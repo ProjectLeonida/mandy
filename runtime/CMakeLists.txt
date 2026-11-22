@@ -2367,8 +2367,10 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_noop_copy COMMAND d3d12_noop_copy_test)
     set_tests_properties(d3d12_noop_copy PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 45)
     set_tests_properties(d3d12_queue_wait PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    # The control pays the same device bring-up as the test above before it waits its 20 ms, so it gets the same
+    # budget: a parallel ctest killed it at 10 s, and WILL_FAIL inverts an exit code but not a ***Timeout.
     add_test(NAME d3d12_queue_wait_timeout COMMAND d3d12_queue_wait_test --timeout-control)
-    set_tests_properties(d3d12_queue_wait_timeout PROPERTIES SKIP_RETURN_CODE 77 WILL_FAIL TRUE TIMEOUT 10)
+    set_tests_properties(d3d12_queue_wait_timeout PROPERTIES SKIP_RETURN_CODE 77 WILL_FAIL TRUE TIMEOUT 60)
     # Textures share blocks of device memory, and a reused range neither leaks old texels nor touches its neighbours.
     add_executable(d3d12_texture_memory_test test/d3d12_texture_memory_test.cpp)
     target_link_libraries(d3d12_texture_memory_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
