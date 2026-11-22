@@ -32,13 +32,16 @@
 #include <cstring>
 #include <memory>
 
-#if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV) || !defined(LEONIDA_TEST_VS_INT_SPV) || \
-    !defined(LEONIDA_TEST_PS_UINT_SPV)
-#error "LEONIDA_TEST_VS_SPV, LEONIDA_TEST_PS_SPV, LEONIDA_TEST_PS_UINT_SPV and LEONIDA_TEST_VS_INT_SPV must name the compiled test shaders"
+#if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV) || !defined(LEONIDA_TEST_PS_UINT_SPV) || \
+    !defined(LEONIDA_TEST_VS_TAIL_SPV) || !defined(LEONIDA_TEST_PS_TAIL_SPV) || !defined(LEONIDA_TEST_VS_INT_SPV)
+#error "LEONIDA_TEST_{VS,PS}{,_TAIL}_SPV, LEONIDA_TEST_PS_UINT_SPV and LEONIDA_TEST_VS_INT_SPV must name the compiled test shaders"
 #endif
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
+} while (0)
+#define REQUIRE(condition) do { \
+    if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return {}; } \
 } while (0)
 
 using namespace d3d12test;
@@ -74,6 +77,130 @@ struct Vertex {
 static_assert(offsetof(Vertex, marker) == 12);
 static_assert(offsetof(Vertex, narrow_color) == 14);
 static_assert(offsetof(Vertex, wrong_color) == 16);
+
+// One draw of the top-left red quad on a PC-side device (not the Xbox proxy), exercising the graphics --pc-tail-ubo
+// path: a VS with 128 push-constant bytes and no pc_tail paired with a PS that reads heap_base from set 1.
+std::vector<std::uint8_t> draw_tail_once(ID3D12Device* device, const std::vector<std::uint8_t>& root_blob,
+                                         const std::vector<std::uint8_t>& vs_container,
+                                         const std::vector<std::uint8_t>& ps_container,
+                                         const D3D12_INPUT_ELEMENT_DESC (&elements)[2], UINT size) {
+    Ref<ID3D12RootSignature> root;
+    REQUIRE(SUCCEEDED(device->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&root.p))));
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = root.p;
+    pso_desc.VS = {vs_container.data(), vs_container.size()};
+    pso_desc.PS = {ps_container.data(), ps_container.size()};
+    pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pso_desc.SampleMask = 0xffffffff;
+    pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    pso_desc.RasterizerState.DepthClipEnable = TRUE;
+    pso_desc.InputLayout = {elements, 2};
+    pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso_desc.NumRenderTargets = 1;
+    pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pso_desc.SampleDesc.Count = 1;
+    Ref<ID3D12PipelineState> pso;
+    REQUIRE(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
+
+    const Vertex vertices[4] = {
+        {-1, 1, 255, 0, 0, 255}, {0, 1, 255, 0, 0, 255}, {-1, 0, 255, 0, 0, 255}, {0, 0, 255, 0, 0, 255}};
+    const std::uint16_t indices[6] = {0, 1, 2, 2, 1, 3};
+    const float red_tint[3] = {1, 0, 1};
+
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+    const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+    Ref<ID3D12Resource> vb, upload, readback, target;
+    const auto vb_desc = buffer_desc(sizeof(vertices));
+    REQUIRE(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &vb_desc,
+                                                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&vb.p))));
+    const auto upload_desc = buffer_desc(1024);
+    REQUIRE(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
+                                                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                      IID_PPV_ARGS(&upload.p))));
+    const auto readback_desc = buffer_desc(size * 256);
+    REQUIRE(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                      IID_PPV_ARGS(&readback.p))));
+    D3D12_RESOURCE_DESC rt_desc{};
+    rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rt_desc.Width = rt_desc.Height = size;
+    rt_desc.DepthOrArraySize = 1;
+    rt_desc.MipLevels = 1;
+    rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rt_desc.SampleDesc.Count = 1;
+    rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    REQUIRE(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
+                                                      D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&target.p))));
+
+    std::uint8_t* up = nullptr;
+    REQUIRE(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
+    std::memcpy(up, vertices, sizeof(vertices));
+    std::memcpy(up + 256, indices, sizeof(indices));
+    std::memcpy(up + 512, red_tint, sizeof(red_tint));
+    const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
+
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    Ref<ID3D12DescriptorHeap> rtv_heap;
+    REQUIRE(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&rtv_heap.p))));
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    device->CreateRenderTargetView(target.p, nullptr, rtv);
+
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    REQUIRE(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    REQUIRE(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    REQUIRE(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, pso.p,
+                                                IID_PPV_ARGS(&list.p))));
+    REQUIRE(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+
+    list->CopyBufferRegion(vb.p, 0, upload.p, 0, sizeof(vertices));
+    const D3D12_RESOURCE_BARRIER barriers[2] = {
+        transition(vb.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER),
+        transition(target.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)};
+    list->ResourceBarrier(2, barriers);
+    const FLOAT blue[4] = {0, 0, 1, 1};
+    list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+    list->SetGraphicsRootSignature(root.p);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_VERTEX_BUFFER_VIEW vbv{vb->GetGPUVirtualAddress(), sizeof(vertices), sizeof(Vertex)};
+    list->IASetVertexBuffers(0, 1, &vbv);
+    const D3D12_INDEX_BUFFER_VIEW ibv{upload_va + 256, sizeof(indices), DXGI_FORMAT_R16_UINT};
+    list->IASetIndexBuffer(&ibv);
+    const D3D12_VIEWPORT viewport{0, 0, float(size), float(size), 0, 1};
+    const D3D12_RECT scissor{0, 0, LONG(size), LONG(size)};
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &scissor);
+    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    const float origin[2] = {0, 0};
+    list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+    list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+    list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+    const auto to_copy = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1, &to_copy);
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = readback.p;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = {0, {DXGI_FORMAT_R8G8B8A8_UNORM, size, size, 1, 256}};
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = target.p;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    REQUIRE(list->Close() == S_OK);
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    REQUIRE(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+    REQUIRE(SUCCEEDED(queue->Signal(fence.p, 1)) && SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
+    void* mapped = nullptr;
+    REQUIRE(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+    std::vector<std::uint8_t> out(size * 256);
+    std::memcpy(out.data(), mapped, out.size());
+    return out;
+}
 
 }  // namespace
 
@@ -162,12 +289,36 @@ int main(int argc, char** argv) {
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]}}";
     }
 
+    // The --pc-tail-ubo twin: VS declares 128 push-constant bytes and no pc_tail (reads neither heap nor code base),
+    // while PS reads heap_base from set 1. Both stages together must fit a 128-byte push-constant device.
+    const testfiles::ScratchDir tail_scratch("leonida_draw_test_tail");
+    const auto& tail_library = tail_scratch.path();
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_TAIL_SPV),
+                                tail_library / "vs_draw_tail.spv"));
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_TAIL_SPV),
+                                tail_library / "ps_draw_tail.spv"));
+    {
+        std::ofstream index(tail_library / "index.json", std::ios::binary);
+        index << "{\"vs_draw_tail\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 128, \"input_signature\": ["
+                 "{\"semantic\": \"COLOR\", \"semantic_index\": 0, \"register\": 0, \"mask\": 15, \"rw_mask\": 15, "
+                 "\"system_value\": 0, \"component_type\": \"float\"}, "
+                 "{\"semantic\": \"POSITION\", \"semantic_index\": 0, \"register\": 1, \"mask\": 3, \"rw_mask\": 3, "
+                 "\"system_value\": 0, \"component_type\": \"float\"}]},\n"
+                 " \"ps_draw_tail\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 128, "
+                 "\"pc_tail\": {\"set\": 1, \"binding\": 0, \"bytes\": 16}, \"outputs\": [0]}}";
+    }
+
     constexpr UINT size = 64;
     std::vector<std::uint8_t> pixels(size * 256), second_pixels(size * 256), logic_pixels(size * 256);
     std::vector<std::uint8_t> strip16_pixels(size * 256), strip32_pixels(size * 256), strip_nocut_pixels(size * 256);
     std::vector<std::uint8_t> msaa_full_pixels(size * 256), msaa_half_pixels(size * 256);
+    std::vector<std::uint8_t> tail_limited_pixels, tail_full_pixels;
     bool ran_msaa = false;
     std::vector<std::uint8_t> step2_pixels(size * 256), step1_pixels(size * 256);
+    bool real_needs_fallback = false;
+    std::uint32_t real_max_push = 0;
     const bool logic_op = d.enabled.logicOp == VK_TRUE;
     const bool has_divisor = d.vertex_attribute_divisor;
     constexpr UINT title_bytes = 2 * 65536;
@@ -183,73 +334,83 @@ int main(int argc, char** argv) {
         EXPECT(title_pages);
         aliases.add_title_memory(title_va, title_bytes);
     }
+    rt::d3d12::VulkanDeviceInfo info{};
+    info.get_instance_proc = d.instance_proc;
+    info.instance = d.instance;
+    info.physical = d.physical;
+    info.device = d.device;
+    info.queue = d.queue;
+    info.queue_family = d.family;
+    info.a8_render_target = d.a8_render_target;
+    info.buffer_device_address = true;
+    info.subgroup = d.subgroup;
+    info.shader_dir = library.string();
+    // Of the PSO features only logicOp is passed on, so the other feature refusals below still apply.
+    info.features.logicOp = d.enabled.logicOp;
+    info.draw_indirect_first_instance = d.enabled.drawIndirectFirstInstance == VK_TRUE;
+    info.multi_draw_indirect = d.enabled.multiDrawIndirect == VK_TRUE;
+    info.draw_indirect_count_enabled = d.draw_indirect_count_enabled;
+    info.robust_index_view = d.robust_index_view;
+    info.max_draw_indirect_count = d.max_draw_indirect_count;
+    info.vertex_attribute_divisor = d.vertex_attribute_divisor;
+
+    // Root signature: [0] two constants (s0, s1: offset), [1] a root CBV (s2:s3: tint).
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants = {0, 0, 2};
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[1].Descriptor = {1, 0};
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+    root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+    root_desc.Desc_1_0 = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+    const auto root_blob = serialize_root_signature(root_desc);
+    EXPECT(!root_blob.empty());
+
+    // The PSO. Input layout order (POSITION, COLOR) differs from the VS's registers (COLOR 0, POSITION 1).
+    const D3D12_INPUT_ELEMENT_DESC elements[2] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D12_APPEND_ALIGNED_ELEMENT,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC base_pso_desc{};
+    base_pso_desc.VS = {vs_container.data(), vs_container.size()};
+    base_pso_desc.PS = {ps_container.data(), ps_container.size()};
+    base_pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    base_pso_desc.SampleMask = 0xffffffff;
+    base_pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    base_pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    base_pso_desc.RasterizerState.DepthClipEnable = TRUE;
+    base_pso_desc.InputLayout = {elements, 2};
+    base_pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    base_pso_desc.NumRenderTargets = 1;
+    base_pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    base_pso_desc.SampleDesc.Count = 1;
+
     {
-        rt::d3d12::VulkanDeviceInfo info{};
-        info.get_instance_proc = d.instance_proc;
-        info.instance = d.instance;
-        info.physical = d.physical;
-        info.device = d.device;
-        info.queue = d.queue;
-        info.queue_family = d.family;
-        info.a8_render_target = d.a8_render_target;
-        info.buffer_device_address = true;
-        info.subgroup = d.subgroup;
-        info.shader_dir = library.string();
-        // Of the PSO features only logicOp is passed on, so the other feature refusals below still apply.
-        info.features.logicOp = d.enabled.logicOp;
-        info.draw_indirect_first_instance = d.enabled.drawIndirectFirstInstance == VK_TRUE;
-        info.multi_draw_indirect = d.enabled.multiDrawIndirect == VK_TRUE;
-        info.draw_indirect_count_enabled = d.draw_indirect_count_enabled;
-        info.robust_index_view = d.robust_index_view;
-        info.max_draw_indirect_count = d.max_draw_indirect_count;
-        info.vertex_attribute_divisor = d.vertex_attribute_divisor;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
                                                            reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
+        real_needs_fallback = rt::d3d12::device_push_constants_need_fallback(device.p);
+        real_max_push = rt::d3d12::device_max_push_constants_size(device.p);
 
-        // Root signature: [0] two constants (s0, s1: offset), [1] a root CBV (s2:s3: tint).
-        D3D12_ROOT_PARAMETER params[2] = {};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants = {0, 0, 2};
-        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-        params[1].Descriptor = {1, 0};
-        D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
-        root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
-        root_desc.Desc_1_0 = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
-        const auto root_blob = serialize_root_signature(root_desc);
-        EXPECT(!root_blob.empty());
         Ref<ID3D12RootSignature> root;
         EXPECT(SUCCEEDED(device->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&root.p))));
 
-        // The PSO. Input layout order (POSITION, COLOR) differs from the VS's registers (COLOR 0, POSITION 1).
-        const D3D12_INPUT_ELEMENT_DESC elements[2] = {
-            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-            {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D12_APPEND_ALIGNED_ELEMENT,
-             D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = base_pso_desc;
         pso_desc.pRootSignature = root.p;
-        pso_desc.VS = {vs_container.data(), vs_container.size()};
-        pso_desc.PS = {ps_container.data(), ps_container.size()};
-        pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-        pso_desc.SampleMask = 0xffffffff;
-        pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-        pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
-        pso_desc.RasterizerState.DepthClipEnable = TRUE;
-        pso_desc.InputLayout = {elements, 2};
-        pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pso_desc.NumRenderTargets = 1;
-        pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        pso_desc.SampleDesc.Count = 1;
         if (indirect_pixels) {
             const int result = check_stateful_indirect_pixels(device.p, root.p, pso_desc, multi_pixels || count_pixels,
                                                               count_pixels, nonindexed_only);
             EXPECT(d.validation_errors() == 0);
             return result;
         }
+
         Ref<ID3D12PipelineState> pso, unfed, mrt, instanced, refused, xor_pso, fullscreen;
+        if (real_needs_fallback) {
+            EXPECT(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p)) == E_NOTIMPL && !pso.p);
+        } else {
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
         pso_desc.InputLayout = {elements, 1};  // COLOR missing: D3D12 rejects a layout that leaves an input unfed
         EXPECT(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&unfed.p)) == E_INVALIDARG && !unfed.p);
@@ -1280,19 +1441,83 @@ int main(int argc, char** argv) {
 
         for (auto* r : {&vertex_buffer, &upload, &readback, &target, &uint_target}) r->reset();
         for (auto* p : {&mrt, &instanced, &refused, &unfed, &xor_pso, &fullscreen}) p->reset();
-        pso.reset();
-        root.reset();
         rtv_heap.reset();
         list.reset();
         allocator.reset();
         queue.reset();
         fence.reset();
+        }
+        pso.reset();
+        root.reset();
         // The device keeps the buffers it made over the title's vertex pages until it goes (make_title_buffer), and
         // each holds a reference: the large batch leaves seven of them.
         if (std::getenv("LEONIDA_TEST_GEOMETRY_BATCH"))
             EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) >= 1);
         else
             EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
+    }
+
+    // A 128-byte push-constant device refuses the 144-byte graphics PSO, and builds + draws the --pc-tail-ubo
+    // VS+PS pair (VS: 128 bytes without pc_tail; PS: 128 bytes with 16-byte pc_tail). Run after `device` is
+    // released so each tail device owns the process-wide title_va_aliases() hooks for its upload-buffer root CBV.
+    {
+        rt::d3d12::VulkanDeviceInfo limited_info = info;
+        limited_info.max_push_constants_size = 128;
+        limited_info.push_constants_need_fallback = true;
+        {
+            Ref<ID3D12Device> limited;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(limited_info, IID_PPV_ARGS(&limited.p))));
+            Ref<ID3D12RootSignature> limited_root;
+            EXPECT(SUCCEEDED(limited->CreateRootSignature(0, root_blob.data(), root_blob.size(),
+                                                          IID_PPV_ARGS(&limited_root.p))));
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC limited_desc = base_pso_desc;
+            limited_desc.pRootSignature = limited_root.p;
+            Ref<ID3D12PipelineState> refused_pc;
+            EXPECT(limited->CreateGraphicsPipelineState(&limited_desc, IID_PPV_ARGS(&refused_pc.p)) == E_NOTIMPL &&
+                   !refused_pc.p);
+        }
+        for (const bool limit : {true, false}) {
+            rt::d3d12::VulkanDeviceInfo tail_info = limit ? limited_info : info;
+            tail_info.shader_dir = tail_library.string();
+            Ref<ID3D12Device> tail_device;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(tail_info, IID_PPV_ARGS(&tail_device.p))));
+            EXPECT(rt::d3d12::device_push_constants_need_fallback(tail_device.p) == (limit || real_needs_fallback));
+            const auto drawn = draw_tail_once(tail_device.p, root_blob, vs_container, ps_container, elements, size);
+            EXPECT(drawn.size() == size * 256);
+            (limit ? tail_limited_pixels : tail_full_pixels) = drawn;
+        }
+        unsigned tail_mismatches = 0;
+        for (UINT row = 0; row < size; ++row) {
+            for (UINT col = 0; col < size; ++col) {
+                const bool top_left = row < size / 2 && col < size / 2;
+                const std::uint8_t want[4] = {std::uint8_t(top_left ? 255 : 0), 0,
+                                              std::uint8_t(top_left ? 0 : 255), 255};
+                const std::uint8_t* got_lim = tail_limited_pixels.data() + row * 256 + col * 4;
+                const std::uint8_t* got_full = tail_full_pixels.data() + row * 256 + col * 4;
+                if ((std::memcmp(got_lim, want, 4) != 0 || std::memcmp(got_full, want, 4) != 0) &&
+                    tail_mismatches++ < 6)
+                    std::fprintf(stderr,
+                                 "tail draw pixel (%u, %u): got %u,%u,%u,%u (128-byte) and %u,%u,%u,%u, want "
+                                 "%u,%u,%u,%u\n",
+                                 col, row, got_lim[0], got_lim[1], got_lim[2], got_lim[3], got_full[0], got_full[1],
+                                 got_full[2], got_full[3], want[0], want[1], want[2], want[3]);
+            }
+        }
+        EXPECT(!tail_mismatches);
+        EXPECT(!d.validation_errors());
+        std::printf("--pc-tail-ubo graphics: a 128-byte device built the tail VS+PS PSO (VS without pc_tail, PS "
+                    "with set-1 tail) and %u/%u pixels matched there and on this GPU\n",
+                    size * size, size * size);
+    }
+
+    if (real_needs_fallback) {
+        if (d.validation_errors()) {
+            std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+            return 1;
+        }
+        std::printf("M1: skipped the 144-byte graphics passes because this GPU reports %u push-constant bytes (< 144)\n",
+                    real_max_push);
+        return 0;
     }
 
     unsigned mismatches = 0;

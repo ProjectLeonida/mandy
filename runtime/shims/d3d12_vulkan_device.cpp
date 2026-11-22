@@ -7342,6 +7342,21 @@ struct DeviceState {
         }
     }
 
+    // Set 1 of the shaders translated with --pc-tail-ubo (docs/d3d12_vulkan.md section 3.2, "Push constants"): their
+    // heap base and code base, bytes 128..143 of ShaderUserData, in a uniform block instead of push constants. One
+    // UNIFORM_BUFFER_DYNAMIC descriptor over the arena serves every pipeline: each writes its 16 bytes into the arena
+    // once and binds this set with their offset, so a pipeline needs no descriptor set of its own. `empty` stands in
+    // for set 0 in a pipeline without the bindless set. `set` is null when it could not be made; such pipelines are
+    // refused then.
+    static constexpr VkDeviceSize kPcTailBytes = 16;
+    struct PcTail {
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+        VkDescriptorSetLayout empty = VK_NULL_HANDLE;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        VkDeviceSize alignment = 256;  // minUniformBufferOffsetAlignment (256 is the most Vulkan allows)
+    } pc_tail;
+
     // The translator's output, loaded on first use.
     std::mutex library_mutex;
     bool library_tried = false;
@@ -11753,10 +11768,94 @@ struct ComputeBuildOptions {
     bool key_only = false;                   // only name the journal file (journal_path), build nothing
 };
 
+// How a pipeline's stages get ShaderUserData: all 144 push-constant bytes, or the first 128 (s0..s31) when every
+// stage fits in 128 bytes (--pc-tail-ubo, with or without a pc_tail block). Stages that declare pc_tail read the
+// heap base and code base from set 1 instead (DeviceState::pc_tail), which `tail` adds to the layout; a mix of
+// 144-byte and --pc-tail-ubo stages keeps the 144-byte range and has the tail too.
+struct UserDataLayout {
+    bool tail = false;
+    std::uint32_t push_bytes = sizeof(leonida::ShaderUserData);
+};
+
+// The layout for these stage entries, or false when the device cannot give it (`reason`, when set, names why without
+// logging; with `log`, logs once as pipeline creation does). 128 bytes is the Vulkan minimum for maxPushConstantsSize,
+// reported on RDNA2 integrated GPUs and some Intel drivers: shaders that need the 144-byte range are refused instead of
+// breaking VUID-VkPushConstantRange-size-00298.
+inline bool resolve_user_data_layout(const DeviceState& device,
+                                     std::initializer_list<const leonida::ShaderEntry*> entries, UserDataLayout& out,
+                                     const char** reason = nullptr, bool log = true) {
+    constexpr std::uint32_t kShort = offsetof(leonida::ShaderUserData, heap_base);  // 128: s0..s31 alone
+    constexpr std::uint32_t kFull = sizeof(leonida::ShaderUserData);                // 144: + heap base, code base
+    out = {};
+    std::uint32_t push_bytes = 0;
+    for (const leonida::ShaderEntry* e : entries) {
+        if (!e) continue;  // a stage the pipeline does not have
+        // A longer tail also holds a --mesh-compute output address, which no stage built here is fed.
+        if (e->pc_tail_bytes && e->pc_tail_bytes != DeviceState::kPcTailBytes) {
+            if (reason) *reason = "pc_tail size is not 16 bytes";
+            if (log)
+                std::fprintf(stderr, "[rt] d3d12: %s has a %u-byte pc_tail; pipelines feed only the heap base and "
+                                     "code base (16 bytes)\n",
+                             e->name.c_str(), e->pc_tail_bytes);
+            return false;
+        }
+        if (e->push_constant_bytes > kFull) {
+            if (reason) *reason = "push constants over 144 bytes";
+            if (log)
+                std::fprintf(stderr, "[rt] d3d12: %s needs %u push-constant bytes; pipelines feed at most %u\n",
+                             e->name.c_str(), e->push_constant_bytes, kFull);
+            return false;
+        }
+        // A --pc-tail-ubo shader that reads neither heap base nor code base has push_constant_bytes == 128 and no
+        // pc_tail; absent push_constant_bytes defaults to 144 unless pc_tail says it was shrunk.
+        const std::uint32_t need =
+            (e->push_constant_bytes ? e->push_constant_bytes <= kShort : e->pc_tail_bytes != 0) ? kShort : kFull;
+        push_bytes = std::max(push_bytes, need);
+        out.tail = out.tail || e->pc_tail_bytes != 0;
+    }
+    if (push_bytes) out.push_bytes = push_bytes;
+    if (out.tail && !device.pc_tail.set) {
+        if (reason) *reason = "set-1 tail and no pc_tail set";
+        if (log)
+            log_once("shaders translated with --pc-tail-ubo need set 1, which this device could not make; stage", 0);
+        return false;
+    }
+    const std::uint32_t limit = device.info.max_push_constants_size;
+    if (limit == 0 || limit >= out.push_bytes) return true;  // 0: not queried
+    if (reason) *reason = out.push_bytes > kShort ? "needs 144 push-constant bytes" : "push constants over device limit";
+    if (log)
+        log_once("pipelines need 144 bytes of push constants; translate the shaders with --pc-tail-ubo for this "
+                 "device, whose maxPushConstantsSize is",
+                 int(limit));
+    return false;
+}
+
+// The pipeline layout: the push-constant range from `user`, set 0 (the bindless set when a stage declares bindings, or
+// an empty stand-in when only set 1 is needed) and set 1 (the tail).
+inline VkResult create_user_data_layout(DeviceState& device, VkShaderStageFlags stages, bool bindless,
+                                        const UserDataLayout& user, VkPipelineLayout& out) {
+    const VkPushConstantRange push{stages, 0, user.push_bytes};
+    VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push;
+    VkDescriptorSetLayout sets[2] = {};
+    if (bindless) {
+        sets[0] = device.bindless->layout();
+        layout_info.setLayoutCount = 1;
+    }
+    if (user.tail) {
+        if (!bindless) sets[0] = device.pc_tail.empty;
+        sets[1] = device.pc_tail.layout;
+        layout_info.setLayoutCount = 2;
+    }
+    layout_info.pSetLayouts = sets;
+    return device.context->vk.vkCreatePipelineLayout(device.info.device, &layout_info, nullptr, &out);
+}
+
 // A compute pipeline from a library entry: what a PSO's first dispatch, the warm-up worker and gta6rt
-// --precompile-pipelines all build, so their journal names and the driver's keys are the same. `layout` is the push
-// range of leonida::ShaderUserData, with the device's bindless set 0 when the entry declares bindings; `subgroup` is
-// leonida::decide_subgroup_size's answer for the entry.
+// --precompile-pipelines all build, so their journal names and the driver's keys are the same. `layout` is the
+// resolve_user_data_layout / create_user_data_layout layout (144 or 128 push-constant bytes, set 0 when the entry
+// declares bindings, and set 1 when it uses pc_tail); `subgroup` is leonida::decide_subgroup_size's answer.
 ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEntry& compute_entry,
                                     VkPipelineLayout layout, const leonida::SubgroupRequest& subgroup,
                                     const ComputeBuildOptions& options) {
@@ -11788,6 +11887,8 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
     }
     const std::size_t bytes = words.size() * sizeof(std::uint32_t);
     out.bytes = bytes;
+    UserDataLayout user;
+    if (!resolve_user_data_layout(device, {entry}, user, nullptr, false)) return out;
     VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -11813,8 +11914,9 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
         key.value(std::uint32_t(pipeline_info.flags));
         key.value(std::uint32_t(pipeline_info.stage.flags));
         key.value(std::uint32_t(pipeline_info.stage.pNext == &required_size ? required_size.requiredSubgroupSize : 0));
-        key.value(std::uint32_t(sizeof(leonida::ShaderUserData)));
+        key.value(std::uint32_t(user.push_bytes));
         key.value(std::uint32_t(entry->binding_count != 0));
+        if (user.tail) key.value(std::uint32_t(1));
         // NVIDIA's diagnostics config (LEONIDA_DEVICE_FAULT=1, Aftermath) compiles with shader debug info: other
         // pipelines, kept apart so switching it on and off does not rewrite every file. Absent when off, so the
         // names of ordinary boots stay as they were.
@@ -12007,20 +12109,36 @@ public:
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         modules_.clear();
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
+        if (tail_bytes_) device_.arena_release(tail_offset_, tail_bytes_, DeviceState::arena_shader);
         --live_pipeline_state_count;
     }
 
-    // Pipeline layouts declare the whole 144-byte block as one push-constant range. A device whose
-    // maxPushConstantsSize is smaller (128 bytes is the Vulkan minimum, which some Intel and mobile drivers
-    // report) needs the uniform-buffer tail #224 flags with push_constants_need_fallback, which is not built yet,
-    // so pipelines are refused there with the limit named instead of breaking VUID-VkPushConstantRange-size-00298.
-    bool push_constants_fit() const {
-        const std::uint32_t limit = device_.info.max_push_constants_size;
-        if (limit == 0 || limit >= sizeof(leonida::ShaderUserData)) return true;  // 0: not queried
-        log_once("pipelines need 144 bytes of push constants (uniform-buffer fallback not built yet); "
-                 "maxPushConstantsSize",
-                 int(limit));
-        return false;
+    bool user_data_layout(std::initializer_list<const leonida::ShaderEntry*> entries, UserDataLayout& out) const {
+        return resolve_user_data_layout(device_, entries, out, nullptr, true);
+    }
+
+    // The pipeline's 16 bytes of set-1 tail: the heap base (the arena's device address) and its code base, as bytes
+    // 128..143 of ShaderUserData would hold them, written into the arena once since neither changes while the
+    // pipeline lives. Replay binds DeviceState::pc_tail's set with `offset`.
+    bool write_tail(std::uint64_t code_base, VkDescriptorSet& set, std::uint32_t& offset) {
+        VkDeviceSize at = 0;
+        if (!device_.arena_allocate(DeviceState::kPcTailBytes, device_.pc_tail.alignment, at,
+                                    DeviceState::arena_shader))
+            return false;
+        const std::uint64_t tail[2] = {device_.arena.address, code_base};
+        static_assert(sizeof(tail) == DeviceState::kPcTailBytes);
+        std::memcpy(device_.arena.mapped + at, tail, sizeof(tail));
+        tail_offset_ = at;
+        tail_bytes_ = DeviceState::kPcTailBytes;
+        set = device_.pc_tail.set;
+        offset = std::uint32_t(at);  // the arena is below 4 GiB
+        return true;
+    }
+
+    // The pipeline layout: the push-constant range from `user`, set 0 (the bindless set, when a stage declares
+    // bindings, or an empty stand-in when only set 1 is needed) and set 1 (the tail).
+    VkResult create_layout(VkShaderStageFlags stages, bool bindless, const UserDataLayout& user, VkPipelineLayout& out) {
+        return create_user_data_layout(device_, stages, bindless, user, out);
     }
 
     // Asks for the subgroup size the shader was translated for, where the device allows (src/subgroup_size.h): the
@@ -12215,11 +12333,13 @@ public:
         default: return leonida::StubOutput::float_;
         }
     }
-    // The stage table's stand-in entry for a stub stage: no bindings, no inputs, no code base, no subgroup request.
+    // The stage table's stand-in entry for a stub stage: no bindings, no inputs, no code base, no subgroup request,
+    // and only the 128-byte push-constant range so stubbed graphics PSOs also work on 128-byte GPUs.
     static const leonida::ShaderEntry& stub_entry() {
         static const leonida::ShaderEntry entry = [] {
             leonida::ShaderEntry e;
             e.name = "LEONIDA_STUB_PIPELINES";
+            e.push_constant_bytes = offsetof(leonida::ShaderUserData, heap_base);
             return e;
         }();
         return entry;
@@ -12275,7 +12395,6 @@ public:
         if (!device_.arena.mapped) {
             return stream_unsupported("pipelines need the GPU address arena (bufferDeviceAddress); stage", 1);
         }
-        if (!push_constants_fit()) return stream_unsupported("graphics push-constant limit");
         if (!vk.graphics_complete()) {
             return stream_unsupported("graphics pipelines need Vulkan 1.3 dynamic rendering and extended dynamic state; stage", 1);
         }
@@ -12689,6 +12808,8 @@ public:
             info.pName = "main";
             stage_infos.push_back(info);
         }
+        UserDataLayout user;
+        if (!user_data_layout({stages[0].entry, stages[1].entry, stages[2].entry}, user)) return E_NOTIMPL;
 
         // Input layout -> vertex input, by semantic. A mesh pipeline has none.
         std::vector<VkVertexInputAttributeDescription> attributes;
@@ -12997,18 +13118,12 @@ public:
         for (const Stage& stage : stages)
             if (stage.bit != VK_SHADER_STAGE_GEOMETRY_BIT || device_.info.features.geometryShader)
                 graphics_.push_stages |= stage.bit;
-        const VkPushConstantRange push{graphics_.push_stages, 0, sizeof(leonida::ShaderUserData)};
-        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layout_info.pushConstantRangeCount = 1;
-        layout_info.pPushConstantRanges = &push;
-        VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
-        if (uses_bindless) {
-            set0_layout = device_.bindless->layout();
-            layout_info.setLayoutCount = 1;
-            layout_info.pSetLayouts = &set0_layout;
-            graphics_.bindless_set = device_.bindless->set();
+        if (uses_bindless) graphics_.bindless_set = device_.bindless->set();
+        graphics_.push_bytes = user.push_bytes;
+        if (create_layout(graphics_.push_stages, uses_bindless, user, graphics_.layout) != VK_SUCCESS) {
+            graphics_.layout = VK_NULL_HANDLE;
+            return E_FAIL;
         }
-        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
         graphics_.mesh = mesh;
@@ -13065,6 +13180,7 @@ public:
             code_base_ = offset;
             graphics_.code_base = offset;
         }
+        if (user.tail && !write_tail(graphics_.code_base, graphics_.tail_set, graphics_.tail_offset)) return E_OUTOFMEMORY;
         if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC: what this pipeline is, for the fsdraw probe's draw lines
             const auto& rt0 = desc.BlendState.RenderTarget[0];
             char text[640];
@@ -13110,7 +13226,6 @@ public:
         if (!device_.arena.mapped) {
             return stream_unsupported("pipelines need the GPU address arena (bufferDeviceAddress); stage", 0);
         }
-        if (!push_constants_fit()) return stream_unsupported("compute push-constant limit");
         // The game's FSSM program, or the FidelityFX DLL's FSPX kind-6 program: in a DXBC container's ACCC part at
         // slot 62, bare from a slot-67 description (docs/fspx.md, "Run-time lookup").
         const leonida::ComputeProgram program = leonida::compute_program(
@@ -13167,23 +13282,19 @@ public:
                 }
             }
         }
+        UserDataLayout user;
+        if (!user_data_layout({entry}, user)) return E_NOTIMPL;
         const std::size_t spirv_bytes = library->spirv_bytes(*entry);
         if (!spirv_bytes) {
             std::fprintf(stderr, "[rt] d3d12: %s.spv is missing\n", entry->name.c_str());
             return E_FAIL;
         }
-        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
-        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layout_info.pushConstantRangeCount = 1;
-        layout_info.pPushConstantRanges = &push;
-        VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
-        if (entry->binding_count) {
-            set0_layout = device_.bindless->layout();
-            layout_info.setLayoutCount = 1;
-            layout_info.pSetLayouts = &set0_layout;
-            pipeline_.bindless_set = device_.bindless->set();
+        if (entry->binding_count) pipeline_.bindless_set = device_.bindless->set();
+        pipeline_.push_bytes = user.push_bytes;
+        if (create_layout(VK_SHADER_STAGE_COMPUTE_BIT, entry->binding_count != 0, user, pipeline_.layout) != VK_SUCCESS) {
+            pipeline_.layout = VK_NULL_HANDLE;
+            return E_FAIL;
         }
-        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
         compute_entry_ = entry;
         stage_bytes_ = spirv_bytes;
         pipeline_.estimate = leonida::large_module_estimate(spirv_bytes);
@@ -13236,6 +13347,7 @@ public:
             code_bytes_ = code.size();
             pipeline_.code_base = code_base_;
         }
+        if (user.tail && !write_tail(pipeline_.code_base, pipeline_.tail_set, pipeline_.tail_offset)) return E_OUTOFMEMORY;
         if (!pipeline_.skipped) order_install(pipeline_.requested, pipeline_.request_context, 'c', entry->name);
         device_.context->add_pipeline(id(), pipeline_,
                                       device_.info.device_fault_diagnostics ? entry->name.c_str() : nullptr);
@@ -13912,6 +14024,8 @@ private:
     }
     VkDeviceSize code_base_ = 0;
     VkDeviceSize code_bytes_ = 0;
+    VkDeviceSize tail_offset_ = 0;  // the pipeline's set-1 tail in the arena (write_tail); 0 bytes: none
+    VkDeviceSize tail_bytes_ = 0;
     bool registered_ = false;
     bool unregistered_ = false;  // taken out of the context's registry (unregister)
     bool is_graphics_ = false;
@@ -15525,6 +15639,8 @@ public:
             };
             leonida::mem_probe::start(std::move(facts));
         }
+        if (state_.arena.mapped && !create_pc_tail())
+            std::fprintf(stderr, "[rt] d3d12: the --pc-tail-ubo set 1 could not be created\n");
         if (info.conditional_rendering) {
             const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                 info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
@@ -16099,6 +16215,64 @@ public:
         return true;
     }
 
+    // DeviceState::pc_tail. Made on every device with an arena, not only those below 144 bytes of push constants:
+    // shaders translated with --pc-tail-ubo run anywhere, which is how the path is tested on a 256-byte GPU too.
+    bool create_pc_tail() {
+        auto& vk = state_.context->vk;
+        auto& tail = state_.pc_tail;
+        const VkDevice dev = state_.info.device;
+        if (!vk.vkCreateDescriptorSetLayout || !vk.vkDestroyDescriptorSetLayout || !vk.vkCreateDescriptorPool ||
+            !vk.vkDestroyDescriptorPool || !vk.vkAllocateDescriptorSets || !vk.vkUpdateDescriptorSets)
+            return false;
+        if (state_.info.physical && state_.info.get_instance_proc) {
+            if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                    state_.info.get_instance_proc(state_.info.instance, "vkGetPhysicalDeviceProperties"))) {
+                VkPhysicalDeviceProperties props{};
+                get_props(state_.info.physical, &props);
+                if (props.limits.minUniformBufferOffsetAlignment)
+                    tail.alignment = std::max<VkDeviceSize>(props.limits.minUniformBufferOffsetAlignment, 16);
+            }
+        }
+        VkDescriptorSetLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        if (vk.vkCreateDescriptorSetLayout(dev, &layout_info, nullptr, &tail.empty) != VK_SUCCESS) {
+            tail.empty = VK_NULL_HANDLE;
+            return false;
+        }
+        const VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL,
+                                                   nullptr};
+        layout_info.bindingCount = 1;
+        layout_info.pBindings = &binding;
+        if (vk.vkCreateDescriptorSetLayout(dev, &layout_info, nullptr, &tail.layout) != VK_SUCCESS) {
+            tail.layout = VK_NULL_HANDLE;
+            return false;
+        }
+        const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1};
+        VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pool_info.maxSets = 1;
+        pool_info.poolSizeCount = 1;
+        pool_info.pPoolSizes = &size;
+        if (vk.vkCreateDescriptorPool(dev, &pool_info, nullptr, &tail.pool) != VK_SUCCESS) {
+            tail.pool = VK_NULL_HANDLE;
+            return false;
+        }
+        VkDescriptorSetAllocateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        set_info.descriptorPool = tail.pool;
+        set_info.descriptorSetCount = 1;
+        set_info.pSetLayouts = &tail.layout;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        if (vk.vkAllocateDescriptorSets(dev, &set_info, &set) != VK_SUCCESS) return false;
+        // The range is one pipeline's tail; the dynamic offset at each bind picks whose.
+        const VkDescriptorBufferInfo buffer{state_.arena.buffer, 0, DeviceState::kPcTailBytes};
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = set;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        write.pBufferInfo = &buffer;
+        vk.vkUpdateDescriptorSets(dev, 1, &write, 0, nullptr);
+        tail.set = set;
+        return true;
+    }
+
     ~Device() override {
         leonida::memory_figures::withdraw_vram_reader(&state_);  // waits for a read of this device in progress
         {
@@ -16168,6 +16342,13 @@ public:
         }
         state_.report_arena();
         state_.destroy_address_guard();
+        if (state_.context) {  // every pipeline, which used them, is gone by now
+            auto& vk = state_.context->vk;
+            const auto& tail = state_.pc_tail;
+            if (tail.pool) vk.vkDestroyDescriptorPool(state_.info.device, tail.pool, nullptr);  // frees the set
+            if (tail.layout) vk.vkDestroyDescriptorSetLayout(state_.info.device, tail.layout, nullptr);
+            if (tail.empty) vk.vkDestroyDescriptorSetLayout(state_.info.device, tail.empty, nullptr);
+        }
         if (state_.context && state_.arena.buffer) {
             leonida::fsdraw::forget_arena(state_.arena.mapped);
             auto& vk = state_.context->vk;
@@ -23414,8 +23595,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                  info.subgroup.compute_full_subgroups ? "on" : "off");
     if (info.push_constants_need_fallback) {
         std::fprintf(stderr,
-                     "[rt] d3d12: WARNING: GPU maxPushConstantsSize (%u bytes) is below the 144 bytes required by "
-                     "the shader contract; uniform-buffer fallback required for the 16-byte tail\n",
+                     "[rt] d3d12: WARNING: GPU maxPushConstantsSize (%u bytes) is below the 144 bytes of the shader "
+                     "contract; only shaders translated with --pc-tail-ubo (heap base and code base in a set-1 "
+                     "uniform block) can be built\n",
                      chosen.limits.maxPushConstantsSize);
     }
 
@@ -23429,7 +23611,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
 }
 
 // A Vulkan device made as `gta6rt --run` makes it, for building the library's compute pipelines with no title
-// (--precompile-pipelines, --compile-server), with the two layouts create_compute makes.
+// (--precompile-pipelines, --compile-server), with the push-constant / descriptor-set layouts create_compute makes.
 class BuildHost {
 public:
     explicit BuildHost(const char* tag) : tag_(tag) {}
@@ -23439,8 +23621,10 @@ public:
         if (!d3d_) return;
         if (device_) {
             auto& vk = device_->context->vk;
-            if (plain_) vk.vkDestroyPipelineLayout(device_->info.device, plain_, nullptr);
-            if (with_set0_) vk.vkDestroyPipelineLayout(device_->info.device, with_set0_, nullptr);
+            for (auto& by_bindless : layouts_)
+                for (auto& by_short : by_bindless)
+                    for (VkPipelineLayout layout : by_short)
+                        if (layout) vk.vkDestroyPipelineLayout(device_->info.device, layout, nullptr);
         }
         d3d_->Release();
     }
@@ -23470,26 +23654,23 @@ public:
         state.pipeline_cache();  // the shared cache and the journal's upkeep, as at a title's first pipeline
         // Every pipeline goes into a journal file: one found in the shared cache would not be.
         state.journal_ask_shared = false;
-        auto& vk = state.context->vk;
-        const VkDevice dev = state.info.device;
-        if (state.info.max_push_constants_size && state.info.max_push_constants_size < sizeof(leonida::ShaderUserData)) {
-            std::fprintf(stderr, "%s maxPushConstantsSize %u is under the shaders' %zu bytes: the runtime builds no "
-                                 "compute pipeline on this device\n",
-                         tag_, state.info.max_push_constants_size, sizeof(leonida::ShaderUserData));
-            return false;
+        const std::uint32_t limit = state.info.max_push_constants_size;
+        for (int tail = 0; tail < 2; ++tail) {
+            if (tail && !state.pc_tail.set) continue;
+            for (int bindless = 0; bindless < 2; ++bindless) {
+                if (bindless && !state.bindless) continue;
+                for (int short_range = 0; short_range < 2; ++short_range) {
+                    const UserDataLayout user{
+                        tail != 0, short_range ? std::uint32_t(offsetof(leonida::ShaderUserData, heap_base))
+                                               : std::uint32_t(sizeof(leonida::ShaderUserData))};
+                    if (limit && limit < user.push_bytes) continue;
+                    if (create_user_data_layout(state, VK_SHADER_STAGE_COMPUTE_BIT, bindless != 0, user,
+                                                layouts_[tail][bindless][short_range]) != VK_SUCCESS)
+                        layouts_[tail][bindless][short_range] = VK_NULL_HANDLE;
+                }
+            }
         }
-        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
-        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layout_info.pushConstantRangeCount = 1;
-        layout_info.pPushConstantRanges = &push;
-        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &plain_) != VK_SUCCESS) return false;
-        if (state.bindless) {
-            const VkDescriptorSetLayout set0 = state.bindless->layout();
-            layout_info.setLayoutCount = 1;
-            layout_info.pSetLayouts = &set0;
-            if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &with_set0_) != VK_SUCCESS)
-                with_set0_ = VK_NULL_HANDLE;
-        }
+        if (!layouts_[0][0][0] && !layouts_[0][0][1]) return false;
         if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                 state.info.get_instance_proc
                     ? state.info.get_instance_proc(state.info.instance, "vkGetPhysicalDeviceProperties")
@@ -23508,14 +23689,22 @@ public:
     // it drops a program's dispatches at play, and each caller decides whether it also keeps the program unbuilt.
     const char* unbuildable(const leonida::ShaderEntry& entry, std::size_t bytes) const {
         if (!bytes) return "no .spv";
-        if (entry.binding_count && !with_set0_) return "set-0 bindings and no bindless set";
+        if (entry.binding_count && !device_->bindless) return "set-0 bindings and no bindless set";
         if (entry.lds_bytes && max_shared_ && entry.lds_bytes > max_shared_) return "workgroup memory over the limit";
+        UserDataLayout user;
+        const char* why = nullptr;
+        if (!resolve_user_data_layout(*device_, {&entry}, user, &why, false)) return why;
+        if (!layout_for(user, entry.binding_count != 0)) return "compute pipeline layout could not be created";
         return nullptr;
     }
 
     ComputeBuild build(const leonida::ShaderEntry& entry, const ComputeBuildOptions& options) {
+        UserDataLayout user;
+        if (!resolve_user_data_layout(*device_, {&entry}, user, nullptr, false)) return {};
+        const VkPipelineLayout layout = layout_for(user, entry.binding_count != 0);
+        if (!layout) return {};
         const leonida::SubgroupRequest subgroup = leonida::decide_subgroup_size(entry, device_->info.subgroup);
-        return build_compute_pipeline(*device_, entry, entry.binding_count ? with_set0_ : plain_, subgroup, options);
+        return build_compute_pipeline(*device_, entry, layout, subgroup, options);
     }
 
     void destroy(VkPipeline pipeline) {
@@ -23523,11 +23712,16 @@ public:
     }
 
 private:
+    VkPipelineLayout layout_for(const UserDataLayout& user, bool bindless) const {
+        const bool short_range = user.push_bytes <= offsetof(leonida::ShaderUserData, heap_base);
+        return layouts_[user.tail ? 1 : 0][bindless ? 1 : 0][short_range ? 1 : 0];
+    }
+
     const char* tag_;
     ID3D12Device* d3d_ = nullptr;
     DeviceState* device_ = nullptr;
     const leonida::ShaderLibrary* library_ = nullptr;
-    VkPipelineLayout plain_ = VK_NULL_HANDLE, with_set0_ = VK_NULL_HANDLE;
+    VkPipelineLayout layouts_[2][2][2]{};
     std::uint32_t max_shared_ = 0;
 };
 
@@ -23677,6 +23871,7 @@ std::uint64_t journal_name_context(DeviceState& state) {
     leonida::pipeline_journal::Hasher hash;
     hash.text("journal-name-context");
     hash.value(std::uint32_t(sizeof(leonida::ShaderUserData)));
+    hash.value(std::uint32_t(state.pc_tail.set != VK_NULL_HANDLE));
     const leonida::SubgroupSizeCaps& sub = state.info.subgroup;
     hash.value(std::uint32_t(sub.subgroup_size_control));
     hash.value(std::uint32_t(sub.compute_full_subgroups));

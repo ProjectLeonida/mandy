@@ -847,6 +847,10 @@ struct ShaderEntry {
     std::string fspx_state_sha256;  // and of its kind-0 entry (dispatch state)
     std::size_t binding_count = 0;  // set-0 bindings the module declares
     std::uint32_t push_constant_bytes = 0;
+    // A shader translated with --pc-tail-ubo reads its heap base and code base (and a --mesh-compute output address)
+    // from a uniform block at set 1, binding 0, not from push-constant bytes 128..143: the size of that block, or 0
+    // when the entry has none.
+    std::uint32_t pc_tail_bytes = 0;
     std::array<std::uint32_t, 3> local_size{1, 1, 1};
     // Workgroup memory the module declares: its LDS array plus what --wave64-emulate adds (SHADER-309). A compute
     // pipeline needs it at or under the device's maxComputeSharedMemorySize (32768 on some drivers).
@@ -1243,6 +1247,7 @@ private:
             if (const Json* b = meta.find("bindings"); b && b->kind == Json::Kind::array) e.binding_count = b->array.size();
             e.push_constant_bytes = u32(meta.find("push_constant_bytes"));
             e.lds_bytes = u32(meta.find("lds_bytes"));
+            if (const Json* t = meta.find("pc_tail"); t && t->kind == Json::Kind::object) e.pc_tail_bytes = u32(t->find("bytes"));
             if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)
                 for (std::size_t i = 0; i < l->array.size() && i < 3; ++i) e.local_size[i] = u32(&l->array[i]);
             // The paired FSPX translator emits uses_code_base only when true. Older
