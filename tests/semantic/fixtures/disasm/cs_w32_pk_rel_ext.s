@@ -26,6 +26,7 @@
 	s_mov_b32 s23, 0x203
 	s_mov_b32 m0, 3
 	s_movrels_b32 s30, s20
+	v_cmpx_eq_u32_e32 0, v0
 	v_mov_b32_e32 v16, 0x40
 	v_mov_b32_e32 v18, 0
 	v_mov_b32_e32 v19, 0x11110000
@@ -41,7 +42,6 @@
 	ds_read_b64 v[24:25], v16
 	s_waitcnt lgkmcnt(0)
 	v_xor_b32_e32 v7, v23, v25
-	v_cmpx_eq_u32_e32 0, v0
 	v_mov_b32_e32 v26, 0
 	buffer_store_dword v3, v26, s[0:3], 0 offen
 	v_mov_b32_e32 v26, 4

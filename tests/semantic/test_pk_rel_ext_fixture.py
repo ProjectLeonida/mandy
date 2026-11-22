@@ -7,6 +7,11 @@ v_pk_add_u16 clamp, v_pk_sub_i16, v_pk_mad_u16 with op_sel, v_pk_max_i16, the tw
 an s_movrels_b32 result and an LDS word from ds_or_rtn_b64 / ds_xor_b64. This runs its fixture as one wave32 group
 through spirv_mini_interp, checks the words against values computed here, and checks that check.py and
 scripts/run_gpu_tests.py expect the same words.
+
+spirv_mini_interp gives every invocation its own LDS, so this cannot see lanes racing on one LDS address. The first
+version ran the LDS ops in all 32 lanes, which passed here and failed on GPUs (an even number of ds_xor_b64 cancel;
+found by @borislisandro and @tumbione on #1850); the .asm now cuts EXEC to lane 0 first, and
+test_lds_ops_run_in_lane_0_only checks that order in the source.
 """
 import os
 import re
@@ -74,6 +79,13 @@ class PkRelExtFixture(unittest.TestCase):
         for k, want in enumerate(EXPECTED):
             with self.subTest(word=k):
                 self.assertEqual(mem[4 * k], want)
+
+    def test_lds_ops_run_in_lane_0_only(self):
+        with open(os.path.join(ROOT, "runtime", "test", "shaders", "cs_w32_pk_rel_ext.asm"), encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip() and not ln.startswith(";")]
+        cmpx = lines.index("v_cmpx_eq_u32_e32 0, v0")
+        first_ds = min(i for i, ln in enumerate(lines) if ln.startswith("ds_"))
+        self.assertLess(cmpx, first_ds)
 
     def test_gpu_runners_expect_the_same_words(self):
         for rel in (("runtime", "test", "shaders", "check.py"), ("scripts", "run_gpu_tests.py")):

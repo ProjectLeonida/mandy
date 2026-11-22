@@ -8,7 +8,8 @@
 ;   out[4], out[5] = v12, v15 after v_swaprel_b32 v10, v11 with M0 = (2 << 16) | 4: swaps v12 and v15
 ;            (v10..v15 = 0x100..0x105)                            = 0x105, 0x102
 ;   out[6] = s_movrels_b32 s30, s20 with M0 = 3 (s20..s23 = 0x200..0x203) = 0x203
-;   out[7] = ds_or_rtn_b64 old high dword ^ the LDS high dword after ds_xor_b64: (0x11110000) ^ ((0x11110000 |
+;   out[7] = ds_or_rtn_b64 old high dword ^ the LDS high dword after ds_xor_b64 (lane 0 only: EXEC is cut to
+;            lane 0 before the LDS ops, since 32 lanes on one address would cancel the XOR in pairs): (0x11110000) ^ ((0x11110000 |
 ;            0x0000FF00) ^ 0x00F00000)                            = 0x00F0FF00
 ; group: 32,1,1
 ; Run: vk_compute_test cs_w32_pk_rel_ext.spv 1 dump -> out[0..7] = 4294901763 2147483646 1114130 65536 261 258 515 15793920
@@ -41,6 +42,7 @@ s_mov_b32 s22, 0x202
 s_mov_b32 s23, 0x203
 s_mov_b32 m0, 3
 s_movrels_b32 s30, s20
+v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v16, 0x40
 v_mov_b32_e32 v18, 0
 v_mov_b32_e32 v19, 0x11110000
@@ -56,7 +58,6 @@ s_waitcnt lgkmcnt(0)
 ds_read_b64 v[24:25], v16
 s_waitcnt lgkmcnt(0)
 v_xor_b32_e32 v7, v23, v25
-v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v26, 0
 buffer_store_dword v3, v26, s[0:3], 0 offen
 v_mov_b32_e32 v26, 4
