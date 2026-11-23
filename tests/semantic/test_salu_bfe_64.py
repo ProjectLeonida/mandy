@@ -767,10 +767,12 @@ class PipelineAndEmissionTests(unittest.TestCase):
         self.assertIn("OpISub %uint", emitted)
         self.assertIn("OpULessThan %bool", emitted)
         self.assertIn("OpSelect %uint", emitted)
-        self.assertIn("OpShiftRightLogical %ulong", emitted)
+        self.assertIn("OpShiftRightLogical %uint", emitted)
         self.assertIn("OpBitwiseOr %uint", emitted)
         self.assertIn("OpStore %scc", emitted)
-        self.assertTrue(g.uses_psb)
+        # 2x32-bit lowering (SHADER-930): no 64-bit integer type, so no Int64 capability.
+        self.assertNotIn("long", emitted)
+        self.assertFalse(g.uses_psb)
 
     def test_rdna2spirv_emission_i64(self) -> None:
         g = rdna2spirv.Gen("ps")
@@ -786,10 +788,11 @@ class PipelineAndEmissionTests(unittest.TestCase):
         g.insn(ins)
         emitted = "\n".join(g.body)
 
-        self.assertIn("OpBitcast %long", emitted)
-        self.assertIn("OpShiftRightArithmetic %long", emitted)
-        self.assertIn("OpBitcast %ulong", emitted)
+        self.assertIn("OpBitFieldSExtract %int", emitted)
+        self.assertIn("OpShiftRightArithmetic %int", emitted)
         self.assertIn("OpStore %scc", emitted)
+        self.assertNotIn("long", emitted)
+        self.assertFalse(g.uses_psb)
 
     def test_rdna2spirv_rejects_invalid_operands(self) -> None:
         # Non-sgpr destination

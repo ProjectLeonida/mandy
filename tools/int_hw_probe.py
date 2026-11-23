@@ -299,6 +299,31 @@ def build_cases():
                      ["s_mov_b32 s4, 0xffffffff", "s_mov_b32 s5, 0xffffffff"],
                      "s_flbit_i32_i64 s6, s[4:5]", "-1 -> -1, SCC kept"),
     ]
+    # SHADER-930: the dword edges of the 2x32-bit s_bfe_*64 lowering (X = 0xf0e1d2c3_89abcdef), and flbit counts
+    # that run from the high dword into the low one. Same cases as runtime/test/shaders/cs_w32_salu64_bfe/_bits.asm.
+    x64 = ["s_mov_b32 s4, 0x89abcdef", "s_mov_b32 s5, 0xf0e1d2c3"]
+    for op, ctl, scc_in, note in (
+            ("s_bfe_u64", 0x400000, 0, "off=0 width=64: both dwords whole, SCC=1"),
+            ("s_bfe_u64", 0x200021, 0, "off=33 width=32 cut to 31: X.hi >> 1"),
+            ("s_bfe_u64", 0x240004, 0, "off=4 width=36: 4 bits in the high dword"),
+            ("s_bfe_u64", 0xff80ffc5, 1, "width=0 with S1[31:23] and S1[15:6] set: 0, SCC=0"),
+            ("s_bfe_i64", 0x7f0001, 0, "off=1 width=127 cut to 63: X >> 1 arithmetic"),
+            ("s_bfe_i64", 0x200008, 0, "off=8 width=32: 0xc389abcd, its sign fills the high dword"),
+            ("s_bfe_i64", 0x210020, 0, "off=32 width=33 cut to 32: X.hi, sign-extended"),
+            ("s_bfe_i64", 0x10003f, 0, "off=63 width=1: bit 63 set -> -1")):
+        cases.append(_salu64_case("salu_64_data", f"{op}_edge_{ctl:08x}", [*x64, f"s_mov_b32 s8, {ctl:#x}"],
+                                  f"{op} s[6:7], s[4:5], s8", scc_in, note))
+    cases += [
+        _salu64_case("salu_64_data", "s_bfe_u64_hi_zero_field",
+                     ["s_mov_b32 s4, 0xffffffff", "s_mov_b32 s5, 0", "s_mov_b32 s8, 0x200020"],
+                     "s_bfe_u64 s[6:7], s[4:5], s8", 1, "off=32 width=32 of 0x00000000_ffffffff: 0, SCC=0"),
+        _salu32_pair("salu_64_data", "s_flbit_i32_b64_one",
+                     ["s_mov_b32 s4, 1", "s_mov_b32 s5, 0"],
+                     "s_flbit_i32_b64 s6, s[4:5]", "bit 0 only -> 63, SCC kept"),
+        _salu32_pair("salu_64_data", "s_flbit_i32_i64_into_lo",
+                     ["s_mov_b32 s4, 0x7fffffff", "s_mov_b32 s5, 0xffffffff"],
+                     "s_flbit_i32_i64 s6, s[4:5]", "0xffffffff_7fffffff -> 32 (bit 31 unlike the sign), SCC kept"),
+    ]
 
     # 7. s_quadmask_b32/b64, s_bitreplicate_b64_b32
     cases += [
