@@ -1653,6 +1653,13 @@ bool rgba8_any_order(DXGI_FORMAT format) {
     }
 }
 
+bool is_srgb_format(DXGI_FORMAT format) {
+    return format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+           format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB || format == DXGI_FORMAT_BC1_UNORM_SRGB ||
+           format == DXGI_FORMAT_BC2_UNORM_SRGB || format == DXGI_FORMAT_BC3_UNORM_SRGB ||
+           format == DXGI_FORMAT_BC7_UNORM_SRGB;
+}
+
 // The full mip chain's length for a texture this size.
 UINT16 full_mips(UINT64 width, UINT height, UINT depth) {
     UINT16 mips = 0;
@@ -12671,10 +12678,13 @@ public:
         // aligned with room for its 4 bytes; with no counter resource the offset is 0.
         if (counter || desc->Buffer.CounterOffsetInBytes) {
             const Resource* c = counter ? Resource::from<Resource>(counter) : nullptr;
-            const bool valid = c && !c->image() && desc->Format == DXGI_FORMAT_UNKNOWN &&
+            const bool structured_uav =
+                desc->Format == DXGI_FORMAT_UNKNOWN && !(desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW);
+            const bool valid = c && !c->image() && structured_uav &&
                                (c->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
                                !(desc->Buffer.CounterOffsetInBytes % D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT) &&
-                               UINT64(desc->Buffer.CounterOffsetInBytes) + 4 <= c->desc().Width;
+                               desc->Buffer.CounterOffsetInBytes <= c->desc().Width &&
+                               c->desc().Width - desc->Buffer.CounterOffsetInBytes >= 4;
             if (!valid) {
                 log_once("unordered-access view counter refused (a structured view, a buffer that allows unordered "
                          "access, a 4096-aligned offset inside it); offset",
@@ -12697,16 +12707,29 @@ public:
         namespace g = leonida::gfx10;
         if (!va || !desc || desc->ViewDimension != D3D12_UAV_DIMENSION_BUFFER) return false;
         const D3D12_BUFFER_UAV& view = desc->Buffer;
-        const bool structured = desc->Format == DXGI_FORMAT_UNKNOWN;
-        const bool raw = desc->Format == DXGI_FORMAT_R32_TYPELESS && (view.Flags & D3D12_BUFFER_UAV_FLAG_RAW);
+        if (view.Flags & ~D3D12_BUFFER_UAV_FLAG_RAW) {
+            log_once("unordered-access view of a buffer with unsupported flags:", int(view.Flags));
+            return false;
+        }
+        const bool raw_flag = (view.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0;
+        const bool structured = desc->Format == DXGI_FORMAT_UNKNOWN && !raw_flag;
+        const bool raw = desc->Format == DXGI_FORMAT_R32_TYPELESS && raw_flag;
+        if (raw_flag && !raw) {
+            log_once("raw buffer unordered-access view requires DXGI_FORMAT_R32_TYPELESS; format", int(desc->Format));
+            return false;
+        }
         const bool typed = !structured && !raw;
+        if (!structured && view.StructureByteStride != 0) {
+            log_once("non-structured buffer unordered-access view requires StructureByteStride 0; stride",
+                     int(view.StructureByteStride));
+            return false;
+        }
         std::uint32_t format_code = 0, element_bytes = 0;
         g::Swizzle channels = g::identity_swizzle;
         if (typed) {
             // D3D12: a typed view has no RAW flag; its format is one of the typed-UAV formats the layer can name.
             const Format mapped = vulkan_format(desc->Format, false);
-            const auto* layout = mapped.format != VK_FORMAT_UNDEFINED && !mapped.typeless && !mapped.rgb96 &&
-                                         !(view.Flags & D3D12_BUFFER_UAV_FLAG_RAW)
+            const auto* layout = mapped.format != VK_FORMAT_UNDEFINED && !mapped.typeless && !mapped.rgb96
                                      ? leonida::uav_clear::layout(mapped.format)
                                      : nullptr;
             format_code = layout ? g::format_from_vulkan(mapped.format) : 0;
@@ -12718,8 +12741,9 @@ public:
             channels = g::format_swizzle(mapped.format);
         }
         const UINT64 unit = structured ? view.StructureByteStride : typed ? element_bytes : 4;
-        if (!unit || unit > 0x3fff || view.FirstElement > width / unit ||
-            (UINT64(view.FirstElement) + view.NumElements) > width / unit ||
+        const UINT64 max_elements = unit ? width / unit : 0;
+        if (!unit || unit > 0x3fff || !view.NumElements || view.FirstElement > max_elements ||
+            view.NumElements > max_elements - view.FirstElement ||
             UINT64(view.NumElements) * (structured || typed ? 1 : 4) > ~0u) {
             log_once("unordered-access view of a buffer outside the resource or with a bad stride; elements",
                      int(view.NumElements));
@@ -12774,17 +12798,21 @@ public:
                      int(r->desc().Flags));
             return;
         }
+        const D3D12_RESOURCE_DESC& rd = r->desc();
+        if (rd.SampleDesc.Count > 1) {
+            log_once("unordered-access view not supported on multisampled textures; samples", int(rd.SampleDesc.Count));
+            return;
+        }
         TextureView view{};
         view.mip_count = 1;
         namespace g = leonida::gfx10;
         if (!desc) {
-            const auto& shape = r->desc();
-            if (shape.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+            if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
                 view.type = g::ImageType::image_3d;
-            else if (shape.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
-                view.type = shape.DepthOrArraySize > 1 ? g::ImageType::image_1d_array : g::ImageType::image_1d;
+            else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+                view.type = rd.DepthOrArraySize > 1 ? g::ImageType::image_1d_array : g::ImageType::image_1d;
                 if (view.type == g::ImageType::image_1d) view.layer_count = 1;
-            } else if (shape.DepthOrArraySize > 1)
+            } else if (rd.DepthOrArraySize > 1)
                 view.type = g::ImageType::image_2d_array;
         } else {
             view.format = desc->Format;
@@ -12845,13 +12873,44 @@ public:
             write_image_descriptor(*storage, view, destination, ImageViewUse::depth_stencil_uav);
             return;
         }
-        // B8G8R8X8 has no typed UAV, so no format of its family gives an unordered-access view.
-        if (alpha_unused(r->desc().Format) || alpha_unused(view.format)) {
-            log_once("unordered-access view of a B8G8R8X8 format; format", int(view.format));
+        // D3D12 forbids typeless, sRGB, depth-stencil, block-compressed, 96-bit, and B8G8R8X8 texture UAVs.
+        const DXGI_FORMAT effective_format = (desc && desc->Format != DXGI_FORMAT_UNKNOWN) ? desc->Format : rd.Format;
+        if (alpha_unused(rd.Format) || alpha_unused(effective_format)) {
+            log_once("unordered-access view of a B8G8R8X8 format; format", int(effective_format));
             return;
         }
-        write_image_descriptor(*r, view, destination, ImageViewUse::storage);
-        state_.context->note_shader_image(r->id());
+        const Format fmt = texture_storage_format(effective_format, false);
+        const leonida::BlockFormat bf = footprint_block(fmt, VK_IMAGE_ASPECT_COLOR_BIT);
+        if (fmt.format == VK_FORMAT_UNDEFINED || fmt.typeless || is_srgb_format(effective_format) ||
+            !(fmt.aspects & VK_IMAGE_ASPECT_COLOR_BIT) || r->aspects() != VK_IMAGE_ASPECT_COLOR_BIT ||
+            fmt.rgb96 || bf.block != 1) {
+            log_once("unordered-access view texture format not supported; format", int(effective_format));
+            return;
+        }
+        if (desc) {
+            if (desc->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE1D) {
+                if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || desc->Texture1D.MipSlice >= rd.MipLevels) {
+                    log_once("invalid Texture1D unordered-access view; mip", int(desc->Texture1D.MipSlice));
+                    return;
+                }
+            } else if (desc->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D) {
+                if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc->Texture2D.MipSlice >= rd.MipLevels ||
+                    desc->Texture2D.PlaneSlice != 0) {
+                    log_once("invalid Texture2D unordered-access view; mip", int(desc->Texture2D.MipSlice));
+                    return;
+                }
+            } else if (desc->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY) {
+                const auto& arr = desc->Texture2DArray;
+                if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || arr.MipSlice >= rd.MipLevels ||
+                    arr.PlaneSlice != 0 || arr.FirstArraySlice >= rd.DepthOrArraySize || arr.ArraySize == 0 ||
+                    (arr.ArraySize != UINT_MAX && arr.ArraySize > UINT(rd.DepthOrArraySize) - arr.FirstArraySlice)) {
+                    log_once("invalid Texture2DArray unordered-access view; array size", int(arr.ArraySize));
+                    return;
+                }
+            }
+        }
+        if (write_image_descriptor(*r, view, destination, ImageViewUse::storage))
+            state_.context->note_shader_image(r->id());
     }
 
     // A sampler is an S# in the first 16 bytes of the slot; the shader finds the sampler by those four dwords.
@@ -14791,8 +14850,8 @@ private:
     enum class ImageViewUse { sampled, storage, depth_stencil_uav };
 
     // Writes the view's T# into the slot and makes sure set 0 and the hash table know it. A view that cannot be
-    // shown leaves the slot a null descriptor.
-    void write_image_descriptor(const Resource& resource, const TextureView& view,
+    // shown leaves the slot a null descriptor and returns false.
+    bool write_image_descriptor(const Resource& resource, const TextureView& view,
                                 D3D12_CPU_DESCRIPTOR_HANDLE destination, ImageViewUse use) {
         const bool storage = use != ImageViewUse::sampled;
         const bool storage_plane = use == ImageViewUse::depth_stencil_uav;
@@ -14801,7 +14860,7 @@ private:
         VkFormat view_format{};
         DeviceState::VolumeSlices slices{};
         if (!image_descriptor(resource, view, storage, image, view_format, slices)) {
-            return;
+            return false;
         }
         const bool sampled = view.type != g::ImageType::image_1d_array &&
                              !(resource.desc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
@@ -14812,12 +14871,12 @@ private:
         if (storage) {
             if (!state_.storage_usable(storage_format)) {
                 log_once("texture view format does not support storage images:", storage_format);
-                return;
+                return false;
             }
             if (new_uav && state_.info.robust_image_access) {
                 if (sampled && !state_.sampled_usable(view_format)) {
                     log_once("texture view format does not support sampled access:", view_format);
-                    return;
+                    return false;
                 }
                 // All three dimensions use Unknown-format storage writes and can use Unknown-format reads
                 // (image_load glc, or any image_load on a 1D array). Check the actual storage view's format.
@@ -14827,14 +14886,14 @@ private:
                                               VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
                     if ((state_.optimal_features(storage_format) & required) != required) {
                         log_once("texture view format lacks the required formatless storage image access:", storage_format);
-                        return;
+                        return false;
                     }
                 }
             }
         }
         if (slices.count && !(state_.info.sliced_3d_uav && state_.info.robust_image_access)) {
             log_once("partial Texture3D UAV requires imageSlicedViewOf3D and robustImageAccess; mip", view.first_mip);
-            return;
+            return false;
         }
         g::ImageWords words = g::encode(image);
         if (storage && view.type == g::ImageType::image_3d) {
@@ -14858,19 +14917,20 @@ private:
                 !g::multisampled(image.type)) {
                 state_.remember_sample(words,{const_cast<Resource*>(&resource),image,view_format,channels_format});
                 std::memcpy(reinterpret_cast<void*>(destination.ptr),words.data(),sizeof(words));
-                return;
+                return true;
             }
             const auto bound = const_cast<Resource&>(resource).bound_image();
-            if (!bound) { log_once("unable to make a placed shader image resident; format", int(resource.desc().Format)); return; }
+            if (!bound) { log_once("unable to make a placed shader image resident; format", int(resource.desc().Format)); return false; }
             const bool registered = state_.bind_image(words, image, bound, view_format,
                                                        channels_format, storage_format, resource.aspects(),
                                                        sampled, storage, slices);
             if (registered && (resource.sparse_image() || storage_plane)) state_.context->note_shader_image(resource.id());
-            if (!registered && (g::multisampled(image.type) || storage_plane)) return;
+            if (!registered && (g::multisampled(image.type) || storage_plane)) return false;
         }
         // The CPU UAV used by ClearUnorderedAccessView is independent of set 0.
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
         resource.note_shader_view();
+        return true;
     }
 
     // Validation shared by CreateCommittedResource and CreateCommittedResource3; internal callers pass null `method`
