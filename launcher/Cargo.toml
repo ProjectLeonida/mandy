@@ -1,0 +1,56 @@
+[package]
+name = "leonida-launcher"
+description = "A small desktop launcher for Leonida: check your copy, build the port, start the loader"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+# The launcher is under the repository's licence; its bundled fonts (fonts/) under the SIL Open
+# Font License.
+license = "GPL-3.0-or-later AND OFL-1.1"
+publish = false
+default-run = "leonida-launcher"
+
+[lib]
+name = "leonida_launcher"
+path = "src/lib.rs"
+
+[[bin]]
+name = "leonida-launcher"
+path = "src/main.rs"
+
+[dependencies]
+# Stock iced 0.14 from crates.io with its default features (wgpu and tiny-skia renderers, X11 and
+# Wayland); advanced for the ported widgets, image for the logo, canvas for the window icons.
+iced = { version = "0.14", features = ["advanced", "image", "canvas"] }
+# iced's wgpu renderer, at iced's exact version, for the one custom primitive (shape.rs: the
+# window's rounded corners and the close button's cross) through its public primitive API.
+iced_wgpu = "=0.14.0"
+# Grapheme clusters: a label's letters, spaced out, and the text field's caret steps.
+unicode-segmentation = "1"
+# The Play page's scene: its shore and palms, filled as anti-aliased paths. The version iced's
+# software renderer already uses, so nothing new is compiled.
+tiny-skia = { version = "0.11", default-features = false, features = ["std"] }
+# The native folder picker: the Windows dialog, and on Linux the desktop portal (X11 and Wayland).
+rfd = "0.15"
+# The platform's per-user configuration folder.
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Draws a view offscreen, as a window would, for the screenshot and keyboard tests.
+iced_runtime = "=0.14.0"
+png = "0.18"
+# The text editing rules' property tests (src/ui/edit.rs).
+proptest = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
