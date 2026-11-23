@@ -5769,14 +5769,14 @@ class Gen:
         after write, on the same memory) waits for the next round, whose barrier orders the memory. A scalar load
         (s_load / s_buffer_load) is a read of the same memory as the vector ops: on hardware every lane's earlier
         store is done before the wave issues it, but here the other half could load before this half has stored
-        (#1587: valu_fuzz --family mem --emulate, lanes 32-63 read the fill pattern). Not ordered: sampling an
-        image the wave wrote."""
+        (#1587: valu_fuzz --family mem --emulate, lanes 32-63 read the fill pattern). Image samples, gathers, and
+        BVH ray-intersection reads also count as memory reads so they order against earlier/later stores."""
         if op in ("ds_swizzle_b32", "ds_bpermute_b32", "ds_permute_b32", "ds_nop"):
             return
         if op.startswith("ds_"):
             kind = "lds"
         elif op.startswith(("buffer_", "tbuffer_", "global_", "flat_", "image_load", "image_store", "image_atomic",
-                            "s_load_", "s_buffer_load_")):
+                            "image_sample", "image_gather4", "image_bvh", "s_load_", "s_buffer_load_")):
             kind = "mem"
         else:
             return
