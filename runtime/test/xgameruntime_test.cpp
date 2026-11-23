@@ -266,8 +266,9 @@ void check_measured_classes(QueryFn query, XSystemAnalyticsInfo (*named_analytic
 }
 
 // xgameruntime.lib's thunks don't import the runtime: they LoadLibraryW(L"xgameruntime.dll") and GetProcAddress five
-// entry points and XErrorReport (measured in the package's libHttpClient.GDK.dll and XCurl.dll). Drive that path
-// through the loader shims, bound by the api set XCurl.dll imports them from, as a mapped image would be.
+// names (measured in the package's libHttpClient.GDK.dll and XCurl.dll), and its XGameRuntimeInitialize a sixth,
+// XErrorReport, without which it refuses to initialise. Drive that path through the loader shims,
+// bound by the api set XCurl.dll imports them from, as a mapped image would be.
 void check_run_time_load() {
     using LoadW = HMODULE(WINAPI*)(LPCWSTR);
     using LoadExA = HMODULE(WINAPI*)(LPCSTR, HANDLE, DWORD);
@@ -436,6 +437,13 @@ void check_run_time_load() {
         const HRESULT reported = reinterpret_cast<Report>(slot(e, 3))(e, E_FAIL, "offline test");
         check(reported == S_OK && seen.hr == E_FAIL && std::strcmp(seen.msg, "offline test") == 0,
               "slot 3 is XErrorReport and reaches the callback slot 4 (XErrorSetCallback) set");
+        // The DLL export XGameRuntimeInitialize looks up: XErrorReport(HRESULT, const char*), two arguments, no `this`.
+        using ReportExport = HRESULT(WINAPI*)(HRESULT, const char*);
+        auto report_export = reinterpret_cast<ReportExport>(get_proc(rt_mod, "XErrorReport"));
+        seen = {};
+        check(report_export && report_export(E_OUTOFMEMORY, "export test") == S_OK && seen.hr == E_OUTOFMEMORY &&
+                  std::strcmp(seen.msg, "export test") == 0,
+              "the XErrorReport export takes (HRESULT, const char*) and reaches the same callback");
         reinterpret_cast<SetCallback>(slot(e, 4))(e, nullptr, nullptr);
         using SetOptions = void(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);  // void, per Microsoft's page
         reinterpret_cast<SetOptions>(slot(e, 5))(e, 0x01, 0x00);  // OutputDebugStringOnError / None
