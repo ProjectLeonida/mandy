@@ -16456,8 +16456,12 @@ def assemble(gen):
                        f"%bcp{k} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(r)}", f"OpStore %bcp{k} %bcu{k}"]
                 continue
             if c == "front":
-                fn += ["%ff = OpLoad %bool %front_facing", "%ffm1 = OpFNegate %float %f1",
-                       "%ffv = OpSelect %float %ff %f1 %ffm1", "%ffu = OpBitcast %uint %ffv",
+                # The mask form, 0xffffffff front / 0 back (SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS = 1, #5123): every
+                # one of the corpus's 345 PS that reads FRONT_FACE tests it as an integer against 0 (344
+                # v_cmp_ne_u32, 1 v_cmp_eq_u32; SHADER-892), which the float form (+1.0 / -1.0, both non-zero)
+                # would call front for every face.
+                fn += ["%ff = OpLoad %bool %front_facing",
+                       f"%ffu = OpSelect %uint %ff {gen.cu(0xFFFFFFFF)} {gen.cu(0)}",
                        f"%ffp = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(r)}", "OpStore %ffp %ffu"]
                 continue
             fn += [f"%fc{c} = OpCompositeExtract %float %fc {c}", f"%fcu{c} = OpBitcast %uint %fc{c}",
@@ -18083,8 +18087,8 @@ def translate(path):
         # lowers nir_intrinsic_load_frag_coord_w_rcp straight to frag_pos[3]. That's the same value as Vulkan's
         # FragCoord.w, so all four components map directly.
         # Hardware order (Mesa src/amd/vulkan/radv_shader_args.c): barycentric pairs, ..., POS_X/Y/Z/W, FRONT_FACE,
-        # ANCILLARY, SAMPLE_COVERAGE, POS_FIXED_PT. Only enabled inputs are packed. Front face is a float whose
-        # sign gives facing (Mesa: load_front_face = front_face > 0; load_front_face_fsign = the raw value).
+        # ANCILLARY, SAMPLE_COVERAGE, POS_FIXED_PT. Only enabled inputs are packed. Front face holds 0xffffffff
+        # (front) / 0 (back), the form the game's shaders test (SHADER-892; Mesa's float form is +1.0 / -1.0).
         layout = {}
         nxt = 2
         for c in range(4):
