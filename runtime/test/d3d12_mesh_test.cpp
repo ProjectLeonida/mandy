@@ -116,6 +116,7 @@ int main(int argc, char** argv) {
     // The same mesh shader listed without "root_window": one translated before the graphics root window (D3D-448).
     const auto ms_old_program = fssm_program({0x4d530002, 0xbf810000});
     const auto ps_program = fssm_program({0x50530001, 0xbf810000});
+    const auto ps_offset_program = fssm_program({0x50530002, 0xbf810000});  // index entry with needs_maintenance8
     const auto vs_program = fssm_program({0x56530002, 0xbf810000});
     auto ms_container = shader_container(ms_program);
     auto ms_old_container = shader_container(ms_old_program);
@@ -129,6 +130,7 @@ int main(int argc, char** argv) {
     std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_old.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_offset.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_VS_FULLSCREEN_SPV, library / "vs_fullscreen.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
@@ -142,7 +144,9 @@ int main(int argc, char** argv) {
                  " \"vs_fullscreen\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": []},\n"
                  " \"ps_draw\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
-              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]}}";
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]},\n"
+                 " \"ps_offset\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_offset_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], \"needs_maintenance8\": true}}";
     }
 
     const auto device_info = [&](bool mesh) {
@@ -222,6 +226,22 @@ int main(int argc, char** argv) {
         const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
         Ref<ID3D12CommandSignature> sig;
         EXPECT(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&sig.p)) == E_NOTIMPL && !sig.p);
+        // A pixel shader whose index entry says needs_maintenance8 (a texel offset outside a gather) is refused on a
+        // device that did not enable VK_KHR_maintenance8 (this one: device_info() leaves it off); the same VS + PS
+        // pipeline with an entry without the flag is created.
+        const auto ps_offset_container = shader_container(ps_offset_program);
+        const D3D12_SHADER_BYTECODE ps_offset{ps_offset_container.data(), ps_offset_container.size()};
+        Stream needs8, plain;
+        needs8.add(RootSubobject{.inner = root.p}).add(VsSubobject{.inner = vs}).add(PsSubobject{.inner = ps_offset});
+        needs8.add(TopologySubobject{.inner = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE});
+        needs8.add(TargetsSubobject{.inner = one_target()});
+        plain.add(RootSubobject{.inner = root.p}).add(VsSubobject{.inner = vs}).add(PsSubobject{.inner = ps});
+        plain.add(TopologySubobject{.inner = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE});
+        plain.add(TargetsSubobject{.inner = one_target()});
+        Ref<ID3D12PipelineState> refused, created;
+        EXPECT(create(device.p, needs8, refused) == E_NOTIMPL && !refused.p);
+        EXPECT(SUCCEEDED(create(device.p, plain, created)) && created.p);
+        created.reset();
         root.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }

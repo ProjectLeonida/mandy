@@ -7346,6 +7346,13 @@ public:
                 log_once("shader bytecode holds no FSSM or FSPX program; bytes", int(stage.code.BytecodeLength));
                 return E_INVALIDARG;
             }
+            if (stage.entry->needs_maintenance8 && !device_.info.maintenance8) {
+                // A texel offset outside a gather is invalid SPIR-V for Vulkan without VK_KHR_maintenance8; refuse
+                // it here, with the reason, instead of handing the driver a module it may reject or miscompile.
+                std::fprintf(stderr, "[rt] d3d12: %s samples with a texel offset; the device has no VK_KHR_maintenance8\n",
+                             stage.entry->name.c_str());
+                return E_NOTIMPL;
+            }
             if (stage.entry->binding_count) {
                 if (!device_.bindless) {
                     std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
@@ -7937,6 +7944,11 @@ public:
             return stream_unsupported("compute shader requires a bindless descriptor set");
         }
         if (entry->binding_count) register_literal_samplers(device_, *entry);
+        if (entry->needs_maintenance8 && !device_.info.maintenance8) {
+            std::fprintf(stderr, "[rt] d3d12: %s samples with a texel offset; the device has no VK_KHR_maintenance8\n",
+                         entry->name.c_str());
+            return E_NOTIMPL;
+        }
         // SHADER-309: a module over the device's maxComputeSharedMemorySize is invalid usage that spirv-val accepts
         // and RADV dies on (#1721); some drivers report 32768. Refuse it here instead of creating the pipeline.
         if (entry->lds_bytes) {
