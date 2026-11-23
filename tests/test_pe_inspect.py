@@ -1154,6 +1154,21 @@ class TestPdataStructured(unittest.TestCase):
         self.assertEqual(p24["entry_count"], 2)
         self.assertEqual(p24["trailing_bytes"], 0)
 
+    def test_pdata_unwind_data_near_size_of_image_boundary_out_of_bounds(self):
+        """UnwindData within 4 bytes of SizeOfImage (e.g. SizeOfImage - 2) requires min 4-byte header -> out_of_bounds."""
+        buf = bytearray(build_image())
+        img = pe_inspect.PeImage(bytes(buf))
+        # Begin and End in range [0x1000, 0x1040), but UnwindData at size_of_image - 2
+        bad_unwind = img.size_of_image - 2
+        entries = struct.pack("<III", 0x1000, 0x1040, bad_unwind)
+        dirs_at = 0x58 + 112
+        struct.pack_into("<II", buf, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1800, 12)
+        place(buf, 0x1800, entries)
+        p = self.inspect_buf(bytes(buf))
+        self.assertFalse(p["valid"])
+        self.assertEqual(p["out_of_bounds_count"], 1)
+        self.assertTrue(any(e["reason"] == "out_of_bounds" for e in p["sample_errors"]))
+
     def test_arm64_pdata_eight_byte_entries(self):
         """ARM64 (0xAA64) .pdata uses 8-byte entries and format='arm64'."""
         buf = bytearray(build_image())
