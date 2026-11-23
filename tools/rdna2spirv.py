@@ -14493,8 +14493,11 @@ class Gen:
             self.image_store(a, mods, dim)
             return
         if op == "image_load_mip":
-            if "glc" in mods:
-                raise Unsupported("image_load_mip glc")  # the coherent storage view has only one mip
+            coherent_mip = "glc" in mods
+            if coherent_mip and (dim != "dim:SQ_RSRC_IMG_2D" or "tfe" in mods or "lwe" in mods):
+                # Only the plain 2D form lowers (image_load_mip_coherent); the other dims and the
+                # status forms have no coherent read modelled.
+                raise Unsupported("image_load_mip glc " + dim.split("SQ_RSRC_IMG_")[-1])
             # x, y[, z], mip. All sampled aliases fetch that LOD; only a tagged volume UAV restricts it to zero.
             is3d = dim == "dim:SQ_RSRC_IMG_3D"
             ncoord = 3 if is3d else 2
@@ -14509,7 +14512,19 @@ class Gen:
             if len(addr) < words:
                 raise Unsupported("image_load_mip coords")
             idx = self.desc_lookup_sgpr(a[2], 8)
-            ip, img, iv = self.tmp(), self.tmp(), self.tmp()
+            iv = self.tmp()
+            raw = [self.load_reg("vgpr", r) for r in addr[:words]]
+            if packed:
+                raw = self.unpack_image_a16_uints(raw)
+            *coords, raw_lod = raw[:ncoord + 1]
+            coords = [self.as_int(c) for c in coords]
+            self.emit(f"{iv} = OpCompositeConstruct %v{ncoord}int {' '.join(coords)}")
+            dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
+            dmask = int(dm.split(":")[1], 0)
+            if coherent_mip:
+                self.image_load_mip_coherent(dim, a[2], iv, idx, dmask, vdata, raw_lod, "d16" in mods)
+                return
+            ip, img = self.tmp(), self.tmp()
             if is3d:
                 self.uses_tex_3d = True
                 self.dynamic_sampled_access(ip, "%_ptr_UC_img3", "%images_3d", idx)
@@ -14517,13 +14532,8 @@ class Gen:
             else:
                 self.dynamic_sampled_access(ip, "%_ptr_UC_img", "%images", idx)
                 self.emit(f"{img} = OpLoad %img2d {ip}")
-            raw = [self.load_reg("vgpr", r) for r in addr[:words]]
-            if packed:
-                raw = self.unpack_image_a16_uints(raw)
-            *coords, lod = [self.as_int(c) for c in raw[:ncoord + 1]]
-            self.emit(f"{iv} = OpCompositeConstruct %v{ncoord}int {' '.join(coords)}")
-            dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
-            self.image_load_typed(dim, a[2], iv, img, idx, int(dm.split(":")[1], 0), vdata,
+            lod = self.as_int(raw_lod)
+            self.image_load_typed(dim, a[2], iv, img, idx, dmask, vdata,
                                   lod=lod, d16="d16" in mods)
             return
         if ((dim != "dim:SQ_RSRC_IMG_2D" and not (is3d_atomic or array_query))
@@ -14603,16 +14613,17 @@ class Gen:
             self.emit(f"{end} = OpLabel")
             return
         ip, img = self.tmp(), self.tmp()
+        coherent_mip = op == "image_load_mip" and "glc" in mods     # reads the storage view, not the sampled one
         if array_query:
             self.uses_tex_array = True
             self.dynamic_sampled_access(ip, "%_ptr_UC_imga", "%images_arr", idx)
             self.emit(f"{img} = OpLoad %img2da {ip}")
-        else:
+        elif not coherent_mip:
             self.dynamic_sampled_access(ip, "%_ptr_UC_img", "%images", idx)
             self.emit(f"{img} = OpLoad %img2d {ip}")
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
         dmask = int(dm.split(":")[1], 0)
-        self.uses_query = True
+        self.uses_query = self.uses_query or not coherent_mip
         if op == "image_get_resinfo":
             vals = self.resinfo_words(img, self.load_reg("vgpr", addr[0]), array_query,
                                       self.load_reg("sgpr", a[2]["r"] + 3))
@@ -14624,6 +14635,24 @@ class Gen:
                     self.dst({"k": "vgpr", "r": vdata["r"] + out, "n": 1}, u)
                     out += 1
             return
+    def image_load_mip_coherent(self, dim, tsharp, iv, idx, dmask, vdata, mip, d16):
+        """image_load_mip with glc. The coherent read goes through the storage view the stores write
+        (image_load_coherent), and that view is one level: the level the T# selects, which is what mip 0 means.
+        A mip past the view's last level reads as zero on hardware (out-of-range image_load_mip), so the read
+        is taken for mip 0 and every other mip writes zeros to the result registers."""
+        is_zero, hit, miss, end = self.tmp(), self.tmp() + "_mip0", self.tmp() + "_mipN", self.tmp() + "_mipend"
+        self.emit(f"{is_zero} = OpIEqual %bool {mip} {self.cu(0)}")
+        self.emit(f"OpSelectionMerge {end} None")
+        self.emit(f"OpBranchConditional {is_zero} {hit} {miss}")
+        self.emit(f"{hit} = OpLabel")
+        self.image_load_coherent(dim, tsharp, iv, idx, dmask, vdata, d16)
+        self.emit(f"OpBranch {end}")
+        self.emit(f"{miss} = OpLabel")
+        n = bin(dmask & 0xF).count("1")
+        for k in range((n + 1) // 2 if d16 else n):
+            self.dst({"k": "vgpr", "r": vdata["r"] + k, "n": 1}, self.cu(0))
+        self.emit(f"OpBranch {end}")
+        self.emit(f"{end} = OpLabel")
 
     def interp_pair_src(self, op, a, ins):
         """SHADER-177: the VGPR source of a v_interp_p1/p2 is the barycentric coordinate that op interpolates
