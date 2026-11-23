@@ -1115,6 +1115,45 @@ class TestPdataStructured(unittest.TestCase):
         finally:
             os.unlink(tmp_path)
 
+    def test_pdata_boundary_partial_tail_passes_while_truncated_entry_fails(self):
+        """Boundary at 0x2000 (RVA 0x1ff4): size 12 and 20 are valid; size 24 is truncated (valid=False)."""
+        raw_base = bytearray(build_image(with_directories=False))
+        dirs_at = 0x58 + 112
+        entry = struct.pack("<III", 0x1000, 0x1040, 0x1A00)
+
+        # Size 12: exactly 1 entry ends at 0x2000 -> valid=True, truncated=False
+        b12 = bytearray(raw_base)
+        struct.pack_into("<II", b12, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1FF4, 12)
+        place(b12, 0x1FF4, entry)
+        p12 = self.inspect_buf(bytes(b12))
+        self.assertTrue(p12["valid"])
+        self.assertFalse(p12["truncated"])
+        self.assertEqual(p12["parsed_count"], 1)
+        self.assertEqual(p12["entry_count"], 1)
+        self.assertEqual(p12["trailing_bytes"], 0)
+
+        # Size 20: 1 complete entry ends at 0x2000 + 8-byte partial tail past mapped boundary -> valid=True (loader parity)
+        b20 = bytearray(raw_base)
+        struct.pack_into("<II", b20, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1FF4, 20)
+        place(b20, 0x1FF4, entry)
+        p20 = self.inspect_buf(bytes(b20))
+        self.assertTrue(p20["valid"])
+        self.assertFalse(p20["truncated"])
+        self.assertEqual(p20["parsed_count"], 1)
+        self.assertEqual(p20["entry_count"], 1)
+        self.assertEqual(p20["trailing_bytes"], 8)
+
+        # Size 24: 2 complete entries declared, second entry missing/truncated past boundary -> valid=False, truncated=True
+        b24 = bytearray(raw_base)
+        struct.pack_into("<II", b24, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1FF4, 24)
+        place(b24, 0x1FF4, entry)
+        p24 = self.inspect_buf(bytes(b24))
+        self.assertFalse(p24["valid"])
+        self.assertTrue(p24["truncated"])
+        self.assertEqual(p24["parsed_count"], 1)
+        self.assertEqual(p24["entry_count"], 2)
+        self.assertEqual(p24["trailing_bytes"], 0)
+
     def test_arm64_pdata_eight_byte_entries(self):
         """ARM64 (0xAA64) .pdata uses 8-byte entries and format='arm64'."""
         buf = bytearray(build_image())

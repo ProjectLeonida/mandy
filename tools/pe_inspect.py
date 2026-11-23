@@ -361,7 +361,8 @@ def _inspect_pdata(img: PeImage) -> dict:
         else:
             start, end = bounds
             mapped = True
-            truncated = max(0, end - start) < size
+            needed_bytes = entry_count * entry_size
+            truncated = max(0, end - start) < needed_bytes
         return {
             "present": True,
             "rva": hex(rva),
@@ -406,8 +407,9 @@ def _inspect_pdata(img: PeImage) -> dict:
 
     start, end = bounds
     available = max(0, end - start)
-    truncated = available < size
-    can_parse = min(size, available) // 12
+    needed_bytes = entry_count * 12
+    truncated = available < needed_bytes
+    can_parse = min(needed_bytes, available) // 12
     parsed_count = can_parse
     mv = memoryview(img.data)
     pdata_view = mv[start:start + can_parse * 12]
