@@ -242,7 +242,7 @@ class WorkRootTests(unittest.TestCase):
             report_paths._WORK_ROOTS.clear()
             self.assertEqual(report_paths.work_root(path), os.path.realpath(tmp))
             self.assertIn(path, report_paths._WORK_ROOTS)
-            self.assertEqual(report_paths.work_root(path), tmp)
+            self.assertEqual(report_paths.work_root(path), os.path.realpath(tmp))
             self.assertEqual(len(report_paths._WORK_ROOTS), 1)
 
 
