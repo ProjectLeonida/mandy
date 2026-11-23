@@ -601,6 +601,11 @@ impl Launcher {
         let ended = match event {
             process::Event::Started(pid) => {
                 running.pid = Some(pid);
+                // Cancel pressed before the process said it had started had nothing to stop yet:
+                // stop it now that there is.
+                if running.cancelled {
+                    process::cancel(pid);
+                }
                 None
             }
             process::Event::Line(line) => {

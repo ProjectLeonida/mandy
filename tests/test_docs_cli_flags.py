@@ -23,10 +23,12 @@ FLAG = re.compile(r"(?<![\w-])(--[a-z][\w-]*)")
 SOURCE_SUFFIXES = (".py", ".ps1", ".cpp", ".cc", ".c", ".h", ".hpp", ".cmake", ".txt", ".cs", ".cjs", ".js", ".html",
                    ".bat", ".sh", ".yml", ".yaml", ".csproj")
 # Flags of other programs the docs quote: gh (AGENTS.md), pip (docs/shader_validation.md), argparse itself, and
-# the spirv-opt passes docs/embedded_shaders.md tried on one module.
+# the spirv-opt passes docs/embedded_shaders.md tried on one module, and cargo and Rust's test runner
+# (launcher/README.md).
 FOREIGN = {"--search", "--state", "--index-url", "--help",
            "--ssa-rewrite", "--eliminate-dead-code-aggressive", "--eliminate-dead-branches", "--merge-blocks",
-           "--cfg-cleanup", "--merge-return", "--scalar-replacement"}
+           "--cfg-cleanup", "--merge-return", "--scalar-replacement",
+           "--all-targets", "--ignored", "--nocapture"}
 # Pages that quote another project's tree (SCARAB, americas-recomp).
 OTHER_PROJECTS = {"docs/fssm_crosscheck.md", "docs/d3d12_xs_surface.md"}
 COMMAND = re.compile(r"\bpython3?(?: -I)? ((?:tools|scripts)/[\w/]+\.py|make_game\.py)\b")
