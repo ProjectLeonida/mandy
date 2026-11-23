@@ -153,6 +153,15 @@ program whose kind 0 is too short for word 4 keeps the code heuristic.
     undecodable words retain the reachable-code check. LLVM can also print the default high-half selector for
     an inline integer second source. If that selector is the only changed bit, the translator preserves the
     stored low-half replication. The hardware measurements are in `tests/semantic/test_alu_dot4_i8.py`.
+  - `tools/shader_disasm.py` (so `fspx_unpack.py --disasm` and `make_game.py`) also prints such a word directly as
+    `v_dot4_i32_i8 vD, a, b, c op_sel:[0,1,0] op_sel_hi:[1,0,1]` with its real encoding. A dword pair that llvm-mc
+    rejected, with exactly opcode 0x16, `op_sel` 2, `op_sel_hi` 5, no `clamp` and no `neg`, is decoded with the two
+    fields at their defaults and then given the fields and the encoding back, so the translator reads it and its
+    encoding check against the blob passes. Any other `op_sel`/`op_sel_hi` value, `clamp` or `neg` is still
+    undecodable (only this one was measured). A pair llvm-mc accepted, such as a literal followed by an instruction,
+    is never touched. `tests/semantic/test_fspx_dot4_op_sel_disasm.py` checks it with llvm-mc (the 5 measured
+    operand sets, and the forms that stay refused); the 89 words of the real programs are not re-run here, because
+    that needs the package's DLL.
 
 ## Kind 7: records
 
