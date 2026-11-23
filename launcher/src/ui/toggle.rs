@@ -7,9 +7,10 @@ use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{Operation, Tree, Widget, tree};
 use iced::advanced::{Clipboard, Shell, mouse, renderer};
 use iced::keyboard::{self, Key, key::Named};
-use iced::{Event, Length, Point, Rectangle, Size, touch};
+use iced::{Event, Length, Point, Rectangle, Size, touch, window};
 
-use crate::ui::tokens::{size, space, typography};
+use crate::ui::tokens::{motion, size, space, typography};
+use crate::ui::transition::Transition;
 
 use crate::ui::focus::Focus;
 use crate::ui::input;
@@ -137,6 +138,41 @@ struct State {
     words: Vec<Plain>,
     pressed: Option<usize>,
     drawn: Option<(Option<usize>, Option<usize>, bool, usize)>,
+    /// Where the chosen segment's highlight is drawn, by segment, between them as it slides or
+    /// is dragged; and the choice it was last drawn for.
+    at: f32,
+    seen: Option<usize>,
+    slide: Option<Transition>,
+    /// A press: where it began across, where the highlight was, and whether it has moved far
+    /// enough to be a drag. As a switch's knob: dragged, the highlight follows the pointer, and
+    /// the choice changes when it's let go.
+    drag: Option<(f32, f32, bool)>,
+}
+
+impl State {
+    /// The highlight slides to `segment` from where it is, or with motion reduced, jumps there.
+    fn slide_to(&mut self, segment: usize) {
+        let to = segment as f32;
+        self.slide = Transition::start(self.at, to, motion::FAST);
+        if self.slide.is_none() {
+            self.at = to;
+        }
+    }
+}
+
+/// The highlight's rectangle `at` the given place among `segments`: between two, as far between
+/// them as `at` is.
+fn highlight(segments: &[Rectangle], at: f32) -> Option<Rectangle> {
+    let last = segments.len().checked_sub(1)?;
+    let at = at.clamp(0.0, last as f32);
+    let (from, to) = (at.floor() as usize, (at.ceil() as usize).min(last));
+    let share = at - from as f32;
+    let (a, b) = (segments[from], segments[to]);
+    let mix = |x: f32, y: f32| x + (y - x) * share;
+    Some(Rectangle::new(
+        Point::new(mix(a.x, b.x), mix(a.y, b.y)),
+        Size::new(mix(a.width, b.width), mix(a.height, b.height)),
+    ))
 }
 
 impl<Message> ToggleGroup<'_, Message> {
@@ -231,7 +267,30 @@ impl<Message> Widget<Message, Theme, Renderer> for ToggleGroup<'_, Message> {
         state
             .focus
             .keep_if(self.on_choose.is_some() && !self.choices.is_empty());
+        // The highlight slides, a frame at a time.
+        if let Event::Window(window::Event::RedrawRequested(now)) = event
+            && let Some(slide) = &mut state.slide
+        {
+            let going = slide.frame(*now);
+            state.at = slide.at();
+            if going {
+                shell.request_redraw();
+            } else {
+                state.slide = None;
+            }
+        }
+        // The choice changed from outside, as Ctrl+L or a key does: the highlight slides there.
+        match state.seen {
+            None => state.at = self.chosen as f32,
+            Some(seen) if seen != self.chosen && state.drag.is_none() => {
+                state.slide_to(self.chosen);
+                shell.request_redraw();
+            }
+            Some(_) => {}
+        }
+        state.seen = Some(self.chosen);
         let over = Self::segment_at(layout, cursor);
+        let last = self.choices.len().saturating_sub(1) as f32;
         if self.on_choose.is_some() {
             match event {
                 Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
@@ -239,25 +298,63 @@ impl<Message> Widget<Message, Theme, Renderer> for ToggleGroup<'_, Message> {
                     if over.is_some() =>
                 {
                     state.pressed = over;
+                    if let Some(at) = cursor.position() {
+                        state.drag = Some((at.x, state.at, false));
+                    }
                     state.focus.click();
                     shell.capture_event();
                 }
+                Event::Mouse(mouse::Event::CursorMoved { position })
+                | Event::Touch(touch::Event::FingerMoved { position, .. }) => {
+                    if let Some((from_x, from_at, dragged)) = &mut state.drag {
+                        // Further than a slip, it drags the highlight rather than clicks.
+                        let moved = position.x - *from_x;
+                        *dragged |= moved.abs() > size::SLIP;
+                        if *dragged {
+                            let step =
+                                (layout.bounds().width / self.choices.len().max(1) as f32).max(1.0);
+                            state.slide = None;
+                            state.at = (*from_at + moved / step).clamp(0.0, last);
+                            shell.request_redraw();
+                            shell.capture_event();
+                        }
+                    }
+                }
                 Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
                 | Event::Touch(touch::Event::FingerLifted { .. }) => {
-                    // Pressed and dragged across, it's the segment let go over that's chosen.
                     if state.pressed.take().is_some() {
-                        if let Some(segment) = over {
-                            self.choose(segment, shell);
-                        }
+                        // Dragged, the nearer segment; clicked, the one let go over. The choice
+                        // changes now, as it's let go.
+                        let dragged = state.drag.take().is_some_and(|(_, _, dragged)| dragged);
+                        let segment = if dragged {
+                            state.at.round() as usize
+                        } else {
+                            over.unwrap_or(self.chosen)
+                        };
+                        state.slide_to(segment);
+                        state.seen = Some(segment);
+                        self.choose(segment, shell);
+                        shell.request_redraw();
                         shell.capture_event();
                     }
                 }
-                Event::Touch(touch::Event::FingerLost { .. }) => state.pressed = None,
+                Event::Touch(touch::Event::FingerLost { .. }) => {
+                    state.pressed = None;
+                    if state.drag.take().is_some() {
+                        state.slide_to(self.chosen);
+                        shell.request_redraw();
+                    }
+                }
                 Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. })
                     if state.focus.is_focused() && input::plain(*modifiers) =>
                 {
                     if let Some(segment) = step(self.chosen, self.choices.len(), key) {
                         state.focus.key();
+                        if segment != self.chosen {
+                            state.slide_to(segment);
+                            state.seen = Some(segment);
+                            shell.request_redraw();
+                        }
                         self.choose(segment, shell);
                         shell.capture_event();
                     }
@@ -266,6 +363,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ToggleGroup<'_, Message> {
             }
         } else {
             state.pressed = None;
+            state.drag = None;
         }
         let now = (over, state.pressed, state.focus.is_shown(), self.chosen);
         input::redraw_on_change(&mut state.drawn, now, event, shell);
@@ -294,36 +392,52 @@ impl<Message> Widget<Message, Theme, Renderer> for ToggleGroup<'_, Message> {
             },
         );
         let over = Self::segment_at(layout, cursor);
-        // While it's dragged, the chosen look follows the pointer.
-        let chosen = state.pressed.and(over).unwrap_or(self.chosen);
         let height = typography::INTERFACE.size * typography::INTERFACE.line_height;
-        let segments = layout.children().map(|segment| segment.bounds());
-        for (index, (segment, words)) in segments.zip(&state.words).enumerate() {
-            let interaction = match self.preview {
-                Some((shown, interaction, _)) if shown == index => interaction,
-                _ if disabled => Interaction::Disabled,
-                _ if state.pressed == Some(index) => Interaction::Pressed,
-                _ if over == Some(index) => Interaction::Hovered,
-                _ => Interaction::Idle,
-            };
+        let segments: Vec<Rectangle> = layout.children().map(|segment| segment.bounds()).collect();
+        let interaction = |index: usize| match self.preview {
+            Some((shown, interaction, _)) if shown == index => interaction,
+            _ if disabled => Interaction::Disabled,
+            _ if state.pressed == Some(index) => Interaction::Pressed,
+            _ if over == Some(index) => Interaction::Hovered,
+            _ => Interaction::Idle,
+        };
+        // Where the highlight is: the chosen segment's, sliding or dragged between them.
+        let at = match (self.preview, state.seen) {
+            (Some(_), _) | (None, None) => self.chosen as f32,
+            (None, Some(_)) => state.at,
+        };
+        let nearest = (at.round().max(0.0) as usize).min(segments.len().saturating_sub(1));
+        // The others first, as they look unchosen; then the highlight over them.
+        for (index, segment) in segments.iter().enumerate() {
             let look = Look {
                 radius: segment_radius,
-                ..theme.toggle_segment(index == chosen, interaction)
+                ..theme.toggle_segment(false, interaction(index))
             };
-            paint::boxed(renderer, segment, &look);
+            paint::boxed(renderer, *segment, &look);
+        }
+        let shown = highlight(&segments, at);
+        if let Some(shown) = shown {
+            let look = Look {
+                radius: segment_radius,
+                ..theme.toggle_segment(true, interaction(nearest))
+            };
+            paint::boxed(renderer, shown, &look);
+        }
+        for (index, (segment, words)) in segments.iter().zip(&state.words).enumerate() {
+            let look = theme.toggle_segment(index == nearest, interaction(index));
             let width = words.min_bounds().width;
-            let at = Point::new(
+            let place = Point::new(
                 segment.center_x() - width / 2.0,
                 segment.center_y() - height / 2.0,
             );
-            paint::fill(renderer, words, at, color(look.ink), bounds);
+            paint::fill(renderer, words, place, color(look.ink), bounds);
         }
         let focused = match self.preview {
             Some((_, _, focused)) => focused,
             None => state.focus.is_shown(),
         };
-        if focused && let Some(segment) = layout.children().nth(self.chosen) {
-            paint::outline(renderer, theme, segment.bounds(), segment_radius);
+        if focused && let Some(shown) = shown {
+            paint::outline(renderer, theme, shown, segment_radius);
         }
     }
 

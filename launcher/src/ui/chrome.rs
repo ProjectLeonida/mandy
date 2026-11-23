@@ -218,7 +218,14 @@ impl<'a, Message: Clone + 'a> From<HeaderBar<'a, Message>> for Element<'a, Messa
             }
             None => row.push(gap(window::BAR_PAD_START)),
         }
-        row.extend(start);
+        // The start slot, the app's name in capitals, sits a pixel lower: capitals have no
+        // descenders, so a centred line box leaves their ink a pixel high.
+        row.extend(start.map(|start| {
+            Element::from(iced::widget::container(start).padding(iced::Padding {
+                top: 2.0,
+                ..iced::Padding::ZERO
+            }))
+        }));
         row.push(fill());
         if let Some(center) = center {
             row.push(center);
@@ -226,7 +233,11 @@ impl<'a, Message: Clone + 'a> From<HeaderBar<'a, Message>> for Element<'a, Messa
         }
         if let Some(end) = end {
             row.push(end);
-            row.push(gap(window::BAR_GAP));
+            row.push(gap(if close.is_some() {
+                window::BUTTON_MARGIN
+            } else {
+                window::BAR_GAP
+            }));
         }
         match close {
             Some(close) => {

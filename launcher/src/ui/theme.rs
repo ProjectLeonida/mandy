@@ -273,6 +273,19 @@ impl Look {
         }
     }
 
+    /// The same with `glow` at a share of its strength, in place of its own: a glow fading in or
+    /// out as the pointer comes and goes ([`crate::ui::transition::Lit`]).
+    pub fn lit(self, glow: Option<Halo>, share: f32) -> Self {
+        let share = share.clamp(0.0, 1.0);
+        Self {
+            glow: glow.filter(|_| share > 0.0).map(|glow| Halo {
+                color: glow.color.opacity(glow.color.alpha() * share),
+                ..glow
+            }),
+            ..self
+        }
+    }
+
     /// The same at a share of its opacity, fill, line and glow: two looks crossfade as one goes
     /// and the other comes.
     pub fn faded(self, share: f32) -> Self {
@@ -843,7 +856,12 @@ impl Theme {
 
     /// The mark at the chosen sidebar row's start: a short bar of magenta, the selection's accent.
     pub fn sidebar_mark(&self) -> crate::ui::tokens::Color {
-        self.palette.accent(Accent::Magenta)
+        // The logo's orange in both modes, against the row's purple-tinted fill: the main color
+        // in light, the secondary in dark.
+        match self.palette.mode {
+            crate::ui::tokens::Mode::Light => self.palette.accent(Accent::Magenta),
+            crate::ui::tokens::Mode::Dark => self.palette.accent(Accent::Cyan),
+        }
     }
 }
 

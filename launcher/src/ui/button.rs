@@ -116,6 +116,8 @@ struct State {
     pressed: bool,
     label: Plain,
     drawn: Option<(Interaction, bool)>,
+    /// Its glow under the pointer, fading in and out.
+    lit: crate::ui::transition::Lit,
     /// Which button the state is: iced keeps a widget's state for whatever widget of its kind
     /// comes where it was, such as the Erase a wizard's next page puts where Next was.
     whose: Option<(Emphasis, String)>,
@@ -303,7 +305,13 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Button<Message> {
         } else {
             state.pressed = false;
         }
-        let now = (self.interaction(state, over), state.focus.is_shown());
+        let interaction = self.interaction(state, over);
+        state.lit.frame(event, shell);
+        state.lit.aim(
+            matches!(interaction, Interaction::Hovered | Interaction::Pressed),
+            shell,
+        );
+        let now = (interaction, state.focus.is_shown());
         input::redraw_on_change(&mut state.drawn, now, event, shell);
     }
 
@@ -323,7 +331,18 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Button<Message> {
             self.interaction(state, cursor.is_over(bounds)),
             state.focus.is_shown(),
         ));
-        let look = theme.button(self.emphasis, interaction);
+        let mut look = theme.button(self.emphasis, interaction);
+        if self.preview.is_none() && interaction != Interaction::Disabled {
+            // The glow fades in and out with the pointer: the hovered or pressed look's, at how
+            // lit it is.
+            let lit = if interaction == Interaction::Pressed {
+                Interaction::Pressed
+            } else {
+                Interaction::Hovered
+            };
+            let glow = theme.button(self.emphasis, lit).glow;
+            look = look.lit(glow, state.lit.share());
+        }
         paint::boxed(renderer, bounds, &look);
         let label = state.label.min_bounds();
         let at = Point::new(

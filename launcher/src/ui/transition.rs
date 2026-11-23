@@ -94,6 +94,53 @@ impl Transition {
     }
 }
 
+/// A control's glow coming and going: under the pointer it fades in, and away from it, out, over
+/// [`motion::FAST`], so light comes from interaction without a jump.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct Lit {
+    /// How lit it is, from 0 to 1, as of the last frame.
+    share: f32,
+    /// Whether it's going to be lit, once it has been told.
+    aim: Option<bool>,
+    fade: Option<Transition>,
+}
+
+impl Lit {
+    /// It should be lit, or not: it fades there from where it is.
+    pub fn aim<Message>(&mut self, lit: bool, shell: &mut Shell<'_, Message>) {
+        if self.aim == Some(lit) {
+            return;
+        }
+        let to = f32::from(u8::from(lit));
+        if self.aim.is_none() {
+            // Its first look: as it is, no fade.
+            self.share = to;
+        } else {
+            Transition::turn(&mut self.fade, self.share, to, motion::FAST, shell);
+            if self.fade.is_none() {
+                self.share = to;
+            }
+        }
+        self.aim = Some(lit);
+    }
+
+    /// A frame: where the fade is, asking for the next while it's on its way.
+    pub fn frame<Message>(&mut self, event: &iced::Event, shell: &mut Shell<'_, Message>) {
+        if let iced::Event::Window(iced::window::Event::RedrawRequested(now)) = event {
+            Transition::advance(&mut self.fade, *now, shell);
+            self.share = match &self.fade {
+                Some(fade) => fade.at(),
+                None => f32::from(u8::from(self.aim.unwrap_or(false))),
+            };
+        }
+    }
+
+    /// How lit it is: 0 to 1.
+    pub fn share(&self) -> f32 {
+        self.share
+    }
+}
+
 /// How far into a cycle `now` is, from 0 to 1, cycles having begun at `start`. In whole
 /// microseconds, so it's as smooth after a week as after a second: a second's fraction in an
 /// `f32` loses its smoothness after a few days.

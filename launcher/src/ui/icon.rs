@@ -84,6 +84,8 @@ struct Pressing {
     focus: Focus,
     pressed: bool,
     drawn: Option<(Interaction, bool)>,
+    /// Its glow under the pointer, fading in and out.
+    lit: crate::ui::transition::Lit,
 }
 
 impl Pressing {
@@ -185,7 +187,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for WindowButton<Message> 
             }
             _ => {}
         }
-        let now = (state.interaction(over), state.focus.is_shown());
+        let interaction = state.interaction(over);
+        state.lit.frame(event, shell);
+        state.lit.aim(interaction != Interaction::Idle, shell);
+        let now = (interaction, state.focus.is_shown());
         input::redraw_on_change(&mut state.drawn, now, event, shell);
     }
 
@@ -205,11 +210,23 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for WindowButton<Message> 
             state.interaction(cursor.is_over(bounds)),
             state.focus.is_shown(),
         ));
-        let look = if self.danger {
-            theme.close_button(interaction)
-        } else {
-            theme.window_button(interaction)
+        let looks = |interaction| {
+            if self.danger {
+                theme.close_button(interaction)
+            } else {
+                theme.window_button(interaction)
+            }
         };
+        let mut look = looks(interaction);
+        if self.preview.is_none() {
+            // The glow fades in and out with the pointer.
+            let lit = if interaction == Interaction::Pressed {
+                Interaction::Pressed
+            } else {
+                Interaction::Hovered
+            };
+            look = look.lit(looks(lit).glow, state.lit.share());
+        }
         paint::boxed(renderer, bounds, &look);
         shape::icon(
             renderer,
