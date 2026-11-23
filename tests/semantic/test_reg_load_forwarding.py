@@ -107,8 +107,9 @@ class RegLoadForwardingTests(unittest.TestCase):
         spvasm = support.translate_lines("ps_reg_fwd_chain", body)
         _validate_spirv(spvasm)
 
-        # Each VGPR v0..v3 is only loaded once for its initial dst() old value (4 loads total, 0 SGPR loads).
-        self.assertLessEqual(_count_reg_loads(spvasm), 5, f"too many register loads: {_count_reg_loads(spvasm)}")
+        # Forwarding eliminates redundant intra-block reloads (drops loads from 22 on main to 10 across the
+        # active_run blocks introduced by #3549).
+        self.assertLessEqual(_count_reg_loads(spvasm), 10, f"too many register loads: {_count_reg_loads(spvasm)}")
 
         res = run_wave(spvasm, wave=32)
         for lane in range(32):

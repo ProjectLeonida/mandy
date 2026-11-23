@@ -389,9 +389,15 @@ class TypedGatherShaders(unittest.TestCase):
                 m = Module(translate(body))
 
                 def source_register(value: str) -> int:
-                    op, load = m.defs[value]
-                    self.assertEqual(op, "OpLoad")
-                    op, ptr = m.defs[load[1]]
+                    op, args = m.defs[value]
+                    if op == "OpLoad":
+                        op, ptr = m.defs[args[1]]
+                        self.assertEqual((op, ptr[1]), ("OpAccessChain", "%vgpr"))
+                        return m.value(ptr[2], 0, 0)
+                    # With intra-block forwarding, value may be the SSA result stored into %vgpr[r].
+                    stores = re.findall(rf"^\s*OpStore (%\w+) {re.escape(value)}\b", m.text, re.MULTILINE)
+                    self.assertTrue(stores, f"expected OpLoad or OpStore into %vgpr for {value} ({op})")
+                    op, ptr = m.defs[stores[-1]]
                     self.assertEqual((op, ptr[1]), ("OpAccessChain", "%vgpr"))
                     return m.value(ptr[2], 0, 0)
 
