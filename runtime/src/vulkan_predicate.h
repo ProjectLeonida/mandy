@@ -8,6 +8,7 @@
 #include <memory>
 #include <initializer_list>
 #include "predicate_reduce_spv.h"
+#include "vulkan_memory.h"
 
 namespace leonida {
 struct PredicateCapture {
@@ -67,17 +68,18 @@ public:
         if (fn<PFN_vkCreateBuffer>("vkCreateBuffer")(device_, &buffer, nullptr, &b->buffer) != VK_SUCCESS) return {};
         VkMemoryRequirements requirements{};
         fn<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(device_, b->buffer, &requirements);
-        std::uint32_t type = UINT32_MAX;
-        for (std::uint32_t i = 0; i < memory_.memoryTypeCount; ++i) {
-            if (!(requirements.memoryTypeBits & (1u << i))) continue;
-            if (type == UINT32_MAX) type = i;
-            if (memory_.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) { type = i; break; }
-        }
-        if (type == UINT32_MAX) return {};
+        const auto order = memory_type_order(memory_, requirements.memoryTypeBits, 0,
+                                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, requirements.size);
+        if (order.empty()) return {};
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
-        allocation.memoryTypeIndex = type;
-        if (fn<PFN_vkAllocateMemory>("vkAllocateMemory")(device_, &allocation, nullptr, &b->memory) != VK_SUCCESS ||
+        const auto alloc_memory = fn<PFN_vkAllocateMemory>("vkAllocateMemory");
+        for (const std::uint32_t type : order) {
+            allocation.memoryTypeIndex = type;
+            if (alloc_memory(device_, &allocation, nullptr, &b->memory) == VK_SUCCESS) break;
+            b->memory = VK_NULL_HANDLE;
+        }
+        if (!b->memory ||
             fn<PFN_vkBindBufferMemory>("vkBindBufferMemory")(device_, b->buffer, b->memory, 0) != VK_SUCCESS) return {};
         const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
         VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
