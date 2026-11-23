@@ -136,6 +136,12 @@ struct VulkanDeviceInfo {
     // VK_EXT_conservative_rasterization is enabled on the logical device. Tier 1/2 depend on the physical
     // precision/overestimation properties; Tier 2 also requires post-snap degenerate triangles.
     bool conservative_rasterization = false;
+    // VK_AMD_mixed_attachment_samples or VK_NV_framebuffer_mixed_samples is enabled on `device`:
+    // target-independent rasterization (ForcedSampleCount > 1 with 1x render targets) chains
+    // VkAttachmentSampleCountInfoAMD onto VkGraphicsPipelineCreateInfo. Without it, attachmentless
+    // ForcedSampleCount still works via core framebufferNoAttachmentsSampleCounts, while mixed-sample RTV
+    // PSOs return E_NOTIMPL.
+    bool mixed_attachment_samples = false;
     // Opt in only for shader libraries whose InnerCoverage input contract uses FullyCoveredEXT. The device
     // still checks physical Tier 2 and fullyCoveredFragmentShaderInputVariable properties. The standalone
     // device leaves this false until the Xbox PS input mapping is confirmed (synthetic GLSL is not that ABI).

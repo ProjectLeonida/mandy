@@ -127,6 +127,7 @@ public:
     bool request_buffer_device_address = false;  // set before create(): enable bufferDeviceAddress where supported
     bool buffer_device_address = false;  // enabled: buffer() memory and buffers can be addressed (device_address())
     bool conservative_rasterization = false; // VK_EXT_conservative_rasterization enabled where available
+    bool mixed_attachment_samples = false; // VK_AMD_mixed_attachment_samples or VK_NV_framebuffer_mixed_samples
     bool request_mesh_shader = false;  // set before create(): enable VK_EXT_mesh_shader (meshShader) where available
     bool mesh_shader = false;          // VK_EXT_mesh_shader and meshShader are enabled
     bool mesh_shader_queries = false;  // the meshShaderQueries feature is enabled on the device
@@ -661,6 +662,17 @@ private:
             return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
         });
         if (conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
+        const char* mixed_samples_ext = nullptr;
+        for (const char* name :
+             {VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME, VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME}) {
+            if (std::any_of(extensions.begin(), extensions.end(),
+                            [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; })) {
+                mixed_samples_ext = name;
+                break;
+            }
+        }
+        mixed_attachment_samples = mixed_samples_ext != nullptr;
+        if (mixed_samples_ext) device_extensions.push_back(mixed_samples_ext);
         if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
         if (vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);

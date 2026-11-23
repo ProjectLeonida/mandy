@@ -7596,6 +7596,28 @@ public:
         }
 
         const D3D12_RASTERIZER_DESC& r = desc.RasterizerState;
+        const UINT forced = r.ForcedSampleCount;
+        if (forced != 0 && forced != 1 && forced != 4 && forced != 8 && forced != 16) {
+            log_once("invalid ForcedSampleCount (expected 0, 1, 4, 8 or 16):", int(forced));
+            return E_INVALIDARG;
+        }
+        if (forced != 0) {
+            if (desc.DepthStencilState.DepthEnable || desc.DepthStencilState.StencilEnable ||
+                desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
+                log_once("ForcedSampleCount requires depth/stencil disabled and DXGI_FORMAT_UNKNOWN DSVFormat; forced",
+                         int(forced));
+                return E_INVALIDARG;
+            }
+            if (forced > 1 && samples != 1) {
+                log_once("ForcedSampleCount > 1 requires SampleDesc.Count == 1; samples", int(samples));
+                return E_INVALIDARG;
+            }
+            if (forced == 1 && samples > 1) {
+                return stream_unsupported(
+                    "ForcedSampleCount = 1 with multisampled attachments is not supported on Vulkan; samples",
+                    int(samples));
+            }
+        }
         if (r.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF &&
             r.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON) return E_INVALIDARG;
         if (r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON) {
@@ -7605,9 +7627,6 @@ public:
             }
             if (r.FillMode != D3D12_FILL_MODE_SOLID ||
                 topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return E_INVALIDARG;
-            // Target-independent rasterization is a separate pipeline path; do not silently ignore its count.
-            if (r.ForcedSampleCount)
-                return stream_unsupported("target-independent rasterization; forced sample count", int(r.ForcedSampleCount));
         }
         VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         raster.polygonMode = r.FillMode == D3D12_FILL_MODE_WIREFRAME ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
@@ -7629,9 +7648,14 @@ public:
         // D3D12 clamps output depth to MinDepth..MaxDepth anyway (needs depthClamp, checked below).
         raster.depthClampEnable = r.DepthClipEnable ? VK_FALSE : VK_TRUE;
 
+        const UINT raster_samples = forced ? forced : samples;
         VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-        multisample.rasterizationSamples = VkSampleCountFlagBits(samples);
-        const VkSampleMask sample_mask = desc.SampleMask;
+        multisample.rasterizationSamples = VkSampleCountFlagBits(raster_samples);
+        // Under D3D12 TIR (ForcedSampleCount > 1, SampleDesc.Count == 1), SampleMask masks Output Merger RTV sample
+        // slots (only bit 0 applies), whereas Vulkan's pSampleMask masks rasterizationSamples. Broadcast bit 0 so
+        // odd masks keep all forced subsamples and even masks suppress all coverage (measured on RTX 5060 + WARP).
+        const VkSampleMask sample_mask =
+            (forced > 1) ? ((desc.SampleMask & 1u) ? ~VkSampleMask(0) : VkSampleMask(0)) : desc.SampleMask;
         multisample.pSampleMask = &sample_mask;
         multisample.alphaToCoverageEnable = desc.BlendState.AlphaToCoverageEnable;
 
@@ -7740,52 +7764,68 @@ public:
             graphics_.depth_format = device_.depth_backing(f.format);
             graphics_.depth_aspects = f.aspects;
         }
-        if (samples > 1) {
+        const bool has_color = std::any_of(graphics_.color_formats.begin(), graphics_.color_formats.end(),
+                                           [](VkFormat f) { return f != VK_FORMAT_UNDEFINED; });
+        const bool has_depth = graphics_.depth_format != VK_FORMAT_UNDEFINED;
+        const bool mixed_samples = (has_color || has_depth) && raster_samples != samples;
+        if (mixed_samples && !device_.info.mixed_attachment_samples)
+            return stream_unsupported("ForcedSampleCount with render targets needs VK_AMD_mixed_attachment_samples or "
+                                      "VK_NV_framebuffer_mixed_samples; forced",
+                                      int(forced));
+        if (samples > 1 || raster_samples > 1) {
             const auto& dinfo = device_.info;
-            const bool has_color = std::any_of(graphics_.color_formats.begin(), graphics_.color_formats.end(),
-                                               [](VkFormat f) { return f != VK_FORMAT_UNDEFINED; });
-            const bool has_depth = graphics_.depth_format != VK_FORMAT_UNDEFINED;
             if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                     dinfo.get_instance_proc ? dinfo.get_instance_proc(dinfo.instance, "vkGetPhysicalDeviceProperties")
                                             : nullptr)) {
                 VkPhysicalDeviceProperties props{};
                 get_props(dinfo.physical, &props);
-                VkSampleCountFlags supported = ~VkSampleCountFlags(0);
-                if (has_color) supported &= props.limits.framebufferColorSampleCounts;
-                if (has_depth && (graphics_.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
-                    supported &= props.limits.framebufferDepthSampleCounts;
-                if (has_depth && (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
-                    supported &= props.limits.framebufferStencilSampleCounts;
-                if (!has_color && !has_depth) supported &= props.limits.framebufferNoAttachmentsSampleCounts;
-                if (!(supported & samples)) {
-                    log_once("multisample count not supported by framebuffer limits; samples", int(samples));
-                    return E_INVALIDARG;
+                if (samples > 1) {
+                    VkSampleCountFlags supported = ~VkSampleCountFlags(0);
+                    if (has_color) supported &= props.limits.framebufferColorSampleCounts;
+                    if (has_depth && (graphics_.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
+                        supported &= props.limits.framebufferDepthSampleCounts;
+                    if (has_depth && (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
+                        supported &= props.limits.framebufferStencilSampleCounts;
+                    if (!has_color && !has_depth) supported &= props.limits.framebufferNoAttachmentsSampleCounts;
+                    if (!(supported & samples)) {
+                        log_once("multisample count not supported by framebuffer limits; samples", int(samples));
+                        return E_INVALIDARG;
+                    }
+                }
+                if (raster_samples > 1 && ((!has_color && !has_depth) || mixed_samples)) {
+                    if (!(props.limits.framebufferNoAttachmentsSampleCounts & raster_samples)) {
+                        log_once("ForcedSampleCount not supported by framebufferNoAttachmentsSampleCounts; samples",
+                                 int(raster_samples));
+                        return E_INVALIDARG;
+                    }
                 }
             }
-            if ((has_color || has_depth) && !device_.image_format_properties) {
-                log_once("cannot query per-format multisample support; samples", int(samples));
-                return E_INVALIDARG;
-            }
-            for (const VkFormat fmt : graphics_.color_formats) {
-                if (fmt == VK_FORMAT_UNDEFINED) continue;
-                VkImageFormatProperties img_props{};
-                if (device_.image_format_properties(dinfo.physical, fmt, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
-                                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, &img_props) != VK_SUCCESS ||
-                    !(img_props.sampleCounts & samples)) {
-                    log_once("multisample count not supported by color attachment format; samples", int(samples));
+            if (samples > 1) {
+                if ((has_color || has_depth) && !device_.image_format_properties) {
+                    log_once("cannot query per-format multisample support; samples", int(samples));
                     return E_INVALIDARG;
                 }
-            }
-            if (has_depth) {
-                VkImageFormatProperties img_props{};
-                if (device_.image_format_properties(dinfo.physical, graphics_.depth_format, VK_IMAGE_TYPE_2D,
-                                                    VK_IMAGE_TILING_OPTIMAL,
-                                                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0,
-                                                    &img_props) != VK_SUCCESS ||
-                    !(img_props.sampleCounts & samples)) {
-                    log_once("multisample count not supported by depth/stencil attachment format; samples",
-                             int(samples));
-                    return E_INVALIDARG;
+                for (const VkFormat fmt : graphics_.color_formats) {
+                    if (fmt == VK_FORMAT_UNDEFINED) continue;
+                    VkImageFormatProperties img_props{};
+                    if (device_.image_format_properties(dinfo.physical, fmt, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, &img_props) != VK_SUCCESS ||
+                        !(img_props.sampleCounts & samples)) {
+                        log_once("multisample count not supported by color attachment format; samples", int(samples));
+                        return E_INVALIDARG;
+                    }
+                }
+                if (has_depth) {
+                    VkImageFormatProperties img_props{};
+                    if (device_.image_format_properties(dinfo.physical, graphics_.depth_format, VK_IMAGE_TYPE_2D,
+                                                        VK_IMAGE_TILING_OPTIMAL,
+                                                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0,
+                                                        &img_props) != VK_SUCCESS ||
+                        !(img_props.sampleCounts & samples)) {
+                        log_once("multisample count not supported by depth/stencil attachment format; samples",
+                                 int(samples));
+                        return E_INVALIDARG;
+                    }
                 }
             }
         }
@@ -7820,6 +7860,8 @@ public:
         recipe_.conservative = r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
         recipe_.multisample = multisample;
         graphics_.samples = samples;
+        recipe_.mixed_samples = mixed_samples;
+        recipe_.attachment_samples = VkSampleCountFlagBits(samples);
         recipe_.sample_mask = sample_mask;
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
@@ -8190,6 +8232,8 @@ private:
         VkPipelineRasterizationStateCreateInfo raster{};
         bool conservative = false;
         VkPipelineMultisampleStateCreateInfo multisample{};
+        bool mixed_samples = false;
+        VkSampleCountFlagBits attachment_samples = VK_SAMPLE_COUNT_1_BIT;
         VkSampleMask sample_mask = ~0u;
         VkPipelineDepthStencilStateCreateInfo depth{};
         std::vector<VkPipelineColorBlendAttachmentState> blends;
@@ -8212,6 +8256,22 @@ private:
             rendering.depthAttachmentFormat = graphics_.depth_format;
         if (depth_bound && (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
             rendering.stencilAttachmentFormat = graphics_.depth_format;
+        const bool any_color_bound = std::any_of(colors.begin(), colors.end(),
+                                                 [](VkFormat f) { return f != VK_FORMAT_UNDEFINED; });
+        const bool any_depth_bound =
+            rendering.depthAttachmentFormat != VK_FORMAT_UNDEFINED ||
+            rendering.stencilAttachmentFormat != VK_FORMAT_UNDEFINED;
+        std::vector<VkSampleCountFlagBits> color_samples;
+        VkAttachmentSampleCountInfoAMD sample_count_info{VK_STRUCTURE_TYPE_ATTACHMENT_SAMPLE_COUNT_INFO_AMD};
+        if (r.mixed_samples && (any_color_bound || any_depth_bound)) {
+            color_samples.assign(colors.size(), r.attachment_samples);
+            sample_count_info.colorAttachmentCount = std::uint32_t(color_samples.size());
+            sample_count_info.pColorAttachmentSamples = color_samples.data();
+            sample_count_info.depthStencilAttachmentSamples =
+                any_depth_bound ? r.attachment_samples : VkSampleCountFlagBits(0);
+            sample_count_info.pNext = rendering.pNext;
+            rendering.pNext = &sample_count_info;
+        }
 
         VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         VkPipelineVertexInputDivisorStateCreateInfoEXT divisor_state{
@@ -16263,6 +16323,16 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.conservative_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
     });
+    const char* mixed_samples_ext = nullptr;
+    for (const char* name :
+         {VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME, VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME}) {
+        if (std::any_of(extensions.begin(), extensions.end(),
+                        [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; })) {
+            mixed_samples_ext = name;
+            break;
+        }
+    }
+    info.mixed_attachment_samples = mixed_samples_ext != nullptr;
     const bool has_host_image_copy = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0;
     });
@@ -16560,6 +16630,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (trace_pipeline_compile() && !v13.core && info.pipeline_creation_feedback)
         device_extensions.push_back(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
     if (info.conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
+    if (mixed_samples_ext) device_extensions.push_back(mixed_samples_ext);
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);

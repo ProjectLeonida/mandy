@@ -896,7 +896,7 @@ The compute path, end to end:
     primitive overestimation no greater than `0.5 - 1/512` pixels, leaving half a minimum grid step within the
     Tier 1 uncertainty bound. `ConservativeRaster=ON` uses overestimate mode with zero extra overestimation,
     including unbound-attachment variants. OFF keeps the ordinary pipeline. Missing support, unknown modes,
-    wireframe and non-triangle PSOs are refused; conservative TIR (`ForcedSampleCount != 0`) remains `E_NOTIMPL`.
+    wireframe and non-triangle PSOs are refused; conservative TIR (`ForcedSampleCount != 0`) uses the TIR rules below.
     Tier 2 additionally requires `degenerateTrianglesRasterized` and primitive overestimation plus half a
     device subpixel step no greater than 1/256 pixel. Other eligible devices retain Tier 1. The standalone
     device does not expose Tier 3: the Xbox `SV_InnerCoverage` input mapping has not been confirmed. See
@@ -957,6 +957,36 @@ The compute path, end to end:
     this test, needs no glslang, and fetches the pinned Vulkan headers only if none are installed. The verbose CTest
     output reports the capability and result; it skips if the selected device lacks a matching native D3D12 adapter
     or Tier 3.
+  - **Target-independent rasterization (`ForcedSampleCount`):**
+    `PipelineState::create_graphics` accepts only `{0, 1, 4, 8, 16}` (else `E_INVALIDARG`). When
+    `ForcedSampleCount != 0` (including `1`), `DepthEnable` and `StencilEnable` must be `FALSE` and `DSVFormat` must
+    be `DXGI_FORMAT_UNKNOWN` (else `E_INVALIDARG`). `ForcedSampleCount > 1` also requires `SampleDesc.Count == 1`
+    (else `E_INVALIDARG`). `ForcedSampleCount == 1` with `SampleDesc.Count > 1` is accepted by native D3D12 and WARP
+    but returns `E_NOTIMPL` here because Vulkan mixed-attachment extensions require
+    `rasterizationSamples >= attachmentSamples`.
+    When `ForcedSampleCount != 0`, `VkPipelineMultisampleStateCreateInfo::rasterizationSamples` uses `ForcedSampleCount`
+    while `graphics_.samples` keeps `SampleDesc.Count` so draw-time `prepare_draw` checks still enforce bound RTV
+    counts. With no bound attachments (`NumRenderTargets == 0` and `DSVFormat == UNKNOWN`, or an all-`UNKNOWN` /
+    `unbound` variant), Vulkan 1.3 core `framebufferNoAttachmentsSampleCounts` validates the forced sample count and
+    `VkAttachmentSampleCountInfoAMD` is omitted. With 1x render targets (`SampleDesc.Count == 1` and
+    `ForcedSampleCount > 1`), mixed-sample TIR requires `VulkanDeviceInfo::mixed_attachment_samples` (enabled from
+    `VK_AMD_mixed_attachment_samples` or `VK_NV_framebuffer_mixed_samples` by `create_vulkan_device_standalone`, else
+    `E_NOTIMPL`) and `framebufferNoAttachmentsSampleCounts`, chaining `VkAttachmentSampleCountInfoAMD` onto
+    `VkPipelineRenderingCreateInfo::pNext` (and omitting it when an `unbound` draw clears all attachments). Because
+    D3D12's `SampleMask` masks Output Merger RTV slots (`bit 0` only when `SampleDesc.Count == 1`) whereas Vulkan's
+    `pSampleMask` masks rasterization subsamples, `ForcedSampleCount > 1` broadcasts `desc.SampleMask & 1` to `~0u`
+    or `0u`.
+    `d3d12_forced_sample_count` compares 25 PSO validation cases, attachmentless occlusion queries (`0/1/4/8/16`,
+    odd/even `SampleMask`, scissor, diagonal, sliver, null-PS), 1x-RTV `R8G8B8A8_UNORM`, `R32_UINT` `SV_Coverage`,
+    2-target MRT, unbound-RTV variant, `ConservativeRaster=ON` + TIR, 4x-RTV sample-mismatch refusal, capability
+    gating, standalone device detection, and multi-submission PSO switching on synthetic hand-encoded SPIR-V vs runtime
+    HLSL (`d3dcompiler_47.dll`): on RTX 5060 Laptop GPU (Windows 11, NVIDIA 621.24, Vulkan 1.4.357, `VK_NV_framebuffer_mixed_samples`)
+    and Microsoft WARP, all 1x-RTV color, `SV_Coverage` (`4x/8x/16x`), and MRT outputs match byte-for-byte across
+    Vulkan, native RTX 5060 D3D12, and WARP; attachmentless Vulkan occlusion counts match WARP sample counts across
+    all 17 active scenes (native RTX 5060 D3D12 counts covered pixels per triangle instead); on Intel RaptorLake-S
+    iGPU (driver 101.7026, Vulkan 1.4.323, no mixed-samples extension), attachmentless TIR (`1/4/8`) matches WARP
+    while `16x` (`E_INVALIDARG`) and 1x-RTV TIR (`E_NOTIMPL`) are refused cleanly (`Intel` D3D12 reports `0` on
+    empty-PS attachmentless occlusion queries even at `ForcedSampleCount=0`).
   - **Formats:** dynamic rendering takes the RTV and DSV formats. A draw that leaves a slot unbound for which the
     PSO names a format (D3D12 allows it and discards those writes) uses a variant of the pipeline with that format
     undefined, built on first use and kept with the PSO. Bit i of the variant key is colour slot i, and bit 8 is
