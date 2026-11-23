@@ -218,5 +218,33 @@ class NoPrivateCopiesTests(unittest.TestCase):
                 self.assertIs(module.same_report_path, report_paths.same_report_path)
 
 
+class WorkRootTests(unittest.TestCase):
+    def test_a_relative_path_is_resolved_again_after_a_chdir(self):
+        # Reported by @senyurah on #7335: two work folders, one relative spelling, and a cache keyed by the spelling
+        # alone answered the second call with the first folder's root.
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = [os.path.join(tmp, name) for name in ("a", "b")]
+            for root in roots:
+                os.makedirs(os.path.join(root, "disasm"))
+            cwd = os.getcwd()
+            try:
+                for root in roots:
+                    os.chdir(root)
+                    self.assertEqual(report_paths.work_root(os.path.join("disasm", "ps_a.s")),
+                                     os.path.realpath(root))
+            finally:
+                os.chdir(cwd)
+
+    def test_an_absolute_path_is_resolved_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "disasm", "ps_a.s")
+            os.makedirs(os.path.dirname(path))
+            report_paths._WORK_ROOTS.clear()
+            self.assertEqual(report_paths.work_root(path), os.path.realpath(tmp))
+            self.assertIn(path, report_paths._WORK_ROOTS)
+            self.assertEqual(report_paths.work_root(path), tmp)
+            self.assertEqual(len(report_paths._WORK_ROOTS), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

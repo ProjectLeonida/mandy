@@ -91,7 +91,12 @@ def work_root(disasm_path):
     same disasm path, up to sixteen times per shader. `os.path.realpath` is a `_getfinalpathname` call on Windows
     (~40 us) and a build translates 26,503 shaders, so the answer is kept per path. It cannot change while a build
     runs; the cap clears the table in a process that walks a whole corpus.
+
+    A relative path is resolved every time and never kept: the same spelling names a different folder after a
+    `chdir`, so a cache keyed by the spelling alone would answer with the first working directory's root.
     """
+    if not os.path.isabs(disasm_path):
+        return os.path.dirname(os.path.dirname(os.path.realpath(disasm_path)))
     cached = _WORK_ROOTS.get(disasm_path)
     if cached is None:
         if len(_WORK_ROOTS) >= _WORK_ROOTS_LIMIT:
