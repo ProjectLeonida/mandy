@@ -5,7 +5,8 @@
 //     Pixels well inside are red and pixels well outside blue. Pixels the edge crosses resolve to a mix, which
 //     only a multisampled target produces (a single-sampled one gives 0 or 255);
 //   - a green quad over the bottom-right quadrant from a PSO with SampleMask 0x1: one sample of four is written,
-//     so those pixels resolve to a quarter green and three quarters blue.
+//     so those pixels resolve to a quarter green and three quarters blue under AVERAGE. MIN and MAX
+//     resolve a shifted rectangle from that quadrant to black and cyan, respectively.
 // PSO quality: D3D12_STANDARD_MULTISAMPLE_PATTERN is accepted, as on native D3D12; quality 1 (past NumQualityLevels)
 // and 3 samples are E_INVALIDARG. A 4x PSO drawing into a single-sampled target fails the list at execute
 // (invalid_subresource) instead of reaching the driver. Shaders: test/glsl/vs_draw.vert, ps_draw.frag. No game data.
@@ -73,7 +74,8 @@ int main() {
 
     constexpr UINT size = 64;
     constexpr UINT samples = 4;
-    std::vector<std::uint8_t> pixels(size * 256);
+    constexpr UINT image_bytes = size * 256;
+    std::vector<std::uint8_t> pixels(image_bytes);
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -163,7 +165,7 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&upload.p))));
-        const auto readback_desc = buffer_desc(size * 256);
+        const auto readback_desc = buffer_desc(4 * image_bytes);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&readback.p))));
@@ -275,6 +277,22 @@ int main() {
         src.pResource = resolved.p;
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        Ref<ID3D12GraphicsCommandList1> list1;
+        EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list1.p))));
+        const D3D12_RESOURCE_BARRIER back_to_resolve =
+            transition(resolved.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+        D3D12_RECT source_rect{40, 40, 48, 48};
+        const D3D12_RESOLVE_MODE modes[]{D3D12_RESOLVE_MODE_MIN, D3D12_RESOLVE_MODE_MAX,
+                                         D3D12_RESOLVE_MODE_AVERAGE};
+        for (UINT i = 0; i < std::size(modes); ++i) {
+            list->ResourceBarrier(1, &back_to_resolve);
+            list1->ResolveSubresourceRegion(resolved.p, 0, 4, 8, target.p, 0, &source_rect,
+                                            DXGI_FORMAT_R8G8B8A8_UNORM, modes[i]);
+            list->ResourceBarrier(1, &to_copy);
+            dst.PlacedFootprint.Offset = (i + 1) * image_bytes;
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+        list1.reset();
         EXPECT(list->Close() == S_OK);
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
@@ -284,6 +302,23 @@ int main() {
         void* mapped = nullptr;
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(pixels.data(), mapped, pixels.size());
+
+        const std::array<std::uint8_t, 4> extrema[]{{0, 0, 0, 255}, {0, 255, 255, 255}};
+        const auto* bytes = static_cast<const std::uint8_t*>(mapped);
+        const auto* average = pixels.data() + 40 * 256 + 40 * 4;  // checked below against the 1:3 mix
+        for (UINT i = 0; i < std::size(modes); ++i) {
+            for (UINT y = 0; y < size; ++y) {
+                for (UINT x = 0; x < size; ++x) {
+                    const UINT offset = y * 256 + x * 4;
+                    const bool inside = x >= 4 && x < 12 && y >= 8 && y < 16;
+                    const auto* expected = pixels.data() + offset;
+                    if (inside) expected = i < std::size(extrema) ? extrema[i].data() : average;
+                    const auto* actual = bytes + (i + 1) * image_bytes + offset;
+                    EXPECT(std::memcmp(expected, actual, 4) == 0);
+                }
+            }
+        }
+        readback->Unmap(0, nullptr);
 
         // A 4x PSO into the single-sampled target: D3D12 requires matching counts, so the list fails at execute.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
