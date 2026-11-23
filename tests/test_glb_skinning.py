@@ -13,6 +13,8 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import stat
 import struct
 import subprocess
 import sys
@@ -655,6 +657,47 @@ class GlbSkinningTests(unittest.TestCase):
         self.assertEqual(0, weight_meta["buffer_view"])
         self.assertEqual(0, joint_meta["accessor"])
         self.assertEqual(1, weight_meta["accessor"])
+
+    def test_zero_initialized_accessor_bounds_count(self):
+        doc_ok = {
+            "accessors": [{"componentType": 5126, "count": 3, "type": "VEC4"}],
+        }
+        rows, meta = glb_skinning._Reader(doc_ok, None).read(0, "WEIGHTS_0")
+        self.assertEqual([(0.0, 0.0, 0.0, 0.0)] * 3, rows)
+        self.assertIsNone(meta["buffer_view"])
+
+        doc_huge = {
+            "accessors": [{
+                "componentType": 5126,
+                "count": glb_skinning.MAX_ZERO_ACCESSOR_COUNT + 1,
+                "type": "VEC4",
+            }],
+        }
+        with self.assertRaisesRegex(glb_skinning.GlbSkinError, "without bufferView"):
+            glb_skinning._Reader(doc_huge, None).read(0, "WEIGHTS_0")
+
+    def test_json_directory_refused_and_atomic_write_preserves_target(self):
+        data = make_glb()
+        path = self.write("valid.glb", data)
+        proc = self.run_tool(path, "--json", self.dir)
+        self.assertEqual(2, proc.returncode)
+        self.assertEqual("", proc.stdout)
+        self.assertIn("directory", proc.stderr)
+
+        out = self.dir / "mode.json"
+        out.write_text("previous\n", encoding="utf-8")
+        if os.name != "nt":
+            os.chmod(out, 0o640)
+        with mock.patch.object(glb_skinning, "replace_retry", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                glb_skinning.write_json(out, {"ok": True})
+        self.assertEqual("previous\n", out.read_text(encoding="utf-8"))
+        self.assertEqual([], list(self.dir.glob(".glb_skinning_*.tmp")))
+
+        glb_skinning.write_json(out, {"ok": True})
+        self.assertEqual({"ok": True}, json.loads(out.read_text(encoding="utf-8")))
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), 0o640)
 
     def test_help(self):
         proc = self.run_tool("--help")
