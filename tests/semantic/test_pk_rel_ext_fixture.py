@@ -16,12 +16,16 @@ test_lds_ops_run_in_lane_0_only checks that order in the source.
 import os
 import re
 import struct
+import sys
 import unittest
 
-import support
-import spirv_mini_interp as si
-
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)  # python -I leaves the script's folder off sys.path
+
+import support  # noqa: E402  (support puts tools/ on sys.path, honouring LEONIDA_TOOLS_DIR)
+import spirv_mini_interp as si  # noqa: E402
+
 ROOT = os.path.dirname(os.path.dirname(HERE))
 M32 = 0xFFFFFFFF
 
