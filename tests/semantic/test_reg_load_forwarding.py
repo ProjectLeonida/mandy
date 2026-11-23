@@ -168,18 +168,21 @@ class RegLoadForwardingTests(unittest.TestCase):
             "v_mov_b32 v5, 0x22",
             "v_mov_b32 v6, 0x33",
             "v_mov_b32 v7, 0x99",
-            # Dynamic store: writes v[4 + 1] = v5 = 0x99; must invalidate cached v5=0x22!
+            # Dynamic store: writes v[4 + 1] = v5 = 0x99; must invalidate cached v5=0x22 immediately.
             "s_mov_b32 m0, 1",
             "v_movreld_b32 v4, v7",
-            # Dynamic read-and-store: v[4 + 2] = v[4 + 2]? No, m0=2 -> v6 = v6; use m0=0x00020000 for swaprel:
-            # swap v[4 + 2] (v6=0x33) and v[4 + 0] (v4=0x11) -> v4=0x33, v6=0x11!
+            # Read v5 BEFORE swaprel so removing v_movreld invalidation fails directly;
+            # also read v4 and v6 so both are cached right before v_swaprel_b32.
+            "v_mov_b32 v8, v5",
+            "v_add_nc_u32 v9, v4, v6",
+            # Swap v[4 + 2] (v6=0x33) and v[4 + 0] (v4=0x11) -> v4=0x33, v6=0x11; must invalidate cached v4/v6!
             "s_mov_b32 m0, 0x00020000",
             "v_swaprel_b32 v4, v4",
             # Dynamic read of v[4 + 1] (v5=0x99) after movreld -> v3=0x99 (verifies OpStore landed in %vgpr!)
             "s_mov_b32 m0, 1",
             "v_movrels_b32 v3, v4",
             "v_mov_b32 v0, v4",
-            "v_mov_b32 v1, v5",
+            "v_mov_b32 v1, v8",
             "v_mov_b32 v2, v6",
             "exp mrt0 v0, v1, v2, v3 done vm",
             "s_endpgm",
@@ -187,6 +190,47 @@ class RegLoadForwardingTests(unittest.TestCase):
         spvasm = support.translate_lines("ps_reg_fwd_movrel", lines)
         _validate_spirv(spvasm)
         self.assertEqual(support.mrt0_words(spvasm), [0x33, 0x99, 0x11, 0x99])
+
+    def test_single_masked_write_outside_active_run_and_single_op_loop(self):
+        """A single masked dst() write caches the OpSelect result (not raw val), and single-op loops reset cache."""
+        # Part 1: single VALU op (< MIN_ACTIVE_RUN) under partial EXEC uses dst() OpSelect, not if (active).
+        body1 = [
+            "v_mov_b32 v0, 10",
+            "v_mov_b32 v1, 0",
+            "v_writelane_b32 v1, 1, 3",
+            "v_cmp_eq_u32 vcc_lo, v1, 0",
+            "s_and_saveexec_b32 s4, vcc_lo",
+            "v_add_nc_u32 v0, v0, 50",
+            "s_or_b32 exec_lo, exec_lo, s4",
+            "v_add_nc_u32 v2, v0, 1",
+            "exp mrt0 v0, v1, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv1 = support.translate_lines("ps_reg_fwd_single_masked", body1)
+        _validate_spirv(spv1)
+        res1 = run_wave(spv1, wave=32)
+        for lane in range(32):
+            want = (10, 1, 11, 11) if lane == 3 else (60, 0, 61, 61)
+            self.assertEqual(tuple(res1["outputs"][lane]["%out_mrt0"]), want)
+
+        # Part 2: loop body with a single lane-local instruction has no active-run label before the first read.
+        body2 = [
+            "s_mov_b32 s4, 0",
+            "s_mov_b32 s5, 5",
+            "v_mov_b32 v0, 100",
+            "BB_loop:",
+            "v_add_nc_u32 v0, v0, 7",
+            "s_add_u32 s4, s4, 1",
+            "s_cmp_lt_u32 s4, s5",
+            "s_cbranch_scc1 BB_loop",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv2 = support.translate_listing("ps_reg_fwd_single_loop", _encode_listing("ps_reg_fwd_single_loop", body2))
+        _validate_spirv(spv2)
+        res2 = run_wave(spv2, wave=32)
+        for lane in range(32):
+            self.assertEqual(tuple(res2["outputs"][lane]["%out_mrt0"]), (135, 135, 135, 135))
 
     def test_dynamic_s_movrels_reads_stored_sgpr_values(self):
         """store_reg still writes %sgpr so s_movrels_b32 reads the updated scalar values in the same block."""

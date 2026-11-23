@@ -260,7 +260,9 @@ def test_a16_sample_gradients_use_full_vgprs(make_shader):
     sample = re.search(r"= OpImageSampleExplicitLod %v4float %\w+ %\w+ Grad (%\w+) (%\w+)$", spvasm, re.M)
     assert sample, "the explicit-gradient sample is missing"
     definitions = dict(re.findall(r"^\s*(%\w+) = (Op[^\n]+)", spvasm, re.M))
-    stored_to = {val: ptr for ptr, val in re.findall(r"^\s*OpStore (%\w+) (%\w+)", spvasm, re.M)}
+    stored_to = {}
+    for ptr, val in re.findall(r"^\s*OpStore (%\w+) (%\w+)", spvasm, re.M):
+        stored_to.setdefault(val, []).append(ptr)
 
     # Trace dPdx and dPdy back to the fixture's full 32-bit derivative words, in operand order.
     for vector, registers in zip(sample.groups(), ((8, 9), (10, 11))):
@@ -273,11 +275,15 @@ def test_a16_sample_gradients_use_full_vgprs(make_shader):
             if word in definitions and definitions[word].startswith("OpLoad %uint "):
                 load, word_type, pointer = definitions[word].split()
                 assert (load, word_type) == ("OpLoad", "%uint")
+                pointers = [pointer]
             else:
-                pointer = stored_to[word]
-            *access, index = definitions[pointer].split()
-            assert access == ["OpAccessChain", "%_ptr_Function_uint", "%vgpr"]
-            assert definitions[index] == f"OpConstant %uint {register}"
+                pointers = stored_to[word]
+            vgpr_indices = []
+            for pointer in pointers:
+                *access, index = definitions[pointer].split()
+                if access == ["OpAccessChain", "%_ptr_Function_uint", "%vgpr"]:
+                    vgpr_indices.append(definitions[index])
+            assert f"OpConstant %uint {register}" in vgpr_indices
     shader.validate(spvasm)
 
 
