@@ -625,6 +625,29 @@ masks, in wave32 and wave64, and in multi-wave groups. The Intel mismatches went
 (50/50 native and 100/100 emulated for seeds 1 to 3). `ds_bpermute` (SHADER-31, #253) matches the model on gfx1150
 too, including "an off source lane reads 0" in both wave sizes.
 
+#### Hand-written LDS atomic fixtures (rows 321, 322, 324)
+
+The last three DS families that had no fixed GPU check now have hand-derived fixtures, so a regression names one op
+instead of a fuzz seed:
+
+- `cs_w32_lds_mskor.asm`: `ds_mskor_b32` and `ds_mskor_rtn_b32`. DATA2 bits outside DATA are ORed in, which is why
+  `0x11223344` with mask `0x0000FFFF` and DATA2 `0x00000008` ends at `0x11220008`, not `0x11223348`; `0xFFFF0000`
+  with mask `0x00FF00FF` and DATA2 `0x00000001` ends at `0xFF000001`.
+- `cs_w32_lds_atomics_incdec.asm` / `cs_w32_lds_atomics_rtn.asm`: `ds_inc_u32`, `ds_dec_u32` and `ds_rsub_u32`,
+  with and without return, at the `M == DATA`, `M > DATA`, `M == 0` and `M == 1` boundaries, the `DATA - M` wrap,
+  and the pre-op word each `_rtn_` form returns.
+- `cs_w32_lds_minmax_f32.asm`: `ds_min_f32`, `ds_max_f32` and the returning forms with a qNaN in either operand,
+  `-0`/`+0`, and `+inf`/`-inf`.
+- `cs_w32_lds_wrxchg_b64.asm`: `ds_wrxchg_rtn_b64` and `ds_wrxchg2_rtn_b64` with `offset0:1`/`offset1:2` (unit 8):
+  the old 64 bits, the two old pairs in vdst order, and the words written.
+- `cs_w32_lds_wrxchg2st64_b64.asm`: `ds_wrxchg2st64_rtn_b64` with offsets 1 and 2 at 0x200 and 0x400 (unit 512),
+  plus markers at 8 and 16 so a `*8` address cannot pass.
+
+All six ran on the RDNA2 iGPU of a Ryzen 5 9600X (`gfx1036`, RADV Mesa 27.0.0-devel, Vulkan 1.4.363) and returned
+exactly the eight words in each header, through both `runtime/test/shaders/check.py` and
+`scripts/run_gpu_tests.py`. `tests/semantic/test_batch5_gpu_fixtures.py` runs the same words through
+`spirv_mini_interp`. No translator mismatch appeared, so there was nothing to minimise.
+
 ### Memory instructions (`tools/mem_diff.py`, FUZZ-5)
 
 `cpu_ref.py` has no memory model, so memory instructions get their own runner. `tools/mem_diff.py`

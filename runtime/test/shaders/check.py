@@ -110,7 +110,7 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
                 "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
                 "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_andn2_exec",
                 "cs_mask_vgpr_exec", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi",
-                "cs_w32_exec_computed")
+                "cs_w32_exec_computed", "cs_w32_lds_mskor", "cs_w32_lds_atomics_incdec", "cs_w32_lds_atomics_rtn", "cs_w32_lds_minmax_f32", "cs_w32_lds_wrxchg_b64", "cs_w32_lds_wrxchg2st64_b64")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
@@ -118,7 +118,7 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_exec_const",
                      "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_andn2_exec", "cs_mask_vgpr_exec", "cs_w32_permlane_fi",
-                     "cs_w32_exec_computed")
+                     "cs_w32_exec_computed", "cs_w32_lds_mskor", "cs_w32_lds_atomics_incdec", "cs_w32_lds_atomics_rtn", "cs_w32_lds_minmax_f32", "cs_w32_lds_wrxchg_b64", "cs_w32_lds_wrxchg2st64_b64")
 CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_row", [0, 0, 1, 2, 3, 4, 5, 6]),
           ("cs_dpp_mask", [1, 0, 3, 2, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee]),
@@ -167,6 +167,22 @@ CS_DUMPS = [*CS_DPP, ("cs_smem_vcc_base", CS_SMEM_VCC), ("cs_store", CS_STORE), 
             # ds_mskor, ds_and/xor_b64, ds_add_rtn_f32, ds_inc/dec/rsub_u32 (cs_lds_atomics_ext.asm header)
             ("cs_lds_atomics_ext", [0xF0F11234, 0xAB34CD78, 0x12345678, 0xF0F00F0F,
                                     0xA5A55A5A, 0x00AA00AA, 0x7FB00000, 0xFE090700]),
+            # ds_mskor_b32 / ds_mskor_rtn_b32, DATA2 bits outside DATA ORed in (cs_w32_lds_mskor.asm header)
+            ("cs_w32_lds_mskor", [0x11223344, 0x11220008, 0xFFFF0000, 0xFF000001,
+                                  0xDEADBEEF, 0x5F5F5F5F, 0xFEEDFACE, 0x12345678]),
+            # ds_inc/dec/rsub_u32 boundaries, DATA = 5 (cs_w32_lds_atomics_incdec.asm header)
+            ("cs_w32_lds_atomics_incdec", [5, 0, 0, 5, 0, 4, 5, 0xFFFFFFFE]),
+            # the same ops' _rtn_ forms return the pre-op word (cs_w32_lds_atomics_rtn.asm header)
+            ("cs_w32_lds_atomics_rtn", [4, 5, 0, 5, 7, 0xFFFFFFFE, 5, 0]),
+            # ds_min/max_f32 with NaN, +-0 and +-inf (cs_w32_lds_minmax_f32.asm header)
+            ("cs_w32_lds_minmax_f32", [0x80000000, 0x00000000, 0x3F800000, 0x3F800000,
+                                       0x7FC00000, 0x3F800000, 0x3F800000, 0x3F800000]),
+            # ds_wrxchg_rtn_b64 and ds_wrxchg2_rtn_b64 (cs_w32_lds_wrxchg_b64.asm header)
+            ("cs_w32_lds_wrxchg_b64", [0x11111111, 0x88888888, 0x22222222, 0x44444444,
+                                       0x33333333, 0xCCCCCCCC, 0xDDDDDDDD, 0xEEEEEEEE]),
+            # ds_wrxchg2st64_rtn_b64, the 512-byte offsets (cs_w32_lds_wrxchg2st64_b64.asm header)
+            ("cs_w32_lds_wrxchg2st64_b64", [0x11111111, 0x44444444, 0x55555555, 0x88888888,
+                                            0x33333333, 0x77777777, 0xAAAAAAAA, 0xEEEEEEEE]),
             # constant EXEC: each lane takes its own bit (Intel got 16-bit constants wrong for lanes 16-31)
             ("cs_exec_const", [16, 8, 2, 16, 0, 16]),
             # a constant lane mask (saveexec, wrexec, s_and/s_not/s_mov_b64 into EXEC or VCC) gives lane L its bit L,
