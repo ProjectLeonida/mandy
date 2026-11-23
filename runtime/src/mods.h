@@ -30,13 +30,56 @@ namespace leonida::mods {
 
 // RAGE's joaat (Jenkins one-at-a-time over the lower-cased name): joaat("player_story000_00") = 0xE472B687,
 // joaat("cs_mandy") = 0xD7C0CDFF, the model ids docs/character_skeleton.md measured in the packs tables.
+//
+// The name comes from mod.json, which is UTF-8, and is hashed as tools/hashdict.py's joaat does, the rule the rest of
+// the pipeline is pinned to (tests/test_joaat_agreement.py): lower-case the text, then hash its Latin-1 bytes, with
+// '?' for a character Latin-1 can't hold. Hashing the UTF-8 bytes gave "Café" a hash no tool agrees with.
+namespace detail {
+
+constexpr void joaat_add(uint32_t& h, uint8_t byte) {
+    h += byte;
+    h += h << 10;
+    h ^= h >> 6;
+}
+
+// The next code point of a UTF-8 string, or 0xFFFFFFFF for a malformed sequence (one byte is consumed for it).
+constexpr uint32_t next_code_point(std::string_view s, std::size_t& i) {
+    const auto b0 = static_cast<unsigned char>(s[i++]);
+    if (b0 < 0x80) return b0;
+    int extra = b0 >= 0xC2 && b0 <= 0xDF ? 1 : b0 >= 0xE0 && b0 <= 0xEF ? 2 : b0 >= 0xF0 && b0 <= 0xF4 ? 3 : -1;
+    if (extra < 0 || i + static_cast<std::size_t>(extra) > s.size()) return 0xFFFFFFFFu;
+    uint32_t cp = b0 & (0x3Fu >> extra);
+    for (int k = 0; k < extra; ++k) {
+        const auto b = static_cast<unsigned char>(s[i + static_cast<std::size_t>(k)]);
+        if ((b & 0xC0) != 0x80) return 0xFFFFFFFFu;
+        cp = cp << 6 | (b & 0x3Fu);
+    }
+    // Overlong forms, surrogates and values past U+10FFFF are not UTF-8.
+    if ((extra == 2 && cp < 0x800) || (extra == 3 && (cp < 0x10000 || cp > 0x10FFFF)) || (cp >= 0xD800 && cp <= 0xDFFF))
+        return 0xFFFFFFFFu;
+    i += static_cast<std::size_t>(extra);
+    return cp;
+}
+
+}  // namespace detail
+
 constexpr uint32_t joaat(std::string_view name) {
     uint32_t h = 0;
-    for (char c : name) {
-        const auto u = static_cast<unsigned char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
-        h += u;
-        h += h << 10;
-        h ^= h >> 6;
+    for (std::size_t i = 0; i < name.size();) {
+        uint32_t cp = detail::next_code_point(name, i);
+        // Python's str.lower() for every code point whose lower case is in Latin-1: A-Z, U+00C0-U+00DE but U+00D7,
+        // U+0178 (Y with diaeresis), U+1E9E (capital sharp s), the Kelvin and Angstrom signs, and U+0130 (capital I
+        // with dot), which lowers to "i" and a combining dot that Latin-1 has no byte for.
+        if ((cp >= 'A' && cp <= 'Z') || (cp >= 0xC0 && cp <= 0xDE && cp != 0xD7)) cp += 0x20;
+        else if (cp == 0x178) cp = 0xFF;
+        else if (cp == 0x1E9E) cp = 0xDF;
+        else if (cp == 0x212A) cp = 'k';
+        else if (cp == 0x212B) cp = 0xE5;
+        else if (cp == 0x130) {
+            detail::joaat_add(h, 'i');
+            cp = '?';
+        }
+        detail::joaat_add(h, static_cast<uint8_t>(cp <= 0xFF ? cp : '?'));
     }
     h += h << 3;
     h ^= h >> 11;
