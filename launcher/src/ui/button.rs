@@ -118,6 +118,8 @@ struct State {
     drawn: Option<(Interaction, bool)>,
     /// Its glow under the pointer, fading in and out.
     lit: crate::ui::transition::Lit,
+    /// Its focus ring's glow, fading in and out with keyboard focus.
+    focus_lit: crate::ui::transition::Lit,
     /// Which button the state is: iced keeps a widget's state for whatever widget of its kind
     /// comes where it was, such as the Erase a wizard's next page puts where Next was.
     whose: Option<(Emphasis, String)>,
@@ -307,6 +309,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Button<Message> {
         }
         let interaction = self.interaction(state, over);
         state.lit.frame(event, shell);
+        state.focus_lit.frame(event, shell);
+        state.focus_lit.aim(state.focus.is_shown(), shell);
         state.lit.aim(
             matches!(interaction, Interaction::Hovered | Interaction::Pressed),
             shell,
@@ -353,7 +357,17 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Button<Message> {
         let clip = bounds.intersection(viewport).unwrap_or(bounds);
         paint::fill(renderer, &state.label, at, color(look.ink), clip);
         if focused {
-            paint::outline(renderer, theme, bounds, look.radius);
+            let glow = theme.focus_glow();
+            let share = if self.preview.is_some() {
+                1.0
+            } else {
+                state.focus_lit.share()
+            };
+            let glow = crate::ui::theme::Halo {
+                color: glow.color.opacity(glow.color.alpha() * share),
+                ..glow
+            };
+            paint::outline_glowing(renderer, theme, bounds, look.radius, glow);
         }
     }
 

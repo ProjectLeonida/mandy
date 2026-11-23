@@ -36,7 +36,7 @@ pub mod text;
 pub mod theme;
 pub mod toggle;
 pub mod tokens;
-mod transition;
+pub(crate) mod transition;
 pub mod window;
 
 pub use button::button;

@@ -85,6 +85,10 @@ impl Session {
         let _ = self.launcher.update(Message::Scale(scale));
         let later = Instant::now() + leonida_launcher::backdrop::DEBOUNCE * 2;
         let _ = self.launcher.update(Message::SceneTick(later));
+        // Its fade, run to the end, as the window's frames would.
+        let _ = self.launcher.update(Message::SceneFrame(later));
+        let whole = later + leonida_launcher::ui::tokens::motion::SCENE_IN;
+        let _ = self.launcher.update(Message::SceneFrame(whole));
     }
 
     /// Sends events to the view; the messages it publishes are kept, not applied.
@@ -169,6 +173,23 @@ pub fn key_event(key: Key, modifiers: Modifiers, pressed: bool) -> Event {
 }
 
 /// Writes RGBA pixels as a PNG.
+/// Draws any view of the launcher's kit, in a theme, at a size: for pictures of parts.
+pub fn render_view(
+    view: leonida_launcher::ui::Element<'_, Message>,
+    theme: &leonida_launcher::ui::Theme,
+    size: Size,
+) -> Vec<u8> {
+    let mut renderer = renderer();
+    let mut ui = UserInterface::build(view, size, Cache::default(), &mut renderer);
+    let style = Style {
+        text_color: iced::theme::Base::base(theme).text_color,
+    };
+    ui.draw(&mut renderer, theme, &style, mouse::Cursor::Unavailable);
+    let background = iced::theme::Base::base(theme).background_color;
+    let physical = Size::new(size.width as u32, size.height as u32);
+    renderer.screenshot(physical, 1.0, background)
+}
+
 pub fn write_png(path: &Path, size: (u32, u32), rgba: &[u8]) {
     if let Some(folder) = path.parent() {
         std::fs::create_dir_all(folder).unwrap();

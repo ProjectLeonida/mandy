@@ -647,9 +647,17 @@ impl Theme {
             Status::Failed => tinted(Accent::Red),
             Status::Running => tinted(Accent::Cyan),
             Status::Info => tinted(Accent::Violet),
-            Status::Waiting => Look {
-                line: Some(p.line),
-                ..Look::bare(radius::ROUND, p.ink(Ink::Muted))
+            // Waiting isn't lit. In dark, though, its line and its small light are the secondary
+            // color, the logo's orange: muted purple on the dark purple page hardly shows.
+            Status::Waiting => match p.mode {
+                crate::ui::tokens::Mode::Dark => Look {
+                    line: Some(p.accent_line(Accent::Cyan)),
+                    ..Look::bare(radius::ROUND, p.accent(Accent::Cyan))
+                },
+                crate::ui::tokens::Mode::Light => Look {
+                    line: Some(p.line),
+                    ..Look::bare(radius::ROUND, p.ink(Ink::Muted))
+                },
             },
         }
     }

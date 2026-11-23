@@ -44,11 +44,9 @@ fn one_generation_per_distinct_final_key() {
     let mut session = Session::new(app, SIZE);
     let generated = || GENERATED.load(Ordering::SeqCst);
 
-    // At start: one picture, once its key has held.
+    // At start: both modes' pictures, at once, with no wait.
     let _ = session.launcher.update(Message::SceneTick(Instant::now()));
-    assert_eq!(generated(), 0, "not before the wait");
-    settle(&mut session);
-    assert_eq!(generated(), 1);
+    assert_eq!(generated(), 2, "both modes, at once");
 
     // Many frames, the pointer moving, focus moving: nothing.
     for at in 0..30 {
@@ -59,7 +57,7 @@ fn one_generation_per_distinct_final_key() {
         session.press(Key::Named(Named::Tab), Modifiers::empty());
         settle(&mut session);
     }
-    assert_eq!(generated(), 1);
+    assert_eq!(generated(), 2);
 
     // Pages switched and back: nothing.
     for page in [
@@ -73,9 +71,10 @@ fn one_generation_per_distinct_final_key() {
         let _ = session.render(1.0);
         settle(&mut session);
     }
-    assert_eq!(generated(), 1);
+    assert_eq!(generated(), 2);
 
-    // A resize drag: many sizes, none held long enough, then the last one holds: one picture.
+    // A resize drag: many sizes, none held long enough, then the last one holds: both modes'
+    // pictures for it.
     let id = window::Id::unique();
     for step in 0..25 {
         let size = Size::new(
@@ -88,19 +87,18 @@ fn one_generation_per_distinct_final_key() {
         let _ = session.launcher.update(Message::SceneTick(Instant::now()));
         let _ = session.render(1.0);
     }
-    assert_eq!(generated(), 1, "nothing while the size keeps changing");
+    assert_eq!(generated(), 2, "nothing while the size keeps changing");
     settle(&mut session);
-    assert_eq!(generated(), 2, "once for the final size");
+    assert_eq!(generated(), 4, "both modes for the final size");
 
-    // Light: one more picture. Dark again, and light again: cached, nothing.
-    for (toggle, expected) in [(1, 3), (2, 3), (3, 3)] {
-        let _ = toggle;
+    // Light, dark, light: both are made already, nothing more.
+    for _ in 0..3 {
         let _ = session.launcher.update(Message::ToggleShade);
         settle(&mut session);
         let _ = session.render(1.0);
-        assert_eq!(generated(), expected);
+        assert_eq!(generated(), 4);
     }
-    assert_eq!(session.launcher.backdrop.generations, 3);
+    assert_eq!(session.launcher.backdrop.generations, 4);
 }
 
 /// The RGBA pixel at `x`, `y` of a frame `width` wide.

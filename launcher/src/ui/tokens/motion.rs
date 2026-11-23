@@ -12,6 +12,14 @@ pub const NORMAL: Duration = Duration::from_millis(200);
 /// Large movements.
 pub const SLOW: Duration = Duration::from_millis(400);
 
+/// A glow coming, as the pointer or focus arrives: slower than a hover's other changes, so light
+/// gathers rather than switches on. The one place to tune every fading glow.
+pub const GLOW_IN: Duration = Duration::from_millis(500);
+/// A glow going, as the pointer or focus leaves: slower still, an afterglow.
+pub const GLOW_OUT: Duration = Duration::from_millis(700);
+/// The Play page's scene appearing once it's made, from nothing to whole.
+pub const SCENE_IN: Duration = Duration::from_millis(500);
+
 /// The text caret's blink: shown this long, then hidden this long.
 pub const CARET_BLINK: Duration = Duration::from_millis(500);
 /// The caret blinks only this long after the last input, then stays shown, so nothing draws at

@@ -505,14 +505,12 @@ pub fn generate(input: &Input) -> Option<Picture> {
         mix(outline, bg, 0.34)
     });
     let silhouette_alpha = if dark { 1.0 } else { 0.88 };
-    let warm = lin(mix(coral, orange, 0.6));
-    let far_color = lin(magenta);
     let cloud = lin(mix(outline, magenta, 0.30));
     let pink_light = lin(pink);
     let streak_color = lin(mix(orange, white, if dark { 0.38 } else { 0.8 }));
     let line_color = lin(mix(orange, white, 0.5));
     let water = lin(if dark { bg } else { mix(bg, blue, 0.10) });
-    let (glow_amount, streak_amount) = if dark { (0.50, 1.25) } else { (0.30, 0.80) };
+    let streak_amount = if dark { 1.25 } else { 0.80 };
 
     let frame = placement(width as f32, height as f32);
     let mask = silhouettes(&frame, width, height)?;
@@ -547,11 +545,6 @@ pub fn generate(input: &Input) -> Option<Picture> {
             blend(&mut c, water, 0.30 + 0.62 * depth.powf(0.6));
             c
         };
-        let near = if above {
-            (fy / HORIZON).clamp(0.0, 1.0).powf(2.2)
-        } else {
-            0.45
-        };
         let dy = fy - HORIZON;
         let line_y = (-(dy / 0.0016).powi(2)).exp();
         let streak_width = 0.034 + 0.17 * depth;
@@ -570,13 +563,6 @@ pub fn generate(input: &Input) -> Option<Picture> {
             let dx = (fx - SUN_X) * ASPECT;
             let r = (dx * dx + dy * dy).sqrt();
             let mut c = base;
-            let glow = (-(r / 0.36).powf(1.5)).exp() * glow_amount * near;
-            if dark {
-                let far = smoothstep(0.08, 0.42, r);
-                add(&mut c, lerp3(warm, far_color, far), glow);
-            } else {
-                add(&mut c, white, glow);
-            }
             for &&(cx, cy, sx, sy, amount) in &clouds {
                 let ex = ((fx - cx) / sx).powi(2);
                 let m = (-(ex + ((fy - cy) / sy).powi(2))).exp() * amount;
@@ -723,9 +709,10 @@ mod tests {
         let mut changed = dark;
         changed.colors.gradient[2] = Color::hex(0x00ff00);
         let other = generate(&changed).unwrap();
-        // The sky over the sun's left, right of the fade, changes with the magenta stop.
-        let (sx, sy) = sun(1040.0, 754.0);
-        let (x, y) = ((sx - 160.0) as u32, (sy - 60.0) as u32);
+        // The sky at the magenta stop's height, at the right edge, clear of the fade, changes
+        // with it.
+        let frame = placement(1040.0, 754.0);
+        let (x, y) = (1030, (frame.top + 0.62 * HORIZON * frame.height) as u32);
         assert_ne!(pixel(&base, x, y), pixel(&other, x, y));
         let light = generate(&input(&Palette::SUNSET_LIGHT, (1040, 754), 1.0)).unwrap();
         assert_ne!(base.rgba, light.rgba);

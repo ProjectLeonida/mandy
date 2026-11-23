@@ -10,11 +10,11 @@
 
 use std::path::PathBuf;
 
-use leonida_launcher::app::{LEAST, Launcher, Message, SIZE};
+use leonida_launcher::app::{LEAST, Launcher, SIZE};
 use leonida_launcher::config;
 use leonida_launcher::repo;
 use leonida_launcher::ui::font;
-use leonida_launcher::ui::window::{Chrome, FrameSetting, settings};
+use leonida_launcher::ui::window::{FrameSetting, settings};
 
 const USAGE: &str = "usage: leonida-launcher [--repo PATH]
 
@@ -49,10 +49,7 @@ fn main() -> iced::Result {
     }
     let frame = FrameSetting::from_env();
     font::load();
-    let boot = move || {
-        let launcher = Launcher::new(repo.clone(), config::path(), frame);
-        (launcher, Chrome::boot().map(Message::Chrome))
-    };
+    let boot = move || Launcher::boot(repo.clone(), config::path(), frame);
     let mut application = iced::application(boot, Launcher::update, Launcher::view)
         .title("Leonida")
         .subscription(Launcher::subscription)

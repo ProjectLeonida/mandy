@@ -94,8 +94,9 @@ impl Transition {
     }
 }
 
-/// A control's glow coming and going: under the pointer it fades in, and away from it, out, over
-/// [`motion::FAST`], so light comes from interaction without a jump.
+/// A control's glow coming and going: under the pointer or with focus it fades in over
+/// [`motion::GLOW_IN`], and out over [`motion::GLOW_OUT`], so light comes from interaction without
+/// a jump.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct Lit {
     /// How lit it is, from 0 to 1, as of the last frame.
@@ -116,7 +117,12 @@ impl Lit {
             // Its first look: as it is, no fade.
             self.share = to;
         } else {
-            Transition::turn(&mut self.fade, self.share, to, motion::FAST, shell);
+            let whole = if lit {
+                motion::GLOW_IN
+            } else {
+                motion::GLOW_OUT
+            };
+            Transition::turn(&mut self.fade, self.share, to, whole, shell);
             if self.fade.is_none() {
                 self.share = to;
             }

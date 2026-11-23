@@ -86,6 +86,8 @@ struct Pressing {
     drawn: Option<(Interaction, bool)>,
     /// Its glow under the pointer, fading in and out.
     lit: crate::ui::transition::Lit,
+    /// Its focus ring's glow, fading in and out with keyboard focus.
+    focus_lit: crate::ui::transition::Lit,
 }
 
 impl Pressing {
@@ -189,6 +191,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for WindowButton<Message> 
         }
         let interaction = state.interaction(over);
         state.lit.frame(event, shell);
+        state.focus_lit.frame(event, shell);
+        state.focus_lit.aim(state.focus.is_shown(), shell);
         state.lit.aim(interaction != Interaction::Idle, shell);
         let now = (interaction, state.focus.is_shown());
         input::redraw_on_change(&mut state.drawn, now, event, shell);
@@ -237,6 +241,15 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for WindowButton<Message> 
         );
         if focused {
             let glow = theme.focus_glow().small();
+            let share = if self.preview.is_some() {
+                1.0
+            } else {
+                state.focus_lit.share()
+            };
+            let glow = crate::ui::theme::Halo {
+                color: glow.color.opacity(glow.color.alpha() * share),
+                ..glow
+            };
             paint::outline_glowing(renderer, theme, bounds, look.radius, glow);
         }
     }

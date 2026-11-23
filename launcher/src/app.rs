@@ -11,7 +11,7 @@ use iced::keyboard::{self, key::Named};
 use iced::widget::image;
 use iced::{Size, Subscription, Task};
 
-use crate::backdrop::{self, Backdrop, DEBOUNCE, Key};
+use crate::backdrop::{self, Backdrop, Key};
 use crate::scene::{self, Picture};
 use crate::ui::chrome::Corners;
 use crate::ui::tokens::window as decorations;
@@ -131,6 +131,8 @@ pub enum Message {
     SceneTick(Instant),
     /// A scene was generated for this key.
     SceneReady(Key, Option<Picture>),
+    /// A frame, while the scene fades in.
+    SceneFrame(Instant),
 }
 
 /// A command under way.
@@ -215,9 +217,8 @@ impl Launcher {
             logo: image::Handle::from_bytes(include_bytes!("../../assets/logo.png").as_slice()),
         };
         launcher.refresh();
-        launcher
-            .backdrop
-            .want(launcher.scene_input(), Instant::now());
+        let wanted = launcher.scene_wanted();
+        launcher.backdrop.want(wanted, Instant::now());
         launcher
     }
 
@@ -241,42 +242,79 @@ impl Launcher {
         )
     }
 
-    /// What the scene would be generated from now, and its key.
-    pub fn scene_input(&self) -> Option<(Key, scene::Input)> {
+    /// The scene's pictures the page wants now, the current mode's first, then the other's, so
+    /// a switch never waits.
+    pub fn scene_wanted(&self) -> Vec<(Key, scene::Input)> {
         let page = self.page_size();
-        let theme = self.chosen_theme();
-        let input = scene::Input {
-            colors: scene::Colors::of(theme.palette()),
-            width: (page.width * self.scale).round() as u32,
-            height: (page.height * self.scale).round() as u32,
-            scale: self.scale,
-            column: COLUMN,
-            corner: (self.chrome.corners() == Corners::Drawn)
-                .then_some(decorations::CORNER_RADIUS - decorations::BORDER),
-        };
-        Some((Key::of(&input, theme.name()), input))
+        let current = self.chosen_theme();
+        let other = Theme::new(match self.settings.shade {
+            Shade::Dark => Palette::SUNSET_LIGHT,
+            Shade::Light => Palette::SUNSET_DARK,
+        });
+        [current, other]
+            .into_iter()
+            .map(|theme| {
+                let input = scene::Input {
+                    colors: scene::Colors::of(theme.palette()),
+                    width: (page.width * self.scale).round() as u32,
+                    height: (page.height * self.scale).round() as u32,
+                    scale: self.scale,
+                    column: COLUMN,
+                    corner: (self.chrome.corners() == Corners::Drawn)
+                        .then_some(decorations::CORNER_RADIUS - decorations::BORDER),
+                };
+                (Key::of(&input, theme.name()), input)
+            })
+            .collect()
     }
 
-    /// Handles a message, then notes the scene the page wants now; a new one starts its wait.
+    /// The launcher as `main` boots it, and its first task: the window found, and the scene's
+    /// first tick, at once, so the Play page's pictures are made as the window opens.
+    pub fn boot(
+        repo: Result<PathBuf, String>,
+        settings_path: Option<PathBuf>,
+        frame: FrameSetting,
+    ) -> (Self, Task<Message>) {
+        let mut launcher = Self::new(repo, settings_path, frame);
+        let scene = launcher.scene_next(Instant::now());
+        (
+            launcher,
+            Task::batch([Chrome::boot().map(Message::Chrome), scene]),
+        )
+    }
+
+    /// Handles a message, then notes the scene's pictures the page wants now and schedules the
+    /// tick that makes the next, if one is needed and none is due: none is ever left waiting.
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
-        if self.backdrop.want(self.scene_input(), Instant::now()) {
-            Task::batch([task, wait(DEBOUNCE)])
-        } else {
-            task
+        let scene = self.scene_next(Instant::now());
+        Task::batch([task, scene])
+    }
+
+    fn scene_next(&mut self, now: Instant) -> Task<Message> {
+        self.backdrop.want(self.scene_wanted(), now);
+        match self.backdrop.schedule(now) {
+            Some(delay) => wait(delay),
+            None => Task::none(),
         }
     }
 
-    /// Generates the scene that's due, if one is: off this thread, or at once when synchronous.
+    /// Generates the picture that's due, if one is: off this thread, or at once when synchronous
+    /// (then every one that's due).
     fn generate_scene(&mut self, now: Instant) -> Task<Message> {
+        let generator = self.backdrop.generator;
+        if self.synchronous {
+            while let Some((key, input)) = self.backdrop.due(now) {
+                self.backdrop.finished(key, generator(&input));
+                if self.backdrop.schedule(now).is_none() {
+                    break;
+                }
+            }
+            return Task::none();
+        }
         let Some((key, input)) = self.backdrop.due(now) else {
             return Task::none();
         };
-        let generator = self.backdrop.generator;
-        if self.synchronous {
-            self.backdrop.finished(key, generator(&input));
-            return Task::none();
-        }
         let (sender, receiver) = iced::futures::channel::oneshot::channel();
         std::thread::spawn(move || {
             let _ = sender.send(generator(&input));
@@ -385,11 +423,9 @@ impl Launcher {
                 }
             }
             Message::SceneTick(now) => return self.generate_scene(now),
-            Message::SceneReady(key, picture) => {
-                self.backdrop.finished(key, picture);
-                // Another key may have come and held meanwhile.
-                return self.generate_scene(Instant::now());
-            }
+            // The next picture, if one is wanted, is scheduled after every message (`update`).
+            Message::SceneReady(key, picture) => self.backdrop.finished(key, picture),
+            Message::SceneFrame(at) => self.backdrop.frame(at),
             Message::Show(page) => {
                 self.page = page;
                 self.chrome.show_page();
@@ -614,7 +650,18 @@ impl Launcher {
         } else {
             Subscription::none()
         };
-        Subscription::batch([keys, Chrome::subscription().map(Message::Chrome), fading])
+        // Frames while the scene fades in, and none once it's whole.
+        let scene = if self.backdrop.is_fading() {
+            iced::window::frames().map(Message::SceneFrame)
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([
+            keys,
+            Chrome::subscription().map(Message::Chrome),
+            fading,
+            scene,
+        ])
     }
 
     /// The window: header bar, sidebar and the page.
@@ -638,30 +685,37 @@ impl Launcher {
         };
         let scrolled: Element<'_, Message> =
             scroll_area(container(page).padding(COLUMN_PAD).width(Fill)).into();
-        // The Play page's scene, under it: the cached picture, never made here. While a resize
-        // is under way, the last one, scaled to cover and kept to the bottom right.
-        let content = match (self.page, self.backdrop.current()) {
-            (
-                Page::Play,
-                Some(backdrop::Shown {
-                    handle: Some(handle),
-                    size,
-                }),
-            ) => {
-                let shown = backdrop::cover(*size, self.page_size());
-                let picture = image(handle.clone())
-                    .width(shown.width)
-                    .height(shown.height)
-                    .content_fit(iced::ContentFit::Fill);
-                let scene = container(picture)
-                    .width(Fill)
-                    .height(Fill)
-                    .align_x(iced::alignment::Horizontal::Right)
-                    .align_y(iced::alignment::Vertical::Bottom)
-                    .clip(true);
-                iced::widget::Stack::with_children([scene.into(), scrolled]).into()
-            }
-            _ => scrolled,
+        // The Play page's scene, under it: cached pictures, never made here. The one it replaces
+        // under the one fading in; while a resize is under way, the last one, scaled to cover and
+        // kept to the bottom right.
+        let content = if self.page == Page::Play {
+            let page = self.page_size();
+            let layer = |shown: &backdrop::Shown, opacity: f32| -> Option<Element<'_, Message>> {
+                let handle = shown.handle.clone()?;
+                let size = backdrop::cover(shown.size, page);
+                let picture = image(handle)
+                    .width(size.width)
+                    .height(size.height)
+                    .content_fit(iced::ContentFit::Fill)
+                    .opacity(opacity);
+                Some(
+                    container(picture)
+                        .width(Fill)
+                        .height(Fill)
+                        .align_x(iced::alignment::Horizontal::Right)
+                        .align_y(iced::alignment::Vertical::Bottom)
+                        .clip(true)
+                        .into(),
+                )
+            };
+            let (previous, shown) = self.backdrop.layers();
+            let mut layers: Vec<Element<'_, Message>> = Vec::new();
+            layers.extend(previous.and_then(|previous| layer(previous, 1.0)));
+            layers.extend(shown.and_then(|(shown, at)| layer(shown, at)));
+            layers.push(scrolled);
+            iced::widget::Stack::with_children(layers).into()
+        } else {
+            scrolled
         };
         // One focus scope round the whole window, as every window has it: Tab goes through the
         // header bar, the sidebar and the page.
