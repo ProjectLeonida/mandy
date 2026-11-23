@@ -63,15 +63,48 @@ pub(crate) fn outline_glowing(
     radius: f32,
     glow: Halo,
 ) {
+    outline_faded(renderer, theme, bounds, radius, glow, 1.0);
+}
+
+/// The focus outline with focus's glow, at `share` of its strength: a focus ring fades in and
+/// out on the glows' own timing, kept by the widget in a [`crate::ui::transition::Lit`].
+pub(crate) fn outline_lit(
+    renderer: &mut Renderer,
+    theme: &Theme,
+    bounds: Rectangle,
+    radius: f32,
+    share: f32,
+) {
+    outline_faded(renderer, theme, bounds, radius, theme.focus_glow(), share);
+}
+
+/// The focus outline with this glow, its line and glow both at `share` of their strength;
+/// nothing at all at none.
+pub(crate) fn outline_faded(
+    renderer: &mut Renderer,
+    theme: &Theme,
+    bounds: Rectangle,
+    radius: f32,
+    glow: Halo,
+    share: f32,
+) {
+    let share = share.clamp(0.0, 1.0);
+    if share <= 0.0 {
+        return;
+    }
     let outline = theme.outline();
     let grow = outline.offset + outline.width;
     let radius = radius.min(bounds.width / 2.0).min(bounds.height / 2.0);
     let bounds = bounds.expand(grow);
+    let glow = Halo {
+        color: glow.color.opacity(glow.color.alpha() * share),
+        ..glow
+    };
     renderer.fill_quad(
         renderer::Quad {
             bounds,
             border: Border {
-                color: color(outline.color),
+                color: color(outline.color.opacity(outline.color.alpha() * share)),
                 width: outline.width,
                 radius: (radius + grow).into(),
             },

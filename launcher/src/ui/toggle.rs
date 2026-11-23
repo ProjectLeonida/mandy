@@ -147,6 +147,8 @@ struct State {
     /// enough to be a drag. As a switch's knob: dragged, the highlight follows the pointer, and
     /// the choice changes when it's let go.
     drag: Option<(f32, f32, bool)>,
+    /// Its focus ring, fading in and out with keyboard focus on the glows' own timing.
+    focus_lit: crate::ui::transition::Lit,
 }
 
 impl State {
@@ -365,6 +367,8 @@ impl<Message> Widget<Message, Theme, Renderer> for ToggleGroup<'_, Message> {
             state.pressed = None;
             state.drag = None;
         }
+        state.focus_lit.frame(event, shell);
+        state.focus_lit.aim(state.focus.is_shown(), shell);
         let now = (over, state.pressed, state.focus.is_shown(), self.chosen);
         input::redraw_on_change(&mut state.drawn, now, event, shell);
     }
@@ -436,8 +440,14 @@ impl<Message> Widget<Message, Theme, Renderer> for ToggleGroup<'_, Message> {
             Some((_, _, focused)) => focused,
             None => state.focus.is_shown(),
         };
-        if focused && let Some(shown) = shown {
-            paint::outline(renderer, theme, shown, segment_radius);
+        // The focus ring fades in and out with keyboard focus, round the highlight wherever it is.
+        let ring = if self.preview.is_some() {
+            f32::from(u8::from(focused))
+        } else {
+            state.focus_lit.share()
+        };
+        if let Some(shown) = shown {
+            paint::outline_lit(renderer, theme, shown, segment_radius, ring);
         }
     }
 

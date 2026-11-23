@@ -247,6 +247,8 @@ struct TextState {
     drawn: Option<(Interaction, bool, u8, crate::ui::edit::Selection)>,
     /// Its glow under the pointer, fading in and out on the glows' own timing.
     lit: crate::ui::transition::Lit,
+    /// Its focus ring, fading in and out with focus on the same timing.
+    focus_lit: crate::ui::transition::Lit,
 }
 
 impl<Message: Clone> Widget<Message, Theme, Renderer> for TextField<'_, Message> {
@@ -412,6 +414,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TextField<'_, Message>
             matches!(shown, Interaction::Hovered | Interaction::Pressed),
             shell,
         );
+        let focused = line.focus.is_focused();
+        state.focus_lit.frame(event, shell);
+        state.focus_lit.aim(focused, shell);
         let now = (
             shown,
             line.focus.is_focused(),
@@ -458,6 +463,12 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TextField<'_, Message>
             area,
             &look,
             focused,
+            // The focus ring on its fade; a preview shows it as its state is.
+            if self.preview.is_some() {
+                f32::from(u8::from(focused))
+            } else {
+                state.focus_lit.share()
+            },
             self.preview.is_some(),
             self.value.is_empty(),
             |renderer, origin, top, clip| {

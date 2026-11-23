@@ -15,7 +15,8 @@ use crate::ui::tokens::{size, space, typography};
 use crate::ui::focus::Focus;
 use crate::ui::input;
 use crate::ui::paint::{self, Plain};
-use crate::ui::theme::{Interaction, color};
+use crate::ui::theme::{Interaction, Look, color};
+use crate::ui::transition::Lit;
 use crate::ui::{Element, Renderer, Theme};
 
 /// A single choice: what's chosen, if anything yet, and the message a new choice sends. Without
@@ -156,6 +157,11 @@ struct State {
     titles: Vec<Plain>,
     descriptions: Vec<Plain>,
     drawn: Option<Drawn>,
+    /// Each card's glows and focus ring, fading in and out on the glows' own timing: under the
+    /// pointer, chosen, and the focus ring round the current one.
+    hover_lit: Vec<Lit>,
+    chosen_lit: Vec<Lit>,
+    ring_lit: Vec<Lit>,
 }
 
 /// The card's padding, across and down; the radio's gap to the text is `space::L` too.
@@ -298,6 +304,25 @@ impl<T: Copy + PartialEq, Message> Widget<Message, Theme, Renderer> for Choice<'
         } else {
             state.pressed = None;
         }
+        // Each card's glows and focus ring fade in and out on the glows' own timing.
+        let count = self.options.len();
+        state.hover_lit.resize_with(count, Lit::default);
+        state.chosen_lit.resize_with(count, Lit::default);
+        state.ring_lit.resize_with(count, Lit::default);
+        let current = self.current();
+        let shown = state.focus.is_shown();
+        for at in 0..count {
+            let interaction = self.interaction(state, at, over == Some(at));
+            let enabled = interaction != Interaction::Disabled;
+            let hovered = matches!(interaction, Interaction::Hovered | Interaction::Pressed);
+            let chosen = Some(self.options[at].value) == self.chosen;
+            state.hover_lit[at].frame(event, shell);
+            state.hover_lit[at].aim(hovered, shell);
+            state.chosen_lit[at].frame(event, shell);
+            state.chosen_lit[at].aim(chosen && enabled, shell);
+            state.ring_lit[at].frame(event, shell);
+            state.ring_lit[at].aim(shown && current == Some(at), shell);
+        }
         let now = (over, state.pressed, state.focus.is_shown(), self.current());
         input::redraw_on_change(&mut state.drawn, now, event, shell);
     }
@@ -333,8 +358,43 @@ impl<T: Copy + PartialEq, Message> Widget<Message, Theme, Renderer> for Choice<'
             };
             let chosen = Some(option.value) == self.chosen;
             let look = theme.option(chosen, interaction);
+            let enabled = interaction != Interaction::Disabled;
+            let hovered = matches!(interaction, Interaction::Hovered | Interaction::Pressed);
+            // How lit each glow is: on their fades, or whole in a preview, a picture of a state.
+            let lit = |lits: &Vec<Lit>, whole: bool| match self.preview {
+                Some(_) => f32::from(u8::from(whole)),
+                None => lits.get(at).map_or(0.0, Lit::share),
+            };
+            let chosen_share = lit(&state.chosen_lit, chosen && enabled);
+            let hover_share = lit(&state.hover_lit, hovered);
+            let ring_share = lit(&state.ring_lit, focused && current == Some(at));
+            // The card: the chosen glow at its share, and under it the pointer's glow, which
+            // gives way to the chosen one as a card is chosen.
+            let chosen_glow = theme.option(true, Interaction::Idle).glow;
+            let hover_glow = theme.option(false, Interaction::Hovered).glow;
+            if let Some(glow) = hover_glow {
+                let card_hover = hover_share * (1.0 - chosen_share);
+                paint::boxed(
+                    renderer,
+                    bounds,
+                    &Look {
+                        fill: None,
+                        line: None,
+                        ..look
+                    }
+                    .lit(Some(glow), card_hover),
+                );
+            }
+            let look = Look { glow: None, ..look }.lit(chosen_glow, chosen_share);
             paint::boxed(renderer, bounds, &look);
+            // The radio circle glows under the pointer, on the same fade.
             let radio = theme.radio(chosen, interaction);
+            let radio_glow = theme.radio(chosen, Interaction::Hovered).glow;
+            let radio = Look {
+                glow: None,
+                ..radio
+            }
+            .lit(radio_glow, hover_share);
             let first_line = title.min_height();
             let circle = Rectangle::new(
                 Point::new(
@@ -362,9 +422,8 @@ impl<T: Copy + PartialEq, Message> Widget<Message, Theme, Renderer> for Choice<'
                 color(theme.ink(crate::ui::tokens::Ink::Muted)),
                 *viewport,
             );
-            if focused && current == Some(at) {
-                paint::outline(renderer, theme, bounds, look.radius);
-            }
+            // The focus ring round the current card fades in and out, and moves by fading.
+            paint::outline_lit(renderer, theme, bounds, look.radius, ring_share);
         }
     }
 

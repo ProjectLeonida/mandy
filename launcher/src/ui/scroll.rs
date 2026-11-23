@@ -270,6 +270,8 @@ struct State {
     /// Its own focus, when it takes focus: more to show than fits, and nothing in it that does.
     focus: Focus,
     takes: bool,
+    /// Its focus ring, fading in and out with keyboard focus on the glows' own timing.
+    focus_lit: crate::ui::transition::Lit,
 }
 
 /// How long the bar stays after the area stops moving, and how long it then takes to fade.
@@ -888,6 +890,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Smooth<'_, Message> {
                 state.focus.click();
             }
         }
+        // The focus ring fades in and out with keyboard focus, before any key handling returns.
+        {
+            let state = tree.state.downcast_mut::<State>();
+            let ringed = state.takes && state.focus.is_shown();
+            state.focus_lit.frame(event, shell);
+            state.focus_lit.aim(ringed, shell);
+        }
         if let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event
             && tree.state.downcast_ref::<State>().focus.is_focused()
             && input::plain(*modifiers)
@@ -1044,9 +1053,14 @@ impl<Message> Widget<Message, Theme, Renderer> for Smooth<'_, Message> {
                 );
             });
         }
-        if state.takes && state.focus.is_shown() {
-            paint::outline(renderer, theme, layout.bounds(), radius::CONTROL);
-        }
+        // The focus ring on its fade, drawn while it fades out too.
+        paint::outline_lit(
+            renderer,
+            theme,
+            layout.bounds(),
+            radius::CONTROL,
+            state.focus_lit.share(),
+        );
     }
 
     fn mouse_interaction(

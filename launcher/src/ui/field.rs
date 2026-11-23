@@ -253,7 +253,8 @@ fn key_edit<'k>(
     }
 }
 
-/// Draws a field's box, and inside its text area the selection, the content and the caret.
+/// Draws a field's box, and inside its text area the selection, the content and the caret; then
+/// the focus ring at `ring` of its strength, as it fades in and out.
 #[allow(clippy::too_many_arguments)]
 fn draw_line(
     renderer: &mut Renderer,
@@ -263,6 +264,7 @@ fn draw_line(
     area: Rectangle,
     look: &Look,
     focused: bool,
+    ring: f32,
     preview: bool,
     empty: bool,
     content: impl FnOnce(&mut Renderer, f32, f32, Rectangle),
@@ -328,9 +330,7 @@ fn draw_line(
     } else {
         inside(renderer);
     }
-    if focused {
-        paint::outline(renderer, theme, bounds, look.radius);
-    }
+    paint::outline_lit(renderer, theme, bounds, look.radius, ring);
 }
 
 /// Whether a press is outside a field: it lets go of focus, as a click elsewhere does, without

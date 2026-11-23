@@ -113,6 +113,8 @@ struct State {
     drawn: Option<(Interaction, bool, bool)>,
     /// Its glow while on, fading in and out on the glows' own timing, apart from the knob.
     lit: crate::ui::transition::Lit,
+    /// Its focus ring, fading in and out with keyboard focus on the same timing.
+    focus_lit: crate::ui::transition::Lit,
 }
 
 impl State {
@@ -294,6 +296,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Switch<'_, Message> {
         }
         state.lit.frame(event, shell);
         state.lit.aim(self.on && self.on_toggle.is_some(), shell);
+        state.focus_lit.frame(event, shell);
+        state.focus_lit.aim(state.focus.is_shown(), shell);
         let now = (
             self.interaction(state, over),
             state.focus.is_shown(),
@@ -364,9 +368,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Switch<'_, Message> {
             knob,
             &Look::solid(on.knob.opacity(on.knob.alpha() * at), radius),
         );
-        if focused {
-            paint::outline(renderer, theme, track, off.track.radius);
-        }
+        // The focus ring fades in and out with keyboard focus, drawn while it fades out too.
+        let ring = if self.preview.is_some() {
+            f32::from(u8::from(focused))
+        } else {
+            state.focus_lit.share()
+        };
+        paint::outline_lit(renderer, theme, track, off.track.radius, ring);
     }
 
     fn mouse_interaction(

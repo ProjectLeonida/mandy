@@ -239,19 +239,20 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for WindowButton<Message> 
             size::ICON_STROKE,
             color(look.ink),
         );
-        if focused {
-            let glow = theme.focus_glow().small();
-            let share = if self.preview.is_some() {
-                1.0
-            } else {
-                state.focus_lit.share()
-            };
-            let glow = crate::ui::theme::Halo {
-                color: glow.color.opacity(glow.color.alpha() * share),
-                ..glow
-            };
-            paint::outline_glowing(renderer, theme, bounds, look.radius, glow);
-        }
+        // The focus ring fades in and out with keyboard focus, drawn while it fades out too.
+        let ring = if self.preview.is_some() {
+            f32::from(u8::from(focused))
+        } else {
+            state.focus_lit.share()
+        };
+        paint::outline_faded(
+            renderer,
+            theme,
+            bounds,
+            look.radius,
+            theme.focus_glow().small(),
+            ring,
+        );
     }
 
     fn mouse_interaction(

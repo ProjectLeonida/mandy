@@ -356,19 +356,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Button<Message> {
         // Kept to the button: a label wider than a set width doesn't spill onto its neighbours.
         let clip = bounds.intersection(viewport).unwrap_or(bounds);
         paint::fill(renderer, &state.label, at, color(look.ink), clip);
-        if focused {
-            let glow = theme.focus_glow();
-            let share = if self.preview.is_some() {
-                1.0
-            } else {
-                state.focus_lit.share()
-            };
-            let glow = crate::ui::theme::Halo {
-                color: glow.color.opacity(glow.color.alpha() * share),
-                ..glow
-            };
-            paint::outline_glowing(renderer, theme, bounds, look.radius, glow);
-        }
+        // The focus ring fades in and out with keyboard focus, its line and glow together: drawn
+        // while it's fading out too, after focus has gone.
+        let ring = if self.preview.is_some() {
+            f32::from(u8::from(focused))
+        } else {
+            state.focus_lit.share()
+        };
+        paint::outline_lit(renderer, theme, bounds, look.radius, ring);
     }
 
     fn mouse_interaction(

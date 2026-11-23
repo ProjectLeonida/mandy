@@ -213,6 +213,8 @@ struct State {
     /// than a slip, so it scrolls the rows rather than choosing one.
     drag: Option<Swipe>,
     drawn: Option<Drawn>,
+    /// Its focus ring, fading in and out with keyboard focus on the glows' own timing.
+    focus_lit: crate::ui::transition::Lit,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -462,6 +464,8 @@ impl<Message> Widget<Message, Theme, Renderer> for List<'_, Message> {
         } else {
             state.pressed = None;
         }
+        state.focus_lit.frame(event, shell);
+        state.focus_lit.aim(state.focus.is_shown(), shell);
         let now = Drawn {
             over,
             pressed: state.pressed,
@@ -567,14 +571,20 @@ impl<Message> Widget<Message, Theme, Renderer> for List<'_, Message> {
             Some((_, _, focused)) => focused,
             None => state.focus.is_shown(),
         };
-        if focused {
+        // The focus ring fades in and out with keyboard focus, drawn while it fades out too.
+        let ring = if self.preview.is_some() {
+            f32::from(u8::from(focused))
+        } else {
+            state.focus_lit.share()
+        };
+        if ring > 0.0 {
             let outlined = self.outlined(bounds, state.first);
             let radius = if self.sidebar {
                 crate::ui::tokens::radius::CHIP
             } else {
                 frame.radius
             };
-            paint::outline(renderer, theme, outlined, radius);
+            paint::outline_lit(renderer, theme, outlined, radius, ring);
         }
     }
 
