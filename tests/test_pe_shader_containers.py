@@ -14,6 +14,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -301,6 +302,20 @@ class ReportPathTests(unittest.TestCase):
 def psv0(stage_code: int) -> bytes:
     """Build a minimal PSV0 chunk payload whose ShaderStage byte is `stage_code`."""
     return struct.pack("<I", 48) + bytes(24) + bytes([stage_code]) + bytes(23)
+
+
+class JsonPreserveTests(unittest.TestCase):
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '[{"previous": true}]'
+            js = os.path.join(tmp, "census.json")
+            with open(js, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(psc, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    psc.write_json_report(js, [{"shaders": 1}])
+            with open(js, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
 
 
 class Psv0StageTests(unittest.TestCase):
