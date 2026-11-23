@@ -1,7 +1,7 @@
 """RDNA2 (GFX10.1/GFX10.3) opcode tables for tools/rdna2_decode.py.
 
 Derived from AMD's machine-readable RDNA2 ISA specification (amdgpu_isa_rdna2.xml,
-MIT licence; https://gpuopen.com/machine-readable-isa), plus the seven gfx1013
+MIT licence; https://gpuopen.com/machine-readable-isa), plus the eight gfx1013
 legacy/waveid instructions documented in docs/isa_coverage.md.
 """
 
@@ -1145,6 +1145,7 @@ VOP3 = {
     0x168: ('v_ldexp_f64', (('VDST', 2, 'f64'), ('SRC0', 2, 'f64'), ('SRC1', 1, 'i'))),
     0x169: ('v_mul_lo_u32', (('VDST', 1, 'i'), ('SRC0', 1, 'i'), ('SRC1', 1, 'i'))),
     0x16a: ('v_mul_hi_u32', (('VDST', 1, 'i'), ('SRC0', 1, 'i'), ('SRC1', 1, 'i'))),
+    0x16b: ('v_mul_lo_i32', (('VDST', 1, 'i'), ('SRC0', 1, 'i'), ('SRC1', 1, 'i'))),
     0x16c: ('v_mul_hi_i32', (('VDST', 1, 'i'), ('SRC0', 1, 'i'), ('SRC1', 1, 'i'))),
     0x16f: ('v_div_fmas_f32', (('VDST', 1, 'f32'), ('SRC0', 1, 'f32'), ('SRC1', 1, 'f32'), ('SRC2', 1, 'f32'))),
     0x170: ('v_div_fmas_f64', (('VDST', 2, 'f64'), ('SRC0', 2, 'f64'), ('SRC1', 2, 'f64'), ('SRC2', 2, 'f64'))),

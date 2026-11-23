@@ -5,7 +5,7 @@ Decodes raw RDNA2 machine code directly into either:
   - `shader_ir`-compatible `.s` disassembly text with `; encoding: [...]` (`disasm_bytes`).
 
 Opcode tables in `tools/rdna2_isa_tables.py` are derived from AMD's MIT-licensed
-machine-readable RDNA2 ISA specification (`amdgpu_isa_rdna2.xml`), plus the seven
+machine-readable RDNA2 ISA specification (`amdgpu_isa_rdna2.xml`), plus the eight
 gfx1013 legacy/waveid instructions documented in `docs/isa_coverage.md`.
 
 Standard library only; no game data, no external tools.
