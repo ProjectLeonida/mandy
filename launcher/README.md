@@ -178,8 +178,9 @@ the SIL Open Font License 1.1, with their licence files beside them.
 
 ## Not done
 
-- Not run on Windows, on a real GPU window, or against a real build: the tests use a stand-in
-  script and offscreen drawing only.
+- Run in a real window on Linux only (Wayland, an RX 7900 XTX), not yet on Windows or macOS, and
+  not through a complete build or a real launch: the tests use a stand-in script and offscreen
+  drawing.
 - The translator's fallback flags (`--no-float-controls`, `--bary-fallback`,
   `--texel-offset-fallback`, `--f16-interp-fallback`, `--mesh-compute`, `--pc-tail-ubo`) and
   `--runtime-build` have no controls yet; they are real options and could go on a Compatibility
