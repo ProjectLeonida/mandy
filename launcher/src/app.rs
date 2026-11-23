@@ -219,7 +219,7 @@ impl Launcher {
             veils: Palette::ALL
                 .iter()
                 .map(|palette| {
-                    let picture = crate::scene::veil(palette.surface(Surface::Bg));
+                    let picture = crate::scene::veil(palette.veil());
                     (
                         palette.name,
                         image::Handle::from_rgba(picture.width, picture.height, picture.rgba),
@@ -723,7 +723,9 @@ impl Launcher {
             layers.extend(previous.and_then(|previous| layer(previous, 1.0)));
             layers.extend(shown.and_then(|(shown, at)| layer(shown, at)));
             // The veil over the scene, stretched to the page, so it follows a resize at once;
-            // while the mode changes, the old one under the new one fading in.
+            // while the mode changes, the old one fading out as the new one fades in. Both are
+            // see-through, so the old one must go as the new one comes: left whole under it, it
+            // would show through to the end and then vanish at once.
             if !layers.is_empty() {
                 let veil = |palette: &Palette, opacity: f32| -> Option<Element<'_, Message>> {
                     let (_, handle) = self.veils.iter().find(|(name, _)| *name == palette.name)?;
@@ -740,7 +742,7 @@ impl Launcher {
                 let chosen = self.chosen_theme();
                 match self.chrome.theme_fade() {
                     Some((from, share)) => {
-                        layers.extend(veil(from.palette(), 1.0));
+                        layers.extend(veil(from.palette(), 1.0 - share));
                         layers.extend(veil(chosen.palette(), share));
                     }
                     None => layers.extend(veil(chosen.palette(), 1.0)),
@@ -823,9 +825,12 @@ impl Launcher {
             })
             .on_press_maybe(primary.enabled().then_some(Message::Act(primary.action)));
         actions = actions.push(main);
+        // The others beside it, large as the main button is, so the row lines up.
         for (action, enabled) in state::secondary(&facts) {
             actions = actions.push(
-                button(action.label()).on_press_maybe(enabled.then_some(Message::Act(action))),
+                button(action.label())
+                    .large()
+                    .on_press_maybe(enabled.then_some(Message::Act(action))),
             );
         }
         if running.is_some() {

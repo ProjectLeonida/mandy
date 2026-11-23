@@ -332,10 +332,16 @@ pub struct Palette {
     pub title_bar: super::effect::EdgeTints,
 }
 
+/// How far the veil's color goes from the background toward the logo's purple (dark) and its
+/// orange (light): a tint, not a color of its own ([`Palette::veil`]).
+pub const VEIL_TINT_DARK: f32 = 0.18;
+pub const VEIL_TINT_LIGHT: f32 = 0.12;
+
 impl Palette {
     /// Sunset in dark: the logo's near-black purple shadow as the app's background, surfaces a
     /// step either side of it, its deep purple outline as the line. The logo's dark purple is the
-    /// main color (the main action, selection, the brand) and its light orange the secondary
+    /// main color (selection, the brand; the main action alone is filled orange, to stand out on
+    /// the purple page) and its light orange the secondary
     /// (focus, what can be acted on, every glow).
     pub const SUNSET_DARK: Palette = Palette {
         theme: ThemeName::Sunset,
@@ -352,9 +358,10 @@ impl Palette {
         body: Color::hex(0xe4d5f3),
         muted: Color::hex(0xb9a2d2),
         dim: Color::hex(0x7c5e9c),
-        // The main action's fill is the logo's dark purple itself, with light text on it.
-        main_fill: logo::OUTLINE,
-        on_main: Color::hex(0xf7efff),
+        // The main action's fill is the logo's orange itself, with the logo's shadow as its ink, so
+        // the one button that starts things stands out on the purple page, glowing orange too.
+        main_fill: logo::ORANGE,
+        on_main: logo::SHADOW,
         // Each accent's soft and line opacities: Neon dark's, but amber's soft (8%).
         accents: [
             // Cyan, the secondary: the logo's light orange, as it is.
@@ -560,6 +567,16 @@ impl Palette {
         }
     }
 
+    /// The veil over the Play page's scene: the background, tinted a little toward the logo's
+    /// purple in dark and its orange in light, so the scene fades into the theme's own color
+    /// rather than into plain background. Every text ink keeps 4.5:1 on it.
+    pub fn veil(&self) -> Color {
+        match self.mode {
+            Mode::Dark => self.bg.mix(logo::OUTLINE, VEIL_TINT_DARK),
+            Mode::Light => self.bg.mix(logo::ORANGE, VEIL_TINT_LIGHT),
+        }
+    }
+
     pub const fn ink(&self, ink: Ink) -> Color {
         match ink {
             Ink::Text => self.text,
@@ -664,6 +681,24 @@ mod tests {
                         surface.name()
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn every_ink_reads_on_the_veil() {
+        for palette in Palette::ALL {
+            let veil = palette.veil();
+            // A tint of the background, the logo's purple in dark and its orange in light.
+            assert_ne!(veil, palette.surface(Surface::Bg), "{}", palette.name);
+            for ink in Ink::ALL {
+                let ratio = contrast(palette.ink(ink), veil);
+                assert!(
+                    ratio >= 4.5,
+                    "{}: {} on the veil: {ratio:.2}",
+                    palette.name,
+                    ink.name()
+                );
             }
         }
     }
@@ -788,11 +823,12 @@ mod tests {
         assert_eq!(light.ink(Ink::Text), logo::SHADOW);
         assert_eq!(dark.line, logo::OUTLINE);
         // The two colors: in dark, purple the main and orange the secondary; in light, the other
-        // way round. The main's fill is the logo's color itself.
+        // way round. The main action's fill is the logo's orange in both, its ink the shadow.
         assert_eq!(
             (dark.main_fill, light.main_fill),
-            (logo::OUTLINE, logo::ORANGE)
+            (logo::ORANGE, logo::ORANGE)
         );
+        assert_eq!((dark.on_main, light.on_main), (logo::SHADOW, logo::SHADOW));
         assert_eq!(dark.accent(Accent::Cyan), logo::ORANGE);
         assert_eq!(light.accent(Accent::Cyan), logo::OUTLINE);
         // As text, the main keeps its hue: purple's blue over red, orange's red over the rest.

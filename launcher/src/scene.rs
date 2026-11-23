@@ -632,7 +632,7 @@ fn clear_corner(rgba: &mut [u8], width: u32, height: u32, radius: f32) {
 /// across and down at once, in shares of the page: the window stretches the picture over the
 /// page as it is drawn, so it fits any size at once.
 pub const VEIL: f32 = 0.85;
-pub const VEIL_FROM: f32 = 0.15;
+pub const VEIL_FROM: f32 = 0.35;
 pub const VEIL_KNEE: f32 = 0.10;
 /// The veil's picture is this many pixels square; stretched, it stays smooth.
 pub const VEIL_SIZE: u32 = 512;
@@ -807,9 +807,9 @@ mod tests {
     }
 
     #[test]
-    fn the_veils_picture_is_the_background_at_the_veils_opacity() {
+    fn the_veils_picture_is_the_veil_color_at_the_veils_opacity() {
         for palette in Palette::ALL {
-            let bg = palette.surface(crate::ui::tokens::Surface::Bg);
+            let bg = palette.veil();
             let picture = veil(bg);
             assert_eq!((picture.width, picture.height), (VEIL_SIZE, VEIL_SIZE));
             let pixel = |x: u32, y: u32| {

@@ -461,14 +461,20 @@ impl Theme {
         }
         match emphasis {
             // The main action: the main color itself as its fill, its own ink on it; under the
-            // pointer it glows in the secondary color, and pressed, the secondary lines it.
+            // pointer it glows in the secondary color, and pressed, the secondary lines it, or
+            // the main color where the fill is the secondary's own (dark's orange button).
             Emphasis::Primary => {
                 let look = Look::boxed(p.main_fill, p.main_fill, radius::BUTTON, p.on_main);
+                let pressed_line = if p.accent(Accent::Cyan) == p.main_fill {
+                    p.accent(Accent::Magenta)
+                } else {
+                    p.accent(Accent::Cyan)
+                };
                 match interaction {
                     Interaction::Idle => look,
                     Interaction::Hovered => look.glowing(self.selected_glow()),
                     _ => Look {
-                        line: Some(p.accent(Accent::Cyan)),
+                        line: Some(pressed_line),
                         ..look
                     }
                     .glowing(self.selected_glow()),

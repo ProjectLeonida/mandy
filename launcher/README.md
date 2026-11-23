@@ -150,8 +150,9 @@ sidebar list, settings groups, form, the window's own decorations and the folded
 
 - **Palettes**: Sunset dark and light, from the logo's pixels. Its light orange and dark purple
   are the two colors: in light, orange is the main one (the main button's fill, selection, the
-  brand) and purple the secondary (focus, switches, every glow); in dark, the other way round.
-  The main button is filled with the logo's own color and its own ink; as text or a line, each
+  brand) and purple the secondary (focus, switches, every glow); in dark, the other way round,
+  except that the main button stays orange, with an orange glow, to stand out on the purple
+  page. It is filled with the logo's orange and its shadow as ink; as text or a line, each
   color keeps its hue but is darkened (light) or lightened (dark) only as far as 4.5:1 needs.
   Information is the logo's blue, errors its coral, warnings a gold. The logo's near-black
   purple shadow is dark's background and light's text, its deep purple outline dark's lines. A
