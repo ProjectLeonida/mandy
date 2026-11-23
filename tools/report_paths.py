@@ -80,6 +80,26 @@ def _same_resolved_name(first, second):
         return False
 
 
+_WORK_ROOTS = {}
+_WORK_ROOTS_LIMIT = 1 << 14
+
+
+def work_root(disasm_path):
+    """The work folder a disasm path belongs to: two levels above it, with symlinks resolved.
+
+    Everything that reads `index.json`, the `.dxbc` input signatures or the `fssm` headers derives this root from the
+    same disasm path, up to sixteen times per shader. `os.path.realpath` is a `_getfinalpathname` call on Windows
+    (~40 us) and a build translates 26,503 shaders, so the answer is kept per path. It cannot change while a build
+    runs; the cap clears the table in a process that walks a whole corpus.
+    """
+    cached = _WORK_ROOTS.get(disasm_path)
+    if cached is None:
+        if len(_WORK_ROOTS) >= _WORK_ROOTS_LIMIT:
+            _WORK_ROOTS.clear()
+        cached = _WORK_ROOTS[disasm_path] = os.path.dirname(os.path.dirname(os.path.realpath(disasm_path)))
+    return cached
+
+
 def same_report_path(first, second):
     # Resolve each path once: the key and the volume probe both want the resolved name, and a guard runs once
     # per input file, so a second realpath per path is the whole cost of the check (see #6220's review).

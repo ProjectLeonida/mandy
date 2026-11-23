@@ -30,7 +30,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
-from report_paths import path_key, same_report_path  # noqa: E402
+from report_paths import path_key, same_report_path, work_root  # noqa: E402
 from shader_ir import HDR, parse_file  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
 from file_mode import published_mode  # noqa: E402
@@ -16488,7 +16488,7 @@ def stage_of(name, path):
     global _STAGES
     if _STAGES is None:
         import json
-        idx = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "index.json")
+        idx = os.path.join(work_root(path), "index.json")
         _STAGES = {}
         if os.path.isfile(idx):
             with open(idx, encoding="utf-8") as f:
@@ -16978,7 +16978,7 @@ def shader_container(path, name):
     source isn't in the carve has none (docs/shader_library.md): Unsupported for that shader, where the bare open()
     raised FileNotFoundError and stopped the whole run."""
     try:
-        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc"), "rb") as f:
+        with open(os.path.join(work_root(path), name + ".dxbc"), "rb") as f:
             return f.read()
     except FileNotFoundError:
         raise Unsupported("no shader container (signatures, PSV0)") from None
@@ -17192,7 +17192,7 @@ def output_signature(path, name):
 
 def output_signature_full(path, name):
     """OSG1 elements as (register, semantic_index, system_value, mask, rw_mask)."""
-    dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
+    dxbc = os.path.join(work_root(path), name + ".dxbc")
     if not os.path.isfile(dxbc):
         return []
     with open(dxbc, "rb") as f:
@@ -17297,7 +17297,7 @@ def mesh_psv(path, name):
 def native_paths(path, name):
     """The .s file's sources next to its folder: fssm/<name>.fssm for the game's shaders, and fspx/<name>.code and
     fspx/<name>.json for the FSPX programs tools/fspx_unpack.py writes (docs/fspx.md)."""
-    root = os.path.dirname(os.path.dirname(os.path.realpath(path)))
+    root = work_root(path)
     return (os.path.join(root, "fssm", name + ".fssm"), os.path.join(root, "fspx", name + ".code"),
             os.path.join(root, "fspx", name + ".json"))
 
@@ -17664,7 +17664,7 @@ def translate(path):
         # 12,101 PS overcount by one or more), and the mask marks 16-bit interpolants for the v_interp path
         # above. No sidecar, or a sidecar with no table, leaves the code-driven declarations untouched.
         try:
-            with open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "fssm",
+            with open(os.path.join(work_root(path), "fssm",
                                    info["name"] + ".fssm"), "rb") as f:
                 blob = f.read()
             count, fp16 = fssm_header.interpolants(blob)
