@@ -5,7 +5,7 @@
 	v_mov_b32_e32 v1, -1
 	buffer_atomic_inc v1, v20, s[0:3], 0 offen glc
 	v_mov_b32_e32 v20, 8
-	v_mov_b32_e32 v8, 20
+	v_mov_b32_e32 v8, 19
 	buffer_atomic_inc v8, v20, s[0:3], 0 offen
 	v_mov_b32_e32 v20, 12
 	v_mov_b32_e32 v6, -1

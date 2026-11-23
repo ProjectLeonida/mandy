@@ -55,7 +55,7 @@ DEC_MAX, DEC_OLDS = sequential(dec, M32)
 EXPECTED = [
     INC_MAX,
     (F + sum(1 << (o - F) for o in INC_OLDS)) & M32,
-    sequential(inc, 20)[0],
+    sequential(inc, 19)[0],
     DEC_MAX,
     sequential(dec, 5)[0],
     max([F] + INC_OLDS),
@@ -66,7 +66,9 @@ EXPECTED = [
 
 class AtomicContendFixture(unittest.TestCase):
     def test_reference(self):
-        self.assertEqual(EXPECTED, [0xEEEEEF0E, 0xEEEEEEED, 0xA, 0xEEEEEECE, 0x4, 0xEEEEEF0D, 0xEEEEEECF, 0xEEEEEEED])
+        self.assertEqual(EXPECTED, [0xEEEEEF0E, 0xEEEEEEED, 0xB, 0xEEEEEECE, 0x4, 0xEEEEEF0D, 0xEEEEEECF, 0xEEEEEEED])
+        # word 2 must tell inc from dec: with D = 20 (or 2, 6, 8) both end at 10 (@sovljanskii on #4331)
+        self.assertNotEqual(sequential(inc, 19)[0], sequential(dec, 19)[0])
 
     def test_a_lost_update_changes_the_sums(self):
         # one returned value twice and another missing: the bit sum is not F + ~0 any more

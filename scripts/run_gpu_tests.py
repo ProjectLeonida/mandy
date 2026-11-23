@@ -1236,7 +1236,7 @@ def run_suite(a, work: str) -> int:
                 # ds_cmpst_f32 and buffer_atomic_fcmpswap: float compare (cs_w32_fcmpswap.asm)
                 "cs_w32_fcmpswap": [0, 0x3F800000, 0x7FC00000, 0x3F800000, 0x80000000, 0x40400000, 0x3F800000, 0x7FC00000],
                 # buffer_atomic_inc/dec with all 32 lanes on the same dwords (cs_w32_atomic_contend.asm)
-                "cs_w32_atomic_contend": [0xEEEEEF0E, 0xEEEEEEED, 0xA, 0xEEEEEECE, 0x4, 0xEEEEEF0D, 0xEEEEEECF, 0xEEEEEEED],
+                "cs_w32_atomic_contend": [0xEEEEEF0E, 0xEEEEEEED, 0xB, 0xEEEEEECE, 0x4, 0xEEEEEF0D, 0xEEEEEECF, 0xEEEEEEED],
                 "cs_w32_new_ops": [0x55, 0x8001, 0xC0000000, 0x80014000, 0x4000FFFF, 0x77, 0x99, 0x1234],
                 "cs_w32_misc_ext": [0x0FFF0FFF, 0xE2C4A688, 0x0007FFFF, 0x7FFF8000, 0xFFFE0002, 0xFFFF0005, 0x509, 0xCAFEF00D],
                 "cs_w32_salu64": [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE],

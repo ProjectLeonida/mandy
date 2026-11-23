@@ -6,14 +6,15 @@
 ;   out[0] = 32 x inc, D = ~0: F + 32                                                      = 0xEEEEEF0E
 ;   out[1] = F + sum of 1 << (old - F) over out[0]'s returned values: F + 0xFFFFFFFF iff each of 0..31 came once
 ;                                                                                            = 0xEEEEEEED
-;   out[2] = 32 x inc, D = 20: the first gives 0 (F >= D), then it wraps every 21: 31 mod 21  = 0x0000000A
+;   out[2] = 32 x inc, D = 19: the first gives 0 (F >= D), then it wraps every 20: 31 mod 20  = 0x0000000B
+;            (D = 19, not 20: with 20 a dec swapped in would also end at 10, @sovljanskii on #4331; dec gives 8)
 ;   out[3] = 32 x dec, D = ~0: F - 32                                                       = 0xEEEEEECE
 ;   out[4] = 32 x dec, D = 5: the first gives 5 (F > D), then 5,4,..,0 repeats: 5 - 31 mod 6 = 0x00000004
 ;   out[5] = umax of F and out[0]'s returned values: F + 31                                  = 0xEEEEEF0D
 ;   out[6] = umin of F and out[3]'s returned values: F - 31                                  = 0xEEEEEECF
 ;   out[7] = F + sum of 1 << (F - old) over out[3]'s returned values                         = 0xEEEEEEED
 ; group: 32,1,1
-; Run: vk_compute_test cs_w32_atomic_contend.spv 1 dump -> out[0..7] = 4008636174 4008636141 10 4008636110 4 4008636173 4008636111 4008636141
+; Run: vk_compute_test cs_w32_atomic_contend.spv 1 dump -> out[0..7] = 4008636174 4008636141 11 4008636110 4 4008636173 4008636111 4008636141
 ; mattr: +wavefrontsize32,-wavefrontsize64
 ; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 v_mov_b32_e32 v3, 0xeeeeeeee
@@ -22,7 +23,7 @@ v_mov_b32_e32 v20, 0
 v_mov_b32_e32 v1, -1
 buffer_atomic_inc v1, v20, s[0:3], 0 offen glc
 v_mov_b32_e32 v20, 8
-v_mov_b32_e32 v8, 20
+v_mov_b32_e32 v8, 19
 buffer_atomic_inc v8, v20, s[0:3], 0 offen
 v_mov_b32_e32 v20, 12
 v_mov_b32_e32 v6, -1
