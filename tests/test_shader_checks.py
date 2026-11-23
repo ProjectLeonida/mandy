@@ -303,7 +303,7 @@ class FloatToIntSweep(unittest.TestCase):
 
         def harness(_tool, _shader, *_args, env=None):
             calls.append(env.get("VKC_SUBGROUP_SIZE"))
-            return 1, "compute subgroup size: 32 not available\n"
+            return 1, "compute subgroup size: 32 not available\nout[0..7] = 0 0 0 0 0 0 0 0\n"
 
         with patch.object(check, "run", side_effect=harness), \
                 patch.object(check, "subgroup_size", return_value=32):
@@ -968,6 +968,26 @@ class Wave32LaneDumps(unittest.TestCase):
             with patch.object(check, "run", return_value=(0, out)):
                 problem = check.compute_test("tools", tmp, "cs_barrier_loop", "1", "dump", expected_words=[128])
         self.assertIsInstance(problem, check.Skip)
+
+    def test_unpinned_dump_does_not_hide_child_failure(self):
+        warning = "compute subgroup size: 32 not available\n"
+        words = "out[0..7] = 0 0 0 0 0 0 0 0\n"
+        cases = ((0, warning + words, True),
+                 (1, warning + words, True),  # wrong-width words are unjudged
+                 (1, warning + words + "1 validation errors\n", False),
+                 (1, warning, False),  # failed before producing a complete dump
+                 (2, warning + words, False),
+                 (77, "unsupported: requested feature unavailable\n", True))
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "index.json").write_text(json.dumps({"cs_barrier_loop": {"subgroup_size": 32}}),
+                                               encoding="utf-8")
+            for code, out, skipped in cases:
+                with self.subTest(code=code, out=out), patch.object(check, "run", return_value=(code, out)):
+                    problem = check.compute_test("tools", tmp, "cs_barrier_loop", "1", "dump",
+                                                 expected_words=[128])
+                self.assertEqual(isinstance(problem, check.Skip), skipped, problem)
+                if not skipped:
+                    self.assertIn(f"exit {code}", problem)
 
     def test_skipped_when_32_lanes_cannot_be_pinned(self):
         for name in check.WAVE32_LANE_DUMPS:
