@@ -101,9 +101,11 @@ def doc_notes(path: str, rel: str) -> list[dict]:
         if DEFINITION.match(body[m.end():].lstrip()):
             continue
         end = i + 1
-        while end < len(lines) and lines[end].strip() and not lines[end].lstrip().startswith(("- ", "* ", "#", "|")):
+        while (end < len(lines) and lines[end].strip() and
+               not LIST_ITEM.match(lines[end].lstrip()) and
+               not lines[end].lstrip().startswith(("#", "|"))):
             end += 1
-        text = " ".join(re.sub(r"^[-*] ", "", l.strip()) for l in lines[i:end])
+        text = " ".join(LIST_ITEM.sub("", l.strip()) for l in lines[i:end])
         notes.append({"file": rel, "line": i + 1, "kind": m.group(1).upper(), "text": without_marker(text)})
     return notes
 

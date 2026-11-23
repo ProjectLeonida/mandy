@@ -99,6 +99,29 @@ class ExeChecklist(unittest.TestCase):
         self.assertEqual(docs[2]["text"], "the same note in the docs' prose spelling.")
         self.assertEqual(docs[3]["text"], "the plural spelling is a note too.")
 
+    def test_doc_notes_stop_at_numbered_and_plus_list_items(self):
+        sample = """# Numbered and Plus Lists
+1. **VERIFY:** first numbered note
+   continuation line.
+2. **VERIFY:** second numbered note.
+3) **UNVERIFIED:** parenthesis numbered note.
++ **ASSUMPTION:** plus list note
+  wrapped plus line.
++ **VERIFY:** second plus note.
+"""
+        path = os.path.join(self.root, "docs", "lists.md")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(sample)
+        notes = ec.doc_notes(path, "docs/lists.md")
+        self.assertEqual(len(notes), 5)
+        self.assertEqual([(n["line"], n["kind"]) for n in notes],
+                         [(2, "VERIFY"), (4, "VERIFY"), (5, "UNVERIFIED"), (6, "ASSUMPTION"), (8, "VERIFY")])
+        self.assertEqual(notes[0]["text"], "first numbered note continuation line.")
+        self.assertEqual(notes[1]["text"], "second numbered note.")
+        self.assertEqual(notes[2]["text"], "parenthesis numbered note.")
+        self.assertEqual(notes[3]["text"], "plus list note wrapped plus line.")
+        self.assertEqual(notes[4]["text"], "second plus note.")
+
     def test_a_marker_inside_a_sentence_or_a_table_row_is_prose(self):
         with open(os.path.join(self.root, "docs", "demo.md"), "a", encoding="utf-8", newline="\n") as f:
             f.write("| `v_demo` | written without the console (**Assumption**: not a note) |\n"
