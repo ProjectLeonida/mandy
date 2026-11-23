@@ -35,6 +35,21 @@ int main() {
     static_assert(joaat("mandy") == 0x03A885E6u, "Mandy's PERSCHARS name hash");
     static_assert(joaat("CS_Mandy") == joaat("cs_mandy"), "joaat lower-cases");
 
+    // mod.json is UTF-8; a name is hashed as tools/hashdict.py's joaat hashes it (lower-cased text, Latin-1 bytes,
+    // '?' for what Latin-1 can't hold). The values are hashdict.joaat's.
+    static_assert(joaat("Caf\xC3\xA9") == 0xEEFBF723u, "Café: one Latin-1 byte for the e-acute");
+    static_assert(joaat("caf\xC3\xA9") == 0xEEFBF723u, "café");
+    static_assert(joaat("\xC3\x89L\xC3\x89GIE") == 0xF5EB747Au, "capital E-acute lower-cases");
+    static_assert(joaat("Cr\xC3\xA8me Br\xC3\xBBl\xC3\xA9" "e") == 0xBBC22EA7u, "Crème Brûlée");
+    static_assert(joaat("Radio_LosSantos_Caf\xC3\xA9") == 0x305CEAD6u, "ASCII and Latin-1 together");
+    static_assert(joaat("a\xC3\x97" "b") == 0x5D67E58Cu, "the multiplication sign has no lower case");
+    static_assert(joaat("\xC5\xB8" "A") == 0x9E5B1DCEu, "U+0178 lowers to U+00FF");
+    static_assert(joaat("\xE1\xBA\x9E") == 0x7CC87953u, "U+1E9E lowers to U+00DF");
+    static_assert(joaat("\xE2\x84\xAA" "elvin") == 0x17744599u, "the Kelvin sign lowers to k");
+    static_assert(joaat("\xE2\x84\xAB") == 0x3A547468u, "the Angstrom sign lowers to U+00E5");
+    static_assert(joaat("\xC4\xB0stanbul") == 0x555FF021u, "U+0130 lowers to i and a dot Latin-1 can't hold");
+    static_assert(joaat("\xE6\x97\xA5\xE6\x9C\xAC") == 0x003CB73Au, "one '?' per character outside Latin-1");
+
     uint32_t id = 0;
     check(parse_model_id("0xD7C0CDFF", id) && id == 0xD7C0CDFFu, "a 0x hash is taken as it is");
     check(parse_model_id("cs_monalisa", id) && id == 0x9CB9BCC6u, "a name is hashed");
