@@ -256,11 +256,11 @@ def safe_stem(name: str | None, index: int) -> str:
     return stem or f"container_{index:02d}"
 
 
-def extract(data: bytes, records: list[dict], directory: str) -> list[dict]:
+def extract(data: bytes, records: list[dict], directory: str, start_index: int = 0) -> list[dict]:
     """Write each container as `<module>.dxbc`; return the translator's index entries."""
     os.makedirs(directory, exist_ok=True)
     index = []
-    for k, record in enumerate(records):
+    for k, record in enumerate(records, start=start_index):
         stem = safe_stem(record["name"], k)
         file = f"{stem}.dxbc"
         target = os.path.join(directory, file)
@@ -345,9 +345,9 @@ def main(argv=None) -> int:
                 )
         if a.extract:
             try:
-                index.extend(extract(data, records, a.extract))
+                index.extend(extract(data, records, a.extract, start_index=len(index)))
             except OSError as e:
-                print(f"ERROR: cannot write {a.extract}: {e}", file=sys.stderr)
+                print(f"ERROR: cannot write {a.extract}: {e.strerror or e}", file=sys.stderr)
                 return 2
 
     if a.extract:
@@ -355,7 +355,7 @@ def main(argv=None) -> int:
             with open(index_path, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(index, f, indent=0)
         except OSError as e:
-            print(f"ERROR: cannot write {index_path}: {e}", file=sys.stderr)
+            print(f"ERROR: cannot write {index_path}: {e.strerror or e}", file=sys.stderr)
             return 2
         print(f"  extracted {len(index)} file(s) to {a.extract}")
         print("  these are game data: do not commit them", file=sys.stderr)
@@ -364,7 +364,7 @@ def main(argv=None) -> int:
         try:
             write_json_report(a.json, all_records)
         except OSError as e:
-            print(f"ERROR: cannot write {a.json}: {e}", file=sys.stderr)
+            print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 2
         print(f"wrote {a.json}")
     return status
