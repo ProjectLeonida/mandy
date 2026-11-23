@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Every status chip, side by side on the Play page's background in each mode: over the text
-//! column (the page's background at 0.97 over the scene) and over the scene itself. Written as a
-//! PNG for the eye, to `$LEONIDA_LAUNCHER_SCREENSHOTS/chips-<mode>.png`; checked here for its
-//! words' contrast on the chip, over the column.
+//! Every status chip, side by side on the Play page's scene in each mode, at the page's left and
+//! over the scene's bright part. Written as a PNG for the eye, to
+//! `$LEONIDA_LAUNCHER_SCREENSHOTS/chips-<mode>.png`; checked here for its words' contrast on the
+//! chip, over the page's background.
 
 mod common;
 
@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use iced::Size;
 use iced::widget::{Stack, column, container, image, row};
 
-use leonida_launcher::app::{COLUMN, Message};
+use leonida_launcher::app::Message;
 use leonida_launcher::scene::{self, Colors, Input};
 use leonida_launcher::ui::theme::Status;
 use leonida_launcher::ui::tokens::color::contrast;
@@ -41,7 +41,6 @@ fn every_chip_on_the_play_pages_background() {
             width: size.width as u32,
             height: size.height as u32,
             scale: 1.0,
-            column: COLUMN,
             corner: None,
         })
         .unwrap();

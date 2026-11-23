@@ -177,14 +177,15 @@ pub struct Launcher {
     /// The logo, decoded once: a handle made anew in every view would be a new image every frame,
     /// uploaded again while anything animates.
     logo: image::Handle,
+    /// The veil over the Play page's scene, one per palette by its name, made once
+    /// ([`crate::scene::veil`]).
+    veils: Vec<(&'static str, image::Handle)>,
 }
 
 /// The Play page's text column: its padding either side of its content, and its content's width,
 /// in logical pixels. Text sits on the page only inside it; the scene's fade keeps it readable.
 pub const COLUMN_PAD: f32 = space::XXL;
 pub const COLUMN_CONTENT: f32 = 420.0;
-/// The column's whole width from the page's left edge, as the scene's fade takes it.
-pub const COLUMN: f32 = COLUMN_PAD + COLUMN_CONTENT + space::XXL;
 
 impl Launcher {
     /// The launcher for a repository, with its settings file (none: not saved).
@@ -215,6 +216,16 @@ impl Launcher {
             synchronous: false,
             scale: 1.0,
             logo: image::Handle::from_bytes(include_bytes!("../../assets/logo.png").as_slice()),
+            veils: Palette::ALL
+                .iter()
+                .map(|palette| {
+                    let picture = crate::scene::veil(palette.surface(Surface::Bg));
+                    (
+                        palette.name,
+                        image::Handle::from_rgba(picture.width, picture.height, picture.rgba),
+                    )
+                })
+                .collect(),
         };
         launcher.refresh();
         let wanted = launcher.scene_wanted();
@@ -259,7 +270,6 @@ impl Launcher {
                     width: (page.width * self.scale).round() as u32,
                     height: (page.height * self.scale).round() as u32,
                     scale: self.scale,
-                    column: COLUMN,
                     corner: (self.chrome.corners() == Corners::Drawn)
                         .then_some(decorations::CORNER_RADIUS - decorations::BORDER),
                 };
@@ -400,8 +410,8 @@ impl Launcher {
             Kind::Play => commands::play(self.platform, &self.exe, &self.settings),
         };
         made.map_err(|missing| match missing {
-            Missing::Package => "Choose the game package folder in Settings.".to_owned(),
-            Missing::Output => "Choose an output folder in Settings.".to_owned(),
+            Missing::Package => "Choose the game package folder on the Game files page.".to_owned(),
+            Missing::Output => "Choose an output folder on the Game files page.".to_owned(),
         })
     }
 
@@ -712,6 +722,30 @@ impl Launcher {
             let mut layers: Vec<Element<'_, Message>> = Vec::new();
             layers.extend(previous.and_then(|previous| layer(previous, 1.0)));
             layers.extend(shown.and_then(|(shown, at)| layer(shown, at)));
+            // The veil over the scene, stretched to the page, so it follows a resize at once;
+            // while the mode changes, the old one under the new one fading in.
+            if !layers.is_empty() {
+                let veil = |palette: &Palette, opacity: f32| -> Option<Element<'_, Message>> {
+                    let (_, handle) = self.veils.iter().find(|(name, _)| *name == palette.name)?;
+                    Some(
+                        image(handle.clone())
+                            .width(Fill)
+                            .height(Fill)
+                            .content_fit(iced::ContentFit::Fill)
+                            .filter_method(image::FilterMethod::Linear)
+                            .opacity(opacity)
+                            .into(),
+                    )
+                };
+                let chosen = self.chosen_theme();
+                match self.chrome.theme_fade() {
+                    Some((from, share)) => {
+                        layers.extend(veil(from.palette(), 1.0));
+                        layers.extend(veil(chosen.palette(), share));
+                    }
+                    None => layers.extend(veil(chosen.palette(), 1.0)),
+                }
+            }
             layers.push(scrolled);
             iced::widget::Stack::with_children(layers).into()
         } else {

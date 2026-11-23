@@ -221,6 +221,11 @@ impl Chrome {
         }
     }
 
+    /// While the theme fades: the one it fades from and how far into the new one it is.
+    pub fn theme_fade(&self) -> Option<(Theme, f32)> {
+        self.fade.map(|fade| (fade.from, fade.share()))
+    }
+
     /// The theme to draw in: the app's, `theme`, or while it fades in, on the way to it.
     pub fn theme(&self, theme: Theme) -> Theme {
         match &self.fade {

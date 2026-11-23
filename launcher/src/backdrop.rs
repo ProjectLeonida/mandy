@@ -29,7 +29,6 @@ pub struct Page {
     pub width: u32,
     pub height: u32,
     scale: u32,
-    column: u32,
     corner: Option<u32>,
 }
 
@@ -48,7 +47,6 @@ impl Key {
                 width: input.width,
                 height: input.height,
                 scale: input.scale.to_bits(),
-                column: input.column.to_bits(),
                 corner: input.corner.map(f32::to_bits),
             },
             theme,
@@ -277,7 +275,6 @@ mod tests {
             width,
             height: 600,
             scale: 1.0,
-            column: 468.0,
             corner: None,
         };
         let dark = input(&Palette::SUNSET_DARK);

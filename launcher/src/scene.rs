@@ -5,14 +5,13 @@
 //! of the page's size. Nothing of it is an image file: a theme's colours go in, pixels come out.
 //!
 //! The scene lives in a 16:10 frame, its horizon at 0.66 of its height and its sun at 0.805 of
-//! its width, and covers the page anchored to the page's bottom right. Over the text column on
-//! the left the page's background lies at 0.97 opacity, then falls away smoothly, so the text
-//! there keeps its contrast whatever the scene does. However narrow the page, the scene stays:
-//! the column's background covers what lies under the text.
+//! its width, and covers the page anchored to the page's bottom right. The picture is the scene
+//! alone: the window lays its veil over it ([`veil`]), a linear gradient of the
+//! page's background from the top left to the bottom right, sized to the page as it is drawn.
 //!
 //! [`generate`] is a pure function: the same input gives the same bytes. It's slow enough (tens
-//! of milliseconds) that the window runs it off its thread, once per size, scale, theme, mode and
-//! column width, and shows the cached picture.
+//! of milliseconds) that the window runs it off its thread, once per size, scale, theme and
+//! mode, and shows the cached picture.
 
 use tiny_skia::{FillRule, Mask, Path, PathBuilder, Stroke, Transform};
 
@@ -24,12 +23,6 @@ pub const ASPECT: f32 = 16.0 / 10.0;
 pub const HORIZON: f32 = 0.66;
 /// The sun's centre, as a share of the frame's width.
 pub const SUN_X: f32 = 0.805;
-/// The background's opacity over the text column.
-pub const SOLID: f32 = 0.97;
-/// The least the fade takes beside the column, in logical pixels, on a page too narrow for more.
-pub const MIN_FADE: f32 = 48.0;
-/// The share of the page's width the fade takes at most.
-const FADE_SPAN: f32 = 0.40;
 /// The sun's radius, as a share of the frame's height.
 const SUN_RADIUS: f32 = 0.112;
 
@@ -69,8 +62,6 @@ pub struct Input {
     pub height: u32,
     /// Physical pixels to a logical one.
     pub scale: f32,
-    /// The text column's width from the page's left edge, in logical pixels.
-    pub column: f32,
     /// The window's rounded corner at the page's bottom right, its radius in logical pixels, if
     /// the window floats with drawn corners: the picture is clear outside it.
     pub corner: Option<f32>,
@@ -271,15 +262,6 @@ pub fn sun(width: f32, height: f32) -> (f32, f32) {
     )
 }
 
-/// The background's opacity at `x` logical pixels from the page's left, on a page `page`
-/// logical pixels wide with a text column `column` wide. However narrow the page, the scene
-/// stays: the column's background covers what of it lies under the text, and the fade takes what
-/// room is left beside it, at least [`MIN_FADE`].
-pub fn fade(x: f32, page: f32, column: f32) -> Option<f32> {
-    let span = (FADE_SPAN * page).min(page - column).max(MIN_FADE);
-    Some(SOLID * (1.0 - smoothstep(column, column + span, x)))
-}
-
 /// The palms' and the shore's coverage of the page, 0..255 a pixel.
 fn silhouettes(frame: &Placement, width: u32, height: u32) -> Option<Mask> {
     let mut mask = Mask::new(width, height)?;
@@ -466,7 +448,6 @@ pub fn generate(input: &Input) -> Option<Picture> {
     if width == 0 || height == 0 || input.scale <= 0.0 {
         return None;
     }
-    let page = width as f32 / input.scale;
     let colors = &input.colors;
     let dark = colors.dark;
     let white = [1.0, 1.0, 1.0];
@@ -505,12 +486,14 @@ pub fn generate(input: &Input) -> Option<Picture> {
         mix(outline, bg, 0.34)
     });
     let silhouette_alpha = if dark { 1.0 } else { 0.88 };
+    let warm = lin(mix(coral, orange, 0.6));
+    let far_color = lin(magenta);
     let cloud = lin(mix(outline, magenta, 0.30));
     let pink_light = lin(pink);
     let streak_color = lin(mix(orange, white, if dark { 0.38 } else { 0.8 }));
     let line_color = lin(mix(orange, white, 0.5));
     let water = lin(if dark { bg } else { mix(bg, blue, 0.10) });
-    let streak_amount = if dark { 1.25 } else { 0.80 };
+    let (glow_amount, streak_amount) = if dark { (0.50, 1.25) } else { (0.30, 0.80) };
 
     let frame = placement(width as f32, height as f32);
     let mask = silhouettes(&frame, width, height)?;
@@ -526,10 +509,6 @@ pub fn generate(input: &Input) -> Option<Picture> {
     };
     let encode: Vec<f32> = (0..=4096).map(|i| to_srgb(i as f32 / 4096.0)).collect();
     let encode = |c: f32| encode[(c.clamp(0.0, 1.0) * 4096.0) as usize];
-
-    let fades: Vec<f32> = (0..width)
-        .map(|x| fade((x as f32 + 0.5) / input.scale, page, input.column).unwrap_or(0.0))
-        .collect();
     let corner = input.corner.map(|radius| radius * input.scale);
 
     let mut rgba = vec![0u8; width as usize * height as usize * 4];
@@ -544,6 +523,11 @@ pub fn generate(input: &Input) -> Option<Picture> {
             let mut c = sky.at(1.0 - 0.55 * depth.powf(0.75));
             blend(&mut c, water, 0.30 + 0.62 * depth.powf(0.6));
             c
+        };
+        let near = if above {
+            (fy / HORIZON).clamp(0.0, 1.0).powf(2.2)
+        } else {
+            0.45
         };
         let dy = fy - HORIZON;
         let line_y = (-(dy / 0.0016).powi(2)).exp();
@@ -563,6 +547,13 @@ pub fn generate(input: &Input) -> Option<Picture> {
             let dx = (fx - SUN_X) * ASPECT;
             let r = (dx * dx + dy * dy).sqrt();
             let mut c = base;
+            let glow = (-(r / 0.36).powf(1.5)).exp() * glow_amount * near;
+            if dark {
+                let far = smoothstep(0.08, 0.42, r);
+                add(&mut c, lerp3(warm, far_color, far), glow);
+            } else {
+                add(&mut c, white, glow);
+            }
             for &&(cx, cy, sx, sy, amount) in &clouds {
                 let ex = ((fx - cx) / sx).powi(2);
                 let m = (-(ex + ((fy - cy) / sy).powi(2))).exp() * amount;
@@ -597,8 +588,7 @@ pub fn generate(input: &Input) -> Option<Picture> {
             if a > 0.0 {
                 blend(&mut c, silhouette, a);
             }
-            let mut s = c.map(encode);
-            blend(&mut s, bg, fades[x as usize]);
+            let s = c.map(encode);
             let at = (row + x as usize) * 4;
             for (channel, value) in s.iter().enumerate() {
                 let noise = dither(x, y, channel as u32) * 0.9 / 255.0;
@@ -636,11 +626,56 @@ fn clear_corner(rgba: &mut [u8], width: u32, height: u32, radius: f32) {
     }
 }
 
+/// The veil over the scene: the page's background at [`VEIL`], held from the top left to
+/// [`VEIL_FROM`] of the way to the bottom right, then thinning on a straight line to nothing at
+/// the bottom right corner, the bend between the two rounded over [`VEIL_KNEE`]. "The way" is
+/// across and down at once, in shares of the page: the window stretches the picture over the
+/// page as it is drawn, so it fits any size at once.
+pub const VEIL: f32 = 0.85;
+pub const VEIL_FROM: f32 = 0.15;
+pub const VEIL_KNEE: f32 = 0.10;
+/// The veil's picture is this many pixels square; stretched, it stays smooth.
+pub const VEIL_SIZE: u32 = 512;
+
+/// The veil's opacity `along` the way from the top left (0) to the bottom right (1).
+pub fn veil_at(along: f32) -> f32 {
+    let s = (along - VEIL_FROM) / (1.0 - VEIL_FROM);
+    let k = VEIL_KNEE / (1.0 - VEIL_FROM);
+    // Linear past the knee; a parabola through it, meeting the hold and the line at their slopes.
+    let thinned = if s <= -k {
+        0.0
+    } else if s < k {
+        (s + k) * (s + k) / (4.0 * k)
+    } else {
+        s
+    };
+    VEIL * (1.0 - thinned.min(1.0))
+}
+
+/// The veil's picture over a page whose background is `bg`: [`VEIL_SIZE`] square, dithered.
+pub fn veil(bg: Color) -> Picture {
+    let size = VEIL_SIZE;
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    let [r, g, b] = bg.rgb8();
+    for y in 0..size {
+        for x in 0..size {
+            let across = (x as f32 + 0.5) / size as f32;
+            let down = (y as f32 + 0.5) / size as f32;
+            let alpha = veil_at((across + down) / 2.0) * 255.0 + dither(x, y, 3) * 0.9;
+            rgba.extend_from_slice(&[r, g, b, alpha.round().clamp(0.0, 255.0) as u8]);
+        }
+    }
+    Picture {
+        width: size,
+        height: size,
+        rgba,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::tokens::color::contrast;
-    use crate::ui::tokens::{Ink, Mode, Palette};
+    use crate::ui::tokens::{Mode, Palette};
 
     fn input(palette: &Palette, size: (u32, u32), scale: f32) -> Input {
         Input {
@@ -648,7 +683,6 @@ mod tests {
             width: size.0,
             height: size.1,
             scale,
-            column: 468.0,
             corner: None,
         }
     }
@@ -657,43 +691,6 @@ mod tests {
         let at = ((y * picture.width + x) * 4) as usize;
         let [r, g, b] = [0, 1, 2].map(|c| u32::from(picture.rgba[at + c]));
         Color::hex((r << 16) | (g << 8) | b)
-    }
-
-    #[test]
-    fn muted_text_reads_on_every_pixel_under_the_column() {
-        for palette in Palette::ALL {
-            let muted = palette.ink(Ink::Muted);
-            for (size, scale) in [((1040, 754), 1.0), ((720, 594), 1.0), ((2320, 1394), 2.0)] {
-                let input = input(&palette, size, scale);
-                let picture = generate(&input).expect("wide enough");
-                let column = (input.column * scale) as u32;
-                let mut worst = f64::MAX;
-                for y in 0..picture.height {
-                    for x in 0..column {
-                        worst = worst.min(contrast(muted, pixel(&picture, x, y)));
-                    }
-                }
-                assert!(worst >= 4.5, "{}: {size:?}: {worst:.2}", palette.name);
-            }
-        }
-    }
-
-    #[test]
-    fn a_narrow_page_keeps_its_scene_beside_the_column() {
-        let palette = Palette::SUNSET_DARK;
-        let bg = palette.surface(crate::ui::tokens::Surface::Bg);
-        // Narrower than the column and a fade's room: the scene stays, the column covered.
-        for (width, scale) in [(600_u32, 1.0), (520, 1.0), (1200, 2.0)] {
-            let picture = generate(&input(&palette, (width, 600), scale)).expect("always a scene");
-            let right = pixel(&picture, width - 4, 560);
-            assert_ne!(
-                right, bg,
-                "{width} at {scale}x: the scene at the right edge"
-            );
-        }
-        // The fade still covers the column, and takes at least its least room beside it.
-        assert_eq!(fade(0.0, 600.0, 468.0), Some(SOLID));
-        assert!(fade(468.0 + MIN_FADE, 500.0, 468.0).unwrap() < 0.01);
     }
 
     #[test]
@@ -782,5 +779,46 @@ mod tests {
         assert_eq!(alpha(899, 599), 0);
         assert_eq!(alpha(880, 580), 255);
         assert_eq!(alpha(0, 0), 255);
+    }
+
+    #[test]
+    fn the_veil_holds_then_thins_on_a_straight_line_without_a_step() {
+        assert_eq!(veil_at(0.0), VEIL);
+        assert_eq!(veil_at(VEIL_FROM - VEIL_KNEE), VEIL);
+        assert_eq!(veil_at(1.0), 0.0);
+        // Past the knee, a straight line: equal steps down.
+        let from = VEIL_FROM + VEIL_KNEE;
+        let steps: Vec<f32> = (0..=10)
+            .map(|i| veil_at(from + (1.0 - from) * i as f32 / 10.0))
+            .collect();
+        let step = steps[0] - steps[1];
+        for pair in steps.windows(2) {
+            assert!((pair[0] - pair[1] - step).abs() < 1e-5);
+        }
+        // Everywhere, falling, and smoothly: no jump between neighbouring pixels of a wide page,
+        // nor in its slope at the knee.
+        let n = 4000;
+        let at: Vec<f32> = (0..=n).map(|i| veil_at(i as f32 / n as f32)).collect();
+        let slope = VEIL / (1.0 - VEIL_FROM) / n as f32;
+        for pair in at.windows(2) {
+            assert!(pair[1] <= pair[0]);
+            assert!(pair[0] - pair[1] <= slope * 1.001);
+        }
+    }
+
+    #[test]
+    fn the_veils_picture_is_the_background_at_the_veils_opacity() {
+        for palette in Palette::ALL {
+            let bg = palette.surface(crate::ui::tokens::Surface::Bg);
+            let picture = veil(bg);
+            assert_eq!((picture.width, picture.height), (VEIL_SIZE, VEIL_SIZE));
+            let pixel = |x: u32, y: u32| {
+                let at = ((y * VEIL_SIZE + x) * 4) as usize;
+                &picture.rgba[at..at + 4]
+            };
+            assert_eq!(pixel(0, 0)[..3], bg.rgb8());
+            assert!((f32::from(pixel(0, 0)[3]) - VEIL * 255.0).abs() <= 1.5);
+            assert!(pixel(VEIL_SIZE - 1, VEIL_SIZE - 1)[3] <= 1);
+        }
     }
 }
