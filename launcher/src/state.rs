@@ -104,9 +104,13 @@ impl Blocked {
     /// Why, in words for the status line.
     pub fn words(&self) -> String {
         match self {
-            Self::NoPackage => "Choose your game package folder in Settings to begin.".to_owned(),
+            Self::NoPackage => {
+                "Choose your game package folder on the Game files page to begin.".to_owned()
+            }
             Self::PackageMissing(path) => format!("The package folder isn't there: {path}"),
-            Self::NoOutput => "Choose an output folder in Settings, then build.".to_owned(),
+            Self::NoOutput => {
+                "Choose an output folder on the Game files page, then build.".to_owned()
+            }
             Self::NotBootable { exe } => format!(
                 "Not bootable yet: the loader is built, but {exe} isn't in your package. \
                  Today's package doesn't include it, so there is nothing to run yet."
@@ -307,6 +311,8 @@ mod tests {
         let status = status(&facts, None);
         assert_eq!(status.tone, Tone::Waiting);
         assert!(status.text.contains("package folder"));
+        // It names a page the window has.
+        assert!(status.text.contains("Game files"));
         assert!(secondary(&facts).is_empty());
     }
 
