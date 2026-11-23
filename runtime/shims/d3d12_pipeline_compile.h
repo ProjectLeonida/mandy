@@ -4,6 +4,7 @@
 #include "../src/vulkan_replay.h"
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -103,8 +104,17 @@ struct CompileTrace {
 class PipelineCompiler {
 public:
     static PipelineCompiler& instance() {
-        static auto* pool = new PipelineCompiler;  // never destroyed: static destruction must not race the worker
-        return *pool;
+        // Constant-initialized atomic pointer (never destroyed) so threads where a mapped executable owns static TLS
+        // slot 0 never skip a function-local static init guard and dereference a null pointer.
+        if (PipelineCompiler* p = instance_ptr_.load(std::memory_order_acquire)) return *p;
+        auto* created = new PipelineCompiler;
+        PipelineCompiler* expected = nullptr;
+        if (!instance_ptr_.compare_exchange_strong(expected, created, std::memory_order_acq_rel,
+                                                   std::memory_order_acquire)) {
+            delete created;
+            return *expected;
+        }
+        return *created;
     }
 
     struct Stats {
@@ -332,6 +342,7 @@ private:
         }
     }
 
+    inline static std::atomic<PipelineCompiler*> instance_ptr_{nullptr};
     std::mutex mutex_;
     std::condition_variable wake_;
     std::condition_variable done_;

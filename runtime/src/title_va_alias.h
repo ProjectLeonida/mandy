@@ -354,10 +354,21 @@ private:
     std::map<std::uint64_t, std::uint64_t> memory_;  // the title's memory: base -> end
 };
 
+// Constant-initialized atomic pointer (never destroyed) so threads where a mapped executable owns static TLS slot 0
+// never skip a function-local static init guard and touch an unconstructed table.
+inline std::atomic<TitleVaAliases*> g_title_va_aliases{nullptr};
+
 // The process's table: the device's title ranges and hooks, read by the command lists and descriptor writers.
 inline TitleVaAliases& title_va_aliases() {
-    static TitleVaAliases aliases;
-    return aliases;
+    if (TitleVaAliases* p = g_title_va_aliases.load(std::memory_order_acquire)) return *p;
+    auto* created = new TitleVaAliases();
+    TitleVaAliases* expected = nullptr;
+    if (!g_title_va_aliases.compare_exchange_strong(expected, created, std::memory_order_acq_rel,
+                                                    std::memory_order_acquire)) {
+        delete created;
+        return *expected;
+    }
+    return *created;
 }
 
 // One diagnostic per descriptor-writing path.

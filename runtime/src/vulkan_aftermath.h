@@ -19,9 +19,13 @@
 
 #include <vulkan/vulkan.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 
 namespace leonida::aftermath {
 
@@ -58,20 +62,79 @@ std::string last_dump_path();
 std::string last_summary();
 
 namespace detail {
-inline thread_local const char* shader_name = nullptr;
+// True once Aftermath crash dumps are enabled. Kept out of C++ thread_local because threads where a mapped executable
+// owns static TLS slot 0 cannot touch static TLS.
+inline std::atomic<bool> active{false};
+
+struct ShaderNameTable {
+    std::mutex mutex;
+    std::unordered_map<std::thread::id, const char*> names;
+};
+
+inline std::atomic<ShaderNameTable*> g_shader_names{nullptr};
+
+inline ShaderNameTable& shader_name_table() {
+    if (ShaderNameTable* p = g_shader_names.load(std::memory_order_acquire)) return *p;
+    auto* created = new ShaderNameTable();
+    ShaderNameTable* expected = nullptr;
+    if (!g_shader_names.compare_exchange_strong(expected, created, std::memory_order_acq_rel,
+                                                std::memory_order_acquire)) {
+        delete created;
+        return *expected;
+    }
+    return *created;
 }
+
+inline const char* current_shader_name() noexcept {
+    if (!active.load(std::memory_order_acquire)) return nullptr;
+    try {
+        ShaderNameTable& t = shader_name_table();
+        std::lock_guard lock(t.mutex);
+        const auto it = t.names.find(std::this_thread::get_id());
+        return it == t.names.end() ? nullptr : it->second;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+inline const char* swap_shader_name(const char* name) noexcept {
+    try {
+        ShaderNameTable& t = shader_name_table();
+        std::lock_guard lock(t.mutex);
+        const std::thread::id tid = std::this_thread::get_id();
+        const auto it = t.names.find(tid);
+        const char* prev = it == t.names.end() ? nullptr : it->second;
+        if (name) {
+            if (it == t.names.end())
+                t.names.emplace(tid, name);
+            else
+                it->second = name;
+        } else if (it != t.names.end()) {
+            t.names.erase(it);
+        }
+        return prev;
+    } catch (...) {
+        return nullptr;
+    }
+}
+}  // namespace detail
 
 // Names the shader modules this thread creates while it is in scope (the wrapper above reads it).
 class ShaderName {
 public:
-    explicit ShaderName(const char* name) noexcept : previous_(detail::shader_name) { detail::shader_name = name; }
+    explicit ShaderName(const char* name) noexcept : active_(detail::active.load(std::memory_order_acquire)) {
+        if (active_) previous_ = detail::swap_shader_name(name);
+    }
     explicit ShaderName(const std::string& name) noexcept : ShaderName(name.c_str()) {}
-    ~ShaderName() { detail::shader_name = previous_; }
+    ~ShaderName() {
+        if (active_) detail::swap_shader_name(previous_);
+    }
     ShaderName(const ShaderName&) = delete;
     ShaderName& operator=(const ShaderName&) = delete;
 
 private:
-    const char* previous_;
+    bool active_ = false;
+    const char* previous_ = nullptr;
 };
 
 }  // namespace leonida::aftermath

@@ -74,14 +74,22 @@
 // allocate here instead, from a heap the title never touches and on whose lock no thread faults.
 namespace leonida::host_heap {
 
+inline std::atomic<HANDLE> g_heap{nullptr};
+
 inline HANDLE handle() {
-    static const HANDLE heap = [] {
-        const HANDLE created = HeapCreate(0, 0, 0);
-        if (!created)  // the process heap brings back the deadlock this heap avoids: write watching stays off
-            std::fprintf(stderr, "[rt] host heap: HeapCreate failed (%lu); write watching is off\n", GetLastError());
-        return created ? created : GetProcessHeap();
-    }();
-    return heap;
+    // Constant-initialized atomic handle so threads where a mapped executable owns static TLS slot 0 never skip a
+    // function-local static init guard and pass a null handle to HeapAlloc.
+    if (HANDLE h = g_heap.load(std::memory_order_acquire)) return h;
+    const HANDLE created = HeapCreate(0, 0, 0);
+    if (!created)  // the process heap brings back the deadlock this heap avoids: write watching stays off
+        std::fprintf(stderr, "[rt] host heap: HeapCreate failed (%lu); write watching is off\n", GetLastError());
+    const HANDLE candidate = created ? created : GetProcessHeap();
+    HANDLE expected = nullptr;
+    if (!g_heap.compare_exchange_strong(expected, candidate, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        if (created) HeapDestroy(created);
+        return expected;
+    }
+    return candidate;
 }
 
 template <class T>

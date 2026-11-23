@@ -654,7 +654,7 @@ void GFSDK_AFTERMATH_CALL on_description(PFN_GFSDK_Aftermath_AddGpuCrashDumpDesc
 VKAPI_ATTR VkResult VKAPI_CALL create_shader_module(VkDevice device, const VkShaderModuleCreateInfo* info,
                                                     const VkAllocationCallbacks* allocator, VkShaderModule* module) {
     const VkResult result = state().real_create.load(std::memory_order_relaxed)(device, info, allocator, module);
-    if (result == VK_SUCCESS && info) register_spirv(info->pCode, info->codeSize, detail::shader_name);
+    if (result == VK_SUCCESS && info) register_spirv(info->pCode, info->codeSize, detail::current_shader_name());
     return result;
 }
 
@@ -706,6 +706,7 @@ bool enable() noexcept {
                 return false;
             }
             s.enabled.store(true, std::memory_order_release);
+            detail::active.store(true, std::memory_order_release);
             device_lost_hook.store(device_lost, std::memory_order_release);
             std::fprintf(stderr, "[rt] aftermath: GPU crash dumps on (%s), written to %s%s\n", narrow(dll).c_str(),
                          narrow(s.dir).c_str(), s.keep_spirv ? ", SPIR-V kept" : "");

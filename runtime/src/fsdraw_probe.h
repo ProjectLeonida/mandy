@@ -33,9 +33,17 @@ struct State {
     std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::uint32_t>> cbv_origin;  // V# base -> location, size
 };
 
+inline std::atomic<State*> g_state{nullptr};
+
 inline State& state() {
-    static State s;
-    return s;
+    if (State* p = g_state.load(std::memory_order_acquire)) return *p;
+    auto* created = new State();
+    State* expected = nullptr;
+    if (!g_state.compare_exchange_strong(expected, created, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        delete created;
+        return *expected;
+    }
+    return *created;
 }
 
 inline void note_pipeline(std::uintptr_t id, std::string text) {

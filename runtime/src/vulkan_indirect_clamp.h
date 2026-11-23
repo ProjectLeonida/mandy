@@ -35,6 +35,7 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -68,20 +69,26 @@ inline constexpr std::uint32_t indirect_clamp_budget = 1u << 27;
 // The largest scratch allocation accepted for one ExecuteIndirect call.
 inline constexpr std::uint64_t indirect_clamp_max_scratch_bytes = std::uint64_t(64) << 20;
 
+inline std::atomic<int> g_indirect_clamp_enabled{-1};
+
 // Read once: LEONIDA_INDIRECT_CLAMP=0 leaves the application's argument buffer to the indirect command.
 inline bool indirect_clamp_enabled() {
-    static const bool enabled = [] {
+    int cached = g_indirect_clamp_enabled.load(std::memory_order_relaxed);
+    if (cached < 0) {
 #ifdef _WIN32
         char value[3]{};
         std::size_t length = 0;
-        if (getenv_s(&length, value, sizeof value, "LEONIDA_INDIRECT_CLAMP") != 0 || !length) return true;
-        return !(length == 2 && value[0] == '0' && !value[1]);
+        if (getenv_s(&length, value, sizeof value, "LEONIDA_INDIRECT_CLAMP") != 0 || !length)
+            cached = 1;
+        else
+            cached = !(length == 2 && value[0] == '0' && !value[1]) ? 1 : 0;
 #else
         const char* value = std::getenv("LEONIDA_INDIRECT_CLAMP");
-        return !value || value[0] != '0' || value[1];
+        cached = (!value || value[0] != '0' || value[1]) ? 1 : 0;
 #endif
-    }();
-    return enabled;
+        g_indirect_clamp_enabled.store(cached, std::memory_order_relaxed);
+    }
+    return cached != 0;
 }
 
 // The record size of each kind, as Vulkan's indirect commands define it and D3D12's argument structs match.

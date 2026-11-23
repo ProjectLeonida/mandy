@@ -134,11 +134,45 @@ constexpr D3D_ROOT_SIGNATURE_VERSION kHighestRootSignatureVersion = D3D_ROOT_SIG
 
 std::atomic<int> g_global_realtime_privilege_override{-1};
 
+// Constant-initialized and intentionally immortal so threads where a mapped executable owns static TLS slot 0 never
+// hit an _Init_thread_header guard or touch a destroyed mutex during process teardown.
+struct SrwGuard {
+    SRWLOCK& lock;
+    explicit SrwGuard(SRWLOCK& l) noexcept : lock(l) { AcquireSRWLockExclusive(&lock); }
+    ~SrwGuard() noexcept { ReleaseSRWLockExclusive(&lock); }
+    SrwGuard(const SrwGuard&) = delete;
+    SrwGuard& operator=(const SrwGuard&) = delete;
+};
+
+SRWLOCK g_log_once_lock = SRWLOCK_INIT;
+std::set<std::pair<std::string, int>>* g_log_once_seen = nullptr;
+
+SRWLOCK g_subgroup_report_lock = SRWLOCK_INIT;
+std::map<std::string, std::pair<std::set<std::string>, unsigned>>* g_subgroup_report_seen = nullptr;
+
+std::atomic<HMODULE> g_vulkan_library{nullptr};
+std::atomic<bool> g_vulkan_library_missing{false};
+
+HMODULE load_vulkan_library() {
+    if (HMODULE cached = g_vulkan_library.load(std::memory_order_acquire)) return cached;
+    if (g_vulkan_library_missing.load(std::memory_order_acquire)) return nullptr;
+    HMODULE loaded = LoadLibraryA("vulkan-1.dll");
+    if (!loaded) {
+        g_vulkan_library_missing.store(true, std::memory_order_release);
+        return nullptr;
+    }
+    HMODULE expected = nullptr;
+    if (!g_vulkan_library.compare_exchange_strong(expected, loaded, std::memory_order_acq_rel)) {
+        FreeLibrary(loaded);
+        return expected;
+    }
+    return loaded;
+}
+
 bool first_diagnostic(const char* what, int value) {
-    static std::mutex mutex;
-    static std::set<std::pair<std::string, int>> seen;
-    std::lock_guard lock(mutex);
-    return seen.insert({what, value}).second;
+    SrwGuard lock(g_log_once_lock);
+    if (!g_log_once_seen) g_log_once_seen = new std::set<std::pair<std::string, int>>;
+    return g_log_once_seen->insert({what, value}).second;
 }
 
 enum class TitleImageOrigin { ordinary, placed, streamed, pending_stream };
@@ -147,13 +181,17 @@ void log_once(const char* what, int value) {
     if (first_diagnostic(what, value)) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
 }
 
+std::atomic<int> g_signed_vsharp_offsets{-1};
+
 // Matches the offset interpretation of the selected shader pack.
 bool signed_vsharp_offsets() {
-    static const bool on = [] {
+    int cached = g_signed_vsharp_offsets.load(std::memory_order_relaxed);
+    if (cached < 0) {
         wchar_t value[2]{};
-        return GetEnvironmentVariableW(L"LEONIDA_IMPORT_BELOW_ARENA", value, 2) == 1 && value[0] == L'1';
-    }();
-    return on;
+        cached = (GetEnvironmentVariableW(L"LEONIDA_IMPORT_BELOW_ARENA", value, 2) == 1 && value[0] == L'1') ? 1 : 0;
+        g_signed_vsharp_offsets.store(cached, std::memory_order_relaxed);
+    }
+    return cached != 0;
 }
 
 // The CBV/SRV/UAV slots a descriptor table declares: the end of its furthest range (D3D12 appends a range at
@@ -1392,12 +1430,16 @@ bool lazy_graphics_pipelines() {
 // GetResourceAllocationInfo for them at boot and asserts when the answer is "invalid", so the device gives them a
 // host format that can do the job (DeviceState::r9g9b9e5_target_stand_in, srgb_uav_emulated).
 // LEONIDA_CONSOLE_FORMATS=0 refuses them, as a PC D3D12 runtime does.
+std::atomic<int> g_console_format_stand_ins{-1};
+
 bool console_format_stand_ins() {
-    static const bool on = [] {
+    int cached = g_console_format_stand_ins.load(std::memory_order_relaxed);
+    if (cached < 0) {
         wchar_t value[2]{};
-        return !(GetEnvironmentVariableW(L"LEONIDA_CONSOLE_FORMATS", value, 2) == 1 && value[0] == L'0');
-    }();
-    return on;
+        cached = !(GetEnvironmentVariableW(L"LEONIDA_CONSOLE_FORMATS", value, 2) == 1 && value[0] == L'0') ? 1 : 0;
+        g_console_format_stand_ins.store(cached, std::memory_order_relaxed);
+    }
+    return cached != 0;
 }
 
 // A driver's compiler needs hundreds of MiB for a very large module; several at once exhausted host memory. Compute modules
@@ -1463,10 +1505,10 @@ void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDev
 // 1000... of that stage so a whole corpus stays readable.
 void report_subgroup_unavailable(const leonida::ShaderEntry& entry, const leonida::SubgroupRequest& request,
                                  const leonida::SubgroupSizeCaps& caps) {
-    static std::mutex mutex;
-    static std::map<std::string, std::pair<std::set<std::string>, unsigned>> seen;  // stage -> names, next report
-    std::lock_guard lock(mutex);
-    auto& [names, next_report] = seen[entry.stage];
+    SrwGuard lock(g_subgroup_report_lock);
+    if (!g_subgroup_report_seen)
+        g_subgroup_report_seen = new std::map<std::string, std::pair<std::set<std::string>, unsigned>>;
+    auto& [names, next_report] = (*g_subgroup_report_seen)[entry.stage];
     if (!names.insert(entry.name).second) return;
     if (names.size() == 1) next_report = 10;
     else if (names.size() != next_report) return;
@@ -9890,8 +9932,17 @@ struct ShaderCacheRegistry {
     }
 };
 
+SRWLOCK g_shader_cache_registry_lock = SRWLOCK_INIT;
+std::atomic<ShaderCacheRegistry*> g_shader_cache_registry{nullptr};
+
 ShaderCacheRegistry& process_shader_cache_registry() {
-    static auto* registry = new ShaderCacheRegistry();
+    if (ShaderCacheRegistry* registry = g_shader_cache_registry.load(std::memory_order_acquire)) return *registry;
+    SrwGuard lock(g_shader_cache_registry_lock);
+    ShaderCacheRegistry* registry = g_shader_cache_registry.load(std::memory_order_relaxed);
+    if (!registry) {
+        registry = new ShaderCacheRegistry();
+        g_shader_cache_registry.store(registry, std::memory_order_release);
+    }
     return *registry;
 }
 
@@ -17441,7 +17492,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     *out = nullptr;
     // LEONIDA_AFTERMATH=1: GPU crash dumps on before the Vulkan instance and device exist (src/vulkan_aftermath.h).
     leonida::aftermath::enable();
-    static const HMODULE library = LoadLibraryA("vulkan-1.dll");
+    const HMODULE library = load_vulkan_library();
     const auto get = library ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(
                                    reinterpret_cast<void*>(GetProcAddress(library, "vkGetInstanceProcAddr")))
                              : nullptr;
