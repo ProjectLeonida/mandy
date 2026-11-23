@@ -104,7 +104,7 @@ CS_SMEM_VCC = list(range(0x7210, 0x7218))
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 # -0, and NaN checks that need SignedZeroInfNanPreserve (cs_signed_zero_nan.asm); 0 in out[4..7] means it's missing
 SIGNED_ZERO_NAN = [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00007c00]
-WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
+WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_swaprel", "cs_movrels", "cs_msad_mqsad", "cs_w32_permute",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
                 "cs_w32_lds_subdword", "cs_w32_lds_wide",
                 "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
@@ -136,6 +136,12 @@ CS_DUMPS = [*CS_DPP, ("cs_smem_vcc_base", CS_SMEM_VCC), ("cs_store", CS_STORE), 
             ("cs_w32_lane_wrap", [25, 16, 777, 777]),
             # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]]
             ("cs_movrelsd_2", [11, 33, 33, 55, 1717, 77, 1515, 1717]),
+            # v_swaprel_b32 swaps the same two M0 fields; a self-swap keeps the register (cs_swaprel.asm)
+            ("cs_swaprel", [11, 22, 55, 44, 77, 55, 66, 88]),
+            # s_movrels_b32/b64: SGPR[S0 + M0], the b64 pair at +1; SCC kept, sources unchanged (cs_movrels.asm)
+            ("cs_movrels", [170, 204, 187, 204, 187, 187, 1, 238]),
+            # v_msad_u8 / v_mqsad_u32_u8: masked byte SADs, sliding windows, 32-bit wrap (cs_msad_mqsad.asm)
+            ("cs_msad_mqsad", [0x30, 0xFFFFFFF4, 0xFFFFFFFA, 7, 0x80000006, 0x1234567C, 0xDEADBEEF, 0xFF]),
             # SHADER-90: ds_permute_b32, the forward (scatter) permute; unwritten lane 0, EXEC gates the destination
             ("cs_w32_permute", [218, 29, 8, 211, 0, 15, 99, 15]),
             # integer ops with CPU-only checks until now (derivations in cs_w32_int_ext.asm)
