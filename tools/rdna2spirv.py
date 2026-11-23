@@ -18922,8 +18922,13 @@ def shard_bucket(files, index, count):
     for path in files:
         try:
             weight[path] = os.path.getsize(path)
-        except OSError:
-            weight[path] = 0
+        except OSError as error:
+            # Not a weight of 0: a shard that cannot size one file would place it by a number no other shard has, so
+            # the buckets would overlap and leave another shader out of the set, and the merge would publish a corpus
+            # with a hole in it (reported by @Zhenyettta on #7479). Every shard derives this partition on its own, so
+            # a size it cannot read has to stop the run and be retried, not be guessed at.
+            raise OSError(f"cannot read the size of {path} for the shard partition: {error}; "
+                          "fix or restore the file and run the shard again") from error
     buckets = [[] for _ in range(count)]
     loads = [0] * count
     for path in sorted(files, key=lambda p: (-weight[p], p)):

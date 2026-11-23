@@ -62,13 +62,17 @@ class ShardBucketTest(unittest.TestCase):
             self.assertLessEqual(span, total / count + max(size.values()), count)
             self.assertLess(span, round_robin, "no better than files[::%d]" % count)
 
-    def test_an_unreadable_size_does_not_drop_the_file(self):
+    def test_a_size_that_cannot_be_read_stops_the_partition(self):
+        # Reported by @Zhenyettta on #7479: a weight of 0 for one unreadable file lets another shard take that file too,
+        # so the set has a shader twice and another one missing. Every shard derives the partition alone, so the only
+        # safe answer is to stop and let the run be retried.
         files = self.make([5, 40, 7])
         gone = os.path.join(self.root, "ps_gone_0.s")
-        files = sorted(files + [gone])          # never created: getsize fails, the path still has to be scheduled
-        buckets = [rdna2spirv.shard_bucket(files, index, 2) for index in range(2)]
-        flat = sorted(path for bucket in buckets for path in bucket)
-        self.assertEqual(flat, files)
+        files = sorted(files + [gone])          # never created: getsize fails
+        with self.assertRaises(OSError) as caught:
+            rdna2spirv.shard_bucket(files, 0, 2)
+        self.assertIn(gone, str(caught.exception))
+        self.assertIn("shard again", str(caught.exception))
 
     def test_one_shard_takes_everything(self):
         files = self.make([5, 40, 7])
