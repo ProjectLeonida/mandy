@@ -1201,7 +1201,7 @@ def run_suite(a, work: str) -> int:
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
             # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
-        elif name in ("cs_smem_vcc_base", "cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_lds_subdword", "cs_w32_lds_wide", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
+        elif name in ("cs_smem_vcc_base", "cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_lds_subdword", "cs_w32_lds_wide", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sdst_exec", "cs_global_atomic32_int", "cs_global_atomic32_rtn", "cs_global_atomic32_float", "cs_global_atomic32_x2", "cs_w32_clamp32", "cs_w32_clamp16", "cs_w32_mad_denorm", "cs_w32_vcmp_f64", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
                       "cs_dpp_bound", "cs_dpp_cmp", "cs_dpp_w64",
                       "cs_w64_mask_detect",
@@ -1322,6 +1322,19 @@ def run_suite(a, work: str) -> int:
                 # inactive lanes keep the old VGPR (cs_mask_vgpr_exec.asm)
                 "cs_mask_vgpr_exec": [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
                                       0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF],
+                # batch 4: sdst under a partial EXEC (cs_w32_sdst_exec.asm; 16 lanes | 1 << 8), the 32-bit
+                # GLOBAL atomics with and without glc (cs_global_atomic32_*.asm), integer clamp (#265),
+                # denormal flush (#379 #380) and the 16 v_cmp/v_cmpx_*_f64 predicates (#381)
+                "cs_w32_sdst_exec": [272, 272, 272, 272, 272, 272, 272, 272],
+                "cs_global_atomic32_int": [0x80000004, 2, 0xFFFFFFFB, 3, 3, 0xFFFFFFFB, 0xF000F000, 0xFF0FFF0F],
+                "cs_global_atomic32_rtn": [0xFFFFFFFF, 0xCAFEF00D, 6, 4, 0x11111111, 0x100, 0xF0F0, 0xAAAA],
+                "cs_global_atomic32_float": [0x3F800000, 0x40000000, 0x40400000, 0, 0x43, 0x42, 0x55, 0x55],
+                "cs_global_atomic32_x2": [0xF000F000, 0x0F0F0F0F, 0xFF0FFF0F, 0xFFFFFFFF,
+                                      0x55555555, 0xEDCBA987, 0xAAAABBBB, 0xCCCCDDDD],
+                "cs_w32_clamp32": [0xFFFFFFFF, 0, 0, 0x7FFFFFFF, 0x80000000, 3, 12, 0],
+                "cs_w32_clamp16": [0xDEADFFFF, 0xDEAD0000, 0xDEAD0000, 0xFFFFFFFF, 0xFFFFFFFF, 0, 0, 0],
+                "cs_w32_mad_denorm": [0, 0, 0, 0, 0x40E00000, 0, 0, 0],
+                "cs_w32_vcmp_f64": [0xC, 0xC, 0xC, 0xC, 0, 0, 0xF, 0xF],
             }
             want = cs_dump_wants[name]
             # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 / cs_w32_permute /
@@ -1340,6 +1353,9 @@ def run_suite(a, work: str) -> int:
                                   "cs_w32_lds_subdword", "cs_w32_lds_wide",
                                   "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_w32_permlane_fi", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap",
                                   "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
+                                  "cs_w32_sdst_exec", "cs_global_atomic32_int", "cs_global_atomic32_rtn",
+                                  "cs_global_atomic32_float", "cs_global_atomic32_x2", "cs_w32_clamp32",
+                                  "cs_w32_clamp16", "cs_w32_mad_denorm", "cs_w32_vcmp_f64",
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
                                   "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_dpp_cmp", "cs_w32_andn2_exec",
                                   "cs_w32_exec_computed") and not emulated and not partial

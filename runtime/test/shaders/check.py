@@ -110,7 +110,7 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
                 "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
                 "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_andn2_exec",
                 "cs_mask_vgpr_exec", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi",
-                "cs_w32_exec_computed")
+                "cs_w32_exec_computed", "cs_w32_sdst_exec", "cs_global_atomic32_int", "cs_global_atomic32_rtn", "cs_global_atomic32_float", "cs_global_atomic32_x2", "cs_w32_clamp32", "cs_w32_clamp16", "cs_w32_mad_denorm", "cs_w32_vcmp_f64")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
@@ -118,7 +118,11 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_exec_const",
                      "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_andn2_exec", "cs_mask_vgpr_exec", "cs_w32_permlane_fi",
-                     "cs_w32_exec_computed")
+                     "cs_w32_exec_computed",
+                     # the sdst masks are 32 EXEC bits wide, and one wave must hold the only lane 0 (the
+                     # atomics are not idempotent, so four 8-lane groups' lane 0s would race)
+                     "cs_w32_sdst_exec", "cs_global_atomic32_int", "cs_global_atomic32_rtn",
+                     "cs_global_atomic32_float", "cs_global_atomic32_x2")
 CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_row", [0, 0, 1, 2, 3, 4, 5, 6]),
           ("cs_dpp_mask", [1, 0, 3, 2, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee]),
@@ -204,7 +208,23 @@ CS_DUMPS = [*CS_DPP, ("cs_smem_vcc_base", CS_SMEM_VCC), ("cs_store", CS_STORE), 
             ("cs_barrier_loop", [128, 96, 64, 32, 128, 96, 64, 0xEEEEEEEE]),
             # SHADER-21 part 2: a mask copied to a VGPR with v_mov_b32 respects EXEC (inactive lanes keep the old VGPR)
             ("cs_mask_vgpr_exec", [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
-                                   0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF])]
+                                   0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF]),
+            # batch 4: sdst under a partial EXEC (derivations in cs_w32_sdst_exec.asm); each sdst is 0xAAAAAAAA,
+            # so the word is 16 set lanes | lowest lane 1 << 8
+            ("cs_w32_sdst_exec", [272, 272, 272, 272, 272, 272, 272, 272]),
+            # 32-bit GLOBAL atomics, the 15 ops and the four _x2 forms (derivations in each .asm header)
+            ("cs_global_atomic32_int", [0x80000004, 2, 0xFFFFFFFB, 3, 3, 0xFFFFFFFB, 0xF000F000, 0xFF0FFF0F]),
+            ("cs_global_atomic32_rtn", [0xFFFFFFFF, 0xCAFEF00D, 6, 4, 0x11111111, 0x100, 0xF0F0, 0xAAAA]),
+            ("cs_global_atomic32_float", [0x3F800000, 0x40000000, 0x40400000, 0, 0x43, 0x42, 0x55, 0x55]),
+            ("cs_global_atomic32_x2", [0xF000F000, 0x0F0F0F0F, 0xFF0FFF0F, 0xFFFFFFFF,
+                                      0x55555555, 0xEDCBA987, 0xAAAABBBB, 0xCCCCDDDD]),
+            # integer clamp on the 32-bit VOP3 forms and the carry ops, then the 16-bit forms (#265)
+            ("cs_w32_clamp32", [0xFFFFFFFF, 0, 0, 0x7FFFFFFF, 0x80000000, 3, 12, 0]),
+            ("cs_w32_clamp16", [0xDEADFFFF, 0xDEAD0000, 0xDEAD0000, 0xFFFFFFFF, 0xFFFFFFFF, 0, 0, 0]),
+            # denormal flush in v_mad/v_mac_f32 and the legacy pair (#379 #380)
+            ("cs_w32_mad_denorm", [0, 0, 0, 0, 0x40E00000, 0, 0, 0]),
+            # all 16 v_cmp/v_cmpx_*_f64 predicates, four per dword (#381)
+            ("cs_w32_vcmp_f64", [0xC, 0xC, 0xC, 0xC, 0, 0, 0xF, 0xF])]
 # num_records bounds check (cs_bounds.asm): one thread, so no 64-wide subgroup requirement.
 # The SMEM and raw MUBUF rules measured on an RX 6800 (derivations in each .asm header): one thread too.
 # Never run cs_smem_sload_neg with a translator that zero-extends the s_load immediate: it reads 4 GiB past the heap.
