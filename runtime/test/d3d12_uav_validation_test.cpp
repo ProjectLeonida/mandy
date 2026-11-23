@@ -373,7 +373,7 @@ int main() {
         EXPECT(decode_tsharp(slot_ptr(9), img, raw) && img.type == g::ImageType::image_1d && img.first_mip == 1 &&
                img.layer_count == 1);
 
-        // Explicit TEXTURE2DARRAY with subrange and with ArraySize == UINT_MAX (~0u).
+        // Explicit TEXTURE2DARRAY with bounded subranges (middle slices and tail slices).
         D3D12_UNORDERED_ACCESS_VIEW_DESC u2da{};
         u2da.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         u2da.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
@@ -383,7 +383,7 @@ int main() {
                img.first_mip == 1 && img.first_layer == 1 && img.layer_count == 2);
         EXPECT(rt::d3d12::bindless_hash_lookup(device.p, raw) != 0);
 
-        u2da.Texture2DArray = {0, 2, UINT_MAX, 0};
+        u2da.Texture2DArray = {0, 2, 2, 0};
         device->CreateUnorderedAccessView(tex2d_arr.p, nullptr, &u2da, cpu_slot(11));
         EXPECT(decode_tsharp(slot_ptr(11), img, raw) && img.type == g::ImageType::image_2d_array &&
                img.first_layer == 2 && img.layer_count == 2);
@@ -452,6 +452,14 @@ int main() {
 
         d.Texture2DArray = {0, 3, 2, 0};  // 3 + 2 > 4 slices
         EXPECT(expect_rejected(tex2d_arr.p, nullptr, &d, "TEXTURE2DARRAY ArraySize past end of array"));
+
+        // D3D12 does not define UINT_MAX / -1 as an "all remaining slices" sentinel for TEXTURE2DARRAY
+        // (unlike D3D12_TEX3D_UAV::WSize), so UINT_MAX must be rejected as out-of-range, not clamped.
+        d.Texture2DArray = {0, 2, UINT_MAX, 0};
+        EXPECT(expect_rejected(tex2d_arr.p, nullptr, &d, "TEXTURE2DARRAY ArraySize == UINT_MAX (non-zero first slice)"));
+
+        d.Texture2DArray = {0, 0, UINT_MAX, 0};
+        EXPECT(expect_rejected(tex2d_arr.p, nullptr, &d, "TEXTURE2DARRAY ArraySize == UINT_MAX (slice 0)"));
 
         d.Texture2DArray = {0, 0, 0, 0};
         EXPECT(expect_rejected(tex2d_arr.p, nullptr, &d, "TEXTURE2DARRAY ArraySize == 0"));

@@ -12903,7 +12903,7 @@ public:
                 const auto& arr = desc->Texture2DArray;
                 if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || arr.MipSlice >= rd.MipLevels ||
                     arr.PlaneSlice != 0 || arr.FirstArraySlice >= rd.DepthOrArraySize || arr.ArraySize == 0 ||
-                    (arr.ArraySize != UINT_MAX && arr.ArraySize > UINT(rd.DepthOrArraySize) - arr.FirstArraySlice)) {
+                    arr.ArraySize > UINT(rd.DepthOrArraySize) - arr.FirstArraySlice) {
                     log_once("invalid Texture2DArray unordered-access view; array size", int(arr.ArraySize));
                     return;
                 }
