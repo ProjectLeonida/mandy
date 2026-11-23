@@ -12,7 +12,9 @@
 //   {"seq":8,"t":0.020,"kind":"exception","code":"0xc0000005","at":"a.dll+0x4a00","access":"read","address":"0x0",
 //        "region":{"base":"0x0","allocation_base":"0x0","size":"0x7ffe0000","state":"0x10000","protect":"0x1",
 //        "type":"0x0"},"regs":{...},"stack":["a.dll+0x4a00","a.dll+0x2210"]}
-//   {"seq":9,"t":0.030,"kind":"exit","code":0}
+//   {"seq":9,"t":0.021,"kind":"exception","code":"0xc0000005","at":"0x0","access":"execute","address":"0x0",
+//        "null_call_from":"a.dll+0x2210","stack":["a.dll+0x2210",...]}   (a call through a null pointer)
+//   {"seq":10,"t":0.030,"kind":"exit","code":0}
 //
 // The exception handler is vectored, logs and returns EXCEPTION_CONTINUE_SEARCH: it never changes what the process
 // does (except LEONIDA_SKIP_INT3, below).
@@ -114,6 +116,7 @@ constexpr DWORD kDbgPrint = 0x40010006;      // DBG_PRINTEXCEPTION_C
 constexpr DWORD kDbgPrintWide = 0x4001000A;  // DBG_PRINTEXCEPTION_WIDE_C
 constexpr DWORD kCppException = 0xE06D7363;  // MSVC throw: logged with its address, never its payload
 constexpr int kMaxFrames = 16;
+constexpr uint64_t kNullPageEnd = 0x10000;  // Windows never maps the first 64 KiB
 
 inline std::string stack_from(const CONTEXT& start_context) {
     CONTEXT c = start_context;
@@ -248,7 +251,7 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
             if (info.ContextRecord) {
                 // The registers at the fault: what an analyst needs to read a title assert (which value, which list).
-                const CONTEXT& c = *info.ContextRecord;
+                CONTEXT c = *info.ContextRecord;
                 const std::pair<const char*, DWORD64> regs[] = {
                     {"rax", c.Rax}, {"rcx", c.Rcx}, {"rdx", c.Rdx}, {"rbx", c.Rbx}, {"rsi", c.Rsi}, {"rdi", c.Rdi},
                     {"r8", c.R8},   {"r9", c.R9},   {"r10", c.R10}, {"r11", c.R11}, {"r12", c.R12}, {"r13", c.R13},
@@ -257,8 +260,18 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                 for (size_t i = 0; i < std::size(regs); ++i)
                     f += std::string(i ? "," : "") + "\"" + regs[i].first + "\":" + quote(hex(regs[i].second));
                 f += "}";
+                // A call through a null (or null-page) pointer faults on the fetch at the target, so there is no
+                // instruction to name and nothing to unwind from. The call has just pushed its return address: start
+                // from that frame, as for a leaf function, and name the caller.
+                if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && reinterpret_cast<uint64_t>(r.ExceptionAddress) <
+                                                                       kNullPageEnd &&
+                    c.Rsp && !IsBadReadPtr(reinterpret_cast<void*>(c.Rsp), 8)) {
+                    c.Rip = *reinterpret_cast<const DWORD64*>(c.Rsp);
+                    c.Rsp += 8;
+                    f += ",\"null_call_from\":" + quote(where(c.Rip));
+                }
+                f += ",\"stack\":" + stack_from(c);
             }
-            if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
         }
     } catch (...) {

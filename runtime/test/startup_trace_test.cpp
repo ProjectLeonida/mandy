@@ -49,6 +49,8 @@ constexpr uint32_t kTextRva = 0x1000;
 constexpr uint32_t kCallerBase = kTextRva + 0x200;  // caller i at kCallerBase + 0x10 * i
 constexpr uint32_t kCallRetOffset = 10;             // sub rsp,0x28 (4) + call [rip+disp] (6)
 constexpr uint32_t kFaultRva = kTextRva + 0x220;
+constexpr uint32_t kNullCallRva = kTextRva + 0x240;   // calls address 0
+constexpr uint32_t kNullCallRetRva = kNullCallRva + 4;  // xor eax,eax (2) + call rax (2)
 constexpr const char* kImageName = "trace_image.bin";
 constexpr const char* kDebugText = "leonida trace probe \"quoted\"";
 constexpr const char* kAnsiText = "caf\xe9 probe";  // 0xE9: 'é' in code page 1252, never valid alone in UTF-8
@@ -105,6 +107,12 @@ std::vector<uint8_t> make_image() {
     const uint8_t fault[] = {0x48, 0x8B, 0x04, 0x25, 0, 0, 0, 0,  // mov rax, [0]
                              0xC3};                               // ret
     std::memcpy(text + (kFaultRva - kTextRva), fault, sizeof fault);
+    // No stack adjustment: the image has no .pdata, so the handler's search unwinds this as a leaf, as the fault
+    // above. (A frame with sub rsp would hand it a wrong return address.)
+    const uint8_t null_call[] = {0x31, 0xC0,  // xor eax, eax
+                                 0xFF, 0xD0,  // call rax: a call through a null pointer
+                                 0xC3};       // ret
+    std::memcpy(text + (kNullCallRva - kTextRva), null_call, sizeof null_call);
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     dir.VirtualAddress = kTextRva;
     dir.Size = 3 * sizeof(IMAGE_IMPORT_DESCRIPTOR);
@@ -224,6 +232,7 @@ void test_trace(const fs::path& dir) {
         OutputDebugStringW(L"wide probe \u00e9\u4e2d");  // its ANSI fallback must not be a second, lossy line
         OutputDebugStringA("after_wide_probe");
         check(call_faulting(m.base + kFaultRva), "the access violation reached the test's handler");
+        check(call_faulting(m.base + kNullCallRva), "the null call's access violation reached the test's handler");
         rt::startup_trace::event("exit", "\"code\":0");
     }
     rt::startup_trace::close();
@@ -275,6 +284,17 @@ void test_trace(const fs::path& dir) {
     check(has(e, "\"region\":{\"base\":\"0x0\"") && has(e, "\"state\":\"0x10000\""),
           "the faulting page's region (address 0 is free memory)");
     check(has(e, "\"stack\":[" + mod.substr(0) + hex_rva(kFaultRva)), "stack starts at the faulting instruction");
+    check(!has(e, "null_call_from"), "a fault inside the image is not a null call");
+
+    const std::string* n = nullptr;
+    for (auto& l : lines)
+        if (l.find("\"kind\":\"exception\"") != std::string::npos && l.find("\"at\":\"0x0\"") != std::string::npos)
+            n = &l;
+    check(n != nullptr, "the call through a null pointer is an exception at 0x0");
+    check(has(n, "\"access\":\"execute\""), "the null call is an execute fault");
+    check(has(n, "\"null_call_from\":" + mod + hex_rva(kNullCallRetRva) + "\""),
+          "null_call_from names the instruction after the call, as module+RVA");
+    check(has(n, "\"stack\":[" + mod + hex_rva(kNullCallRetRva)), "the null call's stack starts at its caller");
 
     check(find_line(lines, "exit") == &lines.back(), "exit comes last");
 }
