@@ -12696,12 +12696,15 @@ class Gen:
                 self.emit(f"{lim} = OpSelect %ulong {raw} {nr64} {prod}")
         guarded = {}
         if lim is not None and not (lim_val is not None and reg is None):
-            # A run-time bound: dword i is in range when off + 4*i + 4 <= limit, and out of range it is 0 with memory
-            # not read. The ends grow with i, so "dword i in range" implies every dword before it is: one selection
-            # on dword 0 covers the load. Inside it each dword reads at index i when in range, else at index 0 (in
-            # range there, so nothing outside the buffer is touched), and the out-of-range ones are then 0. Before,
-            # each dword had its own selection: 2N blocks per s_buffer_load_dwordxN, 11,000 of the 17,000 blocks of
-            # the cascade-shadow CS whose pipeline NVIDIA's compiler could not build in 16 GB.
+            # A run-time bound: dword i is in range when off + 4*i + 4 <= limit, and out of range it is 0. The ends
+            # grow with i, so "dword i in range" implies every dword before it is. There is no branch around the
+            # loads: llvmpipe (Mesa 26.0.8, LLVM 21) hoisted a guarded load out of its selection and read 4 GB past
+            # the buffer (#3039's s12 = -4, offset:20 segfaulted vk_compute_test), and inside a branch on the bound
+            # the compiler may also fold any address selected by it (#4573). So the loads read through
+            # OpSelect(dword 0 in range, the address, the V#'s base), each at index i when in range, else 0: out of
+            # range that is the buffer's base, and the value is OpSelect(in range, loaded, 0). No branch also means
+            # no blocks at all, where one selection per dword was 2N per s_buffer_load_dwordxN (11,000 of the
+            # 17,000 blocks of the cascade-shadow CS whose pipeline NVIDIA's compiler could not build in 16 GB).
             oks = []
             for i in range(n):
                 end, ok = self.tmp(), self.tmp()
@@ -12711,31 +12714,19 @@ class Gen:
                     end = self.cl(imm + 4 * i + 4)
                 self.emit(f"{ok} = OpUGreaterThanEqual %bool {lim} {end}")
                 oks.append(ok)
-            lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
-            pre = self.current_label_placeholder()
-            self.emit(f"OpSelectionMerge {lbl_end} None")
-            self.emit(f"OpBranchConditional {oks[0]} {lbl_do} {lbl_end}")
-            self.emit(f"{lbl_do} = OpLabel")
-            got_in = []
+            sel, sptr = self.tmp(), self.tmp()
+            self.emit(f"{sel} = OpSelect %ulong {oks[0]} {self.host_addr(full)} {self.host_addr(addr)}")
+            self.emit(f"{sptr} = OpConvertUToPtr %_ptr_PSB_arr {sel}")
             for i in range(n):
                 idx, p, got, val = (self.tmp() for _ in range(4))
                 if i == 0:
                     idx = self.cu(0)
                 else:
                     self.emit(f"{idx} = OpSelect %uint {oks[i]} {self.cu(i)} {self.cu(0)}")
-                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {idx}")
+                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {sptr} {idx}")
                 self.emit(f"{got} = OpLoad %uint {p} Aligned 4")
-                if i == 0:
-                    val = got
-                else:
-                    self.emit(f"{val} = OpSelect %uint {oks[i]} {got} {self.cu(0)}")
-                got_in.append(val)
-            self.emit(f"OpBranch {lbl_end}")
-            self.emit(f"{lbl_end} = OpLabel")
-            for i in range(n):
-                v = self.tmp()
-                self.emit(f"{v} = OpPhi %uint {got_in[i]} {lbl_do} {self.cu(0)} {pre}")
-                guarded[i] = v
+                self.emit(f"{val} = OpSelect %uint {oks[i]} {got} {self.cu(0)}")
+                guarded[i] = val
         for i in range(n):
             p, v = self.tmp(), self.tmp()
             if i in guarded:
