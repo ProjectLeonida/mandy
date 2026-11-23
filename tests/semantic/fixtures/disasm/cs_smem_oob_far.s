@@ -3,14 +3,19 @@
 	v_readfirstlane_b32 s12, v1
 	v_mov_b32_e32 v1, 12
 	v_readfirstlane_b32 s13, v1
-	v_mov_b32_e32 v1, 0xffffffe0
+	v_mov_b32_e32 v1, 0
 	v_readfirstlane_b32 s14, v1
+	s_mov_b32 s8, 0x70000000
+	s_mov_b32 s9, 0x10
+	v_mov_b32_e32 v1, 0
+	v_readfirstlane_b32 s10, v1
+	s_mov_b32 s11, 0x31016fac
 	v_mov_b32_e32 v1, 0
 	v_readfirstlane_b32 s15, v1
 	s_buffer_load_dword s20, s[0:3], s12 offset:20
 	s_buffer_load_dword s21, s[0:3], s13 offset:20
 	s_buffer_load_dwordx2 s[22:23], s[0:3], s12 offset:0x10
-	s_buffer_load_dword s24, s[0:3], s14 offset:0x40
+	s_buffer_load_dword s24, s[8:11], s14 offset:0
 	s_buffer_load_dword s25, s[0:3], s15 offset:0x24
 	s_mov_b32 s16, -4
 	s_buffer_load_dword s26, s[0:3], s16 offset:20

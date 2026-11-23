@@ -12701,8 +12701,11 @@ class Gen:
             # loads: llvmpipe (Mesa 26.0.8, LLVM 21) hoisted a guarded load out of its selection and read 4 GB past
             # the buffer (#3039's s12 = -4, offset:20 segfaulted vk_compute_test), and inside a branch on the bound
             # the compiler may also fold any address selected by it (#4573). So the loads read through
-            # OpSelect(dword 0 in range, the address, the V#'s base), each at index i when in range, else 0: out of
-            # range that is the buffer's base, and the value is OpSelect(in range, loaded, 0). No branch also means
+            # OpSelect(dword 0 in range, the address, the heap's base), each at index i when in range, else 0, and
+            # the value is OpSelect(in range, loaded, 0). Out of range that reads the first dword of the heap: Xbox VA
+            # 0 is the start of the host buffer the runtime maps the console's GPU window into (host_addr), so it is
+            # readable even for a descriptor with no readable bytes (num_records 0, whose base may be unmapped),
+            # where main read nothing at all. No branch also means
             # no blocks at all, where one selection per dword was 2N per s_buffer_load_dwordxN (11,000 of the
             # 17,000 blocks of the cascade-shadow CS whose pipeline NVIDIA's compiler could not build in 16 GB).
             oks = []
@@ -12715,7 +12718,7 @@ class Gen:
                 self.emit(f"{ok} = OpUGreaterThanEqual %bool {lim} {end}")
                 oks.append(ok)
             sel, sptr = self.tmp(), self.tmp()
-            self.emit(f"{sel} = OpSelect %ulong {oks[0]} {self.host_addr(full)} {self.host_addr(addr)}")
+            self.emit(f"{sel} = OpSelect %ulong {oks[0]} {self.host_addr(full)} {self.host_addr(self.cl(0))}")
             self.emit(f"{sptr} = OpConvertUToPtr %_ptr_PSB_arr {sel}")
             for i in range(n):
                 idx, p, got, val = (self.tmp() for _ in range(4))
