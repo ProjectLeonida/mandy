@@ -245,6 +245,8 @@ struct TextState {
     /// What it showed when last drawn: how it looks, focus, how much the caret shows, the
     /// selection.
     drawn: Option<(Interaction, bool, u8, crate::ui::edit::Selection)>,
+    /// Its glow under the pointer, fading in and out on the glows' own timing.
+    lit: crate::ui::transition::Lit,
 }
 
 impl<Message: Clone> Widget<Message, Theme, Renderer> for TextField<'_, Message> {
@@ -404,8 +406,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TextField<'_, Message>
                 _ => {}
             }
         }
+        let shown = interaction(self.enabled(), cursor.is_over(bounds));
+        state.lit.frame(event, shell);
+        state.lit.aim(
+            matches!(shown, Interaction::Hovered | Interaction::Pressed),
+            shell,
+        );
         let now = (
-            interaction(self.enabled(), cursor.is_over(bounds)),
+            shown,
             line.focus.is_focused(),
             (line.blink.opacity * 255.0).round() as u8,
             line.selection,
@@ -430,6 +438,16 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TextField<'_, Message>
             state.line.focus.is_focused(),
         ));
         let look = theme.field(interaction, focused, self.invalid);
+        // The hover glow on its own fade; a preview shows it whole.
+        let lit = if self.preview.is_some() {
+            f32::from(u8::from(look.glow.is_some()))
+        } else {
+            state.lit.share()
+        };
+        let glow = theme
+            .field(Interaction::Hovered, focused, self.invalid)
+            .glow;
+        let look = look.lit(glow, lit);
         let area = text_area(bounds, None);
         let value = &state.value;
         draw_line(

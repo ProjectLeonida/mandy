@@ -111,6 +111,8 @@ struct State {
     slide: Option<Transition>,
     drag: Option<Drag>,
     drawn: Option<(Interaction, bool, bool)>,
+    /// Its glow while on, fading in and out on the glows' own timing, apart from the knob.
+    lit: crate::ui::transition::Lit,
 }
 
 impl State {
@@ -290,6 +292,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Switch<'_, Message> {
                 state.slide = None;
             }
         }
+        state.lit.frame(event, shell);
+        state.lit.aim(self.on && self.on_toggle.is_some(), shell);
         let now = (
             self.interaction(state, over),
             state.focus.is_shown(),
@@ -326,7 +330,32 @@ impl<Message> Widget<Message, Theme, Renderer> for Switch<'_, Message> {
             theme.switch(true, interaction),
         );
         paint::boxed(renderer, track, &off.track.faded(1.0 - at));
-        paint::boxed(renderer, track, &on.track.faded(at));
+        let glow = on.track.glow;
+        paint::boxed(
+            renderer,
+            track,
+            &Look {
+                glow: None,
+                ..on.track
+            }
+            .faded(at),
+        );
+        // The on glow, on its own fade.
+        let lit = if self.preview.is_some() {
+            at
+        } else {
+            state.lit.share()
+        };
+        paint::boxed(
+            renderer,
+            track,
+            &Look {
+                fill: None,
+                line: None,
+                ..on.track
+            }
+            .lit(glow, lit),
+        );
         let knob = knob(track, at);
         let radius = knob.height / 2.0;
         paint::boxed(renderer, knob, &Look::solid(off.knob, radius));

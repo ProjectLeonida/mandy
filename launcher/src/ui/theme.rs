@@ -505,7 +505,7 @@ impl Theme {
     pub fn field(&self, interaction: Interaction, focused: bool, invalid: bool) -> Look {
         let p = &self.palette;
         let line = match (interaction, focused, invalid) {
-            (Interaction::Disabled, _, _) => return self.disabled(radius::CONTROL),
+            (Interaction::Disabled, _, _) => return self.disabled(radius::BUTTON),
             (_, true, true) => p.accent(Accent::Red),
             (_, false, true) => p.accent_line(Accent::Red),
             (_, true, false) => p.accent(Accent::Cyan),
@@ -517,7 +517,7 @@ impl Theme {
         let look = Look::boxed(
             p.surface(Surface::Sunk),
             line,
-            radius::CONTROL,
+            radius::BUTTON,
             p.ink(Ink::Text),
         );
         if matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
