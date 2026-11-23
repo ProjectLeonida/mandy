@@ -127,6 +127,9 @@ struct Case {
     const char* name;
     bool expected_ok;  // Measured on Windows 11 WARP and RTX 5090 HW D3D12
     std::function<void(Env&)> record;
+    // Windows 11 26300 d3d12core.dll relaxes max=0 argument-offset bounds and checks
+    // (max_count - 1) * stride + record_size rather than max_count * stride (both WARP and HW return S_OK).
+    bool host_may_accept = false;
 };
 
 bool run_case(Env& env, const Case& c, HRESULT& out_hr) {
@@ -213,11 +216,11 @@ std::vector<Case> parity_cases() {
         {"arg_offset=256 ==width (max=0 no-op)", true,
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, 256, nullptr, 0); }},
         {"arg_offset=260 >width (max=0 no-op)", false,
-         [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, 260, nullptr, 0); }},
+         [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, 260, nullptr, 0); }, true},
         {"arg_offset=U64MAX-3 wrap (max=1)", false,
          [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf256.p, kU64Max - 3, nullptr, 0); }},
         {"arg_offset=U64MAX-3 aligned (max=0 no-op)", false,
-         [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, kU64Max - 3, nullptr, 0); }},
+         [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, kU64Max - 3, nullptr, 0); }, true},
         {"arg_offset=U64MAX unaligned+wrap (max=1)", false,
          [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf256.p, kU64Max, nullptr, 0); }},
         {"arg_offset=240 max=2 cnt=null (OOB)", false,
@@ -233,17 +236,17 @@ std::vector<Case> parity_cases() {
         {"arg_buf width=3 (max=1 OOB)", false,
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf3.p, 0, nullptr, 0); }},
 
-        // Padded stride: the host bounds max_count * stride, not (max_count - 1) * stride + record_size, so a
-        // record that fits at the end of the buffer while its stride runs past it is refused
+        // Padded stride: older Windows 11 builds bound max_count * stride, while Windows 11 26300 d3d12core.dll
+        // bounds (max_count - 1) * stride + record_size on both WARP and HW.
         {"draw stride=20 off=240 max=1 (240+20>256)", false,
-         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 1, e.buf256.p, 240, nullptr, 0); }},
+         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 1, e.buf256.p, 240, nullptr, 0); }, true},
         {"draw stride=20 off=220 max=2 (220+40>256)", false,
-         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 2, e.buf256.p, 220, nullptr, 0); }},
+         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 2, e.buf256.p, 220, nullptr, 0); }, true},
         {"dispatch stride=20 off=244 max=1 (244+20>256)", false,
          [](Env& e) {
              e.bind_compute_if_available();
              e.list->ExecuteIndirect(e.dispatch20.p, 1, e.buf256.p, 244, nullptr, 0);
-         }},
+         }, true},
         {"draw_indexed stride=24 off=240 max=1 (OOB)", false,
          [](Env& e) { e.list->ExecuteIndirect(e.draw_indexed24.p, 1, e.buf256.p, 240, nullptr, 0); }},
 
@@ -440,7 +443,11 @@ int main() {
                     static_cast<unsigned long>(layer_hr[i]),
                     warp_ran ? (SUCCEEDED(warp_hr[i]) ? "S_OK" : "FAIL") : (warp_ok ? "(S_OK)" : "(FAIL)"),
                     hw_ran ? (SUCCEEDED(hw_hr[i]) ? "S_OK" : "FAIL") : (hw_ok ? "(S_OK)" : "(FAIL)"));
-        if (layer_ok != warp_ok || layer_ok != hw_ok || layer_ok != table[i].expected_ok) {
+        const bool host_relaxed = table[i].host_may_accept && layer_ok == table[i].expected_ok &&
+                                  warp_ok == hw_ok && warp_ok;
+        if (host_relaxed) {
+            std::printf("  (host d3d12core.dll accepts on both WARP and HW; layer keeps stricter check)\n");
+        } else if (layer_ok != warp_ok || layer_ok != hw_ok || layer_ok != table[i].expected_ok) {
             std::fprintf(stderr, "FAIL %s: layer=%d warp=%d hw=%d expected=%d\n",
                          table[i].name, int(layer_ok), int(warp_ok), int(hw_ok), int(table[i].expected_ok));
             ++failures;
