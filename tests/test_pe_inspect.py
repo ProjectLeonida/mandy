@@ -976,5 +976,170 @@ class SectionBoundaryReadTest(unittest.TestCase):
                 self.assertEqual(pe_inspect._tls_callbacks(pe_inspect.PeImage(bytes(image2))), 1)
 
 
+class TestExportForwarders(unittest.TestCase):
+    def inspect_buf(self, buf: bytes) -> dict:
+        return pe_inspect._inspect_exports(pe_inspect.PeImage(buf))
+
+    def test_case1_normal_exports_and_unused_slots(self):
+        """Case 1: Normal code exports + unused zero-RVA slot skipped (forwarders empty, invalid_export_count 0)."""
+        data = with_exports([0x1000, 0, 0x1010], {0: "Alpha", 2: "Beta"}, base=1)
+        exp = self.inspect_buf(data)
+        self.assertEqual(exp["exports"], ["Alpha", "Beta"])
+        self.assertEqual(exp["forwarders"], {})
+        self.assertEqual(exp["invalid_export_count"], 0)
+        self.assertEqual(exp["invalid_exports"], [])
+
+    def test_case2_named_forwarded_export(self):
+        """Case 2: Named forwarded export (RVA inside export directory [0x1700, 0x1800))."""
+        data = with_exports([0x1000, FORWARDER], {0: "NormalFunc", 1: "Sleep"}, base=10)
+        exp = self.inspect_buf(data)
+        self.assertEqual(exp["exports"], ["NormalFunc", "Sleep"])
+        self.assertEqual(exp["forwarders"], {"Sleep": "other.Target"})
+        self.assertEqual(exp["invalid_export_count"], 0)
+
+        with tempfile.NamedTemporaryFile(suffix=".dll", delete=False) as f:
+            f.write(data)
+            f.flush()
+            tmp_path = f.name
+        try:
+            report = pe_inspect.inspect(tmp_path, None)
+            md = pe_inspect.to_markdown(report)
+            self.assertIn("(1 forwarded)", md)
+            self.assertIn("## Forwarded Exports", md)
+            self.assertIn("| `Sleep` | `other.Target` |", md)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_case3_ordinal_only_forwarder(self):
+        """Case 3: Ordinal-only forwarded export (index not in named)."""
+        data = with_exports([0x1000, FORWARDER], {0: "Func"}, base=10)
+        exp = self.inspect_buf(data)
+        self.assertEqual(exp["exports"], ["Func", "#11"])
+        self.assertEqual(exp["forwarders"], {"#11": "other.Target"})
+        self.assertEqual(exp["invalid_export_count"], 0)
+
+    def test_case4_aliased_named_forwarders(self):
+        """Case 4: Two export names mapping to the same forwarded EAT index."""
+        data = with_exports([FORWARDER], {0: "AliasA"}, base=1)
+        buf = bytearray(data)
+        place(buf, 0x1700, struct.pack("<IIHHIIIIIII", 0, 0, 0, 0, 0x1780, 1, 1, 2,
+                                       EXPORT_FUNCS, 0x1C00, 0x1C80))
+        place(buf, 0x1C00, struct.pack("<II", 0x1D00, 0x1D10))
+        place(buf, 0x1C80, struct.pack("<HH", 0, 0))
+        place(buf, 0x1D00, b"AliasA\0")
+        place(buf, 0x1D10, b"AliasB\0")
+        exp = self.inspect_buf(bytes(buf))
+        self.assertEqual(exp["exports"], ["AliasA", "AliasB"])
+        self.assertEqual(exp["forwarders"], {"AliasA": "other.Target", "AliasB": "other.Target"})
+        self.assertEqual(exp["invalid_export_count"], 0)
+
+    def test_case5_out_of_bounds_export_rva(self):
+        """Case 5: Out-of-bounds export RVA (>= size_of_image)."""
+        data = with_exports([0x3000], {0: "BadFunc"}, base=10)
+        exp = self.inspect_buf(data)
+        self.assertEqual(exp["exports"], ["BadFunc"])
+        self.assertEqual(exp["invalid_export_count"], 1)
+        self.assertEqual(len(exp["invalid_exports"]), 1)
+        self.assertEqual(exp["invalid_exports"][0]["symbol"], "BadFunc")
+        self.assertEqual(exp["invalid_exports"][0]["reason"], "out_of_bounds")
+
+        with tempfile.NamedTemporaryFile(suffix=".dll", delete=False) as f:
+            f.write(data)
+            f.flush()
+            tmp_path = f.name
+        try:
+            report = pe_inspect.inspect(tmp_path, None)
+            md = pe_inspect.to_markdown(report)
+            self.assertIn("INVALID: 1 invalid: BadFunc (out_of_bounds)", md)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_case6_unreadable_forwarder_and_error_cap(self):
+        """Case 6: Unreadable forwarder string and invalid error cap at <= 5."""
+        buf = bytearray(build_image())
+        dir_entry = 0x58 + 112 + pe_inspect.DIR_EXPORT * 8
+        struct.pack_into("<II", buf, dir_entry, 0x1700, 0x2000)
+        place(buf, 0x1700, struct.pack("<IIHHIIIIIII", 0, 0, 0, 0, 0x1780, 1, 1, 1,
+                                       EXPORT_FUNCS, 0x1C00, 0x1C80))
+        place(buf, EXPORT_FUNCS, struct.pack("<I", 0x3500))
+        place(buf, 0x1C00, struct.pack("<I", 0x1D00))
+        place(buf, 0x1C80, struct.pack("<H", 0))
+        place(buf, 0x1D00, b"BrokenFwd\0")
+        exp = self.inspect_buf(bytes(buf))
+        self.assertEqual(exp["forwarders"], {"BrokenFwd": "?"})
+        self.assertEqual(exp["invalid_export_count"], 1)
+        self.assertEqual(exp["invalid_exports"][0]["reason"], "unreadable_forwarder")
+
+        bad_slots = [0x4000 + i * 0x100 for i in range(8)]
+        bad_names = {i: f"Bad{i}" for i in range(8)}
+        data_bad = with_exports(bad_slots, bad_names, base=1)
+        exp_bad = self.inspect_buf(data_bad)
+        self.assertEqual(exp_bad["invalid_export_count"], 8)
+        self.assertEqual(len(exp_bad["invalid_exports"]), 5)
+
+    def test_case7_combined_forwarder_and_invalid_summary(self):
+        """Case 7: DLL with both valid forwarder and invalid export displays both in markdown."""
+        data = with_exports([0x1000, FORWARDER, 0x3000], {1: "Fwd|Func", 2: "BadFunc"}, base=10)
+        with tempfile.NamedTemporaryFile(suffix=".dll", delete=False) as f:
+            f.write(data)
+            f.flush()
+            tmp_path = f.name
+        try:
+            report = pe_inspect.inspect(tmp_path, None)
+            md = pe_inspect.to_markdown(report)
+            self.assertIn("(1 forwarded; INVALID: 1 invalid: BadFunc (out_of_bounds))", md)
+            self.assertIn("| `Fwd\\|Func` | `other.Target` |", md)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_case8_out_of_range_ordinal_and_small_dir_size(self):
+        """Case 8: Ordinal index >= functions recorded as invalid, dir_size < 40 returns empty."""
+        data = with_exports([0x1000], {0: "NormalFunc"}, base=1)
+        buf = bytearray(data)
+        # Point the ordinal table to index 5 while NumberOfFunctions is 1
+        place(buf, 0x1C80, struct.pack("<H", 5))
+        exp = self.inspect_buf(bytes(buf))
+        self.assertNotIn("NormalFunc", exp["exports"])
+        self.assertEqual(exp["exports"], ["#1"])
+        self.assertEqual(exp["forwarders"], {})
+        self.assertEqual(exp["invalid_export_count"], 1)
+        self.assertEqual(len(exp["invalid_exports"]), 1)
+        self.assertEqual(exp["invalid_exports"][0]["symbol"], "NormalFunc")
+        self.assertEqual(exp["invalid_exports"][0]["ordinal"], 6)
+        self.assertEqual(exp["invalid_exports"][0]["reason"], "out_of_range_ordinal")
+
+        # When slot is 0, exports is empty, but out-of-range ordinal is still recorded
+        data_zero = with_exports([0], {0: "NormalFunc"}, base=1)
+        buf_zero = bytearray(data_zero)
+        place(buf_zero, 0x1C80, struct.pack("<H", 5))
+        exp_zero = self.inspect_buf(bytes(buf_zero))
+        self.assertEqual(exp_zero["exports"], [])
+        self.assertEqual(exp_zero["invalid_export_count"], 1)
+
+        # dir_size < 40 returns empty dict
+        dir_entry = 0x58 + 112 + pe_inspect.DIR_EXPORT * 8
+        struct.pack_into("<II", buf, dir_entry, 0x1700, 39)
+        exp_small = self.inspect_buf(bytes(buf))
+        self.assertEqual(exp_small["exports"], [])
+        self.assertEqual(exp_small["forwarders"], {})
+        self.assertEqual(exp_small["invalid_export_count"], 0)
+
+    def test_case9_out_of_range_ordinal_markdown_report(self):
+        """Case 9: Markdown report includes out_of_range_ordinal invalid export."""
+        data = with_exports([0x1000], {0: "NormalFunc"}, base=1)
+        buf = bytearray(data)
+        place(buf, 0x1C80, struct.pack("<H", 5))
+        with tempfile.NamedTemporaryFile(suffix=".dll", delete=False) as f:
+            f.write(buf)
+            f.flush()
+            tmp_path = f.name
+        try:
+            report = pe_inspect.inspect(tmp_path, None)
+            md = pe_inspect.to_markdown(report)
+            self.assertIn("INVALID: 1 invalid: NormalFunc (out_of_range_ordinal)", md)
+        finally:
+            os.unlink(tmp_path)
+
+
 if __name__ == "__main__":
     unittest.main()

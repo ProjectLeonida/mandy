@@ -243,42 +243,105 @@ def _imports(img: PeImage, kind: str, index: int, delay: bool = False) -> list[d
     return entries
 
 
-def _exports(img: PeImage) -> list[str]:
+def _inspect_exports(img: PeImage) -> dict:
     rva, size = img.directory(DIR_EXPORT)
     if not rva or size < 40:
-        return []
+        return {
+            "exports": [],
+            "forwarders": {},
+            "invalid_export_count": 0,
+            "invalid_exports": [],
+        }
     at = img.offset(rva, 40)
     if at is None:
         start = img.offset(rva)
         if start is not None and start + 40 > len(img.data):
             raise PeFormatError("truncated export directory")
-        return []
+        return {
+            "exports": [],
+            "forwarders": {},
+            "invalid_export_count": 0,
+            "invalid_exports": [],
+        }
     (_chars, _stamp, _major, _minor, _name, base, functions, name_count, addr_functions,
      addr_names, addr_ordinals) = struct.unpack_from("<IIHHIIIIIII", img.data, at)
 
-    def has_export_at(index: int) -> bool:
-        if index >= functions:
-            return False
-        # A zero RVA marks an unused slot. An RVA inside the export directory is a valid forwarder.
-        slot = img.offset(addr_functions + index * 4, 4)
-        return slot is not None and struct.unpack_from("<I", img.data, slot)[0] != 0
+    dir_begin = rva
+    dir_end = rva + size
 
-    named, names = set(), []
+    def get_export_rva(index: int) -> int | None:
+        if index >= functions:
+            return None
+        slot = img.offset(addr_functions + index * 4, 4)
+        if slot is None:
+            return None
+        return struct.unpack_from("<I", img.data, slot)[0]
+
+    names = []
+    forwarders = {}
+    invalid_exports = []
+    invalid_export_count = 0
+
+    def record_invalid(key: str, ord_num: int, exp_rva: int, reason: str) -> None:
+        nonlocal invalid_export_count
+        invalid_export_count += 1
+        if len(invalid_exports) < 5:
+            invalid_exports.append({
+                "symbol": key,
+                "ordinal": ord_num,
+                "rva": hex(exp_rva),
+                "reason": reason,
+            })
+
+    def process_export(key: str, index: int, exp_rva: int) -> None:
+        ord_num = base + index
+        if dir_begin <= exp_rva < dir_end:
+            target = img.string_at(exp_rva)
+            if not target:
+                record_invalid(key, ord_num, exp_rva, "unreadable_forwarder")
+                target = "?"
+            forwarders[key] = target
+        elif exp_rva >= img.size_of_image:
+            record_invalid(key, ord_num, exp_rva, "out_of_bounds")
+
+    named = set()
     for i in range(min(name_count, MAX_ENTRIES)):
         name_at = img.offset(addr_names + i * 4, 4)
         ord_at = img.offset(addr_ordinals + i * 2, 2)
         if name_at is None or ord_at is None:
             break
+        symbol_rva = struct.unpack_from("<I", img.data, name_at)[0]
+        symbol = img.string_at(symbol_rva)
+        key = symbol if symbol is not None else "?"
         index = struct.unpack_from("<H", img.data, ord_at)[0]
-        if not has_export_at(index):
+        if index >= functions:
+            record_invalid(key, base + index, 0, "out_of_range_ordinal")
             continue
-        symbol = img.string_at(struct.unpack_from("<I", img.data, name_at)[0])
-        names.append(symbol if symbol is not None else "?")
+        exp_rva = get_export_rva(index)
+        if exp_rva is None or exp_rva == 0:
+            continue
+        names.append(key)
+        process_export(key, index, exp_rva)
         named.add(index)
+
     for i in range(min(functions, MAX_ENTRIES)):
-        if i not in named and has_export_at(i):
-            names.append(f"#{base + i}")
-    return names
+        if i not in named:
+            exp_rva = get_export_rva(i)
+            if exp_rva is not None and exp_rva != 0:
+                key = f"#{base + i}"
+                names.append(key)
+                process_export(key, i, exp_rva)
+
+    return {
+        "exports": names,
+        "forwarders": forwarders,
+        "invalid_export_count": invalid_export_count,
+        "invalid_exports": invalid_exports,
+    }
+
+
+def _exports(img: PeImage) -> list[str]:
+    return _inspect_exports(img)["exports"]
 
 
 def _export_module_name(img: PeImage) -> str:
@@ -416,7 +479,8 @@ def _inspect(path: str, game_dir: str | None) -> dict:
     for entry in imports:
         entry["where"] = classify_dll(entry["dll"], game_dir)
 
-    exports = _exports(img)
+    exp = _inspect_exports(img)
+    exports = exp["exports"]
     own_names = (os.path.basename(path), _export_module_name(img))
     loads = dll_strings(img.data, {i["dll"].lower() for i in imports}, own_names)
     for entry in loads:
@@ -440,6 +504,10 @@ def _inspect(path: str, game_dir: str | None) -> dict:
         "imports": imports,
         "export_count": len(exports),
         "exports": exports,
+        "forwarders": exp["forwarders"],
+        "forwarder_count": len(exp["forwarders"]),
+        "invalid_export_count": exp["invalid_export_count"],
+        "invalid_exports": exp["invalid_exports"],
         "pdata_functions": pdata_size // 12 if pdata_rva and pdata_size >= 12 else 0,
         "tls_callbacks": _tls_callbacks(img),
         "runtime_load_candidates": loads,
@@ -447,12 +515,25 @@ def _inspect(path: str, game_dir: str | None) -> dict:
 
 
 def to_markdown(r: dict) -> str:
+    exp_summary = f"{r['export_count']:,}"
+    fwd_count = r.get("forwarder_count", 0)
+    inv_count = r.get("invalid_export_count", 0)
+    exp_parts = []
+    if fwd_count > 0:
+        exp_parts.append(f"{fwd_count} forwarded")
+    if inv_count > 0:
+        inv_details = [f"{inv['symbol']} ({inv['reason']})" for inv in r.get("invalid_exports", [])]
+        details_str = f": {', '.join(inv_details)}" if inv_details else ""
+        exp_parts.append(f"INVALID: {inv_count} invalid{details_str}")
+    if exp_parts:
+        exp_summary += f" ({'; '.join(exp_parts)})"
+
     out = [f"# {r['file']}", "",
            f"- {r['machine']}, {'DLL' if r['is_dll'] else 'EXE'}, subsystem {r['subsystem']}, {r['size']:,} bytes",
            f"- image base {r['image_base']}, size {r['size_of_image']:,}, entry RVA {r['entry_rva']}",
            f"- relocations: {'yes' if r['has_relocs'] else 'NO (must load at preferred base)'}; "
            f"ASLR flag: {r['dynamic_base']}",
-           f"- .pdata functions: {r['pdata_functions']:,}; TLS callbacks: {r['tls_callbacks']}; exports: {r['export_count']}",
+           f"- .pdata functions: {r['pdata_functions']:,}; TLS callbacks: {r['tls_callbacks']}; exports: {exp_summary}",
            "", "## Sections", "", "| name | rva | vsize | exec | write | entropy | |", "|---|---|---|---|---|---|---|"]
     for s in r["sections"]:
         flag = "**encrypted?**" if s["looks_encrypted"] else ""
@@ -480,6 +561,14 @@ def to_markdown(r: dict) -> str:
             out.append("")
             out.append(", ".join(f"`{f}`" for f in imp["functions"]))
             out.append("")
+    forwarders = r.get("forwarders", {})
+    if forwarders:
+        out += ["", "## Forwarded Exports", "", "| export | target |", "|---|---|"]
+        items = sorted(forwarders.items())
+        for exp_name, target in items[:50]:
+            out.append(f"| `{exp_name.replace('|', '\\|')}` | `{target.replace('|', '\\|')}` |")
+        if len(items) > 50:
+            out.append(f"| ... and {len(items) - 50} more | |")
     return "\n".join(out) + "\n"
 
 
