@@ -88,6 +88,9 @@ def probe(mcpu: str) -> None:
              f"{install_hint()}")
 
 
+LINE_BYTES = 64
+
+
 def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True):
     if backend == "python":
         asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
@@ -102,7 +105,9 @@ def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True
 
 def run_mc(code: bytes, mcpu: str):
     """One llvm-mc pass over `code`: (listing, invalid word count, stderr), or ("", count, reason) when it failed."""
-    text = " ".join(f"0x{b:02x}" for b in code)
+    # 64 bytes per line: llvm-mc slows down sharply on one long input line (a 90 KB program took 58.6 s as one line
+    # and 0.2 s split like this, with byte-identical output); invalid_offsets() maps (line, col) back to byte offsets.
+    text = "\n".join(" ".join(f"0x{b:02x}" for b in code[i:i + LINE_BYTES]) for i in range(0, len(code), LINE_BYTES))
     try:
         p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
                            input=text, capture_output=True, text=True, errors="replace",
@@ -116,7 +121,7 @@ def run_mc(code: bytes, mcpu: str):
 
 
 ENCODING = re.compile(r"; encoding: \[([^\]]*)\]")
-INVALID_AT = re.compile(r":1:(\d+): warning: invalid instruction encoding")
+INVALID_AT = re.compile(r":(\d+):(\d+): warning: invalid instruction encoding")
 VOPC = 0x3E                    # bits 31..25 of a VOPC word
 DPP_SRC0 = (250, 233, 234)     # the src0 field of a DPP16, DPP8 and DPP8-with-fi word
 STAND_IN = 0x10                # VOP2 v_max_f32: takes the same DPP second word, and llvm-mc decodes it
@@ -124,9 +129,9 @@ STAND_IN_TEXT = "v_max_f32_dpp v0, "
 
 
 def invalid_offsets(err: str) -> set:
-    """Byte offsets llvm-mc rejected: its warning names the column of the word in the one line of 5-character
-    "0xNN " tokens it was given."""
-    return {(int(col) - 1) // 5 for col in INVALID_AT.findall(err)}
+    """Byte offsets llvm-mc rejected: its warning names the 1-based line and column of the word in the
+    LINE_BYTES-per-line stream of 5-character "0xNN " tokens it was given."""
+    return {(int(line) - 1) * LINE_BYTES + (int(col) - 1) // 5 for line, col in INVALID_AT.findall(err)}
 
 
 def vopc_dpp_words(code: bytes, offsets) -> dict:
