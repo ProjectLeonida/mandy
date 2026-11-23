@@ -337,7 +337,8 @@ class TestCli(unittest.TestCase):
             with mock.patch.object(names_mod.os, "walk", walk), \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(names_mod.main([source, "--mount", mount, "--out", report]), 1)
-            self.assertIn(blocked, err.getvalue())
+            # str(OSError) prints the filename with repr(): on Windows every backslash in the path is doubled.
+            self.assertIn(repr(blocked), err.getvalue())
             with open(report, "rb") as f:
                 self.assertEqual(f.read(), b"previous report")
 
