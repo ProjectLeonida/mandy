@@ -4,19 +4,24 @@ Standard library only; no GPU, no LLVM, no game files.
 
 runtime/test/shaders/cs_w32_lds_add_f32.asm (derivations in its header) stores eight words from lane 0. This runs its
 fixture as one wave32 group through spirv_mini_interp with the buffer vk_compute_test gives it (every byte 0xEE, a V#
-with num_records 0xFFFFFFFF), checks the words against a reference that adds in double precision (exact for two
-binary32 values) and rounds once to binary32, that check.py and scripts/run_gpu_tests.py expect the same words, and
-that EXEC is cut to lane 0 before the first LDS op.
+with num_records 0xFFFFFFFF), checks the words against a reference that adds in double precision and rounds once
+to binary32 (exact for these inputs, whose exponents are close: in general a double sum of two binary32 values can
+round, and rounding it again to binary32 could then differ from one rounding), that check.py and
+scripts/run_gpu_tests.py expect the same words, and that EXEC is cut to lane 0 before the first LDS op.
 """
 import os
 import re
 import struct
+import sys
 import unittest
 
-import support
-import spirv_mini_interp as si
-
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)  # python -I leaves the script's folder off sys.path
+
+import support  # noqa: E402  (support puts tools/ on sys.path, honouring LEONIDA_TOOLS_DIR)
+import spirv_mini_interp as si  # noqa: E402
+
 ROOT = os.path.dirname(os.path.dirname(HERE))
 
 FSSM = bytearray(0x148)
@@ -35,7 +40,7 @@ def bits(x):
 
 
 def add(m, d):
-    """binary32 m + d, rounded once to nearest even; past FLT_MAX it is +-inf."""
+    """binary32 m + d, rounded to nearest even (the double sum is exact for this file's inputs); past FLT_MAX +-inf."""
     total = f32(m) + f32(d)
     try:
         return bits(total)
