@@ -361,9 +361,15 @@ class LodQueryCoordinates(unittest.TestCase):
             self.assertEqual(module.defs[image][1][0], image_type)
             op, unpack = module.defs[coord]
             self.assertEqual((op, unpack[:3]), ("OpExtInst", ["%v2float", "%glsl", "UnpackHalf2x16"]))
-            op, load = module.defs[unpack[3]]
-            self.assertEqual(op, "OpLoad")
-            op, ptr = module.defs[load[1]]
+            word = unpack[3]
+            op, load = module.defs[word]
+            if op == "OpLoad":
+                ptr_id = load[1]
+            else:
+                m_st = re.search(rf"^\s*OpStore (%\w+) {re.escape(word)}$", module.text, re.M)
+                self.assertIsNotNone(m_st, f"missing OpStore for forwarded VGPR value {word}")
+                ptr_id = m_st.group(1)
+            op, ptr = module.defs[ptr_id]
             self.assertEqual((op, ptr[1], module.value(ptr[2], 0, 0)), ("OpAccessChain", "%vgpr", register))
             self.assertEqual([int(args[2]) for _, op, args in module.order
                               if op == "OpCompositeExtract" and args[:2] == ["%float", rid]], components)
