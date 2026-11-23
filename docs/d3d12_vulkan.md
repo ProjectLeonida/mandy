@@ -289,7 +289,15 @@ What is implemented (all of it testable without the game):
   a `FragDepth` write turns off for these pipelines. A depth texture sampled in a shader still sees the float.
   `ResolveSubresource` becomes `vkCmdResolveImage` in the same layouts as a copy: a multisampled colour
   subresource into a single-sampled one of the same size and format. Integer colour formats in the requested
-  format or either resource are refused at recording; `Close` fails. `ResolveSubresourceRegion` uses the same
+  format or either resource are refused at recording; `Close` fails. When either resource is typeless and `Format`
+  names a typed member of its family that an image is not in (a typeless RGBA8 resolved as `R8G8B8A8_UNORM_SRGB`, or
+  one resolved into a typed sRGB texture), `vkCmdResolveImage` cannot be used: it needs one format on both sides
+  and would average a typeless image in its own UNORM. The command carries the Vulkan format
+  (`ResolveSubresource::format`), and replay views both images in it and resolves in a rendering scope of its own
+  (colour attachment with an `AVERAGE` resolve, whole subresource), so sRGB averages in linear light. Both images
+  need `ALLOW_RENDER_TARGET`; without it the resolve is refused at replay (`unsupported`), never done in the wrong
+  colour space. `d3d12_msaa_draw_test` checks it: one of four samples green resolves to 137/225 as sRGB and
+  64/191 as UNORM, typeless to typeless and typeless to typed sRGB. `ResolveSubresourceRegion` uses the same
   Vulkan operation for non-integer colour with average mode, taking a source rectangle (or the entire subresource)
   and a destination offset. A `ResolveSubresourceRegion` of one depth or stencil plane (the subresource's plane
   slice, the same on both sides) runs in a rendering scope of its own with no draws: the multisampled plane is the
@@ -330,8 +338,8 @@ What is implemented (all of it testable without the game):
   WARP. Its edge cases (TEST-848) draw a triangle over the cleared 4x source first (depth 0.5, stencil 0x44): the
   pixels on its diagonal edge hold differing samples, and MIN, MAX and AVERAGE over them match the PC runtime on an
   RTX 5070 (driver 621.01) and WARP byte for byte. `DECOMPRESS`,
-  `ResolveSubresource` of depth (which D3D12 does not offer) and resolves between two formats of one typeless family
-  remain open. A multisampled texture copies only to one with the same sample count
+  `ResolveSubresource` of depth (which D3D12 does not offer) and `ResolveSubresourceRegion` of a colour rectangle
+  between two formats of one typeless family remain open. A multisampled texture copies only to one with the same sample count
   and has no footprint.
   Discards, immediate writes and atomic copies replay as section 4.2 describes.
 - **UAV clears** (`ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat`). The CPU handle's slot is read

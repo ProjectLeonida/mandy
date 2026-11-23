@@ -787,7 +787,8 @@ public:
             note_once("ResolveSubresource refused: integer colour formats cannot be resolved");
             return check(false);
         }
-        check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource}));
+        check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource,
+                                         std::nullopt, color_resolve_view_format(format, dst, src)}));
     }
 
     void STDMETHODCALLTYPE ResolveSubresourceRegion(ID3D12Resource* dst, UINT dst_subresource, UINT x, UINT y,

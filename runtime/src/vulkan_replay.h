@@ -1303,6 +1303,9 @@ struct Prepared {
     // Depth or stencil resolves: the mode, and the destination view (`view` is the source's).
     VkResolveModeFlagBits resolve_mode = VK_RESOLVE_MODE_NONE;
     VkImageView resolve_view = VK_NULL_HANDLE;
+    // Colour resolves in a format other than the images' own: both are viewed in it (a mode of AVERAGE, the views
+    // above, and a dynamic-rendering scope, as the depth ones).
+    VkFormat resolve_format = VK_FORMAT_UNDEFINED;
     // Set: the resolve runs in this render pass and framebuffer instead of a dynamic-rendering scope.
     VkRenderPass resolve_pass = VK_NULL_HANDLE;
     VkFramebuffer resolve_framebuffer = VK_NULL_HANDLE;
@@ -2317,6 +2320,34 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
     return ReplayResult::success;
 }
 
+// Whether a colour format averages its samples (a float, UNORM, SNORM or sRGB one): integers cannot be resolved.
+inline bool averages_colour(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_R16G16B16A16_UINT:
+    case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT:
+    case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT:
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT:
+    case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT:
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: return false;
+    default: return typeless_view_family(format) != 0;
+    }
+}
+
+// A whole-subresource colour resolve in `resolve.format` when an image is not in it (a typeless resource, or a
+// typed one resolved against a typeless one): vkCmdResolveImage needs both images in one format and would average
+// in the image's own (UNORM for a typeless RGBA8, where D3D12 asked for sRGB). Both are viewed in the format
+// instead and resolved in a rendering scope, which needs colour-attachment usage on both.
+inline bool prepare_view_resolve(const ResolveSubresource& resolve, Prepared& p) {
+    const auto format = static_cast<VkFormat>(resolve.format);
+    const TargetView view{0, 0, 0, 1, static_cast<ColorViewFormat>(format)};
+    if (resolve.region || !p.source.color_attachment || !p.binding.color_attachment || !averages_colour(format) ||
+        color_view_format(p.source, view) != format || color_view_format(p.binding, view) != format)
+        return false;
+    p.resolve_mode = VK_RESOLVE_MODE_AVERAGE_BIT;
+    p.resolve_format = format;
+    return true;
+}
+
 // Resolve a multisampled colour image into a single-sampled image of the same format, or (a region) one plane of a
 // depth/stencil image into the same plane of another: MIN or MAX, or AVERAGE of depth.
 inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared& p) {
@@ -2341,7 +2372,7 @@ inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared&
     } else if (from.width != to.width || from.height != to.height) {
         return ReplayResult::invalid_copy;
     }
-    if (src.aspectMask != dst.aspectMask || p.source.format != p.binding.format) return unsupported_at(__LINE__);
+    if (src.aspectMask != dst.aspectMask) return unsupported_at(__LINE__);
     const auto finish = [&] {
         p.resolve = {{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1}, src_offset,
                      {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1}, dst_offset, extent};
@@ -2351,7 +2382,7 @@ inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared&
     };
     if (const auto& extrema = resolve.region; src.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && extrema &&
         (extrema->mode == d3d12_resolve_mode::minimum || extrema->mode == d3d12_resolve_mode::maximum)) {
-        if (!p.source.sampled || p.source.line || p.binding.line || p.source.volume ||
+        if (!p.source.sampled || p.source.format != p.binding.format || p.source.line || p.binding.line || p.source.volume ||
             p.source.typeless || p.binding.typeless || p.source.rgb96 || p.binding.rgb96 ||
             color_resolve_type(p.source.format) == ColorResolveType::unsupported)
             return unsupported_at(__LINE__);
@@ -2359,6 +2390,11 @@ inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared&
         return finish();
     }
     const auto& region = resolve.region;
+    const auto asked = static_cast<VkFormat>(resolve.format);
+    const bool in_view_format = src.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && asked != VK_FORMAT_UNDEFINED &&
+                                (p.source.format != asked || p.binding.format != asked);
+    if (in_view_format ? !prepare_view_resolve(resolve, p) : p.source.format != p.binding.format)
+        return unsupported_at(__LINE__);
     if (src.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT) {
         if (region && region->mode != d3d12_resolve_mode::average) return unsupported_at(__LINE__);
     } else {
@@ -3707,11 +3743,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return result;
             if (p.resolve_mode != VK_RESOLVE_MODE_NONE) {
                 if (!vk.begin_rendering || !vk.end_rendering || !vk.image_view) return unsupported_at(__LINE__);
-                p.view = vk.image_view(p.source, p.source_range);
-                p.resolve_view = vk.image_view(p.binding, p.range);
+                ResourceBinding from_binding = p.source, to_binding = p.binding;
+                if (p.resolve_format != VK_FORMAT_UNDEFINED) from_binding.format = to_binding.format = p.resolve_format;
+                p.view = vk.image_view(from_binding, p.source_range);
+                p.resolve_view = vk.image_view(to_binding, p.range);
                 if (!p.view || !p.resolve_view) return unsupported_at(__LINE__);
-                if (const auto result = detail::keep_around_resolve(vk, p); result != ReplayResult::success)
-                    return result;
+                // A colour resolve is whole-subresource: nothing around a rectangle to keep.
+                if (p.resolve_format == VK_FORMAT_UNDEFINED)
+                    if (const auto result = detail::keep_around_resolve(vk, p); result != ReplayResult::success)
+                        return result;
                 // D3D-417, a driver workaround: AMD's Windows driver (32.0.21042.62, Radeon RDNA2 iGPU) resolves a
                 // dynamic-rendering depth attachment from layer 0 of the image when the multisampled view starts at
                 // another layer (the resolve view's first layer it honours). The same two views in a framebuffer
@@ -4929,10 +4969,11 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                                            VK_PIPELINE_STAGE_TRANSFER_BIT);
                 }
-                const VkImageLayout source_attachment =
-                    image_layout(p.source, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-                const VkImageLayout dest_attachment =
-                    image_layout(p.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                const bool colour = p.range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT;
+                const VkImageLayout attachment_layout = colour ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                                                               : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                const VkImageLayout source_attachment = image_layout(p.source, attachment_layout);
+                const VkImageLayout dest_attachment = image_layout(p.binding, attachment_layout);
                 detail::round_trip(vk, command_buffer, p.source, source_pieces, source_attachment, source_state,
                                    attachment_access, attachment_stages, [&] {
                     detail::round_trip(vk, command_buffer, p.binding, dest_pieces, dest_attachment, dest_state,
@@ -4960,8 +5001,14 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                                                 {p.resolve.extent.width, p.resolve.extent.height}};
                         rendering.layerCount = 1;
                         // One plane only, so independentResolve(None) never applies.
-                        if (p.range.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) rendering.pDepthAttachment = &info;
-                        else rendering.pStencilAttachment = &info;
+                        if (colour) {
+                            rendering.colorAttachmentCount = 1;
+                            rendering.pColorAttachments = &info;
+                        } else if (p.range.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) {
+                            rendering.pDepthAttachment = &info;
+                        } else {
+                            rendering.pStencilAttachment = &info;
+                        }
                         vk.begin_rendering(command_buffer, &rendering);
                         vk.end_rendering(command_buffer);
                     });

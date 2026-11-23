@@ -17135,6 +17135,16 @@ bool color_resolve_format_is_integer(DXGI_FORMAT format) {
     return DeviceState::numeric_class(vulkan_format(format, false).format) != 0;
 }
 
+std::uint32_t color_resolve_view_format(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src) {
+    if (!dst || !src) return 0;
+    const auto from = src->GetDesc(), to = dst->GetDesc();
+    if ((from.Flags | to.Flags) & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) return 0;
+    if (!vulkan_format(from.Format, false).typeless && !vulkan_format(to.Format, false).typeless) return 0;
+    const Format requested = vulkan_format(format, false);
+    if (requested.typeless || requested.rgb96 || requested.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return 0;
+    return std::uint32_t(requested.format);
+}
+
 bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src) {
     if (!dst || !src) return false;
     const Format requested = vulkan_format(format, false);
