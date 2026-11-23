@@ -42,7 +42,7 @@ DOC_MARK = re.compile(r"\*\*(VERIFY|ASSUMPTION|UNVERIFIED)S?\b[^*]*:?\*\*", re.I
 # A bold marker followed by a dash defines the term (`- **Assumption** — a design choice ...`), it is not a note.
 DEFINITION = re.compile(r"[\u2014\u2013-]\s")
 # A note is what a list item starts, so the marker after this prefix is at the item's start.
-LIST_ITEM = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
+LIST_ITEM = re.compile(r"^(?:[-*+]|\d+[.)])(?:\s+|$)")
 
 
 def comment_text(line: str) -> str | None:
@@ -90,9 +90,13 @@ def doc_notes(path: str, rel: str) -> list[dict]:
     with open(path, encoding="utf-8", errors="replace") as f:
         lines = f.read().split("\n")
     notes = []
+    in_fence = False
     for i, line in enumerate(lines):
         stripped = line.lstrip()
-        if stripped.startswith("|"):
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence or stripped.startswith("|"):
             continue
         body = LIST_ITEM.sub("", stripped)
         m = DOC_MARK.match(body)
@@ -100,12 +104,38 @@ def doc_notes(path: str, rel: str) -> list[dict]:
             continue
         if DEFINITION.match(body[m.end():].lstrip()):
             continue
+        base_indent = len(line) - len(stripped)
+        is_list = bool(LIST_ITEM.match(stripped))
         end = i + 1
-        while (end < len(lines) and lines[end].strip() and
-               not LIST_ITEM.match(lines[end].lstrip()) and
-               not lines[end].lstrip().startswith(("#", "|"))):
+        fence = False
+        while end < len(lines):
+            curr = lines[end]
+            curr_stripped = curr.lstrip()
+            if curr_stripped.startswith("```"):
+                fence = not fence
+                end += 1
+                continue
+            if fence:
+                end += 1
+                continue
+            if not curr.strip():
+                break
+            if curr_stripped.startswith(("#", "|")):
+                break
+            curr_indent = len(curr) - len(curr_stripped)
+            if LIST_ITEM.match(curr_stripped) and (not is_list or curr_indent <= base_indent):
+                break
             end += 1
-        text = " ".join(LIST_ITEM.sub("", l.strip()) for l in lines[i:end])
+        parts = [LIST_ITEM.sub("", lines[i].strip())]
+        fence = False
+        for l in lines[i + 1:end]:
+            l_str = l.strip()
+            if l_str.startswith("```"):
+                fence = not fence
+                continue
+            if not fence and l_str:
+                parts.append(l_str)
+        text = " ".join(p for p in parts if p)
         notes.append({"file": rel, "line": i + 1, "kind": m.group(1).upper(), "text": without_marker(text)})
     return notes
 
