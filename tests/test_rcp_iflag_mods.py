@@ -72,8 +72,10 @@ class RcpIflagModsTest(unittest.TestCase):
 
         if scale_bits is not None:
             const = match_result(rf"OpConstant %uint {scale_bits}")
-            scale = match_result(rf"OpBitcast %float {const}")
-            value = match_result(rf"OpFMul %float {value} {scale}")
+            scales = re.findall(rf"^ *(%\w+) = OpBitcast %float {re.escape(const)}$", spv, re.M)
+            self.assertTrue(scales, f"Missing SPIR-V instruction: OpBitcast %float {const}")
+            scale_pat = "(?:" + "|".join(re.escape(s) for s in scales) + ")"
+            value = match_result(rf"OpFMul %float {value} {scale_pat}")
         else:
             self.assertNotRegex(spv, r"\bOpFMul %float\b")
 
