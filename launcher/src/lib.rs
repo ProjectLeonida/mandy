@@ -12,5 +12,6 @@ pub mod config;
 pub mod output;
 pub mod process;
 pub mod repo;
+pub mod scene;
 pub mod state;
 pub mod ui;
