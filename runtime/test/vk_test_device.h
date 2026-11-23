@@ -662,15 +662,24 @@ private:
             return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
         });
         if (conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4996)  // getenv: read once, at device init
+#endif
+        const char* amd_mixed_env = std::getenv("LEONIDA_VK_AMD_MIXED_SAMPLES");
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+        const bool allow_amd_mixed = amd_mixed_env && std::strcmp(amd_mixed_env, "1") == 0;
+        const auto has_mixed_ext = [&](const char* name) {
+            return std::any_of(extensions.begin(), extensions.end(),
+                               [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
+        };
         const char* mixed_samples_ext = nullptr;
-        for (const char* name :
-             {VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME, VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME}) {
-            if (std::any_of(extensions.begin(), extensions.end(),
-                            [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; })) {
-                mixed_samples_ext = name;
-                break;
-            }
-        }
+        if (has_mixed_ext(VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME))
+            mixed_samples_ext = VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME;
+        else if (allow_amd_mixed && has_mixed_ext(VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME))
+            mixed_samples_ext = VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME;
         mixed_attachment_samples = mixed_samples_ext != nullptr;
         if (mixed_samples_ext) device_extensions.push_back(mixed_samples_ext);
         if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);

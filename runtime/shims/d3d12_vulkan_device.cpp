@@ -16323,15 +16323,20 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.conservative_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
     });
+    char amd_mixed_env[16]{};
+    std::size_t amd_mixed_len = 0;
+    const bool allow_amd_mixed =
+        getenv_s(&amd_mixed_len, amd_mixed_env, "LEONIDA_VK_AMD_MIXED_SAMPLES") == 0 && amd_mixed_len > 1 &&
+        std::strcmp(amd_mixed_env, "1") == 0;
+    const auto has_mixed_ext = [&](const char* name) {
+        return std::any_of(extensions.begin(), extensions.end(),
+                           [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
+    };
     const char* mixed_samples_ext = nullptr;
-    for (const char* name :
-         {VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME, VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME}) {
-        if (std::any_of(extensions.begin(), extensions.end(),
-                        [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; })) {
-            mixed_samples_ext = name;
-            break;
-        }
-    }
+    if (has_mixed_ext(VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME))
+        mixed_samples_ext = VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME;
+    else if (allow_amd_mixed && has_mixed_ext(VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME))
+        mixed_samples_ext = VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME;
     info.mixed_attachment_samples = mixed_samples_ext != nullptr;
     const bool has_host_image_copy = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0;
