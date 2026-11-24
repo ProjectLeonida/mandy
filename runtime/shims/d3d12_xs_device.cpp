@@ -38,8 +38,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
-#include <new>
 #include <memory>
+#include <mutex>
+#include <new>
 #include <utility>
 
 namespace rt::d3d12_xs {
@@ -78,7 +79,17 @@ struct DeviceProxy {
     std::atomic<std::uint64_t> frame_next_token{1};
     std::atomic<bool> frame_suspended{false};
     std::atomic<std::uint64_t> present_calls{0};
+    std::mutex presentation_mutex;
+    void* presentation_ctx = nullptr;
+    const XboxPresentationOps* presentation_ops = nullptr;
 };
+
+bool get_device_presentation(DeviceProxy* self, void*& ctx, const XboxPresentationOps*& ops) {
+    const std::lock_guard lock(self->presentation_mutex);
+    ctx = self->presentation_ctx;
+    ops = self->presentation_ops;
+    return ctx != nullptr && ops != nullptr;
+}
 
 constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
 
@@ -1246,8 +1257,15 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         note_child_slot<K>(Slot);
         if constexpr (K == ChildKind::queue) {
             const XboxQueueSlotRoutes& qroutes = xbox_queue_slot_routes();
+            void* pres_ctx = nullptr;
+            const XboxPresentationOps* pres_ops = nullptr;
             if (Slot == qroutes.suspend) {
                 log_xbox_route_once(Slot, "Queue::SuspendX", a1, a2, a3, a4, 0);
+                if (get_device_presentation(self->device, pres_ctx, pres_ops) && pres_ops->suspend_x) {
+                    const HRESULT hr = pres_ops->suspend_x(pres_ctx, static_cast<UINT>(a1));
+                    d3d12_trace::record("ID3D12CommandQueue::SuspendX", SUCCEEDED(hr) ? nullptr : "failed");
+                    return hr_to_u64(hr);
+                }
                 self->device->frame_event_scheduled.store(false, std::memory_order_relaxed);
                 self->device->frame_suspended.store(true, std::memory_order_relaxed);
                 d3d12_trace::record("ID3D12CommandQueue::SuspendX");
@@ -1255,6 +1273,11 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             }
             if (Slot == qroutes.resume) {
                 log_xbox_route_once(Slot, "Queue::ResumeX", a1, a2, a3, a4, 0);
+                if (get_device_presentation(self->device, pres_ctx, pres_ops) && pres_ops->resume_x) {
+                    const HRESULT hr = pres_ops->resume_x(pres_ctx);
+                    d3d12_trace::record("ID3D12CommandQueue::ResumeX", SUCCEEDED(hr) ? nullptr : "failed");
+                    return hr_to_u64(hr);
+                }
                 self->device->frame_suspended.store(false, std::memory_order_relaxed);
                 d3d12_trace::record("ID3D12CommandQueue::ResumeX");
                 return hr_to_u64(S_OK);
@@ -1262,6 +1285,12 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             if (Slot == qroutes.present) {
                 log_xbox_route_once(Slot, "Queue::PresentX", a1, a2, a3, a4, 0);
                 const auto plane_count = static_cast<std::uint32_t>(a1);
+                if (get_device_presentation(self->device, pres_ctx, pres_ops) && pres_ops->present_x) {
+                    const HRESULT hr = pres_ops->present_x(pres_ctx, plane_count, reinterpret_cast<const void*>(a2),
+                                                           reinterpret_cast<const void*>(a3));
+                    d3d12_trace::record("ID3D12CommandQueue::PresentX", SUCCEEDED(hr) ? nullptr : "failed");
+                    return hr_to_u64(hr);
+                }
                 if (plane_count > 2 || (plane_count > 0 && a2 == 0)) {
                     d3d12_trace::record("ID3D12CommandQueue::PresentX", "invalid_arg");
                     return hr_to_u64(E_INVALIDARG);
@@ -1442,8 +1471,13 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
 // 60 Hz), and latency is the allowed frames in flight. S_OK even for 0: a boot must not abort here, and nothing paces.
 HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std::uint64_t interval_us,
                                    std::uint64_t latency, std::uint64_t flags) {
-    (void)output;
-    (void)flags;
+    void* pres_ctx = nullptr;
+    const XboxPresentationOps* pres_ops = nullptr;
+    if (get_device_presentation(self, pres_ctx, pres_ops) && pres_ops->set_frame_interval) {
+        return pres_ops->set_frame_interval(pres_ctx, reinterpret_cast<IUnknown*>(output),
+                                            static_cast<UINT>(interval_us), static_cast<UINT>(latency),
+                                            static_cast<UINT>(flags));
+    }
     self->frame_interval_us.store(static_cast<std::uint32_t>(interval_us), std::memory_order_relaxed);
     self->frame_latency.store(static_cast<std::uint32_t>(latency ? latency : 1), std::memory_order_relaxed);
     return S_OK;
@@ -1452,9 +1486,12 @@ HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std:
 // Xbox device slot 79 (public HLE): ScheduleFrameEventX(event, offset_us, pEvent, flags); our pacer has only the origin.
 HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t offset_us,
                                      std::uint64_t flags) {
-    (void)event;
-    (void)offset_us;
-    (void)flags;
+    void* pres_ctx = nullptr;
+    const XboxPresentationOps* pres_ops = nullptr;
+    if (get_device_presentation(self, pres_ctx, pres_ops) && pres_ops->schedule_frame_event) {
+        return pres_ops->schedule_frame_event(pres_ctx, static_cast<UINT>(event), static_cast<UINT>(offset_us),
+                                              static_cast<UINT>(flags));
+    }
     self->frame_event_scheduled.store(true, std::memory_order_relaxed);
     return S_OK;
 }
@@ -1464,10 +1501,13 @@ HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std
 // a zero wait cannot stall the title. A null token pointer is E_POINTER, as a _Out_ parameter.
 HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t timeout_ms,
                                  std::uint64_t flags, std::uint64_t token_word) {
-    (void)event;
-    (void)timeout_ms;
-    (void)flags;
     auto* token = reinterpret_cast<std::uint64_t*>(token_word);
+    void* pres_ctx = nullptr;
+    const XboxPresentationOps* pres_ops = nullptr;
+    if (get_device_presentation(self, pres_ctx, pres_ops) && pres_ops->wait_frame_event) {
+        return pres_ops->wait_frame_event(pres_ctx, static_cast<UINT>(event), static_cast<DWORD>(timeout_ms),
+                                          static_cast<UINT>(flags), token);
+    }
     if (!token) return E_POINTER;
     std::uint64_t value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);
     if (value == 0) value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);  // skip the null token
@@ -1477,12 +1517,18 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
 
 // Xbox device slot 81 (measured in retail exe): GetFrameStatisticsX(token, type_mask, &count, stats).
 // Before a window/presenter is attached, writes *count = 0 and returns S_FALSE (matches XboxPresentation).
-HRESULT proxy_get_frame_statistics_x(DeviceProxy* /*self*/, std::uint64_t token, std::uint64_t type_mask,
+HRESULT proxy_get_frame_statistics_x(DeviceProxy* self, std::uint64_t token, std::uint64_t type_mask,
                                        std::uint64_t count_word, std::uint64_t stats_word) {
+    auto* count = reinterpret_cast<std::uint32_t*>(count_word);
+    void* pres_ctx = nullptr;
+    const XboxPresentationOps* pres_ops = nullptr;
+    if (get_device_presentation(self, pres_ctx, pres_ops) && pres_ops->get_frame_statistics) {
+        return pres_ops->get_frame_statistics(pres_ctx, token, static_cast<UINT>(type_mask), count,
+                                              reinterpret_cast<void*>(stats_word));
+    }
     (void)token;
     (void)type_mask;
     (void)stats_word;
-    auto* count = reinterpret_cast<std::uint32_t*>(count_word);
     if (!count) return E_POINTER;
     *count = 0;
     return S_FALSE;
@@ -2296,6 +2342,18 @@ bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider) {
         return false;
     }
     proxy->adapter_provider = provider;
+    return true;
+}
+
+bool set_device_presentation(void* device, void* ctx, const XboxPresentationOps* ops) {
+    auto* proxy = static_cast<DeviceProxy*>(device_proxy_primary(device));
+    if (!proxy) {
+        std::fprintf(stderr, "[rt] d3d12_xs: set_device_presentation: %p is not a device proxy\n", device);
+        return false;
+    }
+    const std::lock_guard lock(proxy->presentation_mutex);
+    proxy->presentation_ctx = ctx;
+    proxy->presentation_ops = ops;
     return true;
 }
 

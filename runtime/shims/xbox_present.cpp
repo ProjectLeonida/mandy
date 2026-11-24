@@ -1,6 +1,7 @@
 #include "xbox_present.h"
 
 #include "d3d12_trace.h"
+#include "d3d12_xs_device.h"
 
 #include "../src/vulkan_present.h"
 
@@ -312,6 +313,36 @@ HRESULT XboxPresentation::SuspendX(UINT) {
 HRESULT XboxPresentation::ResumeX() {
     pacer_.resume();
     return S_OK;
+}
+
+bool bind_device_presentation(void* device, XboxPresentation* presentation) {
+    static const rt::d3d12_xs::XboxPresentationOps kOps{
+        [](void* ctx, IUnknown* output, UINT interval_us, UINT latency, UINT flags) -> HRESULT {
+            return static_cast<XboxPresentation*>(ctx)->SetFrameIntervalX(output, interval_us, latency, flags);
+        },
+        [](void* ctx, UINT event, UINT offset_us, UINT flags) -> HRESULT {
+            return static_cast<XboxPresentation*>(ctx)->ScheduleFrameEventX(event, offset_us, flags);
+        },
+        [](void* ctx, UINT event, DWORD timeout_ms, UINT flags, std::uint64_t* token) -> HRESULT {
+            return static_cast<XboxPresentation*>(ctx)->WaitFrameEventX(event, timeout_ms, flags, token);
+        },
+        [](void* ctx, std::uint64_t token, UINT type_mask, UINT* count, void* out) -> HRESULT {
+            return static_cast<XboxPresentation*>(ctx)->GetFrameStatisticsX(
+                token, type_mask, count, static_cast<leonida::FrameStatistic*>(out));
+        },
+        [](void* ctx, UINT plane_count, const void* planes, const void* params) -> HRESULT {
+            return static_cast<XboxPresentation*>(ctx)->PresentX(
+                plane_count, static_cast<const XboxPresentPlaneParameters*>(planes),
+                static_cast<const XboxPresentParameters*>(params));
+        },
+        [](void* ctx, UINT flags) -> HRESULT {
+            return static_cast<XboxPresentation*>(ctx)->SuspendX(flags);
+        },
+        [](void* ctx) -> HRESULT {
+            return static_cast<XboxPresentation*>(ctx)->ResumeX();
+        },
+    };
+    return rt::d3d12_xs::set_device_presentation(device, presentation, presentation ? &kOps : nullptr);
 }
 
 }  // namespace rt::d3d12

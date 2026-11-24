@@ -601,6 +601,80 @@ int main(int argc, char** argv) {
                   "queue slot 24 ResumeX returns S_OK");
             check(reinterpret_cast<PresentXFn>(qvtable[32])(queue.Get(), 0, nullptr, nullptr) == S_OK,
                   "queue slot 32 PresentX succeeds again after ResumeX");
+
+            struct FakePresState {
+                int interval_calls = 0;
+                int schedule_calls = 0;
+                int wait_calls = 0;
+                int stats_calls = 0;
+                int present_calls = 0;
+                int suspend_calls = 0;
+                int resume_calls = 0;
+                std::uint64_t next_token = 42;
+            } pres_state;
+            const rt::d3d12_xs::XboxPresentationOps pres_ops{
+                [](void* ctx, IUnknown*, UINT, UINT, UINT) -> HRESULT {
+                    ++static_cast<FakePresState*>(ctx)->interval_calls;
+                    return S_OK;
+                },
+                [](void* ctx, UINT, UINT, UINT) -> HRESULT {
+                    ++static_cast<FakePresState*>(ctx)->schedule_calls;
+                    return S_OK;
+                },
+                [](void* ctx, UINT, DWORD, UINT, std::uint64_t* token) -> HRESULT {
+                    auto* s = static_cast<FakePresState*>(ctx);
+                    ++s->wait_calls;
+                    if (!token) return E_POINTER;
+                    *token = s->next_token++;
+                    return S_OK;
+                },
+                [](void* ctx, std::uint64_t, UINT, UINT* count, void*) -> HRESULT {
+                    ++static_cast<FakePresState*>(ctx)->stats_calls;
+                    if (!count) return E_POINTER;
+                    *count = 1;
+                    return S_OK;
+                },
+                [](void* ctx, UINT, const void*, const void*) -> HRESULT {
+                    ++static_cast<FakePresState*>(ctx)->present_calls;
+                    return S_OK;
+                },
+                [](void* ctx, UINT) -> HRESULT {
+                    ++static_cast<FakePresState*>(ctx)->suspend_calls;
+                    return S_OK;
+                },
+                [](void* ctx) -> HRESULT {
+                    ++static_cast<FakePresState*>(ctx)->resume_calls;
+                    return S_OK;
+                },
+            };
+            using SetIntervalFn = HRESULT(WINAPI*)(void*, void*, UINT32, UINT32, UINT32);
+            using ScheduleFn = HRESULT(WINAPI*)(void*, UINT32, UINT64, void*, UINT32);
+            using WaitEventFn = HRESULT(WINAPI*)(void*, UINT32, UINT32, void*, UINT32, std::uint64_t*);
+
+            check(rt::d3d12_xs::set_device_presentation(device.Get(), &pres_state, &pres_ops),
+                  "set_device_presentation binds callbacks to device proxy");
+            std::uint64_t bound_token = 0;
+            UINT32 bound_stat_count = 0;
+            check(SUCCEEDED(reinterpret_cast<SetIntervalFn>(vtable[78])(device.Get(), nullptr, 16667, 2, 0)) &&
+                      SUCCEEDED(reinterpret_cast<ScheduleFn>(vtable[79])(device.Get(), 0, 0, nullptr, 0)) &&
+                      SUCCEEDED(reinterpret_cast<WaitEventFn>(vtable[80])(device.Get(), 0, 0, nullptr, 0,
+                                                                          &bound_token)) &&
+                      bound_token == 42,
+                  "device slots 78-80 forward to bound XboxPresentationOps");
+            check(reinterpret_cast<GetStatsFn>(vtable[81])(device.Get(), bound_token, 1, &bound_stat_count, nullptr) ==
+                          S_OK &&
+                      bound_stat_count == 1,
+                  "device slot 81 forwards to bound XboxPresentationOps");
+            check(SUCCEEDED(reinterpret_cast<PresentXFn>(qvtable[32])(queue.Get(), 0, nullptr, nullptr)) &&
+                      SUCCEEDED(reinterpret_cast<SuspendFn>(qvtable[23])(queue.Get(), 0)) &&
+                      SUCCEEDED(reinterpret_cast<ResumeFn>(qvtable[24])(queue.Get())) &&
+                      pres_state.interval_calls == 1 && pres_state.schedule_calls == 1 &&
+                      pres_state.wait_calls == 1 && pres_state.stats_calls == 1 &&
+                      pres_state.present_calls == 1 && pres_state.suspend_calls == 1 &&
+                      pres_state.resume_calls == 1,
+                  "queue slots 23/24/32 and device slots 78-81 all dispatch through XboxPresentationOps");
+            check(rt::d3d12_xs::set_device_presentation(device.Get(), nullptr, nullptr),
+                  "set_device_presentation(nullptr) unbinds presentation backend");
         }
     }
 

@@ -95,6 +95,20 @@ void* device_proxy_from_dxgi_device(void* dxgi_device);
 // The device proxy itself, given the proxy or its DXGI pointer; null for anything else.
 void* device_proxy_primary(void* device);
 
+// Optional presentation backend (e.g. rt::d3d12::XboxPresentation) bound to a device proxy. When set, device
+// slots 78-81 (SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX, GetFrameStatisticsX) and queue slots
+// 23/24/32 (SuspendX, ResumeX, PresentX) forward to these callbacks instead of the headless HLE fallback.
+struct XboxPresentationOps {
+    HRESULT (*set_frame_interval)(void* ctx, IUnknown* output, UINT interval_us, UINT latency, UINT flags) = nullptr;
+    HRESULT (*schedule_frame_event)(void* ctx, UINT event, UINT offset_us, UINT flags) = nullptr;
+    HRESULT (*wait_frame_event)(void* ctx, UINT event, DWORD timeout_ms, UINT flags, std::uint64_t* token) = nullptr;
+    HRESULT (*get_frame_statistics)(void* ctx, std::uint64_t token, UINT type_mask, UINT* count, void* out) = nullptr;
+    HRESULT (*present_x)(void* ctx, UINT plane_count, const void* planes, const void* params) = nullptr;
+    HRESULT (*suspend_x)(void* ctx, UINT flags) = nullptr;
+    HRESULT (*resume_x)(void* ctx) = nullptr;
+};
+bool set_device_presentation(void* device, void* ctx, const XboxPresentationOps* ops);
+
 // True when `heap` is a descriptor-heap proxy created by device slot 14.
 bool is_heap_proxy(const void* heap);
 ID3D12DescriptorHeap* heap_proxy_real_heap(const void* heap);

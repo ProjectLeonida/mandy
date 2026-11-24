@@ -200,4 +200,8 @@ private:
 
 inline constexpr UINT xbox_frame_event_origin = leonida::frame_event_origin;
 
+// Wires an XboxPresentation instance into a d3d12_xs device proxy (or its DXGI pointer) so Xbox device
+// slots 78-81 and queue slots 23/24/32 drive this presentation object. Pass nullptr to unbind.
+bool bind_device_presentation(void* device, XboxPresentation* presentation);
+
 }  // namespace rt::d3d12
