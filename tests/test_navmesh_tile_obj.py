@@ -1,9 +1,11 @@
 """Read back OBJ primitives from a synthetic archive, independently of the writer."""
+import os
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -11,6 +13,8 @@ sys.path.insert(0, str(HERE))
 from test_navmesh_decode import build_navmesh, make_rpf, nd
 
 TOOL = HERE.parent / "tools" / "navmesh_tile_obj.py"
+sys.path.insert(0, str(HERE.parent / "tools"))
+import navmesh_tile_obj as tool
 
 
 def read_obj(path):
@@ -62,6 +66,27 @@ class ExportTest(unittest.TestCase):
                 self.assertEqual(run(invalid, out).returncode, 2)
                 self.assertEqual(out.read_bytes(), original)
             self.assertEqual(run(1, archive).returncode, 2)
+
+    def test_stage_cleanup_restores_write_mode_on_replace_failure(self):
+        head, tail = build_navmesh(n_verts=3, poly_sizes=(3,), tiny_bm_cont=True)
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(path, mode, *args, **kwargs):
+            chmod_calls.append((str(path), mode))
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "input.rpf"
+            out = Path(directory) / "tile.obj"
+            make_rpf(archive, [head, tail])
+
+            with mock.patch("os.replace", side_effect=OSError("replace failed")), \
+                 mock.patch("os.chmod", side_effect=track_chmod):
+                code = tool.main([str(archive), "--tile", "0", "--out", str(out)])
+                self.assertEqual(code, 2)
+
+        self.assertTrue(any(mode == 0o600 for _, mode in chmod_calls), chmod_calls)
 
 
 if __name__ == "__main__":
