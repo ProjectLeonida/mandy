@@ -6899,12 +6899,16 @@ class Gen:
             if key is not None:
                 self.x_mcache[key] = res
             return res
+        # The gather is stored to a variable of its own (eager, SHADER-529): a reader that writes a VGPR, v_mbcnt, is
+        # an OpSelect on the lane's EXEC, and SPIRV-Cross (MoltenVK) inlines a single-use gather into that ternary's
+        # taken arm. A lane that is off then never runs the subgroup op, and its bit is missing from the mask the
+        # other lanes count (SHADER-WAVEMASK-EAGER; Apple M5, MoltenVK 1.4.2, tools/crosslane_fuzz.py).
         if self.wave32_fragment:
             ballot = self.tmp()
             self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {mine}")
             word = self.wave32_ballot_word(ballot)
             self.uses_ballot = True
-            return word, self.cu(0)
+            return self.eager("%uint", word), self.cu(0)
         self.uses_wave_bits = True
         lane = self.wave_lane()
         low, sh, bit, b, lo_in, hi_in, lo, hi = (self.tmp() for _ in range(8))
@@ -6916,7 +6920,7 @@ class Gen:
         self.emit(f"{hi_in} = OpSelect %uint {low} {self.cu(0)} {b}")
         self.emit(f"{lo} = OpGroupNonUniformBitwiseOr %uint {self.cu(3)} Reduce {lo_in}")
         self.emit(f"{hi} = OpGroupNonUniformBitwiseOr %uint {self.cu(3)} Reduce {hi_in}")
-        return lo, hi
+        return self.eager("%uint", lo), self.eager("%uint", hi)
 
     def quad_any(self, v):
         """This lane's value after whole-quad mode: all ones if any of the 4 lanes of its quad (4n .. 4n+3 of the
