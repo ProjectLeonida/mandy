@@ -144,15 +144,18 @@ public:
     // {9a4e1c2b-55d8-4f7a-b012-3c8e7a1f6d90}
     static constexpr GUID kTag{0x9a4e1c2b, 0x55d8, 0x4f7a, {0xb0, 0x12, 0x3c, 0x8e, 0x7a, 0x1f, 0x6d, 0x90}};
 
-    CommandSignature(leonida::IndirectKind kind, UINT byte_stride) : kind_(kind), stride_(byte_stride) {}
+    CommandSignature(leonida::IndirectKind kind, UINT byte_stride, UINT argument_count)
+        : kind_(kind), stride_(byte_stride), argument_count_(argument_count) {}
 
     leonida::IndirectKind kind() const { return kind_; }
     UINT stride() const { return stride_; }
+    UINT argument_count() const { return argument_count_; }
     static CommandSignature* from(IUnknown* object) { return Child::from<CommandSignature>(object); }
 
 private:
     leonida::IndirectKind kind_;
     UINT stride_;
+    UINT argument_count_;
 };
 
 class CommandAllocator final
@@ -954,10 +957,12 @@ public:
     void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* signature, UINT max_command_count,
                                            ID3D12Resource* argument_buffer, UINT64 argument_buffer_offset,
                                            ID3D12Resource* count_buffer, UINT64 count_buffer_offset) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
-        leonida::IndirectKind kind = leonida::IndirectKind::draw;
-        UINT stride = 0;
-        if (!command_signature_info(signature, kind, stride) || !argument_buffer)
+        const auto* sig = CommandSignature::from(signature);
+        if (!sig || !argument_buffer) return check(false);
+        const auto kind = sig->kind();
+        const UINT stride = sig->stride();
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE &&
+            (kind != leonida::IndirectKind::dispatch || sig->argument_count() != 1 || count_buffer))
             return check(false);
         const auto arg_desc = argument_buffer->GetDesc();
         if (arg_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || argument_buffer_offset % 4 != 0)
@@ -1008,12 +1013,8 @@ public:
         cmd.argument_offset = argument_buffer_offset;
         cmd.count_buffer = count_buffer ? resource_id(count_buffer) : 0;
         cmd.count_offset = count_buffer ? count_buffer_offset : 0;
-        if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
-            if (!compute_pipeline_ || !compute_.layout) return check(false);
-            cmd.pipeline = compute_pipeline_;
-            cmd.user_data = compute_user_data();
-        }
-        check(list_.execute_indirect(cmd));
+        if (defer([cmd](GraphicsCommandList& parent) { parent.record_indirect(cmd); }, true)) return;
+        record_indirect(cmd);
     }
 
     void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(
@@ -1580,6 +1581,15 @@ private:
         if (!object || std::find(held_.begin(), held_.end(), object) != held_.end()) return;
         object->AddRef();
         held_.push_back(object);
+    }
+
+    void record_indirect(leonida::ExecuteIndirect cmd) {
+        if (cmd.kind == leonida::IndirectKind::dispatch && cmd.max_count) {
+            if (!compute_pipeline_ || !compute_.layout) return check(false);
+            cmd.pipeline = compute_pipeline_;
+            cmd.user_data = compute_user_data();
+        }
+        check(list_.execute_indirect(cmd));
     }
 
     void release_held() {
@@ -2625,21 +2635,13 @@ bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue) {
     return q && q->uses_calibrated_timestamps();
 }
 
-HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
+HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, UINT argument_count, REFIID riid, void** out,
                                  IUnknown* device) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    auto* sig = new CommandSignature(kind, byte_stride);
+    auto* sig = new CommandSignature(kind, byte_stride, argument_count);
     sig->attach_device(device);
     return hand_out(sig, riid, out);
-}
-
-bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride) {
-    const CommandSignature* s = CommandSignature::from(signature);
-    if (!s) return false;
-    kind = s->kind();
-    byte_stride = s->stride();
-    return true;
 }
 
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue) {

@@ -36,7 +36,7 @@ void main(uint3 group : SV_GroupID) {
 )";
 
 bool run(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, UINT count, bool gpu_update,
-         std::array<UINT, 2>& result, bool shim) {
+         std::array<UINT, 2>& result, bool shim, bool bundle_mode = false) {
     Ref<ID3D12RootSignature> root;
     D3D12_ROOT_PARAMETER param{};
     param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -90,29 +90,42 @@ bool run(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, UINT count,
     std::memcpy(mapped, input.data(), sizeof(input));
     source->Unmap(0, nullptr);
 
-    const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_COMPUTE};
+    const auto list_type = bundle_mode ? D3D12_COMMAND_LIST_TYPE_DIRECT : D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{list_type};
     Ref<ID3D12CommandQueue> queue;
-    Ref<ID3D12CommandAllocator> allocator;
-    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12CommandAllocator> allocator, bundle_allocator;
+    Ref<ID3D12GraphicsCommandList> list, bundle;
     Ref<ID3D12Fence> fence;
     if (FAILED(dev->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))) ||
-        FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&allocator.p))) ||
-        FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.p,
-                                     pso.p, IID_PPV_ARGS(&list.p))) ||
+        FAILED(dev->CreateCommandAllocator(list_type, IID_PPV_ARGS(&allocator.p))) ||
+        FAILED(dev->CreateCommandList(0, list_type, allocator.p, bundle_mode ? nullptr : pso.p, IID_PPV_ARGS(&list.p))) ||
         FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))))
         return false;
     list->CopyBufferRegion(args.p, kArgsOffset, source.p, kArgsOffset, kMaximum * kStride);
     list->CopyBufferRegion(counts.p, kCountOffset, source.p, 160, 4);
-    list->CopyBufferRegion(output.p, 0, source.p, 0, 8); // initialize the UAV to zero
+    const UINT output_bytes = bundle_mode ? 16 : 8;
+    list->CopyBufferRegion(output.p, 0, source.p, 0, output_bytes);
     const D3D12_RESOURCE_BARRIER ready[] = {
         transition(args.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
         transition(counts.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
         transition(output.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)};
     list->ResourceBarrier(3, ready);
     list->SetComputeRootSignature(root.p);
-    list->SetPipelineState(pso.p);
     list->SetComputeRootUnorderedAccessView(0, output->GetGPUVirtualAddress());
-    list->ExecuteIndirect(signature.p, kMaximum, args.p, kArgsOffset, counts.p, kCountOffset);
+    if (bundle_mode) {
+        if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&bundle_allocator.p))) ||
+            FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.p, pso.p,
+                                         IID_PPV_ARGS(&bundle.p))))
+            return false;
+        bundle->ExecuteIndirect(signature.p, kMaximum, args.p, kArgsOffset, nullptr, 0);
+        if (FAILED(bundle->Close())) return false;
+        list->ExecuteBundle(bundle.p);
+        list->SetComputeRootUnorderedAccessView(0, output->GetGPUVirtualAddress() + 8);
+        list->ExecuteBundle(bundle.p);
+    } else {
+        list->SetPipelineState(pso.p);
+        list->ExecuteIndirect(signature.p, kMaximum, args.p, kArgsOffset, counts.p, kCountOffset);
+    }
     if (gpu_update) {
         auto to_copy = transition(counts.p, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                                   D3D12_RESOURCE_STATE_COPY_DEST);
@@ -127,7 +140,7 @@ bool run(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, UINT count,
     const auto to_copy = transition(output.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                     D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->ResourceBarrier(1, &to_copy);
-    list->CopyBufferRegion(readback.p, 0, output.p, 0, 8);
+    list->CopyBufferRegion(readback.p, 0, output.p, 0, output_bytes);
     if (FAILED(list->Close())) return false;
     ID3D12CommandList* lists[] = {list.p};
     queue->ExecuteCommandLists(1, lists);
@@ -140,8 +153,10 @@ bool run(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, UINT count,
     CloseHandle(event);
     if (!completed || FAILED(readback->Map(0, nullptr, &mapped)) || !mapped) return false;
     std::memcpy(result.data(), mapped, sizeof(result));
+    std::array<UINT, 2> second{};
+    if (bundle_mode) std::memcpy(second.data(), static_cast<const char*>(mapped) + 8, sizeof(second));
     readback->Unmap(0, nullptr);
-    return true;
+    return !bundle_mode || second == result;
 }
 
 // The second dispatch of a gpu_update run reads the count written by the copy before it (3).
@@ -272,6 +287,17 @@ int main() {
     if (stale_host)
         std::printf("%u GPU-count-overwrite case(s) checked against the expected result only (stale WARP count)\n",
                     stale_host);
+    std::array<UINT, 2> bundle_host{}, bundle_layer{};
+    const auto bundle_expected = expected(kMaximum, false);
+    if (!run(host.p, native_code, 0, false, bundle_host, false, true) ||
+        !run(layer.p, container, 0, false, bundle_layer, true, true) ||
+        bundle_host != bundle_expected || bundle_layer != bundle_expected) {
+        std::fprintf(stderr, "indirect compute bundle: host %u/%u, layer %u/%u, expected %u/%u\n",
+                     bundle_host[0], bundle_host[1], bundle_layer[0], bundle_layer[1],
+                     bundle_expected[0], bundle_expected[1]);
+        return 1;
+    }
+    std::printf("fixed-count ExecuteIndirect bundle: both parent UAV bindings matched WARP\n");
     if (vk.validation_errors()) {
         std::fprintf(stderr, "validation errors: %u\n", vk.validation_errors());
         return 1;

@@ -11715,7 +11715,7 @@ public:
             break;
         default: return E_NOTIMPL;
         }
-        return create_command_signature(kind, desc->ByteStride, riid, out, identity());
+        return create_command_signature(kind, desc->ByteStride, desc->NumArgumentDescs, riid, out, identity());
     }
 
     void STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(
