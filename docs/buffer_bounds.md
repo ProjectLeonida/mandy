@@ -23,6 +23,11 @@ API-created CBVs mirror the observed inline console descriptor (mode 0, 16-byte 
 
 - **RDNA2 follows Mesa's GFX11 column**, not the GFX10 one: of 732 cases, 729 match GFX11 and 696 match GFX10.
   Every GFX10 miss is an access that only partly fits, for example a raw buffer with `N = 3` read at offset 0.
+- **The offset is not cut to 32 bits.** `index * stride` is a full product and `soffset` is added in 64 bits, so
+  index 0xFFFFFFFF with a 20-byte stride addresses base + 0x13FFFFFFEC; in 32 bits it would be the 20 bytes below
+  the base, which modes 2 and 3 do not refuse. The translator forms the offset in 64 bits and adds no bound: an
+  access above 4 GiB that its mode allows is made at that address. Observed on hardware by five-star-recomp
+  (commit `b9b57e2`), not measured here; `tests/semantic/test_buffer_offset_wrap.py`.
 - **In raw mode `soffset` is part of the checked offset.** The 3 cases that match neither column are raw reads at
   offset 8 with `soffset` 8 and `N = 18`: 8 + 8 + 4 > 18, out of range on hardware.
 - Loads and stores agree in every case.
