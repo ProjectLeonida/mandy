@@ -520,6 +520,9 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
                                           "0x100c=0x7fc10001,0x1010=0x40600000,0x1014=0xc0200000"},
              "ps_fnan_fract": {"VKH_SGPRS": "0x1000,0,16,0",
                                "VKH_HEAP": "0x1000=0xaedbe6ff,0x1004=0x00008800,0x1008=0x7fc10001,0x100c=0xc0200000"},
+             # v_max/v_min with -0 and +0 in both orders: RDNA2 orders -0 below +0 (see the .asm header)
+             "ps_fminmax_signed_zero": {"VKH_SGPRS": "0x1000,0,16,0",
+                                        "VKH_HEAP": "0x1000=0x80000000,0x1004=0x00000000"},
              "ps_fnan_med3_s2": {"VKH_SGPRS": "0x1000,0,16,0",
                                  "VKH_HEAP": "0x1000=0x40a00000,0x1004=0x40e00000,0x1008=0x7fc10001,0x100c=0xc0200000"},
              "ps_f16_fnan_med3": {"VKH_SGPRS": "0x1000,0,16,0",
@@ -1529,6 +1532,7 @@ def run_suite(a, work: str) -> int:
                 "ps_sff_imm": (2, 1, 20, 16),                  # SHADER-46: s_ff0/s_ff1 of an immediate
                 "ps_fnan_med3": (0x40A00000, 0xC0200000, 0xC0200000, 0x40600000),   # measured on RDNA2 hardware
                 "ps_fnan_fract": (0x3F7FFFFF, 0x00003BFF, 0xC0200000, 0xC0200000),
+                "ps_fminmax_signed_zero": (0x00000000, 0x00000000, 0x80000000, 0x80000000),  # -0 < +0
                 # v_med3 with a NaN in S2 or in two operands, by the same measured rule (derivations in the .asm headers)
                 "ps_fnan_med3_s2": (0x40A00000, 0x40A00000, 0xC0200000, 0x40E00000),
                 "ps_f16_fnan_med3": (0xAAAA4500, 0xAAAA4500, 0xAAAAC100, 0xAAAA4700),

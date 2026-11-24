@@ -374,6 +374,25 @@ class GpuFixtures(unittest.TestCase):
                                    memory={0x1000 + 4 * i: w for i, w in enumerate(heap)})
         self.assertEqual(words, [0x3F7FFFFF, 0x00003BFF, M25, M25])
 
+    def test_ps_fminmax_signed_zero(self):
+        # max(-0, +0), max(+0, -0), min(-0, +0), min(+0, -0): RDNA2 orders -0 below +0 in either order.
+        spv = support.translate_fixture("ps_fminmax_signed_zero")
+        words = support.mrt0_words(spv, push_constants=[0x1000, 0, 16, 0] + [0] * 28,
+                                   memory={0x1000: 0x80000000, 0x1004: 0x00000000})
+        self.assertEqual(words, [0x00000000, 0x00000000, 0x80000000, 0x80000000])
+
+    def test_ps_fminmax_signed_zero_selects_by_sign_bits(self):
+        # The interpreter orders -0 below +0 for NMax/NMin, so the words above hold either way. A GPU runs
+        # GLSL.std.450's "y if x < y, otherwise x", which returns the first of two zeros: each v_max/v_min must be
+        # followed by the select on the sign bits (AND for max, OR for min) when both operands are zeros.
+        spv = support.translate_fixture("ps_fminmax_signed_zero")
+        body = spv[spv.index("%entry = OpLabel"):]
+        self.assertEqual(body.count("OpExtInst %float %glsl NMax"), 2)
+        self.assertEqual(body.count("OpExtInst %float %glsl NMin"), 2)
+        self.assertEqual(body.count("%c7fffffff\n"), 4)       # one zeros test per min/max
+        # each min/max: the sign-bit select for two zeros, then the NaN select that keeps src0's bits
+        self.assertEqual(body.count("OpSelect %float"), 8)
+
     def test_ps_fnan_med3_s2(self):
         # med3(5, 7, NaN), med3(NaN, NaN, 5), med3(NaN, -2.5, NaN), med3(7, NaN, NaN): min3 with the NaNs ignored
         heap = (P50, P70, NAN_A, M25)

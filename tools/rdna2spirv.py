@@ -6990,10 +6990,35 @@ class Gen:
         self.emit(f"{sel} = OpSelect %float {nan_second} {first} {res}")
         return sel
 
-    def nminmax_f32(self, glsl_op, x, y, y_src=None, nan_y=None):
-        """GLSL.std.450 ``NMin``/``NMax`` returning ``x`` with its bits intact whenever ``y`` is NaN."""
+    def glsl_minmax(self, glsl_op, x, y, zeros_possible=True):
+        """GLSL.std.450 ``NMin``/``NMax`` of two %float values, with -0 ordered below +0 as RDNA2 orders them.
+
+        GLSL.std.450 defines NMax as "y if x < y, otherwise x" (NMin likewise): -0 and +0 compare equal, so with two
+        zeros of opposite sign it returns the first operand and ``max(-0, +0)`` is -0 on a conforming driver. RDNA2
+        gives +0 for max and -0 for min in either order (docs/design.md, Float min/max: "-0 < +0"). When both
+        operands are zeros the result is therefore taken from their sign bits: AND for max (+0 unless both are -0),
+        OR for min (-0 unless both are +0). A NaN operand is not a zero, so NaN handling is left to the caller.
+        ``zeros_possible=False`` (the caller knows both cannot be zeros) emits the plain instruction.
+        Marvisak/VIctory (GPL-3.0) commit bf84134b2 fixed the same lowering for DXIL's FMax/FMin."""
         r = self.tmp()
         self.emit(f"{r} = OpExtInst %float %glsl {glsl_op} {x} {y}")
+        if not zeros_possible:
+            return r
+        xb, yb, both, mag, zeros, signs, zf, out = (self.tmp() for _ in range(8))
+        self.emit(f"{xb} = OpBitcast %uint {x}")
+        self.emit(f"{yb} = OpBitcast %uint {y}")
+        self.emit(f"{both} = OpBitwiseOr %uint {xb} {yb}")
+        self.emit(f"{mag} = OpBitwiseAnd %uint {both} {self.cu(0x7FFFFFFF)}")
+        self.emit(f"{zeros} = OpIEqual %bool {mag} {self.cu(0)}")
+        self.emit(f"{signs} = {'OpBitwiseAnd' if glsl_op == 'NMax' else 'OpBitwiseOr'} %uint {xb} {yb}")
+        self.emit(f"{zf} = OpBitcast %float {signs}")
+        self.emit(f"{out} = OpSelect %float {zeros} {zf} {r}")
+        return out
+
+    def nminmax_f32(self, glsl_op, x, y, y_src=None, nan_y=None):
+        """GLSL.std.450 ``NMin``/``NMax`` returning ``x`` with its bits intact whenever ``y`` is NaN (and -0 below +0,
+        see glsl_minmax)."""
+        r = self.glsl_minmax(glsl_op, x, y)
         return self._select_nan_first(r, x, nan_y, y, y_src)
 
     _SDWA_UNUSED = ("UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE")
@@ -7125,11 +7150,26 @@ class Gen:
         An inline or literal constant that is not a NaN gets no OpIsNan; with no operand left to check there is no
         select."""
         x, y, z = vals
-        lo, hi, m1, m = self.tmp(), self.tmp(), self.tmp(), self.tmp()
-        self.emit(f"{lo} = OpExtInst %float %glsl NMin {x} {y}")
-        self.emit(f"{hi} = OpExtInst %float %glsl NMax {x} {y}")
-        self.emit(f"{m1} = OpExtInst %float %glsl NMax {z} {lo}")
-        self.emit(f"{m} = OpExtInst %float %glsl NMin {m1} {hi}")
+        # -0 below +0 throughout, as for v_min/v_max. Two zeros can only meet when at least two operands may be a
+        # zero: an inline or literal constant that is not one rules itself out (no extra selects then).
+        maybe_zero = 0
+        for i, s in enumerate(srcs):
+            bits = None
+            if s["k"] == "imm":
+                bits = s["v"] & 0xFFFFFFFF
+            elif s["k"] == "fimm":
+                bits = struct.unpack("<I", struct.pack("<f", s["v"]))[0]
+            if bits is None:
+                maybe_zero += 1
+            elif sel is None:
+                maybe_zero += (bits & 0x7FFFFFFF) == 0
+            else:
+                maybe_zero += (((bits >> 16) if sel[i] else bits) & 0x7FFF) == 0
+        zp = maybe_zero >= 2
+        lo = self.glsl_minmax("NMin", x, y, zp)
+        hi = self.glsl_minmax("NMax", x, y, zp)
+        m1 = self.glsl_minmax("NMax", z, lo, zp)
+        m = self.glsl_minmax("NMin", m1, hi, zp)
         checks = []
         preds = []
         for i, (v, s) in enumerate(zip(vals, srcs)):
@@ -7162,8 +7202,7 @@ class Gen:
             mn1 = self._select_nan_first(lo, x, preds[1])
             mn = self.nminmax_f32("NMin", mn1, z, nan_y=preds[2])
         else:
-            mn = self.tmp()
-            self.emit(f"{mn} = OpExtInst %float %glsl NMin {lo} {z}")
+            mn = self.glsl_minmax("NMin", lo, z, zp)
         r = self.tmp()
         self.emit(f"{r} = OpSelect %float {nan} {mn} {m}")
         return r
@@ -9500,7 +9539,14 @@ class Gen:
                 if "add" in op:
                     r = self.sum_toward_zero2(vx, vy, r)
             else:
-                self.emit(f"{r} = OpExtInst %v2float %glsl {'NMax' if 'max' in op else 'NMin'} {vx} {vy}")
+                # Each half as v_max_f16/v_min_f16: -0 below +0 (glsl_minmax), so per component.
+                halves = []
+                for k in (0, 1):
+                    ex, ey = self.tmp(), self.tmp()
+                    self.emit(f"{ex} = OpCompositeExtract %float {vx} {k}")
+                    self.emit(f"{ey} = OpCompositeExtract %float {vy} {k}")
+                    halves.append(self.glsl_minmax("NMax" if "max" in op else "NMin", ex, ey))
+                self.emit(f"{r} = OpCompositeConstruct %v2float {halves[0]} {halves[1]}")
             if "clamp" in mods:
                 c = self.tmp()
                 z2, o2 = self.tmp(), self.tmp()
@@ -9639,9 +9685,8 @@ class Gen:
                 r = self.med3_f(vals, a[1:4], sel)
             else:
                 f = "NMax" if "max" in op else "NMin"   # a NaN operand gives the other one (docs/design.md)
-                m, r = self.tmp(), self.tmp()
-                self.emit(f"{m} = OpExtInst %float %glsl {f} {vals[0]} {vals[1]}")
-                self.emit(f"{r} = OpExtInst %float %glsl {f} {m} {vals[2]}")
+                m = self.glsl_minmax(f, vals[0], vals[1])
+                r = self.glsl_minmax(f, m, vals[2])
             self._finish_f16_minmax_out(a[0], r, mods, dhi, all_nan, h0_mod)  # opsel-capable VOP3: keeps the other half
         elif op in ("v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8"):
             # Four byte-SADs packed as u16 (RDNA ISA pseudocode): for k = 0..3, D.u16[k] = (S2.u16[k] + SAD of the
@@ -9894,7 +9939,7 @@ class Gen:
                     self.emit(f"{ny} = OpFNegate %float {vals[1]}")
                     r = self.sum_toward_zero(vals[0], ny, r)
             else:
-                self.emit(f"{r} = OpExtInst %float %glsl {'NMax' if 'max' in op else 'NMin'} {vals[0]} {vals[1]}")
+                r = self.glsl_minmax("NMax" if "max" in op else "NMin", vals[0], vals[1])
                 self._finish_f16_minmax_out(a[0], r, mods, dhi, all_nan, h0_mod)
             if k:
                 r = self.clamp_f16(r, mods)
