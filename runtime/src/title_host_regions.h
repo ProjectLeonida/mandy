@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -26,6 +27,7 @@ public:
         std::uint64_t gpu_bda = 0;
         std::uint64_t tag = 0;
         std::uint64_t handle = 0;
+        bool import_failed = false;
     };
 
     struct Retired {
@@ -43,6 +45,7 @@ public:
         std::uint64_t gpu_bda = 0;
         std::uint64_t offset = 0;
         std::uint64_t handle = 0;
+        bool import_failed = false;
     };
 
     // Registers [host_va, host_va + size) with gpu_bda = 0 (pending Vulkan import).
@@ -58,9 +61,18 @@ public:
             return;
         }
 
-        std::lock_guard<std::mutex> lock(mutex_);
-        detach_range_locked(host_va, end);
-        regions_.emplace(host_va, Region{host_va, clamped_size, 0, tag, 0});
+        std::function<void()> hook;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            detach_range_locked(host_va, end);
+            regions_.emplace(host_va, Region{host_va, clamped_size, 0, tag, 0, false});
+            if (!retired_.empty()) {
+                hook = retire_hook_;
+            }
+        }
+        if (hook) {
+            hook();
+        }
     }
 
     // Removes [host_va, host_va + size), splitting larger regions if partially unmapped
@@ -75,8 +87,22 @@ public:
             return;
         }
 
+        std::function<void()> hook;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            detach_range_locked(host_va, end);
+            if (!retired_.empty()) {
+                hook = retire_hook_;
+            }
+        }
+        if (hook) {
+            hook();
+        }
+    }
+
+    void set_retire_hook(std::function<void()> hook) {
         std::lock_guard<std::mutex> lock(mutex_);
-        detach_range_locked(host_va, end);
+        retire_hook_ = std::move(hook);
     }
 
     // O(log N) lookup returning the region containing `va` and `offset = va - region.host_va`.
@@ -110,11 +136,20 @@ public:
         std::vector<Region> pending;
         for (const auto& [va, region] : regions_) {
             (void)va;
-            if (region.gpu_bda == 0) {
+            if (region.gpu_bda == 0 && !region.import_failed) {
                 pending.push_back(region);
             }
         }
         return pending;
+    }
+
+    // Marks a region as unimportable so subsequent lookups do not retry sync_pending() indefinitely.
+    void mark_failed(std::uint64_t host_va, std::uint64_t size) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = regions_.find(host_va);
+        if (it != regions_.end() && it->second.size == size && it->second.gpu_bda == 0) {
+            it->second.import_failed = true;
+        }
     }
 
     // Marks a previously registered region [host_va, host_va + size) as imported with `gpu_bda`
@@ -181,7 +216,8 @@ private:
         if (offset >= it->second.size) {
             return {};
         }
-        return Lookup{true, it->second.host_va, it->second.size, it->second.gpu_bda, offset, it->second.handle};
+        return Lookup{true,   it->second.host_va, it->second.size,         it->second.gpu_bda,
+                      offset, it->second.handle,  it->second.import_failed};
     }
 
     void detach_range_locked(std::uint64_t start, std::uint64_t end) {
@@ -218,6 +254,7 @@ private:
     mutable std::mutex mutex_;
     std::map<std::uint64_t, Region> regions_;
     std::vector<Retired> retired_;
+    std::function<void()> retire_hook_;
 };
 
 // Process-wide title host region table shared between the CPU/xmem shims and the Vulkan backend.

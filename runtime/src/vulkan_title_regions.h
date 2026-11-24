@@ -12,7 +12,9 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -49,18 +51,36 @@ public:
     VulkanTitleRegions(const VulkanTitleRegions&) = delete;
     VulkanTitleRegions& operator=(const VulkanTitleRegions&) = delete;
 
-    ~VulkanTitleRegions() { destroy_all(); }
+    ~VulkanTitleRegions() {
+        TitleHostRegions* regions = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            regions = regions_;
+        }
+        if (regions) {
+            regions->set_retire_hook({});
+        }
+        destroy_all();
+    }
 
     void configure(VkDevice device, const VulkanTitleRegionFunctions& fn, VkDeviceSize host_pointer_alignment,
                    const VkPhysicalDeviceMemoryProperties& memory_properties,
                    TitleHostRegions* regions = &title_host_regions()) {
         destroy_all();
-        std::lock_guard<std::mutex> lock(mutex_);
-        device_ = device;
-        fn_ = fn;
-        alignment_ = host_pointer_alignment;
-        memory_properties_ = memory_properties;
-        regions_ = regions;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (regions_ && regions_ != regions) {
+                regions_->set_retire_hook({});
+            }
+            device_ = device;
+            fn_ = fn;
+            alignment_ = host_pointer_alignment;
+            memory_properties_ = memory_properties;
+            regions_ = regions;
+        }
+        if (regions) {
+            regions->set_retire_hook([this]() { collect_retired(true); });
+        }
     }
 
     bool supported() const {
@@ -130,11 +150,11 @@ public:
         }
 
         auto hit = regions->find(va);
-        if (!hit.found) return false;
+        if (!hit.found || hit.import_failed) return false;
         if (hit.gpu_bda == 0 || hit.handle == 0) {
             sync_pending();
             hit = regions->find(va);
-            if (!hit.found || hit.gpu_bda == 0 || hit.handle == 0) return false;
+            if (!hit.found || hit.import_failed || hit.gpu_bda == 0 || hit.handle == 0) return false;
         }
 
         std::lock_guard<std::mutex> lock(mutex_);
@@ -163,7 +183,7 @@ public:
         }
 
         auto hit = regions->find(va);
-        if (!hit.found) return std::nullopt;
+        if (!hit.found || hit.import_failed) return std::nullopt;
         if (hit.gpu_bda == 0) {
             sync_pending();
             return regions->resolve_bda(va);
@@ -252,32 +272,60 @@ private:
         return fallback;
     }
 
+    static void log_once(std::atomic<bool>& flag, const char* reason, std::uint64_t va, std::uint64_t size) {
+        if (!flag.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr, "[rt] title_host_regions: %s (va=0x%llx size=0x%llx)\n", reason,
+                         static_cast<unsigned long long>(va), static_cast<unsigned long long>(size));
+        }
+    }
+
     void import_region(TitleHostRegions* regions, const TitleHostRegions::Region& region) {
         if (!region.host_va || !region.size) return;
 
         const std::uint64_t align = alignment_;
         const std::uint64_t aligned_start = region.host_va & ~(align - 1);
         const std::uint64_t region_end = region.host_va + region.size;
-        if (region_end < region.host_va) return;
+        if (region_end < region.host_va) {
+            regions->mark_failed(region.host_va, region.size);
+            return;
+        }
         const std::uint64_t aligned_end = (region_end + (align - 1)) & ~(align - 1);
-        if (aligned_end <= aligned_start) return;
+        if (aligned_end <= aligned_start) {
+            regions->mark_failed(region.host_va, region.size);
+            return;
+        }
         const std::uint64_t aligned_size = aligned_end - aligned_start;
 
 #ifdef _WIN32
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (!VirtualQuery(reinterpret_cast<const void*>(aligned_start), &mbi, sizeof(mbi))) return;
-        if (mbi.State != MEM_COMMIT) return;
+        static std::atomic<bool> logged_uncommitted{false};
         constexpr DWORD kBadProtect = PAGE_NOACCESS | PAGE_GUARD | PAGE_WRITECOMBINE | PAGE_NOCACHE;
-        if (mbi.Protect & kBadProtect) return;
-        const std::uint64_t mbi_end =
-            reinterpret_cast<std::uint64_t>(mbi.BaseAddress) + static_cast<std::uint64_t>(mbi.RegionSize);
-        if (mbi_end < aligned_end) return;
+        for (std::uint64_t at = aligned_start; at < aligned_end;) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+                (mbi.Protect & kBadProtect)) {
+                log_once(logged_uncommitted, "skipping uncommitted or uncacheable host range", aligned_start,
+                         aligned_size);
+                regions->mark_failed(region.host_va, region.size);
+                return;
+            }
+            const std::uint64_t mbi_end =
+                reinterpret_cast<std::uint64_t>(mbi.BaseAddress) + static_cast<std::uint64_t>(mbi.RegionSize);
+            if (mbi_end <= at) {
+                regions->mark_failed(region.host_va, region.size);
+                return;
+            }
+            at = mbi_end;
+        }
 #endif
 
+        static std::atomic<bool> logged_props{false};
         VkMemoryHostPointerPropertiesEXT host_props{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
         if (fn_.vkGetMemoryHostPointerPropertiesEXT(device_, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                                     reinterpret_cast<void*>(aligned_start),
                                                     &host_props) != VK_SUCCESS) {
+            log_once(logged_props, "vkGetMemoryHostPointerPropertiesEXT rejected host range", aligned_start,
+                     aligned_size);
+            regions->mark_failed(region.host_va, region.size);
             return;
         }
 
@@ -293,17 +341,30 @@ private:
                          VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
+        static std::atomic<bool> logged_buf{false};
         VkBuffer buffer = VK_NULL_HANDLE;
         if (fn_.vkCreateBuffer(device_, &buf_info, nullptr, &buffer) != VK_SUCCESS) {
+            log_once(logged_buf, "vkCreateBuffer failed for host region", aligned_start, aligned_size);
+            regions->mark_failed(region.host_va, region.size);
             return;
         }
 
+        static std::atomic<bool> logged_reqs{false};
         VkMemoryRequirements reqs{};
         fn_.vkGetBufferMemoryRequirements(device_, buffer, &reqs);
+        if (reqs.size > aligned_size) {
+            log_once(logged_reqs, "buffer memory requirements exceed checked host range", aligned_start, aligned_size);
+            fn_.vkDestroyBuffer(device_, buffer, nullptr);
+            regions->mark_failed(region.host_va, region.size);
+            return;
+        }
         const std::uint32_t valid_types = reqs.memoryTypeBits & host_props.memoryTypeBits;
         const std::uint32_t mem_type = choose_memory_type(valid_types);
+        static std::atomic<bool> logged_memtype{false};
         if (mem_type >= memory_properties_.memoryTypeCount) {
+            log_once(logged_memtype, "no compatible memory type for host region", aligned_start, aligned_size);
             fn_.vkDestroyBuffer(device_, buffer, nullptr);
+            regions->mark_failed(region.host_va, region.size);
             return;
         }
 
@@ -317,27 +378,36 @@ private:
 
         VkMemoryAllocateInfo alloc_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         alloc_info.pNext = &flags_info;
-        alloc_info.allocationSize = std::max<VkDeviceSize>(reqs.size, aligned_size);
+        alloc_info.allocationSize = aligned_size;
         alloc_info.memoryTypeIndex = mem_type;
 
+        static std::atomic<bool> logged_alloc{false};
         VkDeviceMemory memory = VK_NULL_HANDLE;
         if (fn_.vkAllocateMemory(device_, &alloc_info, nullptr, &memory) != VK_SUCCESS) {
+            log_once(logged_alloc, "vkAllocateMemory failed for host region", aligned_start, aligned_size);
             fn_.vkDestroyBuffer(device_, buffer, nullptr);
+            regions->mark_failed(region.host_va, region.size);
             return;
         }
 
+        static std::atomic<bool> logged_bind{false};
         if (fn_.vkBindBufferMemory(device_, buffer, memory, 0) != VK_SUCCESS) {
+            log_once(logged_bind, "vkBindBufferMemory failed for host region", aligned_start, aligned_size);
             fn_.vkDestroyBuffer(device_, buffer, nullptr);
             fn_.vkFreeMemory(device_, memory, nullptr);
+            regions->mark_failed(region.host_va, region.size);
             return;
         }
 
         VkBufferDeviceAddressInfo bda_info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         bda_info.buffer = buffer;
         const std::uint64_t base_bda = fn_.vkGetBufferDeviceAddress(device_, &bda_info);
+        static std::atomic<bool> logged_bda{false};
         if (!base_bda) {
+            log_once(logged_bda, "vkGetBufferDeviceAddress returned 0 for host region", aligned_start, aligned_size);
             fn_.vkDestroyBuffer(device_, buffer, nullptr);
             fn_.vkFreeMemory(device_, memory, nullptr);
+            regions->mark_failed(region.host_va, region.size);
             return;
         }
 

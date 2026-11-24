@@ -815,7 +815,7 @@ constexpr DWORD kMemTitle = 0x40000000;
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
     LPVOID const result =
         VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
-    if (result && (allocation_type & MEM_COMMIT) != 0) {
+    if (result && (allocation_type & (kMemGraphics | MEM_COMMIT)) == (kMemGraphics | MEM_COMMIT)) {
         leonida::title_host_regions().register_range(reinterpret_cast<uint64_t>(result), size, 1);
     }
     return result;
