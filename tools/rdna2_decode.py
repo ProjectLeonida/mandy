@@ -562,6 +562,31 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                 dst_op = _sreg(sdst, 1 if wave32 else 2) if sd else _vcc_operand(wave32)
                 args = [dst_op, s0, s1] if not name.startswith("v_cmpx_") else [s0, s1]
                 return finish(name + "_sdwa", args, mods, 8)
+            if is_dpp16 or is_dpp8:
+                # A compare with a DPP src0. llvm-mc has no decoding for it on gfx10 (it rejects the word), but 1.0.2.1's
+                # pipeline library holds it; the second word has the layout of a VOP2's (docs/design.md, "DPP on a
+                # VOPC compare"). The result goes to VCC, as for the plain _e32 compare.
+                if not need(8):
+                    return None, 4
+                w1 = struct.unpack_from("<I", code, pc + 4)[0]
+                s0 = _vreg(w1 & 0xFF, 1)
+                s1 = _vreg(vsrc1, 1)
+                if is_dpp16:
+                    s0["neg"], s0["abs"] = bool((w1 >> 20) & 1), bool((w1 >> 21) & 1)
+                    s1["neg"], s1["abs"] = bool((w1 >> 22) & 1), bool((w1 >> 23) & 1)
+                    mods.append(_format_dpp16_ctrl((w1 >> 8) & 0x1FF))
+                    mods.append(f"row_mask:0x{(w1 >> 28) & 0xF:x}")
+                    mods.append(f"bank_mask:0x{(w1 >> 24) & 0xF:x}")
+                    if (w1 >> 19) & 1:
+                        mods.append("bound_ctrl:1")
+                    if (w1 >> 18) & 1:
+                        mods.append("fi:1")
+                else:
+                    mods.append(f"dpp8:[{','.join(str((w1 >> (8 + 3 * i)) & 7) for i in range(8))}]")
+                    if src0 == 234:
+                        mods.append("fi:1")
+                args = [s0, s1] if name.startswith("v_cmpx_") else [_vcc_operand(wave32), s0, s1]
+                return finish(name + "_dpp", args, mods, 8)
             lit = None
             nbytes = 4
             if src0 == 255:
@@ -979,7 +1004,12 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                     args.append(_src(src1, w, lit, neg=bool(neg & 2), absm=bool(abs_bits & 2)))
             elif fn == "SRC2":
                 args.append(_src(src2, w, lit, neg=bool(neg & 4), absm=bool(abs_bits & 4)))
-        if op_sel:
+        if name in ("v_permlane16_b32", "v_permlanex16_b32"):
+            # These two use op_sel bits 0 and 1 as FI and BOUND_CTRL, not as half selects. llvm-mc prints just that
+            # pair, and nothing when both are 0, whatever bits 2 and 3 hold (LLVM 21.1.8, gfx1013).
+            if op_sel & 3:
+                mods.append(f"op_sel:[{op_sel & 1},{(op_sel >> 1) & 1}]")
+        elif op_sel:
             # op_sel prints [s0,s1,...,dst] (nsrc + 1 bits, or nsrc for VOPC).
             nbits = nsrc if opc < 0x100 else (nsrc + 1)
             bits = [(op_sel >> i) & 1 for i in range(nsrc)]
@@ -1326,7 +1356,9 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             tname = f"param{tgt - 32}"
         else:
             tname = f"tgt{tgt}"
-        args = [{"k": "target", "t": tname}]
+        # shader_ir.parse_line reads `null` as the special register wherever it stands, the export target included,
+        # so the decoded instruction says the same and compares equal to its own printed line parsed back.
+        args = [{"k": "special" if tname == "null" else "target", "t": tname}]
         if compr:
             # Compressed export: en bit 0/1 enables vsrc0 (printed twice), bit 2/3 enables vsrc1 (printed twice).
             for pair in (0, 1):

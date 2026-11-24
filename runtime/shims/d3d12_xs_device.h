@@ -77,6 +77,18 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out);
 // True when `device` points at a proxy created by create_device_proxy. Used by the tests.
 bool is_device_proxy(const void* device);
 
+// The host path of D3D12XboxCreateDevice (BL-2, docs/d3d12_xs_surface.md): the PC D3D12CreateDevice (`create`)
+// asked for kHostDeviceFloor, the lowest feature level D3D12 creates a device at. It is a minimum, so asking for it
+// refuses no adapter the title can run on and still gives the device its highest level, which FEATURE_LEVELS then
+// reports. A null `create`, or S_OK with no device, is E_NOTIMPL / E_FAIL; `*out` is null on failure.
+constexpr D3D_FEATURE_LEVEL kHostDeviceFloor = D3D_FEATURE_LEVEL_11_0;
+using HostCreateDeviceFn = HRESULT(WINAPI*)(IUnknown* adapter, D3D_FEATURE_LEVEL minimum, REFIID riid, void** out);
+HRESULT create_host_device(HostCreateDeviceFn create, IUnknown* adapter, ID3D12Device** out);
+
+// The highest of 11_0, 11_1, 12_0, 12_1 and 12_2 `device` reports through D3D12_FEATURE_FEATURE_LEVELS, or 0 when
+// the query fails.
+D3D_FEATURE_LEVEL max_feature_level(ID3D12Device* device);
+
 // IDXGIDevice1 on the device. A GDKX title asks its device for IDXGIDevice1, then GetAdapter and EnumOutputs(0),
 // to find the output it gives SetFrameIntervalX (docs/d3d12_vulkan.md section 4.5). The proxy answers IDXGIObject,
 // IDXGIDevice and IDXGIDevice1 itself, as one COM object with the device (same reference count, QueryInterface
@@ -131,6 +143,24 @@ using ConsoleDescriptorHeapHandler = HRESULT (*)(ID3D12Device* real, const D3D12
                                                 D3D12_GPU_VIRTUAL_ADDRESS console_address, std::uint64_t console_size,
                                                 REFIID riid, void** out);
 void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler);
+
+// Presentation wiring: connects device frame-event slots (78/79/80/81: SetFrameIntervalX, ScheduleFrameEventX,
+// WaitFrameEventX, GetFrameStatisticsX; 81 is LEONIDA_XS_FRAME_STATISTICS_SLOT) and queue presentation slots (PresentX
+// at 30, or LEONIDA_XS_PRESENT_X_SLOT; SuspendX and ResumeX are routed only when LEONIDA_XS_SUSPEND_X_SLOT /
+// LEONIDA_XS_RESUME_X_SLOT are set) to an external presenter such as rt::d3d12::XboxPresentation without coupling
+// d3d12_xs_device to Vulkan headers. Passing nullptr detaches the handler and restores the default mock/fallback
+// behavior.
+struct PresentationHandler {
+    void* context = nullptr;
+    HRESULT (*set_frame_interval)(void* context, IUnknown* output, UINT interval_us, UINT latency, UINT flags) = nullptr;
+    HRESULT (*schedule_frame_event)(void* context, UINT event, UINT offset_us, UINT flags) = nullptr;
+    HRESULT (*wait_frame_event)(void* context, UINT event, DWORD timeout_ms, UINT flags, std::uint64_t* token) = nullptr;
+    HRESULT (*get_frame_statistics)(void* context, std::uint64_t token, UINT type_mask, UINT* count, void* out) = nullptr;
+    HRESULT (*present_x)(void* context, UINT plane_count, const void* planes, const void* params) = nullptr;
+    HRESULT (*suspend_x)(void* context, UINT flags) = nullptr;
+    HRESULT (*resume_x)(void* context) = nullptr;
+};
+bool set_presentation_handler(void* device, const PresentationHandler* handler);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 26 (the console's struct-return form),

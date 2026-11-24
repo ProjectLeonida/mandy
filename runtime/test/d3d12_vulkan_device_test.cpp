@@ -2449,9 +2449,11 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         o13.InvertedViewportHeightFlipsYSupported || o13.InvertedViewportDepthFlipsZSupported ||
         o13.TextureCopyBetweenDimensionsSupported || o13.AlphaBlendFactorSupported)
         fail("OPTIONS13 unexpected support");
-    if (o14.AdvancedTextureOpsSupported || o14.WriteableMSAATexturesSupported ||
-        o14.IndependentFrontAndBackStencilRefMaskSupported)
+    if (o14.AdvancedTextureOpsSupported || o14.WriteableMSAATexturesSupported)
         fail("OPTIONS14 unexpected support");
+    // DEPTH_STENCIL2's per-face masks and OMSetFrontAndBackStencilRef (d3d12_state_sweep_test draws them).
+    if (!o14.IndependentFrontAndBackStencilRefMaskSupported)
+        fail("OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported should be TRUE");
     if (o15.TriangleFanSupported || o15.DynamicIndexBufferStripCutSupported) fail("OPTIONS15 unexpected support");
     if (o16.DynamicDepthBiasSupported || o16.GPUUploadHeapSupported) fail("OPTIONS16 unexpected support");
     if (o18.RenderPassesValid) fail("OPTIONS18 unexpected support");
@@ -5168,6 +5170,12 @@ int main() {
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
         EXPECT(options.ResourceBindingTier == D3D12_RESOURCE_BINDING_TIER_3);
         EXPECT(options.MaxGPUVirtualAddressBitsPerResource == 40);
+        // Console 0x40-byte (16-dword) D3D12_OPTIONS query (docs/d3d12_xs_surface.md §7.1): 0x3C PC prefix + zero tail.
+        UINT console_opts[16]{};
+        console_opts[15] = 0xdeadbeefu;
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, console_opts, sizeof(console_opts))));
+        EXPECT(std::memcmp(console_opts, &options, sizeof(options)) == 0);
+        EXPECT(console_opts[15] == 0);
 
         D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT va_support{};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va_support, sizeof(va_support))));

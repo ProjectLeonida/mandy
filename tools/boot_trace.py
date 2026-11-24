@@ -32,6 +32,12 @@ import re
 import sys
 
 D3D12_LINE = re.compile(r"^(?:.+ : )?\[d3d12-trace\] #(\d+) (.+) (\S+)\s*$")
+PACING_LINE = re.compile(
+    r"^(?:.+ : )?\[rt\] present: pacing summary "
+    r"frames=(\d+) samples=(\d+) target_us=(\d+) mean_us=(-?\d+(?:\.\d+)?) drift_us=([+-]?\d+(?:\.\d+)?) "
+    r"p50_us=(\d+) p95_us=(\d+) p99_us=(\d+) "
+    r"latency_samples=(\d+) latency_p50_us=(\d+) latency_p95_us=(\d+) latency_p99_us=(\d+)\s*$"
+)
 D3D12_PROBLEMS = ("failed", "unsupported", "refused", "partial")
 D3D12_OUTCOMES = frozenset((*D3D12_PROBLEMS, "called", "ok", "ignored"))
 
@@ -72,6 +78,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
         "int3_skipped": [],
         "exceptions": [],
         "exception_count": 0,
+        "xmem_physical_pages": [],
         "exit": None,
         "error": None,
     }
@@ -165,6 +172,30 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                     trace["exceptions"].append(detail)
                 else:
                     trace["exceptions"][-1] = detail
+            elif kind == "xmem_physical_pages":
+                samples = trace["xmem_physical_pages"]
+                if len(samples) < limit:
+                    attributes = event.get("attributes")
+                    pages = event.get("pages")
+                    record = {
+                        "attributes": (
+                            attributes
+                            if isinstance(attributes, str) and re.fullmatch(r"0x[0-9a-fA-F]{1,16}", attributes)
+                            else None
+                        ),
+                        "pages": pages if type(pages) is int and 0 <= pages < (1 << 64) else None,
+                    }
+                    for key in ("api", "caller"):
+                        value = event.get(key)
+                        record[key] = (
+                            value
+                            if isinstance(value, str)
+                            and bool(value.strip())
+                            and not any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F or ch in ("\u2028", "\u2029")
+                                        for ch in value)
+                            else None
+                        )
+                    samples.append(record)
             elif kind == "exit":
                 trace["exit"] = event.get("code")
             elif kind == "error":
@@ -191,10 +222,29 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
         "last_seq": 0,
         "sequence_break_count": 0,
         "sequence_breaks": [],
+        "frame_pacing": None,
     }
     with _open_text(path) as fh:
         for line in fh:
-            match = D3D12_LINE.match(line.rstrip("\n"))
+            stripped = line.rstrip("\n")
+            pacing_match = PACING_LINE.match(stripped)
+            if pacing_match:
+                trace["frame_pacing"] = {
+                    "frames": int(pacing_match.group(1)),
+                    "samples": int(pacing_match.group(2)),
+                    "target_us": int(pacing_match.group(3)),
+                    "mean_us": float(pacing_match.group(4)),
+                    "drift_us": float(pacing_match.group(5)),
+                    "p50_us": int(pacing_match.group(6)),
+                    "p95_us": int(pacing_match.group(7)),
+                    "p99_us": int(pacing_match.group(8)),
+                    "latency_samples": int(pacing_match.group(9)),
+                    "latency_p50_us": int(pacing_match.group(10)),
+                    "latency_p95_us": int(pacing_match.group(11)),
+                    "latency_p99_us": int(pacing_match.group(12)),
+                }
+                continue
+            match = D3D12_LINE.match(stripped)
             # A crash can truncate the final outcome. A known complete outcome is
             # still usable when the trace ends just before the newline.
             if not match or (not line.endswith("\n") and match.group(3) not in D3D12_OUTCOMES):
@@ -245,6 +295,7 @@ def counts_only(summary: dict) -> dict:
             dllmain_failed=startup["dllmain"]["failed"],
             unimplemented_imports=len(startup["unimplemented"]),
             int3_skipped=len(startup["int3_skipped"]),
+            xmem_physical_pages_count=startup["kinds"].get("xmem_physical_pages", 0),
             exit_observed=startup["exit"] is not None,
         )
     if d3d12 := summary["d3d12"]:
@@ -258,12 +309,16 @@ def counts_only(summary: dict) -> dict:
             "sequence_break_count": d3d12["sequence_break_count"],
             "outcomes": outcomes,
         }
+        if d3d12.get("frame_pacing") is not None:
+            counters["d3d12"]["frame_pacing"] = dict(d3d12["frame_pacing"])
     return counters
 
 
 def _tail(items, limit: int) -> str:
-    shown = ", ".join(str(x) for x in items[:limit])
-    return shown + (f", ... {len(items) - limit} more" if len(items) > limit else "")
+    shown = [str(x) for x in items[:limit]]
+    if len(items) > limit:
+        shown.append(f"... {len(items) - limit} more")
+    return ", ".join(shown)
 
 
 def format_text(summary: dict, limit: int) -> str:
@@ -278,7 +333,8 @@ def format_text(summary: dict, limit: int) -> str:
             kinds = ", ".join(f"{k} {v}" for k, v in sorted(startup["kinds"].items()))
             out.append(f"  kinds: {kinds}")
         if startup["modules"]:
-            names = [m["module"] for m in startup["modules"]]
+            # A relocated module is marked: triage step 1 asks whether the executable sits at its preferred base.
+            names = [m["module"] + (" (relocated)" if m.get("relocated") else "") for m in startup["modules"]]
             out.append(f"  modules ({len(names)}): {_tail(names, limit)}")
         out.append(f"  tls callbacks: {startup['tls_callbacks']}")
         if callback := startup.get("last_tls_callback"):
@@ -331,6 +387,17 @@ def format_text(summary: dict, limit: int) -> str:
                 out.append(f"    code {exc['code']} at {exc['at']}{detail}")
                 if exc.get("stack"):
                     out.append(f"      stack: {_tail(exc['stack'], limit)}")
+        if count := startup["kinds"].get("xmem_physical_pages"):
+            out.append(f"  XMem physical page observations: {count}")
+            shown = startup.get("xmem_physical_pages", [])[:limit]
+            for item in shown:
+                pages = item["pages"] if item["pages"] is not None else "?"
+                out.append(
+                    f"    {item['api'] or '?'} attributes {item['attributes'] or '?'}"
+                    f" requested {pages} pages from {item['caller'] or '?'}"
+                )
+            if len(shown) < count:
+                out.append(f"    ... {count - len(shown)} more")
         if startup["error"]:
             out.append(f"  error: {startup['error']}")
         if startup["exit"] is not None:
@@ -344,6 +411,18 @@ def format_text(summary: dict, limit: int) -> str:
             " (the [rt] diagnostics are not summarized)"
             + (f": {outcomes}" if outcomes else "")
         )
+        if fp := d3d12.get("frame_pacing"):
+            line = (
+                f"  frame pacing: {fp['frames']} frame(s), {fp['samples']} interval(s), "
+                f"target {fp['target_us']} us, mean {fp['mean_us']:.1f} us (drift {fp['drift_us']:+.1f} us), "
+                f"p50/p95/p99 {fp['p50_us']}/{fp['p95_us']}/{fp['p99_us']} us"
+            )
+            if fp["latency_samples"]:
+                line += (
+                    f"; origin-to-present p50/p95/p99 "
+                    f"{fp['latency_p50_us']}/{fp['latency_p95_us']}/{fp['latency_p99_us']} us"
+                )
+            out.append(line)
         if last_call := d3d12.get("last_call"):
             out.append(f"  last recorded call: #{last_call['seq']} {last_call['method']} {last_call['outcome']}")
         if d3d12["sequence_break_count"]:
@@ -385,14 +464,14 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true", help="print the summary as JSON")
     ap.add_argument("--counts-only", action="store_true", help="print aggregate JSON without paths or event details")
     ap.add_argument(
-        "--limit", type=int, default=10, help="items listed per section (default 10)"
+        "--limit", type=int, default=10, help="items listed per section (default 10; 0 omits XMem observation lists)"
     )
     a = ap.parse_args(argv)
     if not a.startup and not a.d3d12:
         print("error: give the startup trace, --d3d12, or both", file=sys.stderr)
         return 2
-    if a.limit < 1:
-        print("error: --limit must be at least 1", file=sys.stderr)
+    if a.limit < 0:
+        print("error: --limit must be non-negative", file=sys.stderr)
         return 2
     summary = summarize(None, None)
     exit_code = 0

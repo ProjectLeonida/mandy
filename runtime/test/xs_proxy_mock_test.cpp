@@ -18,6 +18,7 @@
 
 #include <crtdbg.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -91,11 +92,14 @@ struct Mock {
     bool allocator_tag;      // allocator: answers kLeonidaCommandAllocatorTag; device: the allocators it makes do
     bool create_null;        // device: creation returns create_result with no object
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
+    bool list_refuse;        // device: CreateCommandList refuses every riid with E_NOINTERFACE
+    IID create_riid;         // device: copy of the riid its last CreateCommandList got (the caller's may be a local)
     Mock* last_child;        // device: the object its last creation or open made
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
     D3D12_COMMAND_QUEUE_DESC queue_desc;  // device: the description of its last CreateCommandQueue (slot 8)
+    D3D_FEATURE_LEVEL max_level;  // device: the highest level FEATURE_LEVELS reports (0: the query is refused)
 };
 
 Mock g_pool[256];
@@ -233,6 +237,18 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 return a1;  // a struct-returning method hands the buffer's address back in RAX
             }
             case 50: copy_array(m, slot, a3, a2); break;                    // (flags, count, objects, fence, value)
+            case 13: {  // CheckFeatureSupport(feature, data, size): FEATURE_LEVELS only, as the host answers it
+                auto* levels = reinterpret_cast<D3D12_FEATURE_DATA_FEATURE_LEVELS*>(a2);
+                if (static_cast<std::uint32_t>(a1) != D3D12_FEATURE_FEATURE_LEVELS || !levels || !m->max_level ||
+                    static_cast<std::uint32_t>(a3) != sizeof(*levels) || !levels->pFeatureLevelsRequested)
+                    return static_cast<std::uint32_t>(E_INVALIDARG);
+                D3D_FEATURE_LEVEL best = D3D_FEATURE_LEVEL(0);
+                for (UINT i = 0; i < levels->NumFeatureLevels; ++i)
+                    if (levels->pFeatureLevelsRequested[i] <= m->max_level)
+                        best = std::max(best, levels->pFeatureLevelsRequested[i]);
+                levels->MaxSupportedFeatureLevel = best;
+                return static_cast<std::uint32_t>(best ? S_OK : DXGI_ERROR_UNSUPPORTED);
+            }
             default: break;
         }
         return S_OK;
@@ -276,8 +292,10 @@ HRESULT WINAPI mock_create_command_list(Mock* self, std::uint64_t node_mask, std
     self->args[12][2] = allocator;
     self->args[12][3] = initial_state;
     self->args[12][4] = reinterpret_cast<std::uint64_t>(riid);
+    if (riid) self->create_riid = *riid;
     if (!out) return S_FALSE;
     *out = nullptr;
+    if (self->list_refuse) return E_NOINTERFACE;
     if (self->create_null || FAILED(self->create_result)) return self->create_result;
     Mock* child = new_mock(Kind::command_list);
     child->list_level = self->list_level;
@@ -397,6 +415,67 @@ void* make_fence(void* device, const IID& iid = kFenceIid) {
 
 unsigned long release(void* object) {
     return static_cast<unsigned long>(raw(object, 2));
+}
+
+// ---- 0. The host device's feature-level floor (BL-2) ----
+
+// A host D3D12CreateDevice whose adapter tops out at g_host_max: a minimum above it is refused with E_INVALIDARG,
+// as on a host that tops out at 11_x, and g_host_mode makes it fail outright or succeed with no object.
+D3D_FEATURE_LEVEL g_host_max = D3D_FEATURE_LEVEL_12_1;
+D3D_FEATURE_LEVEL g_host_minimum = D3D_FEATURE_LEVEL(0);  // the minimum the last call asked for
+enum class HostMode { normal, fail, no_object } g_host_mode = HostMode::normal;
+
+HRESULT WINAPI fake_create_device(IUnknown*, D3D_FEATURE_LEVEL minimum, REFIID riid, void** out) {
+    g_host_minimum = minimum;
+    if (!out) return S_FALSE;
+    *out = nullptr;
+    if (g_host_mode == HostMode::fail) return DXGI_ERROR_UNSUPPORTED;
+    if (g_host_mode == HostMode::no_object) return S_OK;
+    if (minimum > g_host_max) return E_INVALIDARG;
+    Mock* m = new_mock(Kind::device);
+    m->max_level = g_host_max;
+    return mock_query(m, &riid, out);
+}
+
+int check_host_device_floor() {
+    g_label = "xs_proxy_mock host feature level";
+    EXPECT(xs::kHostDeviceFloor == D3D_FEATURE_LEVEL_11_0);
+    const D3D_FEATURE_LEVEL tops[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_12_0,
+                                      D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_2};
+    for (const D3D_FEATURE_LEVEL top : tops) {
+        g_host_max = top;
+        // The floor 12_0 the host path used to ask for refuses the adapters that top out at 11_x.
+        void* old = nullptr;
+        const HRESULT old_hr = fake_create_device(nullptr, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), &old);
+        EXPECT(FAILED(old_hr) == (top < D3D_FEATURE_LEVEL_12_0));
+        if (old) release(old);
+
+        ID3D12Device* real = nullptr;
+        EXPECT(xs::create_host_device(&fake_create_device, nullptr, &real) == S_OK && real);
+        EXPECT(g_host_minimum == D3D_FEATURE_LEVEL_11_0);
+        EXPECT(xs::max_feature_level(real) == top);   // the device keeps its highest level
+        // The title asks the device it gets (the Xbox-ABI proxy) through slot 13, CheckFeatureSupport.
+        void* device = nullptr;
+        EXPECT(SUCCEEDED(xs::create_device_proxy(real, __uuidof(ID3D12Device), &device)) && device);
+        D3D12_FEATURE_DATA_FEATURE_LEVELS levels{UINT(std::size(tops)), tops, D3D_FEATURE_LEVEL(0)};
+        EXPECT(hr_of(raw(device, 13, D3D12_FEATURE_FEATURE_LEVELS, word(&levels), sizeof(levels))) == S_OK);
+        EXPECT(levels.MaxSupportedFeatureLevel == top);
+        release(device);
+    }
+    g_host_max = D3D_FEATURE_LEVEL_12_1;
+    ID3D12Device* real = reinterpret_cast<ID3D12Device*>(&g_host_max);   // must be cleared on every failure
+    EXPECT(xs::create_host_device(nullptr, nullptr, &real) == E_NOTIMPL && !real);
+    EXPECT(xs::create_host_device(&fake_create_device, nullptr, nullptr) == E_POINTER);
+    g_host_mode = HostMode::fail;
+    real = reinterpret_cast<ID3D12Device*>(&g_host_max);
+    EXPECT(xs::create_host_device(&fake_create_device, nullptr, &real) == DXGI_ERROR_UNSUPPORTED && !real);
+    g_host_mode = HostMode::no_object;
+    real = reinterpret_cast<ID3D12Device*>(&g_host_max);
+    EXPECT(xs::create_host_device(&fake_create_device, nullptr, &real) == E_FAIL && !real);
+    g_host_mode = HostMode::normal;
+    EXPECT(xs::max_feature_level(nullptr) == D3D_FEATURE_LEVEL(0));
+    g_label = "xs_proxy_mock";
+    return 0;
 }
 
 // ---- 1. Device interface levels ----
@@ -981,17 +1060,27 @@ int check_xbox_slots() {
 
 // ---- 8. Environment overrides for the Xbox device slots (one process each, read once) ----
 
+struct EnvPresenter {
+    int stats = 0, present = 0, suspend = 0, resume = 0;
+};
+
 int run_env_slots(bool valid) {
     const char* frame_interval = valid ? "96" : "2";
     const char* schedule_event = valid ? "97" : "2";
     const char* wait_event = valid ? "98" : "2";
     const char* queue_x = valid ? "99" : "2";
     const char* list_x = valid ? "100" : "2";
+    const char* frame_statistics = valid ? "101" : "2";
+    const char* suspend_x = valid ? "33" : "2";  // a queue slot beyond the PC table, as SuspendX would be
+    const char* resume_x = valid ? "30" : "2";   // equal to PresentX's default: ResumeX is unrouted (logged)
     EXPECT(SetEnvironmentVariableA("LEONIDA_XS_FRAME_INTERVAL_SLOT", frame_interval) != FALSE);
     EXPECT(SetEnvironmentVariableA("LEONIDA_XS_SCHEDULE_EVENT_SLOT", schedule_event) != FALSE);
     EXPECT(SetEnvironmentVariableA("LEONIDA_XS_WAIT_EVENT_SLOT", wait_event) != FALSE);
+    EXPECT(SetEnvironmentVariableA("LEONIDA_XS_FRAME_STATISTICS_SLOT", frame_statistics) != FALSE);
     EXPECT(SetEnvironmentVariableA("LEONIDA_XS_QUEUE_X_SLOT", queue_x) != FALSE);
     EXPECT(SetEnvironmentVariableA("LEONIDA_XS_LIST_X_SLOT", list_x) != FALSE);
+    EXPECT(SetEnvironmentVariableA("LEONIDA_XS_SUSPEND_X_SLOT", suspend_x) != FALSE);
+    EXPECT(SetEnvironmentVariableA("LEONIDA_XS_RESUME_X_SLOT", resume_x) != FALSE);
 
     Mock* mock = nullptr;
     void* device = make_device(mock, 11, true);
@@ -1018,6 +1107,36 @@ int run_env_slots(bool valid) {
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 1);
         EXPECT(release(list) == 0);
         EXPECT(release(allocator) == 0);
+
+        // The presenter answers frame statistics at 101 only (81 is not routed, so the mock refuses it); PresentX
+        // stays at 30, SuspendX answers at 33, and ResumeX, asked for 30, is unrouted, so 32 is refused.
+        EnvPresenter env{};
+        xs::PresentationHandler h{};
+        h.context = &env;
+        h.get_frame_statistics = [](void* ctx, std::uint64_t, UINT, UINT*, void*) -> HRESULT {
+            ++static_cast<EnvPresenter*>(ctx)->stats;
+            return S_FALSE;
+        };
+        h.present_x = [](void* ctx, UINT, const void*, const void*) -> HRESULT {
+            ++static_cast<EnvPresenter*>(ctx)->present;
+            return S_OK;
+        };
+        h.suspend_x = [](void* ctx, UINT) -> HRESULT {
+            ++static_cast<EnvPresenter*>(ctx)->suspend;
+            return S_OK;
+        };
+        h.resume_x = [](void* ctx) -> HRESULT {
+            ++static_cast<EnvPresenter*>(ctx)->resume;
+            return S_OK;
+        };
+        EXPECT(xs::set_presentation_handler(device, &h));
+        UINT count = 0;
+        EXPECT(hr_of(raw(device, 101, 77, 0x1a, word(&count), 0)) == S_FALSE && env.stats == 1);
+        EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&count), 0)) == E_NOTIMPL && env.stats == 1);
+        EXPECT(hr_of(raw(queue, 30, 1, 0, 0)) == S_OK && env.present == 1);
+        EXPECT(hr_of(raw(queue, 33)) == S_OK && env.suspend == 1);
+        EXPECT(hr_of(raw(queue, 32)) == E_NOTIMPL && env.resume == 0);
+        EXPECT(xs::set_presentation_handler(device, nullptr));
         EXPECT(release(queue) == 0);
     } else {
         // Values outside 3..127 are ignored: the five defaults still answer, and a PC slot that is not a default is
@@ -1025,6 +1144,7 @@ int run_env_slots(bool valid) {
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 0);
         EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK && mock->calls[79] == 0);
         EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);
+        EXPECT(hr_of(raw(device, 81, 0, 0, 0, 0)) == S_FALSE);  // the default GetFrameStatisticsX slot, unattached
         EXPECT(hr_of(raw(device, 71)) == S_OK && mock->calls[71] == 1);  // not an Xbox slot: forwarded
     }
     EXPECT(release(device) == 0 && mock->refs == 0);
@@ -1504,6 +1624,39 @@ int check_console_command_list() {
     EXPECT(real_queue->array[10][0] == word(unwrapped_list));
     EXPECT(real_queue->array[10][1] == word(real_list));
 
+    // 5b. Public list revisions the proxy does not model and unknown private IIDs must not trigger a retry.
+    // Spell out the Windows SDK's ID3D12GraphicsCommandList9 IID so this also builds with older headers.
+    const IID list9_iid = {0x34ed2808, 0xffe6, 0x4c2b, {0xb1, 0x1a, 0xca, 0xbd, 0x2b, 0x0c, 0x59, 0xe1}};
+    const IID unknown_iid = {0x12345678, 0x1234, 0x1234, {1, 2, 3, 4, 5, 6, 7, 8}};
+    for (const IID* iid : {&list9_iid, &unknown_iid}) {
+        const unsigned calls_before = mock_device->calls[12];
+        void* unsupported_list = list_proxy;
+        EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(iid), word(&unsupported_list))) ==
+               E_NOINTERFACE);
+        EXPECT(!unsupported_list && mock_device->calls[12] == calls_before + 1);
+    }
+
+    // The measured Xbox list IID is created as ID3D12GraphicsCommandList in one call and stays queryable on the proxy.
+    const IID console_iid = {0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+    const unsigned calls12_before = mock_device->calls[12];
+    void* console_list = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&console_iid), word(&console_list))) == S_OK);
+    EXPECT(xs::is_command_list_proxy(console_list) && mock_device->calls[12] == calls12_before + 1);
+    EXPECT(IsEqualIID(mock_device->create_riid, __uuidof(ID3D12GraphicsCommandList)));
+    void* console_list_qi = nullptr;
+    EXPECT(hr_of(raw(console_list, 0, word(&console_iid), word(&console_list_qi))) == S_OK);
+    EXPECT(console_list_qi == console_list && release(console_list_qi) == 1);
+    EXPECT(release(console_list) == 0);
+
+    // The PC device refuses even ID3D12GraphicsCommandList for a PC IID: E_NOINTERFACE comes back as is, no retry.
+    mock_device->list_refuse = true;
+    const unsigned calls12_refused = mock_device->calls[12];
+    console_list = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), word(&console_list))) ==
+           E_NOINTERFACE);
+    EXPECT(!console_list && mock_device->calls[12] == calls12_refused + 1);
+    mock_device->list_refuse = false;
+
     // 6. Test with list_level = 7 (supporting ID3D12GraphicsCommandList7, 81 slots)
     mock_device->list_level = 7;
     void* list7_proxy = nullptr;
@@ -1534,6 +1687,99 @@ int check_console_command_list() {
     return 0;
 }
 
+// ---- 11. Presentation handler wiring (device slots 78–81 + queue PresentX/SuspendX/ResumeX) ----
+
+struct MockPresenter {
+    int interval_calls = 0;
+    UINT last_interval = 0;
+    int schedule_calls = 0;
+    UINT last_event = 0;
+    int wait_calls = 0;
+    UINT last_flags = 0;
+    int stats_calls = 0;
+    int present_calls = 0;
+    UINT last_planes = 0;
+    int suspend_calls = 0;
+    int resume_calls = 0;
+};
+
+int check_presentation_wiring() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 11, true);
+    EXPECT(device != nullptr);
+    void* queue = make_queue(device);
+    EXPECT(queue != nullptr);
+
+    MockPresenter p{};
+    xs::PresentationHandler h{};
+    h.context = &p;
+    h.set_frame_interval = [](void* ctx, IUnknown*, UINT us, UINT, UINT) -> HRESULT {
+        auto* m = static_cast<MockPresenter*>(ctx);
+        ++m->interval_calls;
+        m->last_interval = us;
+        return S_OK;
+    };
+    h.schedule_frame_event = [](void* ctx, UINT ev, UINT, UINT) -> HRESULT {
+        auto* m = static_cast<MockPresenter*>(ctx);
+        ++m->schedule_calls;
+        m->last_event = ev;
+        return S_OK;
+    };
+    h.wait_frame_event = [](void* ctx, UINT, DWORD, UINT flags, std::uint64_t* tok) -> HRESULT {
+        auto* m = static_cast<MockPresenter*>(ctx);
+        ++m->wait_calls;
+        m->last_flags = flags;
+        if (tok) *tok = 77;
+        return S_FALSE;
+    };
+    h.get_frame_statistics = [](void* ctx, std::uint64_t, UINT, UINT* count, void*) -> HRESULT {
+        auto* m = static_cast<MockPresenter*>(ctx);
+        ++m->stats_calls;
+        if (count) *count = 0;
+        return S_FALSE;
+    };
+    h.present_x = [](void* ctx, UINT plane_count, const void*, const void*) -> HRESULT {
+        auto* m = static_cast<MockPresenter*>(ctx);
+        ++m->present_calls;
+        m->last_planes = plane_count;
+        return S_OK;
+    };
+    h.suspend_x = [](void* ctx, UINT) -> HRESULT {
+        ++static_cast<MockPresenter*>(ctx)->suspend_calls;
+        return S_OK;
+    };
+    h.resume_x = [](void* ctx) -> HRESULT {
+        ++static_cast<MockPresenter*>(ctx)->resume_calls;
+        return S_OK;
+    };
+
+    EXPECT(xs::set_presentation_handler(device, &h));
+    EXPECT(hr_of(raw(device, 78, 0, 33333, 2, 0)) == S_OK && p.interval_calls == 1 && p.last_interval == 33333);
+    EXPECT(hr_of(raw(device, 79, 2, 0, 0, 0)) == S_OK && p.schedule_calls == 1 && p.last_event == 2);
+    std::uint64_t tok = 0;
+    EXPECT(hr_of(raw(device, 80, 0, 0, 0, 2, word(&tok))) == S_FALSE && tok == 77 && p.wait_calls == 1 &&
+           p.last_flags == 2);
+    UINT count = 3;
+    EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&count), 0)) == S_FALSE && count == 0 && p.stats_calls == 1);
+
+    // Queue slot 30 routes to PresentX while attached. SuspendX and ResumeX have no default route, so 31/32 are refused
+    // and never reach the presenter (the env mode, run_env_slots, routes them).
+    EXPECT(hr_of(raw(queue, 30, 1, 0x1000, 0x2000)) == S_OK && p.present_calls == 1 && p.last_planes == 1);
+    EXPECT(hr_of(raw(queue, 31, 0)) == E_NOTIMPL && p.suspend_calls == 0);
+    EXPECT(hr_of(raw(queue, 32)) == E_NOTIMPL && p.resume_calls == 0);
+
+    // Detaching restores default E_NOTIMPL refusal on beyond-PC queue slots.
+    EXPECT(xs::set_presentation_handler(device, nullptr));
+    UINT none = 7;  // unattached GetFrameStatisticsX: no statistics yet, never the PC slot 81
+    EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&none), 0)) == S_FALSE && none == 0 && p.stats_calls == 1);
+    EXPECT(hr_of(raw(queue, 30, 1, 0, 0)) == E_NOTIMPL && p.present_calls == 1);
+
+    EXPECT(release(queue) == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: presentation handler wiring (slots 78-81 and queue PresentX 30) passed\n", g_label);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1543,10 +1789,11 @@ int main(int argc, char** argv) {
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
-    if (check_tail(true) || check_levels() || check_slot48() || check_fence1() || check_create_failures() || check_open_shared() ||
+    if (check_tail(true) || check_host_device_floor() || check_levels() || check_slot48() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list() ||
         check_custom_heap_properties() ||
-        check_resource_allocation_info() || check_slot70() || check_committed_resource3_x())
+        check_resource_allocation_info() || check_slot70() || check_committed_resource3_x() ||
+        check_presentation_wiring())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

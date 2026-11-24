@@ -119,8 +119,9 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
 
 // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only
 // logged and not used to create the device. The struct's total size is unknown, so the log reads 24 x 32-bit words
-// (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead, so 12_0 is used as the
-// least restrictive floor; higher feature levels are still exposed by the created device.
+// (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead: create_host_device asks for
+// 11_0, the least restrictive one (BL-2; 12_0 refused an adapter that tops out at 11_x), and the device still has its
+// highest level.
 HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, const IID* riid, void** out) {
     constexpr auto method = "D3D12XboxCreateDevice";
     using rt::d3d12_trace::result;
@@ -190,13 +191,11 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     if (!create) return result(method, E_NOTIMPL);
 
     ID3D12Device* real = nullptr;
-    HRESULT hr = create(adapter, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device),
-                        reinterpret_cast<void**>(&real));
-    if (FAILED(hr) || !real) {
-        if (real) real->Release();
+    HRESULT hr = rt::d3d12_xs::create_host_device(create, adapter, &real);
+    if (FAILED(hr)) {
         std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: PC D3D12CreateDevice failed (hr=0x%08lx)\n",
                      static_cast<unsigned long>(hr));
-        return result(method, FAILED(hr) ? hr : E_FAIL);
+        return result(method, hr);
     }
 
     hr = rt::d3d12_xs::create_device_proxy(real, *riid, out);
