@@ -138,6 +138,7 @@ enabled. Only the first failure in a continuous series is logged; turning the pa
 | Tab | `View` |
 | W / A / S / D | left stick up / left / down / right |
 | mouse movement | right stick |
+| I / J / K / L | right stick up / left / down / right, at full deflection over the mouse (K is down) |
 | right mouse button | left trigger (aim) |
 | left mouse button | right trigger (fire) |
 
@@ -343,6 +344,7 @@ line is logged when it takes effect); tracking goes on underneath, so clearing i
 | `LEONIDA_RUMBLE` | `1` | `0` turns all rumble, trigger and force-feedback output off |
 | `LEONIDA_PROMPTS` | `auto` | forces the [active input](#active-input) family: `xbox`, `playstation` (or `ps5`), `ps4`, `ps3`, `nintendo` or `keyboard`; `auto` follows the devices |
 | `LEONIDA_PROMPTS_SWITCH_MS` | `300` | shortest time between two changes of the active input family, 0..2000 ms |
+| `LEONIDA_GAMEINPUT_HOTPLUG` | `1` | `0` stops the once-a-second check that restarts SDL's gamepad subsystem when the XInput slots in use or the HID joysticks and gamepads in the raw-input list change (pads plugged in after start under Wine, which sends SDL no device notification) |
 | `LEONIDA_GAMEINPUT_THREAD` | `1` | `0` stops the background poll thread; only `rt::gameinput::poll()` then reads the pads (tests) |
 | `LEONIDA_KEYBOARD_PAD` | `off` | `1` adds the [keyboard pad](#keyboard-pad), read while this process has focus; `always` reads keys whatever has focus |
 | `LEONIDA_INPUT_SCRIPT` | unset | Comma-separated `button@seconds` entries, e.g. `a@2,a@4,start@6`. With SDL3 they drive the keyboard pad, which has to be enabled; without SDL3 they drive [one scripted pad](#scripted-input-without-sdl3), the only device. The first pad update (without SDL3, the first `GameInputCreate`) reads the script once at startup and starts the clock. `reload_config()` does not reread it. Each press lasts 300 ms, or `hold` seconds when the entry is `button@seconds:hold` (more than 0, at most 600). With SDL3 a press then stays down until the title has read the pads six times since it began, but never past 5 s from its start (or its hold, if longer). A title reads its pad once a frame, so at a few seconds a frame a 300 ms press can fall between two reads and never arrive: on the retail title's "Couldn't autosave" prompt, three 300 ms `b` presses did nothing, while 120 presses 0.5 s apart got through; one `b@1100:3` replaces them. Buttons are `a b x y start back lb rb up down left right`. Spaces around entries are allowed. Empty entries, unknown buttons, invalid times (including negative or non-finite values) and invalid holds (0 or less, more than 600, not a number) are counted and ignored. |
