@@ -183,8 +183,18 @@ private:
 
 VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_cache, VkDevice device,
                                              const leonida::cached_pso::Identity& identity) {
-    const PipelineCacheSeed seed(pipeline_cache_path());
-    if (!seed.data()) return VK_NULL_HANDLE;
+    const std::filesystem::path path = pipeline_cache_path();
+    const PipelineCacheSeed seed(path);
+    if (!seed.data()) {
+        // Measured with the retail 1.0.2.1 executable on an RTX 3070: without a seed, the title's first compute
+        // pipeline compiles cold inside its graphics-init thread for longer than the title's own watchdog allows
+        // (~26 s), and the title ends itself with no error in this log. Say once where the seed was looked for.
+        std::fprintf(stderr,
+                     "[rt] d3d12: no usable pipeline_cache.bin at %ls: every pipeline compiles cold (the pipelines "
+                     "stage of make_game.py writes it to --out, beside gta6rt.exe)\n",
+                     path.empty() ? L"(no module path)" : path.c_str());
+        return VK_NULL_HANDLE;
+    }
     if (!seed.compatible(identity)) {
         std::fprintf(stderr, "[rt] d3d12: pipeline_cache.bin does not match this Vulkan device\n");
         return VK_NULL_HANDLE;
