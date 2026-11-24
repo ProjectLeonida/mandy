@@ -691,6 +691,10 @@ def gpu_test_timeout():
         sys.exit(error)
     if not math.isfinite(limit):
         sys.exit(error)
+    # POSIX poll takes a signed 32-bit millisecond timeout. Floor the seconds limit before conversion.
+    max_seconds = (2**31 - 1) // 1000
+    if limit > max_seconds:
+        sys.exit(f"LEONIDA_GPU_TEST_TIMEOUT must not exceed {max_seconds} seconds (0 = no limit), not {text!r}")
     return None if limit <= 0 else limit
 
 
