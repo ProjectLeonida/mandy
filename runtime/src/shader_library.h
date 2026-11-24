@@ -15,18 +15,23 @@
 #include <bit>
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
 #include <map>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#include <share.h>
+#endif
 
 namespace leonida {
 
@@ -982,12 +987,22 @@ private:
     template<typename Fail>
     bool load_index(const std::filesystem::path& dir, const std::string& prefix, Fail&& fail) {
         const auto index = dir / "index.json";
-        std::ifstream file(index, std::ios::binary);
+#ifdef _WIN32
+        auto* handle = _wfsopen(index.c_str(), L"rb", _SH_DENYNO);
+#else
+        auto* handle = std::fopen(index.c_str(), "rb");
+#endif
+        const auto close = [](std::FILE* f) { std::fclose(f); };
+        std::unique_ptr<std::FILE, decltype(close)> file(handle, close);
         if (!file) {
             const auto path = index.u8string();
             return fail("cannot open " + std::string(path.begin(), path.end()));
         }
-        const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        std::string text;
+        char block[16 * 1024];
+        while (const auto count = std::fread(block, 1, sizeof block, file.get()))
+            text.append(block, count);
+        if (std::ferror(file.get())) return fail("index.json could not be read");
         constexpr std::string_view utf8_bom = "\xef\xbb\xbf";
         std::string_view json(text);
         if (json.starts_with(utf8_bom)) json.remove_prefix(utf8_bom.size());

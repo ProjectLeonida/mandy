@@ -13,6 +13,13 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #define CHECK(condition) do {                                    \
     if (!(condition)) {                                          \
         std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); \
@@ -633,6 +640,33 @@ int main() {
     std::filesystem::create_directories(dir);
     const std::string hash = sha256_hex(skewed(600));
     const std::string hash2 = sha256_hex(bytes("another program"));
+#ifdef _WIN32
+    // A complete JSON object in the readable prefix must not hide a read error in the tail.
+    {
+        const auto locked_dir = dir / "locked-tail";
+        std::filesystem::create_directory(locked_dir);
+        const auto path = locked_dir / "index.json";
+        constexpr DWORD lock_offset = 64 * 1024;
+        {
+            std::ofstream index(path, std::ios::binary);
+            index << "{}" << std::string(lock_offset - 2, ' ') << '!';
+            CHECK(index.good());
+        }
+        const HANDLE lock = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        CHECK(lock != INVALID_HANDLE_VALUE);
+        OVERLAPPED range{};
+        range.Offset = lock_offset;
+        const BOOL locked = LockFileEx(lock, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &range);
+        ShaderLibrary partial;
+        std::string error;
+        const bool loaded = locked && partial.load(locked_dir, &error);
+        CloseHandle(lock);
+        CHECK(locked);
+        CHECK(!loaded);
+        CHECK(!partial.loaded() && error == "index.json could not be read");
+    }
+#endif
     {
         std::ofstream index(dir / "index.json", std::ios::binary);
         index << "\xef\xbb\xbf" "{\"cs_test\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash
