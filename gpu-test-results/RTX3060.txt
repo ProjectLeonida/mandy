@@ -3,16 +3,16 @@ Driver:     NVIDIA 621.35 (621.35.0.0), Vulkan 1.4.357
 Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32)
 OS:         Windows 11, 10.0.26300.0
 Commit:     8f481cf16f261c7f37458aeb45e8f4e19994146d (main, 2026-11-24)
-Tools:      MSVC 19.52.37029.0 (VS 2026), SPIRV-Tools v2026.4 (spirv-as/spirv-val),
-            Python 3.15.2, pre-disassembled subset (--disasm-dir tests/semantic/fixtures/disasm)
-run_gpu_tests.py (--disasm-dir tests/semantic/fixtures/disasm):
-            100 shaders: 100 translated, 100 pass spirv-val
-            native:                 81/97 passed, 16 skipped, 0 failed
-            LEONIDA_W64_EMULATE=1:  97/97 passed, 0 skipped, 0 failed
-Failed:     none (all 81 native and 97 emulated cases matched exact words/pixels).
-Skipped:    native: 16 "no 64-wide compute subgroup on this device" (wave64 compute fixtures,
-            all 16 pass under LEONIDA_W64_EMULATE=1).
+Tools:      MSVC 19.52.37029.0 (VS 2026), llvm-mc 21.1.8 (native), SPIRV-Tools v2026.4 (spirv-as/spirv-val),
+            Python 3.15.2
+run_gpu_tests.py:
+            257 shaders: 257 translated, 257 pass spirv-val
+            native:                 197/248 passed, 49 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  229/248 passed, 17 skipped, 2 failed
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (both native and emulated, exit 1).
+Skipped:    native: 32 wave64 compute fixtures ("no 64-wide compute subgroup on this device",
+            all 32 pass under LEONIDA_W64_EMULATE=1), 1 ps_w64x_readlane ("subgroup 32..32"),
+            and 16 cases run by d3d12_*_test / w64_graphics.py.
 Notes:
-- Ran on Windows 11 with Vulkan SDK 1.4.363.1 (`spirv-as` / `spirv-val`), without `llvm-mc`,
-  using the repository's pre-disassembled fixture set (`--disasm-dir tests/semantic/fixtures/disasm`).
-- AI-assisted: built runtime tests with MSVC x64, ran `run_gpu_tests.py` native and emulated on RTX 3060. No game files.
+- Ran on Windows 11 with Vulkan SDK 1.4.363.1 (`spirv-as` / `spirv-val`) and native `llvm-mc` 21.1.8.
+- AI-assisted: built runtime tests with MSVC x64, ran full `run_gpu_tests.py` native and emulated on RTX 3060. No game files.
