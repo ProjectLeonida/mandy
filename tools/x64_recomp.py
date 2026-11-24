@@ -591,6 +591,12 @@ def decode_one(buf, pos, end, addr):
                 ins.unknown, ins.mnem = True, f"op0f_{op:02x}"
                 ins.size = pos - start
                 return ins
+            if op == 0x78 and (rep == "f2" or opsize):
+                # SSE4a: F2 0F 78 /r ib ib (insertq) and 66 0F 78 /0 ib ib (extrq) each
+                # read two imm8 bytes, not the one the 0F entry gives.  Without a
+                # mandatory prefix 0F 78 is Intel VMREAD, which this decoder does not
+                # model anyway, so it keeps the entry.
+                spec = spec[0], "Ev Ib Ib"
         mnem, opspec = spec
     else:
         spec = PRIMARY.get(op)

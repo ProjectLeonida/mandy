@@ -135,6 +135,26 @@ class DecodeTests(unittest.TestCase):
         ins = self.one(asm("f3 0f 1e fa"))      # endbr64 (decoded, no crash)
         self.assertEqual(ins.size, 4)
 
+    def test_sse4a_0f78_two_imm8(self):
+        # SSE4a: with a mandatory prefix, 0F 78 reads two imm8 bytes. Reading one
+        # leaves the decoder in the middle of the second immediate.
+        ins = self.one(asm("f2 0f 78 c1 10 10"))       # insertq xmm0,xmm1,16,16
+        self.assertEqual(ins.mnem, "sse")
+        self.assertEqual(ins.size, 6)
+        self.assertEqual(ins.ops[-2:], (("i", 16, 1), ("i", 16, 1)))
+
+        ins = self.one(asm("66 0f 78 c1 02 04"))       # extrq xmm0,2,4
+        self.assertEqual(ins.size, 6)
+        self.assertEqual(ins.ops[-2:], (("i", 2, 1), ("i", 4, 1)))
+
+        ins = self.one(asm("f2 45 0f 78 dc 10 10"))    # REX.RB: insertq xmm11,xmm12,16,16
+        self.assertEqual(ins.size, 7)
+        self.assertEqual(ins.ops[-2:], (("i", 16, 1), ("i", 16, 1)))
+
+        # the register form 0F 79 takes no immediate and keeps its length
+        ins = self.one(asm("f2 0f 79 ca"))
+        self.assertEqual(ins.size, 4)
+
 
 def run(code):
     return x.run_result(code, GUEST_VA)
