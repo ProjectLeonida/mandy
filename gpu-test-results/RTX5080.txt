@@ -1,0 +1,39 @@
+GPU:        NVIDIA GeForce RTX 5080 (Blackwell / GB203, PCI 10de:2c02)
+Driver:     NVIDIA 621.14 (Windows 32.0.16.2114), Vulkan 1.4.357
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32, default 32)
+OS:         Windows 11 Home, build 26200
+Commit:     7430f59b2755418f5db1682446a4ccef10d455b1 (main, 2026-11-24)
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools, AMDGPU), SPIRV-Tools v2026.4 RC2
+            (Vulkan SDK 1.4.363.0), CMake 4.4.4 + Ninja 1.13.2, MSVC 19.51.36260
+            (Visual Studio 18.11), Windows SDK 10.0.26100, Python 3.12.10
+CPU:        13th Gen Intel Core i9-13900KF
+RAM:        63.79 GiB reported
+
+run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val (both modes)
+            native:                 197/248 passed, 49 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  229/248 passed, 17 skipped, 2 failed
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (native and emulated alike, known #31):
+            r32 sint (sint view): 64 bad, texel(5,3) = 2071.
+Skipped:    native: 31 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup on this
+            device" and 1 "cannot require a 64-wide fragment subgroup" (the wave64 fixtures, which the
+            emulated run covers), plus the 16 documented "run by d3d12_*_test / w64_graphics.py" cases.
+            Emulated: the same 16, plus the 64-wide fragment one.
+
+Runtime:    ctest, RelWithDebInfo, Windows native build (scripts/build_runtime.ps1, VULKAN_SDK set):
+            294 registered, 281 passed, 11 skipped, 1 failed, 1 disabled (gameinput).
+Failed:     d3d12_execute_indirect_validation: the same five parity cases as RTX5070.txt's run, all
+            "layer=0 warp=1 hw=1 expected=0": arg_offset=260 >width (max=0 no-op), arg_offset=U64MAX-3
+            aligned (max=0 no-op), draw stride=20 off=240 max=1, draw stride=20 off=220 max=2,
+            dispatch stride=20 off=244 max=1.
+Skipped:    shader_library_corpus, bink_decode, bink_abi, bink_play_headless, fsr_dispatch,
+            bvh_builder, bink_audio, d3d12_boot_movie, d3d12_first_light (game data or
+            LEONIDA_FIRST_LIGHT_DIR not set), vk_sync_validation, d3d12_rgb9e5_rtv.
+
+Notes:
+- Same checkout: translator suite 465 files / 6,108 tests / 0 failed (run_semantic_tests.py,
+  32 jobs; two files first failed only because spirv-val was not yet on PATH in that shell and
+  passed when rerun with it), node --test tests/test_viewer_streaming.cjs 57/57.
+- Single baseline run on 2026-11-24; no implicit Vulkan layers disabled.
+- AI-assisted (Claude Code): installed the tools, built main, ran run_gpu_tests.py native and
+  emulated, ctest and the translator suite, and wrote this record. Synthetic tests only; no game
+  files, nothing online.
