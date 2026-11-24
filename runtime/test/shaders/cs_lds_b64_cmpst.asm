@@ -126,6 +126,7 @@ v_mov_b32_e32 v4, 0xFFFFFFFF
 ds_cmpst_b32 v1, v3, v4
 s_waitcnt lgkmcnt(0)
 ds_read_b32 v11, v1
+s_waitcnt lgkmcnt(0)
 v_xor_b32_e32 v16, v10, v11
 v_mov_b32_e32 v21, 28
 buffer_store_dword v16, v21, s[0:3], 0 offen
