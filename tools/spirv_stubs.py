@@ -11,6 +11,7 @@ Emits binary SPIR-V 1.0 directly with the standard library (no external spirv-as
 Every inter-stage varying emitted by tools/rdna2spirv.py is a 32-bit vec4 float, so a single stub per
 unique location set matches every shader with that interface.
 """
+import contextlib
 import json
 import os
 import shutil
@@ -18,6 +19,10 @@ import struct
 import sys
 import time
 import uuid
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+
 
 SPIRV_MAGIC = 0x07230203
 SPIRV_VERSION_1_0 = 0x00010000
@@ -266,17 +271,13 @@ def generate_for_index(spirv_dir, index):
         try:
             with stream as f:
                 f.write(data)
-            if os.name == "posix":
-                try:
-                    shutil.copymode(target, staged)
-                except FileNotFoundError:
-                    pass
+            os.chmod(staged, published_mode(target))
             _replace_stub(staged, target)
         except BaseException:
-            try:
+            with contextlib.suppress(OSError):
+                # The staged file may carry a read-only target's mode; make it deletable first.
+                os.chmod(staged, 0o600)
                 os.remove(staged)
-            except OSError:
-                pass
             raise
         written.append(fname)
     return written
