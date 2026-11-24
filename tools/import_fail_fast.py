@@ -46,7 +46,8 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 import pe_inspect  # noqa: E402
 from gdk_runtime_calls import RAX, decode, writes  # noqa: E402
-from import_call_sites import call_sites, import_slots  # noqa: E402
+from import_call_sites import (call_sites, dll_selector, import_selector, import_slots,  # noqa: E402
+                               unmatched_selectors)
 
 CALL_SLOT = re.compile(b"\xff\x15")
 PREFIXES = frozenset((0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF0, 0xF2, 0xF3))
@@ -254,9 +255,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="List the call sites where an x86-64 PE image stops itself when an "
                                              "import returns a failure.")
     ap.add_argument("image")
-    ap.add_argument("--import", dest="imports", action="append", default=[], metavar="DLL!NAME",
+    ap.add_argument("--import", dest="imports", action="append", default=[], metavar="DLL!NAME", type=import_selector,
                     help="an import to look at (repeatable); '#N' names an ordinal import")
-    ap.add_argument("--dll", dest="dlls", action="append", default=[], metavar="DLL",
+    ap.add_argument("--dll", dest="dlls", action="append", default=[], metavar="DLL", type=dll_selector,
                     help="every import of this DLL (repeatable)")
     ap.add_argument("--all", action="store_true", help="list the imports with no fatal site too")
     ap.add_argument("--json", action="store_true", help="print JSON (RVAs in hex) instead of the table")
@@ -267,6 +268,11 @@ def main(argv=None):
         result = fail_fast(data, set(args.imports) or None, set(args.dlls) or None)
     except (OSError, pe_inspect.PeFormatError) as e:
         print(f"{os.path.basename(sys.argv[0])}: {e}", file=sys.stderr)
+        return 2
+    missing = unmatched_selectors(data, args.imports, args.dlls)
+    if missing:
+        print(f"{os.path.basename(sys.argv[0])}: {os.path.basename(args.image)}: "
+              f"no import matches {', '.join(missing)}", file=sys.stderr)
         return 2
     imports = result["imports"]
     if args.json:

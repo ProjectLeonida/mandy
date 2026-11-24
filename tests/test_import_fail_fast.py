@@ -175,6 +175,58 @@ class ImportFailFastTest(unittest.TestCase):
         self.assertEqual(plain.splitlines()[-1], "1 of 3 import(s) called directly, 0 with a fatal result check, 0 fatal site(s)")
         self.assertEqual(len(every.splitlines()), 5)
 
+    def test_cli_refuses_a_malformed_selector(self):
+        """A bare DLL, a bare name or an empty half of --import, and a `DLL!NAME` given to --dll, select no import:
+        the run printed "0 of 0 import(s) called directly" and exited 0, which reads as "nothing here stops the title"."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "image.exe")
+            with open(path, "wb") as f:
+                f.write(self.data)
+            for argv in (["--import", "xmem.dll"], ["--import", "XMemFoo"], ["--import", "xmem.dll!"],
+                         ["--import", "!XMemFoo"], ["--dll", "xmem.dll!XMemFoo"], ["--dll", "!XMemFoo"]):
+                err = io.StringIO()
+                with self.assertRaises(SystemExit) as caught, contextlib.redirect_stderr(err):
+                    import_fail_fast.main([path, *argv])
+                self.assertEqual(caught.exception.code, 2, argv)
+                self.assertTrue(err.getvalue().strip(), argv)
+
+    def test_cli_refuses_a_well_formed_selector_this_image_does_not_have(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "image.exe")
+            with open(path, "wb") as f:
+                f.write(self.data)
+            for argv in (["--import", "xmem.dll!XMemFooo"], ["--import", "xmem!XMemFoo"],
+                         ["--dll", "xmem"], ["--dll", "other.dll"]):
+                for extra in ([], ["--json"], ["--all"]):
+                    code, out, err = run_cli(path, *argv, *extra)
+                    self.assertEqual((code, out), (2, ""), (argv, extra))
+                    self.assertIn(argv[0], err, argv)
+                    self.assertIn(argv[1].lower(), err.lower(), argv)
+
+    def test_cli_refuses_a_typo_beside_a_good_selector_without_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "image.exe")
+            with open(path, "wb") as f:
+                f.write(self.data)
+            code, out, err = run_cli(path, "--import", FOO, "--import", "xmem.dll!XMemFooo")
+            self.assertEqual((code, out), (2, ""))
+            self.assertIn("xmem.dll!XMemFooo", err)
+            self.assertNotIn(FOO + ",", err)
+            code, out, err = run_cli(path, "--dll", "xmem.dll", "--dll", "other.dll")
+            self.assertEqual((code, out), (2, ""))
+            self.assertIn("other.dll", err)
+
+    def test_cli_still_runs_valid_selectors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "image.exe")
+            with open(path, "wb") as f:
+                f.write(self.data)
+            for argv in (["--import", FOO], ["--import", "XMEM.DLL!XMEMBAR"], ["--import", ORD],
+                         ["--dll", "xmem.dll"], ["--dll", "XMEM.DLL", "--import", BAR]):
+                code, out, err = run_cli(path, *argv)
+                self.assertEqual((code, err), (0, ""), argv)
+                self.assertIn("import(s) called directly", out, argv)
+
     def test_cli_exits_2_for_a_missing_or_non_pe_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             code, out, err = run_cli(os.path.join(tmp, "missing.exe"))
