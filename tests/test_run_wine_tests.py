@@ -426,16 +426,23 @@ class DriveMapTest(unittest.TestCase):
         self.assertEqual(os.readlink(self.link), str(other))
         self.assertFalse(scratch.exists())
 
-    def test_failed_drive_setup_removes_scratch_directory(self):
+    def test_an_unwritable_prefix_is_noted_and_the_run_goes_on_unmapped(self):
         scratch = self.prefix / "scratch"
         scratch.mkdir()
         with mock.patch.object(rwt.tempfile, "mkdtemp", return_value=str(scratch)), \
-                mock.patch.object(rwt.os, "symlink", side_effect=PermissionError("link denied")):
-            with self.assertRaisesRegex(PermissionError, "link denied"):
-                with rwt.DriveMap(WINDOWS_ROOT, str(self.root), str(self.prefix)):
-                    self.fail("drive setup unexpectedly succeeded")
+                mock.patch.object(rwt.os, "symlink", side_effect=PermissionError(13, "Permission denied")):
+            with rwt.DriveMap(WINDOWS_ROOT, str(self.root), str(self.prefix)) as drive:
+                self.assertIn("cannot map drive d: Permission denied", drive.note)
+                self.assertIsNone(drive.link)
 
         self.assertFalse(scratch.exists())
+        self.assertFalse(os.path.lexists(self.link))
+
+    def test_a_scratch_folder_that_cannot_be_made_is_noted_too(self):
+        with mock.patch.object(rwt.tempfile, "mkdtemp", side_effect=OSError(28, "No space left on device")):
+            with rwt.DriveMap(WINDOWS_ROOT, str(self.root), str(self.prefix)) as drive:
+                self.assertIn("cannot map drive d: No space left on device", drive.note)
+                self.assertIsNone(drive.scratch)
         self.assertFalse(os.path.lexists(self.link))
 
     def test_no_prefix_or_no_drive_letter_maps_nothing(self):

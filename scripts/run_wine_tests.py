@@ -67,7 +67,8 @@ class DriveMap:
     <root>/runtime/build/generated/x.spv. The drive is a dosdevices link to a scratch folder holding a/Leonida/Leonida
     as a link to the root. If the Windows checkout is the drive root itself, the drive links directly to the
     Linux checkout. Temporary links and scratch folders are removed afterwards. A drive the prefix already has
-    (c:, z:, or one set up by hand) is left alone, and so is a root without an absolute drive path.
+    (c:, z:, or one set up by hand) is left alone, and so is a root without an absolute drive path. A prefix that
+    cannot take the link (read-only, permission denied) also leaves the drive unmapped; the note says why.
     """
 
     def __init__(self, windows_root: str, root: str, prefix: str):
@@ -104,6 +105,10 @@ class DriveMap:
                 self.note = already_set
                 return self
             self.link = link
+        except OSError as e:
+            # A read-only or otherwise unwritable prefix: run the tests without the drive, and say so.
+            self.note = f"cannot map drive {drive}: {e.strerror or e}: the run goes on without it"
+            return self
         finally:
             # __exit__ only runs after a successful __enter__.
             if self.link is None and self.scratch is not None:
