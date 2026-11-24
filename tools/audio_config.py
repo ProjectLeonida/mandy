@@ -127,7 +127,10 @@ def scan(blob, min_ms=MIN_MS, max_ms=MAX_MS):
     end = len(blob) - 20
     pos = 4
     while pos <= end:  # a marker with exactly 20 bytes after it is complete
-        record = blob[pos:pos + 2] == MARKER_1 and _record_at(blob, pos, pos, min_ms, max_ms)
+        pos = blob.find(MARKER_1, pos, end + 2)
+        if pos < 0:
+            break
+        record = _record_at(blob, pos, pos, min_ms, max_ms)
         if not record:
             pos += 1
             continue
