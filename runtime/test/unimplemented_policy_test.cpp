@@ -231,6 +231,17 @@ void test_classification() {
     check(cls("gameinput.dll", "GameInputCreate") == ReturnClass::HResult, "GameInputCreate is hresult");
     check(cls("dstorage_xs.dll", "DStorageGetFactory") == ReturnClass::HResult,
           "the console dstorage name is hresult");
+    check(cls("XCRDAPI.dll", "DStorageGetFactory") == ReturnClass::HResult,
+          "the retail spelling XCRDAPI.dll is hresult, case-insensitively");
+    check(cls("dstorage.dll", "DStorageGetFactory") == ReturnClass::HResult, "the PC dstorage name is hresult");
+    check(cls("xcrdapi.dll", "DStorageGetFactoryLeonidaPolicyProbe") == ReturnClass::Other,
+          "another xcrdapi import is other");
+    for (const char* name : {"XApuConnect", "XApuDequeueResult", "XApuDisconnect", "XApuEnqueueCommand"})
+        check(cls("xapu.dll", name) == ReturnClass::HResult, name);
+    check(cls("xapu.dll", "XApuGetResultCount") == ReturnClass::Other, "XApuGetResultCount returns uint32_t");
+    for (const char* name : {"XDspActivate", "XDspConnectWithMaximumStreamLimit", "XDspDeactivate", "XDspDisconnect",
+                             "XDspSubmitCommand"})
+        check(cls("chad.dll", name) == ReturnClass::HResult, name);
     check(cls("xg_xs.dll", "XGCreateTexture2DComputer") == ReturnClass::Other, "unmeasured xg_xs import is other");
     check(cls("acphal.dll", "AcpHalCreate") == ReturnClass::HResult, "AcpHalCreate is hresult");
     check(cls("acphal.dll", "ApuFree") == ReturnClass::Other, "ApuFree returns void");

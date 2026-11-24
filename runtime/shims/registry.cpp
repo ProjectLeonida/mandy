@@ -84,6 +84,7 @@ std::vector<Lookup> g_lookups;
 //  xcrdapi.dll               functions/dstoragegetfactory). dstorage_xs.dll is the console name; xcrdapi.dll is a
 //                            console module the title may import it from (docs/directstorage.md). dstorage.cpp serves
 //                            it; the class is kept for a build without that shim.
+//  xapu.dll, chad.dll        the HRESULT returns of the shims in xapu_chad.cpp; XApuGetResultCount returns uint32_t.
 const char* const kNotHResult[] = {
     "XAsyncCancel", "XAsyncComplete",
     "XTaskQueueCloseHandle", "XTaskQueueDispatch", "XTaskQueueGetCurrentProcessTaskQueue",
@@ -120,6 +121,14 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
         if (name == "AcpHalAllocateShapeContexts" || name == "AcpHalCreate" ||
             name == "AcpHalReleaseShapeContexts" || name == "ApuAlloc" ||
             name == "ApuCreateHeap")
+            return ReturnClass::HResult;
+    } else if (dll == "xapu.dll") {
+        if (name == "XApuConnect" || name == "XApuDequeueResult" || name == "XApuDisconnect" ||
+            name == "XApuEnqueueCommand")
+            return ReturnClass::HResult;
+    } else if (dll == "chad.dll") {
+        if (name == "XDspActivate" || name == "XDspConnectWithMaximumStreamLimit" || name == "XDspDeactivate" ||
+            name == "XDspDisconnect" || name == "XDspSubmitCommand")
             return ReturnClass::HResult;
     } else if (dll == "xgameruntime.dll") {
         if (name == "XGameRuntimeInitialize" || name == "XGameEventWrite") return ReturnClass::HResult;
