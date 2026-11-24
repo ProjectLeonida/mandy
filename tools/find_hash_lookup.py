@@ -59,7 +59,7 @@ def sections(data):
     pe = struct.unpack_from("<I", data, 0x3C)[0]
     if data[pe:pe + 4] != b"PE\0\0":
         raise ValueError("no PE signature")
-    if len(data) < pe + 22:
+    if len(data) < pe + 24:
         raise ValueError("truncated PE file (no COFF header): an encrypted or packed executable can't be scanned")
     count, opt_size = struct.unpack_from("<H12xH", data, pe + 6)
     first = pe + 24 + opt_size

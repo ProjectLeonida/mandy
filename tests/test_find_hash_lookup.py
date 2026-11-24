@@ -95,6 +95,13 @@ class FindHashLookupTest(unittest.TestCase):
             fhl.sections(full[:0x40 + 10])  # PE signature present, COFF header cut off
         with self.assertRaises(ValueError):
             fhl.sections(full[:0x154 + 20])  # section table cut off mid-record
+        zero = bytearray(pe(b"\x90"))
+        struct.pack_into("<H", zero, 0x46, 0)  # no sections: the short header must still be refused
+        with self.assertRaises(ValueError):
+            fhl.sections(bytes(zero[:0x40 + 22]))
+        with self.assertRaises(ValueError):
+            fhl.sections(bytes(zero[:0x40 + 23]))
+        self.assertEqual(fhl.sections(bytes(zero)), [])
 
     def test_cli_writes_the_report_and_fails_cleanly(self):
         data, lookup, _ = image()
