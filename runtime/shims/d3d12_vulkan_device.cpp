@@ -3104,11 +3104,18 @@ public:
 // subobject that is absent takes the runtime's default (the CD3DX12 defaults: depth test on with LESS, back-face
 // culling, no blending, sample mask 0xFFFFFFFF, one sample). A type given twice, a truncated stream or an unknown
 // type is E_INVALIDARG, as on the PC runtime; state this layer cannot honour yet is E_NOTIMPL with a log.
+struct GraphicsStreamExtras {
+    bool separate_stencil_masks = false;
+    UINT8 back_stencil_read_mask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    UINT8 back_stencil_write_mask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+};
+
 struct PipelineStream {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics{};
     D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
     D3D12_SHADER_BYTECODE ms{};
     D3D12_SHADER_BYTECODE as{};
+    GraphicsStreamExtras extras{};
     bool has_cs = false;
     bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
 };
@@ -3236,18 +3243,17 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
                 log_once("depth-bounds tests are not supported yet; stream subobject", int(type));
                 return E_NOTIMPL;
             }
-            // Separate front and back stencil masks are not modelled (one read and one write mask per PSO).
-            if (d.StencilEnable && (d.FrontFace.StencilReadMask != d.BackFace.StencilReadMask ||
-                                    d.FrontFace.StencilWriteMask != d.BackFace.StencilWriteMask)) {
-                log_once("separate front and back stencil masks are not supported yet; stream subobject", int(type));
-                return E_NOTIMPL;
-            }
             const auto face = [](const D3D12_DEPTH_STENCILOP_DESC1& f) {
                 return D3D12_DEPTH_STENCILOP_DESC{f.StencilFailOp, f.StencilDepthFailOp, f.StencilPassOp, f.StencilFunc};
             };
             g.DepthStencilState = {d.DepthEnable, d.DepthWriteMask, d.DepthFunc, d.StencilEnable,
                                    UINT8(d.FrontFace.StencilReadMask), UINT8(d.FrontFace.StencilWriteMask),
                                    face(d.FrontFace), face(d.BackFace)};
+            out.extras.separate_stencil_masks =
+                d.StencilEnable && (d.FrontFace.StencilReadMask != d.BackFace.StencilReadMask ||
+                                    d.FrontFace.StencilWriteMask != d.BackFace.StencilWriteMask);
+            out.extras.back_stencil_read_mask = UINT8(d.BackFace.StencilReadMask);
+            out.extras.back_stencil_write_mask = UINT8(d.BackFace.StencilWriteMask);
             break;
         }
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1:
@@ -3389,7 +3395,8 @@ public:
     // no VS, no vertex input or input assembly (the input layout, topology type and strip cut are ignored, as D3D12
     // does for mesh PSOs), drawn by DispatchMesh. An AS (amplification shader) is refused: the game has none.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
-                            const D3D12_SHADER_BYTECODE* as = nullptr) {
+                            const D3D12_SHADER_BYTECODE* as = nullptr,
+                            const GraphicsStreamExtras* extras = nullptr) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
@@ -3777,8 +3784,12 @@ public:
         depth.depthWriteEnable = ds.DepthEnable && ds.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
         depth.depthCompareOp = compare_op(ds.DepthFunc);
         depth.stencilTestEnable = ds.StencilEnable;
+        const UINT8 back_read_mask =
+            extras && extras->separate_stencil_masks ? extras->back_stencil_read_mask : ds.StencilReadMask;
+        const UINT8 back_write_mask =
+            extras && extras->separate_stencil_masks ? extras->back_stencil_write_mask : ds.StencilWriteMask;
         depth.front = stencil_face(ds.FrontFace, ds.StencilReadMask, ds.StencilWriteMask);
-        depth.back = stencil_face(ds.BackFace, ds.StencilReadMask, ds.StencilWriteMask);
+        depth.back = stencil_face(ds.BackFace, back_read_mask, back_write_mask);
 
         std::vector<VkPipelineColorBlendAttachmentState> blends(desc.NumRenderTargets);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
@@ -6184,8 +6195,9 @@ public:
         if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return d3d12_trace::result(method, hr);
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
-        const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
-                                         : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as);
+        const HRESULT hr = stream.has_cs
+                               ? pipeline->create_compute(stream.compute)
+                               : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as, &stream.extras);
         if (FAILED(hr)) {
             pipeline->Release();
             return d3d12_trace::result(method, hr);

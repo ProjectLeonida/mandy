@@ -2107,8 +2107,9 @@ The trace will enumerate them.
     a VS stream builds the same PSO as the classic call.
   - `E_INVALIDARG`, as on the PC runtime: a type given twice, an unknown type, a truncated stream, MS with VS,
     tessellation or GS, CS with a graphics stage, or no stage at all.
-  - `E_NOTIMPL` with a log, for what is not built yet: an AS, a depth-bounds test, separate front and back stencil
-    masks, view instancing.
+  - `E_NOTIMPL` with a log, for what is not built yet: an AS, a depth-bounds test, view instancing
+    (`DEPTH_STENCIL2`'s separate front and back stencil read/write masks map to `depth.front` / `depth.back`
+    `compareMask` and `writeMask`).
   - `RASTERIZER1`/`2`'s float depth bias is truncated to the integer the PSO path takes, with a log.
 - **Mesh PSO:** the MS (`ms` index entry by FSSM hash) and PS on the mesh stage. It has no vertex input or input
   assembly; the input layout, topology type and strip cut are ignored, as D3D12 ignores them for mesh PSOs. Topology

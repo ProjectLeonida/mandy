@@ -748,6 +748,76 @@ bool layer_checks(ID3D12Device* device, const std::vector<std::uint8_t>& vs, con
             return false;
         }
     }
+
+    // DEPTH_STENCIL2 stream subobject with distinct FrontFace and BackFace stencil masks succeeds and draws.
+    {
+        Rig r;
+        CHECK(r.init(device, vs, ps));
+        Ref<ID3D12Device2> dev2;
+        CHECK(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dev2.p))));
+        struct alignas(void*) SubRootSig {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+            ID3D12RootSignature* v = nullptr;
+        };
+        struct alignas(void*) SubShader {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t{};
+            D3D12_SHADER_BYTECODE v{};
+        };
+        struct alignas(void*) SubInput {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT;
+            D3D12_INPUT_LAYOUT_DESC v{};
+        };
+        struct alignas(void*) SubRtv {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
+            D3D12_RT_FORMAT_ARRAY v{};
+        };
+        struct alignas(void*) SubDs2 {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2;
+            D3D12_DEPTH_STENCIL_DESC2 v{};
+        };
+        const D3D12_INPUT_ELEMENT_DESC elems[2] = {
+            {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        };
+        struct Stream {
+            SubRootSig rs;
+            SubShader vs;
+            SubShader ps;
+            SubInput ia;
+            SubRtv rtv;
+            SubDs2 ds2;
+        } s{};
+        s.rs.v = r.root1.p;
+        s.vs = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs.data(), vs.size()}};
+        s.ps = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {ps.data(), ps.size()}};
+        s.ia.v = {elems, 2};
+        s.rtv.v.NumRenderTargets = 1;
+        s.rtv.v.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        s.ds2.v.DepthEnable = FALSE;
+        s.ds2.v.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        s.ds2.v.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        s.ds2.v.StencilEnable = TRUE;
+        s.ds2.v.FrontFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                             D3D12_COMPARISON_FUNC_ALWAYS, 0x55, 0x0f};
+        s.ds2.v.BackFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                            D3D12_COMPARISON_FUNC_ALWAYS, 0xaa, 0xf0};
+        const D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(s), &s};
+        Ref<ID3D12PipelineState> ds2_pso;
+        CHECK(SUCCEEDED(dev2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&ds2_pso.p))));
+        std::string grid_text;
+        HRESULT close = S_OK;
+        CHECK(r.render([&](Rig& rig, ID3D12GraphicsCommandList* l) {
+            rig.targets(l);
+            l->SetPipelineState(ds2_pso.p);
+            l->SetGraphicsRootSignature(rig.root1.p);
+            rig.vertices(l, vb_quad);
+            rig.offset(l, 0, 0);
+            rig.tint(l, tint_red);
+            l->IASetPrimitiveTopology(strip);
+            l->DrawInstanced(4, 1, 0, 0);
+        }, grid_text, close));
+        CHECK(close == S_OK && grid_text == ROWS4("RRRRBBBB") " " BLANK4);
+    }
     return true;
 }
 
