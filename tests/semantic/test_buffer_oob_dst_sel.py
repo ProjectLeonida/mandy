@@ -105,7 +105,10 @@ class OobTypedLoadDstSelTests(unittest.TestCase):
             with self.subTest(code=code):
                 pcs = [0, 0, 16, OUT_V, BASE, 0, 16, word3(code, DST_X_0_1_1)] + [0] * 24
                 mem, _ = self._run_cs(lines, push_constants=pcs)
-                self.assertEqual(bool(mem.reads), code == 20)
+                if code == 20:
+                    self.assertIn(BASE, mem.reads)
+                else:
+                    self.assertEqual(mem.reads, [])
                 self.assertEqual([dict.get(mem, i, 0) for i in (0, 4, 8, 12)],
                                  [0x3F000000 if code == 20 else 0, 0, 1, 1])
 
