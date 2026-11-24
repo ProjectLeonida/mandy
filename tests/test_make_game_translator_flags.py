@@ -217,6 +217,9 @@ class MainWiringTest(unittest.TestCase):
         self.assertEqual(pre, ("--no-float-controls", "--bary-fallback", "--mesh-compute"))
         self.assertEqual(sh, pre)
 
+    def test_compact_spirv_reaches_the_shaders_stage(self):
+        self.assertEqual(self.run_main("--compact-spirv"), (("--compact-spirv",),) * 2)
+
     def test_no_flags_by_default(self):
         pre, sh = self.run_main()
         self.assertEqual(pre, ())
