@@ -239,18 +239,35 @@ class BufferAtomicFminmax(unittest.TestCase):
 
 class AtomicNaturalAlignment(unittest.TestCase):
     def test_raw_atomic_soffset_only(self):
-        # No vaddr. The same backed word is in range at N=8 and out of range at N=7.
-        for num_bytes, old_value, stored_value in ((8, 19, 22), (7, 0, 19)):
-            with self.subTest(num_bytes=num_bytes):
-                body = buf_rsrc_lines(TARGET, 0, num_bytes, RAW_W3) + [
-                    "s_mov_b32 s12, 4",
-                    "v_mov_b32_e32 v2, 3",
-                    "buffer_atomic_add v2, off, s[8:11], s12 glc",
-                    "s_waitcnt vmcnt(0)",
-                ] + out_store_lines("v2")
-                mem = run(body, {TARGET: SENTINEL, TARGET + 4: 19})
-                self.assertEqual((mem[TARGET], mem[TARGET + 4], mem[OUT]),
-                                 (SENTINEL, stored_value, old_value))
+        # No vaddr and no instruction offset: the address and the raw bound (offset + soffset + size > NUM_RECORDS,
+        # docs/buffer_bounds.md) come from soffset alone, in each atomic lowering: 32-bit integer, float min/max
+        # and 64-bit _x2. The same backed element is in range at N = soffset + size and out of range one byte short.
+        one, two = 0x3F800000, 0x40000000
+        for op, soffset, data, before, after in (
+            ("add", 4, (3,), (19,), (22,)),
+            ("fmax", 4, (two,), (one,), (two,)),
+            ("swap_x2", 8, (5, 6), (19, 20), (5, 6)),
+        ):
+            n = len(data)
+            reg = "v2" if n == 1 else "v[2:3]"
+            for num_bytes in (soffset + 4 * n, soffset + 4 * n - 1):
+                with self.subTest(op=op, num_bytes=num_bytes):
+                    in_range = num_bytes == soffset + 4 * n
+                    body = buf_rsrc_lines(TARGET, 0, num_bytes, RAW_W3) + [
+                        f"s_mov_b32 s12, {soffset}",
+                        *(f"v_mov_b32_e32 v{2 + i}, {word:#x}" for i, word in enumerate(data)),
+                        f"buffer_atomic_{op} {reg}, off, s[8:11], s12 glc",
+                        "s_waitcnt vmcnt(0)",
+                    ] + out_store_lines(reg, count=n)
+                    memory = {TARGET + 4 * i: SENTINEL for i in range(soffset // 4)}
+                    memory.update({TARGET + soffset + 4 * i: word for i, word in enumerate(before)})
+                    mem = run(body, memory)
+                    self.assertEqual([mem[TARGET + 4 * i] for i in range(soffset // 4)],
+                                     [SENTINEL] * (soffset // 4))
+                    self.assertEqual(tuple(mem[TARGET + soffset + 4 * i] for i in range(n)),
+                                     after if in_range else before)
+                    self.assertEqual(tuple(mem[OUT + 4 * i] for i in range(n)),
+                                     before if in_range else (0,) * n)
 
     def test_buffer_atomic_32bit_alignment(self):
         # Measured natively on gfx1036 (wave32 & wave64): (addr & 3) != 0 drops the atomic;
