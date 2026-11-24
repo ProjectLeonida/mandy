@@ -13,7 +13,14 @@ f16 at byte 16 + 12 i. Both go through the same slab test in tools/rdna2spirv.py
 import struct
 import unittest
 
-from support import mrt0_words, translate_lines
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from support import mrt0_words, translate_lines  # noqa: E402
 
 INF_WORD = 0x7F800000
 MISS = 0xFFFFFFFF

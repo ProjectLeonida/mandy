@@ -16,11 +16,16 @@ import shlex
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 
-import support
-import rdna2spirv
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import rdna2spirv  # noqa: E402
 
 PS_EPILOGUE = ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"]
 CS_EPILOGUE = ["s_endpgm"]

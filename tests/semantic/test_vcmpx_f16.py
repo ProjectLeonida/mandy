@@ -8,8 +8,15 @@ adds bit 29 (VCC kept, 1) next to bit 30 (marker) and bit 28 (a v_cmpx cannot wi
 """
 import unittest
 
-import support
-from test_vcmp_f16 import reference_words
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+from test_vcmp_f16 import reference_words  # noqa: E402
 
 EXPECTED_E32 = [0x68A12080, 0x6CE9B1A2, 0x6BA72C98, 0x6FEFBDBA]      # derivation in ps_vcmpx_f16.asm
 EXPECTED_E64 = [0x64C11100, 0x6CF171C1, 0x67C71D18, 0x6FF77DD9]      # derivation in ps_vcmpx_f16_e64.asm

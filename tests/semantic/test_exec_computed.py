@@ -10,8 +10,12 @@ import os
 import sys
 import unittest
 
-import support
-import spirv_mini_interp as si
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
 
 
 class ExecComputed(unittest.TestCase):

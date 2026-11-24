@@ -9,8 +9,15 @@ a source lane that is on gives its value whatever FI / BOUND_CTRL are.
 import struct
 import unittest
 
-import support
-import spirv_mini_interp as si
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
 
 # 4 user SGPRs (the output V#), 32x1x1 threads: build.py's default header with a 32-wide group.
 FSSM = bytearray(0x148)

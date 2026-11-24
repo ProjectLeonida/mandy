@@ -6,9 +6,15 @@ run on the GPU by check.py and run_gpu_tests.py); its header derives the four wo
 plain Python on the same operand pairs.
 """
 import operator
+import os
+import sys
 import unittest
 
-import support
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
 
 EXPECTED = [0x963E52E8, 0x984DCEE8, 0xB9458EE8, 0xB73612E8]      # derivation in ps_vcmp_int32.asm
 HEAP = (1, 0, 0x80000000, 0x12345678, 3, 5, 0, 0)

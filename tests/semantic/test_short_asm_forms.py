@@ -12,7 +12,14 @@ Standard library only; no GPU, no game files.
 """
 import unittest
 
-import support
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
 
 TAIL = ["exp mrt0 v10, v11, v12, v13 done vm", "s_endpgm"]
 

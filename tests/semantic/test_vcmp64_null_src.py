@@ -1,10 +1,16 @@
 """RDNA2 null reads zero in either 64-bit integer VALU compare source."""
 import itertools
+import os
 import struct
+import sys
 import unittest
 
-import support
-import spirv_mini_interp as si
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
 
 CONDITIONS = ("eq", "ne", "lt", "le", "gt", "ge")
 VALUES = (0, 1, 1 << 32, 1 << 63, (1 << 64) - 1)

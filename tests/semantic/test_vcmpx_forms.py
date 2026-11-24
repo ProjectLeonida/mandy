@@ -15,11 +15,17 @@ Three kinds of test, all through tools/rdna2spirv.py and tests/semantic/spirv_mi
   * a wave of 16 lanes with different operands, one of them switched off beforehand: the lanes left running.
 """
 import itertools
+import os
 import struct
+import sys
 import unittest
 
-import support
-import spirv_mini_interp as si
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
 
 EXPECTED = [0xF05B2A48, 0xF05E8A12, 0xB174BE18, 0x15550000]      # derivation in ps_vcmpx_forms.asm
 # NaN, 1.0, 2.0, -0.0, +0.0, -infinity, two unused words; then four pairs (A, B) as A.lo A.hi B.lo B.hi.

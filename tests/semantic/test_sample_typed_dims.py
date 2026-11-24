@@ -14,10 +14,15 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
-import support
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
 
 DESC = "s[8:15], s[16:19]"
 PRO = ["v_mov_b32 v4, 1.0", "v_mov_b32 v5, 0.5", "v_mov_b32 v6, 0.25", "v_mov_b32 v7, 0.75",

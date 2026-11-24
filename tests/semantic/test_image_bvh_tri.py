@@ -23,7 +23,14 @@ CPU walker on the real-BVH first call, so this case also pins the `<< 8`, not a 
 import struct
 import unittest
 
-from support import mrt0_words, translate_lines
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from support import mrt0_words, translate_lines  # noqa: E402
 
 INF = float("inf")
 SLOTS = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0), (0.5, 2, 0)]

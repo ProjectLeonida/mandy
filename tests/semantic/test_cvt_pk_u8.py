@@ -3,7 +3,11 @@ import os
 import sys
 import unittest
 
-import support
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
 
 sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
 from check import CVT_PK_U8_WORDS

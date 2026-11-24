@@ -9,8 +9,15 @@ written and as llvm-mc prints them; pixel and compute stages) found no other cra
 """
 import unittest
 
-import support
-import rdna2spirv
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import rdna2spirv  # noqa: E402
 
 CASES = (
     "image_sample off, v[1:2], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D slc",

@@ -10,7 +10,14 @@ import struct
 import unittest
 from fractions import Fraction
 
-import support
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
 
 
 def value(h):

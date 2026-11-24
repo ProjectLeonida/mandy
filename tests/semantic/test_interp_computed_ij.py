@@ -27,8 +27,15 @@ comment 7076614458); the classification and counts are in docs/design.md's SHADE
 import struct
 import unittest
 
-import support
-import rdna2spirv
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import rdna2spirv  # noqa: E402
 
 # Barycentric weights of vertices 0, 1, 2 as Vulkan hands them over ((k, i, j); AMD's i, j are .y/.z).
 BARY = (0.25, 0.25, 0.5)

@@ -20,7 +20,11 @@ import sys
 import tempfile
 import unittest
 
-import support
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
 
 TOOLS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "tools"))
 if TOOLS_DIR not in sys.path:

@@ -25,9 +25,13 @@ import tempfile
 import unittest
 import warnings
 
-import support
-import rdna2spirv
-import bary_fallback_gs
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import rdna2spirv  # noqa: E402
+import bary_fallback_gs  # noqa: E402
 
 I, J = 0.3125, 0.4375          # exact in binary32, i + j < 1
 ATTR0 = (0.75, 0.5, 0.0, 1.0)

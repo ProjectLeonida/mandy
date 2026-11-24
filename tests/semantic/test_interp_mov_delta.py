@@ -10,8 +10,15 @@ only; no game files.
 import struct
 import unittest
 
-import support
-import rdna2spirv
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import rdna2spirv  # noqa: E402
 
 BARY = (0.25, 0.25, 0.5)
 VERTS0 = ((1.0, 10.0, 100.0, -1.0), (3.0, 14.0, 107.5, 2.0), (6.0, 19.0, 115.25, -4.0))

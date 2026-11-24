@@ -3,7 +3,14 @@ from fractions import Fraction
 import struct
 import unittest
 
-import support
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
 
 M32 = 0xFFFFFFFF
 

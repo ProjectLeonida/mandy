@@ -1,8 +1,15 @@
 """Regression fixture for a per-draw handle word selecting an eight-word image descriptor."""
 import unittest
 
-from spirv_mini_interp import run_fragment
-from support import translate_lines
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from spirv_mini_interp import run_fragment  # noqa: E402
+from support import translate_lines  # noqa: E402
 
 
 class MaterialHandleTests(unittest.TestCase):

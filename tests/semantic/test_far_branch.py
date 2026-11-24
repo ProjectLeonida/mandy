@@ -7,11 +7,15 @@ four words by hand. The reference here runs the same loops in plain Python on th
 """
 import os
 import re
+import sys
 import unittest
 
-import support
-
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+
 ROOT = os.path.dirname(os.path.dirname(HERE))
 FIXTURE = os.path.join(HERE, "fixtures", "disasm", "ps_far_branch.s")
 ASM = os.path.join(ROOT, "runtime", "test", "shaders", "ps_far_branch.asm")
