@@ -807,13 +807,21 @@ def main() -> int:
                  "Vulkan headers (vulkan-headers on Arch) and configure again.")
     a.build = resolved_build
 
-    work = a.work or tempfile.mkdtemp(prefix="leonida_gpu_tests_")
+    work = a.work
     try:
-        try:
+        if work is None:
+            work = tempfile.mkdtemp(prefix="leonida_gpu_tests_")
+        else:
             os.makedirs(work, exist_ok=True)
-        except OSError as exc:      # the same report run_suite gives for its own folders (#4544)
+    except OSError as exc:
+        if work is None:
+            print(f"error: cannot create a temporary GPU test directory: {exc}. "
+                  "Pass --work with a writable directory.", file=sys.stderr)
+        else:
             print(f"error: cannot prepare GPU test directory {work}: {exc.strerror or exc}", file=sys.stderr)
-            return 2
+        return 2
+
+    try:
         native = native_folder(work)
         if native is None:
             print(f"error: the work folder {ascii(work)} has characters outside this PC's ANSI code page and no 8.3 "
