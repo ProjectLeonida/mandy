@@ -47,15 +47,16 @@ inline QueueFamilies pick_queue_families(std::span<const VkQueueFamilyProperties
     return out;
 }
 
-// A D3D12 COPY/COMPUTE queue may call UpdateTileMappings at any time. Vulkan binds sparse
-// pages on the VkQueue itself, so a family without SPARSE_BINDING cannot back that D3D12
-// queue when reserved buffers are offered. Use the graphics family (already checked for
-// sparse support by the device) rather than submitting an invalid vkQueueBindSparse.
-// Kept separate from the preference-only picker so devices without sparse resources keep
-// their dedicated async families unchanged.
+inline bool supports_sparse_tile_aliasing(const VkPhysicalDeviceFeatures& features,
+                                          const VkPhysicalDeviceSparseProperties& properties) {
+    return features.sparseBinding && features.sparseResidencyAliased && properties.residencyNonResidentStrict;
+}
+
 inline QueueFamilies sparse_capable_queue_families(std::span<const VkQueueFamilyProperties> families,
-                                                  QueueFamilies chosen, bool sparse_buffers) {
-    if (!sparse_buffers || chosen.direct >= families.size() ||
+                                                   QueueFamilies chosen, const VkPhysicalDeviceFeatures& features,
+                                                   const VkPhysicalDeviceSparseProperties& properties) {
+    if (!supports_sparse_tile_aliasing(features, properties) ||
+        !(features.sparseResidencyBuffer || features.sparseResidencyImage2D) || chosen.direct >= families.size() ||
         !(families[chosen.direct].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT))
         return chosen;
     if (chosen.compute >= families.size() ||

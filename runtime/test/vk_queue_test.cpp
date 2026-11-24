@@ -130,30 +130,41 @@ int check_picker() {
         const auto q = pick_queue_families(f, 0);
         EXPECT(q.copy == 2);
     }
-    // D3D12 tile mapping is legal on all queue kinds. Dedicated async queues that cannot
-    // bind sparse pages must use the graphics family when sparse buffers are offered.
+    VkPhysicalDeviceFeatures sparse_buffers{};
+    sparse_buffers.sparseBinding = VK_TRUE;
+    sparse_buffers.sparseResidencyAliased = VK_TRUE;
+    sparse_buffers.sparseResidencyBuffer = VK_TRUE;
+    VkPhysicalDeviceSparseProperties strict_residency{};
+    strict_residency.residencyNonResidentStrict = VK_TRUE;
     {
         constexpr VkQueueFlags S = VK_QUEUE_SPARSE_BINDING_BIT;
         const std::array f{fam(G | S), fam(T), fam(C)};
         const auto preferred = pick_queue_families(f, 0);
         EXPECT(preferred.compute == 2 && preferred.copy == 1);
-        const auto corrected = sparse_capable_queue_families(f, preferred, true);
+        const auto corrected = sparse_capable_queue_families(f, preferred, sparse_buffers, strict_residency);
         EXPECT(corrected.direct == 0 && corrected.compute == 0 && corrected.copy == 0);
-        const auto no_sparse = sparse_capable_queue_families(f, preferred, false);
+        auto sparse_images = sparse_buffers;
+        sparse_images.sparseResidencyBuffer = VK_FALSE;
+        sparse_images.sparseResidencyImage2D = VK_TRUE;
+        const auto image_only = sparse_capable_queue_families(f, preferred, sparse_images, strict_residency);
+        EXPECT(image_only.direct == 0 && image_only.compute == 0 && image_only.copy == 0);
+        const auto non_strict = sparse_capable_queue_families(f, preferred, sparse_images, {});
+        EXPECT(non_strict.compute == 2 && non_strict.copy == 1);
+        const auto no_sparse = sparse_capable_queue_families(f, preferred, {}, strict_residency);
         EXPECT(no_sparse.compute == 2 && no_sparse.copy == 1);
     }
     {
         constexpr VkQueueFlags S = VK_QUEUE_SPARSE_BINDING_BIT;
         const std::array f{fam(G | S), fam(T | S), fam(C | S)};
         const auto preferred = pick_queue_families(f, 0);
-        const auto corrected = sparse_capable_queue_families(f, preferred, true);
+        const auto corrected = sparse_capable_queue_families(f, preferred, sparse_buffers, strict_residency);
         EXPECT(corrected.compute == 2 && corrected.copy == 1);  // preserve dedicated queues
     }
     {
         constexpr VkQueueFlags S = VK_QUEUE_SPARSE_BINDING_BIT;
         const std::array f{fam(G | S), fam(T), fam(C | S)};
         const auto preferred = pick_queue_families(f, 0);
-        const auto corrected = sparse_capable_queue_families(f, preferred, true);
+        const auto corrected = sparse_capable_queue_families(f, preferred, sparse_buffers, strict_residency);
         EXPECT(corrected.compute == 2 && corrected.copy == 0);  // mixed capabilities
     }
     std::printf("queue family picker: 7 layouts ok\n");

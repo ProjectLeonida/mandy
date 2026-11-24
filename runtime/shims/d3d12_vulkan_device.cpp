@@ -5237,8 +5237,8 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: VK_EXT_debug_utils entry points missing; debug markers are off\n");
         }
 
-        const bool sparse_aliasing = state_.context->vk.vkQueueBindSparse && info.features.sparseBinding &&
-            info.features.sparseResidencyAliased && properties.sparseProperties.residencyNonResidentStrict &&
+        const bool sparse_aliasing = state_.context->vk.vkQueueBindSparse &&
+            leonida::supports_sparse_tile_aliasing(info.features, properties.sparseProperties) &&
             info.queue_family < family_count && (families[info.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT);
         state_.sparse_image_tiles = sparse_aliasing && info.features.sparseResidencyImage2D &&
                                     state_.context->vk.vkGetImageSparseMemoryRequirements;
@@ -9613,14 +9613,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         queue_infos.push_back(q);
     }
     const auto preferred = leonida::pick_queue_families(families, info.queue_family);
-    // D3D12 permits UpdateTileMappings on DIRECT, COMPUTE and COPY queues. Vulkan requires
-    // VK_QUEUE_SPARSE_BINDING_BIT on the VkQueue passed to vkQueueBindSparse. A dedicated
-    // async family without that capability cannot implement all D3D12 queue operations;
-    // fall back to the graphics family when sparse buffers are supported. QueueKind still
-    // enforces the D3D12 COPY/COMPUTE stage restrictions on the more capable family.
-    const bool sparse_buffers = chosen_features.sparseBinding && chosen_features.sparseResidencyBuffer &&
-                                chosen_features.sparseResidencyAliased;
-    auto picked = leonida::sparse_capable_queue_families(families, preferred, sparse_buffers);
+    auto picked = leonida::sparse_capable_queue_families(families, preferred, chosen_features,
+                                                        chosen.sparseProperties);
     if (graphics_family_only(queue_test_settings)) picked = {info.queue_family, info.queue_family, info.queue_family};
     std::uint32_t compute_count = 0, copy_count = 0;
     if (picked.compute != info.queue_family) {
