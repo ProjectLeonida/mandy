@@ -178,13 +178,15 @@ class FormatDecodeTableTests(unittest.TestCase):
             expected = tuple(expect_sel(want4, code, s, True) for s in sels) + (0,)
             self.assertEqual(got, expected, f"xyz format {code}")
 
-        # 2) All 8 DST_SEL values (0..7) on _x in-bounds and out-of-bounds for both float (unorm 1) and uint (2)
+        # 2) All 8 DST_SEL values (0..7) on _x in-bounds and out-of-bounds for both float (unorm 1) and uint (2).
+        #    Also set DST_SEL_Y = 5 (odd) so an over-wide 4-bit extract of DST_SEL_X would pull in bit 0 of DST_SEL_Y
+        #    and corrupt selectors 0..3 (catching 3->4 field-width mutations on OpBitFieldUExtract).
         for code in (1, 2, 76, 127):
             want4 = reference(code)
             for in_bounds in (True, False):
                 voff = "0" if in_bounds else "0x200"
                 for sel in range(8):
-                    d3 = (code << 12) | 0x30000000 | sel
+                    d3 = (code << 12) | 0x30000000 | sel | (5 << 3)
                     lines = [f"s_mov_b32 s0, {BASE:#x}", "s_mov_b32 s1, 0", "s_mov_b32 s2, 0x100",
                              f"s_mov_b32 s3, {d3:#x}", f"v_mov_b32 v1, {voff}",
                              "v_mov_b32 v2, 0", "v_mov_b32 v3, 0", "v_mov_b32 v4, 0", "v_mov_b32 v5, 0",
