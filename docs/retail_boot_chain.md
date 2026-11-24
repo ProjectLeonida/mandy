@@ -14,10 +14,10 @@ stand-ins named below (not pull requests yet). Own 1.0.2.1 copy, Windows 11, RTX
 
 | # | Stop | What clears it |
 |---|---|---|
-| 1 | The first `XMemVirtualAlloc` calls: two 64 KiB reserve forms, then 2 MiB pages | #6709, #4531 |
-| 2 | The 2 MiB reserve+commit calls carry attribute words the shim refuses, and `PAGE_GRAPHICS_*` bits (0x800..0x40000) on top of `PAGE_READWRITE` | Local: accept the attribute word, drop the graphics bits and keep the CPU protection. All seven startup allocations then succeed. #6843 measures the attribute words; no PR changes the check yet |
+| 1 | The first `XMemVirtualAlloc` calls: two 64 KiB reserve forms, then 2 MiB pages | No commit of `main` names #6709 or #4531. What `main` carries is `042c5f378` (`xmem: physical pages, default allocators, XMemIsToolsMemAvailable; XMemVirtualAlloc takes 2 MiB pages and placeholders`, landed as #6919) |
+| 2 | The 2 MiB reserve+commit calls carry attribute words the shim refuses, and `PAGE_GRAPHICS_*` bits (0x800..0x40000) on top of `PAGE_READWRITE` | Local: accept the attribute word, drop the graphics bits and keep the CPU protection. All seven startup allocations then succeed. That shape landed as `695792de7` (#6908, `xmem: record XMemVirtualAlloc's attribute word and drop the PAGE_GRAPHICS_* protection bits`); the 2 MiB pages around it came with `042c5f378` (#6919). No commit of `main` names #6843, which measured the attribute words |
 | 3 | `xgameruntime.lib`'s thunk treats a missing `XErrorReport` as fatal | #6582 |
-| 4 | Access violation in the title's allocator: its `/GA` code reads its TLS from module index 0 | #4313 |
+| 4 | Access violation in the title's allocator: its `/GA` code reads its TLS from module index 0 | #4313 was closed without landing. main carries the same behaviour in `runtime/src/pe_loader.cpp` at `b7a3fed28` (`pe_loader: give a /GA executable its own TLS at index 0`) |
 | 5 | Fatal assert when `DStorageGetFactory` returns null | #4348 |
 | 6 | `XMemAllocatePhysicalPages` unimplemented; the title asserts on FALSE | Local stand-in, §2 |
 | 7 | `D3D12XboxCreateDevice` succeeds; device slot 26 is called with its arguments swapped | Local, §3.1 |
@@ -27,6 +27,8 @@ stand-ins named below (not pull requests yet). Own 1.0.2.1 copy, Windows 11, RTX
 | 11 | The title carves five sub-ranges out of that placeholder with `MEM_RESERVE \| MEM_REPLACE_PLACEHOLDER \| MEM_PHYSICAL \| MEM_LARGE_PAGES` (`0x20406000`) at addresses inside it, then allocates a second batch of physical pages | Local: a physical reserve inside a known placeholder stays a placeholder (the page maps split it); other `MEM_REPLACE_PLACEHOLDER` calls split the range and allocate it in place |
 | 12 | Device slot 133 is called; the proxy table had 128 slots, so the call went through a null pointer | Local: a 192-slot table, and a slot 133 stand-in, §3.4 |
 | 13 | **Current stop**: right after the first `CreateDescriptorHeap`, the title calls the heap's slot 9 (`GetCPUDescriptorHandleForHeapStart` on the PC), takes the handle from `rax` and asserts that it equals a value it already holds. Hypothesis: a console descriptor heap starts at an address the title chose or can predict, which the PC handle doesn't match | Open: a question for the descriptor model ([boot.md](boot.md) Q4) |
+
+Three cells of that table were written while the pull requests they named were still open. Searching the history of `main` for those numbers, by commit message and by short hash, gives: no commit anywhere in that history names #6709, #4531 or #6843; #4313 was merged as `254cabbd2` and `b2902830d`, its slot-0 block for already-running threads, is in `main`. Rows 1, 2 and 4 now name the commits `main` carries, read from the merged diffs under `runtime/`. Nothing here was re-run to write those three cells: the measurements above and below the table are the ones recorded on the setup named at the top of this file, and a fresh chain on current `main` is a separate measurement that has not been taken.
 
 At stop 13 the D3D12 trace holds 1,185 calls: the device, 5 command queues, 5 fences, 7 command allocators,
 581 command lists created and closed, a shader cache session, `XboxIDXGIDevice::GetAdapter`, one failed
