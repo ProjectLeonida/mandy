@@ -326,6 +326,11 @@ ReturnClass classify_import(const std::string& dll, const std::string& name) { r
 
 void set_unimplemented_test_hook(TestHook hook) { g_test_hook.store(hook); }
 
+void with_module_lookup_lock_for_test(void (*fn)(void*), void* ctx) {
+    const std::lock_guard lock(g_lookup_mutex);
+    fn(ctx);
+}
+
 void add_module_lookup(void* ctx, ModuleLookup fn) {
     std::lock_guard lock(g_lookup_mutex);
     g_lookups.push_back({ctx, fn});

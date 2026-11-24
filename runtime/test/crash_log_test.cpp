@@ -1,18 +1,23 @@
 // Tests for the opt-in unhandled-exception log (LEONIDA_CRASH_LOG, shims/crash_log.h).
 //
-// Shows a fault in this image and in a small mapped image, and the opt-out.
+// Shows a fault in this image and in a small mapped image, the opt-out, a previous filter, an unwritable log path,
+// and a fault under the registry's lookup lock.
 //
-//   crash_log_test                              the parent: checks the install() rules, then starts three copies of
-//                                               itself and checks their logs and exit codes
-//   crash_log_test --fault-child TIDFILE        writes through a null pointer on a new thread of this image
-//   crash_log_test --fault-mapped DIR TIDFILE   maps a minimal synthetic image, then faults in one of its functions
+//   crash_log_test                                        the parent: checks the install() rules, then starts copies
+//                                                         of itself and checks their logs and exit codes
+//   crash_log_test --fault-child TIDFILE                  writes through a null pointer on a new thread of this image
+//   crash_log_test --fault-mapped DIR TIDFILE             maps a minimal synthetic image, then faults in it
+//   crash_log_test --fault-previous TIDFILE MARKERFILE    installs its own filter before the log, then faults
+//   crash_log_test --fault-locked TIDFILE                 faults while the shim registry's lookup lock is held
 //
 // The parent checks that each child still terminates with 0xC0000005 (the log must not swallow or change the
 // exception), that the log names the code, the faulting address as module+0xRVA and raw, the thread id and the top
 // frames, and that the same block reached stderr. The mapped case has to name crash_image.bin+0x1220, the game's
-// shape of address, not just host modules. A third child runs with the variable unset and must crash the same way
-// without writing anything. LEONIDA_TEST_DIR names the folder for the logs, as for loader_test; the default is the
-// temp folder.
+// shape of address, not just host modules. The opt-out child runs with the variable unset and must crash the same
+// way without writing anything. The previous-filter child must still run the filter it installed; the unwritable
+// case must still print the block on stderr; the locked case proves the handler does not take the lookup lock (the
+// old module_offset path would deadlock here). LEONIDA_TEST_DIR names the folder for the logs, as for loader_test;
+// the default is the temp folder.
 #include <windows.h>
 
 #include <cstdint>
@@ -28,6 +33,7 @@
 #include <vector>
 
 #include "../shims/crash_log.h"
+#include "../shims/shims.h"
 #include "../src/pe_loader.h"
 
 namespace {
@@ -79,6 +85,7 @@ __declspec(noinline) void crash_outer() {
 }
 
 std::wstring g_tid_path;
+std::wstring g_marker_path;
 
 void record_tid() {
     FILE* f = nullptr;
@@ -103,6 +110,38 @@ int fault_child() {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     rt::crash_log::install();  // the opt-out case runs this too: no variable, no handler, the same fault
     return fault_on_thread([] { crash_outer(); });
+}
+
+// A filter installed before the crash log: the log must call it and return its answer, not replace its behaviour.
+LONG CALLBACK previous_filter(EXCEPTION_POINTERS*) {
+    const HANDLE marker = CreateFileW(g_marker_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                                      FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (marker != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(marker, "previous", 8, &written, nullptr);
+        CloseHandle(marker);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+int fault_previous_child() {
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    SetUnhandledExceptionFilter(&previous_filter);
+    rt::crash_log::install();
+    return fault_on_thread([] { crash_outer(); });
+}
+
+// The fault happens while the shim registry's module-lookup lock is held: the handler must not need it.
+int fault_locked_child() {
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    rt::crash_log::install();
+    rt::shims::with_module_lookup_lock_for_test(
+        [](void*) {
+            record_tid();
+            crash_outer();
+        },
+        nullptr);
+    return 6;
 }
 
 // A minimal mapped image with one function that writes through a null pointer. No imports, relocations, TLS or
@@ -301,6 +340,46 @@ void test_opt_out(const fs::path& dir, const fs::path& exe) {
     check(!has(r.stderr_text, "[rt] crash:"), "without the variable nothing is written to stderr");
 }
 
+void test_previous_filter(const fs::path& dir, const fs::path& exe) {
+    const fs::path log = dir / "previous.log";
+    const fs::path stderr_file = dir / "previous.stderr.txt";
+    const fs::path tid_file = dir / "previous.tid.txt";
+    const fs::path marker = dir / "previous.marker.txt";
+    const std::vector<std::wstring> args = {L"--fault-previous", tid_file.wstring(), marker.wstring()};
+    const ChildResult r = run_child(args, log, stderr_file, tid_file, exe);
+    check(r.wait_error == 0, "the previous-filter child ran (error " + std::to_string(r.wait_error) + ")");
+    check(r.exit_code == 0xC0000005u, "the previous-filter child still ends with 0xC0000005");
+    check(has(read_file(log), "unhandled exception 0xC0000005"), "the log is written before the previous filter");
+    check(read_file(marker) == "previous", "the filter installed before the log still runs");
+}
+
+void test_unwritable_path(const fs::path& dir, const fs::path& exe) {
+    const fs::path stderr_file = dir / "unwritable.stderr.txt";
+    const fs::path tid_file = dir / "unwritable.tid.txt";
+    const std::vector<std::wstring> args = {L"--fault-child", tid_file.wstring()};
+    // A directory is an existing path CreateFileW cannot open for append.
+    const ChildResult r = run_child(args, dir, stderr_file, tid_file, exe);
+    check(r.wait_error == 0, "the unwritable-path child ran (error " + std::to_string(r.wait_error) + ")");
+    check(r.exit_code == 0xC0000005u, "an unwritable log path does not change the exit code");
+    check(has(r.stderr_text, "cannot create the log file"), "the unwritable path is reported once");
+    check(has(r.stderr_text, "unhandled exception 0xC0000005"), "the block still reaches stderr without a file");
+}
+
+void test_locked_fault(const fs::path& dir, const fs::path& exe) {
+    const fs::path log = dir / "locked.log";
+    const fs::path stderr_file = dir / "locked.stderr.txt";
+    const fs::path tid_file = dir / "locked.tid.txt";
+    const std::vector<std::wstring> args = {L"--fault-locked", tid_file.wstring()};
+    const ChildResult r = run_child(args, log, stderr_file, tid_file, exe);
+    check(r.wait_error == 0, "the locked-fault child completed instead of deadlocking (error " +
+                                 std::to_string(r.wait_error) + ")");
+    check(r.exit_code == 0xC0000005u, "the locked-fault child still ends with 0xC0000005");
+    const std::string text = read_file(log);
+    check(has(text, "unhandled exception 0xC0000005"), "a fault under the lookup lock is logged");
+    check(has(text, "host:crash_log_test.exe+0x"), "and its module+RVA is still resolved");
+    check(has(text, "thread " + r.thread_id), "and its thread id is named");
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -312,8 +391,19 @@ int wmain(int argc, wchar_t** argv) {
         g_tid_path = argv[3];
         return fault_mapped_child(argv[2]);
     }
+    if (argc == 4 && std::wstring(argv[1]) == L"--fault-previous") {
+        g_tid_path = argv[2];
+        g_marker_path = argv[3];
+        return fault_previous_child();
+    }
+    if (argc == 3 && std::wstring(argv[1]) == L"--fault-locked") {
+        g_tid_path = argv[2];
+        return fault_locked_child();
+    }
     if (argc != 1) {
-        std::fprintf(stderr, "usage: crash_log_test [--fault-child TIDFILE | --fault-mapped DIR TIDFILE]\n");
+        std::fprintf(stderr,
+                     "usage: crash_log_test [--fault-child TIDFILE | --fault-mapped DIR TIDFILE | "
+                     "--fault-previous TIDFILE MARKERFILE | --fault-locked TIDFILE]\n");
         return 2;
     }
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
@@ -326,6 +416,9 @@ int wmain(int argc, wchar_t** argv) {
         test_install_rules(dir);
         test_crash(dir, fs::path(self));
         test_mapped_crash(dir, fs::path(self));
+        test_previous_filter(dir, fs::path(self));
+        test_unwritable_path(dir, fs::path(self));
+        test_locked_fault(dir, fs::path(self));
         test_opt_out(dir, fs::path(self));
         std::error_code ec;
         fs::remove_all(dir, ec);

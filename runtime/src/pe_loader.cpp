@@ -16,6 +16,7 @@
 #include <system_error>
 #include <vector>
 
+#include "../shims/module_ranges.h"
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
 #include "base_reservation.h"
@@ -1096,6 +1097,7 @@ Loader::~Loader() {
     }
     shims::remove_bundled_loader(this);
     shims::remove_module_lookup(this);
+    module_ranges::clear_loader(this);  // before any mapping is freed
     for (auto* m : order_) {
         // TLS state must go away before the image and its TLS block are unmapped.
         if (m->tls_index != kNoTlsIndex && m->tls_slot < kMaxMappedTlsModules) {
@@ -1434,9 +1436,14 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     }
     {
         // From here an address inside the image names it. The memory stays until ~Loader, which unregisters the
-        // lookup first.
+        // lookup first. The crash log reads the same ranges through module_ranges, so it can attribute a fault
+        // without taking this lock.
         std::unique_lock lock(ranges_mutex_);
         ranges_.push_back({reinterpret_cast<uint64_t>(m->base), m->size, m->name});
+        std::vector<module_ranges::Entry> published;
+        published.reserve(ranges_.size());
+        for (const MappedRange& range : ranges_) published.push_back({range.base, range.size, range.name});
+        module_ranges::publish_loader(this, published);
     }
 
     std::memcpy(m->base, file.data(), oh.SizeOfHeaders);

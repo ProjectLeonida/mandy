@@ -506,6 +506,12 @@ needs `--trace`; this log is only the exception that ended the process and works
 previous filter's answer, so the process still ends with the same exception code it would have had; a log that
 cannot be formatted or written is dropped rather than changing that. A debugger still receives the exception first.
 
+The handler takes no lock the dying process may already hold: module names come from ranges the loader publishes as
+it maps (and the host modules seen at install), read with a per-slot seqlock, and the block is written with
+`WriteFile` on handles opened at install instead of stdio. A fault while the shim registry's lookup lock or the
+loader's range lock is held is therefore logged, not deadlocked. The cost is that a host DLL loaded after install
+(the game's `LoadLibrary`, the Vulkan loader) has no name and its frames print as raw addresses.
+
 ### Typed clear regression
 
 `clear_color_test` checks numeric UINT conversion and unchanged float clears without a GPU.
