@@ -189,8 +189,22 @@ reached on the way to the first frame. A bound import is not a working one (the 
 that name exists), and an unimplemented import stops the run only if the title calls it
 ([When an unimplemented import is called](#when-an-unimplemented-import-is-called)). The executable imports 25
 functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`) and the loader binds them to the
-host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim,
-which opens none.
+host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim, which opens none, and `mfplat.dll` is partially overridden so
+`MFCreateSourceResolver` wraps the host `IMFSourceResolver` (`runtime/shims/mfplat_offline.cpp`): network schemes
+(`http`, `https`, `rtsp`, `mms`), UNC shares (two leading separators of either kind, also after a `file:` authority
+and percent-decoding) and remote `file://` hosts are refused with `MF_E_UNSUPPORTED_SCHEME`, and so is everything else
+except console paths (`GAME:`, `G:`, `T:`), absolute drive paths and `file:///` URLs that name one of those, which are
+rewritten through `rt::fs::resolve_read_path` before reaching Media Foundation (relative and drive-relative paths are
+refused, and so is a host drive path on a network drive). Only the source resolver's URL methods are gated:
+`MFCreateSourceReaderFromURL`, `MFCreateFile` and byte streams still reach the host unchanged. The host's
+`mfreadwrite.dll` delay-imports `MFCreateSourceResolver` from `mfplat.dll` itself (`tools/pe_inspect.py` on Windows 10
+22H2), so a source reader made from a URL would use the unwrapped resolver. The title makes none: its import table
+(`tools/import_call_sites.py`) has one call to `MFPlat.DLL!MFCreateSourceResolver` (RVA `0x33a4d25`) and, 0x6a bytes
+later in the same function, the only call to `MFReadWrite.dll!MFCreateSourceReaderFromMediaSource` (`0x33a4d8f`).
+Its other Media Foundation imports are
+`MFStartup`, `MFShutdown`, `MFCreateAttributes`, `MFCreateMediaType` and `MFGetSystemTime`; it imports neither
+`MFCreateSourceReaderFromURL` nor `MFCreateFile`, and `tools/pe_inspect.py` lists no Media Foundation DLL among its
+run-time load candidates. So the title's one way to open media goes through the wrapped resolver.
 
 ## Console paths and the write overlay
 
