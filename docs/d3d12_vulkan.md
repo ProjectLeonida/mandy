@@ -3342,7 +3342,10 @@ Layer plan:
   COM object with the device (a PC `ID3D12Device` has no `IDXGIDevice`, so nothing is forwarded), and `GetAdapter`
   and `GetParent` return the adapter of the device behind it: the layer's own on the Vulkan device, the host adapter
   with the device's LUID on the host backend. The 14 slots are the public `dxgi.h` order, an assumption like the
-  queue's. `SetMaximumFrameLatency` and `SetGPUThreadPriority` are kept and read back only. `dxgi_device_test`
+  queue's. `SetMaximumFrameLatency` and `SetGPUThreadPriority` are kept and read back only, and
+  `QueryResourceResidency` checks non-null array/output arguments and verifies that each entry is an `ID3D12Pageable`
+  owned by the device before reporting `DXGI_RESIDENCY_FULLY_RESIDENT` (matching Xbox unified physical memory;
+  `CreateSurface` stays `E_NOTIMPL` with a log). `dxgi_device_test`
   walks it on both backends; the output itself is `EnumOutputs` (D3D-313).
 - `ALLOW_DISPLAY` committed resources are normal `Resource`s that the presenter may blit to a Vulkan
   swapchain image; `PRESENT` state maps per the resource-state table (`PRESENT_SRC_KHR` only for swapchain images).
