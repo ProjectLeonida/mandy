@@ -390,9 +390,10 @@ What is implemented (all of it testable without the game):
     targets and depth-stencils too: their attachment views are `VK_IMAGE_VIEW_TYPE_1D_ARRAY`), and
     2D textures in the common render-target, depth and texture formats (typeless families become mutable-format
     images; `R24G8_TYPELESS` and `R32G8X24_TYPELESS` are depth-stencil images with or without
-    `ALLOW_DEPTH_STENCIL`, as Vulkan has no colour format with their layout), plus non-attachment 3D textures with
-    mipmapped upload, image copy and readback, and multisampled 2D textures (single-mip render targets or
-    depth-stencils, in the sample counts the GPU has for the format);
+    `ALLOW_DEPTH_STENCIL`, as Vulkan has no colour format with their layout), plus 3D textures with mipmapped
+    upload, image copy and readback, render-target slices and, where Vulkan reports the format combination,
+    depth/stencil slice attachments through `VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT`, and multisampled 2D textures
+    (single-mip render targets or depth-stencils, in the sample counts the GPU has for the format);
   - packed `R9G9B9E5_SHAREDEXP` textures map to `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` for uploads and sampled views.
     When `ALLOW_UNORDERED_ACCESS` is requested on a GPU whose `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` lacks native
     `STORAGE_IMAGE` support (for example NVIDIA), the layer backs the texture with a mutable `VK_FORMAT_R32_UINT`

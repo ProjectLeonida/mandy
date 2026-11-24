@@ -499,7 +499,8 @@ struct TextureCreateInfo {
         const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const bool one_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
         info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
-        if (volume && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+        if (volume && (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
             info.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
         info.imageType = volume ? VK_IMAGE_TYPE_3D : one_d ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
         info.format = format.format;
@@ -1020,8 +1021,6 @@ struct DeviceState {
             }
         }
         Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
-        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
-            return {};
         format.d24 = format.format == VK_FORMAT_D24_UNORM_S8_UINT;  // native or not: clears are quantised
         if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !depth_usable(format.format)) {
             log_once("D24_UNORM_S8_UINT unavailable, using D32_SFLOAT_S8_UINT; format", desc.Format);
@@ -8371,9 +8370,9 @@ private:
                             (desc.Flags & attachment) == attachment ||
                             (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
             return kInvalidAllocation;
-        // The PC runtime: simultaneous access only single-sampled and without depth-stencil, and no volume depth.
-        if (((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && (depth_stencil || samples > 1)) ||
-            (volume && depth_stencil))
+        // The PC runtime: simultaneous access only single-sampled and without depth-stencil. A 3D depth/stencil
+        // resource is valid; Vulkan represents its slice attachments with VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT.
+        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && (depth_stencil || samples > 1))
             return kInvalidAllocation;
         const bool tiled = is_tiled_layout(desc.Layout);
         if (tiled) {

@@ -1616,10 +1616,12 @@ private:
         info.viewType = r.line ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_2D_ARRAY;  // 1D images take no 2D view
         info.format = r.format;
         info.subresourceRange = range;
-        // Attachment views need only color-attachment usage. Inheriting STORAGE usage from a mutable/extended
-        // resource (typeless views such as RGBA8 sRGB, or R32_UINT-backed R9G9B9E5 UAV images) would require unrelated usages.
+        // Attachment views need only their attachment usage. Inheriting STORAGE usage from a mutable/extended
+        // resource (typeless views such as RGBA8 sRGB, or R32_UINT-backed R9G9B9E5 UAV images) would require unrelated
+        // usages; a typeless depth view likewise needs only DEPTH_STENCIL_ATTACHMENT.
         VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
-        usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        usage.usage = (range.aspectMask & depth_stencil_aspects) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                                                                  : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if (r.typeless || (range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && r.color_attachment))
             info.pNext = &usage;
         VkImageView view = VK_NULL_HANDLE;

@@ -7,6 +7,7 @@
 
 namespace {
 unsigned clears = 0, attachment_clears = 0;
+VkImageSubresourceRange captured_range{};
 VKAPI_ATTR void VKAPI_CALL barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
     std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*,
     std::uint32_t, const VkImageMemoryBarrier*) {}
@@ -45,13 +46,17 @@ leonida::ReplayFunctions functions() {
     vk.begin_rendering = begin;
     vk.end_rendering = end;
     vk.clear_attachments = attachments;
-    vk.image_view = [](const auto&, const auto&) { return reinterpret_cast<VkImageView>(std::uintptr_t{1}); };
+    vk.image_view = [](const auto&, const auto& range) {
+        captured_range = range;
+        return reinterpret_cast<VkImageView>(std::uintptr_t{1});
+    };
     return vk;
 }
 
 leonida::ReplayResult run(const leonida::CommandList& list, const leonida::ResourceBinding& binding,
                           const leonida::ReplayFunctions& vk, leonida::LayoutTracker* tracker = nullptr) {
     clears = attachment_clears = 0;
+    captured_range = {};
     return leonida::replay(list, VK_NULL_HANDLE, [&](auto) { return &binding; }, vk, tracker);
 }
 } // namespace
@@ -101,6 +106,30 @@ int main() {
     vk.clear_color_image = nullptr;
     expect(run(rect_color, color, vk, &tracker) == ReplayResult::success && attachment_clears == 1,
            "rectangle clear on an initialized image needs no image clear");
+
+    // A 3D depth image accepts depth aspects. A DSV that selects one W slice must clear through a 2D-array
+    // attachment view; vkCmdClearDepthStencilImage cannot select slices of a 3D mip.
+    auto volume_depth = image(VK_FORMAT_D16_UNORM, VK_IMAGE_ASPECT_DEPTH_BIT);
+    volume_depth.volume = true;
+    volume_depth.depth = 4;
+    leonida::CommandList slice_depth;
+    expect(slice_depth.clear_depth_stencil({1, 0, 2, 1}, leonida::clear_depth, 0.75f, 0) && slice_depth.close(),
+           "record a one-slice 3D depth clear");
+    vk = functions();
+    expect(run(slice_depth, volume_depth, vk) == ReplayResult::success && clears == 0 && attachment_clears == 1,
+           "one-slice 3D depth clear uses an attachment, not an image clear");
+    expect(captured_range.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT && captured_range.baseArrayLayer == 2 &&
+               captured_range.layerCount == 1,
+           "one-slice 3D depth view selects W slice 2");
+    leonida::CommandList whole_volume_depth;
+    expect(whole_volume_depth.clear_depth_stencil({1, 0, 0, 4}, leonida::clear_depth, 0.25f, 0) &&
+               whole_volume_depth.close(),
+           "record a whole-volume depth clear");
+    vk = functions();
+    vk.clear_depth_stencil_image = clear_depth;
+    expect(run(whole_volume_depth, volume_depth, vk) == ReplayResult::success && clears == 1 &&
+               attachment_clears == 0,
+           "whole-volume depth clear keeps the image-clear path");
 
     // not_zeroed images (D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) are only moved out of UNDEFINED, never cleared.
     auto not_zeroed = color;

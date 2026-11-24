@@ -309,6 +309,117 @@ bool check_volume_rtvs(ID3D12Device* host, ID3D12Device* ours) {
     return true;
 }
 
+bool clear_volume_depth_and_read(ID3D12Device* device, std::vector<std::uint16_t>& pixels) {
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    CHECK(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                             IID_PPV_ARGS(&list.p))));
+    CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+
+    constexpr UINT width = 4, height = 4, depth = 4;
+    Ref<ID3D12Resource> image, readback;
+    D3D12_HEAP_PROPERTIES heap_properties{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC texture{};
+    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    texture.Width = width;
+    texture.Height = height;
+    texture.DepthOrArraySize = depth;
+    texture.MipLevels = 1;
+    texture.Format = DXGI_FORMAT_R16_TYPELESS;
+    texture.SampleDesc.Count = 1;
+    texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    CHECK(SUCCEEDED(device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &texture,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr, IID_PPV_ARGS(&image.p))));
+    const auto got_desc = image->GetDesc();
+    CHECK(got_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && got_desc.DepthOrArraySize == depth &&
+          (got_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed{};
+    UINT rows = 0;
+    UINT64 total = 0;
+    device->GetCopyableFootprints(&texture, 0, 1, 0, &placed, &rows, nullptr, &total);
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = total;
+    buffer.Height = buffer.SampleDesc.Count = 1;
+    buffer.DepthOrArraySize = buffer.MipLevels = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    heap_properties.Type = D3D12_HEAP_TYPE_READBACK;
+    CHECK(SUCCEEDED(device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &buffer,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback.p))));
+
+    Ref<ID3D12DescriptorHeap> heap;
+    const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    CHECK(SUCCEEDED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap.p))));
+    const auto first = heap->GetCPUDescriptorHandleForHeapStart();
+    const UINT increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    const D3D12_CPU_DESCRIPTOR_HANDLE slice0{first.ptr}, slice2{first.ptr + increment};
+    D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+    view.Format = DXGI_FORMAT_D16_UNORM;
+    view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    view.Texture2D.MipSlice = 0;
+    device->CreateDepthStencilView(image.p, &view, slice0);
+    view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+    view.Texture2DArray = {0, 2, 1};
+    device->CreateDepthStencilView(image.p, &view, slice2);
+    list->ClearDepthStencilView(slice0, D3D12_CLEAR_FLAG_DEPTH, 0.25f, 0, 0, nullptr);
+    list->ClearDepthStencilView(slice2, D3D12_CLEAR_FLAG_DEPTH, 0.75f, 0, 0, nullptr);
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = image.p;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(1, &barrier);
+    D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+    src.pResource = image.p;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource = readback.p;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = placed;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    CHECK(SUCCEEDED(list->Close()));
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
+    Event event;
+    CHECK(event.handle && SUCCEEDED(fence->SetEventOnCompletion(1, event.handle)));
+    CHECK(WaitForSingleObject(event.handle, 5000) == WAIT_OBJECT_0);
+    void* mapped = nullptr;
+    const D3D12_RANGE range{0, SIZE_T(total)};
+    CHECK(SUCCEEDED(readback->Map(0, &range, &mapped)) && mapped);
+    const auto* base = static_cast<const unsigned char*>(mapped);
+    pixels.resize(width * height * depth);
+    for (UINT z = 0; z < depth; ++z)
+        for (UINT y = 0; y < height; ++y)
+            std::memcpy(pixels.data() + (z * height + y) * width,
+                        base + placed.Offset + z * placed.Footprint.RowPitch * height + y * placed.Footprint.RowPitch,
+                        width * sizeof(std::uint16_t));
+    const D3D12_RANGE none{};
+    readback->Unmap(0, &none);
+    return true;
+}
+
+bool check_volume_depth(ID3D12Device* host, ID3D12Device* ours) {
+    std::vector<std::uint16_t> expected, actual;
+    if (!clear_volume_depth_and_read(host, expected) || !clear_volume_depth_and_read(ours, actual)) return false;
+    if (actual != expected) {
+        std::size_t wrong = 0;
+        for (std::size_t i = 0; i < actual.size(); ++i) wrong += actual[i] != expected[i];
+        std::fprintf(stderr, "3D depth slices: %zu of %zu words differ from WARP\n", wrong, actual.size());
+        return false;
+    }
+    CHECK(actual[0] != actual[32]);  // slice 2 was cleared independently
+    std::printf("3D depth DSVs: %zu D16 words match WARP across four slices\n", actual.size());
+    return true;
+}
+
 // A texture with a castable list takes an RTV in its own format and in the listed one, and none in a format the
 // list doesn't name (the descriptor stays empty): in the other channel order, across B8G8R8X8 and B8G8R8A8, or the
 // texture's own sRGB format. Typed R8G8B8A8, B8G8R8A8 and B8G8R8X8 textures refuse alike.
@@ -480,6 +591,23 @@ int main(int argc, char** argv) {
         }
         if (restricted_depth)
             return check_depth_clear_edge_values(host.p, ours.p, false) ? 0 : 1;
+        VkPhysicalDeviceImageFormatInfo2 volume_depth_query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2};
+        volume_depth_query.format = VK_FORMAT_D16_UNORM;
+        volume_depth_query.type = VK_IMAGE_TYPE_3D;
+        volume_depth_query.tiling = VK_IMAGE_TILING_OPTIMAL;
+        volume_depth_query.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        volume_depth_query.flags = VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+        VkImageFormatProperties2 volume_depth_properties{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+        const auto volume_depth_formats = vk.instance_fn<PFN_vkGetPhysicalDeviceImageFormatProperties2>(
+            "vkGetPhysicalDeviceImageFormatProperties2");
+        const bool volume_depth_supported = volume_depth_formats &&
+            volume_depth_formats(vk.physical, &volume_depth_query, &volume_depth_properties) == VK_SUCCESS;
+        if (volume_depth_supported) {
+            if (!check_volume_depth(host.p, ours.p)) return 1;
+        } else {
+            std::puts("3D depth images unavailable on this Vulkan adapter, skipped");
+        }
         if (!check_volume_rtvs(host.p, ours.p)) return 1;
         if (volume_only) return 0;
         if (!check_unlisted_rtvs(ours.p)) return 1;

@@ -1254,9 +1254,13 @@ inline bool view_range(const ResourceBinding& resource, const TargetView& view, 
     if (view.mip >= resource.mip_levels) return false;
     if (resource.volume) {
         const auto depth = std::max(1u, resource.depth >> view.mip);
-        if (aspects != VK_IMAGE_ASPECT_COLOR_BIT || view.first_layer >= depth ||
-            !view.layer_count || view.layer_count > depth - view.first_layer) return false;
-        // Layouts and transfers address one array layer for the whole 3D mip.
+        constexpr VkImageAspectFlags supported = VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT |
+                                                  VK_IMAGE_ASPECT_STENCIL_BIT;
+        if ((aspects & ~supported) || view.first_layer >= depth || !view.layer_count ||
+            view.layer_count > depth - view.first_layer)
+            return false;
+        // Layouts and transfers address the whole 3D mip as one array layer. Attachment callers replace this
+        // range with the selected W slices when they build a 2D-array view.
         out = {aspects, view.mip, 1, 0, 1};
         return true;
     }
@@ -2727,9 +2731,17 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!detail::view_range(p.binding, depth_clear->target, aspects, p.range))
                 return ReplayResult::invalid_subresource;
             if (!aspects) p.skip = true;
-            if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, p.binding.aspects);
-                r != ReplayResult::success)
-                return r;
+            const bool partial_volume = p.binding.volume &&
+                depth_clear->target.layer_count != std::max(1u, p.binding.depth >> depth_clear->target.mip);
+            if (partial_volume && depth_clear->rects.empty()) {
+                // vkCmdClearDepthStencilImage cannot select W slices of a 3D mip. Clear through a 2D-array
+                // attachment view, as the native 2D DSV into the volume does.
+                const auto extent = detail::mip_extent(p.binding, depth_clear->target.mip);
+                const Rect full{0, 0, std::int32_t(extent.width), std::int32_t(extent.height)};
+                if (const auto r = rect_view(std::span<const Rect>(&full, 1), depth_clear->target, p.binding.aspects);
+                    r != ReplayResult::success) return r;
+            } else if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target,
+                                               p.binding.aspects); r != ReplayResult::success) return r;
             if (!p.skip && p.rects.empty() && !vk.clear_depth_stencil_image) return ReplayResult::unsupported;
         } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
             const UavView& view = uav->view;
