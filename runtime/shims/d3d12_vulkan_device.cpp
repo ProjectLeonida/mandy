@@ -675,6 +675,40 @@ struct DeviceState {
     bool sparse_image_tiles = false;
 
     bool tiles_share_arena() const { return (sparse_buffer_memory_types & (1u << arena.memory_type)) != 0; }
+    bool need_buffer_device_address() const { return info.buffer_device_address || arena.buffer != VK_NULL_HANDLE; }
+
+    VkBufferCreateInfo host_buffer_info(VkDeviceSize bytes, const void* next = nullptr) const {
+        VkBufferCreateInfo result{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, next};
+        result.size = bytes;
+        result.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                       VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+        if (info.conditional_rendering) result.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        if (need_buffer_device_address()) result.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        share(result);
+        return result;
+    }
+
+    // Intel's Windows Vulkan driver (measured on RaptorLake-S) updates WDDM residency for
+    // VK_EXT_external_memory_host allocations asynchronously: calling vkFreeMemory and then VirtualFree
+    // without a real queue submission in between leaves WDDM's paging engine referencing the freed pages and
+    // puts the device into VK_ERROR_DEVICE_LOST. Submitting a barrier-only empty list through staging_queue
+    // and waiting for the queue to idle drains the unpin before the caller returns the pages to Windows.
+    void flush_host_import_unpin() {
+        constexpr std::uint32_t kIntelVendorId = 0x8086;
+        if (pso_identity.vendor != kIntelVendorId || !context || context->is_device_lost()) return;
+        leonida::CommandList list;
+        if (!list.close()) return;
+        std::lock_guard lock(staging_mutex);
+        if (!staging_queue) {
+            staging_queue = std::make_unique<leonida::VulkanQueue>(*context, info.queue, info.queue_family);
+        }
+        if (staging_queue->ok()) {
+            const leonida::CommandList* lists[] = {&list};
+            if (staging_queue->execute(lists) == leonida::ReplayResult::success) staging_queue->idle();
+        }
+    }
 
     VkBufferCreateInfo sparse_buffer_info(VkDeviceSize bytes) const {
         VkBufferCreateInfo result{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -1802,13 +1836,17 @@ public:
             // VK_EXT_external_memory_host needs the caller's pages to stay valid for the imported memory's whole
             // lifetime, and a title may free them right after releasing the resource. So the memory is not left to
             // the deferred queue (freed after the *next* submission retires): wait for what was submitted, then
-            // free it now (found in review).
+            // destroy the buffer and release the memory (or the placed heap range) now (found in review).
             device_.context->wait_retire_ticket(device_.context->submitted_retire_ticket());
             auto& vk = device_.context->vk;
             if (buffer_) vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
-            if (memory_) vk.vkFreeMemory(device_.info.device, memory_, nullptr);
+            if (memory_) {
+                vk.vkFreeMemory(device_.info.device, memory_, nullptr);
+                device_.flush_host_import_unpin();
+            }
             buffer_ = VK_NULL_HANDLE;
             memory_ = VK_NULL_HANDLE;
+            heap_range_.reset();
         }
         if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
         if (image_ && !sparse_image_)
@@ -2014,18 +2052,10 @@ public:
             at = region_end - base;
         }
         if (!importable) return E_NOTIMPL;
-        const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
+        const bool need_bda = device_.need_buffer_device_address();
         VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
-        info.size = desc_.Width;
-        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
-        if (device_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
-        if (need_bda) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-        device_.share(info);
+        VkBufferCreateInfo info = device_.host_buffer_info(desc_.Width, &external);
         if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
@@ -2180,6 +2210,62 @@ public:
         binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
                                  (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
                                   heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
+        device_.context->add_resource(id(), binding);
+        return S_OK;
+    }
+
+    // A placed buffer inside an OpenExistingHeapFromAddress existing heap: binds a VkBuffer directly to the heap's
+    // imported VkDeviceMemory at `heap_offset`, keeping the caller's host pages intact (nothing zeroed) and exposing
+    // `heap_host_address + heap_offset` through Map().
+    HRESULT create_existing_heap_buffer(std::shared_ptr<const leonida::TileHeapAllocation> heap_range,
+                                        const void* heap_host_address, UINT64 heap_offset) {
+        if (!heap_range || heap_range->memory == VK_NULL_HANDLE || !heap_host_address || !desc_.Width ||
+            desc_.Width > heap_range->size || heap_offset > heap_range->size - desc_.Width)
+            return E_INVALIDARG;
+        auto& vk = device_.context->vk;
+        const bool need_bda = device_.need_buffer_device_address();
+        VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        VkBufferCreateInfo info = device_.host_buffer_info(desc_.Width, &external);
+        if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
+        VkMemoryRequirements requirements{};
+        vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
+        if (!(requirements.memoryTypeBits & (1u << heap_range->memory_type)) ||
+            (requirements.alignment && (heap_offset % requirements.alignment) != 0) ||
+            requirements.size > heap_range->size || heap_offset > heap_range->size - requirements.size) {
+            vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
+            buffer_ = VK_NULL_HANDLE;
+            return E_NOTIMPL;
+        }
+        if (vk.vkBindBufferMemory(device_.info.device, buffer_, heap_range->memory, heap_offset) != VK_SUCCESS) {
+            vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
+            buffer_ = VK_NULL_HANDLE;
+            return E_OUTOFMEMORY;
+        }
+        void* const cpu_ptr = static_cast<std::uint8_t*>(const_cast<void*>(heap_host_address)) + heap_offset;
+        heap_range_ = std::move(heap_range);
+        mapped_ = cpu_ptr;
+        host_import_ = true;
+        memory_flags_ = device_.memory.memoryTypes[heap_range_->memory_type].propertyFlags;
+        const auto host_va = reinterpret_cast<std::uintptr_t>(cpu_ptr);
+        if (need_bda && vk.vkGetBufferDeviceAddress) {
+            VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            bda.buffer = buffer_;
+            buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
+            gpu_va_ = buffer_va_;
+        }
+        if (host_va >= device_.arena.size)
+            va_ = host_va;
+        else if (buffer_va_ && device_.arena.buffer != VK_NULL_HANDLE)
+            va_ = buffer_va_ - device_.arena.address;
+        else
+            va_ = host_va;
+        leonida::ResourceBinding binding{};
+        binding.buffer = buffer_;
+        binding.size = desc_.Width;
+        binding.host = cpu_writable() ? static_cast<const std::uint8_t*>(cpu_ptr) : nullptr;
+        binding.host_readable = true;
+        binding.va = va_;
         device_.context->add_resource(id(), binding);
         return S_OK;
     }
@@ -2812,9 +2898,10 @@ public:
         : device_(device), desc_(desc), host_address_(address) {
         allocation_ = std::shared_ptr<const leonida::TileHeapAllocation>(
             new leonida::TileHeapAllocation{memory, 0, desc_.SizeInBytes, memory_type},
-            [device = device_.info.device, free = device_.context->vk.vkFreeMemory]
-            (const leonida::TileHeapAllocation* allocation) {
-                free(device, allocation->memory, nullptr);
+            [&device](const leonida::TileHeapAllocation* allocation) {
+                device.context->wait_retire_ticket(device.context->submitted_retire_ticket());
+                device.context->vk.vkFreeMemory(device.info.device, allocation->memory, nullptr);
+                device.flush_host_import_unpin();
                 delete allocation;
             });
     }
@@ -7047,6 +7134,7 @@ public:
                      int(alignment));
             return d3d12_trace::result(method, E_NOTIMPL);
         }
+        auto& vk = state_.context->vk;
         VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
         if (state_.get_host_pointer_properties(state_.info.device,
                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, address,
@@ -7055,6 +7143,21 @@ public:
             log_once("OpenExistingHeapFromAddress: no memory type imports this host range", 0);
             return d3d12_trace::result(method, E_NOTIMPL);
         }
+        const bool need_bda = state_.need_buffer_device_address();
+        VkMemoryRequirements probe_req{};
+        {
+            VkExternalMemoryBufferCreateInfo probe_ext{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+            probe_ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            const VkBufferCreateInfo probe_info =
+                state_.host_buffer_info(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, &probe_ext);
+            VkBuffer probe = VK_NULL_HANDLE;
+            if (vk.vkCreateBuffer(state_.info.device, &probe_info, nullptr, &probe) == VK_SUCCESS) {
+                vk.vkGetBufferMemoryRequirements(state_.info.device, probe, &probe_req);
+                vk.vkDestroyBuffer(state_.info.device, probe, nullptr);
+            }
+        }
+        const std::uint32_t buffer_types = host.memoryTypeBits & probe_req.memoryTypeBits;
+        const std::uint32_t candidate_types = buffer_types ? buffer_types : host.memoryTypeBits;
         VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
         import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         import.pHostPointer = const_cast<void*>(address);
@@ -7067,13 +7170,14 @@ public:
              {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
               VkMemoryPropertyFlags(0)}) {
             for (std::uint32_t i = 0; i < state_.memory.memoryTypeCount && !memory; ++i) {
-                if (!(host.memoryTypeBits & (1u << i)) ||
+                if (!(candidate_types & (1u << i)) ||
                     (state_.memory.memoryTypes[i].propertyFlags & want) != want)
                     continue;
-                VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+                VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                              need_bda ? static_cast<const void*>(&flags) : &import};
                 allocate.allocationSize = size;
                 allocate.memoryTypeIndex = i;
-                if (state_.context->vk.vkAllocateMemory(state_.info.device, &allocate, nullptr, &memory) ==
+                if (vk.vkAllocateMemory(state_.info.device, &allocate, nullptr, &memory) ==
                     VK_SUCCESS)
                     memory_type = i;
                 else
@@ -7297,13 +7401,6 @@ public:
         if (out) *out = nullptr;
         auto* heap = Heap::from<Heap>(heap_interface);
         if (!heap || !desc) return d3d12_trace::result(method, E_INVALIDARG);
-        if (heap->host_address()) {
-            // An existing heap is not an arena range, and the placed path addresses resources by arena offset.
-            log_once("a placed resource in an existing heap (OpenExistingHeapFromAddress) is not supported yet; "
-                     "dimension",
-                     int(desc->Dimension));
-            return d3d12_trace::result(method, E_NOTIMPL);
-        }
         if (castable_count && castable && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             log_once("castable formats on a placed buffer are invalid; count", int(castable_count));
             return d3d12_trace::result(method, E_INVALIDARG);
@@ -7312,8 +7409,22 @@ public:
         // DENY flags are checked against the resource below, and the host takes any initial state for a buffer in
         // an upload or readback heap (COPY_DEST in an upload heap, GENERIC_READ in a readback heap), where a
         // committed buffer must start in GENERIC_READ or COPY_DEST. UAV access is refused there all the same.
+        // Cross-adapter heaps (including OpenExistingHeapFromAddress) require D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER.
+        const bool cross_adapter_heap = (heap->flags() & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER) != 0;
+        const bool cross_adapter_res = (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER) != 0;
+        if (cross_adapter_heap && !cross_adapter_res) {
+            log_once((std::string(method) + " refused (cross-adapter heap requires ALLOW_CROSS_ADAPTER), dimension")
+                         .c_str(),
+                     int(desc->Dimension));
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
+        D3D12_RESOURCE_DESC checked_desc = *desc;
+        if (cross_adapter_heap) {
+            checked_desc.Flags =
+                D3D12_RESOURCE_FLAGS(UINT(checked_desc.Flags) & ~UINT(D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER));
+        }
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
-        const char* why = committed_resource_refusal(default_heap, D3D12_HEAP_FLAG_NONE, *desc, state, clear,
+        const char* why = committed_resource_refusal(default_heap, D3D12_HEAP_FLAG_NONE, checked_desc, state, clear,
                                                      acceleration_structures(), state_.uma);
         const D3D12_HEAP_TYPE heap_type = heap->properties().Type;
         if (!why && (heap_type == D3D12_HEAP_TYPE_UPLOAD || heap_type == D3D12_HEAP_TYPE_READBACK) &&
@@ -7376,18 +7487,27 @@ public:
         }
         if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         const bool buffer = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
-        if (buffer && !heap->use_as_placed_resource(true)) {
+        if (heap->host_address() && !buffer) {
+            log_once("a placed texture in an existing heap (OpenExistingHeapFromAddress) is not supported yet; "
+                     "dimension",
+                     int(desc->Dimension));
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        if (buffer && !heap->host_address() && !heap->use_as_placed_resource(true)) {
             log_once("placed buffer refused: heap uses a separate allocation for sparse tiles", 1);
             return d3d12_trace::result(method, E_NOTIMPL);
         }
         // Only buffers are addressable, as in D3D12: a placed texture keeps a null VA and its own Vulkan image, which
         // create_texture makes for 1D, 2D and 3D alike (arrays and mips included), as for a committed texture.
-        const VkDeviceSize placed_va = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? heap->offset() + heap_offset : 0;
+        const VkDeviceSize placed_va =
+            (buffer && !heap->host_address()) ? heap->offset() + heap_offset : 0;
         auto* resource = new Resource(state_, *desc, heap->properties(), heap->flags(), placed_va);
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (buffer) {
-            hr = resource->create_placed_buffer(heap->arena_range());
+            hr = heap->host_address()
+                     ? resource->create_existing_heap_buffer(heap->arena_range(), heap->host_address(), heap_offset)
+                     : resource->create_placed_buffer(heap->arena_range());
         } else {
             hr = S_OK;
             const Format format = state_.texture_format(*desc);
