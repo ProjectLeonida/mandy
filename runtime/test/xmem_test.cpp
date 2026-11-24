@@ -22,6 +22,7 @@
 #include <thread>
 #include <vector>
 
+#include "host_wine.h"
 #include "shims.h"
 #include "startup_trace.h"
 #include "xmem.h"
@@ -334,6 +335,21 @@ bool reserved_only(const void* address) {
     return VirtualQuery(address, &info, sizeof(info)) && info.State == MEM_RESERVE;
 }
 
+// Whether the write the caller has just made to the mapped page at `page` left it committed. On Windows a
+// reserve-only view raises on its first touch and xmem's handler commits the page. Wine lets that write through with
+// no fault and goes on reporting MEM_RESERVE for the view (wine-staging 11.21), so the handler never runs there:
+// under Wine the page is committed here, through the call the runtime makes before it hands title memory to the GPU,
+// and what was written must still be there. The checks that follow then see a committed view on both hosts.
+bool committed_by_first_touch(const void* page) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(page, &info, sizeof(info)) && info.State == MEM_COMMIT) return true;
+    if (!hostwine::is_wine()) return false;
+    std::printf("SKIP the first touch commits the page (Wine raises no fault on a reserve-only view); "
+                "committed with commit_physical_range\n");
+    const uint32_t written = read_u32(page, 0);
+    return rt::xmem::commit_physical_range(page, kPage64k) && read_u32(page, 0) == written;
+}
+
 struct PhysicalApi {
     XMemVirtualAllocFn virtual_alloc;
     XMemAllocatePhysicalPagesFn allocate;
@@ -369,9 +385,10 @@ void test_physical_pages(const PhysicalApi& api) {
     check(api.map(window, kPages, pages) == window, "XMemMapPhysicalPages returns the address it mapped");
     for (uint64_t i = 0; i < kPages; ++i) fill_page(window + i * kPage64k, 0x1000u * static_cast<uint32_t>(i + 1));
     {
+        const bool committed = committed_by_first_touch(window);
         MEMORY_BASIC_INFORMATION info{};
         VirtualQuery(window, &info, sizeof(info));
-        check(info.State == MEM_COMMIT && info.Type == MEM_MAPPED && info.Protect == PAGE_READWRITE,
+        check(committed && info.State == MEM_COMMIT && info.Type == MEM_MAPPED && info.Protect == PAGE_READWRITE,
               "a mapped page is a read-write view with the window's protection");
     }
 
@@ -713,9 +730,10 @@ void test_write_combine_window(const PhysicalApi& api) {
     if (mapped) {
         // Physical pages are committed on first touch, so the view is written before it is queried.
         *static_cast<volatile unsigned char*>(window) = 1;
+        const bool committed = committed_by_first_touch(window);
         MEMORY_BASIC_INFORMATION info{};
         VirtualQuery(window, &info, sizeof(info));
-        check(info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE,
+        check(committed && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE,
               "the page mapped there is a plain read-write view");
         fill_page(window, 0x77000000u);
         check(page_holds(window, 0x77000000u), "the page in the write-combine window holds data");
