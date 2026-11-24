@@ -217,8 +217,16 @@ public:
     HRESULT STDMETHODCALLTYPE Close() override {
         constexpr auto method = "ID3D12GraphicsCommandList::Close";
         if (list_.queries_open()) invalid_ = true;
+        // A render pass ends in the list that began it; one that continues in a later list ends here too, with
+        // SUSPENDING_PASS. Closing with a pass open is E_FAIL, as on Windows WARP (D3D-27, d3d12_render_pass_test).
+        const bool pass_open = in_render_pass_;
         if (!list_.close()) return d3d12_trace::result(method, E_FAIL);
         stop_recording();
+        if (pass_open) {
+            in_render_pass_ = false;
+            invalid_ = true;
+            return d3d12_trace::result(method, E_FAIL);
+        }
         return d3d12_trace::result(method, invalid_ ? E_INVALIDARG : S_OK);
     }
 
@@ -437,6 +445,12 @@ public:
                                               const D3D12_CPU_DESCRIPTOR_HANDLE* depth) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return check(false);
+        bind_targets(count, targets, single_range, depth);
+    }
+
+    // OMSetRenderTargets' binding, shared with BeginRenderPass.
+    void bind_targets(UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL single_range,
+                      const D3D12_CPU_DESCRIPTOR_HANDLE* depth) {
         render_targets_.fill({});
         render_target_count_ = count;
         draw_views_stale_ = true;
@@ -656,6 +670,87 @@ public:
                                                      DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) override {
         d3d12_trace::record("ID3D12GraphicsCommandList1::ResolveSubresourceRegion");
         if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
+        resolve_region(dst, dst_subresource, x, y, src, src_subresource, rect, format, mode);
+    }
+
+    // ID3D12GraphicsCommandList4 render passes, emulated at RenderPassesTier 0 on the list's own commands (D3D-27,
+    // docs/d3d12_vulkan.md section 4.3). BeginRenderPass binds the pass's targets as OMSetRenderTargets does and runs
+    // the CLEAR beginning accesses as ClearRenderTargetView / ClearDepthStencilView (the depth and stencil planes each
+    // by their own access). PRESERVE, DISCARD, NO_ACCESS and the PRESERVE_LOCAL_* accesses need no command: a
+    // discarded target's contents are undefined, so keeping them is valid. The RESOLVE ending accesses are copied
+    // here, since the application's arrays need not outlive the call, and run at EndRenderPass as
+    // ResolveSubresourceRegion does. A pass that resumes a suspended one skips its clears, and a pass that suspends
+    // skips its resolves: those belong to the first and the last part of the pass. Direct lists only, one pass at a
+    // time; the calls D3D12 forbids inside a pass are not checked.
+    void STDMETHODCALLTYPE BeginRenderPass(UINT count, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* targets,
+                                           const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* depth,
+                                           D3D12_RENDER_PASS_FLAGS flags) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList4::BeginRenderPass");
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT || list_.closed()) return check(false);
+        if (in_render_pass_ || count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT || (count && !targets))
+            return check(false);
+        if (flags & D3D12_RENDER_PASS_FLAG_ALLOW_UAV_WRITES)
+            note_once("BeginRenderPass: ALLOW_UAV_WRITES needs no command at RenderPassesTier 0");
+        if (flags & (D3D12_RENDER_PASS_FLAG_BIND_READ_ONLY_DEPTH | D3D12_RENDER_PASS_FLAG_BIND_READ_ONLY_STENCIL))
+            note_once("BeginRenderPass: BIND_READ_ONLY_DEPTH/STENCIL use the DSV as it was created");
+        const bool resuming = flags & D3D12_RENDER_PASS_FLAG_RESUMING_PASS;
+        in_render_pass_ = true;
+        pass_resolves_.clear();
+        pass_suspending_ = flags & D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS;
+
+        std::array<D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> handles{};
+        for (UINT i = 0; i < count; ++i) handles[i] = targets[i].cpuDescriptor;
+        const D3D12_CPU_DESCRIPTOR_HANDLE depth_handle = depth ? depth->cpuDescriptor : D3D12_CPU_DESCRIPTOR_HANDLE{};
+        bind_targets(count, count ? handles.data() : nullptr, FALSE, depth ? &depth_handle : nullptr);
+
+        for (UINT i = 0; i < count; ++i) {
+            const auto& target = targets[i];
+            if (target.BeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR && !resuming) {
+                if (!target.cpuDescriptor.ptr) return check(false);
+                const FLOAT* color = target.BeginningAccess.Clear.ClearValue.Color;
+                check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(target.cpuDescriptor.ptr),
+                                                {color[0], color[1], color[2], color[3]}, {}));
+            }
+            if (target.EndingAccess.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE)
+                keep_resolve(target.EndingAccess.Resolve);
+        }
+        if (!depth) return;
+        UINT clear_flags = 0;
+        if (depth->DepthBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
+            clear_flags |= D3D12_CLEAR_FLAG_DEPTH;
+        if (depth->StencilBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
+            clear_flags |= D3D12_CLEAR_FLAG_STENCIL;
+        if (clear_flags && !resuming) {
+            if (!depth->cpuDescriptor.ptr) return check(false);
+            const auto& depth_value = depth->DepthBeginningAccess.Clear.ClearValue.DepthStencil;
+            const auto& stencil_value = depth->StencilBeginningAccess.Clear.ClearValue.DepthStencil;
+            check(list_.clear_depth_stencil(*reinterpret_cast<const leonida::TargetView*>(depth->cpuDescriptor.ptr),
+                                            clear_flags, depth_value.Depth, stencil_value.Stencil, {}));
+        }
+        if (depth->DepthEndingAccess.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE)
+            keep_resolve(depth->DepthEndingAccess.Resolve);
+        if (depth->StencilEndingAccess.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE)
+            keep_resolve(depth->StencilEndingAccess.Resolve);
+    }
+
+    void STDMETHODCALLTYPE EndRenderPass() override {
+        d3d12_trace::record("ID3D12GraphicsCommandList4::EndRenderPass");
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT || list_.closed() || !in_render_pass_) return check(false);
+        in_render_pass_ = false;
+        if (!pass_suspending_) {
+            for (auto& resolve : pass_resolves_) {
+                for (auto& sub : resolve.subresources)
+                    resolve_region(resolve.dst, sub.DstSubresource, sub.DstX, sub.DstY, resolve.src,
+                                   sub.SrcSubresource, &sub.SrcRect, resolve.format, resolve.mode);
+            }
+        }
+        pass_resolves_.clear();
+    }
+
+    // The checks and the command of ResolveSubresourceRegion, without its trace line (a render pass resolve is
+    // traced as EndRenderPass).
+    void resolve_region(ID3D12Resource* dst, UINT dst_subresource, UINT x, UINT y, ID3D12Resource* src,
+                        UINT src_subresource, D3D12_RECT* rect, DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) {
         leonida::ResolveRegion region{x, y, std::nullopt};
         if (mode != D3D12_RESOLVE_MODE_AVERAGE || !color_resolve_format_matches(format, dst, src)) {
             if (!depth_stencil_resolve_supported(format, dst, dst_subresource, x, y, src, src_subresource, rect,
@@ -1275,6 +1370,28 @@ private:
     leonida::TargetView depth_{};
     std::array<float, 4> blend_factor_{1, 1, 1, 1};
 
+    // The open render pass: its RESOLVE ending accesses, copied at BeginRenderPass, and whether it suspends.
+    struct PassResolve {
+        ID3D12Resource* src = nullptr;
+        ID3D12Resource* dst = nullptr;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        D3D12_RESOLVE_MODE mode = D3D12_RESOLVE_MODE_AVERAGE;
+        std::vector<D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS> subresources;
+    };
+    std::vector<PassResolve> pass_resolves_;
+    bool in_render_pass_ = false;
+    bool pass_suspending_ = false;
+
+    void keep_resolve(const D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_PARAMETERS& resolve) {
+        if (!resolve.pSrcResource || !resolve.pDstResource ||
+            (resolve.SubresourceCount && !resolve.pSubresourceParameters))
+            return check(false);
+        PassResolve kept{resolve.pSrcResource, resolve.pDstResource, resolve.Format, resolve.ResolveMode, {}};
+        kept.subresources.assign(resolve.pSubresourceParameters,
+                                 resolve.pSubresourceParameters + resolve.SubresourceCount);
+        pass_resolves_.push_back(std::move(kept));
+    }
+
     // The root signatures and pipeline states this recording uses. D3D12 lets an application release them right
     // after Set*RootSignature / SetPipelineState; the list keeps them until Reset or its own release, so the root
     // layout it reads and the pipeline ExecuteCommandLists looks up still exist. (Keeping them alive while the GPU
@@ -1373,6 +1490,8 @@ private:
         draw_views_stale_ = true;
         depth_ = {};
         blend_factor_ = {1, 1, 1, 1};
+        in_render_pass_ = pass_suspending_ = false;
+        pass_resolves_.clear();
         set_pipeline(state);
     }
 
