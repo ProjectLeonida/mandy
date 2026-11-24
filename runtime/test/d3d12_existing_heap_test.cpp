@@ -1059,9 +1059,14 @@ int check_placed_target_backing(ID3D12Device* device) {
     });
     EXPECT(!retry.ensure() && !retry.bound());
     std::array<std::thread, 4> callers;
-    for (auto& thread : callers) thread = std::thread([&] { retry.ensure(); });
+    std::atomic<unsigned> successes{0};
+    for (auto& thread : callers) {
+        thread = std::thread([&] {
+            if (retry.ensure()) ++successes;
+        });
+    }
     for (auto& thread : callers) thread.join();
-    EXPECT(retry.bound() && attempts.load() == 2);
+    EXPECT(retry.bound() && attempts.load() == 2 && successes.load() == callers.size());
     constexpr UINT width = 16, height = 8, pitch = 256;
     void* pages = VirtualAlloc(nullptr, 65536, MEM_RESERVE, PAGE_NOACCESS);
     EXPECT(pages);
@@ -1081,7 +1086,13 @@ int check_placed_target_backing(ID3D12Device* device) {
     device->CreateRenderTargetView(target.p, nullptr, rtv);
     const char* setting = std::getenv("LEONIDA_PLACED_IMAGE_DEFER");
     const bool lazy = !setting || std::strcmp(setting, "0");
-    EXPECT(bool(rt::d3d12::vulkan_memory_flags(target.p)) == !lazy);
+    const auto backed = [](ID3D12Resource* r) { return rt::d3d12::vulkan_memory_flags(r) != 0; };
+    EXPECT(backed(target.p) == !lazy);
+    D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    Ref<ID3D12Resource> committed;
+    EXPECT_HR(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON,
+                                              nullptr, IID_PPV_ARGS(&committed.p)), S_OK);
+    EXPECT(backed(committed.p));
     GpuReader gpu;
     EXPECT(!gpu.init(device, pitch * height));
     EXPECT_HR(gpu.allocator->Reset(), S_OK);
@@ -1096,12 +1107,13 @@ int check_placed_target_backing(ID3D12Device* device) {
     dst.PlacedFootprint.Footprint = {d.Format, width, height, 1, pitch};
     gpu.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     EXPECT_HR(gpu.list->Close(), S_OK);
+    EXPECT(backed(target.p) == !lazy);
     ID3D12CommandList* lists[]{gpu.list.p};
     gpu.queue->ExecuteCommandLists(1, lists);
     EXPECT_HR(gpu.queue->Signal(gpu.fence.p, 1), S_OK);
     EXPECT_HR(gpu.fence->SetEventOnCompletion(1, gpu.done), S_OK);
     EXPECT(WaitForSingleObject(gpu.done, 30000) == WAIT_OBJECT_0);
-    EXPECT(rt::d3d12::vulkan_memory_flags(target.p));
+    EXPECT(backed(target.p));
     void* mapped = nullptr;
     EXPECT_HR(gpu.readback->Map(0, nullptr, &mapped), S_OK);
     for (UINT y = 0; y < height; ++y) {
