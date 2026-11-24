@@ -7,7 +7,7 @@ numbers, call shapes and counts. [boot.md](boot.md) has the runbook that produce
 executable under `--dry-run`.
 
 Setup: `main` `1cc6e3c12` with #6709, #4531, #6582, #4313, #4348 and #2490 merged locally, plus the local
-stand-ins named below (not pull requests yet). Own 1.0.2.1 copy, Windows 11, RTX 4090 (driver 617.42),
+stand-ins named below (row 9 is now #601; the rest are not pull requests yet). Own 1.0.2.1 copy, Windows 11, RTX 4090 (driver 617.42),
 `LEONIDA_D3D12=vulkan`, MSVC 2022 `RelWithDebInfo` build.
 
 ## 1. The chain
@@ -22,7 +22,7 @@ stand-ins named below (not pull requests yet). Own 1.0.2.1 copy, Windows 11, RTX
 | 6 | `XMemAllocatePhysicalPages` unimplemented; the title asserts on FALSE | Local stand-in, §2 |
 | 7 | `D3D12XboxCreateDevice` succeeds; device slot 26 is called with its arguments swapped | Local, §3.1 |
 | 8 | Device slot 48 is forwarded to the PC slot 48 and fails | Local, §3.2 |
-| 9 | Device slot 73 is forwarded to the PC slot 73; the title then reads through a null list | #2490's list proxy plus local routing, §3.3 |
+| 9 | Device slot 73 is forwarded to the PC slot 73; the title then reads through a null list | #2490's list proxy plus local routing, now the runtime's own answer in #601, §3.3 |
 | 10 | An `XMemVirtualAlloc` reserve of about 185 MiB with type `0x42000`, attribute 7 and `PAGE_NOACCESS` is refused with `ERROR_INVALID_PARAMETER`. `0x40000` is `MEM_RESERVE_PLACEHOLDER` on the PC, which `VirtualAlloc` refuses and only `VirtualAlloc2` accepts; stop 11 supports the same reading on the console | Local: reserve it with `VirtualAlloc2(MEM_RESERVE \| MEM_RESERVE_PLACEHOLDER)` |
 | 11 | The title carves five sub-ranges out of that placeholder with `MEM_RESERVE \| MEM_REPLACE_PLACEHOLDER \| MEM_PHYSICAL \| MEM_LARGE_PAGES` (`0x20406000`) at addresses inside it, then allocates a second batch of physical pages | Local: a physical reserve inside a known placeholder stays a placeholder (the page maps split it); other `MEM_REPLACE_PLACEHOLDER` calls split the range and allocate it in place |
 | 12 | Device slot 133 is called; the proxy table had 128 slots, so the call went through a null pointer | Local: a 192-slot table, and a slot 133 stand-in, §3.4 |
@@ -82,6 +82,11 @@ Xbox device slot 73 is `(desc, allocator, pso, riid, out)`. `desc` is 16 bytes a
 package doesn't export it). The shim's unknown-IID log names it on the player's machine. Creating an
 `ID3D12GraphicsCommandList` of that type and handing out #2490's console list
 proxy gets all 581 lists created and closed.
+
+#601 puts that answer in the runtime instead of a local tree: when the console interface is what was asked for, slot
+73 builds the list as `ID3D12GraphicsCommandList` and the list proxy is handed back for the requested IID; any other
+IID reaches the real device exactly as the title passed it. What that console interface's own method table adds is
+still not established, and #601 does not guess at it.
 
 ### 3.4 Device slot 133 places a resource at a virtual address
 
