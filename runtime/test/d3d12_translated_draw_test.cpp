@@ -28,6 +28,9 @@
 // The triangle's long edge passes exactly through the centres of the pixels with row - col == 32 (32 of them); the
 // top-left rule leaves them uncovered (a right edge), so they must be the clear colour; they are counted apart. Every
 // other pixel (4064 of 4096) is compared exactly. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
+// The host test also changes only the two V# addresses to a valid arena range of degenerate vertices. That
+// frame must contain the exact clear colour everywhere. Restoring the V#s must reproduce the original image.
+// This is an address control, not a test of slot 133, XMem import or the retail title.
 // Built a second time with LEONIDA_M15_GUEST, this file is tiny_guest_draw.exe, which runs the same draws and the same
 // pixel checks as a `gta6rt --run` guest (test/run_guest_draw.cmake). Its device comes from an imported
 // d3d12_xs.dll!D3D12XboxCreateDevice, which gta6rt's shim registry answers (LEONIDA_D3D12=vulkan, LEONIDA_SHADERS=
@@ -151,6 +154,13 @@ int main() {
                                 vertex(-1, 0, c1), vertex(0, 1, c1), vertex(0, 0, c1),    //
                                 vertex(-1, 0, c2), vertex(-1, -1, c2), vertex(0, -1, c2)};
     static_assert(sizeof(Vertex) == 32 && sizeof(vertices) == 288);
+#ifndef LEONIDA_M15_GUEST
+    constexpr unsigned control_vertices = 9;  // the largest V# still describes only allocated bytes
+    const auto degenerate = vertex(-0.5f, 0.5f, c1);
+    constexpr UINT64 vertex_bytes = sizeof(vertices) + control_vertices * sizeof(Vertex);
+#else
+    constexpr UINT64 vertex_bytes = sizeof(vertices);
+#endif
 
     std::vector<Pixel> pixels(target_extent * target_extent);
     {
@@ -223,7 +233,7 @@ int main() {
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
         Ref<ID3D12Resource> vertex_buffer, upload, readback, target;
-        const auto vb_desc = buffer_desc(sizeof(vertices));
+        const auto vb_desc = buffer_desc(vertex_bytes);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &vb_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&vertex_buffer.p))));
@@ -250,6 +260,10 @@ int main() {
         std::uint8_t* up = nullptr;
         EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
         std::memcpy(up, vertices, sizeof(vertices));
+#ifndef LEONIDA_M15_GUEST
+        for (unsigned i = 0; i < control_vertices; ++i)
+            std::memcpy(up + sizeof(vertices) + i * sizeof(Vertex), &degenerate, sizeof(Vertex));
+#endif
 
         // A shader-visible heap in the arena; each slot gets the 16 bytes of a V#, written as raw bytes.
         const D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
@@ -264,8 +278,10 @@ int main() {
         EXPECT(buffer_va >= 0x10000);
         const std::array<std::uint32_t, 4> vsharps[2] = {make_vsharp(buffer_va, 9),                       // 9 vertices
                                                          make_vsharp(buffer_va + 6 * sizeof(Vertex), 3)};  // 6..8
-        for (unsigned i = 0; i < 2; ++i)
-            std::memcpy(reinterpret_cast<void*>(cpu + std::uint64_t(i) * step), vsharps[i].data(), 16);
+        const auto write_vsharp = [&](unsigned i, const std::array<std::uint32_t, 4>& descriptor) {
+            std::memcpy(reinterpret_cast<void*>(cpu + std::uint64_t(i) * step), descriptor.data(), sizeof(descriptor));
+        };
+        for (unsigned i = 0; i < 2; ++i) write_vsharp(i, vsharps[i]);
 
         const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         Ref<ID3D12DescriptorHeap> rtv_heap;
@@ -285,7 +301,7 @@ int main() {
                                                    IID_PPV_ARGS(&list.p))));
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
-        list->CopyBufferRegion(vertex_buffer.p, 0, upload.p, 0, sizeof(vertices));
+        list->CopyBufferRegion(vertex_buffer.p, 0, upload.p, 0, vertex_bytes);
         D3D12_RESOURCE_BARRIER barriers[2] = {
             transition(vertex_buffer.p, D3D12_RESOURCE_STATE_COPY_DEST,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
@@ -293,6 +309,7 @@ int main() {
         list->ResourceBarrier(2, barriers);
         // The first command list already contains the vertex upload. Reuse it for subsequent frames
         // after the preceding submission's fence has completed and its readback is available.
+        constexpr Pixel clear_color{0.5f, 0.125f, 0.25f, 0.5f};
         const auto render_frame = [&](UINT64 frame, float x_offset, float bias) -> int {
             if (frame > 1) {
                 EXPECT(SUCCEEDED(allocator->Reset()));
@@ -301,8 +318,7 @@ int main() {
                                             D3D12_RESOURCE_STATE_RENDER_TARGET);
                 list->ResourceBarrier(1, &to_target);
             }
-            const FLOAT clear[4] = {0.5f, 0.125f, 0.25f, 0.5f};
-            list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+            list->ClearRenderTargetView(rtv, clear_color.data(), 0, nullptr);
 
             list->SetGraphicsRootSignature(root.p);
             ID3D12DescriptorHeap* heaps[] = {srv_heap.p};
@@ -370,6 +386,21 @@ int main() {
         }
 #endif
         EXPECT(render_frame(1, 0.0f, 0.0f) == 0);
+#ifndef LEONIDA_M15_GUEST
+        const auto original_pixels = pixels;
+        // The fence in render_frame has retired all reads of the shader-visible heap. Keep both
+        // descriptor shapes and all draw state unchanged; change only the address read by the VS.
+        const auto redirected_va = buffer_va + sizeof(vertices);
+        write_vsharp(0, make_vsharp(redirected_va, 9));
+        write_vsharp(1, make_vsharp(redirected_va + 6 * sizeof(Vertex), 3));
+        EXPECT(render_frame(2, 0.0f, 0.0f) == 0);
+        for (const auto& pixel : pixels)
+            EXPECT(std::memcmp(pixel.data(), clear_color.data(), sizeof(Pixel)) == 0);
+        for (unsigned i = 0; i < 2; ++i) write_vsharp(i, vsharps[i]);
+        EXPECT(render_frame(3, 0.0f, 0.0f) == 0);
+        EXPECT(std::memcmp(pixels.data(), original_pixels.data(), pixels.size() * sizeof(Pixel)) == 0);
+        std::printf("V# address control: %zu clear pixels after redirection; restored frame bit-exact\n", pixels.size());
+#endif
         for (auto* r : {&vertex_buffer, &upload, &readback, &target}) r->reset();
         pso.reset();
         root.reset();
