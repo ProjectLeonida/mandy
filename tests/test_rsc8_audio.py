@@ -1667,6 +1667,22 @@ class MarkerRegionsTest(unittest.TestCase):
             "names": {}, "exceptions_total": 0, "exceptions": [],
         })
 
+    def test_stage_cleanup_restores_write_mode_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_json = os.path.join(tmp, "out.json")
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def track_chmod(p, mode, **kwargs):
+                chmod_calls.append((p, mode))
+                return real_chmod(p, mode, **kwargs)
+
+            with mock.patch("rsc8_audio.os.replace", side_effect=OSError("replace failed")), \
+                 mock.patch("rsc8_audio.os.chmod", side_effect=track_chmod):
+                with self.assertRaises(OSError):
+                    rsc8_audio.write_report(out_json, [], {})
+            self.assertTrue(any(mode == 0o600 for p, mode in chmod_calls))
+
 
 if __name__ == "__main__":
     unittest.main()
