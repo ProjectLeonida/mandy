@@ -51,6 +51,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -1099,10 +1100,6 @@ struct DeviceState {
         border_color_table.push_back(entry);
         return idx;
     }
-    // A T# names a texture by an address of its own: above 4 GiB, which the GPU address arena for buffers (docs
-    // section 3.3) stays below, and 256 bytes apart (the T# keeps addresses in 256-byte units). Nothing
-    // dereferences it.
-    std::atomic<std::uint64_t> next_image_address{std::uint64_t(1) << 32};
 
     // 0 float, 1 unsigned integer, 2 signed integer: which of the three storage-image arrays a view belongs in.
     static int numeric_class(VkFormat format) {
@@ -1130,7 +1127,13 @@ struct DeviceState {
         }
     }
 
-    void release(const ImageEntry& entry) {  // descriptor_mutex held
+    void release(const ImageEntry& entry, bool swapchain_idle) {  // descriptor_mutex held
+        if (swapchain_idle) {
+            bindless->remove_image(entry.dimension, entry.index);
+            context->vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
+            if (entry.storage) context->vk.vkDestroyImageView(info.device, entry.storage, nullptr);
+            return;
+        }
         const std::uint64_t slot_handle =
             (static_cast<std::uint64_t>(entry.dimension) << 32) | static_cast<std::uint64_t>(entry.index);
         context->defer_destroy(leonida::DeferredDeletionQueue::Kind::bindless_slot, slot_handle);
@@ -1269,20 +1272,20 @@ struct DeviceState {
     }
 
     // The texture at `address` is gone: its views leave set 0 and its T#s the hash table.
-    void forget_image(std::uint64_t address) {
+    void forget_image(std::uint64_t address, bool swapchain_idle = false) {
         std::lock_guard lock(descriptor_mutex);
         if (!bindless) return;
         const auto [first, last] = image_keys.equal_range(address);
         for (auto it = first; it != last; ++it) {
             const auto entry = image_entries.find(it->second);
             bindless->erase_key(it->second);
-            release(entry->second);
+            release(entry->second, swapchain_idle);
             image_entries.erase(entry);
         }
         image_keys.erase(first, last);
         std::erase_if(replaced_images, [&](const ImageEntry& entry) {
             if (entry.address != address) return false;
-            release(entry);
+            release(entry, swapchain_idle);
             return true;
         });
     }
@@ -2150,7 +2153,7 @@ public:
         sparse_image_ = true;
         format_ = format.format;
         aspects_ = format.aspects;
-        image_address_ = device_.next_image_address.fetch_add(256);
+        image_address_ = device_.context->allocate_image_address();
         binding_.image = image_;
         binding_.format = format_;
         binding_.aspects = aspects_;
@@ -2269,7 +2272,7 @@ public:
         format_ = format.format;
         uint_backed_ = format.uint_backed;
         aspects_ = format.aspects;
-        image_address_ = device_.next_image_address.fetch_add(256);
+        image_address_ = device_.context->allocate_image_address();
         binding_ = binding;
         if (host_transfer_) {
             // Moved to GENERAL and zero-filled on the host now, so the CPU can copy into it before any command
@@ -4662,16 +4665,27 @@ private:
     std::shared_ptr<ShaderCacheStore> store_;
 };
 
+struct TextureBacking {
+    const D3D12_RESOURCE_DESC& desc;
+    VkImage image;
+    VkFormat format;
+    VkImageAspectFlags aspects;
+    std::uint64_t address;
+    const Resource* resource = nullptr;  // swapchain images have no Resource allocation
+};
+
 // The T# of a view: what the shader gets to know about it, in the structure the console's shaders read.
 // False (with a log) for a view set 0 cannot show yet.
-bool image_descriptor(const Resource& resource, const TextureView& view, leonida::gfx10::Image& out) {
+bool image_descriptor(const TextureBacking& backing, const TextureView& view, leonida::gfx10::Image& out) {
     namespace g = leonida::gfx10;
-    const D3D12_RESOURCE_DESC& desc = resource.desc();
+    const D3D12_RESOURCE_DESC& desc = backing.desc;
+    const Resource* resource = backing.resource;
+    const bool castable = resource && resource->has_view_format_list();
     // Plane 1 of a depth-stencil texture is its stencil, viewed as X24_TYPELESS_G8_UINT (D24S8) or
     // X32_TYPELESS_G8X24_UINT (D32S8): eight unsigned bits in G, as D3D12 returns them. The T# is 8_UINT, the
     // format of the console's separate stencil surface, and bind_image views the stencil aspect for it.
     const bool stencil = view.plane == 1;
-    if (view.plane > 1 || (stencil && !(resource.aspects() & VK_IMAGE_ASPECT_STENCIL_BIT))) {
+    if (view.plane > 1 || (stencil && !(backing.aspects & VK_IMAGE_ASPECT_STENCIL_BIT))) {
         log_once("no such plane in this texture; plane", int(view.plane));
         return false;
     }
@@ -4699,7 +4713,7 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     if (msaa) {
         // The MS bindings expose typed colour SRVs. An MS view has one mip and can name an array slice range.
         const Format format = texture_storage_format(desc.Format, false);
-        if (resource.aspects() != VK_IMAGE_ASPECT_COLOR_BIT || format.typeless ||
+        if (backing.aspects != VK_IMAGE_ASPECT_COLOR_BIT || format.typeless ||
             (view.format != DXGI_FORMAT_UNKNOWN && view.format != desc.Format)) {
             log_once("multisample shader view requires a matching typed colour format:", int(desc.Format));
             return false;
@@ -4710,7 +4724,8 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             return false;
         }
     }
-    const VkFormat resource_format = resource.uint_backed() ? resource.uint_backed() : resource.format();
+    const VkFormat uint_backed = resource ? resource->uint_backed() : VK_FORMAT_UNDEFINED;
+    const VkFormat resource_format = uint_backed ? uint_backed : backing.format;
     VkFormat named = resource_format;
     if (volume) {
         const bool compatible = vulkan_format(desc.Format, false).typeless
@@ -4727,7 +4742,7 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     // format (VUID-VkImageViewCreateInfo-image-01762 / 09594), so colour view formats such as R16_FLOAT on D16 or
     // R32_UINT on D32 must be rejected. Each view format belongs to its own DXGI family only, whatever format
     // backs the texture (a D24 texture may be D32_SFLOAT_S8_UINT underneath).
-    const bool depth_plane = (resource.aspects() & VK_IMAGE_ASPECT_DEPTH_BIT) && !stencil;
+    const bool depth_plane = (backing.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) && !stencil;
     if (depth_plane) {
         const bool depth_format_fits =
             (desc.Format == DXGI_FORMAT_D16_UNORM &&
@@ -4754,7 +4769,8 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         }
         // Only a castable-format list that names the view's format lets a view cross the two families, as WARP and
         // AMD's D3D12 driver accept (relaxed casting).
-        if (alpha_unused(view.format) != alpha_unused(desc.Format) && !resource.lists_castable_format(view.format)) {
+        if (alpha_unused(view.format) != alpha_unused(desc.Format) &&
+            !(resource && resource->lists_castable_format(view.format))) {
             log_once("view format from another typeless family (B8G8R8X8 and B8G8R8A8):", int(view.format));
             return false;
         }
@@ -4771,28 +4787,28 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     // A 96-bit texture takes views of its own family only (and a four-channel texture none of it), and only the
     // TYPELESS one is cast between FLOAT, UINT and SINT. Its T# names the three-channel format: the swizzle below
     // then reads alpha as one, and bind_image views the RGBA32 image accordingly.
-    const bool rgb96 = resource.rgb96();
+    const bool rgb96 = resource && resource->rgb96();
     if (!stencil && !depth_plane) {
         const bool view_rgb96 = view.format != DXGI_FORMAT_UNKNOWN ? vulkan_format(view.format, false).rgb96 : rgb96;
         if (view_rgb96 != rgb96 ||
-            (rgb96 && desc.Format != DXGI_FORMAT_R32G32B32_TYPELESS && named != resource.format())) {
+            (rgb96 && desc.Format != DXGI_FORMAT_R32G32B32_TYPELESS && named != backing.format)) {
             log_once("view format outside the texture's 96-bit family:", int(view.format));
             return false;
         }
         if (rgb96) named = rgb96_named_format(named);
     }
-    if (named == VK_FORMAT_UNDEFINED || !resource.allows_view_format(named)) {
+    if (named == VK_FORMAT_UNDEFINED || (resource && !resource->allows_view_format(named))) {
         log_once("view format not in the resource's castable list:", int(view.format));
         return false;
     }
     const std::uint32_t code = stencil ? g::stencil_format : g::format_from_vulkan(named);
     VkFormat view_format = VK_FORMAT_UNDEFINED;
     if (stencil) {
-        view_format = resource.format();
+        view_format = backing.format;
     } else if (code && rgb96) {
         view_format = named;
     } else if (code) {
-        view_format = g::vulkan_view_format(resource_format, code, resource.has_view_format_list());
+        view_format = g::vulkan_view_format(resource_format, code, castable);
     }
     if (view_format == VK_FORMAT_UNDEFINED) {
         log_once("view format not supported for this texture:", int(view.format));
@@ -4808,7 +4824,7 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         return false;
     }
     out = {};
-    out.address = resource.image_address();
+    out.address = backing.address;
     out.format = code;
     out.type = view.type;
     out.width = std::uint32_t(desc.Width);
@@ -5321,6 +5337,9 @@ public:
                 if (st->bindless) st->bindless->remove_image(static_cast<leonida::ImageDimension>(dim), idx);
             },
             &state_);
+        state_.context->set_swapchain_image_release([this](std::uint64_t address) {
+            state_.forget_image(address, /*swapchain_idle=*/true);
+        });
         state_.context->set_bindless_prepare([this](VkCommandBuffer command_buffer) {
             std::unique_lock lock(state_.descriptor_mutex);
             if (!state_.bindless->fallbacks_ready()) state_.bindless->record_fallback_init(command_buffer);
@@ -5471,6 +5490,7 @@ public:
             }
             state_.context->drain_deleted_resources(UINT64_MAX);
             state_.context->set_bindless_release(nullptr, nullptr);
+            state_.context->set_swapchain_image_release(nullptr);
             state_.context->set_bindless_current(nullptr);  // the retired generations go with state_.bindless below
         }
         state_.staging_queue.reset();  // it uses the context
@@ -6425,16 +6445,23 @@ public:
         using leonida::gfx10::ImageType;
         if (!destination.ptr) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        if (!resource) return;
         const Resource* r = Resource::from<Resource>(resource);
+        std::optional<leonida::ResourceBinding> back_buffer;
         if (!r) {
-            if (resource) stub("ID3D12Device::CreateShaderResourceView(resource from another device)");
+            back_buffer = state_.context->resource_binding(resource_id(resource));
+            if (!back_buffer) {
+                stub("ID3D12Device::CreateShaderResourceView(resource from another device)");
+                return;
+            }
+            if (!back_buffer->swapchain_image_address) return;
+        }
+        const D3D12_RESOURCE_DESC rd = r ? r->desc() : resource->GetDesc();
+        if (rd.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) {
+            log_once("shader-resource view denied by resource flags; format", int(rd.Format));
             return;
         }
-        if (r->desc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) {
-            log_once("shader-resource view denied by resource flags; format", int(r->desc().Format));
-            return;
-        }
-        if (!r->image()) {
+        if (r && !r->image()) {
             if (!desc) {
                 log_once("buffer SRV requires a description; width", int(r->desc().Width));
                 return;
@@ -6508,13 +6535,13 @@ public:
         }
         TextureView view{};
         if (!desc) {
-            const bool array = r->desc().DepthOrArraySize > 1;
-            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array) {
+            const bool array = rd.DepthOrArraySize > 1;
+            if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array) {
                 view.type = ImageType::image_1d;
                 view.layer_count = 1;
-            } else if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+            } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
                 view.type = ImageType::image_3d;
-            else if (r->desc().SampleDesc.Count > 1)
+            else if (rd.SampleDesc.Count > 1)
                 view.type = array ? ImageType::image_2d_msaa_array : ImageType::image_2d_msaa;
             else if (array)
                 view.type = ImageType::image_2d_array;
@@ -6580,7 +6607,19 @@ public:
                 return;
             }
         }
-        write_image_descriptor(*r, view, destination, false);
+        if (r) {
+            write_image_descriptor(*r, view, destination, false);
+        } else if (view.format == DXGI_FORMAT_UNKNOWN || view.format == rd.Format ||
+                   (back_buffer->srgb_view_format != VK_FORMAT_UNDEFINED &&
+                    vulkan_format(view.format, false).format == back_buffer->srgb_view_format)) {
+            // Swapchain images have one mip and a typed Vulkan format. An 8-bit UNORM one is also viewable in its
+            // sRGB format (host-measured on WARP), which the offscreen image lists (dxgi_swapchain.h).
+            const TextureBacking backing{
+                rd, back_buffer->image, back_buffer->format, back_buffer->aspects, back_buffer->swapchain_image_address};
+            write_image_descriptor(backing, view, destination, false);
+        } else {
+            log_once("back-buffer shader-resource view format not supported; format", int(view.format));
+        }
     }
 
     // An unordered-access view of a buffer is a V# in the slot (docs section 3.4): the shader loads those four dwords
@@ -8463,14 +8502,22 @@ private:
     // shown leaves the slot a null descriptor.
     void write_image_descriptor(const Resource& resource, const TextureView& view,
                                 D3D12_CPU_DESCRIPTOR_HANDLE destination, bool storage) {
+        const TextureBacking backing{resource.desc(), resource.image(), resource.format(), resource.aspects(),
+                                     resource.image_address(), &resource};
+        write_image_descriptor(backing, view, destination, storage);
+    }
+
+    void write_image_descriptor(const TextureBacking& backing, const TextureView& view,
+                                D3D12_CPU_DESCRIPTOR_HANDLE destination, bool storage) {
         leonida::gfx10::Image image{};
-        if (!image_descriptor(resource, view, image)) return;
+        if (!image_descriptor(backing, view, image)) return;
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
-        const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
-                                                  resource.aspects(), storage, resource.has_view_format_list(),
-                                                  resource.uint_backed());
-        if (registered && resource.sparse_image()) state_.context->note_shader_image(resource.id());
-        if (leonida::gfx10::multisampled(image.type) && !registered) return;
+        const Resource* resource = backing.resource;
+        const bool registered = state_.bind_image(words, image, backing.image, backing.format, backing.aspects,
+                                                  storage, resource && resource->has_view_format_list(),
+                                                  resource ? resource->uint_backed() : VK_FORMAT_UNDEFINED);
+        if (registered && resource && resource->sparse_image()) state_.context->note_shader_image(resource->id());
+        if (!registered && (!resource || leonida::gfx10::multisampled(image.type))) return;
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
     }
 

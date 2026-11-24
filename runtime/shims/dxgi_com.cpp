@@ -152,12 +152,17 @@ DXGI_FORMAT vk_to_dxgi_format(VkFormat fmt) {
 // leonida::ResourceId registered in VulkanContext, matching d3d12_com.h's resource_id(ID3D12Resource*) contract.
 class BackBufferResource final : public ID3D12ResourceStubs {
 public:
-    explicit BackBufferResource(const D3D12_RESOURCE_DESC& desc) : desc_(desc) {}
+    BackBufferResource(IUnknown& owner, const D3D12_RESOURCE_DESC& desc) : owner_(owner), desc_(desc) {}
 
-    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        const ULONG count = ++refs_;
+        if (count == 2) owner_.AddRef();  // the first external reference keeps the swap chain alive
+        return count;
+    }
     ULONG STDMETHODCALLTYPE Release() override {
+        IUnknown& owner = owner_;
         const ULONG left = --refs_;
-        if (!left) delete this;
+        if (left == 1) owner.Release();  // the last external reference can delete this buffer with its owner
         return left;
     }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
@@ -199,8 +204,13 @@ public:
     leonida::ResourceId resource_id() const { return reinterpret_cast<leonida::ResourceId>(this); }
     bool held_by_app() const { return refs_ > 1; }
 
+    void release_owner_reference() {
+        if (--refs_ == 0) delete this;
+    }
+
 private:
-    std::atomic<ULONG> refs_{1};
+    IUnknown& owner_;
+    std::atomic<ULONG> refs_{1};  // one reference belongs to the swap chain itself
     D3D12_RESOURCE_DESC desc_{};
 };
 
@@ -218,7 +228,7 @@ public:
     }
 
     ~SwapChain() {
-        unregister_buffers();
+        swapchain_.close([this] { unregister_buffers(); });
         if (restrict_to_output_) restrict_to_output_->Release();
         if (waitable_) CloseHandle(waitable_);
         if (device_) device_->Release();
@@ -379,13 +389,13 @@ public:
             return DXGI_ERROR_INVALID_CALL;
         if (present_queues && !std::all_of(present_queues, present_queues + target_count, is_direct_present_queue))
             return DXGI_ERROR_INVALID_CALL;
-        unregister_buffers();
         const VkExtent2D size = size_or_client(width, height, swapchain_.extent());
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
         const UINT next_flags = flags ? flags : flags_;
         const bool allow_tearing = (next_flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
-        if (!swapchain_.resize(w, h, vk_fmt, count, allow_tearing)) return E_FAIL;
+        if (!swapchain_.resize(w, h, vk_fmt, count, allow_tearing, [this] { unregister_buffers(); }))
+            return E_FAIL;
         source_size_ = {w, h};  // host-measured: ResizeBuffers resets the source region to the new back buffers
         statistics_disjoint_.store(true, std::memory_order_relaxed);
         flags_ = next_flags;
@@ -614,16 +624,22 @@ private:
             swapchain_.is_offscreen() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         buffers_.reserve(count);
         for (std::uint32_t i = 0; i < count; ++i) {
-            auto* bb = new BackBufferResource(desc);
-            context_.add_resource(bb->resource_id(), swapchain_.resource_binding(i), initial_layout);
+            auto* bb = new BackBufferResource(*this, desc);
+            auto binding = swapchain_.resource_binding(i);
+            if (buffer_usage_ & DXGI_USAGE_SHADER_INPUT) {
+                binding.sampled = true;
+                binding.sampled_in_general = true;
+                binding.swapchain_image_address = context_.allocate_image_address();
+            }
+            context_.add_resource(bb->resource_id(), binding, initial_layout);
             buffers_.push_back(bb);
         }
     }
 
     void unregister_buffers() {
         for (auto* bb : buffers_) {
-            context_.remove_resource(bb->resource_id());
-            bb->Release();
+            context_.remove_resource(bb->resource_id(), /*swapchain_idle=*/true);
+            bb->release_owner_reference();
         }
         buffers_.clear();
     }
