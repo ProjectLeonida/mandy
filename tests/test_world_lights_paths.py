@@ -590,6 +590,28 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(len(err.getvalue().strip().splitlines()), 1, err.getvalue())
         self.assertNotIn("Traceback", err.getvalue())
 
+    def test_stage_cleanup_restores_write_mode_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lights = os.path.join(tmp, "lights.jsonl")
+            with open(lights, "w", encoding="utf-8") as f:
+                f.write('{"old": true}\n')
+            os.chmod(lights, 0o444)
+
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def track_chmod(p, mode, **kwargs):
+                chmod_calls.append((p, mode))
+                return real_chmod(p, mode, **kwargs)
+
+            with mock.patch("world_lights_paths.os.replace", side_effect=OSError("replace failed")), \
+                 mock.patch("world_lights_paths.os.chmod", side_effect=track_chmod):
+                with self.assertRaises(OSError):
+                    T.summarize({"lights": {}, "archetype_lights": {}, "resources": 0, "incomplete": 0,
+                                 "light_resources": 0, "ranges": {}, "world_lights": []},
+                                lights_out=lights)
+            self.assertTrue(any(mode == 0o600 for p, mode in chmod_calls))
+
     def test_bad_input_is_one_line(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):

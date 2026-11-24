@@ -50,6 +50,7 @@ if _TOOLS_DIR not in sys.path:
 
 from pool_workers import process_workers  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 import world_census as WC  # noqa: E402
 import world_index as WI  # noqa: E402
 
@@ -776,6 +777,10 @@ def summarize(total, entities=None, lights_out=None):
                 pass
             out = None
         if staged is not None and os.path.exists(staged):
+            try:
+                os.chmod(staged, 0o600)
+            except OSError:
+                pass
             os.remove(staged)
         raise
     finally:
@@ -783,10 +788,15 @@ def summarize(total, entities=None, lights_out=None):
             out.close()
     if staged is not None:
         try:
+            os.chmod(staged, published_mode(lights_out))
             os.replace(staged, lights_out)
         except BaseException:
             # A destination that is a directory (or read-only) must not leave the staged copy behind.
             if os.path.exists(staged):
+                try:
+                    os.chmod(staged, 0o600)
+                except OSError:
+                    pass
                 os.remove(staged)
             raise
     summary["placement"] = dict(placed)
