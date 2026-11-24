@@ -2,7 +2,8 @@ import sys
 import os
 import unittest
 
-sys.path.insert(0, 'tools')
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
 import rdna2spirv
 import spirv_asm
 
