@@ -335,7 +335,7 @@ row of the table above is that translation, and `vk_pipeline_check` creates all 
 (18.4 s on one thread, `LoadInstances` 8.6 s the slowest; the 51 emulated ones 26.9 s, `LeafRehydration` 11.6 s the
 slowest). No build option is involved, and the step needed no change. @Jadiac5 measured the same translation on an
 RX 9070 XT (RDNA4, AMD 32.0.32029.2010): 51 of 51 native and 51 of 51 emulated, the slowest module in 19 to 35 s
-([their comment](https://github.com/ItsNotRexed/Leonida/pull/5680#issuecomment-7101091229)). Those are the
+([their comment](https://github.com/ubiquitarianism/leonida/pull/5680#issuecomment-7101091229)). Those are the
 structured modules too, so the dispatch-loop module below has only been tried on the gfx1036 and the RTX 3070.
 
 Measured on the Radeon (gfx1036, AMD 32.0.21042.62) with `vk_pipeline_check --jobs 1`, one module in the driver at
