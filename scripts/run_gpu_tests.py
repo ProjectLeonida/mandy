@@ -38,6 +38,8 @@ from check import cbv_modulate_test
 from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
 from check import shift64_test   # dynamic 64-bit vector shifts and overlapping destinations
 from check import cmp_f64_test   # the 32 binary64 vector compares on memory-fed operands
+from check import round_f64_test   # the four binary64 roundings on memory-fed inputs
+from check import frexp_ldexp_test   # binary32 and binary64 frexp, and v_ldexp_f32, on memory-fed records
 from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
@@ -445,8 +447,10 @@ def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: 
         return None, "SKIP (no 64-wide compute subgroup on this device)"
     if rc == 0 and wave64 and "compute subgroup size: 64" not in msg.splitlines():
         return False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
+    if rc != 0:
+        return False, f"exit {rc}: {msg or 'no test output'}"
     words = dump_words(msg)
-    if rc != 0 or words is None:
+    if words is None:
         return False, msg
     vals = words[:len(want)]
     return words_match(vals, want), " ".join((hex if hexwords else str)(x) for x in vals)
@@ -997,6 +1001,10 @@ def run_suite(a, work: str) -> int:
         if name in CLIP_CASES:
             detail = clip_test(a.build, spirv_dir, name)
             results.append((name, None if isinstance(detail, Skip) else not detail, detail or "four pixel masks exact"))
+        elif name == "cs_w32_frexp_ldexp":
+            detail = frexp_ldexp_test(a.build, spirv_dir, cs_env)
+            results.append((name, None if isinstance(detail, Skip) else not detail,
+                            detail or "768 words exact (64 records, eight results each, and unchanged inputs)"))
         elif name == "cs_w32_shift64":
             detail = shift64_test(a.build, spirv_dir, cs_env)
             results.append((name, None if isinstance(detail, Skip) else not detail,
@@ -1005,6 +1013,10 @@ def run_suite(a, work: str) -> int:
             detail = cmp_f64_test(a.build, spirv_dir, cs_env)
             results.append((name, None if isinstance(detail, Skip) else not detail,
                             detail or "1536 words exact (256 operand pairs and unchanged inputs)"))
+        elif name == "cs_w32_round_f64":
+            detail = round_f64_test(a.build, spirv_dir, cs_env)
+            results.append((name, None if isinstance(detail, Skip) else not detail,
+                            detail or "1152 words exact (64 inputs, eight roundings each, and unchanged inputs)"))
         elif name == "cs_workgroup_yz":
             rc, msg = run_cmd([vk_compute, spv, "2x3x4", "workgroup_yz"], env=cs_env)
             results.append((name,) + compute_result(rc, msg, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches"
@@ -1335,7 +1347,7 @@ def run_suite(a, work: str) -> int:
                     continue
                 if rc == 0:
                     skip = wave32_lane_skip(msg)
-            if skip is None and name in WAVE32_PIN_DUMPS:
+            if rc == 0 and skip is None and name in WAVE32_PIN_DUMPS:
                 # the device may not be able to run the wave size this fixture was written for (a 64-only device
                 # can't pin 32, so cs_barrier_loop's words mean nothing); check.py skips it too
                 skip = subgroup_pin_skip(msg, cs_env)

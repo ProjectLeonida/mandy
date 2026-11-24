@@ -36,9 +36,9 @@ TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 18)  # three mesh fixtures, ps_tex, ps_imgatomic, ps_table_fetch, six compute fixtures,
+         + len(check.TEXTURE_CONSTANTS) + 20)  # three mesh fixtures, ps_tex, ps_imgatomic, ps_table_fetch, six compute fixtures,
          # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case), cs_fmt_all,
-         # cs_w32_shift64 and cs_w32_cmp_f64
+         # cs_w32_shift64, cs_w32_cmp_f64, cs_w32_round_f64 and cs_w32_frexp_ldexp
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -108,6 +108,22 @@ class Wave64Checks(unittest.TestCase):
             if name == "cs_w32_cmp_f64":
                 # The compare words come back only if check.py seeded the operand records through VKC_HEAP_INIT.
                 initial, expected = check.cmp_f64_words()
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), str(len(expected))))
+                seeded = Path(env["VKC_HEAP_INIT"]).read_bytes() == struct.pack(f"<{len(initial)}I", *initial)
+                words = expected if seeded else initial
+                Path(env["VKC_DUMP"]).write_bytes(struct.pack(f"<{len(words)}I", *words))
+                return 0, ""
+            if name == "cs_w32_frexp_ldexp":
+                # The frexp and ldexp words come back only if check.py seeded the records through VKC_HEAP_INIT.
+                initial, expected = check.frexp_ldexp_words()
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), str(len(expected))))
+                seeded = Path(env["VKC_HEAP_INIT"]).read_bytes() == struct.pack(f"<{len(initial)}I", *initial)
+                words = expected if seeded else initial
+                Path(env["VKC_DUMP"]).write_bytes(struct.pack(f"<{len(words)}I", *words))
+                return 0, ""
+            if name == "cs_w32_round_f64":
+                # The rounded words come back only if check.py seeded the inputs through VKC_HEAP_INIT.
+                initial, expected = check.round_f64_words()
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), str(len(expected))))
                 seeded = Path(env["VKC_HEAP_INIT"]).read_bytes() == struct.pack(f"<{len(initial)}I", *initial)
                 words = expected if seeded else initial
@@ -311,7 +327,7 @@ class FloatToIntSweep(unittest.TestCase):
 
         def harness(_tool, _shader, *_args, env=None):
             calls.append(env.get("VKC_SUBGROUP_SIZE"))
-            return 1, "compute subgroup size: 32 not available\n"
+            return 0, "compute subgroup size: 32 not available\n"
 
         with patch.object(check, "run", side_effect=harness), \
                 patch.object(check, "subgroup_size", return_value=32):
@@ -975,7 +991,12 @@ class Wave32LaneDumps(unittest.TestCase):
             out = "compute subgroup size: 32 not available\nout[0..7] = 0 0 0 0 0 0 0 0\n"
             with patch.object(check, "run", return_value=(0, out)):
                 problem = check.compute_test("tools", tmp, "cs_barrier_loop", "1", "dump", expected_words=[128])
-        self.assertIsInstance(problem, check.Skip)
+            self.assertIsInstance(problem, check.Skip)
+            for code in (1, -11, 0xC0000005):
+                with self.subTest(code=code), patch.object(check, "run", return_value=(code, out)):
+                    problem = check.compute_test("tools", tmp, "cs_barrier_loop", "1", "dump", expected_words=[128])
+                    self.assertNotIsInstance(problem, check.Skip)
+                    self.assertIn(f"exit {code}:", problem)
 
     def test_skipped_when_32_lanes_cannot_be_pinned(self):
         for name in check.WAVE32_LANE_DUMPS:

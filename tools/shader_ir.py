@@ -16,6 +16,7 @@ from collections import Counter
 
 ENC = re.compile(r";\s*encoding:\s*\[([^\]]*)\]")
 HDR = re.compile(r"^;\s*(\S+)\s+code 0x([0-9a-f]+)\.\.0x([0-9a-f]+)")
+INVALID_AT = re.compile(r"<stdin>:1:(\d+): warning: invalid instruction encoding")
 SPECIAL = {"vcc", "vcc_lo", "vcc_hi", "exec", "exec_lo", "exec_hi", "m0", "scc", "null", "off", "src_scc",
            "src_execz", "src_vccz", "src_lds_direct", "src_shared_base", "src_shared_limit",
            "src_private_base", "src_private_limit", "src_pops_exiting_wave_id", "lds", "flat_scratch",
@@ -265,6 +266,9 @@ def parse_file(path):
         info["insns"].append(ins)
     tail = "\n".join(lines)
     info["invalid"] = tail.count("invalid instruction encoding")
+    # Where llvm-mc rejected a word: tools/shader_disasm.py feeds it one line of "0xNN " bytes (5 characters a byte)
+    # starting at code_start, so the message column gives the byte offset. The decoder then moves on by 4 bytes.
+    info["invalid_at"] = sorted({info["code_start"] + (int(c) - 1) // 5 for c in INVALID_AT.findall(tail)})
     return info
 
 

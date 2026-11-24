@@ -291,6 +291,10 @@ def writes(i: Insn) -> list[int]:
     op = i.op
     if i.mod is None:
         low = (op & 7) | ((i.rex & 1) << 3)
+        # Without REX, byte-register codes 4..7 mean AH/CH/DH/BH, not
+        # SPL/BPL/SIL/DIL. Their writes invalidate the corresponding parent GPR.
+        if 0xB4 <= op <= 0xB7 and not i.rex:
+            return [low - 4]
         if 0xB0 <= op <= 0xBF or 0x58 <= op <= 0x5F:
             return [low]
         if 0x91 <= op <= 0x97:

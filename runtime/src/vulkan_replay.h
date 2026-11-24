@@ -3629,16 +3629,23 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const bool discard = (texture->flags & texture_barrier_discard) ||
                                  texture->layout_before == d3d12_layout::undefined;
+            // LayoutAfter UNDEFINED from a defined layout: the contents are no longer needed (the memory is about to
+            // be aliased, say). Vulkan has no transition into UNDEFINED (VUID-VkImageMemoryBarrier2-newLayout-01198),
+            // so each piece keeps the layout it is in and the barrier only orders the accesses; the tracker keeps
+            // that layout too. D3D12 has the next barrier on these subresources start from UNDEFINED, which discards
+            // from whatever layout they are in.
+            const bool release = texture->layout_after == d3d12_layout::undefined &&
+                                 texture->layout_before != d3d12_layout::undefined;
             const VkImageLayout new_layout =
                 image_layout(p.binding, vulkan_layout(texture->layout_after, p.binding.presentable));
             LayoutPieces pieces;
-            if (discard)
+            if (discard && !release)
                 pieces.push_back({range, VK_IMAGE_LAYOUT_UNDEFINED});
             else {
                 const VkImageLayout before =
                     image_layout(p.binding, vulkan_layout(texture->layout_before, p.binding.presentable));
                 pieces = detail::current(tracker, id, range, before);
-                detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker);
+                if (!release) detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker);
             }
             const BarrierScope src = vulkan_barrier_scope(texture->sync_before, texture->access_before, predicates);
             const BarrierScope dst = vulkan_barrier_scope(texture->sync_after, texture->access_after, predicates);
@@ -3649,6 +3656,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             VkImageMemoryBarrier2* const barriers = many.empty() ? few.data() : many.data();
             std::uint32_t barrier_count = 0;
             for (const auto& piece : pieces) {
+                // Released before it was ever used (the tracker still has it in UNDEFINED): nothing to order.
+                if (release && piece.layout == VK_IMAGE_LAYOUT_UNDEFINED) continue;
                 VkImageMemoryBarrier2& b = barriers[barrier_count++];
                 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
                 b.srcStageMask = src.stages;
@@ -3656,7 +3665,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 b.srcAccessMask = src.access;
                 b.dstAccessMask = dst.access;
                 b.oldLayout = piece.layout;
-                b.newLayout = new_layout;
+                b.newLayout = release ? piece.layout : new_layout;
                 b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 b.image = p.binding.image;
@@ -3664,11 +3673,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 if (b.srcStageMask) detail::restrict_to_queue(vk, b.srcStageMask, b.srcAccessMask);
                 if (b.dstStageMask) detail::restrict_to_queue(vk, b.dstStageMask, b.dstAccessMask);
             }
-            VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-            dependency.imageMemoryBarrierCount = barrier_count;
-            dependency.pImageMemoryBarriers = barriers;
-            vk.pipeline_barrier2(command_buffer, &dependency);
-            if (tracker) tracker->set(id, range, new_layout);
+            if (barrier_count) {
+                VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                dependency.imageMemoryBarrierCount = barrier_count;
+                dependency.pImageMemoryBarriers = barriers;
+                vk.pipeline_barrier2(command_buffer, &dependency);
+            }
+            if (tracker && !release) tracker->set(id, range, new_layout);
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
             if (p.skip) continue;
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);

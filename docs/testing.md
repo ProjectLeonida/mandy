@@ -395,6 +395,27 @@ It needs shader Int64 support; a device that lacks it reports a skip. This is a 
 independent of wave64 emulation. On RTX 3080 Ti (616.92, Windows 11), all 640 words matched; replacing the count
 mask with 31 or the arithmetic shift with a logical shift made the test fail at words 66 and 251 respectively.
 
+`cs_w32_frexp_ldexp` checks `v_frexp_mant_f32`, `v_frexp_exp_i32_f32`, `v_ldexp_f32`, `v_frexp_mant_f64` and
+`v_frexp_exp_i32_f64`, which the translator computes with integer ops on the float's words. 64 records of a binary32
+value, an `ldexp` exponent and a binary64 value are loaded at run time: normals, the clamp of the exponent at ±512
+and beyond, results that overflow to an infinity and that fall below the smallest normal, binary32 denormals (read
+as zero), binary64 subnormals (normalized; single fraction bits on both sides of the dword boundary and patterns
+with several), zeros, infinities and NaNs. Each thread stores the five results, `v_frexp_mant_f32` with a `neg`
+source and `v_ldexp_f32` with an `abs` source run with the odd threads turned off, whose destination must keep the
+word it held. The expected words come from an oracle written from the rows of [design.md](design.md)
+(`frexp_mant_f32`, `frexp_exp_i32_f32`, `ldexp_f32` and `frexp_f64` in `check.py`), and
+`tests/test_gpu_frexp_ldexp.py` checks it against `math.frexp` and `math.ldexp` wherever those agree with the
+hardware. Both GPU runners compare all 768 heap words, the 256 unchanged input words included. Run it alone with
+`python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_w32_frexp_ldexp --require-pass`.
+On an RTX 4070 Ti (NVIDIA 620.70.06, Linux) and on llvmpipe (Mesa 26.2.6, LLVM 23.1.4) all 768 words match. While
+the binary32 ops still applied `neg` and `abs` with `OpFNegate` and `FAbs`, six words differed on the 4070 Ti and none
+on llvmpipe: every NaN source under a modifier came back as `0x7fffffff`, the driver's default NaN (word 419 is the
+first: the mantissa of the negated `0x7fc00000`). Rules broken one at a time each failed the test on both devices:
+the mantissa given the exponent field 127 (word 0) or, for binary64, 1023 (word 5), the exponent subtracting 127
+(word 1), `v_ldexp_f32` without its clamp (word 258) or overflowing to the largest finite value (word 106), a
+binary32 denormal not read as zero (word 352), the binary64 subnormal exponent off by one in the low or in the high
+dword (words 134 and 150), and the fixture without its `v_cmpx` (word 15).
+
 `cs_w32_cmp_f64` checks the 32 binary64 vector compares, `v_cmp_*_f64` into VCC and `v_cmpx_*_f64` on EXEC, with
 256 memory-fed operand pairs: the product of 16 values (±inf, ±max, the 1-ULP neighbours of ±1, the smallest
 subnormals, ±0, the smallest normal, a NaN whose payload is only in the low dword and a negative quiet NaN). Each
@@ -410,6 +431,48 @@ and constant operand forms are CPU-checked only (`tests/semantic/test_cmp_f64.py
 canonicalization at word 206, a NaN test that ignores the low dword at word 28, an ordering key without the low
 dword at word 70, the raw result written to an inactive lane's VCC at word 2, `v_cmpx_` replacing EXEC at word 3,
 `abs` ignored and `nlt` lowered as the negation of `le` at word 0.
+
+`cs_w32_round_f64` checks `v_trunc_f64`, `v_ceil_f64`, `v_rndne_f64` and `v_floor_f64`, which the translator gives
+to the driver's double-precision `Trunc`, `Ceil`, `RoundEven` and `Floor` (`shaderFloat64`). 64 inputs are loaded at
+run time: signed zeros, the smallest subnormals and normals, values around 0.5 and 1 (the largest value below 0.5
+among them), ties from 0.5 to 5.5 and at 2^31 + 0.5, 2^51 + 0.5 and 2^52 - 0.5, integers from 2^52 to 2^63, 1e300,
+the largest finite value, the infinities, and quiet and signalling NaNs. Each thread stores the four roundings,
+`v_trunc_f64` with a `neg` source, `v_ceil_f64` with an `abs` source, a `v_floor_f64` whose destination pair overlaps
+its source pair, and a `v_rndne_f64` run with the odd threads turned off, whose destination must keep the pair it
+held. The expected words come from Python (`round_f64` in `check.py`: exact IEEE-754, the result keeping its
+source's sign), and `tests/test_gpu_round_f64.py` checks that oracle against exact rational rounding. All 1152 heap
+words are compared exactly, the 128 unchanged input words included: a NaN and a subnormal are rounded by the
+translated code with integer ops and not by the driver, as the row in [design.md](design.md) says. (llvmpipe gets
+one allowance, for what it does to `Trunc` and `RoundEven` on some CPUs; see below.) Run it alone with
+`python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_w32_round_f64 --require-pass`.
+It needs `shaderFloat64`; a device without it reports a skip.
+
+Measured: on an RTX 4070 Ti (NVIDIA 620.70.06, Linux) and on llvmpipe (Mesa 26.2.6, LLVM 23.1.4) all 1152 words
+match. While those two kinds of input still went to the driver's function, 15 of the 512 results differed on the
+4070 Ti, those of the two signalling NaNs, which came back quiet with sign and payload kept (`0x7ff0000000000001`
+gave `0x7ff8000000000001`), and five more on llvmpipe, which read the two smallest subnormals as zero (`v_ceil_f64`
+of the positive one gave +0 instead of 1, `v_floor_f64` of the negative one -0 instead of -1). Rules broken one at a
+time each failed the test on both devices: a NaN left to the driver (word 784), the NaN and subnormal tests ignoring
+the low dword, `v_ceil_f64` or `v_floor_f64` lifting the subnormal of the wrong sign (words 34 and 38), a subnormal's
+result losing its sign (word 40), a NaN's low word dropped (word 784), `rndne` lowered as `floor(x + 0.5)` (word 20,
+the sign of -0), `trunc` or `ceil` lowered as `Floor`, the `neg` or the `abs` source modifier ignored (words 8 and
+26), the two result words swapped (word 8), and the fixture without its `v_cmpx` (word 30). Two changes are not
+caught everywhere: a subnormal left to the driver fails on llvmpipe (word 34) and passes on the 4070 Ti, which keeps
+binary64 denormals, and `RoundEven` replaced by GLSL `Round` changes nothing on either device, since both send a tie
+to the even integer.
+
+llvmpipe gave those results on a CPU with AVX-512. On one without it, `Trunc` and `RoundEven` of a double go through
+the code llvmpipe has for a float, because its double vectors are twice its native width (512 bits at the usual 256)
+and it only has the exact rounding for a width the CPU has an extension for. There a magnitude above 2^24 comes back
+unchanged (`v_trunc_f64` of 123456789.0625 is 123456789.0625) and `RoundEven` of a smaller one can give the other
+neighbouring integer (1 for 1.5, 0 for the value just above 0.5): 48 of the 512 results, the same 48 with Mesa
+25.2.8 (LLVM 20.1.2) on a CI runner and with Mesa 26.2.6 under `GALLIUM_OVERRIDE_CPU_CAPS=avx`, which is how to see
+it on a CPU that has AVX-512. `Floor` and `Ceil` are exact on that path. The CI's runners differ in this, so the
+unchanged fixture passed or failed there by the machine it got. On llvmpipe the judge therefore lets `v_trunc_f64`
+and `v_rndne_f64` return what that path can give, the source itself above 2^24 and either neighbouring integer
+from 0.5 up to it, and nothing else (`ROUND_F64_FLOAT_PATH` in `check.py`); `v_floor_f64`, `v_ceil_f64`, the kept
+pair and the inputs stay exact there, and no other device gets the allowance. `LP_NATIVE_VECTOR_WIDTH=128` makes
+llvmpipe exact on a CPU with AVX.
 
 ## Wave64 pixel, vertex and geometry shaders (`w64_graphics.py`)
 
