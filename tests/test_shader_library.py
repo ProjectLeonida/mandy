@@ -10,6 +10,7 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -40,9 +41,9 @@ def prog(tag, body=2):
     return code + CODE_END * ((-len(code)) % 256 // 4)
 
 
-def kind0(threads=(8, 8, 1), rsrc2=0xB8A):
+def kind0(threads=(8, 8, 1), rsrc2=0xB8A, wave32=False):
     x, y, z = threads
-    return struct.pack("<7I", 0x4005CF00, 0x6C090102, 0, x | y << 16, z, 0x402C0343, rsrc2)
+    return struct.pack("<7I", 0x4005CF00, 0x6C090102, 0, x | y << 16, z | wave32 << 20, 0x402C0343, rsrc2)
 
 
 def layout_blob(kind, digest, records=1):
@@ -428,6 +429,35 @@ class Main(unittest.TestCase):
                     self.assertEqual(f.read(), state)
             with open(os.path.join(out, "library.json"), encoding="utf-8") as f:
                 self.assertEqual([e["program"] for e in json.load(f)["compute"][:3]], [*names, names[0]])
+    def test_disassembler_is_told_the_wave_size_of_each_compute_state(self):
+        # The stand-in for llvm-mc prints the -mattr option it was started with. A compute program is listed for the
+        # wave size of its dispatch state; a graphics program has no state and keeps llvm-mc's default (wave32).
+        fake = ("import sys\n"
+                "sys.stdin.read()\n"
+                "attrs = [a for a in sys.argv[1:] if a.startswith('-mattr')]\n"
+                "print('\\ts_endpgm ; ' + (' '.join(attrs) or 'no -mattr'))\n")
+        lib = build([(NONE, NONE, {0: (2, 2)})], [(0, NONE, 0, NONE), (1, NONE, 1, NONE)],
+                    [kind0(), kind0(wave32=True), layout_blob(2, D_PS)], [prog(1), prog(2), prog(3)])
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(lib)
+            mc = os.path.join(tmp, "fake_mc.py")
+            with open(mc, "w", encoding="utf-8", newline="\n") as f:
+                f.write(fake)
+            out = os.path.join(tmp, "out")
+            env = dict(os.environ, LLVM_MC=f'"{sys.executable}" "{mc}"')
+            result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "shader_library.py"),
+                                     src, "--out", out, "--disasm", "--jobs", "1"],
+                                    capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            names = [sl.program_name(0, {"cs"}), sl.program_name(1, {"cs"}), sl.program_name(2, {"ps"})]
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                self.assertEqual([(e["file"], e.get("wave32")) for e in json.load(f)],
+                                 [(names[0] + ".dxbc", False), (names[1] + ".dxbc", True), (names[2] + ".dxbc", None)])
+            for name, expected in zip(names, ("-mattr=-wavefrontsize32,+wavefrontsize64", "no -mattr", "no -mattr")):
+                with open(os.path.join(out, "disasm", name + ".s"), encoding="utf-8") as f:
+                    self.assertIn(f"\ts_endpgm ; {expected}\n", f.read(), name)
 
     def test_carve_names_sources_and_copies_containers(self):
         with tempfile.TemporaryDirectory() as tmp:

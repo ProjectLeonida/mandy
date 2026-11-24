@@ -606,6 +606,15 @@ with that reason instead of writing empty `.s` files. To disassemble by hand ins
 LLVM_MC=/usr/lib/llvm-21/bin/llvm-mc python3 -I <repo>/tools/shader_disasm.py <work>/shaders/fssm
 ```
 
+llvm-mc lists the lane-mask operands of a VALU instruction for the wave size it is told, and wave32 is its default for
+these CPUs: a compare's destination as `s8` or `vcc_lo`, where a wave64 program writes `s[8:9]` or `vcc`. For a wave64
+program `shader_disasm.disasm()` therefore adds `-mattr=-wavefrontsize32,+wavefrontsize64`. `shader_disasm.py` takes
+the wave size from the FSSM header, `fspx_unpack.py --disasm` and `shader_library.py --disasm` from the program's
+dispatch state; a graphics program of the pipeline library has none and keeps the default. Only those operands differ
+between the two listings (llvm-mc 23.1.5: the compares, `v_cndmask`, the carry instructions, `v_div_scale` and
+`v_mad_[ui]64_[ui]32`); the instructions and their encodings are the same, and `--backend python` prints the same
+forms. `tests/test_shader_disasm.py` and `tests/semantic/test_disasm_wave64_mask_pair.py` check it.
+
 Code starts at the u32 at FSSM offset 0xC0 (the code-section offset) plus 0x28 bytes into that section, and ends at the
 last `s_endpgm`. Use `--mcpu gfx1013`. Over the whole 26,503-blob 1.0.2.1 corpus (`shader_disasm.py` at `d90444f2`,
 llvm-mc 23.1.5, data blocks excluded as below) gfx1013 decodes all 26,503 blobs with no invalid word; gfx1010, gfx1011

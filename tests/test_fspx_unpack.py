@@ -179,12 +179,12 @@ class Cli(unittest.TestCase):
             code = fspx_unpack.main(list(argv))
         return code, out.getvalue(), err.getvalue()
 
-    def disassemble(self, body):
+    def disassemble(self, body, state=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         src = os.path.join(tmp.name, "one.fspx")
         with open(src, "wb") as f:
-            f.write(make_fspx([(0, kind0()), (6, program())]))
+            f.write(make_fspx([(0, state or kind0()), (6, program())]))
         mc = os.path.join(tmp.name, "fake_mc.py")
         with open(mc, "w", encoding="utf-8", newline="\n") as f:
             f.write(body)
@@ -234,6 +234,22 @@ class Cli(unittest.TestCase):
             listing = f.read()
         self.assertIn("0 invalid words", listing)
         self.assertIn("\ts_endpgm", listing)
+
+    def test_disassembler_is_told_the_wave_size_of_the_dispatch_state(self):
+        # The stand-in prints the -mattr option it was started with. A wave64 program's lane masks are listed as
+        # register pairs only when llvm-mc is told the wave size; wave32 is its default and gets no option.
+        fake = ("import sys\n"
+                "sys.stdin.read()\n"
+                "attrs = [a for a in sys.argv[1:] if a.startswith('-mattr')]\n"
+                "print('\\ts_endpgm ; ' + (' '.join(attrs) or 'no -mattr'))\n")
+        for wave32, expected in ((False, "-mattr=-wavefrontsize32,+wavefrontsize64"), (True, "no -mattr")):
+            with self.subTest(wave32=wave32):
+                result, out = self.disassemble(fake, kind0(wave32=wave32))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                    self.assertEqual(json.load(f)[0]["wave32"], wave32)
+                with open(os.path.join(out, "disasm", "one.s"), encoding="utf-8") as f:
+                    self.assertIn(f"\ts_endpgm ; {expected}\n", f.read())
 
     def test_dll_like_file(self):
         c = Containers().container()
