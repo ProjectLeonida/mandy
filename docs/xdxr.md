@@ -92,7 +92,7 @@ Default for type 0's `0x08` value when it is negative (or when there is no type-
 | `InfoType` | In `XboxBvhBuilder.dll` |
 |---|---|
 | 0 `COMPACTED_SIZE`, 3 `CURRENT_SIZE` | written by one handler |
-| 2 `SERIALIZATION` | written by another handler |
+| 2 `SERIALIZATION` | written by another handler (the layer writes its own serialized form; [bvh.md](bvh.md), *Serialization*) |
 | 1 `TOOLS_VISUALIZATION` and other values | ignored, no error |
 | `0x10` `D3D12XBOX_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_OFFLINE_STATISTICS` | thrown as `E_INVALIDARG` by `0xe6a0` before any work, for every build: the DLL only supports it for offline BVH builds |
 

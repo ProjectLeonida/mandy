@@ -9,10 +9,14 @@
 // Last, the BLAS again with MINIMIZE_MEMORY (BOX16 nodes: a smaller prebuild size and postbuild size), written as
 // d3d12_blas_box16, then updated in place with the same flags (d3d12_blas_box16_update); and once more without
 // ALLOW_UPDATE, so that its triangles are paired into TRI0/TRI1 leaves (d3d12_blas_paired; the ALLOW_UPDATE builds
-// must have no pairs, since a refit rewrites the leaves one triangle each).
+// must have no pairs, since a refit rewrites the leaves one triangle each). Then serialization: the SERIALIZATION
+// postbuild info, SERIALIZE of the BLAS and the TLAS (header, identifier, BLAS pointers, bytes), DESERIALIZE of the
+// BLAS to another address and of the TLAS with its serialized BLAS pointers rewritten to point there, written as
+// d3d12_blas_deserialized and d3d12_tlas_deserialized.
 // `python -I tools/xdxr_bvh.py check-build <out dir>` validates them and traces rays against brute force (ctest:
 // d3d12_xdxr_rt + d3d12_xdxr_rt_check). Exit 77 without a Vulkan device, or with LEONIDA_RT_AS=khr. No game files.
 #include "../shims/d3d12_com.h"
+#include "../src/xdxr_build.h"   // xdxr_serialized_id: the identifier a serialized structure starts with
 
 #include <cmath>
 #include <cstdint>
@@ -496,6 +500,201 @@ int main(int argc, char** argv) {
               "{\"kind\": \"blas\", \"pairs\": true, \"address\": " +
                   std::to_string(static_blas->GetGPUVirtualAddress()) + ", \"triangles\": " + tris + "}\n"))
         return fail("static BLAS readback");
+
+    // ---- serialization: the SERIALIZATION postbuild info of the BLAS (as updated) and of the TLAS (as rebuilt for
+    // CURRENT_SIZE), SERIALIZE both, DESERIALIZE the BLAS somewhere else, point the TLAS's serialized BLAS pointers
+    // at that copy (what D3D12 lets an application do after moving its BLASes), and DESERIALIZE the TLAS. The copies
+    // must be the same bytes but for the instances' BLAS addresses, and are dumped for the ray check ----
+    {
+        if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for serialization");
+        Ref<ID3D12Resource> ser_info, ser_info_rb, tlas_now_rb;
+        if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, 32, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, uav,
+                               ser_info.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, 32, D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_FLAG_NONE, ser_info_rb.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, sizes[1], D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_FLAG_NONE, tlas_now_rb.put())))
+            return fail("serialization info buffers", hr);
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC ser_desc{
+            ser_info->GetGPUVirtualAddress(), D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION};
+        list->EmitRaytracingAccelerationStructurePostbuildInfo(&ser_desc, 2, both);
+        list->ResourceBarrier(1, &barrier);
+        list->CopyBufferRegion(ser_info_rb.p, 0, ser_info.p, 0, 32);
+        list->CopyBufferRegion(compacted_rb.p, 0, blas.p, 0, sizes[0]);      // the BLAS's bytes now, to compare
+        list->CopyBufferRegion(tlas_now_rb.p, 0, tlas.p, 0, sizes[1]);
+        if (!submit(8)) return fail("serialization postbuild submission");
+        D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER expect_hdr[2]{};
+        UINT64 ser_sizes[4] = {};                       // BLAS: size, pointers; TLAS: size, pointers
+        {
+            void* p = nullptr;
+            if (FAILED(ser_info_rb->Map(0, nullptr, &p))) return fail("Map serialization info");
+            std::memcpy(ser_sizes, p, sizeof ser_sizes);
+            ser_info_rb->Unmap(0, nullptr);
+        }
+        const UINT64 hdr = sizeof(D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER);
+        static_assert(sizeof(D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER) == 56, "D3D12 header size");
+        // the header, one 8-byte BLAS pointer per instance of the TLAS (none for the BLAS), and the structure
+        if (ser_sizes[0] != hdr + sizes[0] || ser_sizes[1] != 0 || ser_sizes[2] != hdr + 3 * 8 + sizes[1] ||
+            ser_sizes[3] != 3) {
+            std::fprintf(stderr, "SERIALIZATION info %llu %llu %llu %llu, structures %llu %llu\n",
+                         static_cast<unsigned long long>(ser_sizes[0]), static_cast<unsigned long long>(ser_sizes[1]),
+                         static_cast<unsigned long long>(ser_sizes[2]), static_cast<unsigned long long>(ser_sizes[3]),
+                         static_cast<unsigned long long>(sizes[0]), static_cast<unsigned long long>(sizes[1]));
+            return fail("SERIALIZATION postbuild info");
+        }
+
+        Ref<ID3D12Resource> ser_blas, ser_tlas, ser_blas_rb, ser_tlas_rb, blas2, tlas2, blas2_rb, tlas2_rb, patch;
+        if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, ser_sizes[0], D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               uav, ser_blas.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, ser_sizes[2], D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               uav, ser_tlas.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, ser_sizes[0], D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_FLAG_NONE, ser_blas_rb.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, ser_sizes[2], D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_FLAG_NONE, ser_tlas_rb.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, sizes[0], as_state, uav, blas2.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, sizes[1], as_state, uav, tlas2.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, sizes[0], D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_FLAG_NONE, blas2_rb.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, sizes[1], D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_FLAG_NONE, tlas2_rb.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_UPLOAD, 3 * 8, D3D12_RESOURCE_STATE_GENERIC_READ,
+                               D3D12_RESOURCE_FLAG_NONE, patch.put())))
+            return fail("serialization buffers", hr);
+        const UINT64 blas2_va = blas2->GetGPUVirtualAddress(), tlas2_va = tlas2->GetGPUVirtualAddress();
+        if (blas2_va % 256 || tlas2_va % 256 || blas2_va == blas->GetGPUVirtualAddress())
+            return fail("deserialized structures need their own 256-byte aligned addresses");
+        {
+            void* p = nullptr;
+            if (FAILED(patch->Map(0, nullptr, &p))) return fail("Map pointer patch");
+            const UINT64 moved_to[3] = {blas2_va, blas2_va, blas2_va};
+            std::memcpy(p, moved_to, sizeof moved_to);
+            patch->Unmap(0, nullptr);
+        }
+        // The serialized buffers go through the states D3D12 asks for: SERIALIZE writes them as UNORDERED_ACCESS, the
+        // readback copies them as COPY_SOURCE, the pointer patch writes the TLAS's as COPY_DEST, and DESERIALIZE reads
+        // them as NON_PIXEL_SHADER_RESOURCE. A UAV barrier alone does not order the patch's copy before DESERIALIZE.
+        auto transition = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+            D3D12_RESOURCE_BARRIER t{};
+            t.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            t.Transition.pResource = r;
+            t.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            t.Transition.StateBefore = before;
+            t.Transition.StateAfter = after;
+            list->ResourceBarrier(1, &t);
+        };
+        if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for SERIALIZE");
+        list->CopyRaytracingAccelerationStructure(ser_blas->GetGPUVirtualAddress(), blas->GetGPUVirtualAddress(),
+                                                  D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE);
+        list->CopyRaytracingAccelerationStructure(ser_tlas->GetGPUVirtualAddress(), tlas->GetGPUVirtualAddress(),
+                                                  D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE);
+        transition(ser_blas.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        transition(ser_tlas.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(ser_blas_rb.p, 0, ser_blas.p, 0, ser_sizes[0]);
+        list->CopyBufferRegion(ser_tlas_rb.p, 0, ser_tlas.p, 0, ser_sizes[2]);   // as SERIALIZE wrote it
+        transition(ser_tlas.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(ser_tlas.p, hdr, patch.p, 0, 3 * 8);              // the TLAS's BLAS pointers
+        transition(ser_blas.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(ser_tlas.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        list->CopyRaytracingAccelerationStructure(blas2_va, ser_blas->GetGPUVirtualAddress(),
+                                                  D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE);
+        list->CopyRaytracingAccelerationStructure(tlas2_va, ser_tlas->GetGPUVirtualAddress(),
+                                                  D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE);
+        list->ResourceBarrier(1, &barrier);
+        list->CopyBufferRegion(blas2_rb.p, 0, blas2.p, 0, sizes[0]);
+        list->CopyBufferRegion(tlas2_rb.p, 0, tlas2.p, 0, sizes[1]);
+        if (!submit(9)) return fail("serialize/deserialize submission");
+        if (FAILED(device->GetDeviceRemovedReason())) return fail("device removed after serialization");
+
+        auto read = [](ID3D12Resource* rb, UINT64 size) {
+            std::vector<unsigned char> bytes(static_cast<std::size_t>(size));
+            void* p = nullptr;
+            if (SUCCEEDED(rb->Map(0, nullptr, &p))) {
+                std::memcpy(bytes.data(), p, bytes.size());
+                rb->Unmap(0, nullptr);
+            } else {
+                bytes.clear();
+            }
+            return bytes;
+        };
+        const auto blas_now = read(compacted_rb.p, sizes[0]), tlas_now = read(tlas_now_rb.p, sizes[1]);
+        const auto ser_b = read(ser_blas_rb.p, ser_sizes[0]), ser_t = read(ser_tlas_rb.p, ser_sizes[2]);
+        const auto blas2_bytes = read(blas2_rb.p, sizes[0]), tlas2_bytes = read(tlas2_rb.p, sizes[1]);
+        if (blas_now.empty() || tlas_now.empty() || ser_b.empty() || ser_t.empty() || blas2_bytes.empty() ||
+            tlas2_bytes.empty())
+            return fail("serialization readbacks");
+
+        // the headers: this layer's identifier, the sizes the postbuild info gave, the pointer counts
+        const UINT64 blas_va = blas->GetGPUVirtualAddress();
+        for (int k = 0; k < 2; ++k) {
+            const auto& ser = k ? ser_t : ser_b;
+            std::memcpy(&expect_hdr[k], ser.data(), sizeof expect_hdr[k]);
+            const auto& h = expect_hdr[k];
+            if (std::memcmp(&h.DriverMatchingIdentifier, leonida::xdxr_serialized_id, sizeof(leonida::xdxr_serialized_id)) ||
+                h.SerializedSizeInBytesIncludingHeader != ser_sizes[2 * k] || h.DeserializedSizeInBytes != sizes[k] ||
+                h.NumBottomLevelAccelerationStructurePointersAfterHeader != ser_sizes[2 * k + 1])
+                return fail(k ? "serialized TLAS header" : "serialized BLAS header");
+            if (device->CheckDriverMatchingIdentifier(D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE,
+                                                      &h.DriverMatchingIdentifier) !=
+                D3D12_DRIVER_MATCHING_IDENTIFIER_COMPATIBLE_WITH_DEVICE)
+                return fail("CheckDriverMatchingIdentifier does not accept the layer's own identifier");
+        }
+        D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER other = expect_hdr[0].DriverMatchingIdentifier;
+        other.DriverOpaqueVersioningData[4] ^= 1;
+        if (device->CheckDriverMatchingIdentifier(D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE, &other) !=
+            D3D12_DRIVER_MATCHING_IDENTIFIER_INCOMPATIBLE_VERSION)
+            return fail("CheckDriverMatchingIdentifier: another serialized layout version is not INCOMPATIBLE_VERSION");
+        other = expect_hdr[0].DriverMatchingIdentifier;
+        other.DriverOpaqueGUID.Data1 ^= 1;
+        if (device->CheckDriverMatchingIdentifier(D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE, &other) !=
+            D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED)
+            return fail("CheckDriverMatchingIdentifier: another GUID is not UNRECOGNIZED");
+        // the TLAS's pointers, as SERIALIZE wrote them: the BLAS each instance names; then each structure unchanged
+        for (int i = 0; i < 3; ++i) {
+            UINT64 ptr = 0;
+            std::memcpy(&ptr, ser_t.data() + hdr + 8 * i, 8);
+            if (ptr != blas_va) return fail("serialized TLAS: an instance's BLAS pointer is not the BLAS's address");
+        }
+        if (std::memcmp(ser_b.data() + hdr, blas_now.data(), blas_now.size()) ||
+            std::memcmp(ser_t.data() + hdr + 3 * 8, tlas_now.data(), tlas_now.size()))
+            return fail("a serialized structure's bytes differ from the structure's");
+
+        // the deserialized BLAS is the BLAS; the deserialized TLAS is the TLAS but for each INSTANCE record's BLAS
+        // address (+60, in 256-byte units), which is now the deserialized BLAS's
+        if (blas2_bytes != blas_now) return fail("the deserialized BLAS differs from the BLAS");
+        std::uint32_t elements_off = 0;
+        std::memcpy(&elements_off, tlas_now.data() + 52, 4);
+        std::size_t patched = 0;
+        for (std::size_t w = 0; w + 4 <= tlas_now.size(); w += 4) {
+            std::uint32_t was = 0, now = 0;
+            std::memcpy(&was, tlas_now.data() + w, 4);
+            std::memcpy(&now, tlas2_bytes.data() + w, 4);
+            const bool pointer = w >= elements_off && w < elements_off + 3 * 128 && (w - elements_off) % 128 == 60;
+            if (pointer) {
+                if (was != std::uint32_t(blas_va >> 8) || now != std::uint32_t(blas2_va >> 8)) {
+                    std::fprintf(stderr, "instance word at +%zu: %08x (TLAS %08x), want %08x (BLAS %08x)\n", w, now,
+                                 was, std::uint32_t(blas2_va >> 8), std::uint32_t(blas_va >> 8));
+                    return fail("deserialized TLAS: an instance's BLAS address is not the moved BLAS's");
+                }
+                ++patched;
+            } else if (was != now) {
+                std::fprintf(stderr, "deserialized TLAS word at +%zu: %08x, was %08x\n", w, now, was);
+                return fail("the deserialized TLAS differs from the TLAS outside the BLAS addresses");
+            }
+        }
+        if (patched != 3) return fail("deserialized TLAS: not every instance's BLAS address was checked");
+
+        if (!dump(blas2_rb.p, sizes[0], "d3d12_blas_deserialized",
+                  "{\"kind\": \"blas\", \"pairs\": false, \"address\": " + std::to_string(blas2_va) +
+                      ", \"triangles\": " + triangles_json(moved) + "}\n") ||
+            !dump(tlas2_rb.p, sizes[1], "d3d12_tlas_deserialized",
+                  "{\"kind\": \"tlas\", \"address\": " + std::to_string(tlas2_va) +
+                      ", \"bias\": 0, \"blas\": [\"d3d12_blas_deserialized\"], \"instances\": " + inst + "}\n"))
+            return fail("deserialized structures readback");
+        std::printf("d3d12_xdxr_rt: serialized BLAS %llu bytes, TLAS %llu bytes (3 BLAS pointers); deserialized "
+                    "with the TLAS's BLAS moved\n",
+                    static_cast<unsigned long long>(ser_sizes[0]), static_cast<unsigned long long>(ser_sizes[2]));
+    }
     std::printf("d3d12_xdxr_rt: BLAS %llu bytes (prebuild %llu), TLAS (prebuild %llu), written to %s\n",
                 static_cast<unsigned long long>(blas_info.ResultDataMaxSizeInBytes),
                 static_cast<unsigned long long>(blas_info.ResultDataMaxSizeInBytes),

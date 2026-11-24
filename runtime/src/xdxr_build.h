@@ -28,6 +28,14 @@
 
 namespace leonida {
 
+// The D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER a serialized XDXR structure starts with (xdxr_build.comp
+// SER_ID): the GUID is the ASCII "Leonida XDXR AS ", the versioning data the XDXR header version (6, 2403) and the
+// serialized layout version (1), little-endian words. CheckDriverMatchingIdentifier compares against it.
+inline constexpr std::uint32_t xdxr_serialized_id[8] = {0x6e6f654cu, 0x20616469u, 0x52584458u, 0x20534120u,
+                                                        6u, 1u, 0u, 0u};
+// sizeof(D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER): the identifier (32 bytes) and three UINT64s.
+inline constexpr std::uint32_t xdxr_serialized_header_size = 56;
+
 struct XdxrLayout {
     static constexpr std::uint32_t header_size = 64;
 
@@ -185,14 +193,25 @@ public:
         return true;
     }
 
-    // CopyRaytracingAccelerationStructure CLONE or COMPACT: the structure at `src` to `dst`, as many bytes as its
-    // header says, at most `max_bytes` (the room the destination has). The structures are position-independent.
-    bool record_copy(VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst, std::uint64_t max_bytes) {
+    // D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE values record_copy takes.
+    enum CopyMode : std::uint32_t { copy_clone = 0, copy_compact = 1, copy_serialize = 3, copy_deserialize = 4 };
+
+    // CopyRaytracingAccelerationStructure from `src` to `dst`, writing at most `max_bytes` (the room the destination
+    // has); the sizes come from the source's header on the GPU, so a copy can follow a build in the same list.
+    //   CLONE, COMPACT: the structure as its header sizes it. The structures are position-independent.
+    //   SERIALIZE: the D3D12 serialized form (xdxr_build.comp MODE_SERIALIZE): a 56-byte header that starts with
+    //     xdxr_serialized_id, one BLAS address per instance of a TLAS, then the structure.
+    //   DESERIALIZE: the structure back from that form, with each instance's BLAS address taken from the pointer
+    //     list (which the application may have rewritten).
+    bool record_copy(VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst, std::uint64_t max_bytes,
+                     std::uint32_t mode = copy_clone) {
         if (!loaded_ || !src || !dst || max_bytes < XdxrLayout::header_size) return false;
-        if (src == dst) return true;
+        if (mode != copy_clone && mode != copy_compact && mode != copy_serialize && mode != copy_deserialize)
+            return false;
+        if (src == dst) return mode == copy_clone || mode == copy_compact;
         vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         Push p{};
-        p.mode = mode_copy_as;
+        p.mode = mode == copy_serialize ? mode_serialize : mode == copy_deserialize ? mode_deserialize : mode_copy_as;
         p.src0 = split(src);
         p.dst = split(dst);
         p.count = std::uint32_t(std::min<std::uint64_t>(max_bytes, 0xffffffffull) / 4);
@@ -200,10 +219,23 @@ public:
         return true;
     }
 
-    // One postbuild value (COMPACTED_SIZE or CURRENT_SIZE, the same for these builds): 8 bytes at `dst` for the
-    // structure at `src`. A barrier first: a build or copy recorded just before writes the header it reads.
-    bool record_postbuild(VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst) {
+    // D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_TYPE values record_postbuild answers.
+    enum PostbuildType : std::uint32_t {
+        postbuild_compacted_size = 0, postbuild_serialization = 2, postbuild_current_size = 3
+    };
+    // Bytes one postbuild desc of that type takes at its destination (D3D12's desc structures).
+    static constexpr std::uint32_t postbuild_size(std::uint32_t type) {
+        return type == postbuild_serialization ? 16u : 8u;
+    }
+
+    // One postbuild desc for the structure at `src`, at `dst`: COMPACTED_SIZE or CURRENT_SIZE (the same for these
+    // builds, 8 bytes), or SERIALIZATION (the serialized size and the BLAS pointer count, 16 bytes). A barrier
+    // first: a build or copy recorded just before writes the header it reads.
+    bool record_postbuild(VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst,
+                          std::uint32_t type = postbuild_compacted_size) {
         if (!loaded_ || !src || !dst) return false;
+        if (type != postbuild_compacted_size && type != postbuild_serialization && type != postbuild_current_size)
+            return false;
         VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT,
                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
         vk_.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
@@ -214,6 +246,7 @@ public:
         p.src0 = split(src);
         p.dst = split(dst);
         p.count = 1;
+        p.arg2 = type;
         dispatch(cb, p, 1, false);
         return true;
     }
@@ -223,7 +256,7 @@ private:
         mode_init = 0, mode_triangles = 1, mode_instances = 2, mode_morton = 3, mode_karras = 4, mode_nodes = 5,
         mode_header = 6, mode_radix_count = 7, mode_radix_scan = 8, mode_radix_scatter = 9, mode_small_sort = 10,
         mode_copy_as = 12, mode_postbuild = 13, mode_kept = 14, mode_kept_scan = 15,
-        mode_kept_index = 16, mode_propagate = 17, mode_clear = 18
+        mode_kept_index = 16, mode_propagate = 17, mode_clear = 18, mode_serialize = 19, mode_deserialize = 20
     };
     struct Addr { std::uint32_t lo = 0, hi = 0; };
     struct Push {  // xdxr_build.comp `Push`, std430 push-constant layout

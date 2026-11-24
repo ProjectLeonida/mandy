@@ -1117,11 +1117,33 @@ names its BLASes by address, which a clone keeps. The size comes from the source
 a copy can follow a build in the same command list, and it is bounded by the destination resource. A build's size
 is the nodes it wrote, so `COMPACTED_SIZE` and `CURRENT_SIZE` (from
 `EmitRaytracingAccelerationStructurePostbuildInfo` or the postbuild descs of a build) are both
-`64 * (totalSizeIn64BNodes + 1)`, and compaction gives back the room the layout left for more nodes. Serialization, deserialization and the tools-visualization
-mode are refused at replay as unsupported, not faked. In `LEONIDA_RT_AS=khr` mode the postbuild descs stay ignored,
-as before.
+`64 * (totalSizeIn64BNodes + 1)`, and compaction gives back the room the layout left for more nodes. The
+tools-visualization copy mode and postbuild type are refused at replay as unsupported, not faked. In
+`LEONIDA_RT_AS=khr` mode the postbuild descs stay ignored and serialization is refused, as before.
 
-Not done yet: serialization; a compaction that reclaims the leaves that pairing leaves unused. A surface-area
+**Serialization.** `CopyRaytracingAccelerationStructure` with `SERIALIZE` writes D3D12's serialized form
+(`xdxr_build.comp` `MODE_SERIALIZE`): the 56-byte `D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER`, then
+`NumBottomLevelAccelerationStructurePointersAfterHeader` 8-byte BLAS addresses, then the structure's bytes as they
+are. The header's driver matching identifier is the layer's own (`xdxr_build.h` `xdxr_serialized_id`: the GUID is the
+ASCII `Leonida XDXR AS `, the versioning data the header version 6 and the serialized layout version 1), and
+`CheckDriverMatchingIdentifier` answers `COMPATIBLE_WITH_DEVICE` for it, `INCOMPATIBLE_VERSION` for the same GUID
+with other versioning data, and `UNRECOGNIZED` otherwise (always, with `LEONIDA_RT_AS=khr`). A TLAS carries one
+pointer per INSTANCE record, in record order, read from the record's BLAS address (+60, 256-byte units; 0 for an
+instance without a BLAS); a BLAS carries none. The deserialized size is the structure's own. `DESERIALIZE` copies the
+bytes back and writes each INSTANCE record's BLAS address from the pointer list, so an application that moved its
+BLASes (deserialized them elsewhere) and rewrote the pointers gets a TLAS that names them; the rest of the record
+stays, since a deserialized BLAS is the same structure and its records count from its own start. The `SERIALIZATION`
+postbuild desc (16 bytes) gives the serialized size, `56 + 8 * pointers + 64 * (totalSizeIn64BNodes + 1)`, and the
+pointer count. Both copies are bounded by the destination resource only, since a serialized structure is larger than
+the structure. The payload after the pointers is this layer's: the console's own serialized form (`XboxBvhBuilder.dll`
+writes `SERIALIZATION` postbuild info in a handler of its own, [xdxr.md](xdxr.md) section 4) is not measured, and a
+blob with the console's identifier would be `UNRECOGNIZED`. `d3d12_xdxr_rt_test` serializes a BLAS and a three-instance
+TLAS, deserializes the BLAS to another address, rewrites the TLAS's pointers to it and deserializes the TLAS; the
+copies must equal the originals byte for byte but for the three BLAS addresses, and `d3d12_xdxr_rt_check` traces
+1,000 rays through each against brute force (RTX 5070 Ti, NVIDIA 617.42, and the Ryzen 9 7900X's Radeon 610M, AMD
+2026.04.17, Windows 11: 0 rays differ).
+
+Not done yet: a compaction that reclaims the leaves that pairing leaves unused. A surface-area
 collapse of the radix tree, or treelet restructuring, would trim a few more steps.
 
 ```powershell

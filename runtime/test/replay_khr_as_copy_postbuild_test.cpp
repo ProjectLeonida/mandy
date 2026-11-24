@@ -62,7 +62,9 @@ std::vector<WritePropsCall> prop_writes;
 std::vector<CopyQueryCall> query_copies;
 std::vector<CopyAsCall> as_copies;
 std::vector<std::uint64_t> xdxr_copy_bytes;
+std::vector<std::uint32_t> xdxr_copy_modes;
 std::vector<std::uint64_t> xdxr_postbuild_dests;
+std::vector<std::uint32_t> xdxr_postbuild_types;
 
 template<typename T>
 T handle(std::uintptr_t n) {
@@ -124,7 +126,9 @@ void clear_recorded() {
     query_copies.clear();
     as_copies.clear();
     xdxr_copy_bytes.clear();
+    xdxr_copy_modes.clear();
     xdxr_postbuild_dests.clear();
+    xdxr_postbuild_types.clear();
 }
 
 }  // namespace
@@ -328,13 +332,15 @@ int main() {
 
     // 5. XDXR precedence: when xdxr_copy / xdxr_postbuild are set, KHR paths are bypassed cleanly.
     {
-        vk.xdxr_copy = [](VkCommandBuffer, std::uint64_t, std::uint64_t, std::uint64_t bytes) {
+        vk.xdxr_copy = [](VkCommandBuffer, std::uint64_t, std::uint64_t, std::uint64_t bytes, std::uint32_t mode) {
             ops.push_back(Op::xdxr_copy);
             xdxr_copy_bytes.push_back(bytes);
+            xdxr_copy_modes.push_back(mode);
         };
-        vk.xdxr_postbuild = [](VkCommandBuffer, std::uint64_t, std::uint64_t dest) {
+        vk.xdxr_postbuild = [](VkCommandBuffer, std::uint64_t, std::uint64_t dest, std::uint32_t type) {
             ops.push_back(Op::xdxr_postbuild);
             xdxr_postbuild_dests.push_back(dest);
+            xdxr_postbuild_types.push_back(type);
         };
 
         CommandList xdxr_list;
@@ -346,6 +352,44 @@ int main() {
                    prop_writes.empty() && xdxr_copy_bytes.size() == 1 && xdxr_copy_bytes[0] == post_buf_size - 256 &&
                    xdxr_postbuild_dests.size() == 1 && xdxr_postbuild_dests[0] == post_va_base,
                "XDXR callbacks execute instead of KHR callbacks");
+
+        // SERIALIZE (3) and DESERIALIZE (4) reach the XDXR copy with their mode; VISUALIZATION_DECODE_FOR_TOOLS (2)
+        // has no XDXR form and is refused.
+        CommandList ser_list;
+        expect(ser_list.copy_acceleration_structure({post_va_base + 256, post_va_base, 3}) &&
+                   ser_list.copy_acceleration_structure({post_va_base, post_va_base + 256, 4}) && ser_list.close(),
+               "record XDXR SERIALIZE + DESERIALIZE");
+        expect(run(ser_list) == ReplayResult::success, "XDXR SERIALIZE and DESERIALIZE replay");
+        // a serialized form is longer than its structure, so only the destination's room bounds these copies: 256
+        // bytes from +256, and the whole buffer from the base, although the source there has 256
+        expect(xdxr_copy_modes.size() == 2 && xdxr_copy_modes[0] == 3 && xdxr_copy_modes[1] == 4 &&
+                   xdxr_copy_bytes.size() == 2 && xdxr_copy_bytes[0] == post_buf_size - 256 &&
+                   xdxr_copy_bytes[1] == post_buf_size,
+               "XDXR copies carry the serialize/deserialize mode, bounded by the destination");
+        CommandList decode_list;
+        expect(decode_list.copy_acceleration_structure({post_va_base + 256, post_va_base, 2}) && decode_list.close(),
+               "record XDXR VISUALIZATION_DECODE_FOR_TOOLS");
+        expect(run(decode_list) == ReplayResult::unsupported, "XDXR VISUALIZATION_DECODE_FOR_TOOLS is unsupported");
+
+        // SERIALIZATION (2) postbuild descs are 16 bytes each: two sources land 16 bytes apart, and a destination
+        // with room for 8 bytes a source is too small. TOOLS_VISUALIZATION (1) has no XDXR form.
+        CommandList ser_info;
+        expect(ser_info.acceleration_structure_postbuild({post_va_base, 2, {0x10000, 0x30000}}) && ser_info.close(),
+               "record XDXR SERIALIZATION postbuild");
+        expect(run(ser_info) == ReplayResult::success, "XDXR SERIALIZATION postbuild replays");
+        expect(xdxr_postbuild_dests.size() == 2 && xdxr_postbuild_dests[0] == post_va_base &&
+                   xdxr_postbuild_dests[1] == post_va_base + 16 && xdxr_postbuild_types.size() == 2 &&
+                   xdxr_postbuild_types[0] == 2 && xdxr_postbuild_types[1] == 2,
+               "XDXR SERIALIZATION descs are 16 bytes apart and carry their type");
+        CommandList short_ser;
+        expect(short_ser.acceleration_structure_postbuild({post_va_base + post_buf_size - 24, 2, {0x10000, 0x30000}}) &&
+                   short_ser.close(),
+               "record XDXR SERIALIZATION postbuild into 24 bytes");
+        expect(run(short_ser) == ReplayResult::invalid_copy, "XDXR SERIALIZATION needs 16 bytes a source");
+        CommandList tools_info;
+        expect(tools_info.acceleration_structure_postbuild({post_va_base, 1, {0x10000}}) && tools_info.close(),
+               "record XDXR TOOLS_VISUALIZATION postbuild");
+        expect(run(tools_info) == ReplayResult::unsupported, "XDXR TOOLS_VISUALIZATION is unsupported");
     }
 
     if (failures) return 1;

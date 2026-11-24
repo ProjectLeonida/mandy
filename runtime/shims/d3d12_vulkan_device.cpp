@@ -10392,12 +10392,22 @@ public:
         return E_INVALIDARG;
     }
 
-    // STUB
+    // Serialized acceleration structures this device writes start with leonida::xdxr_serialized_id (xdxr_build.h):
+    // the same GUID and versioning data are compatible, the same GUID with other versioning data is another layout.
+    // With LEONIDA_RT_AS=khr nothing is serialized (the KHR path refuses SERIALIZE), so nothing is recognised.
     D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE CheckDriverMatchingIdentifier(
-        D3D12_SERIALIZED_DATA_TYPE type, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER*) override {
-        return type == D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE
-                   ? D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED
-                   : D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE;
+        D3D12_SERIALIZED_DATA_TYPE type, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER* id) override {
+        if (type != D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE)
+            return D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE;
+        if (!id || !state_.info.xdxr_acceleration_structures || !state_.info.buffer_device_address)
+            return D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED;
+        static_assert(sizeof(D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER) == sizeof(leonida::xdxr_serialized_id));
+        const auto* ours = reinterpret_cast<const unsigned char*>(leonida::xdxr_serialized_id);
+        if (std::memcmp(&id->DriverOpaqueGUID, ours, sizeof(GUID)) != 0)
+            return D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED;
+        return std::memcmp(id->DriverOpaqueVersioningData, ours + sizeof(GUID), sizeof(id->DriverOpaqueVersioningData)) == 0
+                   ? D3D12_DRIVER_MATCHING_IDENTIFIER_COMPATIBLE_WITH_DEVICE
+                   : D3D12_DRIVER_MATCHING_IDENTIFIER_INCOMPATIBLE_VERSION;
     }
 
     // STUB

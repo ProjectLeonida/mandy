@@ -41,8 +41,20 @@
 //                  1) bytes), so the copy can follow a build in the same list; at most count
 //                  words. The records are position-independent (node pointers count from the structure's start, and
 //                  a TLAS names its BLASes by address), so the bytes are the copy.
-//   MODE_POSTBUILD one thread: the 8-byte COMPACTED_SIZE or CURRENT_SIZE of the structure at src0, at dst. A build
-//                  is already as small as it gets, so both are (totalSizeIn64BNodes + 1) * 64.
+//   MODE_POSTBUILD one thread: the postbuild info of the structure at src0, at dst. arg2 is the D3D12 info type:
+//                  COMPACTED_SIZE (0) or CURRENT_SIZE (3), 8 bytes, both (totalSizeIn64BNodes + 1) * 64 since a build
+//                  is already as small as it gets; or SERIALIZATION (2), 16 bytes: the serialized size (below) and
+//                  the BLAS pointer count.
+//   MODE_SERIALIZE CopyRaytracingAccelerationStructure SERIALIZE, one thread per word of the destination (at most
+//                  count): a D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER (56 bytes: the driver matching
+//                  identifier SER_ID, the serialized size including the header, the deserialized size, which is the
+//                  structure's own, and the pointer count N), then N 8-byte BLAS addresses, one per INSTANCE record
+//                  of a TLAS in record order (0 for a BLAS), then the structure's bytes as they are.
+//   MODE_DESERIALIZE the reverse, one thread per word of the structure (at most count): the bytes after the header
+//                  and the pointers, with each INSTANCE record's BLAS address (+60, in 256-byte units) taken from the
+//                  pointer list instead, which the application may have rewritten for BLASes it moved. The rest of
+//                  the record (the BLAS's root pointer and the world box) stays: a deserialized BLAS is the same
+//                  structure, and its records count from its own start.
 // The node count depends on the keys, so the layout (xdxr_build.h XdxrLayout) leaves room for the most a tree of
 // that many elements can have, and the header's size counts only the nodes the build wrote (compaction drops the
 // rest).
@@ -76,7 +88,14 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint
 const uint MODE_INIT = 0u, MODE_TRIANGLES = 1u, MODE_INSTANCES = 2u, MODE_MORTON = 3u, MODE_KARRAS = 4u,
            MODE_NODES = 5u, MODE_HEADER = 6u, MODE_RADIX_COUNT = 7u, MODE_RADIX_SCAN = 8u, MODE_RADIX_SCATTER = 9u,
            MODE_SMALL_SORT = 10u, MODE_COPY_AS = 12u, MODE_POSTBUILD = 13u, MODE_KEPT = 14u,
-           MODE_KEPT_SCAN = 15u, MODE_KEPT_INDEX = 16u, MODE_PROPAGATE = 17u, MODE_CLEAR = 18u;
+           MODE_KEPT_SCAN = 15u, MODE_KEPT_INDEX = 16u, MODE_PROPAGATE = 17u, MODE_CLEAR = 18u,
+           MODE_SERIALIZE = 19u, MODE_DESERIALIZE = 20u;
+// The serialized header's D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER, as words (xdxr_build.h
+// xdxr_serialized_id): the GUID is the ASCII "Leonida XDXR AS ", the versioning data the header version (VERSION_2403)
+// and the serialized layout version (1).
+const uint SER_ID[8] = uint[8](0x6e6f654cu, 0x20616469u, 0x52584458u, 0x20534120u, 6u, 1u, 0u, 0u);
+const uint SER_HEADER_WORDS = 14u;          // sizeof(D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER) / 4
+const uint POSTBUILD_SERIALIZATION = 2u;    // D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION
 const uint SMALL_SORT_MAX = 1024u;          // xdxr_build.h XdxrLayout::small_sort_max
 const uint RADIX_BITS = 4u, RADIX_BINS = 16u, RADIX_PASSES = 8u;
 const uint RADIX_TILE = 256u;              // elements per workgroup in count and scatter: 4 chunks of 64
@@ -759,6 +778,70 @@ void build_header() {
     store(pc.dst, 60u, 0u);                              // compressionParams: uncompressed
 }
 
+// ---- serialization ----
+// A structure's size in bytes (its header: totalSizeIn64BNodes + 1 units of 64), and the BLAS pointers its
+// serialized form carries: one per instance of a TLAS, none for a BLAS.
+uint as_bytes(uvec2 as) { return (load(as, 4u) + 1u) * 64u; }
+uint ser_pointers(uvec2 as) { return (load(as, 0u) & FLAG_BOTTOM_LEVEL) != 0u ? 0u : load(as, 12u); }
+// The serialized size including the header, as 64 bits: 56 + 8 N + the structure, which may pass 2^32.
+uvec2 ser_size(uvec2 as) {
+    uint n = ser_pointers(as);
+    return add64(add64(uvec2(4u * SER_HEADER_WORDS, 0u), uvec2(n << 3, n >> 29)), uvec2(as_bytes(as), 0u));
+}
+
+void postbuild() {
+    if (pc.arg2 == POSTBUILD_SERIALIZATION) {
+        uvec2 size = ser_size(pc.src0);
+        store(pc.dst, 0u, size.x); store(pc.dst, 4u, size.y);
+        store(pc.dst, 8u, ser_pointers(pc.src0)); store(pc.dst, 12u, 0u);
+    } else {
+        store(pc.dst, 0u, as_bytes(pc.src0)); store(pc.dst, 4u, 0u);
+    }
+}
+
+// Word i of the serialized form of the structure at src0.
+void serialize(uint i) {
+    uint n = ser_pointers(pc.src0);
+    uint payload = SER_HEADER_WORDS + 2u * n;
+    uint v;
+    if (i < 8u) {
+        v = SER_ID[i];
+    } else if (i < SER_HEADER_WORDS) {
+        uvec2 size = ser_size(pc.src0);
+        uint w[6] = uint[6](size.x, size.y, as_bytes(pc.src0), 0u, n, 0u);
+        v = w[i - 8u];
+    } else if (i < payload) {
+        // the application's BLAS address, as the INSTANCE record holds it (256-byte units in 32 bits)
+        uint k = (i - SER_HEADER_WORDS) / 2u;
+        uint blas = load(pc.src0, load(pc.src0, 52u) + 128u * k + 60u);
+        v = (i & 1u) == 0u ? blas << 8 : blas >> 24;
+    } else if (i - payload < as_bytes(pc.src0) / 4u) {
+        v = load(pc.src0, 4u * (i - payload));
+    } else {
+        return;
+    }
+    store(pc.dst, 4u * i, v);
+}
+
+// Word i of the structure deserialized from src0 (the serialized form).
+void deserialize(uint i) {
+    uint n = load(pc.src0, 48u);                        // the header's pointer count (low word)
+    uint payload = SER_HEADER_WORDS + 2u * n;
+    if (i >= load(pc.src0, 40u) / 4u) return;           // the deserialized size
+    uint v = load(pc.src0, 4u * (payload + i));
+    if (n != 0u) {
+        uint elements = load(pc.src0, 4u * (payload + 13u));   // the structure's header +52: its INSTANCE records
+        uint rel = 4u * i - elements;
+        if (4u * i >= elements && rel < 128u * n && rel % 128u == 60u) {
+            uint k = rel / 128u;
+            uvec2 blas = uvec2(load(pc.src0, 4u * (SER_HEADER_WORDS + 2u * k)),
+                               load(pc.src0, 4u * (SER_HEADER_WORDS + 2u * k + 1u)));
+            v = (blas.x >> 8) | (blas.y << 24);
+        }
+    }
+    store(pc.dst, 4u * i, v);
+}
+
 void main() {
     uint i = gl_GlobalInvocationID.x;
     // the radix and kept modes use shared memory and barriers: every invocation of a workgroup takes part
@@ -781,9 +864,11 @@ void main() {
     }
     if (i >= pc.count) return;
     if (pc.mode == MODE_POSTBUILD) {
-        if (i == 0u) { store(pc.dst, 0u, (load(pc.src0, 4u) + 1u) * 64u); store(pc.dst, 4u, 0u); }
+        if (i == 0u) postbuild();
         return;
     }
+    if (pc.mode == MODE_SERIALIZE) { serialize(i); return; }
+    if (pc.mode == MODE_DESERIALIZE) { deserialize(i); return; }
     if (pc.mode == MODE_COPY_AS) {
         if (4u * i < (load(pc.src0, 4u) + 1u) * 64u) store(pc.dst, 4u * i, load(pc.src0, 4u * i));
         return;
