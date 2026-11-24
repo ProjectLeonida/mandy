@@ -187,11 +187,27 @@ keys and their text sit in different archives.
 | `--dialogue` | `wave`, `key`, `label`, `speaker`, `text_<lang>` per language |
 | `--tables` | `source`, `offset`, `lang`, `guess` (the per-table guess), `archive` (nested archive offset), `group`, `strings`, `resolved` |
 | `--strings` | `source`, `offset`, `lang`, `hash`, `label`, `text` |
+| `--native-speakers` | `source`, `offset`, `conversation_offset`, `turn_offset`, `line_offset`, `speaker_slot`, `character_hash`, `cue`, `label`, `subtitle_hash` |
 
 Standard library only. The four archives above take about 2 minutes on one core from a carve.
 
 `tools/opus_tags.py` writes the `--dialogue` rows into the exported Ogg Opus files as `LABEL`, `SPEAKER` and
 `SUBTITLE` comments (see [audio.md](audio.md#tags-names-and-subtitles)).
+
+## Native PSIN speaker report
+
+Add `--native-speakers <temp>/speakers.csv` to read conversation occurrences from complete PSIN resources.
+`offset` is the resource location in the input, and the conversation, turn and line offsets are relative to the
+resource. The report keeps repeated cue/label pairs as distinct occurrences. `subtitle_hash` is the lowercase
+JOAAT of the line label and can be joined to the localized tables. `cue` is the native cue and carries no inferred
+wave number or AWC address.
+
+The `0xEDAF33B4` conversation has participant (`0x1638FDAA`) and turn (`0x06A04D25`) arrays at `+0x10` and `+0x20`.
+The turn's source slot at `+0x18` selects the participant whose slot is at `+0x04`. That participant's `+0x00`
+value supplies `character_hash`. The turn's line array references `0x7622C7F9` records with cue and subtitle label
+strings at `+0x00` and `+0x08`. The reader checks the LSCH layout and bounds each array within its typed block.
+An absent or duplicate slot, or a zero participant hash, leaves `character_hash` empty. The legacy `speaker`
+suffix is still available in `--dialogue`. Keep these CSV exports on the machine that reads the game data.
 
 ## Open questions
 

@@ -35,6 +35,7 @@ keeps every table's own guess in ``guess`` and its nested archive's offset in ``
 Usage:
     python -I text_tables.py <source> [<source> ...] [--labels FILE ...]
                              [--dialogue dialogue.csv] [--tables tables.csv] [--strings strings.csv]
+                             [--native-speakers speakers.csv]
 
 A source is an ``rpf9_carve.py`` directory, an ``.rpf`` archive (read through ``gamedata_index.py``; nothing is
 written), or files and directories of whole resources. ``--labels`` adds label names (word lists or a
@@ -59,6 +60,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from file_mode import published_mode  # noqa: E402
 from hashdict import joaat  # noqa: E402
+from psin_dialogue import speaker_rows  # noqa: E402
 
 RESOURCE_MAGIC = b"0DRP"
 RPF9_MAGIC = b"9FPR"
@@ -410,6 +412,18 @@ class Scan:
                 yield row
 
 
+NATIVE_SPEAKER_FIELDS = ["source", "offset", "conversation_offset", "turn_offset", "line_offset",
+                         "speaker_slot", "character_hash", "cue", "label", "subtitle_hash"]
+
+
+def native_speaker_rows(source, offset, data):
+    for conversation, turn, line, slot, character, cue, label in speaker_rows(data):
+        yield {"source": source, "offset": f"{offset:#x}", "conversation_offset": f"{conversation:#x}",
+               "turn_offset": f"{turn:#x}", "line_offset": f"{line:#x}", "speaker_slot": slot,
+               "character_hash": f"{character:08x}" if character else "", "cue": cue,
+               "label": label, "subtitle_hash": f"{joaat(label):08x}"}
+
+
 def _clean(s: str) -> str:
     return s.replace("\t", " ").replace("\r", " ").replace("\n", " ")
 
@@ -441,9 +455,11 @@ def main(argv=None) -> int:
     ap.add_argument("--dialogue", help="CSV: wave, key, label, speaker, text per language")
     ap.add_argument("--tables", help="CSV: one row per string table (source, offset, lang, group, counts)")
     ap.add_argument("--strings", help="CSV: every string (source, offset, lang, hash, label, text)")
+    ap.add_argument("--native-speakers", help="CSV: native PSIN speaker hashes with source and line locations")
     a = ap.parse_args(argv)
     out_flags = [(flag, path) for flag, path in (("--dialogue", a.dialogue), ("--tables", a.tables),
-                                                 ("--strings", a.strings)) if path]
+                                                 ("--strings", a.strings),
+                                                 ("--native-speakers", a.native_speakers)) if path]
     outs = [path for _, path in out_flags]
     seen = []
     for flag, p in out_flags:
@@ -465,12 +481,15 @@ def main(argv=None) -> int:
             ap.error(f"an output must not overwrite an input: {index}")
 
     scan = Scan()
+    native = []
     try:
         for source in a.sources:
             starts = archive_starts(source)
             for label, offset, data in blobs(source):
                 nested = archive_of(starts, offset) if starts else None
                 scan.add(label, offset, data, None if nested is None else (source, nested))
+                if a.native_speakers:
+                    native.extend(native_speaker_rows(label, offset, data))
         names = {}
         for path in a.labels:
             names.update(read_labels(path))
@@ -499,6 +518,8 @@ def main(argv=None) -> int:
                      ({"source": s, "offset": o, "lang": lang, "hash": f"{h:08x}", "label": names.get(h, ""),
                        "text": _clean(text)}
                       for s, o, lang, t in scan.tables for h, text in t.items())))
+    if a.native_speakers:
+        jobs.append((a.native_speakers, NATIVE_SPEAKER_FIELDS, native))
     # Stage every report next to its destination, then swap them all in. A write that fails part-way must
     # leave the previous reports intact instead of truncating the ones that came before it.
     staged = []
