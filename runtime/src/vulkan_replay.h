@@ -814,6 +814,7 @@ struct ReplayFunctions {
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
     PFN_vkCmdClearColorImage clear_color_image = nullptr;
     PFN_vkCmdClearDepthStencilImage clear_depth_stencil_image = nullptr;
+    bool depth_range_unrestricted = false;  // Allows out-of-range float depth clear values.
     // Optional; a list that needs a missing one is rejected with ReplayResult::unsupported.
     PFN_vkCmdPipelineBarrier2 pipeline_barrier2 = nullptr;  // enhanced barriers
     VkPipelineStageFlags2 queue_stages = 0;
@@ -1042,6 +1043,12 @@ struct Prepared {
     std::vector<std::array<VkDeviceSize, 2>> fills;  // ... buffer byte ranges, offset and size
     VkBuffer fill_scratch = VK_NULL_HANDLE;         // short buffer clears: one repeated 8-byte pattern
     VkDeviceSize fill_scratch_offset = 0;
+    // A NaN depth clear of a float depth plane (prepare_nan_depth_clear): scratch filled with the value's bits, then
+    // copied into each cleared rectangle of the depth plane.
+    VkBuffer nan_depth = VK_NULL_HANDLE;
+    VkDeviceSize nan_depth_offset = 0, nan_depth_bytes = 0;
+    std::uint32_t nan_depth_bits = 0;
+    std::vector<VkBufferImageCopy> nan_depth_regions;
     QueryPool* queries = nullptr;  // query commands: the heap
     ComputePipeline pipeline;  // dispatches
     std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
@@ -2094,6 +2101,46 @@ void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const
     }
 }
 
+// Whether a depth clear writes NaN into a float depth plane. D3D12 (WARP, native) stores the quiet NaN as given, but
+// AMD's Vulkan driver stores 1.0 for a NaN depth clear value in vkCmdClearDepthStencilImage and
+// vkCmdClearAttachments, even with VK_EXT_depth_range_unrestricted (RX 9070 XT, RX 7900 XTX). A buffer-to-image copy
+// writes the bits as they are, so such a clear is a copy of the value's bits instead (D3D-CLEAR-NAN-DEPTH). Without
+// the extension a copy needs [0, 1] too, and the clear stays a clear of zero (see emit).
+inline bool nan_depth_copy(const ReplayFunctions& vk, const ResourceBinding& resource, VkImageAspectFlags aspects,
+                           float depth) {
+    return vk.depth_range_unrestricted && std::isnan(depth) && (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+           !resource.depth24 &&
+           (resource.format == VK_FORMAT_D32_SFLOAT || resource.format == VK_FORMAT_D32_SFLOAT_S8_UINT);
+}
+
+// The copies of a NaN depth clear: one region per cleared rectangle (the whole mip without rectangles), every one
+// reading the same scratch, which holds the value for the largest rectangle (4 bytes a texel, also for D32_S8).
+inline ReplayResult prepare_nan_depth_clear(const ReplayFunctions& vk, const ClearDepthStencil& clear, Prepared& p) {
+    if (!vk.copy_buffer_to_image || !vk.fill_buffer || !vk.copy_scratch) return ReplayResult::unsupported;
+    std::vector<VkClearRect> rects = p.rects;
+    if (rects.empty()) rects.push_back({{{0, 0}, mip_extent(p.binding, clear.target.mip)}, 0, p.range.layerCount});
+    VkDeviceSize texels = 0;
+    for (const VkClearRect& rect : rects)
+        texels = std::max(texels, VkDeviceSize(rect.rect.extent.width) * rect.rect.extent.height);
+    if (!texels) return ReplayResult::success;
+    p.nan_depth_bytes = texels * 4;
+    if (!vk.copy_scratch(p.nan_depth_bytes, p.nan_depth, p.nan_depth_offset) || !p.nan_depth ||
+        p.nan_depth_offset % 4)
+        return ReplayResult::unsupported;
+    std::memcpy(&p.nan_depth_bits, &clear.depth, 4);
+    for (const VkClearRect& rect : rects) {
+        if (!rect.rect.extent.width || !rect.rect.extent.height) continue;
+        VkBufferImageCopy region{};
+        region.bufferOffset = p.nan_depth_offset;
+        region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, p.range.baseMipLevel,
+                                   p.range.baseArrayLayer + rect.baseArrayLayer, rect.layerCount};
+        region.imageOffset = {rect.rect.offset.x, rect.rect.offset.y, 0};
+        region.imageExtent = {rect.rect.extent.width, rect.rect.extent.height, 1};
+        p.nan_depth_regions.push_back(region);
+    }
+    return ReplayResult::success;
+}
+
 } // namespace detail
 
 namespace detail {
@@ -2705,6 +2752,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 r != ReplayResult::success)
                 return r;
             if (!p.skip && p.rects.empty() && !vk.clear_depth_stencil_image) return ReplayResult::unsupported;
+            if (!p.skip && detail::nan_depth_copy(vk, p.binding, aspects, depth_clear->depth))
+                if (const auto r = detail::prepare_nan_depth_clear(vk, *depth_clear, p); r != ReplayResult::success)
+                    return r;
         } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
             const UavView& view = uav->view;
             if (!bind(view.resource)) return ReplayResult::unresolved_resource;
@@ -3654,16 +3704,37 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VulkanAccess state = vulkan_access(d3d12_state::depth_write, false);
             auto pieces = detail::current(tracker, id, range, image_layout(p.binding, state.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
-            const float depth = p.binding.depth24 ? depth24_clear_value(depth_clear->depth)  // see depth24.h
-                                : p.binding.format == VK_FORMAT_D16_UNORM
-                                    ? detail::quantize_unorm(depth_clear->depth, 65535.0)  // see quantize_unorm
-                                    : depth_clear->depth;
+            float depth = p.binding.depth24 ? depth24_clear_value(depth_clear->depth)  // see depth24.h
+                          : p.binding.format == VK_FORMAT_D16_UNORM
+                              ? detail::quantize_unorm(depth_clear->depth, 65535.0)  // see quantize_unorm
+                              : depth_clear->depth;
+            // Without the extension both clear commands require a depth in [0, 1], including for float images.
+            if (!vk.depth_range_unrestricted)
+                depth = std::isnan(depth) ? 0.0f : std::clamp(depth, 0.0f, 1.0f);
+            VkImageSubresourceRange cleared = p.range;
+            if (p.nan_depth) {  // see nan_depth_copy: the depth plane is written by a copy, any stencil by a clear
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT);
+                vk.fill_buffer(command_buffer, p.nan_depth, p.nan_depth_offset, p.nan_depth_bytes, p.nan_depth_bits);
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                detail::round_trip(vk, command_buffer, p.binding, pieces, image_layout(p.binding, transfer_dst.layout),
+                                   state, transfer_dst.access, transfer_dst.stages, [&] {
+                    vk.copy_buffer_to_image(command_buffer, p.nan_depth, p.binding.image,
+                                            image_layout(p.binding, transfer_dst.layout),
+                                            std::uint32_t(p.nan_depth_regions.size()), p.nan_depth_regions.data());
+                });
+                cleared.aspectMask &= ~VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT);
+                if (!cleared.aspectMask) continue;
+                depth = 0.0f;  // the stencil clear below leaves the depth plane alone
+            }
             const VkClearDepthStencilValue value{depth, depth_clear->stencil};
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, image_layout(p.binding, transfer_dst.layout),
                                    state, transfer_dst.access, transfer_dst.stages, [&] {
                     vk.clear_depth_stencil_image(command_buffer, p.binding.image,
-                                                 image_layout(p.binding, transfer_dst.layout), &value, 1, &p.range);
+                                                 image_layout(p.binding, transfer_dst.layout), &value, 1, &cleared);
                 });
                 continue;
             }
@@ -3678,10 +3749,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
                 rendering.renderArea = {{0, 0}, detail::mip_extent(p.binding, depth_clear->target.mip)};
                 rendering.layerCount = depth_clear->target.layer_count;
-                if (p.range.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) rendering.pDepthAttachment = &info;
-                if (p.range.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) rendering.pStencilAttachment = &info;
+                if (cleared.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) rendering.pDepthAttachment = &info;
+                if (cleared.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) rendering.pStencilAttachment = &info;
                 vk.begin_rendering(command_buffer, &rendering);
-                VkClearAttachment attachment_clear{p.range.aspectMask, 0, {}};
+                VkClearAttachment attachment_clear{cleared.aspectMask, 0, {}};
                 attachment_clear.clearValue.depthStencil = value;
                 vk.clear_attachments(command_buffer, 1, &attachment_clear, std::uint32_t(p.rects.size()), p.rects.data());
                 vk.end_rendering(command_buffer);
