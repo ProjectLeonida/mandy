@@ -57,7 +57,7 @@ EXPORT = "exp mrt0 v8, v9, v10, v11 done vm"
 KNOWN_DIVERGENCES = {
     "f64-omod": "SHADER-721: f64 output modifiers; owned by @fiestorra.",
     "double-neg-abs": "TEST-912 (#4172): spirv_mini_interp rounds binary64 OpFNegate/FAbs through binary32, changing values as well as NaN payloads.",
-    "fclamp-nan-zero": "The sign of a zero result after f64 clamp/omod is driver-dependent (FClamp); a NaN is +0.",
+    "f64-clamp": "Excluded from default runs: GLSL.std.450 FClamp leaves the sign of a -0 result to the driver (the CPU interpreter keeps -0, the reference gives +0). The --known case is a NaN, which the translator and the reference agree on (+0).",
     "div-fixup-nan-s0": "RDNA2 ISA maps NaN(S0) to signed infinity; current translator preserves the NaN payload.",
 }
 
@@ -543,8 +543,8 @@ def make_case(rng, op, allow_literal=True, known_case=None):
     elif op == "v_add_f64":
         left, right = gen_source(rng, 0, allow_literal, bus), gen_source(rng, 1, allow_literal, bus)
         if known_case == "double-neg-abs": left = "-|v[8:9]|"
-        suffix = " mul:2" if known_case == "f64-omod" else " clamp" if known_case == "fclamp-nan-zero" else ""
-        if known_case == "fclamp-nan-zero": left, right = "0x7ff80001", "1.0"
+        suffix = " mul:2" if known_case == "f64-omod" else " clamp" if known_case == "f64-clamp" else ""
+        if known_case == "f64-clamp": left, right = "0x7ff80001", "1.0"
         body_lines.append(f"{op} v[8:9], {left}, {right}{suffix}")
     elif op == "v_div_fixup_f64":
         if known_case == "div-fixup-nan-s0":
@@ -627,7 +627,7 @@ def run_one(lines, name, tmp, oracle="translator", gpu=None, include_known=False
             if " mul:" in line or " div:" in line:
                 return "skip", f"KNOWN_DIVERGENCE f64-omod: {KNOWN_DIVERGENCES['f64-omod']}", None, None
             if " clamp" in line and "f64" in line:
-                return "skip", f"KNOWN_DIVERGENCE fclamp-nan-zero: {KNOWN_DIVERGENCES['fclamp-nan-zero']}", None, None
+                return "skip", f"KNOWN_DIVERGENCE f64-clamp: {KNOWN_DIVERGENCES['f64-clamp']}", None, None
             if line.split() and line.split()[0] in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_div_fmas_f64") and ("|" in line or "-v[" in line or "-s[" in line):
                 return "skip", f"KNOWN_DIVERGENCE double-neg-abs: {KNOWN_DIVERGENCES['double-neg-abs']}", None, None
     # The hardware kernel is one lane, so EXEC is 1 there and a program that reads exec_lo back sees 1.

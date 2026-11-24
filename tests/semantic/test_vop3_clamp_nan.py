@@ -5,7 +5,9 @@ for v_rcp_iflag_f32 (docs/shader_validation.md, "32-bit float VALU on the GPU": 
 off, 169 programs) and for v_fmac_f16, v_fma_mixlo_f16 and v_fma_mix_f32 (SHADER-186, "f16 output modifiers, clamp and
 v_fma_mix* operands on RDNA2").
 GLSL.std.450 leaves FClamp undefined for a NaN operand, so the translator selects +0 for a NaN before FClamp, as the
-div_fixup and cvt_pknorm clamps already did. Before that the shared helper emitted a bare FClamp, which the CPU
+div_fixup and cvt_pknorm clamps already did. The f64 forms (Gen.clamp_mods_f64) and the packed f16 forms (v_pk_add/mul/
+fma/min/max_f16, per half) follow the same ISA rule, MODE.DX10_CLAMP; neither has been measured on hardware itself
+(docs/design.md says so too), so ClampNanF64Tests and ClampNanPackedF16Tests check the translator against that rule only. Before that the shared helper emitted a bare FClamp, which the CPU
 interpreter refuses (UnsupportedConstruct) and which a driver may return as the NaN.
 
 Each program computes one value in v4 and exports it. The NaN comes from a NaN operand (quiet, negative, signalling)
@@ -174,6 +176,18 @@ class ClampNanF64Tests(unittest.TestCase):
                 with self.subTest(op=line, nan=nan):
                     self.assertEqual(run_f64(line, nan), (0, 0))
 
+    def test_other_callers_of_clamp_mods_f64_give_plus_zero_for_a_nan(self):
+        # v_frexp_mant_f64 passes a NaN operand through, and v_div_fixup_f64 does for a NaN denominator (S1), so
+        # both hand a NaN to clamp_mods_f64. v_cvt_f64_i32/u32 cannot make a NaN, so they are not here.
+        for nan in (F64_QNAN, F64_NEG_QNAN, F64_SNAN):
+            with self.subTest(op="v_frexp_mant_f64", nan=nan):
+                self.assertEqual(run_f64("v_frexp_mant_f64_e64 v[4:5], v[0:1] clamp", nan), (0, 0))
+            with self.subTest(op="v_div_fixup_f64 S1", nan=nan):
+                self.assertEqual(run_f64("v_div_fixup_f64 v[4:5], v[2:3], v[0:1], v[2:3] clamp", nan), (0, 0))
+        # controls: 3.0 has the mantissa 0.75, and -3.0 has -0.75, which clamps to +0
+        self.assertEqual(run_f64("v_frexp_mant_f64_e64 v[4:5], v[0:1] clamp", (0, 0x40080000)), (0, 0x3FE80000))
+        self.assertEqual(run_f64("v_frexp_mant_f64_e64 v[4:5], v[0:1] clamp", (0, 0xC0080000)), (0, 0))
+
     def test_invalid_operation_clamps_to_plus_zero(self):
         # inf + -inf
         neg_inf = (0, 0xFFF00000)
@@ -209,6 +223,22 @@ class ClampNanPackedF16Tests(unittest.TestCase):
                     self.assertEqual(run(line, F16_HALF << 16 | nan, y), F16_HALF << 16)
                 with self.subTest(op=line, nan=hex(nan), half="hi"):
                     self.assertEqual(run(line, nan << 16 | F16_HALF, y), F16_HALF)
+
+    def test_min_max_nan_halves_clamp_to_plus_zero(self):
+        # min/max return the other operand for one NaN, so a half is a NaN only when both operands are: +0 then.
+        # Expected words are literals: (src0, src1) -> result. 0x7e00 is a quiet NaN, 0x3800 is 0.5, 0x8000 is -0,
+        # 0xbc00 is -1.
+        for line in ("v_pk_max_f16 v4, v1, v2 clamp", "v_pk_min_f16 v4, v1, v2 clamp"):
+            for src, want, what in ((0x7E007E00, 0x00000000, "both halves NaN"),
+                                    (0x38007E00, 0x38000000, "lo half NaN, hi half 0.5"),
+                                    (0x7E003800, 0x00003800, "hi half NaN, lo half 0.5"),
+                                    (0x80008000, 0x00000000, "-0 in both halves"),
+                                    (0xBC00BC00, 0x00000000, "-1 in both halves")):
+                with self.subTest(op=line, case=what):
+                    self.assertEqual(run(line, src, src), want)
+            # one NaN operand per half gives the other operand (0.5), which is in range
+            with self.subTest(op=line, case="one NaN operand per half"):
+                self.assertEqual(run(line, 0x38007E00, 0x7E003800), 0x38003800)
 
     def test_invalid_operation_half_clamps_to_plus_zero(self):
         # inf * 0 in the low half, 2 * 1 (clamped to 1) in the high half.
