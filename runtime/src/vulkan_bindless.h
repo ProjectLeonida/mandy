@@ -563,11 +563,13 @@ public:
         const bool must_replace = flush_replaces_table();
         last_flush_degraded_ = false;
         if (table_dirty_ || !table_uploaded_) written = upload_table(command_buffer, retire_ticket, replaced);
+        if (!written && last_failure_result_ == VK_ERROR_DEVICE_LOST) return false;
         if (!written && must_replace && completed_ticket) {
             const std::uint64_t completed = completed_ticket();
             if (!retired_.empty()) {
                 release_retired(completed);
                 written = upload_table(command_buffer, retire_ticket, replaced);
+                if (!written && last_failure_result_ == VK_ERROR_DEVICE_LOST) return false;
             }
             if (!written && completed >= retire_ticket) written = rewrite_table_in_place(command_buffer);
         }
