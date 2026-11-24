@@ -535,6 +535,12 @@ fragment stage either: on an RX 6800 (RDNA2) with AMD's Windows driver 26.11.2 t
 be requested for pixel shaders (they run at the 64-wide default), and the tier C pixel fixtures are a `SKIP` too
 (2026-11-22, [d3d12_vulkan.md](d3d12_vulkan.md), "Subgroup size").
 
+On a Mac every fixture is a `SKIP`. MoltenVK has no geometry stage, its fragment stage may run fewer live lanes than
+32, and the device's `subgroupSupportedStages` leaves the vertex stage out (compute, fragment and tessellation
+control only on an Apple M5 with MoltenVK 1.4.2): Metal has no subgroup built-ins in a vertex function. `vk_harness`
+reports a vertex shader that uses subgroup operations as unsupported there, where the pipeline used to fail with
+"Subgroup builtins are not available in this type of function".
+
 Build and run it on Linux with RADV, pinned to one GPU (`LEONIDA_VK_DEVICE`, see "Choosing the GPU"):
 
 ```sh

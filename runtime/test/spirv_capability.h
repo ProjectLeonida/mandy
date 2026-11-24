@@ -16,6 +16,10 @@ namespace leonida::vk_test {
 inline constexpr std::uint32_t spirv_capability_float64 = 10;
 inline constexpr std::uint32_t spirv_capability_int64 = 11;
 inline constexpr std::uint32_t spirv_capability_int64_atomics = 12;
+// GroupNonUniform and the seven that implicitly declare it: Vote, Arithmetic, Ballot, Shuffle, ShuffleRelative,
+// Clustered and Quad.
+inline constexpr std::uint32_t spirv_capability_group_non_uniform = 61;
+inline constexpr std::uint32_t spirv_capability_group_non_uniform_quad = 68;
 
 // Whether the module declares capability `cap`. OpCapability instructions (2 words each) come first, right after the
 // 5-word header, so the scan stops at the first other instruction. `bytes` may be any length; a partial word is ignored.
@@ -44,6 +48,20 @@ inline bool needs_shader_int64(const void* code, std::size_t bytes) {
 
 inline bool needs_shader_int64(const std::vector<std::uint32_t>& spv) {
     return needs_shader_int64(spv.data(), spv.size() * 4);
+}
+
+// Whether the module uses subgroup operations or the subgroup built-ins (SubgroupSize, SubgroupLocalInvocationId): any
+// GroupNonUniform capability. A stage that does has to be in VkPhysicalDeviceSubgroupProperties::supportedStages.
+// MoltenVK leaves the vertex stage out, and a vertex module that uses them fails its pipeline there, so vk_harness
+// reports 77 for it instead (TEST-W64G-VS-SUBGROUP-STAGE).
+inline bool uses_subgroup_operations(const void* code, std::size_t bytes) {
+    for (std::uint32_t cap = spirv_capability_group_non_uniform; cap <= spirv_capability_group_non_uniform_quad; ++cap)
+        if (declares_capability(code, bytes, cap)) return true;
+    return false;
+}
+
+inline bool uses_subgroup_operations(const std::vector<std::uint32_t>& spv) {
+    return uses_subgroup_operations(spv.data(), spv.size() * 4);
 }
 
 }  // namespace leonida::vk_test
