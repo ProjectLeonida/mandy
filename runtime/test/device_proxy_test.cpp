@@ -574,6 +574,33 @@ int main(int argc, char** argv) {
             ComPtr<ID3D12Device> owner;
             check(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(owner.GetAddressOf()))) && owner.Get() == device.Get(),
                   "the queue proxy's GetDevice is the device the shim returned");
+
+            using GetStatsFn = HRESULT(WINAPI*)(void*, UINT64, UINT32, UINT32*, void*);
+            using SuspendFn = HRESULT(WINAPI*)(void*, UINT32);
+            using ResumeFn = HRESULT(WINAPI*)(void*);
+            using PresentXFn = HRESULT(WINAPI*)(void*, UINT32, const void*, const void*);
+            void** qvtable = *reinterpret_cast<void***>(queue.Get());
+
+            UINT32 stat_count = 99;
+            check(reinterpret_cast<GetStatsFn>(vtable[81])(device.Get(), 1, 1, nullptr, nullptr) == E_POINTER,
+                  "device slot 81 GetFrameStatisticsX(nullptr count) returns E_POINTER");
+            check(reinterpret_cast<GetStatsFn>(vtable[81])(device.Get(), 1, 1, &stat_count, nullptr) == S_FALSE &&
+                      stat_count == 0,
+                  "device slot 81 GetFrameStatisticsX writes count=0 and returns S_FALSE");
+
+            check(reinterpret_cast<PresentXFn>(qvtable[32])(queue.Get(), 0, nullptr, nullptr) == S_OK,
+                  "queue slot 32 PresentX(0 planes) succeeds");
+            check(reinterpret_cast<PresentXFn>(qvtable[32])(queue.Get(), 3, nullptr, nullptr) == E_INVALIDARG,
+                  "queue slot 32 PresentX(>2 planes) returns E_INVALIDARG");
+            check(reinterpret_cast<SuspendFn>(qvtable[23])(queue.Get(), 0) == S_OK,
+                  "queue slot 23 SuspendX returns S_OK");
+            check(reinterpret_cast<PresentXFn>(qvtable[32])(queue.Get(), 0, nullptr, nullptr) ==
+                      HRESULT_FROM_WIN32(ERROR_INVALID_STATE),
+                  "queue slot 32 PresentX while suspended returns ERROR_INVALID_STATE");
+            check(reinterpret_cast<ResumeFn>(qvtable[24])(queue.Get()) == S_OK,
+                  "queue slot 24 ResumeX returns S_OK");
+            check(reinterpret_cast<PresentXFn>(qvtable[32])(queue.Get(), 0, nullptr, nullptr) == S_OK,
+                  "queue slot 32 PresentX succeeds again after ResumeX");
         }
     }
 

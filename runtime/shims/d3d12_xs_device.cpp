@@ -76,6 +76,8 @@ struct DeviceProxy {
     std::atomic<std::uint32_t> frame_latency{1};
     std::atomic<bool> frame_event_scheduled{false};
     std::atomic<std::uint64_t> frame_next_token{1};
+    std::atomic<bool> frame_suspended{false};
+    std::atomic<std::uint64_t> present_calls{0};
 };
 
 constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
@@ -157,6 +159,7 @@ const char* slot_name(unsigned slot) {
         case 78: return "Xbox SetFrameIntervalX";
         case 79: return "Xbox ScheduleFrameEventX";
         case 80: return "Xbox WaitFrameEventX";
+        case 81: return "Xbox GetFrameStatisticsX";
         case 133: return "Xbox CreatePlacedResourceX (a buffer on the title's pages)";
         default: return "forwarded";
     }
@@ -178,11 +181,18 @@ void note_slot(unsigned slot) {
 // that disagrees). A value outside that range is logged once and ignored. The table is read once, on the first
 // generic slot call, so a test that wants other slots sets the variables before it creates a device.
 struct XboxDeviceSlotRoutes {
-    unsigned frame_interval = 78;  // SetFrameIntervalX(output, interval_us, latency, flags)
-    unsigned schedule_event = 79;  // ScheduleFrameEventX(event, offset_us, reserved, flags)
-    unsigned wait_event = 80;      // WaitFrameEventX(event, timeout_ms, reserved, flags, &token)
-    unsigned queue_x = 48;         // CreateCommandQueueX(desc, riid, out)
-    unsigned list_x = 73;          // CreateCommandListX(desc, allocator, initial_state, riid, out)
+    unsigned frame_interval = 78;    // SetFrameIntervalX(output, interval_us, latency, flags)
+    unsigned schedule_event = 79;    // ScheduleFrameEventX(event, offset_us, reserved, flags)
+    unsigned wait_event = 80;        // WaitFrameEventX(event, timeout_ms, reserved, flags, &token)
+    unsigned frame_statistics = 81;  // GetFrameStatisticsX(token, type_mask, &count, stats)
+    unsigned queue_x = 48;           // CreateCommandQueueX(desc, riid, out)
+    unsigned list_x = 73;            // CreateCommandListX(desc, allocator, initial_state, riid, out)
+};
+
+struct XboxQueueSlotRoutes {
+    unsigned suspend = 23;  // SuspendX(flags)
+    unsigned resume = 24;   // ResumeX()
+    unsigned present = 32;  // PresentX(plane_count, planes, params)
 };
 
 unsigned env_device_slot(const char* name, unsigned fallback) {
@@ -210,20 +220,41 @@ const XboxDeviceSlotRoutes& xbox_device_slot_routes() {
         const unsigned frame_interval = env_device_slot("LEONIDA_XS_FRAME_INTERVAL_SLOT", r.frame_interval);
         const unsigned schedule_event = env_device_slot("LEONIDA_XS_SCHEDULE_EVENT_SLOT", r.schedule_event);
         const unsigned wait_event = env_device_slot("LEONIDA_XS_WAIT_EVENT_SLOT", r.wait_event);
+        const unsigned frame_statistics = env_device_slot("LEONIDA_XS_FRAME_STATISTICS_SLOT", r.frame_statistics);
         const unsigned queue_x = env_device_slot("LEONIDA_XS_QUEUE_X_SLOT", r.queue_x);
         const unsigned list_x = env_device_slot("LEONIDA_XS_LIST_X_SLOT", r.list_x);
         const bool moved = frame_interval != r.frame_interval || schedule_event != r.schedule_event ||
-                           wait_event != r.wait_event || queue_x != r.queue_x || list_x != r.list_x;
+                           wait_event != r.wait_event || frame_statistics != r.frame_statistics ||
+                           queue_x != r.queue_x || list_x != r.list_x;
         r.frame_interval = frame_interval;
         r.schedule_event = schedule_event;
         r.wait_event = wait_event;
+        r.frame_statistics = frame_statistics;
         r.queue_x = queue_x;
         r.list_x = list_x;
         if (moved)
             std::fprintf(stderr,
                          "[rt] d3d12_xs: Xbox device slots: SetFrameIntervalX=%u ScheduleFrameEventX=%u "
-                         "WaitFrameEventX=%u CreateCommandQueueX=%u CreateCommandListX=%u\n",
-                         r.frame_interval, r.schedule_event, r.wait_event, r.queue_x, r.list_x);
+                         "WaitFrameEventX=%u GetFrameStatisticsX=%u CreateCommandQueueX=%u CreateCommandListX=%u\n",
+                         r.frame_interval, r.schedule_event, r.wait_event, r.frame_statistics, r.queue_x, r.list_x);
+        return r;
+    }();
+    return routes;
+}
+
+const XboxQueueSlotRoutes& xbox_queue_slot_routes() {
+    static const XboxQueueSlotRoutes routes = [] {
+        XboxQueueSlotRoutes r;
+        const unsigned suspend = env_device_slot("LEONIDA_XS_SUSPEND_SLOT", r.suspend);
+        const unsigned resume = env_device_slot("LEONIDA_XS_RESUME_SLOT", r.resume);
+        const unsigned present = env_device_slot("LEONIDA_XS_PRESENT_SLOT", r.present);
+        const bool moved = suspend != r.suspend || resume != r.resume || present != r.present;
+        r.suspend = suspend;
+        r.resume = resume;
+        r.present = present;
+        if (moved)
+            std::fprintf(stderr, "[rt] d3d12_xs: Xbox queue slots: SuspendX=%u ResumeX=%u PresentX=%u\n",
+                         r.suspend, r.resume, r.present);
         return r;
     }();
     return routes;
@@ -1213,6 +1244,37 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                              reinterpret_cast<void**>(a2)));
     } else {
         note_child_slot<K>(Slot);
+        if constexpr (K == ChildKind::queue) {
+            const XboxQueueSlotRoutes& qroutes = xbox_queue_slot_routes();
+            if (Slot == qroutes.suspend) {
+                log_xbox_route_once(Slot, "Queue::SuspendX", a1, a2, a3, a4, 0);
+                self->device->frame_event_scheduled.store(false, std::memory_order_relaxed);
+                self->device->frame_suspended.store(true, std::memory_order_relaxed);
+                d3d12_trace::record("ID3D12CommandQueue::SuspendX");
+                return hr_to_u64(S_OK);
+            }
+            if (Slot == qroutes.resume) {
+                log_xbox_route_once(Slot, "Queue::ResumeX", a1, a2, a3, a4, 0);
+                self->device->frame_suspended.store(false, std::memory_order_relaxed);
+                d3d12_trace::record("ID3D12CommandQueue::ResumeX");
+                return hr_to_u64(S_OK);
+            }
+            if (Slot == qroutes.present) {
+                log_xbox_route_once(Slot, "Queue::PresentX", a1, a2, a3, a4, 0);
+                const auto plane_count = static_cast<std::uint32_t>(a1);
+                if (plane_count > 2 || (plane_count > 0 && a2 == 0)) {
+                    d3d12_trace::record("ID3D12CommandQueue::PresentX", "invalid_arg");
+                    return hr_to_u64(E_INVALIDARG);
+                }
+                if (self->device->frame_suspended.load(std::memory_order_relaxed)) {
+                    d3d12_trace::record("ID3D12CommandQueue::PresentX", "suspended");
+                    return hr_to_u64(HRESULT_FROM_WIN32(ERROR_INVALID_STATE));
+                }
+                self->device->present_calls.fetch_add(1, std::memory_order_relaxed);
+                d3d12_trace::record("ID3D12CommandQueue::PresentX");
+                return hr_to_u64(S_OK);
+            }
+        }
         if (Slot >= self->slot_count) {
             bool expected = false;
             if (ChildStats<K>::beyond_warned[Slot].compare_exchange_strong(expected, true,
@@ -1411,6 +1473,19 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
     if (value == 0) value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);  // skip the null token
     *token = value;
     return S_OK;
+}
+
+// Xbox device slot 81 (measured in retail exe): GetFrameStatisticsX(token, type_mask, &count, stats).
+// Before a window/presenter is attached, writes *count = 0 and returns S_FALSE (matches XboxPresentation).
+HRESULT proxy_get_frame_statistics_x(DeviceProxy* /*self*/, std::uint64_t token, std::uint64_t type_mask,
+                                       std::uint64_t count_word, std::uint64_t stats_word) {
+    (void)token;
+    (void)type_mask;
+    (void)stats_word;
+    auto* count = reinterpret_cast<std::uint32_t*>(count_word);
+    if (!count) return E_POINTER;
+    *count = 0;
+    return S_FALSE;
 }
 
 // Xbox device slot 73 (public HLE): CreateCommandListX(desc, allocator, initial_state, riid, out). The console call is
@@ -2037,6 +2112,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         if (Slot == routes.wait_event) {
             log_xbox_route_once(Slot, "WaitFrameEventX", a1, a2, a3, a4, a5);
             return hr_to_u64(proxy_wait_frame_event_x(self, a1, a2, a4, a5));
+        }
+        if (Slot == routes.frame_statistics) {
+            log_xbox_route_once(Slot, "GetFrameStatisticsX", a1, a2, a3, a4, a5);
+            return hr_to_u64(proxy_get_frame_statistics_x(self, a1, a2, a3, a4));
         }
         if (Slot == routes.queue_x) {
             log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
