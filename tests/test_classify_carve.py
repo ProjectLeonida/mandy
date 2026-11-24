@@ -360,6 +360,21 @@ class MainTests(unittest.TestCase):
                 data = json.load(f)
             self.assertEqual(counts(data["overall"]["rbf0"]), {"files": 1, "bytes": 42})
 
+    def test_stage_cleanup_restores_write_mode_on_replace_failure(self):
+        self.archive("a", [{"head": RBF0_HEAD, "size": 42}])
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(p, mode, **kwargs):
+            chmod_calls.append((p, mode))
+            return real_chmod(p, mode, **kwargs)
+
+        with mock.patch.object(carve.os, "replace", side_effect=OSError("replace failed")), \
+             mock.patch.object(carve.os, "chmod", side_effect=track_chmod):
+            with self.assertRaises(OSError):
+                self.run_main()
+        self.assertTrue(any(mode == 0o600 for p, mode in chmod_calls))
+
 
 if __name__ == "__main__":
     unittest.main()

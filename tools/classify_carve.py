@@ -121,6 +121,7 @@ def main():
         os.replace(temp, dest)
     except BaseException:
         try:
+            os.chmod(temp, 0o600)
             os.unlink(temp)
         except OSError:
             pass
