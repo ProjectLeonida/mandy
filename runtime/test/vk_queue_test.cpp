@@ -86,7 +86,7 @@ int check_picker() {
     {
         const std::array f{fam(G), fam(T), fam(C)};  // the common NVIDIA layout
         const auto q = pick_queue_families(f, 0);
-        EXPECT(q.direct == 0 && q.compute == 2 && q.copy == 1);
+        EXPECT(q.direct == 0 && q.compute == 2 && q.copy == 2);  // copy needs compute for the repack passes
     }
     {
         const std::array f{fam(G)};  // one family for everything (integrated GPUs, llvmpipe)
@@ -109,25 +109,25 @@ int check_picker() {
         constexpr VkQueueFlags S = VK_QUEUE_SPARSE_BINDING_BIT;
         const std::array f{fam(G | S), fam(T), fam(C)};
         const auto preferred = pick_queue_families(f, 0);
-        EXPECT(preferred.compute == 2 && preferred.copy == 1);
+        EXPECT(preferred.compute == 2 && preferred.copy == 2);
         const auto corrected = sparse_capable_queue_families(f, preferred, true);
         EXPECT(corrected.direct == 0 && corrected.compute == 0 && corrected.copy == 0);
         const auto no_sparse = sparse_capable_queue_families(f, preferred, false);
-        EXPECT(no_sparse.compute == 2 && no_sparse.copy == 1);
+        EXPECT(no_sparse.compute == 2 && no_sparse.copy == 2);
     }
     {
         constexpr VkQueueFlags S = VK_QUEUE_SPARSE_BINDING_BIT;
         const std::array f{fam(G | S), fam(T | S), fam(C | S)};
         const auto preferred = pick_queue_families(f, 0);
         const auto corrected = sparse_capable_queue_families(f, preferred, true);
-        EXPECT(corrected.compute == 2 && corrected.copy == 1);  // preserve dedicated queues
+        EXPECT(corrected.compute == 2 && corrected.copy == 2);  // preserve dedicated queues
     }
     {
         constexpr VkQueueFlags S = VK_QUEUE_SPARSE_BINDING_BIT;
         const std::array f{fam(G | S), fam(T), fam(C | S)};
         const auto preferred = pick_queue_families(f, 0);
         const auto corrected = sparse_capable_queue_families(f, preferred, true);
-        EXPECT(corrected.compute == 2 && corrected.copy == 0);  // mixed capabilities
+        EXPECT(corrected.compute == 2 && corrected.copy == 2);  // the async-compute family binds sparse pages
     }
     std::printf("queue family picker: 7 layouts ok\n");
     return 0;

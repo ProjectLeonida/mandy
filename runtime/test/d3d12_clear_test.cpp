@@ -452,8 +452,16 @@ int main(int argc, char** argv) {
             auto query = vk.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
             query(vk.physical, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, &properties);
             const bool native_rtv = properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
-            if (native_rtv != bool(fs.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) {
-                std::fprintf(stderr, "RGB9E5 render-target support disagrees with the native attachment capability\n");
+            const bool native_storage = properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+            // The shim backs the target with fp16 when E5 lacks attachment or storage and RGBA16F has all three
+            // (device r9g9b9e5_half_targets), so reported RT support may come from the fallback, not native E5.
+            VkFormatProperties half{};
+            query(vk.physical, VK_FORMAT_R16G16B16A16_SFLOAT, &half);
+            const VkFormatFeatureFlags half_need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                                                   VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+            const bool half_rtv = (!native_rtv || !native_storage) && (half.optimalTilingFeatures & half_need) == half_need;
+            if ((native_rtv || half_rtv) != bool(fs.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) {
+                std::fprintf(stderr, "RGB9E5 render-target support disagrees with native attachment or the fp16 fallback\n");
                 return 1;
             }
             if (!(fs.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) {

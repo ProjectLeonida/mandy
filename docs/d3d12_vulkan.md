@@ -416,7 +416,11 @@ What is implemented (all of it testable without the game):
     RGB9E5 words and the fp16 image in the depth24 compute pass (`Depth24Job::rgb9e5`, the rgb96 repack's machinery):
     a footprint readback packs fp16 to RGB9E5 with the same WARP-matching rule as the UAV clear, an upload decodes
     losslessly, and a `CopyResource` to or from a native `E5B9G9R9` texture converts the same way rather than being
-    refused. `ALLOW_DEPTH_STENCIL`, `DENY_SHADER_RESOURCE` and multisampled RT+UAV stay refused, and where fp16
+    refused. These copies preserve the colour value, not the packed bits: fp16 stores the decoded value, so a
+    write-free upload/readback re-encodes a non-canonical word to its canonical form (`0x88000080` and `0x80000100`
+    both decode to red 1.0 and read back as `0x80000100`); the two sample identically. The bit-exact round-trip
+    contract holds only for the UAV-only `R32_UINT` emulation, which keeps the packed word.
+    `ALLOW_DEPTH_STENCIL`, `DENY_SHADER_RESOURCE` and multisampled RT+UAV stay refused, and where fp16
     cannot back it the request is refused as before (`d3d12_r9g9b9e5_uav_test` §7–§9);
   - the descriptor shader samples `B5G5R5A1_UNORM` through a 2D SRV. Opaque and transparent red check bit 15,
     and mixed-channel texels check the five-bit color fields;

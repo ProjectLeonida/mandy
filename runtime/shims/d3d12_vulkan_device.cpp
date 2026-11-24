@@ -969,19 +969,26 @@ struct DeviceState {
                                                (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) ||
                 (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)))
                 return {};
-            if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
-                (!color_attachment_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) ||
-                 ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
-                  !storage_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)))) {
-                if (!r9g9b9e5_half_targets) return {};
-                // fp16 holds every shared-exponent value exactly (9 mantissa bits, exponents down to 2^-24), so the
-                // render target keeps its values at twice the memory. Every view (RTV, SRV, UAV, T#) is fp16
-                // (Format::r9g9b9e5_as_half); copies convert between the logical 4-byte footprint and the fp16 image
-                // (ResourceBinding::rgb9e5, the depth24 pass), so a title's GetCopyableFootprints copy still works.
-                log_once("R9G9B9E5_SHAREDEXP render target unavailable natively, using RGBA16F; format", desc.Format);
-                Format backed{VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT};
-                backed.r9g9b9e5_as_half = true;
-                return backed;
+            if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
+                // When the fp16 fallback is active, every R9G9B9E5 render target uses it — RT-only and RT+UAV alike —
+                // so the backing matches the pipeline's attachment format (which picks fp16 for the logical format).
+                // A split adapter (native E5 attachment but no storage) would otherwise keep an RT-only target packed
+                // while the PSO expects fp16, and the draw would request an fp16 view of a packed image.
+                if (r9g9b9e5_half_targets) {
+                    // fp16 holds every shared-exponent value exactly (9 mantissa bits, exponents down to 2^-24), so the
+                    // render target keeps its values at twice the memory. Every view (RTV, SRV, UAV, T#) is fp16
+                    // (Format::r9g9b9e5_as_half); copies convert between the logical 4-byte footprint and the fp16 image
+                    // (ResourceBinding::rgb9e5, the depth24 pass), so a title's GetCopyableFootprints copy still works.
+                    log_once("R9G9B9E5_SHAREDEXP render target unavailable natively, using RGBA16F; format", desc.Format);
+                    Format backed{VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT};
+                    backed.r9g9b9e5_as_half = true;
+                    return backed;
+                }
+                // No fp16 fallback: native E5 must support the requested flags, or the target is refused.
+                if (!color_attachment_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) ||
+                    ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+                     !storage_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)))
+                    return {};
             }
             if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && r9g9b9e5_uav_emulated) {
                 log_once("R9G9B9E5_SHAREDEXP UAV unavailable natively, using mutable R32_UINT; format", desc.Format);
@@ -4862,6 +4869,10 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     if (stencil) channels = {g::select_zero, g::select_x, g::select_zero, g::select_one};
     else if (desc.Format == DXGI_FORMAT_A8_UNORM) channels = {g::select_zero, g::select_zero, g::select_zero, g::select_x};
     else if (alpha_unused(view.format != DXGI_FORMAT_UNKNOWN ? view.format : desc.Format)) channels[3] = g::select_one;
+    // R9G9B9E5 has no alpha: it reads 1. The fp16 backing carries a physical alpha channel (a clear or blend can
+    // write it), so force the logical alpha to 1 before the caller's mapping, as the B8G8R8X8 path does. Storage
+    // views keep their identity swizzle elsewhere; this is the sampled T#.
+    else if (resource.r9g9b9e5_as_half()) channels[3] = g::select_one;
     for (UINT i = 0; i < 4; ++i) {
         const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, view.mapping);
         if (msaa && from > D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1) {

@@ -12,10 +12,10 @@
 
 namespace leonida {
 
-// Queue families for D3D12's three queue types. Direct needs graphics. Compute prefers a family with compute and no
-// graphics (async compute), copy one with transfer and neither (a DMA engine); each falls back to a more capable
-// family, ending at the graphics one. A dedicated copy family is only used when its image transfer granularity is
-// 1x1x1, because D3D12 copies any box.
+// Queue families for D3D12's three queue types. Direct needs graphics. Compute and copy prefer a family with compute
+// and no graphics (async compute): the backend repacks depth24, rgb96 and R9G9B9E5 footprint copies with a compute
+// dispatch on the copy queue, so a transfer-only DMA family cannot back it. Each falls back to the graphics family.
+// The copy family's image transfer granularity must be 1x1x1, because D3D12 copies any box.
 struct QueueFamilies {
     std::uint32_t direct = 0;
     std::uint32_t compute = 0;
@@ -24,7 +24,7 @@ struct QueueFamilies {
 
 inline QueueFamilies pick_queue_families(std::span<const VkQueueFamilyProperties> families, std::uint32_t graphics) {
     QueueFamilies out{graphics, graphics, graphics};
-    constexpr VkQueueFlags g = VK_QUEUE_GRAPHICS_BIT, c = VK_QUEUE_COMPUTE_BIT, t = VK_QUEUE_TRANSFER_BIT;
+    constexpr VkQueueFlags g = VK_QUEUE_GRAPHICS_BIT, c = VK_QUEUE_COMPUTE_BIT;
     const auto fine_grained = [](const VkQueueFamilyProperties& f) {
         return f.minImageTransferGranularity.width == 1 && f.minImageTransferGranularity.height == 1 &&
                f.minImageTransferGranularity.depth == 1;
@@ -37,13 +37,12 @@ inline QueueFamilies pick_queue_families(std::span<const VkQueueFamilyProperties
             out.compute = i;
             have_compute = true;
         }
-        if (!have_copy && (f.queueFlags & t) && !(f.queueFlags & (g | c)) && fine_grained(f)) {
+        if (!have_copy && (f.queueFlags & c) && !(f.queueFlags & g) && fine_grained(f)) {
             out.copy = i;
             have_copy = true;
         }
     }
-    // No DMA family: copies go to the async-compute family, which can transfer too (compute implies transfer).
-    if (!have_copy && have_compute && fine_grained(families[out.compute])) out.copy = out.compute;
+    // No fine-grained async-compute family: copies stay on the graphics family (out.copy's initial value).
     return out;
 }
 

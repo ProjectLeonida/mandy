@@ -972,6 +972,140 @@ int main() {
                 EXPECT(wrong9 == 0);
                 std::printf("R9G9B9E5 CopyResource to native texture: %ux%u words matched\n", kW, kH);
             }
+
+            // 10. UAV clears on the fp16-backed target follow the logical RGB9E5 rule, not the raw fp16 value (H3):
+            //     a Uint clear writes 0 and a Float clear packs to RGB9E5 as WARP does. A write-free upload/readback
+            //     re-encodes a non-canonical word to its canonical form (H5): fp16 keeps the value, not the exponent.
+            {
+                Ref<ID3D12DescriptorHeap> uheap10;
+                const D3D12_DESCRIPTOR_HEAP_DESC uhd10{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+                EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&uhd10, IID_PPV_ARGS(&uheap10.p))));
+                D3D12_UNORDERED_ACCESS_VIEW_DESC uavd10{};
+                uavd10.Format = DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+                uavd10.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                const auto ucpu10 = uheap10->GetCPUDescriptorHandleForHeapStart();
+                device->CreateUnorderedAccessView(tex.p, nullptr, &uavd10, ucpu10);
+                const auto ugpu10 = uheap10->GetGPUDescriptorHandleForHeapStart();
+
+                D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp10{};
+                UINT rows10 = 0;
+                UINT64 rowbytes10 = 0, total10 = 0;
+                const auto desc10 = tex->GetDesc();
+                device->GetCopyableFootprints(&desc10, 0, 1, 0, &fp10, &rows10, &rowbytes10, &total10);
+                const D3D12_HEAP_PROPERTIES rbheap10{D3D12_HEAP_TYPE_READBACK};
+                Ref<ID3D12Resource> rb10;
+                const auto rbdesc10 = buf_desc(total10);
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&rbheap10, D3D12_HEAP_FLAG_NONE, &rbdesc10,
+                                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                 IID_PPV_ARGS(&rb10.p))));
+                const auto read_words = [&](std::uint32_t fv, void*& m) -> int {
+                    EXPECT(SUCCEEDED(alloc7->Reset()));
+                    EXPECT(SUCCEEDED(list7->Reset(alloc7.p, nullptr)));
+                    D3D12_TEXTURE_COPY_LOCATION dst{rb10.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+                    dst.PlacedFootprint = fp10;
+                    D3D12_TEXTURE_COPY_LOCATION src{tex.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+                    src.SubresourceIndex = 0;
+                    list7->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                    EXPECT(SUCCEEDED(list7->Close()));
+                    ID3D12CommandList* ls[] = {list7.p};
+                    queue7->ExecuteCommandLists(1, ls);
+                    EXPECT(rt::d3d12::last_execute_result(queue7.p) == leonida::ReplayResult::success);
+                    EXPECT(SUCCEEDED(queue7->Signal(fence7.p, fv)) && SUCCEEDED(fence7->SetEventOnCompletion(fv, nullptr)));
+                    EXPECT(SUCCEEDED(rb10->Map(0, nullptr, &m)));
+                    return 0;
+                };
+                const auto count_words = [&](void* m, std::uint32_t want) -> unsigned {
+                    unsigned wrong = 0;
+                    for (UINT y = 0; y < kH; ++y)
+                        for (UINT x = 0; x < kW; ++x) {
+                            std::uint32_t w = 0;
+                            std::memcpy(&w, static_cast<const std::uint8_t*>(m) + y * 256 + x * 4, sizeof(w));
+                            if (w != want) ++wrong;
+                        }
+                    return wrong;
+                };
+                const auto clear_uav = [&](bool is_float, const std::uint32_t values[4], std::uint32_t fv) -> int {
+                    const auto to_uav = transition(tex.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    EXPECT(SUCCEEDED(alloc7->Reset()));
+                    EXPECT(SUCCEEDED(list7->Reset(alloc7.p, nullptr)));
+                    list7->ResourceBarrier(1, &to_uav);
+                    ID3D12DescriptorHeap* heaps10[] = {uheap10.p};
+                    list7->SetDescriptorHeaps(1, heaps10);
+                    if (is_float) {
+                        FLOAT fv4[4];
+                        std::memcpy(fv4, values, sizeof(fv4));
+                        list7->ClearUnorderedAccessViewFloat(ugpu10, ucpu10, tex.p, fv4, 0, nullptr);
+                    } else {
+                        list7->ClearUnorderedAccessViewUint(ugpu10, ucpu10, tex.p, values, 0, nullptr);
+                    }
+                    const auto to_src = transition(tex.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    list7->ResourceBarrier(1, &to_src);
+                    EXPECT(SUCCEEDED(list7->Close()));
+                    ID3D12CommandList* ls[] = {list7.p};
+                    queue7->ExecuteCommandLists(1, ls);
+                    EXPECT(rt::d3d12::last_execute_result(queue7.p) == leonida::ReplayResult::success);
+                    EXPECT(SUCCEEDED(queue7->Signal(fence7.p, fv)) && SUCCEEDED(fence7->SetEventOnCompletion(fv, nullptr)));
+                    return 0;
+                };
+
+                // H3: a Uint clear of nonzero inputs writes 0 (the shared-exponent rule), not fp16 red 1.
+                const std::uint32_t uint_clear[4] = {0x3c00, 0, 0, 0};
+                EXPECT(clear_uav(false, uint_clear, 4) == 0);
+                void* m10a = nullptr;
+                EXPECT(read_words(5, m10a) == 0);
+                EXPECT(count_words(m10a, 0u) == 0);
+                rb10->Unmap(0, nullptr);
+                // H3: a Float clear packs to RGB9E5 directly (1 + 7/4096 -> 0x80000100), not via fp16 double-rounding.
+                const float fr = 1.0f + 7.0f / 4096.0f;
+                std::uint32_t float_clear[4] = {0, 0, 0, 0};
+                std::memcpy(&float_clear[0], &fr, sizeof(fr));
+                EXPECT(clear_uav(true, float_clear, 6) == 0);
+                void* m10b = nullptr;
+                EXPECT(read_words(7, m10b) == 0);
+                EXPECT(count_words(m10b, 0x80000100u) == 0);
+                rb10->Unmap(0, nullptr);
+                std::printf("R9G9B9E5 fp16 UAV clears: Uint writes 0, Float packs to RGB9E5 (WARP rule)\n");
+
+                // H5: a write-free upload of a non-canonical word reads back canonical (value preserved, not bits).
+                Ref<ID3D12Resource> up10;
+                const D3D12_HEAP_PROPERTIES upheap10{D3D12_HEAP_TYPE_UPLOAD};
+                const auto updesc10 = buf_desc(total10);
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&upheap10, D3D12_HEAP_FLAG_NONE, &updesc10,
+                                                                 D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                                 IID_PPV_ARGS(&up10.p))));
+                void* upmap10 = nullptr;
+                EXPECT(SUCCEEDED(up10->Map(0, nullptr, &upmap10)));
+                for (UINT y = 0; y < kH; ++y)
+                    for (UINT x = 0; x < kW; ++x) {
+                        const std::uint32_t w = 0x88000080u;  // red 1.0, exponent 17 (non-canonical)
+                        std::memcpy(static_cast<std::uint8_t*>(upmap10) + y * 256 + x * 4, &w, sizeof(w));
+                    }
+                up10->Unmap(0, nullptr);
+                const auto to_dst = transition(tex.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                EXPECT(SUCCEEDED(alloc7->Reset()));
+                EXPECT(SUCCEEDED(list7->Reset(alloc7.p, nullptr)));
+                list7->ResourceBarrier(1, &to_dst);
+                D3D12_TEXTURE_COPY_LOCATION dst10{tex.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+                dst10.SubresourceIndex = 0;
+                D3D12_TEXTURE_COPY_LOCATION src10{up10.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+                src10.PlacedFootprint = fp10;
+                list7->CopyTextureRegion(&dst10, 0, 0, 0, &src10, nullptr);
+                const auto to_src10 = transition(tex.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list7->ResourceBarrier(1, &to_src10);
+                EXPECT(SUCCEEDED(list7->Close()));
+                ID3D12CommandList* ls10[] = {list7.p};
+                queue7->ExecuteCommandLists(1, ls10);
+                EXPECT(rt::d3d12::last_execute_result(queue7.p) == leonida::ReplayResult::success);
+                EXPECT(SUCCEEDED(queue7->Signal(fence7.p, 8)) && SUCCEEDED(fence7->SetEventOnCompletion(8, nullptr)));
+                void* m10c = nullptr;
+                EXPECT(read_words(9, m10c) == 0);
+                EXPECT(count_words(m10c, 0x80000100u) == 0);  // canonical red 1.0
+                rb10->Unmap(0, nullptr);
+                std::printf("R9G9B9E5 write-free copy: non-canonical 0x88000080 re-encodes to 0x80000100 (value kept)\n");
+            }
         }
     }
 

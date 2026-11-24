@@ -2720,17 +2720,23 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             // Emulated R9G9B9E5_SHAREDEXP images (backed by R32_UINT) lack COLOR_ATTACHMENT on E5B9G9R9 and keep the
             // bit-exact R32_UINT backing path.
             const VkFormat view_format = view.format ? VkFormat(view.format) : p.binding.format;
-            if (!uav_clear::encode(view_format, uav->is_float, uav->values, p.element))
+            // An fp16-backed R9G9B9E5 target (ResourceBinding::rgb9e5) clears by the logical shared-exponent rule:
+            // a Uint clear writes 0 and a Float clear packs to RGB9E5 as WARP does (uav_clear). Decode that packed
+            // word to exact RGB floats — fp16 holds every shared-exponent value — and clear the fp16 image with
+            // them, alpha 1, so a readback packs back to the word the host would have written.
+            const bool rgb9e5 = p.binding.rgb9e5;
+            const VkFormat value_format = rgb9e5 ? VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 : view_format;
+            if (!uav_clear::encode(value_format, uav->is_float, uav->values, p.element))
                 return ReplayResult::unsupported;
-            const auto* image_layout = uav_clear::layout(p.binding.format);
+            const auto* image_layout = uav_clear::layout(rgb9e5 ? VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 : p.binding.format);
             if (!image_layout || image_layout->bytes != p.element.size)
                 return ReplayResult::unsupported;
             const bool attachment = p.binding.color_attachment && !p.binding.volume;
             const bool view_attachable = vk.color_attachment_format
                                              ? vk.color_attachment_format(view_format)
                                              : view_format != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
-            const bool reinterpret = view_format != p.binding.format && attachment && view_attachable;
-            const VkFormat clear_format = reinterpret ? view_format : p.binding.format;
+            const bool reinterpret = !rgb9e5 && view_format != p.binding.format && attachment && view_attachable;
+            const VkFormat clear_format = rgb9e5 ? value_format : (reinterpret ? view_format : p.binding.format);
             if (!uav_clear::decode(clear_format, p.element, p.clear_color))
                 return ReplayResult::unsupported;
             if (reinterpret) p.clear_format = view_format;
@@ -2896,6 +2902,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 // An fp16-backed R9G9B9E5 texture and a native E5B9G9R9 one: the same logical format, different texel
                 // sizes. One scratch holds each region's fp16 texels then its RGB9E5 words; the depth24 pass converts
                 // between them (rgb9e5 mode) and the copies move image <-> scratch tightly packed, as depth <-> colour.
+                // The non-fp16 peer must carry logical R9G9B9E5 texels — native E5B9G9R9 or the R32_UINT UAV emulation
+                // tagged with it; another format's texels are not the 4-byte words the pass packs (an invalid pairing).
+                const ResourceBinding& packed = p.binding.rgb9e5 ? p.source : p.binding;
+                if (packed.format != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && packed.uint_backed != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)
+                    return ReplayResult::invalid_copy;
                 VkDeviceSize total = 0;
                 std::vector<VkDeviceSize> half_off, word_off;
                 for (const VkImageCopy& c : p.image_copies) {
