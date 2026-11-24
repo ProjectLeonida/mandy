@@ -1,0 +1,30 @@
+GPU:        NVIDIA GeForce RTX 4070 (Ada / AD104, PCI 10de:2786), subgroup 32..32
+Driver:     NVIDIA 620.70.06 (proprietary), Vulkan 1.4.357
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32)
+OS:         Arch Linux, kernel 7.3.4-arch1-2
+Commit:     f3e26be7c661e97eb4c70464e675a3b32dc149e3 (main, 2026-11-24)
+Tools:      llvm-mc 23.1.5, SPIRV-Tools v2026.4, CMake 4.5.0 + Ninja 1.13.2,
+            GCC 16.2.1, Python 3.14.10
+build.py:   281 shaders: 281 translated, 281 pass spirv-val
+check.py:   182 of 220 pass, 36 skipped, 2 failed
+            cs_imgload_tfe, cs_imgload_d16_tfe: the same #31 tfe status
+            VGPR issue as run_gpu_tests.py (64 bad r32 sint texels)
+run_gpu_tests.py: 258 shaders: 258 translated, 258 pass spirv-val
+            native:                 198/249 passed, 49 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  230/249 passed, 17 skipped, 2 failed
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (native and emulated alike):
+            exit 1, "r32 sint (sint view): 64 bad, texel(5,3) = 2071"; the tfe
+            status VGPR is read but never written, #31. Same pair and same
+            numbers as the RTX 4070 Ti, 3070 Ti and 780M records.
+Skipped:    native: 31 "no 64-wide compute subgroup on this device", 1 "no
+            64-wide subgroup on this device" and 1 "cannot require a 64-wide
+            fragment subgroup" (the wave64 fixtures, which the emulated run
+            covers), plus the 16 documented "run by d3d12_*_test /
+            w64_graphics.py" cases. Emulated: the same 16, plus the 64-wide
+            fragment one.
+Notes:
+- Built with cmake -S runtime -B runtime/build/linux -G Ninja
+  -DCMAKE_BUILD_TYPE=Release and cmake --build runtime/build/linux; the Linux
+  portable subset (gta6rt and the shims are Windows-only).
+- No game files, nothing online. AI-assisted: built main, ran build.py,
+  check.py and run_gpu_tests.py native and emulated.
