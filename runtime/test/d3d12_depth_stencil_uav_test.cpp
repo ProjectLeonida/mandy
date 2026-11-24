@@ -173,7 +173,10 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
                                 optimized, &refused.p) == E_INVALIDARG && !refused.p);
     }
     rt::d3d12::set_device_outer(device, xbox.p);
-    if (!enhanced && !array && !depth16) CHECK(placeddepthtest::check_alias_lifetime(device, xbox.p));
+    if (!enhanced && !array && !depth16) {
+        CHECK(placeddepthtest::check_alias_lifetime(device, xbox.p));
+        CHECK(placeddepthtest::check_same_base_shapes(device, xbox.p));
+    }
     using CreateFn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
                                       const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
                                       REFIID, void**);

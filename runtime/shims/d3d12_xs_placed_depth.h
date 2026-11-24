@@ -4,12 +4,12 @@
 #include "d3d12_com_object.h"
 #include "d3d12_xs_device.h"
 
-#include <algorithm>
 #include <bit>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 namespace rt::d3d12_xs {
 
@@ -56,7 +56,8 @@ private:
 class PlacedDepthTextures {
 public:
     // The initial barrier layout and optimized clear are checked for each caller before looking up an alias.
-    // Reusing a live compatible placement retains both the attachment image and its writable plane images.
+    // Identical placements can inherit the attachment and plane contents. Different shapes at the same base
+    // get independent backing and must be initialized after an aliasing barrier, without inheriting contents.
     template<class Create>
     HRESULT create(UINT64 address, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_ALLOCATION_INFO allocation,
                    const D3D12_CLEAR_VALUE* clear, REFIID iid, void** out, Create create_backing) {
@@ -70,25 +71,34 @@ public:
         if (clear) optimized = OptimizedClear{clear->Format, std::bit_cast<UINT>(clear->DepthStencil.Depth),
             desc.Format == DXGI_FORMAT_R16_TYPELESS ? UINT8(0) : clear->DepthStencil.Stencil};
         std::shared_ptr<ID3D12Resource> owner;
+        std::vector<std::shared_ptr<ID3D12Resource>> live_backings;
         try {
             {
                 std::lock_guard lock(mutex_);
-                // Weak ownership avoids keeping GPU images or the device alive just because an address was used.
-                std::erase_if(ranges_, [](const auto& entry) { return entry.second.backing.expired(); });
-                auto next = ranges_.lower_bound(address);
-                if (next != ranges_.begin() && std::prev(next)->second.end > address) return E_NOTIMPL;
-                if (next != ranges_.end() && next->first < end) {
-                    const auto& range = next->second;
-                    if (next->first != address || range.end != end || !compatible(desc, range.desc) ||
-                        range.optimized != optimized) return E_NOTIMPL;
-                    owner = range.backing.lock();
+                // Pin every live backing across the check and insertion. The pins are released after unlocking.
+                // Reserve before pruning so an allocation failure cannot leave the registry partly modified.
+                live_backings.reserve(ranges_.size());
+                for (auto entry = ranges_.begin(); entry != ranges_.end();) {
+                    auto backing = entry->second.backing.lock();
+                    if (!backing) {
+                        entry = ranges_.erase(entry);
+                        continue;
+                    }
+                    live_backings.push_back(std::move(backing));
+                    const auto& [base, range] = *entry++;
+                    if (base != address) {
+                        if (base < end && address < range.end) return E_NOTIMPL;
+                    } else if (range.end == end && same_extent(desc, range.desc)) {
+                        if (!compatible(desc, range.desc) || range.optimized != optimized) return E_NOTIMPL;
+                        owner = live_backings.back();
+                    }
                 }
                 if (!owner) {
                     ID3D12Resource* resource = nullptr;
                     const HRESULT hr = create_backing(&resource);
                     if (FAILED(hr)) return hr;
                     owner = {resource, [](ID3D12Resource* r) { r->Release(); }};
-                    ranges_.insert_or_assign(address, Range{end, desc, optimized, owner});
+                    ranges_.emplace(address, Range{end, desc, optimized, owner});
                 }
             }
             auto* alias = new PlacedDepthTexture(std::move(owner), address);
@@ -99,12 +109,14 @@ public:
     }
 
 private:
+    static bool same_extent(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE_DESC& b) {
+        return a.Width == b.Width && a.Height == b.Height && a.DepthOrArraySize == b.DepthOrArraySize;
+    }
+
     // Dimension, mip/sample counts and layout are fixed by the slot handler. The effective alignment and byte
-    // interval have already been validated. All remaining usage and image geometry must match for data inheritance.
+    // interval and image geometry have already been checked. All remaining usage must match for inheritance.
     static bool compatible(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE_DESC& b) {
-        return a.Format == b.Format && a.Width == b.Width && a.Height == b.Height &&
-               a.DepthOrArraySize == b.DepthOrArraySize && a.SampleDesc.Quality == b.SampleDesc.Quality &&
-               a.Flags == b.Flags;
+        return a.Format == b.Format && a.SampleDesc.Quality == b.SampleDesc.Quality && a.Flags == b.Flags;
     }
     struct OptimizedClear {
         DXGI_FORMAT format;
@@ -119,7 +131,7 @@ private:
         std::weak_ptr<ID3D12Resource> backing;
     };
     std::mutex mutex_;
-    std::map<UINT64, Range> ranges_;
+    std::multimap<UINT64, Range> ranges_;
 };
 
 } // namespace rt::d3d12_xs
