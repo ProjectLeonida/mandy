@@ -376,6 +376,7 @@ public:
         if (list_.closed()) return;
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!list_.closed()) check(list_.set_predication({0, 0, 0}));
+        if (custom_samples_) check(list_.set_sample_positions({}));
         reset_state(state);
     }
 
@@ -649,6 +650,24 @@ public:
             return check(false);
         }
         check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource}));
+    }
+
+    void STDMETHODCALLTYPE SetSamplePositions(UINT samples, UINT pixels, D3D12_SAMPLE_POSITION* positions) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList1::SetSamplePositions");
+        if (list_.closed() || type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
+        leonida::SamplePositions pattern{};
+        if (samples || pixels || positions) {
+            if (!positions || !leonida::SamplePositions::valid_grid(samples, pixels)) return;
+            pattern.samples = samples;
+            pattern.pixels = pixels;
+            for (UINT i = 0; i < samples * pixels; ++i) {
+                const auto p = positions[i];
+                if (p.X < -8 || p.X > 7 || p.Y < -8 || p.Y > 7) return;
+                pattern.positions[i] = {p.X, p.Y};
+            }
+        }
+        check(list_.set_sample_positions(pattern));
+        custom_samples_ = samples != 0;
     }
 
     void STDMETHODCALLTYPE ResolveSubresourceRegion(ID3D12Resource* dst, UINT dst_subresource, UINT x, UINT y,
@@ -1252,6 +1271,7 @@ private:
     leonida::CommandList list_;
     bool invalid_ = false;
     UINT front_stencil_ref_ = 0;
+    bool custom_samples_ = false;
     UINT back_stencil_ref_ = 0;
     RootState compute_;
     RootState graphics_;
@@ -1357,6 +1377,7 @@ private:
 
     void reset_state(ID3D12PipelineState* state) {
         front_stencil_ref_ = back_stencil_ref_ = 0;
+        custom_samples_ = false;
         compute_ = {};
         graphics_ = {};
         cbv_srv_uav_heap_ = nullptr;

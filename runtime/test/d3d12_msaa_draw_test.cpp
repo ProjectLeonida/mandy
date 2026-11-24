@@ -46,11 +46,23 @@ D3D12_CPU_DESCRIPTOR_HANDLE heap_start(ID3D12DescriptorHeap* heap) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool grid = argc == 2 && std::strcmp(argv[1], "--sample-grid") == 0;
+    const bool custom = grid || (argc == 2 && std::strcmp(argv[1], "--custom-samples") == 0);
     vktest::Device d;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU (hosted CI): ctest skips
     EXPECT(device_status == vktest::DeviceStatus::ready);
+    if (custom && !d.sample_locations) return 77;
+    if (grid) {
+        const auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceMultisamplePropertiesEXT>(
+            d.instance_proc(d.instance, "vkGetPhysicalDeviceMultisamplePropertiesEXT"));
+        VkMultisamplePropertiesEXT props{VK_STRUCTURE_TYPE_MULTISAMPLE_PROPERTIES_EXT};
+        if (!query) return 77;
+        query(d.physical, VK_SAMPLE_COUNT_4_BIT, &props);
+        if (props.maxSampleLocationGridSize.width % 2 || props.maxSampleLocationGridSize.height % 2 ||
+            !props.maxSampleLocationGridSize.width || !props.maxSampleLocationGridSize.height) return 77;
+    }
 
     const auto vs_program = fssm_program({0x56530001, 0xbf810000});
     const auto ps_program = fssm_program({0x50530001, 0xbf810000});
@@ -83,6 +95,7 @@ int main() {
         info.queue = d.queue;
         info.queue_family = d.family;
         info.buffer_device_address = true;
+        info.sample_locations = custom && d.sample_locations;
         info.shader_dir = library.string();
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
@@ -90,6 +103,12 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);
+        D3D12_FEATURE_DATA_D3D12_OPTIONS2 options{};
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS2, &options, sizeof(options))));
+        if (!custom) EXPECT(options.ProgrammableSamplePositionsTier == D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED);
+        if (custom && options.ProgrammableSamplePositionsTier == D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED) return 77;
+        if (grid && options.ProgrammableSamplePositionsTier != D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_2) return 77;
+        std::printf("OPTIONS2 programmable sample positions tier %u\n", unsigned(options.ProgrammableSamplePositionsTier));
         if (rt::d3d12::device_push_constants_need_fallback(inner)) {
             std::printf("d3d12_msaa_draw_test: skipped, the PSOs need 144 push-constant bytes and this GPU has %u\n",
                         rt::d3d12::device_max_push_constants_size(inner));
@@ -252,10 +271,39 @@ int main() {
         list->ResourceBarrier(1, &to_vertex);
         const FLOAT blue[4] = {0, 0, 1, 1};
         list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+        common_state(rtv, grid ? nullptr : &dsv);
+        if (custom) {
+            Ref<ID3D12GraphicsCommandList1> list1;
+            EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list1.p))));
+            D3D12_SAMPLE_POSITION locations[16]{};
+            for (unsigned pixel = 0; pixel < 4; ++pixel) {
+                const int corner = (pixel & 1) ? 4 : -6;
+                for (int i = 0; i < 4; ++i)
+                    locations[4 * pixel + i] = {INT8(corner + (i & 1)), INT8(corner + (i >> 1))};
+            }
+            list1->SetSamplePositions(4, grid ? 4 : 1, locations);
+        }
         list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-        common_state(rtv, &dsv);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 512);  // red
+        if (grid) {
+            const D3D12_RECT top{0, 0, size, size / 2};
+            list->RSSetScissorRects(1, &top);
+            list->DrawInstanced(3, 1, 0, 0);
+            Ref<ID3D12GraphicsCommandList1> list1;
+            EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list1.p))));
+            list1->SetSamplePositions(0, 0, nullptr);
+            const D3D12_RECT bottom{0, size / 2, size, size};
+            list->RSSetScissorRects(1, &bottom);
+        }
         list->DrawInstanced(3, 1, 0, 0);
+        if (!grid) {
+            const D3D12_RESOURCE_BARRIER depth_transitions[] = {
+                transition(depth.p, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition(depth.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE)};
+            list->ResourceBarrier(2, depth_transitions);
+            list->SetGraphicsRootConstantBufferView(1, upload_va + 768);
+            list->DrawInstanced(3, 1, 0, 0);  // equal depth fails LESS, so the original red must survive
+        }
         list->SetPipelineState(masked.p);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 768);  // green, sample 0 only
         list->DrawIndexedInstanced(6, 1, 0, 0, 0);
@@ -330,6 +378,10 @@ int main() {
                 // One of four samples green, three blue: 63.75 and 191.25, rounded either way by the resolve.
                 if (got[0] != 0 || std::abs(int(got[1]) - 64) > 1 || std::abs(int(got[2]) - 191) > 1 || got[3] != 255)
                     report(col, row, got, "0,64,191,255 (+-1)");
+            } else if (custom && col + row == size - 1) {
+                const int red = grid && row >= size / 2 ? 128 : grid && (col & 1) ? 0 : 255;
+                if (std::abs(int(got[0]) - red) > 1 || got[1] || std::abs(int(got[2]) - (255 - red)) > 1 || got[3] != 255)
+                    report(col, row, got, "coverage from the active sample pattern");
             } else if (distance > margin) {
                 if (!(got[0] == 255 && got[1] == 0 && got[2] == 0 && got[3] == 255)) report(col, row, got, "red");
             } else if (distance < -margin) {
@@ -343,7 +395,7 @@ int main() {
         }
     }
     EXPECT(!mismatches);
-    EXPECT(edge_mixed > 0);  // single-sampled rendering leaves no partial pixels
+    if (!custom) EXPECT(edge_mixed > 0);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;

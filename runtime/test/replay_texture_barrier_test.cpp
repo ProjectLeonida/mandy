@@ -170,6 +170,42 @@ int main() {
         }
     }
 
+    {
+        image.format = VK_FORMAT_D32_SFLOAT;
+        image.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+        image.samples = 4;
+        image.mip_levels = 1;
+        image.sample_locations_depth = true;
+        LayoutTracker depth_tracker;
+        depth_tracker.track(id, image, transfer_src);
+        vk.pipeline_barrier2 = [](VkCommandBuffer, const VkDependencyInfo* info) {
+            const auto& barrier = info->pImageMemoryBarriers[0];
+            const auto* pattern = static_cast<const VkSampleLocationsInfoEXT*>(barrier.pNext);
+            expect(pattern && pattern->sType == VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT, "depth sample locations");
+            if (!pattern) return;
+            const bool custom = barrier.oldLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            expect(pattern->sampleLocationsCount == 4 && pattern->sampleLocationsPerPixel == VK_SAMPLE_COUNT_4_BIT &&
+                   pattern->sampleLocationGridSize.width == 1 && pattern->sampleLocationGridSize.height == 1,
+                   "depth sample grid");
+            expect(pattern->pSampleLocations[0].x == (custom ? 0.f : 0.375f) &&
+                   pattern->pSampleLocations[0].y == (custom ? 0.9375f : 0.125f), "depth sample before and after reset");
+            ++g_calls;
+        };
+        g_calls = 0;
+        SamplePositions pattern{4, 1};
+        pattern.positions[0] = {-8, 7};
+        CommandList list;
+        expect(list.set_sample_positions(pattern) &&
+               list.barrier(TextureBarrier{y::copy, y::copy, a::copy_source, a::copy_dest, l::copy_source, l::copy_dest, id, all, 0}) &&
+               list.set_sample_positions({}) &&
+               list.barrier(TextureBarrier{y::copy, y::copy, a::copy_dest, a::copy_source, l::copy_dest, l::copy_source, id, all, 0}) &&
+               list.close(), "record depth transitions");
+        PreparedList prepared;
+        expect(prepare(list, resolve, vk, prepared) == ReplayResult::success, "prepare depth transitions");
+        emit(prepared, cb, vk, &depth_tracker);
+        expect(g_calls == 2, "both depth transitions emitted");
+    }
+
     if (failures) return 1;
     std::printf("replay_texture_barrier_test: OK\n");
     return 0;

@@ -89,6 +89,7 @@ struct ResourceBinding {
     // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (the GPU has no D24): footprint copies of the depth plane convert
     // (depth24.h) and clears quantise to 24 bits.
     bool depth24_as_float = false;
+    bool sample_locations_depth = false;
     bool depth24 = false;  // a D24 family format, native or not: depth clears are quantised to 24 bits first
     // A D3D12 R32G32B32 texture (12 bytes a texel) held in an R32G32B32A32 image (16): footprints keep D3D12's 12
     // bytes, and copies between it and a buffer are repacked by the depth24 pass (Depth24Job::rgb96).
@@ -773,8 +774,10 @@ struct GraphicsPipeline {
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
     // and stencil. Null when it cannot be built.
     static constexpr std::uint32_t unbound_depth = 1u << 8;
+    static constexpr std::uint32_t custom_samples = 1u << 9;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
+    VkSampleCountFlags sample_grid_1 = 0, sample_grid_4 = 0;
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -853,6 +856,7 @@ struct ReplayFunctions {
     PFN_vkCmdSetPrimitiveTopology set_primitive_topology = nullptr;
     PFN_vkCmdSetPrimitiveRestartEnable set_primitive_restart_enable = nullptr;
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
+    PFN_vkCmdSetSampleLocationsEXT set_sample_locations = nullptr;
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
     PFN_vkCmdDraw draw = nullptr;
     PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
@@ -1313,14 +1317,53 @@ inline VkImageSubresourceRange layout_range(const ResourceBinding& resource, VkI
     return range;
 }
 
+// Vulkan's Standard Sample Locations table, expressed relative to the pixel centre in sixteenths.
+inline const SamplePosition* standard_sample_positions(unsigned samples) {
+    static constexpr SamplePosition one[] = {{0, 0}};
+    static constexpr SamplePosition two[] = {{4, 4}, {-4, -4}};
+    static constexpr SamplePosition four[] = {{-2, -6}, {6, -2}, {-6, 2}, {2, 6}};
+    static constexpr SamplePosition eight[] = {{1, -3}, {-1, 3}, {5, 1}, {-3, -5}, {-5, 5}, {-7, -1}, {3, 7}, {7, -7}};
+    static constexpr SamplePosition sixteen[] = {{1, 1}, {-1, -3}, {-3, 2}, {4, -1}, {-5, -2}, {2, 5}, {5, 3}, {3, -5},
+                                                  {-2, 6}, {0, -7}, {-4, -6}, {-6, 4}, {-8, 0}, {7, -4}, {6, 7}, {-7, -8}};
+    switch (samples) {
+    case 1: return one;
+    case 2: return two;
+    case 4: return four;
+    case 8: return eight;
+    case 16: return sixteen;
+    default: return nullptr;
+    }
+}
+
+struct VulkanSampleLocations {
+    std::array<VkSampleLocationEXT, 16> positions;
+    VkSampleLocationsInfoEXT info;
+
+    const VkSampleLocationsInfoEXT* set(unsigned samples, const SamplePositions* pattern) {
+        const bool custom = pattern && pattern->samples == samples && SamplePositions::valid_grid(samples, pattern->pixels);
+        const auto* source = custom ? pattern->positions.data() : standard_sample_positions(samples);
+        if (!source) return nullptr;
+        const unsigned side = custom && pattern->pixels == 4 ? 2 : 1;
+        const unsigned count = samples * side * side;
+        for (unsigned i = 0; i < count; ++i)
+            positions[i] = {(source[i].x + 8) / 16.f, (source[i].y + 8) / 16.f};
+        info = {VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT, nullptr, VkSampleCountFlagBits(samples), {side, side},
+                count, positions.data()};
+        return &info;
+    }
+};
+
 inline void image_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
                           const VkImageSubresourceRange& range, VkImageLayout old_layout, VkImageLayout new_layout,
                           VkAccessFlags src_access, VkPipelineStageFlags src_stages, VkAccessFlags dst_access,
-                          VkPipelineStageFlags dst_stages) {
+                          VkPipelineStageFlags dst_stages, const SamplePositions* active_samples = nullptr) {
     restrict_to_queue(vk, src_stages, src_access);
     restrict_to_queue(vk, dst_stages, dst_access);
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    VulkanSampleLocations locations;
+    if (resource.sample_locations_depth && old_layout != VK_IMAGE_LAYOUT_UNDEFINED && old_layout != new_layout)
+        barrier.pNext = locations.set(resource.samples, active_samples);
     barrier.srcAccessMask = src_access;
     barrier.dstAccessMask = dst_access;
     barrier.oldLayout = old_layout;
@@ -1501,7 +1544,7 @@ inline bool zero_compressed_image(const ReplayFunctions& vk, VkCommandBuffer com
 // when a zero page or transfer scratch is available) and moved to `layout`, the layout the operation about to run
 // expects; with not_zeroed, it is only moved. The tracker records it.
 inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
-                       ResourceId id, LayoutPieces& pieces, VkImageLayout layout, LayoutTracker* tracker) {
+                       ResourceId id, LayoutPieces& pieces, VkImageLayout layout, LayoutTracker* tracker, const SamplePositions* active_samples = nullptr) {
     constexpr VkAccessFlags any_memory = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     for (auto& piece : pieces) {
         if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
@@ -1511,7 +1554,7 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
         const bool compressed = fmt.block > 1 || (!can_clear && color);
         if (resource.not_zeroed || (!can_clear && !color)) {
             image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
-                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, active_samples);
         } else if (compressed) {
             const bool can_zero =
                 vk.copy_buffer_to_image &&
@@ -1520,21 +1563,21 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
                 const VkImageLayout dst = image_layout(resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, dst, 0,
                               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                              VK_PIPELINE_STAGE_TRANSFER_BIT);
+                              VK_PIPELINE_STAGE_TRANSFER_BIT, active_samples);
                 const bool zeroed = zero_compressed_image(vk, command_buffer, resource, piece.range, dst);
                 image_barrier(vk, command_buffer, resource, piece.range, dst, layout,
                               zeroed ? VK_ACCESS_TRANSFER_WRITE_BIT : 0,
                               zeroed ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory,
-                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, active_samples);
             } else {
                 image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
-                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, active_samples);
             }
         } else {
             const VkImageLayout dst = image_layout(resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, dst, 0,
                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                          VK_PIPELINE_STAGE_TRANSFER_BIT);
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, active_samples);
             if (piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
                 const VkClearColorValue zero{};
                 vk.clear_color_image(command_buffer, resource.image, dst, &zero, 1, &piece.range);
@@ -1543,7 +1586,7 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
                 vk.clear_depth_stencil_image(command_buffer, resource.image, dst, &zero, 1, &piece.range);
             }
             image_barrier(vk, command_buffer, resource, piece.range, dst, layout, VK_ACCESS_TRANSFER_WRITE_BIT,
-                          VK_PIPELINE_STAGE_TRANSFER_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, active_samples);
         }
         piece.layout = layout;
         if (tracker) tracker->set(id, piece.range, layout);
@@ -2029,10 +2072,10 @@ inline ReplayResult keep_around_resolve(const ReplayFunctions& vk, Prepared& p) 
 // promotion lets the copy run in place. Anything else is moved to `wanted` and tracked.
 inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer command_buffer,
                                  const ResourceBinding& resource, ResourceId id, const VkImageSubresourceRange& range,
-                                 VkImageLayout wanted, VkAccessFlags access, LayoutTracker* tracker) {
+                                 VkImageLayout wanted, VkAccessFlags access, LayoutTracker* tracker, const SamplePositions* active_samples = nullptr) {
     const VkImageLayout target = image_layout(resource, wanted);
     auto pieces = current(tracker, id, range, target);
-    initialize(vk, command_buffer, resource, id, pieces, target, tracker);
+    initialize(vk, command_buffer, resource, id, pieces, target, tracker, active_samples);
     // D3D12 orders back-to-back copies and resolves on a resource that stays in COPY_DEST or COPY_SOURCE without a
     // barrier from the application; Vulkan does not. A piece already in the transfer layout gets no layout
     // transition, so an earlier transfer write to it is ordered here instead (write-after-write and read-after-write,
@@ -2054,7 +2097,7 @@ inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer comm
         }
         image_barrier(vk, command_buffer, resource, piece.range, piece.layout, target,
                       VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, access,
-                      VK_PIPELINE_STAGE_TRANSFER_BIT);
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, active_samples);
     }
     if (tracker) tracker->set(id, range, target);
     return target;
@@ -2065,14 +2108,14 @@ inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer comm
 template<typename Body>
 void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
                 const LayoutPieces& pieces, VkImageLayout target, const VulkanAccess& state,
-                VkAccessFlags target_access, VkPipelineStageFlags target_stages, Body&& body) {
+                VkAccessFlags target_access, VkPipelineStageFlags target_stages, Body&& body, const SamplePositions* active_samples = nullptr) {
     for (const auto& piece : pieces) {
         if (piece.layout == target) {
             memory_barrier(vk, command_buffer, state.access, state.stages, target_access, target_stages);
             continue;
         }
         image_barrier(vk, command_buffer, resource, piece.range, piece.layout, target, state.access, state.stages,
-                      target_access, target_stages);
+                      target_access, target_stages, active_samples);
     }
     body();
     for (const auto& piece : pieces) {
@@ -2081,7 +2124,7 @@ void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const
             continue;
         }
         image_barrier(vk, command_buffer, resource, piece.range, target, piece.layout, target_access, target_stages,
-                      state.access, state.stages);
+                      state.access, state.stages, active_samples);
     }
 }
 
@@ -2092,7 +2135,8 @@ namespace detail {
 // Resolves a draw's pipeline, attachments and buffers. Attachment views take the pipeline's formats, so a
 // typeless texture is viewed as the format the pipeline renders.
 template<typename Resolve>
-ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, PreparedDraw& p) {
+ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, PreparedDraw& p,
+                          const SamplePositions* pattern = nullptr) {
     if (!vk.graphics_pipeline || !vk.buffer_at || !vk.image_view || !vk.begin_rendering || !vk.end_rendering ||
         !vk.bind_vertex_buffers2 || !vk.bind_index_buffer || !vk.set_viewport || !vk.set_scissor ||
         !vk.set_primitive_topology || !vk.set_primitive_restart_enable || !vk.set_stencil_reference ||
@@ -2163,6 +2207,12 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
+    if (pattern) {
+        const auto counts = pattern->pixels == 1 ? pipeline->sample_grid_1 : pipeline->sample_grid_4;
+        if (!vk.set_sample_locations || !SamplePositions::valid_grid(pattern->samples, pattern->pixels) ||
+            pattern->samples != pipeline->samples || !(counts & pattern->samples)) return ReplayResult::unsupported;
+        unbound |= GraphicsPipeline::custom_samples;
+    }
     if (unbound) {
         p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
         if (!p.pipeline) return ReplayResult::unsupported;
@@ -2234,10 +2284,10 @@ inline VkPrimitiveTopology vulkan_topology(std::uint32_t topology) {
 // Moves an attachment's tracked pieces to `layout` before rendering (first use zero-fills, as everywhere).
 inline void to_attachment(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const PreparedDraw::Attachment& a,
                           VkImageLayout layout, VkAccessFlags access, VkPipelineStageFlags stages,
-                          LayoutTracker* tracker, bool separate) {
+                          LayoutTracker* tracker, bool separate, const SamplePositions* active_samples = nullptr) {
     const VkImageSubresourceRange range = planes_for_layout(a.binding, a.range, separate);
     auto pieces = current(tracker, a.id, range, layout);
-    initialize(vk, command_buffer, a.binding, a.id, pieces, layout, tracker);
+    initialize(vk, command_buffer, a.binding, a.id, pieces, layout, tracker, active_samples);
     for (const auto& piece : pieces) {
         if (piece.layout == layout) {
             // Attachment writes of an earlier rendering scope are not ordered with this one without a barrier.
@@ -2245,7 +2295,7 @@ inline void to_attachment(const ReplayFunctions& vk, VkCommandBuffer command_buf
             continue;
         }
         image_barrier(vk, command_buffer, a.binding, piece.range, piece.layout, layout,
-                      VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, access, stages);
+                      VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, access, stages, active_samples);
     }
     if (tracker) tracker->set(a.id, range, layout);
 }
@@ -2590,6 +2640,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     bool overlaps = false, statistics_overlaps = false, statistics_active = false;
     out.wrote_readback = false;
     out.readback_src_stages = 0;
+    const SamplePositions* sample_positions = nullptr;
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -2953,6 +3004,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 out.wrote_readback = true;
                 out.readback_src_stages |= VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
             }
+        } else if (const auto* pattern = std::get_if<SamplePositions>(&command)) {
+            sample_positions = pattern->samples ? pattern : nullptr;
         } else if (const auto* predication = std::get_if<Predication>(&command)) {
             predicated = predication->buffer != 0;
             if (!predicated) continue;
@@ -3148,7 +3201,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             auto& prepared_draw = out.draws[out.draw_count];
             prepared_draw.reset();
             p.draw = std::uint32_t(out.draw_count++);
-            if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw); r != ReplayResult::success)
+            if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw, sample_positions); r != ReplayResult::success)
                 return r;
         }
     }
@@ -3410,6 +3463,7 @@ inline void close_labels(VkCommandBuffer command_buffer, const ReplayFunctions& 
 // (close_labels). Without it, the list's own events are balanced at its end.
 inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, const ReplayFunctions& vk,
                  LayoutTracker* tracker = nullptr, std::uint32_t* open_labels = nullptr) {
+    const SamplePositions* active_samples = nullptr;
     std::uint32_t own_labels = 0;
     std::uint32_t& labels = open_labels ? *open_labels : own_labels;
     const auto commands = prepared.list->commands();
@@ -3446,6 +3500,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         if (std::holds_alternative<Draw>(command) || std::holds_alternative<ExecuteIndirect>(command)) {
             end_statistics();
             begin_statistics();
+        }
+        if (const auto* pattern = std::get_if<SamplePositions>(&command)) {
+            active_samples = pattern->samples ? pattern : nullptr;
+            continue;
         }
         if (const auto* predication = std::get_if<Predication>(&command)) {
             // Conditional rendering cannot nest, so a new predicate ends the previous one first.
@@ -3488,10 +3546,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const VkImageLayout new_layout = image_layout(p.binding, to.layout);
             auto pieces = detail::current(tracker, id, range, image_layout(p.binding, from.layout));
-            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, from.layout), tracker);
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, from.layout), tracker, active_samples);
             for (const auto& piece : pieces)
                 detail::image_barrier(vk, command_buffer, p.binding, piece.range, piece.layout, new_layout,
-                                      from.access, from.stages, to.access, to.stages);
+                                      from.access, from.stages, to.access, to.stages, active_samples);
             if (tracker) tracker->set(id, range, new_layout);
         } else if (std::holds_alternative<UavBarrier>(command)) {
             const VulkanAccess uav = vulkan_access(d3d12_state::unordered_access, false);
@@ -3544,7 +3602,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 const VkImageLayout before =
                     image_layout(p.binding, vulkan_layout(texture->layout_before, p.binding.presentable));
                 pieces = detail::current(tracker, id, range, before);
-                detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker);
+                detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker, active_samples);
             }
             const BarrierScope src = vulkan_barrier_scope(texture->sync_before, texture->access_before, predicates);
             const BarrierScope dst = vulkan_barrier_scope(texture->sync_after, texture->access_after, predicates);
@@ -3554,6 +3612,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (pieces.size() > few.size()) many.resize(pieces.size());
             VkImageMemoryBarrier2* const barriers = many.empty() ? few.data() : many.data();
             std::uint32_t barrier_count = 0;
+            detail::VulkanSampleLocations locations;
+            const auto* depth_locations = p.binding.sample_locations_depth ? locations.set(p.binding.samples, active_samples) : nullptr;
             for (const auto& piece : pieces) {
                 VkImageMemoryBarrier2& b = barriers[barrier_count++];
                 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -3562,6 +3622,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 b.srcAccessMask = src.access;
                 b.dstAccessMask = dst.access;
                 b.oldLayout = piece.layout;
+                if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED && piece.layout != new_layout) b.pNext = depth_locations;
                 b.newLayout = new_layout;
                 b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -3579,14 +3640,14 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (p.skip) continue;
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);
             auto pieces = detail::current(tracker, id, p.range, image_layout(p.binding, state.layout));
-            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker, active_samples);
             const VkClearColorValue color = detail::render_target_clear_color(p.clear_format, color_clear->color);
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, image_layout(p.binding, transfer_dst.layout),
                                    state, transfer_dst.access, transfer_dst.stages, [&] {
                     vk.clear_color_image(command_buffer, p.binding.image, image_layout(p.binding, transfer_dst.layout),
                                          &color, 1, &p.range);
-                });
+                }, active_samples);
                 continue;
             }
             const VkImageLayout attachment = image_layout(p.binding, state.layout);
@@ -3607,14 +3668,14 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 attachment_clear.clearValue.color = color;
                 vk.clear_attachments(command_buffer, 1, &attachment_clear, std::uint32_t(p.rects.size()), p.rects.data());
                 vk.end_rendering(command_buffer);
-            });
+            }, active_samples);
         } else if (const auto* depth_clear = std::get_if<ClearDepthStencil>(&command)) {
             if (p.skip) continue;
             // With separate layouts only the cleared planes move; otherwise both do.
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const VulkanAccess state = vulkan_access(d3d12_state::depth_write, false);
             auto pieces = detail::current(tracker, id, range, image_layout(p.binding, state.layout));
-            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker, active_samples);
             const float depth = p.binding.depth24 ? depth24_clear_value(depth_clear->depth)  // see depth24.h
                                 : p.binding.format == VK_FORMAT_D16_UNORM
                                     ? detail::quantize_unorm(depth_clear->depth, 65535.0)  // see quantize_unorm
@@ -3625,7 +3686,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    state, transfer_dst.access, transfer_dst.stages, [&] {
                     vk.clear_depth_stencil_image(command_buffer, p.binding.image,
                                                  image_layout(p.binding, transfer_dst.layout), &value, 1, &p.range);
-                });
+                }, active_samples);
                 continue;
             }
             const VkImageLayout attachment = image_layout(p.binding, state.layout);
@@ -3646,7 +3707,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 attachment_clear.clearValue.depthStencil = value;
                 vk.clear_attachments(command_buffer, 1, &attachment_clear, std::uint32_t(p.rects.size()), p.rects.data());
                 vk.end_rendering(command_buffer);
-            });
+            }, active_samples);
         } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
             if (p.skip) continue;
             // The UAV state, widened to transfers: a later barrier from SYNC_CLEAR_UNORDERED_ACCESS_VIEW names the
@@ -3672,12 +3733,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             // Cleared in place in GENERAL, the UAV layout, which transfer clears and attachments both accept.
             const VkImageLayout layout = image_layout(p.binding, state.layout);
             auto pieces = detail::current(tracker, id, p.range, layout);
-            detail::initialize(vk, command_buffer, p.binding, id, pieces, layout, tracker);
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, layout, tracker, active_samples);
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, layout, state,
                                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, [&] {
                     vk.clear_color_image(command_buffer, p.binding.image, layout, &p.clear_color, 1, &p.range);
-                });
+                }, active_samples);
                 continue;
             }
             detail::round_trip(vk, command_buffer, p.binding, pieces, layout, state,
@@ -3698,7 +3759,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 attachment_clear.clearValue.color = p.clear_color;
                 vk.clear_attachments(command_buffer, 1, &attachment_clear, std::uint32_t(p.rects.size()), p.rects.data());
                 vk.end_rendering(command_buffer);
-            });
+            }, active_samples);
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
             const auto [dst_id, src_id] = copy_ids(command);
@@ -3716,14 +3777,14 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 // synchronization-validation run).
                 const VkImageLayout src_layout = detail::copy_layout(
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker, active_samples);
                 vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.staged,
                                         std::uint32_t(p.staged_reads.size()), p.staged_reads.data());
                 detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                        VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
                 const VkImageLayout dst_layout = detail::copy_layout(
                     vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker, active_samples);
                 vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, dst_layout,
                                         std::uint32_t(p.staged_writes.size()), p.staged_writes.data());
             } else if (!p.image_copies.empty()) {
@@ -3733,10 +3794,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
                     self ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     self ? VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT,
-                    tracker);
+                    tracker, active_samples);
                 const VkImageLayout dst_layout = self ? src_layout : detail::copy_layout(
                     vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker, active_samples);
                 const auto count = std::uint32_t(p.image_copies.size());
                 const auto depth_stencil = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
                 if (std::holds_alternative<CopyResource>(command) &&
@@ -3787,13 +3848,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 }
                 const VkImageLayout dst_layout = detail::copy_layout(
                     vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker, active_samples);
                 vk.copy_buffer_to_image(command_buffer, source, p.binding.image, dst_layout,
                                         std::uint32_t(regions->size()), regions->data());
             } else {
                 const VkImageLayout src_layout = detail::copy_layout(
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker, active_samples);
                 if (!p.has_depth24) {
                     const auto target = p.tile_scratch ? p.tile_scratch : p.binding.buffer;
                     vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, target,
@@ -3842,15 +3903,15 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 const VkImageLayout dest_layout = image_layout(p.binding, dest_state.layout);
                 auto source_pieces = detail::current(
                     tracker, src_id, detail::planes_for_layout(p.source, p.source_range, separate), source_layout);
-                detail::initialize(vk, command_buffer, p.source, src_id, source_pieces, source_layout, tracker);
+                detail::initialize(vk, command_buffer, p.source, src_id, source_pieces, source_layout, tracker, active_samples);
                 auto dest_pieces = detail::current(
                     tracker, dst_id, detail::planes_for_layout(p.binding, p.range, separate), dest_layout);
-                detail::initialize(vk, command_buffer, p.binding, dst_id, dest_pieces, dest_layout, tracker);
+                detail::initialize(vk, command_buffer, p.binding, dst_id, dest_pieces, dest_layout, tracker, active_samples);
                 // The texels around the rectangle, kept in `staged` across the resolve (keep_around_resolve).
                 const auto keep = [&](VkImageLayout wanted, VkAccessFlags access, auto&& copy) {
                     const VkImageLayout layout = image_layout(p.binding, wanted);
                     detail::round_trip(vk, command_buffer, p.binding, dest_pieces, layout, dest_state, access,
-                                       VK_PIPELINE_STAGE_TRANSFER_BIT, [&] { copy(layout); });
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, [&] { copy(layout); }, active_samples);
                 };
                 const auto bands = std::uint32_t(p.staged_reads.size());
                 if (p.staged) {
@@ -3897,8 +3958,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                         else rendering.pStencilAttachment = &info;
                         vk.begin_rendering(command_buffer, &rendering);
                         vk.end_rendering(command_buffer);
-                    });
-                });
+                    }, active_samples);
+                }, active_samples);
                 if (p.staged) {
                     keep(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, [&](VkImageLayout layout) {
                         vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, layout, bands,
@@ -3909,10 +3970,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             const VkImageLayout src_layout = detail::copy_layout(
                 vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker, active_samples);
             const VkImageLayout dst_layout = detail::copy_layout(
                 vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker, active_samples);
             vk.resolve_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout, 1, &p.resolve);
         } else if (const auto* marker = std::get_if<DebugMarker>(&command)) {
             if (!vk.insert_label || !vk.begin_label || !vk.end_label) continue;
@@ -3942,7 +4003,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED)
                         detail::image_barrier(vk, command_buffer, p.binding, piece.range, VK_IMAGE_LAYOUT_UNDEFINED,
                                               piece.layout, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                              any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                                              any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, active_samples);
             }
         } else if (const auto* write = std::get_if<WriteImmediate>(&command)) {
             // vkCmdUpdateBuffer runs in the transfer stage. MARKER_OUT waits for every earlier command to finish
@@ -4140,7 +4201,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 if (!a.id) continue;  // an unbound slot: no image view, writes are dropped
                 const VkImageLayout layout = image_layout(a.binding, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
                 detail::to_attachment(vk, command_buffer, a, layout, color_access,
-                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, tracker, separate);
+                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, tracker, separate, active_samples);
                 colors[slot].imageView = a.view;
                 colors[slot].imageLayout = layout;
                 colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -4150,7 +4211,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (d.depth.id) {
                 const VkImageLayout layout = image_layout(d.depth.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
                 detail::to_attachment(vk, command_buffer, d.depth, layout, depth_access, depth_stages, tracker,
-                                      separate);
+                                      separate, active_samples);
                 depth.imageView = d.depth.view;
                 depth.imageLayout = layout;
                 depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -4196,6 +4257,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                      ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
                                       (graphics.strip_cut == 2 && d.index_type == VK_INDEX_TYPE_UINT32));
                 vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
+            }
+            if (active_samples) {
+                detail::VulkanSampleLocations locations;
+                vk.set_sample_locations(command_buffer, locations.set(active_samples->samples, active_samples));
             }
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);

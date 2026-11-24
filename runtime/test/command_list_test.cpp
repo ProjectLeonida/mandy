@@ -275,6 +275,22 @@ int main() {
     CHECK(std::get<Predication>(predicated.commands()[1]).offset == 16);
     const auto& off = std::get<Predication>(predicated.commands()[2]);
     CHECK(off.buffer == 0 && off.offset == 0 && off.op == 0);
+    CHECK(SamplePositions::valid_grid(16, 1));
+    CHECK(SamplePositions::valid_grid(4, 4));
+    CHECK(!SamplePositions::valid_grid(8, 4));
+    CHECK(!SamplePositions::valid_grid(3, 1));
+    CHECK(!SamplePositions::valid_grid(4, 0));
+    CommandList sampled;
+    SamplePositions pattern{4, 4};
+    pattern.positions[15] = {-8, 7};
+    CHECK(sampled.set_sample_positions(pattern));
+    pattern.positions[15] = {0, 0};
+    CHECK(sampled.set_sample_positions({}));
+    CHECK(sampled.close());
+    CHECK(!sampled.set_sample_positions(pattern));
+    const auto& recorded_pattern = std::get<SamplePositions>(sampled.commands()[0]);
+    CHECK(recorded_pattern.positions[15].x == -8 && recorded_pattern.positions[15].y == 7);
+    CHECK(std::get<SamplePositions>(sampled.commands()[1]).samples == 0);
     // Queries: timestamps only end; other queries are begun and ended in one list, with the same type, and are not
     // begun twice or resolved while running. Resolve offsets are multiples of 8; a resolve of nothing records nothing.
     namespace q = d3d12_query;

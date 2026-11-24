@@ -546,6 +546,20 @@ struct Predication {
     std::uint32_t op;  // d3d12_predication
 };
 
+struct SamplePosition {
+    std::int8_t x, y;
+};
+
+struct SamplePositions {
+    std::uint32_t samples = 0;
+    std::uint32_t pixels = 0;
+    std::array<SamplePosition, 16> positions{};
+
+    static constexpr bool valid_grid(std::uint32_t samples, std::uint32_t pixels) {
+        return (pixels == 1 || pixels == 4) && samples && !(samples & (samples - 1)) && samples <= 16 / pixels;
+    }
+};
+
 // Query heaps are identified like resources, by the COM object's pointer value. A heap's type and size are checked
 // at replay, when the heap is known.
 using QueryHeapId = std::uintptr_t;
@@ -653,7 +667,7 @@ struct AccelerationStructurePostbuild {
 
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
-                             CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
+                             CopyResource, ResolveSubresource, Predication, SamplePositions, ClearUnorderedAccess, DiscardResource,
                              WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
                              ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw, CopyAccelerationStructure,
                              AccelerationStructurePostbuild>;
@@ -822,6 +836,8 @@ public:
                              bundle.commands_.begin() + std::ptrdiff_t(last));
         return true;
     }
+
+    bool set_sample_positions(const SamplePositions& pattern) { return append(pattern); }
 
     // SetPredication. Turning it off ignores the offset and op, as D3D12 does.
     bool set_predication(const Predication& predication) {

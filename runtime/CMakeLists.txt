@@ -2865,7 +2865,9 @@ if(TARGET Vulkan::Headers)
                                  LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
       target_compile_options(d3d12_msaa_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_msaa_draw COMMAND d3d12_msaa_draw_test)
-      set_tests_properties(d3d12_msaa_draw PROPERTIES SKIP_RETURN_CODE 77)
+      add_test(NAME d3d12_custom_samples COMMAND d3d12_msaa_draw_test --custom-samples)
+      add_test(NAME d3d12_sample_grid_reset COMMAND d3d12_msaa_draw_test --sample-grid)
+      set_tests_properties(d3d12_msaa_draw d3d12_custom_samples d3d12_sample_grid_reset PROPERTIES SKIP_RETURN_CODE 77)
       # Geometry shaders: a VS+GS+PS pipeline whose GS emits each triangle twice.
       add_executable(d3d12_geometry_test test/d3d12_geometry_test.cpp shims/d3d12_xs_device.cpp
                      ${LEONIDA_TEST_VS} ${LEONIDA_TEST_GS_DOUBLE} ${LEONIDA_TEST_PS})
