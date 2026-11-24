@@ -586,6 +586,44 @@ RuntimeObject g_networking{kNetworkingVtable, &kNetworkingClass, kNetworkingIids
 const GUID* const kPersistentStorageIids[] = {&kPersistentStorage2, &kPersistentStorage3, nullptr};
 RuntimeObject g_persistent_storage{kPersistentStorageVtable, &kPersistentStorageClass, kPersistentStorageIids};
 
+// ---- XAppCaptureImpl (IXAppCaptureImpl .. 4): the retail executable references it; offline there is no capture ----
+//
+// The retail executable's one xgameruntime reference this file used to refuse: it queries the class id (which is
+// also IXAppCaptureImpl's, per the public xgameruntime IDL and tools/gdk_runtime_classes.json) for
+// IXAppCaptureImpl4 and calls slot 5, XAppCaptureTakeScreenshot (one thunk, measured). There is no console capture
+// or record offline, so every method refuses: a title that checks the HRESULT sees unsupported, and one that does
+// not is no worse off than QueryApiImpl's kClassNotProvided on a null pointer.
+constexpr GUID kAppCaptureClass = {0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}};
+constexpr GUID kAppCapture2 = {0x3a949778, 0x772e, 0x4799, {0xbd, 0xea, 0x0a, 0x66, 0x39, 0xe9, 0x6b, 0xaa}};
+constexpr GUID kAppCapture3 = {0x2bbca60a, 0x619c, 0x4fe1, {0x81, 0x2e, 0xfb, 0x5c, 0x1d, 0xbd, 0xcf, 0x51}};
+constexpr GUID kAppCapture4 = {0x22e672d7, 0xb4e3, 0x406c, {0xbd, 0x50, 0x8f, 0x0d, 0x25, 0x23, 0x6f, 0x9e}};
+
+HRESULT STDMETHODCALLTYPE appcapture_not_implemented(void*) { return E_NOTIMPL; }
+
+#define APPCAP(fn) reinterpret_cast<const void*>(&fn)
+const void* const kAppCaptureVtable[] = {
+    APPCAP(object_query_interface), APPCAP(object_add_ref), APPCAP(object_release),
+    APPCAP(appcapture_not_implemented),  // 3  XAppCaptureTakeDiagnosticScreenshot
+    APPCAP(appcapture_not_implemented),  // 4  XAppCaptureRecordDiagnosticClip
+    APPCAP(appcapture_not_implemented),  // 5  XAppCaptureTakeScreenshot (the executable's call)
+    APPCAP(appcapture_not_implemented),  // 6  XAppCaptureOpenScreenshotStream
+    APPCAP(appcapture_not_implemented),  // 7  XAppCaptureReadScreenshotStream
+    APPCAP(appcapture_not_implemented),  // 8  XAppCaptureCloseScreenshotStream
+    APPCAP(appcapture_not_implemented),  // 9  XAppCaptureEnableRecord
+    APPCAP(appcapture_not_implemented),  // 10 XAppCaptureDisableRecord
+    APPCAP(appcapture_not_implemented),  // 11 XAppCaptureGetVideoCaptureSettings (IXAppCaptureImpl2)
+    APPCAP(appcapture_not_implemented),  // 12 XAppCaptureRecordTimespan
+    APPCAP(appcapture_not_implemented),  // 13 XAppCaptureReadLocalStream
+    APPCAP(appcapture_not_implemented),  // 14 XAppCaptureCloseLocalStream
+    APPCAP(appcapture_not_implemented),  // 15 XAppCaptureStartUserRecord (IXAppCaptureImpl3)
+    APPCAP(appcapture_not_implemented),  // 16 XAppCaptureStopUserRecord
+    APPCAP(appcapture_not_implemented),  // 17 XAppCaptureCancelUserRecord (IXAppCaptureImpl4)
+};
+#undef APPCAP
+static_assert(std::size(kAppCaptureVtable) == 18, "IUnknown + IXAppCaptureImpl's 8 + Impl2's 4 + Impl3's 2 + Impl4's 1");
+const GUID* const kAppCaptureIids[] = {&kAppCapture2, &kAppCapture3, &kAppCapture4, nullptr};
+RuntimeObject g_app_capture{kAppCaptureVtable, &kAppCaptureClass, kAppCaptureIids};
+
 RuntimeObject& system_object();   // XSystemImpl, defined after the XSystem functions it serves
 RuntimeObject& package_object();  // XPackageImpl, after the XPackage functions
 RuntimeObject& game_object();     // XGameImpl, after XPackageImpl
@@ -593,8 +631,8 @@ RuntimeObject* const* measured_objects();  // XGameRuntimeFeatureImpl and XSyste
 
 // The object this file hands out for a class id, or null when the class isn't one of this file's.
 RuntimeObject* find_object(const GUID& class_id) {
-    for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &g_persistent_storage, &system_object(),
-                             &package_object(), &game_object()})
+    for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &g_persistent_storage, &g_app_capture,
+                             &system_object(), &package_object(), &game_object()})
         if (class_id == *o->class_id) return o;
     for (RuntimeObject* const* o = measured_objects(); *o; ++o)
         if (class_id == *(*o)->class_id) return *o;
@@ -1293,7 +1331,6 @@ constexpr GUID kGameRuntimeFeatureClass = {0x8836fe87, 0xedb9, 0x4fe3, {0x8d, 0x
 // The classes no object in this file stands for; the other files serve some of them. Named ...ClassId, not ...Class,
 // because tools/gdk_runtime_calls.py counts every `constexpr GUID k...Class` in these files as a served class.
 constexpr GUID kAccessibilityClassId = {0x3e241977, 0x6237, 0x41e9, {0x85, 0x59, 0x10, 0x2c, 0x2d, 0x99, 0x83, 0xf1}};
-constexpr GUID kAppCaptureClassId = {0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}};
 constexpr GUID kDisplayClassId = {0x03f0fe74, 0xfdd9, 0x4e5c, {0xb6, 0x30, 0xf9, 0x33, 0x9c, 0x47, 0xac, 0xc5}};
 constexpr GUID kGameEventClassId = {0xbbfbdcc7, 0xbfe7, 0x409b, {0xa5, 0xca, 0xed, 0xf0, 0x54, 0x96, 0x0b, 0x4d}};
 constexpr GUID kGameInviteClassId = {0x0651aae2, 0x4012, 0x4077, {0xbf, 0x84, 0x8b, 0x90, 0x97, 0x09, 0x0e, 0x2c}};
@@ -1310,7 +1347,7 @@ struct RuntimeFeature {
 };
 const RuntimeFeature kRuntimeFeatures[] = {
     {&kAccessibilityClassId, false},    // 0  XAccessibility
-    {&kAppCaptureClassId, false},       // 1  XAppCapture
+    {&kAppCaptureClass, false},         // 1  XAppCapture
     {&kThreadingClass, false},          // 2  XAsync
     {&kThreadingClass, false},          // 3  XAsyncProvider
     {&kDisplayClassId, true},           // 4  XDisplay

@@ -417,7 +417,7 @@ class ImageTest(unittest.TestCase):
         # xgameruntime.cpp serves XGameRuntimeFeatureImpl; the ids its feature table only names (k...ClassId) don't count.
         self.assertEqual(served.get("8836fe87-edb9-4fe3-8dad-05f0d2cd5b40"), "kGameRuntimeFeatureClass")
         self.assertEqual(served.get("1b339674-328d-4283-a200-3171f18d3639"), "kLauncherClass")   # XLauncherImpl, xgameruntime_offline.cpp
-        self.assertNotIn("a4f1aee2-4bf1-4485-b008-a7c26d52ac27", served)   # XAppCaptureImpl
+        self.assertEqual(served.get("a4f1aee2-4bf1-4485-b008-a7c26d52ac27"), "kAppCaptureClass")   # XAppCaptureImpl, served
         empty = os.path.join(self.tmp, "no-shims")
         os.makedirs(empty, exist_ok=True)
         with self.assertRaises(OSError):

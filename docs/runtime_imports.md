@@ -494,10 +494,10 @@ layout with the documented argument count, and each behaves as Microsoft's refer
 
 | Class | Interface asked for | Slots (args after `this`) | Offline behaviour |
 |---|---|---|---|
-| `XGameRuntimeFeatureImpl` | its class id | 3 `XGameRuntimeIsFeatureAvailable` (1, returns `bool`) | True when `QueryApiImpl` serves the class the feature's functions go through (whichever `xgameruntime*.cpp` serves it) and the feature is documented for Windows: today XAccessibility, XSpeechSynthesizer, XLauncher, XAsync, XAsyncProvider, XTaskQueue, XThread, XError, XGame, XGameSave, XGameUI, XNetworking, XPackage, XPersistentLocalStorage, XStore, XSystem, XUser, XGameEvent, XGameStreaming. False for XDisplay (served, but documented for the consoles only), for the classes not served (XAppCapture, XGameInvite) and for values past the enum |
+| `XGameRuntimeFeatureImpl` | its class id | 3 `XGameRuntimeIsFeatureAvailable` (1, returns `bool`) | True when `QueryApiImpl` serves the class the feature's functions go through (whichever `xgameruntime*.cpp` serves it) and the feature is documented for Windows: today XAccessibility, XSpeechSynthesizer, XAppCapture, XLauncher, XAsync, XAsyncProvider, XTaskQueue, XThread, XError, XGame, XGameSave, XGameUI, XNetworking, XPackage, XPersistentLocalStorage, XStore, XSystem, XUser, XGameEvent, XGameStreaming. False for XDisplay (served, but documented for the consoles only), for the classes not served (XGameInvite) and for values past the enum |
 | `XSystemAnalyticsImpl` | its class id | 3 `XSystemGetAnalyticsInfo` (1: the result's address, as MSVC passes a returned struct to a member function) | The named export's `XSystemAnalyticsInfo` |
 
-Not served yet, though `libHttpClient.GDK.dll` has thunks for them: `XAppCaptureImpl` and `XGameInviteImpl`,
+Not served yet, though `libHttpClient.GDK.dll` has thunks for them: `XGameInviteImpl`,
 among others.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
@@ -530,7 +530,7 @@ therefore needs no module name beyond the `xgameruntime.dll` it already has, whi
 | Class | Thunks | Referenced | Served |
 |---|---:|---:|---|
 | `XAccessibilityImpl` | 10 | 9 | no |
-| `XAppCaptureImpl` | 1 | 1 | no |
+| `XAppCaptureImpl` | 1 | 1 | yes |
 | `XLauncherImpl` | 3 | 3 | no |
 | `XDisplayImpl` | 1 | 1 | yes |
 | `XGameEventImpl` | 1 | 1 | yes |
@@ -547,10 +547,9 @@ therefore needs no module name beyond the `xgameruntime.dll` it already has, whi
 | `XThreadingImpl` | 18 | 17 | yes |
 | `XUserImpl` | 21 | 21 | yes |
 
-"Served" is the tool's answer for the runtime sources at that commit. The three that are not: `XAccessibilityImpl`
-(the speech-synthesizer slots 8-13, 15, 16 and 21 are referenced; slot 14 is not), `XAppCaptureImpl` (slot 5,
-`XAppCaptureTakeScreenshot`) and `XLauncherImpl` (slots 3-5: `XLaunchUri` and the two display timeout-deferral calls).
-Open pull requests serve them: #4235, #4307 and #4248. The slots of `XUserImpl`, `XStoreImpl` and `XGameSaveImpl` the
+"Served" is the tool's answer for the runtime sources at that commit. The two that are not: `XAccessibilityImpl`
+(the speech-synthesizer slots 8-13, 15, 16 and 21 are referenced; slot 14 is not) and `XLauncherImpl` (slots 3-5:
+`XLaunchUri` and the two display timeout-deferral calls). Open pull requests serve them: #4235 and #4248. The slots of `XUserImpl`, `XStoreImpl` and `XGameSaveImpl` the
 executable calls, and the argument counts the tool estimates from the registers, are in the report the tool writes.
 `XErrorImpl`, which `XCurl.dll` and `libHttpClient.GDK.dll` call, is not among the executable's classes.
 
