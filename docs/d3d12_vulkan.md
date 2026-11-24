@@ -2516,7 +2516,8 @@ The trace will enumerate them.
   the host refuses and the layer copies on purpose.
   - A driver can report `VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT` for a format, create the image with
     host-transfer usage, and then give it no memory type (`memoryTypeBits = 0`). This was measured on a GTX 1050 Ti
-    with NVIDIA 582.78, and the validation layer of Vulkan SDK 1.4.363 reports nothing. Such a texture is made again
+    with NVIDIA 582.78 and again with 582.66 on Windows 10 (#1364), where the same image without host-transfer usage
+    takes device-local memory; the validation layer of Vulkan SDK 1.4.363 reports nothing. Such a texture is made again
     without host-transfer usage before it is bound, and takes the staging path. `d3d12_vulkan_device_test` and
     `d3d12_subresource_copy_test` force this branch on any GPU with `VulkanDeviceInfo::force_host_transfer_retry`
     (their third CPU-copy path; the second compares it with the host runtime).
