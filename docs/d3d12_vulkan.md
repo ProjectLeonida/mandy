@@ -2655,6 +2655,49 @@ The trace will enumerate them.
   and the specular sparkles. Create them with the format the game asks for (`R8G8B8A8_UNORM` and the like) and don't
   substitute a wider or float format for them.
 
+<a id="xg-swizzle-linear-path"></a>
+#### The title already supports the linear tile path (`XG-SWIZZLE-LINEAR-PATH`)
+
+Read statically in 1.0.2.1; nothing was executed. Both `xg_xs.dll` imports are adjacent IAT thunks:
+`XGCreateTextureComputer` at `0x145F3FF40` (`JMP [0x146793F60]`) and `XGSuggestSwizzleMode` at
+`0x145F3FF50` (`JMP [0x146793F68]`).
+
+`XGSuggestSwizzleMode` has one shape at both call sites, `0x140C4B3CE` (in `0x140C4B030`) and
+`0x144ECCCA2` (in `0x144ECC940`). The helper loads the description's tile-class byte `[desc+8]`,
+compares it with `0xFF` (`0x140C4B3B5`, `0x144ECCB00`/`0x144ECCB28`) and calls only on equality, so
+the class is unknown. The arguments are `RCX` = the description block being filled, `RDX` = 0
+(`XOR EDX,EDX`) and `R8` = `RCX+0x2C` (`LEA R8,[RCX+0x2C]`), the block's 32-bit tile-mode field —
+i.e. `XGSuggestSwizzleMode(desc, NULL, &desc->tileMode)`. Both helpers zero the block at `+0x28`
+first, so that field is 0 unless a class is known; a known class writes `0x100 | class` (with
+`0x102` and `0x10A` as special cases) and never 0. The result the callee writes is therefore the
+mode, and 0 is already the value the title uses for "linear" everywhere.
+
+The consumers test that mode word as tiled with `CMP x,0x100` plus `BT x,9` (bits 8 and 9) and
+run the linear arithmetic on the `0` result:
+
+- `0x14555E9E0`, test at `0x14555EA2C`: 0 stores 0 at `[out+8]` and returns
+  `pitch*(row+…) + x` at `0x14555EA45`.
+- `0x14193DE10`, test at `0x14193DE73`: 0 goes to `0x14193DE9E` (which builds a layout through
+  `0x140C4B030` at `0x14193E06B` and then calls `0x1416F7100` from `0x14193DF4B`), not to the
+  tiled branch at `0x14193E314`.
+- `0x1404F4210`, test at `0x1404F448A`: 0 takes `0x1404F44E4`.
+- `0x145121690` takes its non-`0x980` path and calls the computer's `+0x40` with offset 0 and a
+  `pitch*height` span.
+
+What a shim can do with that: `XGSuggestSwizzleMode` writes `0` and returns `S_OK`, and
+`XGCreateTextureComputer` can hand back an object whose slots used at these sites (2, 8, 10 and
+`+0x40`) pass the byte offset through and report the full linear row span. The linear paths above
+compute `pitch*row + x` themselves and ask the object only for an offset, so nothing has to model
+a tile. `FUN_145121980` (`0x145121980`) is not the mode test but a cache: `0x144DB9180` keys it on
+the description bytes, `0xE` and `(flags&0xFF)<<16 | mode`, and it builds a tiled layout only on a
+miss, so an identity computer still has to answer whatever that branch asks.
+
+What is not established: `0x102` and `0x10A` are written by the two helpers, but the four
+consumers above only special-case `0x100` and bit 9, so whether the variants are meant to be tiled
+was not measured. The physical layout of a non-zero mode is not new here either
+([textures.md](textures.md), `runtime/src/gfx10_tiling.h`); 0 is the choice of the linear layout,
+not a description of one.
+
 ### 4.3 Barriers and layouts
 
 Track a current state/layout per subresource. D3D12 states are bitmasks; a combined state takes the union of the
