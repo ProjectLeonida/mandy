@@ -42,6 +42,7 @@ inline constexpr std::size_t blob_bytes = 4 + 4 + 12 + 16 + key_bytes + 4;
 
 inline std::uint32_t fnv1a(const std::uint8_t* data, std::size_t size) {
     std::uint32_t h = 0x811c9dc5u;
+    if (!data) return h;
     for (std::size_t i = 0; i < size; ++i) h = (h ^ data[i]) * 0x01000193u;
     return h;
 }
@@ -73,13 +74,14 @@ inline std::vector<std::uint8_t> encode(const Identity& identity, const Key& key
 }
 
 inline Check check(const Identity& identity, const Key& key, std::span<const std::uint8_t> blob) {
-    if (blob.size() != blob_bytes) return Check::invalid;
+    if (blob.size() != blob_bytes || blob.data() == nullptr) return Check::invalid;
     const std::uint8_t* p = blob.data();
     if (get32(p + blob_bytes - 4) != fnv1a(p, blob_bytes - 4)) return Check::invalid;
     if (get32(p) != magic || get32(p + 4) != version) return Check::invalid;
     if (get32(p + 8) != identity.vendor || get32(p + 12) != identity.device) return Check::other_adapter;
     if (get32(p + 16) != identity.driver || std::memcmp(p + 20, identity.cache_uuid, 16) != 0)
         return Check::other_driver;
+    if (key.size() > key_bytes) return Check::other_description;
     std::string padded = key;
     padded.resize(key_bytes, '\0');
     if (std::memcmp(p + 36, padded.data(), key_bytes) != 0) return Check::other_description;
@@ -90,12 +92,13 @@ inline Check check(const Identity& identity, const Key& key, std::span<const std
 // descriptions give the same bytes only when those fields are equal.
 class KeyBuilder {
 public:
-    KeyBuilder& tag(const char* name) { return bytes(name, std::strlen(name)); }
+    KeyBuilder& tag(const char* name) { return name ? bytes(name, std::strlen(name)) : u32(0xffffffffu); }
     KeyBuilder& u32(std::uint32_t v) {
         put32(data_, v);
         return *this;
     }
     KeyBuilder& bytes(const void* p, std::size_t n) {
+        if (!p) n = 0;
         put32(data_, std::uint32_t(n));
         if (n) data_.insert(data_.end(), static_cast<const std::uint8_t*>(p), static_cast<const std::uint8_t*>(p) + n);
         return *this;
