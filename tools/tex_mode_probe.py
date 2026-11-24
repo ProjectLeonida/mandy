@@ -13,11 +13,15 @@ import os
 import sys
 from collections import Counter
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:  # main() checks the arguments first, then says numpy is missing in one line
+    np = None
 
 sys.path.insert(0, os.path.dirname(__file__))
-from amd_swizzle import _parity, equation, load  # noqa: E402
-from bc_feature import block_average, smoothness  # noqa: E402
+if np is not None:  # both helpers import numpy themselves
+    from amd_swizzle import _parity, equation, load  # noqa: E402
+    from bc_feature import block_average, smoothness  # noqa: E402
 
 BPE = {"BC1": 8, "BC2": 16, "BC3": 16}
 
@@ -90,6 +94,9 @@ def main():
         ap.error(f"cannot read texture index {a.index}: {error}")
     if not isinstance(index, list):
         ap.error(f"{a.index}: texture index must contain a list")
+    if np is None:
+        print("ERROR: tex_mode_probe.py needs numpy (python -m pip install numpy)", file=sys.stderr)
+        return 2
     nib, tab = load()
     texs = [t for t in index if t["fmt_name"].startswith(a.fmt)
             and bc_bpe(t["fmt_name"]) is not None and t["w"] >= 256 and t["h"] >= 256]
