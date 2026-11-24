@@ -1,7 +1,10 @@
-// ID3D12GraphicsCommandList4 render passes (D3D-27) on the Vulkan-backed list, compared byte for byte with Windows
-// WARP through the D3D12 API on both sides: CLEAR and PRESERVE beginning accesses on two render targets, the depth
-// and stencil planes cleared by their own accesses, an MSAA RESOLVE ending access into a rectangle of a larger
-// target, a pass suspended in one list and resumed in the next, and the list errors Close reports.
+// ID3D12GraphicsCommandList4 render passes (D3D-27) on the Vulkan-backed list, compared byte for byte with Windows WARP
+// through the D3D12 API on both sides: CLEAR and PRESERVE beginning accesses on two render targets (also with
+// ALLOW_UAV_WRITES), the depth and stencil planes cleared by their own accesses, an MSAA colour RESOLVE ending access
+// into a rectangle of a larger target and a depth one, a pass suspended in one list and resumed in the next, and what
+// Close returns in 29 list cases: pass nesting, the calls D3D12 forbids inside a pass, passes on bundles and compute
+// lists, and descriptions WARP ignores or refuses. Every case also checks WARP against the values written here, so it
+// cannot pass by both sides being wrong.
 // No game data or shaders. Run explicitly (needs Vulkan hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
@@ -183,7 +186,7 @@ D3D12_RENDER_PASS_BEGINNING_ACCESS begin_access(D3D12_RENDER_PASS_BEGINNING_ACCE
     access.Type = type;
     if (type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR) {
         access.Clear.ClearValue.Format = format;
-        if (format == kDepth) {
+        if (format == kDepth || format == DXGI_FORMAT_D32_FLOAT) {
             access.Clear.ClearValue.DepthStencil = {depth, stencil};
         } else {
             std::memcpy(access.Clear.ClearValue.Color, color.data(), sizeof(float) * 4);
@@ -208,8 +211,8 @@ constexpr auto kRT = D3D12_RESOURCE_STATE_RENDER_TARGET;
 constexpr auto kCopySrc = D3D12_RESOURCE_STATE_COPY_SOURCE;
 
 // Two colour targets cleared red and blue before the pass; the pass CLEARs the first to green and PRESERVEs the
-// second. Expected: green, blue.
-bool clear_and_preserve(ID3D12Device* device, Result& result) {
+// second. Expected: green, blue. `flags` is the pass's (ALLOW_UAV_WRITES must change nothing at Tier 0).
+bool clear_and_preserve(ID3D12Device* device, D3D12_RENDER_PASS_FLAGS flags, Result& result) {
     Context c;
     CHECK(c.create(device));
     Ref<ID3D12Resource> rt[2];
@@ -223,7 +226,7 @@ bool clear_and_preserve(ID3D12Device* device, Result& result) {
     D3D12_RENDER_PASS_RENDER_TARGET_DESC targets[2]{};
     targets[0] = {rtv.handle(0), begin_access(kBeginClear, kColor, {0, 1, 0, 1}), end_access(kEndPreserve)};
     targets[1] = {rtv.handle(1), begin_access(kBeginPreserve), end_access(kEndPreserve)};
-    c.list->BeginRenderPass(2, targets, nullptr, D3D12_RENDER_PASS_FLAG_NONE);
+    c.list->BeginRenderPass(2, targets, nullptr, flags);
     c.list->EndRenderPass();
     for (auto& r : rt) {
         Context::barrier(c.list.p, r.p, kRT, kCopySrc);
@@ -271,8 +274,9 @@ bool depth_and_stencil_planes(ID3D12Device* device, bool second, Result& result)
 
 // A 4x MSAA colour target CLEARed in the pass and RESOLVEd at its end into the 2 x 2 rectangle at (1, 1) of a
 // single-sample target cleared blue before. With `suspend`, the pass is split: it suspends in the first list and
-// resumes in the second, whose CLEAR (red) and the first part's RESOLVE are the ones D3D12 does not run. Expected:
-// the clear colour in the rectangle, blue around it.
+// resumes in the second, whose CLEAR (red) and the first part's RESOLVE are the ones D3D12 does not run. The first
+// part's RESOLVE names the rectangle at (0, 0) instead, so running it would show. Expected: the clear colour in the
+// rectangle at (1, 1), blue around it.
 bool msaa_resolve(ID3D12Device* device, bool suspend, Result& result) {
     Context c;
     CHECK(c.create(device));
@@ -289,7 +293,9 @@ bool msaa_resolve(ID3D12Device* device, bool suspend, Result& result) {
     Context::barrier(c.list.p, dst.p, kRT, D3D12_RESOURCE_STATE_RESOLVE_DEST);
 
     D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS sub{0, 0, 1, 1, {0, 0, 2, 2}};
-    const auto pass = [&](ID3D12GraphicsCommandList4* l, std::array<float, 4> color, D3D12_RENDER_PASS_FLAGS flags) {
+    D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS corner{0, 0, 0, 0, {0, 0, 2, 2}};
+    const auto pass = [&](ID3D12GraphicsCommandList4* l, std::array<float, 4> color, D3D12_RENDER_PASS_FLAGS flags,
+                          D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS* where) {
         D3D12_RENDER_PASS_RENDER_TARGET_DESC target{};
         target.cpuDescriptor = rtv.handle(0);
         target.BeginningAccess = begin_access(kBeginClear, kColor, color);
@@ -298,7 +304,7 @@ bool msaa_resolve(ID3D12Device* device, bool suspend, Result& result) {
         resolve.pSrcResource = msaa.p;
         resolve.pDstResource = dst.p;
         resolve.SubresourceCount = 1;
-        resolve.pSubresourceParameters = &sub;
+        resolve.pSubresourceParameters = where;
         resolve.Format = kColor;
         resolve.ResolveMode = D3D12_RESOLVE_MODE_AVERAGE;
         resolve.PreserveResolveSource = FALSE;
@@ -308,43 +314,218 @@ bool msaa_resolve(ID3D12Device* device, bool suspend, Result& result) {
     // 0.2 / 0.4 / 0.6 / 0.8 are exact enough in UNORM8 that every sample averages to the same byte.
     ID3D12GraphicsCommandList4* last = c.list.p;
     if (suspend) {
-        pass(c.list.p, {0.2f, 0.4f, 0.6f, 0.8f}, D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS);
-        pass(c.list2.p, {1, 0, 0, 1}, D3D12_RENDER_PASS_FLAG_RESUMING_PASS);
+        pass(c.list.p, {0.2f, 0.4f, 0.6f, 0.8f}, D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS, &corner);
+        pass(c.list2.p, {1, 0, 0, 1}, D3D12_RENDER_PASS_FLAG_RESUMING_PASS, &sub);
         last = c.list2.p;
     } else {
-        pass(c.list.p, {0.2f, 0.4f, 0.6f, 0.8f}, D3D12_RENDER_PASS_FLAG_NONE);
+        pass(c.list.p, {0.2f, 0.4f, 0.6f, 0.8f}, D3D12_RENDER_PASS_FLAG_NONE, &sub);
     }
     Context::barrier(last, dst.p, D3D12_RESOURCE_STATE_RESOLVE_DEST, kCopySrc);
     CHECK(c.read(last, dst.p, 0, 4));
     return c.finish(result, suspend);
 }
 
-// What Close returns, each on a list of its own: after EndRenderPass with no pass begun, with a pass left open,
-// after a nested BeginRenderPass, and for one pass begun and ended.
+// A 4x MSAA D32_FLOAT target whose depth the pass CLEARs to 0.25 and RESOLVEs at its end (MIN, named R32_FLOAT:
+// WARP removes the device for a D32_FLOAT resolve format, see d3d12_depth_resolve_test) into a single-sample target
+// cleared to 1 before. Expected: 0.25 everywhere.
+bool depth_resolve(ID3D12Device* device, Result& result) {
+    Context c;
+    CHECK(c.create(device));
+    constexpr auto d32 = DXGI_FORMAT_D32_FLOAT;
+    constexpr auto depth_write = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    Ref<ID3D12Resource> msaa, dst;
+    CHECK(c.texture(d32, 4, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, depth_write, msaa));
+    CHECK(c.texture(d32, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, depth_write, dst));
+    Context::Heap dsv;
+    CHECK(c.heap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2, dsv));
+    device->CreateDepthStencilView(msaa.p, nullptr, dsv.handle(0));
+    device->CreateDepthStencilView(dst.p, nullptr, dsv.handle(1));
+    c.list->ClearDepthStencilView(dsv.handle(1), D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+    Context::barrier(c.list.p, dst.p, depth_write, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+    D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS sub{0, 0, 0, 0, {0, 0, LONG(kSize), LONG(kSize)}};
+    D3D12_RENDER_PASS_DEPTH_STENCIL_DESC pass{};
+    pass.cpuDescriptor = dsv.handle(0);
+    pass.DepthBeginningAccess = begin_access(kBeginClear, d32, {}, 0.25f, 0);
+    pass.StencilBeginningAccess = begin_access(kBeginNoAccess);
+    pass.DepthEndingAccess = end_access(kEndResolve);
+    auto& resolve = pass.DepthEndingAccess.Resolve;
+    resolve.pSrcResource = msaa.p;
+    resolve.pDstResource = dst.p;
+    resolve.SubresourceCount = 1;
+    resolve.pSubresourceParameters = &sub;
+    resolve.Format = DXGI_FORMAT_R32_FLOAT;
+    resolve.ResolveMode = D3D12_RESOLVE_MODE_MIN;
+    resolve.PreserveResolveSource = FALSE;
+    pass.StencilEndingAccess = end_access(kEndNoAccess);
+    c.list->BeginRenderPass(0, nullptr, &pass, D3D12_RENDER_PASS_FLAG_NONE);
+    c.list->EndRenderPass();
+    Context::barrier(c.list.p, dst.p, D3D12_RESOURCE_STATE_RESOLVE_DEST, kCopySrc);
+    CHECK(c.read(c.list.p, dst.p, 0, 4));
+    return c.finish(result);
+}
+
+// What Close returns, each case on a list of its own: pass nesting and order, suspend and resume, the calls D3D12
+// forbids inside a pass, and passes on lists that cannot record one. The names are printed on a mismatch.
+const char* const kListCases[] = {
+    "EndRenderPass without a pass", "a pass left open", "a nested BeginRenderPass", "a valid pass",
+    "EndRenderPass twice", "a SUSPENDING pass", "a RESUMING pass", "a pass with no targets",
+    "ResourceBarrier in a pass", "OMSetRenderTargets in a pass", "ClearRenderTargetView in a pass",
+    "ClearDepthStencilView in a pass", "CopyResource in a pass", "CopyTextureRegion in a pass",
+    "CopyBufferRegion in a pass", "DiscardResource in a pass", "ResolveSubresource in a pass",
+    "ResolveSubresourceRegion in a pass", "Dispatch in a pass", "a pass on a bundle", "a pass on a compute list",
+    "EndRenderPass on a bundle", "EndRenderPass on a compute list", "BeginRenderPass on a bundle",
+    "BeginRenderPass on a compute list", "a CLEAR with a null RTV", "a depth CLEAR with a null DSV",
+    "a RESOLVE with no source", "nine render targets",
+};
+
 bool list_errors(ID3D12Device* device, Result& result) {
     Context c;
     CHECK(c.create(device));
-    Ref<ID3D12Resource> rt;
+    Ref<ID3D12Resource> rt, rt2, msaa, single, ds, buffer, buffer2;
     CHECK(c.texture(kColor, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, kRT, rt));
-    Context::Heap rtv;
+    CHECK(c.texture(kColor, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST, rt2));
+    CHECK(c.texture(kColor, 4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, msaa));
+    CHECK(c.texture(kColor, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_DEST, single));
+    CHECK(c.texture(kDepth, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, ds));
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 256;
+    desc.Height = desc.SampleDesc.Count = 1;
+    desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    CHECK(SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&buffer.p))));
+    CHECK(SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&buffer2.p))));
+    Context::Heap rtv, dsv;
     CHECK(c.heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, rtv));
+    CHECK(c.heap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, dsv));
     device->CreateRenderTargetView(rt.p, nullptr, rtv.handle(0));
+    device->CreateDepthStencilView(ds.p, nullptr, dsv.handle(0));
     D3D12_RENDER_PASS_RENDER_TARGET_DESC target{rtv.handle(0), begin_access(kBeginPreserve), end_access(kEndPreserve)};
-    const auto close_after = [&](int begins, int ends, Result& r) {
+    const auto begin = [&](ID3D12GraphicsCommandList4* l, D3D12_RENDER_PASS_FLAGS flags) {
+        l->BeginRenderPass(1, &target, nullptr, flags);
+    };
+    constexpr auto none = D3D12_RENDER_PASS_FLAG_NONE;
+    // Records `body` on a new list of `type` and appends what its Close returns.
+    const auto close_after = [&](D3D12_COMMAND_LIST_TYPE type, auto&& body) {
         Ref<ID3D12CommandAllocator> allocator;
         Ref<ID3D12GraphicsCommandList4> list;
-        CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
-        CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
-                                                 IID_PPV_ARGS(&list.p))));
-        for (int i = 0; i < begins; ++i) list->BeginRenderPass(1, &target, nullptr, D3D12_RENDER_PASS_FLAG_NONE);
-        for (int i = 0; i < ends; ++i) list->EndRenderPass();
-        r.results.push_back(list->Close());
+        CHECK(SUCCEEDED(device->CreateCommandAllocator(type, IID_PPV_ARGS(&allocator.p))));
+        CHECK(SUCCEEDED(device->CreateCommandList(0, type, allocator.p, nullptr, IID_PPV_ARGS(&list.p))));
+        body(list.p);
+        result.results.push_back(list->Close());
         return true;
     };
-    CHECK(close_after(0, 1, result));  // EndRenderPass without a pass
-    CHECK(close_after(1, 0, result));  // a pass left open
-    CHECK(close_after(2, 1, result));  // a nested BeginRenderPass
-    CHECK(close_after(1, 1, result));  // a valid pass
+    constexpr auto direct = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    const auto in_pass = [&](auto&& call) {
+        return close_after(direct, [&](ID3D12GraphicsCommandList4* l) {
+            begin(l, none);
+            call(l);
+            l->EndRenderPass();
+        });
+    };
+    CHECK(close_after(direct, [&](ID3D12GraphicsCommandList4* l) { l->EndRenderPass(); }));
+    CHECK(close_after(direct, [&](ID3D12GraphicsCommandList4* l) { begin(l, none); }));
+    CHECK(close_after(direct, [&](ID3D12GraphicsCommandList4* l) {
+        begin(l, none);
+        begin(l, none);
+        l->EndRenderPass();
+    }));
+    CHECK(close_after(direct, [&](ID3D12GraphicsCommandList4* l) {
+        begin(l, none);
+        l->EndRenderPass();
+    }));
+    CHECK(close_after(direct, [&](ID3D12GraphicsCommandList4* l) {
+        begin(l, none);
+        l->EndRenderPass();
+        l->EndRenderPass();
+    }));
+    CHECK(close_after(direct, [&](ID3D12GraphicsCommandList4* l) {
+        begin(l, D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS);
+        l->EndRenderPass();
+    }));
+    CHECK(close_after(direct, [&](ID3D12GraphicsCommandList4* l) {
+        begin(l, D3D12_RENDER_PASS_FLAG_RESUMING_PASS);
+        l->EndRenderPass();
+    }));
+    CHECK(close_after(direct, [&](ID3D12GraphicsCommandList4* l) {
+        l->BeginRenderPass(0, nullptr, nullptr, none);
+        l->EndRenderPass();
+    }));
+    CHECK(in_pass([&](ID3D12GraphicsCommandList4* l) {
+        Context::barrier(l, rt.p, kRT, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Context::barrier(l, rt.p, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kRT);
+    }));
+    CHECK(in_pass([&](ID3D12GraphicsCommandList4* l) {
+        const auto handle = rtv.handle(0);
+        l->OMSetRenderTargets(1, &handle, FALSE, nullptr);
+    }));
+    CHECK(in_pass([&](ID3D12GraphicsCommandList4* l) {
+        const FLOAT color[4]{0, 0, 0, 1};
+        l->ClearRenderTargetView(rtv.handle(0), color, 0, nullptr);
+    }));
+    CHECK(in_pass([&](ID3D12GraphicsCommandList4* l) {
+        l->ClearDepthStencilView(dsv.handle(0), D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+    }));
+    CHECK(in_pass([&](ID3D12GraphicsCommandList4* l) { l->CopyResource(rt2.p, rt.p); }));
+    CHECK(in_pass([&](ID3D12GraphicsCommandList4* l) {
+        D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+        dst.pResource = rt2.p;
+        src.pResource = rt.p;
+        dst.Type = src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }));
+    CHECK(in_pass([&](ID3D12GraphicsCommandList4* l) { l->CopyBufferRegion(buffer2.p, 0, buffer.p, 0, 16); }));
+    CHECK(in_pass([&](ID3D12GraphicsCommandList4* l) { l->DiscardResource(rt.p, nullptr); }));
+    CHECK(in_pass([&](ID3D12GraphicsCommandList4* l) { l->ResolveSubresource(single.p, 0, msaa.p, 0, kColor); }));
+    CHECK(in_pass([&](ID3D12GraphicsCommandList4* l) {
+        l->ResolveSubresourceRegion(single.p, 0, 0, 0, msaa.p, 0, nullptr, kColor, D3D12_RESOLVE_MODE_AVERAGE);
+    }));
+    CHECK(in_pass([&](ID3D12GraphicsCommandList4* l) { l->Dispatch(1, 1, 1); }));
+    CHECK(close_after(D3D12_COMMAND_LIST_TYPE_BUNDLE, [&](ID3D12GraphicsCommandList4* l) {
+        begin(l, none);
+        l->EndRenderPass();
+    }));
+    CHECK(close_after(D3D12_COMMAND_LIST_TYPE_COMPUTE, [&](ID3D12GraphicsCommandList4* l) {
+        begin(l, none);
+        l->EndRenderPass();
+    }));
+    CHECK(close_after(D3D12_COMMAND_LIST_TYPE_BUNDLE, [&](ID3D12GraphicsCommandList4* l) { l->EndRenderPass(); }));
+    CHECK(close_after(D3D12_COMMAND_LIST_TYPE_COMPUTE, [&](ID3D12GraphicsCommandList4* l) { l->EndRenderPass(); }));
+    CHECK(close_after(D3D12_COMMAND_LIST_TYPE_BUNDLE, [&](ID3D12GraphicsCommandList4* l) { begin(l, none); }));
+    CHECK(close_after(D3D12_COMMAND_LIST_TYPE_COMPUTE, [&](ID3D12GraphicsCommandList4* l) { begin(l, none); }));
+    CHECK(close_after(direct, [&](ID3D12GraphicsCommandList4* l) {
+        D3D12_RENDER_PASS_RENDER_TARGET_DESC null_target{{}, begin_access(kBeginClear, kColor, {0, 1, 0, 1}),
+                                                         end_access(kEndPreserve)};
+        l->BeginRenderPass(1, &null_target, nullptr, none);
+        l->EndRenderPass();
+    }));
+    CHECK(close_after(direct, [&](ID3D12GraphicsCommandList4* l) {
+        D3D12_RENDER_PASS_DEPTH_STENCIL_DESC null_depth{};
+        null_depth.DepthBeginningAccess = begin_access(kBeginClear, kDepth, {}, 0.5f, 0);
+        null_depth.StencilBeginningAccess = begin_access(kBeginNoAccess);
+        null_depth.DepthEndingAccess = end_access(kEndPreserve);
+        null_depth.StencilEndingAccess = end_access(kEndNoAccess);
+        l->BeginRenderPass(0, nullptr, &null_depth, none);
+        l->EndRenderPass();
+    }));
+    CHECK(close_after(direct, [&](ID3D12GraphicsCommandList4* l) {
+        D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS sub{0, 0, 0, 0, {0, 0, 1, 1}};
+        D3D12_RENDER_PASS_RENDER_TARGET_DESC resolving{rtv.handle(0), begin_access(kBeginPreserve),
+                                                       end_access(kEndResolve)};
+        resolving.EndingAccess.Resolve = {nullptr, single.p, 1, &sub, kColor, D3D12_RESOLVE_MODE_AVERAGE, FALSE};
+        l->BeginRenderPass(1, &resolving, nullptr, none);
+        l->EndRenderPass();
+    }));
+    CHECK(close_after(direct, [&](ID3D12GraphicsCommandList4* l) {
+        D3D12_RENDER_PASS_RENDER_TARGET_DESC nine[9];
+        for (auto& t : nine) t = target;
+        l->BeginRenderPass(9, nine, nullptr, none);
+        l->EndRenderPass();
+    }));
     return true;
 }
 
@@ -420,12 +601,35 @@ int main() {
         struct Named {
             const char* name;
             Case run;
-            std::vector<std::vector<unsigned char>> expected;  // empty: compared with WARP only
+            std::vector<std::vector<unsigned char>> expected;  // the bytes WARP must also give
+            std::vector<HRESULT> expected_results = {};         // the Close results WARP must also give
+            bool skip = false;                                  // the Vulkan device cannot replay the case
+        };
+        // The depth RESOLVE uses MIN, which Vulkan makes optional (SAMPLE_ZERO is the one every device has).
+        VkPhysicalDeviceDepthStencilResolveProperties resolve{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &resolve};
+        vk.instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(vk.physical, &properties);
+        const bool depth_min = resolve.supportedDepthResolveModes & VK_RESOLVE_MODE_MIN_BIT;
+        constexpr HRESULT s_ok = S_OK, arg = E_INVALIDARG, fail = E_FAIL;
+        const std::vector<HRESULT> list_results = {
+            arg, fail, arg, s_ok, arg, s_ok, s_ok, s_ok, s_ok,          // nesting, order, suspend/resume, barrier
+            fail, fail, fail, fail, fail, fail, fail, fail, fail, fail,  // forbidden inside a pass
+            fail, fail, fail, fail, fail, fail,                          // bundles and compute lists
+            s_ok, s_ok,                                                  // CLEAR with a null descriptor
+            s_ok, fail,                                                  // no RESOLVE source, nine targets
         };
         const auto green = repeat({0, 255, 0, 255}, kSize * kSize), blue = repeat({0, 0, 255, 255}, kSize * kSize);
         const auto resolve_colour = resolved({51, 102, 153, 204});
         const Named cases[] = {
-            {"clear_and_preserve", clear_and_preserve, {green, blue}},
+            {"clear_and_preserve",
+             [](ID3D12Device* d, Result& r) { return clear_and_preserve(d, D3D12_RENDER_PASS_FLAG_NONE, r); },
+             {green, blue}},
+            {"clear_and_preserve_allow_uav_writes",
+             [](ID3D12Device* d, Result& r) {
+                 return clear_and_preserve(d, D3D12_RENDER_PASS_FLAG_ALLOW_UAV_WRITES, r);
+             },
+             {green, blue}},
             {"depth_clear_stencil_preserve",
              [](ID3D12Device* d, Result& r) { return depth_and_stencil_planes(d, false, r); },
              {depth_bytes(0.25f), repeat({3}, kSize * kSize)}},
@@ -435,9 +639,14 @@ int main() {
             {"msaa_resolve_region", [](ID3D12Device* d, Result& r) { return msaa_resolve(d, false, r); },
              {resolve_colour}},
             {"suspend_resume", [](ID3D12Device* d, Result& r) { return msaa_resolve(d, true, r); }, {resolve_colour}},
-            {"list_errors", list_errors, {}},
+            {"depth_resolve_min", depth_resolve, {depth_bytes(0.25f)}, {}, !depth_min},
+            {"list_errors", list_errors, {}, list_results},
         };
         for (const auto& item : cases) {
+            if (item.skip) {
+                std::printf("SKIP %s (the Vulkan device has no MIN depth resolve)\n", item.name);
+                continue;
+            }
             Result from_host, from_ours;
             if (!item.run(host.p, from_host)) {
                 std::fprintf(stderr, "%s: the WARP run failed\n", item.name);
@@ -450,9 +659,9 @@ int main() {
                 continue;
             }
             bool ok = from_host.images == from_ours.images && from_host.results == from_ours.results;
-            if (!item.expected.empty() && from_host.images != item.expected) {
-                std::fprintf(stderr, "%s: WARP differs from the expected bytes; the case is not testing what it says\n",
-                             item.name);
+            if (from_host.images != item.expected || from_host.results != item.expected_results) {
+                std::fprintf(stderr, "%s: WARP differs from the expected values, so the case does not test what it "
+                             "says\n", item.name);
                 ok = false;
             }
             for (size_t i = 0; !ok && i < from_host.images.size() && i < from_ours.images.size(); ++i) {
@@ -460,10 +669,13 @@ int main() {
                 std::fprintf(stderr, "%s image %zu:\n  WARP %s\n  ours %s\n", item.name, i,
                              hex(from_host.images[i]).c_str(), hex(from_ours.images[i]).c_str());
             }
-            for (size_t i = 0; !ok && i < from_host.results.size() && i < from_ours.results.size(); ++i) {
-                std::fprintf(stderr, "%s result %zu: WARP 0x%08lx, ours 0x%08lx\n", item.name, i,
-                             static_cast<unsigned long>(from_host.results[i]),
-                             static_cast<unsigned long>(from_ours.results[i]));
+            for (size_t i = 0; !ok && i < from_host.results.size(); ++i) {
+                const HRESULT want = i < item.expected_results.size() ? item.expected_results[i] : S_OK;
+                const HRESULT ours_result = i < from_ours.results.size() ? from_ours.results[i] : S_OK;
+                if (from_host.results[i] == want && ours_result == want) continue;
+                std::fprintf(stderr, "%s, %s: expected 0x%08lx, WARP 0x%08lx, ours 0x%08lx\n", item.name,
+                             i < std::size(kListCases) ? kListCases[i] : "?", static_cast<unsigned long>(want),
+                             static_cast<unsigned long>(from_host.results[i]), static_cast<unsigned long>(ours_result));
             }
             std::printf("%s %s\n", ok ? "PASS" : "FAIL", item.name);
             if (!ok) ++failures;

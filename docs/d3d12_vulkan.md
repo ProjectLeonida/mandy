@@ -2720,20 +2720,29 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   accesses are copied at `BeginRenderPass` (the application's arrays need not outlive the call) and recorded at
   `EndRenderPass` as one `ResolveSubresourceRegion` per subresource parameter, with its checks. A `RESUMING_PASS`
   skips its clears and a `SUSPENDING_PASS` its resolves, so they run once, in the first and the last part of the pass.
-  Only direct lists record passes, one at a time; `EndRenderPass` without a pass makes the list invalid, and `Close`
-  with a pass open returns `E_FAIL`. `ALLOW_UAV_WRITES` needs nothing at Tier 0, and the `BIND_READ_ONLY_*` flags use
-  the DSV as it was created. Not checked: the calls D3D12 forbids inside a pass. `d3d12_render_pass_test` runs six
-  cases on the Vulkan-backed device and on Windows WARP through the D3D12 API and compares the bytes read back: CLEAR
-  and PRESERVE on two colour targets; a `D32_FLOAT_S8X24_UINT` target whose depth plane is cleared with stencil
-  PRESERVEd, then whose stencil is cleared with depth NO_ACCESS; a 4x MSAA target CLEARed and RESOLVEd into a 2 x 2
-  rectangle at (1, 1) of a larger target; the same pass suspended in one list and resumed in the next of one
-  `ExecuteCommandLists` (the resumed part's red CLEAR does not run; the RESOLVE leaves the first part's colour); and
-  what `Close` returns after `EndRenderPass` with no pass (`E_INVALIDARG`), with a pass open (`E_FAIL`, measured on
-  WARP), after a nested `BeginRenderPass` (`E_INVALIDARG`) and for a valid pass (`S_OK`). All six match WARP and the
-  expected bytes on an AMD Radeon RX 6600 (AMD Windows driver 26.6.4, Windows 10 19045); on `main` before this change
-  all six fail. Draws inside a pass are not in the test: they use the same per-draw rendering scope as after
-  `OMSetRenderTargets`. A Tier 1 path, mapping the accesses to `vkCmdBeginRendering` load/store ops and resolve
-  attachments, is not needed for correctness and is left out.
+  `ALLOW_UAV_WRITES` needs nothing at Tier 0, and the `BIND_READ_ONLY_*` flags use the DSV as it was created. `Close`
+  follows Windows WARP, measured by `d3d12_render_pass_test` (the host D3D12 runtime on an RTX 5070 Ti, for the cases
+  #1062's review probed, gave the same codes): `E_INVALIDARG` after `EndRenderPass` with no pass open, after a second
+  `EndRenderPass` and after a nested `BeginRenderPass`; `E_FAIL` with a pass left open, with more than eight render
+  targets, for a pass on a bundle or a compute list, and after a call D3D12 forbids inside a pass:
+  `OMSetRenderTargets`, `ClearRenderTargetView`, `ClearDepthStencilView`, `CopyResource`, `CopyTextureRegion`,
+  `CopyBufferRegion`, `DiscardResource`, `ResolveSubresource`, `ResolveSubresourceRegion` and `Dispatch` (not
+  recorded). A resource barrier inside a pass is allowed. WARP ignores a `CLEAR` with no descriptor and a `RESOLVE`
+  with no source, and so does the layer; a target count with no array faults inside WARP, and the layer makes the list
+  invalid. Not measured, so not checked: the other calls D3D12 forbids inside a pass (the UAV clears, `CopyTiles`,
+  `ExecuteIndirect`, queries). `d3d12_render_pass_test` runs eight cases on the Vulkan-backed device and on WARP
+  through the D3D12 API and compares the bytes read back and the `Close` results, and checks WARP against the values
+  written in the test: CLEAR and PRESERVE on two colour targets, also with `ALLOW_UAV_WRITES`; a
+  `D32_FLOAT_S8X24_UINT` target whose depth plane is cleared with stencil PRESERVEd, then whose stencil is cleared
+  with depth NO_ACCESS; a 4x MSAA colour target CLEARed and RESOLVEd into a 2 x 2 rectangle at (1, 1) of a larger
+  target; a 4x MSAA `D32_FLOAT` depth RESOLVE (MIN, named `R32_FLOAT`, skipped on a Vulkan device without MIN depth
+  resolves); the colour pass suspended in one list and resumed in the next of one `ExecuteCommandLists` (the resumed
+  part's red CLEAR does not run, and the suspended part's RESOLVE, aimed at (0, 0), leaves no trace); and the 29
+  `Close` cases above. On an AMD Radeon RX 6600 (AMD Windows driver 26.6.4, Windows 10 19045) all eight pass, also
+  with `LEONIDA_VK_VALIDATION=1` (0 errors); on `main` before this change all eight fail, and each of seven targeted
+  mutations of the emulation fails one. Draws inside a pass are not in the test: they use the same per-draw rendering
+  scope as after `OMSetRenderTargets`. A Tier 1 path, mapping the accesses to `vkCmdBeginRendering` load/store ops and
+  resolve attachments, is not needed for correctness and is left out.
 
 ### 4.4 Fences, queues and frames in flight
 
