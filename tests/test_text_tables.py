@@ -352,6 +352,31 @@ class TestCli(unittest.TestCase):
             self.assertFalse([f for f in os.listdir(tmp) if f.startswith(".text_tables-")],
                              "staging and backup files must not be left behind")
 
+    def test_stage_cleanup_restores_write_mode_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.mkdir(src)
+            write(os.path.join(src, "conv.pso"), CONV)
+            tables = os.path.join(tmp, "tables.csv")
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def track_chmod(p, mode, **kwargs):
+                chmod_calls.append((p, mode))
+                return real_chmod(p, mode, **kwargs)
+
+            def failing_replace(source, dest):
+                if ".text_tables-" in source:
+                    raise OSError("replace failed")
+                return os.replace(source, dest)
+
+            with patch.object(T.os, "replace", side_effect=failing_replace), \
+                 patch.object(T.os, "chmod", side_effect=track_chmod):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    rc = T.main([src, "--tables", tables])
+                self.assertEqual(rc, 2)
+            self.assertTrue(any(mode == 0o600 for p, mode in chmod_calls))
+
     def test_report_cannot_replace_the_carve_index(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "carve")
