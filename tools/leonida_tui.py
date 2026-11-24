@@ -604,34 +604,39 @@ def unregister_live_process(proc) -> None:
         _live_procs.discard(proc)
 
 
+def _terminate_process(proc) -> None:
+    """Terminate one subprocess (including its Windows child tree)."""
+    try:
+        if proc.poll() is not None:
+            return
+        if os.name == "nt" and getattr(proc, "pid", None):
+            # PowerShell → cmd → cmake is a tree; terminate() alone leaves grandchildren.
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        else:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    except (OSError, ProcessLookupError, AttributeError):
+        try:
+            proc.kill()
+        except (OSError, ProcessLookupError, AttributeError):
+            pass
+
+
 def kill_live_processes() -> None:
     """Terminate every subprocess started for board capture (including Windows child trees)."""
     with _live_procs_lock:
         procs = list(_live_procs)
         _live_procs.clear()
     for proc in procs:
-        try:
-            if proc.poll() is not None:
-                continue
-            if os.name == "nt" and proc.pid:
-                # PowerShell → cmd → cmake is a tree; terminate() alone leaves grandchildren.
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-            else:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-        except (OSError, ProcessLookupError, AttributeError):
-            try:
-                proc.kill()
-            except (OSError, ProcessLookupError, AttributeError):
-                pass
+        _terminate_process(proc)
 
 
 def run_setup(default_jobs: int | None = None, default_overlap: bool = True) -> SetupConfig:
@@ -1150,7 +1155,7 @@ def pump_process(proc, stage: str | None, board: LeonidaBoard | None) -> int:
         try:
             return proc.wait(timeout=0.5)
         except subprocess.TimeoutExpired:
-            kill_live_processes()
+            _terminate_process(proc)
             try:
                 return proc.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
