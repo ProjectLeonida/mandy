@@ -11,6 +11,7 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 | AMD Radeon RX 7900 GRE (RDNA3, gfx1100), subgroup 32..64 | AMD proprietary 26.11.2 (LLPC), Vulkan 1.4.359, Windows 11 x64 | `5d74c27` | 247/247 translated and valid | run via run_gpu_tests.py | 225/241 passed, 16 skipped | none | [#166](https://github.com/ItsNotRexed/Leonida/issues/166#issuecomment-7115041436) |
 | Intel Graphics (Meteor Lake, Xe-LPG), subgroup 8..32 | ANV, Mesa 26.2.7, Vulkan 1.4.354, Fedora 45 | `84347bb` | 279/279 translated and valid | 177/219 pass, 40 skipped, 2 failed | 194/248 passed, 52 skipped (native); 226/248 passed, 20 skipped (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31; pass with #98) | [local note](../gpu-test-results/IntelMTL.txt) |
 | Apple M5 Pro (16-core GPU, Metal 4), subgroup 4..32 | MoltenVK 1.4.2 (Homebrew), Vulkan 1.4.357, macOS 26.7.3 (25G342) | `d42773d07` | 280/280 translated and valid | 175/219 pass, 39 skipped, 5 failed | 183/248 passed, 61 skipped, 4 failed (native); 214/248 passed, 30 skipped, 4 failed (`LEONIDA_W64_EMULATE=1`) | `cs_fma_fused` (known row), `cs_imgload_tfe`, `cs_imgload_d16_tfe` (pass with #291), `ps_imgatomic` flake (#543) | [local note](../gpu-test-results/AppleM5Pro.txt) |
+| AMD Radeon RX 6750 GRE 12GB (RDNA2, gfx1031), subgroup 32..64 | AMD proprietary 32.0.21045.16010, Vulkan 1.4.315, Windows 10 22H2 | `51f3160` | 281/281 translated and valid | 214/220 pass, 4 skipped, 2 failed | 230/249 passed, 17 skipped, 2 failed (native and emulated alike) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31) | — |
 
 ## AMD Radeon RX 9070 GRE — 2026-11-23
 
@@ -124,3 +125,46 @@ distribution's build. The full record, with every skip by name, is in
 
 AI-assisted (Claude Code): built `main` at `84347bb`, ran `build.py`, `check.py` and `run_gpu_tests.py` native and
 emulated on this GPU, and reran the tfe pair with #98 applied.
+
+## AMD Radeon RX 6750 GRE 12GB — 2026-11-24
+
+```
+GPU:        AMD Radeon RX 6750 GRE 12GB (RDNA2 / gfx1031, Navi 22, PCI 1002:73DF), subgroup 32..64
+Driver:     AMD proprietary 32.0.21045.16010 (Adrenalin, 2026-10-16), Vulkan driver 2.0.353, API 1.4.315
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64)
+OS:         Windows 10 Pro 22H2, 10.0.19045; Ryzen 5 5600X, 32 GB
+Commit:     51f31609236a952badeb9c9aba9efc2a6e4dc2ff (main, 2026-11-24)
+Tools:      llvm-mc 21.1.8 (Ubuntu llvm-21 under WSL, LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"),
+            SPIRV-Tools v2026.4 (Vulkan SDK), CMake 3.31.6 + Ninja, MSVC 19.44.35230.0, Python 3.12.10
+build.py:   281 shaders: 281 translated, 281 pass spirv-val
+            wave64 VS/PS/GS on 32-wide subgroups: tier A: 11, tier B: 8, tier C: 13
+            not built (need a DXBC container with signatures): ms_clip, ms_f16_pack, ms_tri, ms_v5_workgroup,
+            ms_w64x_ballot, ms_wave_info_s3
+check.py:   214 of 220 pass, 4 skipped, 2 failed
+run_gpu_tests.py: 258 shaders: 258 translated, 258 pass spirv-val
+            native:                230/249 passed, 17 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1: 230/249 passed, 17 skipped, 2 failed
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe: `r32 uint (uint view): 0 bad` but
+            `r32 sint (sint view): 64 bad, texel(5,3) = 2071` in both runs. Same signature as #31; the Radeon
+            660M and Apple M5 Pro entries record both passing with #291, the Intel MTL one with #98. Not a new
+            failure and not specific to this GPU.
+Skipped:    17 in run_gpu_tests.py: cs_buf_counter, cs_buf_typed, cs_m4_fill, cs_m4_indirect, ps_live_width,
+            ps_m15, ps_m2, ps_m2_array, ps_m2_literal, ps_m2_uoff, ps_m3, ps_m3_post, ps_m3_query,
+            ps_w64x_readlane, vs_m15, vs_m2, vs_m3 (the documented "run by d3d12_*_test" cases, plus
+            ps_w64x_readlane: this device cannot require a 64-wide fragment subgroup, subgroup 32..64).
+            4 in check.py: ms_v5_workgroup, ms_w64x_ballot, ms_wave_info_s3 (mesh fixtures build.py does not
+            build), ps_w64x_readlane.
+```
+
+Setup: `scripts\build_runtime.ps1` (CMake 3.31.6 + Ninja, MSVC 19.44.35230.0), which rebuilt all 755 targets at this
+commit; the GPU test programs came from the same build. Implicit Vulkan layers disabled with
+`VK_LOADER_LAYERS_DISABLE='~implicit~'`, `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1`. Every compute,
+mesh, geometry and pixel case that did not skip and did not fail was exact; the only non-exact lines are the two
+`cs_imgload*_tfe` sint-view reads above.
+
+Separate finding, not part of this test run: `vk_pipeline_check.exe` on the full 26,503-shader corpus crashes
+inside `amdvlk64.dll` while compiling the `#PS_Textured_Eight_e0305669_Wrapped~*` family — access violation
+`0xc0000005` at module offset `0x7e4326`, AMD driver 32.0.21045.16010 — after checkpointing 2,000 of 26,503
+pipelines (the saved cache stayed valid). Worth its own issue; the GPU tests here never create that pipeline.
+
+AI-assisted: yes (an agent ran the builds and tests on this machine; the GPU's owner reviewed the entry).
