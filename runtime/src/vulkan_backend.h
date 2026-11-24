@@ -1195,7 +1195,8 @@ public:
             }
         }
         {
-            std::lock_guard lock(storage_mutex_);  // a buffer destroyed before any submission is not filled
+            std::lock_guard lock(storage_mutex_);  // a buffer or storage image destroyed before any submission is not initialized
+            storage_pending_.erase(id);
             std::erase_if(zero_pending_, [id](const PendingZero& zero) { return zero.id == id; });
         }
         if (img) {
