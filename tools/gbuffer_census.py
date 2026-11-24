@@ -138,8 +138,16 @@ def main():
     parser.add_argument("--payload-coverage", action="store_true",
                         help="count distinct whole FSSM payloads per cohort and histogram their indexed entry counts")
     args = parser.parse_args()
-    print(json.dumps(census(args.dxbc, args.disasm or args.dxbc / "disasm",
-                            payload_coverage=args.payload_coverage), indent=2, sort_keys=True))
+    if not (args.dxbc / "index.json").is_file():
+        print(f"ERROR: {args.dxbc}: not a shader_carve folder (no index.json)", file=sys.stderr)
+        return 2
+    try:
+        report = census(args.dxbc, args.disasm or args.dxbc / "disasm", payload_coverage=args.payload_coverage)
+    except (OSError, ValueError) as e:  # an unreadable or malformed index or listing: one line, not a traceback
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
@@ -147,4 +155,4 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, ValueError, OSError):
         pass
-    main()
+    sys.exit(main())

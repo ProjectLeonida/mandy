@@ -1,7 +1,9 @@
 """tools/navmesh_cell_fit.py: the grid fit, its chance baseline and the per-cell summary, on synthetic vertices.
 No game files."""
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
@@ -45,6 +47,22 @@ class CellFit(unittest.TestCase):
         self.assertIn(cf.nd.joaat_cs("Wagon01.yft"), h)
         self.assertEqual(len(h), 4)
 
+
+class WrongInput(unittest.TestCase):
+    """A file that is not an RPF archive is one ERROR line and exit 2, not a traceback."""
+
+    TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "navmesh_cell_fit.py")
+
+    def test_not_an_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            junk = os.path.join(tmp, "junk.rpf")
+            with open(junk, "wb") as f:
+                f.write(b"\x00" * 4096)
+            p = subprocess.run([sys.executable, "-I", self.TOOL, junk], capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
+        self.assertTrue(p.stderr.startswith("ERROR: "), p.stderr)
 
 if __name__ == "__main__":
     unittest.main()

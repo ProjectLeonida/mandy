@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -66,6 +67,32 @@ class CensusTests(unittest.TestCase):
             self.assertEqual(group["coverage"]["listing_incomplete"], 1)
             self.assertEqual(group["observed_exports"], {"mrt0 compr": 2})
 
+
+class WrongInputTests(unittest.TestCase):
+    """A path that is not a shader_carve folder is one ERROR line and exit 2, not a traceback."""
+
+    TOOL = Path(__file__).resolve().parents[1] / "tools" / "gbuffer_census.py"
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", str(self.TOOL), *args],
+                              capture_output=True, text=True, timeout=120)
+
+    def test_a_file_instead_of_the_carve_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = Path(tmp) / "blob.bin"
+            blob.write_bytes(bytes(range(256)))
+            p = self.run_tool(str(blob))
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertIn("not a shader_carve folder", p.stderr)
+
+    def test_a_malformed_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "index.json").write_bytes(b"\xe6 not json")
+            p = self.run_tool(tmp)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertTrue(p.stderr.startswith("ERROR: "), p.stderr)
 
 if __name__ == "__main__":
     unittest.main()
