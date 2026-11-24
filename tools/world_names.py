@@ -38,6 +38,7 @@ import tempfile
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
@@ -630,7 +631,12 @@ def _write_json(path: str, data: dict) -> None:
         with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(data, handle, indent=1, sort_keys=True)
             handle.write("\n")
-        os.replace(tmp, path)
+        os.chmod(tmp, published_mode(path))
+        try:
+            os.replace(tmp, path)
+        except BaseException:
+            os.chmod(tmp, 0o600)
+            raise
 
 
 def main(argv=None) -> int:
