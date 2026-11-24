@@ -7253,7 +7253,18 @@ class Gen:
         args = [dict(a) for a in ins["args"]]
         if len(args) < 2:
             raise Unsupported("DPP operands")
-        if args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
+        # A VOPC compare in DPP form (docs/design.md, "DPP on a VOPC compare"): src0 comes through the same lane
+        # selection and the result is a mask bit, not a VGPR. Only the forms where every lane writes its bit are
+        # taken: what a lane that DPP leaves unwritten does to its VCC bit is not measured.
+        compare = base_op(ins["op"]).startswith("v_cmp")
+        if compare:
+            if base_op(ins["op"]).startswith("v_cmpx"):
+                raise Unsupported("DPP on v_cmpx")
+            if len(args) != 3:
+                raise Unsupported("DPP compare operands")
+            if row_mask != 0xF or bank_mask != 0xF or not (dpp8 is not None or bound):
+                raise Unsupported("DPP compare with lanes that keep their mask bit")
+        elif args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
             raise Unsupported("DPP destination")
         if args[1].get("n", 1) != 1:
             raise Unsupported("DPP 64-bit source")
@@ -7432,6 +7443,10 @@ class Gen:
             write = self.tmp()
             self.emit(f"{write} = OpLogicalAnd %bool {enabled} {src_ok}")
         args[1] = {"k": "ssa", "v": src0}
+        if compare:
+            # Every lane is enabled and an invalid source reads 0 (checked above), so the compare's own EXEC guard
+            # is the only one: the mask write is the plain compare's.
+            return self._insn({**ins, "args": args})
         previous = self.dpp_guard
         self.dpp_guard = write
         try:

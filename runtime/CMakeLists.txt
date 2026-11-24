@@ -129,11 +129,13 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       add_library(leonida_xma2_decoder STATIC IMPORTED)
       # Link Rust's Windows SDK dependencies. CMake's C++ target selects its own CRT
       # (/MD or /MDd); the C ABI keeps allocation and deallocation on the same side.
+      # synchronization: Rust's std imports WaitOnAddress and WakeByAddress*, which MSVC's
+      # default libraries cover but clang-cl with an xwin SDK does not (lld-link: undefined symbol).
       set_target_properties(leonida_xma2_decoder PROPERTIES
         IMPORTED_LOCATION ${_xma_lib}
         INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder
         INTERFACE_COMPILE_DEFINITIONS LEONIDA_HAVE_XMA2_DECODER=1
-        INTERFACE_LINK_LIBRARIES "kernel32;ntdll;userenv;ws2_32;dbghelp")
+        INTERFACE_LINK_LIBRARIES "kernel32;ntdll;userenv;ws2_32;dbghelp;synchronization")
     else()
       message(WARNING "cargo build of runtime/xma_decoder failed: XMA voices will be silent")
     endif()
@@ -836,6 +838,17 @@ if(BUILD_TESTING)
     set_target_properties(tiny_game_fixed PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
+    # The same game built with /GA, as a title's executable is: its thread_local reads go to module TLS index 0
+    # without _tls_index, and under gta6rt index 0 is gta6rt.exe's own (docs/boot_leads.md, BL-1).
+    add_executable(tiny_game_ga test/fixtures/tiny_game.cpp)
+    target_link_libraries(tiny_game_ga PRIVATE xgameruntime_stub)
+    target_compile_definitions(tiny_game_ga PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(tiny_game_ga PRIVATE /W4 /permissive- /utf-8 /EHsc /GA)
+    # /GA can remove the _tls_index reference that pulls in the CRT TLS directory.
+    target_link_options(tiny_game_ga PRIVATE /INCLUDE:_tls_used)
+    set_target_properties(tiny_game_ga PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+    )
     add_executable(tiny_game_exit_code_test test/tiny_game_exit_code_test.cpp)
     target_compile_definitions(tiny_game_exit_code_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_game_exit_code_test PRIVATE /W4 /permissive- /utf-8)
@@ -1326,10 +1339,12 @@ if(BUILD_TESTING)
   add_test(NAME active_input COMMAND active_input_test)
   if(WIN32 AND TARGET gameinput_test)
     add_test(NAME gameinput COMMAND gameinput_test)
+    add_test(NAME gameinput_script COMMAND gameinput_test --input-script)
   elseif(TARGET gta6rt)
     # Built without SDL3: listed as "Not Run (Disabled)" so it is visible that the shim was not tested.
     add_test(NAME gameinput COMMAND ${CMAKE_COMMAND} -E echo "built without SDL3")
-    set_tests_properties(gameinput PROPERTIES DISABLED TRUE)
+    add_test(NAME gameinput_script COMMAND ${CMAKE_COMMAND} -E echo "built without SDL3")
+    set_tests_properties(gameinput gameinput_script PROPERTIES DISABLED TRUE)
   endif()
   if(WIN32 AND TARGET gta6rt AND TARGET tiny_game)
     if(TARGET tiny_argv_default_a AND NOT CMAKE_CROSSCOMPILING)
@@ -1384,6 +1399,9 @@ if(BUILD_TESTING)
     # The opt-in checks, one test each: thread_local on the game's threads, a C++ exception caught inside the image.
     add_test(NAME run_tiny_game_tls COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 tls)
     add_test(NAME run_tiny_game_eh COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 eh)
+    # The /GA build of the same game: thread_local on the entry thread and on a thread it starts, through index-0
+    # reads, while index 0 holds gta6rt.exe's own TLS.
+    add_test(NAME run_tiny_game_ga_tls COMMAND gta6rt --run $<TARGET_FILE:tiny_game_ga> -- hello 42 tls)
     # BUILD-1457: the stack a game thread gets. gta6rt_stack reads SizeOfStackReserve from the built loader (nothing
     # is run); run_tiny_game_stack asks Windows, on the entry thread and on a thread created with dwStackSize 0.
     add_test(NAME gta6rt_stack COMMAND "${CMAKE_COMMAND}"
@@ -1477,6 +1495,11 @@ if(TARGET Vulkan::Headers)
   add_executable(vk_shader_fma_test test/vk_shader_fma_test.cpp)
   target_link_libraries(vk_shader_fma_test PRIVATE Vulkan::Headers)
   add_test(NAME vk_shader_fma COMMAND vk_shader_fma_test)
+  add_executable(xdxr_builder_validation_test test/xdxr_builder_validation_test.cpp)
+  target_link_libraries(xdxr_builder_validation_test PRIVATE Vulkan::Headers)
+  if(BUILD_TESTING)
+    add_test(NAME xdxr_builder_validation COMMAND xdxr_builder_validation_test)
+  endif()
   # LEONIDA_VK_DEVICE names the GPU in every harness (docs/testing.md, "Choosing the GPU"): a filter that matches no
   # device fails the run in vk_descriptor_bench and vk_sandbox too, instead of testing another GPU (TEST-1141).
   find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -1677,6 +1700,18 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vk_buffer_registration_oom COMMAND vk_buffer_registration_oom_test)
   endif()
+  # VulkanContext::replay_.host_at resolves aliasing placed upload buffers across the full requested byte range.
+  add_executable(vk_host_at_aliasing_test test/vk_host_at_aliasing_test.cpp)
+  target_link_libraries(vk_host_at_aliasing_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_host_at_aliasing_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    if(MSVC)
+      target_compile_options(vk_host_at_aliasing_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_host_at_aliasing COMMAND vk_host_at_aliasing_test)
+  endif()
   # CPU-only: ScratchBuffers chunk alignment, retire/collect/forget, and spare cap (runtime/src/vulkan_scratch.h).
   add_executable(vulkan_scratch_test test/vulkan_scratch_test.cpp)
   target_link_libraries(vulkan_scratch_test PRIVATE Vulkan::Headers)
@@ -1687,6 +1722,22 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vulkan_scratch COMMAND vulkan_scratch_test)
   endif()
   if(WIN32 AND BUILD_TESTING)
+    # Whole title-region import capability: one host allocation bound as a BDA buffer. The default case uses the
+    # measured 185 MiB placeholder size. A machine that cannot import (no importable usage/handle, an import-budget
+    # refusal, no host memory to commit it) exits 77 and is a reported capability result.
+    add_executable(vk_host_region_import_test test/vk_host_region_import_test.cpp)
+    target_link_libraries(vk_host_region_import_test PRIVATE Vulkan::Headers)
+    target_compile_definitions(vk_host_region_import_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    if(MSVC)
+      target_compile_options(vk_host_region_import_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME vk_host_region_import COMMAND vk_host_region_import_test 185)
+    set_tests_properties(vk_host_region_import PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # The same import under VK_LAYER_KHRONOS_validation with synchronization validation. The binary exits 77 when
+    # the layer is not installed, so a machine without the SDK skips this variant instead of failing it.
+    add_test(NAME vk_host_region_import_validation COMMAND vk_host_region_import_test 185)
+    set_tests_properties(vk_host_region_import_validation PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120
+                         ENVIRONMENT "LEONIDA_VK_VALIDATION=1;VK_VALIDATE_SYNC=1")
     # VulkanPresenter tracker lock / failed-submit rollback and capture-buffer WAW synchronization.
     add_executable(vk_presenter_sync_test test/vk_presenter_sync_test.cpp)
     target_link_libraries(vk_presenter_sync_test PRIVATE Vulkan::Headers user32)
@@ -2007,6 +2058,13 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_b5g5r5a1_uav_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_b5g5r5a1_uav COMMAND d3d12_b5g5r5a1_uav_test)
     set_tests_properties(d3d12_b5g5r5a1_uav PROPERTIES SKIP_RETURN_CODE 77)
+    # B4G4R4A4 render targets as RGBA8 images where no 4444 format is a colour attachment (NVIDIA).
+    add_executable(d3d12_b4g4r4a4_target_test test/d3d12_b4g4r4a4_target_test.cpp)
+    target_link_libraries(d3d12_b4g4r4a4_target_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_b4g4r4a4_target_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_b4g4r4a4_target_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_b4g4r4a4_target COMMAND d3d12_b4g4r4a4_target_test)
+    set_tests_properties(d3d12_b4g4r4a4_target PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(d3d12_srgb_uav_test test/d3d12_srgb_uav_test.cpp)
     target_link_libraries(d3d12_srgb_uav_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_srgb_uav_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -2200,6 +2258,17 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_indirect_dispatch_count PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
+    # The cache vk_pipeline_check saves has to hit on the runtime's device (docs/pipeline_check.md): the test
+    # compiles an embedded synthetic compute shader through a same-named copy of the checker, then creates the
+    # same pipeline on the runtime's device from the saved cache.
+    add_executable(pipeline_cache_seed_test test/pipeline_cache_seed_test.cpp)
+    add_dependencies(pipeline_cache_seed_test vk_pipeline_check)
+    target_link_libraries(pipeline_cache_seed_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(pipeline_cache_seed_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(pipeline_cache_seed_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME pipeline_cache_seed COMMAND pipeline_cache_seed_test $<TARGET_FILE:vk_pipeline_check>)
+    set_tests_properties(pipeline_cache_seed PROPERTIES SKIP_RETURN_CODE 77)
+
     # What Close returns after one recorded call, against WARP; today's differences are listed in the test.
     add_executable(d3d12_close_parity_test test/d3d12_close_parity_test.cpp)
     target_link_libraries(d3d12_close_parity_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
@@ -2247,7 +2316,8 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_rgb9e5_rtv COMMAND d3d12_clear_test --rgb9e5)
     set_tests_properties(d3d12_rgb9e5_rtv PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME d3d12_clear COMMAND d3d12_clear_test)
-    set_tests_properties(d3d12_clear PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME d3d12_clear_restricted_depth COMMAND d3d12_clear_test --restricted-depth)
+    set_tests_properties(d3d12_clear d3d12_clear_restricted_depth PROPERTIES SKIP_RETURN_CODE 77)
 
     # Synthetic typed-view readbacks against Windows WARP; run explicitly on a Vulkan GPU.
     add_executable(d3d12_typeless_rtv_test test/d3d12_typeless_rtv_test.cpp)
@@ -2360,6 +2430,15 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_resource_desc_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_resource_desc_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_resource_desc COMMAND d3d12_resource_desc_test)
+
+    # Multi-viewport & multi-scissor rendering (RSSetViewports / RSSetScissorRects 1..16) against host D3D12.
+    add_executable(d3d12_multi_viewport_test test/d3d12_multi_viewport_test.cpp)
+    target_link_libraries(d3d12_multi_viewport_test PRIVATE gta6rt_d3d12_com d3d12 dxgi dxguid)
+    target_compile_definitions(d3d12_multi_viewport_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_multi_viewport_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_multi_viewport COMMAND d3d12_multi_viewport_test)
+    set_tests_properties(d3d12_multi_viewport PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
     set_tests_properties(d3d12_resource_desc PROPERTIES SKIP_RETURN_CODE 77)
 
     # Typeless depth-stencil textures without ALLOW_DEPTH_STENCIL, copied from a depth buffer, against WARP.

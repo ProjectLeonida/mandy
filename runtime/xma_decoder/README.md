@@ -14,7 +14,9 @@ cargo test --manifest-path runtime/xma_decoder/Cargo.toml --locked
 cargo build --manifest-path runtime/xma_decoder/Cargo.toml --locked
 ```
 
-The C++ smoke test is run by the xma2-decoder workflow with MSVC. It links ws2_32, userenv, and ntdll for Rust's Windows standard library.
+The `xma2-decoder` workflow builds and runs the C++ smoke test with MSVC. It links `ws2_32.lib`, `userenv.lib`,
+`ntdll.lib`, and `synchronization.lib` for Rust's Windows standard library. `synchronization.lib` resolves the
+`WaitOnAddress` and `WakeByAddress*` imports in the Rust static library.
 
 ## Use in the runtime
 

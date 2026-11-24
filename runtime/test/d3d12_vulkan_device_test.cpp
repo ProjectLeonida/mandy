@@ -2449,9 +2449,11 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         o13.InvertedViewportHeightFlipsYSupported || o13.InvertedViewportDepthFlipsZSupported ||
         o13.TextureCopyBetweenDimensionsSupported || o13.AlphaBlendFactorSupported)
         fail("OPTIONS13 unexpected support");
-    if (o14.AdvancedTextureOpsSupported || o14.WriteableMSAATexturesSupported ||
-        o14.IndependentFrontAndBackStencilRefMaskSupported)
+    if (o14.AdvancedTextureOpsSupported || o14.WriteableMSAATexturesSupported)
         fail("OPTIONS14 unexpected support");
+    // DEPTH_STENCIL2's per-face masks and OMSetFrontAndBackStencilRef (d3d12_state_sweep_test draws them).
+    if (!o14.IndependentFrontAndBackStencilRefMaskSupported)
+        fail("OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported should be TRUE");
     if (o15.TriangleFanSupported || o15.DynamicIndexBufferStripCutSupported) fail("OPTIONS15 unexpected support");
     if (o16.DynamicDepthBiasSupported || o16.GPUUploadHeapSupported) fail("OPTIONS16 unexpected support");
     if (o18.RenderPassesValid) fail("OPTIONS18 unexpected support");

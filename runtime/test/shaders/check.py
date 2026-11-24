@@ -125,7 +125,9 @@ CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_ops", [100, 10, 11, 12, 13, 14, 15, 16]),
           ("cs_dpp_bound", [10, 10, 11, 12, 13, 14, 15, 16]),
           ("cs_dpp_bank", [0xffffffff, 0xfffffffe, 0xfffffffd, 0xfffffffc, 7, 7, 7, 7]),
-          ("cs_dpp_fi", [1, 2, 3, 0x7777, 5, 6, 7, 0x7777])]
+          ("cs_dpp_fi", [1, 2, 3, 0x7777, 5, 6, 7, 0x7777]),
+          # a VOPC compare with a DPP src0: 1 for the pair compare, 2 for the dpp8 one (cs_dpp_cmp.asm header)
+          ("cs_dpp_cmp", [3, 2, 3, 2, 1, 0, 1, 0])]
 WAVE32_DUMPS += tuple(n for n, _ in CS_DPP)
 WAVE32_LANE_DUMPS += tuple(n for n, _ in CS_DPP)
 CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),

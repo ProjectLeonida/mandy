@@ -579,8 +579,13 @@ void check_run_time_load() {
         char tiny[2] = {'x', 'x'};
         used = 99;
         check(reinterpret_cast<GetPath>(slot(pls, 4))(pls, 2, tiny, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
-                  used == 0,
-              "slot 4 refuses a buffer that is too small");
+                  used == size && tiny[0] == 'x' && tiny[1] == 'x',
+              "slot 4 refuses a buffer that is too small, reports the size it needs and leaves the buffer alone");
+        check(reinterpret_cast<GetPath>(slot(pls, 4))(pls, size - 1, path.data(), &used) ==
+                      HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && used == size,
+              "slot 4 reports the size for a buffer one byte short");
+        check(reinterpret_cast<GetPath>(slot(pls, 4))(pls, 2, tiny, nullptr) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+              "slot 4 tolerates a null used pointer on a short buffer");
 
         {
             std::ofstream cache_file(folder / L"cache.bin", std::ios::binary);

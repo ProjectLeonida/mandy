@@ -171,6 +171,9 @@ public:
     std::uint64_t presents() const { return presents_; }
     // Frames shown mid-scan because of ImmediateThresholdPercent.
     std::uint64_t immediate_presents() const { return pacer_.immediate_presents(); }
+    // Frame-time percentiles, mean drift against target interval, and origin-to-present latency (BL-6).
+    leonida::FramePacingSummary pacing_summary() const { return pacer_.pacing_summary(); }
+    void log_pacing_summary() const;
 
 private:
     // PresentX without its `[d3d12-trace]` line.

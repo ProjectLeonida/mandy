@@ -18,6 +18,7 @@
 
 #include <crtdbg.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -98,6 +99,7 @@ struct Mock {
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
     D3D12_COMMAND_QUEUE_DESC queue_desc;  // device: the description of its last CreateCommandQueue (slot 8)
+    D3D_FEATURE_LEVEL max_level;  // device: the highest level FEATURE_LEVELS reports (0: the query is refused)
 };
 
 Mock g_pool[256];
@@ -235,6 +237,18 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 return a1;  // a struct-returning method hands the buffer's address back in RAX
             }
             case 50: copy_array(m, slot, a3, a2); break;                    // (flags, count, objects, fence, value)
+            case 13: {  // CheckFeatureSupport(feature, data, size): FEATURE_LEVELS only, as the host answers it
+                auto* levels = reinterpret_cast<D3D12_FEATURE_DATA_FEATURE_LEVELS*>(a2);
+                if (static_cast<std::uint32_t>(a1) != D3D12_FEATURE_FEATURE_LEVELS || !levels || !m->max_level ||
+                    static_cast<std::uint32_t>(a3) != sizeof(*levels) || !levels->pFeatureLevelsRequested)
+                    return static_cast<std::uint32_t>(E_INVALIDARG);
+                D3D_FEATURE_LEVEL best = D3D_FEATURE_LEVEL(0);
+                for (UINT i = 0; i < levels->NumFeatureLevels; ++i)
+                    if (levels->pFeatureLevelsRequested[i] <= m->max_level)
+                        best = std::max(best, levels->pFeatureLevelsRequested[i]);
+                levels->MaxSupportedFeatureLevel = best;
+                return static_cast<std::uint32_t>(best ? S_OK : DXGI_ERROR_UNSUPPORTED);
+            }
             default: break;
         }
         return S_OK;
@@ -401,6 +415,67 @@ void* make_fence(void* device, const IID& iid = kFenceIid) {
 
 unsigned long release(void* object) {
     return static_cast<unsigned long>(raw(object, 2));
+}
+
+// ---- 0. The host device's feature-level floor (BL-2) ----
+
+// A host D3D12CreateDevice whose adapter tops out at g_host_max: a minimum above it is refused with E_INVALIDARG,
+// as on a host that tops out at 11_x, and g_host_mode makes it fail outright or succeed with no object.
+D3D_FEATURE_LEVEL g_host_max = D3D_FEATURE_LEVEL_12_1;
+D3D_FEATURE_LEVEL g_host_minimum = D3D_FEATURE_LEVEL(0);  // the minimum the last call asked for
+enum class HostMode { normal, fail, no_object } g_host_mode = HostMode::normal;
+
+HRESULT WINAPI fake_create_device(IUnknown*, D3D_FEATURE_LEVEL minimum, REFIID riid, void** out) {
+    g_host_minimum = minimum;
+    if (!out) return S_FALSE;
+    *out = nullptr;
+    if (g_host_mode == HostMode::fail) return DXGI_ERROR_UNSUPPORTED;
+    if (g_host_mode == HostMode::no_object) return S_OK;
+    if (minimum > g_host_max) return E_INVALIDARG;
+    Mock* m = new_mock(Kind::device);
+    m->max_level = g_host_max;
+    return mock_query(m, &riid, out);
+}
+
+int check_host_device_floor() {
+    g_label = "xs_proxy_mock host feature level";
+    EXPECT(xs::kHostDeviceFloor == D3D_FEATURE_LEVEL_11_0);
+    const D3D_FEATURE_LEVEL tops[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_12_0,
+                                      D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_2};
+    for (const D3D_FEATURE_LEVEL top : tops) {
+        g_host_max = top;
+        // The floor 12_0 the host path used to ask for refuses the adapters that top out at 11_x.
+        void* old = nullptr;
+        const HRESULT old_hr = fake_create_device(nullptr, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), &old);
+        EXPECT(FAILED(old_hr) == (top < D3D_FEATURE_LEVEL_12_0));
+        if (old) release(old);
+
+        ID3D12Device* real = nullptr;
+        EXPECT(xs::create_host_device(&fake_create_device, nullptr, &real) == S_OK && real);
+        EXPECT(g_host_minimum == D3D_FEATURE_LEVEL_11_0);
+        EXPECT(xs::max_feature_level(real) == top);   // the device keeps its highest level
+        // The title asks the device it gets (the Xbox-ABI proxy) through slot 13, CheckFeatureSupport.
+        void* device = nullptr;
+        EXPECT(SUCCEEDED(xs::create_device_proxy(real, __uuidof(ID3D12Device), &device)) && device);
+        D3D12_FEATURE_DATA_FEATURE_LEVELS levels{UINT(std::size(tops)), tops, D3D_FEATURE_LEVEL(0)};
+        EXPECT(hr_of(raw(device, 13, D3D12_FEATURE_FEATURE_LEVELS, word(&levels), sizeof(levels))) == S_OK);
+        EXPECT(levels.MaxSupportedFeatureLevel == top);
+        release(device);
+    }
+    g_host_max = D3D_FEATURE_LEVEL_12_1;
+    ID3D12Device* real = reinterpret_cast<ID3D12Device*>(&g_host_max);   // must be cleared on every failure
+    EXPECT(xs::create_host_device(nullptr, nullptr, &real) == E_NOTIMPL && !real);
+    EXPECT(xs::create_host_device(&fake_create_device, nullptr, nullptr) == E_POINTER);
+    g_host_mode = HostMode::fail;
+    real = reinterpret_cast<ID3D12Device*>(&g_host_max);
+    EXPECT(xs::create_host_device(&fake_create_device, nullptr, &real) == DXGI_ERROR_UNSUPPORTED && !real);
+    g_host_mode = HostMode::no_object;
+    real = reinterpret_cast<ID3D12Device*>(&g_host_max);
+    EXPECT(xs::create_host_device(&fake_create_device, nullptr, &real) == E_FAIL && !real);
+    g_host_mode = HostMode::normal;
+    EXPECT(xs::max_feature_level(nullptr) == D3D_FEATURE_LEVEL(0));
+    g_label = "xs_proxy_mock";
+    return 0;
 }
 
 // ---- 1. Device interface levels ----
@@ -1714,7 +1789,7 @@ int main(int argc, char** argv) {
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
-    if (check_tail(true) || check_levels() || check_slot48() || check_fence1() || check_create_failures() || check_open_shared() ||
+    if (check_tail(true) || check_host_device_floor() || check_levels() || check_slot48() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list() ||
         check_custom_heap_properties() ||
         check_resource_allocation_info() || check_slot70() || check_committed_resource3_x() ||

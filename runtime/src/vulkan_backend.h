@@ -101,6 +101,7 @@ struct VulkanDeviceFunctions {
     X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets)            \
     X(vkCmdPushConstants) X(vkCmdDispatch)                                                                     \
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
+    X(vkCmdSetViewportWithCount) X(vkCmdSetScissorWithCount)                                                   \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements)   \
@@ -987,6 +988,8 @@ public:
         replay_.bind_index_buffer = vk.vkCmdBindIndexBuffer;
         replay_.set_viewport = vk.vkCmdSetViewport;
         replay_.set_scissor = vk.vkCmdSetScissor;
+        replay_.set_viewport_with_count = vk.vkCmdSetViewportWithCount;
+        replay_.set_scissor_with_count = vk.vkCmdSetScissorWithCount;
         replay_.set_primitive_topology = vk.vkCmdSetPrimitiveTopology;
         replay_.set_primitive_restart_enable = vk.vkCmdSetPrimitiveRestartEnable;
         replay_.set_stencil_reference = vk.vkCmdSetStencilReference;
@@ -1017,7 +1020,7 @@ public:
         // binding's host pointer is null on DEFAULT and READBACK heaps, whose mapped bytes the GPU can write.
         replay_.host_at = [this](std::uint64_t va, std::uint64_t bytes, const std::uint8_t*& host) {
             BufferVaIndex<ResourceId>::Hit hit{};
-            if (!buffer_vas_.find(va, hit)) return HostReadStatus::absent;
+            if (!buffer_vas_.find(va, hit, bytes)) return HostReadStatus::absent;
             const ResourceBinding* b = resolve(hit.id);
             if (!b) return HostReadStatus::absent;
             if (!b->host) return HostReadStatus::not_cpu_written;
@@ -1283,6 +1286,11 @@ public:
         replay_.zero_buffer = buffer;
         replay_.zero_offset = offset;
         replay_.zero_size = size;
+    }
+
+    void set_depth_range_unrestricted(bool enabled) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.depth_range_unrestricted = enabled;
     }
 
     // Physical-device COLOR_ATTACHMENT format check for reinterpreted UAV clears.
@@ -2552,6 +2560,18 @@ private:
         if (context_.vk.vkBeginCommandBuffer(command_buffer, &begin) != VK_SUCCESS) {
             discard();
             return ReplayResult::unsupported;
+        }
+        // D3D12 ends every ExecuteCommandLists with all its work done and its writes visible to the next one on the
+        // queue (implicit state decay relies on it), and a list may then touch the same memory without a barrier:
+        // two submissions copying into one buffer, say. Vulkan orders submissions on a queue only by what their
+        // barriers say, so this one starts with a full memory barrier against everything submitted before it
+        // (synchronization validation: WRITE_AFTER_WRITE between vk_queue_test's back-to-back copies).
+        if (context_.vk.vkCmdPipelineBarrier) {  // a mocked context may leave it out
+            VkMemoryBarrier full{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            full.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            full.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &full, 0, nullptr, 0, nullptr);
         }
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
         if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
