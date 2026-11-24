@@ -55,6 +55,8 @@ def iter_banks(fh, size: int):
         if not (buf and base <= pos < base + WINDOW):
             fh.seek(pos)
             base, buf = pos, fh.read(WINDOW + 3)    # +3: a magic that starts in this window and ends in the next
+            if len(buf) < min(WINDOW + 3, size - pos):
+                raise OSError("short read while scanning bank headers")
         bank, at = None, buf.find(b"ADAT", pos - base)
         while 0 <= at < WINDOW:
             bank = parse_adat_at_file(fh, base + at, size)
@@ -70,7 +72,10 @@ def iter_banks(fh, size: int):
 
 def _read(fh, at: int, size: int) -> bytes:
     fh.seek(at)
-    return fh.read(size)
+    data = fh.read(size)
+    if len(data) != size:
+        raise OSError("short read while reading bank data")
+    return data
 
 
 def music_frames(fh, base: int, mus, data) -> dict:
