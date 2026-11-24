@@ -412,7 +412,13 @@ bool guarded_move(void* destination, const void* source, size_t size) {
 #else
     // MinGW has no __try/__except: pre-validate both ranges with VirtualQuery instead. An unreadable source page
     // or an unwritable destination page returns false, which is what the access violation would have meant; a
-    // use-after-check race can still fault, as with any probe-then-use check.
+    // use-after-check race can still fault, as with any probe-then-use check. PAGE_GUARD is deliberately not
+    // rejected: the MSVC __except filter above catches only EXCEPTION_ACCESS_VIOLATION, so a guard-page touch
+    // propagates to vectored handlers, and dstorage_test's hold_on_guard VEH depends on the copy reaching the
+    // guard page (rejecting it turned the held copy into E_DSTORAGE_ACCESS_VIOLATION with no handler invoked).
+    // An unhandled guard touch crashes here exactly as it would in the MSVC build. Reserve-only first-touch
+    // ranges still return false without invoking a handler (see touch_pages in file_system.cpp): only a real
+    // fault can commit them, which needs SEH.
     auto range_ok = [](const void* base, size_t len, bool write) {
         if (len == 0) return true;
         const uintptr_t start = reinterpret_cast<uintptr_t>(base);
@@ -422,7 +428,7 @@ bool guarded_move(void* destination, const void* source, size_t size) {
         for (uintptr_t page = start & ~uintptr_t{0xfff};; page += 0x1000) {
             MEMORY_BASIC_INFORMATION mbi{};
             if (VirtualQuery(reinterpret_cast<LPCVOID>(page), &mbi, sizeof(mbi)) == 0 ||
-                mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+                mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_NOACCESS)) {
                 return false;
             }
             const DWORD access = mbi.Protect & 0xff;
