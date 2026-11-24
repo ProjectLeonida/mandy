@@ -59,6 +59,16 @@ void write_file(const fs::path& path, const void* data, size_t size) {
     if (!f) throw std::runtime_error("cannot write " + path.string());
 }
 
+// A UTF-8 literal widened for _wputenv_s, which is how this test sets a variable the loader reads with getenv_s.
+std::wstring utf16(const char* narrow) {
+    const int needed = MultiByteToWideChar(CP_UTF8, 0, narrow, -1, nullptr, 0);
+    if (needed <= 0) throw std::runtime_error("cannot widen a test value");
+    std::wstring out(static_cast<size_t>(needed), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, narrow, -1, out.data(), needed);
+    out.resize(static_cast<size_t>(needed - 1));  // the NUL MultiByteToWideChar wrote for the -1 length
+    return out;
+}
+
 struct ImageInfo {
     uint64_t image_base = 0;
     uint32_t size_of_image = 0;
@@ -681,6 +691,63 @@ void test_inherited_reservation() {
     if (saved_length && saved_length < 64) SetEnvironmentVariableW(br::kVariable, saved);
 }
 
+// LEONIDA_GUEST_POKE (pe_loader.cpp) writes bytes into the mapped image while it is still writable. The fixture's own
+// bytes are read back from the mapped image: a poke naming this module changes them, and a poke that names another
+// module, is malformed, or would run past the end of the image changes nothing. The rva used is the last eight bytes
+// of the image, inside the mapped block and past the code and data the fixture runs.
+void test_guest_poke(const fs::path& dll) {
+    const auto info = read_image_info(dll);
+    check(info.size_of_image >= 64, "the fixture image has room for the poke test");
+    if (info.size_of_image < 64) return;
+    const uint32_t tail = info.size_of_image - 8;
+
+    auto read_mapped = [&](const wchar_t* spec) {
+        _wputenv_s(L"LEONIDA_GUEST_POKE", spec != nullptr ? spec : L"");
+        rt::Loader loader(dll.parent_path());
+        const rt::Module& m = loader.load(dll);
+        check(m.size == info.size_of_image, "load(dll) with a poke still maps the fixture's SizeOfImage");
+        return std::vector<uint8_t>(m.base + tail, m.base + tail + 8);
+    };
+
+    const std::vector<uint8_t> untouched = read_mapped(nullptr);
+    char spec[256] = {};
+
+    std::snprintf(spec, sizeof spec, "tiny_dll.dll:%x:deadbeefcafebabe", tail);
+    const std::vector<uint8_t> with_extension = read_mapped(utf16(spec).c_str());
+    check(with_extension == std::vector<uint8_t>{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe},
+          "LEONIDA_GUEST_POKE=<module>.dll:<rva>:<hex> writes those bytes into the mapped image");
+
+    std::snprintf(spec, sizeof spec, "TINY_DLL:0x%x:0102", tail);
+    const std::vector<uint8_t> without_extension = read_mapped(utf16(spec).c_str());
+    check(without_extension.size() == 8 && untouched.size() == 8 && without_extension[0] == 0x01 &&
+              without_extension[1] == 0x02 && without_extension[2] == untouched[2] &&
+              without_extension[7] == untouched[7],
+          "the module may be named without its extension and in upper case, and a 0x prefix is accepted");
+
+    std::snprintf(spec, sizeof spec, "tiny_dll.dll:%x:11223344;tiny_dll:0x%x:55667788", tail, tail + 4);
+    const std::vector<uint8_t> two_entries = read_mapped(utf16(spec).c_str());
+    check(two_entries == std::vector<uint8_t>{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88},
+          "several entries separated by ';' are applied in one variable");
+
+    std::snprintf(spec, sizeof spec, "other.dll:%x:ffffffffffffffff", tail);
+    check(read_mapped(utf16(spec).c_str()) == untouched, "a poke naming another module does not touch this image");
+
+    std::snprintf(spec, sizeof spec, "tiny_dll.dll:%x:001122334455667788", info.size_of_image - 3);
+    check(read_mapped(utf16(spec).c_str()) == untouched,
+          "a poke that would run past the end of the image is ignored and changes nothing");
+
+    bool all_bad_changed_nothing = true;
+    for (const char* bad : {"tiny_dll", "tiny_dll:", "tiny_dll:zz:90", "tiny_dll:10:z", "tiny_dll:10:9",
+                            "tiny_dll:10:", ":10:90", "tiny_dll:ffffff00ff:9090"}) {
+        std::snprintf(spec, sizeof spec, "%s", bad);
+        if (read_mapped(utf16(spec).c_str()) != untouched) all_bad_changed_nothing = false;
+    }
+    check(all_bad_changed_nothing, "a malformed entry is reported and changes nothing");
+
+    _wputenv_s(L"LEONIDA_GUEST_POKE", L"");
+    check(read_mapped(nullptr) == untouched, "no LEONIDA_GUEST_POKE writes nothing");
+}
+
 void print_result() {
     if (g_failures == 0)
         std::printf("\npe_loader_test: OK (%d checks)\n", g_checks);
@@ -714,6 +781,7 @@ int main(int argc, char** argv) {
         test_forced_relocation(dll);
         test_rejections(dll, temp.path);
         test_unwind(dll);
+        test_guest_poke(dll);
         test_inherited_reservation();
         test_optional_package();
         test_optional_package_unwind();

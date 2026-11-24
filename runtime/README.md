@@ -180,6 +180,19 @@ directory; the loader's log names the image, the number of rewritten reads and t
 `LEONIDA_TLS_GA_PATCH=0` to turn the rewrite off, for measuring what the image does without it; any other
 value, or leaving it unset, keeps it on.
 
+`LEONIDA_GUEST_POKE` writes bytes into a mapped image while it is still writable, for measuring a value
+the image's own data decides - a byte a boot stops on - without a debugger attached. Entries are separated
+by `;` and each one is `<module>:<rva>:<hex bytes>`: the module is its basename, matched case-insensitively
+with or without its extension, the rva is 1 to 8 hexadecimal digits with or without a `0x` prefix, and the
+bytes are 1 to 256 hexadecimal pairs. It is applied after relocations, so an rva means what the caller
+wrote, and before the TLS template is copied and the sections are protected, so everything that runs
+afterwards - the image's own code, its TLS copies - sees the poked value, and no `VirtualProtect` dance is
+needed. One target is not stable: a poke on the image's own TLS index slot is overwritten a few lines later, when
+the loader writes the index there. Every mapped image is offered the entries, a run-time `LoadLibrary` included; the loader's log names
+the image and how many bytes went where. An entry that does not parse, or that would run past the end of the
+image, is reported and changes nothing. It is a measuring tool, not a compatibility feature: it does not make
+a title work, and nothing reads it in a normal run.
+
 Current limits, by design:
 
 - `load()` runs no image code. Static TLS is data, not code. The TLS index helper is the runtime's own

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -527,6 +528,123 @@ bool ga_tls_patch_enabled() {
     char v[8] = {};
     size_t n = 0;
     return !(getenv_s(&n, v, "LEONIDA_TLS_GA_PATCH") == 0 && n == 2 && v[0] == '0');
+}
+
+// LEONIDA_GUEST_POKE writes bytes into a mapped image while it is still writable, so something the image's own data
+// decides (a value a boot stops on) can be changed from outside while a boot is studied, with no debugger attached.
+// One variable, entries separated by ';', each `<module>:<rva>:<hex bytes>`: the module is its basename, matched
+// case-insensitively with or without its extension; the rva is 1 to 8 hex digits, with or without a 0x prefix; the
+// bytes are 1 to 256 hex pairs. An entry that does not parse, or that would run past the end of the image, is
+// reported and changes nothing. With the variable unset this reads nothing and writes nothing.
+struct GuestPoke {
+    std::string module;
+    uint32_t rva = 0;
+    std::vector<uint8_t> bytes;
+};
+
+bool hex_digit(char c, unsigned& out) {
+    if (c >= '0' && c <= '9') out = static_cast<unsigned>(c - '0');
+    else if (c >= 'a' && c <= 'f') out = static_cast<unsigned>(c - 'a') + 10u;
+    else if (c >= 'A' && c <= 'F') out = static_cast<unsigned>(c - 'A') + 10u;
+    else return false;
+    return true;
+}
+
+bool parse_guest_poke(const std::string& entry, GuestPoke& out, std::string& why) {
+    const size_t first = entry.find(':');
+    const size_t second = first == std::string::npos ? std::string::npos : entry.find(':', first + 1);
+    if (first == std::string::npos || second == std::string::npos) {
+        why = "expected <module>:<rva>:<hex bytes>";
+        return false;
+    }
+    out.module = entry.substr(0, first);
+    if (out.module.empty()) {
+        why = "the module name is empty";
+        return false;
+    }
+    std::string rva_text = entry.substr(first + 1, second - first - 1);
+    if (rva_text.size() > 2 && rva_text[0] == '0' && (rva_text[1] == 'x' || rva_text[1] == 'X'))
+        rva_text.erase(0, 2);
+    if (rva_text.empty() || rva_text.size() > 8) {
+        why = "the rva must be 1 to 8 hexadecimal digits";
+        return false;
+    }
+    uint32_t rva = 0;
+    for (const char c : rva_text) {
+        unsigned digit = 0;
+        if (!hex_digit(c, digit)) {
+            why = "the rva is not hexadecimal";
+            return false;
+        }
+        rva = rva * 16u + digit;
+    }
+    out.rva = rva;
+    const std::string byte_text = entry.substr(second + 1);
+    if (byte_text.empty() || byte_text.size() % 2 || byte_text.size() > 512) {
+        why = "the bytes must be 1 to 256 hexadecimal pairs";
+        return false;
+    }
+    for (size_t i = 0; i < byte_text.size(); i += 2) {
+        unsigned high = 0, low = 0;
+        if (!hex_digit(byte_text[i], high) || !hex_digit(byte_text[i + 1], low)) {
+            why = "a byte is not two hexadecimal digits";
+            return false;
+        }
+        out.bytes.push_back(static_cast<uint8_t>(high * 16u + low));
+    }
+    return true;
+}
+
+// The module a poke names, as the loader records it (`path.filename()`): the extension may be left out, because the
+// point of naming a module here is naming the image someone is studying.
+bool names_module(const GuestPoke& poke, const Module& m) {
+    const std::string want = lower(poke.module);
+    const std::string have = lower(m.name);
+    if (want == have) return true;
+    const size_t dot = have.rfind('.');
+    return dot != std::string::npos && want == have.substr(0, dot);
+}
+
+size_t write_guest_pokes(Module& m) {
+    char spec[2048] = {};
+    size_t length = 0;
+    const int got = getenv_s(&length, spec, sizeof(spec), "LEONIDA_GUEST_POKE");
+    if (got == ERANGE) {
+        std::fprintf(stderr, "[rt] loader: LEONIDA_GUEST_POKE longer than %d characters was ignored\n",
+                     static_cast<int>(sizeof(spec)));
+        return 0;
+    }
+    if (got != 0 || length == 0) return 0;
+    // getenv_s reports the length with the terminating NUL counted; the entries are the text, not its terminator.
+    std::string all(spec, length);
+    while (!all.empty() && all.back() == '\0') all.pop_back();
+    size_t written = 0;
+    for (size_t pos = 0; pos <= all.size();) {
+        const size_t end = all.find(';', pos);
+        const std::string entry = all.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        pos = end == std::string::npos ? all.size() + 1 : end + 1;
+        if (entry.empty()) continue;  // a repeated or trailing ';' is not an entry
+        GuestPoke poke;
+        std::string why;
+        if (!parse_guest_poke(entry, poke, why)) {
+            std::fprintf(stderr, "[rt] loader: LEONIDA_GUEST_POKE entry \"%s\" ignored: %s\n", entry.c_str(),
+                         why.c_str());
+            continue;
+        }
+        if (!names_module(poke, m)) continue;
+        if (poke.rva > m.size || poke.bytes.size() > m.size - poke.rva) {
+            std::fprintf(stderr,
+                         "[rt] loader: %s: LEONIDA_GUEST_POKE rva %#x with %zu bytes does not fit in its %u-byte "
+                         "image\n",
+                         m.name.c_str(), poke.rva, poke.bytes.size(), m.size);
+            continue;
+        }
+        std::memcpy(m.base + poke.rva, poke.bytes.data(), poke.bytes.size());
+        written += poke.bytes.size();
+        std::fprintf(stderr, "[rt] loader: %s: LEONIDA_GUEST_POKE wrote %zu bytes at rva %#x\n", m.name.c_str(),
+                     poke.bytes.size(), poke.rva);
+    }
+    return written;
 }
 
 void uninstall_thread_block(Module& m) {
@@ -1496,6 +1614,11 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     }
     // The TLS directory and the exception directory hold virtual addresses, so both are read after relocation. TLS is
     // installed here, before bind_imports can return control to the caller and before any image code can run.
+    // LEONIDA_GUEST_POKE is applied before this: after relocations (so an rva means what the caller wrote) and before
+    // the TLS template is copied, so a poke reads as the image's own value to everything that runs after this point.
+    // A poke on the image's TLS index slot is the exception: initialize_tls writes the index there a few lines after
+    // this one. Poking the template range is deliberate - the per-thread copies carry the poked bytes.
+    write_guest_pokes(*m);
     initialize_tls(*m);
     parse_exports(*m);
     return *m;
