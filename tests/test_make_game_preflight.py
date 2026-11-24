@@ -7,6 +7,7 @@ Tests use synthetic manifests, mock environments, and isolated temporary directo
 fast, and contain zero game data.
 """
 from collections import namedtuple
+import ctypes
 import functools
 import io
 import json
@@ -903,10 +904,31 @@ class GameDiscoveryTest(unittest.TestCase):
         if os.name != "nt":
             self.assertEqual(folders, [])
             return
-        self.assertEqual(len(folders), len(make_game.KNOWN_FOLDERS))
+        self.assertLessEqual(len(folders), len(make_game.KNOWN_FOLDERS))
         for folder in folders:
             self.assertTrue(os.path.isabs(folder), folder)
         self.assertEqual(make_game.known_folders(), folders)   # the shell's buffers are freed, calls repeat cleanly
+
+    def test_known_folders_keeps_available_paths_when_a_lookup_fails(self):
+        expected = [r"C:\Redirected\Downloads", r"C:\Redirected\Documents"]
+        first, last = [ctypes.create_unicode_buffer(path) for path in expected]
+        addresses = [ctypes.addressof(first), None, ctypes.addressof(last)]
+        results = iter(addresses)
+
+        def get_path(_folder, _flags, _token, path):
+            address = next(results)
+            if address is None:
+                return -1
+            ctypes.cast(path, ctypes.POINTER(ctypes.c_void_p)).contents.value = address
+            return 0
+
+        shell32, ole32 = mock.Mock(), mock.Mock()
+        shell32.SHGetKnownFolderPath.side_effect = get_path
+        libraries = {"shell32": shell32, "ole32": ole32}
+        with mock.patch.object(ctypes, "WinDLL", side_effect=libraries.__getitem__, create=True), \
+             mock.patch.object(os, "name", "nt"):
+            self.assertEqual(make_game.known_folders(), expected)
+        self.assertEqual([call.args[0].value for call in ole32.CoTaskMemFree.call_args_list], addresses)
 
     def test_find_searches_below_rejected_folder_with_config(self):
         outer = os.path.join(self.desktop, "Backup")
