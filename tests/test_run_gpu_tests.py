@@ -106,6 +106,48 @@ class PackedFormatFixture(unittest.TestCase):
             self.assertIn(problem, output.getvalue())
             self.assertIn("0/1 passed", output.getvalue())
 
+    def test_filtered_suite_runs_cs_fmt_all(self):
+        name = "cs_fmt_all"
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+
+            def translate(_cmd, env=None, gpu=True):
+                (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                return 0, ""
+
+            problem = "word 293: expected 0x80007c01, got 0x80007e00"
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate),
+                  patch.object(rgt, "fmt_all_test", return_value=problem) as check_fmt,
+                  contextlib.redirect_stdout(output)):
+                self.assertEqual(rgt.run_suite(args, tmp), 1)
+            check_fmt.assert_called_once()
+            self.assertIn(problem, output.getvalue())
+            self.assertIn("0/1 passed", output.getvalue())
+
+    def test_filtered_suite_passes_cs_fmt_all_with_a_word_count(self):
+        name = "cs_fmt_all"
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+
+            def translate(_cmd, env=None, gpu=True):
+                (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                return 0, ""
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate),
+                  patch.object(rgt, "fmt_all_test", return_value="") as check_fmt,
+                  contextlib.redirect_stdout(output)):
+                self.assertEqual(rgt.run_suite(args, tmp), 0)
+            check_fmt.assert_called_once()
+            self.assertIn(f"{len(rgt.FMT_ALL_WORDS)}/{len(rgt.FMT_ALL_WORDS)} dumped words exact",
+                          output.getvalue())
+            self.assertIn("1/1 passed", output.getvalue())
+
 
 class FrameReadbackTest(unittest.TestCase):
     def test_only_a_frame_written_by_this_run_can_pass(self):
