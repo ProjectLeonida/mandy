@@ -1,0 +1,34 @@
+GPU:        NVIDIA GPU (Pascal class, 4 GB of VRAM), subgroup 32..32 (model and PCI id withheld)
+Driver:     NVIDIA 582.28 (proprietary), Vulkan device API 1.4.312
+OS:         Windows 10 Pro, 10.0.19045
+Commit:     82a2aabcc33bf296b5c2e3e4e7021fa506f8570e (main, 2026-11-24)
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools, AMDGPU target), SPIRV-Tools v2026.4,
+            CMake 4.4.5, Ninja 1.13.2, g++ 13.2.0 (Strawberry MinGW-w64 UCRT), Python 3.13, Release
+build.py:   284 shaders: 284 translated, 284 pass spirv-val
+            not built (need a DXBC container with signatures): ms_clip, ms_f16_pack, ms_tri,
+            ms_v5_workgroup, ms_w64x_ballot, ms_wave_info_s3
+check.py:   178 of 222 pass, 42 skipped, 2 failed
+run_gpu_tests.py: 284 shaders: 284 translated, 284 pass spirv-val
+            native:                 191/252 passed, 59 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  222/252 passed, 28 skipped, 2 failed
+Failed:     cs_imgload_tfe and cs_imgload_d16_tfe, both "exit 1: r32 sint (sint view): 64 bad,
+            texel(5,3) = 2071". Deterministic here: 3 of 3 isolated --filter reruns per case failed
+            with the same texel and count, in the native and the emulated path alike. Known rows,
+            not new: #31 on Intel Meteor Lake (passing there with #98) and the Apple M5 run (passing
+            with #291).
+Skipped:    Both runs: the six mesh cases (no VK_EXT_mesh_shader), five pixel cases reading
+            BaryCoordKHR (no VK_KHR_fragment_shader_barycentric: ps_bary, ps_persp_bary,
+            ps_scc_mask32, ps_uniform_branch, and ps_ij_computed, which was not translated),
+            one 64-wide fragment subgroup case, and 16 cases run by the d3d12_*_test and
+            w64_graphics.py programs. Native additionally skipped 31 cases needing a 64-wide
+            compute subgroup; the emulated run carried those.
+Notes:
+- The Vulkan test tools were built from the same commit with LEONIDA_BUILD_WINDOWS_RUNTIME=OFF
+  and LEONIDA_VULKAN_HEADERS_FETCH=ON. The separate D3D12 and w64_graphics test programs were
+  not run (the d3d12_* CMake targets need the Windows SDK d3d12.h, which this machine lacks;
+  the GPU suite below does not link them).
+- Implicit Vulkan layers disabled (VK_LOADER_LAYERS_DISABLE=~implicit~): the machine has the OBS
+  and RenderDoc implicit layers installed.
+- Wave64 VS/PS/GS on 32-wide subgroups: tier A: 11, tier B: 8, tier C: 13. Tier C is not exact there.
+- No game files were used; the suite runs its handwritten fixtures.
+- AI-assisted: OpenCode (DeepSeek V4.1 Flash) built the tools, ran the tests and prepared this report.
