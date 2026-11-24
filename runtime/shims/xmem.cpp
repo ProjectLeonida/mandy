@@ -18,6 +18,8 @@
 #include <malloc.h>
 #include <psapi.h>
 
+#include "../src/title_host_regions.h"
+
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -443,8 +445,12 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
             record_window(address, size, host_prot);
             return address;
         }
-        return placeholder_api().virtual_alloc2(GetCurrentProcess(), address, size, host_type | MEM_RESERVE, host_prot,
-                                                nullptr, 0);
+        void* const result = placeholder_api().virtual_alloc2(GetCurrentProcess(), address, size,
+                                                              host_type | MEM_RESERVE, host_prot, nullptr, 0);
+        if (result && commit) {
+            leonida::title_host_regions().register_range(reinterpret_cast<uint64_t>(result), size, 2);
+        }
+        return result;
     }
     if (new_placeholder || window) {
         void* const result = reserve_placeholder(address, size, base_granularity);
@@ -460,10 +466,18 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         MEM_EXTENDED_PARAMETER parameter{};
         parameter.Type = MemExtendedParameterAddressRequirements;
         parameter.Pointer = &requirements;
-        return placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size, host_type | MEM_RESERVE, host_prot,
-                                                &parameter, 1);
+        void* const result = placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size,
+                                                              host_type | MEM_RESERVE, host_prot, &parameter, 1);
+        if (result && commit) {
+            leonida::title_host_regions().register_range(reinterpret_cast<uint64_t>(result), size, 2);
+        }
+        return result;
     }
-    return VirtualAlloc(address, size, host_type, host_prot);
+    void* const result = VirtualAlloc(address, size, host_type, host_prot);
+    if (result && commit) {
+        leonida::title_host_regions().register_range(reinterpret_cast<uint64_t>(result), size, 2);
+    }
+    return result;
 }
 
 // With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
@@ -471,6 +485,7 @@ bool unmap_page(uintptr_t address) {
     const FaultLockExclusive lock;
     const auto it = g_mapped.find(address);
     if (it == g_mapped.end()) return true;
+    leonida::title_host_regions().unregister_range(address, kPhysicalPageSize);
     if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(address),
                                        MEM_PRESERVE_PLACEHOLDER)) {
         return false;
@@ -497,6 +512,7 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
                                                    protect, nullptr, 0);
     if (!view) return false;
     g_mapped[address] = MappedPage{page, it->second.section, it->second.offset};
+    leonida::title_host_regions().register_range(address, kPhysicalPageSize, 3);
     return true;
 }
 
@@ -812,7 +828,28 @@ constexpr DWORD kMemGraphics = 0x10000000;
 constexpr DWORD kMemTitle = 0x40000000;
 
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
-    return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
+    LPVOID const result =
+        VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
+    if (result && (allocation_type & (kMemGraphics | MEM_COMMIT)) == (kMemGraphics | MEM_COMMIT)) {
+        leonida::title_host_regions().register_range(reinterpret_cast<uint64_t>(result), size, 1);
+    }
+    return result;
+}
+
+BOOL WINAPI TitleVirtualFree(LPVOID address, SIZE_T size, DWORD free_type) {
+    if (address && (free_type & (MEM_DECOMMIT | MEM_RELEASE)) != 0) {
+        uint64_t unreg_size = size;
+        if (unreg_size == 0) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(address, &mbi, sizeof(mbi))) {
+                unreg_size = mbi.RegionSize;
+            }
+        }
+        if (unreg_size != 0) {
+            leonida::title_host_regions().unregister_range(reinterpret_cast<uint64_t>(address), unreg_size);
+        }
+    }
+    return VirtualFree(address, size, free_type);
 }
 
 }  // namespace
@@ -870,7 +907,9 @@ bool commit_physical_pages(const uint64_t* page_array, size_t count) {
 
 }
 
-#define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
+#define TITLE_VIRTUAL_ALLOC(dll) \
+    {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}, \
+    {dll, "VirtualFree", reinterpret_cast<void*>(&TitleVirtualFree)}
 
 // The classic libraries and the memory api sets a title's imports name.
 SHIM_TABLE(title_memory,
