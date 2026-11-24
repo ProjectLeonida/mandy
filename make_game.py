@@ -2495,7 +2495,86 @@ def require_translated_shaders(work: str) -> str:
     return spirv
 
 
-def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: str | None = None) -> None:
+
+PIPELINE_BATCH_TIMEOUT = 300  # seconds: a batch that takes longer than this has its in-flight modules
+
+def _run_with_timeout(args: list, timeout: float, inflight: str, skip: str,
+                      skip_all: "list[str]", timed_out_modules: "list[str]",
+                      *, log_fn=log) -> int:
+    """Run vk_pipeline_check with a wall-clock timeout per batch.
+
+    When the timeout expires (the driver compiler is stuck on one or more
+    modules), the process is killed, the modules listed in --inflight-file are
+    added to the skip list as timed-out (not crashed), and the caller continues
+    with the next batch. Uses ``run()`` so that the existing test mocks work.
+
+    Returns 0 (timed-out modules are skipped, not failed) or the real exit code
+    if the checker finishes before the deadline.
+    """
+    # run() is blocking and can't take a timeout.  We run it in a thread and
+    # wait at most ``timeout`` seconds.  If the deadline passes, we find the
+    # child process by its PID and kill it, then collect the timed-out modules
+    # from the --inflight-file that vk_pipeline_check keeps up to date.
+    result = [None]  # [exit_code]
+    exc = [None]
+
+    def worker():
+        try:
+            result[0] = run(args, check=False)
+        except SystemExit as e:
+            # run() with check=True calls fail() which does sys.exit()
+            result[0] = e.code if isinstance(e.code, int) else 1
+        except Exception as e:
+            exc[0] = e
+            result[0] = 1
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+
+    if t.is_alive():
+        # The batch is still running after ``timeout`` seconds.  Kill all
+        # vk_pipeline_check processes that share our executable.
+        log_fn(f"pipelines: batch exceeded {timeout:.0f}s, killing vk_pipeline_check "
+               f"(the in-flight modules will be skipped)")
+        _kill_checker_processes(args[0])
+        t.join(timeout=15)
+        _collect_timed_out(inflight, skip, skip_all, timed_out_modules, timeout, log_fn)
+        return 0  # timeout is a skip, not a failure
+
+    if exc[0] is not None:
+        raise exc[0]
+    return result[0] if result[0] is not None else 1
+
+
+def _kill_checker_processes(exe_path: str) -> None:
+    """Kill all processes whose executable matches the checker path."""
+    exe_name = os.path.basename(str(exe_path))
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/f", "/im", exe_name],
+                       capture_output=True, timeout=15)
+    else:
+        subprocess.run(["pkill", "-f", exe_name],
+                       capture_output=True, timeout=15)
+
+
+def _collect_timed_out(inflight: str, skip: str, skip_all: "list[str]",
+                       timed_out_modules: "list[str]", timeout: float, log_fn) -> None:
+    """After killing a timed-out vk_pipeline_check, read its inflight file and
+    add those modules to the timeout list (not the crash list)."""
+    names = read_names(inflight)
+    if names:
+        for n in names:
+            if n not in skip_all:
+                log_fn(f"pipelines: COMPILE TIMEOUT {n} (exceeded {timeout:.0f}s, skipping)")
+                timed_out_modules.append(n)
+                skip_all.append(n)
+        with open(skip, "w", encoding="utf-8", newline="\n") as f:
+            f.write("".join(n + "\n" for n in skip_all))
+
+def pipelines(work: str, out: str, jobs: "int | None" = None, *,
+              runtime_build: str | None = None,
+              max_compile_time: float = PIPELINE_BATCH_TIMEOUT) -> None:
     exe = pipeline_check_exe(runtime_build)
     if not exe and os.name == "nt":
         fail("vk_pipeline_check.exe wasn't built: run the runtime stage with the Vulkan SDK installed.")
@@ -2533,13 +2612,20 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     # exceed available memory, without starting the entire corpus again (BUILD-1030).
     names = pipeline_names(spirv) if checker_supports(exe, "--start", "--count") else []
     crashed: "list[str]" = []
+    timed_out_modules: "list[str]" = []  # modules whose driver compilation exceeded --max-compile-time
 
     def check_range(start: int = 0, count: "int | None" = None) -> int:
         selection = ["--start", str(start), "--count", str(count)] if count is not None else []
         allowed = set(names[start:start + count]) if count is not None else None
         for _ in range(PIPELINE_CRASH_RETRIES + 1):
             drop(inflight)   # a crash during setup must not inherit another process's in-flight module names
-            code = run(base + selection + (["--skip-file", skip] if crashed else []), check=False)
+            skip_all = crashed + timed_out_modules
+            args = base + selection + (["--skip-file", skip] if skip_all else [])
+            if max_compile_time > 0:
+                code = _run_with_timeout(args, max_compile_time, inflight, skip,
+                                         skip_all, timed_out_modules, log_fn=log)
+            else:
+                code = run(args, check=False)
             # Native setup failures also return 1. A finished pass writes/clears this report even when shaders
             # fail validation; setup failures return before writing it. Do not repeat setup for every batch.
             if code == 1 and not os.path.isfile(inflight):
@@ -2575,7 +2661,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
                 log(f"pipelines: {n} took vk_pipeline_check down ({exit_label(code)}); checking the rest without it")
             crashed.extend(suspects)
             with open(skip, "w", encoding="utf-8", newline="\n") as f:
-                f.write("".join(n + "\n" for n in crashed))
+                f.write("".join(n + "\n" for n in crashed + timed_out_modules))
         if crashed:
             record_crashes(out, spirv, crashed)
         fail(f"vk_pipeline_check still crashed after {PIPELINE_CRASH_RETRIES} retries; modules that took it down: "
@@ -2601,6 +2687,10 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         why = f"; {len(crashed)} module(s) took the driver down and were counted as failed (with their SPIR-V " \
               f"hashes in pipeline_crashes.json): " + ", ".join(crashed) if crashed else ""
         fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
+    if timed_out_modules:
+        log(f"pipelines: {len(timed_out_modules)} module(s) skipped (driver compilation exceeded "
+            f"--max-compile-time {max_compile_time:.0f}s): " + ", ".join(timed_out_modules[:5])
+            + (f" and {len(timed_out_modules) - 5} more" if len(timed_out_modules) > 5 else ""))
     log("pipelines: done")
 
 
@@ -2628,7 +2718,6 @@ def record_crashes(out: str, spirv: str, crashed: "list[str]") -> None:
 # 10 minutes since the last cache checkpoint, plus loading the cache). Looked up when pipelines() runs.
 PIPELINE_CRASH_RETRIES = 5
 PIPELINE_BATCH_SIZE = 500   # fresh compiler process and cache checkpoint after at most this many index entries
-
 
 def interrupted(code: int) -> bool:
     """Ctrl+C or a kill, not a crash: SIGINT/SIGTERM off Windows, STATUS_CONTROL_C_EXIT on it."""
@@ -2724,7 +2813,8 @@ def _invoke_stage(name: str, fn) -> None:
 
 def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, wav: bool, jobs: int,
                      runtime_build: str | None, emulate: bool, keep_emulated: bool,
-                     fallbacks: tuple[str, ...], overlap: bool = True) -> None:
+                     fallbacks: tuple[str, ...], overlap: bool = True,
+                     max_compile_time: float = PIPELINE_BATCH_TIMEOUT) -> None:
     """Run build stages after check. With overlap=True (default), shaders/assets/runtime share the machine and
     pipelines starts once shaders (and a selected runtime rebuild) are ready. With overlap=False, stages run in order."""
     cpu_heavy = [s for s in ("shaders", "assets") if s in stages]
@@ -2743,7 +2833,7 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
         runtime(game, out, v, runtime_build, jobs, work=work)
 
     def fn_pipelines():
-        pipelines(work, out, jobs, runtime_build=runtime_build)
+        pipelines(work, out, jobs, runtime_build=runtime_build, max_compile_time=max_compile_time)
 
     builders = {
         "shaders": fn_shaders,
@@ -2874,6 +2964,10 @@ def main() -> int:
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
                          "the shaders need (144, or 152 with --mesh-compute)")
+    ap.add_argument("--max-compile-time", type=float, default=PIPELINE_BATCH_TIMEOUT, metavar="SEC",
+                    help="pipelines: skip a module whose driver compilation exceeds SEC seconds (default %(default)s; "
+                         "0 disables). The build continues with the remaining shaders. Modules that time out are "
+                         "not counted as failures.")
     ap.add_argument("--no-tui", action="store_true",
                     help="plain console logs (default when stdout is not a TTY); skip the LEONIDA setup screen "
                          "and per-stage log view")
@@ -3006,12 +3100,14 @@ def main() -> int:
             tui_board.set_summary(f"build 0% · {', '.join(build_stages)}")
             run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
                              runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                             fallbacks=fallbacks, overlap=overlap)
+                             fallbacks=fallbacks, overlap=overlap,
+                             max_compile_time=a.max_compile_time)
             tui_board.set_summary(f"finished in {(time.time() - t0) / 60:.0f} min")
     else:
         run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
                          runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                         fallbacks=fallbacks, overlap=overlap)
+                         fallbacks=fallbacks, overlap=overlap,
+                         max_compile_time=a.max_compile_time)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 

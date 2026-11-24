@@ -289,7 +289,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
             unittest.mock.ANY, work=os.path.abspath(self.work_dir))
         manager.pipelines.assert_called_once_with(
             os.path.abspath(self.work_dir), os.path.abspath(self.out_dir), unittest.mock.ANY,
-            runtime_build=None)
+            runtime_build=None, max_compile_time=unittest.mock.ANY)
 
     def test_single_stage_execution_isolates_stages(self):
         for stage in ("shaders", "assets", "runtime", "pipelines"):
