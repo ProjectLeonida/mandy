@@ -32,7 +32,7 @@ TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
 DOT4_I8_OPCODE = 0x16         # VOP3P v_dot4_i32_i8
 PROBE = "0x00 0x00 0x81 0xbf"  # s_endpgm: the one instruction every shader ends with
-FAILED = []                    # (path, first stderr line) for shaders that produced no disassembly
+FAILED = []                    # (path, reason) for shaders that could not be read or produced no disassembly
 
 
 MC = mc_command()
@@ -300,9 +300,14 @@ def code_range(b: bytes):
     return None, end + 4 if end >= 0 else None, "scan"
 
 
-def one(path, out, mcpu, backend="llvm-mc"):
-    with open(path, "rb") as f:
-        b = f.read()
+def one(path, out, mcpu, backend="llvm-mc", failed=None):
+    target = FAILED if failed is None else failed
+    try:
+        with open(path, "rb") as f:
+            b = f.read()
+    except OSError as e:
+        target.append((path, e.strerror or str(e)))
+        return "failed"
     wave32 = fssm_header.wave_size(b) != 64
     start, end, how = code_range(b)
     if end is None:
@@ -320,7 +325,7 @@ def one(path, out, mcpu, backend="llvm-mc"):
     asm, bad, err = disasm(b[start:end], mcpu, backend=backend, wave32=wave32)
     if not asm.strip():  # a broken toolchain, not a shader: never report this as "clean"
         reason = (err.strip().splitlines() or ["no output"])[0]
-        FAILED.append((path, reason))
+        target.append((path, reason))
         return "failed"
     name = os.path.splitext(os.path.basename(path))[0]
     # Only a published listing can be reused after an interruption.
@@ -339,7 +344,7 @@ def one(path, out, mcpu, backend="llvm-mc"):
     return "clean" if bad == 0 else "invalid words"
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("--unpack-index", help="disassemble only the FSSMs listed in this unpack index")
@@ -350,7 +355,7 @@ def main():
                     help="disassembler backend: llvm-mc (default) or pure-Python RDNA2 decoder (#1901)")
     ap.add_argument("--limit", type=positive_int)
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if os.path.isfile(a.src):
         if a.unpack_index:
             ap.error("--unpack-index requires an FSSM directory")
@@ -396,15 +401,16 @@ def main():
             else:
                 pending.append(path)
         files = pending
+    failed = []
     if files:
         if a.backend == "llvm-mc":
             probe(a.mcpu)
         with ThreadPoolExecutor(a.jobs) as ex:
-            res.update(ex.map(lambda p: one(p, out, a.mcpu, backend=a.backend), files))
+            res.update(ex.map(lambda p: one(p, out, a.mcpu, backend=a.backend, failed=failed), files))
     print(f"{total} shaders -> {os.path.abspath(out)}: {dict(res)}")
-    if FAILED:
-        path, reason = FAILED[0]
-        fail(f"{len(FAILED)} shader(s) produced no disassembly, first {path}: {reason}")
+    if failed:
+        path, reason = failed[0]
+        fail(f"{len(failed)} shader(s) produced no disassembly, first {path}: {reason}")
     if not (res["clean"] or res["invalid words"] or res["reused"]):
         fail(f"no disassembly produced for {a.src}")
     if os.path.isdir(a.src) and not a.limit:
