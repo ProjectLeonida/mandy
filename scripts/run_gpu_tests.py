@@ -26,7 +26,7 @@ import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
 from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test, fmt_sint32_test,
-                   fmt_xy_xyz_test, tbuffer_store_test)
+                   fmt_all_test, fmt_xy_xyz_test, tbuffer_store_test)
 from check import compute_unsupported   # vk_compute_test's exit 77 over a feature the module needs
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
@@ -1053,6 +1053,10 @@ def run_suite(a, work: str) -> int:
             # TEST-185: xy/xyz format loads and stores, words measured natively on a Radeon 680M (the .asm header)
             problem = fmt_xy_xyz_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "128/128 dumped words exact"))
+        elif name == "cs_fmt_all":
+            # SCALED, SINT, small-float and 10:10:10:2 typed loads and stores (cs_fmt_all.asm header)
+            problem = fmt_all_test(a.build, spirv_dir, cs_env)
+            results.append((name, not problem, problem or "dumped words exact"))
         elif name == "cs_tbuffer_store":
             # tbuffer_store_format_*: the instruction's format, words measured natively on a Radeon 680M (the .asm header)
             problem = tbuffer_store_test(a.build, spirv_dir, cs_env)
