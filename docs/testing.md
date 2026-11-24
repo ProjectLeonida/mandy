@@ -2,13 +2,13 @@
 
 The GPU tests are small hand-written RDNA2 programs in `runtime/test/shaders`. They are translated to SPIR-V and run
 on your GPU, and the results are compared with what the RDNA2 hardware gives. They need no game files, and every
-result helps: post it in [#166](https://github.com/ItsNotRexed/Leonida/issues/166), one comment per GPU and driver.
+result helps: commit a file to [`gpu-test-results/`](../gpu-test-results/), one comment per GPU and driver.
 If your GPU is already covered there, testing an open pull request from the review queue in the [coordination
 issue][claims] helps more.
 
 This page collects the setup steps and the problems testers have run into so far.
 
-[claims]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+[claims]: https://github.com/ubiquitarianism/leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
 
 ## What you need
 
@@ -143,7 +143,7 @@ Write-Output "Test exit code: $LASTEXITCODE"
 ```
 
 Report the executable name, the workflow run and its commit, your GPU and driver,
-the exit code, and the test summary in [#166](https://github.com/ItsNotRexed/Leonida/issues/166).
+the exit code, and the test summary in [`gpu-test-results/`](../gpu-test-results/).
 Label it as a single-test run so the result is easy to distinguish from a full suite run.
 
 ## Run them
@@ -287,7 +287,7 @@ synthetic test shaders, CTest inventory and the path of the Windows checkout. Fr
 used by the Windows job, set `run_id` to the Actions run ID and download the artifact to `runtime/build`:
 
 ```sh
-gh run download "$run_id" --repo ItsNotRexed/Leonida --name runtime-windows --dir runtime/build
+gh run download "$run_id" --repo ubiquitarianism/leonida --name runtime-windows --dir runtime/build
 
 WINE=wine WINEPREFIX="$(mktemp -d)" WINEDLLOVERRIDES="mscoree,mshtml=" WINEDEBUG=-all \
   bash scripts/run_wine_session.sh python3 -I scripts/run_wine_tests.py \
@@ -467,7 +467,7 @@ constant `false` there instead makes the emulated `ms_tri` draw a frame byte-ide
 `ms_tri`, `ms_wave_info_s3`, `ms_w64x_ballot` and `ms_v5_workgroup` byte-identical to NVIDIA's at both widths (Mesa
 26.0.3, [measured by @TreXito](https://github.com/ItsNotRexed/Leonida/pull/3838#issuecomment-7086696759), with a 42-line reduced
 reproducer). llvmpipe is not a substitute for a result from a
-real GPU in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): it catches regressions, not hardware
+real GPU in [`gpu-test-results/`](../gpu-test-results/): it catches regressions, not hardware
 differences.
 
 ## Macs in CI
@@ -708,7 +708,7 @@ CS, 10,974 PS).
 
 ## Posting your result
 
-Use the template at the top of [#166](https://github.com/ItsNotRexed/Leonida/issues/166): GPU, driver, subgroup
+Use the template in [`gpu-test-results/`](../gpu-test-results/): GPU, driver, subgroup
 range, OS, the commit you built, the tool versions and the counts each script printed. Post counts and pass/fail
 lines only, never shaders or logs from the game. A failure that isn't in the table above gets its own issue, linked
 from your entry.
