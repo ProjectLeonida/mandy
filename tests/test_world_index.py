@@ -942,6 +942,23 @@ class WorldIndexTest(unittest.TestCase):
         # Every resource field emitted by parse_resource() for this map must have a matching CSV column.
         self.assertEqual(set(json_row) - set(fieldnames), set())
 
+    def test_staged_entity_report_restores_write_mode_on_replace_failure(self):
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(p, mode, **kwargs):
+            chmod_calls.append((str(p), mode))
+            return real_chmod(p, mode, **kwargs)
+
+        out_path = os.path.join(self.dir, "entities.jsonl")
+        with mock.patch.object(WI.os, "replace", side_effect=OSError("replace failed")), \
+             mock.patch.object(WI.os, "chmod", side_effect=track_chmod):
+            with self.assertRaisesRegex(OSError, "replace failed"):
+                with WI._staged_entity_report(out_path):
+                    pass
+
+        self.assertTrue(any(mode == 0o600 for _, mode in chmod_calls), chmod_calls)
+
 
 def setUpModule():
     # The tools' main() prints its summary JSON; keep it out of the test log (tests that check it redirect again).
