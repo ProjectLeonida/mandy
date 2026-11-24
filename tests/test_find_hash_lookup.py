@@ -85,6 +85,17 @@ class FindHashLookupTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "encrypted"):
             fhl.rank(b"\x6f\x1b\xbc\xae" * 64, [("x", 1)])
 
+    def test_a_truncated_image_is_refused_clearly(self):
+        """Buffers too short for e_lfanew, the COFF header or the section table raise ValueError, not struct.error."""
+        for buf in (b"MZ", b"MZ" + b"\x00" * 60, b"MZ" + b"\x00" * 62):
+            with self.assertRaises(ValueError, msg=f"len {len(buf)}"):
+                fhl.sections(buf)
+        full = pe(b"\x90")
+        with self.assertRaises(ValueError):
+            fhl.sections(full[:0x40 + 10])  # PE signature present, COFF header cut off
+        with self.assertRaises(ValueError):
+            fhl.sections(full[:0x154 + 20])  # section table cut off mid-record
+
     def test_cli_writes_the_report_and_fails_cleanly(self):
         data, lookup, _ = image()
         with tempfile.TemporaryDirectory() as tmp:
