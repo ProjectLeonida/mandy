@@ -1081,6 +1081,7 @@ def _write_bytes_atomic(path: str, glb_bytes: bytes) -> None:
     except BaseException:
         try:
             if tmp_path is not None:
+                os.chmod(tmp_path, 0o600)
                 os.remove(tmp_path)
         except OSError:
             pass

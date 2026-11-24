@@ -1148,6 +1148,23 @@ class TestGlbWriterMainCli(unittest.TestCase):
                 with open(obj_path, encoding="utf-8", newline="") as f:
                     self.assertEqual(f.read(), text)
 
+    def test_write_glb_cleanup_restores_write_mode_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_glb = os.path.join(tmp_dir, "out.glb")
+            prim = _simple_triangle_primitive()
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def track_chmod(p, mode, **kwargs):
+                chmod_calls.append((p, mode))
+                return real_chmod(p, mode, **kwargs)
+
+            with mock.patch("glb_writer._replace", side_effect=OSError("replace failed")), \
+                 mock.patch("glb_writer.os.chmod", side_effect=track_chmod):
+                with self.assertRaises(OSError):
+                    glb_writer.write_glb(out_glb, [prim])
+            self.assertTrue(any(mode == 0o600 for p, mode in chmod_calls))
+
 
 if __name__ == "__main__":
     unittest.main()
