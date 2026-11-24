@@ -3175,6 +3175,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 VkDeviceSize offset = 0;
                 if (!vk.buffer_at(info->dest_va, room, buffer, offset)) return ReplayResult::unresolved_resource;
                 if (room < 8 * info->sources.size()) return ReplayResult::invalid_copy;
+                if (!info->sources.empty()) {
+                    // dest_va is resolved by VA and may target a host-readable buffer; XDXR postbuild writes from compute.
+                    out.wrote_readback = true;
+                    out.readback_src_stages |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                }
             } else if (info->type == 0 && vk.write_acceleration_structures_properties &&
                        vk.resolve_acceleration_structure && vk.reset_query_pool && vk.copy_query_pool_results &&
                        vk.pipeline_barrier && vk.buffer_at && vk.prepare_khr_postbuild) {

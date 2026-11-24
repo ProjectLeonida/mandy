@@ -218,6 +218,49 @@ and `vk_presenter_sync`, `xbox_present` and `dxgi_swapchain` pass, while they fa
 compositor for those three. Six still failed with a real display: `device_proxy`, `d3d12_xs_root_signature`,
 `xdxr_build`, `d3d12_xdxr_rt`, `d3d12_present` and `d3d12_compute`.
 
+Run one after another as above, the suite takes several seconds per test, although a test started by hand takes 0.1 to
+1 second. Four settings make a local run of the cross-build much faster:
+
+```sh
+export WINEPREFIX="$HOME/.local/share/leonida-wine" WINEDEBUG=-all \
+       WINEDLLOVERRIDES="winedbg.exe=d;winemenubuilder.exe=d"
+mkdir -p "$WINEPREFIX"
+xvfb-run -a sh -c 'wineserver -p; wine wineboot -u </dev/null >/dev/null 2>&1
+                   ctest --test-dir runtime/build/windows -j 6 --timeout 120; wineserver -k'
+```
+
+Start the server before `wineboot`: `wineserver -p` does nothing while another server runs for the prefix. Run
+`wineboot` after it, with its output thrown away: the first Wine program a server runs starts the prefix's services,
+which keep that program's output open for as long as the server lives, so a first test that started them would wait
+for the end of its output until the timeout.
+
+- `wineserver -p` keeps one Wine server for the whole run; without it a new one starts for each test.
+- `winedbg.exe=d`: a test that crashes otherwise waits in Wine's debugger until its timeout.
+- `winemenubuilder.exe=d`: without it `wineboot` on a fresh prefix writes `wine-extension-*.desktop` files and the MIME
+  cache into `~/.local/share/applications`, pointing your file associations at the test prefix. Set it before the
+  prefix is first made.
+- `ctest -j 6` runs six tests at a time. The tests that share files under the temp directory (see "Known problems")
+  can then fail now and then; rerun such a failure on its own before you count it.
+
+Measured with Wine 11.22 on llvmpipe, 40 tests of a clang-cl build (`ctest -R '^(d3d12_[a-c]|vk_[a-d]|xg)'`), adding
+one setting at a time:
+
+| Settings | Seconds |
+|---|---|
+| As above: one test after another | 179 |
+| `wineserver -p` (and `wineboot` after it) | 35 |
+| and `WINEDEBUG=-all` | 35 |
+| and `winedbg.exe=d` | 35 |
+| and `ctest -j 6` | 5.6 |
+| `ctest -j 6` and the overrides, without `wineserver -p` | 18 |
+
+The kept server is most of it: a test that takes 0.05 seconds with it took about 3.4 without, the time of a server
+starting and stopping. `WINEDEBUG=-all` and `winedbg.exe=d` changed nothing here because no test crashed; with a crash,
+`winedbg.exe=d` saves the rest of that test's timeout. The full suite (about 310 tests) took about 28 minutes run one
+after another, and 67 seconds with all four settings for two devices (llvmpipe and an integrated GPU) run at the same
+time. `scripts/run_wine_tests.py` (below) does the same: 32 seconds for those 40 tests with `--jobs 1`, 6 with
+`--jobs 6`, and 19 seconds for all 312 tests with `--jobs 6`.
+
 The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `Debug` needs `--include-debug-libs`.
 `make_game.py`'s `runtime` stage makes this same build on Linux when the tools and the SDK are there (`--runtime-build
 runtime/build/windows` takes a folder made by hand like a Windows build). CMake packages are
@@ -290,7 +333,12 @@ WINE=wine WINEPREFIX="$(mktemp -d)" WINEDLLOVERRIDES="mscoree,mshtml=" WINEDEBUG
 
 The session script initializes a dedicated prefix and stops its Wine processes at exit. On a headless host,
 put `xvfb-run -a` before `bash` so prefix initialization and the tests share one virtual display. The test runner
-maps the recorded Windows drive to the Linux checkout for shaders referenced by absolute Windows paths. It prints
+maps the recorded Windows drive to the Linux checkout for shaders referenced by absolute Windows paths. It keeps one
+wineserver alive for the run and stops it at the end, and adds `winedbg.exe=d;winemenubuilder.exe=d` to each test's
+`WINEDLLOVERRIDES` (an entry of yours for the same program wins). `--jobs N` runs N tests at a time (default 1): tests
+marked `RUN_SERIAL` run alone, tests that share a `RESOURCE_LOCK` never overlap, and the verdicts are printed in the
+same order as with `--jobs 1`; the tests that share temp files can fail now and then in parallel (see "Known
+problems"). It prints
 every verdict and returns a failure status if any required test fails, skips or is missing. Check the printed
 verdicts for failures outside the required set.
 
@@ -386,23 +434,6 @@ Each line prints `ok`, a `SKIP` with its reason, or what differed. To add a fixt
 3. Add it to `EXPECT` in `tests/test_wave64_halves_fixtures.py` with the tier, reasons and idioms the translator
    should give it, and run `python -m pytest tests/test_wave64_halves_fixtures.py`.
 4. Run `w64_graphics.py` on a RADV GPU and say which GPU and Mesa version in the pull request.
-## GPUs with 128 bytes of push constants (AMD RDNA2 iGPUs on Windows, some Intel Arc drivers)
-
-The translated shaders take 144 bytes of push constants: s0..s31, then the heap base and the code base. A device whose
-`maxPushConstantsSize` is 128, Vulkan's minimum, can't take that, so the texture tests and every test drawn through
-`vk_harness` skip there (`unsupported: need 144 push constant bytes, device has 128`); `vulkaninfo` shows the limit.
-AMD's older Windows drivers report 128 on RDNA2 iGPUs (Radeon 680M on 22.40.84.06, 610M on 24.10.16.14, the Ryzen 5
-7600's iGPU on 24.10.24); 26.11.2 reports 256 on a Radeon 610M, where these tests run without the variable below.
-RADV reports more on the same chips.
-
-To run them anyway, set `LEONIDA_PC_TAIL_UBO=1` **for both `build.py` and `check.py`** (or for
-`run_gpu_tests.py`). The shaders are then translated with `--pc-tail-ubo`: s0..s31 stay in 128 push-constant bytes,
-and the heap base and code base move to a uniform block at set 1 (`docs/design.md`, "Push-constant tail as a uniform
-block"), which `vk_compute_test`, `vk_store_test`, `vk_harness`, `vk_texture_test`, `vk_sampler_test` and
-`vk_bindless_test` bind (`runtime/test/vk_pc_tail.h`). If you set it
-only for `check.py`, the shaders read the tail from push constants the programs no longer declare. `--mesh-compute`
-(`LEONIDA_MESH_COMPUTE=1`) isn't combined with it yet: its vertex shader still reads the output address from push
-constants, so those tests skip.
 
 ## GPUs with 128 bytes of push constants (AMD RDNA2 iGPUs on Windows, some Intel Arc drivers)
 
