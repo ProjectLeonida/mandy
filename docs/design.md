@@ -242,10 +242,12 @@ could overflow to inf), and pixel interpolation (`v_interp_p1/p2/mov` become fra
 location). MODE writes (`s_setreg`) model the f16/f64 rounding field, FP_ROUND[3:2], the only MODE field the
 corpus writes; other MODE writes are refused (see Known approximations).
 
-`--opt` is off by default and runs a basic-block peephole pass, `tools/spirv_opt.py`, over the emitted
+`--opt` is off by default and runs a dominator-tree SPIR-V optimizer, `tools/spirv_opt.py`, over the emitted
 module before it is assembled: register store-to-load forwarding, `OpAccessChain` CSE, dead-store
-elimination, `OpSelect`/`OpCopyObject` folding and DCE. Only Function-scope variables that do not escape
-are tracked, and a variable with any dynamic index is excluded from whole-function dead-slot elimination.
+elimination, `OpSelect`/`OpCopyObject` folding, DCE, and Scalar Replacement of Aggregates (SROA) splitting
+surviving non-escaped, statically indexed Function-scope arrays (`%vgpr[256]`, `%sgpr[128]`) into per-slot
+scalar `OpVariable`s. Only Function-scope variables that do not escape are tracked, and a variable with any
+dynamic index (`v_movrel*`/`s_movrel*`) is excluded from whole-function dead-slot elimination and SROA.
 
 Measured on five hand-written pixel fixtures from `tests/semantic/fixtures/disasm`, with every result still
 passing `spirv-val --target-env vulkan1.2`: `ps_ops` 76→33 instructions and 7,876→4,516 bytes, `ps_flat`

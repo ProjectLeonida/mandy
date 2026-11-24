@@ -566,6 +566,191 @@ class SpirvOptTests(unittest.TestCase):
         for dead in ("%dead_grp", "%dead_only", "%dead_str", "%dead_g", "%dead_id"):
             self.assertNotIn(dead, opt)
 
+    def test_sroa_splits_surviving_register_arrays_across_control_flow(self):
+        # Across a diamond branch, v8 survives in Function memory after forwarding/DCE.
+        # SROA must eliminate the monolithic %vgpr[256] / %sgpr[128] array allocas and all
+        # static OpAccessChain GEPs, emitting only the surviving scalar Function OpVariables.
+        lines = [
+            "v_mov_b32_e32 v1, 10 ; encoding: [0x8a,0x02,0x02,0x7e]",
+            "v_mov_b32_e32 v2, 20 ; encoding: [0x94,0x02,0x04,0x7e]",
+            "v_mov_b32_e32 v8, 0 ; encoding: [0x80,0x02,0x10,0x7e]",
+            "s_mov_b32 s4, 0 ; encoding: [0x80,0x03,0x84,0xbe]",
+            "s_cmp_eq_u32 s4, 0 ; encoding: [0x04,0x80,0x06,0xbf]",
+            "s_cbranch_scc0 2 ; encoding: [0x02,0x00,0x84,0xbf]",
+            "v_add_nc_u32_e32 v8, v1, v2 ; encoding: [0x01,0x05,0x10,0x4a]",
+            "s_branch 1 ; encoding: [0x01,0x00,0x82,0xbf]",
+            "v_sub_nc_u32_e32 v8, v2, v1 ; encoding: [0x02,0x03,0x10,0x4c]",
+            "v_add_nc_u32_e32 v9, v8, 5 ; encoding: [0x85,0x10,0x12,0x4a]",
+            "exp mrt0 v8, v9, v1, v2 done vm ; encoding: [0x0f,0x18,0x00,0xf8,0x08,0x09,0x01,0x02]",
+            "s_endpgm ; encoding: [0x00,0x00,0x81,0xbf]",
+        ]
+        raw = support.translate_lines("ps_opt_sroa_cf", lines)
+        opt = spirv_opt.optimize(raw)
+        _validate(opt)
+        self.assertEqual(support.mrt0_words(opt), [30, 35, 10, 20])
+        self.assertNotIn("%vgpr = OpVariable", opt)
+        self.assertNotIn("%sgpr = OpVariable", opt)
+        self.assertNotIn("OpAccessChain %_ptr_Function_uint %vgpr", opt)
+        self.assertNotIn("OpAccessChain %_ptr_Function_uint %sgpr", opt)
+        self.assertIn("%rv_8 = OpVariable %_ptr_Function_uint Function %c0", opt)
+
+    def test_sroa_preserves_dynamic_array_and_handles_edge_cases(self):
+        # 1. Runtime-dynamic v_movrels_b32 (m0 from push constant s0) keeps %vgpr array intact while still
+        #    eliminating/scalarizing statically indexed %sgpr.
+        lines = [
+            "v_mov_b32_e32 v1, 0x11111111",
+            "v_mov_b32_e32 v2, 0x22222222",
+            "s_and_b32 m0, s0, 1",
+            "v_movrels_b32_e32 v8, v1",
+            "exp mrt0 v8, v1, v2, v8 done vm",
+            "s_endpgm",
+        ]
+        raw = support.translate_lines("ps_opt_sroa_dyn", lines)
+        opt = spirv_opt.optimize(raw)
+        _validate(opt)
+        self.assertIn("%vgpr = OpVariable", opt)
+        self.assertNotIn("%sgpr = OpVariable", opt)
+        self.assertEqual(
+            support.mrt0_words(opt, push_constants=[0]),
+            [0x11111111, 0x11111111, 0x22222222, 0x11111111],
+        )
+        self.assertEqual(
+            support.mrt0_words(opt, push_constants=[1]),
+            [0x22222222, 0x11111111, 0x22222222, 0x22222222],
+        )
+
+        # 2. Signed vs unsigned constant indices with equal value (int 1 and uint 1) alias to one scalar var,
+        #    while an array with a whole-array OpLoad is NOT split, and a multi-index OpAccessChain into a
+        #    2D array splits cleanly to a per-outer-slot 1D array variable.
+        spv = "\n".join([
+            "               OpCapability Shader",
+            "               OpMemoryModel Logical GLSL450",
+            '               OpEntryPoint Fragment %main "main" %in_cond %out0',
+            "               OpExecutionMode %main OriginUpperLeft",
+            "               OpDecorate %in_cond Location 0",
+            "               OpDecorate %in_cond Flat",
+            "               OpDecorate %out0 Location 0",
+            "       %void = OpTypeVoid",
+            "       %fn_t = OpTypeFunction %void",
+            "       %bool = OpTypeBool",
+            "       %uint = OpTypeInt 32 0",
+            "        %int = OpTypeInt 32 1",
+            "     %v4uint = OpTypeVector %uint 4",
+            "         %c0 = OpConstant %uint 0",
+            "         %c1 = OpConstant %uint 1",
+            "         %c2 = OpConstant %uint 2",
+            "         %c4 = OpConstant %uint 4",
+            "         %i1 = OpConstant %int 1",
+            "       %c77  = OpConstant %uint 77",
+            "       %c99  = OpConstant %uint 99",
+            "       %arr4 = OpTypeArray %uint %c4",
+            "      %null4 = OpConstantNull %arr4",
+            "     %p_arr4 = OpTypePointer Function %arr4",
+            "       %arr2 = OpTypeArray %uint %c2",
+            "      %null2 = OpConstantNull %arr2",
+            "     %p_arr2 = OpTypePointer Function %arr2",
+            "      %arr2d = OpTypeArray %arr2 %c2",
+            "     %null2d = OpConstantNull %arr2d",
+            "    %p_arr2d = OpTypePointer Function %arr2d",
+            "      %p_u32 = OpTypePointer Function %uint",
+            "     %p_in_u = OpTypePointer Input %uint",
+            "    %p_out_4 = OpTypePointer Output %v4uint",
+            "    %in_cond = OpVariable %p_in_u Input",
+            "       %out0 = OpVariable %p_out_4 Output",
+            "       %main = OpFunction %void None %fn_t",
+            "      %entry = OpLabel",
+            "      %split = OpVariable %p_arr4 Function %null4",
+            "       %keep = OpVariable %p_arr4 Function %null4",
+            "        %mat = OpVariable %p_arr2d Function %null2d",
+            "        %cv  = OpLoad %uint %in_cond",
+            "        %nz  = OpINotEqual %bool %cv %c0",
+            "               OpSelectionMerge %merge None",
+            "               OpBranchConditional %nz %then %merge",
+            "       %then = OpLabel",
+            "        %p1u = OpAccessChain %p_u32 %split %c1",
+            "               OpStore %p1u %c99",
+            "       %pm01 = OpAccessChain %p_u32 %mat %c0 %c1",
+            "               OpStore %pm01 %c77",
+            "               OpBranch %merge",
+            "      %merge = OpLabel",
+            "        %p1i = OpAccessChain %p_u32 %split %i1",
+            "        %v1  = OpLoad %uint %p1i",
+            "       %k_all = OpLoad %arr4 %keep",
+            "        %k0  = OpCompositeExtract %uint %k_all 0",
+            "       %pm0  = OpAccessChain %p_arr2 %mat %c0",
+            "       %row0 = OpLoad %arr2 %pm0",
+            "       %m01  = OpCompositeExtract %uint %row0 1",
+            "        %vec = OpCompositeConstruct %v4uint %v1 %k0 %c0 %m01",
+            "               OpStore %out0 %vec",
+            "               OpReturn",
+            "               OpFunctionEnd",
+            "",
+        ])
+        opt2 = spirv_opt.optimize(spv)
+        _validate(opt2)
+        self.assertNotIn("%split = OpVariable", opt2)
+        self.assertIn("%sr_split_1 = OpVariable %p_u32 Function %c0", opt2)
+        self.assertNotIn("%mat = OpVariable", opt2)
+        self.assertIn("%sr_mat_0 = OpVariable %p_arr2 Function %null2", opt2)
+        self.assertIn("%keep = OpVariable %p_arr4 Function %null4", opt2)
+        # Execute via spirv_mini_interp to confirm signed/unsigned slot aliasing and multi-index 2D split.
+        self.assertEqual(support.run_fragment(opt2, inputs={"%in_cond": 1})["%out0"], (99, 0, 0, 77))
+        self.assertEqual(support.run_fragment(opt2, inputs={"%in_cond": 0})["%out0"], (0, 0, 0, 0))
+
+        # 3. Negative signed or out-of-bounds static indices must NOT be split by SROA.
+        spv_oob = "\n".join([
+            "               OpCapability Shader",
+            "               OpMemoryModel Logical GLSL450",
+            '               OpEntryPoint Fragment %main "main" %in_cond %out0',
+            "               OpExecutionMode %main OriginUpperLeft",
+            "               OpDecorate %in_cond Location 0",
+            "               OpDecorate %in_cond Flat",
+            "               OpDecorate %out0 Location 0",
+            "       %void = OpTypeVoid",
+            "       %fn_t = OpTypeFunction %void",
+            "       %bool = OpTypeBool",
+            "       %uint = OpTypeInt 32 0",
+            "        %int = OpTypeInt 32 1",
+            "     %v4uint = OpTypeVector %uint 4",
+            "         %c0 = OpConstant %uint 0",
+            "         %c4 = OpConstant %uint 4",
+            "        %im1 = OpConstant %int -1",
+            "       %arr4 = OpTypeArray %uint %c4",
+            "     %p_arr4 = OpTypePointer Function %arr4",
+            "      %p_u32 = OpTypePointer Function %uint",
+            "     %p_in_u = OpTypePointer Input %uint",
+            "    %p_out_4 = OpTypePointer Output %v4uint",
+            "    %in_cond = OpVariable %p_in_u Input",
+            "       %out0 = OpVariable %p_out_4 Output",
+            "       %main = OpFunction %void None %fn_t",
+            "      %entry = OpLabel",
+            "       %a_hi = OpVariable %p_arr4 Function",
+            "      %a_neg = OpVariable %p_arr4 Function",
+            "        %cv  = OpLoad %uint %in_cond",
+            "        %nz  = OpINotEqual %bool %cv %c0",
+            "               OpSelectionMerge %merge None",
+            "               OpBranchConditional %nz %then %merge",
+            "       %then = OpLabel",
+            "       %p_hi = OpAccessChain %p_u32 %a_hi %c4",
+            "               OpStore %p_hi %c0",
+            "      %p_neg = OpAccessChain %p_u32 %a_neg %im1",
+            "               OpStore %p_neg %c0",
+            "               OpBranch %merge",
+            "      %merge = OpLabel",
+            "      %p_hi2 = OpAccessChain %p_u32 %a_hi %c4",
+            "       %v_hi = OpLoad %uint %p_hi2",
+            "     %p_neg2 = OpAccessChain %p_u32 %a_neg %im1",
+            "      %v_neg = OpLoad %uint %p_neg2",
+            "        %vec = OpCompositeConstruct %v4uint %v_hi %v_neg %c0 %c0",
+            "               OpStore %out0 %vec",
+            "               OpReturn",
+            "               OpFunctionEnd",
+            "",
+        ])
+        opt_oob = spirv_opt.optimize(spv_oob)
+        self.assertIn("%a_hi = OpVariable %p_arr4 Function", opt_oob)
+        self.assertIn("%a_neg = OpVariable %p_arr4 Function", opt_oob)
+
 
 if __name__ == "__main__":
     unittest.main()
