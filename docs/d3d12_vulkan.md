@@ -2890,14 +2890,15 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
     (`prepare_texture_copy` in `runtime/src/vulkan_replay.h`; anything else is `unsupported` there), so accepting
     those needs only the record-time check changed; reporting the capability needs the repack as well. What the
     console's runtime reports is not measured, and no title code that depends on it has been seen.
-- `WriteBufferImmediate` (D3D-26) → `vkCmdUpdateBuffer` of 4 bytes. The address is resolved when the list is
-  executed, through `ReplayFunctions::buffer_at`: the buffer whose `ResourceBinding::va` range holds it, at
+- `WriteBufferImmediate` (D3D-26) → `vkCmdUpdateBuffer` of 4 bytes. When the Vulkan update entry point and console
+  VA arena are available, `OPTIONS3` advertises it for direct, bundle, compute and copy lists. At execution,
+  `ReplayFunctions::buffer_at` resolves the address to the buffer whose `ResourceBinding::va` range holds it, at
   `buffer_offset + (address - va)`. `VulkanContext` finds it by binary search over the buffers' VA ranges
   (`runtime/src/buffer_va_index.h`, kept in step with the registered resources); aliasing placed buffers can
   overlap: the one whose range starts closest below the address and also holds the bytes the view or write needs
-  wins, or, when none holds all of them, the one that starts closest below (`buffer_va_index_test`). These are the same fields and lookup as #291's arena, and the device fills
-  `va` once `GetGPUVirtualAddress` lands (#157/#291); until then, a list with an immediate write is refused as
-  `unresolved_resource`. `DEFAULT` adds no barrier: it is ordered like any copy, by the application's barriers.
+  wins, or, when none holds all of them, the one that starts closest below (`buffer_va_index_test`). If the write
+  cannot be resolved to four bytes in a registered buffer, replay returns `unresolved_resource`. `DEFAULT` adds no
+  barrier: it is ordered like any copy, by the application's barriers.
   `MARKER_OUT` waits for every earlier command to finish and sees its writes (`ALL_COMMANDS`/`MEMORY_WRITE` →
   `TRANSFER`/`TRANSFER_WRITE`). `MARKER_IN` only needs earlier commands to have started. Vulkan cannot express
   that, because `TOP_OF_PIPE` in a first synchronisation scope is no stage at all, so it gets an execution-only

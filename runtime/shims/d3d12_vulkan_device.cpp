@@ -13906,7 +13906,11 @@ public:
             opts->CopyQueueTimestampQueriesSupported = state_.copy_timestamps_supported();
             // Only typeless resources set VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT.
             opts->CastingFullyTypedFormatSupported = FALSE;
-            opts->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE;
+            // Replay resolves the destination through the console VA arena, then writes with vkCmdUpdateBuffer.
+            if (state_.arena.buffer && state_.context->vk.vkCmdUpdateBuffer)
+                opts->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT |
+                    D3D12_COMMAND_LIST_SUPPORT_FLAG_BUNDLE | D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE |
+                    D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY;
             opts->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
             opts->BarycentricsSupported = FALSE;
             return d3d12_trace::result(method, S_OK);

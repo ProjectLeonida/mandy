@@ -7297,6 +7297,50 @@ int main() {
             std::memcpy(&word, static_cast<const std::uint8_t*>(rb_bytes) + 16, sizeof(word));
             EXPECT(word == 0xCAFEBABEu);
             placed_rb->Unmap(0, nullptr);
+
+            D3D12_FEATURE_DATA_D3D12_OPTIONS3 options{};
+            EXPECT(SUCCEEDED(standalone->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options, sizeof(options))));
+            const auto expected_support = D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT | D3D12_COMMAND_LIST_SUPPORT_FLAG_BUNDLE |
+                                          D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE | D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY;
+            EXPECT(options.WriteBufferImmediateSupportFlags == expected_support);
+            Ref<ID3D12Fence> immediate_fence;
+            EXPECT(SUCCEEDED(standalone->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&immediate_fence.p))));
+            for (const auto type : {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                    D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY}) {
+                const auto queue_type = type == D3D12_COMMAND_LIST_TYPE_BUNDLE ? D3D12_COMMAND_LIST_TYPE_DIRECT : type;
+                const D3D12_COMMAND_QUEUE_DESC qd{queue_type};
+                Ref<ID3D12CommandQueue> immediate_queue;
+                Ref<ID3D12CommandAllocator> immediate_allocator, parent_allocator;
+                Ref<ID3D12GraphicsCommandList2> immediate_list;
+                Ref<ID3D12GraphicsCommandList> parent;
+                EXPECT(SUCCEEDED(standalone->CreateCommandQueue(&qd, IID_PPV_ARGS(&immediate_queue.p))));
+                EXPECT(SUCCEEDED(standalone->CreateCommandAllocator(type, IID_PPV_ARGS(&immediate_allocator.p))));
+                EXPECT(SUCCEEDED(standalone->CreateCommandList(0, type, immediate_allocator.p, nullptr,
+                                                               IID_PPV_ARGS(&immediate_list.p))));
+                const UINT marker = static_cast<UINT>(type) + 1;
+                const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER write{placed_rb->GetGPUVirtualAddress() + 32 + 4 * UINT(type),
+                                                                 marker};
+                immediate_list->WriteBufferImmediate(1, &write, nullptr);
+                EXPECT(SUCCEEDED(immediate_list->Close()));
+                ID3D12CommandList* commands[] = {immediate_list.p};
+                if (type == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+                    EXPECT(SUCCEEDED(standalone->CreateCommandAllocator(queue_type, IID_PPV_ARGS(&parent_allocator.p))));
+                    EXPECT(SUCCEEDED(standalone->CreateCommandList(0, queue_type, parent_allocator.p, nullptr,
+                                                                   IID_PPV_ARGS(&parent.p))));
+                    parent->ExecuteBundle(immediate_list.p);
+                    EXPECT(SUCCEEDED(parent->Close()));
+                    commands[0] = parent.p;
+                }
+                immediate_queue->ExecuteCommandLists(1, commands);
+                EXPECT(rt::d3d12::last_execute_result(immediate_queue.p) == leonida::ReplayResult::success);
+                EXPECT(SUCCEEDED(immediate_queue->Signal(immediate_fence.p, marker)) &&
+                       SUCCEEDED(immediate_fence->SetEventOnCompletion(marker, nullptr)));
+            }
+            EXPECT(SUCCEEDED(placed_rb->Map(0, nullptr, &rb_bytes)));
+            std::array<UINT, 4> markers{};
+            std::memcpy(markers.data(), static_cast<const std::uint8_t*>(rb_bytes) + 32, sizeof(markers));
+            EXPECT((markers == std::array<UINT, 4>{1, 2, 3, 4}));
+            placed_rb->Unmap(0, nullptr);
         }
 
         // The heap owns the range: releasing it puts the next heap of that size back at the same place.
