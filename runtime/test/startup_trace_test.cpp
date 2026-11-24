@@ -49,6 +49,19 @@ constexpr uint32_t kTextRva = 0x1000;
 constexpr uint32_t kCallerBase = kTextRva + 0x200;  // caller i at kCallerBase + 0x10 * i
 constexpr uint32_t kCallRetOffset = 10;             // sub rsp,0x28 (4) + call [rip+disp] (6)
 constexpr uint32_t kFaultRva = kTextRva + 0x220;
+constexpr uint32_t kNullCallRva = kTextRva + 0x240;   // calls address 0
+constexpr uint32_t kNullCallRetRva = kNullCallRva + 4;  // xor eax,eax (2) + call rax (2)
+// Jumps to address 0 (tail calls push nothing), reached two ways. The frame on top of the stack is then the one that
+// entered the jumping function, which is not the transfer that faulted:
+constexpr uint32_t kNullJumpRva = kTextRva + 0x260;        // xor ecx,ecx; jmp rcx
+constexpr uint32_t kDirectCallerRva = kTextRva + 0x280;    // call rel32 -> kNullJumpRva
+constexpr uint32_t kDirectCallerRetRva = kDirectCallerRva + 5;
+constexpr uint32_t kIndirectCallerRva = kTextRva + 0x2A0;  // lea rax,[rip+kNullJumpRva]; call rax (rax is not null)
+constexpr uint32_t kIndirectCallerRetRva = kIndirectCallerRva + 9;
+// A call through a null slot in memory, [rip+disp]: the memory form of the faulting call.
+constexpr uint32_t kNullSlotRva = kTextRva + 0x2E0;        // eight zero bytes
+constexpr uint32_t kNullMemCallRva = kTextRva + 0x2C0;     // call qword ptr [rip+kNullSlotRva]
+constexpr uint32_t kNullMemCallRetRva = kNullMemCallRva + 6;
 constexpr const char* kImageName = "trace_image.bin";
 constexpr const char* kDebugText = "leonida trace probe \"quoted\"";
 constexpr const char* kAnsiText = "caf\xe9 probe";  // 0xE9: 'é' in code page 1252, never valid alone in UTF-8
@@ -105,6 +118,38 @@ std::vector<uint8_t> make_image() {
     const uint8_t fault[] = {0x48, 0x8B, 0x04, 0x25, 0, 0, 0, 0,  // mov rax, [0]
                              0xC3};                               // ret
     std::memcpy(text + (kFaultRva - kTextRva), fault, sizeof fault);
+    // No stack adjustment: the image has no .pdata, so the handler's search unwinds this as a leaf, as the fault
+    // above. (A frame with sub rsp would hand it a wrong return address.)
+    const uint8_t null_call[] = {0x31, 0xC0,  // xor eax, eax
+                                 0xFF, 0xD0,  // call rax: a call through a null pointer
+                                 0xC3};       // ret
+    std::memcpy(text + (kNullCallRva - kTextRva), null_call, sizeof null_call);
+    const uint8_t null_jump[] = {0x31, 0xC9,   // xor ecx, ecx
+                                 0xFF, 0xE1};  // jmp rcx: a tail jump through a null pointer
+    std::memcpy(text + (kNullJumpRva - kTextRva), null_jump, sizeof null_jump);
+    {
+        uint8_t direct[] = {0xE8, 0, 0, 0, 0,  // call kNullJumpRva
+                            0xC3};             // ret
+        const int32_t rel = static_cast<int32_t>(kNullJumpRva - kDirectCallerRetRva);
+        std::memcpy(direct + 1, &rel, 4);
+        std::memcpy(text + (kDirectCallerRva - kTextRva), direct, sizeof direct);
+    }
+    {
+        uint8_t indirect[] = {0x48, 0x8D, 0x05, 0, 0, 0, 0,  // lea rax, [rip+kNullJumpRva]
+                              0xFF, 0xD0,                    // call rax: an indirect call to a real function
+                              0xC3};                         // ret
+        const int32_t rel = static_cast<int32_t>(kNullJumpRva - (kIndirectCallerRva + 7));
+        std::memcpy(indirect + 3, &rel, 4);
+        std::memcpy(text + (kIndirectCallerRva - kTextRva), indirect, sizeof indirect);
+    }
+    {
+        uint8_t mem_call[] = {0xFF, 0x15, 0, 0, 0, 0,  // call qword ptr [rip+kNullSlotRva]: the slot holds 0
+                              0xC3};                   // ret
+        const int32_t rel = static_cast<int32_t>(kNullSlotRva - kNullMemCallRetRva);
+        std::memcpy(mem_call + 2, &rel, 4);
+        std::memcpy(text + (kNullMemCallRva - kTextRva), mem_call, sizeof mem_call);
+        std::memset(text + (kNullSlotRva - kTextRva), 0, 8);
+    }
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     dir.VirtualAddress = kTextRva;
     dir.Size = 3 * sizeof(IMAGE_IMPORT_DESCRIPTOR);
@@ -224,6 +269,11 @@ void test_trace(const fs::path& dir) {
         OutputDebugStringW(L"wide probe \u00e9\u4e2d");  // its ANSI fallback must not be a second, lossy line
         OutputDebugStringA("after_wide_probe");
         check(call_faulting(m.base + kFaultRva), "the access violation reached the test's handler");
+        check(call_faulting(m.base + kNullCallRva), "the null call's access violation reached the test's handler");
+        check(call_faulting(m.base + kNullMemCallRva), "the null call through memory reached the test's handler");
+        check(call_faulting(m.base + kDirectCallerRva), "the null jump under a direct call reached the test's handler");
+        check(call_faulting(m.base + kIndirectCallerRva),
+              "the null jump under an indirect call reached the test's handler");
         rt::startup_trace::event("exit", "\"code\":0");
     }
     rt::startup_trace::close();
@@ -273,6 +323,38 @@ void test_trace(const fs::path& dir) {
     check(has(e, "\"at\":" + mod + hex_rva(kFaultRva) + "\""), "exception address is module+RVA");
     check(has(e, "\"access\":\"read\"") && has(e, "\"address\":\"0x0\""), "access kind and faulting address");
     check(has(e, "\"stack\":[" + mod.substr(0) + hex_rva(kFaultRva)), "stack starts at the faulting instruction");
+    check(!has(e, "null_call_from"), "a fault inside the image is not a null call");
+
+    // The four transfers to address 0, in the order they were made.
+    std::vector<const std::string*> nulls;
+    for (auto& l : lines)
+        if (l.find("\"kind\":\"exception\"") != std::string::npos && l.find("\"at\":\"0x0\"") != std::string::npos)
+            nulls.push_back(&l);
+    check(nulls.size() == 4, "each transfer to a null pointer is an exception at 0x0 (" +
+                                 std::to_string(nulls.size()) + ")");
+    nulls.resize(4, nullptr);
+    const std::string* n = nulls[0];
+    check(has(n, "\"access\":\"execute\""), "the null call is an execute fault");
+    check(has(n, "\"null_call_from\":" + mod + hex_rva(kNullCallRetRva) + "\""),
+          "null_call_from names the instruction after the call, as module+RVA");
+    check(has(n, "\"stack\":[" + mod + hex_rva(kNullCallRetRva)), "the null call's stack starts at its caller");
+    check(!has(n, "null_transfer_return"), "a proven null call is not also a null_transfer_return");
+
+    const std::string* mem = nulls[1];
+    check(has(mem, "\"null_call_from\":" + mod + hex_rva(kNullMemCallRetRva) + "\""),
+          "a call through a null slot in memory ([rip+disp]) is attributed too");
+
+    // A tail jump pushes nothing: the frame on the stack belongs to whoever entered the jumping function. A direct
+    // call there cannot be the transfer to null, and neither can an indirect call whose register is not null.
+    const std::string* under_direct = nulls[2];
+    check(!has(under_direct, "null_call_from"), "a null jump under a direct call is not attributed to that call");
+    check(has(under_direct, "\"null_transfer_return\":" + mod + hex_rva(kDirectCallerRetRva) + "\""),
+          "it names the frame the jumping function would return to");
+    check(has(under_direct, "\"stack\":[" + mod + hex_rva(kDirectCallerRetRva)), "and the stack still starts at that frame");
+    const std::string* under_indirect = nulls[3];
+    check(!has(under_indirect, "null_call_from"), "a null jump under an indirect call to a real function is not attributed");
+    check(has(under_indirect, "\"null_transfer_return\":" + mod + hex_rva(kIndirectCallerRetRva) + "\""),
+          "it names the frame the jumping function would return to (indirect)");
 
     check(find_line(lines, "exit") == &lines.back(), "exit comes last");
 }

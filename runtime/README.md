@@ -454,7 +454,7 @@ from the ANSI code page.
 | `file_open_failed` | a guest `CreateFileW`/`CreateFile2` that fails (at most 256 events) | `api`, `path` (as the title passed it), `error` (Win32), `caller` (module+RVA) |
 | `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over | `at` (module+RVA) |
 | `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
-| `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames) |
+| `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames); for an access violation at an address in the first 64 KiB (a transfer to a null pointer), `stack` starts at the frame on top of the stack instead of being empty, and that frame is named as `module+RVA` by one of two fields: `null_call_from` when the instruction before it is an indirect call whose operand, read with the registers of the fault, is the faulting address (the call that faulted); `null_transfer_return` otherwise (a tail jump pushes nothing, so the frame is only where that code would have returned to). A tail jump through the same register the enclosing call went through still reads as `null_call_from` |
 | `exit` / `error` | `--run` returns, or the loader throws | `code` / `what` |
 
 Every line also has `seq` and `t` (seconds since the trace opened). Addresses are `module+0xRVA` for mapped images,

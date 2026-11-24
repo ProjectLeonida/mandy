@@ -356,7 +356,10 @@ std::string module_offset(uint64_t address) {
             }
     }
     HMODULE host = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    // No module sits in the null page. Wine reads a null address with FROM_ADDRESS as "the executable" and named
+    // address 0 as exe+(0 - base); Windows fails the lookup. The guard gives both the plain hex form.
+    if (address >= 0x10000 &&
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            reinterpret_cast<LPCWSTR>(address), &host) && host) {
         // Wide, then UTF-8: the ANSI form would put code-page bytes into the trace's JSON lines.
         wchar_t path[MAX_PATH] = {};
