@@ -483,6 +483,17 @@ bool copy_queue(ID3D12Device* device, bool transfer_only = false) {
         ID3D12CommandList* lists[] = {gpu.list.p};
         gpu.queue->ExecuteCommandLists(1, lists);
         CHECK(rt::d3d12::last_execute_result(gpu.queue.p) == leonida::ReplayResult::unsupported);
+        // The same queue can still execute an ordinary transfer after rejecting the compute repack.
+        CHECK(SUCCEEDED(gpu.allocator->Reset()) && SUCCEEDED(gpu.list->Reset(gpu.allocator.p, nullptr)));
+        gpu.list->CopyBufferRegion(readback.p, 0, upload.p, footprint.Offset, sizeof(std::uint32_t));
+        CHECK(gpu.run());
+        CHECK(rt::d3d12::last_execute_result(gpu.queue.p) == leonida::ReplayResult::success);
+        CHECK(SUCCEEDED(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped))) && mapped);
+        std::uint32_t word = 0;
+        std::memcpy(&word, mapped, sizeof(word));
+        const D3D12_RANGE none{};
+        readback->Unmap(0, &none);
+        CHECK(word == value(11, 0, 0, 0, 0));
         return true;
     }
     CHECK(gpu.run());  // the texture decays to COMMON, and is promoted again as a copy source
@@ -558,36 +569,46 @@ bool refusals(ID3D12Device* device) {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool transfer_only = argc == 2 && std::strcmp(argv[1], "--transfer-only") == 0;
+    if (argc != 1 && !transfer_only) {
+        std::fprintf(stderr, "usage: d3d12_rgb96_test [--transfer-only]\n");
+        return 1;
+    }
     vktest::Device vk;
-    vk.all_queue_types = true;
+    vk.all_queue_types = transfer_only;
     const auto device_status = vk.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
+    rt::d3d12::VulkanDeviceInfo info{};
+    info.get_instance_proc = vk.instance_proc;
+    info.instance = vk.instance;
+    info.physical = vk.physical;
+    info.device = vk.device;
+    info.queue = vk.queue;
+    info.queue_family = vk.family;
+    if (transfer_only) {
+        if (vk.copy_family == vk.family ||
+            (vk.families[vk.copy_family].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))) {
+            std::printf("SKIP: no transfer-only copy family\n");
+            return 77;
+        }
+        Ref<ID3D12Device> transfer;
+        info.command_queues = vk.queues;
+        info.copy_family = vk.copy_family;
+        info.copy_queues = {vk.copy_queue};
+        // Keep conditional_rendering disabled: classification must not depend on predication setup.
+        if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&transfer.p))) ||
+            !copy_queue(transfer.p, true)) return 1;
+        std::printf("transfer-only COPY queue: RGB96 repack refused without conditional rendering\n");
+        return 0;
+    }
     unsigned compared = 0;
     {
         Ref<ID3D12Device> ours, ours_staged, host;
-        rt::d3d12::VulkanDeviceInfo info{};
-        info.get_instance_proc = vk.instance_proc;
-        info.instance = vk.instance;
-        info.physical = vk.physical;
-        info.device = vk.device;
-        info.queue = vk.queue;
-        info.queue_family = vk.family;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours_staged.p)))) return 1;
         info.host_image_copy = vk.host_image_copy;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
-        if (vk.copy_family != vk.family &&
-            !(vk.families[vk.copy_family].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))) {
-            Ref<ID3D12Device> transfer;
-            info.command_queues = vk.queues;
-            info.copy_family = vk.copy_family;
-            info.copy_queues = {vk.copy_queue};
-            // Keep conditional_rendering disabled: classification must not depend on predication setup.
-            if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&transfer.p))) ||
-                !copy_queue(transfer.p, true)) return 1;
-            std::printf("transfer-only COPY queue: RGB96 repack refused without conditional rendering\n");
-        }
         // Wine has a WARP adapter too, but it is vkd3d, whose footprints differ from Microsoft's.
         if (hostwine::host_is_wine()) return 77;  // WARP is the reference for every case
         Ref<IDXGIFactory4> factory;
