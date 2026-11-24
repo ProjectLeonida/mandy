@@ -411,11 +411,14 @@ void fill_mock_vtable(void** vtable, std::index_sequence<I...>) {
 
 // PC ID3D12Device::CreateCommittedResource(heap, flags, desc, state, clear, riid, out) takes seven words after `this`,
 // so a device answers it from its own entry; other kinds keep the generic path for slot 27.
+D3D12_RESOURCE_DESC g_committed_desc{};  // the description PC slot 27 last got, as received
+
 HRESULT WINAPI mock_create_committed_resource(Mock* self, std::uint64_t heap, std::uint64_t flags, std::uint64_t desc,
                                               std::uint64_t state, std::uint64_t clear, const IID* riid, void** out) {
     ++self->calls[27];
     const std::uint64_t words[] = {heap, flags, desc, state, clear};
     std::memcpy(self->args[27], words, sizeof(words));
+    if (desc) g_committed_desc = *reinterpret_cast<const D3D12_RESOURCE_DESC*>(desc);
     if (self->kind != Kind::device) return mock_call(self, 27, words);
     return mock_create(self, Kind::resource, reinterpret_cast<std::uint64_t>(riid), reinterpret_cast<std::uint64_t>(out));
 }
@@ -2152,6 +2155,177 @@ int check_committed_resource3_x() {
     return 0;
 }
 
+// The retail boot's stop after #517: slot 127 is asked for a TEXTURE3D 768x768x6 R16_TYPELESS depth-stencil, one mip,
+// one sample, ALLOW_DEPTH_STENCIL. Only that measured shape is described as a 2D depth array of six slices (slot 25
+// for sizing, slots 76/127 and the 133 handler for creation); a colour volume, another slice count and a multi-mip
+// volume keep their dimension, because a 3D mip shrinks its depth and a 2D array does not. The title's own description
+// is never written.
+int check_volume_depth() {
+    constexpr std::uint32_t kXboxLayoutTiled = 0x101, kBarrierLayoutUndefined = 0xFFFFFFFFu;
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = DXGI_FORMAT_D16_UNORM;
+    clear.DepthStencil.Depth = 1.0f;
+
+    D3D12_RESOURCE_DESC volume = target_desc(768, 768, DXGI_FORMAT_R16_TYPELESS);
+    volume.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    volume.DepthOrArraySize = 6;
+    volume.MipLevels = 1;
+    volume.SampleDesc.Count = 1;
+    volume.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(kXboxLayoutTiled);
+    volume.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    const D3D12_RESOURCE_DESC title_desc = volume;
+
+    D3D12_RESOURCE_DESC four = volume;
+    four.DepthOrArraySize = 4;
+    const D3D12_RESOURCE_DESC four_desc = four;
+    D3D12_RESOURCE_DESC multi_mip = volume;
+    multi_mip.MipLevels = 2;
+    const D3D12_RESOURCE_DESC multi_mip_desc = multi_mip;
+    D3D12_RESOURCE_DESC colour = volume;
+    colour.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    colour.Flags = D3D12_RESOURCE_FLAG_NONE;
+    const D3D12_RESOURCE_DESC colour_desc = colour;
+
+    const auto is_pc_depth_array = [](const D3D12_RESOURCE_DESC& d) {
+        return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width == 768 && d.Height == 768 &&
+               d.DepthOrArraySize == 6 && d.MipLevels == 1 && d.Format == DXGI_FORMAT_R16_TYPELESS &&
+               d.SampleDesc.Count == 1 && d.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    };
+
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 10, true);
+    EXPECT(device && xs::device_proxy_slot_count(device) == 79);
+    void* const* vtable = *reinterpret_cast<void* const* const*>(device);
+    using ConsoleFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT,
+                                                               const D3D12_RESOURCE_DESC*);
+    const auto get_info = reinterpret_cast<ConsoleFn>(vtable[25]);
+    const auto ask = [&](const D3D12_RESOURCE_DESC* descs, UINT count) {
+        D3D12_RESOURCE_ALLOCATION_INFO info{};
+        g_seen_calls = 0;
+        g_seen_desc_count = 0;
+        std::memset(g_seen_descs, 0xCC, sizeof(g_seen_descs));
+        return get_info(&info, device, 0, count, descs) == &info;
+    };
+
+    // Sizing the measured descriptor: the PC device is asked for a 2D depth array of six slices.
+    EXPECT(ask(&volume, 1));
+    EXPECT(g_seen_desc_count == 1 && is_pc_depth_array(g_seen_descs[0]));
+    EXPECT(std::memcmp(&volume, &title_desc, sizeof(volume)) == 0);
+    // In a list, only the measured descriptor changes.
+    const D3D12_RESOURCE_DESC pair[2] = {volume, four};
+    EXPECT(ask(pair, 2));
+    EXPECT(g_seen_desc_count == 2 && is_pc_depth_array(g_seen_descs[0]) &&
+           g_seen_descs[1].Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+           g_seen_descs[1].DepthOrArraySize == 4);
+    // Other volume depths and colour volumes keep their dimension: nothing is silently converted.
+    EXPECT(ask(&four, 1));
+    EXPECT(g_seen_descs[0].Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D);
+    EXPECT(ask(&multi_mip, 1));
+    EXPECT(g_seen_descs[0].Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D);
+    EXPECT(ask(&colour, 1));
+    EXPECT(g_seen_descs[0].Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D);
+    EXPECT(std::memcmp(&four, &four_desc, sizeof(four)) == 0);
+    EXPECT(std::memcmp(&multi_mip, &multi_mip_desc, sizeof(multi_mip)) == 0);
+    EXPECT(std::memcmp(&colour, &colour_desc, sizeof(colour)) == 0);
+
+    // Slot 76, the console's CreateCommittedResource: the PC slot 27 gets the 2D depth array, same state and clear.
+    g_committed_desc = {};
+    void* resource = nullptr;
+    std::uint64_t words76[10] = {word(&heap), 0, word(&volume), D3D12_RESOURCE_STATE_DEPTH_WRITE, word(&clear),
+                                 word(&kResourceIid), word(&resource), 0, 0, 0};
+    EXPECT(hr_of(raw10(device, 76, words76)) == S_OK && resource);
+    EXPECT(mock->calls[27] == 1 && is_pc_depth_array(g_committed_desc));
+    EXPECT(g_committed_desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
+    EXPECT(static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(mock->args[27][3])) ==
+               D3D12_RESOURCE_STATE_DEPTH_WRITE &&
+           mock->args[27][4] == word(&clear));
+    EXPECT(std::memcmp(&volume, &title_desc, sizeof(volume)) == 0);
+    static_cast<void>(release(resource));
+    // A multi-mip volume keeps its dimension here too.
+    words76[2] = word(&multi_mip);
+    resource = nullptr;
+    EXPECT(hr_of(raw10(device, 76, words76)) == S_OK && resource);
+    EXPECT(g_committed_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+           g_committed_desc.MipLevels == 2);
+    static_cast<void>(release(resource));
+
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    // Slot 127, the measured stop: the same description as D3D12_RESOURCE_DESC1, with the barrier layout and clear.
+    D3D12_RESOURCE_DESC1 volume1{};
+    volume1.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    volume1.Width = 768;
+    volume1.Height = 768;
+    volume1.DepthOrArraySize = 6;
+    volume1.MipLevels = 1;
+    volume1.Format = DXGI_FORMAT_R16_TYPELESS;
+    volume1.SampleDesc.Count = 1;
+    volume1.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(kXboxLayoutTiled);
+    volume1.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    const D3D12_RESOURCE_DESC1 title_desc1 = volume1;
+    g_committed3 = {};
+    resource = nullptr;
+    std::uint64_t words[10] = {word(&heap), D3D12_HEAP_FLAG_NONE, word(&volume1), kBarrierLayoutUndefined,
+                               word(&clear), 0, 0, 0, word(&kResourceIid), word(&resource)};
+    EXPECT(hr_of(raw10(device, 127, words)) == S_OK && resource);
+    EXPECT(g_committed3.calls == 1 && g_committed3.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+           g_committed3.desc.Width == 768 && g_committed3.desc.Height == 768 &&
+           g_committed3.desc.DepthOrArraySize == 6 && g_committed3.desc.MipLevels == 1 &&
+           g_committed3.desc.Format == DXGI_FORMAT_R16_TYPELESS && g_committed3.desc.SampleDesc.Count == 1 &&
+           g_committed3.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    EXPECT(g_committed3.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
+    EXPECT(g_committed3.clear == &clear && g_committed3.layout == kBarrierLayoutUndefined);
+    EXPECT(std::memcmp(&volume1, &title_desc1, sizeof(volume1)) == 0);
+    static_cast<void>(release(resource));
+
+    // A multi-mip volume and a four-slice volume are not the measured shape: they go on as 3D.
+    D3D12_RESOURCE_DESC1 multi_mip1 = volume1;
+    multi_mip1.MipLevels = 2;
+    words[2] = word(&multi_mip1);
+    resource = nullptr;
+    EXPECT(hr_of(raw10(device, 127, words)) == S_OK && resource);
+    EXPECT(g_committed3.calls == 2 && g_committed3.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+           g_committed3.desc.MipLevels == 2);
+    static_cast<void>(release(resource));
+    D3D12_RESOURCE_DESC1 four1 = volume1;
+    four1.DepthOrArraySize = 4;
+    words[2] = word(&four1);
+    resource = nullptr;
+    EXPECT(hr_of(raw10(device, 127, words)) == S_OK && resource);
+    EXPECT(g_committed3.calls == 3 && g_committed3.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+           g_committed3.desc.DepthOrArraySize == 4);
+    static_cast<void>(release(resource));
+#endif
+
+    // Slot 133, the console's CreatePlacedResourceX: the handler sees the 2D depth array.
+    struct PlacedCapture {
+        D3D12_RESOURCE_DESC desc{};
+        void* va = nullptr;
+    };
+    static PlacedCapture placed;
+    placed = {};
+    xs::set_placed_at_va_handler([](ID3D12Device*, void* va, const D3D12_RESOURCE_DESC& desc, std::uint32_t,
+                                    const IID&, void** out) -> HRESULT {
+        placed.desc = desc;
+        placed.va = va;
+        *out = reinterpret_cast<void*>(0x1330);
+        return S_OK;
+    });
+    void* const va = reinterpret_cast<void*>(0x7000);
+    resource = nullptr;
+    EXPECT(hr_of(raw(device, 133, word(va), word(&volume), 0xFFFFFFFFull, word(&clear), word(&kResourceIid),
+                     word(&resource))) == S_OK);
+    EXPECT(resource == reinterpret_cast<void*>(0x1330) && placed.va == va && is_pc_depth_array(placed.desc));
+    EXPECT(std::memcmp(&volume, &title_desc, sizeof(volume)) == 0);
+    xs::set_placed_at_va_handler(nullptr);
+
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: the measured console TEXTURE3D 768x768x6 R16_TYPELESS depth-stencil is sized and created as a "
+                "2D depth array of six slices, and other volume depths keep their dimension\n", g_label);
+    return 0;
+}
+
 }  // namespace
 
 // A failure ends the process with a message on stderr, never in a dialog a test run would wait on: abort() (an
@@ -2368,6 +2542,7 @@ int main(int argc, char** argv) {
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list() ||
         check_custom_heap_properties() ||
         check_resource_allocation_info() || check_slot70() || check_committed_resource3_x() ||
+        check_volume_depth() ||
         check_descriptor_heap_hooks() ||
         check_render_target_sizes() ||
         check_allocation_descriptions_cleaned() ||

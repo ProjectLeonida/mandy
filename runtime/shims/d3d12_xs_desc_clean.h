@@ -52,4 +52,26 @@ inline D3D12_RESOURCE_DESC pc_resource_desc(const D3D12_RESOURCE_DESC& xbox) {
     return pc;
 }
 
+// The console allows a depth-stencil texture to be a TEXTURE3D (measured: the retail boot asks slot 127 for a
+// 768x768x6 R16_TYPELESS volume with one mip and one sample). PC D3D12 has no volume depth-stencil at all, so that
+// description cannot be sized or created. Only this measured shape is translated, to a 2D depth array of the same
+// six slices. A mip chain is not equivalent: a 3D mip shrinks its depth, while a 2D array keeps every layer at every
+// mip, so a multi-mip volume, another slice count or a multisampled one is left as it is and the PC refusal stands.
+template <class Desc>
+inline bool is_measured_volume_depth(const Desc& xbox) {
+    return xbox.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+           (static_cast<std::uint32_t>(xbox.Flags) & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0 &&
+           xbox.MipLevels == 1 && xbox.SampleDesc.Count == 1 && xbox.DepthOrArraySize == 6;
+}
+
+// A copy of `xbox` with the measured volume depth-stencil described as a 2D depth array of six slices. The format,
+// ALLOW_DEPTH_STENCIL, the clear value (passed separately) and the mip and sample counts are the title's; only the
+// dimension changes, and DepthOrArraySize already holds the slice count.
+template <class Desc>
+inline Desc pc_depth_desc(const Desc& xbox) {
+    Desc pc = xbox;
+    if (is_measured_volume_depth(pc)) pc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    return pc;
+}
+
 }  // namespace rt::d3d12_xs

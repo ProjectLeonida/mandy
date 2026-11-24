@@ -25,6 +25,10 @@
 //   slot 127  CreateCommittedResource3 (heap, flags, desc1, layout, clear, session, castable count/list, riid, out) ->
 //             PC ID3D12Device10::CreateCommittedResource3 (PC slot 76), with the Xbox layout word replaced and the
 //             Xbox flag bits dropped (RT-5 stop 15, docs/retail_boot_chain.md). E_NOTIMPL when the PC device lacks it.
+//   A measured console volume depth-stencil (TEXTURE3D, ALLOW_DEPTH_STENCIL, one mip, one sample, six slices: the
+//   retail boot's 768x768x6 R16_TYPELESS) is sized through slot 25 and created through slots 76/127/133 as a 2D
+//   depth array of six slices, with its format, flags and clear value kept. Any other volume depth is left to the PC
+//   device's refusal: a multi-mip volume does not have the fixed layer count of a 2D array (d3d12_xs_desc_clean.h).
 //   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The Xbox desc's first fields are
 //             D3D12_COMMAND_QUEUE_DESC's (public HLE).
 //   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> PC CreateCommandList(0, type, allocator,

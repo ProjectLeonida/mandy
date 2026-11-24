@@ -219,6 +219,20 @@ bool trace_enabled() {
     return enabled;
 }
 
+// One line the first time the measured console volume depth-stencil is described to the PC device (slot 25 sizes it
+// before slot 127 creates it). Other volume depths are left to the PC device's refusal; see d3d12_xs_desc_clean.h.
+template <class Desc>
+void note_measured_volume_depth(unsigned slot, const Desc& xbox) {
+    static std::atomic<bool> logged{false};
+    if (!first_call(logged)) return;
+    std::fprintf(stderr,
+                 "[rt] d3d12_xs: slot %u: measured console TEXTURE3D depth-stencil %llux%llux%u (format %d, flags "
+                 "0x%x, one mip, one sample) is described to the PC device as a TEXTURE2D depth array of %u slices\n",
+                 slot, static_cast<unsigned long long>(xbox.Width), static_cast<unsigned long long>(xbox.Height),
+                 static_cast<unsigned>(xbox.DepthOrArraySize), static_cast<int>(xbox.Format),
+                 static_cast<unsigned>(xbox.Flags), static_cast<unsigned>(xbox.DepthOrArraySize));
+}
+
 const char* slot_name(unsigned slot) {
     switch (slot) {
         case 0: return "QueryInterface";
@@ -2437,7 +2451,9 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
     // The measured description is 56 bytes plus Xbox extension words; D3D12_RESOURCE_DESC is exactly 56 bytes.
     // The Xbox layout word is 0x101 (tiled) or 0x1 (row-major buffer), and is not a PC layout value. Committed
     // resources take ROW_MAJOR for buffers and UNKNOWN for everything else, so the word is ignored and replaced.
-    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
+    // The measured volume depth-stencil is a 2D depth array on the PC device (d3d12_xs_desc_clean.h).
+    if (is_measured_volume_depth(*xbox_desc)) note_measured_volume_depth(76, *xbox_desc);
+    D3D12_RESOURCE_DESC pc_desc = pc_depth_desc(*xbox_desc);
     const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -2481,7 +2497,8 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     // The PC flags up to RAYTRACING_ACCELERATION_STRUCTURE (0x100) and USE_TIGHT_ALIGNMENT (0x400); 0x200 is
     // dropped, as committed_resource_refusal says the host refuses it (found in review).
     constexpr std::uint32_t kPcResourceFlags = 0x5ff;
-    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
+    if (is_measured_volume_depth(*xbox_desc)) note_measured_volume_depth(133, *xbox_desc);
+    D3D12_RESOURCE_DESC pc_desc = pc_depth_desc(*xbox_desc);
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
         without_depth_stencil_uav(pc_desc.Dimension, xbox_flags & kPcResourceFlags));
@@ -2557,7 +2574,8 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
         return E_NOTIMPL;
     }
 
-    D3D12_RESOURCE_DESC1 pc_desc = *xbox_desc;
+    if (is_measured_volume_depth(*xbox_desc)) note_measured_volume_depth(127, *xbox_desc);
+    D3D12_RESOURCE_DESC1 pc_desc = pc_depth_desc(*xbox_desc);
     const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
@@ -2903,6 +2921,12 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
         for (UINT i = 0; i < desc_count; ++i) {
             const auto& desc = descs[i];
             clean[i] = call.console_abi || desc.Layout == kXboxTiledResourceLayout ? pc_resource_desc(desc) : desc;
+            // The retail boot's volume depth-stencil cannot be sized by the PC device; the measured shape becomes a
+            // 2D depth array of the same slices (d3d12_xs_desc_clean.h). Any other volume depth stays as it came.
+            if (is_measured_volume_depth(clean[i])) {
+                note_measured_volume_depth(25, desc);
+                clean[i] = pc_depth_desc(clean[i]);
+            }
             static std::atomic<bool> uav_dropped{false};
             if (((static_cast<std::uint32_t>(desc.Flags) & ~static_cast<std::uint32_t>(clean[i].Flags)) &
                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
