@@ -8,6 +8,7 @@ subsystems, tagging execution prerequisites and synthetic coverage gaps.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 
 SUBSYSTEMS = ("runtime", "shader", "tools", "viewer")
+SOURCE_EXTENSIONS = (".py", ".cpp", ".c", ".cjs", ".js", ".mjs")
+SKIP_DIRS = {"__pycache__", ".git", ".pytest_cache", "build", "build_vs"}
 
 
 def classify_subsystem(rel_path: str, content: str) -> str:
@@ -79,53 +82,96 @@ def detect_prerequisites(runner: str, content: str) -> list[str]:
     return sorted(set(prereqs))
 
 
+def _discover_semantic_files(semantic_dir: Path) -> list[Path]:
+    """Mirror scripts/run_semantic_tests.py discovery rules for tests/semantic/."""
+    found: list[Path] = []
+    if not semantic_dir.is_dir():
+        return found
+    for base, dirs, files in os.walk(semantic_dir):
+        dirs[:] = sorted(
+            d for d in dirs
+            if d not in SKIP_DIRS and os.path.isfile(os.path.join(base, d, "__init__.py"))
+        )
+        prefix = os.path.relpath(base, semantic_dir).replace(os.sep, ".")
+        if prefix != "." and "__init__.py" in files:
+            found.append(Path(base) / "__init__.py")
+        for name in sorted(files):
+            if re.fullmatch(r"[_a-z]\w*\.py", name, re.IGNORECASE) and fnmatch.fnmatch(name, "test*.py"):
+                found.append(Path(base) / name)
+    return found
+
+
+def _classify_retail_requirement(content: str) -> str:
+    """Classify retail package reliance as 'none', 'optional', or 'required'."""
+    if "requires_retail_package" in content:
+        return "required"
+    has_env = "LEONIDA_GAME_DIR" in content or "LEONIDA_MOVIE" in content
+    if not has_env:
+        return "none"
+    content_lower = content.lower()
+    if "skip" in content_lower or "optional" in content_lower or "when unset" in content_lower:
+        return "optional"
+    return "required"
+
+
 def scan_tests(root: Path) -> list[dict]:
     """Scan and catalog all test files in the repository."""
     inventory = []
+    semantic_dir = root / "tests" / "semantic"
+    candidates: set[Path] = set(_discover_semantic_files(semantic_dir))
+
     search_dirs = [
         root / "tests",
         root / "runtime" / "test",
     ]
-
     for search_dir in search_dirs:
         if not search_dir.is_dir():
             continue
-        for p in search_dir.rglob("*"):
-            if not p.is_file():
+        for base, dirs, files in os.walk(search_dir):
+            base_path = Path(base)
+            if base_path == semantic_dir:
+                dirs[:] = []
                 continue
-            name_lower = p.name.lower()
-            if not (
-                name_lower.startswith("test_")
-                or name_lower.endswith("_test.py")
-                or name_lower.endswith("_test.cpp")
-                or name_lower.endswith("_test.cjs")
-            ):
-                continue
-
-            rel_path = p.relative_to(root).as_posix()
-            try:
-                content = p.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                content = ""
-
-            subsystem = classify_subsystem(rel_path, content)
-            runner = classify_runner(p, content)
-            prereqs = detect_prerequisites(runner, content)
-
-            needs_retail = any(
-                marker in content
-                for marker in ("LEONIDA_GAME_DIR", "LEONIDA_MOVIE", "requires_retail_package")
+            dirs[:] = sorted(
+                d for d in dirs
+                if d not in SKIP_DIRS and (base_path / d) != semantic_dir
             )
+            for name in files:
+                p = base_path / name
+                if p.suffix.lower() not in SOURCE_EXTENSIONS:
+                    continue
+                name_lower = name.lower()
+                if (
+                    name_lower.startswith("test_")
+                    or name_lower.endswith("_test.py")
+                    or name_lower.endswith("_test.cpp")
+                    or name_lower.endswith("_test.cjs")
+                ):
+                    candidates.add(p)
 
-            inventory.append({
-                "path": rel_path,
-                "name": p.name,
-                "subsystem": subsystem,
-                "runner": runner,
-                "prerequisites": prereqs,
-                "is_synthetic": not needs_retail,
-                "needs_retail_game_data": needs_retail,
-            })
+    for p in candidates:
+        rel_path = p.relative_to(root).as_posix()
+        try:
+            content = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            content = ""
+
+        subsystem = classify_subsystem(rel_path, content)
+        runner = classify_runner(p, content)
+        prereqs = detect_prerequisites(runner, content)
+        retail_req = _classify_retail_requirement(content)
+        needs_retail = retail_req != "none"
+
+        inventory.append({
+            "path": rel_path,
+            "name": p.name,
+            "subsystem": subsystem,
+            "runner": runner,
+            "prerequisites": prereqs,
+            "is_synthetic": retail_req != "required",
+            "needs_retail_game_data": needs_retail,
+            "retail_requirement": retail_req,
+        })
 
     return sorted(inventory, key=lambda x: x["path"])
 
@@ -212,7 +258,8 @@ def main(argv: list[str] | None = None) -> int:
         print("\nFiltered Tests:")
         for item in inventory:
             prereq_str = ", ".join(item["prerequisites"]) if item["prerequisites"] else "none"
-            print(f"  [{item['subsystem']}] {item['path']} ({item['runner']}) — prereqs: {prereq_str}")
+            retail_tag = f" [retail:{item['retail_requirement']}]" if item["retail_requirement"] != "none" else ""
+            print(f"  [{item['subsystem']}] {item['path']} ({item['runner']}){retail_tag} — prereqs: {prereq_str}")
 
     return 0
 

@@ -5,10 +5,16 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-INVENTORY_TOOL = ROOT / "tools" / "test_inventory.py"
+TOOLS = ROOT / "tools"
+INVENTORY_TOOL = TOOLS / "test_inventory.py"
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
+
+import test_inventory  # noqa: E402
 
 
 class TestInventoryTests(unittest.TestCase):
@@ -64,6 +70,47 @@ class TestInventoryTests(unittest.TestCase):
         data = json.loads(proc.stdout)
         for t in data["tests"]:
             self.assertTrue(t["needs_retail_game_data"])
+            self.assertIn(t["retail_requirement"], ("optional", "required"))
+
+    def test_ignores_pycache_and_matches_semantic_discovery_rules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            sem = tmp_root / "tests" / "semantic"
+            cache = sem / "__pycache__"
+            pkg = sem / "pkg"
+            rt = tmp_root / "runtime" / "test"
+            cache.mkdir(parents=True)
+            pkg.mkdir(parents=True)
+            rt.mkdir(parents=True)
+
+            (sem / "test_sample.py").write_text("import unittest\n", encoding="utf-8", newline="\n")
+            (sem / "testCase.py").write_text("import unittest\n", encoding="utf-8", newline="\n")
+            (pkg / "__init__.py").write_text("import unittest\n", encoding="utf-8", newline="\n")
+            (cache / "test_sample.cpython-314.pyc").write_bytes(b"\x00" * 16)
+            (rt / "optional_retail_test.cpp").write_text(
+                '// optional retail leg\nif (!getenv("LEONIDA_GAME_DIR")) printf("SKIP\\n");\n',
+                encoding="utf-8",
+                newline="\n",
+            )
+            (rt / "required_retail_test.py").write_text(
+                "requires_retail_package = True\n", encoding="utf-8", newline="\n"
+            )
+
+            items = {i["path"]: i for i in test_inventory.scan_tests(tmp_root)}
+            self.assertEqual(
+                sorted(items),
+                [
+                    "runtime/test/optional_retail_test.cpp",
+                    "runtime/test/required_retail_test.py",
+                    "tests/semantic/pkg/__init__.py",
+                    "tests/semantic/testCase.py",
+                    "tests/semantic/test_sample.py",
+                ],
+            )
+            self.assertEqual(items["runtime/test/optional_retail_test.cpp"]["retail_requirement"], "optional")
+            self.assertTrue(items["runtime/test/optional_retail_test.cpp"]["is_synthetic"])
+            self.assertEqual(items["runtime/test/required_retail_test.py"]["retail_requirement"], "required")
+            self.assertFalse(items["runtime/test/required_retail_test.py"]["is_synthetic"])
 
 
 if __name__ == "__main__":
