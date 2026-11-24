@@ -1083,6 +1083,24 @@ class TestVerifyCache(unittest.TestCase):
         with open(self.cache, "rb") as f:
             self.assertNotIn(b"\r\n", f.read())
 
+    def test_save_cache_stage_cleanup_restores_write_mode_on_replace_failure(self) -> None:
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(path, mode, *args, **kwargs):
+            chmod_calls.append((str(path), mode))
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with patch("os.replace", side_effect=OSError("replace failed")), \
+             patch("os.chmod", side_effect=track_chmod):
+            with self.assertRaisesRegex(OSError, "replace failed"):
+                mv.save_cache(self.cache, {"foo": {"stamp": [1, 2, 3, 4, 5], "sha256": "abc"}})
+
+        self.assertTrue(any(mode == 0o600 for _, mode in chmod_calls), chmod_calls)
+        cache_dir = os.path.dirname(self.cache)
+        leftover = [f for f in os.listdir(cache_dir) if f.startswith(".verify-cache-")]
+        self.assertEqual(leftover, [])
+
 
 class TestSaveVerifyCache(unittest.TestCase):
     def setUp(self) -> None:
