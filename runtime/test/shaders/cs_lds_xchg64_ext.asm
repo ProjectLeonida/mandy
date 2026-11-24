@@ -9,19 +9,22 @@
 ;           low ^ high: 0xAAAA0001 ^ 0xBBBB0002                                                     -> 0x11110003
 ;   out[1]  the old pair it returned, low ^ high: 0x11111111 ^ 0x22222222                            -> 0x33333333
 ;   out[2]  ds_or_rtn_b64 at 0x700: (0x0F0F0000, 0x000000F0) | (0x0000F0F0, 0xFF000000) leaves
-;           (0x0F0FF0F0, 0xFF0000F0); low ^ high                                                   -> 0xF00FF000
+;           (0x0F0FF0F0, 0xFF0000F0), low ^ high 0xF00FF000; XOR the old pair it returned, low ^ high
+;           0x0F0F00F0                                                                             -> 0xFF00F0F0
 ;   out[3]  ds_wrxchg2_rtn_b64 at base 0x80, offset0:0 offset1:2 (unit 8: 0x80 and 0x90), seeded (1, 2) and
 ;           (3, 4), data (0x10, 0x20) and (0x30, 0x40): the four old dwords in vdst, one byte each   -> 0x04030201
 ;   out[4]  the four dwords at 0x80, 0x84, 0x90, 0x94 after it, one byte each                       -> 0x40302010
 ;   out[5]  ds_wrxchg2st64_rtn_b64 at base 0x100, offset0:1 offset1:2 (unit 512: 0x300 and 0x500), seeded
 ;           (5, 6) and (7, 8), data (0x50, ..) and (0x70, ..): bytes = old low dword of each element, then the
 ;           new low dword of each                                                                   -> 0x70500705
-;   out[6]  ds_min_f32 at 0x600: M qNaN (0x7FC00000), DATA 1.5: NMin keeps the non-NaN operand        -> 0x3FC00000
-;   out[7]  ds_max_rtn_f32 at 0x604: M -0.0, DATA +0.0: -0.0 orders below +0.0, so the word left is +0.0; it XOR
-;           the returned -0.0                                                                      -> 0x80000000
+;   out[6]  ds_min_f32 at 0x600: M qNaN (0x7FC00000), DATA 1.5: NMin keeps the non-NaN operand (0x3FC00000);
+;           XOR ds_max_rtn_f32 at 0x604: M -0.0, DATA +0.0: -0.0 orders below +0.0, so the word left is +0.0
+;           (0x00000000)                                                                           -> 0x3FC00000
+;   out[7]  the pre-op word ds_max_rtn_f32 returned, -0.0, on its own: a XOR with the word left could not tell
+;           (+0.0 left, -0.0 returned) from the swapped (-0.0 left, +0.0 returned)                 -> 0x80000000
 ;
 ; Run: vk_compute_test cs_lds_xchg64_ext.spv 1 dump
-;   -> out[0..7] = 0x11110003 0x33333333 0xF00FF000 0x04030201
+;   -> out[0..7] = 0x11110003 0x33333333 0xFF00F0F0 0x04030201
 ;                  0x40302010 0x70500705 0x3FC00000 0x80000000
 ; rsrc2: 0x40088
 ; group: 32,1,1
@@ -60,6 +63,8 @@ s_waitcnt lgkmcnt(0)
 ds_read_b64 v[10:11], v1
 s_waitcnt lgkmcnt(0)
 v_xor_b32_e32 v10, v10, v11
+v_xor_b32_e32 v12, v12, v13
+v_xor_b32_e32 v10, v10, v12
 v_mov_b32_e32 v21, 8
 buffer_store_dword v10, v21, s[0:3], 0 offen
 
@@ -144,9 +149,9 @@ s_waitcnt lgkmcnt(0)
 ds_read_b32 v10, v1
 ds_read_b32 v12, v2
 s_waitcnt lgkmcnt(0)
+v_xor_b32_e32 v10, v10, v12
 v_mov_b32_e32 v21, 24
 buffer_store_dword v10, v21, s[0:3], 0 offen
-v_xor_b32_e32 v12, v12, v11
 v_mov_b32_e32 v21, 28
-buffer_store_dword v12, v21, s[0:3], 0 offen
+buffer_store_dword v11, v21, s[0:3], 0 offen
 s_endpgm

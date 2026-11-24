@@ -1205,7 +1205,7 @@ def run_suite(a, work: str) -> int:
                 "cs_lds_b64_cmpst": [0x11110001, 0x22220002, 0x33330003, 0x44440004,
                                      0xCCCC000C, 0x44440004, 0xBBBB000B, 0x3579BADC],
                 # ds_wrxchg*_rtn_b64, ds_or_rtn_b64, ds_min_f32, ds_max_rtn_f32 (cs_lds_xchg64_ext.asm header)
-                "cs_lds_xchg64_ext": [0x11110003, 0x33333333, 0xF00FF000, 0x04030201,
+                "cs_lds_xchg64_ext": [0x11110003, 0x33333333, 0xFF00F0F0, 0x04030201,
                                     0x40302010, 0x70500705, 0x3FC00000, 0x80000000],
                 # ds_mskor, ds_and/xor_b64, ds_add_rtn_f32, ds_inc/dec/rsub_u32 (cs_lds_atomics_ext.asm header)
                 "cs_lds_atomics_ext": [0xF0F11234, 0xAB34CD78, 0x12345678, 0xF0F00F0F,
