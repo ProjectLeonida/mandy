@@ -107,7 +107,7 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
                 "cs_w32_lds_subdword", "cs_w32_lds_wide",
                 "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
-                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_andn2_exec",
+                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_dot_int", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_andn2_exec",
                 "cs_mask_vgpr_exec", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi",
                 "cs_w32_exec_computed")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
@@ -147,6 +147,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # ds_cmpst_f32 and buffer_atomic_fcmpswap: float compare (cs_w32_fcmpswap.asm)
             ("cs_w32_fcmpswap", [0, 0x3F800000, 0x7FC00000, 0x3F800000, 0x80000000, 0x40400000, 0x3F800000, 0x7FC00000]),
             ("cs_w32_new_ops", [0x55, 0x8001, 0xC0000000, 0x80014000, 0x4000FFFF, 0x77, 0x99, 0x1234]),
+            # the packed integer dot products, with clamp (derivations in cs_w32_dot_int.asm)
+            ("cs_w32_dot_int", [0x00000081, 0xFFFF7F04, 0x00004288, 0xFFFFFFDA, 0x00000104, 0xFFFFFFFF, 0x7FFFFFFE, 0x7FFFFFFF]),
             ("cs_w32_misc_ext", [0x0FFF0FFF, 0xE2C4A688, 0x0007FFFF, 0x7FFF8000, 0xFFFE0002, 0xFFFF0005, 0x509, 0xCAFEF00D]),
             ("cs_w32_salu64", [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE]),
             # SHADER-85: 8-bit LDS reads into one half of a VGPR, the other half kept
@@ -341,7 +343,10 @@ FMT_D16_XYZ_WORDS = [
 GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4,
                                                  0x0000009E, 0xFFFF8BAD, 0x57023FFC, 0xEEEEEEEE]),
                  # global/buffer atomics, 8/16-bit global stores and d16 loads with CPU-only checks until now
-                 ("cs_global_mem_ext", "40", [0x5, 0xC, 0x977, 0xFFF00000, 0xEDCB5678, 0xEF332211, 0x887766BE, 0xFF801234])]
+                 ("cs_global_mem_ext", "40", [0x5, 0xC, 0x977, 0xFFF00000, 0xEDCB5678, 0xEF332211, 0x887766BE, 0xFF801234]),
+                 # global/buffer_atomic_csub: the clamp at 0, glc, and 32 lanes on one dword (cases in the .asm header)
+                 ("cs_global_csub", "40", [0x10070905, 0x0D070000, 0x00630064, 0x80000000, 0x00000000,
+                                           0xFFFFFFFE, 0x000C0500, 0x01D800D2])]
 # cs_heap_init.asm: vk_compute_test's VKC_HEAP_INIT copies this file (zeros, then four words at 0x100) to the start
 # of the heap; the shader copies the four words to 0, and out[4..7] are the file's zeros, not the 0xEE fill.
 HEAP_INIT_WORDS = [0x1BADB002, 0xCAFEF00D, 0x80000001, 0x0000FFFF]
