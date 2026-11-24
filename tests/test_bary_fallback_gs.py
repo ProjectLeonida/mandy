@@ -849,6 +849,32 @@ class TestMainAndCLI(unittest.TestCase):
             leftovers = [name for name in os.listdir(tmp) if name.startswith(".bary-gs-")]
             self.assertEqual(leftovers, [])
 
+    def test_stage_cleanup_restores_write_mode_on_replace_failure(self):
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(path, mode, *args, **kwargs):
+            chmod_calls.append((str(path), mode))
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
+                json.dump({
+                    "ps": {
+                        "stage": "ps",
+                        "inputs": [0],
+                        "bary_fallback_input": {"location": 1},
+                    }
+                }, f)
+
+            with mock.patch("subprocess.run", side_effect=_successful_spirv_tools), \
+                 mock.patch("os.replace", side_effect=OSError("replace failed")), \
+                 mock.patch("os.chmod", side_effect=track_chmod):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    bary_fallback_gs.build_for_index(tmp)
+
+        self.assertTrue(any(mode == 0o600 for _, mode in chmod_calls), chmod_calls)
+
 
 if __name__ == "__main__":
     unittest.main()
