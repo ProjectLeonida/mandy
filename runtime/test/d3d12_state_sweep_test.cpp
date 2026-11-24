@@ -580,6 +580,15 @@ int main() {
     }
     std::printf("host reference: %s\n", adapter.c_str());
 
+    // DEPTH_STENCIL2 (per-face stencil masks) and OMSetFrontAndBackStencilRef require
+    // D3D12_OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported. Older host runtimes (e.g. Windows 10) do not
+    // know OPTIONS14 (CheckFeatureSupport fails) and refuse DEPTH_STENCIL2 pipelines, while the layer accepts them.
+    D3D12_FEATURE_DATA_D3D12_OPTIONS14 host_o14{};
+    const HRESULT host_o14_hr =
+        host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS14, &host_o14, sizeof(host_o14));
+    const bool host_per_face_stencil =
+        SUCCEEDED(host_o14_hr) && host_o14.IndependentFrontAndBackStencilRefMaskSupported != FALSE;
+
     const HMODULE compiler = LoadLibraryExA("d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const auto compile = compiler ? reinterpret_cast<pD3DCompile>(reinterpret_cast<void*>(
                                         GetProcAddress(compiler, "D3DCompile")))
@@ -599,6 +608,26 @@ int main() {
     const std::vector<Case> cases = build_cases();
     unsigned compared = 0, differ = 0, skipped = 0;
     for (const Case& c : cases) {
+        if (c.stream && !host_per_face_stencil) {
+            const Result mine = run(ours.p, c, our_programs);
+            if (!mine.ok) {
+                ++differ;
+                std::printf("%s: the layer failed (pipeline 0x%08x)  MISMATCH\n", c.name.c_str(),
+                            static_cast<unsigned>(mine.pso));
+                continue;
+            }
+            if (FAILED(host_o14_hr)) {
+                std::printf("%s: not comparable on this host (host runtime lacks D3D12_FEATURE_D3D12_OPTIONS14, "
+                            "hr 0x%08x)\n",
+                            c.name.c_str(), static_cast<unsigned>(host_o14_hr));
+            } else {
+                std::printf("%s: not comparable on this host "
+                            "(host reports OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported = FALSE)\n",
+                            c.name.c_str());
+            }
+            ++skipped;
+            continue;
+        }
         const Result reference = run(host.p, c, host_programs);
         const Result mine = run(ours.p, c, our_programs);
         if (!reference.ok && SUCCEEDED(reference.pso) ) {
