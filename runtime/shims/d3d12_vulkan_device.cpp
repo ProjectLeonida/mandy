@@ -950,6 +950,18 @@ struct DeviceState {
         return VK_SAMPLE_COUNT_1_BIT;
     }
 
+    // A multisample shader view needs a colour format the GPU samples at that count. The usages are the ones a
+    // multisampled colour texture is created with (TextureCreateInfo): an attachment that is sampled and copied.
+    bool multisample_sampleable(VkFormat format, UINT samples) const {
+        if (!image_format_properties) return true;
+        VkImageFormatProperties props{};
+        constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        return image_format_properties(info.physical, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, 0,
+                                       &props) == VK_SUCCESS &&
+               (props.sampleCounts & samples) != 0;
+    }
+
     // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
         if (!xr_bias_compatible(desc)) return {};
@@ -4698,9 +4710,24 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     }
     if (msaa) {
         // The MS bindings expose typed colour SRVs. An MS view has one mip and can name an array slice range.
-        const Format format = texture_storage_format(desc.Format, false);
-        if (resource.aspects() != VK_IMAGE_ASPECT_COLOR_BIT || format.typeless ||
-            (view.format != DXGI_FORMAT_UNKNOWN && view.format != desc.Format)) {
+        if (resource.aspects() != VK_IMAGE_ASPECT_COLOR_BIT) {
+            log_once("multisample shader view requires a colour texture; format", int(desc.Format));
+            return false;
+        }
+        const Format storage = texture_storage_format(desc.Format, false);
+        if (storage.typeless) {
+            // A typeless colour texture has no format for the view to inherit, so the SRV names a concrete member of
+            // the texture's own family (R8G8B8A8_TYPELESS takes R8G8B8A8_UNORM or _UNORM_SRGB, R16G16B16A16_TYPELESS
+            // takes _FLOAT, _UNORM, _UINT, ...), as D3D12 requires. The T# is written for that format below.
+            const Format named_format = texture_storage_format(view.format, false);
+            if (view.format == DXGI_FORMAT_UNKNOWN || named_format.typeless ||
+                named_format.format == VK_FORMAT_UNDEFINED ||
+                format_family(view.format) != format_family(desc.Format)) {
+                log_once("multisample shader view of a typeless colour texture needs a typed format of its family:",
+                         int(view.format));
+                return false;
+            }
+        } else if (view.format != DXGI_FORMAT_UNKNOWN && view.format != desc.Format) {
             log_once("multisample shader view requires a matching typed colour format:", int(desc.Format));
             return false;
         }
@@ -4783,6 +4810,10 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     }
     if (named == VK_FORMAT_UNDEFINED || !resource.allows_view_format(named)) {
         log_once("view format not in the resource's castable list:", int(view.format));
+        return false;
+    }
+    if (msaa && !resource.device_state().multisample_sampleable(named, desc.SampleDesc.Count)) {
+        log_once("multisample shader view format is not sampleable at this texture's sample count:", int(named));
         return false;
     }
     const std::uint32_t code = stencil ? g::stencil_format : g::format_from_vulkan(named);
