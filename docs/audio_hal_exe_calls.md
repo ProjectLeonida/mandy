@@ -66,12 +66,13 @@ open pull request for it.
 ## What the executable already does about a failure
 
 Four of the calls above have a branch for a negative result: `AcpHalCreate`, `AcpHalAllocateShapeContexts`,
-`ApuCreateHeap` and `XApuDequeueResult`. An unimplemented import under `LEONIDA_UNIMPLEMENTED=log` returns 0, so a caller
-that tests for a negative result sees success with its outputs unset; under `fail` only imports `classify_import`
+`ApuCreateHeap` and `XApuDequeueResult`. An unimplemented import under `LEONIDA_UNIMPLEMENTED=log` returns 0, so a
+caller that tests for a negative result sees success with its outputs unset; under `fail` only imports `classify_import`
 knows to return an `HRESULT` get `E_NOTIMPL`; all four are on that list now (`runtime/shims/registry.cpp` names the
-`AcpHal.dll`, `xapu.dll` and `chad.dll` functions whose shims return an `HRESULT`), but their shims serve them. So today neither mode makes the executable take its own failure path for the audio hardware.
-Whether the title survives that path, or needs the coprocessor, is **unmeasured**: it takes a run to find out, and the
-first run reported in #6603 stops earlier, in `D3D12ConfigureVirtualMemoryX`.
+`AcpHal.dll`, `xapu.dll` and `chad.dll` functions whose shims return an `HRESULT`), but their shims serve them. So today
+neither mode makes the executable take its own failure path for the audio hardware. Whether the title survives that
+path, or needs the coprocessor, is **unmeasured**: it takes a run to find out, and the first run reported in #6603 stops
+earlier, in `D3D12ConfigureVirtualMemoryX`.
 
 ## What this does not show
 
