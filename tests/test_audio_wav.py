@@ -789,6 +789,35 @@ class AudioWavCliTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("is not Ogg Opus", err.getvalue())
 
+    def test_stage_cleanup_restores_write_mode_on_replace_failure(self):
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(path, mode, *args, **kwargs):
+            chmod_calls.append((str(path), mode))
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.ogg")
+            with open(src, "wb") as f:
+                f.write(b"data")
+            dst = os.path.join(tmp, "out.wav")
+
+            def fake_run(cmd, **kwargs):
+                with open(cmd[-1], "wb") as f:
+                    f.write(b"wav")
+                return mock.Mock(returncode=0, stderr="")
+
+            with mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch.object(audio_wav, "ogg_output_samples", return_value=0), \
+                 mock.patch("os.replace", side_effect=OSError("replace failed")), \
+                 mock.patch("os.chmod", side_effect=track_chmod):
+                success, msg = audio_wav.decode("ffmpeg", src, dst)
+                self.assertFalse(success)
+                self.assertIn("replace failed", msg)
+
+        self.assertTrue(any(mode == 0o600 for _, mode in chmod_calls), chmod_calls)
+
 
 if __name__ == "__main__":
     unittest.main()

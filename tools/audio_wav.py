@@ -32,6 +32,9 @@ import struct
 import subprocess
 import sys
 import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode
 import time
 from typing import BinaryIO
 import unicodedata
@@ -429,7 +432,15 @@ def decode(ffmpeg: str, src: str, dst: str):
             r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace")
             if r.returncode != 0:
                 return False, (r.stderr.strip() or f"ffmpeg exited with {r.returncode}")
-            os.replace(tmp, dst)
+            os.chmod(tmp, published_mode(dst))
+            try:
+                os.replace(tmp, dst)
+            except BaseException:
+                try:
+                    os.chmod(tmp, 0o600)
+                except OSError:
+                    pass
+                raise
         return True, ""
     except OSError as e:
         return False, str(e)
