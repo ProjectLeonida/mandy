@@ -456,7 +456,7 @@ assert(begin >= 0 && end > begin, 'viewer streaming section must exist');
 const source = html.slice(begin, end);
 const settle = () => new Promise(setImmediate);
 function fixture(count = 1) {
-    const requests = [], added = [], disposed = [];
+    const requests = [], added = [], disposed = [], parses = [];
     const timers = new Map();
     let now = 0, nextTimer = 0;
     class Group { add() {} }
@@ -477,12 +477,65 @@ function fixture(count = 1) {
                 request.completeBody = () => body(request);
                 signal.addEventListener('abort', () => fail(signal.reason), { once: true });
             }) });
+            request.streamHeaders = (responseHeaders = {}, url = '') => {
+                const normalized = new Map(
+                    Object.entries(responseHeaders).map(([k, v]) => [k.toLowerCase(), String(v)]),
+                );
+                const queue = [];
+                let waiting = null, ended = false, canceled = false, released = false, locked = false;
+                const stream = {
+                    push(chunk) {
+                        if (ended || canceled) return;
+                        if (waiting) { const w = waiting; waiting = null; w.resolve({ done: false, value: chunk }); }
+                        else queue.push({ done: false, value: chunk });
+                    },
+                    end() {
+                        if (ended || canceled) return;
+                        ended = true;
+                        if (waiting) { const w = waiting; waiting = null; w.resolve({ done: true, value: undefined }); }
+                    },
+                    get canceled() { return canceled; },
+                    get released() { return released; },
+                };
+                request.stream = stream;
+                resolve({
+                    ok: true,
+                    url,
+                    headers: { get: k => normalized.get(String(k).toLowerCase()) ?? null },
+                    body: {
+                        getReader() {
+                            assert.equal(locked, false, 'reader lock must not be acquired twice');
+                            locked = true;
+                            return {
+                                read() {
+                                    if (queue.length > 0) return Promise.resolve(queue.shift());
+                                    if (ended || canceled) return Promise.resolve({ done: true, value: undefined });
+                                    return new Promise((res, rej) => { waiting = { resolve: res, reject: rej }; });
+                                },
+                                cancel() {
+                                    canceled = true;
+                                    if (waiting) {
+                                        const w = waiting; waiting = null; w.resolve({ done: true, value: undefined });
+                                    }
+                                    return Promise.resolve();
+                                },
+                                releaseLock() { locked = false; released = true; },
+                            };
+                        },
+                    },
+                });
+                return stream;
+            };
             signal.addEventListener('abort', () => reject(signal.reason), { once: true });
             requests.push(request);
         }),
         GLTFLoader: class {
-            parseAsync(request, resourcePath) {
-                return new Promise((resolve, reject) => { request.parse = { resolve, reject, resourcePath }; });
+            parseAsync(bytes, resourcePath) {
+                return new Promise((resolve, reject) => {
+                    const entry = { bytes, resolve, reject, resourcePath };
+                    parses.push(entry);
+                    if (bytes && typeof bytes === 'object' && 'url' in bytes) bytes.parse = entry;
+                });
             }
         },
         scene: { add: obj => added.push(obj), remove() {} },
@@ -497,7 +550,7 @@ function fixture(count = 1) {
     vm.runInContext(`globalThis.state = { live, stream, drop,
         get inflight() { return inflight; }, get failed() { return failed; } }`, context);
     const object = () => ({ traverse(fn) { fn({ geometry: { dispose() { disposed.push(this); } } }); } });
-    return { context, requests, added, disposed, state: context.state, object,
+    return { context, requests, parses, added, disposed, state: context.state, object,
         frame(time = now) { now = time; context.state.stream(); },
         async advanceTimers(time) {
             now = time;
@@ -607,6 +660,122 @@ test('a completed download clears its deadline before GLB parsing finishes', asy
     const obj = f.object();
     await f.finish(0, obj);
     assert.deepEqual(f.added, [obj]);
+    assert.equal(f.state.inflight, 0);
+    assert.equal(f.state.failed, 0);
+});
+
+test('streamed chunk downloads reset the idle deadline on each non-empty body chunk', async t => {
+    for (const [label, headers] of [['with Content-Length', { 'Content-Length': '6' }], ['without Content-Length', {}]]) {
+        await t.test(label, async () => {
+            const f = fixture();
+            f.frame();
+            const stream = f.requests[0].streamHeaders(headers);
+            await settle();
+            await f.advanceTimers(20000);
+            stream.push(new Uint8Array([1, 2]));
+            await settle();
+            await f.advanceTimers(40000);
+            assert.equal(f.requests[0].signal.aborted, false);
+            stream.push(new Uint8Array([3, 4]));
+            await settle();
+            await f.advanceTimers(65000);
+            assert.equal(f.requests[0].signal.aborted, false);
+            stream.push(new Uint8Array([5, 6]));
+            stream.end();
+            await settle();
+            assert.equal(f.requests[0].signal.aborted, false);
+            assert.equal(stream.released, true);
+            assert.equal(f.parses.length, 1);
+            assert.deepEqual(Array.from(new Uint8Array(f.parses[0].bytes)), [1, 2, 3, 4, 5, 6]);
+            const obj = f.object();
+            f.parses[0].resolve({ scene: obj });
+            await settle();
+            assert.deepEqual(f.added, [obj]);
+            assert.equal(f.state.failed, 0);
+            assert.equal(f.state.inflight, 0);
+        });
+    }
+});
+
+test('streamed chunk headers alone do not reset the download deadline', async () => {
+    const f = fixture();
+    f.frame();
+    await f.advanceTimers(20000);
+    const stream = f.requests[0].streamHeaders({ 'Content-Length': '8' });
+    await settle();
+    await f.advanceTimers(29999);
+    assert.equal(f.requests[0].signal.aborted, false);
+    await f.advanceTimers(30000);
+    assert.equal(f.requests[0].signal.aborted, true);
+    assert.equal(stream.canceled, true);
+    assert.equal(stream.released, true);
+    assert.equal(f.parses.length, 0);
+    assert.equal(f.state.failed, 1);
+    assert.equal(f.state.inflight, 0);
+});
+
+test('empty body chunks do not reset the streamed download deadline', async () => {
+    const f = fixture();
+    f.frame();
+    const stream = f.requests[0].streamHeaders({});
+    await settle();
+    await f.advanceTimers(10000);
+    stream.push(new Uint8Array([9]));
+    await settle();
+    await f.advanceTimers(25000);
+    stream.push(new Uint8Array(0));
+    await settle();
+    await f.advanceTimers(39999);
+    assert.equal(f.requests[0].signal.aborted, false);
+    await f.advanceTimers(40000);
+    assert.equal(f.requests[0].signal.aborted, true);
+    assert.equal(stream.canceled, true);
+    assert.equal(stream.released, true);
+    assert.equal(f.state.failed, 1);
+    assert.equal(f.state.inflight, 0);
+});
+
+test('streamed chunk assembly handles Content-Length mismatches and encoded bodies', async t => {
+    const cases = [
+        ['shorter than Content-Length', { 'Content-Length': '10' },
+            [new Uint8Array([1, 2, 3]), new Uint8Array([4])], [1, 2, 3, 4]],
+        ['longer than Content-Length', { 'Content-Length': '3' },
+            [new Uint8Array([1, 2]), new Uint8Array([3, 4, 5])], [1, 2, 3, 4, 5]],
+        ['Content-Encoding ignores Content-Length preallocation', { 'Content-Length': '2', 'Content-Encoding': 'gzip' },
+            [new Uint8Array([7, 8, 9])], [7, 8, 9]],
+    ];
+    for (const [label, headers, chunks, expected] of cases) {
+        await t.test(label, async () => {
+            const f = fixture();
+            f.frame();
+            const stream = f.requests[0].streamHeaders(headers);
+            await settle();
+            for (const chunk of chunks) stream.push(chunk);
+            stream.end();
+            await settle();
+            assert.equal(f.parses.length, 1);
+            assert.deepEqual(Array.from(new Uint8Array(f.parses[0].bytes)), expected);
+            f.parses[0].resolve({ scene: f.object() });
+            await settle();
+            assert.equal(f.state.failed, 0);
+            assert.equal(f.state.inflight, 0);
+        });
+    }
+});
+
+test('dropping a streamed chunk mid-transfer cancels its reader and releases the lock', async () => {
+    const f = fixture();
+    f.frame();
+    const stream = f.requests[0].streamHeaders({ 'Content-Length': '16' });
+    await settle();
+    stream.push(new Uint8Array([1, 2, 3, 4]));
+    await settle();
+    f.state.drop('chunk_0');
+    await settle();
+    assert.equal(f.requests[0].signal.aborted, true);
+    assert.equal(stream.canceled, true);
+    assert.equal(stream.released, true);
+    assert.equal(f.parses.length, 0);
     assert.equal(f.state.inflight, 0);
     assert.equal(f.state.failed, 0);
 });
