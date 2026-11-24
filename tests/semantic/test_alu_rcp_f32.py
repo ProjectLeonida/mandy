@@ -187,10 +187,11 @@ class ALUVRcpF32Tests(unittest.TestCase):
         self.assertEqual(res, bits32(0.5))
         self.assertNotEqual(res, x_bits)
 
-    def test_rcp_f32_zero_is_undefined(self):
-        # v_rcp_f32(0) lowers to OpFDiv 1.0/0, which SPIR-V leaves undefined.
-        with self.assertRaises(si.UnsupportedConstruct):
-            run_op(bits32(0.0))
+    def test_rcp_f32_zero_is_signed_inf(self):
+        # v_rcp_f32(+-0) = +-inf on RDNA2 (docs/design.md, special results); the translation no longer divides by
+        # zero, which SPIR-V leaves undefined.
+        self.assertEqual(run_op(bits32(0.0)), 0x7F800000)
+        self.assertEqual(run_op(bits32(-0.0)), 0xFF800000)
 
 
 if __name__ == "__main__":

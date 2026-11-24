@@ -725,16 +725,15 @@ class RcpF32AndIflagExecutionTests(unittest.TestCase):
                         got = run_op(f"{op}{suffix} v0, v1", x_bits)
                         self.assertTrue(is_f32_nan_bits(got), f"expected NaN, got {got:#010x}")
 
-    def test_zero_inputs_raise_unsupported_construct(self):
+    def test_zero_inputs_give_signed_inf(self):
+        # RDNA2: v_rcp_f32 / v_rcp_iflag_f32 of +-0 is +-inf (docs/design.md, special results)
         for op in self.OPS:
             for suffix in ("_e32", "_e64"):
-                for x_bits in (0x00000000, 0x80000000):
+                for x_bits, want in ((0x00000000, 0x7F800000), (0x80000000, 0xFF800000)):
                     with self.subTest(op=op + suffix, x=hex(x_bits)):
-                        with self.assertRaises(si.UnsupportedConstruct):
-                            run_op(f"{op}{suffix} v0, v1", x_bits)
+                        self.assertEqual(run_op(f"{op}{suffix} v0, v1", x_bits), want)
             with self.subTest(op=op, mod="-|0|"):
-                with self.assertRaises(si.UnsupportedConstruct):
-                    run_op(f"{op}_e64 v0, -|0|", 0)
+                self.assertEqual(run_op(f"{op}_e64 v0, -|0|", 0), 0xFF800000)
 
     def test_vop3_output_and_source_modifiers(self):
         cases = (
@@ -1134,11 +1133,12 @@ class NewtonRaphsonAccuracyAndEdgeCaseTests(unittest.TestCase):
                 self.assertEqual(run_nr_fdiv_ps(ab, bb), want)
 
     def test_zero_and_infinite_divisor_behavior(self):
-        # Division by +-0.0 is undefined in SPIR-V and raises UnsupportedConstruct
+        # A +-0.0 divisor: v_rcp_f32(+-0) = +-inf (RDNA2 special result), then the refinement FMA computes
+        # 1 - (+-0) * (+-inf) = NaN, so the quotient is NaN, as on hardware
         for z in (0x00000000, 0x80000000):
             with self.subTest(zero=hex(z)):
-                with self.assertRaises(si.UnsupportedConstruct):
-                    run_nr_fdiv_ps(f32_bits(1.0), z)
+                got = run_nr_fdiv_ps(f32_bits(1.0), z)
+                self.assertTrue(is_f32_nan_bits(got), f"expected NaN from a zero divisor, got {got:#010x}")
 
         # Infinite divisor: 1 / +-inf -> +-0.0, step 2 FMA calculates 1 - inf * 0 -> NaN
         for inf_bits in (0x7F800000, 0xFF800000):
