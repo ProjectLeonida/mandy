@@ -53,6 +53,7 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bcpack  # noqa: E402
 import bcpack_tables_bptc as _bptc  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 from tex_headers import (  # noqa: E402
     array_surface_layout, compact_surface_layout, cubemap_surface_layout,
     decode_etpf_chunk_pages, etpf_streaming_padding, gfx10_tile_bytes,
@@ -1493,15 +1494,6 @@ def analyze(pool, index, *, allow_bcpack=True):
 
 # --- commands --------------------------------------------------------------
 
-def same_output_path(first, second):
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def find_pools(arg):
     """Pools under a game root (data/ttdb and pack/*/data/ttdb), or, for any other folder such as data/ttdb
     itself or one pack, every .ttpf below it. A file is taken as a pool."""
@@ -2185,7 +2177,7 @@ def main(argv=None):
                 print(f"ERROR: --json {a.json} is a directory", file=sys.stderr)
                 return 2
             for p in pools:
-                if same_output_path(a.json, p):
+                if same_report_path(a.json, p):
                     print(f"ERROR: --json would overwrite the input {p}", file=sys.stderr)
                     return 2
         try:
@@ -2205,7 +2197,7 @@ def main(argv=None):
                 continue
             if label == "--history file" and not os.path.isfile(asset):
                 continue
-            if same_output_path(a.out, asset):
+            if same_report_path(a.out, asset):
                 print(f"ERROR: {a.out} would overwrite the {label} {asset}", file=sys.stderr)
                 return 2
     try:
