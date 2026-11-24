@@ -626,6 +626,9 @@ the DLLs never write (draws, input-assembler and output-merger state); read a fe
 - **Its vtable fallback is console slot 80** (section 3.3a), read from the code: when the buffer is full, each site
   calls slot 80 (`+0x280`) instead, as `(x, 1, 1, W)` with the same `W` (`0x149ba`, `0x1525d`, `0x153b4`, `0x1d047`).
   So the packet is slot 80's inline form; that slot 80 is a `Dispatch` with one extra word stays inferred.
+- **`DispatchX` routing:** `console_to_pc_list_slot` in `runtime/shims/d3d12_xs_device.h` routes console slot 80
+  to PC `Dispatch` (slot 14), forwarding `(x, y, z)` and ignoring the trailing `W` word (covered by
+  `xs_proxy_mock_test`).
 - **`W` is `0x8020`** at `0x14972` and `0x1d002`, and **`0x20`** at `0x15215` and `0x1536a`. What bit 15 of `W`
   selects is not known.
 
