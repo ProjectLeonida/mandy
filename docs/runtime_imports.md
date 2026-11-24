@@ -494,7 +494,7 @@ layout with the documented argument count, and each behaves as Microsoft's refer
 
 | Class | Interface asked for | Slots (args after `this`) | Offline behaviour |
 |---|---|---|---|
-| `XGameRuntimeFeatureImpl` | its class id | 3 `XGameRuntimeIsFeatureAvailable` (1, returns `bool`) | True when `QueryApiImpl` serves the class the feature's functions go through (whichever `xgameruntime*.cpp` serves it) and the feature is documented for Windows: today XAccessibility, XSpeechSynthesizer, XAppCapture, XLauncher, XAsync, XAsyncProvider, XTaskQueue, XThread, XError, XGame, XGameSave, XGameUI, XNetworking, XPackage, XPersistentLocalStorage, XStore, XSystem, XUser, XGameEvent, XGameStreaming. False for XDisplay (served, but documented for the consoles only), for the classes not served (XGameInvite) and for values past the enum |
+| `XGameRuntimeFeatureImpl` | its class id | 3 `XGameRuntimeIsFeatureAvailable` (1, returns `bool`) | True when `QueryApiImpl` serves the class the feature's functions go through (whichever `xgameruntime*.cpp` serves it) and the feature is documented for Windows: today XAccessibility, XSpeechSynthesizer, XAppCapture, XLauncher, XAsync, XAsyncProvider, XTaskQueue, XThread, XError, XGame, XGameSave, XGameUI, XNetworking, XPackage, XPersistentLocalStorage, XStore, XSystem, XUser, XGameEvent, XGameStreaming. False for XDisplay (served, but documented for the consoles only), for the classes not served (XGameInvite) and for values past the enum. For XAppCapture, "served" means the class id and the v1-v4 interface ids answer `QueryApiImpl` while every method of the offline object returns `E_NOTIMPL` - the feature is reported available, capture itself is not |
 | `XSystemAnalyticsImpl` | its class id | 3 `XSystemGetAnalyticsInfo` (1: the result's address, as MSVC passes a returned struct to a member function) | The named export's `XSystemAnalyticsInfo` |
 
 Not served yet, though `libHttpClient.GDK.dll` has thunks for them: `XGameInviteImpl`,
@@ -547,9 +547,14 @@ therefore needs no module name beyond the `xgameruntime.dll` it already has, whi
 | `XThreadingImpl` | 18 | 17 | yes |
 | `XUserImpl` | 21 | 21 | yes |
 
-"Served" is the tool's answer for the runtime sources at that commit. The two that are not: `XAccessibilityImpl`
-(the speech-synthesizer slots 8-13, 15, 16 and 21 are referenced; slot 14 is not) and `XLauncherImpl` (slots 3-5:
-`XLaunchUri` and the two display timeout-deferral calls). Open pull requests serve them: #4235 and #4248. The slots of `XUserImpl`, `XStoreImpl` and `XGameSaveImpl` the
+"Served" is the tool's answer for the runtime sources at that commit. `XAppCaptureImpl` (class
+`a4f1aee2-4bf1-4485-b008-a7c26d52ac27`) is served by this change: `g_app_capture` in `runtime/shims/xgameruntime.cpp`
+answers its class and interface ids in `QueryApiImpl`, and its 18-slot `IXAppCaptureImpl` through
+`IXAppCaptureImpl4` vtable is present in full, every slot answering `E_NOTIMPL` offline. `XAccessibilityImpl` and
+`XLauncherImpl` are served in `runtime/shims/xgameruntime_offline.cpp`, landed on main by the merged pull request
+#401 (RT-GDK-SPEECH-DISPLAY-LIFECYCLE, commit `05318a387`) - the table's `no` for the two is the measurement at
+`main` `1cc6e3c1`, before that merge. `XAppCaptureImpl` was the last of the executable's referenced thunks that no
+shim served: with it, all 158 referenced thunks are covered. The slots of `XUserImpl`, `XStoreImpl` and `XGameSaveImpl` the
 executable calls, and the argument counts the tool estimates from the registers, are in the report the tool writes.
 `XErrorImpl`, which `XCurl.dll` and `libHttpClient.GDK.dll` call, is not among the executable's classes.
 
