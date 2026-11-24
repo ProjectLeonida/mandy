@@ -106,9 +106,10 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
   )
 
-  # Rust XMA2 decoder (runtime/xma_decoder), built at configure time when cargo is on PATH,
+  # Rust XMA2 decoder (runtime/xma_decoder), opt-in at configure time when cargo is on PATH,
   # or supplied prebuilt via -DLEONIDA_XMA2_DECODER_LIB=<path> (skipping cargo at configure time).
   # Without it (or if the cargo build fails) the runtime still builds and XMA voices output silence.
+  option(LEONIDA_XMA2_DECODER "Build the Rust XMA2 decoder at configure time" OFF)
   option(LEONIDA_REQUIRE_XMA2_DECODER "Fail configure if the Rust XMA2 decoder is unavailable" OFF)
   set(LEONIDA_XMA2_DECODER_LIB "" CACHE FILEPATH
     "Prebuilt leonida_xma2_decoder.lib (skips running cargo at configure time)")
@@ -116,7 +117,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   leonida_resolve_prebuilt_xma2_decoder("${LEONIDA_XMA2_DECODER_LIB}" "${CMAKE_BINARY_DIR}" _xma_lib_resolved)
   if(_xma_lib_resolved)
     message(STATUS "Using prebuilt Rust XMA2 decoder: ${_xma_lib_resolved}")
-  else()
+  elseif(LEONIDA_XMA2_DECODER OR LEONIDA_REQUIRE_XMA2_DECODER)
     find_program(LEONIDA_CARGO cargo)
     if(LEONIDA_CARGO)
       # Cargo's host (or configured default target) can differ from the runtime's MSVC ABI.
@@ -141,6 +142,8 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     else()
       message(STATUS "cargo not found: runtime/xma_decoder not built, XMA voices will be silent")
     endif()
+  else()
+    message(STATUS "LEONIDA_XMA2_DECODER is OFF: runtime/xma_decoder not built, XMA voices will be silent")
   endif()
   if(_xma_lib_resolved)
     add_library(leonida_xma2_decoder STATIC IMPORTED)
@@ -152,10 +155,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       IMPORTED_LOCATION "${_xma_lib_resolved}"
       INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder"
       INTERFACE_COMPILE_DEFINITIONS LEONIDA_HAVE_XMA2_DECODER=1
-      INTERFACE_LINK_LIBRARIES "kernel32;ntdll;userenv;ws2_32;dbghelp;synchronization")
-  endif()
-  if(LEONIDA_REQUIRE_XMA2_DECODER AND NOT TARGET leonida_xma2_decoder)
-    message(FATAL_ERROR "LEONIDA_REQUIRE_XMA2_DECODER is enabled, but the Rust XMA2 decoder is unavailable")
   endif()
 
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
