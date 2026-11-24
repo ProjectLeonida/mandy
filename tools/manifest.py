@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 CHUNK = 8 * 1024 * 1024
@@ -174,11 +175,20 @@ def create(game_dir: str, out: str, jobs: int = 1) -> int:
     entries = {rel: entries[rel] for rel, _ in files}
     out_dir = os.path.dirname(os.path.abspath(out))
     os.makedirs(out_dir, exist_ok=True)
+    mode = published_mode(out)
     with tempfile.TemporaryDirectory(dir=out_dir) as staging:
         staged = os.path.join(staging, "manifest.json")
         with open(staged, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"created": time.strftime("%Y-%m-%d %H:%M:%S"), "files": entries}, f, indent=1)
-        os.replace(staged, out)
+        os.chmod(staged, mode)
+        try:
+            os.replace(staged, out)
+        except BaseException:
+            try:
+                os.chmod(staged, 0o600)
+            except OSError:
+                pass
+            raise
     print(f"{len(entries)} files, {total / 2**30:.1f} GiB -> {out}")
     return 0
 
