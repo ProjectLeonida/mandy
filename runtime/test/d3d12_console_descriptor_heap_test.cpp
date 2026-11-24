@@ -105,6 +105,30 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
                      static_cast<unsigned long long>(console.address));
         return false;
     }
+
+    // An ordinary one-descriptor desc followed by the words 1 and 32 (what d3d12_draw_test's RTV desc had after it
+    // on the stack under MSVC RelWithDebInfo): the size matches 1 * 32, but 0x1 is no heap address, so slot 14 has
+    // to create an ordinary heap instead of handing out 0x1 as the heap start.
+    ConsoleDescriptorHeapDesc stray{};
+    stray.desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    stray.desc.NumDescriptors = 1;
+    stray.address = 1;
+    stray.size = 32;
+    Ref<ID3D12DescriptorHeap> stray_heap;
+    const HRESULT stray_hr = proxy->CreateDescriptorHeap(&stray.desc, IID_PPV_ARGS(stray_heap.put()));
+    ID3D12DescriptorHeap* stray_real = SUCCEEDED(stray_hr) && stray_heap.get()
+                                           ? rt::d3d12_xs::heap_proxy_real_heap(stray_heap.p) : nullptr;
+    if (!stray_real) {
+        std::fprintf(stderr, "proxy CreateDescriptorHeap(stray trailing words) failed: 0x%08lx\n",
+                     static_cast<unsigned long>(stray_hr));
+        return false;
+    }
+    const auto stray_cpu = stray_real->GetCPUDescriptorHandleForHeapStart();
+    if (stray_cpu.ptr == 0 || stray_cpu.ptr == static_cast<SIZE_T>(stray.address)) {
+        std::fprintf(stderr, "stray trailing words were taken as a console heap: CPU start 0x%llx\n",
+                     static_cast<unsigned long long>(stray_cpu.ptr));
+        return false;
+    }
     return true;
 }
 

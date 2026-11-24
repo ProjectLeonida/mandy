@@ -1714,12 +1714,16 @@ HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t
 }
 
 // A console descriptor heap carries a size as well as an address, and that size is 32 bytes per descriptor. A PC
-// desc's trailing words are whatever the caller holds next; they do not encode NumDescriptors * 32, so this
-// separates the two layouts without guessing anything about the address itself.
+// desc's trailing words are whatever the caller holds next; they rarely encode NumDescriptors * 32, but for a
+// one-descriptor heap a small count of 32 next to it is enough. MSVC's RelWithDebInfo d3d12_draw_test leaves the
+// words 1 and 32 after its one-entry RTV desc, which passed the size check and turned the RTV handle into 0x1. So
+// the address also has to lie above the first 64 KiB, which Windows never maps (the lowest user-mode address is
+// 0x10000) and no console heap address can be in either.
 static bool console_heap_range_plausible(const D3D12_DESCRIPTOR_HEAP_DESC* desc, std::uint64_t address,
                                          std::uint64_t size) {
     constexpr std::uint64_t kConsoleDescriptorSize = 32;
-    if (address == 0 || size == 0) return false;
+    constexpr std::uint64_t kLowestMappedAddress = 0x10000;
+    if (address < kLowestMappedAddress || size == 0) return false;
     if (desc->NumDescriptors == 0 || desc->NumDescriptors > (0xFFFFFFFFull / kConsoleDescriptorSize)) return false;
     if (size != static_cast<std::uint64_t>(desc->NumDescriptors) * kConsoleDescriptorSize) return false;
     return true;
