@@ -101,6 +101,7 @@ struct VulkanDeviceFunctions {
     X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets)            \
     X(vkCmdPushConstants) X(vkCmdDispatch)                                                                     \
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
+    X(vkCmdSetViewportWithCount) X(vkCmdSetScissorWithCount)                                                   \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements)   \
@@ -987,6 +988,8 @@ public:
         replay_.bind_index_buffer = vk.vkCmdBindIndexBuffer;
         replay_.set_viewport = vk.vkCmdSetViewport;
         replay_.set_scissor = vk.vkCmdSetScissor;
+        replay_.set_viewport_with_count = vk.vkCmdSetViewportWithCount;
+        replay_.set_scissor_with_count = vk.vkCmdSetScissorWithCount;
         replay_.set_primitive_topology = vk.vkCmdSetPrimitiveTopology;
         replay_.set_primitive_restart_enable = vk.vkCmdSetPrimitiveRestartEnable;
         replay_.set_stencil_reference = vk.vkCmdSetStencilReference;
@@ -1283,6 +1286,11 @@ public:
         replay_.zero_buffer = buffer;
         replay_.zero_offset = offset;
         replay_.zero_size = size;
+    }
+
+    void set_depth_range_unrestricted(bool enabled) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.depth_range_unrestricted = enabled;
     }
 
     // Physical-device COLOR_ATTACHMENT format check for reinterpreted UAV clears.

@@ -67,6 +67,7 @@ XboxPresentation::XboxPresentation(std::unique_ptr<WindowPresenter> presenter, l
 }
 
 XboxPresentation::~XboxPresentation() {
+    if (presents_.load() > 0) log_pacing_summary();
     {
         std::lock_guard lock(worker_mutex_);
         worker_stop_ = true;
@@ -74,6 +75,26 @@ XboxPresentation::~XboxPresentation() {
     worker_wake_.notify_all();
     display_white_thread_.join();
     presenter_->set_abort(nullptr);
+}
+
+void XboxPresentation::log_pacing_summary() const {
+    const leonida::FramePacingSummary s = pacer_.pacing_summary();
+    std::fprintf(stderr,
+                 "[rt] present: pacing summary frames=%llu samples=%llu target_us=%u mean_us=%.1f drift_us=%+.1f "
+                 "p50_us=%llu p95_us=%llu p99_us=%llu latency_samples=%llu latency_p50_us=%llu "
+                 "latency_p95_us=%llu latency_p99_us=%llu\n",
+                 static_cast<unsigned long long>(s.frames),
+                 static_cast<unsigned long long>(s.samples),
+                 s.target_interval_us,
+                 s.mean_us,
+                 s.drift_us,
+                 static_cast<unsigned long long>(s.p50_us),
+                 static_cast<unsigned long long>(s.p95_us),
+                 static_cast<unsigned long long>(s.p99_us),
+                 static_cast<unsigned long long>(s.latency_samples),
+                 static_cast<unsigned long long>(s.latency_p50_us),
+                 static_cast<unsigned long long>(s.latency_p95_us),
+                 static_cast<unsigned long long>(s.latency_p99_us));
 }
 
 // Windows' SDR white level costs a QueryDisplayConfig and two DisplayConfigGetDeviceInfo calls (measured in

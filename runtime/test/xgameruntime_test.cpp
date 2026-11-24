@@ -579,8 +579,13 @@ void check_run_time_load() {
         char tiny[2] = {'x', 'x'};
         used = 99;
         check(reinterpret_cast<GetPath>(slot(pls, 4))(pls, 2, tiny, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
-                  used == 0,
-              "slot 4 refuses a buffer that is too small");
+                  used == size && tiny[0] == 'x' && tiny[1] == 'x',
+              "slot 4 refuses a buffer that is too small, reports the size it needs and leaves the buffer alone");
+        check(reinterpret_cast<GetPath>(slot(pls, 4))(pls, size - 1, path.data(), &used) ==
+                      HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && used == size,
+              "slot 4 reports the size for a buffer one byte short");
+        check(reinterpret_cast<GetPath>(slot(pls, 4))(pls, 2, tiny, nullptr) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+              "slot 4 tolerates a null used pointer on a short buffer");
 
         {
             std::ofstream cache_file(folder / L"cache.bin", std::ios::binary);
@@ -1089,6 +1094,37 @@ int main() {
     SetEnvironmentVariableA("LEONIDA_PACKAGED", "0");
     check(is_packaged() == false, "XPackageIsPackagedProcess respects LEONIDA_PACKAGED=0 override");
     SetEnvironmentVariableA("LEONIDA_PACKAGED", nullptr);
+
+    using AppMemoryLimitFn = uint64_t(__stdcall*)();
+    auto app_mem_limit = get<AppMemoryLimitFn>("XSystemGetAppMemoryUsageLimit");
+    check(app_mem_limit != nullptr, "XSystemGetAppMemoryUsageLimit is registered");
+    if (app_mem_limit) {
+        char saved_env[64]{};
+        const DWORD saved_n = GetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", saved_env, sizeof(saved_env));
+        SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", nullptr);
+        MEMORYSTATUSEX ms{sizeof(ms)};
+        const uint64_t expected_default = GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys : (12ULL << 30);
+        check(app_mem_limit() == expected_default, "XSystemGetAppMemoryUsageLimit reports host RAM by default");
+        SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "6144");
+        check(app_mem_limit() == 6144ULL * 1024ULL * 1024ULL,
+              "XSystemGetAppMemoryUsageLimit honors LEONIDA_TITLE_MEMORY_MB=6144");
+        SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "512");
+        check(app_mem_limit() == 2048ULL * 1024ULL * 1024ULL,
+              "XSystemGetAppMemoryUsageLimit clamps LEONIDA_TITLE_MEMORY_MB below 2048 MiB");
+        SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "131072");
+        check(app_mem_limit() == 65536ULL * 1024ULL * 1024ULL,
+              "XSystemGetAppMemoryUsageLimit clamps LEONIDA_TITLE_MEMORY_MB above 65536 MiB");
+        SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "notanumber");
+        check(app_mem_limit() == expected_default,
+              "XSystemGetAppMemoryUsageLimit ignores invalid LEONIDA_TITLE_MEMORY_MB");
+        SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "6144mb");
+        check(app_mem_limit() == expected_default,
+              "XSystemGetAppMemoryUsageLimit ignores LEONIDA_TITLE_MEMORY_MB with trailing text");
+        SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "-4096");
+        check(app_mem_limit() == expected_default,
+              "XSystemGetAppMemoryUsageLimit ignores negative LEONIDA_TITLE_MEMORY_MB");
+        SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", (saved_n > 0 && saved_n < sizeof(saved_env)) ? saved_env : nullptr);
+    }
 
     // Work on the thread pool, completions dispatched by the "game loop" on this thread.
     auto create = get<QueueCreateFn>("XTaskQueueCreate");

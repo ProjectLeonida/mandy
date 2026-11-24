@@ -34,6 +34,7 @@ FARPROC host(const char* name) {
 
 using SerializeFn = decltype(&::D3D12SerializeVersionedRootSignature);
 using DeserializerFn = decltype(&::D3D12CreateRootSignatureDeserializer);
+using VersionedDeserializerFn = decltype(&::D3D12CreateVersionedRootSignatureDeserializer);
 using LegacySerializeFn = decltype(&::D3D12SerializeRootSignature);
 using CreateDeviceFn = decltype(&::D3D12CreateDevice);
 
@@ -117,11 +118,34 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
     return fn(data, size, iid, out);
 }
 
+HRESULT WINAPI create_versioned_root_signature_deserializer(const void* data, SIZE_T size, REFIID iid, void** out) {
+    static auto fn = reinterpret_cast<VersionedDeserializerFn>(host("D3D12CreateVersionedRootSignatureDeserializer"));
+    if (!fn) return E_NOTIMPL;
+
+    std::vector<uint8_t> cleared;
+    if (rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(data, static_cast<size_t>(size), cleared)) {
+        return fn(cleared.data(), cleared.size(), iid, out);
+    }
+    return fn(data, size, iid, out);
+}
+
+void* xmem_descriptor_heap_alloc(std::size_t byte_size, std::uint64_t attributes) {
+    const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
+    return (hooks && hooks->alloc) ? hooks->alloc(byte_size, attributes) : nullptr;
+}
+
+void xmem_descriptor_heap_free(void* ptr, std::uint64_t attributes) {
+    const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
+    if (hooks && hooks->free) hooks->free(ptr, attributes);
+}
+
 // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only
 // logged and not used to create the device. The struct's total size is unknown, so the log reads 24 x 32-bit words
-// (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead, so 12_0 is used as the
-// least restrictive floor; higher feature levels are still exposed by the created device.
+// (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead: create_host_device asks for
+// 11_0, the least restrictive one (BL-2; 12_0 refused an adapter that tops out at 11_x), and the device still has its
+// highest level.
 HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, const IID* riid, void** out) {
+    rt::d3d12_xs::set_default_descriptor_heap_allocator(&xmem_descriptor_heap_alloc, &xmem_descriptor_heap_free);
     constexpr auto method = "D3D12XboxCreateDevice";
     using rt::d3d12_trace::result;
     if (!out) return result(method, E_POINTER);
@@ -155,6 +179,12 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         std::fprintf(stderr,
                      "[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the PC ID3D12Device in the Xbox-ABI proxy "
                      "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n");
+        // A console method whose slot is another PC method (61) is served only to the title: a caller in an image
+        // this loader mapped.
+        rt::d3d12_xs::set_console_caller([](std::uint64_t address) {
+            std::uint64_t base = 0;
+            return rt::shims::mapped_image_base(address, base);
+        });
     }
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -190,13 +220,11 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     if (!create) return result(method, E_NOTIMPL);
 
     ID3D12Device* real = nullptr;
-    HRESULT hr = create(adapter, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device),
-                        reinterpret_cast<void**>(&real));
-    if (FAILED(hr) || !real) {
-        if (real) real->Release();
+    HRESULT hr = rt::d3d12_xs::create_host_device(create, adapter, &real);
+    if (FAILED(hr)) {
         std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: PC D3D12CreateDevice failed (hr=0x%08lx)\n",
                      static_cast<unsigned long>(hr));
-        return result(method, FAILED(hr) ? hr : E_FAIL);
+        return result(method, hr);
     }
 
     hr = rt::d3d12_xs::create_device_proxy(real, *riid, out);
@@ -215,6 +243,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
 
 static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
 static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
+static_assert(std::is_same_v<decltype(&create_versioned_root_signature_deserializer), VersionedDeserializerFn>);
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
 
 // Measured call (RT-5, 1.0.2.1): the title calls it once at startup with one pointer to a zeroed 32-byte block whose
@@ -229,6 +258,9 @@ SHIM_TABLE(d3d12_xs,
     {"d3d12_xs.dll", "D3D12SerializeRootSignature", reinterpret_cast<void*>(&serialize_root_signature_legacy)},
     {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer",
      reinterpret_cast<void*>(&create_root_signature_deserializer)},
+    {"d3d12_xs.dll", "D3D12CreateVersionedRootSignatureDeserializer",
+     reinterpret_cast<void*>(&create_versioned_root_signature_deserializer)},
+    {"d3d12_xs.dll", "#7", reinterpret_cast<void*>(&create_versioned_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
     {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&configure_virtual_memory)},
 );

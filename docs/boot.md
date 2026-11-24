@@ -29,8 +29,11 @@ Two traces are written independently:
 
 `tools/boot_trace.py` reads both and prints the triage units: modules, unimplemented calls and callers,
 DllMain/TLS results, exceptions with their stack frames, the exit, and the D3D12 calls by outcome and first call
-per method. The `[rt]` lines in the same stderr log carry the device parameters, feature ids and warnings; the
-summary leaves them as a count, so grep `^\[rt\]` for those.
+per method. When `XboxPresentation` logs its teardown `[rt] present: pacing summary ...` line (BL-6), the D3D12
+summary also reports the frame count, interval count, target interval, mean and drift against target, `p50`/`p95`/`p99`
+frame times, and `p50`/`p95`/`p99` origin-to-present latencies (and includes the numeric `frame_pacing` object in
+`--json` and `--counts-only`). The remaining `[rt]` lines in the same stderr log carry the device parameters, feature
+ids and warnings; the summary leaves them as a count, so grep `^\[rt\]` for those.
 
 For `xmem_physical_pages`, the shim records the first request for each distinct attribute word. The text and
 JSON summaries list the API, raw attribute word, requested page count and caller for the first `--limit`
@@ -75,10 +78,17 @@ wine runtime/build/windows/gta6rt.exe --run /path/to/game_scarlett_master.exe \
 python3 -I tools/boot_trace.py /tmp/boot.jsonl --d3d12 /tmp/d3d12.log
 ```
 
+`runtime\build\gta6rt.exe` is where `scripts\build_runtime.ps1` (Ninja) puts it; the direct CMake path in
+[runtime/README.md](../runtime/README.md) uses the multi-config Visual Studio generator, which writes
+`runtime\build\RelWithDebInfo\gta6rt.exe` instead.
+
 `--trace FILE` **refuses an existing file** (exit 2): it is created before the loader reads anything, so use a
 fresh name or delete the old one. `LEONIDA_D3D12=vulkan` selects the Vulkan-backed device, the only backend that
-writes the `[d3d12-trace]` lines; without it the layer uses the Windows D3D12 device and the trace has nothing to
-read. Keep the traces out of the repository: they can quote whatever the game prints.
+traces command lists, resources and pipelines; without it the layer uses the Windows D3D12 device, and the
+`[d3d12-trace]` lines are only what the Xbox-ABI proxy forwards (device creation, queue, fence and allocator
+calls), which `boot_trace.py` summarizes without complaint. A run on the Vulkan device prints
+`[rt] d3d12: Vulkan device: <name>`; check the log for it (a runtime built without the Vulkan headers accepts the
+variable and stays on the Windows device). Keep the traces out of the repository: they can quote whatever the game prints.
 
 Useful switches:
 
@@ -99,7 +109,8 @@ Useful switches:
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their
   implicit layers add swapchain usage that shows up as validation errors ([testing.md](testing.md), "Known
   problems").
-* `--overlay DIR` sends the guest's writes to a private folder instead of the package.
+* `--overlay DIR` sends the guest's writes to DIR instead of the default `<game-dir>\overlay` (useful when the
+  package drive is read-only); the package itself is never written.
 
 ## 3. Triage order
 
@@ -114,13 +125,25 @@ Read the startup trace first; the first event that is not the expected one is th
    TLS index. The summary shows the address and phase of the last observed TLS callback
    (`last_tls_callback` in JSON). The loader records it before invoking the callback, so the record gives no
    completion result. The loader's own TLS is checked by `run_tiny_game_tls`.
+   An access violation in CRT startup before the first D3D12 call can be the TLS index instead: code built with
+   `/GA` reads its thread-local data at module index 0 without `_tls_index`, and index 0 belongs to `gta6rt.exe`
+   (stop 4 of [retail_boot_chain.md](retail_boot_chain.md)). `load()` rewrites those reads in a mapped executable
+   so that they reach the image's own block, and every other mapped module with a TLS directory has an index of
+   its own ([`runtime/README.md`](../runtime/README.md), "PE loader"). The stderr log has one
+   `[rt] loader: <image>: <N> index-0 TLS reads` line for the executable; `N` 0 on an image that faults there
+   means its reads have a shape the rewrite does not know. `LEONIDA_TLS_GA_PATCH=0` turns the rewrite off, to
+   see the stop without it. `loader_tls` checks both ways with a synthetic `/GA` executable mapped beside a DLL
+   that has TLS of its own, on the loading thread and on a new one, and `run_tiny_game_ga_tls` runs a `/GA`
+   build of the stand-in game through `gta6rt --run`. Not confirmed here on the retail executable: that needs
+   game files.
 4. **`exception`** — code, `at`, access/address and the stack frames. The loader's vectored handler only records,
    so the process behaviour is the same with or without the trace. When the report reaches `--limit`, it reserves
    the final slot for the last observed exception. The trace also includes handled exceptions, so the last
    observation alone does not establish what caused the run to stop.
 5. **`exit` / `error`** — a clean exit is not a correct frame; continue to the D3D12 trace.
-6. **D3D12 trace** — the `failed`, `unsupported`, `refused` and `partial` lines name the method. A `partial`
-   submission ran the supported commands from a list. The runtime's `[rt]` diagnostic names the command it left out.
+6. **D3D12 trace** — the `failed`, `unsupported` and `refused` lines name the method. A `failed`
+   `ExecuteCommandLists` submitted nothing from its lists. (`boot_trace.py` also lists a `partial` outcome, a
+   submission that ran only the supported commands; the runtime does not write it yet.)
    Compare the method's position with the public SDK vtable. An unknown slot is expected until the executable names it
    (Q2, Q6). The `[rt]` lines in the same log carry the 24 device words, feature IDs and warnings.
    The summary expects `#1` first, then one more than the last observed number. It counts each mismatch once and
@@ -139,8 +162,8 @@ is `null`; if neither input yields a report, stdout is empty.
 
 ## 4. The open questions, and the trace signal for each
 
-The questions are in [`d3d12_vulkan.md`](d3d12_vulkan.md) §8.2; that table repeats 16, 19 and 20, and this one is
-the de-duplicated 1–22. It maps each question to the event to look for; it does not answer them.
+The questions are in [`d3d12_vulkan.md`](d3d12_vulkan.md) §8.2; this table takes the same 1–22 in
+order. It maps each question to the event to look for; it does not answer them.
 
 | # | Question | Signal in the first trace |
 |---|---|---|
@@ -181,5 +204,6 @@ the de-duplicated 1–22. It maps each question to the event to look for; it doe
 The retail executable is not in the package, so this page is untested against it; the tool and the trace formats
 are tested on synthetic fixtures and on `tiny_game` (which has no D3D12 calls). The present slots (Q6) and the
 Xbox device parameters (Q1) remain the first things the executable itself has to name. The D3D12 trace needs the
-Vulkan backend; a build without it runs the game's calls through the PC device and records nothing. The runbook
+Vulkan backend; a build without it runs the game's calls through the PC device and records only the proxy's
+device, queue, fence and allocator calls. The runbook
 does not make the game boot; it makes the first real trace readable.

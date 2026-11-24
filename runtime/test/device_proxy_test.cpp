@@ -23,6 +23,7 @@
 #include <wrl/client.h>
 
 #include "d3d12_trace.h"
+#include "d3d12_xs_desc_clean.h"
 #include "d3d12_xs_device.h"
 #include "shims.h"
 
@@ -160,6 +161,9 @@ int main(int argc, char** argv) {
     check(rt::d3d12_xs::device_slot_overridden(14), "device slot 14 is the descriptor-heap override");
     check(rt::d3d12_xs::device_slot_overridden(62), "device slot 62 is the compute-PSO override");
     check(rt::d3d12_xs::device_slot_overridden(76), "device slot 76 is the resource override");
+    check(rt::d3d12_xs::device_slot_overridden(86), "device slot 86 is the CreatePipelineState override");
+    check(rt::d3d12_xs::device_slot_overridden(101), "device slot 101 is the CreateStateObject override");
+    check(rt::d3d12_xs::device_slot_overridden(108), "device slot 108 is the GetResourceAllocationInfo2 override");
     check(rt::d3d12_xs::device_slot_overridden(67),
           "device slot 67 is the DeserializeComputePipelineStateX override (console native-code compute pipeline, not PC CreateProtectedResourceSession1)");
 
@@ -225,7 +229,11 @@ int main(int argc, char** argv) {
         const D3D12_RESOURCE_DESC desc = buffer_desc();
         D3D12_RESOURCE_ALLOCATION_INFO got{~0ull, ~0ull};
         D3D12_RESOURCE_ALLOCATION_INFO* returned = get_alloc_info(&got, device.Get(), 0, 1, &desc);
-        const D3D12_RESOURCE_ALLOCATION_INFO want = real->GetResourceAllocationInfo(0, 1, &desc);
+        // The proxy cleans the console layout word and flag bits before the PC call (stop 16), so the expected answer is
+        // the PC device's for the cleaned description (the raw 0x101 layout makes WARP answer UINT64_MAX).
+        const D3D12_RESOURCE_DESC clean = rt::d3d12_xs::pc_resource_desc(desc);
+        const D3D12_RESOURCE_ALLOCATION_INFO want = real->GetResourceAllocationInfo(0, 1, &clean);
+        check(want.SizeInBytes != UINT64_MAX, "WARP accepts the normalized slot-25 buffer description");
         check(returned == &got, "slot 25 returns the caller's buffer in RAX");
         check(got.SizeInBytes == want.SizeInBytes && got.Alignment == want.Alignment,
               "slot 25 (C ABI) writes the PC device's GetResourceAllocationInfo into the caller's buffer");
@@ -516,6 +524,101 @@ int main(int argc, char** argv) {
         check(SUCCEEDED(hr) && pso67 != nullptr, "slot 67 creates a compute PSO via CreateComputePipelineState");
         check(rt::d3d12_xs::device_slot_hits(67) == 1, "slot 67 hit counter is 1");
         check(rt::d3d12_xs::device_slot_first_call_seen(67), "slot 67 first-call flag is set");
+
+        // Slot 86: CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**), forwarded to PC
+        // ID3D12Device2::CreatePipelineState (PC slot 47).
+        if (slots > 47) {
+            struct alignas(void*) ComputeStream {
+                alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE root_type =
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+                ID3D12RootSignature* root_sig = nullptr;
+                alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE cs_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS;
+                D3D12_SHADER_BYTECODE cs{};
+            } stream;
+            stream.root_sig = root_signature.Get();
+            stream.cs.pShaderBytecode = bytecode->GetBufferPointer();
+            stream.cs.BytecodeLength = bytecode->GetBufferSize();
+            D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(stream), &stream};
+            using XboxCreatePipelineStateFn =
+                HRESULT(WINAPI*)(void*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*, void**);
+            auto create_stream_pso = reinterpret_cast<XboxCreatePipelineStateFn>(proxy_vtbl[86]);
+            ComPtr<ID3D12PipelineState> pso86;
+            hr = create_stream_pso(device.Get(), &stream_desc, &iid_pso,
+                                   reinterpret_cast<void**>(pso86.GetAddressOf()));
+            check(SUCCEEDED(hr) && pso86 != nullptr,
+                  "slot 86 creates a PSO via PC ID3D12Device2::CreatePipelineState (slot 47)");
+            check(rt::d3d12_xs::device_slot_hits(86) == 1, "slot 86 hit counter is 1");
+            check(rt::d3d12_xs::device_slot_first_call_seen(86), "slot 86 first-call flag is set");
+        }
+    }
+
+    // Slot 101: CreateStateObject(const D3D12_STATE_OBJECT_DESC*, REFIID, void**), forwarded to PC
+    // ID3D12Device5::CreateStateObject (PC slot 62).
+    if (slots > 62) {
+        using XboxCreateStateObjectFn = HRESULT(WINAPI*)(void*, const D3D12_STATE_OBJECT_DESC*, const IID*, void**);
+        auto create_state_object = reinterpret_cast<XboxCreateStateObjectFn>(proxy_vtbl[101]);
+        D3D12_STATE_OBJECT_DESC empty_so{};
+        empty_so.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
+        void* so_out = reinterpret_cast<void*>(0x1111);
+        hr = create_state_object(device.Get(), &empty_so, nullptr, &so_out);
+        check(hr == E_POINTER && so_out == nullptr, "slot 101 nulls its output for a null IID");
+        check(rt::d3d12_xs::device_slot_hits(101) == 1, "slot 101 hit counter is 1");
+    }
+
+    // Slot 108: GetResourceAllocationInfo2(ret, this, visible_mask, count, descs, info1) with C-ABI struct return,
+    // 56-byte D3D12_RESOURCE_DESC entries, and Xbox layout/flag words, compared against direct PC
+    // ID3D12Device8::GetResourceAllocationInfo2 (PC slot 68).
+    if (slots > 68) {
+        ComPtr<ID3D12Device8> real_device8;
+        if (real && SUCCEEDED(real->QueryInterface(IID_PPV_ARGS(real_device8.GetAddressOf()))) && real_device8) {
+            D3D12_RESOURCE_DESC xbox_descs[2]{};
+            xbox_descs[0].Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            xbox_descs[0].Width = 64;
+            xbox_descs[0].Height = 64;
+            xbox_descs[0].DepthOrArraySize = 1;
+            xbox_descs[0].MipLevels = 1;
+            xbox_descs[0].Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            xbox_descs[0].SampleDesc.Count = 1;
+            xbox_descs[0].Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+            xbox_descs[0].Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | 0x300000u);
+            xbox_descs[1].Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            xbox_descs[1].Width = 4096;
+            xbox_descs[1].Height = 1;
+            xbox_descs[1].DepthOrArraySize = 1;
+            xbox_descs[1].MipLevels = 1;
+            xbox_descs[1].SampleDesc.Count = 1;
+            xbox_descs[1].Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+            xbox_descs[1].Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x200000u);
+
+            D3D12_RESOURCE_DESC1 pc_descs[2]{};
+            std::memcpy(&pc_descs[0], &xbox_descs[0], sizeof(D3D12_RESOURCE_DESC));
+            pc_descs[0].SamplerFeedbackMipRegion = {};
+            pc_descs[0].Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            pc_descs[0].Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            std::memcpy(&pc_descs[1], &xbox_descs[1], sizeof(D3D12_RESOURCE_DESC));
+            pc_descs[1].SamplerFeedbackMipRegion = {};
+            pc_descs[1].Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            pc_descs[1].Flags = D3D12_RESOURCE_FLAG_NONE;
+
+            D3D12_RESOURCE_ALLOCATION_INFO1 pc_info1[2]{};
+            const D3D12_RESOURCE_ALLOCATION_INFO pc_info =
+                real_device8->GetResourceAllocationInfo2(1, 2, pc_descs, pc_info1);
+
+            using XboxGetAllocInfo2CAbiFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(
+                D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT, const D3D12_RESOURCE_DESC*,
+                D3D12_RESOURCE_ALLOCATION_INFO1*);
+            auto get_alloc_info2 = reinterpret_cast<XboxGetAllocInfo2CAbiFn>(proxy_vtbl[108]);
+            D3D12_RESOURCE_ALLOCATION_INFO xbox_info{};
+            D3D12_RESOURCE_ALLOCATION_INFO1 xbox_info1[2]{};
+            D3D12_RESOURCE_ALLOCATION_INFO* ret_ptr =
+                get_alloc_info2(&xbox_info, device.Get(), 1, 2, xbox_descs, xbox_info1);
+            check(ret_ptr == &xbox_info && xbox_info.SizeInBytes == pc_info.SizeInBytes &&
+                      xbox_info.Alignment == pc_info.Alignment && xbox_info1[0].SizeInBytes == pc_info1[0].SizeInBytes &&
+                      xbox_info1[1].SizeInBytes == pc_info1[1].SizeInBytes,
+                  "slot 108 C-ABI GetResourceAllocationInfo2 with 56-byte Xbox descs matches PC Device8");
+            check(rt::d3d12_xs::device_slot_hits(108) == 1, "slot 108 hit counter is 1");
+        }
     }
 
     // _COM_Outptr_ (d3d12.h): a failed create leaves NULL in the output. WARP accepts invalid heap descriptions,
@@ -575,6 +678,71 @@ int main(int argc, char** argv) {
             check(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(owner.GetAddressOf()))) && owner.Get() == device.Get(),
                   "the queue proxy's GetDevice is the device the shim returned");
         }
+    }
+
+    // Title-exported __XMemAllocationHooks__ backing for CreateDescriptorHeap (slot 14) + CPU handle translation
+    // against the real WARP D3D12 runtime.
+    {
+        struct HookState {
+            alignas(64) std::uint8_t backing[4096]{};
+            std::size_t alloc_size = 0;
+            std::uint64_t alloc_attr = 0;
+            void* freed_ptr = nullptr;
+            std::uint64_t freed_attr = 0;
+            int alloc_count = 0;
+            int free_count = 0;
+        };
+        static HookState hook_state;
+        hook_state = {};
+        struct HookCallbacks {
+            static void* __stdcall alloc(std::size_t size, std::uint64_t attr) {
+                ++hook_state.alloc_count;
+                hook_state.alloc_size = size;
+                hook_state.alloc_attr = attr;
+                if ((attr & 0x3FFFull) == 4 && size <= sizeof(hook_state.backing)) return hook_state.backing;
+                return nullptr;
+            }
+            static void __stdcall free(void* ptr, std::uint64_t attr) {
+                ++hook_state.free_count;
+                hook_state.freed_ptr = ptr;
+                hook_state.freed_attr = attr;
+            }
+        };
+        const rt::shims::XMemAllocationHooks title_hooks{&HookCallbacks::alloc, &HookCallbacks::free};
+        rt::shims::add_xmem_allocation_hooks(&title_hooks, &title_hooks);
+
+        D3D12_DESCRIPTOR_HEAP_DESC hooked_desc{};
+        hooked_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hooked_desc.NumDescriptors = 4;
+        hooked_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        const UINT inc = device->GetDescriptorHandleIncrementSize(hooked_desc.Type);
+        ComPtr<ID3D12DescriptorHeap> hooked_heap;
+        hr = device->CreateDescriptorHeap(&hooked_desc, IID_PPV_ARGS(hooked_heap.GetAddressOf()));
+        check(SUCCEEDED(hr) && hooked_heap != nullptr, "hooked slot 14 creates a descriptor heap");
+        check(hook_state.alloc_count == 1 && hook_state.alloc_size == hooked_desc.NumDescriptors * inc &&
+                  hook_state.alloc_attr == rt::d3d12_xs::kXmemDescriptorHeapAttributes,
+              "slot 14 invokes __XMemAllocationHooks__ with heap byte size and D3D descriptor-heap attributes");
+        if (hooked_heap) {
+            void** hooked_vtbl = *reinterpret_cast<void***>(hooked_heap.Get());
+            const auto hooked_cpu = reinterpret_cast<GetCpuHandleFn>(hooked_vtbl[9])(hooked_heap.Get());
+            const auto hooked_gpu = reinterpret_cast<GetGpuHandleFn>(hooked_vtbl[10])(hooked_heap.Get());
+            const auto expected_base = reinterpret_cast<SIZE_T>(hook_state.backing);
+            check(hooked_cpu.ptr == expected_base,
+                  "hooked heap slot 9 returns the title-supplied CPU descriptor base");
+            check(hooked_gpu.ptr != 0, "hooked heap slot 10 returns a valid GPU descriptor start");
+
+            // Create a CBV at slot 1 of the title-backed heap; WARP validates the translated real handle.
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
+            cbv.BufferLocation = 0;
+            cbv.SizeInBytes = 256;
+            device->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{expected_base + inc});
+            check(true, "CreateConstantBufferView translates a title-backed CPU descriptor handle on WARP");
+        }
+        hooked_heap.Reset();
+        check(hook_state.free_count == 1 && hook_state.freed_ptr == hook_state.backing &&
+                  hook_state.freed_attr == rt::d3d12_xs::kXmemDescriptorHeapAttributes,
+              "releasing the hooked heap frees its backing through __XMemAllocationHooks__");
+        rt::shims::remove_xmem_allocation_hooks(&title_hooks);
     }
 
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.

@@ -216,7 +216,10 @@ inline VkPipelineStageFlags2 vulkan_sync(std::uint32_t sync) {
          VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT},
         {y::render_target, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
         {y::compute_shading, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
-        {y::copy, VK_PIPELINE_STAGE_2_COPY_BIT},
+        // CLEAR as well: two D3D12 copy-scope commands are recorded as Vulkan clear commands, WriteBufferImmediate
+        // as vkCmdUpdateBuffer and ResolveQueryData's never-written queries as vkCmdFillBuffer, and synchronization2
+        // puts both in the CLEAR stage, not COPY.
+        {y::copy, VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT},
         {y::resolve, VK_PIPELINE_STAGE_2_RESOLVE_BIT},
         {y::execute_indirect, VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT},
         {y::all_shading, pre_raster | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
@@ -773,6 +776,7 @@ struct GraphicsPipeline {
     std::uint32_t zero_step_slots = 0;    // per-instance slots with InstanceDataStepRate 0: stride 0 at draw time
     std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
     bool mesh = false;                    // a mesh shader instead of a vertex shader: drawn by DispatchMesh only
+    bool viewport_with_count = false;     // pipeline uses VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
     // and stencil. Null when it cannot be built.
@@ -814,6 +818,7 @@ struct ReplayFunctions {
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
     PFN_vkCmdClearColorImage clear_color_image = nullptr;
     PFN_vkCmdClearDepthStencilImage clear_depth_stencil_image = nullptr;
+    bool depth_range_unrestricted = false;  // Allows out-of-range float depth clear values.
     // Optional; a list that needs a missing one is rejected with ReplayResult::unsupported.
     PFN_vkCmdPipelineBarrier2 pipeline_barrier2 = nullptr;  // enhanced barriers
     VkPipelineStageFlags2 queue_stages = 0;
@@ -854,6 +859,8 @@ struct ReplayFunctions {
     PFN_vkCmdBindIndexBuffer bind_index_buffer = nullptr;
     PFN_vkCmdSetViewport set_viewport = nullptr;
     PFN_vkCmdSetScissor set_scissor = nullptr;
+    PFN_vkCmdSetViewportWithCount set_viewport_with_count = nullptr;
+    PFN_vkCmdSetScissorWithCount set_scissor_with_count = nullptr;
     PFN_vkCmdSetPrimitiveTopology set_primitive_topology = nullptr;
     PFN_vkCmdSetPrimitiveRestartEnable set_primitive_restart_enable = nullptr;
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
@@ -2134,6 +2141,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
     if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
+    if (pipeline->viewport_with_count && (!vk.set_viewport_with_count || !vk.set_scissor_with_count))
+        return ReplayResult::unsupported;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
     p.graphics = pipeline;
@@ -2182,9 +2191,17 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         if (!a.view) return ReplayResult::unsupported;
         shrink(a.binding, draw.depth, a.range);
     }
-    if (p.area.width == UINT32_MAX) {  // no attachment: the viewport bounds the rendering
-        p.area = {std::uint32_t(std::max(0.0f, draw.viewport.x + draw.viewport.width)),
-                  std::uint32_t(std::max(0.0f, draw.viewport.y + draw.viewport.height))};
+    if (p.area.width == UINT32_MAX) {  // no attachment: the viewports bound the rendering
+        std::uint32_t max_w = std::uint32_t(std::max(0.0f, draw.viewport.x + draw.viewport.width));
+        std::uint32_t max_h = std::uint32_t(std::max(0.0f, draw.viewport.y + draw.viewport.height));
+        if (draw.viewports) {
+            for (std::uint32_t i = 0; i < draw.viewports->viewport_count; ++i) {
+                const Viewport& v = draw.viewports->viewports[i];
+                max_w = std::max(max_w, std::uint32_t(std::max(0.0f, v.x + v.width)));
+                max_h = std::max(max_h, std::uint32_t(std::max(0.0f, v.y + v.height)));
+            }
+        }
+        p.area = {max_w, max_h};
     }
     p.layers = layers == UINT32_MAX ? 1 : std::max(1u, layers);
 
@@ -3071,13 +3088,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const VkDeviceSize record_size = detail::indirect_record_size(ind->kind);
             if (!record_size || ind->stride < record_size || ind->stride % sizeof(std::uint32_t))
                 return ReplayResult::invalid_indirect_arguments;
-            // The span is max_count * stride, the bytes the signature can walk, as D3D12 measures it: a record that
-            // fits at the end of the buffer while its stride runs past it is refused (`240` with stride `20` in a
-            // `256`-byte buffer). A zero max_count still has to name an offset inside the buffer.
-            if (ind->argument_offset > p.binding.size ||
-                ind->max_count > (p.binding.size - ind->argument_offset) / ind->stride ||
-                !detail::indirect_range(p.binding, ind->argument_offset,
-                                        VkDeviceSize(ind->max_count) * ind->stride))
+            // The range is the bytes the commands read, (max_count - 1) * stride + record_size: the rule recording
+            // applies (d3d12_com.cpp, ExecuteIndirect) and the one vkCmdDraw*Indirect states. A zero max_count is a
+            // no-op that recording never passes on; if one arrives it reads nothing and needs no range.
+            if (ind->max_count
+                    ? !detail::indirect_range(p.binding, ind->argument_offset,
+                                              VkDeviceSize(ind->max_count - 1) * ind->stride + record_size)
+                    : (p.binding.buffer_offset | ind->argument_offset) % sizeof(std::uint32_t) != 0)
                 return ReplayResult::invalid_indirect_arguments;
             if (ind->count_buffer) {
                 const ResourceBinding* cnt = resolve(ind->count_buffer);
@@ -3158,6 +3175,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 VkDeviceSize offset = 0;
                 if (!vk.buffer_at(info->dest_va, room, buffer, offset)) return ReplayResult::unresolved_resource;
                 if (room < 8 * info->sources.size()) return ReplayResult::invalid_copy;
+                if (!info->sources.empty()) {
+                    // dest_va is resolved by VA and may target a host-readable buffer; XDXR postbuild writes from compute.
+                    out.wrote_readback = true;
+                    out.readback_src_stages |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                }
             } else if (info->type == 0 && vk.write_acceleration_structures_properties &&
                        vk.resolve_acceleration_structure && vk.reset_query_pool && vk.copy_query_pool_results &&
                        vk.pipeline_barrier && vk.buffer_at && vk.prepare_khr_postbuild) {
@@ -3602,16 +3624,23 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const bool discard = (texture->flags & texture_barrier_discard) ||
                                  texture->layout_before == d3d12_layout::undefined;
+            // LayoutAfter UNDEFINED from a defined layout: the contents are no longer needed (the memory is about to
+            // be aliased, say). Vulkan has no transition into UNDEFINED (VUID-VkImageMemoryBarrier2-newLayout-01198),
+            // so each piece keeps the layout it is in and the barrier only orders the accesses; the tracker keeps
+            // that layout too. D3D12 has the next barrier on these subresources start from UNDEFINED, which discards
+            // from whatever layout they are in.
+            const bool release = texture->layout_after == d3d12_layout::undefined &&
+                                 texture->layout_before != d3d12_layout::undefined;
             const VkImageLayout new_layout =
                 image_layout(p.binding, vulkan_layout(texture->layout_after, p.binding.presentable));
             LayoutPieces pieces;
-            if (discard)
+            if (discard && !release)
                 pieces.push_back({range, VK_IMAGE_LAYOUT_UNDEFINED});
             else {
                 const VkImageLayout before =
                     image_layout(p.binding, vulkan_layout(texture->layout_before, p.binding.presentable));
                 pieces = detail::current(tracker, id, range, before);
-                detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker);
+                if (!release) detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker);
             }
             const BarrierScope src = vulkan_barrier_scope(texture->sync_before, texture->access_before, predicates);
             const BarrierScope dst = vulkan_barrier_scope(texture->sync_after, texture->access_after, predicates);
@@ -3622,6 +3651,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             VkImageMemoryBarrier2* const barriers = many.empty() ? few.data() : many.data();
             std::uint32_t barrier_count = 0;
             for (const auto& piece : pieces) {
+                // Released before it was ever used (the tracker still has it in UNDEFINED): nothing to order.
+                if (release && piece.layout == VK_IMAGE_LAYOUT_UNDEFINED) continue;
                 VkImageMemoryBarrier2& b = barriers[barrier_count++];
                 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
                 b.srcStageMask = src.stages;
@@ -3629,7 +3660,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 b.srcAccessMask = src.access;
                 b.dstAccessMask = dst.access;
                 b.oldLayout = piece.layout;
-                b.newLayout = new_layout;
+                b.newLayout = release ? piece.layout : new_layout;
                 b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 b.image = p.binding.image;
@@ -3637,11 +3668,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 if (b.srcStageMask) detail::restrict_to_queue(vk, b.srcStageMask, b.srcAccessMask);
                 if (b.dstStageMask) detail::restrict_to_queue(vk, b.dstStageMask, b.dstAccessMask);
             }
-            VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-            dependency.imageMemoryBarrierCount = barrier_count;
-            dependency.pImageMemoryBarriers = barriers;
-            vk.pipeline_barrier2(command_buffer, &dependency);
-            if (tracker) tracker->set(id, range, new_layout);
+            if (barrier_count) {
+                VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                dependency.imageMemoryBarrierCount = barrier_count;
+                dependency.pImageMemoryBarriers = barriers;
+                vk.pipeline_barrier2(command_buffer, &dependency);
+            }
+            if (tracker && !release) tracker->set(id, range, new_layout);
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
             if (p.skip) continue;
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);
@@ -3682,10 +3715,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VulkanAccess state = vulkan_access(d3d12_state::depth_write, false);
             auto pieces = detail::current(tracker, id, range, image_layout(p.binding, state.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
-            const float depth = p.binding.depth24 ? depth24_clear_value(depth_clear->depth)  // see depth24.h
-                                : p.binding.format == VK_FORMAT_D16_UNORM
-                                    ? detail::quantize_unorm(depth_clear->depth, 65535.0)  // see quantize_unorm
-                                    : depth_clear->depth;
+            float depth = p.binding.depth24 ? depth24_clear_value(depth_clear->depth)  // see depth24.h
+                          : p.binding.format == VK_FORMAT_D16_UNORM
+                              ? detail::quantize_unorm(depth_clear->depth, 65535.0)  // see quantize_unorm
+                              : depth_clear->depth;
+            // Without the extension both clear commands require a depth in [0, 1], including for float images.
+            if (!vk.depth_range_unrestricted)
+                depth = std::isnan(depth) ? 0.0f : std::clamp(depth, 0.0f, 1.0f);
             const VkClearDepthStencilValue value{depth, depth_clear->stencil};
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, image_layout(p.binding, transfer_dst.layout),
@@ -4246,14 +4282,46 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.
-            const Viewport& v = draw->viewport;
-            const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
-            vk.set_viewport(command_buffer, 0, 1, &viewport);
-            const Rect& s = draw->scissor;
-            const VkRect2D scissor{{std::max(0, s.left), std::max(0, s.top)},
-                                   {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
-                                    std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
-            vk.set_scissor(command_buffer, 0, 1, &scissor);
+            if (graphics.viewport_with_count) {
+                std::array<VkViewport, DrawViewports::max_count> vps{};
+                std::array<VkRect2D, DrawViewports::max_count> scs{};
+                const std::uint32_t vp_n = draw->viewports ? draw->viewports->viewport_count : 1u;
+                const std::uint32_t sc_n = draw->viewports ? draw->viewports->scissor_count : 1u;
+                const std::uint32_t count = std::clamp(std::max(vp_n, sc_n), 1u, DrawViewports::max_count);
+                for (std::uint32_t k = 0; k < count; ++k) {
+                    const Viewport v = (draw->viewports && k < vp_n) ? draw->viewports->viewports[k]
+                                                                     : (k == 0 ? draw->viewport : Viewport{});
+                    const bool valid_vp = (k < vp_n) && (v.width > 0.0f) && (v.height > 0.0f);
+                    if (valid_vp) {
+                        vps[k] = {v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
+                    } else {
+                        // Vulkan forbids width/height == 0; pair a 1x1 dummy viewport with an empty scissor so nothing
+                        // rasterizes into an unbound/empty D3D12 viewport slot.
+                        vps[k] = {0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
+                    }
+                    if (valid_vp && k < sc_n) {
+                        const Rect s = draw->viewports ? draw->viewports->scissors[k] : draw->scissor;
+                        const std::int32_t left = std::max(0, s.left);
+                        const std::int32_t top = std::max(0, s.top);
+                        scs[k] = {{left, top},
+                                  {std::uint32_t(std::max(0, s.right - left)),
+                                   std::uint32_t(std::max(0, s.bottom - top))}};
+                    } else {
+                        scs[k] = {{0, 0}, {0, 0}};
+                    }
+                }
+                vk.set_viewport_with_count(command_buffer, count, vps.data());
+                vk.set_scissor_with_count(command_buffer, count, scs.data());
+            } else {
+                const Viewport& v = draw->viewport;
+                const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
+                vk.set_viewport(command_buffer, 0, 1, &viewport);
+                const Rect& s = draw->scissor;
+                const VkRect2D scissor{{std::max(0, s.left), std::max(0, s.top)},
+                                       {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
+                                        std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
+                vk.set_scissor(command_buffer, 0, 1, &scissor);
+            }
             // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
             // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
             if (!draw->mesh) {
