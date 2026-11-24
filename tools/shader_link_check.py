@@ -228,6 +228,10 @@ def write_report(path: Path, doc):
         os.replace(temporary, path)
     finally:
         if temporary is not None:
+            try:
+                os.chmod(temporary, 0o600)
+            except OSError:
+                pass
             temporary.unlink(missing_ok=True)
 
 

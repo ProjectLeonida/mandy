@@ -570,6 +570,27 @@ class CommandLineTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(reflect.call_count, 2)
 
+    def test_write_report_cleans_up_staged_file_when_replace_fails_even_if_readonly(self):
+        report = self.directory / "readonly_report.json"
+        report.write_text('{"initial": 1}\n', encoding="utf-8")
+        os.chmod(report, 0o444)
+
+        real_unlink = os.unlink
+
+        def windows_strict_unlink(p, *args, **kwargs):
+            mode = os.stat(p).st_mode
+            if not (mode & 0o200):
+                raise PermissionError(13, f"Access is denied: {p}")
+            return real_unlink(p, *args, **kwargs)
+
+        with patch("os.replace", side_effect=OSError(13, "Permission denied")), \
+             patch("os.unlink", side_effect=windows_strict_unlink):
+            with self.assertRaises(OSError):
+                link.write_report(report, {"new": True})
+
+        leftover = [p.name for p in self.directory.glob(".shader-link-*")]
+        self.assertEqual(leftover, [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
