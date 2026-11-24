@@ -2277,6 +2277,15 @@ Pipeline creation:
   buffer device address, storage image without format, maintenance8.
 - Request the subgroup size each shader was translated for (`requiredSubgroupSize` 64 or 32) where the device lists the stage
   in `requiredSubgroupSizeStages`, and say so in the log where it cannot (section 3.2, "Subgroup size").
+- `LEONIDA_SKIP_COMPUTE=<part of a name>[,<part>...]` is a diagnostic and is unset by default. A compute program
+  whose library name contains one of the parts (`all` or `*`: every compute program) is not built: it gets no
+  shader module and no `VkPipeline`. `CreateComputePipelineState` still succeeds. Replay logs the program name
+  on its first dropped dispatch, and every
+  dispatch that names the program, direct or through `ExecuteIndirect`, is dropped while the rest of its command
+  list is replayed. What the program would have written keeps its previous contents. It isolates a program that
+  hangs the GPU or loses the device while the program or its input is fixed; it is not a fix. The variable is read
+  once, at the first compute pipeline state. `d3d12_skip_compute_test` runs the three cases (unset, one name,
+  `all`) on the GPU.
 - Pipeline caches: graphics and compute PSOs use one `VkPipelineCache` per device. On first use the runtime reads
   the `pipelines` build stage's `pipeline_cache.bin` beside the executable if its Vulkan header matches the device
   and pipeline-cache UUID. When the file is absent or incompatible, the runtime starts with an empty cache.
