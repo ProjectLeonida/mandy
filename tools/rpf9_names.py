@@ -211,7 +211,11 @@ def publish_report(path, rows, summary):
             json.dump({"summary": summary, "files": rows}, f, indent=1)
             f.write("\n")
         os.chmod(temp, published_mode(path))
-        os.replace(temp, path)
+        try:
+            os.replace(temp, path)
+        except BaseException:
+            os.chmod(temp, 0o600)
+            raise
 
 
 def _int_arg(text):
