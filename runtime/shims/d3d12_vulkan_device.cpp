@@ -641,6 +641,7 @@ struct DeviceState {
     PFN_vkTransitionImageLayoutEXT transition_image_layout = nullptr;
     // VK_EXT_external_memory_host; null unless info.host_pointer_alignment is set and the entry point loaded.
     PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_properties = nullptr;
+    bool settle_host_imports = false;  // an Intel driver: settle_host_import reads every fresh import once
 
     // WriteToSubresource/ReadFromSubresource without host image copy: one staging copy at a time, submitted to
     // the device's VkQueue and waited for. Created on first use.
@@ -1412,6 +1413,74 @@ struct DeviceState {
         }
         return VK_NULL_HANDLE;
     }
+
+    // Intel's Windows driver goes on working with a host import's pages for a moment after vkAllocateMemory has
+    // returned. When they are gone before it is done, it loses the device at the next vkQueueSubmit, also when the
+    // import was already freed with vkFreeMemory. A title may do just that: open an existing heap or place a buffer
+    // on its pages, release it and free the pages, which the same GPU's D3D12 driver takes. So on that driver the
+    // GPU reads a fresh import once before its owner is handed out: four bytes copied out of it on the device's
+    // queue and waited for, after which the pages can go as soon as the import is freed. Measured with a raw
+    // Vulkan program on an Iris Xe (32.0.101.7092): import, vkFreeMemory, VirtualFree and a submission lose the
+    // device in 10 of 10 runs for 1, 16 and 64 MiB (5 of 10 for 64 KiB), in none with the copy in between; an
+    // RTX 4060 (621.40) loses none either way. No device property reports it, so the vendor ID decides.
+    // False, logged once, when the copy could not be made: the import is as usable as before.
+    bool settle_host_import(VkDeviceMemory imported, std::uint32_t memory_type) {
+        if (!settle_host_imports) return true;
+        auto& vk = context->vk;
+        constexpr VkDeviceSize bytes = 4;
+        leonida::ResourceBinding source{}, target{};
+        source.size = target.size = bytes;
+        VkDeviceMemory target_memory = VK_NULL_HANDLE;
+        const auto release = [&](bool settled) {
+            if (source.buffer) vk.vkDestroyBuffer(info.device, source.buffer, nullptr);
+            if (target.buffer) vk.vkDestroyBuffer(info.device, target.buffer, nullptr);
+            if (target_memory) vk.vkFreeMemory(info.device, target_memory, nullptr);
+            if (!settled)
+                log_once("a host import could not be read before it was handed out; memory type", int(memory_type));
+            return settled;
+        };
+        VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+        buffer.size = bytes;
+        buffer.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        share(buffer);
+        VkMemoryRequirements requirements{};
+        if (vk.vkCreateBuffer(info.device, &buffer, nullptr, &source.buffer) != VK_SUCCESS) return release(false);
+        vk.vkGetBufferMemoryRequirements(info.device, source.buffer, &requirements);
+        if (!(requirements.memoryTypeBits & (1u << memory_type)) ||
+            vk.vkBindBufferMemory(info.device, source.buffer, imported, 0) != VK_SUCCESS)
+            return release(false);
+        buffer.pNext = nullptr;
+        buffer.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (vk.vkCreateBuffer(info.device, &buffer, nullptr, &target.buffer) != VK_SUCCESS) return release(false);
+        vk.vkGetBufferMemoryRequirements(info.device, target.buffer, &requirements);
+        target_memory = allocate(requirements, 0, 0);
+        if (!target_memory || vk.vkBindBufferMemory(info.device, target.buffer, target_memory, 0) != VK_SUCCESS)
+            return release(false);
+        // Resources only for the length of this call, as staged_copy's buffer is: the IDs are the bindings' addresses.
+        const auto source_id = reinterpret_cast<leonida::ResourceId>(&source);
+        const auto target_id = reinterpret_cast<leonida::ResourceId>(&target);
+        leonida::CommandList list;
+        if (!list.copy_buffer({target_id, 0, source_id, 0, bytes}) || !list.close()) return release(false);
+        context->add_resource(source_id, source);
+        context->add_resource(target_id, target);
+        leonida::ReplayResult result = leonida::ReplayResult::unsupported;
+        {
+            std::lock_guard lock(staging_mutex);
+            if (!staging_queue)
+                staging_queue = std::make_unique<leonida::VulkanQueue>(*context, info.queue, info.queue_family);
+            if (staging_queue->ok()) {
+                const leonida::CommandList* lists[] = {&list};
+                result = staging_queue->execute(lists);
+                if (result == leonida::ReplayResult::success && !staging_queue->idle())
+                    result = leonida::ReplayResult::unsupported;
+            }
+        }
+        context->remove_resource(source_id);
+        context->remove_resource(target_id);
+        return release(result == leonida::ReplayResult::success);
+    }
 };
 
 // The Vulkan format for a texture this layer can create, with the D24 fallback; VK_FORMAT_UNDEFINED, after a log
@@ -2070,10 +2139,12 @@ public:
                                               need_bda ? static_cast<const void*>(&flags) : &import};
                 allocate.allocationSize = bytes;
                 allocate.memoryTypeIndex = i;
-                if (vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &memory_) == VK_SUCCESS)
+                if (vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &memory_) == VK_SUCCESS) {
                     memory_flags_ = device_.memory.memoryTypes[i].propertyFlags;
-                else
+                    device_.settle_host_import(memory_, i);
+                } else {
                     memory_ = VK_NULL_HANDLE;
+                }
             }
             if (memory_) break;
         }
@@ -5114,6 +5185,7 @@ public:
                 VkPhysicalDeviceProperties props{};
                 get_props(info.physical, &props);
                 state_.pso_identity.vendor = props.vendorID;
+                state_.settle_host_imports = props.vendorID == 0x8086;  // Intel: DeviceState::settle_host_import
                 state_.pso_identity.device = props.deviceID;
                 state_.pso_identity.driver = props.driverVersion;
                 std::memcpy(state_.pso_identity.cache_uuid, props.pipelineCacheUUID, VK_UUID_SIZE);
@@ -7127,6 +7199,7 @@ public:
             log_once("OpenExistingHeapFromAddress: importing the host range failed; size in KiB", int(size / 1024));
             return d3d12_trace::result(method, E_OUTOFMEMORY);
         }
+        state_.settle_host_import(memory, memory_type);
         D3D12_HEAP_DESC desc{};
         desc.SizeInBytes = size;
         desc.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;

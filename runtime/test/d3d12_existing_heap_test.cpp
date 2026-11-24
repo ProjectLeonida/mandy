@@ -126,6 +126,83 @@ int compare_cases(const std::vector<Case>& ours, const std::vector<Case>& host, 
     return failures;
 }
 
+// A title may release an existing heap, or a buffer it placed on its own pages, and free the pages at once, with no
+// submission in between: the device then takes the next submission, as the same GPU's D3D12 driver does. Intel's
+// Vulkan driver lost its device there (Iris Xe, 32.0.101.7092: the pages have to outlast vkAllocateMemory by a
+// moment, also when the import is already freed), 5 of 10 times for 64 KiB and 10 of 10 for 1 and 16 MiB, until the
+// layer made the GPU read a fresh import before handing it out (DeviceState::settle_host_import).
+int check_pages_freed_at_once(ID3D12Device* device) {
+    const char* who = "vulkan pages freed at once";
+    Ref<ID3D12Device3> device3;
+    EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device3.p))));
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    for (const SIZE_T size : {SIZE_T(0x10000), SIZE_T(0x100000), SIZE_T(0x1000000)}) {
+        void* pages = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        EXPECT(pages != nullptr);
+        {
+            Ref<ID3D12Heap> heap;
+            EXPECT_HR(device3->OpenExistingHeapFromAddress(pages, IID_PPV_ARGS(&heap.p)), S_OK);
+        }
+        EXPECT(VirtualFree(pages, 0, MEM_RELEASE));
+        pages = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        EXPECT(pages != nullptr);
+        {
+            desc.Width = size;
+            Ref<ID3D12Resource> buffer;
+            EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 0xFFFFFFFFu,
+                                                               IID_PPV_ARGS(&buffer.p)),
+                      S_OK);
+        }
+        EXPECT(VirtualFree(pages, 0, MEM_RELEASE));
+    }
+    desc.Width = 256;
+    D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD}, readback_heap{D3D12_HEAP_TYPE_READBACK};
+    Ref<ID3D12Resource> upload, readback;
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                     D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                     IID_PPV_ARGS(&upload.p))));
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                     IID_PPV_ARGS(&readback.p))));
+    void* mapped = nullptr;
+    EXPECT(SUCCEEDED(upload->Map(0, nullptr, &mapped)));
+    const auto pattern = [](UINT i) { return static_cast<std::uint8_t>(i * 29u + 3u); };
+    for (UINT i = 0; i < 256; ++i) static_cast<std::uint8_t*>(mapped)[i] = pattern(i);
+    upload->Unmap(0, nullptr);
+    D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                               IID_PPV_ARGS(&list.p))));
+    list->CopyBufferRegion(readback.p, 0, upload.p, 0, 256);
+    EXPECT(SUCCEEDED(list->Close()));
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+    EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
+    HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    EXPECT(SUCCEEDED(fence->SetEventOnCompletion(1, done)));
+    EXPECT(WaitForSingleObject(done, 10000) == WAIT_OBJECT_0);
+    CloseHandle(done);
+    EXPECT_HR(device->GetDeviceRemovedReason(), S_OK);
+    EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+    bool same = true;
+    for (UINT i = 0; i < 256; ++i) same &= static_cast<std::uint8_t*>(mapped)[i] == pattern(i);
+    readback->Unmap(0, nullptr);
+    EXPECT(same);
+    std::printf("%s: the device took a copy after 3 heaps and 3 placed buffers were released and their pages freed\n",
+                who);
+    return 0;
+}
+
 // The heap is the caller's memory: CheckFeatureSupport says so, and the heap stays valid while it is held.
 // Without the extension the feature is unsupported and an accepted range is E_NOTIMPL.
 int check_import(ID3D12Device* device, bool supported) {
@@ -368,6 +445,7 @@ int main() {
                 if (vk.host_pointer_alignment) failures += compare_cases(vulkan_cases, host_cases, who.c_str());
             }
         }
+        if (vk.host_pointer_alignment) failures += check_pages_freed_at_once(ours.p);
     }
     if (vk.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", vk.validation_errors());
