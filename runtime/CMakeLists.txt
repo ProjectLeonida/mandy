@@ -250,6 +250,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xapu_queue.cpp
     shims/xapu_chad.cpp
     shims/dstorage.cpp
+    shims/win32_env.cpp
   )
   # These sources use __try to handle access violations. MSVC always catches them; clang-cl needs asynchronous
   # exceptions (as for tiny_dll below). A source file property also applies to dstorage_test.
@@ -631,6 +632,17 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(console_registry_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(console_registry_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(console_registry_test PRIVATE /OPT:NOREF)
+
+  # Win32 localization, process priority boost, and named pipe shims.
+  add_executable(win32_env_test
+    test/win32_env_test.cpp
+    shims/win32_env.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(win32_env_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(win32_env_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(win32_env_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(win32_env_test PRIVATE /OPT:NOREF)
 
   # Synthetic tests for the atomic API reference lifecycle.
   add_executable(api_ref_state_test test/api_ref_state_test.cpp)
@@ -1731,6 +1743,11 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET console_registry_test)
     add_test(NAME console_registry COMMAND console_registry_test)
+  endif()
+  if(WIN32 AND TARGET win32_env_test)
+    add_test(NAME win32_env COMMAND win32_env_test)
+    add_test(NAME win32_env_override COMMAND win32_env_test --expect-override)
+    set_tests_properties(win32_env_override PROPERTIES ENVIRONMENT "LEONIDA_GEO=jp;LEONIDA_LOCALE=en-GB")
   endif()
   if(WIN32 AND TARGET api_ref_state_test)
     add_test(NAME api_ref_state COMMAND api_ref_state_test)
