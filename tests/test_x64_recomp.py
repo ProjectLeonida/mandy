@@ -135,6 +135,22 @@ class DecodeTests(unittest.TestCase):
         ins = self.one(asm("f3 0f 1e fa"))      # endbr64 (decoded, no crash)
         self.assertEqual(ins.size, 4)
 
+    def test_vzeroupper_and_vzeroall_have_no_modrm(self):
+        # VEX.128/256.0F.WIG 77 (vzeroupper / vzeroall) is the one map-1 VEX opcode with no
+        # ModRM byte. Reading one behind the three-byte instruction swallowed the byte that
+        # followed it, so a function's decode fell out of step from its first vzeroupper on.
+        # tools/gdk_runtime_calls.py already makes this exception for the same opcode.
+        for code in (asm("c5 f8 77"), asm("c5 fc 77")):
+            ins = self.one(code)
+            self.assertEqual(ins.mnem, "v77", code.hex())
+            self.assertEqual(ins.size, 3, code.hex())
+            self.assertEqual(ins.ops, ())
+
+    def test_vzeroupper_does_not_swallow_the_next_instruction(self):
+        # vzeroupper; ret: with the extra ModRM byte the ret's 0xc3 was consumed as an
+        # operand and the walk then ran into the bytes after the function (rva 0xa4ab00).
+        insns = list(x.disasm(asm("c5 f8 77 c3"), 0x1000))
+        self.assertEqual([(i.mnem, i.size) for i in insns], [("v77", 3), ("ret", 1)])
 
 def run(code):
     return x.run_result(code, GUEST_VA)

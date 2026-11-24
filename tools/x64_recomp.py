@@ -198,6 +198,11 @@ OF[0x6E] = ("movd", "V Ed")
 OF[0x7E] = ("movd", "Ed V")
 
 _VEX_IMM8_MAP1 = {0x70, 0x71, 0x72, 0x73, 0xC2, 0xC4, 0xC5, 0xC6}
+# VEX.128/256.0F.WIG 77 (vzeroupper / vzeroall) is the one map-1 VEX opcode with no ModRM byte
+# at all: the ModRM byte the other map-1 forms read is really the next instruction.
+# tools/gdk_runtime_calls.py makes the same exception for it (see its decoder), and
+# tests/test_gdk_runtime_calls.py pins the length of C5 F8 77 at 3.
+_VEX_NO_MODRM_MAP1 = {0x77}
 
 
 class Insn:
@@ -556,7 +561,10 @@ def decode_one(buf, pos, end, addr):
     if vex is not None:
         omap = vex["map"]
         if omap == 1:
-            spec = ("simd", "V W Ib") if op in _VEX_IMM8_MAP1 else ("simd", "V W")
+            if op in _VEX_NO_MODRM_MAP1:
+                spec = ("simd", "")
+            else:
+                spec = ("simd", "V W Ib") if op in _VEX_IMM8_MAP1 else ("simd", "V W")
         elif omap == 2:
             spec = ("simd", "V W")
         elif omap == 3:

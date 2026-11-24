@@ -130,6 +130,32 @@ class EdgeTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_vzeroupper_does_not_desync_a_function(self):
+        # A .pdata function that is exactly "vzeroupper; ret". vzeroupper takes no ModRM byte,
+        # so both instructions must be decoded (the ret is indirect control flow). Reading a
+        # ModRM byte after the three-byte vzeroupper ate the 0xc3 and swallowed the ret. In
+        # the retail image rva 0xa4ab00 ends "add rsp,68h; ret" and the walk read "c4 68 c3".
+        buf = bytearray(build_pe())
+
+        def at(rva):
+            return TEXT_RAW + (rva - TEXT_RVA)
+
+        buf[at(0x1050):at(0x1054)] = bytes.fromhex("c5f877c3")
+        struct.pack_into("<III", buf, at(0x2024), 0x1050, 0x1054, 0x210C)   # 4th .pdata entry
+        struct.pack_into("<II", buf, 0x58 + 112 + 3 * 8, 0x2000, 4 * 12)   # exception dir: 4
+        with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as f:
+            f.write(bytes(buf))
+            path = f.name
+        try:
+            r = rc.census(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(r["pdata_functions"], 4)
+        self.assertEqual(r["decode_errors"], 0)
+        self.assertEqual(r["insns"], 13)                          # 12 without the fix
+        self.assertEqual(r["indirect_control_flow"].get("ret"), 5)   # 4 without the fix
+        self.assertIn("v77", {k for k, _ in r["top_mnemonics"]})
+
 
 if __name__ == "__main__":
     unittest.main()
