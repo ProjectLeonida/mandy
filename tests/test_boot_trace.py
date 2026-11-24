@@ -108,7 +108,7 @@ class BootTraceTests(unittest.TestCase):
             f.writelines(json.dumps(event) + newline for event in events)
 
     def write_lines(self, path, lines):
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(lines) + "\n")
 
     def test_startup_summary(self):
@@ -188,7 +188,7 @@ class BootTraceTests(unittest.TestCase):
 
     def test_truncated_line_is_counted_not_fatal(self):
         self.write(self.startup, STARTUP)
-        with open(self.startup, "a", encoding="utf-8") as f:
+        with open(self.startup, "a", encoding="utf-8", newline="\n") as f:
             f.write('{"seq": 15, "kind":')
         trace = bt.parse_startup(self.startup)
         self.assertEqual(trace["events"], len(STARTUP))
@@ -204,7 +204,7 @@ class BootTraceTests(unittest.TestCase):
             ],
             newline="\r\n",
         )
-        with open(self.startup, "a", encoding="utf-8") as f:
+        with open(self.startup, "a", encoding="utf-8", newline="\n") as f:
             f.write("null\n")
         trace = bt.parse_startup(self.startup)
         self.assertEqual(trace["events"], 2)
@@ -424,10 +424,17 @@ class BootTraceTests(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             self.assertEqual(bt.main([os.path.join(self.tmp.name, "missing.jsonl")]), 2)
-            open(self.startup, "w").close()
+            self.write(self.startup, [])
             self.assertEqual(bt.main([self.startup]), 2)
             self.assertEqual(bt.main(["--limit", "0", self.startup]), 2)
         self.assertIn("cannot read", err.getvalue())
+
+    def test_negative_limit_is_an_error(self):
+        self.write(self.startup, STARTUP)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(bt.main([self.startup, "--limit", "-1"]), 2)
+        self.assertIn("--limit", err.getvalue())
 
     def test_attach_failure_is_reported_before_any_d3d12_call(self):
         self.write(self.startup, [{"kind": "error", "what": "guest.dll: DllMain returned FALSE"}])
@@ -533,6 +540,7 @@ class BootTraceTests(unittest.TestCase):
         for needle in (
             "pid 123",
             "modules (2)",
+            "game.exe, x.dll (relocated)",
             "dllmain: 1 ok, 1 failed",
             "unimplemented: 2 unique",
             "x.dll!Foo from game.exe+0x10",
@@ -590,6 +598,122 @@ class BootTraceTests(unittest.TestCase):
                 text = bt.format_text(summary, 10)
                 self.assertIn("tls callbacks: 2", text)
                 self.assertIn(f"last observed TLS callback: fixture.exe+0x2200 ({phase})", text)
+
+    def physical_pages_reports(self, observations, limit):
+        self.write(self.startup, [
+            {"seq": seq, "t": 0.0, "kind": "xmem_physical_pages", **fields}
+            for seq, fields in enumerate(observations, 1)
+        ])
+        args = [self.startup, "--limit", str(limit)]
+        text, report = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(text):
+            self.assertEqual(bt.main(args), 0)
+        with contextlib.redirect_stdout(report):
+            self.assertEqual(bt.main([*args, "--json"]), 0)
+        startup = json.loads(report.getvalue())["startup"]
+        self.assertEqual(startup["kinds"]["xmem_physical_pages"], len(observations))
+        self.assertIn(f"  XMem physical page observations: {len(observations)}", text.getvalue())
+        return text.getvalue(), startup["xmem_physical_pages"]
+
+    def test_single_xmem_physical_pages_observation(self):
+        observation = {
+            "api": "XMemAllocatePhysicalPages", "attributes": "0x0", "pages": 0, "caller": "0x20",
+        }
+        text, records = self.physical_pages_reports([observation], 1)
+        self.assertEqual(records, [observation])
+        self.assertIn("    XMemAllocatePhysicalPages attributes 0x0 requested 0 pages from 0x20\n", text)
+        self.assertNotIn("more", text)
+
+    def test_xmem_physical_pages_observations_keep_trace_order_and_full_count(self):
+        observations = [
+            {"api": "XMemAllocatePhysicalPages", "attributes": attributes, "pages": pages, "caller": caller}
+            for attributes, pages, caller in (
+                ("0xffffffffffffffff", (1 << 64) - 1, "fixture.dll+0x30"),
+                ("0x10", 2, "fixture.dll+0x20"),
+                ("0x20", 1, "fixture.dll+0x10"),
+            )
+        ]
+        for limit in (0, 2, 3):
+            with self.subTest(limit=limit):
+                text, records = self.physical_pages_reports(observations, limit)
+                self.assertEqual(records, observations[:limit])
+                self.assertEqual(
+                    [line for line in text.splitlines() if line.startswith("    XMemAllocatePhysicalPages ")],
+                    [f"    {item['api']} attributes {item['attributes']} requested {item['pages']} pages"
+                     f" from {item['caller']}" for item in observations[:limit]],
+                )
+                if limit < len(observations):
+                    self.assertIn(f"    ... {len(observations) - limit} more", text)
+                else:
+                    self.assertNotIn("more", text)
+
+    def test_counts_only_includes_all_xmem_physical_page_observations(self):
+        self.write(self.startup, [
+            {"kind": "xmem_physical_pages", "api": "private-api", "attributes": "0x20",
+             "pages": 4, "caller": "private-caller"},
+        ] * 3)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bt.main([self.startup, "--counts-only", "--limit", "1"]), 0)
+        summary = json.loads(out.getvalue())["startup"]
+        self.assertEqual(summary["xmem_physical_pages_count"], 3)
+        self.assertNotIn("xmem_physical_pages", summary)
+        self.assertNotIn("private-", out.getvalue())
+
+    def test_xmem_physical_pages_handles_missing_and_malformed_fields(self):
+        unknown = {"api": None, "attributes": None, "pages": None, "caller": None}
+        nbsp_caller = "fixture\u00a0one.dll+0x20"
+        text, records = self.physical_pages_reports([
+            {},
+            {"api": ["unexpected"], "attributes": "not hex", "pages": True, "caller": "\x1b[2J"},
+            {"api": "XMemAllocatePhysicalPages", "attributes": "0x10", "pages": -1, "caller": "fixture.dll+0x50"},
+            {"api": "XMemAllocatePhysicalPages", "attributes": "0x20", "pages": 4, "caller": nbsp_caller},
+        ], 4)
+        self.assertEqual(records, [
+            unknown,
+            unknown,
+            {"api": "XMemAllocatePhysicalPages", "attributes": "0x10", "pages": None, "caller": "fixture.dll+0x50"},
+            {"api": "XMemAllocatePhysicalPages", "attributes": "0x20", "pages": 4, "caller": nbsp_caller},
+        ])
+        self.assertEqual(text.count("    ? attributes ? requested ? pages from ?\n"), 2)
+        self.assertIn("    XMemAllocatePhysicalPages attributes 0x10 requested ? pages from fixture.dll+0x50\n", text)
+        self.assertIn(f"    XMemAllocatePhysicalPages attributes 0x20 requested 4 pages from {nbsp_caller}\n", text)
+
+    def test_frame_pacing_summary_parsed_formatted_and_kept_in_counts_only(self):
+        self.write_lines(self.d3d12, [
+            "[d3d12-trace] #1 XboxPresentation::PresentX ok",
+            "gta6rt.exe : [rt] present: pacing summary frames=101 samples=100 target_us=16667 "
+            "mean_us=16712.5 drift_us=+45.5 p50_us=16667 p95_us=17100 p99_us=18200 "
+            "latency_samples=101 latency_p50_us=4200 latency_p95_us=6100 latency_p99_us=7900",
+        ])
+        trace = bt.parse_d3d12(self.d3d12)
+        self.assertEqual(trace["ignored_lines"], 0)
+        self.assertEqual(trace["frame_pacing"], {
+            "frames": 101,
+            "samples": 100,
+            "target_us": 16667,
+            "mean_us": 16712.5,
+            "drift_us": 45.5,
+            "p50_us": 16667,
+            "p95_us": 17100,
+            "p99_us": 18200,
+            "latency_samples": 101,
+            "latency_p50_us": 4200,
+            "latency_p95_us": 6100,
+            "latency_p99_us": 7900,
+        })
+        text = bt.format_text(bt.summarize(None, trace), 10)
+        self.assertIn(
+            "frame pacing: 101 frame(s), 100 interval(s), target 16667 us, mean 16712.5 us (drift +45.5 us), "
+            "p50/p95/p99 16667/17100/18200 us; origin-to-present p50/p95/p99 4200/6100/7900 us",
+            text,
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bt.main(["--d3d12", self.d3d12, "--counts-only"]), 0)
+        counts = json.loads(out.getvalue())
+        self.assertEqual(counts["d3d12"]["frame_pacing"]["drift_us"], 45.5)
+        self.assertEqual(counts["d3d12"]["frame_pacing"]["p99_us"], 18200)
 
 
 if __name__ == "__main__":

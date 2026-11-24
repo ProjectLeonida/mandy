@@ -2,13 +2,14 @@
 
 The GPU tests are small hand-written RDNA2 programs in `runtime/test/shaders`. They are translated to SPIR-V and run
 on your GPU, and the results are compared with what the RDNA2 hardware gives. They need no game files, and every
-result helps: post it in [#166](https://github.com/ItsNotRexed/Leonida/issues/166), one comment per GPU and driver.
+result helps: submit a pull request adding a record under [`gpu-test-results/`](../gpu-test-results), following
+the existing files there and [CONTRIBUTING.md](../CONTRIBUTING.md).
 If your GPU is already covered there, testing an open pull request from the review queue in the [coordination
 issue][claims] helps more.
 
 This page collects the setup steps and the problems testers have run into so far.
 
-[claims]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+[claims]: https://github.com/ubiquitarianism/leonida/issues/14
 
 ## What you need
 
@@ -158,7 +159,7 @@ Write-Output "Test exit code: $LASTEXITCODE"
 ```
 
 Report the executable name, the workflow run and its commit, your GPU and driver,
-the exit code, and the test summary in [#166](https://github.com/ItsNotRexed/Leonida/issues/166).
+the exit code, and the test summary in your `gpu-test-results/` record.
 Label it as a single-test run so the result is easy to distinguish from a full suite run.
 
 ## Run them
@@ -183,16 +184,6 @@ The two-step form, which `CONTRIBUTING.md` describes:
 ```sh
 python -I runtime/test/shaders/build.py <out dir>
 python -I runtime/test/shaders/check.py <out dir> <folder with the test programs>
-```
-
-For the standalone `v_mullit_f32` readback, build the full-screen triangle and the
-hand-written semantic fixture, then run 120 draws with runtime SGPR inputs.
-The driver checks every pixel against an integer product rounded to 24 bits.
-It reports the input words, pixel and channel on the first mismatch.
-
-```sh
-python -I runtime/test/shaders/build.py <out-dir> vs_ids ps_mullit
-python -I runtime/test/shaders/mullit_readback.py <out-dir> <harness-directory>
 ```
 
 For D3D12/runtime tests, `LEONIDA_VK_VALIDATION=1` enables `VK_LAYER_KHRONOS_validation`. When running with validation, set `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` if MSI Afterburner (RivaTuner) or OBS is installed: their overlay layers can add unsupported swapchain usage, and in an elevated (administrator) terminal the loader ignores `VK_LOADER_LAYERS_DISABLE=~implicit~` (see "Known problems").
@@ -360,6 +351,17 @@ on an Apple M3 Max (MoltenVK 1.4.2 and 1.4.3): 17 workgroup shapes from 1 to 102
 subgroups, with and without full subgroups and register pressure, all 32 lanes in order. A device whose default
 isn't the requested size still prints `not available`, and those tests skip.
 
+`cs_w32_shift64` checks `v_lshlrev_b64`, `v_lshrrev_b64` and `v_ashrrev_i64` with 64 memory-fed cases:
+eight boundary values crossed with counts 0, 1, 31, 32, 33, 63, 64 and 65. The expected values come from Python
+integers using the low six count bits, as specified by the [RDNA2 ISA, VOP3 opcodes 767–769](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content).
+It also overlaps the destination with the count, one source word or the entire source pair. Both GPU runners
+compare all 640 heap words (384 results and 256 unchanged input words); the operands are loaded at runtime so
+the driver cannot replace the tested operations with constant-folded answers. Run it alone with
+`python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_w32_shift64 --require-pass`.
+It needs shader Int64 support; a device that lacks it reports a skip. This is a wave32 test of 64-bit values,
+independent of wave64 emulation. On RTX 3080 Ti (616.92, Windows 11), all 640 words matched; replacing the count
+mask with 31 or the arithmetic shift with a logical shift made the test fail at words 66 and 251 respectively.
+
 ## Wave64 pixel, vertex and geometry shaders (`w64_graphics.py`)
 
 Graphics stages have no emulation: on a 32-wide subgroup a wave64 VS, PS or GS runs as two 32-lane halves, and the
@@ -399,23 +401,6 @@ Each line prints `ok`, a `SKIP` with its reason, or what differed. To add a fixt
 3. Add it to `EXPECT` in `tests/test_wave64_halves_fixtures.py` with the tier, reasons and idioms the translator
    should give it, and run `python -m pytest tests/test_wave64_halves_fixtures.py`.
 4. Run `w64_graphics.py` on a RADV GPU and say which GPU and Mesa version in the pull request.
-## GPUs with 128 bytes of push constants (AMD RDNA2 iGPUs on Windows, some Intel Arc drivers)
-
-The translated shaders take 144 bytes of push constants: s0..s31, then the heap base and the code base. A device whose
-`maxPushConstantsSize` is 128, Vulkan's minimum, can't take that, so the texture tests and every test drawn through
-`vk_harness` skip there (`unsupported: need 144 push constant bytes, device has 128`); `vulkaninfo` shows the limit.
-AMD's older Windows drivers report 128 on RDNA2 iGPUs (Radeon 680M on 22.40.84.06, 610M on 24.10.16.14, the Ryzen 5
-7600's iGPU on 24.10.24); 26.11.2 reports 256 on a Radeon 610M, where these tests run without the variable below.
-RADV reports more on the same chips.
-
-To run them anyway, set `LEONIDA_PC_TAIL_UBO=1` **for both `build.py` and `check.py`** (or for
-`run_gpu_tests.py`). The shaders are then translated with `--pc-tail-ubo`: s0..s31 stay in 128 push-constant bytes,
-and the heap base and code base move to a uniform block at set 1 (`docs/design.md`, "Push-constant tail as a uniform
-block"), which `vk_compute_test`, `vk_store_test`, `vk_harness`, `vk_texture_test`, `vk_sampler_test` and
-`vk_bindless_test` bind (`runtime/test/vk_pc_tail.h`). If you set it
-only for `check.py`, the shaders read the tail from push constants the programs no longer declare. `--mesh-compute`
-(`LEONIDA_MESH_COMPUTE=1`) isn't combined with it yet: its vertex shader still reads the output address from push
-constants, so those tests skip.
 
 ## GPUs with 128 bytes of push constants (AMD RDNA2 iGPUs on Windows, some Intel Arc drivers)
 
@@ -645,7 +630,7 @@ game's device ignores it`, so leaving them set cannot slow a game down (`run_tin
 | `ps_vcmpx_forms` fails on a Mac: word 1 reads `0xf05e8e16`, want `0xf05e8a12` | MoltenVK's fast-math makes a compare of a NaN with itself true (SHADER-234) | Current `main`'s test programs turn it off (`MVK_CONFIG_FAST_MATH_ENABLED=0`, unless you set the variable yourself); rebuild them |
 | On a Mac, a translated shader's GPU time is 1.5 to 16 times what it would be without the precise-arithmetic overhead | MoltenVK's SPIRV-Cross turns every `NoContraction` float add, subtract and multiply into a call to an `[[clang::optnone]]` helper that Metal does not inline. MoltenVK 1.4.2 and `main` up to at least `5189f8de` are affected (SHADER-234, [design notes](design.md#translator-status-and-runtime-contract)) | Expected with these MoltenVK versions, and the output is still exact. Before you time shaders on a Mac, build MoltenVK with SPIRV-Cross `98cbb7c0` or newer in `ExternalRevisions/SPIRV-Cross_repo_revision` (KhronosGroup/MoltenVK#2917 moves it to `57e4efcc`), and point `LEONIDA_VULKAN_LOADER` at its `libMoltenVK.dylib` |
 | `d3d12_descriptor_test` reports that the set had room for fewer than 5001 2D views and 2100 samplers, and the device logs that the bindless set holds fewer samplers than a full shader-visible sampler heap | The device's descriptor limits, or its `vkGetDescriptorSetLayoutSupport`, allow no bigger bindless set ([d3d12_vulkan.md](d3d12_vulkan.md) section 5). MoltenVK's answer is ignored, since it rejects every layout of `maxPerSetDescriptors` (1212) or more although it runs the full set | Expected where the limits are low. The test still checks the last index of each array and that the next view and sampler are refused |
-| `cs_dpp_ops` fails on a Mac with MoltenVK 1.4.2: `out[0..7] = 100 100 11 ...`, want `100 10 11 ...` | MoltenVK 1.4.2's SPIRV-Cross moves the DPP lowering's subgroup ballot and shuffle into a short-circuiting `&&` and `?:`, so only some lanes run them and lane 1 sees its source lane 0 as inactive. SPIRV-Cross `5c372ffb` (in MoltenVK `main`) keeps them out of `?:`; a ballot on the right of `&&` is still moved there in SPIRV-Cross `57e4efcc` | Expected with MoltenVK 1.4.2; it passes with MoltenVK `main` (point `LEONIDA_VULKAN_LOADER` at its `libMoltenVK.dylib`) and on KosmicKrisp |
+| `cs_dpp_ops` fails on a Mac with MoltenVK 1.4.2: `out[0..7] = 100 100 11 ...`, want `100 10 11 ...` | MoltenVK 1.4.2's SPIRV-Cross moves the DPP lowering's subgroup ballot and shuffle into a short-circuiting `&&` and `?:`, so only some lanes run them and lane 1 sees its source lane 0 as inactive. SPIRV-Cross `5c372ffb` (in MoltenVK `main`) keeps them out of `?:`; a ballot on the right of `&&` is still moved there in SPIRV-Cross `57e4efcc` | Fixed in the translator (SHADER-529, #3227): it stores the ballot and the shuffle to variables of their own, so the MSL that MoltenVK 1.4.2 generates (`MVK_CONFIG_DEBUG=1`) runs each as a statement in every lane. Translate again with current `main`; MoltenVK `main` and KosmicKrisp are no longer needed for it. A pass alone does not show the fix: an Apple M5 Pro (macOS 26.5.1) returns the right words with 1.4.2 even when the ballot is on the right of `&&` |
 | `check.py`'s `cs_fma_fused` fails on a Mac with MoltenVK 1.4.2: word 7 reads `15360` (`0x3c00`), want `29521` (`0x7351`) | The f16 multiply-add (round to odd). The MSL of 1.4.2 and of MoltenVK `main` differ only in SPIRV-Cross's precise-arithmetic helpers (`[[clang::optnone]]` and `fma(l, r, 0)` against `math_mode(safe)` and `fma(l, r, -0.0)`, the SHADER-182 / SHADER-234 change) | Expected with MoltenVK 1.4.2; it passes with MoltenVK `main` |
 | `gs_tri` and `ms_tri` fail on a Mac | MoltenVK has no geometry stage and no `VK_EXT_mesh_shader` | Current `main` reports them as skipped |
 | With `LEONIDA_W64_EMULATE=1` on llvmpipe, the `ms_*` tests fail. Measured with Mesa 26.3.1: on x86_64 at 256-bit vectors (the default there) all six abort with "LLVM ERROR: Cannot emit physreg copy instruction"; on arm64 (128-bit) `ms_tri` draws nothing (the frame stays at the clear color); on x86_64 at 128 bits (`LP_NATIVE_VECTOR_WIDTH=128`) `ms_tri` happened to draw correctly, but with Mesa 26.0.3 `ms_wave_info_s3` and `ms_v5_workgroup` draw nothing there (4 of 6 pass, [measured by @TreXito](https://github.com/ItsNotRexed/Leonida/pull/3838#issuecomment-7086696759)) ([measured runs](https://github.com/ItsNotRexed/Leonida/issues/3127#issuecomment-7086469679)) | An llvmpipe bug: a mesh shader's runtime `CullPrimitiveEXT` is stored through an invalid `bitcast <N x i1> to <N x float>` (TEST-782, #3127; see "Without a GPU: Mesa llvmpipe") | Run the mesh tests on llvmpipe without `LEONIDA_W64_EMULATE`, or add `LEONIDA_MESH_COMPUTE=1` (the compute fallback): with it all 6 `ms_*` pass emulated on llvmpipe (x86_64, 256-bit) |
@@ -723,9 +708,14 @@ CS, 10,974 PS).
 
 ## Posting your result
 
-Use the template at the top of [#166](https://github.com/ItsNotRexed/Leonida/issues/166): GPU, driver, subgroup
-range, OS, the commit you built, the tool versions and the counts each script printed. Post counts and pass/fail
-lines only, never shaders or logs from the game. A failure that isn't in the table above gets its own issue, linked
-from your entry.
+Submit a pull request adding a file under [`gpu-test-results/`](../gpu-test-results), using the existing files
+there as format examples. Follow [CONTRIBUTING.md](../CONTRIBUTING.md) and claim the work in the
+[coordination issue][claims] before opening the pull request.
 
-Use your system's detected CPU, GPU, VRAM and RAM model names in the #166 entry, not benchmark scores. For a rough browser-based check against reference profiles, you can use [Can I Run Leonida](https://assttro.github.io/can-i-run-leonida/).
+Include your GPU, driver, subgroup range, OS, the commit you built, the tool versions, and the pass, skip and fail
+counts each script printed. Label a single-test run clearly instead of presenting it as a full suite run.
+Post counts and pass/fail lines only, never shaders or logs from the game. A failure that is not in the table
+above gets its own issue, linked from your record.
+
+Use your system's detected CPU, GPU, VRAM and RAM model names in your result record, not benchmark scores.
+For a rough browser-based check against reference profiles, you can use [Can I Run Leonida](https://assttro.github.io/can-i-run-leonida/).

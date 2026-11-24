@@ -355,6 +355,10 @@ std::vector<std::wstring> parent_of(const std::vector<std::wstring>& parts) {
     return parts.empty() ? parts : std::vector<std::wstring>(parts.begin(), parts.end() - 1);
 }
 
+DWORD missing_error(const Roots& r, const std::vector<std::wstring>& parts) {
+    return is_folder(r, parent_of(parts)) ? ERROR_FILE_NOT_FOUND : ERROR_PATH_NOT_FOUND;
+}
+
 // Whether a folder has nothing in the title's view: no overlay entry and no package entry that is not deleted.
 bool empty_in_view(const Roots& r, const std::vector<std::wstring>& parts) {
     std::error_code ec;
@@ -701,6 +705,41 @@ void note_open_failure(const char* api, LPCWSTR name, DWORD error, const void* c
             rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
 }
 
+// Reads one byte of every 4 KiB page of [buffer, buffer + size) from user mode, so that pages committed on first
+// touch (xmem's physical-page views: a reserve-only section committed by its vectored handler) are committed before
+// the kernel writes into them. A page that is not valid at all is left for the caller's ReadFile to refuse. No C++
+// objects here: the function has __try.
+bool touch_pages(void* buffer, DWORD size) {
+    auto* p = static_cast<volatile const unsigned char*>(buffer);
+    const uintptr_t first = reinterpret_cast<uintptr_t>(buffer) & ~uintptr_t{0xfff};
+    const uintptr_t end = reinterpret_cast<uintptr_t>(buffer) + size;
+    bool all = true;
+    for (uintptr_t page = first; page < end; page += 0x1000) {
+        const uintptr_t at = page < reinterpret_cast<uintptr_t>(p) ? reinterpret_cast<uintptr_t>(p) : page;
+        __try {
+            (void)*reinterpret_cast<volatile const unsigned char*>(at);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            all = false;
+        }
+    }
+    return all;
+}
+
+// ReadFile with one retry for a destination the kernel cannot write yet. The retail title reads into title memory
+// that xmem maps from physical pages committed on first touch; the kernel's write raises no user-mode fault, so
+// ReadFile fails with ERROR_NOACCESS (998), and the title's read loop sleeps 1 ms and retries forever (measured on
+// 1.0.2.1, native Windows). Touching the pages from user mode commits them; the read is then retried once.
+BOOL WINAPI read_file(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, LPOVERLAPPED overlapped) {
+    if (ReadFile(file, buffer, size, read, overlapped)) return TRUE;
+    if (GetLastError() != ERROR_NOACCESS || !buffer || !size) return FALSE;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true))
+        std::fprintf(stderr, "[rt] fs: ReadFile into uncommitted title memory (ERROR_NOACCESS): committing the "
+                             "destination pages and retrying (logged once)\n");
+    touch_pages(buffer, size);
+    return ReadFile(file, buffer, size, read, overlapped);
+}
+
 HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,
                             DWORD disposition, DWORD flags, HANDLE template_file) {
     if (!name) {
@@ -989,10 +1028,7 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
             removed = true;
         }
     }
-    if (!removed) {
-        SetLastError(ERROR_FILE_NOT_FOUND);
-        return FALSE;
-    }
+    if (!removed) return fail_bool(missing_error(r, parts));
     return TRUE;
 }
 
@@ -1081,7 +1117,7 @@ BOOL WINAPI remove_directory_w(LPCWSTR name) {
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (drive_root(name, parts)) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" and "T:" themselves stay
     const View v = view(r, parts);
-    if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (v.kind == Kind::None) return fail_bool(missing_error(r, parts));
     if (v.kind == Kind::File) return fail_bool(ERROR_DIRECTORY);
     if (!empty_in_view(r, parts)) return fail_bool(ERROR_DIR_NOT_EMPTY);
 
@@ -1118,7 +1154,7 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (drive_root(from, src) || drive_root(to, dst)) return fail_bool(ERROR_ACCESS_DENIED);
     const View from_view = view(r, src);
-    if (from_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (from_view.kind == Kind::None) return fail_bool(missing_error(r, src));
     const std::filesystem::path overlay_from = disk_path(r.overlay, src), overlay_to = disk_path(r.overlay, dst);
     if (same_entry(src, dst)) {
         // The destination is the source, so it is not "already there". The host succeeds at a move onto the same
@@ -1369,7 +1405,7 @@ BOOL WINAPI set_file_attributes_w(LPCWSTR name, DWORD attributes) {
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (parts.empty()) return fail_bool(ERROR_ACCESS_DENIED);
     const View v = view(r, parts);
-    if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (v.kind == Kind::None) return fail_bool(missing_error(r, parts));
 
     // The attributes belong to the overlay copy: a package file is copied up and a package folder mirrored first,
     // so the package keeps its own attributes and reads, which prefer the overlay, see the new ones.
@@ -1405,6 +1441,7 @@ using namespace rt::fs;
     {dll, "CreateFileA", reinterpret_cast<void*>(&create_file_a)},                                       \
         {dll, "CreateFileW", reinterpret_cast<void*>(&create_file_w)},                                   \
         {dll, "CreateFile2", reinterpret_cast<void*>(&create_file2)},                                    \
+        {dll, "ReadFile", reinterpret_cast<void*>(&read_file)},                                          \
         {dll, "FindFirstFileA", reinterpret_cast<void*>(&find_first_file_a)},                            \
         {dll, "FindFirstFileW", reinterpret_cast<void*>(&find_first_file_w)},                            \
         {dll, "FindFirstFileExA", reinterpret_cast<void*>(&find_first_file_ex_a)},                       \

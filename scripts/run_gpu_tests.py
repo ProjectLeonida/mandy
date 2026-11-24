@@ -36,6 +36,7 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_
 from check import SIGNED_MIP_TEST, UINT_MIP_TEST
 from check import cbv_modulate_test
 from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
+from check import shift64_test   # dynamic 64-bit vector shifts and overlapping destinations
 from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
@@ -93,10 +94,23 @@ def make_ms_psv0(threads_x: int, maxv: int, maxp: int, topology: int = 2, group_
     return struct.pack("<I", len(r)) + bytes(r)
 
 
+# A comment line a .asm carries when llvm-mc cannot assemble it (cs_dpp_cmp.asm: a VOPC compare in DPP form).
+TEXT_ONLY_MARK = "; run_gpu_tests: text only, llvm-mc has no gfx1013 encoding for an instruction here"
+
+
 def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
     """Assemble raw RDNA2 .asm with llvm-mc -show-encoding into .s format for rdna2spirv.py."""
     with open(asm_path, encoding="utf-8") as source:
         raw = source.read()
+    if any(ln.strip() == TEXT_ONLY_MARK for ln in raw.splitlines()):
+        # The source holds an instruction llvm-mc has no gfx1013 encoding for. The translator reads straight-line
+        # code from its text alone (tests/semantic/regen_fixtures.py writes such listings), so the lines go through
+        # as they are.
+        lines = [f"; {name}  code 0x0..0x0 (synthetic), gfx1013, 0 invalid words"]
+        lines += ["\t" + ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.lstrip().startswith(";")]
+        with open(s_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines) + "\n")
+        return
     cmd = mc_command.mc_command(llvm_mc) + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
     for ln in raw.splitlines():
         s = ln.strip()
@@ -149,8 +163,13 @@ def spirv_as(asm_text: str, out_spv: str, assembler: str = "spirv-as") -> None:
         with open(out_spv, "wb") as f:
             f.write(spv_bytes)
         return
-    p = subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-o", out_spv, "-"],
-                       input=asm_text, capture_output=True, text=True)
+    try:
+        p = subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-o", out_spv, "-"],
+                           input=asm_text, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise RuntimeError("spirv-as not found on PATH (use --assembler python to assemble with tools/spirv_asm.py)") from None
+    except OSError as exc:
+        raise RuntimeError(f"spirv-as could not be started: {exc.strerror or exc}") from None
     if p.returncode != 0:
         raise RuntimeError(f"spirv-as failed for {out_spv}:\n{p.stderr}")
 
@@ -258,6 +277,8 @@ def read_raw_u32(path: str) -> list[tuple[int, int, int, int]]:
     return [struct.unpack_from("<4I", data, 16 * i) for i in range(n)]
 
 
+# cs_div_fmas_f64_rt's operands a = 1 + 2^-30, c = -(1 + 2^-29) as s4..s7 (low word first).
+DIV_FMAS_F64_SGPRS = "0x00400000,0x3ff00000,0x00800000,0xbff00000"
 UNSUPPORTED = 77   # vk_harness: the device lacks a stage the test draws with (geometry or mesh shaders)
 
 
@@ -975,6 +996,10 @@ def run_suite(a, work: str) -> int:
         if name in CLIP_CASES:
             detail = clip_test(a.build, spirv_dir, name)
             results.append((name, None if isinstance(detail, Skip) else not detail, detail or "four pixel masks exact"))
+        elif name == "cs_w32_shift64":
+            detail = shift64_test(a.build, spirv_dir, cs_env)
+            results.append((name, None if isinstance(detail, Skip) else not detail,
+                            detail or "640 words exact (64 shift cases and unchanged inputs)"))
         elif name == "cs_workgroup_yz":
             rc, msg = run_cmd([vk_compute, spv, "2x3x4", "workgroup_yz"], env=cs_env)
             results.append((name,) + compute_result(rc, msg, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches"
@@ -1092,10 +1117,12 @@ def run_suite(a, work: str) -> int:
                 ok, detail = judge_cs_dump(rc, msg, [0, 0x40040000], wave64=False, partial=False, emulated=False,
                                            hexwords=True)
                 results.append((name, ok, detail))
-        elif name == "cs_div_fmas_f64":
+        elif name in ("cs_div_fmas_f64", "cs_div_fmas_f64_rt"):
             # One-rounding binary64 FMA: strict where the translator emitted OpFmaKHR on doubles (shaderFmaFloat64,
             # --fma khr); under the default GLSL Fma the split result (0) is allowed, as cs_fma_fused allows it.
-            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            # The _rt fixture reads the same operands from s4..s7, so the driver cannot fold the Fma at compile time.
+            env = dict(cs_env or os.environ, VKC_SGPRS=DIV_FMAS_F64_SGPRS) if name.endswith("_rt") else cs_env
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=env)
             if rc == UNSUPPORTED:      # no shaderFloat64, or (--fma khr) no shaderFmaFloat64
                 results.append((name, None, unsupported_skip(msg)))
             else:
@@ -1105,7 +1132,8 @@ def run_suite(a, work: str) -> int:
                 ok = rc == 0 and (words == fused or (not strict and words == split))
                 detail = " ".join(hex(x) for x in words) if words else msg
                 if ok and words == split:
-                    detail += " (split: the driver rounds GLSL Fma on doubles twice; --fma khr fixes it)"
+                    detail += (" (split: the driver rounded GLSL Fma on doubles twice%s; --fma khr fixes it)"
+                               % ("" if name.endswith("_rt") else " when folding the constants"))
                 results.append((name, ok, detail))
         elif name == "cs_cvt_f32_sat":
             # #300's saturating float -> int conversions: one dispatch per input word in s4 (VKC_SGPRS).
@@ -1152,7 +1180,7 @@ def run_suite(a, work: str) -> int:
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
         elif name in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_lds_subdword", "cs_w32_lds_wide", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
-                      "cs_dpp_bound", "cs_dpp_w64",
+                      "cs_dpp_bound", "cs_dpp_cmp", "cs_dpp_w64",
                       "cs_w64_mask_detect",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute", "cs_w64x_permute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
@@ -1213,6 +1241,7 @@ def run_suite(a, work: str) -> int:
                 "cs_dpp_bound": [10, 10, 11, 12, 13, 14, 15, 16],
                 "cs_dpp_bank": [0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD, 0xFFFFFFFC, 7, 7, 7, 7],
                 "cs_dpp_fi": [1, 2, 3, 0x7777, 5, 6, 7, 0x7777],
+                "cs_dpp_cmp": [3, 2, 3, 2, 1, 0, 1, 0],
                 "cs_dpp_w64": [1, 0, 3, 2, 5, 4, 7, 6],
                 # SHADER-99: -0 and NaN survive (SignedZeroInfNanPreserve, cs_signed_zero_nan.asm); 0 in out[4..7]
                 # without it
@@ -1287,7 +1316,7 @@ def run_suite(a, work: str) -> int:
                                   "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_w32_permlane_fi", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap",
                                   "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
-                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_w32_andn2_exec",
+                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_dpp_cmp", "cs_w32_andn2_exec",
                                   "cs_w32_exec_computed") and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
@@ -1319,6 +1348,9 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
+            results.append((name, *helper_result(rc, msg)))
+        elif name == "cs_imgstore_cube":   # GPU-CUBE-STORE: six-layer 2D-array views at bindings 11/12/13
+            rc, msg = run_cmd([vk_store, spv, "cube"])
             results.append((name, *helper_result(rc, msg)))
         elif name in ("cs_imgload", "cs_imgload_tfe", "cs_imgload_d16", "cs_imgload_d16_tfe", "cs_sample_lz_int_d16"):
             rc, msg = run_cmd([vk_store, spv, "load" if name in ("cs_imgload", "cs_imgload_tfe") else "load-d16"])
