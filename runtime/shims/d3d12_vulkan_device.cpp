@@ -5185,6 +5185,13 @@ public:
                 return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             }, max_storage_range);
         }
+        if (state_.context->loaded()) {
+            state_.context->enable_color_resolve(
+                [this](const VkMemoryRequirements& requirements) {
+                    return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                },
+                [this](const VkImageCreateInfo& image) { return SUCCEEDED(state_.check_image_support(image)); });
+        }
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");
         query_luid_and_clock(get_device);
@@ -8934,8 +8941,29 @@ VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D
     return VK_NULL_HANDLE;
 }
 
+bool color_extremum_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src) {
+    if (!dst || !src) return false;
+    const auto from = src->GetDesc();
+    const auto to = dst->GetDesc();
+    if ((from.Flags | to.Flags) & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) return false;
+    const Format requested = texture_storage_format(format, false);
+    return from.Format == format && to.Format == format && !requested.typeless && !requested.rgb96 &&
+           requested.aspects == VK_IMAGE_ASPECT_COLOR_BIT &&
+           leonida::color_resolve_type(requested.format) != leonida::ColorResolveType::unsupported;
+}
+
 bool color_resolve_format_is_integer(DXGI_FORMAT format) {
     return DeviceState::numeric_class(vulkan_format(format, false).format) != 0;
+}
+
+std::uint32_t color_resolve_view_format(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src) {
+    if (!dst || !src) return 0;
+    const auto from = src->GetDesc(), to = dst->GetDesc();
+    if ((from.Flags | to.Flags) & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) return 0;
+    if (!vulkan_format(from.Format, false).typeless && !vulkan_format(to.Format, false).typeless) return 0;
+    const Format requested = vulkan_format(format, false);
+    if (requested.typeless || requested.rgb96 || requested.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return 0;
+    return std::uint32_t(requested.format);
 }
 
 bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src) {

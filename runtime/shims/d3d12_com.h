@@ -256,7 +256,12 @@ VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource);
 // Whether the requested colour format has an integer numeric class.
 bool color_resolve_format_is_integer(DXGI_FORMAT format);
 
+// The VkFormat a whole-subresource ResolveSubresource averages in when a resource is typeless and `format` names a
+// typed colour member of its family (the one the textures' own format does not say); 0: the textures' own format.
+std::uint32_t color_resolve_view_format(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src);
+
 // Whether both resources use the requested typed, non-integer colour format for a regional average resolve.
+bool color_extremum_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src);
 bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src);
 
 // Whether a resolve of one depth or stencil plane can be replayed: both resources are depth-stencil textures of

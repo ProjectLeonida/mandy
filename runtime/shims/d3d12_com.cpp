@@ -648,7 +648,8 @@ public:
             note_once("ResolveSubresource refused: integer colour formats cannot be resolved");
             return check(false);
         }
-        check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource}));
+        check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource,
+                                         std::nullopt, color_resolve_view_format(format, dst, src)}));
     }
 
     void STDMETHODCALLTYPE ResolveSubresourceRegion(ID3D12Resource* dst, UINT dst_subresource, UINT x, UINT y,
@@ -656,6 +657,15 @@ public:
                                                      DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) override {
         d3d12_trace::record("ID3D12GraphicsCommandList1::ResolveSubresourceRegion");
         if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
+        if ((mode == D3D12_RESOLVE_MODE_MIN || mode == D3D12_RESOLVE_MODE_MAX) &&
+            color_extremum_resolve_format_matches(format, dst, src)) {
+            leonida::ResolveRegion extrema{x, y, std::nullopt};
+            extrema.mode = mode == D3D12_RESOLVE_MODE_MIN ? leonida::d3d12_resolve_mode::minimum
+                                                         : leonida::d3d12_resolve_mode::maximum;
+            if (rect) extrema.src_rect = leonida::Rect{rect->left, rect->top, rect->right, rect->bottom};
+            return check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src),
+                                                     src_subresource, extrema}));
+        }
         leonida::ResolveRegion region{x, y, std::nullopt};
         if (mode != D3D12_RESOLVE_MODE_AVERAGE || !color_resolve_format_matches(format, dst, src)) {
             if (!depth_stencil_resolve_supported(format, dst, dst_subresource, x, y, src, src_subresource, rect,

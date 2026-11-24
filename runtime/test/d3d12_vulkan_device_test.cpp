@@ -6288,6 +6288,11 @@ int main() {
             EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
             list7->ResolveSubresourceRegion(region_target.p, 0, 4, 1, msaa.p, 0, &region, region_format,
                                             D3D12_RESOLVE_MODE_MAX);
+            EXPECT(list->Close() == S_OK);  // a colour MAX resolve is replayed (see d3d12_msaa_draw_test)
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            // A mode that is no colour resolve at all (ENCODE_SAMPLER_FEEDBACK, value 4) stays refused.
+            list7->ResolveSubresourceRegion(region_target.p, 0, 4, 1, msaa.p, 0, &region, region_format,
+                                            static_cast<D3D12_RESOLVE_MODE>(4));
             EXPECT(list->Close() == E_INVALIDARG);
             EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
             list7->ResolveSubresourceRegion(region_target.p, 0, 4, 1, msaa.p, 0, &region,

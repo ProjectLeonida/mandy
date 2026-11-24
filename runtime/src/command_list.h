@@ -363,13 +363,16 @@ struct ResolveRegion {
 };
 
 // Without a region, both subresources have the same extent. A region with no source rectangle takes the
-// entire source to the given destination offset. The resolve uses the images' own format.
+// entire source to the given destination offset. The resolve uses the images' own format, except that `format` (a
+// VkFormat, 0: none) names the member of a typeless family the colour is averaged in, which a plain
+// ResolveSubresource of a typeless resource gives (sRGB averages in linear light, UNORM does not).
 struct ResolveSubresource {
     ResourceId dst;
     std::uint32_t dst_subresource;
     ResourceId src;
     std::uint32_t src_subresource;
     std::optional<ResolveRegion> region = std::nullopt;
+    std::uint32_t format = 0;
 };
 
 // Dispatch, with what it uses captured when it is recorded: the pipeline (an opaque id the replay resolves) and
