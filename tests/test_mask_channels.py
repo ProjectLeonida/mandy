@@ -82,6 +82,40 @@ class MaskChannelTests(unittest.TestCase):
                         sys.stderr = saved_err
                 self.assertEqual(cm.exception.code, 2)
 
+    def test_failed_replace_of_read_only_report_removes_writable_temp(self):
+        """A failed replace over a read-only report leaves the old report, removes the staged file and
+        still exits 2 with one ERROR line: the staged file had the read-only destination's bits, so the
+        cleanup has to make it deletable first, or Windows strands it and masks the real error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path, out = os.path.join(tmp, "m.dds"), os.path.join(tmp, "m.json")
+            with open(path, "wb") as fh:
+                fh.write(rgba8_dds(W, H, image()))
+            buf, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(buf), redirect_stderr(err):
+                self.assertEqual(mc.main([path, "--thresholds", "128", "--json", out]), 0)
+            old = open(out, encoding="utf-8").read()
+            os.chmod(out, 0o444)
+            self.addCleanup(lambda: os.path.exists(out) and os.chmod(out, 0o600))
+            made_writable = []
+            real_chmod = os.chmod
+
+            def chmod(staged_path, mode, *args, **kwargs):
+                if isinstance(staged_path, str) and os.path.basename(staged_path).startswith(".mask-json-") \
+                        and mode == 0o600:
+                    made_writable.append(staged_path)
+                return real_chmod(staged_path, mode, *args, **kwargs)
+
+            err2 = io.StringIO()
+            with mock.patch.object(mc.os, "replace", side_effect=OSError("replace denied")), \
+                    mock.patch.object(mc.os, "chmod", chmod), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(err2):
+                self.assertEqual(mc.main([path, "--thresholds", "128", "--json", out]), 2)
+            self.assertEqual(err2.getvalue().count("ERROR: "), 1)      # the replace error, not cleanup noise
+            self.assertIn("replace denied", err2.getvalue())
+            self.assertEqual(open(out, encoding="utf-8").read(), old)  # the old report is untouched
+            self.assertEqual([n for n in os.listdir(tmp) if n.startswith(".mask-json-")], [])
+            self.assertEqual(len(made_writable), 1)                    # the staged file was made deletable
+
     def test_json_folder_is_created(self):
         """--json under a folder that does not exist yet gets the report, not a traceback, and nothing else."""
         with tempfile.TemporaryDirectory() as tmp:
