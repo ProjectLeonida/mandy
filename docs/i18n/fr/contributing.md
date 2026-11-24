@@ -30,7 +30,7 @@ d'autre. Si deux pull requests se recoupent malgré tout, celle qui arrive en pr
 
 Une fois la pull request ouverte, publiez `done: <ID> -> #<PR>` dans l'issue. Les pull requests visent `main`.
 
-Le dépôt d'origine (`ItsNotRexed/Leonida`) est devenu privé le 23 novembre 2026, avec ses issues et ses pull
+Le dépôt d'origine (`ubiquitarianism/leonida`) est devenu privé le 23 novembre 2026, avec ses issues et ses pull
 requests. Un `#N` écrit avant cette date dans la documentation, un commentaire de code ou un message de commit est
 un **ancien** numéro et ne mène plus nulle part, y compris les deux vers lesquels cette page renvoyait : #166
 (résultats des tests GPU) et #313 (la page de la couche D3D12 → Vulkan).
