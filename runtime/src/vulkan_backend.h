@@ -2766,7 +2766,11 @@ private:
                 context_.quad_indices_->emit(cb, job);
             };
         }
-        if (context_.depth24_ && !transfer_only) {
+        if (transfer_only) {
+            // The common replay table also carries a converter. Leave it unavailable here so preparing a
+            // copy that needs a compute repack fails before recording anything on a transfer-only family.
+            replay.depth24_prepare = {};
+        } else if (context_.depth24_) {
             replay.depth24_prepare = [this, &tracker_lock, &depth24_guard](Depth24Job& job,
                                                                            std::vector<Depth24Job>& parts) {
                 if (!tracker_lock.owns_lock()) tracker_lock.lock();

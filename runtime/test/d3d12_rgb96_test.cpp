@@ -12,7 +12,7 @@
 //   - what creation, GetResourceAllocationInfo and CheckFeatureSupport say, next to WARP's answers, and that
 //     the three agree with each other;
 //   - copies between a 96-bit texture and an RGBA32 one refused;
-//   - an upload and a readback on a COPY queue;
+//   - an upload and a readback on a COPY queue, plus refusal on a transfer-only Vulkan family;
 //   - how long an upload and a readback take at 64x64 and 256x256, and up to 4096x4096 with LEONIDA_RGB96_LARGE
 //     set (single runs, each on a new queue).
 // No game data or shaders. Run explicitly (needs Vulkan hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
@@ -447,7 +447,7 @@ bool timed(ID3D12Device* device, UINT size, double& upload_ms, double& readback_
 
 // An upload and a readback on a COPY queue, where streaming uploads run: the repack is a compute dispatch, which
 // the layer's copy queues must take. The texture starts in COMMON and is promoted, as a copy queue requires.
-bool copy_queue(ID3D12Device* device) {
+bool copy_queue(ID3D12Device* device, bool transfer_only = false) {
     Gpu gpu;
     CHECK(gpu.create(device, D3D12_COMMAND_LIST_TYPE_COPY));
     constexpr UINT width = 7, height = 5;
@@ -477,6 +477,13 @@ bool copy_queue(ID3D12Device* device) {
     {
         const auto dst = subresource(texture.p, 0), src = placed(upload.p, footprint);
         gpu.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    if (transfer_only) {
+        CHECK(SUCCEEDED(gpu.list->Close()));
+        ID3D12CommandList* lists[] = {gpu.list.p};
+        gpu.queue->ExecuteCommandLists(1, lists);
+        CHECK(rt::d3d12::last_execute_result(gpu.queue.p) == leonida::ReplayResult::unsupported);
+        return true;
     }
     CHECK(gpu.run());  // the texture decays to COMMON, and is promoted again as a copy source
     {
@@ -553,6 +560,7 @@ bool refusals(ID3D12Device* device) {
 
 int main() {
     vktest::Device vk;
+    vk.all_queue_types = true;
     const auto device_status = vk.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
@@ -569,6 +577,17 @@ int main() {
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours_staged.p)))) return 1;
         info.host_image_copy = vk.host_image_copy;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
+        if (vk.copy_family != vk.family &&
+            !(vk.families[vk.copy_family].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))) {
+            Ref<ID3D12Device> transfer;
+            info.command_queues = vk.queues;
+            info.copy_family = vk.copy_family;
+            info.copy_queues = {vk.copy_queue};
+            // Keep conditional_rendering disabled: classification must not depend on predication setup.
+            if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&transfer.p))) ||
+                !copy_queue(transfer.p, true)) return 1;
+            std::printf("transfer-only COPY queue: RGB96 repack refused without conditional rendering\n");
+        }
         // Wine has a WARP adapter too, but it is vkd3d, whose footprints differ from Microsoft's.
         if (hostwine::host_is_wine()) return 77;  // WARP is the reference for every case
         Ref<IDXGIFactory4> factory;
