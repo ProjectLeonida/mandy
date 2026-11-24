@@ -1405,6 +1405,11 @@ public:
         bindless_prepare_ = std::move(prepare);
     }
 
+    using ColorResolve = ColorResolvePass<VulkanDeviceFunctions>;
+    void enable_color_resolve(ColorResolve::Allocate allocate, ColorResolve::Supported supported) {
+        color_resolve_ = std::make_unique<ColorResolve>(vk, device_, std::move(allocate), std::move(supported));
+    }
+
     // D24_UNORM_S8_UINT stored as D32: copies of its depth plane run a compute pass (vulkan_depth24.h). `allocate`
     // gives the scratch buffers device-local memory. Without this such a copy is refused as unsupported.
     void enable_depth24(PFN_vkGetDeviceProcAddr get, Depth24Converter::Allocate allocate,
@@ -1733,6 +1738,7 @@ private:
     std::uint64_t bindless_upload_value_ = 0;
     std::uint64_t bindless_upload_version_ = 0;
     std::unique_ptr<Depth24Converter> depth24_;
+    std::unique_ptr<ColorResolve> color_resolve_;
     std::unique_ptr<ScratchBuffers> scratch_;  // copies staged through a buffer (depth <-> colour)
     std::function<void(bool)> bindless_commit_;
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
@@ -2399,6 +2405,17 @@ private:
                 context_.counted_dispatch_->emit(cb, job);
             };
         }
+        std::vector<std::shared_ptr<void>> color_resolves;
+        if (kind_ == QueueKind::direct && context_.color_resolve_) {
+            replay.prepare_color_resolve = [this, &color_resolves](const ResourceBinding& source,
+                const VkImageSubresourceRange& range, VkExtent3D extent, ColorResolveJob& job) {
+                const auto layout = image_layout(source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                auto allocation = context_.color_resolve_->prepare(source.image, source.format, range, layout, extent, job);
+                if (!allocation) return false;
+                color_resolves.push_back(std::move(allocation));
+                return true;
+            };
+        }
         if (context_.depth24_ && !transfer_only) {
             replay.depth24_prepare = [this, &tracker_lock, &depth24_guard](Depth24Job& job,
                                                                            std::vector<Depth24Job>& parts) {
@@ -2698,6 +2715,7 @@ private:
             slot->predicate = std::move(batch);
             slot->predicated_copy = std::move(copy_batch);
             slot->counted_dispatch = std::move(counted_batch);
+            slot->color_resolves = std::move(color_resolves);
             queries.commit();
             slot->segments = std::move(queries.retained);
         } else {
@@ -2931,6 +2949,7 @@ private:
         std::vector<VkEvent> events;  // order_timestamp_copy's, reset and reused once the slot completes
         std::unique_ptr<PredicatedBufferCopier::Batch> predicated_copy;
         std::unique_ptr<IndirectDispatchCounter::Batch> counted_dispatch;
+        std::vector<std::shared_ptr<void>> color_resolves;
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
         std::vector<KhrInstanceStage> khr_instances;  // KHR ARRAY_OF_POINTERS staging, same lifetime
         std::vector<KhrAsQueryPool> khr_as_queries;   // KHR postbuild COMPACTED_SIZE query pools, same lifetime
@@ -3153,6 +3172,7 @@ private:
             reuse->predicate.reset();
             reuse->predicated_copy.reset();
             reuse->counted_dispatch.reset();
+            reuse->color_resolves.clear();
             reuse->ticket = UINT64_MAX;  // in use until submitted
             return reuse;
         }

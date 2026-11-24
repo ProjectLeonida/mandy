@@ -33,6 +33,7 @@
 #include "command_list.h"
 #include "depth24.h"
 #include "uav_clear.h"
+#include "vulkan_color_resolve.h"
 
 #include <vulkan/vulkan.h>
 #include "vulkan_predicate.h"
@@ -230,6 +231,8 @@ inline VkPipelineStageFlags2 vulkan_sync(std::uint32_t sync) {
         known |= bit.sync;
         out |= bit.stages;
     }
+    // The colour MIN/MAX resolve reads from a fragment shader and copies its output to the destination.
+    if (sync & y::resolve) out |= VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
     // Ray tracing, video and split have no narrower equivalent without extensions.
     if (sync & ~known) out |= VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     return out;
@@ -943,6 +946,8 @@ struct ReplayFunctions {
     // Optional format check for color-attachment reinterpretation on mutable UAV clears; unset assumes every format
     // except E5B9G9R9_UFLOAT_PACK32 supports COLOR_ATTACHMENT.
     std::function<bool(VkFormat)> color_attachment_format;
+    std::function<bool(const ResourceBinding&, const VkImageSubresourceRange&, VkExtent3D,
+                       ColorResolveJob&)> prepare_color_resolve;
     // Footprint copies of a depth24_as_float texture (depth24.h): `depth24_prepare` makes the scratch and descriptors
     // for a job while the list is checked, `depth24_run` records its dispatch. Without them such a copy is unsupported.
     std::function<bool(Depth24Job&, std::vector<Depth24Job>&)> depth24_prepare;  // whole copy in, dispatches out
@@ -1019,6 +1024,10 @@ struct Prepared {
     std::vector<VkImageCopy> image_copies;
     bool same_copy_subresource = false;
     VkImageResolve resolve{};  // resolves
+    bool color_extremum = false;
+    ColorResolveJob color_resolve;
+    std::uint32_t color_occlusion_end = PreparedQuery::no_segment;
+    std::uint32_t color_occlusion_begin = PreparedQuery::no_segment;
     // Depth or stencil resolves: the mode, and the destination view (`view` is the source's).
     VkResolveModeFlagBits resolve_mode = VK_RESOLVE_MODE_NONE;
     VkImageView resolve_view = VK_NULL_HANDLE;
@@ -1978,6 +1987,22 @@ inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared&
         return ReplayResult::invalid_copy;
     }
     if (src.aspectMask != dst.aspectMask || p.source.format != p.binding.format) return ReplayResult::unsupported;
+    const auto finish = [&] {
+        p.resolve = {{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1}, src_offset,
+                     {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1}, dst_offset, extent};
+        p.range = dst;
+        p.source_range = src;
+        return ReplayResult::success;
+    };
+    if (const auto& extrema = resolve.region; src.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && extrema &&
+        (extrema->mode == d3d12_resolve_mode::minimum || extrema->mode == d3d12_resolve_mode::maximum)) {
+        if (!p.source.sampled || p.source.line || p.binding.line || p.source.volume ||
+            p.source.typeless || p.binding.typeless || p.source.rgb96 || p.binding.rgb96 ||
+            color_resolve_type(p.source.format) == ColorResolveType::unsupported)
+            return ReplayResult::unsupported;
+        p.color_extremum = true;
+        return finish();
+    }
     const auto& region = resolve.region;
     if (src.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT) {
         if (region && region->mode != d3d12_resolve_mode::average) return ReplayResult::unsupported;
@@ -1990,11 +2015,7 @@ inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared&
                        : region->mode == d3d12_resolve_mode::maximum   ? VK_RESOLVE_MODE_MAX_BIT
                                                                        : VK_RESOLVE_MODE_AVERAGE_BIT;
     }
-    p.resolve = {{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1}, src_offset,
-                 {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1}, dst_offset, extent};
-    p.range = dst;
-    p.source_range = src;
-    return ReplayResult::success;
+    return finish();
 }
 
 // A depth or stencil resolve of a rectangle runs in a rendering scope whose render area is the rectangle, and Vulkan
@@ -2326,8 +2347,17 @@ inline ReplayResult plan_occlusion_segments(PreparedList& out) {
     // slot and opens a new one if any query remains active. Each shared interval is recorded only once.
     std::map<std::pair<QueryHeapId, std::uint32_t>, std::uint32_t> active;
     std::uint32_t current = detail::PreparedQuery::no_segment;
-    for (auto& query : out.queries) {
-        const Command& command = out.list->commands()[query.command];
+    std::size_t next_query = 0;
+    for (std::size_t i = 0; i < out.commands.size(); ++i) {
+        auto& p = out.commands[i];
+        if (p.color_extremum && current != detail::PreparedQuery::no_segment) {
+            // The internal triangle is outside the logical query's measured work.
+            p.color_occlusion_end = current;
+            current = p.color_occlusion_begin = out.segment_count++;
+        }
+        if (next_query == out.queries.size() || out.queries[next_query].command != i) continue;
+        auto& query = out.queries[next_query++];
+        const Command& command = out.list->commands()[i];
         if (std::holds_alternative<ResolveQueries>(command)) continue;
         const auto range = query_range(command);
         // Binary occlusion is virtualized alongside the ordinary kind (D3D-252): both are VK_QUERY_TYPE_OCCLUSION,
@@ -2388,7 +2418,7 @@ inline void plan_statistics_segments(PreparedList& out) {
     for (std::size_t i = 0; i < out.commands.size(); ++i) {
         auto& p = out.commands[i];
         if (begin && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
-                      p.counted_dispatch.indirect)) {
+                      p.counted_dispatch.indirect || p.color_extremum)) {
             inner.push_back({&p.statistics_end, &p.statistics_begin, -1});
             splits = true;
         }
@@ -2475,7 +2505,7 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
             // A helper dispatch while a query runs would be counted into it (D3D-162): close the shared physical
             // segment before it and open a new one after, the way resolves do.
             if (!active.empty() && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
-                                    p.counted_dispatch.indirect)) {
+                                    p.counted_dispatch.indirect || p.color_extremum)) {
                 p.statistics_end = current;
                 current = open();
                 p.statistics_begin = current;
@@ -2928,6 +2958,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                         {std::min(from.width, to.width), std::min(from.height, to.height)}, p.resolve_pass);
                     if (!p.resolve_framebuffer) return ReplayResult::unsupported;
                 }
+            }
+            if (p.color_extremum) {
+                // Use the same physical query segments as overlapping occlusion and internal dispatches.
+                overlaps |= ordinary_active || binary_active;
+                if ((statistics_active && !statistics_helpers) || !vk.prepare_color_resolve || !vk.copy_image ||
+                    !vk.begin_rendering || !vk.end_rendering || !vk.bind_pipeline || !vk.bind_descriptor_sets ||
+                    !vk.push_constants || !vk.set_viewport || !vk.set_scissor || !vk.draw ||
+                    !vk.prepare_color_resolve(p.source, p.source_range, p.resolve.extent, p.color_resolve))
+                    return ReplayResult::unsupported;
             }
         } else if (const auto* discard = std::get_if<DiscardResource>(&command)) {
             // Buffers and partial (rectangle) discards keep their contents, which "undefined" allows.
@@ -3444,6 +3483,58 @@ inline void close_labels(VkCommandBuffer command_buffer, const ReplayFunctions& 
 }
 
 // Writes a prepared list. With a tracker, barriers start from the tracked layouts and update them.
+// The triangle writes only the scratch rectangle. The transfer writes exactly that rectangle at the destination.
+inline void emit_color_resolve(const ReplayFunctions& vk, VkCommandBuffer cb, const detail::Prepared& p,
+                               ResourceId src_id, ResourceId dst_id, bool maximum, LayoutTracker* tracker) {
+    const auto& job = p.color_resolve;
+    ResourceBinding scratch{};
+    scratch.image = job.scratch;
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    const VkImageLayout attachment = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    constexpr auto output = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    detail::image_barrier(vk, cb, scratch, range, VK_IMAGE_LAYOUT_UNDEFINED, attachment,
+                          0, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, output);
+
+    const auto state = vulkan_access(d3d12_state::resolve_source, false);
+    const auto initial = image_layout(p.source, state.layout);
+    auto pieces = detail::current(tracker, src_id, p.source_range, initial);
+    detail::initialize(vk, cb, p.source, src_id, pieces, initial, tracker);
+    const auto sampled = image_layout(p.source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    detail::round_trip(vk, cb, p.source, pieces, sampled, state, VK_ACCESS_SHADER_READ_BIT,
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, [&] {
+        VkRenderingAttachmentInfo target{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        target.imageView = job.target;
+        target.imageLayout = attachment;
+        target.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        target.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfo render{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        render.renderArea.extent = {p.resolve.extent.width, p.resolve.extent.height};
+        render.layerCount = render.colorAttachmentCount = 1;
+        render.pColorAttachments = &target;
+        const VkViewport viewport{0, 0, float(p.resolve.extent.width), float(p.resolve.extent.height), 0, 1};
+        const std::int32_t push[]{p.resolve.srcOffset.x, p.resolve.srcOffset.y,
+                                  std::int32_t(p.source.samples), maximum ? 1 : 0};
+        vk.begin_rendering(cb, &render);
+        vk.bind_pipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, job.pipeline);
+        vk.bind_descriptor_sets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, job.layout, 0, 1, &job.set, 0, nullptr);
+        vk.push_constants(cb, job.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
+        vk.set_viewport(cb, 0, 1, &viewport);
+        vk.set_scissor(cb, 0, 1, &render.renderArea);
+        vk.draw(cb, 3, 1, 0, 0);
+        vk.end_rendering(cb);
+    });
+
+    constexpr auto transfer_src = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    detail::image_barrier(vk, cb, scratch, range, attachment, transfer_src,
+                          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, output, VK_ACCESS_TRANSFER_READ_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT);
+    const VkImageLayout dst_layout = detail::copy_layout(
+        vk, cb, p.binding, dst_id, p.range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+    const VkImageCopy copy{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, p.resolve.dstSubresource,
+                           p.resolve.dstOffset, p.resolve.extent};
+    vk.copy_image(cb, job.scratch, transfer_src, p.binding.image, dst_layout, 1, &copy);
+}
+
 // `open_labels` counts the debug labels begun and not yet ended in this command buffer: an EndEvent with none open
 // is dropped (Vulkan requires a matching begin), and the caller ends what is still open before it ends the buffer
 // (close_labels). Without it, the list's own events are balanced at its end.
@@ -3865,6 +3956,25 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         } else if (std::holds_alternative<ResolveSubresource>(command)) {
             // resolve_source and resolve_dest are the transfer layouts, as copy_source and copy_dest are.
             const auto [dst_id, src_id] = copy_ids(command);
+            if (p.color_extremum) {
+                constexpr auto none = detail::PreparedQuery::no_segment;
+                end_statistics();
+                if (p.color_occlusion_end != none)
+                    vk.end_query(command_buffer, prepared.segment_pool, prepared.segment_base + p.color_occlusion_end);
+                if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
+                const auto& region = *std::get<ResolveSubresource>(command).region;
+                emit_color_resolve(vk, command_buffer, p, src_id, dst_id,
+                                   region.mode == d3d12_resolve_mode::maximum, tracker);
+                if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
+                if (p.color_occlusion_begin != none) {
+                    const auto segment = prepared.segment_base + p.color_occlusion_begin;
+                    vk.reset_query_pool(command_buffer, prepared.segment_pool, segment, 1);
+                    vk.begin_query(command_buffer, prepared.segment_pool, segment,
+                                   prepared.precise_segments ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+                }
+                begin_statistics();
+                continue;
+            }
             if (p.resolve_mode != VK_RESOLVE_MODE_NONE) {
                 // A rendering scope of its own, with no draws: the source plane as the attachment, the destination
                 // as its resolve target. Both go to the attachment layout and back. Resolves run in the colour

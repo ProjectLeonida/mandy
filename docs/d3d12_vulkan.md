@@ -2509,6 +2509,12 @@ The trace will enumerate them.
     Microsoft WARP and an NVIDIA GTX 1660 SUPER: total tiles, the tile shape and every packed-mip field are zero,
     and the returned subresource-tiling count is zero (so its output element is untouched). This holds for
     `FLOAT`, `UINT`, `SINT` and `TYPELESS`; there is no standard tile shape to implement for a 12-byte texel.
+- Colour `ResolveSubresourceRegion(MIN/MAX)` fetches every sample of each source pixel and reduces each channel.
+  A fragment pass writes a temporary attachment, then replay copies the rectangle to the destination offset. This
+  accepts matching typed 2D UNORM, FLOAT, UINT and SINT formats when Vulkan supports sampling the multisampled source
+  and rendering to a same-format attachment. Application occlusion and pipeline-statistics queries exclude the
+  helper draw. `d3d12_msaa_draw_test` checks a shifted 4x UNORM region with MIN, MAX and AVERAGE and compares the
+  pixels outside the rectangle with the original image.
 - Resource flags map to Vulkan usage: `ALLOW_RENDER_TARGET` → `COLOR_ATTACHMENT`, `ALLOW_DEPTH_STENCIL` →
   `DEPTH_STENCIL_ATTACHMENT`, `ALLOW_UNORDERED_ACCESS` → `STORAGE`, `ALLOW_SIMULTANEOUS_ACCESS` → concurrent
   sharing, `DENY_*` → omit the corresponding usage. Buffers get the union of usages their states and flags imply;
