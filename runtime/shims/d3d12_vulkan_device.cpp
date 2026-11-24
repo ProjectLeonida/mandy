@@ -13775,6 +13775,7 @@ public:
                 if (levels->pFeatureLevelsRequested[i] <= D3D_FEATURE_LEVEL_12_1)
                     best = std::max(best, levels->pFeatureLevelsRequested[i]);
             levels->MaxSupportedFeatureLevel = best;  // 0 with DXGI_ERROR_UNSUPPORTED, as the host writes it
+            log_once("CheckFeatureSupport FEATURE_LEVELS max", static_cast<int>(best));
             if (!best) return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
             return d3d12_trace::result(method, S_OK);
         }
@@ -13795,6 +13796,7 @@ public:
             arch->UMA = state_.uma ? TRUE : FALSE;
             arch->CacheCoherentUMA = FALSE;
             if (v1) arch->IsolatedMMU = TRUE;
+            log_once("CheckFeatureSupport ARCHITECTURE UMA", static_cast<int>(arch->UMA));
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS: {
@@ -13834,6 +13836,7 @@ public:
                 // (docs/d3d12_xs_surface.md §7.1): fill the 0x3C-byte PC prefix and zero the trailing 4 bytes.
                 std::memset(static_cast<std::uint8_t*>(data) + sizeof(pc_opts), 0, sizeof(UINT));
             }
+            log_once("CheckFeatureSupport OPTIONS ResourceBindingTier", static_cast<int>(pc_opts.ResourceBindingTier));
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS1: {
@@ -13848,6 +13851,7 @@ public:
             // (section 4.1): a game that sizes work from it plans for less parallelism than the GPU has, not more.
             opts->TotalLaneCount = facts.lane_max;
             opts->ExpandedComputeResourceStates = TRUE;  // Vulkan has no resource states to expand
+            log_once("CheckFeatureSupport OPTIONS1 WaveOps", static_cast<int>(opts->WaveOps));
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS8: {
@@ -13894,6 +13898,7 @@ public:
             opts->SRVOnlyTiledResourceTier3 = FALSE;
             opts->RenderPassesTier = D3D12_RENDER_PASS_TIER_0;
             opts->RaytracingTier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
+            log_once("CheckFeatureSupport OPTIONS5 RaytracingTier", static_cast<int>(opts->RaytracingTier));
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS7: {
@@ -13906,6 +13911,7 @@ public:
             opts->MeshShaderTier =
                 state_.info.mesh_shader ? D3D12_MESH_SHADER_TIER_1 : D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
             opts->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
+            log_once("CheckFeatureSupport OPTIONS7 MeshShaderTier", static_cast<int>(opts->MeshShaderTier));
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS9: {
