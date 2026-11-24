@@ -37,7 +37,7 @@ TOTAL = (len(check.COMPUTE) + 8 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.IMAGE_STORE_CASES)
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
-         + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
+         + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS) + len(check.SAMPLE_DIMS_TESTS)
          + len(check.TEXTURE_CONSTANTS) + 20)  # three mesh fixtures, ps_tex, ps_imgatomic, ps_table_fetch, six compute fixtures,
          # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case), cs_fmt_all,
          # cs_w32_shift64, cs_w32_cmp_f64, cs_w32_round_f64 and cs_w32_frexp_ldexp
@@ -245,6 +245,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "base_ids_test", return_value=""),
                   patch.object(check, "get_lod_test", return_value=""),
                   patch.object(check, "sampler_test", return_value=""),
+                  patch.object(check, "sample_dims_test", return_value=""),
                   patch.object(check, "table_fetch_test", return_value=""),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
