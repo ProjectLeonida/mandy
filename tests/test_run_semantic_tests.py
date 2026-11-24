@@ -39,12 +39,31 @@ def run(*argv):
     return code, out.getvalue()
 
 
-def cli(*argv):
+def cli(*argv, env=None):
     return subprocess.run([sys.executable, "-I", os.path.join(ROOT, "scripts", "run_semantic_tests.py"), *argv],
-                          capture_output=True, text=True, timeout=15)
+                          capture_output=True, text=True, timeout=15, env=env)
 
 
 class RunnerTest(unittest.TestCase):
+    def test_child_workers_ignore_host_pythonpath(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            poison = os.path.join(tmp, "host_injected.py")
+            with open(poison, "w", encoding="utf-8") as f:
+                f.write("VALUE = True\n")
+            suite_dir = os.path.join(tmp, "suite")
+            os.mkdir(suite_dir)
+            suite(suite_dir, {"test_isolated.py":
+                "import unittest\n"
+                "try:\n    import host_injected\n"
+                "except ImportError:\n    pass\n"
+                "else:\n    raise AssertionError('host PYTHONPATH leaked into worker')\n"
+                "class T(unittest.TestCase):\n    def test_ok(self): pass\n"})
+            env = dict(os.environ, PYTHONPATH=tmp)
+            for jobs in (1, 2):
+                with self.subTest(jobs=jobs):
+                    result = cli(suite_dir, "-j", str(jobs), env=env)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_parallel_timeout_reports_partial_output_and_keeps_healthy_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"helper.py": "X = 1\n", "test_hang.py": HANG,

@@ -184,15 +184,18 @@ def mutants_for(lines: list[str], first: int, last: int) -> list[Mutant]:
 def run_test(test_file: str, tools_dir: str, timeout: int) -> tuple[bool, str]:
     """True when the test file passes against tools_dir."""
     here = os.path.dirname(os.path.abspath(test_file))
-    path = os.pathsep.join(filter(None, [here, os.path.join(ROOT, "tests", "semantic"), os.environ.get("PYTHONPATH")]))
-    env = dict(os.environ, LEONIDA_TOOLS_DIR=os.path.abspath(tools_dir), PYTHONDONTWRITEBYTECODE="1",
-               PYTHONPATH=path)
+    semantic_dir = os.path.join(ROOT, "tests", "semantic")
+    path = os.pathsep.join(dict.fromkeys([here, semantic_dir]))
+    env = dict(os.environ, LEONIDA_TOOLS_DIR=os.path.abspath(tools_dir), PYTHONDONTWRITEBYTECODE="1")
     # Through unittest, as tests/semantic/test_mutations.py does: a file with no `__main__` block runs nothing when
-    # started as a script, which would pass the baseline and let every mutant survive.
+    # started as a script, which would pass the baseline and let every mutant survive. The isolated bootstrap adds
+    # only the test directories needed for imports; host PYTHONPATH and user site-packages are excluded.
     module = os.path.splitext(os.path.basename(test_file))[0]
+    bootstrap = ("import os, sys, unittest; sys.path[:0] = sys.argv[1].split(os.pathsep); "
+                 "unittest.main(module=sys.argv[2], argv=['unittest', *sys.argv[3:]])")
     try:
-        p = subprocess.run([sys.executable, "-m", "unittest", module], cwd=here, env=env, capture_output=True,
-                           encoding="utf-8", errors="replace", timeout=timeout)
+        p = subprocess.run([sys.executable, "-I", "-c", bootstrap, path, module], cwd=here, env=env,
+                           capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
         return False, f"timed out after {timeout} s"
     if p.returncode == 5:                         # unittest's exit status when it found no tests (Python 3.12+)

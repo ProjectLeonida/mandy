@@ -12,8 +12,9 @@ the pattern matches their basenames, not directory paths. Package `__init__.py` 
 because discover imports them and runs any TestCase they define regardless of the pattern. No matching files is an
 error in serial and parallel runs.
 
-It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py` by default, and packages below it), each as
-`python -m unittest <module>` from that folder, so a file sees the same import path as under discover. The files can
+It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py` by default, and packages below it), each in
+an isolated Python process. A small bootstrap adds only the suite directory to `sys.path` before loading the module, so
+host `PYTHONPATH` and user site-packages cannot supply test imports. The files can
 run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
 or on a single core, it runs that discover command itself. Prints the output of every failing file and one summary
 line, and exits 1 if a file fails, none is found, or no test ran. Standard library only.
@@ -74,12 +75,15 @@ def positive_seconds(value):
 
 
 def run_module(directory, module, verbose, timeout=None):
-    """(return code, tests run, output) of `python -m unittest <target>` run from `directory`."""
+    """(return code, tests run, output) of an isolated unittest process loading target from directory."""
     # `python -m unittest pkg.__init__` imports pkg and then runs the same file again as pkg.__init__, so a
     # registration in the initializer happens twice. Running the package itself imports it once; module_path() is
     # still the initializer's path, so the jobs stay sorted by the file they run.
     target = module[:-len(".__init__")] if module.endswith(".__init__") else module
-    cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), target]
+    cmd = [sys.executable, "-I", "-c",
+           "import sys, unittest; sys.path.insert(0, sys.argv[1]); "
+           "unittest.main(module=sys.argv[2], argv=['unittest', *sys.argv[3:]])",
+           directory, target, *(["-v"] if verbose else [])]
     try:
         p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                            errors="replace", timeout=timeout)
@@ -114,7 +118,7 @@ def main(argv=None):
         return 1
     if a.jobs <= 1:
         try:
-            return subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", directory,
+            return subprocess.call([sys.executable, "-I", "-m", "unittest", "discover", "-s", directory,
                                     "-p", a.pattern, *(["-v"] if a.verbose else [])], timeout=a.timeout)
         except subprocess.TimeoutExpired:
             # Inherited stdout/stderr have already emitted any partial test output.

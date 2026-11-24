@@ -5,6 +5,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -178,6 +179,25 @@ class EndToEnd(unittest.TestCase):
 
 
 class RunTestEncoding(unittest.TestCase):
+    def test_worker_ignores_host_pythonpath(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            poison_dir = os.path.join(tmp, "poison")
+            test_dir = os.path.join(tmp, "suite")
+            os.mkdir(poison_dir)
+            os.mkdir(test_dir)
+            with open(os.path.join(poison_dir, "host_injected.py"), "w", encoding="utf-8") as f:
+                f.write("VALUE = True\n")
+            test = os.path.join(test_dir, "test_isolated.py")
+            with open(test, "w", encoding="utf-8", newline="\n") as f:
+                f.write("import unittest\n"
+                        "try:\n    import host_injected\n"
+                        "except ImportError:\n    pass\n"
+                        "else:\n    raise AssertionError('host PYTHONPATH leaked into worker')\n"
+                        "class T(unittest.TestCase):\n    def test_ok(self): pass\n")
+            with patch.dict(os.environ, {"PYTHONPATH": poison_dir}):
+                ok, last = sm.run_test(test, os.path.join(ROOT, "tools"), 30)
+        self.assertTrue(ok, last)
+
     def test_utf8_bytes_outside_windows_codepage_do_not_crash(self):
         with tempfile.TemporaryDirectory() as tmp:
             test = os.path.join(tmp, "test_utf8_out.py")
