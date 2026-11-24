@@ -96,6 +96,19 @@ class NoUmaskFlipTests(unittest.TestCase):
             os.chmod(path, 0o604)
             self.assertEqual(file_mode.published_mode(path), 0o604)
 
+    def test_new_file_mode_restores_write_permission_before_probe_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def track_chmod(p, mode, **kwargs):
+                chmod_calls.append((p, mode))
+                return real_chmod(p, mode, **kwargs)
+
+            with mock.patch("file_mode.os.chmod", side_effect=track_chmod):
+                file_mode.new_file_mode(directory)
+            self.assertTrue(any(mode == 0o600 for p, mode in chmod_calls))
+
 
 if __name__ == "__main__":
     unittest.main()
