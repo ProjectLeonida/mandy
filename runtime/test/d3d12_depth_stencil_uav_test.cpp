@@ -10,6 +10,7 @@
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -105,7 +106,7 @@ HRESULT create_committed3(ID3D12Device* device, ID3D12Device* xbox, const D3D12_
 }
 
 int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind, UINT16 layers,
-        DXGI_FORMAT format, Handoff handoff) {
+        DXGI_FORMAT format, Handoff handoff, bool normalized_views = false) {
     const bool array = layers > 1;
     // Array views cover the last two layers so the shader reaches slice 5 in the six-layer case.
     const UINT first_slice = array ? layers - 2u : 0;
@@ -119,6 +120,10 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
     if (depth16) {
         fixture = array ? LEONIDA_DEPTH16_ARRAY_SPV : LEONIDA_DEPTH16_2D_SPV;
         bindings = array ? "2,12" : "2,9";
+    }
+    if (normalized_views) {
+        fixture = array ? LEONIDA_DEPTH16_SHARED_ARRAY_SPV : LEONIDA_DEPTH16_SHARED_2D_SPV;
+        bindings = array ? "2,11,12" : "2,8,9";
     }
     const auto program = d3d12test::fssm_program({0x44535541, 0xbf810000});
     const auto shader = d3d12test::shader_container(program);
@@ -286,18 +291,31 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
     const SIZE_T step = device->GetDescriptorHandleIncrementSize(views_desc.Type);
     CHECK(base && step >= 32);
     std::uint32_t keys[2][8]{};
-    for (UINT plane = 0; plane < planes; ++plane) {
+    const UINT uav_views = normalized_views ? 2 : planes;
+    for (UINT i = 0; i < uav_views; ++i) {
+        const UINT plane = depth16 ? 0 : i;
         D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
         view.ViewDimension = array ? D3D12_UAV_DIMENSION_TEXTURE2DARRAY : D3D12_UAV_DIMENSION_TEXTURE2D;
         view.Format = depth16 ? DXGI_FORMAT_R16_UINT : plane == 0 ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R8_UINT;
+        if (normalized_views && i == 1) view.Format = DXGI_FORMAT_R16_UNORM;
         if (array) view.Texture2DArray = {0, first_slice, 2, plane};
         else view.Texture2D.PlaneSlice = plane;
-        const D3D12_CPU_DESCRIPTOR_HANDLE handle{base + plane * step};
+        const D3D12_CPU_DESCRIPTOR_HANDLE handle{base + i * step};
         device->CreateUnorderedAccessView(texture.p, nullptr, &view, handle);
-        std::memcpy(keys[plane], reinterpret_cast<const void*>(handle.ptr), sizeof(keys[plane]));
-        CHECK(rt::d3d12::bindless_hash_lookup(device, keys[plane]) != 0);
+        std::memcpy(keys[i], reinterpret_cast<const void*>(handle.ptr), sizeof(keys[i]));
+        CHECK(rt::d3d12::bindless_hash_lookup(device, keys[i]) != 0);
     }
-    if (planes == 2) CHECK(std::memcmp(keys[0], keys[1], sizeof(keys[0])) != 0);
+    if (uav_views == 2) CHECK(std::memcmp(keys[0], keys[1], sizeof(keys[0])) != 0);
+    if (normalized_views) {
+        using namespace leonida::gfx10;
+        ImageWords raw_words{}, normalized_words{};
+        std::copy_n(keys[0], raw_words.size(), raw_words.begin());
+        std::copy_n(keys[1], normalized_words.size(), normalized_words.begin());
+        Image raw{}, unorm{};
+        CHECK(decode(raw_words, raw) && decode(normalized_words, unorm));
+        CHECK(raw.address == unorm.address && raw.format == format_from_vulkan(VK_FORMAT_R16_UINT) &&
+              unorm.format == format_from_vulkan(VK_FORMAT_R16_UNORM));
+    }
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = depth16 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -328,7 +346,7 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
                                                   D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     Ref<ID3D12DescriptorHeap> visible;
     CHECK(SUCCEEDED(device->CreateDescriptorHeap(&visible_desc, IID_PPV_ARGS(&visible.p))));
-    device->CopyDescriptorsSimple(planes, visible->GetCPUDescriptorHandleForHeapStart(), {base}, visible_desc.Type);
+    device->CopyDescriptorsSimple(uav_views, visible->GetCPUDescriptorHandleForHeapStart(), {base}, visible_desc.Type);
     const auto gpu = visible->GetGPUDescriptorHandleForHeapStart();
     const FLOAT depth_clear[] = {0.75f, 0, 0, 0};
     const UINT stencil_clear[] = {0x31, 0, 0, 0};
@@ -386,7 +404,7 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
 
     const float depth_seed[] = {0.5f, 0.25f, 1.0f};
     const UINT8 stencil_seed[] = {0x5a, 0x37, 0xcb};
-    const UINT16 d16_seed[] = {0, 0xffff, 257, 514, 771, 1028};
+    const UINT16 d16_seed[] = {UINT16(normalized_views ? 0x4321 : 0), 0xffff, 257, 514, 771, 1028};
     const auto flags = depth16 ? D3D12_CLEAR_FLAG_DEPTH : D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
     if (modern) {
         Ref<ID3D12GraphicsCommandList7> list;
@@ -431,11 +449,16 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
     auto* list = shader_batch.list.p;
     list->SetDescriptorHeaps(1, clear_heaps);
     const UINT d16_clear[] = {0x4512, 0, 0, 0};
+    constexpr UINT d16_normalized_bits = 0x2468;
+    const FLOAT d16_normalized_clear[] = {float(d16_normalized_bits) / 65535.0f, 0, 0, 0};
     if (depth16) list->ClearUnorderedAccessViewUint(gpu, {base}, texture.p, d16_clear, 1, &depth_rect);
     else {
         list->ClearUnorderedAccessViewFloat(gpu, {base}, texture.p, depth_clear, 1, &depth_rect);
         list->ClearUnorderedAccessViewUint({gpu.ptr + step}, {base + step}, texture.p, stencil_clear, 1, &stencil_rect);
     }
+    if (normalized_views)
+        list->ClearUnorderedAccessViewFloat({gpu.ptr + step}, {base + step}, texture.p,
+                                            d16_normalized_clear, 1, &stencil_rect);
     D3D12_RESOURCE_BARRIER order{};
     order.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     order.UAV.pResource = texture.p;
@@ -495,6 +518,10 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
                 if (depth16) {
                     expected = cleared ? d16_clear[0] : d16_seed[layer];
                     if (layer == layers - 1u && x == 2 && y == 1) expected ^= 0x1357u;
+                    if (normalized_views) {
+                        if (in_view && x == 3 && y == 2) expected = d16_normalized_bits;
+                        if (layer == layers - 1u && x == 4 && y == 2) expected ^= 0x2753u;
+                    }
                 } else if (plane == 0) {
                     float depth = cleared ? depth_clear[0] : depth_seed[layer];
                     if (layer == first_slice && x == 2 && y == 1) depth *= 0.25f;
@@ -517,9 +544,9 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
     const char* path = placed ? "slot 133" : "slot 76";
     if (modern) path = rt::d3d12_xs::device_slot_overridden(127) ? "slot 127" : "CreateCommittedResource3";
     std::printf("%s, %ux%u, %u layers, %u planes, %s barriers, graphics family %u, shader family %u, "
-                "plane transfers on %s: every pixel matched\n", path, width, height, UINT(layers), planes,
+                "plane transfers on %s%s: every pixel matched\n", path, width, height, UINT(layers), planes,
                 enhanced ? "enhanced" : "legacy", vk.family, handoff == Handoff::direct ? vk.family : vk.compute_family,
-                compute_copy ? "compute" : "graphics");
+                compute_copy ? "compute" : "graphics", normalized_views ? ", raw and normalized R16 UAVs" : "");
     return 0;
 }
 } // namespace
@@ -555,5 +582,17 @@ int main() {
     for (const UINT16 layers : reported_layers)
         if (run(vk, 9, 7, true, Texture::committed3, layers, d16, Handoff::graphics_transitions)) return 1;
     if (run(vk, 9, 7, true, Texture::committed3, 3, d32s8, Handoff::graphics_transitions)) return 1;
+    VkFormatProperties normalized{}, raw{};
+    const auto properties = vk.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
+    properties(vk.physical, VK_FORMAT_R16_UNORM, &normalized);
+    properties(vk.physical, VK_FORMAT_R16_UINT, &raw);
+    const VkFormatFeatureFlags view_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | (raw.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
+    if ((normalized.optimalTilingFeatures & view_features) == view_features) {
+        if (run(vk, 9, 7, false, Texture::committed, 1, d16, Handoff::direct, true) ||
+            run(vk, 13, 9, true, Texture::placed, 3, d16, Handoff::graphics_transitions, true)) return 1;
+    } else {
+        std::printf("R16_UNORM storage views unavailable; integer depth UAVs tested\n");
+    }
     return vk.validation_errors() ? 1 : 0;
 }

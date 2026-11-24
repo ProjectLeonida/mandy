@@ -2313,13 +2313,24 @@ public:
             decltype(storage_planes_) planes;
             D3D12_RESOURCE_DESC plane_desc = desc_;
             plane_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-            // D16 copies through a buffer as raw UNORM bits. R16_UINT lets an Xbox UAV read/write those bits.
+            // D16 copies through a buffer as raw bits. Both R16 views address the same bits when supported.
             const DXGI_FORMAT formats[] = {depth16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8_UINT};
             const UINT plane_count = depth16 ? 1 : 2;
             for (UINT plane = 0; plane < plane_count; ++plane) {
                 plane_desc.Format = formats[plane];
                 planes[plane] = std::make_unique<Resource>(device_, plane_desc, heap_, storage_heap_flags);
-                const HRESULT hr = planes[plane]->create_texture(device_.texture_format(plane_desc));
+                const auto format = device_.texture_format(plane_desc);
+                if (depth16 && device_.storage_usable(VK_FORMAT_R16_UNORM) &&
+                    device_.sampled_usable(VK_FORMAT_R16_UNORM) &&
+                    (!device_.color_attachment_usable(format.format) ||
+                     device_.color_attachment_usable(VK_FORMAT_R16_UNORM))) {
+                    const HRESULT hr = planes[plane]->create_texture(format, {VK_FORMAT_R16_UNORM});
+                    if (SUCCEEDED(hr)) continue;
+                    if (hr != E_INVALIDARG) return hr;
+                    // The device can still use the original integer-only shadow if it refused the format list.
+                    planes[plane] = std::make_unique<Resource>(device_, plane_desc, heap_, storage_heap_flags);
+                }
+                const HRESULT hr = planes[plane]->create_texture(format);
                 if (FAILED(hr)) return hr;
             }
             // Replacing the binding preserves the tracked layout of the original depth/stencil image.
@@ -6802,7 +6813,10 @@ public:
                 return;
             }
             const Resource* storage = r->depth_stencil_uav(view.plane);
-            if (!storage || view.format != storage->desc().Format) {
+            const bool normalized_d16 = storage && storage->desc().Format == DXGI_FORMAT_R16_UINT &&
+                view.format == DXGI_FORMAT_R16_UNORM && storage->has_view_format_list() &&
+                storage->allows_view_format(VK_FORMAT_R16_UNORM);
+            if (!storage || (view.format != storage->desc().Format && !normalized_d16)) {
                 log_once("unsupported Xbox depth-stencil UAV plane or format; format", int(view.format));
                 return;
             }

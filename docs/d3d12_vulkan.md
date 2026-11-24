@@ -2496,8 +2496,10 @@ The trace will enumerate them.
   Xbox allocation queries return the attachment's placement size for XMem accounting; the writable
   planes are private backend allocations. The supported shapes are single-sample, single-mip 2D
   textures and 2D arrays. For `R32G8X24_TYPELESS`, use `R32_FLOAT` on depth plane 0 and `R8_UINT` on stencil
-  plane 1. For `R16_TYPELESS`, use `R16_UINT` on plane 0 to access the raw D16 bits. An array UAV selects a
-  contiguous range of layers. The depth/stencil and shader-resource views continue to use the attachment image.
+  plane 1. For `R16_TYPELESS`, plane 0 exposes raw bits through `R16_UINT` and normalized values through
+  `R16_UNORM` when the device supports both storage views of the same image. Both views share the same depth
+  bits. An array UAV selects a contiguous range of layers. The depth/stencil and shader-resource views continue
+  to use the attachment image.
   Slot 133 keeps the guest address. Identical, live placements share their image and writable planes across
   distinct COM objects. A partial overlap or incompatible reinterpretation is refused.
 - Legacy and enhanced texture transitions copy the selected planes and layers to or from their storage images.
