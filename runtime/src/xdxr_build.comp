@@ -206,13 +206,15 @@ bool ptr_is_node(uint p) { return (p & 7u) == BOX16 || (p & 7u) == BOX32; }
 // docs/bvh.md 3.1, XdxrDecompressBox16) ----
 // A float rounded to a half toward -inf (up = false) or +inf (up = true), so the quantised box still contains the
 // exact one. Integer code: packHalf2x16's rounding is implementation-defined (AMD's rounds toward zero), and this has
-// to be directed. Beyond the half range a value becomes +-inf on its outward side and +-HALF_MAX (0x7bff) on its
+// to be directed. The sign is taken as (u & 0x80000000) >> 16, not (u >> 16) & 0x8000: the AMD Windows shader
+// compiler (driver 24.10.24, Vulkan 1.3.280, gfx1035) miscompiles the shift-then-mask form and every BOX16 box
+// comes out with flipped half signs (xdxr_build_check fails on all box16 cases; NVIDIA is unaffected). Beyond the half range a value becomes +-inf on its outward side and +-HALF_MAX (0x7bff) on its
 // inward side, so an empty box (min +inf, max -inf) stays empty. No denormal half is produced: a value below the
 // smallest normal (2^-14) in magnitude goes to 0 or to +-2^-14, whichever is on its side, because a decoder that
 // flushes half denormals to zero would otherwise shrink the box. tools/xdxr_bvh.py half_round is the same function.
 uint half_directed(float x, bool up) {
     uint u = floatBitsToUint(x);
-    uint sign = (u >> 16) & 0x8000u;
+    uint sign = (u & 0x80000000u) >> 16;
     uint a = u & 0x7fffffffu;
     bool away = up != (sign != 0u);          // round the magnitude up (away from zero) or down (toward zero)
     if (a > 0x7f800000u) return sign | 0x7e00u;                     // NaN: not produced by the box code
