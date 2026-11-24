@@ -1715,11 +1715,16 @@ HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t
 
 // A console descriptor heap carries a size as well as an address, and that size is 32 bytes per descriptor. A PC
 // desc's trailing words are whatever the caller holds next; they do not encode NumDescriptors * 32, so this
-// separates the two layouts without guessing anything about the address itself.
+// separates the two layouts without guessing anything about the address itself except its alignment: a heap range
+// the title supplies is a 64 KiB-aligned console VA, while the words after a PC desc can be any value. Without the
+// alignment check, a caller whose neighbouring local happened to encode the size was read as a console heap, and
+// its garbage address was handed out as the CPU handle: d3d12_subgroup crashed writing the view there.
 static bool console_heap_range_plausible(const D3D12_DESCRIPTOR_HEAP_DESC* desc, std::uint64_t address,
                                          std::uint64_t size) {
     constexpr std::uint64_t kConsoleDescriptorSize = 32;
+    constexpr std::uint64_t kConsoleHeapAlignment = 0x10000;
     if (address == 0 || size == 0) return false;
+    if (address % kConsoleHeapAlignment) return false;
     if (desc->NumDescriptors == 0 || desc->NumDescriptors > (0xFFFFFFFFull / kConsoleDescriptorSize)) return false;
     if (size != static_cast<std::uint64_t>(desc->NumDescriptors) * kConsoleDescriptorSize) return false;
     return true;

@@ -127,6 +127,32 @@ bool check_normal_heap_unchanged(ID3D12Device* device) {
     return true;
 }
 
+// A PC desc whose following words look like the console layout except for the alignment: the size matches
+// NumDescriptors * 32, so before the alignment check the heap was read as console-addressed and its CPU handle became
+// the garbage word. In d3d12_subgroup that word was the bytes of a shader name and the first view write crashed.
+bool check_unaligned_tail_is_not_a_console_heap(ID3D12Device* device) {
+    struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc{};
+        std::uint64_t address = 0x65626f72705f7370ull;  // "ps_probe", not 64 KiB aligned
+        std::uint64_t size = 1ull * 32ull;
+    } shape;
+    shape.desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    shape.desc.NumDescriptors = 1;
+    Ref<ID3D12DescriptorHeap> heap;
+    const HRESULT hr = device->CreateDescriptorHeap(&shape.desc, IID_PPV_ARGS(heap.put()));
+    if (FAILED(hr) || !heap.get()) {
+        std::fprintf(stderr, "CreateDescriptorHeap(unaligned tail) failed: 0x%08lx\n", static_cast<unsigned long>(hr));
+        return false;
+    }
+    const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+    if (cpu.ptr == static_cast<SIZE_T>(shape.address)) {
+        std::fprintf(stderr, "unaligned tail was taken as a console heap address: 0x%llx\n",
+                     static_cast<unsigned long long>(cpu.ptr));
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -149,6 +175,7 @@ int main() {
     }
 
     if (!check_normal_heap_unchanged(device.get())) return 1;
+    if (!check_unaligned_tail_is_not_a_console_heap(device.get())) return 1;
     if (!check_console_addressed_heap(device.get())) return 1;
     if (!check_xs_proxy_slot14(device.get())) return 1;
     std::fprintf(stderr, "ok\n");
