@@ -56,10 +56,13 @@ int main() {
     }
 
     auto stats = rt::d3d12::device_vram_stats(dev);
-    std::printf("Device VRAM: %llu MiB | low_vram_mode=%d (auto=%d) | budget=%d priority=%d pageable=%d | reserve=%llu MiB\n",
+    std::printf("Initial device VRAM: %llu MiB | low_vram_mode=%d (auto=%d) | budget=%d priority=%d pageable=%d | "
+                "reserve=%llu MiB | cap=%llu MiB\n",
                 static_cast<unsigned long long>(stats.device_local_bytes >> 20), int(stats.low_vram_mode),
                 int(stats.auto_detected), int(stats.memory_budget_ext), int(stats.memory_priority_ext),
-                int(stats.pageable_memory_ext), static_cast<unsigned long long>(stats.reserve_bytes >> 20));
+                int(stats.pageable_memory_ext), static_cast<unsigned long long>(stats.reserve_bytes >> 20),
+                static_cast<unsigned long long>(stats.vram_cap_bytes >> 20));
+    std::fflush(stdout);
 
     if (!stats.memory_budget_ext) {
         std::printf("SKIP (GPU/driver lacks VK_EXT_memory_budget)\n");
@@ -73,24 +76,37 @@ int main() {
         CHECK(stats.reserve_bytes >= (64ull << 20));
     }
 
-    // If running on a huge (> 4.5 GiB) GPU where auto-mode stayed off, re-create with LEONIDA_LOW_VRAM=1 and a large
-    // reserve so we can still verify budget steering quickly without allocating 16 GiB.
+    // If running on a larger (> 4.5 GiB) GPU where auto-mode stayed off, re-create with LEONIDA_LOW_VRAM=1 and an
+    // explicit 2048 MiB soft VRAM cap (plus 512 MiB critical reserve) so budget steering is reliably exercised
+    // regardless of whether the card has 8, 16, 24, or 32 GiB of VRAM.
     if (!stats.low_vram_mode) {
         dev->Release();
         dev = nullptr;
         _putenv_s("LEONIDA_LOW_VRAM", "1");
-        _putenv_s("LEONIDA_VRAM_RESERVE_MB", "2048");
+        _putenv_s("LEONIDA_VRAM_RESERVE_MB", "512");
+        _putenv_s("LEONIDA_VRAM_CAP_MB", "2048");
         hr = rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&dev));
         CHECK(SUCCEEDED(hr) && dev);
         stats = rt::d3d12::device_vram_stats(dev);
         CHECK(stats.low_vram_mode);
+        CHECK(stats.vram_cap_bytes == (2048ull << 20));
+        std::printf("Stress device VRAM: %llu MiB | low_vram_mode=%d (auto=%d) | budget=%d priority=%d pageable=%d | "
+                    "reserve=%llu MiB | cap=%llu MiB\n",
+                    static_cast<unsigned long long>(stats.device_local_bytes >> 20), int(stats.low_vram_mode),
+                    int(stats.auto_detected), int(stats.memory_budget_ext), int(stats.memory_priority_ext),
+                    int(stats.pageable_memory_ext), static_cast<unsigned long long>(stats.reserve_bytes >> 20),
+                    static_cast<unsigned long long>(stats.vram_cap_bytes >> 20));
+        std::fflush(stdout);
     }
 
-    // Allocate 2048x2048 RGBA8 textures (16 MiB each) up to VRAM + 512 MiB (capped at 5120 MiB) while interleaving
-    // critical 1920x1080 Render Targets & Depth Buffers to prove critical resources stay in DEVICE_LOCAL VRAM even
-    // after spillable textures begin steering to system memory.
-    const std::uint64_t target_mib =
-        std::min<std::uint64_t>((stats.device_local_bytes >> 20) + 512, 5120);
+    // Allocate 2048x2048 RGBA8 textures (16 MiB each) up to effective_budget + 512 MiB (capped at 5120 MiB) while
+    // interleaving critical 1920x1080 Render Targets & Depth Buffers to prove critical resources stay in DEVICE_LOCAL
+    // VRAM even after spillable textures begin steering to system memory.
+    const std::uint64_t effective_budget_mib =
+        (stats.vram_cap_bytes > 0 && stats.vram_cap_bytes < stats.device_local_bytes)
+            ? (stats.vram_cap_bytes >> 20)
+            : (stats.device_local_bytes >> 20);
+    const std::uint64_t target_mib = std::min<std::uint64_t>(effective_budget_mib + 512, 5120);
     const std::size_t tex_count = static_cast<std::size_t>(target_mib / 16);
 
     std::vector<ID3D12Resource*> spillable_textures;

@@ -6880,6 +6880,28 @@ struct DeviceState {
         return mutex;
     }
 
+    bool query_budget(VkDeviceSize alloc_size, VkPhysicalDeviceMemoryBudgetPropertiesEXT& out) const {
+        if (!vram_policy.enabled || !info.memory_budget || !memory_properties2 || !info.physical) return false;
+        constexpr VkDeviceSize kLargeAllocRefresh = VkDeviceSize(1) << 20;
+        constexpr VkDeviceSize kPendingRefreshDelta = VkDeviceSize(16) << 20;
+        std::lock_guard lock(budget_mutex);
+        if (!budget_valid || alloc_size >= kLargeAllocRefresh || pending_local_bytes >= kPendingRefreshDelta) {
+            VkPhysicalDeviceMemoryProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+                                                     &cached_budget};
+            memory_properties2(info.physical, &props2);
+            budget_valid = true;
+            pending_local_bytes = 0;
+        }
+        out = cached_budget;
+        if (pending_local_bytes > 0) {
+            for (std::uint32_t h = 0; h < memory.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; ++h) {
+                if (memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                    out.heapUsage[h] += pending_local_bytes;
+            }
+        }
+        return true;
+    }
+
     VkDeviceMemory allocate(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags required,
                             VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags* chosen = nullptr,
                             bool device_address = false, std::uint32_t* chosen_type = nullptr,
@@ -6891,29 +6913,9 @@ struct DeviceState {
         priority_info.priority = leonida::memory_allocation_priority(priority);
         VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
-        const VkPhysicalDeviceMemoryBudgetPropertiesEXT* budget_ptr = nullptr;
-        if (vram_policy.enabled && priority == leonida::MemoryPriority::spillable && info.memory_budget &&
-            memory_properties2 && info.physical) {
-            constexpr VkDeviceSize kLargeAllocRefresh = VkDeviceSize(1) << 20;
-            constexpr VkDeviceSize kPendingRefreshDelta = VkDeviceSize(16) << 20;
-            std::lock_guard lock(budget_mutex);
-            if (!budget_valid || requirements.size >= kLargeAllocRefresh ||
-                pending_local_bytes >= kPendingRefreshDelta) {
-                VkPhysicalDeviceMemoryProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
-                                                         &cached_budget};
-                memory_properties2(info.physical, &props2);
-                budget_valid = true;
-                pending_local_bytes = 0;
-            }
-            budget = cached_budget;
-            if (pending_local_bytes > 0) {
-                for (std::uint32_t h = 0; h < memory.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; ++h) {
-                    if (memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-                        budget.heapUsage[h] += pending_local_bytes;
-                }
-            }
-            budget_ptr = &budget;
-        }
+        const VkPhysicalDeviceMemoryBudgetPropertiesEXT* budget_ptr =
+            (priority == leonida::MemoryPriority::spillable && query_budget(requirements.size, budget)) ? &budget
+                                                                                                        : nullptr;
         bool steered = false;
         const auto order = leonida::memory_type_order_budgeted(
             memory, requirements.memoryTypeBits, required, preferred, requirements.size, priority, budget_ptr,
@@ -7038,8 +7040,9 @@ struct DeviceState {
     // and the caller makes its own allocation as it would without the blocks.
     std::unique_ptr<leonida::ImageMemory::Range> allocate_image(const VkMemoryRequirements& requirements,
                                                                 VkMemoryPropertyFlags& chosen) {
-        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
-        const bool have_budget = vram_policy.enabled && query_memory_budget(budget);
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        const bool have_budget = query_budget(requirements.size, budget);
         for (const std::uint32_t i : leonida::memory_type_order(memory, requirements.memoryTypeBits,
                                                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
                                                                 requirements.size)) {
