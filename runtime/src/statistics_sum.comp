@@ -1,26 +1,30 @@
 #version 450
 
-// Adds the D3D12_QUERY_DATA_PIPELINE_STATISTICS segments of one split pipeline-statistics query (D3D-162): one
-// invocation per counter, in the order of VkQueryPipelineStatisticFlagBits, which is the D3D12 field order.
-// `mesh` segments come from the pool a mesh draw can run in (D3D-291), which counts only the fragment and compute
-// invocations: they are copied to counters 7 and 8 of their record, so PSInvocations takes the fragment one and
-// CSInvocations the compute one, and every other counter adds nothing.
-// The clipping invocations of a mesh segment come from the mesh-primitives count of that segment, copied to
-// counter 5 (D3D-MESH-CLIPPING-COUNTER); without that count the field stays 0.
-layout(local_size_x = 11) in;
+// Sum the physical query segments into a PIPELINE_STATISTICS1 record, one invocation per D3D12 field.
+// A traditional segment supplies fields 0 through 10 in Vulkan flag order. A mesh segment supplies fragment,
+// compute and optionally mesh invocations in slots 7 through 9, plus generated mesh primitives in slot 5.
+// Use those primitives for both CInvocations and MSPrimitives. Missing counters have been cleared by replay.
+layout(local_size_x = 14) in;
 layout(set = 0, binding = 0, std430) buffer QueryResults {
-    uvec2 total[11];
-    uvec2 segments[];  // `count` results of 11 counters each
+    uvec2 total[14];
+    uvec2 segments[];  // `count` records of 14 counters each
 };
 layout(push_constant) uniform ResolveRange { uint count; uint mesh; };
 
 void main() {
     const uint counter = gl_LocalInvocationID.x;
     uvec2 sum = total[counter];
-    const bool counted = mesh == 0u || counter == 5u || counter == 7u || counter == 10u;
-    const uint source = mesh != 0u && counter == 10u ? 8u : counter;
+    const bool inMesh = mesh != 0u;
+    const bool counted = inMesh ? counter == 5u || counter == 7u || counter == 10u ||
+                                 counter == 12u || counter == 13u : counter < 11u;
+    uint source = counter;
+    if (inMesh) {
+        if (counter == 10u) source = 8u;  // CSInvocations
+        if (counter == 12u) source = 9u;  // MSInvocations
+        if (counter == 13u) source = 5u;  // MSPrimitives
+    }
     for (uint i = 0; counted && i < count; ++i) {
-        uvec2 segment = segments[i * 11 + source];
+        uvec2 segment = segments[i * 14 + source];
         uint low = sum.x + segment.x;
         sum.y += segment.y + uint(low < sum.x);
         sum.x = low;

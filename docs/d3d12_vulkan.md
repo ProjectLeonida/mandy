@@ -3619,11 +3619,20 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   `PIPELINE_STATISTICS` heaps count all eleven Vulkan statistics (`0x7ff`), whose result order is the field order
   of `D3D12_QUERY_DATA_PIPELINE_STATISTICS` (IA vertices, IA primitives, VS, GS invocations, GS primitives,
   clipper invocations and primitives, PS, HS, DS, CS), so one 88-byte result per query is copied as is. They need
-  `pipelineStatisticsQuery`. `VIDEO_DECODE_STATISTICS` and `PIPELINE_STATISTICS1` (mesh and amplification counts)
-  are logged and refused with `E_NOTIMPL`. Invalid descriptions are answered as the host runtime answers them
+  `pipelineStatisticsQuery`. `VIDEO_DECODE_STATISTICS` is refused with `E_NOTIMPL`.
+  Invalid descriptions are answered as the host runtime answers them
   (`compare_invalid_arguments`, "query heap:", RTX 5070 / 621.14): `E_INVALIDARG` for no queries, a node other than
   node 0, or a type past `PIPELINE_STATISTICS1` (7), checked before the output; a valid description with a null
   output is then `E_UNEXPECTED`, not `S_FALSE`.
+- **Extended pipeline statistics** (D3D-132). `PIPELINE_STATISTICS1` resolves 112 bytes per slot: the eleven
+  legacy counters and `ASInvocations`, `MSInvocations`, and `MSPrimitives`. The main queue needs
+  `pipelineStatisticsQuery` and compute support for the resolve. With `meshShaderQueries`, the mesh segment pool
+  reads `VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT` and uses the existing
+  `VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT` result for `MSPrimitives`. `OPTIONS9.MeshShaderPipelineStatsSupported`
+  reports that availability. The three added fields are zero without `meshShaderQueries`; `ASInvocations` is
+  always zero because the runtime has no amplification shaders. See the
+  [D3D12 mesh shader specification](https://microsoft.github.io/DirectX-Specs/d3d/MeshShader.html#pipeline-statistics)
+  and [VK_EXT_mesh_shader](https://github.khronos.org/Vulkan-Site/features/latest/features/proposals/VK_EXT_mesh_shader.html#_queries).
 - **Stream-output statistics** (D3D-302). The layer has no stream output: a graphics PSO with `StreamOutput`
   entries is refused and `SOSetTargets` is not implemented, so no primitive reaches a stream and every
   `SO_STATISTICS_STREAM0..3` query counts 0 written and 0 needed. An `SO_STATISTICS` heap is therefore made without
@@ -3752,11 +3761,7 @@ Not implemented yet:
 - **Overlapping queries in the single-list `replay()` helper.** It has no segment pool, so a list whose occlusion
   kinds or statistics queries overlap each other is refused there with `ReplayResult::unsupported`; the batched
   path above replays them.
-- Mesh-shader statistics (`PIPELINE_STATISTICS1`, D3D-132), and stream-output statistics that count real
-  primitives (they wait for stream output itself). (`GetClockCalibration` is implemented: see section 4.4,
-  "Fences, queues and frames in flight".)
-- Stream-output and mesh-shader statistics. (`GetClockCalibration` is implemented: see section 4.4, "Fences,
-  queues and frames in flight".)
+- Stream-output statistics that count real primitives wait for stream output itself.
 - Xbox-specific query heap types (if any) are **Open**; unknown types are logged.
 
 ### 4.7 Indirect commands and command signatures

@@ -256,20 +256,17 @@ public:
                 create_pipeline(statistics_sum_spirv, statistics_pipeline_));
     }
 
-    // Adds `count` pipeline-statistics results into one D3D12_QUERY_DATA_PIPELINE_STATISTICS at dst + offset: the
-    // segments of a statistics query that was split around helper dispatches (D3D-162) or mesh draws (D3D-291).
-    // Segment i is in `mesh_queries` when mesh[i] is set (two counters: fragment and compute; see
-    // statistics_sum.comp), otherwise in `queries` (all eleven). A mesh segment's clipping invocations come from
-    // `primitives_queries`, the mesh-primitives count of that segment (D3D-MESH-CLIPPING-COUNTER); it is null when
-    // the device has no meshShaderQueries, and the field then reads 0.
+    // Sum physical segments into an 11- or 14-counter D3D12 record. The mesh pool holds fragment and compute
+    // invocations, plus mesh invocations when meshShaderQueries is enabled. The separate primitives pool then
+    // supplies both mesh primitives and the mesh contribution to clipping invocations.
     void sum_statistics(VkCommandBuffer cb, VkQueryPool queries, VkQueryPool mesh_queries,
                         VkQueryPool primitives_queries, const std::uint8_t* mesh, std::uint32_t first,
-                        std::uint32_t count, VkBuffer dst, VkDeviceSize offset) const {
-        constexpr VkDeviceSize result = statistics_counters * word_size;
+                        std::uint32_t count, VkBuffer dst, VkDeviceSize offset, std::uint32_t result_size) const {
+        constexpr VkDeviceSize record = statistics_counters * word_size;
         constexpr VkDeviceSize mesh_slot = 7 * word_size;  // PSInvocations, where the mesh pool's first counter goes
         constexpr VkDeviceSize clipping_slot = 5 * word_size;  // CInvocations, where the mesh-primitives count goes
         begin_scratch_write(cb);
-        vk_.vkCmdFillBuffer(cb, scratch_, 0, result, 0);
+        vk_.vkCmdFillBuffer(cb, scratch_, 0, record, 0);
         bind(cb, statistics_pipeline_);
         while (count) {
             const bool in_mesh = mesh && mesh[first];
@@ -277,17 +274,16 @@ public:
             while (chunk < std::min(count, statistics_capacity) && bool(mesh && mesh[first + chunk]) == in_mesh)
                 ++chunk;
             if (in_mesh) {
-                // The mesh pool holds only the fragment and compute counters, so the clipping field of a mesh
-                // segment reads 0 unless the mesh-primitives count fills it (D3D-MESH-CLIPPING-COUNTER).
-                vk_.vkCmdFillBuffer(cb, scratch_, result, chunk * result, 0);
+                // Clear slots that the mesh pools may leave unwritten.
+                vk_.vkCmdFillBuffer(cb, scratch_, record, chunk * record, 0);
                 barrier(cb, transfer, transfer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
             }
             vk_.vkCmdCopyQueryPoolResults(cb, in_mesh ? mesh_queries : queries, first, chunk, scratch_,
-                                          result + (in_mesh ? mesh_slot : 0), result,
+                                          record + (in_mesh ? mesh_slot : 0), record,
                                           VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
             if (in_mesh && primitives_queries)
-                vk_.vkCmdCopyQueryPoolResults(cb, primitives_queries, first, chunk, scratch_, result + clipping_slot,
-                                              result, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                vk_.vkCmdCopyQueryPoolResults(cb, primitives_queries, first, chunk, scratch_, record + clipping_slot,
+                                              record, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
             barrier(cb, transfer | compute, compute, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                     shader_access);
             dispatch(cb, chunk, 1, in_mesh);
@@ -295,7 +291,7 @@ public:
             count -= chunk;
             if (count) barrier(cb, compute, transfer, shader_access, VK_ACCESS_TRANSFER_WRITE_BIT);
         }
-        copy_result(cb, dst, offset, result);
+        copy_result(cb, dst, offset, result_size);
     }
 
     void sum(VkCommandBuffer cb, VkQueryPool queries, std::uint32_t first, std::uint32_t count,
@@ -420,8 +416,8 @@ private:
     static constexpr std::uint32_t sum_capacity = 256;  // one more word holds the running sum
     static constexpr std::uint32_t binary_capacity = 1024;
     static constexpr std::uint32_t binary_group_size = 64;  // local_size_x in binary_occlusion.comp
-    static constexpr std::uint32_t statistics_counters = 11;  // local_size_x in statistics_sum.comp
-    static constexpr std::uint32_t statistics_capacity = 64;  // segments per pass; 11 more words hold the sums
+    static constexpr std::uint32_t statistics_counters = 14;  // local_size_x in statistics_sum.comp
+    static constexpr std::uint32_t statistics_capacity = 64;  // segments per pass, plus one record holding the sums
     static constexpr VkDeviceSize word_size = sizeof(std::uint64_t);
     static constexpr VkDeviceSize scratch_size =
         std::max({sum_capacity + 1, binary_capacity, (statistics_capacity + 1) * statistics_counters}) * word_size;
@@ -1428,6 +1424,8 @@ public:
         graphics_pipelines_[id] = pipeline;
         if (shaders && device_fault_) device_fault_->pipeline_names[id] = *shaders;
     }
+    bool can_resolve_segmented_queries() const { return occlusion_resolve_memory_.memoryTypeCount != 0; }
+
     // Configure before queue creation, when the selected queue family supports compute.
     void set_occlusion_resolve_memory(const VkPhysicalDeviceMemoryProperties& memory) {
         occlusion_resolve_memory_ = memory;
@@ -2778,7 +2776,7 @@ private:
             };
         }
         const auto& occlusion_memory = context_.occlusion_resolve_memory_;
-        const bool can_resolve_occlusion = occlusion_memory.memoryTypeCount != 0;
+        const bool can_resolve_occlusion = context_.can_resolve_segmented_queries();
         if (can_resolve_occlusion) {
             replay.sum_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
                                           std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
@@ -2791,9 +2789,9 @@ private:
             replay.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, VkQueryPool mesh_pool,
                                            VkQueryPool primitives_pool, const std::uint8_t* mesh,
                                            std::uint32_t first, std::uint32_t count, VkBuffer dst,
-                                           VkDeviceSize offset) {
+                                           VkDeviceSize offset, std::uint32_t result_size) {
                 occlusion_resolve_->sum_statistics(cb, pool, mesh_pool, primitives_pool, mesh, first, count, dst,
-                                                  offset);
+                                                  offset, result_size);
             };
             replay.sum_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
                                                  std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
@@ -2840,12 +2838,13 @@ private:
             if (std::find(statistics->mesh.begin(), statistics->mesh.end(), 1) == statistics->mesh.end()) {
                 statistics->mesh.clear();
             } else {
-                // The counters a mesh draw allows (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076): the
-                // fragment and compute invocations, and no other (D3D-291).
+                // Keep only counters compatible with mesh draws (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076).
                 VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
                 info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
                 info.queryCount = statistics_segments;
                 info.pipelineStatistics = kMeshStatisticsFlags;
+                if (context_.mesh_queries)
+                    info.pipelineStatistics |= VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT;
                 if (context_.vk.vkCreateQueryPool(statistics->device, &info, nullptr, &statistics->mesh_pool) !=
                     VK_SUCCESS)
                     return queue_unsupported(__LINE__);

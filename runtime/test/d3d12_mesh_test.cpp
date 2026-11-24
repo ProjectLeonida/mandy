@@ -706,6 +706,66 @@ int main(int argc, char** argv) {
             // Vulkan has no clipped-primitive counter, so the clipping primitives of a mesh segment stay 0.
             EXPECT(mesh_only.CPrimitives == 0 && mesh_only.PSInvocations > 0);
             if (!d.mesh_shader_queries) EXPECT(mesh_only.CInvocations == 0);
+
+            // Exercise the 112-byte stride with mixed, mesh-only, vertex-only and unused slots in one resolve.
+            D3D12_FEATURE_DATA_D3D12_OPTIONS9 options9{};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &options9, sizeof(options9))));
+            EXPECT(bool(options9.MeshShaderPipelineStatsSupported) == d.mesh_shader_queries);
+            constexpr auto stats1 = D3D12_QUERY_TYPE_PIPELINE_STATISTICS1;
+            const D3D12_QUERY_HEAP_DESC extended_desc{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1, 4, 0};
+            Ref<ID3D12QueryHeap> extended;
+            EXPECT(SUCCEEDED(device->CreateQueryHeap(&extended_desc, IID_PPV_ARGS(&extended.p))));
+            D3D12_QUERY_DATA_PIPELINE_STATISTICS1 extended_data[4]{};
+            Ref<ID3D12Resource> extended_results;
+            const auto extended_buffer = buffer_desc(sizeof(extended_data));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &extended_buffer,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&extended_results.p))));
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+            list->SetGraphicsRootSignature(root.p);
+            list->RSSetScissorRects(1, &scissor);
+            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+            list->SetGraphicsRootConstantBufferView(1, upload_va);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list->BeginQuery(extended.p, stats1, 0);
+            vertex_draw();
+            list->BeginQuery(extended.p, stats1, 1);
+            mesh_draw(2, 2);
+            list->EndQuery(extended.p, stats1, 1);
+            mesh_draw(1, 1);
+            vertex_draw();
+            list->EndQuery(extended.p, stats1, 0);
+            list->BeginQuery(extended.p, stats1, 2);
+            vertex_draw();
+            vertex_draw();
+            list->EndQuery(extended.p, stats1, 2);
+            list->ResolveQueryData(extended.p, stats1, 0, 4, extended_results.p, 0);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 4)) && SUCCEEDED(fence->SetEventOnCompletion(4, nullptr)));
+            EXPECT(SUCCEEDED(extended_results->Map(0, nullptr, &stats_mapped)));
+            std::memcpy(extended_data, stats_mapped, sizeof(extended_data));
+            extended_results->Unmap(0, nullptr);
+            for (unsigned i = 0; i < 3; ++i) {
+                EXPECT(extended_data[i].IAVertices == data[i].IAVertices);
+                EXPECT(extended_data[i].IAPrimitives == data[i].IAPrimitives);
+                EXPECT(extended_data[i].CInvocations == data[i].CInvocations);
+                EXPECT(extended_data[i].ASInvocations == 0);
+            }
+            EXPECT(extended_data[2].MSInvocations == 0 && extended_data[2].MSPrimitives == 0);
+            if (d.mesh_shader_queries) {
+                EXPECT(extended_data[0].MSInvocations > extended_data[1].MSInvocations);
+                EXPECT(extended_data[1].MSInvocations > 0);
+                EXPECT(extended_data[0].MSPrimitives == mesh_clipping);
+                EXPECT(extended_data[1].MSPrimitives == mesh_only.CInvocations);
+            } else {
+                for (const auto& entry : extended_data)
+                    EXPECT(entry.MSInvocations == 0 && entry.MSPrimitives == 0);
+            }
+            const D3D12_QUERY_DATA_PIPELINE_STATISTICS1 zero{};
+            EXPECT(std::memcmp(&extended_data[3], &zero, sizeof(zero)) == 0);
         } else {
             std::printf("pipelineStatisticsQuery not available: the D3D-291 statistics check is skipped\n");
         }

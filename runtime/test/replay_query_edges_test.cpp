@@ -32,8 +32,10 @@ constexpr unsigned binary_group_size = 64;
 constexpr VkDeviceSize word_size = sizeof(std::uint64_t);
 constexpr unsigned statistics_size = query_result_size(d3d12_query::pipeline_statistics);
 constexpr unsigned statistics_counters = statistics_size / word_size;
+constexpr unsigned extended_statistics_size = query_result_size(d3d12_query::pipeline_statistics1);
+constexpr unsigned statistics_record_words = extended_statistics_size / word_size;
 constexpr VkDeviceSize scratch_size = std::max({sum_capacity + 1, binary_capacity,
-    (statistics_capacity + 1) * statistics_counters}) * word_size;
+    (statistics_capacity + 1) * statistics_record_words}) * word_size;
 constexpr unsigned char guard_byte = 0xa5;
 
 template<class T>
@@ -62,7 +64,7 @@ struct MockReplay {
     std::vector<Call> copies;
     std::vector<std::pair<VkQueryPool, unsigned>> resets;
     std::set<VkQueryPool> statistics_pools;
-    std::set<VkQueryPool> mesh_pools;  // pools with the two counters a mesh draw allows (D3D-291)
+    std::map<VkQueryPool, unsigned> mesh_pools;  // two or three pipeline counters per mesh segment
     std::set<VkQueryPool> primitives_pools;  // the mesh-primitives count of a mesh segment (D3D-MESH-CLIPPING-COUNTER)
     std::vector<unsigned> chunks;
     std::vector<unsigned> meshes;   // statistics_sum.comp's mesh flag, one per chunk
@@ -115,10 +117,9 @@ struct MockReplay {
         copies.push_back({p, first, count, off, stride});
         auto& q = values.at(p);
         expect(first <= q.size() && count <= q.size() - first, "mock query access out of bounds");
-        // A mesh pool counts two counters, not the eleven of the full pool (D3D-291).
-        const unsigned counters = mesh_pools.count(p) ? 2u
-                                  : primitives_pools.count(p) ? 1u
-                                                             : (stride == statistics_size ? statistics_counters : 1u);
+        const bool statistics = stride == statistics_size || stride == extended_statistics_size;
+        const unsigned counters = mesh_pools.count(p) ? mesh_pools.at(p)
+                                  : statistics && !primitives_pools.count(p) ? statistics_counters : 1u;
         for (unsigned i = 0; i < count; ++i) {
             for (unsigned j = 0; j < counters; ++j) {
                 word(b, off + i * stride + word_size * j, q[first + i][j]);
@@ -253,7 +254,8 @@ struct MockReplay {
             helper(false, false, p, f, n, b, off);
         };
         v.sum_statistics = [helper](VkCommandBuffer, VkQueryPool p, VkQueryPool, VkQueryPool, const std::uint8_t*,
-            unsigned f, unsigned n, VkBuffer b, VkDeviceSize off) {
+            unsigned f, unsigned n, VkBuffer b, VkDeviceSize off, std::uint32_t size) {
+            expect(size == statistics_size, "legacy statistics helper result size");
             helper(true, false, p, f, n, b, off);
         };
         v.resolve_binary_occlusion = [helper](VkCommandBuffer, VkQueryPool p, unsigned f, unsigned n, VkBuffer b,
@@ -316,13 +318,19 @@ void test_helper_chunks() {
             }
         } else {
             const bool statistics = c.mode == MockReplay::statistics;
-            for (unsigned j = 0; j < (statistics ? statistics_counters : 1u); ++j) {
-                // A mesh segment counts the mesh-primitives count, the fragment and the compute invocations,
-                // and they land in CInvocations, PSInvocations and CSInvocations (statistics_sum.comp, D3D-291 and
-                // D3D-MESH-CLIPPING-COUNTER).
-                if (mesh && statistics && j != 5 && j != 7 && j != 10) continue;
-                const unsigned source = mesh && j == 10 ? 8 : j;
-                unsigned width = statistics ? statistics_counters : 1;
+            const unsigned width = statistics ? statistics_record_words : 1;
+            for (unsigned j = 0; j < width; ++j) {
+                if (!mesh && j >= statistics_counters) continue;
+                unsigned source = j;
+                if (mesh) {
+                    switch (j) {
+                    case 5: case 7: break;
+                    case 10: source = 8; break;
+                    case 12: source = 9; break;
+                    case 13: source = 5; break;
+                    default: continue;
+                    }
+                }
                 auto total = c.word(VK_NULL_HANDLE, word_size * j);
                 for (unsigned i = 0; i < n; ++i) {
                     total += c.word(VK_NULL_HANDLE, word_size * (width * (i + 1) + source));
@@ -370,7 +378,7 @@ void test_helper_chunks() {
             } else {
                 if (mode == MockReplay::statistics) {
                     helper.sum_statistics({}, qp, VK_NULL_HANDLE, VK_NULL_HANDLE, nullptr, first, n, dst,
-                                          output_offset);
+                                          output_offset, statistics_size);
                 } else {
                     helper.sum({}, qp, first, n, dst, output_offset);
                 }
@@ -412,7 +420,7 @@ void test_helper_chunks() {
     expect(c.word(dst, output_offset) == reset_sum, "sum accumulator reset between calls");
     c.mode = MockReplay::statistics;
     c.values[qp][first_query].fill(reset_counter);
-    helper.sum_statistics({}, qp, VK_NULL_HANDLE, VK_NULL_HANDLE, nullptr, first_query, 1, dst, output_offset);
+    helper.sum_statistics({}, qp, VK_NULL_HANDLE, VK_NULL_HANDLE, nullptr, first_query, 1, dst, output_offset, statistics_size);
     for (unsigned j = 0; j < statistics_counters; ++j) {
         expect(c.word(dst, output_offset + word_size * j) == reset_counter, "statistics accumulator reset");
     }
@@ -428,13 +436,15 @@ void test_helper_chunks() {
         const std::uint8_t mesh_flags[mesh_segments] = {1, 1, 1};
         auto mesh_pool = handle<VkQueryPool>(3);
         auto primitives_pool = handle<VkQueryPool>(4);
-        c.mesh_pools.insert(mesh_pool);
+        c.mesh_pools.emplace(mesh_pool, 3);
         c.primitives_pools.insert(primitives_pool);
         c.values[mesh_pool].resize(mesh_segments);
         c.values[primitives_pool].resize(mesh_segments);
-        std::uint64_t fragment_total = 0, compute_total = 0, generated_total = 0;
+        std::uint64_t fragment_total = 0, compute_total = 0, generated_total = 0, mesh_total = 0;
         for (unsigned i = 0; i < mesh_segments; ++i) {
             c.values[mesh_pool][i][0] = fragment + i;  // the fragment shader invocations
+            c.values[mesh_pool][i][2] = 4 + i;  // mesh invocations
+            mesh_total += c.values[mesh_pool][i][2];
             c.values[mesh_pool][i][1] = compute + i;   // the compute shader invocations
             c.values[primitives_pool][i][0] = generated + i;  // the primitives the mesh shader emitted
             fragment_total += c.values[mesh_pool][i][0];
@@ -448,13 +458,15 @@ void test_helper_chunks() {
         c.meshes.clear();
         c.groups.clear();
         c.transfers.clear();
-        helper.sum_statistics({}, qp, mesh_pool, primitives_pool, mesh_flags, 0, mesh_segments, dst, output_offset);
-        for (unsigned j = 0; j < statistics_counters; ++j) {
-            const std::uint64_t v = j == 5 ? generated_total : j == 7 ? fragment_total : j == 10 ? compute_total : 0;
+        helper.sum_statistics({}, qp, mesh_pool, primitives_pool, mesh_flags, 0, mesh_segments, dst, output_offset,
+                              extended_statistics_size);
+        for (unsigned j = 0; j < statistics_record_words; ++j) {
+            const std::uint64_t v = j == 5 || j == 13 ? generated_total : j == 7 ? fragment_total
+                                    : j == 10 ? compute_total : j == 12 ? mesh_total : 0;
             std::memcpy(expected.data() + output_offset + word_size * j, &v, word_size);
         }
         expect(c.buffers[dst] == expected,
-               "a mesh segment fills CInvocations, PSInvocations and CSInvocations, and no other field");
+               "a mesh segment fills clipping, fragment, compute and the two mesh fields");
         expect(c.meshes.size() == 1 && c.meshes[0] == 1, "the mesh chunk says its segments are mesh ones");
         expect(c.copies.size() == 2 && c.copies[0].pool == mesh_pool && c.copies[1].pool == primitives_pool,
                "the mesh segment is read from the mesh pool and the mesh-primitives pool");

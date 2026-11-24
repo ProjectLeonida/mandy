@@ -9495,6 +9495,9 @@ public:
             // counts 0 written and 0 needed. That needs no Vulkan pool: Begin/EndQuery run nothing and a resolve fills zeros. When stream
             // output lands, this becomes a VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool (D3D-302).
             return register_pool(desc);
+        case h::pipeline_statistics1:
+            if (!device_.context->can_resolve_segmented_queries()) return E_NOTIMPL;
+            [[fallthrough]];
         case h::pipeline_statistics:
             if (!device_.info.pipeline_statistics_query) {
                 log_once("pipeline-statistics query heap: pipelineStatisticsQuery not enabled; type", desc.Type);
@@ -9504,7 +9507,7 @@ public:
             info.pipelineStatistics = kPipelineStatistics;
             break;
         default:
-            // Video decode and mesh-shader statistics (PIPELINE_STATISTICS1) have no path yet.
+            // Video decode has no query path.
             log_once("query heap type not supported:", desc.Type);
             return E_NOTIMPL;
         }
@@ -9532,7 +9535,10 @@ private:
     // IAVertices, IAPrimitives, VSInvocations, GSInvocations, GSPrimitives, CInvocations, CPrimitives,
     // PSInvocations, HSInvocations (patches), DSInvocations, CSInvocations.
     static constexpr VkQueryPipelineStatisticFlags kPipelineStatistics = 0x7ff;
-    static_assert(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) == 11 * sizeof(UINT64));
+    static_assert(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) ==
+                  leonida::query_result_size(leonida::d3d12_query::pipeline_statistics));
+    static_assert(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1) ==
+                  leonida::query_result_size(leonida::d3d12_query::pipeline_statistics1));
 
     DeviceState& device_;
     VkQueryPool pool_ = VK_NULL_HANDLE;  // null for a stream-output heap (no Vulkan query behind it)
@@ -13946,7 +13952,8 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS9)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9*>(data);
             *opts = {};
-            opts->MeshShaderPipelineStatsSupported = FALSE;
+            opts->MeshShaderPipelineStatsSupported = state_.info.pipeline_statistics_query && state_.info.mesh_shader_queries &&
+                                                     state_.context->can_resolve_segmented_queries();
             opts->MeshShaderSupportsFullRangeRenderTargetArrayIndex = FALSE;
             opts->AtomicInt64OnTypedResourceSupported = FALSE;
             opts->AtomicInt64OnGroupSharedSupported = FALSE;

@@ -1006,10 +1006,10 @@ struct ReplayFunctions {
     // rendering: the segments of a statistics query split around resolves (D3D-162) and mesh draws (D3D-291).
     // Segment i is in the second pool when mesh[i] is set (mesh may be null: none is). The third pool holds the
     // mesh-primitives count of a mesh segment (D3D-MESH-CLIPPING-COUNTER); it is null when the device has no
-    // meshShaderQueries.
+    // meshShaderQueries. The final argument selects the D3D12 result size.
     std::function<void(VkCommandBuffer, VkQueryPool, VkQueryPool mesh_pool, VkQueryPool primitives_pool,
                        const std::uint8_t* mesh, std::uint32_t first, std::uint32_t count, VkBuffer dst,
-                       VkDeviceSize offset)>
+                       VkDeviceSize offset, std::uint32_t result_size)>
         sum_statistics;
     // Sums `count` binary-occlusion segments and normalizes the total to a 64-bit 0 or 1, outside conditional
     // rendering: a binary query split over physical segments because it overlaps other occlusion queries (D3D-252).
@@ -2652,6 +2652,7 @@ public:
     bool statistics_overlaps = false;
     // For each of those segments, whether it holds mesh draws and so runs in statistics_mesh_pool (D3D-291).
     std::vector<std::uint8_t> statistics_mesh;
+    bool statistics_extended = false;
     VkQueryPool statistics_mesh_pool = VK_NULL_HANDLE;
     // The mesh-primitives pool of the list's mesh segments (D3D-MESH-CLIPPING-COUNTER).
     VkQueryPool statistics_primitives_pool = VK_NULL_HANDLE;
@@ -2712,9 +2713,8 @@ inline bool has_helper_dispatch(const PreparedList& out, std::size_t i) {
 // depend on heap state at planning time, so every non-timestamp resolve splits conservatively.
 // The counters a mesh draw may count: VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076 leaves the input
 // assembly, vertex, geometry, tessellation and clipping bits out of the pipelineStatistics flags of every pool that
-// is active during a mesh draw, so a mesh segment runs in a pool with the fragment and compute counters only
-// (D3D-291). D3D12 counts the clipping invocations and primitives of a mesh pipeline, but Vulkan has no counter for
-// them during a mesh draw, so those two fields read 0.
+// is active during a mesh draw. The baseline mesh pool counts fragment and compute invocations. The backend
+// adds mesh invocations and a separate primitives pool on devices with meshShaderQueries.
 inline constexpr VkQueryPipelineStatisticFlags kMeshStatisticsFlags =
     VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT | VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT;
 // The bits the same VUID forbids in a pool that is active during a mesh draw.
@@ -2764,13 +2764,13 @@ inline void plan_statistics_segments(PreparedList& out) {
                 inner.push_back({&query.statistics_end, &query.statistics_begin, -1});
                 splits = true;
             }
-        } else if (range.type == d3d12_query::pipeline_statistics) {
+        } else if (is_pipeline_statistics(range.type)) {
             if (std::holds_alternative<BeginQuery>(command)) {
                 begin = &query;
                 inner.clear();
                 splits = mesh = false;
             } else if (begin) {
-                if (splits || mesh) {
+                if (splits || mesh || range.type == d3d12_query::pipeline_statistics1) {
                     const std::uint32_t first = out.statistics_segment_count;
                     const auto open = [&] {
                         out.statistics_mesh.push_back(0);
@@ -2854,7 +2854,7 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
         const auto range = query_range(command);
         if (!std::holds_alternative<ResolveQueries>(command)) {
             // A Begin or End of another query kind leaves the shared segment alone.
-            if (range.type != d3d12_query::pipeline_statistics) continue;
+            if (!is_pipeline_statistics(range.type)) continue;
             query->statistics_end = current;
             const auto key = std::pair{range.heap, range.first};
             if (std::holds_alternative<BeginQuery>(command)) {
@@ -2956,6 +2956,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.statistics_pool = out.statistics_mesh_pool = VK_NULL_HANDLE;
     out.statistics_base = out.statistics_segment_count = 0;
     out.statistics_mesh.clear();
+    out.statistics_extended = false;
     out.khr_postbuilds.clear();
     const bool rendering = vk.begin_rendering && vk.end_rendering && vk.clear_attachments && vk.image_view;
     const bool copies = vk.copy_buffer && vk.copy_buffer_to_image && vk.copy_image_to_buffer && vk.copy_image;
@@ -3501,6 +3502,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 } else if (is_so_statistics(range.type)) {
                     // No Vulkan query runs for it (QueryPool::pool is null), so it overlaps nothing.
                 } else {
+                    out.statistics_extended |= range.type == d3d12_query::pipeline_statistics1;
                     statistics_overlaps |= begin && statistics_active_count;
                     if (begin) ++statistics_active_count; else --statistics_active_count;
                     statistics_active = statistics_active_count != 0;
@@ -3745,8 +3747,8 @@ public:
             } else if (mesh) {
                 // Unsplit, the query would be active around a mesh draw with counters Vulkan forbids there.
                 return unsupported_at(__LINE__);
-            } else if (list.statistics_overlaps) {
-                // Whole queries on the heap pool would keep two pipeline-statistics queries active at once.
+            } else if (list.statistics_overlaps || list.statistics_extended) {
+                // The heap pool cannot handle overlapping queries or produce an extended result.
                 return unsupported_at(__LINE__);
             } else {
                 for (const auto& command : list.commands)
@@ -3773,7 +3775,7 @@ public:
             } else {
                 const auto& resolve = std::get<ResolveQueries>(command);
                 const bool binary = resolve.type == d3d12_query::binary_occlusion;
-                const bool statistics = resolve.type == d3d12_query::pipeline_statistics;
+                const bool statistics = is_pipeline_statistics(resolve.type);
                 // A helper dispatch inside an unsplit statistics query would count in the application's
                 // CSInvocations.
                 const bool uncounted = !query.statistics_active ||
@@ -3793,11 +3795,12 @@ public:
                         const auto& saved = value.occlusion;
                         const std::uint8_t* kinds = saved.segments->mesh.empty() ? nullptr
                                                                                  : saved.segments->mesh.data();
-                        // A mesh segment's four counters go through the sum to land in their D3D12 fields.
+                        // Remap mesh counters and pad the extended result even for a single segment.
                         const bool any_mesh = kinds && std::find(kinds + saved.first, kinds + saved.first + saved.count,
                                                                  std::uint8_t(1)) != kinds + saved.first + saved.count;
                         run = {saved.segments->pool, saved.first, saved.count, run.offset,
-                               saved.count > 1 || any_mesh, saved.segments->mesh_pool,
+                               saved.count > 1 || any_mesh || resolve.type == d3d12_query::pipeline_statistics1,
+                               saved.segments->mesh_pool,
                                saved.segments->primitives_pool, kinds};
                         if (any_mesh && !statistics) return ReplayResult::invalid_query;
                         if (!can_sum || (run.sum && !uncounted)) return unsupported_at(__LINE__);
@@ -3941,9 +3944,9 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
         for (const auto& run : query.resolves) {
             if (!run.pool) {
                 vk.fill_buffer(cb, dst, run.offset, VkDeviceSize(run.count) * size, 0);
-            } else if (run.sum && resolve.type == d3d12_query::pipeline_statistics) {
+            } else if (run.sum && is_pipeline_statistics(resolve.type)) {
                 vk.sum_statistics(cb, run.pool, run.mesh_pool, run.primitives_pool, run.mesh, run.first, run.count,
-                                  dst, run.offset);
+                                  dst, run.offset, size);
             } else if (run.sum && binary) {
                 vk.sum_binary_occlusion(cb, run.pool, run.first, run.count, dst, run.offset);
             } else if (run.sum || binary) {
