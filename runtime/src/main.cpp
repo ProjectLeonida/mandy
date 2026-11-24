@@ -54,9 +54,9 @@ const char* binding_name(rt::Binding b) {
 
 int usage() {
     std::fprintf(stderr,
-                 "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE]\n"
-                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
-                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
+                 "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--upscaler-picker RVA[,KIND]] [--trace FILE]\n"
+                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--upscaler-picker RVA[,KIND]] [--trace-d3d12] [--trace FILE]\n"
+                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--upscaler-picker RVA[,KIND]] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
     return 2;
 }
 
@@ -67,6 +67,8 @@ int wmain(int argc, wchar_t** argv) {
     uint32_t archetype_lookup_rva = 0;  // --archetype-lookup RVA[,ARG]: the game's archetype lookup by hash
     int archetype_lookup_arg = 0;
     uint32_t view_mode_getter_rva = 0;  // --view-mode-getter RVA: the game's view mode of a camera context
+    uint32_t upscaler_picker_rva = 0;   // --upscaler-picker RVA[,KIND]: the game's choice of upscaler
+    uint32_t upscaler_kind = 7;         // what it returns instead: 7 is AMD's FFX upscaler in 1.0.2.1
     bool dry_run = false, init = false, run = false, trace_d3d12 = false;
     std::vector<std::wstring> game_args;  // wide: path::string() throws on a character the code page lacks (RT-84)
     std::wstring trace_file;
@@ -85,19 +87,25 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--overlay" && i + 1 < argc) overlay_dir = argv[++i];
         else if (a == L"--mods" && i + 1 < argc) mods_dir = argv[++i];
         else if (a == L"--view-mode-getter" && i + 1 < argc) {
-            wchar_t* end = nullptr;
-            const unsigned long rva = std::wcstoul(argv[++i], &end, 16);
-            if (!end || *end || rva == 0) return usage();
-            view_mode_getter_rva = static_cast<uint32_t>(rva);
+            bool has_second = false;
+            uint32_t unused = 0;
+            if (!leonida::mods::parse_hook_option(argv[++i], view_mode_getter_rva, has_second, unused, 0) ||
+                has_second)
+                return usage();
+        }
+        else if (a == L"--upscaler-picker" && i + 1 < argc) {
+            bool has_kind = false;
+            uint32_t kind = 0;
+            if (!leonida::mods::parse_hook_option(argv[++i], upscaler_picker_rva, has_kind, kind, 255) ||
+                (has_kind && kind == 0))
+                return usage();
+            if (has_kind) upscaler_kind = kind;
         }
         else if (a == L"--archetype-lookup" && i + 1 < argc) {
-            const std::wstring v = argv[++i];
-            const auto comma = v.find(L',');
-            wchar_t* end = nullptr;
-            const unsigned long rva = std::wcstoul(v.substr(0, comma).c_str(), &end, 16);
-            if (!end || *end || rva == 0) return usage();
-            archetype_lookup_rva = static_cast<uint32_t>(rva);
-            if (comma != std::wstring::npos) archetype_lookup_arg = v.substr(comma + 1) == L"1" ? 1 : 0;
+            bool has_arg = false;
+            uint32_t arg = 0;
+            if (!leonida::mods::parse_hook_option(argv[++i], archetype_lookup_rva, has_arg, arg, 1)) return usage();
+            archetype_lookup_arg = static_cast<int>(arg);
         }
         else if (image.empty()) image = a;
         else return usage();
@@ -160,6 +168,21 @@ int wmain(int argc, wchar_t** argv) {
             std::fprintf(stderr, "[rt] mods: first-person view (value %u) for %s%s\n", camera.first_person_value,
                          camera.contexts.empty() ? "every context" : "the listed contexts",
                          view_mode_getter_rva ? "" : "; not applied: no --view-mode-getter RVA for this executable");
+        // The upscaler: --upscaler-picker wins; else the enabled mod's "upscaler" section.
+        if (const leonida::mods::UpscalerChoice up = leonida::mods::upscaler_of(mods.mods);
+            up.set && up.kind && !upscaler_picker_rva) {
+            upscaler_picker_rva = up.picker_rva;
+            upscaler_kind = up.kind;
+        }
+        if (upscaler_picker_rva && upscaler_kind == 7) {
+            // FSR needs the PC upscaler shim: without it the game's FFX calls reach the package's console DLL.
+            wchar_t ffx_pc[8] = {};
+            if (GetEnvironmentVariableW(L"LEONIDA_FFX_PC", ffx_pc, 8) != 1 || ffx_pc[0] != L'1') {
+                std::fprintf(stderr, "[rt] mods: FSR upscaler not applied: it needs LEONIDA_FFX_PC=1 (the PC upscaler "
+                                     "shim, docs/modding.md \"Upscaler\")\n");
+                upscaler_picker_rva = 0;
+            }
+        }
         if (leonida::mods::active().size())
             std::fprintf(stderr, archetype_lookup_rva ? "[rt] mods: %zu archetype swap(s) loaded\n"
                                  : "[rt] mods: %zu archetype swap(s) loaded; not applied: no --archetype-lookup RVA for "
@@ -188,26 +211,41 @@ int wmain(int argc, wchar_t** argv) {
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
         // The mods' archetype swaps (docs/modding.md): hooked here, before any image code runs, when the lookup's RVA
         // for this executable is given. The count of redirected calls shows whether the RVA is the real lookup.
-        if (view_mode_getter_rva) {
-            const auto r = leonida::hooks::hook_image_results(main_module.base, view_mode_getter_rva,
-                                                              &leonida::mods::override_view_mode);
-            if (r.ok)
-                std::fprintf(stderr, "[rt] mods: view-mode getter at RVA 0x%X hooked: %zu direct call(s) redirected\n",
-                             view_mode_getter_rva, r.redirected);
+        // The upscaler the game renders through (docs/modding.md, "Upscaler"): its picker's result is replaced.
+        // One log line per hook. No direct call to the RVA means it isn't that function in this executable (a stale
+        // mod or a wrong RVA), so it says so rather than "hooked".
+        const auto report = [](const char* what, uint32_t rva, const leonida::hooks::HookResult& r, const char* detail) {
+            if (!r.ok)
+                std::fprintf(stderr, "[rt] mods: %s at RVA 0x%X not hooked: %s\n", what, rva, r.error);
+            else if (!r.redirected)
+                std::fprintf(stderr, "[rt] mods: %s at RVA 0x%X not hooked: no direct call to it (wrong RVA for this "
+                                     "executable?)\n", what, rva);
             else
-                std::fprintf(stderr, "[rt] mods: view-mode getter at RVA 0x%X not hooked: %s\n", view_mode_getter_rva,
-                             r.error);
+                std::fprintf(stderr, "[rt] mods: %s at RVA 0x%X hooked%s: %zu direct call(s) redirected\n", what, rva,
+                             detail, r.redirected);
+        };
+        if (upscaler_picker_rva) {
+            leonida::mods::upscaler_kind_slot() = upscaler_kind;
+            char detail[32];
+            std::snprintf(detail, sizeof(detail), ", upscaler %u", upscaler_kind);
+            report("upscaler picker", upscaler_picker_rva,
+                   leonida::hooks::hook_image_results(main_module.base, upscaler_picker_rva,
+                                                      &leonida::mods::override_upscaler),
+                   detail);
         }
+        if (view_mode_getter_rva)
+            report("view-mode getter", view_mode_getter_rva,
+                   leonida::hooks::hook_image_results(main_module.base, view_mode_getter_rva,
+                                                      &leonida::mods::override_view_mode),
+                   "");
         if (archetype_lookup_rva) {
-            const auto r = leonida::hooks::hook_image_calls(
-                main_module.base, archetype_lookup_rva,
-                [](uint32_t hash) { return leonida::mods::active().remap(hash); }, archetype_lookup_arg);
-            if (r.ok)
-                std::fprintf(stderr, "[rt] mods: archetype lookup at RVA 0x%X hooked (argument %d): %zu direct "
-                                     "call(s) redirected\n", archetype_lookup_rva, archetype_lookup_arg, r.redirected);
-            else
-                std::fprintf(stderr, "[rt] mods: archetype lookup at RVA 0x%X not hooked: %s\n", archetype_lookup_rva,
-                             r.error);
+            char detail[32];
+            std::snprintf(detail, sizeof(detail), " (argument %d)", archetype_lookup_arg);
+            report("archetype lookup", archetype_lookup_rva,
+                   leonida::hooks::hook_image_calls(
+                       main_module.base, archetype_lookup_rva,
+                       [](uint32_t hash) { return leonida::mods::active().remap(hash); }, archetype_lookup_arg),
+                   detail);
         }
         if (run) rt::process::set_command_line(image.filename().wstring(), game_args);
         std::exception_ptr init_failure;

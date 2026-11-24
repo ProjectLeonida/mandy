@@ -134,6 +134,50 @@ int main() {
     set_active_camera(camera_of({}));
     check(override_view_mode(3, 0) == 3, "with no camera mod the game's view mode passes through");
 
+    check(override_upscaler(6, 0) == 6, "with no --upscaler-picker kind the game's upscaler passes through");
+    upscaler_kind_slot() = 7;
+    check(override_upscaler(6, 0) == 7 && override_upscaler(7, 1) == 7, "--upscaler-picker RVA,7 makes every pick 7");
+    upscaler_kind_slot() = 0;
+
+    {
+        uint32_t rva = 0, n = 0;
+        bool has_n = false;
+        check(parse_hook_option(L"7E93F0", rva, has_n, n, 255) && rva == 0x7E93F0 && !has_n, "RVA alone parses");
+        check(parse_hook_option(L"7E93F0,6", rva, has_n, n, 255) && rva == 0x7E93F0 && has_n && n == 6,
+              "RVA,KIND parses both numbers");
+        check(parse_hook_option(L"0x7e93f0,7", rva, has_n, n, 255) && rva == 0x7E93F0 && n == 7,
+              "a 0x prefix and lower-case hex are taken");
+        rva = 0x1234;
+        n = 9;
+        const wchar_t* const bad[] = {L"7E93F0x", L"7E93F0,6x", L"7E93F0,", L"7E93F0,,6", L",6", L"", L"0", L" 7E93F0",
+                                      L"-7E93F0", L"+7E93F0", L"7E93F0,256", L"7E93F0,-1", L"1FFFFFFFF", L"zz"};
+        bool all_refused = true;
+        for (const wchar_t* t : bad) all_refused = all_refused && !parse_hook_option(t, rva, has_n, n, 255);
+        check(all_refused && rva == 0x1234 && n == 9,
+              "trailing garbage, an empty or zero RVA, a sign or space, a second number past the limit and an RVA past "
+              "32 bits are refused, leaving the outputs alone");
+        check(parse_hook_option(L"1A2B3C0,1", rva, has_n, n, 1) && !parse_hook_option(L"1A2B3C0,2", rva, has_n, n, 1),
+              "the limit on the second number holds (archetype lookup: argument 0 or 1)");
+        check(!parse_hook_option(nullptr, rva, has_n, n, 255), "a null text is refused");
+    }
+
+    Mod fsr, game_choice, fsr_off;
+    check(parse_mod(R"({"upscaler":{"use":"fsr","picker_rva":"7E93F0"}})", "u1", fsr, error) && fsr.upscaler.set &&
+              fsr.upscaler.kind == 7 && fsr.upscaler.picker_rva == 0x7E93F0,
+          "an \"upscaler\" section with use fsr and the picker's RVA parses");
+    check(parse_mod(R"({"upscaler":{"use":"game","picker_rva":"7E93F0"}})", "u2", game_choice, error) &&
+              game_choice.upscaler.kind == 0,
+          "use game leaves the game's choice");
+    check(!parse_mod(R"({"upscaler":{"use":"dlss","picker_rva":"7E93F0"}})", "x", fsr_off, error) &&
+              !parse_mod(R"({"upscaler":{"use":"fsr"}})", "x", fsr_off, error) &&
+              !parse_mod(R"({"upscaler":{"use":"fsr","picker_rva":"zz"}})", "x", fsr_off, error),
+          "an unknown upscaler, a missing RVA and a bad RVA are refused");
+    check(parse_mod(R"({"enabled":false,"upscaler":{"use":"fsr","picker_rva":"7E93F0"}})", "u3", fsr_off, error),
+          "a disabled upscaler mod parses");
+    check(upscaler_of({fsr, fsr_off}).kind == 7 && upscaler_of({fsr, game_choice}).kind == 0 &&
+              !upscaler_of({fsr_off}).set,
+          "the last enabled upscaler mod decides; a disabled one is skipped");
+
     const testfiles::ScratchDir scratch("leonida_mods_test");
     const auto& dir = scratch.path();
     write(dir / "a_mandy" / "mod.json",

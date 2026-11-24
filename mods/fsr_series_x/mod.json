@@ -1,0 +1,6 @@
+{
+  "name": "FSR in the Series X configuration",
+  "enabled": false,
+  "game_version": "1.0.2.1",
+  "upscaler": { "use": "fsr", "picker_rva": "7E93F0" }
+}

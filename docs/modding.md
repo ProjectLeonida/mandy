@@ -187,3 +187,49 @@ metadata per mode, and the callers of the `UseFirstPersonCameraMatrix` check in 
 whether the active view is first person). The hook (`hook_image_results` in `runtime/src/code_hooks.h`) runs
 the original and overrides its result; it is for getters with at most four register arguments and an
 integer result. ctest `code_hooks` and `mods` cover the thunk and the override.
+
+## Upscaler (`--upscaler-picker`)
+
+The game chooses its upscaler once, in a small function that returns an upscaler number: in 1.0.2.1 **7** is
+AMD's FFX upscaler (the `amd_fidelityfx_loader_xbox.dll` imports) and **6** the game's own. It returns 7 only on a
+Series S (console type 6, which the game reads from the registry `ConsoleMode` value, answered by the runtime since #6990), so a
+Series X configuration renders through the game's upscaler. Measured by a static look at the 1.0.2.1 executable;
+nothing executed.
+
+In short: the game asks one question, "which upscaler?", and the runtime answers it instead. The game keeps its
+Series X resolution and settings, and its FSR calls go to AMD's PC FSR through the upscaler shim.
+
+**The mod** `mods/fsr_series_x` does it: set `"enabled": true` in its `mod.json` and run with the PC upscaler shim
+(`LEONIDA_FFX_PC=1`, `LEONIDA_FFX_DIR`). Without the shim the runtime leaves the game's choice alone and says so,
+because the game's FFX calls would otherwise reach the package's console DLL. An `"upscaler"` section takes `"use"`:
+`"fsr"` or `"game"`, and the picker's `"picker_rva"` for that executable version; the last enabled mod with one
+decides.
+
+```json
+{ "name": "FSR in the Series X configuration", "enabled": true, "game_version": "1.0.2.1",
+  "upscaler": { "use": "fsr", "picker_rva": "7E93F0" } }
+```
+
+The command line does the same and wins over the mods (FSR, kind 7, also needs `LEONIDA_FFX_PC=1` there):
+`--upscaler-picker RVA[,KIND]` (hex RVA, decimal `KIND`,
+default 7) replaces every result of the picker with `KIND`, through the same result-override hook as the view-mode
+getter (`leonida::mods::override_upscaler`).
+
+```powershell
+$env:LEONIDA_FFX_PC = '1'
+gta6rt.exe --run game_scarlett_master.exe --game-dir <package> --upscaler-picker 7E93F0
+```
+
+| Version | RVA | Direct calls redirected |
+|---|---|---|
+| 1.0.2.1 | `0x7E93F0` | 4 (three calls and a tail jump) |
+
+To find it in another version: the FFX wrapper's `ffxCreateContext` call is in a class whose one instance is a
+static; a short function returns that instance for upscaler 7 (another static for 6, null for anything else). The
+picker is the function whose result is passed to it, and it tests the console type the registry gave. `--dry-run`
+with the RVA prints how many direct calls were redirected, which should match the table; an RVA with no direct call
+(a stale mod, another version) logs `not hooked: no direct call to it` instead, for every hook option.
+
+**Not yet seen running:** the game doesn't reach its first frame under `gta6rt` yet, so the effect is unmeasured.
+The FSR render size per quality mode is the FFX wrapper's own choice. ctest `mods` checks the override and the
+`"upscaler"` section.

@@ -248,6 +248,13 @@ These commands use the package in `game_path.txt`, the port's `overlay` for writ
 When the Vulkan backend is selected with `LEONIDA_D3D12=vulkan`, the packaged runtime finds the translated shaders
 in `<work>/shaders/spirv` using `shader_path.txt` beside `gta6rt.exe`. Set `LEONIDA_SHADERS` to use another directory.
 
+### Mods and the upscaler
+
+The runtime reads mods from `mods/<name>/mod.json` at start ([docs/modding.md](docs/modding.md)). One is
+`mods/fsr_series_x`, off by default: with `"enabled": true` and AMD's PC upscaler (`LEONIDA_FFX_PC=1`), the game keeps
+its Series X resolution and settings and upscales with FSR, which on the console it only uses on Series S. Not seen in
+game yet: the game doesn't reach its first frame.
+
 ## How it works
 
 | Piece | What it does | Where |

@@ -77,6 +77,7 @@ method, scope and caveats. No game data is included.
 | [xdxr.md](xdxr.md) | `BATCHED_DESC2` (`0x50`) and `XDXR_STREAM_DESC` (`0x10`) from `XboxBvhBuilder.dll`'s reads; stream records' offsets and defaults; offline statistics not in the package. |
 | [d3d12_command_objects.md](d3d12_command_objects.md) | Measured command queue/list/fence/`PresentX` surface; verified vs prior art vs open. |
 | [xbox_d3d12_xs.md](xbox_d3d12_xs.md) | The `d3d12_xs` graphics ABI quoted from Microsoft's public GDK reference: root signatures, state objects, DXIL libraries, hit groups, shader cache sessions; which pages are missing or NDA-gated. |
+| [modding.md](modding.md) | Mods: `mods/<name>/mod.json` folders the runtime reads at start (archetype swaps, first-person view, the upscaler). "Upscaler": `mods/fsr_series_x` makes the game use FSR in its Series X configuration. |
 | [runtime_imports.md](runtime_imports.md) | The 16 shipped modules' measured imports and shim/host/unimplemented split. |
 | [xmem_exe_calls.md](xmem_exe_calls.md) | How the retail executable calls `xmem.dll`: call sites and constant arguments per import (`tools/import_call_sites.py`), the 23 `XMemVirtualAlloc` calls that all pass an attribute word, and the inferred shape of the physical-page family. |
 | [audio_hal_exe_calls.md](audio_hal_exe_calls.md) | How the retail executable calls the 22 audio coprocessor, texture layout and DirectStorage imports that have no shim: call sites, constant arguments, and the four calls with a negative-result branch. |

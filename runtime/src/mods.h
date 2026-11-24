@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -61,6 +62,14 @@ struct CameraView {
     std::vector<uint32_t> contexts;
 };
 
+// "upscaler": which upscaler the game's upscaler picker answers (docs/modding.md, "Upscaler"). `use`: "fsr" (7, AMD's
+// FFX upscaler) or "game" (leave the game's choice); `picker_rva`: the picker's RVA in this executable version (hex).
+struct UpscalerChoice {
+    bool set = false;         // the mod has an "upscaler" section
+    uint32_t kind = 0;        // 0 = the game's choice
+    uint32_t picker_rva = 0;
+};
+
 struct Mod {
     std::string folder;  // the folder name under mods/
     std::string name;
@@ -68,6 +77,7 @@ struct Mod {
     bool enabled = true;
     std::vector<ArchetypeSwap> archetype_swaps;
     CameraView camera;
+    UpscalerChoice upscaler;
 };
 
 struct LoadResult {
@@ -163,6 +173,22 @@ inline bool parse_mod(std::string_view text, const std::string& folder, Mod& mod
             }
             mod.archetype_swaps.push_back(std::move(swap));
         }
+    }
+    if (const Json* up = root.find("upscaler")) {
+        const Json* use = up->kind == Json::Kind::object ? up->find("use") : nullptr;
+        if (!use || use->kind != Json::Kind::string || (use->string != "fsr" && use->string != "game")) {
+            error = "\"upscaler\": \"use\" must be \"fsr\" or \"game\"";
+            return false;
+        }
+        const Json* rva = up->find("picker_rva");
+        char* end = nullptr;
+        const unsigned long value =
+            rva && rva->kind == Json::Kind::string ? std::strtoul(rva->string.c_str(), &end, 16) : 0;
+        if (!value || !end || *end) {
+            error = "\"upscaler\": \"picker_rva\" must be the picker's RVA in hex, e.g. \"7E93F0\"";
+            return false;
+        }
+        mod.upscaler = {true, use->string == "fsr" ? 7u : 0u, static_cast<uint32_t>(value)};
     }
     if (const Json* cam = root.find("camera")) {
         if (cam->kind != Json::Kind::object) {
@@ -262,6 +288,14 @@ inline ArchetypeSwaps& active_slot() {
 inline void set_active(ArchetypeSwaps swaps) { active_slot() = std::move(swaps); }
 inline const ArchetypeSwaps& active() { return active_slot(); }
 
+// The upscaler choice of the enabled mods: the last one (in folder order) with an "upscaler" section decides.
+inline UpscalerChoice upscaler_of(const std::vector<Mod>& mods) {
+    UpscalerChoice choice;
+    for (const Mod& m : mods)
+        if (m.enabled && m.upscaler.set) choice = m.upscaler;
+    return choice;
+}
+
 // The camera override of the enabled mods: the last one (in folder order) with a "camera" section decides.
 inline CameraView camera_of(const std::vector<Mod>& mods) {
     CameraView view;
@@ -286,6 +320,44 @@ inline uint32_t override_view_mode(uint32_t result, uint32_t context) {
         if (!listed) return result;
     }
     return v.first_person_value;
+}
+
+// A hook option's value (gta6rt --upscaler-picker, --archetype-lookup, --view-mode-getter): "RVA" or "RVA,N", a nonzero
+// hex RVA (a 0x prefix allowed), then optionally a comma and a decimal N up to `max_second`. Parsed in place, with
+// nothing allowed after the last number; false on anything else, and `rva`/`second` are then left as they were.
+inline bool parse_hook_option(const wchar_t* text, uint32_t& rva, bool& has_second, uint32_t& second,
+                              uint32_t max_second) {
+    const auto digit = [](wchar_t c, bool hex) {
+        return (c >= L'0' && c <= L'9') || (hex && ((c >= L'a' && c <= L'f') || (c >= L'A' && c <= L'F')));
+    };
+    if (!text || !digit(text[0], true)) return false;  // wcstoul would also take spaces and a sign
+    wchar_t* end = nullptr;
+    const unsigned long long r = std::wcstoull(text, &end, 16);
+    if (end == text || r == 0 || r > 0xffffffffull) return false;
+    if (*end == L'\0') {
+        rva = static_cast<uint32_t>(r);
+        has_second = false;
+        return true;
+    }
+    const wchar_t* n_text = end + 1;
+    if (*end != L',' || !digit(*n_text, false)) return false;
+    const unsigned long long n = std::wcstoull(n_text, &end, 10);
+    if (*end != L'\0' || n > max_second) return false;
+    rva = static_cast<uint32_t>(r);
+    has_second = true;
+    second = static_cast<uint32_t>(n);
+    return true;
+}
+
+// The upscaler the hooked upscaler picker returns (gta6rt --upscaler-picker RVA[,KIND], docs/modding.md): 0 keeps the
+// game's choice. In 1.0.2.1 the picker returns 7 (AMD's FFX upscaler) on Series S and 6 (the game's own) otherwise.
+inline uint32_t& upscaler_kind_slot() {
+    static uint32_t kind = 0;
+    return kind;
+}
+inline uint32_t override_upscaler(uint32_t result, uint32_t /*arg0*/) {
+    const uint32_t kind = upscaler_kind_slot();
+    return kind ? kind : result;
 }
 
 }  // namespace leonida::mods
