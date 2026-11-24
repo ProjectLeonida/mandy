@@ -106,6 +106,9 @@ int main() {
     constexpr UINT size = 64;
     std::vector<std::uint8_t> pixels(size * 256), second_pixels(size * 256), logic_pixels(size * 256);
     std::vector<std::uint8_t> strip16_pixels(size * 256), strip32_pixels(size * 256), strip_nocut_pixels(size * 256);
+    // Index buffer view size: a fetch past SizeInBytes reads index 0 (view_out), one inside the view reads the data.
+    std::vector<std::uint8_t> view_out_pixels(size * 256), view_in_pixels(size * 256), view_straddle_pixels(size * 256);
+    std::vector<std::uint8_t> null_ib_pixels(size * 256), zero_ib_pixels(size * 256), live_ib_pixels(size * 256);
     std::vector<std::uint8_t> msaa_full_pixels(size * 256), msaa_half_pixels(size * 256);
     bool ran_msaa = false;
     std::vector<std::uint8_t> step2_pixels(size * 256), step1_pixels(size * 256);
@@ -131,6 +134,30 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);
+
+        // First arena allocation follows the 64 KiB zero page. A broken null-IBV bind can fetch these indices.
+        constexpr UINT large_index_count = 40000;
+        const D3D12_HEAP_PROPERTIES index_upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+        const D3D12_HEAP_PROPERTIES index_default_heap{D3D12_HEAP_TYPE_DEFAULT};
+        const auto large_index_desc = buffer_desc(large_index_count * sizeof(std::uint16_t));
+        Ref<ID3D12Resource> live_indices, index_upload, zero_indices;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&index_default_heap, D3D12_HEAP_FLAG_NONE, &large_index_desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&live_indices.p))));
+        EXPECT(live_indices->GetGPUVirtualAddress() == 64 * 1024);
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&index_upload_heap, D3D12_HEAP_FLAG_NONE, &large_index_desc,
+                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                         IID_PPV_ARGS(&index_upload.p))));
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&index_upload_heap, D3D12_HEAP_FLAG_NONE, &large_index_desc,
+                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                         IID_PPV_ARGS(&zero_indices.p))));
+        void* index_data = nullptr;
+        EXPECT(SUCCEEDED(index_upload->Map(0, nullptr, &index_data)));
+        for (UINT i = 0; i < large_index_count; ++i) static_cast<std::uint16_t*>(index_data)[i] = i % 4;
+        index_upload->Unmap(0, nullptr);
+        EXPECT(SUCCEEDED(zero_indices->Map(0, nullptr, &index_data)));
+        std::memset(index_data, 0, large_index_count * sizeof(std::uint16_t));
+        zero_indices->Unmap(0, nullptr);
 
         // Root signature: [0] two constants (s0, s1: offset), [1] a root CBV (s2:s3: tint).
         D3D12_ROOT_PARAMETER params[2] = {};
@@ -367,6 +394,10 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
         // Upload the vertices, prepare the target.
+        list->CopyBufferRegion(live_indices.p, 0, index_upload.p, 0, large_index_count * sizeof(std::uint16_t));
+        const auto indices_ready = transition(live_indices.p, D3D12_RESOURCE_STATE_COPY_DEST,
+                                              D3D12_RESOURCE_STATE_INDEX_BUFFER);
+        list->ResourceBarrier(1, &indices_ready);
         list->CopyBufferRegion(vertex_buffer.p, 0, upload.p, 0, sizeof(vertices));
         D3D12_RESOURCE_BARRIER barriers[2] = {
             transition(vertex_buffer.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER),
@@ -532,6 +563,10 @@ int main() {
             std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 1280, strip_idx16, sizeof(strip_idx16));
             std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 1536, strip_idx32, sizeof(strip_idx32));
             std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 1792, strip_nocut, sizeof(strip_nocut));
+            // Four indices of the top-left quad, then the same four again: the second half is the data a draw would
+            // read if the view's end were ignored.
+            const std::uint16_t view_idx[8] = {0, 1, 2, 3, 0, 1, 2, 3};
+            std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 3072, view_idx, sizeof(view_idx));
             upload->Unmap(0, nullptr);
 
             auto strip_desc = pso_desc;
@@ -550,11 +585,27 @@ int main() {
                 D3D12_INDEX_BUFFER_VIEW ibv;
                 UINT index_count;
                 std::vector<std::uint8_t>* out;
+                UINT first = 0;  // StartIndexLocation
+                leonida::ReplayResult want = leonida::ReplayResult::success;
+                bool bind_index = true;
             };
             const StripPass strip_passes[] = {
                 {strip16_pso.p, {upload_va + 1280, sizeof(strip_idx16), DXGI_FORMAT_R16_UINT}, 9, &strip16_pixels},
                 {strip32_pso.p, {upload_va + 1536, sizeof(strip_idx32), DXGI_FORMAT_R32_UINT}, 9, &strip32_pixels},
                 {strip_off_pso.p, {upload_va + 1792, sizeof(strip_nocut), DXGI_FORMAT_R16_UINT}, 8, &strip_nocut_pixels},
+                // View of 4 indices, draw of indices 4..7: all outside the view, so all read 0 (a degenerate strip).
+                {strip_off_pso.p, {upload_va + 3072, 8, DXGI_FORMAT_R16_UINT}, 4, &view_out_pixels, 4},
+                // Negative control: the view covers the 8 indices, the same draw reads the quad.
+                {strip_off_pso.p, {upload_va + 3072, 16, DXGI_FORMAT_R16_UINT}, 4, &view_in_pixels, 4},
+                // Indices 2..5 cross the view's end: 2 and 3 are read, 4 and 5 are outside and read 0, so the strip is
+                // (2, 3, 0, 0): one triangle (2, 3, 0) of the top-left quad. Without the cut the buffer's 0, 1 would
+                // give (2, 3, 0, 1), the whole quad.
+                {strip_off_pso.p, {upload_va + 3072, 8, DXGI_FORMAT_R16_UINT}, 4, &view_straddle_pixels, 2},
+                {strip_off_pso.p, {}, large_index_count, &null_ib_pixels, 0, leonida::ReplayResult::success, false},
+                {strip_off_pso.p, {zero_indices->GetGPUVirtualAddress(), large_index_count * 2, DXGI_FORMAT_R16_UINT},
+                 large_index_count, &zero_ib_pixels},
+                {strip_off_pso.p, {live_indices->GetGPUVirtualAddress(), large_index_count * 2, DXGI_FORMAT_R16_UINT},
+                 large_index_count, &live_ib_pixels},
             };
             UINT64 strip_fence = 10;
             for (const auto& sp : strip_passes) {
@@ -564,21 +615,21 @@ int main() {
                 list->SetGraphicsRootSignature(root.p);
                 list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
                 list->IASetVertexBuffers(0, 1, &strip_vbv);
-                list->IASetIndexBuffer(&sp.ibv);
+                if (sp.bind_index) list->IASetIndexBuffer(&sp.ibv);
                 list->RSSetViewports(1, &viewport);
                 list->RSSetScissorRects(1, &scissor);
                 list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
                 list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
                 list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
-                list->DrawIndexedInstanced(sp.index_count, 1, 0, 0, 0);
+                list->DrawIndexedInstanced(sp.index_count, 1, sp.first, 0, 0);
                 list->ResourceBarrier(1, &to_copy);
                 list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
                 EXPECT(list->Close() == S_OK);
                 queue->ExecuteCommandLists(1, lists);
-                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
                 ++strip_fence;
                 EXPECT(SUCCEEDED(queue->Signal(fence.p, strip_fence)) &&
                        SUCCEEDED(fence->SetEventOnCompletion(strip_fence, nullptr)));
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == sp.want);
                 std::memcpy(sp.out->data(), mapped, sp.out->size());
             }
         }
@@ -1019,7 +1070,8 @@ int main() {
         list->OMSetRenderTargets(9, &rtv, TRUE, nullptr);
         EXPECT(list->Close() == E_INVALIDARG);
 
-        for (auto* r : {&vertex_buffer, &upload, &readback, &target, &uint_target}) r->reset();
+        for (auto* r : {&vertex_buffer, &upload, &readback, &target, &uint_target, &live_indices, &index_upload, &zero_indices})
+            r->reset();
         for (auto* p : {&mrt, &instanced, &refused, &unfed, &xor_pso, &fullscreen}) p->reset();
         pso.reset();
         root.reset();
@@ -1106,6 +1158,37 @@ int main() {
     }
     EXPECT(!mismatches);
     EXPECT(nocut_bl_red > 0);
+    // Index buffer view size: past the view's end every fetch reads 0 (nothing drawn), inside it the data is read.
+    UINT view_out_red = 0, view_in_tl_red = 0;
+    for (UINT row = 0; row < size; ++row) {
+        for (UINT col = 0; col < size; ++col) {
+            const std::uint8_t* out = view_out_pixels.data() + row * 256 + col * 4;
+            const std::uint8_t* in = view_in_pixels.data() + row * 256 + col * 4;
+            if (out[0] == 255) ++view_out_red;
+            if (row < size / 2 && col < size / 2 && in[0] == 255 && in[2] == 0) ++view_in_tl_red;
+        }
+    }
+    EXPECT(view_out_red == 0);
+    UINT null_red = 0, zero_red = 0, live_red = 0;
+    for (UINT row = 0; row < size; ++row) {
+        for (UINT col = 0; col < size; ++col) {
+            const UINT offset = row * 256 + col * 4;
+            null_red += null_ib_pixels[offset] == 255;
+            zero_red += zero_ib_pixels[offset] == 255;
+            live_red += live_ib_pixels[offset] == 255;
+        }
+    }
+    EXPECT(null_red == 0 && zero_red == 0 && live_red > 0);
+    std::printf("40000 indices: null view %u red, zero view %u red, live view %u red\n",
+                null_red, zero_red, live_red);
+    // Straddling draw: the strip is (2, 3, 0, 0), the lower-left half of the quad; the buffer's own 0, 1 would also
+    // paint the upper-right half.
+    const auto straddle_px = [&](UINT col, UINT row) { return view_straddle_pixels.data() + row * 256 + col * 4; };
+    EXPECT(straddle_px(4, 28)[0] == 255 && straddle_px(4, 28)[2] == 0);  // lower-left corner of the quad: drawn
+    EXPECT(straddle_px(28, 4)[0] == 0 && straddle_px(28, 4)[2] == 255);   // upper-right corner: blue
+    EXPECT(view_in_tl_red == (size / 2) * (size / 2));
+    std::printf("index view size: draw past the view painted %u red pixels (want 0); view covering the draw painted "
+                "%u of %u top-left pixels\n", view_out_red, view_in_tl_red, (size / 2) * (size / 2));
     std::printf("strip cut (0xFFFF & 0xFFFFFFFF): 4096/4096 pixels matched each (no-cut negative control painted %u "
                 "bridge pixels in bottom-left)\n",
                 nocut_bl_red);

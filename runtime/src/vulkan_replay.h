@@ -1074,6 +1074,15 @@ struct PreparedDraw {
     VkBuffer index_buffer = VK_NULL_HANDLE;
     VkDeviceSize index_offset = 0;
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+    std::uint32_t index_first = 0;  // firstIndex to draw with: the draw's, or 0 on the zero page or a staged copy
+    // A draw that reads past the index view's end binds a scratch copy of the indices it fetches instead: the
+    // in-view part copied from the buffer, the rest zero. fill_bytes 0: no copy.
+    struct IndexStage {
+        VkBuffer scratch = VK_NULL_HANDLE;
+        VkDeviceSize scratch_offset = 0, fill_bytes = 0;
+        VkBuffer source = VK_NULL_HANDLE;
+        VkDeviceSize source_offset = 0, copy_bytes = 0;
+    } index_stage;
     VkExtent2D area{};
     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
 
@@ -1090,6 +1099,8 @@ struct PreparedDraw {
         index_buffer = VK_NULL_HANDLE;
         index_offset = 0;
         index_type = VK_INDEX_TYPE_UINT16;
+        index_first = 0;
+        index_stage = {};
         area = {};
         layers = 1;
     }
@@ -2206,14 +2217,40 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         if (draw.index.format == 57) p.index_type = VK_INDEX_TYPE_UINT16;
         else if (draw.index.format == 42) p.index_type = VK_INDEX_TYPE_UINT32;
         else if (draw.index.va) return ReplayResult::unsupported;
-        if (!draw.index.va) {  // no index buffer: every index reads 0
-            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
-            p.index_buffer = vk.zero_buffer;
-            p.index_offset = vk.zero_offset;
-        } else {
+        p.index_first = draw.first;
+        // Index fetches outside the view read 0 in D3D12, but vkCmdBindIndexBuffer binds to the end of the buffer (the
+        // layer's device does not enable VK_KHR_maintenance5 for a bind size). A draw wholly inside the view binds
+        // the buffer. One that reads past the view's end binds the zero page when every index is outside, else a
+        // scratch copy of the indices it fetches (in-view part copied, the rest zero), so no byte past the view is read.
+        const std::uint64_t index_bytes = p.index_type == VK_INDEX_TYPE_UINT32 ? 4 : 2;
+        std::uint64_t view_indices = 0;
+        if (draw.index.va) {
             std::uint64_t size = draw.index.size;
             if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset))
                 return ReplayResult::unresolved_resource;
+            view_indices = size / index_bytes;  // size is the view's, cut at the buffer's end
+        }
+        const std::uint64_t last = std::uint64_t(draw.first) + draw.count;  // one past the last index fetched
+        if (!draw.index.va || (draw.count > 0 && last > view_indices)) {
+            const std::uint64_t inside = draw.first < view_indices ? view_indices - draw.first : 0;
+            const std::uint64_t bytes = std::uint64_t(draw.count) * index_bytes;
+            if (inside == 0 && vk.zero_buffer && bytes <= vk.zero_size) {
+                p.index_buffer = vk.zero_buffer;
+                p.index_offset = vk.zero_offset;
+                p.index_first = 0;
+            } else {
+                if (!vk.copy_scratch || !vk.fill_buffer || !vk.copy_buffer) return ReplayResult::unsupported;
+                const std::uint64_t fill = (bytes + 3) & ~std::uint64_t(3);  // vkCmdFillBuffer: multiples of 4
+                VkBuffer scratch = VK_NULL_HANDLE;
+                VkDeviceSize offset = 0;
+                if (!vk.copy_scratch(fill + 4, scratch, offset)) return ReplayResult::unsupported;
+                offset = (offset + 3) & ~VkDeviceSize(3);  // also a multiple of the index size
+                p.index_stage = {scratch, offset, fill, p.index_buffer,
+                                 p.index_offset + VkDeviceSize(draw.first) * index_bytes, inside * index_bytes};
+                p.index_buffer = scratch;
+                p.index_offset = offset;
+                p.index_first = 0;
+            }
         }
     }
     return ReplayResult::success;
@@ -4203,6 +4240,21 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const GraphicsPipeline& graphics = *d.graphics;
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
+            if (d.index_stage.fill_bytes) {
+                const auto& stage = d.index_stage;
+                constexpr VkAccessFlags transfer_rw = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               transfer_rw, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                vk.fill_buffer(command_buffer, stage.scratch, stage.scratch_offset, stage.fill_bytes, 0);
+                if (stage.copy_bytes) {
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   transfer_rw, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    const VkBufferCopy region{stage.source_offset, stage.scratch_offset, stage.copy_bytes};
+                    vk.copy_buffer(command_buffer, stage.source, stage.scratch, 1, &region);
+                }
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_ACCESS_INDEX_READ_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT);
+            }
             vk.begin_rendering(command_buffer, &rendering);
 
             ShaderUserData data{};
@@ -4248,7 +4300,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
             } else if (draw->indexed) {
                 vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
-                vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
+                vk.draw_indexed(command_buffer, draw->count, draw->instances, d.index_first, draw->base_vertex,
                                 draw->first_instance);
             } else {
                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
