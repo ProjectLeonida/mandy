@@ -129,12 +129,23 @@ HRESULT WINAPI create_versioned_root_signature_deserializer(const void* data, SI
     return fn(data, size, iid, out);
 }
 
+void* xmem_descriptor_heap_alloc(std::size_t byte_size, std::uint64_t attributes) {
+    const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
+    return (hooks && hooks->alloc) ? hooks->alloc(byte_size, attributes) : nullptr;
+}
+
+void xmem_descriptor_heap_free(void* ptr, std::uint64_t attributes) {
+    const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
+    if (hooks && hooks->free) hooks->free(ptr, attributes);
+}
+
 // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only
 // logged and not used to create the device. The struct's total size is unknown, so the log reads 24 x 32-bit words
 // (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead: create_host_device asks for
 // 11_0, the least restrictive one (BL-2; 12_0 refused an adapter that tops out at 11_x), and the device still has its
 // highest level.
 HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, const IID* riid, void** out) {
+    rt::d3d12_xs::set_default_descriptor_heap_allocator(&xmem_descriptor_heap_alloc, &xmem_descriptor_heap_free);
     constexpr auto method = "D3D12XboxCreateDevice";
     using rt::d3d12_trace::result;
     if (!out) return result(method, E_POINTER);

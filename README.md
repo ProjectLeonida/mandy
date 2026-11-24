@@ -282,6 +282,10 @@ in `<work>/shaders/spirv` using `shader_path.txt` beside `gta6rt.exe`. Set `LEON
 | Research tools | PE/RTTI inspection, raw carving, texture tiling probes, GPU test harnesses | `tools/`, `runtime/test/` |
 | Progress dashboard | One offline page of what passes, what changed since it last passed and what blocks next, built from test results and the docs' own tables; nothing is written inside the repo | `tools/progress_dashboard.py` |
 
+Localized string tables are decoded by `tools/text_tables.py` ([docs/text.md](docs/text.md)); their language is
+guessed from script (kana, hangul, CJK, Cyrillic, Arabic) or Latin words, and subtitles are joined to dialogue lines
+across languages.
+
 The translator's runtime contract (user SGPRs, push constants, memory model, bindless images, vertex fetch,
 system values) and all the format notes are in [docs/design.md](docs/design.md); the format, asset, runtime
 and validation notes are indexed in [docs/README.md](docs/README.md). The Xbox D3D12 plan is in
