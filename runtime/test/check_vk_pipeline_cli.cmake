@@ -18,12 +18,22 @@ check_invalid(--jobs 4294967296)
 check_invalid(--start -1)
 check_invalid(--max-bytes 1MiB)
 check_invalid(--large-module-bytes -1)
+check_invalid(--isolate-address-space-mib)
+check_invalid(--isolate-address-space-mib 0)
+check_invalid(--isolate-address-space-mib -1)
+check_invalid(--isolate-address-space-mib 17592186044416)
 check_invalid(--slow nonsense)
 check_invalid(--slow nan)
 check_invalid(--slow -0.5)
 check_invalid(--slow 1.2.3)  # strtod must consume the whole token, not just its numeric prefix
 check_invalid(--stage --graphics-only)
 check_invalid(--stats)
+
+execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}" --isolate-address-space-mib 64
+                RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+if(NOT code STREQUAL "2" OR NOT log MATCHES "--isolate-address-space-mib requires --isolate")
+  message(FATAL_ERROR "Expected an isolation mode error, got ${code}\n${log}")
+endif()
 
 function(check_protected_input name)
   execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}" ${ARGN}

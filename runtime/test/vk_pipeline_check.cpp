@@ -64,6 +64,7 @@
 #include <condition_variable>
 #include <cerrno>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -88,6 +89,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <cerrno>
+#endif
+#ifdef __linux__
+#include <sys/resource.h>
 #endif
 
 static PFN_vkGetInstanceProcAddr gipa;
@@ -789,8 +793,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
             "[--max-bytes N] [--large-module-bytes N] [--large-parallel N] [--stage all|cs|graphics | --compute-only | --graphics-only] "
-            "[--stats FILE] [--cache-feedback] [--isolate [--isolate-batch N]] [--inflight-file F] "
-            "[--skip-file F]\n");
+            "[--stats FILE] [--cache-feedback] [--isolate [--isolate-batch N]"
+#ifdef __linux__
+            " [--isolate-address-space-mib N]"
+#endif
+            "] [--inflight-file F] [--skip-file F]\n");
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
@@ -804,6 +811,8 @@ int main(int argc, char** argv) {
     std::string stage_filter = "all";
     bool cache_feedback = false, isolate = false, iso_child = false;
     size_t isolate_batch = 256;
+    constexpr std::uint64_t mib = 1024 * 1024;
+    std::uint64_t isolate_address_space_mib = 0;
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
         auto value = [&]() -> std::string_view {
@@ -851,6 +860,9 @@ int main(int argc, char** argv) {
         else if (a == "--isolate-batch") {   // parsed like the other numbers (#1735); at least one per batch
             valid = number(isolate_batch);
             isolate_batch = std::max<size_t>(1, isolate_batch);
+        } else if (a == "--isolate-address-space-mib") {
+            valid = number(isolate_address_space_mib) && isolate_address_space_mib > 0 &&
+                    isolate_address_space_mib <= std::numeric_limits<std::uint64_t>::max() / mib;
         }
         else if (a.starts_with("--")) {   // not a cache path: an option this build doesn't know
             std::fprintf(stderr, "unknown option %s\n", a.c_str());
@@ -877,6 +889,31 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--isolate cannot be combined with --stats\n");
         return 2;
     }
+    if (isolate_address_space_mib && !isolate && !iso_child) {
+        std::fprintf(stderr, "--isolate-address-space-mib requires --isolate\n");
+        return 2;
+    }
+#ifdef __linux__
+    if (iso_child && !isolate && isolate_address_space_mib) {
+        rlimit limit{};
+        if (getrlimit(RLIMIT_AS, &limit) != 0) {
+            std::perror("getrlimit(RLIMIT_AS)");
+            return 1;
+        }
+        const auto bytes = static_cast<rlim_t>(isolate_address_space_mib * mib);
+        limit.rlim_cur = std::min(limit.rlim_cur, bytes);
+        limit.rlim_max = std::min(limit.rlim_max, bytes);
+        if (setrlimit(RLIMIT_AS, &limit) != 0) {
+            std::perror("setrlimit(RLIMIT_AS)");
+            return 1;
+        }
+    }
+#else
+    if (isolate_address_space_mib) {
+        std::fprintf(stderr, "--isolate-address-space-mib is supported only on Linux\n");
+        return 2;
+    }
+#endif
 #ifdef _WIN32
     if (iso_child) SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 #endif
@@ -948,6 +985,8 @@ int main(int argc, char** argv) {
                                          "--large-module-bytes", std::to_string(large_module_bytes),
                                          "--large-parallel", std::to_string(large_parallel)};
         if (cache_feedback) pass.push_back("--cache-feedback");
+        if (isolate_address_space_mib)
+            pass.insert(pass.end(), {"--isolate-address-space-mib", std::to_string(isolate_address_space_mib)});
         if (!inflight_path.empty()) pass.insert(pass.end(), {"--inflight-file", inflight_path});
         if (!skip_path.empty()) pass.insert(pass.end(), {"--skip-file", skip_path});
         struct Agg { uint32_t mod_ok = 0, mod_bad = 0, pipe_ok = 0, pipe_bad = 0, pipe_skip = 0, big = 0, crashed = 0, fb[3] = {}; };

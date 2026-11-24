@@ -39,7 +39,8 @@ normal driver check. Mesh pipelines on devices without mesh shader support still
 | `--large-module-bytes N` | Compile modules larger than N bytes alone (default 4 MiB; 0 disables isolation). |
 | `--stats FILE` | Write the driver's per-shader statistics as CSV rows `name,stage,statistic,value`. Needs `VK_KHR_pipeline_executable_properties`; use it without `cache.bin`, because a cached pipeline may come without statistics. |
 | `--cache-feedback` | Group successful pipeline creations by `VkPipelineCreationFeedback`: cache hits, no hit reported, and unavailable. |
-| `--isolate` | POSIX only: check in child processes, `--isolate-batch N` modules at a time (default 256), so a crashing module is recorded as `MODULE CRASH` and the pass continues. Not compatible with `--stats`. |
+| `--isolate` | Check in child processes, `--isolate-batch N` modules at a time (default 256), so a crashing module is recorded as `MODULE CRASH` and the pass continues. Not compatible with `--stats`. |
+| `--isolate-address-space-mib N` | Cap each `--isolate` child's virtual address space at N MiB on Linux. A stricter inherited limit takes precedence. |
 | `--inflight-file F` | Keep the modules currently in the driver in F as `name<TAB>phase` lines. It is rewritten by the watchdog and when a large module enters or leaves, and emptied at the end; `make_game.py`'s pipelines stage reads it. |
 | `--skip-file F` | Do not compile modules named one per line in F; each is reported as `MODULE CRASH` and counted as a failed pipeline. `make_game.py` writes F after a crash so the next run checks the rest. |
 
@@ -386,6 +387,10 @@ child processes on native Windows and POSIX:
 ```sh
 vk_pipeline_check <spirv dir> cache.bin --isolate [--isolate-batch 256] [--jobs N ...]
 ```
+
+On Linux, add `--isolate-address-space-mib N` to limit an isolated driver's host allocations before they exhaust
+system memory. This uses `RLIMIT_AS`, which includes virtual mappings and reservations. A limit too low for
+driver setup will stop the run during setup. Choose a budget that leaves room for the rest of the system.
 
 - The parent opens no Vulkan device. It runs this executable, one child at a time, over `--isolate-batch`
   modules (default 256) of the same sorted, stage-filtered list, with the other options passed on (`--jobs` is
