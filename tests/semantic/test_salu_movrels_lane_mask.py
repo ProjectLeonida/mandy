@@ -80,7 +80,7 @@ class MovrelsLaneMaskWave32(unittest.TestCase):
             with self.subTest(lane=lane):
                 self.assertEqual((d, bits), (5, 2))
                 self.assertEqual(ctl_bits, 2)
-                self.assertEqual(ctl_d, 0xFFFFFFFF if lane in (0, 2) else 0)   # a copy stays a mask
+                self.assertEqual(ctl_d, 5)      # the copy stays a mask; store()'s v_mov reads its word
 
     def test_index_from_m0_hits_mask_and_data_neighbours(self):
         # s10 data, s11 a v_cmp mask (lanes 1, 4, 9), s12 data; M0 picks each in turn from a base of s9.

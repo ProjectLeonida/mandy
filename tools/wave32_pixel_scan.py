@@ -196,6 +196,7 @@ def scan_shader(insns):
     """Per-family occurrence counts for one wave32 program (a Counter, empty when nothing matches)."""
     blocks, succ = blocks_of(insns)
     masks_at, _, either_at = lane_masks.analyse(blocks, succ, include_either=True, wave64=False)
+    moves = lane_masks.number_moves(blocks, masks_at, wave64=False)
     hits = Counter()
     for blk in blocks:
         scc_from_mask = False                       # the last SCC writer in this block was a lane-mask SOP
@@ -203,6 +204,8 @@ def scan_shader(insns):
             op = rdna2spirv.base_op(ins["op"])
             masks, either = masks_at.get(id(ins), {}), either_at.get(id(ins), set())
             fam = family_of(ins, masks, either)
+            if not fam and lane_masks.mask_word_operands(ins, masks, moves, wave64=False):
+                fam = "mask_word"       # a lane mask read as a number
             if fam:
                 hits[fam] += 1
             elif op in MASK_BRANCHES or (reads_scc(ins, op) and scc_from_mask):

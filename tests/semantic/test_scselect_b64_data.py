@@ -383,7 +383,7 @@ class LaneMaskPreservationTests(unittest.TestCase):
                 for lane in range(32):
                     in_mask = (lane < 10) if scc else (lane >= 16)
                     want_v1 = 0x55 if (scc == 0 or in_mask) else 0xAA
-                    want_s4 = MASK32 if in_mask else 0
+                    want_s4 = 0x3FF if scc else 0xFFFF0000      # v_mov_b32 reads the mask's word
                     self.assertEqual(outs[lane], (want_cnt, want_v1, scc, want_s4), f"lane={lane}")
 
     def test_wave64_vcc_exec_and_sgpr_masks(self):

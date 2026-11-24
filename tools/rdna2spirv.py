@@ -1705,14 +1705,15 @@ class Gen:
     def lane_local(self, ins):
         """True when ins only reads and writes this invocation's own registers, and its VGPR writes are the only
         ones EXEC gates. Each invocation is one lane, so skipping it where the lane is inactive is the same as
-        keeping the old value of everything it writes: what dst()'s per-write OpSelect does. A lane mask read as
-        data is this lane's bit (only s_bcnt1, s_ff1 and v_mbcnt gather the whole wave's); a mask on its way
+        keeping the old value of everything it writes: what dst()'s per-write OpSelect does. An op that
+        rebuilds a mask's word from every lane (mask_words) is not; a mask on its way
         through a VGPR (mask_writes) is written in every lane, so it stays out."""
         op = base_op(ins["op"])
         a = ins["args"]
         return (op.startswith("v_") and op not in NOOPS and not op.startswith(NOT_LANE_LOCAL) and "_co_" not in op
                 and not ins["op"].endswith("_dpp") and not any(m.startswith(DPP_MODS) for m in ins["mods"])
-                and bool(a) and a[0]["k"] == "vgpr" and id(ins) not in self.mask_writes)
+                and bool(a) and a[0]["k"] == "vgpr" and id(ins) not in self.mask_writes
+                and not ins.get("mask_words"))
 
     def insns(self, seq):
         """Translate seq, a straight run of instructions (no branch among them). A run of at least MIN_ACTIVE_RUN
@@ -6106,6 +6107,16 @@ class Gen:
         after the real registers in the %sgpr array (the array grows by as many)."""
         self.lane_masks, self.mask_writes, self.lane_either = lane_masks.analyse(*blocks, include_either=True,
                                                                                 wave64=self.wave64)
+        moves = lane_masks.number_moves(blocks[0], self.lane_masks, self.wave64)
+        if moves:       # these VGPRs get the mask's word, so they hold data from here on
+            self.lane_masks, self.mask_writes, self.lane_either = lane_masks.analyse(
+                *blocks, include_either=True, wave64=self.wave64, moves=moves)
+        for blk in blocks[0]:
+            for ins in blk:
+                words = lane_masks.mask_word_operands(ins, self.lane_masks.get(id(ins), {}), moves, self.wave64)
+                ins.pop("mask_words", None)
+                if words:
+                    ins["mask_words"] = words   # read by insn() and by the emulation planner
         # lane_masks merges a mask on one path with plain data on another by dropping the register,
         # so "not in cur_masks" does not prove it is data on every path. Keep a conservative set.
         self.ever_mask = {r for m in self.lane_masks.values() for r in m if isinstance(r, int)}
@@ -7128,6 +7139,13 @@ class Gen:
         if self.emulate:
             self.x_memory_order(base_op(ins["op"]))
         self.cur_either = self.lane_either.get(id(ins), ())
+        if ins.get("mask_words"):
+            # a lane mask read as a number: the wave's mask word instead of this lane's 0 / ~0
+            args = list(ins["args"])
+            for i in ins["mask_words"]:
+                args[i] = {**{k: v for k, v in args[i].items() if k not in ("r", "n", "t")},
+                           "k": "ssa", "v": self.lane_mask_word(args[i])}
+            ins = {**ins, "args": args}
         try:
             if ins["op"].endswith("_dpp"):
                 bop = base_op(ins["op"])

@@ -52,6 +52,19 @@ SGPR_REL_DST = ("s_movreld_b32", "s_movreld_b64", "s_movrelsd_2_b32")
 VECTOR_BITWISE = ("v_mov_b32", "v_or3_b32", "v_or_b32", "v_and_b32", "v_and_or_b32",
                   "v_xor_b32", "v_xor3_b32", "v_xnor_b32", "v_bfi_b32", "v_not_b32")
 
+# 32-bit integer ops that use their sources as numbers: a lane mask they read has to be the wave's mask word, so the
+# translator rebuilds it from the lanes' bits (SHADER-MASK-AS-DATA). Bitwise ops, selects and compares are not here:
+# they work on the lane's own bit, or have a mask path of their own.
+NUMBER_READERS = frozenset((
+    "s_add_u32", "s_add_i32", "s_sub_u32", "s_sub_i32", "s_addc_u32", "s_subb_u32", "s_mul_i32", "s_mul_hi_u32",
+    "s_mul_hi_i32", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32", "s_bfe_u32", "s_bfe_i32", "s_min_u32", "s_min_i32",
+    "s_max_u32", "s_max_i32", "s_brev_b32", "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32",
+    "s_lshl4_add_u32",
+    "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32",
+    "v_mul_lo_u32", "v_mul_hi_u32", "v_min_u32", "v_max_u32", "v_min_i32", "v_max_i32", "v_bfe_u32", "v_bfe_i32",
+    "v_add3_u32", "v_lshl_add_u32", "v_add_lshl_u32", "v_bcnt_u32_b32",
+))
+
 
 def base_op(op):
     for suffix in ("_e32", "_e64", "_sdwa", "_dpp"):
@@ -141,7 +154,51 @@ def lane_slot(vgpr, lane):
     return ("lane", vgpr["r"], lane["v"] & 63)
 
 
-def step(state, ins, wave64=True):
+def mask_word_source(state, a, wave64=True):
+    """Whether operand `a` is one 32-bit scalar register that holds a lane mask (or half of one) in `state`."""
+    if a["k"] == "special":
+        t = a.get("t", "")
+        if t == "exec_lo" or (t == "exec_hi" and wave64):
+            return True
+        if t in ("vcc_lo", "vcc_hi"):
+            return state.get("vcc_hi" if t == "vcc_hi" and not wave64 else "vcc") in MASK_KINDS
+        return False
+    return a["k"] == "sgpr" and a.get("n", 1) == 1 and state.get(a["r"]) in MASK_KINDS
+
+
+def _plain_move(ins):
+    a = ins["args"]
+    return (base_op(ins["op"]) == "v_mov_b32" and not ins["op"].endswith(("_sdwa", "_dpp", "_dpp8")) and len(a) == 2
+            and not ins.get("mods") and a[0]["k"] == "vgpr"
+            and not any(a[1].get(m) for m in ("neg", "abs", "sext")))
+
+
+def number_moves(blocks, masks, wave64=True):
+    """The v_mov_b32 of a mask into a VGPR that nothing reads as a mask afterwards: ids of the instructions.
+
+    A VGPR counts as read as a mask anywhere in the program if a vector bitwise op that makes a mask of it, or
+    v_readfirstlane, reads it while it holds one (the v_mov / v_or3 / v_readfirstlane idiom). The whole register
+    is then left as it was, for every move into it."""
+    moves, used = [], set()
+    for blk in blocks:
+        for ins in blk:
+            op, a, state = base_op(ins["op"]), ins["args"], masks.get(id(ins), {})
+            if _plain_move(ins) and mask_word_source(state, a[1], wave64):
+                moves.append((id(ins), a[0]["r"]))
+            elif op in VECTOR_BITWISE or op == "v_readfirstlane_b32":
+                used.update(x["r"] for x in a[1:] if x["k"] == "vgpr" and ("v", x["r"]) in state)
+    return {i for i, r in moves if r not in used}
+
+
+def mask_word_operands(ins, state, moves=frozenset(), wave64=True):
+    """Indices of the operands of `ins` that read a lane mask as a number."""
+    op, a = base_op(ins["op"]), ins["args"]
+    if id(ins) not in moves and (op not in NUMBER_READERS or ins["op"].endswith(("_sdwa", "_dpp", "_dpp8"))):
+        return ()
+    return tuple(i for i in range(1, len(a)) if mask_word_source(state, a[i], wave64))
+
+
+def step(state, ins, wave64=True, moves=frozenset()):
     """Update `state` (register -> MASK | MASK_LO | MASK_HI | EITHER) for one instruction. True if it writes a mask to a VGPR.
 
     `wave64` False: the program runs in 32-lane waves, where a 64-bit s_bfm_b64 result can't be a lane mask."""
@@ -207,7 +264,7 @@ def step(state, ins, wave64=True):
         written = range(a[0]["r"], a[0]["r"] + a[0].get("n", 1))
         for key in [k for k in state if isinstance(k, tuple) and k[1] in written]:
             del state[key]
-        if None not in kinds and any(k in MASK_KINDS for k in kinds):
+        if id(ins) not in moves and None not in kinds and any(k in MASK_KINDS for k in kinds):
             ms = {k for k in kinds if k in MASK_KINDS}
             state[("v", a[0]["r"])] = ms.pop() if len(ms) == 1 else MASK
             # A plain copy (v_mov_b32) is an ordinary VALU write: inactive lanes keep the old
@@ -269,7 +326,7 @@ def parked(blocks, masks):
     return sorted(found)
 
 
-def analyse(blocks, succ, *, include_either=False, wave64=True):
+def analyse(blocks, succ, *, include_either=False, wave64=True, moves=frozenset()):
     entry = [None] * len(blocks)                        # None: not reached yet
     if blocks:
         entry[0] = {}
@@ -278,7 +335,7 @@ def analyse(blocks, succ, *, include_either=False, wave64=True):
         n = work.pop()
         state = dict(entry[n])
         for ins in blocks[n]:
-            step(state, ins, wave64)
+            step(state, ins, wave64, moves)
         for s in succ[n]:
             if entry[s] is None:
                 merged = dict(state)
@@ -304,6 +361,6 @@ def analyse(blocks, succ, *, include_either=False, wave64=True):
             out[id(ins)] = {r: k for r, k in state.items() if k in MASK_KINDS}
             if include_either:
                 either[id(ins)] = {r for r, k in state.items() if k == EITHER}
-            if step(state, ins, wave64):
+            if step(state, ins, wave64, moves):
                 writes.add(id(ins))
     return (out, writes, either) if include_either else (out, writes)
