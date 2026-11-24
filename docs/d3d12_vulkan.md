@@ -407,12 +407,17 @@ What is implemented (all of it testable without the game):
     `d3d12_uav_clear_test`). An `ALLOW_RENDER_TARGET` texture (with or without `ALLOW_UNORDERED_ACCESS`) on a GPU
     whose `E5B9G9R9` lacks `COLOR_ATTACHMENT` or `STORAGE_IMAGE` (for example NVIDIA) is instead an
     `R16G16B16A16_SFLOAT` image (`Format::r9g9b9e5_as_half`): fp16 holds every shared-exponent value exactly (9
-    mantissa bits, exponents down to 2^-24), at twice the memory per texel. Every view — RTV, SRV, UAV and T# — is
+    mantissa bits, exponents down to 2^-24), at twice the memory per texel. fp16 is a superset of RGB9E5: it also
+    keeps negative and per-channel-precision writes that the console clamps to 0 and shares one exponent for, so a
+    blended fp16 image can hold values the console never stores (a readback quantises back to RGB9E5 with the
+    console's rule). Every view — RTV, SRV, UAV and T# — is
     fp16, the PSO's render-target format follows the image, and `CheckFeatureSupport` advertises `RENDER_TARGET`.
-    The resource is GPU-owned (a `DEFAULT`-heap render target), so no CPU layout depends on the format and
-    `GetCopyableFootprints` still reports the logical 4-byte layout; `ALLOW_DEPTH_STENCIL`, `DENY_SHADER_RESOURCE`
-    and multisampled RT+UAV stay refused, and where fp16 cannot back it the request is refused as before
-    (`d3d12_r9g9b9e5_uav_test` §7);
+    `GetCopyableFootprints` still reports the logical 4-byte layout, and copies through it convert between the
+    RGB9E5 words and the fp16 image in the depth24 compute pass (`Depth24Job::rgb9e5`, the rgb96 repack's machinery):
+    a footprint readback packs fp16 to RGB9E5 with the same WARP-matching rule as the UAV clear, an upload decodes
+    losslessly, and a `CopyResource` to or from a native `E5B9G9R9` texture converts the same way rather than being
+    refused. `ALLOW_DEPTH_STENCIL`, `DENY_SHADER_RESOURCE` and multisampled RT+UAV stay refused, and where fp16
+    cannot back it the request is refused as before (`d3d12_r9g9b9e5_uav_test` §7–§9);
   - the descriptor shader samples `B5G5R5A1_UNORM` through a 2D SRV. Opaque and transparent red check bit 15,
     and mixed-channel texels check the five-bit color fields;
   - `B5G5R5A1_UNORM` with `ALLOW_UNORDERED_ACCESS` on a GPU whose `VK_FORMAT_A1R5G5B5_UNORM_PACK16` lacks

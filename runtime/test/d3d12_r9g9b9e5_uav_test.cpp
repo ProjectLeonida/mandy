@@ -821,24 +821,19 @@ int main() {
 #endif
 
         // 7. Render-target fallback: where E5B9G9R9 cannot attach or store, an RT-flagged format-67 texture is an
-        //    RGBA16F image (Format::r9g9b9e5_as_half). Create the RT+UAV texture the Series S boot asks for, clear it
-        //    through the render-target view, and read the fp16 texels back. fp16 holds every shared-exponent value
-        //    exactly, so the clear colors land bit-exact. Skipped where the format is native or fp16 cannot back it.
+        //    RGBA16F image (Format::r9g9b9e5_as_half). Create the RT+UAV texture the Series S boot asks for and clear
+        //    it through the render-target view. Sections 8 and 9 read it back through the logical footprint a title
+        //    uses. Skipped where the format is native or fp16 cannot back it.
         if (half_targets) {
-            constexpr UINT kW = 64, kH = 32, kPitch = 512;  // 64 fp16 texels * 8 bytes = 512 (256-aligned)
+            constexpr UINT kW = 64, kH = 32;
             const auto rt_desc = tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, kW, kH, 1, 1,
                                           DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
                                           D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-            Ref<ID3D12Resource> tex, readback;
+            Ref<ID3D12Resource> tex;
             EXPECT(SUCCEEDED(device->CreateCommittedResource(&def_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
                                                              D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
                                                              IID_PPV_ARGS(&tex.p))));
             EXPECT(tex->GetDesc().Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP);
-            const D3D12_HEAP_PROPERTIES rb_heap{D3D12_HEAP_TYPE_READBACK};
-            const auto rb_desc = buf_desc(UINT64(kPitch) * kH);
-            EXPECT(SUCCEEDED(device->CreateCommittedResource(&rb_heap, D3D12_HEAP_FLAG_NONE, &rb_desc,
-                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                             IID_PPV_ARGS(&readback.p))));
 
             Ref<ID3D12DescriptorHeap> rtv_heap7;
             const D3D12_DESCRIPTOR_HEAP_DESC rtv_hd7{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
@@ -867,42 +862,116 @@ int main() {
             list7->ClearRenderTargetView(rtv7, green, 1, &rect);
             const auto to_src = transition(tex.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
             list7->ResourceBarrier(1, &to_src);
-            // The image is fp16, so the readback footprint is fp16 (8-byte texels); the logical format-67 footprint
-            // GetCopyableFootprints reports is the GPU-owned layout the title never copies through.
-            D3D12_TEXTURE_COPY_LOCATION dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-            dst.PlacedFootprint = {0, {DXGI_FORMAT_R16G16B16A16_FLOAT, kW, kH, 1, kPitch}};
-            D3D12_TEXTURE_COPY_LOCATION src{tex.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-            src.SubresourceIndex = 0;
-            list7->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            // Execute the clears; the texture stays COPY_SOURCE for the logical-footprint readback (8) and the
+            // CopyResource to a native texture (9) below.
             EXPECT(SUCCEEDED(list7->Close()));
             ID3D12CommandList* lists7[] = {list7.p};
             queue7->ExecuteCommandLists(1, lists7);
             EXPECT(rt::d3d12::last_execute_result(queue7.p) == leonida::ReplayResult::success);
             EXPECT(SUCCEEDED(queue7->Signal(fence7.p, 1)) && SUCCEEDED(fence7->SetEventOnCompletion(1, nullptr)));
+            std::printf("R9G9B9E5 render-target fallback: RGBA16F image, %ux%u clears recorded\n", kW, kH);
 
-            void* mapped = nullptr;
-            EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
-            unsigned wrong = 0;
-            for (UINT y = 0; y < kH; ++y) {
-                for (UINT x = 0; x < kW; ++x) {
-                    std::uint16_t texel[4] = {};
-                    std::memcpy(texel, static_cast<const std::uint8_t*>(mapped) + y * kPitch + x * 8, sizeof(texel));
-                    const bool inside = x >= UINT(rect.left) && x < UINT(rect.right) && y >= UINT(rect.top) &&
-                                        y < UINT(rect.bottom);
-                    const std::uint16_t one = 0x3C00;  // fp16 1.0
-                    const std::uint16_t want[4] = {inside ? std::uint16_t(0) : one,
-                                                   inside ? one : std::uint16_t(0),
-                                                   0,
-                                                   inside ? std::uint16_t(0) : one};
-                    for (UINT c = 0; c < 4; ++c)
-                        if (texel[c] != want[c] && wrong++ < 4)
-                            std::fprintf(stderr, "fp16 texel (%u, %u) ch %u = 0x%04x, want 0x%04x\n",
-                                         x, y, c, texel[c], want[c]);
+            // 8. A title copies through the logical format-67 footprint GetCopyableFootprints reports (4-byte texels,
+            //    RowPitch 256), not the fp16 image's layout. The readback repacks fp16 to RGB9E5 words (depth24 pass,
+            //    rgb9e5 mode); the submission must succeed, not be dropped (PR #592 review).
+            {
+                D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+                UINT fp_rows = 0;
+                UINT64 fp_row_bytes = 0, fp_total = 0;
+                const auto fp_desc = tex->GetDesc();
+                device->GetCopyableFootprints(&fp_desc, 0, 1, 0, &fp, &fp_rows, &fp_row_bytes, &fp_total);
+                EXPECT(fp.Footprint.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP);
+                EXPECT(fp.Footprint.RowPitch == 256);
+                EXPECT(fp_total == UINT64(256) * kH);
+                Ref<ID3D12Resource> rb8;
+                const D3D12_HEAP_PROPERTIES rb_heap8{D3D12_HEAP_TYPE_READBACK};
+                const auto rb_desc8 = buf_desc(fp_total);
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&rb_heap8, D3D12_HEAP_FLAG_NONE, &rb_desc8,
+                                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                 IID_PPV_ARGS(&rb8.p))));
+                EXPECT(SUCCEEDED(alloc7->Reset()));
+                EXPECT(SUCCEEDED(list7->Reset(alloc7.p, nullptr)));
+                D3D12_TEXTURE_COPY_LOCATION dst8{rb8.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+                dst8.PlacedFootprint = fp;
+                D3D12_TEXTURE_COPY_LOCATION src8{tex.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+                src8.SubresourceIndex = 0;
+                list7->CopyTextureRegion(&dst8, 0, 0, 0, &src8, nullptr);
+                EXPECT(SUCCEEDED(list7->Close()));
+                ID3D12CommandList* lists8[] = {list7.p};
+                queue7->ExecuteCommandLists(1, lists8);
+                EXPECT(rt::d3d12::last_execute_result(queue7.p) == leonida::ReplayResult::success);
+                EXPECT(SUCCEEDED(queue7->Signal(fence7.p, 2)) && SUCCEEDED(fence7->SetEventOnCompletion(2, nullptr)));
+                void* mapped8 = nullptr;
+                EXPECT(SUCCEEDED(rb8->Map(0, nullptr, &mapped8)));
+                unsigned wrong8 = 0;
+                for (UINT y = 0; y < kH; ++y) {
+                    for (UINT x = 0; x < kW; ++x) {
+                        std::uint32_t word = 0;
+                        std::memcpy(&word, static_cast<const std::uint8_t*>(mapped8) + y * 256 + x * 4, sizeof(word));
+                        const bool inside = x >= UINT(rect.left) && x < UINT(rect.right) && y >= UINT(rect.top) &&
+                                            y < UINT(rect.bottom);
+                        const std::uint32_t want = inside ? 0x80020000u : 0x80000100u;  // green / red, exponent 16
+                        if (word != want && wrong8++ < 4)
+                            std::fprintf(stderr, "RGB9E5 texel (%u, %u) = 0x%08x, want 0x%08x\n", x, y, word, want);
+                    }
                 }
+                rb8->Unmap(0, nullptr);
+                EXPECT(wrong8 == 0);
+                std::printf("R9G9B9E5 logical-footprint readback: %ux%u RGB9E5 words matched\n", kW, kH);
             }
-            readback->Unmap(0, nullptr);
-            EXPECT(wrong == 0);
-            std::printf("R9G9B9E5 render-target fallback: RGBA16F image, %ux%u clears matched\n", kW, kH);
+
+            // 9. CopyResource from the fp16-backed RT into a plain format-67 texture (native E5B9G9R9): the 8<->4-byte
+            //    formats convert through the same pass instead of being refused. Read the plain texture back through its
+            //    4-byte footprint and check the same words.
+            {
+                const auto plain_desc = tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, kW, kH, 1, 1,
+                                                 DXGI_FORMAT_R9G9B9E5_SHAREDEXP, D3D12_RESOURCE_FLAG_NONE);
+                Ref<ID3D12Resource> plain, rb9;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&def_heap, D3D12_HEAP_FLAG_NONE, &plain_desc,
+                                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                 IID_PPV_ARGS(&plain.p))));
+                EXPECT(SUCCEEDED(alloc7->Reset()));
+                EXPECT(SUCCEEDED(list7->Reset(alloc7.p, nullptr)));
+                list7->CopyResource(plain.p, tex.p);
+                const auto to_src9 = transition(plain.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list7->ResourceBarrier(1, &to_src9);
+                D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp9{};
+                UINT rows9 = 0;
+                UINT64 row_bytes9 = 0, total9 = 0;
+                device->GetCopyableFootprints(&plain_desc, 0, 1, 0, &fp9, &rows9, &row_bytes9, &total9);
+                const D3D12_HEAP_PROPERTIES rb_heap9{D3D12_HEAP_TYPE_READBACK};
+                const auto rb_desc9 = buf_desc(total9);
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&rb_heap9, D3D12_HEAP_FLAG_NONE, &rb_desc9,
+                                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                 IID_PPV_ARGS(&rb9.p))));
+                D3D12_TEXTURE_COPY_LOCATION dst9{rb9.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+                dst9.PlacedFootprint = fp9;
+                D3D12_TEXTURE_COPY_LOCATION src9{plain.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+                src9.SubresourceIndex = 0;
+                list7->CopyTextureRegion(&dst9, 0, 0, 0, &src9, nullptr);
+                EXPECT(SUCCEEDED(list7->Close()));
+                ID3D12CommandList* lists9[] = {list7.p};
+                queue7->ExecuteCommandLists(1, lists9);
+                EXPECT(rt::d3d12::last_execute_result(queue7.p) == leonida::ReplayResult::success);
+                EXPECT(SUCCEEDED(queue7->Signal(fence7.p, 3)) && SUCCEEDED(fence7->SetEventOnCompletion(3, nullptr)));
+                void* mapped9 = nullptr;
+                EXPECT(SUCCEEDED(rb9->Map(0, nullptr, &mapped9)));
+                unsigned wrong9 = 0;
+                for (UINT y = 0; y < kH; ++y) {
+                    for (UINT x = 0; x < kW; ++x) {
+                        std::uint32_t word = 0;
+                        std::memcpy(&word, static_cast<const std::uint8_t*>(mapped9) + y * 256 + x * 4, sizeof(word));
+                        const bool inside = x >= UINT(rect.left) && x < UINT(rect.right) && y >= UINT(rect.top) &&
+                                            y < UINT(rect.bottom);
+                        const std::uint32_t want = inside ? 0x80020000u : 0x80000100u;
+                        if (word != want && wrong9++ < 4)
+                            std::fprintf(stderr, "CopyResource texel (%u, %u) = 0x%08x, want 0x%08x\n", x, y, word, want);
+                    }
+                }
+                rb9->Unmap(0, nullptr);
+                EXPECT(wrong9 == 0);
+                std::printf("R9G9B9E5 CopyResource to native texture: %ux%u words matched\n", kW, kH);
+            }
         }
     }
 

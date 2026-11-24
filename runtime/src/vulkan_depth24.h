@@ -1,5 +1,7 @@
 // Also the repack of 96-bit R32G32B32 texels, held in R32G32B32A32 images (Depth24Job::rgb96, D3D-62): the same
 // scratch, parts and lifetime, with texels of three words in the footprint and four in the scratch.
+// Also the conversion of R9G9B9E5 words and fp16 texels for an fp16-backed render target (Depth24Job::rgb9e5,
+// RT-RGB9E5-HALF): one word in the footprint, two in the scratch, decoded or quantised rather than repacked.
 //
 // The compute pass behind D24_UNORM_S8_UINT on a GPU without D24 (depth24.h, depth24_convert.comp). A copy between a
 // footprint and the depth aspect of such a texture goes through a scratch buffer of floats: an upload converts the
@@ -110,7 +112,8 @@ public:
     void run(VkCommandBuffer command_buffer, const Depth24Job& job) const {
         struct Push {
             std::uint32_t width, height, slices, to_float, app_base, app_row, app_slice, scratch_base;
-        } push{job.width, job.height, job.slices, (job.to_float ? 1u : 0u) | (job.rgb96 ? 2u : 0u), job.app_base_words,
+        } push{job.width, job.height, job.slices,
+               (job.to_float ? 1u : 0u) | (job.rgb96 ? 2u : 0u) | (job.rgb9e5 ? 4u : 0u), job.app_base_words,
                job.app_row_words, job.app_slice_words, job.scratch_base_words};
         vk_.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         vk_.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &job.set, 0,

@@ -93,6 +93,9 @@ struct ResourceBinding {
     // A D3D12 R32G32B32 texture (12 bytes a texel) held in an R32G32B32A32 image (16): footprints keep D3D12's 12
     // bytes, and copies between it and a buffer are repacked by the depth24 pass (Depth24Job::rgb96).
     bool rgb96 = false;
+    // An R9G9B9E5_SHAREDEXP render target held in an R16G16B16A16_SFLOAT image (Format::r9g9b9e5_as_half): its
+    // footprint keeps D3D12's 4 bytes, and copies convert between the RGB9E5 words and the fp16 image (rgb9e5 pass).
+    bool rgb9e5 = false;
     bool color_attachment = false;     // has COLOR_ATTACHMENT usage: unordered-access rectangle clears need it
     bool sampled = false;              // has SAMPLED usage (no DENY_SHADER_RESOURCE): the present compose pass reads it
     bool host_readable = false;        // D3D12_HEAP_TYPE_READBACK (or CUSTOM write-back): needs host-read flush
@@ -490,6 +493,7 @@ inline constexpr std::uint32_t rgb96_bytes = 12;
 inline BlockFormat copy_block_format(const ResourceBinding& resource, VkImageAspectFlags aspect) {
     BlockFormat format = block_format(resource.format, aspect);
     if (resource.rgb96 && format.bytes) format.bytes = rgb96_bytes;
+    if (resource.rgb9e5 && format.bytes) format.bytes = 4;  // the logical R9G9B9E5 texel, not the fp16 image's 8
     return format;
 }
 
@@ -1020,6 +1024,8 @@ struct Prepared {
                                // (or a copy of an rgb96 texture: repacked by the same pass)
     std::uint32_t rgb96_row_words = 0;    // an rgb96 footprint: words between its rows and between its slices
     std::uint32_t rgb96_slice_words = 0;
+    std::uint32_t rgb9e5_row_words = 0;   // an fp16-backed R9G9B9E5 footprint: the same, in 4-byte words
+    std::uint32_t rgb9e5_slice_words = 0;
     Depth24Job depth24;                    // the whole copy: where its scratch floats are
     std::vector<Depth24Job> depth24_parts;  // the dispatches that convert it
     // A depth <-> colour copy: the source into `staged` (image to buffer), then `staged` into the destination.
@@ -1857,10 +1863,15 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     region.imageSubresource = {range.aspectMask, range.baseMipLevel, range.baseArrayLayer, 1};
     region.imageOffset = {std::int32_t(texture_x), std::int32_t(texture_y), std::int32_t(texture_z)};
     region.imageExtent = {w, h, depth};
-    if (image.rgb96) {  // the repack's scratch replaces this buffer in the copy; these are for the pass
+    if (image.rgb96 || image.rgb9e5) {  // the pass's scratch replaces this buffer in the copy; these are for the pass
         if (placed.row_pitch / 4 > UINT32_MAX || slice_pitch / 4 > UINT32_MAX) return ReplayResult::unsupported;
-        p.rgb96_row_words = std::uint32_t(placed.row_pitch / 4);
-        p.rgb96_slice_words = std::uint32_t(slice_pitch / 4);
+        if (image.rgb96) {
+            p.rgb96_row_words = std::uint32_t(placed.row_pitch / 4);
+            p.rgb96_slice_words = std::uint32_t(slice_pitch / 4);
+        } else {
+            p.rgb9e5_row_words = std::uint32_t(placed.row_pitch / 4);
+            p.rgb9e5_slice_words = std::uint32_t(slice_pitch / 4);
+        }
         region.bufferRowLength = 0;
         region.bufferImageHeight = 0;
     }
@@ -1920,7 +1931,7 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
         dst.depth != src.depth || dst.volume != src.volume || dst.mip_levels != src.mip_levels ||
         dst.array_layers != src.array_layers || (dst.aspects != src.aspects && !depth_colour_pair(dst, src)) ||
         dst.samples != src.samples || dst.rgb96 != src.rgb96 ||
-        block_format(dst.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes != block_format(src.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes)
+        copy_block_format(dst, VK_IMAGE_ASPECT_COLOR_BIT).bytes != copy_block_format(src, VK_IMAGE_ASPECT_COLOR_BIT).bytes)
         return ReplayResult::invalid_copy;
     // A depth <-> colour pair has one aspect on each side; the copies name each side's own (staged by the caller).
     const bool cross = dst.aspects != src.aspects;
@@ -2793,8 +2804,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     p.buffer_image_copies[0].imageSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT;
                 const bool rgb96_footprint = result == ReplayResult::success && image.rgb96 &&
                     !p.buffer_image_copies.empty();
+                const bool rgb9e5_footprint = result == ReplayResult::success && image.rgb9e5 &&
+                    !p.buffer_image_copies.empty();
                 // Without a segment pool, refuse before allocating conversion scratch/descriptors.
-                if (statistics_active && !statistics_helpers && (depth24_footprint || rgb96_footprint)) return ReplayResult::unsupported;
+                if (statistics_active && !statistics_helpers && (depth24_footprint || rgb96_footprint || rgb9e5_footprint))
+                    return ReplayResult::unsupported;
                 if (depth24_footprint) {
                     const VkBufferImageCopy& region = p.buffer_image_copies[0];
                     const ResourceBinding& buffer = upload ? p.source : p.binding;
@@ -2825,6 +2839,23 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     job.slices = region.imageExtent.depth;
                     job.app_row_words = p.rgb96_row_words;
                     job.app_slice_words = p.rgb96_slice_words;
+                    if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) return ReplayResult::unsupported;
+                    p.has_depth24 = true;
+                } else if (rgb9e5_footprint) {
+                    // A footprint of an fp16-backed R9G9B9E5 render target: 4-byte words, 8 in the image. Same pass.
+                    const VkBufferImageCopy& region = p.buffer_image_copies[0];
+                    const ResourceBinding& buffer = upload ? p.source : p.binding;
+                    Depth24Job& job = p.depth24;
+                    job.rgb9e5 = true;
+                    job.to_float = upload;
+                    job.app = buffer.buffer;
+                    job.app_offset = region.bufferOffset;
+                    job.app_size = buffer.buffer_offset + buffer.size;
+                    job.width = region.imageExtent.width;
+                    job.height = region.imageExtent.height;
+                    job.slices = region.imageExtent.depth;
+                    job.app_row_words = p.rgb9e5_row_words;
+                    job.app_slice_words = p.rgb9e5_slice_words;
                     if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) return ReplayResult::unsupported;
                     p.has_depth24 = true;
                 }
@@ -2860,6 +2891,56 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     p.staged_writes.push_back(region);
                 }
                 p.image_copies.clear();
+            }
+            if (result == ReplayResult::success && !p.image_copies.empty() && p.binding.rgb9e5 != p.source.rgb9e5) {
+                // An fp16-backed R9G9B9E5 texture and a native E5B9G9R9 one: the same logical format, different texel
+                // sizes. One scratch holds each region's fp16 texels then its RGB9E5 words; the depth24 pass converts
+                // between them (rgb9e5 mode) and the copies move image <-> scratch tightly packed, as depth <-> colour.
+                VkDeviceSize total = 0;
+                std::vector<VkDeviceSize> half_off, word_off;
+                for (const VkImageCopy& c : p.image_copies) {
+                    const VkDeviceSize texels = VkDeviceSize(c.extent.width) * c.extent.height * c.extent.depth *
+                                              c.srcSubresource.layerCount;
+                    half_off.push_back(total);
+                    total += (texels * 8 + 255) / 256 * 256;
+                    word_off.push_back(total);
+                    total += (texels * 4 + 255) / 256 * 256;
+                }
+                VkDeviceSize base = 0;
+                if (!vk.copy_scratch || !vk.copy_scratch(total, p.staged, base) || !vk.depth24_prepare || !vk.depth24_run)
+                    return ReplayResult::unsupported;
+                const bool src_half = p.source.rgb9e5;
+                for (std::size_t r = 0; r < p.image_copies.size(); ++r) {
+                    const VkImageCopy& c = p.image_copies[r];
+                    VkBufferImageCopy region{};
+                    region.bufferOffset = base + (src_half ? half_off[r] : word_off[r]);
+                    region.imageSubresource = c.srcSubresource;
+                    region.imageOffset = c.srcOffset;
+                    region.imageExtent = c.extent;
+                    p.staged_reads.push_back(region);
+                    region.bufferOffset = base + (p.binding.rgb9e5 ? half_off[r] : word_off[r]);
+                    region.imageSubresource = c.dstSubresource;
+                    region.imageOffset = c.dstOffset;
+                    p.staged_writes.push_back(region);
+                    Depth24Job job{};
+                    job.rgb9e5 = true;
+                    job.to_float = !src_half;  // a native source uploads RGB9E5 words to fp16; an fp16 one reads back
+                    job.app = p.staged;
+                    job.app_offset = base + word_off[r];
+                    job.app_size = base + total;
+                    job.scratch = p.staged;
+                    job.scratch_offset = base + half_off[r];
+                    job.width = c.extent.width;
+                    job.height = c.extent.height;
+                    job.slices = c.extent.depth * c.srcSubresource.layerCount;
+                    job.app_row_words = c.extent.width;
+                    job.app_slice_words = c.extent.width * c.extent.height;
+                    std::vector<Depth24Job> parts;
+                    if (!vk.depth24_prepare(job, parts)) return ReplayResult::unsupported;
+                    p.depth24_parts.insert(p.depth24_parts.end(), parts.begin(), parts.end());
+                }
+                p.image_copies.clear();
+                p.has_depth24 = true;
             }
             if (result != ReplayResult::success) return result;
             if (p.binding.host_readable) {
@@ -3719,8 +3800,21 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
                 vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.staged,
                                         std::uint32_t(p.staged_reads.size()), p.staged_reads.data());
-                detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                       VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                if (p.has_depth24) {
+                    // An fp16 <-> R9G9B9E5 conversion: the scratch's fp16 texels become RGB9E5 words (or the reverse)
+                    // before the destination reads them.
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    end_statistics();
+                    for (const auto& part : p.depth24_parts) run_depth24(part);
+                    begin_statistics();
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                           VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                } else {
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                }
                 const VkImageLayout dst_layout = detail::copy_layout(
                     vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);

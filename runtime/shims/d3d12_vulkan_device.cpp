@@ -975,8 +975,9 @@ struct DeviceState {
                   !storage_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)))) {
                 if (!r9g9b9e5_half_targets) return {};
                 // fp16 holds every shared-exponent value exactly (9 mantissa bits, exponents down to 2^-24), so the
-                // render target keeps its values at twice the memory; the resource is GPU-owned, no CPU layout depends
-                // on the format. Every view (RTV, SRV, UAV, T#) is fp16 (Format::r9g9b9e5_as_half).
+                // render target keeps its values at twice the memory. Every view (RTV, SRV, UAV, T#) is fp16
+                // (Format::r9g9b9e5_as_half); copies convert between the logical 4-byte footprint and the fp16 image
+                // (ResourceBinding::rgb9e5, the depth24 pass), so a title's GetCopyableFootprints copy still works.
                 log_once("R9G9B9E5_SHAREDEXP render target unavailable natively, using RGBA16F; format", desc.Format);
                 Format backed{VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT};
                 backed.r9g9b9e5_as_half = true;
@@ -2263,6 +2264,7 @@ public:
         binding.castable_view_formats = !view_formats_.empty();  // a castable list made the image mutable
         binding.uint_backed = format.uint_backed;
         binding.rgb96 = format.rgb96;
+        binding.rgb9e5 = format.r9g9b9e5_as_half;
         binding.depth24_as_float = format.d24_as_float;
         binding.depth24 = format.d24;
         binding.format = format.format;

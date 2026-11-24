@@ -12,6 +12,14 @@
 // 2 and 3). A footprint texel is then three words and a scratch texel four, and the words are copied as they are:
 // to_float == 3 (upload):   scratch[s .. s+2] = app[a .. a+2], scratch[s+3] = 0 (never read: views read alpha as one)
 // to_float == 2 (readback): app[a .. a+2]     = scratch[s .. s+2]
+//
+// The same pass converts R9G9B9E5_SHAREDEXP words and fp16 texels (RT-RGB9E5-HALF; `to_float` 4 and 5): an
+// fp16-backed render target reports a 4-byte footprint but its image holds 8-byte fp16 texels. A footprint texel
+// is one word (the packed RGB9E5) and a scratch texel two (four fp16 channels). fp16 holds every shared-exponent
+// value exactly, so the upload decodes losslessly; the readback quantises as ClearUnorderedAccessViewFloat on WARP
+// (uav_clear.h to_rgb9e5): negatives and NaN 0, overflow and +Inf 65408, mantissas half-up, exponent bump on 512.
+// to_float == 5 (upload):   scratch[s .. s+1] = the fp16 of the decoded app[a] (alpha 1)
+// to_float == 4 (readback): app[a]            = the RGB9E5 of the fp16 scratch[s .. s+1] (alpha dropped)
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -21,7 +29,7 @@ layout(set = 0, binding = 1) buffer Scratch { uint scratch[]; };
 
 layout(push_constant) uniform Push {
     uint width, height, slices;
-    uint to_float;   // 0 and 1: D24 words and floats; 2 and 3: 96-bit texels of 3 and 4 words (see above)
+    uint to_float;   // 0/1: D24 words and floats; 2/3: 96-bit texels (3/4 words); 4/5: R9G9B9E5 words and fp16 (1/2)
     uint app_base;   // first word of the region in `app`, within the bound window
     uint app_row;    // words between rows and between slices of the app buffer
     uint app_slice;
@@ -48,9 +56,45 @@ uint depth24_from_bits(uint bits) {
     return uint(roundEven(uintBitsToFloat(bits) * 16777215.0));
 }
 
+// The RGB9E5 word of three floats, as WARP's ClearUnorderedAccessViewFloat writes it (uav_clear.h to_rgb9e5).
+uint rgb9e5_from_float(float r, float g, float b) {
+    const float max_value = 65408.0;
+    r = (r > 0.0) ? min(r, max_value) : 0.0;  // !(v > 0): negatives and NaN to 0
+    g = (g > 0.0) ? min(g, max_value) : 0.0;
+    b = (b > 0.0) ? min(b, max_value) : 0.0;
+    float max_c = max(r, max(g, b));
+    if (max_c == 0.0) return 0u;
+    // frexp(max_c) exponent + 15; max_c is a normal float (>= 2^-24) after the fp16 decode and clamp.
+    int exp_shared = max(0, ((floatBitsToInt(max_c) >> 23) & 0xff) - 111);
+    float denom = uintBitsToFloat(uint(exp_shared + 103) << 23);  // 2^(exp_shared - 24)
+    if (uint(floor(max_c / denom + 0.5)) == 512u) { ++exp_shared; denom *= 2.0; }
+    uint rm = uint(floor(r / denom + 0.5));
+    uint gm = uint(floor(g / denom + 0.5));
+    uint bm = uint(floor(b / denom + 0.5));
+    return rm | (gm << 9) | (bm << 18) | (uint(exp_shared) << 27);
+}
+
 void main() {
     uvec3 g = gl_GlobalInvocationID;
     if (g.x >= pc.width || g.y >= pc.height || g.z >= pc.slices) return;
+    if ((pc.to_float & 4u) != 0u) {
+        uint a = pc.app_base + g.z * pc.app_slice + g.y * pc.app_row + g.x;
+        uint s = pc.scratch_base + ((g.z * pc.height + g.y) * pc.width + g.x) * 2u;
+        if ((pc.to_float & 1u) != 0u) {
+            uint word = app[a];
+            float scale = uintBitsToFloat(uint(int(word >> 27) + 103) << 23);  // 2^(e - 24), exact
+            float r = float(word & 0x1ffu) * scale;
+            float gg = float((word >> 9) & 0x1ffu) * scale;
+            float b = float((word >> 18) & 0x1ffu) * scale;
+            scratch[s] = packHalf2x16(vec2(r, gg));
+            scratch[s + 1u] = packHalf2x16(vec2(b, 1.0));
+        } else {
+            vec2 rg = unpackHalf2x16(scratch[s]);
+            vec2 ba = unpackHalf2x16(scratch[s + 1u]);
+            app[a] = rgb9e5_from_float(rg.x, rg.y, ba.x);
+        }
+        return;
+    }
     if (pc.to_float >= 2u) {
         uint a = pc.app_base + g.z * pc.app_slice + g.y * pc.app_row + g.x * 3u;
         uint s = pc.scratch_base + ((g.z * pc.height + g.y) * pc.width + g.x) * 4u;

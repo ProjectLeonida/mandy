@@ -57,8 +57,11 @@ inline float depth24_clear_value(float value) { return depth24_to_float(depth24_
 struct Depth24Job {
     bool to_float = false;           // an upload (D24 words to floats); false: a readback (floats to words)
     bool rgb96 = false;              // 96-bit texels: `to_float` is only the direction (true: the upload)
+    // R9G9B9E5 words (one a texel) <-> fp16 texels (two words): an fp16-backed render target's footprint copies
+    // and its copies to and from a native E5B9G9R9 texture convert here (RT-RGB9E5-HALF). `to_float` is the direction.
+    bool rgb9e5 = false;
     std::uint32_t app_texel_words() const { return rgb96 ? 3 : 1; }
-    std::uint32_t scratch_texel_words() const { return rgb96 ? 4 : 1; }
+    std::uint32_t scratch_texel_words() const { return rgb96 ? 4 : rgb9e5 ? 2 : 1; }
     VkBuffer app = VK_NULL_HANDLE;   // the application's buffer
     std::uint64_t app_offset = 0;    // bytes, a multiple of 4
     std::uint64_t app_size = 0;      // bytes in the buffer
