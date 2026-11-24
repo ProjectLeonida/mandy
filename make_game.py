@@ -1320,12 +1320,14 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         log(f"shaders: the fallback flags are now {want_flags or 'none'} (the shaders were translated with "
             f"{had_flags or 'none'}): translating again")
         drop(translated)
-    if os.path.isfile(translated) and translated_index_is_empty(translated):
-        # An empty merge, or an index that cannot be read, is not a finished translation. The shard plan goes with it:
-        # its parts are what the empty merge read, so a retry has to translate them again rather than reuse them.
-        log("shaders: the saved translated index names no shaders: translating again")
-        drop(translated, shard_plan)
-    if not os.path.isfile(translated):
+    if shader_list is not None:
+        # Subset translation: write to a separate directory, never touch the full index.
+        subset_spirv = os.path.join(spirv, "subset")
+        os.makedirs(subset_spirv, exist_ok=True)
+        log(f"shaders: translating listed shaders to {subset_spirv}")
+        translate(disasm, subset_spirv, jobs, emulate=emulate, fallbacks=fallbacks,
+                  shader_list=shader_list)
+    elif not os.path.isfile(translated):
         need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
         need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
         log(f"shaders: translating RDNA2 to SPIR-V on {jobs} processes (the longest step)")
@@ -1339,13 +1341,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
             f.write(want_flags + "\n")
         with open(sources_file, "w", encoding="utf-8", newline="\n") as f:
             f.write(sources + "\n")
-        if shader_list is not None:
-            # A subset translation never reuses a previous full index: drop it so only the listed shaders
-            # are translated and the merged index names just them.
-            drop(translated)
-        translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks,
-                  shader_list=shader_list)
-    if shader_list is None:
+        translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
         verify_translation_completeness(dxbc, spirv)
     native_pso_hashes(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
