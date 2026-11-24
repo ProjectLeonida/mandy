@@ -2451,12 +2451,14 @@ The trace will enumerate them.
     `d3d12_texture_tiles_test` compares initially unmapped tiles, column mappings, aliases, and a fence-delayed
     remap with native D3D12, including clipped edges at 4-byte and byte-unaligned offsets. `CopyTiles` documents no
     alignment for `BufferStartOffsetInBytes`; at a byte-unaligned offset WARP also runs, to confirm the test's
-    expectations (it meets them at every offset tried, 1-8), and the layer is held to them. AMD's Windows D3D12
-    driver (RX 7900 XT, 26.11.2) does not: judging by the texel values (the D3D12 debug layer was not run), it
-    moves whole tiles as if the offset were rounded down to a multiple of 4, in both directions, so a row-major
-    copy finds each texel 1-3 bytes early and texels that straddle a tile seam differ in the `CopyTiles` reads. The
-    test prints a note when a native run matches that rounded-down model at every texel, and fails on any other
-    divergence ([testing.md](testing.md#known-problems)).
+    expectations (it meets them at every offset tried, 1-8), and the layer is held to them. Two Windows D3D12
+    drivers measured so far do not. Judging by the texel values (the D3D12 debug layer was not run), they move
+    whole tiles as if the offset were rounded down to a multiple of 4. AMD's (RX 7900 XT, 26.11.2) does so in both
+    directions, so a row-major copy finds each texel 1-3 bytes early and texels that straddle a tile seam differ in
+    the `CopyTiles` reads. Intel's (Iris Xe, 32.0.101.7092, measured on that host in #964) does so only in the
+    tiles-to-buffer copies, so the row-major copy matches and the `CopyTiles` reads of every nonzero texel differ.
+    The test prints a note when every checked read of a native run matches one of those two models, the same one
+    for every case on the device, and fails on any other divergence ([testing.md](testing.md#known-problems)).
 - `D3D12_RESOURCE_DESC::Layout`: the public `ROW_MAJOR` and `64KB_STANDARD_SWIZZLE` values plus the Xbox `0x101`
   tiled value from slot 76. Row-major textures need `VK_IMAGE_TILING_LINEAR` (not usable for RT/DS) or a staging
   copy; `64KB_STANDARD_SWIZZLE` and `0x101` have no direct Vulkan equivalent. If the game uploads console-tiled data,

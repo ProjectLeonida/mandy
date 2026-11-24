@@ -123,9 +123,11 @@ bool for_each_checked(UINT width, UINT height, UINT64 tile_copy_offset, Visit&& 
 }
 
 // The readback buffer run() leaves if every CopyTiles moves whole 64 KiB tiles (clipped texels too) with its linear
-// offset taken as `linear`, in both directions. `linear` == tile_copy_offset gives the D3D12 rules (main() checks
-// that against the expectations above); tile_copy_offset & ~3 gives the AMD pattern described in main().
-std::vector<std::uint8_t> modelled_readback(UINT width, UINT height, UINT64 tile_copy_offset, UINT64 linear) {
+// offset taken as `upload_linear` when it reads the buffer (to_tiled) and as `readback_linear` when it writes it
+// (to_linear). Both == tile_copy_offset gives the D3D12 rules (main() checks that against the expectations above);
+// the driver patterns described in main() round one or both down to a multiple of 4.
+std::vector<std::uint8_t> modelled_readback(UINT width, UINT height, UINT64 tile_copy_offset, UINT64 upload_linear,
+                                            UINT64 readback_linear) {
     std::vector<std::uint8_t> upload(tile_copy_offset + image_bytes), heap(image_bytes),
         readback(row_major_offset + image_bytes);
     fill_tiles(upload.data() + tile_copy_offset);
@@ -134,10 +136,10 @@ std::vector<std::uint8_t> modelled_readback(UINT width, UINT height, UINT64 tile
     constexpr UINT a_heap_tile[tiles] = {0, 2, 1, 3};
     const auto b_tile = [&](UINT tile) { return heap.data() + a_heap_tile[tile ^ 1] * tile_bytes; };
     for (UINT tile = 0; tile < tiles; ++tile)
-        std::memcpy(heap.data() + a_heap_tile[tile] * tile_bytes, upload.data() + linear + tile * tile_bytes,
+        std::memcpy(heap.data() + a_heap_tile[tile] * tile_bytes, upload.data() + upload_linear + tile * tile_bytes,
                     tile_bytes);
     for (UINT tile = 0; tile < tiles; ++tile)
-        std::memcpy(readback.data() + linear + image_bytes + tile * tile_bytes, b_tile(tile), tile_bytes);
+        std::memcpy(readback.data() + readback_linear + image_bytes + tile * tile_bytes, b_tile(tile), tile_bytes);
     for (UINT y = 0; y < height; ++y)  // CopyTextureRegion, at an aligned footprint
         for (UINT x = 0; x < width; ++x)
             std::memcpy(readback.data() + row_major_offset + (y * full_width + x) * sizeof(std::uint32_t),
@@ -147,15 +149,16 @@ std::vector<std::uint8_t> modelled_readback(UINT width, UINT height, UINT64 tile
     // The gated remap: b's top row reuses heap tile 0 (a's first tile), its bottom row is unmapped (zeros).
     for (UINT tile = 0; tile < tiles; ++tile)
         if (tile < 2)
-            std::memcpy(readback.data() + linear + 2 * image_bytes + tile * tile_bytes, heap.data(), tile_bytes);
+            std::memcpy(readback.data() + readback_linear + 2 * image_bytes + tile * tile_bytes, heap.data(),
+                        tile_bytes);
         else
-            std::memset(readback.data() + linear + 2 * image_bytes + tile * tile_bytes, 0, tile_bytes);
+            std::memset(readback.data() + readback_linear + 2 * image_bytes + tile * tile_bytes, 0, tile_bytes);
     return readback;
 }
 
 // The model with the true offset must reproduce the expectations, or it cannot judge a native divergence.
 bool model_matches_rules(UINT width, UINT height, UINT64 tile_copy_offset) {
-    const auto model = modelled_readback(width, height, tile_copy_offset, tile_copy_offset);
+    const auto model = modelled_readback(width, height, tile_copy_offset, tile_copy_offset, tile_copy_offset);
     return for_each_checked(width, height, tile_copy_offset,
                             [&](const char* read, UINT tile, UINT x, UINT y, UINT64 offset, std::uint32_t expected) {
         if (load(model.data(), offset) == expected) return true;
@@ -164,12 +167,19 @@ bool model_matches_rules(UINT width, UINT height, UINT64 tile_copy_offset) {
     });
 }
 
-// A native run at a byte-unaligned offset reads every texel quietly instead of stopping at the first that breaks the
-// D3D12 rules: how many do, and how many differ from `model` (the readback modelled_readback gives).
-struct Advisory {
-    const std::vector<std::uint8_t>* model = nullptr;
-    std::uint64_t texels = 0, differ = 0, unmodelled = 0;
+// One measured driver pattern: the readback modelled_readback gives for it, and how many checked reads differ from it.
+struct DriverModel {
+    const char* rounding;  // which CopyTiles round the offset down, as the NOTE names it
+    std::vector<std::uint8_t> readback;
+    std::uint64_t unmodelled = 0;
     char first_unmodelled[160] = {};
+};
+
+// A native run at a byte-unaligned offset reads every texel quietly instead of stopping at the first that breaks the
+// D3D12 rules: how many do, and how many differ from each driver model.
+struct Advisory {
+    std::vector<DriverModel> models;
+    std::uint64_t texels = 0, differ = 0;
 };
 
 // False when a call fails, or (unless `advisory`) a texel breaks the D3D12 rules.
@@ -307,15 +317,16 @@ bool run(ID3D12Device& device, UINT width, UINT height, UINT64 tile_copy_offset,
     const auto judge = [&](const char* read, UINT tile, UINT x, UINT y, UINT64 offset, std::uint32_t expected) {
         const auto actual = load(bytes, offset);
         if (advisory) {
-            const auto modelled = load(advisory->model->data(), offset);
             ++advisory->texels;
             advisory->differ += actual != expected;
-            if (actual != modelled) {
-                if (advisory->unmodelled == 0)
-                    std::snprintf(advisory->first_unmodelled, sizeof(advisory->first_unmodelled),
+            for (auto& model : advisory->models) {
+                const auto modelled = load(model.readback.data(), offset);
+                if (actual == modelled) continue;
+                if (model.unmodelled == 0)
+                    std::snprintf(model.first_unmodelled, sizeof(model.first_unmodelled),
                                   "%s tile %u at (%u,%u): got %#x, expected %#x, modelled %#x", read, tile, x, y,
                                   actual, expected, modelled);
-                ++advisory->unmodelled;
+                ++model.unmodelled;
             }
         } else if (actual != expected) {
             std::fprintf(stderr, "%s tile %u at (%u,%u): got %#x, expected %#x\n", read, tile, x, y, actual, expected);
@@ -388,11 +399,15 @@ int main() {
     auto native = native_device();
     // Byte-unaligned CopyTiles offsets. CopyTiles documents no alignment for BufferStartOffsetInBytes, and WARP meets
     // the expectations at every offset tried (1-8), so at such an offset WARP runs too, to confirm them; the layer is
-    // held to the expectations. AMD's Windows D3D12 driver (RX 7900 XT, 26.11.2) does not meet them: judging by the
-    // texel values (the D3D12 debug layer was not run), it moves the tiles as if the offset were rounded down to a
-    // multiple of 4, in both directions. The row-major copy then finds each texel 1-3 bytes early, and texels that
-    // straddle a tile seam differ in the CopyTiles reads too. Such a native run is a NOTE only when every texel
-    // matches that rounded-down model (modelled_readback); any other divergence fails, and so does any texel at a
+    // held to the expectations. Two Windows drivers measured so far do not meet them. Judging by the texel values
+    // (the D3D12 debug layer was not run), they move the tiles as if the offset were rounded down to a multiple of 4:
+    // - AMD (RX 7900 XT, 26.11.2) in both directions. The row-major copy then finds each texel 1-3 bytes early, and
+    //   texels that straddle a tile seam differ in the CopyTiles reads too.
+    // - Intel (Iris Xe, 32.0.101.7092, measured on that host in pull request #964) only in the tiles-to-buffer
+    //   copies: the upload honours the offset, so the row-major copy matches and the CopyTiles reads of every
+    //   nonzero texel differ.
+    // Such a native run is a NOTE only when every checked read matches one of those two models (modelled_readback),
+    // and every case on the device matches the same one; any other divergence fails, and so does any texel at a
     // 4-byte offset.
     const auto warp = warp_device();
     const auto* info = rt::d3d12::vulkan_device_info(vulkan.Get());
@@ -406,6 +421,7 @@ int main() {
                                ReplayCase{240, 240, 4, false}, ReplayCase{256, 240, 1, false},
                                ReplayCase{240, 240, 3, false}, ReplayCase{256, 256, 4, true}};
     if (!dedicated_copy) std::puts("No separate Vulkan copy family for the cross-family case");
+    const char* device_rounding = nullptr;  // the model the first diverging native case matched
     for (const auto& [width, height, linear_offset, separate_copy_queue] : cases) {
         if (separate_copy_queue && !dedicated_copy) continue;
         bool sparse = false;
@@ -426,11 +442,13 @@ int main() {
         if (byte_offset && !model_matches_rules(width, height, linear_offset)) return 1;
         if (native) {
             const UINT rounded_offset = linear_offset & ~3u;
-            std::vector<std::uint8_t> rounded;
             Advisory advisory;
             if (byte_offset) {
-                rounded = modelled_readback(width, height, linear_offset, rounded_offset);
-                advisory.model = &rounded;
+                advisory.models.push_back({"in both directions", modelled_readback(width, height, linear_offset,
+                                                                                   rounded_offset, rounded_offset)});
+                advisory.models.push_back({"only in the tiles-to-buffer copies",
+                                           modelled_readback(width, height, linear_offset, linear_offset,
+                                                             rounded_offset)});
             }
             if (!run(*native.Get(), width, height, linear_offset, expected, false, separate_copy_queue, sparse,
                      byte_offset ? &advisory : nullptr) ||
@@ -438,20 +456,38 @@ int main() {
                 std::fprintf(stderr, "Native D3D12 failed: %u x %u, linear offset %u\n", width, height, linear_offset);
                 return 1;
             }
+            const DriverModel* fit = nullptr;
+            for (const auto& model : advisory.models)
+                if (!model.unmodelled) {
+                    fit = &model;
+                    break;
+                }
             if (!advisory.differ) {
                 std::printf("Native D3D12 matched all %zu verified pixels\n", observed.size());
-            } else if (!advisory.unmodelled) {
+            } else if (fit) {
+                if (device_rounding && std::strcmp(device_rounding, fit->rounding) != 0) {
+                    std::fprintf(stderr, "Native D3D12 failed: %u x %u, linear offset %u matches the offset rounded "
+                                 "down %s, but an earlier case matched it rounded down %s\n", width, height,
+                                 linear_offset, fit->rounding, device_rounding);
+                    return 1;
+                }
                 std::printf("NOTE: native D3D12 broke the expectations at %llu of %llu checked reads, every read as "
-                            "CopyTiles would with linear offset %u rounded down to %u in both directions "
+                            "CopyTiles would with linear offset %u rounded down to %u %s "
                             "(docs/testing.md, Known problems); not a failure\n",
                             static_cast<unsigned long long>(advisory.differ),
-                            static_cast<unsigned long long>(advisory.texels), linear_offset, rounded_offset);
+                            static_cast<unsigned long long>(advisory.texels), linear_offset, rounded_offset,
+                            fit->rounding);
+                device_rounding = fit->rounding;
             } else {
                 std::fprintf(stderr, "Native D3D12 failed: %u x %u, linear offset %u: %llu of %llu checked reads "
-                             "break the expectations, and %llu differ from the rounded-down model; first: %s\n",
+                             "break the expectations\n",
                              width, height, linear_offset, static_cast<unsigned long long>(advisory.differ),
-                             static_cast<unsigned long long>(advisory.texels),
-                             static_cast<unsigned long long>(advisory.unmodelled), advisory.first_unmodelled);
+                             static_cast<unsigned long long>(advisory.texels));
+                for (const auto& model : advisory.models)
+                    std::fprintf(stderr, "  %llu differ from the model with the offset rounded down to %u %s; "
+                                 "first: %s\n",
+                                 static_cast<unsigned long long>(model.unmodelled), rounded_offset, model.rounding,
+                                 model.first_unmodelled);
                 return 1;
             }
         }
