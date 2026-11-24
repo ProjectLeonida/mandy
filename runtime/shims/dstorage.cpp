@@ -400,6 +400,7 @@ File* live_file(IDStorageFileX* p) {
 // memmove that turns an access violation into an error instead of ending the process. No C++ objects here: a
 // function with __try cannot have any that need unwinding.
 bool guarded_move(void* destination, const void* source, size_t size) {
+#ifdef _MSC_VER
     __try {
         std::memmove(destination, source, size);
         return true;
@@ -407,6 +408,33 @@ bool guarded_move(void* destination, const void* source, size_t size) {
                                                                   : EXCEPTION_CONTINUE_SEARCH) {
         return false;
     }
+#else
+    // MinGW has no __try/__except: pre-validate both ranges with VirtualQuery instead. An unreadable source page
+    // or an unwritable destination page returns false, which is what the access violation would have meant; a
+    // use-after-check race can still fault, as with any probe-then-use check.
+    auto range_ok = [](const void* base, size_t len, bool write) {
+        const uintptr_t start = reinterpret_cast<uintptr_t>(base);
+        for (uintptr_t page = start & ~uintptr_t{0xfff}; page < start + len; page += 0x1000) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<LPCVOID>(page), &mbi, sizeof(mbi)) == 0 ||
+                mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+                return false;
+            }
+            const DWORD access = mbi.Protect & 0xff;
+            if (write ? (access != PAGE_READWRITE && access != PAGE_WRITECOPY &&
+                         access != PAGE_EXECUTE_READWRITE && access != PAGE_EXECUTE_WRITECOPY)
+                      : (access != PAGE_READONLY && access != PAGE_READWRITE && access != PAGE_WRITECOPY &&
+                         access != PAGE_EXECUTE_READ && access != PAGE_EXECUTE_READWRITE &&
+                         access != PAGE_EXECUTE_WRITECOPY)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!range_ok(source, size, false) || !range_ok(destination, size, true)) return false;
+    std::memmove(destination, source, size);
+    return true;
+#endif
 }
 
 // Reads one byte of every 4 KiB page of the range from user mode. Title memory that xmem maps from physical pages is
@@ -415,10 +443,17 @@ bool guarded_move(void* destination, const void* source, size_t size) {
 void touch_pages(void* buffer, size_t size) {
     const uintptr_t start = reinterpret_cast<uintptr_t>(buffer);
     for (uintptr_t page = start & ~uintptr_t{0xfff}; page < start + size; page += 0x1000) {
+#ifdef _MSC_VER
         __try {
             (void)*reinterpret_cast<volatile const unsigned char*>(page < start ? start : page);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
+#else
+        // MinGW has no __try/__except: probe the page with VirtualQuery instead of touching it (see the
+        // file_system.cpp touch_pages fallback). Uncommitted pages stay for the kernel to refuse.
+        MEMORY_BASIC_INFORMATION mbi{};
+        (void)VirtualQuery(reinterpret_cast<LPCVOID>(page < start ? start : page), &mbi, sizeof(mbi));
+#endif
     }
 }
 
