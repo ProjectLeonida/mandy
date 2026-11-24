@@ -29,6 +29,7 @@
 #include "vulkan_present_compose.h"
 #include "fsdraw_probe.h"  // LOCAL DIAGNOSTIC
 #include "local_diagnostics.h"
+#include "present_probe.h"
 #include "present_dump.h"
 
 // Use the original EXT spellings. They are aliases of the promoted KHR types and are available in older headers.
@@ -407,9 +408,11 @@ public:
         if (source_rect) pending.rect = *source_rect;
         if (planes) pending.planes = *planes;
         deferred_.push_back(pending);
-        if (const std::uint64_t n = ++probe_deferred_; local_diagnostics() && (n <= 8 || n % 600 == 0))
-            std::fprintf(stderr, "[rt] present-probe: present #%llu queued behind held work (%zu queued)\n",
-                         static_cast<unsigned long long>(n), deferred_.size());
+        if (present_probe::enabled()) {
+            if (const std::uint64_t n = ++probe_deferred_; present_probe::sampled(n, 8, 600))
+                std::fprintf(stderr, "[rt] present-probe: present #%llu queued behind held work (%zu queued)\n",
+                             static_cast<unsigned long long>(n), deferred_.size());
+        }
         last_tore_ = false;
         context_.holds().after_held(this, [this] { run_deferred(); });
         return VK_SUCCESS;
@@ -472,7 +475,7 @@ private:
     VkResult submit_now(const ResourceBinding* binding, ResourceId source, bool vsync, const PresentRect* source_rect,
                         bool srgb, bool tear = false, const PresentPlanes* planes = nullptr) {
         last_tore_ = false;
-        probe_path(binding, source, planes);  // LOCAL DIAGNOSTIC
+        if (present_probe::enabled() || probe_source_) probe_path(binding, source, planes);
         if (!ok_) return VK_ERROR_INITIALIZATION_FAILED;
         if (surface_lost_) {  // the window's display went away under a presented swapchain
             // Try to make a new surface for the same window (the hwnd is retained by the factory's callback).
@@ -769,7 +772,7 @@ private:
             }
         }
         if (id && !resolved) ++probe_unresolved_;
-        if (local_diagnostics() && (n <= 6 || n % 600 == 0))
+        if (present_probe::enabled() && present_probe::sampled(n, 6, 600))
             std::fprintf(stderr,
                          "[rt] present-probe: submit #%llu path %s source 0x%llx resolved %d image %p format %d %ux%u "
                          "mips %u layers %u samples %u sampled %d (blit %llu compose %llu blank %llu unresolved %llu)\n",

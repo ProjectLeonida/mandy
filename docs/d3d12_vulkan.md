@@ -1347,6 +1347,8 @@ and any validation error fails them.
   - the 22 written-or-refused cases behind the table in section 3.2, compared with the host's PC runtime when
     there is one.
 - `xbox_present_test`: `PresentX` and the frame events (section 4.5, "what is implemented"), checked on swapchain pixels.
+- `present_probe_test`: `LEONIDA_PRESENT_PROBE` and `LEONIDA_CAPTURE_SOURCE` (section 4.5), unset and set (`--on`): the
+  same clear, draws and `PresentX` calls show the same frames, with no probe line or source file when unset.
     there is one. A host that reports no non-normalized samplers is compared only on the 3 cases without the
     flag. The other 19 are then checked against their recorded answers only.
 - `d3d12_subgroup_test`: subgroup size control through D3D12 PSOs, on the PSOs of the device proxy.
@@ -3577,6 +3579,24 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   layer actually presented: the window is not readable in every setup (under Wine it is not even mapped), and the
   mean is enough to tell a real frame from a black one. `d3d12_present_test` turns it on and checks the files against
   the colour it clears to.
+- *Source capture* (`LEONIDA_CAPTURE_SOURCE=1`, with `LEONIDA_CAPTURE`): for the same frames, also copies mip 0
+  of the texture the title presented (plane 0 of a composition) to host memory on the presenter's queue, waits for
+  it, and writes `<dir>/source_NNNNN.ppm` (8-bit RGB, clamped) plus one line of `<dir>/source_index.txt` with the
+  path (`blit` or `compose`), the format, the extent, the tracked layout, the mean RGB and how many texels are not
+  zero. The frame capture says what was shown and this says what was handed over, so a black frame can be told from
+  a failed blit or composition. A texture that no tracked operation ever wrote is not read (its line says `never
+  written`), nor is a multisampled or block-compressed one. Off unless the variable is set (anything but empty or
+  `0`).
+- *Present probe* (`LEONIDA_PRESENT_PROBE=1`, `runtime/src/present_probe.h`): `[rt] present-probe:` lines on stderr
+  for a frame that is presented but shows nothing. `ClearRenderTargetView` logs the target and the colour; a draw
+  logs its pipeline, render target, viewport and scissor, and whether it was recorded or dropped for want of a
+  viewport; `PresentX` logs the plane count, tokens, resources and flags of a call and, when a check refuses it,
+  which check and the `HRESULT`; the presenter logs the path of each submitted present (`blit`, `compose` or
+  `blank`), the source's id, format, extent, mips, layers and samples, whether the id still resolves, and the
+  running count per path; a present queued behind held work is counted too. Each kind of line is written for the
+  first few events and then for every 600th (draws: every 1200th), and the lines hold ids, sizes, formats, counts
+  and result codes, never the contents of a buffer or texture. Unset (or empty, or `0`), nothing is written and no
+  counter is kept. `present_probe_test` runs the same clear, draws and presents with both variables unset and set.
 - *`SuspendX`/`ResumeX`*: suspend drops the interval, the origin event and the frames in flight, wakes blocked waits
   with `ERROR_INVALID_STATE` and refuses presents (a `PresentX` waiting for a swapchain image polls the suspended
   state every 50 ms and gives up, so `SuspendX` never waits on it); resume allows presents again, but waits fail until

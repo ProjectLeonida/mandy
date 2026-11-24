@@ -10,6 +10,7 @@
 #include "../src/title_va_alias.h"
 #include "../src/fsdraw_probe.h"  // LOCAL DIAGNOSTIC
 #include "../src/local_diagnostics.h"
+#include "../src/present_probe.h"
 
 #include <algorithm>
 #include <array>
@@ -823,7 +824,7 @@ public:
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr || !color) return check(false);
         // LOCAL DIAGNOSTIC: what the title clears, and with which colour
-        if (leonida::local_diagnostics()) {
+        if (leonida::present_probe::enabled()) {
             static std::atomic<std::uint64_t> clears{0};
             const std::uint64_t n = ++clears;
             if (n <= 6 || n % 600 == 0) {
@@ -1824,10 +1825,12 @@ private:
         // No viewport (never set, or unbound with RSSetViewports(0)) or every bound viewport empty: D3D12 rasterizes
         // nothing, and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         // LOCAL DIAGNOSTIC: the state each draw is recorded with
-        if (leonida::local_diagnostics()) {
+        std::uint64_t n = 0;
+        if (leonida::present_probe::enabled()) {
             static std::atomic<std::uint64_t> draws{0}, skipped{0};
             const bool skip = !any_nonempty_viewport();
-            const std::uint64_t n = ++draws, k = skip ? ++skipped : skipped.load();
+            n = ++draws;
+            const std::uint64_t k = skip ? ++skipped : skipped.load();
             if (n <= 8 || n % 1200 == 0)
                 std::fprintf(stderr, "[rt] present-probe: draw #%llu (%s; %llu skipped so far) pso %p rts %u rt0 0x%llx "
                                      "mip %u viewport %.0fx%.0f at %.0f,%.0f scissor %d,%d-%d,%d count %u x%u\n",
@@ -1836,6 +1839,8 @@ private:
                              render_target_count_, static_cast<unsigned long long>(render_targets_[0].resource),
                              render_targets_[0].mip, viewport_.width, viewport_.height, viewport_.x, viewport_.y,
                              scissor_.left, scissor_.top, scissor_.right, scissor_.bottom, count, instances);
+        }
+        if (leonida::local_diagnostics()) {
             // LOCAL DIAGNOSTIC (fsdraw): the first draw of each pipeline, and one frame's draws every ~300 frames,
             // with the pipeline's description, the root data and what the bound descriptor tables hold.
             static std::mutex seen_mutex;
