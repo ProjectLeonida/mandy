@@ -176,6 +176,7 @@ void start_title_peek(std::uint8_t* base) {
 
 }  // namespace
 
+#include "audio_endpoint_probe.h"
 #include "base_reservation.h"
 #include "compile_gate_policy.h"
 #include "code_hooks.h"
@@ -559,6 +560,13 @@ int wmain(int argc, wchar_t** argv) {
     if (!rt::cpu_emulation::install())
         std::fprintf(stderr, "[rt] cpu: AddVectoredExceptionHandler failed (error %lu); instructions this CPU lacks "
                              "will stop the game\n", GetLastError());
+    // Without a default audio output the title stops after its first-run screens (docs/boot.md, "No audio output
+    // device"): said here, since nothing later points at it.
+    if (HRESULT hr = S_OK; rt::audio_probe::default_render_endpoint(&hr) == rt::audio_probe::Endpoint::missing)
+        std::fprintf(stderr, "[rt] audio: the host has no default audio output (GetDefaultAudioEndpoint 0x%08lX); the game "
+                             "will stop on a loading screen after its first-run screens. Give Wine an output device, "
+                             "a silent one is enough (docs/boot.md, \"No audio output device\")\n",
+                     static_cast<unsigned long>(hr));
 
     try {
         rt::Loader loader(game_dir);

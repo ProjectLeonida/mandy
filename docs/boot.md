@@ -283,7 +283,46 @@ order. It maps each question to the event to look for; it does not answer them.
   does not affect these outcomes.
 * `exit` is the game's own code, not the loader's. A crash after the first frame is the next layer question.
 
-## 6. Limits
+## 6. No audio output device
+
+The title needs a default audio output. With none it does not fail at once: it stops after the first-run screens
+(the account, privacy and terms screens), on a dark loading screen that keeps being drawn. Nothing crashes and no
+`unimplemented_call` or `exception` points at it. The runtime prints an `[rt] audio:` line at start when the host has
+no default render endpoint (`runtime/src/audio_endpoint_probe.h`). A Wine prefix with `winealsa.drv` and
+`winepulse.drv` disabled, or a sandbox without `/dev/snd` and the sound server's sockets, is the usual way to get
+there, and so is a muted test run.
+
+Measured on the Xbox package 1.0.2.1 under Wine 11.22, with breakpoints and hit counts (`LEONIDA_BREAK`):
+
+1. While it starts its audio, the title asks for the default render endpoint once
+   (`IMMDeviceEnumerator::GetDefaultAudioEndpoint(eRender, eConsole)`, RVA `0x43aec05`). When that fails it skips its
+   audio device setup (RVA `0x1e7f580`, which activates `IAudioClient` and `ISpatialAudioClient`), so the audio
+   object's list of outputs stays empty.
+2. The per-frame audio update (RVA `0x5267720`) takes that object's lock, finds no outputs and returns without
+   releasing it (its early return at RVA `0x5267cfb`). It ran on a pool worker that then went back to waiting for
+   jobs while still owning the lock.
+3. The frame thread takes the same lock (RVA `0x5594650`, called from RVA `0x1e95161`) and waits on it for good. The
+   frame tick (RVA `0x43ae230`, which advances the frame counter and wakes threads parked on it) ran once in the
+   whole run.
+4. The main thread parks in a startup step (RVA `0x2431600`) until the frame counter moves on and is never woken.
+   Every streaming update the main thread drives stops with it, so a later synchronous streaming request (the loop
+   at RVA `0x3a158a9`) waits for ever.
+
+With an output device, the same build gets past this point: the audio setup runs, the early return is never taken
+and the frame tick keeps running. A console always has an output, so the early return is not reached there.
+
+A silent device is enough. For a muted run under Wine, keep `winealsa.drv` enabled and point ALSA at its null
+plugin, which needs no sound card and plays nothing:
+
+```sh
+printf 'pcm.!default { type null }\npcm.null { type null }\nctl.!default { type hw card 0 }\n' > null-alsa.conf
+WINEDLLOVERRIDES='winepulse.drv=d' ALSA_CONFIG_PATH="$PWD/null-alsa.conf" wine gta6rt.exe --run ...
+```
+
+`ALSA_CONFIG_PATH` replaces ALSA's own configuration, so the file must stand alone. A list that adds it after the
+system file does not work: the sound server's default from the system configuration still wins.
+
+## 7. Limits
 
 The retail executable is not in the package, so this page is untested against it; the tool and the trace formats
 are tested on synthetic fixtures and on `tiny_game` (which has no D3D12 calls). The present slots (Q6) and the
