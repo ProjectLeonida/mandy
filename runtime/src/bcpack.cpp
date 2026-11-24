@@ -108,6 +108,7 @@ std::int64_t rem(std::int64_t v, std::int64_t m) {
 // history entry (`lost`).
 struct Ctx {
     bool lenient = false;
+    bool replace_builtin = false;  // History::replace of this mode: the built-in BC1-5 table is not read
     const History* history = nullptr;
     std::vector<std::uint8_t> lost;
     std::size_t guessed() const { return static_cast<std::size_t>(std::count(lost.begin(), lost.end(), 1)); }
@@ -119,9 +120,9 @@ struct Ctx {
     }
 };
 
-// The base of block i: the zero state, an earlier block, or a confirmed history entry (external first). An entry
-// nobody has confirmed refuses the chunk (strict) or gives the zero state and marks the block lost (lenient); a block
-// that predicts from a lost block is lost too.
+// The base of block i: the zero state, an earlier block, or a confirmed history entry (external first, then the
+// built-in table unless the external one replaces it). An entry nobody has confirmed refuses the chunk (strict) or
+// gives the zero state and marks the block lost (lenient); a block that predicts from a lost block is lost too.
 template <std::size_t K>
 Status base_of(std::size_t i, std::int64_t d, const std::array<std::int64_t, K>& zero,
                const std::vector<std::array<std::int64_t, K>>& hist, std::span<const std::int16_t> builtin,
@@ -136,7 +137,8 @@ Status base_of(std::size_t i, std::int64_t d, const std::array<std::int64_t, K>&
         return Status::ok;
     }
     const std::size_t entry = static_cast<std::size_t>(256 + static_cast<std::int64_t>(i) - d);
-    for (std::span<const std::int16_t> table : {external, builtin}) {
+    const std::span<const std::int16_t> fallback = ctx.replace_builtin ? std::span<const std::int16_t>{} : builtin;
+    for (std::span<const std::int16_t> table : {external, fallback}) {
         if (table.size() < (entry + 1) * K || table[entry * K] < 0) continue;
         for (std::size_t k = 0; k < K; ++k) out[k] = table[entry * K + k];
         return Status::ok;
@@ -764,8 +766,34 @@ Status bc6h(const Lanes& l, Ctx& ctx, std::span<std::uint8_t> out) {
 
 bool read_history_sidecar(std::span<const std::uint8_t> bytes, History& out) {
     static constexpr char kMagic[8] = {'B', 'C', 'P', 'H', 'I', 'S', 'T', '1'};
+    static constexpr char kBc15Magic[8] = {'B', 'C', '1', '5', 'H', 'I', 'S', '1'};
+    // The optional BC1-5 section: its magic, then per mode 1, 3, 4, 5 a "given" byte, a "replace" byte and 256
+    // entries of K int16 (K = 6, 8, 2, 4), -1 where an entry is not confirmed.
+    static constexpr std::array<std::pair<std::uint32_t, std::size_t>, 4> kBc15{{{1, 6}, {3, 8}, {4, 2}, {5, 4}}};
     constexpr std::size_t kBc6h = 70, kBc7 = 168, kSize = 8 + 256 * (kBc6h + kBc7);
-    if (bytes.size() != kSize || !std::equal(std::begin(kMagic), std::end(kMagic), bytes.begin())) return false;
+    constexpr std::size_t kBc15Size = 8 + 4 * 2 + 256 * 2 * (6 + 8 + 2 + 4);
+    const bool bc15 = bytes.size() == kSize + kBc15Size;
+    if ((bytes.size() != kSize && !bc15) || !std::equal(std::begin(kMagic), std::end(kMagic), bytes.begin()))
+        return false;
+    if (bc15 && !std::equal(std::begin(kBc15Magic), std::end(kBc15Magic), bytes.begin() + kSize)) return false;
+    std::array<std::vector<std::int16_t>, 8> values = out.values;
+    std::array<bool, 8> replace = out.replace;
+    if (bc15) {
+        const std::uint8_t* q = bytes.data() + kSize + 8;
+        for (const auto& [mode, k] : kBc15) {
+            const bool given = q[0] != 0, whole = q[1] != 0;
+            q += 2;
+            std::vector<std::int16_t> table(256 * k);
+            for (std::int16_t& v : table) {
+                v = static_cast<std::int16_t>(q[0] | (q[1] << 8));
+                q += 2;
+            }
+            if (given) {
+                values[mode] = std::move(table);
+                replace[mode] = whole;
+            }
+        }
+    }
     std::vector<History::Bc6hEntry> bc6h(256);
     std::vector<History::Bc7Entry> bc7(256);
     const std::uint8_t* p = bytes.data() + 8;
@@ -796,6 +824,8 @@ bool read_history_sidecar(std::span<const std::uint8_t> bytes, History& out) {
     }
     out.bc6h = std::move(bc6h);
     out.bc7 = std::move(bc7);
+    out.values = std::move(values);
+    out.replace = replace;
     return true;
 }
 
@@ -1060,6 +1090,7 @@ Result decode(std::span<const std::uint8_t> in, std::uint32_t mode, std::span<st
     const std::span<const std::int16_t> external = external_for(options.history, mode);
     Ctx ctx;
     ctx.lenient = options.lenient;
+    ctx.replace_builtin = options.history && mode < options.history->replace.size() && options.history->replace[mode];
     ctx.history = options.history;
     ctx.lost.assign(out.size() / bytes, 0);
     Status s;

@@ -1237,10 +1237,19 @@ void test_bcpack(Env& env) {
             if (pick(c)) return &c;
         return nullptr;
     };
-    const BlockCase* bc1 = find([](const BlockCase& c) { return c.mode == 1 && c.status == 0 && c.out_size >= 64; });
+    // The request path reads the calibrated history set below, whose BC1 table replaces the built-in one: the BC1
+    // chunk is one that decodes to the same blocks with it as with the built-in table.
+    leonida::bcpack::History calibrated;
+    check(leonida::bcpack::read_history_sidecar(bcpack_vectors::kHistorySidecar, calibrated), "the sidecar reads");
+    const BlockCase* bc1 = find([&](const BlockCase& c) {
+        if (c.mode != 1 || c.status != 0 || c.out_size < 64) return false;
+        std::vector<uint8_t> with(c.out_size);
+        return leonida::bcpack::decode({c.raw, c.raw_size}, 1, with, &calibrated) == leonida::bcpack::Status::ok &&
+               std::equal(with.begin(), with.end(), c.blocks);
+    });
     const BlockCase* bc7 = find([](const BlockCase& c) { return c.mode == 7 && c.status == 0 && c.out_size >= 64; });
-    // The request path reads the calibrated history set below, so the lenient case comes from the history vectors,
-    // whose provisional blocks Python made with that history. The other chunks read no built-in history.
+    // The lenient case comes from the history vectors, whose provisional blocks Python made with that history. The
+    // BC7 chunk reads no built-in history.
     const BlockCase* guessed = nullptr;
     for (const BlockCase& c : bcpack_vectors::kHistoryCases)
         if (c.mode == 7 && c.status == 7 && c.lenient_known) {
@@ -1339,8 +1348,10 @@ void test_bcpack(Env& env) {
                                      : std::all_of(out[i].begin(), out[i].begin() + c.destination,
                                                    [](uint8_t x) { return x == 0xEE; });
         const bool tail = std::all_of(out[i].end() - kSlack, out[i].end(), [](uint8_t x) { return x == 0xEE; });
-        check(head && tail, c.expected ? "the decoded blocks, and nothing past them"
-                                       : "a failed BCPack request leaves the destination untouched");
+        const std::string what = std::string(c.expected ? "the decoded blocks, and nothing past them: "
+                                                        : "a failed BCPack request leaves the destination untouched: ") +
+                                 c.what;
+        check(head && tail, what.c_str());
     }
     s->Release();
     q->Release();

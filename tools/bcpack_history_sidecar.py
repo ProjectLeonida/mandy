@@ -1,11 +1,12 @@
-r"""Write the BC6H/BC7 BCPack history sidecar the runtime decoder reads (stdlib only).
+r"""Write the BCPack history sidecar the runtime decoder reads (stdlib only).
 
-The built-in BC6H and BC7 history of BCPack is not in the repository: tools/bcpack_tables_bptc.py knows none of it.
-A user who has calibrated it from their own copy (tools/bcpack_history_calib.py, the `--history` JSON of
-tools/bcpack.py) can hand it to the runtime decoder (runtime/src/bcpack.h, `read_history_sidecar`) through this file:
-the history JSON is read by the same loaders tools/bcpack.py uses (`load_bc6h`, `load_bc7`, so a file, a folder
-holding bc6h.json / bc7.json, or a dict all work, with the same merging and mid-range fill), and written as fixed
-little-endian tables the C++ reads without a JSON parser.
+The built-in BC6H and BC7 history of BCPack is not in the repository: tools/bcpack_tables_bptc.py knows none of it,
+and the repository's BC1/BC3/BC4/BC5 tables confirm only part of theirs. A user who has calibrated the history from
+their own copy (tools/bcpack_history_calib.py, the `--history` JSON of tools/bcpack.py) can hand it to the runtime
+decoder (runtime/src/bcpack.h, `read_history_sidecar`) through this file: the history JSON is read by the same loaders
+tools/bcpack.py uses (`load_bc6h`, `load_bc7`, `load_bc_history`, so a file, a folder holding bc6h.json / bc7.json /
+bc1.json ..., or a dict all work, with the same merging and mid-range fill), and written as fixed little-endian
+tables the C++ reads without a JSON parser.
 
 The layout is "BCPHIST1" (8 bytes), then 256 BC6H entries of 70 bytes:
     12 x uint16  endpoint history (3 channels x w, x, y, z)
@@ -16,6 +17,12 @@ The layout is "BCPHIST1" (8 bytes), then 256 BC6H entries of 70 bytes:
 then 256 BC7 entries of 168 bytes: endpoints, endpoint bits, endpoint confirmed bits (24 bytes each), indices, index
 bits, index confirmed bits (32 bytes each): 60,936 bytes in all. It is the profile format of the integration branch
 in #984 (tools/gen_bcpack_runtime_tables.py --profile), byte for byte, so one file serves both.
+
+Only when the history has a BC1, BC3, BC4 or BC5 section does a "BC15HIS1" section follow (10,256 bytes, 71,192 in
+all; #984's profile reader may not take that longer file): for modes 1, 3, 4, 5 in turn, a "given" byte, a "replace"
+byte (the section's "replace": true, the built-in table is then not read), and 256 entries of 6, 8, 2 or 4 int16, the
+section's confirmed entries, -1 where an entry is not confirmed. Provisional entries are left out: the runtime decodes
+strictly from confirmed history, as it does with the built-in tables.
 
 The sidecar is made from the user's own data: keep it on their machine, never commit or post it.
 
@@ -34,6 +41,26 @@ MAGIC = b"BCPHIST1"
 BC6H_ENTRY = 70
 BC7_ENTRY = 168
 SIZE = len(MAGIC) + 256 * (BC6H_ENTRY + BC7_ENTRY)
+BC15_MAGIC = b"BC15HIS1"
+BC15_MODES = ((1, 6), (3, 8), (4, 2), (5, 4))
+BC15_SIZE = len(BC15_MAGIC) + sum(2 + 256 * k * 2 for _, k in BC15_MODES)
+
+
+def render_bc15(history):
+    """The BC15HIS1 section for `history`, or b"" when it has no BC1/BC3/BC4/BC5 section."""
+    loaded = {mode: bptc.load_bc_history(mode, history) for mode, _ in BC15_MODES}
+    if all(v is None for v in loaded.values()):
+        return b""
+    out = bytearray(BC15_MAGIC)
+    for mode, k in BC15_MODES:
+        section = loaded[mode]
+        confirmed, replace = ({}, False) if section is None else (section[0], section[2])
+        out += bytes((section is not None, bool(replace)))
+        for i in range(256):
+            out += struct.pack(f"<{k}h", *(confirmed[i] if i in confirmed else (-1,) * k))
+    if len(out) != BC15_SIZE:
+        raise SystemExit(f"internal error: wrote {len(out)} BC1-5 bytes, expected {BC15_SIZE}")
+    return bytes(out)
 
 
 def render(history):
@@ -53,12 +80,13 @@ def render(history):
             out += bytes(v & 0xFF for v in b7[key][i])
     if len(out) != SIZE:
         raise SystemExit(f"internal error: wrote {len(out)} bytes, expected {SIZE}")
-    return bytes(out)
+    return bytes(out) + render_bc15(history)
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("history", help="the calibrated history: a JSON file or a folder with bc6h.json / bc7.json")
+    ap.add_argument("history", help="the calibrated history: a JSON file or a folder with bc6h.json / bc7.json / "
+                                    "bc1.json / bc3.json / bc4.json / bc5.json")
     ap.add_argument("out", help="the sidecar to write (keep it on this machine)")
     args = ap.parse_args(argv)
     if os.path.abspath(args.out) == os.path.abspath(args.history):

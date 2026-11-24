@@ -902,9 +902,10 @@ private:
         return hr;
     }
 
-    // The user's calibrated BC6H/BC7 history, read once: the sidecar named by LEONIDA_BCPACK_HISTORY, or else
+    // The user's calibrated history, read once: the sidecar named by LEONIDA_BCPACK_HISTORY, or else
     // bcpack_history.bin next to the runtime's executable (tools/bcpack_history_sidecar.py writes it from the history
-    // the user calibrated from their own copy). Null without one: every built-in BC6H/BC7 entry is then unknown.
+    // the user calibrated from their own copy): BC6H/BC7, and BC1/BC3/BC4/BC5 when it has their section. Null without
+    // one: every built-in BC6H/BC7 entry is then unknown, and BC1-5 read the repository's confirmed entries only.
     static const leonida::bcpack::History* calibrated_history() {
         static const leonida::bcpack::History* const loaded = [] () -> const leonida::bcpack::History* {
             std::wstring path;
@@ -922,7 +923,7 @@ private:
             const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                             FILE_ATTRIBUTE_NORMAL, nullptr);
             if (file == INVALID_HANDLE_VALUE) return nullptr;  // none given: not an error
-            std::vector<uint8_t> bytes(70000);
+            std::vector<uint8_t> bytes(128 * 1024);  // the sidecar is 60,936 or 71,192 bytes; anything longer is refused
             DWORD got = 0;
             const BOOL ok = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &got, nullptr);
             CloseHandle(file);
@@ -933,7 +934,10 @@ private:
                 log_once("bcpack history file", "the BCPack history sidecar is not a BCPHIST1 file: ignored");
                 return nullptr;
             }
-            log_once("bcpack history file", "BCPack requests use the calibrated BC6H/BC7 history sidecar");
+            log_once("bcpack history file", history->values[1].empty() && history->values[3].empty() &&
+                                                    history->values[4].empty() && history->values[5].empty()
+                                                ? "BCPack requests use the calibrated BC6H/BC7 history sidecar"
+                                                : "BCPack requests use the calibrated BC1-7 history sidecar");
             return history;
         }();
         return loaded;

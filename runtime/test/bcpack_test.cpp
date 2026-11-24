@@ -112,7 +112,33 @@ int main() {
     }
     check(hist_ok > 0 && hist_lenient > 0, "the history cases hold strict and provisional decodes");
     check(needs_history > 0, "some chunk decodes strictly only with the calibrated history");
+    // Its BC1-5 section: BC1 replacing the built-in table, BC4 and BC5 merged onto theirs, BC3 not given.
+    check(calibrated.values[1].size() == 256 * 6 && calibrated.replace[1] && calibrated.values[3].empty() &&
+              calibrated.values[4].size() == 256 * 2 && !calibrated.replace[4] &&
+              calibrated.values[5].size() == 256 * 4,
+          "the sidecar's BC1-5 section reads, with BC1's replace flag");
+    int bc15_needs = 0, replace_matters = 0;
+    for (const auto& c : bcpack_vectors::kHistoryCases) {
+        if (c.mode >= 6 || c.status != 0) continue;
+        std::vector<std::uint8_t> without(c.out_size);
+        if (bp::decode({c.raw, c.raw_size}, c.mode, without) != Status::ok) ++bc15_needs;
+    }
+    bp::History merged = calibrated;
+    merged.replace[1] = false;
+    for (const auto& c : bcpack_vectors::kHistoryCases) {
+        if (c.mode != 1) continue;
+        std::vector<std::uint8_t> blocks(c.out_size);
+        if (static_cast<int>(bp::decode({c.raw, c.raw_size}, c.mode, blocks, &merged)) != c.status) ++replace_matters;
+    }
+    check(bc15_needs > 0, "some BC1-5 chunk decodes strictly only with the calibrated history");
+    check(replace_matters > 0, "BC1's replace flag changes how some chunk decodes, as in tools/bcpack.py");
+    std::printf("bcpack history: BC1-5 %d chunks only with the history, BC1 replace decides %d\n", bc15_needs,
+                replace_matters);
     std::vector<std::uint8_t> sidecar(bcpack_vectors::kHistorySidecar, std::end(bcpack_vectors::kHistorySidecar));
+    bp::History base_only;
+    check(bp::read_history_sidecar(std::span(sidecar).first(60936), base_only) && base_only.bc7.size() == 256 &&
+              base_only.values[1].empty() && !base_only.replace[1],
+          "the sidecar without its BC1-5 section (#984's profile size) still reads");
     bp::History untouched;
     sidecar[0] ^= 1;
     check(!bp::read_history_sidecar(sidecar, untouched) && untouched.bc7.empty(), "a sidecar with the wrong magic");

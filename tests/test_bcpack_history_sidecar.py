@@ -1,9 +1,10 @@
-"""tools/bcpack_history_sidecar.py writes the BC6H/BC7 history sidecar the runtime decoder reads (synthetic history only).
+"""tools/bcpack_history_sidecar.py writes the BCPack history sidecar the runtime decoder reads (synthetic history only).
 
 The layout is the one runtime/src/bcpack.cpp's read_history_sidecar reads: "BCPHIST1", 256 BC6H entries of 70 bytes,
-256 BC7 entries of 168. These checks put known values into a made-up history and find them at their offsets, so a
-change on either side shows here; runtime/test/bcpack_test.cpp decodes with a sidecar of this tool against
-tools/bcpack.py with the same history. No game files.
+256 BC7 entries of 168, then, only when the history has a BC1/BC3/BC4/BC5 section, "BC15HIS1" with a given byte, a
+replace byte and 256 int16 entries per mode. These checks put known values into a made-up history and find them at
+their offsets, so a change on either side shows here; runtime/test/bcpack_test.cpp decodes with a sidecar of this tool
+against tools/bcpack.py with the same history. No game files.
 """
 import json
 import os
@@ -75,6 +76,36 @@ class SidecarLayout(unittest.TestCase):
         self.assertEqual(tuple(data[at + 72:at + 104]), tuple(i % 16 for i in range(32)), "indices")
         self.assertEqual(tuple(data[at + 104:at + 136]), (4,) * 32, "index bits")
         self.assertEqual(tuple(data[at + 136:at + 168]), (2,) * 32, "index confirmed bits")
+
+    def test_no_bc15_section_keeps_the_profile_size(self):
+        self.assertEqual(len(sidecar.render(_history())), 60936, "BC6H/BC7 only: #984's profile size, unchanged")
+
+    def test_bc15_section(self):
+        history = _history()
+        history["bc1"] = {"confirmed": {"3": [1, 2, 3, 4, 5, 6]}, "provisional": {"4": [6, 5, 4, 3, 2, 1]},
+                          "replace": True}
+        history["bc5"] = {"confirmed": {"255": [9, 8, 7, 6]}}
+        data = sidecar.render(history)
+        self.assertEqual(len(data), 60936 + sidecar.BC15_SIZE)
+        self.assertEqual(len(data), 71192)
+        at = 60936
+        self.assertEqual(data[at:at + 8], b"BC15HIS1")
+        at += 8
+        offsets = {}
+        for mode, k in sidecar.BC15_MODES:
+            offsets[mode] = at
+            at += 2 + 256 * k * 2
+
+        def entry(mode, k, i):
+            return struct.unpack_from(f"<{k}h", data, offsets[mode] + 2 + i * k * 2)
+
+        self.assertEqual(tuple(data[offsets[1]:offsets[1] + 2]), (1, 1), "BC1 given, replace")
+        self.assertEqual(entry(1, 6, 3), (1, 2, 3, 4, 5, 6))
+        self.assertEqual(entry(1, 6, 4), (-1,) * 6, "a provisional entry is not written")
+        self.assertEqual(entry(1, 6, 0), (-1,) * 6)
+        self.assertEqual(tuple(data[offsets[3]:offsets[3] + 2]), (0, 0), "BC3 not given")
+        self.assertEqual(tuple(data[offsets[5]:offsets[5] + 2]), (1, 0), "BC5 given, merged")
+        self.assertEqual(entry(5, 4, 255), (9, 8, 7, 6))
 
     def test_command_line(self):
         with tempfile.TemporaryDirectory() as tmp:

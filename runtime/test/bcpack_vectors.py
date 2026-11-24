@@ -80,12 +80,13 @@ def lane_cases(rng, count):
     return out
 
 
-def _distance_code(rng, i):
-    """A history distance code for block i: none, an earlier block, or a built-in entry (d > i)."""
+def _distance_code(rng, i, builtin=0.04):
+    """A history distance code for block i: none, an earlier block, or a built-in entry (d > i) with probability
+    about `builtin` (the default keeps the original split: 0.5 none, 0.46 earlier, 0.04 built-in)."""
     r = rng.random()
-    if r < 0.5:
+    if r < min(0.5, 1 - builtin):
         d = 0
-    elif r < 0.96:
+    elif r < 1 - builtin:
         d = rng.randint(1, min(i, 255)) if i > 0 else 0
     else:
         d = rng.randint(i + 1, 255) if i < 255 else 0
@@ -93,7 +94,8 @@ def _distance_code(rng, i):
     return 2 * d if d <= 127 else 2 * (256 - d) - 1
 
 
-def block_cases(rng, count):
+def block_cases(rng, count, history=None, builtin=0.04):
+    """BC1/BC3/BC4/BC5 chunks and the strict Python decode of each, with `history` when given."""
     out = []
     for _ in range(count):
         codec = rng.choice([1, 3, 4, 5])
@@ -103,7 +105,7 @@ def block_cases(rng, count):
         lanes = _random_lanes(rng, codec, nsym)
         lanes[1] = [0] * nsym if rng.random() > 0.06 else [rng.randrange(1, 16)] + [0] * (nsym - 1)
         for i in range(nblocks):
-            code = _distance_code(rng, i)
+            code = _distance_code(rng, i, builtin)
             if two:  # lane 0 holds the code's even bits in element a and its odd bits in element b (`_inter8`)
                 lanes[0][2 * i] = sum(((code >> (2 * k)) & 1) << k for k in range(4))
                 lanes[0][2 * i + 1] = sum(((code >> (2 * k + 1)) & 1) << k for k in range(4))
@@ -113,7 +115,7 @@ def block_cases(rng, count):
         if rng.random() < 0.12:
             raw = _corrupt(rng, raw)
         size = nblocks * bcpack.BLOCK_BYTES[codec]
-        out.append((codec, raw, size) + _reference(raw, codec, size) + (None,))
+        out.append((codec, raw, size) + _reference(raw, codec, size, history) + (None,))
     return out
 
 
@@ -319,10 +321,15 @@ def render():
     # A synthetic calibrated history (no game data), its sidecar, and BC6H/BC7 chunks that often read it.
     hrng = random.Random(SEED + 1)
     history = synthetic_history(hrng)
+    # Its BC1-5 part has a generator of its own, so the BC6H/BC7 cases above stay what they were.
+    brng = random.Random(SEED + 2)
+    history.update(synthetic_bc15_history(brng))
     import bcpack_history_sidecar as sidecar  # noqa: PLC0415
-    lines += ["// The BCPHIST1 sidecar of a synthetic calibrated history (tools/bcpack_history_sidecar.py).",
+    lines += ["// The BCPHIST1 sidecar (with its BC15HIS1 section) of a synthetic calibrated history",
+              "// (tools/bcpack_history_sidecar.py).",
               _bytes("kHistorySidecar", sidecar.render(history)), ""]
     hist_cases = bc7_cases(hrng, 60, history, builtin=0.3) + bc6h_cases(hrng, 60, history, builtin=0.3)
+    hist_cases += block_cases(brng, 100, history, builtin=0.35)
     for k, (codec, raw, size, status, expected, lenient) in enumerate(hist_cases):
         lines.append(_bytes(f"hist_raw_{k}", raw))
         lines.append(_bytes(f"hist_out_{k}", expected or b""))
@@ -338,6 +345,25 @@ def render():
         lines.append(f"    {{{codec}, hist_raw_{k}, {len(raw)}, {size}, {status}, hist_out_{k}, {tail}}},")
     lines += ["};", "", "}  // namespace bcpack_vectors", ""]
     return "\n".join(lines), lanes, blocks + hist_cases
+
+
+def synthetic_bc15_history(rng):
+    """Made-up BC1/BC3/BC4/BC5 history sections in the JSON shape `load_bc_history` reads: BC1 replacing its
+    built-in table (the only one that confirms many entries, 252), BC4 and BC5 merged onto theirs (confirmed and
+    provisional entries), BC3 not given."""
+    out = {}
+    for codec, key, mods, replace in ((1, "bc1", (32, 64, 32, 32, 64, 32), True), (4, "bc4", (256, 256), False),
+                                      (5, "bc5", (256, 256, 256, 256), False)):
+        confirmed, provisional = {}, {}
+        for i in range(256):
+            r = rng.random()
+            row = [rng.randrange(m) for m in mods]
+            if r < 0.45:
+                confirmed[str(i)] = row
+            elif r < 0.6:
+                provisional[str(i)] = row
+        out[key] = {"codec": key, "confirmed": confirmed, "provisional": provisional, "replace": replace}
+    return out
 
 
 def synthetic_history(rng):

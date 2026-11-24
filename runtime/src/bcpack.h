@@ -64,12 +64,14 @@ Status decode_lanes(std::span<const std::uint8_t> in, std::span<const std::uint8
 // The user's calibrated built-in history (tools/bcpack_history_calib.py), which the repository does not carry.
 //  - BC1, BC3, BC4, BC5: confirmed entries besides the built-in ones, entry e of mode m at values[m][e * K .. e * K + K)
 //    with K = 6, 8, 2, 4 for modes 1, 3, 4, 5; -1 or a short vector means "not given". An entry given here wins over
-//    the built-in one (`_resolve_bc_history`'s merge).
+//    the built-in one (`_resolve_bc_history`'s merge); with replace[m] the built-in table of mode m is not read at
+//    all (the history JSON's "replace": true). Provisional entries are not taken, as for the built-in tables.
 //  - BC6H and BC7: the tables `load_bc6h` / `load_bc7` of tools/bcpack_tables_bptc.py make from the history JSON,
 //    read from the sidecar tools/bcpack_history_sidecar.py writes (read_history_sidecar). Without them every built-in
 //    BC6H/BC7 entry is unknown: strict decoding refuses a chunk that refers to one, lenient decoding takes zeros.
 struct History {
     std::array<std::vector<std::int16_t>, 8> values;
+    std::array<bool, 8> replace{};
 
     struct Bc6hEntry {
         std::array<std::array<std::uint16_t, 4>, 3> endpoints{};  // per channel: w, x, y, z
@@ -86,8 +88,9 @@ struct History {
     std::vector<Bc7Entry> bc7;    // 256 entries, or empty: all unknown
 };
 
-// Reads the "BCPHIST1" sidecar of tools/bcpack_history_sidecar.py (60,936 bytes) into `out`'s BC6H and BC7 tables.
-// False, leaving `out` unchanged, for anything else.
+// Reads the "BCPHIST1" sidecar of tools/bcpack_history_sidecar.py into `out`: its BC6H and BC7 tables (60,936 bytes,
+// the format of #984's profile), then, in a longer file, the "BC15HIS1" section with the BC1/BC3/BC4/BC5 confirmed
+// entries and replace flags (71,192 bytes in all). False, leaving `out` unchanged, for anything else.
 bool read_history_sidecar(std::span<const std::uint8_t> bytes, History& out);
 
 struct Options {
