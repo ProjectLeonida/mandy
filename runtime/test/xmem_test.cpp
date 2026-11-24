@@ -459,6 +459,16 @@ bool access_faults(volatile uint32_t* address, bool write) {
     return false;
 }
 
+// How many of the `pages` 64 KiB pages from `base` are committed (MEM_COMMIT) in this process's view.
+uint64_t committed_pages(const uint8_t* base, uint64_t pages) {
+    uint64_t committed = 0;
+    for (uint64_t i = 0; i < pages; ++i) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(base + i * kPage64k, &info, sizeof(info)) && info.State == MEM_COMMIT) ++committed;
+    }
+    return committed;
+}
+
 int64_t commit_growth(const PERFORMANCE_INFORMATION& from, const PERFORMANCE_INFORMATION& to) {
     return (static_cast<int64_t>(to.CommitTotal) - static_cast<int64_t>(from.CommitTotal)) *
            static_cast<int64_t>(to.PageSize);
@@ -499,10 +509,14 @@ void test_physical_pages_commit_on_touch(const PhysicalApi& api) {
         return;
     }
     check(api.map(window, kMapped, pages.data()) == window, "1,024 of them map into one window");
+    // CommitTotal is system-wide, so another process that commits or frees memory between two samples moves it too:
+    // while a build ran it swung by up to -120 MiB / +24 MiB within one touch loop (P3.3, 2026-11-24). What this test
+    // can know for itself is the state of each page of its own view: a mapped page that is not yet charged is
+    // MEM_RESERVE there, and MEM_COMMIT once it is (commit_mapped_page reads the same state). The system-wide growth
+    // is printed for information only.
+    check(committed_pages(window, kMapped) == 0, "mapping them does not charge them (no page of the view committed)");
     PERFORMANCE_INFORMATION mapped{};
     GetPerformanceInfo(&mapped, sizeof(mapped));
-    check(commit_growth(allocated, mapped) < static_cast<int64_t>(kMapped * kPage64k / 2),
-          "mapping them does not charge them");
 
     for (uint64_t i = 0; i < kTouched; ++i) {
         static_cast<volatile uint32_t*>(static_cast<void*>(window + i * kPage64k))[0] =
@@ -510,10 +524,12 @@ void test_physical_pages_commit_on_touch(const PhysicalApi& api) {
     }
     PERFORMANCE_INFORMATION touched{};
     GetPerformanceInfo(&touched, sizeof(touched));
-    const int64_t touched_growth = commit_growth(mapped, touched);
-    check(touched_growth >= static_cast<int64_t>(kTouched * kPage64k / 2) &&
-              touched_growth < static_cast<int64_t>(kMapped * kPage64k),
-          "writing to 512 of them charges about those 512 pages");
+    const uint64_t committed = committed_pages(window, kMapped);
+    check(committed == kTouched && committed_pages(window, kTouched) == kTouched,
+          "writing to 512 of them charges exactly those 512 pages (committed in the view)");
+    std::printf("  %llu of %llu pages committed; system commit grew %lld KiB meanwhile (information only)\n",
+                static_cast<unsigned long long>(committed), static_cast<unsigned long long>(kMapped),
+                static_cast<long long>(commit_growth(mapped, touched) / 1024));
     bool written = true;
     for (uint64_t i = 0; i < kTouched; ++i) written &= read_u32(window + i * kPage64k, 0) == (0xc0de0000u | i);
     check(written, "each touched page keeps what was written to it");
