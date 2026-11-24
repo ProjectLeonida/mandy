@@ -2155,10 +2155,13 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                     return true;
                 }))
                 return hr_to_u64(hr);
-            // No presenter: no statistics yet (S_FALSE with a zero count, the "not available yet" answer in
-            // docs/d3d12_vulkan.md), and never the PC slot 81 (ID3D12Device13::OpenExistingHeapFromAddress1).
+            // No presenter: match FramePacer::get_frame_statistics (E_INVALIDARG on null pCount, otherwise S_FALSE with
+            // a zero count, the "not available yet" answer in docs/d3d12_vulkan.md), and never the PC slot 81
+            // (ID3D12Device13::OpenExistingHeapFromAddress1).
             log_xbox_route_once(Slot, "GetFrameStatisticsX", a1, a2, a3, a4, a5);
-            if (auto* count = reinterpret_cast<UINT*>(a3)) *count = 0;
+            auto* count = reinterpret_cast<UINT*>(a3);
+            if (!count) return hr_to_u64(E_INVALIDARG);
+            *count = 0;
             return hr_to_u64(S_FALSE);
         }
         if (Slot == routes.queue_x) {

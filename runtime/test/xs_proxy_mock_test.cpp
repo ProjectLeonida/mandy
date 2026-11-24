@@ -1069,7 +1069,10 @@ int run_env_slots(bool valid) {
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 0);
         EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK && mock->calls[79] == 0);
         EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);
-        EXPECT(hr_of(raw(device, 81, 0, 0, 0, 0)) == S_FALSE);  // the default GetFrameStatisticsX slot, unattached
+        UINT stats_count = 3;
+        EXPECT(hr_of(raw(device, 81, 0, 0, word(&stats_count), 0)) == S_FALSE && stats_count == 0 &&
+               mock->calls[81] == 0);  // the default GetFrameStatisticsX slot, unattached
+        EXPECT(hr_of(raw(device, 81, 0, 0, 0, 0)) == E_INVALIDARG && mock->calls[81] == 0);
         EXPECT(hr_of(raw(device, 71)) == S_OK && mock->calls[71] == 1);  // not an Xbox slot: forwarded
     }
     EXPECT(release(device) == 0 && mock->refs == 0);
@@ -1693,10 +1696,32 @@ int check_presentation_wiring() {
     EXPECT(hr_of(raw(queue, 31, 0)) == E_NOTIMPL && p.suspend_calls == 0);
     EXPECT(hr_of(raw(queue, 32)) == E_NOTIMPL && p.resume_calls == 0);
 
-    // Detaching restores default E_NOTIMPL refusal on beyond-PC queue slots.
+    // Detaching restores default E_NOTIMPL refusal on beyond-PC queue slots, and detached GetFrameStatisticsX
+    // validates pCount without hitting PC slot 81.
     EXPECT(xs::set_presentation_handler(device, nullptr));
     UINT none = 7;  // unattached GetFrameStatisticsX: no statistics yet, never the PC slot 81
-    EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&none), 0)) == S_FALSE && none == 0 && p.stats_calls == 1);
+    EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&none), 0)) == S_FALSE && none == 0 && p.stats_calls == 1 &&
+           mock->calls[81] == 0);
+    std::uint64_t stats_sentinel[4] = {0x1111, 0x2222, 0x3333, 0x4444};
+    EXPECT(hr_of(raw(device, 81, 77, 0x1a, 0, 0)) == E_INVALIDARG && p.stats_calls == 1 && mock->calls[81] == 0);
+    EXPECT(hr_of(raw(device, 81, 77, 0x1a, 0, word(stats_sentinel))) == E_INVALIDARG && p.stats_calls == 1 &&
+           mock->calls[81] == 0 && stats_sentinel[0] == 0x1111 && stats_sentinel[1] == 0x2222 &&
+           stats_sentinel[2] == 0x3333 && stats_sentinel[3] == 0x4444);
+    UINT cap = 4;
+    EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&cap), word(stats_sentinel))) == S_FALSE && cap == 0 &&
+           p.stats_calls == 1 && mock->calls[81] == 0 && stats_sentinel[0] == 0x1111 &&
+           stats_sentinel[1] == 0x2222 && stats_sentinel[2] == 0x3333 && stats_sentinel[3] == 0x4444);
+
+    // A partial PresentationHandler without get_frame_statistics falls back to the same detached path.
+    xs::PresentationHandler partial_h{};
+    partial_h.context = &p;
+    EXPECT(xs::set_presentation_handler(device, &partial_h));
+    EXPECT(hr_of(raw(device, 81, 77, 0x1a, 0, 0)) == E_INVALIDARG && p.stats_calls == 1 && mock->calls[81] == 0);
+    UINT partial_count = 5;
+    EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&partial_count), word(stats_sentinel))) == S_FALSE &&
+           partial_count == 0 && p.stats_calls == 1 && mock->calls[81] == 0);
+    EXPECT(xs::set_presentation_handler(device, nullptr));
+
     EXPECT(hr_of(raw(queue, 30, 1, 0, 0)) == E_NOTIMPL && p.present_calls == 1);
 
     EXPECT(release(queue) == 0);
