@@ -67,6 +67,7 @@ W64G_COUNTS = Counter()   # tiers of the wave64 VS/PS/GS translated so far, for 
 # barycentrics, so .y/.z are AMD's i/j as with BaryCoordKHR.
 BARY_FALLBACK = False
 SHADER_CLOCK = False
+MSAA_IMAGE_LOAD = False  # opt in for a target with float/uint/sint multisampled sampled-image bindings
 FMA_KHR = False          # --fma khr: fused multiply-adds are OpFmaKHR (SPV_KHR_fma, VK_KHR_shader_fma), not GLSL Fma
 FMA_EXACT = False        # --fma exact: fused multiply-adds are emulated from single-rounded f32 ops (Gen.fma_exact)
 # --texel-offset-fallback: image_sample*_o without VK_KHR_maintenance8. The run-time texel offset is folded into the
@@ -297,6 +298,7 @@ class Gen:
         self.uses_store_views = set()  # image_store dims used (index into STORE_DIMS)
         self.uses_int_sampler = False    # 2D typed sampled-image types for sampling and gathering
         self.uses_int_fetch = set()    # typed image_load dims (index into STORE_DIMS): uint/sint sampled aliases
+        self.uses_ms_views = set()     # image_load multisample arrayed flags (0 = 2D_MSAA, 1 = 2D_MSAA_ARRAY)
         self.uses_d16_image = False    # a d16 image result is narrowed: needs the normalized / 32-bit-float tables
         self.uses_fmt_size = False    # %fmt_size_tab: byte size of each 7-bit buffer FORMAT code (0 = not in FORMATS)
         self.reads_store_views = False  # a coherent image_load reads a storage view (StorageImageReadWithoutFormat)
@@ -13265,6 +13267,35 @@ class Gen:
         a16 = "a16" in mods
         d16 = "d16" in mods
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D")
+        if op == "image_load" and dim in ("dim:SQ_RSRC_IMG_2D_MSAA", "dim:SQ_RSRC_IMG_2D_MSAA_ARRAY"):
+            if not MSAA_IMAGE_LOAD:
+                raise Unsupported("image_load MSAA needs --msaa-image-load (set 0 sampled bindings 20-25)")
+            dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
+            if any(m not in (dim, dm, "a16", "d16", "unorm") for m in mods):
+                raise Unsupported("image_load MSAA modifiers")
+            dmask = int(dm.split(":")[1], 0)
+            if not 1 <= dmask <= 15:
+                raise Unsupported("image_load MSAA dmask")
+            words = (dmask.bit_count() + 1) // 2 if d16 else dmask.bit_count()
+            if a[0]["k"] != "vgpr" or a[0]["n"] != words:
+                raise Unsupported("image_load MSAA destination")
+            arrayed = int(dim.endswith("_ARRAY"))
+            # RDNA2 table 42: x, y, optional slice, then fragid. A16 packs pairs low half first.
+            naddr = 3 + arrayed
+            regs = self.addr_regs(a[1])
+            if len(regs) != ((naddr + 1) // 2 if a16 else naddr):
+                raise Unsupported("image_load MSAA coords")
+            coords = [self.load_reg("vgpr", r) for r in regs]
+            if a16:
+                coords = self.unpack_image_a16_uints(coords)
+            iv = self.tmp()
+            xy_layer = " ".join(self.as_int(c) for c in coords[:naddr - 1])
+            self.emit(f"{iv} = OpCompositeConstruct {'%v3int' if arrayed else '%v2int'} {xy_layer}")
+            self.uses_ms_views.add(arrayed)
+            idx = self.desc_lookup_sgpr(a[2], 8)
+            self.image_load_ms_typed(arrayed, self.sgpr_word(a[2], 1), iv, self.as_int(coords[naddr - 1]),
+                                     idx, dmask, a[0], d16)
+            return
         kinds = {"dim:SQ_RSRC_IMG_2D": ("img2d", "%images", "simg2d", 2, "_ptr_UC_img"),
                  "dim:SQ_RSRC_IMG_2D_ARRAY": ("img2da", "%images_arr", "simg2da", 3, "_ptr_UC_imga"),
                  # Cube: the shader already did face selection (v_cube*), and cube_coords maps (s, t, face) onto a
@@ -13817,6 +13848,19 @@ class Gen:
             return res
         self.image_read_typed(dim, t1, img, idx, dmask, vdata, d16, fetch)
 
+    def image_load_ms_typed(self, ms_arr, t1, iv, sample, idx, dmask, vdata, d16=False):
+        def view(cls):
+            ip, im = self.tmp(), self.tmp()
+            self.dynamic_sampled_access(ip, f"%_ptr_UC_itx_ms{cls}_{ms_arr}", f"%itx_ms{cls}_{ms_arr}", idx)
+            self.emit(f"{im} = OpLoad %itximg_ms{cls}_{ms_arr} {ip}")
+            return im
+
+        def fetch(image, _cls, ty):
+            res = self.tmp()
+            self.emit(f"{res} = OpImageFetch {ty} {image} {iv} Sample {sample}")
+            return res
+        self.image_read_typed(None, t1, None, idx, dmask, vdata, d16, fetch, view=view)
+
     def image_load_coherent(self, dim, t1, iv, idx, dmask, vdata, d16):
         """image_load with glc: a coherent read. On GFX10 a device-scope load is glc + dlc and a device-scope store
         glc (Mesa ac_get_hw_cache_flags maps ACCESS_COHERENT to exactly these bits); the POPS pixel shaders read and
@@ -13849,8 +13893,8 @@ class Gen:
         (0 float, 1 uint, 2 sint); by default the sampled image img for float and, for UINT and SINT, typed aliases
         of the dimension's sampled binding (SHADER-151), so no storage image feature is needed.
         dmask selects the output components; d16 packs two per VGPR."""
-        di = self.STORE_DIMS[dim][0]
         if view is None:
+            di = self.STORE_DIMS[dim][0]
             self.uses_int_fetch.add(di)
 
             def view(cls):
@@ -15408,12 +15452,14 @@ def assemble(gen):
          [f"%ms_out_f16h{n}_{h}" for n in ms_halves for h in (0, 1)])) if ms else []) + (
         ["%x_buf"] if gen.emulate or gen.bar_rounds and not gen.bar_counts_in_lds() else []) + (
         ([("%gs_in_pos" if sv == 1 else f"%gs_in{r}") for r, sv in gen.gs["in"]] +
-         [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         (["%fmt_uint_mask", "%fmt_sint_mask"] if gen.uses_store_views or gen.uses_int_fetch else []) + \
+         [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) + \
+        (["%fmt_uint_mask", "%fmt_sint_mask"] if gen.uses_store_views or gen.uses_int_fetch or gen.uses_ms_views else []) + \
          (["%fmt_norm_mask", "%fmt_f32_mask"] if gen.uses_d16_image else []) + \
         (["%fmt_size_tab"] if gen.uses_fmt_size else []) + \
         (["%fmt_desc_tab", "%fmt_norm_rep_tab"] if gen.uses_fmt_tables else []) + \
         [f"%stv{c}_{d}" for d in sorted(gen.uses_store_views) for c in range(3)] + \
-        [f"%itx{c}_{d}" for d in sorted(gen.uses_int_fetch) for c in (1, 2)]
+        [f"%itx{c}_{d}" for d in sorted(gen.uses_int_fetch) for c in (1, 2)] + \
+        [f"%itx_ms{c}_{arr}" for arr in sorted(gen.uses_ms_views) for c in (0, 1, 2)]
     psb = gen.uses_psb
     tex = gen.uses_tex
     sg = gen.uses_subgroup
@@ -15715,7 +15761,7 @@ def assemble(gen):
     if gen.uses_fmt_tables:
         gen.cu(128)
         gen.cu(17)
-    if gen.uses_store_views or gen.uses_int_fetch:
+    if gen.uses_store_views or gen.uses_int_fetch or gen.uses_ms_views:
         gen.cu(16)
         for words in Gen.int_format_masks():
             for w in words:
@@ -15741,7 +15787,7 @@ def assemble(gen):
         types.append(f"{fn_type} = OpTypeFunction %uint " + " ".join(["%uint"] * arity))
     # dedupe_types keeps the first uvec4 it meets: when the typed-image types follow, declare the ballot type after
     # them, so a shader that gains a ballot keeps the name %v4uint_st (SHADER-1016).
-    st_types = gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image
+    st_types = gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image or gen.uses_ms_views
     if gen.uses_ballot and not st_types:
         types.append("%v4uint_bal = OpTypeVector %uint 4")       # dedupe_types merges it with any other uvec4
     if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):
@@ -15798,7 +15844,7 @@ def assemble(gen):
                      " ".join(gen.lconsts[v] for v in Gen.fmt_norm_reps()))
         gvars += ["%fmt_desc_tab = OpVariable %_ptr_Private_fmt_desc Private %fmt_desc_init",
                   "%fmt_norm_rep_tab = OpVariable %_ptr_Private_fmt_rep Private %fmt_norm_rep_init"]
-    if gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image:
+    if gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image or gen.uses_ms_views:
         u, si = Gen.int_format_masks()
         types += ["%v4uint_st = OpTypeVector %uint 4", "%v4int_st = OpTypeVector %int 4",
                   *(["%v4uint_bal = OpTypeVector %uint 4"] if gen.uses_ballot else []),
@@ -15826,6 +15872,16 @@ def assemble(gen):
                 dec += [f"OpDecorate %itx{cls}_{di} DescriptorSet 0",
                         f"OpDecorate %itx{cls}_{di} Binding {Gen.SAMPLED_BINDINGS[di]}"]
                 gvars += [f"%itx{cls}_{di} = OpVariable %_ptr_UC_rt_itx{cls}_{di} UniformConstant"]
+        for arr in sorted(gen.uses_ms_views):
+            for cls, st in enumerate(("%float", "%uint", "%int")):
+                binding = 20 + 2 * cls + arr
+                types += [f"%itximg_ms{cls}_{arr} = OpTypeImage {st} 2D 0 {arr} 1 1 Unknown",
+                          f"%rt_itx_ms{cls}_{arr} = OpTypeRuntimeArray %itximg_ms{cls}_{arr}",
+                          f"%_ptr_UC_rt_itx_ms{cls}_{arr} = OpTypePointer UniformConstant %rt_itx_ms{cls}_{arr}",
+                          f"%_ptr_UC_itx_ms{cls}_{arr} = OpTypePointer UniformConstant %itximg_ms{cls}_{arr}"]
+                dec += [f"OpDecorate %itx_ms{cls}_{arr} DescriptorSet 0",
+                        f"OpDecorate %itx_ms{cls}_{arr} Binding {binding}"]
+                gvars += [f"%itx_ms{cls}_{arr} = OpVariable %_ptr_UC_rt_itx_ms{cls}_{arr} UniformConstant"]
         for di in sorted(gen.uses_store_views):
             _, sdim, arr, _ = next(v for v in Gen.STORE_DIMS.values() if v[0] == di)
             for cls, st in enumerate(("%float", "%uint", "%int")):
@@ -18989,6 +19045,9 @@ def main():
                     help="mesh shaders become compute shaders that write their vertices and primitives to a buffer "
                          "(metadata: mesh_compute), drawn by tools/mesh_compute_vs.py, for devices without "
                          "VK_EXT_mesh_shader (e.g. NVIDIA Pascal)")
+    ap.add_argument("--msaa-image-load", action="store_true",
+                    help="translate per-sample image_load on 2D MSAA textures and arrays for targets "
+                         "with all float, uint and sint multisample bindings in set 0 (20-25)")
     ap.add_argument("--shader-clock", choices=("off", "khr"), default="off",
                     help="s_memtime / s_memrealtime: off = Unsupported (default), khr = OpReadClockKHR (needs "
                          "VK_KHR_shader_clock; feature shaderSubgroupClock / shaderDeviceClock in the metadata)")
@@ -19038,10 +19097,11 @@ def main():
     MAX_SHARED_BYTES = a.max_shared_memory
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
-    global PC_TAIL_UBO
+    global PC_TAIL_UBO, MSAA_IMAGE_LOAD
     PC_TAIL_UBO = a.pc_tail_ubo
     global FMA_EXACT
     FMA_KHR = a.fma == "khr"
+    MSAA_IMAGE_LOAD = a.msaa_image_load
     SHADER_CLOCK = a.shader_clock == "khr"
     FMA_EXACT = a.fma == "exact"
     STRUCTURED = not a.dispatch_loop

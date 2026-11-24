@@ -543,7 +543,7 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
 
     `resources` binds descriptor-set variables by name: a StorageBuffer variable whose block is one runtime array
     of words takes a list of those words; a UniformConstant array of images takes a list with one entry per
-    descriptor index, each a function (coordinate, lod) -> the 4-tuple OpImageFetch returns. A descriptor variable
+    descriptor index, each a function (coordinate, lod_or_sample) -> the 4-tuple OpImageFetch returns. A descriptor variable
     left out stays declared but cannot be accessed (OpAccessChain into it raises)."""
     inputs = inputs or {}
     resources = resources or {}
@@ -852,8 +852,8 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             image = val(a[1])
             if not callable(image):
                 raise UnsupportedConstruct(f"OpImageFetch of an image no resource binds: {line}")
-            if len(a) != 5 or a[3] != "Lod":
-                raise UnsupportedConstruct(f"OpImageFetch other than with one Lod operand: {line}")
+            if len(a) != 5 or a[3] not in ("Lod", "Sample"):
+                raise UnsupportedConstruct(f"OpImageFetch needs one Lod or Sample operand: {line}")
             texel = tuple(image(val(a[2]), val(a[4])))
             kind = types.t[a[0]]
             if kind[0] != "vec" or len(texel) != kind[2]:
