@@ -613,6 +613,12 @@ no inline write, except one checked site in `libHttpClient.GDK.dll`, which impor
 result as an upper bound of about one site per image. Removing the compare and branch in front of the builder's
 `0x14972` write turns exactly that site into "not checked", so a missing check is visible.
 
+On the executable (`26,674,075` instructions scanned with `tools/inline_scan.py <exe> --sites`), there are **0
+`UNCHECKED` sites**: all 14 checked command-list inline sites compare against `+0x30` (×12) or `+0x28` (×2) — the
+remaining 96 `checked` hits in the image at `+0x8`, `+0x10`, `+0x20`, `+0x40` and `+0xd0` are non-list structs such
+as string/JSON writers — and the fallback vtable slots are `20`, `24`, `35`, `43`, `45` and `47`, all six already
+mapped by `console_to_pc_list_slot`.
+
 On the executable, `python -I tools/inline_scan.py <exe> --sites` answers the question in one pass (see the day-one
 list in `docs/design.md`): no unchecked site means a cursor-at-limit layer sees every command the game records; each
 unchecked site is listed by RVA and is a write that layer never sees. Its fallback-slot line is the set of console
@@ -780,9 +786,9 @@ Queues and fences are wrapped the same way.
   and `Evict` (34/35), `SetEventOnMultipleFenceCompletion` (45), `SetResidencyPriority` (46) and
   `EnqueueMakeResident` (50).
 - **QueryInterface.** It answers only the modelled interfaces, so no real object reaches the title.
-- **What is not covered.** Command lists are not wrapped yet: `ExecuteCommandLists` passes the lists through,
-  and a heap proxy given to a list's `SetDescriptorHeaps` reaches the real list unchanged. The command-list
-  proxy of §3.5a adds the unwrap at both places.
+- **Command-list wrapping (§3.5a).** `CreateCommandListX` (slot 73) wraps returned command lists in
+  `ListProxy`, `ExecuteCommandLists` unwraps the list array before forwarding, and `SetDescriptorHeaps` /
+  `ExecuteBundle` / `Reset` unwrap heap, bundle and allocator proxies.
 
 Command allocators get the same kind of proxy: device slot 9 (`CreateCommandAllocator`) returns one.
 

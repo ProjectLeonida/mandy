@@ -3829,6 +3829,36 @@ int check_console_command_list() {
         EXPECT(upload % 512 == 0);
         std::memset(reinterpret_cast<void*>(upload), 0x5a, 2048);
     }
+    // Fallback vtable slots measured in the title executable: 20->20, 24->24, 35->31, 43->39, 45->41, 47->43
+    raw(list_proxy, 20, 0x11, 0, 0, 0);
+    EXPECT(real_list->calls[20] == 1 && real_list->args[20][0] == 0x11);
+    raw(list_proxy, 24, 0x22, 0, 0, 0);
+    EXPECT(real_list->calls[24] == 1 && real_list->args[24][0] == 0x22);
+    raw(list_proxy, 35, 0x33, 0, 0, 0);
+    EXPECT(real_list->calls[31] == 1 && real_list->args[31][0] == 0x33);
+    raw(list_proxy, 43, 0x44, 0, 0, 0);
+    EXPECT(real_list->calls[39] == 1 && real_list->args[39][0] == 0x44);
+    raw(list_proxy, 45, 0x55, 0, 0, 0);
+    EXPECT(real_list->calls[41] == 1 && real_list->args[41][0] == 0x55);
+    {
+        D3D12_INDEX_BUFFER_VIEW view{0x66000, 4, DXGI_FORMAT_R16_UINT};
+        raw(list_proxy, 47, word(&view), 0, 0, 0);
+        EXPECT(real_list->calls[43] == 1);
+        EXPECT(view.BufferLocation == 0x66000);  // the proxy translates a copy, not the title's struct
+    }
+
+    // Console slot 85 (CopyTextureRegionX) -> PC slot 16
+    raw(list_proxy, 85, 0x77, 1, 2, 3);
+    EXPECT(real_list->calls[16] == 1 && real_list->args[16][0] == 0x77);
+
+    // Console slot 31 (ExecuteBundle) -> PC slot 27, unwrapping a wrapped bundle list
+    void* bundle_proxy = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), word(&bundle_proxy))) == S_OK);
+    EXPECT(xs::is_command_list_proxy(bundle_proxy));
+    void* real_bundle = xs::command_list_proxy_real_list(bundle_proxy);
+    raw(list_proxy, 31, word(bundle_proxy), 0, 0, 0);
+    EXPECT(real_list->calls[27] == 1 && real_list->args[27][0] == word(real_bundle));
+    EXPECT(release(bundle_proxy) == 0);
     EXPECT(xs::list_slot_hits(148) == 1);
     EXPECT(xs::list_slot_first_call_seen(148));
 
