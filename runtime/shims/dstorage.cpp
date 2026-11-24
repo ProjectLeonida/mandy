@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -413,8 +414,12 @@ bool guarded_move(void* destination, const void* source, size_t size) {
     // or an unwritable destination page returns false, which is what the access violation would have meant; a
     // use-after-check race can still fault, as with any probe-then-use check.
     auto range_ok = [](const void* base, size_t len, bool write) {
+        if (len == 0) return true;
         const uintptr_t start = reinterpret_cast<uintptr_t>(base);
-        for (uintptr_t page = start & ~uintptr_t{0xfff}; page < start + len; page += 0x1000) {
+        const uintptr_t max = (std::numeric_limits<uintptr_t>::max)();
+        if (len - 1 > max - start) return false;
+        const uintptr_t last = (start + len - 1) & ~uintptr_t{0xfff};
+        for (uintptr_t page = start & ~uintptr_t{0xfff};; page += 0x1000) {
             MEMORY_BASIC_INFORMATION mbi{};
             if (VirtualQuery(reinterpret_cast<LPCVOID>(page), &mbi, sizeof(mbi)) == 0 ||
                 mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
@@ -428,6 +433,7 @@ bool guarded_move(void* destination, const void* source, size_t size) {
                          access != PAGE_EXECUTE_WRITECOPY)) {
                 return false;
             }
+            if (page == last) break;
         }
         return true;
     };
