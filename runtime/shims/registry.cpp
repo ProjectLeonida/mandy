@@ -80,7 +80,8 @@ std::vector<Lookup> g_lookups;
 //  xaudio2_9.dll             XAudio2Create: HRESULT (learn.microsoft.com/windows/win32/api/xaudio2/
 //  xaudio2_9redist.dll       nf-xaudio2-xaudio2create). xaudio2_9.dll is the console name (docs/d3d12_vulkan.md §7).
 //  dstorage.dll              DStorageGetFactory: HRESULT (learn.microsoft.com/windows/win32/api/dstorage/
-//  dstorage_xs.dll           nf-dstorage-dstoragegetfactory). dstorage_xs.dll is the console name.
+//  dstorage_xs.dll           nf-dstorage-dstoragegetfactory). dstorage_xs.dll is the console name; the retail
+//  xcrdapi.dll               executable imports the same function from XCRDAPI.dll (docs/runtime_imports.md).
 const char* const kNotHResult[] = {
     "XAsyncCancel", "XAsyncComplete",
     "XTaskQueueCloseHandle", "XTaskQueueDispatch", "XTaskQueueGetCurrentProcessTaskQueue",
@@ -111,7 +112,7 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
         if (name == "XAudio2Create") return ReturnClass::HResult;
     } else if (dll == "gameinput.dll") {
         if (name == "GameInputCreate") return ReturnClass::HResult;
-    } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll") {
+    } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll" || dll == "xcrdapi.dll") {
         if (name == "DStorageGetFactory") return ReturnClass::HResult;
     } else if (dll == "acphal.dll") {
         if (name == "AcpHalAllocateShapeContexts" || name == "AcpHalCreate" ||
