@@ -3071,7 +3071,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 }
                 if (build->is_tlas && build->instance_pointers && build->instance_count) {
                     if (!vk.prepare_khr_instances || !vk.host_at || !vk.buffer_at) return ReplayResult::unsupported;
-                    return vk.prepare_khr_instances(*build, p.khr_instances);
+                    if (const auto r = vk.prepare_khr_instances(*build, p.khr_instances); r != ReplayResult::success)
+                        return r;
                 }
             }
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
