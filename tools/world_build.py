@@ -1218,6 +1218,7 @@ def _write_json_atomic(path: str, data: dict, replace=None) -> None:
     except BaseException:
         try:
             if tmp_path is not None:
+                os.chmod(tmp_path, 0o600)
                 os.remove(tmp_path)
         except OSError:
             pass

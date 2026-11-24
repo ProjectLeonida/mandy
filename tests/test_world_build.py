@@ -2068,6 +2068,24 @@ world_build.build_world(assets, output)
             with open(os.path.join(recovery, "previous", "c_0_0.glb"), "rb") as f:
                 self.assertEqual(f.read(), b"previous chunk")
 
+    def test_write_json_atomic_cleanup_restores_write_mode_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "world.json")
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def track_chmod(p, mode, **kwargs):
+                chmod_calls.append((p, mode))
+                return real_chmod(p, mode, **kwargs)
+
+            def failing_replace(src, dst):
+                raise OSError("replace failed")
+
+            with unittest.mock.patch("world_build.os.chmod", side_effect=track_chmod):
+                with self.assertRaises(OSError):
+                    world_build._write_json_atomic(dest, {"test": 1}, replace=failing_replace)
+            self.assertTrue(any(mode == 0o600 for p, mode in chmod_calls))
+
 
 # ---------------------------------------------------------------------------
 # 4. viewer/serve.py tests
