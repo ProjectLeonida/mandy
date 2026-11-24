@@ -217,6 +217,7 @@ public:
     HRESULT STDMETHODCALLTYPE Close() override {
         constexpr auto method = "ID3D12GraphicsCommandList::Close";
         if (list_.queries_open()) invalid_ = true;
+        if (in_render_pass_) invalid_ = true;  // a pass begun and not ended (WARP: E_FAIL); a suspended one is fine
         if (!list_.close()) return d3d12_trace::result(method, E_FAIL);
         stop_recording();
         return d3d12_trace::result(method, invalid_ ? E_INVALIDARG : S_OK);
@@ -233,6 +234,8 @@ public:
         if (!list_.reset()) return d3d12_trace::result(method, E_FAIL);  // D3D12 resets only closed lists
         record_into(command_allocator);
         invalid_ = false;
+        in_render_pass_ = pass_suspended_ = false;
+        pass_resolves_.clear();
         calls_.clear();
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
@@ -436,6 +439,90 @@ public:
     void STDMETHODCALLTYPE OMSetRenderTargets(UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL single_range,
                                               const D3D12_CPU_DESCRIPTOR_HANDLE* depth) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (in_render_pass_) return check(false);  // a render pass binds its own targets (WARP)
+        bind_targets(count, targets, single_range, depth);
+    }
+
+    // ID3D12GraphicsCommandList4 render passes (D3D-27; docs/d3d12_vulkan.md section 4.3, "Render passes"), emulated
+    // on the list's own commands as the PC runtime does for a driver at RenderPassesTier 0: BeginRenderPass binds the
+    // pass's targets and runs its CLEAR beginning accesses, EndRenderPass runs its RESOLVE ending accesses. DISCARD,
+    // PRESERVE (and the PRESERVE_LOCAL forms) and NO_ACCESS leave the contents as they are, which every one of them
+    // allows. A SUSPENDING pass keeps its ending accesses for the pass that resumes it, and a RESUMING pass does not
+    // run its beginning accesses again. The recording rules are WARP's, measured by d3d12_render_pass_test: no
+    // nesting, no End without a Begin, at most 8 targets, direct lists only, Close fails while a pass is open,
+    // copies, resolves, clears, DiscardResource and OMSetRenderTargets fail inside a pass (barriers do not), and a
+    // pass that follows a suspended one must resume it with no command recorded in between.
+    void STDMETHODCALLTYPE BeginRenderPass(UINT count, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* targets,
+                                           const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* depth,
+                                           D3D12_RENDER_PASS_FLAGS flags) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList4::BeginRenderPass");
+        if (list_.closed()) return;
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
+        if (in_render_pass_ || count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT || (count && !targets))
+            return check(false);
+        const bool resuming = (flags & D3D12_RENDER_PASS_FLAG_RESUMING_PASS) != 0;
+        if (pass_suspended_) {
+            if (!resuming || list_.commands().size() != suspended_at_) check(false);
+            pass_suspended_ = false;
+        }
+        in_render_pass_ = true;
+        pass_flags_ = flags;
+        pass_resolves_.clear();
+
+        std::array<D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> handles{};
+        for (UINT i = 0; i < count; ++i) handles[i] = targets[i].cpuDescriptor;
+        const D3D12_CPU_DESCRIPTOR_HANDLE ds = depth ? depth->cpuDescriptor : D3D12_CPU_DESCRIPTOR_HANDLE{};
+        bind_targets(count, handles.data(), FALSE, ds.ptr ? &ds : nullptr);
+
+        for (UINT i = 0; i < count; ++i) keep_resolve(targets[i].EndingAccess);
+        if (depth) {
+            keep_resolve(depth->DepthEndingAccess);
+            keep_resolve(depth->StencilEndingAccess);
+        }
+        if (resuming) return;  // the suspended pass ran these already
+
+        for (UINT i = 0; i < count; ++i) {
+            const auto& access = targets[i].BeginningAccess;
+            if (access.Type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR || !handles[i].ptr) continue;
+            const FLOAT* color = access.Clear.ClearValue.Color;
+            check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(handles[i].ptr),
+                                            {color[0], color[1], color[2], color[3]}, {}));
+        }
+        if (ds.ptr) {
+            UINT clear = 0;
+            if (depth->DepthBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
+                clear |= D3D12_CLEAR_FLAG_DEPTH;
+            if (depth->StencilBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
+                clear |= D3D12_CLEAR_FLAG_STENCIL;
+            if (clear)
+                check(list_.clear_depth_stencil(*reinterpret_cast<const leonida::TargetView*>(ds.ptr), clear,
+                                                depth->DepthBeginningAccess.Clear.ClearValue.DepthStencil.Depth,
+                                                depth->StencilBeginningAccess.Clear.ClearValue.DepthStencil.Stencil,
+                                                {}));
+        }
+    }
+
+    void STDMETHODCALLTYPE EndRenderPass() override {
+        d3d12_trace::record("ID3D12GraphicsCommandList4::EndRenderPass");
+        if (list_.closed()) return;
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT || !in_render_pass_) return check(false);
+        in_render_pass_ = false;
+        if (pass_flags_ & D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS) {
+            pass_suspended_ = true;
+            suspended_at_ = list_.commands().size();
+            return;  // the resuming pass ends with these accesses
+        }
+        for (PassResolve& resolve : pass_resolves_) {
+            for (auto& where : resolve.where)
+                resolve_region(resolve.dst, where.DstSubresource, where.DstX, where.DstY, resolve.src,
+                               where.SrcSubresource, &where.SrcRect, resolve.format, resolve.mode);
+        }
+        pass_resolves_.clear();
+    }
+
+private:
+    void bind_targets(UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL single_range,
+                      const D3D12_CPU_DESCRIPTOR_HANDLE* depth) {
         if (count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return check(false);
         render_targets_.fill({});
         render_target_count_ = count;
@@ -447,6 +534,25 @@ public:
         depth_ = depth && depth->ptr ? *reinterpret_cast<const leonida::TargetView*>(depth->ptr) : leonida::TargetView{};
     }
 
+    // A RESOLVE ending access, copied at BeginRenderPass (the caller's arrays need not outlive the call) and run by
+    // EndRenderPass. PreserveResolveSource changes nothing here: the source keeps its contents either way.
+    struct PassResolve {
+        ID3D12Resource* src;
+        ID3D12Resource* dst;
+        DXGI_FORMAT format;
+        D3D12_RESOLVE_MODE mode;
+        std::vector<D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS> where;
+    };
+    void keep_resolve(const D3D12_RENDER_PASS_ENDING_ACCESS& access) {
+        if (access.Type != D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE) return;
+        const auto& r = access.Resolve;
+        if (!r.pSrcResource || !r.pDstResource || (r.SubresourceCount && !r.pSubresourceParameters))
+            return check(false);
+        pass_resolves_.push_back({r.pSrcResource, r.pDstResource, r.Format, r.ResolveMode,
+                                  {r.pSubresourceParameters, r.pSubresourceParameters + r.SubresourceCount}});
+    }
+
+public:
     void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT factor[4]) override {
         if (list_.closed()) return;
         const std::array<float, 4> value = factor ? std::array<float, 4>{factor[0], factor[1], factor[2], factor[3]}
@@ -557,6 +663,7 @@ public:
     void STDMETHODCALLTYPE CopyBufferRegion(ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
                                             UINT64 src_offset, UINT64 bytes) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyBufferRegion");
+        if (in_render_pass_) return check(false);  // not inside a render pass (WARP)
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         check(list_.copy_buffer({resource_id(dst), dst_offset, resource_id(src), src_offset, bytes}));
     }
@@ -565,6 +672,7 @@ public:
                                      const D3D12_TILE_REGION_SIZE* size, ID3D12Resource* linear,
                                      UINT64 linear_offset, D3D12_TILE_COPY_FLAGS flags) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyTiles");
+        if (in_render_pass_) return check(false);  // not inside a render pass (WARP)
         const auto direction = flags & ~D3D12_TILE_COPY_FLAG_NO_HAZARD;
         const bool to_linear = direction == D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER;
         const auto grid = tile_grid(tiled);
@@ -612,6 +720,7 @@ public:
     void STDMETHODCALLTYPE CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, UINT y, UINT z,
                                              const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyTextureRegion");
+        if (in_render_pass_) return check(false);  // not inside a render pass (WARP)
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!dst || !src) return check(false);
         leonida::CopyTexture copy{location(*dst), x, y, z, location(*src), box != nullptr, {}};
@@ -621,6 +730,7 @@ public:
 
     void STDMETHODCALLTYPE CopyResource(ID3D12Resource* dst, ID3D12Resource* src) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyResource");
+        if (in_render_pass_) return check(false);  // not inside a render pass (WARP)
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (dst && dst == src) {
             // A self-copy on a DEFAULT heap is a no-op, but an UPLOAD/READBACK resource still cannot
@@ -637,6 +747,7 @@ public:
     void STDMETHODCALLTYPE ResolveSubresource(ID3D12Resource* dst, UINT dst_subresource, ID3D12Resource* src,
                                               UINT src_subresource, DXGI_FORMAT format) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ResolveSubresource");
+        if (in_render_pass_) return check(false);  // not inside a render pass (WARP)
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         const auto integer_color = [](ID3D12Resource* resource) {
             if (!resource) return false;
@@ -655,6 +766,13 @@ public:
                                                      ID3D12Resource* src, UINT src_subresource, D3D12_RECT* rect,
                                                      DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) override {
         d3d12_trace::record("ID3D12GraphicsCommandList1::ResolveSubresourceRegion");
+        if (in_render_pass_) return check(false);
+        resolve_region(dst, dst_subresource, x, y, src, src_subresource, rect, format, mode);
+    }
+
+    // ResolveSubresourceRegion without the trace line; a render pass's RESOLVE ending access runs through it too.
+    void resolve_region(ID3D12Resource* dst, UINT dst_subresource, UINT x, UINT y, ID3D12Resource* src,
+                        UINT src_subresource, const D3D12_RECT* rect, DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) {
         if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         leonida::ResolveRegion region{x, y, std::nullopt};
         if (mode != D3D12_RESOLVE_MODE_AVERAGE || !color_resolve_format_matches(format, dst, src)) {
@@ -696,6 +814,7 @@ public:
     void STDMETHODCALLTYPE ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE view, const FLOAT color[4], UINT count,
                                                  const D3D12_RECT* rects) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearRenderTargetView");
+        if (in_render_pass_) return check(false);  // not inside a render pass (WARP)
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr || !color) return check(false);
         check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(view.ptr),
@@ -706,6 +825,7 @@ public:
                                                  FLOAT depth, UINT8 stencil, UINT count,
                                                  const D3D12_RECT* rects) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearDepthStencilView");
+        if (in_render_pass_) return check(false);  // not inside a render pass (WARP)
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr) return check(false);
         check(list_.clear_depth_stencil(*reinterpret_cast<const leonida::TargetView*>(view.ptr), u(flags), depth,
@@ -714,6 +834,7 @@ public:
 
     // A null region discards the whole resource. Not allowed in a bundle.
     void STDMETHODCALLTYPE DiscardResource(ID3D12Resource* resource, const D3D12_DISCARD_REGION* region) override {
+        if (in_render_pass_) return check(false);  // not inside a render pass (WARP)
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!region) return check(list_.discard({resource_id(resource), 0, 0, false, true}));
         if (region->NumRects && !region->pRects) return check(false);
@@ -1251,6 +1372,13 @@ private:
     CommandAllocator* allocator_ = nullptr;  // referenced while the list is open
     leonida::CommandList list_;
     bool invalid_ = false;
+    // Render passes (BeginRenderPass). pass_suspended_: the last pass ended with SUSPENDING_PASS, at suspended_at_
+    // recorded commands; the next pass must resume it with nothing recorded in between.
+    bool in_render_pass_ = false;
+    D3D12_RENDER_PASS_FLAGS pass_flags_ = D3D12_RENDER_PASS_FLAG_NONE;
+    std::vector<PassResolve> pass_resolves_;
+    bool pass_suspended_ = false;
+    std::size_t suspended_at_ = 0;
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
     RootState compute_;
