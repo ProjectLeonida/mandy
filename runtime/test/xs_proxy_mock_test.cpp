@@ -1387,6 +1387,25 @@ int check_committed_resource3_x() {
     return 0;
 }
 
+int check_derived_pso_slot55() {
+    EXPECT(xs::device_slot_overridden(55));
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 10, true);
+    EXPECT(device != nullptr);
+    xs::reset_device_proxy_stats();
+    void* out = reinterpret_cast<void*>(0x1111);
+    const unsigned pc55_before = mock->calls[55];
+    EXPECT(hr_of(raw(device, 55, 0, 1, 0, word(&kResourceIid), word(&out))) == E_POINTER && out == nullptr);
+
+    out = reinterpret_cast<void*>(0x1111);
+    unsigned char rec[0x14c]{};
+    EXPECT(hr_of(raw(device, 55, 0, 1, word(rec), word(&kResourceIid), word(&out))) == E_FAIL && out == nullptr);
+    EXPECT(mock->calls[55] == pc55_before && xs::device_slot_hits(55) == 2);
+    EXPECT(release(device) == 0);
+    std::printf("%s: device slot 55 refuses null/unkept inputs without reaching PC slot 55\n", g_label);
+    return 0;
+}
+
 }  // namespace
 
 // A failure ends the process with a message on stderr, never in a dialog a test run would wait on: abort() (an
@@ -1718,7 +1737,7 @@ int main(int argc, char** argv) {
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list() ||
         check_custom_heap_properties() ||
         check_resource_allocation_info() || check_slot70() || check_committed_resource3_x() ||
-        check_presentation_wiring())
+        check_presentation_wiring() || check_derived_pso_slot55())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

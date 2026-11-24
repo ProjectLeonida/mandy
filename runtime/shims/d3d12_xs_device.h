@@ -153,7 +153,7 @@ bool set_presentation_handler(void* device, const PresentationHandler* handler);
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 26 (the console's struct-return form),
 // 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
-// 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 70, 76 and 127. Slot 10 is intentionally false: the
+// 78/79/80 (the Xbox slots above, at their configured indices), 55, 62, 67, 70, 76 and 127. Slot 10 is intentionally false: the
 // measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
 // handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);

@@ -6576,8 +6576,9 @@ int main() {
                 Ref<ID3D12Device4> device4;
                 Ref<ID3D12Device10> device10;
                 Ref<ID3D12Resource> one, two;
-                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p))));
-                // Not through the proxy: its slot 78 is the Xbox SetFrameIntervalX (2dbcb882c), not this method.
+                // Not through the proxy: slot 55 is Xbox CreateDerivedPipelineState and slot 78 is Xbox
+                // SetFrameIntervalX (2dbcb882c), not PC CreateReservedResource1/2.
+                EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device4.p))));
                 EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device10.p))));
                 EXPECT(SUCCEEDED(device4->CreateReservedResource1(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                                   nullptr, IID_PPV_ARGS(&one.p))));

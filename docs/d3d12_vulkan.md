@@ -92,6 +92,15 @@ enough for the bundled middleware's `d3d12_xs` calls, not for the game. The laye
   start handles returned in RAX at heap slots 9/10. Implement the public chain plus those measured overrides
   explicitly; do not assume every slot. Device 11 adds `CreateSampler2`; command list 8 adds
   `OMSetFrontAndBackStencilRef` (public SDK).
+- **Derived pipeline states (device slot 55).** `CreateDerivedPipelineState(pBasePSO, n, pRecords, riid, out)`
+  (`runtime/shims/d3d12_xs_pso_stream.cpp`, `n` = 1..4 records of `0x14c` bytes: a u32 tag and payload at `+4`) patches a
+  deep copy of the base PSO's `D3D12_PIPELINE_STATE_STREAM_DESC` (stored as `ID3D12Object` private data and freed
+  with the PSO) and creates the derived PSO through PC slot 47 (`ID3D12Device2::CreatePipelineState`), keeping the
+  patched stream on the new PSO too (ready for console slot 86 via `#727` once merged). Tags 0 (`D3D12_DEPTH_STENCIL_DESC`
+  on `DEPTH_STENCIL` or `DEPTH_STENCIL1`), 1 (`D3D12_RASTERIZER_DESC`, `0x2c` bytes), 2 (`D3D12_BLEND_DESC`, `0x148`
+  bytes), 3 (`SAMPLE_MASK`) and 5 (`0x16` bytes: `StencilReadMask` and `StencilWriteMask` overlaid at payload `+0x10`/`+0x11`
+  of `DEPTH_STENCIL`/`DEPTH_STENCIL1`, applied in record order) are supported; any other tag, unmodelled stream
+  subobjects (such as `VIEW_INSTANCING`), or a base without a kept stream is refused (`E_INVALIDARG`/`E_FAIL`, null output).
 - **Unknown IIDs and slots.** `QueryInterface` must log the IID and return `E_NOINTERFACE` if it is not in the
   public chain. If the game then fails, the IID and the call site identify the Xbox-specific interface to reverse.
   Do not invent a vtable for an unknown IID: a wrong slot is worse than a clean failure.
