@@ -902,11 +902,49 @@ private:
         return hr;
     }
 
+    // The user's calibrated BC6H/BC7 history, read once: the sidecar named by LEONIDA_BCPACK_HISTORY, or else
+    // bcpack_history.bin next to the runtime's executable (tools/bcpack_history_sidecar.py writes it from the history
+    // the user calibrated from their own copy). Null without one: every built-in BC6H/BC7 entry is then unknown.
+    static const leonida::bcpack::History* calibrated_history() {
+        static const leonida::bcpack::History* const loaded = [] () -> const leonida::bcpack::History* {
+            std::wstring path;
+            if (const DWORD n = GetEnvironmentVariableW(L"LEONIDA_BCPACK_HISTORY", nullptr, 0); n > 1) {
+                path.resize(n);
+                path.resize(GetEnvironmentVariableW(L"LEONIDA_BCPACK_HISTORY", path.data(), n));
+            } else {
+                wchar_t module[MAX_PATH];
+                const DWORD len = GetModuleFileNameW(nullptr, module, MAX_PATH);
+                if (len == 0 || len >= MAX_PATH) return nullptr;
+                path.assign(module, len);
+                path.resize(path.find_last_of(L"\\/") + 1);
+                path += L"bcpack_history.bin";
+            }
+            const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                            FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (file == INVALID_HANDLE_VALUE) return nullptr;  // none given: not an error
+            std::vector<uint8_t> bytes(70000);
+            DWORD got = 0;
+            const BOOL ok = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &got, nullptr);
+            CloseHandle(file);
+            bytes.resize(ok ? got : 0);
+            auto* history = new leonida::bcpack::History;
+            if (!leonida::bcpack::read_history_sidecar(bytes, *history)) {
+                delete history;
+                log_once("bcpack history file", "the BCPack history sidecar is not a BCPHIST1 file: ignored");
+                return nullptr;
+            }
+            log_once("bcpack history file", "BCPack requests use the calibrated BC6H/BC7 history sidecar");
+            return history;
+        }();
+        return loaded;
+    }
+
     // A BCPack request whose checks have passed: the source goes into a staging buffer, is inflated to
     // IntermediateSize bytes first when the request is zlib too, and is decoded into DestinationSize bytes of BCn
-    // blocks (leonida::bcpack::decode, lenient). The blocks reach the destination only when the whole chunk decoded,
-    // so a failed one leaves the destination as it was. A chunk that rests on built-in history nobody has measured
-    // (BC6H and BC7 have none) decodes with a few wrong blocks rather than failing, and is logged once.
+    // blocks (leonida::bcpack::decode, lenient, with the calibrated history when there is one). The blocks reach the
+    // destination only when the whole chunk decoded, so a failed one leaves the destination as it was. A chunk that
+    // rests on built-in history nobody has measured decodes with a few wrong blocks rather than failing, and is
+    // logged once.
     HRESULT unpack_request(const Entry& e, bool memory, unsigned mode) {
         const DSTORAGE_REQUEST& r = e.request;
         std::vector<uint8_t> source, blocks;
@@ -940,7 +978,8 @@ private:
         }
         leonida::bcpack::Result decoded{};
         if (SUCCEEDED(hr)) {
-            decoded = leonida::bcpack::decode(source, mode, blocks, leonida::bcpack::Options{nullptr, true});
+            const leonida::bcpack::Options options{calibrated_history(), true};
+            decoded = leonida::bcpack::decode(source, mode, blocks, options);
             if (decoded.status != leonida::bcpack::Status::ok) {
                 log_once(std::string("bcpack ") + leonida::bcpack::status_name(decoded.status),
                          std::string("a BCPack request could not be decoded: ") +

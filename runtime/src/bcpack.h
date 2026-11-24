@@ -61,14 +61,34 @@ struct Lanes {
 Status decode_lanes(std::span<const std::uint8_t> in, std::span<const std::uint8_t> widths, std::size_t count,
                     Lanes& out);
 
-// Confirmed history entries from the user's calibrated tables (tools/bcpack_history_calib.py), to use besides the
-// built-in ones: entry e of mode m at values[m][e * K .. e * K + K) with K = 6, 8, 2, 4 for modes 1, 3, 4, 5; -1 or a
-// short vector means "not given". An entry given here wins over the built-in one (`_resolve_bc_history`'s merge).
-// BC6H's and BC7's calibrated history is not read yet: their built-in entries are all unknown, so strict decoding
-// refuses a chunk that refers to one and lenient decoding takes zeros.
+// The user's calibrated built-in history (tools/bcpack_history_calib.py), which the repository does not carry.
+//  - BC1, BC3, BC4, BC5: confirmed entries besides the built-in ones, entry e of mode m at values[m][e * K .. e * K + K)
+//    with K = 6, 8, 2, 4 for modes 1, 3, 4, 5; -1 or a short vector means "not given". An entry given here wins over
+//    the built-in one (`_resolve_bc_history`'s merge).
+//  - BC6H and BC7: the tables `load_bc6h` / `load_bc7` of tools/bcpack_tables_bptc.py make from the history JSON,
+//    read from the sidecar tools/bcpack_history_sidecar.py writes (read_history_sidecar). Without them every built-in
+//    BC6H/BC7 entry is unknown: strict decoding refuses a chunk that refers to one, lenient decoding takes zeros.
 struct History {
     std::array<std::vector<std::int16_t>, 8> values;
+
+    struct Bc6hEntry {
+        std::array<std::array<std::uint16_t, 4>, 3> endpoints{};  // per channel: w, x, y, z
+        std::array<std::uint8_t, 16> indices{};
+        std::array<std::array<std::uint8_t, 4>, 3> endpoint_confirmed_bits{};
+        std::array<std::uint8_t, 16> index_confirmed_bits{};
+        std::uint8_t endpoint_class = 0, index_class = 0;  // 0 unknown, 1 fitted, 2 last resort, 3 confirmed
+    };
+    struct Bc7Entry {
+        std::array<std::uint8_t, 24> endpoints{}, endpoint_bits{}, endpoint_confirmed_bits{};
+        std::array<std::uint8_t, 32> indices{}, index_bits{}, index_confirmed_bits{};
+    };
+    std::vector<Bc6hEntry> bc6h;  // 256 entries, or empty: all unknown
+    std::vector<Bc7Entry> bc7;    // 256 entries, or empty: all unknown
 };
+
+// Reads the "BCPHIST1" sidecar of tools/bcpack_history_sidecar.py (60,936 bytes) into `out`'s BC6H and BC7 tables.
+// False, leaving `out` unchanged, for anything else.
+bool read_history_sidecar(std::span<const std::uint8_t> bytes, History& out);
 
 struct Options {
     const History* history = nullptr;

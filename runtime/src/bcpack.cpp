@@ -104,11 +104,19 @@ std::int64_t rem(std::int64_t v, std::int64_t m) {
     return r < 0 ? r + m : r;
 }
 
-// The decode in progress: the policy, and per block whether it rests on an unknown history entry (`lost`).
+// The decode in progress: the policy, the user's calibrated history, and per block whether it rests on an unknown
+// history entry (`lost`).
 struct Ctx {
     bool lenient = false;
+    const History* history = nullptr;
     std::vector<std::uint8_t> lost;
     std::size_t guessed() const { return static_cast<std::size_t>(std::count(lost.begin(), lost.end(), 1)); }
+    const History::Bc6hEntry* bc6h(std::size_t entry) const {
+        return history && history->bc6h.size() == 256 ? &history->bc6h[entry] : nullptr;
+    }
+    const History::Bc7Entry* bc7(std::size_t entry) const {
+        return history && history->bc7.size() == 256 ? &history->bc7[entry] : nullptr;
+    }
 };
 
 // The base of block i: the zero state, an earlier block, or a confirmed history entry (external first). An entry
@@ -344,9 +352,52 @@ bool bc7_inferred(int rank) {
     return std::find(tables::kBc7Inferred.begin(), tables::kBc7Inferred.end(), rank) != tables::kBc7Inferred.end();
 }
 
+// `_bc7_field_bits`: the leading bits of a stored endpoint byte a mode reads per channel (R, G, B, A).
+std::array<int, 4> bc7_field_bits(int mode, int rot) {
+    int w[4] = {kB7Colour[mode], kB7Colour[mode], kB7Colour[mode], kB7Alpha[mode]};
+    if (rot) {
+        w[rot - 1] = kB7Alpha[mode];
+        w[3] = kB7Colour[mode];
+    }
+    std::array<int, 4> bits{};
+    for (int c = 0; c < 4; ++c) bits[c] = w[c] ? w[c] + ((kB7PBits[mode] && c == 0) ? 1 : 0) : 0;
+    return bits;
+}
+
+// Whether a direct read of built-in entry `entry` by a block of `mode` / `rot` finds every bit it needs known
+// (`endpoint_bits` / `index_bits` at least what the mode reads), as `_bc7_check` measures it. `confirmed` asks the
+// confirmed depths instead. Without a calibrated table nothing is known.
+bool bc7_endpoint_known(const Ctx& ctx, std::size_t entry, int mode, int rot, bool confirmed) {
+    const History::Bc7Entry* h = ctx.bc7(entry);
+    const std::array<int, 4> bits = bc7_field_bits(mode, rot);
+    for (int sub = 0; sub < kB7Subsets[mode]; ++sub)
+        for (int e = 0; e < 2; ++e)
+            for (int c = 0; c < 4; ++c) {
+                if (!bits[c]) continue;
+                const std::size_t j = static_cast<std::size_t>(sub * 8 + e * 4 + c);
+                const int have = h ? (confirmed ? h->endpoint_confirmed_bits[j] : h->endpoint_bits[j]) : 0;
+                if (have < bits[c]) return false;
+            }
+    return true;
+}
+
+bool bc7_index_known(const Ctx& ctx, std::size_t entry, int mode, bool confirmed) {
+    const History::Bc7Entry* h = ctx.bc7(entry);
+    const int want[2] = {kB7IndexBits[mode], (mode == 4 || mode == 5) ? 2 : 0};
+    for (int st = 0; st < 2; ++st)
+        for (int p = 0; p < 16 && want[st]; ++p) {
+            const std::size_t j = static_cast<std::size_t>(st * 16 + p);
+            const int have = h ? (confirmed ? h->index_confirmed_bits[j] : h->index_bits[j]) : 0;
+            if (have < want[st]) return false;
+        }
+    return true;
+}
+
 Status bc7(const Lanes& l, Ctx& ctx, std::span<std::uint8_t> out) {
     const std::size_t n = l.count / 2;
-    // _bc7_check: every signature in the table, none inferred, no reference into the built-in history.
+    // _bc7_check: every signature in the table; strict: none inferred, and every bit a block reads from the built-in
+    // history known and confirmed. `_bc7_check` takes, per entry, the most bits any block reads from it; a slot short
+    // for one reader is short for that maximum, so checking each direct read on its own refuses the same chunks.
     for (std::size_t i = 0; i < n; ++i) {
         const int rank = bc7_rank(l.at(15, 2 * i), l.at(15, 2 * i + 1));
         if (rank < 0 || tables::kBc7Config[rank][0] > 7 || tables::kBc7Config[rank][1] == 255) return Status::bad_block;
@@ -355,11 +406,20 @@ Status bc7(const Lanes& l, Ctx& ctx, std::span<std::uint8_t> out) {
         for (std::size_t i = 0; i < n; ++i)
             if (bc7_inferred(bc7_rank(l.at(15, 2 * i), l.at(15, 2 * i + 1)))) return Status::unconfirmed_history;
         for (std::size_t i = 0; i < std::min<std::size_t>(n, 256); ++i) {
+            const auto& cfg = tables::kBc7Config[static_cast<std::size_t>(bc7_rank(l.at(15, 2 * i), l.at(15, 2 * i + 1)))];
             const int di = inter8(l.at(1, 2 * i), l.at(1, 2 * i + 1));
             const int de = (di + static_cast<int>(unzig(static_cast<std::uint16_t>(inter8(l.at(0, 2 * i),
                                                                                           l.at(0, 2 * i + 1)))))) & 255;
-            if (static_cast<std::size_t>(de) > i || static_cast<std::size_t>(di) > i)
-                return Status::unconfirmed_history;
+            if (static_cast<std::size_t>(de) > i) {
+                const std::size_t entry = 256 + i - static_cast<std::size_t>(de);
+                for (const bool confirmed : {false, true})
+                    if (!bc7_endpoint_known(ctx, entry, cfg[0], cfg[2], confirmed)) return Status::unconfirmed_history;
+            }
+            if (static_cast<std::size_t>(di) > i) {
+                const std::size_t entry = 256 + i - static_cast<std::size_t>(di);
+                for (const bool confirmed : {false, true})
+                    if (!bc7_index_known(ctx, entry, cfg[0], confirmed)) return Status::unconfirmed_history;
+            }
         }
     }
 
@@ -381,13 +441,21 @@ Status bc7(const Lanes& l, Ctx& ctx, std::span<std::uint8_t> out) {
             rep = eps[i - static_cast<std::size_t>(de)];
             lost_e[i] = lost_e[i - static_cast<std::size_t>(de)];
         } else if (de) {
-            lost_e[i] = 1;  // the built-in entry is unknown: the zero state
+            // The built-in entry: the calibrated endpoints where they are given (all zero otherwise, as Python's
+            // empty table), and the block is guessed unless every bit it reads is known.
+            const std::size_t entry = 256 + i - static_cast<std::size_t>(de);
+            if (const History::Bc7Entry* h = ctx.bc7(entry))
+                for (std::size_t k = 0; k < 24; ++k) rep[k] = h->endpoints[k];
+            lost_e[i] = !bc7_endpoint_known(ctx, entry, mode, rot, false);
         }
         if (di && static_cast<std::size_t>(di) <= i) {
             rix = ixs[i - static_cast<std::size_t>(di)];
             lost_i[i] = lost_i[i - static_cast<std::size_t>(di)];
         } else if (di) {
-            lost_i[i] = 1;
+            const std::size_t entry = 256 + i - static_cast<std::size_t>(di);
+            if (const History::Bc7Entry* h = ctx.bc7(entry))
+                for (std::size_t k = 0; k < 32; ++k) rix[k] = h->indices[k];
+            lost_i[i] = !bc7_index_known(ctx, entry, mode, false);
         }
         ctx.lost[i] = lost_e[i] || lost_i[i];
 
@@ -566,7 +634,7 @@ Status bc6h(const Lanes& l, Ctx& ctx, std::span<std::uint8_t> out) {
     std::vector<Endpoints> st_e(n);
     std::vector<std::array<int, 16>> st_i(n);
     std::vector<std::uint8_t> lost_e(n, 0), lost_i(n, 0);
-    bool unknown_reference = false;
+    bool history_refused = false;  // strict: a direct read of a built-in entry that is not confirmed
     std::size_t violations = 0;
     for (std::size_t i = 0; i < n; ++i) {
         const std::size_t a = 2 * i, b = 2 * i + 1;
@@ -585,8 +653,22 @@ Status bc6h(const Lanes& l, Ctx& ctx, std::span<std::uint8_t> out) {
             eref = st_e[i - static_cast<std::size_t>(de)];
             lost_e[i] = lost_e[i - static_cast<std::size_t>(de)];
         } else {
-            lost_e[i] = 1;  // the built-in entry is unknown: zeros
-            unknown_reference = true;
+            // A built-in entry: the calibrated values (zeros without a table, Python's empty one). Strict needs it
+            // confirmed (class 3) with every bit this block's mode reads confirmed; a block on an unknown entry
+            // (class 0) is guessed. Fitted and last-resort entries (1, 2) decode without counting, as in Python.
+            const History::Bc6hEntry* h = ctx.bc6h(256 + i - static_cast<std::size_t>(de));
+            if (h)
+                for (std::size_t c = 0; c < 3; ++c)
+                    for (std::size_t q = 0; q < 4; ++q) eref[c][q] = h->endpoints[c][q];
+            const int cls = h ? h->endpoint_class : 0;
+            bool weak = false;
+            for (std::size_t c = 0; c < 3 && h; ++c) {
+                const int dc = md.delta[c];
+                const int need[4] = {md.base, dc, md.regions == 2 ? dc : 0, md.regions == 2 ? dc : 0};
+                for (std::size_t q = 0; q < 4; ++q) weak = weak || h->endpoint_confirmed_bits[c][q] < need[q];
+            }
+            history_refused = history_refused || cls != 3 || weak;
+            lost_e[i] = cls == 0;
         }
         std::array<int, 16> iref{};
         if (di == 0) {
@@ -595,8 +677,14 @@ Status bc6h(const Lanes& l, Ctx& ctx, std::span<std::uint8_t> out) {
             iref = st_i[i - static_cast<std::size_t>(di)];
             lost_i[i] = lost_i[i - static_cast<std::size_t>(di)];
         } else {
-            lost_i[i] = 1;
-            unknown_reference = true;
+            const History::Bc6hEntry* h = ctx.bc6h(256 + i - static_cast<std::size_t>(di));
+            if (h)
+                for (std::size_t p = 0; p < 16; ++p) iref[p] = h->indices[p];
+            const int cls = h ? h->index_class : 0;
+            bool weak = false;
+            for (std::size_t p = 0; p < 16 && h; ++p) weak = weak || h->index_confirmed_bits[p] < (md.regions == 2 ? 3 : 4);
+            history_refused = history_refused || cls != 3 || weak;
+            lost_i[i] = cls == 0;
         }
 
         const int regions = md.regions, base = md.base, w_shift = 16 - base;
@@ -666,13 +754,50 @@ Status bc6h(const Lanes& l, Ctx& ctx, std::span<std::uint8_t> out) {
         ctx.lost[i] = lost_e[i] || lost_i[i] || (bad && ctx.lenient);
     }
     if (!ctx.lenient) {
-        if (unknown_reference) return Status::unconfirmed_history;
+        if (history_refused) return Status::unconfirmed_history;
         if (violations) return Status::bad_block;
     }
     return Status::ok;
 }
 
 }  // namespace
+
+bool read_history_sidecar(std::span<const std::uint8_t> bytes, History& out) {
+    static constexpr char kMagic[8] = {'B', 'C', 'P', 'H', 'I', 'S', 'T', '1'};
+    constexpr std::size_t kBc6h = 70, kBc7 = 168, kSize = 8 + 256 * (kBc6h + kBc7);
+    if (bytes.size() != kSize || !std::equal(std::begin(kMagic), std::end(kMagic), bytes.begin())) return false;
+    std::vector<History::Bc6hEntry> bc6h(256);
+    std::vector<History::Bc7Entry> bc7(256);
+    const std::uint8_t* p = bytes.data() + 8;
+    for (History::Bc6hEntry& e : bc6h) {
+        for (auto& channel : e.endpoints)
+            for (auto& v : channel) {
+                v = static_cast<std::uint16_t>(p[0] | (p[1] << 8));
+                p += 2;
+            }
+        for (auto& v : e.indices) v = *p++;
+        for (auto& channel : e.endpoint_confirmed_bits)
+            for (auto& v : channel) v = *p++;
+        for (auto& v : e.index_confirmed_bits) v = *p++;
+        e.endpoint_class = *p++;
+        e.index_class = *p++;
+    }
+    // Per BC7 entry: endpoints, endpoint bits, endpoint confirmed bits (24 bytes each), then indices, index bits,
+    // index confirmed bits (32 bytes each).
+    for (History::Bc7Entry& e : bc7) {
+        for (auto* table : {&e.endpoints, &e.endpoint_bits, &e.endpoint_confirmed_bits}) {
+            std::copy(p, p + 24, table->begin());
+            p += 24;
+        }
+        for (auto* table : {&e.indices, &e.index_bits, &e.index_confirmed_bits}) {
+            std::copy(p, p + 32, table->begin());
+            p += 32;
+        }
+    }
+    out.bc6h = std::move(bc6h);
+    out.bc7 = std::move(bc7);
+    return true;
+}
 
 const char* status_name(Status status) {
     switch (status) {
@@ -935,6 +1060,7 @@ Result decode(std::span<const std::uint8_t> in, std::uint32_t mode, std::span<st
     const std::span<const std::int16_t> external = external_for(options.history, mode);
     Ctx ctx;
     ctx.lenient = options.lenient;
+    ctx.history = options.history;
     ctx.lost.assign(out.size() / bytes, 0);
     Status s;
     switch (mode) {

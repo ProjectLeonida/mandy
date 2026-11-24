@@ -81,6 +81,47 @@ int main() {
         if (r.status == Status::ok && r.guessed) ++lenient_guessed;
     }
 
+    // The user's calibrated BC6H/BC7 history, through its sidecar (a synthetic one here): strict decoding against
+    // tools/bcpack.py with the same history, lenient against its provisional mode, and the history has to matter.
+    bp::History calibrated;
+    check(bp::read_history_sidecar(bcpack_vectors::kHistorySidecar, calibrated) && calibrated.bc6h.size() == 256 &&
+              calibrated.bc7.size() == 256,
+          "the synthetic history sidecar reads");
+    int hist_ok = 0, hist_lenient = 0, needs_history = 0;
+    for (std::size_t k = 0; k < std::size(bcpack_vectors::kHistoryCases); ++k) {
+        const auto& c = bcpack_vectors::kHistoryCases[k];
+        std::vector<std::uint8_t> strict(c.out_size), loose(c.out_size), without(c.out_size);
+        const bp::Result s = bp::decode({c.raw, c.raw_size}, c.mode, strict, bp::Options{&calibrated, false});
+        char what[160];
+        std::snprintf(what, sizeof what, "history case %zu (mode %u): status %d (%s), Python %d", k, c.mode,
+                      static_cast<int>(s.status), bp::status_name(s.status), c.status);
+        check(static_cast<int>(s.status) == c.status, what);
+        if (s.status == Status::ok && c.status == 0) {
+            std::snprintf(what, sizeof what, "history case %zu (mode %u): the same blocks", k, c.mode);
+            check(std::memcmp(strict.data(), c.blocks, c.out_size) == 0, what);
+            ++hist_ok;
+            if (bp::decode({c.raw, c.raw_size}, c.mode, without) != Status::ok) ++needs_history;
+        }
+        const bp::Result r = bp::decode({c.raw, c.raw_size}, c.mode, loose, bp::Options{&calibrated, true});
+        if (c.lenient_known) {
+            std::snprintf(what, sizeof what, "history case %zu (mode %u): lenient gives Python's provisional blocks",
+                          k, c.mode);
+            check(r.status == Status::ok && std::memcmp(loose.data(), c.lenient_blocks, c.out_size) == 0, what);
+            ++hist_lenient;
+        }
+    }
+    check(hist_ok > 0 && hist_lenient > 0, "the history cases hold strict and provisional decodes");
+    check(needs_history > 0, "some chunk decodes strictly only with the calibrated history");
+    std::vector<std::uint8_t> sidecar(bcpack_vectors::kHistorySidecar, std::end(bcpack_vectors::kHistorySidecar));
+    bp::History untouched;
+    sidecar[0] ^= 1;
+    check(!bp::read_history_sidecar(sidecar, untouched) && untouched.bc7.empty(), "a sidecar with the wrong magic");
+    sidecar[0] ^= 1;
+    sidecar.pop_back();
+    check(!bp::read_history_sidecar(sidecar, untouched) && untouched.bc6h.empty(), "a sidecar of the wrong size");
+    std::printf("bcpack history: %d strict decodes against Python, %d of them only with the history; %d lenient\n",
+                hist_ok, needs_history, hist_lenient);
+
     // Refusals that need no stream.
     std::vector<std::uint8_t> out(32);
     const std::uint8_t none[1] = {0};

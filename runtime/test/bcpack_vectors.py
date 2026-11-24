@@ -117,10 +117,10 @@ def block_cases(rng, count):
     return out
 
 
-def _reference(raw, codec, size):
+def _reference(raw, codec, size, history=None):
     """(status, blocks) of the strict Python decode of `raw`."""
     try:
-        return OK, bcpack.decode(raw, codec, size)
+        return OK, bcpack.decode(raw, codec, size, history=history)
     except bcpack.BcpackProvisionalError:
         return UNCONFIRMED, None
     except bcpack.BcpackError as e:
@@ -159,7 +159,7 @@ def _split8_inverse(even, odd):
     return sum((((even >> k) & 1) << (2 * k)) | (((odd >> k) & 1) << (2 * k + 1)) for k in range(4))
 
 
-def bc7_cases(rng, count):
+def bc7_cases(rng, count, history=None, builtin=0.03):
     """BC7 chunks: one signature per block (now and then an inferred one), endpoint and index distances within the
     chunk or, rarely, into the built-in history (all unknown), random endpoints and mostly representable indices."""
     import bcpack_tables_bptc as bptc  # noqa: PLC0415
@@ -182,9 +182,9 @@ def bc7_cases(rng, count):
 
             def distance():
                 r = rng.random()
-                if r < 0.55 or (i == 0 and r < 0.97):
+                if r < 0.55 or (i == 0 and r < 1 - builtin):
                     return 0
-                if r < 0.97:
+                if r < 1 - builtin:
                     return rng.randint(1, i)
                 return rng.randint(i + 1, 255)
 
@@ -200,16 +200,16 @@ def bc7_cases(rng, count):
         if rng.random() < 0.06:
             raw = _corrupt(rng, raw)
         size = 16 * nblocks
-        status, expected = _reference(raw, 7, size)
+        status, expected = _reference(raw, 7, size, history)
         try:
-            lenient = bcpack.decode(raw, 7, size, allow_provisional=True)
+            lenient = bcpack.decode(raw, 7, size, allow_provisional=True, history=history)
         except (bcpack.BcpackError, ZeroDivisionError, IndexError):
             lenient = None
         out.append((7, raw, size, status, expected, lenient))
     return out
 
 
-def bc6h_cases(rng, count):
+def bc6h_cases(rng, count, history=None, builtin=0.03):
     """BC6H chunks: a mode symbol 0..13 per block (now and then one past 13), a partition, endpoint and index
     distances within the chunk or, rarely, into the built-in history (all unknown), random endpoint deltas, and index
     deltas of -1 or -2, which keep the anchors representable from the no-reference index base (8)."""
@@ -225,9 +225,9 @@ def bc6h_cases(rng, count):
 
             def distance():
                 r = rng.random()
-                if r < 0.55 or (i == 0 and r < 0.97):
+                if r < 0.55 or (i == 0 and r < 1 - builtin):
                     return 0
-                if r < 0.97:
+                if r < 1 - builtin:
                     return rng.randint(1, i)
                 return rng.randint(i + 1, 255)
 
@@ -242,9 +242,9 @@ def bc6h_cases(rng, count):
         if rng.random() < 0.06:
             raw = _corrupt(rng, raw)
         size = 16 * nblocks
-        status, expected = _reference(raw, 6, size)
+        status, expected = _reference(raw, 6, size, history)
         try:
-            lenient = bcpack.decode(raw, 6, size, allow_provisional=True)
+            lenient = bcpack.decode(raw, 6, size, allow_provisional=True, history=history)
         except (bcpack.BcpackError, ZeroDivisionError, IndexError):
             lenient = None
         out.append((6, raw, size, status, expected, lenient))
@@ -314,8 +314,70 @@ def render():
         else:
             tail = f"true, {'block_out' if lenient == expected else 'block_lenient'}_{k}"
         lines.append(f"    {{{codec}, block_raw_{k}, {len(raw)}, {size}, {status}, block_out_{k}, {tail}}},")
+    lines += ["};", ""]
+
+    # A synthetic calibrated history (no game data), its sidecar, and BC6H/BC7 chunks that often read it.
+    hrng = random.Random(SEED + 1)
+    history = synthetic_history(hrng)
+    import bcpack_history_sidecar as sidecar  # noqa: PLC0415
+    lines += ["// The BCPHIST1 sidecar of a synthetic calibrated history (tools/bcpack_history_sidecar.py).",
+              _bytes("kHistorySidecar", sidecar.render(history)), ""]
+    hist_cases = bc7_cases(hrng, 60, history, builtin=0.3) + bc6h_cases(hrng, 60, history, builtin=0.3)
+    for k, (codec, raw, size, status, expected, lenient) in enumerate(hist_cases):
+        lines.append(_bytes(f"hist_raw_{k}", raw))
+        lines.append(_bytes(f"hist_out_{k}", expected or b""))
+        if lenient is not None and lenient != expected:
+            lines.append(_bytes(f"hist_lenient_{k}", lenient))
+    lines += ["", "// Decoded with that history: strict and, where it succeeds, Python's provisional mode.",
+              "inline constexpr BlockCase kHistoryCases[] = {"]
+    for k, (codec, raw, size, status, expected, lenient) in enumerate(hist_cases):
+        if lenient is None:
+            tail = "false, nullptr"
+        else:
+            tail = f"true, {'hist_out' if lenient == expected else 'hist_lenient'}_{k}"
+        lines.append(f"    {{{codec}, hist_raw_{k}, {len(raw)}, {size}, {status}, hist_out_{k}, {tail}}},")
     lines += ["};", "", "}  // namespace bcpack_vectors", ""]
-    return "\n".join(lines), lanes, blocks
+    return "\n".join(lines), lanes, blocks + hist_cases
+
+
+def synthetic_history(rng):
+    """A made-up calibrated history in the JSON shape tools/bcpack_tables_bptc.py reads, covering every case the
+    decoders tell apart: BC7 entries fully known and confirmed, known but unconfirmed, partly known or absent; BC6H
+    entries confirmed with every bit, confirmed but short of bits, fitted, last resort or unknown."""
+    ep, ep_b, ep_cb, ix, ix_b, ix_cb = {}, {}, {}, {}, {}, {}
+    for i in range(256):
+        r = rng.random()
+        if r < 0.15:
+            continue  # absent: every bit unknown
+        ep[str(i)] = [rng.randrange(256) for _ in range(24)]
+        ix[str(i)] = [rng.randrange(16) for _ in range(32)]
+        if r < 0.70:
+            ep_b[str(i)], ep_cb[str(i)] = [8] * 24, [8] * 24
+            ix_b[str(i)], ix_cb[str(i)] = [4] * 32, [4] * 32
+        elif r < 0.85:
+            ep_b[str(i)], ep_cb[str(i)] = [8] * 24, [0] * 24
+            ix_b[str(i)], ix_cb[str(i)] = [4] * 32, [0] * 32
+        else:
+            ep_b[str(i)] = [rng.randrange(9) for _ in range(24)]
+            ep_cb[str(i)] = [min(b, rng.randrange(9)) for b in ep_b[str(i)]]
+            ix_b[str(i)] = [rng.randrange(5) for _ in range(32)]
+            ix_cb[str(i)] = [min(b, rng.randrange(5)) for b in ix_b[str(i)]]
+    bc7 = {"historyEndpoints": ep, "historyEndpointBits": ep_b, "historyEndpointConfirmedBits": ep_cb,
+           "historyIndices": ix, "historyIndexBits": ix_b, "historyIndexConfirmedBits": ix_cb}
+    eh, ih, ec, ic, ecb, icb = {}, {}, {}, {}, {}, {}
+    for i in range(256):
+        eh[str(i)] = [[rng.randrange(1 << 16), rng.randrange(1 << 10), rng.randrange(1 << 6), rng.randrange(1 << 6)]
+                      for _ in range(3)]
+        ih[str(i)] = [rng.randrange(16) for _ in range(16)]
+        ec[str(i)] = rng.choices((3, 2, 1, 0), (70, 8, 8, 14))[0]
+        ic[str(i)] = rng.choices((3, 2, 1, 0), (70, 8, 8, 14))[0]
+        full = rng.random() < 0.8
+        ecb[str(i)] = [[16, 10, 6, 6] if full else [rng.randrange(17), rng.randrange(11), rng.randrange(7),
+                                                       rng.randrange(7)] for _ in range(3)]
+        icb[str(i)] = [4] * 16 if rng.random() < 0.85 else [rng.randrange(5) for _ in range(16)]
+    bc6h = {"endpointHistory": eh, "indexHistory": ih, "endpointClass": ec, "indexClass": ic,
+            "endpointConfirmedBits": ecb, "indexConfirmedBits": icb}
+    return {"bc6h": bc6h, "bc7": bc7}
 
 
 def main(argv=None):

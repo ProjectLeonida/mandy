@@ -146,6 +146,17 @@ The first boot with the executable settles most of this: the dry-run report show
   in the decompression statistics like zlib ones. `bcpack_test` checks the decoder against the Python one on
   synthetic chunks (`runtime/test/bcpack_vectors.py`): strict decoding on all of them, lenient BC6H and BC7 decoding
   against Python's provisional mode. Swizzle is not applied (no request measured on the retail title asks for it).
+
+  **The calibrated BC6H/BC7 history.** The repository carries no built-in BC6H or BC7 history: it has to be
+  calibrated from the user's own copy (`tools/bcpack_history_calib.py`, the `--history` JSON of `tools/bcpack.py`).
+  `python -I tools/bcpack_history_sidecar.py <history.json | folder> bcpack_history.bin` turns that JSON into a
+  60,936-byte "BCPHIST1" sidecar (the same loaders as `tools/bcpack.py`, so the same merging and mid-range fill; the
+  layout of the #984 integration branch's profile). The request path reads it once, at its first BCPack decode: the
+  file `LEONIDA_BCPACK_HISTORY` names, or else `bcpack_history.bin` next to the runtime's executable; with one, a block
+  on a calibrated entry decodes from that entry instead of from zeros, and only entries that are still unknown count as
+  guessed. A file that is not a BCPHIST1 sidecar is ignored with a log line. The sidecar comes from the user's data:
+  it stays on their machine. `bcpack_test` decodes with a synthetic sidecar against `tools/bcpack.py` with the same
+  history, strict and provisional, and `dstorage_test` reads one through `LEONIDA_BCPACK_HISTORY`.
 - **Cancel**: `CancelRequestsWithTag(mask, value)` marks every request enqueued before the call and not yet started
   whose `(CancellationTag & mask) == value`. A cancelled request completes as a success without reading and is not
   counted as a failure, as the overview and the reference say, even when it also had an error found at enqueue.
@@ -170,10 +181,10 @@ The first boot with the executable settles most of this: the dry-run report show
 
 - **Swizzle** (`SwizzleMode`): the decode order is DEFLATE, BCPack, swizzle, so it becomes a stage after the BCPack
   decode and before the destination write. No request measured on the retail title asks for it.
-- **The user's calibrated BCPack history** (`bcpack::History`, from `tools/bcpack_history_calib.py`'s tables): with it,
-  the blocks the request path decodes from the zero state today would decode exactly. Every BCPack request measured
-  on the retail title (modes 1, 5 and 7, issue #14 comment 7135719755) also has the destination-pages bit, so they
-  reach the decoder once destination pages are served (RT-DSTORAGE-DEST-PAGES).
+- **Calibrated BC1/BC3/BC4/BC5 history in the request path**: `bcpack::History::values` takes it, but the sidecar
+  carries BC6H and BC7 only, so the request path decodes those four modes from the repository's confirmed entries
+  alone. Every BCPack request measured on the retail title (modes 1, 5 and 7, issue #14 comment 7135719755) also has
+  the destination-pages bit, so they reach the decoder once destination pages are served (RT-DSTORAGE-DEST-PAGES).
 - **Physical pages** (`SourceIsPhysicalPages`, `DestinationIsPhysicalPages`): arrays of 64 KiB page numbers from
   `XMemAllocatePhysicalPages`; needs the `xmem` shim to translate a page number to the address it mapped.
 - **GPU memory**: the console API has no GPU destinations of its own (memory is unified, so a destination is an

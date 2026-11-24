@@ -10,11 +10,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "../src/bcpack.h"
 #include "bcpack_vectors.h"  // synthetic BCPack chunks and what tools/bcpack.py decodes from them
 #include "dstorage_xs_abi.h"
 #include "file_system.h"
@@ -1237,10 +1239,39 @@ void test_bcpack(Env& env) {
     };
     const BlockCase* bc1 = find([](const BlockCase& c) { return c.mode == 1 && c.status == 0 && c.out_size >= 64; });
     const BlockCase* bc7 = find([](const BlockCase& c) { return c.mode == 7 && c.status == 0 && c.out_size >= 64; });
-    const BlockCase* guessed = find([](const BlockCase& c) { return c.mode == 7 && c.status == 7 && c.lenient_known; });
+    // The request path reads the calibrated history set below, so the lenient case comes from the history vectors,
+    // whose provisional blocks Python made with that history. The other chunks read no built-in history.
+    const BlockCase* guessed = nullptr;
+    for (const BlockCase& c : bcpack_vectors::kHistoryCases)
+        if (c.mode == 7 && c.status == 7 && c.lenient_known) {
+            guessed = &c;
+            break;
+        }
     const BlockCase* corrupt = find([](const BlockCase& c) { return c.status == 3; });
     check(bc1 && bc7 && guessed && corrupt, "the BCPack vectors hold the chunks this test needs");
     if (!(bc1 && bc7 && guessed && corrupt)) return;
+
+    // The calibrated history the request path reads once, at its first decode: a synthetic sidecar named by
+    // LEONIDA_BCPACK_HISTORY. A chunk on that history must decode to Python's blocks with it, which it would not
+    // without it.
+    const BlockCase* on_history = nullptr;
+    for (const BlockCase& c : bcpack_vectors::kHistoryCases) {
+        if (c.status != 0) continue;
+        std::vector<uint8_t> without(c.out_size);
+        if (leonida::bcpack::decode({c.raw, c.raw_size}, c.mode, without, leonida::bcpack::Options{nullptr, true})
+                    .status == leonida::bcpack::Status::ok &&
+            !std::equal(without.begin(), without.end(), c.blocks)) {
+            on_history = &c;
+            break;
+        }
+    }
+    check(on_history != nullptr, "the history vectors hold a chunk whose blocks change with the history");
+    const fs::path sidecar = env.root / "bcpack_history.bin";
+    {
+        std::ofstream f(sidecar, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(bcpack_vectors::kHistorySidecar), sizeof bcpack_vectors::kHistorySidecar);
+    }
+    SetEnvironmentVariableW(L"LEONIDA_BCPACK_HISTORY", sidecar.wstring().c_str());
 
     const std::vector<uint8_t> bc1_raw(bc1->raw, bc1->raw + bc1->raw_size);
     const std::vector<uint8_t> bc1_zlib = stored_stream(bc1_raw);
@@ -1259,7 +1290,7 @@ void test_bcpack(Env& env) {
         {bc7->raw, static_cast<uint32_t>(bc7->raw_size), static_cast<uint32_t>(bc7->out_size), 0, mode(7), S_OK,
          bc7->blocks, "a BC7 BCPack request decodes to the Python decoder's blocks"},
         {guessed->raw, static_cast<uint32_t>(guessed->raw_size), static_cast<uint32_t>(guessed->out_size), 0, mode(7),
-         S_OK, guessed->lenient_blocks, "a BC7 chunk on unknown built-in history decodes as Python's provisional mode"},
+         S_OK, guessed->lenient_blocks, "a BC7 chunk strict decoding refuses decodes as Python's provisional mode"},
         {corrupt->raw, static_cast<uint32_t>(corrupt->raw_size), static_cast<uint32_t>(corrupt->out_size), 0,
          mode(corrupt->mode), E_DSTORAGE_DECOMPRESSION_ERROR, nullptr, "a corrupt BCPack chunk"},
         {bc1_zlib.data(), static_cast<uint32_t>(bc1_zlib.size()), static_cast<uint32_t>(bc1->out_size),
@@ -1275,6 +1306,11 @@ void test_bcpack(Env& env) {
          "a BCPack request with no destination size"},
         {bc1->raw, static_cast<uint32_t>(bc1->raw_size), static_cast<uint32_t>(bc1->out_size) - 4, 0, mode(1),
          E_DSTORAGE_DECOMPRESSION_ERROR, nullptr, "a BCPack destination that is not whole blocks"},
+        {on_history ? on_history->raw : bc1->raw,
+         static_cast<uint32_t>(on_history ? on_history->raw_size : bc1->raw_size),
+         static_cast<uint32_t>(on_history ? on_history->out_size : bc1->out_size), 0,
+         mode(on_history ? on_history->mode : 1), S_OK, on_history ? on_history->blocks : bc1->blocks,
+         "a chunk on the calibrated history decodes to Python's blocks with the LEONIDA_BCPACK_HISTORY sidecar"},
     };
 
     IDStorageQueueX2* q = make_queue(env, 0x80, true, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
@@ -1308,6 +1344,7 @@ void test_bcpack(Env& env) {
     }
     s->Release();
     q->Release();
+    SetEnvironmentVariableW(L"LEONIDA_BCPACK_HISTORY", nullptr);
 }
 
 int main() {
