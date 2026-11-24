@@ -8,12 +8,14 @@
 //   result[first + i] = the texel at ((i % 8) + 0.5, (i / 8) + 0.5) / 8 + (1, 0), as RGBA8 with red in the low byte.
 // With mode 1 the image is an integer one (an R8G8B8A8_UINT view, read through the same binding as a
 // utexture2D), and each channel is stored as its value clamped to 255: a UINT border colour shows as 0 or 1.
+// TEST_MS_UINT, TEST_MS_SINT, TEST_MS_FLOAT and TEST_MS_DEPTH build the variants that read a multisampled
+// texture's four samples (the first three through the uint, sint and float MS bindings; the last as depth bits).
 // The whole tile to the right in U: a sampler that wraps in U gives the texel at the same place in the image,
 // one that clamps (as the fallback sampler at index 0 does) the image's right edge. So the result shows that
 // the S# was found, not only the T#.
 // Set 0 is the device's bindless set; set 1 is the test's output buffer.
 #extension GL_EXT_nonuniform_qualifier : require
-#if defined(TEST_MS_FLOAT) || defined(TEST_MS_UINT) || defined(TEST_MS_SINT)
+#if defined(TEST_MS_FLOAT) || defined(TEST_MS_UINT) || defined(TEST_MS_SINT) || defined(TEST_MS_DEPTH)
 #extension GL_EXT_samplerless_texture_functions : require
 #endif
 
@@ -34,6 +36,10 @@ layout(set = 0, binding = 23) uniform utexture2DMSArray ms_arrays[];
 layout(set = 0, binding = 24) uniform itexture2DMS ms_images[];
 layout(set = 0, binding = 25) uniform itexture2DMSArray ms_arrays[];
 #elif defined(TEST_MS_FLOAT)
+layout(set = 0, binding = 20) uniform texture2DMS ms_images[];
+layout(set = 0, binding = 21) uniform texture2DMSArray ms_arrays[];
+#elif defined(TEST_MS_DEPTH)
+// A depth texture is sampled as float; the test compares the raw bits of the depth value.
 layout(set = 0, binding = 20) uniform texture2DMS ms_images[];
 layout(set = 0, binding = 21) uniform texture2DMSArray ms_arrays[];
 #else
@@ -85,6 +91,13 @@ void main() {
     if (pc.mode == 2) color = texelFetch(ms_images[image], xy, sample_index);
     else color = texelFetch(ms_arrays[image], ivec3(xy, pc.layer), sample_index);
     result[pc.first + i] = packUnorm4x8(color);
+#elif defined(TEST_MS_DEPTH)
+    // The depth plane of a 4x depth texture: the raw bits of each of the four samples, sample fastest.
+    const ivec2 xy = ivec2((i / 4) % 4, i / 16);
+    float depth;
+    if (pc.mode == 2) depth = texelFetch(ms_images[image], xy, int(i % 4)).r;
+    else depth = texelFetch(ms_arrays[image], ivec3(xy, pc.layer), int(i % 4)).r;
+    result[pc.first + i] = floatBitsToUint(depth);
 #elif defined(TEST_GATHER_ALPHA)
     const uint smp = lookup(sampler_key);
     const vec2 uv = (vec2(i % 8, i / 8) + 1.0) / 8.0;

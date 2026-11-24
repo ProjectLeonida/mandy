@@ -950,6 +950,21 @@ struct DeviceState {
         return VK_SAMPLE_COUNT_1_BIT;
     }
 
+    // A multisample shader view needs a format the GPU samples at that count, as the texture's own aspect: a
+    // multisampled colour texture is an attachment that is sampled and copied, a depth texture a depth attachment.
+    bool multisample_sampleable(VkFormat format, VkImageAspectFlags aspects, UINT samples) const {
+        if (!image_format_properties) return true;
+        VkImageFormatProperties props{};
+        const bool depth = (aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+        const VkImageUsageFlags usage = (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                                               : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
+                                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        return image_format_properties(info.physical, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, 0,
+                                       &props) == VK_SUCCESS &&
+               (props.sampleCounts & samples) != 0;
+    }
+
     // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
         if (!xr_bias_compatible(desc)) return {};
@@ -4697,13 +4712,31 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         return false;
     }
     if (msaa) {
-        // The MS bindings expose typed colour SRVs. An MS view has one mip and can name an array slice range.
-        const Format format = texture_storage_format(desc.Format, false);
-        if (resource.aspects() != VK_IMAGE_ASPECT_COLOR_BIT || format.typeless ||
-            (view.format != DXGI_FORMAT_UNKNOWN && view.format != desc.Format)) {
-            log_once("multisample shader view requires a matching typed colour format:", int(desc.Format));
-            return false;
+        // The MS bindings expose typed colour SRVs and a depth-stencil texture's depth plane. An MS view has one mip
+        // and can name an array slice range. A colour texture's view format is settled here; a depth-stencil
+        // texture's by the plane checks below, which handle single-sampled views too.
+        if (resource.aspects() == VK_IMAGE_ASPECT_COLOR_BIT) {
+            const Format storage = texture_storage_format(desc.Format, false);
+            if (storage.typeless) {
+                // A typeless colour texture has no format for the view to inherit, so the SRV names a concrete member
+                // of the texture's own family (R8G8B8A8_TYPELESS takes R8G8B8A8_UNORM or _UNORM_SRGB,
+                // R16G16B16A16_TYPELESS takes _FLOAT, _UNORM, _UINT, ...), as D3D12 requires. The T# is written for
+                // that format below.
+                const Format named_format = texture_storage_format(view.format, false);
+                if (view.format == DXGI_FORMAT_UNKNOWN || named_format.typeless ||
+                    named_format.format == VK_FORMAT_UNDEFINED ||
+                    format_family(view.format) != format_family(desc.Format)) {
+                    log_once("multisample shader view of a typeless colour texture needs a typed format of its family:",
+                             int(view.format));
+                    return false;
+                }
+            } else if (view.format != DXGI_FORMAT_UNKNOWN && view.format != desc.Format) {
+                log_once("multisample shader view requires a matching typed colour format:", int(desc.Format));
+                return false;
+            }
         }
+        // A depth-stencil texture's view format is settled by the plane check below, which handles single-sampled
+        // views too. D3D12's TEXTURE2DMS and TEXTURE2DMSARRAY SRVs have no plane field, so plane 1 is unreachable.
         // Four 3-bit selectors followed by D3D12's always-set bit.
         if ((view.mapping >> 12) != 1) {
             log_once("invalid multisample shader view component mapping:", int(view.mapping));
@@ -4783,6 +4816,10 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     }
     if (named == VK_FORMAT_UNDEFINED || !resource.allows_view_format(named)) {
         log_once("view format not in the resource's castable list:", int(view.format));
+        return false;
+    }
+    if (msaa && !resource.device_state().multisample_sampleable(named, resource.aspects(), desc.SampleDesc.Count)) {
+        log_once("multisample shader view format is not sampleable at this texture's sample count:", int(named));
         return false;
     }
     const std::uint32_t code = stencil ? g::stencil_format : g::format_from_vulkan(named);
@@ -7879,7 +7916,8 @@ public:
             // The plane formats a shader reads a depth-stencil texture through (CreateShaderResourceView takes them on
             // R24G8/R32G8X24 and D24S8/D32S8 textures) have no image of their own, so the lookups below find nothing.
             // The host reports them as sampled 2D and cube textures with mips, the depth plane also filtered and
-            // compared. Left out, as for the depth formats themselves: 1D, and multisample loads.
+            // compared. Left out, as for the depth formats themselves: 1D. The host advertises MULTISAMPLE_LOAD for
+            // these formats, so the layer does where the depth image can be sampled at a multisampled count.
             const bool depth_plane = fs->Format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
                                      fs->Format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
             if (depth_plane || fs->Format == DXGI_FORMAT_X24_TYPELESS_G8_UINT ||
@@ -7900,6 +7938,16 @@ public:
                     fs->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_SHADER_GATHER |
                                     D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE_COMPARISON |
                                     D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON;
+                VkImageFormatProperties msaa{};
+                const VkImageUsageFlags msaa_usage =
+                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                if (state_.bindless && state_.bindless->supports_ms_class(0) && state_.image_format_properties &&
+                    state_.image_format_properties(state_.info.physical, family, VK_IMAGE_TYPE_2D,
+                                                   VK_IMAGE_TILING_OPTIMAL, msaa_usage, 0,
+                                                   &msaa) == VK_SUCCESS &&
+                    (msaa.sampleCounts & d3d12_multisample_sample_counts))
+                    fs->Support1 |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD;
                 return d3d12_trace::result(method, S_OK);
             }
             const Format fmt = texture_storage_format(fs->Format, false);
