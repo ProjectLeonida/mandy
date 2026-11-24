@@ -88,6 +88,57 @@ int main() {
               GetLastError() == ERROR_INVALID_PARAMETER,
           "invalid month must fail with ERROR_INVALID_PARAMETER");
 
+    // Impossible calendar dates (e.g., 2026-02-30, non-leap 2026-02-29, 2026-04-31) must fail, not fall back.
+    SYSTEMTIME feb30 = st;
+    feb30.wYear = 2026;
+    feb30.wMonth = 2;
+    feb30.wDay = 30;
+    SetLastError(0);
+    CHECK(date_api(L"en-US", 0, &feb30, L"yyyy-MM-dd", buf, 32, nullptr) == 0 &&
+              GetLastError() == ERROR_INVALID_PARAMETER,
+          "2026-02-30 must fail with ERROR_INVALID_PARAMETER");
+
+    SYSTEMTIME feb29_nonleap = st;
+    feb29_nonleap.wYear = 2026;
+    feb29_nonleap.wMonth = 2;
+    feb29_nonleap.wDay = 29;
+    SetLastError(0);
+    CHECK(date_api(L"en-US", 0, &feb29_nonleap, L"yyyy-MM-dd", buf, 32, nullptr) == 0 &&
+              GetLastError() == ERROR_INVALID_PARAMETER,
+          "non-leap 2026-02-29 must fail with ERROR_INVALID_PARAMETER");
+
+    SYSTEMTIME apr31 = st;
+    apr31.wYear = 2026;
+    apr31.wMonth = 4;
+    apr31.wDay = 31;
+    SetLastError(0);
+    CHECK(date_api(L"en-US", 0, &apr31, L"yyyy-MM-dd", buf, 32, nullptr) == 0 &&
+              GetLastError() == ERROR_INVALID_PARAMETER,
+          "2026-04-31 must fail with ERROR_INVALID_PARAMETER");
+
+    // Valid leap day (2024-02-29) must succeed.
+    SYSTEMTIME feb29_leap = st;
+    feb29_leap.wYear = 2024;
+    feb29_leap.wMonth = 2;
+    feb29_leap.wDay = 29;
+    n = date_api(L"en-US", 0, &feb29_leap, L"yyyy-MM-dd", buf, 32, nullptr);
+    CHECK(n == 11 && std::wcscmp(buf, L"2024-02-29") == 0,
+          "valid leap day 2024-02-29 failed (n=%d)", n);
+
+    // Invalid flags must fail with ERROR_INVALID_FLAGS instead of falling back.
+    SetLastError(0);
+    CHECK(date_api(L"en-US", 0x00008000u, &st, nullptr, buf, 32, nullptr) == 0 &&
+              GetLastError() == ERROR_INVALID_FLAGS,
+          "invalid GetDateFormatEx flags must fail with ERROR_INVALID_FLAGS");
+    SetLastError(0);
+    CHECK(date_api(L"en-US", DATE_SHORTDATE, &st, L"yyyy-MM-dd", buf, 32, nullptr) == 0 &&
+              GetLastError() == ERROR_INVALID_FLAGS,
+          "GetDateFormatEx with both DATE_SHORTDATE and lpFormat must fail with ERROR_INVALID_FLAGS");
+    SetLastError(0);
+    CHECK(time_api(L"en-US", 0x00008000u, &st, nullptr, buf, 32) == 0 &&
+              GetLastError() == ERROR_INVALID_FLAGS,
+          "invalid GetTimeFormatEx flags must fail with ERROR_INVALID_FLAGS");
+
     SYSTEMTIME bad_time = st;
     bad_time.wHour = 25;
     SetLastError(0);

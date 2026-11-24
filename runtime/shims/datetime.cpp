@@ -31,7 +31,13 @@ const wchar_t* const kLongMonths[12] = {L"January",  L"February", L"March",    L
 bool is_valid_date(const SYSTEMTIME& st) {
     if (st.wYear < 1601 || st.wYear > 9999) return false;
     if (st.wMonth < 1 || st.wMonth > 12) return false;
-    if (st.wDay < 1 || st.wDay > 31) return false;
+    static const WORD kDaysInMonth[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    WORD max_day = kDaysInMonth[st.wMonth - 1];
+    if (st.wMonth == 2) {
+        const bool leap = (st.wYear % 4u == 0u) && ((st.wYear % 100u != 0u) || (st.wYear % 400u == 0u));
+        if (leap) max_day = 29;
+    }
+    if (st.wDay < 1 || st.wDay > max_day) return false;
     return true;
 }
 
@@ -212,11 +218,13 @@ int WINAPI shim_GetDateFormatEx(LPCWSTR lpLocaleName, DWORD dwFlags, const SYSTE
 
     int res = ::GetDateFormatEx(effective_loc, dwFlags, &st, lpFormat, lpDateStr, cchDate, lpCalendar);
     if (res > 0) return res;
-    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) return 0;
+    DWORD err = GetLastError();
+    if (err == ERROR_INSUFFICIENT_BUFFER || err == ERROR_INVALID_FLAGS) return 0;
 
     res = ::GetDateFormatEx(LOCALE_NAME_INVARIANT, dwFlags, &st, lpFormat, lpDateStr, cchDate, nullptr);
     if (res > 0) return res;
-    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) return 0;
+    err = GetLastError();
+    if (err == ERROR_INSUFFICIENT_BUFFER || err == ERROR_INVALID_FLAGS || err == ERROR_INVALID_PARAMETER) return 0;
 
     return write_wide_result(format_date_fallback(st, lpFormat), lpDateStr, cchDate);
 }
@@ -240,11 +248,13 @@ int WINAPI shim_GetTimeFormatEx(LPCWSTR lpLocaleName, DWORD dwFlags, const SYSTE
 
     int res = ::GetTimeFormatEx(effective_loc, dwFlags, &st, lpFormat, lpTimeStr, cchTime);
     if (res > 0) return res;
-    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) return 0;
+    DWORD err = GetLastError();
+    if (err == ERROR_INSUFFICIENT_BUFFER || err == ERROR_INVALID_FLAGS) return 0;
 
     res = ::GetTimeFormatEx(LOCALE_NAME_INVARIANT, dwFlags, &st, lpFormat, lpTimeStr, cchTime);
     if (res > 0) return res;
-    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) return 0;
+    err = GetLastError();
+    if (err == ERROR_INSUFFICIENT_BUFFER || err == ERROR_INVALID_FLAGS || err == ERROR_INVALID_PARAMETER) return 0;
 
     return write_wide_result(format_time_fallback(st, lpFormat), lpTimeStr, cchTime);
 }
