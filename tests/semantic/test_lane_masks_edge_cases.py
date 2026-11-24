@@ -7,8 +7,15 @@ VGPR/parked-mask state nor forces write_all_lanes on SDWA/DPP ops nor wipes mask
 import struct
 import unittest
 
-import spirv_mini_interp as si
-import support
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 FSSM = bytearray(0x148)
 struct.pack_into("<4I", FSSM, 0x138, 0x88, 4, 1, 1)  # 4 user SGPRs, workgroup id in s4, 4x1x1

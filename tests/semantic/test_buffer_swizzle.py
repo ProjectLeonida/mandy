@@ -25,9 +25,16 @@ words 1 and 3 or-ed at run time.
 import re
 import unittest
 
-import support
-import spirv_mini_interp as si
-import test_value_semantics as tv         # module only: importing its classes would collect them a second time
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
+import test_value_semantics as tv         # module only: importing its classes would collect them a second time  # noqa: E402
 
 BASE = tv.VEC_REGION
 OUT_V = 0x31016FAC                          # the output V# in s[0:3]: RAW, base 0

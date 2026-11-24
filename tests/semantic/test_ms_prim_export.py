@@ -20,11 +20,16 @@ come from the second wave (s3[27:24] = 1).
 """
 import os
 import struct
+import sys
 import unittest
 
-import support
-import rdna2spirv
-import spirv_mini_interp as si
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import rdna2spirv  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
 
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "ms_prim_export.asm")
 THREADS = MAX_OUT = 72

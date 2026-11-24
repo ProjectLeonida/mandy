@@ -7,12 +7,17 @@ leaves is not pinned by this test.
 """
 import gc
 import os
+import sys
 import tempfile
 import unittest
 import warnings
 
-import support
-from test_value_semantics import PS_FLAT_DXBC   # attr0.xy and attr1.x, f32
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+from test_value_semantics import PS_FLAT_DXBC   # attr0.xy and attr1.x, f32  # noqa: E402
 
 # attr0 = (1.5, -0.25): x read with clamp (1.0), y with clamp (0.0), x again without it (1.5), y without (-0.25).
 SHADER = """v_interp_p1ll_f16 v2, v0, attr0.x

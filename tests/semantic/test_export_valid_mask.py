@@ -9,11 +9,18 @@ is also what decides on a path with no `vm` export (class ColorExportMask). Hand
 from pathlib import Path
 import unittest
 
-import support
-import rdna2spirv
-import shader_ir
-from spirv_mini_interp import run_fragment
-from spirv_wave_interp import run_wave
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import rdna2spirv  # noqa: E402
+import shader_ir  # noqa: E402
+from spirv_mini_interp import run_fragment  # noqa: E402
+from spirv_wave_interp import run_wave  # noqa: E402
 
 ONE = 0x3F800000
 SEED = [f"v_mov_b32_e32 v2, 0x{ONE:x}", "v_mov_b32_e32 v1, 1"]

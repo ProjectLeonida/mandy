@@ -9,7 +9,14 @@ would give it for those raw per-vertex words.
 import struct
 import unittest
 
-import support
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
 
 # Barycentric weights of vertices 0, 1, 2 (AMD i = 0.25, j = 0.5).
 BARY = (0.25, 0.25, 0.5)

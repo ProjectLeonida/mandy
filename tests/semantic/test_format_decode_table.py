@@ -11,10 +11,17 @@ import struct
 import unittest
 from fractions import Fraction
 
-import support
-from spirv_mini_interp import half_to_float, run_fragment
+import os
+import sys
 
-import rdna2spirv
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+from spirv_mini_interp import half_to_float, run_fragment  # noqa: E402
+
+import rdna2spirv  # noqa: E402
 
 BASE = 0x1000
 WORDS = (0x8123C4F7, 0x3E9A7F01, 0xC0490FDB, 0x5AA5FF80)

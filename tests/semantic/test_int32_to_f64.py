@@ -8,9 +8,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from support import translate_fixture, translate_lines
-import rdna2spirv
-import spirv_interface
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from support import translate_fixture, translate_lines  # noqa: E402
+import rdna2spirv  # noqa: E402
+import spirv_interface  # noqa: E402
 
 
 class Int32ToFloat64(unittest.TestCase):

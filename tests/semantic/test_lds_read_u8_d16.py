@@ -22,8 +22,15 @@ import struct
 import unittest
 from unittest import mock
 
-import support
-import spirv_mini_interp as si
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
 
 # 4 user SGPRs (the output V#), workgroup id in s4, 512 bytes of LDS, 32x1x1 threads.
 FSSM = bytearray(0x148)

@@ -15,12 +15,18 @@ hand and recomputed by the plain-Python references in ReferenceTests, which use 
 interpreter.
 """
 import math
+import os
 import struct
+import sys
 import unittest
 from fractions import Fraction
 
-import spirv_mini_interp as si
-import support
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 EXPECTED_F32_MODS = (0xC0256A01, 0x3F800000, 0x41E00000, 0x3FC00000)
 

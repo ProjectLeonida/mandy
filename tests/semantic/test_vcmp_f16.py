@@ -6,10 +6,16 @@ runtime/test/shaders/ps_vcmp_f16.asm and ps_vcmp_f16_e64.asm (also run on the GP
 their headers derive the eight words by hand. The reference here is plain Python on the same f16 bit patterns.
 """
 import math
+import os
 import struct
+import sys
 import unittest
 
-import support
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
 
 EXPECTED_E32 = [0x48A12080, 0x4CE9B1A2, 0x4BA72C98, 0x4FEFBDBA]      # derivation in ps_vcmp_f16.asm
 EXPECTED_E64 = [0x44C11100, 0x4CF171C1, 0x47C71D18, 0x4FF77DD9]      # derivation in ps_vcmp_f16_e64.asm

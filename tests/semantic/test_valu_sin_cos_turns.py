@@ -5,10 +5,16 @@ inputs and leaves Sin outside [-pi, pi], where Vulkan's precision is not guarant
 1e-4 off near 255 turns; reducing first is within an f32 ulp of the double result.
 """
 import math
+import os
 import struct
+import sys
 import unittest
 
-import support
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
 
 
 def _bits(x):

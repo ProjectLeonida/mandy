@@ -32,10 +32,16 @@ Expectations were also recorded as GPU results in the header comments of runtime
 (not re-confirmed on GPU here).
 """
 import math
+import os
 import struct
+import sys
 import unittest
 
-import support
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
 
 M = 0xFFFFFFFF
 FINITE_EXPORT_XOR = 0x40000000

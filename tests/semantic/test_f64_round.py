@@ -1,13 +1,19 @@
 """Value regressions for RDNA2's binary64 round-to-integral instructions."""
 import math
+import os
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-import support
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
 
 
 def words(value):
