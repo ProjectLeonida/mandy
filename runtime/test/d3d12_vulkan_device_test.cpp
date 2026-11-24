@@ -3066,9 +3066,23 @@ struct PlacedArgs {
     const IID* riid = &__uuidof(ID3D12Resource);
 };
 
+bool g_placed_host_tier1 = false;
+
+D3D12_HEAP_FLAGS tier1_placed_heap_flags(const D3D12_HEAP_DESC& heap, const D3D12_RESOURCE_DESC* desc) {
+    if (heap.Flags != D3D12_HEAP_FLAG_NONE) return heap.Flags;
+    if (heap.Properties.Type == D3D12_HEAP_TYPE_UPLOAD || heap.Properties.Type == D3D12_HEAP_TYPE_READBACK)
+        return D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    if (!desc || desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    if ((desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0)
+        return D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+    return D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+}
+
 HRESULT placed(ID3D12Device* device, const D3D12_RESOURCE_DESC* desc, const PlacedArgs& args = {}) {
+    D3D12_HEAP_DESC heap_desc = args.heap;
+    if (g_placed_host_tier1) heap_desc.Flags = tier1_placed_heap_flags(heap_desc, desc);
     ID3D12Heap* heap = nullptr;
-    if (FAILED(device->CreateHeap(&args.heap, IID_PPV_ARGS(&heap)))) return E_UNEXPECTED;
+    if (FAILED(device->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap)))) return E_UNEXPECTED;
     void* out = nullptr;
     const HRESULT hr = device->CreatePlacedResource(heap, args.offset, desc, args.state, args.clear, *args.riid,
                                                     args.output ? &out : nullptr);
@@ -3131,6 +3145,14 @@ bool host_ray_tracing(ID3D12Device* host) {
     D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5{};
     return SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5))) &&
            o5.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
+}
+
+// A resource heap tier 1 host (measured on a GeForce GTX 1050 Ti, Windows 10) refuses heaps without two DENY flags
+// (D3D12_HEAP_FLAG_NONE / ALLOW_ALL) with E_INVALIDARG, while the layer accepts them as Xbox does.
+bool host_resource_heap_tier1(ID3D12Device* host) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o{};
+    return SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o))) &&
+           o.ResourceHeapTier == D3D12_RESOURCE_HEAP_TIER_1;
 }
 
 // Windows 10's runtime (no ID3D12Device10) still checks a buffer's initial state and refuses a HARDWARE_PROTECTED
@@ -4380,50 +4402,57 @@ int compare_invalid_arguments(ID3D12Device* ours) {
     return mismatches;
 }
 
+HRESULT heap_create_guarded(ID3D12Device* device, D3D12_HEAP_DESC desc) {
+    __try {
+        return heap_create(device, desc);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return kFaulted;
+    }
+}
+
 // D3D-238: the valid neighbours of the CreateHeap refusals in compare_invalid_arguments, compared
 // with the host on a device that has the GPU address arena (without it the layer answers every heap E_NOTIMPL).
 int compare_heap_neighbours(ID3D12Device* ours) {
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
+    // A resource heap tier 1 host (measured on a GeForce GTX 1050 Ti, Windows 10) refuses heaps without two DENY
+    // flags (D3D12_HEAP_FLAG_NONE / ALLOW_ALL) with E_INVALIDARG, while the layer accepts them as Xbox does. Keep
+    // comparing the alignment, size and heap-type checks on both devices by making those NONE-flag heaps buffers-only
+    // on a tier-1 host; on a tier-2+ host nothing changes.
+    const bool host_tier1 = host_resource_heap_tier1(host.p);
+    const D3D12_HEAP_FLAGS default_flags = host_tier1 ? D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS : D3D12_HEAP_FLAG_NONE;
+    if (host_tier1)
+        std::printf("CreateHeap valid neighbours: host is resource heap tier 1, comparing NONE-flag heaps as "
+                    "buffers-only\n");
     struct Case {
         const char* name;
-        InvalidCase call;
+        D3D12_HEAP_DESC desc;
         bool windows10_refuses = false;
     };
-    static const Case cases[] = {
-        {"heap: alignment 0", [](ID3D12Device* d) { return heap_create(d, heap_desc_of(0)); }},
-        {"heap: alignment 64 KiB", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT));
-         }},
-        {"heap: alignment 4 MiB", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT,
-                                                {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE,
-                                                D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT));
-         }},
-        {"heap: size 1000", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE, 1000));
-         }},
-        {"heap: upload", [](ID3D12Device* d) { return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_UPLOAD})); }},
-        {"heap: readback", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_READBACK}));
-         }},
-        {"heap: custom write-combine L0", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
-                                                    D3D12_MEMORY_POOL_L0}));
-         }},
-        {"heap: ALLOW_ONLY_BUFFERS (two DENY flags)", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS));
-         }},
+    const Case cases[] = {
+        {"heap: alignment 0", heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, default_flags)},
+        {"heap: alignment 64 KiB",
+         heap_desc_of(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, {D3D12_HEAP_TYPE_DEFAULT}, default_flags)},
+        {"heap: alignment 4 MiB",
+         heap_desc_of(D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT, {D3D12_HEAP_TYPE_DEFAULT}, default_flags,
+                      D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT)},
+        {"heap: size 1000", heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, default_flags, 1000)},
+        {"heap: upload", heap_desc_of(0, {D3D12_HEAP_TYPE_UPLOAD}, default_flags)},
+        {"heap: readback", heap_desc_of(0, {D3D12_HEAP_TYPE_READBACK}, default_flags)},
+        {"heap: custom write-combine L0",
+         heap_desc_of(0, {D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE, D3D12_MEMORY_POOL_L0},
+                      default_flags)},
+        {"heap: ALLOW_ONLY_BUFFERS (two DENY flags)",
+         heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS)},
         // The D3D12_HEAP_FLAGS documentation calls it unsupported, but the host accepts it (RTX 4070 SUPER and
         // UHD 770, @CowBoYdu76). Windows 10's and Windows 11 23H2's runtimes refuse it, as they refuse the committed
         // case above.
-        {"heap: HARDWARE_PROTECTED", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_HARDWARE_PROTECTED));
-         }, true},
+        {"heap: HARDWARE_PROTECTED",
+         heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_HARDWARE_PROTECTED), true},
     };
     int mismatches = 0;
     for (const Case& c : cases) {
-        const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, host.p);
+        const HRESULT a = heap_create_guarded(ours, c.desc), b = heap_create_guarded(host.p, c.desc);
         if (a == b) continue;
         if (c.windows10_refuses && windows10_refusal(c.name, host.p, a, b)) continue;
         ++mismatches;
@@ -4500,6 +4529,19 @@ int compare_heap_descs(ID3D12Device* ours) {
 int compare_placed_reserved(ID3D12Device* ours) {
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
+    // On a resource heap tier 1 host (measured on a GeForce GTX 1050 Ti, Windows 10), PlacedArgs' default NONE-flag
+    // heap is refused by CreateHeap so placed() would return E_UNEXPECTED on the host. Use category-specific
+    // ALLOW_ONLY_* heaps on both devices so CreatePlacedResource's argument checks are still compared; on tier 2+
+    // nothing changes.
+    const bool host_tier1 = host_resource_heap_tier1(host.p);
+    if (host_tier1)
+        std::printf("CreatePlacedResource/CreateReservedResource arguments: host is resource heap tier 1, using "
+                    "category-specific ALLOW_ONLY_* heaps for NONE-flag placed cases\n");
+    struct ScopedTier1 {
+        bool prev;
+        explicit ScopedTier1(bool v) : prev(g_placed_host_tier1) { g_placed_host_tier1 = v; }
+        ~ScopedTier1() { g_placed_host_tier1 = prev; }
+    } scoped_tier1(host_tier1);
     struct Case {
         const char* name;
         InvalidCase call;

@@ -369,26 +369,50 @@ int main() {
             SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &host_arch, sizeof(host_arch))) &&
             SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &our_arch, sizeof(our_arch))) &&
             host_arch.UMA != our_arch.UMA;
-        std::vector<std::string> l1_cases;
-        for (const Case& c : cases())
+        // A resource heap tier 1 host (measured on a GeForce GTX 1050 Ti, Windows 10) refuses mixed heaps without two
+        // DENY flags (ALLOW_ALL) with E_INVALIDARG, while the layer accepts them as Xbox does. Those cases are not
+        // comparable on a tier-1 host; on a tier-2+ host (e.g. WARP) nothing changes.
+        D3D12_FEATURE_DATA_D3D12_OPTIONS host_opts{};
+        const bool host_tier1 =
+            SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &host_opts, sizeof(host_opts))) &&
+            host_opts.ResourceHeapTier == D3D12_RESOURCE_HEAP_TIER_1;
+        constexpr UINT kDenyMask = D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
+                                   D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
+        std::vector<std::string> l1_cases, mixed_heap_cases;
+        for (const Case& c : cases()) {
             if (c.props.Type == D3D12_HEAP_TYPE_CUSTOM && c.props.MemoryPoolPreference == D3D12_MEMORY_POOL_L1)
                 l1_cases.emplace_back(c.name);
-        const auto in_l1_case = [&](const std::string& name) {
-            for (const std::string& c : l1_cases)
+            if (c.kind == Kind::placed) {
+                const UINT deny = UINT(c.flags) & kDenyMask;
+                if (deny != UINT(D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS) &&
+                    deny != UINT(D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES) &&
+                    deny != UINT(D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES))
+                    mixed_heap_cases.emplace_back(c.name);
+            }
+        }
+        const auto in_case = [](const std::vector<std::string>& list, const std::string& name) {
+            for (const std::string& c : list)
                 if (name.compare(0, c.size(), c) == 0 && name.size() > c.size() && (name[c.size()] == ':' ||
                     name[c.size()] == ',' || name[c.size()] == ' ')) return true;
             return false;
         };
-        std::printf("heap properties: host %s (UMA %d, the layer's UMA %d)\n", host_name.c_str(), host_arch.UMA,
-                    our_arch.UMA);
+        std::printf("heap properties: host %s (UMA %d, the layer's UMA %d, heap tier %d)\n", host_name.c_str(),
+                    host_arch.UMA, our_arch.UMA, int(host_opts.ResourceHeapTier));
         // A resource one side couldn't create has fewer entries: compare case by case on the names both have.
         int mismatches = 0, compared = 0, skipped = 0;
         std::size_t j = 0;
         for (std::size_t i = 0; i < ours.names.size(); ++i) {
-            if (uma_differs && in_l1_case(ours.names[i])) {
+            if (uma_differs && in_case(l1_cases, ours.names[i])) {
                 if (verbose || ours.names[i].ends_with(": created"))
                     std::printf("heap properties %s: not comparable on this host (MEMORY_POOL_L1 on a %s host)\n",
                                 ours.names[i].c_str(), host_arch.UMA ? "UMA" : "NUMA");
+                ++skipped;
+                continue;
+            }
+            if (host_tier1 && in_case(mixed_heap_cases, ours.names[i])) {
+                if (verbose || ours.names[i].ends_with(": created"))
+                    std::printf("heap properties %s: not comparable on this host (resource heap tier 1 host)\n",
+                                ours.names[i].c_str());
                 ++skipped;
                 continue;
             }
