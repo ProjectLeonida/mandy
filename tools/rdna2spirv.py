@@ -395,6 +395,7 @@ class Gen:
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
         self.tbuffer_norm_fns: dict[int, list[str]] = {}  # one exact quotient per used magnitude width
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
+        self.fmt_dyn_fn = None  # lines of the dynamic-channel format-decode function (%fmt_dec_dyn) for ncomp < 4
         self.fmt_norm_fn = None    # lines of the shared exact norm quotient for a run-time width (SHADER-849)
         self.fmt_enc_fn = None    # lines of the format-encode and element-size functions, once a typed store needs them
         self.uses_fmt_tables = False    # %fmt_desc_tab / %fmt_norm_rep_tab: a format's kind and channel widths
@@ -3325,7 +3326,29 @@ class Gen:
                 o = self.tmp()
                 self.emit(f"{o} = OpIAdd %uint {offsets[-1]} {widths[i - 1]}")
                 offsets.append(o)
-            if k == 1:
+            if k is None:
+                chan = params[2]
+                # Dynamic output channel 0..3: eff = chan % ncomp for ncomp in {1, 2, 3, 4} (all widths are 0 when 0).
+                one, two, three = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{one} = OpIEqual %bool {ncomp} {self.cu(1)}")
+                self.emit(f"{two} = OpIEqual %bool {ncomp} {self.cu(2)}")
+                self.emit(f"{three} = OpIEqual %bool {ncomp} {self.cu(3)}")
+                c_mod2, c_is3, c_mod3 = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{c_mod2} = OpBitwiseAnd %uint {chan} {self.cu(1)}")
+                self.emit(f"{c_is3} = OpIEqual %bool {chan} {self.cu(3)}")
+                self.emit(f"{c_mod3} = OpSelect %uint {c_is3} {self.cu(0)} {chan}")
+                eff3, eff2, eff = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{eff3} = OpSelect %uint {three} {c_mod3} {chan}")
+                self.emit(f"{eff2} = OpSelect %uint {two} {c_mod2} {eff3}")
+                self.emit(f"{eff} = OpSelect %uint {one} {self.cu(0)} {eff2}")
+                wid, off = widths[0], offsets[0]
+                for i in (1, 2, 3):
+                    eq, ws, os_ = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{eq} = OpIEqual %bool {eff} {self.cu(i)}")
+                    self.emit(f"{ws} = OpSelect %uint {eq} {widths[i]} {wid}")
+                    self.emit(f"{os_} = OpSelect %uint {eq} {offsets[i]} {off}")
+                    wid, off = ws, os_
+            elif k == 1:
                 one, wid, off = self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{one} = OpIEqual %bool {ncomp} {self.cu(1)}")
                 self.emit(f"{wid} = OpSelect %uint {one} {widths[0]} {widths[1]}")
@@ -3423,16 +3446,21 @@ class Gen:
             res = sel
         return res
 
-    def fmt_dec_functions(self):
-        """The shared per-component decode functions (SHADER-849), one per output component."""
-        if self.fmt_fn is None:
+    def _ensure_fmt_tables(self):
+        if not self.uses_fmt_tables:
             self.uses_fmt_tables = True
             # The tables are constants: register them here, while the constant section can still take them.
             for v in Gen.fmt_desc_table():
                 self.cu(v)
             for v in Gen.fmt_norm_reps():
                 self.cl(v)
-            fns = list(self.fmt_norm_function())
+        self.fmt_norm_function()
+
+    def fmt_dec_functions(self):
+        """The shared per-component decode functions (SHADER-849), one per output component."""
+        if self.fmt_fn is None:
+            self._ensure_fmt_tables()
+            fns = []
             for k in range(4):
                 saved, self.body = self.body, []
                 params = [f"%fd{k}_fmt", f"%fd{k}_words"]
@@ -3443,6 +3471,28 @@ class Gen:
                         [f"%fmt_dec_c{k}_entry = OpLabel"] + lines + [f"OpReturnValue {res}", "OpFunctionEnd"])
             self.fmt_fn = fns
         return self.fmt_fn
+
+    def fmt_dec_dyn_function(self):
+        """Shared dynamic-channel decode function %fmt_dec_dyn(fmt, words, chan) for 1/2/3-component loads."""
+        if self.fmt_dyn_fn is None:
+            self._ensure_fmt_tables()
+            saved, self.body = self.body, []
+            params = ["%fdd_fmt", "%fdd_words", "%fdd_chan"]
+            res = self.fmt_dec_component(None, params)
+            lines, self.body = self.body, saved
+            self.fmt_dyn_fn = (["%fmt_dec_dyn = OpFunction %uint None %fn_fmt_dec_dyn"] +
+                               [f"{params[0]} = OpFunctionParameter %uint",
+                                f"{params[1]} = OpFunctionParameter %v4uint_fmt",
+                                f"{params[2]} = OpFunctionParameter %uint"] +
+                               ["%fmt_dec_dyn_entry = OpLabel"] + lines + [f"OpReturnValue {res}", "OpFunctionEnd"])
+        return self.fmt_dyn_fn
+
+    def format_decode_dyn_call(self, fmt, wvec, chan):
+        """One uint id: the single channel `chan` (0..3) decoded per the run-time FORMAT."""
+        self.fmt_dec_dyn_function()
+        r = self.tmp()
+        self.emit(f"{r} = OpFunctionCall %uint %fmt_dec_dyn {fmt} {wvec} {chan}")
+        return r
 
     def format_decode_call(self, fmt, words):
         """4 uint ids: the element decoded per the run-time FORMAT, through the shared per-component functions.
@@ -3588,8 +3638,12 @@ class Gen:
             comps = self.decode_format(words, fixed_fmt, fixed=True)
             widths = self.FORMATS[fixed_fmt][2]
             d3 = self.cu(sum((4 + c) << (3 * c) for c in range(len(widths))))
-        else:
+        elif ncomp == 4:
             comps = self.format_decode_call(fmt, words)
+        else:
+            comps = None
+            wvec = self.tmp()
+            self.emit(f"{wvec} = OpCompositeConstruct %v4uint_fmt " + " ".join(words[:4]))
         # DST_SEL swizzle: 0 -> 0, 1 -> 1.0 (float/norm/scaled) or integer 1 (UINT/SINT, INVALID or reserved;
         # SHADER-86, SHADER-429), 4..7 -> X..W. On an out-of-bounds MUBUF load `words` are 0 so `comps` decode to 0,
         # while DST_SEL=1 still produces 1.0f / 1 (MTBUF overrides `d3` above with 4..7 / 0, so OOB and INVALID stay 0).
@@ -3616,25 +3670,44 @@ class Gen:
         dst1 = self.tmp()
         self.emit(f"{dst1} = OpSelect %uint {is_int_fmt} {self.cu(1)} {self.cu(0x3F800000)}")
         # In-bounds gate applies to components read from buffer memory, leaving DST_SEL=1 intact (SHADER-429).
-        bounded_comps = []
-        for comp in comps:
-            cb = self.tmp()
-            self.emit(f"{cb} = OpSelect %uint {in_b} {comp} {self.cu(0)}")
-            bounded_comps.append(cb)
         outs = []
-        for c in range(ncomp):
-            sel = self.tmp()
-            self.emit(f"{sel} = OpBitFieldUExtract %uint {d3} {self.cu(3 * c)} {self.cu(3)}")
-            r = self.cu(0)
-            for code_v, src in ((1, dst1), (4, bounded_comps[0]), (5, bounded_comps[1]), (6, bounded_comps[2]), (7, bounded_comps[3])):
-                e, s = self.tmp(), self.tmp()
-                self.emit(f"{e} = OpIEqual %bool {sel} {self.cu(code_v)}")
-                self.emit(f"{s} = OpSelect %uint {e} {src} {r}")
-                r = s
-            if d16:
-                outs.append(r)
-            else:
-                self.dst({"k": "vgpr", "r": vd["r"] + c, "n": 1}, r)
+        if comps is not None:
+            bounded_comps = []
+            for comp in comps:
+                cb = self.tmp()
+                self.emit(f"{cb} = OpSelect %uint {in_b} {comp} {self.cu(0)}")
+                bounded_comps.append(cb)
+            for c in range(ncomp):
+                sel = self.tmp()
+                self.emit(f"{sel} = OpBitFieldUExtract %uint {d3} {self.cu(3 * c)} {self.cu(3)}")
+                r = self.cu(0)
+                for code_v, src in ((1, dst1), (4, bounded_comps[0]), (5, bounded_comps[1]), (6, bounded_comps[2]), (7, bounded_comps[3])):
+                    e, s = self.tmp(), self.tmp()
+                    self.emit(f"{e} = OpIEqual %bool {sel} {self.cu(code_v)}")
+                    self.emit(f"{s} = OpSelect %uint {e} {src} {r}")
+                    r = s
+                if d16:
+                    outs.append(r)
+                else:
+                    self.dst({"k": "vgpr", "r": vd["r"] + c, "n": 1}, r)
+        else:
+            # Demand-driven decode for 1/2/3-component dynamic-format loads: decode only the channel
+            # selected by each output's DST_SEL (4..7 -> channel 0..3) instead of all four channels.
+            for c in range(ncomp):
+                sel, chan = self.tmp(), self.tmp()
+                self.emit(f"{sel} = OpBitFieldUExtract %uint {d3} {self.cu(3 * c)} {self.cu(3)}")
+                self.emit(f"{chan} = OpBitwiseAnd %uint {sel} {self.cu(3)}")
+                dec = self.format_decode_dyn_call(fmt, wvec, chan)
+                cb, is_ch, is_1, r0, r = (self.tmp() for _ in range(5))
+                self.emit(f"{cb} = OpSelect %uint {in_b} {dec} {self.cu(0)}")
+                self.emit(f"{is_ch} = OpUGreaterThanEqual %bool {sel} {self.cu(4)}")
+                self.emit(f"{is_1} = OpIEqual %bool {sel} {self.cu(1)}")
+                self.emit(f"{r0} = OpSelect %uint {is_1} {dst1} {self.cu(0)}")
+                self.emit(f"{r} = OpSelect %uint {is_ch} {cb} {r0}")
+                if d16:
+                    outs.append(r)
+                else:
+                    self.dst({"k": "vgpr", "r": vd["r"] + c, "n": 1}, r)
         if d16:
             # D16 packs two results per register, saturating integer formats according to signedness.
             def int_half(word):
@@ -15720,13 +15793,16 @@ def assemble(gen):
         types.append("%fn_desc_lookup = OpTypeFunction %uint " + " ".join(["%uint"] * 8))
     if gen.tbuffer_norm_fns or gen.fmt_enc_fn:
         types.append("%fn_tbuffer_norm = OpTypeFunction %uint %uint")      # also the element-size function's type
-    if gen.fmt_fn or gen.fmt_enc_fn:
+    if gen.fmt_fn or gen.fmt_dyn_fn or gen.fmt_enc_fn:
         types.append("%v4uint_fmt = OpTypeVector %uint 4")      # dedupe_types merges it with any other uvec4
+    if gen.fmt_fn or gen.fmt_dyn_fn:
+        types.append("%fn_fmt_norm = OpTypeFunction %uint %uint %uint")
     if gen.fmt_fn:
         # The decode function takes the format code and the element's four dwords as a v4uint: a type of its own
         # structure, so it never repeats another function type in the module (SPIR-V forbids that).
         types.append("%fn_fmt_dec = OpTypeFunction %uint %uint %v4uint_fmt")
-        types.append("%fn_fmt_norm = OpTypeFunction %uint %uint %uint")
+    if gen.fmt_dyn_fn:
+        types.append("%fn_fmt_dec_dyn = OpTypeFunction %uint %uint %v4uint_fmt %uint")
     if gen.fmt_enc_fn:
         types.append("%fn_fmt_encode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 29))
     for arity, fn_type in sorted(gen.x_round_fn_types.items()):
@@ -16137,7 +16213,7 @@ def assemble(gen):
         fn.append(f"{p} = OpAccessChain %_ptr_Function_uint {arr} {gen.cu(r)}")
     # Spill pointers last: a spilled value's type may be declared anywhere above.
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
-    helpers = (gen.desc_fn or []) + (gen.fmt_fn or []) + (gen.fmt_enc_fn or [])
+    helpers = (gen.desc_fn or []) + (gen.fmt_norm_fn or []) + (gen.fmt_fn or []) + (gen.fmt_dyn_fn or []) + (gen.fmt_enc_fn or [])
     for function in gen.tbuffer_norm_fns.values():
         helpers.extend(function)
     for function in gen.x_round_fns.values():

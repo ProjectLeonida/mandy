@@ -246,6 +246,19 @@ class TestFormatDecoderBoundary(unittest.TestCase):
         self.assertEqual(len(comps2), 4)
         self.assertIs(self.gen.fmt_fn, first_fn)
 
+    def test_format_decode_dyn_call_builds_and_caches_function(self):
+        self.assertIsNone(self.gen.fmt_dyn_fn)
+        r1 = self.gen.format_decode_dyn_call("%fmt_var", "%wvec", "%chan0")
+        self.assertTrue(r1.startswith("%"))
+        self.assertIsNotNone(self.gen.fmt_dyn_fn)
+        first_fn = self.gen.fmt_dyn_fn
+        # Dynamic single-channel call does not build the 4-component %fmt_dec_c0..c3 functions.
+        self.assertIsNone(self.gen.fmt_fn)
+
+        r2 = self.gen.format_decode_dyn_call("%fmt_var2", "%wvec", "%chan1")
+        self.assertTrue(r2.startswith("%"))
+        self.assertIs(self.gen.fmt_dyn_fn, first_fn)
+
     def test_encode_format_saturation_and_boundary(self):
         fcomps = ["%f0", "%f1", "%f2", "%f3"]
         icomps = ["%i0", "%i1", "%i2", "%i3"]
