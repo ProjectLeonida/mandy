@@ -2497,14 +2497,14 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_buffer_tiles_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_buffer_tiles_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_buffer_tiles COMMAND d3d12_buffer_tiles_test)
-    set_tests_properties(d3d12_buffer_tiles PROPERTIES SKIP_RETURN_CODE 77
-                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
     add_executable(d3d12_texture_tiles_test test/d3d12_texture_tiles_test.cpp)
     target_link_libraries(d3d12_texture_tiles_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_texture_tiles_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_texture_tiles_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_texture_tiles COMMAND d3d12_texture_tiles_test)
-    set_tests_properties(d3d12_texture_tiles PROPERTIES SKIP_RETURN_CODE 77
+    # A refused sparse update can leave the test's queue blocked during teardown. Bound both tests so ctest can move on.
+    set_tests_properties(d3d12_buffer_tiles d3d12_texture_tiles PROPERTIES
+                         SKIP_RETURN_CODE 77 TIMEOUT 300
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
     # DXR acceleration-structure prebuild and command-list recording validation parity test.
