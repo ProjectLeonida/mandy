@@ -747,6 +747,48 @@ class TestWriteGlbFilesystem(unittest.TestCase):
             summary = glb_writer.read_glb_summary(disk_bytes)
             self.assertEqual(summary["version"], 2)
 
+    def test_failed_replace_over_readonly_glb_cleans_staging_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_file = os.path.join(tmp_dir, "output.glb")
+            previous = b"previous glb"
+            with open(out_file, "wb") as f:
+                f.write(previous)
+            os.chmod(out_file, 0o444)
+            try:
+                with mock.patch.object(glb_writer, "_replace", side_effect=PermissionError("replace failed")):
+                    with self.assertRaisesRegex(PermissionError, "replace failed"):
+                        glb_writer._write_bytes_atomic(out_file, b"new glb")
+                with open(out_file, "rb") as f:
+                    self.assertEqual(f.read(), previous)
+                self.assertEqual([n for n in os.listdir(tmp_dir) if n != "output.glb"], [])
+            finally:
+                for name in os.listdir(tmp_dir):
+                    try:
+                        os.chmod(os.path.join(tmp_dir, name), 0o600)
+                    except OSError:
+                        pass
+
+    @unittest.skipUnless(os.name == "nt", "Windows enforces read-only file replace and unlink")
+    def test_windows_readonly_glb_failure_cleans_staging_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_file = os.path.join(tmp_dir, "output.glb")
+            previous = b"previous glb"
+            with open(out_file, "wb") as f:
+                f.write(previous)
+            os.chmod(out_file, 0o444)
+            try:
+                with self.assertRaises(PermissionError):
+                    glb_writer._write_bytes_atomic(out_file, b"new glb")
+                with open(out_file, "rb") as f:
+                    self.assertEqual(f.read(), previous)
+                self.assertEqual([n for n in os.listdir(tmp_dir) if n != "output.glb"], [])
+            finally:
+                for name in os.listdir(tmp_dir):
+                    try:
+                        os.chmod(os.path.join(tmp_dir, name), 0o600)
+                    except OSError:
+                        pass
+
 
 class TestObjParserAndBounds(unittest.TestCase):
     """Tests Wavefront OBJ parsing, coordinate transforms, UV flipping, and bounds."""
