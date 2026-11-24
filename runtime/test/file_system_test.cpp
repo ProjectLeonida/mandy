@@ -306,6 +306,8 @@ void run_checks(const std::filesystem::path& root) {
         };
         check(host_volumes && matches_volume(L"G:\\", package_serial, package_flags, package_fs),
               "G: volume identity matches the host package volume");
+        check(host_volumes && matches_volume(L"GAME:\\", package_serial, package_flags, package_fs),
+              "GAME: volume identity matches the host package volume");
         check(host_volumes && matches_volume(L"T:\\", overlay_serial, overlay_flags, overlay_fs),
               "T: volume identity matches the host overlay ancestor volume");
         wchar_t root_w[MAX_PATH]{};
@@ -331,8 +333,9 @@ void run_checks(const std::filesystem::path& root) {
             info_a_missing && info_a_missing("T:\\", nullptr, 0, &serial_a_before, nullptr, &flags_a_before, fs_a_before, MAX_PATH);
         std::filesystem::create_directories(missing_overlay);
         check(host_volumes && matches_volume(L"G:\\", package_serial, package_flags, package_fs) &&
+              matches_volume(L"GAME:\\", package_serial, package_flags, package_fs) &&
               matches_volume(L"T:\\", overlay_serial, overlay_flags, overlay_fs),
-              "G: and T: retain their host volume identities after overlay creation");
+              "G:, GAME:, and T: retain their host volume identities after overlay creation");
         const bool after = info && info(L"T:\\", nullptr, 0, &serial_after, nullptr, &flags_after, fs_after, MAX_PATH) &&
             info_a_missing && info_a_missing("T:\\", nullptr, 0, &serial_a_after, nullptr, &flags_a_after, fs_a_after, MAX_PATH);
         check(before && after && serial_before == serial_after && flags_before == flags_after &&

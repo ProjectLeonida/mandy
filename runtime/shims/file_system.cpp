@@ -1442,7 +1442,7 @@ bool volume_host_root(const std::wstring& name, std::wstring& result) {
     const Roots r = roots();
     size_t prefix = 0;
     const Drive drive = console_drive(name, prefix);
-    const bool package_volume = drive == Drive::Game && prefix == 2;
+    const bool package_volume = drive == Drive::Game;
     auto dir = package_volume ? r.game : r.overlay;
     const DWORD attributes = dir.empty() ? INVALID_FILE_ATTRIBUTES : ::GetFileAttributesW(dir.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES) {
