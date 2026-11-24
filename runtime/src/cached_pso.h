@@ -74,7 +74,7 @@ inline std::vector<std::uint8_t> encode(const Identity& identity, const Key& key
 }
 
 inline Check check(const Identity& identity, const Key& key, std::span<const std::uint8_t> blob) {
-    if (blob.size() != blob_bytes || blob.data() == nullptr) return Check::invalid;
+    if (blob.size() != blob_bytes) return Check::invalid;
     const std::uint8_t* p = blob.data();
     if (get32(p + blob_bytes - 4) != fnv1a(p, blob_bytes - 4)) return Check::invalid;
     if (get32(p) != magic || get32(p + 4) != version) return Check::invalid;

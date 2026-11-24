@@ -77,8 +77,7 @@ void test_corruption_and_size_and_null_blob() {
 
     CHECK(leonida::cached_pso::check(id, key, std::span<const std::uint8_t>(blob.data(), blob.size() - 1)) ==
           Check::invalid);
-    CHECK(leonida::cached_pso::check(id, key, std::span<const std::uint8_t>(static_cast<const std::uint8_t*>(nullptr), leonida::cached_pso::blob_bytes)) ==
-          Check::invalid);
+    CHECK(leonida::cached_pso::check(id, key, std::span<const std::uint8_t>{}) == Check::invalid);
 }
 
 void test_overlong_key_rejected_in_check() {
