@@ -1947,12 +1947,17 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
 
     A shard publishes shard<i>.json and then index.part<i>.json. Both are needed to reuse it. A run stopped
     part-way, or during the merge, keeps those parts when it resumes with the same --jobs, wave64 mode, fallback
-    flags and translator source, and starts only the shards that have none. shaders() drops the plan whenever an
-    earlier step reruns."""
+    flags, translator source and shader list, and starts only the shards that have none. shaders() drops the plan
+    whenever an earlier step reruns."""
     os.makedirs(spirv, exist_ok=True)
     plan_path = os.path.join(spirv, SHARD_PLAN)
     plan = {"jobs": jobs, "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks),
             "translator": translator_digest()}
+    if shader_list is not None:
+        # The list content is part of the plan identity: overwriting the same list file with a different
+        # selection must not reuse shards translated for the old list.
+        with open(shader_list, "rb") as f:
+            plan["shader_list"] = hashlib.sha256(f.read()).hexdigest()
     try:
         with open(plan_path, encoding="utf-8") as f:
             same = json.load(f) == plan
