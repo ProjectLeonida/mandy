@@ -4,8 +4,9 @@
 // BCPack into BCn blocks, then swizzles (docs/directstorage.md). This file is the middle step only, portable (no
 // windows.h), so it builds and tests on every OS. The lane layer is a line-by-line port of
 // tools/bcpack_calibration/src/model.rs (itself a port of `_decode_lanes_raw`); the block rebuilds follow
-// tools/bcpack_calibration/src/blocks.rs and `_bc1_blocks` .. `_bc5_blocks`, and `_bc7_check` / `_bc7_rebuild` for
-// BC7 (with the structure of DadaCap's prototype port). The tables come from tools/bcpack_tables*.py through
+// tools/bcpack_calibration/src/blocks.rs and `_bc1_blocks` .. `_bc5_blocks`, `_bc6h_blocks` for BC6H (its header
+// bit plans generated from `_bc6h_plan`), and `_bc7_check` / `_bc7_rebuild` for BC7 (with the structure of DadaCap's
+// prototype port). The tables come from tools/bcpack_tables*.py through
 // tools/bcpack_header.py (bcpack_tables.h).
 //
 // Two policies:
@@ -13,12 +14,11 @@
 //    a BC7 signature whose configuration is only inferred, or a BC7 block that fails its anchor / p-bit consistency
 //    check refuses the whole chunk. The test vectors hold this decoder to the Python one.
 //  - lenient, what a title needs: such a block is decoded anyway, from the zero state where the history is unknown
-//    (what `bcpack.decode(..., allow_provisional=True)` does for BC7, whose built-in history is all unknown), and
+//    (what `bcpack.decode(..., allow_provisional=True)` does for BC6H and BC7, whose built-in history is all unknown), and
 //    counted in Result::guessed together with every block that predicts from it. The texture then has a few wrong
 //    blocks instead of missing.
 //
-// Done: BCPack modes 1 (BC1), 3 (BC3), 4 (BC4), 5 (BC5) and 7 (BC7). Not yet: 6 (BC6H), which returns
-// Status::unsupported_codec.
+// Done: all six BCPack modes, 1 (BC1), 3 (BC3), 4 (BC4), 5 (BC5), 6 (BC6H) and 7 (BC7).
 #pragma once
 
 #include <array>
@@ -38,7 +38,7 @@ enum class Status {
     lane1_nonzero,        // lane 1 carries data (unexpected for BC1..BC5)
     bad_symbol,           // a symbol outside its lookup table
     unconfirmed_history,  // strict: a block needs a history entry or signature nobody has confirmed
-    bad_block,            // BC7: a signature outside the table, or (strict) an anchor / p-bit inconsistency
+    bad_block,            // BC6H/BC7: a mode or signature outside the table, or (strict) an inconsistent anchor or p-bit
 };
 
 const char* status_name(Status status);
@@ -62,8 +62,8 @@ Status decode_lanes(std::span<const std::uint8_t> in, std::span<const std::uint8
 // Confirmed history entries from the user's calibrated tables (tools/bcpack_history_calib.py), to use besides the
 // built-in ones: entry e of mode m at values[m][e * K .. e * K + K) with K = 6, 8, 2, 4 for modes 1, 3, 4, 5; -1 or a
 // short vector means "not given". An entry given here wins over the built-in one (`_resolve_bc_history`'s merge).
-// BC7's calibrated history is not read yet: its built-in entries are all unknown, so strict decoding refuses a BC7
-// chunk that refers to one and lenient decoding takes the zero state.
+// BC6H's and BC7's calibrated history is not read yet: their built-in entries are all unknown, so strict decoding
+// refuses a chunk that refers to one and lenient decoding takes zeros.
 struct History {
     std::array<std::vector<std::int16_t>, 8> values;
 };

@@ -535,6 +535,143 @@ Status bc7(const Lanes& l, Ctx& ctx, std::span<std::uint8_t> out) {
     return Status::ok;
 }
 
+// BC6H -------------------------------------------------------------------------------------------------------------
+// `_bc6h_blocks` of tools/bcpack.py. The header bit layout of each mode comes from `_bc6h_plan` through the table
+// header (kBc6hPlan), so the D3D11 layout strings are not parsed twice. The built-in BC6H history is all unknown: a
+// reference before the chunk's first block is refused (strict) or read as zeros, as Python's provisional mode does
+// (lenient). Refusals in Python's order: a mode symbol past 13 (at once), then the history, then the anchor indices.
+
+// `_inter(a, b, n)`: the bits of a and b interleaved, a's first.
+int inter(int a, int b, int n) {
+    int d = 0;
+    for (int k = 0; k < n; ++k) d |= (((a >> k) & 1) << (2 * k)) | (((b >> k) & 1) << (2 * k + 1));
+    return d;
+}
+
+// `_bc6h_stream_w`: BCPack's base endpoint in the D3D11 bit order of modes 13 and 14.
+std::int64_t bc6h_stream_w(int mode, std::int64_t w) {
+    if (mode == 13) return (w & 0x3FF) | (((w >> 10) & 1) << 11) | (((w >> 11) & 1) << 10);
+    if (mode == 14) {
+        std::int64_t out = w & 0x3FF;
+        for (int b = 10; b < 16; ++b) out |= ((w >> b) & 1) << (25 - b);
+        return out;
+    }
+    return w;
+}
+
+Status bc6h(const Lanes& l, Ctx& ctx, std::span<std::uint8_t> out) {
+    using Endpoints = std::array<std::array<std::int64_t, 4>, 3>;
+    static constexpr std::array<std::int64_t, 4> kNoneChannel{0x8000, 0x200, 0x20, 0x20};
+    const std::size_t n = l.count / 2;
+    std::vector<Endpoints> st_e(n);
+    std::vector<std::array<int, 16>> st_i(n);
+    std::vector<std::uint8_t> lost_e(n, 0), lost_i(n, 0);
+    bool unknown_reference = false;
+    std::size_t violations = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::size_t a = 2 * i, b = 2 * i + 1;
+        const int m_sym = l.at(15, a);
+        if (m_sym > 13) return Status::bad_block;
+        const int mode = m_sym + 1;
+        const tables::Bc6hMode& md = tables::kBc6hModes[static_cast<std::size_t>(mode)];
+        const int part = std::min<int>(l.at(15, b), 31);
+        const int di = inter8(l.at(1, a), l.at(1, b));
+        const int de = (di + static_cast<int>(unzig(static_cast<std::uint16_t>(inter8(l.at(0, a), l.at(0, b)))))) & 255;
+
+        Endpoints eref{};
+        if (de == 0) {
+            eref = {kNoneChannel, kNoneChannel, kNoneChannel};
+        } else if (static_cast<std::size_t>(de) <= i) {
+            eref = st_e[i - static_cast<std::size_t>(de)];
+            lost_e[i] = lost_e[i - static_cast<std::size_t>(de)];
+        } else {
+            lost_e[i] = 1;  // the built-in entry is unknown: zeros
+            unknown_reference = true;
+        }
+        std::array<int, 16> iref{};
+        if (di == 0) {
+            iref.fill(8);
+        } else if (static_cast<std::size_t>(di) <= i) {
+            iref = st_i[i - static_cast<std::size_t>(di)];
+            lost_i[i] = lost_i[i - static_cast<std::size_t>(di)];
+        } else {
+            lost_i[i] = 1;
+            unknown_reference = true;
+        }
+
+        const int regions = md.regions, base = md.base, w_shift = 16 - base;
+        const std::int64_t mw = (std::int64_t{1} << base) - 1;
+        std::int64_t f[3][4] = {};
+        Endpoints st{};
+        for (int c = 0; c < 3; ++c) {
+            const int dc = md.delta[c];
+            const std::int64_t m_d = (std::int64_t{1} << dc) - 1;
+            const int sh = dc < 6 ? 6 - dc : 0;
+            const std::int64_t dz0 = unzig(static_cast<std::uint16_t>(inter(l.at(2 + c, a), l.at(2 + c, b), 8)));
+            const std::int64_t dz1 = unzig(static_cast<std::uint16_t>(inter(l.at(5 + c, a), l.at(5 + c, b), 5)));
+            const std::int64_t dz2 = unzig(l.at(8 + c, a)), dz3 = unzig(l.at(8 + c, b));
+            const auto& r = eref[static_cast<std::size_t>(c)];
+            const std::int64_t w = ((r[0] >> w_shift) + dz0) & mw;
+            const std::int64_t x = ((r[1] >> (10 - dc)) + dz1) & m_d;
+            const std::int64_t y = ((r[2] >> sh) + dz2) & m_d;
+            const std::int64_t z = ((r[3] >> sh) + dz3) & m_d;
+            const std::int64_t x10 = x << (10 - dc);
+            if (regions == 2) {
+                st[static_cast<std::size_t>(c)] = {w << w_shift, x10, y << sh, z << sh};
+                f[c][0] = bc6h_stream_w(mode, w), f[c][1] = x, f[c][2] = y, f[c][3] = z;
+            } else {
+                const std::int64_t v = (w & m_d) ^ (md.transformed ? (std::int64_t{1} << (dc - 1)) : 0);
+                const std::int64_t low_y = dc >= 6 ? v >> (dc - 6) : v << sh;
+                st[static_cast<std::size_t>(c)] = {w << w_shift, x10, low_y, x10 >> 4};
+                f[c][0] = bc6h_stream_w(mode, w), f[c][1] = x;
+            }
+        }
+        st_e[i] = st;
+
+        const int ibits = regions == 2 ? 3 : 4, imask = (1 << ibits) - 1, ishift = 4 - ibits;
+        std::array<int, 16> ix{}, si{};
+        for (int y = 0; y < 4; ++y) {
+            const bool first_odd = y < 3;  // the last row's pairs are the other way round
+            const int sa = l.at(static_cast<std::size_t>(11 + y), a), sb = l.at(static_cast<std::size_t>(11 + y), b);
+            const int d[4] = {deint(sa, first_odd), deint(sa, !first_odd), deint(sb, first_odd), deint(sb, !first_odd)};
+            for (int x = 0; x < 4; ++x) {
+                const std::size_t p = static_cast<std::size_t>(y * 4 + x);
+                ix[p] = ((iref[p] >> ishift) + static_cast<int>(unzig(static_cast<std::uint16_t>(d[x])))) & imask;
+                si[p] = ix[p] << ishift;
+            }
+        }
+        st_i[i] = si;
+
+        const int second = regions == 2 ? tables::kBc7Anchor2[static_cast<std::size_t>(part)] : -1;
+        bool bad = false;
+        if (ix[0] & (regions == 2 ? 4 : 8)) ++violations, bad = true;
+        if (regions == 2 && (ix[static_cast<std::size_t>(second)] & 4)) ++violations, bad = true;
+
+        std::uint64_t word[2] = {md.code, 0};
+        const auto set = [&](int pos) { word[pos >> 6] |= std::uint64_t{1} << (pos & 63); };
+        for (std::size_t k = md.plan_start; k < static_cast<std::size_t>(md.plan_start) + md.plan_size; ++k) {
+            const tables::Bc6hStep& step = tables::kBc6hPlan[k];
+            const std::int64_t value = step.c < 0 ? part : f[step.c][step.q];
+            if ((value >> step.bit) & 1) set(step.pos);
+        }
+        int at = md.header;
+        for (int p = 0; p < 16; ++p) {
+            const int nb = (p == 0 || p == second) ? ibits - 1 : ibits;
+            for (int k = 0; k < nb; ++k, ++at)
+                if ((ix[static_cast<std::size_t>(p)] >> k) & 1) set(at);
+        }
+        std::uint8_t* to = out.data() + 16 * i;
+        for (int k = 0; k < 2; ++k)
+            for (int byte = 0; byte < 8; ++byte) to[8 * k + byte] = static_cast<std::uint8_t>(word[k] >> (8 * byte));
+        ctx.lost[i] = lost_e[i] || lost_i[i] || (bad && ctx.lenient);
+    }
+    if (!ctx.lenient) {
+        if (unknown_reference) return Status::unconfirmed_history;
+        if (violations) return Status::bad_block;
+    }
+    return Status::ok;
+}
+
 }  // namespace
 
 const char* status_name(Status status) {
@@ -788,7 +925,7 @@ Status decode_lanes(std::span<const std::uint8_t> raw, std::span<const std::uint
 Result decode(std::span<const std::uint8_t> in, std::uint32_t mode, std::span<std::uint8_t> out,
               const Options& options) {
     const std::uint32_t bytes = block_bytes(mode);
-    if (mode != 1 && mode != 3 && mode != 4 && mode != 5 && mode != 7) return {Status::unsupported_codec};
+    if (block_bytes(mode) == 0) return {Status::unsupported_codec};
     if (out.size() % bytes) return {Status::bad_size};
     Lanes lanes;
     if (const Status s = decode_lanes(in, lane_widths(mode), out.size() / kElementBytes, lanes); s != Status::ok)
@@ -805,6 +942,7 @@ Result decode(std::span<const std::uint8_t> in, std::uint32_t mode, std::span<st
         case 3: s = bc3(lanes, external, ctx, out); break;
         case 4: s = bc4(lanes, external, ctx, out); break;
         case 5: s = bc5(lanes, external, ctx, out); break;
+        case 6: s = bc6h(lanes, ctx, out); break;
         default: s = bc7(lanes, ctx, out); break;
     }
     return {s, s == Status::ok ? ctx.guessed() : 0};

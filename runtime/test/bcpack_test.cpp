@@ -85,7 +85,6 @@ int main() {
     std::vector<std::uint8_t> out(32);
     const std::uint8_t none[1] = {0};
     check(bp::decode(none, 2, out) == Status::unsupported_codec, "mode 2 (BC2) has no BCPack form");
-    check(bp::decode(none, 6, out) == Status::unsupported_codec, "mode 6 (BC6H) is not ported yet");
     check(bp::decode(none, 8, out) == Status::unsupported_codec, "mode 8 does not exist");
     std::vector<std::uint8_t> odd(12);
     check(bp::decode(none, 1, odd) == Status::bad_size, "12 bytes are not whole BC1 blocks");
