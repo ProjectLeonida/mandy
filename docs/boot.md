@@ -32,6 +32,12 @@ DllMain/TLS results, exceptions with their stack frames, the exit, and the D3D12
 per method. The `[rt]` lines in the same stderr log carry the device parameters, feature ids and warnings; the
 summary leaves them as a count, so grep `^\[rt\]` for those.
 
+With `LEONIDA_CRASH_LOG` set (`runtime/README.md`, "Unhandled-exception log"), the exception that ends a run without
+a debugger also gets a block on stderr and in that file: code, faulting address as module+0xRVA, thread, and the top
+frames. That is the signal for a `0xC0000005` after the CLZERO emulation: it is the one unhandled exception, not
+every first-chance event the startup trace records, and it names the fault and its callers even when no `--trace`
+was given.
+
 For `xmem_physical_pages`, the shim records the first request for each distinct attribute word. The text and
 JSON summaries list the API, raw attribute word, requested page count and caller for the first `--limit`
 records in trace order. Use `--limit 0` to keep the total with no records. Text shows how many records were

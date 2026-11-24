@@ -1066,6 +1066,19 @@ if(BUILD_TESTING)
     target_link_options(startup_trace_test PRIVATE /OPT:NOREF)
     add_dependencies(startup_trace_test gta6rt_tls_host)
     add_test(NAME startup_trace COMMAND startup_trace_test)
+
+    # LEONIDA_CRASH_LOG (shims/crash_log.h): a child process writes through a null pointer on a thread; the parent
+    # checks the code, faulting address as module+0xRVA, thread id and top frames in both stderr and the file, and
+    # that the child still ends with 0xC0000005. No game files, no GPU.
+    add_executable(crash_log_test
+      test/crash_log_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+    )
+    target_compile_definitions(crash_log_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(crash_log_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    add_dependencies(crash_log_test gta6rt_tls_host)
+    add_test(NAME crash_log COMMAND crash_log_test)
   endif()
 
   if(TARGET device_proxy_test)
