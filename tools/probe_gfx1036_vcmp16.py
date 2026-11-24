@@ -3,11 +3,15 @@
   - Inline int/float constants and 32-bit literals with op_sel=0/1.
   - SGPR high halves, f16 abs/neg/ordered-vs-unordered NaN.
 
-Usage:
-  powershell -File C:\\Leonida-worktrees\\with-gpu-lock.ps1 "cd C:\\Leonida-worktrees\\w4-cmp16-opsel; python scripts/probe_gfx1036_vcmp16.py"
+Usage (from the checkout root, on a machine with a gfx1036 GPU):
+  python -I tools/probe_gfx1036_vcmp16.py
+
+Needs spirv-as on PATH (Vulkan SDK) and vk_compute_test built in runtime/build
+(cmake --build runtime/build --config RelWithDebInfo --target vk_compute_test).
 """
 import math
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -21,7 +25,21 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 from support import STUB_DXBC, rdna2spirv
 import spirv_mini_interp as si
 
-VK_COMPUTE_TEST = os.path.join(ROOT, "runtime", "build", "vk_compute_test.exe")
+_EXE = "vk_compute_test" + (".exe" if os.name == "nt" else "")
+_BUILD = os.path.join(ROOT, "runtime", "build")
+# A multi-config (Visual Studio) build puts it in RelWithDebInfo or Release; the first one found is used.
+VK_COMPUTE_TEST = next((p for p in (os.path.join(_BUILD, d, _EXE) for d in ("", "RelWithDebInfo", "Release"))
+                        if os.path.isfile(p)), os.path.join(_BUILD, _EXE))
+
+
+def missing_prerequisite():
+    """One line naming what the probe cannot run without, or None."""
+    if not os.path.isfile(VK_COMPUTE_TEST):
+        return (f"vk_compute_test not found in {_BUILD} or its RelWithDebInfo/Release folder; build it first "
+                "(cmake --build runtime/build --config RelWithDebInfo --target vk_compute_test)")
+    if shutil.which("spirv-as") is None:
+        return "spirv-as not found on PATH; install the Vulkan SDK (https://vulkan.lunarg.com/)"
+    return None
 
 # Half-precision bit constants
 H_ZERO = 0x0000      # +0.0
@@ -334,6 +352,10 @@ def test_f16_nan_and_modifiers(wave_size=32):
 
 
 def main():
+    problem = missing_prerequisite()
+    if problem:
+        print(f"ERROR: {problem}", file=sys.stderr)
+        return 1
     print("=" * 70)
     print("PROBING GFX1036 SILICON FOR V_CMP(X) 16-BIT OP_SEL & CONSTANTS")
     print("=" * 70)
@@ -367,4 +389,4 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, ValueError, OSError):
         pass
-    main()
+    sys.exit(main())
