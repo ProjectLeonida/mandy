@@ -349,7 +349,15 @@ Windows and POSIX. The ranges partition the same name-sorted index as `--start` 
 short range. Each finished process saves to the same `pipeline_cache.bin`, and the next loads that checkpoint.
 This bounds each invocation to a range that can be split further if concurrent heavy compiles exceed available
 memory. A work folder with at most 500 entries keeps the single invocation. An older checker without the range
-options keeps the older invocation; rebuild the runtime to get batching.
+options keeps the older invocation only when no separate translation index exists; rebuild the runtime to check
+those indexes.
+
+The build checks the translated `library/`, `fspx/` and `exe/` indexes, when present, before the main corpus index.
+They all use the same `pipeline_cache.bin` that the runtime loads. In particular, this precompiles the slot-67
+library compute pipelines before the game requests them during boot. Each index has separate in-flight, skip and
+crash-report files (for example, `pipeline_inflight_library.txt` and `pipeline_crashes_library.json`), so a
+failure in one index does not hide a failure in another. A validation failure still permits later indexes to be
+checked; a setup failure or interruption stops the stage.
 
 If a batch crashes, its in-flight modules are checked alone in fresh processes. A module that reproducibly crashes
 is recorded as failed, and the rest is checked. If none crashes alone, the entire failed range is retried in

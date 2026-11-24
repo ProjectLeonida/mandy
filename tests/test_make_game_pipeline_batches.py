@@ -95,7 +95,15 @@ class PipelineBatchesTest(unittest.TestCase):
         (self.spirv / "index.json").write_text(json.dumps({n: {} for n in reversed(names)}),
                                                 encoding="utf-8", newline="\n")
 
-    def invoke(self, control=None, range_support=True):
+    def make_extra(self, label, names, control=None):
+        folder = self.spirv / label
+        folder.mkdir()
+        (folder / "index.json").write_text(json.dumps({n: {"stage": "cs"} for n in reversed(names)}),
+                                           encoding="utf-8", newline="\n")
+        (folder / "control.json").write_text(json.dumps(control or {}), encoding="utf-8", newline="\n")
+        return folder
+
+    def invoke(self, control=None, range_support=True, report_support=True):
         (self.spirv / "control.json").write_text(json.dumps(control or {}), encoding="utf-8", newline="\n")
         def run(args, hint="", check=True, **kwargs):
             args = [str(a) for a in args]
@@ -106,6 +114,8 @@ class PipelineBatchesTest(unittest.TestCase):
                 raise SystemExit(1)
             return done.returncode
         def supports(exe, *options):
+            if "--inflight-file" in options:
+                return report_support
             return range_support or "--start" not in options
         logs, err = [], io.StringIO()
         # create=True keeps the regression runnable on the old implementation, which lacks this constant.
@@ -120,10 +130,52 @@ class PipelineBatchesTest(unittest.TestCase):
                 return exc.code, logs, err.getvalue()
         return 0, logs, err.getvalue()
 
-    def calls(self, event=None):
-        path = self.spirv / "calls.jsonl"
+    def calls(self, event=None, label="corpus"):
+        path = (self.spirv if label == "corpus" else self.spirv / label) / "calls.jsonl"
         rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
         return [row for row in rows if event is None or row["event"] == event]
+
+    def test_separate_indexes_checkpoint_into_one_cache_before_corpus(self):
+        library = self.make_extra("library", ["lib_00", "lib_01", "lib_02", "lib_03"])
+        fspx = self.make_extra("fspx", ["fspx_00", "fspx_01"])
+        exe = self.make_extra("exe", ["exe_00"])
+        code, _, err = self.invoke()
+        self.assertEqual(code, 0, err)
+        self.assertEqual([Path(cmd[1]) for cmd in self.commands],
+                         [library, library, fspx, exe, self.spirv, self.spirv, self.spirv])
+        self.assertEqual([row["selected"] for row in self.calls("completed", "library")],
+                         [["lib_00", "lib_01", "lib_02"], ["lib_03"]])
+        want = ["lib_00", "lib_01", "lib_02", "lib_03", "fspx_00", "fspx_01", "exe_00", *self.names]
+        self.assertEqual(json.loads((self.out / "pipeline_cache.bin").read_text(encoding="utf-8")), want)
+        self.assertTrue(all(Path(cmd[2]) == self.out / "pipeline_cache.bin" for cmd in self.commands))
+
+    def test_library_crash_has_its_own_report_and_corpus_still_completes(self):
+        # The same name in both indexes must not let the library skip list hide a healthy corpus module.
+        self.make_extra("library", ["lib_00", "m_01"], {"crasher": "m_01"})
+        code, _, err = self.invoke()
+        self.assertNotEqual(code, 0)
+        self.assertIn("library", err)
+        self.assertIn("m_01", err)
+        self.assertEqual((self.out / "pipeline_crashes_library.txt").read_text(encoding="utf-8"), "m_01\n")
+        with (self.out / "pipeline_crashes_library.json").open(encoding="utf-8") as f:
+            report = json.load(f)
+        self.assertEqual([item["name"] for item in report["modules"]], ["m_01"])
+        self.assertFalse((self.out / "pipeline_crashes.json").exists())
+        self.assertEqual({n for row in self.calls("completed") for n in row["active"]}, set(self.names))
+
+    def test_separate_index_requires_report_support(self):
+        self.make_extra("library", ["lib_00"])
+        code, _, err = self.invoke(report_support=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("rebuild", err)
+        self.assertEqual(self.commands, [])
+
+    def test_separate_index_requires_range_support(self):
+        self.make_extra("library", ["lib_00"])
+        code, _, err = self.invoke(range_support=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--start/--count", err)
+        self.assertEqual(self.commands, [])
 
     def test_bounded_processes_cover_the_sorted_index_and_tail(self):
         code, _, err = self.invoke()
