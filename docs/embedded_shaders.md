@@ -245,6 +245,16 @@ chunk ends exactly at that total; that is what rejects the FSR DLL's `DXBC` imme
 `tests/test_pe_shader_containers.py` build containers by hand (no game data) and cover the accepted layout, a
 bare magic, a truncated chunk, an `ACCC`/`FSPX` container, the `ILDN` name and the extraction index.
 
+A console program can also be stored compressed, and then the image has no `DXBC` magic for it. The record is a u32
+stored size, the u32 constant `0x000DDCE7`, the stored size again, the u32 size of the container and a raw deflate
+stream of the whole container; both stored sizes count from the constant, so they include those 12 bytes. It is the
+layout the five-star-recomp project describes for the shader records of the effect tables (its note on shader
+containers). The tool takes such a record only when both sizes agree and fit, the stream ends exactly where the record
+does and inflates to exactly one container of the named size, and that container holds an `XBCH` program. It lists the
+record after the plain containers, which keep their order and file names, with the `offset` of the constant,
+`stored_size`, and the `size` and `sha256` of the inflated container, which `--extract` writes. The tests build such
+records by hand and cover the rejected forms.
+
 ## 7. Build step and run-time lookup
 
 **Build (D3D-557).** `make_game.py`'s `shaders` stage, after the game's own shaders and the FidelityFX step, runs
