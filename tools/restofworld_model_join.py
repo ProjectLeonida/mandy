@@ -46,6 +46,11 @@ import sys
 import time
 import zlib
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from report_paths import same_report_path  # noqa: E402
+
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
 SYS_BASE = 0x50000000
 GFX_BASE = 0x60000000
@@ -1234,21 +1239,14 @@ def byte_count_arg(text):
 
 
 def _aliases_input(out_path, source_path):
-    if os.path.normcase(os.path.realpath(out_path)) == os.path.normcase(os.path.realpath(source_path)):
+    if same_report_path(out_path, source_path):
         return True
-    try:
-        if os.path.samefile(out_path, source_path):
-            return True
-    except OSError:
-        pass
     if os.path.isdir(source_path):
         index_path = os.path.join(source_path, "index.json")
-        if os.path.normcase(os.path.realpath(out_path)) == os.path.normcase(os.path.realpath(index_path)):
+        if same_report_path(out_path, index_path):
             return True
         if not os.path.isfile(out_path):
             return False
-        if os.path.isfile(index_path) and os.path.samefile(out_path, index_path):
-            return True
         src_root = os.path.normcase(os.path.abspath(source_path))
         target = os.path.normcase(os.path.abspath(out_path))
         if os.path.dirname(target) == src_root and target.endswith((".bin", ".bk2")):
