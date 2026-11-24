@@ -7121,6 +7121,7 @@ int main() {
             EXPECT(on.shaderResourceMinLod == have.features.shaderResourceMinLod);
             EXPECT(made->shader_output_layer == (have12.shaderOutputLayer == VK_TRUE));
             EXPECT(made->shader_output_viewport_index == (have12.shaderOutputViewportIndex == VK_TRUE));
+            EXPECT(made->shader_buffer_int64_atomics == (have12.shaderBufferInt64Atomics == VK_TRUE));
             // The pixel-shader extensions (barycentrics, the POPS interlock, maintenance8's texel offsets): each is
             // enabled exactly when the GPU offers the extension and its feature. A structure is chained into the
             // query only when its extension is offered.

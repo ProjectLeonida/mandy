@@ -1,0 +1,172 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
+; GPU multi-thread test for --int64-atomics (64-bit OpAtomicExchange / Int64Atomics on buffer_atomic_swap_x2 and
+; global_atomic_swap_x2; ds_wrxchg_rtn_b64 is unchanged). Built with --int64-atomics by run_gpu_tests.py and
+; build.py (and globally with LEONIDA_INT64_ATOMICS=1); exits 77 if the Vulkan device lacks shaderBufferInt64Atomics.
+; 40 groups make a 0x2800-byte heap; only group 0 runs the atomic swaps across all 64 threads (2 wave32 waves) over
+; 4 rounds (256 buffer + 256 global swaps), verifying every returned pair has matching (lo ^ hi) tag+id parity
+; (0 tears on atomic 64-bit exchange; two 32-bit dword exchanges tear when concurrent waves interleave).
+; Finally group 0 thread 0 checks known return + readback values:
+; Run: vk_compute_test cs_atomic_swap_x2_int64.spv 40 dump ->
+;   0x0 0x0 0x100 0x100 0x1 0x1 0xdead0001 0x9abcdef0
+v_or_b32_e32 v1, s4, v0
+v_cmpx_eq_u32_e32 0, v1
+v_mov_b32 v2, 0x2000
+v_mov_b32 v10, 0xaa000000
+v_mov_b32 v11, 0xbb000000
+buffer_atomic_swap_x2 v[10:11], v2, s[0:3], 0 offen
+s_mov_b32 s20, 0x2000
+s_mov_b32 s21, 0
+v_mov_b32 v30, 0
+v_mov_b32 v4, 0xcc000000
+v_mov_b32 v5, 0xee000000
+global_atomic_swap_x2 v30, v[4:5], s[20:21] offset:16
+v_mov_b32 v9, 0
+v_mov_b32 v18, 0x2020
+buffer_atomic_and v9, v18, s[0:3], 0 offen
+v_mov_b32 v19, 0x2024
+buffer_atomic_and v9, v19, s[0:3], 0 offen
+v_mov_b32 v22, 0x2028
+buffer_atomic_and v9, v22, s[0:3], 0 offen
+v_mov_b32 v23, 0x202c
+buffer_atomic_and v9, v23, s[0:3], 0 offen
+s_waitcnt vmcnt(0)
+s_mov_b32 exec_lo, -1
+s_barrier
+v_mov_b32 v1, s4
+v_cmpx_eq_u32_e32 0, v1
+v_mov_b32 v2, 0x2000
+s_mov_b32 s20, 0x2000
+s_mov_b32 s21, 0
+v_mov_b32 v30, 0
+v_mov_b32 v18, 0x2020
+v_mov_b32 v19, 0x2024
+v_mov_b32 v22, 0x2028
+v_mov_b32 v23, 0x202c
+v_mov_b32 v9, 1
+v_add_nc_u32_e32 v3, 1, v0
+v_or_b32_e32 v10, 0xaa000000, v3
+v_or_b32_e32 v11, 0xbb000000, v3
+buffer_atomic_swap_x2 v[10:11], v2, s[0:3], 0 offen glc
+s_waitcnt vmcnt(0)
+v_xor_b32_e32 v8, v10, v11
+v_cmp_ne_u32_e32 vcc_lo, 0x11000000, v8
+v_cndmask_b32_e32 v8, 0, v9, vcc_lo
+buffer_atomic_add v8, v18, s[0:3], 0 offen
+buffer_atomic_add v9, v22, s[0:3], 0 offen
+v_or_b32_e32 v4, 0xcc000000, v3
+v_or_b32_e32 v5, 0xee000000, v3
+global_atomic_swap_x2 v[6:7], v30, v[4:5], s[20:21] offset:16 glc
+s_waitcnt vmcnt(0)
+v_xor_b32_e32 v8, v6, v7
+v_cmp_ne_u32_e32 vcc_lo, 0x22000000, v8
+v_cndmask_b32_e32 v8, 0, v9, vcc_lo
+buffer_atomic_add v8, v19, s[0:3], 0 offen
+buffer_atomic_add v9, v23, s[0:3], 0 offen
+v_add_nc_u32_e32 v3, 64, v3
+v_or_b32_e32 v10, 0xaa000000, v3
+v_or_b32_e32 v11, 0xbb000000, v3
+buffer_atomic_swap_x2 v[10:11], v2, s[0:3], 0 offen glc
+s_waitcnt vmcnt(0)
+v_xor_b32_e32 v8, v10, v11
+v_cmp_ne_u32_e32 vcc_lo, 0x11000000, v8
+v_cndmask_b32_e32 v8, 0, v9, vcc_lo
+buffer_atomic_add v8, v18, s[0:3], 0 offen
+buffer_atomic_add v9, v22, s[0:3], 0 offen
+v_or_b32_e32 v4, 0xcc000000, v3
+v_or_b32_e32 v5, 0xee000000, v3
+global_atomic_swap_x2 v[6:7], v30, v[4:5], s[20:21] offset:16 glc
+s_waitcnt vmcnt(0)
+v_xor_b32_e32 v8, v6, v7
+v_cmp_ne_u32_e32 vcc_lo, 0x22000000, v8
+v_cndmask_b32_e32 v8, 0, v9, vcc_lo
+buffer_atomic_add v8, v19, s[0:3], 0 offen
+buffer_atomic_add v9, v23, s[0:3], 0 offen
+v_add_nc_u32_e32 v3, 64, v3
+v_or_b32_e32 v10, 0xaa000000, v3
+v_or_b32_e32 v11, 0xbb000000, v3
+buffer_atomic_swap_x2 v[10:11], v2, s[0:3], 0 offen glc
+s_waitcnt vmcnt(0)
+v_xor_b32_e32 v8, v10, v11
+v_cmp_ne_u32_e32 vcc_lo, 0x11000000, v8
+v_cndmask_b32_e32 v8, 0, v9, vcc_lo
+buffer_atomic_add v8, v18, s[0:3], 0 offen
+buffer_atomic_add v9, v22, s[0:3], 0 offen
+v_or_b32_e32 v4, 0xcc000000, v3
+v_or_b32_e32 v5, 0xee000000, v3
+global_atomic_swap_x2 v[6:7], v30, v[4:5], s[20:21] offset:16 glc
+s_waitcnt vmcnt(0)
+v_xor_b32_e32 v8, v6, v7
+v_cmp_ne_u32_e32 vcc_lo, 0x22000000, v8
+v_cndmask_b32_e32 v8, 0, v9, vcc_lo
+buffer_atomic_add v8, v19, s[0:3], 0 offen
+buffer_atomic_add v9, v23, s[0:3], 0 offen
+v_add_nc_u32_e32 v3, 64, v3
+v_or_b32_e32 v10, 0xaa000000, v3
+v_or_b32_e32 v11, 0xbb000000, v3
+buffer_atomic_swap_x2 v[10:11], v2, s[0:3], 0 offen glc
+s_waitcnt vmcnt(0)
+v_xor_b32_e32 v8, v10, v11
+v_cmp_ne_u32_e32 vcc_lo, 0x11000000, v8
+v_cndmask_b32_e32 v8, 0, v9, vcc_lo
+buffer_atomic_add v8, v18, s[0:3], 0 offen
+buffer_atomic_add v9, v22, s[0:3], 0 offen
+v_or_b32_e32 v4, 0xcc000000, v3
+v_or_b32_e32 v5, 0xee000000, v3
+global_atomic_swap_x2 v[6:7], v30, v[4:5], s[20:21] offset:16 glc
+s_waitcnt vmcnt(0)
+v_xor_b32_e32 v8, v6, v7
+v_cmp_ne_u32_e32 vcc_lo, 0x22000000, v8
+v_cndmask_b32_e32 v8, 0, v9, vcc_lo
+buffer_atomic_add v8, v19, s[0:3], 0 offen
+buffer_atomic_add v9, v23, s[0:3], 0 offen
+s_waitcnt vmcnt(0)
+s_mov_b32 exec_lo, -1
+s_barrier
+v_or_b32_e32 v1, s4, v0
+v_cmpx_eq_u32_e32 0, v1
+v_mov_b32 v10, 0
+buffer_atomic_add v10, v18, s[0:3], 0 offen glc
+v_mov_b32 v11, 0
+buffer_atomic_add v11, v19, s[0:3], 0 offen glc
+v_mov_b32 v12, 0
+buffer_atomic_add v12, v22, s[0:3], 0 offen glc
+v_mov_b32 v13, 0
+buffer_atomic_add v13, v23, s[0:3], 0 offen glc
+v_mov_b32 v14, 0xdead0001
+v_mov_b32 v15, 0xcafe0002
+buffer_atomic_swap_x2 v[14:15], v2, s[0:3], 0 offen glc
+s_waitcnt vmcnt(0)
+v_xor_b32_e32 v8, v14, v15
+v_cmp_eq_u32_e32 vcc_lo, 0x11000000, v8
+v_cndmask_b32_e32 v14, 0, v9, vcc_lo
+v_mov_b32 v16, 0x11223344
+v_mov_b32 v17, 0x55667788
+buffer_atomic_swap_x2 v[16:17], v2, s[0:3], 0 offen glc
+v_mov_b32 v4, 0x12345678
+v_mov_b32 v5, 0x9abcdef0
+global_atomic_swap_x2 v[6:7], v30, v[4:5], s[20:21] offset:16 glc
+s_waitcnt vmcnt(0)
+v_xor_b32_e32 v8, v6, v7
+v_cmp_eq_u32_e32 vcc_lo, 0x22000000, v8
+v_cndmask_b32_e32 v15, 0, v9, vcc_lo
+v_mov_b32 v4, 0
+v_mov_b32 v5, 0
+global_atomic_swap_x2 v[6:7], v30, v[4:5], s[20:21] offset:16 glc
+s_waitcnt vmcnt(0)
+v_mov_b32 v20, 0
+buffer_store_dword v10, v20, s[0:3], 0 offen
+v_mov_b32 v20, 4
+buffer_store_dword v11, v20, s[0:3], 0 offen
+v_mov_b32 v20, 8
+buffer_store_dword v12, v20, s[0:3], 0 offen
+v_mov_b32 v20, 12
+buffer_store_dword v13, v20, s[0:3], 0 offen
+v_mov_b32 v20, 16
+buffer_store_dword v14, v20, s[0:3], 0 offen
+v_mov_b32 v20, 20
+buffer_store_dword v15, v20, s[0:3], 0 offen
+v_mov_b32 v20, 24
+buffer_store_dword v16, v20, s[0:3], 0 offen
+v_mov_b32 v20, 28
+buffer_store_dword v7, v20, s[0:3], 0 offen
+s_endpgm

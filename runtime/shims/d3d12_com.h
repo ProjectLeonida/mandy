@@ -191,6 +191,9 @@ struct VulkanDeviceInfo {
     // arena and have console VAs (docs section 3.3), and GetGPUVirtualAddress returns those addresses; ray tracing
     // needs it too. Without it, GetGPUVirtualAddress returns 0 and pipelines cannot be created.
     bool buffer_device_address = false;
+    // Vulkan 1.2 shaderBufferInt64Atomics is enabled on `device`: translated shaders built with
+    // `rdna2spirv.py --int64-atomics` (OpCapability Int64Atomics on *_atomic_swap_x2) can create compute/graphics PSOs.
+    bool shader_buffer_int64_atomics = false;
     // Optional VK_KHR_acceleration_structure + VK_KHR_deferred_host_operations + VK_KHR_ray_query are enabled:
     // GetRaytracingAccelerationStructurePrebuildInfo and BuildRaytracingAccelerationStructure (BLAS + TLAS) work.
     bool ray_tracing = false;

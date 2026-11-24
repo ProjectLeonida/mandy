@@ -1775,7 +1775,7 @@ WAVE64_MODES = ("auto", "on", "off")
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
                   ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
-                  ("--compact-spirv", "compact_spirv"))
+                  ("--compact-spirv", "compact_spirv"), ("--int64-atomics", "int64_atomics"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -3039,6 +3039,10 @@ def main() -> int:
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
                          "the shaders need (144, or 152 with --mesh-compute)")
+    ap.add_argument("--int64-atomics", action="store_true",
+                    help="emit 64-bit OpAtomicExchange (OpCapability Int64Atomics, requires "
+                         "shaderBufferInt64Atomics) for buffer_atomic_swap_x2 / global_atomic_swap_x2 "
+                         "instead of two 32-bit dword exchanges (ds_wrxchg_rtn_b64 is unchanged)")
     ap.add_argument("--no-tui", action="store_true",
                     help="plain console logs (default when stdout is not a TTY); skip the LEONIDA setup screen "
                          "and per-stage log view")
