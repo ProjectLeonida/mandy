@@ -11,6 +11,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -282,6 +283,22 @@ class TestErrorsAndCli(unittest.TestCase):
             with contextlib.redirect_stdout(text):
                 self.assertEqual(R.main([paths["in.bin"], "--geom", geo, "--out", paths["out.bin"]]), 0)
             self.assertIn("rehydrated", text.getvalue())
+
+    def test_publish_restores_write_mode_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "out.bin")
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def track_chmod(p, mode, **kwargs):
+                chmod_calls.append((p, mode))
+                return real_chmod(p, mode, **kwargs)
+
+            with mock.patch("bvh_rehydrate.os.replace", side_effect=OSError("replace failed")), \
+                 mock.patch("bvh_rehydrate.os.chmod", side_effect=track_chmod):
+                with self.assertRaises(OSError):
+                    R._publish(out, b"data")
+            self.assertTrue(any(mode == 0o600 for p, mode in chmod_calls))
 
 
 if __name__ == "__main__":
