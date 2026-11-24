@@ -57,7 +57,7 @@ RDNA2 GPU プログラムは Vulkan 向けの SPIR-V に翻訳され、モデル
 2. サブモジュール込みでリポジトリを取得します。
 
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/ubiquitarianism/leonida
    ```
 
    GitHub の "Download ZIP" では `third_party/rpf9-explorer` が含まれません。`git` があればビルドが自動で
@@ -132,7 +132,7 @@ python -I make_game.py --wave64-emulate off            # auto（既定）、on�
 
 ## コントリビュートと GPU テスト
 
-- GPU テストの手順（ゲームファイル不要）: [docs/testing.md](../../testing.md)。結果は
-  [#166](https://github.com/ItsNotRexed/Leonida/issues/166) に、GPU とドライバーごとに 1 コメントで投稿します。
+- GPU テストの手順（ゲームファイル不要）: [docs/testing.md](../../testing.md)。結果を提出するには、既存の報告と同じ形式で
+  [gpu-test-results/](../../../gpu-test-results/) にファイルを追加するプルリクエストを作成してください。
 - コントリビュートのルール、ゲームデータを持ち込まない方針、作業の調整:
   [`CONTRIBUTING.md`](../../../CONTRIBUTING.md)。
