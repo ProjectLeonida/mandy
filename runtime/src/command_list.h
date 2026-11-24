@@ -412,6 +412,10 @@ struct DrawViews {
     std::array<TargetView, 8> render_targets{};
     std::array<VertexBufferView, 32> vertex_buffers{};  // by input slot
     std::uint32_t render_target_count = 8;
+    std::array<Viewport, 16> viewports{};
+    std::array<Rect, 16> scissors{};
+    std::uint32_t viewport_count = 0;  // 0: single Draw::viewport; >0: all viewports_[0..count-1]
+    std::uint32_t scissor_count = 0;   // 0: single Draw::scissor; >0: all scissors_[0..count-1]
 };
 
 // DrawInstanced / DrawIndexedInstanced / DispatchMesh, with everything they use captured when they are recorded:

@@ -143,6 +143,14 @@ int main(int argc, char** argv) {
         EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 7 && back == 9);
         list8->ExecuteBundle(bundle.p);  // the same closed bundle can be executed repeatedly
 
+        // Multi-viewport and multi-scissor recording (up to 16) closes cleanly; > 16 fails at Close.
+        const D3D12_VIEWPORT vps[2] = {{0.f, 0.f, 64.f, 64.f, 0.f, 1.f}, {64.f, 0.f, 64.f, 64.f, 0.f, 1.f}};
+        const D3D12_RECT scs[2] = {{0, 0, 64, 64}, {64, 0, 128, 64}};
+        list8->RSSetViewports(2, vps);
+        list8->RSSetScissorRects(2, scs);
+        list8->RSSetViewports(0, nullptr);
+        list8->RSSetScissorRects(0, nullptr);
+
         ID3D12CommandList* bundle_submission[] = {bundle.p};
         queue->ExecuteCommandLists(1, bundle_submission);  // bundles are executed only inside direct lists
         EXPECT(rt::d3d12::last_execute_result(queue.p) == ReplayResult::unsupported);

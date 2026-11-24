@@ -3936,7 +3936,9 @@ public:
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
         graphics_.mesh = mesh;
+        graphics_.dynamic_viewport_count = vk.vkCmdSetViewportWithCount && vk.vkCmdSetScissorWithCount;
         recipe_.mesh = mesh;
+        recipe_.dynamic_viewport_count = graphics_.dynamic_viewport_count;
         recipe_.stages = std::move(stage_infos);
         recipe_.attributes = std::move(attributes);
         recipe_.bindings = std::move(bindings);
@@ -4085,6 +4087,7 @@ private:
     // What a graphics pipeline is made from, so variants can be built at draw time.
     struct Recipe {
         bool mesh = false;  // no vertex input or input assembly state, and no dynamic topology or strides
+        bool dynamic_viewport_count = false;
         std::vector<VkPipelineShaderStageCreateInfo> stages;
         // One per entry of create_graphics's stage table (VS, GS, PS), static_assert there; what `stages` chain.
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[3]{};
@@ -4103,15 +4106,19 @@ private:
 
     // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined.
     VkPipeline build(std::uint32_t unbound) const {
-        // The stride state is last: a pipeline without vertex bindings (a full-screen pass that builds its vertices
-        // from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it
-        // (VUID-vkCmdDraw-pStrides-04913).
-        static constexpr VkDynamicState dynamic_states[] = {
-            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
-            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
-            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-            VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
         const Recipe& r = recipe_;
+        VkDynamicState dynamic_states[8]{};
+        std::uint32_t dynamic_count = 0;
+        const auto push_dyn = [&](VkDynamicState s) { dynamic_states[dynamic_count++] = s; };
+        push_dyn(r.dynamic_viewport_count ? VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT : VK_DYNAMIC_STATE_VIEWPORT);
+        push_dyn(r.dynamic_viewport_count ? VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT : VK_DYNAMIC_STATE_SCISSOR);
+        if (!r.mesh) {
+            push_dyn(VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY);
+            push_dyn(VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE);
+        }
+        push_dyn(VK_DYNAMIC_STATE_STENCIL_REFERENCE);
+        push_dyn(VK_DYNAMIC_STATE_BLEND_CONSTANTS);
+        if (!r.mesh && !r.bindings.empty()) push_dyn(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE);
         std::vector<VkFormat> colors = graphics_.color_formats;
         for (std::size_t slot = 0; slot < colors.size(); ++slot)
             if (unbound & (1u << slot)) colors[slot] = VK_FORMAT_UNDEFINED;
@@ -4137,8 +4144,8 @@ private:
         vertex_input.vertexAttributeDescriptionCount = std::uint32_t(r.attributes.size());
         vertex_input.pVertexAttributeDescriptions = r.attributes.data();
         VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-        viewport.viewportCount = 1;
-        viewport.scissorCount = 1;
+        viewport.viewportCount = r.dynamic_viewport_count ? 0u : 1u;
+        viewport.scissorCount = r.dynamic_viewport_count ? 0u : 1u;
         VkPipelineMultisampleStateCreateInfo multisample = r.multisample;
         VkPipelineRasterizationStateCreateInfo raster = r.raster;
         VkPipelineRasterizationConservativeStateCreateInfoEXT conservative{
@@ -4153,19 +4160,9 @@ private:
         VkPipelineColorBlendStateCreateInfo blend = r.blend;
         blend.attachmentCount = std::uint32_t(r.blends.size());
         blend.pAttachments = r.blends.data();
-        // A mesh pipeline takes neither the topology nor the strides as dynamic state
-        // (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065 and -07066).
-        static constexpr VkDynamicState mesh_dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                                                                 VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-                                                                 VK_DYNAMIC_STATE_BLEND_CONSTANTS};
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        if (r.mesh) {
-            dynamic.dynamicStateCount = std::uint32_t(std::size(mesh_dynamic_states));
-            dynamic.pDynamicStates = mesh_dynamic_states;
-        } else {
-            dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states)) - (r.bindings.empty() ? 1 : 0);
-            dynamic.pDynamicStates = dynamic_states;
-        }
+        dynamic.dynamicStateCount = dynamic_count;
+        dynamic.pDynamicStates = dynamic_states;
 
         VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
         info.stageCount = std::uint32_t(r.stages.size());
@@ -5461,6 +5458,9 @@ public:
         arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address);
         state_.context->set_zero_page(arena.buffer, 0, kArenaReserved);
+        state_.context->set_multi_viewport(state_.info.features.multiViewport == VK_TRUE);
+        if (state_.info.features.multiViewport != VK_TRUE)
+            log_once("multiViewport disabled; clamping viewports/scissors to", 1);
         return true;
     }
 
@@ -9807,6 +9807,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     enable.dualSrcBlend = chosen_features.dualSrcBlend;
     enable.logicOp = chosen_features.logicOp;
     enable.depthClamp = chosen_features.depthClamp;
+    enable.multiViewport = chosen_features.multiViewport;
     enable.geometryShader = chosen_features.geometryShader;  // translated geometry shaders (195 in the corpus)
     // What translated shaders declare (the index's `features`): 64-bit integers in most of the corpus (25,803 of
     // 26,503 entries), doubles, 16-bit integers, clip and cull distances in a few vertex shaders, image stores

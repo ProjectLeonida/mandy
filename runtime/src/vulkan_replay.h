@@ -773,6 +773,7 @@ struct GraphicsPipeline {
     std::uint32_t zero_step_slots = 0;    // per-instance slots with InstanceDataStepRate 0: stride 0 at draw time
     std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
     bool mesh = false;                    // a mesh shader instead of a vertex shader: drawn by DispatchMesh only
+    bool dynamic_viewport_count = false;  // VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT enabled
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
     // and stencil. Null when it cannot be built.
@@ -854,6 +855,9 @@ struct ReplayFunctions {
     PFN_vkCmdBindIndexBuffer bind_index_buffer = nullptr;
     PFN_vkCmdSetViewport set_viewport = nullptr;
     PFN_vkCmdSetScissor set_scissor = nullptr;
+    PFN_vkCmdSetViewportWithCount set_viewport_with_count = nullptr;
+    PFN_vkCmdSetScissorWithCount set_scissor_with_count = nullptr;
+    bool multi_viewport = false;
     PFN_vkCmdSetPrimitiveTopology set_primitive_topology = nullptr;
     PFN_vkCmdSetPrimitiveRestartEnable set_primitive_restart_enable = nullptr;
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
@@ -2111,6 +2115,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
+    if (pipeline->dynamic_viewport_count && (!vk.set_viewport_with_count || !vk.set_scissor_with_count))
+        return ReplayResult::unsupported;
     if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
@@ -4218,14 +4224,35 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.
-            const Viewport& v = draw->viewport;
-            const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
-            vk.set_viewport(command_buffer, 0, 1, &viewport);
-            const Rect& s = draw->scissor;
-            const VkRect2D scissor{{std::max(0, s.left), std::max(0, s.top)},
-                                   {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
-                                    std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
-            vk.set_scissor(command_buffer, 0, 1, &scissor);
+            const std::uint32_t raw_vp_count =
+                (draw->views && draw->views->viewport_count) ? std::min<std::uint32_t>(draw->views->viewport_count, 16u) : 1u;
+            const std::uint32_t vp_count =
+                graphics.dynamic_viewport_count ? (vk.multi_viewport ? raw_vp_count : 1u) : 1u;
+            VkViewport viewports[16]{};
+            for (std::uint32_t vi = 0; vi < vp_count; ++vi) {
+                const Viewport& v = (draw->views && draw->views->viewport_count) ? draw->views->viewports[vi] : draw->viewport;
+                viewports[vi] = {v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
+            }
+            const std::uint32_t raw_sc_count =
+                (draw->views && draw->views->scissor_count) ? std::min<std::uint32_t>(draw->views->scissor_count, 16u) : 1u;
+            VkRect2D scissors[16]{};
+            for (std::uint32_t si = 0; si < vp_count; ++si) {
+                if (si < raw_sc_count) {
+                    const Rect& s = (draw->views && draw->views->scissor_count) ? draw->views->scissors[si] : draw->scissor;
+                    scissors[si] = {{std::max(0, s.left), std::max(0, s.top)},
+                                    {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
+                                     std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
+                } else {
+                    scissors[si] = {{0, 0}, {0, 0}};
+                }
+            }
+            if (graphics.dynamic_viewport_count && vk.set_viewport_with_count && vk.set_scissor_with_count) {
+                vk.set_viewport_with_count(command_buffer, vp_count, viewports);
+                vk.set_scissor_with_count(command_buffer, vp_count, scissors);
+            } else {
+                vk.set_viewport(command_buffer, 0, 1, viewports);
+                vk.set_scissor(command_buffer, 0, 1, scissors);
+            }
             // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
             // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
             if (!draw->mesh) {

@@ -950,7 +950,9 @@ The compute path, end to end:
     dynamic-rendering scope. Its layer count is the smallest layer count of the bound views.
   - **Viewport:** it is flipped (negative height), because translated vertex shaders write D3D clip coordinates;
     front-face winding then matches D3D12's.
-  - Only the first viewport and scissor are used, and primitive restart is not modelled yet.
+  - Up to 16 viewports and scissor rectangles are forwarded through `VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT` /
+    `VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT` when `VkPhysicalDeviceFeatures::multiViewport` is enabled (clamped to the
+    first entry with a `log_once` notice otherwise); primitive restart is not modelled yet.
 
   **Resources and heaps:**
   - A buffer of 0 bytes, or one whose size wraps when aligned, is `E_INVALIDARG`. One the arena cannot hold is
