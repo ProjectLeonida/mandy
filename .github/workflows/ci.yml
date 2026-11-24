@@ -61,7 +61,9 @@ jobs:
     needs: change-scope
     if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
     runs-on: windows-latest
-    timeout-minutes: 15
+    # The standard-library loop takes about 20 minutes on this runner (486 files in 20 min 15 s, the whole job
+    # 21 min 20 s, on 24 November 2026). At 15 the job was cancelled on every run and reported nothing.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
