@@ -16,6 +16,11 @@ Failed:     cs_imgload_tfe and cs_imgload_d16_tfe, both "exit 1: r32 sint (sint 
             with the same texel and count, in the native and the emulated path alike. Known rows,
             not new: #31 on Intel Meteor Lake (passing there with #98) and the Apple M5 run (passing
             with #291).
+Spot reruns (same commit and binaries, --filter, each case 3 times native and 3 emulated):
+            cs_fma_fused            3/3 pass native, 3/3 pass emulated ("8/8 fused exact")
+            ps_imgatomic            3/3 pass native, 3/3 pass emulated (0 of 256 texels, 0 of 4096 pixels wrong)
+            The two rows that fail or flake on MoltenVK are stable passes here. Three wave64 cases that only
+            run emulated also pass 2/2 each: cs_w64_exec_computed, cs_wave64_ballot, cs_w64_mask_detect.
 Skipped:    Both runs: the six mesh cases (no VK_EXT_mesh_shader), five pixel cases reading
             BaryCoordKHR (no VK_KHR_fragment_shader_barycentric: ps_bary, ps_persp_bary,
             ps_scc_mask32, ps_uniform_branch, and ps_ij_computed, which was not translated),
