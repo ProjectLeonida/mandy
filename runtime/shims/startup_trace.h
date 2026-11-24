@@ -18,6 +18,7 @@
 // same handler records their text without a shim.
 //
 // The file can quote whatever the game prints: it stays on the player's machine (AGENTS.md, "No game data").
+// A successful query adds the memory region containing the address of an access violation.
 #pragma once
 
 #include <windows.h>
@@ -181,6 +182,13 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                 const auto op = r.ExceptionInformation[0];
                 f += ",\"access\":" + quote(op == 0 ? "read" : op == 1 ? "write" : "execute") +
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
+                // The faulting page's region: committed or not, its protection, private or a mapped view.
+                MEMORY_BASIC_INFORMATION m{};
+                if (VirtualQuery(reinterpret_cast<const void*>(r.ExceptionInformation[1]), &m, sizeof(m)))
+                    f += ",\"region\":{\"base\":" + quote(hex(reinterpret_cast<uint64_t>(m.BaseAddress))) +
+                         ",\"allocation_base\":" + quote(hex(reinterpret_cast<uint64_t>(m.AllocationBase))) +
+                         ",\"size\":" + quote(hex(m.RegionSize)) + ",\"state\":" + quote(hex(m.State)) +
+                         ",\"protect\":" + quote(hex(m.Protect)) + ",\"type\":" + quote(hex(m.Type)) + "}";
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
