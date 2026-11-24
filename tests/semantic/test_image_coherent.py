@@ -184,6 +184,41 @@ class CoherentMipLoad(unittest.TestCase):
         self.assertEqual({v for _, v in m.reads()}, {"%stv0_0", "%stv1_0", "%stv2_0"})
         self.assertNotIn("OpImageFetch", m.text)
 
+    def test_d16_odd_dmask_preserves_high_half_on_both_mip_branches(self):
+        for dmask, regs, dest_reg in ((0x1, "v0", 0), (0x7, "v[0:1]", 1)):
+            with self.subTest(dmask=hex(dmask)):
+                m = self.mip_load("glc dlc d16", dmask=dmask, regs=regs)
+                hi_masks = 0
+                for _, op, args in m.ops:
+                    if op != "OpBitwiseAnd":
+                        continue
+                    rhs = m.defs.get(args[2])
+                    if not rhs or rhs[0] != "OpConstant" or int(rhs[1][1], 0) != 0xFFFF0000:
+                        continue
+                    copy = m.defs.get(args[1])
+                    if not copy or copy[0] != "OpCopyObject":
+                        continue
+                    load = m.defs.get(copy[1][1])
+                    if not load or load[0] != "OpLoad":
+                        continue
+                    ptr = m.defs.get(load[1][1])
+                    if ptr and ptr[0] == "OpAccessChain" and ptr[1][1] == "%vgpr" and ptr[1][2] == f"%c{dest_reg:x}":
+                        hi_masks += 1
+                self.assertEqual(hi_masks, 4)     # 3 typed branches in mip == 0 + 1 miss branch in mip != 0
+
+    def test_a16_packed_coords_and_mip(self):
+        m = Module(translate(["image_load_mip v[0:3], v[4:5], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm glc dlc a16"]))
+        self.assertEqual({v for _, v in m.reads()}, {"%stv0_0", "%stv1_0", "%stv2_0"})
+        self.assertEqual(m.coherent, {"%stv0_0", "%stv1_0", "%stv2_0"})
+        self.assertNotIn("OpImageFetch", m.text)
+        self.assertNotIn("ImageQuery", m.caps)
+
+    def test_glc_alone_is_coherent_and_needs_no_image_query(self):
+        m = self.mip_load(mods="glc")
+        self.assertEqual(len(m.reads()), 3)
+        self.assertEqual(m.coherent, {"%stv0_0", "%stv1_0", "%stv2_0"})
+        self.assertNotIn("ImageQuery", m.caps)
+
     def test_negative_control_plain_mip_load_stays_on_the_sampled_path(self):
         m = self.mip_load(mods="")
         self.assertEqual(m.reads(), [])
@@ -205,6 +240,7 @@ class UnmodelledCoherentReads(unittest.TestCase):
         self.check_refused("image_load_mip v[0:3], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY unorm glc dlc")
         self.check_refused("image_load_mip v[0:3], v[4:7], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_3D unorm glc dlc")
         self.check_refused("image_load_mip v[0:4], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm glc tfe")
+        self.check_refused("image_load_mip v[0:3], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm glc lwe")
 
 
 @unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"), "needs spirv-as and spirv-val")
@@ -214,18 +250,24 @@ class Validation(unittest.TestCase):
             for dim in DIMS:
                 with self.subTest(dim=dim):
                     sa, sv = os.path.join(tmp, f"{dim}.spvasm"), os.path.join(tmp, f"{dim}.spv")
-                    with open(sa, "w", encoding="utf-8") as f:
+                    with open(sa, "w", encoding="utf-8", newline="\n") as f:
                         f.write(rmw(dim))
                     result = rdna2spirv.assemble_spirv(sa, sv)
                     self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
 
     def test_spirv_val_accepts_a_coherent_mip_load(self):
+        cases = (
+            ("f32", "glc dlc", "v[0:3]", "v[4:6]", "0xf"),
+            ("d16", "glc dlc d16", "v[0:1]", "v[4:6]", "0xf"),
+            ("d16_odd", "glc dlc d16", "v0", "v[4:6]", "0x1"),
+            ("a16", "glc dlc a16", "v[0:3]", "v[4:5]", "0xf"),
+        )
         with tempfile.TemporaryDirectory() as tmp:
-            for name, mods, regs in (("f32", "glc dlc", "v[0:3]"), ("d16", "glc dlc d16", "v[0:1]")):
+            for name, mods, regs, addr, dmask in cases:
                 with self.subTest(form=name):
-                    text = translate([f"image_load_mip {regs}, v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm {mods}"])
+                    text = translate([f"image_load_mip {regs}, {addr}, s[0:7] dmask:{dmask} dim:SQ_RSRC_IMG_2D unorm {mods}"])
                     sa, sv = os.path.join(tmp, f"{name}.spvasm"), os.path.join(tmp, f"{name}.spv")
-                    with open(sa, "w", encoding="utf-8") as f:
+                    with open(sa, "w", encoding="utf-8", newline="\n") as f:
                         f.write(text)
                     result = rdna2spirv.assemble_spirv(sa, sv)
                     self.assertEqual(result.returncode, 0, result.stderr + result.stdout)

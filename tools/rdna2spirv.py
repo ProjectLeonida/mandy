@@ -14649,8 +14649,13 @@ class Gen:
         self.emit(f"OpBranch {end}")
         self.emit(f"{miss} = OpLabel")
         n = bin(dmask & 0xF).count("1")
-        for k in range((n + 1) // 2 if d16 else n):
-            self.dst({"k": "vgpr", "r": vdata["r"] + k, "n": 1}, self.cu(0))
+        regs = (n + 1) // 2 if d16 else n
+        for k in range(regs):
+            dest = {"k": "vgpr", "r": vdata["r"] + k, "n": 1}
+            if d16 and (n & 1) and k == regs - 1:
+                self.write_lo16(dest, self.cu(0))
+            else:
+                self.dst(dest, self.cu(0))
         self.emit(f"OpBranch {end}")
         self.emit(f"{end} = OpLabel")
 
