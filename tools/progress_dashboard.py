@@ -145,9 +145,14 @@ def scrub(text, limit=240):
         checkout = rf"(?<![\w.:/~]){re.escape(ROOT)}"
     # Consume a same-prefix sibling too, so shown() can redact its entire path.
     checkout_path = rf"{checkout}[^\s'\"]*"
-    drive_path = r"(?i:\b[a-z]:[\\/][^\s'\"]*)"
+    # A quoted drive path ends at its quote. An unquoted one goes on over spaces while a later part still has its
+    # separator, so `D:\My work\name` is one path and the prose after a path stays.
+    drive = r"\b[a-z]:"
+    quoted_path = rf"(?i:(?<='){drive}[\\/][^']*(?=')|(?<=\"){drive}[\\/][^\"]*(?=\"))"
+    more = r"(?:(?: +(?![a-z]:[\\/])[^\s'\"\\/]+)*? +(?![a-z]:[\\/])[^\s'\"\\/]+{sep}[^\s'\"]*)*"
+    drive_path = "(?i:" + "|".join(rf"{drive}{sep}[^\s'\"]*" + more.format(sep=sep) for sep in (r"\\", "/")) + ")"
     posix_path = r"(?<![\w.:/~])/[^\s/'\"][^\s'\"]*"
-    line = re.sub(rf"{checkout_path}|{drive_path}|{posix_path}", shown, line)
+    line = re.sub(rf"{quoted_path}|{checkout_path}|{drive_path}|{posix_path}", shown, line)
     if HOME and len(HOME) > 3:
         line = line.replace(HOME, "~")
     line = re.sub(r"~[\\/][^\s'\"]*", "<path>", line)

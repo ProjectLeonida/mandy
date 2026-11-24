@@ -517,6 +517,23 @@ class Scrub(unittest.TestCase):
         self.assertEqual(pd.scrub("in " + os.path.join(pd.HOME, "work", f"{SENTINEL}.fssm")), "in <path>")
         self.assertEqual(pd.scrub(f"C:{sep}work{sep}{SENTINEL}_a.fssm, C:{sep}{SENTINEL}_b.fssm"), "<path> <path>")
 
+    def test_drive_paths_with_spaces_lose_their_whole_name(self):
+        for line, want in (
+            (rf"FAIL: cannot read D:\My work\shaders\{SENTINEL}.fssm", "FAIL: cannot read <path>"),
+            (rf"D:\My work\a b c\{SENTINEL}.fssm line 3", "<path> line 3"),
+            (rf"D:\My work\{SENTINEL}_a.fssm, D:\Other work\{SENTINEL}_b.fssm", "<path> <path>"),
+            (f"FAIL: cannot read D:/My work/shaders/{SENTINEL}.fssm", "FAIL: cannot read <path>"),
+            (rf"Permission denied: 'D:\\My work\\{SENTINEL} one.fssm'", "Permission denied: '<path>'"),
+            (rf'File "D:\My work\{SENTINEL} one.py", line 3', 'File "<path>", line 3'),
+            (r"D:\work\a.txt is not a folder", "<path> is not a folder"),
+            (r"D:\work\a.txt, then tests/test_x.py failed", "<path> then tests/test_x.py failed"),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(pd.scrub(line), want)
+        if os.name == "nt":
+            sibling = os.path.join(ROOT + " work", f"{SENTINEL} one.fssm")
+            self.assertEqual(pd.scrub(f"cannot read '{sibling}' now"), "cannot read '<path>' now")
+
     def test_paths_inside_the_repository_become_relative(self):
         line = "Error: " + os.path.join(ROOT, "tools", "text_tables.py") + " line 3"
         self.assertEqual(pd.scrub(line), "Error: tools/text_tables.py line 3")
