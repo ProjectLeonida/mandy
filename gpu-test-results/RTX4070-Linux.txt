@@ -6,7 +6,9 @@ Commit:     f3e26be7c661e97eb4c70464e675a3b32dc149e3 (main, 2026-11-24)
 Tools:      llvm-mc 23.1.5, SPIRV-Tools v2026.4, CMake 4.5.0 + Ninja 1.13.2,
             GCC 16.2.1, Python 3.14.10
 build.py:   281 shaders: 281 translated, 281 pass spirv-val
-check.py:   182 of 220 pass, 36 skipped, 0 failed
+check.py:   182 of 220 pass, 36 skipped, 2 failed
+            cs_imgload_tfe, cs_imgload_d16_tfe: the same #31 tfe status
+            VGPR issue as run_gpu_tests.py (64 bad r32 sint texels)
 run_gpu_tests.py: 258 shaders: 258 translated, 258 pass spirv-val
             native:                 198/249 passed, 49 skipped, 2 failed
             LEONIDA_W64_EMULATE=1:  230/249 passed, 17 skipped, 2 failed
