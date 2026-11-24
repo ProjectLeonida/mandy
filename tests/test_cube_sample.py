@@ -40,6 +40,8 @@ def sample_coords(spv, vgprs):
             chain = d[a[1]][1]
             assert chain[1] == "%vgpr"
             return bits(vgprs[value(chain[2])])
+        if op == "OpSelect" and (a[1] == "%true" or d.get(a[1]) == ("OpLoad", ["%bool", "%active"])):
+            return value(a[2])
         if op == "OpFSub":
             return f32(value(a[1]) - value(a[2]))
         if op == "OpFMul":

@@ -256,13 +256,15 @@ class Unsupported(Exception):
 
 
 class Gen:
-    def __init__(self, stage, hoist_reg_ptrs=False, cache_active=False):
+    def __init__(self, stage, hoist_reg_ptrs=False, cache_active=False, cache_regs=False):
         self.stage = stage
         self.hoist_reg_ptrs = hoist_reg_ptrs
         self.reg_ptrs = {}
         self.cache_active = cache_active
         self.exec_static_true = False
         self._active_ssa = None
+        self.cache_regs = cache_regs
+        self._reg_val = {}
         self.body = []
         self.consts = {}
         # tof/tou results -> the id they were bitcast from. A bitcast of a bitcast gives the original id back: wherever
@@ -424,6 +426,7 @@ class Gen:
             self._active_ssa = s.split()[2]
         elif s.endswith("= OpLabel"):
             self._active_ssa = None
+            self._reg_val.clear()
         if self.emulate:
             if s.startswith(("OpStore %vcc ", "OpStore %active ")):
                 reg, val = s.split()[1:3]
@@ -451,10 +454,19 @@ class Gen:
         self.emit(f"{p} = OpAccessChain %_ptr_Function_uint {arr} {self.cu(r)}")
         return p
 
+    def invalidate_reg_kind(self, kind):
+        if self._reg_val:
+            self._reg_val = {k: v for k, v in self._reg_val.items() if k[0] != kind}
+
     def load_reg(self, kind, r):
+        key = (kind, r)
+        if self.cache_regs and key in self._reg_val:
+            return self._reg_val[key]
         p = self.reg_ptr(kind, r)
         t = self.tmp()
         self.emit(f"{t} = OpLoad %uint {p}")
+        if self.cache_regs:
+            self._reg_val[key] = t
         return t
 
     def store_reg(self, kind, r, val):
@@ -465,6 +477,8 @@ class Gen:
                 self.desc_cache = {k: v for k, v in self.desc_cache.items() if not (k[0] <= r < k[0] + k[1])}
         p = self.reg_ptr(kind, r)
         self.emit(f"OpStore {p} {val}")
+        if self.cache_regs:
+            self._reg_val[(kind, r)] = val
 
     def imm_val(self, a):
         """Integer literal value if 'a' is an immediate or known SGPR constant, else None."""
@@ -1660,9 +1674,14 @@ class Gen:
             if self.write_all_lanes or ((self.active_run or self.exec_static_true) and self.dpp_guard is None):
                 self.store_reg("vgpr", a["r"], val)
                 return
+            key = ("vgpr", a["r"])
             p = self.reg_ptr("vgpr", a["r"])
-            old, r = self.tmp(), self.tmp()
-            self.emit(f"{old} = OpLoad %uint {p}")
+            if self.cache_regs and key in self._reg_val:
+                old = self._reg_val[key]
+            else:
+                old = self.tmp()
+                self.emit(f"{old} = OpLoad %uint {p}")
+            r = self.tmp()
             if eager:
                 mask = self.exec_value()
                 if self.dpp_guard is not None:
@@ -1682,6 +1701,8 @@ class Gen:
                     active = guarded
                 self.emit(f"{r} = OpSelect %uint {active} {val} {old}")
             self.emit(f"OpStore {p} {r}")
+            if self.cache_regs:
+                self._reg_val[key] = r
         elif a["k"] == "sgpr" and a.get("n", 1) == 1:
             self.store_reg(a["k"], a["r"], val)
         elif self.wave64 and a["k"] == "special" and a["t"] in ("vcc_lo", "vcc_hi") and self.vcc_half_keeps_mask():
@@ -5514,6 +5535,7 @@ class Gen:
         self.desc_cache.clear()
         self.sgpr_imm.clear()
         self._active_ssa = None
+        self._reg_val.clear()
         self.block_label = f"%blk{seg}"
         self.x_dirty = set()
 
@@ -8679,7 +8701,7 @@ class Gen:
             val, ln = self.src_u(a[1]), self.src_u(a[2])
             if slot and slot[1:] in self.parked:        # somewhere a mask is fetched back from this lane: keep ours
                 self.store_reg("sgpr", self.parked[slot[1:]], val)
-            me, m, eq, old, r = (self.tmp() for _ in range(5))
+            me, m, eq, r = (self.tmp() for _ in range(4))
             if self.stage in ("cs", "ms") or self.wave32_fragment:
                 # Wave32 fragments use their lane within either half of a wider Vulkan subgroup.
                 self.emit(f"{me} = OpCopyObject %uint {self.wave_lane()}")
@@ -8687,10 +8709,17 @@ class Gen:
                 self.emit(f"{me} = OpLoad %uint %sg_lane")
             self.emit(f"{m} = OpBitwiseAnd %uint {ln} {self.cu(63 if self.wave64 else 31)}")
             self.emit(f"{eq} = OpIEqual %bool {me} {m}")
+            key = ("vgpr", a[0]["r"])
             p = self.reg_ptr("vgpr", a[0]["r"])
-            self.emit(f"{old} = OpLoad %uint {p}")
+            if self.cache_regs and key in self._reg_val:
+                old = self._reg_val[key]
+            else:
+                old = self.tmp()
+                self.emit(f"{old} = OpLoad %uint {p}")
             self.emit(f"{r} = OpSelect %uint {eq} {val} {old}")
             self.emit(f"OpStore {p} {r}")
+            if self.cache_regs:
+                self._reg_val[key] = r
         elif op in self.BUFFER_SUB16:
             self.buffer_sub(op, a, mods)
         elif op.startswith("buffer_store_dword") or op in ("buffer_store_format_x", "buffer_store_format_xy",
@@ -9469,6 +9498,7 @@ class Gen:
                 sel = self.tmp()
                 self.emit(f"{sel} = OpSelect %uint {write} {new} {old}")
                 self.emit(f"OpStore {p_} {sel}")
+            self.invalidate_reg_kind("vgpr")
         elif op in ("v_movrels_b32", "v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32"):
             # Relative VGPR indexing through M0: movrels reads VGPR[src + M0], movreld writes VGPR[dst + M0],
             # movrelsd does both. The register file is an array, so these become dynamic array accesses.
@@ -9500,6 +9530,7 @@ class Gen:
                 self.emit(f"{write} = OpLogicalAnd %bool {self.active_b()} {valid}")
                 self.emit(f"{sel} = OpSelect %uint {write} {v} {old}")
                 self.emit(f"OpStore {dp} {sel}")
+                self.invalidate_reg_kind("vgpr")
             else:
                 self.dst(d, v)
         elif op in ("v_med3_f16", "v_min3_f16", "v_max3_f16"):
@@ -17453,7 +17484,7 @@ def translate(path):
             raise Unsupported("reachable instruction with normalized encoding")
     else:
         check_printed_encodings(path, info)
-    g = Gen(stage, hoist_reg_ptrs=True, cache_active=True)
+    g = Gen(stage, hoist_reg_ptrs=True, cache_active=True, cache_regs=True)
     g.exec_static_true = not any(writes_exec(i) for i in insns)
     if stage in ("vs", "ms"):   # --f16-interp-fallback places the decoded halves clear of every param
         g.param_max = max((int(t[5:]) for i in insns if base_op(i["op"]) == "exp" for t in
@@ -17835,6 +17866,7 @@ def translate(path):
             g.x_order_barrier()
         g.desc_cache.clear()
         g._active_ssa = None
+        g._reg_val.clear()
         g.sgpr_imm.clear()
         g.x_tok.clear()
         g.x_mcache.clear()
@@ -17873,6 +17905,7 @@ def translate(path):
                         g.emit(f"{blbl} = OpLabel")
                         g.desc_cache.clear()
                         g._active_ssa = None
+                        g._reg_val.clear()
                         g.sgpr_imm.clear()
                         g.x_tok.clear()
                         g.x_mcache.clear()
@@ -17949,6 +17982,7 @@ def translate(path):
             g.x_dirty.add((kind, "w"))
         g.desc_cache.clear()
         g._active_ssa = None
+        g._reg_val.clear()
         g.sgpr_imm.clear()
         g.x_tok.clear()
         g.x_mcache.clear()
@@ -17969,8 +18003,9 @@ def translate(path):
         g.x_dirty = set(plan["dirty_in"].get(n, ())) if g.emulate_inline else set()
         g.x_tok, g.x_mcache = {}, {}     # a register's value is only known from where this block wrote it
         g.x_gen += 1
-        g.desc_cache.clear()
-        g._active_ssa = None            # a cached lookup is only good inside the block that made it
+        g.desc_cache.clear()            # a cached lookup is only good inside the block that made it
+        g._active_ssa = None
+        g._reg_val.clear()
         g.sgpr_imm.clear()
         cur = n
         while True:
@@ -17990,6 +18025,7 @@ def translate(path):
                     cur = fold_chain[cur]
                     g.desc_cache.clear()
                     g._active_ssa = None
+                    g._reg_val.clear()
                     g.sgpr_imm.clear()
                     g.x_tok.clear()
                     g.x_mcache.clear()

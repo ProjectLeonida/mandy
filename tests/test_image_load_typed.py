@@ -329,9 +329,15 @@ class LodQueryCoordinates(unittest.TestCase):
             self.assertEqual(module.defs[image][1][0], image_type)
             op, unpack = module.defs[coord]
             self.assertEqual((op, unpack[:3]), ("OpExtInst", ["%v2float", "%glsl", "UnpackHalf2x16"]))
-            op, load = module.defs[unpack[3]]
-            self.assertEqual(op, "OpLoad")
-            op, ptr = module.defs[load[1]]
+            word = unpack[3]
+            op, load = module.defs[word]
+            if op == "OpLoad":
+                ptr_id = load[1]
+            else:
+                m_st = re.search(rf"^\s*OpStore (%\w+) {re.escape(word)}$", module.text, re.M)
+                self.assertIsNotNone(m_st, f"missing OpStore for forwarded VGPR value {word}")
+                ptr_id = m_st.group(1)
+            op, ptr = module.defs[ptr_id]
             self.assertEqual((op, ptr[1], module.value(ptr[2], 0, 0)), ("OpAccessChain", "%vgpr", register))
             self.assertEqual([int(args[2]) for _, op, args in module.order
                               if op == "OpCompositeExtract" and args[:2] == ["%float", rid]], components)
@@ -351,9 +357,15 @@ class TypedGatherShaders(unittest.TestCase):
                 m = Module(translate(body))
 
                 def source_register(value: str) -> int:
-                    op, load = m.defs[value]
-                    self.assertEqual(op, "OpLoad")
-                    op, ptr = m.defs[load[1]]
+                    op, args = m.defs[value]
+                    if op == "OpLoad":
+                        op, ptr = m.defs[args[1]]
+                        self.assertEqual((op, ptr[1]), ("OpAccessChain", "%vgpr"))
+                        return m.value(ptr[2], 0, 0)
+                    # With intra-block forwarding, value may be the SSA result stored into %vgpr[r].
+                    stores = re.findall(rf"^\s*OpStore (%\w+) {re.escape(value)}\b", m.text, re.MULTILINE)
+                    self.assertTrue(stores, f"expected OpLoad or OpStore into %vgpr for {value} ({op})")
+                    op, ptr = m.defs[stores[-1]]
                     self.assertEqual((op, ptr[1]), ("OpAccessChain", "%vgpr"))
                     return m.value(ptr[2], 0, 0)
 

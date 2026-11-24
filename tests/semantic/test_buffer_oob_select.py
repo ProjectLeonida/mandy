@@ -582,7 +582,7 @@ def v_sharp(mode, stride, nr, runtime, fmt=22):
     return lines
 
 
-MODE_EXTRACT = re.compile(r"OpBitFieldUExtract %uint %t\d+ %c1c %c2\b")     # word3 >> 28 & 3 at run time
+MODE_EXTRACT = re.compile(r"OpBitFieldUExtract %uint %\w+ %c1c %c2\b")     # word3 >> 28 & 3 at run time
 
 
 class OobSelect(unittest.TestCase):

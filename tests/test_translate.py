@@ -147,11 +147,15 @@ def test_explicit_mip_depth_compare(make_shader, a16, d16):
     sample = re.search(r"(%\w+) = OpImageSampleDrefExplicitLod %float %\w+ %\w+ (%\w+) Lod (%\w+)", spv)
     assert sample
     defs = dict(re.findall(r"(%\w+) = (.+)", spv))
+    stored_to = {val: ptr for ptr, val in re.findall(r"OpStore (%\w+) (%\w+)", spv)}
+
+    def raw_word_register(word: str) -> list[str]:
+        if word in defs and defs[word].startswith("OpLoad %uint "):
+            return defs[defs[word].split()[-1]].split()[-2:]
+        return defs[stored_to[word]].split()[-2:]
 
     def float_source_register(value: str) -> list[str]:
-        load = defs[value].split()[-1]  # f32 bitcast
-        ptr = defs[load].split()[-1]    # raw VGPR word
-        return defs[ptr].split()[-2:]
+        return raw_word_register(defs[value].split()[-1])  # f32 bitcast
 
     result, ref, lod = sample.groups()
     assert float_source_register(ref) == ["%vgpr", "%c0"]
@@ -162,7 +166,7 @@ def test_explicit_mip_depth_compare(make_shader, a16, d16):
         op, _, pair, half = defs[unpacked_half].split()
         assert (op, half) == ("OpCompositeExtract", "0")
         raw = defs[pair].split()[-1]
-        assert defs[defs[raw].split()[-1]].endswith("%vgpr %c2")
+        assert raw_word_register(raw) == ["%vgpr", "%c2"]
     else:
         assert float_source_register(lod) == ["%vgpr", "%c3"]
     bits = next(name for name, code in defs.items() if code == f"OpBitcast %uint {result}")
@@ -256,6 +260,9 @@ def test_a16_sample_gradients_use_full_vgprs(make_shader):
     sample = re.search(r"= OpImageSampleExplicitLod %v4float %\w+ %\w+ Grad (%\w+) (%\w+)$", spvasm, re.M)
     assert sample, "the explicit-gradient sample is missing"
     definitions = dict(re.findall(r"^\s*(%\w+) = (Op[^\n]+)", spvasm, re.M))
+    stored_to = {}
+    for ptr, val in re.findall(r"^\s*OpStore (%\w+) (%\w+)", spvasm, re.M):
+        stored_to.setdefault(val, []).append(ptr)
 
     # Trace dPdx and dPdy back to the fixture's full 32-bit derivative words, in operand order.
     for vector, registers in zip(sample.groups(), ((8, 9), (10, 11))):
@@ -265,11 +272,18 @@ def test_a16_sample_gradients_use_full_vgprs(make_shader):
         for component, register in zip(components, registers):
             cast, float_type, word = definitions[component].split()
             assert (cast, float_type) == ("OpBitcast", "%float")
-            load, word_type, pointer = definitions[word].split()
-            assert (load, word_type) == ("OpLoad", "%uint")
-            *access, index = definitions[pointer].split()
-            assert access == ["OpAccessChain", "%_ptr_Function_uint", "%vgpr"]
-            assert definitions[index] == f"OpConstant %uint {register}"
+            if word in definitions and definitions[word].startswith("OpLoad %uint "):
+                load, word_type, pointer = definitions[word].split()
+                assert (load, word_type) == ("OpLoad", "%uint")
+                pointers = [pointer]
+            else:
+                pointers = stored_to[word]
+            vgpr_indices = []
+            for pointer in pointers:
+                *access, index = definitions[pointer].split()
+                if access == ["OpAccessChain", "%_ptr_Function_uint", "%vgpr"]:
+                    vgpr_indices.append(definitions[index])
+            assert f"OpConstant %uint {register}" in vgpr_indices
     shader.validate(spvasm)
 
 
@@ -468,6 +482,9 @@ def _vgpr_to_index_map(spvasm, array_var, ptr_type):
             val_of[m.group(1)] = val_of[m.group(2)]
             continue
         m = re.match(r"\s*OpStore (%\w+) (%\w+)", line)
+        if m and m.group(1) in vgpr_of:
+            val_of[m.group(2)] = vgpr_of[m.group(1)]
+            continue
         if m and m.group(1) in ptr_idx and m.group(2) in val_of:
             stores[ptr_idx[m.group(1)]] = val_of[m.group(2)]
     return stores
@@ -790,10 +807,10 @@ def test_wqm_on_data_is_a_bit_operation(make_shader):
     shader.validate(asm)
     assert "OpGroupNonUniform" not in asm
     for k in (1, 2, 3):                                  # three shifts per word, two words (s_wqm_b64)
-        assert len(re.findall(rf"OpShiftRightLogical %uint %t\d+ %c{k}\n", asm)) == 2
-    assert len(re.findall(r"OpBitwiseAnd %uint %t\d+ %c11111111\n", asm)) == 2
-    assert len(re.findall(r"OpIMul %uint %t\d+ %cf\n", asm)) == 2
-    assert re.search(r"OpBitwiseOr %uint %t\d+ %t\d+\n(?:.*\n)*?.*OpStore %scc", asm)   # SCC = low | high != 0
+        assert len(re.findall(rf"OpShiftRightLogical %uint %\w+ %c{k}\n", asm)) == 2
+    assert len(re.findall(r"OpBitwiseAnd %uint %\w+ %c11111111\n", asm)) == 2
+    assert len(re.findall(r"OpIMul %uint %\w+ %cf\n", asm)) == 2
+    assert re.search(r"OpBitwiseOr %uint %\w+ %\w+\n(?:.*\n)*?.*OpStore %scc", asm)   # SCC = low | high != 0
 
 
 def test_wqm_without_quad_operations_outside_fragment_and_compute(make_shader):

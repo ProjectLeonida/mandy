@@ -37,17 +37,27 @@ def samples(spv):
 
 
 def source_vgpr(spv, value):
-    """The VGPR index the id `value` was loaded from (through bitcasts), or None."""
+    """The VGPR index the id `value` came from (OpLoad or forwarded OpStore of %vgpr[k], through bitcasts), or None."""
     consts = {k: int(v) for k, v in re.findall(r"^\s*(%\w+) = OpConstant %uint (\d+)", spv, re.M)}
+    vgpr_ptrs = {ptr: consts[idx] for ptr, idx in
+                 re.findall(r"^\s*(%\w+) = OpAccessChain %\S+ %vgpr (%\w+)", spv, re.M)
+                 if idx in consts}
+    stored_to = {val: vgpr_ptrs[ptr] for ptr, val in
+                 re.findall(r"^\s*OpStore (%\w+) (%\w+)", spv, re.M)
+                 if ptr in vgpr_ptrs}
     for _ in range(8):
         m = re.search(rf"^\s*{re.escape(value)} = (\w+) (?:%\w+ )?(%\w+)", spv, re.M)
-        if not m:
+        if m:
+            op, src = m.groups()
+            if op == "OpLoad":
+                return vgpr_ptrs.get(src)
+            if value in stored_to:
+                return stored_to[value]
+            value = src
+        elif value in stored_to:
+            return stored_to[value]
+        else:
             return None
-        op, src = m.groups()
-        if op == "OpLoad":
-            m2 = re.search(rf"^\s*{re.escape(src)} = OpAccessChain %\S+ %vgpr (%\w+)", spv, re.M)
-            return consts.get(m2.group(1)) if m2 else None
-        value = src
     return None
 
 
