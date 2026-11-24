@@ -60,9 +60,10 @@ void main() {
         if (oob_select == 3u) {
             const uint byte_off = pc.s[4] + i * 4u;
             result.w[i] = (byte_off + 4u <= num_records) ? at(base).w[byte_off >> 2u] : 0u;
-        } else if (oob_select == 1u && stride >= 4u) {
-            const uint idx = pc.s[4] + i;
-            result.w[i] = (idx < num_records) ? at(base).w[(idx * stride) >> 2u] : 0u;
+        } else if (oob_select <= 1u && stride >= 4u) {
+            const uint field = pc.s[4];
+            const bool in_bounds = i < num_records && (oob_select == 1u || field <= stride - 4u);
+            result.w[i] = in_bounds ? at(base).w[(i * stride + field) >> 2u] : 0u;
         } else {
             result.w[i] = 0u;
         }

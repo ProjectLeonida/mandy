@@ -6471,7 +6471,8 @@ public:
                 buffer.stride = std::uint32_t(stride);
                 buffer.num_records = desc->Buffer.NumElements;
                 buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
-                buffer.oob_select = leonida::gfx10::OobSelect::structured;
+                // Check the field offset against the record stride, as for structured UAVs (five-star-recomp 3d287ab).
+                buffer.oob_select = leonida::gfx10::OobSelect::structured_with_offset;
             } else {
                 const Format fmt = vulkan_format(desc->Format, false);
                 if (fmt.format == VK_FORMAT_UNDEFINED || fmt.typeless || !(fmt.aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
