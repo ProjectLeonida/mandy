@@ -484,6 +484,39 @@ class Execution(unittest.TestCase):
             "s_mov_b64 exec, s[10:11]"]))
         self.assertNotEqual(whole, halves)
         self.assertEqual(tier, "C")
+    def test_waterfall_needs_whole_word_integer_equality(self):
+        # v4 is one word in lanes 0..31 and another in lanes 32..63. The loop reads the first lane's word, selects the
+        # lanes that compare equal to it and writes that word to them. A float equality takes +0.0 and -0.0 as equal
+        # and a 16-bit or SDWA compare ignores the high half, so the wave handles all 64 lanes with lane 0's word
+        # while the second half reads its own first lane: not partition invariant. An integer equality of the whole
+        # word is, on the same words. A v_cmpx narrows EXEC itself, from a copy saved at the head of the loop.
+        def loop(shift, compare, mods=""):
+            if compare.startswith("v_cmpx"):
+                body = ["s_mov_b64 s[12:13], exec", "v_readfirstlane_b32 s20, v4", f"{compare} s20, v4{mods}"]
+            else:
+                body = ["v_readfirstlane_b32 s20, v4", f"{compare} vcc, s20, v4{mods}",
+                        "s_and_saveexec_b64 s[12:13], vcc"]
+            body += ["v_mov_b32_e32 v6, s20", "s_xor_b64 exec, exec, s[12:13]"]
+            back = sum(size(text) for text in body) // 4 + 1
+            return vs(["v_lshrrev_b32_e32 v4, 5, v0", f"v_lshlrev_b32_e32 v4, {shift}, v4"] + body +
+                      [f"s_cbranch_execnz -{back}", "s_mov_b64 exec, s[10:11]"])
+
+        for shift, compare, mods in ((31, "v_cmp_eq_f32_e32", ""), (16, "v_cmp_eq_u16_e32", ""),
+                                     (16, "v_cmp_eq_i16_e32", ""),
+                                     (16, "v_cmp_eq_u32_sdwa", " src0_sel:WORD_0 src1_sel:WORD_0"),
+                                     (31, "v_cmpx_eq_f32_e32", ""), (16, "v_cmpx_eq_u16_e32", "")):
+            with self.subTest(compare=compare):
+                tier, whole, halves = self.run_both("vs_wf_part_word", loop(shift, compare, mods))
+                self.assertEqual([w[0] for w in whole], [0] * 64)
+                self.assertEqual([w[0] for w in halves], [0] * 32 + [1 << shift] * 32)
+                self.assertEqual(tier, "C")
+        for shift, compare in ((31, "v_cmp_eq_u32_e32"), (31, "v_cmp_eq_i32_e32"), (16, "v_cmp_eq_u32_e64"),
+                               (31, "v_cmpx_eq_u32_e32"), (31, "v_cmpx_eq_i32_e32")):
+            with self.subTest(compare=compare, shift=shift):
+                tier, whole, halves = self.run_both("vs_wf_whole_word", loop(shift, compare))
+                self.assertEqual(tier, "B")
+                self.assertEqual(whole, halves)
+                self.assertEqual([w[0] for w in whole], [0] * 32 + [1 << shift] * 32)
 
     def test_b_waterfall_invariant(self):
         tier, whole, halves = self.run_both("vs_b_wf", vs([
