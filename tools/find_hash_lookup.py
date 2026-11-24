@@ -54,13 +54,21 @@ def sections(data):
     """[(name, rva, raw offset, size, executable)] of a PE file (32- or 64-bit)."""
     if data[:2] != b"MZ":
         raise ValueError("not a PE file (no MZ header): an encrypted or packed executable can't be scanned")
+    if len(data) < 0x40:
+        raise ValueError("truncated PE file (no e_lfanew): an encrypted or packed executable can't be scanned")
     pe = struct.unpack_from("<I", data, 0x3C)[0]
     if data[pe:pe + 4] != b"PE\0\0":
         raise ValueError("no PE signature")
+    if len(data) < pe + 24:
+        raise ValueError("truncated PE file (no COFF header): an encrypted or packed executable can't be scanned")
     count, opt_size = struct.unpack_from("<H12xH", data, pe + 6)
     first = pe + 24 + opt_size
+    if len(data) < first:
+        raise ValueError("truncated PE file (short optional header): an encrypted or packed executable can't be scanned")
     out = []
     for i in range(count):
+        if len(data) < first + 40 * i + 40:
+            raise ValueError("truncated PE file (short section table): an encrypted or packed executable can't be scanned")
         name, vsize, rva, rsize, raw = struct.unpack_from("<8sIIII", data, first + 40 * i)
         flags = struct.unpack_from("<I", data, first + 40 * i + 36)[0]
         out.append((name.rstrip(b"\0").decode("ascii", "replace"), rva, raw, min(vsize or rsize, rsize),
