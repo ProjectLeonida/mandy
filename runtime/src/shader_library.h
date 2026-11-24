@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cerrno>
 #include <cstdint>
@@ -27,6 +28,20 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
+// The SHA extensions path of sha256_hex: x86-64 with GCC or Clang (target attributes and <cpuid.h>). Elsewhere, or
+// with LEONIDA_SHA256_X86 defined to 0, sha256_hex uses the portable compression alone.
+#ifndef LEONIDA_SHA256_X86
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+#define LEONIDA_SHA256_X86 1
+#else
+#define LEONIDA_SHA256_X86 0
+#endif
+#endif
+#if LEONIDA_SHA256_X86
+#include <cpuid.h>
+#include <immintrin.h>
+#endif
 
 namespace leonida {
 
@@ -363,54 +378,156 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
 // ---------------------------------------------------------------------------------------------------------------
 // SHA-256
 
-inline std::string sha256_hex(std::span<const std::uint8_t> data) {
-    static constexpr std::uint32_t k[64] = {
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
-    std::uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-                          0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+namespace detail {
+
+inline constexpr std::uint32_t sha256_k[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+
+// SHA-256 compressions of `blocks` 64-byte blocks at `p` into `h` (FIPS 180-4, 6.2.2), in portable C++.
+inline void sha256_blocks_portable(std::uint32_t (&h)[8], const std::uint8_t* p, std::size_t blocks) {
     const auto rotr = [](std::uint32_t x, int n) { return (x >> n) | (x << (32 - n)); };
-    std::vector<std::uint8_t> message(data.begin(), data.end());
-    const std::uint64_t bits = std::uint64_t(data.size()) * 8;
-    message.push_back(0x80);
-    while (message.size() % 64 != 56) message.push_back(0);
-    for (int i = 7; i >= 0; --i) message.push_back(std::uint8_t(bits >> (8 * i)));
-    for (std::size_t block = 0; block < message.size(); block += 64) {
-        std::uint32_t w[64];
+    for (; blocks; --blocks, p += 64) {
+        std::uint32_t w[16];
         for (int i = 0; i < 16; ++i)
-            w[i] = (std::uint32_t(message[block + 4 * i]) << 24) | (std::uint32_t(message[block + 4 * i + 1]) << 16) |
-                   (std::uint32_t(message[block + 4 * i + 2]) << 8) | message[block + 4 * i + 3];
-        for (int i = 16; i < 64; ++i) {
-            const std::uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
-            const std::uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-        }
+            w[i] = (std::uint32_t(p[4 * i]) << 24) | (std::uint32_t(p[4 * i + 1]) << 16) |
+                   (std::uint32_t(p[4 * i + 2]) << 8) | p[4 * i + 3];
+        // The message schedule, kept as its last 16 words (step 1): word i >= 16 replaces word i - 16.
+        const auto schedule = [&](int i) {
+            if (i < 16) return w[i];
+            const std::uint32_t w15 = w[(i - 15) & 15], w2 = w[(i - 2) & 15];
+            const std::uint32_t s0 = rotr(w15, 7) ^ rotr(w15, 18) ^ (w15 >> 3);
+            const std::uint32_t s1 = rotr(w2, 17) ^ rotr(w2, 19) ^ (w2 >> 10);
+            return w[i & 15] += s0 + w[(i - 7) & 15] + s1;
+        };
+        // Eight rounds per step, each naming the working variables in their rotated order, so no round moves them
+        // (step 3). Ch is written as g ^ (e & (f ^ g)) and Maj as (a & b) | (c & (a | b)): the same functions.
+        const auto round = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c, std::uint32_t& d, std::uint32_t e,
+                               std::uint32_t f, std::uint32_t g, std::uint32_t& hh, int i) {
+            const std::uint32_t t1 =
+                hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + (g ^ (e & (f ^ g))) + sha256_k[i] + schedule(i);
+            const std::uint32_t t2 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) | (c & (a | b)));
+            d += t1;
+            hh = t1 + t2;
+        };
         std::uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
-        for (int i = 0; i < 64; ++i) {
-            const std::uint32_t t1 = hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + k[i] + w[i];
-            const std::uint32_t t2 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
-            hh = g;
-            g = f;
-            f = e;
-            e = d + t1;
-            d = c;
-            c = b;
-            b = a;
-            a = t1 + t2;
+        for (int i = 0; i < 64; i += 8) {
+            round(a, b, c, d, e, f, g, hh, i);
+            round(hh, a, b, c, d, e, f, g, i + 1);
+            round(g, hh, a, b, c, d, e, f, i + 2);
+            round(f, g, hh, a, b, c, d, e, i + 3);
+            round(e, f, g, hh, a, b, c, d, i + 4);
+            round(d, e, f, g, hh, a, b, c, i + 5);
+            round(c, d, e, f, g, hh, a, b, i + 6);
+            round(b, c, d, e, f, g, hh, a, i + 7);
         }
         h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
     }
+}
+
+#if LEONIDA_SHA256_X86
+// The same compressions with the x86 SHA extensions: SHA256RNDS2 runs two rounds, SHA256MSG1/MSG2 extend the
+// schedule. The instructions hold the state as ABEF and CDGH, A and C in the high lanes.
+__attribute__((target("sha,sse4.1"))) inline void sha256_blocks_x86(std::uint32_t (&h)[8], const std::uint8_t* p,
+                                                                     std::size_t blocks) {
+    const __m128i byteswap = _mm_set_epi64x(0x0c0d0e0f08090a0bll, 0x0405060700010203ll);  // each word big-endian
+    const __m128i badc = _mm_shuffle_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(h)), 0xb1);
+    const __m128i hgfe = _mm_shuffle_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(h + 4)), 0x1b);
+    __m128i abef = _mm_alignr_epi8(badc, hgfe, 8);   // lanes f e b a
+    __m128i cdgh = _mm_blend_epi16(hgfe, badc, 0xf0);  // lanes h g d c
+    for (; blocks; --blocks, p += 64) {
+        const __m128i abef_in = abef, cdgh_in = cdgh;
+        __m128i m[4];
+        for (int i = 0; i < 4; ++i)
+            m[i] = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 16 * i)), byteswap);
+        for (int i = 0; i < 16; ++i) {  // rounds 4i..4i+3, their words in m[i % 4]
+            if (i >= 4) {
+                const __m128i w7 = _mm_alignr_epi8(m[(i - 1) & 3], m[(i - 2) & 3], 4);  // words 4i-7..4i-4
+                m[i & 3] = _mm_sha256msg2_epu32(_mm_add_epi32(_mm_sha256msg1_epu32(m[i & 3], m[(i - 3) & 3]), w7),
+                                                m[(i - 1) & 3]);
+            }
+            const __m128i kw =
+                _mm_add_epi32(m[i & 3], _mm_loadu_si128(reinterpret_cast<const __m128i*>(sha256_k + 4 * i)));
+            cdgh = _mm_sha256rnds2_epu32(cdgh, abef, kw);
+            abef = _mm_sha256rnds2_epu32(abef, cdgh, _mm_shuffle_epi32(kw, 0x0e));
+        }
+        abef = _mm_add_epi32(abef, abef_in);
+        cdgh = _mm_add_epi32(cdgh, cdgh_in);
+    }
+    const __m128i abfe = _mm_shuffle_epi32(abef, 0x1b);  // lanes a b e f
+    const __m128i ghcd = _mm_shuffle_epi32(cdgh, 0xb1);  // lanes g h c d
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(h), _mm_blend_epi16(abfe, ghcd, 0xf0));    // a b c d
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(h + 4), _mm_alignr_epi8(ghcd, abfe, 8));  // e f g h
+}
+
+// Whether this processor has the SHA extensions, SSSE3 and SSE4.1 (CPUID.7.0:EBX[29], CPUID.1:ECX[9] and [19]).
+// Asked once, into a constant-initialized atomic rather than a function-local dynamic static, so no thread-safe
+// statics guard runs on a guest thread.
+inline constinit std::atomic<int> sha256_x86_known{0};  // 0: not asked yet, 1: no, 2: yes
+
+inline bool sha256_x86_supported() {
+    int answer = sha256_x86_known.load(std::memory_order_relaxed);
+    if (!answer) {
+        unsigned a = 0, b = 0, c = 0, d = 0;
+        bool yes = __get_cpuid_max(0, nullptr) >= 7;
+        if (yes) {
+            __cpuid(1, a, b, c, d);
+            yes = (c >> 9 & 1) && (c >> 19 & 1);
+        }
+        if (yes) {
+            __cpuid_count(7, 0, a, b, c, d);
+            yes = b >> 29 & 1;
+        }
+        answer = yes ? 2 : 1;
+        sha256_x86_known.store(answer, std::memory_order_relaxed);
+    }
+    return answer == 2;
+}
+#endif
+
+inline void sha256_blocks(std::uint32_t (&h)[8], const std::uint8_t* p, std::size_t blocks) {
+#if LEONIDA_SHA256_X86
+    if (sha256_x86_supported()) return sha256_blocks_x86(h, p, blocks);
+#endif
+    sha256_blocks_portable(h, p, blocks);
+}
+
+// SHA-256 with the compression `blocks`. The whole blocks are compressed where they lie; only the tail and its
+// padding (one or two blocks) go through a buffer on the stack, so a hash allocates nothing but its 64-character
+// result.
+template<typename Blocks>
+std::string sha256_hex_with(std::span<const std::uint8_t> data, Blocks&& blocks) {
+    std::uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                          0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    const std::size_t whole = data.size() / 64;
+    if (whole) blocks(h, data.data(), whole);
+    const std::size_t rest = data.size() - 64 * whole;
+    std::uint8_t tail[128] = {};
+    if (rest) std::memcpy(tail, data.data() + 64 * whole, rest);
+    tail[rest] = 0x80;
+    const std::size_t tail_blocks = rest < 56 ? 1 : 2;
+    const std::uint64_t bits = std::uint64_t(data.size()) * 8;
+    for (int i = 0; i < 8; ++i) tail[64 * tail_blocks - 1 - i] = std::uint8_t(bits >> (8 * i));
+    blocks(h, tail, tail_blocks);
     static constexpr char hex[] = "0123456789abcdef";
-    std::string out;
-    for (const std::uint32_t word : h)
-        for (int shift = 28; shift >= 0; shift -= 4) out.push_back(hex[(word >> shift) & 0xf]);
+    std::string out(64, '0');
+    for (int i = 0; i < 8; ++i)
+        for (int j = 0; j < 8; ++j) out[std::size_t(8 * i + j)] = hex[(h[i] >> (28 - 4 * j)) & 0xf];
     return out;
+}
+
+} // namespace detail
+
+inline std::string sha256_hex(std::span<const std::uint8_t> data) {
+    return detail::sha256_hex_with(data, [](std::uint32_t (&h)[8], const std::uint8_t* p, std::size_t blocks) {
+        detail::sha256_blocks(h, p, blocks);
+    });
 }
 
 // ---------------------------------------------------------------------------------------------------------------

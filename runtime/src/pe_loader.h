@@ -149,6 +149,9 @@ private:
     // owns every import of that DLL; `out` is the export, or null when the DLL lacks it. Caller holds mutex_.
     bool resolve_compat(const std::string& key, const std::string& dll, const std::string& name, uint16_t ordinal,
                         bool by_ordinal, void*& out);
+    struct ImportedDll;                    // what binding learns once per imported DLL (pe_loader.cpp)
+    struct ImportCache;                    // the imported DLLs of the bind_imports call running
+    ImportCache* import_cache_ = nullptr;  // that call's cache (under mutex_), nullptr outside one
     void* resolve_forwarder(const std::string& spec, Binding& binding, int depth);
     void parse_exports(Module& m);
     void protect_sections(Module& m);

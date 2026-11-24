@@ -74,7 +74,7 @@ Roots roots() {
     return {g_game_dir, g_overlay_dir};
 }
 
-std::wstring lower(std::wstring s) {
+[[maybe_unused]] std::wstring lower(std::wstring s) {
     for (auto& c : s) c = static_cast<wchar_t>(std::towlower(c));
     return s;
 }
@@ -108,15 +108,22 @@ enum class Parsed { Host, Console, Refused };
 // and a ".." that would leave the root are refused: the package and the overlay are the only folders a title may name.
 bool is_separator(wchar_t c) { return c == L'\\' || c == L'/'; }
 
-// True when `path` is `root` or lies below it, compared by name (case-insensitive, either separator).
+// One character as lies_under compares it: lower case, '/' read as '\\'.
+wchar_t fold(wchar_t c) {
+    c = static_cast<wchar_t>(std::towlower(c));
+    return c == L'/' ? L'\\' : c;
+}
+
+// True when `path` is `root` or lies below it, compared by name (case-insensitive, either separator). Compared in
+// place: every G:/T: path asks this twice, and lowered copies of both strings were four allocations a call.
 bool lies_under(const std::wstring& path, const std::filesystem::path& root) {
-    std::wstring base = lower(root.native());
-    for (auto& c : base) if (c == L'/') c = L'\\';
-    while (!base.empty() && base.back() == L'\\') base.pop_back();
-    if (base.empty()) return false;
-    std::wstring p = lower(path);
-    for (auto& c : p) if (c == L'/') c = L'\\';
-    return p.compare(0, base.size(), base) == 0 && (p.size() == base.size() || p[base.size()] == L'\\');
+    const std::wstring& base = root.native();
+    size_t n = base.size();
+    while (n > 0 && fold(base[n - 1]) == L'\\') --n;  // trailing separators of the root do not count
+    if (n == 0 || path.size() < n) return false;
+    for (size_t i = 0; i < n; ++i)
+        if (fold(path[i]) != fold(base[i])) return false;
+    return path.size() == n || fold(path[n]) == L'\\';
 }
 
 // The console shim may resolve even a short guest name to an extended-length host path. GetFullPathNameW
@@ -169,17 +176,27 @@ std::filesystem::path win32_find_path(const std::filesystem::path& path, const s
 // configured. The scratch folder lives in the overlay, as `.gta6rt-temp`.
 enum class Drive { None, Game, Scratch };
 
+bool has_game_prefix(const std::wstring& path) {
+    if (path.size() < kGamePrefixLength) return false;
+    for (size_t i = 0; i < kGamePrefixLength; ++i)
+        if (static_cast<wchar_t>(std::towlower(path[i])) != kGamePrefix[i]) return false;
+    return true;
+}
+
 Drive console_drive(const std::wstring& path, size_t& prefix_length) {
-    if (path.size() >= kGamePrefixLength && lower(path.substr(0, kGamePrefixLength)) == kGamePrefix) {
+    if (has_game_prefix(path)) {
         prefix_length = kGamePrefixLength;
         return Drive::Game;
     }
     if (path.size() < 2 || path[1] != L':' || (path.size() > 2 && !is_separator(path[2]))) return Drive::None;
     const wchar_t letter = static_cast<wchar_t>(std::towlower(path[0]));
     if (letter != L'g' && letter != L't') return Drive::None;
-    const Roots r = roots();
-    if (r.game.empty() && r.overlay.empty()) return Drive::None;
-    if (lies_under(path, r.game) || lies_under(path, r.overlay)) return Drive::None;
+    {
+        // The roots compared where they are, under the lock roots() takes, instead of copied out first.
+        std::lock_guard lock(g_mutex);
+        if (g_game_dir.empty() && g_overlay_dir.empty()) return Drive::None;
+        if (lies_under(path, g_game_dir) || lies_under(path, g_overlay_dir)) return Drive::None;
+    }
     prefix_length = 2;
     return letter == L'g' ? Drive::Game : Drive::Scratch;
 }
@@ -191,39 +208,48 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
     parts.clear();
     if (drive == Drive::Scratch) {
         parts.push_back(kScratchDir);
-        const std::filesystem::path overlay = roots().overlay;
-        const DWORD last_error = ::GetLastError();
-        std::error_code ec;
-        if (!overlay.empty()) std::filesystem::create_directories(win32_io_path(overlay / kScratchDir), ec);
-        ::SetLastError(last_error);
+        std::filesystem::path scratch;
+        {
+            std::lock_guard lock(g_mutex);
+            if (!g_overlay_dir.empty()) scratch = g_overlay_dir / kScratchDir;
+        }
+        if (!scratch.empty()) {
+            scratch = win32_io_path(scratch);  // outside the lock: a long overlay path asks GetFullPathNameW
+            const DWORD last_error = ::GetLastError();
+            // Once the folder is there create_directories makes nothing, so one attribute query answers most calls:
+            // the std::filesystem status it starts with opens a handle to the folder, ~50 us on every T: path.
+            const DWORD attributes = ::GetFileAttributesW(scratch.c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                std::error_code ec;
+                std::filesystem::create_directories(scratch, ec);
+            }
+            ::SetLastError(last_error);
+        }
     }
     const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
-    std::wstring part;
-    auto flush = [&]() -> bool {
-        if (part.empty() || part == L".") {
-            part.clear();
-            return true;
-        }
-        if (part == L"..") {
+    // Each component is path[start, end): read in place, and copied once when kept (no per-character growth).
+    auto flush = [&](size_t start, size_t end) -> bool {
+        const size_t length = end - start;
+        const wchar_t* const part = path.data() + start;
+        if (length == 0 || (length == 1 && part[0] == L'.')) return true;
+        if (length == 2 && part[0] == L'.' && part[1] == L'.') {
             if (parts.size() <= floor) return false;
             parts.pop_back();
-        } else if (part.find(L':') != std::wstring::npos) {
+        } else if (std::wmemchr(part, L':', length) != nullptr) {
             return false;
         } else {
-            parts.push_back(part);
+            parts.emplace_back(part, length);
         }
-        part.clear();
         return true;
     };
+    size_t start = prefix_length;
     for (size_t i = prefix_length; i < path.size(); ++i) {
-        const wchar_t c = path[i];
-        if (is_separator(c)) {
-            if (!flush()) return Parsed::Refused;
-        } else {
-            part.push_back(c);
+        if (is_separator(path[i])) {
+            if (!flush(start, i)) return Parsed::Refused;
+            start = i + 1;
         }
     }
-    if (!flush()) return Parsed::Refused;
+    if (!flush(start, path.size())) return Parsed::Refused;
     // The overlay's own folders are not part of the title's GAME: tree: hidden from its listings (internal_dir) and
     // refused as an explicit path too, in every spelling the loop above normalises (case, slashes, "." and "..").
     // T: still names the scratch folder: its first part is pushed above, not parsed from the title's path.

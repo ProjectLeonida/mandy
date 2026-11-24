@@ -14,6 +14,7 @@
 
 #include "shims.h"
 #include "startup_trace.h"
+#include "unimplemented_import.h"
 
 namespace rt::shims {
 namespace {
@@ -32,8 +33,7 @@ std::string lower_ascii(std::string s) {
 bool starts_with(const std::string& s, const char* prefix) { return s.rfind(prefix, 0) == 0; }
 
 std::mutex g_called_mutex;
-std::set<std::string> g_called;
-std::map<const char*, ReturnClass> g_seen;  // by the thunk's `what` pointer; both under g_called_mutex
+std::set<std::string> g_called;  // under g_called_mutex; only a first call takes it
 std::atomic<TestHook> g_test_hook{nullptr};
 
 // ---- Return-value policy ----------------------------------------------------------------------------------------
@@ -162,30 +162,28 @@ std::string describe_address(uint64_t addr) {
     return std::string(head) + " = not inside any module";
 }
 
-// Called by the common stub with the import's "dll!name" string and the registers it saved. The return value goes
-// back to the game's caller in rax; the stub zeroes xmm0.
-extern "C" uint64_t rt_unimplemented(const char* what, const CallInfo* info) {
+// The return class of a thunk's "dll!name" key: the DLL is what comes before the first '!', the name what follows.
+ReturnClass classify_key(const std::string& full) {
+    const auto bang = full.find('!');
+    return classify(lower_ascii(bang == std::string::npos ? "" : full.substr(0, bang)),
+                    bang == std::string::npos ? full : full.substr(bang + 1));
+}
+
+// Called by the common stub with the import's record (unimplemented_import.h) and the registers it saved. The return
+// value goes back to the game's caller in rax; the stub zeroes xmm0.
+extern "C" uint64_t rt_unimplemented(UnimplementedImport* import, const CallInfo* info) {
     if (auto hook = g_test_hook.load()) hook(_AddressOfReturnAddress());
     const UnimplementedPolicy policy = unimplemented_policy();
 
-    // `what` is a string that lives for the process and is unique per import, so the pointer keys the per-import
-    // state. Strings are built only the first time an import is seen; a repeat call costs one map lookup.
-    ReturnClass cls;
-    bool first = false;
-    {
+    // The record holds the per-import state: the return class, fixed when the thunk was made, and the called flag. A
+    // repeat call is one relaxed load, with no lock shared between imports or threads; only the first call of an
+    // import takes g_called_mutex, to add it to the list report_called_unimplemented prints.
+    const char* const what = import->what;
+    const ReturnClass cls = static_cast<ReturnClass>(import->return_class);
+    const bool first = import->first_call();
+    if (first) {
         std::lock_guard lock(g_called_mutex);
-        auto it = g_seen.find(what);
-        if (it == g_seen.end()) {
-            const std::string full = what;
-            const auto bang = full.find('!');
-            cls = classify(lower_ascii(bang == std::string::npos ? "" : full.substr(0, bang)),
-                           bang == std::string::npos ? full : full.substr(bang + 1));
-            g_seen.emplace(what, cls);
-            g_called.insert(full);
-            first = true;
-        } else {
-            cls = it->second;
-        }
+        g_called.insert(what);
     }
     const uint64_t fail_value = cls == ReturnClass::HResult ? kENotImpl : 0;
     if (first && startup_trace::enabled())
@@ -222,13 +220,13 @@ extern "C" uint64_t rt_unimplemented(const char* what, const CallInfo* info) {
 }
 
 // Thunk layout (x86-64), one per import:
-//   49 BA <imm64>   mov r10, what            ("dll!name"; r10 is volatile and carries no argument)
+//   49 BA <imm64>   mov r10, import          (its UnimplementedImport record; r10 is volatile and carries no argument)
 //   48 B8 <imm64>   mov rax, common_stub
 //   FF E0           jmp rax
 // The game's `call` pushed the return address, so at thunk entry [rsp] is the caller. rcx/rdx/r8/r9 are untouched.
 //
 // The common stub (one copy, made on first use) saves those registers and the return address, calls
-// rt_unimplemented(what, &saved), and returns its rax straight to the game's caller with xmm0 zeroed (so a caller
+// rt_unimplemented(import, &saved), and returns its rax straight to the game's caller with xmm0 zeroed (so a caller
 // that expects a float or double result sees 0.0):
 //   sub rsp, 0x48                       ; 8 (return address) + 0x48 leaves rsp 16-byte aligned at the call
 //   mov [rsp+0x20..0x38], rcx, rdx, r8, r9   ; the CallInfo, above the 32-byte shadow space
@@ -519,10 +517,11 @@ void* make_unimplemented_thunk(const std::string& dll, const std::string& name) 
         g_pool_used = 0;
         if (!g_pool) return nullptr;
     }
-    const char* what = _strdup(key.c_str());  // lives for the process
+    // Both live for the process: the thunk holds the record's address.
+    auto* const import = new UnimplementedImport(_strdup(key.c_str()), static_cast<uint8_t>(classify_key(key)));
     uint8_t* t = g_pool + g_pool_used;
     g_pool_used += kThunkSize;
-    const uint64_t a = reinterpret_cast<uint64_t>(what), f = reinterpret_cast<uint64_t>(g_stub);
+    const uint64_t a = reinterpret_cast<uint64_t>(import), f = reinterpret_cast<uint64_t>(g_stub);
     uint8_t code[kThunkSize] = {0x49, 0xBA};
     std::memcpy(code + 2, &a, 8);
     code[10] = 0x48;
