@@ -273,6 +273,32 @@ class Cli(unittest.TestCase):
         self.assertEqual(len(stderr.splitlines()), 1)
         self.assertIn("Permission denied", stderr)
 
+    def test_stage_cleanup_restores_write_mode_on_replace_failure(self):
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(path, mode, *args, **kwargs):
+            chmod_calls.append((str(path), mode))
+            return real_chmod(path, mode, *args, **kwargs)
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd[0] == "spirv-as":
+                with open(cmd[cmd.index("-o") + 1], "wb") as f:
+                    f.write(b"spv binary")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            write_index(tmp, {"ms_a": {"mesh_compute": layout(clip=1)}})
+
+            with mock.patch.object(vs, "tool_path", side_effect=lambda name: name), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("os.replace", side_effect=OSError("replace failed")), \
+                 mock.patch("os.chmod", side_effect=track_chmod):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    vs.build_for_index(tmp)
+
+        self.assertTrue(any(mode == 0o600 for _, mode in chmod_calls), chmod_calls)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,6 +28,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode
+
 SUFFIX = ".mesh_vs"   # <ms name>.mesh_vs.spvasm / .spv next to the mesh shader
 USER_SGPRS = 32       # push constants: s0..s31, heap base, code base, then the output address (rdna2spirv.py)
 PC_TAIL_SET = 1       # set/binding of rdna2spirv.py --pc-tail-ubo's uniform block (6 dwords with --mesh-compute)
@@ -317,7 +320,15 @@ def build_for_index(spirv_dir):
                 r = subprocess.run(cmd, capture_output=True, text=True)
                 if r.returncode:
                     raise RuntimeError(f"{name} failed for {asm}:\n{r.stdout}{r.stderr}")
-            os.replace(staged_spv, spv)
+            os.chmod(staged_spv, published_mode(spv))
+            try:
+                os.replace(staged_spv, spv)
+            except BaseException:
+                try:
+                    os.chmod(staged_spv, 0o600)
+                except OSError:
+                    pass
+                raise
         built.append(spv)
     return built
 
