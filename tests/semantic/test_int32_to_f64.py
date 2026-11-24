@@ -72,7 +72,11 @@ class Int32ToFloat64(unittest.TestCase):
                 ])
                 value, = re.findall(rf"(%\w+) = {opcode} %double ", text)
                 self.assertNotIn("OpFMul %double", text)
-                clamped, = re.findall(rf"(%\w+) = OpExtInst %double %glsl FClamp {value} ", text)
+                # clamp_mods_f64 replaces a NaN with +0 before FClamp (DX10_CLAMP); the converted value is the
+                # one checked and selected.
+                nan, = re.findall(rf"(%\w+) = OpIsNan %bool {value}\n", text)
+                safe, = re.findall(rf"(%\w+) = OpSelect %double {nan} %\w+ {value}\n", text)
+                clamped, = re.findall(rf"(%\w+) = OpExtInst %double %glsl FClamp {safe} ", text)
                 self.assertIn(f"OpBitcast %v2uint_d {clamped}\n", text)
                 omod_only = translate_lines("ps_int32_to_f64_omod", [
                     "v_mov_b32 v4, 3",

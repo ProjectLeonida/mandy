@@ -57,7 +57,7 @@ EXPORT = "exp mrt0 v8, v9, v10, v11 done vm"
 KNOWN_DIVERGENCES = {
     "f64-omod": "SHADER-721: f64 output modifiers; owned by @fiestorra.",
     "double-neg-abs": "TEST-912 (#4172): spirv_mini_interp rounds binary64 OpFNegate/FAbs through binary32, changing values as well as NaN payloads.",
-    "fclamp-nan-zero": "FClamp NaN and signed-zero results are driver-dependent after f64 clamp/omod.",
+    "fclamp-nan-zero": "The sign of a zero result after f64 clamp/omod is driver-dependent (FClamp); a NaN is +0.",
     "div-fixup-nan-s0": "RDNA2 ISA maps NaN(S0) to signed infinity; current translator preserves the NaN payload.",
 }
 
@@ -320,8 +320,9 @@ def ref_program(lines, include_known=False, exec_lo=M32):
                 scale = {"mul:2": 2.0, "mul:4": 4.0, "div:2": 0.5}.get(modifier)
                 if scale is not None:
                     out = QNAN if is_nan(out) else from_float(to_float(out) * scale)
-            if "clamp" in modifiers and not is_nan(out):
-                out = from_float(min(1.0, max(0.0, to_float(out))))
+            if "clamp" in modifiers:
+                # HW_MODE has DX10_CLAMP=1: the clamp bit turns a NaN into +0 (docs/design.md).
+                out = 0 if is_nan(out) else from_float(min(1.0, max(0.0, to_float(out))))
             d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(out)
         elif op in ("v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64"):
             x = read_source(a[0], vgpr, sgpr)
