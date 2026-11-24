@@ -1870,10 +1870,11 @@ public:
             if (context_.scratch_) context_.scratch_->forget(progress_);
         }
         if (progress_) {
-            // This queue is idle, so whatever initialisation it published (storage images, zero-filled buffers) has
-            // finished: the next submission on another queue must not wait on a semaphore that is about to go.
+            // This queue is idle, so whatever initialisation or bindless table upload it published has finished:
+            // the next submission on another queue must not wait on a semaphore that is about to go.
             std::lock_guard lock(context_.storage_mutex_);
             if (context_.storage_init_semaphore_ == progress_) context_.storage_init_semaphore_ = VK_NULL_HANDLE;
+            if (context_.bindless_upload_semaphore_ == progress_) context_.bindless_upload_semaphore_ = VK_NULL_HANDLE;
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
