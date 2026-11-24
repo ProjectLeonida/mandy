@@ -103,6 +103,13 @@ public:
         return true;
     }
 
+    // After align(), take up to length bytes, including the available prefix at EOF.
+    std::span<const std::uint8_t> take_aligned(std::size_t length) {
+        const auto bytes = in_.subspan(pos_, std::min(length, in_.size() - pos_));
+        pos_ += bytes.size();
+        return bytes;
+    }
+
     std::size_t position() const { return pos_ - std::size_t(count_ / 8); }
     bool failed() const { return failed_; }
 
@@ -285,11 +292,9 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
             const unsigned length = b[0] | (b[1] << 8), complement = b[2] | (b[3] << 8);
             if (length != (~complement & 0xffff)) return fail(ZlibError::data);
             if (out.size() > limit || length > limit - out.size()) return fail(ZlibError::limit);
-            for (unsigned i = 0; i < length; ++i) {
-                std::uint8_t x;
-                if (!reader.byte(x)) return fail(ZlibError::data);
-                out.push_back(x);
-            }
+            const auto payload = reader.take_aligned(length);
+            out.insert(out.end(), payload.begin(), payload.end());
+            if (payload.size() != length) return fail(ZlibError::data);
         } else if (type == 1) {  // fixed Huffman
             static const auto tables = [] {
                 std::pair<detail::Huffman, detail::Huffman> t;

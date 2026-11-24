@@ -308,6 +308,7 @@ int huffman_lut_checks() {
             w.write_byte(std::uint8_t(n >> 8));
             w.write_byte(std::uint8_t(nlen));
             w.write_byte(std::uint8_t(nlen >> 8));
+            const std::size_t payload_at = w.bytes.size();
             for (char c : mid) {
                 w.write_byte(std::uint8_t(c));
                 expected.push_back(std::uint8_t(c));
@@ -326,7 +327,16 @@ int huffman_lut_checks() {
             CHECK(zlib_inflate(w.bytes, out, expected.size()) && out == expected);
             for (std::size_t cut = 0; cut < w.bytes.size(); ++cut) {
                 std::vector<std::uint8_t> trunc(w.bytes.begin(), w.bytes.begin() + cut);
-                CHECK(!zlib_inflate(trunc, out, expected.size()));
+                ZlibError why{};
+                CHECK(!zlib_inflate(trunc, out, expected.size(), &why));
+                if (cut >= payload_at && cut < payload_at + n) {
+                    CHECK(why == ZlibError::data);
+                    const auto prefix_end = expected.begin() + k + (cut - payload_at);
+                    CHECK(std::equal(out.begin(), out.end(), expected.begin(), prefix_end));
+                    // The output limit applies to the whole declared block before consuming its payload.
+                    CHECK(!zlib_inflate(trunc, out, k + n - 1, &why) && why == ZlibError::limit);
+                    CHECK(std::equal(out.begin(), out.end(), expected.begin(), expected.begin() + k));
+                }
             }
         }
     }
