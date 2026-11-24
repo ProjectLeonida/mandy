@@ -44,8 +44,13 @@ def pack_layout(sig, stage=None):
     stage None: rt::rootsig::pack (from s0, two dwords per table). A stage from
     STAGE_BASE: rt::rootsig::pack_stage (from the stage base, one dword per table;
     dwords below the base are {"param": None, "sub": 0, "ptype": "driver"}).
-    error is set (and dwords empty) on spill, cost overflow or bad input:
-    refuse, never truncate.
+    A compute layout stops at the first parameter that does not fit whole: that
+    parameter and every later one live in the compute argument block behind
+    s[0:1] (modelled on XboxBvhBuilder.dll's programs, docs/d3d12_vulkan.md
+    section 3.5), which this SGPR layout does not list. Other stages keep the
+    refusal: their graphics spill has not been measured.
+    error is set (and dwords empty) on a non-compute spill, cost overflow or bad
+    input: refuse, never truncate.
     """
     if stage is not None and stage not in STAGE_BASE:
         return [], f"no console base for stage {stage!r}"
@@ -59,6 +64,7 @@ def pack_layout(sig, stage=None):
     base = STAGE_BASE[stage] if stage is not None else 0
     dwords = [{"param": None, "sub": 0, "ptype": "driver"} for _ in range(base)]
     cost = 0
+    spilling = False
     params = [dict(p) for p in raw_params]  # normalized copy; input untouched
     if len(params) > 64:
         return [], "more than 64 root parameters"
@@ -82,10 +88,15 @@ def pack_layout(sig, stage=None):
         cost += cost_add
         if cost > 64:
             return [], "exceeds the 64-dword D3D12 cost limit"
+        if spilling:
+            continue  # Still validate every later parameter and its cost.
         if len(dwords) + width > 32:
-            if stage is not None:
-                return [], (f"param {index} does not fit in the user SGPRs from s{base} "
-                            "(spill array not modelled)")
+            if stage == "cs":
+                # Compute's spill is modelled (docs/d3d12_vulkan.md section 3.5): inline placement stops here and
+                # every parameter from this one lives in the argument block behind s[0:1] — no SGPR dwords for it.
+                # The block itself is not part of this SGPR layout; the other stages keep the refusal.
+                spilling = True
+                continue
             return [], "needs more than 32 user SGPRs (spill unsupported)"
         for sub in range(width):
             dwords.append({"param": index, "sub": sub, "ptype": ptype})

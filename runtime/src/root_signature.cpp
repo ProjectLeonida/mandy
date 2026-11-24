@@ -55,14 +55,17 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
         out.error = "root signature has more than 64 root parameters";
         return out;
     }
+    // Only compute's spill is measured (docs/d3d12_vulkan.md section 3.5): a signature that does not fit s4..s31
+    // puts its arguments in the block behind s[0:1], in the inline layout's widths as bytes. The other stages
+    // keep the refusal until one of their programs is measured.
+    const bool model_spill = stage == Stage::Compute;
     uint64_t cost = 0;  // 64-bit, as in pack()
     uint64_t next = out.base;
-    uint64_t spill_next = 0;
     bool spilling = false;
+    uint64_t block_dwords = 0;
     std::vector<uint32_t> first;
-    std::vector<uint32_t> spill;
     first.reserve(sig.params.size());
-    spill.reserve(sig.params.size());
+    out.block_dword.reserve(sig.params.size());
     for (size_t i = 0; i < sig.params.size(); ++i) {
         const RootParameter& p = sig.params[i];
         if (p.type != ParamType::Constants && p.type != ParamType::Descriptor && p.type != ParamType::Table) {
@@ -76,27 +79,26 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
         }
         // 0 for a constant parameter of 0 values, which then shares its first SGPR with the next parameter.
         const uint64_t dwords = stage_dwords(p.type, p.num_values);
+        // The block carries every parameter in order (measured: a fitting program's reads align to its bytes too,
+        // so the layer fills the whole block for every compute signature, not only the spilled tail).
+        out.block_dword.push_back(static_cast<uint32_t>(block_dwords));
+        block_dwords += dwords;
         if (!spilling && next + dwords <= kMaxUserSgprs) {
             first.push_back(static_cast<uint32_t>(next));
-            spill.push_back(kNoSpill);
             next += dwords;
-        } else if (stage == Stage::Compute) {
-            // Compute packs this parameter and every later one contiguously into the spill array behind s[0:1]
-            // (docs/d3d12_vulkan.md §3.5 & §7). Total spill stays bounded by kMaxD3d12Cost (<= 64 dwords).
+        } else if (model_spill) {
+            if (out.spill_start == kNoSgpr) out.spill_start = static_cast<uint32_t>(i);
             spilling = true;
             first.push_back(kNoSgpr);
-            spill.push_back(static_cast<uint32_t>(spill_next));
-            spill_next += dwords;
         } else {
             out.error = "root parameter " + std::to_string(i) + " does not fit in the user SGPRs from s" +
-                        std::to_string(out.base) + " (spill array not modelled)";
+                        std::to_string(out.base) + " (spill unmeasured for this stage)";
             return out;
         }
     }
     out.first_sgpr = std::move(first);
-    out.spill_dword = std::move(spill);
     out.end_sgpr = static_cast<uint32_t>(next);
-    out.spill_dwords = static_cast<uint32_t>(spill_next);
+    out.block_dwords = static_cast<uint32_t>(block_dwords);
     out.d3d12_cost = static_cast<uint32_t>(cost);
     out.ok = true;
     return out;

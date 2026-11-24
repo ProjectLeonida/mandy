@@ -16456,7 +16456,7 @@ public:
         layout.graphics_ok = graphics_ok;
         layout.mesh_ok = pixel.ok && mesh.ok;
         layout.compute_ok = compute.ok;
-        if (compute.ok && !compute.spill_dwords) layout.compute_arguments_end = compute.end_sgpr;
+        if (compute.ok && !compute.spills()) layout.compute_arguments_end = compute.end_sgpr;
         // Vertex, pixel and geometry shaders share the s8 layout and one user-data block (a non-compute stage
         // refuses a spill, so pixel.ok means every argument is inline).
         if (pixel.ok) layout.graphics_arguments_end = pixel.end_sgpr;
