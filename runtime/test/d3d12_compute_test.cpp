@@ -772,7 +772,7 @@ int main() {
             EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &deny_buf_desc,
                                                              D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                              IID_PPV_ARGS(&srv_deny.p))));
-            const auto srv_rb_desc = buffer_desc(6 * bytes, D3D12_RESOURCE_FLAG_NONE);
+            const auto srv_rb_desc = buffer_desc(8 * bytes, D3D12_RESOURCE_FLAG_NONE);
             EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &srv_rb_desc,
                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                              IID_PPV_ARGS(&srv_readback.p))));
@@ -848,10 +848,10 @@ int main() {
                 EXPECT(decode_slot(3, d3));
                 EXPECT(d3.address == srv_va && d3.stride == 16 && d3.num_records == 32 &&
                        d3.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT) &&
-                       d3.oob_select == leonida::gfx10::OobSelect::structured);
+                       d3.oob_select == leonida::gfx10::OobSelect::structured_with_offset);
                 EXPECT(decode_slot(4, d4));
                 EXPECT(d4.address == srv_va + 256 && d4.stride == 16 && d4.num_records == 32 &&
-                       d4.oob_select == leonida::gfx10::OobSelect::structured);
+                       d4.oob_select == leonida::gfx10::OobSelect::structured_with_offset);
                 EXPECT(decode_slot(5, d5));
                 const leonida::gfx10::Swizzle want_swz = {leonida::gfx10::select_z, leonida::gfx10::select_y,
                                                           leonida::gfx10::select_x, leonida::gfx10::select_one};
@@ -887,7 +887,7 @@ int main() {
             EXPECT(expect_zero_srv(srv_default.p, &bad));             // out of bounds (70 * 16 > 1024)
             EXPECT(expect_zero_srv(nullptr, &raw_a));                 // null resource -> null V#
 
-            // Upload buffer contents to arena and dispatch 6 GPU passes through the shader-visible descriptor table.
+            // Upload buffer contents to arena and dispatch 8 GPU passes through the shader-visible descriptor table.
             // out_a is already in D3D12_RESOURCE_STATE_UNORDERED_ACCESS at the end of the CBV pass.
             EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
             list->CopyBufferRegion(srv_default.p, 0, srv_upload.p, 0, buf_bytes);
@@ -901,6 +901,7 @@ int main() {
             const struct SrvDispatch {
                 UINT slot_idx;
                 UINT readback_offset;
+                UINT field_offset = 0;
             } srv_dispatches[] = {
                 {1, 0 * bytes},
                 {2, 1 * bytes},
@@ -908,10 +909,12 @@ int main() {
                 {4, 3 * bytes},
                 {5, 4 * bytes},
                 {7, 5 * bytes},
+                {3, 6 * bytes, 16},  // first dword past the structured record
+                {5, 7 * bytes, 16},  // same offset with the typed index-only check
             };
-            const std::uint32_t srv_mode[2] = {0u, 0xFFFFFFFFu};  // s1 == 0xFFFFFFFF selects buffer SRV V# mode
-            list->SetComputeRoot32BitConstants(0, 2, srv_mode, 0);
             for (const auto& cfg : srv_dispatches) {
+                const std::uint32_t args[2] = {cfg.field_offset, 0xFFFFFFFFu};
+                list->SetComputeRoot32BitConstants(0, 2, args, 0);
                 list->SetComputeRootDescriptorTable(2, slot_gpu(cfg.slot_idx));
                 list->Dispatch(1, 1, 1);
                 const auto to_src =
@@ -937,6 +940,11 @@ int main() {
             std::memcpy(srv_struct_b.data(), rb + 3 * bytes, bytes);
             std::memcpy(srv_typed.data(), rb + 4 * bytes, bytes);
             std::memcpy(srv_null.data(), rb + 5 * bytes, bytes);
+            const auto* cross_record = static_cast<const std::uint32_t*>(srv_res) + 6 * elements;
+            for (UINT i = 0; i < elements; ++i) {
+                EXPECT(cross_record[i] == 0u);
+                EXPECT(cross_record[elements + i] == (i < 24 ? 0x50000u + (9u + i) * 4u : 0u));
+            }
         }
 
         for (auto* r : {&out_a, &out_b, &out_c, &constants, &readback}) r->reset();
