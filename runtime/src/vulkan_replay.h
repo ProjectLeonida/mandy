@@ -2739,10 +2739,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             aspects &= available;
             if (!detail::view_range(p.binding, depth_clear->target, aspects, p.range))
                 return ReplayResult::invalid_subresource;
-            if (!aspects) p.skip = true;
-            if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, p.binding.aspects);
-                r != ReplayResult::success)
+            // View only the cleared aspect(s): Intel's Windows driver (101.6129, UHD Graphics 770) drops a
+            // stencil-only vkCmdClearAttachments when back-to-back depth-only and stencil-only rectangle clears
+            // share a combined DEPTH | STENCIL attachment view. Also skip view creation when !aspects (D3D-437).
+            if (!aspects) {
+                p.skip = true;
+            } else if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, aspects);
+                       r != ReplayResult::success) {
                 return r;
+            }
             if (!p.skip && p.rects.empty() && !vk.clear_depth_stencil_image) return ReplayResult::unsupported;
         } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
             const UavView& view = uav->view;

@@ -167,7 +167,8 @@ bool clear_depth_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned dep
                           FLOAT depth_full, UINT8 stencil_full, FLOAT depth_part, UINT8 stencil_part,
                           std::vector<unsigned char>& depth_pixels, std::vector<unsigned char>& stencil_pixels,
                           D3D12_CLEAR_FLAGS full_flags = D3D12_CLEAR_FLAGS(0),
-                          D3D12_CLEAR_FLAGS part_flags = D3D12_CLEAR_FLAGS(0), bool part_no_flags = false) {
+                          D3D12_CLEAR_FLAGS part_flags = D3D12_CLEAR_FLAGS(0), bool part_no_flags = false,
+                          bool split_plane_rects = false) {
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12GraphicsCommandList> list;
@@ -215,8 +216,14 @@ bool clear_depth_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned dep
         static_cast<D3D12_CLEAR_FLAGS>((has_stencil ? D3D12_CLEAR_FLAG_STENCIL : 0) | D3D12_CLEAR_FLAG_DEPTH);
     list->ClearDepthStencilView(handle, full_flags ? full_flags : flags, depth_full, stencil_full, 0, nullptr);
     const D3D12_RECT rect{1, 1, 4, 3};
-    list->ClearDepthStencilView(handle, part_no_flags ? D3D12_CLEAR_FLAGS(0) : (part_flags ? part_flags : flags),
-                                depth_part, stencil_part, 1, &rect);
+    if (split_plane_rects && has_stencil) {
+        list->ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_DEPTH, depth_part, 0, 1, &rect);
+        const D3D12_RECT stencil_rect{0, 0, 3, 2};
+        list->ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_STENCIL, 0.0f, stencil_part, 1, &stencil_rect);
+    } else {
+        list->ClearDepthStencilView(handle, part_no_flags ? D3D12_CLEAR_FLAGS(0) : (part_flags ? part_flags : flags),
+                                    depth_part, stencil_part, 1, &rect);
+    }
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = image.p;
@@ -669,6 +676,27 @@ int main(int argc, char** argv) {
                 return 1;
             if (actual != expected) {
                 std::fprintf(stderr, "D32_FLOAT stencil-flag case %u: depth readback differs from WARP\n", i);
+                ++format_failures;
+                continue;
+            }
+            ++cases_checked;
+        }
+        // Back-to-back depth-only then stencil-only rectangle clears on combined depth-stencil formats.
+        // Intel's Windows Vulkan driver (101.6129, UHD Graphics 770) drops the stencil-only vkCmdClearAttachments
+        // when both dynamic-rendering passes share a combined DEPTH | STENCIL attachment image view.
+        for (const DXGI_FORMAT ds_format : {DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT}) {
+            std::vector<unsigned char> actual, expected, actual_stencil, expected_stencil;
+            if (!clear_depth_and_read(ours.p, ds_format, 4, true, 0.25f, 0x5A, 0.75f, 0xA5, actual, actual_stencil,
+                                      D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, D3D12_CLEAR_FLAGS(0), false,
+                                      true) ||
+                !clear_depth_and_read(host.p, ds_format, 4, true, 0.25f, 0x5A, 0.75f, 0xA5, expected,
+                                      expected_stencil, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                                      D3D12_CLEAR_FLAGS(0), false, true))
+                return 1;
+            if (actual != expected || actual_stencil != expected_stencil) {
+                std::fprintf(stderr,
+                             "depth-stencil split-plane rect clear format %d: %s readback differs from WARP\n",
+                             int(ds_format), actual != expected ? "depth" : "stencil");
                 ++format_failures;
                 continue;
             }
