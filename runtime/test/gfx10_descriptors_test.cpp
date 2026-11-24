@@ -299,6 +299,10 @@ int main() {
     CHECK((one_field({.lod_bias = -100.0f}) == SamplerWords{0, 0, 0x2000, 0}));
     CHECK((one_field({.mag_filter = Filter::bilinear}) == SamplerWords{0, 0, 1u << 20, 0}));
     CHECK((one_field({.min_filter = Filter::aniso_bilinear}) == SamplerWords{0, 0, 3u << 22, 0}));
+    CHECK((one_field({.z_filter = Filter::point}) == SamplerWords{0, 0, 0u << 24, 0}));
+    CHECK((one_field({.z_filter = Filter::bilinear}) == SamplerWords{0, 0, 1u << 24, 0}));
+    CHECK((one_field({.z_filter = Filter::aniso_point}) == SamplerWords{0, 0, 2u << 24, 0}));
+    CHECK((one_field({.z_filter = Filter::aniso_bilinear}) == SamplerWords{0, 0, 3u << 24, 0}));
     CHECK((one_field({.mip_filter = MipFilter::linear}) == SamplerWords{0, 0, 2u << 26, 0}));
     CHECK((one_field({.border_color = BorderColor::opaque_white}) == SamplerWords{0, 0, 0, 2u << 30}));
     CHECK((one_field({.border_color = BorderColor::table, .border_color_index = 0xABC}) ==
@@ -331,8 +335,25 @@ int main() {
                               Sampler{.address_u = AddressMode::mirror_once_last_texel, .max_anisotropy = 4,
                                       .lod_bias = 31.0f, .border_color = BorderColor::table,
                                       .border_color_index = 4095, .unnormalized = true,
-                                      .filter_mode = FilterMode::minimum}})
+                                      .filter_mode = FilterMode::minimum},
+                              Sampler{.mag_filter = Filter::bilinear, .min_filter = Filter::point,
+                                      .z_filter = Filter::bilinear, .mip_filter = MipFilter::linear},
+                              Sampler{.mag_filter = Filter::point, .min_filter = Filter::bilinear,
+                                      .z_filter = Filter::aniso_bilinear}})
         CHECK(decode(encode(in)) == in);
+    // The volume filter is independent of XY and mip filtering, and every two-bit value survives a round trip.
+    for (std::uint32_t z = 0; z < 4; ++z) {
+        const Sampler in{.mag_filter = Filter::bilinear, .min_filter = Filter::point,
+                         .z_filter = Filter(z), .mip_filter = MipFilter::linear};
+        const SamplerWords words = encode(in);
+        CHECK(get(words[2], 24, 2) == z);
+        CHECK(decode(words) == in);
+    }
+    // Raw-word form: this also compiles against the old codec, where Z_FILTER was dropped and this check failed.
+    for (std::uint32_t z = 0; z < 4; ++z) {
+        const SamplerWords words{0, 0, (1u << 20) | (3u << 22) | (z << 24) | (2u << 26), 0};
+        CHECK(encode(decode(words)) == words);
+    }
     // MAX_ANISO_RATIO above 4 reads as 16x.
     CHECK(decode(SamplerWords{7u << 9, 0, 0, 0}).max_anisotropy == 16);
     CHECK(decode(SamplerWords{0, 0, 0x2000, 0}).lod_bias == -32.0f);

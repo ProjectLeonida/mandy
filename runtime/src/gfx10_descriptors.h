@@ -464,6 +464,7 @@ struct Sampler {
     AddressMode address_w = AddressMode::wrap;
     Filter mag_filter = Filter::point;
     Filter min_filter = Filter::point;
+    Filter z_filter = Filter::point;  // volume (W-axis) filter; D3D12's sampler desc has no separate Z field
     MipFilter mip_filter = MipFilter::none;
     std::uint32_t max_anisotropy = 1;
     CompareFunction compare = CompareFunction::never;  // never: not a comparison sampler, as radv writes it
@@ -497,7 +498,7 @@ inline constexpr std::uint32_t kCompareNever = 1u << 12;
 //          DEPTH_COMPARE_FUNC [14:12], FORCE_UNNORMALIZED [15], FILTER_MODE [30:29]
 //   WORD1  MIN_LOD [11:0], MAX_LOD [23:12]                       (4.8 fixed, clamped to 0..15)
 //   WORD2  LOD_BIAS [13:0] (signed 5.8 fixed, clamped to -32..31), XY_MAG_FILTER [21:20], XY_MIN_FILTER [23:22],
-//          MIP_FILTER [27:26]
+//          Z_FILTER [25:24], MIP_FILTER [27:26]
 //   WORD3  BORDER_COLOR_PTR [11:0], BORDER_COLOR_TYPE [31:30]
 // Mesa also sets tuning fields from the anisotropy (ANISO_THRESHOLD, ANISO_BIAS, PERF_MIP, ANISO_OVERRIDE) and
 // TRUNC_COORD for point filters. They are not written here, and decode() ignores them.
@@ -514,7 +515,7 @@ inline SamplerWords encode(const Sampler& sampler) {
                field(detail::unsigned_fixed(sampler.max_lod, 0, 15), 12, 12);
     words[2] = field(detail::signed_fixed(sampler.lod_bias, -32, 31), 0, 14) |
                field(std::uint32_t(sampler.mag_filter), 20, 2) | field(std::uint32_t(sampler.min_filter), 22, 2) |
-               field(std::uint32_t(sampler.mip_filter), 26, 2);
+               field(std::uint32_t(sampler.z_filter), 24, 2) | field(std::uint32_t(sampler.mip_filter), 26, 2);
     const bool marked = sampler.integer_border && sampler.border_color != BorderColor::table;
     words[3] = field(marked ? kIntegerBorderPtr : sampler.border_color_index, 0, 12) |
                field(std::uint32_t(sampler.border_color), 30, 2);
@@ -543,6 +544,7 @@ inline Sampler decode(const SamplerWords& words) {
     sampler.lod_bias = float(std::int32_t(bias ^ 0x2000u) - 0x2000) / 256.0f;  // sign-extend 14 bits
     sampler.mag_filter = Filter(get(words[2], 20, 2));
     sampler.min_filter = Filter(get(words[2], 22, 2));
+    sampler.z_filter = Filter(get(words[2], 24, 2));
     sampler.mip_filter = MipFilter(get(words[2], 26, 2));
     sampler.border_color_index = get(words[3], 0, 12);
     sampler.border_color = BorderColor(get(words[3], 30, 2));
