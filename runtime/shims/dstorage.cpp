@@ -11,8 +11,12 @@
 //   - A zlib request (ZlibDecompress alone) reads its source into a staging buffer, inflates it on the worker with
 //     the runtime's RFC 1950 inflater (leonida::zlib_inflate, src/shader_library.h) and copies the result to the
 //     destination only when it is exactly DestinationSize bytes; a stream that fails leaves the destination as it was.
-//   - BCPack, swizzle and physical-page requests fail with E_NOTIMPL for now (later PRs: they become stages between
-//     the read and the destination write, BCPack after the inflate).
+//   - A BCPack request (BcpackMode, with or without ZlibDecompress) reads its source into a staging buffer, inflates
+//     it to IntermediateSize bytes first when it is zlib too, decodes the BCPack chunk into BCn blocks on the worker
+//     (leonida::bcpack, src/bcpack.h, lenient: blocks that rest on an unknown built-in history entry are decoded and
+//     logged) and copies the blocks to the destination only when all of them decoded.
+//   - Swizzle and physical-page requests fail with E_NOTIMPL for now (later PRs: swizzle becomes a stage after the
+//     BCPack decode).
 // Nothing here goes online or touches the GPU.
 #include <windows.h>
 #include <d3d12.h>
@@ -32,6 +36,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../src/bcpack.h"          // leonida::bcpack::decode
 #include "../src/shader_library.h"  // leonida::zlib_inflate
 #include "dstorage_xs_abi.h"
 #include "shims.h"
@@ -796,8 +801,13 @@ private:
         if (options::source_type(o) != desc_.SourceType) return E_DSTORAGE_INVALID_SOURCE_TYPE;
         if (options::bcpack(o) > DSTORAGE_BCPACK_MODE_BC7) return E_DSTORAGE_INVALID_BCPACK_MODE;
         if (options::swizzle(o) > DSTORAGE_SWIZZLE_MODE_4K_12K_4K_12K) return E_DSTORAGE_INVALID_SWIZZLE_MODE;
-        if (options::bcpack(o) != 0 || options::swizzle(o) != 0) {
-            log_once("decompress", "BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
+        if (options::swizzle(o) != 0) {
+            log_once("swizzle", "swizzle requests are not implemented yet (E_NOTIMPL)");
+            return E_NOTIMPL;
+        }
+        const unsigned bcpack = static_cast<unsigned>(options::bcpack(o));
+        if (bcpack != 0 && leonida::bcpack::block_bytes(bcpack) == 0) {
+            log_once("bcpack mode", "a BCPack request names a mode with no BCPack form (BC2)");
             return E_NOTIMPL;
         }
         if (o & (options::kDestinationPages | options::kSourcePages)) {
@@ -805,12 +815,15 @@ private:
             return E_NOTIMPL;
         }
         const bool zlib = options::zlib(o);
-        // IntermediateSize is the BCPack data's size between the inflate and the BCPack decode (DSTORAGE_REQUEST), so
-        // it is 0 for every request that gets here (BCPack is refused above).
-        if (r.IntermediateSize != 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
+        // IntermediateSize is the BCPack data's size between the inflate and the BCPack decode (DSTORAGE_REQUEST): set
+        // exactly when the request is both zlib and BCPack, 0 otherwise. It bounds a staging buffer, so it is held
+        // to the same limit as a destination.
+        if ((r.IntermediateSize != 0) != (zlib && bcpack != 0)) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
+        if (r.IntermediateSize > kMax4kPageDestinationSize) return E_DSTORAGE_REQUEST_TOO_LARGE;
         // E_DSTORAGE_INVALID_DESTINATION_SIZE: without decompression DestinationSize must equal the source's length,
-        // with it it must be larger (dstorageerr.h's description; DSTORAGE_REQUEST says the same of DestinationSize).
-        if (zlib ? r.DestinationSize <= r.SourceSize : r.DestinationSize != r.SourceSize)
+        // with zlib it must be larger (dstorageerr.h's description; DSTORAGE_REQUEST says the same of DestinationSize).
+        // A BCPack chunk only has to decode to something: its size against the source depends on the texture.
+        if (bcpack ? r.DestinationSize == 0 : zlib ? r.DestinationSize <= r.SourceSize : r.DestinationSize != r.SourceSize)
             return E_DSTORAGE_INVALID_DESTINATION_SIZE;
         const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
         const uint64_t total = static_cast<uint64_t>(r.DestinationSize) + (memory ? r.SourceSize : 0u);
@@ -828,6 +841,7 @@ private:
             if (!r.File) return E_INVALIDARG;
             if (!e.file_counted) return E_DSTORAGE_FILE_NOT_OPEN;
         }
+        if (bcpack) return unpack_request(e, memory, bcpack);
         if (zlib) return inflate_request(e, memory);
         if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
         if (memory) return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
@@ -862,26 +876,84 @@ private:
         }
         log_once("zlib", "zlib requests are inflated on the CPU (RFC 1950, leonida::zlib_inflate)");
         set_decompression_pending(+1);
-        leonida::ZlibError why = leonida::ZlibError::none;
-        const bool inflated = leonida::zlib_inflate(source, result, r.DestinationSize, &why);
+        const HRESULT hr = inflate_exact(source, result, r.DestinationSize);
         set_decompression_pending(-1);
-        HRESULT hr = S_OK;
-        if (!inflated) {
-            switch (why) {
-                case leonida::ZlibError::header: hr = E_DSTORAGE_ZLIB_BAD_HEADER; break;
-                case leonida::ZlibError::checksum: hr = E_DSTORAGE_ZLIB_PARITY_FAIL; break;
-                case leonida::ZlibError::limit: hr = E_DSTORAGE_DECOMPRESSION_ERROR; break;  // longer than the destination
-                default: hr = E_DSTORAGE_ZLIB_BAD_DATA; break;
-            }
-        } else if (result.size() != r.DestinationSize) {
-            hr = E_DSTORAGE_DECOMPRESSION_ERROR;  // shorter than the destination
-        }
-        if (FAILED(hr)) {
-            std::lock_guard lock(stats().mutex);
-            ++stats().s.DecompressionErrors;
-            return hr;
-        }
+        if (FAILED(hr)) return count_decompression_error(hr);
         return guarded_move(r.Destination, result.data(), result.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
+    }
+
+    // Inflates `source` into exactly `size` bytes of `result`, or the E_DSTORAGE code of how the stream failed.
+    static HRESULT inflate_exact(const std::vector<uint8_t>& source, std::vector<uint8_t>& result, uint32_t size) {
+        leonida::ZlibError why = leonida::ZlibError::none;
+        if (!leonida::zlib_inflate(source, result, size, &why)) {
+            switch (why) {
+                case leonida::ZlibError::header: return E_DSTORAGE_ZLIB_BAD_HEADER;
+                case leonida::ZlibError::checksum: return E_DSTORAGE_ZLIB_PARITY_FAIL;
+                case leonida::ZlibError::limit: return E_DSTORAGE_DECOMPRESSION_ERROR;  // longer than the destination
+                default: return E_DSTORAGE_ZLIB_BAD_DATA;
+            }
+        }
+        return result.size() == size ? S_OK : E_DSTORAGE_DECOMPRESSION_ERROR;  // shorter than the destination
+    }
+
+    static HRESULT count_decompression_error(HRESULT hr) {
+        std::lock_guard lock(stats().mutex);
+        ++stats().s.DecompressionErrors;
+        return hr;
+    }
+
+    // A BCPack request whose checks have passed: the source goes into a staging buffer, is inflated to
+    // IntermediateSize bytes first when the request is zlib too, and is decoded into DestinationSize bytes of BCn
+    // blocks (leonida::bcpack::decode, lenient). The blocks reach the destination only when the whole chunk decoded,
+    // so a failed one leaves the destination as it was. A chunk that rests on built-in history nobody has measured
+    // (BC6H and BC7 have none) decodes with a few wrong blocks rather than failing, and is logged once.
+    HRESULT unpack_request(const Entry& e, bool memory, unsigned mode) {
+        const DSTORAGE_REQUEST& r = e.request;
+        std::vector<uint8_t> source, blocks;
+        try {
+            source.resize(r.SourceSize);
+            blocks.resize(r.DestinationSize);
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        if (r.SourceSize != 0) {
+            if (memory) {
+                if (!guarded_move(source.data(), r.Source, r.SourceSize)) return E_DSTORAGE_ACCESS_VIOLATION;
+            } else if (const HRESULT hr = read_file_range(e.file->handle(), r.FileOffset, source.data(), r.SourceSize);
+                       FAILED(hr)) {
+                return hr;
+            }
+        }
+        log_once("bcpack", "BCPack requests are decoded on the CPU (leonida::bcpack)");
+        set_decompression_pending(+1);
+        HRESULT hr = S_OK;
+        if (options::zlib(r.Options.AsUINT64)) {
+            std::vector<uint8_t> packed;
+            try {
+                packed.reserve(r.IntermediateSize);
+            } catch (const std::bad_alloc&) {
+                set_decompression_pending(-1);
+                return E_OUTOFMEMORY;
+            }
+            hr = inflate_exact(source, packed, r.IntermediateSize);
+            source.swap(packed);
+        }
+        leonida::bcpack::Result decoded{};
+        if (SUCCEEDED(hr)) {
+            decoded = leonida::bcpack::decode(source, mode, blocks, leonida::bcpack::Options{nullptr, true});
+            if (decoded.status != leonida::bcpack::Status::ok) {
+                log_once(std::string("bcpack ") + leonida::bcpack::status_name(decoded.status),
+                         std::string("a BCPack request could not be decoded: ") +
+                             leonida::bcpack::status_name(decoded.status));
+                hr = E_DSTORAGE_DECOMPRESSION_ERROR;
+            }
+        }
+        set_decompression_pending(-1);
+        if (FAILED(hr)) return count_decompression_error(hr);
+        if (decoded.guessed)
+            log_once("bcpack guessed",
+                     "a BCPack chunk rests on built-in history nobody has measured: some of its blocks are guessed");
+        return guarded_move(r.Destination, blocks.data(), blocks.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
     }
 
     void set_pending(int delta) {

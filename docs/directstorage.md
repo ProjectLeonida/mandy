@@ -92,12 +92,14 @@ The first boot with the executable settles most of this: the dry-run report show
      (`E_DSTORAGE_INVALID_FILE_HANDLE`);
   3. reserved option bits (`E_DSTORAGE_RESERVED_FIELDS`), then the source type against the queue's
      (`E_DSTORAGE_INVALID_SOURCE_TYPE`);
-  4. BCPack mode above 7, swizzle mode above 4 (`_INVALID_BCPACK_MODE`, `_INVALID_SWIZZLE_MODE`), then BCPack or
-     swizzle, with or without zlib, then physical pages (`E_NOTIMPL`, logged once: later PRs);
-  5. an `IntermediateSize` (`_INVALID_INTERMEDIATE_SIZE`: it is the size between the inflate and the BCPack decode,
-     so only a zlib + BCPack request has one), a `DestinationSize` other than `SourceSize` without zlib, or not
-     larger than `SourceSize` with it (`_INVALID_DESTINATION_SIZE`: the rule `dstorageerr.h` gives for that code,
-     and what `DSTORAGE_REQUEST` says of `DestinationSize`), more than 1 GiB in total, then a buffer over 32 MiB
+  4. BCPack mode above 7, swizzle mode above 4 (`_INVALID_BCPACK_MODE`, `_INVALID_SWIZZLE_MODE`), then swizzle,
+     BCPack mode 2 (BC2 has no BCPack form) and physical pages (`E_NOTIMPL`, logged once: later PRs);
+  5. an `IntermediateSize` on any but a zlib + BCPack request, or none on one (`_INVALID_INTERMEDIATE_SIZE`: it is the
+     size between the inflate and the BCPack decode), an `IntermediateSize` over 32 MiB (`_REQUEST_TOO_LARGE`), a
+     `DestinationSize` other than `SourceSize` without decompression, not larger than `SourceSize` with zlib alone, or
+     0 with BCPack (`_INVALID_DESTINATION_SIZE`: the rule `dstorageerr.h` gives for that code, and what
+     `DSTORAGE_REQUEST` says of `DestinationSize`; a BCPack chunk's size against its blocks depends on the texture),
+     more than 1 GiB in total, then a buffer over 32 MiB
      (`_REQUEST_TOO_LARGE` for both: `DSTORAGE_REQUEST` allows a buffer over 32 MiB only with 64 KiB or 2 MiB pages,
      which are not implemented yet; the source is never larger than the destination here, so the destination's
      limit covers it), then a zlib file request whose `FileOffset` is not 16-byte aligned (`_INVALID_FILE_OFFSET`,
@@ -132,6 +134,18 @@ The first boot with the executable settles most of this: the dry-run report show
 
   The inflater decodes one bit at a time, on the queue's worker: correct, not fast. A faster decoder (table lookup)
   can replace it behind `zlib_inflate` without touching the request path.
+- **BCPack** (`BcpackMode` 1, 3, 4, 5, 6 or 7, with or without `ZlibDecompress`): the source is read into a staging
+  buffer, inflated first to exactly `IntermediateSize` bytes when the request is zlib too (the same inflater and
+  failure codes as above), then decoded into `DestinationSize` bytes of BCn blocks by the runtime's BCPack decoder
+  (`runtime/src/bcpack.h`, library `gta6rt_bcpack`, a port of `tools/bcpack.py` for all six modes). The request path
+  decodes leniently: a block that rests on built-in history nobody has measured (all of BC6H's and BC7's) is rebuilt
+  from the zero state, as `bcpack.decode(..., allow_provisional=True)` does, and the request still succeeds, with a
+  line logged once, so a texture has a few wrong blocks instead of missing. A chunk the decoder refuses (a corrupt
+  stream, non-zero bytes after it, a destination that is not whole blocks, a BC6H mode or BC7 signature outside its
+  table) fails with `E_DSTORAGE_DECOMPRESSION_ERROR` and leaves the destination as it was. Decoded BCPack requests count
+  in the decompression statistics like zlib ones. `bcpack_test` checks the decoder against the Python one on
+  synthetic chunks (`runtime/test/bcpack_vectors.py`): strict decoding on all of them, lenient BC6H and BC7 decoding
+  against Python's provisional mode. Swizzle is not applied (no request measured on the retail title asks for it).
 - **Cancel**: `CancelRequestsWithTag(mask, value)` marks every request enqueued before the call and not yet started
   whose `(CancellationTag & mask) == value`. A cancelled request completes as a success without reading and is not
   counted as a failure, as the overview and the reference say, even when it also had an error found at enqueue.
@@ -154,20 +168,12 @@ The first boot with the executable settles most of this: the dry-run report show
 
 ## Not done yet (later PRs)
 
-- **BCPack** (`BcpackMode`; `tools/bcpack.py` is the reference decoder), then **swizzle** (`SwizzleMode`). The
-  decode order is DEFLATE, BCPack, swizzle; with both zlib and BCPack `IntermediateSize` is the size between them
-  (the inflate's output, the BCPack decoder's input), and `FileOffset` must be 16-byte aligned. Each becomes a stage
-  after `inflate_request`'s inflate and before its destination write, so the request checks above stay where they
-  are. **The decoder itself exists** (`runtime/src/bcpack.h`, library `gta6rt_bcpack`, RT-BCPACK-DECODER): a port
-  of `tools/bcpack.py`'s lane layer and of its rebuilds for all six modes (BC1, BC3, BC4, BC5, BC6H, BC7), with the user's calibrated
-  history as an optional `History`. It has two policies: strict (the default), like `bcpack.decode`, refuses a chunk
-  that needs an unconfirmed history entry, an inferred BC7 signature, or a BC6H/BC7 block whose anchor or p-bit check fails;
-  lenient, for the request path, decodes such blocks anyway (from the zero state where the history is unknown, which
-  is all of BC6H's and BC7's built-in history today) and reports how many in `Result::guessed`, so a texture comes with a few
-  wrong blocks instead of missing. `bcpack_test` checks strict decoding against the Python decoder and lenient BC7
-  and BC6H decoding against its provisional mode, on synthetic chunks (`runtime/test/bcpack_vectors.py`). What is left here is the wiring: call `bcpack::decode` from `execute_request` once destination
-  pages exist, since every BCPack request measured on the retail title (modes 1, 5 and 7, issue #14 comment
-  7135719755) also has the destination-pages bit.
+- **Swizzle** (`SwizzleMode`): the decode order is DEFLATE, BCPack, swizzle, so it becomes a stage after the BCPack
+  decode and before the destination write. No request measured on the retail title asks for it.
+- **The user's calibrated BCPack history** (`bcpack::History`, from `tools/bcpack_history_calib.py`'s tables): with it,
+  the blocks the request path decodes from the zero state today would decode exactly. Every BCPack request measured
+  on the retail title (modes 1, 5 and 7, issue #14 comment 7135719755) also has the destination-pages bit, so they
+  reach the decoder once destination pages are served (RT-DSTORAGE-DEST-PAGES).
 - **Physical pages** (`SourceIsPhysicalPages`, `DestinationIsPhysicalPages`): arrays of 64 KiB page numbers from
   `XMemAllocatePhysicalPages`; needs the `xmem` shim to translate a page number to the address it mapped.
 - **GPU memory**: the console API has no GPU destinations of its own (memory is unified, so a destination is an
@@ -191,8 +197,12 @@ fixed-Huffman block) from text the test rebuilds, and stored-block streams the t
 block followed by the dynamic one. They are read from a file and from memory (also in place); a bad header, a
 preset dictionary, a reserved block type, a truncated stream, an Adler-32 mismatch, a stream shorter and one longer
 than `DestinationSize`, a stored stream larger than its result, an unaligned offset, an `IntermediateSize`, zlib with
-BCPack or swizzle (`E_NOTIMPL`), an unreadable source and an unwritable destination each get their code, a failed
-stream leaves its destination untouched, and the decompression statistics count them.
+swizzle (`E_NOTIMPL`), zlib with BCPack whose stream is longer than its `IntermediateSize`, an unreadable source and an
+unwritable destination each get their code, a failed stream leaves its destination untouched, and the decompression
+statistics count them. BCPack requests use chunks of `runtime/test/bcpack_vectors.h` from memory: BC1 and BC7 chunks
+decode to the Python decoder's blocks, a BC7 chunk on unknown built-in history to its provisional blocks, a BC1 chunk
+inside a stored zlib stream to the same blocks; a corrupt chunk, a destination that is not whole blocks, a zlib +
+BCPack request without an `IntermediateSize` and a BCPack request with no destination size each get their code.
 
 ## Sources and licences
 

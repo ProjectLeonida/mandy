@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include "bcpack_vectors.h"  // synthetic BCPack chunks and what tools/bcpack.py decodes from them
 #include "dstorage_xs_abi.h"
 #include "file_system.h"
 #include "shims.h"
@@ -403,8 +404,8 @@ void test_reads_and_errors(Env& env) {
         r.Options.ZlibDecompress = 1;
         cases.push_back({r, E_DSTORAGE_INVALID_DESTINATION_SIZE, "zlib with DestinationSize equal to SourceSize"});
         r = file_request(b, 0, few.data(), 8);
-        r.Options.BcpackMode = DSTORAGE_BCPACK_MODE_BC1;
-        cases.push_back({r, E_NOTIMPL, "BCPack is not implemented yet"});
+        r.Options.BcpackMode = DSTORAGE_BCPACK_MODE_BC2;
+        cases.push_back({r, E_NOTIMPL, "BCPack mode 2 (BC2 has no BCPack form)"});
         r = file_request(b, 0, few.data(), 8);
         r.Options.SwizzleMode = DSTORAGE_SWIZZLE_MODE_4K_4K_8K;
         cases.push_back({r, E_NOTIMPL, "swizzle is not implemented yet"});
@@ -1122,7 +1123,8 @@ void test_zlib(Env& env) {
         {file.size() - 16, 32, 64, E_DSTORAGE_END_OF_FILE, nullptr, "a zlib source past the end of the file"},
         {at_dynamic, z, 3191, E_DSTORAGE_INVALID_INTERMEDIATE_SIZE, nullptr, "zlib with an IntermediateSize", 0,
          16},
-        {at_dynamic, z, 3191, E_NOTIMPL, nullptr, "zlib and BCPack is not implemented yet",
+        {at_dynamic, z, 3191, E_DSTORAGE_DECOMPRESSION_ERROR, nullptr,
+         "zlib and BCPack: the stream inflates past IntermediateSize",
          static_cast<uint64_t>(DSTORAGE_BCPACK_MODE_BC1) << options::kBcpackShift, 64},
         {at_dynamic, z, 3191, E_NOTIMPL, nullptr, "zlib and swizzle is not implemented yet",
          static_cast<uint64_t>(DSTORAGE_SWIZZLE_MODE_4K_4K_8K) << options::kSwizzleShift},
@@ -1206,18 +1208,107 @@ void test_zlib(Env& env) {
     ms->Release();
     mq->Release();
 
-    // Counted when the inflate starts: the 11 file requests (4 good, 7 bad streams) and 4 memory requests (all but the
-    // unreadable source) whose checks passed and whose source was read. Failed: the 7 bad file streams and the memory
-    // one with an Adler-32 mismatch; a destination the process cannot write is not a decompression error.
+    // Counted when the inflate starts: the 12 file requests (4 good, 7 bad streams, and the zlib and BCPack one) and 4
+    // memory requests (all but the unreadable source) whose checks passed and whose source was read. Failed: the 7 bad
+    // file streams, the zlib and BCPack one whose stream is longer than its IntermediateSize, and the memory one with
+    // an Adler-32 mismatch; a destination the process cannot write is not a decompression error.
     DSTORAGE_STATS after{};
     env.factory->GetStats(&after);
-    check(after.TotalDecompressionRequestCount - before.TotalDecompressionRequestCount == 15,
+    check(after.TotalDecompressionRequestCount - before.TotalDecompressionRequestCount == 16,
           "TotalDecompressionRequestCount counts the zlib requests that reached the inflate");
-    check(after.DecompressionErrors - before.DecompressionErrors == 8, "DecompressionErrors counts the bad streams");
+    check(after.DecompressionErrors - before.DecompressionErrors == 9, "DecompressionErrors counts the bad streams");
     check(after.PendingDecompressionRequestCount == 0, "no decompression is pending afterwards");
 }
 
 }  // namespace
+
+// ---- BCPack requests -----------------------------------------------------------------------------------------------
+//
+// Synthetic chunks only: bcpack_vectors.h (runtime/test/bcpack_vectors.py) holds BCPack chunks made by
+// tests/test_bcpack.py's encoder and the blocks the Python decoder rebuilds from them; bcpack_test checks the decoder
+// on all of them. Here a few go through the queue: plain and zlib-wrapped, a chunk that only lenient decoding takes
+// (the request path decodes leniently), a corrupt one, and the size rules of a BCPack request.
+void test_bcpack(Env& env) {
+    using bcpack_vectors::BlockCase;
+    const auto find = [](auto pick) -> const BlockCase* {
+        for (const BlockCase& c : bcpack_vectors::kBlockCases)
+            if (pick(c)) return &c;
+        return nullptr;
+    };
+    const BlockCase* bc1 = find([](const BlockCase& c) { return c.mode == 1 && c.status == 0 && c.out_size >= 64; });
+    const BlockCase* bc7 = find([](const BlockCase& c) { return c.mode == 7 && c.status == 0 && c.out_size >= 64; });
+    const BlockCase* guessed = find([](const BlockCase& c) { return c.mode == 7 && c.status == 7 && c.lenient_known; });
+    const BlockCase* corrupt = find([](const BlockCase& c) { return c.status == 3; });
+    check(bc1 && bc7 && guessed && corrupt, "the BCPack vectors hold the chunks this test needs");
+    if (!(bc1 && bc7 && guessed && corrupt)) return;
+
+    const std::vector<uint8_t> bc1_raw(bc1->raw, bc1->raw + bc1->raw_size);
+    const std::vector<uint8_t> bc1_zlib = stored_stream(bc1_raw);
+    struct Case {
+        const uint8_t* source;
+        uint32_t source_size, destination, intermediate;
+        uint64_t options;
+        HRESULT want;
+        const uint8_t* expected;  // null: the destination stays untouched
+        const char* what;
+    };
+    const auto mode = [](unsigned m) { return static_cast<uint64_t>(m) << options::kBcpackShift; };
+    const std::vector<Case> cases = {
+        {bc1->raw, static_cast<uint32_t>(bc1->raw_size), static_cast<uint32_t>(bc1->out_size), 0, mode(1), S_OK,
+         bc1->blocks, "a BC1 BCPack request decodes to the Python decoder's blocks"},
+        {bc7->raw, static_cast<uint32_t>(bc7->raw_size), static_cast<uint32_t>(bc7->out_size), 0, mode(7), S_OK,
+         bc7->blocks, "a BC7 BCPack request decodes to the Python decoder's blocks"},
+        {guessed->raw, static_cast<uint32_t>(guessed->raw_size), static_cast<uint32_t>(guessed->out_size), 0, mode(7),
+         S_OK, guessed->lenient_blocks, "a BC7 chunk on unknown built-in history decodes as Python's provisional mode"},
+        {corrupt->raw, static_cast<uint32_t>(corrupt->raw_size), static_cast<uint32_t>(corrupt->out_size), 0,
+         mode(corrupt->mode), E_DSTORAGE_DECOMPRESSION_ERROR, nullptr, "a corrupt BCPack chunk"},
+        {bc1_zlib.data(), static_cast<uint32_t>(bc1_zlib.size()), static_cast<uint32_t>(bc1->out_size),
+         static_cast<uint32_t>(bc1->raw_size), options::kZlib | mode(1), S_OK, bc1->blocks,
+         "a zlib and BCPack request inflates to IntermediateSize, then decodes"},
+        {bc1_zlib.data(), static_cast<uint32_t>(bc1_zlib.size()), static_cast<uint32_t>(bc1->out_size),
+         static_cast<uint32_t>(bc1->raw_size) - 1, options::kZlib | mode(1), E_DSTORAGE_DECOMPRESSION_ERROR, nullptr,
+         "a zlib and BCPack request whose stream is longer than IntermediateSize"},
+        {bc1_zlib.data(), static_cast<uint32_t>(bc1_zlib.size()), static_cast<uint32_t>(bc1->out_size), 0,
+         options::kZlib | mode(1), E_DSTORAGE_INVALID_INTERMEDIATE_SIZE, nullptr,
+         "a zlib and BCPack request without an IntermediateSize"},
+        {bc1->raw, static_cast<uint32_t>(bc1->raw_size), 0, 0, mode(1), E_DSTORAGE_INVALID_DESTINATION_SIZE, nullptr,
+         "a BCPack request with no destination size"},
+        {bc1->raw, static_cast<uint32_t>(bc1->raw_size), static_cast<uint32_t>(bc1->out_size) - 4, 0, mode(1),
+         E_DSTORAGE_DECOMPRESSION_ERROR, nullptr, "a BCPack destination that is not whole blocks"},
+    };
+
+    IDStorageQueueX2* q = make_queue(env, 0x80, true, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+    IDStorageStatusArrayX* s = make_status(env, static_cast<UINT32>(cases.size()));
+    constexpr size_t kSlack = 64;  // past DestinationSize: must stay untouched
+    std::vector<std::vector<uint8_t>> out(cases.size());
+    for (size_t i = 0; i < cases.size(); ++i) {
+        const Case& c = cases[i];
+        out[i].assign(c.destination + kSlack, 0xEE);
+        DSTORAGE_REQUEST r{};
+        r.Options.AsUINT64 = options::kSourceMemory | c.options;
+        r.Source = c.source;
+        r.SourceSize = c.source_size;
+        r.Destination = out[i].data();
+        r.DestinationSize = c.destination;
+        r.IntermediateSize = c.intermediate;
+        q->EnqueueRequest(&r);
+        q->EnqueueStatus(s, static_cast<UINT32>(i));
+    }
+    q->Submit();
+    check(wait_complete(s, static_cast<UINT32>(cases.size() - 1)), "the BCPack requests complete");
+    for (size_t i = 0; i < cases.size(); ++i) {
+        const Case& c = cases[i];
+        check_hr(s->GetHResult(static_cast<UINT32>(i)), c.want, c.what);
+        const bool head = c.expected ? std::equal(c.expected, c.expected + c.destination, out[i].begin())
+                                     : std::all_of(out[i].begin(), out[i].begin() + c.destination,
+                                                   [](uint8_t x) { return x == 0xEE; });
+        const bool tail = std::all_of(out[i].end() - kSlack, out[i].end(), [](uint8_t x) { return x == 0xEE; });
+        check(head && tail, c.expected ? "the decoded blocks, and nothing past them"
+                                       : "a failed BCPack request leaves the destination untouched");
+    }
+    s->Release();
+    q->Release();
+}
 
 int main() {
     wchar_t temp[MAX_PATH];
@@ -1253,6 +1344,7 @@ int main() {
     test_stats_timing(env);
     test_stats(env);
     test_zlib(env);  // after test_stats, whose request totals it would change
+    test_bcpack(env);
 
     fs::remove_all(env.root, ec);
     std::printf("dstorage: %d checks, %d failures\n", g_checks, g_failures);
