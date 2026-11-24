@@ -1932,7 +1932,18 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     // Without a handler (a PC device behind the proxy, or none registered) the slot refuses like any slot past the
     // PC vtable, whatever its arguments.
     const PlacedAtVaHandler handler = g_placed_at_va.load(std::memory_order_acquire);
-    if (!handler) return E_NOTIMPL;
+    if (!handler) {
+        // Measured on the retail 1.0.2.1 executable under gta6rt --run with the host's D3D12 device: the title takes
+        // this refusal as a failed graphics init and stops at an int3 a few calls later, with nothing in the log
+        // pointing here. Only the Vulkan device registers a handler, so name the switch once.
+        static std::atomic<bool> hinted{false};
+        if (!hinted.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 133 CreatePlacedResourceX: no handler behind this device -> E_NOTIMPL; "
+                         "only the Vulkan device serves it (set LEONIDA_D3D12=vulkan)\n");
+        }
+        return E_NOTIMPL;
+    }
     if (!out || !xbox_desc || !riid) return E_POINTER;
     // An integer mask: a D3D12_RESOURCE_FLAGS constant past the SDK's last enumerator is not a constant expression
     // for clang-cl with SDK 10.0.26100 (found in review). The cast is applied to the masked value at run time.

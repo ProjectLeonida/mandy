@@ -150,12 +150,17 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params = null\n");
     }
 
+    // Logged once, naming the device that actually goes behind the proxy: the Vulkan branch below returns before the
+    // host's D3D12 device is created, so a single message here would name the wrong one on that path.
     static std::atomic<bool> proxy_logged{false};
-    if (!proxy_logged.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the PC ID3D12Device in the Xbox-ABI proxy "
-                     "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n");
-    }
+    const auto log_proxy = [](const char* device) {
+        if (!proxy_logged.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the %s in the Xbox-ABI proxy "
+                         "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n",
+                         device);
+        }
+    };
 
 #ifdef LEONIDA_VULKAN_DEVICE
     // Opt-in until the Vulkan device covers the first frame: LEONIDA_D3D12=vulkan puts the Vulkan-backed device
@@ -163,6 +168,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     char backend[16] = {};
     size_t backend_length = 0;
     if (getenv_s(&backend_length, backend, "LEONIDA_D3D12") == 0 && std::strcmp(backend, "vulkan") == 0) {
+        log_proxy("Vulkan-backed ID3D12Device (LEONIDA_D3D12=vulkan)");
         ID3D12Device* vulkan = nullptr;
         HRESULT vhr = rt::d3d12::create_vulkan_device_standalone(
             __uuidof(ID3D12Device), reinterpret_cast<void**>(&vulkan), rt::d3d12::QueueTestSettings::ignore);
@@ -186,6 +192,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     }
 #endif
 
+    log_proxy("host's PC ID3D12Device");
     static auto create = reinterpret_cast<CreateDeviceFn>(host("D3D12CreateDevice"));
     if (!create) return result(method, E_NOTIMPL);
 
