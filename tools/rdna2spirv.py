@@ -5906,6 +5906,9 @@ class Gen:
             sgl = self.tmp()
             self.emit(f"{sgl} = OpLoad %uint %sg_lane")
             self.emit(f"{half} = OpBitwiseAnd %uint {sgl} {self.cu(32)}")
+            self_lane = sgl
+        else:
+            self_lane = lane
         bal = self.tmp()
         self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
         acc = self.cu(0)
@@ -5914,12 +5917,13 @@ class Gen:
             if self.wave64 or self.wave32_fragment:
                 src = self.tmp()
                 self.emit(f"{src} = OpBitwiseOr %uint {half} {self.cu(j)}")
-            ex, shv, v, shd, hit, nxt = (self.tmp() for _ in range(6))
-            # a shuffle from a lane that isn't running (the missing lanes of a partial wave) is undefined
+            ex, safe_src, shv, v, shd, hit, nxt = (self.tmp() for _ in range(7))
+            # Redirect absent source lanes before the shuffle: even a masked undefined result is undefined.
             self.emit(f"{ex} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {src}")
-            self.emit(f"{shv} = OpGroupNonUniformShuffle %uint %c3 {tp} {src}")
+            self.emit(f"{safe_src} = OpSelect %uint {ex} {src} {self_lane}")
+            self.emit(f"{shv} = OpGroupNonUniformShuffle %uint %c3 {tp} {safe_src}")
             self.emit(f"{v} = OpSelect %uint {ex} {shv} {self.cu(0)}")
-            self.emit(f"{shd} = OpGroupNonUniformShuffle %uint %c3 {dat} {src}")
+            self.emit(f"{shd} = OpGroupNonUniformShuffle %uint %c3 {dat} {safe_src}")
             self.emit(f"{hit} = OpIEqual %bool {v} {mine}")
             self.emit(f"{nxt} = OpSelect %uint {hit} {shd} {acc}")
             acc = nxt
@@ -7140,6 +7144,8 @@ class Gen:
             kv = dict(m.split(":", 1) for m in mods if m.split(":", 1)[0] in ("src0_sel", "src1_sel", "dst_sel", "dst_unused"))
             args = [dict(x) for x in ins["args"]]
             first = 0 if op.startswith("v_cmpx") else 1
+            if op in ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32") and len(args) > 3:
+                first = 2    # vdst, carry-out, src0, src1, carry-in; the short form (3 operands) has no carry-out
             for i, key in enumerate(("src0_sel", "src1_sel")):
                 j = first + i
                 if j < len(args) and (kv.get(key, "DWORD") != "DWORD" or args[j].get("sext")):
@@ -9933,18 +9939,28 @@ class Gen:
                 self.emit(f"{cin} = OpSelect %uint {self.tmp_bool_nz(cin_m)} {self.cu(1)} {self.cu(0)}")
             else:
                 cin = self.cu(0)
-            s1, c1, s2, c2, r, carry = (self.tmp() for _ in range(6))
-            if sub:
-                self.emit(f"{s1} = OpISubBorrow %umul {x} {y}")
+            if sub and srcs[0] == srcs[1]:
+                # x - x: the difference is 0 and there is no borrow, so D = 0 - carry in and the borrow out is the
+                # carry in. Written out instead of OpISubBorrow %x %x: AMD's Windows driver (amdvlk64.dll,
+                # 32.0.21037.1004 and 32.0.21045.29003, gfx1036) dies with an access violation creating a native
+                # wave64 compute pipeline in which that borrow predicates a subgroup shuffle's value
+                # (docs/design.md, "Carry-out subtract of a register from itself").
+                r = self.tmp()
+                self.emit(f"{r} = OpISub %uint {self.cu(0)} {cin}")
+                carry = cin
             else:
-                self.emit(f"{s1} = OpIAddCarry %umul {x} {y}")
-            r1 = self.tmp()
-            self.emit(f"{r1} = OpCompositeExtract %uint {s1} 0")
-            self.emit(f"{c1} = OpCompositeExtract %uint {s1} 1")
-            self.emit(f"{s2} = {'OpISubBorrow' if sub else 'OpIAddCarry'} %umul {r1} {cin}")
-            self.emit(f"{r} = OpCompositeExtract %uint {s2} 0")
-            self.emit(f"{c2} = OpCompositeExtract %uint {s2} 1")
-            self.emit(f"{carry} = OpBitwiseOr %uint {c1} {c2}")
+                s1, c1, s2, c2, r, carry = (self.tmp() for _ in range(6))
+                if sub:
+                    self.emit(f"{s1} = OpISubBorrow %umul {x} {y}")
+                else:
+                    self.emit(f"{s1} = OpIAddCarry %umul {x} {y}")
+                r1 = self.tmp()
+                self.emit(f"{r1} = OpCompositeExtract %uint {s1} 0")
+                self.emit(f"{c1} = OpCompositeExtract %uint {s1} 1")
+                self.emit(f"{s2} = {'OpISubBorrow' if sub else 'OpIAddCarry'} %umul {r1} {cin}")
+                self.emit(f"{r} = OpCompositeExtract %uint {s2} 0")
+                self.emit(f"{c2} = OpCompositeExtract %uint {s2} 1")
+                self.emit(f"{carry} = OpBitwiseOr %uint {c1} {c2}")
             carry_nz = self.tmp_bool_nz(carry)
             if "clamp" in mods:
                 # Hardware saturates D (0xffffffff on add carry, 0 on sub borrow) while reporting the real carry/borrow.

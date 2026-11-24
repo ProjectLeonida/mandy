@@ -147,7 +147,11 @@ class Insn:
 
 def decode(buf, off: int, base_rva: int) -> Insn | None:
     """Decode the instruction at buf[off] (buf starts at base_rva). None for an invalid or cut-off instruction."""
-    n = len(buf)
+    if off < 0 or off >= len(buf):
+        return None
+    # x86 instructions occupy at most 15 bytes. Bound prefix scanning as well as
+    # operand reads, so a long invalid prefix run cannot rescan the whole tail.
+    n = min(len(buf), off + 15)
     p = off
     p66 = p67 = False
     while p < n and buf[p] in _PREFIXES:
