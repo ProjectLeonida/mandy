@@ -553,6 +553,25 @@ class OutputTest(unittest.TestCase):
         self.assertIn("must be different files", result.stderr)
         self.assertFalse(os.path.exists(out))
 
+    def test_new_json_and_csv_paths_that_differ_only_in_case(self):
+        source = os.path.join(self.root, "sample.bin")
+        with open(source, "wb") as f:
+            f.write(wide_blob())
+        out = os.path.join(self.root, "tree.json")
+        table = os.path.join(self.root, "TREE.JSON")
+
+        result = self._run_cli(source, out, "--csv", table)
+        if os.path.exists(os.path.join(self.root, "SAMPLE.BIN")):
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("must be different files", result.stderr)
+            self.assertFalse(os.path.exists(out))
+        else:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["summary"]["resources"], 1)
+            with open(table, encoding="utf-8", newline="") as f:
+                self.assertEqual(next(csv.DictReader(f))["root"], "TestRoot")
+
     def test_root_filter_and_limit(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
             f.write(wide_blob())

@@ -337,6 +337,27 @@ class ArgumentTest(unittest.TestCase):
                 with open(path, "rb") as f:
                     self.assertEqual(f.read(), original)
 
+    def test_new_report_with_a_case_variant_of_the_carve_manifest(self):
+        carve = os.path.join(self.root, "carve")
+        os.mkdir(carve)
+        manifest = os.path.join(carve, "index.json")
+        report = os.path.join(carve, "INDEX.JSON")
+        with open(manifest, "xb"):
+            pass
+        folds_case = os.path.exists(report)
+        os.remove(manifest)  # The guard must work before either path exists.
+
+        result = self.run_tool(carve, report)
+        if folds_case:
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("would overwrite a carve input", result.stderr)
+            self.assertFalse(os.path.exists(report))
+        else:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(report, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["files"], [])
+            self.assertFalse(os.path.exists(manifest))
+
     def test_directory_report_cannot_replace_a_stream_via_a_hard_link(self):
         stream = os.path.join(self.root, "00000001.bin")
         out = os.path.join(self.root, "report.csv")
