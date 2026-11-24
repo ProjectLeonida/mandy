@@ -3,8 +3,8 @@
 // No d3d12.h, no windows.h: this compiles on Linux CI and in the Windows
 // runtime alike. It models exactly what docs/d3d12_vulkan.md section 3.5
 // needs: root parameters in order, static samplers (no dwords), the 64-dword
-// D3D12 cost limit, and the 32-dword console user-SGPR budget. Anything that
-// does not fit is refused loudly, never guessed (see pack()).
+// D3D12 cost limit, and the 32-dword console user-SGPR budget. Compute's argument block is modelled by pack_stage;
+// unmeasured graphics spills are refused loudly.
 //
 // Numbering follows D3D12 docs: descriptor tables cost 1 dword of the 64-dword
 // limit, root views (CBV/SRV/UAV) cost 2, 32-bit constants cost their count.
@@ -183,7 +183,8 @@ struct StagePackResult {
     // every parameter, inline or not, in root-signature order at the inline layout's widths as bytes — a root
     // CBV/SRV/UAV 8 B, a descriptor table 4 B, a 32-bit constant 4 B per value, no alignment. block_dword[i] is
     // parameter i's first dword in that block (kNoBlockDword when the signature is refused), block_dwords the
-    // block's size; it is the full inline span in dwords, whether or not the signature fits s4..s31.
+    // block's size; for compute it is the full span whether or not the signature fits s4..s31 (at most 64).
+    // Non-compute stages have no block metadata.
     uint32_t spill_start = kNoSgpr;         // first parameter that did not fit inline (kNoSgpr: all fit)
     std::vector<uint32_t> block_dword;      // per parameter: first dword in the argument block
     uint32_t block_dwords = 0;              // the argument block's size, in dwords

@@ -3816,6 +3816,28 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_rebound_tables_off PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_DESC_MIRROR=0")
       add_test(NAME d3d12_rebound_second_device COMMAND d3d12_title_va_test --rebound-second-device)
       set_tests_properties(d3d12_rebound_second_device PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_DESC_MIRROR=1")
+      foreach(size small large)
+        if(size STREQUAL "small")
+          set(root_constants 8)
+        else()
+          set(root_constants 27)
+        endif()
+        set(LEONIDA_ROOT_${size}_SPV ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_root_${size}.spv)
+        add_custom_command(OUTPUT ${LEONIDA_ROOT_${size}_SPV}
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3
+                  -DROOT_CONSTANTS=${root_constants} -o ${LEONIDA_ROOT_${size}_SPV}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_root_arguments.comp
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_root_arguments.comp VERBATIM)
+      endforeach()
+      add_executable(d3d12_root_arguments_test test/d3d12_root_arguments_test.cpp
+        ${LEONIDA_ROOT_small_SPV} ${LEONIDA_ROOT_large_SPV})
+      target_link_libraries(d3d12_root_arguments_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_root_arguments_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+        LEONIDA_ROOT_SMALL_SPV="${LEONIDA_ROOT_small_SPV}" LEONIDA_ROOT_LARGE_SPV="${LEONIDA_ROOT_large_SPV}")
+      target_compile_options(d3d12_root_arguments_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_root_arguments COMMAND d3d12_root_arguments_test)
+      set_tests_properties(d3d12_root_arguments PROPERTIES SKIP_RETURN_CODE 77
+        FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
       # Compute PSOs from FSPX programs (docs/fspx.md): an ACCC container at slot 62 and a bare kind-6 program.
       add_executable(d3d12_fspx_compute_test test/d3d12_fspx_compute_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_TEST_CS})
       target_link_libraries(d3d12_fspx_compute_test PRIVATE gta6rt_d3d12_com)
@@ -4403,6 +4425,29 @@ if(TARGET Vulkan::Headers)
     add_test(NAME replay_khr_as_copy_postbuild COMMAND replay_khr_as_copy_postbuild_test)
     # PreparedList::wrote_readback and readback_src_stages match the actual producer stage (depth24, rgb96, UAV clear; no GPU).
     add_executable(replay_readback_stages_test test/replay_readback_stages_test.cpp)
+    add_executable(replay_root_arguments_test test/replay_root_arguments_test.cpp)
+    target_link_libraries(replay_root_arguments_test PRIVATE Vulkan::Headers)
+    add_test(NAME replay_root_arguments COMMAND replay_root_arguments_test)
+    add_executable(queue_root_arguments_test test/queue_root_arguments_test.cpp)
+    target_link_libraries(queue_root_arguments_test PRIVATE Vulkan::Headers)
+    add_test(NAME queue_root_arguments COMMAND queue_root_arguments_test)
+    find_program(LEONIDA_ROOT_GLSLANG glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    if(LEONIDA_ROOT_GLSLANG)
+      set(LEONIDA_ROOT_NATIVE_SPV ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_root_native.spv)
+      add_custom_command(OUTPUT ${LEONIDA_ROOT_NATIVE_SPV}
+        COMMAND ${LEONIDA_ROOT_GLSLANG} -V --target-env vulkan1.3 -o ${LEONIDA_ROOT_NATIVE_SPV}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_root_arguments.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_root_arguments.comp VERBATIM)
+      add_executable(vk_root_arguments_test test/vk_root_arguments_test.cpp ${LEONIDA_ROOT_NATIVE_SPV})
+      target_link_libraries(vk_root_arguments_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+      target_compile_definitions(vk_root_arguments_test PRIVATE LEONIDA_ROOT_NATIVE_SPV="${LEONIDA_ROOT_NATIVE_SPV}")
+      if(WIN32)
+        target_compile_definitions(vk_root_arguments_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      endif()
+      add_test(NAME vk_root_arguments COMMAND vk_root_arguments_test)
+      set_tests_properties(vk_root_arguments PROPERTIES SKIP_RETURN_CODE 77
+        FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    endif()
     target_link_libraries(replay_readback_stages_test PRIVATE Vulkan::Headers)
     if(WIN32)
       target_compile_definitions(replay_readback_stages_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

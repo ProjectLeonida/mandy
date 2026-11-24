@@ -562,6 +562,7 @@ struct RootArgumentLayout {
         // (src/title_va_alias.h) and the submission-time heap refresh. Views are capped at 1024 slots (an unbounded
         // range counts as 1024) and samplers at the shader-visible sampler heap limit. 0: not a table.
         std::uint32_t table_descriptors = 0;
+        std::uint32_t block_offset = rt::rootsig::kNoBlockDword;  // compute argument-block dword
     };
     std::vector<Parameter> parameters;
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
@@ -577,6 +578,7 @@ struct RootArgumentLayout {
     // spill, or graphics keeps pack()'s s0 layout).
     std::uint32_t compute_arguments_end = rt::rootsig::kNoSgpr;
     std::uint32_t graphics_arguments_end = rt::rootsig::kNoSgpr;
+    std::uint32_t block_dwords = 0;  // full compute layout, including inline parameters; at most 64
 };
 
 // For the command list: the argument layout of a root signature from a Vulkan device, and the id it records for a

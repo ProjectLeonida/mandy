@@ -503,7 +503,7 @@ int main() {
         check(f.ok && !f.spills() && f.first_sgpr == std::vector<uint32_t>({4, 6, 8}) &&
                   f.block_dword == std::vector<uint32_t>({0, 2, 4}) && f.block_dwords == 20,
               "pack_stage: a fitting signature gets both layouts");
-        // A view needs two dwords: it spills whole if only s31 remains.
+        // Parameters fit whole or become block-only; an unused inline word is not filled by later parameters.
         RootSignature over;
         over.params = {consts(27), view()};  // the view would need s31..s32, so it spills
         const StagePackResult r = pack_stage(over, Stage::Compute);
@@ -643,6 +643,7 @@ int main() {
                   spilled.end_sgpr == 32 && spilled.spills() && spilled.spill_start == 1 &&
                   spilled.block_dword == std::vector<uint32_t>({0, 28, 29, 29}) && spilled.block_dwords == 30,
               "pack_stage: zero-value constants in the compute argument block take no dwords");
+        // Validation continues after the first block-only parameter.
         RootSignature costly;
         costly.params = {consts(32), consts(33)};
         const StagePackResult costly_r = pack_stage(costly, Stage::Compute);
@@ -651,6 +652,24 @@ int main() {
         RootSignature many;
         many.params.assign(65, table());
         check(!pack_stage(many, Stage::Compute).ok, "pack_stage: more than 64 parameters rejected");
+        RootSignature bad;
+        bad.params = {consts(29), RootParameter{}};
+        bad.params.back().type = static_cast<ParamType>(99);
+        check(!pack_stage(bad, Stage::Compute).ok, "pack_stage: unknown type after spill rejected");
+        bad.params.back() = consts(36);
+        check(!pack_stage(bad, Stage::Compute).ok, "pack_stage: over-cost constants after spill rejected");
+        bad.params.back() = consts(0);
+        const auto zero_after_spill = pack_stage(bad, Stage::Compute);
+        check(zero_after_spill.ok && zero_after_spill.spills() && zero_after_spill.spill_start == 0 &&
+                  zero_after_spill.first_sgpr == std::vector<uint32_t>({kNoSgpr, kNoSgpr}) &&
+                  zero_after_spill.block_dword == std::vector<uint32_t>({0, 29}) &&
+                  zero_after_spill.block_dwords == 29,
+              "pack_stage: zero constants after spill accepted with zero block dwords");
+        RootSignature maximum;
+        maximum.params.assign(64, table());
+        const auto max = pack_stage(maximum, Stage::Compute);
+        check(max.ok && max.block_dwords == 64 && max.block_dword.back() == 63,
+              "pack_stage: maximum cost fits the 64-dword snapshot bound");
     }
 
     if (g_failures != 0) std::printf("%d FAILURES\n", g_failures);

@@ -61,7 +61,6 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
     const bool model_spill = stage == Stage::Compute;
     uint64_t cost = 0;  // 64-bit, as in pack()
     uint64_t next = out.base;
-    bool spilling = false;
     uint64_t block_dwords = 0;
     std::vector<uint32_t> first;
     first.reserve(sig.params.size());
@@ -81,14 +80,15 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
         const uint64_t dwords = stage_dwords(p.type, p.num_values);
         // The block carries every parameter in order (measured: a fitting program's reads align to its bytes too,
         // so the layer fills the whole block for every compute signature, not only the spilled tail).
-        out.block_dword.push_back(static_cast<uint32_t>(block_dwords));
-        block_dwords += dwords;
-        if (!spilling && next + dwords <= kMaxUserSgprs) {
+        if (model_spill) {
+            out.block_dword.push_back(static_cast<uint32_t>(block_dwords));
+            block_dwords += dwords;
+        }
+        if (!out.spills() && next + dwords <= kMaxUserSgprs) {
             first.push_back(static_cast<uint32_t>(next));
             next += dwords;
         } else if (model_spill) {
             if (out.spill_start == kNoSgpr) out.spill_start = static_cast<uint32_t>(i);
-            spilling = true;
             first.push_back(kNoSgpr);
         } else {
             out.error = "root parameter " + std::to_string(i) + " does not fit in the user SGPRs from s" +

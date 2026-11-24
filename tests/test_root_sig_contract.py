@@ -362,6 +362,9 @@ def test_zero_value_constants_take_no_dwords():
                                                 {"type": "constants", "count": 0},
                                                 {"type": "constants", "count": 1}]}, "cs")
     assert error == "" and len(dwords) == 32
+    dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": 29},
+                                                {"type": "constants", "count": 0}]}, "cs")
+    assert error == "" and len(dwords) == 4
     dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": 64}]}, "cs")
     assert error == "" and len(dwords) == 4
     dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": 64}]}, "ps")
@@ -379,23 +382,29 @@ def test_console_layout_spill_goes_to_the_argument_block():
     assert error == "" and len(dwords) == 4                        # the whole 29-dword parameter spills: none inline
     assert all(slot["param"] is None for slot in dwords)
 
+    # Do not resume inline placement after the first non-fitting parameter.
+    sig = {"params": [{"type": "constants", "count": 27}, {"type": "cbv"}, {"type": "table"}]}
+    dwords, error = rsc.pack_layout(sig, "cs")
+    assert error == "" and len(dwords) == 31
+
+
+@pytest.mark.parametrize("tail", [
+    {"type": "constants", "count": -1},
+    {"type": "constants", "count": True},
+    {"type": "constants", "count": 36},
+    {"type": "unknown"},
+    {"type": "ufo"},
+])
+def test_console_spill_validates_the_entire_tail(tail):
+    dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": 29}, tail]}, "cs")
+    assert dwords == [] and error
+
 
 def test_console_spill_does_not_resume_inline_placement():
     sig = {"params": [{"type": "constants", "count": 27}, {"type": "uav"}, {"type": "table"}]}
     dwords, error = rsc.pack_layout(sig, "cs")
     assert error == "" and len(dwords) == 31
     assert all(slot["param"] == 0 for slot in dwords[4:])
-
-
-@pytest.mark.parametrize("tail", [
-    {"type": "constants", "count": 36},
-    {"type": "constants", "count": -1},
-    {"type": "constants", "count": True},
-    {"type": "ufo"},
-])
-def test_console_spill_still_validates_the_remaining_parameters(tail):
-    dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": 29}, tail]}, "cs")
-    assert dwords == [] and error
 
 
 def test_console_reconcile_fsr_reads():

@@ -1,0 +1,28 @@
+#version 460
+// Hand-written contract probe, not a retail shader. Read the whole block through heap_base + s[0:1],
+// including both address halves, the table, constants and vector-read padding.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#ifndef ROOT_CONSTANTS
+#define ROOT_CONSTANTS 27
+#endif
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+layout(push_constant) uniform UserData { uint s[32]; uvec2 heap_base; uvec2 code_base; } pc;
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint carry;
+    uint lo = uaddCarry(a.x, b.x, carry);
+    return uvec2(lo, a.y + b.y + carry);
+}
+Words at(uvec2 va) { return Words(add64(pc.heap_base, va)); }
+void main() {
+    if (any(notEqual(gl_WorkGroupID, uvec3(0)))) return;
+    Words args = at(uvec2(pc.s[0], pc.s[1] & 255u));
+    Words result = at(uvec2(args.w[ROOT_CONSTANTS + 3], args.w[ROOT_CONSTANTS + 4]));
+    for (uint i = 0; i < ROOT_CONSTANTS + 5; ++i) result.w[i] = args.w[i];
+    for (uint i = 0; i < 28; ++i) result.w[32 + i] = pc.s[4 + i];
+    result.w[60] = gl_NumWorkGroups.x;
+    result.w[61] = gl_NumWorkGroups.y;
+    result.w[62] = gl_NumWorkGroups.z;
+    result.w[63] = args.w[ROOT_CONSTANTS + 5 + 15]; // last padding dword
+}

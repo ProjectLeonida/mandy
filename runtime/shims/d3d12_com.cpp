@@ -1451,6 +1451,7 @@ private:
     struct RootState {
         const RootArgumentLayout* layout = nullptr;
         std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> data{};
+        std::vector<std::uint32_t> block;
     };
 
     // D3D12 leaves root arguments undefined after a root-signature change; they start at zero here. Setting the
@@ -1472,6 +1473,7 @@ private:
         state.layout = layout;
         if (layout && (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED)) directly_indexed_ = true;
         state.data = {};
+        state.block.assign(is_compute(state) && layout ? layout->block_dwords : 0, 0);
         // CreateRootSignature accepted it for the other bind point only (its log line says why).
         if (layout && !(is_compute(state) ? layout->compute_ok : layout->graphics_ok)) {
             stub(is_compute(state) ? "SetComputeRootSignature(signature that does not fit the compute layout)"
@@ -1497,12 +1499,18 @@ private:
         return &state.layout->parameters[index];
     }
 
-    // Dwords beyond the 32 user registers are what the console spills to memory; that layout is still open.
-    void write(RootState& state, std::uint32_t dword, std::uint32_t value) {
-        if (dword < rt::rootsig::kMaxUserSgprs)
-            state.data[dword] = value;
-        else
-            stub("root arguments beyond 32 user-data dwords (spill not modelled)");
+    // Preserve the sub-dword for both copies (constants with offsets, and both halves of a root view).
+    void write(RootState& state, const RootArgumentLayout::Parameter& p, std::uint32_t sub, std::uint32_t value) {
+        const auto first = first_dword(state, p);
+        if (first != rt::rootsig::kNoSgpr) {
+            if (first >= state.data.size() || sub >= state.data.size() - first) return check(false);
+            state.data[first + sub] = value;
+        }
+        if (is_compute(state)) {
+            if (p.block_offset >= state.block.size() || sub >= state.block.size() - p.block_offset)
+                return check(false);
+            state.block[p.block_offset + sub] = value;
+        }
     }
 
     void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
@@ -1524,19 +1532,7 @@ private:
         if (!p) return;
         if ((count && !data) || std::uint64_t(offset) + count > p->constant_count) return check(false);
         const auto* values = static_cast<const std::uint32_t*>(data);
-        const std::uint32_t first = first_dword(state, *p);
-        if (first == rt::rootsig::kNoSgpr) return spilled();
-        for (UINT i = 0; i < count; ++i) write(state, first + offset + i, values[i]);
-    }
-
-    // A parameter in the spill array behind s[0:1] (a compute signature past s31: pack_stage gives it no SGPR, only a
-    // spill_dword): that array is not written yet, so its value is not stored; kNoSgpr plus an offset must never
-    // reach write(), where it would wrap round to s0.
-    static void spilled() {
-        static std::atomic<bool> said{false};
-        if (!said.exchange(true))
-            std::fprintf(stderr, "[rt] d3d12: root arguments in the spill array behind s[0:1] are not stored (the "
-                                 "array is not written yet)\n");
+        for (UINT i = 0; i < count; ++i) write(state, *p, offset + i, values[i]);
     }
 
     void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type) {
@@ -1563,13 +1559,11 @@ private:
         }
         if (type != rt::rootsig::ParamType::Descriptor && va && p->table_descriptors)
             remember_table(va, p->table_descriptors);
-        const std::uint32_t first = first_dword(state, *p);
-        if (first == rt::rootsig::kNoSgpr) return spilled();
-        write(state, first, std::uint32_t(va));
+        write(state, *p, 0, std::uint32_t(va));
         // In the console layouts a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
         // live below 4 GiB); a root view keeps both halves. pack()'s graphics layout gives every address two dwords.
         const bool console = is_compute(state) || state.layout->graphics_console;
-        if (!(console && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
+        if (!(console && type == rt::rootsig::ParamType::Table)) write(state, *p, 1, std::uint32_t(va >> 32));
     }
 
     D3D12_COMMAND_LIST_TYPE type_;
@@ -2001,7 +1995,7 @@ private:
                 std::fputc('\n', stderr);
             }
         }
-        check(list_.dispatch({compute_pipeline_, compute_user_data(), x, y, z}));
+        check(list_.dispatch({compute_pipeline_, compute_user_data(), x, y, z, compute_.block}));
     }
 
     // The views block a draw records. Rebuilt only when the render targets or the bound vertex buffers change.
@@ -2112,6 +2106,7 @@ private:
             note_direct_heap_indexing(compute_.layout);
             cmd.pipeline = compute_pipeline_;
             cmd.user_data = compute_user_data();
+            cmd.root_arguments = compute_.block;
         }
         check(list_.execute_indirect(cmd));
     }
