@@ -80,7 +80,9 @@ class MovrelsLaneMaskWave32(unittest.TestCase):
             with self.subTest(lane=lane):
                 self.assertEqual((d, bits), (5, 2))
                 self.assertEqual(ctl_bits, 2)
-                self.assertEqual(ctl_d, 0xFFFFFFFF if lane in (0, 2) else 0)   # a copy stays a mask
+                # The copy stays a mask (ctl_bits), but the VALU read of it is a data read: every lane gets
+                # the whole wave's mask word 5, not its own 0 / ~0 bit.
+                self.assertEqual(ctl_d, 5)
 
     def test_index_from_m0_hits_mask_and_data_neighbours(self):
         # s10 data, s11 a v_cmp mask (lanes 1, 4, 9), s12 data; M0 picks each in turn from a base of s9.

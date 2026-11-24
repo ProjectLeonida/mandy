@@ -144,6 +144,32 @@ def _bitwise_mask_lines(wave_size):
     return lines
 
 
+def _readfirstlane_vgpr_dst_lines(wave_size):
+    """v_readfirstlane_b32 into a VGPR of a mask-holding VGPR, stored back as data. The
+    destination is plain data — VGPR writes are never mask-tracked — so every lane must get
+    the broadcast wave mask word, not this lane's 0 / ~0 bit (the mask word here is the low
+    word in wave64, which is all v2 holds)."""
+    is64 = wave_size == 64
+    r = {
+        "exec": "exec" if is64 else "exec_lo",
+        "mov": "s_mov_b64" if is64 else "s_mov_b32",
+        "s6": "s[6:7]" if is64 else "s6",
+        "s8": "s[8:9]" if is64 else "s8",
+        "s10": "s[10:11]" if is64 else "s10",
+    }
+    return [
+        f"{r['mov']} {r['exec']}, -1",
+        "v_and_b32 v1, 1, v0",
+        f"v_cmp_eq_u32_e64 {r['s6']}, v1, 0",       # even lanes
+        f"v_cmp_lt_u32_e64 {r['s8']}, v0, 10",      # lanes < 10
+        f"v_cmp_lt_u32_e64 {r['s10']}, v0, 20",     # lanes < 20
+        "v_and_or_b32 v2, s6, s8, s10",             # mask VGPR: (even & <10) | <20
+        "v_readfirstlane_b32 v3, v2",               # VGPR dst: the broadcast mask word
+        "v_mul_lo_u32 v14, v0, 36",
+        "buffer_store_dword v3, v14, s[0:3], 0 offen",
+    ]
+
+
 def _vgpr_stores(spv):
     """Return mapping `vgpr_idx -> [rhs_expression, ...]` for constant-index `%vgpr` OpStores."""
     const_uint = {}
@@ -190,17 +216,33 @@ class _VectorBitwiseMixin:
         cnt_andor = sum(want_andor)
         cnt_xnor = sum(want_xnor)
         cnt_bfi = sum(want_bfi)
+        # The mask VGPRs hold the whole wave's mask word (a VALU read of a mask operand is a data
+        # read), stored in every lane by the mask writes; the low word covers lanes 0-31.
+        word_andor = sum(1 << i for i in range(32) if want_andor[i])
+        word_xnor = sum(1 << i for i in range(32) if want_xnor[i])
+        word_bfi = sum(1 << i for i in range(32) if want_bfi[i])
         for lane in range(self.wave_size):
             base = lane * 36
-            self.assertEqual(mem[base], 0xFFFFFFFF if want_andor[lane] else 0, f"lane {lane} raw and_or")
-            self.assertEqual(mem[base + 4], 0xFFFFFFFF if want_xnor[lane] else 0, f"lane {lane} raw xnor")
-            self.assertEqual(mem[base + 8], 0xFFFFFFFF if want_bfi[lane] else 0, f"lane {lane} raw bfi")
+            self.assertEqual(mem[base], word_andor, f"lane {lane} raw and_or")
+            self.assertEqual(mem[base + 4], word_xnor, f"lane {lane} raw xnor")
+            self.assertEqual(mem[base + 8], word_bfi, f"lane {lane} raw bfi")
             self.assertEqual(mem[base + 12], 20 if want_andor[lane] else 10, f"lane {lane} cndmask and_or")
             self.assertEqual(mem[base + 16], 40 if want_xnor[lane] else 30, f"lane {lane} cndmask xnor")
             self.assertEqual(mem[base + 20], 60 if want_bfi[lane] else 50, f"lane {lane} cndmask bfi")
             self.assertEqual(mem[base + 24], cnt_andor, f"lane {lane} bcnt and_or")
             self.assertEqual(mem[base + 28], cnt_xnor, f"lane {lane} bcnt xnor")
             self.assertEqual(mem[base + 32], cnt_bfi, f"lane {lane} bcnt bfi")
+
+    def test_readfirstlane_mask_vgpr_dst_gets_wave_word(self):
+        mem = _run_cs(
+            f"cs_rfl_vgpr_w{self.wave_size}",
+            _readfirstlane_vgpr_dst_lines(self.wave_size),
+            wave_size=self.wave_size,
+        )
+        # (even & lane < 10) | lane < 20 -> lanes 0..19 of the low word, the same in every lane.
+        want = sum(1 << i for i in range(32) if ((i & 1) == 0 and i < 10) or i < 20)
+        for lane in range(self.wave_size):
+            self.assertEqual(mem[lane * 36], want, f"lane {lane} readfirstlane dst")
 
 
 class TestVectorBitwiseMasksWave32(_VectorBitwiseMixin, unittest.TestCase):
@@ -223,7 +265,9 @@ class TestVectorBitwiseMasksWave64Emulated(unittest.TestCase):
         )
         self.assertTrue(gen.wave64 and gen.emulate)
         self.assertEqual(len(gen.mask_writes), 6)
-        self.assertNotIn("FindILsb", spv)
+        # Emulation exchanges through %x_buf instead of subgroup ops; FindILsb (GLSL extinst) is fine —
+        # the readfirstlane of a mask VGPR now takes the exchange path like any other readfirstlane.
+        self.assertNotIn("OpGroupNonUniform", spv)
         self.assertIn("OpControlBarrier", spv)
         self.assertIn("OpStore %x_it", spv)
         stores = _vgpr_stores(spv)
@@ -233,6 +277,16 @@ class TestVectorBitwiseMasksWave64Emulated(unittest.TestCase):
             self.assertTrue(stores[vreg][-1].startswith("OpNot %uint "), stores[vreg][-1])
         for vreg in (4, 7):  # v_bfi_b32 -> final OpBitwiseOr
             self.assertTrue(stores[vreg][-1].startswith("OpBitwiseOr %uint "), stores[vreg][-1])
+
+    def test_readfirstlane_vgpr_dst_emulate_structure(self):
+        spv, gen = _translate_cs(
+            "cs_rfl_vgpr_w64_emu",
+            _readfirstlane_vgpr_dst_lines(64),
+            wave_size=64,
+            emulate=True,
+        )
+        self.assertTrue(gen.wave64 and gen.emulate)
+        self.assertNotIn("OpGroupNonUniform", spv)
 
 
 class TestVectorBitwiseDataControl(unittest.TestCase):
