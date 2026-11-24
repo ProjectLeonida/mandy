@@ -427,7 +427,7 @@ def xvd_header(path: str):
         return None
     flags, = struct.unpack_from("<I", b, 0x208)
     content_type, = struct.unpack_from("<I", b, 0x284)
-    xvc_data_length, = struct.unpack_from("<I", b, 0x290)
+    xvc_data_length, = struct.unpack_from("<Q", b, 0x290)
     version = struct.unpack_from("<4H", b, 0x3BC)        # stored lowest part first: 1,2,0,1 is 1.0.2.1
     return {"kind": "XVC" if xvc_data_length else "XVD",
             "encrypted": not flags & XVD_ENCRYPTION_DISABLED,

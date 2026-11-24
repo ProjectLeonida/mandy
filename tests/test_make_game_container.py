@@ -28,7 +28,7 @@ def xvd_bytes(*, flags=0x41, content_type=1, xvc_data_length=0x1000, version=(1,
     struct.pack_into("<I", b, 0x208, flags)
     struct.pack_into("<I", b, 0x20C, 3)                  # FormatVersion
     struct.pack_into("<I", b, 0x284, content_type)
-    struct.pack_into("<I", b, 0x290, xvc_data_length)
+    struct.pack_into("<Q", b, 0x290, xvc_data_length)
     struct.pack_into("<4H", b, 0x3BC, *version)
     return bytes(b[:size])
 
@@ -52,6 +52,12 @@ class XvdHeaderTest(unittest.TestCase):
         h = make_game.xvd_header(self.write("os.xvd", xvd_bytes(xvc_data_length=0, content_type=3)))
         self.assertEqual(h["kind"], "XVD")
         self.assertEqual(h["content_type"], 3)
+
+    def test_a_length_above_4gib_stays_an_xvc(self):
+        h = make_game.xvd_header(self.write("big.xvc", xvd_bytes(xvc_data_length=0x1_0000_0001)))
+        self.assertEqual(h["kind"], "XVC")
+        h = make_game.xvd_header(self.write("low32zero.xvc", xvd_bytes(xvc_data_length=0x1_0000_0000)))
+        self.assertEqual(h["kind"], "XVC")
 
     def test_encryption_disabled_flag(self):
         h = make_game.xvd_header(self.write("open.xvc", xvd_bytes(flags=0x41 | 0x2)))
