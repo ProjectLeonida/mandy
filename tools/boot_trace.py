@@ -27,6 +27,7 @@ parse, the report still includes the other trace.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import re
 import sys
@@ -46,13 +47,15 @@ class TraceError(ValueError):
     """The file is unreadable or holds no valid trace event."""
 
 
+@contextmanager
 def _open_text(path: str):
     """Read UTF-8 or use the byte-order mark to decode a UTF-16 trace."""
     try:
         with open(path, "rb") as raw:
             head = raw.read(2)
         encoding = "utf-16" if head in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
-        return open(path, encoding=encoding, errors="replace")
+        with open(path, encoding=encoding, errors="replace") as stream:
+            yield stream
     except OSError as e:
         raise TraceError(f"cannot read {path}: {e.strerror or e}") from e
 
