@@ -598,19 +598,52 @@ class SubgroupPinSkip(unittest.TestCase):
     already (unpinned_subgroup_skip), the runner used to judge it and report a failure."""
     MSG = "device: X (subgroup 64..64)\ncompute subgroup size: 32 not available\n" + dump(WANT)
 
+    def test_unpinned_dump_does_not_hide_child_failure(self):
+        name = "cs_barrier_loop"
+        warning = "device: X (subgroup 64..64)\ncompute subgroup size: 32 not available\n"
+        words = dump([128, 96, 64, 32, 128, 96, 64, 0])
+        cases = ((0, warning + words, True),
+                 (1, warning + words, True),  # wrong-width words are unjudged
+                 (1, warning + words + "1 validation errors\n", False),
+                 (1, warning, False),
+                 (2, warning + words, False),
+                 (77, "unsupported: requested feature unavailable\n", True))
+        for code, msg, skipped in cases:
+            with self.subTest(code=code, msg=msg), tempfile.TemporaryDirectory() as tmp:
+                args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+
+                def launch(cmd, **_kwargs):
+                    if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                        (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                        (Path(tmp) / "spirv" / "index.json").write_text(
+                            json.dumps({name: {"subgroup_size": 32}}), encoding="utf-8")
+                        return 0, ""
+                    return code, msg
+
+                output = io.StringIO()
+                with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                      patch.object(rgt, "spirv_as"), patch.object(rgt, "run_cmd", side_effect=launch),
+                      contextlib.redirect_stdout(output)):
+                    status = rgt.run_suite(args, tmp)
+                self.assertEqual(status, 0 if skipped else 1, output.getvalue())
+                self.assertIn(f"{'SKIP' if skipped else 'FAIL'}  {name}", output.getvalue())
+                if not skipped:
+                    self.assertIn("compute subgroup size: 32 not available", output.getvalue())
+                    self.assertNotIn("passed, 1 skipped", output.getvalue())
+
     def test_unpinned_size_is_a_skip(self):
-        self.assertEqual(rgt.subgroup_pin_skip(self.MSG, {"VKC_SUBGROUP_SIZE": "32"}),
+        self.assertEqual(rgt.subgroup_pin_skip(0, self.MSG, {"VKC_SUBGROUP_SIZE": "32"}),
                          "SKIP (the device can't run this shader at 32 lanes on request)")
 
     def test_no_pin_requested_is_judged(self):
         for env in (None, {}, {"VKC_SGPRS": "0x1"}, {"VKH_SUBGROUP_SIZE": "64"}):
             with self.subTest(env=env):
-                self.assertIsNone(rgt.subgroup_pin_skip(self.MSG, env))
+                self.assertIsNone(rgt.subgroup_pin_skip(0, self.MSG, env))
 
     def test_a_honoured_pin_is_judged(self):
         out = "device: X (subgroup 32..64)\ncompute subgroup size: 32\n" + dump(WANT)
-        self.assertIsNone(rgt.subgroup_pin_skip(out, {"VKC_SUBGROUP_SIZE": "32"}))
-        self.assertIsNone(rgt.subgroup_pin_skip("device: X (subgroup 32..64)\n" + dump(WANT),
+        self.assertIsNone(rgt.subgroup_pin_skip(0, out, {"VKC_SUBGROUP_SIZE": "32"}))
+        self.assertIsNone(rgt.subgroup_pin_skip(0, "device: X (subgroup 32..64)\n" + dump(WANT),
                                                 {"VKC_SUBGROUP_SIZE": "32"}))
 
     def test_only_wave_width_fixtures_carry_the_rule(self):
