@@ -28,11 +28,18 @@ Fallback runs (the device has no VK_KHR_fragment_shader_barycentric, so the defa
             ps_ij_computed still skips with both variables set: it wants PerVertexKHR inputs and the fallbacks
             do not provide them. These passes are conditional on the variable, so compare them with the
             default-run numbers above, not instead of them.
+w64_graphics.py runs (the 29 wave64 VS/PS/GS fixtures this program owns, which the suite above does not run):
+            built into a work folder by hand (the translator for the ps_, gs_ fixtures, the same assembler),
+            2 full passes: 17 of 29 "ok" in both, the same 17 both times, 12 tier C skipped both times.
+            Tiers A and B pass exactly: 12 pixel, 4 vertex and 1 geometry fixtures, all against the words their
+            headers derive. Tier C needs one device that can require both 64 and 32 lanes before it can compare the
+            two images, so it skips here (or needs W64G_REF from a 64-lane GPU); this card has no 64-wide fragment
+            subgroup. So the A/B result is the single-size check, not the two-size comparison.
 Skipped:    Both runs: the six mesh cases (no VK_EXT_mesh_shader), five pixel cases reading
             BaryCoordKHR (no VK_KHR_fragment_shader_barycentric: ps_bary, ps_persp_bary,
             ps_scc_mask32, ps_uniform_branch, and ps_ij_computed, which was not translated),
-            one 64-wide fragment subgroup case, and 16 cases run by the d3d12_*_test and
-            w64_graphics.py programs. Native additionally skipped 31 cases needing a 64-wide
+            one 64-wide fragment subgroup case, and 16 cases run by the d3d12_*_test program
+            (the w64_graphics.py cases were run separately, see above). Native additionally skipped 31 cases needing a 64-wide
             compute subgroup; the emulated run carried those.
 Notes:
 - The Vulkan test tools were built from the same commit with LEONIDA_BUILD_WINDOWS_RUNTIME=OFF
