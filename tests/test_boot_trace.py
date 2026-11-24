@@ -540,6 +540,7 @@ class BootTraceTests(unittest.TestCase):
         for needle in (
             "pid 123",
             "modules (2)",
+            "game.exe, x.dll (relocated)",
             "dllmain: 1 ok, 1 failed",
             "unimplemented: 2 unique",
             "x.dll!Foo from game.exe+0x10",
@@ -664,6 +665,42 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(text.count("    ? attributes ? requested ? pages from ?\n"), 2)
         self.assertIn("    XMemAllocatePhysicalPages attributes 0x10 requested ? pages from fixture.dll+0x50\n", text)
         self.assertIn(f"    XMemAllocatePhysicalPages attributes 0x20 requested 4 pages from {nbsp_caller}\n", text)
+
+    def test_frame_pacing_summary_parsed_formatted_and_kept_in_counts_only(self):
+        self.write_lines(self.d3d12, [
+            "[d3d12-trace] #1 XboxPresentation::PresentX ok",
+            "gta6rt.exe : [rt] present: pacing summary frames=101 samples=100 target_us=16667 "
+            "mean_us=16712.5 drift_us=+45.5 p50_us=16667 p95_us=17100 p99_us=18200 "
+            "latency_samples=101 latency_p50_us=4200 latency_p95_us=6100 latency_p99_us=7900",
+        ])
+        trace = bt.parse_d3d12(self.d3d12)
+        self.assertEqual(trace["ignored_lines"], 0)
+        self.assertEqual(trace["frame_pacing"], {
+            "frames": 101,
+            "samples": 100,
+            "target_us": 16667,
+            "mean_us": 16712.5,
+            "drift_us": 45.5,
+            "p50_us": 16667,
+            "p95_us": 17100,
+            "p99_us": 18200,
+            "latency_samples": 101,
+            "latency_p50_us": 4200,
+            "latency_p95_us": 6100,
+            "latency_p99_us": 7900,
+        })
+        text = bt.format_text(bt.summarize(None, trace), 10)
+        self.assertIn(
+            "frame pacing: 101 frame(s), 100 interval(s), target 16667 us, mean 16712.5 us (drift +45.5 us), "
+            "p50/p95/p99 16667/17100/18200 us; origin-to-present p50/p95/p99 4200/6100/7900 us",
+            text,
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bt.main(["--d3d12", self.d3d12, "--counts-only"]), 0)
+        counts = json.loads(out.getvalue())
+        self.assertEqual(counts["d3d12"]["frame_pacing"]["drift_us"], 45.5)
+        self.assertEqual(counts["d3d12"]["frame_pacing"]["p99_us"], 18200)
 
 
 if __name__ == "__main__":

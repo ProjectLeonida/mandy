@@ -32,7 +32,7 @@ class MergeCheckTest(unittest.TestCase):
         self.addCleanup(td.cleanup)
         self.repo = td.name
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-        env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+        env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "XDG_CONFIG_HOME": td.name})
         patcher = mock.patch.dict(os.environ, env, clear=True)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -116,6 +116,12 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual(r["verdict"], "already-merged")
         self.assertEqual(len(r["merges"]), 1)
         self.assertEqual(r["commits"], {"total": 1, "on_main": 1})
+
+    def test_unicode_line_separator_in_squash_subject(self):
+        self.write("notes.txt", "updated\n")
+        sha = self.commit("Update notes (#10)\u2028and examples (#11)")
+        self.assertEqual(mc.prior_merges(self.repo, "main", [10, 11], 10),
+                         {10: [], 11: [sha[:12]]})
 
     def test_batch_keeps_prior_merges_separate(self):
         base = self.git("rev-parse", "main")

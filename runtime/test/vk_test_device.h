@@ -106,6 +106,8 @@ public:
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
+    bool request_depth_range_unrestricted = false;
+    bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted enabled
     // create(true) only: VK_KHR (else EXT) swapchain_maintenance1 and its feature enabled, with the surface half on the
     // instance, so a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per present.
     bool swapchain_maintenance1 = false;
@@ -119,6 +121,7 @@ public:
     bool sample_locations = false;
     bool request_mesh_shader = false;  // set before create(): enable VK_EXT_mesh_shader (meshShader) where available
     bool mesh_shader = false;          // VK_EXT_mesh_shader and meshShader are enabled
+    bool mesh_shader_queries = false;  // the meshShaderQueries feature is enabled on the device
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
@@ -524,10 +527,13 @@ public:
             VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &mesh_features};
             instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
             mesh_shader = mesh_features.meshShader == VK_TRUE;
+            mesh_shader_queries = mesh_features.meshShaderQueries == VK_TRUE;
         }
         if (mesh_shader) {
             mesh_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT, *v13_.next()};
             mesh_features.meshShader = VK_TRUE;
+            // The mesh-primitives query, which counts the primitives a mesh shader emits (D3D-MESH-CLIPPING-COUNTER).
+            mesh_features.meshShaderQueries = mesh_shader_queries ? VK_TRUE : VK_FALSE;
             *v13_.next() = &mesh_features;
         }
         enable.occlusionQueryPrecise = features.features.occlusionQueryPrecise;  // query heaps, where available
@@ -568,6 +574,11 @@ public:
         enabled = enable;
         std::vector<const char*> device_extensions;
         v13_.add_extensions(device_extensions);
+        depth_range_unrestricted = request_depth_range_unrestricted &&
+            std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME) == 0;
+            });
+        if (depth_range_unrestricted) device_extensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
         conservative_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
             return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
         });
