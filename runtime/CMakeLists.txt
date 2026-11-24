@@ -585,6 +585,13 @@ if(BUILD_TESTING)
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)
 
+  # Thread-safe host VA -> GPU BDA region table (runtime/src/title_host_regions.h): pure stdlib, no Vulkan instance.
+  add_executable(title_host_regions_test test/title_host_regions_test.cpp)
+  target_include_directories(title_host_regions_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  find_package(Threads REQUIRED)
+  target_link_libraries(title_host_regions_test PRIVATE Threads::Threads)
+  add_test(NAME title_host_regions COMMAND title_host_regions_test)
+
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
 
@@ -1482,13 +1489,14 @@ endif()
 if(TARGET Vulkan::Headers)
   foreach(tool vk_harness vk_ps_sweep vk_texture_test vk_sampler_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
           vk_bindless_test vk_image_fuzz vk_descriptor_bench depth24_convert_test vk_predicate_capture_test vk_predicated_copy_test
-          vk_xdxr_build_test vk_queue_test vk_sandbox)
+          vk_xdxr_build_test vk_queue_test vk_sandbox title_host_region_gpu_test)
     add_executable(${tool} test/${tool}.cpp)
     target_link_libraries(${tool} PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     if(WIN32)
       target_compile_definitions(${tool} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
   endforeach()
+  add_test(NAME title_host_region_gpu COMMAND title_host_region_gpu_test)
   # OpFmaKHR width gate of vk_shader_fma.h (shaderFmaFloat32 / shaderFmaFloat64): no Vulkan instance, no GPU.
   add_executable(vk_shader_fma_test test/vk_shader_fma_test.cpp)
   target_link_libraries(vk_shader_fma_test PRIVATE Vulkan::Headers)

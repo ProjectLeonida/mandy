@@ -5153,9 +5153,12 @@ public:
             }
         }
         if (info.host_image_copy) load_host_image_copy(get_device);
-        if (info.host_pointer_alignment)
+        if (info.host_pointer_alignment) {
             state_.get_host_pointer_properties = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
                 get_device(info.device, "vkGetMemoryHostPointerPropertiesEXT"));
+            state_.context->configure_title_regions(state_.get_host_pointer_properties, info.host_pointer_alignment,
+                                                    state_.memory);
+        }
         // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU.
         state_.context->enable_copy_scratch(get_device, [this](const VkMemoryRequirements& requirements) {
             return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
