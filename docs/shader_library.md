@@ -109,6 +109,40 @@ as scalar data. The translator keeps its existing behavior when the source is ab
 or the library code has another strict wave64 marker. Synthetic cases are in
 `tests/semantic/test_fspx_wave_size.py`.
 
+### Containers and programs
+
+The carved corpus is counted two ways, and the two numbers are both right (BL-5 in
+[boot_leads.md](boot_leads.md)):
+
+| Count | What it counts | 1.0.2.1 |
+|---|---|---|
+| Containers | carved `DXBC` files, one row of the carve index each | 26,503 |
+| Programs | tag-`0x0D` payloads (`XBCH` → `FSSM`) inside them | 26,698 |
+
+The difference is 195 containers that hold two payloads. All 195 are vertex shaders; every other container holds
+one:
+
+| Stage | Containers | Payloads | Containers with two |
+|---|---|---|---|
+| `vs` | 2,236 | 2,431 | 195 |
+| `ms` | 9,282 | 9,282 | 0 |
+| `ps` | 12,101 | 12,101 | 0 |
+| `gs` | 195 | 195 | 0 |
+| `cs` | 2,689 | 2,689 | 0 |
+
+So 195 is the geometry-shader count because of what the second payload is, not because geometry shaders are
+counted twice or missed: it is the same vertex shader built for the export-shader stage of a legacy
+geometry-shader pipeline ([design.md](design.md), "VS as ES (two-payload VS containers)"). The carve skips
+nothing here.
+
+`tools/fssm_unpack.py` prints these counts after it unpacks (`programs: … payloads in … containers`, then one
+line per stage when it is given the carve index, whose `stage` field it reads). It still writes one program per
+container, the last payload by default, so the 195 export-stage variants are not translated; which payload a
+geometry-shader pipeline selects is open ([fssm_crosscheck.md](fssm_crosscheck.md) §6).
+
+Measured on an own 1.0.2.1 copy from the build's `index.json` and `fssm_index.json`. The synthetic case is
+`test_program_counts_separate_containers_from_payloads` in `tests/test_fssm_unpack.py`.
+
 ## 4. Tool
 
 ```sh

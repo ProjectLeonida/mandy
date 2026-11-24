@@ -1,6 +1,7 @@
 #include "xbox_present.h"
 
 #include "d3d12_trace.h"
+#include "d3d12_xs_device.h"
 
 #include "../src/vulkan_present.h"
 
@@ -66,6 +67,7 @@ XboxPresentation::XboxPresentation(std::unique_ptr<WindowPresenter> presenter, l
 }
 
 XboxPresentation::~XboxPresentation() {
+    if (presents_.load() > 0) log_pacing_summary();
     {
         std::lock_guard lock(worker_mutex_);
         worker_stop_ = true;
@@ -73,6 +75,26 @@ XboxPresentation::~XboxPresentation() {
     worker_wake_.notify_all();
     display_white_thread_.join();
     presenter_->set_abort(nullptr);
+}
+
+void XboxPresentation::log_pacing_summary() const {
+    const leonida::FramePacingSummary s = pacer_.pacing_summary();
+    std::fprintf(stderr,
+                 "[rt] present: pacing summary frames=%llu samples=%llu target_us=%u mean_us=%.1f drift_us=%+.1f "
+                 "p50_us=%llu p95_us=%llu p99_us=%llu latency_samples=%llu latency_p50_us=%llu "
+                 "latency_p95_us=%llu latency_p99_us=%llu\n",
+                 static_cast<unsigned long long>(s.frames),
+                 static_cast<unsigned long long>(s.samples),
+                 s.target_interval_us,
+                 s.mean_us,
+                 s.drift_us,
+                 static_cast<unsigned long long>(s.p50_us),
+                 static_cast<unsigned long long>(s.p95_us),
+                 static_cast<unsigned long long>(s.p99_us),
+                 static_cast<unsigned long long>(s.latency_samples),
+                 static_cast<unsigned long long>(s.latency_p50_us),
+                 static_cast<unsigned long long>(s.latency_p95_us),
+                 static_cast<unsigned long long>(s.latency_p99_us));
 }
 
 // Windows' SDR white level costs a QueryDisplayConfig and two DisplayConfigGetDeviceInfo calls (measured in
@@ -312,6 +334,41 @@ HRESULT XboxPresentation::SuspendX(UINT) {
 HRESULT XboxPresentation::ResumeX() {
     pacer_.resume();
     return S_OK;
+}
+
+bool attach_xbox_presentation(void* device_proxy, XboxPresentation* presentation) {
+    if (!presentation) return rt::d3d12_xs::set_presentation_handler(device_proxy, nullptr);
+    rt::d3d12_xs::PresentationHandler handler{};
+    handler.context = presentation;
+    handler.set_frame_interval = [](void* ctx, IUnknown* output, UINT interval_us, UINT latency, UINT flags) {
+        return static_cast<XboxPresentation*>(ctx)->SetFrameIntervalX(output, interval_us, latency, flags);
+    };
+    handler.schedule_frame_event = [](void* ctx, UINT event, UINT offset_us, UINT flags) {
+        return static_cast<XboxPresentation*>(ctx)->ScheduleFrameEventX(event, offset_us, flags);
+    };
+    handler.wait_frame_event = [](void* ctx, UINT event, DWORD timeout_ms, UINT flags, std::uint64_t* token) {
+        return static_cast<XboxPresentation*>(ctx)->WaitFrameEventX(event, timeout_ms, flags, token);
+    };
+    handler.get_frame_statistics = [](void* ctx, std::uint64_t token, UINT type_mask, UINT* count, void* out) {
+        return static_cast<XboxPresentation*>(ctx)->GetFrameStatisticsX(
+            token, type_mask, count, static_cast<leonida::FrameStatistic*>(out));
+    };
+    handler.present_x = [](void* ctx, UINT plane_count, const void* planes, const void* params) {
+        return static_cast<XboxPresentation*>(ctx)->PresentX(
+            plane_count, static_cast<const XboxPresentPlaneParameters*>(planes),
+            static_cast<const XboxPresentParameters*>(params));
+    };
+    handler.suspend_x = [](void* ctx, UINT flags) {
+        return static_cast<XboxPresentation*>(ctx)->SuspendX(flags);
+    };
+    handler.resume_x = [](void* ctx) {
+        return static_cast<XboxPresentation*>(ctx)->ResumeX();
+    };
+    return rt::d3d12_xs::set_presentation_handler(device_proxy, &handler);
+}
+
+bool detach_xbox_presentation(void* device_proxy) {
+    return rt::d3d12_xs::set_presentation_handler(device_proxy, nullptr);
 }
 
 }  // namespace rt::d3d12
