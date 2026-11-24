@@ -45,7 +45,7 @@ from check import failure   # "exit <status>: <last lines>", check.py's detail f
 from check import run_readback
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
-                   unpinned_subgroup_skip, vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
+                   unpinned_compute_dump_skip, vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, VINT_ENV, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
 from check import barycentric_problem
 from check import NAN_PAYLOAD_TEST, nan_payload_problem
@@ -398,13 +398,13 @@ def dump_words(msg: str) -> list[int] | None:
     return [int(x) for x in m.group(1).split()] if m else None
 
 
-def subgroup_pin_skip(msg: str, cs_env: dict | None) -> Skip | None:
+def subgroup_pin_skip(code: int, msg: str, cs_env: dict | None) -> Skip | None:
     """A Skip when the runner asked for a subgroup size (VKC_SUBGROUP_SIZE) and vk_compute_test says this device
     cannot pin it, so the dispatched words are not the ones the fixture was written for. Only for the dumps in
     WAVE32_PIN_DUMPS: everything else the runner judges at the device's own width, which is how cs_store and the
     cs_w32_* fixtures keep being tested on a 64-only device (check.py is conservative and skips all of them)."""
     if cs_env and "VKC_SUBGROUP_SIZE" in cs_env:
-        return unpinned_subgroup_skip(msg)
+        return unpinned_compute_dump_skip(code, msg)
     return None
 
 
@@ -1314,7 +1314,7 @@ def run_suite(a, work: str) -> int:
             if skip is None and name in WAVE32_PIN_DUMPS:
                 # the device may not be able to run the wave size this fixture was written for (a 64-only device
                 # can't pin 32, so cs_barrier_loop's words mean nothing); check.py skips it too
-                skip = subgroup_pin_skip(msg, cs_env)
+                skip = subgroup_pin_skip(rc, msg, cs_env)
             if skip:   # e.g. Mesa llvmpipe's 8-wide subgroups: these 32-lane masks can't come out right
                 ok, detail = None, str(skip)
             else:

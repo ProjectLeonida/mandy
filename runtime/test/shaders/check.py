@@ -897,6 +897,19 @@ def unpinned_subgroup_skip(out):
     return None
 
 
+def unpinned_compute_dump_skip(code, out):
+    """Skip an unpinnable dump only after a complete run without a validation error.
+
+    An unpinned dispatch may exit 1 because its words mismatch at the wrong wave width. A validation error also
+    exits 1, but prints a separate diagnostic; an earlier failure has no complete out[0..7] line.
+    """
+    if code not in (0, 1) or re.search(r"^[1-9]\d* validation errors$", out, re.MULTILINE):
+        return None
+    if not re.search(r"^out\[0\.\.7\] = (?:[0-9]+ ){7}[0-9]+$", out, re.MULTILINE):
+        return None
+    return unpinned_subgroup_skip(out)
+
+
 def wave32_lane_skip(out):
     """The skip rule for WAVE32_LANE_DUMPS, shared with run_gpu_tests.py."""
     return narrow_subgroup_skip(out) or unpinned_subgroup_skip(out)
@@ -992,7 +1005,7 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
             return Skip(f"SKIP ({out.strip() or 'unsupported device'})")
         if code == 0 and (skip := wave32_lane_skip(out)):
             return skip
-    if sg and (skip := unpinned_subgroup_skip(out)):
+    if sg and (skip := (unpinned_compute_dump_skip(code, out) if mode == "dump" else unpinned_subgroup_skip(out))):
         return skip
     if code != 0:
         return failure(code, out, 2)
