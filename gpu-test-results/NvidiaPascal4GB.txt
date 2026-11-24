@@ -21,6 +21,13 @@ Spot reruns (same commit and binaries, --filter, each case 3 times native and 3 
             ps_imgatomic            3/3 pass native, 3/3 pass emulated (0 of 256 texels, 0 of 4096 pixels wrong)
             The two rows that fail or flake on MoltenVK are stable passes here. Three wave64 cases that only
             run emulated also pass 2/2 each: cs_w64_exec_computed, cs_wave64_ballot, cs_w64_mask_detect.
+Fallback runs (the device has no VK_KHR_fragment_shader_barycentric, so the default run skips these):
+            with LEONIDA_BARY_FALLBACK=1, 2/2 pass each and exact: ps_bary (4096/4096 pixels),
+            ps_persp_bary (perspective-correct on every covered pixel), ps_scc_mask32 and ps_uniform_branch.
+            With LEONIDA_F16_INTERP_FALLBACK=1, ps_interp_f16_high passes 2/2 (halves and control within 2e-3).
+            ps_ij_computed still skips with both variables set: it wants PerVertexKHR inputs and the fallbacks
+            do not provide them. These passes are conditional on the variable, so compare them with the
+            default-run numbers above, not instead of them.
 Skipped:    Both runs: the six mesh cases (no VK_EXT_mesh_shader), five pixel cases reading
             BaryCoordKHR (no VK_KHR_fragment_shader_barycentric: ps_bary, ps_persp_bary,
             ps_scc_mask32, ps_uniform_branch, and ps_ij_computed, which was not translated),
