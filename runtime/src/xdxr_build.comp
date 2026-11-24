@@ -22,8 +22,17 @@
 //                  takes its children's children, so up to four), and how many per tile
 //   MODE_KEPT_SCAN one workgroup: the exclusive prefix sum of the tile counts, and the node count
 //   MODE_KEPT_INDEX per tile: each kept inner node's box node index, in sorted order (the root is node 0)
-//   MODE_NODES     one thread per inner node: a kept one writes its node's child pointers (pairing its sibling
-//                  triangles into TRI1 leaves with FLAG_PAIR), its children's parent table entries, and clears its
+// With FLAG_PAIR (a bottom-level build of two or more triangles that will not be updated), MODE_TRIANGLES writes the
+// leaves to scratch instead, and five steps place them:
+//   MODE_PAIR      one thread per inner node: a kept one pairs its sibling triangles (below), rewriting the first
+//                  one's leaf and marking the sibling's as dropped
+//   MODE_LEAF_COUNT, MODE_LEAF_SCAN, MODE_LEAF_INDEX: as the kept modes, over the leaves: each kept leaf's place, in
+//                  element order, and how many there are
+//   MODE_LEAF_PLACE one thread per word of the leaves: a kept leaf's word to its place in the structure
+// The kept leaves are then dense, one 64-byte record a pair, and the nodes start right after the last one
+// (nodes_off(), the header's +40) instead of at pc.nodes_off, so the structure is 64 bytes smaller per pair.
+//   MODE_NODES     one thread per inner node: a kept one writes its node's child pointers (a paired sibling's is
+//                  the TRI1 pointer to its partner's leaf), its children's parent table entries, and clears its
 //                  box accumulator. The nodes are BOX32 (128 bytes, float boxes) or, with FLAG_BOX16, BOX16 (64
 //                  bytes, half boxes rounded outward); the accumulators keep every box exact either way, so
 //                  rounding never compounds up the tree
@@ -89,7 +98,8 @@ const uint MODE_INIT = 0u, MODE_TRIANGLES = 1u, MODE_INSTANCES = 2u, MODE_MORTON
            MODE_NODES = 5u, MODE_HEADER = 6u, MODE_RADIX_COUNT = 7u, MODE_RADIX_SCAN = 8u, MODE_RADIX_SCATTER = 9u,
            MODE_SMALL_SORT = 10u, MODE_COPY_AS = 12u, MODE_POSTBUILD = 13u, MODE_KEPT = 14u,
            MODE_KEPT_SCAN = 15u, MODE_KEPT_INDEX = 16u, MODE_PROPAGATE = 17u, MODE_CLEAR = 18u,
-           MODE_SERIALIZE = 19u, MODE_DESERIALIZE = 20u;
+           MODE_SERIALIZE = 19u, MODE_DESERIALIZE = 20u, MODE_PAIR = 21u, MODE_LEAF_COUNT = 22u,
+           MODE_LEAF_SCAN = 23u, MODE_LEAF_INDEX = 24u, MODE_LEAF_PLACE = 25u;
 // The serialized header's D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER, as words (xdxr_build.h
 // xdxr_serialized_id): the GUID is the ASCII "Leonida XDXR AS ", the versioning data the header version (VERSION_2403)
 // and the serialized layout version (1).
@@ -148,9 +158,10 @@ void store(uvec2 base, uint byte_offset, uint v) { at(base, byte_offset).w[0] = 
 void storef(uvec2 base, uint byte_offset, float v) { store(base, byte_offset, floatBitsToUint(v)); }
 bool is_null(uvec2 a) { return a.x == 0u && a.y == 0u; }
 
-// ---- scratch: centroid bounds (6 ordered words at 0) and the node count (word 6), keys and element indices twice
-// (the radix sort's two sides; the sorted result is back in the first after an even number of passes), digit
-// counts, their exclusive prefix sums, element boxes, a box accumulator per node, the binary tree ----
+// ---- scratch: centroid bounds (6 ordered words at 0), the node count (word 6) and with FLAG_PAIR the kept leaf
+// count (word 7), keys and element indices twice (the radix sort's two sides; the sorted result is back in the first
+// after an even number of passes), digit counts, their exclusive prefix sums, element boxes, with FLAG_PAIR the
+// leaves and their bookkeeping, a box accumulator per node, the binary tree ----
 const uint SCRATCH_KEYS = 64u;
 const uint SCRATCH_NODE_COUNT = 24u;
 uint radix_tiles() { return (pc.sort_size + RADIX_TILE - 1u) / RADIX_TILE; }
@@ -161,8 +172,19 @@ uint vals2_off() { return SCRATCH_KEYS + 12u * pc.sort_size; }
 uint counts_off() { return SCRATCH_KEYS + 16u * pc.sort_size; }  // RADIX_BINS x tiles, digit-major
 uint offsets_off() { return counts_off() + 4u * RADIX_BINS * radix_tiles(); }  // the same shape: the scan of counts
 uint boxes_off() { return offsets_off() + 4u * RADIX_BINS * radix_tiles(); }  // 6 floats per element
+// FLAG_PAIR only (xdxr_build.h XdxrLayout::pair), between the boxes and the accumulators so that no offset of these
+// depends on pc.arg0 (MODE_TRIANGLES writes the first two, and its arg0 is the vertex stride):
+bool paired() { return (pc.flags & FLAG_TLAS) == 0u && (pc.flags & FLAG_PAIR) != 0u; }
+const uint SCRATCH_LEAF_COUNT = 28u;                                  // the leaves the build keeps
+uint stage_off() { return boxes_off() + 24u * pc.elements; }          // the leaves while the pairs are chosen
+uint lkeep_off() { return stage_off() + 64u * pc.elements; }          // 1 when the leaf stays, 0 when dropped
+uint lmap_off() { return lkeep_off() + 4u * pc.elements; }            // a kept leaf's place among them
+uint partner_off() { return lmap_off() + 4u * pc.elements; }          // a paired sibling: the first triangle's element
+uint ltile_counts_off() { return partner_off() + 4u * pc.elements; }  // kept leaves per tile of RADIX_TILE
+uint ltile_offsets_off() { return ltile_counts_off() + 4u * radix_tiles(); }
+uint pairing_end() { return paired() ? ltile_offsets_off() + 4u * radix_tiles() : stage_off(); }
 // 8 words per node: the arrival counter, the ordered min x y z (atomicMin), the ordered max x y z (atomicMax), unused
-uint accum_off() { return boxes_off() + 24u * pc.elements; }
+uint accum_off() { return pairing_end(); }
 uint inner() { return pc.elements > 1u ? pc.elements - 1u : 0u; }   // inner nodes of the binary tree
 uint left_off() { return accum_off() + 32u * pc.arg0; }
 uint right_off() { return left_off() + 4u * inner(); }
@@ -209,8 +231,17 @@ bool is_tlas() { return (pc.flags & FLAG_TLAS) != 0u; }
 bool is_box16() { return (pc.flags & FLAG_BOX16) != 0u; }
 uint element_size() { return is_tlas() ? 128u : 64u; }
 uint node_size() { return is_box16() ? 64u : 128u; }
-uint element_ptr(uint e) { return ((pc.elements_off + e * element_size()) >> 6) << 3 | (is_tlas() ? INSTANCE : TRI0); }
-uint node_ptr(uint n) { return ((pc.nodes_off + n * node_size()) >> 6) << 3 | (is_box16() ? BOX16 : BOX32); }
+// Where the nodes start: after the kept leaves when pairing (valid from MODE_LEAF_SCAN on), else the layout's place.
+uint nodes_off() { return paired() ? pc.elements_off + 64u * load(pc.scratch, SCRATCH_LEAF_COUNT) : pc.nodes_off; }
+// Element e's record; when pairing, its kept leaf's place (valid from MODE_LEAF_INDEX on, for a kept leaf).
+uint element_ptr(uint e) {
+    uint slot = paired() ? load(pc.scratch, lmap_off() + 4u * e) : e;
+    return ((pc.elements_off + slot * element_size()) >> 6) << 3 | (is_tlas() ? INSTANCE : TRI0);
+}
+uint node_ptr(uint n) { return ((nodes_off() + n * node_size()) >> 6) << 3 | (is_box16() ? BOX16 : BOX32); }
+// The leaf element e writes: in the structure at its own slot, or when pairing in scratch until MODE_LEAF_PLACE.
+uvec2 leaf_buf() { return paired() ? pc.scratch : pc.dst; }
+uint leaf_off(uint e) { return (paired() ? stage_off() : pc.elements_off) + 64u * e; }
 uint ptr_unit(uint p) { return p >> 3; }
 bool ptr_is_node(uint p) { return (p & 7u) == BOX16 || (p & 7u) == BOX32; }
 
@@ -272,16 +303,21 @@ void build_triangle(uint t) {
     vec3 v[3];
     for (uint k = 0u; k < 3u; ++k) v[k] = transformed(vertex(index_of(3u * t + k)));
     uint e = pc.first + t;
-    uint o = pc.elements_off + 64u * e;
+    uvec2 b = leaf_buf();
+    uint o = leaf_off(e);
     for (uint k = 0u; k < 3u; ++k) {
-        storef(pc.dst, o + 12u * k, v[k].x); storef(pc.dst, o + 12u * k + 4u, v[k].y);
-        storef(pc.dst, o + 12u * k + 8u, v[k].z);
+        storef(b, o + 12u * k, v[k].x); storef(b, o + 12u * k + 4u, v[k].y);
+        storef(b, o + 12u * k + 8u, v[k].z);
     }
-    storef(pc.dst, o + 36u, v[2].x); storef(pc.dst, o + 40u, v[2].y); storef(pc.dst, o + 44u, v[2].z);  // slot 3 unused
-    store(pc.dst, o + 48u, pc.geometry);
-    store(pc.dst, o + 52u, t);                 // primitive index within its geometry
-    store(pc.dst, o + 56u, INVALID);           // no TRI1 in this leaf
-    store(pc.dst, o + 60u, REMAP_IDENTITY);
+    storef(b, o + 36u, v[2].x); storef(b, o + 40u, v[2].y); storef(b, o + 44u, v[2].z);  // slot 3 unused
+    store(b, o + 48u, pc.geometry);
+    store(b, o + 52u, t);                      // primitive index within its geometry
+    store(b, o + 56u, INVALID);                // no TRI1 in this leaf
+    store(b, o + 60u, REMAP_IDENTITY);
+    if (paired()) {                            // kept and unpaired until MODE_PAIR says otherwise
+        store(pc.scratch, lkeep_off() + 4u * e, 1u);
+        store(pc.scratch, partner_off() + 4u * e, INVALID);
+    }
     // D3D12: a triangle whose first vertex has a NaN x is inactive, and so is one with a NaN anywhere it cannot
     // be hit; an empty box keeps it out of every traversal and of the centroid bounds.
     bool nan_any = any(isnan(v[0])) || any(isnan(v[1])) || any(isnan(v[2]));
@@ -487,23 +523,24 @@ void radix_scatter(uint w, uint t) {
 // from the same geometry and both active, go into the first one's leaf: TRI0 reads slots (0, 1, 2) and TRI1 (1, 3, 2)
 // (docs/bvh.md 7a), so the first triangle is rotated to put the shared edge in slots 1 -> 2, the sibling's third
 // vertex goes in slot 3, its primitive index in PrimitiveIndex2 and its remap byte in byte 1. The node keeps one child
-// per triangle, each with its own box, so the tree is unchanged: the TRI1 child points at the first triangle's leaf
-// and the sibling's own leaf is left unreferenced. Both pointers have this node as parent. Pairs never cross nodes,
-// so no other thread touches these leaves. The barycentric remap byte of a node type returns D3D12's (b1, b2): bits
-// [1:0] and [3:2] are the positions, in the order that node type reads its slots, of the triangle's vertices 1 and 2.
-// MODE_NODES records each element's pointer (TRI0, or TRI1 for a paired sibling) for MODE_PROPAGATE. ----
-uint leaf_off(uint e) { return pc.elements_off + 64u * e; }
+// per triangle, each with its own box, so the tree is unchanged: the TRI1 child points at the first triangle's leaf,
+// and the sibling's own leaf is dropped (MODE_LEAF_PLACE does not write it). Both pointers have this node as parent.
+// Pairs never cross nodes, so no other thread touches these leaves. The barycentric remap byte of a node type returns
+// D3D12's (b1, b2): bits [1:0] and [3:2] are the positions, in the order that node type reads its slots, of the
+// triangle's vertices 1 and 2. MODE_PAIR runs on the leaves in scratch and records each sibling's partner; MODE_NODES
+// records each element's pointer (TRI0, or TRI1 for a paired sibling) for MODE_PROPAGATE. ----
 uvec3 leaf_vertex(uint e, uint k) {
     uint o = leaf_off(e) + 12u * k;
-    return uvec3(load(pc.dst, o), load(pc.dst, o + 4u), load(pc.dst, o + 8u));
+    uvec2 b = leaf_buf();
+    return uvec3(load(b, o), load(b, o + 4u), load(b, o + 8u));
 }
 void store_vertex(uint e, uint slot, uvec3 v) {
     uint o = leaf_off(e) + 12u * slot;
-    store(pc.dst, o, v.x); store(pc.dst, o + 4u, v.y); store(pc.dst, o + 8u, v.z);
+    uvec2 b = leaf_buf();
+    store(b, o, v.x); store(b, o + 4u, v.y); store(b, o + 8u, v.z);
 }
-// e[c]: the element of child slot c, INVALID when the slot holds an inner node or nothing; kids[c] already holds
-// element_ptr(e[c]) for an element.
-void pair_children(uint e[4], inout uint kids[4]) {
+// e[c]: the element of child slot c, INVALID when the slot holds an inner node or nothing.
+void pair_children(uint e[4]) {
     uvec3 v[4][3];
     uint geo[4];
     bool live[4], used[4];
@@ -511,7 +548,7 @@ void pair_children(uint e[4], inout uint kids[4]) {
         live[c] = false; used[c] = false; geo[c] = 0u;
         for (uint k = 0u; k < 3u; ++k) v[c][k] = uvec3(0u);
         if (e[c] == INVALID) continue;
-        geo[c] = load(pc.dst, leaf_off(e[c]) + 48u);
+        geo[c] = load(leaf_buf(), leaf_off(e[c]) + 48u);
         for (uint k = 0u; k < 3u; ++k) v[c][k] = leaf_vertex(e[c], k);
         vec3 lo, hi;
         load_box(e[c], lo, hi);
@@ -538,13 +575,15 @@ void pair_children(uint e[4], inout uint kids[4]) {
             store_vertex(e[c], 1u, v[c][k]);
             store_vertex(e[c], 2u, v[c][(k + 1u) % 3u]);
             store_vertex(e[c], 3u, v[d][(kd + 2u) % 3u]);
-            store(pc.dst, leaf_off(e[c]) + 56u, load(pc.dst, leaf_off(e[d]) + 52u));
+            uvec2 b = leaf_buf();
+            store(b, leaf_off(e[c]) + 56u, load(b, leaf_off(e[d]) + 52u));
             // TRI0 reads (p0, p1, p2): vertex m of the first triangle is in slot (m + 4 - k) % 3. TRI1 reads
             // (p1, p3, p2): vertex m of the sibling is in slot (m + 5 - kd) % 3.
             uint remap0 = (5u - k) % 3u | ((6u - k) % 3u) << 2;
             uint remap1 = (6u - kd) % 3u | ((7u - kd) % 3u) << 2;
-            store(pc.dst, leaf_off(e[c]) + 60u, remap0 | remap1 << 8);
-            kids[d] = (kids[c] & ~7u) | TRI1;
+            store(b, leaf_off(e[c]) + 60u, remap0 | remap1 << 8);
+            store(pc.scratch, lkeep_off() + 4u * e[d], 0u);       // the sibling's own leaf is dropped
+            store(pc.scratch, partner_off() + 4u * e[d], e[c]);   // MODE_NODES points its TRI1 child at e[c]'s leaf
             break;
         }
     }
@@ -611,14 +650,14 @@ void kept_flags(uint w, uint t) {
     if (t == 0u) store(pc.scratch, ktile_counts_off() + 4u * w, kept_count);
 }
 
-// Workgroup w: each kept node's index, the tile's base plus the kept nodes before it in the tile, read in chunks
-// of 64 with an inclusive scan of the flags.
-void kept_index(uint w, uint t) {
-    uint base = load(pc.scratch, ktile_offsets_off() + 4u * w);
-    uint begin = w * RADIX_TILE, end = min(begin + RADIX_TILE, inner());
+// Workgroup w, over n flags at `flags` in tiles of RADIX_TILE: each set flag's index at `map`, the tile's base (at
+// `offsets`) plus the set flags before it in the tile, read in chunks of 64 with an inclusive scan of the flags.
+void tile_index(uint w, uint t, uint flags, uint n, uint offsets, uint map) {
+    uint base = load(pc.scratch, offsets + 4u * w);
+    uint begin = w * RADIX_TILE, end = min(begin + RADIX_TILE, n);
     for (uint chunk = begin; chunk < end; chunk += 64u) {
         uint i = chunk + t;
-        uint flag = i < end ? load(pc.scratch, kept_off() + 4u * i) : 0u;
+        uint flag = i < end ? load(pc.scratch, flags + 4u * i) : 0u;
         kept_scan[t] = flag;
         barrier();
         for (uint step = 1u; step < 64u; step <<= 1) {
@@ -627,10 +666,30 @@ void kept_index(uint w, uint t) {
             kept_scan[t] += add;
             barrier();
         }
-        if (flag != 0u) store(pc.scratch, kmap_off() + 4u * i, base + kept_scan[t] - 1u);
+        if (flag != 0u) store(pc.scratch, map + 4u * i, base + kept_scan[t] - 1u);
         base += kept_scan[63];
         barrier();
     }
+}
+void kept_index(uint w, uint t) { tile_index(w, t, kept_off(), inner(), ktile_offsets_off(), kmap_off()); }
+
+// MODE_LEAF_COUNT, workgroup w: the kept leaves of its tile of elements.
+void leaf_count(uint w, uint t) {
+    if (t == 0u) kept_count = 0u;
+    barrier();
+    uint begin = w * RADIX_TILE, end = min(begin + RADIX_TILE, pc.elements);
+    for (uint i = begin + t; i < end; i += 64u)
+        if (load(pc.scratch, lkeep_off() + 4u * i) != 0u) atomicAdd(kept_count, 1u);
+    barrier();
+    if (t == 0u) store(pc.scratch, ltile_counts_off() + 4u * w, kept_count);
+}
+
+// MODE_LEAF_PLACE, word i of the leaves in scratch: a kept leaf's word to its place in the structure.
+void leaf_place(uint i) {
+    uint e = i / 16u;
+    if (load(pc.scratch, lkeep_off() + 4u * e) == 0u) return;
+    uint to = pc.elements_off + 64u * load(pc.scratch, lmap_off() + 4u * e) + 4u * (i % 16u);
+    store(pc.dst, to, load(pc.scratch, stage_off() + 4u * i));
 }
 
 // ---- MODE_NODES ----
@@ -659,6 +718,34 @@ void store_slot_box(uint o, uint c, bool box16, vec3 lo, vec3 hi) {
     storef(pc.dst, b + 12u, hi.x); storef(pc.dst, b + 16u, hi.y); storef(pc.dst, b + 20u, hi.z);
 }
 
+// The children of kept inner node i's box node, as binary-tree codes (LEAF | sorted position for an element, or an
+// inner node): the children of its two children, an element counting as its own child, so two to four. The rest of
+// `codes` is INVALID.
+void node_children(uint i, out uint codes[4]) {
+    codes = uint[4](INVALID, INVALID, INVALID, INVALID);
+    uint n = 0u;
+    uint halves[2] = uint[2](load(pc.scratch, left_off() + 4u * i), load(pc.scratch, right_off() + 4u * i));
+    for (uint h = 0u; h < 2u; ++h) {
+        uint c = halves[h];
+        if ((c & LEAF) != 0u) {
+            codes[n++] = c;
+            continue;
+        }
+        codes[n++] = load(pc.scratch, left_off() + 4u * c);
+        codes[n++] = load(pc.scratch, right_off() + 4u * c);
+    }
+}
+
+// MODE_PAIR: the pairs among kept inner node i's triangle children (FLAG_PAIR, so two or more elements).
+void pair_node(uint i) {
+    if (load(pc.scratch, kept_off() + 4u * i) == 0u) return;
+    uint codes[4];
+    node_children(i, codes);
+    uint elems[4];
+    for (uint c = 0u; c < 4u; ++c) elems[c] = codes[c] == INVALID ? INVALID : child_element(codes[c]);
+    pair_children(elems);
+}
+
 void build_node(uint i) {
     uint kids[4] = uint[4](INVALID, INVALID, INVALID, INVALID);
     uint elems[4] = uint[4](INVALID, INVALID, INVALID, INVALID);
@@ -672,28 +759,25 @@ void build_node(uint i) {
         if (load(pc.scratch, kept_off() + 4u * i) == 0u) return;
         node = load(pc.scratch, kmap_off() + 4u * i);
         if (node >= pc.arg0) return;                    // the layout's bound (xdxr_build.h) makes this impossible
-        uint n = 0u;
-        uint halves[2] = uint[2](load(pc.scratch, left_off() + 4u * i), load(pc.scratch, right_off() + 4u * i));
-        for (uint h = 0u; h < 2u; ++h) {
-            uint c = halves[h];
-            uint grand[2] = uint[2](c, c);
-            uint m = 1u;
-            if ((c & LEAF) == 0u) {
-                grand[0] = load(pc.scratch, left_off() + 4u * c);
-                grand[1] = load(pc.scratch, right_off() + 4u * c);
-                m = 2u;
-            }
-            for (uint g = 0u; g < m; ++g) {
-                elems[n] = child_element(grand[g]);
-                kids[n++] = child_ptr(grand[g]);
+        uint codes[4];
+        node_children(i, codes);
+        for (uint c = 0u; c < 4u; ++c) {
+            if (codes[c] == INVALID) continue;
+            elems[c] = child_element(codes[c]);
+            kids[c] = child_ptr(codes[c]);
+        }
+        if (paired()) {                                 // a sibling MODE_PAIR paired: TRI1 in its partner's leaf
+            for (uint c = 0u; c < 4u; ++c) {
+                if (elems[c] == INVALID) continue;
+                uint partner = load(pc.scratch, partner_off() + 4u * elems[c]);
+                if (partner != INVALID) kids[c] = (element_ptr(partner) & ~7u) | TRI1;
             }
         }
-        if (!is_tlas() && (pc.flags & FLAG_PAIR) != 0u) pair_children(elems, kids);
     }
     for (uint c = 0u; c < 4u; ++c)
         if (elems[c] != INVALID) store(pc.scratch, tptr_off() + 4u * elems[c], kids[c]);
     uint me = node_ptr(node);
-    uint o = pc.nodes_off + node_size() * node;
+    uint o = nodes_off() + node_size() * node;
     for (uint c = 0u; c < 4u; ++c) {
         store(pc.dst, o + 4u * c, kids[c]);
         if (kids[c] != INVALID) {                       // MODE_PROPAGATE writes its box
@@ -710,7 +794,7 @@ void build_node(uint i) {
 // ---- MODE_PROPAGATE ----
 uint parent_of(uint p) { return load(pc.dst, pc.parents_off + 4u * (ptr_unit(p) - pc.elements_off / 64u)); }
 bool ptr_box16(uint p) { return (p & 7u) == BOX16; }
-uint node_index(uint p) { return (ptr_unit(p) * 64u - pc.nodes_off) / (ptr_box16(p) ? 64u : 128u); }
+uint node_index(uint p) { return (ptr_unit(p) * 64u - nodes_off()) / (ptr_box16(p) ? 64u : 128u); }
 void accum_box(uint node, out vec3 lo, out vec3 hi) {
     Words a = accum(node);
     uint w[6];
@@ -761,7 +845,7 @@ void build_header() {
     storef(pc.dst, 28u, hi.x); storef(pc.dst, 32u, hi.y); storef(pc.dst, 36u, hi.z);
     if (pc.arg2 == 1u) return;                          // an update: the rest is the source's, unchanged
     uint nodes = pc.elements <= 1u ? 1u : load(pc.scratch, SCRATCH_NODE_COUNT);
-    uint end = pc.nodes_off + node_size() * nodes;
+    uint end = nodes_off() + node_size() * nodes;
     if (is_box16()) {                                   // the spare unit after the last node (xdxr_build.h)
         for (uint k = 0u; k < 16u; ++k) store(pc.dst, end + 4u * k, 0u);
         end += 64u;
@@ -770,7 +854,7 @@ void build_header() {
     store(pc.dst, 4u, end / 64u - 1u);                  // totalSizeIn64BNodes does not count the header
     store(pc.dst, 8u, 0u);                               // crc32: not computed for runtime builds
     store(pc.dst, 12u, pc.elements);
-    store(pc.dst, 40u, pc.nodes_off);
+    store(pc.dst, 40u, nodes_off());
     store(pc.dst, 44u, 0u);                              // offsetToPrimRemap
     store(pc.dst, 48u, node_ptr(0u));
     store(pc.dst, 52u, pc.elements_off);
@@ -858,6 +942,15 @@ void main() {
         return;
     }
     if (pc.mode == MODE_KEPT_INDEX) { kept_index(gl_WorkGroupID.x, gl_LocalInvocationID.x); return; }
+    if (pc.mode == MODE_LEAF_COUNT) { leaf_count(gl_WorkGroupID.x, gl_LocalInvocationID.x); return; }
+    if (pc.mode == MODE_LEAF_SCAN) {
+        scan(gl_LocalInvocationID.x, ltile_counts_off(), ltile_offsets_off(), radix_tiles(), SCRATCH_LEAF_COUNT);
+        return;
+    }
+    if (pc.mode == MODE_LEAF_INDEX) {
+        tile_index(gl_WorkGroupID.x, gl_LocalInvocationID.x, lkeep_off(), pc.elements, ltile_offsets_off(), lmap_off());
+        return;
+    }
     if (pc.mode == MODE_HEADER) {
         if (i == 0u) build_header();
         return;
@@ -884,6 +977,10 @@ void main() {
         morton(i);
     } else if (pc.mode == MODE_KARRAS) {
         karras(int(i));
+    } else if (pc.mode == MODE_PAIR) {
+        pair_node(i);
+    } else if (pc.mode == MODE_LEAF_PLACE) {
+        leaf_place(i);
     } else if (pc.mode == MODE_NODES) {
         build_node(i);
     } else if (pc.mode == MODE_PROPAGATE) {

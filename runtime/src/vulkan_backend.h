@@ -1081,7 +1081,8 @@ public:
                     XdxrLayout layout;
                     // An update needs ALLOW_UPDATE (D3D12 requires it on the build and the update): a structure
                     // built without it may have paired leaves, which a refit would rewrite as wrong geometry.
-                    return xdxr_inputs(b, nullptr, 0) && layout.compute(xdxr_elements(b), b.is_tlas, xdxr_box16(b)) &&
+                    return xdxr_inputs(b, nullptr, 0) &&
+                           layout.compute(xdxr_elements(b), b.is_tlas, xdxr_box16(b), xdxr_pair(b)) &&
                            b.dst_va && b.scratch_va && (!b.is_tlas || !b.instance_count || b.instances_va) &&
                            (!b.update || (b.build_flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) != 0);
                 };
@@ -1090,7 +1091,7 @@ public:
                     // and the BLAS addresses in instance descs get the same bias.
                     const std::uint64_t base = replay_.heap_base;
                     XdxrLayout layout;
-                    layout.compute(xdxr_elements(b), b.is_tlas, xdxr_box16(b));
+                    layout.compute(xdxr_elements(b), b.is_tlas, xdxr_box16(b), xdxr_pair(b));
                     // PERFORM_UPDATE refits the source (the destination itself when no source is given, as D3D12
                     // allows for an in-place update); a full build otherwise.
                     const std::uint64_t from = b.update ? base + (b.src_va ? b.src_va : b.dst_va) : 0;
@@ -1477,8 +1478,8 @@ public:
     }
     // Whether a bottom-level build pairs sibling triangles into TRI0/TRI1 leaves: not when the structure may be
     // updated (ALLOW_UPDATE), since a refit rewrites the leaves one triangle each and would leave every TRI1 child
-    // reading wrong vertices. xdxr_check refuses an update without ALLOW_UPDATE for that reason. Pairing changes
-    // neither the layout nor the tree, so prebuild info does not depend on it.
+    // reading wrong vertices. xdxr_check refuses an update without ALLOW_UPDATE for that reason. Pairing keeps the
+    // tree and the result's room; it needs more scratch (XdxrLayout::pair), so prebuild info reads the same flag.
     static bool xdxr_pair(const BuildAccelerationStructure& b) {
         return !b.is_tlas && !b.update && (b.build_flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) == 0;
     }

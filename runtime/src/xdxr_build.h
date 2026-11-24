@@ -56,12 +56,19 @@ struct XdxrLayout {
     static constexpr std::uint32_t radix_passes = 8;
     static constexpr std::uint32_t small_sort_max = 1024;  // xdxr_build.comp SMALL_SORT_MAX: one-workgroup sort
     std::uint64_t scratch = 0;         // scratch bytes
+    // A bottom-level build that may pair its triangles into TRI0/TRI1 leaves (xdxr_build.comp MODE_PAIR): its
+    // scratch also holds the leaves while the pairs are chosen, so that the build can write only the leaves it keeps,
+    // one 64-byte record per pair, with the nodes right after them. Such a build is smaller than `size` by 64 bytes a
+    // pair; `nodes_off` is where the nodes start when nothing pairs, and the header (+40) gives where they are.
+    bool pair = false;
 
     // False when the count would overflow the 32-bit offsets of the format. `half_boxes`: BOX16 inner nodes.
-    bool compute(std::uint32_t count, bool top_level, bool half_boxes = false) {
+    // `pairing`: room for TRI1 pairing (bottom level, two or more triangles; record_blas pairs only with it).
+    bool compute(std::uint32_t count, bool top_level, bool half_boxes = false, bool pairing = false) {
         *this = XdxrLayout{};
         tlas = top_level;
         box16 = half_boxes;
+        pair = pairing && !top_level && count >= 2;
         node_size = box16 ? 64u : 128u;
         elements = count;
         element_size = tlas ? 128u : 64u;
@@ -94,6 +101,10 @@ struct XdxrLayout {
         // each element's pointer in the tree
         scratch = 64 + 16ull * sort_size + 8ull * radix_bins * tiles() + 24ull * count + 32ull * nodes +
                   20ull * inner() + 8ull * kept_tiles() + 4ull * count;
+        // pairing: the leaves (64 bytes each), then per leaf whether the build keeps it, its place among the kept
+        // ones and the leaf its triangle was paired into, and a kept count per tile with its prefix sum
+        if (pair) scratch += 76ull * count + 8ull * tiles();
+        if (scratch >= (std::uint64_t(1) << 32)) return false;   // the shader's scratch offsets are 32-bit
         return true;
     }
     std::uint32_t tiles() const { return (sort_size + radix_tile - 1) / radix_tile; }
@@ -135,10 +146,11 @@ public:
     // to the new positions. Its tree is kept and only its boxes change, which is valid for any motion and costs no
     // sort, though a refitted tree traverses more slowly as the geometry moves away from where it was built.
     //
-    // `pair`: sibling triangles that share an edge go into one leaf as TRI0 and TRI1 (xdxr_build.comp MODE_NODES).
-    // The layout and the tree are the same either way. A refit rewrites every leaf as one triangle, so a structure
-    // that will be updated must be built without pairing (the layer pairs only builds without ALLOW_UPDATE), and an
-    // update ignores `pair`.
+    // `pair`: sibling triangles that share an edge go into one leaf as TRI0 and TRI1 (xdxr_build.comp MODE_PAIR),
+    // when the layout was computed with `pairing`. The tree is the same either way; the leaves are written densely,
+    // one record a pair, so the build is 64 bytes smaller per pair (its header's size, COMPACTED_SIZE, and what a
+    // COMPACT copy keeps). A refit rewrites every leaf as one triangle, so a structure that will be updated must be
+    // built without pairing (the layer pairs only builds without ALLOW_UPDATE), and an update ignores `pair`.
     bool record_blas(VkCommandBuffer cb, const XdxrLayout& layout, const std::vector<XdxrTriangles>& geometries,
                      std::uint64_t dst, std::uint64_t scratch, std::uint64_t update_from = 0, bool pair = false) {
         if (!loaded_ || layout.tlas || !layout.size || !dst || !scratch) return false;
@@ -149,7 +161,7 @@ public:
         }
         if (total != layout.elements) return false;
         Push p = base(layout, dst, scratch);
-        if (pair && !update_from) p.flags |= flag_pair;
+        if (pair && !update_from && layout.pair) p.flags |= flag_pair;
         if (update_from) refit_begin(cb, layout, p, update_from); else begin(cb, layout, p);
         std::uint32_t first = 0;
         for (std::size_t g = 0; g < geometries.size(); ++g) {
@@ -256,7 +268,8 @@ private:
         mode_init = 0, mode_triangles = 1, mode_instances = 2, mode_morton = 3, mode_karras = 4, mode_nodes = 5,
         mode_header = 6, mode_radix_count = 7, mode_radix_scan = 8, mode_radix_scatter = 9, mode_small_sort = 10,
         mode_copy_as = 12, mode_postbuild = 13, mode_kept = 14, mode_kept_scan = 15,
-        mode_kept_index = 16, mode_propagate = 17, mode_clear = 18, mode_serialize = 19, mode_deserialize = 20
+        mode_kept_index = 16, mode_propagate = 17, mode_clear = 18, mode_serialize = 19, mode_deserialize = 20,
+        mode_pair = 21, mode_leaf_count = 22, mode_leaf_scan = 23, mode_leaf_index = 24, mode_leaf_place = 25
     };
     struct Addr { std::uint32_t lo = 0, hi = 0; };
     struct Push {  // xdxr_build.comp `Push`, std430 push-constant layout
@@ -364,6 +377,23 @@ private:
             dispatch(cb, t, 64);                       // one workgroup
             t.mode = mode_kept_index;
             dispatch(cb, t, 64 * l.kept_tiles());
+        }
+        // pairing: choose the pairs among each node's triangle children, number the leaves that stay, and write them
+        // densely; the nodes then start after the last one (xdxr_build.comp nodes_off())
+        if (p.flags & flag_pair) {
+            Push q = p;
+            q.mode = mode_pair;
+            q.count = l.inner();
+            dispatch(cb, q, q.count);
+            q.mode = mode_leaf_count;
+            dispatch(cb, q, 64 * l.tiles());           // one workgroup of 64 per tile
+            q.mode = mode_leaf_scan;
+            dispatch(cb, q, 64);                       // one workgroup
+            q.mode = mode_leaf_index;
+            dispatch(cb, q, 64 * l.tiles());
+            q.mode = mode_leaf_place;
+            q.count = 16 * l.elements;                 // one thread per word of the leaves
+            dispatch(cb, q, q.count);
         }
         Push n = p;
         n.mode = mode_nodes;

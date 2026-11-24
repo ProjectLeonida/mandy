@@ -11,7 +11,9 @@
 // BOX16 builds (blas_box16_*: half boxes, which check-build compares bit for bit with tools/xdxr_bvh.py encode_box16),
 // including coordinates past the half range and below its smallest normal, and a refit; TRI1 pairing (blas_paired_*:
 // sibling triangles that share an edge in one leaf), on grids, BOX16, a transform, inactive triangles, triangles that
-// share an edge in the same direction or across geometries (never paired), and the radix-sort path.
+// share an edge in the same direction or across geometries (never paired), and the radix-sort path; a paired grid
+// is 64 bytes a pair smaller than the same grid unpaired (blas_grid_unpaired), and keeps that size through its
+// COMPACTED_SIZE and a COMPACT copy (blas_paired_compacted).
 // Exit 77 when there is no Vulkan device with bufferDeviceAddress.
 // `vk_xdxr_build_test <out dir> <triangles>` instead times BLAS builds of that many random triangles (wall clock of
 // one submission each, after one warm-up; result and scratch in device-local memory), then in-place updates
@@ -126,6 +128,23 @@ void expand(const Geometry& g, std::uint32_t geometry, std::vector<Tri>& out) {
     }
 }
 
+// The TRI1 child pointers in a structure's nodes (from the header's offsetToNodes to its end): the triangles paired
+// into another triangle's leaf. A BOX16 structure's spare last unit is zero, a TRI0 pointer, so it adds nothing.
+std::uint32_t count_tri1(const char* s, std::size_t size) {
+    std::uint32_t nodes_off = 0, root = 0, n = 0;
+    std::memcpy(&nodes_off, s + 40, 4);
+    std::memcpy(&root, s + 48, 4);
+    const std::size_t step = (root & 7u) == 4u ? 64 : 128;     // BOX16 or BOX32 nodes
+    for (std::size_t o = nodes_off; o + 16 <= size; o += step) {
+        for (int c = 0; c < 4; ++c) {
+            std::uint32_t p = 0;
+            std::memcpy(&p, s + o + 4 * c, 4);
+            if (p != 0xffffffffu && (p & 7u) == 1u) ++n;
+        }
+    }
+    return n;
+}
+
 struct Built {
     std::uint64_t address = 0;
     std::size_t size = 0;              // as the header gives it
@@ -181,7 +200,7 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
         total += geo.triangle_count;
     }
     XdxrLayout layout;
-    EXPECT(layout.compute(total, false, box16));
+    EXPECT(layout.compute(total, false, box16, pair));
     Buffer dst = make(gpu, layout.size + 256), scratch = make(gpu, std::size_t(layout.scratch));
     EXPECT(dst.buffer && scratch.buffer);
     const std::uint64_t base = (dst.address + 255) & ~std::uint64_t(255);   // 256-byte aligned, as D3D12 requires
@@ -209,7 +228,9 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
     };
     if (!moved) {
         EXPECT(dump(name, dst, base, built.tris));
-        std::printf("%s: %u triangles, %u bytes, %u nodes\n", name.c_str(), total, layout.size, layout.nodes);
+        // a paired build writes one leaf a pair, so it ends below the layout's room by more than the unused nodes
+        std::printf("%s: %u triangles, %zu of %u bytes, room for %u nodes\n", name.c_str(), total, built.size,
+                    layout.size, layout.nodes);
         return 0;
     }
     // the update: new positions in the same vertex buffers, then a refit of the structure just built
@@ -409,6 +430,31 @@ int main(int argc, char** argv) {
         Geometry pg = grid(12, 4, false);
         pg.u16 = true;
         if (build_blas(gpu, builder, dir, "blas_paired_grid", {pg}, p0, 0, nullptr, false, false, true)) return 1;
+        // Pairing saves a leaf a pair: the same grid unpaired (the same tree) is longer by exactly 64 bytes per TRI1
+        // child, and COMPACTED_SIZE and a COMPACT copy keep the smaller size.
+        Built u0;
+        if (build_blas(gpu, builder, dir, "blas_grid_unpaired", {pg}, u0)) return 1;
+        {
+            Buffer info = make(gpu, 8), packed = make(gpu, p0.size + 256);
+            EXPECT(info.buffer && packed.buffer);
+            const std::uint64_t packed_at = (packed.address + 255) & ~std::uint64_t(255);
+            EXPECT(gpu.run([&](VkCommandBuffer cb) {
+                const bool ok = builder.record_postbuild(cb, p0.address, info.address) &&
+                                builder.record_copy(cb, p0.address, packed_at, p0.size, XdxrBuilder::copy_compact);
+                barrier_to_host(gpu, cb);
+                return ok;
+            }));
+            std::uint64_t compacted = 0;
+            std::memcpy(&compacted, info.map, 8);
+            const char* bytes = static_cast<const char*>(packed.map) + (packed_at - packed.address);
+            const std::uint32_t pairs = count_tri1(bytes, p0.size);
+            EXPECT(pairs > 0 && compacted == p0.size && u0.size == p0.size + 64ull * pairs);
+            const std::string j = "{\"kind\": \"blas\", \"address\": " + std::to_string(packed_at) +
+                                  ", \"pairs\": true, \"box16\": false, \"triangles\": " + tris_json(p0.tris) + "}\n";
+            EXPECT(write_file(dir + "/blas_paired_compacted.bin", bytes, p0.size) &&
+                   write_file(dir + "/blas_paired_compacted.json", j.data(), j.size()));
+            std::printf("blas_paired_compacted: %u pairs, %zu bytes against %zu unpaired\n", pairs, p0.size, u0.size);
+        }
         if (build_blas(gpu, builder, dir, "blas_paired_grid_box16", {grid(9, 2, true)}, p1, 0, nullptr, false, true,
                        true))
             return 1;

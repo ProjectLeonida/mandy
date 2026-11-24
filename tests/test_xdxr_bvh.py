@@ -469,6 +469,34 @@ class Validate(unittest.TestCase):
         struct.pack_into("<f", b, root + 16, math.nan)
         self.assertTrue(any("NaN" in e for e in X.validate(bytes(b), expect_bottom=True)))
 
+    def test_leaves_are_dense(self):
+        # build_blas writes one leaf record a pair: no unit of the element region is left without a pointer
+        for pair in (False, True):
+            data, info = X.build_blas(X.grid_mesh(), pair=pair)
+            self.assertEqual(X.validate(data), [])
+            self.assertEqual(X.unreferenced_leaves(data), [])
+            self.assertEqual(info["leaves"], info["triangles"] - X.count_pairs(data))
+        self.assertGreater(X.count_pairs(data), 0)
+
+    def test_unreferenced_leaf_is_reported(self):
+        # Pair two sibling leaves the way the GPU builder did before it placed leaves densely: the second child
+        # becomes a TRI1 pointer into the first one's record, and its own record is left in the element region.
+        b = bytearray(self.data)
+        stack = [struct.unpack_from("<I", b, 48)[0]]
+        while stack:
+            p = stack.pop()
+            if p == X.INVALID or X.ptr_type(p) not in (X.BOX16, X.BOX32):
+                continue
+            kids = struct.unpack_from("<4I", b, X.ptr_offset(p))
+            leaves = [i for i, k in enumerate(kids) if k != X.INVALID and X.ptr_type(k) == X.TRI0]
+            if len(leaves) >= 2:
+                first, second = kids[leaves[0]], kids[leaves[1]]
+                struct.pack_into("<I", b, X.ptr_offset(p) + 4 * leaves[1], (first & ~7) | X.TRI1)
+                self.assertEqual(X.unreferenced_leaves(bytes(b)), [X.ptr_offset(second)])
+                return
+            stack.extend(kids)
+        self.fail("no node with two leaf children in the scene")
+
 
 
 def console_layout(data, k):

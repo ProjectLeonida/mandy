@@ -869,6 +869,25 @@ def count_pairs(data):
     return node_census(data).get(TRI1, 0)
 
 
+def unreferenced_leaves(data):
+    """Byte offsets of the 64-byte units of a valid bottom-level BVH's element region (offsetToElements up to
+    offsetToNodes) that no reachable triangle pointer names. build_blas, and the GPU builder since it writes one leaf
+    record a pair, lay the leaves out densely, so a build has none: every unit a pairing leaves unused is reclaimed."""
+    nodes_off, elements_off = struct.unpack_from("<I", data, 40)[0], struct.unpack_from("<I", data, 52)[0]
+    named = set()
+    stack = [struct.unpack_from("<I", data, 48)[0]]
+    while stack:
+        p = stack.pop()
+        if p == INVALID:
+            continue
+        kind = ptr_type(p)
+        if kind <= TRI3:
+            named.add(ptr_offset(p))
+        elif kind in (BOX16, BOX32):
+            stack.extend(struct.unpack_from("<4I", data, ptr_offset(p)))
+    return [off for off in range(elements_off, nodes_off, UNIT) if off not in named]
+
+
 # ---- checking a GPU build (runtime/test/vk_xdxr_build_test.cpp) ----
 def _case_names(directory):
     """Find cases using a literal directory and the usual JSON filename pattern."""
@@ -960,6 +979,10 @@ def check_build(directory, rays=300, seed=1):
             errs.append("built with pairing, but no TRI1 node is reachable")
         if desc.get("pairs") is False and pairs:
             errs.append(f"{pairs} TRI1 nodes, but none of its triangles may pair")
+        if desc["kind"] == "blas" and not errs:     # one leaf record a pair, nothing left unused between them
+            gaps = unreferenced_leaves(data)
+            if gaps:
+                errs.append(f"{len(gaps)} leaf records no triangle pointer names (the first at {gaps[0]:#x})")
         if desc.get("all_rotations") and not errs:   # every (first, sibling) rotation of a pair is exercised
             rotations = pair_rotations(data)
             if len(rotations) < 9:

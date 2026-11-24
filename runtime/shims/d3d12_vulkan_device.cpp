@@ -10611,14 +10611,18 @@ public:
         }
         auto& vk = state_.context->vk;
         if (state_.context->xdxr_acceleration_structures()) {
-            // XDXR records: the layout depends only on the triangle or instance count and on whether the nodes are
-            // BOX16 (MINIMIZE_MEMORY, bottom level; xdxr_build.h). Its size has room for the most nodes a tree of
-            // that many elements can have; a build's own size, in its header, is what COMPACTED_SIZE reports. An
-            // update refits (no sort); the build's scratch size covers it.
+            // XDXR records: the layout depends only on the triangle or instance count, on whether the nodes are
+            // BOX16 (MINIMIZE_MEMORY, bottom level; xdxr_build.h) and, for its scratch, on whether the triangles may
+            // pair (a bottom level without ALLOW_UPDATE). Its size has room for the most nodes a tree of that many
+            // elements can have and a leaf per triangle; a build's own size, in its header, is what COMPACTED_SIZE
+            // reports. An update refits (no sort); the build's scratch size covers it.
             leonida::BuildAccelerationStructure build{};
             build.is_tlas = is_tlas;
             if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY)
                 build.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR;
+            // a bottom-level build without ALLOW_UPDATE pairs its triangles, which takes more scratch
+            if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE)
+                build.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
             if (build.is_tlas) {
                 build.instance_count = desc->NumDescs;
             } else {
@@ -10637,7 +10641,7 @@ public:
             }
             leonida::XdxrLayout layout;
             if (!layout.compute(leonida::VulkanContext::xdxr_elements(build), build.is_tlas,
-                                leonida::VulkanContext::xdxr_box16(build)))
+                                leonida::VulkanContext::xdxr_box16(build), leonida::VulkanContext::xdxr_pair(build)))
                 return;
             out->ResultDataMaxSizeInBytes = layout.size;
             out->ScratchDataSizeInBytes = layout.scratch;

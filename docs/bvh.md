@@ -1064,26 +1064,39 @@ zeroed 64-byte unit after the last node it wrote, and the header's size counts i
 64-byte node would otherwise be read past the structure, or past a compacted copy of it.
 
 **TRI1 pairing.** A bottom-level build without `ALLOW_UPDATE` pairs triangles into TRI0/TRI1 leaves, as the console
-builder does in its offline BLASes (§4a, check 4 of "How a match is verified"). The pass that writes the nodes
-pairs each triangle child of a node with a later triangle child of the same node (among its at most four children)
+builder does in its offline BLASes (§4a, check 4 of "How a match is verified"). A pass after the tree is known
+(`MODE_PAIR`) pairs each triangle child of a node with a later triangle child of the same node (among its at most four children)
 when four things hold. The two must share an edge in opposite directions, with the same two vertices bit for bit. They must come from
 the same geometry, since a leaf holds one `GeometryIndexAndFlags`. And both must be active. The first triangle is
 rotated so the shared edge is slots 1 -> 2, the sibling's third vertex goes in slot 3, its primitive index in
 `PrimitiveIndex2`, and each node type's remap byte returns D3D12's barycentrics for its own vertex order. The node
-still has one child per triangle, each with its own box: the TRI1 child points at the first triangle's leaf, and the
-sibling's own leaf is left unused. The tree, the layout and the sizes are therefore the same as without pairing.
-Nothing is saved yet: reclaiming the unused leaves would need a compaction that moves records and rewrites pointers,
-and compaction here copies bytes. What pairing gives is the console's leaf format, with a pair's two triangles in
-one 64-byte record. Because pairs never cross nodes, one thread owns each leaf it rewrites, and both pointers of a
-pair have the same parent, so the parent table has one writer per entry. The pass records each triangle's pointer
+still has one child per triangle, each with its own box: the TRI1 child points at the first triangle's leaf, so the
+tree is the same as without pairing.
+
+The leaves are laid out densely, one 64-byte record a pair, as the console's are (§4a: one `Leaf` per entry, an entry
+holding the second primitive). A paired build writes its leaves to scratch first; once the pairs are chosen, a scan
+over the leaves that stay (the dropped ones are the siblings') gives each its place, they are copied into the
+element region in element order, and the nodes start right after the last one. `offsetToNodes` (+40) says where, and
+the nodes, their pointers and the parent table are written for those places directly, so nothing is moved
+afterwards. `numElements` stays the triangle count, as `build_blas` writes it, the count of triangle pointers. The
+build is therefore 64 bytes smaller per pair: its header's size, `COMPACTED_SIZE` and `CURRENT_SIZE`, and what a
+`COMPACT` copy keeps. The prebuild room is unchanged (a leaf per triangle, since the pairs are not known before the
+build); the scratch grows by 76 bytes a triangle for the leaves and their bookkeeping, and only for a bottom-level
+build without `ALLOW_UPDATE` (`XdxrLayout::pair`, which `GetRaytracingAccelerationStructurePrebuildInfo` reads from
+the same flag). On the 288-triangle grid of `vk_xdxr_build_test`, 80 pairs make it 34,048 bytes against 39,168
+unpaired; the 7,200-triangle grid's 2,208 pairs, 846,848 against 988,160 (14%). Because pairs never cross nodes, one
+thread owns each leaf it rewrites, and both pointers of a
+pair have the same parent, so the parent table has one writer per entry. The node pass records each triangle's pointer
 (TRI0, or TRI1 for the sibling) in scratch, so the bottom-up box pass finds the sibling's slot through the first
 triangle's leaf. On a sorted grid of 7,200 triangles, 2,208 of the 3,600 possible pairs form (2,625 with the tree of four
 consecutive elements: a radix-tree node often has an inner node among its children, and only triangle children
 pair). A refit rewrites every leaf as one triangle, so a structure that may be updated is
 not paired. **ASSUMPTION:** that pairing only siblings is close enough. The console builder's pairing rule is not
 traced; `tools/xdxr_bvh.py` `build_blas(pair=True)` pairs greedily over the whole mesh instead, and both traverse
-the same way. `check-build` compares barycentrics as well as hits, and checks that a paired case has TRI1 nodes and
-that cases that must not pair (other geometry, same direction) have none.
+the same way. `check-build` compares barycentrics as well as hits, and checks that a paired case has TRI1 nodes,
+that cases that must not pair (other geometry, same direction) have none, and that no 64-byte unit of a BLAS's
+element region is left without a triangle pointer (`unreferenced_leaves`: the unused sibling leaves the builder
+kept before it laid the leaves out densely).
 
 The node count depends on the keys. A kept node has two children only when both of its binary children are
 elements, so with N elements there are at most (3N - 2) / 4 nodes. `XdxrLayout` computes the result and scratch
@@ -1117,7 +1130,8 @@ names its BLASes by address, which a clone keeps. The size comes from the source
 a copy can follow a build in the same command list, and it is bounded by the destination resource. A build's size
 is the nodes it wrote, so `COMPACTED_SIZE` and `CURRENT_SIZE` (from
 `EmitRaytracingAccelerationStructurePostbuildInfo` or the postbuild descs of a build) are both
-`64 * (totalSizeIn64BNodes + 1)`, and compaction gives back the room the layout left for more nodes. The
+`64 * (totalSizeIn64BNodes + 1)`, and compaction gives back the room the layout left for more nodes and, in a
+paired build, the 64 bytes a pair its leaves no longer take. The
 tools-visualization copy mode and postbuild type are refused at replay as unsupported, not faked. In
 `LEONIDA_RT_AS=khr` mode the postbuild descs stay ignored and serialization is refused, as before.
 
@@ -1143,8 +1157,9 @@ copies must equal the originals byte for byte but for the three BLAS addresses, 
 1,000 rays through each against brute force (RTX 5070 Ti, NVIDIA 617.42, and the Ryzen 9 7900X's Radeon 610M, AMD
 2026.04.17, Windows 11: 0 rays differ).
 
-Not done yet: a compaction that reclaims the leaves that pairing leaves unused. A surface-area
-collapse of the radix tree, or treelet restructuring, would trim a few more steps.
+Not done yet: a surface-area collapse of the radix tree, or treelet restructuring, would trim a few more steps; the
+room the layout keeps for the most nodes a tree can have, and for a leaf per triangle, is only given back by a
+`COMPACT` copy.
 
 ```powershell
 python -I tools/xdxr_bvh.py selftest --seed 1 --rays 400   # build BLASes, compare closest hits with brute force

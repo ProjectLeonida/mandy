@@ -8,8 +8,9 @@
 // buffer of exactly that size, written as d3d12_blas_compacted as <case>.bin + <case>.json at their console GPU virtual addresses.
 // Last, the BLAS again with MINIMIZE_MEMORY (BOX16 nodes: a smaller prebuild size and postbuild size), written as
 // d3d12_blas_box16, then updated in place with the same flags (d3d12_blas_box16_update); and once more without
-// ALLOW_UPDATE, so that its triangles are paired into TRI0/TRI1 leaves (d3d12_blas_paired; the ALLOW_UPDATE builds
-// must have no pairs, since a refit rewrites the leaves one triangle each). Then serialization: the SERIALIZATION
+// ALLOW_UPDATE, so that its triangles are paired into TRI0/TRI1 leaves, one record a pair, with its own (larger)
+// prebuild scratch (d3d12_blas_paired; the ALLOW_UPDATE builds must have no pairs, since a refit rewrites the leaves
+// one triangle each). Then serialization: the SERIALIZATION
 // postbuild info, SERIALIZE of the BLAS and the TLAS (header, identifier, BLAS pointers, bytes), DESERIALIZE of the
 // BLAS to another address and of the TLAS with its serialized BLAS pointers rewritten to point there, written as
 // d3d12_blas_deserialized and d3d12_tlas_deserialized.
@@ -474,24 +475,29 @@ int main(int argc, char** argv) {
     std::printf("d3d12_xdxr_rt: MINIMIZE_MEMORY BLAS %llu bytes (BOX16)\n", static_cast<unsigned long long>(box16_size));
 
     // ---- a BLAS that will not be updated (no ALLOW_UPDATE): sibling triangles that share an edge are paired into
-    // TRI0/TRI1 leaves. Pairing changes neither the layout nor the size ----
+    // TRI0/TRI1 leaves, one 64-byte record a pair. The prebuild room is the same (a leaf per triangle) and the
+    // scratch larger (the leaves wait there while the pairs are chosen); the build is 64 bytes smaller per pair ----
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS static_inputs = blas_inputs;
     static_inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO static_info{};
     device->GetRaytracingAccelerationStructurePrebuildInfo(&static_inputs, &static_info);
     if (static_info.ResultDataMaxSizeInBytes != blas_info.ResultDataMaxSizeInBytes)
         return fail("a BLAS without ALLOW_UPDATE has another prebuild size");
-    Ref<ID3D12Resource> static_blas, static_rb;
+    if (static_info.ScratchDataSizeInBytes <= blas_info.ScratchDataSizeInBytes)
+        return fail("a BLAS that pairs its triangles asks for no more scratch");
+    Ref<ID3D12Resource> static_blas, static_rb, static_scratch;
     if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, static_info.ResultDataMaxSizeInBytes, as_state, uav,
                            static_blas.put())) ||
         FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, static_info.ResultDataMaxSizeInBytes,
-                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, static_rb.put())))
+                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, static_rb.put())) ||
+        FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, static_info.ScratchDataSizeInBytes,
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS, uav, static_scratch.put())))
         return fail("static BLAS buffers", hr);
     if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for the static BLAS");
     build = {};
     build.Inputs = static_inputs;
     build.DestAccelerationStructureData = static_blas->GetGPUVirtualAddress();
-    build.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+    build.ScratchAccelerationStructureData = static_scratch->GetGPUVirtualAddress();
     list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
     list->ResourceBarrier(1, &barrier);
     list->CopyBufferRegion(static_rb.p, 0, static_blas.p, 0, static_info.ResultDataMaxSizeInBytes);
@@ -500,6 +506,34 @@ int main(int argc, char** argv) {
               "{\"kind\": \"blas\", \"pairs\": true, \"address\": " +
                   std::to_string(static_blas->GetGPUVirtualAddress()) + ", \"triangles\": " + tris + "}\n"))
         return fail("static BLAS readback");
+    {
+        // One leaf record a pair: the element region (offsetToElements to offsetToNodes) holds a record per
+        // triangle less one per TRI1 child, so the build is 64 bytes a pair smaller than unpaired.
+        void* p = nullptr;
+        if (FAILED(static_rb->Map(0, nullptr, &p))) return fail("Map the static BLAS");
+        const auto* s = static_cast<const char*>(p);
+        std::uint32_t units = 0, triangles = 0, nodes_off = 0, elements_off = 0, pairs = 0;
+        std::memcpy(&units, s + 4, 4);
+        std::memcpy(&triangles, s + 12, 4);
+        std::memcpy(&nodes_off, s + 40, 4);
+        std::memcpy(&elements_off, s + 52, 4);
+        const UINT64 used = (UINT64(units) + 1) * 64;
+        for (UINT64 o = nodes_off; o + 128 <= used; o += 128) {         // BOX32 nodes
+            for (int c = 0; c < 4; ++c) {
+                std::uint32_t ptr = 0;
+                std::memcpy(&ptr, s + o + 4 * c, 4);
+                if (ptr != 0xffffffffu && (ptr & 7u) == 1u) ++pairs;     // TRI1
+            }
+        }
+        static_rb->Unmap(0, nullptr);
+        if (!pairs || nodes_off < elements_off || (nodes_off - elements_off) / 64 + pairs != triangles) {
+            std::fprintf(stderr, "paired BLAS: %u triangles, %u pairs, %u leaf records\n", triangles, pairs,
+                         (nodes_off - elements_off) / 64);
+            return fail("a paired BLAS does not keep one leaf record a pair");
+        }
+        std::printf("d3d12_xdxr_rt: paired BLAS %llu bytes, %u triangles in %u leaves (%u bytes saved)\n",
+                    static_cast<unsigned long long>(used), triangles, triangles - pairs, 64 * pairs);
+    }
 
     // ---- serialization: the SERIALIZATION postbuild info of the BLAS (as updated) and of the TLAS (as rebuilt for
     // CURRENT_SIZE), SERIALIZE both, DESERIALIZE the BLAS somewhere else, point the TLAS's serialized BLAS pointers
