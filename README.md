@@ -169,6 +169,20 @@ The mode is saved next to the translated shaders, and changing it translates the
 reuse previously emulated shaders. The AMD Windows workaround rebuilds those shaders in native mode.
 Use `--wave64-emulate on` to force emulation or `--wave64-emulate off` to force native wave64.
 
+These automatic decisions ask the GPU of the machine that runs the build. When the shaders are translated somewhere
+else, give the build the other PC's answers. This is the case under WSL, whose only Vulkan device is llvmpipe
+(8-wide, no `PerVertexKHR`), so it would turn on wave64 emulation and `--f16-interp-fallback`. It is also the case
+on another PC. On the PC that will run the port, run `python -I tools/vk_subgroup_info.py > gpu.json`, then pass
+`--gpu-info gpu.json` to the build. The decisions covered are:
+- the wave64 mode;
+- `--f16-interp-fallback`;
+- `--pc-tail-ubo`;
+- `--bary-fallback`;
+- `--mesh-compute` on Intel's driver.
+
+With `--gpu-info`, neither `vulkaninfo` nor the probe runs on the build machine. A file that is not the tool's
+answer stops the build.
+
 Four fallback flags are forwarded to the translator the same way, saved next to the translated shaders, and changing
 them translates them again: `--no-float-controls` (drop `SignedZeroInfNanPreserve`, for devices whose pipeline check
 skips a shader without `shaderSignedZeroInfNanPreserveFloat32`; needs PR #664's translator flag), `--bary-fallback`

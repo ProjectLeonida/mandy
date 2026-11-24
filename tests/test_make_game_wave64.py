@@ -299,6 +299,111 @@ class KeepEmulatedFlagTest(unittest.TestCase):
         self.assertEqual(self.settings("auto", gpu), (True, True))
 
 
+class GpuInfoFileTest(unittest.TestCase):
+    """--gpu-info FILE: the shaders stage decides for the PC that will run the port, from the answers
+    tools/vk_subgroup_info.py saved there, instead of probing the machine that runs the build (WSL's llvmpipe, a
+    build server). Nothing on the build machine is asked: no vk_subgroup_info.py, no vulkaninfo."""
+
+    # vk_subgroup_info.py's answer on an RX 6900 XT under AMD's Windows driver (measured, trimmed: device data only).
+    RX6900 = {"device": "AMD Radeon RX 6900 XT", "subgroup_size": 64, "min_subgroup_size": 32, "max_subgroup_size": 64,
+              "subgroup_size_control": True, "native64_compute": True, "native64": True, "per_vertex_inputs": True,
+              "max_push_constants_size": 256, "vendor_id": 4098, "driver_id": 1, "mesh_in_supported_stages": True,
+              "rdna1_amd_windows": False, "rdna2_amd_windows": True}
+    # The same tool under WSL, where the only Vulkan device is llvmpipe: what the build would otherwise decide from.
+    LLVMPIPE = {"device": "llvmpipe (LLVM 21.1.8, 256 bits)", "subgroup_size": 8, "max_subgroup_size": 8,
+                "native64": False, "native64_compute": False, "per_vertex_inputs": False,
+                "max_push_constants_size": 256, "driver_id": 13, "rdna2_amd_windows": False}
+    NVIDIA = {"device": "NVIDIA GeForce RTX 4060 Ti", "max_subgroup_size": 32, "native64": False,
+              "native64_compute": False, "per_vertex_inputs": True, "max_push_constants_size": 256, "driver_id": 4}
+
+    def write(self, tmp, text, name="gpu.json"):
+        path = os.path.join(tmp, name)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return path
+
+    def test_the_file_is_read_like_the_tools_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # The tool prints one JSON line; a redirect may carry a loader warning before it.
+            path = self.write(tmp, "WARNING: a layer\n" + json.dumps(self.RX6900) + "\n\n")
+            self.assertEqual(make_game.load_gpu_info(path), self.RX6900)
+
+    def test_a_bad_file_stops_the_build_with_the_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = {"missing": os.path.join(tmp, "absent.json"),
+                     "empty": self.write(tmp, "", "empty.json"),
+                     "not json": self.write(tmp, "not json\n", "bad.json"),
+                     "not an object": self.write(tmp, "[1, 2]\n", "list.json"),
+                     "the tool's error answer": self.write(tmp, '{"error": "RuntimeError: vkCreateInstance failed (-9)"}\n',
+                                                           "error.json")}
+            for label, path in cases.items():
+                with self.subTest(case=label), mock.patch.object(make_game, "fail", side_effect=SystemExit(1)) as fail:
+                    with self.assertRaises(SystemExit):
+                        make_game.load_gpu_info(path)
+                    self.assertIn("--gpu-info", fail.call_args.args[0])
+
+    def probe(self, answers, call):
+        """Run `call` with --gpu-info's answers in place; fails if anything on the build machine is asked."""
+        with mock.patch.object(make_game, "GPU_INFO_FROM_FILE", answers), \
+                mock.patch.object(make_game.subprocess, "run", side_effect=AssertionError("probed the build machine")), \
+                mock.patch.object(make_game.shutil, "which", return_value="vulkaninfo"), \
+                mock.patch.object(make_game, "log", lambda *a: None):
+            return call()
+
+    def test_every_gpu_question_is_answered_from_the_file(self):
+        self.assertEqual(self.probe(self.RX6900, make_game.runtime_gpu_info), self.RX6900)
+        self.assertIs(self.probe(self.RX6900, make_game.runtime_gpu_per_vertex), True)
+        self.assertIs(self.probe(self.LLVMPIPE, make_game.runtime_gpu_per_vertex), False)
+        self.assertEqual(self.probe(self.RX6900, make_game.runtime_gpu_max_push_constants), 256)
+        self.assertIs(self.probe(self.RX6900, make_game.runtime_gpu_mesh_draws_crash), False)
+
+    def test_wave64_auto_decides_for_the_target_gpu(self):
+        # The RX 6900 XT under AMD's Windows driver: native wave64 (#857), whatever the build machine has.
+        self.assertEqual(self.probe(self.RX6900, lambda: make_game.wave64_settings("auto")), (False, False))
+        # A 32-wide target turns emulation on from its own maxSubgroupSize, without vulkaninfo.
+        self.assertEqual(self.probe(self.NVIDIA, lambda: make_game.wave64_settings("auto")), (True, True))
+        # 64-wide and confirmed by the runtime check, not on AMD's Windows driver: off, as with vulkaninfo.
+        other64 = dict(self.NVIDIA, max_subgroup_size=64, native64=True)
+        self.assertEqual(self.probe(other64, lambda: make_game.wave64_settings("auto")), (False, True))
+        # A file without the size: unknown, so on (exact everywhere), as when vulkaninfo can't tell.
+        self.assertEqual(self.probe({"device": "?"}, lambda: make_game.wave64_settings("auto")), (True, True))
+
+    def test_main_uses_the_file_for_the_shaders_stage(self):
+        """The WSL case: the build machine's probe would answer llvmpipe; with --gpu-info the RX 6900 XT decides,
+        so there is no wave64 emulation and no fallback flag."""
+        def build_machine_probe(args, **kwargs):
+            if os.path.basename(str(args[-1])) == "vk_subgroup_info.py":
+                return subprocess.CompletedProcess(args, 0, stdout=json.dumps(self.LLVMPIPE), stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout=vulkaninfo_text(8), stderr="")
+
+        def run(extra):
+            with tempfile.TemporaryDirectory() as tmp:
+                game = os.path.join(tmp, "game")
+                os.makedirs(game)
+                gpu = self.write(tmp, json.dumps(self.RX6900) + "\n")
+                argv = ["make_game.py", "--game", game, "--out", os.path.join(tmp, "o"), "--work",
+                        os.path.join(tmp, "w"), "--stages", "shaders", "--no-tui"] + [gpu if a == "GPU" else a
+                                                                                       for a in extra]
+                with mock.patch.object(sys, "argv", argv), mock.patch.object(make_game, "below_normal"), \
+                        mock.patch.object(make_game, "GPU_INFO_FROM_FILE", None), \
+                        mock.patch.object(make_game, "log", lambda *a: None), \
+                        mock.patch.object(make_game, "check", return_value={"expected_exe": "g.exe"}), \
+                        mock.patch.object(make_game, "preflight"), \
+                        mock.patch.object(make_game.shutil, "which", return_value="vulkaninfo"), \
+                        mock.patch.object(make_game.subprocess, "run", side_effect=build_machine_probe) as probe, \
+                        mock.patch.object(make_game, "shaders") as sh:
+                    make_game.main()
+                asked = [c.args[0] for c in probe.call_args_list]
+                return sh.call_args.kwargs["emulate"], sh.call_args.kwargs["fallbacks"], asked
+
+        emulate, fallbacks, asked = run([])
+        self.assertTrue(emulate)                                     # without the file: llvmpipe decides
+        self.assertIn("--f16-interp-fallback", fallbacks)
+        emulate, fallbacks, asked = run(["--gpu-info", "GPU"])
+        self.assertEqual((emulate, fallbacks), (False, ()))         # the RX 6900 XT decides
+        self.assertEqual(asked, [])                                  # and nothing on the build machine is asked
+
+
 class SubgroupInfoToolTest(unittest.TestCase):
     def test_enumeration_failures_do_not_select_from_a_partial_list(self):
         import ctypes

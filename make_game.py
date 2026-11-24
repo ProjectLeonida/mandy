@@ -1745,16 +1745,22 @@ def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, boo
             "on the AMD Windows driver and runs wave64 natively. That driver can crash on emulated wave64 code "
             "(#857), so auto uses native wave64 and rebuilds emulated outputs (--wave64-emulate on to force emulation)")
         return False, False
-    exe = shutil.which("vulkaninfo")
     size = None
-    if exe:
-        try:
-            r = subprocess.run([exe], capture_output=True, text=True, errors="replace", timeout=120)
-            size = smallest_max_subgroup(r.stdout)
-        except (OSError, subprocess.SubprocessError):
-            size = None
+    if GPU_INFO_FROM_FILE is not None:
+        # The target PC's own maxSubgroupSize: this machine's vulkaninfo would describe the wrong GPU.
+        v = gpu.get("max_subgroup_size")
+        size = v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
+    else:
+        exe = shutil.which("vulkaninfo")
+        if exe:
+            try:
+                r = subprocess.run([exe], capture_output=True, text=True, errors="replace", timeout=120)
+                size = smallest_max_subgroup(r.stdout)
+            except (OSError, subprocess.SubprocessError):
+                size = None
     if size is None:
-        log("shaders: couldn't read the GPU's subgroup size from vulkaninfo: wave64 emulation on "
+        source = "--gpu-info" if GPU_INFO_FROM_FILE is not None else "vulkaninfo"
+        log(f"shaders: couldn't read the GPU's subgroup size from {source}: wave64 emulation on "
             "(exact on every GPU; --wave64-emulate off to skip it on a GPU with 64-wide subgroups)")
         return True, True
     on = size < 64
@@ -1772,8 +1778,38 @@ def wave64_emulate(mode: str, *, mesh_compute: bool = False) -> bool:
     return wave64_settings(mode, mesh_compute=mesh_compute)[0]
 
 
+# --gpu-info FILE: tools/vk_subgroup_info.py's answers saved on the PC that will run the port. When set, every GPU
+# question of the shaders stage is answered from it and nothing on the build machine is probed: under WSL the only
+# Vulkan device is llvmpipe (8-wide, no PerVertexKHR), so probing there turned on wave64 emulation and
+# --f16-interp-fallback for a target that needs neither.
+GPU_INFO_FROM_FILE: "dict | None" = None
+
+
+def load_gpu_info(path: str) -> dict:
+    """The answers in a saved `python -I tools/vk_subgroup_info.py` output: its last non-empty line, a JSON object
+    without the tool's "error" key. A file that can't be used stops the build: guessing would translate the corpus for
+    the wrong GPU."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = [line.strip() for line in f if line.strip()]
+    except OSError as e:
+        fail(f"--gpu-info: cannot read {path}: {e.strerror or e}")
+    try:
+        info = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        info = None
+    if not isinstance(info, dict):
+        fail(f"--gpu-info: {path} is not the output of tools/vk_subgroup_info.py (its last line is no JSON object). "
+             "Save it on the PC that will run the port with: python -I tools/vk_subgroup_info.py > gpu.json")
+    if "error" in info:
+        fail(f"--gpu-info: {path} records the probe's error on that PC ({info['error']}); run the tool there again")
+    return info
+
+
 def runtime_gpu_info() -> dict:
     """tools/vk_subgroup_info.py's answer for the GPU the runtime would use; {} when it can't tell."""
+    if GPU_INFO_FROM_FILE is not None:
+        return dict(GPU_INFO_FROM_FILE)
     try:
         r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
                            capture_output=True, text=True, timeout=60)
@@ -1786,13 +1822,8 @@ def runtime_gpu_info() -> dict:
 def runtime_gpu_per_vertex():
     """per_vertex_inputs as tools/vk_subgroup_info.py answers for the GPU the runtime would use: False where the
     driver can't compile PerVertexKHR (MoltenVK) or lacks fragmentShaderBarycentric, None when it can't tell."""
-    try:
-        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
-                           capture_output=True, text=True, timeout=60)
-        v = json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs")
-        return None if v is None else bool(v)
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
-        return None
+    v = runtime_gpu_info().get("per_vertex_inputs")
+    return None if v is None else bool(v)
 
 
 def runtime_gpu_barycentric_fallback():
@@ -2883,6 +2914,11 @@ def main() -> int:
                     help="translate wave64 compute and mesh shaders to be exact on any subgroup size (needed on "
                          "32-wide GPUs: NVIDIA, Intel). auto (default) checks GPU subgroup support and prefers "
                          "native wave64 on affected AMD Windows drivers")
+    ap.add_argument("--gpu-info", metavar="FILE",
+                    help="answers of `python -I tools/vk_subgroup_info.py` saved on the PC that will run the port: "
+                         "the shaders stage decides wave64 emulation and the automatic fallback flags for that GPU "
+                         "instead of probing this machine's (to translate under WSL, whose Vulkan device is "
+                         "llvmpipe, or on another PC)")
     ap.add_argument("--no-float-controls", action="store_true",
                     help="translate without SignedZeroInfNanPreserve and DenormPreserve (Depends on: #664), for "
                          "devices whose vk_pipeline_check skips a shader without "
@@ -2965,6 +3001,11 @@ def main() -> int:
         if inside:
             fail("--out and --work must be outside the game folder.")
     runtime_build = os.path.abspath(a.runtime_build) if a.runtime_build else None
+    if a.gpu_info:
+        global GPU_INFO_FROM_FILE
+        GPU_INFO_FROM_FILE = load_gpu_info(a.gpu_info)
+        log(f"shaders: deciding for the GPU in {a.gpu_info} ({GPU_INFO_FROM_FILE.get('device', 'unnamed')}), not "
+            "this machine's")
     if a.stages is None and os.name != "nt" and not runtime_build:
         lacking = cross_build_missing()
         if lacking:
