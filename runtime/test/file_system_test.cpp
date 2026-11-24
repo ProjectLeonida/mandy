@@ -1331,6 +1331,18 @@ void run_checks(const std::filesystem::path& root) {
         check(attributes_w(L"T:\\x") == INVALID_FILE_ATTRIBUTES && GetLastError() != ERROR_INVALID_NAME,
               "without configured folders G: and T: stay host drives");
         rt::fs::configure(package, overlay);
+
+        // T: listings work with --overlay but no --game-dir: the scratch folder lives in the overlay only.
+        {
+            const std::filesystem::path scratch_overlay = root / "scratch_no_game_overlay";
+            rt::fs::configure({}, scratch_overlay);
+            const std::vector<std::wstring> t_names = list(first_w, next_w, find_close, L"T:\\*");
+            check(t_names.size() == 2 && count(t_names, L".") == 1 && count(t_names, L"..") == 1,
+                  "without a game folder FindFirstFileW(T:\\*) still lists the scratch root as . and ..");
+            check(std::filesystem::exists(scratch_overlay / ".gta6rt-temp"),
+                  "listing T: creates the scratch folder in the overlay");
+            rt::fs::configure(package, overlay);
+        }
     }
 
     // An open that writes needs its folder to exist in the title's view, and a failed open changes nothing.

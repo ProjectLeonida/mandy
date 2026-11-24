@@ -544,7 +544,10 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
     }
 
     const Roots r = roots();
-    if (r.game.empty()) {
+    // T:'s scratch folder lives in the overlay only, so a caller with --overlay but no --game-dir can still list
+    // it: gate those listings on the overlay instead of the package.
+    const bool scratch = !parts.empty() && same_name(parts.front().c_str(), kScratchDir);
+    if ((scratch ? r.overlay : r.game).empty()) {
         error = ERROR_PATH_NOT_FOUND;
         return false;
     }
@@ -641,7 +644,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         ::FindClose(h);
     };
     add_root(r.overlay, true);
-    add_root(r.game, false);
+    if (!scratch) add_root(r.game, false);  // T: never names the package, so don't probe its root
 
     if (out.empty()) {
         error = ERROR_FILE_NOT_FOUND;
@@ -712,11 +715,21 @@ bool touch_pages(void* buffer, DWORD size) {
     bool all = true;
     for (uintptr_t page = first; page < end; page += 0x1000) {
         const uintptr_t at = page < reinterpret_cast<uintptr_t>(p) ? reinterpret_cast<uintptr_t>(p) : page;
+#ifdef _MSC_VER
         __try {
             (void)*reinterpret_cast<volatile const unsigned char*>(at);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             all = false;
         }
+#else
+        // MinGW has no __try/__except: probe the page with VirtualQuery instead of touching it. A page that is
+        // not committed (or is guarded/unreadable) counts as untouched, and ReadFile refuses it as before.
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(at), &mbi, sizeof(mbi)) == 0 ||
+            mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+            all = false;
+        }
+#endif
     }
     return all;
 }
