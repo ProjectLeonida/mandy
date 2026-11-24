@@ -27,6 +27,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <type_traits>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -128,6 +129,80 @@ int check_placed_uavs(ID3D12Device* device) {
     placed_view(device, 71, volume, view, &address, dest);
     EXPECT(got == Words{});
     std::printf("placed UAVs: %u matching views, %u null controls\n", enabled ? 2 : 0, enabled ? 2 : 4);
+    return 0;
+}
+
+// RT-TITLE-BUFFER-VIEWS: slots 70/71 with a buffer description write the V# that CreateShaderResourceView /
+// CreateUnorderedAccessView write for a buffer resource at the same address, the shapes the retail title passes
+// (typed R32_UINT and structured stride 16 and 32 through slot 71, flags 0x20004); a view those refuse gives the null
+// descriptor.
+int check_placed_buffer_views(ID3D12Device* device) {
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    const auto desc = buffer_desc(1024, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    Ref<ID3D12Resource> buffer;
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                                     nullptr, IID_PPV_ARGS(&buffer.p))));
+    const auto* address = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(buffer->GetGPUVirtualAddress()));
+    auto title = desc;
+    title.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x20004);  // as the retail title passes it: a bit beyond PC's
+    using Words = std::array<UINT, 8>;
+    unsigned matched = 0, nulls = 0;
+    const auto same = [&](const auto& view, bool unordered) {
+        Words expected{}, got{};
+        got.fill(~0u);
+        const D3D12_CPU_DESCRIPTOR_HANDLE want{reinterpret_cast<SIZE_T>(expected.data())};
+        if constexpr (std::is_same_v<std::decay_t<decltype(view)>, D3D12_UNORDERED_ACCESS_VIEW_DESC>)
+            device->CreateUnorderedAccessView(buffer.p, nullptr, &view, want);
+        else
+            device->CreateShaderResourceView(buffer.p, &view, want);
+        placed_view(device, unordered ? 71 : 70, title, view, address, {reinterpret_cast<SIZE_T>(got.data())});
+        EXPECT(expected != Words{} && got == expected);
+        ++matched;
+        return 0;
+    };
+    const auto null = [&](const auto& view, bool unordered, const D3D12_RESOURCE_DESC& resource) {
+        Words got{};
+        got.fill(~0u);
+        placed_view(device, unordered ? 71 : 70, resource, view, address, {reinterpret_cast<SIZE_T>(got.data())});
+        EXPECT(got == Words{});
+        ++nulls;
+        return 0;
+    };
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Format = DXGI_FORMAT_R32_UINT;  // typed
+    uav.Buffer = {4, 60, 0, 0, D3D12_BUFFER_UAV_FLAG_NONE};
+    EXPECT(same(uav, true) == 0);
+    uav.Format = DXGI_FORMAT_UNKNOWN;  // structured
+    for (UINT stride : {16u, 32u}) {
+        uav.Buffer = {1, 1024 / stride - 1, stride, 0, D3D12_BUFFER_UAV_FLAG_NONE};
+        EXPECT(same(uav, true) == 0);
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Format = DXGI_FORMAT_R32_TYPELESS;  // raw
+    srv.Buffer = {0, 256, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+    EXPECT(same(srv, false) == 0);
+    srv.Format = DXGI_FORMAT_UNKNOWN;  // structured
+    srv.Buffer = {2, 30, 32, D3D12_BUFFER_SRV_FLAG_NONE};
+    EXPECT(same(srv, false) == 0);
+    srv.Format = DXGI_FORMAT_R32_UINT;  // typed
+    srv.Buffer = {0, 256, 0, D3D12_BUFFER_SRV_FLAG_NONE};
+    EXPECT(same(srv, false) == 0);
+
+    // Controls: past the buffer's end, a counter offset with no counter resource, and a UAV of a buffer whose
+    // description does not allow unordered access.
+    uav.Buffer = {1, 1024 / 16, 16, 0, D3D12_BUFFER_UAV_FLAG_NONE};
+    EXPECT(null(uav, true, title) == 0);
+    uav.Buffer = {0, 4, 16, 4096, D3D12_BUFFER_UAV_FLAG_NONE};
+    EXPECT(null(uav, true, title) == 0);
+    auto read_only = title;
+    read_only.Flags = D3D12_RESOURCE_FLAG_NONE;
+    uav.Buffer = {0, 4, 16, 0, D3D12_BUFFER_UAV_FLAG_NONE};
+    EXPECT(null(uav, true, read_only) == 0);
+    std::printf("placed buffer views: %u matching views, %u null controls\n", matched, nulls);
     return 0;
 }
 
@@ -247,6 +322,7 @@ int main() {
         alignas(256) std::byte placement{};
         EXPECT(SUCCEEDED(place(device.p, &placement, texture_desc, 8, &textures[1].p)));
         EXPECT(check_placed_uavs(device.p) == 0);
+        EXPECT(check_placed_buffer_views(device.p) == 0);
         // The upload buffer: texture A at 0, texture B at 2048 (8 rows of the 256-byte pitch).
         constexpr UINT64 b_offset = 2048;
         const auto upload_desc = buffer_desc(4096);

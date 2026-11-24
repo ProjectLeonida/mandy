@@ -103,7 +103,8 @@ unsigned device_proxy_slot_count(const void* device);
 // The PC device behind a proxy. Null when `device` is not a proxy.
 ID3D12Device* device_proxy_real_device(const void* device);
 
-// A placed texture view names its resource by address and description. False selects the null view.
+// A placed view (slots 70/71) names its resource by address and description: a texture placed by slot 133, or a
+// buffer of that many bytes at that address (RT-TITLE-BUFFER-VIEWS). False selects the null view.
 using PlacedTextureViewHandler = bool (*)(ID3D12Device*, bool unordered, const D3D12_RESOURCE_DESC&,
                                           const std::uint32_t* view, UINT64 address, D3D12_CPU_DESCRIPTOR_HANDLE);
 void set_placed_texture_view_handler(PlacedTextureViewHandler handler);

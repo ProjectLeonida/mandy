@@ -1578,12 +1578,13 @@ HRESULT proxy_create_command_queue_xbox(DeviceProxy* self, const std::uint32_t* 
 
 // Slots 70/71 take a resource description and an SRV/UAV description followed by the placement address
 // in dwords 10-11 (the console ABI also recorded by VIctory, victory-gpu/descriptor). The PC methods at
-// these slots have different arguments. A backend without a matching image supplies a null descriptor.
+// these slots have different arguments. A backend without a matching image supplies a null descriptor. A buffer
+// description goes to the same handler, which writes a buffer view of the address (RT-TITLE-BUFFER-VIEWS).
 void proxy_create_placed_view(DeviceProxy* self, bool unordered, std::uint64_t resource_words,
                               std::uint64_t view_words, std::uint64_t destination) {
     const unsigned slot = unordered ? 71 : 70;
     note_slot(slot);
-    log_xbox_route_once(slot, unordered ? "placed texture UAV" : "placed texture SRV",
+    log_xbox_route_once(slot, unordered ? "placed view UAV" : "placed view SRV",
                         resource_words, view_words, destination, 0, 0);
     if (!destination) return;
     const D3D12_CPU_DESCRIPTOR_HANDLE dest{destination};
@@ -1592,7 +1593,7 @@ void proxy_create_placed_view(DeviceProxy* self, bool unordered, std::uint64_t r
         std::uint32_t view[12]{};
         if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(resource_words),
                               &resource, sizeof(resource), nullptr) &&
-            resource.Dimension >= D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+            resource.Dimension >= D3D12_RESOURCE_DIMENSION_BUFFER &&
             resource.Dimension <= D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
             ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(view_words),
                               view, sizeof(view), nullptr)) {
