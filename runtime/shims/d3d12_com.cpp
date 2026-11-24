@@ -485,7 +485,7 @@ public:
     void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) override {
         d3d12_trace::record("ID3D12GraphicsCommandList6::DispatchMesh");
         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
-        if (defer([=](GraphicsCommandList& l) { l.record_dispatch_mesh(x, y, z); }, true)) return;
+        if (defer([x, y, z](GraphicsCommandList& l) { l.record_dispatch_mesh(x, y, z); }, true)) return;
         record_dispatch_mesh(x, y, z);
     }
 

@@ -558,8 +558,12 @@ int main() {
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
             const UINT64 bundle_fence = d.pipeline_statistics_query ? 4 : 3;
+            HANDLE bundle_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            EXPECT(bundle_event != nullptr);
             EXPECT(SUCCEEDED(queue->Signal(fence.p, bundle_fence)) &&
-                   SUCCEEDED(fence->SetEventOnCompletion(bundle_fence, nullptr)));
+                   SUCCEEDED(fence->SetEventOnCompletion(bundle_fence, bundle_event)) &&
+                   WaitForSingleObject(bundle_event, 20000) == WAIT_OBJECT_0);
+            CloseHandle(bundle_event);
 
             std::array<std::uint8_t, size * 256> bundle_pixels{};
             void* bundle_mapped = nullptr;
