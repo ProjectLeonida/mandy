@@ -961,7 +961,7 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
             f.write(text)
         return len(text)
 
-    def run_preflight(self, work, free_gb, wav=False, ffmpeg=True):
+    def run_preflight(self, work, free_gb, wav=False, ffmpeg=True, no_audio=False):
         usage = Usage(1000 * 2**30, (1000 - free_gb) * 2**30, free_gb * 2**30)
 
         def which(cmd):
@@ -976,7 +976,23 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
              mock.patch("make_game.ensure_submodule", return_value=None), \
              mock.patch("sys.stdout", io.StringIO()), \
              mock.patch("shutil.disk_usage", return_value=usage):
-            make_game.preflight(["shaders", "assets"], work, wav=wav)
+            make_game.preflight(["shaders", "assets"], work, wav=wav, no_audio=no_audio)
+
+    def test_no_audio_uses_lower_fresh_asset_estimate(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.assert_fails(self.run_preflight, work, free_gb=380,
+                              match="about 400 GB is needed")
+            self.run_preflight(work, free_gb=380, no_audio=True)
+
+    def test_no_audio_completion_marker_credits_non_audio_exports(self):
+        with tempfile.TemporaryDirectory() as work:
+            path = os.path.join(work, "assets", make_game.ASSETS_NO_AUDIO_MARKER)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("audio export skipped finished\n")
+            self.assertTrue(make_game.assets_exported(work, no_audio=True))
+            self.assertFalse(make_game.assets_exported(work))
+            self.run_preflight(work, free_gb=220, no_audio=True)
 
     def write_xma(self, work, decoded):
         """One XMA2 stream as the assets stage leaves it, with or without the .wav that ffmpeg decodes it to."""
@@ -1174,6 +1190,7 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
                 f.write(b"\0" * 999)
             expected = (100 + 7 + r1) + (30 + 3 + r2) + (4096 + pool) + (200 + hashed) + (9 + 60 + 1) + 80
             self.assertEqual(make_game.assets_bytes_on_disk(work), expected)
+            self.assertEqual(make_game.assets_bytes_on_disk(work, no_audio=True), expected - (9 + 60 + 1 + 80))
 
     def test_unrelated_files_under_assets_are_not_credited(self):
         # A large file the exporter didn't write must not let a short drive through.

@@ -130,8 +130,10 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 **Is this PC strong enough?** [Can I Run Leonida](https://assttro.github.io/can-i-run-leonida/) is a lightweight browser-based checker that compares your PC against reference profiles. It's a rough estimate, not a benchmark.
 
 **Low disk space:** the ~400 GB figure is for the full build. To *run* the port, `--stages check,shaders,runtime`
-needs about 30 GB; the `assets` stage (~370 GB) is only for the asset tools, and `--wav` adds several times the
-Ogg Opus size (the preflight prints this choice when the assets stage is what does not fit). `--work` and `--out`
+needs about 30 GB; the `assets` stage (~370 GB) is only for the asset tools. Use `--no-audio` with the assets stage
+to skip audio extraction and conversion; this reduces the estimated total to about 370 GB. Existing audio files are
+left untouched, and a later assets run without `--no-audio` can export audio. `--wav` adds several times the Ogg
+Opus size (the preflight prints this choice when the assets stage is what does not fit). `--work` and `--out`
 can sit on another drive. The runtime maps the package in place, so a read-only package drive needs
 `gta6rt --overlay <writable folder>`; `--overlay` is a `gta6rt` option, not a `make_game.py` one. Leave the `.s`
 files in `work/shaders/dxbc/disasm` in place: the next run checks them against the list in `disasm.done` and
@@ -148,6 +150,7 @@ python -I make_game.py --check --full-check            # also compare SHA-256 of
 python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\Leonida" --work "E:\leonida-work"
 python -I make_game.py --stages shaders,assets         # only some stages
 python -I make_game.py --game "D:\path\to\your\package" --wav   # also decode Opus to PCM WAV (large)
+python -I make_game.py --stages assets --no-audio       # skip audio extraction and conversion
 python -I make_game.py --wave64-emulate off            # auto (default), on or off; see below
 ```
 
@@ -202,6 +205,8 @@ per-stage log view (`1`–`4` / `Tab`) keeps parallel output demuxed; full stage
 
 `--wav` is off by default because 16-bit PCM WAV is several times larger than Ogg Opus. It decodes the repackaged Ogg
 Opus streams to `work\assets\audio\wav` after the audio bank step; existing WAV files are skipped when a build resumes.
+`--no-audio` leaves all existing audio outputs untouched and skips every audio export step in the assets stage; the
+default still exports audio. It cannot be combined with `--wav`.
 
 ### Vulkan diagnostics on Linux
 

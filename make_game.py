@@ -723,17 +723,28 @@ def icloud_default_notes() -> list:
 # ---------------------------------------------------------------- preflight
 # GiB (free bytes / 2**30), the unit Windows Explorer shows as "GB"; 370 GiB is about 397 GB in decimal units.
 MIN_FREE_GB = {"shaders": 30, "assets": 370}
+# The asset export measured about 337 GiB before audio; round up for the no-audio estimate.
+MIN_FREE_GB_NO_AUDIO = 340
+ASSETS_NO_AUDIO_MARKER = "assets_without_audio.done"
 
 
-def assets_exported(work: str) -> bool:
-    """Whether an earlier run finished the assets stage's exports, so its space is already in use. xma.done is the
-    last marker assets() writes, after every model, texture and audio export before it succeeded; ogg.done is read
-    too. A marker counts only when it holds what mark() writes, not because a file of that name exists.
+def assets_exported(work: str, no_audio: bool = False) -> bool:
+    """Whether an earlier run finished the assets stage's exports, so its space is already in use. For a build that
+    skipped audio, its marker is written only after every non-audio export succeeds. Otherwise xma.done is the last
+    marker assets() writes; ogg.done is read too. A marker counts only when it holds what mark() writes, not because
+    a file of that name exists.
     xma.done is written with or without ffmpeg, and every run decodes the XMA2 streams that have no .wav yet once
     ffmpeg is on PATH. So with ffmpeg there, a stream still waiting for its .wav means the stage will write again.
     Models, textures and pools made by another decoder (DECODER_RECORD) don't change the answer: assets() removes each
     such folder before it exports it again, so the new export goes into the space the old one held."""
     audio = os.path.join(work, "assets", "audio")
+    if no_audio:
+        try:
+            with open(os.path.join(work, "assets", ASSETS_NO_AUDIO_MARKER), encoding="utf-8") as f:
+                if f.read().strip() == "audio export skipped finished":
+                    return True
+        except (OSError, UnicodeError):
+            pass
     for name, what in (("ogg.done", "awc_opus.py"), ("xma.done", "rpf9dump xma")):
         try:
             with open(os.path.join(audio, name), encoding="utf-8") as f:
@@ -794,14 +805,14 @@ def _finished_pool_dirs(top: str) -> list:
     return found
 
 
-def assets_bytes_on_disk(work: str) -> int:
+def assets_bytes_on_disk(work: str, no_audio: bool = False) -> int:
     """Bytes a stopped assets stage has already written and a rerun will keep, so they are not needed free again.
     A model or texture folder counts, finished or not, when its decoder.sha256 matches the current decoder:
     assets() deletes a folder with another or no fingerprint and exports it again, but for a matching one rpf9dump
     skips every output that already exists (Util.WriteAtomic only renames complete files into place; a leftover
     *.partial is deleted and written again, so it is not counted). Pools, audio and the other steps count only when
     finished (a pool whose manifest ttpf_manifest() accepts, audio_manifest.json, ogg.done, xma.done); the unfinished
-    part of those is not counted, which is conservative."""
+    part of those is not counted, which is conservative. Audio is excluded when this run skips audio."""
     out = os.path.join(work, "assets")
     if _linked(out):
         return 0
@@ -825,12 +836,13 @@ def assets_bytes_on_disk(work: str) -> int:
                 total += _tree_bytes(folder, ignore_suffix=".partial")
     for top in ("ttpf", "ttpf_pack"):
         total += sum(_tree_bytes(d) for d in _finished_pool_dirs(os.path.join(out, top)))
-    audio = os.path.join(out, "audio")
-    if os.path.isfile(os.path.join(audio, "audio_manifest.json")):
-        total += _tree_bytes(audio, skip=("ogg", "xma", "wav"))
-    for step in ("ogg", "xma"):
-        if os.path.isfile(os.path.join(audio, f"{step}.done")):
-            total += _tree_bytes(os.path.join(audio, step))
+    if not no_audio:
+        audio = os.path.join(out, "audio")
+        if os.path.isfile(os.path.join(audio, "audio_manifest.json")):
+            total += _tree_bytes(audio, skip=("ogg", "xma", "wav"))
+        for step in ("ogg", "xma"):
+            if os.path.isfile(os.path.join(audio, f"{step}.done")):
+                total += _tree_bytes(os.path.join(audio, step))
     return total
 
 
@@ -847,8 +859,10 @@ def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
 
 def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | None = None, *,
               emulate: bool = False, keep_emulated: bool = False,
-              fallbacks: tuple[str, ...] = (), jobs: int = 1) -> None:
+              fallbacks: tuple[str, ...] = (), jobs: int = 1, no_audio: bool = False) -> None:
     """Find every missing prerequisite before a long build starts, and list them all at once."""
+    if wav and no_audio:
+        fail("--no-audio cannot be combined with --wav")
     if "runtime" in stages and runtime_build:
         absent = [n for n in RUNTIME_FILES if not os.path.isfile(os.path.join(runtime_build, n))]
         if absent:
@@ -890,9 +904,11 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if "pipelines" in stages and "shaders" not in stages:
         require_translated_shaders(work)
     need = {s: MIN_FREE_GB.get(s, 0) for s in stages}
+    if no_audio and "assets" in need:
+        need["assets"] = MIN_FREE_GB_NO_AUDIO
     # A rerun that only refreshes the shaders shouldn't need room for a second copy of exports already on disk.
     # --wav still counts it: the WAV decode writes several times the Ogg Opus size and has no marker.
-    if need.get("assets") and not wav and assets_exported(work):
+    if need.get("assets") and not wav and assets_exported(work, no_audio=no_audio):
         log(f"preflight: the assets are already exported in {work}; not counting their {need['assets']} GB")
         need["assets"] = 0
     os.makedirs(work, exist_ok=True)
@@ -907,7 +923,7 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     # --wav still counts the whole estimate, as above: the WAV decode writes several times the Ogg Opus size and has
     # no marker, so what is on disk says nothing about what it will still write.
     if free_gb < need_gb and need.get("assets") and not wav:
-        done_gb = min(assets_bytes_on_disk(work) // 2**30, need["assets"])
+        done_gb = min(assets_bytes_on_disk(work, no_audio=no_audio) // 2**30, need["assets"])
         if done_gb:
             log(f"preflight: {done_gb} GB of a stopped asset export is already in {work}; not counting it again")
             need_gb -= done_gb
@@ -2100,7 +2116,10 @@ def ttpf_manifest(pool_dir: str) -> dict | None:
     return doc
 
 
-def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = None) -> None:
+def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = None,
+           no_audio: bool = False) -> None:
+    if no_audio and wav:
+        fail("--no-audio cannot be combined with --wav")
     # make_game.py also runs under python -I, which omits the script directory.
     if TOOLS not in sys.path:
         sys.path.insert(0, TOOLS)
@@ -2108,6 +2127,12 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
 
     get_exporter = functools.cache(rpf9dump)
     out = os.path.join(work, "assets")
+    os.makedirs(out, exist_ok=True)
+    no_audio_marker = os.path.join(out, ASSETS_NO_AUDIO_MARKER)
+    try:
+        os.unlink(no_audio_marker)
+    except FileNotFoundError:
+        pass
 
     def dump(*parts: str) -> None:
         """Run rpf9dump; pass --jobs only when the build overlaps another CPU-heavy stage."""
@@ -2180,15 +2205,15 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
     pool_todo = [(p, name, root, pool_dir, record) for p, name, root, pool_dir, record in pool_jobs
                  if ttpf_manifest(pool_dir) is None]
     pool_follow = pool_jobs
-    need_audio = not os.path.isfile(os.path.join(out, "audio", "audio_manifest.json"))
+    need_audio = not no_audio and not os.path.isfile(os.path.join(out, "audio", "audio_manifest.json"))
     ogg = os.path.join(out, "audio", "ogg")
     ogg_done = os.path.join(out, "audio", "ogg.done")
-    need_ogg = not os.path.isfile(ogg_done)
-    need_wav = bool(wav)
+    need_ogg = not no_audio and not os.path.isfile(ogg_done)
+    need_wav = bool(wav) and not no_audio
     xma_dir = os.path.join(out, "audio", "xma")
     xma_done = os.path.join(out, "audio", "xma.done")
-    need_xma = not os.path.isfile(xma_done)
-    ff = shutil.which("ffmpeg")
+    need_xma = not no_audio and not os.path.isfile(xma_done)
+    ff = None if no_audio else shutil.which("ffmpeg")
     need_xma_decode = bool(ff)  # decode_xma no-ops when nothing is pending
     total = (len(archive_todo) + len(pool_todo) + len(pool_follow) + int(need_audio) + int(need_ogg)
              + int(need_wav) + int(need_xma) + int(need_xma_decode))
@@ -2218,36 +2243,41 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
         if written or blocked:
             log(f"assets: {name}: {written} full BCPack DDS written, {blocked} limited (see manifest.json)")
         progress.tick(force=True)
-    if need_audio:
-        log("assets: audio banks")
-        dump("audio", os.path.join(game, "audio.rpf"), out)
-        progress.tick(force=True)
-    # The two audio steps below count as finished only by a marker written after they succeed: their folders are
-    # created first and exist after a stopped run too.
-    if need_ogg:
-        # Lossless: the banks' Opus packets repackaged as standard Ogg Opus files (PCM streams as .wav)
-        log("assets: audio streams -> Ogg Opus")
-        py("awc_opus.py", os.path.join(out, "audio", "awc"), ogg, "--jobs", str(jobs))
-        mark(ogg_done, "awc_opus.py")
-        progress.tick(force=True)
-    if need_wav:
-        if not os.path.isdir(ogg):
-            fail("assets: no Ogg Opus output to decode. The audio bank step must finish first (run the assets stage).")
-        # Opt-in: lossless Ogg Opus -> 16-bit PCM WAV, several times larger. Existing WAVs are skipped.
-        log("assets: audio Ogg Opus -> PCM WAV")
-        py("audio_wav.py", ogg, "--out", os.path.join(out, "audio", "wav"), "--jobs", str(jobs))
-        progress.tick(force=True)
-    if need_xma:
-        log("assets: XMA2 streams")
-        dump("xma", os.path.join(game, "audio.rpf"), out)
-        mark(xma_done, "rpf9dump xma")
-        progress.tick(force=True)
-    # Every run: decodes what a stopped or failed run left, and everything once ffmpeg is installed later.
-    if ff:
-        decode_xma(ff, xma_dir, jobs)
-        progress.tick(force=True)
+    if no_audio:
+        log("assets: audio export skipped (--no-audio)")
     else:
-        log("assets: ffmpeg not on PATH: XMA2 streams kept as .xma.wav (ffmpeg decodes them)")
+        if need_audio:
+            log("assets: audio banks")
+            dump("audio", os.path.join(game, "audio.rpf"), out)
+            progress.tick(force=True)
+        # The two audio steps below count as finished only by a marker written after they succeed: their folders are
+        # created first and exist after a stopped run too.
+        if need_ogg:
+            # Lossless: the banks' Opus packets repackaged as standard Ogg Opus files (PCM streams as .wav)
+            log("assets: audio streams -> Ogg Opus")
+            py("awc_opus.py", os.path.join(out, "audio", "awc"), ogg, "--jobs", str(jobs))
+            mark(ogg_done, "awc_opus.py")
+            progress.tick(force=True)
+        if need_wav:
+            if not os.path.isdir(ogg):
+                fail("assets: no Ogg Opus output to decode. The audio bank step must finish first (run the assets stage).")
+            # Opt-in: lossless Ogg Opus -> 16-bit PCM WAV, several times larger. Existing WAVs are skipped.
+            log("assets: audio Ogg Opus -> PCM WAV")
+            py("audio_wav.py", ogg, "--out", os.path.join(out, "audio", "wav"), "--jobs", str(jobs))
+            progress.tick(force=True)
+        if need_xma:
+            log("assets: XMA2 streams")
+            dump("xma", os.path.join(game, "audio.rpf"), out)
+            mark(xma_done, "rpf9dump xma")
+            progress.tick(force=True)
+        # Every run: decodes what a stopped or failed run left, and everything once ffmpeg is installed later.
+        if ff:
+            decode_xma(ff, xma_dir, jobs)
+            progress.tick(force=True)
+        else:
+            log("assets: ffmpeg not on PATH: XMA2 streams kept as .xma.wav (ffmpeg decodes them)")
+    if no_audio:
+        mark(no_audio_marker, "audio export skipped")
     log("assets: done")
 
 
@@ -2732,7 +2762,7 @@ def _invoke_stage(name: str, fn) -> None:
 
 def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, wav: bool, jobs: int,
                      runtime_build: str | None, emulate: bool, keep_emulated: bool,
-                     fallbacks: tuple[str, ...], overlap: bool = True) -> None:
+                     fallbacks: tuple[str, ...], overlap: bool = True, no_audio: bool = False) -> None:
     """Run build stages after check. With overlap=True (default), shaders/assets/runtime share the machine and
     pipelines starts once shaders (and a selected runtime rebuild) are ready. With overlap=False, stages run in order."""
     cpu_heavy = [s for s in ("shaders", "assets") if s in stages]
@@ -2745,7 +2775,7 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
         shaders(game, work, shader_jobs, emulate=emulate, keep_emulated=keep_emulated, fallbacks=fallbacks)
 
     def fn_assets():
-        assets(game, work, wav, jobs, dump_jobs=dump_jobs)
+        assets(game, work, wav, jobs, dump_jobs=dump_jobs, no_audio=no_audio)
 
     def fn_runtime():
         runtime(game, out, v, runtime_build, jobs, work=work)
@@ -2847,6 +2877,8 @@ def main() -> int:
     ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
     ap.add_argument("--wav", action="store_true",
                     help="also decode the Ogg Opus audio to 16-bit PCM WAV (much larger; needs ffmpeg)")
+    ap.add_argument("--no-audio", action="store_true",
+                    help="skip audio extraction and conversion in the assets stage; existing audio files are kept")
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
     ap.add_argument("--runtime-build", metavar="DIR", type=nonempty_path,
@@ -2886,6 +2918,8 @@ def main() -> int:
                     help="plain console logs (default when stdout is not a TTY); skip the LEONIDA setup screen "
                          "and per-stage log view")
     a = ap.parse_args()
+    if a.wav and a.no_audio:
+        ap.error("--wav cannot be combined with --no-audio")
     stages = STAGES
     if a.stages is not None:
         stages = [s.strip() for s in a.stages.split(",") if s.strip()]
@@ -3001,7 +3035,7 @@ def main() -> int:
         a.jobs = leonida_tui.clamp_jobs(cfg.jobs)
         overlap = cfg.overlap
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-              fallbacks=fallbacks, jobs=a.jobs)
+              fallbacks=fallbacks, jobs=a.jobs, no_audio=a.no_audio)
     if not a.out and icloud_documents():
         for note in icloud_default_notes():
             log(note)
@@ -3014,12 +3048,12 @@ def main() -> int:
             tui_board.set_summary(f"build 0% · {', '.join(build_stages)}")
             run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
                              runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                             fallbacks=fallbacks, overlap=overlap)
+                             fallbacks=fallbacks, overlap=overlap, no_audio=a.no_audio)
             tui_board.set_summary(f"finished in {(time.time() - t0) / 60:.0f} min")
     else:
         run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
                          runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                         fallbacks=fallbacks, overlap=overlap)
+                         fallbacks=fallbacks, overlap=overlap, no_audio=a.no_audio)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 

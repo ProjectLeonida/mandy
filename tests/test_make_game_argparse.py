@@ -1,4 +1,4 @@
-"""Unit tests for make_game.py argument parsing, validation, stage sequencing, --jobs, and --wav handling.
+"""Unit tests for make_game.py argument parsing, validation, stage sequencing, --jobs, and audio flags.
 
     python -I tests/test_make_game_argparse.py
 """
@@ -53,6 +53,7 @@ class ArgparseDefaultsAndTypesTest(unittest.TestCase):
         self.assertFalse(a.check)
         self.assertFalse(a.full_check)
         self.assertFalse(a.wav)
+        self.assertFalse(a.no_audio)
         self.assertFalse(a.find)
         expected_default_jobs = max(1, (os.cpu_count() or 2) // 2)
         self.assertEqual(a.jobs, expected_default_jobs)
@@ -96,6 +97,7 @@ class ArgparseDefaultsAndTypesTest(unittest.TestCase):
         self.assertTrue(a.check)
         self.assertTrue(a.full_check)
         self.assertTrue(a.wav)
+        self.assertFalse(a.no_audio)
         self.assertEqual(a.jobs, 8)
         self.assertTrue(a.find)
 
@@ -282,7 +284,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
             emulate=unittest.mock.ANY, keep_emulated=True, fallbacks=unittest.mock.ANY)
         manager.assets.assert_called_once_with(
             os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), False, unittest.mock.ANY,
-            dump_jobs=unittest.mock.ANY)
+            dump_jobs=unittest.mock.ANY, no_audio=False)
         self.assertIsNotNone(manager.assets.call_args.kwargs["dump_jobs"])
         manager.runtime.assert_called_once_with(
             os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY, None,
@@ -371,7 +373,7 @@ class JobsHandlingTest(unittest.TestCase):
                                     probe.assert_called_once_with("auto", mesh_compute=False)
                                     mock_preflight.assert_called_once_with(
                                         ["shaders"], os.path.abspath(work), False, None,
-                                        emulate=True, keep_emulated=True, fallbacks=(), jobs=6)
+                                        emulate=True, keep_emulated=True, fallbacks=(), jobs=6, no_audio=False)
                                     mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6,
                                                                          emulate=True, keep_emulated=True, fallbacks=())
 
@@ -392,7 +394,32 @@ class JobsHandlingTest(unittest.TestCase):
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
                                     mock_assets.assert_called_once_with(
-                                        os.path.abspath(game), os.path.abspath(work), True, 10, dump_jobs=None)
+                                        os.path.abspath(game), os.path.abspath(work), True, 10, dump_jobs=None,
+                                        no_audio=False)
+
+    def test_no_audio_forwarded_to_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = os.path.join(tmp, "game")
+            work = os.path.join(tmp, "work")
+            os.makedirs(game)
+            with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", os.path.join(tmp, "out"),
+                                            "--work", work, "--no-tui", "--stages", "assets", "--no-audio"]):
+                with patch("make_game.below_normal"):
+                    with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
+                        with patch("make_game.preflight") as mock_preflight, patch("make_game.log"):
+                            with patch("make_game.assets") as mock_assets:
+                                ret = make_game.main()
+            self.assertEqual(ret, 0)
+            self.assertTrue(mock_preflight.call_args.kwargs["no_audio"])
+            self.assertTrue(mock_assets.call_args.kwargs["no_audio"])
+
+    def test_wav_and_no_audio_are_rejected(self):
+        with patch.object(sys, "argv", ["make_game.py", "--wav", "--no-audio"]):
+            with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
+                with self.assertRaises(SystemExit) as ctx:
+                    make_game.main()
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("--wav cannot be combined with --no-audio", mock_err.getvalue())
 
     def test_translate_spawns_exact_job_count(self):
         with tempfile.TemporaryDirectory() as tmp:

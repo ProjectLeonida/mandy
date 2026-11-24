@@ -149,7 +149,7 @@ class AudioStageResumeTest(unittest.TestCase):
         open(cmd[-1], "w").close()        # a failed ffmpeg can still leave part of its output
         return subprocess.CompletedProcess(cmd, 1)
 
-    def run_stage(self, ffmpeg="ffmpeg"):
+    def run_stage(self, ffmpeg="ffmpeg", no_audio=False):
         self.ran = []
         with mock.patch.object(make_game, "rpf9dump", lambda w: "rpf9dump"), \
                 mock.patch.object(make_game, "run", self.fake_run), \
@@ -157,7 +157,7 @@ class AudioStageResumeTest(unittest.TestCase):
                 mock.patch.object(make_game.shutil, "which", lambda n: ffmpeg), \
                 mock.patch.object(make_game.subprocess, "run", self.fake_subprocess), \
                 mock.patch.object(make_game, "log", lambda *a: None):
-            make_game.assets(self.game, self.work, False, 2)
+            make_game.assets(self.game, self.work, False, 2, no_audio=no_audio)
         return self.ran
 
     def wavs(self):
@@ -168,6 +168,19 @@ class AudioStageResumeTest(unittest.TestCase):
         self.assertEqual(self.run_stage(), ["awc_opus.py", "rpf9dump xma", "ffmpeg", "ffmpeg"])
         self.assertEqual(self.wavs(), ["s1.wav", "s1.xma.wav", "s2.wav", "s2.xma.wav"])
         self.assertEqual(self.run_stage(), [])
+
+    def test_no_audio_skips_audio_without_deleting_existing_files_and_can_resume_full_export(self):
+        existing = self.touch(self.audio, "ogg", "already-exported.ogg")
+        os.remove(os.path.join(self.audio, "audio_manifest.json"))
+
+        self.assertEqual(self.run_stage(no_audio=True), [])
+        self.assertTrue(os.path.isfile(existing))
+        self.assertTrue(make_game.assets_exported(self.work, no_audio=True))
+        self.assertFalse(make_game.assets_exported(self.work))
+        self.assertEqual(self.run_stage(no_audio=True), [])
+
+        self.assertEqual(self.run_stage(), ["awc_opus.py", "rpf9dump xma", "ffmpeg", "ffmpeg"])
+        self.assertFalse(os.path.exists(os.path.join(self.work, "assets", make_game.ASSETS_NO_AUDIO_MARKER)))
 
     def test_ogg_folder_from_a_stopped_run_does_not_count_as_done(self):
         os.makedirs(os.path.join(self.audio, "ogg"))
