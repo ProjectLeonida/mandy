@@ -1412,7 +1412,16 @@ def fspx_cache_complete(spirv: str) -> bool:
         and isinstance(meta.get("fspx_code_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", meta["fspx_code_sha256"])
         for meta in index.values()
     )
-    return has_compute_key and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
+    if not has_compute_key:
+        return False
+    try:
+        for name in index:
+            module = os.stat(os.path.join(spirv, name + ".spv"))
+            if not stat.S_ISREG(module.st_mode) or module.st_size == 0:
+                return False
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,

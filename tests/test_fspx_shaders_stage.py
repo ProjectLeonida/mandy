@@ -244,17 +244,21 @@ class FspxStage(unittest.TestCase):
             make_game.fspx_shaders(self.game, self.work, "llvm-mc 23")
             self.assertEqual(self.calls, [])
 
-    def test_missing_cached_module_is_rebuilt(self) -> None:
+    def test_missing_or_empty_cached_module_is_rebuilt(self) -> None:
         self.translations = {"upscaler_00": ("c" * 64, "s" * 64, b"synthetic module")}
         self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
         self.assertEqual(self.run_step(), [])
         module = os.path.join(self.spirv, "upscaler_00.spv")
-        os.remove(module)
-
-        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
-        with open(module, "rb") as f:
-            self.assertEqual(f.read(), b"synthetic module")
-        self.assertEqual(self.run_step(), [])
+        for damage in ("missing", "empty"):
+            with self.subTest(damage=damage):
+                if damage == "missing":
+                    os.remove(module)
+                else:
+                    open(module, "wb").close()
+                self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+                with open(module, "rb") as f:
+                    self.assertEqual(f.read(), b"synthetic module")
+                self.assertEqual(self.run_step(), [])
 
     def test_no_dll_no_step(self):
         os.remove(self.dll)
