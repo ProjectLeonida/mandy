@@ -20,6 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import bcpack  # noqa: E402
 import bcpack_tables as t  # noqa: E402
+import bcpack_tables_bptc as bptc  # noqa: E402
 
 OUT = os.path.join(os.path.dirname(HERE), "runtime", "src", "bcpack_tables.h")
 MAX_WIDTH = bcpack.MAX_WIDTH
@@ -54,6 +55,56 @@ def _history_flat(name, k):
             raise SystemExit(f"{name}[{entry}] does not have {k} values")
         flat[entry * k:entry * k + k] = values
     return flat
+
+
+def _bc7_parts():
+    """BC7 (BCPack mode 7): signature configurations, the rank of every lane-15 symbol pair, the public D3D11 BC7
+    partition and anchor tables, and the ranks whose configuration is only inferred. The built-in BC7 history is
+    not written: tools/bcpack_tables_bptc.py knows no bit of it, so it comes from the user's calibrated tables only."""
+    s = bptc._bc7_static()
+    config = [v for row in s["config"] for v in row]
+    if len(s["config"]) != 286 or any(not 0 <= v <= 255 for v in config):
+        raise SystemExit("BC7_CONFIG does not have the expected shape")
+    for k in range(256):
+        if bptc.load_bc7(None)["history_endpoint_bits"][k] != (0,) * 24:
+            raise SystemExit("the built-in BC7 history now has known bits: write it into the header too")
+    return [
+        "",
+        "// BC7_CONFIG: per signature rank, (mode, partition, rotation, index selection); mode 255 is invalid.",
+        f"inline constexpr std::array<std::array<std::uint8_t, 4>, {len(s['config'])}> kBc7Config = {{{{",
+        "\n".join("    {" + ", ".join(str(v) for v in row) + "}," for row in s["config"]),
+        "}};",
+        "",
+        "// The signature rank of lane-15 symbols (a, b) at a * 16 + b; -1 where no rank is assigned.",
+        f"inline constexpr std::array<std::int16_t, {len(s['rank_of'])}> kBc7Rank = {{",
+        _rows(s["rank_of"], 16, 4),
+        "};",
+        "",
+        "// D3D11 BC7 two-subset partitions, packed: bit p is the subset of pixel p.",
+        f"inline constexpr std::array<std::uint16_t, {len(bptc.BC7_PART2_PACKED)}> kBc7Partition2 = {{",
+        _rows(bptc.BC7_PART2_PACKED, 8, 6),
+        "};",
+        "",
+        "// D3D11 BC7 three-subset partitions, packed: bits 2p..2p+1 are the subset of pixel p.",
+        f"inline constexpr std::array<std::uint32_t, {len(bptc.BC7_PART3_PACKED)}> kBc7Partition3 = {{",
+        _rows([f"{v}u" for v in bptc.BC7_PART3_PACKED], 6, 11),
+        "};",
+        "",
+        "// Anchor pixel of subset 1 (two subsets), and of subsets 1 and 2 (three subsets), per partition.",
+        f"inline constexpr std::array<std::uint8_t, 64> kBc7Anchor2 = {{",
+        _rows(bptc.BC7_ANCHOR2, 16, 3),
+        "};",
+        f"inline constexpr std::array<std::uint8_t, 64> kBc7Anchor3a = {{",
+        _rows(bptc.BC7_ANCHOR3A, 16, 3),
+        "};",
+        f"inline constexpr std::array<std::uint8_t, 64> kBc7Anchor3b = {{",
+        _rows(bptc.BC7_ANCHOR3B, 16, 3),
+        "};",
+        "",
+        "// Ranks whose mode-2 partition is inferred from anchor positions and order only (strict decoding refuses them).",
+        f"inline constexpr std::array<std::uint16_t, {len(s['inferred'])}> kBc7Inferred = {{"
+        + ", ".join(str(v) for v in sorted(s["inferred"])) + "};",
+    ]
 
 
 def render():
@@ -104,6 +155,7 @@ def render():
         parts += ["", f"// {name}: entry e at [e * {k}, e * {k} + {k}); -1 where the entry is not confirmed.",
                   f"inline constexpr std::array<std::int16_t, {len(flat)}> kBc{codec}History = {{",
                   _rows(flat, k * (16 // k) if k <= 16 else k, 4), "};"]
+    parts += _bc7_parts()
     parts += ["", "}  // namespace leonida::bcpack::tables", ""]
     return "\n".join(parts)
 

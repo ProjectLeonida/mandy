@@ -4,11 +4,20 @@
 // BCPack into BCn blocks, then swizzles (docs/directstorage.md). This file is the middle step only, portable (no
 // windows.h), so it builds and tests on every OS. The lane layer is a line-by-line port of
 // tools/bcpack_calibration/src/model.rs (itself a port of `_decode_lanes_raw`); the block rebuilds follow
-// tools/bcpack_calibration/src/blocks.rs and `_bc1_blocks` .. `_bc5_blocks`. Strict like `bcpack.decode` by default:
-// a block that refers to a built-in history entry that is not confirmed is refused, never guessed. The tables come
-// from tools/bcpack_tables.py through tools/bcpack_header.py (bcpack_tables.h).
+// tools/bcpack_calibration/src/blocks.rs and `_bc1_blocks` .. `_bc5_blocks`, and `_bc7_check` / `_bc7_rebuild` for
+// BC7 (with the structure of DadaCap's prototype port). The tables come from tools/bcpack_tables*.py through
+// tools/bcpack_header.py (bcpack_tables.h).
 //
-// Done: BCPack modes 1 (BC1), 3 (BC3), 4 (BC4) and 5 (BC5). Not yet: 6 (BC6H) and 7 (BC7), which return
+// Two policies:
+//  - strict (the default), as `bcpack.decode`: a block that refers to a built-in history entry nobody has confirmed,
+//    a BC7 signature whose configuration is only inferred, or a BC7 block that fails its anchor / p-bit consistency
+//    check refuses the whole chunk. The test vectors hold this decoder to the Python one.
+//  - lenient, what a title needs: such a block is decoded anyway, from the zero state where the history is unknown
+//    (what `bcpack.decode(..., allow_provisional=True)` does for BC7, whose built-in history is all unknown), and
+//    counted in Result::guessed together with every block that predicts from it. The texture then has a few wrong
+//    blocks instead of missing.
+//
+// Done: BCPack modes 1 (BC1), 3 (BC3), 4 (BC4), 5 (BC5) and 7 (BC7). Not yet: 6 (BC6H), which returns
 // Status::unsupported_codec.
 #pragma once
 
@@ -28,7 +37,8 @@ enum class Status {
     trailing_data,        // non-zero bytes after the last lane finished
     lane1_nonzero,        // lane 1 carries data (unexpected for BC1..BC5)
     bad_symbol,           // a symbol outside its lookup table
-    unconfirmed_history,  // a block refers to a built-in history entry that is not confirmed
+    unconfirmed_history,  // strict: a block needs a history entry or signature nobody has confirmed
+    bad_block,            // BC7: a signature outside the table, or (strict) an anchor / p-bit inconsistency
 };
 
 const char* status_name(Status status);
@@ -52,12 +62,27 @@ Status decode_lanes(std::span<const std::uint8_t> in, std::span<const std::uint8
 // Confirmed history entries from the user's calibrated tables (tools/bcpack_history_calib.py), to use besides the
 // built-in ones: entry e of mode m at values[m][e * K .. e * K + K) with K = 6, 8, 2, 4 for modes 1, 3, 4, 5; -1 or a
 // short vector means "not given". An entry given here wins over the built-in one (`_resolve_bc_history`'s merge).
+// BC7's calibrated history is not read yet: its built-in entries are all unknown, so strict decoding refuses a BC7
+// chunk that refers to one and lenient decoding takes the zero state.
 struct History {
     std::array<std::vector<std::int16_t>, 8> values;
 };
 
+struct Options {
+    const History* history = nullptr;
+    bool lenient = false;
+};
+
+struct Result {
+    Status status = Status::ok;
+    std::size_t guessed = 0;  // lenient: blocks decoded from an unknown history entry, or that predict from one
+};
+
 // Decodes one BCPack chunk of `mode` into `out`, whose size is the decoded size (a whole number of blocks). On any
 // status but ok, `out` is left in an unspecified state.
+Result decode(std::span<const std::uint8_t> in, std::uint32_t mode, std::span<std::uint8_t> out,
+              const Options& options);
+// The strict decode of `in` (Options{history}).
 Status decode(std::span<const std::uint8_t> in, std::uint32_t mode, std::span<std::uint8_t> out,
               const History* history = nullptr);
 

@@ -50,7 +50,7 @@ int main() {
     }
 
     // Whole chunks: the same blocks, or the same class of refusal.
-    int block_ok = 0;
+    int block_ok = 0, lenient_checked = 0, lenient_guessed = 0;
     for (std::size_t k = 0; k < std::size(bcpack_vectors::kBlockCases); ++k) {
         const auto& c = bcpack_vectors::kBlockCases[k];
         std::vector<std::uint8_t> out(c.out_size);
@@ -64,12 +64,28 @@ int main() {
             check(std::memcmp(out.data(), c.blocks, c.out_size) == 0, what);
             ++block_ok;
         }
+        // Lenient: where Python's provisional decode succeeds, the same bytes; and lenient never refuses a chunk the
+        // strict decode accepts, nor changes its bytes, nor counts a guessed block in it.
+        std::vector<std::uint8_t> loose(c.out_size);
+        const bp::Result r = bp::decode({c.raw, c.raw_size}, c.mode, loose, bp::Options{nullptr, true});
+        if (c.lenient_known) {
+            std::snprintf(what, sizeof what, "block case %zu (mode %u): lenient gives Python's provisional blocks (%s)",
+                          k, c.mode, bp::status_name(r.status));
+            check(r.status == Status::ok && std::memcmp(loose.data(), c.lenient_blocks, c.out_size) == 0, what);
+            ++lenient_checked;
+        }
+        if (c.status == 0) {
+            std::snprintf(what, sizeof what, "block case %zu (mode %u): lenient agrees with strict", k, c.mode);
+            check(r.status == Status::ok && r.guessed == 0 && loose == out, what);
+        }
+        if (r.status == Status::ok && r.guessed) ++lenient_guessed;
     }
 
     // Refusals that need no stream.
     std::vector<std::uint8_t> out(32);
     const std::uint8_t none[1] = {0};
     check(bp::decode(none, 2, out) == Status::unsupported_codec, "mode 2 (BC2) has no BCPack form");
+    check(bp::decode(none, 6, out) == Status::unsupported_codec, "mode 6 (BC6H) is not ported yet");
     check(bp::decode(none, 8, out) == Status::unsupported_codec, "mode 8 does not exist");
     std::vector<std::uint8_t> odd(12);
     check(bp::decode(none, 1, odd) == Status::bad_size, "12 bytes are not whole BC1 blocks");
@@ -91,8 +107,11 @@ int main() {
     }
     check(tried, "the vectors hold a BC1 chunk refused for its history");
 
-    std::printf("bcpack: %d lane cases accepted, %d refused; %d block cases decoded, %zu checked\n", lane_ok,
-                lane_refused, block_ok, std::size(bcpack_vectors::kBlockCases));
+    check(lenient_guessed > 0, "the vectors hold a chunk lenient decoding takes with guessed blocks");
+    std::printf("bcpack: %d lane cases accepted, %d refused; %d block cases decoded, %zu checked; lenient: %d "
+                "against Python's provisional decode, %d with guessed blocks\n",
+                lane_ok, lane_refused, block_ok, std::size(bcpack_vectors::kBlockCases), lenient_checked,
+                lenient_guessed);
     if (g_failures) std::printf("%d FAILURES\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

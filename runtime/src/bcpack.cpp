@@ -104,17 +104,27 @@ std::int64_t rem(std::int64_t v, std::int64_t m) {
     return r < 0 ? r + m : r;
 }
 
-// The base of block i: the zero state, an earlier block, or a confirmed history entry (external first).
+// The decode in progress: the policy, and per block whether it rests on an unknown history entry (`lost`).
+struct Ctx {
+    bool lenient = false;
+    std::vector<std::uint8_t> lost;
+    std::size_t guessed() const { return static_cast<std::size_t>(std::count(lost.begin(), lost.end(), 1)); }
+};
+
+// The base of block i: the zero state, an earlier block, or a confirmed history entry (external first). An entry
+// nobody has confirmed refuses the chunk (strict) or gives the zero state and marks the block lost (lenient); a block
+// that predicts from a lost block is lost too.
 template <std::size_t K>
 Status base_of(std::size_t i, std::int64_t d, const std::array<std::int64_t, K>& zero,
                const std::vector<std::array<std::int64_t, K>>& hist, std::span<const std::int16_t> builtin,
-               std::span<const std::int16_t> external, std::array<std::int64_t, K>& out) {
+               std::span<const std::int16_t> external, Ctx& ctx, std::array<std::int64_t, K>& out) {
     if (d == 0) {
         out = zero;
         return Status::ok;
     }
     if (static_cast<std::int64_t>(i) - d >= 0) {
         out = hist[i - static_cast<std::size_t>(d)];
+        ctx.lost[i] = ctx.lost[i - static_cast<std::size_t>(d)];
         return Status::ok;
     }
     const std::size_t entry = static_cast<std::size_t>(256 + static_cast<std::int64_t>(i) - d);
@@ -123,7 +133,10 @@ Status base_of(std::size_t i, std::int64_t d, const std::array<std::int64_t, K>&
         for (std::size_t k = 0; k < K; ++k) out[k] = table[entry * K + k];
         return Status::ok;
     }
-    return Status::unconfirmed_history;
+    if (!ctx.lenient) return Status::unconfirmed_history;
+    out = zero;
+    ctx.lost[i] = 1;
+    return Status::ok;
 }
 
 std::span<const std::int16_t> external_for(const History* history, std::uint32_t mode) {
@@ -153,14 +166,14 @@ bool lane_is_zero(const Lanes& lanes, std::size_t lane) {
     return true;
 }
 
-Status bc1(const Lanes& l, std::span<const std::int16_t> external, std::span<std::uint8_t> out) {
+Status bc1(const Lanes& l, std::span<const std::int16_t> external, Ctx& ctx, std::span<std::uint8_t> out) {
     if (!lane_is_zero(l, 1)) return Status::lane1_nonzero;
     static constexpr std::array<std::int64_t, 6> mods{32, 64, 32, 32, 64, 32};
     const std::size_t n = l.count;
     std::vector<std::array<std::int64_t, 6>> hist(n);
     for (std::size_t i = 0; i < n; ++i) {
         std::array<std::int64_t, 6> b{};
-        if (const Status s = base_of<6>(i, dist(l.at(0, i)), {}, hist, tables::kBc1History, external, b);
+        if (const Status s = base_of<6>(i, dist(l.at(0, i)), {}, hist, tables::kBc1History, external, ctx, b);
             s != Status::ok)
             return s;
         std::array<std::int64_t, 6> e{};
@@ -181,13 +194,13 @@ Status bc1(const Lanes& l, std::span<const std::int16_t> external, std::span<std
     return Status::ok;
 }
 
-Status bc4(const Lanes& l, std::span<const std::int16_t> external, std::span<std::uint8_t> out) {
+Status bc4(const Lanes& l, std::span<const std::int16_t> external, Ctx& ctx, std::span<std::uint8_t> out) {
     if (!lane_is_zero(l, 1)) return Status::lane1_nonzero;
     const std::size_t n = l.count;
     std::vector<std::array<std::int64_t, 2>> hist(n);
     for (std::size_t i = 0; i < n; ++i) {
         std::array<std::int64_t, 2> b{};
-        if (const Status s = base_of<2>(i, dist(l.at(0, i)), {128, 128}, hist, tables::kBc4History, external, b);
+        if (const Status s = base_of<2>(i, dist(l.at(0, i)), {128, 128}, hist, tables::kBc4History, external, ctx, b);
             s != Status::ok)
             return s;
         const std::int64_t a0 = (b[0] + unzig(l.at(2, i))) & 255, a1 = (b[1] + unzig(l.at(3, i))) & 255;
@@ -209,7 +222,7 @@ Status bc4(const Lanes& l, std::span<const std::int16_t> external, std::span<std
 }
 
 // BC3 and BC5 carry two symbols of every lane per block, so the lane count is twice the block count.
-Status bc3(const Lanes& l, std::span<const std::int16_t> external, std::span<std::uint8_t> out) {
+Status bc3(const Lanes& l, std::span<const std::int16_t> external, Ctx& ctx, std::span<std::uint8_t> out) {
     if (l.count % 2) return Status::bad_size;
     if (!lane_is_zero(l, 1)) return Status::lane1_nonzero;
     static constexpr std::array<std::int64_t, 8> mods{256, 256, 32, 64, 32, 32, 64, 32};
@@ -219,7 +232,7 @@ Status bc3(const Lanes& l, std::span<const std::int16_t> external, std::span<std
         const std::size_t a = 2 * i, b = 2 * i + 1;
         std::array<std::int64_t, 8> base{};
         if (const Status s = base_of<8>(i, dist8(l.at(0, a), l.at(0, b)), {128, 128, 0, 0, 0, 0, 0, 0}, hist,
-                                        tables::kBc3History, external, base);
+                                        tables::kBc3History, external, ctx, base);
             s != Status::ok)
             return s;
         const std::array<std::uint16_t, 8> dz{l.at(2, a), l.at(2, b), l.at(7, a), l.at(8, a),
@@ -252,7 +265,7 @@ Status bc3(const Lanes& l, std::span<const std::int16_t> external, std::span<std
     return Status::ok;
 }
 
-Status bc5(const Lanes& l, std::span<const std::int16_t> external, std::span<std::uint8_t> out) {
+Status bc5(const Lanes& l, std::span<const std::int16_t> external, Ctx& ctx, std::span<std::uint8_t> out) {
     if (l.count % 2) return Status::bad_size;
     if (!lane_is_zero(l, 1)) return Status::lane1_nonzero;
     const std::size_t blocks = l.count / 2;
@@ -261,7 +274,7 @@ Status bc5(const Lanes& l, std::span<const std::int16_t> external, std::span<std
         const std::size_t a = 2 * i, b = 2 * i + 1;
         std::array<std::int64_t, 4> base{};
         if (const Status s = base_of<4>(i, dist8(l.at(0, a), l.at(0, b)), {128, 128, 128, 128}, hist,
-                                        tables::kBc5History, external, base);
+                                        tables::kBc5History, external, ctx, base);
             s != Status::ok)
             return s;
         const std::array<std::int64_t, 4> e{(base[0] + unzig(l.at(2, a))) & 255, (base[1] + unzig(l.at(2, b))) & 255,
@@ -285,6 +298,243 @@ Status bc5(const Lanes& l, std::span<const std::int16_t> external, std::span<std
     return Status::ok;
 }
 
+// BC7 --------------------------------------------------------------------------------------------------------------
+// `_bc7_check` then `_bc7_rebuild` of tools/bcpack.py, in that order, so a chunk is refused for the same reason. The
+// built-in BC7 history is all unknown (tools/bcpack_tables_bptc.py has no bit of it), so a reference before the
+// chunk's first block is refused (strict) or decoded from the zero state, which is what Python's provisional mode
+// rebuilds too (lenient). Per-mode constants: `_B7_*`.
+constexpr std::array<int, 8> kB7Subsets{3, 2, 3, 2, 1, 1, 1, 2};
+constexpr std::array<int, 8> kB7Colour{4, 6, 5, 7, 5, 7, 7, 5};
+constexpr std::array<int, 8> kB7Alpha{0, 0, 0, 0, 6, 8, 7, 5};
+constexpr std::array<int, 8> kB7PBits{1, 2, 0, 1, 0, 0, 1, 1};  // 1: per endpoint, 2: shared per subset
+constexpr std::array<int, 8> kB7IndexBits{3, 3, 2, 2, 3, 2, 4, 2};
+constexpr std::array<int, 8> kB7PartitionBits{4, 6, 6, 6, 0, 0, 0, 6};
+constexpr int kB7Lane[3][4] = {{2, 3, 4, 5}, {6, 7, 8, 9}, {10, 5, 9, -1}};
+
+// The 8-bit value `_inter8` makes of two 4-bit symbols.
+int inter8(std::uint16_t a, std::uint16_t b) {
+    int code = 0;
+    for (int k = 0; k < 4; ++k) code |= (((a >> k) & 1) << (2 * k)) | (((b >> k) & 1) << (2 * k + 1));
+    return code;
+}
+
+// The even (odd = false) or odd bits of an 8-bit symbol, packed (`_DEINT`).
+int deint(int s, bool odd) {
+    const int o = odd ? 1 : 0;
+    return ((s >> o) & 1) | (((s >> (2 + o)) & 1) << 1) | (((s >> (4 + o)) & 1) << 2) | (((s >> (6 + o)) & 1) << 3);
+}
+
+// A 128-bit BC7 block written from its low bit up.
+struct Bits128 {
+    std::uint64_t word[2] = {0, 0};
+    int pos = 0;
+    void put(std::uint64_t value, int bits) {
+        if (bits <= 0) return;
+        value &= (bits >= 64) ? ~std::uint64_t{0} : ((std::uint64_t{1} << bits) - 1);
+        for (int k = 0; k < bits; ++k, ++pos)
+            if (pos < 128 && ((value >> k) & 1)) word[pos >> 6] |= std::uint64_t{1} << (pos & 63);
+    }
+};
+
+int bc7_rank(std::uint16_t a, std::uint16_t b) {
+    return a < 32 && b < 16 ? tables::kBc7Rank[a * 16u + b] : -1;
+}
+
+bool bc7_inferred(int rank) {
+    return std::find(tables::kBc7Inferred.begin(), tables::kBc7Inferred.end(), rank) != tables::kBc7Inferred.end();
+}
+
+Status bc7(const Lanes& l, Ctx& ctx, std::span<std::uint8_t> out) {
+    const std::size_t n = l.count / 2;
+    // _bc7_check: every signature in the table, none inferred, no reference into the built-in history.
+    for (std::size_t i = 0; i < n; ++i) {
+        const int rank = bc7_rank(l.at(15, 2 * i), l.at(15, 2 * i + 1));
+        if (rank < 0 || tables::kBc7Config[rank][0] > 7 || tables::kBc7Config[rank][1] == 255) return Status::bad_block;
+    }
+    if (!ctx.lenient) {
+        for (std::size_t i = 0; i < n; ++i)
+            if (bc7_inferred(bc7_rank(l.at(15, 2 * i), l.at(15, 2 * i + 1)))) return Status::unconfirmed_history;
+        for (std::size_t i = 0; i < std::min<std::size_t>(n, 256); ++i) {
+            const int di = inter8(l.at(1, 2 * i), l.at(1, 2 * i + 1));
+            const int de = (di + static_cast<int>(unzig(static_cast<std::uint16_t>(inter8(l.at(0, 2 * i),
+                                                                                          l.at(0, 2 * i + 1)))))) & 255;
+            if (static_cast<std::size_t>(de) > i || static_cast<std::size_t>(di) > i)
+                return Status::unconfirmed_history;
+        }
+    }
+
+    // _bc7_rebuild.
+    std::vector<std::array<int, 24>> eps(n);
+    std::vector<std::array<int, 32>> ixs(n);
+    std::vector<std::uint8_t> lost_e(n, 0), lost_i(n, 0);
+    bool inconsistent = false;
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::size_t a = 2 * i, b = 2 * i + 1;
+        const int rank = bc7_rank(l.at(15, a), l.at(15, b));
+        const auto& cfg = tables::kBc7Config[static_cast<std::size_t>(rank)];
+        const int mode = cfg[0], part = cfg[1], rot = cfg[2], isel = cfg[3];
+        const int di = inter8(l.at(1, a), l.at(1, b));
+        const int de = (di + static_cast<int>(unzig(static_cast<std::uint16_t>(inter8(l.at(0, a), l.at(0, b)))))) & 255;
+        std::array<int, 24> rep{};
+        std::array<int, 32> rix{};
+        if (de && static_cast<std::size_t>(de) <= i) {
+            rep = eps[i - static_cast<std::size_t>(de)];
+            lost_e[i] = lost_e[i - static_cast<std::size_t>(de)];
+        } else if (de) {
+            lost_e[i] = 1;  // the built-in entry is unknown: the zero state
+        }
+        if (di && static_cast<std::size_t>(di) <= i) {
+            rix = ixs[i - static_cast<std::size_t>(di)];
+            lost_i[i] = lost_i[i - static_cast<std::size_t>(di)];
+        } else if (di) {
+            lost_i[i] = 1;
+        }
+        ctx.lost[i] = lost_e[i] || lost_i[i];
+
+        const int ns = kB7Subsets[mode], cb = kB7Colour[mode], ab = kB7Alpha[mode], pk = kB7PBits[mode];
+        int w[4] = {cb, cb, cb, ab};
+        if (rot) {
+            w[rot - 1] = ab;
+            w[3] = cb;
+        }
+        int val[3][2][4] = {};
+        int pb[3][2] = {};
+        bool bad = false;
+        std::array<int, 24> sep{};
+        for (int sub = 0; sub < ns; ++sub) {
+            for (int c = 0; c < 4; ++c) {
+                const int lane = kB7Lane[sub][c];
+                if (!w[c] || lane < 0) continue;
+                const int bits = w[c] + ((pk && c == 0) ? 1 : 0), shift = 8 - bits, mask = (1 << bits) - 1;
+                const int v0 = ((rep[sub * 8 + c] >> shift) + static_cast<int>(unzig(l.at(static_cast<std::size_t>(lane), a)))) & mask;
+                const int v1 = ((rep[sub * 8 + 4 + c] >> shift) + static_cast<int>(unzig(l.at(static_cast<std::size_t>(lane), b)))) & mask;
+                val[sub][0][c] = v0;
+                val[sub][1][c] = v1;
+                sep[sub * 8 + c] = v0 << shift;
+                sep[sub * 8 + 4 + c] = v1 << shift;
+            }
+            if (pk == 1) {
+                pb[sub][0] = val[sub][0][0] & 1;
+                pb[sub][1] = val[sub][1][0] & 1;
+            } else if (pk == 2) {
+                pb[sub][0] = pb[sub][1] = val[sub][0][0] & 1;
+                if ((val[sub][1][0] & 1) != pb[sub][0]) bad = true;
+            }
+        }
+        for (int sub = ns; sub < 3; ++sub)
+            for (int k = 0; k < 8; ++k) sep[sub * 8 + k] = sep[k];
+        eps[i] = sep;
+
+        const int b1 = kB7IndexBits[mode], b1_shift = 4 - b1, b1_mask = (1 << b1) - 1;
+        const bool two = mode == 4 || mode == 5;
+        int s1[16] = {}, s2[16] = {};
+        std::array<int, 32> six{};
+        static constexpr std::size_t rows1[4] = {11, 12, 13, 14}, rows2[4] = {6, 7, 8, 10};
+        for (int y = 0; y < 4; ++y) {
+            const bool first_odd = y < 3;  // the last row's pairs are the other way round
+            const int sa = l.at(rows1[y], a), sb = l.at(rows1[y], b);
+            const int d1[4] = {deint(sa, first_odd), deint(sa, !first_odd), deint(sb, first_odd), deint(sb, !first_odd)};
+            for (int x = 0; x < 4; ++x) {
+                const int p = y * 4 + x;
+                s1[p] = ((rix[p] >> b1_shift) + static_cast<int>(unzig(static_cast<std::uint16_t>(d1[x])))) & b1_mask;
+                six[p] = s1[p] << b1_shift;
+            }
+            if (!two) continue;
+            const int ta = l.at(rows2[y], a), tb = l.at(rows2[y], b);
+            const int d2[4] = {deint(ta, first_odd), deint(ta, !first_odd), deint(tb, first_odd), deint(tb, !first_odd)};
+            for (int x = 0; x < 4; ++x) {
+                const int p = y * 4 + x;
+                s2[p] = ((rix[16 + p] >> 2) + static_cast<int>(unzig(static_cast<std::uint16_t>(d2[x])))) & 3;
+                six[16 + p] = s2[p] << 2;
+            }
+        }
+        ixs[i] = six;
+
+        std::uint8_t* to = out.data() + 16 * i;
+        std::fill(to, to + 16, std::uint8_t{0});
+        const bool empty_endpoints = std::all_of(sep.begin(), sep.end(), [](int v) { return v == 0; });
+        const bool empty_indices = std::all_of(std::begin(s1), std::end(s1), [](int v) { return v == 0; });
+        if (mode == 0 && part == 0 && empty_endpoints && empty_indices) {
+            inconsistent = inconsistent || bad;
+            continue;  // the reserved all-zero block
+        }
+
+        int anchors[3] = {0, 0, 0};
+        if (ns == 2) {
+            anchors[1] = tables::kBc7Anchor2[static_cast<std::size_t>(part)];
+        } else if (ns == 3) {
+            anchors[1] = tables::kBc7Anchor3a[static_cast<std::size_t>(part)];
+            anchors[2] = tables::kBc7Anchor3b[static_cast<std::size_t>(part)];
+        }
+        const auto subset_of = [&](int p) -> int {
+            if (ns == 2) return (tables::kBc7Partition2[static_cast<std::size_t>(part)] >> p) & 1;
+            if (ns == 3) return static_cast<int>((tables::kBc7Partition3[static_cast<std::size_t>(part)] >> (2 * p)) & 3);
+            return 0;
+        };
+        const int* pri = s1;
+        const int* sec = nullptr;
+        int ib = b1, ib2 = 0;
+        if (mode == 4) {
+            pri = s2, ib = 2, sec = s1, ib2 = 3;
+        } else if (mode == 5) {
+            pri = s1, ib = 2, sec = s2, ib2 = 2;
+        }
+
+        Bits128 block;
+        block.put(std::uint64_t{1} << mode, mode + 1);
+        if (kB7PartitionBits[mode]) block.put(static_cast<std::uint64_t>(part), kB7PartitionBits[mode]);
+        if (two) block.put(static_cast<std::uint64_t>(rot), 2);
+        if (mode == 4) block.put(static_cast<std::uint64_t>(isel), 1);
+        for (int c = 0; c < 3; ++c) {
+            const int tc = (rot && c == rot - 1) ? 3 : c;
+            const bool drop = pk && tc == 0;
+            for (int sub = 0; sub < ns; ++sub)
+                for (int e = 0; e < 2; ++e) block.put(static_cast<std::uint64_t>(drop ? val[sub][e][tc] >> 1 : val[sub][e][tc]), cb);
+        }
+        if (ab) {
+            const int tc = rot ? rot - 1 : 3;
+            const bool drop = pk && tc == 0;
+            for (int sub = 0; sub < ns; ++sub)
+                for (int e = 0; e < 2; ++e) block.put(static_cast<std::uint64_t>(drop ? val[sub][e][tc] >> 1 : val[sub][e][tc]), ab);
+        }
+        if (pk == 1) {
+            for (int sub = 0; sub < ns; ++sub) {
+                block.put(static_cast<std::uint64_t>(pb[sub][0]), 1);
+                block.put(static_cast<std::uint64_t>(pb[sub][1]), 1);
+            }
+        } else if (pk == 2) {
+            for (int sub = 0; sub < ns; ++sub) block.put(static_cast<std::uint64_t>(pb[sub][0]), 1);
+        }
+        for (int p = 0; p < 16; ++p) {
+            const int pv = pri[p];
+            if (p == anchors[subset_of(p)]) {
+                if (pv >> (ib - 1)) bad = true;
+                block.put(static_cast<std::uint64_t>(pv), ib - 1);
+            } else {
+                block.put(static_cast<std::uint64_t>(pv), ib);
+            }
+        }
+        if (sec) {
+            for (int p = 0; p < 16; ++p) {
+                const int sv = sec[p];
+                if (p == 0) {
+                    if (sv >> (ib2 - 1)) bad = true;
+                    block.put(static_cast<std::uint64_t>(sv), ib2 - 1);
+                } else {
+                    block.put(static_cast<std::uint64_t>(sv), ib2);
+                }
+            }
+        }
+        if (block.pos != 128) return Status::bad_block;  // `_B7_SIGNATURE`: refused in every mode
+        for (int k = 0; k < 2; ++k)
+            for (int byte = 0; byte < 8; ++byte) to[8 * k + byte] = static_cast<std::uint8_t>(block.word[k] >> (8 * byte));
+        inconsistent = inconsistent || bad;
+        if (bad && ctx.lenient) ctx.lost[i] = 1;
+    }
+    if (inconsistent && !ctx.lenient) return Status::bad_block;  // the anchor / p-bit consistency check
+    return Status::ok;
+}
+
 }  // namespace
 
 const char* status_name(Status status) {
@@ -297,6 +547,7 @@ const char* status_name(Status status) {
         case Status::lane1_nonzero: return "lane 1 is non-zero";
         case Status::bad_symbol: return "symbol outside its lookup table";
         case Status::unconfirmed_history: return "block refers to an unconfirmed built-in history entry";
+        case Status::bad_block: return "BC7 block fails its signature or consistency check";
     }
     return "unknown status";
 }
@@ -534,23 +785,34 @@ Status decode_lanes(std::span<const std::uint8_t> raw, std::span<const std::uint
     }
 }
 
-Status decode(std::span<const std::uint8_t> in, std::uint32_t mode, std::span<std::uint8_t> out,
-              const History* history) {
+Result decode(std::span<const std::uint8_t> in, std::uint32_t mode, std::span<std::uint8_t> out,
+              const Options& options) {
     const std::uint32_t bytes = block_bytes(mode);
-    if (mode != 1 && mode != 3 && mode != 4 && mode != 5) return Status::unsupported_codec;
-    if (out.size() % bytes) return Status::bad_size;
+    if (mode != 1 && mode != 3 && mode != 4 && mode != 5 && mode != 7) return {Status::unsupported_codec};
+    if (out.size() % bytes) return {Status::bad_size};
     Lanes lanes;
     if (const Status s = decode_lanes(in, lane_widths(mode), out.size() / kElementBytes, lanes); s != Status::ok)
-        return s;
+        return {s};
     if (std::any_of(in.begin() + static_cast<std::ptrdiff_t>(lanes.used), in.end(), [](std::uint8_t b) { return b; }))
-        return Status::trailing_data;
-    const std::span<const std::int16_t> external = external_for(history, mode);
+        return {Status::trailing_data};
+    const std::span<const std::int16_t> external = external_for(options.history, mode);
+    Ctx ctx;
+    ctx.lenient = options.lenient;
+    ctx.lost.assign(out.size() / bytes, 0);
+    Status s;
     switch (mode) {
-        case 1: return bc1(lanes, external, out);
-        case 3: return bc3(lanes, external, out);
-        case 4: return bc4(lanes, external, out);
-        default: return bc5(lanes, external, out);
+        case 1: s = bc1(lanes, external, ctx, out); break;
+        case 3: s = bc3(lanes, external, ctx, out); break;
+        case 4: s = bc4(lanes, external, ctx, out); break;
+        case 5: s = bc5(lanes, external, ctx, out); break;
+        default: s = bc7(lanes, ctx, out); break;
     }
+    return {s, s == Status::ok ? ctx.guessed() : 0};
+}
+
+Status decode(std::span<const std::uint8_t> in, std::uint32_t mode, std::span<std::uint8_t> out,
+              const History* history) {
+    return decode(in, mode, out, Options{history, false}).status;
 }
 
 }  // namespace leonida::bcpack
