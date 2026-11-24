@@ -233,8 +233,7 @@ def write_manifest(rows: list, banks: int, streamed: int, fmt: str, out: str) ->
     try:
         with staged:
             _emit(staged)
-        if os.name != "nt":
-            os.chmod(staged.name, published_mode(destination))
+        os.chmod(staged.name, published_mode(destination))
         replace_retry(staged.name, destination)
     finally:
         # The staging file may have inherited a read-only destination's mode; make it deletable
