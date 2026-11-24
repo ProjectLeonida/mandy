@@ -662,6 +662,19 @@ class MainTest(unittest.TestCase):
                 drive.assert_not_called()
                 launch.assert_not_called()
 
+    def test_malformed_dependency_lists_are_rejected_before_launch(self):
+        for property_name in ("DEPENDS", "FIXTURES_SETUP", "FIXTURES_REQUIRED"):
+            for invalid in ("setup", None, 7, ["setup", 7]):
+                with self.subTest(property_name=property_name, value=invalid):
+                    setup = ctest_entry("setup", self.command("ok.py"))
+                    consumer = ctest_entry("consumer", self.command("ok.py"), {property_name: invalid})
+                    with mock.patch.object(rwt, "DriveMap") as drive, mock.patch.object(rwt, "run_test", return_value=("pass", "")) as launch:
+                        code, _, err = self.run_main([setup, consumer])
+                    self.assertEqual(code, 2)
+                    self.assertIn("not the output of ctest", err)
+                    drive.assert_not_called()
+                    launch.assert_not_called()
+
     def test_an_unbuilt_test_without_a_command_is_valid_inventory(self):
         code, out, err = self.run_main([{"name": "unbuilt"}], "--require", "unbuilt")
         self.assertEqual(code, 1)
