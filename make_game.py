@@ -1203,6 +1203,7 @@ def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,
         return False
     had = read_shader_setting(os.path.join(spirv, "wave64_emulate.txt"), default="off")
     return (had == requested_shader_mode(had, emulate, keep_emulated)
+            and read_shader_setting(os.path.join(dxbc, "carve_sources.sha256")) == carve_sources_digest()
             and read_shader_setting(os.path.join(spirv, "translator_flags.txt")) == translator_flags_setting(fallbacks)
             and read_shader_setting(os.path.join(spirv, "translation_sources.sha256")) == translation_sources_digest()
             and os.path.isfile(os.path.join(dxbc, "disasm.done"))
@@ -1241,15 +1242,21 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     # Each stage counts as finished only when the file it writes last is there, never because its folder exists
     # or holds many files: a run stopped part-way leaves both. Re-running a stage drops the later stages' proof.
     carved = os.path.join(dxbc, "index.json")             # shader_carve.py, renamed into place at the end
+    carve_sources_file = os.path.join(dxbc, "carve_sources.sha256")
     unpacked = os.path.join(dxbc, "fssm_index.json")      # fssm_unpack.py, the same
     disassembly_started = os.path.join(dxbc, "disasm.started")
     disassembled = os.path.join(dxbc, "disasm.done")      # records LLVM and the listings produced
     translated = os.path.join(spirv, "index.json")        # rdna2spirv.py --merge, renamed into place
     shard_plan = os.path.join(spirv, SHARD_PLAN)          # lets translate() keep finished shards; see there
     signature = llvm_mc_signature()
-    if not os.path.isfile(carved):
+    carve_sources = carve_sources_digest()
+    if not os.path.isfile(carved) or read_shader_setting(carve_sources_file) != carve_sources:
         log("shaders: carving shaders.rpf")
-        drop(translated, shard_plan, disassembled, disassembly_started, unpacked)
+        drop(carved, translated, shard_plan, disassembled, disassembly_started, unpacked)
+        os.makedirs(dxbc, exist_ok=True)
+        # The carve writes its index last, so the stamp alone cannot mark an interrupted run complete.
+        with open(carve_sources_file, "w", encoding="utf-8", newline="\n") as f:
+            f.write(carve_sources + "\n")
         py("shader_carve.py", src, dxbc)
     if unpacked_shader_stems(dxbc) is None:
         log("shaders: unpacking native code")
@@ -1860,6 +1867,11 @@ def sources_digest(folder: str, names, lead: str = "") -> str:
 def translation_sources_digest() -> str:
     """SHA-256 over the name and exact bytes of each TRANSLATION_SOURCES file."""
     return sources_digest(TOOLS, TRANSLATION_SOURCES)
+
+
+def carve_sources_digest() -> str:
+    """Digest of the tools that produce the DXBC carve and its index."""
+    return sources_digest(TOOLS, ("shader_carve.py", "shader_carve_accel.py"))
 
 
 def drop(*paths: str) -> None:

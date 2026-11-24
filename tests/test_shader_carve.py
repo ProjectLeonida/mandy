@@ -183,6 +183,28 @@ class ShaderModelParsingTest(unittest.TestCase):
 
 
 class EntryMarkerRegexTest(unittest.TestCase):
+    def test_carved_names_exclude_printable_length_prefix(self):
+        dxbc = make_dxbc([(b"DXIL", make_dxil_payload(0x65, 5))])
+        names = ("A" * 64, "~" + "n" * 125)
+        entries = b"".join(
+            b"\x00" + bytes([len(name) + 1]) + make_rpf_entry(name, 2, dxbc)
+            for name in names
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "synthetic.bin")
+            out = os.path.join(tmp, "carved")
+            with open(src, "wb") as f:
+                f.write(entries)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(shader_carve.main([src, out]), 0)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                index = json.load(f)
+            self.assertEqual([entry["name"] for entry in index], list(names))
+            self.assertEqual([entry["file"] for entry in index], [name + ".dxbc" for name in names])
+            for entry in index:
+                with open(os.path.join(out, entry["file"]), "rb") as f:
+                    self.assertEqual(f.read(), dxbc)
+
     def test_valid_entry_pattern_matching(self):
         entry = make_rpf_entry("valid_name", 2, b"DXBC" + bytes(range(40)), entry_id=100)
         match = shader_carve.ENTRY.search(entry)
