@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; s_buffer_load out of range by more than 4 GB, with the offset in a register (#4573): the translator gives 0 for
 ; each dword outside the bound and loads it with no branch, through OpSelect(dword 0 in range, address, heap base),
 ; because llvmpipe hoisted a branch-guarded load (with the old form this fixture segfaults vk_compute_test on
