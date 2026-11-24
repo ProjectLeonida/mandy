@@ -1027,7 +1027,12 @@ def _load_history(hist_path):
         history = json.loads(read_utf8(hist_path).lstrip("\ufeff"))
     except ValueError as exc:
         raise ValueError(f"{hist_path}: invalid JSON: {exc}") from None
-    if not isinstance(history, list) or any(not isinstance(item, dict) or "content_hash" not in item for item in history):
+    if not isinstance(history, list) or any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("content_hash"), str)
+        or not isinstance(item.get("metrics"), dict)
+        for item in history
+    ):
         raise ValueError(f"{hist_path}: expected a JSON list of snapshot summaries")
     return history
 

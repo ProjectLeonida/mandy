@@ -710,13 +710,22 @@ class Hardening(unittest.TestCase):
             out = os.path.join(tmp, "out")
             os.makedirs(out)
             hist = Path(out, "history.json")
-            for bad in (b"{bad", b"{}"):
+            for bad in (
+                b"{bad",
+                b"{}",
+                b'[{"content_hash":"old"}]',
+                b'[{"content_hash":"old","metrics":null}]',
+                b'[{"content_hash":"old","metrics":[]}]',
+                b'[{"content_hash":null,"metrics":{}}]',
+            ):
                 hist.write_bytes(bad)
                 err = io.StringIO()
                 with mock.patch.object(pd, "build", return_value=snap), contextlib.redirect_stderr(err):
                     rc = pd.main(["--out", out])
                 self.assertEqual(rc, 2)
                 self.assertIn("error:", err.getvalue())
+                self.assertEqual(hist.read_bytes(), bad)
+                self.assertFalse(Path(out, "progress.html").exists())
 
             valid = [{"generated_at": "2026-11-24T09:00:00Z", "head": "abc", "content_hash": "0" * 16, "metrics": {}}]
             hist.write_bytes(b"\xef\xbb\xbf" + json.dumps(valid).encode("utf-8"))
