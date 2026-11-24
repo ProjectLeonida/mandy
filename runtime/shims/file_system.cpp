@@ -687,41 +687,47 @@ std::filesystem::path overlay_dir() {
     return g_overlay_dir;
 }
 
+std::string trace_path(LPCWSTR name) {
+    std::string utf8;
+    if (const int n = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr); n > 1) {
+        utf8.resize(static_cast<size_t>(n) - 1);
+        WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8.data(), n, nullptr, nullptr);
+    }
+    return rt::startup_trace::quote(utf8);
+}
+
 // gta6rt --trace FILE: a failed open of a guest path goes to the startup trace as a "file_open_failed" event (the
 // path the title passed, the Win32 error, the caller as module+RVA), so a boot that stops on a missing or refused
-// file names it. Failures only, and at most 256 of them, so a title probing many optional files can't fill the file.
+// file names it. At most 256 failures are recorded.
 void note_open_failure(const char* api, LPCWSTR name, DWORD error, const void* caller) {
     if (!rt::startup_trace::enabled()) return;
     static std::atomic<int> left{256};
     if (left.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
-    std::string utf8;
-    if (const int n = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr); n > 1) {
-        utf8.resize(static_cast<size_t>(n) - 1);
-        WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8.data(), n, nullptr, nullptr);
-    }
     rt::startup_trace::event(
         "file_open_failed",
-        std::string("\"api\":\"") + api + "\",\"path\":" + rt::startup_trace::quote(utf8) +
+        std::string("\"api\":\"") + api + "\",\"path\":" + trace_path(name) +
             ",\"error\":" + std::to_string(error) + ",\"caller\":" +
             rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
 }
 
-// LOCAL DIAGNOSTIC: gta6rt --trace FILE also records the first 600 successful opens ("file_open": path, access,
-// caller), so the startup trace shows which file the title was working on when it stopped making progress.
+// The first 600 successful opens go to the trace as "file_open" events (the path the title passed, the access mask,
+// the caller), so a boot that stops making progress shows which files it had reached. Their budget is separate from
+// the failures', so neither kind of event can use up the other's.
 void note_open(const char* api, LPCWSTR name, DWORD access, const void* caller) {
     if (!rt::startup_trace::enabled()) return;
-    static std::atomic<int> left{600};
-    if (left.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
-    std::string utf8;
-    if (const int n = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr); n > 1) {
-        utf8.resize(static_cast<size_t>(n) - 1);
-        WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8.data(), n, nullptr, nullptr);
-    }
+    static std::atomic<unsigned> slots{600};
+    unsigned left = slots.load(std::memory_order_relaxed);
+    while (left && !slots.compare_exchange_weak(left, left - 1, std::memory_order_relaxed)) {}
+    if (!left) return;
+    // OPEN_ALWAYS and CREATE_ALWAYS report ERROR_ALREADY_EXISTS through the last error of a successful open, and
+    // writing the event changes it: the title must see the value the open left.
+    const DWORD error = GetLastError();
     rt::startup_trace::event(
         "file_open",
-        std::string("\"api\":\"") + api + "\",\"path\":" + rt::startup_trace::quote(utf8) + ",\"access\":" +
+        std::string("\"api\":\"") + api + "\",\"path\":" + trace_path(name) + ",\"access\":" +
             std::to_string(access) + ",\"caller\":" +
             rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
+    SetLastError(error);
 }
 
 // Reads one byte of every 4 KiB page of [buffer, buffer + size) from user mode, so that pages committed on first
