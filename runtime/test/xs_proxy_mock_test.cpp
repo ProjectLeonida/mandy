@@ -964,6 +964,30 @@ int check_xbox_slots() {
     EXPECT(hr_of(raw(device, 73, word(&desc), 0, 0, word(&list_iid), word(&list))) == E_INVALIDARG);
     EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), 0)) == E_POINTER);
 
+    // Asked for the console command-list interface - what the retail title's slot-73 call actually asks for, and an
+    // IID no PC device answers - the list is built as ID3D12GraphicsCommandList and the console proxy is handed back
+    // for the IID that was asked for. That IID is measured from the title and appears in no image of the package.
+    constexpr GUID kConsoleListIid{0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+    const IID build_iid = __uuidof(ID3D12GraphicsCommandList);
+    void* console_list = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&kConsoleListIid), word(&console_list))) ==
+           S_OK);
+    EXPECT(xs::is_command_list_proxy(console_list) && console_list != nullptr);
+    EXPECT(mock->calls[12] == 2);
+    EXPECT(mock->args[12][4] != word(&kConsoleListIid) &&
+           IsEqualIID(*reinterpret_cast<const IID*>(mock->args[12][4]), build_iid));
+    // The object handed back answers the interface it was created as, from the console list table.
+    void* asked_again = nullptr;
+    EXPECT(hr_of(raw(console_list, 0, word(&kConsoleListIid), word(&asked_again))) == S_OK);
+    EXPECT(asked_again == console_list);
+    EXPECT(release(asked_again) == 1);
+    // An interface the proxy does not model stays refused, with the output nulled.
+    const IID resource_iid = __uuidof(ID3D12Resource);
+    void* not_a_list = nullptr;
+    EXPECT(hr_of(raw(console_list, 0, word(&resource_iid), word(&not_a_list))) == E_NOINTERFACE);
+    EXPECT(not_a_list == nullptr);
+    EXPECT(release(console_list) == 0);
+
     EXPECT(xs::device_slot_overridden(48) && xs::device_slot_overridden(73) && xs::device_slot_overridden(78) &&
            xs::device_slot_overridden(79) && xs::device_slot_overridden(80));
 

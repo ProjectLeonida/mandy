@@ -983,6 +983,15 @@ inline void note_list_slot(unsigned slot, std::uint64_t a1 = 0, std::uint64_t a2
                      static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
 }
 
+// The command-list interface the retail title asks device slot 73 for. It is a constant of the title itself, one
+// entry of the table of object IIDs its Create* calls pass to the device: the entry between IID_ID3D12CommandAllocator
+// and the command-signature IID, at its .rdata rva 0x61e0668, found by searching the Data4 bytes through the mapped
+// images. One instruction in the title names it, and it feeds the slot-73 call. It shares Data1 with
+// IID_ID3D12GraphicsCommandList6, appears in no image of the package, and is not in the PC SDK. The call shape is
+// docs/retail_boot_chain.md section 3.3; what that interface's own method table adds is not established, so the proxy
+// answers it with the console list table it already models.
+constexpr GUID kConsoleCommandListIid{0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+
 inline bool is_list_iid(const IID& iid) {
     return IsEqualIID(iid, __uuidof(IUnknown)) || IsEqualIID(iid, __uuidof(ID3D12Object)) ||
            IsEqualIID(iid, __uuidof(ID3D12DeviceChild)) || IsEqualIID(iid, __uuidof(ID3D12CommandList)) ||
@@ -994,7 +1003,8 @@ inline bool is_list_iid(const IID& iid) {
            IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList5)) ||
            IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList6)) ||
            IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList7)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList8));
+           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList8)) ||
+           IsEqualIID(iid, kConsoleCommandListIid);
 }
 
 inline unsigned long list_add_ref(ListProxy* self) { return self->refs.fetch_add(1, std::memory_order_relaxed) + 1; }
@@ -1021,6 +1031,13 @@ inline HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out
     if (!is_list_iid(*riid)) {
         if (supports_iid(self->real, *riid)) log_refused_iid("list", *riid);
         return E_NOINTERFACE;
+    }
+    // The console command-list interface is the one this proxy's own slot table answers, and no PC object implements
+    // it, so the real object's capability is not consulted for it. Every PC interface still has to be implemented.
+    if (IsEqualIID(*riid, kConsoleCommandListIid)) {
+        *out = self;
+        list_add_ref(self);
+        return S_OK;
     }
     if (!supports_iid(self->real, *riid)) return E_NOINTERFACE;
     *out = self;
@@ -1441,9 +1458,31 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     auto* allocator = allocator_proxy_real_allocator(reinterpret_cast<void*>(allocator_word));
     if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
+    // The title asks for the console command-list interface, which no PC device answers: build the list through
+    // ID3D12GraphicsCommandList - the interface this proxy's real pointer is typed as, and what section 3.3 of
+    // docs/retail_boot_chain.md prescribes for the stand-in - and let wrap_list hand the console proxy back for the
+    // IID that was asked for. A PC IID a real device does answer keeps the direct path.
+    // The title asks for the console command-list interface, which no PC device answers: build the list through
+    // ID3D12GraphicsCommandList - the interface this proxy's real pointer is typed as, and what section 3.3 of
+    // docs/retail_boot_chain.md prescribes for the stand-in - and let wrap_list hand the console proxy back for the
+    // IID that was asked for. Any other IID goes to the real device exactly as the title passed it.
+    const bool asked_console = IsEqualIID(*riid, kConsoleCommandListIid);
+    if (asked_console) {
+        static std::atomic<bool> asked_logged{false};
+        if (first_call(asked_logged))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 73 CreateCommandListX was asked for {%08lX-%04X-%04X-%02X%02X-%02X%02X%"
+                         "02X%02X%02X%02X}: the list is built as ID3D12GraphicsCommandList and answered with the "
+                         "console list proxy\n",
+                         static_cast<unsigned long>(riid->Data1), riid->Data2, riid->Data3, riid->Data4[0],
+                         riid->Data4[1], riid->Data4[2], riid->Data4[3], riid->Data4[4], riid->Data4[5],
+                         riid->Data4[6], riid->Data4[7]);
+    }
+    const IID built_as = __uuidof(ID3D12GraphicsCommandList);
     void* created = nullptr;
-    const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
-                                                     *riid, &created);
+    const HRESULT hr =
+        asked_console ? self->real->CreateCommandList(0, type, allocator, initial_state, built_as, &created)
+                      : self->real->CreateCommandList(0, type, allocator, initial_state, *riid, &created);
     if (FAILED(hr)) return hr;
     return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
 }
