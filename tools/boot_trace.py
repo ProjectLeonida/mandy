@@ -251,7 +251,14 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
                 if line.strip():
                     trace["ignored_lines"] += 1
                 continue
-            seq, method, outcome = int(match.group(1)), match.group(2), match.group(3)
+            try:
+                seq = int(match.group(1))
+            except ValueError:
+                # Corrupt sequence fields can exceed Python's integer digit limit.
+                # Treat them like other malformed lines and keep later calls.
+                trace["ignored_lines"] += 1
+                continue
+            method, outcome = match.group(2), match.group(3)
             trace["calls"] += 1
             expected = trace["last_seq"] + 1
             if seq != expected:
