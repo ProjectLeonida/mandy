@@ -6107,7 +6107,7 @@ class Gen:
         after the real registers in the %sgpr array (the array grows by as many)."""
         self.lane_masks, self.mask_writes, self.lane_either = lane_masks.analyse(*blocks, include_either=True,
                                                                                 wave64=self.wave64)
-        moves = lane_masks.number_moves(blocks[0], self.lane_masks, self.wave64)
+        moves = lane_masks.number_moves(*blocks, self.lane_masks, self.wave64)
         if moves:       # these VGPRs get the mask's word, so they hold data from here on
             self.lane_masks, self.mask_writes, self.lane_either = lane_masks.analyse(
                 *blocks, include_either=True, wave64=self.wave64, moves=moves)

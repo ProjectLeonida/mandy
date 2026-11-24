@@ -136,6 +136,33 @@ class MaskAsDataTests(unittest.TestCase):
                  "s_and_saveexec_b32 s12, s14", "v_mov_b32_e32 v4, 2", "s_mov_b32 exec_lo, s12"]
         self.assertEqual(run(lines, 32), [2 if i < 10 or i > 20 else 1 for i in range(32)])
 
+    def test_a_register_reused_for_another_mask(self):
+        # v5 goes through the idiom first; the second mask copied into it is only read as a number
+        lines = ["v_cmp_gt_u32_e64 s10, 10, v0", "v_mov_b32_e32 v5, s10", "v_readfirstlane_b32 s14, v5",
+                 "v_cmp_gt_u32_e64 s11, 4, v0", "v_mov_b32_e32 v5, s11", "v_add_nc_u32_e32 v4, 1, v5"]
+        self.check(lines, 32, 0x10)
+
+    def test_a_number_before_the_register_is_used_for_the_idiom(self):
+        lines = ["v_cmp_gt_u32_e64 s11, 4, v0", "v_mov_b32_e32 v5, s11", "v_add_nc_u32_e32 v4, 1, v5",
+                 "v_cmp_gt_u32_e64 s10, 10, v0", "v_mov_b32_e32 v5, s10", "v_readfirstlane_b32 s14, v5",
+                 "s_and_saveexec_b32 s12, s14", "v_mov_b32_e32 v4, 2", "s_mov_b32 exec_lo, s12"]
+        self.assertEqual(run(lines, 32), [2 if i < 10 else 0x10 for i in range(32)])
+
+    def test_copies_of_the_vgpr(self):
+        # a chain of VGPR copies read as a number, and one that ends in the idiom
+        head = ["v_cmp_gt_u32_e64 s10, 10, v0", "v_mov_b32_e32 v5, s10", "v_mov_b32_e32 v6, v5"]
+        self.check(head + ["v_mov_b32_e32 v4, v6"], 32, 0x3FF)
+        self.assertEqual(run(head + ["v_mov_b32_e32 v4, 1", "v_readfirstlane_b32 s14, v6", "s_and_saveexec_b32 s12, s14",
+                                     "v_mov_b32_e32 v4, 2", "s_mov_b32 exec_lo, s12"], 32),
+                         [2 if i < 10 else 1 for i in range(32)])
+
+    def test_two_moves_that_meet_at_a_mask_read(self):
+        # one of two copies on two paths, then read as a mask: both keep the lane's own bit
+        lines = ["v_cmp_gt_u32_e64 s10, 10, v0", "v_cmp_gt_u32_e64 s11, 4, v0", "v_mov_b32_e32 v5, s10",
+                 "v_mov_b32_e32 v6, s11", "v_or_b32_e32 v5, v5, v6", "v_readfirstlane_b32 s14, v5",
+                 "v_mov_b32_e32 v4, 1", "s_and_saveexec_b32 s12, s14", "v_mov_b32_e32 v4, 2", "s_mov_b32 exec_lo, s12"]
+        self.assertEqual(run(lines, 32), [2 if i < 10 else 1 for i in range(32)])
+
     def test_plain_data_is_untouched(self):
         lines = ["s_mov_b32 s10, 0x3ff", "s_add_u32 s20, s10, 1", "v_mov_b32_e32 v4, s20"]
         self.check(lines, 32, 0x400)

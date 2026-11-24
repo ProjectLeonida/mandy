@@ -173,21 +173,48 @@ def _plain_move(ins):
             and not any(a[1].get(m) for m in ("neg", "abs", "sext")))
 
 
-def number_moves(blocks, masks, wave64=True):
-    """The v_mov_b32 of a mask into a VGPR that nothing reads as a mask afterwards: ids of the instructions.
+def number_moves(blocks, succ, masks, wave64=True):
+    """The v_mov_b32 of a mask into a VGPR whose value nothing reads as a mask: ids of the instructions.
 
-    A VGPR counts as read as a mask anywhere in the program if a vector bitwise op that makes a mask of it, or
-    v_readfirstlane, reads it while it holds one (the v_mov / v_or3 / v_readfirstlane idiom). The whole register
-    is then left as it was, for every move into it."""
-    moves, used = [], set()
-    for blk in blocks:
-        for ins in blk:
+    A value is read as a mask when a vector bitwise op or v_readfirstlane reads the VGPR while it holds one (the
+    v_mov / v_or3 / v_readfirstlane idiom). Each move is followed forward, through VGPR copies, while the register holds
+    a mask, so reuse of the register for another mask does not matter; moves that meet at such a read are all left as they were."""
+    moves = {id(ins): ins["args"][0]["r"] for blk in blocks for ins in blk
+             if _plain_move(ins) and mask_word_source(masks.get(id(ins), {}), ins["args"][1], wave64)}
+    if not moves:
+        return set()
+    used, entry = set(), [None] * len(blocks)           # entry: VGPR -> the moves whose value it may hold
+    entry[0] = {}
+    work = [0]
+    while work:
+        n = work.pop()
+        reach = dict(entry[n])
+        for ins in blocks[n]:
             op, a, state = base_op(ins["op"]), ins["args"], masks.get(id(ins), {})
-            if _plain_move(ins) and mask_word_source(state, a[1], wave64):
-                moves.append((id(ins), a[0]["r"]))
-            elif op in VECTOR_BITWISE or op == "v_readfirstlane_b32":
-                used.update(x["r"] for x in a[1:] if x["k"] == "vgpr" and ("v", x["r"]) in state)
-    return {i for i, r in moves if r not in used}
+            reach = {r: ids for r, ids in reach.items() if ("v", r) in state}
+            copied = None
+            if _plain_move(ins) and a[1]["k"] == "vgpr":
+                copied = reach.get(a[1]["r"])           # a copy of the value: what reads the copy decides
+            elif id(ins) not in moves and (op in VECTOR_BITWISE or op == "v_readfirstlane_b32"):
+                for x in a[1:]:
+                    if x["k"] == "vgpr":
+                        used |= reach.get(x["r"], frozenset())
+            if id(ins) in moves:
+                reach[moves[id(ins)]] = frozenset((id(ins),))
+            elif a and a[0]["k"] == "vgpr":             # written again: a mask computed in the VGPR is not a move
+                for r in range(a[0]["r"], a[0]["r"] + a[0].get("n", 1)):
+                    reach.pop(r, None)
+                if copied:
+                    reach[a[0]["r"]] = copied
+        for s in succ[n]:
+            old = entry[s]
+            merged = dict(old or {})
+            for r, ids in reach.items():
+                merged[r] = merged.get(r, frozenset()) | ids
+            if old is None or merged != old:
+                entry[s] = merged
+                work.append(s)
+    return set(moves) - used
 
 
 def mask_word_operands(ins, state, moves=frozenset(), wave64=True):
