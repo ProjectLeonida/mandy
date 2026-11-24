@@ -243,6 +243,9 @@ struct Format {
     VkFormat uint_backed = VK_FORMAT_UNDEFINED;
     // A 96-bit R32G32B32 format, held in the R32G32B32A32 image `format` names (ResourceBinding::rgb96).
     bool rgb96 = false;
+    // An R9G9B9E5_SHAREDEXP render target held in an R16G16B16A16_SFLOAT image (E5B9G9R9 has no attachment or
+    // storage here): every view — RTV, SRV, UAV and T# — is fp16, which holds every shared-exponent value exactly.
+    bool r9g9b9e5_as_half = false;
 };
 
 // 96-bit textures are always RGBA32 images, even where the GPU has an RGB32 one (most have none with optimal
@@ -618,6 +621,9 @@ struct DeviceState {
     // True when VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks native STORAGE_IMAGE but mutable R32_UINT+{R32_UINT,E5B9G9R9}
     // is supported, so R9G9B9E5_SHAREDEXP UAV textures are backed by R32_UINT with separate storage/sampled views.
     bool r9g9b9e5_uav_emulated = false;
+    // True when E5B9G9R9 lacks attachment or storage support and R16G16B16A16_SFLOAT has both: R9G9B9E5 render
+    // targets (with or without UAV) are fp16 images, which hold every shared-exponent value exactly.
+    bool r9g9b9e5_half_targets = false;
     // The same for B5G5R5A1_UNORM: VK_FORMAT_A1R5G5B5_UNORM_PACK16 without STORAGE_IMAGE, backed by mutable R16_UINT.
     bool b5g5r5a1_uav_emulated = false;
     // The same for the 8-bit sRGB formats: VK_FORMAT_R8G8B8A8_SRGB / B8G8R8A8_SRGB without STORAGE_IMAGE (as on most
@@ -966,8 +972,16 @@ struct DeviceState {
             if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
                 (!color_attachment_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) ||
                  ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
-                  !storage_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32))))
-                return {};
+                  !storage_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)))) {
+                if (!r9g9b9e5_half_targets) return {};
+                // fp16 holds every shared-exponent value exactly (9 mantissa bits, exponents down to 2^-24), so the
+                // render target keeps its values at twice the memory; the resource is GPU-owned, no CPU layout depends
+                // on the format. Every view (RTV, SRV, UAV, T#) is fp16 (Format::r9g9b9e5_as_half).
+                log_once("R9G9B9E5_SHAREDEXP render target unavailable natively, using RGBA16F; format", desc.Format);
+                Format backed{VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT};
+                backed.r9g9b9e5_as_half = true;
+                return backed;
+            }
             if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && r9g9b9e5_uav_emulated) {
                 log_once("R9G9B9E5_SHAREDEXP UAV unavailable natively, using mutable R32_UINT; format", desc.Format);
                 Format backed{VK_FORMAT_R32_UINT, VK_IMAGE_ASPECT_COLOR_BIT};
@@ -1838,6 +1852,7 @@ public:
     }
     bool has_castable_formats() const { return !castable_formats_.empty(); }
     VkFormat uint_backed() const { return uint_backed_; }  // Format::uint_backed
+    bool r9g9b9e5_as_half() const { return r9g9b9e5_as_half_; }  // Format::r9g9b9e5_as_half
     VkImageAspectFlags aspects() const { return aspects_; }
     bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
@@ -2268,6 +2283,7 @@ public:
         binding.sampled_in_general = device_.bindless != nullptr;
         format_ = format.format;
         uint_backed_ = format.uint_backed;
+        r9g9b9e5_as_half_ = format.r9g9b9e5_as_half;
         aspects_ = format.aspects;
         image_address_ = device_.next_image_address.fetch_add(256);
         binding_ = binding;
@@ -2615,6 +2631,7 @@ private:
     std::vector<VkFormat> view_formats_;  // creation-time castable list; empty means no restriction
     std::vector<DXGI_FORMAT> castable_formats_;  // the same list as the application gave it
     VkFormat uint_backed_ = VK_FORMAT_UNDEFINED;
+    bool r9g9b9e5_as_half_ = false;
     std::uint64_t image_address_ = 0;  // what a T# names the texture by
     bool rgb96_ = false;
     VkImageAspectFlags aspects_ = 0;
@@ -3854,6 +3871,8 @@ public:
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             if (desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) continue;
             graphics_.color_formats[i] = vulkan_format(desc.RTVFormats[i], false).format;
+            if (desc.RTVFormats[i] == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && device_.r9g9b9e5_half_targets)
+                graphics_.color_formats[i] = VK_FORMAT_R16G16B16A16_SFLOAT;  // the image the target is made of
             if (graphics_.color_formats[i] == VK_FORMAT_UNDEFINED) {
                 log_once("render-target format not supported yet:", desc.RTVFormats[i]);
                 return E_INVALIDARG;
@@ -4762,7 +4781,8 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             log_once("incompatible R9G9B9E5 view format:", int(view.format));
             return false;
         }
-        named = texture_storage_format(view.format, false).format;
+        named = resource.r9g9b9e5_as_half() ? VK_FORMAT_R16G16B16A16_SFLOAT
+                                            : texture_storage_format(view.format, false).format;
         if (g::is_depth_stencil_format(named)) {
             log_once("depth-stencil view format on a colour texture:", int(view.format));
             return false;
@@ -5044,6 +5064,12 @@ public:
             return;
         state_.r9g9b9e5_uav_emulated =
             state_.probe_uint_backed_uav(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, VK_FORMAT_R32_UINT);
+        state_.r9g9b9e5_half_targets =
+            (!state_.color_attachment_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) ||
+             !state_.storage_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)) &&
+            state_.color_attachment_usable(VK_FORMAT_R16G16B16A16_SFLOAT) &&
+            state_.storage_usable(VK_FORMAT_R16G16B16A16_SFLOAT) &&
+            state_.sampled_usable(VK_FORMAT_R16G16B16A16_SFLOAT);
         state_.b5g5r5a1_uav_emulated =
             state_.probe_uint_backed_uav(VK_FORMAT_A1R5G5B5_UNORM_PACK16, VK_FORMAT_R16_UINT);
         state_.rgba8_srgb_uav_emulated =
@@ -6265,6 +6291,12 @@ public:
                     view = {};
                 else
                     view.format = static_cast<leonida::ColorViewFormat>(r->uint_backed());
+            } else if (r && r->r9g9b9e5_as_half()) {
+                // An RGBA16F-backed R9G9B9E5 render target (Format::r9g9b9e5_as_half) renders in its own format only.
+                if (desc && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != rd.Format)
+                    view = {};
+                else
+                    view.format = static_cast<leonida::ColorViewFormat>(VK_FORMAT_R16G16B16A16_SFLOAT);
             } else if (rd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ||
                        (desc && desc->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) {
                 if (rd.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
@@ -8081,6 +8113,8 @@ public:
                     s2 = D3D12_FORMAT_SUPPORT2_NONE;
                 }
             }
+            if (fs->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && state_.r9g9b9e5_half_targets)
+                s1 |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET;  // through the RGBA16F image (Format::r9g9b9e5_as_half)
             if (fs->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && state_.r9g9b9e5_uav_emulated) {
                 s1 |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
                 // Reads go through the sampled E5B9G9R9 view, like every typed UAV read (see above).

@@ -397,14 +397,22 @@ What is implemented (all of it testable without the game):
     When `ALLOW_UNORDERED_ACCESS` is requested on a GPU whose `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` lacks native
     `STORAGE_IMAGE` support (for example NVIDIA), the layer backs the texture with a mutable `VK_FORMAT_R32_UINT`
     image (`MUTABLE_FORMAT | EXTENDED_USAGE` + `VkImageFormatListCreateInfo` `{R32_UINT, E5B9G9R9_UFLOAT_PACK32}`),
-    refusing `ALLOW_RENDER_TARGET`, `ALLOW_DEPTH_STENCIL` and `DENY_SHADER_RESOURCE`: `CheckFeatureSupport` advertises
+    refusing `ALLOW_DEPTH_STENCIL` and `DENY_SHADER_RESOURCE`: `CheckFeatureSupport` advertises
     `TYPED_UNORDERED_ACCESS_VIEW` and `UAV_TYPED_STORE` (plus `UAV_TYPED_LOAD` with `R32_UINT` storage atomics) while
-    keeping `RENDER_TARGET` off; SRV and UAV descriptors emit the `E5B9G9R9` T# (`FORMAT 132`, RGB1) and reject
+    keeping `RENDER_TARGET` off for a UAV-only texture; SRV and UAV descriptors emit the `E5B9G9R9` T# (`FORMAT 132`, RGB1) and reject
     incompatible casts, while set 0 creates a `VK_IMAGE_USAGE_SAMPLED_BIT` `E5B9G9R9` sampled view and a
     `VK_IMAGE_USAGE_STORAGE_BIT` `R32_UINT` storage view (bound in `as_uint` / `r32ui`, never `as_float`);
     `ClearUnorderedAccessViewFloat` packs RGB9E5 with round-half-up (clamping negative/NaN to 0 and +Inf/overflow to
     65408, bumping on 512) and `ClearUnorderedAccessViewUint` writes 0, matching WARP (`d3d12_r9g9b9e5_uav_test`,
-    `d3d12_uav_clear_test`);
+    `d3d12_uav_clear_test`). An `ALLOW_RENDER_TARGET` texture (with or without `ALLOW_UNORDERED_ACCESS`) on a GPU
+    whose `E5B9G9R9` lacks `COLOR_ATTACHMENT` or `STORAGE_IMAGE` (for example NVIDIA) is instead an
+    `R16G16B16A16_SFLOAT` image (`Format::r9g9b9e5_as_half`): fp16 holds every shared-exponent value exactly (9
+    mantissa bits, exponents down to 2^-24), at twice the memory per texel. Every view — RTV, SRV, UAV and T# — is
+    fp16, the PSO's render-target format follows the image, and `CheckFeatureSupport` advertises `RENDER_TARGET`.
+    The resource is GPU-owned (a `DEFAULT`-heap render target), so no CPU layout depends on the format and
+    `GetCopyableFootprints` still reports the logical 4-byte layout; `ALLOW_DEPTH_STENCIL`, `DENY_SHADER_RESOURCE`
+    and multisampled RT+UAV stay refused, and where fp16 cannot back it the request is refused as before
+    (`d3d12_r9g9b9e5_uav_test` §7);
   - the descriptor shader samples `B5G5R5A1_UNORM` through a 2D SRV. Opaque and transparent red check bit 15,
     and mixed-channel texels check the five-bit color fields;
   - `B5G5R5A1_UNORM` with `ALLOW_UNORDERED_ACCESS` on a GPU whose `VK_FORMAT_A1R5G5B5_UNORM_PACK16` lacks
