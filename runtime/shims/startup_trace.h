@@ -33,6 +33,7 @@
 #include <string>
 
 #include "shims.h"
+#include "stack_walk.h"
 
 namespace rt::startup_trace {
 
@@ -114,22 +115,12 @@ constexpr DWORD kCppException = 0xE06D7363;  // MSVC throw: logged with its addr
 constexpr int kMaxFrames = 16;
 
 inline std::string stack_from(const CONTEXT& start_context) {
-    CONTEXT c = start_context;
+    uint64_t addresses[kMaxFrames] = {};
+    const int count = stack_walk::frames(start_context, addresses, kMaxFrames);
     std::string out = "[";
-    for (int i = 0; i < kMaxFrames && c.Rip; ++i) {
+    for (int i = 0; i < count; ++i) {
         if (i) out += ',';
-        out += quote(where(c.Rip));
-        DWORD64 image_base = 0;
-        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &image_base, nullptr);
-        if (!fn) {  // a leaf function: the return address is at [rsp]
-            if (!c.Rsp || IsBadReadPtr(reinterpret_cast<void*>(c.Rsp), 8)) break;
-            c.Rip = *reinterpret_cast<DWORD64*>(c.Rsp);
-            c.Rsp += 8;
-            continue;
-        }
-        void* handler_data = nullptr;
-        DWORD64 frame = 0;
-        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, c.Rip, fn, &c, &handler_data, &frame, nullptr);
+        out += quote(where(addresses[i]));
     }
     return out + "]";
 }

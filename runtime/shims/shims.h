@@ -85,6 +85,11 @@ bool owns_bundled_module_handle(void* module);
 using TestHook = void (*)(const void* return_address_slot);
 void set_unimplemented_test_hook(TestHook hook);
 
+// Test seam: calls fn(ctx) while holding the module-lookup lock that module_offset takes. A crash handler that
+// resolves modules from its own published ranges (crash_log.h) must still log and let the process die instead of
+// deadlocking on that lock; crash_log_test's --fault-locked case runs its fault here.
+void with_module_lookup_lock_for_test(void (*fn)(void*), void* ctx);
+
 // Makes a small thunk for an import with no binding; calling it follows the policy above. It passes the caller's
 // return address and the first four argument registers through unchanged.
 void* make_unimplemented_thunk(const std::string& dll, const std::string& name);

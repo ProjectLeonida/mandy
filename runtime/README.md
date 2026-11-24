@@ -481,6 +481,37 @@ python -I tools\boot_trace.py startup.jsonl --d3d12 d3d12.log
 [docs/boot.md](../docs/boot.md) is the runbook around it: the commands, the triage order and the open questions'
 trace signals.
 
+### Unhandled-exception log: `LEONIDA_CRASH_LOG`
+
+Opt-in. `LEONIDA_CRASH_LOG` names a file for a block about an exception nothing handled
+([shims/crash_log.h](shims/crash_log.h)); `1`, `on` or `true` selects the overlay's `leonida-crash.log`
+(`--overlay`, default `<game-dir>/overlay`), so the log never lands in the package. The block goes to that file and
+to stderr; leave the variable unset (or `0`) to turn it off.
+
+```text
+[rt] crash: 2026-11-24T10:11:12.345Z unhandled exception 0xC0000005 at game.exe+0x4a00 (0x7ff612345678), thread 12345
+[rt] crash:   access violation reading address 0x0
+[rt] crash:   rip 0x7ff612345678 rsp 0x1a2b3c4d5e6f rbp 0x1a2b3c4d5e70
+[rt] crash:   stack:
+[rt] crash:     #0 game.exe+0x4a00
+[rt] crash:     #1 game.exe+0x2210
+...
+[rt] crash: end of unhandled exception 0xC0000005
+```
+
+Addresses are `module+0xRVA` for mapped images and `host:name.dll+0xRVA` for host modules, up to 16 frames. This is
+a `SetUnhandledExceptionFilter` handler, not a vectored one: an exception a handler or a `catch` deals with is not
+logged. The trace's `exception` event records every exception before handlers run, first-chance ones included, and
+needs `--trace`; this log is only the exception that ended the process and works without the trace. It returns the
+previous filter's answer, so the process still ends with the same exception code it would have had; a log that
+cannot be formatted or written is dropped rather than changing that. A debugger still receives the exception first.
+
+The handler takes no lock the dying process may already hold: module names come from ranges the loader publishes as
+it maps (and the host modules seen at install), read with a per-slot seqlock, and the block is written with
+`WriteFile` on handles opened at install instead of stdio. A fault while the shim registry's lookup lock or the
+loader's range lock is held is therefore logged, not deadlocked. The cost is that a host DLL loaded after install
+(the game's `LoadLibrary`, the Vulkan loader) has no name and its frames print as raw addresses.
+
 ### Typed clear regression
 
 `clear_color_test` checks numeric UINT conversion and unchanged float clears without a GPU.

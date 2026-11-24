@@ -33,6 +33,7 @@
 #include "host_cpu.h"
 #include "mods.h"
 #include "pe_loader.h"
+#include "../shims/crash_log.h"
 #include "../shims/d3d12_trace.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/file_system.h"
@@ -173,6 +174,9 @@ int wmain(int argc, wchar_t** argv) {
                                                    : "error: cannot create the trace file\n");
         return 2;
     }
+    // LEONIDA_CRASH_LOG (shims/crash_log.h): opt-in. The overlay is the default file when the variable is `1`, so a
+    // crash log never lands in the read-only package; the handler only records and leaves termination as it was.
+    rt::crash_log::install(overlay_dir / L"leonida-crash.log");
     // The console's Zen 2 instructions this CPU may lack (docs/cpu_features.md): emulated on #UD. Installed after the
     // trace's handler so it runs first, and an emulated instruction is not recorded as an exception.
     if (const auto host = rt::cpu_emulation::detect_host(); !host.sse4a || !host.clzero || !host.monitorx || !host.clwb)
