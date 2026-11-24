@@ -9677,7 +9677,7 @@ public:
             for (auto queue : info.compute_queues) state_.context->add_diagnostic_queue(queue);
             for (auto queue : info.copy_queues) state_.context->add_diagnostic_queue(queue);
         }
-        leonida::mem_probe::install(state_.context->vk);  // LOCAL DIAGNOSTIC: before anything allocates
+        const bool mem_probe_installed = leonida::mem_probe::install(state_.context->vk);
         if (info.device_fault_diagnostics && rt::compute_probe::enabled())
             state_.context->set_input_probe([this](auto lists, auto sequence, auto queue) {
                 rt::compute_probe::inspect(state_, lists, sequence, queue);
@@ -9760,7 +9760,7 @@ public:
         }
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
-        {  // LOCAL DIAGNOSTIC: mem probe (LEONIDA_MEM_PROBE=<seconds>)
+        if (mem_probe_installed) {
             leonida::mem_probe::DeviceFacts facts;
             facts.memory = state_.memory;
             facts.title_ranges = [] { return leonida::title_va_aliases().title_memory_ranges(); };
@@ -9806,7 +9806,7 @@ public:
                               (unsigned long long)shadows, leonida::fsdraw::pipeline_count());
                 return std::string(text);
             };
-            leonida::mem_probe::start(std::move(facts));
+            mem_probe_ = leonida::mem_probe::start(std::move(facts));
         }
         if (info.conditional_rendering) {
             const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
@@ -10257,6 +10257,7 @@ public:
     }
 
     ~Device() override {
+        mem_probe_.reset();  // The sampler reads state_.
         raw_images_.clear();
         leonida::title_va_aliases().clear_hooks(&state_);
         {
@@ -15148,6 +15149,7 @@ private:
     std::mutex native_pipeline_mutex_;
     std::unordered_map<std::string, std::weak_ptr<PipelineState>> native_pipelines_;
     DeviceState state_;
+    std::unique_ptr<leonida::mem_probe::Sampler> mem_probe_;
     struct RawImage {
         std::unique_ptr<Resource> resource;
         std::vector<std::string> fingerprints;
