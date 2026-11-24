@@ -295,11 +295,8 @@ def summarize(rows):
 
 
 def _census_inputs(root, disasm=None):
-    """Existing files in `root` (and `disasm` when given) that `--json` must not overwrite."""
-    paths = []
-    manifest = os.path.join(root, "index.json")
-    if os.path.isfile(manifest):
-        paths.append(manifest)
+    """Manifest paths and existing inputs that `--json` must not overwrite."""
+    paths = [os.path.join(root, "index.json")]
     with os.scandir(root) as entries:
         for entry in entries:
             if entry.name.lower().endswith(".dxbc") and entry.is_file():
@@ -311,9 +308,7 @@ def _census_inputs(root, disasm=None):
                 if entry.name.lower().endswith(".json") and entry.is_file():
                     paths.append(entry.path)
     if disasm:
-        disasm_manifest = os.path.join(disasm, "index.json")
-        if os.path.isfile(disasm_manifest):
-            paths.append(disasm_manifest)
+        paths.append(os.path.join(disasm, "index.json"))
         with os.scandir(disasm) as entries:
             for entry in entries:
                 if entry.name.lower().endswith(".s") and entry.is_file():

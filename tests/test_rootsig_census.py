@@ -305,6 +305,20 @@ class TestCensus(unittest.TestCase):
                 with open(path, "rb") as fh:
                     self.assertEqual(fh.read(), snapshots[path])
 
+    def test_json_refuses_manifest_paths_before_either_file_exists(self):
+        disasm = os.path.join(self.tmp.name, "disasm")
+        os.mkdir(disasm)
+        for directory in (self.tmp.name, disasm):
+            with self.subTest(directory=directory):
+                target = os.path.join(directory, "index.json")
+                self.assertFalse(os.path.exists(target))
+                run = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--disasm", disasm, "--json", target],
+                                     capture_output=True, text=True)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                self.assertIn("would overwrite an input file", run.stderr)
+                self.assertEqual(run.stdout, "")
+                self.assertFalse(os.path.exists(target))
+
     def test_json_guard_delegates_to_shared_same_report_path(self):
         self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
         out = os.path.join(self.tmp.name, "ALIAS.JSON")
