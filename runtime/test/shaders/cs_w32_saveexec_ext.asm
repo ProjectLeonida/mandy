@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; The saveexec / wrexec kinds #1657 added (xor, andn1, orn1, orn2, nand, nor, xnor, andn1_wrexec), run on a GPU.
 ; One wave32 group. S0 = lanes 10..29 and each step's EXEC = lanes 0..23 come from compares (a lane mask held in an
 ; SGPR, as compiled code has it). Each step runs the op
