@@ -260,8 +260,8 @@ class ImportFailFastTest(unittest.TestCase):
                 },
             },
         )
-        self.assertEqual((other_code, other_err), (0, ""))
-        self.assertEqual(json.loads(other_out), {"image_base": "0x140000000", "imports": {}})
+        self.assertEqual((other_code, other_out), (2, ""))
+        self.assertIn("no import matches --dll other.dll", other_err)
 
     def test_additional_result_copy_width_and_mask_encodings(self):
         """Exercise 0x89 reg copies, 0xF7 masks, 16-bit 0x66 ax tests, and 0x3D imm32 compares."""
