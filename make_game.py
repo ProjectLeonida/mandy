@@ -1233,7 +1233,7 @@ def translated_index_is_empty(index: str) -> bool:
 
 
 def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulated: bool = False,
-            fallbacks: tuple[str, ...] = ()) -> None:
+            fallbacks: tuple[str, ...] = (), shader_list: str | None = None) -> None:
     src = os.path.join(game, "shaders.rpf")
     sh = os.path.join(work, "shaders")
     dxbc = os.path.join(sh, "dxbc")
@@ -1339,8 +1339,14 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
             f.write(want_flags + "\n")
         with open(sources_file, "w", encoding="utf-8", newline="\n") as f:
             f.write(sources + "\n")
-        translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
-    verify_translation_completeness(dxbc, spirv)
+        if shader_list is not None:
+            # A subset translation never reuses a previous full index: drop it so only the listed shaders
+            # are translated and the merged index names just them.
+            drop(translated)
+        translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks,
+                  shader_list=shader_list)
+    if shader_list is None:
+        verify_translation_completeness(dxbc, spirv)
     native_pso_hashes(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
@@ -1926,7 +1932,7 @@ def _stop_procs(procs: list) -> None:
 
 
 def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
-              fallbacks: tuple[str, ...] = ()) -> None:
+              fallbacks: tuple[str, ...] = (), shader_list: str | None = None) -> None:
     """rdna2spirv.py runs on one core: start one --shard per job side by side, then merge their index parts.
 
     A shard publishes shard<i>.json and then index.part<i>.json. Both are needed to reuse it. A run stopped
@@ -1960,6 +1966,8 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
     tool = os.path.join(TOOLS, "rdna2spirv.py")
     extra = ["--wave64-emulate"] if emulate else []
     extra.extend(fallbacks)
+    if shader_list is not None:
+        extra.extend(["--shader-list", shader_list])
     if todo:
         which = f"0..{jobs - 1}" if len(todo) == jobs else ",".join(str(i) for i in todo)
         log(f"  rdna2spirv.py {disasm} --out {spirv} --shard {which}/{jobs}" + "".join(" " + e for e in extra))
@@ -2758,7 +2766,7 @@ def _invoke_stage(name: str, fn) -> None:
 
 def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, wav: bool, jobs: int,
                      runtime_build: str | None, emulate: bool, keep_emulated: bool,
-                     fallbacks: tuple[str, ...], overlap: bool = True) -> None:
+                     fallbacks: tuple[str, ...], shader_list: str | None, overlap: bool = True) -> None:
     """Run build stages after check. With overlap=True (default), shaders/assets/runtime share the machine and
     pipelines starts once shaders (and a selected runtime rebuild) are ready. With overlap=False, stages run in order."""
     cpu_heavy = [s for s in ("shaders", "assets") if s in stages]
@@ -2768,7 +2776,8 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
     progress = StageBoard([s for s in ("shaders", "assets", "runtime", "pipelines") if s in stages])
 
     def fn_shaders():
-        shaders(game, work, shader_jobs, emulate=emulate, keep_emulated=keep_emulated, fallbacks=fallbacks)
+        shaders(game, work, shader_jobs, emulate=emulate, keep_emulated=keep_emulated,
+                fallbacks=fallbacks, shader_list=shader_list)
 
     def fn_assets():
         assets(game, work, wav, jobs, dump_jobs=dump_jobs)
@@ -2908,6 +2917,9 @@ def main() -> int:
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
                          "the shaders need (144, or 152 with --mesh-compute)")
+    ap.add_argument("--shader-list", metavar="FILE", type=nonempty_path,
+                    help="translate only shaders whose stem is listed in FILE (one stem per line); "
+                         "skips the completeness check, for testing on a subset instead of all 26,503")
     ap.add_argument("--no-tui", action="store_true",
                     help="plain console logs (default when stdout is not a TTY); skip the LEONIDA setup screen "
                          "and per-stage log view")
@@ -3040,12 +3052,12 @@ def main() -> int:
             tui_board.set_summary(f"build 0% · {', '.join(build_stages)}")
             run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
                              runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                             fallbacks=fallbacks, overlap=overlap)
+                             fallbacks=fallbacks, shader_list=a.shader_list, overlap=overlap)
             tui_board.set_summary(f"finished in {(time.time() - t0) / 60:.0f} min")
     else:
         run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
                          runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                         fallbacks=fallbacks, overlap=overlap)
+                         fallbacks=fallbacks, shader_list=a.shader_list, overlap=overlap)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 
