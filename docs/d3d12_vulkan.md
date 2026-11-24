@@ -2449,7 +2449,14 @@ The trace will enumerate them.
   - `CopyTiles` transfers RGBA8 tiles in either direction. Partial edge blocks use the full 512-byte linear row
     pitch and transfer only in-bounds texels. Byte-unaligned offsets use transfer scratch.
     `d3d12_texture_tiles_test` compares initially unmapped tiles, column mappings, aliases, and a fence-delayed
-    remap with native D3D12, including clipped edges and byte-unaligned offsets.
+    remap with native D3D12, including clipped edges at 4-byte and byte-unaligned offsets. `CopyTiles` documents no
+    alignment for `BufferStartOffsetInBytes`; at a byte-unaligned offset WARP also runs, to confirm the test's
+    expectations (it meets them at every offset tried, 1-8), and the layer is held to them. AMD's Windows D3D12
+    driver (RX 7900 XT, 26.11.2) does not: judging by the texel values (the D3D12 debug layer was not run), it
+    moves whole tiles as if the offset were rounded down to a multiple of 4, in both directions, so a row-major
+    copy finds each texel 1-3 bytes early and texels that straddle a tile seam differ in the `CopyTiles` reads. The
+    test prints a note when a native run matches that rounded-down model at every texel, and fails on any other
+    divergence ([testing.md](testing.md#known-problems)).
 - `D3D12_RESOURCE_DESC::Layout`: the public `ROW_MAJOR` and `64KB_STANDARD_SWIZZLE` values plus the Xbox `0x101`
   tiled value from slot 76. Row-major textures need `VK_IMAGE_TILING_LINEAR` (not usable for RT/DS) or a staging
   copy; `64KB_STANDARD_SWIZZLE` and `0x101` have no direct Vulkan equivalent. If the game uploads console-tiled data,
