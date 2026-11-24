@@ -404,6 +404,7 @@ public:
         enable12.samplerFilterMinmax = sampler_filter_minmax;
         shader_output_viewport_index = features12.shaderOutputViewportIndex == VK_TRUE;
         enable12.shaderOutputViewportIndex = shader_output_viewport_index;
+        enable12.drawIndirectCount = features12.drawIndirectCount;
         enable12.bufferDeviceAddress = VK_TRUE;
 
         const std::uint32_t graphics_count = std::max(1u, std::min(queue_count_wanted, family_queue_count));
@@ -440,6 +441,7 @@ public:
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
         enable.multiViewport = features.features.multiViewport;  // d3d12_multi_viewport_test, where available
+        enable.multiDrawIndirect = features.features.multiDrawIndirect;  // ExecuteIndirect multi-draw, where available
         enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 for their addresses
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
