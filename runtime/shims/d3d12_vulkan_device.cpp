@@ -51,6 +51,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -556,6 +557,8 @@ std::filesystem::path shader_directory_from_file(const std::filesystem::path& co
 }
 
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
+class Resource;
+
 struct DeviceState {
     VulkanDeviceInfo info;
     std::vector<std::uint32_t> families;
@@ -1064,6 +1067,10 @@ struct DeviceState {
         std::uint64_t address;
     };
     std::unique_ptr<leonida::BindlessSet> bindless;
+    // Non-owning. The last Release removes its entry under the same lock used to acquire a view reference.
+    using TexturePlacements = std::multimap<UINT64, Resource*>;
+    std::mutex placement_mutex;
+    TexturePlacements texture_placements;
     std::mutex descriptor_mutex;  // the set and the containers below
     // vkDeviceWaitIdle calls made for the bindless set (none, unless LEONIDA_BINDLESS_IDLE_WAIT restores the old wait).
     std::atomic<std::uint64_t> bindless_idle_waits{0};
@@ -1790,6 +1797,18 @@ public:
              D3D12_HEAP_FLAGS heap_flags, VkDeviceSize placed_va)
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) {}
 
+    ULONG STDMETHODCALLTYPE Release() override {
+        if (!placement_entry_) return Child::Release();
+        {
+            std::lock_guard lock(device_.placement_mutex);
+            const ULONG left = drop_reference();
+            if (left) return left;
+            device_.texture_placements.erase(*placement_entry_);
+        }
+        delete this;
+        return 0;
+    }
+
     ~Resource() override {
         if (accel_) {
             device_.context->unregister_acceleration_structure(gpu_va_);
@@ -2315,7 +2334,13 @@ public:
     // The title's own address for a texture Xbox slot 133 placed. The image is still the committed fallback, so its
     // pixels do not alias the title's pages yet; the address is what GetGPUVirtualAddress answers (XCL PR #168's
     // behavior, measured on a retail title).
-    void set_title_address(D3D12_GPU_VIRTUAL_ADDRESS address) { va_ = address; }
+    void set_title_address(D3D12_GPU_VIRTUAL_ADDRESS address) {
+        va_ = address;
+        if (address) {
+            std::lock_guard lock(device_.placement_mutex);
+            placement_entry_ = device_.texture_placements.emplace(address, this);
+        }
+    }
 
     //
     // The node masks read back as the one node of a single adapter (0 becomes 1), and the heap flags as the runtime
@@ -2615,6 +2640,7 @@ private:
     std::vector<VkFormat> view_formats_;  // creation-time castable list; empty means no restriction
     std::vector<DXGI_FORMAT> castable_formats_;  // the same list as the application gave it
     VkFormat uint_backed_ = VK_FORMAT_UNDEFINED;
+    std::optional<DeviceState::TexturePlacements::iterator> placement_entry_;
     std::uint64_t image_address_ = 0;  // what a T# names the texture by
     bool rgb96_ = false;
     VkImageAspectFlags aspects_ = 0;
@@ -5012,6 +5038,7 @@ public:
         // Every Vulkan device serves Xbox device slot 133, whichever entry made it: create_vulkan_device and the
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
+        rt::d3d12_xs::set_placed_texture_view_handler(&write_placed_view);
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
         rt::d3d12_xs::set_console_descriptor_heap_handler(&rt::d3d12::create_console_descriptor_heap);
         state_.info = info;
@@ -6418,6 +6445,80 @@ public:
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
     }
 
+    // The V# of a shader-resource view of the buffer of `width` bytes at GPU address `base_va`: from a resource
+    // (CreateShaderResourceView), or from Xbox device slot 70's description and address (write_placed_view), which
+    // name no resource object. Raw, structured or typed; a description it refuses leaves the slot as it was.
+    void write_buffer_srv_at(UINT64 base_va, UINT64 width, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
+                             D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+        if (!desc) {
+            log_once("buffer SRV requires a description; width", int(width));
+            return;
+        }
+        if (desc->ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
+            log_once("shader-resource view dimension not supported for buffer:", desc->ViewDimension);
+            return;
+        }
+        if (!base_va || !desc->Buffer.NumElements || (desc->Buffer.Flags & ~D3D12_BUFFER_SRV_FLAG_RAW)) return;
+        leonida::gfx10::Buffer buffer{};
+        if (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
+            if (desc->Format != DXGI_FORMAT_R32_TYPELESS || desc->Buffer.StructureByteStride != 0) return;
+            if (desc->Buffer.FirstElement > width / 4) return;
+            const UINT64 byte_off = desc->Buffer.FirstElement * 4;
+            const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * 4;
+            if (byte_size > width - byte_off || byte_size > UINT32_MAX) return;
+            buffer.address = base_va + byte_off;
+            buffer.stride = 0;
+            buffer.num_records = std::uint32_t(byte_size);
+            buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+            buffer.oob_select = leonida::gfx10::OobSelect::raw;
+        } else if (desc->Buffer.StructureByteStride != 0) {
+            if (desc->Format != DXGI_FORMAT_UNKNOWN || desc->Buffer.StructureByteStride > 16383) return;
+            const UINT64 stride = desc->Buffer.StructureByteStride;
+            if (desc->Buffer.FirstElement > width / stride) return;
+            const UINT64 byte_off = desc->Buffer.FirstElement * stride;
+            const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
+            if (byte_size > width - byte_off) return;
+            buffer.address = base_va + byte_off;
+            buffer.stride = std::uint32_t(stride);
+            buffer.num_records = desc->Buffer.NumElements;
+            buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+            buffer.oob_select = leonida::gfx10::OobSelect::structured;
+        } else {
+            const Format fmt = vulkan_format(desc->Format, false);
+            if (fmt.format == VK_FORMAT_UNDEFINED || fmt.typeless || !(fmt.aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
+                log_once("buffer SRV format not supported:", int(desc->Format));
+                return;
+            }
+            const VkFormat named = fmt.rgb96 ? rgb96_named_format(fmt.format) : fmt.format;
+            const std::uint32_t code = leonida::gfx10::format_from_vulkan(named);
+            const leonida::BlockFormat bf = footprint_block(fmt, VK_IMAGE_ASPECT_COLOR_BIT);
+            if (!code || bf.block != 1 || !bf.bytes || bf.bytes > 16383) {
+                log_once("buffer SRV format not supported:", int(desc->Format));
+                return;
+            }
+            const UINT64 stride = bf.bytes;
+            if (desc->Buffer.FirstElement > width / stride) return;
+            const UINT64 byte_off = desc->Buffer.FirstElement * stride;
+            const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
+            if (byte_size > width - byte_off) return;
+            buffer.address = base_va + byte_off;
+            buffer.stride = std::uint32_t(stride);
+            buffer.num_records = desc->Buffer.NumElements;
+            buffer.format = code;
+            const leonida::gfx10::Swizzle channels = leonida::gfx10::format_swizzle(named);
+            for (unsigned i = 0; i < 4; ++i) {
+                const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, desc->Shader4ComponentMapping);
+                buffer.swizzle[i] = from < 4 ? channels[from]
+                                    : from == D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0
+                                        ? leonida::gfx10::select_zero
+                                        : leonida::gfx10::select_one;
+            }
+            buffer.oob_select = leonida::gfx10::OobSelect::structured;
+        }
+        const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+    }
+
     // A shader-resource view of a texture is a T# in the slot (docs section 3.4): the shader loads those eight
     // dwords through its descriptor table and finds the image by them. A buffer SRV writes a 16-byte GFX10 V# in the
     // first half of the slot (raw, structured, or typed). A slot left as zeros is a null descriptor.
@@ -6437,78 +6538,9 @@ public:
             log_once("shader-resource view denied by resource flags; format", int(r->desc().Format));
             return;
         }
-        if (!r->image()) {
-            if (!desc) {
-                log_once("buffer SRV requires a description; width", int(r->desc().Width));
-                return;
-            }
-            if (desc->ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
-                log_once("shader-resource view dimension not supported for buffer:", desc->ViewDimension);
-                return;
-            }
-            const UINT64 base_va = const_cast<Resource*>(r)->GetGPUVirtualAddress();
-            const UINT64 width = r->desc().Width;
-            if (!base_va || !desc->Buffer.NumElements || (desc->Buffer.Flags & ~D3D12_BUFFER_SRV_FLAG_RAW)) return;
-            leonida::gfx10::Buffer buffer{};
-            if (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
-                if (desc->Format != DXGI_FORMAT_R32_TYPELESS || desc->Buffer.StructureByteStride != 0) return;
-                if (desc->Buffer.FirstElement > width / 4) return;
-                const UINT64 byte_off = desc->Buffer.FirstElement * 4;
-                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * 4;
-                if (byte_size > width - byte_off || byte_size > UINT32_MAX) return;
-                buffer.address = base_va + byte_off;
-                buffer.stride = 0;
-                buffer.num_records = std::uint32_t(byte_size);
-                buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
-                buffer.oob_select = leonida::gfx10::OobSelect::raw;
-            } else if (desc->Buffer.StructureByteStride != 0) {
-                if (desc->Format != DXGI_FORMAT_UNKNOWN || desc->Buffer.StructureByteStride > 16383) return;
-                const UINT64 stride = desc->Buffer.StructureByteStride;
-                if (desc->Buffer.FirstElement > width / stride) return;
-                const UINT64 byte_off = desc->Buffer.FirstElement * stride;
-                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
-                if (byte_size > width - byte_off) return;
-                buffer.address = base_va + byte_off;
-                buffer.stride = std::uint32_t(stride);
-                buffer.num_records = desc->Buffer.NumElements;
-                buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
-                buffer.oob_select = leonida::gfx10::OobSelect::structured;
-            } else {
-                const Format fmt = vulkan_format(desc->Format, false);
-                if (fmt.format == VK_FORMAT_UNDEFINED || fmt.typeless || !(fmt.aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
-                    log_once("buffer SRV format not supported:", int(desc->Format));
-                    return;
-                }
-                const VkFormat named = fmt.rgb96 ? rgb96_named_format(fmt.format) : fmt.format;
-                const std::uint32_t code = leonida::gfx10::format_from_vulkan(named);
-                const leonida::BlockFormat bf = footprint_block(fmt, VK_IMAGE_ASPECT_COLOR_BIT);
-                if (!code || bf.block != 1 || !bf.bytes || bf.bytes > 16383) {
-                    log_once("buffer SRV format not supported:", int(desc->Format));
-                    return;
-                }
-                const UINT64 stride = bf.bytes;
-                if (desc->Buffer.FirstElement > width / stride) return;
-                const UINT64 byte_off = desc->Buffer.FirstElement * stride;
-                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
-                if (byte_size > width - byte_off) return;
-                buffer.address = base_va + byte_off;
-                buffer.stride = std::uint32_t(stride);
-                buffer.num_records = desc->Buffer.NumElements;
-                buffer.format = code;
-                const leonida::gfx10::Swizzle channels = leonida::gfx10::format_swizzle(named);
-                for (unsigned i = 0; i < 4; ++i) {
-                    const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, desc->Shader4ComponentMapping);
-                    buffer.swizzle[i] = from < 4 ? channels[from]
-                                        : from == D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0
-                                            ? leonida::gfx10::select_zero
-                                            : leonida::gfx10::select_one;
-                }
-                buffer.oob_select = leonida::gfx10::OobSelect::structured;
-            }
-            const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
-            std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
-            return;
-        }
+        if (!r->image())
+            return write_buffer_srv_at(const_cast<Resource*>(r)->GetGPUVirtualAddress(), r->desc().Width, desc,
+                                       destination);
         TextureView view{};
         if (!desc) {
             const bool array = r->desc().DepthOrArraySize > 1;
@@ -6596,8 +6628,15 @@ public:
     // counter resource's address plus CounterOffsetInBytes. Append and consume are atomics a shader does on it.
     void write_buffer_uav(ID3D12Resource* resource, ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
                           D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+        write_buffer_uav_at(Resource::from<Resource>(resource)->desc(), resource->GetGPUVirtualAddress(), counter, desc,
+                            destination);
+    }
+
+    // The same V# for the buffer `rd` at GPU address `va`: from a resource above, or from Xbox device slot 71's
+    // description and address (write_placed_view), which name no resource object.
+    void write_buffer_uav_at(const D3D12_RESOURCE_DESC& rd, UINT64 va, ID3D12Resource* counter,
+                             const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
         namespace g = leonida::gfx10;
-        const D3D12_RESOURCE_DESC& rd = Resource::from<Resource>(resource)->desc();
         if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             log_once("unordered-access view of a buffer created without ALLOW_UNORDERED_ACCESS; flags", int(rd.Flags));
             return;
@@ -6651,7 +6690,6 @@ public:
                 return;
             }
         }
-        const UINT64 va = resource->GetGPUVirtualAddress();
         const UINT64 counter_va = counter ? counter->GetGPUVirtualAddress() : 0;
         if (!va || (counter && !counter_va)) return;
         g::Buffer buffer{};
@@ -7135,6 +7173,94 @@ public:
             case 10: return D3D12_RESOURCE_STATE_RESOLVE_DEST;
             default: return D3D12_RESOURCE_STATE_COMMON;
         }
+    }
+
+    static bool write_placed_view(ID3D12Device* real, bool unordered, const D3D12_RESOURCE_DESC& desc,
+                                  const std::uint32_t* words, UINT64 address, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
+        auto* device = Device::from<Device>(real);
+        if (!device) return false;
+        // A buffer view (RT-TITLE-BUFFER-VIEWS): the title's buffer is the `Width` bytes at `address`, which the layer
+        // takes as a GPU address as it takes a constant-buffer view's BufferLocation. The V# is the one
+        // CreateShaderResourceView / CreateUnorderedAccessView write for a buffer resource there, with the same
+        // bounds; a view they refuse (or a UAV with a counter offset, which names no counter resource here) gives
+        // the caller's null descriptor. Measured on the retail title: typed R32_UINT and structured (stride 16, 32)
+        // views of small buffers through slot 71 (issue #14, comment 7140195321).
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (!desc.Width) return false;
+            std::memset(reinterpret_cast<void*>(dest.ptr), 0, kDescriptorSize);
+            if (unordered) {
+                D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+                std::memcpy(&uav, words, sizeof(uav));
+                device->write_buffer_uav_at(desc, address, nullptr, &uav, dest);
+            } else {
+                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                std::memcpy(&srv, words, sizeof(srv));
+                if (!srv.Shader4ComponentMapping) srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                device->write_buffer_srv_at(address, desc.Width, &srv, dest);
+            }
+            leonida::gfx10::BufferWords written{};
+            std::memcpy(written.data(), reinterpret_cast<const void*>(dest.ptr), sizeof(written));
+            return written != leonida::gfx10::BufferWords{};
+        }
+        static const bool allow_uav = [] {
+            const char* setting = std::getenv("LEONIDA_PLACED_TEXTURE_UAV");
+            return !setting || std::strcmp(setting, "0") != 0;
+        }();
+        if (unordered && !allow_uav) return false;
+
+        auto release = [](Resource* r) { r->Release(); };
+        std::unique_ptr<Resource, decltype(release)> resource(nullptr, release);
+        {
+            std::lock_guard lock(device->state_.placement_mutex);
+            auto [first, end] = device->state_.texture_placements.equal_range(address);
+            while (end != first) {
+                Resource* candidate = (--end)->second;
+                const auto& r = candidate->desc();
+                if (r.Dimension != desc.Dimension || r.Width != desc.Width || r.Height != desc.Height ||
+                    r.DepthOrArraySize != desc.DepthOrArraySize || (desc.MipLevels && r.MipLevels != desc.MipLevels) ||
+                    r.SampleDesc.Count != desc.SampleDesc.Count ||
+                    (r.Format != desc.Format && !candidate->lists_castable_format(desc.Format))) continue;
+                if (unordered ? !(r.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+                              : (r.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) continue;
+                candidate->AddRef();
+                resource.reset(candidate);
+                break;
+            }
+        }
+        if (!resource) return false;
+        if (unordered) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+            std::memcpy(&uav, words, sizeof(uav));
+            if (uav.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE3D) {
+                const auto& volume = uav.Texture3D;
+                const auto& r = resource->desc();
+                if (r.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || volume.MipSlice >= r.MipLevels) return false;
+                const UINT depth = std::max(1u, UINT(r.DepthOrArraySize) >> volume.MipSlice);
+                if (volume.FirstWSlice || (volume.WSize != UINT_MAX && volume.WSize != depth)) return false;
+                TextureView view{};
+                view.type = leonida::gfx10::ImageType::image_3d;
+                view.format = uav.Format;
+                view.first_mip = volume.MipSlice;
+                view.mip_count = 1;
+                std::memset(reinterpret_cast<void*>(dest.ptr), 0, kDescriptorSize);
+                device->write_image_descriptor(*resource, view, dest, true);
+                device->state_.context->note_shader_image(resource->id());
+            } else {
+                device->CreateUnorderedAccessView(resource.get(), nullptr, &uav, dest);
+            }
+        } else {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            std::memcpy(&srv, words, sizeof(srv));
+            if (!srv.Shader4ComponentMapping) srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            device->CreateShaderResourceView(resource.get(), &srv, dest);
+        }
+        leonida::gfx10::ImageWords key{};
+        std::memcpy(key.data(), reinterpret_cast<const void*>(dest.ptr), sizeof(key));
+        if (!leonida::gfx10::is_image(key)) return false;
+        std::lock_guard lock(device->state_.descriptor_mutex);
+        if (!device->state_.bindless) return true;
+        const auto it = device->state_.image_entries.find(key);
+        return it != device->state_.image_entries.end() && (!unordered || it->second.storage);
     }
 
     HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, std::uint32_t layout, REFIID riid,

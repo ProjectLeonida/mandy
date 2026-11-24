@@ -668,6 +668,20 @@ side inwards:
     `TEXTURE2DMS` view reads layer zero, while `TEXTURE2DMSARRAY` selects a range starting at
     `FirstArraySlice` (`ArraySize = UINT_MAX` selects the remaining layers). The format-support query
     advertises `MULTISAMPLE_LOAD` when the format can be sampled with MSAA and its binding pair is available.
+  - Xbox device slots 70 (SRV) and 71 (UAV) can select a live texture created by slot 133.
+    The address and resource description select the most recent compatible placement, including when
+    several live resources share an address. UAVs require writable backing. A 3D UAV can select one
+    complete mip. A missing placement or unsupported view gives a null descriptor.
+    Set `LEONIDA_PLACED_TEXTURE_UAV=0` to restore null placed UAVs.
+  - With a buffer description, slots 70 and 71 write a buffer view (RT-TITLE-BUFFER-VIEWS): the buffer is the
+    description's `Width` bytes at the address, taken as a GPU address as a constant-buffer view's
+    `BufferLocation` is, and the V# is the one `CreateShaderResourceView` / `CreateUnorderedAccessView` write for a
+    buffer resource there (raw, structured or typed, same bounds; the shared `write_buffer_srv_at` /
+    `write_buffer_uav_at`). A view those refuse, or a UAV with a counter offset (no counter resource is named),
+    gives the null descriptor. The retail title passes typed `R32_UINT` and structured (stride 16 and 32) views of
+    small buffers through slot 71 with flags `0x20004`; with the null descriptor, the instance-culling dispatches
+    read leftover memory as a V# and the device is lost (issue #14, comment 7140195321). `d3d12_set0_compute_test`
+    compares six views with the PC methods' and checks three null controls.
   - A texture is named in its T#s by an address of its own, above 4 GiB and 256 bytes apart, that nothing
     dereferences; its entries leave the set and the table when it is destroyed.
   - `VulkanDeviceInfo::bindless` says the Vulkan device has the features this needs: `runtimeDescriptorArray`,
