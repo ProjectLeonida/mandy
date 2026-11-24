@@ -137,6 +137,27 @@ class HarnessError(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("failed or unsupported", out.getvalue())
 
+    def test_stock_shader_requires_the_cpu_check(self):
+        output = "bench ms: median=1.0 min=0.9 max=1.1\nbench out fnv1a: abc\n4 groups x 64: 0 mismatches\n"
+        with patch.object(bench_wave64.subprocess, "run") as launch:
+            launch.return_value.stderr = ""
+            launch.return_value.returncode = 0
+            launch.return_value.stdout = output
+
+            def measure(name):
+                return bench_wave64.run("tools", name + ".spv", 4, 2, None, True)
+
+            self.assertIsNotNone(measure("custom")[0])
+            self.assertEqual(launch.call_args.args[0][-1], "dump")
+            self.assertIsNone(measure("cs_bench_mix")[0])
+            self.assertEqual(launch.call_args.args[0][-1], "bench_mix")
+            launch.return_value.stdout += "bench_mix checked 256 words\n"
+            self.assertIsNotNone(measure("cs_bench_mix")[0])
+            mismatch = "4 groups x 64: 3 mismatches (first at 34: got 0x60fcfa47)"
+            launch.return_value.stdout = mismatch + "\nout[0..7] = 0 0 0 0 0 0 0 0\n"
+            launch.return_value.returncode = 1
+            self.assertEqual(measure("cs_bench_mix"), (None, mismatch, None))
+
 
 class ArgumentValidation(unittest.TestCase):
     def test_positive_only(self):

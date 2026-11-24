@@ -63,7 +63,8 @@ def run(tools, spv, groups, reps, driver, emulate):
     env = dict(os.environ, VKC_BENCH=str(reps))
     if driver is not None:
         env["VK_LOADER_DRIVERS_SELECT"] = driver
-    args = [os.path.join(tools, COMPUTE_TEST), spv, str(groups), "dump"]
+    stock_shader = os.path.basename(spv) == "cs_bench_mix.spv"
+    args = [os.path.join(tools, COMPUTE_TEST), spv, str(groups), "bench_mix" if stock_shader else "dump"]
     if not emulate:
         args.append("--require-wave64")
     try:
@@ -71,6 +72,11 @@ def run(tools, spv, groups, reps, driver, emulate):
     except OSError as e:
         return None, f"{args[0]}: {e}", None
     out = r.stdout + r.stderr
+    mismatch = re.search(r"^\d+ groups x 64: [1-9]\d* mismatches.*$", out, re.MULTILINE)
+    if stock_shader and mismatch:
+        return None, mismatch.group(), None
+    if stock_shader and not r.returncode and f"bench_mix checked {groups * 64} words\n" not in out:
+        return None, "missing stock shader readback check (rebuild vk_compute_test)", None
     m = re.search(r"bench ms: median=([\d.]+) min=([\d.]+) max=([\d.]+)", out)
     h = re.search(r"bench out fnv1a: (\w+)", out)
     dev = re.search(r"device: (.*) \(subgroup", out)
