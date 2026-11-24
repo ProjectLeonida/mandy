@@ -53,7 +53,11 @@ def comment_text(line: str) -> str | None:
 
 def without_marker(text: str) -> str:
     """The note without its leading marker word ("ASSUMPTION: x" -> "x"), which the list already shows."""
-    return re.sub(r"^\**\s*(ASSUMPTION|UNVERIFIED|VERIFY)S?\b[^:]*:\**\s*", "", text, count=1, flags=re.IGNORECASE)
+    if text.startswith("**"):
+        return re.sub(r"^\*\*\s*(?:ASSUMPTION|UNVERIFIED|VERIFY)S?\b[^*]*\*\*\s*:?\s*", "", text,
+                      count=1, flags=re.IGNORECASE)
+    return re.sub(r"^(?:ASSUMPTION|UNVERIFIED|VERIFY)S?\b(?:\s*\([^)]*\))?(?:\s*:\s*|\s+)", "", text,
+                  count=1, flags=re.IGNORECASE)
 
 
 def code_notes(path: str, rel: str) -> list[dict]:
@@ -101,9 +105,13 @@ def doc_notes(path: str, rel: str) -> list[dict]:
         if DEFINITION.match(body[m.end():].lstrip()):
             continue
         end = i + 1
-        while end < len(lines) and lines[end].strip() and not lines[end].lstrip().startswith(("- ", "* ", "#", "|")):
+        while end < len(lines):
+            nxt = lines[end].lstrip()
+            if not nxt or nxt.startswith(("#", "|")) or LIST_ITEM.match(nxt):
+                break
             end += 1
-        text = " ".join(re.sub(r"^[-*] ", "", l.strip()) for l in lines[i:end])
+        first_line = LIST_ITEM.sub("", lines[i].strip(), count=1)
+        text = " ".join([first_line] + [l.strip() for l in lines[i + 1:end]])
         notes.append({"file": rel, "line": i + 1, "kind": m.group(1).upper(), "text": without_marker(text)})
     return notes
 
@@ -138,12 +146,28 @@ def called_classes(paths: list[str]) -> set[str]:
     """The class ids the executable's gdk_runtime_calls reports list (any image in them)."""
     ids = set()
     for p in paths:
-        with open(p, encoding="utf-8") as f:
+        with open(p, encoding="utf-8-sig") as f:
             doc = json.load(f)
-        for image in doc.get("images", [doc]):
-            for c in image.get("classes", []):
-                if c.get("class_id"):
-                    ids.add(str(c["class_id"]).lower())
+        if not isinstance(doc, dict):
+            raise ValueError(f"{p}: expected a JSON object")
+        images = doc["images"] if "images" in doc else [doc]
+        if not isinstance(images, list):
+            raise ValueError(f"{p}: 'images' must be a list")
+        for image in images:
+            if not isinstance(image, dict):
+                raise ValueError(f"{p}: each image entry must be an object")
+            classes = image["classes"] if "classes" in image else []
+            if not isinstance(classes, list):
+                raise ValueError(f"{p}: 'classes' must be a list")
+            for c in classes:
+                if not isinstance(c, dict):
+                    raise ValueError(f"{p}: each class entry must be an object")
+                cid = c.get("class_id")
+                if cid is not None:
+                    if not isinstance(cid, str):
+                        raise ValueError(f"{p}: 'class_id' must be a string")
+                    if cid:
+                        ids.add(cid.lower())
     return ids
 
 
