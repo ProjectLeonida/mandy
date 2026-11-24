@@ -34,10 +34,12 @@ v_mov_b32_e32 v4, 0x11111111
 v_mov_b32_e32 v5, 0x22222222
 ds_write_b64 v1, v[4:5]
 s_waitcnt lgkmcnt(0)
+s_barrier
 v_mov_b32_e32 v4, 0xAAAA0001
 v_mov_b32_e32 v5, 0xBBBB0002
 ds_wrxchg_rtn_b64 v[12:13], v1, v[4:5]
 s_waitcnt lgkmcnt(0)
+s_barrier
 ds_read_b64 v[10:11], v1
 s_waitcnt lgkmcnt(0)
 v_xor_b32_e32 v10, v10, v11
@@ -53,10 +55,12 @@ v_mov_b32_e32 v4, 0x0F0F0000
 v_mov_b32_e32 v5, 0x000000F0
 ds_write_b64 v1, v[4:5]
 s_waitcnt lgkmcnt(0)
+s_barrier
 v_mov_b32_e32 v4, 0x0000F0F0
 v_mov_b32_e32 v5, 0xFF000000
 ds_or_rtn_b64 v[12:13], v1, v[4:5]
 s_waitcnt lgkmcnt(0)
+s_barrier
 ds_read_b64 v[10:11], v1
 s_waitcnt lgkmcnt(0)
 v_xor_b32_e32 v10, v10, v11
@@ -73,12 +77,14 @@ v_mov_b32_e32 v4, 3
 v_mov_b32_e32 v5, 4
 ds_write_b64 v2, v[4:5]
 s_waitcnt lgkmcnt(0)
+s_barrier
 v_mov_b32_e32 v4, 0x10
 v_mov_b32_e32 v5, 0x20
 v_mov_b32_e32 v6, 0x30
 v_mov_b32_e32 v7, 0x40
 ds_wrxchg2_rtn_b64 v[12:15], v1, v[4:5], v[6:7] offset0:0 offset1:2
 s_waitcnt lgkmcnt(0)
+s_barrier
 v_lshlrev_b32_e32 v13, 8, v13
 v_or_b32_e32 v12, v12, v13
 v_lshlrev_b32_e32 v14, 16, v14
@@ -109,6 +115,7 @@ v_mov_b32_e32 v4, 7
 v_mov_b32_e32 v5, 8
 ds_write_b64 v3, v[4:5]
 s_waitcnt lgkmcnt(0)
+s_barrier
 v_mov_b32_e32 v1, 0x100
 v_mov_b32_e32 v4, 0x50
 v_mov_b32_e32 v5, 0x60
@@ -116,6 +123,7 @@ v_mov_b32_e32 v6, 0x70
 v_mov_b32_e32 v7, 0x80
 ds_wrxchg2st64_rtn_b64 v[12:15], v1, v[4:5], v[6:7] offset0:1 offset1:2
 s_waitcnt lgkmcnt(0)
+s_barrier
 ds_read_b32 v10, v2
 ds_read_b32 v11, v3
 s_waitcnt lgkmcnt(0)
@@ -136,11 +144,13 @@ v_mov_b32_e32 v2, 0x604
 v_mov_b32_e32 v3, 0x80000000
 ds_write_b32 v2, v3
 s_waitcnt lgkmcnt(0)
+s_barrier
 v_mov_b32_e32 v3, 0x3FC00000
 ds_min_f32 v1, v3
 v_mov_b32_e32 v3, 0
 ds_max_rtn_f32 v11, v2, v3
 s_waitcnt lgkmcnt(0)
+s_barrier
 ds_read_b32 v10, v1
 ds_read_b32 v12, v2
 s_waitcnt lgkmcnt(0)

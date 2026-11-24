@@ -37,8 +37,10 @@ v_mov_b32_e32 v11, 5
 v_mov_b32_e32 v12, 9
 ds_write_b32 v10, v11
 s_waitcnt lgkmcnt(0)
+s_barrier
 ds_cmpst_rtn_b32 v13, v10, v11, v12
 s_waitcnt lgkmcnt(0)
+s_barrier
 ds_read_b32 v14, v10
 s_waitcnt lgkmcnt(0)
 v_lshl_or_b32 v7, v13, 8, v14
