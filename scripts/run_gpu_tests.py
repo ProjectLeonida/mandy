@@ -813,6 +813,9 @@ def _w64_graphics_only() -> frozenset:
 
 
 W64_GRAPHICS_ONLY = _w64_graphics_only()
+# Compute fixtures that declare their expected words in their own header (fixture_expect.py): no row here.
+import fixture_expect  # noqa: E402
+EXPECT_FIXTURES = fixture_expect.expect_fixtures(SHADER_DIR)
 
 
 def run_suite(a, work: str) -> int:
@@ -971,7 +974,15 @@ def run_suite(a, work: str) -> int:
         cs_env = dict(os.environ, VKC_SUBGROUP_SIZE=str(sg)) if sg else None
         gfx_env = dict(os.environ, VKH_SUBGROUP_SIZE=str(sg)) if sg else None
 
-        if name in CLIP_CASES:
+        if name in EXPECT_FIXTURES:
+            # The words and group count come from the fixture's own `; expect:` header (fixture_expect.py).
+            want, groups = EXPECT_FIXTURES[name]
+            rc, msg = run_cmd([vk_compute, spv, groups, "dump"], env=cs_env)
+            words = dump_words(msg)
+            vals = words[:len(want)] if words else []
+            results.append((name,) + compute_result(rc, msg, rc == 0 and vals == want,
+                                                    " ".join(hex(x) for x in vals) if vals else msg))
+        elif name in CLIP_CASES:
             detail = clip_test(a.build, spirv_dir, name)
             results.append((name, None if isinstance(detail, Skip) else not detail, detail or "four pixel masks exact"))
         elif name == "cs_workgroup_yz":
@@ -1005,16 +1016,14 @@ def run_suite(a, work: str) -> int:
             ok = None if isinstance(problem, Skip) else not problem
             results.append((name, ok, problem or f"4096 pixels in each of {len(GET_LOD_TESTS[name])} draw(s): the "
                             "clamped and the calculated LOD within 1/16"))
-        elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_smem_sconst_off", "cs_buf_tail", "cs_oob_select", "cs_oob_tail",
-                      "cs_buf_swizzle", "cs_cmpx_class_f32", "cs_cvt_pk_u8", "cs_pk_mul_lo_const", "cs_buf_load_sub", "cs_buf_fmt8"):
+        elif name in ("cs_smem_stride_align", "cs_smem_sload_neg", "cs_smem_sconst_off", "cs_buf_tail", "cs_oob_select", "cs_oob_tail",
+                      "cs_buf_swizzle", "cs_cmpx_class_f32", "cs_cvt_pk_u8", "cs_pk_mul_lo_const", "cs_buf_load_sub"):
             # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
             # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
             # cs_cmpx_class_f32 and cs_cvt_pk_u8 are per-lane and need no particular subgroup width either.
             # The other four pin the SMEM and raw MUBUF rules measured on an RX 6800 (derivations in each .asm).
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
             want = {
-                "cs_bounds": [0x12345678, 0x12345678, 0, 0xEEEEEEEE],
-                "cs_smem_bounds": [0, 0x5EED0010, 0x5EED000C, 0, 0x5EED000C, 0x5EED0010, 0, 0],
                 "cs_smem_stride_align": [0x5EED0010, 0, 0, 0x5EED0000, 0x5EED0000, 0x5EED0000, 0x5EED0000,
                                          0x5EED0004],
                 # never run with a translator that zero-extends the s_load immediate (reads 4 GiB past the heap)
@@ -1033,7 +1042,6 @@ def run_suite(a, work: str) -> int:
                 "cs_pk_mul_lo_const": PK_MUL_LO_WORDS,
                 # TEST-510: sub-dword MUBUF loads (RAW end check by element size) and GFX10_FORMAT_8_UINT
                 "cs_buf_load_sub": [0x80, 0xFFFFFF80, 0x1FF, 0xFFFF807F, 0xAB01, 0xCD, 0, 0],
-                "cs_buf_fmt8": [0x7F, 0x80, 0xFF, 0x01, 0, 0, 0xFF, 1],
             }[name]
             words = dump_words(msg)
             vals = words[:len(want)] if words else []

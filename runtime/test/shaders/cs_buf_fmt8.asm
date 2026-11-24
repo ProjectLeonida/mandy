@@ -10,6 +10,7 @@
 ; One thread, no wave64 requirement.
 ; Run: vk_compute_test cs_buf_fmt8.spv 1 dump -> out[0..7] = 0x0000007f 0x00000080 0x000000ff 0x00000001 0x00000000
 ; 0x00000000 0x000000ff 0x00000001 (127 128 255 1 0 0 255 1).
+; expect: 0x7f 0x80 0xff 0x01 0 0 0xff 1
 v_cmpx_eq_u32_e32 0, v0
 v_mov_b32 v1, 0x01ff807f
 buffer_store_dword v1, off, s[0:3], 0 offset:64

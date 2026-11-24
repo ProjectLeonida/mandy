@@ -33,7 +33,8 @@ WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n
 # All check.py cases, including the six vk_store_test shaders and the three mesh fixtures, and TEST-184's
 # vk_store_test "words" fixtures and image_get_lod draws.
 TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 6
-         + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
+         + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.EXPECT_FIXTURES)
+         + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
          + len(check.TEXTURE_CONSTANTS) + 16)  # three mesh fixtures, ps_tex, ps_imgatomic, ps_table_fetch, six compute fixtures,
@@ -144,8 +145,10 @@ class Wave64Checks(unittest.TestCase):
                 groups, words = next((g, w) for n, g, w in check.GLOBAL_OFFSET if n == name)
                 self.assertEqual(args[0], groups)
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
-            if name in dict(check.BOUNDS):    # the SMEM / raw MUBUF rule tests: their words, then the 0xee fill
-                words = (dict(check.BOUNDS)[name] + [0xEEEEEEEE] * 8)[:8]
+            if name in dict(check.BOUNDS) or name in check.EXPECT_FIXTURES:
+                # the SMEM / raw MUBUF rule tests and the header-declared fixtures: their words, then the 0xee fill
+                want = dict(check.BOUNDS).get(name) or check.EXPECT_FIXTURES[name][0]
+                words = (want + [0xEEEEEEEE] * 8)[:8]
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_cvt_pk_u8":
                 return 0, "out[0..7] = " + " ".join(map(str, check.CVT_PK_U8_WORDS)) + "\n"

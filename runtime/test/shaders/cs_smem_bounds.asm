@@ -14,6 +14,7 @@
 ; and writes s24..s31 to out[0..7].
 ; Run: vk_compute_test cs_smem_bounds.spv 1 dump -> out[0..7] = 0x00000000 0x5eed0010 0x5eed000c 0x00000000
 ; 0x5eed000c 0x5eed0010 0x00000000 0x00000000 (0 1592590352 1592590348 0 1592590348 1592590352 0 0).
+; expect: 0 0x5eed0010 0x5eed000c 0 0x5eed000c 0x5eed0010 0 0
 v_cmpx_eq_u32_e32 0, v0
 v_mov_b32 v1, 0x5eed0000
 v_mov_b32 v2, 0x5eed0004
