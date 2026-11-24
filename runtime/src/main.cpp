@@ -39,6 +39,7 @@
 #include "../shims/process_shim.h"
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
+#include "../shims/thread_snapshot.h"
 #include "../shims/xmem.h"
 
 namespace {
@@ -272,6 +273,8 @@ int wmain(int argc, wchar_t** argv) {
         }
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
+        // LEONIDA_THREAD_SNAPSHOT=<s>[,<s>...]: what every thread waits on at those times (shims/thread_snapshot.h).
+        rt::thread_snapshot::start_from_env(&rt::shims::module_offset);
         const int code = rt::process::run_entry(main_module.base + main_module.entry_rva);
         std::fflush(stdout);
         std::printf("game exited with code %d\n", code);

@@ -254,6 +254,12 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     message(STATUS "d3d12.lib not found: root_sig_test and device_proxy_test are not built")
   endif()
 
+  # LEONIDA_THREAD_SNAPSHOT (shims/thread_snapshot.h): waiting threads named with the object they wait on, then resumed.
+  add_executable(thread_snapshot_test test/thread_snapshot_test.cpp)
+  target_include_directories(thread_snapshot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(thread_snapshot_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(thread_snapshot_test PRIVATE /W4 /permissive- /utf-8)
+
   # xmem shim ABI test: resolves the registered xmem.dll exports itself, so xmem.cpp and registry.cpp are compiled
   # into this executable instead of reusing gta6rt's objects (which would duplicate their symbols).
   add_executable(xmem_test
@@ -1218,6 +1224,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
+  endif()
+  if(WIN32 AND TARGET thread_snapshot_test)
+    add_test(NAME thread_snapshot COMMAND thread_snapshot_test)
   endif()
   if(WIN32 AND TARGET xg_xs_test)
     add_test(NAME xg_xs COMMAND xg_xs_test)
