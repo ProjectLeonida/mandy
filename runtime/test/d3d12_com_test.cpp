@@ -9,8 +9,10 @@
 #include "../src/gfx10_descriptors.h"
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -136,6 +138,9 @@ int main(int argc, char** argv) {
         Ref<ID3D12GraphicsCommandList8> list8;
         EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list8.p))));
         list8->OMSetFrontAndBackStencilRef(1, 2);
+        list8->OMSetDepthBounds(0.25f, 0.75f);
+        float min_depth = 0.0f, max_depth = 0.0f;
+        EXPECT(rt::d3d12::depth_bounds(list8.p, min_depth, max_depth) && min_depth == 0.25f && max_depth == 0.75f);
         Ref<ID3D12CommandAllocator> bundle_allocator;
         Ref<ID3D12GraphicsCommandList8> bundle;
         EXPECT(SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
@@ -153,10 +158,12 @@ int main(int argc, char** argv) {
                                                IID_PPV_ARGS(&wrong_bundle.p)) == E_INVALIDARG);
         EXPECT(!wrong_bundle.p);
         bundle->OMSetFrontAndBackStencilRef(7, 9);
+        bundle->OMSetDepthBounds(0.125f, 0.875f);
         EXPECT(bundle->Close() == S_OK);
         list8->ExecuteBundle(bundle.p);
         UINT front = 0, back = 0;
         EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 7 && back == 9);
+        EXPECT(rt::d3d12::depth_bounds(list8.p, min_depth, max_depth) && min_depth == 0.125f && max_depth == 0.875f);
 
         // An untouched bundle inherits the parent's current sticky state; its default values must not overwrite it.
         Ref<ID3D12CommandAllocator> untouched_allocator;
@@ -168,6 +175,7 @@ int main(int argc, char** argv) {
         EXPECT(untouched_bundle->Close() == S_OK);
         list8->ExecuteBundle(untouched_bundle.p);
         EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 7 && back == 9);
+        EXPECT(rt::d3d12::depth_bounds(list8.p, min_depth, max_depth) && min_depth == 0.125f && max_depth == 0.875f);
         list8->ExecuteBundle(bundle.p);  // the same closed bundle can be executed repeatedly
 
         ID3D12CommandList* bundle_submission[] = {bundle.p};
@@ -432,26 +440,32 @@ int main(int argc, char** argv) {
         list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 2.0f, 0, 0, nullptr);
         EXPECT(list->Close() == S_OK);
 
-        // State-setting calls on a closed direct list or bundle are ignored and do not mutate recorded state.
+        // Post-close state calls on a closed direct list or bundle are ignored and do not mutate recorded state.
         EXPECT(SUCCEEDED(allocator->Reset()));
         EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        list8->OMSetDepthBounds(std::numeric_limits<float>::quiet_NaN(), 0.5f);
         list->OMSetStencilRef(5);
+        list8->OMSetDepthBounds(0.25f, 0.75f);
         EXPECT(list->Close() == S_OK);
         EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 5 && back == 5);
+        EXPECT(rt::d3d12::depth_bounds(list8.p, min_depth, max_depth) && min_depth == 0.25f && max_depth == 0.75f);
         const FLOAT post_close_factor[4] = {0.1f, 0.2f, 0.3f, 0.4f};
         list->OMSetStencilRef(99);
         list->OMSetBlendFactor(post_close_factor);
+        list8->OMSetDepthBounds(0.9f, 0.95f);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list->IASetIndexBuffer(nullptr);
         list->SetPipelineState(nullptr);
         list->ClearState(nullptr);
         list->ExecuteBundle(bundle.p);
         EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 5 && back == 5);
+        EXPECT(rt::d3d12::depth_bounds(list8.p, min_depth, max_depth) && min_depth == 0.25f && max_depth == 0.75f);
         EXPECT(list->Close() == E_FAIL);
 
         // Post-close state calls on a closed bundle do not append calls or invalidate the bundle.
         bundle->OMSetStencilRef(99);
         bundle->OMSetBlendFactor(post_close_factor);
+        bundle->OMSetDepthBounds(0.9f, 0.95f);
         bundle->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST);
         bundle->IASetIndexBuffer(nullptr);
         bundle->SetPipelineState(nullptr);
@@ -461,6 +475,7 @@ int main(int argc, char** argv) {
         EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
         list->ExecuteBundle(bundle.p);
         EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 7 && back == 9);
+        EXPECT(rt::d3d12::depth_bounds(list8.p, min_depth, max_depth) && min_depth == 0.125f && max_depth == 0.875f);
         EXPECT(list->Close() == S_OK);
     }
 

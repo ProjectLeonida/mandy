@@ -235,6 +235,8 @@ public:
     }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
     UINT back_stencil_ref() const { return back_stencil_ref_; }
+    float min_depth_bounds() const { return min_depth_bounds_; }
+    float max_depth_bounds() const { return max_depth_bounds_; }
     D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base() const { return cbv_srv_uav_base_; }
     D3D12_GPU_VIRTUAL_ADDRESS sampler_base() const { return sampler_base_; }
 
@@ -565,7 +567,8 @@ public:
         }
         if (!any_nonempty_viewport()) return;  // as record_draw: nothing is rasterized
         leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, {}, 0, viewport_,
-                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
+                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_,
+                           min_depth_bounds_, max_depth_bounds_, false, x, y, z, 0, 0};
         note_direct_heap_indexing(graphics_.layout);
         draw.mesh = true;
         draw.viewports = draw_viewports();
@@ -936,6 +939,20 @@ public:
                                             ID3D12Resource* dst, UINT64 offset) override {
         if (!query_allowed(type)) return check(false);
         check(list_.resolve_queries({query_heap_id(heap), u(type), first, count, resource_id(dst), offset}));
+    }
+
+    // GCL1. Dynamic depth-bounds range (default 0.0..1.0), allowed in bundles and accepting out-of-range/NaN at record
+    // time as D3D12 does (replayed cleanly inside Vulkan's 0..1 domain in vulkan_replay.h).
+    void STDMETHODCALLTYPE OMSetDepthBounds(FLOAT min, FLOAT max) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList1::OMSetDepthBounds");
+        if (list_.closed()) return;
+        if (defer([=](GraphicsCommandList& l) {
+                l.min_depth_bounds_ = min;
+                l.max_depth_bounds_ = max;
+            }))
+            return;
+        min_depth_bounds_ = min;
+        max_depth_bounds_ = max;
     }
 
     // GCL8. Each draw applies the two faces with vkCmdSetStencilReference(VK_STENCIL_FACE_FRONT_BIT / BACK_BIT).
@@ -1552,6 +1569,8 @@ private:
     bool invalid_ = false;
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
+    float min_depth_bounds_ = 0.0f;
+    float max_depth_bounds_ = 1.0f;
     RootState compute_;
     RootState graphics_;
     std::uintptr_t compute_pipeline_ = 0;
@@ -1681,6 +1700,8 @@ private:
 
     void reset_state(ID3D12PipelineState* state) {
         front_stencil_ref_ = back_stencil_ref_ = 0;
+        min_depth_bounds_ = 0.0f;
+        max_depth_bounds_ = 1.0f;
         compute_ = {};
         graphics_ = {};
         cbv_srv_uav_heap_ = nullptr;
@@ -2052,7 +2073,8 @@ private:
     void record_raster_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance,
                             const leonida::IndirectDrawArgs* indirect = nullptr) {
         leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, index_, topology_, viewport_,
-                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
+                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_,
+                           min_depth_bounds_, max_depth_bounds_, indexed, count, instances,
                            first, base_vertex, first_instance};
         draw.viewports = draw_viewports();
         const bool recorded = indirect ? list_.draw_indirect(std::move(draw), *indirect) : list_.draw(std::move(draw));
@@ -2804,6 +2826,14 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
     if (!l) return false;
     front = l->front_stencil_ref();
     back = l->back_stencil_ref();
+    return true;
+}
+
+bool depth_bounds(ID3D12GraphicsCommandList1* list, float& min_depth, float& max_depth) {
+    const GraphicsCommandList* l = GraphicsCommandList::from(list);
+    if (!l) return false;
+    min_depth = l->min_depth_bounds();
+    max_depth = l->max_depth_bounds();
     return true;
 }
 

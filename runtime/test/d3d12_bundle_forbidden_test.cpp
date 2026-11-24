@@ -120,6 +120,9 @@ std::vector<Call> calls() {
         {"OMSetBlendFactor", [](Env&, ID3D12GraphicsCommandList* b) {
              const FLOAT factor[4] = {1, 1, 1, 1};
              b->OMSetBlendFactor(factor); }},
+        {"OMSetDepthBounds", [](Env&, ID3D12GraphicsCommandList* b) {
+             Ref<ID3D12GraphicsCommandList1> b1;
+             if (SUCCEEDED(b->QueryInterface(IID_PPV_ARGS(&b1.p)))) b1->OMSetDepthBounds(0.25f, 0.75f); }},
     };
 }
 

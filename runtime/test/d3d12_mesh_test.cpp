@@ -157,6 +157,7 @@ int main(int argc, char** argv) {
         info.queue_family = d.family;
         info.buffer_device_address = true;
         info.shader_dir = library.string();
+        info.features.depthBounds = d.enabled.depthBounds;
         info.mesh_shader = mesh;
         info.mesh_shader_queries = mesh && d.mesh_shader_queries;
         info.pipeline_statistics_query = d.pipeline_statistics_query;
@@ -317,7 +318,14 @@ int main(int argc, char** argv) {
         D3D12_DEPTH_STENCIL_DESC1 bounds{};
         bounds.DepthBoundsTestEnable = TRUE;
         bad.add(DepthStencil1Subobject{.inner = bounds});
-        EXPECT(create(device.p, bad, refused) == E_NOTIMPL && !refused.p);
+        D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2{};
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS2, &o2, sizeof(o2))));
+        if (o2.DepthBoundsTestSupported) {
+            Ref<ID3D12PipelineState> bounds_pso;
+            EXPECT(SUCCEEDED(create(device.p, bad, bounds_pso)) && bounds_pso.p);
+        } else {
+            EXPECT(create(device.p, bad, refused) == E_NOTIMPL && !refused.p);
+        }
 
         // A console stream: its numbering has no gap at 23, so its mesh shader is 24 (the PC's AS) and its
         // RASTERIZER1 26 (the PC's DEPTH_STENCIL2). An AS without an MS is no PC stream, so the layer reads it with the
