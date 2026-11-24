@@ -544,7 +544,10 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
     }
 
     const Roots r = roots();
-    if (r.game.empty()) {
+    // T:'s scratch folder lives in the overlay only, so a caller with --overlay but no --game-dir can still list
+    // it: gate those listings on the overlay instead of the package.
+    const bool scratch = !parts.empty() && same_name(parts.front().c_str(), kScratchDir);
+    if ((scratch ? r.overlay : r.game).empty()) {
         error = ERROR_PATH_NOT_FOUND;
         return false;
     }
@@ -641,7 +644,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         ::FindClose(h);
     };
     add_root(r.overlay, true);
-    add_root(r.game, false);
+    if (!scratch) add_root(r.game, false);  // T: never names the package, so don't probe its root
 
     if (out.empty()) {
         error = ERROR_FILE_NOT_FOUND;
