@@ -229,6 +229,12 @@ class MainWiringTest(unittest.TestCase):
         self.assertEqual(self.run_main(per_vertex=True), ((), ()))
         self.assertEqual(self.run_main("--f16-interp-fallback", per_vertex=True), (("--f16-interp-fallback",),) * 2)
 
+    def test_explicit_loop_limit_reaches_the_shaders_stage(self):
+        for limit in ("0", "16"):
+            with self.subTest(limit=limit):
+                expected = (f"--loop-limit={limit}",)
+                self.assertEqual(self.run_main("--loop-limit", limit), (expected, expected))
+
     def test_barycentric_fallback_follows_anv_probe(self):
         self.assertEqual(self.run_main(barycentric_fallback=True), (("--bary-fallback",),) * 2)
         self.assertEqual(self.run_main(barycentric_fallback=False), ((), ()))
