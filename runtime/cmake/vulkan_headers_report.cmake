@@ -39,22 +39,27 @@ function(leonida_vulkan_headers_find include_dirs dir_var version_var)
 endfunction()
 
 # include_dirs: the INTERFACE_INCLUDE_DIRECTORIES of Vulkan::Headers. origin: PIN (the hash-checked download of
-# LEONIDA_VULKAN_HEADERS_PIN), SOURCE_DIR (FETCHCONTENT_SOURCE_DIR_VULKANHEADERS) or FOUND (anything else).
+# LEONIDA_VULKAN_HEADERS_PIN), PIN_CACHED (a copy already in FETCHCONTENT_BASE_DIR, which
+# FETCHCONTENT_FULLY_DISCONNECTED=ON uses without downloading or checking an archive; leonida_vulkan_headers_check
+# has confirmed only its version), SOURCE_DIR (FETCHCONTENT_SOURCE_DIR_VULKANHEADERS) or FOUND (anything else).
 function(leonida_vulkan_headers_report include_dirs origin)
   leonida_vulkan_headers_find("${include_dirs}" dir version)
   if(NOT dir)
     set(dir "${include_dirs}")
   endif()
+  # string(CONCAT) on quoted pieces keeps a ";" in the text, which a list would split on.
   if(origin STREQUAL "PIN")
     set(what "the pin: Khronos Vulkan-Headers ${LEONIDA_VULKAN_HEADERS_PIN}, hash-checked")
+  elseif(origin STREQUAL "PIN_CACHED")
+    string(CONCAT what "the pinned version, cached source: Khronos Vulkan-Headers ${LEONIDA_VULKAN_HEADERS_PIN}; "
+                       "archive not checked in this configure (FETCHCONTENT_FULLY_DISCONNECTED=ON)")
   elseif(origin STREQUAL "SOURCE_DIR")
-    set(what "from FETCHCONTENT_SOURCE_DIR_VULKANHEADERS: a local copy used in place of the pin, not checked "
-             "against it")
+    string(CONCAT what "from FETCHCONTENT_SOURCE_DIR_VULKANHEADERS: a local copy used in place of the pin, not "
+                       "checked against it")
   else()
-    set(what "found on this machine, not the pin (-DLEONIDA_VULKAN_HEADERS_FETCH=ON builds against the pinned "
-             "Khronos Vulkan-Headers)")
+    string(CONCAT what "found on this machine, not the pin (-DLEONIDA_VULKAN_HEADERS_FETCH=ON builds against the "
+                       "pinned Khronos Vulkan-Headers)")
   endif()
-  string(CONCAT what ${what})
   message(STATUS "Vulkan headers: ${dir} (VK_HEADER_VERSION ${version}), ${what}")
 endfunction()
 
@@ -62,9 +67,9 @@ endfunction()
 # source_dir (empty when it populated none). FetchContent_MakeAvailable(VulkanHeaders) can return other headers
 # without populating anything: a dependency provider can answer it, and so can find_package() when an earlier
 # FetchContent_Declare(VulkanHeaders) asked for that or when FETCHCONTENT_TRY_FIND_PACKAGE_MODE=ALWAYS applies (an
-# installed VulkanHeadersConfig.cmake with VK_HEADER_VERSION 111 was named as the pin that way). origin PIN also needs
-# the pinned version, LEONIDA_VULKAN_HEADERS_PIN_VERSION, which a build folder populated before the pin changed and
-# configured with FETCHCONTENT_FULLY_DISCONNECTED=ON does not have.
+# installed VulkanHeadersConfig.cmake with VK_HEADER_VERSION 111 was named as the pin that way). origin PIN or
+# PIN_CACHED also needs the pinned version, LEONIDA_VULKAN_HEADERS_PIN_VERSION, which a build folder populated before
+# the pin changed and configured with FETCHCONTENT_FULLY_DISCONNECTED=ON does not have.
 function(leonida_vulkan_headers_check include_dirs source_dir origin)
   leonida_vulkan_headers_find("${include_dirs}" dir version)
   set(same FALSE)
@@ -88,7 +93,8 @@ function(leonida_vulkan_headers_check include_dirs source_dir origin)
       "earlier FetchContent_Declare(VulkanHeaders). Remove it, or configure without either of the two to build "
       "against the installed headers.")
   endif()
-  if(origin STREQUAL "PIN" AND NOT version STREQUAL "${LEONIDA_VULKAN_HEADERS_PIN_VERSION}")
+  if((origin STREQUAL "PIN" OR origin STREQUAL "PIN_CACHED") AND
+     NOT version STREQUAL "${LEONIDA_VULKAN_HEADERS_PIN_VERSION}")
     message(FATAL_ERROR
       "${dir} has VK_HEADER_VERSION ${version}, but the pinned Khronos Vulkan-Headers ${LEONIDA_VULKAN_HEADERS_PIN} "
       "are version ${LEONIDA_VULKAN_HEADERS_PIN_VERSION}, so ${source_dir} is not the pin. A dependency provider may "

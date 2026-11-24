@@ -164,6 +164,16 @@ class ReportLineTest(unittest.TestCase):
         self.assertIn(f"Vulkan headers: {self.include.as_posix()} (VK_HEADER_VERSION {PIN_VERSION})", line)
         self.assertIn("the pin: Khronos Vulkan-Headers 0123456789abcdef0123456789abcdef01234567", line)
 
+    def test_a_cached_pin_does_not_claim_a_hash_check(self):
+        # FETCHCONTENT_FULLY_DISCONNECTED=ON: the copy in FETCHCONTENT_BASE_DIR is used and no archive is checked.
+        write_headers(self.include, PIN_VERSION)
+        r = run_report(f"$<BUILD_INTERFACE:{self.include.as_posix()}>", "PIN_CACHED")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        line = headers_line(r.stdout)
+        self.assertIn(f"(VK_HEADER_VERSION {PIN_VERSION}), the pinned version, cached source: Khronos Vulkan-Headers "
+                      "0123456789abcdef0123456789abcdef01234567; archive not checked in this configure", line)
+        self.assertNotIn("hash-checked", line)
+
     def test_source_dir_copy_is_not_vouched_for(self):
         write_headers(self.include, PIN_VERSION)
         r = run_report(self.include.as_posix(), "SOURCE_DIR")
@@ -210,9 +220,11 @@ class CheckTest(unittest.TestCase):
 
     def test_another_version_is_not_the_pin(self):
         write_headers(self.source / "include", PIN_VERSION - 1)
-        r = run_check((self.source / "include").as_posix(), self.source.as_posix(), "PIN")
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn(f"has VK_HEADER_VERSION {PIN_VERSION - 1}", " ".join(r.stderr.split()))
+        for origin in ("PIN", "PIN_CACHED"):
+            with self.subTest(origin=origin):
+                r = run_check((self.source / "include").as_posix(), self.source.as_posix(), origin)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(f"has VK_HEADER_VERSION {PIN_VERSION - 1}", " ".join(r.stderr.split()))
 
     def test_a_source_dir_copy_may_be_another_version(self):
         write_headers(self.source / "include", PIN_VERSION - 1)
@@ -289,7 +301,11 @@ class ConfigureTest(unittest.TestCase):
                                     f"-DFETCHCONTENT_BASE_DIR={deps.as_posix()}", "-DFETCHCONTENT_FULLY_DISCONNECTED=ON")
         self.assert_uses(dirs, deps / "vulkanheaders-src" / "include")
         self.assertFalse(any(same_dir(d, self.package_include) for d in dirs), dirs)
-        self.assertIn(f"(VK_HEADER_VERSION {PIN_VERSION}), the pin: Khronos Vulkan-Headers ", line)
+        # The preseeded copy is the pinned version, but no archive was checked in this configure.
+        self.assertIn(f"(VK_HEADER_VERSION {PIN_VERSION}), the pinned version, cached source: Khronos Vulkan-Headers ",
+                      line)
+        self.assertIn("archive not checked in this configure (FETCHCONTENT_FULLY_DISCONNECTED=ON)", line)
+        self.assertNotIn("hash-checked", line)
 
     def test_a_dependency_provider_cannot_stand_in_for_the_pin(self):
         provider = self.base / "provider.cmake"
