@@ -1442,8 +1442,16 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
     void* created = nullptr;
-    const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
-                                                     *riid, &created);
+    HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
+                                               *riid, &created);
+    if (hr == E_NOINTERFACE && *riid != __uuidof(IUnknown)) {
+        // Console CreateCommandListX callers pass a console-only command-list IID that PC runtimes/layers do not
+        // implement. Fall back to ID3D12GraphicsCommandList and wrap it as a console list proxy.
+        hr = self->real->CreateCommandList(0, type, allocator, initial_state,
+                                           __uuidof(ID3D12GraphicsCommandList), &created);
+        if (SUCCEEDED(hr))
+            return wrap_list(static_cast<IUnknown*>(created), self, &__uuidof(ID3D12GraphicsCommandList), out);
+    }
     if (FAILED(hr)) return hr;
     return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
 }
