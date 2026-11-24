@@ -888,7 +888,10 @@ than invent slots.
    like the one `GetRaytracingAccelerationStructurePrebuildInfo` accepts is not enough by itself,
    because the validation reads the records with CPU loads.
 2. **GCL8 is now implemented** in PR #164 (public slot 81, recorded/reset, CTest 9/9); the
-   builder's `+0x490` is `Barrier` (section 3.3), and its slot 148 needs an upload allocator (section 3.3a).
+   builder's `+0x490` is `Barrier` (section 3.3), and console list slot 148 (`AllocateUploadMemory(size, alignment)`)
+   is implemented in `runtime/shims/d3d12_xs_device.cpp` (`ListProxy::allocate_upload_memory` backs requests from
+   upload buffer chunks with >=16-byte power-of-2 alignment, `Reset` rewinds chunk offsets, and root CBV/SRV/UAV calls
+   translate returned CPU pointers to chunk GPU VAs; checked in `xs_proxy_mock_test`).
 3. **When the executable appears, trace the four creation calls first.** Per-slot counters on
    device slots 8/9/12/36, then queue slots 10/14/15, fence slots 8/9/10, and every slot beyond
    the public chain. The first `PresentX` call and the queue vtable tail are the only way to
