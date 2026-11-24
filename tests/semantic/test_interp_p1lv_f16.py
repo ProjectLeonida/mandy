@@ -3,7 +3,7 @@
 Covers the remaining 16-bit interpolation behaviour in tools/rdna2spirv.py not exercised by
 test_interp_f16.py (clamp), test_interp_f16_high.py (p1ll low/high), or test_f16_interp_fallback.py:
 - v_interp_p1lv_f16: PerVertexKHR low/high half decoding, standalone f32 intermediate, paired v_interp_p2_f16
-  f16 narrowing and VOP3 clamp, nearest-even tie rounding, SV_Position ISG1 layout coexistence,
+  f16 narrowing (toward zero, SHADER-468) and VOP3 clamp, tie rounding, SV_Position ISG1 layout coexistence,
   --f16-interp-fallback (F16_HALVES) execution and location-clash rejection, and SPIR-V negative controls.
 - --bary-fallback (BARY_FALLBACK) with v_interp_p1ll_f16, v_interp_p1lv_f16, and v_interp_p2_f16: omits
   PerVertexKHR / BaryCoordKHR, reads ordinary smooth vec4 inputs (where `high` cannot be distinguished),
@@ -14,6 +14,7 @@ test_interp_f16.py (clamp), test_interp_f16_high.py (p1ll low/high), or test_f16
 """
 from __future__ import annotations
 
+import bisect
 import math
 import os
 import re
@@ -113,22 +114,44 @@ def compute_perspective_barycentrics(l0: float, l1: float, l2: float,
     return f32_round(i_persp), f32_round(j_persp)
 
 
+# All non-negative finite f16 values in bit order (0x0000..0x7BFF); index == bit pattern.
+_F16_POS = [struct.unpack("<e", struct.pack("<H", b))[0] for b in range(0x7C00)]
+
+
+def f16_rtz_bits(val: float) -> int:
+    """Narrow ``val`` to f16 bits toward zero, as v_interp_p2_f16 does on RDNA2 (SHADER-468: the SPI's
+    narrowing follows MODE.FP16_ROUND, which AMD's compilers set toward zero around the interp pair)."""
+    if math.isnan(val):
+        return 0x7E00
+    if math.isinf(val):
+        return 0x7C00 | (0x8000 if val < 0 else 0)
+    sign = 0x8000 if val < 0 else 0
+    a = abs(val)
+    if a >= 65520.0:
+        return sign | 0x7BFF            # f16_bits(rtz=True) saturates finite overflow at 65504
+    i = bisect.bisect_right(_F16_POS, a) - 1
+    return sign | (i if i >= 0 else 0)   # below the smallest subnormal: signed zero
+
+
 def v_interp_p1lv_f16_ref(i_coord: float, p0: float, p1: float) -> float:
-    """Reference oracle for v_interp_p1lv_f16: D = P0 + i * (P1 - P0) in f32 intermediate precision."""
-    d1 = f32_round(p1 - p0)
+    """Reference oracle for v_interp_p1lv_f16: D = P0 + i * P10 in f32 intermediate precision, where P10 is
+    the SPI's per-half f16 difference P1 - P0 rounded to nearest even (SHADER-468)."""
+    d1 = f16_round(f32_round(p1 - p0))
     m1 = f32_round(d1 * i_coord)
     return f32_round(p0 + m1)
 
 
-def v_interp_p2_f16_ref(j_coord: float, p0: float, p2: float,
-                        p1_accum: float, clamp: bool = False) -> int:
-    """Reference oracle for v_interp_p2_f16: D = p1_accum + j * (P2 - P0), optional clamp, narrowed to f16 bits."""
-    d2 = f32_round(p2 - p0)
-    m2 = f32_round(d2 * j_coord)
-    res_f32 = f32_round(p1_accum + m2)
+def v_interp_p2_f16_ref(i_coord: float, j_coord: float, p0: float, p1: float, p2: float,
+                        clamp: bool = False) -> int:
+    """Reference oracle for v_interp_p2_f16 as translated (SHADER-468): the P10/P20 deltas are f16 differences,
+    P0 + i*P10 + j*P20 is summed in f32, an optional clamp applies, and the result narrows toward zero."""
+    d1 = f16_round(f32_round(p1 - p0))
+    d2 = f16_round(f32_round(p2 - p0))
+    s = f32_round(p0 + f32_round(d1 * i_coord))
+    res_f32 = f32_round(s + f32_round(d2 * j_coord))
     if clamp:
         res_f32 = max(0.0, min(1.0, res_f32))
-    return f16_to_bits(res_f32)
+    return f16_rtz_bits(res_f32)
 
 
 def v_interp_p1lv_eval_ref(i_coord: float, j_coord: float,
@@ -136,7 +159,7 @@ def v_interp_p1lv_eval_ref(i_coord: float, j_coord: float,
                            clamp: bool = False) -> tuple[float, int]:
     """Evaluate paired v_interp_p1lv_f16 and v_interp_p2_f16: returns (f32_intermediate, f16_bits)."""
     p1_accum = v_interp_p1lv_f16_ref(i_coord, p0, p1)
-    p2_res = v_interp_p2_f16_ref(j_coord, p0, p2, p1_accum, clamp=clamp)
+    p2_res = v_interp_p2_f16_ref(i_coord, j_coord, p0, p1, p2, clamp=clamp)
     return p1_accum, p2_res
 
 
@@ -291,11 +314,12 @@ class InterpP1lvF16DefaultTests(unittest.TestCase):
         words_raw = support.mrt0_words(spv_raw, inputs=support.varyings(spv_raw, attrs, BARY))
         self.assertEqual([w & 0xFFFF for w in words_raw[:3]], [f16_bits(1.5), f16_bits(-0.25), 0x3800])
 
-    def test_p1lv_nearest_even_rounding_and_subnormal_f16(self):
-        # Midpoint ties:
-        # 1.0 (0x3c00) and 1.0 + 2^-10 (0x3c01) averaged at (0.5, 0.5, 0.0) -> 1.0 + 2^-11 -> 0x3c00 (even)
-        # 1.0 + 2^-10 (0x3c01) and 1.0 + 2^-9 (0x3c02) averaged -> 1.0 + 3*2^-11 -> 0x3c02 (even)
-        # Subnormals 0x0002 and 0x0004 averaged -> 0x0003 (subnormal preserved by f16_bits)
+    def test_p1lv_toward_zero_rounding_and_subnormal_f16(self):
+        # Midpoint ties (v_interp_p2_f16 narrows toward zero on RDNA2, SHADER-468):
+        # 1.0 (0x3c00) and 1.0 + 2^-10 (0x3c01) averaged at (0.5, 0.5, 0.0) -> 1.0 + 2^-11 -> 0x3c00
+        # 1.0 + 2^-10 (0x3c01) and 1.0 + 2^-9 (0x3c02) averaged -> 1.0 + 3*2^-11 -> 0x3c01 (toward zero;
+        #   nearest even would give 0x3c02)
+        # Subnormals 0x0002 and 0x0004 averaged -> 0x0003 (subnormal preserved)
         lines = [
             "v_mov_b32_e32 v10, 0",
             "v_interp_p1lv_f16 v2, v0, attr0.x, v10",
@@ -317,7 +341,7 @@ class InterpP1lvF16DefaultTests(unittest.TestCase):
         ]
         spv, _ = translate_with_flags("ps_p1lv_ties", lines, dxbc=PS_ATTR01_DXBC)
         words = support.mrt0_words(spv, inputs=support.varyings(spv, {0: attr0}, (0.5, 0.5, 0.0)))
-        self.assertEqual([w & 0xFFFF for w in words[:3]], [0x3C00, 0x3C02, 0x0003])
+        self.assertEqual([w & 0xFFFF for w in words[:3]], [0x3C00, 0x3C01, 0x0003])
 
     def test_p1lv_with_sv_position_in_isg1(self):
         # SV_Position at ISG1 reg 0 occupies v2..v5; v_interp_p1lv_f16 reads v0 and vsrc2=v10 without conflict.
@@ -684,7 +708,7 @@ class SimdWaveInterpP1lv:
       - EXEC mask (32-bit or 64-bit) gating lane evaluation and register writes.
       - Inactive lane preservation: disabled lanes keep their prior VGPR state.
       - v_interp_p1lv_f16: evaluates first-axis perspective interpolation intermediate in f32.
-      - v_interp_p2_f16: accumulates second axis, applies optional clamp, narrows to f16 (nearest-even).
+      - v_interp_p2_f16: accumulates second axis, applies optional clamp, narrows to f16 (toward zero, SHADER-468).
     """
 
     def __init__(self, wave_size: int = 32, exec_mask: int | None = None):
@@ -695,6 +719,7 @@ class SimdWaveInterpP1lv:
         self.exec_mask = self.mask_all if exec_mask is None else (exec_mask & self.mask_all)
         self.sgprs = [0] * 128
         self.vgprs = [[0] * 256 for _ in range(wave_size)]
+        self._lane_i = [0.0] * wave_size
 
     def is_lane_active(self, lane: int) -> bool:
         return bool((self.exec_mask >> lane) & 1)
@@ -716,6 +741,7 @@ class SimdWaveInterpP1lv:
             if not self.is_lane_active(lane):
                 continue
             i_coord = bits_to_f32(self.vgprs[lane][vsrc_i])
+            self._lane_i[lane] = i_coord
             accum_f32 = v_interp_p1lv_f16_ref(i_coord, p0, p1)
             self.vgprs[lane][vdst] = f32_to_bits(accum_f32)
 
@@ -725,14 +751,13 @@ class SimdWaveInterpP1lv:
                         high: bool = False, clamp: bool = False):
         """Execute v_interp_p2_f16 across all active SIMD lanes."""
         vals = [unpack_f16_halves(p)[1 if high else 0] for p in attr_packed]
-        p0, p2 = vals[0], vals[2]
+        p0, p1, p2 = vals[0], vals[1], vals[2]
 
         for lane in range(self.wave_size):
             if not self.is_lane_active(lane):
                 continue
             j_coord = bits_to_f32(self.vgprs[lane][vsrc_j])
-            accum_f32 = bits_to_f32(self.vgprs[lane][partial_src])
-            res_bits = v_interp_p2_f16_ref(j_coord, p0, p2, accum_f32, clamp=clamp)
+            res_bits = v_interp_p2_f16_ref(self._lane_i[lane], j_coord, p0, p1, p2, clamp=clamp)
             self.vgprs[lane][vdst] = res_bits
 
 
