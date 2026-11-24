@@ -248,7 +248,7 @@ struct MockReplay {
             helper(false, false, p, f, n, b, off);
         };
         v.sum_statistics = [helper](VkCommandBuffer, VkQueryPool p, VkQueryPool, VkQueryPool, const std::uint8_t*,
-            unsigned f, unsigned n, VkBuffer b, VkDeviceSize off) {
+            unsigned f, unsigned n, VkBuffer b, VkDeviceSize off, bool) {
             helper(true, false, p, f, n, b, off);
         };
         v.resolve_binary_occlusion = [helper](VkCommandBuffer, VkQueryPool p, unsigned f, unsigned n, VkBuffer b,

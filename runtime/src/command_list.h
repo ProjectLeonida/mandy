@@ -201,9 +201,11 @@ constexpr bool query_fits_heap(std::uint32_t heap_type, std::uint32_t query_type
     }
 }
 
-// Bytes one resolved query takes: a UINT64 for occlusion and timestamps, D3D12_QUERY_DATA_PIPELINE_STATISTICS
-// (11 UINT64s) for pipeline statistics, D3D12_QUERY_DATA_SO_STATISTICS (2 UINT64s) for stream output. 0 for the
-// types this layer does not resolve.
+constexpr bool is_pipeline_statistics(std::uint32_t query_type) {
+    return query_type == d3d12_query::pipeline_statistics || query_type == d3d12_query::pipeline_statistics1;
+}
+
+// Bytes one resolved query takes. 0 for the types this layer does not resolve.
 constexpr std::uint32_t query_result_size(std::uint32_t query_type) {
     namespace q = d3d12_query;
     switch (query_type) {
@@ -211,6 +213,7 @@ constexpr std::uint32_t query_result_size(std::uint32_t query_type) {
     case q::binary_occlusion:
     case q::timestamp: return 8;
     case q::pipeline_statistics: return 11 * 8;
+    case q::pipeline_statistics1: return 14 * 8;
     // D3D12_QUERY_DATA_SO_STATISTICS: NumPrimitivesWritten, PrimitivesStorageNeeded.
     case q::so_statistics_stream0:
     case q::so_statistics_stream0 + 1:

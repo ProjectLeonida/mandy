@@ -2,28 +2,29 @@
 
 // Adds the D3D12_QUERY_DATA_PIPELINE_STATISTICS segments of one split pipeline-statistics query (D3D-162): one
 // invocation per counter, in the order of VkQueryPipelineStatisticFlagBits, which is the D3D12 field order.
-// `mesh` segments come from the pool a mesh draw can run in (D3D-291), which counts only the fragment and compute
-// invocations: they are copied to counters 7 and 8 of their record, so PSInvocations takes the fragment one and
-// CSInvocations the compute one, and every other counter adds nothing.
-// The clipping invocations of a mesh segment come from the mesh-primitives count of that segment, copied to
-// counter 5 (D3D-MESH-CLIPPING-COUNTER); without that count the field stays 0.
-layout(local_size_x = 11) in;
+// Mesh segments place the fragment, compute and optional mesh invocations in consecutive slots 7..9. Slot 5
+// holds the mesh-primitives count for both clipping invocations and MSPrimitives. No task stage is supported.
+layout(local_size_x = 14) in;
 layout(set = 0, binding = 0, std430) buffer QueryResults {
-    uvec2 total[11];
-    uvec2 segments[];  // `count` results of 11 counters each
+    uvec2 words[];  // totals followed by count segments, all with the same width
 };
-layout(push_constant) uniform ResolveRange { uint count; uint mesh; };
+layout(push_constant) uniform ResolveRange { uint count; uint flags; };
 
 void main() {
     const uint counter = gl_LocalInvocationID.x;
-    uvec2 sum = total[counter];
-    const bool counted = mesh == 0u || counter == 5u || counter == 7u || counter == 10u;
-    const uint source = mesh != 0u && counter == 10u ? 8u : counter;
+    const bool mesh = (flags & 1u) != 0u;
+    const uint width = (flags & 2u) != 0u ? 14u : 11u;
+    if (counter >= width) return;
+    uvec2 sum = words[counter];
+    const bool counted = mesh ? counter == 5u || counter == 7u || counter == 10u ||
+                               counter == 12u || counter == 13u : counter < 11u;
+    const uint source = !mesh ? counter : counter == 10u ? 8u : counter == 12u ? 9u :
+                        counter == 13u ? 5u : counter;
     for (uint i = 0; counted && i < count; ++i) {
-        uvec2 segment = segments[i * 11 + source];
+        uvec2 segment = words[(i + 1u) * width + source];
         uint low = sum.x + segment.x;
         sum.y += segment.y + uint(low < sum.x);
         sum.x = low;
     }
-    total[counter] = sum;
+    words[counter] = sum;
 }

@@ -891,7 +891,7 @@ struct ReplayFunctions {
     // meshShaderQueries.
     std::function<void(VkCommandBuffer, VkQueryPool, VkQueryPool mesh_pool, VkQueryPool primitives_pool,
                        const std::uint8_t* mesh, std::uint32_t first, std::uint32_t count, VkBuffer dst,
-                       VkDeviceSize offset)>
+                       VkDeviceSize offset, bool extended)>
         sum_statistics;
     // Sums `count` binary-occlusion segments and normalizes the total to a 64-bit 0 or 1, outside conditional
     // rendering: a binary query split over physical segments because it overlaps other occlusion queries (D3D-252).
@@ -2449,13 +2449,13 @@ inline void plan_statistics_segments(PreparedList& out) {
                 inner.push_back({&query.statistics_end, &query.statistics_begin, -1});
                 splits = true;
             }
-        } else if (range.type == d3d12_query::pipeline_statistics) {
+        } else if (is_pipeline_statistics(range.type)) {
             if (std::holds_alternative<BeginQuery>(command)) {
                 begin = &query;
                 inner.clear();
                 splits = mesh = false;
             } else if (begin) {
-                if (splits || mesh) {
+                if (splits || mesh || range.type == d3d12_query::pipeline_statistics1) {
                     const std::uint32_t first = out.statistics_segment_count;
                     const auto open = [&] {
                         out.statistics_mesh.push_back(0);
@@ -2540,7 +2540,7 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
         const auto range = query_range(command);
         if (!std::holds_alternative<ResolveQueries>(command)) {
             // A Begin or End of another query kind leaves the shared segment alone.
-            if (range.type != d3d12_query::pipeline_statistics) continue;
+            if (!is_pipeline_statistics(range.type)) continue;
             query->statistics_end = current;
             const auto key = std::pair{range.heap, range.first};
             if (std::holds_alternative<BeginQuery>(command)) {
@@ -3276,6 +3276,8 @@ public:
                     if (command.statistics_end != detail::PreparedQuery::no_segment)
                         return ReplayResult::unsupported;
                 for (auto& query : list.queries) {
+                    if (query_range(list.list->commands()[query.command]).type == d3d12_query::pipeline_statistics1)
+                        return ReplayResult::unsupported;
                     query.statistics_end = query.statistics_begin = detail::PreparedQuery::no_segment;
                     query.statistics_count = 0;
                 }
@@ -3296,7 +3298,8 @@ public:
             } else {
                 const auto& resolve = std::get<ResolveQueries>(command);
                 const bool binary = resolve.type == d3d12_query::binary_occlusion;
-                const bool statistics = resolve.type == d3d12_query::pipeline_statistics;
+                const bool statistics = is_pipeline_statistics(resolve.type);
+                const bool extended = resolve.type == d3d12_query::pipeline_statistics1;
                 // A helper dispatch inside an unsplit statistics query would count in the application's
                 // CSInvocations.
                 const bool uncounted = !query.statistics_active ||
@@ -3316,11 +3319,11 @@ public:
                         const auto& saved = value.occlusion;
                         const std::uint8_t* kinds = saved.segments->mesh.empty() ? nullptr
                                                                                  : saved.segments->mesh.data();
-                        // A mesh segment's four counters go through the sum to land in their D3D12 fields.
+                        // Repack mesh counters and widen the extended results even when there is only one segment.
                         const bool any_mesh = kinds && std::find(kinds + saved.first, kinds + saved.first + saved.count,
                                                                  std::uint8_t(1)) != kinds + saved.first + saved.count;
                         run = {saved.segments->pool, saved.first, saved.count, run.offset,
-                               saved.count > 1 || any_mesh, saved.segments->mesh_pool,
+                               saved.count > 1 || any_mesh || extended, saved.segments->mesh_pool,
                                saved.segments->primitives_pool, kinds};
                         if (any_mesh && !statistics) return ReplayResult::invalid_query;
                         if (!can_sum || (run.sum && !uncounted)) return ReplayResult::unsupported;
@@ -3328,6 +3331,8 @@ public:
                         else if (binary) (run.sum ? needs_sum_binary : needs_binary) = true;
                         else needs_sum |= run.sum;
                         retain(saved.segments);
+                    } else if (extended && value.ended) {
+                        return ReplayResult::unsupported;
                     }
                     if (!query.resolves.empty() && !run.sum && run.count == 1) {
                         auto& last = query.resolves.back();
@@ -3464,9 +3469,9 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
         for (const auto& run : query.resolves) {
             if (!run.pool) {
                 vk.fill_buffer(cb, dst, run.offset, VkDeviceSize(run.count) * size, 0);
-            } else if (run.sum && resolve.type == d3d12_query::pipeline_statistics) {
+            } else if (run.sum && is_pipeline_statistics(resolve.type)) {
                 vk.sum_statistics(cb, run.pool, run.mesh_pool, run.primitives_pool, run.mesh, run.first, run.count,
-                                  dst, run.offset);
+                                  dst, run.offset, resolve.type == d3d12_query::pipeline_statistics1);
             } else if (run.sum && binary) {
                 vk.sum_binary_occlusion(cb, run.pool, run.first, run.count, dst, run.offset);
             } else if (run.sum || binary) {

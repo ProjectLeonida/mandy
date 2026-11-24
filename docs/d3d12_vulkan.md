@@ -3253,8 +3253,13 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   `PIPELINE_STATISTICS` heaps count all eleven Vulkan statistics (`0x7ff`), whose result order is the field order
   of `D3D12_QUERY_DATA_PIPELINE_STATISTICS` (IA vertices, IA primitives, VS, GS invocations, GS primitives,
   clipper invocations and primitives, PS, HS, DS, CS), so one 88-byte result per query is copied as is. They need
-  `pipelineStatisticsQuery`. `VIDEO_DECODE_STATISTICS` and `PIPELINE_STATISTICS1` (mesh and amplification counts)
-  are logged and refused with `E_NOTIMPL`. Invalid descriptions are answered as the host runtime answers them
+  `pipelineStatisticsQuery`. Where the device also enables `meshShaderQueries`, `PIPELINE_STATISTICS1` resolves
+  the same counters followed by amplification invocations, mesh invocations and mesh primitives (112 bytes).
+  The overlapping-query planner uses the same segments for either result layout. The Vulkan mesh invocation
+  and generated-primitives queries supply the two mesh counters. Amplification invocations are zero because
+  the layer cannot create an amplification shader PSO. `OPTIONS9.MeshShaderPipelineStatsSupported` reports
+  whether the extended query is available. `VIDEO_DECODE_STATISTICS` is refused with `E_NOTIMPL`.
+  Invalid descriptions are answered as the host runtime answers them
   (`compare_invalid_arguments`, "query heap:", RTX 5070 / 621.14): `E_INVALIDARG` for no queries, a node other than
   node 0, or a type past `PIPELINE_STATISTICS1` (7), checked before the output; a valid description with a null
   output is then `E_UNEXPECTED`, not `S_FALSE`.
@@ -3386,11 +3391,7 @@ Not implemented yet:
 - **Overlapping queries in the single-list `replay()` helper.** It has no segment pool, so a list whose occlusion
   kinds or statistics queries overlap each other is refused there with `ReplayResult::unsupported`; the batched
   path above replays them.
-- Mesh-shader statistics (`PIPELINE_STATISTICS1`, D3D-132), and stream-output statistics that count real
-  primitives (they wait for stream output itself). (`GetClockCalibration` is implemented: see section 4.4,
-  "Fences, queues and frames in flight".)
-- Stream-output and mesh-shader statistics. (`GetClockCalibration` is implemented: see section 4.4, "Fences,
-  queues and frames in flight".)
+- Stream-output statistics that count real primitives (they wait for stream output itself).
 - Xbox-specific query heap types (if any) are **Open**; unknown types are logged.
 
 ### 4.7 Indirect commands and command signatures

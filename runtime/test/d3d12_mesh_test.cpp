@@ -415,12 +415,22 @@ int main() {
         // from a mesh-primitives query instead (D3D-MESH-CLIPPING-COUNTER): the number of primitives the mesh
         // shader emitted that reached the fragment shader. How many that is depends on the driver, so the counts
         // are compared with each other and not written down.
+        D3D12_FEATURE_DATA_D3D12_OPTIONS9 options9{};
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &options9, sizeof(options9))));
+        const D3D12_QUERY_HEAP_DESC extended_desc{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1, 2, 0};
+        const bool extended_supported = d.pipeline_statistics_query && d.mesh_shader_queries;
+        Ref<ID3D12QueryHeap> extended;
+        const HRESULT extended_result = device->CreateQueryHeap(&extended_desc, IID_PPV_ARGS(&extended.p));
+        EXPECT(extended_result == (extended_supported ? S_OK : E_NOTIMPL));
+        EXPECT(bool(extended.p) == extended_supported);
+        EXPECT(bool(options9.MeshShaderPipelineStatsSupported) == extended_supported);
         if (d.pipeline_statistics_query) {
             const D3D12_QUERY_HEAP_DESC statistics_desc{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 3, 0};
             Ref<ID3D12QueryHeap> statistics;
             EXPECT(SUCCEEDED(device->CreateQueryHeap(&statistics_desc, IID_PPV_ARGS(&statistics.p))));
             Ref<ID3D12Resource> results;
-            const auto results_desc = buffer_desc(3 * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS));
+            constexpr UINT64 extended_offset = 3 * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS);
+            const auto results_desc = buffer_desc(extended_offset + 2 * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1));
             EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &results_desc,
                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                              IID_PPV_ARGS(&results.p))));
@@ -445,19 +455,26 @@ int main() {
                 list6->DispatchMesh(x, y, 1);
             };
             list->BeginQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+            if (extended_supported) list->BeginQuery(extended.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS1, 0);
             vertex_draw();
             mesh_draw(2, 2);
             mesh_draw(1, 1);
             vertex_draw();
+            if (extended_supported) list->EndQuery(extended.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS1, 0);
             list->EndQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
             list->BeginQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 1);
             mesh_draw(2, 2);
             list->EndQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 1);
             list->BeginQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 2);
+            if (extended_supported) list->BeginQuery(extended.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS1, 1);
             vertex_draw();
             vertex_draw();
             list->EndQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 2);
+            if (extended_supported) list->EndQuery(extended.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS1, 1);
             list->ResolveQueryData(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 3, results.p, 0);
+            if (extended_supported)
+                list->ResolveQueryData(extended.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS1, 0, 2, results.p,
+                                       extended_offset);
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
@@ -466,6 +483,21 @@ int main() {
             void* stats_mapped = nullptr;
             EXPECT(SUCCEEDED(results->Map(0, nullptr, &stats_mapped)));
             std::memcpy(data, stats_mapped, sizeof(data));
+            if (extended_supported) {
+                D3D12_QUERY_DATA_PIPELINE_STATISTICS1 mesh_data[2]{};
+                std::memcpy(mesh_data, static_cast<const std::uint8_t*>(stats_mapped) + extended_offset,
+                            sizeof(mesh_data));
+                std::printf("statistics1, mixed: AS %llu MS %llu primitives %llu; vertex only: AS %llu MS %llu "
+                            "primitives %llu\n", mesh_data[0].ASInvocations, mesh_data[0].MSInvocations,
+                            mesh_data[0].MSPrimitives, mesh_data[1].ASInvocations, mesh_data[1].MSInvocations,
+                            mesh_data[1].MSPrimitives);
+                EXPECT(std::memcmp(&mesh_data[0], &data[0], sizeof(data[0])) == 0);
+                EXPECT(std::memcmp(&mesh_data[1], &data[2], sizeof(data[2])) == 0);
+                EXPECT(mesh_data[0].ASInvocations == 0 && mesh_data[0].MSInvocations == 5 * 32 &&
+                       mesh_data[0].MSPrimitives == 10);
+                EXPECT(mesh_data[1].ASInvocations == 0 && mesh_data[1].MSInvocations == 0 &&
+                       mesh_data[1].MSPrimitives == 0);
+            }
             results->Unmap(0, nullptr);
             const auto& mixed = data[0];
             const auto& mesh_only = data[1];
@@ -506,6 +538,7 @@ int main() {
 
         for (auto* r : {&upload, &readback, &target}) r->reset();
         for (auto* p : {&mesh_pso, &vs_pso, &refused}) p->reset();
+        extended.reset();
         root.reset();
         rtv_heap.reset();
         list6.reset();

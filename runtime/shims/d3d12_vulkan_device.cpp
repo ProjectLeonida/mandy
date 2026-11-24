@@ -4990,6 +4990,9 @@ public:
             // counts 0 written and 0 needed. That needs no Vulkan pool: Begin/EndQuery run nothing and a resolve fills zeros. When stream
             // output lands, this becomes a VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool (D3D-302).
             return register_pool(desc);
+        case h::pipeline_statistics1:
+            if (!device_.info.mesh_pipeline_statistics()) return E_NOTIMPL;
+            [[fallthrough]];
         case h::pipeline_statistics:
             if (!device_.info.pipeline_statistics_query) {
                 log_once("pipeline-statistics query heap: pipelineStatisticsQuery not enabled; type", desc.Type);
@@ -4999,7 +5002,7 @@ public:
             info.pipelineStatistics = kPipelineStatistics;
             break;
         default:
-            // Video decode and mesh-shader statistics (PIPELINE_STATISTICS1) have no path yet.
+            // Video decode statistics have no path yet.
             log_once("query heap type not supported:", desc.Type);
             return E_NOTIMPL;
         }
@@ -7738,8 +7741,7 @@ public:
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7*>(data);
             *opts = {};
             // Tier 1 is mesh PSOs and DispatchMesh, on VK_EXT_mesh_shader. Amplification shaders are part of the tier
-            // but refused at PSO creation (the game has none); OPTIONS9's mesh statistics and full-range render
-            // target array index stay FALSE.
+            // but refused at PSO creation (the game has none).
             opts->MeshShaderTier =
                 state_.info.mesh_shader ? D3D12_MESH_SHADER_TIER_1 : D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
             opts->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
@@ -7749,7 +7751,7 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS9)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9*>(data);
             *opts = {};
-            opts->MeshShaderPipelineStatsSupported = FALSE;
+            opts->MeshShaderPipelineStatsSupported = state_.info.mesh_pipeline_statistics();
             opts->MeshShaderSupportsFullRangeRenderTargetArrayIndex = FALSE;
             opts->AtomicInt64OnTypedResourceSupported = FALSE;
             opts->AtomicInt64OnGroupSharedSupported = FALSE;
