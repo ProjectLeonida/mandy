@@ -37,6 +37,7 @@ from check import SIGNED_MIP_TEST, UINT_MIP_TEST
 from check import cbv_modulate_test
 from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
 from check import shift64_test   # dynamic 64-bit vector shifts and overlapping destinations
+from check import cmp_f64_test   # the 32 binary64 vector compares on memory-fed operands
 from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
@@ -1000,6 +1001,10 @@ def run_suite(a, work: str) -> int:
             detail = shift64_test(a.build, spirv_dir, cs_env)
             results.append((name, None if isinstance(detail, Skip) else not detail,
                             detail or "640 words exact (64 shift cases and unchanged inputs)"))
+        elif name == "cs_w32_cmp_f64":
+            detail = cmp_f64_test(a.build, spirv_dir, cs_env)
+            results.append((name, None if isinstance(detail, Skip) else not detail,
+                            detail or "1536 words exact (256 operand pairs and unchanged inputs)"))
         elif name == "cs_workgroup_yz":
             rc, msg = run_cmd([vk_compute, spv, "2x3x4", "workgroup_yz"], env=cs_env)
             results.append((name,) + compute_result(rc, msg, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches"

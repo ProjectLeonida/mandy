@@ -387,6 +387,68 @@ def shift64_test(tools, spirv, env=None):
         return dump_test(tools, spirv, "cs_w32_shift64", expected, len(expected), child)
 
 
+# cs_w32_cmp_f64.asm: the 16 binary64 compare predicates in opcode order (bit n of a result word is predicate n), and
+# the operand values every pair is drawn from, in ascending order and then two NaNs.
+CMP_F64_PREDICATES = ("f", "lt", "eq", "le", "gt", "lg", "ge", "o",
+                      "u", "nge", "nlg", "ngt", "nle", "neq", "nlt", "tru")
+CMP_F64_VALUES = (
+    0xFFF0000000000000,   # -inf
+    0xFFEFFFFFFFFFFFFF,   # -max
+    0xBFF0000000000001,   # -1 - 1 ulp
+    0xBFF0000000000000,   # -1
+    0xBFEFFFFFFFFFFFFF,   # the value above -1: its high dword is the smaller one, its low dword all ones
+    0x8000000000000001,   # the negative smallest subnormal
+    0x8000000000000000,   # -0
+    0x0000000000000000,   # +0
+    0x0000000000000001,   # the smallest subnormal
+    0x0010000000000000,   # the smallest normal
+    0x3FF0000000000000,   # 1
+    0x3FF0000000000001,   # 1 + 1 ulp
+    0x7FEFFFFFFFFFFFFF,   # +max
+    0x7FF0000000000000,   # +inf
+    0x7FF0000000000001,   # a NaN whose payload is only in the low dword: its high dword is +inf's
+    0xFFF8000000000000)   # a negative quiet NaN
+CMP_F64_SIGN = 1 << 63
+
+
+def cmp_f64_predicates(a_bits, b_bits):
+    """The 16 results of comparing two binary64 bit patterns, as a mask with bit n for CMP_F64_PREDICATES[n].
+    IEEE-754 through Python floats: a pair with a NaN is unordered, so lt, eq and gt are all false for it and every
+    negated predicate is true; -0 equals +0 and a subnormal is not zero."""
+    a, b = (struct.unpack("<d", struct.pack("<Q", bits))[0] for bits in (a_bits, b_bits))
+    unordered = a != a or b != b
+    lt, eq, gt = a < b, a == b, a > b
+    results = (False, lt, eq, lt or eq, gt, lt or gt, gt or eq, not unordered,
+               unordered, not (gt or eq), not (lt or gt), not gt, not (lt or eq), not eq, not lt, True)
+    return sum(1 << bit for bit, result in enumerate(results) if result)
+
+
+def cmp_f64_words():
+    """cs_w32_cmp_f64: the input heap and the full expected readback, with Python floats as the oracle. Record
+    16 * ia + ib compares value ia with value ib. Thread i handles records i and i + 128, so a record's thread has
+    the record's parity."""
+    inputs, results = [], []
+    for record, (a, b) in enumerate((a, b) for a in CMP_F64_VALUES for b in CMP_F64_VALUES):
+        inputs.extend((a & 0xFFFFFFFF, a >> 32, b & 0xFFFFFFFF, b >> 32))
+        word = cmp_f64_predicates(a, b)
+        word |= (record % 2 == 0) << 16     # tru with the odd threads turned off first
+        word |= (cmp_f64_predicates(a & ~CMP_F64_SIGN, b ^ CMP_F64_SIGN) >> 1 & 1) << 17    # lt of |a| and -b
+        word |= (cmp_f64_predicates(a ^ CMP_F64_SIGN, b & ~CMP_F64_SIGN) >> 9 & 1) << 18    # nge of -a and |b|
+        results.extend((word, word))        # the v_cmp_ word (VCC), then the v_cmpx_ word (EXEC)
+    return [0xEEEEEEEE] * len(results) + inputs, results + inputs
+
+
+def cmp_f64_test(tools, spirv, env=None):
+    """Verify the 32 binary64 compares on 256 memory-fed operand pairs, including the untouched input records."""
+    initial, expected = cmp_f64_words()
+    with tempfile.TemporaryDirectory(prefix="leonida-cmp-f64-") as tmp:
+        path = Path(tmp) / "input.bin"
+        path.write_bytes(struct.pack(f"<{len(initial)}I", *initial))
+        child = dict(os.environ if env is None else env, VKC_HEAP_INIT=str(path))
+        child.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_w32_cmp_f64") or 32))
+        return dump_test(tools, spirv, "cs_w32_cmp_f64", expected, len(expected), child)
+
+
 # cs_user_sgprs.asm: vk_compute_test puts these words in s4..s7 and the shader stores them back.
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
@@ -1883,6 +1945,7 @@ def main():
     results.append(("cs_heap_init", compute_test(tools, spirv, "cs_heap_init", "1", "dump",
                                                  expected_words=HEAP_INIT_EXPECTED, env=heap_init_env())))
     results.append(("cs_w32_shift64", shift64_test(tools, spirv)))
+    results.append(("cs_w32_cmp_f64", cmp_f64_test(tools, spirv)))
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
     results.append(("cs_fma_fused", fma_fused_test(tools, spirv)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",

@@ -239,7 +239,7 @@ Current limits, by design:
 ### What `xgameruntime.dll` reports: environment overrides
 
 The `xgameruntime` shim (`shims/xgameruntime.cpp`) answers the title's questions about the console and its package
-with fixed values. Five environment variables change an answer, for trying another of the title's code paths. Each
+with fixed values. Six environment variables change an answer, for trying another of the title's code paths. Each
 is read on every call, and a value that is empty or too long for its buffer is ignored.
 `tests/test_docs_env_vars.py` fails when the runtime or `make_game.py` reads a `LEONIDA_*` variable that no
 document names.
@@ -251,6 +251,7 @@ document names.
 | `LEONIDA_PACKAGE_ID` | `LeonidaPackageIdentifier00000000` | The identifier `XPackageGetCurrentProcessPackageIdentifier` returns (up to 32 characters). It is also the one identifier `XPackageMount` refuses with `E_ACCESSDENIED`, as the game's own package. |
 | `LEONIDA_CONTENT_PACKAGES` | unset | The content packages `XPackageMount` can mount: `id1=path1;id2=path2` (up to 1,023 characters). The mount path of a listed identifier is its path, as written; any other identifier is `ERROR_NOT_FOUND`, and a path longer than 259 characters is `ERROR_INSUFFICIENT_BUFFER`. |
 | `LEONIDA_PACKAGED` | `1` | `0`, or text that is not a number, makes `XPackageIsPackagedProcess` return false. Any other number keeps it true. |
+| `LEONIDA_TITLE_MEMORY_MB` | unset | Caps the title memory limit (in MiB, clamped to `2048..65536`) reported by both `XSystemGetAppMemoryUsageLimit` (`xgameruntime.cpp`) and `XMemGetWorkingSetStatistics` (`xmem.cpp`). Useful on 16 GB RAM / low-VRAM hosts to prevent oversized title pools; invalid or non-positive values are ignored and fall back to the host memory report. |
 
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own

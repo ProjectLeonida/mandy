@@ -294,6 +294,16 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 out->VisibleNodeMask = kHeapMarker;
                 return a1;  // a struct-returning method hands the buffer's address back in RAX
             }
+            case 41:                                                        // CreateCommandSignature(desc, ...)
+                if (const auto* desc = reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1)) {
+                    m->array[41][0] = desc->ByteStride | std::uint64_t{desc->NumArgumentDescs} << 32;
+                    for (UINT i = 0; desc->pArgumentDescs && i < desc->NumArgumentDescs && i < 3; ++i) {
+                        std::uint32_t type = 0;  // read as its 32 bits: a console type is outside the enum's range
+                        std::memcpy(&type, &desc->pArgumentDescs[i].Type, sizeof(type));
+                        m->array[41][i + 1] = type;
+                    }
+                }
+                break;
             case 50: copy_array(m, slot, a3, a2); break;                    // (flags, count, objects, fence, value)
             case 13: {  // CheckFeatureSupport(feature, data, size): FEATURE_LEVELS only, as the host answers it
                 auto* levels = reinterpret_cast<D3D12_FEATURE_DATA_FEATURE_LEVELS*>(a2);
@@ -1066,7 +1076,9 @@ int check_allocators() {
     return 0;
 }
 
-// ---- 7. Xbox device slots from the public HLE (48, 73, 78, 79, 80) ----
+
+
+// ---- 7. Xbox device slots from the public HLE (48, 73, 78, 79, 80) and the retail title (41) ----
 //
 // A device that answers ID3D12Device11 (80 PC slots) is the Vulkan layer's shape: slots 78/79 are inside its table
 // (CreateReservedResource2/CreateSampler2 there) and 80 is just past it. None of the five may reach the mock's own
@@ -1134,14 +1146,67 @@ int check_xbox_slots() {
     EXPECT(hr_of(raw(device, 73, word(&desc), 0, 0, word(&list_iid), word(&list))) == E_INVALIDARG);
     EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), 0)) == E_POINTER);
 
-    EXPECT(xs::device_slot_overridden(48) && xs::device_slot_overridden(73) && xs::device_slot_overridden(78) &&
-           xs::device_slot_overridden(79) && xs::device_slot_overridden(80));
+    // 41 CreateCommandSignature: a console argument of type 105 reaches the PC slot 41 as DISPATCH, in a copy of the
+    // description (stride, count, the root argument before it and the root signature kept). A PC description is
+    // passed as the same pointer.
+    D3D12_INDIRECT_ARGUMENT_DESC console_args[2]{};
+    console_args[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    console_args[0].Constant.Num32BitValuesToSet = 1;
+    constexpr std::uint32_t kType105 = 105;  // outside the enum's range: written and read as its 32 bits
+    std::memcpy(&console_args[1].Type, &kType105, sizeof(kType105));
+    const D3D12_COMMAND_SIGNATURE_DESC console_sig{16, 2, console_args, 0};
+    const IID sig_iid = __uuidof(ID3D12CommandSignature);
+    void* sig = nullptr;
+    EXPECT(hr_of(raw(device, 41, word(&console_sig), 0x5150, word(&sig_iid), word(&sig))) == S_OK);
+    EXPECT(mock->calls[41] == 1 && xs::device_slot_hits(41) == 1);
+    EXPECT(mock->args[41][0] != word(&console_sig) && mock->args[41][1] == 0x5150);
+    EXPECT(mock->args[41][2] == word(&sig_iid) && mock->args[41][3] == word(&sig));
+    EXPECT(mock->array[41][0] == (16 | std::uint64_t{2} << 32));
+    EXPECT(mock->array[41][1] == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT &&
+           mock->array[41][2] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH);
+    std::uint32_t caller_type = 0;
+    std::memcpy(&caller_type, &console_args[1].Type, sizeof(caller_type));
+    EXPECT(caller_type == kType105);  // the caller's description is untouched
+    D3D12_INDIRECT_ARGUMENT_DESC pc_arg{};
+    pc_arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+    const D3D12_COMMAND_SIGNATURE_DESC pc_sig{12, 1, &pc_arg, 0};
+    EXPECT(hr_of(raw(device, 41, word(&pc_sig), 0, word(&sig_iid), word(&sig))) == S_OK);
+    EXPECT(mock->calls[41] == 2 && mock->args[41][0] == word(&pc_sig));
+    EXPECT(mock->array[41][1] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH);
+
+    // 61 is CreateSamplerX(desc, dest) for the title and the PC CreateMetaCommand for a host caller. With no
+    // console-caller check installed (a host program like this one), the call is the PC slot 61.
+    D3D12_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    const std::uint64_t sampler_handle = 0x7ff012340040ull;
+    raw(device, 61, word(&sampler), sampler_handle);
+    EXPECT(mock->calls[61] == 1 && mock->calls[22] == 0 && xs::device_slot_hits(61) == 1);
+    // A caller the check calls the title's (here every one): the PC CreateSampler (slot 22) gets the same two words,
+    // not the PC slot 61. A null description is skipped without reaching the device.
+    xs::set_console_caller([](std::uint64_t) { return true; });
+    raw(device, 61, word(&sampler), sampler_handle);
+    EXPECT(mock->calls[61] == 1 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 2);
+    EXPECT(mock->args[22][0] == word(&sampler) && mock->args[22][1] == sampler_handle);
+    raw(device, 61, 0, sampler_handle);
+    EXPECT(mock->calls[61] == 1 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 3);
+    // A caller outside the title's images is a host one again.
+    xs::set_console_caller([](std::uint64_t) { return false; });
+    raw(device, 61, word(&sampler), sampler_handle);
+    EXPECT(mock->calls[61] == 2 && mock->calls[22] == 1);
+    xs::set_console_caller(nullptr);
+
+    EXPECT(xs::device_slot_overridden(41) && xs::device_slot_overridden(48) && xs::device_slot_overridden(61) &&
+           xs::device_slot_overridden(73) &&
+           xs::device_slot_overridden(78) && xs::device_slot_overridden(79) && xs::device_slot_overridden(80));
 
     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
     EXPECT(release(queue) == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
-    std::printf("%s: device slots 48/73/78/79/80 route to a queue, a list and frame-event tokens without reaching "
-                "the mock's own PC slots\n", g_label);
+    std::printf("%s: device slots 48/73/78/79/80 route to a queue, a list and frame-event tokens, and slot 61 to "
+                "CreateSampler, without reaching the mock's own PC slots; slot 41 creates argument type 105 as DISPATCH\n",
+                g_label);
     return 0;
 #else
     std::printf("%s: ID3D12Device11 is not in this SDK; Xbox slot 80's beyond-table case is not built\n", g_label);

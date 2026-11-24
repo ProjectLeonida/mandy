@@ -6,6 +6,10 @@
 //             the device in RCX and the buffer in RDX. The thunk takes the console form when RDX holds a device
 //             proxy, and forwards the PC form otherwise. Slots 25 and 43 return structs too; no call of them by
 //             the executable has been seen yet, so they are forwarded in the PC form.
+//   slot 41   CreateCommandSignature at its PC position; a console argument of type 105 (a 12-byte dispatch, read
+//             from the retail title's call sites) is created as D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.
+//   slot 61   CreateSamplerX(desc, dest) -> PC CreateSampler (slot 22); the description's PC
+//             D3D12_SAMPLER_DESC prefix is passed. The PC slot 61 is CreateMetaCommand. Measured on the retail title's boot.
 //   slot 62   CreateComputePipelineState(desc, w2, w3, iid, out): two words (0 from XboxBvhBuilder, meaning unknown)
 //             before the IID. The PC slot 62 is CreateStateObject.
 //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
@@ -184,6 +188,12 @@ bool set_presentation_handler(void* device, const PresentationHandler* handler);
 // measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
 // handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
+
+// Whether a return address is in an image the guest loader mapped, i.e. the call comes from the title. Device slot 61
+// is CreateSamplerX for such a caller and the PC ID3D12Device5::CreateMetaCommand for any other; with no check
+// installed every caller is a host one. D3D12XboxCreateDevice installs rt::shims::mapped_image_base.
+using ConsoleCaller = bool (*)(std::uint64_t address);
+void set_console_caller(ConsoleCaller classify);
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
 // (no reference added), or null when the pointer is not such a proxy.

@@ -395,6 +395,22 @@ It needs shader Int64 support; a device that lacks it reports a skip. This is a 
 independent of wave64 emulation. On RTX 3080 Ti (616.92, Windows 11), all 640 words matched; replacing the count
 mask with 31 or the arithmetic shift with a logical shift made the test fail at words 66 and 251 respectively.
 
+`cs_w32_cmp_f64` checks the 32 binary64 vector compares, `v_cmp_*_f64` into VCC and `v_cmpx_*_f64` on EXEC, with
+256 memory-fed operand pairs: the product of 16 values (±inf, ±max, the 1-ULP neighbours of ±1, the smallest
+subnormals, ±0, the smallest normal, a NaN whose payload is only in the low dword and a negative quiet NaN). Each
+thread stores one bit per predicate for both forms, a bit for `tru` run with the odd threads turned off (an inactive
+lane gets VCC 0 from `v_cmp_` and stays off through `v_cmpx_`) and two bits for `lt` and `nge` with VOP3 `abs`/`neg`.
+The expected words come from Python floats (`cmp_f64_words` in `check.py`): IEEE-754 ordering, with every pair that
+has a NaN unordered. Both GPU runners compare all 1536 heap words (512 result words and 1024 unchanged input words);
+the operands are loaded at run time, so neither the translator nor the driver can fold a compare. Run it alone with
+`python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_w32_cmp_f64 --require-pass`.
+It is a wave32 test and no step of it needs a particular subgroup width, so it also runs on llvmpipe; the SGPR-pair
+and constant operand forms are CPU-checked only (`tests/semantic/test_cmp_f64.py`). On an RTX 4070 Ti (NVIDIA
+620.70.06, Linux) all 1536 words matched, and seven translator rules broken one at a time each failed it: no `-0`
+canonicalization at word 206, a NaN test that ignores the low dword at word 28, an ordering key without the low
+dword at word 70, the raw result written to an inactive lane's VCC at word 2, `v_cmpx_` replacing EXEC at word 3,
+`abs` ignored and `nlt` lowered as the negation of `le` at word 0.
+
 ## Wave64 pixel, vertex and geometry shaders (`w64_graphics.py`)
 
 Graphics stages have no emulation: on a 32-wide subgroup a wave64 VS, PS or GS runs as two 32-lane halves, and the
