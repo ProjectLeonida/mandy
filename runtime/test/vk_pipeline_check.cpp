@@ -34,6 +34,7 @@
 //                 that kills the driver is recorded as failed ("MODULE CRASH") and the pass
 //                 goes on. A crashed batch is bisected to the module. Children run one after the other and share
 //                 cache.bin. Not compatible with --stats.
+//   --memory-limit-mib N  Windows isolation only: cap each child's job commit and report its peak.
 //   --inflight-file F  keep the modules that are in the driver in F, one "name<TAB>phase" line each (phase: module
 //                 while vkCreateShaderModule runs, pipeline while its pipeline is created), so whoever ran the check
 //                 can tell which module was there when the process died. F is rewritten when a module over
@@ -53,6 +54,10 @@
 #include "pipeline_cache_snapshot.h"
 #include "large_module_gate.h"
 #include "pipeline_summary.h"
+#include "pipeline_isolation_retry.h"
+#ifdef _WIN32
+#include "pipeline_child_job.h"
+#endif
 #include "../src/spirv_words.h"
 #include "../src/subgroup_size.h"
 
@@ -597,6 +602,9 @@ struct ChildRun {
     uint32_t status = 0;    // exit status when it exited (a full DWORD on Windows)
     std::string runner_error;
     std::string out;        // its stdout
+#ifdef _WIN32
+    leonida::ChildJobReport job;
+#endif
 };
 
 std::string child_exit_status(uint32_t status) {
@@ -642,7 +650,8 @@ std::wstring quote_child_arg(std::wstring_view arg) {
     return quoted.append(slashes, L'\\') + L"\"";
 }
 
-void collect_child(const std::filesystem::path& exe, std::vector<std::string>& args, ChildRun& r) {
+void collect_child(const std::filesystem::path& exe, std::vector<std::string>& args, ChildRun& r,
+                   size_t memory_limit_bytes) {
     const auto failed = [&](const char* api) {
         const DWORD error = GetLastError();
         r.runner_error = std::string(api) + " failed (Win32 error " + std::to_string(error) + ")";
@@ -660,7 +669,9 @@ void collect_child(const std::filesystem::path& exe, std::vector<std::string>& a
         command += quote_child_arg(wide);
     }
 
-    using Handle = std::unique_ptr<void, decltype(&CloseHandle)>;
+    using Handle = leonida::ChildHandle;
+    leonida::PipelineChildJob job;
+    if (memory_limit_bytes && !job.configure(memory_limit_bytes, r.runner_error)) return;
     SECURITY_ATTRIBUTES inherited{sizeof(inherited), nullptr, TRUE};
     HANDLE read_handle = nullptr, write_handle = nullptr;
     if (!CreatePipe(&read_handle, &write_handle, &inherited, 0)) return failed("CreatePipe");
@@ -701,8 +712,9 @@ void collect_child(const std::filesystem::path& exe, std::vector<std::string>& a
                                                       child_handles, (stderr_copy ? 3 : 2) * sizeof(HANDLE),
                                                       nullptr, nullptr);
     PROCESS_INFORMATION process{};
+    const DWORD flags = EXTENDED_STARTUPINFO_PRESENT | (memory_limit_bytes ? CREATE_SUSPENDED : 0);
     const bool started = configured && CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE,
-                                                       EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
+                                                       flags, nullptr, nullptr,
                                                        &startup.StartupInfo, &process);
     const DWORD start_error = started ? 0 : GetLastError();
     DeleteProcThreadAttributeList(startup.lpAttributeList);
@@ -710,10 +722,18 @@ void collect_child(const std::filesystem::path& exe, std::vector<std::string>& a
         SetLastError(start_error);
         return failed(configured ? "CreateProcessW" : "UpdateProcThreadAttribute");
     }
-    CloseHandle(process.hThread);
     Handle child(process.hProcess, CloseHandle);
+    Handle thread(process.hThread, CloseHandle);
     write_end.reset();   // EOF must depend on the child closing its write handle.
 
+    if (memory_limit_bytes) {
+        if (!job.start(child.get(), thread.get(), r.runner_error)) return;
+        thread.reset();
+        DWORD status = 0;
+        if (job.collect(child.get(), read_end.get(), r.out, status, r.job, r.runner_error)) r.status = status;
+        return;
+    }
+    thread.reset();
     char buffer[4096];
     DWORD bytes = 0;
     while (ReadFile(read_end.get(), buffer, sizeof buffer, &bytes, nullptr)) {
@@ -727,7 +747,7 @@ void collect_child(const std::filesystem::path& exe, std::vector<std::string>& a
     r.status = status;
 }
 #else
-void collect_child(const std::filesystem::path& exe, std::vector<std::string>& args, ChildRun& r) {
+void collect_child(const std::filesystem::path& exe, std::vector<std::string>& args, ChildRun& r, size_t) {
     args.insert(args.begin(), exe.native());
     std::vector<char*> argv;
     for (auto& a : args) argv.push_back(a.data());
@@ -768,13 +788,14 @@ std::string_view next_child_line(std::string_view& output) {
 }
 
 ChildRun run_child(const std::filesystem::path& exe, const std::string& dir,
-                   const std::vector<std::string>& pass, const std::string& cache_path, size_t start, size_t count) {
+                   const std::vector<std::string>& pass, const std::string& cache_path, size_t start, size_t count,
+                   size_t memory_limit_bytes) {
     ChildRun r;
     std::vector<std::string> args = {dir};
     if (!cache_path.empty()) args.push_back(cache_path);
     for (const auto& a : pass) args.push_back(a);
     args.insert(args.end(), {"--isolate-child", "--start", std::to_string(start), "--count", std::to_string(count)});
-    collect_child(exe, args, r);
+    collect_child(exe, args, r, memory_limit_bytes);
     std::string_view output = r.out;
     while (!output.empty()) {
         const auto line = next_child_line(output);
@@ -791,7 +812,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
             "[--max-bytes N] [--large-module-bytes N] [--large-parallel N] [--stage all|cs|graphics | --compute-only | --graphics-only] "
-            "[--stats FILE] [--cache-feedback] [--isolate [--isolate-batch N]] [--inflight-file F] "
+            "[--stats FILE] [--cache-feedback] [--isolate [--isolate-batch N] [--memory-limit-mib N (Windows)]] [--inflight-file F] "
             "[--skip-file F]\n");
         return 2;
     }
@@ -806,6 +827,8 @@ int main(int argc, char** argv) {
     std::string stage_filter = "all";
     bool cache_feedback = false, isolate = false, iso_child = false;
     size_t isolate_batch = 256;
+    size_t memory_limit_mib = 0;
+    constexpr size_t bytes_per_mib = 1024 * 1024;
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
         auto value = [&]() -> std::string_view {
@@ -849,6 +872,9 @@ int main(int argc, char** argv) {
         else if (a == "--skip-file") valid = !(skip_path = value()).empty();
         else if (a == "--cache-feedback") cache_feedback = true;
         else if (a == "--isolate") isolate = true;
+        else if (a == "--memory-limit-mib")
+            valid = number(memory_limit_mib) && memory_limit_mib > 0 &&
+                    memory_limit_mib <= std::numeric_limits<size_t>::max() / bytes_per_mib;
         else if (a == "--isolate-child") iso_child = true;   // internal: the parent's child runs
         else if (a == "--isolate-batch") {   // parsed like the other numbers (#1735); at least one per batch
             valid = number(isolate_batch);
@@ -878,6 +904,17 @@ int main(int argc, char** argv) {
     if (isolate && !stats_path.empty()) {
         std::fprintf(stderr, "--isolate cannot be combined with --stats\n");
         return 2;
+    }
+    if (memory_limit_mib) {
+#ifdef _WIN32
+        if (!isolate || iso_child) {
+            std::fprintf(stderr, "--memory-limit-mib requires the --isolate parent\n");
+            return 2;
+        }
+#else
+        std::fprintf(stderr, "--memory-limit-mib is supported only on Windows\n");
+        return 2;
+#endif
     }
 #ifdef _WIN32
     if (iso_child) SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
@@ -982,31 +1019,44 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             if (!r.cache_ok) cache_ok = false;
         };
-        // Returns the number of failures recorded for [s, s + n): crashed modules, or 1 for a crash that vanished.
-        auto bisect = [&](auto&& self, size_t s, size_t n) -> size_t {
-            if (setup_failed) return 0;
-            const ChildRun r = run_child(exe, dir, pass, cache_path, s, n);
+        auto attempt = [&](size_t s, size_t n, std::string& split_reason) {
+            const size_t limit_bytes = memory_limit_mib * bytes_per_mib;
+            const ChildRun r = run_child(exe, dir, pass, cache_path, s, n, limit_bytes);
+            const auto action = leonida::isolation_action(r, n);
+#ifdef _WIN32
+            if (limit_bytes) {
+                std::fprintf(stderr, "child over [%zu, %zu) job commit: limit %zu bytes, ", s, s + n, limit_bytes);
+                if (r.job.peak_bytes)
+                    std::fprintf(stderr, "peak %zu bytes", *r.job.peak_bytes);
+                else if (r.job.peak_error)
+                    std::fprintf(stderr, "peak unavailable (Win32 error %lu)", r.job.peak_error);
+                else
+                    std::fprintf(stderr, "peak unavailable");
+                std::fprintf(stderr, "; %s", r.job.event_label());
+                if (r.runner_error.empty())
+                    std::fprintf(stderr, "; exit status %s", child_exit_status(r.status).c_str());
+                std::fputc('\n', stderr);
+            }
+#endif
             if (!r.runner_error.empty()) {
                 std::fprintf(stderr, "error: could not run an isolation child: %s\n", r.runner_error.c_str());
-                setup_failed = true;
-                return 0;
+                return action;
             }
-            if (r.done) { commit(r); return 0; }
+            if (action == leonida::IsolationAction::complete) { commit(r); return action; }
             const std::string status = child_exit_status(r.status);
 #ifndef _WIN32
             const std::string signal = r.sig ? signal_label(r.sig) : "";
 #else
             const std::string signal;
 #endif
-            if (!r.ready) {   // died or exited before the work loop: not a module's fault
+            if (action == leonida::IsolationAction::abort) {   // died or exited before the work loop
                 std::fputs(r.out.c_str(), stdout);
                 if (!signal.empty()) std::fprintf(stderr, "error: a child process died during setup (%s)\n", signal.c_str());
                 else std::fprintf(stderr, "error: a child process failed during setup (exit status %s)\n", status.c_str());
-                setup_failed = true;
-                return 0;
+                return action;
             }
             const std::string why = signal.empty() ? "driver exited with status " + status : "driver crashed: " + signal;
-            if (n == 1) {
+            if (action == leonida::IsolationAction::record) {
                 const std::string& name = *all[s].first;
                 const std::string& st = all[s].second->stage;
                 std::printf("MODULE CRASH %s (%s, %s)\n", name.c_str(), st.c_str(), why.c_str());
@@ -1014,22 +1064,19 @@ int main(int argc, char** argv) {
                 crashes.push_back(name + " (" + st + ", " + why + ")");
                 agg[st].pipe_bad++;
                 agg[st].crashed++;
-                return 1;
+                return action;
             }
             std::fprintf(stderr, "child over [%zu, %zu) died (%s); bisecting\n", s, s + n, why.c_str());
-            const size_t half = n / 2;
-            size_t found = self(self, s, half);
-            found += self(self, s + half, n - half);
-            if (found == 0 && !setup_failed) {
-                std::printf("MODULE CRASH [%zu, %zu) not reproduced when split (%s); counted as failed\n", s, s + n, why.c_str());
-                ++unreproduced;
-                return 1;
-            }
-            return found;
+            split_reason = why;
+            return action;
+        };
+        auto record_unreproduced = [&](size_t s, size_t n, const std::string& why) {
+            std::printf("MODULE CRASH [%zu, %zu) not reproduced when split (%s); counted as failed\n", s, s + n, why.c_str());
+            ++unreproduced;
         };
         for (size_t s = lo; s < hi && !setup_failed;) {
             const size_t batch = std::min(isolate_batch, hi - s);
-            bisect(bisect, s, batch);
+            leonida::isolate_range(s, batch, setup_failed, attempt, record_unreproduced);
             s += batch;
         }
         if (setup_failed) return 1;

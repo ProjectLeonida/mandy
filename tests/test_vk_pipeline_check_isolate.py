@@ -97,6 +97,20 @@ class IsolateTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("cs: 5 modules ok, 0 failed", r.stdout)
         self.assertIn("cs pipelines: 5 ok, 0 failed, 0 skipped", r.stdout)
+        self.assertNotIn("job commit:", r.stderr)
+
+    @unittest.skipUnless(WINDOWS, "Job Objects require Windows")
+    def test_guarded_isolation_reports_each_completed_batch(self):
+        r = self.run_tool(["--isolate", "--isolate-batch", "2", "--memory-limit-mib", "512"],
+                          cache=self.cache("guarded clean.cache"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("cs: 5 modules ok, 0 failed", r.stdout)
+        self.assertIn("cs pipelines: 5 ok, 0 failed, 0 skipped", r.stdout)
+        peaks = [line for line in r.stderr.splitlines() if "job commit:" in line]
+        self.assertEqual(len(peaks), 3, r.stderr)
+        for line in peaks:
+            self.assertRegex(line, r"limit 536870912 bytes, peak [1-9][0-9]* bytes")
+            self.assertTrue(line.endswith("exit status 0"), line)
 
     def test_oversized_batch_keeps_the_requested_slice(self):
         r = self.run_tool(["--isolate", "--start", "2", "--count", "2",

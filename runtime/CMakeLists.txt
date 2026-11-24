@@ -599,6 +599,14 @@ if(BUILD_TESTING)
   find_package(Threads REQUIRED)
   target_link_libraries(large_module_gate_test PRIVATE Threads::Threads)
   add_test(NAME large_module_gate COMMAND large_module_gate_test)
+  if(WIN32)
+    add_executable(pipeline_child_job_test test/pipeline_child_job_test.cpp)
+    target_compile_definitions(pipeline_child_job_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_test(NAME pipeline_child_job COMMAND pipeline_child_job_test)
+    add_test(NAME pipeline_child_job_nested COMMAND pipeline_child_job_test --nested-test)
+    set_tests_properties(pipeline_child_job pipeline_child_job_nested PROPERTIES TIMEOUT 20)
+    set_tests_properties(pipeline_child_job_nested PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   # vk_pipeline_check's isolate summary stage set: pure stdlib, no Vulkan device.
   add_executable(pipeline_summary_test test/pipeline_summary_test.cpp)
   add_test(NAME pipeline_summary COMMAND pipeline_summary_test)
@@ -1542,6 +1550,7 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_pipeline_check_cli COMMAND "${CMAKE_COMMAND}"
              "-DTOOL=$<TARGET_FILE:vk_pipeline_check>"
              "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/vk_pipeline_check_cli_input"
+             "-DWINDOWS_TARGET=${WIN32}"
              "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_pipeline_cli.cmake")
     add_test(NAME vk_texture_cube_alpha COMMAND vk_texture_test --self-test-cube-alpha)

@@ -39,7 +39,8 @@ normal driver check. Mesh pipelines on devices without mesh shader support still
 | `--large-module-bytes N` | Compile modules larger than N bytes alone (default 4 MiB; 0 disables isolation). |
 | `--stats FILE` | Write the driver's per-shader statistics as CSV rows `name,stage,statistic,value`. Needs `VK_KHR_pipeline_executable_properties`; use it without `cache.bin`, because a cached pipeline may come without statistics. |
 | `--cache-feedback` | Group successful pipeline creations by `VkPipelineCreationFeedback`: cache hits, no hit reported, and unavailable. |
-| `--isolate` | POSIX only: check in child processes, `--isolate-batch N` modules at a time (default 256), so a crashing module is recorded as `MODULE CRASH` and the pass continues. Not compatible with `--stats`. |
+| `--isolate` | Windows and POSIX: check in child processes, `--isolate-batch N` modules at a time (default 256), so a crashing module is recorded as `MODULE CRASH` and the pass continues. Not compatible with `--stats`. |
+| `--memory-limit-mib N` | Windows only, requires `--isolate`. Limit each child job's committed memory to a positive integer number of MiB and report the job's peak per attempt. |
 | `--inflight-file F` | Keep the modules currently in the driver in F as `name<TAB>phase` lines. It is rewritten by the watchdog and when a large module enters or leaves, and emptied at the end; `make_game.py`'s pipelines stage reads it. |
 | `--skip-file F` | Do not compile modules named one per line in F; each is reported as `MODULE CRASH` and counted as a failed pipeline. `make_game.py` writes F after a crash so the next run checks the rest. |
 
@@ -413,6 +414,49 @@ On Windows, `SIGFPE` and `SIGSEGV` use the corresponding exception exit codes.
 `tests/test_vk_pipeline_check_isolate.py` uses it with five hand-written compute
 shaders to check `--isolate` without a crashing driver; it skips when the tool isn't built or there is no
 Vulkan device.
+
+### Windows committed-memory limit
+
+```sh
+vk_pipeline_check <spirv dir> cache.bin --isolate --memory-limit-mib 8192
+```
+
+Each attempt, including each smaller batch after a split, gets a new Windows Job Object with a hard
+job-wide committed-memory limit (1 MiB = 1,048,576 bytes). The job accounts for the compiler process and
+descendants that remain in the job. The limit includes child startup and cache work. The parent and
+other system processes consume memory separately. Choose a limit with headroom for them. This option
+does not set a system-wide memory budget, cap physical RAM or GPU memory directly, or change the
+large-module scheduling budget. A high limit can still lead to paging and poor system responsiveness.
+When commit would exceed the limit, Windows can deny the allocation. A denial does not necessarily
+terminate the child. A compiler that mishandles the denial can still hang.
+
+The parent configures the job, creates the child suspended, assigns it to the job, then resumes its primary
+thread. Suspended assignment uses the existing Win32 process API and handle-list path in both CMake and the
+direct Windows build without requiring support for the newer `PROC_THREAD_ATTRIBUTE_JOB_LIST` attribute.
+The latter can assign at creation and eliminate the gap in which abrupt parent termination can leave a
+suspended, unassigned child. The suspended child cannot execute application code during that gap.
+Assignment honors any outer job. If launch or protection fails, the checker reports the failing Win32
+operation and stops with exit status 1. Cleanup failure or a cleanup wait timeout is also reported.
+It never retries without the requested protection. Once assigned,
+closing the job terminates its remaining processes. After the main child exits, the collector reads only
+stdout bytes already available, so a descendant retaining the pipe cannot hold the collector open.
+
+The parent reports the configured limit and Windows' `PeakJobMemoryUsed` in bytes on stderr. The peak is
+the OS accounting value. A native Windows regression run reported a peak above the cap during a rejected
+allocation. A peak near or above
+the cap, a generic allocation failure, or an abnormal exit cannot establish the cause. If Windows delivers
+`JOB_OBJECT_MSG_JOB_MEMORY_LIMIT` for this job, the parent reports an observed event for that attempt.
+These notifications are best-effort. Without one, limit involvement is unconfirmed. An observed event
+does not identify a failing shader or change how completed results, cache failures, interrupted batches,
+or exit codes are counted. A child may recover from a denied allocation and still complete successfully.
+
+Windows API references: [job limits and peak accounting](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_extended_limit_information),
+[job notifications and nesting](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects),
+and [process creation attributes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute).
+
+The GPU-independent CLI test exercises real guarded and unguarded launches up to a deliberately
+unavailable Vulkan device. The synthetic Vulkan isolation test also compares completed guarded
+and unguarded batches on Windows when a usable device is available.
 
 ## Application pipeline-cache feedback
 
