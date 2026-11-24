@@ -325,7 +325,54 @@ inline constexpr FormatRow format_table[] = {
 // The format of the console's separate stencil surface: what a T# of a depth-stencil texture's stencil plane names.
 inline constexpr std::uint32_t stencil_format = 5;  // GFX10_FORMAT_8_UINT
 
+// The table indexed both ways, built at compile time, so the lookups below cost one load instead of a scan of
+// the table (they run for every view a descriptor names: CreateShaderResourceView, the T# -> set 0 binding).
+// Each keeps the scan's answer: the first row in table order. Codes are 9 bits (T# word 1 bits 28:20); the
+// Vulkan formats of the core range are below 256, and the few above it (VK_EXT_4444_formats) fall back to the scan.
+namespace detail {
+inline constexpr std::uint8_t no_row = 0xFF;
+inline constexpr std::uint32_t code_count = 512, dense_vulkan_formats = 256;
+static_assert(std::size(format_table) < no_row, "a row index must fit in a byte");
+
+struct FormatIndex {
+    std::array<std::uint8_t, dense_vulkan_formats> by_vulkan{};  // first row of a format
+    std::array<std::uint8_t, code_count> first{};                // first row of a code
+    std::array<std::uint8_t, code_count> count{};                // rows of the code, all adjacent to `first`
+};
+
+inline constexpr FormatIndex build_format_index() {
+    FormatIndex index{};
+    index.by_vulkan.fill(no_row);
+    index.first.fill(no_row);
+    for (std::size_t i = 0; i < std::size(format_table); ++i) {
+        const FormatRow& row = format_table[i];
+        if (std::uint32_t(row.vulkan) < dense_vulkan_formats && index.by_vulkan[row.vulkan] == no_row)
+            index.by_vulkan[row.vulkan] = std::uint8_t(i);
+        if (index.first[row.gfx10] == no_row) index.first[row.gfx10] = std::uint8_t(i);
+        ++index.count[row.gfx10];
+    }
+    return index;
+}
+inline constexpr FormatIndex format_index = build_format_index();
+
+// The rows of one code are adjacent, so [first, first + count) is every row of the code, in table order.
+inline constexpr bool codes_adjacent() {
+    for (std::size_t i = 0; i < std::size(format_table); ++i) {
+        const std::uint32_t code = format_table[i].gfx10;
+        if (code >= code_count) return false;
+        if (i < format_index.first[code] || i >= std::size_t(format_index.first[code]) + format_index.count[code])
+            return false;
+    }
+    return true;
+}
+static_assert(codes_adjacent(), "keep the rows of a GFX10 code together in format_table");
+} // namespace detail
+
 inline constexpr const FormatRow* format_row(VkFormat format) {
+    if (std::uint32_t(format) < detail::dense_vulkan_formats) {
+        const std::uint8_t i = detail::format_index.by_vulkan[std::uint32_t(format)];
+        return i == detail::no_row ? nullptr : &format_table[i];
+    }
     for (const FormatRow& row : format_table)
         if (row.vulkan == format) return &row;
     return nullptr;
@@ -334,9 +381,9 @@ inline constexpr const FormatRow* format_row(VkFormat format) {
 // The Vulkan format with the code's bits, in the hardware's channel order where Vulkan has such a format.
 // VK_FORMAT_UNDEFINED: not in the table. A code that depth and colour formats share gives the colour format.
 inline constexpr VkFormat vulkan_format(std::uint32_t gfx10_format) {
-    for (const FormatRow& row : format_table)
-        if (row.gfx10 == gfx10_format) return row.vulkan;
-    return VK_FORMAT_UNDEFINED;
+    if (gfx10_format >= detail::code_count) return VK_FORMAT_UNDEFINED;
+    const std::uint8_t i = detail::format_index.first[gfx10_format];
+    return i == detail::no_row ? VK_FORMAT_UNDEFINED : format_table[i].vulkan;
 }
 
 // 0 (GFX10_FORMAT_INVALID): not in the table.
@@ -380,8 +427,12 @@ inline constexpr VkFormat vulkan_view_format(VkFormat image_format, std::uint32_
     if (image->gfx10 == gfx10_format) return image_format;
     if (is_depth_stencil_format(image_format)) return VK_FORMAT_UNDEFINED;
     const FormatRow* fallback = nullptr;
-    for (const FormatRow& row : format_table) {
-        if (row.gfx10 != gfx10_format || is_depth_stencil_format(row.vulkan)) continue;
+    if (gfx10_format >= detail::code_count) return VK_FORMAT_UNDEFINED;
+    const std::size_t first = detail::format_index.first[gfx10_format];
+    const std::size_t end = first + detail::format_index.count[gfx10_format];
+    for (std::size_t i = first; i < end; ++i) {  // empty for a code not in the table
+        const FormatRow& row = format_table[i];
+        if (is_depth_stencil_format(row.vulkan)) continue;
         if (row.channels == image->channels) return row.vulkan;
         if (!fallback) fallback = &row;
     }

@@ -11,6 +11,7 @@
 #endif
 #include "binary_occlusion_spirv.h"
 #include "buffer_va_index.h"
+#include "image_view_cache.h"
 #include "occlusion_sum_spirv.h"
 #include "queue_holds.h"
 #include "retire_tickets.h"
@@ -1108,7 +1109,7 @@ public:
         for (const auto& [key, framebuffer] : resolve_framebuffers_)
             vk.vkDestroyFramebuffer(device_, framebuffer, nullptr);
         for (const auto& [key, pass] : resolve_passes_) vk.vkDestroyRenderPass(device_, pass, nullptr);
-        for (const auto& [key, view] : views_) vk.vkDestroyImageView(device_, view, nullptr);
+        views_.for_each([&](VkImageView view) { vk.vkDestroyImageView(device_, view, nullptr); });
     }
 
     VulkanContext(const VulkanContext&) = delete;
@@ -1225,14 +1226,9 @@ public:
                     ++f;
                 }
             }
-            for (auto v = views_.begin(); v != views_.end();) {
-                if (std::get<0>(v->first) == img) {
-                    defer_destroy(DeferredDeletionQueue::Kind::image_view, v->second);
-                    v = views_.erase(v);
-                } else {
-                    ++v;
-                }
-            }
+            views_.erase_image(img, [&](VkImageView view) {
+                defer_destroy(DeferredDeletionQueue::Kind::image_view, view);
+            });
         }
         if (sparse_resource)
             defer_destroy(DeferredDeletionQueue::Kind::sparse_resource,
@@ -1603,9 +1599,9 @@ private:
     // Called from prepare; protected by views_mutex_ so concurrent shared_lock readers are safe.
     VkImageView view(const ResourceBinding& r, const VkImageSubresourceRange& range) {
         std::lock_guard lock(views_mutex_);
-        const auto key = std::make_tuple(r.image, range.aspectMask, range.baseMipLevel, range.baseArrayLayer,
-                                         range.layerCount, r.format);
-        if (const auto it = views_.find(key); it != views_.end()) return it->second;
+        const ViewCache::Key key{r.image, range.aspectMask, range.baseMipLevel, range.baseArrayLayer, range.layerCount,
+                                 static_cast<std::uint32_t>(r.format)};
+        if (const VkImageView cached = views_.find(key)) return cached;
         VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         info.image = r.image;
         info.viewType = r.line ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_2D_ARRAY;  // 1D images take no 2D view
@@ -1619,7 +1615,7 @@ private:
             info.pNext = &usage;
         VkImageView view = VK_NULL_HANDLE;
         if (vk.vkCreateImageView(device_, &info, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
-        views_[key] = view;
+        views_.insert(key, view);
         return view;
     }
 
@@ -1719,7 +1715,8 @@ private:
     VkSemaphore storage_init_semaphore_ = VK_NULL_HANDLE;
     std::uint64_t storage_init_value_ = 0;
     std::uint64_t storage_init_version_ = 0;
-    std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
+    using ViewCache = ImageViewCache<VkImage, VkImageView>;
+    ViewCache views_;  // view()'s attachment views, indexed by image for destroy (image_view_cache.h)
     // depth_resolve_framebuffer's caches, under views_mutex_ like views_.
     std::map<std::tuple<VkFormat, std::uint32_t, VkImageLayout, VkImageLayout, VkResolveModeFlagBits>, VkRenderPass>
         resolve_passes_;

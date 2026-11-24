@@ -17,6 +17,7 @@
 #include "dxgi_com.h"
 #include "../src/arena_size.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/descriptor_tables.h"
 #include "../src/depth24_fragment.h"
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
@@ -1071,33 +1072,18 @@ struct DeviceState {
     std::atomic<bool> bindless_cap_logged{false};
     std::map<leonida::DescriptorKey, ImageEntry> image_entries;
     std::multimap<std::uint64_t, leonida::DescriptorKey> image_keys;  // by the texture's address
-    std::vector<ImageEntry> replaced_images;  // kept until their texture goes: work in flight may still use them
+    // Kept until their texture goes (work in flight may still use them), by the texture's address.
+    leonida::ReplacedImages<ImageEntry> replaced_images;
     std::map<leonida::DescriptorKey, VkSampler> sampler_entries;
-    struct CustomBorderColor {
-        bool is_int = false;
-        VkClearColorValue value{};
-        bool operator==(const CustomBorderColor& o) const {
-            return is_int == o.is_int && std::memcmp(&value, &o.value, sizeof(value)) == 0;
-        }
-    };
-    std::vector<CustomBorderColor> border_color_table;
+    leonida::BorderColorTable border_color_table;  // hashed: CreateSampler looks a colour up without a scan
 
     std::uint32_t register_border_color(bool is_int, const void* components) {
         std::lock_guard lock(descriptor_mutex);
-        CustomBorderColor entry{};
-        entry.is_int = is_int;
-        std::memcpy(&entry.value, components, sizeof(entry.value));
-        for (std::size_t i = 0; i < border_color_table.size(); ++i) {
-            if (border_color_table[i] == entry) return std::uint32_t(i);
-        }
-        if (border_color_table.size() >= 4000) {
+        const auto result = border_color_table.find_or_add(is_int, components);
+        if (result.full)
             log_once("custom sampler border colour table is full (4000 entries); clamping index",
                      int(border_color_table.size()));
-            return 3999;
-        }
-        const std::uint32_t idx = std::uint32_t(border_color_table.size());
-        border_color_table.push_back(entry);
-        return idx;
+        return result.index;
     }
     // A T# names a texture by an address of its own: above 4 GiB, which the GPU address arena for buffers (docs
     // section 3.3) stays below, and 256 bytes apart (the T# keeps addresses in 256-byte units). Nothing
@@ -1258,7 +1244,7 @@ struct DeviceState {
             return false;
         }
         if (existing != image_entries.end()) {
-            replaced_images.push_back(existing->second);  // the read-only entry of the same bytes
+            replaced_images.add(existing->second.address, existing->second);  // the read-only entry of the same bytes
             existing->second = entry;
         } else {
             image_entries.emplace(words, entry);
@@ -1280,11 +1266,7 @@ struct DeviceState {
             image_entries.erase(entry);
         }
         image_keys.erase(first, last);
-        std::erase_if(replaced_images, [&](const ImageEntry& entry) {
-            if (entry.address != address) return false;
-            release(entry);
-            return true;
-        });
+        replaced_images.take(address, [&](const ImageEntry& entry) { release(entry); });
     }
 
     // Gives the S# `words` a sampler in set 0 and an entry in the hash table, unless it has them.
@@ -1326,7 +1308,8 @@ struct DeviceState {
             if (info.custom_border_color && info.custom_border_color_without_format &&
                 sampler.border_color_index < border_color_table.size()) {
                 const auto& entry = border_color_table[sampler.border_color_index];
-                custom_border.customBorderColor = entry.value;
+                static_assert(sizeof(custom_border.customBorderColor) == sizeof(entry.bits));
+                std::memcpy(&custom_border.customBorderColor, entry.bits.data(), sizeof(entry.bits));
                 custom_border.format = VK_FORMAT_UNDEFINED;
                 sampler_info.borderColor =
                     entry.is_int ? VK_BORDER_COLOR_INT_CUSTOM_EXT : VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;

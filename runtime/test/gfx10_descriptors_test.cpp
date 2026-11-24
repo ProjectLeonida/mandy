@@ -258,8 +258,45 @@ int main() {
         }
     }
 
+    // The indexed lookups give the first row in table order, as a scan would, for every format and code; the
+    // codes are 9 bits, the formats above the dense range (VK_EXT_4444_formats) and unknown ones still resolve.
+    for (std::size_t i = 0; i < std::size(format_table); ++i) {
+        const FormatRow& row = format_table[i];
+        const FormatRow* first_of_format = nullptr;
+        const FormatRow* first_of_code = nullptr;
+        for (const FormatRow& other : format_table) {
+            if (!first_of_format && other.vulkan == row.vulkan) first_of_format = &other;
+            if (!first_of_code && other.gfx10 == row.gfx10) first_of_code = &other;
+        }
+        CHECK(format_row(row.vulkan) == first_of_format);
+        CHECK(vulkan_format(row.gfx10) == first_of_code->vulkan);
+    }
+    for (std::uint32_t code = 0; code < 1024; ++code) {
+        bool listed = false;
+        for (const FormatRow& row : format_table) listed = listed || row.gfx10 == code;
+        if (!listed) CHECK(vulkan_format(code) == VK_FORMAT_UNDEFINED);
+        if (!listed) CHECK(vulkan_view_format(VK_FORMAT_R8G8B8A8_UNORM, code, true) == VK_FORMAT_UNDEFINED);
+    }
+    for (std::uint32_t f = 0; f < 1024; ++f) {
+        bool listed = false;
+        for (const FormatRow& row : format_table) listed = listed || std::uint32_t(row.vulkan) == f;
+        if (!listed) CHECK(format_row(VkFormat(f)) == nullptr);
+    }
+    CHECK(vulkan_format(5) == VK_FORMAT_R8_UINT);  // not S8_UINT, the second row of the code
+    CHECK(vulkan_format(22) == VK_FORMAT_R32_SFLOAT);
+    CHECK(vulkan_format(0xFFFFFFFFu) == VK_FORMAT_UNDEFINED);
+    CHECK(format_row(VK_FORMAT_A4R4G4B4_UNORM_PACK16) && format_row(VK_FORMAT_A4R4G4B4_UNORM_PACK16)->gfx10 == 136);
+    CHECK(format_from_vulkan(VK_FORMAT_A4B4G4R4_UNORM_PACK16) == 136);
+    CHECK(format_row(VkFormat(1000340002)) == nullptr);
+    CHECK(format_row(VkFormat(0x7FFFFFFF)) == nullptr);
+    CHECK(vulkan_view_format(VK_FORMAT_A4R4G4B4_UNORM_PACK16, 136) == VK_FORMAT_A4R4G4B4_UNORM_PACK16);
+    CHECK(vulkan_view_format(VK_FORMAT_R4G4B4A4_UNORM_PACK16, 136) == VK_FORMAT_R4G4B4A4_UNORM_PACK16);
+    CHECK(vulkan_view_format(VK_FORMAT_B8G8R8A8_UNORM, 130) == VK_FORMAT_B8G8R8A8_SRGB);  // second row of 130
+    CHECK(vulkan_view_format(VK_FORMAT_R8G8B8A8_UNORM, 0x1FF, true) == VK_FORMAT_UNDEFINED);
+    CHECK(vulkan_view_format(VK_FORMAT_R8G8B8A8_UNORM, 0xFFFFFFFFu, true) == VK_FORMAT_UNDEFINED);
+
     // DST_SEL as a component mapping.
-    const auto same = [](const VkComponentMapping& m, VkComponentSwizzle r, VkComponentSwizzle g, VkComponentSwizzle b,
+    const auto same =[](const VkComponentMapping& m, VkComponentSwizzle r, VkComponentSwizzle g, VkComponentSwizzle b,
                          VkComponentSwizzle a) { return m.r == r && m.g == g && m.b == b && m.a == a; };
     constexpr auto R = VK_COMPONENT_SWIZZLE_R, G = VK_COMPONENT_SWIZZLE_G, B = VK_COMPONENT_SWIZZLE_B,
                    A = VK_COMPONENT_SWIZZLE_A, zero = VK_COMPONENT_SWIZZLE_ZERO, one = VK_COMPONENT_SWIZZLE_ONE;

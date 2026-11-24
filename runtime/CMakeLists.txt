@@ -582,6 +582,12 @@ if(BUILD_TESTING)
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)
+  # VulkanContext::view's attachment-view cache (runtime/src/image_view_cache.h): pure stdlib, no Vulkan instance.
+  add_executable(image_view_cache_test test/image_view_cache_test.cpp)
+  add_test(NAME image_view_cache COMMAND image_view_cache_test)
+  # DeviceState's border colour table and replaced views (runtime/src/descriptor_tables.h): pure stdlib.
+  add_executable(descriptor_tables_test test/descriptor_tables_test.cpp)
+  add_test(NAME descriptor_tables COMMAND descriptor_tables_test)
 
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
@@ -1655,6 +1661,13 @@ if(TARGET Vulkan::Headers)
   target_link_libraries(vulkan_mesh_limits_test PRIVATE Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vulkan_mesh_limits COMMAND vulkan_mesh_limits_test)
+  endif()
+  # CPU-only: BindlessSet's pending-write queue and free-index search through a fake Vulkan device, against the
+  # former std::unordered_map queue and byte loop, with a short benchmark (--bench for a longer one).
+  add_executable(bindless_queue_test test/bindless_queue_test.cpp)
+  target_link_libraries(bindless_queue_test PRIVATE Vulkan::Headers)
+  if(BUILD_TESTING)
+    add_test(NAME bindless_queue COMMAND bindless_queue_test)
   endif()
   # CPU-only: Vulkan 1.3 core vs 1.2 KHR/EXT feature probing and proc fallback (runtime/src/vulkan13_features.h).
   add_executable(vulkan13_features_test test/vulkan13_features_test.cpp)
@@ -3384,6 +3397,11 @@ if(TARGET Vulkan::Headers)
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
     add_test(NAME gfx10_descriptors COMMAND gfx10_descriptors_test)
+    # CPU cost of the GFX10 format-table lookups an SRV makes, indexed against the scans they replaced; ctest runs
+    # its self-test (both agree on every format and code), run it without arguments for the numbers.
+    add_executable(gfx10_format_bench test/gfx10_format_bench.cpp)
+    target_link_libraries(gfx10_format_bench PRIVATE Vulkan::Headers)
+    add_test(NAME gfx10_format_bench_selftest COMMAND gfx10_format_bench --self-test)
     # CPU cost of the D3D12 -> Vulkan replay per command (record, prepare, emit) with no-op Vulkan entry points:
     # no GPU or driver. ctest runs its quick self-test; run it without arguments for the numbers.
     add_executable(replay_cpu_bench test/replay_cpu_bench.cpp)

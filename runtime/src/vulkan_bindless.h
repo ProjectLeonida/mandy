@@ -51,7 +51,6 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
-#include <unordered_map>
 #include <vector>
 
 namespace leonida {
@@ -507,7 +506,8 @@ public:
         if (replaced) {
             write_shadow();  // includes the pending writes just folded in
         } else if (!pending_.empty()) {
-            std::vector<VkWriteDescriptorSet> writes(pending_.size());
+            auto& writes = pending_writes_;  // kept between flushes: no allocation once it has grown
+            writes.resize(pending_.size());
             for (std::size_t i = 0; i < pending_.size(); ++i) {
                 writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
                 writes[i].dstSet = set_;
@@ -519,8 +519,8 @@ public:
             }
             vk_.vkUpdateDescriptorSets(device_, std::uint32_t(writes.size()), writes.data(), 0, nullptr);
         }
+        for (const Pending& pending : pending_) pending_at_[pending.binding][pending.index] = 0;
         pending_.clear();
-        pending_slots_.clear();
         return written;
     }
 
@@ -599,14 +599,15 @@ private:
 
     static constexpr std::uint32_t dimensions = 6, classes = 3;
 
-    // The first free index in [begin, end), marked used; 0 when there is none.
+    // The first free index in [begin, end), marked used; 0 when there is none. memchr finds the first 0 byte the
+    // way the loop over `used` would, a word or a vector register at a time.
     static std::uint32_t allocate(std::vector<std::uint8_t>& used, std::uint32_t begin, std::uint32_t end) {
-        for (std::uint32_t i = begin; i < end; ++i) {
-            if (used[i]) continue;
-            used[i] = 1;
-            return i;
-        }
-        return 0;
+        if (begin >= end) return 0;
+        const void* found = std::memchr(used.data() + begin, 0, end - begin);
+        if (!found) return 0;
+        const auto i = std::uint32_t(static_cast<const std::uint8_t*>(found) - used.data());
+        used[i] = 1;
+        return i;
     }
 
     std::uint32_t memory_type(std::uint32_t allowed, VkMemoryPropertyFlags wanted) const {
@@ -627,6 +628,7 @@ private:
             if (b == bindless::table_binding || !bindless::binding_enabled(b, features_)) continue;
             shadow_[b].assign(features_.counts[b], VkDescriptorImageInfo{});
             shadow_written_[b].assign(features_.counts[b], 0);
+            pending_at_[b].assign(features_.counts[b], 0);
         }
 
         for (std::uint32_t d = 0; d < dimensions; ++d) {
@@ -972,12 +974,14 @@ private:
     // A slot has one pending write: a later one takes its place. So a view or sampler that is removed before the
     // next flush(), and may be destroyed by then, is never written.
     void queue(std::uint32_t binding, std::uint32_t index, const VkDescriptorImageInfo& info) {
-        const std::uint64_t slot = (std::uint64_t(binding) << 32) | index;
-        const auto [at, added] = pending_slots_.try_emplace(slot, pending_.size());
-        if (added)
-            pending_.push_back({binding, index, info});
-        else
-            pending_[at->second].info = info;
+        auto& at = pending_at_[binding];
+        if (index >= at.size()) at.resize(std::size_t(index) + 1, 0);  // not reached: indices stay below counts[]
+        if (at[index]) {
+            pending_[at[index] - 1].info = info;
+            return;
+        }
+        pending_.push_back({binding, index, info});
+        at[index] = std::uint32_t(pending_.size());
     }
 
     void write_sampler(std::uint32_t index, VkSampler sampler) {
@@ -1027,7 +1031,9 @@ private:
     std::array<std::vector<std::uint8_t>, dimensions> image_used_;
     std::vector<std::uint8_t> sampler_used_;
     std::vector<Pending> pending_;
-    std::unordered_map<std::uint64_t, std::size_t> pending_slots_;  // binding and index -> place in pending_
+    // binding, index -> 1 + place in pending_, 0 when the slot has no pending write; flush() zeroes what it used.
+    std::array<std::vector<std::uint32_t>, bindless::bindings.size()> pending_at_;
+    std::vector<VkWriteDescriptorSet> pending_writes_;  // flush()'s in-place writes, reused
     DescriptorTable table_{64};
     TableBuffers table_buffers_;
     bool table_uploaded_ = false;  // the table's current contents are in table_buffers_.table
