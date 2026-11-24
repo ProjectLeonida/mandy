@@ -512,6 +512,9 @@ def decode_one(buf, pos, end, addr):
     if pos >= end:
         raise DecodeError("truncated prefixes")
 
+    # VEX and EVEX are prefixes, so the opcode they introduce is required: a buffer that ends inside
+    # one is a truncated instruction, like a lone REX byte below, and must raise DecodeError instead
+    # of reading the opcode past `end`.
     vex = None
     b0 = buf[pos]
     if b0 == 0x62 and pos + 3 < end:
@@ -521,6 +524,8 @@ def decode_one(buf, pos, end, addr):
                    "r": (~p0 >> 7) & 1, "x": (~p0 >> 6) & 1, "b": (~p0 >> 5) & 1,
                    "w": (p1 >> 7) & 1, "vvvv": (~p1 >> 3) & 0xF, "pp": p1 & 3}
             pos += 4
+            if pos >= end:
+                raise DecodeError("truncated after evex prefix")
             b0 = buf[pos]
     elif b0 in (0xC4, 0xC5) and pos + 1 < end:
         if b0 == 0xC5:
@@ -529,11 +534,17 @@ def decode_one(buf, pos, end, addr):
                    "w": 0, "vvvv": (~b1 >> 3) & 0xF, "pp": b1 & 3}
             pos += 2
         else:
+            # The three-byte VEX form reads two payload bytes, so the two-byte check above is not
+            # enough for it.
+            if pos + 2 >= end:
+                raise DecodeError("truncated after vex prefix")
             b1, b2 = buf[pos + 1], buf[pos + 2]
             vex = {"evex": False, "map": b1 & 0x1F, "r": (~b1 >> 7) & 1,
                    "x": (~b1 >> 6) & 1, "b": (~b1 >> 5) & 1,
                    "w": (b2 >> 7) & 1, "vvvv": (~b2 >> 3) & 0xF, "pp": b2 & 3}
             pos += 3
+        if pos >= end:
+            raise DecodeError("truncated after vex prefix")
         b0 = buf[pos]
 
     rex = 0

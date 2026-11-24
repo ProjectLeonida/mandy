@@ -13,6 +13,7 @@ The qemu tests skip cleanly when qemu-system-aarch64 is not installed.
 
     python -I tests/test_x64_recomp.py
 """
+import itertools
 import os
 import shutil
 import sys
@@ -151,6 +152,34 @@ class DecodeTests(unittest.TestCase):
         # operand and the walk then ran into the bytes after the function (rva 0xa4ab00).
         insns = list(x.disasm(asm("c5 f8 77 c3"), 0x1000))
         self.assertEqual([(i.mnem, i.size) for i in insns], [("v77", 3), ("ret", 1)])
+
+    def test_truncated_vex_and_evex_are_decode_errors(self):
+        # decode_one promises never to read past `end`. A VEX or EVEX prefix as the last
+        # bytes of the buffer used to index one byte past it and raise IndexError, which a
+        # caller that only catches DecodeError (tools/recomp_census.py among them) does not
+        # survive.
+        for code in (asm("c4 68"), asm("c4 68 c3"), asm("c5 f8"), asm("62 f1 7c 48")):
+            with self.assertRaises(x.DecodeError, msg=code.hex()):
+                x.decode_one(code, 0, len(code), 0x1000)
+
+    def test_never_reads_past_end(self):
+        # The same promise over every sequence up to four bytes of an alphabet of prefixes,
+        # REX bytes, escape bytes and opcodes: each either decodes within the buffer or
+        # raises DecodeError.
+        alphabet = bytes([0x62, 0xC4, 0xC5, 0x0F, 0x66, 0x67, 0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E,
+                          0x26, 0x64, 0x65, 0x48, 0x40, 0x4F, 0x90, 0xC3, 0xE8, 0xEB, 0x8B, 0x83,
+                          0x00, 0xFF, 0x38, 0x3A])
+        for n in (1, 2, 3, 4):
+            for combo in itertools.product(alphabet, repeat=n):
+                code = bytes(combo)
+                try:
+                    ins = x.decode_one(code, 0, n, 0x1000)
+                except x.DecodeError:
+                    continue
+                except IndexError as e:
+                    self.fail(f"decode_one read past end on {code.hex()}: {e}")
+                self.assertLessEqual(ins.size, n, code.hex())
+
 
 def run(code):
     return x.run_result(code, GUEST_VA)

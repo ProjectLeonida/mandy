@@ -130,6 +130,29 @@ class EdgeTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_truncated_vex_prefix_is_a_gap_not_a_crash(self):
+        # A .pdata function whose bytes end inside a three-byte VEX prefix: decode_one must report a
+        # decode gap rather than read past the function's buffer and abort the whole census. Any
+        # .pdata boundary can cut a prefix; the retail image reached the same read through the
+        # vzeroupper desync covered by test_vzeroupper_does_not_desync_a_function.
+        buf = bytearray(build_pe())
+
+        def at(rva):
+            return TEXT_RAW + (rva - TEXT_RVA)
+
+        buf[at(0x1040):at(0x1043)] = bytes.fromhex("c468c3")
+        struct.pack_into("<III", buf, at(0x2024), 0x1040, 0x1043, 0x210C)   # 4th .pdata entry
+        struct.pack_into("<II", buf, 0x58 + 112 + 3 * 8, 0x2000, 4 * 12)   # exception dir: 4
+        with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as f:
+            f.write(bytes(buf))
+            path = f.name
+        try:
+            r = rc.census(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(r["pdata_functions"], 4)
+        self.assertGreaterEqual(r["decode_errors"], 1)
+
     def test_vzeroupper_does_not_desync_a_function(self):
         # A .pdata function that is exactly "vzeroupper; ret". vzeroupper takes no ModRM byte,
         # so both instructions must be decoded (the ret is indirect control flow). Reading a
