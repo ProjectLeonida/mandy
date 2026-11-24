@@ -32,6 +32,11 @@ rdna2spirv = support.rdna2spirv
 wave64_emulate_opt = rdna2spirv.wave64_emulate_opt
 
 MASK32 = 0xFFFFFFFF
+
+
+def _buffer_pointer_in(text):
+    """A buffer address becoming a pointer: the uint-pair bitcast (rdna2spirv.lower_addr64) or OpConvertUToPtr."""
+    return "OpBitcast %_ptr_PSB" in text or "OpConvertUToPtr" in text
 VSHARP = [0, 0, 0xFFFFFFFF, 0x31016FAC]  # raw buffer covering all offsets
 
 
@@ -447,6 +452,12 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
             elif op == "OpUConvert":
                 bits = types[a[0]][1]
                 vals[res] = vals[a[1]] & ((1 << bits) - 1)
+            elif op == "OpBitcast" and a[0] in ptr_types:
+                # A (low, high) uint pair bitcast to a PhysicalStorageBuffer pointer (rdna2spirv.lower_addr64): the
+                # address OpConvertUToPtr of the 64-bit value would give.
+                lo, hi = vals[a[1]]
+                ptrs[res] = ("psb", (lo & MASK32) | ((hi & MASK32) << 32))
+                vals[res] = ptrs[res]
             elif op == "OpBitcast":
                 k = types[a[0]]
                 v = vals[a[1]]
@@ -1477,10 +1488,10 @@ class StructuredEmulationTests(unittest.TestCase):
             i3 = next(i for i, l in enumerate(lines) if l.strip().startswith("%blk3 = OpLabel"))
             blk2_to_end = lines[i2:]
             store_idx = next(i for i, l in enumerate(blk2_to_end)
-                             if "OpStore" in l and "OpConvertUToPtr" in "\n".join(blk2_to_end[max(0, i - 15):i]))
+                             if "OpStore" in l and _buffer_pointer_in("\n".join(blk2_to_end[max(0, i - 15):i])))
             i3_rel = i3 - i2
             load_idx = next(i for i, l in enumerate(blk2_to_end[i3_rel:], i3_rel)
-                            if "OpLoad %uint" in l and "OpConvertUToPtr" in "\n".join(blk2_to_end[max(0, i - 15):i]))
+                            if "OpLoad %uint" in l and _buffer_pointer_in("\n".join(blk2_to_end[max(0, i - 15):i])))
             self.assertTrue(any("OpControlBarrier" in l for l in blk2_to_end[store_idx:load_idx]),
                             f"missing OpControlBarrier between blk2 buffer_store and blk3 buffer_load ({expected_mode})")
             for rev in (False, True):

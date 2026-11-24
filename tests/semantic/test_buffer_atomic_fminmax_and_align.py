@@ -463,7 +463,9 @@ class AtomicNaturalAlignment(unittest.TestCase):
         for body, mask_const in cases:
             with self.subTest(insn=body[-1]):
                 spv = translate(body)
-                self.assertIn("OpUConvert %uint", spv)
+                # The 64-bit address narrowed to its low word: OpUConvert %uint, or since lower_addr64 the pair's
+                # low word (an OpCopyObject of it).
+                self.assertTrue("OpUConvert %uint" in spv or "OpCopyObject %uint %a64_" in spv)
                 self.assertIn("OpBitwiseAnd %uint", spv)
                 self.assertIn(mask_const, spv)
 

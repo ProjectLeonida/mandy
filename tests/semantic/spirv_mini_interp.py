@@ -905,6 +905,20 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             values[res] = val(a[2]) if val(a[1]) else val(a[3])
         elif op == "OpCopyObject":
             values[res] = val(a[1])
+        elif op == "OpBitcast" and a[0] in ptr_types:
+            # A (low, high) pair of 32-bit words bitcast to a PhysicalStorageBuffer pointer (rdna2spirv.lower_addr64,
+            # as GL_EXT_buffer_reference_uvec2): the same address OpConvertUToPtr of the 64-bit value would give.
+            v = val(a[1])
+            vt = types.t.get(id_type.get(a[1]))
+            if not (vt and vt[0] == "vec" and vt[2] == 2 and types.t.get(vt[1], ())[:2] == ("int", 32)):
+                raise UnsupportedConstruct("OpBitcast to a pointer from a type other than a 2-component 32-bit "
+                                           "integer vector")
+            if not (isinstance(v, tuple) and len(v) == 2 and all(isinstance(x, int) and not isinstance(x, bool)
+                                                                 for x in v)):
+                raise UnsupportedConstruct("OpBitcast to a pointer from something other than two 32-bit words")
+            if ptr_types[a[0]][0] != "PhysicalStorageBuffer":
+                raise UnsupportedConstruct("OpBitcast to a pointer that is not PhysicalStorageBuffer")
+            values[res] = pointers[res] = ("psb", (v[0] & MASK) | ((v[1] & MASK) << 32))
         elif op == "OpBitcast":
             k, v = types.t[a[0]], val(a[1])
             source = types.t.get(id_type.get(a[1]))

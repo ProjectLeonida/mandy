@@ -295,7 +295,9 @@ def test_cs_store_packed_atomic_pointers(make_shader):
         access = defs[ptr].split()
         assert access[:2] == ["OpAccessChain", "%_ptr_PSB_uint"]
         _, _, base, index = access
-        assert defs[base].startswith("OpConvertUToPtr %_ptr_PSB_arr ")
+        # The array pointer is the address bitcast from a (low, high) uint pair (lower_addr64), or, with
+        # --int64-addresses, OpConvertUToPtr of the 64-bit value.
+        assert defs[base].startswith(("OpBitcast %_ptr_PSB_arr ", "OpConvertUToPtr %_ptr_PSB_arr "))
         assert defs[index] == "OpConstant %uint 0"
 
 

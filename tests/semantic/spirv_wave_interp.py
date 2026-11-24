@@ -804,6 +804,15 @@ class _Wave:
                 raise UnsupportedConstruct("nested OpCompositeInsert")
             v[int(a[3])] = self.raw(lane, a[1])
             return tuple(v)
+        if op == "OpBitcast" and a[0] in m.ptr_types:
+            # A (low, high) uint pair bitcast to a buffer pointer (rdna2spirv.lower_addr64): the address
+            # OpConvertUToPtr of the 64-bit value would give.
+            cls, pointee = m.ptr_types[a[0]]
+            if cls != "PhysicalStorageBuffer":
+                raise UnsupportedConstruct(f"OpBitcast to storage class {cls}")
+            lo, hi = (int(x) for x in self.val(lane, a[1]))
+            lane.pointers[res] = ("psb", (lo & 0xFFFFFFFF) | ((hi & 0xFFFFFFFF) << 32), pointee)
+            return None
         if op == "OpBitcast":
             k, v = m.types[a[0]], self.val(lane, a[1])
             if k[0] == "float" and isinstance(v, int) and not isinstance(v, bool):

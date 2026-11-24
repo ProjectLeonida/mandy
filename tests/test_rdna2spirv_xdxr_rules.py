@@ -43,21 +43,21 @@ class TestRdna2SpirvXdxrRules(unittest.TestCase):
     def test_buffer_load_ushort(self):
         """buffer_load_ushort loads 16 bits zero-extended into destination register."""
         asm = translate_cs("cs_load_ushort", "\tbuffer_load_ushort v0, v1, s[0:3], 0 offen")
-        self.assertIn("OpConvertUToPtr %_ptr_PSB_arr", asm)
+        self.assertTrue("OpBitcast %_ptr_PSB_arr" in asm or "OpConvertUToPtr %_ptr_PSB_arr" in asm)   # the buffer address (a uint pair since lower_addr64)
         self.assertIn("OpLoad %uint", asm)
         self.assertTrue("65535" in asm or "0xffff" in asm.lower())
 
     def test_buffer_load_sshort_signed(self):
         """buffer_load_sshort loads 16 bits sign-extended into destination register."""
         asm = translate_cs("cs_load_short", "\tbuffer_load_sshort v0, v1, s[0:3], 0 offen")
-        self.assertIn("OpConvertUToPtr %_ptr_PSB_arr", asm)
+        self.assertTrue("OpBitcast %_ptr_PSB_arr" in asm or "OpConvertUToPtr %_ptr_PSB_arr" in asm)   # the buffer address (a uint pair since lower_addr64)
         self.assertIn("OpLoad %uint", asm)
         self.assertIn("OpBitFieldSExtract", asm)
 
     def test_tbuffer_load_format_8_uint(self):
         """tbuffer_load_format_x with BUF_FMT_8_UINT decodes format 5 into uint."""
         asm = translate_cs("cs_tb_8_uint", "\ttbuffer_load_format_x v0, v1, s[0:3], 0 format:[BUF_FMT_8_UINT] offen")
-        self.assertIn("OpConvertUToPtr %_ptr_PSB_arr", asm)
+        self.assertTrue("OpBitcast %_ptr_PSB_arr" in asm or "OpConvertUToPtr %_ptr_PSB_arr" in asm)   # the buffer address (a uint pair since lower_addr64)
         self.assertIn("OpLoad %uint", asm)
         self.assertIn("OpBitFieldUExtract %uint", asm)
 

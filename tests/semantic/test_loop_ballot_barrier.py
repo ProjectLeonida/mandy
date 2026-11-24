@@ -238,6 +238,7 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
     consts = mod["consts"]
     types = mod["types"]
     gvars = mod["gvars"]
+    ptr_elem = mod["ptr_elem"]
     blocks = mod["blocks"]
     make_zero = mod["make_zero"]
     mem = {} if memory is None else memory
@@ -444,7 +445,13 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
             elif op == "OpCopyObject":
                 inv.ssa[res] = val_of(inv, args[1])
             elif op == "OpBitcast":
-                inv.ssa[res] = val_of(inv, args[1])
+                if args[0] in ptr_elem and ptr_elem[args[0]][0] == "PhysicalStorageBuffer":
+                    # A (low, high) uint pair bitcast to a buffer pointer (rdna2spirv.lower_addr64): the address
+                    # OpConvertUToPtr of the 64-bit value would give.
+                    lo, hi = val_of(inv, args[1])
+                    inv.ssa[res] = ("phys", (lo & M32) | ((hi & M32) << 32))
+                else:
+                    inv.ssa[res] = val_of(inv, args[1])
             elif op == "OpCompositeExtract":
                 inv.ssa[res] = val_of(inv, args[1])[int(args[2])]
             elif op == "OpCompositeConstruct":
