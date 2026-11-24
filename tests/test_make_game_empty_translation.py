@@ -171,6 +171,64 @@ class TranslateLockedIndexTest(unittest.TestCase):
         self.assertIn("rdna2spirv.py: shard 0 exited with 1.", self.failure('{"old": {}}', shard_code=1))
 
 
+class ShadersStageSubsetTest(unittest.TestCase):
+    """shaders() with --shader-list: writes to a separate subset directory, never touches the full index."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.work = tmp.name
+        self.dxbc = os.path.join(self.work, "shaders", "dxbc")
+        self.spirv = os.path.join(self.work, "shaders", "spirv")
+        os.makedirs(self.dxbc)
+        os.makedirs(self.spirv)
+        # Pre-populate a full index that must survive the subset run.
+        write(self.index(), json.dumps({"shader_full": {"stage": "ps", "fssm_sha256": "deadbeef"}}))
+
+    def index(self):
+        return os.path.join(self.spirv, "index.json")
+
+    def run_stage(self, shader_list=None):
+        calls = []
+
+        def fake_py(tool, *args):
+            if tool == "shader_carve.py":
+                write(os.path.join(self.dxbc, "index.json"), json.dumps([{"file": "shader.dxbc"}]))
+            elif tool == "fssm_unpack.py":
+                write(os.path.join(self.dxbc, "fssm_index.json"), json.dumps([{"name": "shader"}]))
+            elif tool == "shader_disasm.py":
+                write(os.path.join(self.dxbc, "disasm", "shader.s"), "synthetic listing\n")
+
+        def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=(), shader_list=None):
+            calls.append((spirv, shader_list))
+            os.makedirs(spirv, exist_ok=True)
+            write(os.path.join(spirv, "index.json"), json.dumps({"shader_subset": {"stage": "ps"}}))
+
+        with mock.patch.object(make_game, "py", fake_py), \
+                mock.patch.object(make_game, "need", lambda *a: None), \
+                mock.patch.object(make_game, "translate", fake_translate), \
+                mock.patch.object(make_game, "llvm_mc_signature", return_value="test llvm-mc 21"), \
+                mock.patch.object(make_game, "log", lambda *a: None):
+            make_game.shaders(os.path.join(self.work, "game"), self.work, 2, shader_list=shader_list)
+        return calls
+
+    def test_subset_translates_to_subset_dir_and_full_index_survives(self):
+        calls = self.run_stage(shader_list=["shader_subset"])
+        # translate() was called once, with the subset directory and the shader list
+        self.assertEqual(len(calls), 1)
+        spirv_dir, sl = calls[0]
+        self.assertEqual(spirv_dir, os.path.join(self.spirv, "subset"))
+        self.assertEqual(sl, ["shader_subset"])
+        # The full index is untouched.
+        with open(self.index(), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"shader_full": {"stage": "ps", "fssm_sha256": "deadbeef"}})
+        # The subset index exists with just the subset entry.
+        subset_index = os.path.join(self.spirv, "subset", "index.json")
+        self.assertTrue(os.path.exists(subset_index))
+        with open(subset_index, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"shader_subset": {"stage": "ps"}})
+
+
 class RequireTranslatedShadersTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()

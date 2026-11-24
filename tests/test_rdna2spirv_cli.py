@@ -164,6 +164,36 @@ class SourceDiscovery(unittest.TestCase):
             self.assertIn("1 pass spirv-val", stdout)
             self.assertTrue((out / "ps_ok.spv").is_file())
 
+    def test_shader_list_filters_translated_shaders(self):
+        # Only stems listed in --shader-list are translated; others in the folder are skipped.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "disasm")
+            os.mkdir(src)
+            with open(os.path.join(src, "ps_keep.s"), "w", encoding="utf-8") as f:
+                f.write("\ts_endpgm\n")
+            with open(os.path.join(src, "ps_skip.s"), "w", encoding="utf-8") as f:
+                f.write("\ts_endpgm\n")
+            with open(os.path.join(tmp, "ps_keep.dxbc"), "wb") as f:
+                f.write(b"DXBC" + bytes(28))
+            with open(os.path.join(tmp, "ps_skip.dxbc"), "wb") as f:
+                f.write(b"DXBC" + bytes(28))
+            list_file = os.path.join(tmp, "list.txt")
+            with open(list_file, "w", encoding="utf-8", newline="\n") as f:
+                f.write("ps_keep\n")
+            out = os.path.join(tmp, "spirv")
+            p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", out,
+                                "--shader-list", list_file,
+                                "--no-asm", "--no-validate", "--assembler", "python"],
+                               capture_output=True, text=True, errors="replace")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("1 translated", p.stdout)
+            self.assertTrue(os.path.exists(os.path.join(out, "ps_keep.spv")))
+            self.assertFalse(os.path.exists(os.path.join(out, "ps_skip.spv")))
+            # The index names only the listed shader.
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                index = json.load(f)
+            self.assertEqual(set(index), {"ps_keep"})
+
     def test_non_s_file_as_src_is_refused_with_usage_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "notes.txt")
