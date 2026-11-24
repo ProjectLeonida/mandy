@@ -19445,6 +19445,9 @@ def main():
     ap.add_argument("--shard", type=_shard_arg,
                     help="i/n: translate every n-th shader starting at i (run n processes in parallel, "
                          "then merge the index.part*.json files with --merge)")
+    ap.add_argument("--shader-list", default=None,
+                    help="only translate shaders whose stem is in this file (one stem per line); "
+                         "used to translate a subset of the corpus without rebuilding all 26,503")
     ap.add_argument("--no-asm", action="store_true",
                     help="delete each .spvasm once its .spv is written (the text is ~2.7x the binary: 35 GB for the corpus)")
     ap.add_argument("--assembler", choices=("spirv-as", "python"), default="spirv-as",
@@ -19608,6 +19611,14 @@ def main():
         files = files[:a.limit]
     if shard is not None:
         files = files[shard::sn]
+    if a.shader_list is not None:
+        wanted = set()
+        with open(a.shader_list, encoding="utf-8") as f:
+            for line in f:
+                name = line.strip()
+                if name:
+                    wanted.add(name)
+        files = [p for p in files if os.path.splitext(os.path.basename(p))[0] in wanted]
     why, ok, valid = Counter(), 0, 0
     meta = {}
     invalid = set()
