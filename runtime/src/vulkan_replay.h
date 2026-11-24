@@ -3532,6 +3532,25 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             dependency.pMemoryBarriers = &barrier;
             vk.pipeline_barrier2(command_buffer, &dependency);
         } else if (const auto* texture = std::get_if<TextureBarrier>(&command)) {
+            const BarrierScope src = vulkan_barrier_scope(texture->sync_before, texture->access_before, predicates);
+            const BarrierScope dst = vulkan_barrier_scope(texture->sync_after, texture->access_after, predicates);
+            // D3D12 Enhanced Barriers: UNDEFINED -> UNDEFINED means execution/memory sync with no layout transition.
+            // Emitting VkImageMemoryBarrier2 with newLayout = UNDEFINED violates VUID-VkImageMemoryBarrier2-newLayout-01198
+            // and would overwrite LayoutTracker to UNDEFINED (triggering a spurious zero-fill on next use).
+            if (texture->layout_before == d3d12_layout::undefined && texture->layout_after == d3d12_layout::undefined) {
+                VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+                barrier.srcStageMask = src.stages;
+                barrier.dstStageMask = dst.stages;
+                barrier.srcAccessMask = src.access;
+                barrier.dstAccessMask = dst.access;
+                if (barrier.srcStageMask) detail::restrict_to_queue(vk, barrier.srcStageMask, barrier.srcAccessMask);
+                if (barrier.dstStageMask) detail::restrict_to_queue(vk, barrier.dstStageMask, barrier.dstAccessMask);
+                VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                dependency.memoryBarrierCount = 1;
+                dependency.pMemoryBarriers = &barrier;
+                vk.pipeline_barrier2(command_buffer, &dependency);
+                continue;
+            }
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const bool discard = (texture->flags & texture_barrier_discard) ||
                                  texture->layout_before == d3d12_layout::undefined;
@@ -3546,8 +3565,6 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 pieces = detail::current(tracker, id, range, before);
                 detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker);
             }
-            const BarrierScope src = vulkan_barrier_scope(texture->sync_before, texture->access_before, predicates);
-            const BarrierScope dst = vulkan_barrier_scope(texture->sync_after, texture->access_after, predicates);
             // One barrier for each piece: nearly always one or two (LayoutPieces), which stay on the stack.
             std::array<VkImageMemoryBarrier2, 2> few;
             std::vector<VkImageMemoryBarrier2> many;
