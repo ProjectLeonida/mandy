@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import struct
 import sys
 
@@ -2557,11 +2558,9 @@ def build_test_kernel(code, guest_va, rw_base=KERNEL_RW, rx_base=KERNEL_BASE):
     return stub_bytes(entry_va) + img, tr
 
 
-QEMU_BIN = os.environ.get(
-    "QEMU_AARCH64",
-    "/home/nolan/.nix-profile/bin/qemu-system-aarch64"
-    if os.path.exists("/home/nolan/.nix-profile/bin/qemu-system-aarch64")
-    else "qemu-system-aarch64")
+# QEMU_AARCH64 names a binary that is not on PATH; otherwise the one on PATH, else the bare name for a clear error.
+QEMU_BIN = (os.environ.get("QEMU_AARCH64") or shutil.which("qemu-system-aarch64")
+            or "qemu-system-aarch64")
 
 
 def run_kernel(code, guest_va=0x46000000, timeout=15):

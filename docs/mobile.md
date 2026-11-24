@@ -32,7 +32,7 @@ of the x86-64 → arm64 groundwork.
 | Dispatch runtime | `tools/x64_recomp.py` `emit_rt` | `rt_dispatch` (guest pc → host pc through a generated table), `rt_mkflags` (NZCV+operands → canonical x86 EFLAGS; preserves NZCV), `rt_print` (semihosting result output) |
 | Verification | `tools/x64_recomp.py` `build_test_kernel`/`run_kernel` | flat kernel image → `qemu-system-aarch64 -M virt -cpu cortex-a53 -kernel -semihosting`; guest `ret` off the sentinel stack exits and prints `R=xxxxxxxx` (guest edi) |
 | PE census | `tools/recomp_census.py` | walks every `.pdata` function, decodes + translates it, reports coverage %, hazard mnemonics, indirect control flow, unwind-info flags |
-| Tests | `tests/test_x64_recomp.py`, `tests/test_recomp_census.py` | hand-built byte fixtures only; exec tests skip when qemu is absent |
+| Tests | `tests/test_x64_recomp.py`, `tests/test_recomp_census.py` | hand-built byte fixtures only; exec tests skip when qemu is absent (`QEMU_AARCH64` names the binary, else `qemu-system-aarch64` on `PATH`) |
 
 ### Translator contract (as implemented)
 

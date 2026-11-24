@@ -14,7 +14,6 @@ The qemu tests skip cleanly when qemu-system-aarch64 is not installed.
     python -I tests/test_x64_recomp.py
 """
 import os
-import shutil
 import sys
 import unittest
 
@@ -27,12 +26,8 @@ if TOOLS_DIR not in sys.path:
 
 import x64_recomp as x  # noqa: E402
 
-QEMU = os.environ.get(
-    "QEMU_AARCH64",
-    "/home/nolan/.nix-profile/bin/qemu-system-aarch64"
-    if os.path.exists("/home/nolan/.nix-profile/bin/qemu-system-aarch64")
-    else shutil.which("qemu-system-aarch64") or "")
-HAS_QEMU = bool(QEMU) and os.path.exists(QEMU)
+# The binary x64_recomp.run_kernel will start: QEMU_AARCH64, else qemu-system-aarch64 on PATH.
+HAS_QEMU = os.path.isfile(x.QEMU_BIN)
 
 GUEST_VA = 0x46000000
 SCRATCH = 0x47100000  # inside the kernel image's RW RAM window, away from ctx/stack
