@@ -716,6 +716,9 @@ struct OcclusionSegmentPool {
     // segment index whether it runs there. Empty when no segment of the submission holds a mesh draw.
     VkQueryPool mesh_pool = VK_NULL_HANDLE;
     std::vector<std::uint8_t> mesh;
+    // The mesh-primitives pool of the mesh segments (D3D-MESH-CLIPPING-COUNTER): one query per segment, begun and
+    // ended with the mesh segment. Null when the device has no meshShaderQueries.
+    VkQueryPool primitives_pool = VK_NULL_HANDLE;
 
     OcclusionSegmentPool() = default;
     OcclusionSegmentPool(const OcclusionSegmentPool&) = delete;
@@ -723,6 +726,7 @@ struct OcclusionSegmentPool {
     ~OcclusionSegmentPool() {
         if (pool) destroy(device, pool, nullptr);
         if (mesh_pool) destroy(device, mesh_pool, nullptr);
+        if (primitives_pool) destroy(device, primitives_pool, nullptr);
     }
 };
 
@@ -876,9 +880,12 @@ struct ReplayFunctions {
                        VkBuffer dst, VkDeviceSize offset)> resolve_binary_occlusion;
     // Adds `count` pipeline-statistics results into one D3D12_QUERY_DATA_PIPELINE_STATISTICS, outside conditional
     // rendering: the segments of a statistics query split around resolves (D3D-162) and mesh draws (D3D-291).
-    // Segment i is in the second pool when mesh[i] is set (mesh may be null: none is).
-    std::function<void(VkCommandBuffer, VkQueryPool, VkQueryPool mesh_pool, const std::uint8_t* mesh,
-                       std::uint32_t first, std::uint32_t count, VkBuffer dst, VkDeviceSize offset)>
+    // Segment i is in the second pool when mesh[i] is set (mesh may be null: none is). The third pool holds the
+    // mesh-primitives count of a mesh segment (D3D-MESH-CLIPPING-COUNTER); it is null when the device has no
+    // meshShaderQueries.
+    std::function<void(VkCommandBuffer, VkQueryPool, VkQueryPool mesh_pool, VkQueryPool primitives_pool,
+                       const std::uint8_t* mesh, std::uint32_t first, std::uint32_t count, VkBuffer dst,
+                       VkDeviceSize offset)>
         sum_statistics;
     // Sums `count` binary-occlusion segments and normalizes the total to a 64-bit 0 or 1, outside conditional
     // rendering: a binary query split over physical segments because it overlaps other occlusion queries (D3D-252).
@@ -959,6 +966,8 @@ struct QueryResolveRun {
     bool sum = false;
     // Statistics segments: the mesh-compatible pool and the kind of each segment (OcclusionSegmentPool::mesh).
     VkQueryPool mesh_pool = VK_NULL_HANDLE;
+    // The mesh-primitives pool of the mesh segments (D3D-MESH-CLIPPING-COUNTER); null without meshShaderQueries.
+    VkQueryPool primitives_pool = VK_NULL_HANDLE;
     const std::uint8_t* mesh = nullptr;
 };
 
@@ -2347,6 +2356,8 @@ public:
     // For each of those segments, whether it holds mesh draws and so runs in statistics_mesh_pool (D3D-291).
     std::vector<std::uint8_t> statistics_mesh;
     VkQueryPool statistics_mesh_pool = VK_NULL_HANDLE;
+    // The mesh-primitives pool of the list's mesh segments (D3D-MESH-CLIPPING-COUNTER).
+    VkQueryPool statistics_primitives_pool = VK_NULL_HANDLE;
     // Copies, resolves and UAV clears that run as transfers, recorded while a predicate was set. D3D12 skips them
     // when the predicate says so, but Vulkan's conditional rendering does not cover transfer commands, so they run
     // unconditionally (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
@@ -2391,10 +2402,26 @@ inline ReplayResult plan_occlusion_segments(PreparedList& out) {
 // Helper dispatches must not contribute to the application's CSInvocations (D3D-162). Query resolves and
 // ordinary helper commands share one sequence of physical statistics segments. Resolve dispatch requirements
 // depend on heap state at planning time, so every non-timestamp resolve splits conservatively.
-// A mesh draw cannot run while a query with the input-assembly, vertex, geometry or tessellation counters is active
-// (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076), though D3D12 allows it and reads those fields as 0. A query
-// that holds a mesh draw is split as well (D3D-291): a segment's first draw decides whether it runs in the full pool
-// or in the mesh one (statistics_mesh), and a later draw of the other kind ends it and begins one of its own kind.
+// The counters a mesh draw may count: VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076 leaves the input
+// assembly, vertex, geometry, tessellation and clipping bits out of the pipelineStatistics flags of every pool that
+// is active during a mesh draw, so a mesh segment runs in a pool with the fragment and compute counters only
+// (D3D-291). D3D12 counts the clipping invocations and primitives of a mesh pipeline, but Vulkan has no counter for
+// them during a mesh draw, so those two fields read 0.
+inline constexpr VkQueryPipelineStatisticFlags kMeshStatisticsFlags =
+    VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT | VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT;
+// The bits the same VUID forbids in a pool that is active during a mesh draw.
+inline constexpr VkQueryPipelineStatisticFlags kForbiddenMeshStatisticsFlags =
+    VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT | VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT |
+    VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT | VK_QUERY_PIPELINE_STATISTIC_GEOMETRY_SHADER_INVOCATIONS_BIT |
+    VK_QUERY_PIPELINE_STATISTIC_GEOMETRY_SHADER_PRIMITIVES_BIT | VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT |
+    VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT |
+    VK_QUERY_PIPELINE_STATISTIC_TESSELLATION_CONTROL_SHADER_PATCHES_BIT |
+    VK_QUERY_PIPELINE_STATISTIC_TESSELLATION_EVALUATION_SHADER_INVOCATIONS_BIT;
+// A mesh draw cannot run while a query with the input-assembly, vertex, geometry, tessellation or clipping counters
+// is active (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076), though D3D12 allows it and reads those fields as
+// 0. A query that holds a mesh draw is split as well (D3D-291): a segment's first draw decides whether it runs in
+// the full pool or in the mesh one (statistics_mesh), and a later draw of the other kind ends it and begins one of
+// its own kind.
 // Dispatches and segments without draws use the full pool; ExecuteIndirect draws count as vertex draws. Each draw
 // has its own rendering scope, so a split before one stays outside rendering, as a helper's does.
 inline void plan_statistics_segments(PreparedList& out) {
@@ -3241,6 +3268,7 @@ public:
                 retain(statistics_pool);
                 list.statistics_pool = statistics_pool->pool;
                 list.statistics_mesh_pool = statistics_pool->mesh_pool;
+                list.statistics_primitives_pool = statistics_pool->primitives_pool;
                 list.statistics_base = statistics_base;
             } else if (mesh) {
                 // Unsplit, the query would be active around a mesh draw with counters Vulkan forbids there.
@@ -3297,7 +3325,8 @@ public:
                         const bool any_mesh = kinds && std::find(kinds + saved.first, kinds + saved.first + saved.count,
                                                                  std::uint8_t(1)) != kinds + saved.first + saved.count;
                         run = {saved.segments->pool, saved.first, saved.count, run.offset,
-                               saved.count > 1 || any_mesh, saved.segments->mesh_pool, kinds};
+                               saved.count > 1 || any_mesh, saved.segments->mesh_pool,
+                               saved.segments->primitives_pool, kinds};
                         if (any_mesh && !statistics) return ReplayResult::invalid_query;
                         if (!can_sum || (run.sum && !uncounted)) return ReplayResult::unsupported;
                         if (statistics) needs_statistics_sum |= run.sum;
@@ -3364,6 +3393,9 @@ inline void end_statistics_segment(const PreparedList& list, std::uint32_t segme
                                    const ReplayFunctions& vk) {
     if (segment == PreparedQuery::no_segment) return;
     vk.end_query(cb, statistics_segment_pool(list, segment), list.statistics_base + segment);
+    // The mesh-primitives count of a mesh segment (D3D-MESH-CLIPPING-COUNTER).
+    if (list.statistics_primitives_pool && list.statistics_mesh[segment])
+        vk.end_query(cb, list.statistics_primitives_pool, list.statistics_base + segment);
 }
 
 inline void begin_statistics_segment(const PreparedList& list, std::uint32_t segment, VkCommandBuffer cb,
@@ -3372,6 +3404,12 @@ inline void begin_statistics_segment(const PreparedList& list, std::uint32_t seg
     const auto pool = statistics_segment_pool(list, segment);
     vk.reset_query_pool(cb, pool, list.statistics_base + segment, 1);
     vk.begin_query(cb, pool, list.statistics_base + segment, 0);
+    // The mesh-primitives count of a mesh segment (D3D-MESH-CLIPPING-COUNTER): a query of its own type, which the
+    // mesh statistics pool cannot hold.
+    if (list.statistics_primitives_pool && list.statistics_mesh[segment]) {
+        vk.reset_query_pool(cb, list.statistics_primitives_pool, list.statistics_base + segment, 1);
+        vk.begin_query(cb, list.statistics_primitives_pool, list.statistics_base + segment, 0);
+    }
 }
 
 }  // namespace detail
@@ -3432,7 +3470,8 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
             if (!run.pool) {
                 vk.fill_buffer(cb, dst, run.offset, VkDeviceSize(run.count) * size, 0);
             } else if (run.sum && resolve.type == d3d12_query::pipeline_statistics) {
-                vk.sum_statistics(cb, run.pool, run.mesh_pool, run.mesh, run.first, run.count, dst, run.offset);
+                vk.sum_statistics(cb, run.pool, run.mesh_pool, run.primitives_pool, run.mesh, run.first, run.count,
+                                  dst, run.offset);
             } else if (run.sum && binary) {
                 vk.sum_binary_occlusion(cb, run.pool, run.first, run.count, dst, run.offset);
             } else if (run.sum || binary) {

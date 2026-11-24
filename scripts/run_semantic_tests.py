@@ -8,13 +8,15 @@ r"""Run the translator regression suite (tests/semantic) one process per test fi
 
 `-p` / `--pattern` selects test filenames using unittest discover's glob syntax (default `test*.py`). Quote the
 pattern so the shell does not expand it. Only Python module filenames are selected, including inside packages;
-the pattern matches their basenames, not directory paths. No matching files is an error in serial and parallel runs.
+the pattern matches their basenames, not directory paths. Package `__init__.py` modules are always included,
+because discover imports them and runs any TestCase they define regardless of the pattern. No matching files is an
+error in serial and parallel runs.
 
 It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py` by default, and packages below it), each as
 `python -m unittest <module>` from that folder, so a file sees the same import path as under discover. The files can
 run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
 or on a single core, it runs that discover command itself. Prints the output of every failing file and one summary
-line, and exits 1 if a file fails or none is found. Standard library only.
+line, and exits 1 if a file fails, none is found, or no test ran. Standard library only.
 
 `--timeout SECONDS` limits each module subprocess in parallel mode, or the entire discover subprocess with
 `-j 1`. The value must be positive and at most 86400 seconds (24 hours), keeping it within platform wait limits.
@@ -35,15 +37,31 @@ import time
 MAX_TIMEOUT_SECONDS = 24 * 60 * 60
 
 
+def module_path(directory, module):
+    """Source path of a dotted module name, including a package's `__init__.py`."""
+    parts = module.split(".")
+    if parts[-1] == "__init__":
+        return os.path.join(directory, *parts[:-1], "__init__.py")
+    return os.path.join(directory, *parts) + ".py"
+
+
 def test_modules(directory, pattern="test*.py"):
     """Dotted names of the test modules unittest discover finds under `directory` (it enters packages only)."""
     names = []
     for base, dirs, files in os.walk(directory):
         dirs[:] = sorted(d for d in dirs if os.path.isfile(os.path.join(base, d, "__init__.py")))
         prefix = os.path.relpath(base, directory).replace(os.sep, ".")
+        # Discover imports every package below its start folder even when no filename in it matches the pattern,
+        # and loads TestCase classes defined in the package initializer. Parallel runs must see those too.
+        if prefix != "." and "__init__.py" in files:
+            init = f"{prefix}.__init__"
+            if init not in names:
+                names.append(init)
         for name in sorted(files):
             if re.fullmatch(r"[_a-z]\w*\.py", name, re.IGNORECASE) and fnmatch.fnmatch(name, pattern):
-                names.append(name[:-3] if prefix == "." else f"{prefix}.{name[:-3]}")
+                module = name[:-3] if prefix == "." else f"{prefix}.{name[:-3]}"
+                if module not in names:
+                    names.append(module)
     return names
 
 
@@ -56,8 +74,12 @@ def positive_seconds(value):
 
 
 def run_module(directory, module, verbose, timeout=None):
-    """(return code, tests run, output) of `python -m unittest <module>` run from `directory`."""
-    cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), module]
+    """(return code, tests run, output) of `python -m unittest <target>` run from `directory`."""
+    # `python -m unittest pkg.__init__` imports pkg and then runs the same file again as pkg.__init__, so a
+    # registration in the initializer happens twice. Running the package itself imports it once; module_path() is
+    # still the initializer's path, so the jobs stay sorted by the file they run.
+    target = module[:-len(".__init__")] if module.endswith(".__init__") else module
+    cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), target]
     try:
         p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                            errors="replace", timeout=timeout)
@@ -67,7 +89,12 @@ def run_module(directory, module, verbose, timeout=None):
             out = out.decode(locale.getpreferredencoding(False), errors="replace")
         return 1, 0, out + f"\nTIMED OUT after {timeout:g} s: {module}\n"
     ran = re.search(r"^Ran (\d+) tests? in", p.stdout, re.M)
-    return p.returncode, int(ran.group(1)) if ran else 0, p.stdout
+    count = int(ran.group(1)) if ran else 0
+    # Discover imports every package initializer, but an empty one has no tests to run. It is included in the
+    # module list so parallel runs see TestCase classes when there are any; without them, it is not a failure.
+    if p.returncode == 5 and count == 0 and module.endswith(".__init__") and "NO TESTS RAN" in p.stdout:
+        return 0, 0, p.stdout
+    return p.returncode, count, p.stdout
 
 
 def main(argv=None):
@@ -94,7 +121,7 @@ def main(argv=None):
             print(f"TIMED OUT after {a.timeout:g} s: unittest discover in {directory}", file=sys.stderr)
             return 1
     # Largest files first: they tend to run longest, and one started last would set the wall time alone.
-    modules.sort(key=lambda m: -os.path.getsize(os.path.join(directory, *m.split(".")) + ".py"))
+    modules.sort(key=lambda m: -os.path.getsize(module_path(directory, m)))
     start, total, failed = time.monotonic(), 0, []
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:
         jobs = {pool.submit(run_module, directory, m, a.verbose, a.timeout): m for m in modules}
@@ -109,6 +136,11 @@ def main(argv=None):
     took = time.monotonic() - start
     summary = f"{len(modules)} files, {total} tests, {len(failed)} files failed in {took:.0f} s with {a.jobs} jobs"
     print(summary + (": " + ", ".join(sorted(failed)) if failed else ""))
+    if total == 0:
+        # An empty package initializer is a job that legitimately runs no tests; a run where every job did is not a
+        # pass (discover, which -j 1 forwards to, exits 5 for it).
+        print(f"no tests ran in {directory}")
+        return 1
     return 1 if failed else 0
 
 

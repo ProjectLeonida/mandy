@@ -5,8 +5,9 @@ repository's test corpus does not contain `game_scarlett_master.exe` (RT-5); the
 separately maps it and leaves 30 imports unimplemented, and `--init` runs its TLS callbacks and the package DLLs'
 `DllMain`s without an exception
 ([`runtime_imports.md`](runtime_imports.md#the-retail-executable-rt-5)), so this page is still the procedure and the
-trace tool for the first boot. The executable's `ws2_32.dll` imports bind to the host's, so run `--run` with the
-network off. Nothing here quotes game data; a real trace stays on the player's machine.
+trace tool for the first boot. Outbound `ws2_32.dll` and `winhttp.dll` calls are restricted offline by the shims
+(`ws2_offline.cpp` permits loopback only; `winhttp_offline.cpp` refuses all requests), though running with the network
+off remains good defence in depth. Nothing here quotes game data; a real trace stays on the player's machine.
 
 ## 1. What the first boot produces
 
@@ -31,6 +32,11 @@ DllMain/TLS results, exceptions with their stack frames, the exit, and the D3D12
 per method. The `[rt]` lines in the same stderr log carry the device parameters, feature ids and warnings; the
 summary leaves them as a count, so grep `^\[rt\]` for those.
 
+For `xmem_physical_pages`, the shim records the first request for each distinct attribute word. The text and
+JSON summaries list the API, raw attribute word, requested page count and caller for the first `--limit`
+records in trace order. Use `--limit 0` to keep the total with no records. Text shows how many records were
+omitted, and JSON keeps the full count in `startup.kinds.xmem_physical_pages`.
+
 ## 2. Commands
 
 Windows (from the repository root):
@@ -41,7 +47,8 @@ $exe = "C:\path\to\game_scarlett_master.exe"
 $pkg = "C:\path\to\the\package"
 $trace = Join-Path $env:TEMP boot.jsonl
 $log = Join-Path $env:TEMP d3d12.log
-.\runtime\build\gta6rt.exe --run $exe --game-dir $pkg --trace $trace --trace-d3d12 2>&1 |
+& { $ErrorActionPreference = 'Continue'
+    .\runtime\build\gta6rt.exe --run $exe --game-dir $pkg --trace $trace --trace-d3d12 2>&1 } |
     ForEach-Object { $_.ToString() } |
     Out-File -LiteralPath $log -Width 4096 -Encoding utf8
 python -I tools\boot_trace.py $trace --d3d12 $log
@@ -50,6 +57,13 @@ python -I tools\boot_trace.py $trace --d3d12 $log
 The capture pipeline writes each message as text to avoid PowerShell 5.1 wrapping the first stderr record at a
 narrow output width. The tool also reads existing UTF-16LE logs saved with `2>` in PowerShell 5.1 and recognizes
 the `program.exe : ` prefix on the first stderr line.
+
+The `& { ... }` block matters when the session (or a profile or script) has `$ErrorActionPreference = 'Stop'`:
+Windows PowerShell 5.1 then turns the first stderr line into a terminating error, the run stops there, and the log
+holds no `[d3d12-trace]` line, so it reads as a run with no D3D12 call. The block sets `Continue` for the run only
+(`scripts/first_look.ps1` captures its dry run the same way). Measured on 5.1.26100 with a stand-in that prints three
+trace lines to stderr and exits 37: without the block, all three with `Continue` and none with `Stop`; with it, all
+three with either, `$LASTEXITCODE` 37, and the session's preference unchanged.
 
 Linux under Wine (a cross build made with xwin, or the `runtime-windows` artifact; the backend must be Vulkan):
 
