@@ -31,6 +31,7 @@ import re
 import stat
 import statistics
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from xml.parsers.expat import errors
@@ -38,7 +39,9 @@ from xml.parsers.expat import errors
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+import file_mode  # noqa: E402
 import gamedata_index as gi  # noqa: E402
+import replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 BOM = b"\xef\xbb\xbf"
@@ -478,7 +481,8 @@ def xml_files(directory: str):
     def scan_failed(exc: OSError) -> None:
         raise exc
 
-    for base, _, names in os.walk(directory, onerror=scan_failed):
+    for base, dirs, names in os.walk(directory, onerror=scan_failed):
+        dirs.sort()
         for name in sorted(names):
             if name.lower().endswith(".xml"):
                 yield os.path.join(base, name)
@@ -601,14 +605,43 @@ def _make_parent(path: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 
-def write_csv(path: str, rows: list) -> None:
+def _atomic_write_text(path: str, write_body) -> None:
+    """Write a text report through a staging file in the destination folder and replace atomically."""
     _make_parent(path)
+    parent = os.path.dirname(os.path.abspath(path))
+    mode = file_mode.published_mode(path)
+    fd, tmp_path = tempfile.mkstemp(prefix=".gamedata_xml-", suffix=".tmp", dir=parent)
+    try:
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                fd = None
+                write_body(f)
+                f.flush()
+        finally:
+            if fd is not None:
+                os.close(fd)
+        os.chmod(tmp_path, mode)
+        replace_retry.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def write_csv(path: str, rows: list) -> None:
     fields = ["source", "offset_hex", "bytes", "chunks", "root", "category", "header", "complete",
               "well_formed", "fragment", "tail_only", "truncated", "malformed", "element_count",
               "max_depth", "comments", "attributes", "refs", "platform", "platform_total", "filename",
               "parent_path", "parent_file", "xi_include", "type_attrs", "type_values", "content_values",
               "error"]
-    with open(path, "w", newline="", encoding="utf-8") as f:
+
+    def _body(f) -> None:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore", lineterminator="\n")
         writer.writeheader()
         for row in rows:
@@ -620,6 +653,16 @@ def write_csv(path: str, rows: list) -> None:
                          "malformed"):
                 out[flag] = str(row[flag]).lower()
             writer.writerow(out)
+
+    _atomic_write_text(path, _body)
+
+
+def write_json(path: str, payload: dict) -> None:
+    def _body(f) -> None:
+        json.dump(payload, f, indent=1, allow_nan=False)
+        f.write("\n")
+
+    _atomic_write_text(path, _body)
 
 
 def plural(count: int, word: str) -> str:
@@ -677,13 +720,13 @@ def print_summary(summary: dict, agg: dict) -> None:
               f'{root}  [{stats["category"]}]')
 
 
-def main() -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("targets", nargs="+", help="carve directory or XML file(s)")
     parser.add_argument("--csv", help="write one row per XML document to this CSV")
     parser.add_argument("--json", help="write the summary, per-root catalog and rows to this JSON")
     parser.add_argument("--check", action="store_true", help="validate well-formedness and report fragments")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.csv and args.json and same_report_path(args.csv, args.json):
         parser.error("--csv and --json must use different paths")
@@ -730,9 +773,7 @@ def main() -> int:
     if args.json:
         public_rows = [{key: value for key, value in row.items() if key != "_scan"} for row in rows]
         try:
-            _make_parent(args.json)
-            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"summary": summary, "roots": agg["roots"], "rows": public_rows}, f, indent=1)
+            write_json(args.json, {"summary": summary, "roots": agg["roots"], "rows": public_rows})
         except OSError as exc:
             print(f"ERROR: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)
             return 2
