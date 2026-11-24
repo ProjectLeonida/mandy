@@ -3,7 +3,7 @@
 Each program loads its operands into VGPR pairs, runs one instruction into v[4:5] and exports both words, which the CPU interpreter computes from the emitted SPIR-V. The
 expected values are written out by hand from the RDNA2 ISA (docs/design.md, "Binary64 multiply, FMA, min/max and
 conversions"); the integer conversions are in test_valu_cvt_int_f64.py. Until this change the translator refused
-all of these ops by name (Unsupported).
+all of these ops by name (Unsupported). The f64 results ignore the VOP3 omod (mul:2, mul:4, div:2) and apply clamp.
 Standard library only; no game data.
 """
 import os
@@ -16,6 +16,7 @@ from support import mrt0_words, translate_lines  # noqa: E402  (support puts too
 import rdna2spirv  # noqa: E402
 
 QNAN = 0x7FF8000000000000
+SNAN = 0x7FF0000000000001
 NEG_QNAN_PAYLOAD = 0xFFF8000000000123
 INF = float("inf")
 
@@ -29,9 +30,9 @@ def value(word):
     return struct.unpack("<d", struct.pack("<Q", word))[0]
 
 
-def run(op_line, x=0.0, y=0.0, z=0.0):
-    """The binary64 word left in v[4:5] after op_line, with v[0:1] = x, v[2:3] = y and v[6:7] = z."""
-    lines = []
+def run(op_line, x=0.0, y=0.0, z=0.0, pre=()):
+    """The binary64 word left in v[4:5] after op_line, with v[0:1] = x, v[2:3] = y and v[6:7] = z. `pre` lines run first."""
+    lines = list(pre)
     for reg, v in ((0, x), (2, y), (6, z)):
         w = bits(v)
         lines += [f"v_mov_b32 v{reg}, {w & 0xFFFFFFFF:#x}", f"v_mov_b32 v{reg + 1}, {w >> 32:#x}"]
@@ -43,7 +44,7 @@ def run(op_line, x=0.0, y=0.0, z=0.0):
 
 class MulF64(unittest.TestCase):
     def test_products(self):
-        for x, y, want in ((1.5, -2.25, -3.375), (3.0, 1.0 / 3.0, 3.0 * (1.0 / 3.0)), (1e300, 1e10, INF),
+        for x, y, want in ((1.5, -2.25, -3.375), (3.0, 0x3FD5555555555555, 1.0), (1e300, 1e10, INF),
                            (-0.0, 5.0, -0.0), (2.0 ** -1000, 2.0 ** -60, 2.0 ** -1060)):
             with self.subTest(x=x, y=y):
                 self.assertEqual(run("v_mul_f64 v[4:5], v[0:1], v[2:3]", x, y), bits(want))
@@ -52,11 +53,20 @@ class MulF64(unittest.TestCase):
         w = run("v_mul_f64 v[4:5], v[0:1], v[2:3]", INF, 0.0)
         self.assertNotEqual(value(w), value(w))
 
-    def test_source_modifiers_literal_and_output_modifiers(self):
+    def test_source_modifiers_literal_inline_and_sgpr_sources(self):
+        # An inline integer is sign-extended to the binary64 bits, so 2 is the denormal 2 * 2^-1074 (design.md).
+        self.assertEqual(run("v_mul_f64 v[4:5], 2, v[0:1]", 1.5), 0x3)
+        # An SGPR pair is read as an f64 source.
+        lines = ["s_mov_b32 s2, 0", "s_mov_b32 s3, 0x40000000"]
+        self.assertEqual(run("v_mul_f64 v[4:5], s[2:3], v[0:1]", 1.5, pre=lines), bits(3.0))
+        self.assertEqual(run("v_mul_f64 v[4:5], v[0:1], s[2:3]", 1.5, pre=lines), bits(3.0))
+
         self.assertEqual(run("v_mul_f64 v[4:5], -v[0:1], |v[2:3]|", 1.5, -2.0), bits(-3.0))
         # A hex literal dword is bits 63:32 of the f64 operand (docs/design.md, f64 literal sources): 2.0.
         self.assertEqual(run("v_mul_f64 v[4:5], 0x40000000, v[0:1]", 1.5), bits(3.0))
         self.assertEqual(run("v_mul_f64 v[4:5], v[0:1], 0.5", 3.0), bits(1.5))
+
+    def test_clamp(self):
         self.assertEqual(run("v_mul_f64 v[4:5], v[0:1], v[2:3] clamp", 1.5, 2.0), bits(1.0))
         self.assertEqual(run("v_mul_f64 v[4:5], v[0:1], v[2:3] clamp", -1.5, 2.0), 0)
 
@@ -71,15 +81,26 @@ class FmaF64(unittest.TestCase):
         self.assertEqual(run("v_fma_f64 v[4:5], v[0:1], v[2:3], v[6:7]", 1.5, 2.0, 0.25), bits(3.25))
         self.assertEqual(run("v_fma_f64 v[4:5], v[0:1], 2.0, 0x3ff00000", 1.5), bits(4.0))
         self.assertEqual(run("v_fma_f64 v[4:5], -v[0:1], v[2:3], v[6:7]", 1.5, 2.0, 0.25), bits(-2.75))
-        self.assertEqual(run("v_fma_f64 v[4:5], v[0:1], v[2:3], v[6:7] div:2", 1.5, 2.0, 1.0), bits(2.0))
+        # The omod is ignored: 1.5 * 2.0 + 1.0 = 4.0 whatever div:2 says.
+        self.assertEqual(run("v_fma_f64 v[4:5], v[0:1], v[2:3], v[6:7] div:2", 1.5, 2.0, 1.0), bits(4.0))
 
 
 class MinMaxF64(unittest.TestCase):
     def test_ordered_values(self):
-        for x, y in ((1.5, -2.0), (-2.0, 1.5), (INF, -INF), (1e-310, 2e-310)):
+        for x, y, lo, hi in ((1.5, -2.0, -2.0, 1.5), (-2.0, 1.5, -2.0, 1.5), (INF, -INF, -INF, INF),
+                             (1e-310, 2e-310, 1e-310, 2e-310)):
             with self.subTest(x=x, y=y):
-                self.assertEqual(run("v_min_f64 v[4:5], v[0:1], v[2:3]", x, y), bits(min(x, y)))
-                self.assertEqual(run("v_max_f64 v[4:5], v[0:1], v[2:3]", x, y), bits(max(x, y)))
+                self.assertEqual(run("v_min_f64 v[4:5], v[0:1], v[2:3]", x, y), bits(lo))
+                self.assertEqual(run("v_max_f64 v[4:5], v[0:1], v[2:3]", x, y), bits(hi))
+
+    def test_signed_zeros(self):
+        # -0 orders below +0, in both operand orders. That is the rule measured for v_min/max_f32 (design.md); it is
+        # NOT measured for the f64 forms, and GLSL.std.450 NMin/NMax leave it to the driver without
+        # SignedZeroInfNanPreserve (the CPU interpreter models it).
+        for x, y in ((-0.0, 0.0), (0.0, -0.0)):
+            with self.subTest(x=x, y=y):
+                self.assertEqual(run("v_min_f64 v[4:5], v[0:1], v[2:3]", x, y), bits(-0.0))
+                self.assertEqual(run("v_max_f64 v[4:5], v[0:1], v[2:3]", x, y), bits(0.0))
 
     def test_one_nan_gives_the_other_operand(self):
         for op in ("v_min_f64", "v_max_f64"):
@@ -92,9 +113,29 @@ class MinMaxF64(unittest.TestCase):
             with self.subTest(op=op):
                 self.assertEqual(run(f"{op} v[4:5], v[0:1], v[2:3]", NEG_QNAN_PAYLOAD, QNAN), NEG_QNAN_PAYLOAD)
 
+    def test_signalling_nan_operands(self):
+        # Only what the translator documents: one NaN (signalling too) gives the other operand, and two NaNs give
+        # S0 with its bits intact, so a signalling S0 is not quieted.
+        for op in ("v_min_f64", "v_max_f64"):
+            with self.subTest(op=op):
+                self.assertEqual(run(f"{op} v[4:5], v[0:1], v[2:3]", SNAN, 1.5), bits(1.5))
+                self.assertEqual(run(f"{op} v[4:5], v[0:1], v[2:3]", 1.5, SNAN), bits(1.5))
+                self.assertEqual(run(f"{op} v[4:5], v[0:1], v[2:3]", SNAN, QNAN), SNAN)
+
+    def test_sign_modifiers_on_a_nan_src0_move_the_sign_bit(self):
+        # Two NaNs: the result is S0 with abs/neg applied to its sign bit alone (payload and quiet bit untouched).
+        for op in ("v_min_f64", "v_max_f64"):
+            with self.subTest(op=op):
+                self.assertEqual(run(f"{op} v[4:5], -v[0:1], v[2:3]", NEG_QNAN_PAYLOAD, QNAN), 0x7FF8000000000123)
+                self.assertEqual(run(f"{op} v[4:5], |v[0:1]|, v[2:3]", NEG_QNAN_PAYLOAD, QNAN), 0x7FF8000000000123)
+                self.assertEqual(run(f"{op} v[4:5], -v[0:1], v[2:3]", SNAN, QNAN), 0xFFF0000000000001)
+                self.assertEqual(run(f"{op} v[4:5], -|v[0:1]|, v[2:3]", 0x7FF8000000000123, QNAN), 0xFFF8000000000123)
+
     def test_modifiers(self):
         self.assertEqual(run("v_max_f64 v[4:5], -v[0:1], |v[2:3]|", 1.5, -0.5), bits(0.5))
-        self.assertEqual(run("v_max_f64 v[4:5], v[0:1], v[2:3] mul:4 clamp", 0.5, 0.125), bits(1.0))
+        self.assertEqual(run("v_min_f64 v[4:5], |v[0:1]|, -v[2:3]", -1.5, 0.5), bits(-0.5))
+        # The omod is ignored, clamp applies: max(0.5, 0.125) = 0.5 whatever mul:4 says.
+        self.assertEqual(run("v_max_f64 v[4:5], v[0:1], v[2:3] mul:4 clamp", 0.5, 0.125), bits(0.5))
 
 
 class CvtF64F32(unittest.TestCase):
@@ -120,6 +161,43 @@ class CvtF64F32(unittest.TestCase):
         self.assertEqual(self.run_f32(0x3FC00000, "v_cvt_f64_f32_e64 v[4:5], -v0"), bits(-1.5))
         self.assertEqual(self.run_f32(0x3FC00000, "v_cvt_f64_f32_e64 v[4:5], v0 clamp"), bits(1.0))
         self.assertEqual(run("v_cvt_f64_f32_e32 v[4:5], 0.5"), bits(0.5))
+
+
+class OmodIsIgnored(unittest.TestCase):
+    """mul:2, mul:4 and div:2 change nothing on an f64 result while f64 denormals are kept (docs/design.md); clamp
+    still applies, with or without an omod in front of it. Unmeasured for these five ops."""
+
+    # (line without modifiers, operands x y z, hand-written result)
+    CASES = (
+        ("v_mul_f64 v[4:5], v[0:1], v[2:3]", (1.5, 2.0, 0.0), 3.0),
+        ("v_fma_f64 v[4:5], v[0:1], v[2:3], v[6:7]", (1.5, 2.0, 1.0), 4.0),
+        ("v_min_f64 v[4:5], v[0:1], v[2:3]", (3.0, 5.0, 0.0), 3.0),
+        ("v_max_f64 v[4:5], v[0:1], v[2:3]", (3.0, 5.0, 0.0), 5.0),
+    )
+
+    def test_omods_scale_nothing(self):
+        for line, (x, y, z), want in self.CASES:
+            for omod in ("mul:2", "mul:4", "div:2"):
+                with self.subTest(line=line, omod=omod):
+                    self.assertEqual(run(f"{line} {omod}", x, y, z), bits(want))
+        for omod in ("mul:2", "mul:4", "div:2"):
+            with self.subTest(op="v_cvt_f64_f32", omod=omod):
+                self.assertEqual(run(f"v_cvt_f64_f32_e64 v[4:5], v0 {omod}", 0x3FC00000), bits(1.5))
+
+    def test_omod_and_clamp_together(self):
+        # clamp alone gives 1.0 for the results above 1; with an omod (ignored) the same. A result below 1 passes
+        # through unscaled: 0.25 * 3.0 = 0.75 stays 0.75 under mul:4 clamp, and would be 1.0 if mul:4 applied.
+        for line, (x, y, z), want in self.CASES:
+            for omod in ("mul:2", "mul:4", "div:2"):
+                with self.subTest(line=line, omod=omod):
+                    self.assertEqual(run(f"{line} {omod} clamp", x, y, z), bits(1.0))
+        self.assertEqual(run("v_mul_f64 v[4:5], v[0:1], v[2:3] mul:4 clamp", 0.25, 3.0), bits(0.75))
+        self.assertEqual(run("v_fma_f64 v[4:5], v[0:1], v[2:3], v[6:7] mul:4 clamp", 0.25, 2.0, 0.25), bits(0.75))
+        self.assertEqual(run("v_min_f64 v[4:5], v[0:1], v[2:3] mul:4 clamp", 0.75, 5.0), bits(0.75))
+        self.assertEqual(run("v_max_f64 v[4:5], v[0:1], v[2:3] mul:4 clamp", 0.75, 0.125), bits(0.75))
+        self.assertEqual(run("v_cvt_f64_f32_e64 v[4:5], v0 mul:4 clamp", 0x3F400000), bits(0.75))
+        # div:2 and clamp on a negative result: 0.
+        self.assertEqual(run("v_mul_f64 v[4:5], v[0:1], v[2:3] div:2 clamp", -1.5, 2.0), 0)
 
 
 class Refusals(unittest.TestCase):

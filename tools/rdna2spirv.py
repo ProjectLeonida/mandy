@@ -6801,13 +6801,26 @@ class Gen:
             self.emit(f"{word} = OpCompositeExtract %uint {pair} {i}")
             self.dst({"k": "vgpr", "r": d["r"] + i, "n": 1}, word)
 
-    def src_f64(self, sv, op):
+    def src_f64(self, sv, op, raw_sign=False):
         """A register pair or constant source as a %double (sets nothing: the caller sets uses_f64), with the VOP3
-        abs then neg source modifiers applied to the double."""
+        abs then neg source modifiers applied to the double. With raw_sign they are moves of the sign bit in the
+        high word instead of OpFAbs/OpFNegate, which a driver may use to quiet a signalling NaN: v_min/v_max_f64 use
+        that, as the f32/f16 min/max do (src_f_sign_mods)."""
         lo, hi = self.f64_source_words(sv, op)
+        if raw_sign:
+            if sv.get("abs"):
+                t = self.tmp()
+                self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+                hi = t
+            if sv.get("neg"):
+                t = self.tmp()
+                self.emit(f"{t} = OpBitwiseXor %uint {hi} {self.cu(0x80000000)}")
+                hi = t
         v2, d = self.tmp(), self.tmp()
         self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {lo} {hi}")
         self.emit(f"{d} = OpBitcast %double {v2}")
+        if raw_sign:
+            return d
         if sv.get("abs"):
             t = self.tmp()
             self.emit(f"{t} = OpExtInst %double %glsl FAbs {d}")
@@ -6827,16 +6840,20 @@ class Gen:
 
         - v_mul_f64: S0 * S1, one rounding. v_fma_f64: S0 * S1 + S2, one rounding (emit_fma64).
         - v_min_f64/v_max_f64: as the measured f32 rule ("Float min/max/med3 with NaN"): one NaN operand gives the
-          other operand, two give S0.
-        - v_cvt_f64_f32: exact widening of the f32 source; under the game's MODE (f32 denormals flushed) a
-          denormal source reads as a zero of its sign, as the measured v_floor/v_ceil/v_fract_f32 do.
+          other operand, two give S0 (its bits, the source sign modifiers applied as sign-bit moves). The f64 forms
+          are not measured, nor is the order of -0 and +0, which follows the f32 rule.
+        - v_cvt_f64_f32: exact widening of the f32 source. Under the game's MODE (f32 denormals flushed) a denormal
+          source reads as a zero of its sign: by analogy with the f32 denormal-input rule of the measured
+          v_floor/v_ceil/v_fract_f32, NOT measured for this conversion.
         - v_cvt_i32_f64/v_cvt_u32_f64: truncate toward zero, saturate out-of-range values and infinities, NaN -> 0
-          (ISA: "Out-of-range floating point values (including infinity) saturate. NaN is converted to 0"), as
-          v_cvt_i32_f32/v_cvt_u32_f32 do.
+          (ISA description, not GPU-checked), as v_cvt_i32_f32/v_cvt_u32_f32 do.
 
-        The f64 results take the VOP3 clamp/omod through dst_f64 (clamp_mods_f64), as v_add_f64 does; the integer
-        results take no output modifier. A program that changes MODE.FP_ROUND is refused for v_mul/v_fma_f64:
-        only v_add_f64 models the directed f64 rounding modes (f64_add_mode)."""
+        Output modifiers: only `clamp` reaches the f64 result (dst_f64). The omod (mul:2, mul:4, div:2) is accepted
+        and ignored, because an f64 result ignores it while f64 denormals are kept, the game's MODE: the
+        per-result-precision gate of tools/f64_omod_probe.py, measured on gfx1036 for v_cvt_f64_i32/u32,
+        v_frexp_mant_f64 and v_div_fixup_f64 and not measured for these ops. The integer results take no output
+        modifier (refused). A program that changes MODE.FP_ROUND is refused for v_mul/v_fma_f64: only v_add_f64
+        models the directed f64 rounding modes (f64_add_mode)."""
         float_dst = op not in ("v_cvt_i32_f64", "v_cvt_u32_f64")
         nsrc = {"v_fma_f64": 3, "v_mul_f64": 2, "v_min_f64": 2, "v_max_f64": 2}.get(op, 1)
         if len(a) != nsrc + 1:
@@ -6856,9 +6873,10 @@ class Gen:
             x = self.flush_f32(self.src_f(src))
             r = self.tmp()
             self.emit(f"{r} = OpFConvert %double {x}")
-            self.dst_f64(a[0], r, mods, op)
+            self.dst_f64(a[0], r, [m for m in mods if m == "clamp"], op)
             return
-        srcs = [self.src_f64(sv, op) for sv in a[1:]]
+        minmax = op in ("v_min_f64", "v_max_f64")
+        srcs = [self.src_f64(sv, op, raw_sign=minmax) for sv in a[1:]]
         if op in ("v_cvt_i32_f64", "v_cvt_u32_f64"):
             d = a[0]
             if d["k"] != "vgpr" or d.get("n", 1) != 1:
@@ -6891,7 +6909,7 @@ class Gen:
             self.emit(f"{nan_y} = OpIsNan %bool {y}")
             self.emit(f"{sel} = OpSelect %double {nan_y} {x} {nmm}")
             r = sel
-        self.dst_f64(a[0], r, mods, op)
+        self.dst_f64(a[0], r, [m for m in mods if m == "clamp"], op)
 
     def flush_f32_mods(self, v, mods):
         """Flush a subnormal sum before output modifiers and flush again after them (SHADER-340, RDNA1 gfx1010)."""
