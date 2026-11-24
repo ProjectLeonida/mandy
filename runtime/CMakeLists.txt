@@ -2269,6 +2269,13 @@ if(TARGET Vulkan::Headers)
     add_test(NAME pipeline_cache_seed COMMAND pipeline_cache_seed_test $<TARGET_FILE:vk_pipeline_check>)
     set_tests_properties(pipeline_cache_seed PROPERTIES SKIP_RETURN_CODE 77)
 
+    # Builds a folder of compute programs on the runtime's own Vulkan device and writes that device's pipeline cache
+    # (a tool, not a test: it needs the user's carved programs and translated shaders).
+    add_executable(pso_warmup test/pso_warmup.cpp)
+    target_link_libraries(pso_warmup PRIVATE gta6rt_d3d12_com d3d12 dxgi version)
+    target_compile_definitions(pso_warmup PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    target_compile_options(pso_warmup PRIVATE /W4 /permissive- /utf-8)
+
     # What Close returns after one recorded call, against WARP; today's differences are listed in the test.
     add_executable(d3d12_close_parity_test test/d3d12_close_parity_test.cpp)
     target_link_libraries(d3d12_close_parity_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)

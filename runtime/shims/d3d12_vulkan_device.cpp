@@ -613,6 +613,47 @@ struct DeviceState {
         return pipeline_cache_handle;
     }
 
+    // Writes this device's pipeline cache to `path` (through a temporary file, so a reader never sees half of it).
+    // The data is the driver's own, keyed on this device's extensions and features: unlike a cache from
+    // vk_pipeline_check, whose device enables a different set, it hits for the pipelines this runtime creates
+    // (measured on an RTX 3070, docs/d3d12_vulkan.md section 4).
+    std::mutex pipeline_cache_save_mutex;
+    bool save_pipeline_cache(const std::filesystem::path& path) {
+        const auto& vk = context->vk;
+        const VkPipelineCache cache = pipeline_cache();
+        if (!cache || !vk.vkGetPipelineCacheData || path.empty()) return false;
+        const std::lock_guard lock(pipeline_cache_save_mutex);
+        std::size_t size = 0;
+        if (vk.vkGetPipelineCacheData(info.device, cache, &size, nullptr) != VK_SUCCESS || !size) return false;
+        std::vector<char> data(size);
+        if (vk.vkGetPipelineCacheData(info.device, cache, &size, data.data()) != VK_SUCCESS) return false;
+        std::filesystem::path temp = path;
+        temp += L".partial";
+        {
+            std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+            if (!out.write(data.data(), static_cast<std::streamsize>(size))) return false;
+        }
+        std::error_code error;
+        std::filesystem::rename(temp, path, error);
+        if (error) return false;
+        std::fprintf(stderr, "[rt] d3d12: wrote %zu bytes of pipeline cache to %ls\n", size, path.c_str());
+        return true;
+    }
+
+    // LEONIDA_PIPELINE_CACHE_OUT=<file>: save after every slow compile, so a run the title (or its watchdog) ends
+    // without a device teardown still keeps what it compiled. Read once.
+    const std::filesystem::path& pipeline_cache_out() {
+        static const std::filesystem::path out = [] {
+            wchar_t* value = nullptr;
+            std::size_t length = 0;
+            std::filesystem::path path;
+            if (_wdupenv_s(&value, &length, L"LEONIDA_PIPELINE_CACHE_OUT") == 0 && value && *value) path = value;
+            std::free(value);
+            return path;
+        }();
+        return out;
+    }
+
     QueueClock clock;  // what every queue's GetClockCalibration uses
     PFN_vkGetPhysicalDeviceFormatProperties2 format_properties2 = nullptr;
     // True when VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks native STORAGE_IMAGE but mutable R32_UINT+{R32_UINT,E5B9G9R9}
@@ -4097,9 +4138,20 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
-        if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
-            VK_SUCCESS)
-            return E_FAIL;
+        // The console never makes the title wait for a compile here; a long one on its own thread can outlast the
+        // title's watchdog (measured: the retail 1.0.2.1 BVH builder's largest program, ~28 s cold on an RTX 3070).
+        // Name the slow ones, so a stall points at a shader.
+        const auto compile_start = std::chrono::steady_clock::now();
+        const VkResult compiled =
+            vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline);
+        const auto compile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - compile_start).count();
+        if (compile_ms >= 1000)
+            std::fprintf(stderr, "[rt] d3d12: compute pipeline %s took %lld ms to compile\n", entry->name.c_str(),
+                         static_cast<long long>(compile_ms));
+        if (compiled != VK_SUCCESS) return E_FAIL;
+        if (compile_ms >= 250 && !device_.pipeline_cache_out().empty())
+            device_.save_pipeline_cache(device_.pipeline_cache_out());
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
@@ -5549,6 +5601,7 @@ public:
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
     const DeviceState& state() const { return state_; }
+    DeviceState& mutable_state() { return state_; }
     IUnknown* holder() { return identity(); }
     // Console-extended CreateDescriptorHeap (Xbox slot 14): a heap at the title's console address. The proxy's
     // handler (set_console_descriptor_heap_handler) calls this; a normal PC create never does.
@@ -8874,6 +8927,11 @@ std::shared_ptr<const leonida::TileHeapAllocation> tile_heap(ID3D12Heap* heap, c
 bool is_sparse_image(ID3D12Resource* resource) {
     const auto* object = Resource::from<Resource>(resource);
     return object && object->sparse_image();
+}
+
+bool save_pipeline_cache(ID3D12Device* device, const wchar_t* path) {
+    Device* d = Device::from<Device>(device);
+    return d && path && d->mutable_state().save_pipeline_cache(path);
 }
 
 void set_device_outer(ID3D12Device* device, IUnknown* outer) {

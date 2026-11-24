@@ -2071,7 +2071,21 @@ Pipeline creation:
   the `pipelines` build stage's `pipeline_cache.bin` beside the executable if its Vulkan header matches the device
   and pipeline-cache UUID. When the file is absent or incompatible, the runtime starts with an empty cache.
   The offline checker matches the runtime's layout and subgroup request for compute shaders with no descriptor
-  bindings and the standard 144-byte push-constant range.
+  bindings and the standard 144-byte push-constant range, but **its device does not match the runtime's**: the
+  runtime enables 17 device extensions the checker does not (mesh shader, maintenance5/8, shader FMA and clock,
+  fragment barycentrics and interlock among them) and a different feature set, and a driver keys its cache on that.
+  Measured on an RTX 3070 (driver 32.0.16.1692): the checker's own re-run of the retail BVH builder's largest
+  program is a cache hit in 0.01 s, while the runtime with that `pipeline_cache.bin` loaded still compiles it cold
+  (about 28 s). A cache that seeds the runtime has to come from the runtime's device:
+  - `pso_warmup <dir of .dxbc compute programs> <out file>` (`runtime/test/pso_warmup.cpp`) builds each program
+    through `create_vulkan_device_standalone`, the device `gta6rt --run` uses with `LEONIDA_D3D12=vulkan`, and writes
+    that device's cache (`LEONIDA_SHADERS` must name the translated SPIR-V). For the BVH builder's 52 programs
+    (`<work>/shaders/bvh`): 63 s cold, then 5.7 s with the result seeded, the 28 s program included.
+  - `LEONIDA_PIPELINE_CACHE_OUT=<file>` makes the runtime write its cache after every compute compile of 250 ms or
+    more, so a run that ends without a device teardown (the title's watchdog, a crash) keeps what it compiled.
+  A compute compile of 1 s or more is logged with the shader's name. Why it matters: the retail title compiles its
+  BVH builder on its graphics-init thread, and a cold 28 s compile there outlasts the title's own watchdog
+  (about 26 s), which then ends the process with nothing in the log.
   `GetCachedBlob` records the vendor, device, driver version, `pipelineCacheUUID` and a SHA-256 of the description
   without `Flags`, sealed by a checksum (`runtime/src/cached_pso.h`). The answers are the host's, measured on an
   RTX 3060 and WARP: the same description is accepted; another
