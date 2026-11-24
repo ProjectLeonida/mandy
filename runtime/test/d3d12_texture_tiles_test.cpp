@@ -99,6 +99,7 @@ template <typename Visit>
 bool for_each_checked(UINT width, UINT height, UINT64 tile_copy_offset, Visit&& visit) {
     for (UINT tile = 0; tile < tiles; ++tile) {
         const UINT first_y = (tile / 2) * tile_height, first_x = (tile % 2) * tile_width;
+        if (first_y >= height || first_x >= width) continue;  // a texture smaller than the tile grid
         const UINT rows = std::min(tile_height, height - first_y), columns = std::min(tile_width, width - first_x);
         for (UINT y = 0; y < rows; ++y) {
             for (UINT x = 0; x < columns; ++x) {
@@ -199,6 +200,9 @@ bool run(ID3D12Device& device, UINT width, UINT height, UINT64 tile_copy_offset,
     const D3D12_RANGE empty{0, 0};
     void* mapped = nullptr;
     EXPECT(SUCCEEDED(upload->Map(0, &empty, &mapped)));
+    // modelled_readback() reads the bytes before the CopyTiles offset when it rounds the offset down: zero them
+    // explicitly rather than rely on a committed resource starting zeroed.
+    std::memset(mapped, 0, static_cast<std::size_t>(tile_copy_offset));
     fill_tiles(static_cast<std::uint8_t*>(mapped) + tile_copy_offset);
     upload->Unmap(0, nullptr);
 
@@ -306,10 +310,13 @@ bool run(ID3D12Device& device, UINT width, UINT height, UINT64 tile_copy_offset,
             const auto modelled = load(advisory->model->data(), offset);
             ++advisory->texels;
             advisory->differ += actual != expected;
-            if (actual != modelled && !advisory->unmodelled++)
-                std::snprintf(advisory->first_unmodelled, sizeof(advisory->first_unmodelled),
-                              "%s tile %u at (%u,%u): got %#x, expected %#x, modelled %#x", read, tile, x, y, actual,
-                              expected, modelled);
+            if (actual != modelled) {
+                if (advisory->unmodelled == 0)
+                    std::snprintf(advisory->first_unmodelled, sizeof(advisory->first_unmodelled),
+                                  "%s tile %u at (%u,%u): got %#x, expected %#x, modelled %#x", read, tile, x, y,
+                                  actual, expected, modelled);
+                ++advisory->unmodelled;
+            }
         } else if (actual != expected) {
             std::fprintf(stderr, "%s tile %u at (%u,%u): got %#x, expected %#x\n", read, tile, x, y, actual, expected);
             return false;
