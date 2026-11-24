@@ -719,12 +719,9 @@ int compare_allocation_info(ID3D12Device* ours) {
                       D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS), 0},
         {"4x MSAA with simultaneous access",
          with(texture_desc(64, 64, rgba8, rt | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS), 0, 4), 0},
-        {"depth-stencil volume", [&] {
-             D3D12_RESOURCE_DESC desc = small_volume(8, 8, 4, DXGI_FORMAT_D32_FLOAT);
-             desc.Alignment = 0;
-             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-             return desc;
-         }(), 0},
+        // A depth-stencil volume is not in this list: the PC host refuses it, and the Xbox device proxy this test
+        // compares describes it as a 2D depth array (xs_proxy_mock_test checks the descriptor). The PC layer's own
+        // refusal is checked next to the call, on `inner`.
         {"64x64 depth", texture_desc(64, 64, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
          64 * 64 * 4},
         {"8x8 array of 6", texture_desc(8, 8, rgba8, none, 4, 6), 8 * 8 * 4 * 6},
@@ -5534,6 +5531,16 @@ int main() {
         if (allocation_mismatches < 0)
             std::printf("GetResourceAllocationInfo: no host D3D12 device to compare with, skipped\n");
         EXPECT(allocation_mismatches <= 0);
+        // The PC rule still refuses a volume depth-stencil; only the console proxy describes it as a 2D depth array
+        // (xs_proxy_mock_test checks that descriptor). The host's answer is UINT64_MAX, and the layer's is too.
+        {
+            D3D12_RESOURCE_DESC volume_depth = texture_desc(8, 8, DXGI_FORMAT_D32_FLOAT,
+                                                            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+            volume_depth.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+            volume_depth.DepthOrArraySize = 4;
+            EXPECT(inner->GetResourceAllocationInfo(0, 1, &volume_depth).SizeInBytes == UINT64_MAX);
+            EXPECT(device->GetResourceAllocationInfo(0, 1, &volume_depth).SizeInBytes != UINT64_MAX);
+        }
         const int rule_mismatches = compare_command_list_rules(device.p);
         if (rule_mismatches < 0) std::printf("command-list rules: no host D3D12 device to compare with, skipped\n");
         EXPECT(rule_mismatches <= 0);

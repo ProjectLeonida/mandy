@@ -98,6 +98,7 @@ struct Mock {
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
     D3D12_COMMAND_QUEUE_DESC queue_desc;  // device: the description of its last CreateCommandQueue (slot 8)
+    D3D12_RESOURCE_DESC allocation_desc;  // device: the first description its last slot 25 got, as received
 };
 
 Mock g_pool[256];
@@ -221,6 +222,8 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
             case 25: {  // GetResourceAllocationInfo, the PC method: (return buffer, visible mask, count, descs)
                 auto* out = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(a1);
                 if (!out) break;
+                // The proxy may hand a copy of the caller's description array; keep the first one.
+                if (a4) std::memcpy(&m->allocation_desc, reinterpret_cast<const void*>(a4), sizeof(m->allocation_desc));
                 out->SizeInBytes = kAllocationMarker + a3;  // the count, so the test sees the arguments arrive
                 out->Alignment = static_cast<UINT>(a2);     // the visible mask
                 return a1;
@@ -318,6 +321,27 @@ HRESULT WINAPI mock_create_committed_resource3(Mock* self, const D3D12_HEAP_PROP
 }
 #endif
 
+// PC ID3D12Device::CreateCommittedResource takes seven words after `this`, so it has its own entry (PC slot 27) that
+// keeps the description the proxy built from the console's.
+struct CommittedResourceCall {
+    unsigned calls;
+    D3D12_RESOURCE_DESC desc;
+    D3D12_RESOURCE_STATES state;
+    const D3D12_CLEAR_VALUE* clear;
+};
+CommittedResourceCall g_committed;
+
+HRESULT WINAPI mock_create_committed_resource(Mock* self, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+                                              const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
+                                              const D3D12_CLEAR_VALUE* clear, const IID* riid, void** out) {
+    g_committed.calls += 1;
+    if (desc) g_committed.desc = *desc;
+    g_committed.state = state;
+    g_committed.clear = clear;
+    return mock_create(self, Kind::resource, reinterpret_cast<std::uint64_t>(riid),
+                       reinterpret_cast<std::uint64_t>(out));
+}
+
 template <std::size_t... I>
 void fill_mock_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&mock_slot<static_cast<unsigned>(I)>)), ...);
@@ -328,6 +352,7 @@ void** mock_vtable() {
     static const bool filled = [] {
         fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
         table[12] = reinterpret_cast<void*>(&mock_create_command_list);
+        table[27] = reinterpret_cast<void*>(&mock_create_committed_resource);
 #ifdef __ID3D12Device10_INTERFACE_DEFINED__
         table[76] = reinterpret_cast<void*>(&mock_create_committed_resource3);
 #endif
@@ -344,10 +369,11 @@ using SlotFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::
                                       std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
 
 std::uint64_t raw(const void* object, unsigned slot, std::uint64_t a1 = 0, std::uint64_t a2 = 0,
-                  std::uint64_t a3 = 0, std::uint64_t a4 = 0, std::uint64_t a5 = 0, std::uint64_t a6 = 0) {
+                  std::uint64_t a3 = 0, std::uint64_t a4 = 0, std::uint64_t a5 = 0, std::uint64_t a6 = 0,
+                  std::uint64_t a7 = 0) {
     void* const* vtable = *reinterpret_cast<void* const* const*>(object);
-    return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(object), a1, a2, a3, a4, a5, a6, 0, 0, 0, 0, 0,
-                                                  0, 0, 0);
+    return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(object), a1, a2, a3, a4, a5, a6, a7, 0, 0, 0, 0, 0,
+                                                  0, 0);
 }
 
 // A call with the ten words of device slot 127 (and any other slot that takes up to ten).
@@ -1387,6 +1413,141 @@ int check_committed_resource3_x() {
     return 0;
 }
 
+// The retail boot's stop after #517: device slot 127 is asked for a TEXTURE3D 768x768x6 R16_TYPELESS depth-stencil
+// (one mip, one sample, ALLOW_DEPTH_STENCIL). PC D3D12 has no volume depth-stencil, so the proxy sizes (slot 25) and
+// creates (slots 76/127 and the 133 handler) it as a 2D depth array of the same six slices. The format, the
+// depth-stencil flag, the clear value and the title's own description must not change.
+int check_volume_depth() {
+    constexpr std::uint32_t kXboxLayoutTiled = 0x101, kBarrierLayoutUndefined = 0xFFFFFFFFu;
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = DXGI_FORMAT_D16_UNORM;
+    clear.DepthStencil.Depth = 1.0f;
+
+    // The descriptor from the stop: a six-slice volume depth, Xbox tiled layout.
+    D3D12_RESOURCE_DESC volume{};
+    volume.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    volume.Width = 768;
+    volume.Height = 768;
+    volume.DepthOrArraySize = 6;
+    volume.MipLevels = 1;
+    volume.Format = DXGI_FORMAT_R16_TYPELESS;
+    volume.SampleDesc.Count = 1;
+    volume.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(kXboxLayoutTiled);
+    volume.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    const D3D12_RESOURCE_DESC title_desc = volume;
+
+    const auto title_desc_unchanged = [&]() { return std::memcmp(&volume, &title_desc, sizeof(volume)) == 0; };
+    const auto is_pc_depth_array = [](const D3D12_RESOURCE_DESC& d) {
+        return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width == 768 && d.Height == 768 &&
+               d.DepthOrArraySize == 6 && d.MipLevels == 1 && d.Format == DXGI_FORMAT_R16_TYPELESS &&
+               d.SampleDesc.Count == 1 && d.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    };
+
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 10, true);
+    EXPECT(device && xs::device_proxy_slot_count(device) == 79);
+    xs::reset_device_proxy_stats();
+    void* const* vtable = *reinterpret_cast<void* const* const*>(device);
+
+    // Slot 25, the console's struct-return form: sizing sees a 2D depth array of six slices, and the title's
+    // description is left as it was.
+    struct Padded {
+        std::uint8_t before[16];
+        D3D12_RESOURCE_ALLOCATION_INFO value;
+        std::uint8_t after[64];
+    } padded;
+    std::memset(&padded, 0xA5, sizeof(padded));
+    using ConsoleFn = std::uint64_t(WINAPI*)(void*, void*, std::uint64_t, std::uint64_t, std::uint64_t);
+    EXPECT(reinterpret_cast<ConsoleFn>(vtable[25])(&padded.value, device, 1, 1, word(&volume)) == word(&padded.value));
+    EXPECT(mock->calls[25] == 1 && mock->args[25][2] == 1);
+    EXPECT(is_pc_depth_array(mock->allocation_desc));
+    EXPECT(title_desc_unchanged());
+    for (const std::uint8_t byte : padded.before) EXPECT(byte == 0xA5);
+    for (const std::uint8_t byte : padded.after) EXPECT(byte == 0xA5);
+
+    // The same slot leaves a colour volume alone: this is a depth-stencil rule, not a 3D one.
+    D3D12_RESOURCE_DESC colour = volume;
+    colour.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    colour.Flags = D3D12_RESOURCE_FLAG_NONE;
+    const D3D12_RESOURCE_DESC colour_desc = colour;
+    EXPECT(reinterpret_cast<ConsoleFn>(vtable[25])(&padded.value, device, 1, 1, word(&colour)) == word(&padded.value));
+    EXPECT(mock->allocation_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+           mock->allocation_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM);
+    EXPECT(std::memcmp(&colour, &colour_desc, sizeof(colour)) == 0);
+
+    // Slot 76, the console's CreateCommittedResource: the PC slot 27 gets the 2D depth array, same state and clear.
+    g_committed = {};
+    void* resource = nullptr;
+    EXPECT(hr_of(raw(device, 76, word(&heap), D3D12_HEAP_FLAG_NONE, word(&volume), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                     word(&clear), word(&kResourceIid), word(&resource))) == S_OK);
+    EXPECT(resource && reinterpret_cast<Mock*>(resource)->kind == Kind::resource);
+    EXPECT(g_committed.calls == 1 && is_pc_depth_array(g_committed.desc));
+    EXPECT(g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
+    EXPECT(g_committed.state == D3D12_RESOURCE_STATE_DEPTH_WRITE && g_committed.clear == &clear);
+    EXPECT(title_desc_unchanged());
+    static_cast<void>(release(resource));
+
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    // Slot 127, the measured stop: the same description as D3D12_RESOURCE_DESC1, the initial barrier layout and a
+    // clear value, all as the title passes them.
+    D3D12_RESOURCE_DESC1 volume1{};
+    volume1.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    volume1.Width = 768;
+    volume1.Height = 768;
+    volume1.DepthOrArraySize = 6;
+    volume1.MipLevels = 1;
+    volume1.Format = DXGI_FORMAT_R16_TYPELESS;
+    volume1.SampleDesc.Count = 1;
+    volume1.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(kXboxLayoutTiled);
+    volume1.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    const D3D12_RESOURCE_DESC1 title_desc1 = volume1;
+    g_committed3 = {};
+    resource = nullptr;
+    std::uint64_t words[10] = {word(&heap), D3D12_HEAP_FLAG_NONE, word(&volume1), kBarrierLayoutUndefined,
+                               word(&clear), 0, 0, 0, word(&kResourceIid), word(&resource)};
+    EXPECT(hr_of(raw10(device, 127, words)) == S_OK);
+    EXPECT(resource && reinterpret_cast<Mock*>(resource)->kind == Kind::resource);
+    EXPECT(g_committed3.calls == 1 && g_committed3.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+           g_committed3.desc.Width == 768 && g_committed3.desc.Height == 768 &&
+           g_committed3.desc.DepthOrArraySize == 6 && g_committed3.desc.MipLevels == 1 &&
+           g_committed3.desc.Format == DXGI_FORMAT_R16_TYPELESS && g_committed3.desc.SampleDesc.Count == 1 &&
+           g_committed3.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    EXPECT(g_committed3.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
+    EXPECT(g_committed3.clear == &clear && g_committed3.layout == kBarrierLayoutUndefined);
+    EXPECT(std::memcmp(&volume1, &title_desc1, sizeof(volume1)) == 0);
+    static_cast<void>(release(resource));
+#endif
+
+    // Slot 133, the console's CreatePlacedResourceX: the handler it hands the resource to sees the 2D depth array.
+    struct PlacedCapture {
+        D3D12_RESOURCE_DESC desc{};
+        void* va = nullptr;
+    };
+    static PlacedCapture placed;
+    placed = {};
+    xs::set_placed_at_va_handler([](ID3D12Device*, void* va, const D3D12_RESOURCE_DESC& desc, std::uint32_t,
+                                    const IID&, void** out) -> HRESULT {
+        placed.desc = desc;
+        placed.va = va;
+        *out = reinterpret_cast<void*>(0x1330);
+        return S_OK;
+    });
+    void* const va = reinterpret_cast<void*>(0x7000);
+    resource = nullptr;
+    EXPECT(hr_of(raw(device, 133, word(va), word(&volume), 0xFFFFFFFFull, word(&clear), word(&kResourceIid),
+                     word(&resource))) == S_OK);
+    EXPECT(resource == reinterpret_cast<void*>(0x1330) && placed.va == va && is_pc_depth_array(placed.desc));
+    EXPECT(title_desc_unchanged());
+    xs::set_placed_at_va_handler(nullptr);
+
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: a console TEXTURE3D 768x768x6 R16_TYPELESS depth-stencil is sized and created as a 2D depth "
+                "array of six slices; the title's description is unchanged\n", g_label);
+    return 0;
+}
+
 }  // namespace
 
 // A failure ends the process with a message on stderr, never in a dialog a test run would wait on: abort() (an
@@ -1718,7 +1879,7 @@ int main(int argc, char** argv) {
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list() ||
         check_custom_heap_properties() ||
         check_resource_allocation_info() || check_slot70() || check_committed_resource3_x() ||
-        check_presentation_wiring())
+        check_volume_depth() || check_presentation_wiring())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

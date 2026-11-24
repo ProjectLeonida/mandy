@@ -19,6 +19,12 @@
 //   slot 127  CreateCommittedResource3 (heap, flags, desc1, layout, clear, session, castable count/list, riid, out) ->
 //             PC ID3D12Device10::CreateCommittedResource3 (PC slot 76), with the Xbox layout word replaced and the
 //             Xbox flag bits dropped (RT-5 stop 15, docs/retail_boot_chain.md). E_NOTIMPL when the PC device lacks it.
+//   slot 25   GetResourceAllocationInfo, also in the console's struct-return form, sizes the descriptions the title
+//             later hands to 76/127.
+//   A volume depth-stencil (TEXTURE3D with ALLOW_DEPTH_STENCIL: the retail boot asks slot 127 for 768x768x6
+//   R16_TYPELESS) is not a PC resource. Slots 25, 76 and 127 and the slot 133 handler describe it as a 2D depth array
+//   of the same slices, with the format, flags, clear value and mip count kept (d3d12_xs_desc_clean.h). The PC rule
+//   that refuses a volume depth-stencil stays: this is console ABI translation, not a new PC capability.
 //   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The Xbox desc's first fields are
 //             D3D12_COMMAND_QUEUE_DESC's (public HLE).
 //   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> PC CreateCommandList(0, type, allocator,

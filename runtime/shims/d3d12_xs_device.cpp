@@ -24,6 +24,7 @@
 // for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
+#include "d3d12_xs_desc_clean.h"
 #include "d3d12_trace.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
@@ -138,6 +139,20 @@ bool trace_enabled() {
         return length > 0 && value[0] != '\0' && value[0] != '0';
     }();
     return enabled;
+}
+
+// One line the first time the console's volume depth-stencil is described to the PC device. The resource is the one
+// the retail boot asks slot 127 for after #517; slot 25 sizes it first, so that is where the line normally appears.
+template <class Desc>
+void note_volume_depth(unsigned slot, const Desc& xbox) {
+    static std::atomic<bool> logged{false};
+    if (!first_call(logged)) return;
+    std::fprintf(stderr,
+                 "[rt] d3d12_xs: slot %u: console TEXTURE3D depth-stencil %llux%llux%u (format %d, flags 0x%x) is "
+                 "described to the PC device as a TEXTURE2D depth array of %u slices\n",
+                 slot, static_cast<unsigned long long>(xbox.Width), static_cast<unsigned long long>(xbox.Height),
+                 static_cast<unsigned>(xbox.DepthOrArraySize), static_cast<int>(xbox.Format),
+                 static_cast<unsigned>(xbox.Flags), static_cast<unsigned>(xbox.DepthOrArraySize));
 }
 
 const char* slot_name(unsigned slot) {
@@ -1901,7 +1916,9 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
     // The measured description is 56 bytes plus Xbox extension words; D3D12_RESOURCE_DESC is exactly 56 bytes.
     // The Xbox layout word is 0x101 (tiled) or 0x1 (row-major buffer), and is not a PC layout value. Committed
     // resources take ROW_MAJOR for buffers and UNKNOWN for everything else, so the word is ignored and replaced.
-    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
+    // A volume depth-stencil is a 2D depth array on the PC device (d3d12_xs_desc_clean.h).
+    if (is_volume_depth_stencil(*xbox_desc)) note_volume_depth(76, *xbox_desc);
+    D3D12_RESOURCE_DESC pc_desc = pc_depth_desc(*xbox_desc);
     const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -1939,7 +1956,8 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     // The PC flags up to RAYTRACING_ACCELERATION_STRUCTURE (0x100) and USE_TIGHT_ALIGNMENT (0x400); 0x200 is
     // dropped, as committed_resource_refusal says the host refuses it (found in review).
     constexpr std::uint32_t kPcResourceFlags = 0x5ff;
-    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
+    if (is_volume_depth_stencil(*xbox_desc)) note_volume_depth(133, *xbox_desc);
+    D3D12_RESOURCE_DESC pc_desc = pc_depth_desc(*xbox_desc);
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
     // The Xbox layout word (0x101 tiled, 0x1 row-major buffer) is no PC layout: ROW_MAJOR for a buffer and UNKNOWN
@@ -2020,7 +2038,8 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
         return E_NOTIMPL;
     }
 
-    D3D12_RESOURCE_DESC1 pc_desc = *xbox_desc;
+    if (is_volume_depth_stencil(*xbox_desc)) note_volume_depth(127, *xbox_desc);
+    D3D12_RESOURCE_DESC1 pc_desc = pc_depth_desc(*xbox_desc);
     const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
@@ -2229,8 +2248,26 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
                                                 std::uint64_t count, const D3D12_RESOURCE_DESC* descs) {
     note_slot(25);
     const StructReturnCall call = struct_return_call(a0, a1);
+    const UINT resource_count = static_cast<UINT>(count);
+    // The console may size a volume depth-stencil here before it creates one; the PC device sizes and then makes a
+    // 2D depth array of the same slices (d3d12_xs_desc_clean.h). Only that case gets a copy of the description array;
+    // every other call forwards the title's own words.
+    const D3D12_RESOURCE_DESC* pc_descs = descs;
+    std::unique_ptr<D3D12_RESOURCE_DESC[]> copies;
+    if (descs) {
+        for (UINT i = 0; i < resource_count; ++i) {
+            if (!is_volume_depth_stencil(descs[i])) continue;
+            note_volume_depth(25, descs[i]);
+            copies.reset(new (std::nothrow) D3D12_RESOURCE_DESC[resource_count]);
+            if (copies) {
+                for (UINT j = 0; j < resource_count; ++j) copies[j] = pc_depth_desc(descs[j]);
+                pc_descs = copies.get();
+            }
+            break;  // without the copy the PC device refuses the volume, as before
+        }
+    }
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = call.self->real->GetResourceAllocationInfo(
-        static_cast<UINT>(visible_mask), static_cast<UINT>(count), descs);
+        static_cast<UINT>(visible_mask), resource_count, pc_descs);
     return call.ret;
 }
 
