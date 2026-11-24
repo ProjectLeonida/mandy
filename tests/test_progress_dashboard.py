@@ -523,10 +523,16 @@ class Scrub(unittest.TestCase):
             (rf"D:\My work\a b c\{SENTINEL}.fssm line 3", "<path> line 3"),
             (rf"D:\My work\{SENTINEL}_a.fssm, D:\Other work\{SENTINEL}_b.fssm", "<path> <path>"),
             (f"FAIL: cannot read D:/My work/shaders/{SENTINEL}.fssm", "FAIL: cannot read <path>"),
+            (rf"cannot read D:/My work\fixtures\{SENTINEL}.txt", "cannot read <path>"),
+            (rf"cannot read D:\My work/stubs/{SENTINEL}.spv", "cannot read <path>"),
+            (rf"D:\My own work/sub dir\a b/{SENTINEL}.fssm line 3", "<path> line 3"),
+            (rf"D:\My work/{SENTINEL}_a.fssm, D:/Other work\{SENTINEL}_b.fssm", "<path> <path>"),
             (rf"Permission denied: 'D:\\My work\\{SENTINEL} one.fssm'", "Permission denied: '<path>'"),
             (rf'File "D:\My work\{SENTINEL} one.py", line 3', 'File "<path>", line 3'),
             (r"D:\work\a.txt is not a folder", "<path> is not a folder"),
             (r"D:\work\a.txt, then tests/test_x.py failed", "<path> then tests/test_x.py failed"),
+            (r"D:\work\a.txt and tests/test_x.py failed", "<path> and tests/test_x.py failed"),
+            (r"D:\work\a.txt is 3/4 done", "<path> is 3/4 done"),
         ):
             with self.subTest(line=line):
                 self.assertEqual(pd.scrub(line), want)
