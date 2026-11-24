@@ -2226,7 +2226,27 @@ public:
         }
         if (FAILED(support)) return support;
         device_.share(info);
-        const VkResult created = vk.vkCreateImage(device_.info.device, &info, nullptr, &image_);
+        VkResult created = vk.vkCreateImage(device_.info.device, &info, nullptr, &image_);
+        VkMemoryRequirements requirements{};
+        if (created == VK_SUCCESS) vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
+        // Some drivers (observed on NVIDIA 582.28 / GTX 1050 with identicalMemoryTypeRequirements = false) accept
+        // VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT in format/create queries yet return memoryTypeBits == 0. Fall back to
+        // a normal image and staging copies, just as when check_image_support refuses the bit.
+        if (host_transfer_ && (created != VK_SUCCESS || !requirements.memoryTypeBits)) {
+            if (image_) {
+                vk.vkDestroyImage(device_.info.device, image_, nullptr);
+                image_ = VK_NULL_HANDLE;
+            }
+            log_once("host-transfer image had no usable memory type; falling back to staging copies, usage",
+                     int(info.usage));
+            host_transfer_ = false;
+            info.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+            support = device_.check_image_support(info);
+            if (FAILED(support)) return support;
+            created = vk.vkCreateImage(device_.info.device, &info, nullptr, &image_);
+            requirements = {};
+            if (created == VK_SUCCESS) vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
+        }
         if (created != VK_SUCCESS) {
             if (created == VK_ERROR_OUT_OF_HOST_MEMORY || created == VK_ERROR_OUT_OF_DEVICE_MEMORY)
                 return E_OUTOFMEMORY;
@@ -2236,8 +2256,6 @@ public:
             }
             return E_OUTOFMEMORY;
         }
-        VkMemoryRequirements requirements{};
-        vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
         memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
         if (!memory_ || vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) != VK_SUCCESS)
             return E_OUTOFMEMORY;

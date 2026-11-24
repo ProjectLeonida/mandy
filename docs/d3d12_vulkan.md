@@ -2471,6 +2471,8 @@ The trace will enumerate them.
   image format and flags, moved to
   `GENERAL` and zero-filled on the host at creation, and copied with `vkCopyMemoryToImageEXT`/
   `vkCopyImageToMemoryEXT` while they stay in `GENERAL` (D3D12's `COMMON`). Every other case (no extension, a
+  driver whose `vkCreateImage` / `vkGetImageMemoryRequirements` leaves `memoryTypeBits` empty for host-transfer
+  usage, a
   texture a barrier has moved, a default-heap texture, which D3D12 does not allow but the layer copies and logs) is
   a `CopyTextureRegion` from or to a host-visible staging buffer, replayed on the device's queue and waited for, so
   the layout tracker and a first use's zero fill behave exactly as for the application's own copies.
