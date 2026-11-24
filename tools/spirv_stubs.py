@@ -19,6 +19,9 @@ import sys
 import time
 import uuid
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode
+
 SPIRV_MAGIC = 0x07230203
 SPIRV_VERSION_1_0 = 0x00010000
 
@@ -266,13 +269,13 @@ def generate_for_index(spirv_dir, index):
         try:
             with stream as f:
                 f.write(data)
-            if os.name == "posix":
-                try:
-                    shutil.copymode(target, staged)
-                except FileNotFoundError:
-                    pass
+            os.chmod(staged, published_mode(target))
             _replace_stub(staged, target)
         except BaseException:
+            try:
+                os.chmod(staged, 0o600)
+            except OSError:
+                pass
             try:
                 os.remove(staged)
             except OSError:

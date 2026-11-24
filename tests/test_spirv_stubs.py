@@ -145,6 +145,25 @@ class SpirvStubsTests(unittest.TestCase):
             self.assertEqual(spirv_stubs.generate_for_index(tmp, index), written)
             self.assertEqual(target.stat().st_mode & 0o777, 0o640)
 
+    def test_stage_cleanup_restores_write_mode_on_replace_failure(self):
+        index = {"ps": {"stage": "ps", "inputs": [0]}}
+        cleaned_up_modes = []
+        original_remove = os.remove
+
+        def record_mode_and_remove(path):
+            if str(path).endswith(".tmp"):
+                cleaned_up_modes.append(os.stat(path).st_mode & 0o777)
+            original_remove(path)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(spirv_stubs.os, "replace", side_effect=OSError("replace failed")), \
+                 patch.object(spirv_stubs.os, "remove", side_effect=record_mode_and_remove):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    spirv_stubs.generate_for_index(tmp, index)
+
+        self.assertEqual(len(cleaned_up_modes), 1)
+        self.assertEqual(cleaned_up_modes[0], 0o600)
+
     def test_required_stubs_and_deduplication(self):
         index = {
             "cs_a": {"stage": "cs"},
