@@ -54,6 +54,7 @@
 #include <set>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <cwchar>
 #include <vector>
 
@@ -9447,6 +9448,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     LEONIDA_INSTANCE(vkCreateDevice);
     LEONIDA_INSTANCE(vkGetDeviceProcAddr);
 #undef LEONIDA_INSTANCE
+    const auto win32_presentation_support = instance_has_surface
+        ? reinterpret_cast<PFN_vkGetPhysicalDeviceWin32PresentationSupportKHR>(
+              get(owned.instance, "vkGetPhysicalDeviceWin32PresentationSupportKHR"))
+        : nullptr;
     std::uint32_t count = 0;
     vkEnumeratePhysicalDevices(owned.instance, &count, nullptr);
     std::vector<VkPhysicalDevice> physicals(count);
@@ -9461,10 +9466,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     VkPhysicalDeviceFeatures chosen_features{};
     VkPhysicalDeviceVulkan12Features chosen12{};
     bool chosen_draw_params = false;
+    std::vector<VkExtensionProperties> extensions;
     leonida::Vulkan13Features v13, candidate13;
-    // The first usable device of the highest vulkan_device_rank: a native driver over Microsoft's Dozen (which says
-    // it is a discrete GPU, #915), then discrete over integrated; the test harnesses (vk_device_pick.h) pick the same.
-    int chosen_rank = -1;
+    // Prefer a device we can present from. Within each group, prefer native over Dozen and discrete over integrated.
+    std::pair<bool, int> chosen_rank{false, -1};
     for (VkPhysicalDevice candidate : physicals) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(candidate, &props);
@@ -9482,13 +9487,25 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         vkGetPhysicalDeviceQueueFamilyProperties(candidate, &family_count, nullptr);
         std::vector<VkQueueFamilyProperties> families(family_count);
         vkGetPhysicalDeviceQueueFamilyProperties(candidate, &family_count, families.data());
+        std::uint32_t extension_count = 0;
+        vkEnumerateDeviceExtensionProperties(candidate, nullptr, &extension_count, nullptr);
+        std::vector<VkExtensionProperties> candidate_extensions(extension_count);
+        vkEnumerateDeviceExtensionProperties(candidate, nullptr, &extension_count, candidate_extensions.data());
+        const bool swapchain = instance_has_surface &&
+            std::any_of(candidate_extensions.begin(), candidate_extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0;
+            });
+        const int device_rank = leonida::vulkan_device_rank(static_cast<int>(props.deviceType), props.vendorID);
         for (std::uint32_t i = 0; i < family_count; ++i) {
-            if (!(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
-            if (const int rank = leonida::vulkan_device_rank(static_cast<int>(props.deviceType), props.vendorID);
-                rank > chosen_rank) {
+            if (!families[i].queueCount || !(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
+            const bool can_present = swapchain &&
+                (!win32_presentation_support || win32_presentation_support(candidate, i) == VK_TRUE);
+            const std::pair rank{can_present, device_rank};
+            if (rank > chosen_rank) {
                 chosen_rank = rank;
                 info.physical = candidate;
                 info.queue_family = i;
+                info.presentation = can_present;
                 chosen = props;
                 chosen_bc = bc;
                 chosen_features = features.features;
@@ -9496,8 +9513,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                 chosen_draw_params = draw_params;
                 v13.choose(candidate13);
             }
-            break;
+            if (can_present) break;  // the first presentation-capable graphics family on this device
         }
+        if (info.physical == candidate) extensions = std::move(candidate_extensions);
     }
     if (!info.physical)
         return fail(leonida::vulkan_device_filter().empty()
@@ -9516,24 +9534,17 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     // VK_KHR_acceleration_structure + VK_KHR_ray_query for hardware BVH builds (BLAS + TLAS).
     VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
-    bool has_swapchain = false;
     VkPhysicalDeviceAccelerationStructureFeaturesKHR as_features{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     VkPhysicalDeviceRayQueryFeaturesKHR rq_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     {
-        std::uint32_t extension_count = 0;
-        vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
-        std::vector<VkExtensionProperties> extensions(extension_count);
-        vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, extensions.data());
         bool has_as = false, has_dho = false, has_rq = false;
         for (const auto& e : extensions) {
             if (!std::strcmp(e.extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &conditional};
                 vkGetPhysicalDeviceFeatures2(info.physical, &features);
                 info.conditional_rendering = conditional.conditionalRendering == VK_TRUE;
-            } else if (!std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
-                has_swapchain = true;
             } else if (!std::strcmp(e.extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
                 has_as = true;
             } else if (!std::strcmp(e.extensionName, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)) {
@@ -9707,10 +9718,6 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
     // Optional: VK_EXT_host_image_copy lets WriteToSubresource/ReadFromSubresource copy on the CPU.
-    std::uint32_t extension_count = 0;
-    vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
-    std::vector<VkExtensionProperties> extensions(extension_count);
-    vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, extensions.data());
     info.conservative_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
     });
@@ -9896,7 +9903,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
 #ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
     VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT swapchain_m1{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT};
-    if (has_swapchain && instance_has_surface) {
+    if (info.presentation) {
         const auto device_has = [&](const char* name) {
             return std::any_of(extensions.begin(), extensions.end(),
                                [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
@@ -9977,7 +9984,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (calibrated) device_extensions.push_back(calibrated);
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
-    if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    if (info.presentation) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     if (swapchain_m1_name) device_extensions.push_back(swapchain_m1_name);
     if (info.mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
     if (info.ray_tracing) {
@@ -9985,7 +9992,6 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
     }
-    info.presentation = has_swapchain && instance_has_surface;
     info.swapchain_colorspace = info.presentation && swapchain_colorspace_enabled;
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
@@ -10020,6 +10026,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.push_constants_need_fallback = (info.max_push_constants_size < 144);
     std::fprintf(stderr, "[rt] d3d12: Vulkan device: %s (maxPushConstantsSize: %u bytes)\n", chosen.deviceName,
                  chosen.limits.maxPushConstantsSize);
+    std::fprintf(stderr, "[rt] d3d12: Vulkan graphics queue family %u, Win32 presentation %s\n",
+                 info.queue_family, info.presentation ? "enabled" : "unavailable");
     std::fprintf(stderr,
                  "[rt] d3d12: subgroup sizes %u..%u (default %u), requirable in stages 0x%x, subgroupSizeControl %s, "
                  "computeFullSubgroups %s\n",

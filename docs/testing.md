@@ -587,8 +587,11 @@ With more than one GPU, pick one through the Vulkan loader, for example
 `vulkaninfo --summary` shows which devices the loader then sees.
 
 Two GPUs of one vendor share one driver, so the loader cannot tell them apart (an RTX 5070 Ti next to an RTX 3060,
-say; without a choice the runtime and every test take the same one: a native driver over Microsoft's Dozen, discrete
-over integrated, the first on a tie, `vulkan_device_rank` in `runtime/src/vulkan_device_filter.h`).
+say). When choosing a Vulkan device, the standalone D3D12 layer first prefers GPUs with swapchain support and a
+graphics queue that can present to the Windows desktop. Within each group it uses the same ranking as the test
+harnesses: a native driver over Microsoft's Dozen, discrete over integrated, and the first on a tie
+(`vulkan_device_rank` in `runtime/src/vulkan_device_filter.h`). The runtime logs the selected GPU, graphics queue
+family and whether Win32 presentation is available.
 `LEONIDA_VK_DEVICE` names the GPU by part of its name, without case: `LEONIDA_VK_DEVICE=5070` or
 `LEONIDA_VK_DEVICE=radeon`. The D3D12 tests (`vk_test_device.h`) and the layer's standalone device read it,
 and a value that matches no device fails the run instead of testing
