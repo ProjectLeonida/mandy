@@ -148,9 +148,9 @@ int check_import(ID3D12Device* device, bool supported) {
             EXPECT_HR(hr, S_OK);
             EXPECT(heap.p != nullptr);
             EXPECT(heap->GetDesc().SizeInBytes == size);
-            // The CPU still owns the pages: a write through them is what the GPU will read.
+            // The CPU still owns the pages: a write through them is preserved (not zeroed) and visible via Map().
+            static_cast<unsigned char*>(memory)[0xFFFF] = 0x5a;
             static_cast<unsigned char*>(memory)[size - 1] = 0x5a;
-            // A placed resource in it is refused until the placed path addresses existing heaps.
             D3D12_RESOURCE_DESC buffer{};
             buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
             buffer.Width = 0x10000;
@@ -158,9 +158,21 @@ int check_import(ID3D12Device* device, bool supported) {
             buffer.SampleDesc.Count = 1;
             buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
             Ref<ID3D12Resource> placed;
+            // Existing heaps carry SHARED_CROSS_ADAPTER, so placed resources without ALLOW_CROSS_ADAPTER are refused.
             EXPECT_HR(device->CreatePlacedResource(heap.p, 0, &buffer, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                    IID_PPV_ARGS(&placed.p)),
-                      E_NOTIMPL);
+                      E_INVALIDARG);
+            EXPECT(placed.p == nullptr);
+            buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+            EXPECT_HR(device->CreatePlacedResource(heap.p, 0, &buffer, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                   IID_PPV_ARGS(&placed.p)),
+                      S_OK);
+            EXPECT(placed.p != nullptr);
+            void* mapped = nullptr;
+            EXPECT_HR(placed->Map(0, nullptr, &mapped), S_OK);
+            EXPECT(mapped == memory);
+            EXPECT(static_cast<const unsigned char*>(mapped)[0xFFFF] == 0x5a);
+            placed->Unmap(0, nullptr);
         }
     }
     EXPECT(VirtualFree(memory, 0, MEM_RELEASE));

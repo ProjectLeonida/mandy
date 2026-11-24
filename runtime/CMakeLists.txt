@@ -2068,6 +2068,13 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_existing_heap_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_existing_heap COMMAND d3d12_existing_heap_test)
     set_tests_properties(d3d12_existing_heap PROPERTIES SKIP_RETURN_CODE 77)
+    # Placed buffers inside OpenExistingHeapFromAddress existing heaps (RT-EXISTING-HEAP-PLACED).
+    add_executable(d3d12_existing_heap_placed_test test/d3d12_existing_heap_placed_test.cpp)
+    target_link_libraries(d3d12_existing_heap_placed_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_existing_heap_placed_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_existing_heap_placed_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_existing_heap_placed COMMAND d3d12_existing_heap_placed_test)
+    set_tests_properties(d3d12_existing_heap_placed PROPERTIES SKIP_RETURN_CODE 77)
     # Slot 133 on untouched xmem physical pages: committed through the pages hook, then imported. xmem.cpp and
     # registry.cpp are compiled in, as xmem_test does, to reach the registered XMem* exports.
     add_executable(d3d12_xmem_placed_test test/d3d12_xmem_placed_test.cpp shims/xmem.cpp shims/registry.cpp)
