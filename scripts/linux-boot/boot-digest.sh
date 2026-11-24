@@ -1,53 +1,55 @@
 #!/bin/bash
-# ExecStopPost of a leonida-boot-* unit: runs after the boot ends however it ended (exit, crash, oomd kill, timeout).
-# Writes /opt/leonida/work/<agent>/boot-<n>.digest.txt and appends a line to /opt/leonida/work/boots.tsv.
-# Local only: digests quote trace lines, so they never go into commits or PRs.
+# usage: boot-digest.sh <name>      (run-boot.sh starts it when the leonida-boot-<name> unit has ended)
+# Runs after the boot however it ended (exit, crash, oomd kill, time limit). Writes
+# $LEONIDA_BOOT_DIR/runs/<name>/digest.txt and appends one line to $LEONIDA_BOOT_DIR/boots.tsv.
+# Local only: a digest quotes trace lines, so it never goes into a commit, an issue or a pull request.
 set -u
-AGENT=$1; N=$2; WORK=/opt/leonida/work/$AGENT; LOG=$WORK/boot-$N.log; RES=$WORK/boot-$N.resources.tsv
-META=$WORK/boot-$N.meta; OUT=$WORK/boot-$N.digest.txt; LEDGER=/opt/leonida/work/boots.tsv
+NAME=${1:?name}; BASE=${LEONIDA_BOOT_DIR:-$HOME/.local/share/leonida-boot}; RUN=$BASE/runs/$NAME
+LOG=$RUN/boot.log; RES=$RUN/resources.tsv; META=$RUN/meta; OUT=$RUN/digest.txt; LEDGER=$BASE/boots.tsv
 START=$(sed -n 's/^start_epoch=//p' "$META" 2>/dev/null); BOOT=$(sed -n 's/^boot_epoch=//p' "$META" 2>/dev/null)
 START=${START:-$(date +%s)}; BOOT=${BOOT:-$START}; END=$(date +%s)
-RESULT=${SERVICE_RESULT:-?}; ECODE=${EXIT_CODE:-?}; ESTAT=${EXIT_STATUS:-?}
+RESULT=${SERVICE_RESULT:-?}
 D3D=$(grep -o 'd3d12=[^ ]*' "$LOG" 2>/dev/null | tail -1 | cut -d= -f2)
 STDOUT=${D3D/d3d12-run-/stdout-run-}
-CAP=/opt/leonida/capture/$AGENT-$N
+CAP=$RUN/capture
 
 verdict=OK
 # systemd-oomd can kill the unit's processes without the unit ending in "oom-kill" (boot.sh then exits on its own).
-if journalctl --user -u "leonida-boot-$AGENT-$N" --since "@$START" -q --no-pager 2>/dev/null | grep -q 'systemd-oomd killed'; then RESULT=oom-kill; fi
+if journalctl --user -u "leonida-boot-$NAME" --since "@$START" -q --no-pager 2>/dev/null | grep -q 'systemd-oomd killed'; then RESULT=oom-kill; fi
+# The loader's own exit code, as boot-inner.sh logged it (124 is the time limit and was turned into 0 there).
+RC=$(sed -n 's/^\[run-boot\] .* boot\.sh exit \([0-9]*\)$/\1/p' "$LOG" 2>/dev/null | tail -1)
+[ "$RESULT" = success ] && [ -n "$RC" ] && [ "$RC" != 0 ] && [ "$RC" != 124 ] && RESULT=exit-code
 case "$RESULT" in
   oom-kill) verdict="KILLED BY OOM (systemd-oomd or kernel): memory, not a crash" ;;
   timeout) verdict="TIMEOUT" ;;
-  exit-code) verdict="EXITED WITH ERROR (code $ECODE status $ESTAT)" ;;
-  signal|core-dump) verdict="KILLED BY SIGNAL ($ESTAT)" ;;
+  exit-code) verdict="EXITED WITH ERROR (boot.sh exit ${RC:-?})" ;;
+  signal|core-dump) verdict="KILLED BY SIGNAL" ;;
   success) verdict="OK (ran to its time limit or exited cleanly)" ;;
 esac
 grep -q 'time limit reached' "$LOG" 2>/dev/null && [ "$RESULT" = success ] && verdict="OK (ran its full time limit)"
 
 cnt() { local c=0; [ -f "$D3D" ] && c=$(grep -a -c -E "$@" "$D3D"); echo "${c:-0}"; }
 {
-  echo "== leonida boot $AGENT-$N: $verdict"
-  echo "unit result=$RESULT exit_code=$ECODE exit_status=$ESTAT"
+  echo "== leonida boot $NAME: $verdict"
+  echo "unit result=$RESULT"
   echo "queued $((BOOT-START)) s, ran $((END-BOOT)) s; trace $D3D"
   sed -n '/^LEONIDA_\|^WINEDEBUG\|^unit=/p' "$META" 2>/dev/null | tr '\n' ' '; echo
   echo
-  echo "-- counts"
-  echo "PresentX ok $(cnt 'XboxPresentation::PresentX ok')  refused $(cnt 'XboxPresentation::PresentX failed')"
-  echo "CreatePipelineState failed $(cnt 'CreatePipelineState failed')  FSPX compute misses $(cnt 'no translated compute shader for FSPX')  slot-67 failed $(cnt 'slot 67 call .* failed')"
-  echo "E_NOTIMPL $(cnt 'E_NOTIMPL')  wine err: lines $(cnt '^[0-9a-f]{4}:err:|:err:')  exceptions $(cnt -i 'exception|unhandled|page fault|access violation')"
-  grep -a -m1 -E 'translated shaders \(' "$D3D" 2>/dev/null
-  grep -a 'present-probe: source frame .* via' "$D3D" 2>/dev/null | tail -1 | sed 's/.*via/source via/' | cut -c1-120
+  echo "-- counts in the D3D12 trace"
+  echo "no translated shader $(cnt 'no translated ')  E_NOTIMPL $(cnt 'E_NOTIMPL')  failed with an HRESULT $(cnt 'failed with 0x8')"
+  echo "Wine err: lines $(cnt ':err:')  exceptions $(cnt -i 'exception|unhandled|page fault|access violation')"
   echo
-  echo "-- frames (swapchain; then the title's own backbuffer when LEONIDA_CAPTURE_SOURCE=1)"
-  [ -f "$CAP/index.txt" ] && { echo "$(wc -l < "$CAP/index.txt") captured; last: $(tail -1 "$CAP/index.txt" | cut -c1-110)"; awk '{m=$(NF-2)+$(NF-1)+$NF; if (m>0) n++} END{print n+0 " of " NR " frames non-black"}' "$CAP/index.txt"; } || echo "no capture index"
-  grep -a 'present-probe: source frame .* mean' "$D3D" 2>/dev/null | tail -2 | sed 's/.*source frame/source frame/' | cut -c1-140
+  echo "-- frames (every LEONIDA_CAPTURE_EVERY-th presented frame of the swapchain)"
+  if [ -f "$CAP/index.txt" ]; then
+    echo "$(wc -l < "$CAP/index.txt") captured; last: $(tail -1 "$CAP/index.txt" | cut -c1-110)"
+    awk '{m=$(NF-2)+$(NF-1)+$NF; if (m>0) n++} END{print n+0 " of " NR " frames non-black"}' "$CAP/index.txt"
+  else
+    echo "none captured"
+  fi
   echo
   echo "-- resources (2 s samples)"
-  [ -s "$RES" ] && awk -F'\t' 'NR>1{ if(min==""||$2<min)min=$2; if($3>sw)sw=$3; if($4>um)um=$4; if($5>us)us=$5; if($6+0>gm)gm=$6 } END{printf "min RAM available %s MB, max swap used %s MB, game peak %s MB RAM + %s MB swap, VRAM peak %s MB\n",min,sw,um,us,gm}' "$RES" || echo "no samples"
-  journalctl --user -u "leonida-boot-$AGENT-$N" --since "@$START" -q --no-pager 2>/dev/null | grep -E 'Consumed|oom|Failed' | sed 's/^.*\]: //' | sort -u | cut -c1-200
-  # Compare with other boots instead of guessing: on the console (Series S) path the title itself grows to ~20 GB of
-  # RAM+swap by ~130 s (fsdraw-6: 9.9 GB + 11.2 GB), mostly zero pages that zram compresses well.
-  [ -s "$RES" ] && awk -F'\t' 'NR>1{t=$4+$5; if(t>m)m=t} END{printf "game peak RAM+swap %.1f GB (console-path baseline ~20 GB at 130 s; oomd kills when zram swap passes 98%%)\n", m/1024}' "$RES"
+  [ -s "$RES" ] && awk -F'\t' 'NR>1{ if(min==""||$2<min)min=$2; if($3>sw)sw=$3; if($4>um)um=$4; if($5>us)us=$5; if($6+0>gm)gm=$6 } END{printf "min RAM available %d MB, max swap used %d MB, game peak %d MB RAM + %d MB swap, VRAM peak %d MB\n", min, sw, um, us, gm}' "$RES"
+  journalctl --user -u "leonida-boot-$NAME" --since "@$START" -q --no-pager 2>/dev/null | grep -E 'Consumed|oom|Failed' | sed 's/^.*\]: //' | sort -u | cut -c1-200
   echo
   echo "-- system events during the boot (OOM, GPU Xid, segfaults)"
   { journalctl --since "@$BOOT" -q --no-pager 2>/dev/null | grep -i -E 'systemd-oomd.*(Marked|killed)|oom-kill|out of memory|NVRM: Xid|segfault|gta6rt|wineserver.*crash' ; } | cut -c1-200 | tail -15
@@ -61,15 +63,13 @@ cnt() { local c=0; [ -f "$D3D" ] && c=$(grep -a -c -E "$@" "$D3D"); echo "${c:-0
   echo
   echo "-- where the trace ended"
   [ -f "$D3D" ] && tail -n 8 "$D3D" | cut -c1-200
-} > "$OUT" 2>&1
+} > "$OUT.tmp" 2>&1
+mv "$OUT.tmp" "$OUT"
 
 frames=$( [ -f "$CAP/index.txt" ] && awk '{m=$(NF-2)+$(NF-1)+$NF; if (m>0) n++} END{print (n+0) "/" NR}' "$CAP/index.txt" || echo "-")
 peak=$( [ -s "$RES" ] && awk -F'\t' 'NR>1{if($4>u)u=$4} END{print u+0}' "$RES" || echo "-")
 exec 7>>"$LEDGER"; flock 7
-# Both the unit's ExecStopPost and the outer wrapper call this; the first one to finish records the boot.
-grep -q -P "^[^\t]*\t$AGENT\t$N\t" "$LEDGER" 2>/dev/null && exit 0
-[ -s "$LEDGER" ] || printf 'end\tagent\tn\tresult\tran_s\tpresentx_ok\tpso_failed\tfspx_miss\tnonblack_frames\tpeak_mb\tgta6rt\n' >&7
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$AGENT" "$N" "$RESULT" "$((END-BOOT))" \
-  "$(cnt 'XboxPresentation::PresentX ok')" "$(cnt 'CreatePipelineState failed')" "$(cnt 'no translated compute shader for FSPX')" \
-  "$frames" "$peak" "$(sed -n 's/^unit=.*gta6rt=\([^ ]*\).*/\1/p' "$META")" >&7
+[ -s "$LEDGER" ] || printf 'end\tname\tresult\tran_s\tnonblack_frames\tpeak_mb\tgta6rt\n' >&7
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$NAME" "$RESULT" "$((END-BOOT))" "$frames" "$peak" \
+  "$(sed -n 's/^unit=.*gta6rt=\([^ ]*\).*/\1/p' "$META")" >&7
 exit 0

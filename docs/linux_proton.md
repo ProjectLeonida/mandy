@@ -25,40 +25,82 @@ Windows A reaches every stage three to five times faster than the Linux machine 
 ~180 s, story load from ~110 s against ~240-300 s), so it is the better machine for iterating on the world phase;
 the Linux machine is the one that shows what 16 GB of RAM allows.
 
-## Building on Linux
+## Building from a checkout
 
-The runtime is a Windows executable. On Linux it is cross-built with clang-cl against an [xwin](https://github.com/Jake-Shadle/xwin)
-copy of the Windows SDK:
+The runtime is a Windows program. On Linux it is cross-built with clang-cl against an
+[xwin](https://github.com/Jake-Shadle/xwin) copy of the Windows SDK ([linux.md](linux.md) has the packages and the
+one-time `xwin` command):
 
 ```sh
-scripts/linux-boot/configure-worktree.sh <checkout>      # XWIN_DIR=<sdk>, SDL3_SRC=<SDL3 tree> for an offline configure
+scripts/linux-boot/configure-worktree.sh <checkout>      # XWIN_DIR=<sdk>; SDL3_SRC=<an SDL3 source tree> configures offline
 cmake --build <checkout>/runtime/build/boot --target gta6rt -j6
 ```
 
-`gta6rt_tls_host.dll` is built with the `gta6rt` target and must stay next to the executable. Unit tests are Windows
-executables too and run under Wine (`scripts/run_wine_tests.py`, or directly with the same `wine` binary and a
-prefix of their own: sharing the game's prefix with tests breaks its window).
+`configure-worktree.sh` configures a Ninja Release build in `<checkout>/runtime/build/boot` with
+`runtime/cmake/clang-cl-xwin.cmake`. `gta6rt_tls_host.dll` is built with the `gta6rt` target and must stay next to the
+executable: without it the title gets no module TLS index and exits at once, so `run-boot.sh` refuses to start.
 
-## Booting on Linux
+## Booting
 
-`scripts/linux-boot/boot.sh` is the plain launcher and `run-boot.sh` wraps it as a `systemd --user` unit with a
-memory sampler, a GPU lock, a build lock (no compile while the game runs) and a digest after the boot. They assume
-the layout the comments at their top describe (`/opt/leonida` for traces, overlay and caches; the package under
-`/opt/gta6`); adjust the paths at the top to yours. What matters:
+`boot.sh` is the plain launcher. `run-boot.sh` wraps it as a `systemd --user` unit.
 
-- **Wine:** Proton Experimental's `files/bin/wine` with its own prefix (`WINEPREFIX`), `WINEDLLOVERRIDES="mscoree,mshtml="`.
-- **No network:** the title runs inside `unshare -rn` (new user and network namespace). Nothing is online.
-- **Backend:** `LEONIDA_D3D12=vulkan`, `LEONIDA_SHADERS=<translated library>`.
-- **NVIDIA shader cache:** `__GL_SHADER_DISK_CACHE_SIZE` raised (the library is ~19 GB of SPIR-V) and
-  `__GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1`.
-- **Input:** a pad through GameInput/SDL3, or the keyboard pad (`LEONIDA_KEYBOARD_PAD=always`), or a script:
-  `LEONIDA_INPUT_SCRIPT=a@210,a@240` presses A at those seconds (any length since this branch; it was cut at 63
-  characters before).
-- **Window:** frames are presented in the title's own window; `LEONIDA_PRESENT_WINDOW=own|hidden` chooses otherwise.
+```sh
+export LEONIDA_GAME_DIR=<your copy of the package>     # the folder with game_scarlett_master.exe
+export LEONIDA_SHADERS=<work>/shaders/spirv            # the translated library make_game.py built
+scripts/linux-boot/boot.sh dry-run                     # imports only
+scripts/linux-boot/boot.sh init                        # TLS callbacks and DLL initialization
+scripts/linux-boot/boot.sh run 150                     # start the title, stop it after 150 s
+scripts/linux-boot/run-boot.sh first runtime/build/boot/gta6rt.exe 150 LEONIDA_ARENA_MB=2048
+```
 
-Three setup mistakes each give a blank or empty picture without an error: the executable's embedded shaders missing
-from the library (`exe/index.json`), a build without SDL3 (no pad), and a BCPack predictor file that was never
-generated (`tools/build_dstorage_history.py`; without it the loading art and most BC7 textures stay empty).
+| Variable | Default | Meaning |
+|---|---|---|
+| `LEONIDA_GAME_DIR` | none, required | The folder of your copy of the package. It is read in place. |
+| `LEONIDA_SHADERS` | none, required for `run` | The translated shader library. |
+| `LEONIDA_BOOT_DIR` | `~/.local/share/leonida-boot` | Where traces, the overlay (the title's writes), the driver's shader cache, the locks and the runs go. |
+| `GTA6RT` | `runtime/build/boot/gta6rt.exe` of the checkout | The loader `boot.sh` starts. `run-boot.sh` takes it as its second argument. |
+| `WINE` | Proton Experimental's `files/bin/wine` when Steam has it, else `wine` | The Wine to use. **One Wine per prefix, always.** A Proton prefix links to files inside the Proton installation, and another Wine version that starts in it updates the prefix by writing through those links. On the machine below that overwrote about 1,200 of Proton's own files, and every Proton start failed afterwards; the tool's files then have to be verified or reinstalled through Steam. |
+| `WINEPREFIX` | `~/.local/share/leonida-boot-prefix` | A prefix for boots alone. |
+| `LEONIDA_BOOT_MIN_FREE_MB` | `6500` | `run-boot.sh` waits up to ten minutes for this much memory before it boots. |
+
+What the scripts set, and why:
+
+- **No network.** The loader runs inside `unshare -rn`, a new user and network namespace that needs no root. The
+  title has no network at all, which is the project's rule (nothing online) enforced by the kernel.
+- **Wine.** `WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d"`: a new prefix does not ask to install Mono and Gecko,
+  and a process that crashes ends instead of starting `winedbg`. With the Wine installation broken as the table
+  above describes, `winedbg` started for a crashing Wine service crashed as well and was started again for itself,
+  about ten thousand times, until memory ran out; the loader's own trace already records the title's exceptions.
+  Keep the
+  boot prefix apart from the one unit tests use. On the machine below, a test's `wineserver` that was still alive
+  (started without a display) was joined by the next boot, which then had no window.
+- **Backend.** `LEONIDA_D3D12=vulkan` and `LEONIDA_SHADERS` for `run`.
+- **NVIDIA's shader disk cache** is moved under `LEONIDA_BOOT_DIR` and its size limit raised
+  (`__GL_SHADER_DISK_CACHE_SIZE`, 20 GiB unless you set it), with `__GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1`, so that
+  the pipelines one boot compiled are still there for the next.
+- **Traces.** `--trace` always and `--trace-d3d12` for `run`; `tools/boot_trace.py` summarises them next to the logs.
+
+Other switches pass through: any `KEY=VALUE` after the seconds of `run-boot.sh` is set in the unit, for example
+`LEONIDA_KEYBOARD_PAD=always` ([gameinput.md](gameinput.md)) or `LEONIDA_SKIP_INT3=1` ([boot.md](boot.md)).
+
+## What `run-boot.sh` adds
+
+- The boot runs outside your shell's process tree, with `OOMScoreAdjust=900`: when memory runs out the kernel takes
+  the game, not the session that started it.
+- It waits for memory headroom and for swap below 70 %, then holds a GPU lock (one boot at a time) and a build lock
+  for the whole boot. A build that takes the same lock never competes with the game for memory:
+  `flock "$LEONIDA_BOOT_DIR/.build.lock" cmake --build ...`.
+- RAM, swap, the unit's own memory and VRAM (`nvidia-smi`, when present) are sampled every 2 s into `resources.tsv`.
+- A frame capture is on (`LEONIDA_CAPTURE`, every 4800th presented frame) and so is Wine's error channel.
+- A second small unit waits for the boot to end, also when `systemd-oomd` or the kernel killed it, and writes
+  `digest.txt`: the verdict (`OK`, `EXITED WITH ERROR`, `KILLED BY OOM`, `KILLED BY SIGNAL`), how long it queued and
+  ran, counts from the D3D12 trace, captured frames and how many are not black, memory peaks, kernel events (OOM,
+  NVIDIA Xid, segfaults), every distinct error line with its count, and the last lines of the trace. One line per
+  boot is appended to `boots.tsv`.
+
+Everything is in `$LEONIDA_BOOT_DIR/runs/<name>/` and `$LEONIDA_BOOT_DIR/traces/`. `run-boot.sh` prints the digest
+and exits 0 only for `OK`. **Traces, logs and digests can quote the title's own text. Keep them on the machine that
+produced them**: no trace, log or capture goes into a commit, an issue or a pull request.
 
 ## What a healthy boot looks like (Linux machine)
 
