@@ -61,7 +61,7 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
 1. Instale los requisitos anteriores.
 2. Clone el repositorio **con su submódulo**:
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/ubiquitarianism/leonida
    ```
 3. Haga doble clic en **`Build.bat`**.
 
@@ -216,8 +216,8 @@ descomprimido. Así evita compilar el runtime; la misma opción funciona en Wind
    pruebas de GPU. Diga si recibió ayuda de una IA. Las reglas están en
    [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
 
-La [guía de pruebas de GPU](../../testing.md) explica cómo ejecutarlas sin ningún archivo del juego. Publique sus
-resultados en la [issue #166](https://github.com/ItsNotRexed/Leonida/issues/166), un comentario por GPU y por
-controlador.
+La [guía de pruebas de GPU](../../testing.md) explica cómo ejecutarlas sin ningún archivo del juego. Envíe sus
+resultados en una pull request que añada un archivo a [gpu-test-results/](../../../gpu-test-results/), siguiendo
+el formato de los informes existentes.
 
-[coord]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+[coord]: https://github.com/ubiquitarianism/leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
