@@ -319,7 +319,11 @@ def write_output(path, rows, summary):
         # os.replace hands the destination the staged file's bits; give them the destination's mode
         # (an existing report's, or what open() would have made for a new file) so perms are stable.
         os.chmod(staged, published_mode(dest))
-        os.replace(staged, dest)
+        try:
+            os.replace(staged, dest)
+        except BaseException:
+            os.chmod(staged, 0o600)
+            raise
 
 
 def byte_count(text):

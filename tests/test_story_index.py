@@ -522,6 +522,22 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertIn("output would overwrite an input file", p.stderr)
 
+    def test_stage_cleanup_restores_write_mode_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "out.json")
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def track_chmod(p, mode, **kwargs):
+                chmod_calls.append((p, mode))
+                return real_chmod(p, mode, **kwargs)
+
+            with mock.patch("story_index.os.replace", side_effect=OSError("replace failed")), \
+                 mock.patch("story_index.os.chmod", side_effect=track_chmod):
+                with self.assertRaises(OSError):
+                    story_index.write_output(dest, [], {})
+            self.assertTrue(any(mode == 0o600 for p, mode in chmod_calls))
+
 
 if __name__ == "__main__":
     unittest.main()
