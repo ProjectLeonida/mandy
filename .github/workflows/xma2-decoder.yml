@@ -16,6 +16,11 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # Coalesce superseded pending pushes per branch without canceling an active main build.
+  group: xma2-decoder-${{ github.event_name }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   windows-ffi:
     runs-on: windows-latest
