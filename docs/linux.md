@@ -12,9 +12,9 @@ names; the build lists anything it can't find before it starts.
 | Piece | On Linux | How it is checked |
 |---|---|---|
 | `make_game.py`: check, shaders, assets, pipelines | Native | CI (`stdlib-tests-linux`, `translator-tests`, `semantic-tests`) |
-| `Build.sh`, `Mods.sh` | Native (`/bin/sh`) | `tests/test_shell_launchers.py`, in the standard-library loop of `stdlib-tests-linux` |
-| Shader translator, its tests and the GPU test tools (`vk_harness`, `vk_pipeline_check`, ...) | Native, GCC or Clang | CI (`linux-gpu-tools`: GCC, tests on llvmpipe); Clang builds them too, but no CI job uses it yet |
-| `rpf9dump` (asset export) | Native, .NET 8 or newer | CI builds it on Windows only (the `check` job) |
+| `Build.sh`, `Mods.sh` | Native (`/bin/sh`) | `tests/test_shell_launchers.py`, in the standard-library loop of `stdlib-tests-linux`, which also runs `./Build.sh --help` |
+| Shader translator, its tests and the GPU test tools (`vk_harness`, `vk_pipeline_check`, ...) | Native, GCC or Clang | CI (`linux-gpu-tools`: GCC, tests on llvmpipe; `linux-clang`: Clang, `ctest`) |
+| `rpf9dump` (asset export) | Native, .NET 8 or newer | CI (`rpf9dump-linux`; the `check` job builds it on Windows) |
 | `gta6rt`, its shims and their tests | Windows program, under Wine or Proton | Cross-built with clang-cl and xwin; CI runs the Windows build under Wine on pushes to `main` |
 
 ## Build the port

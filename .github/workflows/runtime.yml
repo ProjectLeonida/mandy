@@ -502,6 +502,59 @@ jobs:
             fi
           done <<< "$names"
 
+  # The same native Linux build with Clang instead of the runner's default GCC, so a change that only one of the two
+  # compilers accepts shows up on a pull request. The CPU and llvmpipe runtime tests run; the GPU shader tests are
+  # left to linux-gpu-tools, which already runs them on llvmpipe.
+  linux-clang:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Cache Vulkan headers
+        id: vulkan-headers-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vulkan-headers/include
+          key: vulkan-headers-6802bb4733b63ed5efd3adb308a6c885ef180ea1
+      - name: Checkout Vulkan headers (vulkan-sdk-1.4.363.0)
+        if: steps.vulkan-headers-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KhronosGroup/Vulkan-Headers
+          ref: 6802bb4733b63ed5efd3adb308a6c885ef180ea1 # vulkan-sdk-1.4.363.0
+          path: .vulkan-headers
+          sparse-checkout: include
+          persist-credentials: false
+      - name: Install Clang, the Vulkan loader and llvmpipe
+        run: |
+          pkgs=(clang libvulkan-dev mesa-vulkan-drivers)
+          command -v cmake >/dev/null || pkgs+=(cmake)
+          command -v ninja >/dev/null || pkgs+=(ninja-build)
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
+          clang++ --version
+      - name: Configure
+        env:
+          CC: clang
+          CXX: clang++
+          VULKAN_SDK: ${{ github.workspace }}/.vulkan-headers
+        run: >-
+          cmake -S runtime -B runtime/build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          -DLEONIDA_REQUIRE_VULKAN=ON
+      - name: Check the compiler is Clang
+        run: grep -h 'set(CMAKE_CXX_COMPILER_ID "Clang")' runtime/build/CMakeFiles/*/CMakeCXXCompiler.cmake
+      - name: Build
+        run: cmake --build runtime/build --parallel
+      - name: Runtime tests (Linux, Clang)
+        run: ctest --test-dir runtime/build --output-on-failure -j "$(nproc)"
+
   # Builds the runtime on an Apple Silicon Mac and runs its tests and the hand-written GPU tests on MoltenVK. The
   # hosted runner is a VM whose Metal device is "Apple Paravirtual device" (MTLGPUFamilyMac2, not Apple7), so
   # Mesa's KosmicKrisp finds no device there; MoltenVK runs, with 32-wide subgroups. macos-26, not macos-15: Xcode

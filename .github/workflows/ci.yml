@@ -269,6 +269,38 @@ jobs:
       - name: Viewer chunk streaming (synthetic, no browser or game data)
         run: node --test tests/test_*.cjs
 
+  # rpf9dump, the asset exporter, built and run on Linux: the check job builds it on Windows only, while the assets
+  # stage of make_game.py builds the same project on Linux (on Ubuntu 26.04 its .NET 10 SDK does it through
+  # global.json's latestMajor roll-forward). Every input is synthetic. tests/test_rpf9dump_exit_codes.py is not run
+  # here: its two blocked-write cases put a directory at <file>.partial, which Util.WriteAtomic no longer writes (it
+  # uses a unique <file>.<pid>.<tid>.<guid>.partial), so they fail on Linux; the check job still runs the file.
+  rpf9dump-linux:
+    needs: change-scope
+    if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: "8.0.x"
+          cache: true
+          cache-dependency-path: "**/packages.lock.json"
+      - name: Build rpf9dump
+        run: dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
+      - name: Test TTPF export retry
+        env:
+          RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll
+        run: python -I tests/test_ttpf_export_resume.py
+      - name: Test rpf9dump diagnostics
+        run: dotnet run --project tests/Rpf9DumpDiagnostics/Rpf9DumpDiagnostics.csproj -c Release
+
   # The check job runs the standard-library loop on Windows, which has no SPIRV-Tools or numpy: the spirv-val checks
   # (test_split_big_switch, test_image_load_typed...), the numpy paths and the POSIX-only tests skip there. This job
   # runs the same loop on Linux with them installed, so those tests run somewhere.
@@ -290,6 +322,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends spirv-tools
           pip install -r tests/requirements.txt
+      # The Linux entry point, as the check job runs make_game.py --help on Windows.
+      - name: Build.sh help
+        run: ./Build.sh --help
       - name: Tests (standard library only, Linux)
         shell: bash
         run: |
