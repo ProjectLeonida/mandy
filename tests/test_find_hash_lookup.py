@@ -102,6 +102,8 @@ class FindHashLookupTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             fhl.sections(bytes(zero[:0x40 + 23]))
         self.assertEqual(fhl.sections(bytes(zero)), [])
+        with self.assertRaises(ValueError):
+            fhl.sections(bytes(zero[:0x40 + 24 + 0xF0 - 1]))  # truncated optional header, even with no sections
 
     def test_cli_writes_the_report_and_fails_cleanly(self):
         data, lookup, _ = image()

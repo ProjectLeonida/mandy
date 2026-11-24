@@ -63,6 +63,8 @@ def sections(data):
         raise ValueError("truncated PE file (no COFF header): an encrypted or packed executable can't be scanned")
     count, opt_size = struct.unpack_from("<H12xH", data, pe + 6)
     first = pe + 24 + opt_size
+    if len(data) < first:
+        raise ValueError("truncated PE file (short optional header): an encrypted or packed executable can't be scanned")
     out = []
     for i in range(count):
         if len(data) < first + 40 * i + 40:
