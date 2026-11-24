@@ -220,6 +220,10 @@ F1 = {"v_rcp_f32": "rcp", "v_rsq_f32": "InverseSqrt", "v_sqrt_f32": "Sqrt", "v_e
 S2 = {"s_and_b32": "OpBitwiseAnd", "s_or_b32": "OpBitwiseOr",
       "s_lshl_b32": "OpShiftLeftLogical", "s_lshr_b32": "OpShiftRightLogical", "s_mul_i32": "OpIMul"}
 
+# VOP2 carry ops whose long form (vD, carry out, src0, src1, carry in) puts the carry out between the destination
+# and the sources; Gen.insn() starts their SDWA source selects at the first source (SHADER-SDWA-CO-CI-SELECT).
+SDWA_CARRY_OPS = frozenset({"v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32"})
+
 # RDNA2 ISA SOPC scalar compare (14 ops) and bit-test (4 ops) exact mnemonic sets (tools/rdna2_isa_tables.py SOPC).
 SOPC_CMP32_OPS = frozenset({
     "s_cmp_eq_i32", "s_cmp_lg_i32", "s_cmp_gt_i32", "s_cmp_ge_i32", "s_cmp_lt_i32", "s_cmp_le_i32",
@@ -7140,6 +7144,9 @@ class Gen:
             kv = dict(m.split(":", 1) for m in mods if m.split(":", 1)[0] in ("src0_sel", "src1_sel", "dst_sel", "dst_unused"))
             args = [dict(x) for x in ins["args"]]
             first = 0 if op.startswith("v_cmpx") else 1
+            if op in SDWA_CARRY_OPS and len(args) == 5:
+                # the long form vD, carry out, src0, src1, carry in: the sources start after the carry out
+                first = 2
             for i, key in enumerate(("src0_sel", "src1_sel")):
                 j = first + i
                 if j < len(args) and (kv.get(key, "DWORD") != "DWORD" or args[j].get("sext")):
