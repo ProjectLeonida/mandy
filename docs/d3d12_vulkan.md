@@ -673,6 +673,14 @@ side inwards:
     as D3D12 requires, and the T# is written for it; a typeless or `UNKNOWN` view format, one from another family,
     or a format the GPU cannot sample at that count leaves a null descriptor and is logged. `d3d12_msaa_typeless_srv_test`
     clears and draws an `R8G8B8A8_TYPELESS` 4x target and reads all four samples through its `R8G8B8A8_UNORM` T#.
+    A multisampled depth-stencil texture's SRV is its depth plane, named and validated as for single-sampled views
+    (`R32G8X24_TYPELESS` takes `R32_FLOAT_X8X24_TYPELESS`, `R24G8_TYPELESS` `R24_UNORM_X8_TYPELESS`, `D32_FLOAT`
+    `R32_FLOAT`, `D16_UNORM` `R16_UNORM`; `UNKNOWN` only on the typed textures); the T# is the depth format
+    (X24_8_32_FLOAT, 8_24_UNORM, 32_FLOAT, 16_UNORM) through the depth aspect, and set 0 samples it through the
+    float multisample pair. The format-support query advertises `MULTISAMPLE_LOAD` for the plane formats, as the
+    host does. D3D12's `TEXTURE2DMS`/`TEXTURE2DMSARRAY` SRVs have no plane field, so plane 1 is not an SRV shape.
+    `d3d12_msaa_depth_srv_test` clears and sample-masked-draws an `R32G8X24_TYPELESS` 4x target and reads all four
+    depth samples through its `R32_FLOAT_X8X24_TYPELESS` T#.
   - A texture is named in its T#s by an address of its own, above 4 GiB and 256 bytes apart, that nothing
     dereferences; its entries leave the set and the table when it is destroyed.
   - `VulkanDeviceInfo::bindless` says the Vulkan device has the features this needs: `runtimeDescriptorArray`,
@@ -701,8 +709,8 @@ volume, plus minimum-LOD clamped views (inside the mip range via `VK_EXT_image_v
 Known gaps in the descriptor path: buffer shader-resource views and constant-buffer views (the V# a shader would
 load for them; the structure is in `gfx10_descriptors.h`, the views are not written; buffer UAVs of every kind are,
 section 3.4 "Buffer UAVs", `d3d12_m4_compute_test` and `d3d12_buffer_uav_test`);
-1D-array SRVs, 1D and 3D storage views, other typeless volume formats, multisampled depth/stencil
-SRVs, and shader-translator lowering for multisample loads. Single-sampled depth-plane views (`R24_UNORM_X8_TYPELESS`,
+1D-array SRVs, 1D and 3D storage views, other typeless volume formats, and shader-translator lowering for
+multisample loads. Single-sampled depth-plane views (`R24_UNORM_X8_TYPELESS`,
 `R32_FLOAT_X8X24_TYPELESS`) are a T# of the texture's depth format (8_24_UNORM, X24_8_32_FLOAT) through the
 depth aspect (the texture's backing format, so X24_8_32_FLOAT for a D24 texture where the layer stores it as
 `D32_SFLOAT_S8_UINT`), each on its own family only (the other family's is a null

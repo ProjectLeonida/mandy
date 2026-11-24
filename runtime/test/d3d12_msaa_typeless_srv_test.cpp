@@ -10,8 +10,8 @@
 //     green in sample 0 of the masked quad, and red or blue (never green) on the diagonal's partially covered
 //     pixels. No game data.
 // Views that must stay null descriptors: a typeless format, UNKNOWN on a typeless texture, a format from another
-// family, a single-sample view of the 4x texture, and an MS view of an R32G8X24_TYPELESS depth texture (the
-// retail prototype's logged format; multisampled depth/stencil SRVs are not sampled).
+// family, a single-sample view of the 4x texture, and a colour format on an R32G8X24_TYPELESS depth texture (the
+// retail prototype's logged format; d3d12_msaa_depth_srv serves its depth plane).
 // Shaders: test/glsl/vs_draw.vert, ps_draw.frag and cs_sample.comp (TEST_MS_FLOAT).
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "shader_fixture_path.h"
@@ -388,10 +388,10 @@ int main() {
         srv_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         device->CreateShaderResourceView(typed.p, &srv_desc, srv_slot(typed_foreign_view));
         EXPECT(null_at(typed_foreign_view));  // a typed MS texture still needs its own format
-        srv_desc.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         if (depth_created) {
             device->CreateShaderResourceView(depth.p, &srv_desc, srv_slot(depth_view));
-            EXPECT(null_at(depth_view));  // multisampled depth/stencil SRVs are not sampled
+            EXPECT(null_at(depth_view));  // a colour format on a depth texture; d3d12_msaa_depth_srv is its plane
         }
 
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
@@ -497,7 +497,8 @@ int main() {
         return 1;
     }
     std::printf("MSAA typeless SRV: R8G8B8A8_TYPELESS 4x target cleared and drawn, 64 samples matched through its "
-                "R8G8B8A8_UNORM T#; typeless, foreign-family, UNKNOWN, single-sample and depth views stayed null\n");
+                "R8G8B8A8_UNORM T#; typeless, foreign-family, UNKNOWN, single-sample and colour-on-depth views stayed "
+                "null\n");
 #endif
     return 0;
 }
