@@ -1081,11 +1081,14 @@ the nodes, their pointers and the parent table are written for those places dire
 afterwards. `numElements` stays the triangle count, as `build_blas` writes it, the count of triangle pointers. The
 build is therefore 64 bytes smaller per pair: its header's size, `COMPACTED_SIZE` and `CURRENT_SIZE`, and what a
 `COMPACT` copy keeps. The prebuild room is unchanged (a leaf per triangle, since the pairs are not known before the
-build); the scratch grows by 76 bytes a triangle for the leaves and their bookkeeping, and only for a bottom-level
+build); the scratch grows by 80 bytes a triangle for the leaves and their bookkeeping, and only for a bottom-level
 build without `ALLOW_UPDATE` (`XdxrLayout::pair`, which `GetRaytracingAccelerationStructurePrebuildInfo` reads from
 the same flag). On the 288-triangle grid of `vk_xdxr_build_test`, 80 pairs make it 34,048 bytes against 39,168
-unpaired; the 7,200-triangle grid's 2,208 pairs, 846,848 against 988,160 (14%). Because pairs never cross nodes, one
-thread owns each leaf it rewrites, and both pointers of a
+unpaired; the 7,200-triangle grid's 2,208 pairs, 846,848 against 988,160 (14%). The pairing step only records each
+pair and its rotation; the step that copies the leaves into the structure writes a pair's leaf from the two staged
+ones, so no invocation stores to a word it loaded earlier in the same dispatch (the SPIRV-Cross reordering in MoltenVK
+1.4.2 noted in `xdxr_build.comp`; rewriting the first triangle's staged leaf in place lost pairs on an Apple M5 Pro).
+Because pairs never cross nodes, one thread owns each pair, and both pointers of a
 pair have the same parent, so the parent table has one writer per entry. The node pass records each triangle's pointer
 (TRI0, or TRI1 for the sibling) in scratch, so the bottom-up box pass finds the sibling's slot through the first
 triangle's leaf. On a sorted grid of 7,200 triangles, 2,208 of the 3,600 possible pairs form (2,625 with the tree of four

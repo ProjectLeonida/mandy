@@ -102,8 +102,8 @@ struct XdxrLayout {
         scratch = 64 + 16ull * sort_size + 8ull * radix_bins * tiles() + 24ull * count + 32ull * nodes +
                   20ull * inner() + 8ull * kept_tiles() + 4ull * count;
         // pairing: the leaves (64 bytes each), then per leaf whether the build keeps it, its place among the kept
-        // ones and the leaf its triangle was paired into, and a kept count per tile with its prefix sum
-        if (pair) scratch += 76ull * count + 8ull * tiles();
+        // ones, its partner and the pair's rotation, and a kept count per tile with its prefix sum
+        if (pair) scratch += 80ull * count + 8ull * tiles();
         if (scratch >= (std::uint64_t(1) << 32)) return false;   // the shader's scratch offsets are 32-bit
         return true;
     }

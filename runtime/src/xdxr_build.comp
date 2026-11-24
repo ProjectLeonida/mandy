@@ -24,11 +24,12 @@
 //   MODE_KEPT_INDEX per tile: each kept inner node's box node index, in sorted order (the root is node 0)
 // With FLAG_PAIR (a bottom-level build of two or more triangles that will not be updated), MODE_TRIANGLES writes the
 // leaves to scratch instead, and five steps place them:
-//   MODE_PAIR      one thread per inner node: a kept one pairs its sibling triangles (below), rewriting the first
-//                  one's leaf and marking the sibling's as dropped
+//   MODE_PAIR      one thread per inner node: a kept one pairs its sibling triangles (below), recording each pair
+//                  and its rotation and marking the sibling's leaf as dropped (no leaf is rewritten in scratch)
 //   MODE_LEAF_COUNT, MODE_LEAF_SCAN, MODE_LEAF_INDEX: as the kept modes, over the leaves: each kept leaf's place, in
 //                  element order, and how many there are
-//   MODE_LEAF_PLACE one thread per word of the leaves: a kept leaf's word to its place in the structure
+//   MODE_LEAF_PLACE one thread per word of the leaves: a kept leaf's word to its place in the structure, a pair's
+//                  leaf made from its two staged ones
 // The kept leaves are then dense, one 64-byte record a pair, and the nodes start right after the last one
 // (nodes_off(), the header's +40) instead of at pc.nodes_off, so the structure is 64 bytes smaller per pair.
 //   MODE_NODES     one thread per inner node: a kept one writes its node's child pointers (a paired sibling's is
@@ -176,11 +177,14 @@ uint boxes_off() { return offsets_off() + 4u * RADIX_BINS * radix_tiles(); }  //
 // depends on pc.arg0 (MODE_TRIANGLES writes the first two, and its arg0 is the vertex stride):
 bool paired() { return (pc.flags & FLAG_TLAS) == 0u && (pc.flags & FLAG_PAIR) != 0u; }
 const uint SCRATCH_LEAF_COUNT = 28u;                                  // the leaves the build keeps
+const uint FIRST = 0x80000000u;   // partner_off: this element is the first triangle of a pair (elements < 2^31)
 uint stage_off() { return boxes_off() + 24u * pc.elements; }          // the leaves while the pairs are chosen
 uint lkeep_off() { return stage_off() + 64u * pc.elements; }          // 1 when the leaf stays, 0 when dropped
 uint lmap_off() { return lkeep_off() + 4u * pc.elements; }            // a kept leaf's place among them
-uint partner_off() { return lmap_off() + 4u * pc.elements; }          // a paired sibling: the first triangle's element
-uint ltile_counts_off() { return partner_off() + 4u * pc.elements; }  // kept leaves per tile of RADIX_TILE
+uint partner_off() { return lmap_off() + 4u * pc.elements; }          // a paired sibling: the first triangle's element;
+                                                                      // a first triangle: FIRST | its sibling
+uint rotation_off() { return partner_off() + 4u * pc.elements; }      // a first triangle: k | kd << 2 (pair_children)
+uint ltile_counts_off() { return rotation_off() + 4u * pc.elements; } // kept leaves per tile of RADIX_TILE
 uint ltile_offsets_off() { return ltile_counts_off() + 4u * radix_tiles(); }
 uint pairing_end() { return paired() ? ltile_offsets_off() + 4u * radix_tiles() : stage_off(); }
 // 8 words per node: the arrival counter, the ordered min x y z (atomicMin), the ordered max x y z (atomicMax), unused
@@ -525,9 +529,10 @@ void radix_scatter(uint w, uint t) {
 // vertex goes in slot 3, its primitive index in PrimitiveIndex2 and its remap byte in byte 1. The node keeps one child
 // per triangle, each with its own box, so the tree is unchanged: the TRI1 child points at the first triangle's leaf,
 // and the sibling's own leaf is dropped (MODE_LEAF_PLACE does not write it). Both pointers have this node as parent.
+// MODE_PAIR only records the pair (partner_off, rotation_off); MODE_LEAF_PLACE writes the pair's leaf (paired_word).
 // Pairs never cross nodes, so no other thread touches these leaves. The barycentric remap byte of a node type returns
 // D3D12's (b1, b2): bits [1:0] and [3:2] are the positions, in the order that node type reads its slots, of the
-// triangle's vertices 1 and 2. MODE_PAIR runs on the leaves in scratch and records each sibling's partner; MODE_NODES
+// triangle's vertices 1 and 2. MODE_PAIR reads the leaves in scratch and records each sibling's partner; MODE_NODES
 // records each element's pointer (TRI0, or TRI1 for a paired sibling) for MODE_PROPAGATE. ----
 uvec3 leaf_vertex(uint e, uint k) {
     uint o = leaf_off(e) + 12u * k;
@@ -570,20 +575,12 @@ void pair_children(uint e[4]) {
             }
             if (k == 3u) continue;
             used[d] = true;
-            // the first triangle as (p0, p1, p2) with the shared edge p1 -> p2; slot 3 is the sibling's third vertex
-            store_vertex(e[c], 0u, v[c][(k + 2u) % 3u]);
-            store_vertex(e[c], 1u, v[c][k]);
-            store_vertex(e[c], 2u, v[c][(k + 1u) % 3u]);
-            store_vertex(e[c], 3u, v[d][(kd + 2u) % 3u]);
-            uvec2 b = leaf_buf();
-            store(b, leaf_off(e[c]) + 56u, load(b, leaf_off(e[d]) + 52u));
-            // TRI0 reads (p0, p1, p2): vertex m of the first triangle is in slot (m + 4 - k) % 3. TRI1 reads
-            // (p1, p3, p2): vertex m of the sibling is in slot (m + 5 - kd) % 3.
-            uint remap0 = (5u - k) % 3u | ((6u - k) % 3u) << 2;
-            uint remap1 = (6u - kd) % 3u | ((7u - kd) % 3u) << 2;
-            store(b, leaf_off(e[c]) + 60u, remap0 | remap1 << 8);
-            store(pc.scratch, lkeep_off() + 4u * e[d], 0u);       // the sibling's own leaf is dropped
-            store(pc.scratch, partner_off() + 4u * e[d], e[c]);   // MODE_NODES points its TRI1 child at e[c]'s leaf
+            // MODE_LEAF_PLACE writes the pair's leaf from the two staged ones. MODE_PAIR stores nothing to the
+            // leaves it reads: SPIRV-Cross in MoltenVK 1.4.2 can move a load after a store to the same word (above).
+            store(pc.scratch, lkeep_off() + 4u * e[d], 0u);            // the sibling's own leaf is dropped
+            store(pc.scratch, partner_off() + 4u * e[d], e[c]);        // MODE_NODES points its TRI1 child at e[c]'s leaf
+            store(pc.scratch, partner_off() + 4u * e[c], FIRST | e[d]);
+            store(pc.scratch, rotation_off() + 4u * e[c], k | kd << 2);
             break;
         }
     }
@@ -684,12 +681,36 @@ void leaf_count(uint w, uint t) {
     if (t == 0u) store(pc.scratch, ltile_counts_off() + 4u * w, kept_count);
 }
 
-// MODE_LEAF_PLACE, word i of the leaves in scratch: a kept leaf's word to its place in the structure.
+// Word w of first triangle e's leaf once it holds its sibling s, with the shared edge at k of e and kd of s
+// (pair_children): the first triangle as (p0, p1, p2) with the shared edge p1 -> p2, slot 3 the sibling's third
+// vertex, the sibling's primitive index in PrimitiveIndex2 and its remap byte in byte 1. TRI0 reads (p0, p1, p2):
+// vertex m of the first triangle is in slot (m + 4 - k) % 3. TRI1 reads (p1, p3, p2): vertex m of the sibling is in
+// slot (m + 5 - kd) % 3.
+uint paired_word(uint e, uint s, uint k, uint kd, uint w) {
+    if (w < 9u) return load(pc.scratch, leaf_off(e) + 12u * ((k + 2u + w / 3u) % 3u) + 4u * (w % 3u));
+    if (w < 12u) return load(pc.scratch, leaf_off(s) + 12u * ((kd + 2u) % 3u) + 4u * (w - 9u));
+    if (w < 14u) return load(pc.scratch, leaf_off(e) + 4u * w);          // geometry, primitive index
+    if (w == 14u) return load(pc.scratch, leaf_off(s) + 52u);           // PrimitiveIndex2
+    uint remap0 = (5u - k) % 3u | ((6u - k) % 3u) << 2;
+    uint remap1 = (6u - kd) % 3u | ((7u - kd) % 3u) << 2;
+    return remap0 | remap1 << 8;
+}
+
+// MODE_LEAF_PLACE, word i of the leaves in scratch: a kept leaf's word to its place in the structure, a pair's
+// leaf made from its two staged ones.
 void leaf_place(uint i) {
-    uint e = i / 16u;
+    uint e = i / 16u, w = i % 16u;
     if (load(pc.scratch, lkeep_off() + 4u * e) == 0u) return;
-    uint to = pc.elements_off + 64u * load(pc.scratch, lmap_off() + 4u * e) + 4u * (i % 16u);
-    store(pc.dst, to, load(pc.scratch, stage_off() + 4u * i));
+    uint to = pc.elements_off + 64u * load(pc.scratch, lmap_off() + 4u * e) + 4u * w;
+    uint mate = load(pc.scratch, partner_off() + 4u * e);
+    uint v;
+    if (mate != INVALID && (mate & FIRST) != 0u) {
+        uint rot = load(pc.scratch, rotation_off() + 4u * e);
+        v = paired_word(e, mate & ~FIRST, rot & 3u, rot >> 2, w);
+    } else {
+        v = load(pc.scratch, stage_off() + 4u * i);
+    }
+    store(pc.dst, to, v);
 }
 
 // ---- MODE_NODES ----
@@ -770,7 +791,7 @@ void build_node(uint i) {
             for (uint c = 0u; c < 4u; ++c) {
                 if (elems[c] == INVALID) continue;
                 uint partner = load(pc.scratch, partner_off() + 4u * elems[c]);
-                if (partner != INVALID) kids[c] = (element_ptr(partner) & ~7u) | TRI1;
+                if (partner != INVALID && (partner & FIRST) == 0u) kids[c] = (element_ptr(partner) & ~7u) | TRI1;
             }
         }
     }
