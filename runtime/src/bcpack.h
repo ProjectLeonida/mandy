@@ -16,7 +16,9 @@
 //  - lenient, what a title needs: such a block is decoded anyway, from the zero state where the history is unknown
 //    (what `bcpack.decode(..., allow_provisional=True)` does for BC6H and BC7, whose built-in history is all unknown), and
 //    counted in Result::guessed together with every block that predicts from it. The texture then has a few wrong
-//    blocks instead of missing.
+//    blocks instead of missing. Unlike Python's provisional mode, lenient decoding never applies `_loose_limit` (at
+//    most 1 block in 1,024 resting on unknown history) and never refuses a chunk for anchor or p-bit inconsistencies:
+//    it decodes them all and leaves the decision to the caller through Result::guessed.
 //
 // Done: all six BCPack modes, 1 (BC1), 3 (BC3), 4 (BC4), 5 (BC5), 6 (BC6H) and 7 (BC7).
 #pragma once

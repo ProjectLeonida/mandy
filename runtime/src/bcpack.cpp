@@ -925,7 +925,7 @@ Status decode_lanes(std::span<const std::uint8_t> raw, std::span<const std::uint
 Result decode(std::span<const std::uint8_t> in, std::uint32_t mode, std::span<std::uint8_t> out,
               const Options& options) {
     const std::uint32_t bytes = block_bytes(mode);
-    if (block_bytes(mode) == 0) return {Status::unsupported_codec};
+    if (bytes == 0) return {Status::unsupported_codec};
     if (out.size() % bytes) return {Status::bad_size};
     Lanes lanes;
     if (const Status s = decode_lanes(in, lane_widths(mode), out.size() / kElementBytes, lanes); s != Status::ok)
