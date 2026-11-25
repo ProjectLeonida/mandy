@@ -41,3 +41,7 @@ __pycache__/
 *.exp
 *.log
 .vs/
+
+# Predictor profiles are fitted from the user's own texture pools.
+*.bcph
+*.bcph.stamp

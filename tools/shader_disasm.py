@@ -92,19 +92,22 @@ def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True
     if backend == "python":
         asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
         return asm, bad, ""
-    asm, bad, err = run_mc(code, mcpu)
+    asm, bad, err = run_mc(code, mcpu, wave32)
     if bad and asm.strip():
-        fixed = with_vopc_dpp(code, mcpu, err)
+        fixed = with_vopc_dpp(code, mcpu, err, wave32)
         if fixed:
             return fixed
     return asm, bad, err
 
 
-def run_mc(code: bytes, mcpu: str):
+def run_mc(code: bytes, mcpu: str, wave32: bool = True):
     """One llvm-mc pass over `code`: (listing, invalid word count, stderr), or ("", count, reason) when it failed."""
-    text = " ".join(f"0x{b:02x}" for b in code)
+    # llvm-mc echoes the entire input line for each bad word. Newlines are whitespace, even inside
+    # a multiword instruction. Bound each diagnostic to one dword instead of the whole shader.
+    text = "\n".join(" ".join(f"0x{b:02x}" for b in code[i:i + 4]) for i in range(0, len(code), 4))
     try:
-        p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
+        wave_flags = [] if wave32 else ["-mattr=-wavefrontsize32,+wavefrontsize64"]
+        p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", *wave_flags, "-show-encoding"],
                            input=text, capture_output=True, text=True, errors="replace",
                            creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
     except OSError as e:
@@ -116,7 +119,7 @@ def run_mc(code: bytes, mcpu: str):
 
 
 ENCODING = re.compile(r"; encoding: \[([^\]]*)\]")
-INVALID_AT = re.compile(r":1:(\d+): warning: invalid instruction encoding")
+INVALID_AT = re.compile(r":(\d+):(\d+): warning: invalid instruction encoding")
 VOPC = 0x3E                    # bits 31..25 of a VOPC word
 DPP_SRC0 = (250, 233, 234)     # the src0 field of a DPP16, DPP8 and DPP8-with-fi word
 STAND_IN = 0x10                # VOP2 v_max_f32: takes the same DPP second word, and llvm-mc decodes it
@@ -124,9 +127,10 @@ STAND_IN_TEXT = "v_max_f32_dpp v0, "
 
 
 def invalid_offsets(err: str) -> set:
-    """Byte offsets llvm-mc rejected: its warning names the column of the word in the one line of 5-character
-    "0xNN " tokens it was given."""
-    return {(int(col) - 1) // 5 for col in INVALID_AT.findall(err)}
+    """Byte offsets llvm-mc rejected: its warning names the line and column of the word in the input of 5-character
+    "0xNN " tokens it was given, one line per dword (run_mc); a listing made from one line of the whole code has
+    every warning on line 1."""
+    return {(int(line) - 1) * 4 + (int(col) - 1) // 5 for line, col in INVALID_AT.findall(err)}
 
 
 def vopc_dpp_words(code: bytes, offsets) -> dict:
@@ -143,7 +147,7 @@ def vopc_dpp_words(code: bytes, offsets) -> dict:
     return found
 
 
-def with_vopc_dpp(code: bytes, mcpu: str, err: str):
+def with_vopc_dpp(code: bytes, mcpu: str, err: str, wave32: bool = True):
     """The listing of `code` with each rejected VOPC compare in DPP form printed as the instruction it is, or None
     when there is none (docs/design.md, "DPP on a VOPC compare"). llvm-mc has no decoding for the pair on gfx10, so
     it is decoded with the first word turned into a VOP2 that takes the same DPP second word (v_max_f32 into v0),
@@ -156,7 +160,7 @@ def with_vopc_dpp(code: bytes, mcpu: str, err: str):
         patched = bytearray(code)
         for at, (_, w0, _) in words.items():
             struct.pack_into("<I", patched, at, STAND_IN << 25 | (w0 & 0x1FFFF))
-        asm, bad, err2 = run_mc(bytes(patched), mcpu)
+        asm, bad, err2 = run_mc(bytes(patched), mcpu, wave32)
         if not asm.strip():
             return None
         invalid, pos, hit, lines = invalid_offsets(err2), 0, set(), []

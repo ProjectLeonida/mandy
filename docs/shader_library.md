@@ -180,6 +180,29 @@ them and the state key is the record's state blob. The step is redone as a whole
 `llvm-mc`, the wave64 mode or the flags change (`library_build.json`, written last), and a clash of both keys between
 different modules fails it, as for the FSPX step. Graphics pipelines are not translated by the build.
 
+### Resuming a compute-only batch on Linux
+
+Run `tools/shader_library.py` with `--stages cs --disasm --jobs 2` and the carved containers, or select the
+kind-6 hashes with `--compute-hashes`. For an unpacked library with its input `index.json`, use the compute batch.
+
+```sh
+python3 -I scripts/translate_pipeline_compute.py /path/to/unpacked --out /path/to/spirv/library --wave64-emulate
+```
+
+Use a dedicated output folder. The two workers run at nice 19. Each has a 768 MiB address-space limit and uses one
+SPIRV-Tools process at a time (four processes total). `--jobs 1` uses a single worker and `--memory-mib` changes
+the per-process limit. A rerun checks each module against its checksum and the listing, source container, FSPX
+sidecars, toolchain and wave mode. It retries failures. Only validated modules enter the runtime index. Its
+atomic replacement follows both workers, so an interrupted run leaves the previous index readable. A partial
+run exits nonzero and writes the reasons to `failures.json`, keyed by kind-6 and kind-0 SHA-256. Old modules
+can still be used by a runtime that already opened the preceding index.
+
+Among 2,680 compute programs, 46 start with two 12-byte literal-bearing VOP3 NOP hash carriers. Their body
+starts at byte 24. The three-record form starts at byte 36. The no-op measurements are in `docs/fspx.md`.
+A hash literal can resemble an instruction. `shader_library.py` excludes both complete carrier records before
+looking for the end of the program. LLVM input uses one dword per line, including within multiword instructions,
+so its diagnostic for an invalid word echoes at most four source bytes.
+
 ## 5. Translation
 
 With `--carve` and `rdna2spirv.py` at `main` `aa2988cc` (llvm-mc 23, `gfx1013`), **17,955 of the 21,522 programs

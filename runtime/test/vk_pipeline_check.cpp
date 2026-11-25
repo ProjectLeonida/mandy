@@ -49,7 +49,7 @@
 //                 pipelines stage's retry.
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
-#include "pipeline_cache_file.h"
+#include "../src/pipeline_cache_file.h"
 #include "pipeline_cache_snapshot.h"
 #include "large_module_gate.h"
 #include "pipeline_summary.h"
@@ -1115,7 +1115,7 @@ int main(int argc, char** argv) {
     auto has = [&](const char* e) { for (auto& x : exts) if (!std::strcmp(x.extensionName, e)) return true; return false; };
     std::vector<const char*> enable;
 
-    // Query what the GPU supports for core 1.2/1.3 and any optional extensions requested by `work`.
+    // Query the core and optional device features used by the checker.
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT lock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};

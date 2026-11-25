@@ -104,13 +104,29 @@ Useful switches:
   `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
+* `LEONIDA_STUB_PIPELINES=1` creates a pipeline whose translated shader is missing (no shader library, or no entry
+  for its program) as a no-op stub instead of failing `CreateGraphicsPipelineState` / `CreateComputePipelineState`.
+  The stub is never registered, so `SetPipelineState` binds no PSO and its draws and dispatches are no-ops (D3D-482).
+  Diagnostic only, like `LEONIDA_SKIP_INT3`: it follows a boot past every pipeline the title creates without
+  translating or running a game shader, so nothing the title draws reaches the screen. Each stub is logged with a
+  power-of-two count.
+* During `--run` on Vulkan, the runtime paints the package shell splash when the title shows its window. The first
+  direct queue presents it on the window's swapchain. Startup clears keep the splash visible until the first
+  non-black output replaces it. The runtime reads `ShellVisuals/SplashScreenImage` from
+  `MicrosoftGame.Config` or `SplashScreen/Image` from `appxmanifest.xml`, preserves the image's aspect ratio and
+  uses the same swapchain for PresentX. A surface without readback hands off at the first title present.
+  Set `LEONIDA_PACKAGE_SPLASH=0` to disable the splash.
 * `LEONIDA_VK_VALIDATION=1` enables the Khronos validation layer with the Vulkan backend (startup overhead; it is a
   diagnostic).
+* `LEONIDA_DEVICE_FAULT=1` enables Vulkan device-loss diagnostics and checkpoints where available. The first
+  observed loss prints a `[rt] device-fault:` report to stderr.
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their
   implicit layers add swapchain usage that shows up as validation errors ([testing.md](testing.md), "Known
   problems").
 * `--overlay DIR` sends the guest's writes to DIR instead of the default `<game-dir>\overlay` (useful when the
-  package drive is read-only); the package itself is never written.
+  package drive is read-only); the package itself is never written. Set `LEONIDA_WRITE_DIR` to override that folder
+  for one run (it wins over `--overlay`). For a fresh first-run profile, also set `LEONIDA_SAVE_DIR` to a separate
+  empty directory for the local game-save provider.
 
 ## 3. Triage order
 

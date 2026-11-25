@@ -8,8 +8,9 @@ hold counts, offsets, chunk names and module identifiers.
 ## 1. Why they matter
 
 `tools/shader_carve.py` carves `shaders.rpf` only. Two DLLs in the same package carry compute programs of their
-own, and `make_game.py`'s `shaders` stage translates both sets after the game's shaders (section 7 for the
-builder, [fspx.md](fspx.md) for FidelityFX):
+own, and the game executable carries graphics programs inline; `make_game.py`'s `shaders` stage translates all
+three sets after the game's shaders (section 7 for the builder and the executable, [fspx.md](fspx.md) for
+FidelityFX):
 
 * `XboxBvhBuilder.dll`, Microsoft's XDXR acceleration-structure builder. Its constructor creates compute PSOs
   through device slot 62, and the builder is on the critical path for ray tracing.
@@ -42,7 +43,7 @@ validator rejects it (the scan reports both counts).
 ### Retail executable (`game_scarlett_master.exe`, RT-5)
 
 Scanning the retail executable (120,181,760 bytes, SHA-256 `e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`)
-with `tools/pe_shader_containers.py` finds **10** valid DXBC containers (9,520 bytes total, file offsets
+for literal DXBC headers finds **10** valid containers (9,520 bytes total, file offsets
 `0x688cd3c`..`0x688fdf6`, sizes 924–992 bytes) and 1 rejected `DXBC` hit:
 
 * **Stages (`PSV0`):** **1** vertex shader (`0x688cd3c`, 992 bytes) and **9** pixel shaders (924–980 bytes). Unlike the
@@ -53,6 +54,9 @@ with `tools/pe_shader_containers.py` finds **10** valid DXBC containers (9,520 b
   unpack via `tools/fssm_unpack.py` (10/10 `FSSM`, 1,245–4,176 bytes), disassemble cleanly via `tools/shader_disasm.py --backend python`
   (10/10 clean), translate via `tools/rdna2spirv.py` (10/10 translated, all wave64 tier A), and pass `vk_pipeline_check`
   on an NVIDIA GeForce RTX 5060 Laptop GPU (driver `617.14`, Windows 11): **10/10 modules and 10/10 pipelines OK** (1 VS, 9 PS, 0 failed, 0 skipped).
+  The build now extracts and translates these 10 in its own `exe` stage (section 7), and the runtime loads them
+  from `<shaders>/exe/index.json`; one of them is the VS that 14 graphics PSOs named and could not create before
+  that step existed (section 7, measured).
 
 **Every one of the 52 containers carries two representations of its program:**
 
@@ -290,12 +294,57 @@ The last line also gets `--wave64-emulate` and the fallback flags of the build, 
   emulated modules made at the default cap, `RadixAlloc` is refused (`declares 37084 bytes of workgroup memory`,
   `0x80004001`) after 28 creations.
 
+**Packed pixel shaders.** The executable also holds two native pixel shaders in SGD5 records. Their header file
+offsets are `0x688ecf6` and `0x688f17f`. Both stored lengths include the 12-byte header. Raw deflate yields a
+complete DXBC of 1,324 or 1,052 bytes. Their FSSM SHA-256 keys are
+`cae1e27820adde6a6cb35e308290164ad8cf7107f0fe147d50a2053d7ceeb4b8` and
+`879cb2e326c5e5333935a0b2b1dd9c3c2adc1b03e546d1f84f993d912b4f66b0`. The first is
+`PS_ClearMulti4_f05fef9c_Wrapped`, requested by two graphics streams whose lookup failed with the old index.
+`pe_shader_containers.py` checks the stored lengths, inflates the complete stream and validates the inner
+container. It appends packed XBCH records after the plain containers to preserve their existing file names.
+Three other packed DXBCs have no native XBCH entry. The 12 native programs (1 VS, 11 PS) all translate, pass
+`spirv-val`, and compile with the pipeline checker's partner stubs on an RTX 4070.
+
+The clear shader lookup failed for two distinct graphics state keys.
+
+- `589de82a8d0f07c4eaa73fa3d25a69c3c6d0eb79cca5bc970f129313a180b207`
+- `550e747ba7a5fd9b1467ed8c33be3276ed434621d919c6aa179bdb629086389d`
+
+Both use the VS `exe/container_00` (FSSM `01ac7810dcabd62afcd904b231e90d9a031a51808a700e3349290bec5f0d426f`)
+and the recovered PS `exe/container_10`. Both declare two render targets, RT0 format 87 (BGRA8 UNORM) and
+DSV format 20 (D32 FLOAT S8X24 UINT). Their translated VS and PS pass the pairwise interface check.
+
+**The executable's native containers (`exe_shaders()`).** After the builder's step, the same stage runs
+`pe_shader_containers.py <game>/game_scarlett_master.exe --extract <work>/shaders/exe`, then `fssm_unpack.py`,
+`shader_disasm.py` and `rdna2spirv.py` as in the recipe above, into `<work>/shaders/spirv/exe`. The executable
+passes these containers inline to `CreatePipelineState`, so no archive holds them; the key is `fssm_sha256` again.
+The step is reused on the same conditions as the builder's (the image, the three tools before the translator, the
+translator, llvm-mc, the wave64 mode and the fallback flags) and reports every program left untranslated on every
+run. Measured on 1.0.2.1: **12/12 translate and pass `spirv-val`** (1 VS, 11 PS, 1,245–4,239 bytes); the VS's
+SHA-256 is `01ac7810dcabd62afcd904b231e90d9a031a51808a700e3349290bec5f0d426f`.
+
+**That VS is why 14 graphics PSOs failed (measured).** On the base commit, a 100 s boot refused **14** of 50,469
+`CreatePipelineState` calls, every one with `no translated vs for FSSM sha256 01ac...`: none of the 26,503 indexed
+`fssm` blobs has that SHA-256, because the container is in the executable and the build never extracted it. The
+translator supports it (all 10 executable containers unpack, disassemble and translate cleanly, wave64 tier A), so
+the gap was extraction, not translation. With this step and the runtime index, the same boot creates all 14
+(**0 failed**, 10 `exe` entries loaded). The 14 calls have 13 distinct signatures (one repeats) and share one
+paired PS (`452212e59d983c3b6404328105153b5b26a435f5d7780dbcedc0c46a51ecec60`, `exe/container_06`, a colour
+passthrough); their target layouts are R8G8B8A8_UNORM and R8G8B8A8_UNORM_SRGB, R11G11B10_FLOAT, R10G10B10A2_UNORM,
+A8_UNORM and B8G8R8A8_UNORM, with and without D32_FLOAT_S8X24_UINT, plus one 5-RT layout. The VS has only
+`SV_VertexID` as an input and reads two streams (position, colour) out of the title's memory through a descriptor
+in its root arguments, so these are quad/UI draws (Scaleform-style), not a texture composite; the B8G8R8A8 layouts
+can write a backbuffer-format target. A 150 s boot with late-frame captures (`LEONIDA_CAPTURE_EVERY=300`, frames
+1 to 6,901, so the last ones about 110 s in) was still all black (24/24 frames, mean rgb 0.00), so this VS was not
+the black-frame cause; see the presentation notes for that.
+
 **Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json`, then
-`<dir>/fspx/index.json` and `<dir>/bvh/index.json` when they are there. The builder's entries are named
-`bvh/<name>`, the path of their module below `<dir>`, and go into the table of the game's shaders, so
-`create_compute` finds them through the lookup it already had (`compute_program()` gives an `FSSM` program, looked up
-by `(cs, fssm_sha256)`). A missing or unreadable `bvh/index.json` leaves the other indexes loaded, and the main
-index is still required. `bvh_size()` counts the entries, which `shader_library_corpus_test` leaves out of the
+`<dir>/fspx/index.json`, `<dir>/bvh/index.json` and `<dir>/exe/index.json` when they are there. The builder's
+entries are named `bvh/<name>` and the executable's `exe/<name>`, the path of their module below `<dir>`, and go
+into the table of the game's shaders, so `create_graphics` and `create_compute` find them through the lookups they
+already had (`compute_program()` gives an `FSSM` program, looked up by `(cs, fssm_sha256)`). A missing or
+unreadable `bvh/index.json` or `exe/index.json` leaves the other indexes loaded, and the main index is still
+required. `bvh_size()` and `exe_size()` count those entries, which `shader_library_corpus_test` leaves out of the
 entries a carved container must reach, like the FSPX ones.
 
 **Measured: `LEONIDA_BVH_DEVICE=vulkan bvh_builder_test`** (package 1.0.2.1, `LEONIDA_BVH_RECORD62=1`,

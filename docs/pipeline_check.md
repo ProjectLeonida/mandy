@@ -24,6 +24,8 @@ For an index entry with `lds_bytes`, the checker compares the reported workgroup
 limit counts as a module failure before Vulkan receives the shader. Older indexes without this field still use the
 normal driver check. Mesh pipelines on devices without mesh shader support still use the existing feature skip.
 
+Build with `make_game.py --stages shaders --compact-spirv` to run SPIRV-Tools local load elimination, redundant value elimination and dead-code elimination before validation. The same flag works on `tools/rdna2spirv.py` and `scripts/translate_pipeline_compute.py`. It preserves stage interfaces, descriptor bindings and specialization constants. Omit the flag for an unoptimized comparison. On NVIDIA use separate empty pipeline caches and set `__GL_SHADER_DISK_CACHE=0` for both arms. Use one pipeline per checker process with `--jobs 1 --slow 0` for per-module timings.
+
 ## Options
 
 `vk_pipeline_check <spirv dir> [cache.bin] [options]`
