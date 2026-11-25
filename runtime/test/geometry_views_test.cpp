@@ -7,13 +7,18 @@
 //   4. two written tiles of one view are two tile copies (LEONIDA_GEOMETRY_WHOLE_VIEWS=1, whole views, fails 2-4);
 //   5. a small cap refuses past its budget without re-trying while nothing changed;
 //   6. retiring a range defers freeing until its GPU ticket completes, then returns budget and lets refused ranges retry;
-//   7. releasing every view in a block via geometry_writes::note_released destroys the block and frees its reserved budget.
+//   7. releasing every view in a sub-4 MiB block via geometry_writes::note_released destroys the block and frees its budget;
+//   8. note_released ignores ranges outside the watched tile bounds and queues ranges inside them;
+//   9. overflowing the release queue (65537 disjoint ranges) collapses to one covering range and retires covered views;
+//  10. reaping the last view in a standard 4 MiB block keeps it as a spare and the next view reuses it;
+//  11. under a cap, an unfitting 4 MiB spare is destroyed so a larger request can succeed (or fail if still over cap).
 #include <windows.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "../shims/d3d12_geometry_views.h"
@@ -32,6 +37,7 @@ void check(bool condition, const char* what) {
 // The Vulkan calls TitleBufferWindows::allocate makes, over host memory.
 int g_live_buffers = 0;
 int g_live_allocs = 0;
+int g_total_allocs = 0;
 struct FakeBuffer {
     VkDeviceSize size = 0;
     void* memory = nullptr;
@@ -97,7 +103,10 @@ struct FakeDevice {
                             VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags* chosen, bool) {
         if (chosen) *chosen = required | preferred;
         void* mem = VirtualAlloc(nullptr, r.size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (mem) ++g_live_allocs;
+        if (mem) {
+            ++g_live_allocs;
+            ++g_total_allocs;
+        }
         return reinterpret_cast<VkDeviceMemory>(mem);
     }
 };
@@ -251,6 +260,115 @@ int main() {
     capped.release(device);
     check(g_live_buffers == 0 && g_live_allocs == 0, "teardown frees all remaining Vulkan buffers and memory");
     VirtualFree(small_title, 0, MEM_RELEASE);
+
+    // 8-11. Watched-bounds filtering, release-queue overflow collapse, 4 MiB spare block reuse and cap eviction.
+    auto* pool_title =
+        static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 6 * kView, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!pool_title) return 1;
+    for (std::size_t i = 0; i < 6 * kView; ++i) pool_title[i] = std::uint8_t((i * 17) ^ 0x3c);
+    const auto pbase = reinterpret_cast<std::uintptr_t>(pool_title);
+
+    // 8. note_released outside [watched_lo, watched_hi) is ignored; inside is queued.
+    rt::d3d12::GeometryViews watched(6 * kView);
+    const std::uint64_t va_w1 = watched.resolve(device, pbase, kView, copy);
+    const std::uint64_t va_w2 = watched.resolve(device, pbase + kView, kView, copy);
+    check(va_w1 != 0 && va_w2 != 0 && watched.live_views() == 2 && watched.block_count() == 1 &&
+              watched.empty_blocks() == 0,
+          "two 1 MiB views share one 4 MiB block");
+    const auto watched_lo = leonida::geometry_writes::state().watched_lo.load(std::memory_order_acquire);
+    const auto watched_hi = leonida::geometry_writes::state().watched_hi.load(std::memory_order_acquire);
+    check(watched_lo <= pbase && watched_hi >= pbase + 2 * kView, "watched bounds cover resolved views");
+    leonida::geometry_writes::note_released(watched_lo - 4096, watched_lo);
+    leonida::geometry_writes::note_released(watched_hi, watched_hi + 4096);
+    check(!leonida::geometry_writes::has_released(), "note_released outside watched bounds is not queued");
+    leonida::geometry_writes::note_released(pbase, pbase + 4096);
+    check(leonida::geometry_writes::has_released(), "note_released inside watched bounds is queued");
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> drained;
+    leonida::geometry_writes::take_released(drained);
+    check(drained.size() == 1 && drained[0].first == pbase && drained[0].second == pbase + 4096 &&
+              !leonida::geometry_writes::has_released(),
+          "take_released returns the queued in-bounds range");
+    // A GPU-only twin freed by its own address lies outside the watched (CPU) bounds but still counts: its CPU view
+    // holds the views. Only the address arithmetic of the pair is used; nothing is mapped at the GPU address.
+    const std::uintptr_t gpu_twin = std::uintptr_t(0x600000000000ull);
+    leonida::title_gpu_views::note_reservation(pbase, 2 * kView, false);
+    check(leonida::title_gpu_views::note_reservation(gpu_twin, 2 * kView, true), "the GPU-only twin pairs");
+    leonida::geometry_writes::note_released(gpu_twin + 2 * kView, gpu_twin + 2 * kView + 4096);
+    check(!leonida::geometry_writes::has_released(), "a range past the twin is not queued");
+    leonida::geometry_writes::note_released(gpu_twin + kView, gpu_twin + kView + 4096);
+    check(leonida::geometry_writes::has_released(), "a range of the GPU-only twin over a watched view is queued");
+    watched.drain_released(device, 3, 0);
+    check(watched.live_views() == 1 && watched.retired_count() == 1 && watched.find(pbase + kView, kView) == 0 &&
+              watched.find(pbase, kView) == va_w1,
+          "draining the twin's range retires the view at its CPU address only");
+    const std::uint64_t va_w2b = watched.resolve(device, pbase + kView, kView, copy);
+    check(va_w2b != 0, "the retired view is made again on the next resolve");
+
+    // 9. Queue overflow: 65537 disjoint ranges collapse into one covering range; drain retires every covered view.
+    constexpr std::size_t kOverflowCount = 65537;
+    for (std::size_t i = 0; i < kOverflowCount; ++i)
+        leonida::geometry_writes::note_released(pbase + i * 16, pbase + i * 16 + 8);
+    leonida::geometry_writes::take_released(drained);
+    check(drained.size() == 1 && drained[0].first == pbase &&
+              drained[0].second == pbase + (kOverflowCount - 1) * 16 + 8 && !leonida::geometry_writes::has_released(),
+          "65537 disjoint ranges collapse into a single covering range");
+    for (std::size_t i = 0; i < kOverflowCount; ++i)
+        leonida::geometry_writes::note_released(pbase + i * 16, pbase + i * 16 + 8);
+    watched.drain_released(device, 10, 9);
+    check(!leonida::geometry_writes::has_released() && watched.live_views() == 0 && watched.retired_count() == 2,
+          "drain_released after overflow retires every view inside the collapsed range");
+    watched.release(device);
+    check(g_live_buffers == 0 && g_live_allocs == 0, "watched teardown frees its block");
+
+    // 10. Spare 4 MiB block: retiring and reaping the sole view keeps the block empty and the next view reuses it.
+    rt::d3d12::GeometryViews spare(6 * kView);
+    const std::uint64_t va_s1 = spare.resolve(device, pbase, kView, copy);
+    const int allocs_after_first = g_total_allocs;
+    check(va_s1 != 0 && spare.block_count() == 1 && spare.empty_blocks() == 0 && spare.reserved() == 4 * kView &&
+              g_live_buffers == 1 && g_live_allocs == 1,
+          "first view under a 6 MiB cap allocates one standard 4 MiB block");
+    check(spare.retire_range(pbase + kView - 16, pbase + kView, 1) == 1 && spare.reap(device, 1) == 1,
+          "retiring a tail subrange and reaping frees the view");
+    check(spare.live_views() == 0 && spare.block_count() == 1 && spare.empty_blocks() == 1 &&
+              spare.reserved() == 4 * kView && g_live_buffers == 1 && g_live_allocs == 1,
+          "reaping the last view keeps the empty 4 MiB block as a spare");
+    const std::uint64_t va_s2 = spare.resolve(device, pbase + kView, kView, copy);
+    check(va_s2 != 0 && spare.block_count() == 1 && spare.empty_blocks() == 0 && g_live_buffers == 1 &&
+              g_live_allocs == 1 && g_total_allocs == allocs_after_first,
+          "a new view reuses the spare 4 MiB block with no new allocation");
+
+    // 11. Spare given up under the cap: destroy the unfitting 4 MiB spare so a larger request succeeds, and still
+    // refuse a request that remains over the cap after the spare is destroyed.
+    check(spare.retire_range(pbase + kView, pbase + 2 * kView, 2) == 1 && spare.reap(device, 2) == 1 &&
+              spare.block_count() == 1 && spare.empty_blocks() == 1 && spare.reserved() == 4 * kView,
+          "reaping the reused view returns the 4 MiB block to spare");
+    const std::uint64_t va_big = spare.resolve(device, pbase, 5 * kView, copy);
+    check(va_big != 0 && spare.block_count() == 1 && spare.empty_blocks() == 0 && spare.reserved() == 5 * kView &&
+              g_live_buffers == 1 && g_live_allocs == 1,
+          "a 5 MiB request under a 6 MiB cap destroys the 4 MiB spare and succeeds");
+    spare.release(device);
+    check(g_live_buffers == 0 && g_live_allocs == 0, "spare teardown frees its block");
+
+    rt::d3d12::GeometryViews tight(9 * kView);
+    const std::uint64_t va_t1 = tight.resolve(device, pbase, 3 * kView, copy);
+    const std::uint64_t va_t2 = tight.resolve(device, pbase + 3 * kView, 2 * kView, copy);
+    check(va_t1 != 0 && va_t2 != 0 && tight.block_count() == 2 && tight.reserved() == 8 * kView,
+          "two views that do not share one 4 MiB block reserve 8 MiB");
+    check(tight.retire_range(pbase + 3 * kView, pbase + 5 * kView, 1) == 1 && tight.reap(device, 1) == 1 &&
+              tight.block_count() == 2 && tight.empty_blocks() == 1 && tight.reserved() == 8 * kView,
+          "reaping the second block leaves one 4 MiB spare alongside one live 4 MiB block");
+    const std::uint64_t va_over = tight.resolve(device, pbase, 6 * kView, copy);
+    check(va_over == 0 && tight.cap_refusals() == 1 && tight.block_count() == 1 && tight.empty_blocks() == 0 &&
+              tight.reserved() == 4 * kView && g_live_buffers == 1 && g_live_allocs == 1,
+          "a 6 MiB request drops the 4 MiB spare and is refused because only 5 MiB of cap remain");
+    const std::uint64_t va_fit = tight.resolve(device, pbase, 5 * kView, copy);
+    check(va_fit != 0 && tight.block_count() == 2 && tight.reserved() == 9 * kView && g_live_buffers == 2 &&
+              g_live_allocs == 2,
+          "a 5 MiB request succeeds in the cap freed by dropping the spare");
+    tight.release(device);
+    check(g_live_buffers == 0 && g_live_allocs == 0, "tight cap teardown frees all blocks");
+
+    VirtualFree(pool_title, 0, MEM_RELEASE);
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

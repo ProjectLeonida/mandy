@@ -2400,7 +2400,6 @@ struct DeviceState {
     std::uint64_t geometry_va(std::uint64_t guest, std::uint64_t span, bool read_only) {
         if (!geometry.cap() || !span || !guest || !watch_shadow_writes()) return 0;
         const auto cpu = leonida::title_gpu_views::to_cpu(guest, span);
-        if (geometry.should_reclaim(cpu, span)) drain_geometry_releases();
         auto& aliases = leonida::title_va_aliases();
         const auto alias = aliases.shader_va(cpu, span);
         if (alias != cpu) return alias;
@@ -2624,7 +2623,6 @@ struct DeviceState {
         } else {
             bool geometry_copy = false;
             if (geometry.cap() && watch_shadow_writes() && !context->knows_buffer_va(extent.start, extent.size)) {
-                if (geometry.should_reclaim(extent.start, extent.size)) drain_geometry_releases();
                 shader = geometry.resolve(*this, extent.start, extent.size, copy_geometry);
                 geometry_copy = shader != 0;
             }
@@ -2750,7 +2748,6 @@ struct DeviceState {
         const auto cpu = leonida::title_gpu_views::to_host_view(static_cast<std::uintptr_t>(va),
                                                                 static_cast<std::uintptr_t>(span));
         if (context->knows_buffer_va(cpu, span)) return 0;
-        if (geometry.should_reclaim(cpu, span)) drain_geometry_releases();
         const std::uint64_t copy = geometry.resolve(*this, cpu, span, copy_geometry);
         if (!copy) return 0;
         std::lock_guard lock(title_window_mutex);

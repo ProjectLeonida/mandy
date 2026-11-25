@@ -12,8 +12,10 @@
 namespace rt::d3d12 {
 
 // Storage for shader-addressed mirrors when the main arena has no usable offset.
-// Sub-ranges freed via free() are coalesced for reuse; an empty block releases its Vulkan buffer and memory.
+// Sub-ranges freed via free() are coalesced for reuse; one empty standard 4 MiB block is kept as a spare and any
+// other empty block releases its Vulkan buffer and memory.
 class TitleBufferWindows {
+    static constexpr VkDeviceSize kBlockSize = 4ull << 20;
     struct Block {
         VkBuffer buffer{};
         VkDeviceMemory memory{};
@@ -35,16 +37,30 @@ class TitleBufferWindows {
     bool local_refused_ = false;  // device-local blocks refused once: host memory from then on
     std::uint64_t quick_refusals_ = 0;
 
+    template<class Device>
+    void destroy_block(Device& d, std::vector<Block>::iterator it) {
+        d.context->vk.vkUnmapMemory(d.info.device, it->memory);
+        d.context->vk.vkDestroyBuffer(d.info.device, it->buffer, nullptr);
+        d.context->vk.vkFreeMemory(d.info.device, it->memory, nullptr);
+        reserved_ -= it->reserved_bytes;
+        blocks_.erase(it);
+    }
+
 public:
     VkDeviceSize reserved() const { return reserved_; }
     std::size_t block_count() const { return blocks_.size(); }
+    std::size_t empty_blocks() const {
+        std::size_t count = 0;
+        for (const auto& b : blocks_)
+            if (b.live == 0) ++count;
+        return count;
+    }
 
     template<class Device>
     bool allocate(Device& d, VkDeviceSize bytes, VkDeviceSize& offset, std::uint8_t*& mapped,
                   bool device_local = false, VkDeviceSize cap = UINT64_MAX, bool* at_cap = nullptr) {
         if (!bytes) return false;
         const VkDeviceSize alignment = device_local ? 16 : 65536;
-        constexpr VkDeviceSize block_size = 4ull << 20;
         auto take = [&](Block& b) {
             for (auto it = b.free_ranges.begin(); it != b.free_ranges.end(); ++it) {
                 const VkDeviceSize range_start = it->first;
@@ -80,13 +96,25 @@ public:
             failed_at_ = std::chrono::steady_clock::now();
             return false;
         };
-        const VkDeviceSize remaining_cap = reserved_ < cap ? cap - reserved_ : 0;
-        if (bytes > remaining_cap) {
-            if (at_cap) *at_cap = true;
+        auto drop_unfitting_spare = [&] {
+            for (auto it = blocks_.begin(); it != blocks_.end(); ++it) {
+                if (it->live == 0 && bytes > it->capacity) {
+                    destroy_block(d, it);
+                    return true;
+                }
+            }
             return false;
+        };
+        VkDeviceSize remaining_cap = reserved_ < cap ? cap - reserved_ : 0;
+        if (bytes > remaining_cap) {
+            if (drop_unfitting_spare()) remaining_cap = reserved_ < cap ? cap - reserved_ : 0;
+            if (bytes > remaining_cap) {
+                if (at_cap) *at_cap = true;
+                return false;
+            }
         }
         Block b{};
-        b.capacity = std::max(bytes, std::min(block_size, remaining_cap));
+        b.capacity = std::max(bytes, std::min(kBlockSize, remaining_cap));
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = b.capacity;
         info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
@@ -95,9 +123,12 @@ public:
         VkMemoryRequirements req{};
         vk.vkGetBufferMemoryRequirements(d.info.device, b.buffer, &req);
         if (req.size > remaining_cap) {
-            if (at_cap) *at_cap = true;
-            vk.vkDestroyBuffer(d.info.device, b.buffer, nullptr);
-            return false;
+            if (drop_unfitting_spare()) remaining_cap = reserved_ < cap ? cap - reserved_ : 0;
+            if (req.size > remaining_cap) {
+                if (at_cap) *at_cap = true;
+                vk.vkDestroyBuffer(d.info.device, b.buffer, nullptr);
+                return false;
+            }
         }
         // Device-local (Resizable BAR) when asked and while the driver gives it; host memory otherwise. After the
         // story load the driver refused every 4 MiB device-local, host-visible block with a device address
@@ -141,8 +172,8 @@ public:
         return failed();
     }
 
-    // Returns [offset, offset + bytes) to its block for reuse; destroys the block once no live allocations remain.
-    // Caller must guarantee no in-flight GPU work references this range.
+    // Returns [offset, offset + bytes) to its block for reuse; keeps one empty 4 MiB block as a spare and destroys
+    // any other empty block. Caller must guarantee no in-flight GPU work references this range.
     template<class Device>
     bool free(Device& d, VkDeviceSize offset, VkDeviceSize bytes) {
         if (!bytes) return false;
@@ -170,12 +201,13 @@ public:
             b.free_ranges.emplace(merged_begin, merged_end - merged_begin);
             if (b.live > 0) --b.live;
             if (b.live == 0) {
-                d.context->vk.vkUnmapMemory(d.info.device, b.memory);
-                d.context->vk.vkDestroyBuffer(d.info.device, b.buffer, nullptr);
-                d.context->vk.vkFreeMemory(d.info.device, b.memory, nullptr);
-                reserved_ -= b.reserved_bytes;
-                blocks_.erase(it);
-                failed_ = false;
+                if (b.capacity == kBlockSize && empty_blocks() == 1) {
+                    b.free_ranges.clear();
+                    b.free_ranges.emplace(0, b.capacity);
+                    b.used = 0;
+                } else {
+                    destroy_block(d, it);
+                }
             }
             return true;
         }

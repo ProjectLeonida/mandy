@@ -70,7 +70,9 @@ class GeometryViews {
             return std::hash<std::uint64_t>{}(std::uint64_t(k.first) * 0x9E3779B97F4A7C15ull ^ k.second);
         }
     };
-    std::unordered_map<Key, std::uint64_t, KeyHash> refused_;  // key -> free_generation_ at refusal (under mutex_)
+    std::map<Key, std::uint64_t> refused_;  // key -> free_generation_ at refusal (under mutex_)
+    std::size_t max_view_bytes_{};          // largest size of any view ever created (under mutex_)
+    std::size_t max_refused_bytes_{};       // largest size of any refused key (under mutex_)
     // keys_, views_ (the vector itself, and each live view's source, size, dst, va, bda and alive) and by_address_
     // change only under mutex_ and then structure_mutex_ exclusively. lookup() and find() read them under
     // structure_mutex_ shared, so they do not wait for a refresh() in progress (which holds mutex_ and changes only a
@@ -216,12 +218,6 @@ public:
     bool has_pending_reclaim() const {
         return leonida::geometry_writes::has_released() || has_retired();
     }
-    bool should_reclaim(Address cpu, std::size_t bytes) const {
-        if (leonida::geometry_writes::has_released()) return true;
-        if (!has_retired()) return false;
-        VkDeviceSize va = 0;
-        return !fast_find({cpu, bytes}, va) || va == 0;
-    }
 
     std::uint64_t bytes() const {
         std::lock_guard lock(mutex_);
@@ -252,6 +248,10 @@ public:
     std::size_t block_count() const {
         std::lock_guard lock(mutex_);
         return pool_.block_count();
+    }
+    std::size_t empty_blocks() const {
+        std::lock_guard lock(mutex_);
+        return pool_.empty_blocks();
     }
 
     std::uint64_t find(Address cpu, std::size_t bytes) const {
@@ -287,6 +287,7 @@ public:
         if (over_bytes || !pool_.allocate(device, bytes, va, mapped, true, limit, &at_cap)) {
             if (at_cap || over_bytes) {
                 refused_[key] = gen;
+                if (bytes > max_refused_bytes_) max_refused_bytes_ = bytes;
                 publish(key, 0, gen);
                 if (++cap_refusals_ <= 4)
                     std::fprintf(stderr, "[rt] geometry buffer cap refused %zu bytes, %llu bytes already reserved\n",
@@ -315,6 +316,7 @@ public:
             keys_[key] = id;
             by_address_.emplace(bda, id);
         }
+        if (bytes > max_view_bytes_) max_view_bytes_ = bytes;
         ++live_views_;
         bytes_ += bytes;
         bool ready = true;
@@ -350,14 +352,18 @@ public:
         {
             std::lock_guard lock(mutex_);
             std::vector<std::size_t> ids;
-            for (const auto& [key, id] : keys_) {
+            const Key key_start{begin > max_view_bytes_ ? begin - max_view_bytes_ : Address(0), 0};
+            for (auto it = keys_.lower_bound(key_start); it != keys_.end(); ++it) {
+                const auto& [key, id] = *it;
                 if (key.first >= end) break;
                 if (begin < key.first + key.second) ids.push_back(id);
             }
             std::vector<Key> stale_refused;
-            for (const auto& entry : refused_) {
-                const auto& key = entry.first;
-                if (key.first < end && begin < key.first + key.second) stale_refused.push_back(key);
+            const Key refused_start{begin > max_refused_bytes_ ? begin - max_refused_bytes_ : Address(0), 0};
+            for (auto it = refused_.lower_bound(refused_start); it != refused_.end(); ++it) {
+                const auto& key = it->first;
+                if (key.first >= end) break;
+                if (begin < key.first + key.second) stale_refused.push_back(key);
             }
             if (ids.empty() && stale_refused.empty()) return 0;
             callbacks.reserve(ids.size());
@@ -624,6 +630,8 @@ public:
             fast_.clear();
         }
         refused_.clear();
+        max_view_bytes_ = 0;
+        max_refused_bytes_ = 0;
         free_ids_.clear();
         retired_.clear();
         retired_count_.store(0, std::memory_order_release);

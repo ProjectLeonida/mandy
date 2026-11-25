@@ -2,6 +2,7 @@
 
 #include "title_page_watch.h"
 #include <array>
+#include <cstdint>
 #include <vector>
 
 namespace leonida::geometry_writes {
@@ -20,6 +21,9 @@ struct State {
     host_heap::map<std::uintptr_t, Cell> cells;
     std::atomic<std::uint64_t> serial{1};
     std::atomic<std::size_t> count{0};
+    // Union of every tile passed to acquire(): [watched_lo, watched_hi). Monotonic; updated under mutex.
+    std::atomic<std::uintptr_t> watched_lo{UINTPTR_MAX};
+    std::atomic<std::uintptr_t> watched_hi{0};
     std::mutex released_mutex;
     host_heap::vector<std::pair<std::uintptr_t, std::uintptr_t>> released;
     std::atomic<bool> has_released{false};
@@ -33,8 +37,31 @@ inline bool has_released() { return state().has_released.load(std::memory_order_
 inline void note_released(std::uintptr_t begin, std::uintptr_t end) {
     auto& s = state();
     if (end <= begin || !s.count.load(std::memory_order_acquire)) return;
+    const std::uintptr_t lo = s.watched_lo.load(std::memory_order_acquire);
+    const std::uintptr_t hi = s.watched_hi.load(std::memory_order_acquire);
+    if (end <= lo || begin >= hi) {
+        // Views are keyed by the CPU view's address, so a GPU-only range freed by its own address counts through its
+        // CPU view (GeometryViews::drain_released maps it there).
+        leonida::title_gpu_views::Range pair{};
+        if (!leonida::title_gpu_views::view_at(begin, 1, pair) || begin < pair.gpu || begin - pair.gpu >= pair.size)
+            return;
+        const std::uintptr_t cpu = pair.cpu + (begin - pair.gpu);
+        const std::uintptr_t span = (std::min)(end - begin, pair.size - (begin - pair.gpu));
+        if (cpu + span <= lo || cpu >= hi) return;
+    }
     std::lock_guard lock(s.released_mutex);
-    if (s.released.size() < 65536) s.released.emplace_back(begin, end);
+    if (s.released.size() < 65536) {
+        s.released.emplace_back(begin, end);
+    } else {
+        std::uintptr_t merged_lo = begin;
+        std::uintptr_t merged_hi = end;
+        for (const auto& [r_lo, r_hi] : s.released) {
+            if (r_lo < merged_lo) merged_lo = r_lo;
+            if (r_hi > merged_hi) merged_hi = r_hi;
+        }
+        s.released.clear();
+        s.released.emplace_back(merged_lo, merged_hi);
+    }
     s.has_released.store(true, std::memory_order_release);
 }
 
@@ -54,6 +81,11 @@ inline Cell* acquire(std::uintptr_t va) {
     std::lock_guard lock(s.mutex);
     auto& c = s.cells[va];
     ++c.refs;
+    const std::uintptr_t tile_end = va <= UINTPTR_MAX - tile_size ? va + tile_size : UINTPTR_MAX;
+    if (va < s.watched_lo.load(std::memory_order_relaxed))
+        s.watched_lo.store(va, std::memory_order_release);
+    if (tile_end > s.watched_hi.load(std::memory_order_relaxed))
+        s.watched_hi.store(tile_end, std::memory_order_release);
     s.count.store(s.cells.size(), std::memory_order_release);
     return &c;
 }
