@@ -3932,7 +3932,12 @@ Not implemented yet:
 - Signatures that change root constants, vertex/index buffers or descriptors per argument cannot be expressed by
   one Vulkan indirect call. Use a compute expansion pass that writes a Vulkan-shaped indirect buffer, or
   `VK_NV_device_generated_commands` on NVIDIA. Start with the simple signatures; the trace will show which
-  signatures the game creates.
+  signatures the game creates. Until then `CreateCommandSignature` refuses a valid signature with more than one
+  argument with `E_NOTIMPL`, logged once per first argument type (D3D-INDIRECT-STATE-REFUSE): the signature keeps
+  only its kind and stride and `ExecuteIndirect` reads the draw's arguments at the start of each record, so
+  accepting one would draw with the state argument's bytes as counts. Invalid descriptions are still
+  `E_INVALIDARG`, as on the host. The title's five startup signatures each have one argument (section 4.9).
+  Checked by `d3d12_execute_indirect_validation`.
 - Predication (`SetPredication`) maps to `VK_EXT_conditional_rendering` (D3D-18). Done: `GraphicsCommandList::
   SetPredication` records a `Predication` command (`runtime/src/command_list.h`; offset 8-byte aligned, op
   `EQUAL_ZERO` or `NOT_EQUAL_ZERO`, a null buffer turns it off). The replay (`runtime/src/vulkan_replay.h`) begins
