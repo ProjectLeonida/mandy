@@ -64,6 +64,17 @@ def cli(*argv):
 
 
 class RunnerTest(unittest.TestCase):
+    def test_parallel_worker_without_a_result_fails_even_if_it_exits_zero(self):
+        early_exit = ("import os\nimport unittest\nclass T(unittest.TestCase):\n"
+                      "    def test_exits_before_reporting(self): os._exit(0)\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_early.py": early_exit, "test_pass.py": PASS})
+            result = cli(tmp, "-j", "2")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("==== FAILED: test_early", result.stdout)
+            self.assertIn("Test worker exited without reporting a valid unittest result", result.stdout)
+            self.assertIn("2 files, 2 tests, 1 files failed", result.stdout)
+
     def test_parallel_timeout_reports_partial_output_and_keeps_healthy_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"helper.py": "X = 1\n", "test_hang.py": HANG,

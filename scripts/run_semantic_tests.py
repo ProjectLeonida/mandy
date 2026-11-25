@@ -140,13 +140,13 @@ def positive_seconds(value):
 
 
 def read_count(path):
-    """The number of tests the child ran, as unittest's own result object reported it."""
+    """The number of tests reported by unittest's result object, or None without a valid count."""
     try:
         with open(path, encoding="utf-8") as handle:
-            return int(json.load(handle)["testsRun"])
+            count = json.load(handle)["testsRun"]
     except (OSError, ValueError, KeyError, TypeError):
-        # The child wrote no result: it did not finish, so no test is known to have run.
-        return 0
+        return None
+    return count if type(count) is int and count >= 0 else None
 
 
 def run_module(directory, module, verbose, timeout=None):
@@ -183,6 +183,10 @@ def run_module(directory, module, verbose, timeout=None):
             _unregister_process(proc)
         count = read_count(count_path)
     out = stdout + stderr
+    if count is None:
+        if proc.returncode == 0:
+            return 1, 0, out + "\nTest worker exited without reporting a valid unittest result.\n"
+        return proc.returncode, 0, out
     # Discover imports every package initializer, but an empty one has no tests to run. It is included in the
     # module list so parallel runs see TestCase classes when there are any; without them, it is not a failure.
     if proc.returncode == 5 and count == 0 and module.endswith(".__init__") and "NO TESTS RAN" in stderr:
