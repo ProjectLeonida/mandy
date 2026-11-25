@@ -2070,6 +2070,30 @@ def barycentric_problem(px: list[tuple[float, float, float, float]], abs_tol: fl
     return ""
 
 
+def kosmickrisp(out):
+    """Whether a test program's output names Mesa's KosmicKrisp driver (vk_harness's "driver: KosmicKrisp")."""
+    return "driver: KosmicKrisp" in out.splitlines()
+
+
+def f32_nan(word):
+    return (word & 0x7F800000) == 0x7F800000 and word & 0x007FFFFF != 0
+
+
+def kosmickrisp_canonical_f32(actual, expected, out):
+    """KosmicKrisp (Mesa 26.3.1) writes any f32 NaN to an RGBA32F attachment as 0x7fc00000 (#3125, docs/testing.md):
+    where a test expects another NaN word, that canonical word is all the device can show."""
+    return f32_nan(expected) and actual == 0x7FC00000 and kosmickrisp(out)
+
+
+def pixel_words_problem(px, want, out):
+    """"" when every pixel is the `want` words, else how many differ. On KosmicKrisp an expected f32 NaN may read back
+    as the canonical 0x7fc00000 (kosmickrisp_canonical_f32); every other word stays exact."""
+    def differs(p):
+        return any(a != e and not kosmickrisp_canonical_f32(a, e, out) for a, e in zip(p, want))
+    wrong = [p for p in px if differs(p)]
+    return "" if not wrong else f"{len(wrong)} of {len(px)} pixels differ, e.g. {[hex(x) for x in wrong[0]]}"
+
+
 def nan_payload_problem(px, out):
     """Check the exact words, except for the measured KosmicKrisp RGBA32F canonicalization (#3125)."""
     if len(px) != 64 * 64:
@@ -2120,8 +2144,7 @@ def pixel_test(tools, spirv, name):
     if name == NAN_PAYLOAD_TEST:
         return nan_payload_problem(px, out)
     if name in PIXEL_BITS:
-        wrong = sum(p != PIXEL_BITS[name] for p in px)
-        return "" if not wrong else f"{wrong} of {n} pixels differ, e.g. {[hex(x) for x in next(p for p in px if p != PIXEL_BITS[name])]}"
+        return pixel_words_problem(px, PIXEL_BITS[name], out)
     if name == "ps_bary":
         return barycentric_problem(px, 1e-6)
     if name == "ps_persp_bary":

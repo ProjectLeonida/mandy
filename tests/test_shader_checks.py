@@ -1213,6 +1213,34 @@ class TexelOffsetFormsChecks(unittest.TestCase):
                 self.assertIn("pixels differ", problem)
 
 
+class KosmicKrispCanonicalNaN(unittest.TestCase):
+    """KosmicKrisp writes every f32 NaN to an RGBA32F attachment as 0x7fc00000 (docs/testing.md): an exact-word pixel
+    test accepts that word in a channel that expects a NaN, on that driver only."""
+    KK = "device: Apple M3\ndriver: KosmicKrisp\n"
+    OTHER = "device: Apple M3\ndriver: MoltenVK\n"
+
+    def test_a_nan_channel_may_read_canonical_on_kosmickrisp_only(self):
+        want = check.PIXEL_BITS["ps_cndmask_sign_mods"]                    # (0xff800001, 0x7f800001, 0x80000001, ...)
+        canonical = tuple(0x7FC00000 if check.f32_nan(w) else w for w in want)
+        self.assertNotEqual(canonical, want)
+        self.assertEqual(check.pixel_words_problem([canonical] * 4096, want, self.KK), "")
+        self.assertIn("4096 of 4096", check.pixel_words_problem([canonical] * 4096, want, self.OTHER))
+        self.assertEqual(check.pixel_words_problem([want] * 4096, want, self.OTHER), "")
+
+    def test_only_the_canonical_word_and_only_in_a_nan_channel(self):
+        want = check.PIXEL_BITS["ps_valu16_mad_sel"]                       # channel 2 is 0xffffffff, a NaN
+        other_nan = tuple(0x7FC00001 if check.f32_nan(w) else w for w in want)
+        self.assertIn("pixels differ", check.pixel_words_problem([other_nan] * 4096, want, self.KK))
+        finite_changed = (want[0] ^ 1, *want[1:])                          # channel 0 is not a NaN
+        self.assertIn("pixels differ", check.pixel_words_problem([finite_changed] * 4096, want, self.KK))
+
+    def test_the_nan_test(self):
+        self.assertTrue(check.f32_nan(0x7F800001))
+        self.assertTrue(check.f32_nan(0xFFFFFFFF))
+        self.assertFalse(check.f32_nan(0x7F800000))                         # +inf
+        self.assertFalse(check.f32_nan(0x3F800000))
+
+
 class PixelTestRegistry(unittest.TestCase):
     def test_pixel_tests_include_every_pixel_fixture(self):
         # A repeated PIXEL_TESTS assignment silently dropped ps_texoff once; keep the registry explicit.

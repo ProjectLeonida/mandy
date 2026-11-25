@@ -52,7 +52,7 @@ from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip,
                    unpinned_subgroup_skip, vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, VINT_ENV, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
 from check import barycentric_problem
-from check import NAN_PAYLOAD_TEST, nan_payload_problem
+from check import NAN_PAYLOAD_TEST, kosmickrisp, nan_payload_problem, pixel_words_problem
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
 from check import FMA_FUSED_ENV, judge_fma_fused   # cs_fma_fused: strict under LEONIDA_FMA=khr, fused/split under glsl
@@ -457,10 +457,15 @@ def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: 
     return words_match(vals, want), " ".join((hex if hexwords else str)(x) for x in vals)
 
 
-def check_pixel_const(raw_path: str, want: tuple[int, int, int, int]) -> tuple[bool, str]:
+def check_pixel_const(raw_path: str, want: tuple[int, int, int, int], out: str = "") -> tuple[bool, str]:
+    """Every pixel exact, except that on KosmicKrisp an expected f32 NaN may read back as the canonical 0x7fc00000
+    (check.py's kosmickrisp_canonical_f32; `out` is the test program's output, which names the driver)."""
     px = read_raw_u32(raw_path)
     if len(px) != 64 * 64:
         return False, f"expected 4096 pixels, got {len(px)}"
+    if kosmickrisp(out) and not pixel_words_problem(px, want, out):
+        exact = all(p == want for p in px)
+        return True, "4096/4096 pixels exact" if exact else "4096/4096 pixels exact but for KosmicKrisp's canonical NaN"
     bad = [(i, p) for i, p in enumerate(px) if p != want]
     if bad:
         i, p = bad[0]
@@ -1567,7 +1572,7 @@ def run_suite(a, work: str) -> int:
                 if name == "ps_vcmpx_forms" and (skip := vcmpx_forms_narrow_skip(msg)):
                     ok, detail = None, str(skip)
                 else:
-                    ok, detail = check_pixel_const(raw, const_wants[name])
+                    ok, detail = check_pixel_const(raw, const_wants[name], msg)
             elif name == NAN_PAYLOAD_TEST:
                 problem = nan_payload_problem(read_raw_u32(raw), msg)
                 ok, detail = not problem, problem or "4096/4096 pixels match the driver-aware NaN payload check"
