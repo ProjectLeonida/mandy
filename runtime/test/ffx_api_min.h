@@ -1,6 +1,6 @@
-// The subset of the public FidelityFX API that fsr_dispatch_test.cpp calls, written out from the FidelityFX SDK
-// v2.4.0 headers Kits/FidelityFX/api/include/ffx_api.h, api/include/ffx_api_types.h,
-// api/include/dx12/ffx_api_dx12.h and
+// The subset of the public FidelityFX API that fsr_dispatch_test.cpp and src/ffx_vk_backend.cpp call, written out
+// from the FidelityFX SDK v2.4.0 headers Kits/FidelityFX/api/include/ffx_api.h, api/include/ffx_api_types.h,
+// api/include/dx12/ffx_api_dx12.h, api/include/vk/ffx_api_vk.h and
 // upscalers/include/ffx_upscale.h (https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK). Those headers carry
 // the MIT license below. Only declarations are here: no AMD code, and nothing from the game's DLL.
 //
@@ -44,6 +44,7 @@ constexpr uint32_t EFFECT_MASK = 0x00ff0000u;
 constexpr uint32_t BACKEND_MASK = 0xff000000u;
 constexpr uint32_t EFFECT_ID_UPSCALE = 0x00010000u;
 constexpr uint32_t BACKEND_ID_DX12 = 0x00000000u;
+constexpr uint32_t BACKEND_ID_VK = 0x01000000u;
 constexpr uint32_t BACKEND_ID_XBOX = 0x02000000u;  // declared in ffx_api.h; its descriptors are not public
 
 constexpr StructType effect_sub_id(uint32_t effect, uint32_t sub) { return (effect & EFFECT_MASK) | (sub & ~EFFECT_MASK); }
@@ -75,6 +76,13 @@ struct QueryDescGetVersions {
     uint64_t* outputCount;
     uint64_t* versionIds;
     const char** versionNames;
+};
+
+constexpr StructType QUERY_DESC_TYPE_GET_PROVIDER_VERSION = 6u;
+struct QueryGetProviderVersion {
+    Header header;
+    uint64_t versionId;       // the provider the queried context uses; 0 if the query was invalid
+    const char* versionName;  // e.g. "4.1.2"
 };
 
 struct Dimensions2D {
@@ -130,6 +138,18 @@ struct CreateBackendDX12Desc {
     void* device;  // ID3D12Device*
 };
 
+// ffx_api_vk.h. The Vulkan handles are kept as void* so this header needs no vulkan.h.
+constexpr StructType CREATE_CONTEXT_DESC_TYPE_BACKEND_VK = backend_sub_id(BACKEND_ID_VK, 0x03);
+struct VkDeviceContext {
+    void* vkDevice;          // VkDevice
+    void* vkPhysicalDevice;  // VkPhysicalDevice
+    void* vkDeviceProcAddr;  // PFN_vkGetDeviceProcAddr
+};
+struct CreateBackendVKDesc {
+    Header header;
+    VkDeviceContext deviceContext;
+};
+
 // ffx_api_types.h: resources and the values used below.
 enum : uint32_t {
     SURFACE_FORMAT_R16G16B16A16_FLOAT = 4,
@@ -152,7 +172,7 @@ struct ResourceDescription {
 };
 
 struct Resource {
-    void* resource;  // ID3D12Resource*
+    void* resource;  // ID3D12Resource*, or a VkImage on the Vulkan backend
     ResourceDescription description;
     uint32_t state;
 };
@@ -166,7 +186,7 @@ struct FloatCoords2D {
 constexpr StructType DISPATCH_DESC_TYPE_UPSCALE = effect_sub_id(EFFECT_ID_UPSCALE, 0x01);
 struct DispatchDescUpscale {
     Header header;
-    void* commandList;
+    void* commandList;  // ID3D12GraphicsCommandList*, or a VkCommandBuffer on the Vulkan backend
     Resource color;
     Resource depth;
     Resource motionVectors;

@@ -1769,6 +1769,17 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(${tool} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
   endforeach()
+  if(WIN32)
+    # RT-344: AMD's PC FidelityFX upscaler on a Vulkan device (src/ffx_vk_backend). Skips (77) without a GPU or
+    # without amd_fidelityfx_loader_vk.dll in LEONIDA_FFX_DIR.
+    add_executable(ffx_vk_dispatch_test test/ffx_vk_dispatch_test.cpp src/ffx_vk_backend.cpp)
+    target_link_libraries(ffx_vk_dispatch_test PRIVATE Vulkan::Headers)
+    target_compile_definitions(ffx_vk_dispatch_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    if(BUILD_TESTING)
+      add_test(NAME ffx_vk_dispatch COMMAND ffx_vk_dispatch_test)
+      set_tests_properties(ffx_vk_dispatch PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+  endif()
   # OpFmaKHR width gate of vk_shader_fma.h (shaderFmaFloat32 / shaderFmaFloat64): no Vulkan instance, no GPU.
   add_executable(vk_shader_fma_test test/vk_shader_fma_test.cpp)
   target_link_libraries(vk_shader_fma_test PRIVATE Vulkan::Headers)
