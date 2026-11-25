@@ -8385,6 +8385,13 @@ class Gen:
                 lo, hi = self.load_reg("sgpr", a[1]["r"]), self.load_reg("sgpr", a[1]["r"] + 1)
             elif op.endswith("b64") and a[1]["k"] == "imm":
                 lo, hi = self.src64_data(a[1], op)      # a constant's own 64 bits, as s_ff1_i32_b64 reads them
+            elif op.endswith("b64") and a[1]["k"] == "special" and a[1].get("t") == "vcc":
+                # Plain 64-bit scalar data in VCC (not a lane mask): read both %vcc and %vcc_hi, as bitcmp does.
+                lo, hi = self.tmp(), self.tmp()
+                self.emit(f"{lo} = OpLoad %uint %vcc")
+                self.emit(f"{hi} = OpLoad %uint %vcc_hi")
+            elif op.endswith("b64") and a[1]["k"] == "special" and a[1].get("t") == "null":
+                lo, hi = self.cu(0), self.cu(0)
             else:
                 lo, hi = (self.mask_src(a[1]), self.cu(0)) if op.endswith("b64") else (self.src_u(a[1]), self.cu(0))
             if "bcnt0" in op:
@@ -8461,6 +8468,12 @@ class Gen:
                 if op != "s_flbit_i32_b64" or not self.wave64:
                     raise Unsupported(op + " of a lane mask")
                 lo, hi = self.wave_mask(x)
+            elif x["k"] == "special" and x.get("t") == "vcc":
+                lo, hi = self.tmp(), self.tmp()
+                self.emit(f"{lo} = OpLoad %uint %vcc")
+                self.emit(f"{hi} = OpLoad %uint %vcc_hi")
+            elif x["k"] == "special" and x.get("t") == "null":
+                lo, hi = self.cu(0), self.cu(0)
             elif x["k"] == "sgpr" and x.get("n") == 2:
                 lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
             elif x["k"] == "imm":
@@ -8503,6 +8516,12 @@ class Gen:
                 # A 64-bit constant's own 64 bits (inline negative constants sign-extend, literals zero-extend),
                 # matching s_bcnt0/1_i32_b64 and src64_data.
                 lo, hi = self.src64_data(a[1], op)
+            elif a[1]["k"] == "special" and a[1].get("t") == "vcc":
+                lo, hi = self.tmp(), self.tmp()
+                self.emit(f"{lo} = OpLoad %uint %vcc")
+                self.emit(f"{hi} = OpLoad %uint %vcc_hi")
+            elif a[1]["k"] == "special" and a[1].get("t") == "null":
+                lo, hi = self.cu(0), self.cu(0)
             elif a[1]["k"] != "sgpr" or a[1].get("n") != 2:
                 lo, hi = self.mask_src(a[1]), self.cu(0)
             else:
