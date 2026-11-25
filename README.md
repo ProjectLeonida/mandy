@@ -101,6 +101,7 @@ The port isn't downloaded ready-made. It's built on your PC from your own copy.
    and otherwise tells you what to do.
 3. Double-click **`Build.bat`**. On Linux or macOS, run **`./Build.sh`** from a terminal instead (see
    [docs/linux.md](docs/linux.md) for Linux).
+   Prefer a window? Double-click **`Leonida.bat`** (or run `./Leonida.sh`) for the builder app: pick the folders, tick the stages, press Build.
 
 It finds your copy of the game by itself: it looks in Downloads, Desktop, Documents (also where Windows keeps them,
 such as in OneDrive), Games, your home folder and the top of every drive, two folders deep. It recognises the
