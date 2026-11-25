@@ -1402,6 +1402,55 @@ int check_mapped_plane(ID3D12Device* device) {
     return 0;
 }
 
+// The last chunk contains a texel outside the periodic hash's two per-page samples and final 64 bytes.
+int check_large_mapped_texture(ID3D12Device* device) {
+    const char* who = "large persistent slot-133 texture";
+    constexpr UINT width = 2048, height = 1024, pitch = width * 4, size = pitch * height;
+    constexpr UINT missed = size - pitch + 128;
+    const auto release_pages = [](void* p) { VirtualFree(p, 0, MEM_RELEASE); };
+    std::unique_ptr<void, decltype(release_pages)> pages(
+        VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), release_pages);
+    EXPECT(pages);
+    GpuReader gpu;
+    EXPECT(!gpu.init(device, size));
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = desc.DepthOrArraySize = desc.MipLevels = 1;
+    leonida::title_xg_layouts::note({UINT(desc.Dimension), UINT(desc.Format), height, 1, 1, width}, 1);
+    Ref<ID3D12Resource> texture;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages.get(), desc, 6, IID_PPV_ARGS(&texture.p)), S_OK);
+    void* mapped = nullptr;
+    EXPECT_HR(texture->Map(0, nullptr, &mapped), S_OK);
+    EXPECT(mapped == pages.get());
+    auto* pixels = static_cast<std::uint8_t*>(mapped);
+    std::memset(pixels, 0x18, size);
+    ID3D12CommandList* lists[]{gpu.list.p};
+    auto submit = [&](UINT64 fence) {
+        gpu.queue->ExecuteCommandLists(1, lists);
+        return SUCCEEDED(gpu.queue->Signal(gpu.fence.p, fence)) &&
+               SUCCEEDED(gpu.fence->SetEventOnCompletion(fence, gpu.done)) &&
+               WaitForSingleObject(gpu.done, 30000) == WAIT_OBJECT_0;
+    };
+    std::vector<std::uint8_t> readback(size);
+    EXPECT(submit(1));
+    EXPECT_HR(texture->ReadFromSubresource(readback.data(), pitch, size, 0, nullptr), S_OK);
+    EXPECT(readback[missed] == 0x18);
+    pixels[missed] = 0x41;  // Leave the original Map open and send no write notification.
+    // Here there is one large mapped texture. 32 chunks cover its 8 MiB, then the next pass uploads it.
+    for (UINT64 fence = 2; fence <= 34; ++fence) EXPECT(submit(fence));
+    EXPECT_HR(texture->ReadFromSubresource(readback.data(), pitch, size, 0, nullptr), S_OK);
+    EXPECT(readback[missed] == 0x41);
+    pixels[0] = 0x52;  // A sampled change still refreshes on the very next pass.
+    EXPECT(submit(35));
+    EXPECT_HR(texture->ReadFromSubresource(readback.data(), pitch, size, 0, nullptr), S_OK);
+    EXPECT(readback[0] == 0x52);
+    texture->Unmap(0, nullptr);
+    return 0;
+}
+
 // Several threads write the same watched pages while submissions keep making them read-only again. Two threads that
 // fault on one page race: the first fault reopens it, a submission can protect it again before the second fault is
 // handled, and the second write must still be retried, not refused (refused, the process ends: seen natively). After
@@ -1990,7 +2039,8 @@ void print_cases(const std::vector<Case>& cases, const char* who) {
 
 int main(int argc, char** argv) {
     const bool prefix_only = argc == 2 && std::strcmp(argv[1], "--host-prefix-only") == 0;
-    if (argc != 1 && !prefix_only) return 2;
+    const bool large_mapped_only = argc == 2 && std::strcmp(argv[1], "--large-mapped-only") == 0;
+    if (argc != 1 && !prefix_only && !large_mapped_only) return 2;
     _putenv_s("LEONIDA_TITLE_TEXTURE_PERIOD_MS", "0");
     _putenv_s("LEONIDA_TITLE_TEXTURE_CHECK_KB", "0");
     vktest::Device vk;
@@ -2018,6 +2068,18 @@ int main(int argc, char** argv) {
             const int result = check_host_prefix_buffers(ours.p);
             return result || vk.validation_errors() ? 1 : 0;
         }
+        if (large_mapped_only) {
+            if (vk.host_image_copy) {
+                std::puts("large persistent slot-133 texture: host copies available");
+                failures += check_large_mapped_texture(ours.p);
+            }
+            info.host_image_copy = false;
+            Ref<ID3D12Device> staged;
+            if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&staged.p)))) return 1;
+            std::puts("large persistent slot-133 texture: forced staged copies");
+            failures += check_large_mapped_texture(staged.p);
+            return failures || vk.validation_errors() ? 1 : 0;
+        }
         failures += check(ours.p, "vulkan");
         const std::vector<Case> vulkan_cases = open_cases(ours.p);
         print_cases(vulkan_cases, "vulkan");
@@ -2028,6 +2090,7 @@ int main(int argc, char** argv) {
             failures += check_pending_stream_views(ours.p);
             failures += check_shared_bc_placements(ours.p);
             failures += check_mapped_plane(ours.p);
+            failures += check_large_mapped_texture(ours.p);
             failures += check_mapped_bc_array(ours.p);
         }
         {
@@ -2037,6 +2100,7 @@ int main(int argc, char** argv) {
             Ref<ID3D12Device> staged;
             if (FAILED(rt::d3d12::create_vulkan_device(no_host_copy, IID_PPV_ARGS(&staged.p)))) return 1;
             failures += check_mapped_plane(staged.p);
+            failures += check_large_mapped_texture(staged.p);
             failures += check_mapped_bc_array(staged.p);
         }
         failures += check_written_pages_all(ours.p);

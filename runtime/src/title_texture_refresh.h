@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -27,6 +28,42 @@ inline bool title_write_overlaps(const TitleWriteRanges& writes, std::uintptr_t 
                                      [](auto address, const auto& range) { return address < range.second; });
     return begin < end && it != writes.end() && it->first < end;
 }
+
+// Each digest describes a chunk of the last successful upload, never a subsequently observed CPU snapshot.
+class TitleTextureChunkHashes {
+public:
+    static constexpr std::size_t chunk_bytes = 256u << 10;
+
+    struct Chunk {
+        std::size_t offset, bytes;
+        std::uint64_t hash;
+    };
+
+    bool ready() const { return !hashes_.empty(); }
+
+    template<class Hash>
+    void snapshot(std::size_t bytes, Hash hash) {
+        bytes_ = bytes;
+        next_ = 0;
+        hashes_.resize(bytes / chunk_bytes + (bytes % chunk_bytes != 0));
+        for (std::size_t i = 0; i < hashes_.size(); ++i) {
+            const auto offset = i * chunk_bytes;
+            hashes_[i] = hash(offset, std::min(chunk_bytes, bytes - offset));
+        }
+    }
+
+    // The caller checks ready() first. A failed read still advances so later chunks get their turn.
+    Chunk next() {
+        const auto index = next_;
+        next_ = index + 1 == hashes_.size() ? 0 : index + 1;
+        const auto offset = index * chunk_bytes;
+        return {offset, std::min(chunk_bytes, bytes_ - offset), hashes_[index]};
+    }
+
+private:
+    std::vector<std::uint64_t> hashes_;
+    std::size_t bytes_ = 0, next_ = 0;
+};
 
 // The registry's entries as one pass will visit them, in placement order. A pass cannot walk the registry itself: a
 // fill it makes can submit, a submission destroys a retired image, and that image's destructor erases its entry
