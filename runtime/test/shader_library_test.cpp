@@ -541,6 +541,16 @@ int main() {
         input.seekg(0, std::ios::end);
         CHECK(read_spirv_words(input, input.tellg()) == header);
     }
+    {
+        const std::vector<std::uint32_t> module = {0x07230203, 0x00010300, 0, 1, 0, 0x00010000};
+        std::string reversed(reinterpret_cast<const char*>(module.data()), module.size() * sizeof(module.front()));
+        for (std::size_t offset = 0; offset < reversed.size(); offset += sizeof(module.front())) {
+            std::reverse(reversed.begin() + offset, reversed.begin() + offset + sizeof(module.front()));
+        }
+        std::istringstream input(reversed);
+        input.seekg(0, std::ios::end);
+        CHECK(read_spirv_words(input, input.tellg()) == module);
+    }
     for (const auto& bad : {std::string{}, header_bytes.substr(0, 16), header_bytes + 'x',
                             std::string("bad!") + header_bytes.substr(4)}) {
         std::istringstream input(bad);
