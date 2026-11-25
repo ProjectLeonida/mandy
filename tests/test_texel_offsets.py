@@ -229,6 +229,24 @@ def _folded_level(spv, lod, word2=None, levels=4):
     return ev(size_q[0][-1])
 
 
+def _floor_vgprs(spv):
+    """The VGPR behind the operand of each Floor of the level chain, following bitcasts back to its OpLoad of %vgpr."""
+    d = _defs(spv)
+    consts = {k: int(v[2]) for k, v in d.items() if v[0] == "OpConstant" and v[1] == "%uint"}
+    out = []
+    for v in d.values():
+        if v[:4] != ["OpExtInst", "%float", "%glsl", "Floor"]:
+            continue
+        x = v[4]
+        while d[x][0] in ("OpBitcast", "OpCopyObject"):
+            x = d[x][2]
+        assert d[x][0] == "OpLoad", (x, d[x])
+        chain = d[d[x][2]]
+        assert chain[0] == "OpAccessChain" and chain[2] == "%vgpr", chain
+        out.append(consts[chain[3]])
+    return out
+
+
 def _f32(bits):
     import struct
     return struct.unpack("<f", struct.pack("<I", bits))[0]
@@ -277,6 +295,9 @@ def test_fallback_level_of_sample_c_l_o_follows_its_lod_and_mip_filter(mip, lod,
     word2 = mip << 26 | 0x00500000
     spv = translate_listing(tmp_path, PROLOGUE + f"\ns_mov_b32 s18, 0x{word2:x}\n" + sample)
     assert _folded_level(spv, lod) == level
+    # _folded_level feeds the LOD in at the Floor; check that the Floor really reads the LOD register (v14), not a
+    # constant or another address word.
+    assert _floor_vgprs(spv) == ([] if mip == MIP_NONE else [14])
 
 
 def test_fallback_literal_mip_filter_emits_one_rounding(tmp_path, fallback):

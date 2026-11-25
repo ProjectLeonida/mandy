@@ -203,6 +203,8 @@ class SampleCLForms(unittest.TestCase):
             (line_of("image_sample_c_l", "2D", False, 3, "tfe"), "needs scalar depth comparison"),
             (line_of("image_sample_c_l_o", "2D", False, 4, "lwe"), "needs scalar depth comparison"),
             (line_of("image_sample_c_l", "2D", False, 3, "glc"), "glc 2D"),         # a sampled read has no coherent form
+            (line_of("image_sample_c_l", "2D", False, 3, "slc"), "image_sample_c_l modifier slc"),
+            (line_of("image_sample_c_l_o", "2D", False, 4, "unorm"), "image_sample_c_l_o modifier unorm"),
             (line_of("image_sample_c_l", "2D", False, 2), "address width"),         # the LOD is missing
             (line_of("image_sample_c_l", "2D", False, 4), "address width"),
             (line_of("image_sample_c_l_o", "2D", False, 3), "address width"),       # the offset is missing

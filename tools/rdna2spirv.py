@@ -13383,8 +13383,11 @@ class Gen:
             # a dword each and the coordinates and the LOD pack in pairs.
             if dim == "dim:SQ_RSRC_IMG_3D":
                 raise Unsupported(op + " 3D depth comparison has no Vulkan form")
-            if dmask != 1 or any(m not in (dim, dm, "a16", "d16") for m in mods):
+            if dmask != 1 or any(m in ("tfe", "lwe") for m in mods):
                 raise Unsupported(op + " needs scalar depth comparison (dmask:0x1, no tfe/lwe)")
+            other = [m for m in mods if m not in (dim, dm, "a16", "d16")]
+            if other:
+                raise Unsupported(op + " modifier " + other[0])
             fixed = (1 if op.endswith("_o") else 0) + 1
             if len(addr) != fixed + ((ncoord + 2) // 2 if a16 else ncoord + 1):
                 raise Unsupported(op + " address width")
