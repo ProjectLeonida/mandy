@@ -159,11 +159,24 @@ inline constexpr std::uint32_t packed_uav_flag = 0x00400000;
 inline constexpr std::uint32_t volume_uav_word(std::uint32_t offset, std::uint32_t count) {
     return volume_uav_tag | ((count - 1) << 11) | offset;
 }
+struct VolumeUavRange {
+    std::uint32_t first_w = 0;
+    std::uint32_t w_size = 0;
+};
+// The tag stores the first W slice and the slice count minus one. Bit 22 is independent packed-format metadata.
+inline constexpr bool volume_uav_range(const ImageWords& words, const Image& image, VolumeUavRange& out) {
+    if (image.type != ImageType::image_3d || !(words[4] & volume_uav_flag) ||
+        (words[7] & volume_uav_tag_mask) != volume_uav_tag)
+        return false;
+    out.first_w = words[7] & 0x7ffu;
+    out.w_size = ((words[7] >> 11) & 0x7ffu) + 1u;
+    return true;
+}
 inline constexpr bool partial_volume_uav(const ImageWords& words, const Image& image) {
+    VolumeUavRange range{};
+    if (!volume_uav_range(words, image, range)) return false;
     const auto mip_depth = image.depth >> image.first_mip;
-    return image.type == ImageType::image_3d && (words[4] & volume_uav_flag) &&
-           (words[7] & volume_uav_tag_mask) == volume_uav_tag &&
-           (words[7] & ~packed_uav_flag) != volume_uav_word(0, mip_depth ? mip_depth : 1u);
+    return range.first_w != 0 || range.w_size != (mip_depth ? mip_depth : 1u);
 }
 
 inline constexpr float image_min_lod(const ImageWords& words) {
