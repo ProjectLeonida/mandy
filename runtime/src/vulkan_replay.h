@@ -867,6 +867,7 @@ struct GraphicsPipeline {
     std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
     bool mesh = false;                    // a mesh shader instead of a vertex shader: drawn by DispatchMesh only
     bool viewport_with_count = false;     // pipeline uses VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT
+    bool depth_bounds_test = false;       // VK_DYNAMIC_STATE_DEPTH_BOUNDS enabled on this pipeline
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
     // and stencil. Null when it cannot be built.
@@ -1094,6 +1095,7 @@ struct ReplayFunctions {
     PFN_vkCmdSetPrimitiveTopology set_primitive_topology = nullptr;
     PFN_vkCmdSetPrimitiveRestartEnable set_primitive_restart_enable = nullptr;
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
+    PFN_vkCmdSetDepthBounds set_depth_bounds = nullptr;
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
     PFN_vkCmdDraw draw = nullptr;
     unsigned* mesh_draw_count = nullptr;  // opt-in count for this submission
@@ -2594,6 +2596,7 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
     if (draw.mesh && !vk.draw_mesh_tasks) return unsupported_at(__LINE__);
     if (pipeline->viewport_with_count && (!vk.set_viewport_with_count || !vk.set_scissor_with_count))
         return unsupported_at(__LINE__);
+    if (pipeline->depth_bounds_test && !vk.set_depth_bounds) return unsupported_at(__LINE__);
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
     if (pipeline->color_formats.size() > max_render_targets) return unsupported_at(__LINE__);
     p.graphics = pipeline;
@@ -5195,6 +5198,14 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             }
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
+            if (graphics.depth_bounds_test && vk.set_depth_bounds) {
+                // D3D12: NaN converts to 0 silently; then the range is clamped, an inverted one is empty.
+                const float mn = draw->min_depth_bounds != draw->min_depth_bounds ? 0.0f : draw->min_depth_bounds;
+                const float mx = draw->max_depth_bounds != draw->max_depth_bounds ? 0.0f : draw->max_depth_bounds;
+                const bool empty = mn > mx || mn > 1.0f || mx < 0.0f;
+                vk.set_depth_bounds(command_buffer, empty ? 1.0f : (mn < 0.0f ? 0.0f : mn),
+                                    empty ? 0.0f : (mx > 1.0f ? 1.0f : mx));
+            }
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());
             for (std::uint32_t slot = 0; slot < d.vertex_buffers.size(); ++slot) {
                 if (!d.vertex_buffers[slot]) continue;

@@ -391,6 +391,41 @@ std::vector<Case> cases() {
         {"OMSetBlendFactor", true, match,
          CALLS(const FLOAT factor[4] = {0.25f, 0.5f, 0.75f, 1.0f}; e.list->OMSetBlendFactor(factor))},
         {"OMSetStencilRef(7)", true, match, CALLS(e.list->OMSetStencilRef(7))},
+        {"OMSetDepthBounds(0.25, 0.75)", true, match,
+         [](Env& e) {
+             Ref<ID3D12GraphicsCommandList1> list1;
+             if (FAILED(e.list->QueryInterface(IID_PPV_ARGS(&list1.p)))) return false;
+             list1->OMSetDepthBounds(0.25f, 0.75f);
+             return true;
+         }},
+        {"OMSetDepthBounds(-0.1, 0.5)", true, match,
+         [](Env& e) {
+             Ref<ID3D12GraphicsCommandList1> list1;
+             if (FAILED(e.list->QueryInterface(IID_PPV_ARGS(&list1.p)))) return false;
+             list1->OMSetDepthBounds(-0.1f, 0.5f);
+             return true;
+         }},
+        {"OMSetDepthBounds(0.5, 1.1)", true, match,
+         [](Env& e) {
+             Ref<ID3D12GraphicsCommandList1> list1;
+             if (FAILED(e.list->QueryInterface(IID_PPV_ARGS(&list1.p)))) return false;
+             list1->OMSetDepthBounds(0.5f, 1.1f);
+             return true;
+         }},
+        {"OMSetDepthBounds(0.8, 0.2)", true, match,
+         [](Env& e) {
+             Ref<ID3D12GraphicsCommandList1> list1;
+             if (FAILED(e.list->QueryInterface(IID_PPV_ARGS(&list1.p)))) return false;
+             list1->OMSetDepthBounds(0.8f, 0.2f);
+             return true;
+         }},
+        {"OMSetDepthBounds(NaN, 0.5)", true, match,
+         [](Env& e) {
+             Ref<ID3D12GraphicsCommandList1> list1;
+             if (FAILED(e.list->QueryInterface(IID_PPV_ARGS(&list1.p)))) return false;
+             list1->OMSetDepthBounds(std::numeric_limits<float>::quiet_NaN(), 0.5f);
+             return true;
+         }},
         {"ExecuteBundle after post-close state calls on bundle", true, match,
          CALLS(const FLOAT factor[4] = {0.25f, 0.5f, 0.75f, 1.0f};
                e.closed_bundle->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

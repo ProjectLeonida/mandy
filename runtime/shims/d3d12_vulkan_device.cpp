@@ -7691,7 +7691,10 @@ leonida::cached_pso::Key pipeline_key(const D3D12_COMPUTE_PIPELINE_STATE_DESC& d
     return leonida::sha256_hex(key.data());
 }
 
-leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+// `extra` carries fields only a console stream has (back-face masks, depth bounds); they are hashed into the same key,
+// as the cached blob holds just the first 64 characters. Without it the key is the plain description's.
+leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
+                                      const leonida::cached_pso::KeyBuilder* extra = nullptr) {
     leonida::cached_pso::KeyBuilder key;
     key.tag("graphics");
     key_root_signature(key, desc.pRootSignature);
@@ -7741,6 +7744,7 @@ leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& 
         .u32(desc.NumRenderTargets);
     for (const DXGI_FORMAT format : desc.RTVFormats) key.u32(format);
     key.u32(desc.DSVFormat).u32(desc.SampleDesc.Count).u32(desc.SampleDesc.Quality).u32(desc.NodeMask);
+    if (extra) key.bytes(extra->data().data(), extra->data().size());
     return leonida::sha256_hex(key.data());
 }
 
@@ -7784,6 +7788,10 @@ struct StencilFaceMasks {
     UINT8 write = D3D12_DEFAULT_STENCIL_WRITE_MASK;
 };
 
+struct GraphicsStreamExtras {
+    bool depth_bounds_test = false;
+};
+
 struct PipelineStream {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics{};
     bool back_masks = false;  // DEPTH_STENCIL2: back_stencil holds the back face's masks
@@ -7791,6 +7799,7 @@ struct PipelineStream {
     D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
     D3D12_SHADER_BYTECODE ms{};
     D3D12_SHADER_BYTECODE as{};
+    GraphicsStreamExtras extras{};
     bool has_cs = false;
     bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
 };
@@ -7931,9 +7940,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
             D3D12_DEPTH_STENCIL_DESC1 d{};
             take(d);
-            if (ok && d.DepthBoundsTestEnable) {
-                return stream_unsupported("depth-bounds tests are not supported yet; stream subobject", int(type));
-            }
+            out.extras.depth_bounds_test = ok && (d.DepthBoundsTestEnable != FALSE);
             g.DepthStencilState = {d.DepthEnable, d.DepthWriteMask, d.DepthFunc, d.StencilEnable, d.StencilReadMask,
                                    d.StencilWriteMask, d.FrontFace, d.BackFace};
             break;
@@ -7942,9 +7949,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
             D3D12_DEPTH_STENCIL_DESC2 d{};
             take(d);
             if (!ok) break;
-            if (d.DepthBoundsTestEnable) {
-                return stream_unsupported("depth-bounds tests are not supported yet; stream subobject", int(type));
-            }
+            out.extras.depth_bounds_test = d.DepthBoundsTestEnable != FALSE;
             // Each face has its own read and write mask (OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported):
             // the description takes the front face's, back_stencil the back face's.
             out.back_masks = true;
@@ -8142,7 +8147,7 @@ public:
                 const auto* record=rt::d3d12_xs::find_pso_record(this);
                 PipelineStream stream{};
                 HRESULT hr=record?parse_pipeline_stream(record->desc(),stream):E_INVALIDARG;
-                if(SUCCEEDED(hr))hr=stream.has_cs?create_compute(stream.compute):create_graphics(stream.graphics,&stream.ms,&stream.as);
+                if(SUCCEEDED(hr))hr=stream.has_cs?create_compute(stream.compute):create_graphics(stream.graphics,&stream.ms,&stream.as,stream.back_masks?&stream.back_stencil:nullptr,&stream.extras);
             });
         }
         return registered_ && (is_graphics_==graphics);
@@ -8203,7 +8208,9 @@ public:
         if (seen.insert(line).second) std::fprintf(stderr, "%s\n", line);
     }
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
-                            const D3D12_SHADER_BYTECODE* as = nullptr, const StencilFaceMasks* back_masks = nullptr) {
+                            const D3D12_SHADER_BYTECODE* as = nullptr,
+                            const StencilFaceMasks* back_masks = nullptr,
+                            const GraphicsStreamExtras* extras = nullptr) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
@@ -8708,6 +8715,7 @@ public:
         depth.depthTestEnable = ds.DepthEnable;
         depth.depthWriteEnable = ds.DepthEnable && ds.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
         depth.depthCompareOp = compare_op(ds.DepthFunc);
+        depth.depthBoundsTestEnable = (extras && extras->depth_bounds_test) ? VK_TRUE : VK_FALSE;
         depth.stencilTestEnable = ds.StencilEnable;
         depth.front = stencil_face(ds.FrontFace, ds.StencilReadMask, ds.StencilWriteMask);
         depth.back = back_masks ? stencil_face(ds.BackFace, back_masks->read, back_masks->write)
@@ -8779,6 +8787,8 @@ public:
             return stream_unsupported("logic ops need logicOp, which the device lacks; op", int(first.LogicOp));
         if (raster.depthClampEnable && !features.depthClamp)
             return stream_unsupported("DepthClipEnable = FALSE needs depthClamp, which the device lacks; flag", 0);
+        if (depth.depthBoundsTestEnable && !features.depthBounds)
+            return stream_unsupported("depth-bounds testing needs depthBounds, which the device lacks; enabled", 1);
 
         graphics_.viewport_with_count =
             features.multiViewport && vk.vkCmdSetViewportWithCount && vk.vkCmdSetScissorWithCount;
@@ -8878,6 +8888,7 @@ public:
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
         graphics_.mesh = mesh;
+        graphics_.depth_bounds_test = depth.depthBoundsTestEnable == VK_TRUE;
         recipe_.mesh = mesh;
         recipe_.stages = std::move(stage_infos);
         recipe_.attributes = std::move(attributes);
@@ -9324,7 +9335,7 @@ private:
         // A mesh pipeline takes neither the topology nor the strides as dynamic state
         // (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065 and -07066).
         // With multiViewport enabled, VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT allow 1..16 dynamic viewports/scissors.
-        VkDynamicState dyn_list[8]{};
+        VkDynamicState dyn_list[9]{};
         std::uint32_t dyn_count = 0;
         dyn_list[dyn_count++] =
             graphics_.viewport_with_count ? VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT : VK_DYNAMIC_STATE_VIEWPORT;
@@ -9336,6 +9347,7 @@ private:
         }
         dyn_list[dyn_count++] = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
         dyn_list[dyn_count++] = VK_DYNAMIC_STATE_BLEND_CONSTANTS;
+        if (r.depth.depthBoundsTestEnable == VK_TRUE) dyn_list[dyn_count++] = VK_DYNAMIC_STATE_DEPTH_BOUNDS;
         if (!r.mesh && !r.bindings.empty()) dyn_list[dyn_count++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
         dynamic.dynamicStateCount = dyn_count;
@@ -11638,7 +11650,17 @@ public:
         if(!record)return E_INVALIDARG;
         auto* pipeline=new PipelineState(state_);
         pipeline->attach_device(identity());
-        pipeline->set_cache_key(stream.has_cs?pipeline_key(stream.compute):pipeline_key(stream.graphics));
+        if(stream.has_cs) {
+            pipeline->set_cache_key(pipeline_key(stream.compute));
+        } else {
+            // The stream description carries fields the plain graphics description cannot:
+            // DEPTH_STENCIL2 back-face masks and the depth-bounds enable. Mix them in so two
+            // console PSOs differing only in these do not share one cache key.
+            leonida::cached_pso::KeyBuilder extra;
+            extra.u32(stream.back_masks?1u:0u).u32(stream.back_stencil.read).u32(stream.back_stencil.write)
+                .u32(stream.extras.depth_bounds_test?1u:0u);
+            pipeline->set_cache_key(pipeline_key(stream.graphics,&extra));
+        }
         if(!rt::d3d12_xs::attach_pso_record(pipeline,std::move(record))){pipeline->Release();return E_OUTOFMEMORY;}
         pipeline->set_pending_stream(stream.has_cs);
         return hand_out(pipeline,iid,out);
@@ -13721,7 +13743,8 @@ public:
         pipeline->attach_device(identity());
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
                                          : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as,
-                                                                     stream.back_masks ? &stream.back_stencil : nullptr);
+                                                                     stream.back_masks ? &stream.back_stencil : nullptr,
+                                                                     &stream.extras);
         if (FAILED(hr)) {
             pipeline->Release();
             return finish(hr);
@@ -15513,7 +15536,7 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS2)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS2*>(data);
             *opts = {};
-            opts->DepthBoundsTestSupported = FALSE;
+            opts->DepthBoundsTestSupported = state_.info.features.depthBounds ? TRUE : FALSE;
             opts->ProgrammableSamplePositionsTier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
             return d3d12_trace::result(method, S_OK);
         }
@@ -18125,6 +18148,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     enable.logicOp = chosen_features.logicOp;
     enable.depthClamp = chosen_features.depthClamp;
     enable.multiViewport = chosen_features.multiViewport;
+    enable.depthBounds = chosen_features.depthBounds;
     enable.geometryShader = chosen_features.geometryShader;  // translated geometry shaders (195 in the corpus)
     // What translated shaders declare (the index's `features`): 64-bit integers in most of the corpus (25,803 of
     // 26,503 entries), doubles, 16-bit integers, clip and cull distances in a few vertex shaders, formatless image
