@@ -82,9 +82,10 @@ int main() {
     const auto no_resource = [](auto) -> const ResourceBinding* { return nullptr; };
 
     const auto prepare = [&](std::uint64_t va, std::uint32_t view_bytes, std::uint32_t first, std::uint32_t count,
-                             PreparedDraw& p) {
+                             PreparedDraw& p, std::uint32_t topology = 0) {
         Draw draw;
         draw.indexed = true;
+        draw.topology = topology;
         draw.index = {va, view_bytes, dxgi_r16_uint};
         draw.first = first;
         draw.count = count;
@@ -123,6 +124,19 @@ int main() {
         expect(prepare(0, 0, 0, 100, p) == ReplayResult::success, "null view, large draw: success");
         expect(p.index_buffer == scratch_buffer && p.index_stage.copy_bytes == 0 && p.index_stage.fill_bytes >= 200,
                "null view, large draw: a zeroed scratch covers the whole draw");
+    }
+
+    {  // An indexed quad list of indices 2..9 over a view of 4: its expansion pass reads only the view
+       // (prepare_quad_indices), so the buffer and the view's size stay as they are and nothing is staged.
+        PreparedDraw p;
+        expect(prepare(ib_va, 8, 2, 8, p, topology_quad_list) == ReplayResult::success, "quad straddle: success");
+        expect(p.index_buffer == index_buffer && p.index_size == 8 && p.index_stage.fill_bytes == 0,
+               "quad straddle: the buffer and view size go to the expansion pass, no staging");
+    }
+    {  // An indexed quad list with no index buffer: the zero page, as main binds it.
+        PreparedDraw p;
+        expect(prepare(0, 0, 0, 8, p, topology_quad_list) == ReplayResult::success, "quad null view: success");
+        expect(p.index_buffer == zero_buffer && p.index_stage.fill_bytes == 0, "quad null view: the zero page is bound");
     }
 
     if (failures) {

@@ -2527,6 +2527,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         // layer's device does not enable VK_KHR_maintenance5 for a bind size). A draw wholly inside the view binds
         // the buffer. One that reads past the view's end binds the zero page when every index is outside, else a
         // scratch copy of the indices it fetches (in-view part copied, the rest zero), so no byte past the view is read.
+        // An indexed quad list is left to its expansion pass, which reads only the view (prepare_quad_indices).
         const std::uint64_t index_bytes = p.index_type == VK_INDEX_TYPE_UINT32 ? 4 : 2;
         std::uint64_t view_indices = 0;
         if (draw.index.va) {
@@ -2546,7 +2547,13 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             view_indices = size / index_bytes;  // size is the view's, cut at the buffer's end
         }
         const std::uint64_t last = std::uint64_t(draw.first) + draw.count;  // one past the last index fetched
-        if (!draw.index.va || (draw.count > 0 && last > view_indices)) {
+        if (draw.topology == topology_quad_list) {
+            if (!draw.index.va) {  // no index buffer: every index reads 0
+                if (!vk.zero_buffer) return unresolved_at(__LINE__);
+                p.index_buffer = vk.zero_buffer;
+                p.index_offset = vk.zero_offset;
+            }
+        } else if (!draw.index.va || (draw.count > 0 && last > view_indices)) {
             const std::uint64_t inside = draw.first < view_indices ? view_indices - draw.first : 0;
             const std::uint64_t bytes = std::uint64_t(draw.count) * index_bytes;
             if (inside == 0 && vk.zero_buffer && bytes <= vk.zero_size) {
@@ -2554,11 +2561,11 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
                 p.index_offset = vk.zero_offset;
                 p.index_first = 0;
             } else {
-                if (!vk.copy_scratch || !vk.fill_buffer || !vk.copy_buffer) return ReplayResult::unsupported;
+                if (!vk.copy_scratch || !vk.fill_buffer || !vk.copy_buffer) return unsupported_at(__LINE__);
                 const std::uint64_t fill = (bytes + 3) & ~std::uint64_t(3);  // vkCmdFillBuffer: multiples of 4
                 VkBuffer scratch = VK_NULL_HANDLE;
                 VkDeviceSize offset = 0;
-                if (!vk.copy_scratch(fill + 4, scratch, offset)) return ReplayResult::unsupported;
+                if (!vk.copy_scratch(fill + 4, scratch, offset)) return unsupported_at(__LINE__);
                 offset = (offset + 3) & ~VkDeviceSize(3);  // also a multiple of the index size
                 p.index_stage = {scratch, offset, fill, p.index_buffer,
                                  p.index_offset + VkDeviceSize(draw.first) * index_bytes, inside * index_bytes};
