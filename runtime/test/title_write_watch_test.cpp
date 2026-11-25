@@ -137,7 +137,81 @@ int main() {
     ww::remove(other + ww::kPage);  // any address inside it
     check(!ww::contains(other) && ww::contains(base) && ww::generation() != generation,
           "remove forgets the reservation holding the address, and only it");
+
+    // 7. mark() clips to overlapping write-watched reservations without dropping leading margins or polluting past end.
+    {
+        auto* other2_ptr = static_cast<std::uint8_t*>(
+            VirtualAlloc(nullptr, 4 * ww::kPage, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE));
+        check(other2_ptr != nullptr, "a second committed write-watched reservation");
+        if (other2_ptr) {
+            const auto other2 = reinterpret_cast<std::uintptr_t>(other2_ptr);
+            ww::add(other2, 4 * ww::kPage);
+            const Runs other2_runs{{other2, other2 + 4 * ww::kPage}};
+            // Sync reader a on both reservations.
+            (void)ask(a, all);
+            (void)ask(a, other2_runs);
+            // (a) mark() starting BEFORE `base` must still mark the overlapping prefix of `base`.
+            ww::mark(base - 2 * ww::kPage, base + 2 * ww::kPage);
+            check(ask(a, all).pages == std::set<std::uintptr_t>{base, base + ww::kPage},
+                  "mark() starting before a watched reservation marks its overlapping prefix");
+            // (b) mark() extending > kKeep pages past the higher reservation's end into unwatched space must clip to
+            //     that reservation and NOT raise s.floor to dirty the lower unrelated reservation.
+            const bool base_higher = base > other2;
+            const std::uintptr_t hi_base = base_higher ? base : other2;
+            const std::uintptr_t hi_bytes = base_higher ? kBytes : 4 * ww::kPage;
+            const std::uintptr_t hi_tail = hi_base + hi_bytes - 2 * ww::kPage;
+            ww::mark(hi_tail, hi_tail + (ww::kKeep + 16) * ww::kPage);
+            const Answer clipped = ask(a, Runs{{base, base + kBytes}, {other2, other2 + 4 * ww::kPage}});
+            check(clipped.pages == std::set<std::uintptr_t>{hi_tail, hi_tail + ww::kPage},
+                  "mark() extending > kKeep pages past a watched reservation clips to its tail without raising floor");
+            // (c) mark() spanning two disjoint reservations marks both overlapping portions without raising floor.
+            const std::uintptr_t span_lo = (std::min)(base + 15 * ww::kPage, other2);
+            const std::uintptr_t span_hi = (std::max)(base + kBytes, other2 + ww::kPage);
+            if ((span_hi - span_lo) / ww::kPage <= ww::kKeep) {
+                ww::mark(span_lo, span_hi);
+                const Answer both = ask(a, Runs{{base, base + kBytes}, {other2, other2 + 4 * ww::kPage}});
+                check(both.pages.count(base + 15 * ww::kPage) == 1 && both.pages.count(other2) == 1,
+                      "mark() spanning two disjoint watched reservations marks both");
+            }
+            ww::remove(other2);
+            VirtualFree(other2_ptr, 0, MEM_RELEASE);
+        }
+    }
+
+    // 8. ask() checks that one old reservation covers the whole run [from, to), not just `from`.
+    {
+        ww::remove(base);
+        ww::add(base, 8 * ww::kPage);  // first half only
+        (void)ask(a, Runs{{base, base + 8 * ww::kPage}});
+        ww::add(base + 8 * ww::kPage, 8 * ww::kPage);  // second half added AFTER reader `a`'s last asking
+        const Answer split_ans = ask(a, all);
+        check(!split_ans.refused && split_ans.pages.size() == 16,
+              "ask() treats a run whose tail was added after the reader's last asking as dirty");
+    }
+
+    // 9. Boundary safety near UINTPTR_MAX: add(), mark(), and title_page_aliases::for_each_in() saturate and terminate.
+    {
+        const std::uintptr_t top_page = UINTPTR_MAX & ~(ww::kPage - 1);
+        ww::add(top_page - ww::kPage, 4 * ww::kPage);
+        check(ww::contains(top_page - ww::kPage) && ww::end_of(top_page - ww::kPage) == top_page,
+              "add() saturates near UINTPTR_MAX without wrapping end below base");
+        ww::mark(top_page - ww::kPage, UINTPTR_MAX);
+        ww::remove(top_page - ww::kPage);
+        check(!ww::contains(top_page - ww::kPage), "saturated top reservation removes cleanly");
+
+        const std::uintptr_t top_alias = UINTPTR_MAX & ~(leonida::title_page_aliases::kPageSize - 1);
+        leonida::title_page_aliases::set(top_alias, true);
+        std::size_t hits = 0;
+        leonida::title_page_aliases::for_each_in(top_alias - leonida::title_page_aliases::kPageSize, UINTPTR_MAX,
+                                                 [&](std::uintptr_t va) {
+                                                     if (va == top_alias) ++hits;
+                                                 });
+        leonida::title_page_aliases::set(top_alias, false);
+        check(hits == 1, "title_page_aliases::for_each_in() terminates near UINTPTR_MAX and visits the top page");
+    }
+
     ww::remove(base);
+    ww::remove(base + 8 * ww::kPage);
     ww::close_reader(a);
     VirtualFree(reinterpret_cast<void*>(other), 0, MEM_RELEASE);
     VirtualFree(pages, 0, MEM_RELEASE);

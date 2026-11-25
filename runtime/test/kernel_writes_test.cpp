@@ -248,6 +248,69 @@ int main() {
 
     leonida::kernel_writes::set_committer(nullptr);
     check_holds();
+
+    // ReadFileScatter pin cleanup on synchronous completion + saturating bounds in begin_write/hold.
+    {
+        namespace kw = leonida::kernel_writes;
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        const DWORD page = si.dwPageSize ? si.dwPageSize : 4096;
+        wchar_t sdir[MAX_PATH]{}, spath[MAX_PATH]{};
+        GetTempPathW(MAX_PATH, sdir);
+        GetTempFileNameW(sdir, L"kws", 0, spath);
+        HANDLE sf = CreateFileW(spath, GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_NO_BUFFERING |
+                                    FILE_FLAG_OVERLAPPED,
+                                nullptr);
+        auto* sbuf = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        check(sf != INVALID_HANDLE_VALUE && sbuf != nullptr, "scatter file and page-aligned buffer");
+        if (sf != INVALID_HANDLE_VALUE && sbuf != nullptr) {
+            std::memset(sbuf, 0x5a, page);
+            OVERLAPPED wov{};
+            wov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            DWORD wdone = 0;
+            BOOL wok = WriteFile(sf, sbuf, page, &wdone, &wov);
+            if (!wok && GetLastError() == ERROR_IO_PENDING) wok = GetOverlappedResult(sf, &wov, &wdone, TRUE);
+            check(wok && wdone == page, "scatter file populated with one page");
+
+            std::memset(sbuf, 0, page);
+            FILE_SEGMENT_ELEMENT segs[2]{};
+            segs[0].Buffer = sbuf;
+            OVERLAPPED rov{};
+            rov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            kw::set_opener([](std::uintptr_t, std::uintptr_t) {});
+            const BOOL sok = kw::read_file_scatter(sf, segs, page, nullptr, &rov);
+            const DWORD serr = GetLastError();
+            if (sok) {
+                // Synchronous completion: pin must already be released (not leaked into state().pins).
+                rov.Internal = static_cast<ULONG_PTR>(STATUS_PENDING);  // simulates immediate OVERLAPPED reuse
+                const auto sb = reinterpret_cast<std::uintptr_t>(sbuf);
+                check(kw::state().count.load() == 0 && pinned_bytes(sb, sb + page) == 0,
+                      "synchronous ReadFileScatter releases its pins immediately");
+            } else if (serr == ERROR_IO_PENDING) {
+                DWORD rdone = 0;
+                check(GetOverlappedResult(sf, &rov, &rdone, TRUE) && rdone == page, "async ReadFileScatter completes");
+                const auto sb = reinterpret_cast<std::uintptr_t>(sbuf);
+                check(pinned_bytes(sb, sb + page) == 0 && kw::state().count.load() == 0,
+                      "async ReadFileScatter drops its pin once OVERLAPPED completes");
+            } else {
+                check(false, "ReadFileScatter succeeded or returned ERROR_IO_PENDING");
+            }
+            check(sbuf[0] == 0x5a && sbuf[page - 1] == 0x5a, "ReadFileScatter read the page bytes");
+            // Overflow-safe upper bound in hold()/begin_write(): must saturate instead of wrapping below begin.
+            const auto near_max = reinterpret_cast<const void*>(UINTPTR_MAX - 0x1000u);
+            const std::uint64_t hp = kw::hold(near_max, 0x4000u);
+            check(hp != 0 && pinned_bytes(UINTPTR_MAX - 0x1000u, UINTPTR_MAX) == 0x1000u,
+                  "hold() saturates end near UINTPTR_MAX instead of wrapping");
+            kw::release(hp);
+            kw::set_opener(nullptr);
+            CloseHandle(rov.hEvent);
+            CloseHandle(wov.hEvent);
+        }
+        if (sbuf) VirtualFree(sbuf, 0, MEM_RELEASE);
+        if (sf != INVALID_HANDLE_VALUE) CloseHandle(sf);
+    }
+
     UnmapViewOfFile(g_view);
     CloseHandle(section);
     CloseHandle(file);
