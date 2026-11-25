@@ -239,6 +239,14 @@ class ProgramText(unittest.TestCase):
                                                            build=folder, work_parent=folder, retries=retries))
             self.assertEqual(got, ["vk_compute_test: crashed (exit 3221225477)"])
             self.assertEqual(calls, [0])     # the retries are spent first, then it is skipped
+        # A signal death is a negative subprocess returncode on POSIX; it is a crash skip too.
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"VK_FUZZ_SKIP_CRASH": "1"}):
+                got = self._run_with_fake_gpu(
+                    tmp, [(-11, "", "")], [],
+                    lambda folder, retries: R.run_programs([["v_mov_b32 v8, 0"]], words=1, wave=32,
+                                                           build=folder, work_parent=folder, retries=retries))
+            self.assertEqual(got, ["vk_compute_test: crashed (exit -11)"])
         # Both harness errors stay fatal under VK_FUZZ_SKIP_CRASH: 1 is a CHECK failure, 2 a usage error.
         for fatal in ((1, "", "FAILED vkCreateShaderModule"), (2, "", "usage: ...")):
             with self.subTest(exit=fatal[0]), tempfile.TemporaryDirectory() as tmp:

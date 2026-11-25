@@ -15,6 +15,11 @@ words * 4 through the V# in s[0:3]. The result list has, per program, a list of 
 there is no result (llvm-mc rejected it, the translator refused it, the device cannot run it, the lanes disagree).
 wave64_text() rewrites the wave32 spellings of lane masks (vcc_lo, s20, s21) as the 64-bit ones.
 
+LEONIDA_PC_TAIL_UBO=1 translates with rdna2spirv.py --pc-tail-ubo and passes the same variable to vk_compute_test
+for 128-byte push-constant devices. VK_FUZZ_SKIP_CRASH=1 records any vk_compute_test exit other than 0, 1, 2 or 77
+as a skip, including signal deaths (which Python reports as negative return codes); exits 1 and 2 stay fatal because
+they are harness/check failures, not driver crashes.
+
 opaque=True (the default of run_programs) keeps the driver from folding the program: a `v_mov_b32 vN, K` seed becomes
 `v_xor_b32 vN, K ^ FILL, vF`, where vF is read from the output buffer, which vk_compute_test fills with 0xEEEEEEEE.
 The program computes the same values at run time, but a compiler that sees literal operands folds them itself, and
