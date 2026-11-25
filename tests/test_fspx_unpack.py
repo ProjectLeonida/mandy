@@ -179,7 +179,7 @@ class Cli(unittest.TestCase):
             code = fspx_unpack.main(list(argv))
         return code, out.getvalue(), err.getvalue()
 
-    def disassemble(self, body):
+    def disassemble(self, body, *extra):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         src = os.path.join(tmp.name, "one.fspx")
@@ -191,7 +191,7 @@ class Cli(unittest.TestCase):
         out = os.path.join(tmp.name, "out")
         env = dict(os.environ, LLVM_MC=f'"{sys.executable}" "{mc}"')
         result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "fspx_unpack.py"),
-                                 src, "--out", out, "--disasm"], capture_output=True, text=True, env=env)
+                                 src, "--out", out, "--disasm", *extra], capture_output=True, text=True, env=env)
         return result, out
 
     def test_disassembly_error_writes_no_listing(self):
@@ -225,6 +225,19 @@ class Cli(unittest.TestCase):
         self.assertIn("1 invalid words", listing)
         self.assertIn("\ts_endpgm", listing)
         self.assertIn("warning: invalid instruction encoding", listing)
+
+    def test_auto_backend_replaces_a_listing_with_invalid_words(self):
+        # llvm-mc 21 and 22 leave words of five of the 29 FidelityFX programs undecoded; the Python decoder reads them.
+        result, out = self.disassemble("import sys\n"
+                                       "print('\\ts_endpgm')\n"
+                                       "sys.stderr.write('warning: invalid instruction encoding\\n')\n",
+                                       "--backend", "auto")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with open(os.path.join(out, "disasm", "one.s"), encoding="utf-8") as f:
+            listing = f.read()
+        self.assertIn("0 invalid words", listing)
+        self.assertIn("s_endpgm", listing)
+        self.assertNotIn("warning: invalid instruction encoding", listing)
 
     def test_clean_disassembly_keeps_listing(self):
         result, out = self.disassemble("print('\\ts_endpgm')\n")

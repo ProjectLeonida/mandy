@@ -89,6 +89,14 @@ def probe(mcpu: str) -> None:
 
 
 def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True):
+    if backend == "auto":
+        asm, bad, err = disasm(code, mcpu, backend="llvm-mc", wave32=wave32)
+        if bad == 0 and asm.strip():
+            return asm, bad, err
+        py_asm, py_bad, _ = disasm(code, mcpu, backend="python", wave32=wave32)
+        if py_asm.strip() and (not asm.strip() or py_bad < bad):
+            return py_asm, py_bad, ""
+        return asm, bad, err
     if backend == "python":
         asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
         return asm, bad, ""
@@ -276,8 +284,8 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--skip-existing", action="store_true", help="reuse complete listings from a matching run")
     ap.add_argument("--mcpu", default="gfx1013")
-    ap.add_argument("--backend", choices=("llvm-mc", "python"), default="llvm-mc",
-                    help="disassembler backend: llvm-mc (default) or pure-Python RDNA2 decoder (#1901)")
+    ap.add_argument("--backend", choices=("llvm-mc", "python", "auto"), default="llvm-mc",
+                    help="disassembler backend: llvm-mc (default), pure-Python RDNA2 decoder (#1901), or auto")
     ap.add_argument("--limit", type=positive_int)
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args()
@@ -327,7 +335,7 @@ def main():
                 pending.append(path)
         files = pending
     if files:
-        if a.backend == "llvm-mc":
+        if a.backend in ("llvm-mc", "auto"):
             probe(a.mcpu)
         with ThreadPoolExecutor(a.jobs) as ex:
             res.update(ex.map(lambda p: one(p, out, a.mcpu, backend=a.backend), files))

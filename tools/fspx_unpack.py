@@ -16,7 +16,7 @@ docs/fspx.md.
 as the DLL skips it. The DLL does not check the version word.
 
 Usage:
-    python -I fspx_unpack.py <file> [<file> ...] --out DIR [--disasm] [--mcpu gfx1030]
+    python -I fspx_unpack.py <file> [<file> ...] --out DIR [--disasm] [--mcpu gfx1030] [--backend auto]
 <file> is the DLL, a .dxbc container or a bare FSPX payload. Writes, per shader, the same layout the game's shader
 corpus uses, so tools/rdna2spirv.py can read it:
     DIR/<name>.dxbc          the container (absent for a bare payload)
@@ -188,6 +188,9 @@ def main(argv=None) -> int:
     ap.add_argument("--mcpu", default="gfx1030",
                     help="llvm-mc CPU for --disasm (default gfx1030: the programs use v_dot4 instructions, which "
                          "gfx1010 and gfx1013 do not decode)")
+    ap.add_argument("--backend", choices=("llvm-mc", "python", "auto"), default="llvm-mc",
+                    help="disassembler for --disasm (shader_disasm.py): auto falls back to the pure-Python decoder for "
+                         "a program llvm-mc leaves invalid words in, when that decodes more of it")
     a = ap.parse_args(argv)
     # An output in the input folder can replace a .dxbc input and, when the input is the folder itself,
     # os.makedirs writes there before open() tries to read the folder as a file. Refuse before either.
@@ -259,7 +262,8 @@ def main(argv=None) -> int:
             listing = None
             if disasm and meta["code"]["end"]:
                 start, end = meta["code"]["start"], meta["code"]["end"]
-                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu, wave32=meta.get("wave32", True))
+                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu, backend=a.backend,
+                                                    wave32=meta.get("wave32", True))
                 if not asm.strip():
                     reason = (err.strip().splitlines() or ["no output"])[0]
                     print(f"{name}: {reason}", file=sys.stderr)

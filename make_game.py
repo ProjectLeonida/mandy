@@ -1446,7 +1446,7 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
                 for entry in entries:
                     if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
                         os.unlink(entry.path)
-    py("fspx_unpack.py", dll, "--out", unpacked, "--disasm")
+    py("fspx_unpack.py", dll, "--out", unpacked, "--disasm", "--backend", "auto")
     extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
     py("rdna2spirv.py", os.path.join(unpacked, "disasm"), "--out", spirv, "--no-asm", *extra)
     verify_fspx_key_clash(spirv, translated, "FSPX")
