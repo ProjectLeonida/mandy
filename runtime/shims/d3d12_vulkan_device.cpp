@@ -2622,7 +2622,7 @@ struct DeviceState {
         leonida::XdxrLayout layout;
         // A count the format cannot hold: left as it was, and refused when the list is prepared (xdxr_check).
         if (!layout.compute(leonida::VulkanContext::xdxr_elements(b), b.is_tlas,
-                            leonida::VulkanContext::xdxr_box16(b)))
+                            leonida::VulkanContext::xdxr_box16(b), leonida::VulkanContext::xdxr_pair(b)))
             return true;
         const std::uint64_t title_dst = b.dst_va;
         std::uint64_t out = 0;
