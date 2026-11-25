@@ -9307,7 +9307,12 @@ class Gen:
                     self.emit(f"{sat} = OpSelect %uint {ov} {self.cu(0 if 'sub' in op else 0xFFFF)} {r}")
                     r = sat
             lo = self.tmp()
-            self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
+            # BitFieldUExtract, not OpBitwiseAnd & 0xFFFF: on NVIDIA's shader compiler an And of a value that
+            # passed through %int ops (the signed i16 add/sub/min/max and ashr paths below) feeding the
+            # preserve-high-half merge miscompiles the KEPT high half (measured on an RTX 4070 SUPER, wave32:
+            # v_add_nc_i16 ... op_sel:[1,1,0] clamp wrote 0x1113AAA8 for 0x0002AAA8). Extract reads the same
+            # low 16 bits and dodges that peephole; AMD and the interpreter are unaffected.
+            self.emit(f"{lo} = OpBitFieldUExtract %uint {r} {self.cu(0)} {self.cu(16)}")
             if e64 and sb[2]:
                 # op_sel destination bit: the result goes to the high half, the low half is kept.
                 if a[0]["k"] != "vgpr":
@@ -9349,7 +9354,7 @@ class Gen:
                     self.emit(f"{sat} = OpBitcast %uint {hi_c}")
                 r = sat
             lo = self.tmp()
-            self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
+            self.emit(f"{lo} = OpBitFieldUExtract %uint {r} {self.cu(0)} {self.cu(16)}")   # see the nc_i16 note above: And & 0xFFFF miscompiles on NVIDIA
             if dhi:
                 old, keep, sh16, v = (self.tmp() for _ in range(4))
                 self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', a[0]['r'])}")
@@ -9389,7 +9394,7 @@ class Gen:
             else:
                 r = m
             lo = self.tmp()
-            self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
+            self.emit(f"{lo} = OpBitFieldUExtract %uint {r} {self.cu(0)} {self.cu(16)}")   # same NVIDIA And-&-0xFFFF workaround as above
             self.write_half16(a[0], lo, dhi)
         elif op == "v_bcnt_u32_b32":
             self._check_int32_valu(op, ins["op"], a, mods)

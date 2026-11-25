@@ -452,7 +452,9 @@ class ValuInt16NegativeControlsTests(unittest.TestCase):
              ref_word("v_sub_nc_u16", 0x0000000A, 0x00000005)),
             ("v_mul_lo_u16 drops 16-bit result mask",
              "v_mul_lo_u16_e64 v0, v1, v2", 0x00000101, 0x00000101,
-             r"(%\w+) = OpIMul %uint (%\w+) (%\w+)\n(\s*%\w+) = OpBitwiseAnd %uint \1 %cffff",
+             # The low-16 mask is OpBitFieldUExtract, not OpBitwiseAnd & 0xFFFF: NVIDIA's shader
+             # compiler miscompiles the And on %int-derived values feeding the high-half merge.
+             r"(%\w+) = OpIMul %uint (%\w+) (%\w+)\n(\s*%\w+) = OpBitFieldUExtract %uint \1 %\w+ %\w+",
              r"\1 = OpIMul %uint \2 \3\n\4 = OpCopyObject %uint \1", 1,
              ref_word("v_mul_lo_u16", 0x00000101, 0x00000101)),
             ("v_min_u16 drops high-half preservation",
