@@ -15,12 +15,18 @@
 //   - forwards a VS `BuiltIn ClipDistance` or `BuiltIn CullDistance` `float[1..8]` array when present (rejecting
 //     mixed clip+cull and `ShaderLayer` / `ShaderViewportIndex`, which a pass-through helper cannot forward);
 //   - writes `(1, 0, 0)`, `(0, 1, 0)`, `(0, 0, 1)` at `bary_location` so perspective interpolation yields
-//     `BaryCoordKHR` (`.y` / `.z` = AMD's `i` / `j`).
+//     `BaryCoordKHR` (`.y` / `.z` = AMD's `i` / `j`);
+//   - for a computed I/J pair (SHADER-177, `"per_vertex": {"<attribute>": <first location>}` in the same index
+//     entry, RT-BARY-FALLBACK-PER-VERTEX), writes the triangle's three values of VS output `<attribute>` to the
+//     PS's `Flat vec4<f32>[3]` input at `<first location>` (element k = vertex k, the same at every emitted vertex,
+//     so the flat value does not depend on the provoking vertex), as `tools/bary_fallback_gs.py` does; an attribute
+//     the VS does not export is zero-filled like an ordinary pass-through input.
 //
 // Pure C++20 stdlib, no Vulkan or Windows headers required.
 
 #include "spirv_f16_halves.h"
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <set>
@@ -36,9 +42,12 @@ struct BaryFallbackGsInfo {
     std::uint32_t cull_count = 0;
 };
 
+// `per_vertex` is the index entry's `bary_fallback_input.per_vertex` (`ShaderEntry::bary_fallback_per_vertex`):
+// attribute (VS output location) -> first of the three PS input locations of its `Flat vec4<f32>[3]`.
 inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
                                    std::span<const std::uint32_t> ps_words,
                                    std::uint32_t bary_location,
+                                   const std::map<std::uint32_t, std::uint32_t>& per_vertex,
                                    std::vector<std::uint32_t>& gs_words,
                                    BaryFallbackGsInfo* out_info = nullptr,
                                    std::string* error = nullptr) {
@@ -72,6 +81,7 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
     constexpr std::uint32_t kExecModeOutputTriangleStrip = 29;
 
     constexpr std::uint32_t kDecorationBuiltIn = 11;
+    constexpr std::uint32_t kDecorationFlat = 14;
     constexpr std::uint32_t kDecorationComponent = 31;
     constexpr std::uint32_t kBuiltInPosition = 0;
     constexpr std::uint32_t kBuiltInClipDistance = 3;
@@ -194,6 +204,9 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
     std::map<std::uint32_t, std::uint32_t> ps_in_var_pointee;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> ps_loc_decs;
     std::set<std::uint32_t> ps_component_targets;
+    std::set<std::uint32_t> ps_int32_tys;
+    std::map<std::uint32_t, std::uint32_t> ps_int_consts;                         // const_id -> value
+    std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> ps_arr_tys;  // arr_id -> (elem_ty, len_id)
 
     for (const Inst& inst : ps_mod.insts) {
         if (inst.opcode == kOpFunction) break;
@@ -207,6 +220,12 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
         } else if (inst.opcode == kOpTypeVector && inst.words.size() == 4 && ps_float32_tys.count(inst.words[2])) {
             if (inst.words[3] == 3) ps_v3float_tys.insert(inst.words[1]);
             if (inst.words[3] == 4) ps_v4float_tys.insert(inst.words[1]);
+        } else if (inst.opcode == kOpTypeInt && inst.words.size() == 4 && inst.words[2] == 32) {
+            ps_int32_tys.insert(inst.words[1]);
+        } else if (inst.opcode == kOpConstant && inst.words.size() == 4 && ps_int32_tys.count(inst.words[1])) {
+            ps_int_consts[inst.words[2]] = inst.words[3];
+        } else if (inst.opcode == kOpTypeArray && inst.words.size() == 4) {
+            ps_arr_tys[inst.words[1]] = {inst.words[2], inst.words[3]};
         } else if (inst.opcode == kOpTypePointer && inst.words.size() == 4 && inst.words[2] == kStorageInput) {
             ps_ptr_in_pointee[inst.words[1]] = inst.words[3];
         } else if (inst.opcode == kOpVariable && inst.words.size() >= 4 && inst.words[3] == kStorageInput) {
@@ -232,11 +251,57 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
                     " collides with a non-vec3 PS Input");
     }
 
+    // Computed I/J pairs: the PS's Flat vec4[3] at `base` takes the three vertices' values of VS output `attr`.
+    struct PerVertex {
+        std::uint32_t attr = 0;
+        std::uint32_t base = 0;
+        bool forwarded = false;  // false: the VS does not export `attr`, so the array is zero-filled
+    };
+    std::map<std::uint32_t, std::uint32_t> pv_base_attr;  // first location -> attribute
+    for (const auto& [attr, base] : per_vertex) {
+        if (base > UINT32_MAX - 2u)
+            return fail("bary_fallback: per-vertex locations of attribute " + std::to_string(attr) + " overflow");
+        if (!pv_base_attr.emplace(base, attr).second)
+            return fail("bary_fallback: two per-vertex attributes share first Location " + std::to_string(base));
+    }
+    std::vector<PerVertex> pv_list;
+    for (const auto& [base, attr] : pv_base_attr) {
+        const auto ps_it = ps_in_loc_pointee.find(base);
+        if (ps_it == ps_in_loc_pointee.end()) continue;  // the PS does not read it: nothing to feed
+        const auto arr_it = ps_arr_tys.find(ps_it->second);
+        const auto len_it = arr_it == ps_arr_tys.end() ? ps_int_consts.end() : ps_int_consts.find(arr_it->second.second);
+        if (arr_it == ps_arr_tys.end() || !ps_v4float_tys.count(arr_it->second.first) ||
+            len_it == ps_int_consts.end() || len_it->second != 3u) {
+            return fail("bary_fallback: PS per-vertex Input at Location " + std::to_string(base) +
+                        " is not vec4<f32>[3]");
+        }
+        for (std::uint32_t k = 0; k < 3; ++k) {
+            const std::uint32_t loc = base + k;
+            if (loc == bary_location || (k && ps_in_loc_pointee.count(loc))) {
+                return fail("bary_fallback: per-vertex locations " + std::to_string(base) + ".." +
+                            std::to_string(base + 2u) + " of attribute " + std::to_string(attr) +
+                            " collide with another PS Input");
+            }
+        }
+        PerVertex pv{attr, base, false};
+        if (const auto vs_it = vs_out_loc_pointee.find(attr); vs_it != vs_out_loc_pointee.end()) {
+            if (!vs_v4float_tys.count(vs_it->second))
+                return fail("bary_fallback: VS Output at Location " + std::to_string(attr) + " is not vec4<f32>");
+            pv.forwarded = true;
+        }
+        pv_list.push_back(pv);
+    }
+    const auto in_pv_block = [&](std::uint32_t loc) {
+        for (const PerVertex& pv : pv_list)
+            if (loc >= pv.base && loc - pv.base < 3u) return true;
+        return false;
+    };
+
     std::vector<std::uint32_t> pass_locs;
     std::vector<std::uint32_t> forwarded_locs;
     std::set<std::uint32_t> zero_loc_set;
     for (const auto& [loc, pt_ty] : ps_in_loc_pointee) {
-        if (loc == bary_location) continue;
+        if (loc == bary_location || in_pv_block(loc)) continue;
         if (!ps_v4float_tys.count(pt_ty))
             return fail("bary_fallback: PS pass-through Input at Location " + std::to_string(loc) + " is not vec4<f32>");
         pass_locs.push_back(loc);
@@ -270,6 +335,10 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
     const std::uint32_t id_ptr_out_v4 = alloc();
     const std::uint32_t id_ptr_out_v3 = alloc();
     const std::uint32_t id_null_v4 = zero_loc_set.empty() ? 0 : alloc();
+    bool pv_zero = false;
+    for (const PerVertex& pv : pv_list) pv_zero = pv_zero || !pv.forwarded;
+    const std::uint32_t id_ptr_out_arr = pv_list.empty() ? 0 : alloc();
+    const std::uint32_t id_null_arr = pv_zero ? alloc() : 0;
 
     const std::uint32_t dist_count = clip_count ? clip_count : cull_count;
     const std::uint32_t dist_cap = cull_count ? kCapCullDistance : kCapClipDistance;
@@ -299,7 +368,13 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
     std::map<std::uint32_t, std::uint32_t> id_in_loc;
     std::map<std::uint32_t, std::uint32_t> id_out_loc;
     for (std::uint32_t loc : forwarded_locs) id_in_loc[loc] = alloc();
+    // A per-vertex attribute reads the VS output at its own number; one GS Input per VS location, shared with an
+    // ordinary pass-through of the same location.
+    for (const PerVertex& pv : pv_list)
+        if (pv.forwarded && !id_in_loc.count(pv.attr)) id_in_loc[pv.attr] = alloc();
     for (std::uint32_t loc : pass_locs) id_out_loc[loc] = alloc();
+    std::map<std::uint32_t, std::uint32_t> id_out_pv;  // first location -> Output vec4[3]
+    for (const PerVertex& pv : pv_list) id_out_pv[pv.base] = alloc();
     const std::uint32_t id_out_bary = alloc();
     const std::uint32_t id_in_dist = dist_count ? alloc() : 0;
     const std::uint32_t id_out_dist = dist_count ? alloc() : 0;
@@ -314,8 +389,9 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
 
     // 3. EntryPoint ("main\0")
     std::vector<std::uint32_t> ep = {kExecModelGeometry, id_main, 0x6e69616du, 0x00000000u, id_in_pos, id_out_pos};
-    for (std::uint32_t loc : forwarded_locs) ep.push_back(id_in_loc[loc]);
+    for (const auto& [loc, id] : id_in_loc) ep.push_back(id);
     for (std::uint32_t loc : pass_locs) ep.push_back(id_out_loc[loc]);
+    for (const auto& [base, id] : id_out_pv) ep.push_back(id);
     ep.push_back(id_out_bary);
     if (dist_count) {
         ep.push_back(id_in_dist);
@@ -336,10 +412,14 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
         gs.insts.push_back(make_inst(kOpDecorate, {id_in_dist, kDecorationBuiltIn, dist_builtin}));
         gs.insts.push_back(make_inst(kOpDecorate, {id_out_dist, kDecorationBuiltIn, dist_builtin}));
     }
-    for (std::uint32_t loc : forwarded_locs)
-        gs.insts.push_back(make_inst(kOpDecorate, {id_in_loc[loc], kDecorationLocation, loc}));
+    for (const auto& [loc, id] : id_in_loc)
+        gs.insts.push_back(make_inst(kOpDecorate, {id, kDecorationLocation, loc}));
     for (std::uint32_t loc : pass_locs)
         gs.insts.push_back(make_inst(kOpDecorate, {id_out_loc[loc], kDecorationLocation, loc}));
+    for (const auto& [base, id] : id_out_pv) {
+        gs.insts.push_back(make_inst(kOpDecorate, {id, kDecorationLocation, base}));
+        gs.insts.push_back(make_inst(kOpDecorate, {id, kDecorationFlat}));
+    }
     gs.insts.push_back(make_inst(kOpDecorate, {id_out_bary, kDecorationLocation, bary_location}));
 
     // 6. Types, Constants, Global Variables
@@ -357,6 +437,8 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
     gs.insts.push_back(make_inst(kOpTypePointer, {id_ptr_out_v4, kStorageOutput, id_v4float}));
     gs.insts.push_back(make_inst(kOpTypePointer, {id_ptr_out_v3, kStorageOutput, id_v3float}));
     if (id_null_v4) gs.insts.push_back(make_inst(kOpConstantNull, {id_v4float, id_null_v4}));
+    if (id_ptr_out_arr) gs.insts.push_back(make_inst(kOpTypePointer, {id_ptr_out_arr, kStorageOutput, id_arr_v4_3}));
+    if (id_null_arr) gs.insts.push_back(make_inst(kOpConstantNull, {id_arr_v4_3, id_null_arr}));
     if (dist_count) {
         if (id_dist_count != id_uint_3) gs.insts.push_back(make_inst(kOpConstant, {id_uint, id_dist_count, dist_count}));
         gs.insts.push_back(make_inst(kOpTypeArray, {id_arr_dist, id_float, id_dist_count}));
@@ -374,10 +456,12 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
 
     gs.insts.push_back(make_inst(kOpVariable, {id_ptr_in_arr, id_in_pos, kStorageInput}));
     gs.insts.push_back(make_inst(kOpVariable, {id_ptr_out_v4, id_out_pos, kStorageOutput}));
-    for (std::uint32_t loc : forwarded_locs)
-        gs.insts.push_back(make_inst(kOpVariable, {id_ptr_in_arr, id_in_loc[loc], kStorageInput}));
+    for (const auto& [loc, id] : id_in_loc)
+        gs.insts.push_back(make_inst(kOpVariable, {id_ptr_in_arr, id, kStorageInput}));
     for (std::uint32_t loc : pass_locs)
         gs.insts.push_back(make_inst(kOpVariable, {id_ptr_out_v4, id_out_loc[loc], kStorageOutput}));
+    for (const auto& [base, id] : id_out_pv)
+        gs.insts.push_back(make_inst(kOpVariable, {id_ptr_out_arr, id, kStorageOutput}));
     gs.insts.push_back(make_inst(kOpVariable, {id_ptr_out_v3, id_out_bary, kStorageOutput}));
     if (dist_count) {
         gs.insts.push_back(make_inst(kOpVariable, {id_ptr_in_tri_dist, id_in_dist, kStorageInput}));
@@ -387,6 +471,18 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
     // 7. Function main
     gs.insts.push_back(make_inst(kOpFunction, {id_void, id_main, 0, id_fn}));
     gs.insts.push_back(make_inst(kOpLabel, {id_entry}));
+    // The triangle's three values of each per-vertex attribute, loaded once: every emitted vertex stores the same.
+    std::map<std::uint32_t, std::array<std::uint32_t, 3>> pv_vals;  // first location -> value ids
+    for (const PerVertex& pv : pv_list) {
+        if (!pv.forwarded) continue;
+        for (std::uint32_t k = 0; k < 3; ++k) {
+            const std::uint32_t ptr = alloc();
+            const std::uint32_t val = alloc();
+            gs.insts.push_back(make_inst(kOpAccessChain, {id_ptr_in_v4, ptr, id_in_loc[pv.attr], id_int_v[k]}));
+            gs.insts.push_back(make_inst(kOpLoad, {id_v4float, val, ptr}));
+            pv_vals[pv.base][k] = val;
+        }
+    }
     for (std::uint32_t v = 0; v < 3; ++v) {
         const std::uint32_t pos_ptr = alloc();
         const std::uint32_t pos_val = alloc();
@@ -403,6 +499,17 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
                 gs.insts.push_back(make_inst(kOpAccessChain, {id_ptr_in_v4, attr_ptr, id_in_loc[loc], id_int_v[v]}));
                 gs.insts.push_back(make_inst(kOpLoad, {id_v4float, attr_val, attr_ptr}));
                 gs.insts.push_back(make_inst(kOpStore, {id_out_loc[loc], attr_val}));
+            }
+        }
+        for (const PerVertex& pv : pv_list) {
+            if (!pv.forwarded) {
+                gs.insts.push_back(make_inst(kOpStore, {id_out_pv[pv.base], id_null_arr}));
+                continue;
+            }
+            for (std::uint32_t k = 0; k < 3; ++k) {
+                const std::uint32_t out_ptr = alloc();
+                gs.insts.push_back(make_inst(kOpAccessChain, {id_ptr_out_v4, out_ptr, id_out_pv[pv.base], id_int_v[k]}));
+                gs.insts.push_back(make_inst(kOpStore, {out_ptr, pv_vals[pv.base][k]}));
             }
         }
         if (dist_count) {
@@ -423,6 +530,17 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
     gs_words = gs.serialize();
     if (out_info) *out_info = {clip_count, cull_count};
     return true;
+}
+
+// A PS with no computed I/J pair (no `per_vertex` in its index entry).
+inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
+                                   std::span<const std::uint32_t> ps_words,
+                                   std::uint32_t bary_location,
+                                   std::vector<std::uint32_t>& gs_words,
+                                   BaryFallbackGsInfo* out_info = nullptr,
+                                   std::string* error = nullptr) {
+    return build_bary_fallback_gs(vs_words, ps_words, bary_location, std::map<std::uint32_t, std::uint32_t>{},
+                                  gs_words, out_info, error);
 }
 
 }  // namespace leonida

@@ -8610,7 +8610,8 @@ public:
             leonida::BaryFallbackGsInfo bary_info{};
             std::string bary_error;
             if (!leonida::build_bary_fallback_gs(vs_stage.words, ps_stage.words,
-                                                 *ps_stage.entry->bary_fallback_location, words, &bary_info,
+                                                 *ps_stage.entry->bary_fallback_location,
+                                                 ps_stage.entry->bary_fallback_per_vertex, words, &bary_info,
                                                  &bary_error)) {
                 std::fprintf(stderr, "[rt] d3d12: %s\n", bary_error.c_str());
                 return E_FAIL;
@@ -9602,7 +9603,8 @@ private:
             } else if (sources_[i].kind == StageSource::bary_fallback) {
                 if (vs == SIZE_MAX || ps == SIZE_MAX || !sources_[ps].entry->bary_fallback_location ||
                     !leonida::build_bary_fallback_gs(words[vs], words[ps],
-                                                     *sources_[ps].entry->bary_fallback_location, words[i], nullptr,
+                                                     *sources_[ps].entry->bary_fallback_location,
+                                                     sources_[ps].entry->bary_fallback_per_vertex, words[i], nullptr,
                                                      &why))
                     return false;
             } else if (sources_[i].kind == StageSource::depth_only) {
