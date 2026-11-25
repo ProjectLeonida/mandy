@@ -20,6 +20,10 @@ but won't do it yourself? Post `finding: <one line>` there, with where it is and
 list for others. When two pull requests overlap anyway, the one that lands first is merged and the other is asked to
 rebase or close. Pull requests target `main`.
 
+`python -I tools/coord.py check <files> --id <ID>` asks the coordination worker which open claims share those files
+or that ID, and `python -I tools/coord.py claim <ID>` records yours there instead of in a comment;
+[docs/coordination.md](docs/coordination.md) has both.
+
 The original repository (`ItsNotRexed/Leonida`) went private on 23 November 2026, and its issues and pull requests
 went with it. A `#N` in the docs, in a code comment or in a commit message from before that date is an **old**
 number and links nowhere now, including the two this page used to send you to: #166 (GPU test results) and #313
