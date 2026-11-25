@@ -552,6 +552,10 @@ def main():
     ap.add_argument("--list-ops", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
+    if args.max_ops < 1:
+        ap.error("--max-ops must be at least 1")
+    if args.programs < 1:
+        ap.error("--programs must be at least 1")
 
     if args.list_ops:
         for op, form in OP_FORMS.items():

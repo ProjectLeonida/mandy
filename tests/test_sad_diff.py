@@ -146,5 +146,32 @@ class EverythingSkipped(unittest.TestCase):
         self.assertEqual(rc, 2, out.getvalue())
         self.assertIn("no program ran: every one was skipped", out.getvalue())
 
+class ArgumentGuards(unittest.TestCase):
+    TOOL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "tools", "sad_diff.py")
+
+    def _cli(self, *args):
+        import subprocess
+        return subprocess.run([sys.executable, "-I", self.TOOL, *args],
+                              capture_output=True, text=True, timeout=300)
+
+    def test_zero_or_negative_counts_are_usage_errors_before_any_work(self):
+        # --max-ops 0 used to crash in randint(1, 0) after the sweep; --programs 0 used to
+        # exit 0 on the sweep alone. Both are usage errors, rejected before any program runs.
+        for flag in ("--max-ops", "--programs"):
+            for count in ("0", "-1"):
+                with self.subTest(flag=flag, count=count):
+                    proc = self._cli(flag, count)
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    self.assertIn(f"{flag} must be at least 1", proc.stderr)
+                    self.assertNotIn("Traceback", proc.stderr)
+                    self.assertEqual(proc.stdout, "")   # nothing ran, not even the sweep
+
+    def test_a_valid_small_run_still_matches(self):
+        proc = self._cli("--no-sweep", "--programs", "2", "--max-ops", "3", "--seed", "3")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("SAD family: 2/2 programs match", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
