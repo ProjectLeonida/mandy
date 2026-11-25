@@ -40,7 +40,7 @@ struct Config {
     uint8_t lightbar[3] = {0, 0, 0};                    //   player colour
     bool rumble = true;                                 // LEONIDA_RUMBLE=0 turns all rumble off
     bool background_thread = true;                      // LEONIDA_GAMEINPUT_THREAD=0: poll only from poll()
-    KeyboardPadMode keyboard_pad = KeyboardPadMode::Off;  // LEONIDA_KEYBOARD_PAD=1|focus|always|off
+    KeyboardPadMode keyboard_pad = KeyboardPadMode::Off;  // config(): Focused unless LEONIDA_KEYBOARD_PAD=off|0|always
 };
 
 // The configuration in use. Read from the environment on the first GameInputCreate.

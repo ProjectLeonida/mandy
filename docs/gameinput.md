@@ -42,9 +42,10 @@ it has no `GameInputCreate`, as before, so the loader binds it to the host's `Ga
 thunk. `gameinput_test` and `gameinput_probe` are not built, and CTest lists `gameinput` as not run (disabled) rather
 than failing.
 
-`scripts/build_runtime.ps1` (what `make_game.py` runs) builds the shim only on its CMake path, when Visual Studio's
-C++ CMake tools are installed. Its direct-`cl.exe` fallback compiles a fixed file list without the shim and warns
-about it.
+`scripts/build_runtime.ps1` builds the shim only on its CMake path, when Visual Studio's C++ CMake tools are
+installed. Its direct-`cl.exe` fallback compiles a fixed file list without the shim and warns about it.
+`make_game.py`'s runtime stage on Windows runs it with `-FetchSdl3`, so a build made the usual way has controller,
+keyboard and mouse input; `--no-sdl3` leaves the download out (an installed SDL3 is still used).
 
 ## Mapping
 
@@ -77,11 +78,10 @@ controller-button array (`GetControllerButtonState`, indexed in SDL's `SDL_Gamep
 
 ## Keyboard pad
 
-The title reads gamepads only, so keyboard input has to arrive as a gamepad. With `LEONIDA_KEYBOARD_PAD` set, the
-shim attaches one SDL virtual gamepad named `Keyboard pad (Leonida)` and presses its buttons from the keyboard on
+The title reads gamepads only, so keyboard input has to arrive as a gamepad. The shim attaches one SDL virtual gamepad named `Keyboard pad (Leonida)` and presses its buttons from the keyboard on
 every poll. It then goes through the same path as a real pad: a device object, the next free player slot, readings,
-reading and device callbacks, and UI navigation derived from its buttons. It reports no rumble motors. It is off by
-default.
+reading and device callbacks, and UI navigation derived from its buttons. It reports no rumble motors. It is on by
+default in the focused mode, so a player without a pad can still play; `LEONIDA_KEYBOARD_PAD=off` removes it.
 
 | key | button |
 |---|---|
@@ -124,8 +124,8 @@ moves away or the keyboard pad is turned off. The cursor stays visible: hiding i
 owns the game's window, which is the title's, not the shim's.
 
 Keys are read with `GetAsyncKeyState`, which needs no window or message loop (SDL's keyboard is part of its video
-subsystem, which this build leaves out) and works under Wine. With `LEONIDA_KEYBOARD_PAD=1` keys count only while a
-window of this process is in the foreground. Losing focus releases keyboard and mouse input. The cursor is read
+subsystem, which this build leaves out) and works under Wine. By default (or with `LEONIDA_KEYBOARD_PAD=1`) keys count only
+while a window of this process is in the foreground. Losing focus releases keyboard and mouse input. The cursor is read
 afresh on return so the right stick does not jump. Scripted presses run with or without focus for unattended runs.
 `LEONIDA_KEYBOARD_PAD=always` reads physical input whatever has focus; a console tool such as
   `gameinput_probe` needs it, because its console window belongs to the terminal, not to the tool.
@@ -301,7 +301,7 @@ line is logged when it takes effect); tracking goes on underneath, so clearing i
 | `LEONIDA_PROMPTS` | `auto` | forces the [active input](#active-input) family: `xbox`, `playstation` (or `ps5`), `ps4`, `ps3`, `nintendo` or `keyboard`; `auto` follows the devices |
 | `LEONIDA_PROMPTS_SWITCH_MS` | `300` | shortest time between two changes of the active input family, 0..2000 ms |
 | `LEONIDA_GAMEINPUT_THREAD` | `1` | `0` stops the background poll thread; only `rt::gameinput::poll()` then reads the pads (tests) |
-| `LEONIDA_KEYBOARD_PAD` | `off` | `1` adds the [keyboard pad](#keyboard-pad), read while this process has focus; `always` reads keys whatever has focus |
+| `LEONIDA_KEYBOARD_PAD` | `1` | the [keyboard pad](#keyboard-pad), read while this process has focus; `always` reads keys whatever has focus; `off` removes it |
 | `LEONIDA_INPUT_SCRIPT` | unset | With the keyboard pad enabled, set comma-separated `button@seconds` entries, e.g. `a@2,a@4,start@6`. The first pad update reads the script once at startup and starts the clock. `reload_config()` does not reread it. Each press lasts 300 ms. Buttons are `a b x y start back lb rb up down left right`. Spaces around entries are allowed. Empty entries, unknown buttons and invalid times (including negative or non-finite values) are counted and ignored. |
 | `LEONIDA_MOUSE_SENSITIVITY` | `1` | scales how far the mouse moves the keyboard pad's right stick, 0.1..10 |
 

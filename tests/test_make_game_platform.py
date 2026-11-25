@@ -457,9 +457,23 @@ class RuntimeBuildPackagingTest(unittest.TestCase):
                     mock.patch.object(make_game, "ROOT", root), \
                     mock.patch.object(make_game, "run") as run, mock.patch.object(make_game, "log"):
                 make_game.runtime(root, os.path.join(root, "out"), {"expected_exe": "game.exe"}, jobs=1)
-            command = run.call_args.args[0]
-            self.assertEqual(command[command.index("-File") + 1:],
-                             [os.path.join(root, "scripts", "build_runtime.ps1"), "-Jobs", "1"])
+                default = run.call_args.args[0]
+                make_game.runtime(root, os.path.join(root, "out"), {"expected_exe": "game.exe"}, jobs=1, sdl3=False)
+                without = run.call_args.args[0]
+            # INPUT-OUT-OF-THE-BOX: without -FetchSdl3 (and no installed SDL3) the GameInput shim is not built, and
+            # no controller, keyboard or mouse reaches the title.
+            script = os.path.join(root, "scripts", "build_runtime.ps1")
+            self.assertEqual(default[default.index("-File") + 1:], [script, "-Jobs", "1", "-FetchSdl3"])
+            self.assertEqual(without[without.index("-File") + 1:], [script, "-Jobs", "1"])
+
+    def test_no_sdl3_reaches_the_runtime_stage(self):
+        seen = {}
+        with mock.patch.object(make_game, "runtime", lambda *a, **k: seen.update(k)), \
+                mock.patch.object(make_game, "StageBoard"):
+            make_game.run_build_stages(["runtime"], game="g", work="w", out="o", v={}, wav=False, jobs=1,
+                                       runtime_build=None, emulate=False, keep_emulated=False, fallbacks=(),
+                                       overlap=False, sdl3=False)
+        self.assertIs(seen.get("sdl3"), False)
 
     def test_off_windows_copies_the_build_and_writes_a_wine_launcher(self):
         with tempfile.TemporaryDirectory() as root:

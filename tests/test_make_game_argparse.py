@@ -286,7 +286,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
         self.assertIsNotNone(manager.assets.call_args.kwargs["dump_jobs"])
         manager.runtime.assert_called_once_with(
             os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY, None,
-            unittest.mock.ANY, work=os.path.abspath(self.work_dir))
+            unittest.mock.ANY, work=os.path.abspath(self.work_dir), sdl3=True)
         manager.pipelines.assert_called_once_with(
             os.path.abspath(self.work_dir), os.path.abspath(self.out_dir), unittest.mock.ANY,
             runtime_build=None)

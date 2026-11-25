@@ -172,12 +172,15 @@ rt::gameinput::Config read_config() {
     }
     if (env("LEONIDA_RUMBLE") == "0") c.rumble = false;
     if (env("LEONIDA_GAMEINPUT_THREAD") == "0") c.background_thread = false;
+    // On by default in the focused mode: the title reads gamepads only, so without it a player with no pad has no
+    // input at all. Keys and the mouse count only while this process's window has focus (docs/gameinput.md).
     const std::string k = env("LEONIDA_KEYBOARD_PAD");
-    if (k == "1" || k == "on" || k == "focus") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Focused;
+    if (k.empty() || k == "1" || k == "on" || k == "focus") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Focused;
     else if (k == "always") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Always;
-    else if (!k.empty() && k != "0" && k != "off")
-        std::fprintf(stderr, "[rt] gameinput: LEONIDA_KEYBOARD_PAD=%s unknown (1, always or off), keyboard pad off\n",
-                     k.c_str());
+    else if (k == "0" || k == "off") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Off;
+    else
+        std::fprintf(stderr, "[rt] gameinput: LEONIDA_KEYBOARD_PAD=%s unknown (1, focus, always or off), keyboard pad "
+                             "off\n", k.c_str());
     using leonida::InputFamily;
     const std::string p = env("LEONIDA_PROMPTS");
     if (p == "xbox") c.prompts = InputFamily::Xbox;
