@@ -727,6 +727,21 @@ public:
 
     void set_device_fault(DeviceFaultDiagnostics* diagnostics) { diagnostics_ = diagnostics; }
 
+    // For a stall report: the waits not yet satisfied, as (fence, value, a callback rather than an event).
+    struct PendingWait {
+        VkSemaphore semaphore;
+        std::uint64_t value;
+        bool callback;
+    };
+    std::vector<PendingWait> pending_waits() {
+        std::lock_guard lock(mutex_);
+        std::vector<PendingWait> out;
+        out.reserve(pending_.size());
+        for (const Entry& entry : pending_)
+            out.push_back({entry.semaphore, entry.value, static_cast<bool>(entry.callback)});
+        return out;
+    }
+
     void set_signal_event_fn(SignalEventFn fn) {
         std::lock_guard lock(mutex_);
         signal_event_ = fn;
@@ -1259,10 +1274,12 @@ public:
         replay_.separate_depth_stencil_layouts = separate_depth_stencil_layouts;
         if (loaded_) {
             fence_dispatcher_ = std::make_unique<FenceWaitDispatcher>(device_, vk, device_lost_);
+            holds_.set_describe_extra([this](std::FILE* out) { describe_cpu_waits(out); });
         }
     }
 
     ~VulkanContext() {
+        holds_.set_describe_extra(nullptr);  // waits for a stall report that is running
         progress_watch_ = {};  // stop before queues, timelines or diagnostic state go away
         gpu_labels_.stop(device_);
         fence_dispatcher_.reset();
@@ -1957,6 +1974,48 @@ public:
     void enqueue_fence_callback(VkSemaphore sem, std::uint64_t value, std::function<void()> cb) {
         if (fence_dispatcher_) fence_dispatcher_->enqueue_callback(sem, value, std::move(cb));
     }
+    // For a stall report (QueueHolds::describe): the CPU waits on fences not yet satisfied (SetEventOnCompletion and
+    // the layer's own callbacks), one line per fence: the lowest value waited for, the fence's counter now and the
+    // highest Signal submitted for it. A counter below the value with a Signal submitted is the GPU's to finish; with
+    // none submitted, nothing will finish it until someone submits that Signal.
+    void describe_cpu_waits(std::FILE* out) {
+        if (!fence_dispatcher_) return;
+        auto waits = fence_dispatcher_->pending_waits();
+        if (waits.empty()) return;
+        std::sort(waits.begin(), waits.end(), [](const auto& a, const auto& b) {
+            return a.semaphore != b.semaphore ? reinterpret_cast<std::uintptr_t>(a.semaphore) <
+                                                    reinterpret_cast<std::uintptr_t>(b.semaphore)
+                                              : a.value < b.value;
+        });
+        std::fprintf(out, "[rt] d3d12: stall report: %zu CPU wait(s) on fences are not satisfied:\n", waits.size());
+        unsigned lines = 0;
+        for (std::size_t i = 0; i < waits.size();) {
+            std::size_t j = i;
+            unsigned events = 0, callbacks = 0;
+            for (; j < waits.size() && waits[j].semaphore == waits[i].semaphore; ++j)
+                (waits[j].callback ? callbacks : events) += 1;
+            if (lines++ < 16) {
+                std::uint64_t counter = 0, submitted = 0;
+                const bool counted = vk.vkGetSemaphoreCounterValue(device_, waits[i].semaphore, &counter) == VK_SUCCESS;
+                const bool known = holds_.submitted(waits[i].semaphore, submitted);
+                char counter_text[32] = "unreadable", submitted_text[32] = "not tracked";
+                if (counted)
+                    std::snprintf(counter_text, sizeof(counter_text), "%llu", static_cast<unsigned long long>(counter));
+                if (known)
+                    std::snprintf(submitted_text, sizeof(submitted_text), "%llu",
+                                  static_cast<unsigned long long>(submitted));
+                std::fprintf(out,
+                             "[rt] d3d12:   fence %p: %u event(s) and %u callback(s) wait for >= %llu; counter %s, "
+                             "highest Signal submitted %s%s\n",
+                             reinterpret_cast<const void*>(waits[i].semaphore), events, callbacks,
+                             static_cast<unsigned long long>(waits[i].value), counter_text, submitted_text,
+                             known && submitted < waits[i].value ? " (no Signal of that value submitted yet)" : "");
+            }
+            i = j;
+        }
+        if (lines > 16) std::fprintf(out, "[rt] d3d12:   (%u fences in all; the first 16 are shown)\n", lines);
+    }
+
     void cancel_fence_waits(VkSemaphore sem) {
         if (fence_dispatcher_) fence_dispatcher_->cancel(sem);
     }
@@ -3493,7 +3552,7 @@ private:
         // signatures of the lists (the application may release them right after the call).
         std::vector<std::shared_ptr<void>> pins;
         std::vector<std::shared_ptr<void>> wait_pins;  // the fences of `waits`
-        std::chrono::steady_clock::time_point held_at{};  // LEONIDA_GPU_LATENCY: when it was held
+        std::chrono::steady_clock::time_point held_at{};  // when it was held (LEONIDA_GPU_LATENCY, stall report)
     };
 
     bool waits_pending(const std::vector<VkSemaphore>& semaphores, const std::vector<std::uint64_t>& values) const {
@@ -3547,7 +3606,7 @@ private:
             wait_values_.clear();
             wait_pins_.clear();
         }
-        if (gpu_latency::enabled()) op.held_at = std::chrono::steady_clock::now();
+        op.held_at = std::chrono::steady_clock::now();  // LEONIDA_GPU_LATENCY and the stall report
         held_.push_back(std::move(op));
         context_.holds().held_changed(1);
     }
@@ -3631,6 +3690,53 @@ private:
                 context_.holds().held_changed(-1);
             }
         }
+    }
+
+    // Holder: for a stall report (QueueHolds::describe), what this queue holds and what its oldest held operation
+    // waits for: each fence, the value it waits for and the highest Signal submitted for it so far. The state lock
+    // is tried for a while only: a thread stuck inside this queue is itself what the report should show.
+    void describe_held(std::FILE* out) override {
+        std::unique_lock state(state_mutex_, std::defer_lock);
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (!state.try_lock()) {
+            if (std::chrono::steady_clock::now() >= until) {
+                std::fprintf(out, "[rt] d3d12: stall report: %s queue %p: its state lock has been held for over half "
+                                  "a second (a submission on it is busy or blocked)\n",
+                             queue_kind_name(), static_cast<const void*>(this));
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (held_.empty()) return;
+        const Deferred& op = held_.front();
+        const double held_s =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - op.held_at).count();
+        const char* what = op.kind == Deferred::Kind::batch ? "ExecuteCommandLists"
+                           : op.kind == Deferred::Kind::signal ? "Signal" : "debug marker";
+        std::fprintf(out, "[rt] d3d12: stall report: %s queue %p holds %zu operation(s); the oldest, a %s held %.1f s "
+                          "ago, %s\n",
+                     queue_kind_name(), static_cast<const void*>(this), held_.size(), what, held_s,
+                     op.waits.empty() ? "waits for nothing itself (it is behind work held before it)"
+                                      : "waits for:");
+        for (std::size_t i = 0; i < op.waits.size(); ++i) {
+            std::uint64_t submitted = 0;
+            const bool known = context_.holds().submitted(op.waits[i], submitted);
+            if (!known)
+                std::fprintf(out, "[rt] d3d12:   fence %p >= %llu (not a tracked fence: counted as satisfied)\n",
+                             reinterpret_cast<const void*>(op.waits[i]),
+                             static_cast<unsigned long long>(op.wait_values[i]));
+            else
+                std::fprintf(out, "[rt] d3d12:   fence %p >= %llu, highest Signal submitted %llu%s\n",
+                             reinterpret_cast<const void*>(op.waits[i]),
+                             static_cast<unsigned long long>(op.wait_values[i]),
+                             static_cast<unsigned long long>(submitted),
+                             submitted >= op.wait_values[i] ? " (satisfied: the release has not run yet)"
+                                                            : " (no Signal of that value yet)");
+        }
+    }
+
+    const char* queue_kind_name() const {
+        return kind_ == QueueKind::direct ? "direct" : kind_ == QueueKind::compute ? "compute" : "copy";
     }
 
     // Holder: the sequence number of the oldest held operation.

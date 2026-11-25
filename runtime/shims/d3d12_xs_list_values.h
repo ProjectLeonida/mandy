@@ -38,6 +38,10 @@
 // a few milliseconds, not the full timeout, per such wait. A wait cut short is watched for the rest of the full
 // timeout: met in that time, its address keeps the full timeout from then on. A gate cut short that is met within
 // its short timeout gives every wait the full timeout again.
+// Stall snapshot: when the 10 s summary has not changed three times in a row while writes are still waiting to land,
+// the pump says once which write groups wait for which queue's `written` fence (and how far that fence got), which
+// gates are closed on what memory, and what the D3D12 layer holds and why (QueueHolds, src/held_work_report.h).
+// Logging only.
 // LEONIDA_LIST_VALUES=0 drops both methods (the behaviour before this file).
 
 #include <windows.h>
@@ -53,6 +57,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -60,6 +65,7 @@
 #include <vector>
 
 #include "d3d12_xs_device.h"          // console_value_met, ListValueStats
+#include "../src/held_work_report.h"  // leonida::report_held_work: the stall snapshot
 #include "../src/title_page_watch.h"  // leonida::kernel_writes::store
 #include "../src/value_write_sink.h"  // leonida::value_sink: the arena and xmem's PAGE_NOACCESS pages
 
@@ -157,7 +163,8 @@ struct Write {
 };
 
 struct Counters {
-    std::atomic<std::uint64_t> writes_recorded{0}, writes_landed{0}, writes_failed{0};
+    // Recorded into a list (once per recording), submitted (each time a list that holds them is executed), landed.
+    std::atomic<std::uint64_t> writes_recorded{0}, writes_submitted{0}, writes_landed{0}, writes_failed{0};
     std::atomic<std::uint64_t> waits_recorded{0}, waits_met_at_submit{0}, waits_relayed{0};
     std::atomic<std::uint64_t> gates_held{0}, gates_met{0}, gates_timed_out{0};
     std::atomic<std::uint64_t> cuts{0}, cuts_deferred{0}, cut_failures{0};
@@ -497,6 +504,8 @@ private:
     static constexpr std::size_t kMaxStreaks = 256;    // addresses whose timeouts are counted (least recently used go)
     static constexpr std::size_t kMaxLate = 64;        // waits cut short watched for the rest of the full timeout
     static constexpr std::uint64_t kStallMs = 1000;    // a gate Signal this long is reported (watch_releaser)
+    static constexpr unsigned kStillSummaries = 3;     // 10 s summaries alike before the stall snapshot
+    static constexpr std::size_t kSnapshotItems = 8;   // write groups and gates the snapshot lists
 
     struct WriteGroup {
         std::shared_ptr<QueueValues> queue;
@@ -585,7 +594,9 @@ private:
                 // Writes wake us through SetEventOnCompletion; the timeout is only a safety net (and, while the
                 // releaser is inside a Signal, how often watch_releaser looks at it).
                 const bool releasing = signal_since_ms_.load(std::memory_order_relaxed) != 0;
-                WaitForSingleObject(wake_, polling ? kPollMs : writes ? 50 : releasing ? 500 : INFINITE);
+                // With nothing in flight it still looks every 10 s, so the summary and the stall snapshot are said
+                // when the title stopped submitting altogether.
+                WaitForSingleObject(wake_, polling ? kPollMs : writes ? 50 : releasing ? 500 : 10000);
             }
             if (stop_.load(std::memory_order_relaxed)) break;
             pass(false);
@@ -787,7 +798,9 @@ private:
         busy_ = false;
     }
 
-    // One line every 10 s while there is traffic, for boot logs.
+    // One line every 10 s once list values are in use, for boot logs. When three in a row are the same while recorded
+    // writes have not all landed, the stall snapshot follows once (snapshot()), and again only after the counters
+    // moved.
     void summarize() {
         const auto now = Clock::now();
         if (now < next_summary_) return;
@@ -796,14 +809,30 @@ private:
         const auto get = [](const std::atomic<std::uint64_t>& v) {
             return static_cast<unsigned long long>(v.load(std::memory_order_relaxed));
         };
+        const std::uint64_t moved[] = {get(c.writes_recorded), get(c.writes_submitted), get(c.writes_landed),
+                                       get(c.writes_failed),   get(c.waits_recorded),   get(c.gates_held),
+                                       get(c.gates_met),       get(c.gates_timed_out),  get(c.releases)};
+        const bool unlanded = moved[0] > moved[2] + moved[3];  // recorded, not landed (or never submitted)
+        if (std::equal(std::begin(moved), std::end(moved), std::begin(last_moved_)) && unlanded) {
+            if (++still_summaries_ >= kStillSummaries && !snapshot_logged_) {
+                snapshot_logged_ = true;
+                snapshot(stderr, still_summaries_ * 10);
+            }
+        } else {
+            still_summaries_ = 0;
+            snapshot_logged_ = false;
+            std::copy(std::begin(moved), std::end(moved), std::begin(last_moved_));
+        }
         std::fprintf(stderr,
-                     "[rt] d3d12_xs: list values so far: %llu writes recorded, %llu landed, %llu failed; %llu waits "
-                     "recorded, %llu met at submission, %llu relayed; %llu gates held, %llu met, %llu timed out "
+                     "[rt] d3d12_xs: list values so far: %llu writes recorded, %llu submitted, %llu landed, %llu "
+                     "failed; %llu waits recorded, %llu met at submission, %llu relayed; %llu gates held, %llu met, "
+                     "%llu timed out "
                      "(%llu short, %llu demotions, %llu met late); %llu cuts (%llu deferred to a query's end, %llu "
                      "failed), %llu on bundles; releaser %llu signals, %.1f ms, longest %.2f ms, %llu stalls; longest pump pass "
                      "%.2f ms; %llu page remaps at the call (longest wait %.2f ms), %llu deferred (%llu failed); "
                      "timestamps %llu from the GPU, %llu from the CPU clock\n",
-                     get(c.writes_recorded), get(c.writes_landed), get(c.writes_failed), get(c.waits_recorded),
+                     get(c.writes_recorded), get(c.writes_submitted), get(c.writes_landed), get(c.writes_failed),
+                     get(c.waits_recorded),
                      get(c.waits_met_at_submit), get(c.waits_relayed), get(c.gates_held), get(c.gates_met),
                      get(c.gates_timed_out), get(c.gates_short), get(c.demotions), get(c.late_met), get(c.cuts),
                      get(c.cuts_deferred), get(c.cut_failures), get(c.bundle_ops), get(c.releases),
@@ -813,6 +842,104 @@ private:
                      get(c.remaps_failed), get(c.stamps_gpu), get(c.stamps_cpu));
     }
 
+public:
+    // The stall snapshot: what the writes still waiting to land and the gates still closed wait for, and what the
+    // D3D12 layer holds (leonida::report_held_work). Said when the counters stood still for `still_s` seconds (0: on
+    // request, the test). A write group lands once its queue's `written` fence reaches its value: a completed value
+    // below it means the queue has not run that far, so the queue's held work (the lines after) or its GPU work is
+    // what to look at. The fences are read with no lock held.
+    void snapshot(std::FILE* out, unsigned still_s = 0) {
+        struct GroupView {
+            std::shared_ptr<QueueValues> queue;
+            std::uint64_t value;
+            std::size_t writes;
+            std::uint64_t first_address;
+        };
+        struct GateView {
+            std::shared_ptr<QueueValues> queue;
+            std::uint64_t value;
+            bool started, action;
+            std::uint64_t after;
+            double open_s;
+            std::vector<Wait> waits;
+        };
+        std::vector<GroupView> groups;
+        std::vector<GateView> gates;
+        std::size_t group_count = 0, gate_count = 0;
+        const auto now = Clock::now();
+        {
+            std::lock_guard lock(mutex_);
+            group_count = writes_.size();
+            gate_count = gates_.size();
+            for (const WriteGroup& group : writes_) {
+                if (groups.size() == kSnapshotItems) break;
+                groups.push_back({group.queue, group.value, group.writes.size(),
+                                  group.writes.empty() ? 0 : group.writes.front().address});
+            }
+            for (const Gate& gate : gates_) {
+                if (gates.size() == kSnapshotItems) break;
+                gates.push_back({gate.queue, gate.value, gate.started, static_cast<bool>(gate.action), gate.after,
+                                 gate.started ? std::chrono::duration<double>(now - gate.since).count() : 0.0,
+                                 gate.waits});
+            }
+        }
+        const Counters& c = counters();
+        const unsigned long long recorded = c.writes_recorded.load(std::memory_order_relaxed),
+                                 submitted = c.writes_submitted.load(std::memory_order_relaxed),
+                                 landed = c.writes_landed.load(std::memory_order_relaxed),
+                                 failed = c.writes_failed.load(std::memory_order_relaxed);
+        if (still_s)
+            std::fprintf(out, "[rt] d3d12_xs: stall snapshot: the list-value counters have not moved for %u s (writes "
+                              "%llu recorded, %llu submitted, %llu landed, %llu failed: recorded but never submitted "
+                              "is a list the title did not execute); %zu write group(s) and %zu gate(s) are "
+                              "waiting:\n",
+                         still_s, recorded, submitted, landed, failed, group_count, gate_count);
+        else
+            std::fprintf(out, "[rt] d3d12_xs: stall snapshot: %zu write group(s) and %zu gate(s) are waiting:\n",
+                         group_count, gate_count);
+        for (const GroupView& group : groups) {
+            const unsigned long long completed =
+                group.queue && group.queue->written ? group.queue->written->GetCompletedValue() : 0;
+            std::fprintf(out, "[rt] d3d12_xs:   %zu write(s) (first at 0x%llx) on queue values %p land at its written "
+                              "fence %llu, completed %llu%s\n",
+                         group.writes, static_cast<unsigned long long>(group.first_address),
+                         static_cast<const void*>(group.queue.get()), static_cast<unsigned long long>(group.value),
+                         completed,
+                         completed >= group.value ? " (reached: the pump has not landed them yet)"
+                                                  : " (the queue has not run that far)");
+        }
+        for (const GateView& gate : gates) {
+            const unsigned long long gate_done =
+                gate.queue && gate.queue->gate ? gate.queue->gate->GetCompletedValue() : 0;
+            if (gate.action) {
+                std::fprintf(out, "[rt] d3d12_xs:   an action gate %llu on queue values %p runs behind its written "
+                                  "fence %llu (gate fence completed %llu)\n",
+                             static_cast<unsigned long long>(gate.value), static_cast<const void*>(gate.queue.get()),
+                             static_cast<unsigned long long>(gate.after), gate_done);
+                continue;
+            }
+            char state[64] = "behind an earlier gate of its queue";
+            if (gate.started) std::snprintf(state, sizeof(state), "its time has run for %.1f s", gate.open_s);
+            std::fprintf(out, "[rt] d3d12_xs:   gate %llu on queue values %p (gate fence completed %llu), %s:\n",
+                         static_cast<unsigned long long>(gate.value), static_cast<const void*>(gate.queue.get()),
+                         gate_done, state);
+            for (const Wait& wait : gate.waits) {
+                std::uint64_t memory = 0;
+                const bool readable = read_value(wait.address, wait.wide, memory);
+                std::fprintf(out,
+                             "[rt] d3d12_xs:     wait%u for 0x%llx, comparison %u against 0x%llx; memory %s0x%llx\n",
+                             wait.wide ? 64u : 32u, static_cast<unsigned long long>(wait.address), wait.comparison,
+                             static_cast<unsigned long long>(wait.reference), readable ? "" : "unreadable, ",
+                             static_cast<unsigned long long>(memory));
+            }
+        }
+        if (group_count > groups.size() || gate_count > gates.size())
+            std::fprintf(out, "[rt] d3d12_xs:   (the first %zu of each are shown)\n", kSnapshotItems);
+        leonida::report_held_work(out);
+        std::fflush(out);
+    }
+
+private:
     // A timestamp write's value: the GPU's timestamp for the write's place in its list when the GPU wrote one, else
     // the CPU's clock now. Flag 1 is in the queue's GetTimestampFrequency ticks; flag 2 (the system timestamp) is a
     // QueryPerformanceCounter value, the GPU's timestamp turned into one through the queue's clock calibration (never
@@ -1035,6 +1162,10 @@ private:
     bool busy_ = false;               // a pass is landing or handing over what it took off the lists
     unsigned logged_met_ = 0;
     Clock::time_point next_summary_ = Clock::now() + std::chrono::seconds(10);  // the pump thread's only
+    // summarize()'s: the counters at the last change, 10 s summaries alike since, the snapshot said for this stall.
+    std::uint64_t last_moved_[9] = {};
+    unsigned still_summaries_ = 0;
+    bool snapshot_logged_ = false;
     std::mutex release_mutex_;        // releases_ and releasing_
     std::condition_variable release_ready_;
     std::deque<Release> releases_;
