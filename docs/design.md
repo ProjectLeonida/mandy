@@ -168,6 +168,12 @@ python -I make_game.py --stages assets   # everything, in order; skips what is d
 ```
 
 Full-scan indexes are also saved to `%LOCALAPPDATA%\RpfPreview\Indexes`, so the rpf9-explorer GUI opens these archives with complete listings instead of its 16 MiB preview scan.
+On Linux that is `RpfPreview/Indexes` under `$XDG_DATA_HOME`, or under `~/.local/share` when the variable is unset.
+If that data folder does not exist, .NET reports no folder at all and the index is written to `RpfPreview/Indexes`
+under the current directory instead (`RecoveryIndexCache.CachePath` in `third_party/rpf9-explorer`; measured on
+Linux with .NET 10.0.14 and a 64 KiB file of zeros as the source). An index holds the archive's full path and the
+names of its recovered entries, so it is game data: `RpfPreview/` is in `.gitignore`, and creating the data folder
+before the first run keeps the index out of the checkout.
 
 ## Other prepared pieces
 

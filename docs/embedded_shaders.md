@@ -140,10 +140,10 @@ that expands to `FSSM` ([fssm_crosscheck.md](fssm_crosscheck.md)). On all 52 con
 |---|---|
 | `tools/fssm_unpack.py` | **52/52** decompress to a valid `FSSM` blob (716 B to 101,320 B, median 2,200 B) |
 | `tools/shader_disasm.py --mcpu gfx1013` | **52/52** disassemble; 42 with no invalid word, 10 with invalid words in the code |
-| `tools/rdna2spirv.py` | **51** translate and pass `spirv-val` (`main` `49475796`) |
+| `tools/rdna2spirv.py` | **52/52** translate and pass `spirv-val` (`main` `3aa975421`, natively and with `--wave64-emulate`; 51 at `main` `49475796`, before `buffer_store_short`) |
 
-When this page was first written, 42 translated and 10 stopped at four rules. Three of those rules have landed since
-(`427c1376`, from #1968), and one program still waits on a fifth rule:
+When this page was first written, 42 translated and 10 stopped at four rules. Those rules have landed since, and so
+has a fifth that one program then stopped at (`buffer_store_short`, `8f208d09a`):
 
 | module(s) | blocker then | now |
 |---|---|---|
@@ -151,12 +151,12 @@ When this page was first written, 42 translated and 10 stopped at four rules. Th
 | `PT_LoadInstances` | `global_atomic_fmin` | translates |
 | `Box32Rehydration`, `ReloadTriangles` | `buffer_load_ushort` | translate |
 | `LeafRehydration` | `tbuffer_load_format_x GFX10_FORMAT_8_UINT` | translates |
-| `Box16Rehydration` | `buffer_load_ushort` | stops at `buffer_store_short` (#1864) |
+| `Box16Rehydration` | `buffer_load_ushort`, then `buffer_store_short` | translates |
 
 The disassembly count is unchanged: the same 42 programs have no invalid word, and 10 have invalid words in the
 code. All 10 of those translate; `Box16Rehydration` is one of the 42 clean ones.
 
-On current `main`, 51 of the 52 programs translate and pass `spirv-val`. The four earlier blockers were
+On current `main`, all 52 programs translate and pass `spirv-val`. The four earlier blockers were
 implemented in #1871 and #1968 (`427c1376`):
 
 * `tbuffer_load_format_x GFX10_FORMAT_8_UINT` (#1871) unblocked `LeafRehydration`.
@@ -164,11 +164,11 @@ implemented in #1871 and #1968 (`427c1376`):
 * `global_atomic_fmin` (#1968) unblocked `PT_LoadInstances`.
 * `buffer_load_ushort` (#1968) unblocked `Box32Rehydration`, `ReloadTriangles`, and the load half of `Box16Rehydration`.
 
-The single remaining untranslated program stops at one rule:
+The last program needed one more rule, which landed in `8f208d09a`:
 
-| module(s) | blocker |
+| module(s) | rule |
 |---|---|
-| `Box16Rehydration` | `buffer_store_short` (#1864) |
+| `Box16Rehydration` | `buffer_store_short` |
 
 Reproduction, after `--extract` above:
 
@@ -182,17 +182,17 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
 
 ## 5. What this changes
 
-* **The RT builder does not need a DXIL path for the console code.** Its programs are RDNA2 `FSSM`, and 51 of
-  52 already pass `spirv-val` with the translator the project uses for the game's 26,503 shaders. The bitcode in
+* **The RT builder does not need a DXIL path for the console code.** Its programs are RDNA2 `FSSM`, and all
+  52 pass `spirv-val` with the translator the project uses for the game's 26,503 shaders. The bitcode in
   the same container is a second representation (the one the PC-compiler experiment measured); it is not what
   the console runtime executes.
-* **The missing rules were small, and only one is left.** `global_atomic_fmax`/`fmin` (6 programs),
-  `buffer_load_ushort` (3) and `tbuffer_load_format_x` with format 8 (1) were ordinary translator rules, not a new
-  compiler backend, and they are on `main`. The one left is `buffer_store_short` (#1864), for `Box16Rehydration`.
+* **The missing rules were small, and none is left.** `global_atomic_fmax`/`fmin` (6 programs),
+  `buffer_load_ushort` (3), `tbuffer_load_format_x` with format 8 (1) and `buffer_store_short` (1,
+  `Box16Rehydration`) were ordinary translator rules, not a new compiler backend, and they are on `main`.
 * **The rehydration programs are the ones closest to the shipped data.** `Box16Rehydration`,
   `Box32Rehydration` and `LeafRehydration` are exactly the programs that would turn the dehydrated BVH packs
   into runtime trees ([bvh.md](bvh.md) §3.1). `LeafRehydration` translates since #1871, `Box32Rehydration`
-  translates since #1968 (`427c1376`), and only `Box16Rehydration` awaits #1864 (`buffer_store_short`).
+  translates since #1968 (`427c1376`), and `Box16Rehydration` since `buffer_store_short` (`8f208d09a`).
 * **What is still open.** None of the 52 has been executed on a GPU; translation and `spirv-val` do not prove the
   output. Which of them the game actually creates is a call-site question (RT-5). The module-to-pipeline order
   above comes from `ILDN`, not from a runtime trace. The `STAT` metadata-only shape is consistent with reflection,
@@ -272,8 +272,8 @@ The last line also gets `--wave64-emulate` and the fallback flags of the build, 
 * **A program without a rule is reported, not skipped.** There is no skip list. After the translation the step
   compares the extraction index with the translation index and logs the counts and the name of every program the
   runtime cannot find (no entry with an `fssm_sha256`, which includes an entry whose metadata failed). It logs them
-  on every run, also when the step is reused. Today that is one line: 51 of 52, `Box16Rehydration`
-  (`buffer_store_short`, #1864). The other 51 are published. When no program translates the step fails and keeps
+  on every run, also when the step is reused. Today it names none: 52 of 52 are published (it named
+  `Box16Rehydration` until `buffer_store_short` was on `main`). When no program translates the step fails and keeps
   no index.
 * **`--max-shared-memory 32768`.** The constructor creates a pipeline for every program and throws at the first
   failure, and the runtime refuses a module over the device's `maxComputeSharedMemorySize` (`E_NOTIMPL`,

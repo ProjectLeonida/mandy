@@ -2056,9 +2056,9 @@ have; add the content hash to the index.
 
 Pipeline creation:
 
-- `D3D12_GRAPHICS_PIPELINE_STATE_DESC` is supported today (`CreateGraphicsPipelineState`), as is the compute desc. The
-  `D3D12_PIPELINE_STATE_STREAM_DESC` subobjects (`CreatePipelineState`) are not implemented yet. The plan: parse the
-  stream subobjects in order; unknown types are a hard error with the type number logged.
+- `D3D12_GRAPHICS_PIPELINE_STATE_DESC` is supported (`CreateGraphicsPipelineState`), as are the compute desc and the
+  `D3D12_PIPELINE_STATE_STREAM_DESC` subobjects (`CreatePipelineState`; "Implemented (D3D-29)" below): the stream's
+  subobjects are parsed in order, and an unknown type is `E_INVALIDARG`.
 - Build `VkPipelineShaderStageCreateInfo` from the translated module and the index entry. Mesh shaders use
   `VK_EXT_mesh_shader` (`AS`/`MS` subobjects → task/mesh stages); geometry uses the geometry stage; compute uses a
   compute pipeline.
@@ -3561,9 +3561,9 @@ own names use the `XDXR` prefix for Xbox's raytracing path:
 
 **The builder's own shaders are console FSSM, not Xbox DXIL.** Each of the 52 containers carries an LLVM
 bitcode blob and an `XDAT`/`XBCH` record; the PC experiment below compiled the bitcode, but the console runtime
-executes the `XBCH` record. Measured from that record: 52/52 unpack to `FSSM`, 51 translate and all 51 pass
-`spirv-val` with the same translator the game's 26,503 shaders use; the one left (`Box16Rehydration`) needs
-`buffer_store_short` (#1864) ([embedded_shaders.md](embedded_shaders.md)). The
+executes the `XBCH` record. Measured from that record: 52/52 unpack to `FSSM`, and all 52 translate and pass
+`spirv-val` with the same translator the game's 26,503 shaders use; the last one, `Box16Rehydration`, since
+`buffer_store_short` landed (`8f208d09a`; [embedded_shaders.md](embedded_shaders.md)). The
 raw 64-bit addresses are the corpus's existing raw-address path, not a separate lowering. Open: whether the game
 uses the builder at all (RT-5) and whether the translated programs match a reference on a GPU.
 
@@ -3573,7 +3573,7 @@ Vulkan AS would be invisible to them. Two paths:
 
 1. If `XboxBvhBuilder` does the build with its own compute dispatches (the likely case, given it ships as a DLL
    with a device and command lists), the layer must translate and run its compute shaders. The console programs
-   are `FSSM` and 51 of the 52 already pass `spirv-val`; only `Box16Rehydration` still needs `buffer_store_short` (#1864). Buffers,
+   are `FSSM` and all 52 pass `spirv-val`. Buffers,
    UAVs, descriptors, barriers and indirect dispatch are necessary but not sufficient. The standard
    `BuildRaytracingAccelerationStructure` calls may never reach our command list.
 2. If the game calls `ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure`, the layer must implement
@@ -3851,7 +3851,7 @@ M0–M2 do not need the executable.
 | **M3** | Depth/stencil, multiple render targets, resource barriers, render passes, occlusion queries, fences, 2–3 frames in flight; run the game's first frames | Real frame structure and the first game code | The game reaches its first rendered frame (loading screen/menu or whatever the executable does) or stops on a single unsupported call with a clean report. **Synthetic part met** by `d3d12_m3_frame_test`: through the proxy, D3D12 API only, six frames through a ring of three slots (three frames in flight; each slot has its own allocator, list, targets, depth buffer, query and fence, and a frame waits with `SetEventOnCompletion` + an event for the fence its slot signalled three frames earlier before reading back and recording the slot again). Pass 1 draws three rectangles from root constants with translator-output shaders (`vs_m3.asm`, `ps_m3.asm`, hand-written RDNA2) through `OMSetRenderTargets` into two render targets (R8G8B8A8_UNORM and R32_FLOAT) and a `D24_UNORM_S8_UINT` depth/stencil buffer (the layer substitutes D32_SFLOAT_S8_UINT on the Radeon; the RTX has it natively): depth LESS with write, stencil REPLACE with references 1 and 2, then a draw with no depth test whose stencil test is EQUAL; before the far rectangle, a single-output probe (`ps_m3_query.asm`) uses the same depth/stencil tests with color, depth and stencil writes disabled, inside `BeginQuery`/`EndQuery(OCCLUSION)`, and `ResolveQueryData` writes its sample count to a readback buffer. The actual far-rectangle draw still writes both render targets with depth/stencil writes enabled. Resource barriers move the first target RENDER_TARGET → PIXEL_SHADER_RESOURCE\|COPY_SOURCE and the second to COPY_SOURCE (and back at the next frame, from resources created in those states). Pass 2 samples the first target through an SRV in a descriptor table (the M2 path) with `ps_m3_post.asm` into a third target. Every pixel of all three targets (the float one bit for bit) matches the CPU reference with error 0 in each of the six frames, and the single-output probe's occlusion count equals the exact visible area of the far rectangle in each frame (3555 samples over the six frames). The original version was validation clean (including synchronization validation) on the AMD Radeon 880M and the RTX 5070 Laptop; current probe/isolation results are recorded below. @whattheflop's run on #1584 (GeForce RTX 3080 and a Ryzen 7 9800X3D Radeon iGPU) sampled the fences with nonblocking reads after each submit and saw 1, 2, 3, 1, 2, 3 slots still incomplete on NVIDIA and 1, 1, 1, 1, 1, 1 on AMD: up to three slots in flight on NVIDIA, one on AMD (sampled fence completion; GPU execution overlap was not measured). **Still open for M3:** render passes (`BeginRenderPass`, D3D-27) are not exercised, nor `BINARY_OCCLUSION`, occlusion during pipeline statistics (D3D-162), MSAA or depth/stencil copies and read-only DSV states in this test; the game's own first frames need the executable |
 | **M4** | Compute PSOs, UAVs, storage images, indirect dispatch, copy queues, async streaming | Asset loading and GPU compute | The world's streaming path runs without device loss; compute results match a CPU/reference check. **Synthetic part met** by `d3d12_m4_compute_test`: through the proxy, D3D12 API only, with translator-output compute shaders (`cs_m4_fill.asm` and `cs_m4_indirect.asm`, hand-written RDNA2). A COPY queue streams an input buffer in (`CopyBufferRegion` from an UPLOAD buffer into a DEFAULT buffer created in COMMON), `Signal`; a COMPUTE queue `Wait`s on it and runs one list: a compute root signature (four root constants and a descriptor table of five UAVs: a structured buffer, three raw buffers and an `R32_UINT` `RWTexture2D`), a compute PSO and `Dispatch` (256 threads) that fills the structured buffer and the image from the input and writes the arguments of the next dispatch into a raw buffer; barriers (the argument buffer to `INDIRECT_ARGUMENT`, UAV barriers on the buffer and the image); `ExecuteIndirect` with a dispatch command signature running a second PSO for the 3 groups the first dispatch asked for, which reads the buffer and the image back (`image_load`) and writes a raw output; then everything to COMMON and `Signal`. A COPY queue `Wait`s on that fence, copies the five results (the image through `CopyTextureRegion`) to a readback buffer, and the CPU waits with `SetEventOnCompletion`. Each D3D12 queue has its own `VkQueue` where the family has two (both test GPUs); all 1,924 result words match the CPU reference with error 0; validation (with synchronization validation) clean on the AMD Radeon 880M and the RTX 5070 Laptop. Layer gaps this test found, closed with it: buffer UAVs (structured and raw) were not written (`CreateUnorderedAccessView` stubbed them, now a V# in the slot); `ExecuteIndirect` of a dispatch ran whatever pipeline and root arguments the command buffer had bound instead of the list's (now recorded with the command, as `Dispatch` does); an image created in `UNORDERED_ACCESS` and first used by a shader was zero-filled by the first barrier or copy that named it, losing the shader's writes (now moved to GENERAL, zeroed, by the first submission after its UAV view is created that is not on a copy queue and dispatches or draws; every other queue's next submission waits for that one); and a queue submitted before the queue whose fence it waits on, when a resource's layout is handed over between them (the layout tracker followed submission order, so a copy list was replayed against the layout from before the compute list ran and the run stopped on a validation error): such a batch is now held on the CPU until a Signal that satisfies its Wait has been submitted, and recorded in dependency order (section 4.4, "Wait before Signal across queues"; `d3d12_queue_handover_test`, every queue-type and submission order, exact against the host runtime). **Still open for M4:** the storage-image initialization is tied to the first shader-running submission, not to the list that uses the image, so a list that only reaches an image through a barrier or copy before any dispatch or draw is submitted still zero-fills it first (as before), and an image used by a shader only on a queue that never runs one of its own dispatches or draws first relies on another queue's submission; buffer SRVs and CBVs as V#s (typed buffer UAVs and UAV counters are done: `d3d12_buffer_uav_test`, section 3.4 "Buffer UAVs"), `ExecuteIndirect` signatures that change root arguments or use count buffers for dispatches, and async streaming itself and the world's streaming path, which need the game |
 | **M5** | Mesh shaders, `ExecuteIndirect`, bindless-table pressure, multi-threaded command lists, pipeline cache | World rendering | A stable open-world frame at any frame rate; then profile and optimise |
-| **M6** | Ray tracing/XDXR: standard AS builds or the shipped `XboxBvhBuilder` compute path; BVH node format; the builder's 52 console `FSSM` programs (51 pass `spirv-val`, one rule left: [embedded_shaders.md](embedded_shaders.md)) | RT shadows and any RT effects | RT output matches a reference; the builder's shaders run through the `FSSM` translator or a substitute; no unknown XDXR call remains |
+| **M6** | Ray tracing/XDXR: standard AS builds or the shipped `XboxBvhBuilder` compute path; BVH node format; the builder's 52 console `FSSM` programs (all 52 translate and pass `spirv-val`: [embedded_shaders.md](embedded_shaders.md)) | RT shadows and any RT effects | RT output matches a reference; the builder's shaders run through the `FSSM` translator or a substitute; no unknown XDXR call remains |
 | **M7** | HDR, VRS, `PresentX` planes (2-plane HDR + GameDVR compose, `ImmediateThresholdPercent`), resize, alt-tab, `SuspendX`/`ResumeX`, frame pacing and `GetFrameStatisticsX` | Presentation polish | HDR and resize work on the target display; no validation errors over a long run. **Partly met:** `ImmediateThresholdPercent` (late frame flipped at once through `VK_KHR/EXT_swapchain_maintenance1` IMMEDIATE/FIFO_RELAXED, section 4.5; checked on the fake-clock decision and on the Vulkan present mode, 0 VUIDs in our runs with `LEONIDA_VK_VALIDATION=1` on two GPUs, no tearing observed on a display; the console's real semantics are unmeasured). **Plane compose** (section 4.5): 1-2 planes scaled from a source rectangle to a destination placement, point or bilinear, plane 1 alpha-blended (premultiplied or straight), filtered and blended in linear light, SDR (sRGB or gamma 2.2) and HDR10 (PQ) planes converted to the swapchain, SDR white from Windows' setting when HDR10 is active (else 203 nits), checked against a CPU model on two GPUs with 0 VUIDs (exact for point filtering, within 1-2 levels for bilinear, alpha, tone map and PQ conversions); the layouts, flag values and alpha convention are ours, the console's plane semantics are unmeasured, and the public HDR sample's second plane is the GameDVR copy, not an overlay. HDR10 swapchain (ST.2084 surface): verified on an RTX 5080 with an HDR10 display by @JavierBlanco23 in #2069, not on AMD (our test displays list no ST.2084 surface); HDR10 on an SDR swapchain is tone mapped (identity below 0.8 of SDR white, Reinhard shoulder above, then clipped per channel). `SuspendX`/`ResumeX`, frame pacing and a minimal `GetFrameStatisticsX` exist; VRS, alt-tab, an AMD HDR10 display run are open |
 
 **M3 occlusion portability (D3D-209).** Vulkan's [occlusion query specification](https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#queries-occlusion)
@@ -3988,16 +3988,11 @@ folded into the table below with the measurement basis noted per row; nothing is
 The builder's 52 compute shaders are a second *corpus*, not a second shader front end. Each container carries an
 LLVM bitcode blob and an `XDAT`/`XBCH` record; the bitcode is what the PC D3D12 compiler experiment consumed
 (44 of 53 rejected, 22 lowered), while the console runtime executes the `XBCH` record. That record decompresses
-to `FSSM`, the same container the game's own compute shaders use: 52/52 unpack, 51 translate and all 51 pass
-`spirv-val` with `tools/rdna2spirv.py`. The one left, `Box16Rehydration`, stops at `buffer_store_short`;
-[embedded_shaders.md](embedded_shaders.md) lists the rules that closed the other nine. The raw 64-bit addresses are the translator's existing raw-address path, so no address-to-resource
-table is needed on top. A port that runs `XboxBvhBuilder` therefore needs the FSSM translator plus one rule,
+to `FSSM`, the same container the game's own compute shaders use: 52/52 unpack, translate and pass
+`spirv-val` with `tools/rdna2spirv.py`; [embedded_shaders.md](embedded_shaders.md) lists the five rules that
+closed the last ten. The raw 64-bit addresses are the translator's existing raw-address path, so no
+address-to-resource table is needed on top. A port that runs `XboxBvhBuilder` therefore needs the FSSM translator,
 not a DXIL front end (a substitute builder remains the alternative).
-`spirv-val` with `tools/rdna2spirv.py`. The single program left (`Box16Rehydration`) stops at `buffer_store_short`
-(#1864); [embedded_shaders.md](embedded_shaders.md) lists it. The raw 64-bit addresses are the translator's
-existing raw-address path, so no address-to-resource table is needed on top. A port that runs `XboxBvhBuilder`
-therefore needs the FSSM translator plus that rule, not a DXIL front end (a substitute builder remains the
-alternative).
 Correctness is still unverified on a GPU and the call sites need the executable (RT-5).
 
 ### 7.3 Licence
@@ -4035,7 +4030,7 @@ nothing is copied from their trees.
 | 4 | Are Xbox descriptor bytes GFX10 T#/S#, and what are the heap increments? Does the game use `Create*View` or build descriptors itself? | Dump a shader-visible heap after the first `CreateShaderResourceView` and after the first draw; compare the bytes the shader loads with the T# parser. The start-handle return ABI is known (RAX); the increment values still need measuring. |
 | 5 | What is the buffer/descriptor/code VA range, and what arena capacity is needed? | Log every `GetGPUVirtualAddress` and every descriptor base; track the high-water mark. Choose a capacity; grow at a frame boundary if needed. |
 | 6 | Which swapchain/present path is used: DXGI, `PresentX`, or both? | **Partly answered from public samples (§4.5):** GDKX samples use `PresentX` + frame events and no DXGI swapchain (DXGI only for `IDXGIDevice1`→adapter→output). Hypothesis for the game, not observed: same. Still open: vtable slots, `D3D12XBOX_*` layouts, and whether the game also creates a swapchain. Check imports and the first present call. Implement the `PresentX` + frame-event presenter first; keep DXGI swapchain as fallback. |
-| 7 | Does the game build acceleration structures through the standard D3D12 calls or through `XboxBvhBuilder`'s own compute path? | Log `BuildRaytracingAccelerationStructure`, `CopyRaytracingAccelerationStructure`, `Emit...PostbuildInfo`, and the builder's command-list method calls on the first RT frame. The builder's container carries a DXIL bitcode blob and a console `XBCH` record; the record is `FSSM` and 51 of 52 programs pass `spirv-val` ([embedded_shaders.md](embedded_shaders.md)). If the builder path is used, translate the `XBCH` record rather than the bitcode. |
+| 7 | Does the game build acceleration structures through the standard D3D12 calls or through `XboxBvhBuilder`'s own compute path? | Log `BuildRaytracingAccelerationStructure`, `CopyRaytracingAccelerationStructure`, `Emit...PostbuildInfo`, and the builder's command-list method calls on the first RT frame. The builder's container carries a DXIL bitcode blob and a console `XBCH` record; the record is `FSSM` and all 52 programs pass `spirv-val` ([embedded_shaders.md](embedded_shaders.md)). If the builder path is used, translate the `XBCH` record rather than the bitcode. |
 | 8 | What are the layouts of `D3D12XBOX_XDXR_STREAM_DESC`, the batched build desc, and the offline statistics desc? | **Measured** from `XboxBvhBuilder.dll`'s reads ([xdxr.md](xdxr.md)): `BATCHED_DESC2` (`0x50`) and `XDXR_STREAM_DESC` (`0x10`) with every field's offset, and the stream records' offsets, types and defaults. Still open: the record names, and the offline statistics layout, which the DLL never writes (it rejects that postbuild type). |
 | 9 | Xbox texture creation is device slot 76 with layout `0x101` (tiled) or `0x1` (row-major). What is the tiled data layout, and does the game upload console-tiled or DCC data? | Trace slot 76, `CopyTextureRegion` and the resource descs. If the game uploads console-tiled data, add a detile step or a matching layout. |
 | 10 | Does the game use binning, DCC, VRS, wave MMA, stream output, tessellation, or amplification shaders? | **Shaders: answered** by `tools/feature_scan.py` over all 26,503 (1.0.2.1): no hull, domain or amplification shader (DXIL program kinds: 2,236 VS, 12,101 PS, 195 GS, 2,689 CS, 9,282 MS); no `WAVE_MMA` or `SHADING_RATE` in any SFI0, and no `v_mfma`/`v_wmma`/`v_smfmac` in the disassembly; no output-signature element on a stream other than 0 (all 195 GS write stream 0 only) and no GDS / `ds_ordered_count` / GWS instruction, so no stream-output path. Also from SFI0: 10 PS need ROVs (pixel interlock), 30 shaders `TILED_RESOURCES` (see #18), 685 `ATOMIC_INT64_ON_TYPED_RESOURCE`. Binning and DCC are not shader-visible; they stay open for the PSO/stream subobjects. |
@@ -4075,8 +4070,8 @@ nothing is copied from their trees.
 - **Xbox tiling/DCC.** Slot 76 and layout `0x101` are known, but the tiled data layout, detile path and DCC remain
   unknown. If the game assumes console tiling or compression metadata, the layer needs a detile/repack step.
 - **BVH builder shaders.** The container's DXIL bitcode is Xbox DXIL that PC drivers reject; its console `XBCH`
-  record is `FSSM`, and 51 of the 52 programs already pass `spirv-val` through the same translator as the game
-  ([embedded_shaders.md](embedded_shaders.md)). The one left needs `buffer_store_short` (#1864). Translation is not execution:
+  record is `FSSM`, and all 52 programs pass `spirv-val` through the same translator as the game
+  ([embedded_shaders.md](embedded_shaders.md)). Translation is not execution:
   there is no GPU reference for any of the 52 yet.
 - **Ray tracing.** The game's RT work includes 64 compute shaders that traverse AMD-format BVH nodes, and it ships
   a BVH builder; a standard D3D12 AS path may also exist. If it is used, the layer must build AMD-format nodes, not
@@ -4217,7 +4212,7 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     prints the reason with the adapter's PCI vendor id. WARP creates all 53 PSOs, and the constructor and destructor
     return.
   - **The runtime itself still shouldn't hand Xbox DXIL to a PC driver.** The same container carries the console
-    `XBCH` record, which decompresses to `FSSM`; 51 of the 52 programs translate and pass `spirv-val` today
+    `XBCH` record, which decompresses to `FSSM`; all 52 programs translate and pass `spirv-val` today
     ([embedded_shaders.md](embedded_shaders.md)). Translating that record is the path that avoids a DXIL lowering
     front end (section 7.2, M6); the bitcode is a second representation.
 - **On the Vulkan device (D3D-557).** With `LEONIDA_BVH_DEVICE=vulkan` the constructor runs on the Vulkan-backed
@@ -4227,8 +4222,10 @@ on a PC device behind the Xbox-ABI proxy). Measured:
   (`E_FAIL` with no library, `E_INVALIDARG` with the game's corpus loaded). With it, on an RTX 3070 (NVIDIA 610.74)
   and on a Ryzen 7 9700X's integrated Radeon (AMD 32.0.21042.62), both with the `--wave64-emulate` translation, 49 of
   the first 50 creations return `S_OK` and the constructor throws `E_INVALIDARG` at #50, `Box16Rehydration`, the one
-  program the translator has no rule for yet (#1864). With that rule applied locally all 53 are created and the
-  constructor and destructor return. Nothing has been dispatched.
+  program the translator had no rule for then. Since that rule, `buffer_store_short`, is on `main` (`8f208d09a`), all
+  53 are created on the Radeon with the emulated modules and the constructor and destructor return
+  ([embedded_shaders.md](embedded_shaders.md) section 7, `main` `8575d36e`; the RTX 3070 was not run again). Nothing
+  has been dispatched.
 
 ### A.3 `amd_fidelityfx_upscaler_xbox.dll`
 
