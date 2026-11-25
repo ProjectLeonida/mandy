@@ -433,6 +433,103 @@ static std::uintptr_t source_tile, peer_tile;
 void aliases_of_test_tile(std::uintptr_t va, std::vector<std::uintptr_t>& peers) {
     if (va == source_tile) peers.push_back(peer_tile);
 }
+// LEONIDA_TITLE_WINDOWS_MB=0: no window fits the cap. A view of the title's memory must then never name the title's
+// raw VA (one GPU read of that loses the device, #1537). The pages here are private, uncopied memory, so no geometry
+// copy backs them either: both views are written zero-size (no base, no records), and a dispatch through one reads
+// zeros, not the title's bytes.
+int check_window_overflow(Context& c) {
+    constexpr UINT64 ring_bytes = 256 * 1024;
+    auto* ring = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, ring_bytes, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(ring);
+    const auto ring_va = reinterpret_cast<std::uint64_t>(ring);
+    EXPECT(ring_va >= c.arena && !(ring_va & 0xFFFF));
+    for (UINT i = 0; i < ring_bytes / 4; ++i) ring[i] = 0xC0000000u + i * 7u;  // never zero
+    auto& aliases = leonida::title_va_aliases();
+    aliases.add_title_memory(ring_va, ring_bytes);
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    Ref<ID3D12DescriptorHeap> heap;
+    EXPECT(SUCCEEDED(c.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    const std::uint64_t cpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 9))(heap.p);
+    const std::uint64_t gpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 10))(heap.p);
+    const UINT inc = c.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC first{ring_va + 0x2000, 256}, second{ring_va + 0x30000, 256};
+    c.device->CreateConstantBufferView(&first, D3D12_CPU_DESCRIPTOR_HANDLE{cpu});
+    c.device->CreateConstantBufferView(&second, D3D12_CPU_DESCRIPTOR_HANDLE{cpu + inc});
+    const auto a = vsharp_base(cpu), b = vsharp_base(cpu + inc);
+    const auto records = [](std::uint64_t at) {
+        std::uint32_t w[4];
+        std::memcpy(w, reinterpret_cast<const void*>(at), sizeof(w));
+        return w[2];
+    };
+    const auto named = [&](std::uint64_t base, std::uint64_t raw) {
+        return base == raw ? "the raw VA" : !base ? "nothing (zero-size)" : base < c.arena ? "the arena" : "elsewhere";
+    };
+    std::printf("window cap 0: views of the title's memory named %s and %s\n", named(a, first.BufferLocation),
+                named(b, second.BufferLocation));
+    EXPECT(a != first.BufferLocation && b != second.BufferLocation);
+    EXPECT(a == 0 && records(cpu) == 0);
+    EXPECT(b == 0 && records(cpu + inc) == 0);
+    EXPECT(aliases.shader_va(first.BufferLocation) == first.BufferLocation);  // no window was made
+
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT}, readback_heap{D3D12_HEAP_TYPE_READBACK};
+    const auto uav = buffer_desc(kBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const auto readback_desc = buffer_desc(kBytes);
+    Ref<ID3D12Resource> out, readback;
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
+                                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                       IID_PPV_ARGS(&out.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                       IID_PPV_ARGS(&readback.p))));
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    EXPECT(SUCCEEDED(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, c.pso,
+                                                 IID_PPV_ARGS(&list.p))));
+    ID3D12DescriptorHeap* heaps[] = {heap.p};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(c.root);
+    list->SetComputeRoot32BitConstant(0, 0, 0);  // the CBV mode of check_title_memory: its first four words
+    list->SetComputeRoot32BitConstant(0, 0, 1);
+    list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu});
+    list->Dispatch(1, 1, 1);
+    D3D12_RESOURCE_BARRIER to_copy{};
+    to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_copy.Transition.pResource = out.p;
+    to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(1, &to_copy);
+    list->CopyBufferRegion(readback.p, 0, out.p, 0, kBytes);
+    EXPECT(list->Close() == S_OK);
+    ID3D12CommandList* lists[] = {list.p};
+    c.queue->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(c.queue) == leonida::ReplayResult::success);
+    EXPECT(SUCCEEDED(c.queue->Signal(c.fence, ++c.fence_value)));
+    EXPECT(SUCCEEDED(c.fence->SetEventOnCompletion(c.fence_value, nullptr)));
+    void* mapped = nullptr;
+    EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+    const auto* got = static_cast<const std::uint32_t*>(mapped);
+    UINT zeros = 0;
+    for (UINT i = 0; i < kElements; ++i) zeros += got[i] == 0;
+    readback->Unmap(0, nullptr);
+    std::printf("window cap 0: a dispatch through the zero-size view read %u/%u zero words\n", zeros, kElements);
+    EXPECT(zeros == kElements);
+    aliases.remove_title_memory(ring_va);
+    VirtualFree(ring, 0, MEM_RELEASE);
+    return 0;
+}
+// These fixtures register their own pairs without XMem. Retire each before Wine can reuse either VA.
+void remove_test_pair(std::uintptr_t gpu, std::uintptr_t cpu) {
+    auto& state = leonida::title_gpu_views::state();
+    std::unique_lock lock(state.mutex);
+    std::erase_if(state.views, [&](const auto& pair) { return pair.gpu == gpu && pair.cpu == cpu; });
+    state.count.store(state.views.size(), std::memory_order_release);
+}
+
 int check_title_memory(Context& c, int& checks, bool geometry) {
     constexpr UINT64 ring_bytes = 256 * 1024;
     auto* ring = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, ring_bytes, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -447,12 +544,12 @@ int check_title_memory(Context& c, int& checks, bool geometry) {
 
     const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT}, readback_heap{D3D12_HEAP_TYPE_READBACK};
     const auto uav = buffer_desc(kBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    Ref<ID3D12Resource> out[3], readback;
+    Ref<ID3D12Resource> out[4], readback;
     for (auto& o : out)
         EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
                                                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                                                            IID_PPV_ARGS(&o.p))));
-    const auto readback_desc = buffer_desc(3 * kBytes);
+    const auto readback_desc = buffer_desc(4 * kBytes);
     EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
                                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                        IID_PPV_ARGS(&readback.p))));
@@ -462,7 +559,8 @@ int check_title_memory(Context& c, int& checks, bool geometry) {
                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         UINT64 address{}, size{};
     } h;
-    if (geometry) {
+    const bool console = geometry || std::getenv("LEONIDA_TEST_CONSOLE_SHADOW");
+    if (console) {
         h.size = 65536;
         h.desc.NumDescriptors = UINT(h.size / 32);
         h.address = reinterpret_cast<UINT64>(VirtualAlloc(nullptr, h.size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -473,7 +571,7 @@ int check_title_memory(Context& c, int& checks, bool geometry) {
     const std::uint64_t cpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 9))(heap.p);
     const std::uint64_t gpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 10))(heap.p);
     const UINT inc = c.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    EXPECT(!geometry || cpu == h.address);
+    EXPECT(!console || cpu == h.address);
     const auto raw_vsharp = [](std::uint64_t address) {
         leonida::gfx10::Buffer b{};
         b.address = address;
@@ -482,6 +580,17 @@ int check_title_memory(Context& c, int& checks, bool geometry) {
         b.oob_select = leonida::gfx10::OobSelect::raw;
         return leonida::gfx10::encode(b);
     };
+    if (!console) {
+        // Unknown high address and a view extending past a real buffer.
+        const auto missing = raw_vsharp((1ull << 46) + 4096);
+        const auto partial = raw_vsharp(out[0]->GetGPUVirtualAddress() + kBytes - 4);
+        auto* words = reinterpret_cast<std::uint32_t*>(cpu + 6 * inc);
+        std::memcpy(words, missing.data(), sizeof(missing));
+        std::memcpy(words + 4, partial.data(), sizeof(partial));
+        aliases.scan_table(gpu + 6 * inc, 1);
+        EXPECT(words[0] == 0 && words[1] == 0 && words[2] == 0 && words[3] == missing[3]);
+        EXPECT(words[4] == 0 && words[5] == 0 && words[6] == 0 && words[7] == partial[3]);
+    }
     // Slot 0: a V# the CPU writes itself, its base in the ring. Slot 1: CreateConstantBufferView of the ring.
     // Slot 2: a raw 64-bit VA (out[2]) for the root-view mode. Slots 3 and 4: the negative controls.
     std::uint64_t guest = ring_va;
@@ -531,7 +640,8 @@ int check_title_memory(Context& c, int& checks, bool geometry) {
     std::uint8_t before3[32], before4[32];
     std::memcpy(before3, reinterpret_cast<const void*>(cpu + 3 * inc), 32);
     std::memcpy(before4, reinterpret_cast<const void*>(cpu + 4 * inc), 32);
-
+    const auto missing = raw_vsharp((1ull << 46) + 4096);
+    std::memcpy(reinterpret_cast<void*>(cpu + 5 * inc), missing.data(), sizeof(missing));
     // The ring's data, written before the submission (after the descriptors, as a title fills its ring per frame).
     for (UINT i = 0; i < ring_bytes / 4; ++i) ring[i] = 0xC0000000u + i * 7u;
     if (geometry) {
@@ -565,13 +675,17 @@ int check_title_memory(Context& c, int& checks, bool geometry) {
     list->SetComputeRootUnorderedAccessView(1, ring_va + 0x3000);
     list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu + 2 * inc});
     list->Dispatch(1, 1, 1);
+    list->SetComputeRoot32BitConstant(0, 0xFFFFFFFAu, 1);  // cs_user_data's descriptor-word mode
+    list->SetComputeRootUnorderedAccessView(1, out[3]->GetGPUVirtualAddress());
+    list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu + 5 * inc});
+    list->Dispatch(1, 1, 1);
     // The negative-control slots are bound too, so the scan reads them.
     list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu + 3 * inc});
     list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu + 4 * inc});
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     list->ResourceBarrier(1, &barrier);
-    for (UINT k = 0; k < 3; ++k) {
+    for (UINT k = 0; k < 4; ++k) {
         D3D12_RESOURCE_BARRIER to_copy{};
         to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         to_copy.Transition.pResource = out[k].p;
@@ -597,9 +711,12 @@ int check_title_memory(Context& c, int& checks, bool geometry) {
         if (got[kElements + i] == ring[0x2000 / 4 + (geometry ? i % 4 : i)]) ++cbv_ok;
         if (got[2 * kElements + i] == ring[0x3000 / 4 + 64 + i] + kRootAdd) ++root_ok;
     }
+    const auto* descriptor = got + 3 * kElements;
+    EXPECT(!descriptor[0] && !descriptor[1] && !descriptor[2] && descriptor[3] == missing[3]);
+    if (console) EXPECT(!std::memcmp(reinterpret_cast<void*>(cpu + 5 * inc), missing.data(), sizeof(missing)));
     readback->Unmap(0, nullptr);
-    const bool rewritten = geometry
-        ? vsharp_base(cpu + 9 * inc) == guest + data_offset  // shader followed the copy; original bytes intact
+    const bool rewritten = console
+        ? vsharp_base(cpu + (geometry ? 9 * inc : 0)) == guest + data_offset  // shader followed the copy; original bytes intact
         : vsharp_base(cpu) != ring_va + data_offset && vsharp_base(cpu) == aliases.shader_va(ring_va + data_offset);
     const bool arena_kept = !std::memcmp(before3, reinterpret_cast<const void*>(cpu + 3 * inc), 32);
     const bool image_kept = !std::memcmp(before4, reinterpret_cast<const void*>(cpu + 4 * inc), 32);
@@ -614,8 +731,7 @@ int check_title_memory(Context& c, int& checks, bool geometry) {
                 static_cast<unsigned long long>(aliases.translated(leonida::TitleVaAliases::root_view) - root_before));
     EXPECT(raw_ok == kElements && cbv_ok == kElements && root_ok == kElements);
     EXPECT(rewritten && arena_kept && image_kept);
-    // Left alone and counted: committed memory that is not the title's (the runtime's own, say), and a title range
-    // with no committed page.
+    // Neither unrelated host memory nor a reserved-only title page has a GPU copy.
     const std::uint64_t untranslated_before = aliases.untranslated(leonida::TitleVaAliases::created_view);
     void* host = VirtualAlloc(nullptr, 65536, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     void* gone = VirtualAlloc(nullptr, 65536, MEM_TOP_DOWN | MEM_RESERVE, PAGE_READWRITE);
@@ -624,24 +740,83 @@ int check_title_memory(Context& c, int& checks, bool geometry) {
     const D3D12_CONSTANT_BUFFER_VIEW_DESC not_title{host_va, 256}, reserved_only{gone_va, 256};
     c.device->CreateConstantBufferView(&not_title, D3D12_CPU_DESCRIPTOR_HANDLE{cpu + 5 * inc});
     c.device->CreateConstantBufferView(&reserved_only, D3D12_CPU_DESCRIPTOR_HANDLE{cpu + 6 * inc});
-    EXPECT(vsharp_base(cpu + 5 * inc) == (host_va & 0xFFFFFFFFFFFFull));
-    EXPECT(vsharp_base(cpu + 6 * inc) == (gone_va & 0xFFFFFFFFFFFFull));
-    EXPECT(aliases.untranslated(leonida::TitleVaAliases::created_view) - untranslated_before == 2);
+    EXPECT(vsharp_base(cpu + 5 * inc) == 0);
+    // A title range with no committed page gets no copy: the view is written with no base and no records (loads
+    // return 0, stores are dropped), never with the raw title address a shader would add heap_base to.
+    EXPECT(vsharp_base(cpu + 6 * inc) == 0);
+    EXPECT(aliases.untranslated(leonida::TitleVaAliases::created_view) == untranslated_before);
+    if (console) heap.reset();
     if (geometry) {
-        heap.reset();
         leonida::geometry_writes::aliases.store(nullptr);
+        remove_test_pair(guest, source_tile);
         UnmapViewOfFile(peer);
         UnmapViewOfFile(primary);
         CloseHandle(section);
-        VirtualFree(reinterpret_cast<void*>(h.address), 0, MEM_RELEASE);
         aliases.remove_title_memory(guest);
         VirtualFree(reinterpret_cast<void*>(guest), 0, MEM_RELEASE);
     }
+    if (console) VirtualFree(reinterpret_cast<void*>(h.address), 0, MEM_RELEASE);
     aliases.remove_title_memory(gone_va);
     aliases.remove_title_memory(ring_va);
     VirtualFree(host, 0, MEM_RELEASE);
     VirtualFree(gone, 0, MEM_RELEASE);
     checks += 4;
+    return 0;
+}
+
+// For a stream pool, the title reserves its CPU view and a GPU-only alias of the
+// same size; both name the same frames. One mapping serves the pool's readable run, and a view naming either address
+// resolves to it, so streamed vertex buffers stop asking for a 128 KiB title window each and no address is left raw.
+int check_stream_pool(Context& c, int& checks) {
+    constexpr UINT64 pool_bytes = 256 * 1024;
+    void* cpu_pages = VirtualAlloc(nullptr, pool_bytes, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void* gpu_alias = VirtualAlloc(nullptr, pool_bytes, MEM_TOP_DOWN | MEM_RESERVE, PAGE_NOACCESS);
+    EXPECT(cpu_pages && gpu_alias);
+    const auto cpu_va = reinterpret_cast<std::uint64_t>(cpu_pages);
+    const auto gpu_va = reinterpret_cast<std::uint64_t>(gpu_alias);
+    EXPECT(cpu_va >= c.arena && gpu_va >= c.arena);
+    // The reservations the xmem shims record, CPU view first (title_gpu_views pairs a GPU-only one with the
+    // CPU-mappable one of the same size made just before it).
+    EXPECT(!leonida::title_gpu_views::note_reservation(cpu_va, pool_bytes, false));  // the CPU twin
+    EXPECT(leonida::title_gpu_views::note_reservation(gpu_va, pool_bytes, true));    // pairs with it
+    auto& aliases = leonida::title_va_aliases();
+    aliases.add_title_memory(cpu_va, pool_bytes);
+    aliases.add_title_memory(gpu_va, pool_bytes);
+    EXPECT(leonida::title_gpu_views::to_host_view(gpu_va + 0x2000, 0x100) == cpu_va + 0x2000);
+
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+                                               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    Ref<ID3D12DescriptorHeap> heap;
+    EXPECT(SUCCEEDED(c.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    const std::uint64_t handle = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 9))(heap.p);
+    const UINT inc = c.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const std::size_t ranges_before = aliases.size();
+    // A view naming the GPU-only alias, then one naming the CPU view of the same bytes.
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC alias_view{gpu_va + 0x2000, 256};
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC cpu_view{cpu_va + 0x2000, 256};
+    c.device->CreateConstantBufferView(&alias_view, D3D12_CPU_DESCRIPTOR_HANDLE{handle});
+    c.device->CreateConstantBufferView(&cpu_view, D3D12_CPU_DESCRIPTOR_HANDLE{handle + inc});
+    const std::uint64_t alias_base = vsharp_base(handle);
+    const std::uint64_t twin_base = vsharp_base(handle + inc);
+    // One mapping, entered for both addresses: the same backing, and no raw address.
+    EXPECT(alias_base != 0 && alias_base != ((gpu_va + 0x2000) & 0xFFFFFFFFFFFFull));
+    EXPECT(alias_base == twin_base);
+    EXPECT(alias_base == (aliases.shader_va(gpu_va + 0x2000) & 0xFFFFFFFFFFFFull));
+    EXPECT(aliases.shader_va(gpu_va + 0x2000) == aliases.shader_va(cpu_va + 0x2000));
+    // Two ranges (the two views' addresses), each a page-aligned run of the pool: one mapping, not one per view.
+    EXPECT(aliases.size() == ranges_before + 2);
+    std::printf("stream pool: GPU-only alias 0x%llx and CPU view 0x%llx share one %llu KiB mapping (V# base "
+                "0x%llx); a second view naming the twin made no mapping\n",
+                static_cast<unsigned long long>(gpu_va), static_cast<unsigned long long>(cpu_va),
+                static_cast<unsigned long long>(pool_bytes >> 10), static_cast<unsigned long long>(alias_base));
+
+    heap.reset();
+    aliases.remove_title_memory(gpu_va);
+    aliases.remove_title_memory(cpu_va);
+    remove_test_pair(gpu_va, cpu_va);
+    VirtualFree(gpu_alias, 0, MEM_RELEASE);
+    VirtualFree(cpu_pages, 0, MEM_RELEASE);
+    checks += 3;
     return 0;
 }
 
@@ -819,6 +994,14 @@ int main(int argc, char** argv) {
     const bool second_device = argc == 2 && std::strcmp(argv[1], "--rebound-second-device") == 0;
     const bool api_copy = api_copy_off || (argc == 2 && std::strcmp(argv[1], "--api-descriptor-copy") == 0);
     const bool rebind = api_copy || mirror_off || second_device || (argc == 2 && std::strcmp(argv[1], "--rebound-tables") == 0);
+    const bool window_cap = argc == 2 && std::strcmp(argv[1], "--window-cap") == 0;
+    if (window_cap) {
+        const char* cap = std::getenv("LEONIDA_TITLE_WINDOWS_MB");
+        if (!cap || std::strcmp(cap, "0")) {
+            std::fprintf(stderr, "FAIL: --window-cap needs LEONIDA_TITLE_WINDOWS_MB=0\n");
+            return 1;
+        }
+    }
     const char* setting = std::getenv("LEONIDA_GEOMETRY_MB");
     const bool geometry = setting && std::atoi(setting) > 0;
     vktest::Device d;
@@ -917,11 +1100,21 @@ int main(int argc, char** argv) {
             EXPECT(d.validation_errors() == 0);
             return 0;
         }
+        if (window_cap) {
+            if (check_window_overflow(c)) return 1;
+            if (d.validation_errors()) {
+                std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+                return 1;
+            }
+            std::printf("title memory past the window cap: the views were zero-size and the shader read zeros\n");
+            return 0;
+        }
         if (geometry && check_declined_imports(c)) return 1;
         if (geometry && check_import_over_shadow(c)) return 1;
         if (check_kind(c, "read-write", PAGE_READWRITE, checks)) return 1;
         if (check_kind(c, "write-combined", PAGE_READWRITE | PAGE_WRITECOMBINE, checks)) return 1;
         if (check_title_memory(c, checks, geometry)) return 1;
+        if (check_stream_pool(c, checks)) return 1;
         if (geometry && std::atoi(setting) == 16 && check_geometry_slab_tails(c)) return 1;
     }
     if (d.validation_errors()) {
