@@ -2905,7 +2905,9 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   copies when the image supports them.
   A CPU-visible, single-sampled colour title image that needs no format conversion uses the staged upload
   if the device, format or image usage lacks host-transfer support, or if the host-transfer image has no
-  compatible memory type. The latter occurs on GTX 1050 Ti for a mapped linear R8 movie plane.
+  compatible memory type. The runtime logs that last case once per Vulkan format. A GTX 1050 Ti on
+  NVIDIA 582.66 reported it for R8_UNORM, R8G8B8A8_UNORM and BC1_RGBA_UNORM_BLOCK.
+  [GTX 1050 Ti test results](https://github.com/ubiquitarianism/leonida/pull/1894#issuecomment-7174515492)
   When both placements are available, an allocation failure on the staged path retries the original
   host-copyable image. `LEONIDA_TITLE_IMAGE_STAGING=0`
   restores the original placement policy. With `LEONIDA_MEM_PROBE`, each title image class logs its

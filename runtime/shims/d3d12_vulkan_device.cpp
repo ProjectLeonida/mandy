@@ -6222,11 +6222,12 @@ public:
                                      origin != TitleImageOrigin::ordinary && format.aspects == VK_IMAGE_ASPECT_COLOR_BIT;
         VkMemoryRequirements with_host{};
         const bool have_host_requirements = can_stage_title && host_transfer_ && device_.memory_requirements(info, with_host);
-        // Pascal accepts HOST_TRANSFER for a linear R8 plane but can give that image no bindable memory type.
+        // A driver can accept HOST_TRANSFER for the image yet give it no bindable memory type.
         if (have_host_requirements && !with_host.memoryTypeBits) {
             info.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
             host_transfer_ = false;
             if (HRESULT hr = device_.check_image_support(info); FAILED(hr)) return hr;
+            log_once("title image has no host-transfer memory type, using staging for Vulkan format", int(info.format));
         }
         // Keep placed movie planes with a known linear CPU layout on the host-copy path, where there is one.
         // Map on a staged placement still returns the title's pages and participates in the refresh.
