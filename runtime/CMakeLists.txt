@@ -834,6 +834,10 @@ if(BUILD_TESTING)
   target_link_libraries(image_memory_test PRIVATE Threads::Threads)
   add_test(NAME image_memory COMMAND image_memory_test)
 
+  # Host-memory import eligibility and memory-type deduplication (runtime/src/host_import_policy.h): pure stdlib.
+  add_executable(host_import_policy_test test/host_import_policy_test.cpp)
+  add_test(NAME host_import_policy COMMAND host_import_policy_test)
+
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
 

@@ -17,6 +17,7 @@
 #include "../src/gfx10_descriptors.h"
 #include "../src/deferred_image_binding.h"
 #include <dxgi1_4.h>
+#include <winioctl.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -617,6 +618,49 @@ int check_title_placed_all(ID3D12Device* device) {
     failures += check_title_placed(device, "section view", view, size, /*may_refuse=*/true);
     UnmapViewOfFile(view);
     CloseHandle(section);
+
+    // Sparse disk-file-backed section (as xmem creates under LEONIDA_XMEM_BACKING_DIR): under Wine/Linux,
+    // long-term pinning of file-backed MAP_SHARED views is refused by the kernel, so slot 133 skips the
+    // host import and serves a shadow buffer directly without provoking kernel pin rejections.
+    {
+        const char* who = "vulkan slot-133 file-backed section";
+        wchar_t temp_dir[MAX_PATH]{}, temp_file[MAX_PATH]{};
+        EXPECT(GetTempPathW(MAX_PATH, temp_dir) != 0);
+        EXPECT(GetTempFileNameW(temp_dir, L"lhi", 0, temp_file) != 0);
+        HANDLE file = CreateFileW(temp_file, GENERIC_READ | GENERIC_WRITE | DELETE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_ALWAYS,
+                                  FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        EXPECT(file != INVALID_HANDLE_VALUE);
+        DWORD ignored = 0;
+        LARGE_INTEGER file_size{};
+        file_size.QuadPart = static_cast<LONGLONG>(size);
+        (void)DeviceIoControl(file, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &ignored, nullptr);
+        EXPECT(SetFilePointerEx(file, file_size, nullptr, FILE_BEGIN) && SetEndOfFile(file));
+        HANDLE file_section = CreateFileMappingW(file, nullptr, PAGE_READWRITE, 0, DWORD(size), nullptr);
+        void* file_view = file_section ? MapViewOfFile(file_section, FILE_MAP_ALL_ACCESS, 0, 0, size) : nullptr;
+        EXPECT(file_view != nullptr);
+        {
+            const std::uint64_t imports_before = rt::d3d12::title_host_imports(device);
+            D3D12_RESOURCE_DESC file_desc{};
+            file_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            file_desc.Width = size;
+            file_desc.Height = file_desc.DepthOrArraySize = file_desc.MipLevels = 1;
+            file_desc.SampleDesc.Count = 1;
+            file_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            Ref<ID3D12Resource> file_buf;
+            EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, file_view, file_desc, 0xFFFFFFFFu,
+                                                               IID_PPV_ARGS(&file_buf.p)),
+                      S_OK);
+            if (hostwine::host_is_wine()) {
+                EXPECT(rt::d3d12::title_host_imports(device) == imports_before);
+                EXPECT(rt::d3d12::title_shadow_buffer(file_buf.p));
+            }
+        }
+        failures += check_title_placed(device, "file-backed section view", file_view, size, /*may_refuse=*/true);
+        UnmapViewOfFile(file_view);
+        CloseHandle(file_section);
+        CloseHandle(file);
+    }
 
     // Cache-modified ranges are not imported (WC imports read wrong bytes on an RTX 5090 in review): a shadow buffer
     // answers at the same VA. Some Wine versions report a requested WC allocation as plain read-write memory; check
