@@ -114,7 +114,7 @@ Useful switches:
   `MicrosoftGame.Config` or `SplashScreen/Image` from `appxmanifest.xml`, preserves the image's aspect ratio and
   uses the same swapchain for PresentX. A surface without readback hands off at the first title present.
   Set `LEONIDA_PACKAGE_SPLASH=0` to disable the splash.
-* `LEONIDA_COMPILE_STATUS=1` reports in-flight Vulkan PSO builds, the age of the oldest, and completed calls on stderr every 10 seconds while builds are active.
+* `LEONIDA_COMPILE_STATUS=1` reports in-flight Vulkan PSO builds, the oldest build's shader name and age, and completed calls on stderr every 10 seconds while builds are active.
 * `LEONIDA_VK_VALIDATION=1` enables the Khronos validation layer with the Vulkan backend (startup overhead; it is a
   diagnostic).
 * `LEONIDA_DEVICE_FAULT=1` enables Vulkan device-loss diagnostics and checkpoints where available. The first

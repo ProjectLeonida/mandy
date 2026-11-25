@@ -12062,7 +12062,7 @@ private:
         VkPipeline pipeline = VK_NULL_HANDLE;
         const auto cache = device_.pipeline_cache();
         const char* program = "-", *fragment = "-";
-        if (leonida::pipeline_profile::enabled()) {
+        if (leonida::pipeline_profile::enabled() || device_.compile_status.enabled()) {
             for (const auto& source : sources_) {
                 if (!source.entry) continue;
                 if (source.slot == 0) program = source.entry->name.c_str();
@@ -12074,7 +12074,7 @@ private:
         const leonida::dev_status::Build dev_build(r.mesh ? "mesh pipeline" : "graphics pipeline");
         const leonida::pipeline_profile::DriverCall profile(r.mesh ? "ms" : "vs", lazy_ ? "lazy" : "eager",
                                                          program, fragment, unbound);
-        const auto result = device_.compile_status.track([&] {
+        const auto result = device_.compile_status.track(program, [&] {
             return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1, &info, nullptr, &pipeline);
         });
         if (status) *status = result;
