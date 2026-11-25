@@ -103,6 +103,11 @@ instruction family per file; the list below describes some of them, not every fi
   constants) through the interpreter, and checks that the words each `.asm` header derives are the ones `check.py`
   and `scripts/run_gpu_tests.py` expect. The two interp fixtures get the constants their vertex shader,
   `vs_interp_consts`, exports.
+- `test_batch5_gpu_fixtures.py` runs the six batch-5 LDS atomic GPU fixtures (`cs_w32_lds_mskor`,
+  `_atomics_incdec`, `_atomics_rtn`, `_minmax_f32`, `_wrxchg_b64`, `_wrxchg2st64_b64`) through the interpreter and
+  checks the eight words each `.asm` header derives against `check.py` and `scripts/run_gpu_tests.py`. They cover
+  `ds_mskor`, the `ds_inc/dec/rsub_u32` and `ds_min/max_f32` boundaries with and without return, and the three
+  64-bit `ds_wrxchg` forms, and were measured on an RDNA2 iGPU (`gfx1036`, RADV).
 - `test_vcmpx_forms.py` runs the 14 `v_cmpx` forms that had no test (`eq`/`gt`/`le`/`lt`/`ngt`/`nle` `_f32`,
   `f_i32`, `t_u32`, `eq`/`gt`/`le` `_i64`, `ge`/`lt`/`ne` `_u64`) in both encodings: each on a table of
   operands (NaN, signed zeros, infinities; 64-bit values that only one word or the sign tells apart), where
