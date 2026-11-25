@@ -6,10 +6,11 @@ on:
   # What can break this build: the runtime and its vendored queue, the scripts the jobs run, this workflow, the
   # line endings every checkout gets (.gitattributes), and everything the tools those scripts read depend on -
   # their sibling imports, the data files they load by name (gfx10_formats.json is one a .py-only scan misses) and
-  # the hw_oracle directory. Any other file under tools/ used to start a full Windows and Wine build it cannot break
-  # (BUILD-856); paths-ignore cannot say "everything under tools/ except these", so the event lists what triggers
-  # it. tests/test_runtime_paths.py recomputes the tools/ part and fails when an entry is missing; keep the two
-  # lists identical.
+  # the hw_oracle directory - and the sources under tools/ that runtime/CMakeLists.txt compiles (tools/conformance,
+  # for vk_present_dump_test). Any other file under tools/ used to start a full Windows and Wine build it cannot
+  # break (BUILD-856); paths-ignore cannot say "everything under tools/ except these", so the event lists what
+  # triggers it. tests/test_runtime_paths.py recomputes the tools/ part and fails when an entry is missing; keep
+  # the two lists identical.
   push:
     branches: [main]
     paths:
@@ -27,6 +28,7 @@ on:
       - "tools/cf_diff.py"
       - "tools/cf_ref.py"
       - "tools/cfg_structure.py"
+      - "tools/conformance/**"
       - "tools/cpu_ref.py"
       - "tools/f32_fuzz.py"
       - "tools/file_mode.py"
@@ -78,6 +80,7 @@ on:
       - "tools/cf_diff.py"
       - "tools/cf_ref.py"
       - "tools/cfg_structure.py"
+      - "tools/conformance/**"
       - "tools/cpu_ref.py"
       - "tools/f32_fuzz.py"
       - "tools/file_mode.py"
