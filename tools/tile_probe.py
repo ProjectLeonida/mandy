@@ -178,6 +178,16 @@ def main():
     if not os.path.exists(a.blob):
         print(f"ERROR: {a.blob}: does not exist", file=sys.stderr)
         return 2
+    # An --offset with no bytes left to probe is a usage error, not a failed probe: exit 2 like the other argument
+    # checks (it used to reach the probe and exit 1 as "no layout fits"). An empty blob at offset 0 is the
+    # exception: the offset is fine there, the sample itself is just too short, so that stays on the result path.
+    size = os.path.getsize(a.blob) if not os.path.isdir(a.blob) else 0
+    if a.offset < 0:
+        print("ERROR: --offset must not be negative", file=sys.stderr)
+        return 2
+    if a.offset >= size and (size or a.offset):
+        print(f"ERROR: --offset {a.offset} is past the end of blob {a.blob} ({size} bytes)", file=sys.stderr)
+        return 2
     if a.out:
         check_preview_path(a.out, a.blob)
     if np is None:
@@ -188,8 +198,6 @@ def main():
             data = f.read()
     except OSError as e:
         raise SystemExit(f"{a.blob}: {e.strerror or e}")
-    if not 0 <= a.offset < len(data):  # a negative offset used to probe the file's tail, one past the end nothing
-        raise SystemExit(f"--offset {a.offset} is outside {a.blob} ({len(data)} bytes)")
     res = probe(data, a.offset)
     if not res:
         # Every candidate needs at least 16 rows of blocks at one of the widths; a short sample used to print
