@@ -731,6 +731,118 @@ int check_stream_pool(Context& c, int& checks) {
     return 0;
 }
 
+// A bottom-level build whose vertices, indices, destination and scratch are all the title's own memory, with no
+// resource over any of it. The builder takes device addresses, so each is translated when the build is recorded: the
+// header the shader reads back at the destination has the triangles' bounds.
+int check_bvh_build(Context& c) {
+    Ref<ID3D12Device5> device5;
+    EXPECT(SUCCEEDED(c.inner->QueryInterface(IID_PPV_ARGS(&device5.p))));
+    constexpr std::uint64_t bytes = 512 * 1024, vertices_at = 0x1000, indices_at = 0x2000, dst_at = 0x20100,
+                            scratch_at = 0x50000;
+    auto* memory = static_cast<std::uint8_t*>(
+        VirtualAlloc(nullptr, bytes, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(memory);
+    const auto va = reinterpret_cast<std::uint64_t>(memory);
+    EXPECT(va >= c.arena && !(va & 0xFFFF));
+    auto& aliases = leonida::title_va_aliases();
+    aliases.add_title_memory(va, bytes);
+    const float vertices[6][3] = {{1, 2, 3}, {4, 2, 3}, {1, 8, 3}, {-5, 0, 1}, {0, 0, 1}, {0, 1, 9}};
+    const std::uint16_t indices[6] = {0, 1, 2, 3, 4, 5};
+    std::memcpy(memory + vertices_at, vertices, sizeof(vertices));
+    std::memcpy(memory + indices_at, indices, sizeof(indices));
+
+    D3D12_RAYTRACING_GEOMETRY_DESC geometry{};
+    geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+    geometry.Triangles.VertexBuffer = {va + vertices_at, sizeof(vertices[0])};
+    geometry.Triangles.VertexCount = 6;
+    geometry.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+    geometry.Triangles.IndexBuffer = va + indices_at;
+    geometry.Triangles.IndexCount = 6;
+    geometry.Triangles.IndexFormat = DXGI_FORMAT_R16_UINT;
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build{};
+    build.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    build.Inputs.NumDescs = 1;
+    build.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    build.Inputs.pGeometryDescs = &geometry;
+    build.DestAccelerationStructureData = va + dst_at;
+    build.ScratchAccelerationStructureData = va + scratch_at;
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
+    device5->GetRaytracingAccelerationStructurePrebuildInfo(&build.Inputs, &info);
+    EXPECT(info.ResultDataMaxSizeInBytes && info.ResultDataMaxSizeInBytes <= scratch_at - dst_at);
+    EXPECT(info.ScratchDataSizeInBytes && info.ScratchDataSizeInBytes <= bytes - scratch_at);
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    Ref<ID3D12DescriptorHeap> heap;
+    EXPECT(SUCCEEDED(c.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    const std::uint64_t cpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 9))(heap.p);
+    const std::uint64_t gpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 10))(heap.p);
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT}, readback_heap{D3D12_HEAP_TYPE_READBACK};
+    const auto uav = buffer_desc(kBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const auto readback_desc = buffer_desc(kBytes);
+    Ref<ID3D12Resource> out, readback;
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
+                                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                       IID_PPV_ARGS(&out.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                       IID_PPV_ARGS(&readback.p))));
+    const std::uint64_t out_va = out->GetGPUVirtualAddress();
+    std::memcpy(reinterpret_cast<void*>(cpu), &out_va, sizeof(out_va));
+
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12GraphicsCommandList4> list4;
+    EXPECT(SUCCEEDED(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, c.pso,
+                                                 IID_PPV_ARGS(&list.p))));
+    EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list4.p))));
+    list4->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+    // Before anything runs: an address left as it was would lose the device.
+    for (const auto at : {vertices_at, indices_at, dst_at, scratch_at}) EXPECT(aliases.shader_va(va + at) != va + at);
+    EXPECT(aliases.shader_va(va + dst_at, info.ResultDataMaxSizeInBytes) != va + dst_at);
+    EXPECT(aliases.shader_va(va + scratch_at, info.ScratchDataSizeInBytes) != va + scratch_at);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    list->ResourceBarrier(1, &barrier);
+    ID3D12DescriptorHeap* heaps[] = {heap.p};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(c.root);
+    // As in check_title_memory: 64 words 256 bytes past the root view's base, plus kRootAdd, to the slot's raw VA.
+    list->SetComputeRoot32BitConstant(0, kRootAdd, 0);
+    list->SetComputeRoot32BitConstant(0, 0xFFFFFFFDu, 1);
+    list->SetComputeRootUnorderedAccessView(1, va + dst_at - 256);
+    list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu});
+    list->Dispatch(1, 1, 1);
+    D3D12_RESOURCE_BARRIER to_copy{};
+    to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_copy.Transition.pResource = out.p;
+    to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(1, &to_copy);
+    list->CopyBufferRegion(readback.p, 0, out.p, 0, kBytes);
+    EXPECT(list->Close() == S_OK);
+    ID3D12CommandList* lists[] = {list.p};
+    c.queue->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(c.queue) == leonida::ReplayResult::success);
+    EXPECT(SUCCEEDED(c.queue->Signal(c.fence, ++c.fence_value)));
+    EXPECT(SUCCEEDED(c.fence->SetEventOnCompletion(c.fence_value, nullptr)));
+    void* mapped = nullptr;
+    EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+    std::uint32_t header[16];
+    for (UINT i = 0; i < 16; ++i) header[i] = static_cast<const std::uint32_t*>(mapped)[i] - kRootAdd;
+    readback->Unmap(0, nullptr);
+    float bounds[6];  // the header's bytes 16 to 39 (xdxr_build.comp: the structure's box)
+    std::memcpy(bounds, header + 4, sizeof(bounds));
+    std::printf("acceleration-structure build in title memory: bounds %g %g %g to %g %g %g\n", bounds[0], bounds[1],
+                bounds[2], bounds[3], bounds[4], bounds[5]);
+    const float expected[6] = {-5, 0, 1, 4, 8, 9};
+    for (int i = 0; i < 6; ++i) EXPECT(bounds[i] == expected[i]);
+    // `memory` stays reserved: its windows stay in the alias table, so a later check must not be given its addresses.
+    return 0;
+}
+
 // Four 4 MiB slabs fill the 16 MiB fixture budget. A final 1 MiB view still fits
 // immediately after the 3 MiB view in the second slab.
 int check_geometry_slab_tails(Context& c) {
@@ -939,6 +1051,7 @@ int main(int argc, char** argv) {
         info.queue = d.queue;
         info.queue_family = d.family;
         info.buffer_device_address = true;
+        info.xdxr_acceleration_structures = true;
         if (geometry) info.host_pointer_alignment = d.host_pointer_alignment;
         info.subgroup = d.subgroup;
         info.shader_dir = library.string();
@@ -1008,6 +1121,9 @@ int main(int argc, char** argv) {
         if (check_kind(c, "read-write", PAGE_READWRITE, checks)) return 1;
         if (check_kind(c, "write-combined", PAGE_READWRITE | PAGE_WRITECOMBINE, checks)) return 1;
         if (check_title_memory(c, checks, geometry)) return 1;
+        // Before the stream pool: its ranges stay in the alias table after it is freed, so two parts of a block allocated
+        // at its addresses would share one copy.
+        if (!geometry && check_bvh_build(c)) return 1;
         if (check_stream_pool(c, checks)) return 1;
         if (geometry && std::atoi(setting) == 16 && check_geometry_slab_tails(c)) return 1;
     }
