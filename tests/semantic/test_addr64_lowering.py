@@ -90,6 +90,13 @@ def global_program(base, offset):
 
 # (heap base, VGPR address, signed offset): a negative offset across the low-word boundary, and a positive one.
 GLOBAL_CASES = [(0x1000, 0x1_0000_0000, -4), (0x1000, 0x2000, -2048), (0x1_FFFF_FFF0, 0x20, 2044)]
+# A VGPR address with bit 47 set is a negative 48-bit VA (Gen.host_addr sign-extends it: shifts by 16 both ways, which
+# the lowering turns into the two words' shifts), so it reads below the heap base.
+NEGATIVE_48_CASES = [(0x1_0000_0000, 0xFFFF_FFFF_FFF0, 8), (0x2_0000_1000, 0x8000_0000_0000, 0)]
+
+
+def sext48(va):
+    return va - (1 << 48) if va & (1 << 47) else va
 
 
 class AddressLoweringTests(unittest.TestCase):
@@ -132,6 +139,18 @@ class AddressLoweringTests(unittest.TestCase):
                 want = run(translate("cs_a64_glo_ref", global_program(base, offset), lowered=False), heap, memory)
                 got = run(lowered, heap, memory)
                 self.assertEqual(want[heap & M64], MAGIC)
+                self.assertEqual(got, want)
+
+    def test_negative_48_bit_address_same_as_the_int64_form(self):
+        for heap, base, offset in NEGATIVE_48_CASES:
+            with self.subTest(heap=hex(heap), base=hex(base), offset=offset):
+                addr = (heap + sext48(base) + offset) & M64
+                memory = {addr: MAGIC, (addr + 4) & M64: 0x0BAD0004, (addr - 4) & M64: 0x0BAD0000}
+                lowered = translate("cs_a64_neg", global_program(base, offset))
+                self.assertNotIn("OpCapability Int64", lowered)
+                want = run(translate("cs_a64_neg_ref", global_program(base, offset), lowered=False), heap, memory)
+                got = run(lowered, heap, memory)
+                self.assertEqual(want[heap & M64], MAGIC)     # the reference read below the heap base
                 self.assertEqual(got, want)
 
     def test_dropping_the_carry_is_caught(self):

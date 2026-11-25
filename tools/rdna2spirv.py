@@ -16777,12 +16777,14 @@ def assemble(gen):
 # Every PhysicalStorageBuffer address the generator builds is one idiom: widen a 32-bit word (OpUConvert), shift a
 # high word left by 32, OR, add or subtract (64-bit constants included), AND a mask, take a word back (narrow to
 # 32 bits, or shift right by 32), sign-extend a dword (the signed offset of a global_* access) and shift it right
-# arithmetically by 32, compare two such values (the NUM_RECORDS bound), convert to a pointer. A shader
+# arithmetically by 32, shift by 1..31 either way (host_addr's 48-bit sign extension: left and then arithmetically
+# right by 16), compare two such values (the NUM_RECORDS bound), convert to a pointer. A shader
 # whose only 64-bit integers are that idiom doesn't need the Int64 capability (Vulkan shaderInt64, which Intel's
 # drivers lack, #313): lower_addr64 rewrites it to (low, high) pairs of 32-bit words, OpIAddCarry / OpISubBorrow
 # carrying into the high word, compares high word first, and bitcasts the pair (a uvec2) to the pointer, as
-# GL_EXT_buffer_reference_uvec2 does. A shader with any other 64-bit integer use (64-bit multiplies, shifts by other
-# amounts, a 64-bit OpPhi or variable) is left exactly as it was and keeps Int64. --int64-addresses turns the lowering off.
+# GL_EXT_buffer_reference_uvec2 does. A shader with any other 64-bit integer use (64-bit multiplies, shifts by a
+# variable amount or by more than 32, a 64-bit OpPhi or variable) is left exactly as it was and keeps Int64.
+# --int64-addresses turns the lowering off.
 _A64_PRODUCERS = ("OpUConvert", "OpShiftLeftLogical", "OpShiftRightLogical", "OpBitwiseOr", "OpBitwiseAnd", "OpIAdd",
                   "OpISub", "OpSConvert", "OpBitcast", "OpShiftRightArithmetic")
 # 64-bit compares of two addresses: high words first, then the low words.
@@ -16794,7 +16796,7 @@ _A64_ID = re.compile(r"%[\w.]+")
 
 def lower_addr64(text):
     lines = text.split("\n")
-    t64, c64, prod, conv, cmp, narrow, rtype = set(), {}, {}, {}, {}, {}, {}
+    t64, c64, c32, prod, conv, cmp, narrow, rtype = set(), {}, {}, {}, {}, {}, {}, {}
     for line in lines:
         w = line.split()
         if len(w) < 3 or w[1] != "=":
@@ -16806,6 +16808,8 @@ def lower_addr64(text):
             t64.add(res)
         elif op == "OpConstant" and args and args[0] in t64:
             c64[res] = int(args[1]) & 0xFFFFFFFFFFFFFFFF
+        elif op == "OpConstant" and args[:1] == ["%uint"] and len(args) == 2:
+            c32[res] = int(args[1]) & 0xFFFFFFFF        # a shift amount may be a 32-bit constant
         elif op in _A64_PRODUCERS and args and args[0] in t64:
             prod[res] = (op, args[1:])
         elif op == "OpUConvert" and args[:1] == ["%uint"] and len(args) == 2:
@@ -16817,6 +16821,8 @@ def lower_addr64(text):
     if not t64:
         return text
     v64 = set(c64) | set(prod)
+    # a shift's amount: a 64-bit or 32-bit constant of 1..32 (the 48-bit sign extension of host_addr shifts by 16)
+    shift = {r: v for r, v in {**c32, **c64}.items() if 1 <= v <= 32}
     narrow = {r: v for r, v in narrow.items() if v in v64}
     for res, (op, a) in list(cmp.items()):       # a compare of two 64-bit values; any other compare is left alone
         if a[0] not in v64 and a[1] not in v64:
@@ -16828,7 +16834,7 @@ def lower_addr64(text):
               rtype.get(a[0]) in ("%uint", "%int")) or \
              (op == "OpBitcast" and len(a) == 1 and a[0] in v64) or \
              (op in ("OpShiftLeftLogical", "OpShiftRightLogical", "OpShiftRightArithmetic") and len(a) == 2 and
-              a[0] in v64 and c64.get(a[1]) == 32) or \
+              a[0] in v64 and a[1] in shift) or \
              (op in ("OpBitwiseOr", "OpBitwiseAnd", "OpIAdd", "OpISub") and len(a) == 2 and a[0] in v64 and
               a[1] in v64)
         if not ok:
@@ -16859,11 +16865,11 @@ def lower_addr64(text):
                 pair[res] = (a[0], const(0))
             elif op == "OpBitcast":                      # between the 64-bit integer types: the same words
                 pair[res] = pair[a[0]]
-            elif op == "OpShiftLeftLogical":
+            elif op == "OpShiftLeftLogical" and shift[a[1]] == 32:
                 pair[res] = (const(0), pair[a[0]][0])
-            elif op == "OpShiftRightLogical":
+            elif op == "OpShiftRightLogical" and shift[a[1]] == 32:
                 pair[res] = (pair[a[0]][1], const(0))
-            elif op in ("OpSConvert", "OpShiftRightArithmetic"):
+            elif op == "OpSConvert" or (op == "OpShiftRightArithmetic" and shift[a[1]] == 32):
                 # A sign-extended dword (a 32-bit value widened, or the arithmetic shift by 32, which keeps the high
                 # word and sign-extends it): the high word is the sign, the value shifted right arithmetically by 31.
                 n += 1
@@ -16883,6 +16889,26 @@ def lower_addr64(text):
                 out += [f"         {p}s = OpShiftRightArithmetic %int {signed} {const(31)}",
                         f"         {p}h = OpBitcast %uint {p}s"]
                 pair[res] = (low, p + "h")
+            elif op in ("OpShiftLeftLogical", "OpShiftRightLogical", "OpShiftRightArithmetic"):
+                # A shift by k of 1..31: each word takes the bits the other word shifts across (32 - k of them).
+                n += 1
+                (xl, xh), k, p = pair[a[0]], shift[a[1]], f"%a64_{n}"
+                if op == "OpShiftLeftLogical":
+                    out += [f"         {p}l = OpShiftLeftLogical %uint {xl} {const(k)}",
+                            f"         {p}a = OpShiftLeftLogical %uint {xh} {const(k)}",
+                            f"         {p}b = OpShiftRightLogical %uint {xl} {const(32 - k)}",
+                            f"         {p}h = OpBitwiseOr %uint {p}a {p}b"]
+                else:
+                    out += [f"         {p}a = OpShiftRightLogical %uint {xl} {const(k)}",
+                            f"         {p}b = OpShiftLeftLogical %uint {xh} {const(32 - k)}",
+                            f"         {p}l = OpBitwiseOr %uint {p}a {p}b"]
+                    if op == "OpShiftRightLogical":
+                        out.append(f"         {p}h = OpShiftRightLogical %uint {xh} {const(k)}")
+                    else:
+                        out += [f"         {p}i = OpBitcast %int {xh}",
+                                f"         {p}s = OpShiftRightArithmetic %int {p}i {const(k)}",
+                                f"         {p}h = OpBitcast %uint {p}s"]
+                pair[res] = (p + "l", p + "h")
             else:
                 n += 1
                 (xl, xh), (yl, yh), p = pair[a[0]], pair[a[1]], f"%a64_{n}"
