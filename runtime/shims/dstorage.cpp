@@ -36,6 +36,7 @@
 #include "../src/bcpack.h"
 #include "../src/guarded_copy.h"
 #include "../src/shader_directory.h"
+#include "io_trace.h"  // LEONIDA_IO_TRACE
 #include "../src/dstorage_swizzle.h"
 #include "../src/dstorage_trace.h"
 #include "dstorage_xs_abi.h"
@@ -639,6 +640,20 @@ public:
                 if (!e.file) e.enqueue_error = E_DSTORAGE_INVALID_FILE_HANDLE;
             }
             e.counted = true;  // TotalRequestCount is "submitted requests" (DSTORAGE_PRIORITY_STATS): see submit_locked
+            if (rt::io_trace::enabled()) {
+                const bool from_file = options::source_type(o) == DSTORAGE_REQUEST_SOURCE_FILE;
+                std::string path = "<memory>";
+                if (from_file && e.file) {
+                    const std::wstring& w = e.file->path();
+                    const int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), int(w.size()), nullptr, 0, nullptr, nullptr);
+                    path.assign(size_t(len), ' ');
+                    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), int(w.size()), path.data(), len, nullptr, nullptr);
+                }
+                rt::io_trace::line("ds %s off=0x%llx src=%u dst=%u zlib=%d bcpack=%llu name=%s", path.c_str(),
+                                   from_file ? (unsigned long long)e.request.FileOffset : 0ull, e.request.SourceSize,
+                                   e.request.DestinationSize, int(options::zlib(o)),
+                                   (unsigned long long)options::bcpack(o), rt::io_trace::safe_name(e.request.Name).c_str());
+            }
         }
         enqueue(std::move(e));
     }
