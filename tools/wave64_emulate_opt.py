@@ -186,6 +186,9 @@ _MASK_CHK_WORD_READER = 1
 _MASK_CHK_MBCNT = 2
 _MASK_CHK_SCMP = 3
 _MASK_CHK_SCC_VOTE = 4
+_MASK_CHK_B32_MOV = 5
+_MASK_CHK_B32_LOGIC = 6
+_MASK_CHK_B32_CSELECT = 7
 
 # 4-bit dirty-state bitmask: bit0=("mem","r"), bit1=("mem","w"), bit2=("lds","r"), bit3=("lds","w")
 _DIRTY_MEM_R = 1
@@ -331,6 +334,12 @@ def _get_op_meta(raw_op):
         mask_chk = _MASK_CHK_SCMP
     elif op in _MASK_SCC_VOTE_OPS:
         mask_chk = _MASK_CHK_SCC_VOTE
+    elif op == "s_mov_b32":
+        mask_chk = _MASK_CHK_B32_MOV
+    elif op in _SOP2_B32_LOGIC:
+        mask_chk = _MASK_CHK_B32_LOGIC
+    elif op == "s_cselect_b32":
+        mask_chk = _MASK_CHK_B32_CSELECT
     else:
         mask_chk = _MASK_CHK_NONE
 
@@ -833,6 +842,103 @@ def _is_mask_op(ins, x, lm_map):
     return _has_vcc_or_exec(x)
 
 
+def _mask_half(x, lm_map):
+    """Matches Gen.mask_half (wave64) in tools/rdna2spirv.py: return 'lo', 'hi', or None."""
+    k = x.get("k")
+    if k == "special":
+        t = x.get("t", "")
+        if t in ("exec_lo", "vcc_lo"):
+            return "lo"
+        if t in ("exec_hi", "vcc_hi"):
+            return "hi"
+        return None
+    if k == "sgpr" and x.get("n", 1) == 1:
+        mk = lm_map.get(x["r"])
+        if mk == _lane_masks.MASK_LO:
+            return "lo"
+        if mk == _lane_masks.MASK_HI:
+            return "hi"
+    return None
+
+
+def _mask_b32_dst_half(d, srcs, ins, lm_map):
+    """Matches Gen._mask_b32_dst_half (wave64) in tools/rdna2spirv.py: return (to_mask_dst, half)."""
+    if d.get("k") != "special":
+        return False, None
+    t = d.get("t", "")
+    if t in ("exec_lo", "exec_hi"):
+        return True, "hi" if t == "exec_hi" else "lo"
+    if t in ("vcc_lo", "vcc_hi") and ("vcc" in lm_map or any(_holds_lane_mask(ins, s, lm_map) for s in srcs)):
+        return True, "hi" if t == "vcc_hi" else "lo"
+    return False, None
+
+
+def _mask_chk_may_barrier(ins, meta, lane_masks, scc_live):
+    """True iff `ins` (with non-zero `meta[11]`) may emit wave_mask / wave_equal / g_vote under --wave64-emulate."""
+    mask_chk = meta[11]
+    a = ins["args"]
+    if mask_chk == _MASK_CHK_SCC_VOTE:
+        op = meta[0]
+        if op.endswith("_b32") and op in _ALL_SAVEEXEC_WREXEC:
+            # In wave64, s_*_saveexec_b32 / s_*_wrexec_b32 operate on EXEC_LO and collect an opposite-half
+            # wave_mask when the source is in the high half or the saved destination is exec_hi/vcc_hi,
+            # independent of SCC liveness (rdna2spirv.py).
+            if a and a[0].get("k") == "special" and a[0].get("t") in ("exec_hi", "vcc_hi"):
+                return True
+            if len(a) >= 2:
+                lm = lane_masks.get(id(ins), {})
+                if _holds_lane_mask(ins, a[1], lm) and _mask_half(a[1], lm) == "hi":
+                    return True
+        if not scc_live or id(ins) not in scc_live:
+            return False
+        if (meta[8] & _FLAG_SCC_VOTE_ALWAYS_MASK) or (bool(a) and _has_vcc_or_exec(a[0])):
+            return True
+        lm = lane_masks.get(id(ins), {})
+        return any(_is_mask_op(ins, x, lm) for x in a[1:])
+    if mask_chk == _MASK_CHK_B32_MOV:
+        if len(a) < 2:
+            return False
+        lm = lane_masks.get(id(ins), {})
+        to_mask_dst, dst_half = _mask_b32_dst_half(a[0], a[1:2], ins, lm)
+        return (to_mask_dst and dst_half is not None
+                and _holds_lane_mask(ins, a[1], lm) and _mask_half(a[1], lm) not in (None, dst_half))
+    if mask_chk == _MASK_CHK_B32_CSELECT:
+        if len(a) < 3:
+            return False
+        lm = lane_masks.get(id(ins), {})
+        srcs = a[1:3]
+        to_mask_dst, dst_half = _mask_b32_dst_half(a[0], srcs, ins, lm)
+        return (to_mask_dst and dst_half is not None and all(_lane_masks._maskable_b32(s) for s in srcs)
+                and any(_holds_lane_mask(ins, s, lm) and _mask_half(s, lm) not in (None, dst_half) for s in srcs))
+    if mask_chk == _MASK_CHK_B32_LOGIC:
+        if len(a) < 2:
+            return False
+        lm = lane_masks.get(id(ins), {})
+        srcs = a[1:2] if meta[0] == "s_not_b32" else a[1:3]
+        to_mask_dst, dst_half = _mask_b32_dst_half(a[0], srcs, ins, lm)
+        if (to_mask_dst and dst_half is not None and all(_lane_masks._maskable_b32(s) for s in srcs)
+                and any(_holds_lane_mask(ins, s, lm) and _mask_half(s, lm) not in (None, dst_half) for s in srcs)):
+            return True
+        if scc_live and id(ins) in scc_live:
+            if to_mask_dst:
+                return True
+            mask_srcs = [s for s in srcs if _holds_lane_mask(ins, s, lm)]
+            if mask_srcs:
+                halves = {_mask_half(s, lm) for s in mask_srcs} - {None}
+                if len(halves) <= 1:
+                    return True
+        return False
+    if mask_chk == _MASK_CHK_WORD_READER:
+        return len(a) > 1 and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {}))
+    if mask_chk == _MASK_CHK_MBCNT:
+        return len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {}))
+    # _MASK_CHK_SCMP
+    lm = lane_masks.get(id(ins), {})
+    return any(_holds_lane_mask(ins, x, lm) or
+               (meta[0] in ("s_cmp_eq_u64", "s_cmp_lg_u64") and _has_any_lane_mask_word(x, lm))
+               for x in a)
+
+
 def _is_exec_op_arg(x):
     return x.get("k") == "special" and x.get("t", "") == "exec"
 
@@ -923,29 +1029,10 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
                 if sacc[1]:
                     mem_w = True
 
-        # 2. Cross-lane mask readers (`wave_mask`, `wave_equal`, live-SCC `scc_from_mask`).
+        # 2. Cross-lane mask readers (`wave_mask`, `wave_equal`, live-SCC `scc_from_mask`/`scc_logic`).
         a = ins["args"]
-        mask_chk = m[11]
-        if mask_chk:
-            if mask_chk == _MASK_CHK_SCC_VOTE:
-                if has_scc_live and id(ins) in scc_live:
-                    if (flags & _FLAG_SCC_VOTE_ALWAYS_MASK) or (bool(a) and _has_vcc_or_exec(a[0])):
-                        return False, _EMPTY_MEM_STATS, 0, (), ()
-                    lm = lane_masks.get(id(ins), {})
-                    if any(_is_mask_op(ins, x, lm) for x in a[1:]):
-                        return False, _EMPTY_MEM_STATS, 0, (), ()
-            elif mask_chk == _MASK_CHK_WORD_READER:
-                if len(a) > 1 and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {})):
-                    return False, _EMPTY_MEM_STATS, 0, (), ()
-            elif mask_chk == _MASK_CHK_MBCNT:
-                if len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {})):
-                    return False, _EMPTY_MEM_STATS, 0, (), ()
-            else:  # _MASK_CHK_SCMP
-                lm = lane_masks.get(id(ins), {})
-                if any(_holds_lane_mask(ins, x, lm) or
-                       (m[0] in ("s_cmp_eq_u64", "s_cmp_lg_u64") and _has_any_lane_mask_word(x, lm))
-                       for x in a):
-                    return False, _EMPTY_MEM_STATS, 0, (), ()
+        if m[11] and _mask_chk_may_barrier(ins, m, lane_masks, scc_live if has_scc_live else None):
+            return False, _EMPTY_MEM_STATS, 0, (), ()
 
         # 3. Track scalar writes and EXEC writes.
         _, ins_mw, _ = _scalar_rw_with_meta(ins, m)
@@ -1292,32 +1379,9 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                         mem_w = True
 
             a = ins["args"]
-            mask_chk = m[11]
-            if mask_chk:
-                if mask_chk == _MASK_CHK_SCC_VOTE:
-                    if has_scc_live and id(ins) in scc_live:
-                        if (flags & _FLAG_SCC_VOTE_ALWAYS_MASK) or (bool(a) and _has_vcc_or_exec(a[0])):
-                            clean = False
-                            continue
-                        lm = lane_masks.get(id(ins), {})
-                        if any(_is_mask_op(ins, x, lm) for x in a[1:]):
-                            clean = False
-                            continue
-                elif mask_chk == _MASK_CHK_WORD_READER:
-                    if len(a) > 1 and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {})):
-                        clean = False
-                        continue
-                elif mask_chk == _MASK_CHK_MBCNT:
-                    if len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {})):
-                        clean = False
-                        continue
-                else:  # _MASK_CHK_SCMP
-                    lm = lane_masks.get(id(ins), {})
-                    if any(_holds_lane_mask(ins, x, lm) or
-                           (m[0] in ("s_cmp_eq_u64", "s_cmp_lg_u64") and _has_any_lane_mask_word(x, lm))
-                           for x in a):
-                        clean = False
-                        continue
+            if m[11] and _mask_chk_may_barrier(ins, m, lane_masks, scc_live if has_scc_live else None):
+                clean = False
+                continue
 
             may_w |= ins_mw
             s_bits = ins_mw & _ALL_SGPRS
@@ -1521,8 +1585,8 @@ def _is_uniform_scc_safe(active_blocks, lane_masks, scc_live):
                 continue
             a = ins["args"]
             lm = lane_masks.get(ins_id, {})
-            writes_exec = bool(a) and a[0].get("k") == "special" and a[0].get("t", "").startswith("exec")
-            if writes_exec or any(_holds_lane_mask(ins, x, lm) for x in a[1:]):
+            to_mask_dst, _ = _mask_b32_dst_half(a[0], a[1:], ins, lm) if a else (False, None)
+            if to_mask_dst or any(_holds_lane_mask(ins, x, lm) for x in a[1:]):
                 return False
     return True
 
@@ -1533,25 +1597,9 @@ def _insn_may_barrier_with_meta(ins, meta, lane_masks, scc_live):
     flags = meta[8]
     if flags & _FLAG_ALWAYS_BARRIER or _vcc_pair_collects_mask(ins, lane_masks):
         return True
-    mask_chk = meta[11]
-    if not mask_chk:
+    if not meta[11]:
         return False
-    a = ins["args"]
-    if mask_chk == _MASK_CHK_SCC_VOTE:
-        if not scc_live or id(ins) not in scc_live:
-            return False
-        if (flags & _FLAG_SCC_VOTE_ALWAYS_MASK) or (bool(a) and _has_vcc_or_exec(a[0])):
-            return True
-        lm = lane_masks.get(id(ins), {})
-        return any(_is_mask_op(ins, x, lm) for x in a[1:])
-    if mask_chk == _MASK_CHK_WORD_READER:
-        return len(a) > 1 and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {}))
-    if mask_chk == _MASK_CHK_MBCNT:
-        return len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {}))
-    lm = lane_masks.get(id(ins), {})
-    return any(_holds_lane_mask(ins, x, lm) or
-               (meta[0] in ("s_cmp_eq_u64", "s_cmp_lg_u64") and _has_any_lane_mask_word(x, lm))
-               for x in a)
+    return _mask_chk_may_barrier(ins, meta, lane_masks, scc_live)
 
 
 def _insn_may_barrier(ins, lane_masks, scc_live):

@@ -594,5 +594,200 @@ class DsNopOrderTests(unittest.TestCase):
                 self.assertEqual(mem[512 + l * 4], 900 + l, f"v5 w1 l={l} rev={rev}")
 
 
+class B32MaskBarrierTests(unittest.TestCase):
+    def _insn(self, op, args):
+        return {"op": op, "args": args, "mods": [], "enc": None, "pc": 0}
+
+    def test_unit_b32_opposite_half_and_live_scc_prediction(self):
+        vcc_lo = {"k": "special", "t": "vcc_lo"}
+        vcc_hi = {"k": "special", "t": "vcc_hi"}
+        exec_lo = {"k": "special", "t": "exec_lo"}
+        exec_hi = {"k": "special", "t": "exec_hi"}
+        s6 = {"k": "sgpr", "r": 6, "n": 1}
+        s7 = {"k": "sgpr", "r": 7, "n": 1}
+        s10 = {"k": "sgpr", "r": 10, "n": 1}
+        s12 = {"k": "sgpr", "r": 12, "n": 1}
+        lm_vcc = {"vcc": "mask", 6: "mask_lo", 7: "mask_hi"}
+
+        cases = [
+            # s_mov_b32: opposite-half mask destination emits wave_mask even with dead SCC
+            ("s_mov_b32", [vcc_lo, vcc_hi], lm_vcc, False, True),
+            ("s_mov_b32", [vcc_lo, s7], lm_vcc, False, True),
+            ("s_mov_b32", [exec_lo, vcc_hi], lm_vcc, False, True),
+            ("s_mov_b32", [vcc_hi, exec_lo], {}, False, True),
+            ("s_mov_b32", [vcc_lo, vcc_lo], lm_vcc, False, False),
+            ("s_mov_b32", [vcc_lo, s6], lm_vcc, False, False),
+            ("s_mov_b32", [vcc_lo, s10], {}, False, False),
+            # s_cselect_b32: opposite-half mask source emits wave_mask even with dead SCC
+            ("s_cselect_b32", [vcc_lo, vcc_hi, s10], lm_vcc, False, True),
+            ("s_cselect_b32", [vcc_lo, s10, s7], lm_vcc, False, True),
+            ("s_cselect_b32", [vcc_lo, vcc_lo, s10], lm_vcc, False, False),
+            # _SOP2_B32_LOGIC: opposite-half emits wave_mask regardless of SCC; live SCC votes on mask ops
+            ("s_and_b32", [vcc_lo, vcc_hi, s10], lm_vcc, False, True),
+            ("s_and_b32", [vcc_lo, s7, s10], lm_vcc, False, True),
+            ("s_not_b32", [vcc_lo, vcc_hi], lm_vcc, False, True),
+            ("s_not_b32", [vcc_lo, vcc_lo], lm_vcc, False, False),
+            ("s_not_b32", [vcc_lo, vcc_lo], lm_vcc, True, True),
+            ("s_and_b32", [vcc_lo, vcc_lo, s10], lm_vcc, False, False),
+            ("s_and_b32", [vcc_lo, vcc_lo, s10], lm_vcc, True, True),
+            ("s_and_b32", [s12, vcc_lo, s10], lm_vcc, False, False),
+            ("s_and_b32", [s12, vcc_lo, s10], lm_vcc, True, True),
+            ("s_or_b32", [s12, s10, s10], {}, True, False),
+            # saveexec_b32 / wrexec_b32: high-half source or high-half special dst emits wave_mask even when SCC is dead
+            ("s_and_saveexec_b32", [s10, vcc_hi], lm_vcc, False, True),
+            ("s_and_saveexec_b32", [s10, s7], lm_vcc, False, True),
+            ("s_and_saveexec_b32", [vcc_hi, s6], lm_vcc, False, True),
+            ("s_and_saveexec_b32", [exec_hi, s6], lm_vcc, False, True),
+            ("s_andn1_wrexec_b32", [s10, vcc_hi], lm_vcc, False, True),
+            ("s_andn1_wrexec_b32", [vcc_hi, s6], lm_vcc, False, True),
+            ("s_and_saveexec_b32", [s10, s6], lm_vcc, False, False),
+            ("s_and_saveexec_b32", [s10, s6], lm_vcc, True, True),
+        ]
+        for op, args, lm, scc_live_flag, want in cases:
+            ins = self._insn(op, args)
+            lm_map = {id(ins): lm}
+            scc_live = {id(ins)} if scc_live_flag else set()
+            self.assertEqual(
+                wave64_emulate_opt._insn_may_barrier(ins, lm_map, scc_live),
+                want,
+                f"_insn_may_barrier {op} {args} scc_live={scc_live_flag}",
+            )
+            clean = wave64_emulate_opt._classify_block_body([ins], lm_map, scc_live, frozenset())[0]
+            self.assertEqual(clean, not want, f"_classify_block_body {op} {args} scc_live={scc_live_flag}")
+
+    def test_opposite_half_and_live_scc_b32_inside_execz_regions(self):
+        # Every one of these triggers wave_mask or scc_logic vote under --wave64-emulate and previously tripped
+        # `AssertionError: wave64 emulation: x_split inside a folded lane-local region`.
+        cases = [
+            ("s_mov_b32_vcc_opp", [
+                ("v_cmp_ge_u32_e64 vcc, v0, 36", 8),
+                ("s_mov_b32 vcc_lo, vcc_hi", 4),
+                ("v_cndmask_b32_e64 v4, 10, 20, vcc", 8),
+            ], lambda l: (20 if (l + 32) >= 36 else 10) if l < 16 else (20 if l >= 36 else 0)),
+            ("s_and_b32_vcc_opp_dead_scc", [
+                ("v_cmp_ge_u32_e64 vcc, v0, 38", 8),
+                ("s_and_b32 vcc_lo, vcc_hi, -1", 4),
+                ("v_cndmask_b32_e64 v4, 10, 20, vcc", 8),
+            ], lambda l: (20 if (l + 32) >= 38 else 10) if l < 16 else ((20 if l >= 38 else 10) if l >= 36 else 0)),
+            ("s_not_b32_vcc_opp_dead_scc", [
+                ("v_cmp_ge_u32_e64 vcc, v0, 38", 8),
+                ("s_not_b32 vcc_lo, vcc_hi", 4),
+                ("v_cndmask_b32_e64 v4, 10, 20, vcc", 8),
+            ], lambda l: (20 if not ((l + 32) >= 38) else 10) if l < 16 else ((20 if l >= 38 else 10) if l >= 36 else 0)),
+            ("s_cselect_b32_vcc_opp", [
+                ("s_cmp_eq_u32 1, 1", 4),
+                ("v_cmp_ge_u32_e64 vcc, v0, 37", 8),
+                ("s_cselect_b32 vcc_lo, vcc_hi, 0", 4),
+                ("v_cndmask_b32_e64 v4, 10, 20, vcc", 8),
+            ], lambda l: (20 if (l + 32) >= 37 else 10) if l < 16 else ((20 if l >= 37 else 10) if l >= 36 else 0)),
+            ("s_and_b32_vcc_same_live_scc", [
+                ("v_cmp_eq_u32_e64 vcc, v0, 5", 8),
+                ("s_and_b32 vcc_lo, vcc_lo, -1", 4),
+                ("s_cselect_b32 s14, 77, 88", 4),
+                ("v_mov_b32_e32 v4, s14", 4),
+            ], lambda l: 77 if (l < 16 or l >= 36) else 0),
+            ("s_and_b32_sgpr_live_scc", [
+                ("v_cmp_eq_u32_e64 vcc, v0, 5", 8),
+                ("s_and_b32 s15, vcc_lo, -1", 4),
+                ("s_cselect_b32 s14, 91, 92", 4),
+                ("v_mov_b32_e32 v4, s14", 4),
+            ], lambda l: 91 if (l < 16 or l >= 36) else 0),
+            ("s_and_saveexec_b32_hi_src", [
+                ("v_cmp_ge_u32_e64 vcc, v0, 36", 8),
+                ("s_and_saveexec_b32 s14, vcc_hi", 4),
+                ("v_mov_b32_e32 v4, 33", 4),
+            ], lambda l: 33 if ((l < 16 and (l + 32) >= 36) or l >= 36) else 0),
+            ("s_andn1_wrexec_b32_hi_src", [
+                ("v_cmp_ge_u32_e64 vcc, v0, 36", 8),
+                ("s_andn1_wrexec_b32 s14, vcc_hi", 4),
+                ("v_mov_b32_e32 v4, 44", 4),
+            ], lambda l: 44 if ((l < 16 and not ((l + 32) >= 36)) or l >= 36) else 0),
+            ("s_and_saveexec_b32_vcc_hi_dst", [
+                ("v_cmp_lt_u32_e64 s[6:7], v0, 8", 8),
+                ("s_and_saveexec_b32 vcc_hi, s6", 4),
+                ("v_mov_b32_e32 v4, 55", 4),
+            ], lambda l: 55 if (l < 8 or l >= 36) else 0),
+        ]
+        for name, body, expect in cases:
+            with self.subTest(case=name):
+                skip_words = sum(nb for _, nb in body) // 4
+                # Lanes 0..15 and 36..63 active so vcc_hi has non-zero bits while vcc_lo observes them.
+                insns = [
+                    ("v_mov_b32_e32 v4, 0", 4),
+                    ("v_cmp_lt_u32_e64 s[4:5], v0, 16", 8),
+                    ("v_cmp_ge_u32_e64 s[8:9], v0, 36", 8),
+                    ("s_or_b64 s[4:5], s[4:5], s[8:9]", 4),
+                    ("s_and_saveexec_b64 s[2:3], s[4:5]", 4),
+                    (f"s_cbranch_execz {skip_words}", 4),
+                ] + body + [
+                    ("s_mov_b64 exec, s[2:3]", 4),
+                    ("v_lshlrev_b32_e32 v10, 2, v0", 4),
+                    ("buffer_store_dword v4, v10, s[0:3], 0 offen", 8),
+                    ("s_endpgm", 4),
+                ]
+                spv, _ = _translate_encoded("cs_" + name, insns, (64, 1, 1), emulate=True)
+                self.assertEqual(spirv_asm.assemble(spv, target_env="vulkan1.2")[:4], b"\x03\x02\x23\x07")
+                self.assertGreaterEqual(_pre_vote_or_atomic_count(spv), 1)
+                for rev in (False, True):
+                    mem, _ = run_emulated_workgroup(spv, (64, 1, 1), push_constants=VSHARP + [0] * 28, reverse_order=rev)
+                    for lane in range(64):
+                        self.assertEqual(mem[lane * 4], expect(lane), f"{name} lane {lane} rev={rev}")
+
+    def test_same_half_b32_dead_scc_still_folds(self):
+        # Negative control: same-half s_and_b32 with dead SCC does not emit wave_mask/vote and still folds.
+        insns = [
+            ("v_mov_b32_e32 v4, 0", 4),
+            ("v_cmp_lt_u32_e64 s[4:5], v0, 16", 8),
+            ("s_and_saveexec_b64 s[2:3], s[4:5]", 4),
+            ("s_cbranch_execz 5", 4),
+            ("v_cmp_lt_u32_e64 vcc, v0, 8", 8),
+            ("s_and_b32 vcc_lo, vcc_lo, -1", 4),
+            ("v_cndmask_b32_e64 v4, 10, 20, vcc", 8),
+            ("s_mov_b64 exec, s[2:3]", 4),
+            ("v_lshlrev_b32_e32 v10, 2, v0", 4),
+            ("buffer_store_dword v4, v10, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        spv, gen = _translate_encoded("cs_same_half_dead_scc", insns, (64, 1, 1), emulate=True)
+        self.assertEqual(_pre_vote_or_atomic_count(spv), 0)
+        self.assertEqual(sum(1 for b in gen.blocks if b is not None), 1)
+        mem, _ = run_emulated_workgroup(spv, (64, 1, 1), push_constants=VSHARP + [0] * 28)
+        for lane in range(64):
+            want = 20 if lane < 8 else (10 if lane < 16 else 0)
+            self.assertEqual(mem[lane * 4], want, f"lane {lane}")
+
+    def test_opposite_half_b32_multiwave_divergent_guard(self):
+        # 128 threads: Wave 0 enters s_cbranch_scc0 guard containing `s_mov_b32 vcc_lo, vcc_hi` (dead SCC);
+        # Wave 1 skips it. The guard MUST NOT be placed in sync_free_blocks (would deadlock at OpControlBarrier).
+        insns = [
+            ("s_mov_b64 exec, -1", 4),
+            ("v_mov_b32_e32 v4, 10", 4),
+            ("v_and_b32_e32 v1, 63, v0", 4),
+            ("v_cmp_ge_u32_e64 vcc, v1, 40", 8),
+            ("v_readfirstlane_b32 s19, v0", 4),
+            ("s_cmp_lt_u32 s19, 64", 4),
+            ("s_cbranch_scc0 3", 4),
+            ("s_mov_b32 vcc_lo, vcc_hi", 4),
+            ("v_cndmask_b32_e64 v4, 10, 20, vcc", 8),
+            ("v_lshlrev_b32_e32 v10, 2, v0", 4),
+            ("buffer_store_dword v4, v10, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        spv, gen = _translate_encoded("cs_b32_opp_mw", insns, (128, 1, 1), emulate=True, rsrc2=0x20088)
+        self.assertEqual(gen.control_flow, "emulated wave64 structured")
+        self.assertEqual(gen.emulate_plan["mode"], "structured_hybrid")
+        self.assertEqual(len(gen.emulate_plan["sync_free_blocks"]), 0)
+        self.assertGreaterEqual(len(gen.emulate_plan["mini_blocks"]), 1)
+        self.assertEqual(spirv_asm.assemble(spv, target_env="vulkan1.2")[:4], b"\x03\x02\x23\x07")
+        for rev in (False, True):
+            mem, _ = run_emulated_workgroup(spv, (128, 1, 1), push_constants=VSHARP + [0] * 28, reverse_order=rev)
+            for l in range(64):
+                local = l & 63
+                want = 20 if ((local < 32 and local + 32 >= 40) or local >= 40) else 10
+                self.assertEqual(mem[l * 4], want, f"w0 l={l} rev={rev}")
+            for l in range(64, 128):
+                self.assertEqual(mem[l * 4], 10, f"w1 l={l} rev={rev}")
+
+
 if __name__ == "__main__":
     unittest.main()
