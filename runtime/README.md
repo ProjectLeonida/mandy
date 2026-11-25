@@ -358,6 +358,7 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_WINDOW` | unset | `WxH` resizes the title's window when the presenter attaches to it. |
 | `LEONIDA_PRESENT_DUMP` | unset | *Diagnostic.* `DIR` or `DIR,N` writes every Nth presented frame (60 by default) as a PNG into `DIR` (`src/present_dump.h`). The files are pictures of the title: keep them out of commits, issues and pull requests. |
 | `LEONIDA_LOCAL_SPEECH` | unset | `1` forwards the title's speech-synthesis calls to the host's installed `xgameruntime.dll` where there is one. Unset, and wherever that library is missing, the silent voice answers. No profile sets it. |
+| `LEONIDA_AUDIO` | unset | `silent` (any case) makes the title's `MMDeviceEnumerator` answer every render question with the runtime's silent output endpoint, even on a host that has an output (`shims/silent_audio.cpp`, read at each `CoCreateInstance`): no host audio device is opened and every sample is thrown away, for muted test runs. Unset, or any other value, the host's endpoint answers when there is one and the silent endpoint only when the host has none. Capture keeps the host's answer either way. See [docs/runtime_imports.md](../docs/runtime_imports.md#audio-output-off-the-console-wasapi). |
 
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own

@@ -1,7 +1,8 @@
 // leonida::kernel_writes::read_file (runtime/src/title_page_watch.h) into memory that is reserved until its first
 // touch, as xmem maps the title's physical pages (SEC_RESERVE section views committed by a fault handler): the kernel's
-// write does not fault such a page in, so the read fails with ERROR_NOACCESS unless the committer runs first. No game
-// data.
+// write does not fault such a page in, so the read fails with ERROR_NOACCESS unless the committer runs first. Then
+// kernel_writes::hold, the pin a host import keeps over its pages: recorded with no opener set (no tracker yet), seen
+// by for_each_pin until release(), untouched by a file read's pin ending over the same pages. No game data.
 #include <windows.h>
 
 #include <cstdint>
@@ -27,6 +28,55 @@ constexpr DWORD kFileBytes = 256 * 1024;
 
 std::uint8_t* g_view = nullptr;
 int g_commits = 0;
+int g_opens = 0;
+std::uintptr_t g_opened_begin = 0, g_opened_end = 0;
+
+void count_open(std::uintptr_t begin, std::uintptr_t end) {
+    ++g_opens;
+    g_opened_begin = begin;
+    g_opened_end = end;
+}
+
+// The bytes of [begin, end) the pins cover.
+std::size_t pinned_bytes(std::uintptr_t begin, std::uintptr_t end) {
+    std::size_t bytes = 0;
+    leonida::kernel_writes::for_each_pin(begin, end, [&](std::uintptr_t from, std::uintptr_t to) { bytes += to - from; });
+    return bytes;
+}
+
+void check_holds() {
+    namespace kw = leonida::kernel_writes;
+    static std::uint8_t pages[3 * 4096];
+    const auto begin = reinterpret_cast<std::uintptr_t>(pages);
+    kw::set_opener(nullptr);
+    check(pinned_bytes(begin, begin + sizeof(pages)) == 0, "no pin before the hold");
+    check(kw::hold(pages, 0) == 0 && kw::hold(nullptr, 4096) == 0, "an empty hold pins nothing");
+    // No opener: begin_write records nothing, a hold does (a tracker made later must still pass over the pages).
+    check(kw::begin_write(pages, 4096, nullptr) == 0, "begin_write records nothing without an opener");
+    const std::uint64_t first = kw::hold(pages, 2 * 4096);
+    check(first != 0 && pinned_bytes(begin, begin + sizeof(pages)) == 2 * 4096,
+          "a hold without an opener pins its range");
+    check(pinned_bytes(begin + 2 * 4096, begin + sizeof(pages)) == 0, "and nothing past it");
+    // With an opener: the range is opened once the pin is in.
+    kw::set_opener(&count_open);
+    const std::uint64_t second = kw::hold(pages + 4096, 2 * 4096);
+    check(second != 0 && second != first && g_opens == 1 && g_opened_begin == begin + 4096 &&
+              g_opened_end == begin + 3 * 4096,
+          "a hold with an opener opens exactly its range");
+    // A file read's pin over the same pages ends without ending the holds.
+    const std::uint64_t read = kw::begin_write(pages, sizeof(pages), nullptr);
+    check(read != 0 && pinned_bytes(begin, begin + sizeof(pages)) == 2 * 4096 + 2 * 4096 + sizeof(pages),
+          "a file read's pin adds to the holds");
+    kw::end_write(read, false);
+    check(pinned_bytes(begin, begin + sizeof(pages)) == 4 * 4096, "its end leaves the holds");
+    kw::end_write(first, true);  // as a pending overlapped read would: a hold has no OVERLAPPED, so it ends too
+    check(pinned_bytes(begin, begin + 4096) == 0 && pinned_bytes(begin + 4096, begin + sizeof(pages)) == 2 * 4096,
+          "ending one hold leaves the other");
+    kw::release(second);
+    kw::release(0);
+    check(pinned_bytes(begin, begin + sizeof(pages)) == 0, "released, no pin is left");
+    kw::set_opener(nullptr);
+}
 
 // Stands in for rt::xmem::commit_physical_range: commits the part of the test view the range covers.
 bool commit_view(const void* address, std::size_t bytes) {
@@ -80,6 +130,7 @@ int main() {
           "a read into committed memory does not call the committer");
 
     leonida::kernel_writes::set_committer(nullptr);
+    check_holds();
     UnmapViewOfFile(g_view);
     CloseHandle(section);
     CloseHandle(file);

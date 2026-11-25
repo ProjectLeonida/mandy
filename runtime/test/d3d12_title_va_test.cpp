@@ -298,6 +298,129 @@ int check_kind(Context& c, const char* kind, DWORD protect, int& checks) {
     return 0;
 }
 
+// With imports on: a slot-133 buffer the layer does not import holds no import memory once
+// create_buffer_at_host_address has returned, whichever step declined it. The memory an import declined after its
+// allocation (one the driver put below the arena) used to wait in the deferred queue past the next submission, while
+// the shadow made instead over the same pages made them read-only: RADV then rejects every submission (found and
+// measured by NateWeav, #14). Two placements: at a page start (imported where the driver takes it) and 4 bytes into
+// a page (declined after the buffer exists wherever the buffer's alignment is above 4). Then a submission over the
+// shadow's pages, which must still succeed.
+int check_declined_imports(Context& c) {
+    const std::uint64_t before = rt::d3d12::title_host_imports(c.inner);
+    void* pages = VirtualAlloc(nullptr, kPages, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    EXPECT(pages);
+    const D3D12_RESOURCE_DESC desc = buffer_desc(kPages / 2);
+    int shadows = 0;
+    for (const std::size_t at : {std::size_t(0), std::size_t(4)}) {
+        Ref<ID3D12Resource> buffer;
+        EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(c.inner, static_cast<std::uint8_t*>(pages) + at,
+                                                                  desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer.p))));
+        const bool shadow = rt::d3d12::title_shadow_buffer(buffer.p);
+        shadows += shadow;
+        const std::uint64_t live = rt::d3d12::title_host_imports(c.inner);
+        std::printf("slot-133 buffer at page offset %zu: %s, %llu import(s) live\n", at,
+                    shadow ? "declined (shadow)" : "imported", static_cast<unsigned long long>(live - before));
+        EXPECT(live == before + (shadow ? 0 : 1));
+        // A submission with the buffer alive: the shadow's tracker guards its pages here.
+        Ref<ID3D12CommandAllocator> allocator;
+        Ref<ID3D12GraphicsCommandList> list;
+        EXPECT(SUCCEEDED(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                          IID_PPV_ARGS(&allocator.p))));
+        EXPECT(SUCCEEDED(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                     IID_PPV_ARGS(&list.p))));
+        EXPECT(list->Close() == S_OK);
+        ID3D12CommandList* lists[] = {list.p};
+        c.queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(c.queue) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(c.queue->Signal(c.fence, ++c.fence_value)));
+        EXPECT(SUCCEEDED(c.fence->SetEventOnCompletion(c.fence_value, nullptr)));
+        buffer.reset();
+        EXPECT(rt::d3d12::title_host_imports(c.inner) == before);
+    }
+    VirtualFree(pages, 0, MEM_RELEASE);
+    std::printf("declined imports: %d of 2 placements took the shadow, none left import memory behind\n", shadows);
+    return 0;
+}
+
+// With imports on: a page a shadow tracker watches and a live import shares stays writable across submissions. RADV
+// rejects every submission once a page under a live import is read-only (found and measured by NateWeav, #14), so an
+// import pins its pages (leonida::kernel_writes::hold) and the tracker passes over them. The shadow comes first: its
+// pages are read-only when the buffer is made, so the layer does not import them. Made writable again, the tracker
+// guards them at the next submission (the control); written, they are open again; then an import over the same pages,
+// and two submissions that must leave them writable.
+int check_import_over_shadow(Context& c) {
+    auto* pages = static_cast<std::uint8_t*>(
+        VirtualAlloc(nullptr, kPages, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(pages);
+    const auto protection = [&] {
+        MEMORY_BASIC_INFORMATION region{};
+        return VirtualQuery(pages, &region, sizeof(region)) ? region.Protect & 0xFF : 0;
+    };
+    const auto submit = [&]() -> int {
+        Ref<ID3D12CommandAllocator> allocator;
+        Ref<ID3D12GraphicsCommandList> list;
+        EXPECT(SUCCEEDED(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                          IID_PPV_ARGS(&allocator.p))));
+        EXPECT(SUCCEEDED(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                     IID_PPV_ARGS(&list.p))));
+        EXPECT(list->Close() == S_OK);
+        ID3D12CommandList* lists[] = {list.p};
+        c.queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(c.queue) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(c.queue->Signal(c.fence, ++c.fence_value)));
+        EXPECT(SUCCEEDED(c.fence->SetEventOnCompletion(c.fence_value, nullptr)));
+        return 0;
+    };
+    const D3D12_RESOURCE_DESC desc = buffer_desc(kPages);
+    DWORD old = 0;
+    EXPECT(VirtualProtect(pages, kPages, PAGE_READONLY, &old));
+    Ref<ID3D12Resource> shadow, import;
+    EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(c.inner, pages, desc, 0xFFFFFFFFu,
+                                                              IID_PPV_ARGS(&shadow.p))));
+    EXPECT(rt::d3d12::title_shadow_buffer(shadow.p));
+    EXPECT(VirtualProtect(pages, kPages, PAGE_READWRITE, &old));
+    if (submit()) return 1;
+    const bool guarded = protection() == PAGE_READONLY;
+    pages[0] = 1;  // the tracker's fault handler opens the page again
+    EXPECT(protection() == PAGE_READWRITE);
+    const std::uint64_t imports = rt::d3d12::title_host_imports(c.inner);
+    EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(c.inner, pages, desc, 0xFFFFFFFFu,
+                                                              IID_PPV_ARGS(&import.p))));
+    const bool imported = !rt::d3d12::title_shadow_buffer(import.p);
+    std::size_t pinned = 0;
+    const auto begin = reinterpret_cast<std::uintptr_t>(pages);
+    leonida::kernel_writes::for_each_pin(begin, begin + kPages,
+                                         [&](std::uintptr_t from, std::uintptr_t to) { pinned += to - from; });
+    std::printf("import over a shadow's pages: the tracker %s them alone; the second buffer %s, %zu KiB pinned\n",
+                guarded ? "guarded" : "did not guard", imported ? "imported" : "declined (shadow)", pinned >> 10);
+    EXPECT(guarded);  // the control: without a pin the tracker makes these pages read-only
+    if (!imported) {
+        EXPECT(pinned == 0 && rt::d3d12::title_host_imports(c.inner) == imports);
+        import.reset();
+        shadow.reset();
+        VirtualFree(pages, 0, MEM_RELEASE);
+        return 0;
+    }
+    EXPECT(pinned >= kPages && rt::d3d12::title_host_imports(c.inner) == imports + 1);
+    pages[1] = 2;  // written again: the tracker would guard these pages at the next refresh
+    for (int i = 0; i < 2; ++i) {
+        if (submit()) return 1;
+        EXPECT(protection() == PAGE_READWRITE);
+    }
+    import.reset();
+    pinned = 0;
+    leonida::kernel_writes::for_each_pin(begin, begin + kPages,
+                                         [&](std::uintptr_t from, std::uintptr_t to) { pinned += to - from; });
+    EXPECT(pinned == 0);  // the import's memory is freed: its pin ended
+    pages[2] = 3;
+    if (submit()) return 1;
+    EXPECT(protection() == PAGE_READONLY);  // and the tracker guards the pages again
+    shadow.reset();
+    EXPECT(protection() == PAGE_READWRITE);
+    VirtualFree(pages, 0, MEM_RELEASE);
+    return 0;
+}
+
 // The title's own memory outside any slot-133 buffer: a VirtualAlloc range standing for its per-frame constant ring
 // (#8862 section 3.5). Three ways a shader is given an address in it, each read back through an arena buffer:
 //   - a buffer V# the CPU writes into a shader-visible heap itself, as the title does (rewritten before the submission);
@@ -794,6 +917,8 @@ int main(int argc, char** argv) {
             EXPECT(d.validation_errors() == 0);
             return 0;
         }
+        if (geometry && check_declined_imports(c)) return 1;
+        if (geometry && check_import_over_shadow(c)) return 1;
         if (check_kind(c, "read-write", PAGE_READWRITE, checks)) return 1;
         if (check_kind(c, "write-combined", PAGE_READWRITE | PAGE_WRITECOMBINE, checks)) return 1;
         if (check_title_memory(c, checks, geometry)) return 1;

@@ -636,6 +636,31 @@ inline void end_write(std::uint64_t id, bool pending) {
     s.count.store(s.pins.size(), std::memory_order_release);
 }
 
+// For as long as the GPU may use [buffer, buffer + bytes) as host memory (the D3D12 layer's VK_EXT_external_memory_host
+// imports): pins the range until release() and opens it. Unlike begin_write it records the pin before any tracker
+// exists, so a tracker made later passes over the pages too. RADV checks an import's pages again at every submission,
+// and once one of them is read-only the kernel rejects that submission and every later one ("The CS has been
+// rejected", then VK_ERROR_DEVICE_LOST; found and measured by NateWeav, #14), so no guard may land on them. Returns
+// the pin's id, 0 for an empty range.
+inline std::uint64_t hold(const void* buffer, std::size_t bytes) {
+    if (!buffer || !bytes) return 0;
+    State& s = state();
+    const auto begin = reinterpret_cast<std::uintptr_t>(buffer);
+    std::uint64_t id = 0;
+    {
+        std::lock_guard lock(s.mutex);
+        id = s.next_id++;
+        s.pins.push_back({begin, begin + bytes, nullptr, id});
+        s.count.store(s.pins.size(), std::memory_order_release);
+    }
+    // After the pin: a guard a refresh made before it is lifted, and no refresh from here on makes one.
+    if (const Opener opener = s.opener.load(std::memory_order_acquire)) opener(begin, begin + bytes);
+    return id;
+}
+
+// The import is freed: its pin ends.
+inline void release(std::uint64_t id) { end_write(id, false); }
+
 // Readies [buffer, buffer + bytes) for a retry after ERROR_NOACCESS: commits xmem's pages that wait for their first
 // touch (the kernel's write does not fault them in) and opens watched pages again. false: neither side is set.
 inline bool reopen(const void* buffer, std::size_t bytes) {

@@ -3999,7 +3999,7 @@ void log_measured_state_blob_fields(const void* blob, std::size_t blob_size) {
         if (g_state_blob_field_logged[i].compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
             std::uint32_t val = 0;
             std::memcpy(&val, bytes + off, 4);
-            std::fprintf(stderr, "[rt] d3d12_xs: state blob: campo sin identificar en 0x%03x = 0x%08x\n",
+            std::fprintf(stderr, "[rt] d3d12_xs: state blob: unidentified field at 0x%03x = 0x%08x\n",
                          static_cast<unsigned>(off), static_cast<unsigned>(val));
         }
     }
@@ -4253,9 +4253,26 @@ D3D12_RESOURCE_STATES depth_image_state(D3D12_RESOURCE_STATES requested) {
     return requested == D3D12_RESOURCE_STATE_UNORDERED_ACCESS ? D3D12_RESOURCE_STATE_COMMON : requested;
 }
 
+// The depth provider answers E_INVALIDARG or E_NOTIMPL for a texture it has no unordered-access form of
+// (Resource::enable_depth_stencil_uav). A console D16S8 target is one on a GPU with D24S8 attachments (every NVIDIA
+// card): pc_format() makes it as D24_UNORM_S8_UINT, and the provider takes only R16_TYPELESS, 118 and
+// R32G8X24_TYPELESS. Slots 76 and 133 then make the texture without unordered access, as they did before the provider
+// (#939), and the title gets its texture instead of asserting. Any other failure is passed on as it is.
+bool depth_provider_refusal(HRESULT hr) { return hr == E_INVALIDARG || hr == E_NOTIMPL; }
+
+void note_depth_provider_refusal(std::atomic<bool>& seen, unsigned slot, DXGI_FORMAT format, HRESULT hr) {
+    if (first_call(seen))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot %u: the depth provider refused a depth-stencil texture with unordered access "
+                     "(format %d, hr=0x%08x); it is made without unordered access\n",
+                     slot, static_cast<int>(format), static_cast<unsigned>(hr));
+}
+
+// `refused` (optional) is set when the provider refused the texture (depth_provider_refusal), not when the backing
+// itself failed.
 HRESULT create_depth_uav_backing(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* props, D3D12_HEAP_FLAGS flags,
                                  const D3D12_RESOURCE_DESC& native, D3D12_RESOURCE_STATES initial,
-                                 const D3D12_CLEAR_VALUE* clear, ID3D12Resource** out) {
+                                 const D3D12_CLEAR_VALUE* clear, ID3D12Resource** out, bool* refused = nullptr) {
     // The logical Xbox texture has a UAV. Its writable planes take ALLOW_SHADER_ATOMICS, which the PC
     // rejects on the depth-only attachment. Upload/readback heaps cannot hold a UAV on either API.
     if (props && (props->Type == D3D12_HEAP_TYPE_UPLOAD || props->Type == D3D12_HEAP_TYPE_READBACK))
@@ -4268,20 +4285,37 @@ HRESULT create_depth_uav_backing(DeviceProxy* self, const D3D12_HEAP_PROPERTIES*
     if (FAILED(hr)) {
         (*out)->Release();
         *out = nullptr;
+        if (refused) *refused = depth_provider_refusal(hr);
     }
     return hr;
 }
 
 HRESULT proxy_create_placed_depth(DeviceProxy* self, UINT64 address, const D3D12_RESOURCE_DESC& desc,
-                                  std::uint32_t layout, const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) {
+                                  std::uint32_t layout, const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out,
+                                  bool* provider_refused) {
     const auto native = depth_image_desc(desc);
-    if (!self->validate_depth_placement(native, layout, clear)) return E_INVALIDARG;
-    const auto alloc = self->real->GetResourceAllocationInfo(0, 1, &native);
-    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    return self->placed_depth_textures.create(address, native, alloc, clear, desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN, riid, out, [&](ID3D12Resource** backing) {
-        return create_depth_uav_backing(self, &heap, D3D12_HEAP_FLAG_NONE, native, D3D12_RESOURCE_STATE_COMMON,
-                                        clear, backing);
-    });
+    const bool valid = self->validate_depth_placement(native, layout, clear);
+    D3D12_RESOURCE_ALLOCATION_INFO alloc{};
+    HRESULT hr = E_INVALIDARG;
+    if (valid) {
+        alloc = self->real->GetResourceAllocationInfo(0, 1, &native);
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        hr = self->placed_depth_textures.create(address, native, alloc, clear, desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN, riid, out, [&](ID3D12Resource** backing) {
+            return create_depth_uav_backing(self, &heap, D3D12_HEAP_FLAG_NONE, native, D3D12_RESOURCE_STATE_COMMON,
+                                            clear, backing, provider_refused);
+        });
+    }
+    // A refusal here reaches no trace line, and the title stops on an int3 right after it: log the first few. The
+    // provider's own refusal is not one of them: slot 133 makes that texture without unordered access and says so.
+    static std::atomic<int> refusals{0};
+    if (FAILED(hr) && !*provider_refused && refusals.fetch_add(1, std::memory_order_relaxed) < 8)
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 133 depth texture refused (hr=0x%08x, %s): format %d %llux%ux%u, Xbox layout "
+                     "0x%x, layout word 0x%x, PC size %llu\n",
+                     static_cast<unsigned>(hr), valid ? "placement" : "description", int(desc.Format),
+                     static_cast<unsigned long long>(desc.Width), unsigned(desc.Height), unsigned(desc.DepthOrArraySize),
+                     unsigned(desc.Layout), layout, static_cast<unsigned long long>(alloc.SizeInBytes));
+    return hr;
 }
 
 HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
@@ -4315,13 +4349,19 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
     // With a provider for the unordered-access planes the texture keeps them (two resources behind one).
     if (supports_depth_uav(self, *xbox_desc)) {
         ID3D12Resource* resource = nullptr;
+        bool refused = false;
         HRESULT hr = create_depth_uav_backing(self, heap_properties, heap_flags, depth_image_desc(pc_desc),
-                                              depth_image_state(initial_state), clear_value, &resource);
-        if (FAILED(hr)) return hr;
-        hr = resource->QueryInterface(*riid, out);
-        if (SUCCEEDED(hr)) lease_title_resource_memory(self, *out, pc_desc, unsigned(xbox_desc->Layout));
-        resource->Release();
-        return hr;
+                                              depth_image_state(initial_state), clear_value, &resource, &refused);
+        if (SUCCEEDED(hr)) {
+            hr = resource->QueryInterface(*riid, out);
+            if (SUCCEEDED(hr)) lease_title_resource_memory(self, *out, pc_desc, unsigned(xbox_desc->Layout));
+            resource->Release();
+            return hr;
+        }
+        if (!refused) return hr;
+        // pc_desc has no unordered access already (without_depth_stencil_uav): the committed texture below is it.
+        static std::atomic<bool> refusal_seen{false};
+        note_depth_provider_refusal(refusal_seen, 76, xbox_desc->Format, hr);
     }
     const HRESULT hr = self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc,
                                                            pc_initial_state(&pc_desc, initial_state), clear_value,
@@ -4649,7 +4689,13 @@ HRESULT proxy_create_placed_resource_slot133(DeviceProxy* self, std::uint64_t va
         depth_uav_description(*xbox_desc)) {
         note_slot(133);
         *out = nullptr;
-        return proxy_create_placed_depth(self, va, *xbox_desc, state, clear_value, *riid, out);
+        bool refused = false;
+        const HRESULT hr = proxy_create_placed_depth(self, va, *xbox_desc, state, clear_value, *riid, out, &refused);
+        if (!refused) return hr;
+        // The paths below make it without unordered access, as before the provider (depth_provider_refusal).
+        *out = nullptr;
+        static std::atomic<bool> refusal_seen{false};
+        note_depth_provider_refusal(refusal_seen, 133, xbox_desc->Format, hr);
     }
     if (out && xbox_desc && riid) {
         const HRESULT hr = proxy_create_buffer_at_va(self, reinterpret_cast<void*>(va), xbox_desc, state, clear_value,

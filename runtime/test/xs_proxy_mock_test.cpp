@@ -1547,6 +1547,126 @@ int check_placed_resource_x() {
     return 0;
 }
 
+// ---- 6c. Slots 76 and 133 when the depth provider refuses a depth-stencil texture with unordered access ----
+//
+// The provider answers E_INVALIDARG or E_NOTIMPL for a texture it has no unordered-access form of: a console D16S8
+// (format 118) target that the Vulkan layer makes as D24S8 on a GPU with D24S8 attachments (NVIDIA). The slots then
+// make the texture as they did before the provider: slot 76 a committed texture without unordered access, slot 133
+// its stand-in (the title-pages handler, else the committed one). The backing the provider refused is released. Any
+// other failure (the provider out of memory, the backing itself, a placement the backend refuses) is passed on as it
+// is, with no stand-in.
+HRESULT g_provider_result = S_OK;
+unsigned g_provider_calls = 0;
+Mock* g_provider_backing = nullptr;  // the resource the provider was last given
+bool g_placement_valid = true;
+
+HRESULT mock_depth_provider(ID3D12Resource* resource, D3D12_HEAP_FLAGS) {
+    ++g_provider_calls;
+    g_provider_backing = reinterpret_cast<Mock*>(resource);
+    return g_provider_result;
+}
+
+bool mock_validate_placement(const D3D12_RESOURCE_DESC&, std::uint32_t, const D3D12_CLEAR_VALUE*) {
+    return g_placement_valid;
+}
+
+int check_depth_provider_refusal() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device && xs::set_depth_stencil_uav_provider(device, mock_depth_provider, mock_validate_placement));
+    constexpr std::uint64_t kVa = 0x7f0000000000ull;  // 64 KiB aligned, as the placement is checked to be
+    constexpr auto kDepthStencilUav = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                                                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    // The description measured where a real boot stopped: 1280x720, one mip, format 118, depth-stencil with UAV.
+    D3D12_RESOURCE_DESC d16s8{};
+    d16s8.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d16s8.Width = 1280;
+    d16s8.Height = 720;
+    d16s8.DepthOrArraySize = 1;
+    d16s8.MipLevels = 1;
+    d16s8.Format = static_cast<DXGI_FORMAT>(118);
+    d16s8.SampleDesc.Count = 1;
+    d16s8.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+    d16s8.Flags = kDepthStencilUav;
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    void* resource = nullptr;
+    const std::uint64_t words76[10] = {word(&heap), 0, word(&d16s8), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0,
+                                       word(&kResourceIid), word(&resource), 0, 0, 0};
+    const auto place = [&] {
+        return hr_of(raw6(device, 133, kVa, word(&d16s8), 0xFFFFFFFFu, 0, word(&kResourceIid), word(&resource)));
+    };
+    const auto arm = [&](HRESULT result) {
+        g_provider_result = result;
+        g_provider_calls = 0;
+        g_provider_backing = nullptr;
+        resource = reinterpret_cast<void*>(1);
+        return mock->calls[27];
+    };
+
+    // The provider accepts: one backing, handed out as the texture (slot 76) or behind its placement (slot 133).
+    unsigned before = arm(S_OK);
+    EXPECT(hr_of(raw10(device, 76, words76)) == S_OK && resource == g_provider_backing && g_provider_calls == 1);
+    EXPECT(mock->calls[27] == before + 1 && !(g_committed.desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+    EXPECT(release(resource) == 0);
+    before = arm(S_OK);
+    EXPECT(place() == S_OK && resource && g_provider_calls == 1 && mock->calls[27] == before + 1);
+    EXPECT(release(resource) == 0 && g_provider_backing->refs == 0);
+
+    // The provider refuses: the texture is made without it, and the refused backing is not kept.
+    for (const HRESULT refusal : {E_INVALIDARG, E_NOTIMPL}) {
+        before = arm(refusal);
+        EXPECT(hr_of(raw10(device, 76, words76)) == S_OK && resource && g_provider_calls == 1);
+        EXPECT(g_provider_backing && g_provider_backing->refs == 0 && resource != g_provider_backing);
+        EXPECT(mock->calls[27] == before + 2 && reinterpret_cast<Mock*>(resource)->kind == Kind::resource);
+        EXPECT(g_committed.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL &&
+               g_committed.desc.Format == d16s8.Format && g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
+        EXPECT(g_committed.state == D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        EXPECT(release(resource) == 0);
+
+        // Slot 133 reaches its stand-in with the title's description, as before the provider; without the
+        // title-pages handler that is the committed DEFAULT one, in COMMON for the all-ones layout.
+        before = arm(refusal);
+        EXPECT(place() == S_OK && resource && g_provider_calls == 1);
+        EXPECT(g_provider_backing && g_provider_backing->refs == 0 && resource != g_provider_backing);
+        EXPECT(mock->calls[27] == before + 2 && reinterpret_cast<Mock*>(resource)->kind == Kind::resource);
+        EXPECT(g_committed.heap.Type == D3D12_HEAP_TYPE_DEFAULT && g_committed.state == D3D12_RESOURCE_STATE_COMMON);
+        EXPECT(g_committed.desc.Format == d16s8.Format && g_committed.desc.Width == d16s8.Width &&
+               g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
+        EXPECT(release(resource) == 0);
+    }
+
+    // Any other failure of the provider is passed on, with no texture and no stand-in.
+    before = arm(E_OUTOFMEMORY);
+    EXPECT(hr_of(raw10(device, 76, words76)) == E_OUTOFMEMORY && !resource && g_provider_calls == 1);
+    EXPECT(g_provider_backing->refs == 0 && mock->calls[27] == before + 1);
+    before = arm(E_OUTOFMEMORY);
+    EXPECT(place() == E_OUTOFMEMORY && !resource && g_provider_calls == 1);
+    EXPECT(g_provider_backing->refs == 0 && mock->calls[27] == before + 1);
+
+    // So is a failure of the backing itself, which the provider never sees.
+    mock->create_result = E_INVALIDARG;
+    before = arm(S_OK);
+    EXPECT(hr_of(raw10(device, 76, words76)) == E_INVALIDARG && !resource && g_provider_calls == 0);
+    EXPECT(mock->calls[27] == before + 1);
+    before = arm(S_OK);
+    EXPECT(place() == E_INVALIDARG && !resource && g_provider_calls == 0 && mock->calls[27] == before + 1);
+    mock->create_result = S_OK;
+
+    // And a placement the backend refuses (E_INVALIDARG too), before any backing is made.
+    g_placement_valid = false;
+    before = arm(E_INVALIDARG);
+    EXPECT(place() == E_INVALIDARG && !resource && g_provider_calls == 0 && mock->calls[27] == before);
+    g_placement_valid = true;
+
+    EXPECT(xs::set_depth_stencil_uav_provider(device, nullptr));
+    g_provider_result = S_OK;
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: a format 118 depth-stencil texture the depth provider refuses (E_INVALIDARG, E_NOTIMPL) is made "
+                "without it by slots 76 and 133; its other failures, the backing's and the placement's are passed "
+                "on\n", g_label);
+    return 0;
+}
+
 // The same stand-in with LEONIDA_SLOT133_LAYOUT_WORD=1 (its own process: the switch is read once): the fourth word is
 // a D3D12_BARRIER_LAYOUT. A device without ID3D12Device10 gets the legacy state of that layout through
 // CreateCommittedResource; one with it gets CreateCommittedResource3 and the layout as given.
@@ -2030,9 +2150,29 @@ int check_xbox_queue_slots() {
     raw(queue, 18, word(&host_desc));
     EXPECT(queue_mock->calls[16] == 1 && queue_mock->calls[18] == 2);
 
+    // Queue slots 16 and 17 with one of the title's fences are Signal and Wait, PC slots 14 and 15, with the real
+    // fence, and never the PC slots 16 and 17, which write through their first argument: forwarded by number, the
+    // frequency went over the fence proxy's first word, its vtable pointer, and the title's next call on that fence
+    // went through a null pointer. The fence also marks the newer layout (check_signalx_detection).
+    void* fence = make_fence(device);
+    EXPECT(fence);
+    const auto real_fence = word(xs::fence_proxy_real_fence(fence));
+    void* const fence_vtable_before = *reinterpret_cast<void**>(fence);
+    const std::uint64_t signal14 = queue_mock->calls[14], wait15 = queue_mock->calls[15];
+    const std::uint64_t getter16 = queue_mock->calls[16], getter17 = queue_mock->calls[17];
+    EXPECT(hr_of(raw(queue, 16, word(fence), 7)) == S_OK);
+    EXPECT(queue_mock->calls[14] == signal14 + 1 && queue_mock->args[14][0] == real_fence &&
+           queue_mock->args[14][1] == 7);
+    EXPECT(hr_of(raw(queue, 17, word(fence), 9)) == S_OK);
+    EXPECT(queue_mock->calls[15] == wait15 + 1 && queue_mock->args[15][0] == real_fence &&
+           queue_mock->args[15][1] == 9);
+    EXPECT(queue_mock->calls[16] == getter16 && queue_mock->calls[17] == getter17);
+    EXPECT(*reinterpret_cast<void**>(fence) == fence_vtable_before);
+    EXPECT(release(fence) == 0);
+
     EXPECT(release(queue) == 0 && release(device) == 0 && mock->refs == 0);
     std::printf("%s: queue slot 35 routes ExecuteCommandLists(count, lists) to PC slot 10 with UINT count masking "
-                "and list proxies unwrapped\n", g_label);
+                "and list proxies unwrapped; slots 16 and 17 with a fence are Signal and Wait\n", g_label);
     return 0;
 }
 
@@ -4081,7 +4221,7 @@ int main(int argc, char** argv) {
         check_list_cpu_handles() ||
         check_presentation_wiring() || check_queue_copy_page_mappings())
         return 1;
-    if (check_placed_resource_x()) return 1;
+    if (check_placed_resource_x() || check_depth_provider_refusal()) return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
 }

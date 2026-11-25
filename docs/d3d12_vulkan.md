@@ -839,9 +839,12 @@ The compute path, end to end:
     so descriptor bytes the application writes itself are what shaders load.
   - Upload and readback buffers keep their own memory, and their VA is their device address minus the heap base.
   - Shader programs (FSSM blobs) are copied in as the code base.
-- **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place in two layouts:
-  `pack()` for the graphics bind point and `pack_stage(Stage::Compute)` for the compute one (from s4, one dword per
-  table; section 3.5, D3D-448). A signature neither can place (more than 32 user dwords: the spill layout is open; the
+- **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place in two layouts, both
+  the console's (one dword per table; section 3.5, D3D-448): `pack_stage(Stage::Pixel)` for the graphics bind point
+  (from s8; a signature past s31 there keeps `pack()`'s s0 layout, logged) and `pack_stage(Stage::Compute)` for the
+  compute one (from s4). It also checks
+  `pack_stage(Stage::Mesh)`: a signature past a mesh shader's 16-dword window is logged, and `DispatchMesh` with it
+  invalidates the list. A signature neither bind point can place (past s31: the spill layout is open; the
   translated shaders have no below-base spill-pointer candidates) is refused with both reasons; one only a single layout places is created with a log line, and binding it at the other bind point
   invalidates the list. Before
   that it answers as the host runtime does (`compare_invalid_arguments`, "root signature:", RTX 5070 / 621.14):
@@ -1741,18 +1744,36 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    include PS_NoStripImmutableTable at s11 and VS_TransformD at s12. Their shader inputs establish the
    destination dwords. The explicit graphics layouts and ordering for signatures with spills still need
    independent root-signature evidence.
+   **Inline compute layout (integration #984).** Run
+   `python -I tools/compute_heap_layout_census.py <carve>/disasm` on each compute carve. Of 5,450 indexed compute
+   entries, 2,959 advertise direct indexing and none of those embeds its root signature. Adding
+   `--group fspx_compute --dispatch-log <dispatch-log>` joined seven resource-indexing entries to independently
+   recorded layouts. In all seven, a dynamically indexed resource descriptor used the first SGPR after the explicit
+   arguments. There were zero mismatches and zero cases without room **among those seven**. For the remaining
+   2,952 entries the layout is unknown. These are entries across carves, which can contain the same program.
+   No sampler-indexing entry had a matched layout. Putting the resource heap first when both flags are set, then the
+   sampler in the next dword, remains a hypothesis. D3D-329's adjacent SGPR examples alone do not establish it.
    The runtime snapshots the bound resource and sampler heap pointers in that order after the explicit
-   arguments for direct and indirect compute dispatches with an inline signature. Set
+   arguments for direct and indirect compute dispatches with an inline signature. An unbound heap contributes
+   zero, and rebinding affects later commands. A heap that cannot fit in the inline user data is reported once,
+   and a signature whose compute arguments spill gets nothing written (logged once). Set
    `LEONIDA_COMPUTE_DIRECT_HEAPS=0` to restore the previous compute arguments.
    Draws do the same in the graphics layout (`pack_stage(Stage::Pixel)`, from s8, one dword per table): the
    resource heap's 32-bit shader VA goes in the dword after the explicit arguments, then the sampler heap's, each
    only when the signature has its flag, snapshotted per draw. Vertex, pixel and geometry shaders share one
    user-data block and that layout, so one write serves all three; a signature whose explicit arguments take
    s8..s10 gives s11, one whose arguments take s8..s11 gives s12 (the two program reads above). A mesh shader reads
-   its arguments from s16, which is not modelled, so in a mesh pipeline only the pixel shader gets the heaps. A
-   signature that keeps the s0 graphics layout, or whose arguments fill s31, gets none (logged once).
-   `d3d12_graphics_direct_heaps_test` checks the recorded draws and what a vertex and a pixel shader read, with
-   and without the flags. Set `LEONIDA_GRAPHICS_DIRECT_HEAPS=0` to restore the previous draw arguments.
+   push dword d as s(d + 8) through its root window (section 3.5), so `DispatchMesh` records the same dwords and
+   the mesh stage finds the resource heap at s(16 + end − 8), right after its arguments from s16, where DadaCap
+   reports every directly indexed program of the retail library reads it, for compute from s4, VS/PS/GS from s8
+   and mesh from s16 (issue #14, comment 7143020922, on a `boot-prototype` run; not reproduced in this
+   repository). A mesh signature that fills the window leaves no room there: a heap past s31 of the mesh shader
+   (push dword 24 or later) is logged once. A signature that keeps the s0 graphics layout, or whose arguments fill
+   s31, gets none (logged once). `d3d12_graphics_direct_heaps_test` checks the recorded draws and what a vertex
+   and a pixel shader read, with and without the flags; `d3d12_mesh_test` checks that a mesh draw records the
+   vertex draw's dwords, a resource-only rebind, a signature ending at s30 and one on the s0 layout (recorded
+   arguments only; no GPU read through a mesh shader). Set `LEONIDA_GRAPHICS_DIRECT_HEAPS=0` to restore the
+   previous draw arguments.
 3. **Game-built descriptor memory.** The game writes raw T#/S# bytes into a heap itself, without calling
    `CreateShaderResourceView`. The shaders then read those bytes exactly as in case 1.
 
@@ -1877,7 +1898,8 @@ This is the least verifiable part of the layer. D3D12 gives the application a ro
 turns it into the user SGPRs (`s0..s31`) that the shader reads. The translator already copies those 32 dwords from
 push constants into `s0..s31`. The layer must produce them.
 
-The default mapping (implemented by `rt::rootsig::pack` in `runtime/src/root_signature.{h,cpp}`) follows root
+The first mapping the layer used (`rt::rootsig::pack` in `runtime/src/root_signature.{h,cpp}`, kept for the tools and
+tests that compare the two models; the runtime now uses the console layout below at both bind points) follows root
 parameter order:
 
 | Root parameter | User-data dwords |
@@ -1917,11 +1939,27 @@ below 4 GiB). A parameter that does not fit goes, with every later one, to the s
 - **Vertex/pixel/geometry s8 and mesh s16: a hypothesis.** It rests on the census above only; no signature
   confirms these bases, and visibility is not modelled (every parameter takes its place in every stage).
 
-The runtime uses the console layout for the **compute** bind point only. Graphics keeps `pack()`: every stage of a
-pipeline reads `s0..s31` from one push-constant block at offset 0 (`tools/rdna2spirv.py`, `ShaderUserData` in
-`runtime/src/vulkan_replay.h`), so a mesh shader (base s16) and a pixel shader (base s8) in one pipeline would need
-the same root argument at two offsets. That needs per-stage user-data windows in the translator's push-constant
-contract (D3D-448 follow-up). A root signature carries both layouts; one that only one of them can place is
+The runtime uses the console layout at **both** bind points. Every stage of a pipeline reads one push-constant block
+(`ShaderUserData` in `runtime/src/vulkan_replay.h`), so the graphics bind point lays a signature out once with
+`pack_stage(Stage::Pixel)` (the same s8 base as vertex and geometry): root dword k at push dword 8 + k. A vertex,
+pixel or geometry shader reads SGPR i from push dword i, so it finds the arguments at s8.. as the console puts them.
+A graphics signature past s31 (more than 24 dwords from s8) keeps `pack()`'s layout (from s0, two dwords per table),
+logged as "keeps the s0 graphics layout": the graphics spill array is not modelled. `LEONIDA_GRAPHICS_STAGE_LAYOUT=0`
+keeps `pack()` for every graphics signature (`RootArgumentLayout::graphics_console` false).
+**The graphics root window (D3D-448-GRAPHICS):** a mesh shader's root arguments start at s16, so the translator loads
+its s16..s31 from push dwords 8..23 instead (`user_data_dword` in `tools/rdna2spirv.py`); a mesh and a pixel shader
+of one pipeline then find each argument in the same dword. A mesh shader's s8..s15 are below its base and read 0;
+s0..s7 stay push dwords 0..7 for every stage. The index records the window as `"root_window": {"sgpr": 16, "dword":
+8}`, and a mesh PSO whose mesh shader lacks it (translated before) is refused with a log line asking for the shaders
+stage again. The mesh window holds 16 dwords (s16..s31) where the others hold 24 (s8..s31): a signature that fits the
+graphics layout but not the mesh window, or one on `pack()`'s s0 layout, is created (the first is logged), and
+`DispatchMesh` with it invalidates the list (`RootArgumentLayout::mesh_ok`, `d3d12_mesh_test`). Live evidence for s8
+and one dword per table: on the retail frame loop the VS of a textured draw reads table slots 0 and 2 through s8 and
+its PS slot 1, which hold exactly the buffer, constants and texture the title bound (issue #14, comment 7131556366,
+native Windows, RTX 5080). What mesh shaders read below s16 was counted on the 1.0.2.1 corpus
+(`user_sgpr_census.py --base ms=16`, issue #14 comment 7138532347): of 9,282 mesh shaders, 9,279 read nothing below
+s16; three read one 32-bit constant there (`s13` in one, `s15` in two), never a pointer, and they read it as 0 now.
+Its meaning is not established. A root signature carries both layouts; one that only one of them can place is
 created, and binding it at the other bind point invalidates the command list (`Close` returns `E_INVALIDARG`).
 `s0..s3` of a compute dispatch are the driver's block; the layer leaves them zero (109 CS read `s1` as a constant,
 42 `s3`; their meaning is open).
@@ -2288,6 +2326,26 @@ Pipeline creation:
     serialized size and bytes are each device's own (the host's empty library is 900 bytes, the layer's 16).
   - Not compared: the calls the host runtime faults on (`Serialize(nullptr, n)`, `StorePipeline` with a null PSO,
     `Load*` with a null name or description); the layer answers `E_INVALIDARG` for each.
+- Compiles at draw time: the first draw of a graphics pipeline, the first dispatch of a compute pipeline the warm-up
+  has not built, and each variant are compiled for the submission that needs them. `prepare()` leaves each one that is
+  not built yet to `PipelineCompiles`, once per pipeline and variant; `VulkanQueue::execute_now` then compiles them
+  side by side on the device's workers (`runtime/src/pipeline_workers.h`), the submitting thread among them, and writes
+  the command buffer when all are built. Every draw and dispatch has its own pipeline: none is left to a later frame. A
+  pipeline the driver refuses has the result it had when `prepare()` built it: a draw or an indirect dispatch fails the
+  submission, a dispatch is dropped (strict replay: fails it too). The resource lock is held while they compile, as it
+  is when each is compiled alone, so a PSO released meanwhile waits for the submission. The workers have ended before
+  the session cache is read at device teardown. `LEONIDA_PIPELINE_THREADS=<n>` sets the workers: unset, half the
+  logical processors and at most 8; `0` compiles each pipeline on the submitting thread where `prepare()` meets it.
+  Graphics pipelines of 1 MiB of SPIR-V or more, and compute pipelines over 128 KiB (`LEONIDA_SERIAL_BIG_COMPILES`),
+  are compiled one after another beside the smaller ones, because a compile takes the driver some hundred bytes of
+  memory for each byte of SPIR-V ([pipeline_check.md](pipeline_check.md)); so are the variants of one PSO.
+  `LEONIDA_ASYNC_PIPELINES=1` is not changed: its builds stay on the compile worker. Measured with synthetic programs
+  never compiled before and the warm-up off (RTX 3080, NVIDIA 621.24, Windows 11, 16 logical processors, 8 workers,
+  three runs each): the first submission of 192 graphics pipelines takes 126 to 143 ms instead of 861 to 882, of 192
+  variants 124 to 130 instead of 856 to 863, of 96 compute pipelines 74 to 81 instead of 486 to 519, and the process
+  holds about 50 MiB more (the driver keeps memory for each thread that compiles). One `VkPipelineCache` is enough: one
+  cache per thread, merged, was about as fast. Tested by `pipeline_workers`, `replay_pipeline_compiles` and
+  `d3d12_pipeline_workers`.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.
@@ -2817,7 +2875,23 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   plane 1. For `R16_TYPELESS`, use `R16_UINT` on plane 0 to access the raw D16 bits. An array UAV selects a
   contiguous range of layers. The depth/stencil and shader-resource views continue to use the attachment image.
   Slot 133 keeps the guest address. Identical, live placements share their image and writable planes across
-  distinct COM objects. A partial overlap or incompatible reinterpretation is refused.
+  distinct COM objects. An incompatible reinterpretation at the same address is refused. A placement's extent is
+  the PC allocation size, which can exceed the title's own block (RADV sizes a large D16 target above it, so the
+  title's next block starts inside the range); a placement that starts inside another one therefore gets its own
+  image when both layouts are opaque, since D3D12 leaves an alias's contents undefined until reinitialized, and is
+  refused only for a non-opaque layout. Before this, the retail boot stopped on the title's assert while it created
+  its D16 depth targets on an RDNA2 iGPU under RADV. A refused depth placement is logged (no trace line covers it).
+  Where the provider (`Resource::enable_depth_stencil_uav`) has no unordered-access form of a texture it answers
+  `E_INVALIDARG` or `E_NOTIMPL`, and slots 76 and 133 then make the texture without unordered access, as before the
+  provider: slot 76 as a committed depth-stencil texture, slot 133 through its stand-in (the title-placed texture, or
+  the committed one). The first such refusal per slot is logged. That is the console D16S8 format (118) on a GPU with
+  D24S8 attachments (every NVIDIA card): `pc_format()` makes it as `D24_UNORM_S8_UINT`, which the provider does not
+  take; a real boot stopped on an int3 after slot 133 returned that refusal. Its UAVs then write no
+  descriptor, as for the slot 25 stand-in. Any other failure (out of memory, the backing itself, a refused placement)
+  is passed on as before. Follow-up: teach `enable_depth_stencil_uav` the D24S8-made form of format 118 (its widened
+  path already serves a D16S8 target stored as `D32_SFLOAT_S8_UINT`), so these textures keep their UAVs on NVIDIA
+  too. `xs_proxy_mock` checks the refusal against a mock provider, and `xbox_d16s8_refused_uav` on a GPU with
+  `LEONIDA_CONSOLE_D16S8=d24`.
 - Legacy and enhanced texture transitions copy the selected planes and layers to or from their storage images.
   Fence-ordered graphics and compute queues can share UAV access. A dedicated compute family can perform
   the plane transfer itself when `VK_KHR_maintenance10` and the format's depth/stencil copy flags allow it.

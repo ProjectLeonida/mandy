@@ -803,6 +803,10 @@ struct ComputePipeline {
     VkPipeline (*build)(void*) = nullptr;
     void* build_context = nullptr;
     bool async_build = false;  // a null handle may be waiting for the compile worker
+    // What `build` would return when it is built already and nobody is building it, else null; builds nothing. Null: a
+    // first use is always built where prepare() meets it. Not used with async_build. See PipelineCompiles.
+    VkPipeline (*built)(void*) = nullptr;
+    bool large = false;        // compiled one after another with the other large ones (PipelineCompiles)
     bool skipped = false;      // never built on request (LEONIDA_SKIP_COMPUTE): its dispatches are dropped
 };
 
@@ -830,6 +834,10 @@ struct GraphicsPipeline {
     // IA topology requiring a fourth-corner geometry stage. Zero when the PSO already contains the stage.
     std::uint32_t rectangle_variant_topology = 0;
     std::function<VkPipeline(std::uint32_t flags)> variant;
+    // What `variant` would return when it is built already and nobody is building one, else null; builds nothing. See
+    // ComputePipeline::built.
+    std::function<VkPipeline(std::uint32_t flags)> built;
+    bool large = false;  // as ComputePipeline::large
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
     bool async_build = false;
 };
@@ -915,7 +923,75 @@ inline ReplayResult unsupported_at(int line) {
 }
 
 
+// The pipelines of a submission that are not built yet. prepare() adds each of them once and goes on; build_pipelines()
+// then compiles them all and puts them where prepare() left them out. Holds pointers to registered pipelines: valid
+// while the context's resource lock is held.
+class PipelineCompiles {
+public:
+    // Where a prepared command finds its pipeline: an index for `built`, plus one; 0 when it needs none.
+    using Ticket = std::uint32_t;
+    // Which command needs a pipeline: it decides what a pipeline that cannot be built means (build_pipelines).
+    enum class User : std::uint8_t { draw, dispatch, indirect_dispatch };
+    struct Use {
+        Ticket ticket;
+        User user;
+    };
+    // A compile takes the driver some hundred bytes of memory for each byte of SPIR-V (docs/pipeline_check.md): graphics
+    // pipelines of this much or more are `large`.
+    static constexpr std::uint64_t large_spirv_bytes = 1u << 20;
+
+    Ticket add(const GraphicsPipeline& pipeline, std::uint32_t flags) {
+        return add({&pipeline, nullptr, flags}, User::draw);
+    }
+    Ticket add(const ComputePipeline& pipeline, User user) { return add({nullptr, &pipeline, 0}, user); }
+
+    bool empty() const { return jobs_.empty(); }
+    std::size_t size() const { return jobs_.size(); }
+    VkPipeline built(Ticket ticket) const { return jobs_[ticket - 1].built; }
+    const std::vector<Use>& uses() const { return uses_; }  // in the order of the commands
+
+    // Compiles all of them through run(count, job) (PipelineWorkers::run): the large ones one after another, as without
+    // workers, beside the others.
+    template<typename Run>
+    void build(Run&& run) {
+        std::vector<std::size_t> single, large;
+        for (std::size_t i = 0; i < jobs_.size(); ++i) (is_large(jobs_[i]) ? large : single).push_back(i);
+        const auto compile = [this](std::size_t i) {
+            Job& job = jobs_[i];
+            job.built = job.graphics ? job.graphics->variant(job.flags) : job.compute->build(job.compute->build_context);
+        };
+        const std::size_t chain = large.empty() ? 0 : 1;  // the large ones are one unit, the first
+        run(chain + single.size(), [&](std::size_t i) {
+            if (i >= chain)
+                compile(single[i - chain]);
+            else
+                for (const std::size_t each : large) compile(each);
+        });
+    }
+
+private:
+    struct Job {
+        const GraphicsPipeline* graphics;  // one of the two
+        const ComputePipeline* compute;
+        std::uint32_t flags;
+        VkPipeline built = VK_NULL_HANDLE;
+    };
+    static bool is_large(const Job& job) { return job.graphics ? job.graphics->large : job.compute->large; }
+    Ticket add(const Job& job, User user) {
+        const void* const pipeline = job.graphics ? static_cast<const void*>(job.graphics) : job.compute;
+        const auto [it, added] = tickets_.try_emplace({pipeline, job.flags}, Ticket(jobs_.size() + 1));
+        if (added) jobs_.push_back(job);
+        uses_.push_back({it->second, user});
+        return it->second;
+    }
+    std::vector<Job> jobs_;
+    std::vector<Use> uses_;
+    std::map<std::pair<const void*, std::uint32_t>, Ticket> tickets_;
+};
+
 struct ReplayFunctions {
+    // Set: prepare() leaves pipelines that are not built to it instead of building each on the spot.
+    PipelineCompiles* compiles = nullptr;
     std::function<void(VkCommandBuffer, const label::Write&)> gpu_label;
     // Set 0 for the pipelines that declare one (their own `bindless_set` is only the marker): the device's current
     // generation of it, which a flush may have replaced since the pipeline was made. Null: the pipeline's.
@@ -1179,6 +1255,7 @@ struct Prepared {
     VkDeviceSize fill_scratch_offset = 0;
     QueryPool* queries = nullptr;  // query commands: the heap
     ComputePipeline pipeline;  // dispatches
+    PipelineCompiles::Ticket compile = 0;  // dispatches: where the pipeline comes from when it was not built yet
     std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
     std::uint32_t depth_uav_copy = UINT32_MAX;
     bool order_depth_uav = false;
@@ -1224,6 +1301,7 @@ struct PreparedDraw {
     // lock across both), so it is not copied.
     const GraphicsPipeline* graphics = nullptr;
     VkPipeline pipeline = VK_NULL_HANDLE;  // graphics->pipeline, or its variant for the slots the draw leaves unbound
+    PipelineCompiles::Ticket compile = 0;  // where `pipeline` comes from when it was not built yet
     std::vector<Attachment> colors;  // by slot; id 0 = unbound
     Attachment depth;
     std::vector<VkBuffer> vertex_buffers;
@@ -1244,6 +1322,7 @@ struct PreparedDraw {
         skipped = false;
         graphics = nullptr;
         pipeline = VK_NULL_HANDLE;
+        compile = 0;
         colors.clear();
         depth = {};
         vertex_buffers.clear();
@@ -2462,12 +2541,17 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
     if (unbound || !p.pipeline) {
-        p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
-        if (!p.pipeline && pipeline->async_build && !strict_replay()) {
-            p.skipped = true;
-            return ReplayResult::success;
+        if (vk.compiles && pipeline->variant && pipeline->built && !pipeline->async_build) {
+            p.pipeline = pipeline->built(unbound);
+            if (!p.pipeline) p.compile = vk.compiles->add(*pipeline, unbound);
+        } else {
+            p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
+            if (!p.pipeline && pipeline->async_build && !strict_replay()) {
+                p.skipped = true;
+                return ReplayResult::success;
+            }
+            if (!p.pipeline) return unsupported_at(__LINE__);
         }
-        if (!p.pipeline) return unsupported_at(__LINE__);
     }
 
     // An unbound vertex-buffer slot reads zeros, as in D3D12: the zero page with stride 0. Per-instance slots with
@@ -2532,6 +2616,20 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         }
     }
     return ReplayResult::success;
+}
+
+// A compute pipeline that is built on first use: the one built already, the one vk.compiles will build with the
+// submission's others (true, with p.compile set and no pipeline yet), or the one built here.
+inline bool first_use(const ComputePipeline& pipeline, PipelineCompiles::User user, const ReplayFunctions& vk, Prepared& p) {
+    if (p.pipeline.pipeline || !pipeline.build) return p.pipeline.pipeline != VK_NULL_HANDLE;
+    if (vk.compiles && pipeline.built && !pipeline.async_build && !pipeline.skipped &&
+        (!pipeline.bindless_set || vk.bind_descriptor_sets)) {
+        p.pipeline.pipeline = pipeline.built(pipeline.build_context);
+        if (!p.pipeline.pipeline) p.compile = vk.compiles->add(pipeline, user);
+        return true;
+    }
+    p.pipeline.pipeline = pipeline.build(pipeline.build_context);
+    return p.pipeline.pipeline != VK_NULL_HANDLE;
 }
 
 // An indexed quad list (D3D_PRIMITIVE_TOPOLOGY 19): the scratch and the compute job that turn the application's
@@ -2664,6 +2762,32 @@ public:
     VkPipelineStageFlags2 readback_src_stages = 0;
     std::vector<detail::PreparedKhrPostbuild> khr_postbuilds;
 };
+
+// Ends the preparation of a submission whose prepare() calls used `compiles` and returned `result` (the first that
+// failed, if any): builds the pipelines through run(count, job), puts them into `lists`, and returns what the calls would
+// have returned had they built each pipeline themselves. Every use in `compiles` comes from a command before the one that
+// failed, so a pipeline that cannot be built counts first, at the earliest command that uses it: it fails the list of a
+// draw or an indirect dispatch, and a dispatch is dropped as prepare() drops one.
+template<typename Run>
+ReplayResult build_pipelines(PipelineCompiles& compiles, std::span<PreparedList> lists, ReplayResult result,
+                             Run&& run) {
+    if (compiles.empty()) return result;
+    compiles.build(run);
+    for (const PipelineCompiles::Use& use : compiles.uses()) {
+        if (compiles.built(use.ticket)) continue;
+        if (use.user == PipelineCompiles::User::draw) return unsupported_at(__LINE__);
+        if (use.user == PipelineCompiles::User::indirect_dispatch || strict_replay()) return unresolved_at(__LINE__);
+        unresolved_at(__LINE__);
+    }
+    if (result != ReplayResult::success) return result;
+    for (PreparedList& list : lists) {
+        for (detail::Prepared& command : list.commands)
+            if (command.compile) command.pipeline.pipeline = compiles.built(command.compile);
+        for (std::size_t i = 0; i < list.draw_count; ++i)
+            if (list.draws[i].compile) list.draws[i].pipeline = compiles.built(list.draws[i].compile);
+    }
+    return result;
+}
 
 inline ReplayResult plan_occlusion_segments(PreparedList& out) {
     // Active logical queries cover a contiguous range of physical slots. A Begin or End closes the old
@@ -3568,10 +3692,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
                 if (!pipeline) return unresolved_at(__LINE__);
                 p.pipeline = *pipeline;
-                if (!p.pipeline.pipeline && p.pipeline.build) p.pipeline.pipeline = p.pipeline.build(p.pipeline.build_context);
-                if (!p.pipeline.pipeline && p.pipeline.skipped) continue;  // dropped on request, strict or not
-                if (!p.pipeline.pipeline && p.pipeline.async_build && !strict_replay()) continue;
-                if (!p.pipeline.pipeline) return unresolved_at(__LINE__);
+                const bool found = detail::first_use(*pipeline, PipelineCompiles::User::indirect_dispatch, vk, p);
+                if (!found && p.pipeline.skipped) continue;  // dropped on request, strict or not
+                if (!found && p.pipeline.async_build && !strict_replay()) continue;
+                if (!found) return unresolved_at(__LINE__);
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
@@ -3676,9 +3800,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 continue;
             }
             p.pipeline = *pipeline;
-            if (!p.pipeline.pipeline && p.pipeline.build) p.pipeline.pipeline = p.pipeline.build(p.pipeline.build_context);
-            if (!p.pipeline.pipeline && p.pipeline.skipped) continue;  // dropped on request, strict or not
-            if (!p.pipeline.pipeline) {
+            const bool found = detail::first_use(*pipeline, PipelineCompiles::User::dispatch, vk, p);
+            if (!found && p.pipeline.skipped) continue;  // dropped on request, strict or not
+            if (!found) {
                 if (strict) return unresolved_at(__LINE__);
                 if (!p.pipeline.async_build) unresolved_at(__LINE__);
                 continue;

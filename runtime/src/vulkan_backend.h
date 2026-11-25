@@ -14,6 +14,7 @@
 #include "buffer_va_index.h"
 #include "image_memory.h"
 #include "occlusion_sum_spirv.h"
+#include "pipeline_workers.h"
 #include "queue_holds.h"
 #include "retire_tickets.h"
 #include "statistics_sum_spirv.h"
@@ -1428,6 +1429,17 @@ public:
         graphics_pipelines_[id] = pipeline;
         if (shaders && device_fault_) device_fault_->pipeline_names[id] = *shaders;
     }
+    // Workers for the pipelines a submission needs and that are not built yet. Null (the default): each is built where
+    // prepare() meets it, on the submitting thread. Replacing it waits for submissions that are compiling, and ends the
+    // workers it had.
+    void set_pipeline_workers(std::unique_ptr<PipelineWorkers> workers) {
+        std::unique_lock lock(resource_mutex_);
+        pipeline_workers_.swap(workers);
+    }
+    PipelineWorkers::Stats pipeline_worker_stats() {
+        std::shared_lock lock(resource_mutex_);
+        return pipeline_workers_ ? pipeline_workers_->stats() : PipelineWorkers::Stats{};
+    }
     // Configure before queue creation, when the selected queue family supports compute.
     void set_occlusion_resolve_memory(const VkPhysicalDeviceMemoryProperties& memory) {
         occlusion_resolve_memory_ = memory;
@@ -2003,6 +2015,7 @@ private:
     std::unordered_map<ResourceId, std::shared_ptr<SparseResource>> sparse_resources_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
+    std::unique_ptr<PipelineWorkers> pipeline_workers_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
     std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ and zero_pending_ only
@@ -2091,6 +2104,22 @@ public:
             return UINT64_MAX;
         }
         if (result != VK_SUCCESS) return 0;
+        if (value == UINT64_MAX) {
+            // A lost device can show itself here first: measured on NVIDIA 621.24 and reported on 617.14, the counter
+            // query succeeds with UINT64_MAX (and vkWaitSemaphores with a zero timeout succeeds too) before any call
+            // has returned VK_ERROR_DEVICE_LOST. vkDeviceWaitIdle is what then says so, and it is also what a driver
+            // needs to have returned before vkGetDeviceFaultInfoEXT answers (LEONIDA_DEVICE_FAULT=1). When
+            // vkDeviceWaitIdle succeeds, nothing is recorded and the value is returned as the driver gave it.
+            VkResult idle = VK_SUCCESS;
+            {
+                std::lock_guard lock(context_.submit_mutex());
+                idle = context_.observe_result(context_.vk.vkDeviceWaitIdle(context_.device()),
+                                               "vkDeviceWaitIdle (a fence counter of UINT64_MAX)");
+            }
+            if (idle == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost(
+                    "a fence's counter read UINT64_MAX and vkDeviceWaitIdle then returned VK_ERROR_DEVICE_LOST");
+        }
         return value;
     }
 
@@ -2787,9 +2816,18 @@ private:
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
         std::uint32_t segments = 0, statistics_segments = 0;
         bool has_queries = false;
+        // With workers, the pipelines the lists need and that are not built yet are compiled together below instead of
+        // one after another in prepare(). resource_lock is held until they are all built, which keeps the pipeline
+        // states that own them alive (remove_pipeline takes it uniquely).
+        PipelineCompiles compiles;
+        if (context_.pipeline_workers_) replay.compiles = &compiles;
+        ReplayResult prepare_result = ReplayResult::success;
         for (std::size_t i = 0; i < lists.size(); ++i) {
             const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion);
-            if (result != ReplayResult::success) return result;
+            if (result != ReplayResult::success) {
+                prepare_result = result;
+                break;
+            }
             if (prepared[i].segment_count > UINT32_MAX - segments ||
                 prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)
                 return queue_unsupported(__LINE__);
@@ -2797,6 +2835,12 @@ private:
             statistics_segments += prepared[i].statistics_segment_count;
             has_queries = has_queries || !prepared[i].queries.empty();
         }
+        prepare_result = build_pipelines(
+            compiles, std::span(prepared).first(lists.size()), prepare_result,
+            [this](std::size_t count, const std::function<void(std::size_t)>& job) {
+                context_.pipeline_workers_->run(count, job);
+            });
+        if (prepare_result != ReplayResult::success) return prepare_result;
         const auto segment_pool = [this](VkQueryType type, std::uint32_t count,
                                          std::shared_ptr<OcclusionSegmentPool>& out) {
             const auto& vk = context_.vk;

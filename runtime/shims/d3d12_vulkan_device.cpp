@@ -1310,6 +1310,16 @@ bool console_format_stand_ins() {
     return on;
 }
 
+// A driver's compiler needs hundreds of MiB for a very large module; several at once exhausted host memory. Compute modules
+// over 128 KiB compile one at a time (LEONIDA_SERIAL_BIG_COMPILES=0: as many as are asked for).
+bool serial_big_compile(std::size_t spirv_bytes) {
+    static const bool serial = [] {
+        wchar_t v[2]{};
+        return !(GetEnvironmentVariableW(L"LEONIDA_SERIAL_BIG_COMPILES", v, 2) == 1 && v[0] == L'0');
+    }();
+    return serial && spirv_bytes > 128 * 1024;
+}
+
 bool startup_cache_checkpoints_enabled() {
     static const bool enabled = [] {
         wchar_t value[2]{};
@@ -1937,6 +1947,8 @@ struct DeviceState {
     PFN_vkTransitionImageLayoutEXT transition_image_layout = nullptr;
     // VK_EXT_external_memory_host; null unless info.host_pointer_alignment is set and the entry point loaded.
     PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_properties = nullptr;
+    // Slot-133 imports whose memory is allocated (create_host_buffer), for title_host_imports.
+    std::atomic<std::uint64_t> host_imports{0};
 
     // The live shadow buffers of Xbox device slot 133 (Resource::create_shadow_buffer): title-placed buffers whose
     // pages the driver would not import. Each is brought up to date from the title's pages before every submission
@@ -2451,6 +2463,7 @@ struct DeviceState {
         // import
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
+        std::uint64_t pin = 0;  // the imported pages' leonida::kernel_writes pin while `memory` lives
         std::size_t scan_at = 0;  // the next slot the T# scan reads
         // copy
         bool identity = false;
@@ -2665,6 +2678,7 @@ struct DeviceState {
         const auto fail = [&] {
             if (heap.buffer) vk.vkDestroyBuffer(info.device, heap.buffer, nullptr);
             if (heap.memory) vk.vkFreeMemory(info.device, heap.memory, nullptr);
+            leonida::kernel_writes::release(std::exchange(heap.pin, 0));
             heap.buffer = VK_NULL_HANDLE;
             heap.memory = VK_NULL_HANDLE;
             return false;
@@ -2682,6 +2696,7 @@ struct DeviceState {
         import.pHostPointer = const_cast<char*>(pages);
         VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
         flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        heap.pin = leonida::kernel_writes::hold(pages, std::size_t(heap.bytes));  // as create_host_buffer's
         for (const VkMemoryPropertyFlags want :
              {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
               VkMemoryPropertyFlags(0)}) {
@@ -2804,6 +2819,7 @@ struct DeviceState {
             context->wait_retire_ticket(context->submitted_retire_ticket());
             context->vk.vkDestroyBuffer(info.device, heap->buffer, nullptr);
             context->vk.vkFreeMemory(info.device, heap->memory, nullptr);
+            leonida::kernel_writes::release(std::exchange(heap->pin, 0));
         } else {
             arena_release(heap->shader_va, heap->bytes, arena_descriptor_heap);
         }
@@ -4564,7 +4580,11 @@ public:
             device_.context->wait_retire_ticket(device_.context->submitted_retire_ticket());
             auto& vk = device_.context->vk;
             if (buffer_) vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
-            if (memory_) vk.vkFreeMemory(device_.info.device, memory_, nullptr);
+            if (memory_) {
+                vk.vkFreeMemory(device_.info.device, memory_, nullptr);
+                device_.host_imports.fetch_sub(1, std::memory_order_relaxed);
+            }
+            leonida::kernel_writes::release(std::exchange(host_pin_, 0));
             buffer_ = VK_NULL_HANDLE;
             memory_ = VK_NULL_HANDLE;
         }
@@ -4850,21 +4870,43 @@ public:
         if (need_bda) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         device_.share(info);
         if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
+        // An import not used is destroyed here, not left to the destructor's deferred queue: there it outlived the
+        // next submission while the shadow the caller makes instead over the same pages guarded them, and RADV
+        // rejects every submission once a page under a live import is read-only (the CS is rejected, then
+        // VK_ERROR_DEVICE_LOST: found and measured by NateWeav, #14). Nothing was submitted with it: the resource is
+        // registered only on success.
+        const auto decline = [&](HRESULT hr) {
+            if (buffer_) vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
+            if (memory_) {
+                vk.vkFreeMemory(device_.info.device, memory_, nullptr);
+                device_.host_imports.fetch_sub(1, std::memory_order_relaxed);
+            }
+            leonida::kernel_writes::release(std::exchange(host_pin_, 0));
+            buffer_ = VK_NULL_HANDLE;
+            memory_ = VK_NULL_HANDLE;
+            buffer_va_ = gpu_va_ = 0;
+            return hr;
+        };
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
         VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
         if (device_.get_host_pointer_properties(device_.info.device,
                                                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, base_address,
                                                 &host) != VK_SUCCESS)
-            return E_NOTIMPL;
+            return decline(E_NOTIMPL);
         const std::uint32_t types = host.memoryTypeBits & requirements.memoryTypeBits;
         // An offset off the buffer's own alignment cannot be bound: the fallback answers.
-        if (!types || (offset % requirements.alignment) || requirements.size > bytes - offset) return E_NOTIMPL;
+        if (!types || (offset % requirements.alignment) || requirements.size > bytes - offset)
+            return decline(E_NOTIMPL);
         VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
         import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         import.pHostPointer = base_address;
         VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
         flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        // The imported pages are pinned before the import and until its memory is freed, so the shadow trackers
+        // and the geometry watch never make them read-only meanwhile (leonida::kernel_writes::hold). Taken first,
+        // so no guard lands between the writability check above and the import.
+        host_pin_ = leonida::kernel_writes::hold(base_address, std::size_t(bytes));
         // Host-visible and coherent first, as the caller's pages are; then any type both the import and the
         // buffer take.
         for (const VkMemoryPropertyFlags want :
@@ -4877,15 +4919,18 @@ public:
                 allocate.allocationSize = bytes;
                 allocate.memoryTypeIndex = i;
                 std::lock_guard serial(DeviceState::memory_mutex());
-                if (vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &memory_) == VK_SUCCESS)
+                if (vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &memory_) == VK_SUCCESS) {
                     memory_flags_ = device_.memory.memoryTypes[i].propertyFlags;
-                else
+                    device_.host_imports.fetch_add(1, std::memory_order_relaxed);
+                } else {
                     memory_ = VK_NULL_HANDLE;
+                }
             }
             if (memory_) break;
         }
-        if (!memory_) return E_OUTOFMEMORY;
-        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, offset) != VK_SUCCESS) return E_OUTOFMEMORY;
+        if (!memory_) return decline(E_OUTOFMEMORY);
+        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, offset) != VK_SUCCESS)
+            return decline(E_OUTOFMEMORY);
         if (need_bda && vk.vkGetBufferDeviceAddress) {
             VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             bda.buffer = buffer_;
@@ -4911,9 +4956,7 @@ public:
                              address, static_cast<unsigned long long>(desc_.Width),
                              static_cast<unsigned long long>(buffer_va_),
                              static_cast<unsigned long long>(device_.arena.address));
-            buffer_va_ = 0;
-            gpu_va_ = 0;
-            return E_NOTIMPL;
+            return decline(E_NOTIMPL);
         }
         mapped_ = address;
         host_import_ = true;
@@ -6132,6 +6175,7 @@ private:
     std::uint64_t buffer_va_ = 0;
     std::uint64_t gpu_va_ = 0;
     bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
+    std::uint64_t host_pin_ = 0;  // create_host_buffer: the pages' leonida::kernel_writes pin while memory_ lives
     std::uint8_t* shadow_ = nullptr;  // create_shadow_buffer: memory_ mapped, in DeviceState::shadows
     bool aliased_ = false;            // va_ is in leonida::title_va_aliases(), reached at title_alias_
     std::uint64_t title_alias_ = 0;
@@ -7321,6 +7365,15 @@ public:
                     std::fprintf(stderr, "[rt] d3d12: %s\n", refusal.c_str());
                     return stream_unsupported("mesh shader exceeds a device mesh limit");
                 }
+                // The graphics bind point lays root arguments out from push dword 8, which a mesh shader reads from
+                // its s16 only when translated with the graphics root window (index "root_window", D3D-448).
+                if (!stage.entry->graphics_root_window) {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: mesh shader %s was translated before the graphics root window; translate "
+                                 "the shaders again (make_game.py --stages shaders)\n",
+                                 stage.entry->name.c_str());
+                    return E_INVALIDARG;
+                }
             }
             if (stage.entry->uses_code_base) {
                 if (code_stage) {
@@ -7386,6 +7439,7 @@ public:
         if (!mesh && topology_bits != leonida::topology_type_rect_list)
             graphics_.rectangle_variant_topology = leonida::topology_rect_list;
 
+        std::uint64_t spirv_bytes = 0;
         for (Stage& stage : stages) {
             if (!stage.entry) continue;
             // After the f16 link above, which can also edit the pixel shader's words.
@@ -7400,6 +7454,7 @@ public:
                     stage.words = std::move(patched);
                 }
             }
+            spirv_bytes += stage.words.size() * sizeof(std::uint32_t);
             if (trace_pipeline_compile()) {
                 if (!profile_shaders_.empty()) profile_shaders_ += ',';
                 profile_shaders_ += stage.entry->name;
@@ -7785,6 +7840,13 @@ public:
                 return graphics_.async_build ? queue_build(false, unbound) : variant(unbound, "draw");
             });
         };
+        graphics_.built = [this](std::uint32_t unbound) {
+            std::unique_lock lock(variants_mutex_, std::try_to_lock);  // held: another thread is compiling one
+            if (!lock.owns_lock()) return VkPipeline(VK_NULL_HANDLE);
+            const auto it = variants_.find(unbound);
+            return it == variants_.end() ? VkPipeline(VK_NULL_HANDLE) : it->second;
+        };
+        graphics_.large = spirv_bytes >= leonida::PipelineCompiles::large_spirv_bytes;
 
         if (code_stage) {
             VkDeviceSize offset = 0;
@@ -7944,6 +8006,12 @@ public:
                 });
             };
             pipeline_.build_context = this;
+            pipeline_.built = [](void* self) {
+                auto* pso = static_cast<PipelineState*>(self);
+                std::unique_lock lock(pso->variants_mutex_, std::try_to_lock);  // held: another thread is compiling it
+                return lock.owns_lock() ? pso->pipeline_.pipeline : VkPipeline(VK_NULL_HANDLE);
+            };
+            pipeline_.large = serial_big_compile(spirv_bytes);
         } else if (!build_compute("compute-create")) {
             return E_FAIL;
         }
@@ -7977,15 +8045,9 @@ private:
         const leonida::ShaderLibrary* library = device_.library();
         const leonida::ShaderEntry* entry = compute_entry_;
         if (!library || !entry) return VK_NULL_HANDLE;
-        // The driver's compiler needs hundreds of MiB per very large module; several at once exhausted host memory.
-        // Modules over 128 KiB compile one at a time (LEONIDA_SERIAL_BIG_COMPILES=0: as many as are asked for).
-        static const bool serial_big = [] {
-            wchar_t v[2]{};
-            return !(GetEnvironmentVariableW(L"LEONIDA_SERIAL_BIG_COMPILES", v, 2) == 1 && v[0] == L'0');
-        }();
         static std::mutex big_compile;
         std::unique_lock<std::mutex> big_lock(big_compile, std::defer_lock);
-        if (serial_big && stage_bytes_ > 128 * 1024) big_lock.lock();
+        if (serial_big_compile(stage_bytes_)) big_lock.lock();
         auto words = library->spirv(*entry);
         if (words.empty()) {
             std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
@@ -9691,6 +9753,17 @@ public:
         leonida::title_va_aliases().set_buffer_maker(this, [](void* device, std::uint64_t va, std::uint64_t bytes) {
             static_cast<std::remove_reference_t<decltype(*this)>*>(device)->make_title_buffer(va, bytes);
         });
+        {
+            char text[32] = {};
+            size_t length = 0;
+            const bool present = getenv_s(&length, text, "LEONIDA_PIPELINE_THREADS") == 0 && length > 1;
+            const auto threads = leonida::pipeline_threads(present ? text : "", std::thread::hardware_concurrency());
+            if (!threads.valid)
+                std::fprintf(stderr, "[rt] d3d12: LEONIDA_PIPELINE_THREADS=%s is not a number; using %u\n", text,
+                             threads.count);
+            if (threads.count)
+                state_.context->set_pipeline_workers(std::make_unique<leonida::PipelineWorkers>(threads.count));
+        }
         leonida::title_va_aliases().set_hooks(
             &state_,
             [](void* device, std::uint64_t va, std::uint64_t bytes, std::uint64_t& out) {
@@ -10269,6 +10342,7 @@ public:
                                               "vkDeviceWaitIdle");
             }
             state_.context->drain_deleted_resources(UINT64_MAX);
+            state_.context->set_pipeline_workers(nullptr);  // before the pipeline cache is written and destroyed
             state_.context->set_bindless_release(nullptr, nullptr);
             state_.context->set_bindless_current(nullptr);  // the retired generations go with state_.bindless below
         }
@@ -11859,8 +11933,8 @@ public:
             if (container_size != size) return E_INVALIDARG;
         }
         // The repository's root-signature model (runtime/src/root_signature.h): parse the RTS0 blob, then pack
-        // the parameters into the 32 user-data dwords. pack() refuses what it cannot place (more than 32 dwords:
-        // the console spills those to memory, in a layout that is still open), and so does this.
+        // the parameters into the 32 user-data dwords in the console layout. pack_stage() refuses what it cannot
+        // place (past s31: the console spills those to memory, in a layout that is still open), and so does this.
         const rt::rootsig::DecodeResult parsed = rt::rootsig::parse_rts0(bytes, size);
         if (!parsed.ok) {
             std::fprintf(stderr, "[rt] d3d12: root signature not understood: %s\n", parsed.error.c_str());
@@ -11869,11 +11943,14 @@ public:
         // Two layouts, one per bind point (RootArgumentLayout): graphics takes the console layout of vertex and
         // pixel shaders (s8, one dword per table) where it fits without a spill and keeps pack() otherwise, compute
         // the console layout pack_stage() measured (D3D-448). The signature is refused only when neither can place it.
+        // A mesh shader reads the same graphics block from its s16 (the translator's root window, push dword 8 = s16),
+        // so its 16-dword window only needs checking (D3D-448-GRAPHICS).
         const rt::rootsig::PackResult packed = rt::rootsig::pack(parsed.sig);
         // LEONIDA_GRAPHICS_STAGE_LAYOUT=0 keeps pack() for every graphics signature.
         const rt::rootsig::StagePackResult pixel =
             local_graphics_stage_layout() ? rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Pixel)
                                           : rt::rootsig::StagePackResult{};
+        const rt::rootsig::StagePackResult mesh = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Mesh);
         const rt::rootsig::StagePackResult compute = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Compute);
         if (!pixel.ok && packed.ok && local_graphics_stage_layout()) {
             static std::atomic<unsigned> kept{0};
@@ -11890,12 +11967,21 @@ public:
         }
         if (!graphics_ok)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n", packed.error.c_str());
+        else if (pixel.ok && !mesh.ok) {
+            static std::atomic<unsigned> too_large{0};
+            const unsigned n = ++too_large;
+            if (n == 1 || (n & (n - 1)) == 0)
+                std::fprintf(stderr,
+                             "[rt] d3d12: root signature too large for a mesh shader's root window: %s (%u so far)\n",
+                             mesh.error.c_str(), n);
+        }
         if (!compute.ok)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for graphics only: %s\n", compute.error.c_str());
         RootArgumentLayout layout;
         layout.flags = parsed.sig.flags;
         layout.graphics_console = pixel.ok;
         layout.graphics_ok = graphics_ok;
+        layout.mesh_ok = pixel.ok && mesh.ok;
         layout.compute_ok = compute.ok;
         if (compute.ok && !compute.spill_dwords) layout.compute_arguments_end = compute.end_sgpr;
         // Vertex, pixel and geometry shaders share the s8 layout and one user-data block (a non-compute stage
@@ -15336,6 +15422,13 @@ VkBuffer vulkan_buffer(ID3D12Resource* resource) {
     return r ? r->buffer() : VK_NULL_HANDLE;
 }
 
+leonida::PipelineWorkers::Stats pipeline_worker_stats(ID3D12Device* device) {
+    if (!device) return {};
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (auto* d = Device::from<Device>(real ? real : device)) return d->context().pipeline_worker_stats();
+    return {};
+}
+
 const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
     if (!device) return nullptr;
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
@@ -15351,6 +15444,11 @@ std::uint64_t title_shadow_refresh_queries(ID3D12Device* device) {
     std::uint64_t queries = 0;
     for (const auto& shadow : state.shadows) queries += shadow->refresh_queries();
     return queries;
+}
+
+std::uint64_t title_host_imports(ID3D12Device* device) {
+    auto* d = Device::from<Device>(device);
+    return d ? d->state().host_imports.load(std::memory_order_relaxed) : 0;
 }
 
 std::uint64_t title_shadow_trackers(ID3D12Device* device) {

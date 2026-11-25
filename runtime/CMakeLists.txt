@@ -195,7 +195,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xbox_bvh_builder.cpp
     shims/library_loader.cpp
     shims/process.cpp
+    shims/lifecycle.cpp
     shims/com_shim.cpp
+    shims/silent_audio.cpp
     shims/bcrypt_rng.cpp
     shims/xapu_chad.cpp
     shims/dstorage.cpp
@@ -411,6 +413,18 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(process_cmdline_test PRIVATE /OPT:NOREF)
   target_link_libraries(process_cmdline_test PRIVATE shell32)
 
+  # Console lifecycle shim: RegisterAppStateChangeNotification, oversized window fitting, and subclass forwarding.
+  add_executable(lifecycle_test
+    test/lifecycle_test.cpp
+    shims/lifecycle.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(lifecycle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(lifecycle_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(lifecycle_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(lifecycle_test PRIVATE /OPT:NOREF)
+  target_link_libraries(lifecycle_test PRIVATE user32)
+
   # Console paths (GAME:) and the write overlay: the file shims resolved through the registry, over temporary folders.
   add_executable(file_system_test
     test/file_system_test.cpp
@@ -460,12 +474,26 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(com_shim_test
     test/com_shim_test.cpp
     shims/com_shim.cpp
+    shims/silent_audio.cpp
     shims/registry.cpp
   )
   target_include_directories(com_shim_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(com_shim_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(com_shim_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(com_shim_test PRIVATE /OPT:NOREF)
+
+  # The silent output endpoint (MMDeviceEnumerator through CoCreateInstance): stand-in hosts, a render stream on
+  # its clock, and the CoCreateInstance hook with LEONIDA_AUDIO=silent. No host audio device is opened.
+  add_executable(silent_audio_test
+    test/silent_audio_test.cpp
+    shims/silent_audio.cpp
+    shims/com_shim.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(silent_audio_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(silent_audio_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(silent_audio_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(silent_audio_test PRIVATE /OPT:NOREF)
 
   # BCrypt RNG and algorithm provider shims.
   add_executable(bcrypt_rng_test
@@ -728,6 +756,12 @@ if(BUILD_TESTING)
 
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
+  # The pool that compiles a submission's pipelines (runtime/src/pipeline_workers.h): pure stdlib.
+  add_executable(pipeline_workers_test test/pipeline_workers_test.cpp)
+  find_package(Threads REQUIRED)
+  target_link_libraries(pipeline_workers_test PRIVATE Threads::Threads)
+  add_test(NAME pipeline_workers COMMAND pipeline_workers_test)
+  set_tests_properties(pipeline_workers PROPERTIES TIMEOUT 120)
 
   # D3D-704's session-cache limit and header check: pure stdlib, no Vulkan headers.
   add_executable(pipeline_cache_store_test test/pipeline_cache_store_test.cpp)
@@ -1489,6 +1523,9 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)
   endif()
+  if(WIN32 AND TARGET lifecycle_test)
+    add_test(NAME lifecycle COMMAND lifecycle_test)
+  endif()
   if(WIN32 AND TARGET file_system_test)
     add_test(NAME file_system COMMAND file_system_test)
   endif()
@@ -1503,6 +1540,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET com_shim_test)
     add_test(NAME com_shim COMMAND com_shim_test)
+  endif()
+  if(WIN32 AND TARGET silent_audio_test)
+    add_test(NAME silent_audio COMMAND silent_audio_test)
   endif()
   if(WIN32 AND TARGET bcrypt_rng_test)
     add_test(NAME bcrypt_rng COMMAND bcrypt_rng_test)
@@ -1945,6 +1985,22 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_fence_dispatcher_sync COMMAND vk_fence_dispatcher_sync_test)
     set_tests_properties(vk_fence_dispatcher_sync PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  # A device loss the driver shows only as a timeline counter of UINT64_MAX (driver functions interposed).
+  add_executable(vk_fence_lost_by_counter_test test/vk_fence_lost_by_counter_test.cpp)
+  target_link_libraries(vk_fence_lost_by_counter_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_fence_lost_by_counter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(vk_fence_lost_by_counter_test PRIVATE Threads::Threads)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_fence_lost_by_counter_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_fence_lost_by_counter COMMAND vk_fence_lost_by_counter_test)
+    set_tests_properties(vk_fence_lost_by_counter PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   # The bindless set under view churn (bounded table, spare generations) and failed allocations (host table, in-place
   # rewrite, a degraded flush instead of a refused submission).
   add_executable(vk_bindless_grow_test test/vk_bindless_grow_test.cpp)
@@ -2177,6 +2233,18 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_texture_memory COMMAND d3d12_texture_memory_test)
     set_tests_properties(d3d12_texture_memory PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    # The pipelines a submission needs, compiled on the device's workers: the same image as without them. The second
+    # time with the pipelines compiled when they are created, which leaves the variants.
+    add_executable(d3d12_pipeline_workers_test test/d3d12_pipeline_workers_test.cpp)
+    target_link_libraries(d3d12_pipeline_workers_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_pipeline_workers_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_pipeline_workers_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_pipeline_workers COMMAND d3d12_pipeline_workers_test)
+    add_test(NAME d3d12_pipeline_workers_eager COMMAND d3d12_pipeline_workers_test)
+    set_tests_properties(d3d12_pipeline_workers d3d12_pipeline_workers_eager PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    set_tests_properties(d3d12_pipeline_workers_eager PROPERTIES
+                         ENVIRONMENT "LEONIDA_LAZY_PIPELINES=0;LEONIDA_LAZY_COMPUTE=0")
     # ExecuteCommandLists refuses a list whose type isn't the queue's (debug-layer message 836).
     add_executable(d3d12_queue_list_type_test test/d3d12_queue_list_type_test.cpp)
     target_link_libraries(d3d12_queue_list_type_test PRIVATE gta6rt_d3d12_com)
@@ -2879,6 +2947,11 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(xbox_d16s8_storage PROPERTIES
                          ENVIRONMENT "LEONIDA_TEST_D16S8_UAV=1;LEONIDA_CONSOLE_D16S8=native" SKIP_RETURN_CODE 77 TIMEOUT 30)
     set_tests_properties(xbox_depth_storage PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    # Made as D24S8, a D16S8 depth-stencil texture with unordered access is refused by the depth provider; slots 76
+    # and 133 make it without unordered access instead (d24 forces what a GPU with D24S8 attachments chooses).
+    add_test(NAME xbox_d16s8_refused_uav COMMAND xbox_depth_storage_test)
+    set_tests_properties(xbox_d16s8_refused_uav PROPERTIES
+                         ENVIRONMENT "LEONIDA_TEST_D16S8_REFUSED_UAV=1;LEONIDA_CONSOLE_D16S8=d24" SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_executable(xbox_d16s8_surface_test test/xbox_d16s8_surface_test.cpp)
     target_link_libraries(xbox_d16s8_surface_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(xbox_d16s8_surface_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -3712,21 +3785,11 @@ if(TARGET Vulkan::Headers)
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ms_draw.mesh
         COMMENT "Compiling the mesh test shader ms_draw.mesh"
         VERBATIM)
-      # The mesh test's signature is on the s0 fallback layout (see d3d12_mesh_test.cpp), so its pixel shader is
-      # ps_draw.frag reading the tint VA at s2:s3 instead of s10:s11.
-      set(LEONIDA_TEST_PS_S0 ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_draw_s0.spv)
-      add_custom_command(
-        OUTPUT ${LEONIDA_TEST_PS_S0}
-        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -DROOT_BASE=0 -o ${LEONIDA_TEST_PS_S0}
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ps_draw.frag
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ps_draw.frag
-        COMMENT "Compiling the mesh test's pixel shader ps_draw.frag (s0 layout)"
-        VERBATIM)
       add_executable(d3d12_mesh_test test/d3d12_mesh_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_TEST_MS}
-                     ${LEONIDA_TEST_PS_S0} ${LEONIDA_TEST_VS_FULLSCREEN})
+                     ${LEONIDA_TEST_PS} ${LEONIDA_TEST_VS_FULLSCREEN})
       target_link_libraries(d3d12_mesh_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_mesh_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
-                                 LEONIDA_TEST_MS_SPV="${LEONIDA_TEST_MS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS_S0}"
+                                 LEONIDA_TEST_MS_SPV="${LEONIDA_TEST_MS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
                                  LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}")
       target_compile_options(d3d12_mesh_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_mesh COMMAND d3d12_mesh_test)
@@ -3978,6 +4041,15 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_readback_stages_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_readback_stages COMMAND replay_readback_stages_test)
+    # Pipelines not built yet, left to the pool of pipeline_workers.h: what prepare() alone would give (no GPU).
+    add_executable(replay_pipeline_compiles_test test/replay_pipeline_compiles_test.cpp)
+    target_link_libraries(replay_pipeline_compiles_test PRIVATE Vulkan::Headers Threads::Threads)
+    if(WIN32)
+      target_compile_definitions(replay_pipeline_compiles_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_pipeline_compiles COMMAND replay_pipeline_compiles_test)
+    add_test(NAME replay_pipeline_compiles_strict COMMAND replay_pipeline_compiles_test)
+    set_tests_properties(replay_pipeline_compiles_strict PROPERTIES ENVIRONMENT "LEONIDA_STRICT_REPLAY=1")
     add_executable(replay_quad_list_test test/replay_quad_list_test.cpp)
     target_link_libraries(replay_quad_list_test PRIVATE Vulkan::Headers)
     if(WIN32)

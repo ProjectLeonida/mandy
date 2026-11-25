@@ -273,8 +273,13 @@ leonida::ResourceId uav_image_resource(ID3D12Resource* resource, std::uint64_t a
 VkBuffer vulkan_buffer(ID3D12Resource* resource);
 // What a device from create_vulkan_device* was created with (enabled features included), or null. For tests.
 const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device);
+// The device's pipeline workers (src/pipeline_workers.h) and what they have compiled; zeros without any. For tests.
+leonida::PipelineWorkers::Stats pipeline_worker_stats(ID3D12Device* device);
 // True when a slot-133 buffer is a shadow copied from the title's pages, false when they were imported. For tests.
 bool title_shadow_buffer(ID3D12Resource* resource);
+// Slot-133 imports (VK_EXT_external_memory_host) whose memory `device` holds: an import declined after its memory
+// was allocated is freed before create_buffer_at_host_address returns. For tests.
+std::uint64_t title_host_imports(ID3D12Device* device);
 // VirtualQuery calls made by the title-buffer shadows in their latest refresh. For tests.
 std::uint64_t title_shadow_refresh_queries(ID3D12Device* device);
 // The trackers behind the title-buffer shadows and title windows (copies whose pages overlap or touch share one).
@@ -449,10 +454,13 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
 // carries both layouts:
 //   - graphics: rt::rootsig::pack_stage(Stage::Pixel), the console layout of vertex, pixel and geometry shaders
 //     (from s8, one dword per table), which the game's own shaders read: VS_Blit/PS_BlitColour and the Scaleform
-//     VS load their table's first descriptor from s[8:9] with s9 forced to 0. A signature that would spill there
+//     VS load their table's first descriptor from s[8:9] with s9 forced to 0. A vertex, pixel or geometry shader
+//     reads SGPR i from push dword i, so root dword k is push dword 8 + k. A signature that would spill there
 //     (more than 24 dwords) keeps rt::rootsig::pack() (from s0, two dwords per table), logged: the graphics spill
-//     array is not modelled. A mesh shader reads from s16 and shares the block with its pixel shader (s8), so mesh
-//     pipelines still see their arguments 8 dwords early (D3D-448);
+//     array is not modelled. A mesh shader's root arguments start at s16; the translator loads its s16.. from push
+//     dwords 8.. ("root_window" in index.json), so the same block serves both stages of a mesh pipeline. Its window
+//     is 16 dwords: mesh_ok says whether Stage::Mesh places the signature too, and a mesh draw with one it refuses
+//     invalidates the list (D3D-448-GRAPHICS);
 //   - compute: rt::rootsig::pack_stage(Stage::Compute), the measured console layout (from s4, one dword per table).
 // A layout that refuses the signature is marked unusable; binding the signature there invalidates the list.
 // LEONIDA_GRAPHICS_STAGE_LAYOUT=0 keeps rt::rootsig::pack() (from s0, two dwords per address) for every graphics
@@ -467,7 +475,7 @@ inline bool local_graphics_stage_layout() {
 struct RootArgumentLayout {
     struct Parameter {
         rt::rootsig::ParamType type;
-        std::uint32_t user_offset;     // graphics: first dword; unused for a parameter with no dwords
+        std::uint32_t user_offset;     // graphics: first push dword; unused for a parameter with no dwords
         std::uint32_t constant_count;  // constants only
         std::uint32_t compute_offset = rt::rootsig::kNoSgpr;  // compute: first user SGPR
         // A table: the slots its ranges declare, for the scan of title-written V#s before a submission
@@ -480,6 +488,9 @@ struct RootArgumentLayout {
     // The graphics layout is the console's (pack_stage(Stage::Pixel)): a table takes one dword. False: pack()'s, two.
     bool graphics_console = false;
     bool graphics_ok = true;
+    // The console graphics layout also fits a mesh shader's 16-dword window (s16..s31 = push dwords 8..23). False
+    // for a signature on pack()'s s0 layout, which a mesh shader translated with the root window cannot read.
+    bool mesh_ok = false;
     bool compute_ok = true;
     // One past the last user-data dword the explicit root arguments take at each bind point, where the console puts
     // the directly indexed heaps (resource heap, then sampler heap). kNoSgpr: no such dword (the compute arguments
