@@ -10,6 +10,7 @@ import io
 import os
 import random
 import re
+import subprocess
 import sys
 import unittest
 from collections import Counter
@@ -371,6 +372,41 @@ class Translated(unittest.TestCase):
             self.assertIn("expected 0x00000000, actual 0x3f800000", d.check(lines))
         finally:
             d.translate_listing = real
+
+
+def cli(*args):
+    """(exit code, stdout, stderr) of the tool as a real command line, under -I as the module docstring runs it."""
+    p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "div_fixup_diff.py"), *args],
+                       capture_output=True, text=True)
+    return p.returncode, p.stdout, p.stderr
+
+
+class Arguments(unittest.TestCase):
+    """A --max-ops or --programs below 1 is a usage error: exit 2, nothing run. The defaults are 6 and 300."""
+
+    def usage_error(self, *args):
+        """The stderr of an ``args`` run, which must have exited 2 before a stage printed anything."""
+        code, out, err = cli("--no-sweep", *args)
+        self.assertEqual((code, out), (2, ""), args)
+        self.assertNotIn("Traceback", err)
+        return err
+
+    def test_max_ops_below_one(self):
+        for n in ("0", "-1", "-6"):
+            with self.subTest(max_ops=n):
+                self.assertIn("--max-ops must be at least 1", self.usage_error("--programs", "1", "--max-ops", n))
+
+    def test_programs_below_one(self):
+        # --no-sweep once ran nothing at all and exited 0 here; with the sweep it ran the sweep alone
+        for n in ("0", "-2"):
+            with self.subTest(programs=n):
+                self.assertIn("--programs must be at least 1", self.usage_error("--programs", n))
+
+    def test_a_valid_run_still_succeeds(self):
+        for args in (("--no-sweep", "--programs", "1", "--max-ops", "1"),
+                     ("--no-sweep", "--programs", "2", "--max-ops", "1", "--ops", "v_div_fixup_f32")):
+            with self.subTest(args=args):
+                self.assertEqual(cli(*args)[0], 0)
 
 
 if __name__ == "__main__":

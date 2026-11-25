@@ -73,7 +73,8 @@ Stages:
   3. random seeded programs.
 
 Exit code 0 when every judged program matches, 1 on a mismatch (the first one is printed with its listing) or a
-translator skip (every generated form is one the translator takes), 2 on a harness error.
+translator skip (every generated form is one the translator takes), 2 on a harness error or a usage error (a
+--programs or --max-ops below 1).
 
 Usage:
     python -I tools/div_fixup_diff.py [--programs N] [--seed S] [--max-ops N] [--ops v_div_fixup_f64]
@@ -958,7 +959,7 @@ def self_test():
     return ok
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--programs", type=int, default=300, help="random programs after the sweep and the grid")
     ap.add_argument("--seed", type=int, default=1)
@@ -967,7 +968,13 @@ def main():
     ap.add_argument("--no-sweep", action="store_true", help="skip the source-kind sweep and the edge grid")
     ap.add_argument("--list-ops", action="store_true")
     ap.add_argument("--self-test", action="store_true")
-    args = ap.parse_args()
+    if argv is None:
+        argv = sys.argv[1:]
+    args = ap.parse_args(argv)
+    if args.programs < 1:
+        ap.error("--programs must be at least 1")
+    if args.max_ops < 1:
+        ap.error("--max-ops must be at least 1")
     if args.list_ops:
         for op in OPS:
             print(f"{op:16s} {OP_FORMS[op]}")
