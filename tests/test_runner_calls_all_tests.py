@@ -10,7 +10,7 @@ test_depth() this way (PR #3122 fixes it), and tests/test_feature_scan.py had th
 only unrouted assert (PR #3051).  This is the runner counterpart of tests/test_ci_registration.py: it reuses
 that file's classification straight from the workflow (so it cannot drift from ci.yml) and fails for every
 stdlib-mode file whose __main__ block neither names each top-level test function nor dispatches the whole set
-through the ``globals()`` loop some runners use.  Intentional non-calls live in RUNNER_SKIPS with their reason,
+through a ``globals()`` loop or comprehension, as some runners do.  Intentional non-calls live in RUNNER_SKIPS with their reason,
 so a new dead test cannot hide behind a documented one.
 
 Only the tracked test files and the workflow are read; no game files, no build tools, no pytest.
@@ -35,22 +35,6 @@ RUNNER_SKIPS = {
         # drop this entry once that merges and the runner calls test_depth() first.
         "test_depth",
     },
-    "tests/test_feature_scan.py": {
-        # Its __main__ runner calls every test_* through run_tests([... for ... in globals().items() ...]), a
-        # comprehension dispatches_tests() does not follow, so each top-level test is listed here.
-        "test_feature_scan",
-        "test_short_signature",
-        "test_part_payload_outside_container_is_unreadable",
-        "test_bad_shaders_folder_is_one_line",
-        "test_out_inside_corpus_is_a_usage_error",
-        "test_duplicate_shader_names_keep_file_stages",
-        "test_v_perm_b32_selectors",
-        "test_typed_buffers_and_psv0",
-        "test_a_test_that_raises_fails_the_run_and_the_rest_still_run",
-        "test_a_failed_check_fails_only_its_own_test",
-        "test_out_via_directory_alias_into_corpus_is_a_usage_error",
-        "test_out_hard_link_to_carved_index_is_a_usage_error",
-    },
 }
 
 
@@ -62,14 +46,30 @@ def runner_block(tree):
     return None
 
 
+def _reads_namespace(node):
+    """True when ``node`` calls globals(), locals() or vars() somewhere inside it."""
+    return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+               and n.func.id in ("globals", "locals", "vars") for n in ast.walk(node))
+
+
 def dispatches_tests(block):
-    """True when the runner runs its tests through a loop over module globals and calls the loop variable."""
+    """True when the runner runs its tests through a loop over module globals and calls the loop variable, or
+    hands a comprehension over module globals that yields the loop variable straight to a call, as in
+    ``run_tests([fn for name, fn in globals().items() if name.startswith("test_")])``."""
     for node in ast.walk(block):
+        if isinstance(node, ast.Call):
+            for arg in list(node.args) + [k.value for k in node.keywords]:
+                if not isinstance(arg, (ast.ListComp, ast.GeneratorExp, ast.SetComp)):
+                    continue
+                if not any(_reads_namespace(g.iter) for g in arg.generators):
+                    continue
+                targets = {t.id for g in arg.generators for t in ast.walk(g.target) if isinstance(t, ast.Name)}
+                if isinstance(arg.elt, ast.Name) and arg.elt.id in targets:
+                    return True
         if not isinstance(node, ast.For):
             continue
         targets = {t.id for t in ast.walk(node.target) if isinstance(t, ast.Name)}
-        if not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                   and n.func.id in ("globals", "locals", "vars") for n in ast.walk(node)):
+        if not _reads_namespace(node):
             continue
         if any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in targets
                for n in ast.walk(node)):
@@ -123,6 +123,16 @@ class RunnerCallsTestsTest(unittest.TestCase):
         self.assertEqual(uncalled_tests(source), [])
         sabotaged = source.replace("    test_straight_line()", "    # dropped for the bite check", 1)
         self.assertEqual(uncalled_tests(sabotaged), ["test_straight_line"])
+
+    def test_a_globals_comprehension_dispatches_every_test(self):
+        # tests/test_feature_scan.py hands run_tests() a comprehension over globals(): a test added there is run,
+        # so it must not need a RUNNER_SKIPS entry, while the same comprehension over a fixed table runs only what
+        # the table lists and leaves every test it misses reported.
+        source = registration.read(registration.ROOT, "tests/test_feature_scan.py")
+        self.assertEqual(uncalled_tests(source), [])
+        fixed_table = source.replace("list(globals().items())", "list(TESTS.items())", 1)
+        self.assertNotEqual(fixed_table, source, "the runner's comprehension moved; update this bite check")
+        self.assertIn("test_feature_scan", uncalled_tests(fixed_table))
 
 
 if __name__ == "__main__":
