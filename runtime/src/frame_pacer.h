@@ -267,7 +267,8 @@ public:
     // GetFrameStatisticsX(token, type_mask, &count, array). `count` is the room in `out` on entry and the number of
     // entries written on return. S_OK when every producible requested type was written (event, present, display),
     // S_FALSE with count 0 or fewer when they are not (there yet, or the token is unknown or has aged out of the
-    // last 64). With a null `out`, count only receives how many entries are available.
+    // last 64). With a null `out`, count only receives how many entries are available. A repeated present leaves
+    // the token's first present and display timestamps intact.
     std::int32_t get_frame_statistics(std::uint64_t token, std::uint32_t type_mask, std::uint32_t* count,
                                       FrameStatistic* out) {
         if (!count) return pacer_hr::invalid_arg;
@@ -352,11 +353,14 @@ public:
         std::lock_guard guard(mutex_);
         const std::uint64_t now = clock_.now_us();
         retire_locked(now);
-        record_present_timing_locked(now, token);
+        Record* record = record_present_timing_locked(now, token);
+        if (record && record->presented) record = nullptr;
         last_presented_ = std::max(last_presented_, token);
         if (!interval_set_ || !any_armed_locked() || uncapped_) {  // not paced or uncapped: shows at once
-            for (Record& r : records_)
-                if (r.token == token) { r.presented = r.displayed = true; r.present_us = r.display_us = now; }
+            if (record) {
+                record->presented = record->displayed = true;
+                record->present_us = record->display_us = now;
+            }
             return;
         }
         // The vblank after now, and not before the one after the previous queued frame.
@@ -366,15 +370,15 @@ public:
         float percent = 0.0f;
         if (sync == PresentSync::immediate && pending_.empty()) {
             flip = now;
-            std::uint64_t late_us = 0;
-            for (const Record& r : records_)
-                if (r.token == token && now > r.due_us) late_us = now - r.due_us;
+            const std::uint64_t late_us = record && now > record->due_us ? now - record->due_us : 0;
             percent = scan_percent(late_us, period_us_);
             ++immediate_presents_;
         }
-        pending_.push_back(Pending{token, flip, percent});
-        for (Record& r : records_)
-            if (r.token == token) { r.presented = true; r.present_us = now; }
+        pending_.push_back(Pending{record ? token : 0, flip, percent});
+        if (record) {
+            record->presented = true;
+            record->present_us = now;
+        }
         retire_locked(now);
         cv_.notify_all();
     }
@@ -484,7 +488,7 @@ private:
         bool presented = false, displayed = false;
     };
 
-    void record_present_timing_locked(std::uint64_t now, std::uint64_t token) {
+    Record* record_present_timing_locked(std::uint64_t now, std::uint64_t token) {
         ++presents_recorded_;
         if (has_last_present_ && now >= last_present_us_) {
             interval_ring_[interval_head_] = now - last_present_us_;
@@ -494,17 +498,18 @@ private:
         has_last_present_ = true;
         last_present_us_ = now;
         if (token != 0) {
-            for (const Record& r : records_) {
+            for (Record& r : records_) {
                 if (r.token == token) {
                     if (now >= r.origin_us) {
                         latency_ring_[latency_head_] = now - r.origin_us;
                         latency_head_ = (latency_head_ + 1) % frame_pacing_window;
                         if (latency_count_ < frame_pacing_window) ++latency_count_;
                     }
-                    break;
+                    return &r;
                 }
             }
         }
+        return nullptr;
     }
 
     // Frames whose vblank has come are shown.
