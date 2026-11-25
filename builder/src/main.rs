@@ -11,6 +11,12 @@ use eframe::egui::{
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 
+const ASSETS: usize = 2;
+const RUNTIME: usize = 3;
+/// What running the port takes. The asset export is 370 GB that only the asset tools read, and the pipeline test is
+/// hours; both stay one click away.
+const RUN_STEPS: [bool; 5] = [true, true, false, true, false];
+
 const SIZE: Vec2 = vec2(960.0, 600.0);
 const PAGE: Color32 = Color32::from_rgb(19, 18, 24);
 const INK: Color32 = Color32::from_rgb(240, 238, 244);
@@ -62,7 +68,7 @@ enum Page {
 
 struct Found {
     python: Option<Vec<String>>,
-    out: Option<String>,
+    defaults: Option<(String, bool)>,
     games: Vec<(String, String)>,
 }
 
@@ -139,11 +145,11 @@ impl App {
         let (r, c) = (root.clone(), ctx.clone());
         std::thread::spawn(move || {
             let python = backend::find_python();
-            let (out, games) = match (&python, &r) {
-                (Some(p), Some(r)) => (backend::default_out(p, r), backend::find_games(p, r)),
+            let (defaults, games) = match (&python, &r) {
+                (Some(p), Some(r)) => (backend::defaults(p, r), backend::find_games(p, r)),
                 _ => (None, vec![]),
             };
-            let _ = tx.send(Found { python, out, games });
+            let _ = tx.send(Found { python, defaults, games });
             c.request_repaint();
         });
         Self {
@@ -156,7 +162,7 @@ impl App {
             out: config.get("out").into(),
             default_out: String::new(),
             jobs: (std::thread::available_parallelism().map_or(2, |n| n.get()) / 2).max(1),
-            stages: [true; 5],
+            stages: RUN_STEPS,
             page: Page::Files,
             check_only: false,
             show_log: false,
@@ -192,7 +198,11 @@ impl App {
         if let Some(f) = self.searching.as_ref().and_then(|r| r.try_recv().ok()) {
             self.searching = None;
             self.python = f.python;
-            self.default_out = f.out.unwrap_or_default();
+            let (out, runtime) = f.defaults.unwrap_or_default();
+            self.default_out = out;
+            if !runtime {
+                self.stages[RUNTIME] = false; // it can't be built here; asking for it by name would stop the build
+            }
             if self.out.is_empty() {
                 self.out = self.default_out.clone();
             }
@@ -523,7 +533,7 @@ impl App {
         self.label(ui, 64.0, 444.0, "Steps to run");
         let mut x = 64.0;
         for i in 1..5 {
-            let name = STAGES[i].1;
+            let name = if i == ASSETS { "Export assets, 370 GB" } else { STAGES[i].1 };
             let g = ui.painter().layout_no_wrap(name.into(), semi(13.0), INK);
             let rect = r(x, 460.0, g.size().x + 46.0, 36.0);
             let resp = hit(ui, rect, &format!("stage{i}"), name, true);
@@ -548,7 +558,7 @@ impl App {
         } else if self.chosen.is_none() && self.searching.is_none() {
             ("Choose your game files to continue.", SOFT)
         } else {
-            ("The first build takes hours and hundreds of GB. You can stop and resume.", SOFT)
+            (if self.stages[ASSETS] { "Needs about 400 GB and takes hours. You can stop and resume." } else { "Needs about 30 GB and takes a while. You can stop and resume." }, SOFT)
         };
         let g = ui.painter().layout(msg.into(), reg(13.0), ink, 480.0);
         ui.painter().galley(pos2(64.0, 546.0 - g.size().y / 2.0), g, ink);

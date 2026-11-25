@@ -167,12 +167,18 @@ pub fn python(py: &[String], root: &Path) -> Command {
     c
 }
 
-/// make_game.py's own default output folder (iCloud and redirected Documents are its business).
-pub fn default_out(py: &[String], root: &Path) -> Option<String> {
-    let code = "import sys; sys.path.insert(0, sys.argv[1]); import make_game; print(make_game.default_out())";
+/// make_game.py's own default output folder (iCloud and redirected Documents are its business), and whether it can
+/// build the runtime here: off Windows that takes a cross-build.
+pub fn defaults(py: &[String], root: &Path) -> Option<(String, bool)> {
+    let code = "import os, sys; sys.path.insert(0, sys.argv[1]); import make_game; print(make_game.default_out()); \
+                print(int(os.name == 'nt' or not make_game.cross_build_missing()))";
     let o = python(py, root).args(["-c", code]).arg(root).output().ok()?;
-    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-    (o.status.success() && !s.is_empty()).then_some(s)
+    parse_defaults(&String::from_utf8_lossy(&o.stdout))
+}
+
+fn parse_defaults(text: &str) -> Option<(String, bool)> {
+    let (out, runtime) = text.trim().rsplit_once('\n')?;
+    Some((out.trim().to_string(), runtime.trim() == "1"))
 }
 
 /// `make_game.py --find`: (folder, title and version) of each copy on this computer.
@@ -293,6 +299,12 @@ mod tests {
     fn find_output_keeps_folders_with_brackets() {
         let t = "/games/a (copy)  (Game 1.0)\nnot usable: /x  (packaged)\n1 found\n";
         assert_eq!(parse_find(t), vec![("/games/a (copy)".to_string(), "Game 1.0".to_string())]);
+    }
+
+    #[test]
+    fn asks_make_game_for_its_defaults() {
+        assert_eq!(parse_defaults("/a b/Leonida\r\n0\r\n"), Some(("/a b/Leonida".into(), false)));
+        assert!(defaults(&find_python().unwrap(), &find_root().unwrap()).is_some());
     }
 
     #[cfg(unix)]
