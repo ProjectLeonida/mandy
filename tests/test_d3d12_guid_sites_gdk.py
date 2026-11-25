@@ -39,6 +39,13 @@ class TestD3d12GuidSitesGdk(unittest.TestCase):
     def test_read_gdk_guids_missing_or_invalid_returns_empty(self) -> None:
         self.assertEqual(dgs.read_gdk_guids("/nonexistent/gdk.json"), {})
 
+    def test_read_gdk_guids_non_dict_json_returns_empty(self) -> None:
+        with TemporaryDirectory() as tmp:
+            p = Path(tmp) / "gdk.json"
+            for doc in ("[1, 2, 3]", '"text"', "42", "null"):
+                p.write_text(doc, encoding="utf-8")
+                self.assertEqual(dgs.read_gdk_guids(str(p)), {})
+
 
 if __name__ == "__main__":
     unittest.main()

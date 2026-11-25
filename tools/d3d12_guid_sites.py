@@ -76,6 +76,8 @@ def read_gdk_guids(path: str) -> dict[str, uuid.UUID]:
             doc = json.load(f)
     except (OSError, ValueError):
         return {}
+    if not isinstance(doc, dict):
+        return {}
     out: dict[str, uuid.UUID] = {}
     for section in ("classes", "interfaces"):
         entries = doc.get(section)
