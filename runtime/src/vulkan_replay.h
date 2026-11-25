@@ -1431,6 +1431,29 @@ struct PreparedDraw {
     }
 };
 
+// Fixed-function attachment operations are ordered within a rendering scope. Keep compatible direct draws in
+// that scope instead of storing/loading the same attachments and ordering them again between every draw.
+// Pipeline identity deliberately keeps this conservative (including depth/stencil attachment selection).
+inline bool same_rendering_scope(const PreparedDraw& a, const PreparedDraw& b) {
+    if (a.graphics != b.graphics || a.pipeline != b.pipeline || a.area.width != b.area.width ||
+        a.area.height != b.area.height || a.layers != b.layers || a.colors.size() != b.colors.size())
+        return false;
+    const auto same_attachment = [](const PreparedDraw::Attachment& x, const PreparedDraw::Attachment& y,
+                                    VkImageLayout wanted) {
+        if (x.id != y.id) return false;
+        if (!x.id) return true;  // neither slot participates in rendering
+        return x.view == y.view && x.binding.image == y.binding.image &&
+               image_layout(x.binding, wanted) == image_layout(y.binding, wanted) &&
+               x.range.aspectMask == y.range.aspectMask && x.range.baseMipLevel == y.range.baseMipLevel &&
+               x.range.levelCount == y.range.levelCount && x.range.baseArrayLayer == y.range.baseArrayLayer &&
+               x.range.layerCount == y.range.layerCount;
+    };
+    for (std::size_t slot = 0; slot < a.colors.size(); ++slot)
+        if (!same_attachment(a.colors[slot], b.colors[slot], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL))
+            return false;
+    return same_attachment(a.depth, b.depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+}
+
 // D3D converts a float clear value to a normalised format by rounding to nearest even, so an exact tie goes to the
 // even neighbour (0.5 on 8 bits is 128). Vulkan leaves the rounding of ties to the GPU, and NVIDIA writes 127, one
 // step below WARP and AMD. The value is rounded here and handed over as the exact fraction, which no GPU rounds
@@ -3031,8 +3054,8 @@ inline constexpr VkQueryPipelineStatisticFlags kForbiddenMeshStatisticsFlags =
 // 0. A query that holds a mesh draw is split as well (D3D-291): a segment's first draw decides whether it runs in
 // the full pool or in the mesh one (statistics_mesh), and a later draw of the other kind ends it and begins one of
 // its own kind.
-// Dispatches and segments without draws use the full pool; ExecuteIndirect draws count as vertex draws. Each draw
-// has its own rendering scope, so a split before one stays outside rendering, as a helper's does.
+// Dispatches and segments without draws use the full pool; ExecuteIndirect draws count as vertex draws. Replay
+// closes any shared draw rendering scope before a segment boundary or helper, keeping both outside rendering.
 inline void plan_statistics_segments(PreparedList& out) {
     detail::PreparedQuery* begin = nullptr;
     // A split point (a helper or a resolve), or a draw: kind 0 vertex, 1 mesh.
@@ -4348,6 +4371,13 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
     const bool predicates = vk.begin_conditional_rendering != nullptr;
     VkConditionalRenderingBeginInfoEXT predicate{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
     std::size_t next_query = 0;
+    const detail::PreparedDraw* rendering_draw = nullptr;
+    const auto end_rendering = [&] {
+        if (rendering_draw) {
+            vk.end_rendering(command_buffer);
+            rendering_draw = nullptr;
+        }
+    };
     // A dispatch honours conditional rendering and a copy does not (the layer runs copies unpredicated), so the
     // conversion around a copy must run whatever the predicate says: end it for the dispatch and begin it again.
     const auto run_depth24 = [&](const Depth24Job& job) {
@@ -4369,6 +4399,15 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
         const auto raster = draw_command(command);
+        const auto* next_draw = raster.state ? &prepared.draws[p.draw] : nullptr;
+        const bool keep_rendering = next_draw && !raster.arguments && !next_draw->skipped &&
+            !next_draw->quad_indices.buffer && !p.indirect_clamp.buffer &&
+            p.statistics_end == detail::PreparedQuery::no_segment &&
+            p.statistics_begin == detail::PreparedQuery::no_segment;
+        // Close before queries, barriers, copies, predicate changes, helper dispatches and segment resets. Even a
+        // dropped draw ends the run: only consecutive compatible direct draws share a scope.
+        if (rendering_draw && (!keep_rendering || !detail::same_rendering_scope(*rendering_draw, *next_draw)))
+            end_rendering();
         if (next_query < prepared.queries.size() && prepared.queries[next_query].command == i) {
             if constexpr (Checkpoints)
                 if (std::holds_alternative<ResolveQueries>(command))
@@ -4376,7 +4415,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             emit_query(prepared, prepared.queries[next_query++], command_buffer, vk, predicate);
             continue;
         }
-        // Helpers run outside the per-command rendering scopes; both segment endpoints stay outside too.
+        // Helpers and both segment endpoints run outside rendering scopes.
         const auto end_statistics = [&] {
             detail::end_statistics_segment(prepared, p.statistics_end, command_buffer, vk);
         };
@@ -5159,44 +5198,47 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             if constexpr (Checkpoints)
                 checkpoints->record(command_buffer, i, CheckpointKind::draw,
                                     d.pipeline, draw->pipeline);
-            constexpr VkAccessFlags color_access =
-                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            constexpr VkAccessFlags depth_access =
-                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-            constexpr VkPipelineStageFlags depth_stages =
-                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-            std::array<VkRenderingAttachmentInfo, detail::max_render_targets> colors;
-            colors.fill({VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO});
-            for (std::size_t slot = 0; slot < d.colors.size(); ++slot) {
-                const auto& a = d.colors[slot];
-                if (!a.id) continue;  // an unbound slot: no image view, writes are dropped
-                const VkImageLayout layout = image_layout(a.binding, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-                detail::to_attachment(vk, command_buffer, a, layout, color_access,
-                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, tracker, separate);
-                colors[slot].imageView = a.view;
-                colors[slot].imageLayout = layout;
-                colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                colors[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            }
-            VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-            if (d.depth.id) {
-                const VkImageLayout layout = image_layout(d.depth.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-                detail::to_attachment(vk, command_buffer, d.depth, layout, depth_access, depth_stages, tracker,
-                                      separate);
-                depth.imageView = d.depth.view;
-                depth.imageLayout = layout;
-                depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            }
-            VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
-            rendering.renderArea = {{0, 0}, d.area};
-            rendering.layerCount = d.layers;  // array views: SV_RenderTargetArrayIndex picks the layer
-            rendering.colorAttachmentCount = std::uint32_t(d.colors.size());
-            rendering.pColorAttachments = colors.data();
             const GraphicsPipeline& graphics = *d.graphics;
-            if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
-            if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
-            vk.begin_rendering(command_buffer, &rendering);
+            if (!rendering_draw) {
+                constexpr VkAccessFlags color_access =
+                    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                constexpr VkAccessFlags depth_access =
+                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                constexpr VkPipelineStageFlags depth_stages =
+                    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+                std::array<VkRenderingAttachmentInfo, detail::max_render_targets> colors;
+                colors.fill({VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO});
+                for (std::size_t slot = 0; slot < d.colors.size(); ++slot) {
+                    const auto& a = d.colors[slot];
+                    if (!a.id) continue;  // an unbound slot: no image view, writes are dropped
+                    const VkImageLayout layout = image_layout(a.binding, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                    detail::to_attachment(vk, command_buffer, a, layout, color_access,
+                                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, tracker, separate);
+                    colors[slot].imageView = a.view;
+                    colors[slot].imageLayout = layout;
+                    colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                    colors[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                }
+                VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+                if (d.depth.id) {
+                    const VkImageLayout layout = image_layout(d.depth.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                    detail::to_attachment(vk, command_buffer, d.depth, layout, depth_access, depth_stages, tracker,
+                                          separate);
+                    depth.imageView = d.depth.view;
+                    depth.imageLayout = layout;
+                    depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                    depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                }
+                VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+                rendering.renderArea = {{0, 0}, d.area};
+                rendering.layerCount = d.layers;  // array views: SV_RenderTargetArrayIndex picks the layer
+                rendering.colorAttachmentCount = std::uint32_t(d.colors.size());
+                rendering.pColorAttachments = colors.data();
+                if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
+                if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
+                vk.begin_rendering(command_buffer, &rendering);
+                rendering_draw = &d;
+            }
 
             ShaderUserData data{};
             std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
@@ -5325,9 +5367,10 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             } else {
                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
             }
-            vk.end_rendering(command_buffer);
+            if (!keep_rendering) end_rendering();
         }
     }
+    end_rendering();
     // Predication does not carry over to the next command list.
     if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
     if (!open_labels) close_labels(command_buffer, vk, own_labels);

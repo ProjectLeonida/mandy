@@ -1059,8 +1059,22 @@ The compute path, end to end:
   - **Buffers:** vertex and index views resolve to buffers by VA (arena or upload). A view that runs past its
     buffer is cut at the buffer's end. An unbound vertex slot, or an indexed draw with no index buffer, reads the
     arena's reserved first 64 KiB, which is kept zero (stride 0), so it gets the zeros D3D12 gives.
-  - **Attachments:** they move to attachment layouts through the tracker, and the draw runs in a
-    dynamic-rendering scope. Its layer count is the smallest layer count of the bound views.
+  - **Attachments:** they move to attachment layouts through the tracker. Consecutive resolved direct draws share
+    a dynamic-rendering scope when the prepared graphics pipeline, attachment slots/images/views/ranges/layouts,
+    render area and layer count match. Its layer count is the smallest layer count of the bound views. Every other
+    command, skipped draw, indirect draw, statistics segment endpoint or GPU helper closes the scope first. Each
+    draw still binds its own state and push constants; only redundant attachment dependencies and scope boundaries
+    are removed (D3D-REPLAY-DRAW-SCOPE-RUNS). Vulkan guarantees fixed-function depth/stencil/blend ordering in
+    [rasterization order](https://docs.vulkan.org/spec/latest/chapters/primsrast.html#primsrast-order) within the
+    scope. `replay_rendering_scope_test` checks the boundaries with CPU mocks; `vk_rendering_scope_test` checks
+    overlapping depth-tested and blended draws against independently calculated pixels and offers `--bench` for
+    CPU replay and GPU/frame timings, without game files.
+    Build `vk_rendering_scope_test` with CMake and run it once with `LEONIDA_VK_VALIDATION=1` for correctness,
+    then without validation with `--bench` for timings. It compares 1,000/10,000 draws in compatible runs of
+    1/4/16/64/all draws separated by global UAV barriers. Preparation and pipeline creation are outside the
+    measurements; `emit_ms` measures Vulkan command recording, `gpu_ms` brackets replay after draining the clears,
+    and `frame_ms` includes recording, submission, readback and waiting for GPU completion. Those are serialized
+    synthetic frame costs, not the game's FPS. Timings have no pass/fail threshold.
   - **Viewport:** it is flipped (negative height), because translated vertex shaders write D3D clip coordinates;
     front-face winding then matches D3D12's.
   - Only the first viewport and scissor are used, and primitive restart is not modelled yet.
@@ -3245,8 +3259,9 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
 - Render passes: `BeginRenderPass`/`EndRenderPass` map to `vkCmdBeginRendering`/`vkCmdEndRendering` (dynamic
   rendering). The `D3D12_RENDER_PASS_BEGINNING_ACCESS`/`ENDING_ACCESS` types give the load/store ops and resolve
   targets. Suspending/resuming passes have no direct Vulkan equivalent; split them into two rendering scopes with
-  the same attachments and `LOAD`/`STORE`. If the game does not use render passes, build a rendering scope per draw
-  from the bound RTVs/DSV and let explicit `Clear*View` calls do the clears.
+  the same attachments and `LOAD`/`STORE`. Draws recorded outside explicit render passes use the bound RTVs/DSV
+  with `LOAD`/`STORE`; consecutive compatible direct draws share a scope as described in section 3.2.
+  Explicit `Clear*View` calls still do the clears and end any preceding draw scope.
 
 ### 4.4 Fences, queues and frames in flight
 
