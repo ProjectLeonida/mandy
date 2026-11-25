@@ -25,6 +25,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -1072,31 +1073,32 @@ public:
     // The size of the module's file in bytes, or 0 when it is missing: what spirv() would read, without reading it.
     std::size_t spirv_bytes(const ShaderEntry& entry) const {
         std::error_code ec;
-        auto path = dir_;
-        path += "/" + entry.name + ".spv";
-        auto size = std::filesystem::file_size(path, ec);
-        if (ec && !entry.spv_file.empty()) {
-            auto alt = dir_;
-            alt += "/" + entry.spv_file;
-            size = std::filesystem::file_size(alt, ec);
-        }
+        auto size = std::filesystem::file_size(module_path(entry.name + ".spv"), ec);
+        if (ec && !entry.spv_file.empty()) size = std::filesystem::file_size(module_path(entry.spv_file), ec);
         return ec ? 0 : static_cast<std::size_t>(size);
     }
 
     // The module's words, or empty when <dir>/<name>.spv is missing or not SPIR-V.
     std::vector<std::uint32_t> spirv(const ShaderEntry& entry) const {
-        auto path = dir_;
-        path += "/" + entry.name + ".spv";
-        std::ifstream file(path, std::ios::binary | std::ios::ate);
-        if (!file && !entry.spv_file.empty()) {
-            auto alt = dir_;
-            alt += "/" + entry.spv_file;
-            file.open(alt, std::ios::binary | std::ios::ate);
-        }
+        std::ifstream file(module_path(entry.name + ".spv"), std::ios::binary | std::ios::ate);
+        if (!file && !entry.spv_file.empty()) file.open(module_path(entry.spv_file), std::ios::binary | std::ios::ate);
         return read_spirv_words(file, file.tellg());
     }
 
 private:
+    std::filesystem::path module_path(std::string_view filename) const {
+        // Index strings are UTF-8, including the optional explicit SPIR-V filename.
+        try {
+            std::u8string suffix = u8"/";
+            suffix.append(filename.begin(), filename.end());
+            auto path = dir_;
+            path += suffix;
+            return path;
+        } catch (const std::system_error&) {
+            return {};  // a filename the host cannot decode is an unavailable module
+        }
+    }
+
     // A non-negative integer field, or 0 when it is missing, not a number or out of range.
     static std::uint32_t u32(const Json* value) {
         if (!value || value->kind != Json::Kind::number) return 0;
