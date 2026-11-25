@@ -12,6 +12,7 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdint>
@@ -76,9 +77,12 @@ public:
         int containing = 0;
         const Entry* below = nullptr;
         const Entry* above = nullptr;
+        // "containing" only for an object the address itself is in; one that shares only the reported page with it is
+        // "on the page", since the driver gives the fault address no closer than `precision`.
+        const auto inside = [&](const Entry& e) { return address >= e.base && address - e.base < e.size; };
         for (const auto& [base, e] : live_) {
             if (overlaps(e)) {
-                if (containing++ < 16) out += describe("live, containing", e, address);
+                if (containing++ < 16) out += describe(inside(e) ? "live, containing" : "live, on the page", e, address);
                 continue;
             }
             if (base + e.size <= lo && (!below || base + e.size > below->base + below->size)) below = &e;
@@ -89,7 +93,7 @@ public:
         int held = 0;
         for (auto it = unbound_.rbegin(); it != unbound_.rend() && held < 16; ++it)
             if (overlaps(*it)) {
-                out += describe("unbound, held it", *it, address);
+                out += describe(inside(*it) ? "unbound, held it" : "unbound, held the page", *it, address);
                 ++held;
             }
         if (!containing && !held) out += "  nothing live or recently unbound there\n";
@@ -142,6 +146,7 @@ private:
 };
 
 struct State {
+    std::mutex install;  // the messenger fields below; the record has a lock of its own
     Record record;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     VkPhysicalDeviceAddressBindingReportFeaturesEXT feature{
@@ -149,7 +154,9 @@ struct State {
     VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
     VkInstance messenger_instance = VK_NULL_HANDLE;
     PFN_vkDestroyDebugUtilsMessengerEXT destroy_messenger = nullptr;
-    bool on = false;
+    // A device enabled the report and this process's messenger records it. Read at a device fault on whatever thread
+    // notices it, so atomic.
+    std::atomic<bool> on{false};
 };
 
 inline State& state() {
@@ -185,11 +192,22 @@ inline VKAPI_ATTR VkBool32 VKAPI_CALL on_message(VkDebugUtilsMessageSeverityFlag
     return VK_FALSE;
 }
 
-// Before vkCreateDevice: adds the extension and its feature to `device`'s chain when the device has them.
-inline bool enable_device(VkPhysicalDevice physical, PFN_vkGetPhysicalDeviceFeatures2 query,
+// Before vkCreateDevice: adds the extension and its feature to `device`'s chain when the device has them and
+// `instance` has this process's messenger. Without the messenger nothing would record the reports, so the device is
+// left as it is and a fault report says the bindings were not recorded.
+inline bool enable_device(VkInstance instance, VkPhysicalDevice physical, PFN_vkGetPhysicalDeviceFeatures2 query,
                           std::span<const VkExtensionProperties> advertised, std::vector<const char*>& extensions,
                           VkDeviceCreateInfo& device) {
     if (!requested() || !query) return false;
+    {
+        State& s = state();
+        std::lock_guard lock(s.install);
+        if (!s.messenger || s.messenger_instance != instance) {
+            std::fprintf(stderr, "[rt] address-binding: no messenger on this device's instance; bindings are not "
+                                 "recorded\n");
+            return false;
+        }
+    }
     const bool has = std::any_of(advertised.begin(), advertised.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME) == 0;
     });
@@ -228,13 +246,22 @@ inline void install_messenger(VkInstance instance, PFN_vkGetInstanceProcAddr get
     info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT;
     info.pfnUserCallback = &on_message;
     State& s = state();
-    const VkResult r = create(instance, &info, nullptr, &s.messenger);
+    std::lock_guard lock(s.install);
+    // One record per process: a second instance (a second device in one process) would mix its GPU addresses with
+    // the first's, and overwriting the handle would leave the first messenger alive past its instance. So the
+    // second one is refused, and its device is not enabled.
+    if (s.messenger) {
+        std::fprintf(stderr, "[rt] address-binding: a messenger is already installed for another instance; this "
+                             "instance's bindings are not recorded\n");
+        return;
+    }
+    VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
+    const VkResult r = create(instance, &info, nullptr, &messenger);
     if (r == VK_SUCCESS) {
+        s.messenger = messenger;
         s.messenger_instance = instance;
         s.destroy_messenger = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
             get(instance, "vkDestroyDebugUtilsMessengerEXT"));
-    } else {
-        s.messenger = VK_NULL_HANDLE;
     }
     std::fprintf(stderr, "[rt] address-binding: messenger %s\n", r == VK_SUCCESS ? "installed" : "failed");
 }
@@ -242,17 +269,26 @@ inline void install_messenger(VkInstance instance, PFN_vkGetInstanceProcAddr get
 // Before vkDestroyInstance: a messenger may not outlive its instance. What it recorded stays.
 inline void uninstall_messenger(VkInstance instance) {
     State& s = state();
+    std::lock_guard lock(s.install);
     if (!s.messenger || s.messenger_instance != instance) return;
     if (s.destroy_messenger) s.destroy_messenger(instance, s.messenger, nullptr);
     s.messenger = VK_NULL_HANDLE;
     s.messenger_instance = VK_NULL_HANDLE;
+    s.destroy_messenger = nullptr;
     s.on = false;
 }
 
 // At a device fault: what the driver had bound at and around `address`, on stderr.
 inline void describe(std::uint64_t address, std::uint64_t precision) {
     State& s = state();
-    if (!s.on) return;
+    if (!s.on) {
+        // Asked for but not recording: say so, rather than leave a report that reads as "no object there".
+        if (requested())
+            std::fprintf(stderr, "[rt] address-binding: 0x%" PRIx64 ": bindings were not recorded for this device (no "
+                                 "messenger or no VK_EXT_device_address_binding_report; see the address-binding "
+                                 "lines at startup)\n", address);
+        return;
+    }
     const std::string text = s.record.report(address, precision);
     std::size_t at = 0;
     while (at < text.size()) {

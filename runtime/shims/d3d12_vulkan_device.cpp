@@ -18533,8 +18533,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (aftermath && !info.device_diagnostics_config)
         std::fprintf(stderr, "[rt] aftermath: VK_NV_device_diagnostics_config unavailable; the dump has no shader "
                              "debug info, resource tracking or checkpoints\n");
-    leonida::address_binding::enable_device(info.physical, vkGetPhysicalDeviceFeatures2, extensions, device_extensions,
-                                            device_info);
+    leonida::address_binding::enable_device(owned.instance, info.physical, vkGetPhysicalDeviceFeatures2, extensions,
+                                            device_extensions, device_info);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
