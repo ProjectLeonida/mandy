@@ -385,6 +385,12 @@ class SmemBodyEvaluator:
     forward selection constructs the bounds check emits (OpSelectionMerge, OpBranchConditional, OpBranch to a later
     label, OpPhi naming the block it came from). The heap base (push constant dwords 32..33) is 0 unless given,
     which makes every address read an Xbox VA.
+
+    A dword whose bound is only known at run time is loaded without a branch, through
+    OpSelect(in range, its address, the V#'s base), and its value is OpSelect(in range, loaded, 0) (#4573: llvmpipe
+    hoisted a branch-guarded load and read 4 GB past the buffer). A load through the out-of-range side of such a
+    select reads nothing the program sees, so it goes to `discarded`, not `reads`: `reads` stays the addresses the
+    hardware rule reads.
     """
 
     def __init__(self, gen, sgpr, memory, heap_base=0):
@@ -395,6 +401,8 @@ class SmemBodyEvaluator:
         self.heap_base = heap_base
         self.ids = {}
         self.reads = []          # byte address of every PhysicalStorageBuffer dword load, in order
+        self.discarded = []      # loads through the out-of-range side of an address OpSelect (value thrown away)
+        self.redirect = set()    # ids derived from that side: the selected address, its pointer, its access chain
         lines = [line.split() for line in gen.body]
         labels = {w[0]: i for i, w in enumerate(lines) if len(w) == 3 and w[1:] == ["=", "OpLabel"]}
         self.block, self.came_from = "%entry", None
@@ -456,12 +464,18 @@ class SmemBodyEvaluator:
             if kind != "psb":
                 raise AssertionError(f"PSB access chain on {kind}")
             value = ("mem", (address + 4 * self._value(args[1])) & MASK64)
+            if args[0] in self.redirect:
+                self.redirect.add(result)
+        elif op == "OpLoad" and ty == "%uint" and args[0] == "%ud_base_lo_p":
+            value = self.heap_base & MASK32
+        elif op == "OpLoad" and ty == "%uint" and args[0] == "%ud_base_hi_p":
+            value = (self.heap_base >> 32) & MASK32
         elif op == "OpLoad" and ty == "%uint":
             kind, where = self._value(args[0])
             if kind == "sgpr":
                 value = self.sgpr.get(where, 0) & MASK32
             elif kind == "mem" and args[1:] == ["Aligned", "4"]:
-                self.reads.append(where)
+                (self.discarded if args[0] in self.redirect else self.reads).append(where)
                 value = self.memory.read_dword(where)
             else:
                 raise AssertionError("unmodelled load: " + " ".join(words))
@@ -500,8 +514,12 @@ class SmemBodyEvaluator:
             if not isinstance(cond, bool):
                 raise AssertionError("OpSelect on a non-bool")
             value = self._value(args[1] if cond else args[2])
+            if ty == "%ulong" and not cond:
+                self.redirect.add(result)
         elif op == "OpConvertUToPtr" and ty == "%_ptr_PSB_arr":
             value = ("psb", self._value(args[0]))
+            if args[0] in self.redirect:
+                self.redirect.add(result)
         else:
             raise AssertionError("unmodelled instruction: " + " ".join(words))
         self.ids[result] = value
