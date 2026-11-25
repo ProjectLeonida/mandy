@@ -2551,6 +2551,31 @@ def build_test_elf(code, guest_va, rw_base=0x700000, rx_base=0x400000):
 
 KERNEL_BASE = 0x40080000          # qemu-system virt -kernel load address
 KERNEL_RW = 0x47000000            # scratch RAM: ctx @ +0, guest stack @ +0x8000
+KERNEL_TTB = 0x10000              # offset in the RW window of the level-1 translation table (one 4 KiB page)
+
+
+def _emit_identity_mmu(s, rw_base, rx_base):
+    """Turn the EL1 MMU on with an identity map of the 1 GiB blocks holding the image and the RW window.
+
+    With the MMU off every data access is Device memory, where an unaligned access is an alignment
+    fault. x86 code reads and writes unaligned everywhere, so the guest needs Normal memory. The table
+    page sits in RAM qemu zeroes at reset; only the block entries in use are written.
+    """
+    ttb = rw_base + KERNEL_TTB
+    s.li(0, ttb)
+    for gib in sorted({rx_base >> 30, rw_base >> 30}):
+        # 1 GiB block: AF, inner shareable, EL1 read/write, executable, MAIR attribute 0
+        s.li(1, (gib << 30) | 0x701)
+        s.str(1, 0, gib * 8, size=8)
+    s.li(1, 0xFF)                          # MAIR attribute 0: Normal, write-back cacheable
+    s.emit(0xD518A201)                     # msr mair_el1, x1
+    s.li(1, 0x200803519)                   # T0SZ=25 (39-bit VA, level-1 start), 4 KiB granule, 40-bit PA, EPD1
+    s.emit(0xD5182041)                     # msr tcr_el1, x1
+    s.emit(0xD5182000)                     # msr ttbr0_el1, x0
+    s.emit(0xD5033FDF)                     # isb
+    s.li(1, 0x30D01805)                    # RES1 bits | I | C | M; A (alignment check) stays clear
+    s.emit(0xD5181001)                     # msr sctlr_el1, x1
+    s.emit(0xD5033FDF)                     # isb
 
 
 def build_test_kernel(code, guest_va, rw_base=KERNEL_RW, rx_base=KERNEL_BASE):
@@ -2568,6 +2593,7 @@ def build_test_kernel(code, guest_va, rw_base=KERNEL_RW, rx_base=KERNEL_BASE):
 
     def stub_bytes(entry_va):
         s = Asm()
+        _emit_identity_mmu(s, rw_base, rx_base)
         s.li(CTX_REG, rw_base)
         s.li(GMAP[4], rw_base + 0x8000)
         s.str(31, GMAP[4], 0)              # guest stack top: sentinel ret -> pc 0

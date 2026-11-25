@@ -361,6 +361,26 @@ class ExecTests(unittest.TestCase):
             "c3"))
         self.assertEqual(r, 42)
 
+    def test_unaligned_memory_access(self):
+        # x86 reads and writes at any address. With the harness MMU off these were Device-memory
+        # accesses and each one took an alignment fault, which hung the run until the timeout.
+        s = SCRATCH
+        setup = ("48 bb " + s.to_bytes(8, "little").hex(),    # mov rbx,scratch
+                 "c7 03 41 42 43 44",                         # mov dword [rbx],0x44434241
+                 "c7 43 04 45 46 47 48")                      # mov dword [rbx+4],0x48474645
+        for tail, want in (
+                ("8b 7b 01", 0x45444342),                     # mov edi,[rbx+1]
+                ("8b 7b 02", 0x46454443),                     # mov edi,[rbx+2]
+                ("0f b7 7b 01", 0x4342),                      # movzx edi,word [rbx+1]
+                ("48 8b 7b 01 48 c1 ef 20", 0x00484746),      # mov rdi,[rbx+1]; shr rdi,32
+                ("66 b8 ef be 66 89 43 03 8b 3b", 0xEF434241),        # mov [rbx+3],ax; mov edi,[rbx]
+                ("b8 44 33 22 11 89 43 02 8b 3b", 0x33444241),        # mov [rbx+2],eax; mov edi,[rbx]
+                ("48 b8 88 77 66 55 44 33 22 11 48 89 43 01 8b 7b 04", 0x22334455)):  # mov [rbx+1],rax
+            with self.subTest(tail=tail):
+                r, tr = run(asm(*setup, tail, "c3"))
+                self.assertEqual(tr.stats["unhandled"], [])
+                self.assertEqual(r, want)
+
     def test_lea_and_indexed_mem(self):
         s = SCRATCH
         r, _ = run(asm(
