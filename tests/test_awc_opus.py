@@ -398,6 +398,29 @@ class ExportBankTest(unittest.TestCase):
             f.write(bank)
         return path, pcm16, floats
 
+    def test_skip_existing_leaves_written_files_alone(self):
+        path, _, _ = self.make_bank()
+        awc.export_bank(path, self.out)
+        written = {}
+        for root, _, files in os.walk(self.out):
+            for name in files:
+                full = os.path.join(root, name)
+                written[full] = os.stat(full).st_mtime_ns
+        self.assertEqual(len(written), 3, written)
+        # Freeze one output so a rewrite is visible, then export again with the flag.
+        target = sorted(written)[0]
+        os.utime(target, ns=(0, 0))
+        counts = awc.export_bank(path, self.out, skip_existing=True)
+        self.assertEqual(os.stat(target).st_mtime_ns, 0, "an existing file was rewritten")
+        for full, mtime in written.items():
+            if full != target:
+                self.assertEqual(os.stat(full).st_mtime_ns, mtime, full)
+        self.assertEqual((counts["opus"], counts["pcm"]), (1, 2), counts)
+        # Control: the same export without the flag does rewrite the frozen file.
+        awc.export_bank(path, self.out)
+        self.assertNotEqual(os.stat(target).st_mtime_ns, 0,
+                            "a plain export should have rewritten the file, so the flag is what spares it")
+
     def test_recursive_cli_preserves_bank_paths(self):
         src = Path(self.tmp.name) / "banks"
         samples = {"north/shared": 11, "south/shared": 22, "flat": 33}
