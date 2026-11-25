@@ -4,7 +4,9 @@
 //   1. a new view is copied whole;
 //   2. a write into one tile of a 1 MiB view (16 tiles) copies that tile's 64 KiB again, not the view;
 //   3. a write into a tile two views share is read once and copied into both;
-//   4. two written tiles of one view are two tile copies (LEONIDA_GEOMETRY_WHOLE_VIEWS=1, whole views, fails 2-4).
+//   4. two written tiles of one view are two tile copies (LEONIDA_GEOMETRY_WHOLE_VIEWS=1, whole views, fails 2-4);
+//   5. two address-adjacent written tiles of one view are one 128 KiB copy (the adjacent copy-range merge);
+//   6. a run is capped at 1 MiB: 32 adjacent written tiles are two 1 MiB copies, not one 2 MiB allocation.
 #include <windows.h>
 
 #include <cstdint>
@@ -159,6 +161,24 @@ int main() {
     views.refresh(copy);
     check(g_copies.size() == 2 && g_copies[0] == kTile && g_copies[1] == kTile, "two written tiles, two tile copies");
     check(!std::memcmp(copy_bytes, title, kView), "the copy matches the title's pages");
+
+    // 5. Writes in two address-adjacent tiles of one view: one 128 KiB copy, not two 64 KiB ones.
+    g_copies.clear();
+    title_write(base + 6 * kTile + 7, 3);
+    title_write(base + 7 * kTile + 11, 4);
+    views.refresh(copy);
+    check(g_copies.size() == 1 && g_copies[0] == 2 * kTile, "two adjacent written tiles are one 128 KiB copy");
+    check(copy_bytes[6 * kTile + 7] == 3 && copy_bytes[7 * kTile + 11] == 4, "both adjacent tiles reached the copy");
+    check(!std::memcmp(copy_bytes, title, kView), "the copy matches the title's pages after the merged run");
+
+    // 6. A run is capped at 1 MiB: 32 adjacent written tiles are two 1 MiB copies, not one 2 MiB allocation.
+    const std::uint64_t va3 = views.resolve(device, base, 32 * kTile, copy);
+    check(va3 != 0, "a two-MiB view over the watched tiles");
+    g_copies.clear();
+    for (std::size_t t = 0; t < 32; ++t) title_write(base + t * kTile + t, std::uint8_t(0x40 + t));
+    views.refresh(copy);
+    check(g_copies.size() == 2 && g_copies[0] == 16 * kTile && g_copies[1] == 16 * kTile,
+          "a 32-tile adjacent run is two 1 MiB copies");
 
     views.release(device);
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
