@@ -1,9 +1,11 @@
 """tools/sandbox_scene.py: entity world rows, nearest-first selection and the packed vertex layout."""
+import hashlib
 import io
 import json
 import os
 import sys
 import struct
+import subprocess
 import tempfile
 import tracemalloc
 import unittest
@@ -11,6 +13,7 @@ from contextlib import redirect_stderr
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools'))
 import sandbox_scene
+import world_names
 
 class TestSandboxScene(unittest.TestCase):
     def test_draw_rows(self):
@@ -183,6 +186,79 @@ class TestCliErrors(unittest.TestCase):
         self.assertEqual(err.getvalue(), "")
         with open(out, "rb") as f:
             self.assertEqual(f.read(4), b"LSB1")
+
+
+class TestAtomicSceneOutput(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.script = os.path.join(self.root, "tools", "sandbox_scene.py")
+        self.models = os.path.join(self.tmp.name, "models")
+        os.mkdir(self.models)
+        model_name = "synthetic_atomic_scene_prop"
+        vertex_count = 60
+        obj = "\n".join([
+            *(f"v {i} 0 0" for i in range(vertex_count)),
+            *(f"f {i} {i + 1} {i + 2}" for i in range(1, vertex_count - 1, 3)),
+        ]) + "\n"
+        with open(os.path.join(self.models, model_name + ".obj"), "w", encoding="utf-8") as f:
+            f.write(obj)
+        with open(os.path.join(self.models, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump({"Items": [{"Name": model_name, "File": model_name + ".obj", "MeshShaders": [0]}]}, f)
+        self.entities = os.path.join(self.tmp.name, "entities.jsonl")
+        with open(self.entities, "w", encoding="utf-8") as f:
+            json.dump({"archetype": world_names.joaat(model_name), "position": [0, 0, 0],
+                       "rotation": [0, 0, 0, 1], "lod_level": 0}, f)
+            f.write("\n")
+
+    def _run(self, out, limited=False):
+        command = [sys.executable, "-I", self.script, "--entities", self.entities,
+                   "--models", self.models, "--center", "0", "0", "--out", out]
+        if limited:
+            return subprocess.run(
+                ["bash", "-c", 'trap "" XFSZ; ulimit -f 1; exec "$@"', "sandbox-scene", *command],
+                cwd=self.root, capture_output=True, text=True)
+        return subprocess.run(command, cwd=self.root, capture_output=True, text=True)
+
+    def test_failed_write_preserves_existing_output(self):
+        out = os.path.join(self.tmp.name, "scene.bin")
+        original = b"pre-existing scene contents"
+        with open(out, "wb") as f:
+            f.write(original)
+
+        result = self._run(out, limited=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("File too large", result.stderr)
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+    def test_failed_write_leaves_no_temporary_file(self):
+        out = os.path.join(self.tmp.name, "scene.bin")
+        with open(out, "wb") as f:
+            f.write(b"existing")
+
+        result = self._run(out, limited=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(set(os.listdir(self.tmp.name)), {"models", "entities.jsonl", "scene.bin"})
+
+    def test_successful_write_preserves_scene_bytes(self):
+        out = os.path.join(self.tmp.name, "scene.bin")
+        with open(out, "wb") as f:
+            f.write(b"old scene")
+        os.chmod(out, 0o640)
+
+        result = self._run(out)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        expected_sha256 = "c456bc9bd29f8f0d4dd36a983fd70c8fb25ebadbb9a4bd6c97672c2f11a09493"
+        with open(out, "rb") as f:
+            self.assertEqual(hashlib.sha256(f.read()).hexdigest(), expected_sha256)
+        self.assertEqual(os.stat(out).st_mode & 0o777, 0o640)
+        self.assertEqual(set(os.listdir(self.tmp.name)), {"models", "entities.jsonl", "scene.bin"})
 
 
 if __name__ == "__main__":
