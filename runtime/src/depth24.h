@@ -9,6 +9,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 
@@ -28,19 +29,44 @@ inline constexpr std::uint32_t depth24_max = 0xffffff;
 // The conversion of a float to a 24-bit UNORM as WARP and AMD's D3D12 drivers do it (measured against both, 5215
 // clear values, ties and their neighbours included, in d3d12_depth24_compare.h): NaN and values below 0 give 0, 1 and above the
 // maximum, anything in between multiplies by 2^24 - 1 in float (a rounded product, so a value a hair over a tie can
-// land on it) and then rounds to nearest, ties to even (std::nearbyint's default mode). NVIDIA's D3D12 driver breaks
+// land on it) and then rounds to nearest, ties to even. NVIDIA's D3D12 driver breaks
 // some of those ties the other way, and its Vulkan driver, which has a native D24, agrees with it; a texture the
 // layer stores as D32 follows WARP and AMD, which is what the Xbox build's own hardware is.
+//
+// Both roundings (the product to a float, the float to an integer) are the GPU's round-to-nearest-even whatever the
+// calling thread's floating-point rounding mode: a clear can run on a thread that set FE_DOWNWARD or FE_TOWARDZERO,
+// and a float multiply, std::nearbyint and a double-to-float conversion all follow that mode (0x1p-23f gives 1 rather
+// than 2 when rounding down). So the product is formed exactly in a double (24 bits times 24 bits fit in 53, so no
+// rounding happens in any mode) and rounded by depth24_detail::round_even, which uses floor, fmod and ldexp only: those
+// are exact in every mode and need no fenv access.
+namespace depth24_detail {
+// x >= 0 and below 2^52 with x + 0.5 exact (callers pass at most 24 integer bits and 24 fraction bits).
+inline double round_even(double x) {
+    const double r = std::floor(x + 0.5);
+    return r - x == 0.5 && std::fmod(r, 2.0) != 0.0 ? r - 1.0 : r;
+}
+}  // namespace depth24_detail
+
 inline std::uint32_t depth24_quantize(float value) {
     if (!(value > 0.0f)) return 0;
     if (value >= 1.0f) return depth24_max;
-    const float product = value * 16777215.0f;  // a float multiply, not a double one
-    return static_cast<std::uint32_t>(std::nearbyint(product));
+    const double exact = double(value) * 16777215.0;  // exact: 24 + 24 bits
+    // The float product the GPU multiply gives: 24 significant bits, ties to even.
+    int exponent = 0;
+    std::frexp(exact, &exponent);  // exact = f * 2^exponent, f in [0.5, 1)
+    const double product = std::ldexp(depth24_detail::round_even(std::ldexp(exact, 24 - exponent)), exponent - 24);
+    return static_cast<std::uint32_t>(depth24_detail::round_even(product));
 }
 
-// The float stored for a 24-bit UNORM: the nearest float to d / 16777215 (quantising it gives d back).
+// The float stored for a 24-bit UNORM: the nearest float to d / 16777215 (quantising it gives d back). The same
+// arithmetic as depth24_convert.comp, no division: for d = m * 2^(e-23), m of 24 bits, the quotient is exactly
+// float(m + 1) * 2^(e-47) (see the shader). Every step is exact, so the thread's rounding mode does not matter.
 inline float depth24_to_float(std::uint32_t d) {
-    return static_cast<float>(double(d & depth24_max) / double(depth24_max));
+    d &= depth24_max;
+    if (d == 0) return 0.0f;
+    const int e = std::bit_width(d) - 1;
+    const std::uint32_t m = d << (23 - e);
+    return std::ldexp(static_cast<float>(m + 1u), e - 47);
 }
 
 // A depth value as the layer's D32 must hold it for a D24 texture: what a clear writes, so that reading the texture
