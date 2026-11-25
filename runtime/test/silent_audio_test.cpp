@@ -11,6 +11,7 @@
 #include <propsys.h>
 #include <spatialaudioclient.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -639,8 +640,10 @@ void test_spatial_stream() {
     QueryPerformanceCounter(&t0);
     int passes = 0;
     bool buffers_ok = true;
+    LARGE_INTEGER woke[10]{};
     for (int i = 0; i < 10; ++i) {
         if (WaitForSingleObject(event, 500) != WAIT_OBJECT_0) break;
+        QueryPerformanceCounter(&woke[i]);
         if (FAILED(stream->BeginUpdatingAudioObjects(&available, &frames))) break;
         for (ISpatialAudioObject* o : {fl, fr}) {
             buffer = nullptr;
@@ -655,9 +658,21 @@ void test_spatial_stream() {
     }
     QueryPerformanceCounter(&t1);
     const double seconds = static_cast<double>(t1.QuadPart - t0.QuadPart) / static_cast<double>(f.QuadPart);
-    std::printf("  spatial: %d passes in %.1f ms\n", passes, seconds * 1000.0);
+    // The first event comes from Start; the nine after it are one 10 ms period apart. Waking on the default 15.625 ms
+    // system timer tick made every gap one tick (10 passes in about 140 ms). A host so busy that the passes took over
+    // 300 ms starves every thread, so the gaps say nothing about the timer there and are only printed.
+    double gaps[9]{};
+    for (int i = 1; i < 10; ++i)
+        gaps[i - 1] = static_cast<double>(woke[i].QuadPart - woke[i - 1].QuadPart) * 1000.0 /
+                      static_cast<double>(f.QuadPart);
+    std::sort(gaps, gaps + 9);
+    std::printf("  spatial: %d passes in %.1f ms, median gap %.2f ms\n", passes, seconds * 1000.0, gaps[4]);
     check(passes == 10, "the spatial event is signalled every pass while running");
     check(seconds > 0.04 && seconds < 2.0, "the passes come at about real time (10 in 40 ms .. 2 s)");
+    if (passes == 10 && seconds < 0.3)
+        check(gaps[4] > 8.0 && gaps[4] < 12.5, "the passes are 10 ms apart, not one system timer tick");
+    else
+        std::printf("  spatial: the host starved the passes; their spacing is not checked\n");
     check(buffers_ok, "every object gets a 480-frame mono float buffer in each pass");
     BOOL active = TRUE;
     check(fr->IsActive(&active) == S_OK && !active, "an object is inactive after the pass it ended in");
