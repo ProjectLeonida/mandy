@@ -101,6 +101,25 @@ The thunk keeps the Win64 argument registers and the return address intact (it i
 reaches a shared stub that saves them, so a floating-point caller still reads 0.0 from xmm0 and a debugger can unwind
 through it.
 
+### Guest asserts: `LEONIDA_SKIP_ASSERTS`
+
+A title's assert ends in an `int3`. Without a debugger that breakpoint is unhandled and the run ends there.
+`LEONIDA_SKIP_ASSERTS=N` (a decimal number, 1 to 1000000; diagnostic, off by default) makes `--init` and `--run`
+install a vectored exception handler ([src/assert_skip.h](src/assert_skip.h)) before any image code runs. It steps
+over up to N `int3` (the byte 0xCC) at addresses in no host module, the mapped images and code a title wrote
+itself, and prints one line for each:
+
+```
+[rt] LEONIDA_SKIP_ASSERTS: int3 at game.exe+0x1234 stepped over (1 of 3)
+```
+
+After N it says so once (`3 int3 stepped over; the one at ... is not`) and the next `int3` ends the run as before. An
+`int3` in a host module (gta6rt, its shims, a system DLL) is never stepped over. Unset, empty or `0` installs
+nothing; any other value is reported and treated as `0`. No `--trace` is needed; with one, each skip is also an
+`int3_skipped` event and the trace's own handler records the breakpoint and its stack first. `LEONIDA_SKIP_INT3`
+(with `--trace`) is the older switch: it steps over every guest `int3` without a limit and logs each address once;
+while a trace is open it runs first. Each skipped address is a finding, not a fix: a correct run reaches none.
+
 ### Compat modules: `LEONIDA_COMPAT_DIR`
 
 Opt-in. When `LEONIDA_COMPAT_DIR` names a folder, an import whose DLL is a file in that folder (matched by file name,
@@ -598,7 +617,7 @@ from the ANSI code page.
 | `xmem_attributes` | the first `XMemAlloc`, `XMemFree`, `XMemAllocDefault`, `XMemFreeDefault` and `XMemVirtualAlloc` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (not for the frees), `caller` (module+RVA) |
 | `xmem_physical_pages` | the first `XMemAllocatePhysicalPages` for each distinct attribute word | `api`, `attributes`, `pages`, `caller` |
 | `file_open_failed` | a guest `CreateFileW`/`CreateFile2` that fails (at most 256 events) | `api`, `path` (as the title passed it), `error` (Win32), `caller` (module+RVA) |
-| `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over | `at` (module+RVA) |
+| `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over; with `LEONIDA_SKIP_ASSERTS` (below): every int3 it steps over | `at` (module+RVA); `skip` (the count, `LEONIDA_SKIP_ASSERTS` only) |
 | `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
 | `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames) |
 | `exit` / `error` | `--run` returns, or the loader throws | `code` / `what` |
@@ -606,7 +625,7 @@ from the ANSI code page.
 Every line also has `seq` and `t` (seconds since the trace opened). Addresses are `module+0xRVA` for mapped images,
 `host:name.dll+0xRVA` for host modules. The exception handler only records: it returns `EXCEPTION_CONTINUE_SEARCH`,
 so the process behaves the same with or without the trace (except under the diagnostic `LEONIDA_SKIP_INT3`, which
-steps over int3). It works with any `LEONIDA_UNIMPLEMENTED` policy.
+steps over int3; `LEONIDA_SKIP_ASSERTS` steps over int3 with or without the trace). It works with any `LEONIDA_UNIMPLEMENTED` policy.
 
 The file can quote what the game prints, so it stays on your machine. In issues and pull requests, share counts or
 lines from synthetic fixtures only.

@@ -449,6 +449,16 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(int3_skip_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(int3_skip_test PRIVATE /OPT:NOREF)
 
+  # LEONIDA_SKIP_ASSERTS (src/assert_skip.h): int3 in a page no host module owns, stepped over up to a limit.
+  add_executable(assert_skip_test
+    test/assert_skip_test.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(assert_skip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(assert_skip_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(assert_skip_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(assert_skip_test PRIVATE /OPT:NOREF)
+
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
   add_executable(winhttp_offline_test
     test/winhttp_offline_test.cpp
@@ -1548,6 +1558,9 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET int3_skip_test)
     add_test(NAME int3_skip COMMAND int3_skip_test)
   endif()
+  if(WIN32 AND TARGET assert_skip_test)
+    add_test(NAME assert_skip COMMAND assert_skip_test)
+  endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
   endif()
@@ -1734,6 +1747,12 @@ if(BUILD_TESTING)
              "-DTOOL=$<TARGET_FILE:gta6rt>" "-DWANT=${GTA6RT_STACK}"
              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_stack_reserve.cmake")
     add_test(NAME run_tiny_game_stack COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 stack)
+    # LEONIDA_SKIP_ASSERTS (src/assert_skip.h): two int3 in the mapped image, in no host module, are stepped over and
+    # the game carries on to its normal exit. Without the variable the first one would end the run.
+    add_test(NAME run_tiny_game_skip_asserts COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 int3)
+    set_tests_properties(run_tiny_game_skip_asserts PROPERTIES
+      ENVIRONMENT "LEONIDA_SKIP_ASSERTS=2"
+      FAIL_REGULAR_EXPRESSION "tiny_game: FAIL|LEONIDA_SKIP_ASSERTS: [^\n]* is not")
     # A /GA executable under --run and --init reads its TLS from slot 0, and the trace names gta6rt.exe as the image
     # whose index 0 moved.
     add_test(NAME run_tiny_tls_ga COMMAND ${CMAKE_COMMAND}

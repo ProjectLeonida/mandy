@@ -100,6 +100,10 @@ Useful switches:
   `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
+* `LEONIDA_SKIP_ASSERTS=N` steps over up to N int3 in guest code, with or without `--trace`, and prints each one
+  as `[rt] LEONIDA_SKIP_ASSERTS: int3 at <module>+0x... stepped over (k of N)`; the next one after N ends the run as
+  before. An int3 in a host module is never stepped over. The same caveat: each skipped address is a finding
+  ([runtime/README.md](../runtime/README.md), "Guest asserts").
 * `LEONIDA_STUB_PIPELINES=1` creates a pipeline whose translated shader is missing (no shader library, or no entry
   for its program) as a no-op stub instead of failing `CreateGraphicsPipelineState` / `CreateComputePipelineState`.
   The stub is never registered, so `SetPipelineState` binds no PSO and its draws and dispatches are no-ops (D3D-482).

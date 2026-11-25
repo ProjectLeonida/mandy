@@ -141,6 +141,7 @@ void start_title_peek(std::uint8_t* base) {
 
 }  // namespace
 
+#include "assert_skip.h"
 #include "base_reservation.h"
 #include "code_hooks.h"
 #include "cpu_emulation.h"
@@ -407,6 +408,17 @@ int wmain(int argc, wchar_t** argv) {
     if (!rt::cpu_emulation::install())
         std::fprintf(stderr, "[rt] cpu: AddVectoredExceptionHandler failed (error %lu); instructions this CPU lacks "
                              "will stop the game\n", GetLastError());
+    // LEONIDA_SKIP_ASSERTS=N (src/assert_skip.h): up to N int3 in guest code are logged and stepped over. Off unless
+    // set; installed before the first TLS callback, the first image code that runs.
+    if (init || run)
+        if (const unsigned skip_asserts = rt::assert_skip::limit_from_environment()) {
+            if (rt::assert_skip::install(skip_asserts))
+                std::fprintf(stderr, "[rt] LEONIDA_SKIP_ASSERTS=%u: up to %u int3 in guest code are stepped over "
+                                     "(diagnostic)\n", skip_asserts, skip_asserts);
+            else
+                std::fprintf(stderr, "[rt] LEONIDA_SKIP_ASSERTS: AddVectoredExceptionHandler failed (error %lu); off\n",
+                             GetLastError());
+        }
 
     try {
         rt::Loader loader(game_dir);

@@ -1,6 +1,6 @@
 // A stand-in game executable for `gta6rt --run`: what a real title does in its first second, run through the
 // loader instead of the Windows one. Test code, not game content. Run as
-//   gta6rt --run tiny_game.exe -- hello 42 [tls] [eh] [stack] [game-file] [exit-code] [abort-mode]
+//   gta6rt --run tiny_game.exe -- hello 42 [tls] [eh] [stack] [game-file] [int3] [exit-code] [abort-mode]
 // It checks its arguments, a static initializer, the heap, a file round trip, a second thread, and the
 // xgameruntime.dll imports (answered by the shim registry: the stub DLL it links against would fail them), then
 // calls exit() with 0 (42 with `exit-code`) when everything held. Two checks are opt-in, by argument (CTest's
@@ -12,6 +12,8 @@
 // A fourth, `stack` (run_tiny_game_stack), checks that the entry thread and a thread created with dwStackSize 0
 // both have 8 MB of stack: a driver compiles shaders on the game's threads (BUILD-1457). Only under gta6rt: run
 // natively, the second thread gets this program's own 1 MB.
+// `int3` (run_tiny_game_skip_asserts) runs two soft asserts, an int3 at each of two sites followed by code that
+// carries on, as a title's assert does; it passes only under LEONIDA_SKIP_ASSERTS=2 or more, which steps over them.
 // An `abort-*` mode installs a SIGABRT disposition and calls abort(); tiny_game_abort_test compares the exact exit
 // codes with a native run of the same image. No game files.
 // On MSVC, `eh` needs more than the unwind tables #176 registers: _CxxThrowException finds the throwing image
@@ -63,6 +65,16 @@ void abort_crt_exit_handler(int) {
     std::exit(43);  // the same through the shimmed exit() import
 }
 void abort_return_handler(int) {}
+
+// Two int3 sites: noinline, so the optimizer cannot fold them into one.
+__declspec(noinline) void soft_assert_a(volatile int& reached) {
+    __debugbreak();
+    reached = reached + 1;
+}
+__declspec(noinline) void soft_assert_b(volatile int& reached) {
+    __debugbreak();
+    reached = reached + 1;
+}
 
 // The reserved stack of the calling thread, in bytes, written to *out (a size_t).
 DWORD WINAPI stack_reserve(void* out) {
@@ -176,6 +188,15 @@ int main(int argc, char** argv) {
         check(read, "GAME:\\tiny_game_probe.txt is read from the game folder after SetCurrentDirectory");
     } else {
         std::printf("tiny_game: SKIP GAME: file (argument game-file)\n");
+    }
+
+    if (has_arg(argc, argv, "int3")) {
+        volatile int reached = 0;
+        soft_assert_a(reached);
+        soft_assert_b(reached);
+        check(reached == 2, "the code after each of two int3 ran (LEONIDA_SKIP_ASSERTS stepped over them)");
+    } else {
+        std::printf("tiny_game: SKIP int3 (argument int3)\n");
     }
 
     if (has_arg(argc, argv, "abort-handler")) {
