@@ -17032,7 +17032,28 @@ DST_ALSO_READ = ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v
 
 # All VGPR operands of these instructions are sources, including store address and data ranges.
 VGPR_READ_ONLY_PREFIXES = ("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "ds_write",
-                           "global_store", "flat_store", "scratch_store")
+                           "ds_store", "global_store", "flat_store", "scratch_store")
+
+_DS_ATOMIC_PREFIXES = (
+    "ds_add", "ds_sub", "ds_rsub", "ds_inc", "ds_dec", "ds_min", "ds_max",
+    "ds_and", "ds_or", "ds_xor", "ds_mskor", "ds_cmpst", "ds_wrxchg",
+)
+
+
+def _vgpr_reads_all(op: str, mods: list[str]) -> bool:
+    """True when every VGPR operand is read-only and the instruction writes no VGPR."""
+    if op.startswith(VGPR_READ_ONLY_PREFIXES):
+        return True
+    if op.startswith(("global_atomic_", "flat_atomic_", "buffer_atomic_", "image_atomic_")) and "glc" not in mods:
+        return True
+    if op.startswith(_DS_ATOMIC_PREFIXES) and "_rtn" not in op:
+        return True
+    return False
+
+
+def _vgpr_dst_also_read(op: str, mods: list[str]) -> bool:
+    """True when a[0] is both read (input data) and written (old value returned)."""
+    return op.startswith(("buffer_atomic_", "image_atomic_")) and "glc" in mods
 
 
 def read_before_write_vgprs(insns):
@@ -17050,18 +17071,19 @@ def read_before_write_vgprs(insns):
         a, op = ins["args"], ins["op"]
         if not a:
             continue
-        reads_all = op.startswith(VGPR_READ_ONLY_PREFIXES) \
-            or (op.startswith("global_atomic_") and "glc" not in ins["mods"])   # no vdst without glc
+        mods = ins.get("mods", [])
+        reads_all = _vgpr_reads_all(op, mods)
         regs = []
-        for x in (a if reads_all or sdwa_reads_dst(op, ins.get("mods", [])) else a[1:]):
+        for x in (a if reads_all or sdwa_reads_dst(op, mods) else a[1:]):
             if x["k"] == "vgpr":
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if (base_op(op) in DST_ALSO_READ or
-                (op.startswith(("global_load_", "buffer_load_")) and "_d16" in op and "format" not in op)) and \
-                a[0]["k"] == "vgpr":   # d16 keeps a half
-            regs.append(a[0]["r"])
+        if a[0]["k"] == "vgpr":
+            if base_op(op) in DST_ALSO_READ or _vgpr_dst_also_read(op, mods):
+                regs.extend(range(a[0]["r"], a[0]["r"] + a[0].get("n", 1)))
+            elif op.startswith(("global_load_", "buffer_load_")) and "_d16" in op and "format" not in op:
+                regs.append(a[0]["r"])  # d16 keeps a half
         lane_read = base_op(op) == "v_readlane_b32"
         for r in regs:
             if r in written or r in first or (r in carried and lane_read):
@@ -17116,7 +17138,7 @@ def interp_ij_analysis(insns, g):
         a, op = ins["args"], ins["op"]
         if not a:
             continue
-        reads_all = op.startswith(VGPR_READ_ONLY_PREFIXES)
+        reads_all = _vgpr_reads_all(op, ins.get("mods", []))
         if not reads_all and a[0]["k"] == "vgpr":
             for r in vgpr_dest_registers(ins):
                 writes[r].append(n)
@@ -17317,16 +17339,20 @@ def reg_reads_writes(insns):
         a, op = ins["args"], ins["op"]
         if not a:
             continue
-        reads_all = op.startswith(VGPR_READ_ONLY_PREFIXES)
+        mods = ins.get("mods", [])
+        reads_all = _vgpr_reads_all(op, mods)
         regs = []
-        for x in (a if reads_all or sdwa_reads_dst(op, ins.get("mods", [])) else a[1:]):
+        for x in (a if reads_all or sdwa_reads_dst(op, mods) else a[1:]):
             if x["k"] == "vgpr":
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if (base_op(op) in DST_ALSO_READ or base_op(op) == "v_writelane_b32") and a[0]["k"] == "vgpr":
-            # v_writelane_b32 keeps the other lanes: over a slice that is a read of the destination
-            regs.append(a[0]["r"])
+        if a[0]["k"] == "vgpr":
+            if base_op(op) in DST_ALSO_READ or _vgpr_dst_also_read(op, mods):
+                regs.extend(range(a[0]["r"], a[0]["r"] + a[0].get("n", 1)))
+            elif base_op(op) == "v_writelane_b32":
+                # v_writelane_b32 keeps the other lanes: over a slice that is a read of the destination
+                regs.append(a[0]["r"])
         rr.update(regs)
         if not reads_all and a[0]["k"] == "vgpr":
             ww.update(vgpr_dest_registers(ins))
