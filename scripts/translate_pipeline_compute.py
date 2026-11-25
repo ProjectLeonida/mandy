@@ -10,12 +10,14 @@ import json
 import os
 import resource
 import shutil
+import signal
 import sys
 import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "tools"), str(ROOT)]
+from file_mode import published_mode
 from make_game import file_sha256 as digest, translation_sources_digest
 import rdna2spirv as translator
 
@@ -29,20 +31,23 @@ def build_one(src, out, name, settings, compact=False):
     inputs = [settings, name, code_key, state_key, digest(listing), digest(Path(str(side) + ".json")),
               digest(container) if container.is_file() else None]
     key = hashlib.sha256(json.dumps(inputs).encode()).hexdigest()
-    receipt = out / ".compute-cache" / (key + ".json")
+    cache = out / ".compute-cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    receipt = cache / (key + ".json")
     if receipt.exists():
         try:
             row = json.loads(receipt.read_text(encoding="utf-8"))
             if (row["meta"]["fspx_code_sha256"], row["meta"]["fspx_state_sha256"]) == (code_key, state_key):
                 module_hash = row["module"]
-                if len(module_hash) == 64 and all(c in "0123456789abcdef" for c in module_hash):
+                if isinstance(module_hash, str) and len(module_hash) == 64 and all(
+                        c in "0123456789abcdef" for c in module_hash):
                     if digest(out / (name + "_" + module_hash + ".spv")) == module_hash:
                         return row
         except (OSError, ValueError, KeyError, TypeError):
             pass
 
     asm = translator.translate(str(listing))
-    with tempfile.TemporaryDirectory(dir=out / ".compute-cache") as tmp:
+    with tempfile.TemporaryDirectory(dir=cache) as tmp:
         sa, sv = Path(tmp) / "module.spvasm", Path(tmp) / "module.spv"
         sa.write_text(asm, encoding="utf-8", newline="\n")
         result = translator.assemble_spirv(str(sa), str(sv), asm_text=asm, compact=compact)
@@ -53,7 +58,9 @@ def build_one(src, out, name, settings, compact=False):
                 "cs", code_key, state_key):
             raise ValueError("compute stage or FSPX identity mismatch")
         module_hash = digest(sv)
-        sv.replace(out / (name + "_" + module_hash + ".spv"))
+        target = out / (name + "_" + module_hash + ".spv")
+        os.chmod(sv, published_mode(str(target)))
+        sv.replace(target)
     row = {"meta": meta, "module": module_hash}
     translator.write_index(str(receipt), row)
     return row
@@ -73,7 +80,7 @@ def build_part(src, out, names, settings, report, compact=False):
 
 def build(src, out, names, settings, jobs, compact=False):
     cache = out / ".compute-cache"
-    cache.mkdir(exist_ok=True)
+    cache.mkdir(parents=True, exist_ok=True)
     with (cache / "lock").open("ab") as lock, tempfile.TemporaryDirectory(dir=cache) as tmp:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         reports = [Path(tmp) / str(i) for i in range(jobs)]
@@ -86,11 +93,22 @@ def build(src, out, names, settings, jobs, compact=False):
                 traceback.print_exc()
                 os._exit(1)
             os._exit(0)
+        parent_exc = False
         try:
             build_part(src, out, names[::jobs], settings, reports[0], compact)
+        except BaseException:
+            parent_exc = True
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            raise
         finally:
-            if pid and os.waitpid(pid, 0)[1]:
-                raise RuntimeError("second translation worker failed")
+            if pid:
+                _, status = os.waitpid(pid, 0)
+                if status and not parent_exc:
+                    raise RuntimeError("second translation worker failed")
 
         index, failures, pairs = {}, {}, {}
         for report in reports:
@@ -115,7 +133,32 @@ def build(src, out, names, settings, jobs, compact=False):
         return int(bool(failures))
 
 
-def main():
+def load_compute_names(index_path):
+    """Parse an unpacked shader library index.json and return sorted unique compute shader stems."""
+    try:
+        rows = json.loads(index_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read {index_path}: {exc}") from None
+    if not isinstance(rows, list):
+        raise ValueError(f"invalid input index {index_path}: expected a JSON list")
+    names = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("stage"), str):
+            raise ValueError(f"invalid entry in input index {index_path}")
+        if row["stage"] != "cs":
+            continue
+        filename = row.get("file")
+        if (not isinstance(filename, str) or Path(filename).name != filename
+                or not filename.endswith(".dxbc") or len(filename) <= 5
+                or "\\" in filename or "/" in filename):
+            raise ValueError("invalid compute filename in input index")
+        names.append(filename[:-5])
+    if not names or len(set(names)) != len(names):
+        raise ValueError("expected unique compute filenames in the input index")
+    return sorted(names)
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("inputs", type=Path, help="unpacked library with index.json, disasm/ and fspx/")
     ap.add_argument("--out", type=Path, required=True, help="dedicated runtime library subdirectory")
@@ -127,16 +170,12 @@ def main():
                     default=translator.spirv_loop_guard.DEFAULT_LIMIT, help="maximum loop visits (0 disables)")
     ap.add_argument("--compact-spirv", action="store_true", help="compact modules with spirv-opt before validation")
     ap.add_argument("--wave64-emulate", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.memory_mib < 1:
         ap.error("--memory-mib must be positive")
     src, out = args.inputs.resolve(), args.out.resolve()
     if out == src or src in out.parents or out in src.parents:
         ap.error("input and output directories must be separate")
-    os.setpriority(os.PRIO_PROCESS, 0, 19)
-    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-    bound = min(n for n in (args.memory_mib << 20, soft, hard) if n != resource.RLIM_INFINITY)
-    resource.setrlimit(resource.RLIMIT_AS, (bound, hard))
     versions = []
     required_tools = ["spirv-as", "spirv-val"]
     if args.compact_spirv:
@@ -146,29 +185,26 @@ def main():
         if not binary:
             ap.error(tool + " is required")
         versions.append(digest(Path(binary)))
+    try:
+        names = load_compute_names(src / "index.json")
+    except ValueError as exc:
+        ap.error(str(exc))
+    os.setpriority(os.PRIO_PROCESS, 0, 19)
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    bound = min(n for n in (args.memory_mib << 20, soft, hard) if n != resource.RLIM_INFINITY)
+    resource.setrlimit(resource.RLIMIT_AS, (bound, hard))
     settings = [translation_sources_digest(), digest(Path(__file__)), versions, args.wave64_emulate,
-                args.loop_limit, args.descriptor_hash]
-    rows = json.loads((src / "index.json").read_text(encoding="utf-8"))
-    names = []
-    for row in rows:
-        if row["stage"] != "cs":
-            continue
-        filename = row["file"]
-        if Path(filename).name != filename or not filename.endswith(".dxbc") or "\\" in filename:
-            ap.error("invalid compute filename in input index")
-        names.append(filename[:-5])
-    if not names or len(set(names)) != len(names):
-        ap.error("expected unique compute filenames in the input index")
+                args.loop_limit, args.descriptor_hash, args.compact_spirv]
     out.mkdir(parents=True, exist_ok=True)
     translator.DESCRIPTOR_HASH = args.descriptor_hash
     translator.LOOP_LIMIT = args.loop_limit
     translator.WAVE64_EMULATE = args.wave64_emulate
-    return build(src, out, sorted(names), settings, args.jobs, args.compact_spirv)
+    return build(src, out, names, settings, args.jobs, args.compact_spirv)
 
 
 if __name__ == "__main__":
     try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
         sys.stdout.reconfigure(errors="replace")
-    except AttributeError:
+    except (AttributeError, ValueError, OSError):
         pass
     sys.exit(main())
