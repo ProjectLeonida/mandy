@@ -174,7 +174,8 @@ int main(int argc, char** argv) {
                                                            reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
 
-        // First arena allocation follows the 64 KiB zero page. A broken null-IBV bind can fetch these indices.
+        // First arena allocation follows the 64 KiB zero page and the 256 KiB quad index table (64 Ki 32-bit
+        // indices) after it. A broken null-IBV bind can fetch these indices.
         constexpr UINT large_index_count = 40000;
         const D3D12_HEAP_PROPERTIES index_upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES index_default_heap{D3D12_HEAP_TYPE_DEFAULT};
@@ -183,7 +184,7 @@ int main(int argc, char** argv) {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&index_default_heap, D3D12_HEAP_FLAG_NONE, &large_index_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&live_indices.p))));
-        EXPECT(live_indices->GetGPUVirtualAddress() == 64 * 1024);
+        EXPECT(live_indices->GetGPUVirtualAddress() == 64 * 1024 + 64 * 1024 * sizeof(std::uint32_t));
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&index_upload_heap, D3D12_HEAP_FLAG_NONE, &large_index_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&index_upload.p))));
