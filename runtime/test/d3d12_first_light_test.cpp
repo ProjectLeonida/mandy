@@ -136,6 +136,11 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
                                                            reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
+        if (rt::d3d12::device_push_constants_need_fallback(inner)) {
+            std::printf("d3d12_first_light_test: skipped, the PSOs need 144 push-constant bytes and this GPU has %u\n",
+                        rt::d3d12::device_max_push_constants_size(inner));
+            return 77;
+        }
 
         // No root parameters: the VS applies no matrix and the PS has no bindings (vk_harness pushes zeros too).
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
