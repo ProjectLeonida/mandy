@@ -20,7 +20,8 @@ not part of this pair.
 
 ## 2. How the pair is chosen
 
-The material → program table is in the executable (#2519), so the pair is chosen by what the shaders read, from
+The material → program table is in the executable (#2519, an old number from the original repository that does not
+resolve here), so the pair is chosen by what the shaders read, from
 `<work>/shaders/spirv/index.json` and the listings in `<work>/shaders/dxbc/disasm`:
 
 | | Vertex shader | Pixel shader |
