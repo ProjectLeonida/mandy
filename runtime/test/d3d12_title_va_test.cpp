@@ -822,8 +822,9 @@ int check_stream_pool(Context& c, int& checks) {
 
 // A bottom-level build whose vertices, indices, destination and scratch are all the title's own memory, with no
 // resource over any of it. The builder takes device addresses, so each is translated when the build is recorded: the
-// header the shader reads back at the destination has the triangles' bounds.
-int check_bvh_build(Context& c) {
+// header the shader reads back at the destination has the triangles' bounds. It needs the layer's own builds:
+// LEONIDA_RT_AS=khr or off in the environment fails it.
+int check_bvh_build(Context& c, int& checks) {
     Ref<ID3D12Device5> device5;
     EXPECT(SUCCEEDED(c.inner->QueryInterface(IID_PPV_ARGS(&device5.p))));
     constexpr std::uint64_t bytes = 512 * 1024, vertices_at = 0x1000, indices_at = 0x2000, dst_at = 0x20100,
@@ -929,6 +930,7 @@ int check_bvh_build(Context& c) {
     const float expected[6] = {-5, 0, 1, 4, 8, 9};
     for (int i = 0; i < 6; ++i) EXPECT(bounds[i] == expected[i]);
     // `memory` stays reserved: its windows stay in the alias table, so a later check must not be given its addresses.
+    checks += 1;
     return 0;
 }
 
@@ -1229,7 +1231,7 @@ int main(int argc, char** argv) {
         if (check_title_memory(c, checks, geometry)) return 1;
         // Before the stream pool: its ranges stay in the alias table after it is freed, so two parts of a block allocated
         // at its addresses would share one copy.
-        if (!geometry && check_bvh_build(c)) return 1;
+        if (!geometry && check_bvh_build(c, checks)) return 1;
         if (check_stream_pool(c, checks)) return 1;
         if (geometry && std::atoi(setting) == 16 && check_geometry_slab_tails(c)) return 1;
     }
