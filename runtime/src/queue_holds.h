@@ -1,12 +1,17 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include "held_work_report.h"
 
 namespace leonida {
 
@@ -44,10 +49,24 @@ public:
         virtual void discard_waiting_on(Semaphore semaphore) = 0;
         // Sequence number (next_seq()) of the oldest held operation, 0 when nothing is held.
         virtual std::uint64_t oldest_held_seq() = 0;
+        // For a stall report (describe()): one or more lines on what the queue holds and what its oldest held
+        // operation waits for. Nothing when it holds nothing. Diagnostics only; the default says nothing.
+        virtual void describe_held(std::FILE* out) { (void)out; }
 
     protected:
         ~Holder() = default;
     };
+
+    // Every QueueHolds can be asked from anywhere what it holds (report_held_work, held_work_report.h): a stall
+    // watchdog that sees nothing move names the fence the held work waits for.
+    QueueHolds() {
+        register_held_work(this, [](const void* self, std::FILE* out) {
+            const_cast<QueueHolds*>(static_cast<const QueueHolds*>(self))->describe(out);
+        });
+    }
+    ~QueueHolds() { unregister_held_work(this); }
+    QueueHolds(const QueueHolds&) = delete;
+    QueueHolds& operator=(const QueueHolds&) = delete;
 
     void add_fence(Semaphore semaphore, std::uint64_t initial) {
         std::lock_guard lock(mutex_);
@@ -98,6 +117,43 @@ public:
         std::lock_guard lock(mutex_);
         const auto it = fences_.find(semaphore);
         return it != fences_.end() && it->second < value;
+    }
+
+    // The highest value a Signal was submitted for (or the CPU set), for reports. False for a semaphore it was never
+    // told about.
+    bool submitted(Semaphore semaphore, std::uint64_t& value) const {
+        std::lock_guard lock(mutex_);
+        const auto it = fences_.find(semaphore);
+        if (it == fences_.end()) return false;
+        value = it->second;
+        return true;
+    }
+
+    // More for the stall report, said before the queues (the owner's CPU fence waits, say); null removes it. Taken
+    // under the report registry's lock, so removing it waits for a report that is running.
+    void set_describe_extra(std::function<void(std::FILE*)> extra) {
+        std::lock_guard lock(held_work_registry().mutex);
+        describe_extra_ = std::move(extra);
+    }
+
+    // A stall report: what every queue holds (Holder::describe_held). Waits up to a second for a running release,
+    // since a holder may be detached and destroyed meanwhile; a release that does not end in that time is itself
+    // the answer, and is said instead.
+    void describe(std::FILE* out) {
+        if (describe_extra_) describe_extra_(out);
+        if (!any_held()) return;
+        std::unique_lock pump(pump_mutex_, std::defer_lock);
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!pump.try_lock()) {
+            if (std::chrono::steady_clock::now() >= until) {
+                std::fprintf(out, "[rt] d3d12: stall report: %lld operation(s) held, and a release of held work has "
+                                  "been running for over a second (the thread that runs it is busy or blocked)\n",
+                             static_cast<long long>(held_.load(std::memory_order_acquire)));
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        for (Holder* holder : snapshot()) holder->describe_held(out);
     }
 
     void attach(Holder* holder) {
@@ -230,6 +286,7 @@ private:
     std::atomic<std::int64_t> barrier_count_{0};
     std::atomic<std::uint64_t> seq_{0};
     std::atomic<bool> dirty_{false};
+    std::function<void(std::FILE*)> describe_extra_;  // set_describe_extra; read under the registry's lock
 };
 
 }  // namespace leonida

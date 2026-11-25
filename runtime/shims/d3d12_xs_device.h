@@ -130,6 +130,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <vector>
@@ -473,7 +474,7 @@ inline constexpr bool console_value_met(std::uint32_t comparison, std::uint64_t 
     }
 }
 struct ListValueStats {
-    std::uint64_t writes_recorded, writes_landed, writes_failed;
+    std::uint64_t writes_recorded, writes_submitted, writes_landed, writes_failed;  // submitted: per execution
     std::uint64_t waits_recorded, waits_met_at_submit, waits_relayed;  // relayed: a GPU wait on a write in flight
     std::uint64_t gates_held, gates_met, gates_timed_out;               // gate: opened from the CPU
     std::uint64_t cuts, cuts_deferred, cut_failures;                    // a list split at a wait after work
@@ -496,6 +497,9 @@ void set_list_values_enabled(bool on);
 void stop_list_values(unsigned ms);
 // Test helper: true once every write landed and every gate opened, waiting up to `ms`.
 bool list_values_idle(unsigned ms);
+// The stall snapshot the pump logs once its counters stood still with writes not landed (unlanded write groups,
+// open gates, the D3D12 layer's held work), written to `out` now. Test helper and debugger aid.
+void list_values_snapshot(std::FILE* out);
 // Test helper: the real lists a list proxy's recording is in (1 + its cuts), 0 for anything else.
 unsigned list_proxy_part_count(const void* list);
 

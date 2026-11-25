@@ -3984,7 +3984,8 @@ int check_list_values() {
     EXPECT(xs::list_values_idle(2000));
     EXPECT(cell(0) == 0x1374 && cell(1) == 0xabcd && cell(2) != 0);
     xs::ListValueStats stats = xs::list_value_stats();
-    EXPECT(stats.writes_recorded == 3 && stats.writes_landed == 3 && stats.writes_failed == 0);
+    EXPECT(stats.writes_recorded == 3 && stats.writes_submitted == 3 && stats.writes_landed == 3 &&
+           stats.writes_failed == 0);
 
     // 2. A wait holds its part until another queue's write lands: the waiter's queue waits on its gate before the
     // part, and the pump signals the gate only after the writer's fence is reached and the value is in memory.
@@ -4150,6 +4151,40 @@ int check_list_values() {
     EXPECT(!xs::list_values_idle(30) && cell(3) == 0x66 && cell(4) == 0x77 && fence_completed(a_gate) == 2);
     InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cells[7]), 3);
     EXPECT(xs::list_values_idle(2000) && fence_completed(a_gate) == 3);
+
+    // 9. The stall snapshot names what is still waiting: a write group whose queue has not reached its `written`
+    // value (with how far the fence got), and a closed gate with its address, comparison, reference and memory.
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+    raw(lw, 14, 1, 1, 1);
+    raw(lw, 72, word(&g_cells[0]), 0x99, 0, 0);
+    EXPECT(hr_of(raw(lw, 9)) == S_OK);
+    EXPECT(submit(qa, lw) == 0);  // a_written 6, not reached (5 is)
+    EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
+    raw(lv, 74, word(&g_cells[1]), 7, 0x100000, 1);  // wait64(>=): memory holds 0xabcd, nothing in flight writes it
+    raw(lv, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lv, 9)) == S_OK);
+    EXPECT(submit(qb, lv) == 0);
+    EXPECT(!xs::list_values_idle(30));
+    {
+        std::FILE* out = std::tmpfile();
+        EXPECT(out);
+        xs::list_values_snapshot(out);
+        std::rewind(out);
+        std::string text;
+        char chunk[512];
+        for (std::size_t got; (got = std::fread(chunk, 1, sizeof(chunk), out)) > 0;) text.append(chunk, got);
+        std::fclose(out);
+        char address[64];
+        std::snprintf(address, sizeof(address), "0x%llx", static_cast<unsigned long long>(word(&g_cells[1])));
+        EXPECT(text.find("1 write group(s) and 1 gate(s) are waiting") != std::string::npos);
+        EXPECT(text.find("land at its written fence 6, completed 5 (the queue has not run that far)") !=
+               std::string::npos);
+        EXPECT(text.find(std::string("wait64 for ") + address + ", comparison 7 against 0x100000; memory 0xabcd") !=
+               std::string::npos);
+    }
+    fence_signal(a_written, 6);
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cells[1]), 0x100000);
+    EXPECT(xs::list_values_idle(2000) && cell(0) == 0x99);
 
     // Every real list, spare and fence goes with its proxy.
     EXPECT(xs::list_values_idle(2000));

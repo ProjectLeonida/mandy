@@ -271,6 +271,15 @@ The runtime's model:
   behind a gate takes longer: the remap is then deferred to the releaser, which runs it once the queue's write
   fence passes the call's point and only then opens a gate the queue's later work waits on, so the GPU sees the
   order of the call and the title's thread does not wait (the console's CPU does not either).
+- Every 10 s the pump logs its counters (`list values so far`): writes recorded (once per recording), submitted
+  (each time a list that holds them is executed) and landed, waits, gates and the releaser's work. Recorded but never
+  submitted is a list the title did not execute, not a write in flight. When three of those lines in a row are the
+  same while recorded writes have not all landed, the pump logs a stall snapshot once (again only after the counters
+  moved): each submitted write group still waiting, with the `written` fence value it needs and the value the fence
+  has reached; each closed gate, with its address, comparison, reference and what memory holds; and from the Vulkan
+  layer (`src/held_work_report.h`), the CPU waits on fences that are not satisfied and, for each queue that holds
+  work, what its oldest held operation waits for, both with the highest Signal submitted for that fence. A fence
+  whose wait has no Signal of that value submitted names what the stall is waiting for. Logging only.
 
 ## 6. Root arguments
 

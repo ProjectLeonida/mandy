@@ -3506,6 +3506,7 @@ public:
             group_.clear();
         }
         if (writes_.empty()) return;
+        list_values::bump(list_values::counters().writes_submitted, writes_.size());
         list_values::QueueValues* values = queue_->values.get();
         if (values) {
             const std::uint64_t value = ++values->written_value;
@@ -6532,7 +6533,8 @@ const char* list_tail_slot_name(unsigned slot, unsigned char console_layout) {
 
 // Every counter of list_values::Counters, by name: the stats and their reset stay in step.
 #define LEONIDA_LIST_VALUE_COUNTERS(X)                                                                         \
-    X(writes_recorded) X(writes_landed) X(writes_failed) X(waits_recorded) X(waits_met_at_submit)            \
+    X(writes_recorded) X(writes_submitted) X(writes_landed) X(writes_failed) X(waits_recorded)               \
+    X(waits_met_at_submit)                                                                                    \
     X(waits_relayed) X(gates_held) X(gates_met) X(gates_timed_out) X(cuts) X(cuts_deferred) X(cut_failures)  \
     X(gates_short) X(demotions) X(late_met) X(bundle_ops) X(releases) X(release_us) X(release_us_max)        \
     X(pass_us_max) X(release_stalls) X(remaps_now) X(remaps_deferred) X(remaps_failed) X(remap_wait_us_max)    \
@@ -6562,6 +6564,8 @@ void set_list_values_enabled(bool on) { list_values::set_enabled(on); }
 void stop_list_values(unsigned ms) { list_values::Pump::get().stop(ms); }
 
 bool list_values_idle(unsigned ms) { return list_values::Pump::get().idle(ms); }
+
+void list_values_snapshot(std::FILE* out) { list_values::Pump::get().snapshot(out); }
 
 unsigned list_proxy_part_count(const void* list) {
     if (!is_list_proxy_impl(list)) return 0;
