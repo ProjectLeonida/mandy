@@ -10264,6 +10264,8 @@ public:
                 state_.context->observe_result(state_.context->vk.vkDeviceWaitIdle(state_.info.device),
                                               "vkDeviceWaitIdle");
             }
+            for (auto* buffer : title_buffers_) buffer->Release();
+            title_buffers_.clear();
             state_.context->drain_deleted_resources(UINT64_MAX);
             state_.context->set_bindless_release(nullptr, nullptr);
             state_.context->set_bindless_current(nullptr);  // the retired generations go with state_.bindless below
@@ -13232,6 +13234,13 @@ public:
             log_once("a buffer over the title's memory for a vertex or index view could not be made; HRESULT", int(hr));
             return;
         }
+        // Internal buffers are owned by the device and must not keep it alive.
+        auto* resource = Resource::from<Resource>(made);
+        if (!resource) {
+            made->Release();
+            return;
+        }
+        resource->attach_device(nullptr);
         title_buffers_.push_back(made);
         title_buffer_bytes_ += end - start;
         if (title_buffers_.size() <= 8 || !(title_buffers_.size() & (title_buffers_.size() - 1)))
