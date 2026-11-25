@@ -171,6 +171,34 @@ def animated_gltf():
     return gltf
 
 
+def morph_fixture(interpolation, output_count):
+    """A point with two morph targets and two keyframes; all floats live in the BIN chunk."""
+    accessors, views = [], []
+    data = bytearray()
+
+    def add(values, kind, count, **fields):
+        packed = struct.pack(f"<{len(values)}f", *values)
+        index = len(views)
+        views.append({"buffer": 0, "byteOffset": len(data), "byteLength": len(packed)})
+        accessors.append({"bufferView": index, "componentType": 5126, "type": kind,
+                          "count": count, **fields})
+        data.extend(packed)
+        return index
+
+    base, left, right = (add(point, "VEC3", 1, min=point, max=point)
+                         for point in ([0, 0, 0], [-1, 0, 0], [1, 0, 0]))
+    times = add([0, 1], "SCALAR", 2, min=[0], max=[1])
+    weights = add([0.5] * output_count, "SCALAR", output_count)
+    return {
+        "asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
+        "meshes": [{"primitives": [{"mode": 0, "attributes": {"POSITION": base},
+                                    "targets": [{"POSITION": left}, {"POSITION": right}]}]}],
+        "animations": [{"channels": [{"sampler": 0, "target": {"path": "weights", "node": 0}}],
+                        "samplers": [{"input": times, "output": weights, "interpolation": interpolation}]}],
+        "accessors": accessors, "bufferViews": views, "buffers": [{"byteLength": len(data)}],
+    }, data
+
+
 
 class GlbInspectTests(unittest.TestCase):
     def run_tool(self, *args):
@@ -896,6 +924,46 @@ class GlbInspectTests(unittest.TestCase):
                 animation = json.load(handle)["animations"][0]
             self.assertEqual(animation["channel_count"], 0)
             self.assertIn("animation channels is not an array", animation["issues"])
+
+    def animation_issues(self, doc, data):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "morph.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(doc, data))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out, encoding="utf-8") as handle:
+                return json.load(handle)["animations"][0]["issues"]
+
+    def test_morph_weight_output_count(self):
+        for mode, valid_count in (("LINEAR", 4), ("STEP", 4), ("CUBICSPLINE", 12)):
+            for count in (valid_count, valid_count // 2):
+                with self.subTest(mode=mode, count=count):
+                    issues = self.animation_issues(*morph_fixture(mode, count))
+                    if count == valid_count:
+                        self.assertEqual(issues, [])
+                    else:
+                        self.assertEqual(len(issues), 1, issues)
+                        self.assertIn(f"{count} output values", issues[0])
+
+    def test_morph_weight_sampler_shared_by_meshes_of_different_widths(self):
+        doc, data = morph_fixture("LINEAR", 4)
+        doc["nodes"].append({"mesh": 1})
+        doc["scenes"][0]["nodes"].append(1)
+        two_target = doc["meshes"][0]["primitives"][0]
+        doc["meshes"].append({"primitives": [{**two_target, "targets": two_target["targets"][:1]}]})
+        doc["animations"][0]["channels"].append({"sampler": 0, "target": {"path": "weights", "node": 1}})
+        issues = self.animation_issues(doc, data)
+        self.assertEqual(len(issues), 1, issues)
+        self.assertIn("channel[1]", issues[0])
+        self.assertIn("4 output values", issues[0])
+
+    def test_morph_weight_count_when_first_primitive_has_no_targets(self):
+        doc, data = morph_fixture("LINEAR", 2)
+        primitives = doc["meshes"][0]["primitives"]
+        primitives.insert(0, {"mode": 0, "attributes": primitives[0]["attributes"]})
+        self.assertTrue(any("2 output values" in issue for issue in self.animation_issues(doc, data)))
 
     def test_cubic_spline_output_count_is_validated(self):
         gltf = animated_gltf()
