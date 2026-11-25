@@ -63,6 +63,7 @@
 #endif
 #include "descriptor_table.h"
 #include "queue_families.h"
+#include "vulkan_memory.h"
 
 #include <vulkan/vulkan.h>
 
@@ -754,10 +755,38 @@ private:
         return 0;
     }
 
-    std::uint32_t memory_type(std::uint32_t allowed, VkMemoryPropertyFlags wanted) const {
-        for (std::uint32_t i = 0; i < memory_.memoryTypeCount; ++i)
-            if ((allowed & (1u << i)) && (memory_.memoryTypes[i].propertyFlags & wanted) == wanted) return i;
-        return 0xffffffffu;
+    bool is_small_bar(const VkMemoryType& type, bool rebar) const {
+        constexpr VkMemoryPropertyFlags bar =
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+        if (rebar || (type.propertyFlags & bar) != bar || memory_.memoryHeapCount == 0) return false;
+        return type.heapIndex < memory_.memoryHeapCount && memory_.memoryHeaps[type.heapIndex].size <= kBarWindowBytes;
+    }
+
+    // Allowed memory types that fit `size` bytes (VUID-vkAllocateMemory-pAllocateInfo-01713), preferred properties
+    // first. Without Resizable BAR, small BAR-window types are moved behind other eligible types so table, staging,
+    // and fallback allocations do not consume the 256 MiB BAR window when main VRAM or system RAM is available.
+    std::vector<std::uint32_t> memory_types(std::uint32_t allowed, VkMemoryPropertyFlags required,
+                                            VkMemoryPropertyFlags preferred, VkDeviceSize size,
+                                            bool avoid_small_bar) const {
+        const bool rebar = resizable_bar(memory_);
+        std::vector<std::uint32_t> order;
+        if (memory_.memoryHeapCount > 0) {
+            order = memory_type_order(memory_, allowed, required, preferred, size);
+        } else {
+            const std::uint32_t count = std::min<std::uint32_t>(memory_.memoryTypeCount, VK_MAX_MEMORY_TYPES);
+            for (const VkMemoryPropertyFlags flags : {required | preferred, required}) {
+                for (std::uint32_t i = 0; i < count; ++i) {
+                    if (!(allowed & (1u << i)) || (memory_.memoryTypes[i].propertyFlags & flags) != flags) continue;
+                    if (std::find(order.begin(), order.end(), i) == order.end()) order.push_back(i);
+                }
+            }
+        }
+        if (avoid_small_bar && !rebar && order.size() > 1) {
+            std::stable_partition(order.begin(), order.end(), [&](std::uint32_t i) {
+                return !is_small_bar(memory_.memoryTypes[i], false);
+            });
+        }
+        return order;
     }
 
     bool create_layout() {
@@ -872,15 +901,33 @@ private:
             info.samples = t == ms_type ? features_.ms_samples[c] : VK_SAMPLE_COUNT_1_BIT;
             info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | usage;
             share_across_queue_families(info, families_);
-            if (vk_.vkCreateImage(device_, &info, nullptr, &image.image) != VK_SUCCESS) return false;
+            if (vk_.vkCreateImage(device_, &info, nullptr, &image.image) != VK_SUCCESS) {
+                image.image = VK_NULL_HANDLE;
+                return false;
+            }
             VkMemoryRequirements requirements{};
             vk_.vkGetImageMemoryRequirements(device_, image.image, &requirements);
             VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
             allocation.allocationSize = requirements.size;
-            allocation.memoryTypeIndex = memory_type(requirements.memoryTypeBits, 0);
-            return allocation.memoryTypeIndex != 0xffffffffu &&
-                   vk_.vkAllocateMemory(device_, &allocation, nullptr, &image.memory) == VK_SUCCESS &&
-                   vk_.vkBindImageMemory(device_, image.image, image.memory, 0) == VK_SUCCESS;
+            VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            for (const std::uint32_t type :
+                 memory_types(requirements.memoryTypeBits, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, requirements.size,
+                              true)) {
+                allocation.memoryTypeIndex = type;
+                result = vk_.vkAllocateMemory(device_, &allocation, nullptr, &image.memory);
+                if (result == VK_SUCCESS) break;
+                image.memory = VK_NULL_HANDLE;
+            }
+            if (result != VK_SUCCESS) {
+                note_failure("fallback image", result);
+                return false;
+            }
+            result = vk_.vkBindImageMemory(device_, image.image, image.memory, 0);
+            if (result != VK_SUCCESS) {
+                note_failure("fallback image", result);
+                return false;
+            }
+            return true;
         };
         const auto create_view = [&](const FallbackImage& image, std::uint32_t d, std::uint32_t c, VkImageView& view) {
             VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -932,7 +979,11 @@ private:
         sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
         sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sampler.maxLod = VK_LOD_CLAMP_NONE;
-        return vk_.vkCreateSampler(device_, &sampler, nullptr, &fallback_sampler_) == VK_SUCCESS;
+        if (vk_.vkCreateSampler(device_, &sampler, nullptr, &fallback_sampler_) != VK_SUCCESS) {
+            fallback_sampler_ = VK_NULL_HANDLE;
+            return false;
+        }
+        return true;
     }
 
     // device_local: the table (DEVICE_LOCAL, else HOST_VISIBLE when the device has no such type or that heap is out
@@ -956,23 +1007,46 @@ private:
         vk_.vkGetBufferMemoryRequirements(device_, made.buffer, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
-        const auto allocate = [&](std::uint32_t type) {
-            if (type == 0xffffffffu) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-            allocation.memoryTypeIndex = type;
-            const VkResult result = vk_.vkAllocateMemory(device_, &allocation, nullptr, &made.memory);
-            if (result != VK_SUCCESS) made.memory = VK_NULL_HANDLE;
-            return result;
-        };
-        const std::uint32_t local = device_local
-                                        ? memory_type(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-                                        : 0xffffffffu;
-        VkResult result = device_local ? allocate(local) : allocate(memory_type(requirements.memoryTypeBits, host));
-        if (result != VK_SUCCESS && device_local) {
-            const std::uint32_t fallback = memory_type(requirements.memoryTypeBits, host);
-            if (fallback != local) {
-                result = allocate(fallback);
-                if (result == VK_SUCCESS && local != 0xffffffffu) ++table_host_fallbacks_;
+        const auto allocate_from = [&](const std::vector<std::uint32_t>& candidates, std::uint32_t& tried_mask,
+                                       VkResult& last_result) {
+            for (const std::uint32_t type : candidates) {
+                if (type >= VK_MAX_MEMORY_TYPES || (tried_mask & (1u << type))) continue;
+                tried_mask |= 1u << type;
+                allocation.memoryTypeIndex = type;
+                const VkResult r = vk_.vkAllocateMemory(device_, &allocation, nullptr, &made.memory);
+                if (r == VK_SUCCESS) {
+                    last_result = VK_SUCCESS;
+                    return true;
+                }
+                made.memory = VK_NULL_HANDLE;
+                last_result = r;
             }
+            return false;
+        };
+        std::uint32_t tried_mask = 0;
+        VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        if (device_local) {
+            const std::uint32_t type_count = std::min<std::uint32_t>(memory_.memoryTypeCount, VK_MAX_MEMORY_TYPES);
+            bool had_local = false;
+            for (std::uint32_t i = 0; i < type_count; ++i) {
+                if ((requirements.memoryTypeBits & (1u << i)) &&
+                    (memory_.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                    had_local = true;
+                    break;
+                }
+            }
+            const auto local_types = memory_types(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                                                  requirements.size, true);
+            if (!allocate_from(local_types, tried_mask, result)) {
+                const auto host_types = memory_types(requirements.memoryTypeBits, host, 0, requirements.size, true);
+                if (allocate_from(host_types, tried_mask, result) && had_local &&
+                    !(memory_.memoryTypes[allocation.memoryTypeIndex].propertyFlags &
+                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+                    ++table_host_fallbacks_;
+            }
+        } else {
+            const auto host_types = memory_types(requirements.memoryTypeBits, host, 0, requirements.size, true);
+            allocate_from(host_types, tried_mask, result);
         }
         if (result == VK_SUCCESS) {
             made.device_local = (memory_.memoryTypes[allocation.memoryTypeIndex].propertyFlags &
