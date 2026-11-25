@@ -155,20 +155,28 @@ void base_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd, const Case& c, ID3D12Roo
 struct Result {
     bool ok = false;
     HRESULT pso = S_OK;
+    const char* failed_step = nullptr;
+    HRESULT failed_hr = S_OK;
     std::vector<unsigned char> color, stencil;
 };
 
 Result run(ID3D12Device* device, const Case& c, const Programs& p) {
     Result r;
+    const auto fail = [&](const char* step, HRESULT err) {
+        r.failed_step = step;
+        r.failed_hr = err;
+        return r;
+    };
     const D3D12_HEAP_PROPERTIES def_heap{D3D12_HEAP_TYPE_DEFAULT}, rb_heap{D3D12_HEAP_TYPE_READBACK};
     Ref<ID3D12RootSignature> root;
-    if (FAILED(device->CreateRootSignature(0, p.root.data(), p.root.size(), IID_PPV_ARGS(&root.p)))) return r;
+    HRESULT hr = device->CreateRootSignature(0, p.root.data(), p.root.size(), IID_PPV_ARGS(&root.p));
+    if (FAILED(hr)) return fail("CreateRootSignature", hr);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
     base_state(pd, c, root.p, p);
     Ref<ID3D12PipelineState> pso;
     r.pso = c.stream ? create_stream_pso(device, pd, c, &pso.p)
                      : device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso.p));
-    if (FAILED(r.pso)) return r;
+    if (FAILED(r.pso)) return fail("pipeline", r.pso);
 
     D3D12_RESOURCE_DESC cd{};
     cd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -181,11 +189,12 @@ Result run(ID3D12Device* device, const Case& c, const Programs& p) {
     dd.Format = kDepthFormat;
     dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     Ref<ID3D12Resource> color, depth;
-    if (FAILED(device->CreateCommittedResource(&def_heap, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                               nullptr, IID_PPV_ARGS(&color.p))) ||
-        FAILED(device->CreateCommittedResource(&def_heap, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE,
-                                               nullptr, IID_PPV_ARGS(&depth.p))))
-        return r;
+    hr = device->CreateCommittedResource(&def_heap, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                         nullptr, IID_PPV_ARGS(&color.p));
+    if (FAILED(hr)) return fail("CreateCommittedResource(color)", hr);
+    hr = device->CreateCommittedResource(&def_heap, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                         nullptr, IID_PPV_ARGS(&depth.p));
+    if (FAILED(hr)) return fail("CreateCommittedResource(depth)", hr);
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT cfoot{}, sfoot{};
     UINT crows = 0, srows = 0;
     UINT64 crow_bytes = 0, srow_bytes = 0, ctotal = 0, stotal = 0;
@@ -198,18 +207,19 @@ Result run(ID3D12Device* device, const Case& c, const Programs& p) {
     bd.SampleDesc = {1, 0};
     bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     bd.Width = ctotal;
-    if (FAILED(device->CreateCommittedResource(&rb_heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
-                                               nullptr, IID_PPV_ARGS(&cread.p))))
-        return r;
+    hr = device->CreateCommittedResource(&rb_heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                         IID_PPV_ARGS(&cread.p));
+    if (FAILED(hr)) return fail("CreateCommittedResource(color readback)", hr);
     bd.Width = stotal;
-    if (FAILED(device->CreateCommittedResource(&rb_heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
-                                               nullptr, IID_PPV_ARGS(&sread.p))))
-        return r;
+    hr = device->CreateCommittedResource(&rb_heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                         IID_PPV_ARGS(&sread.p));
+    if (FAILED(hr)) return fail("CreateCommittedResource(stencil readback)", hr);
     Ref<ID3D12DescriptorHeap> rtv_heap, dsv_heap;
     const D3D12_DESCRIPTOR_HEAP_DESC rh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1}, dh{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1};
-    if (FAILED(device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&rtv_heap.p))) ||
-        FAILED(device->CreateDescriptorHeap(&dh, IID_PPV_ARGS(&dsv_heap.p))))
-        return r;
+    hr = device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&rtv_heap.p));
+    if (FAILED(hr)) return fail("CreateDescriptorHeap(RTV)", hr);
+    hr = device->CreateDescriptorHeap(&dh, IID_PPV_ARGS(&dsv_heap.p));
+    if (FAILED(hr)) return fail("CreateDescriptorHeap(DSV)", hr);
     const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
     const auto dsv = dsv_heap->GetCPUDescriptorHandleForHeapStart();
     D3D12_RENDER_TARGET_VIEW_DESC rv{};
@@ -226,11 +236,14 @@ Result run(ID3D12Device* device, const Case& c, const Programs& p) {
     Ref<ID3D12GraphicsCommandList> list;
     Ref<ID3D12Fence> fence;
     const D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT};
-    if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue.p))) ||
-        FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc.p))) ||
-        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.p, nullptr, IID_PPV_ARGS(&list.p))) ||
-        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))))
-        return r;
+    hr = device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue.p));
+    if (FAILED(hr)) return fail("CreateCommandQueue", hr);
+    hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc.p));
+    if (FAILED(hr)) return fail("CreateCommandAllocator", hr);
+    hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.p, nullptr, IID_PPV_ARGS(&list.p));
+    if (FAILED(hr)) return fail("CreateCommandList", hr);
+    hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p));
+    if (FAILED(hr)) return fail("CreateFence", hr);
     list->ClearRenderTargetView(rtv, c.clear_color, 0, nullptr);
     list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, c.clear_depth, c.clear_stencil, 0,
                                 nullptr);
@@ -241,7 +254,8 @@ Result run(ID3D12Device* device, const Case& c, const Programs& p) {
     list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
     if (c.back_ref >= 0) {
         Ref<ID3D12GraphicsCommandList8> list8;
-        if (FAILED(list->QueryInterface(IID_PPV_ARGS(&list8.p)))) return r;
+        hr = list->QueryInterface(IID_PPV_ARGS(&list8.p));
+        if (FAILED(hr)) return fail("QueryInterface(ID3D12GraphicsCommandList8)", hr);
         list8->OMSetFrontAndBackStencilRef(c.stencil_ref, UINT(c.back_ref));
     } else {
         list->OMSetStencilRef(c.stencil_ref);
@@ -266,23 +280,32 @@ Result run(ID3D12Device* device, const Case& c, const Programs& p) {
     D3D12_TEXTURE_COPY_LOCATION ssrc{depth.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     ssrc.SubresourceIndex = 1;  // the stencil plane of a D32_FLOAT_S8X24_UINT texture
     list->CopyTextureRegion(&sdst, 0, 0, 0, &ssrc, nullptr);
-    if (FAILED(list->Close())) return r;
+    hr = list->Close();
+    if (FAILED(hr)) return fail("Close", hr);
     ID3D12CommandList* lists[] = {list.p};
     queue->ExecuteCommandLists(1, lists);
-    if (FAILED(queue->Signal(fence.p, 1)) || FAILED(fence->SetEventOnCompletion(1, nullptr))) return r;
+    hr = queue->Signal(fence.p, 1);
+    if (FAILED(hr)) return fail("Signal", hr);
+    hr = fence->SetEventOnCompletion(1, nullptr);
+    if (FAILED(hr)) return fail("SetEventOnCompletion", hr);
     const auto read = [](ID3D12Resource* buffer, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& foot, UINT rows,
                          UINT64 row_bytes, std::vector<unsigned char>& out) {
         void* mapped = nullptr;
-        if (FAILED(buffer->Map(0, nullptr, &mapped))) return false;
+        const HRESULT map_hr = buffer->Map(0, nullptr, &mapped);
+        if (FAILED(map_hr)) return map_hr;
         for (UINT y = 0; y < rows; ++y) {
             const auto* row = static_cast<const unsigned char*>(mapped) + foot.Offset + y * foot.Footprint.RowPitch;
             out.insert(out.end(), row, row + row_bytes);
         }
         const D3D12_RANGE none{};
         buffer->Unmap(0, &none);
-        return true;
+        return S_OK;
     };
-    r.ok = read(cread.p, cfoot, crows, crow_bytes, r.color) && read(sread.p, sfoot, srows, srow_bytes, r.stencil);
+    hr = read(cread.p, cfoot, crows, crow_bytes, r.color);
+    if (FAILED(hr)) return fail("Map(color)", hr);
+    hr = read(sread.p, sfoot, srows, srow_bytes, r.stencil);
+    if (FAILED(hr)) return fail("Map(stencil)", hr);
+    r.ok = true;
     return r;
 }
 
@@ -580,14 +603,16 @@ int main() {
     }
     std::printf("host reference: %s\n", adapter.c_str());
 
-    // DEPTH_STENCIL2 (per-face stencil masks) and OMSetFrontAndBackStencilRef require
-    // D3D12_OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported. Older host runtimes (e.g. Windows 10) do not
-    // know OPTIONS14 (CheckFeatureSupport fails) and refuse DEPTH_STENCIL2 pipelines, while the layer accepts them.
+    // DEPTH_STENCIL2 subobjects require a host runtime that knows D3D12_FEATURE_D3D12_OPTIONS14 (older hosts such as
+    // Windows 10 fail CheckFeatureSupport and refuse every DEPTH_STENCIL2 pipeline). When OPTIONS14 is known but
+    // IndependentFrontAndBackStencilRefMaskSupported is FALSE, only cases with differing front/back masks or
+    // OMSetFrontAndBackStencilRef (back_ref >= 0) are unsupported; identical-mask single-ref streams still compare.
     D3D12_FEATURE_DATA_D3D12_OPTIONS14 host_o14{};
     const HRESULT host_o14_hr =
         host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS14, &host_o14, sizeof(host_o14));
+    const bool host_has_o14 = SUCCEEDED(host_o14_hr);
     const bool host_per_face_stencil =
-        SUCCEEDED(host_o14_hr) && host_o14.IndependentFrontAndBackStencilRefMaskSupported != FALSE;
+        host_has_o14 && host_o14.IndependentFrontAndBackStencilRefMaskSupported != FALSE;
 
     const HMODULE compiler = LoadLibraryExA("d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const auto compile = compiler ? reinterpret_cast<pD3DCompile>(reinterpret_cast<void*>(
@@ -608,15 +633,18 @@ int main() {
     const std::vector<Case> cases = build_cases();
     unsigned compared = 0, differ = 0, skipped = 0;
     for (const Case& c : cases) {
-        if (c.stream && !host_per_face_stencil) {
+        const bool needs_independent_stencil =
+            c.front_read != c.back_read || c.front_write != c.back_write || c.back_ref >= 0;
+        if ((c.stream && !host_has_o14) || (!host_per_face_stencil && needs_independent_stencil)) {
             const Result mine = run(ours.p, c, our_programs);
             if (!mine.ok) {
                 ++differ;
-                std::printf("%s: the layer failed (pipeline 0x%08x)  MISMATCH\n", c.name.c_str(),
-                            static_cast<unsigned>(mine.pso));
+                std::printf("%s: the layer failed (%s 0x%08x)  MISMATCH\n", c.name.c_str(),
+                            mine.failed_step ? mine.failed_step : "unknown",
+                            static_cast<unsigned>(mine.failed_hr));
                 continue;
             }
-            if (FAILED(host_o14_hr)) {
+            if (!host_has_o14) {
                 std::printf("%s: not comparable on this host (host runtime lacks D3D12_FEATURE_D3D12_OPTIONS14, "
                             "hr 0x%08x)\n",
                             c.name.c_str(), static_cast<unsigned>(host_o14_hr));
@@ -630,8 +658,10 @@ int main() {
         }
         const Result reference = run(host.p, c, host_programs);
         const Result mine = run(ours.p, c, our_programs);
-        if (!reference.ok && SUCCEEDED(reference.pso) ) {
-            std::fprintf(stderr, "%s: the host failed\n", c.name.c_str());
+        if (!reference.ok && SUCCEEDED(reference.pso)) {
+            std::fprintf(stderr, "%s: the host failed (%s 0x%08x)\n", c.name.c_str(),
+                         reference.failed_step ? reference.failed_step : "unknown",
+                         static_cast<unsigned>(reference.failed_hr));
             return 1;
         }
         if (FAILED(reference.pso)) {
@@ -646,7 +676,8 @@ int main() {
         }
         if (!mine.ok) {
             // A format the layer has no render target for yet.
-            std::printf("%s: SKIP, the layer failed (pipeline 0x%08x)\n", c.name.c_str(), static_cast<unsigned>(mine.pso));
+            std::printf("%s: SKIP, the layer failed (%s 0x%08x)\n", c.name.c_str(),
+                        mine.failed_step ? mine.failed_step : "unknown", static_cast<unsigned>(mine.failed_hr));
             ++skipped;
             continue;
         }
