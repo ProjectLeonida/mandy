@@ -12,7 +12,9 @@ import re
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 TOOLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
@@ -597,7 +599,7 @@ class HarnessErrors(unittest.TestCase):
 
     def _main(self, run_gpu, argv):
         """main() with the assembler, translator and GPU replaced: every program 'translates'."""
-        def translate(work, emulate):
+        def translate(work, emulate, pc_tail=False):
             spdir = os.path.join(work, "spirv_emu" if emulate else "spirv_nat")
             os.makedirs(spdir, exist_ok=True)
             for name in names:
@@ -628,7 +630,7 @@ class HarnessErrors(unittest.TestCase):
     def test_run_goes_on_after_a_hang_and_exits_2(self):
         calls = []
 
-        def run_gpu(exe, spv, prog, work, emulate):
+        def run_gpu(exe, spv, prog, work, emulate, pc_tail=False):
             calls.append(prog.name)
             if len(calls) == 2:
                 raise X.HarnessError("vk_compute_test timed out after 60 s")
@@ -645,7 +647,7 @@ class HarnessErrors(unittest.TestCase):
         self.assertEqual(kept, [f"{calls[1]}_native.asm"])
 
     def test_every_program_skipped_exits_2(self):
-        def run_gpu(exe, spv, prog, work, emulate):
+        def run_gpu(exe, spv, prog, work, emulate, pc_tail=False):
             raise X.Unpinned("the device can't run it at 32 lanes")
 
         code, out = self._main(run_gpu, ["--programs", "4", "--wave", "32", "--modes", "native"])
@@ -655,7 +657,7 @@ class HarnessErrors(unittest.TestCase):
         self.assertNotIn("mismatch;", out)
 
     def test_skips_beside_matches_exit_0(self):
-        def run_gpu(exe, spv, prog, work, emulate):
+        def run_gpu(exe, spv, prog, work, emulate, pc_tail=False):
             if prog.wave == 32:
                 raise X.Unpinned("the device can't run it at 32 lanes")
             return self._expected_words(prog)
@@ -667,7 +669,7 @@ class HarnessErrors(unittest.TestCase):
         self.assertIn("wave64 emulate: programs 2, match 2", out)
 
     def test_clean_run_still_exits_0(self):
-        code, out = self._main(lambda exe, spv, prog, work, emulate: self._expected_words(prog),
+        code, out = self._main(lambda exe, spv, prog, work, emulate, pc_tail=False: self._expected_words(prog),
                                ["--programs", "3", "--wave", "32", "--modes", "native", "--no-maskdata"])
         self.assertEqual(code, 0)
         self.assertIn("match 3, mismatch 0, hyp_only 0, rejected 0, harness_errors 0", out)
@@ -943,6 +945,98 @@ class Ext(unittest.TestCase):
             labels = [ln for ln in plain if ln.endswith(":")]
             self.assertEqual(len(guarded), 2 * (len(plain) - len(labels)) - 1 + len(labels))
         self.assertGreater(loops, 10)
+
+
+
+class PcTailUbo(unittest.TestCase):
+    """LEONIDA_PC_TAIL_UBO / --pc-tail-ubo, as tools/lds_fuzz.py has it (TEST-873): on a device whose
+    maxPushConstantsSize is 128 the translated programs read the tail from a uniform block, and vk_compute_test
+    must be told the same. No GPU, no llvm-mc."""
+
+    def test_pc_tail_ubo_forwarded_to_translator_and_vk_compute_test(self):
+        import crosslane_fuzz as f
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            cmds = []
+
+            def fake_run(cmd, **kw):
+                cmds.append((list(cmd), kw.get("env")))
+                env = kw.get("env") or {}
+                if env.get("VKC_DUMP"):
+                    with open(env["VKC_DUMP"], "wb") as fh:   # one word: enough for run_gpu to unpack
+                        fh.write(b"\x00\x00\x00\x00")
+                (tmp / "spirv_nat").mkdir(parents=True, exist_ok=True)
+                (tmp / "spirv_emu").mkdir(parents=True, exist_ok=True)
+                for d in ("spirv_nat", "spirv_emu"):
+                    (tmp / d / "index.json").write_text("{}", encoding="utf-8")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with mock.patch.object(f.subprocess, "run", side_effect=fake_run):
+                f.translate(tmp, False)
+                f.translate(tmp, False, pc_tail=True)
+            self.assertNotIn("--pc-tail-ubo", cmds[0][0])
+            self.assertIn("--pc-tail-ubo", cmds[1][0])
+
+            prog = types.SimpleNamespace(group=64, wave=32)
+            clean_env = {k: v for k, v in os.environ.items() if k != "LEONIDA_PC_TAIL_UBO"}
+            with mock.patch.dict(os.environ, clean_env, clear=True), \
+                    mock.patch.object(f.subprocess, "run", side_effect=fake_run):
+                f.run_gpu("vk_compute_test", "a.spv", prog, str(tmp), False)
+                f.run_gpu("vk_compute_test", "a.spv", prog, str(tmp), False, pc_tail=True)
+            self.assertNotIn("LEONIDA_PC_TAIL_UBO", cmds[2][1])
+            self.assertEqual(cmds[3][1]["LEONIDA_PC_TAIL_UBO"], "1")
+
+    def test_pc_tail_ubo_from_flag_or_env(self):
+        import crosslane_fuzz as f
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            exe = tmp / ("vk_compute_test" + (".exe" if os.name == "nt" else ""))
+            exe.touch()
+            for extra, env_val, want in (
+                ([], "", False),
+                (["--pc-tail-ubo"], "", True),
+                ([], "1", True),
+                ([], "yes", True),
+                ([], "0", False),
+            ):
+                with self.subTest(extra=extra, env_val=env_val):
+                    seen_t, seen_g = [], []
+
+                    def fake_translate(work, _emulate, pc_tail=False):
+                        seen_t.append(pc_tail)
+                        out = os.path.join(str(work), "spirv_emu" if _emulate else "spirv_nat")
+                        os.makedirs(out, exist_ok=True)
+                        with open(os.path.join(out, "p100003.spv"), "wb"):
+                            pass
+                        return out, ""
+
+                    def fake_run_gpu(_exe, _spv, prog, _work, _emulate, pc_tail=False):
+                        seen_g.append(pc_tail)
+                        exp, _hyp = prog.expected()
+                        return [v for _, v in sorted(exp.items())]
+
+                    def fake_assemble(_mc, _prog, _src, _disasm, _fssm):
+                        pass
+
+                    def fake_mc():
+                        return ["llvm-mc"]
+
+                    argv = ["crosslane_fuzz.py", "--programs", "1", "--wave", "32", "--modes", "native",
+                            "--exe", str(exe), *extra]
+                    with mock.patch.dict(os.environ, {"LEONIDA_PC_TAIL_UBO": env_val}), \
+                            mock.patch.object(sys, "argv", argv), \
+                            mock.patch.object(f, "translate", side_effect=fake_translate), \
+                            mock.patch.object(f, "run_gpu", side_effect=fake_run_gpu), \
+                            mock.patch.object(f, "assemble", side_effect=fake_assemble), \
+                            mock.patch.object(f, "make_program", side_effect=lambda seed, wave, ops, **kw:
+                                              types.SimpleNamespace(name=f"p{seed}", wave=wave, group=32,
+                                                                    expected=lambda ops=None: ({}, False),
+                                                                    source=lambda: "", partial_wave=False)), \
+                            mock.patch("mc_command.mc_command", side_effect=fake_mc), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        f.main()
+                    self.assertEqual(seen_t, [want])
+                    self.assertEqual(seen_g, [want])
 
 
 if __name__ == "__main__":
