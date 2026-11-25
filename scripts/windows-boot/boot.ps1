@@ -139,6 +139,12 @@ function Get-FirstValue {
     return ""
 }
 
+function Get-BootPath {
+    param([string]$Path)
+    if ($Path) { return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path) }
+    return ""
+}
+
 function Read-SideFile {
     # One line from a text file make_game.py writes beside gta6rt.exe (game_path.txt, shader_path.txt).
     param([string]$Path)
@@ -188,14 +194,14 @@ if (-not $Name) { $Name = "boot-" + (Get-Date -Format "yyyyMMdd-HHmmss") }
 if ($NoInput) { $InputScript = "" }
 if ($Name -notmatch '^[A-Za-z0-9._-]+$') { throw "-Name may hold letters, digits, '.', '_' and '-' only: $Name" }
 
-$Runtime = Get-FirstValue @($Runtime, $env:GTA6RT, (Join-Path $RepoRoot "runtime\build\RelWithDebInfo\gta6rt.exe"))
+$Runtime = Get-BootPath (Get-FirstValue @($Runtime, $env:GTA6RT, (Join-Path $RepoRoot "runtime\build\RelWithDebInfo\gta6rt.exe")))
 $RuntimeDir = Split-Path -Parent $Runtime
-$GameDir = Get-FirstValue @($GameDir, $env:LEONIDA_GAME_DIR, (Read-SideFile (Join-Path $RuntimeDir "game_path.txt")))
-$Exe = Get-FirstValue @($Exe, $env:LEONIDA_EXE, $(if ($GameDir) { Join-Path $GameDir $ExeName } else { "" }))
-$Shaders = Get-FirstValue @($Shaders, $env:LEONIDA_SHADERS)
-$OutDir = Get-FirstValue @($OutDir, $env:LEONIDA_RUNS, (Join-Path $HOME "leonida-runs"))
-$OutDir = [System.IO.Path]::GetFullPath($OutDir)
-$Overlay = Get-FirstValue @($Overlay, (Join-Path $OutDir "overlay"))
+$GameDir = Get-BootPath (Get-FirstValue @($GameDir, $env:LEONIDA_GAME_DIR, (Read-SideFile (Join-Path $RuntimeDir "game_path.txt"))))
+$Exe = Get-BootPath (Get-FirstValue @($Exe, $env:LEONIDA_EXE, $(if ($GameDir) { Join-Path $GameDir $ExeName } else { "" })))
+$Shaders = Get-BootPath (Get-FirstValue @($Shaders, $env:LEONIDA_SHADERS))
+$OutDir = Get-BootPath (Get-FirstValue @($OutDir, $env:LEONIDA_RUNS, (Join-Path $HOME "leonida-runs")))
+$Overlay = Get-BootPath (Get-FirstValue @($Overlay, (Join-Path $OutDir "overlay")))
+$RunDirectory = Join-Path $OutDir ("work_" + $Name)
 $Capture = Join-Path $OutDir ("cap_" + $Name)
 $LogFile = Join-Path $OutDir ($Name + ".log")
 $StdoutFile = Join-Path $OutDir ($Name + ".stdout.log")
@@ -266,6 +272,16 @@ foreach ($pair in $EnvPairs) {
     if ($pair -notmatch '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { throw "not a parameter and not KEY=VALUE: '$pair' (Get-Help $PSCommandPath -Full)" }
     $bootEnv[$Matches[1]] = $Matches[2]
 }
+foreach ($key in @("LEONIDA_SHADERS", "LEONIDA_CAPTURE", "LEONIDA_PIPELINE_CACHE_DIR")) {
+    if ($bootEnv[$key]) { $bootEnv[$key] = Get-BootPath $bootEnv[$key] }
+}
+foreach ($key in @("LEONIDA_COMPAT_DIR", "LEONIDA_DSTORAGE_HISTORY", "LEONIDA_SAVE_DIR",
+                  "LEONIDA_WRITE_DIR", "LEONIDA_XMEM_BACKING_DIR")) {
+    $value = $bootEnv[$key]
+    if ($value -and -not [System.IO.Path]::IsPathRooted($value)) {
+        $bootEnv[$key] = Get-BootPath (Join-Path $RepoRoot $value)
+    }
+}
 if ($bootEnv["LEONIDA_CAPTURE"]) { $Capture = $bootEnv["LEONIDA_CAPTURE"] }
 
 $gameArgs = @("--run", $Exe, "--game-dir", $GameDir, "--overlay", $Overlay, "--trace", $TraceFile, "--trace-d3d12") + $ExtraArgs
@@ -275,6 +291,7 @@ if (-not $DigestOnly) {
     Write-Output "[boot] $Name  ${Seconds}s  repo $RepoRoot"
     Write-Output "[boot] gta6rt  $Runtime"
     Write-Output "[boot] out     $OutDir"
+    Write-Output "[boot] cwd     $RunDirectory"
     foreach ($k in $bootEnv.Keys) { if ($bootEnv[$k] -ne "") { Write-Output ("[boot] env     {0}={1}" -f $k, $bootEnv[$k]) } }
     Write-Output "[boot] command $(ConvertTo-ProcessArgument $Runtime) $argLine"
 }
@@ -314,7 +331,7 @@ if (-not $DigestOnly) {
             }
         }
 
-        foreach ($d in @($OutDir, $Overlay)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+        foreach ($d in @($OutDir, $Overlay, $RunDirectory)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
         if ($bootEnv["LEONIDA_PIPELINE_CACHE_DIR"]) {
             New-Item -ItemType Directory -Force -Path $bootEnv["LEONIDA_PIPELINE_CACHE_DIR"] | Out-Null
         }
@@ -336,7 +353,7 @@ if (-not $DigestOnly) {
 
         # ------------------------------------------------------------------------------------------- the boot
         $started = Get-Date
-        $proc = Start-Process -FilePath $Runtime -ArgumentList $argLine -WorkingDirectory $RepoRoot -NoNewWindow -PassThru `
+        $proc = Start-Process -FilePath $Runtime -ArgumentList $argLine -WorkingDirectory $RunDirectory -NoNewWindow -PassThru `
             -RedirectStandardError $LogFile -RedirectStandardOutput $StdoutFile
         $handle = $proc.Handle   # keeps the exit code readable after the process ends
         $stopped = $false
