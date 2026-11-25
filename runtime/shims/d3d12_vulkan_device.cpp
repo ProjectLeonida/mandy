@@ -4936,12 +4936,14 @@ public:
             wchar_t value[2]{};
             return GetEnvironmentVariableW(L"LEONIDA_IMPORT_BELOW_ARENA", value, 2) == 1 && value[0] == L'1';
         }();
-        if (buffer_va_ && buffer_va_ < device_.arena.address && !keep_low_imports) {
+        const bool below_arena = buffer_va_ && device_.arena.address && buffer_va_ < device_.arena.address;
+        const bool outside_vsharp = !rt::d3d12::host_import_va_in_vsharp_range(device_.arena.address, buffer_va_);
+        if (outside_vsharp && !(below_arena && keep_low_imports)) {
             static std::atomic<int> logged{0};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
                 std::fprintf(stderr,
-                             "[rt] d3d12: an import of title memory at %p (%llu bytes) landed below the arena (device "
-                             "address 0x%llx, arena 0x%llx): a shadow in the arena is used instead\n",
+                             "[rt] d3d12: an import of title memory at %p (%llu bytes) lies outside the 48-bit V# range "
+                             "above the arena (device address 0x%llx, arena 0x%llx): a shadow in the arena is used instead\n",
                              address, static_cast<unsigned long long>(desc_.Width),
                              static_cast<unsigned long long>(buffer_va_),
                              static_cast<unsigned long long>(device_.arena.address));

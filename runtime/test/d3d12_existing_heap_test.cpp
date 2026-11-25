@@ -1867,16 +1867,80 @@ void print_cases(const std::vector<Case>& cases, const char* who) {
                     int(c.desc.Properties.CPUPageProperty), int(c.desc.Properties.MemoryPoolPreference),
                     unsigned(c.desc.Flags));
 }
+
+int check_vsharp_48bit_range_guard() {
+    const char* who = "vsharp 48-bit range guard";
+    int failures = 0;
+    constexpr VkDeviceAddress kArena = 0x00007FFF00000000ull;
+    constexpr VkDeviceAddress kLimit = (1ull << 48) - 1ull;
+    // Guard is inactive when either address is 0 (no arena or no BDA).
+    EXPECT(rt::d3d12::host_import_va_in_vsharp_range(0, kArena));
+    EXPECT(rt::d3d12::host_import_va_in_vsharp_range(kArena, 0));
+    // Boundary inputs: just below arena, offsets 0 and 2^48 - 1 accepted; offset 2^48 and low VA rejected.
+    EXPECT(!rt::d3d12::host_import_va_in_vsharp_range(kArena, kArena - 1ull));
+    EXPECT(!rt::d3d12::host_import_va_in_vsharp_range(kArena, 0x1000ull));
+    EXPECT(rt::d3d12::host_import_va_in_vsharp_range(kArena, kArena));
+    EXPECT(rt::d3d12::host_import_va_in_vsharp_range(kArena, kArena + kLimit));
+    EXPECT(!rt::d3d12::host_import_va_in_vsharp_range(kArena, kArena + (1ull << 48)));
+    if (failures == 0) std::printf("%s: deterministic boundary cases passed\n", who);
+    return failures;
+}
+
+int check_title_placed_with_bda(const vktest::Device& vk) {
+    const char* who = "vulkan slot-133 buffer (BDA arena)";
+    int failures = 0;
+    Ref<ID3D12Device> bda_dev;
+    rt::d3d12::VulkanDeviceInfo info{};
+    info.get_instance_proc = vk.instance_proc;
+    info.instance = vk.instance;
+    info.physical = vk.physical;
+    info.device = vk.device;
+    info.queue = vk.queue;
+    info.queue_family = vk.family;
+    info.host_pointer_alignment = vk.host_pointer_alignment;
+    info.buffer_device_address = true;
+    EXPECT_HR(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&bda_dev.p)), S_OK);
+    if (!bda_dev.p) return failures ? failures : 1;
+
+    constexpr SIZE_T size = 0x10000;
+    void* pages = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    EXPECT(pages != nullptr);
+    if (!pages) return failures ? failures : 1;
+    std::memset(pages, 0x5A, size);
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    {
+        Ref<ID3D12Resource> buffer;
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(bda_dev.p, pages, desc, 0xFFFFFFFFu,
+                                                           IID_PPV_ARGS(&buffer.p)),
+                  S_OK);
+        if (buffer.p) {
+            const D3D12_GPU_VIRTUAL_ADDRESS gpu_va = buffer->GetGPUVirtualAddress();
+            EXPECT(gpu_va != 0);
+            std::printf("%s: returned valid GPU VA 0x%llx (%s)\n", who, static_cast<unsigned long long>(gpu_va),
+                        gpu_va == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages) ? "direct host import"
+                                                                                     : "arena shadow fallback");
+        }
+    }
+    VirtualFree(pages, 0, MEM_RELEASE);
+    return failures;
+}
 }  // namespace
 
 int main() {
     _putenv_s("LEONIDA_TITLE_TEXTURE_PERIOD_MS", "0");
     _putenv_s("LEONIDA_TITLE_TEXTURE_CHECK_KB", "0");
     vktest::Device vk;
+    vk.request_buffer_device_address = true;
     const auto status = vk.initialize();
     if (status == vktest::DeviceStatus::unavailable) return 77;
     if (status != vktest::DeviceStatus::ready) return 1;
     int failures = 0;
+    failures += check_vsharp_48bit_range_guard();
     {
         Ref<ID3D12Device> ours;
         rt::d3d12::VulkanDeviceInfo info{};
@@ -1898,6 +1962,7 @@ int main() {
         failures += check_import(ours.p, vk.host_pointer_alignment != 0);
         failures += check_placed_target_backing(ours.p);
         if (vk.host_pointer_alignment) failures += check_title_placed_all(ours.p);
+        if (vk.host_pointer_alignment && vk.buffer_device_address) failures += check_title_placed_with_bda(vk);
         if (vk.host_image_copy) {
             failures += check_pending_stream_views(ours.p);
             failures += check_shared_bc_placements(ours.p);

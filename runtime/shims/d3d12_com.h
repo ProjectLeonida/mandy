@@ -535,6 +535,13 @@ bool bound_descriptor_heap_bases(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRT
 // The size of every descriptor slot (GetDescriptorHandleIncrementSize), for handle ranges.
 inline constexpr UINT descriptor_size = 32;
 
+// True when a host-imported buffer's Vulkan device address can be encoded relative to `arena_address` in an RDNA2
+// 48-bit V# buffer descriptor (offset in [0, 2^48)). Unchecked when either address is 0 (no arena or no BDA).
+inline constexpr bool host_import_va_in_vsharp_range(VkDeviceAddress arena_address, VkDeviceAddress buffer_va) {
+    if (arena_address == 0 || buffer_va == 0) return true;
+    return buffer_va >= arena_address && ((buffer_va - arena_address) >> 48) == 0;
+}
+
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
 
