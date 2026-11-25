@@ -80,22 +80,39 @@ class WaveRef(cf_ref.WaveMachine):
     bytes get 4-byte placeholders (no branch needs the sizes)."""
 
     def __init__(self, info, wave):
+        insns = []
         for i, ins in enumerate(info["insns"]):
             if not ins.get("enc"):
                 if ins["op"].startswith(("s_branch", "s_cbranch")):
                     raise cf_ref.ProgramError("a branch needs encoding bytes")
-                ins["enc"], ins["pc"] = "00000000", 4 * i
-        super().__init__(info, wave)
+                ins = dict(ins, enc="00000000", pc=4 * i)
+            insns.append(ins)
+        super().__init__(dict(info, insns=insns), wave)
 
-    def _lane_sel(self, arg):
-        return self._int_src(arg, 0, scalar=True) & (self.wave - 1)
+    def _reject_mods(self, op, arg):
+        if arg.get("abs") or arg.get("neg"):
+            raise cf_ref.Unsupported(op, self.pc, "abs/neg modifiers are not modelled")
+
+    def _check_vgpr_dst(self, op, dst):
+        self._reject_mods(op, dst)
+        if dst["k"] != "vgpr" or dst.get("n", 1) != 1:
+            raise cf_ref.Unsupported(op, self.pc, "destination must be a single VGPR")
+
+    def _scalar_int_src(self, op, arg):
+        self._reject_mods(op, arg)
+        return self._int_src(arg, 0, scalar=True)
+
+    def _lane_sel(self, op, arg):
+        return self._scalar_int_src(op, arg) & (self.wave - 1)
 
     def _vsrc(self, ins, arg):
-        if arg["k"] != "vgpr":
-            raise cf_ref.Unsupported(ins["op"], self.pc, "source must be a VGPR")
+        self._reject_mods(ins["op"], arg)
+        if arg["k"] != "vgpr" or arg.get("n", 1) != 1:
+            raise cf_ref.Unsupported(ins["op"], self.pc, "source must be a single VGPR")
         return [self._vgpr(arg["r"], lane) for lane in range(64)]
 
     def _count_src(self, op, src, width):
+        self._reject_mods(op, src)
         if src["k"] == "imm":
             return src["v"] & ((1 << width) - 1)          # an inline constant sign-extends to the operand width
         if src["k"] == "sgpr" and src.get("n", 1) == width // 32:
@@ -115,6 +132,10 @@ class WaveRef(cf_ref.WaveMachine):
             # sD = ~S0, SCC = sD != 0, on a lane mask of the wave's width.
             self._check_width(base, op)
             self._expect(ins, 2)
+            if ins.get("mods"):
+                raise cf_ref.Unsupported(op, self.pc, "modifier is not modelled")
+            self._reject_mods(op, a[0])
+            self._reject_mods(op, a[1])
             r = ~self._read_mask(a[1]) & self.wmask
             self._write_mask(a[0], r)
             self.scc = 1 if r else 0
@@ -123,6 +144,9 @@ class WaveRef(cf_ref.WaveMachine):
             # bcnt1/0: how many bits are 1/0 (SCC = result != 0); ff1/0: the lowest bit that is 1/0, -1 if none
             # (SCC unchanged).
             self._expect(ins, 2)
+            if ins.get("mods"):
+                raise cf_ref.Unsupported(op, self.pc, "modifier is not modelled")
+            self._reject_mods(op, a[0])
             width = 64 if base.endswith("_b64") else 32
             v = self._count_src(op, a[1], width)
             if "0_i32" in base:
@@ -137,27 +161,44 @@ class WaveRef(cf_ref.WaveMachine):
         if base == "v_readlane_b32":
             # sD = vS of lane S1 mod the wave size (S1[5:0] in wave64, S1[4:0] in wave32), EXEC ignored.
             self._expect(ins, 3)
-            self._write_scalar_dst(a[0], self._vsrc(ins, a[1])[self._lane_sel(a[2])])
+            if ins.get("mods"):
+                raise cf_ref.Unsupported(op, self.pc, "modifier is not modelled")
+            self._reject_mods(op, a[0])
+            self._write_scalar_dst(a[0], self._vsrc(ins, a[1])[self._lane_sel(op, a[2])])
             return None
         if base == "v_readfirstlane_b32":
             # sD = vS of the lowest lane that is on in EXEC; lane 0 when none is.
             self._expect(ins, 2)
+            if ins.get("mods"):
+                raise cf_ref.Unsupported(op, self.pc, "modifier is not modelled")
+            self._reject_mods(op, a[0])
             active = self._active_lanes()
             self._write_scalar_dst(a[0], self._vsrc(ins, a[1])[active[0] if active else 0])
             return None
         if base == "v_writelane_b32":
             # vD of lane S1 mod the wave size = S0; every other lane keeps its value. EXEC ignored.
             self._expect(ins, 3)
-            self._write_vgpr(a[0], self._lane_sel(a[2]), self._int_src(a[1], 0, scalar=True))
+            if ins.get("mods"):
+                raise cf_ref.Unsupported(op, self.pc, "modifier is not modelled")
+            self._check_vgpr_dst(op, a[0])
+            self._write_vgpr(a[0], self._lane_sel(op, a[2]), self._scalar_int_src(op, a[1]))
             return None
         if base == "ds_bpermute_b32":
             # Backward permute: lane l reads vData of lane ((vAddr[l] + offset) / 4) mod 32 of its own 32-lane group
             # (a wave64 runs it as two wave32s), 0 if that lane is off in EXEC. All sources are read first.
             self._expect(ins, 3)
             mods = ins.get("mods") or []
-            if any(not m.startswith("offset:") for m in mods):
+            if any(not m.startswith("offset:") for m in mods) or len(mods) > 1:
                 raise cf_ref.Unsupported(op, self.pc, "modifier is not modelled")
-            off = next((int(m.split(":", 1)[1], 0) for m in mods), 0)
+            off = 0
+            if mods:
+                try:
+                    off = int(mods[0].split(":", 1)[1], 0)
+                except ValueError as e:
+                    raise cf_ref.Unsupported(op, self.pc, f"invalid offset modifier {mods[0]!r}") from e
+                if not 0 <= off <= 0xFFFF:
+                    raise cf_ref.Unsupported(op, self.pc, f"offset {off} outside 16-bit DS range")
+            self._check_vgpr_dst(op, a[0])
             addr, data = self._vsrc(ins, a[1]), self._vsrc(ins, a[2])
             out = {}
             for lane in self._active_lanes():
@@ -173,7 +214,8 @@ class WaveRef(cf_ref.WaveMachine):
             self._expect(ins, 4)
             if ins.get("mods"):
                 raise cf_ref.Unsupported(op, self.pc, "op_sel (FI/BOUND_CTRL) is not modelled")
-            s1, s2 = self._int_src(a[2], 0, scalar=True), self._int_src(a[3], 0, scalar=True)
+            self._check_vgpr_dst(op, a[0])
+            s1, s2 = self._scalar_int_src(op, a[2]), self._scalar_int_src(op, a[3])
             data = self._vsrc(ins, a[1])
             out = {}
             for lane in self._active_lanes():

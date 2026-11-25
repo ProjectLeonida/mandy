@@ -97,6 +97,59 @@ class Reference(unittest.TestCase):
         with self.assertRaises(cf_ref.Unsupported):
             machine(["v_permlane16_b32 v2, v1, s6, s6 op_sel:[1,0]"])
 
+    def test_rejects_multi_dword_vgpr_and_abs_neg_modifiers_on_cross_lane_ops(self):
+        cases = [
+            (64, ["v_readlane_b32 s7, v[2:3], 0"]),
+            (64, ["v_readlane_b32 s7, -v2, 0"]),
+            (64, ["v_readlane_b32 s7, v2, -s6"]),
+            (64, ["v_readfirstlane_b32 s7, v[2:3]"]),
+            (64, ["v_readfirstlane_b32 s7, |v2|"]),
+            (64, ["v_writelane_b32 v[2:3], s6, 0"]),
+            (64, ["v_writelane_b32 v2, -s6, 0"]),
+            (64, ["v_writelane_b32 v2, s6, -s7"]),
+            (64, ["ds_bpermute_b32 v2, v[3:4], v1"]),
+            (64, ["ds_bpermute_b32 v2, v3, -v1"]),
+            (64, ["v_permlane16_b32 v2, v[1:2], s6, s7"]),
+            (64, ["v_permlane16_b32 v2, |v1|, s6, s7"]),
+            (64, ["v_permlane16_b32 v2, v1, -s6, s7"]),
+            (32, ["s_bcnt1_i32_b32 s7, neg(1)"]),
+            (64, ["s_ff1_i32_b64 s7, |s[6:7]|"]),
+            (64, ["s_not_b64 s[6:7], -exec"]),
+        ]
+        for wave, body in cases:
+            with self.subTest(wave=wave, insn=body[0]):
+                with self.assertRaises(cf_ref.Unsupported):
+                    machine(body, wave=wave)
+
+    def test_validates_dst_even_when_exec_zero_or_source_lanes_off(self):
+        cases = [
+            (64, ["s_mov_b64 exec, 0", "ds_bpermute_b32 s6, v1, v2"]),
+            (64, ["s_mov_b64 exec, 0", "ds_bpermute_b32 v[2:3], v1, v2"]),
+            (64, ["s_mov_b64 exec, 0", "v_permlane16_b32 s6, v1, s7, s8"]),
+            (64, ["s_mov_b64 exec, 0", "v_permlanex16_b32 v[2:3], v1, s7, s8"]),
+            (32, ["s_mov_b32 exec_lo, 0xfffe", "s_mov_b32 s6, 0", "v_permlane16_b32 s7, v1, s6, s6"]),
+        ]
+        for wave, body in cases:
+            with self.subTest(wave=wave, insn=body[-1]):
+                with self.assertRaises(cf_ref.Unsupported):
+                    machine(body, wave=wave)
+
+    def test_bpermute_rejects_bad_or_out_of_range_offset_modifiers(self):
+        for mod in ("offset:-4", "offset:65536", "offset:bogus", "offset:4 offset:8"):
+            with self.subTest(mod=mod):
+                with self.assertRaises(cf_ref.Unsupported):
+                    machine([f"ds_bpermute_b32 v2, v1, v1 {mod}"])
+
+    def test_wave_ref_init_does_not_mutate_caller_insns(self):
+        info = {
+            "name": "t",
+            "code_start": 0,
+            "insns": [{"op": "s_endpgm", "args": [], "mods": [], "enc": "", "pc": 0}],
+        }
+        m = wave_diff.WaveRef(info, 64)
+        m.run()
+        self.assertEqual(info["insns"][0]["enc"], "")
+
 
 class Fuzzer(unittest.TestCase):
     def test_canaries(self):
