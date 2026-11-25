@@ -47,10 +47,12 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "gameinput.h"
 #include "gameinput_abi.h"
+#include "gameinput_script.h"
 #include "shims.h"
 
 using namespace gi;
@@ -131,14 +133,30 @@ const rt::gameinput::HapticApi& haptics() { return *g_haptic_api.load(); }
 
 // ---- configuration ----------------------------------------------------------------------------------------------
 
-std::string env(const char* name) {
-    char buf[64];
-    const DWORD n = GetEnvironmentVariableA(name, buf, sizeof buf);
-    if (n == 0 || n >= sizeof buf) return {};
-    std::string s(buf, n);
-    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return s;
+std::string env(const char* name) { return rt::gameinput::script::env_lower(name); }
+
+// The script's button numbers are SDL's (gameinput_script.h shares them with the shim built without SDL3).
+constexpr bool script_buttons_match_sdl() {
+    const struct {
+        uint32_t bit;
+        SDL_GamepadButton sdl;
+    } expected[] = {{GameInputGamepadA, SDL_GAMEPAD_BUTTON_SOUTH},          {GameInputGamepadB, SDL_GAMEPAD_BUTTON_EAST},
+                    {GameInputGamepadX, SDL_GAMEPAD_BUTTON_WEST},           {GameInputGamepadY, SDL_GAMEPAD_BUTTON_NORTH},
+                    {GameInputGamepadMenu, SDL_GAMEPAD_BUTTON_START},       {GameInputGamepadView, SDL_GAMEPAD_BUTTON_BACK},
+                    {GameInputGamepadLeftShoulder, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER},
+                    {GameInputGamepadRightShoulder, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER},
+                    {GameInputGamepadDPadUp, SDL_GAMEPAD_BUTTON_DPAD_UP},   {GameInputGamepadDPadDown, SDL_GAMEPAD_BUTTON_DPAD_DOWN},
+                    {GameInputGamepadDPadLeft, SDL_GAMEPAD_BUTTON_DPAD_LEFT},
+                    {GameInputGamepadDPadRight, SDL_GAMEPAD_BUTTON_DPAD_RIGHT}};
+    if (std::size(expected) != std::size(rt::gameinput::script::kButtons)) return false;
+    for (const auto& e : expected) {
+        bool found = false;
+        for (const auto& b : rt::gameinput::script::kButtons) found |= b.bit == e.bit && b.sdl == e.sdl;
+        if (!found) return false;
+    }
+    return true;
 }
+static_assert(script_buttons_match_sdl(), "gameinput_script.h's SDL button numbers drifted from SDL_GamepadButton");
 
 rt::gameinput::Config read_config() {
     rt::gameinput::Config c;
@@ -1098,30 +1116,7 @@ Snapshot read_pad(Device* d) {
         }
     }
 
-    // UI navigation derived from the gamepad (VERIFY against the console's own mapping).
-    const uint32_t b = s.gamepad.buttons;
-    const float t = 0.5f;
-    uint32_t& u = s.ui;
-    if (b & GameInputGamepadMenu) u |= GameInputUiNavigationMenu;
-    if (b & GameInputGamepadView) u |= GameInputUiNavigationView;
-    if (b & GameInputGamepadA) u |= GameInputUiNavigationAccept;
-    if (b & GameInputGamepadB) u |= GameInputUiNavigationCancel;
-    if (b & GameInputGamepadX) u |= GameInputUiNavigationContext1;
-    if (b & GameInputGamepadY) u |= GameInputUiNavigationContext2;
-    if (b & GameInputGamepadLeftThumbstick) u |= GameInputUiNavigationContext3;
-    if (b & GameInputGamepadRightThumbstick) u |= GameInputUiNavigationContext4;
-    if ((b & GameInputGamepadDPadUp) || s.gamepad.leftThumbstickY > t) u |= GameInputUiNavigationUp;
-    if ((b & GameInputGamepadDPadDown) || s.gamepad.leftThumbstickY < -t) u |= GameInputUiNavigationDown;
-    if ((b & GameInputGamepadDPadLeft) || s.gamepad.leftThumbstickX < -t) u |= GameInputUiNavigationLeft;
-    if ((b & GameInputGamepadDPadRight) || s.gamepad.leftThumbstickX > t) u |= GameInputUiNavigationRight;
-    if (b & GameInputGamepadLeftShoulder) u |= GameInputUiNavigationPageLeft;
-    if (b & GameInputGamepadRightShoulder) u |= GameInputUiNavigationPageRight;
-    if (s.gamepad.leftTrigger > t) u |= GameInputUiNavigationPageUp;
-    if (s.gamepad.rightTrigger > t) u |= GameInputUiNavigationPageDown;
-    if (s.gamepad.rightThumbstickY > t) u |= GameInputUiNavigationScrollUp;
-    if (s.gamepad.rightThumbstickY < -t) u |= GameInputUiNavigationScrollDown;
-    if (s.gamepad.rightThumbstickX < -t) u |= GameInputUiNavigationScrollLeft;
-    if (s.gamepad.rightThumbstickX > t) u |= GameInputUiNavigationScrollRight;
+    s.ui = rt::gameinput::script::ui_navigation(s.gamepad);
     return s;
 }
 
@@ -1861,8 +1856,8 @@ void update_keyboard_pad() {
     bool down[SDL_GAMEPAD_BUTTON_COUNT] = {};
     int lx = 0, ly = 0;
     bool aim = false, fire = false;
-    // Out of focus every button, stick and trigger is released, so a key held while switching windows does not stay
-    // pressed, and the cursor is read afresh on return, so moving it in another window does not swing the stick.
+    // Focus gates physical keyboard and mouse input. Read the cursor afresh on return to avoid a jump.
+    // Scripted presses still run while the window is unfocused.
     const bool active = mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()();
     if (active) {
         const rt::gameinput::KeyDownFn key_down = g_key_down.load();
@@ -1890,11 +1885,37 @@ void update_keyboard_pad() {
     }
     clip_cursor(active && g_raw_ready && g_cursor_pos.load() == system_cursor_pos && foreground_is_ours());
     for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
+    // LEONIDA_INPUT_SCRIPT="a@70,a@85,start@120" (with LEONIDA_KEYBOARD_PAD=always): timed presses on the keyboard
+    // pad, in seconds since the pad's first update, each held 300 ms. For unattended boots: the title's first prompt
+    // waits for a button with no timeout (docs/re/notes/firstframe.md, step 5). The parser, the timeline and the
+    // button names are gameinput_script.h's, shared with the scripted pad of a build without SDL3.
+    namespace script = rt::gameinput::script;
+    int right_y = g_keyboard.right_y;
+    static const script::Script scripted = [] {
+        script::Script s = script::parse(env("LEONIDA_INPUT_SCRIPT"));
+        if (!s.empty() || s.rejected)
+            std::fprintf(stderr, "[rt] gameinput: LEONIDA_INPUT_SCRIPT: %zu scripted press(es), %zu rejected\n",
+                         s.presses.size(), s.rejected);
+        return s;
+    }();
+    if (!scripted.empty()) {
+        static const ULONGLONG origin = GetTickCount64();
+        const double now = (GetTickCount64() - origin) / 1000.0;
+        const script::Held held = script::held_at(scripted, now);
+        if (held.stick) right_y = held.stick > 0 ? -kStickFull : kStickFull;  // SDL's +Y is down
+        for (const script::Button& b : script::kButtons) {
+            if (!(scripted.named & b.bit)) continue;
+            const auto button = static_cast<SDL_GamepadButton>(b.sdl);
+            SDL_SetJoystickVirtualButton(g_keyboard.js, button, (held.buttons & b.bit) || down[button]);
+        }
+        static uint32_t was = 0;
+        script::log_scripted(held.buttons, &was, now);
+    }
     const int reach = lx && ly ? kStickDiagonal : kStickFull;
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFTX, static_cast<Sint16>(lx * reach));
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFTY, static_cast<Sint16>(ly * reach));
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHTX, static_cast<Sint16>(g_keyboard.right_x));
-    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHTY, static_cast<Sint16>(g_keyboard.right_y));
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHTY, static_cast<Sint16>(right_y));
     // SDL maps a full-range virtual axis to the trigger, so -32768 is released, 0 half pulled, 32767 full.
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, aim ? 32767 : -32768);
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, fire ? 32767 : -32768);
@@ -1965,6 +1986,17 @@ void poll_once() {
         read_raw(d, &snap);
         const bool guide_changed = d->last_snap.guide != snap.guide;
         const bool changed = !(d->last_snap == snap);
+        // Every press is logged in LEONIDA_INPUT_SCRIPT's own form (name@seconds), so a session played by hand can
+        // be replayed unattended: join the logged items with commas. The right stick's vertical throws (what scrolls
+        // a page) are logged as rsup/rsdown. LEONIDA_INPUT_LOG=0 turns the lines off.
+        {
+            static const bool log_presses = env("LEONIDA_INPUT_LOG") != "0";
+            static const ULONGLONG log_origin = GetTickCount64();
+            if (log_presses)
+                rt::gameinput::script::log_presses(snap.gamepad.buttons & ~d->last_snap.gamepad.buttons,
+                                                   d->last_snap.gamepad.rightThumbstickY, snap.gamepad.rightThumbstickY,
+                                                   (GetTickCount64() - log_origin) / 1000.0, d->name.c_str());
+        }
         d->last_snap = snap;
         // A newly opened pad's first sample here is its baseline (active_input.h), so connecting a pad with a button
         // held changes nothing.
