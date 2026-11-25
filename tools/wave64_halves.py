@@ -1240,8 +1240,8 @@ class Analysis:
 
     def cmp_tag(self, st, ins, op, srcs, t_src, idiom):
         """(tag, taint) of the lane mask a v_cmp / v_cmpx writes. The two recognised comparisons: a waterfall
-        scalar against the VGPR it was read from (every lane of the mask owns that value), and a lane rank
-        against 0 (the first lane of the mask the rank counts)."""
+        scalar against the VGPR it was read from, as a whole-word integer equality (every lane of the mask owns
+        that value), and a lane rank against 0 (the first lane of the mask the rank counts)."""
         T = st["t"]
         tag, tj = None, t_src
         # A waterfall needs equality of the entire unmodified descriptor word.
