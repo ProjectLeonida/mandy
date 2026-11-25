@@ -286,7 +286,9 @@ public:
         std::lock_guard lock(mutex_);
         for (std::size_t i = submission.dispatch_count - submission.dispatches.size(); i < submission.dispatch_count; ++i)
             dispatches_[dispatch_count_++ % dispatches_.size()] = submission.dispatches[i % submission.dispatch_limit];
-        submission.dispatches.clear();
+        // With LEONIDA_DEVICE_FAULT_ROOTS each recent submission keeps its own dispatches: a later submission can
+        // push every one of them out of the global history before the driver reports a checkpoint in it.
+        if (!include_roots_) submission.dispatches.clear();
         recent_[submission.sequence % recent_.size()] = std::move(submission);
     }
 
@@ -324,24 +326,32 @@ private:
         std::lock_guard lock(mutex_);
         const auto n = std::min(dispatch_count_, dispatches_.size());
         for (std::size_t i = dispatch_count_ - n; i < dispatch_count_; ++i) {
-            const auto& d = dispatches_[i % dispatches_.size()];
-            std::fprintf(stderr, "[rt] device-fault: submitted dispatch seq=%zu execute=%" PRIu64
-                         " queue=%p (%s) list=%zu command=%zu shader=%s ", i + 1, d.execute_call,
-                         static_cast<void*>(d.queue), d.queue_kind, d.list, d.command, d.shader ? d.shader : "-");
-            if (d.indirect)
-                std::fprintf(stderr, "indirect args=0x%" PRIxPTR "+0x%" PRIx64 " count=0x%" PRIxPTR
-                             "+0x%" PRIx64 " max=%u stride=%u", d.argument_buffer, d.argument_offset,
-                             d.count_buffer, d.count_offset, d.max_count, d.stride);
-            else std::fprintf(stderr, "groups=%u,%u,%u", d.groups[0], d.groups[1], d.groups[2]);
-            if (include_roots_) {
-                std::fputs(" roots=", stderr);
-                for (auto word : d.roots) std::fprintf(stderr, "%08x ", word);
-            }
-            std::fputc('\n', stderr);
+            std::fprintf(stderr, "[rt] device-fault: submitted dispatch seq=%zu", i + 1);
+            print_dispatch(dispatches_[i % dispatches_.size()]);
         }
     }
 
+    // The rest of a dispatch line: where it was submitted, its shader, its groups or indirect arguments, and with
+    // LEONIDA_DEVICE_FAULT_ROOTS its 32 root words.
+    void print_dispatch(const CheckpointDispatch& d) const {
+        std::fprintf(stderr, " execute=%" PRIu64 " queue=%p (%s) list=%zu command=%zu shader=%s ", d.execute_call,
+                     static_cast<void*>(d.queue), d.queue_kind, d.list, d.command, d.shader ? d.shader : "-");
+        if (d.indirect)
+            std::fprintf(stderr, "indirect args=0x%" PRIxPTR "+0x%" PRIx64 " count=0x%" PRIxPTR
+                         "+0x%" PRIx64 " max=%u stride=%u", d.argument_buffer, d.argument_offset,
+                         d.count_buffer, d.count_offset, d.max_count, d.stride);
+        else std::fprintf(stderr, "groups=%u,%u,%u", d.groups[0], d.groups[1], d.groups[2]);
+        if (include_roots_) {
+            std::fputs(" roots=", stderr);
+            for (auto word : d.roots) std::fprintf(stderr, "%08x ", word);
+        }
+        std::fputc('\n', stderr);
+    }
+
 public:
+    // Checkpoints whose dispatch the report found in its submission's history (LEONIDA_DEVICE_FAULT_ROOTS); tests.
+    std::size_t checkpoint_dispatches_found() const { return checkpoint_dispatches_found_; }
+
     // LOCAL DIAGNOSTIC: run once after a loss is reported (the compute input probe rechecks the descriptors it saw).
     void set_lost_hook(std::function<void()> hook) {
         std::lock_guard lock(mutex_);
@@ -454,6 +464,18 @@ private:
                              pipeline.shaders[1] ? pipeline.shaders[1] : "-",
                              pipeline.shaders[2] ? pipeline.shaders[2] : "-");
             }
+            // The dispatch at the checkpoint, from the submission's own history (LEONIDA_DEVICE_FAULT_ROOTS).
+            if (include_roots_ && marker.kind == CheckpointKind::dispatch) {
+                bool found = false;
+                for (const auto& dispatch : entry.dispatches) {
+                    if (dispatch.list != marker.list || dispatch.command != marker.command) continue;
+                    std::fputs("[rt] device-fault: checkpoint dispatch", stderr);
+                    print_dispatch(dispatch);
+                    found = true;
+                }
+                if (found) ++checkpoint_dispatches_found_;
+                else std::fputs("[rt] device-fault: checkpoint dispatch not in its submission's history\n", stderr);
+            }
         }
     }
 
@@ -469,6 +491,7 @@ private:
     PFN_vkGetQueueCheckpointDataNV vkGetQueueCheckpointDataNV = nullptr;
     std::atomic<bool> reported_{false};
     std::atomic<std::uint64_t> execute_calls_{0};
+    mutable std::size_t checkpoint_dispatches_found_ = 0;
     std::uint32_t sequence_ = 0;
     std::mutex mutex_;  // leaf lock, guards queues_ and recent_
     std::vector<VkQueue> queues_;
