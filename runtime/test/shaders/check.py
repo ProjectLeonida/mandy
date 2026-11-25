@@ -1656,9 +1656,10 @@ def sampler_compare_mismatch(data, words, view):
 # and an LOD-1 sample, so the same SAMPLER_CASES expectations hold for all: ps_ssharp (image_sample_lz and
 # image_sample), ps_ssharp_ld (image_sample_l and image_sample_d), ps_ssharp_b (image_sample_lz and image_sample_b),
 # ps_ssharp_cube and ps_ssharp_3d (image_sample_lz and image_sample on a cube and a volume) and ps_ssharp_c
-# (image_sample_c_lz and image_sample_c on a depth texture, judged as compare results).
+# (image_sample_c_lz and image_sample_c on a depth texture, judged as compare results); ps_ssharp_o (image_sample_lz_o
+# and image_sample_o) runs only under LEONIDA_TEXOFF_FALLBACK=1, its Grad derivatives being what it checks.
 SAMPLER_FIXTURES = {"ps_ssharp": (), "ps_ssharp_ld": (), "ps_ssharp_b": (), "ps_ssharp_cube": ("--cube",),
-                    "ps_ssharp_3d": ("--3d",), "ps_ssharp_c": ("--dref",)}
+                    "ps_ssharp_3d": ("--3d",), "ps_ssharp_c": ("--dref",), "ps_ssharp_o": ()}
 SSHARP_LESS_EQUAL = 3 << 12   # S# word 0 DEPTH_COMPARE_FUNC [14:12] = LESS_EQUAL (Vulkan's VK_COMPARE_OP_LESS_OR_EQUAL)
 
 
@@ -1668,6 +1669,8 @@ def sampler_test(tools, spirv, ps="ps_ssharp"):
     each pixel; ps_ssharp_c's compare reads 0 on level 0 and 1 on level 1."""
     mode = SAMPLER_FIXTURES[ps]
     dref = "--dref" in mode
+    if ps == "ps_ssharp_o" and os.environ.get("LEONIDA_TEXOFF_FALLBACK") != "1":
+        return Skip("SKIP (needs LEONIDA_TEXOFF_FALLBACK=1: vk_sampler_test enables no VK_KHR_maintenance8)")
     shaders = [os.path.join(spirv, name + ".spv") for name in ("vs_ids", ps)]
     for path in shaders:
         if not os.path.isfile(path):
