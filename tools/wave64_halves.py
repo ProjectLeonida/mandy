@@ -1244,11 +1244,17 @@ class Analysis:
         against 0 (the first lane of the mask the rank counts)."""
         T = st["t"]
         tag, tj = None, t_src
+        # A waterfall needs equality of the entire unmodified descriptor word.
+        # Floating equality merges the two signed zeros. Halfword comparisons and
+        # SDWA/DPP can select lanes whose original descriptor words differ, too.
+        whole_word = (op in ("v_cmp_eq_i32", "v_cmp_eq_u32")
+                      and not ins["op"].endswith(("_sdwa", "_dpp")) and not ins.get("mods")
+                      and not any(x.get("abs") or x.get("neg") for x in srcs))
         if "_eq_" in op and len(srcs) == 2:
             for sc, vv in ((srcs[0], srcs[1]), (srcs[1], srcs[0])):
                 r = _regs(sc)
                 g = st["g"].get(r[0]) if r else None
-                if g and g[0] == "wfs" and vv.get("k") == "vgpr" and vv["r"] == g[1] and not vv.get("neg"):
+                if whole_word and g and g[0] == "wfs" and vv.get("k") == "vgpr" and vv["r"] == g[1]:
                     tag, tj = ("wfmask", g[1]), self.rd(st, ins, vv) | (T.get(r[0], 0) & ~WFS)
                     idiom("waterfall")
                 elif g and g[0] == "rank" and sc.get("k") == "vgpr" and vv.get("k") == "imm" and vv["v"] == 0 and                         (T.get(r[0], 0) & ~TAG_BITS) == 0:

@@ -100,6 +100,7 @@ COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh",
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
 COMPUTE += [("cs_bvh32", "1", "bvh")]   # TEST-184: image_bvh_intersect_ray, the 32-bit node pointer; same scene and words
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800, 0x40ff8000, 0x3ff00000]
+CS_SMEM_VCC = list(range(0x7210, 0x7218))
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 # -0, and NaN checks that need SignedZeroInfNanPreserve (cs_signed_zero_nan.asm); 0 in out[4..7] means it's missing
 SIGNED_ZERO_NAN = [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00007c00]
@@ -130,7 +131,7 @@ CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_cmp", [3, 2, 3, 2, 1, 0, 1, 0])]
 WAVE32_DUMPS += tuple(n for n, _ in CS_DPP)
 WAVE32_LANE_DUMPS += tuple(n for n, _ in CS_DPP)
-CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
+CS_DUMPS = [*CS_DPP, ("cs_smem_vcc_base", CS_SMEM_VCC), ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
             ("cs_w32_lane_wrap", [25, 16, 777, 777]),
             # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]]
@@ -695,6 +696,33 @@ def frexp_ldexp_test(tools, spirv, env=None):
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
 USER_SGPRS_WORDS = USER_SGPRS + [0xEEEEEEEE] * 4
+# cs_w32_salu_ext.asm: the sixteen operand words vk_compute_test puts in s4..s19, and the 73 words the shader stores
+# (each derived in its header; tests/test_gpu_salu_ext.py recomputes them with the reference of tools/salu_diff.py).
+SALU_EXT_SGPRS = [0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x00000001, 0x12345678, 0xDEADBEEF, 0x0000FF80, 0x00000025,
+                  0x00000040, 0x00000000, 0x00000001, 0x80000001, 0xFFFF0000, 0xFFFFFFFF, 0x00000000, 0x00000047]
+SALU_EXT_WORDS = [
+    0xFFFFFFFF, 0x12345677, 0xCC89A887, 0x00000000, 0x33765778, 0x00000000, 0xCC99E897, 0x00000000,
+    0xFC000000, 0x00000000, 0x00000000, 0x12345680, 0x01F3266F, 0x00000011, 0x80000000, 0x00000001,
+    0x00000000, 0x12345678, 0x00000008, 0x00000000, 0x80000000, 0x1233D678, 0x7FFFFFFF, 0x0FD5BDEE,
+    0xBEEF5678, 0xDEAD1234, 0x1E6A2C48, 0x00000001, 0xFFFFFFFF, 0x0000001F, 0x00000010, 0xFFFFFFFF,
+    0x00000000, 0xFFFFFF80, 0x00000078, 0xFFFFFFDF, 0x00000020, 0xC962FC98, 0x12345678, 0xFFFF8000,
+    0x00000040, 0x00000000, 0x00000001, 0x80000001, 0xFFFF0000, 0xFFFFFFDF, 0xFFFFFF7F, 0xFFFFFFFF,
+    0x00000000, 0x00000020, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x02000000, 0xFF000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000020, 0x00000080, 0x00000080, 0x00000000, 0x00000000, 0x07FFFFFF,
+    0x00000000, 0x00000000, 0x00000000, 0x00000010, 0x00000000, 0x0056D555, 0x000D5555, 0x00555555,
+    0x0000015B]
+SALU_EXT_HEAP_WORDS = 80   # the 73 results, then words that must keep the harness's fill
+
+
+def salu_ext_test(tools, spirv, env=None):
+    """cs_w32_salu_ext: 38 scalar ALU ops on the operands of SALU_EXT_SGPRS, every destination and SCC stored. The
+    whole 80-word heap is compared: the 73 results and the untouched fill after them."""
+    child = dict(os.environ if env is None else env, VKC_SGPRS=",".join(f"{w:#x}" for w in SALU_EXT_SGPRS))
+    child.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_w32_salu_ext") or 32))
+    expected = SALU_EXT_WORDS + [0xEEEEEEEE] * (SALU_EXT_HEAP_WORDS - len(SALU_EXT_WORDS))
+    return dump_test(tools, spirv, "cs_w32_salu_ext", expected, SALU_EXT_HEAP_WORDS, child)
+
+
 # cs_fma_fused.asm: single-rounded f32 multiply-adds (and one f16). The operands arrive in s4..s7 so no driver can fold
 # them; FMA_FUSED are the exact single-rounded words and FMA_SPLIT are the exact split-rounded words (derivations in
 # the .asm header; out[7] is f16 round-to-odd, never GLSL Fma, so it is always 0x7351). Under --fma khr
@@ -743,7 +771,9 @@ W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               # s_andn2_saveexec_b64 / s_andn2_wrexec_b64: EXEC = S0 & ~EXEC over both halves, D old / new EXEC, SCC
               ("cs_w64x_andn2_exec", [1, 16, 32, 4144, 2052, 3, 8, 1544]),
               # s_and/s_or_saveexec_b64 (VCC and SGPR-pair sources), s_andn2_saveexec/wrexec_b64 (SGPR pair): D, EXEC, SCC
-              ("cs_w64x_saveexec_b64", [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171])]
+              ("cs_w64x_saveexec_b64", [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171]),
+              # SHADER-W64-SDST-PAIR: v_cmp_* / carry-out SGPR destinations printed as one register (no mattr line)
+              ("cs_w64x_cmp_sdst", [10240, 6144, 2053, 8224, 7714, 6184, 4144, 5])]
 # A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
                 ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
@@ -2154,6 +2184,32 @@ def clip_test(tools, spirv, name):
     return ""
 
 
+def texture_uav_test(tools, spv):
+    """The Windows D3D12 test compares every texel itself, through both Vulkan and WARP."""
+    if os.name != "nt":
+        return Skip("SKIP (needs the Windows D3D12 runtime)")
+    exe = os.path.join(tools, "d3d12_texture_uav_test" + EXE)
+    if not os.path.isfile(exe):
+        return f"missing {exe}"
+    code, out = run(exe, spv)
+    if code == UNSUPPORTED:
+        reason = next((line for line in out.splitlines() if line.startswith("SKIP:")), "unsupported device")
+        return Skip(reason)
+    return "" if code == 0 else failure(code, out, 8)
+
+
+IMAGE_STORE_CASES = {
+    "cs_imgstore": (),
+    "cs_imgstore_cube": ("cube",),   # GPU-CUBE-STORE: six-layer 2D-array views at bindings 11/12/13
+    "cs_imgload": ("load",),
+    "cs_imgload_tfe": ("load",),
+    "cs_imgload_d16": ("load-d16",),
+    "cs_imgload_d16_tfe": ("load-d16",),
+    "cs_sample_lz_int_d16": ("load-d16",),
+    "cs_imgload_mip": ("load-mip",),
+}
+
+
 def main():
     if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
         print(__doc__)
@@ -2187,6 +2243,7 @@ def main():
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
                                                   expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
+    results.append(("cs_w32_salu_ext", salu_ext_test(tools, spirv)))
     results.append(("cs_heap_init", compute_test(tools, spirv, "cs_heap_init", "1", "dump",
                                                  expected_words=HEAP_INIT_EXPECTED, env=heap_init_env())))
     results.append(("cs_w32_shift64", shift64_test(tools, spirv)))
@@ -2208,10 +2265,7 @@ def main():
     results.append(("ms_wave_info_s3", mesh_w64x_test(tools, spirv, "ms_wave_info_s3")))
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         results.append(("ms_v5_workgroup", mesh_v5_test(tools, spirv, Path(tmp) / "groups.raw")))
-    for name, args in (("cs_imgstore", []), ("cs_imgstore_cube", ["cube"]), ("cs_imgload", ["load"]),
-                       ("cs_imgload_tfe", ["load"]),
-                       ("cs_imgload_d16", ["load-d16"]), ("cs_imgload_d16_tfe", ["load-d16"]),
-                       ("cs_sample_lz_int_d16", ["load-d16"])):
+    for name, args in IMAGE_STORE_CASES.items():
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
         if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature this test needs
             m = re.search(r"unsupported: .*", out)
@@ -2219,6 +2273,9 @@ def main():
             continue
         bad = re.findall(r"(\d+) bad", out)
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
+    texture_uav_spv = os.path.join(spirv, "cs_texture_uav.spv")
+    if os.path.isfile(texture_uav_spv):
+        results.append(("cs_texture_uav", texture_uav_test(tools, texture_uav_spv)))
     for name in STORE_WORDS:   # TEST-184: image atomics and image_get_resinfo
         results.append((name, store_words_test(tools, spirv, name)))
     for name in GET_LOD_TESTS:   # TEST-184: image_get_lod, 2D and 2D array

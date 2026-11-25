@@ -1,4 +1,5 @@
 #pragma once
+#include "gpu_label_memory.h"
 
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
@@ -527,6 +528,7 @@ struct UavView {
     std::uint32_t mip;           // texture
     std::uint32_t first_layer;
     std::uint32_t layer_count;
+    bool exact_clear_format = false; // newly exposed 1D/3D UAVs: do not clear via a different backing format
 };
 
 // ClearUnorderedAccessViewUint / ...Float; the resource must be in unordered_access state at execution. values are
@@ -667,7 +669,7 @@ struct AccelerationStructurePostbuild {
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
-                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
+                             WriteImmediate, label::Write, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
                              ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw, CopyAccelerationStructure,
                              AccelerationStructurePostbuild>;
 
@@ -797,6 +799,11 @@ public:
     }
 
     // WriteBufferImmediate: D3D12 requires a 4-byte aligned, non-null address and one of the three modes.
+    bool write_gpu_label(const label::Write& write) {
+        if(write.target.owner.expired() || write.clock>2) return false;
+        return append(write);
+    }
+
     bool write_immediate(const WriteImmediate& write) {
         if (!write.address || write.address % 4 || write.mode > write_immediate_mode::marker_out) return false;
         return append(write);
