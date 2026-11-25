@@ -432,6 +432,144 @@ def subgroup_pin_skip(msg: str, cs_env: dict | None) -> Skip | None:
 # report a failure that is really an unpinnable wave size (GCN3/GCN4 expose 64..64 only).
 WAVE32_PIN_DUMPS = ("cs_barrier_loop",)
 
+# Compute dump fixtures (sorted one entry per line to avoid horizontal-tuple merge conflicts).
+# Adding a fixture edits only CS_DUMP_WANTS (and CS_DUMP_NON_WAVE64 / CS_DUMP_HEXWORDS if applicable).
+CS_DUMP_WANTS: dict[str, list[int]] = {
+    "cs_barrier_divergent": [127, 126, 125, 124, 123, 122, 121, 120],
+    "cs_barrier_early_end": [127, 126, 125, 124, 123, 122, 121, 120],
+    "cs_barrier_loop": [128, 96, 64, 32, 128, 96, 64, 0xEEEEEEEE],
+    "cs_bpermute32": [0, 50, 162, 99, 36, 218, 183, 15],
+    "cs_dpp": [1, 0, 3, 2, 5, 4, 7, 6],
+    "cs_dpp8": [7, 6, 5, 4, 3, 2, 1, 0],
+    "cs_dpp_bank": [0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD, 0xFFFFFFFC, 7, 7, 7, 7],
+    "cs_dpp_bound": [10, 10, 11, 12, 13, 14, 15, 16],
+    "cs_dpp_cmp": [3, 2, 3, 2, 1, 0, 1, 0],
+    "cs_dpp_fi": [1, 2, 3, 0x7777, 5, 6, 7, 0x7777],
+    "cs_dpp_mask": [1, 0, 3, 2, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE],
+    "cs_dpp_ops": [100, 10, 11, 12, 13, 14, 15, 16],
+    "cs_dpp_row": [0, 0, 1, 2, 3, 4, 5, 6],
+    "cs_dpp_w64": [1, 0, 3, 2, 5, 4, 7, 6],
+    "cs_exec_const": [16, 8, 2, 16, 0, 16],
+    "cs_lds_atomics_ext": [0xF0F11234, 0xAB34CD78, 0x12345678, 0xF0F00F0F, 0xA5A55A5A, 0x00AA00AA, 0x7FB00000, 0xFE090700],
+    "cs_lds_b64_cmpst": [0x11110001, 0x22220002, 0x33330003, 0x44440004, 0xCCCC000C, 0x44440004, 0xBBBB000B, 0x3579BADC],
+    "cs_lds_xchg64_ext": [0x11110003, 0x33333333, 0xF00FF000, 0x04030201, 0x40302010, 0x70500705, 0x3FC00000, 0x80000000],
+    "cs_mask_vgpr_exec": [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF],
+    "cs_movrelsd_2": [11, 33, 33, 55, 1717, 77, 1515, 1717],
+    "cs_signed_zero_nan": [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00007C00],
+    "cs_smem_soffset_imm": [0x5EED0024, 0x5EED0028, 0x5EED002C, 0x5EED0030, 0x5EED0010, 0x5EED0014, 0x5EED0018, 0x5EED001C],
+    "cs_smem_vcc_base": CS_SMEM_VCC,
+    "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
+    "cs_w32_andn2_exec": [1, 8, 16, 2064, 2068, 3, 20, 1544],
+    "cs_w32_buffer_store_sub": [0x1122AB44, 0xCDEF7788, 0x34AABBCC, 0xDDDDDD12, 0x0102035A, 0x05061234, 0xAB, 0xFFFFCDEF],
+    "cs_w32_buffer_sub16": [0xBEEF00AA, 0x00AA1234, 0xBEEFFFAA, 0xFFAA1234, 0xBEEF8899, 0x88991234, 0x1122CD44, 0xABCD7788],
+    "cs_w32_exec_computed": [259, 1028, 3088, 7682, 512, 4100, 0, 3],
+    "cs_w32_fcmpswap": [0, 0x3F800000, 0x7FC00000, 0x3F800000, 0x80000000, 0x40400000, 0x3F800000, 0x7FC00000],
+    "cs_w32_int_ext": [1, 27, 1, 0x33332222, 0xC0000000, 0x4000, 18, 0x20304050],
+    "cs_w32_lane_wrap": [25, 16, 777, 777],
+    "cs_w32_lds_subdword": [0x11B2D444, 0xA1B2C3D4, 0xFFFFFFB2, 0x000000B2, 0x00000011, 0xFFFFA1B2, 0x0000A1B2, 0xFFFFC3D4],
+    "cs_w32_lds_u8_d16": [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234],
+    "cs_w32_lds_wide": [0xCAFEF00D, 0xFEEDFACE, 0x600DD00D, 0x00000000, 0x8BADF00D, 0xDEADC0DE, 0x12345678, 0x9ABCDEF0],
+    "cs_w32_mask_imm": [2056, 20, 2, 6152, 2050, 4112, 258, 32],
+    "cs_w32_misc_ext": [0x0FFF0FFF, 0xE2C4A688, 0x0007FFFF, 0x7FFF8000, 0xFFFE0002, 0xFFFF0005, 0x509, 0xCAFEF00D],
+    "cs_w32_new_ops": [0x55, 0x8001, 0xC0000000, 0x80014000, 0x4000FFFF, 0x77, 0x99, 0x1234],
+    "cs_w32_partial_permute": [0, 29, 127, 0, 1, 0, 134, 113],
+    "cs_w32_partial_scmp": [0, 1, 1, 0, 1, 1, 1, 1],
+    "cs_w32_permlane_fi": [1000, 0, 4, 1, 1000, 0, 52, 49],
+    "cs_w32_permute": [218, 29, 8, 211, 0, 15, 99, 15],
+    "cs_w32_salu64": [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE],
+    "cs_w32_sincos": [1, 1, 1, 1, 1, 1],
+    "cs_w64_exec_computed": [291, 1028, 11264, 771, 8192, 4132, 0, 3],
+    "cs_w64_mask_detect": [48],
+    "cs_w64_mask_imm": [2056, 1084, 828, 2052, 319, 2104, 516, 2064],
+    "cs_w64x_andn2_exec": [1, 16, 32, 4144, 2052, 3, 8, 1544],
+    "cs_w64x_ballot": [2053, 2061, 2069, 2077, 2085, 2093, 2101, 2109],
+    "cs_w64x_bpermute": [36, 316, 253, 218, 435, 225, 0, 442],
+    "cs_w64x_branch": [0, 0, 0, 0, 5, 5, 9, 9],
+    "cs_w64x_chain_barrier": [564, 563, 500, 627],
+    "cs_w64x_cmp_sdst": [10240, 6144, 2053, 8224, 7714, 6184, 4144, 5],
+    "cs_w64x_lds_raw": [132, 137, 100, 108, 131, 101, 149, 118],
+    "cs_w64x_lds_war": [1032, 1063, 1000, 1031, 2032, 2063, 2000, 2031],
+    "cs_w64x_load_ballot_load": [43, 74, 75, 42, 42, 18, 41, 32],
+    "cs_w64x_mask_reuse": [8, 40, 8, 40, 2, 20, 10, 64],
+    "cs_w64x_mask_reuse2": [10, 20, 8, 8, 5, 2, 132, 131],
+    "cs_w64x_partial": [40, 40, 528, 0, 0, 532, 539, 524820],
+    "cs_w64x_partial_scmp": [0, 1, 0, 1, 1, 1, 1, 0],
+    "cs_w64x_permute": [218, 442, 435, 239, 0, 99, 239, 232],
+    "cs_w64x_readfirstlane": [140, 140, 163, 132, 100, 105, 133, 48],
+    "cs_w64x_readlane": [121, 121, 16, 97, 16, 100, 100, 121],
+    "cs_w64x_saveexec_b64": [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171],
+    "cs_w64x_sbarrier": [605, 605, 686, 686, 3032, 3013, 3032, 3031],
+    "cs_w64x_wg128_branches": [121, 121, 343, 343, 14, 31, 19812, 22728],
+    "cs_w64x_writelane": [4660, 77, 99, 2748, 0, 0, 4660, 99],
+    "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
+    "cs_wm_bfm64": [16, 8, 8, 40],
+    "cs_wm_half_cmp": [1, 0, 1, 1],
+    "cs_wm_half_ops": [32, 16, 16, 0, 16],
+    "cs_wm_scc_rfl": [55, 48],
+    "cs_wqm_w32": [12, 1, 4, 0, 8, 15728880, 4, 32],
+    "cs_wqm_w64": [20, 4, 12, 8, 1, 0, 15728895, 20],
+    "cs_wqm_w64_half": [11, 14, 0, 1, 6, 8, 12, 2],
+}
+
+# Fixtures in CS_DUMP_WANTS that run without --require-wave64 (wave32, scalar, barrier, and DPP tests).
+CS_DUMP_NON_WAVE64: frozenset[str] = frozenset({
+    "cs_barrier_divergent",
+    "cs_barrier_early_end",
+    "cs_barrier_loop",
+    "cs_bpermute32",
+    "cs_dpp",
+    "cs_dpp8",
+    "cs_dpp_bank",
+    "cs_dpp_bound",
+    "cs_dpp_cmp",
+    "cs_dpp_fi",
+    "cs_dpp_mask",
+    "cs_dpp_ops",
+    "cs_dpp_row",
+    "cs_exec_const",
+    "cs_lds_atomics_ext",
+    "cs_lds_b64_cmpst",
+    "cs_lds_xchg64_ext",
+    "cs_mask_vgpr_exec",
+    "cs_movrelsd_2",
+    "cs_signed_zero_nan",
+    "cs_smem_soffset_imm",
+    "cs_store",
+    "cs_w32_andn2_exec",
+    "cs_w32_buffer_store_sub",
+    "cs_w32_buffer_sub16",
+    "cs_w32_exec_computed",
+    "cs_w32_fcmpswap",
+    "cs_w32_int_ext",
+    "cs_w32_lane_wrap",
+    "cs_w32_lds_subdword",
+    "cs_w32_lds_u8_d16",
+    "cs_w32_lds_wide",
+    "cs_w32_mask_imm",
+    "cs_w32_misc_ext",
+    "cs_w32_new_ops",
+    "cs_w32_partial_permute",
+    "cs_w32_partial_scmp",
+    "cs_w32_permlane_fi",
+    "cs_w32_permute",
+    "cs_w32_salu64",
+    "cs_w32_sincos",
+    "cs_wqm_w32",
+})
+
+# Fixtures in CS_DUMP_WANTS whose mismatch diagnostics format output words in hex.
+CS_DUMP_HEXWORDS: frozenset[str] = frozenset({
+    "cs_lds_atomics_ext",
+    "cs_lds_b64_cmpst",
+    "cs_lds_xchg64_ext",
+    "cs_signed_zero_nan",
+    "cs_smem_soffset_imm",
+    "cs_store",
+    "cs_w32_lds_subdword",
+    "cs_w32_lds_u8_d16",
+    "cs_w32_lds_wide",
+})
+
 
 def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: bool, emulated: bool,
                   hexwords: bool = False) -> tuple[bool | None, str]:
@@ -1201,148 +1339,15 @@ def run_suite(a, work: str) -> int:
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
             # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
-        elif name in ("cs_smem_vcc_base", "cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_lds_subdword", "cs_w32_lds_wide", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
-                      "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
-                      "cs_dpp_bound", "cs_dpp_cmp", "cs_dpp_w64",
-                      "cs_w64_mask_detect",
-                      "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute", "cs_w64x_permute",
-                      "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
-                      "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
-                      "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
-                      "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_barrier_early_end",
-                      "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_w64x_cmp_sdst", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_andn2_exec",
-                      "cs_mask_vgpr_exec", "cs_w32_exec_computed", "cs_w64_exec_computed"):
-            cs_dump_wants = {
-                "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
-                # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
-                "cs_smem_vcc_base": CS_SMEM_VCC,
-                "cs_smem_soffset_imm": [0x5EED0024, 0x5EED0028, 0x5EED002C, 0x5EED0030,
-                                        0x5EED0010, 0x5EED0014, 0x5EED0018, 0x5EED001C],
-                # SHADER-52: wave32 lane select & 31 (40 → 8)
-                "cs_w32_lane_wrap": [25, 16, 777, 777],
-                # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]] (cs_movrelsd_2.asm)
-                "cs_movrelsd_2": [11, 33, 33, 55, 1717, 77, 1515, 1717],
-                # SHADER-90: ds_permute_b32 (cs_w32_permute.asm): scatter, unwritten lane = 0, EXEC gates the write
-                "cs_w32_permute": [218, 29, 8, 211, 0, 15, 99, 15],
-                # integer ops with CPU-only checks until now (cs_w32_int_ext.asm)
-                "cs_w32_int_ext": [1, 27, 1, 0x33332222, 0xC0000000, 0x4000, 18, 0x20304050],
-                # 64-bit scalar data ops and v_mad_u64_u32 (cs_w32_salu64.asm)
-                # more ops with CPU-only checks until now (cs_w32_misc_ext.asm)
-                # ops merged on 2026-11-22 with CPU-only checks (cs_w32_new_ops.asm)
-                # plain 8/16-bit MUBUF stores, one crossing a dword (cs_w32_buffer_store_sub.asm)
-                "cs_w32_buffer_store_sub": [0x1122AB44, 0xCDEF7788, 0x34AABBCC, 0xDDDDDD12, 0x0102035A, 0x05061234, 0xAB, 0xFFFFCDEF],
-                # 8/16-bit MUBUF d16 loads and stores (cs_w32_buffer_sub16.asm)
-                "cs_w32_buffer_sub16": [0xBEEF00AA, 0x00AA1234, 0xBEEFFFAA, 0xFFAA1234, 0xBEEF8899, 0x88991234, 0x1122CD44, 0xABCD7788],
-                # ds_cmpst_f32 and buffer_atomic_fcmpswap: float compare (cs_w32_fcmpswap.asm)
-                "cs_w32_fcmpswap": [0, 0x3F800000, 0x7FC00000, 0x3F800000, 0x80000000, 0x40400000, 0x3F800000, 0x7FC00000],
-                "cs_w32_new_ops": [0x55, 0x8001, 0xC0000000, 0x80014000, 0x4000FFFF, 0x77, 0x99, 0x1234],
-                "cs_w32_misc_ext": [0x0FFF0FFF, 0xE2C4A688, 0x0007FFFF, 0x7FFF8000, 0xFFFE0002, 0xFFFF0005, 0x509, 0xCAFEF00D],
-                "cs_w32_salu64": [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE],
-                # SHADER-85: ds_read_u8/i8_d16[_hi] (cs_w32_lds_u8_d16.asm header)
-                "cs_w32_lds_u8_d16": [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234],
-                # 8/16-bit and 64/96/128-bit LDS accesses (cs_w32_lds_subdword.asm / cs_w32_lds_wide.asm headers)
-                "cs_w32_lds_subdword": [0x11B2D444, 0xA1B2C3D4, 0xFFFFFFB2, 0x000000B2, 0x00000011, 0xFFFFA1B2, 0x0000A1B2, 0xFFFFC3D4],
-                "cs_w32_lds_wide": [0xCAFEF00D, 0xFEEDFACE, 0x600DD00D, 0x00000000, 0x8BADF00D, 0xDEADC0DE, 0x12345678, 0x9ABCDEF0],
-                # ds_cmpst_b32 and the b64 2-address forms (cs_lds_b64_cmpst.asm header)
-                "cs_lds_b64_cmpst": [0x11110001, 0x22220002, 0x33330003, 0x44440004,
-                                     0xCCCC000C, 0x44440004, 0xBBBB000B, 0x3579BADC],
-                # ds_wrxchg*_rtn_b64, ds_or_rtn_b64, ds_min_f32, ds_max_rtn_f32 (cs_lds_xchg64_ext.asm header)
-                "cs_lds_xchg64_ext": [0x11110003, 0x33333333, 0xF00FF000, 0x04030201,
-                                    0x40302010, 0x70500705, 0x3FC00000, 0x80000000],
-                # ds_mskor, ds_and/xor_b64, ds_add_rtn_f32, ds_inc/dec/rsub_u32 (cs_lds_atomics_ext.asm header)
-                "cs_lds_atomics_ext": [0xF0F11234, 0xAB34CD78, 0x12345678, 0xF0F00F0F,
-                                       0xA5A55A5A, 0x00AA00AA, 0x7FB00000, 0xFE090700],
-                # constant EXEC masks (cs_exec_const.asm): each lane takes its own bit of the constant
-                "cs_exec_const": [16, 8, 2, 16, 0, 16],
-                # constant lane masks: lane L takes bit L (cs_w32_mask_imm.asm / cs_w64_mask_imm.asm headers)
-                "cs_w32_mask_imm": [2056, 20, 2, 6152, 2050, 4112, 258, 32],
-                "cs_w64_mask_imm": [2056, 1084, 828, 2052, 319, 2104, 516, 2064],
-                "cs_dpp": [1, 0, 3, 2, 5, 4, 7, 6],
-                "cs_dpp_row": [0, 0, 1, 2, 3, 4, 5, 6],
-                "cs_dpp_mask": [1, 0, 3, 2, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE],
-                "cs_dpp8": [7, 6, 5, 4, 3, 2, 1, 0],
-                "cs_dpp_ops": [100, 10, 11, 12, 13, 14, 15, 16],
-                "cs_dpp_bound": [10, 10, 11, 12, 13, 14, 15, 16],
-                "cs_dpp_bank": [0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD, 0xFFFFFFFC, 7, 7, 7, 7],
-                "cs_dpp_fi": [1, 2, 3, 0x7777, 5, 6, 7, 0x7777],
-                "cs_dpp_cmp": [3, 2, 3, 2, 1, 0, 1, 0],
-                "cs_dpp_w64": [1, 0, 3, 2, 5, 4, 7, 6],
-                # SHADER-99: -0 and NaN survive (SignedZeroInfNanPreserve, cs_signed_zero_nan.asm); 0 in out[4..7]
-                # without it
-                "cs_signed_zero_nan": [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00007C00],
-                "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
-                "cs_wm_half_ops": [32, 16, 16, 0, 16],
-                "cs_wm_half_cmp": [1, 0, 1, 1],
-                "cs_wm_bfm64": [16, 8, 8, 40],
-                "cs_wm_scc_rfl": [55, 48],
-                "cs_w64_mask_detect": [48],
-                "cs_wqm_w64": [20, 4, 12, 8, 1, 0, 15728895, 20],       # cs_wqm_w64.asm / cs_wqm_w32.asm headers
-                "cs_wqm_w32": [12, 1, 4, 0, 8, 15728880, 4, 32],
-                "cs_wqm_w64_half": [11, 14, 0, 1, 6, 8, 12, 2],
-                # cross-half tests (derivations in each .asm); need exact wave64 or its emulation
-                "cs_w64x_readlane": [121, 121, 16, 97, 16, 100, 100, 121],
-                "cs_w64x_writelane": [4660, 77, 99, 2748, 0, 0, 4660, 99],
-                "cs_w64x_readfirstlane": [140, 140, 163, 132, 100, 105, 133, 48],
-                "cs_w64x_bpermute": [36, 316, 253, 218, 435, 225, 0, 442],
-                "cs_w64x_permute": [218, 442, 435, 239, 0, 99, 239, 232],      # SHADER-90, cs_w64x_permute.asm
-                "cs_w64x_branch": [0, 0, 0, 0, 5, 5, 9, 9],
-                "cs_w64x_mask_reuse": [8, 40, 8, 40, 2, 20, 10, 64],
-                "cs_w64x_mask_reuse2": [10, 20, 8, 8, 5, 2, 132, 131],
-                "cs_w64x_chain_barrier": [564, 563, 500, 627],
-                "cs_w64x_ballot": [2053, 2061, 2069, 2077, 2085, 2093, 2101, 2109],
-                "cs_w64x_wg128_branches": [121, 121, 343, 343, 14, 31, 19812, 22728],
-                "cs_w64x_lds_raw": [132, 137, 100, 108, 131, 101, 149, 118],
-                "cs_w64x_lds_war": [1032, 1063, 1000, 1031, 2032, 2063, 2000, 2031],
-                "cs_w64x_partial": [40, 40, 528, 0, 0, 532, 539, 524820],
-                "cs_w64x_partial_scmp": [0, 1, 0, 1, 1, 1, 1, 0],     # s_cmp mask, -1 in a partial wave
-                "cs_w32_partial_scmp": [0, 1, 1, 0, 1, 1, 1, 1],      # the same in a 20-thread wave32
-                # ds_permute_b32 in a 20-thread wave32: a never-launched source lane sends nothing (.asm header)
-                "cs_w32_partial_permute": [0, 29, 127, 0, 1, 0, 134, 113],
-                "cs_w32_andn2_exec": [1, 8, 16, 2064, 2068, 3, 20, 1544],   # s_andn2_saveexec/wrexec_b32 (.asm header)
-                # SHADER-1264: a computed value written to exec_lo / exec_hi gives each lane its own bit
-                # (cs_w32_exec_computed.asm / cs_w64_exec_computed.asm headers)
-                "cs_w32_exec_computed": [259, 1028, 3088, 7682, 512, 4100, 0, 3],
-                "cs_w64_exec_computed": [291, 1028, 11264, 771, 8192, 4132, 0, 3],
-                "cs_w32_sincos": [1, 1, 1, 1, 1, 1],                  # SHADER-88 (cs_w32_sincos.asm): angles in turns
-                # SHADER-74: v_permlane16/x16 FI / BOUND_CTRL with the source lane off in EXEC (cs_w32_permlane_fi.asm)
-                "cs_w32_permlane_fi": [1000, 0, 4, 1, 1000, 0, 52, 49],
-                "cs_w64x_sbarrier": [605, 605, 686, 686, 3032, 3013, 3032, 3031],
-                "cs_w64x_load_ballot_load": [43, 74, 75, 42, 42, 18, 41, 32],
-                "cs_w64x_andn2_exec": [1, 16, 32, 4144, 2052, 3, 8, 1544],   # s_andn2_saveexec/wrexec_b64 (.asm header)
-                "cs_w64x_saveexec_b64": [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171],   # .asm header
-                "cs_w64x_cmp_sdst": [10240, 6144, 2053, 8224, 7714, 6184, 4144, 5],             # .asm header
-                "cs_bpermute32": [0, 50, 162, 99, 36, 218, 183, 15],     # wave32: needs 32 lanes
-                # SHADER-91: s_barrier sites in different wave-uniform branches meet (cs_barrier_divergent.asm)
-                "cs_barrier_divergent": [127, 126, 125, 124, 123, 122, 121, 120],
-                # SHADER-91: other waves end without s_barrier (cs_barrier_early_end.asm); a loop whose trip count
-                # differs per wave (cs_barrier_loop.asm)
-                "cs_barrier_early_end": [127, 126, 125, 124, 123, 122, 121, 120],
-                "cs_barrier_loop": [128, 96, 64, 32, 128, 96, 64, 0xEEEEEEEE],
-                # SHADER-21 part 2: a mask copied to a VGPR with v_mov_b32 respects EXEC —
-                # inactive lanes keep the old VGPR (cs_mask_vgpr_exec.asm)
-                "cs_mask_vgpr_exec": [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
-                                      0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF],
-            }
-            want = cs_dump_wants[name]
-            # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 / cs_w32_permute /
-            # cs_w32_lds_u8_d16 / cs_w32_sincos / cs_w32_int_ext / cs_w32_salu64 / cs_w32_misc_ext / cs_w32_new_ops / cs_signed_zero_nan, the wave32
-            # cs_wqm_w32 / cs_bpermute32 and the DPP tests is a whole-wave (wave64) mask test: ask for a 64-wide subgroup and skip,
-            # as check.py does, where the device has none
-            # (vk_compute_test exits 77) instead of reporting a failure. With LEONIDA_W64_EMULATE=1 they were
-            # translated with --wave64-emulate and run on any subgroup size.
-            # cs_w64x_partial and cs_w64x_partial_scmp (40-thread groups) can't have full subgroups: they ask for
-            # size 64 without them.
+        elif name in CS_DUMP_WANTS:
+            want = CS_DUMP_WANTS[name]
+            # Every dump outside CS_DUMP_NON_WAVE64 is a whole-wave (wave64) test: ask for a 64-wide subgroup and
+            # skip, as check.py does, where the device has none (vk_compute_test exits 77). With
+            # LEONIDA_W64_EMULATE=1 they were translated with --wave64-emulate and run on any subgroup size.
+            # cs_w64x_partial and cs_w64x_partial_scmp (40-thread groups) ask for size 64 without full subgroups.
             emulated = w64_emulated()
             partial = name in ("cs_w64x_partial", "cs_w64x_partial_scmp")
-            wave64 = name not in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
-                                  "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
-                                  "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops",
-                                  "cs_w32_lds_subdword", "cs_w32_lds_wide",
-                                  "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_w32_permlane_fi", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap",
-                                  "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
-                                  "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
-                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_dpp_cmp", "cs_w32_andn2_exec",
-                                  "cs_w32_exec_computed") and not emulated and not partial
+            wave64 = name not in CS_DUMP_NON_WAVE64 and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)
@@ -1364,9 +1369,7 @@ def run_suite(a, work: str) -> int:
             else:
                 want = judged_words(name, msg, want)   # cs_signed_zero_nan on Apple and llvmpipe (check.py)
                 ok, detail = judge_cs_dump(rc, msg, want, wave64=wave64, partial=partial, emulated=emulated,
-                                           hexwords=name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lds_u8_d16",
-                                                             "cs_w32_lds_subdword", "cs_w32_lds_wide",
-                                                             "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_signed_zero_nan"))
+                                           hexwords=name in CS_DUMP_HEXWORDS)
                 if ok and None in want:
                     unjudged = ", ".join(str(i) for i, w in enumerate(want) if w is None)
                     detail += f" (words {unjudged} not judged on this device: UNJUDGED_WORDS in check.py)"
