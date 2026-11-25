@@ -11,12 +11,13 @@ class DeferredImageBinding {
 public:
     using Bind = bool (*)(void*);
     DeferredImageBinding(void* owner, Bind bind) : owner_(owner), bind_(bind) {}
+    void* owner() const { return owner_; }
     bool bound() const { return bound_.load(std::memory_order_acquire); }
     bool ensure() {
         if (bound()) return true;
         std::lock_guard lock(mutex_);
         if (bound()) return true;
-        if (!bind_(owner_)) return false;
+        if (!bind_ || !bind_(owner_)) return false;
         bound_.store(true, std::memory_order_release);
         return true;
     }
