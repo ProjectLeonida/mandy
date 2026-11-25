@@ -1,12 +1,13 @@
 """runtime/test/shaders/build.py under the PerVertexKHR fallbacks (LEONIDA_BARY_FALLBACK=1, LEONIDA_F16_INTERP_FALLBACK=1).
 
-The translator refuses a computed I/J pair (ps_ij_computed) without PerVertexKHR inputs, which both fallbacks take
-away. build.py used to treat that as a failed batch: it exited before publishing anything, so check.py then reported
+The translator refuses a computed I/J pair (ps_ij_computed) under --f16-interp-fallback, which has no per-vertex
+inputs. build.py used to treat that as a failed batch: it exited before publishing anything, so check.py then reported
 every test missing (0 of 147 on a Mac, where check.py needs LEONIDA_F16_INTERP_FALLBACK=1). check.py and
-run_gpu_tests.py report ps_ij_computed as SKIP there; build.py now leaves it out and builds the rest.
+run_gpu_tests.py report ps_ij_computed as SKIP there; build.py leaves it out and builds the rest. --bary-fallback
+translates it (its geometry shader passes the three vertices' values), so build.py builds it there.
 
 Standard library only; the translator is replaced by a stand-in that writes the index and modules and, like the real
-one, refuses ps_ij_computed under a fallback. No llvm-mc, SPIR-V tools, GPU or game data.
+one, refuses ps_ij_computed under the f16 fallback. No llvm-mc, SPIR-V tools, GPU or game data.
 
     python -I tests/test_shader_build_fallbacks.py
 """
@@ -50,7 +51,7 @@ class BuildUnderFallbackTest(unittest.TestCase):
     def fake_translate(self, work, names):
         """What rdna2spirv.py leaves in <work>/spirv: a module and an index entry per shader it validated."""
         self.asked.append(list(names))
-        fallback = any(os.environ.get(v) == "1" for v in FALLBACKS)
+        fallback = os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1" and os.environ.get("LEONIDA_BARY_FALLBACK") != "1"
         spirv = Path(work) / "spirv"
         spirv.mkdir(parents=True)
         index = {}
@@ -79,17 +80,24 @@ class BuildUnderFallbackTest(unittest.TestCase):
                 status = e.code
         return status, stdout.getvalue()
 
-    def test_each_fallback_builds_the_rest_without_ps_ij_computed(self):
-        for var in FALLBACKS:
-            with self.subTest(fallback=var):
+    def test_the_f16_fallback_builds_the_rest_without_ps_ij_computed(self):
+        status, printed = self.run_build(["cs_store", "ps_ij_computed"], {"LEONIDA_F16_INTERP_FALLBACK": "1"})
+        self.assertEqual(status, 0, printed)
+        self.assertEqual(self.asked, [["cs_store"]])
+        self.assertTrue((self.out / "spirv" / "cs_store.spv").is_file())
+        self.assertFalse((self.out / "spirv" / "ps_ij_computed.spv").exists())
+        self.assertIn("ps_ij_computed", printed)
+        self.assertIn("per-vertex inputs", printed)
+
+    def test_the_bary_fallback_builds_ps_ij_computed(self):
+        for env in ({"LEONIDA_BARY_FALLBACK": "1"}, {"LEONIDA_BARY_FALLBACK": "1", "LEONIDA_F16_INTERP_FALLBACK": "1"}):
+            with self.subTest(env=env):
                 self.fresh()
-                status, printed = self.run_build(["cs_store", "ps_ij_computed"], {var: "1"})
+                status, printed = self.run_build(["cs_store", "ps_ij_computed"], env)
                 self.assertEqual(status, 0, printed)
-                self.assertEqual(self.asked, [["cs_store"]])
-                self.assertTrue((self.out / "spirv" / "cs_store.spv").is_file())
-                self.assertFalse((self.out / "spirv" / "ps_ij_computed.spv").exists())
-                self.assertIn("ps_ij_computed", printed)
-                self.assertIn("PerVertexKHR", printed)
+                self.assertEqual(self.asked, [["cs_store", "ps_ij_computed"]])
+                self.assertTrue((self.out / "spirv" / "ps_ij_computed.spv").is_file())
+                self.assertNotIn("not built (computed", printed)
 
     def test_missing_mullit_fixture_is_not_accepted_as_a_build_target(self):
         status, printed = self.run_build(["ps_mullit"], {})

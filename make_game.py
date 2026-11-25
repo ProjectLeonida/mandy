@@ -1805,6 +1805,15 @@ def runtime_gpu_barycentric_fallback():
         return None
 
 
+def runtime_gpu_geometry_shader():
+    """geometryShader as tools/vk_subgroup_info.py answers for the GPU the runtime would use, or None."""
+    try:
+        v = runtime_gpu_info().get("geometry_shader")
+        return v if isinstance(v, bool) else None
+    except (AttributeError, TypeError):
+        return None
+
+
 def barycentric_fallback_override():
     """LEONIDA_BARY_FALLBACK=1/0 forces the same barycentric path as the GPU test runner; None leaves it automatic."""
     v = (os.environ.get("LEONIDA_BARY_FALLBACK") or "").strip().lower()
@@ -2981,6 +2990,7 @@ def main() -> int:
             a.mesh_compute = keep_recorded_fallback("--mesh-compute", work)
     emulate, keep_emulated = (wave64_settings(a.wave64_emulate, mesh_compute=a.mesh_compute) if "shaders" in stages
                               else (False, a.wave64_emulate == "auto"))
+    per_vertex = None
     if "shaders" in stages and not a.f16_interp_fallback:
         per_vertex = runtime_gpu_per_vertex()
         if per_vertex is False:
@@ -3003,11 +3013,19 @@ def main() -> int:
                 a.bary_fallback = False
             else:
                 bary_fallback = runtime_gpu_barycentric_fallback()
-                if bary_fallback is True:
-                    log("shaders: this GPU's driver has a known BaryCoordKHR bug (Mesa ANV, or AMD's Windows driver "
-                        "on gfx90c): translating with --bary-fallback")
+                # A GPU with geometry shaders but no PerVertexKHR inputs (no fragmentShaderBarycentric; #1285)
+                # needs the pass-through geometry shader, not only the f16-half fallback. MoltenVK has neither
+                # geometry shaders nor PerVertexKHR, so it stays on --f16-interp-fallback alone.
+                geometry = runtime_gpu_geometry_shader() if per_vertex is False else None
+                if bary_fallback is True or geometry is True:
+                    if bary_fallback is True:
+                        log("shaders: this GPU's driver has a known BaryCoordKHR bug (Mesa ANV, or AMD's Windows driver "
+                            "on gfx90c): translating with --bary-fallback")
+                    else:
+                        log("shaders: the GPU the runtime would use has geometry shaders but can't take PerVertexKHR "
+                            "inputs: translating with --bary-fallback")
                     a.bary_fallback = True
-                elif bary_fallback is None:
+                elif bary_fallback is None or geometry is None and per_vertex is False:
                     a.bary_fallback = keep_recorded_fallback("--bary-fallback", work)
     if "shaders" in stages and not a.pc_tail_ubo:
         need_pc = 152 if a.mesh_compute else 144

@@ -30,7 +30,11 @@ driver. Its shader compiler can crash in vkCreateComputePipelines on emulated wa
 per_vertex_inputs says whether the device can run a pixel shader with PerVertexKHR inputs (16-bit interpolation,
 docs/design.md): the fragmentShaderBarycentric feature, and a driver other than MoltenVK, whose SPIR-V to MSL
 conversion rejects the decoration ("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). Where it is
-false, the shaders are translated with --f16-interp-fallback.
+false, the shaders are translated with --f16-interp-fallback. geometry_shader is
+VkPhysicalDeviceFeatures.geometryShader. A GPU with geometry shaders and per_vertex_inputs false (no
+fragmentShaderBarycentric; the RX 5700 XT in #1285) is translated with --bary-fallback as well, so a computed
+I/J pair can read the three vertices' values from the pass-through geometry shader. MoltenVK reports geometry
+shaders off, and keeps the f16 fallback alone.
 
 barycentric_fallback is true for Intel's open-source Mesa driver (ANV). SHADER-925 found that Mesa ANV 26.2.5
 advertises fragmentShaderBarycentric but returns a zero BaryCoordKHR.i for translated pixel shaders on Intel Arc B580;
@@ -95,6 +99,8 @@ VULKAN_12_REQUIRED_EXTENSIONS = frozenset((b"VK_KHR_dynamic_rendering", b"VK_KHR
 
 PROPS_SIZE = 824            # sizeof(VkPhysicalDeviceProperties) on 64-bit
 FEATURES2_SIZE = 240        # sizeof(VkPhysicalDeviceFeatures2): 16 + 55 VkBool32, padded to 8
+# VkPhysicalDeviceFeatures.geometryShader is the 5th VkBool32, so 16 + 4 * 4.
+FEATURES2_GEOMETRY_SHADER = 32
 F12_SIZE = 208              # sizeof(VkPhysicalDeviceVulkan12Features): 16 + 47 VkBool32, padded to 8
 F13_SIZE = 80               # sizeof(VkPhysicalDeviceVulkan13Features): 16 + 15 VkBool32, padded to 8
 # Byte offsets of the VkBool32 members read below (16-byte header, then 4 bytes per member in header order)
@@ -332,6 +338,7 @@ def query(*, stage_caps=False) -> dict:
                           sg.requiredSubgroupSizeStages, sg.maxComputeWorkgroupSubgroups,
                           sgc,
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
+                          bool(u32(f2, FEATURES2_GEOMETRY_SHADER)),
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
                           int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
@@ -343,7 +350,7 @@ def query(*, stage_caps=False) -> dict:
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
         (name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
-         sgc, per_vertex, max_push_constants_size, vendor, device, driver) = chosen
+         sgc, per_vertex, geometry_shader, max_push_constants_size, vendor, device, driver) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -365,6 +372,7 @@ def query(*, stage_caps=False) -> dict:
             "native64_compute": compute64,
             "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,
+            "geometry_shader": geometry_shader,
             "barycentric_fallback": barycentric_fallback(vendor, device, driver),
             "max_push_constants_size": max_push_constants_size,
             "vendor_id": vendor,

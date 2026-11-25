@@ -65,6 +65,11 @@ W64G_COUNTS = Counter()   # tiers of the wave64 VS/PS/GS translated so far, for 
 # VK_KHR_fragment_shader_barycentric. Whatever feeds the stage before the PS (a pass-through geometry shader) writes
 # (1,0,0), (0,1,0), (0,0,1) at the triangle's three vertices; interpolating those gives the perspective-correct
 # barycentrics, so .y/.z are AMD's i/j as with BaryCoordKHR.
+# An attribute a computed I/J pair reads (SHADER-177), which needs the three vertices' values, is a Flat vec4[3]
+# input instead of PerVertexKHR, at three consecutive locations no other input uses ("per_vertex" in
+# bary_fallback_input: attribute -> first location). The geometry shader writes vertex k's value of the attribute
+# into element k at every vertex it emits, so the flat value is the triangle's three values whatever the provoking
+# vertex; Gen.attribute then weights them as on the PerVertexKHR path.
 BARY_FALLBACK = False
 SHADER_CLOCK = False
 FMA_KHR = False          # --fma khr: fused multiply-adds are OpFmaKHR (SPV_KHR_fma, VK_KHR_shader_fma), not GLSL Fma
@@ -274,6 +279,7 @@ class Gen:
         self.inputs = {}
         self.interpolated = set()   # inputs read through v_interp_p1/p2; the rest are flat (v_interp_mov only)
         self.per_vertex = set()     # PS: attribute numbers read by a *_f16 interp: PerVertexKHR, decoded per half
+        self.pv_fallback = {}       # PS under --bary-fallback: per-vertex attribute -> first location of its vec4[3]
         self.f16_halves = set()     # PS, --f16-interp-fallback: the same attributes, read from decoded-half inputs
         self.f16_half_locs = {}     # PS/VS/MS, --f16-interp-fallback: attr/param n -> (low_loc, high_loc)
         self.param_max = -1         # VS/MS: the highest exp paramN (--f16-interp-fallback keeps halves above it)
@@ -14448,6 +14454,11 @@ class Gen:
         self.emit(f"{t} = OpBitcast %float {u}")
         return t
 
+    def pv_input(self, name):
+        """Whether input variable `name` is an attribute read per vertex (a vec4[3]: PerVertexKHR, or Flat under
+        --bary-fallback). By attribute number, since --bary-fallback moves such an input off its own location."""
+        return name.startswith("%in_attr") and int(name[len("%in_attr"):]) in self.per_vertex
+
     def attribute(self, n, comp, flat=False, half=None, ij=None, vertex_delta=None):
         """Component `comp` of fragment input attribute n (declared as a vec4 Input at Location n).
 
@@ -15520,8 +15531,19 @@ def assemble(gen):
             if k.startswith("%in_f16h"):
                 a_str, h_str = k[len("%in_f16h"):].split("_")
                 gen.inputs[k] = gen.f16_half_locs[int(a_str)][int(h_str)]
-    used = set(gen.inputs.values())
-    if len(used) != len(gen.inputs):    # --f16-interp-fallback: a decoded-half location is also an attribute
+    gen.pv_fallback = {}
+    if BARY_FALLBACK and gen.per_vertex:
+        # The per-vertex attributes become Flat vec4[3] inputs, each at the lowest three consecutive locations no
+        # other input uses (their own location is free: every read of such an attribute goes through the array).
+        taken = {v for k, v in gen.inputs.items() if not (k.startswith("%in_attr") and int(k[8:]) in gen.per_vertex)}
+        taken |= {loc for pair in gen.f16_half_locs.values() for loc in pair}
+        for n in sorted(gen.per_vertex):
+            base = next(b for b in range(len(taken) + 3) if not {b, b + 1, b + 2} & taken)
+            gen.pv_fallback[n] = base
+            gen.inputs[f"%in_attr{n}"] = base
+            taken |= {base, base + 1, base + 2}
+    used = set(gen.inputs.values()) | {b + k for b in gen.pv_fallback.values() for k in (1, 2)}
+    if len(set(gen.inputs.values())) != len(gen.inputs):    # --f16-interp-fallback: a decoded-half location is also an attribute
         raise Unsupported("--f16-interp-fallback: a decoded-half location is also read as an attribute")
     # The producer fills both halves of every attribute in f16_halves (the index's f16_halves lists the pair), so a
     # raw attribute at the location of a half this shader doesn't read is overwritten all the same.
@@ -15689,7 +15711,9 @@ def assemble(gen):
             dec.append(f"OpDecorate {name} Location {int(''.join(ch for ch in tgt if ch.isdigit()))}")
     for name, n in gen.inputs.items():
         dec.append(f"OpDecorate {name} Location {n}")
-        if n in gen.per_vertex:
+        if gen.pv_input(name) and gen.pv_fallback:
+            dec.append(f"OpDecorate {name} Flat")       # --bary-fallback: the geometry shader's vec4[3] (BARY_FALLBACK)
+        elif gen.pv_input(name):
             dec.append(f"OpDecorate {name} PerVertexKHR")
         elif name not in gen.interpolated:
             dec.append(f"OpDecorate {name} Flat")
@@ -16039,8 +16063,8 @@ def assemble(gen):
                 gvars += ["%out_viewport = OpVariable %_ptr_Output_int Output"]
     if gen.per_vertex:      # the three vertices' raw words for Gen.attribute
         types += [f"%arr_pv4 = OpTypeArray %v4float {gen.cu(3)}", "%_ptr_Input_pv4 = OpTypePointer Input %arr_pv4"]
-    gvars += [f"{n} = OpVariable {'%_ptr_Input_pv4' if k in gen.per_vertex else '%_ptr_Input_v4'} Input"
-              for n, k in gen.inputs.items()]
+    gvars += [f"{n} = OpVariable {'%_ptr_Input_pv4' if gen.pv_input(n) else '%_ptr_Input_v4'} Input"
+              for n in gen.inputs]
     if sg:
         gvars += ["%sg_lane = OpVariable %_ptr_Input_uint Input"]
     if tex:
@@ -17016,10 +17040,9 @@ def interp_ij_analysis(insns, g):
         if s["src"] in (0, 1):
             g.frag_inputs[s["src"]] = ("bary_i", "bary_j")[s["src"]]
         attrs.add(s["attr"])
-    if attrs and BARY_FALLBACK:
-        raise Unsupported("computed I/J pair under --bary-fallback: no PerVertexKHR inputs")
-    if attrs and F16_HALVES:
-        # --f16-interp-fallback reads decoded halves from the producer: no per-vertex inputs either
+    if attrs and F16_HALVES and not BARY_FALLBACK:
+        # --f16-interp-fallback reads decoded halves from the producer: no per-vertex inputs either. With
+        # --bary-fallback as well (NVIDIA Pascal), the geometry shader passes the three vertices' raw words instead.
         raise Unsupported("computed I/J pair under --f16-interp-fallback: no PerVertexKHR inputs")
     return attrs
 
@@ -17772,7 +17795,9 @@ def translate(path):
                 attr_reads[op].update(arg["a"] for arg in ins["args"] if arg["k"] == "attr")
         f16_read = attr_reads["v_interp_p1ll_f16"] | attr_reads["v_interp_p1lv_f16"] | attr_reads["v_interp_p2_f16"]
         mixed_f32 = attr_reads["v_interp_mov_f32"] & (attr_reads["v_interp_p1_f32"] | attr_reads["v_interp_p2_f32"])
-        if mixed_f32 and (BARY_FALLBACK or F16_HALVES):
+        # Under --bary-fallback an attribute that a computed I/J pair also reads is a per-vertex array all the same
+        # (interp_ij_analysis below), whose element 0 is P0 for the MOV; the other mixed attributes are refused there.
+        if mixed_f32 and F16_HALVES and not BARY_FALLBACK:
             raise Unsupported("flat and interpolated reads of one f32 attribute need per-vertex inputs")
         mov_delta = {x["a"] for i in insns if base_op(i["op"]) == "v_interp_mov_f32"
                      and any(x.get("k") == "interp" and x.get("t") in ("p10", "p20") for x in i["args"])
@@ -17840,7 +17865,13 @@ def translate(path):
         g.v_interp_copy = interp_copy_sources(insns)   # before v_interp runs: I/J guards (SHADER-177)
         # SHADER-177: annotate v_interp sites whose I/J operand is a computed pair, and let those
         # attributes be read per-vertex (attribute() weights them with the operand values).
-        g.per_vertex |= interp_ij_analysis(insns, g)
+        computed = interp_ij_analysis(insns, g)
+        g.per_vertex |= computed
+        # --bary-fallback with --f16-interp-fallback: a computed attribute's f16 reads decode the per-vertex raw
+        # words (Gen.attribute) rather than the producer's decoded halves.
+        g.f16_halves -= computed
+        if BARY_FALLBACK and mixed_f32 - computed:
+            raise Unsupported("flat and interpolated reads of one f32 attribute need per-vertex inputs")
         if any("ij" in i for i in insns):
             # Computed v_interp sites load their I/J VGPRs at runtime; no_bary above stripped all
             # v_interp sources, so an untouched (or conditionally/EXEC-masked written) v0/v1 still
@@ -18788,11 +18819,16 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     if g.writes_depth:
         m["writes_depth"] = True
     if g.inputs:
-        m["inputs"] = sorted(g.inputs.values())
+        # The locations the PS reads; under --bary-fallback a per-vertex attribute is listed by its own number (the
+        # producer's location), and bary_fallback_input says where the geometry shader puts it.
+        m["inputs"] = sorted(int(k[len("%in_attr"):]) if g.pv_input(k) else v for k, v in g.inputs.items())
     if getattr(g, "bary_location", None) is not None:
         # --bary-fallback: the raw barycentrics are a perspective-interpolated vec3 at this location; the stage
         # before the PS must write (1,0,0), (0,1,0), (0,0,1) at the triangle's vertices (see BARY_FALLBACK).
         m["bary_fallback_input"] = {"location": g.bary_location}
+        if g.pv_fallback:
+            # Computed I/J pairs: attribute -> first of the three locations of its Flat vec4[3] (BARY_FALLBACK)
+            m["bary_fallback_input"]["per_vertex"] = {str(n): b for n, b in sorted(g.pv_fallback.items())}
     if F16_HALVES and g.stage in ("vs", "ms", "ps"):
         # --f16-interp-fallback: PS = the attributes whose f16 reads take decoded halves, VS/MS = the params that
         # export them; each as {n: [low-half location, high-half location]}. When a PS's canonical half slots would

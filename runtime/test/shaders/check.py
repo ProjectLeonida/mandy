@@ -721,7 +721,8 @@ W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
 # LEONIDA_BARY_FALLBACK=1/0 overrides the device probe for raw barycentrics. Unset, Mesa ANV selects the fallback.
 BARY_FALLBACK = barycentric_fallback()
 # LEONIDA_F16_INTERP_FALLBACK=1 (as build.py reads it): *_f16 interps were translated from decoded-half inputs, with no
-# PerVertexKHR inputs at all, so the translator refuses a computed I/J pair (ps_ij_computed) there.
+# PerVertexKHR inputs at all, so the translator refuses a computed I/J pair (ps_ij_computed) there. (--bary-fallback
+# translates it: its geometry shader passes the three vertices' values.)
 F16_HALVES = os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1"
 W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               ("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
@@ -2055,9 +2056,9 @@ def nan_payload_problem(px, out):
 
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
-    if name == "ps_ij_computed" and (BARY_FALLBACK or F16_HALVES):
-        # Before the .spv check: without PerVertexKHR inputs the translator refuses a computed I/J pair (no .spv).
-        return Skip("SKIP (computed I/J pairs need PerVertexKHR inputs: no --bary-fallback / --f16-interp-fallback)")
+    if name == "ps_ij_computed" and F16_HALVES and not BARY_FALLBACK:
+        # Before the .spv check: without per-vertex inputs the translator refuses a computed I/J pair (no .spv).
+        return Skip("SKIP (computed I/J pairs need per-vertex inputs: --f16-interp-fallback without --bary-fallback)")
     if not os.path.isfile(path):
         return f"missing {name}.spv"
     if name == "ps_cbv_modulate":
