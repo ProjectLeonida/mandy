@@ -77,7 +77,7 @@ static_assert(offsetof(Vertex, wrong_color) == 16);
 
 }  // namespace
 
-int main(int argc, char** argv) {
+static int run_test(int argc, char** argv) {
     const bool title_index = argc == 2 && std::strcmp(argv[1], "--title-index-window") == 0;
     const bool title_vertex = argc == 2 && std::strcmp(argv[1], "--title-vertex-window") == 0;
     const bool title_window = title_index || title_vertex;
@@ -544,6 +544,16 @@ int main(int argc, char** argv) {
             EXPECT(aliases.shader_va(title_va + 65536) == aliases.shader_va(title_va) + 65536);
             EXPECT(aliases.shader_va(title_va + 65536) != title_va + 65536);
             readback->Unmap(0, nullptr);
+            for (auto* r : {&vertex_buffer, &upload, &readback, &target, &uint_target}) r->reset();
+            for (auto* p : {&mrt, &instanced, &refused, &unfed, &xor_pso, &fullscreen}) p->reset();
+            pso.reset();
+            root.reset();
+            rtv_heap.reset();
+            list.reset();
+            allocator.reset();
+            queue.reset();
+            fence.reset();
+            EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
             EXPECT(d.validation_errors() == 0);
             return 0;
         }
@@ -1242,12 +1252,7 @@ int main(int argc, char** argv) {
         allocator.reset();
         queue.reset();
         fence.reset();
-        // The device keeps the buffers it made over the title's vertex pages until it goes (make_title_buffer), and
-        // each holds a reference: the large batch leaves seven of them.
-        if (std::getenv("LEONIDA_TEST_GEOMETRY_BATCH"))
-            EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) >= 1);
-        else
-            EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
+        EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
 
     unsigned mismatches = 0;
@@ -1398,5 +1403,12 @@ int main(int argc, char** argv) {
                 "unbound target and DSV, a rebound root signature, step rate 0 and an unbound vertex slot; then %s "
                 "and a full-screen pass without vertex input\n",
                 size * size, logic_op ? "an XOR logic op" : "(no logicOp on this GPU)");
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    const int result = run_test(argc, argv);
+    if (result != 0) return result;
+    EXPECT(vktest::validation_error_count() == 0);
     return 0;
 }
