@@ -3,12 +3,17 @@
 // it. The replay stages copies Vulkan cannot do in one command through them (vulkan_replay.h, depth <-> colour
 // copies). Single-threaded: the caller holds the context's lock. The same life cycle as the depth24 converter's own
 // scratch (vulkan_depth24.h), which also needs descriptor pools and exists only on GPUs without D24.
+// The chunks are transfer sources and destinations; `extra_usage` adds what another user needs (the expanded indices
+// of quad lists, quad_index_expand.h: an index buffer written through its device address).
 #pragma once
 
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
 #include <vulkan/vulkan.h>
+#include "queue_families.h"
+
+#include "vulkan_device_fault.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -23,14 +28,16 @@ public:
     // A device-local allocation for a chunk; null on failure.
     using Allocate = std::function<VkDeviceMemory(const VkMemoryRequirements&)>;
 
-    ScratchBuffers(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate)
-        : device_(device), allocate_(std::move(allocate)) {
+    ScratchBuffers(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate, VkBufferUsageFlags extra_usage = 0,
+                   std::vector<std::uint32_t> families = {}, DeviceFaultDiagnostics* diagnostics = nullptr)
+        : device_(device), diagnostics_(diagnostics), allocate_(std::move(allocate)), extra_usage_(extra_usage),
+          families_(std::move(families)) {
         loaded_ = vk_.load(get, device);
     }
 
     ~ScratchBuffers() {
         if (!loaded_) return;
-        vk_.vkDeviceWaitIdle(device_);
+        DeviceFaultDiagnostics::observe(diagnostics_, vk_.vkDeviceWaitIdle(device_), "vkDeviceWaitIdle");
         release(current_);
         for (auto& batch : retired_) release(batch);
         for (auto& chunk : spare_) destroy(chunk);
@@ -101,7 +108,9 @@ public:
             if (retired_[i].ticket != 0) {
                 std::uint64_t done = 0;
                 if (!retired_[i].timeline ||
-                    vk_.vkGetSemaphoreCounterValue(device_, retired_[i].timeline, &done) != VK_SUCCESS ||
+                    DeviceFaultDiagnostics::observe(diagnostics_,
+                        vk_.vkGetSemaphoreCounterValue(device_, retired_[i].timeline, &done),
+                        "vkGetSemaphoreCounterValue (scratch)") != VK_SUCCESS ||
                     done < retired_[i].ticket) {
                     ++i;
                     continue;
@@ -152,7 +161,9 @@ private:
     bool make_chunk(std::uint64_t size, Chunk& out) {
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size;
-        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | extra_usage_;
+        // A retired chunk can be reused by a submission on a different queue family.
+        share_across_queue_families(info, families_);
         if (vk_.vkCreateBuffer(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vk_.vkGetBufferMemoryRequirements(device_, out.buffer, &requirements);
@@ -175,7 +186,10 @@ private:
     }
 
     VkDevice device_;
+    DeviceFaultDiagnostics* diagnostics_;
     Allocate allocate_;
+    VkBufferUsageFlags extra_usage_ = 0;
+    std::vector<std::uint32_t> families_;
     Functions vk_;
     bool loaded_ = false;
     Batch current_;               // handed out, not yet submitted

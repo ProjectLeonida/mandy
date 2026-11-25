@@ -647,6 +647,19 @@ class BootTraceTests(unittest.TestCase):
                 else:
                     self.assertNotIn("more", text)
 
+    def test_counts_only_includes_all_xmem_physical_page_observations(self):
+        self.write(self.startup, [
+            {"kind": "xmem_physical_pages", "api": "private-api", "attributes": "0x20",
+             "pages": 4, "caller": "private-caller"},
+        ] * 3)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bt.main([self.startup, "--counts-only", "--limit", "1"]), 0)
+        summary = json.loads(out.getvalue())["startup"]
+        self.assertEqual(summary["xmem_physical_pages_count"], 3)
+        self.assertNotIn("xmem_physical_pages", summary)
+        self.assertNotIn("private-", out.getvalue())
+
     def test_xmem_physical_pages_handles_missing_and_malformed_fields(self):
         unknown = {"api": None, "attributes": None, "pages": None, "caller": None}
         nbsp_caller = "fixture\u00a0one.dll+0x20"
