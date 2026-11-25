@@ -918,13 +918,26 @@ void STDMETHODCALLTYPE save_close_update(void*, XGameSaveUpdateHandle u) {
     delete u;
 }
 
+// Whether the update already has an op for the file `name` is stored in. Encoded names are ASCII, so on a
+// case-insensitive volume (NTFS) "story" and "STORY" are one file, and so one blob.
+bool has_op_for_file(const XGameSaveUpdate* u, std::string_view name) {
+    const auto file_of = [](std::string_view n) {
+        std::string f = encode_name(n);
+        for (char& c : f) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        return f;
+    };
+    const std::string file = file_of(name);
+    return std::any_of(u->ops.begin(), u->ops.end(), [&](const auto& op) { return file_of(op.first) == file; });
+}
+
 // 25: HRESULT XGameSaveSubmitBlobWrite(XGameSaveUpdateHandle, const char* blobName, const uint8_t* data, size_t size).
-// One write or delete per blob per update; the update (and so each blob) stays within GS_MAX_BLOB_SIZE.
+// One write or delete per blob per update, names differing only in case being one blob; the update (and so each blob)
+// stays within GS_MAX_BLOB_SIZE.
 HRESULT STDMETHODCALLTYPE save_write(void*, XGameSaveUpdateHandle u, const char* name, const uint8_t* data, size_t size) {
     if (!valid_blob_name(name) || (!data && size)) return E_INVALIDARG;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_updates, u)) return E_GS_HANDLE_EXPIRED;
-    if (u->ops.count(name)) return E_INVALIDARG;
+    if (has_op_for_file(u, name)) return E_INVALIDARG;
     if (size > kMaxUpdateBytes || u->bytes + size > kMaxUpdateBytes) return E_GS_UPDATE_TOO_BIG;
     u->ops.emplace(name, Op{true, std::vector<uint8_t>(data, data + size)});
     u->bytes += size;
@@ -936,7 +949,7 @@ HRESULT STDMETHODCALLTYPE save_delete_blob(void*, XGameSaveUpdateHandle u, const
     if (!valid_blob_name(name)) return E_INVALIDARG;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_updates, u)) return E_GS_HANDLE_EXPIRED;
-    if (u->ops.count(name)) return E_INVALIDARG;
+    if (has_op_for_file(u, name)) return E_INVALIDARG;
     u->ops.emplace(name, Op{false, {}});
     return S_OK;
 }

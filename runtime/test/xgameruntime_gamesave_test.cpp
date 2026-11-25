@@ -454,10 +454,13 @@ int main() {
 
     // ---- quota underflow on case-insensitive blob aliases ----
     // On Windows NTFS, "story" and "STORY" refer to the same on-disk file; subtracting its existing size twice in
-    // one update used to underflow uint64_t and fail a tiny update or delete with E_GS_QUOTA_EXCEEDED.
+    // one update used to underflow uint64_t and fail a tiny update or delete with E_GS_QUOTA_EXCEEDED. The second
+    // name is now refused as the same blob, like an exact duplicate, so the update holds one op for the file.
     {
         Handle qc = nullptr, qu = nullptr;
         const std::string payload(5000, 'Q');
+        int64_t before = 0;   // the containers of earlier checks still hold data
+        check(at<Quota>(save, 7)(save, provider, &before) == S_OK, "remaining quota before the case-alias checks");
         check(at<Create>(save, 16)(save, provider, "quota_case", &qc) == S_OK && qc,
               "CreateContainer for case-alias quota check");
         check(at<Create>(save, 23)(save, qc, nullptr, &qu) == S_OK &&
@@ -470,8 +473,8 @@ int main() {
         qu = nullptr;
         check(at<Create>(save, 23)(save, qc, nullptr, &qu) == S_OK &&
                   at<ByName>(save, 26)(save, qu, "story") == S_OK &&
-                  at<ByName>(save, 26)(save, qu, "STORY") == S_OK,
-              "queue case-colliding deletes in one update");
+                  at<ByName>(save, 26)(save, qu, "STORY") == E_INVALIDARG,
+              "a delete of \"STORY\" after one of \"story\" in the same update is refused as the same blob");
         const HRESULT del_hr = at<Submit>(save, 27)(save, qu);
         check(del_hr == S_OK && del_hr != E_GS_QUOTA_EXCEEDED,
               "case-colliding deletes do not underflow quota to E_GS_QUOTA_EXCEEDED");
@@ -480,8 +483,8 @@ int main() {
         at<Close>(save, 24)(save, qu);
 
         int64_t rem = 0;
-        check(at<Quota>(save, 7)(save, provider, &rem) == S_OK && rem == (int64_t{1} << 30),
-              "remaining quota returns to full capacity after case-colliding delete");
+        check(at<Quota>(save, 7)(save, provider, &rem) == S_OK && rem == before,
+              "remaining quota returns to its value before the seed after case-colliding delete");
 
         // Re-seed and test write + case-colliding delete in one update.
         qu = nullptr;
@@ -495,11 +498,16 @@ int main() {
         qu = nullptr;
         check(at<Create>(save, 23)(save, qc, nullptr, &qu) == S_OK &&
                   at<Write>(save, 25)(save, qu, "story", reinterpret_cast<const uint8_t*>("abc"), 3) == S_OK &&
-                  at<ByName>(save, 26)(save, qu, "STORY") == S_OK,
-              "queue write and case-colliding delete in one update");
+                  at<ByName>(save, 26)(save, qu, "STORY") == E_INVALIDARG,
+              "a delete of \"STORY\" after a write of \"story\" in the same update is refused as the same blob");
         const HRESULT wd_hr = at<Submit>(save, 27)(save, qu);
         check(wd_hr == S_OK && wd_hr != E_GS_QUOTA_EXCEEDED,
               "write + case-colliding delete does not underflow quota to E_GS_QUOTA_EXCEEDED");
+        {
+            std::ifstream f(root / L"local-user" / L"quota_case" / L"story", std::ios::binary);
+            check(std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()) == "abc",
+                  "the write of \"story\" is applied and the refused delete is not");
+        }
         at<Close>(save, 24)(save, qu);
         at<Close>(save, 17)(save, qc);
         check(at<ByName>(save, 10)(save, provider, "quota_case") == S_OK, "clean up quota_case container");
