@@ -106,41 +106,53 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
   )
 
-  # Rust XMA2 decoder (runtime/xma_decoder), built at configure time when cargo is on PATH.
-  # Without it (or if that build fails) the runtime still builds and XMA voices output silence.
+  # Rust XMA2 decoder (runtime/xma_decoder), built at configure time when cargo is on PATH,
+  # or supplied prebuilt via -DLEONIDA_XMA2_DECODER_LIB=<path> (skipping cargo at configure time).
+  # Without it (or if the cargo build fails) the runtime still builds and XMA voices output silence.
   option(LEONIDA_REQUIRE_XMA2_DECODER "Fail configure if the Rust XMA2 decoder is unavailable" OFF)
-  find_program(LEONIDA_CARGO cargo)
-  if(LEONIDA_CARGO)
-    # Cargo's host (or configured default target) can differ from the runtime's MSVC ABI.
-    set(_xma_target x86_64-pc-windows-msvc)
-    set(_xma_target_dir ${CMAKE_BINARY_DIR}/xma_decoder)
-    set(_xma_lib ${_xma_target_dir}/${_xma_target}/release/leonida_xma2_decoder.lib)
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-      ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.toml
-      ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.lock
-      ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/src/lib.rs)
-    execute_process(
-      COMMAND ${LEONIDA_CARGO} build --release --locked --target ${_xma_target}
-              --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.toml
-              --target-dir ${_xma_target_dir}
-      TIMEOUT 120
-      RESULT_VARIABLE _xma_result)
-    if(_xma_result STREQUAL "0" AND EXISTS ${_xma_lib})
-      add_library(leonida_xma2_decoder STATIC IMPORTED)
-      # Link Rust's Windows SDK dependencies. CMake's C++ target selects its own CRT
-      # (/MD or /MDd); the C ABI keeps allocation and deallocation on the same side.
-      # synchronization: Rust's std imports WaitOnAddress and WakeByAddress*, which MSVC's
-      # default libraries cover but clang-cl with an xwin SDK does not (lld-link: undefined symbol).
-      set_target_properties(leonida_xma2_decoder PROPERTIES
-        IMPORTED_LOCATION ${_xma_lib}
-        INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder
-        INTERFACE_COMPILE_DEFINITIONS LEONIDA_HAVE_XMA2_DECODER=1
-        INTERFACE_LINK_LIBRARIES "kernel32;ntdll;userenv;ws2_32;dbghelp;synchronization")
-    else()
-      message(WARNING "cargo build of runtime/xma_decoder failed: XMA voices will be silent")
-    endif()
+  set(LEONIDA_XMA2_DECODER_LIB "" CACHE FILEPATH
+    "Prebuilt leonida_xma2_decoder.lib (skips running cargo at configure time)")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/xma2_decoder.cmake")
+  leonida_resolve_prebuilt_xma2_decoder("${LEONIDA_XMA2_DECODER_LIB}" "${CMAKE_BINARY_DIR}" _xma_lib_resolved)
+  if(_xma_lib_resolved)
+    message(STATUS "Using prebuilt Rust XMA2 decoder: ${_xma_lib_resolved}")
   else()
-    message(STATUS "cargo not found: runtime/xma_decoder not built, XMA voices will be silent")
+    find_program(LEONIDA_CARGO cargo)
+    if(LEONIDA_CARGO)
+      # Cargo's host (or configured default target) can differ from the runtime's MSVC ABI.
+      set(_xma_target x86_64-pc-windows-msvc)
+      set(_xma_target_dir ${CMAKE_BINARY_DIR}/xma_decoder)
+      set(_xma_lib ${_xma_target_dir}/${_xma_target}/release/leonida_xma2_decoder.lib)
+      set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.toml
+        ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.lock
+        ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/src/lib.rs)
+      execute_process(
+        COMMAND ${LEONIDA_CARGO} build --release --locked --target ${_xma_target}
+                --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.toml
+                --target-dir ${_xma_target_dir}
+        TIMEOUT 120
+        RESULT_VARIABLE _xma_result)
+      if(_xma_result STREQUAL "0" AND EXISTS "${_xma_lib}")
+        set(_xma_lib_resolved "${_xma_lib}")
+      else()
+        message(WARNING "cargo build of runtime/xma_decoder failed: XMA voices will be silent")
+      endif()
+    else()
+      message(STATUS "cargo not found: runtime/xma_decoder not built, XMA voices will be silent")
+    endif()
+  endif()
+  if(_xma_lib_resolved)
+    add_library(leonida_xma2_decoder STATIC IMPORTED)
+    # Link Rust's Windows SDK dependencies. CMake's C++ target selects its own CRT
+    # (/MD or /MDd); the C ABI keeps allocation and deallocation on the same side.
+    # synchronization: Rust's std imports WaitOnAddress and WakeByAddress*, which MSVC's
+    # default libraries cover but clang-cl with an xwin SDK does not (lld-link: undefined symbol).
+    set_target_properties(leonida_xma2_decoder PROPERTIES
+      IMPORTED_LOCATION "${_xma_lib_resolved}"
+      INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder"
+      INTERFACE_COMPILE_DEFINITIONS LEONIDA_HAVE_XMA2_DECODER=1
+      INTERFACE_LINK_LIBRARIES "kernel32;ntdll;userenv;ws2_32;dbghelp;synchronization")
   endif()
   if(LEONIDA_REQUIRE_XMA2_DECODER AND NOT TARGET leonida_xma2_decoder)
     message(FATAL_ERROR "LEONIDA_REQUIRE_XMA2_DECODER is enabled, but the Rust XMA2 decoder is unavailable")

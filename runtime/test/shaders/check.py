@@ -695,6 +695,33 @@ def frexp_ldexp_test(tools, spirv, env=None):
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
 USER_SGPRS_WORDS = USER_SGPRS + [0xEEEEEEEE] * 4
+# cs_w32_salu_ext.asm: the sixteen operand words vk_compute_test puts in s4..s19, and the 73 words the shader stores
+# (each derived in its header; tests/test_gpu_salu_ext.py recomputes them with the reference of tools/salu_diff.py).
+SALU_EXT_SGPRS = [0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x00000001, 0x12345678, 0xDEADBEEF, 0x0000FF80, 0x00000025,
+                  0x00000040, 0x00000000, 0x00000001, 0x80000001, 0xFFFF0000, 0xFFFFFFFF, 0x00000000, 0x00000047]
+SALU_EXT_WORDS = [
+    0xFFFFFFFF, 0x12345677, 0xCC89A887, 0x00000000, 0x33765778, 0x00000000, 0xCC99E897, 0x00000000,
+    0xFC000000, 0x00000000, 0x00000000, 0x12345680, 0x01F3266F, 0x00000011, 0x80000000, 0x00000001,
+    0x00000000, 0x12345678, 0x00000008, 0x00000000, 0x80000000, 0x1233D678, 0x7FFFFFFF, 0x0FD5BDEE,
+    0xBEEF5678, 0xDEAD1234, 0x1E6A2C48, 0x00000001, 0xFFFFFFFF, 0x0000001F, 0x00000010, 0xFFFFFFFF,
+    0x00000000, 0xFFFFFF80, 0x00000078, 0xFFFFFFDF, 0x00000020, 0xC962FC98, 0x12345678, 0xFFFF8000,
+    0x00000040, 0x00000000, 0x00000001, 0x80000001, 0xFFFF0000, 0xFFFFFFDF, 0xFFFFFF7F, 0xFFFFFFFF,
+    0x00000000, 0x00000020, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x02000000, 0xFF000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000020, 0x00000080, 0x00000080, 0x00000000, 0x00000000, 0x07FFFFFF,
+    0x00000000, 0x00000000, 0x00000000, 0x00000010, 0x00000000, 0x0056D555, 0x000D5555, 0x00555555,
+    0x0000015B]
+SALU_EXT_HEAP_WORDS = 80   # the 73 results, then words that must keep the harness's fill
+
+
+def salu_ext_test(tools, spirv, env=None):
+    """cs_w32_salu_ext: 38 scalar ALU ops on the operands of SALU_EXT_SGPRS, every destination and SCC stored. The
+    whole 80-word heap is compared: the 73 results and the untouched fill after them."""
+    child = dict(os.environ if env is None else env, VKC_SGPRS=",".join(f"{w:#x}" for w in SALU_EXT_SGPRS))
+    child.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_w32_salu_ext") or 32))
+    expected = SALU_EXT_WORDS + [0xEEEEEEEE] * (SALU_EXT_HEAP_WORDS - len(SALU_EXT_WORDS))
+    return dump_test(tools, spirv, "cs_w32_salu_ext", expected, SALU_EXT_HEAP_WORDS, child)
+
+
 # cs_fma_fused.asm: single-rounded f32 multiply-adds (and one f16). The operands arrive in s4..s7 so no driver can fold
 # them; FMA_FUSED are the exact single-rounded words and FMA_SPLIT are the exact split-rounded words (derivations in
 # the .asm header; out[7] is f16 round-to-odd, never GLSL Fma, so it is always 0x7351). Under --fma khr
@@ -743,7 +770,9 @@ W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               # s_andn2_saveexec_b64 / s_andn2_wrexec_b64: EXEC = S0 & ~EXEC over both halves, D old / new EXEC, SCC
               ("cs_w64x_andn2_exec", [1, 16, 32, 4144, 2052, 3, 8, 1544]),
               # s_and/s_or_saveexec_b64 (VCC and SGPR-pair sources), s_andn2_saveexec/wrexec_b64 (SGPR pair): D, EXEC, SCC
-              ("cs_w64x_saveexec_b64", [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171])]
+              ("cs_w64x_saveexec_b64", [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171]),
+              # SHADER-W64-SDST-PAIR: v_cmp_* / carry-out SGPR destinations printed as one register (no mattr line)
+              ("cs_w64x_cmp_sdst", [10240, 6144, 2053, 8224, 7714, 6184, 4144, 5])]
 # A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
                 ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
@@ -2187,6 +2216,7 @@ def main():
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
                                                   expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
+    results.append(("cs_w32_salu_ext", salu_ext_test(tools, spirv)))
     results.append(("cs_heap_init", compute_test(tools, spirv, "cs_heap_init", "1", "dump",
                                                  expected_words=HEAP_INIT_EXPECTED, env=heap_init_env())))
     results.append(("cs_w32_shift64", shift64_test(tools, spirv)))

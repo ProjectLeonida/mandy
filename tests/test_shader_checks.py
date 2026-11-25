@@ -31,8 +31,8 @@ WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n
 
 
 # All check.py cases, including the seven vk_store_test shaders and the three mesh fixtures, and TEST-184's
-# vk_store_test "words" fixtures and image_get_lod draws.
-TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 7
+# vk_store_test "words" fixtures and image_get_lod draws. One of the eight next to COMPUTE is cs_w32_salu_ext.
+TOTAL = (len(check.COMPUTE) + 8 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 7
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
@@ -134,6 +134,14 @@ class Wave64Checks(unittest.TestCase):
                 seeded = (env or {}).get("VKC_SGPRS") == check.USER_SGPRS_ENV["VKC_SGPRS"]
                 words = check.USER_SGPRS_WORDS if seeded else [0] * 4 + [0xEEEEEEEE] * 4
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
+            if name == "cs_w32_salu_ext":
+                # The scalar results come back only if check.py passed the sixteen operand words in VKC_SGPRS.
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), str(check.SALU_EXT_HEAP_WORDS)))
+                seeded = env.get("VKC_SGPRS") == ",".join(f"{w:#x}" for w in check.SALU_EXT_SGPRS)
+                words = check.SALU_EXT_WORDS if seeded else [0] * len(check.SALU_EXT_WORDS)
+                words = words + [0xEEEEEEEE] * (check.SALU_EXT_HEAP_WORDS - len(words))
+                Path(env["VKC_DUMP"]).write_bytes(struct.pack(f"<{len(words)}I", *words))
+                return 0, ""
             if name == "cs_cvt_f32_sat":
                 return cvt_answer(env)
             if name == "cs_fma_fused":

@@ -384,6 +384,28 @@ on an Apple M3 Max (MoltenVK 1.4.2 and 1.4.3): 17 workgroup shapes from 1 to 102
 subgroups, with and without full subgroups and register pressure, all 32 lanes in order. A device whose default
 isn't the requested size still prints `not available`, and those tests skip.
 
+`cs_w32_salu_ext` runs 38 scalar ALU ops that no other fixture runs: `s_sub_i32`, `s_andn2_b32`, `s_orn2_b32`,
+`s_xor_b32`, `s_ashr_i32`, `s_mul_hi_u32`, `s_lshl3_add_u32`, `s_lshl4_add_u32`, `s_pack_ll_b32_b16`,
+`s_pack_hh_b32_b16`, `s_abs_i32`, `s_bcnt0_i32_b32`, `s_bitset0_b32`, `s_bitset1_b32`, `s_brev_b32`, `s_flbit_i32`,
+`s_flbit_i32_b32`, `s_sext_i32_i8`, the six `s_cmp_*_i32`, `s_cmp_gt_u32`, `s_cmp_le_u32`, `s_bitcmp0_b32`,
+`s_bitcmp1_b32`, `s_addk_i32`, `s_mulk_i32`, `s_cmovk_i32`, `s_ashr_i64`, `s_lshl_b64`, `s_lshr_b64`,
+`s_bcnt0_i32_b64`, `s_bitset0_b64`, `s_cmov_b64` and `s_ff0_i32_b64`. Its sixteen operand words arrive in `s4..s19`
+through `VKC_SGPRS`, so each op reaches the driver as SPIR-V: a scalar op on literals is folded by the translator
+(the "Chained scalar constant folding" row of [design.md](design.md)) and only its result is stored. One thread stores
+every destination and four words of SCC bits: SCC after each op that writes it, each run on operands that set it
+and on operands that clear it; each compare and bit test both ways, the signed and the unsigned ones on words that
+tell the two apart; and SCC after each op that must keep it, set to 1 and to 0 in turn before them. The 73 expected
+words are literals in `check.py`, derived in the fixture's header, and `tests/test_gpu_salu_ext.py` recomputes them
+from the fixture's own instruction lines with the reference of `tools/salu_diff.py`, the model that was compared
+with hardware. Both GPU runners compare the whole 80-word heap, the untouched fill after the results included. Run
+it alone with `python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_w32_salu_ext --require-pass`.
+On an RTX 4070 Ti (NVIDIA 620.70.06, Linux) and on llvmpipe (Mesa 26.2.6, LLVM 23.1.4) all 80 words match. Nine
+translator rules broken one at a time each failed it on both: `s_ashr_i32` shifting in zeros (word 8),
+`s_lshlN_add_u32` taking SCC from the add's carry alone (word 69), `s_abs_i32` negating (word 17), `s_mulk_i32` and
+`s_addk_i32` zero-extending their immediate (words 37 and 21), `s_cmovk_i32` ignoring SCC (word 38), the 64-bit
+shifts taking their count modulo 32 and `s_ashr_i64` shifting in zeros (word 51), and the 64-bit shifts taking SCC
+from the low dword alone (word 72).
+
 `cs_w32_shift64` checks `v_lshlrev_b64`, `v_lshrrev_b64` and `v_ashrrev_i64` with 64 memory-fed cases:
 eight boundary values crossed with counts 0, 1, 31, 32, 33, 63, 64 and 65. The expected values come from Python
 integers using the low six count bits, as specified by the [RDNA2 ISA, VOP3 opcodes 767–769](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content).

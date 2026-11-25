@@ -556,6 +556,128 @@ void test_physical_pages(const PhysicalApi& api) {
     // The windows were split into one placeholder per page; the process exit releases them.
 }
 
+// rt::xmem::copy_page_mappings_fn, behind console queue slot 31 (CopyPageMappingsBatchX): a destination page maps the
+// physical page that is mapped at the source page, so both addresses are one memory, as two XMemMapPhysicalPages calls
+// with the same page would make them.
+void test_copy_page_mappings(const PhysicalApi& api) {
+    const auto copy = rt::xmem::copy_page_mappings_fn;
+    check(copy != nullptr, "xmem.cpp sets the copy_page_mappings hook");
+    if (!copy) return;
+    constexpr uint64_t kPool = 4, kHeap = 8;
+    auto* const pool = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kPool * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    auto* const heap = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kHeap * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    check(pool && heap, "XMemVirtualAlloc reserves a pool window and a heap window");
+    if (!pool || !heap) return;
+    uint64_t pages[kPool]{};
+    uint64_t count = kPool;
+    check(api.allocate(0x280, &count, pages) == TRUE && count == kPool, "pages for the pool");
+    // Pool pages 0..2 mapped, pool page 3 left unmapped.
+    check(api.map(pool, 3, pages) == pool, "the pool maps three pages");
+    for (uint64_t i = 0; i < 3; ++i) fill_page(pool + i * kPage64k, 0x7100u + static_cast<uint32_t>(i));
+
+    // A run: heap pages 0 and 1 show pool pages 1 and 2, and are the same memory.
+    check(copy(heap, pool + kPage64k, 2, false), "a run of pool pages maps into the heap");
+    check(page_holds(heap, 0x7101u) && page_holds(heap + kPage64k, 0x7102u), "the heap pages show pool pages 1 and 2");
+    static_cast<volatile uint32_t*>(static_cast<void*>(heap + kPage64k))[1] = 0xc0ffee31;
+    check(read_u32(pool + 2 * kPage64k, 4) == 0xc0ffee31, "a write through the heap is seen in the pool: one memory");
+
+    // One page repeated.
+    check(copy(heap + 2 * kPage64k, pool, 3, true), "one pool page maps at three heap pages");
+    check(page_holds(heap + 2 * kPage64k, 0x7100u) && page_holds(heap + 4 * kPage64k, 0x7100u),
+          "every repeated page shows pool page 0");
+
+    // A pool page with nothing mapped leaves its destination unmapped; so does the null source.
+    check(copy(heap + 5 * kPage64k, pool + 2 * kPage64k, 2, false), "a run that ends in an unmapped pool page maps");
+    check(page_holds(heap + 5 * kPage64k, 0x7102u) && reserved_only(heap + 6 * kPage64k),
+          "the unmapped pool page leaves its heap page unmapped");
+    check(copy(heap, nullptr, 2, false), "a null source unmaps");
+    check(reserved_only(heap) && reserved_only(heap + kPage64k), "the heap pages are reserved again");
+    check(page_holds(pool + kPage64k, 0x7101u), "unmapping the heap leaves the pool's own mapping");
+
+    // Overlapping source and destination: every source page is read before any destination page changes.
+    check(copy(pool + kPage64k, pool, 2, false), "a run maps over an overlapping range");
+    check(page_holds(pool + kPage64k, 0x7100u) && page_holds(pool + 2 * kPage64k, 0x7101u),
+          "the overlapping run shows the pages from before it");
+
+    uint8_t outside = 0;
+    const auto outside_page =
+        reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(&outside) + 0xffff) & ~uintptr_t{0xffff});
+    check(!copy(outside_page, pool, 1, false), "a destination outside any window fails");
+    SetLastError(ERROR_SUCCESS);
+    check(!copy(heap + 1, pool, 1, false) && GetLastError() == ERROR_INVALID_PARAMETER,
+          "a destination that is not 64 KiB-aligned fails");
+    check(!copy(heap, pool + 1, 1, false) && GetLastError() == ERROR_INVALID_PARAMETER,
+          "a source that is not 64 KiB-aligned fails");
+
+    api.map(heap, kHeap, nullptr);
+    api.map(pool, kPool, nullptr);
+    check(api.free_pages(kPool, pages) == TRUE, "the pool's pages are freed");
+}
+
+bool access_faults(volatile uint32_t* address, bool write);
+
+// The same hook on a GPU-only destination: the title reserves a CPU-mappable range and a GPU-only one of the same size
+// right after it (title_gpu_views), and the D3D12 layer reads the GPU-only range's memory at the CPU range's address.
+// A batch copy onto the GPU-only range maps the same pages at the CPU range too, so that memory becomes readable there.
+void test_copy_page_mappings_cpu_view(const PhysicalApi& api) {
+    const auto copy = rt::xmem::copy_page_mappings_fn;
+    if (!copy) return;  // test_copy_page_mappings reports it
+    constexpr uint64_t kPool = 2, kPair = 3;
+    auto* const pool = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kPool * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    auto* const other = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    // The pair: the CPU-mappable range, then the GPU-only one (PAGE_GRAPHICS_NOACCESS | PAGE_NOACCESS) of its size.
+    auto* const cpu = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kPair * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    auto* const gpu = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPair * kPage64k, MEM_RESERVE | kXmem64kPages, 0x3, 0x801));
+    check(pool && other && cpu && gpu, "XMemVirtualAlloc reserves a pool, a window and a CPU + GPU-only pair");
+    if (!pool || !other || !cpu || !gpu) return;
+    check(leonida::title_gpu_views::to_cpu(reinterpret_cast<uintptr_t>(gpu)) == reinterpret_cast<uintptr_t>(cpu),
+          "the GPU-only range reads at the CPU range reserved just before it");
+    uint64_t pages[kPool]{};
+    uint64_t count = kPool;
+    check(api.allocate(0x280, &count, pages) == TRUE && count == kPool, "pages for the pool");
+    check(api.map(pool, kPool, pages) == pool, "the pool maps its pages");
+    for (uint64_t i = 0; i < kPool; ++i) fill_page(pool + i * kPage64k, 0x7300u + static_cast<uint32_t>(i));
+
+    // A run onto the GPU-only range: its CPU range shows the same bytes. Each page is read under a guard first, so a
+    // page left reserved fails its check instead of faulting the test (Wine's VirtualQuery does not report a view
+    // mapped into a placeholder as committed, so the state is not asked for).
+    const auto readable = [](const uint8_t* page) {
+        return !access_faults(reinterpret_cast<volatile uint32_t*>(const_cast<uint8_t*>(page)), false);
+    };
+    check(copy(gpu, pool, kPool, false), "a run of pool pages maps onto the GPU-only range");
+    check(readable(gpu) && page_holds(gpu, 0x7300u), "the GPU-only range shows the pool pages");
+    check(readable(cpu) && readable(cpu + kPage64k), "the paired CPU range is readable after the copy");
+    check(readable(cpu) && readable(cpu + kPage64k) && page_holds(cpu, 0x7300u) && page_holds(cpu + kPage64k, 0x7301u),
+          "the paired CPU range shows the same bytes as the pool");
+    check(!readable(cpu + 2 * kPage64k), "a CPU page past the copied run stays unmapped");
+    if (readable(cpu + kPage64k)) {
+        static_cast<volatile uint32_t*>(static_cast<void*>(cpu + kPage64k))[1] = 0xc0ffee32;
+        check(read_u32(pool + kPage64k, 4) == 0xc0ffee32 && read_u32(gpu + kPage64k, 4) == 0xc0ffee32,
+              "a write at the CPU range is seen in the pool and the GPU-only range: one memory");
+    }
+
+    // A GPU-only source whose page is mapped only at its CPU range is found there.
+    check(api.map(cpu + 2 * kPage64k, 1, &pages[0]) == cpu + 2 * kPage64k, "a page maps at the CPU range alone");
+    check(copy(other, gpu + 2 * kPage64k, 1, false), "a copy from the GPU-only range maps");
+    check(readable(other) && page_holds(other, 0x7300u),
+          "a GPU-only source page unmapped there is looked up at its CPU range");
+
+    // A null source unmaps both ranges.
+    check(copy(gpu, nullptr, kPool, false), "a null source unmaps the GPU-only range");
+    check(!readable(gpu) && !readable(cpu) && !readable(cpu + kPage64k), "the paired CPU range is unmapped with it");
+
+    api.map(other, 1, nullptr);
+    api.map(cpu, kPair, nullptr);
+    api.map(pool, kPool, nullptr);
+    check(api.free_pages(kPool, pages) == TRUE, "the pool's pages are freed");
+}
+
 bool access_faults(volatile uint32_t* address, bool write) {
     __try {
         if (write) {
@@ -1530,6 +1652,8 @@ int main() {
     if (tools_mem) check(tools_mem() == FALSE, "XMemIsToolsMemAvailable returns FALSE (no devkit tools memory)");
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);
+        test_copy_page_mappings(physical);
+        test_copy_page_mappings_cpu_view(physical);
         test_physical_pages_commit_on_touch(physical);
         test_commit_physical_pages(physical);
         test_first_touch_during_remap(physical);

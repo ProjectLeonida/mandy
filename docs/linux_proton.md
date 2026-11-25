@@ -101,11 +101,15 @@ Each item was a stop on at least one of the machines. Tests named in the pull re
 
 ## Where it stops
 
-- **Streamed memory that never reaches its destination.** The title calls queue slot 31 (`CopyPageMappingsBatchX`)
-  about 300 times per boot and this branch still ignores it; tens of thousands of streamed views wait for memory
-  that never becomes readable. An open pull request in this repository implements it.
-- **Culling compute at world start** reads buffers named by descriptors in the directly indexed heap; with the
-  point above unfixed those reads leave mapped memory and the device is lost (NVIDIA Xid 13/109 on Linux).
+- **Streamed memory that reaches its destination late or not at all.** The title calls queue slot 31
+  (`CopyPageMappingsBatchX`) about 300 times per boot. With #968 this branch maps each batch's pool pages at the
+  destination and at the paired CPU view the layer reads (`docs/d3d12_vulkan.md`, section 4.9), so most streamed
+  views find readable memory; before it, tens of thousands of them waited for memory that never became readable. Two gaps
+  remain: the mappings change when the call is made, not in queue order, and a run with the CPU-view fix still had
+  views waiting after 420 s, apparently for ranges no mapping call had reached yet.
+- **Culling compute at world start** reads buffers named by descriptors in the directly indexed heap; where the
+  memory behind them is not mapped, those reads leave mapped memory and the device is lost (NVIDIA Xid 13/109 on
+  Linux).
 - **Mesh stages** do not get the heap offset yet.
 - **16 GB of RAM:** at the end of the load the process holds ~14.6 GB (RAM plus swap) on the Linux machine after the
   cuts above. zram made this worse (compressed pages still occupy RAM); a swap file on disk is the better choice.
