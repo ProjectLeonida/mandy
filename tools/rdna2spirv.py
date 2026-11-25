@@ -10107,6 +10107,9 @@ class Gen:
             # The inferred game's f32 denorm mode is flush-in/flush-out. Unlike an IEEE multiply, the legacy
             # zero override gives +0 even when a negative subnormal operand becomes -0 after input flushing.
             # Flush the product before omod: otherwise FLT_MIN * 0.5 mul:2 becomes FLT_MIN, not zero.
+            # A subnormal operand reads as zero, so one magnitude test per operand is both its input flush and
+            # the zero override; the product of the unflushed operands is discarded whenever either test holds.
+            # Without omod the result is +0, the flushed product or a clamp of those, never a new subnormal.
             x, y = (self.src_f(t) for t in a[1:3])
             m, ax, ay, zx, zy, either, r = (self.tmp() for _ in range(7))
             self.emit(f"{m} = OpFMul %float {x} {y}")
