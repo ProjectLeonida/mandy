@@ -12,7 +12,11 @@
 //   {"seq":8,"t":0.020,"kind":"exception","code":"0xc0000005","at":"a.dll+0x4a00","access":"read","address":"0x0",
 //        "region":{"base":"0x0","allocation_base":"0x0","size":"0x7ffe0000","state":"0x10000","protect":"0x1",
 //        "type":"0x0"},"regs":{...},"stack":["a.dll+0x4a00","a.dll+0x2210"]}
-//   {"seq":9,"t":0.030,"kind":"exit","code":0}
+//   {"seq":9,"t":0.021,"kind":"exception","code":"0xc0000005","at":"0x0","access":"execute","address":"0x0",
+//        "null_call_from":"a.dll+0x2210","stack":["a.dll+0x2210",...]}   (a call through a null pointer)
+//   {"seq":10,"t":0.022,"kind":"exception","code":"0xc0000005","at":"0x0","access":"execute","address":"0x0",
+//        "null_transfer_return":"a.dll+0x2230","stack":["a.dll+0x2230",...]}   (a jump to null: not attributed)
+//   {"seq":11,"t":0.030,"kind":"exit","code":0}
 //
 // The exception handler is vectored, logs and returns EXCEPTION_CONTINUE_SEARCH: it never changes what the process
 // does (except LEONIDA_SKIP_INT3, below).
@@ -32,6 +36,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <cstring>
+#include <initializer_list>
 #include <string>
 
 #include "shims.h"
@@ -114,6 +120,7 @@ constexpr DWORD kDbgPrint = 0x40010006;      // DBG_PRINTEXCEPTION_C
 constexpr DWORD kDbgPrintWide = 0x4001000A;  // DBG_PRINTEXCEPTION_WIDE_C
 constexpr DWORD kCppException = 0xE06D7363;  // MSVC throw: logged with its address, never its payload
 constexpr int kMaxFrames = 16;
+constexpr uint64_t kNullPageEnd = 0x10000;  // Windows never maps the first 64 KiB
 
 inline std::string stack_from(const CONTEXT& start_context) {
     CONTEXT c = start_context;
@@ -199,6 +206,62 @@ inline void dump_transient_pool(const CONTEXT& c) {
     }
 }
 
+// Whether a call instruction that ends at `ret` is the transfer that faulted at `fault`. A fault on the fetch at a
+// call's target happens before any instruction of the target runs, so the registers in `c` are the call's own and
+// its operand can be evaluated again: an indirect call (FF /2, register or memory, with its SIB, displacement and
+// REX.B/REX.X) is the faulting call when that operand is `fault`. A direct call (E8) never targets the null page, and
+// an indirect one whose operand is some other address went somewhere else first: in both, the transfer to `fault`
+// came later, from a jump (a tail call), and `ret` is only the frame that code would have returned to.
+// One case reads as a call and is not: a tail jump through the very register the enclosing call went through.
+inline bool faulting_call_ends_at(uint64_t ret, const CONTEXT& c, uint64_t fault) {
+    uint8_t b[8] = {};  // the eight bytes before `ret`
+    SIZE_T got = 0;
+    if (ret < sizeof b || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(ret - sizeof b), b,
+                                             sizeof b, &got) || got != sizeof b)
+        return false;
+    // The call pushed its return address, so RSP as the operand saw it is 8 above the fault's.
+    const uint64_t reg[16] = {c.Rax, c.Rcx, c.Rdx, c.Rbx, c.Rsp + 8, c.Rbp, c.Rsi, c.Rdi,
+                              c.R8,  c.R9,  c.R10, c.R11, c.R12,     c.R13, c.R14, c.R15};
+    for (const int len : {2, 3, 4, 6, 7}) {
+        const uint8_t* p = b + sizeof b - len;
+        if (p[0] != 0xFF || ((p[1] >> 3) & 7) != 2) continue;
+        const int mod = p[1] >> 6, rm = p[1] & 7;
+        const bool sib = mod != 3 && rm == 4;
+        const uint8_t s = sib ? p[2] : 0;
+        const int disp = mod == 1 ? 1 : (mod == 2 || (mod == 0 && (rm == 5 || (sib && (s & 7) == 5)))) ? 4 : 0;
+        if (2 + (sib ? 1 : 0) + disp != len) continue;
+        const uint8_t rex = len < 8 && (p[-1] & 0xF0) == 0x40 ? p[-1] : 0;  // the byte before, when it is a REX
+        const int rex_b = (rex & 1) << 3, rex_x = (rex & 2) << 2;
+        uint64_t target = 0;
+        if (mod == 3) {
+            target = reg[rm | rex_b];
+        } else {
+            int64_t d = 0;
+            if (disp == 1) d = static_cast<int8_t>(p[len - 1]);
+            if (disp == 4) {
+                int32_t d32 = 0;
+                std::memcpy(&d32, p + len - 4, 4);
+                d = d32;
+            }
+            uint64_t address = static_cast<uint64_t>(d);
+            if (mod == 0 && rm == 5) {
+                address += ret;  // RIP-relative: RIP is the next instruction
+            } else if (sib) {
+                const int index = ((s >> 3) & 7) | rex_x, base = (s & 7) | rex_b;
+                if (index != 4) address += reg[index] << (s >> 6);
+                if (!(mod == 0 && (s & 7) == 5)) address += reg[base];
+            } else {
+                address += reg[rm | rex_b];
+            }
+            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), &target, sizeof target,
+                                   &got) || got != sizeof target)
+                continue;
+        }
+        if (target == fault) return true;
+    }
+    return false;
+}
+
 inline void log_exception(const EXCEPTION_POINTERS& info) {
     const EXCEPTION_RECORD& r = *info.ExceptionRecord;
     try {
@@ -248,7 +311,7 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
             if (info.ContextRecord) {
                 // The registers at the fault: what an analyst needs to read a title assert (which value, which list).
-                const CONTEXT& c = *info.ContextRecord;
+                CONTEXT c = *info.ContextRecord;
                 const std::pair<const char*, DWORD64> regs[] = {
                     {"rax", c.Rax}, {"rcx", c.Rcx}, {"rdx", c.Rdx}, {"rbx", c.Rbx}, {"rsi", c.Rsi}, {"rdi", c.Rdi},
                     {"r8", c.R8},   {"r9", c.R9},   {"r10", c.R10}, {"r11", c.R11}, {"r12", c.R12}, {"r13", c.R13},
@@ -257,8 +320,23 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                 for (size_t i = 0; i < std::size(regs); ++i)
                     f += std::string(i ? "," : "") + "\"" + regs[i].first + "\":" + quote(hex(regs[i].second));
                 f += "}";
+                // A transfer to a null (or null-page) address faults on the fetch at the target, so there is no
+                // instruction to name and nothing to unwind from. The top of the stack is the frame that code would
+                // return to: start from it, as for a leaf function. It is the caller only when the instruction
+                // before it is an indirect call whose operand, with the registers of the fault, is the faulting
+                // address (faulting_call_ends_at): then it is `null_call_from`. Otherwise the transfer was a jump (a
+                // tail call pushes nothing) or cannot be attributed, and the frame is `null_transfer_return`.
+                const auto fault = reinterpret_cast<uint64_t>(r.ExceptionAddress);
+                if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault < kNullPageEnd && c.Rsp &&
+                    !IsBadReadPtr(reinterpret_cast<void*>(c.Rsp), 8)) {
+                    const DWORD64 top = *reinterpret_cast<const DWORD64*>(c.Rsp);
+                    const bool call = faulting_call_ends_at(top, c, fault);
+                    c.Rip = top;
+                    c.Rsp += 8;
+                    f += std::string(call ? ",\"null_call_from\":" : ",\"null_transfer_return\":") + quote(where(c.Rip));
+                }
+                f += ",\"stack\":" + stack_from(c);
             }
-            if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
         }
     } catch (...) {
