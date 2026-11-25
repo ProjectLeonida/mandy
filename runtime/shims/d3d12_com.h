@@ -578,6 +578,9 @@ void set_global_realtime_privilege_override_for_test(int state);
 // not one of this module's command lists.
 bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT& back);
 
+// The depth-bounds range last recorded by ID3D12GraphicsCommandList1::OMSetDepthBounds on `list` (default 0..1).
+bool depth_bounds(ID3D12GraphicsCommandList1* list, float& min_depth, float& max_depth);
+
 // A copy of the commands `list` has recorded so far, for tests of what a bundle puts into its parent. False when
 // `list` is not one of this module's command lists.
 bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Command>& commands);

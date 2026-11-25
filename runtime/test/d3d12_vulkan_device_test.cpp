@@ -2423,7 +2423,7 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         fail("unknown feature unexpectedly answered");
 
     // Local invariants for what this layer actually implements.
-    if (o2.DepthBoundsTestSupported ||
+    if (o2.DepthBoundsTestSupported != (info.features.depthBounds ? TRUE : FALSE) ||
         o2.ProgrammableSamplePositionsTier != D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED)
         fail("OPTIONS2 unexpected support");
     if (o3.CastingFullyTypedFormatSupported ||
@@ -5095,6 +5095,7 @@ int main() {
         info.queue_family = d.family;
         info.conditional_rendering = d.conditional_rendering;  // SetPredication (the D24 tests check copies under it)
         info.texture_compression_bc = d.bc;
+        info.features.depthBounds = d.enabled.depthBounds;
         info.occlusion_query_precise = d.occlusion_query_precise;
         info.pipeline_statistics_query = d.pipeline_statistics_query;
         info.conditional_rendering = d.conditional_rendering;

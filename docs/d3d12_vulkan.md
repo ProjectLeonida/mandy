@@ -2452,7 +2452,11 @@ The trace will enumerate them.
     a VS stream builds the same PSO as the classic call.
   - `E_INVALIDARG`, as on the PC runtime: a type given twice, an unknown type, a truncated stream, MS with VS,
     tessellation or GS, CS with a graphics stage, or no stage at all.
-  - `E_NOTIMPL` with a log, for what is not built yet: an AS, a depth-bounds test, view instancing.
+  - `E_NOTIMPL` with a log, for what is not built yet: an AS, view instancing.
+  - `DEPTH_STENCIL1`/`DEPTH_STENCIL2` `DepthBoundsTestEnable` maps to hardware `depthBoundsTestEnable` +
+    `VK_DYNAMIC_STATE_DEPTH_BOUNDS` and `OMSetDepthBounds` — recorded on both direct lists and bundles, with
+    out-of-range/inverted/`NaN` bounds accepted at record time as on D3D12 and sanitized into Vulkan's `0..1`
+    range at replay — refusing with `E_NOTIMPL` when `VkPhysicalDeviceFeatures::depthBounds` is absent.
   - `DEPTH_STENCIL2`'s per-face read and write masks go to each face's `VkStencilOpState` (the front face's in the
     description, the back face's beside it), so `OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported` is TRUE:
     with `OMSetFrontAndBackStencilRef`'s per-face references, both of that cap's parts.
@@ -2582,7 +2586,8 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   - `OPTIONS19` maps `SupportedSampleCountsWithNoOutputs` from `framebufferNoAttachmentsSampleCounts`, ties
     `AnisoFilterWithPointMipSupported` to `VulkanDeviceInfo::sampler_anisotropy`, and reports the baseline heap
     limits (`2048` samplers, `1000000` views);
-  - `OPTIONS21` reports baseline `D3D12_EXECUTE_INDIRECT_TIER_1_0`, and unimplemented features/tiers (`DepthBounds`,
+  - `OPTIONS2` reports `DepthBoundsTestSupported` from `VkPhysicalDeviceFeatures::depthBounds`;
+  - `OPTIONS21` reports baseline `D3D12_EXECUTE_INDIRECT_TIER_1_0`, and unimplemented features/tiers (
     `CastingFullyTypedFormat`, MSAA UAVs, independent stencil masks, render passes, RT, mesh shaders, sampler
     feedback, wave MMA, work graphs, GPU upload heaps) stay `FALSE`/`NOT_SUPPORTED`/`TIER_0`. Checked live against
     the host D3D12 runtime on the same adapter (`NVIDIA GeForce RTX 5080`, driver `616.56`, Windows 11): 15/15 feature

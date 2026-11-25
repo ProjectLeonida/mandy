@@ -454,6 +454,8 @@ struct Draw {
     std::array<float, 4> blend_factor{1, 1, 1, 1};
     std::uint32_t stencil_front = 0;
     std::uint32_t stencil_back = 0;
+    float min_depth_bounds = 0.0f;
+    float max_depth_bounds = 1.0f;
     bool indexed = false;
     std::uint32_t count = 0;  // vertices or indices per instance
     std::uint32_t instances = 0;
