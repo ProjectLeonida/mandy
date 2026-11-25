@@ -31,6 +31,7 @@ check.py too, whose test programs then bind that block (runtime/test/vk_pc_tail.
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -198,7 +199,26 @@ def translate_tests(work, names):
     # 128-byte push constants: the tail in a set-1 uniform block. The values the test programs accept (vk_pc_tail.h).
     if (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on"):
         cmd.append("--pc-tail-ubo")
-    return subprocess.run(cmd).returncode
+    int64_on = (os.environ.get("LEONIDA_INT64_ATOMICS") or "").strip().lower() in ("1", "true", "yes", "on")
+    if int64_on:
+        cmd.append("--int64-atomics")
+    rc = subprocess.run(cmd).returncode
+    if rc or int64_on or "cs_atomic_swap_x2_int64" not in names:
+        return rc
+    # cs_atomic_swap_x2_int64 specifically exercises --int64-atomics even when LEONIDA_INT64_ATOMICS is unset globally.
+    atomic_disasm = work / "disasm_int64"
+    atomic_out = work / "spirv_int64"
+    atomic_disasm.mkdir()
+    shutil.copy2(disasm / "cs_atomic_swap_x2_int64.s", atomic_disasm / "cs_atomic_swap_x2_int64.s")
+    rc = subprocess.run(cmd[:3] + [atomic_disasm, "--out", atomic_out, *cmd[6:], "--int64-atomics"]).returncode
+    if rc:
+        return rc
+    shutil.copy2(atomic_out / "cs_atomic_swap_x2_int64.spv", spirv / "cs_atomic_swap_x2_int64.spv")
+    main_idx = json.loads((spirv / "index.json").read_text(encoding="utf-8"))
+    sub_idx = json.loads((atomic_out / "index.json").read_text(encoding="utf-8"))
+    main_idx["cs_atomic_swap_x2_int64"] = sub_idx["cs_atomic_swap_x2_int64"]
+    (spirv / "index.json").write_text(json.dumps(main_idx, indent=2) + "\n", encoding="utf-8", newline="\n")
+    return 0
 
 
 def main():

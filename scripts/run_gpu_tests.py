@@ -397,6 +397,9 @@ def pc_tail_ubo() -> bool:
     # block at set 1), for devices whose maxPushConstantsSize is 128. The test programs read the same variable
     # (runtime/test/vk_pc_tail.h) and bind the block; same accepted values as LEONIDA_W64_EMULATE.
     return (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on")
+def int64_atomics() -> bool:
+    # LEONIDA_INT64_ATOMICS=1: translate all tests with --int64-atomics (64-bit OpAtomicExchange on *_atomic_swap_x2).
+    return (os.environ.get("LEONIDA_INT64_ATOMICS") or "").strip().lower() in ("1", "true", "yes", "on")
 def wavemask_check(vk_compute: str, spv: str, env: dict | None, emulated: bool) -> tuple[bool | None, str]:
     """cs_wavemask, as in check.py: (passed, detail), passed None for a skip. The native build needs a 64-wide
     subgroup and skips where the device has none; with LEONIDA_W64_EMULATE=1 it was translated with
@@ -947,6 +950,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--mesh-compute")
         if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1
             cmd.append("--pc-tail-ubo")
+        if int64_atomics():   # 64-bit OpAtomicExchange on *_atomic_swap_x2 (OpCapability Int64Atomics)
+            cmd.append("--int64-atomics")
         if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma, OpFmaKHR or emulated (docs/design.md)
             cmd += ["--fma", os.environ["LEONIDA_FMA"]]
         rc, out = run_cmd(cmd, gpu=False)
@@ -954,6 +959,32 @@ def run_suite(a, work: str) -> int:
     print(out)
     if rc != 0:
         return 1
+    if not int64_atomics() and any(os.path.basename(p) == "cs_atomic_swap_x2_int64.s" for p in disasm_files):
+        # Always translate the multi-thread tearing fixture with --int64-atomics so CI exercises 64-bit OpAtomicExchange
+        # without mutating the 32-bit default path tested by cs_global_mem_ext.
+        with tempfile.TemporaryDirectory(prefix="disasm_i64-", dir=work) as i64_disasm, \
+                tempfile.TemporaryDirectory(prefix="spirv_i64-", dir=work) as i64_spirv:
+            shutil.copyfile(os.path.join(disasm_dir, "cs_atomic_swap_x2_int64.s"),
+                            os.path.join(i64_disasm, "cs_atomic_swap_x2_int64.s"))
+            i64_cmd = cmd[:4] + [i64_disasm, "--out", i64_spirv] + cmd[7:] + ["--int64-atomics"]
+            rc64, out64 = run_cmd(i64_cmd, gpu=False)
+            if rc64 != 0:
+                print("=== rdna2spirv.py (--int64-atomics) ===", file=sys.stderr)
+                print(out64, file=sys.stderr)
+                return 1
+            shutil.copyfile(os.path.join(i64_spirv, "cs_atomic_swap_x2_int64.spv"),
+                            os.path.join(spirv_dir, "cs_atomic_swap_x2_int64.spv"))
+            main_idx_p = os.path.join(spirv_dir, "index.json")
+            sub_idx_p = os.path.join(i64_spirv, "index.json")
+            if os.path.isfile(main_idx_p) and os.path.isfile(sub_idx_p):
+                with open(main_idx_p, encoding="utf-8") as f:
+                    main_idx = json.load(f)
+                with open(sub_idx_p, encoding="utf-8") as f:
+                    sub_idx = json.load(f)
+                main_idx["cs_atomic_swap_x2_int64"] = sub_idx["cs_atomic_swap_x2_int64"]
+                with open(main_idx_p, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(main_idx, f, indent=2)
+                    f.write("\n")
     if bary_fallback():
         import bary_fallback_gs
         for gs in bary_fallback_gs.build_for_index(spirv_dir):
@@ -1105,14 +1136,16 @@ def run_suite(a, work: str) -> int:
             # d16_xyz / d16_xy typed-buffer loads and d16_xyz stores (cs_fmt_d16_xyz.asm header)
             problem = fmt_d16_xyz_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "80/80 dumped words exact"))
-        elif name in ("cs_global_neg_offset", "cs_global_mem_ext"):
+        elif name in ("cs_global_neg_offset", "cs_global_mem_ext", "cs_atomic_swap_x2_int64"):
             # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups give a 0x2800-byte
             # heap holding both the right addresses and the 4096-lower ones. One thread, no wave64 requirement.
             # cs_global_mem_ext.asm: global/buffer atomics, 8/16-bit global stores and d16 loads in the same heap.
+            # cs_atomic_swap_x2_int64.asm: multi-thread *_atomic_swap_x2 tearing test (--int64-atomics).
             rc, msg = run_cmd([vk_compute, spv, "40", "dump"], env=cs_env)
             want = {"cs_global_neg_offset": [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4, 0x9E, 0xFFFF8BAD,
                                              0x57023FFC, 0xEEEEEEEE],
-                    "cs_global_mem_ext": [0x5, 0xC, 0x977, 0xFFF00000, 0xEDCB5678, 0xEF332211, 0x887766BE, 0xFF801234]}[name]
+                    "cs_global_mem_ext": [0x5, 0xC, 0x977, 0xFFF00000, 0xEDCB5678, 0xEF332211, 0x887766BE, 0xFF801234],
+                    "cs_atomic_swap_x2_int64": [0, 0, 256, 256, 1, 1, 0xDEAD0001, 0x9ABCDEF0]}[name]
             ok, detail = judge_cs_dump(rc, msg, want, wave64=False, partial=False, emulated=False, hexwords=True)
             results.append((name, ok, detail))
         elif name == "cs_heap_init":
