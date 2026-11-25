@@ -83,6 +83,12 @@ Runtime workflow. The stage writes `<out>/gta6rt.sh`, which starts `gta6rt.exe` 
 [testing.md](testing.md#the-windows-runtime-on-linux-under-wine-or-proton) has the test runs under Wine and Proton
 and what fails there.
 
+For XMA2 audio, `runtime/CMakeLists.txt` builds `runtime/xma_decoder` for `x86_64-pc-windows-msvc` when `cargo` is on
+`PATH`. Distribution Rust packages typically omit the Windows MSVC standard library, which leaves XMA voices silent
+unless you add the `x86_64-pc-windows-msvc` Rust target or pass a prebuilt static library with
+`-DLEONIDA_XMA2_DECODER_LIB=<path>`, built yourself from this checkout's `runtime/xma_decoder` with the command in
+[runtime/xma_decoder/README.md](../runtime/xma_decoder/README.md).
+
 ### What Wine answers differently
 
 Every import the loader does not shim binds to the host's DLLs, and under Wine those are Wine's own. A few of them
@@ -103,8 +109,8 @@ did, or avoids the difference on every host, and still checks the shim or the lo
 - **Reserve-only section views**: the first write to a `SEC_RESERVE` view goes through with no fault, and
   `VirtualQuery` keeps reporting `MEM_RESERVE` for the page until something commits it. On Windows that write faults
   and the XMem shim commits the page in its handler, which therefore never runs under Wine: a page the title has
-  written is usable there and still reported as reserved. `xmem` commits it with `rt::xmem::commit_physical_range`,
-  the call the runtime makes before it imports title memory, and checks that the bytes written before are kept.
+  written is usable there and still reported as reserved. `xmem` skips the reported state and protection there and
+  checks that the page is a read-write view that holds what was written.
 - **Guard pages**: a `PAGE_GUARD` page that starts exactly at the reading thread's `StackBase` loses its guard with
   nothing raised; one page higher, the exception arrives. `dstorage` keeps its guard page inside an allocation of
   its own, on every host.

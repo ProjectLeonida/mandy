@@ -66,6 +66,7 @@ CAUGHT = [
     ("heightmap2.dat", b"MHIU" + bytes(12), "MHIU heightmap"),
     ("presets.dat", b"SPS1" + bytes(12), "SPS1 shader-preset table"),
     ("effects.dat", b"SGD5" + bytes(12), "SGD5 effects database"),
+    ("profile.dat", b"BCPHIST1" + bytes(8), "local BCPack predictor profile"),
     ("texcontainer.dat", b"RDS5" + bytes(12), "RDS5 texture container"),
     ("bank2.json", b"AWC\x00" + bytes(12), "AWC audio bank"),
     ("script.lol", b"YSC\x00" + bytes(12), "YSC compiled script"),
