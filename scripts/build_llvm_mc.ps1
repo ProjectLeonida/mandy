@@ -19,12 +19,17 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
+if ([string]::IsNullOrWhiteSpace($Version) -or $Version -match '[\s\x00-\x1f%]') {
+    throw "-Version '$Version' is not a valid LLVM release version."
+}
+
 # cmd.exe expands %...% on every line of _build.cmd (twice on a CALL line), so a -Temp with % in it breaks the build.
 # A relative -Temp is checked as the full path it resolves to (the working directory can hold the %).
 $fullTemp = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Temp))
 if ($fullTemp.Contains('%')) {
     throw "-Temp '$fullTemp' contains '%', which cmd.exe expands in the generated _build.cmd. Choose a -Temp folder without % in its path."
 }
+$Temp = $fullTemp
 
 if (-not $Keep) {
     # Compare directory boundaries, including when the paths do not exist yet.
@@ -40,19 +45,26 @@ foreach ($t in "git", "python") {
     if (-not (Get-Command $t -ErrorAction SilentlyContinue)) { throw "$t wasn't found on PATH." }
 }
 $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
-$vs = & "$installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+$vswhere = Join-Path $installer "vswhere.exe"
+if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) { throw "Visual Studio with the C++ x64 tools wasn't found." }
+$vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (-not $vs) { throw "Visual Studio with the C++ x64 tools wasn't found." }
 $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+if (-not (Test-Path -LiteralPath $vcvars -PathType Leaf)) { throw "Visual Studio vcvars64.bat wasn't found at '$vcvars'." }
 $jobs = [Math]::Max(1, [int]([Environment]::ProcessorCount / 2))
 
 $cmakeDir = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake"
 $cmake = Join-Path $cmakeDir "CMake\bin\cmake.exe"
-$ninja = Join-Path $cmakeDir "Ninja\ninja.exe"
-if (-not ((Test-Path $cmake) -and (Test-Path $ninja))) {
-    $cmake = (Get-Command cmake -ErrorAction SilentlyContinue).Source
-    $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
-    if (-not ($cmake -and $ninja)) { throw "CMake and Ninja weren't found (install VS's 'C++ CMake tools' or put them on PATH)." }
+if (-not (Test-Path -LiteralPath $cmake -PathType Leaf)) {
+    $cmakeCmd = Get-Command cmake -ErrorAction SilentlyContinue
+    $cmake = if ($cmakeCmd) { $cmakeCmd.Source } else { $null }
 }
+$ninja = Join-Path $cmakeDir "Ninja\ninja.exe"
+if (-not (Test-Path -LiteralPath $ninja -PathType Leaf)) {
+    $ninjaCmd = Get-Command ninja -ErrorAction SilentlyContinue
+    $ninja = if ($ninjaCmd) { $ninjaCmd.Source } else { $null }
+}
+if (-not ($cmake -and $ninja)) { throw "CMake and Ninja weren't found (install VS's 'C++ CMake tools' or put them on PATH)." }
 
 $src = Join-Path $Temp "src"
 $out = Join-Path $Temp "build"
@@ -144,14 +156,14 @@ if ($p.ExitCode -ne 0) { throw "build failed ($($p.ExitCode)); the build folder 
 $exe = Join-Path $out "bin\llvm-mc.exe"
 # Through a file: a PowerShell pipe can prepend a BOM, which llvm-mc rejects as an invalid token.
 $probeFile = Join-Path $Temp "probe.txt"
-[IO.File]::WriteAllText($probeFile, "0x00 0x00 0x81 0xbf`n")
+[IO.File]::WriteAllText($probeFile, "0x00 0x00 0x81 0xbf`n", [System.Text.UTF8Encoding]::new($false))
 $probe = & $exe --disassemble -triple=amdgcn -mcpu=gfx1013 $probeFile
 if ($LASTEXITCODE -ne 0 -or -not ($probe -match "s_endpgm")) { throw "the built llvm-mc didn't disassemble an s_endpgm" }
 
 New-Item -ItemType Directory -Force $Dest | Out-Null
 # LLVM_MC is saved for future terminals, whose working directory can differ from this one.
 $final = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath((Join-Path $Dest "llvm-mc.exe"))
-Copy-Item -Force $exe $final
+Copy-Item -LiteralPath $exe -Destination $final -Force
 if (-not $Keep) {
     Remove-DirectoryRobust $Temp
     if (Test-Path -LiteralPath $Temp) {
