@@ -166,9 +166,13 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     DEPENDS "${bcpack_tools}/gen_bcpack_runtime_tables.py" "${bcpack_tools}/bcpack.py"
             "${bcpack_tools}/bcpack_tables.py" "${bcpack_tools}/bcpack_tables_bptc.py"
     VERBATIM)
-  add_executable(bcpack_history_train "../tools/bcpack_history_train.cpp" "${bcpack_tables}")
+  # One owner keeps parallel MSBuild projects from writing the same include twice.
+  add_custom_target(gta6rt_bcpack_tables DEPENDS "${bcpack_tables}")
+  add_executable(bcpack_history_train "../tools/bcpack_history_train.cpp")
+  add_dependencies(bcpack_history_train gta6rt_bcpack_tables)
   target_include_directories(bcpack_history_train PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-  add_library(gta6rt_bcpack STATIC src/bcpack.cpp "${bcpack_tables}")
+  add_library(gta6rt_bcpack STATIC src/bcpack.cpp)
+  add_dependencies(gta6rt_bcpack gta6rt_bcpack_tables)
   target_include_directories(gta6rt_bcpack PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
   add_executable(gta6rt
