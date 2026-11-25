@@ -215,25 +215,28 @@ class _VectorBitwiseMixin:
         want_bfi = [(i < 10) if (i & 1 == 0) else (i & 2 == 0) for i in range(self.wave_size)]
         for lane in range(self.wave_size):
             base = lane * 36
-            # The mask reads run while EXEC is narrowed to lanes < 10, so the wave-mask gather is
-            # suppressed (mask_word_read_ok: a group op can't be relied on to see lanes EXEC has
-            # off — MoltenVK, #1397 review). Each lane's mask operand read keeps its own 0 / ~0
-            # bit and the bitwise ops still update every lane, so each lane stores its own bit of
-            # the composed mask: ~0 where the lane is in it, 0 elsewhere.
-            self.assertEqual(mem[base], 0xFFFFFFFF if want_andor[lane] else 0,
-                             f"lane {lane} raw and_or")
-            self.assertEqual(mem[base + 4], 0xFFFFFFFF if want_xnor[lane] else 0,
-                             f"lane {lane} raw xnor")
-            self.assertEqual(mem[base + 8], 0xFFFFFFFF if want_bfi[lane] else 0,
-                             f"lane {lane} raw bfi")
-            # readfirstlane broadcasts lane 0's result — ~0 in each case — so every lane takes the
-            # mask-set arm and bcnt counts the whole wave's bits.
-            self.assertEqual(mem[base + 12], 20, f"lane {lane} cndmask and_or")
-            self.assertEqual(mem[base + 16], 40, f"lane {lane} cndmask xnor")
-            self.assertEqual(mem[base + 20], 60, f"lane {lane} cndmask bfi")
-            self.assertEqual(mem[base + 24], self.wave_size, f"lane {lane} bcnt and_or")
-            self.assertEqual(mem[base + 28], self.wave_size, f"lane {lane} bcnt xnor")
-            self.assertEqual(mem[base + 32], self.wave_size, f"lane {lane} bcnt bfi")
+            # The mask reads run while EXEC is narrowed to lanes < 10. Hardware SGPRs hold the
+            # whole wave's mask word, and the eager gather sees the lanes EXEC has off too, so the
+            # bitwise VALU op composes the 32-bit mask words themselves. The VGPR result is that
+            # wave-uniform word in every lane (for the low-half SGPRs in wave64 as well).
+            andor_word = sum((1 << i) for i, b in enumerate(want_andor[:32]) if b)
+            xnor_word = sum((1 << i) for i, b in enumerate(want_xnor[:32]) if b)
+            bfi_word = sum((1 << i) for i, b in enumerate(want_bfi[:32]) if b)
+            self.assertEqual(mem[base], andor_word, f"lane {lane} raw and_or")
+            self.assertEqual(mem[base + 4], xnor_word, f"lane {lane} raw xnor")
+            self.assertEqual(mem[base + 8], bfi_word, f"lane {lane} raw bfi")
+            # readfirstlane broadcasts lane 0's copy of the composed wave mask word. Mask consumers
+            # extract each lane's own bit again: cndmask follows that lane's membership, and bcnt
+            # counts the set bits of the composed masks (low plus high halves in wave64).
+            self.assertEqual(mem[base + 12], 20 if want_andor[lane] else 10,
+                             f"lane {lane} cndmask and_or")
+            self.assertEqual(mem[base + 16], 40 if want_xnor[lane] else 30,
+                             f"lane {lane} cndmask xnor")
+            self.assertEqual(mem[base + 20], 60 if want_bfi[lane] else 50,
+                             f"lane {lane} cndmask bfi")
+            self.assertEqual(mem[base + 24], sum(want_andor), f"lane {lane} bcnt and_or")
+            self.assertEqual(mem[base + 28], sum(want_xnor), f"lane {lane} bcnt xnor")
+            self.assertEqual(mem[base + 32], sum(want_bfi), f"lane {lane} bcnt bfi")
 
     def test_readfirstlane_mask_vgpr_dst_gets_wave_word(self):
         mem = _run_cs(
@@ -389,11 +392,11 @@ class TestScalarMaskNumberReads(unittest.TestCase):
 
 
 class TestMaskDataReadExecGate(unittest.TestCase):
-    """A lane-mask data read gathers the wave's mask word with a group op only while every lane the
-    word covers is EXEC-active: drivers differ on whether lanes EXEC has off still vote (MoltenVK's
-    group ops saw only the lanes a narrowed EXEC left on, #1397 review). Otherwise the read keeps
-    this lane's 0 / ~0 — the pre-#1397 answer — and an EXEC operand's own word still gathers, since
-    lanes off in EXEC contribute 0 either way."""
+    """A lane-mask data read gathers the wave's mask word even while EXEC is narrowed. EXEC is a
+    per-lane value in the translator's model, not SPIR-V control flow; the mask-data reader is kept
+    out of lane-local `if (active)` runs and wave_mask's eager store keeps drivers from moving the
+    subgroup gather into an EXEC-selected arm. Thus lanes EXEC has off still contribute the bits they
+    hold, as hardware's wave-wide mask register does."""
 
     def _lines(self, tail):
         return [
@@ -407,19 +410,59 @@ class TestMaskDataReadExecGate(unittest.TestCase):
             "s_endpgm",
         ]
 
-    def test_vcc_read_under_narrowed_exec_keeps_lane_bit(self):
+    def test_vcc_read_under_narrowed_exec_gathers_mask_word(self):
         lines = self._lines(["v_mov_b32_e32 v2, vcc_lo"])
         spv, _ = _translate_cs("cs_maskdata_narrowed", lines, wave_size=32, emulate=False)
-        self.assertNotIn("OpGroupNonUniformBitwiseOr", spv)
+        self.assertIn("OpGroupNonUniformBitwiseOr", spv)
         mem = _run_cs("cs_maskdata_narrowed_run", lines, wave_size=32, emulate=False)
         for lane in range(32):
-            # EXEC-active even lanes store their own VCC bit (0: VCC is the odd lanes); odd lanes
-            # are off in EXEC — the store doesn't run — which is the per-lane answer, not the
-            # 0xAAAAAAAA word a gather would have produced.
+            # EXEC-active even lanes store the whole odd-lane VCC word; odd lanes are off in EXEC,
+            # so the store doesn't run for them.
             if lane & 1:
                 self.assertNotIn(lane * 4, mem, f"lane {lane}")
             else:
-                self.assertEqual(mem[lane * 4], 0, f"lane {lane}")
+                self.assertEqual(mem[lane * 4], 0xAAAAAAAA, f"lane {lane}")
+
+    def test_sgpr_read_under_narrowed_exec_gathers_mask_word(self):
+        # Gefik23's crosslane_fuzz family: a compare-written SGPR mask read after EXEC narrows.
+        lines = [
+            "v_and_b32 v1, 1, v0",
+            "v_cmp_eq_u32_e64 s10, v1, 1",         # s10 = odd lanes, 0xAAAAAAAA
+            f"v_mov_b32_e32 v2, {SENTINEL:#x}",
+            "s_mov_b32 exec_lo, 0x55555555",      # EXEC = even lanes
+            "v_mov_b32_e32 v2, s10",
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "buffer_store_dword v2, v3, s[0:3], 0 offen",
+            "s_endpgm",
+        ]
+        spv, _ = _translate_cs("cs_maskdata_sgpr_narrowed", lines, wave_size=32, emulate=False)
+        self.assertIn("OpGroupNonUniformBitwiseOr", spv)
+        mem = _run_cs("cs_maskdata_sgpr_narrowed_run", lines, wave_size=32, emulate=False)
+        for lane in range(32):
+            if lane & 1:
+                self.assertNotIn(lane * 4, mem, f"lane {lane}")
+            else:
+                self.assertEqual(mem[lane * 4], 0xAAAAAAAA, f"lane {lane}")
+
+    def test_sgpr_read_after_independent_full_exec_restore_gathers(self):
+        # ecox982745's independent-SGPR restore: s7 is runtime-all-ones but is not an EXEC alias.
+        # The mask word is still the wave-wide value; no EXEC provenance proof is needed.
+        lines = [
+            "v_mov_b32_e32 v7, -1",
+            "v_readfirstlane_b32 s7, v7",
+            "v_and_b32 v1, 1, v0",
+            "v_cmp_ne_u32_e64 s10, v1, 0",         # odd lanes
+            "s_mov_b32 exec_lo, s7",
+            "v_mov_b32_e32 v2, s10",
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "buffer_store_dword v2, v3, s[0:3], 0 offen",
+            "s_endpgm",
+        ]
+        spv, _ = _translate_cs("cs_maskdata_independent_exec", lines, wave_size=32, emulate=False)
+        self.assertIn("OpGroupNonUniformBitwiseOr", spv)
+        mem = _run_cs("cs_maskdata_independent_exec_run", lines, wave_size=32, emulate=False)
+        for lane in range(32):
+            self.assertEqual(mem[lane * 4], 0xAAAAAAAA, f"lane {lane}")
 
     def test_vcc_read_after_exec_restore_gathers(self):
         lines = self._lines(["s_mov_b32 exec_lo, -1", "v_mov_b32_e32 v2, vcc_lo"])
