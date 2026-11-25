@@ -51,13 +51,14 @@ inline void set_arena(ArenaWrite write, void* device) {
 inline void clear_arena(void* device) {
     State& s = state();
     const std::lock_guard lock(s.mutex);
-    if (s.device != device) return;
+    if (!device || s.device != device) return;
     s.arena = nullptr;
     s.device = nullptr;
 }
 
 // Asked before any host store of a value write: an arena offset must never reach one.
 inline Landing arena(std::uint64_t address, const void* bytes, unsigned size) {
+    if (!bytes || (size != 4 && size != 8)) return Landing::refused;
     State& s = state();
     const std::lock_guard lock(s.mutex);
     if (!s.arena) return Landing::elsewhere;
@@ -66,12 +67,22 @@ inline Landing arena(std::uint64_t address, const void* bytes, unsigned size) {
 
 // xmem sets it when it is linked into the process (shims/xmem.cpp).
 inline void set_title_pages(TitlePagesWrite write) { state().title_pages.store(write, std::memory_order_release); }
+inline void clear_title_pages() { state().title_pages.store(nullptr, std::memory_order_release); }
 
 // The fallback after a host store into the title's memory failed: the page may be one of xmem's that the title's view
 // keeps PAGE_NOACCESS. False without xmem, or when the page is not xmem's.
 inline bool title_pages(const void* address, const void* bytes, std::size_t size) {
+    if (!address || !bytes || size == 0) return false;
     const TitlePagesWrite write = state().title_pages.load(std::memory_order_acquire);
     return write && write(address, bytes, size);
+}
+
+inline void reset_for_test() {
+    State& s = state();
+    const std::lock_guard lock(s.mutex);
+    s.arena = nullptr;
+    s.device = nullptr;
+    s.title_pages.store(nullptr, std::memory_order_release);
 }
 
 }  // namespace leonida::value_sink
