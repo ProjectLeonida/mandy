@@ -9854,8 +9854,6 @@ public:
                 families(info.physical, &count, nullptr);
                 std::vector<VkQueueFamilyProperties> queues(count);
                 families(info.physical, &count, queues.data());
-                if (info.copy_family < count && !(queues[info.copy_family].queueFlags & VK_QUEUE_COMPUTE_BIT))
-                    state_.context->set_transfer_only_family(info.copy_family);
                 if (info.queue_family < count && (queues[info.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
                     state_.context->configure_predication(get_device, state_.memory, limits.limits.maxStorageBufferRange, info.queue_family);
                     if (info.storage_buffer_8bit) state_.context->configure_predicated_copy(get_device, limits.limits);
@@ -9945,6 +9943,12 @@ public:
             if (family.queueFlags & VK_QUEUE_COMPUTE_BIT)
                 state_.context->set_occlusion_resolve_memory(state_.memory);
         }
+
+        // Queue replay needs this even when conditional rendering is disabled. A transfer-only queue cannot
+        // run the D24/RGB96 repack shaders or the bindless preparation used by graphics and compute queues.
+        if (info.copy_family < family_count &&
+            !(families[info.copy_family].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)))
+            state_.context->set_transfer_only_family(info.copy_family);
 
         if (info.debug_utils) {
             leonida::DebugLabelFunctions labels;
