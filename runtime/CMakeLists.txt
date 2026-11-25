@@ -1835,6 +1835,7 @@ if(TARGET Vulkan::Headers)
   add_test(NAME vulkan_device_fault COMMAND vulkan_device_fault_test)
 
   foreach(tool vk_harness vk_ps_sweep vk_texture_test vk_sampler_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
+          vk_rendering_scope_test
           vk_bindless_test vk_image_fuzz vk_descriptor_bench depth24_convert_test vk_predicate_capture_test vk_predicated_copy_test
           vk_xdxr_build_test vk_queue_test vk_sandbox)
     add_executable(${tool} test/${tool}.cpp)
@@ -1921,10 +1922,10 @@ if(TARGET Vulkan::Headers)
     endif()
     add_test(NAME depth24_convert COMMAND depth24_convert_test)
     set_tests_properties(depth24_convert PROPERTIES SKIP_RETURN_CODE 77)
-    # Self-checking Vulkan tests with no shaders or game data; each exits 77 without a Vulkan device (TEST-514).
+    # Self-checking Vulkan tests with synthetic inputs; each exits 77 without a Vulkan device (TEST-514).
     # indirect_clamp is registered next to its own add_executable above, where tests/test_ctest_registration.py
     # can see it.
-    foreach(test vk_command_replay vk_predicated_copy vk_predicate_capture vk_queue)
+    foreach(test vk_command_replay vk_rendering_scope vk_predicated_copy vk_predicate_capture vk_queue)
       add_test(NAME ${test} COMMAND ${test}_test)
       set_tests_properties(${test} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
@@ -4341,6 +4342,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_cpu_bench PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_cpu_bench_selftest COMMAND replay_cpu_bench --self-test)
+    # Compatible direct draws share rendering; all non-draw/helper/query boundaries close it (no GPU or game data).
+    add_executable(replay_rendering_scope_test test/replay_rendering_scope_test.cpp)
+    target_link_libraries(replay_rendering_scope_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_rendering_scope_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_rendering_scope COMMAND replay_rendering_scope_test)
     add_test(NAME vk_descriptor_bench_selftest COMMAND vk_descriptor_bench --self-test)
     # mods.h: mod.json manifests and archetype swaps (docs/modding.md)
     add_executable(mods_test test/mods_test.cpp)
