@@ -82,8 +82,17 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(status, "match", detail)
 
     def test_undefined_spirv_is_its_own_class(self):
-        vals = [0] + [0] * 8                                 # v_rcp_f32 of +0: hardware +inf, OpFDiv by zero
-        status, _ = ff.check("v_rcp_f32", vals, [(0, {})], False, [])
+        # v_rcp_f32 of +0 used to be the example (hardware +inf, OpFDiv by zero); the translator now models RDNA2's
+        # special results (SHADER-F32-SPECIAL-RESULTS), so it matches.
+        vals = [0] + [0] * 8
+        status, detail = ff.check("v_rcp_f32", vals, [(0, {})], False, [])
+        self.assertEqual(status, "match", detail)
+        # No f32 op this fuzzer generates is left undefined for these operands now, so the class is checked through
+        # the interpreter error that reports undefined SPIR-V: it is its own class, not a skip.
+        from unittest import mock
+        with mock.patch.object(ff, "run_fragment",
+                               side_effect=RuntimeError("OpFDiv by zero (undefined in SPIR-V)")):
+            status, _ = ff.check("v_rcp_f32", [ff.bits(4.0)] + [0] * 8, [(0, {})], False, [])
         self.assertEqual(status, "undefined")
 
     def test_denormal_operand_is_skipped(self):

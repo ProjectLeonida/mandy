@@ -37,6 +37,19 @@ class RcpIflagModsTest(unittest.TestCase):
         value, fdiv_expr = fdiv_matches[0]
         src = fdiv_expr.split()[-1]
 
+        # SHADER-F32-SPECIAL-RESULTS (Gen.f32_special_results): a +-0 operand reaches OpFDiv as 1.0, and the
+        # reciprocal of it is selected as +-inf afterwards. Step over both selects to the modifier chain.
+        m = re.match(r"^OpSelect %float (%\w+) %f1 (%\w+)$", defs[src])
+        self.assertIsNotNone(m, f"Expected the special-operand select before OpFDiv, got {defs[src]}")
+        special, src = m.group(1), m.group(2)
+        rb = re.search(rf"^ *(%\w+) = OpBitcast %uint {value}$", spv, re.M)
+        self.assertIsNotNone(rb, "Missing the bitcast of the OpFDiv result")
+        out = re.search(rf"^ *(%\w+) = OpSelect %uint {special} %\w+ {rb.group(1)}$", spv, re.M)
+        self.assertIsNotNone(out, "Missing the special-result select after OpFDiv")
+        vf = re.search(rf"^ *(%\w+) = OpBitcast %float {out.group(1)}$", spv, re.M)
+        self.assertIsNotNone(vf, "Missing the bitcast of the selected result")
+        value = vf.group(1)
+
         # Verify source modifier chain feeding OpFDiv.
         if neg or abs_:
             # The modified float, as the id itself: a bitcast to uint and back is the original id (Gen.tof/tou).
@@ -81,7 +94,11 @@ class RcpIflagModsTest(unittest.TestCase):
         else:
             self.assertNotIn("FClamp", spv)
 
-        word = match_result(rf"OpBitcast %uint {value}")
+        if value == vf.group(1):
+            # No output modifier: the stored word is the selected %uint itself (Gen.tou of a Gen.tof result).
+            word = out.group(1)
+        else:
+            word = match_result(rf"OpBitcast %uint {value}")
         dest = match_result(r"OpAccessChain %_ptr_Function_uint %vgpr %c0")
         if not re.search(rf"(?m)^ *OpStore {re.escape(dest)} {re.escape(word)}$", spv):
             old_word = match_result(rf"OpLoad %uint {dest}")
