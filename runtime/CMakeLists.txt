@@ -1822,6 +1822,12 @@ if(TARGET Vulkan::Headers)
              "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/vk_pipeline_check_cli_input"
              "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_pipeline_cli.cmake")
+    if(Python3_FOUND AND NOT CMAKE_CROSSCOMPILING)
+      add_test(NAME vk_pipeline_check_mesh_compute COMMAND "${Python3_EXECUTABLE}" -I
+               "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_pipeline_mesh_compute.py"
+               --ctest --exe "$<TARGET_FILE:vk_pipeline_check>")
+      set_tests_properties(vk_pipeline_check_mesh_compute PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
     add_test(NAME vk_texture_cube_alpha COMMAND vk_texture_test --self-test-cube-alpha)
     if(WIN32)
       # Reads SizeOfStackReserve from the built file; the program is not run, so it needs no emulator.
