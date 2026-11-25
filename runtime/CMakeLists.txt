@@ -3718,6 +3718,17 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_stub_pipelines COMMAND d3d12_stub_pipelines_test)
       set_tests_properties(d3d12_stub_pipelines PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
       set_tests_properties(d3d12_draw d3d12_title_index_window d3d12_title_vertex_window PROPERTIES SKIP_RETURN_CODE 77)
+      # LEONIDA_PRESENT_PROBE and LEONIDA_CAPTURE_SOURCE (src/present_probe.h): the same clear, draws and PresentX
+      # calls with both unset (no probe line, no source capture) and with both set (--on: every line and the files).
+      add_executable(present_probe_test test/present_probe_test.cpp ${LEONIDA_TEST_VS_FULLSCREEN} ${LEONIDA_TEST_PS})
+      target_link_libraries(present_probe_test PRIVATE gta6rt_d3d12_com user32)
+      target_compile_definitions(present_probe_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}"
+                                 LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      target_compile_options(present_probe_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME present_probe_off COMMAND present_probe_test)
+      add_test(NAME present_probe_on COMMAND present_probe_test --on)
+      set_tests_properties(present_probe_off present_probe_on PROPERTIES SKIP_RETURN_CODE 77)
       # Graphics & compute PSO descriptor validation parity against live Windows D3D12 (WARP and HW).
       add_executable(d3d12_pso_validation_test test/d3d12_pso_validation_test.cpp ${LEONIDA_TEST_VS}
                      ${LEONIDA_TEST_PS} ${LEONIDA_TEST_PS_UINT} ${LEONIDA_TEST_VS_FULLSCREEN} ${LEONIDA_TEST_CS})

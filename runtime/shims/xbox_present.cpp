@@ -1,5 +1,6 @@
 #include <atomic>
 #include "xbox_present.h"
+#include "../src/present_probe.h"
 
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
@@ -154,7 +155,7 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
 // LOCAL DIAGNOSTIC (LEONIDA_LOCAL_DIAGNOSTICS=1): which check refuses PresentX, with its HRESULT.
 static HRESULT present_diag(int line, HRESULT hr) {
     static std::atomic<int> logged{0};
-    if (FAILED(hr) && leonida::local_diagnostics() && logged.fetch_add(1) < 40)
+    if (FAILED(hr) && leonida::present_probe::enabled() && logged.fetch_add(1) < 40)
         std::fprintf(stderr, "[rt] PresentX diag: refused at line %d hr 0x%08lx\n", line, static_cast<unsigned long>(hr));
     return hr;
 }
@@ -162,7 +163,7 @@ static HRESULT present_diag(int line, HRESULT hr) {
 HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlaneParameters* planes,
                                     const XboxPresentParameters* params) {
     std::lock_guard serialise(present_mutex_);
-    if (leonida::local_diagnostics()) {
+    if (leonida::present_probe::enabled()) {
         static std::atomic<int> dumped{0};
         if (dumped.fetch_add(1) < 6) {
             std::fprintf(stderr, "[rt] PresentX diag: planes %u params %p suspended %d registered %d\n", plane_count,
