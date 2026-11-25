@@ -2,6 +2,7 @@
 // touch, as xmem maps the title's physical pages (SEC_RESERVE section views committed by a fault handler): the kernel's
 // write does not fault such a page in, so the read fails with ERROR_NOACCESS unless the committer runs first. No game
 // data.
+#include "test_temp_dir.h"
 #include <windows.h>
 
 #include <cstdint>
@@ -40,7 +41,7 @@ bool commit_view(const void* address, std::size_t bytes) {
 
 int main() {
     wchar_t dir[MAX_PATH], path[MAX_PATH];
-    GetTempPathW(MAX_PATH, dir);
+    wcscpy_s(dir, testfiles::temp_dir().c_str());
     GetTempFileNameW(dir, L"kwt", 0, path);
     std::vector<std::uint8_t> bytes(kFileBytes);
     for (DWORD i = 0; i < kFileBytes; ++i) bytes[i] = static_cast<std::uint8_t>(i * 7 + (i >> 9));

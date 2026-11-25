@@ -1,5 +1,6 @@
 // LEONIDA_SKIP_INT3 (shims/startup_trace.h): with the variable set and a trace open, an int3 is logged once per
 // address and stepped over, so execution continues. A separate executable because the variable is read once.
+#include "test_temp_dir.h"
 #include <windows.h>
 
 #include <cstdio>
@@ -40,7 +41,7 @@ __declspec(noinline) void site_b(int& reached) {
 int main() {
     SetEnvironmentVariableW(L"LEONIDA_SKIP_INT3", L"1");  // before the first exception: the flag is read once
     wchar_t temp[MAX_PATH];
-    GetTempPathW(MAX_PATH, temp);
+    wcscpy_s(temp, testfiles::temp_dir().c_str());
     const std::wstring path = std::wstring(temp) + L"int3_skip_test_" + std::to_wstring(GetCurrentProcessId()) + L".jsonl";
     DeleteFileW(path.c_str());
     check(rt::startup_trace::open(path.c_str()), "open the startup trace file");

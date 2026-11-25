@@ -16,6 +16,7 @@
 //     yet, so its list closes.
 // The shaders are GLSL written to the translator's contract (test/glsl/ms_draw.mesh, ps_draw.frag, vs_fullscreen.vert).
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -124,7 +125,7 @@ int main(int argc, char** argv) {
     ms_container[36 + 8 + 2] = 13;  // DXIL mesh shader kind
     ms_old_container[36 + 8 + 2] = 13;
     const auto vs_container = shader_container(vs_program);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_mesh_test";
+    const auto library = testfiles::temp_dir() / "leonida_mesh_test";
     std::filesystem::create_directories(library);
     std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_old.spv", std::filesystem::copy_options::overwrite_existing);
