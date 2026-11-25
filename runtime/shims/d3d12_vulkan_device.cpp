@@ -2389,7 +2389,7 @@ struct DeviceState {
         if (!context || !geometry.has_pending_reclaim()) return;
         const std::uint64_t retire_ticket = context->submitted_retire_ticket();
         const std::uint64_t completed_ticket =
-            geometry.has_retired() || leonida::geometry_writes::has_released() ? context->completed_retire_ticket() : 0;
+            geometry.has_retired() || geometry.has_released() ? context->completed_retire_ticket() : 0;
         geometry.drain_released(*this, retire_ticket, completed_ticket, forget_geometry_alias);
     }
     static rt::d3d12::GeometryCopy copy_geometry(std::uint8_t* to, const std::uint8_t* from, std::size_t size) {

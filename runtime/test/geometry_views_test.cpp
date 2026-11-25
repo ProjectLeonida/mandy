@@ -11,7 +11,8 @@
 //   8. note_released ignores ranges outside the watched tile bounds and queues ranges inside them;
 //   9. overflowing the release queue (65537 disjoint ranges) collapses to one covering range and retires covered views;
 //  10. reaping the last view in a standard 4 MiB block keeps it as a spare and the next view reuses it;
-//  11. under a cap, an unfitting 4 MiB spare is destroyed so a larger request can succeed (or fail if still over cap).
+//  11. under a cap, an unfitting 4 MiB spare is destroyed so a larger request can succeed (or fail if still over cap);
+//  12. one note_released reaches every GeometryViews instance, and a destroyed instance unsubscribes cleanly.
 #include <windows.h>
 
 #include <cstdint>
@@ -243,9 +244,9 @@ int main() {
     // 7. Release B and C via the xmem notification bridge (geometry_writes::note_released + drain_released):
     // once their GPU ticket completes, the block becomes empty and its Vulkan buffer and memory are destroyed.
     leonida::geometry_writes::note_released(range_b, range_c + kView);
-    check(leonida::geometry_writes::has_released(), "note_released queues released title ranges");
+    check(capped.has_released(), "note_released queues released title ranges");
     capped.drain_released(device, 6, 5);
-    check(!leonida::geometry_writes::has_released() && capped.live_views() == 0 && capped.retired_count() == 2 &&
+    check(!capped.has_released() && capped.live_views() == 0 && capped.retired_count() == 2 &&
               g_live_buffers == 1 && g_live_allocs == 1,
           "drain_released retires B and C at ticket 6 and defers freeing while completed ticket is 5");
     check(capped.reap(device, 6) == 2 && capped.retired_count() == 0 && capped.bytes() == 0 &&
@@ -280,13 +281,13 @@ int main() {
     check(watched_lo <= pbase && watched_hi >= pbase + 2 * kView, "watched bounds cover resolved views");
     leonida::geometry_writes::note_released(watched_lo - 4096, watched_lo);
     leonida::geometry_writes::note_released(watched_hi, watched_hi + 4096);
-    check(!leonida::geometry_writes::has_released(), "note_released outside watched bounds is not queued");
+    check(!watched.has_released(), "note_released outside watched bounds is not queued");
     leonida::geometry_writes::note_released(pbase, pbase + 4096);
-    check(leonida::geometry_writes::has_released(), "note_released inside watched bounds is queued");
+    check(watched.has_released(), "note_released inside watched bounds is queued");
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> drained;
-    leonida::geometry_writes::take_released(drained);
+    leonida::geometry_writes::take_released(watched.release_queue(), drained);
     check(drained.size() == 1 && drained[0].first == pbase && drained[0].second == pbase + 4096 &&
-              !leonida::geometry_writes::has_released(),
+              !watched.has_released(),
           "take_released returns the queued in-bounds range");
     // A GPU-only twin freed by its own address lies outside the watched (CPU) bounds but still counts: its CPU view
     // holds the views. Only the address arithmetic of the pair is used; nothing is mapped at the GPU address.
@@ -294,9 +295,9 @@ int main() {
     leonida::title_gpu_views::note_reservation(pbase, 2 * kView, false);
     check(leonida::title_gpu_views::note_reservation(gpu_twin, 2 * kView, true), "the GPU-only twin pairs");
     leonida::geometry_writes::note_released(gpu_twin + 2 * kView, gpu_twin + 2 * kView + 4096);
-    check(!leonida::geometry_writes::has_released(), "a range past the twin is not queued");
+    check(!watched.has_released(), "a range past the twin is not queued");
     leonida::geometry_writes::note_released(gpu_twin + kView, gpu_twin + kView + 4096);
-    check(leonida::geometry_writes::has_released(), "a range of the GPU-only twin over a watched view is queued");
+    check(watched.has_released(), "a range of the GPU-only twin over a watched view is queued");
     watched.drain_released(device, 3, 0);
     check(watched.live_views() == 1 && watched.retired_count() == 1 && watched.find(pbase + kView, kView) == 0 &&
               watched.find(pbase, kView) == va_w1,
@@ -308,14 +309,14 @@ int main() {
     constexpr std::size_t kOverflowCount = 65537;
     for (std::size_t i = 0; i < kOverflowCount; ++i)
         leonida::geometry_writes::note_released(pbase + i * 16, pbase + i * 16 + 8);
-    leonida::geometry_writes::take_released(drained);
+    leonida::geometry_writes::take_released(watched.release_queue(), drained);
     check(drained.size() == 1 && drained[0].first == pbase &&
-              drained[0].second == pbase + (kOverflowCount - 1) * 16 + 8 && !leonida::geometry_writes::has_released(),
+              drained[0].second == pbase + (kOverflowCount - 1) * 16 + 8 && !watched.has_released(),
           "65537 disjoint ranges collapse into a single covering range");
     for (std::size_t i = 0; i < kOverflowCount; ++i)
         leonida::geometry_writes::note_released(pbase + i * 16, pbase + i * 16 + 8);
     watched.drain_released(device, 10, 9);
-    check(!leonida::geometry_writes::has_released() && watched.live_views() == 0 && watched.retired_count() == 2,
+    check(!watched.has_released() && watched.live_views() == 0 && watched.retired_count() == 2,
           "drain_released after overflow retires every view inside the collapsed range");
     watched.release(device);
     check(g_live_buffers == 0 && g_live_allocs == 0, "watched teardown frees its block");
@@ -369,6 +370,58 @@ int main() {
     check(g_live_buffers == 0 && g_live_allocs == 0, "tight cap teardown frees all blocks");
 
     VirtualFree(pool_title, 0, MEM_RELEASE);
+
+    // 12. Two GeometryViews instances over the same title extent both receive one note_released; a destroyed instance
+    // unsubscribes so later releases do not touch it and surviving instances still receive them.
+    auto* shared_title =
+        static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 2 * kView, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!shared_title) return 1;
+    for (std::size_t i = 0; i < 2 * kView; ++i) shared_title[i] = std::uint8_t((i * 29) ^ 0xa5);
+    const auto shbase = reinterpret_cast<std::uintptr_t>(shared_title);
+
+    {
+        rt::d3d12::GeometryViews dev_a(2 * kView);
+        rt::d3d12::GeometryViews dev_b(2 * kView);
+        const std::uint64_t va_a1 = dev_a.resolve(device, shbase, kView, copy);
+        const std::uint64_t va_b1 = dev_b.resolve(device, shbase, kView, copy);
+        check(va_a1 != 0 && va_b1 != 0 && dev_a.live_views() == 1 && dev_b.live_views() == 1 &&
+                  dev_a.bytes() == kView && dev_b.bytes() == kView,
+              "two GeometryViews instances resolve the same title range");
+
+        leonida::geometry_writes::note_released(shbase, shbase + kView);
+        check(dev_a.has_released() && dev_b.has_released(),
+              "one note_released queues the range in both instances");
+
+        dev_a.drain_released(device, 1, 1);
+        check(!dev_a.has_released() && dev_a.live_views() == 0 && dev_a.retired_count() == 0 && dev_a.bytes() == 0 &&
+                  dev_b.has_released() && dev_b.live_views() == 1 && dev_b.bytes() == kView,
+              "draining the first instance retires and reaps its view without emptying the second instance's queue");
+
+        dev_b.drain_released(device, 1, 1);
+        check(!dev_b.has_released() && dev_b.live_views() == 0 && dev_b.retired_count() == 0 && dev_b.bytes() == 0,
+              "draining the second instance also retires and reaps its view");
+
+        const std::uint64_t va_keep = dev_a.resolve(device, shbase + kView, kView, copy);
+        check(va_keep != 0 && dev_a.live_views() == 1 && dev_a.bytes() == kView,
+              "surviving instance resolves a second range");
+        {
+            rt::d3d12::GeometryViews ephemeral(2 * kView);
+            const std::uint64_t va_eph = ephemeral.resolve(device, shbase + kView, kView, copy);
+            check(va_eph != 0 && ephemeral.live_views() == 1, "scoped instance resolves the same range");
+            ephemeral.release(device);
+        }
+        leonida::geometry_writes::note_released(shbase + kView, shbase + 2 * kView);
+        check(dev_a.has_released(), "note_released after another instance is destroyed reaches the surviving instance");
+        dev_a.drain_released(device, 2, 2);
+        check(!dev_a.has_released() && dev_a.live_views() == 0 && dev_a.retired_count() == 0 && dev_a.bytes() == 0,
+              "surviving instance retires and reaps after the destroyed instance unsubscribed");
+
+        dev_a.release(device);
+        dev_b.release(device);
+    }
+    check(g_live_buffers == 0 && g_live_allocs == 0, "multi-instance teardown frees all blocks");
+    VirtualFree(shared_title, 0, MEM_RELEASE);
+
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

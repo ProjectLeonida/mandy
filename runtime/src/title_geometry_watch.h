@@ -16,6 +16,11 @@ struct Cell {
     std::array<DWORD, tile_size / page_size> restore{};
     unsigned refs = 0;
 };
+struct ReleaseQueue {
+    std::mutex mutex;
+    host_heap::vector<std::pair<std::uintptr_t, std::uintptr_t>> ranges;
+    std::atomic<bool> pending{false};
+};
 struct State {
     std::mutex mutex;
     host_heap::map<std::uintptr_t, Cell> cells;
@@ -24,16 +29,31 @@ struct State {
     // Union of every tile passed to acquire(): [watched_lo, watched_hi). Monotonic; updated under mutex.
     std::atomic<std::uintptr_t> watched_lo{UINTPTR_MAX};
     std::atomic<std::uintptr_t> watched_hi{0};
-    std::mutex released_mutex;
-    host_heap::vector<std::pair<std::uintptr_t, std::uintptr_t>> released;
-    std::atomic<bool> has_released{false};
+    std::mutex subscribers_mutex;
+    host_heap::vector<ReleaseQueue*> subscribers;
 };
 inline State& state() { static State s; return s; }
 
-inline bool has_released() { return state().has_released.load(std::memory_order_acquire); }
+inline void subscribe(ReleaseQueue& queue) {
+    auto& s = state();
+    std::lock_guard lock(s.subscribers_mutex);
+    if (std::find(s.subscribers.begin(), s.subscribers.end(), &queue) == s.subscribers.end())
+        s.subscribers.push_back(&queue);
+}
 
-// Records a title address range [begin, end) that was released or unmapped so GeometryViews can evict its views.
-// Uses host_heap and a separate leaf lock so xmem can call it without contending with the write-fault handler.
+inline void unsubscribe(ReleaseQueue& queue) {
+    auto& s = state();
+    std::lock_guard lock(s.subscribers_mutex);
+    std::erase(s.subscribers, &queue);
+}
+
+inline bool has_released(const ReleaseQueue& queue) {
+    return queue.pending.load(std::memory_order_acquire);
+}
+
+// Records a title address range [begin, end) that was released or unmapped so every subscribed GeometryViews can
+// evict its views. Uses host_heap and separate leaf locks so xmem does not contend with the write-fault handler.
+// Lock order: subscribers_mutex -> queue.mutex; take_released takes only queue.mutex.
 inline void note_released(std::uintptr_t begin, std::uintptr_t end) {
     auto& s = state();
     if (end <= begin || !s.count.load(std::memory_order_acquire)) return;
@@ -49,31 +69,33 @@ inline void note_released(std::uintptr_t begin, std::uintptr_t end) {
         const std::uintptr_t span = (std::min)(end - begin, pair.size - (begin - pair.gpu));
         if (cpu + span <= lo || cpu >= hi) return;
     }
-    std::lock_guard lock(s.released_mutex);
-    if (s.released.size() < 65536) {
-        s.released.emplace_back(begin, end);
-    } else {
-        std::uintptr_t merged_lo = begin;
-        std::uintptr_t merged_hi = end;
-        for (const auto& [r_lo, r_hi] : s.released) {
-            if (r_lo < merged_lo) merged_lo = r_lo;
-            if (r_hi > merged_hi) merged_hi = r_hi;
+    std::lock_guard subscribers_lock(s.subscribers_mutex);
+    for (ReleaseQueue* q : s.subscribers) {
+        std::lock_guard lock(q->mutex);
+        if (q->ranges.size() < 65536) {
+            q->ranges.emplace_back(begin, end);
+        } else {
+            std::uintptr_t merged_lo = begin;
+            std::uintptr_t merged_hi = end;
+            for (const auto& [r_lo, r_hi] : q->ranges) {
+                if (r_lo < merged_lo) merged_lo = r_lo;
+                if (r_hi > merged_hi) merged_hi = r_hi;
+            }
+            q->ranges.clear();
+            q->ranges.emplace_back(merged_lo, merged_hi);
         }
-        s.released.clear();
-        s.released.emplace_back(merged_lo, merged_hi);
+        q->pending.store(true, std::memory_order_release);
     }
-    s.has_released.store(true, std::memory_order_release);
 }
 
 template<class Out>
-inline void take_released(Out& out) {
+inline void take_released(ReleaseQueue& queue, Out& out) {
     out.clear();
-    auto& s = state();
-    if (!s.has_released.load(std::memory_order_acquire)) return;
-    std::lock_guard lock(s.released_mutex);
-    out.assign(s.released.begin(), s.released.end());
-    s.released.clear();
-    s.has_released.store(false, std::memory_order_release);
+    if (!queue.pending.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(queue.mutex);
+    out.assign(queue.ranges.begin(), queue.ranges.end());
+    queue.ranges.clear();
+    queue.pending.store(false, std::memory_order_release);
 }
 
 inline Cell* acquire(std::uintptr_t va) {

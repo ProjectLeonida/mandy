@@ -108,6 +108,7 @@ class GeometryViews {
     std::map<Address, Tile> tiles_;
     std::vector<Retired> retired_;
     std::atomic<std::size_t> retired_count_{0};
+    leonida::geometry_writes::ReleaseQueue releases_;
     std::atomic<std::uint64_t> free_generation_{0};
     std::uint64_t serial_{}, bytes_{}, cap_refusals_{}, allocation_failures_{}, ready_{}, uploads_{}, uploaded_{};
     std::uint64_t submissions_{}, dirty_refreshes_{}, refilled_{}, tile_fills_{};
@@ -202,7 +203,14 @@ class GeometryViews {
     }
 
 public:
-    explicit GeometryViews(std::uint64_t cap_override = 0) : cap_override_(cap_override) {}
+    explicit GeometryViews(std::uint64_t cap_override = 0) : cap_override_(cap_override) {
+        leonida::geometry_writes::subscribe(releases_);
+    }
+    ~GeometryViews() { leonida::geometry_writes::unsubscribe(releases_); }
+    GeometryViews(const GeometryViews&) = delete;
+    GeometryViews& operator=(const GeometryViews&) = delete;
+    GeometryViews(GeometryViews&&) = delete;
+    GeometryViews& operator=(GeometryViews&&) = delete;
 
     static std::uint64_t cap() {
         static const std::uint64_t value = []() -> std::uint64_t {
@@ -214,10 +222,10 @@ public:
 
     std::uint64_t effective_cap() const { return cap_override_ ? cap_override_ : cap(); }
 
+    bool has_released() const { return leonida::geometry_writes::has_released(releases_); }
     bool has_retired() const { return retired_count_.load(std::memory_order_acquire) != 0; }
-    bool has_pending_reclaim() const {
-        return leonida::geometry_writes::has_released() || has_retired();
-    }
+    bool has_pending_reclaim() const { return has_released() || has_retired(); }
+    leonida::geometry_writes::ReleaseQueue& release_queue() { return releases_; }
 
     std::uint64_t bytes() const {
         std::lock_guard lock(mutex_);
@@ -435,7 +443,7 @@ public:
     void drain_released(Device& device, std::uint64_t retire_ticket, std::uint64_t completed_ticket,
                         OnRetire&& on_retire = {}) {
         std::vector<std::pair<Address, Address>> ranges;
-        leonida::geometry_writes::take_released(ranges);
+        leonida::geometry_writes::take_released(releases_, ranges);
         for (const auto& [begin, end] : ranges) {
             retire_range(begin, end, retire_ticket, on_retire);
             leonida::title_gpu_views::Range pair{};
