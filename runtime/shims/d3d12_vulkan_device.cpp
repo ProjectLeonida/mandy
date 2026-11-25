@@ -1420,30 +1420,32 @@ bool startup_cache_checkpoints_enabled() {
 }
 
 // Writes the session cache at a startup checkpoint or during device teardown. The size cap applies to either write.
-void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache,
-                                 bool checkpoint = false) {
-    if (!cache || !vk.vkGetPipelineCacheData) return;
+leonida::pipeline_cache_store::CheckpointOutcome save_session_pipeline_cache(
+    const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache, bool checkpoint = false) {
+    using leonida::pipeline_cache_store::CheckpointOutcome;
+    if (!cache || !vk.vkGetPipelineCacheData) return CheckpointOutcome::skipped;
     auto limit = pipeline_cache_save_limit();
     // The output is an opaque Vulkan blob. A prefix is not an incremental cache.
     if (checkpoint) limit = (std::min)(limit, std::size_t{512} << 20);
-    if (!limit) return;
+    if (!limit) return CheckpointOutcome::skipped;
     const auto start = compile_us();
     std::size_t size = 0;
     if (vk.vkGetPipelineCacheData(device, cache, &size, nullptr) != VK_SUCCESS ||
-        size <= sizeof(VkPipelineCacheHeaderVersionOne)) return;
+        size <= sizeof(VkPipelineCacheHeaderVersionOne))
+        return CheckpointOutcome::skipped;
     if (size > limit) {
         std::fprintf(stderr, "[rt] d3d12: pipeline cache is %zu bytes, over the %zu-byte write limit\n", size, limit);
-        return;
+        return CheckpointOutcome::skipped;
     }
     const auto queried = compile_us();
-    // A size query can itself serialize the driver cache. Let newly queued work run first.
-    if (checkpoint && PipelineCompiler::instance().has_compile_waiter()) return;
+    // Yield only if a priority-0 awaited draw/dispatch build arrived while querying cache size.
+    if (checkpoint && PipelineCompiler::instance().has_compile_waiter()) return CheckpointOutcome::deferred;
     const auto path = pipeline_cache_session_path();
-    if (path.empty()) return;
+    if (path.empty()) return CheckpointOutcome::skipped;
     CacheStagingFile staging(path, size);
     if (!staging.data) {
         std::fprintf(stderr, "[rt] d3d12: could not map staging file for %zu pipeline cache bytes\n", size);
-        return;
+        return CheckpointOutcome::skipped;
     }
     auto written = size;
     const auto result = vk.vkGetPipelineCacheData(device, cache, &written, staging.data);
@@ -1456,6 +1458,7 @@ void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDev
                      compile_us()-filled, int(ok), int(result));
     if (ok) std::fprintf(stderr, "[rt] d3d12: wrote %zu bytes to pipeline_cache.session.bin\n", written);
     else std::fprintf(stderr, "[rt] d3d12: pipeline cache snapshot incomplete (%d); previous session retained\n", int(result));
+    return ok ? CheckpointOutcome::saved : CheckpointOutcome::skipped;
 }
 
 // A shader whose subgroup size cannot be had runs at the device's: inexact if it crosses the halves of a wave64 (or,
@@ -1961,7 +1964,8 @@ struct DeviceState {
     leonida::cached_pso::Identity pso_identity;  // what GetCachedBlob records and CachedPSO is checked against
     std::once_flag pipeline_cache_once;
     VkPipelineCache pipeline_cache_handle = VK_NULL_HANDLE;
-    std::atomic<ULONGLONG> next_checkpoint{GetTickCount64() + 120000};
+    leonida::pipeline_cache_store::CheckpointSchedule checkpoint_schedule{
+        GetTickCount64() + leonida::pipeline_cache_store::default_checkpoint_interval_ms};
     std::atomic<unsigned> active_compiles{0};
 
     VkPipelineCache pipeline_cache() {
@@ -9079,7 +9083,7 @@ private:
     // failure is logged and not retried.
     VkPipeline build_compute(const char* trigger) {
         CompileActivity activity(device_.active_compiles);
-        std::lock_guard lock(variants_mutex_);
+        std::unique_lock lock(variants_mutex_);
         if (pipeline_.pipeline || compute_failed_) return pipeline_.pipeline;
         compute_failed_ = true;  // until the pipeline exists
         auto& vk = device_.context->vk;
@@ -9134,9 +9138,11 @@ private:
         if (took >= 2000)
             std::fprintf(stderr, "[rt] d3d12: compute pipeline %s took %.1f s to build (%zu B SPIR-V)\n",
                          entry->name.c_str(), double(took) / 1000.0, bytes);
-        maybe_checkpoint(cache);
         pipeline_.pipeline = built;
         compute_failed_ = false;
+        lock.unlock();
+        activity.finish();
+        maybe_checkpoint(cache);
         return built;
     }
 
@@ -9147,24 +9153,29 @@ private:
     // The startup cache checkpoint is the device's job, not this PSO's: ~Device cancels it before the cache goes.
     void maybe_checkpoint(VkPipelineCache cache) {
         if (!cache || !startup_cache_checkpoints_enabled()) return;
-        auto now = GetTickCount64();
-        auto next = device_.next_checkpoint.load();
-        if (now < next || !device_.next_checkpoint.compare_exchange_strong(next, ULLONG_MAX)) return;
+        using leonida::pipeline_cache_store::CheckpointOutcome;
+        const auto now = GetTickCount64();
+        if (!device_.checkpoint_schedule.try_claim(now)) return;
         DeviceState* const state = &device_;
         bool queued = false;
         try {
-            queued = PipelineCompiler::instance().submit(state, state, SIZE_MAX, [state, cache] {
-                try {
-                    if (!state->active_compiles.load() && !PipelineCompiler::instance().has_compile_waiter())
-                        save_session_pipeline_cache(state->context->vk, state->info.device, cache, true);
-                } catch (const std::exception& e) {
-                    std::fprintf(stderr, "[rt] pipeline cache checkpoint failed: %s\n", e.what());
-                }
-                state->next_checkpoint.store(GetTickCount64() + 120000);
-            });
+            queued = PipelineCompiler::instance().submit(
+                state, state, leonida::pipeline_cache_store::checkpoint_priority, [state, cache] {
+                    CheckpointOutcome outcome = CheckpointOutcome::deferred;
+                    try {
+                        if (!PipelineCompiler::instance().has_compile_waiter()) {
+                            outcome = save_session_pipeline_cache(state->context->vk, state->info.device, cache, true);
+                        }
+                    } catch (const std::exception& e) {
+                        outcome = CheckpointOutcome::skipped;
+                        std::fprintf(stderr, "[rt] pipeline cache checkpoint failed: %s\n", e.what());
+                    }
+                    state->checkpoint_schedule.complete(GetTickCount64(), outcome);
+                });
         } catch (...) {
         }
-        if (!queued) device_.next_checkpoint.store(now + 120000);  // refused after an exit stop, or out of memory
+        // Refused after an exit stop, or out of memory.
+        if (!queued) device_.checkpoint_schedule.complete(now, CheckpointOutcome::skipped);
     }
 
     VkPipeline queue_build(bool compute, std::uint32_t unbound, std::size_t warm_bytes = 0) {
@@ -9439,6 +9450,7 @@ private:
             pipeline = VK_NULL_HANDLE;
         }
         drop_modules();
+        activity.finish();
         if (pipeline) maybe_checkpoint(cache);
         return pipeline;
     }

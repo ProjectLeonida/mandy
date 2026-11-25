@@ -138,9 +138,11 @@ public:
         return closed_;
     }
 
+    // Priority 0 is an awaited first-use draw/dispatch build; priority 1 is a cache checkpoint; higher priorities are
+    // speculative compute warm-up builds (keyed by SPIR-V byte size). Only priority-0 waiters preempt a checkpoint.
     bool has_compile_waiter() {
         std::lock_guard lock(mutex_);
-        return !jobs_.empty() && jobs_.begin()->first != SIZE_MAX;
+        return !jobs_.empty() && jobs_.begin()->first == 0;
     }
     // Returns when no job is queued or running. A job owns its pipeline state, and through it the device, until it
     // finishes; a caller that counts references (rt::d3d12_xs::device_proxy_ref_count) waits here first.

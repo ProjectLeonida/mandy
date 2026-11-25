@@ -2363,8 +2363,9 @@ Pipeline creation:
   compute programs and drops their dispatches, direct and indirect; the first dropped dispatch of each is logged.
   It is a way past a program that hangs the GPU while the program or its input is fixed, not a fix.
   `LEONIDA_STARTUP_CACHE_CHECKPOINTS=1` also schedules a snapshot after a successful pipeline build,
-  at most once per 120 seconds. It starts on the compile worker when queued builds have drained and the device
-  has no active builds. These snapshots have an additional 512 MiB ceiling. The driver fills a mapped staging
+  starting 30 seconds after device creation and at most once per 30 seconds after a save. It queues on the
+  compile worker at priority 1 (behind priority-0 awaited first-use builds and ahead of speculative warm-up),
+  yielding only when a priority-0 build is queued (retrying after 5 seconds). These snapshots have an additional 512 MiB ceiling. The driver fills a mapped staging
   file directly. A successful snapshot atomically replaces the session. An interrupted write preserves the
   previous cache; the next launch removes unheld staging files older than ten minutes.
   `LEONIDA_TRACE_PIPELINE_COMPILE=1` records each graphics and compute build's trigger, thread, elapsed time,

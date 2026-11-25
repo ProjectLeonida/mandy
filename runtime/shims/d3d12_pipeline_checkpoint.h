@@ -12,8 +12,19 @@
 namespace rt::d3d12 {
 struct CompileActivity {
     std::atomic<unsigned>& count;
-    explicit CompileActivity(std::atomic<unsigned>& active) : count(active) { ++count; }
-    ~CompileActivity() { --count; }
+    bool active = true;
+    explicit CompileActivity(std::atomic<unsigned>& c) : count(c) {
+        count.fetch_add(1, std::memory_order_acq_rel);
+    }
+    void finish() {
+        if (active) {
+            count.fetch_sub(1, std::memory_order_acq_rel);
+            active = false;
+        }
+    }
+    ~CompileActivity() { finish(); }
+    CompileActivity(const CompileActivity&) = delete;
+    CompileActivity& operator=(const CompileActivity&) = delete;
 };
 
 inline bool direct_session_cache() {

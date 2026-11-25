@@ -14,6 +14,7 @@
 // part of Vulkan's ABI, not something a driver chooses.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -65,5 +66,61 @@ inline bool header_matches(const void* data, std::size_t size, const cached_pso:
            read_u32(bytes + 8) == identity.vendor && read_u32(bytes + 12) == identity.device &&
            std::memcmp(bytes + 16, identity.cache_uuid, sizeof(identity.cache_uuid)) == 0;
 }
+
+inline constexpr std::uint64_t default_checkpoint_interval_ms = 30000;
+inline constexpr std::uint64_t default_checkpoint_retry_ms = 5000;
+inline constexpr std::size_t checkpoint_priority = 1;  // behind priority-0 awaited builds, ahead of warm-up (SPIR-V bytes)
+
+enum class CheckpointOutcome : std::uint8_t {
+    saved,     // snapshot written; wait interval_ms before the next checkpoint
+    deferred,  // yielded to a priority-0 awaited build; retry after retry_ms
+    skipped,   // empty cache, over size cap, or I/O failure; wait interval_ms before retrying
+};
+
+// Coalesces startup pipeline-cache checkpoint scheduling across compiling threads.
+// At most one checkpoint runs at a time; a deferred checkpoint backs off briefly (retry_ms) instead of burning the
+// full cooldown interval.
+class CheckpointSchedule {
+public:
+    explicit CheckpointSchedule(std::uint64_t initial_due_ms,
+                                std::uint64_t interval_ms = default_checkpoint_interval_ms,
+                                std::uint64_t retry_ms = default_checkpoint_retry_ms)
+        : next_due_ms_(clamp_due(initial_due_ms)), interval_ms_(interval_ms), retry_ms_(retry_ms) {}
+
+    bool try_claim(std::uint64_t now_ms) {
+        std::uint64_t expected = next_due_ms_.load(std::memory_order_acquire);
+        while (expected != in_flight && now_ms >= expected) {
+            if (next_due_ms_.compare_exchange_weak(expected, in_flight, std::memory_order_acq_rel,
+                                                   std::memory_order_acquire)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void complete(std::uint64_t now_ms, CheckpointOutcome outcome) {
+        const std::uint64_t wait = outcome == CheckpointOutcome::deferred ? retry_ms_ : interval_ms_;
+        next_due_ms_.store(saturate_add(now_ms, wait), std::memory_order_release);
+    }
+
+    void abort_claim(std::uint64_t now_ms) {
+        next_due_ms_.store(saturate_add(now_ms, retry_ms_), std::memory_order_release);
+    }
+
+    std::uint64_t next_due_ms() const { return next_due_ms_.load(std::memory_order_acquire); }
+    bool in_progress() const { return next_due_ms_.load(std::memory_order_acquire) == in_flight; }
+
+private:
+    static constexpr std::uint64_t in_flight = (std::numeric_limits<std::uint64_t>::max)();
+    static constexpr std::uint64_t max_due = in_flight - 1;
+    static std::uint64_t clamp_due(std::uint64_t t) { return t > max_due ? max_due : t; }
+    static std::uint64_t saturate_add(std::uint64_t a, std::uint64_t b) {
+        return a > max_due - b ? max_due : a + b;
+    }
+
+    std::atomic<std::uint64_t> next_due_ms_;
+    std::uint64_t interval_ms_;
+    std::uint64_t retry_ms_;
+};
 
 }  // namespace leonida::pipeline_cache_store
