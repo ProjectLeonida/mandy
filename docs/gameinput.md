@@ -78,10 +78,11 @@ controller-button array (`GetControllerButtonState`, indexed in SDL's `SDL_Gamep
 
 ## Keyboard pad
 
-The title reads gamepads only, so keyboard input has to arrive as a gamepad. The shim attaches one SDL virtual gamepad named `Keyboard pad (Leonida)` and presses its buttons from the keyboard on
-every poll. It then goes through the same path as a real pad: a device object, the next free player slot, readings,
-reading and device callbacks, and UI navigation derived from its buttons. It reports no rumble motors. It is on by
-default in the focused mode, so a player without a pad can still play; `LEONIDA_KEYBOARD_PAD=off` removes it.
+The title reads gamepads only, so keyboard input has to arrive as a gamepad. The shim attaches one SDL virtual
+gamepad named `Keyboard pad (Leonida)` and presses its buttons from the keyboard on every poll. It then goes
+through the same path as a real pad: a device object, the next free player slot, readings, reading and device
+callbacks, and UI navigation derived from its buttons. It reports no rumble motors. It is on by default in the
+focused mode, so a player without a pad can still play; `LEONIDA_KEYBOARD_PAD=off` removes it.
 
 | key | button |
 |---|---|
@@ -124,9 +125,10 @@ moves away or the keyboard pad is turned off. The cursor stays visible: hiding i
 owns the game's window, which is the title's, not the shim's.
 
 Keys are read with `GetAsyncKeyState`, which needs no window or message loop (SDL's keyboard is part of its video
-subsystem, which this build leaves out) and works under Wine. By default (or with `LEONIDA_KEYBOARD_PAD=1`) keys count only
-while a window of this process is in the foreground. Losing focus releases keyboard and mouse input. The cursor is read
-afresh on return so the right stick does not jump. Scripted presses run with or without focus for unattended runs.
+subsystem, which this build leaves out) and works under Wine. By default (or with `LEONIDA_KEYBOARD_PAD=1`), keys
+count only while a window of this process is in the foreground. Losing focus releases keyboard and mouse input.
+The cursor is read afresh on return so the right stick does not jump. Scripted presses run with or without focus
+for unattended runs.
 `LEONIDA_KEYBOARD_PAD=always` reads physical input whatever has focus; a console tool such as
   `gameinput_probe` needs it, because its console window belongs to the terminal, not to the tool.
 - Force feedback and haptics run through a fake haptic backend (`rt::gameinput::set_haptic_source`), because SDL's
