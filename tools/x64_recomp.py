@@ -68,6 +68,8 @@ FLAG_WRITERS = {
     "cmps": "NZCVPA", "scas": "NZCVPA",
     "sahf": "NZCPA", "popf": "NZCVPA",
     "clc": "C", "stc": "C", "cmc": "C",
+    "ucomiss": "NZCVPA", "ucomisd": "NZCVPA",
+    "comiss": "NZCVPA", "comisd": "NZCVPA",
 }
 
 FLAG_READERS = {
@@ -82,6 +84,7 @@ SUB_KIND = {"sub", "cmp", "sbb", "dec", "neg", "cmps", "scas"}
 ADD_KIND = {"add", "adc", "inc", "shl", "sal", "shr", "sar", "rol", "ror",
             "popf", "sahf", "mul", "imul", "clc", "stc", "cmc"}
 LOGIC_KIND = {"and", "or", "xor", "test"}
+FCMP_KIND = {"ucomiss", "ucomisd", "comiss", "comisd"}
 
 _ALU = ("add", "or", "adc", "sbb", "and", "sub", "xor", "cmp")
 _GROUP1 = _ALU
@@ -236,6 +239,8 @@ def _fmt_op(o):
     if o[0] == "r":
         name = REG_NAMES[o[1]] + (".hi8" if len(o) > 3 and o[3] else "")
         return f"{name}/{o[2]}"
+    if o[0] == "x":
+        return f"xmm{o[1]}/{o[2]}"
     if o[0] == "i":
         return f"{o[1]:#x}"
     if o[0] == "a":
@@ -246,6 +251,60 @@ def _fmt_op(o):
         idx = "" if m["index"] is None else "+" + REG_NAMES[m["index"]] + f"*{1 << m['scale']}"
         return f"[{base}{idx}{m['disp']:+x}]/{m['size']}"
     return str(o)
+
+
+# Legacy 0F SSE/SSE2 dispatch keyed by (opcode, mandatory_prefix) where prefix is
+# "f3" / "f2" / "66" / "" (F2/F3 take precedence over 66). MMX forms without 66/F2/F3
+# stay unhandled ("simd") so they are never mis-translated as XMM ops.
+_OF_SSE = {
+    (0x10, ""): ("movups", "Vx Wx"), (0x10, "66"): ("movupd", "Vx Wx"),
+    (0x10, "f3"): ("movss", "Vd Wd"), (0x10, "f2"): ("movsd", "Vq Wq"),
+    (0x11, ""): ("movups", "Wx Vx"), (0x11, "66"): ("movupd", "Wx Vx"),
+    (0x11, "f3"): ("movss", "Wd Vd"), (0x11, "f2"): ("movsd", "Wq Vq"),
+    (0x28, ""): ("movaps", "Vx Wx"), (0x28, "66"): ("movapd", "Vx Wx"),
+    (0x29, ""): ("movaps", "Wx Vx"), (0x29, "66"): ("movapd", "Wx Vx"),
+    (0x2A, "f3"): ("cvtsi2ss", "Vd Ey"), (0x2A, "f2"): ("cvtsi2sd", "Vq Ey"),
+    (0x2C, "f3"): ("cvttss2si", "Gy Wd"), (0x2C, "f2"): ("cvttsd2si", "Gy Wq"),
+    (0x2D, "f3"): ("cvtss2si", "Gy Wd"), (0x2D, "f2"): ("cvtsd2si", "Gy Wq"),
+    (0x2E, ""): ("ucomiss", "Vd Wd"), (0x2E, "66"): ("ucomisd", "Vq Wq"),
+    (0x2F, ""): ("comiss", "Vd Wd"), (0x2F, "66"): ("comisd", "Vq Wq"),
+    (0x51, "f3"): ("sqrtss", "Vd Wd"), (0x51, "f2"): ("sqrtsd", "Vq Wq"),
+    (0x54, ""): ("andps", "Vx Wx"), (0x54, "66"): ("andpd", "Vx Wx"),
+    (0x55, ""): ("andnps", "Vx Wx"), (0x55, "66"): ("andnpd", "Vx Wx"),
+    (0x56, ""): ("orps", "Vx Wx"), (0x56, "66"): ("orpd", "Vx Wx"),
+    (0x57, ""): ("xorps", "Vx Wx"), (0x57, "66"): ("xorpd", "Vx Wx"),
+    (0x58, "f3"): ("addss", "Vd Wd"), (0x58, "f2"): ("addsd", "Vq Wq"),
+    (0x59, "f3"): ("mulss", "Vd Wd"), (0x59, "f2"): ("mulsd", "Vq Wq"),
+    (0x5A, "f3"): ("cvtss2sd", "Vq Wd"), (0x5A, "f2"): ("cvtsd2ss", "Vd Wq"),
+    (0x5C, "f3"): ("subss", "Vd Wd"), (0x5C, "f2"): ("subsd", "Vq Wq"),
+    (0x5D, "f3"): ("minss", "Vd Wd"), (0x5D, "f2"): ("minsd", "Vq Wq"),
+    (0x5E, "f3"): ("divss", "Vd Wd"), (0x5E, "f2"): ("divsd", "Vq Wq"),
+    (0x5F, "f3"): ("maxss", "Vd Wd"), (0x5F, "f2"): ("maxsd", "Vq Wq"),
+    (0x6E, "66"): ("movdq_gpr", "Vy Ey"),
+    (0x6E, ""): ("simd", "V Ey"), (0x6E, "f2"): ("simd", "V Ey"), (0x6E, "f3"): ("simd", "V Ey"),
+    (0x6F, "66"): ("movdqa", "Vx Wx"), (0x6F, "f3"): ("movdqu", "Vx Wx"),
+    (0x7E, "66"): ("movdq_gpr", "Ey Vy"), (0x7E, "f3"): ("movq", "Vq Wq"),
+    (0x7E, ""): ("simd", "Ey V"), (0x7E, "f2"): ("simd", "Ey V"),
+    (0x7F, "66"): ("movdqa", "Wx Vx"), (0x7F, "f3"): ("movdqu", "Wx Vx"),
+    (0xD6, "66"): ("movq", "Wq Vq"),
+    (0xDB, "66"): ("pand", "Vx Wx"), (0xDF, "66"): ("pandn", "Vx Wx"),
+    (0xEB, "66"): ("por", "Vx Wx"), (0xEF, "66"): ("pxor", "Vx Wx"),
+}
+
+_SSE_SCALAR_ARITH = {"addss", "addsd", "subss", "subsd", "mulss", "mulsd", "divss", "divsd"}
+_SSE_SCALAR_MINMAX = {"minss", "minsd", "maxss", "maxsd"}
+_SSE_SCALAR_MOV = {"movss", "movsd", "movd", "movq"}
+_SSE_VEC_MOV = {"movaps", "movups", "movapd", "movupd", "movdqa", "movdqu"}
+_SSE_VEC_BIT = {"xorps", "xorpd", "pxor", "andps", "andpd", "pand",
+                "andnps", "andnpd", "pandn", "orps", "orpd", "por"}
+_SSE_CVT_FP = {"cvtss2sd", "cvtsd2ss"}
+_SSE_CVT_I2F = {"cvtsi2ss", "cvtsi2sd"}
+_SSE_CVT_F2I = {"cvttss2si", "cvttsd2si", "cvtss2si", "cvtsd2si"}
+_SSE_MNEMS = (
+    _SSE_SCALAR_ARITH | _SSE_SCALAR_MINMAX | {"sqrtss", "sqrtsd"} | FCMP_KIND
+    | _SSE_SCALAR_MOV | _SSE_VEC_MOV | _SSE_VEC_BIT
+    | _SSE_CVT_FP | _SSE_CVT_I2F | _SSE_CVT_F2I
+)
 
 
 class DecodeError(Exception):
@@ -259,8 +318,9 @@ def _vsize(opsize, rexw):
 
 
 def _size_of(letter, opsize, rexw):
-    return {"b": 1, "w": 2, "d": 4, "q": 8,
+    return {"b": 1, "w": 2, "d": 4, "q": 8, "x": 16,
             "v": _vsize(opsize, rexw),
+            "y": 8 if rexw else 4,
             "z": 2 if opsize else 4}.get(letter, 0)
 
 
@@ -315,11 +375,11 @@ def _modrm(buf, pos, end, rex_r, rex_x, rex_b, has_rex):
             mem["disp"] = struct.unpack_from("<i", buf, pos)[0]
             pos += 4
 
-    def make(size):
+    def make(size, reg_kind="r"):
         if rm_reg is not None:
-            if size == 1 and not has_rex and 4 <= rm_reg <= 7:
+            if reg_kind == "r" and size == 1 and not has_rex and 4 <= rm_reg <= 7:
                 return ("r", rm_reg - 4, 1, True)
-            return ("r", rm_reg, size)
+            return (reg_kind, rm_reg, size)
         m = dict(mem)
         m["size"] = size
         return ("m", m)
@@ -333,7 +393,7 @@ def _finish(buf, pos, end, ins, start, mnem, opspec, state, addr, opcode_byte):
     rexr, rexx, rexb = state["rexr"], state["rexx"], state["rexb"]
     has_rex, vex = state["has_rex"], state["vex"]
 
-    has_modrm = opspec and any(t[0] in "EGMUW" for t in opspec.split())
+    has_modrm = opspec and any(t[0] in "EGMUVW" for t in opspec.split())
     reg_field, rm_make = 0, None
     if has_modrm:
         reg_field, rm_make, pos, _ = _modrm(buf, pos, end, rexr, rexx, rexb, has_rex)
@@ -345,10 +405,14 @@ def _finish(buf, pos, end, ins, start, mnem, opspec, state, addr, opcode_byte):
             hi8 = s == "b" and not has_rex and 4 <= reg_field <= 7
             ops.append(("r", reg_field - 4 if hi8 else reg_field,
                         _size_of(s, opsize, rexw), hi8))
-        elif t in "EMUW":
+        elif t == "V":
+            ops.append(("x", reg_field, _size_of(s, opsize, rexw) or 16))
+        elif t in "EM":
             ops.append(rm_make(_size_of(s, opsize, rexw)))
+        elif t in "UW":
+            ops.append(rm_make(_size_of(s, opsize, rexw) or 16, "x"))
         elif t == "H":
-            ops.append(("r", vex["vvvv"] if vex else 0, 16))
+            ops.append(("x", vex["vvvv"] if vex else 0, 16))
         elif t == "O":
             r = (opcode_byte & 7) | (rexb << 3)
             hi8 = s == "b" and not has_rex and 4 <= r <= 7
@@ -430,7 +494,7 @@ def _classify(ins, mnem, cc_index, state):
     elif mnem in ("imul", "mul", "div", "idiv"):
         ins.kind = "mul"
         ins.flags_w = FLAG_WRITERS.get(mnem, "")
-    elif mnem in ("mov", "movzx", "movsx", "movsxd", "movnti", "movd"):
+    elif mnem in ("mov", "movzx", "movsx", "movsxd", "movnti"):
         ins.kind = "mov"
     elif mnem == "lea":
         ins.kind = "lea"
@@ -467,15 +531,17 @@ def _classify(ins, mnem, cc_index, state):
     elif mnem in ("cld", "std"):
         ins.kind = "df"
     elif mnem in ("lahf", "sahf"):
-        ins.kind = "conv"
+        ins.kind = "alu"
         if mnem == "sahf":
             ins.flags_w = "NZCPA"
         else:
             ins.flags_r = "NZCPA"
     elif mnem == "x87":
         ins.kind = "x87"
-    elif mnem in ("simd", "sse"):
+    elif mnem in ("simd", "sse") or mnem in _SSE_MNEMS:
         ins.kind = "simd"
+        if mnem in FCMP_KIND:
+            ins.flags_w = FLAG_WRITERS[mnem]
     elif mnem in ("ud1", "ud2", "int3"):
         ins.kind = "trap"
     elif mnem == "leave":
@@ -592,12 +658,17 @@ def decode_one(buf, pos, end, addr):
             pos += 1
             spec = ("simd", "V W Ib")
         else:
-            spec = OF.get(op)
+            pp = rep or ("66" if opsize else "")
+            spec = _OF_SSE.get((op, pp))
+            if spec is None:
+                spec = OF.get(op)
             if spec is None:
                 ins.unknown, ins.mnem = True, f"op0f_{op:02x}"
                 ins.size = pos - start
                 return ins
         mnem, opspec = spec
+        if mnem == "movdq_gpr":
+            mnem = "movq" if rexw else "movd"
     else:
         spec = PRIMARY.get(op)
         if spec is None:
@@ -1144,6 +1215,86 @@ class Asm:
     def rev(self, rd, rn, sf=1):
         self.emit((0xDAC00C00 if sf else 0x5AC00800) | rn << 5 | rd)
 
+    def mrs_cpacr_el1(self, rt):
+        self.emit(0xD5381040 | rt)
+
+    def msr_cpacr_el1(self, rt):
+        self.emit(0xD5181040 | rt)
+
+    def isb(self):
+        self.emit(0xD5033FDF)
+
+    # floating-point / SIMD (scalar S/D and 128-bit Q/16B)
+    def fldr(self, vt, rn, off=0, size=4):
+        base = {4: 0xBD400000, 8: 0xFD400000, 16: 0x3DC00000}[size]
+        assert 0 <= off < 4096 * size and off % size == 0
+        self.emit(base | (off // size) << 10 | rn << 5 | vt)
+
+    def fstr(self, vt, rn, off=0, size=4):
+        base = {4: 0xBD000000, 8: 0xFD000000, 16: 0x3D800000}[size]
+        assert 0 <= off < 4096 * size and off % size == 0
+        self.emit(base | (off // size) << 10 | rn << 5 | vt)
+
+    def fadd(self, vd, vn, vm, dp=0):
+        self.emit((0x1E602800 if dp else 0x1E202800) | vm << 16 | vn << 5 | vd)
+
+    def fsub(self, vd, vn, vm, dp=0):
+        self.emit((0x1E603800 if dp else 0x1E203800) | vm << 16 | vn << 5 | vd)
+
+    def fmul(self, vd, vn, vm, dp=0):
+        self.emit((0x1E600800 if dp else 0x1E200800) | vm << 16 | vn << 5 | vd)
+
+    def fdiv(self, vd, vn, vm, dp=0):
+        self.emit((0x1E601800 if dp else 0x1E201800) | vm << 16 | vn << 5 | vd)
+
+    def fsqrt(self, vd, vn, dp=0):
+        self.emit((0x1E61C000 if dp else 0x1E21C000) | vn << 5 | vd)
+
+    def fcmp(self, vn, vm, dp=0):
+        self.emit((0x1E602000 if dp else 0x1E202000) | vm << 16 | vn << 5)
+
+    def fcsel(self, vd, vn, vm, cond, dp=0):
+        self.emit((0x1E600C00 if dp else 0x1E200C00) | vm << 16 | COND[cond] << 12 | vn << 5 | vd)
+
+    def fmov_r(self, vd, vn, dp=0):
+        self.emit((0x1E604000 if dp else 0x1E204000) | vn << 5 | vd)
+
+    def fmov_to_fp(self, vd, rn, dp=0):
+        self.emit((0x9E670000 if dp else 0x1E270000) | rn << 5 | vd)
+
+    def fmov_to_gpr(self, rd, vn, dp=0):
+        self.emit((0x9E660000 if dp else 0x1E260000) | vn << 5 | rd)
+
+    def fcvt_s2d(self, vd, vn):
+        self.emit(0x1E22C000 | vn << 5 | vd)
+
+    def fcvt_d2s(self, vd, vn):
+        self.emit(0x1E624000 | vn << 5 | vd)
+
+    def scvtf(self, vd, rn, sf=0, dp=0):
+        self.emit(0x1E220000 | (sf << 31) | (dp << 22) | rn << 5 | vd)
+
+    def fcvtzs(self, rd, vn, sf=0, dp=0):
+        self.emit(0x1E380000 | (sf << 31) | (dp << 22) | vn << 5 | rd)
+
+    def fcvtns(self, rd, vn, sf=0, dp=0):
+        self.emit(0x1E200000 | (sf << 31) | (dp << 22) | vn << 5 | rd)
+
+    def vins0(self, vd, vn, dp=0):
+        self.emit((0x6E080400 if dp else 0x6E040400) | vn << 5 | vd)
+
+    def vand16b(self, vd, vn, vm):
+        self.emit(0x4E201C00 | vm << 16 | vn << 5 | vd)
+
+    def vbic16b(self, vd, vn, vm):
+        self.emit(0x4E601C00 | vm << 16 | vn << 5 | vd)
+
+    def vorr16b(self, vd, vn, vm):
+        self.emit(0x4EA01C00 | vm << 16 | vn << 5 | vd)
+
+    def veor16b(self, vd, vn, vm):
+        self.emit(0x6E201C00 | vm << 16 | vn << 5 | vd)
+
 
 # ---------------------------------------------------------------------------
 # guest->host register/flag contract
@@ -1152,6 +1303,9 @@ class Asm:
 # guest reg -> host reg. Scratch: x0-x4, x16(ADDR_T), x17(GTMP), x30(LINK). x28=ctx. x18 free.
 GMAP = {0: 19, 1: 20, 2: 21, 3: 22, 4: 23, 5: 24, 6: 25, 7: 26,
         8: 27, 9: 9, 10: 10, 11: 11, 12: 12, 13: 13, 14: 14, 15: 15}
+# guest xmm0..xmm15 -> host v0..v15; v28..v30 are FP/SIMD scratch.
+XMAP = {i: i for i in range(16)}
+VT0, VT1, VT2 = 28, 29, 30
 CTX_REG = 28
 ADDR_T = 16
 GTMP = 17
@@ -1299,7 +1453,12 @@ class FunctionTranslator:
                                 nearest[f] = w
                     prods = set(nearest.values())
                     if len(prods) == 1 and set(nearest) == need:
-                        self.arm_path[ins.addr] = next(iter(prods))
+                        prod = next(iter(prods))
+                        if prod.mnem in FCMP_KIND and writers[-1] is not prod:
+                            self.arm_path[ins.addr] = None
+                            self.mat.add(prod.addr)
+                        else:
+                            self.arm_path[ins.addr] = prod
                     else:
                         self.arm_path[ins.addr] = None
                         for w in prods:
@@ -1433,6 +1592,17 @@ class FunctionTranslator:
     #   "eq"..  single arm cond, "al" always, None = never taken,
     #   ("or",c1,c2) taken when either holds, ("and",c1,c2) taken when both hold.
     def _arm_cond(self, cc, mnem):
+        if mnem in FCMP_KIND:
+            # arm64 FCMP NZCV: == -> 0110, < -> 1000, > -> 0010, unordered -> 0011.
+            # x86 UCOMIS*: == -> Z=1, < -> C=1, > -> 0, unordered -> Z=P=C=1; O=S=A=0.
+            return {"o": None, "no": "al",
+                    "b": "lt", "ae": "ge",
+                    "e": ("or", "eq", "vs"), "ne": ("and", "ne", "vc"),
+                    "be": "le", "a": "gt",
+                    "s": None, "ns": "al",
+                    "p": "vs", "np": "vc",
+                    "l": None, "ge": "al",
+                    "le": ("or", "eq", "vs"), "g": ("and", "ne", "vc")}[cc]
         if mnem in LOGIC_KIND:
             # C=V=0: o/b never taken, no/ae always; l<->mi, ge<->pl (V=0), be<->Z, a<->!Z
             return {"o": None, "no": "al", "b": None, "ae": "al", "e": "eq", "ne": "ne",
@@ -1471,13 +1641,13 @@ class FunctionTranslator:
         return True
 
     def _emit_jcc(self, ins):
-        a = self.asm
         lbl = self._target_lbl(ins.ops[0][1])
-        if ins.cc in ("p", "np"):
-            self._parity_jcc(ins, lbl)
-            return
         if self._producer_ok(ins):
-            self._cond_branch(self._arm_cond(ins.cc, self.arm_path[ins.addr].mnem), lbl)
+            cond = self._arm_cond(ins.cc, self.arm_path[ins.addr].mnem)
+            if cond == "ctx":
+                self._parity_jcc(ins, lbl)
+            else:
+                self._cond_branch(cond, lbl)
             return
         self._ctx_jcc(ins.cc, lbl)
 
@@ -1506,7 +1676,8 @@ class FunctionTranslator:
             a.bcond(simple[cc][1], lbl)
             return
         if cc in ("be", "a"):
-            a.tst_i(w, EF_CF | EF_ZF, sf=0)
+            a.movz(T1, EF_CF | EF_ZF, 0, sf=0)
+            a.tst_r(w, T1, sf=0)
             a.bcond("ne" if cc == "be" else "eq", lbl)
             return
         if cc in ("l", "ge", "le", "g"):
@@ -1562,7 +1733,16 @@ class FunctionTranslator:
                 a.bfi(T1, T0, 0, 8)                # low byte := ah flag bits
                 a.stur(T1, CTX_REG, CTX_EFLAGS, size=8)
             else:
-                self._mkflags(0)
+                prod = self.arm_path.get(ins.addr)
+                if prod is not None:
+                    if prod.mnem in FCMP_KIND:
+                        self._emit_fcmp_flags()
+                    elif prod.mnem in SUB_KIND:
+                        self._mkflags(1)
+                    elif prod.mnem in LOGIC_KIND:
+                        self._mkflags(2)
+                    else:
+                        self._mkflags(0)
                 a.ldur(T0, CTX_REG, CTX_EFLAGS, size=8)
                 a.bfi(GMAP[0], T0, 8, 8)
             self.arm_path[ins.addr] = ins
@@ -1720,7 +1900,10 @@ class FunctionTranslator:
             # !x86 C for sub-kind, so the toggle is a no-op exactly for sub-kind.
             prod = self.arm_path.get(ins.addr)
             if prod is not None and "C" in FLAG_WRITERS.get(prod.mnem, ""):
-                if prod.mnem not in SUB_KIND:
+                if prod.mnem in FCMP_KIND:
+                    a.cset(T0, "ge", sf=0)            # !x86_CF for FCMP
+                    self._set_cf(T0)
+                elif prod.mnem not in SUB_KIND:
                     a.mrs_nzcv(T0)
                     a.eor_i(T0, T0, 0x20000000)
                     a.msr_nzcv(T0)
@@ -1746,7 +1929,10 @@ class FunctionTranslator:
         #   adc wants arm C = x86 CF, sbb wants arm C = !x86 CF (borrow).
         prod = self.arm_path.get(ins.addr)
         if prod is not None and "C" in FLAG_WRITERS.get(prod.mnem, ""):
-            x86c = "cc" if prod.mnem in SUB_KIND else "cs"   # arm cond iff x86 CF=1
+            if prod.mnem in FCMP_KIND:
+                x86c = "lt"
+            else:
+                x86c = "cc" if prod.mnem in SUB_KIND else "cs"   # arm cond iff x86 CF=1
             if m == "sbb":
                 x86c = INV[x86c]
             a.cset(T3, x86c, sf=0)
@@ -1825,7 +2011,16 @@ class FunctionTranslator:
             a.ldr_post(T0, rsp, 8)
             self._store(ins, ins.ops[0], T0)
         elif m == "pushf":
-            self._mkflags(0)
+            prod = self.arm_path.get(ins.addr)
+            if prod is not None:
+                if prod.mnem in FCMP_KIND:
+                    self._emit_fcmp_flags()
+                elif prod.mnem in SUB_KIND:
+                    self._mkflags(1)
+                elif prod.mnem in LOGIC_KIND:
+                    self._mkflags(2)
+                else:
+                    self._mkflags(0)
             a.ldur(T0, CTX_REG, CTX_EFLAGS, size=8)
             a.orr_i(T0, T0, 2, sf=0)
             a.str_pre(T0, rsp, -8)
@@ -2208,6 +2403,8 @@ class FunctionTranslator:
             self._emit_str(ins)
         elif k == "cc":
             self._emit_setcc(ins) if m == "setcc" else self._emit_cmov(ins)
+        elif k == "simd":
+            self._emit_simd(ins)
         elif k == "branch":
             self._emit_branch(ins)
         elif k == "call":
@@ -2236,15 +2433,189 @@ class FunctionTranslator:
             return False
         return set(CC_FLAGS[ins.cc]) <= set(FLAG_WRITERS[prod.mnem])
 
+    def _read_xmm(self, ins, op, scratch_v, size):
+        if op[0] == "x":
+            return XMAP[op[1]]
+        if op[0] == "m":
+            self._mem_addr(op[1], ADDR_T)
+            self.asm.fldr(scratch_v, ADDR_T, 0, size=size)
+            return scratch_v
+        raise UnhandledInsn(ins, f"xmm load {op}")
+
+    def _emit_fcmp_flags(self):
+        """Materialize canonical x86 EFLAGS from arm64 FCMP NZCV without clobbering NZCV."""
+        a = self.asm
+        a.cset(T0, "lt", sf=0)                       # EF_CF (bit 0): < or unordered
+        a.cset(T1, "vs", sf=0)                       # PF (bit 2): unordered
+        a.orr_r(T0, T0, T1, sf=0, shift=0, imm6=2)
+        a.cset(T2, "eq", sf=0)                       # ZF (bit 6): == or unordered
+        a.orr_r(T2, T2, T1, sf=0)
+        a.orr_r(T0, T0, T2, sf=0, shift=0, imm6=6)
+        a.str(T0, CTX_REG, CTX_EFLAGS, size=4)
+        a.eor_i(T1, T1, 1, sf=0)                     # even parity (0) when PF=1, odd (1) when PF=0
+        a.stur(T1, CTX_REG, CTX_RES, size=8)
+
+    def _emit_simd(self, ins):
+        a = self.asm
+        m = ins.mnem
+        if m in _SSE_SCALAR_MOV:
+            dst, src = ins.ops
+            if m in ("movss", "movsd"):
+                dp = 1 if m == "movsd" else 0
+                sz = 8 if dp else 4
+                if dst[0] == "x" and src[0] == "x":
+                    if dst[1] != src[1]:
+                        a.vins0(XMAP[dst[1]], XMAP[src[1]], dp=dp)
+                elif dst[0] == "x" and src[0] == "m":
+                    self._mem_addr(src[1], ADDR_T)
+                    a.fldr(XMAP[dst[1]], ADDR_T, 0, size=sz)
+                elif dst[0] == "m" and src[0] == "x":
+                    self._mem_addr(dst[1], ADDR_T)
+                    a.fstr(XMAP[src[1]], ADDR_T, 0, size=sz)
+                else:
+                    raise UnhandledInsn(ins, f"{m} ops")
+                return
+            # movd (4 bytes) / movq (8 bytes): always zero-extends XMM dst upper bits
+            dp = 1 if m == "movq" else 0
+            sz = 8 if dp else 4
+            if dst[0] == "x" and src[0] == "x":
+                a.fmov_r(XMAP[dst[1]], XMAP[src[1]], dp=dp)
+            elif dst[0] == "x" and src[0] == "r":
+                a.fmov_to_fp(XMAP[dst[1]], GMAP[src[1]], dp=dp)
+            elif dst[0] == "x" and src[0] == "m":
+                self._mem_addr(src[1], ADDR_T)
+                a.fldr(XMAP[dst[1]], ADDR_T, 0, size=sz)
+            elif dst[0] == "r" and src[0] == "x":
+                a.fmov_to_gpr(GMAP[dst[1]], XMAP[src[1]], dp=dp)
+            elif dst[0] == "m" and src[0] == "x":
+                self._mem_addr(dst[1], ADDR_T)
+                a.fstr(XMAP[src[1]], ADDR_T, 0, size=sz)
+            else:
+                raise UnhandledInsn(ins, f"{m} ops")
+            return
+        if m in _SSE_VEC_MOV:
+            dst, src = ins.ops
+            if dst[0] == "x" and src[0] == "x":
+                if dst[1] != src[1]:
+                    vs = XMAP[src[1]]
+                    a.vorr16b(XMAP[dst[1]], vs, vs)
+            elif dst[0] == "x" and src[0] == "m":
+                self._mem_addr(src[1], ADDR_T)
+                a.fldr(XMAP[dst[1]], ADDR_T, 0, size=16)
+            elif dst[0] == "m" and src[0] == "x":
+                self._mem_addr(dst[1], ADDR_T)
+                a.fstr(XMAP[src[1]], ADDR_T, 0, size=16)
+            else:
+                raise UnhandledInsn(ins, f"{m} ops")
+            return
+        if m in _SSE_VEC_BIT:
+            dst, src = ins.ops
+            vd = XMAP[dst[1]]
+            vs = self._read_xmm(ins, src, VT1, 16)
+            if m in ("xorps", "xorpd", "pxor"):
+                a.veor16b(vd, vd, vs)
+            elif m in ("andps", "andpd", "pand"):
+                a.vand16b(vd, vd, vs)
+            elif m in ("andnps", "andnpd", "pandn"):
+                a.vbic16b(vd, vs, vd)                # (~dst) & src
+            else:
+                a.vorr16b(vd, vd, vs)
+            return
+        if m in _SSE_SCALAR_ARITH:
+            dst, src = ins.ops
+            dp = 1 if m.endswith("sd") else 0
+            vd = XMAP[dst[1]]
+            vs = self._read_xmm(ins, src, VT1, 8 if dp else 4)
+            fn = {"add": a.fadd, "sub": a.fsub, "mul": a.fmul, "div": a.fdiv}[m[:3]]
+            fn(VT0, vd, vs, dp=dp)
+            a.vins0(vd, VT0, dp=dp)
+            return
+        if m in ("sqrtss", "sqrtsd"):
+            dst, src = ins.ops
+            dp = 1 if m == "sqrtsd" else 0
+            vd = XMAP[dst[1]]
+            vs = self._read_xmm(ins, src, VT1, 8 if dp else 4)
+            a.fsqrt(VT0, vs, dp=dp)
+            a.vins0(vd, VT0, dp=dp)
+            return
+        if m in _SSE_SCALAR_MINMAX:
+            dst, src = ins.ops
+            dp = 1 if m.endswith("sd") else 0
+            vd = XMAP[dst[1]]
+            vs = self._read_xmm(ins, src, VT1, 8 if dp else 4)
+            cond = "mi" if m.startswith("min") else "gt"
+            a.mrs_nzcv(GTMP)
+            a.fcmp(vd, vs, dp=dp)
+            a.fcsel(VT0, vd, vs, cond, dp=dp)
+            a.msr_nzcv(GTMP)
+            a.vins0(vd, VT0, dp=dp)
+            return
+        if m in FCMP_KIND:
+            dst, src = ins.ops
+            dp = 1 if m.endswith("sd") else 0
+            vd = XMAP[dst[1]]
+            vs = self._read_xmm(ins, src, VT1, 8 if dp else 4)
+            a.fcmp(vd, vs, dp=dp)
+            if ins.addr in self.mat:
+                self._emit_fcmp_flags()
+            return
+        if m in _SSE_CVT_FP:
+            dst, src = ins.ops
+            vd = XMAP[dst[1]]
+            if m == "cvtss2sd":
+                vs = self._read_xmm(ins, src, VT1, 4)
+                a.fcvt_s2d(VT0, vs)
+                a.vins0(vd, VT0, dp=1)
+            else:
+                vs = self._read_xmm(ins, src, VT1, 8)
+                a.fcvt_d2s(VT0, vs)
+                a.vins0(vd, VT0, dp=0)
+            return
+        if m in _SSE_CVT_I2F:
+            dst, src = ins.ops
+            dp = 1 if m == "cvtsi2sd" else 0
+            sf = 1 if self._op_size(src) == 8 else 0
+            self._load(ins, src, T0)
+            a.scvtf(VT0, T0, sf=sf, dp=dp)
+            a.vins0(XMAP[dst[1]], VT0, dp=dp)
+            return
+        if m in _SSE_CVT_F2I:
+            dst, src = ins.ops
+            dp = 1 if m in ("cvttsd2si", "cvtsd2si") else 0
+            trunc = m.startswith("cvtt")
+            sf = 1 if self._op_size(dst) == 8 else 0
+            vs = self._read_xmm(ins, src, VT1, 8 if dp else 4)
+            (a.fcvtzs if trunc else a.fcvtns)(T0, vs, sf=sf, dp=dp)
+            # x86 returns integer indefinite (INT_MIN) for NaN or positive overflow;
+            # arm64 fcvtzs/fcvtns already saturates negative overflow to INT_MIN, so only
+            # values not strictly less than the positive overflow threshold need replacing.
+            if dp == 0:
+                upper_bits = 0x5F000000 if sf else 0x4F000000
+            elif sf == 1:
+                upper_bits = 0x43E0000000000000
+            else:
+                upper_bits = 0x41E0000000000000 if trunc else 0x41DFFFFFFFE00000
+            a.li(T1, upper_bits)
+            a.fmov_to_fp(VT0, T1, dp=dp)
+            a.li(T2, 0x8000000000000000 if sf else 0x80000000)
+            a.mrs_nzcv(GTMP)
+            a.fcmp(vs, VT0, dp=dp)
+            a.csel(T0, T0, T2, "mi", sf=sf)
+            a.msr_nzcv(GTMP)
+            self._store(ins, dst, T0)
+            return
+        raise UnhandledInsn(ins, f"kind {ins.kind}")
+
     def _emit_setcc(self, ins):
         a = self.asm
         op = ins.ops[0]
         tl, dl = self._skip_lbl(), self._skip_lbl()
-        if ins.cc in ("p", "np"):
-            self._parity_jcc(ins, tl)
-        elif self._producer_ok(ins):
+        if self._producer_ok(ins):
             cond = self._arm_cond(ins.cc, self.arm_path[ins.addr].mnem)
-            self._cond_branch(cond, tl)
+            if cond == "ctx":
+                self._parity_jcc(ins, tl)
+            else:
+                self._cond_branch(cond, tl)
         else:
             self._ctx_jcc(ins.cc, tl)
         a.movz(T0, 0, 0, sf=0)
@@ -2262,23 +2633,25 @@ class FunctionTranslator:
         self._load(ins, src, T0)
         g = GMAP[dst[1]]
         sf = 1 if self._op_size(dst) == 8 else 0
-        if ins.cc not in ("p", "np") and self._producer_ok(ins):
+        if self._producer_ok(ins):
             cond = self._arm_cond(ins.cc, self.arm_path[ins.addr].mnem)
             if cond == "al":
                 a.mov(g, T0, sf)
                 return
             if cond is None:
                 return
-            if isinstance(cond, str):
+            if isinstance(cond, str) and cond != "ctx":
                 self._load(ins, dst, T1, as_size=self._op_size(dst))
                 a.csel(g, T0, T1, cond, sf)
                 return
         tl = self._skip_lbl()
         done = self._skip_lbl()
-        if ins.cc in ("p", "np"):
-            self._parity_jcc(ins, tl)
-        elif self._producer_ok(ins):
-            self._cond_branch(cond, tl)
+        if self._producer_ok(ins):
+            cond = self._arm_cond(ins.cc, self.arm_path[ins.addr].mnem)
+            if cond == "ctx":
+                self._parity_jcc(ins, tl)
+            else:
+                self._cond_branch(cond, tl)
         else:
             self._ctx_jcc(ins.cc, tl)
         a.b(done)
@@ -2537,6 +2910,10 @@ def build_test_kernel(code, guest_va, rw_base=KERNEL_RW, rx_base=KERNEL_BASE):
 
     def stub_bytes(entry_va):
         s = Asm()
+        s.mrs_cpacr_el1(0)
+        s.orr_i(0, 0, 3 << 20)             # CPACR_EL1.FPEN = 0b11 (enable FP/SIMD at EL1)
+        s.msr_cpacr_el1(0)
+        s.isb()
         s.li(CTX_REG, rw_base)
         s.li(GMAP[4], rw_base + 0x8000)
         s.str(31, GMAP[4], 0)              # guest stack top: sentinel ret -> pc 0

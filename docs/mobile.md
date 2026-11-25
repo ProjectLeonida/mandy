@@ -38,6 +38,15 @@ of the x86-64 → arm64 groundwork.
 
 - Guest regs `rax`–`r15` → host `x19`–`x27`, `x9`–`x15` (`GMAP`); `x28` = guest ctx pointer,
   `x16` = dispatch target, `x17`/`x30` scratch/link, `x0`–`x3` temps.
+- Guest `xmm0`–`xmm15` → host `v0`–`v15` (`XMAP`); `v28`–`v30` FP/SIMD scratch. Scalar SSE/SSE2
+  float ops (`add`/`sub`/`mul`/`div`/`sqrt`/`min`/`max`, `cvt*`, register-to-register `movss`/`movsd`)
+  write lane 0 via `ins` so upper XMM bits are preserved, while memory `movss`/`movsd` and `movd`/`movq`
+  zero-extend to 128 bits. `minss`/`minsd`/`maxss`/`maxsd` and float-to-int conversions (`cvtt*2si`/`cvt*2si`)
+  preserve live `NZCV` and match x86 NaN/signed-zero/overflow-indefinite (`INT_MIN`) rules. `ucomis*`/`comis*`
+  map arm64 `fcmp` flags (ordered and unordered `PF`/`ZF`/`CF`, `OF=SF=AF=0`) onto both the NZCV fast path
+  and materialized `CTX_EFLAGS`. 128-bit moves (`movaps`/`movups`/`movapd`/`movupd`/`movdqa`/`movdqu`) and
+  bitwise ops (`xorps`/`xorpd`/`pxor`, `andps`/`andpd`/`pand`, `andnps`/`andnpd`/`pandn`, `orps`/`orpd`/`por`)
+  operate across the full `16B` register.
 - Ctx block: `+0x00` canonical x86 EFLAGS dword, `+0x08` last result, `+0x10`/`+0x18` last
   operands (for AF/PF reconstruction), `+0x38` the semihosting exit block in test images.
 - Flag model: arithmetic runs on arm NZCV directly; a conditional reads arm NZCV only when one
