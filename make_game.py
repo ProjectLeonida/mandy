@@ -2510,6 +2510,18 @@ def build_pipeline_check(jobs: int) -> None:
                 "or VULKAN_SDK); the CMake output above says which is missing.")
 
 
+def dstorage_profile_hint(profile: str) -> "str | None":
+    """The warning for a BCPack predictor profile that was not generated, or None when the file exists.
+
+    The runtime reads `<work>/bcpack/history.bcph` (or LEONIDA_DSTORAGE_HISTORY) and silently keeps the built-in
+    codec policy when it is absent; the loading art and most BC7 textures then stay empty. The runtime stage
+    generates it with tools/build_dstorage_history.py, so a missing file afterwards is a real setup gap."""
+    if os.path.isfile(profile):
+        return None
+    return (f"the BCPack predictor profile was not generated at {profile}; loading art and most BC7 textures "
+            "stay empty. Generate it with tools/build_dstorage_history.py")
+
+
 def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs: int = 1,
             *, work: str | None = None) -> None:
     destinations = [*RUNTIME_FILES, "game_path.txt"]
@@ -2555,6 +2567,8 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
             native = os.path.join(build, "bcpack_history_train.exe")
             trainer = ["--trainer", native] if os.name == "nt" and os.path.isfile(native) else []
             py("build_dstorage_history.py", game, "--out", profile, "--if-needed", *trainer)
+            if hint := dstorage_profile_hint(profile):
+                log("runtime: warning: " + hint)
         # Wine's path converter takes the original Unix filename bytes. The Windows reader expects UTF-8.
         encoded = shader_dir.encode("utf-8") if os.name == "nt" else os.fsencode(shader_dir)
         pending = tempfile.NamedTemporaryFile(dir=out, delete=False)
