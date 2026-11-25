@@ -203,13 +203,36 @@ python -I tools/first_light.py --game "<package>" --work ~/leonida-work \
 LEONIDA_FIRST_LIGHT_DIR=~/leonida-work/first_light/camera python -I tests/test_first_light.py -v
 ```
 
+### Through the Xbox D3D12 device
+
+Generate the reference with `--camera --run`. In PowerShell, set `$work` to the First Light workspace and
+`$build` to the CMake build directory, then point the section 5 CTest at the camera output.
+
+```powershell
+$env:LEONIDA_FIRST_LIGHT_DIR = Join-Path $work 'first_light/camera'
+ctest --test-dir $build -C RelWithDebInfo -R '^d3d12_first_light$' --output-on-failure -V
+```
+
+The fixture uploads the two matrices beside the mesh in a DEFAULT buffer. It creates two CBVs in slots 1 and 3
+of a shader-visible heap and binds that table with `SetGraphicsRootDescriptorTable`. The first graphics root dword
+occupies s8, placing the table in s9 as the VS expects. The CPU reference and `vk_harness` use a y-down viewport.
+The D3D12 draw negates the clip-Y column of the view-projection matrix so the same model point lands on the same
+pixel in both readbacks.
+
+On Windows 11 with an RTX 5070 Ti and NVIDIA 617.42, the section 1 model gave the following results at 128×128.
+Both views also passed with Vulkan synchronization validation enabled.
+
+| Camera yaw (pitch 25°, FOV 50°) | Covered pixels | Pixels bit-identical to `vk_harness` | CPU UV probes |
+|---|---:|---:|---:|
+| 30° | 6,851 | 16,384 / 16,384 | centre + 4 |
+| 55° | 6,846 | 16,384 / 16,384 | centre + 4 |
+
 ## 8. Limits and next
 
-* The camera draw (section 7) runs in `vk_harness` only. Through the D3D12 layer, s9 and the table it points at
-  have to come from root arguments, which `d3d12_first_light_test` does not set up yet.
 * `--camera` and `--dds` don't combine: the camera VS's table and the textured PS's T# both take s9 of the shared
   push constants and heap VA 0x100, so `first_light.py` refuses the pair. A textured perspective draw needs a
   second constant layout.
 * One model and one draw. The `levels.rpf` windows have world props with POSITION/NORMAL/COLOUR/UV layouts that
   match the `sga_dr_*`/`Rage_Transform*` families by signature; pairing one of those is the natural next image.
-* The game still cannot boot: the executable is not in the package (RT-5), so no call site selects these programs.
+* First Light selects the model and the shader pair explicitly. For observations from the title's own render loop,
+  see the [Windows first-run UI](first_run_ui.md) and [story-load measurements](linux_proton.md).

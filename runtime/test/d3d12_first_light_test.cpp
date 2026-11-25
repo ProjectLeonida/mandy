@@ -1,4 +1,4 @@
-// First light through the port's D3D12 layer (docs/first_light.md section 5): the real model and the real translated
+// First light through the port's D3D12 layer (docs/first_light.md sections 5 and 7): the real model and the translated
 // VS/PS that tools/first_light.py assembled from the user's package, drawn through the Xbox-ABI device proxy over the
 // Vulkan device. Package-gated: it reads everything at run time from LEONIDA_FIRST_LIGHT_DIR (the first_light.py
 // output folder) and prints SKIP and exits 77 when that is unset. No game data is in the repository.
@@ -10,9 +10,9 @@
 //     arena, and one DrawIndexedInstanced draws the whole mesh with no depth test and no culling, as vk_harness does;
 //   - the R32G32B32A32_FLOAT target is cleared to -1 (vk_harness's clear) and read back through CopyTextureRegion.
 // The oracle is vk_harness's (tests/test_first_light.py): coverage in the manifest's window, the clear corner keeps
-// -1, and the centre pixel is the UV the mesh's last covering triangle gives there. D3D12 clip space is y-up and the
-// layer flips the viewport, while vk_harness draws with a y-down viewport, so vk_harness row r is row H-1-r here.
-// When the folder also has vk_harness's image.raw, every pixel must equal it with the rows flipped.
+// -1, and the centre pixel is the UV the mesh's last covering triangle gives there. The passthrough draw flips rows
+// against vk_harness. The camera converts its projection to D3D12's y-up convention and uses the same image rows.
+// The test compares every pixel against vk_harness's image.raw.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -34,6 +35,29 @@ using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);  // heap slot 9: ha
 using Pixel = std::array<float, 4>;
 
 namespace {
+
+using Matrix = std::array<std::array<float, 4>, 4>;
+
+constexpr std::size_t align_cbv(std::size_t bytes) {
+    constexpr UINT alignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+    return (bytes + alignment - 1) / alignment * alignment;
+}
+
+bool read_matrix(const leonida::Json& camera, std::string_view key, Matrix& matrix) {
+    const auto* value = camera.find(key);
+    if (!value || value->kind != leonida::Json::Kind::array || value->array.size() != matrix.size()) return false;
+    for (std::size_t row = 0; row < matrix.size(); ++row) {
+        const auto& cells = value->array[row];
+        if (cells.kind != leonida::Json::Kind::array || cells.array.size() != matrix[row].size()) return false;
+        for (std::size_t col = 0; col < matrix[row].size(); ++col) {
+            const auto& cell = cells.array[col];
+            if (cell.kind != leonida::Json::Kind::number || !std::isfinite(cell.number) ||
+                std::fabs(cell.number) > std::numeric_limits<float>::max()) return false;
+            matrix[row][col] = static_cast<float>(cell.number);
+        }
+    }
+    return true;
+}
 
 std::vector<std::uint8_t> read_file(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
@@ -116,7 +140,23 @@ int main() {
     const std::size_t vertex_bytes = std::size_t(vertex_count) * stride, index_bytes = std::size_t(index_count) * 4;
     EXPECT(vertex_count && index_count && mesh.size() == 8 + vertex_bytes + index_bytes);
     EXPECT(vertex_count == number(manifest, "vertex_count") && index_count == number(manifest, "index_count"));
-    const std::size_t index_offset = (vertex_bytes + 255) / 256 * 256;
+    const auto* camera = manifest.find("camera");
+    const bool perspective = camera && camera->kind != leonida::Json::Kind::null;
+    // The VS reads world at byte 0 of the first CBV and viewproj at byte 0x160 of the second.
+    constexpr UINT viewproj_offset = 0x160;
+    constexpr UINT world_bytes = UINT(align_cbv(sizeof(Matrix)));
+    constexpr UINT view_bytes = UINT(align_cbv(viewproj_offset + sizeof(Matrix)));
+    Matrix world{}, viewproj{};
+    if (perspective) {
+        EXPECT(read_matrix(*camera, "world", world));
+        EXPECT(read_matrix(*camera, "viewproj", viewproj));
+        // The manifest projects to vk_harness's y-down viewport. Negate clip Y for D3D12's
+        // y-up viewport so both rasterizers interpolate at the same framebuffer coordinates.
+        for (auto& row : viewproj) row[1] = -row[1];
+    }
+    const std::size_t constants_offset = align_cbv(vertex_bytes);
+    const std::size_t index_offset = constants_offset + (perspective ? world_bytes + view_bytes : 0);
+    const std::size_t vertex_buffer_bytes = perspective ? index_offset : vertex_bytes;
 
     std::vector<Pixel> pixels(std::size_t(width) * height);
     {
@@ -137,10 +177,23 @@ int main() {
                                                            reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
 
-        // No root parameters: the VS applies no matrix and the PS has no bindings (vk_harness pushes zeros too).
+        // Graphics arguments start at s8. The camera VS reads the table from s9, with its CBVs
+        // at byte offsets 0x20 and 0x60. The passthrough VS uses an empty root signature.
+        constexpr UINT world_slot = 1, view_slot = 3;
+        const D3D12_DESCRIPTOR_RANGE ranges[] = {
+            {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, world_slot},
+            {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, view_slot}};
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants = {2, 0, 1};
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable = {2, ranges};
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
         root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
-        root_desc.Desc_1_0 = {0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+        root_desc.Desc_1_0 = {perspective ? 2u : 0u, perspective ? params : nullptr, 0, nullptr,
+                              D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
         const auto root_blob = serialize_root_signature(root_desc);
         EXPECT(!root_blob.empty());
         Ref<ID3D12RootSignature> root;
@@ -177,7 +230,7 @@ int main() {
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
         Ref<ID3D12Resource> vertex_buffer, index_buffer, upload, readback, target;
-        const auto vb_desc = buffer_desc(vertex_bytes), ib_desc = buffer_desc(index_bytes);
+        const auto vb_desc = buffer_desc(vertex_buffer_bytes), ib_desc = buffer_desc(index_bytes);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &vb_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&vertex_buffer.p))));
@@ -208,6 +261,26 @@ int main() {
         EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
         std::memcpy(up, mesh.data() + 8, vertex_bytes);
         std::memcpy(up + index_offset, mesh.data() + 8 + vertex_bytes, index_bytes);
+        Ref<ID3D12DescriptorHeap> camera_heap;
+        D3D12_GPU_DESCRIPTOR_HANDLE camera_table{};
+        if (perspective) {
+            std::memset(up + vertex_bytes, 0, index_offset - vertex_bytes);
+            std::memcpy(up + constants_offset, world.data(), sizeof(world));
+            std::memcpy(up + constants_offset + world_bytes + viewproj_offset, viewproj.data(), sizeof(viewproj));
+            const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, view_slot + 1,
+                                                   D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&camera_heap.p))));
+            const auto cpu = reinterpret_cast<XboxHeapHandleFn>(slot(camera_heap.p, 9))(camera_heap.p);
+            camera_table.ptr = reinterpret_cast<XboxHeapHandleFn>(slot(camera_heap.p, 10))(camera_heap.p);
+            const UINT step = device->GetDescriptorHandleIncrementSize(desc.Type);
+            EXPECT(cpu && camera_table.ptr && step == 32);
+            const auto va = vertex_buffer->GetGPUVirtualAddress() + constants_offset;
+            const D3D12_CONSTANT_BUFFER_VIEW_DESC world_cbv{va, world_bytes};
+            const D3D12_CONSTANT_BUFFER_VIEW_DESC view_cbv{va + world_bytes, view_bytes};
+            device->CreateConstantBufferView(&world_cbv, {cpu + world_slot * step});
+            device->CreateConstantBufferView(&view_cbv, {cpu + view_slot * step});
+        }
+        upload->Unmap(0, nullptr);
 
         const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         Ref<ID3D12DescriptorHeap> rtv_heap;
@@ -227,7 +300,7 @@ int main() {
                                                    IID_PPV_ARGS(&list.p))));
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
-        list->CopyBufferRegion(vertex_buffer.p, 0, upload.p, 0, vertex_bytes);
+        list->CopyBufferRegion(vertex_buffer.p, 0, upload.p, 0, vertex_buffer_bytes);
         list->CopyBufferRegion(index_buffer.p, 0, upload.p, index_offset, index_bytes);
         D3D12_RESOURCE_BARRIER barriers[3] = {
             transition(vertex_buffer.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER),
@@ -238,6 +311,11 @@ int main() {
         list->ClearRenderTargetView(rtv, clear, 0, nullptr);
 
         list->SetGraphicsRootSignature(root.p);
+        if (perspective) {
+            list->SetDescriptorHeaps(1, &camera_heap.p);
+            list->SetGraphicsRoot32BitConstant(0, 0, 0);
+            list->SetGraphicsRootDescriptorTable(1, camera_table);
+        }
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         const D3D12_VERTEX_BUFFER_VIEW vbv{vertex_buffer->GetGPUVirtualAddress(), UINT(vertex_bytes), stride};
         list->IASetVertexBuffers(0, 1, &vbv);
@@ -277,6 +355,7 @@ int main() {
         pso.reset();
         root.reset();
         rtv_heap.reset();
+        camera_heap.reset();
         list.reset();
         allocator.reset();
         queue.reset();
@@ -284,8 +363,8 @@ int main() {
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
 
-    // vk_harness's (x, y) is (x, H-1-y) here: same clip-space point, opposite viewport direction.
-    const auto at = [&](UINT x, UINT vk_y) -> const Pixel& { return pixels[std::size_t(height - 1 - vk_y) * width + x]; };
+    const auto target_y = [&](UINT vk_y) { return perspective ? vk_y : height - 1 - vk_y; };
+    const auto at = [&](UINT x, UINT vk_y) -> const Pixel& { return pixels[std::size_t(target_y(vk_y)) * width + x]; };
     unsigned covered = 0;
     for (const Pixel& p : pixels) covered += p[3] > 0.5f;
     const double ratio = double(covered) / (double(width) * height);
@@ -295,7 +374,7 @@ int main() {
     if (pixel_of(manifest, "clear_pixel", clear_xy)) {
         const Pixel& p = at(UINT(clear_xy[0]), UINT(clear_xy[1]));
         const float want = float(number(manifest, "clear", -1.0));
-        std::printf("clear pixel (%u, %u): %g %g %g %g\n", UINT(clear_xy[0]), height - 1 - UINT(clear_xy[1]), p[0],
+        std::printf("clear pixel (%u, %u): %g %g %g %g\n", UINT(clear_xy[0]), target_y(UINT(clear_xy[1])), p[0],
                     p[1], p[2], p[3]);
         for (float c : p) EXPECT(std::fabs(c - want) <= 1e-5f);
     }
@@ -303,7 +382,7 @@ int main() {
         if (!pixel_of(manifest, "centre_pixel", centre_xy)) centre_xy = {double(width / 2), double(height / 2)};
         const Pixel& p = at(UINT(centre_xy[0]), UINT(centre_xy[1]));
         std::printf("centre pixel (%u, %u): %.5f %.5f %.5f %.5f (mesh UV %.5f %.5f)\n", UINT(centre_xy[0]),
-                    height - 1 - UINT(centre_xy[1]), p[0], p[1], p[2], p[3], centre_uv[0], centre_uv[1]);
+                    target_y(UINT(centre_xy[1])), p[0], p[1], p[2], p[3], centre_uv[0], centre_uv[1]);
         const double want[4] = {centre_uv[0], centre_uv[1], 0.0, 1.0};
         for (int c = 0; c < 4; ++c) EXPECT(std::fabs(p[c] - want[c]) <= 2e-3);
     }
@@ -373,13 +452,13 @@ int main() {
                                    one_f16_step(got[1], want[1]) && one_f16_step(got[2], want[2]);
                 ++(close ? f16_step : differ);
                 std::fprintf(stderr, "vk_harness (%u, %u): %g %g %g %g, here (%u, %u): %g %g %g %g%s\n", x, y,
-                             want[0], want[1], want[2], want[3], x, height - 1 - y, got[0], got[1], got[2], got[3],
+                             want[0], want[1], want[2], want[3], x, target_y(y), got[0], got[1], got[2], got[3],
                              close ? " (one f16 step)" : "");
                 if (differ > 8) return 1;
             }
         }
-        std::printf("against vk_harness's image.raw (rows flipped): %u of %u pixels bit-exact, %u one f16 step apart, "
-                    "%u different\n", exact, width * height, f16_step, differ);
+        std::printf("against vk_harness's image.raw (%s): %u of %u pixels bit-exact, %u one f16 step apart, "
+                    "%u different\n", perspective ? "same rows" : "rows flipped", exact, width * height, f16_step, differ);
         EXPECT(differ == 0);
         // An adjacent half only appears where the f32 interpolant sits a few ulps from an f16 truncation boundary,
         // about 2^-11 of values per channel: 1 pixel of 12,804 covered on the RTX 3060. Allow at most one covered
