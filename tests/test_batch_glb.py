@@ -41,6 +41,42 @@ def _create_minimal_bc1_dds(color: int = 0xF800) -> bytes:
 
 
 class TestBatchGlb(unittest.TestCase):
+    def test_colliding_stems_leave_all_outputs_untouched(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as root:
+            source, output = Path(root) / "in", Path(root) / "out"
+            source.mkdir()
+            output.mkdir()
+            names = ["safe.obj", "car.obj", "car.OBJ"]
+            for name in names:
+                (source / name).write_bytes(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+            (output / "car.glb").write_bytes(b"previous export")
+            # Simulate a case-sensitive source listing on volumes where the last two names alias.
+            with mock.patch.object(batch_glb.os, "listdir", return_value=names):
+                with self.assertRaisesRegex(ValueError, r"car\.obj.*car\.OBJ|car\.OBJ.*car\.obj"):
+                    batch_glb.batch_convert(str(source), str(output), jobs=2)
+            self.assertEqual((output / "car.glb").read_bytes(), b"previous export")
+            self.assertFalse((output / "safe.glb").exists())
+
+    def test_case_distinct_outputs_follow_the_destination_volume(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source, output = Path(root) / "in", Path(root) / "out"
+            source.mkdir()
+            output.mkdir()
+            # Different extension spellings alone already collide. Here the stems differ too.
+            for name in ("Car.obj", "car.obj"):
+                (source / name).write_bytes(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+            from unittest import mock
+            with mock.patch.object(batch_glb.os, "listdir", return_value=["Car.obj", "car.obj"]):
+                if (source / "CAR.obj").exists():
+                    with self.assertRaisesRegex(ValueError, "same GLB"):
+                        batch_glb.batch_convert(str(source), str(output))
+                else:
+                    stats = batch_glb.batch_convert(str(source), str(output))
+                    self.assertEqual(stats["succeeded"], 2)
+                    self.assertFalse((output / "Car.glb").samefile(output / "car.glb"))
+
     def test_cli_reports_directory_setup_errors(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             missing = os.path.join(root, "missing")
