@@ -1890,6 +1890,48 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL per_format_instance_proc(VkInstance ins
     return original_instance_proc(instance, name);
 }
 
+// Pascal can create the mapped R8 movie plane with HOST_TRANSFER yet offer no memory for it.
+// Use the bound-image requirements API for both the probe and the eventual allocation.
+PFN_vkGetDeviceProcAddr original_device_proc;
+std::atomic<VkImage> host_plane{};
+
+VKAPI_ATTR VkResult VKAPI_CALL track_plane(VkDevice device, const VkImageCreateInfo* info,
+                                           const VkAllocationCallbacks* allocator, VkImage* image) {
+    auto create = reinterpret_cast<PFN_vkCreateImage>(original_device_proc(device, "vkCreateImage"));
+    const VkResult result = create(device, info, allocator, image);
+    if (result == VK_SUCCESS && info->format == VK_FORMAT_R8_UNORM &&
+        info->extent.width == 256 && info->extent.height == 8 && (info->usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT))
+        host_plane = *image;
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL untrack_plane(VkDevice device, VkImage image, const VkAllocationCallbacks* allocator) {
+    VkImage expected = image;
+    host_plane.compare_exchange_strong(expected, VK_NULL_HANDLE);
+    reinterpret_cast<PFN_vkDestroyImage>(original_device_proc(device, "vkDestroyImage"))(device, image, allocator);
+}
+
+VKAPI_ATTR void VKAPI_CALL plane_requirements(VkDevice device, VkImage image, VkMemoryRequirements* requirements) {
+    auto get = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(
+        original_device_proc(device, "vkGetImageMemoryRequirements"));
+    get(device, image, requirements);
+    if (image == host_plane) requirements->memoryTypeBits = 0;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL plane_device_proc(VkDevice device, const char* name) {
+    if (!std::strcmp(name, "vkGetDeviceImageMemoryRequirements") ||
+        !std::strcmp(name, "vkGetDeviceImageMemoryRequirementsKHR")) return nullptr;
+    if (!std::strcmp(name, "vkCreateImage")) return reinterpret_cast<PFN_vkVoidFunction>(track_plane);
+    if (!std::strcmp(name, "vkDestroyImage")) return reinterpret_cast<PFN_vkVoidFunction>(untrack_plane);
+    if (!std::strcmp(name, "vkGetImageMemoryRequirements")) return reinterpret_cast<PFN_vkVoidFunction>(plane_requirements);
+    return original_device_proc(device, name);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL plane_instance_proc(VkInstance instance, const char* name) {
+    if (!std::strcmp(name, "vkGetDeviceProcAddr")) return reinterpret_cast<PFN_vkVoidFunction>(plane_device_proc);
+    return original_instance_proc(instance, name);
+}
+
 void print_cases(const std::vector<Case>& cases, const char* who) {
     for (const Case& c : cases)
         std::printf("%s: %-44s hr=0x%08lX size=%llu align=%llu type=%d cpu=%d pool=%d flags=0x%x\n", who, c.name,
@@ -1946,6 +1988,13 @@ int main() {
             if (FAILED(rt::d3d12::create_vulkan_device(per_format, IID_PPV_ARGS(&limited.p)))) return 1;
             failures += check_mapped_plane(limited.p);
             failures += check_mapped_bc_array(limited.p);
+
+            original_device_proc = vk.device_proc;
+            auto no_plane_memory = info;
+            no_plane_memory.get_instance_proc = plane_instance_proc;
+            Ref<ID3D12Device> restricted;
+            if (FAILED(rt::d3d12::create_vulkan_device(no_plane_memory, IID_PPV_ARGS(&restricted.p)))) return 1;
+            failures += check_mapped_plane(restricted.p);
         }
         {
             // Without host image copies a title image is filled through the staged upload, a linear plane too.
