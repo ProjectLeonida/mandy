@@ -1201,7 +1201,7 @@ def run_suite(a, work: str) -> int:
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
             # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
-        elif name in ("cs_smem_vcc_base", "cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_lds_subdword", "cs_w32_lds_wide", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
+        elif name in ("cs_smem_vcc_base", "cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_swaprel", "cs_movrels", "cs_msad_mqsad", "cs_w32_permute", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_lds_subdword", "cs_w32_lds_wide", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
                       "cs_dpp_bound", "cs_dpp_cmp", "cs_dpp_w64",
                       "cs_w64_mask_detect",
@@ -1222,6 +1222,12 @@ def run_suite(a, work: str) -> int:
                 "cs_w32_lane_wrap": [25, 16, 777, 777],
                 # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]] (cs_movrelsd_2.asm)
                 "cs_movrelsd_2": [11, 33, 33, 55, 1717, 77, 1515, 1717],
+                # v_swaprel_b32 swaps the same two M0 fields (cs_swaprel.asm)
+                "cs_swaprel": [11, 22, 55, 44, 77, 55, 66, 88],
+                # s_movrels_b32/b64: SGPR[S0 + M0], b64 pair at +1, SCC kept (cs_movrels.asm)
+                "cs_movrels": [170, 204, 187, 204, 187, 187, 1, 238],
+                # v_msad_u8 / v_mqsad_u32_u8: masked byte SADs, sliding windows, 32-bit wrap (cs_msad_mqsad.asm)
+                "cs_msad_mqsad": [0x30, 0xFFFFFFF4, 0xFFFFFFFA, 7, 0x80000006, 0x1234567C, 0xDEADBEEF, 0xFF],
                 # SHADER-90: ds_permute_b32 (cs_w32_permute.asm): scatter, unwritten lane = 0, EXEC gates the write
                 "cs_w32_permute": [218, 29, 8, 211, 0, 15, 99, 15],
                 # integer ops with CPU-only checks until now (cs_w32_int_ext.asm)
@@ -1324,7 +1330,8 @@ def run_suite(a, work: str) -> int:
                                       0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF],
             }
             want = cs_dump_wants[name]
-            # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 / cs_w32_permute /
+            # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 / cs_swaprel / cs_movrels /
+            # cs_msad_mqsad / cs_w32_permute /
             # cs_w32_lds_u8_d16 / cs_w32_sincos / cs_w32_int_ext / cs_w32_salu64 / cs_w32_misc_ext / cs_w32_new_ops / cs_signed_zero_nan, the wave32
             # cs_wqm_w32 / cs_bpermute32 and the DPP tests is a whole-wave (wave64) mask test: ask for a 64-wide subgroup and skip,
             # as check.py does, where the device has none
@@ -1335,6 +1342,7 @@ def run_suite(a, work: str) -> int:
             emulated = w64_emulated()
             partial = name in ("cs_w64x_partial", "cs_w64x_partial_scmp")
             wave64 = name not in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
+                                  "cs_swaprel", "cs_movrels", "cs_msad_mqsad",
                                   "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
                                   "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops",
                                   "cs_w32_lds_subdword", "cs_w32_lds_wide",
