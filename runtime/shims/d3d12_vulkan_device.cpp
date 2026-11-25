@@ -10135,6 +10135,14 @@ struct TitleTexture {
     std::uint64_t full_hash = 0;
     bool full_hashed = false;
     bool every_byte() const { return mapped && layout.layout.size <= (4u << 20); }
+    bool rolling_hash() const { return mapped && !every_byte(); }
+    leonida::TitleTextureChunkHashes chunk_hashes;
+    std::uint64_t source_revision = 0;       // Map, written Unmap or a replacement texture layout
+    void layout_changed() {
+        ++source_revision;
+        hashed = false;
+        chunk_hashes = {};
+    }
     std::uint64_t fills = 0;
 };
 
@@ -10171,6 +10179,7 @@ void DeviceState::title_texture_mapped(const void* resource, std::uint64_t addre
     if (it == title_textures.end() || it->second->resource != resource) return;
     TitleTexture& t = *it->second;
     t.mapped = true;
+    ++t.source_revision;
     t.memory.retry();
     // The title computes the layout of what it writes right before it maps: take it when no view gave one.
     if (!t.gpu_written && (t.layout_guessed || !t.layout_known) &&
@@ -10178,7 +10187,7 @@ void DeviceState::title_texture_mapped(const void* resource, std::uint64_t addre
         t.layout_known = true;
         t.layout_guessed = false;
         t.layout_from_xg = true;
-        t.hashed = false;
+        t.layout_changed();
     }
     static std::atomic<int> logged{0};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 48) {
@@ -10204,6 +10213,7 @@ void DeviceState::title_texture_unmapped(const void* resource, std::uint64_t add
     std::lock_guard lock(title_texture_mutex);
     const auto it = title_textures.find(address);
     if (it != title_textures.end() && it->second->resource == resource) {
+        ++it->second->source_revision;
         it->second->stale = true;
         it->second->memory.retry();
     }
@@ -11972,6 +11982,8 @@ public:
         const auto entries = leonida::title_texture_snapshot(state_.title_textures);
         title_pass_ = true;
         std::uint64_t checked = 0, filled = 0, fill_pass_ns = 0;
+        TitleTexture* first_rolling = nullptr;
+        TitleTexture* next_rolling = nullptr;
         const auto visit = [&](TitleTexture& t) {
             // A slot-133 texture's guessed layout (no slot-70 view yet) is only used once the title maps it.
             if (t.gpu_written || !t.layout_known || !t.resource ||
@@ -12004,7 +12016,14 @@ public:
                 t.memory.defer();
                 return;
             }
-            if (t.hashed && hash == t.hash && !t.stale) {
+            const bool rolling = t.rolling_hash();
+            if (t.hashed && hash == t.hash && !t.stale && (!rolling || t.chunk_hashes.ready())) {
+                if (rolling) {
+                    // A single exhaustive chunk across all large mapped textures, after the usual checks.
+                    if (!first_rolling) first_rolling = &t;
+                    if (!next_rolling && t.address >= title_rolling_cursor_) next_rolling = &t;
+                    return;
+                }
                 if (!t.every_byte() || stats.passes % 6) return;
                 std::uint64_t full = 0;
                 checked += span;
@@ -12069,6 +12088,12 @@ public:
                 ++stats.every_pass_visits;
                 visit(*entry.second);
             }
+        if (TitleTexture* t = next_rolling ? next_rolling : first_rolling) {
+            title_rolling_cursor_ = t->address + 1;
+            const auto start = clock::now();
+            checked += check_title_chunk(*t);
+            stats.hash_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
+        }
         stats.every_pass_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - every_start).count();
         // The budget is the round robin's: mapped and stale textures above are checked every pass whatever it is.
         const auto first_bytes = checked, first_hash_ns = stats.hash_ns;
@@ -12198,8 +12223,8 @@ private:
             // still has that resource. Others (host copies, unbound memory) are filled under the lock as before.
             Resource* r = nullptr;
             rt::xg_xs::Texture layout{};
-            std::uint64_t cpu = 0, fills = 0;
-            bool every_byte = false;
+            std::uint64_t cpu = 0;
+            TitleFillVersion version;
             {
                 std::lock_guard lock(state_.title_texture_mutex);
                 const InTitleTextures inside;
@@ -12214,8 +12239,8 @@ private:
                             r->AddRef();
                             layout = t.layout;
                             cpu = t.cpu;
-                            fills = t.fills;
-                            every_byte = t.every_byte();
+                            version = {t.fills, t.source_revision, leonida::title_memory_map::generation(),
+                                       t.every_byte(), t.rolling_hash()};
                         } else {
                             filled = fill_title_texture(t, true) != 0;
                         }
@@ -12223,7 +12248,7 @@ private:
                 }
             }
             if (r) {
-                filled = fill_unlocked(address, *r, layout, cpu, fills, every_byte, f);
+                filled = fill_unlocked(address, *r, layout, cpu, version, f);
                 r->Release();
             }
             std::size_t left = 0;
@@ -12244,20 +12269,35 @@ private:
         }
     }
 
+    struct TitleFillVersion {
+        std::uint64_t fills = 0, source_revision = 0, map_generation = 0;
+        bool every_byte = false, rolling = false;
+    };
+
+    static bool title_mapping_unchanged(std::uint64_t generation, std::uint64_t base, std::uint64_t span) {
+        if (generation == leonida::title_memory_map::generation()) return true;
+        std::uint64_t now = 0;
+        bool overlaps = false;
+        return leonida::title_memory_map::changes_since(generation, now, base, base + span,
+                                                         [&](auto, auto) { overlaps = true; }) && !overlaps;
+    }
+
     // The fill worker's fill of a staged texture: copy, hash and upload without the registry lock, then the result
     // under it, if the registry still names `r` at `address` and nobody filled it meanwhile.
     bool fill_unlocked(std::uint64_t address, Resource& r, const rt::xg_xs::Texture& layout, std::uint64_t cpu,
-                       std::uint64_t fills, bool every_byte, TitleFiller& f) {
+                       TitleFillVersion version, TitleFiller& f) {
         const std::uint64_t span = layout.layout.size;
         f.tiled.resize(std::size_t(span));
         const bool copied = copy_guarded(f.tiled.data(), reinterpret_cast<const std::uint8_t*>(cpu), std::size_t(span),
                                          title_memory_write_combined(cpu));
         std::uint64_t hash = 0, full = 0;
         bool full_hashed = false, ok = false, nonzero = false;
+        leonida::TitleTextureChunkHashes chunk_hashes;
         std::uint64_t staged_ns = 0;
         if (copied) {
             hash_guarded(f.tiled.data(), f.tiled.size(), hash);
-            full_hashed = every_byte && hash_guarded(f.tiled.data(), f.tiled.size(), full, true);
+            full_hashed = version.every_byte && hash_guarded(f.tiled.data(), f.tiled.size(), full, true);
+            if (version.rolling) snapshot_title_chunks(chunk_hashes, f.tiled);
             const auto start = std::chrono::steady_clock::now();
             ok = r.upload_staged_title(layout, f.tiled.data(), f.columns, false, nonzero);
             staged_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
@@ -12281,12 +12321,21 @@ private:
             return false;
         }
         ++title_stats_.staged_fills;
-        if (t.fills != fills) return true;  // another fill recorded itself in between: its hash is as good
+        if ((version.rolling || t.rolling_hash()) &&
+            (t.fills != version.fills || t.source_revision != version.source_revision ||
+             !title_mapping_unchanged(version.map_generation, cpu, span))) {
+            // This upload may have become visible after the intervening one. Refill from the current layout
+            // rather than trusting a digest from a different upload or from before the first large Map.
+            t.stale = true;
+            return true;
+        }
+        if (t.fills != version.fills) return true;  // another fill recorded itself in between: its hash is as good
         if (t.owned && !t.fills) r.publish_streamed_texture();
         t.hash = hash;
         t.hashed = true;
         t.full_hash = full;
         t.full_hashed = full_hashed;
+        t.chunk_hashes = std::move(chunk_hashes);
         ++t.fills;
         ++title_stats_.fills;
         title_stats_.fill_bytes += span;
@@ -12333,6 +12382,7 @@ private:
         geometry_refresher_->wake.notify_one();
     }
     std::uint64_t title_refresh_cursor_ = 0;                       // under title_texture_mutex
+    std::uint64_t title_rolling_cursor_ = 0;                       // likewise
     std::uint64_t title_map_generation_ = 0;                       // likewise: the map changes the passes have seen
     std::chrono::steady_clock::time_point title_retry_all_{};      // likewise
     leonida::TitleWriteRanges title_map_changes_;                  // likewise, scratch
@@ -12429,7 +12479,7 @@ private:
                     t->desc = words;
                     t->layout_known = true;
                     t->layout_guessed = t->layout_from_xg = false;
-                    t->hashed = false;
+                    t->layout_changed();
                 } else {
                     refuse_title_view(why, d, address);  // counted; the view of its image is still written
                 }
@@ -12644,6 +12694,32 @@ private:
         if (!t.hashed || hash != t.hash || t.stale) fill_title_texture(t, true);
     }
 
+    static void snapshot_title_chunks(leonida::TitleTextureChunkHashes& chunks,
+                                      const std::vector<std::uint8_t>& snapshot) {
+        chunks.snapshot(snapshot.size(), [&](std::size_t offset, std::size_t bytes) {
+            return hash_bytes(snapshot.data() + offset, bytes, true);
+        });
+    }
+
+    std::size_t check_title_chunk(TitleTexture& t) {
+        const auto chunk = t.chunk_hashes.next();
+        const auto address = t.cpu + chunk.offset;
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(address));
+        std::uint64_t hash = 0;
+        bool ok = false;
+        // Stream from WC pages into cached scratch before hashing, just as the upload copy does.
+        if (title_memory_write_combined(address)) {
+            if (title_tiled_.size() < chunk.bytes) title_tiled_.resize(chunk.bytes);
+            ok = copy_guarded(title_tiled_.data(), bytes, chunk.bytes, true);
+            if (ok) hash = hash_bytes(title_tiled_.data(), chunk.bytes, true);
+        } else {
+            ok = hash_guarded(bytes, chunk.bytes, hash, true);
+        }
+        if (!ok) t.memory.defer();
+        else if (hash != chunk.hash) t.stale = true;  // Use the next pass's normal priority upload.
+        return chunk.bytes;
+    }
+
     // Snapshot the whole footprint before uploading any subresource. A concurrent unmap defers the fill.
     // Private title staging bypasses the D3D12 submit callbacks. Generic staged copies require an outer fill.
     std::uint64_t fill_title_texture(TitleTexture& t, bool staged) {
@@ -12657,6 +12733,8 @@ private:
                 }
         const std::uint64_t span = layout.layout.size;
         if (!title_texture_readable(t)) return 0;
+        const bool rolling = t.rolling_hash();
+        const auto map_generation = rolling ? leonida::title_memory_map::generation() : 0;
         title_tiled_.resize(std::size_t(span));
         if (!copy_guarded(title_tiled_.data(), reinterpret_cast<const std::uint8_t*>(t.cpu), std::size_t(span),
                           title_memory_write_combined(t.cpu))) {
@@ -12724,9 +12802,14 @@ private:
                          static_cast<unsigned long long>(t.cpu), static_cast<unsigned long long>(span),
                          int(staged), int(nonzero));
         if (t.owned && !t.fills) t.resource->publish_streamed_texture();
-        t.hash = hash;
-        t.hashed = true;
-        t.stale = false;
+        if (rolling && !title_mapping_unchanged(map_generation, t.cpu, span)) {
+            t.stale = true;
+        } else {
+            if (rolling) snapshot_title_chunks(t.chunk_hashes, title_tiled_);
+            t.hash = hash;
+            t.hashed = true;
+            t.stale = false;
+        }
         ++t.fills;
         ++title_stats_.fills;
         title_stats_.fill_bytes += span;
