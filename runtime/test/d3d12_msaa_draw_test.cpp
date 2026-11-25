@@ -5,7 +5,8 @@
 //     Pixels well inside are red and pixels well outside blue. Pixels the edge crosses resolve to a mix, which
 //     only a multisampled target produces (a single-sampled one gives 0 or 255);
 //   - a green quad over the bottom-right quadrant from a PSO with SampleMask 0x1: one sample of four is written,
-//     so those pixels resolve to a quarter green and three quarters blue.
+//     so those pixels resolve to a quarter green and three quarters blue under AVERAGE. MIN and MAX
+//     resolve a shifted rectangle from that quadrant to black and cyan, respectively.
 // PSO quality: D3D12_STANDARD_MULTISAMPLE_PATTERN is accepted, as on native D3D12; quality 1 (past NumQualityLevels)
 // and 3 samples are E_INVALIDARG. A 4x PSO drawing into a single-sampled target fails the list at execute
 // (invalid_subresource) instead of reaching the driver. Shaders: test/glsl/vs_draw.vert, ps_draw.frag. No game data.
@@ -73,7 +74,8 @@ int main() {
 
     constexpr UINT size = 64;
     constexpr UINT samples = 4;
-    std::vector<std::uint8_t> pixels(size * 256);
+    constexpr UINT image_bytes = size * 256;
+    std::vector<std::uint8_t> pixels(image_bytes), format_pixels(3 * image_bytes);
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -155,6 +157,7 @@ int main() {
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
         Ref<ID3D12Resource> vertex_buffer, upload, readback, target, depth, resolved;
+        Ref<ID3D12Resource> typeless_target, typeless_resolved, srgb_resolved, unorm_resolved, format_readback;
         const auto vb_desc = buffer_desc(sizeof(vertices));
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &vb_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
@@ -163,7 +166,7 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&upload.p))));
-        const auto readback_desc = buffer_desc(size * 256);
+        const auto readback_desc = buffer_desc(4 * image_bytes);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&readback.p))));
@@ -190,6 +193,27 @@ int main() {
                                                          D3D12_RESOURCE_STATE_RESOLVE_DEST, nullptr,
                                                          IID_PPV_ARGS(&resolved.p))));
 
+        // ResolveSubresource's Format names the typeless family member to average in: a typeless 4x target, and
+        // single-sampled destinations that are typeless (resolved as sRGB, and as UNORM for a control) or typed sRGB.
+        D3D12_RESOURCE_DESC typeless_desc = rt_desc;
+        typeless_desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &typeless_desc,
+                                                         D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                         IID_PPV_ARGS(&typeless_target.p))));
+        typeless_desc.SampleDesc = {1, 0};
+        for (auto* destination : {&typeless_resolved, &unorm_resolved})
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &typeless_desc,
+                                                             D3D12_RESOURCE_STATE_RESOLVE_DEST, nullptr,
+                                                             IID_PPV_ARGS(&destination->p))));
+        typeless_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &typeless_desc,
+                                                         D3D12_RESOURCE_STATE_RESOLVE_DEST, nullptr,
+                                                         IID_PPV_ARGS(&srgb_resolved.p))));
+        const auto format_readback_desc = buffer_desc(3 * size * 256);
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &format_readback_desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&format_readback.p))));
+
         std::uint8_t* up = nullptr;
         EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
         std::memcpy(up, vertices, sizeof(vertices));
@@ -198,7 +222,7 @@ int main() {
         std::memcpy(up + 768, tints[1], sizeof(tints[1]));
         const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
 
-        const D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2,
+        const D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3,
                                                        D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         const D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1,
                                                        D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -213,6 +237,8 @@ int main() {
         ms_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
         device->CreateRenderTargetView(target.p, &ms_view, rtv);
         device->CreateRenderTargetView(resolved.p, nullptr, single_rtv);
+        const D3D12_CPU_DESCRIPTOR_HANDLE typeless_rtv{single_rtv.ptr + rt::d3d12::descriptor_size};
+        device->CreateRenderTargetView(typeless_target.p, &ms_view, typeless_rtv);
         D3D12_DEPTH_STENCIL_VIEW_DESC ms_depth{};
         ms_depth.Format = DXGI_FORMAT_D32_FLOAT;
         ms_depth.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMS;
@@ -275,6 +301,22 @@ int main() {
         src.pResource = resolved.p;
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        Ref<ID3D12GraphicsCommandList1> list1;
+        EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list1.p))));
+        const D3D12_RESOURCE_BARRIER back_to_resolve =
+            transition(resolved.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+        D3D12_RECT source_rect{40, 40, 48, 48};
+        const D3D12_RESOLVE_MODE modes[]{D3D12_RESOLVE_MODE_MIN, D3D12_RESOLVE_MODE_MAX,
+                                         D3D12_RESOLVE_MODE_AVERAGE};
+        for (UINT i = 0; i < std::size(modes); ++i) {
+            list->ResourceBarrier(1, &back_to_resolve);
+            list1->ResolveSubresourceRegion(resolved.p, 0, 4, 8, target.p, 0, &source_rect,
+                                            DXGI_FORMAT_R8G8B8A8_UNORM, modes[i]);
+            list->ResourceBarrier(1, &to_copy);
+            dst.PlacedFootprint.Offset = (i + 1) * image_bytes;
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+        list1.reset();
         EXPECT(list->Close() == S_OK);
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
@@ -284,6 +326,23 @@ int main() {
         void* mapped = nullptr;
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(pixels.data(), mapped, pixels.size());
+
+        const std::array<std::uint8_t, 4> extrema[]{{0, 0, 0, 255}, {0, 255, 255, 255}};
+        const auto* bytes = static_cast<const std::uint8_t*>(mapped);
+        const auto* average = pixels.data() + 40 * 256 + 40 * 4;  // checked below against the 1:3 mix
+        for (UINT i = 0; i < std::size(modes); ++i) {
+            for (UINT y = 0; y < size; ++y) {
+                for (UINT x = 0; x < size; ++x) {
+                    const UINT offset = y * 256 + x * 4;
+                    const bool inside = x >= 4 && x < 12 && y >= 8 && y < 16;
+                    const auto* expected = pixels.data() + offset;
+                    if (inside) expected = i < std::size(extrema) ? extrema[i].data() : average;
+                    const auto* actual = bytes + (i + 1) * image_bytes + offset;
+                    EXPECT(std::memcmp(expected, actual, 4) == 0);
+                }
+            }
+        }
+        readback->Unmap(0, nullptr);
 
         // A 4x PSO into the single-sampled target: D3D12 requires matching counts, so the list fails at execute.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
@@ -299,7 +358,55 @@ int main() {
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)));
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
 
-        for (auto* r : {&vertex_buffer, &upload, &readback, &target, &depth, &resolved}) r->reset();
+        // The same two draws into the typeless target, resolved three ways from one source.
+        EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
+        list->ClearRenderTargetView(typeless_rtv, blue, 0, nullptr);
+        list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        common_state(typeless_rtv, &dsv);
+        list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+        list->DrawInstanced(3, 1, 0, 0);
+        list->SetPipelineState(masked.p);
+        list->SetGraphicsRootConstantBufferView(1, upload_va + 768);
+        list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+        D3D12_RESOURCE_BARRIER typeless_to_resolve = transition(typeless_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                                D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        list->ResourceBarrier(1, &typeless_to_resolve);
+        struct FormatCase {
+            ID3D12Resource* destination;
+            DXGI_FORMAT resolve_format, footprint_format;
+        };
+        const FormatCase format_cases[3] = {
+            {typeless_resolved.p, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM},  // typeless -> typeless
+            {srgb_resolved.p, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB},  // -> typed sRGB
+            {unorm_resolved.p, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM}};          // control: UNORM
+        for (const FormatCase& c : format_cases)
+            list->ResolveSubresource(c.destination, 0, typeless_target.p, 0, c.resolve_format);
+        UINT64 offset = 0;
+        for (const FormatCase& c : format_cases) {
+            D3D12_RESOURCE_BARRIER to_source = transition(c.destination, D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                                                          D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &to_source);
+            D3D12_TEXTURE_COPY_LOCATION to{};
+            to.pResource = format_readback.p;
+            to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            to.PlacedFootprint = {offset, {c.footprint_format, size, size, 1, 256}};
+            D3D12_TEXTURE_COPY_LOCATION from{};
+            from.pResource = c.destination;
+            from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            offset += size * 256;
+        }
+        EXPECT(list->Close() == S_OK);
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)));
+        EXPECT(SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
+        void* format_mapped = nullptr;
+        EXPECT(SUCCEEDED(format_readback->Map(0, nullptr, &format_mapped)));
+        std::memcpy(format_pixels.data(), format_mapped, format_pixels.size());
+
+        for (auto* r : {&vertex_buffer, &upload, &readback, &target, &depth, &resolved, &typeless_target,
+                        &typeless_resolved, &srgb_resolved, &unorm_resolved, &format_readback}) r->reset();
         pso.reset();
         masked.reset();
         root.reset();
@@ -344,6 +451,24 @@ int main() {
     }
     EXPECT(!mismatches);
     EXPECT(edge_mixed > 0);  // single-sampled rendering leaves no partial pixels
+
+    // One sample of four is green, three blue, in the bottom-right quadrant: averaged as UNORM that is 64/191, and
+    // as sRGB (in linear light) 137/225. Outside the quadrant every sample agrees, so the format changes nothing.
+    const int quadrant_green[3] = {137, 137, 64}, quadrant_blue[3] = {225, 225, 191};
+    const char* format_case_names[3] = {"typeless -> typeless as sRGB", "typeless -> typed sRGB",
+                                        "typeless -> typeless as UNORM"};
+    for (int which = 0; which < 3; ++which) {
+        const std::uint8_t* image = format_pixels.data() + which * size * 256;
+        const std::uint8_t* inside = image + (size * 3 / 4) * 256 + (size * 3 / 4) * 4;
+        const std::uint8_t* below = image + (size * 7 / 8) * 256 + (size * 3 / 8) * 4;  // under the diagonal: blue
+        const std::uint8_t* above = image + (size / 8) * 256 + (size / 8) * 4;          // over the diagonal: red
+        std::fprintf(stderr, "%s: quadrant %u,%u,%u,%u (want 0,%d,%d,255)\n", format_case_names[which], inside[0],
+                     inside[1], inside[2], inside[3], quadrant_green[which], quadrant_blue[which]);
+        EXPECT(inside[0] == 0 && std::abs(int(inside[1]) - quadrant_green[which]) <= 2 &&
+               std::abs(int(inside[2]) - quadrant_blue[which]) <= 2 && inside[3] == 255);
+        EXPECT(below[0] == 0 && below[1] == 0 && below[2] == 255 && below[3] == 255);
+        EXPECT(above[0] == 255 && above[1] == 0 && above[2] == 0 && above[3] == 255);
+    }
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
