@@ -815,7 +815,6 @@ class QueryTest(unittest.TestCase):
                     "native64": want_native64,
                     "per_vertex_inputs": True,
                     "barycentric_fallback": False,
-                    "explicit_lod_bias": False,
                     "max_push_constants_size": 256,
                     "vendor_id": 0,
                     "device_id": 0,
@@ -846,15 +845,6 @@ class QueryTest(unittest.TestCase):
                 res, _vk = self._run_query(FakeDevice(driver_id=driver))
                 self.assertIs(res["barycentric_fallback"], want)
         self.assertEqual(vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, 6)
-
-    def test_explicit_lod_bias(self):
-        """MoltenVK drops the sampler's mipLodBias (ps_ssharp), so the translator applies the S# bias itself there."""
-        for label, driver, want in (("moltenvk", vk_info.VK_DRIVER_ID_MOLTENVK, True), ("amd", 1, False),
-                                    ("radv", 3, False), ("llvmpipe", 13, False)):
-            with self.subTest(case=label):
-                res, _vk = self._run_query(FakeDevice(driver_id=driver))
-                self.assertIs(res["explicit_lod_bias"], want)
-        self.assertEqual(vk_info.VK_DRIVER_ID_MOLTENVK, 14)
 
     def test_barycentric_fallback_rejects_an_intel_windows_fake(self):
         """Intel Windows uses its Windows driver ID, not ANV; the fake must carry Intel's vendor ID."""

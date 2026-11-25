@@ -78,8 +78,9 @@ FMA_EXACT = False        # --fma exact: fused multiply-adds are emulated from si
 # maintenance8 outside gather. Implicit-LOD samples become Grad samples with the derivatives of the original
 # coordinate, so a per-pixel offset doesn't change the LOD. Gathers keep their Offset (shaderImageGatherExtended).
 TEXEL_OFFSET_FALLBACK = False
-# --explicit-lod-bias: MoltenVK 1.4.2 drops VkSamplerCreateInfo::mipLodBias (ps_ssharp: neither image_sample_lz with
-# a +1 S# LOD_BIAS nor the derivative-LOD image_sample with -1 moves a level). With this flag the shader applies the
+# --explicit-lod-bias: MoltenVK 1.4.2 on an Apple M3 drops VkSamplerCreateInfo::mipLodBias (ps_ssharp: neither
+# image_sample_lz with a +1 S# LOD_BIAS nor the derivative-LOD image_sample with -1 moves a level); on an Apple M5 Pro
+# the same MoltenVK applies it, so tools/lod_bias_probe.py measures it per device. With this flag the shader applies the
 # S#'s signed 5.8 LOD_BIAS (word 2 [13:0]) itself: added to the Lod of explicit-LOD samples and to the bias of
 # _b / _c_b, as a Bias operand on implicit samples, and as a 2^bias scale of Grad derivatives (lambda = log2 of
 # their length). The sampler still clamps the result to MIN_LOD..MAX_LOD. Only for a driver that drops the
@@ -19567,8 +19568,8 @@ def main():
                     help="image_sample*_o without VK_KHR_maintenance8 (e.g. NVIDIA Pascal): fold the texel offset into "
                          "the coordinate instead of the Offset operand")
     ap.add_argument("--explicit-lod-bias", action="store_true",
-                    help="add the S# LOD_BIAS to the Lod of explicit-LOD samples, for a driver that drops the sampler's "
-                         "mipLodBias there (MoltenVK 1.4.2); elsewhere the bias would count twice")
+                    help="apply the S# LOD_BIAS in the shader, for a driver whose sampler drops mipLodBias (measured by "
+                         "tools/lod_bias_probe.py); elsewhere the bias would count twice")
     ap.add_argument("--mesh-compute", action="store_true",
                     help="mesh shaders become compute shaders that write their vertices and primitives to a buffer "
                          "(metadata: mesh_compute), drawn by tools/mesh_compute_vs.py, for devices without "

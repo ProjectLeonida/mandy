@@ -193,13 +193,6 @@ def barycentric_fallback(vendor_id: int, device_id: int, driver_id: int) -> bool
             or gfx90c_amd_windows(vendor_id, device_id, driver_id))
 
 
-def explicit_lod_bias(driver_id: int) -> bool:
-    """Drivers that drop VkSamplerCreateInfo::mipLodBias from explicit-LOD samples: MoltenVK 1.4.2 (ps_ssharp's
-    "point bias +1" reads level 0 through image_sample_lz). The translator then adds the S# bias itself
-    (rdna2spirv.py --explicit-lod-bias)."""
-    return driver_id == VK_DRIVER_ID_MOLTENVK
-
-
 def physical_devices(vk, instance):
     # The list can grow between the count and fetch. Recount, with a bound for a changing driver.
     for _ in range(3):
@@ -373,7 +366,6 @@ def query(*, stage_caps=False) -> dict:
             "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,
             "barycentric_fallback": barycentric_fallback(vendor, device, driver),
-            "explicit_lod_bias": explicit_lod_bias(driver),
             "max_push_constants_size": max_push_constants_size,
             "vendor_id": vendor,
             "device_id": device,

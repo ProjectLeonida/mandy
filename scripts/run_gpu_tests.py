@@ -388,13 +388,16 @@ def _device_barycentric_fallback():
     return _BARYCENTRIC_FALLBACK[0]
 
 
-def _device_explicit_lod_bias():
-    """explicit_lod_bias from tools/vk_subgroup_info.py (MoltenVK), cached per suite, or None."""
+def _device_explicit_lod_bias(build: str | None):
+    """tools/lod_bias_probe.py's answer for the device the tests run on (cached per suite), or None: it draws ps_ssharp
+    translated without the flag and looks whether the sampler moved the level for LOD_BIAS +1 and -1."""
     if not _EXPLICIT_LOD_BIAS:
         answer = None
         try:
-            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
-                               capture_output=True, text=True, timeout=60)
+            if not build:
+                raise OSError("no test programs")
+            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "lod_bias_probe.py"), "--build", build],
+                               capture_output=True, text=True, timeout=300)
             answer = json.loads(r.stdout.strip().splitlines()[-1]).get("explicit_lod_bias")
         except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             pass
@@ -402,16 +405,16 @@ def _device_explicit_lod_bias():
     return _EXPLICIT_LOD_BIAS[0]
 
 
-def explicit_lod_bias() -> bool:
-    """LEONIDA_EXPLICIT_LOD_BIAS=1 (or 0): translate with --explicit-lod-bias, so an explicit-LOD sample takes the
-    S# LOD_BIAS in the shader. Unset, it is on where the driver drops mipLodBias there: tools/vk_subgroup_info.py
-    reports explicit_lod_bias true (MoltenVK)."""
+def explicit_lod_bias(build: str | None) -> bool:
+    """LEONIDA_EXPLICIT_LOD_BIAS=1 (or 0): translate with --explicit-lod-bias, so samples take the S# LOD_BIAS in the
+    shader. Unset, it is on where tools/lod_bias_probe.py measures that the sampler drops mipLodBias (MoltenVK on an
+    Apple M3, not on an M5 Pro: a driver ID can't tell); a probe without an answer leaves it off."""
     v = (os.environ.get("LEONIDA_EXPLICIT_LOD_BIAS") or "").strip().lower()
     if v in ("1", "true", "yes", "on"):
         return True
     if v in ("0", "false", "no", "off"):
         return False
-    return _device_explicit_lod_bias() is True
+    return _device_explicit_lod_bias(build) is True
 
 
 def w64_emulated() -> bool:
@@ -969,7 +972,7 @@ def run_suite(a, work: str) -> int:
             cmd.append("--f16-interp-fallback")
         if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
             cmd.append("--texel-offset-fallback")
-        if explicit_lod_bias():   # the S# LOD bias added to explicit LODs, which MoltenVK's sampler drops
+        if explicit_lod_bias(getattr(a, "build", None)):   # the S# LOD bias in the shader, where the sampler drops it (measured)
             cmd.append("--explicit-lod-bias")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
             cmd.append("--mesh-compute")
