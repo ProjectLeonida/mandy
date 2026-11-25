@@ -139,7 +139,13 @@ def build_image(is64: bool = True, with_directories: bool = True) -> bytes:
     place(buf, 0x1780, b"sample.dll\0")
 
     # .pdata: three RUNTIME_FUNCTION entries. TLS: two callbacks then the zero terminator.
-    place(buf, 0x1800, bytes(36))
+    if is64:
+        pdata_entries = (struct.pack("<III", 0x1000, 0x1040, 0x1A00) +
+                         struct.pack("<III", 0x1040, 0x1080, 0x1A00) +
+                         struct.pack("<III", 0x1080, 0x10C0, 0x1A00))
+        place(buf, 0x1800, pdata_entries)
+    else:
+        place(buf, 0x1800, bytes(36))
     tls = bytearray(40 if is64 else 24)
     struct.pack_into("<Q" if is64 else "<I", tls, 24 if is64 else 12, base + 0x1940)
     place(buf, 0x1900, bytes(tls))
@@ -302,6 +308,9 @@ class PeInspectTest(unittest.TestCase):
         for report in (self.report, self.report32):
             self.assertEqual(report["pdata_functions"], 3)
             self.assertEqual(report["tls_callbacks"], 2)
+        md32 = pe_inspect.to_markdown(self.report32)
+        self.assertIn("(non-x64)", md32)
+        self.assertNotIn("(OK)", md32)
 
     def test_pe32_headers_and_thunks(self):
         r = self.report32
@@ -974,6 +983,254 @@ class SectionBoundaryReadTest(unittest.TestCase):
                 image2[0x3FE:0x400] = straddle[:2]
                 image2[b_raw2:b_raw2 + width - 2] = straddle[2:]
                 self.assertEqual(pe_inspect._tls_callbacks(pe_inspect.PeImage(bytes(image2))), 1)
+
+
+class TestPdataStructured(unittest.TestCase):
+    """Clean-room unit tests for Exception Directory (.pdata) RUNTIME_FUNCTION parsing and validation.
+
+    Covers all 9 required verification scenarios matching the runtime loader contract (docs/design.md,
+    runtime/src/pe_loader.cpp Loader::register_unwind).
+    """
+
+    def inspect_buf(self, buf: bytes) -> dict:
+        img = pe_inspect.PeImage(buf)
+        return pe_inspect._inspect_pdata(img)
+
+    def test_case1_no_pdata_directory(self):
+        """Case 1: Image with no .pdata directory (present=False, valid=True, entry_count=0)."""
+        buf = bytearray(build_image(with_directories=False))
+        p = self.inspect_buf(bytes(buf))
+        self.assertFalse(p["present"])
+        self.assertTrue(p["valid"])
+        self.assertEqual(p["entry_count"], 0)
+        self.assertEqual(p["parsed_count"], 0)
+
+    def test_case2_valid_sorted_non_overlapping(self):
+        """Case 2: Valid sorted non-overlapping .pdata with adjacent ranges [0x1000, 0x1040) + [0x1040, 0x1080)."""
+        buf = bytearray(build_image())
+        entries = struct.pack("<III", 0x1000, 0x1040, 0x1A00) + struct.pack("<III", 0x1040, 0x1080, 0x1A00)
+        dirs_at = 0x58 + 112
+        struct.pack_into("<II", buf, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1800, 24)
+        place(buf, 0x1800, entries)
+        p = self.inspect_buf(bytes(buf))
+        self.assertTrue(p["present"])
+        self.assertTrue(p["valid"])
+        self.assertEqual(p["parsed_count"], 2)
+        self.assertEqual(p["entry_count"], 2)
+        self.assertEqual(p["min_begin"], "0x1000")
+        self.assertEqual(p["max_end"], "0x1080")
+        self.assertEqual(p["overlap_count"], 0)
+        self.assertEqual(p["unsorted_count"], 0)
+
+    def test_case3_valid_zero_length_entry(self):
+        """Case 3: Valid .pdata with zero-length entry (begin == end, symcryptk.dll pattern) at boundary."""
+        buf = bytearray(build_image())
+        entries = (
+            struct.pack("<III", 0x1000, 0x1040, 0x1A00) +
+            struct.pack("<III", 0x1040, 0x1040, 0x1A00) +
+            struct.pack("<III", 0x1040, 0x1080, 0x1A00)
+        )
+        dirs_at = 0x58 + 112
+        struct.pack_into("<II", buf, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1800, 36)
+        place(buf, 0x1800, entries)
+        p = self.inspect_buf(bytes(buf))
+        self.assertTrue(p["present"])
+        self.assertTrue(p["valid"])
+        self.assertEqual(p["parsed_count"], 3)
+        self.assertEqual(p["zero_length_count"], 1)
+        self.assertEqual(p["overlap_count"], 0)
+
+    def test_case4_inverted_entry(self):
+        """Case 4: Inverted entry (end < begin) -> valid=False, inverted_count=1, captured in sample_errors."""
+        buf = bytearray(build_image())
+        entries = struct.pack("<III", 0x1040, 0x1020, 0x1A00)
+        dirs_at = 0x58 + 112
+        struct.pack_into("<II", buf, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1800, 12)
+        place(buf, 0x1800, entries)
+        p = self.inspect_buf(bytes(buf))
+        self.assertFalse(p["valid"])
+        self.assertEqual(p["inverted_count"], 1)
+        self.assertTrue(any(e["reason"] == "inverted" for e in p["sample_errors"]))
+
+    def test_case5_out_of_bounds_entry(self):
+        """Case 5: Out-of-bounds entry (end > size_of_image or unwind outside) -> valid=False, out_of_bounds_count >= 1."""
+        buf = bytearray(build_image())
+        entries = struct.pack("<III", 0x1000, 0x2500, 0x1A00)
+        dirs_at = 0x58 + 112
+        struct.pack_into("<II", buf, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1800, 12)
+        place(buf, 0x1800, entries)
+        p = self.inspect_buf(bytes(buf))
+        self.assertFalse(p["valid"])
+        self.assertGreaterEqual(p["out_of_bounds_count"], 1)
+        self.assertTrue(any(e["reason"] == "out_of_bounds" for e in p["sample_errors"]))
+
+    def test_case6_unsorted_entries(self):
+        """Case 6: Unsorted entries (begin < prev_begin) -> valid=False, unsorted_count=1."""
+        buf = bytearray(build_image())
+        entries = struct.pack("<III", 0x1040, 0x1080, 0x1A00) + struct.pack("<III", 0x1000, 0x1040, 0x1A00)
+        dirs_at = 0x58 + 112
+        struct.pack_into("<II", buf, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1800, 24)
+        place(buf, 0x1800, entries)
+        p = self.inspect_buf(bytes(buf))
+        self.assertFalse(p["valid"])
+        self.assertEqual(p["unsorted_count"], 1)
+        self.assertTrue(any(e["reason"] == "unsorted" for e in p["sample_errors"]))
+
+    def test_case7_overlapping_entries(self):
+        """Case 7: Overlapping entries ([0x1000, 0x1050) followed by [0x1030, 0x1080)) -> valid=False, overlap_count=1."""
+        buf = bytearray(build_image())
+        entries = struct.pack("<III", 0x1000, 0x1050, 0x1A00) + struct.pack("<III", 0x1030, 0x1080, 0x1A00)
+        dirs_at = 0x58 + 112
+        struct.pack_into("<II", buf, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1800, 24)
+        place(buf, 0x1800, entries)
+        p = self.inspect_buf(bytes(buf))
+        self.assertFalse(p["valid"])
+        self.assertEqual(p["overlap_count"], 1)
+        self.assertTrue(any(e["reason"] == "overlap" for e in p["sample_errors"]))
+
+    def test_case8_misaligned_directory_size(self):
+        """Case 8: Misaligned directory size (size = 20, trailing_bytes = 8) -> valid=True, parsed_count=1 (loader parity)."""
+        buf = bytearray(build_image())
+        entries = struct.pack("<III", 0x1000, 0x1040, 0x1A00) + b"\x00" * 8
+        dirs_at = 0x58 + 112
+        struct.pack_into("<II", buf, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1800, 20)
+        place(buf, 0x1800, entries)
+        p = self.inspect_buf(bytes(buf))
+        self.assertTrue(p["valid"])
+        self.assertEqual(p["entry_count"], 1)
+        self.assertEqual(p["parsed_count"], 1)
+        self.assertEqual(p["trailing_bytes"], 8)
+        self.assertEqual(p["sample_errors"], [])
+
+        with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as f:
+            f.write(bytes(buf))
+            f.flush()
+            tmp_path = f.name
+        try:
+            report = pe_inspect.inspect(tmp_path, None)
+            md = pe_inspect.to_markdown(report)
+            self.assertIn("OK", md)
+            self.assertIn("8 trailing bytes ignored", md)
+            self.assertNotIn("INVALID", md)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_pdata_boundary_partial_tail_passes_while_truncated_entry_fails(self):
+        """Boundary at 0x2000 (RVA 0x1ff4): size 12 and 20 are valid; size 24 is truncated (valid=False)."""
+        raw_base = bytearray(build_image(with_directories=False))
+        dirs_at = 0x58 + 112
+        entry = struct.pack("<III", 0x1000, 0x1040, 0x1A00)
+
+        # Size 12: exactly 1 entry ends at 0x2000 -> valid=True, truncated=False
+        b12 = bytearray(raw_base)
+        struct.pack_into("<II", b12, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1FF4, 12)
+        place(b12, 0x1FF4, entry)
+        p12 = self.inspect_buf(bytes(b12))
+        self.assertTrue(p12["valid"])
+        self.assertFalse(p12["truncated"])
+        self.assertEqual(p12["parsed_count"], 1)
+        self.assertEqual(p12["entry_count"], 1)
+        self.assertEqual(p12["trailing_bytes"], 0)
+
+        # Size 20: 1 complete entry ends at 0x2000 + 8-byte partial tail past mapped boundary -> valid=True (loader parity)
+        b20 = bytearray(raw_base)
+        struct.pack_into("<II", b20, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1FF4, 20)
+        place(b20, 0x1FF4, entry)
+        p20 = self.inspect_buf(bytes(b20))
+        self.assertTrue(p20["valid"])
+        self.assertFalse(p20["truncated"])
+        self.assertEqual(p20["parsed_count"], 1)
+        self.assertEqual(p20["entry_count"], 1)
+        self.assertEqual(p20["trailing_bytes"], 8)
+
+        # Size 24: 2 complete entries declared, second entry missing/truncated past boundary -> valid=False, truncated=True
+        b24 = bytearray(raw_base)
+        struct.pack_into("<II", b24, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1FF4, 24)
+        place(b24, 0x1FF4, entry)
+        p24 = self.inspect_buf(bytes(b24))
+        self.assertFalse(p24["valid"])
+        self.assertTrue(p24["truncated"])
+        self.assertEqual(p24["parsed_count"], 1)
+        self.assertEqual(p24["entry_count"], 2)
+        self.assertEqual(p24["trailing_bytes"], 0)
+
+    def test_pdata_unwind_data_near_size_of_image_boundary_out_of_bounds(self):
+        """UnwindData within 4 bytes of SizeOfImage (e.g. SizeOfImage - 2) requires min 4-byte header -> out_of_bounds."""
+        buf = bytearray(build_image())
+        img = pe_inspect.PeImage(bytes(buf))
+        # Begin and End in range [0x1000, 0x1040), but UnwindData at size_of_image - 2
+        bad_unwind = img.size_of_image - 2
+        entries = struct.pack("<III", 0x1000, 0x1040, bad_unwind)
+        dirs_at = 0x58 + 112
+        struct.pack_into("<II", buf, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1800, 12)
+        place(buf, 0x1800, entries)
+        p = self.inspect_buf(bytes(buf))
+        self.assertFalse(p["valid"])
+        self.assertEqual(p["out_of_bounds_count"], 1)
+        self.assertTrue(any(e["reason"] == "out_of_bounds" for e in p["sample_errors"]))
+
+    def test_arm64_pdata_eight_byte_entries(self):
+        """ARM64 (0xAA64) .pdata uses 8-byte entries and format='arm64'."""
+        buf = bytearray(build_image())
+        struct.pack_into("<H", buf, 0x44, 0xAA64)
+        dirs_at = 0x58 + 112
+        struct.pack_into("<II", buf, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1800, 16)
+        p = self.inspect_buf(bytes(buf))
+        self.assertEqual(p["format"], "arm64")
+        self.assertEqual(p["entry_count"], 2)
+        self.assertEqual(p["trailing_bytes"], 0)
+        self.assertTrue(p["valid"])
+
+        with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as f:
+            f.write(bytes(buf))
+            f.flush()
+            tmp_path = f.name
+        try:
+            report = pe_inspect.inspect(tmp_path, None)
+            self.assertEqual(report["pdata_functions"], 2)
+            md = pe_inspect.to_markdown(report)
+            self.assertIn("(arm64)", md)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_zero_copy_pdata_tracemalloc(self):
+        """Zero-copy memoryview slicing prevents directory-sized memory spikes."""
+        import tracemalloc
+        for is_x64 in (False, True):
+            with self.subTest(is_x64=is_x64):
+                size = 1 << 20  # 1 MiB
+                raw = bytearray(build_image(is_x64, False))
+                raw.extend(bytes(0x200 + size - len(raw)))
+                section = 0x58 + (240 if is_x64 else 224)
+                struct.pack_into("<III", raw, section + 8, size, 0x1000, size)
+                struct.pack_into("<I", raw, 0x58 + 56, 0x1000 + size)
+                dirs_offset = 0x58 + (112 if is_x64 else 96)
+                struct.pack_into("<II", raw, dirs_offset + pe_inspect.DIR_EXCEPTION * 8, 0x1000, size)
+                img = pe_inspect.PeImage(bytes(raw))
+                tracemalloc.start()
+                report = pe_inspect._inspect_pdata(img)
+                peak = tracemalloc.get_traced_memory()[1]
+                tracemalloc.stop()
+                self.assertLess(peak, 65536, f"Peak memory {peak} exceeded 64 KiB for is_x64={is_x64}")
+                self.assertTrue(report["present"])
+
+    def test_case9_unmapped_or_truncated(self):
+        """Case 9: Unmapped/truncated .pdata RVA -> valid=False, sample_errors bounded <= 5."""
+        buf = bytearray(build_image())
+        dirs_at = 0x58 + 112
+        struct.pack_into("<II", buf, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x5000, 24)
+        p = self.inspect_buf(bytes(buf))
+        self.assertFalse(p["mapped"])
+        self.assertFalse(p["valid"])
+
+        buf2 = bytearray(build_image())
+        bad_entries = b"".join(struct.pack("<III", 0x1040 + i * 16, 0x1020 + i * 16, 0x1A00) for i in range(10))
+        struct.pack_into("<II", buf2, dirs_at + pe_inspect.DIR_EXCEPTION * 8, 0x1800, len(bad_entries))
+        place(buf2, 0x1800, bad_entries)
+        p2 = self.inspect_buf(bytes(buf2))
+        self.assertFalse(p2["valid"])
+        self.assertEqual(p2["inverted_count"], 10)
+        self.assertLessEqual(len(p2["sample_errors"]), 5)
 
 
 if __name__ == "__main__":
