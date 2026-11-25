@@ -1,0 +1,78 @@
+; Ops merged with CPU-only checks (#1649 packed 16-bit integer ops, #1673 v_swaprel_b32, #1598 s_movrels_b32,
+; #1539 ds_or/xor_b64), run once on a GPU. Lane 0 of a wave32 group stores eight dwords:
+;   out[0] = v_pk_add_u16(0xFFFF0001, 0x00010002) clamp         = 0xFFFF0003  (high half saturates)
+;   out[1] = v_pk_sub_i16(0x80000005, 0x00010007)                = 0x7FFFFFFE  (wraps: -32768-1, 5-7)
+;   out[2] = v_pk_mad_u16(0x00030002, 0x00050004, 0x00070006) op_sel:[1,0,0] op_sel_hi:[0,1,1] = 0x00110012
+;            (low half: S0.hi * S1.lo + S2.lo = 3*4+6; high half: S0.lo * S1.hi + S2.hi = 2*5+7)
+;   out[3] = v_pk_max_i16(0x8000FFFF, 0x00010000)                = 0x00010000
+;   out[4], out[5] = v12, v15 after v_swaprel_b32 v10, v11 with M0 = (2 << 16) | 4: swaps v12 and v15
+;            (v10..v15 = 0x100..0x105)                            = 0x105, 0x102
+;   out[6] = s_movrels_b32 s30, s20 with M0 = 3 (s20..s23 = 0x200..0x203) = 0x203
+;   out[7] = ds_or_rtn_b64 old high dword ^ the LDS high dword after ds_xor_b64 (lane 0 only: EXEC is cut to
+;            lane 0 before the LDS ops, since 32 lanes on one address would cancel the XOR in pairs): (0x11110000) ^ ((0x11110000 |
+;            0x0000FF00) ^ 0x00F00000)                            = 0x00F0FF00
+; group: 32,1,1
+; Run: vk_compute_test cs_w32_pk_rel_ext.spv 1 dump -> out[0..7] = 4294901763 2147483646 1114130 65536 261 258 515 15793920
+; mattr: +wavefrontsize32,-wavefrontsize64
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
+v_mov_b32_e32 v1, 0xffff0001
+v_mov_b32_e32 v2, 0x10002
+v_pk_add_u16 v3, v1, v2 clamp
+v_mov_b32_e32 v1, 0x80000005
+v_mov_b32_e32 v2, 0x10007
+v_pk_sub_i16 v4, v1, v2
+v_mov_b32_e32 v1, 0x30002
+v_mov_b32_e32 v2, 0x50004
+v_mov_b32_e32 v5, 0x70006
+v_pk_mad_u16 v5, v1, v2, v5 op_sel:[1,0,0] op_sel_hi:[0,1,1]
+v_mov_b32_e32 v1, 0x8000ffff
+v_mov_b32_e32 v2, 0x10000
+v_pk_max_i16 v6, v1, v2
+v_mov_b32_e32 v10, 0x100
+v_mov_b32_e32 v11, 0x101
+v_mov_b32_e32 v12, 0x102
+v_mov_b32_e32 v13, 0x103
+v_mov_b32_e32 v14, 0x104
+v_mov_b32_e32 v15, 0x105
+s_mov_b32 m0, 0x20004
+v_swaprel_b32 v10, v11
+s_mov_b32 s20, 0x200
+s_mov_b32 s21, 0x201
+s_mov_b32 s22, 0x202
+s_mov_b32 s23, 0x203
+s_mov_b32 m0, 3
+s_movrels_b32 s30, s20
+v_cmpx_eq_u32_e32 0, v0
+v_mov_b32_e32 v16, 0x40
+v_mov_b32_e32 v18, 0
+v_mov_b32_e32 v19, 0x11110000
+ds_write_b64 v16, v[18:19]
+s_waitcnt lgkmcnt(0)
+v_mov_b32_e32 v20, 0
+v_mov_b32_e32 v21, 0xff00
+ds_or_rtn_b64 v[22:23], v16, v[20:21]
+s_waitcnt lgkmcnt(0)
+v_mov_b32_e32 v21, 0xf00000
+ds_xor_b64 v16, v[20:21]
+s_waitcnt lgkmcnt(0)
+ds_read_b64 v[24:25], v16
+s_waitcnt lgkmcnt(0)
+v_xor_b32_e32 v7, v23, v25
+v_mov_b32_e32 v26, 0
+buffer_store_dword v3, v26, s[0:3], 0 offen
+v_mov_b32_e32 v26, 4
+buffer_store_dword v4, v26, s[0:3], 0 offen
+v_mov_b32_e32 v26, 8
+buffer_store_dword v5, v26, s[0:3], 0 offen
+v_mov_b32_e32 v26, 12
+buffer_store_dword v6, v26, s[0:3], 0 offen
+v_mov_b32_e32 v26, 16
+buffer_store_dword v12, v26, s[0:3], 0 offen
+v_mov_b32_e32 v26, 20
+buffer_store_dword v15, v26, s[0:3], 0 offen
+v_mov_b32_e32 v26, 24
+v_mov_b32_e32 v27, s30
+buffer_store_dword v27, v26, s[0:3], 0 offen
+v_mov_b32_e32 v26, 28
+buffer_store_dword v7, v26, s[0:3], 0 offen
+s_endpgm
