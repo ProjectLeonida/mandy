@@ -1,4 +1,4 @@
-// Synthetic byte-for-byte CopyBufferRegion oracle. --warp-only measures the native reference without Vulkan.
+// Synthetic byte-for-byte oracle for CopyBufferRegion and buffer CopyResource. --warp-only measures the native reference without Vulkan.
 #include "vk_test_device.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
@@ -11,7 +11,10 @@
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); return false; } } while (0)
 namespace {
 template<class T> struct Ref { T* p = nullptr; ~Ref() { if (p) p->Release(); } T* operator->() const { return p; } };
-struct Case { UINT64 source_bytes, destination_bytes, source_offset, destination_offset, bytes; };
+struct Case {
+    UINT64 source_bytes, destination_bytes, source_offset, destination_offset, bytes;
+    bool whole_resource = false;
+};
 bool buffer(ID3D12Device* device, UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state, Ref<ID3D12Resource>& out) {
     const D3D12_HEAP_PROPERTIES properties{heap};
     D3D12_RESOURCE_DESC desc{}; desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -81,7 +84,8 @@ bool run(ID3D12Device* device, const Case& c, UINT64 predicate, D3D12_PREDICATIO
         list->BeginQuery(statistics.p,D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0);
     }
     if(enabled) list->SetPredication(condition.p,8,op);
-    list->CopyBufferRegion(destination.p,c.destination_offset,source.p,c.source_offset,c.bytes);
+    if (c.whole_resource) list->CopyResource(destination.p, source.p);
+    else list->CopyBufferRegion(destination.p,c.destination_offset,source.p,c.source_offset,c.bytes);
     list->SetPredication(nullptr,0,D3D12_PREDICATION_OP_EQUAL_ZERO);
     if (statistics_query) {
         list->EndQuery(statistics.p,D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0);
@@ -238,7 +242,8 @@ int main(int argc,char** argv) {
         if(FAILED(rt::d3d12::create_vulkan_device(info,IID_PPV_ARGS(&ours.p))))return 1;
     }
     const Case cases[]={{1,1,0,0,1},{2,3,1,2,1},{7,11,1,3,5},{13,17,3,1,7},{33,35,0,3,32},
-        {257,259,1,3,256},{4099,4103,3,7,4096},{4099,4103,4098,4102,1},{13,17,13,17,0}};
+        {257,259,1,3,256},{4099,4103,3,7,4096},{4099,4103,4098,4102,1},{13,17,13,17,0},
+        {1,1,0,0,1,true},{4099,4099,0,0,4099,true}};
     unsigned count=0;
     for(const auto& c:cases)for(UINT64 value:{UINT64_C(0),UINT64_C(1),UINT64_C(1)<<32,(UINT64_C(1)<<32)|7,UINT64_MAX})
         for(auto op:{D3D12_PREDICATION_OP_EQUAL_ZERO,D3D12_PREDICATION_OP_NOT_EQUAL_ZERO})for(bool enabled:{false,true}) {
@@ -278,12 +283,13 @@ int main(int argc,char** argv) {
             }
     // D3D-162: capture and byte-copy helpers are invisible in every statistics counter, whether executed or skipped.
     if (!native_only && vk.pipeline_statistics_query) {
-        for (UINT64 value : {UINT64_C(0),UINT64_C(1)<<32})
-            for (auto op : {D3D12_PREDICATION_OP_EQUAL_ZERO,D3D12_PREDICATION_OP_NOT_EQUAL_ZERO}) {
-                std::vector<unsigned char> expected,actual;
-                if (!run(host.p,cases[3],value,op,true,expected,true) ||
-                    !run(ours.p,cases[3],value,op,true,actual,true) || actual!=expected) return 1;
-            }
+        for (const auto& copy : {cases[3], cases[std::size(cases) - 1]})
+            for (UINT64 value : {UINT64_C(0),UINT64_C(1)<<32})
+                for (auto op : {D3D12_PREDICATION_OP_EQUAL_ZERO,D3D12_PREDICATION_OP_NOT_EQUAL_ZERO}) {
+                    std::vector<unsigned char> expected,actual;
+                    if (!run(host.p,copy,value,op,true,expected,true) ||
+                        !run(ours.p,copy,value,op,true,actual,true) || actual!=expected) return 1;
+                }
     }
     if(!native_only&&vk.validation_errors())return 1;
     std::printf("query-to-predicated-copy: %u exact cases, %u recapture controls; GPU overwrite and predicate guards exact\n",query_cases,recapture_controls);

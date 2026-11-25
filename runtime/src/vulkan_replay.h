@@ -3229,7 +3229,6 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
             if (!copies) return unsupported_at(__LINE__);
-            if (predicated && !std::holds_alternative<CopyBuffer>(command)) ++out.unpredicated_copies;
             const auto [dst_id, src_id] = copy_ids(command);
             const ResourceBinding* source = resolve(src_id);
             if (!bind(dst_id) || !source) return unresolved_at(__LINE__);
@@ -3253,11 +3252,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     return ReplayResult::invalid_copy;
                 if (p.source.buffer == p.binding.buffer && src < dst + buffer_copy->size && dst < src + buffer_copy->size)
                     return ReplayResult::invalid_copy;
-                if (predicated) {
-                    if ((statistics_active && !statistics_helpers) || !vk.prepare_predicated_copy || !vk.emit_predicated_copy ||
-                        !vk.prepare_predicated_copy(p.source.buffer, p.binding.buffer, src, dst, buffer_copy->size, p.predicated_copy))
-                        return unsupported_at(__LINE__);
-                } else p.buffer_copies.push_back({src, dst, buffer_copy->size});
+                p.buffer_copies.push_back({src, dst, buffer_copy->size});
             } else if (const auto* texture_copy = std::get_if<CopyTexture>(&command)) {
                 result = detail::prepare_texture_copy(*texture_copy, p);
                 if (result == ReplayResult::success && !p.staged_reads.empty()) {
@@ -3374,10 +3369,23 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 p.image_copies.clear();
             }
             if (result != ReplayResult::success) return result;
+            if (predicated) {
+                if (p.buffer_copies.empty()) {
+                    ++out.unpredicated_copies;  // Texture copies still use transfer commands.
+                } else {
+                    // CopyBufferRegion and buffer CopyResource each produce one validated byte range.
+                    const VkBufferCopy& region = p.buffer_copies.front();
+                    if ((statistics_active && !statistics_helpers) ||
+                        !vk.prepare_predicated_copy || !vk.emit_predicated_copy ||
+                        !vk.prepare_predicated_copy(p.source.buffer, p.binding.buffer, region.srcOffset,
+                                                    region.dstOffset, region.size, p.predicated_copy))
+                        return unsupported_at(__LINE__);
+                    p.buffer_copies.clear();
+                }
+            }
             if (p.binding.host_readable) {
                 out.wrote_readback = true;
-                const bool compute_write =
-                    (predicated && std::holds_alternative<CopyBuffer>(command)) || (p.has_depth24 && !p.binding.image);
+                const bool compute_write = !p.predicated_copy.empty() || (p.has_depth24 && !p.binding.image);
                 out.readback_src_stages |= compute_write
                     ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_2_COPY_BIT;
             }
@@ -3981,7 +3989,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
     const bool predicates = vk.begin_conditional_rendering != nullptr;
     VkConditionalRenderingBeginInfoEXT predicate{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
     std::size_t next_query = 0;
-    // A dispatch honours conditional rendering and a copy does not (the layer runs copies unpredicated), so the
+    // A dispatch honours conditional rendering and a Vulkan transfer copy does not, so the
     // conversion around a copy must run whatever the predicate says: end it for the dispatch and begin it again.
     const auto run_depth24 = [&](const Depth24Job& job) {
         if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
