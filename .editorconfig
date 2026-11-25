@@ -1,0 +1,15 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+
+[*.{bat,cmd,ps1,sln}]
+end_of_line = crlf
+
+[runtime/test/d3d12_depth_resolve_test.cpp]
+charset = utf-8-bom
+
+[runtime/test/d3d12_sparse_queue_family_test.cpp]
+charset = utf-8-bom
