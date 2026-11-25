@@ -420,6 +420,7 @@ class Gen:
                                   # single defining plain v_mov of it); valid I/J sources (SHADER-177)
         self.blocks = []      # per basic block: list of SPIR-V lines (dispatch-loop form), empty = straight-line
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
+        self.out_pcs = None   # per basic block: exact set of %pc values written (including cfg_structure.END)
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
         self.tbuffer_norm_fns: dict[int, list[str]] = {}  # one exact quotient per used magnitude width
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
@@ -6574,6 +6575,26 @@ class Gen:
             return self.cu(0), self.cu(0)
         raise Unsupported(op + " source")
 
+    @staticmethod
+    def valu_imm_i64(v: int) -> int:
+        """The 64-bit value of an immediate in a signed 64-bit VALU source (v_cmp(x)_*_i64, v_ashrrev_i64 S1,
+        v_mad_i64_i32 S2). LLVM AMDGPU operand syntax, "Conversion of Integer Values": a 32-bit literal used as an
+        i64 operand is sign-extended ({-1, num.i32}), as a u64/b64 operand zero-extended ({0, num.u32}, which
+        src64_data does). llvm-mc prints -100 as 0xffffff9c, so a printed literal with bit 31 set is widened here;
+        inline constants (-16..-1) and decimal literals are parsed as negative already and pass through the mask.
+        The scalar ops do the same (SHADER-SALU-LITERAL-SEXT, #978)."""
+        v &= 0xFFFFFFFFFFFFFFFF
+        if 0x80000000 <= v <= 0xFFFFFFFF:
+            v |= 0xFFFFFFFF00000000
+        return v
+
+    def src64_i64(self, s, op):
+        """src64_data for a signed 64-bit VALU source: an immediate is widened by valu_imm_i64."""
+        if s["k"] == "imm":
+            v = self.valu_imm_i64(s["v"])
+            return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+        return self.src64_data(s, op)
+
     def dst64_data(self, d, rlo, rhi, op, *, allow_null=False):
         if allow_null and d["k"] == "special" and d.get("t") == "null":
             return
@@ -9108,12 +9129,12 @@ class Gen:
             # v_cmpx (GFX10) writes EXEC only.
             cmpx = op.startswith("v_cmpx_")
             d, x, y = (None, a[-2], a[-1]) if cmpx else (a[0], a[1], a[2])
+            cond, signed = op.split("_")[2], op.endswith("_i64")
             def pair64(sv):
                 if sv["k"] == "vgpr" and sv.get("n") == 2:
                     return self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
-                return self.src64_data(sv, op)
+                return self.src64_i64(sv, op) if signed else self.src64_data(sv, op)
             (x0, x1), (y0, y1) = pair64(x), pair64(y)
-            cond, signed = op.split("_")[2], op.endswith("_i64")
             hi_op = {"lt": "LessThan", "le": "LessThan", "gt": "GreaterThan", "ge": "GreaterThan"}[cond]
             lo_op = {"lt": "ULessThan", "le": "ULessThanEqual", "gt": "UGreaterThan", "ge": "UGreaterThanEqual"}[cond]
             hx, hy = (self.as_int(x1), self.as_int(y1)) if signed else (x1, y1)
@@ -9168,8 +9189,9 @@ class Gen:
             if src["k"] in ("vgpr", "sgpr") and src.get("n") == 2:
                 lo, hi = self.load_reg(src["k"], src["r"]), self.load_reg(src["k"], src["r"] + 1)
             elif src["k"] == "imm":
-                # 64-bit inline/literal constant: sign-extended from 32 bits.
-                v = src["v"] & 0xFFFFFFFFFFFFFFFF
+                # 64-bit inline/literal constant: an inline constant is sign-extended; a 32-bit literal is
+                # sign-extended for the i64 shift and zero-extended for the b64 ones (valu_imm_i64).
+                v = self.valu_imm_i64(src["v"]) if op == "v_ashrrev_i64" else src["v"] & 0xFFFFFFFFFFFFFFFF
                 lo, hi = self.cu(v & 0xFFFFFFFF), self.cu((v >> 32) & 0xFFFFFFFF)
             else:
                 raise Unsupported(op + " operands")
@@ -9909,7 +9931,7 @@ class Gen:
             def pair(s):
                 if s["k"] == "vgpr" and s.get("n") == 2:
                     return self.load_reg(s["k"], s["r"]), self.load_reg(s["k"], s["r"] + 1)
-                return self.src64_data(s, op)
+                return self.src64_i64(s, op) if op.endswith("_i64") else self.src64_data(s, op)
             (x0, x1), (y0, y1) = pair(x), pair(y)
             e0, e1, eq, r = (self.tmp() for _ in range(4))
             self.emit(f"{e0} = OpIEqual %bool {x0} {y0}")
@@ -12387,7 +12409,8 @@ class Gen:
             if s2["k"] in ("vgpr", "sgpr") and s2.get("n") == 2:
                 c_lo, c_hi = self.load_reg(s2["k"], s2["r"]), self.load_reg(s2["k"], s2["r"] + 1)
             elif s2["k"] == "imm":
-                v = s2["v"] & 0xFFFFFFFFFFFFFFFF          # 64-bit inline/literal constant: sign-extended from 32 bits
+                # An inline constant is sign-extended; a 32-bit literal too for the i64 S2, zero-extended for u64.
+                v = self.valu_imm_i64(s2["v"]) if signed else s2["v"] & 0xFFFFFFFFFFFFFFFF
                 c_lo, c_hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
             else:
                 raise Unsupported(op + " operands")
@@ -16483,7 +16506,7 @@ def assemble(gen):
         helpers.extend(function)
     for function in gen.x_round_fns.values():
         helpers.extend(function)
-    tree, nesting = (capped_tree(gen.succ) if gen.blocks and not gen.emulate and not gen.bar_rounds
+    tree, nesting = (capped_tree(gen.succ, gen.out_pcs) if gen.blocks and not gen.emulate and not gen.bar_rounds
                      else (None, None))
     if nesting is not None:
         gen.nesting = nesting
@@ -18276,6 +18299,7 @@ def translate(path):
                 g.cu(n)
             raw_edges = split_edges
     succ = [list(dict.fromkeys(e)) for e in raw_edges]
+    g.out_pcs = _block_out_pcs(blocks, raw_edges, succ)
     g.vm_latch = stage == "ps" and exec_changes_after_vm(blocks, succ)
     g.park_masks((blocks, succ))
     halves_analysis(g, blocks, succ)
@@ -18555,14 +18579,34 @@ def finish_module(g):
     return spirv_loop_guard.add_guards(text, LOOP_LIMIT)
 
 
-def capped_tree(succ):
+def _block_out_pcs(blocks, raw_edges, succ):
+    """Possible `%pc` values each basic block can store (`cfg_structure.END` when the block can end the shader).
+    A conditional branch with no fallthrough block (`len(raw_edges[b]) == 1`, i.e. the last block or a split clone
+    of it) emits `OpSelect %uint cond tgt len(blocks)` and therefore writes either `tgt` or `END`."""
+    out_pcs = {}
+    for b, blk in enumerate(blocks):
+        pcs = set(succ[b])
+        if not pcs:
+            pcs.add(cfg_structure.END)
+        elif len(raw_edges[b]) == 1:
+            last = next((i for i in blk if base_op(i["op"]) == "s_endpgm" or base_op(i["op"]) in BRANCHES), None)
+            if last is not None and base_op(last["op"]) in BRANCHES and base_op(last["op"]) != "s_branch":
+                pcs.add(cfg_structure.END)
+        out_pcs[b] = frozenset(pcs)
+    return out_pcs
+
+
+def capped_tree(succ, out_pcs=None):
     """(tree, nesting): the structured tree for `succ` and its depth, or (None, None) under --dispatch-loop or when
     cfg_structure can't structure it; tree is None (nesting still the measured depth) when it nests deeper than
     MAX_STRUCTURED_DEPTH. assemble() emits exactly this tree, and needs_barrier_rounds() decides from the same one
     (SHADER-427 review): a barrier in a tree that falls back to the dispatch loop isn't at a structured top level."""
-    tree = cfg_structure.structure(succ) if STRUCTURED else None
+    if out_pcs is None:
+        out_pcs = {b: (set(succ[b]) if succ[b] else {cfg_structure.END}) for b in range(len(succ))}
+    tree = cfg_structure.structure(succ, out_pcs=out_pcs) if STRUCTURED else None
     if tree is None:
         return None, None
+    tree = cfg_structure.unwrap_known_pc_guards(tree, out_pcs)
     nesting = cfg_structure.depth(tree)
     if MAX_STRUCTURED_DEPTH and nesting > MAX_STRUCTURED_DEPTH:
         return None, nesting                         # too deep to validate cheaply: use the flat form
@@ -18589,7 +18633,7 @@ def needs_barrier_rounds(g, blocks, succ):
                 break
     if not with_barrier:
         return False
-    tree, _ = capped_tree(succ)         # the tree assemble() emits: over MAX_STRUCTURED_DEPTH it's the dispatch loop
+    tree, _ = capped_tree(succ, g.out_pcs)  # the tree assemble() emits: over MAX_STRUCTURED_DEPTH it's the dispatch loop
     top = {it[1] for it in tree if it[0] == "block"} if tree is not None else set()
     return not with_barrier <= top
 
