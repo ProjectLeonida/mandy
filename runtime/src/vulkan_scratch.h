@@ -161,9 +161,7 @@ private:
     bool make_chunk(std::uint64_t size, Chunk& out) {
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size;
-        // INDEX_BUFFER: a draw that reads past its index view's end binds a staged copy (vulkan_replay.h, prepare).
-        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT | extra_usage_;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | extra_usage_;
         // A retired chunk can be reused by a submission on a different queue family.
         share_across_queue_families(info, families_);
         if (vk_.vkCreateBuffer(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) return false;

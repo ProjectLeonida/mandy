@@ -9841,7 +9841,10 @@ public:
             [this, index_scratch](const VkMemoryRequirements& requirements) {
                 return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, index_scratch);
             },
-            index_scratch ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0, state_.families);
+            // INDEX_BUFFER on every GPU: a draw that reads past its index view's end binds a staged copy
+            // (vulkan_replay.h, prepare_draw).
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT | (index_scratch ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
+            state_.families);
         if (info.buffer_device_address && info.physical && info.get_instance_proc) {
             if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {

@@ -184,7 +184,8 @@ int main(int argc, char** argv) {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&index_default_heap, D3D12_HEAP_FLAG_NONE, &large_index_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&live_indices.p))));
-        EXPECT(live_indices->GetGPUVirtualAddress() == 64 * 1024 + 64 * 1024 * sizeof(std::uint32_t));
+        // The first allocation follows the 64 KiB zero page and the quad index table (16 Ki quads of 6 indices).
+        EXPECT(live_indices->GetGPUVirtualAddress() == 64 * 1024 + 16 * 1024 * 6 * sizeof(std::uint32_t));
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&index_upload_heap, D3D12_HEAP_FLAG_NONE, &large_index_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&index_upload.p))));
