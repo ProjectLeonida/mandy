@@ -5,6 +5,8 @@
 //   4. VS ClipDistance[2] and CullDistance[3] forwarding (capabilities, BuiltIn arrays, no duplicate types).
 //   5. Combined link_f16_halves + build_bary_fallback_gs: f16 relocation preserves bary_location and forwards relocated halves.
 //   6. Clean refusals: mixed ClipDistance + CullDistance, ShaderLayer / ShaderViewportIndex, non-vec3 collision at bary_location.
+//   7. Computed I/J pairs (RT-BARY-FALLBACK-PER-VERTEX): a PS `Flat vec4[3]` Input named by `per_vertex` gets the
+//      triangle's three values of the VS output it maps, with shared GS Inputs, zero-fill and clean refusals.
 // Optional `--dump-dir <dir>` writes each synthesized GS binary for external `spirv-val` inspection.
 // No GPU or game files required.
 #include "../src/spirv_bary_fallback.h"
@@ -141,7 +143,8 @@ std::vector<std::uint32_t> build_vs(const VsSpec& spec) {
 std::vector<std::uint32_t> build_ps(const std::vector<std::uint32_t>& raw_locs,
                                     const std::set<std::uint32_t>& flat_locs,
                                     std::optional<std::uint32_t> bary_v3_loc,
-                                    const std::map<std::uint32_t, std::array<std::uint32_t, 2>>& f16_halves = {}) {
+                                    const std::map<std::uint32_t, std::array<std::uint32_t, 2>>& f16_halves = {},
+                                    const std::vector<std::uint32_t>& pv_bases = {}) {
     std::uint32_t next_id = 1;
     const auto alloc = [&]() { return next_id++; };
 
@@ -165,6 +168,16 @@ std::vector<std::uint32_t> build_ps(const std::vector<std::uint32_t>& raw_locs,
         in_v4_vars.push_back({alloc(), pair[0]});
         in_v4_vars.push_back({alloc(), pair[1]});
     }
+    // --bary-fallback computed I/J pairs: a Flat vec4[3] Input at each first location (rdna2spirv's pv_fallback).
+    std::uint32_t id_uint = 0, id_uint_3 = 0, id_arr_v4_3 = 0, id_ptr_in_arr = 0;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> in_pv_vars;
+    if (!pv_bases.empty()) {
+        id_uint = alloc();
+        id_uint_3 = alloc();
+        id_arr_v4_3 = alloc();
+        id_ptr_in_arr = alloc();
+        for (std::uint32_t base : pv_bases) in_pv_vars.push_back({alloc(), base});
+    }
 
     std::vector<std::uint32_t> w = {kSpirvMagic, 0x00010500u, 0, next_id, 0};
     append_inst(w, kOpCapability, {1});
@@ -173,6 +186,7 @@ std::vector<std::uint32_t> build_ps(const std::vector<std::uint32_t>& raw_locs,
     std::vector<std::uint32_t> ep = {kExecModelFragment, id_main, 0x6e69616du, 0x00000000u, id_out0};
     if (id_bary) ep.push_back(id_bary);
     for (const auto& [v, loc] : in_v4_vars) ep.push_back(v);
+    for (const auto& [v, loc] : in_pv_vars) ep.push_back(v);
     append_inst_vec(w, kOpEntryPoint, ep);
     append_inst(w, kOpExecutionMode, {id_main, 7});  // OriginUpperLeft
 
@@ -181,6 +195,10 @@ std::vector<std::uint32_t> build_ps(const std::vector<std::uint32_t>& raw_locs,
     for (const auto& [v, loc] : in_v4_vars) {
         append_inst(w, kOpDecorate, {v, kDecorationLocation, loc});
         if (flat_locs.count(loc)) append_inst(w, kOpDecorate, {v, 14});  // Flat
+    }
+    for (const auto& [v, loc] : in_pv_vars) {
+        append_inst(w, kOpDecorate, {v, kDecorationLocation, loc});
+        append_inst(w, kOpDecorate, {v, 14});  // Flat
     }
 
     append_inst(w, 19, {id_void});
@@ -192,10 +210,17 @@ std::vector<std::uint32_t> build_ps(const std::vector<std::uint32_t>& raw_locs,
     append_inst(w, kOpTypePointer, {id_ptr_in_v4, kStorageInput, id_v4float});
     append_inst(w, kOpTypePointer, {id_ptr_out_v4, kStorageOutput, id_v4float});
     append_inst(w, kOpConstantNull, {id_v4float, id_null_v4});
+    if (!pv_bases.empty()) {
+        append_inst(w, kOpTypeInt, {id_uint, 32, 0});
+        append_inst(w, 43, {id_uint, id_uint_3, 3});
+        append_inst(w, 28, {id_arr_v4_3, id_v4float, id_uint_3});
+        append_inst(w, kOpTypePointer, {id_ptr_in_arr, kStorageInput, id_arr_v4_3});
+    }
 
     append_inst(w, kOpVariable, {id_ptr_out_v4, id_out0, kStorageOutput});
     if (id_bary) append_inst(w, kOpVariable, {id_ptr_in_v3, id_bary, kStorageInput});
     for (const auto& [v, loc] : in_v4_vars) append_inst(w, kOpVariable, {id_ptr_in_v4, v, kStorageInput});
+    for (const auto& [v, loc] : in_pv_vars) append_inst(w, kOpVariable, {id_ptr_in_arr, v, kStorageInput});
 
     append_inst(w, kOpFunction, {id_void, id_main, 0, id_fn});
     append_inst(w, 248, {id_entry});
@@ -209,6 +234,9 @@ struct GsInspection {
     std::set<std::uint32_t> caps;
     std::set<std::uint32_t> in_locs;
     std::map<std::uint32_t, std::uint32_t> out_loc_vec_len;  // loc -> 3 or 4
+    std::set<std::uint32_t> out_pv_locs;                     // first location of each Flat Output vec4[3]
+    int out_pv_stores = 0;                                   // stores through an element of such an Output
+    int out_pv_null_stores = 0;                              // whole-array zero-fill stores
     int emit_vertices = 0;
     int end_primitives = 0;
     bool has_in_pos = false;
@@ -232,6 +260,11 @@ bool verify_gs_module(const std::vector<std::uint32_t>& words, GsInspection& out
     std::map<std::uint32_t, std::uint32_t> vec_len;
     std::map<std::uint32_t, std::uint32_t> ptr_pointee;
     std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> var_info;  // var_id -> (storage, pointee)
+    std::set<std::uint32_t> arr_v4_3_tys;       // vec4<f32>[3]
+    std::map<std::uint32_t, std::uint32_t> uint_consts;
+    std::set<std::uint32_t> flat_vars;
+    std::set<std::uint32_t> null_arr_consts;    // OpConstantNull of vec4<f32>[3]
+    std::set<std::uint32_t> out_arr_elem_ptrs;  // access chains into an Output vec4<f32>[3]
     bool saw_fn_end = false;
 
     const auto record_def = [&](std::uint32_t id) {
@@ -265,6 +298,7 @@ bool verify_gs_module(const std::vector<std::uint32_t>& words, GsInspection& out
             break;
         case kOpDecorate:
             if (section < 3 || section > 4) return false;
+            if (inst.words.size() == 3 && inst.words[2] == 14) flat_vars.insert(inst.words[1]);
             section = 4;
             break;
         case kOpFunction:
@@ -286,8 +320,14 @@ bool verify_gs_module(const std::vector<std::uint32_t>& words, GsInspection& out
                     if (inst.opcode == kOpTypeFloat && inst.words[2] == 32) float_ty = inst.words[1];
                     if (inst.opcode == kOpTypeVector && inst.words[2] == float_ty) vec_len[inst.words[1]] = inst.words[3];
                     if (inst.opcode == kOpTypePointer) ptr_pointee[inst.words[1]] = inst.words[3];
+                    if (inst.opcode == 28 && vec_len.count(inst.words[2]) && vec_len[inst.words[2]] == 4 &&
+                        uint_consts.count(inst.words[3]) && uint_consts[inst.words[3]] == 3)
+                        arr_v4_3_tys.insert(inst.words[1]);
                 } else if (inst.opcode == 43 || inst.opcode == 44 || inst.opcode == kOpConstantNull) {
                     if (!record_def(inst.words[2])) return false;
+                    if (inst.opcode == 43 && inst.words.size() == 4) uint_consts[inst.words[2]] = inst.words[3];
+                    if (inst.opcode == kOpConstantNull && arr_v4_3_tys.count(inst.words[1]))
+                        null_arr_consts.insert(inst.words[2]);
                 } else if (inst.opcode == kOpVariable) {
                     if (!record_def(inst.words[2])) return false;
                     global_vars.insert(inst.words[2]);
@@ -300,6 +340,16 @@ bool verify_gs_module(const std::vector<std::uint32_t>& words, GsInspection& out
                     if (!record_def(inst.words[1])) return false;
                 } else if (inst.opcode == kOpAccessChain || inst.opcode == kOpLoad) {
                     if (!record_def(inst.words[2])) return false;
+                    if (inst.opcode == kOpAccessChain) {
+                        const auto base = var_info.find(inst.words[3]);
+                        if (base != var_info.end() && base->second.first == kStorageOutput &&
+                            arr_v4_3_tys.count(base->second.second))
+                            out_arr_elem_ptrs.insert(inst.words[2]);
+                    }
+                } else if (inst.opcode == kOpStore && out_arr_elem_ptrs.count(inst.words[1])) {
+                    ++out.out_pv_stores;
+                } else if (inst.opcode == kOpStore && null_arr_consts.count(inst.words[2])) {
+                    ++out.out_pv_null_stores;
                 } else if (inst.opcode == 218) {
                     ++out.emit_vertices;
                 } else if (inst.opcode == 219) {
@@ -333,11 +383,20 @@ bool verify_gs_module(const std::vector<std::uint32_t>& words, GsInspection& out
             const std::uint32_t loc = inst.words[3];
             if (storage == kStorageInput) {
                 if (!out.in_locs.insert(loc).second) return false;
+            } else if (storage == kStorageOutput && arr_v4_3_tys.count(pt)) {
+                // A per-vertex block: Flat, and (checked below) three locations clear of every other output.
+                if (!flat_vars.count(inst.words[1]) || !out.out_pv_locs.insert(loc).second) return false;
             } else if (storage == kStorageOutput) {
                 const auto vlen = vec_len.find(pt);
                 if (vlen == vec_len.end()) return false;
                 if (!out.out_loc_vec_len.emplace(loc, vlen->second).second) return false;
             }
+        }
+    }
+    for (std::uint32_t base : out.out_pv_locs) {
+        for (std::uint32_t k = 0; k < 3; ++k) {
+            if (out.out_loc_vec_len.count(base + k)) return false;
+            if (k && out.out_pv_locs.count(base + k)) return false;
         }
     }
     return out.has_in_pos && out.has_out_pos && out.emit_vertices == 3 && out.end_primitives == 1;
@@ -489,6 +548,96 @@ int main(int argc, char** argv) {
         const auto ps_collide = build_ps({0, 1}, {}, std::nullopt);
         err.clear();
         CHECK(!build_bary_fallback_gs(vs_ok, ps_collide, 1, gs, nullptr, &err) && !err.empty() && gs == sentinel);
+    }
+
+    // 7. Computed I/J pairs: bary_fallback_input.per_vertex (attribute -> first of three locations).
+    using PerVertexMap = std::map<std::uint32_t, std::uint32_t>;
+    // 7a. The shape of a translated computed-I/J PS: attribute 0 as a Flat vec4[3] at Locations 0..2, barycentrics
+    //     at 3.
+    {
+        const auto vs = build_vs({.raw_locs = {0}});
+        const auto ps = build_ps({}, {}, 3, {}, {0});
+        std::vector<std::uint32_t> gs;
+        std::string err;
+        // Without the map the array is still refused, as before.
+        CHECK(!build_bary_fallback_gs(vs, ps, 3, gs, nullptr, &err) && !err.empty() && gs.empty());
+        err.clear();
+        CHECK(build_bary_fallback_gs(vs, ps, 3, PerVertexMap{{0, 0}}, gs, nullptr, &err));
+        GsInspection ins;
+        CHECK(verify_gs_module(gs, ins));
+        CHECK((ins.in_locs == std::set<std::uint32_t>{0}));
+        CHECK((ins.out_pv_locs == std::set<std::uint32_t>{0}));
+        CHECK(ins.out_loc_vec_len.size() == 1 && ins.out_loc_vec_len[3] == 3);
+        CHECK(ins.out_pv_stores == 9 && ins.out_pv_null_stores == 0);  // three values at each of three vertices
+        maybe_dump(dump_dir, "gs_per_vertex", gs);
+    }
+
+    // 7b. A relocated block next to ordinary inputs: attribute 0 -> Locations 3..5, pass-through 1, barycentrics 2;
+    //     the PS also reads Location 0 as an ordinary input, so one GS Input at Location 0 feeds both.
+    {
+        const auto vs = build_vs({.raw_locs = {0, 1, 6}});
+        const auto ps = build_ps({0, 1}, {}, 2, {}, {3});
+        std::vector<std::uint32_t> gs;
+        std::string err;
+        CHECK(build_bary_fallback_gs(vs, ps, 2, PerVertexMap{{0, 3}}, gs, nullptr, &err));
+        GsInspection ins;
+        CHECK(verify_gs_module(gs, ins));
+        CHECK((ins.in_locs == std::set<std::uint32_t>{0, 1}));  // 6 is unread and stays unconsumed
+        CHECK((ins.out_pv_locs == std::set<std::uint32_t>{3}));
+        CHECK(ins.out_loc_vec_len.size() == 3);
+        CHECK(ins.out_loc_vec_len[0] == 4 && ins.out_loc_vec_len[1] == 4 && ins.out_loc_vec_len[2] == 3);
+        CHECK(ins.out_pv_stores == 9);
+        maybe_dump(dump_dir, "gs_per_vertex_relocated", gs);
+    }
+
+    // 7c. Two attributes, one of which the VS does not export: that array is zero-filled, with no dangling GS Input.
+    {
+        const auto vs = build_vs({.raw_locs = {2}});
+        const auto ps = build_ps({}, {}, 0, {}, {1, 4});
+        std::vector<std::uint32_t> gs;
+        std::string err;
+        CHECK(build_bary_fallback_gs(vs, ps, 0, PerVertexMap{{2, 1}, {5, 4}}, gs, nullptr, &err));
+        GsInspection ins;
+        CHECK(verify_gs_module(gs, ins));
+        CHECK((ins.in_locs == std::set<std::uint32_t>{2}));
+        CHECK((ins.out_pv_locs == std::set<std::uint32_t>{1, 4}));
+        CHECK(ins.out_pv_stores == 9 && ins.out_pv_null_stores == 3);
+        maybe_dump(dump_dir, "gs_per_vertex_zero_fill", gs);
+    }
+
+    // 7d. A mapping the PS does not declare is ignored: the module is the one built without it.
+    {
+        const auto vs = build_vs({.raw_locs = {0, 2}});
+        const auto ps = build_ps({0, 2}, {}, 1);
+        std::vector<std::uint32_t> plain, mapped;
+        std::string err;
+        CHECK(build_bary_fallback_gs(vs, ps, 1, plain, nullptr, &err));
+        CHECK(build_bary_fallback_gs(vs, ps, 1, PerVertexMap{{0, 7}}, mapped, nullptr, &err));
+        CHECK(plain == mapped);
+    }
+
+    // 7e. Refusals leave caller's gs_words untouched.
+    {
+        const std::vector<std::uint32_t> sentinel = {0xdeadbeefu};
+        std::vector<std::uint32_t> gs = sentinel;
+        std::string err;
+        const auto vs = build_vs({.raw_locs = {0, 1}});
+        const auto refused = [&](const std::vector<std::uint32_t>& ps, std::uint32_t bary, const PerVertexMap& pv) {
+            err.clear();
+            return !build_bary_fallback_gs(vs, ps, bary, pv, gs, nullptr, &err) && !err.empty() && gs == sentinel;
+        };
+        // The mapped first location holds a plain vec4, not vec4[3].
+        CHECK(refused(build_ps({0}, {}, 3), 3, {{0, 0}}));
+        // The block 0..2 runs into the barycentric location.
+        CHECK(refused(build_ps({}, {}, 2, {}, {0}), 2, {{0, 0}}));
+        // The block 0..2 runs into another PS Input (Location 1).
+        CHECK(refused(build_ps({1}, {}, 3, {}, {0}), 3, {{0, 0}}));
+        // Two attributes at one first location.
+        CHECK(refused(build_ps({}, {}, 3, {}, {0}), 3, {{0, 0}, {1, 0}}));
+        // A first location whose block would pass the last location.
+        CHECK(refused(build_ps({}, {}, 3, {}, {0}), 3, {{0, 0}, {1, 0xfffffffeu}}));
+        // An array the map names by its second location only.
+        CHECK(refused(build_ps({}, {}, 3, {}, {0}), 3, {{0, 1}}));
     }
 
     return 0;

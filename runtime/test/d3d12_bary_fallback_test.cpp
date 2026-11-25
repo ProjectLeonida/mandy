@@ -13,6 +13,11 @@
 //      `f16_halves` for `param7` at `[15, 16]` (relocated to `[28, 29]` before GS synthesis).
 //   4. Refusals: non-triangle topology (`E_INVALIDARG`), explicit GS (`E_NOTIMPL`), and disabled `geometryShader`
 //      feature (`E_NOTIMPL`).
+//   5. Computed I/J pairs (RT-BARY-FALLBACK-PER-VERTEX): a PS that reads an attribute as a `Flat vec4[3]` named by
+//      `bary_fallback_input.per_vertex` and weights the three vertices' values with its own I/J. The VS gives each
+//      vertex a different value, and the weights are chosen so that every other order of the three vertices lands
+//      at least 15 LSB away. Drawn with the block at the attribute's own first locations and relocated next to an
+//      ordinary input; without the map the same PS is refused (`E_FAIL`).
 // Skips (77) when no usable Vulkan 1.3 device or `geometryShader` feature is present. No game data.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
@@ -21,6 +26,7 @@
 #include "../src/shader_library.h"
 #include "../src/spirv_bary_fallback.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -354,6 +360,206 @@ std::vector<std::uint32_t> make_bary_f16_ps(std::uint32_t num_raw, std::uint32_t
     return w;
 }
 
+// The VS of the computed-I/J draws, from VertexIndex (0, 1, 2): the positions of make_bary_vs(true, ...) (w = 1, 2,
+// 4), Location 0 = vec4(0.5, 0.25, 0.75, 1.0) at every vertex, and Location 1 = a different value per vertex:
+// (1, 0, 0.5, 0.25), (0, 1, 0.25, 0.5), (0.5, 0.25, 1, 1).
+std::vector<std::uint32_t> make_ij_vs() {
+    std::uint32_t next_id = 1;
+    const auto alloc = [&]() { return next_id++; };
+
+    const std::uint32_t id_void = alloc();
+    const std::uint32_t id_fn = alloc();
+    const std::uint32_t id_float = alloc();
+    const std::uint32_t id_v4float = alloc();
+    const std::uint32_t id_int = alloc();
+    const std::uint32_t id_bool = alloc();
+    const std::uint32_t id_ptr_in_int = alloc();
+    const std::uint32_t id_ptr_out_v4 = alloc();
+
+    const std::uint32_t id_f0 = alloc();     //  0.0
+    const std::uint32_t id_f1 = alloc();     //  1.0
+    const std::uint32_t id_fm1 = alloc();    // -1.0
+    const std::uint32_t id_f2 = alloc();     //  2.0
+    const std::uint32_t id_f4 = alloc();     //  4.0
+    const std::uint32_t id_f6 = alloc();     //  6.0
+    const std::uint32_t id_fm2 = alloc();    // -2.0
+    const std::uint32_t id_fm4 = alloc();    // -4.0
+    const std::uint32_t id_f12 = alloc();    // 12.0
+    const std::uint32_t id_f025 = alloc();   //  0.25
+    const std::uint32_t id_f05 = alloc();    //  0.50
+    const std::uint32_t id_f075 = alloc();   //  0.75
+
+    const std::uint32_t id_p0 = alloc();
+    const std::uint32_t id_p1 = alloc();
+    const std::uint32_t id_p2 = alloc();
+    const std::uint32_t id_attr0_val = alloc();
+    const std::uint32_t id_c0 = alloc();
+    const std::uint32_t id_c1 = alloc();
+    const std::uint32_t id_c2 = alloc();
+    const std::uint32_t id_i0 = alloc();
+    const std::uint32_t id_i1 = alloc();
+
+    const std::uint32_t id_vid_var = alloc();
+    const std::uint32_t id_pos_var = alloc();
+    const std::uint32_t id_out0_var = alloc();
+    const std::uint32_t id_out1_var = alloc();
+
+    const std::uint32_t id_main = alloc();
+    const std::uint32_t id_entry = alloc();
+    const std::uint32_t id_vid = alloc();
+    const std::uint32_t id_is0 = alloc();
+    const std::uint32_t id_is1 = alloc();
+    const std::uint32_t id_p12 = alloc();
+    const std::uint32_t id_pos = alloc();
+    const std::uint32_t id_c12 = alloc();
+    const std::uint32_t id_col = alloc();
+
+    std::vector<std::uint32_t> w = {kSpirvMagic, 0x00010500u, 0, next_id, 0};
+    put_inst(w, kOpCapability, {1});  // Shader
+    put_inst(w, kOpMemoryModel, {0, 1});
+    put_inst(w, kOpEntryPoint, {kExecModelVertex, id_main, 0x6e69616du, 0x00000000u,
+                                id_vid_var, id_pos_var, id_out0_var, id_out1_var});
+
+    put_inst(w, kOpDecorate, {id_vid_var, 11, 42});  // BuiltIn VertexIndex
+    put_inst(w, kOpDecorate, {id_pos_var, 11, 0});   // BuiltIn Position
+    put_inst(w, kOpDecorate, {id_out0_var, kDecorationLocation, 0});
+    put_inst(w, kOpDecorate, {id_out1_var, kDecorationLocation, 1});
+
+    put_inst(w, 19, {id_void});
+    put_inst(w, 33, {id_fn, id_void});
+    put_inst(w, kOpTypeFloat, {id_float, 32});
+    put_inst(w, kOpTypeVector, {id_v4float, id_float, 4});
+    put_inst(w, kOpTypeInt, {id_int, 32, 1});
+    put_inst(w, 20, {id_bool});
+    put_inst(w, kOpTypePointer, {id_ptr_in_int, kStorageInput, id_int});
+    put_inst(w, kOpTypePointer, {id_ptr_out_v4, kStorageOutput, id_v4float});
+
+    put_inst(w, 43, {id_float, id_f0, 0x00000000u});
+    put_inst(w, 43, {id_float, id_f1, 0x3f800000u});
+    put_inst(w, 43, {id_float, id_fm1, 0xbf800000u});
+    put_inst(w, 43, {id_float, id_f2, 0x40000000u});
+    put_inst(w, 43, {id_float, id_f4, 0x40800000u});
+    put_inst(w, 43, {id_float, id_f6, 0x40c00000u});
+    put_inst(w, 43, {id_float, id_fm2, 0xc0000000u});
+    put_inst(w, 43, {id_float, id_fm4, 0xc0800000u});
+    put_inst(w, 43, {id_float, id_f12, 0x41400000u});
+    put_inst(w, 43, {id_float, id_f025, 0x3e800000u});
+    put_inst(w, 43, {id_float, id_f05, 0x3f000000u});
+    put_inst(w, 43, {id_float, id_f075, 0x3f400000u});
+
+    put_inst(w, 44, {id_v4float, id_p0, id_fm1, id_fm1, id_f0, id_f1});
+    put_inst(w, 44, {id_v4float, id_p1, id_f6, id_fm2, id_f0, id_f2});
+    put_inst(w, 44, {id_v4float, id_p2, id_fm4, id_f12, id_f0, id_f4});
+    put_inst(w, 44, {id_v4float, id_attr0_val, id_f05, id_f025, id_f075, id_f1});
+    put_inst(w, 44, {id_v4float, id_c0, id_f1, id_f0, id_f05, id_f025});
+    put_inst(w, 44, {id_v4float, id_c1, id_f0, id_f1, id_f025, id_f05});
+    put_inst(w, 44, {id_v4float, id_c2, id_f05, id_f025, id_f1, id_f1});
+    put_inst(w, 43, {id_int, id_i0, 0u});
+    put_inst(w, 43, {id_int, id_i1, 1u});
+
+    put_inst(w, kOpVariable, {id_ptr_in_int, id_vid_var, kStorageInput});
+    put_inst(w, kOpVariable, {id_ptr_out_v4, id_pos_var, kStorageOutput});
+    put_inst(w, kOpVariable, {id_ptr_out_v4, id_out0_var, kStorageOutput});
+    put_inst(w, kOpVariable, {id_ptr_out_v4, id_out1_var, kStorageOutput});
+
+    put_inst(w, kOpFunction, {id_void, id_main, 0, id_fn});
+    put_inst(w, 248, {id_entry});
+    put_inst(w, kOpLoad, {id_int, id_vid, id_vid_var});
+    put_inst(w, 170, {id_bool, id_is0, id_vid, id_i0});      // OpIEqual vid 0
+    put_inst(w, 170, {id_bool, id_is1, id_vid, id_i1});      // OpIEqual vid 1
+    put_inst(w, 169, {id_v4float, id_p12, id_is1, id_p1, id_p2});
+    put_inst(w, 169, {id_v4float, id_pos, id_is0, id_p0, id_p12});
+    put_inst(w, 169, {id_v4float, id_c12, id_is1, id_c1, id_c2});
+    put_inst(w, 169, {id_v4float, id_col, id_is0, id_c0, id_c12});
+    put_inst(w, kOpStore, {id_pos_var, id_pos});
+    put_inst(w, kOpStore, {id_out0_var, id_attr0_val});
+    put_inst(w, kOpStore, {id_out1_var, id_col});
+    put_inst(w, kOpReturn, {});
+    put_inst(w, kOpFunctionEnd, {});
+    return w;
+}
+
+// The weights the computed-I/J PS gives the three vertices' values: I = 0.5 and J = 0.125 in
+// P0 + I * (P1 - P0) + J * (P2 - P0), so 0.375, 0.5 and 0.125.
+constexpr float kIjWeights[3] = {0.375f, 0.5f, 0.125f};
+constexpr float kIjValues[3][4] = {{1.0f, 0.0f, 0.5f, 0.25f}, {0.0f, 1.0f, 0.25f, 0.5f}, {0.5f, 0.25f, 1.0f, 1.0f}};
+
+// A PS in the shape rdna2spirv.py --bary-fallback gives a computed I/J pair: the attribute is a Flat vec4[3] at
+// `pv_base` (element k = vertex k) and the raw barycentrics a vec3 at `bary_loc`. comb = the kIjWeights sum of the
+// three elements. Writes vec4(comb.rgb, bary.y), or with `with_attr0` (an ordinary vec4 Input at Location 0)
+// vec4(comb.r, comb.g, bary.y, attr0.z).
+std::vector<std::uint32_t> make_ij_ps(std::uint32_t pv_base, std::uint32_t bary_loc, bool with_attr0) {
+    // 1=void, 2=fn, 3=float, 4=v3float, 5=v4float, 6=uint, 7=uint_3, 8=arr, 9=ptr_in_v3, 10=ptr_in_v4,
+    // 11=ptr_in_arr, 12=ptr_out_v4, 13=int, 14..16=int 0..2, 17..19=weights, 20=out0, 21=in_pv, 22=in_bary,
+    // 23=in_attr0, 24=main, 25=entry, 26..31=element pointers and values, 32..34=weighted, 35=sum01, 36=comb,
+    // 37=bary, 38=comb.r, 39=comb.g, 40=comb.b, 41=bary.y, 42=attr0, 43=attr0.z, 44=rgba
+    constexpr std::uint32_t kBound = 45;
+    std::vector<std::uint32_t> w = {kSpirvMagic, 0x00010500u, 0, kBound, 0};
+    put_inst(w, kOpCapability, {1});
+    put_inst(w, kOpMemoryModel, {0, 1});
+    std::vector<std::uint32_t> ep = {kExecModelFragment, 24, 0x6e69616du, 0x00000000u, 20, 21, 22};
+    if (with_attr0) ep.push_back(23);
+    put_inst_vec(w, kOpEntryPoint, ep);
+    put_inst(w, kOpExecutionMode, {24, 7});  // OriginUpperLeft
+
+    put_inst(w, kOpDecorate, {20, kDecorationLocation, 0});
+    put_inst(w, kOpDecorate, {21, kDecorationLocation, pv_base});
+    put_inst(w, kOpDecorate, {21, 14});  // Flat
+    put_inst(w, kOpDecorate, {22, kDecorationLocation, bary_loc});
+    if (with_attr0) put_inst(w, kOpDecorate, {23, kDecorationLocation, 0});
+
+    put_inst(w, 19, {1});
+    put_inst(w, 33, {2, 1});
+    put_inst(w, kOpTypeFloat, {3, 32});
+    put_inst(w, kOpTypeVector, {4, 3, 3});
+    put_inst(w, kOpTypeVector, {5, 3, 4});
+    put_inst(w, kOpTypeInt, {6, 32, 0});
+    put_inst(w, 43, {6, 7, 3u});
+    put_inst(w, 28, {8, 5, 7});
+    put_inst(w, kOpTypePointer, {9, kStorageInput, 4});
+    put_inst(w, kOpTypePointer, {10, kStorageInput, 5});
+    put_inst(w, kOpTypePointer, {11, kStorageInput, 8});
+    put_inst(w, kOpTypePointer, {12, kStorageOutput, 5});
+    put_inst(w, kOpTypeInt, {13, 32, 1});
+    put_inst(w, 43, {13, 14, 0u});
+    put_inst(w, 43, {13, 15, 1u});
+    put_inst(w, 43, {13, 16, 2u});
+    put_inst(w, 43, {3, 17, 0x3ec00000u});  // 0.375
+    put_inst(w, 43, {3, 18, 0x3f000000u});  // 0.5
+    put_inst(w, 43, {3, 19, 0x3e000000u});  // 0.125
+
+    put_inst(w, kOpVariable, {12, 20, kStorageOutput});
+    put_inst(w, kOpVariable, {11, 21, kStorageInput});
+    put_inst(w, kOpVariable, {9, 22, kStorageInput});
+    if (with_attr0) put_inst(w, kOpVariable, {10, 23, kStorageInput});
+
+    put_inst(w, kOpFunction, {1, 24, 0, 2});
+    put_inst(w, 248, {25});
+    for (std::uint32_t k = 0; k < 3; ++k) {
+        put_inst(w, kOpAccessChain, {10, 26 + 2 * k, 21, 14 + k});
+        put_inst(w, kOpLoad, {5, 27 + 2 * k, 26 + 2 * k});
+        put_inst(w, 142, {5, 32 + k, 27 + 2 * k, 17 + k});  // OpVectorTimesScalar
+    }
+    put_inst(w, 129, {5, 35, 32, 33});  // OpFAdd
+    put_inst(w, 129, {5, 36, 35, 34});
+    put_inst(w, kOpLoad, {4, 37, 22});
+    put_inst(w, kOpCompositeExtract, {3, 38, 36, 0});
+    put_inst(w, kOpCompositeExtract, {3, 39, 36, 1});
+    put_inst(w, kOpCompositeExtract, {3, 40, 36, 2});
+    put_inst(w, kOpCompositeExtract, {3, 41, 37, 1});
+    if (with_attr0) {
+        put_inst(w, kOpLoad, {5, 42, 23});
+        put_inst(w, kOpCompositeExtract, {3, 43, 42, 2});
+        put_inst(w, kOpCompositeConstruct, {5, 44, 38, 39, 41, 43});
+    } else {
+        put_inst(w, kOpCompositeConstruct, {5, 44, 38, 39, 40, 41});
+    }
+    put_inst(w, kOpStore, {20, 44});
+    put_inst(w, kOpReturn, {});
+    put_inst(w, kOpFunctionEnd, {});
+    return w;
+}
+
 int to_unorm8(float v) {
     if (v <= 0.0f) return 0;
     if (v >= 1.0f) return 255;
@@ -381,6 +587,10 @@ int main() {
     const auto gs_dummy_prog = fssm_program({0x4753ba01, 0xbf810000});
     const auto ps_bary_prog = fssm_program({0x5053ba01, 0xbf810000});
     const auto ps_f16_prog = fssm_program({0x5053ba02, 0xbf810000});
+    const auto vs_ij_prog = fssm_program({0x5653ba04, 0xbf810000});
+    const auto ps_ij_prog = fssm_program({0x5053ba03, 0xbf810000});
+    const auto ps_ij_reloc_prog = fssm_program({0x5053ba04, 0xbf810000});
+    const auto ps_ij_nomap_prog = fssm_program({0x5053ba05, 0xbf810000});
 
     const auto vs_persp_c = shader_container(vs_persp_prog);
     const auto vs_clip_c = shader_container(vs_clip_prog);
@@ -388,6 +598,10 @@ int main() {
     const auto gs_dummy_c = shader_container(gs_dummy_prog);
     const auto ps_bary_c = shader_container(ps_bary_prog);
     const auto ps_f16_c = shader_container(ps_f16_prog);
+    const auto vs_ij_c = shader_container(vs_ij_prog);
+    const auto ps_ij_c = shader_container(ps_ij_prog);
+    const auto ps_ij_reloc_c = shader_container(ps_ij_reloc_prog);
+    const auto ps_ij_nomap_c = shader_container(ps_ij_nomap_prog);
 
     const auto vs_persp_spv = make_bary_vs(true, false);
     const auto ps_bary_spv = make_bary_ps(1);
@@ -402,6 +616,10 @@ int main() {
     write_spv(lib_dir / "gs_dummy.spv", gs_dummy_spv);
     write_spv(lib_dir / "ps_bary.spv", ps_bary_spv);
     write_spv(lib_dir / "ps_bary_f16.spv", make_bary_f16_ps(14, 14, 15, 16));
+    write_spv(lib_dir / "vs_ij.spv", make_ij_vs());
+    write_spv(lib_dir / "ps_ij.spv", make_ij_ps(0, 3, false));
+    write_spv(lib_dir / "ps_ij_reloc.spv", make_ij_ps(4, 1, true));
+    write_spv(lib_dir / "ps_ij_nomap.spv", make_ij_ps(0, 3, false));
     {
         std::ofstream idx(lib_dir / "index.json", std::ios::binary | std::ios::trunc);
         idx << "{\"vs_persp\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_persp_prog)
@@ -419,7 +637,24 @@ int main() {
                "\"bary_fallback_input\": {\"location\": 1}},\n"
                " \"ps_bary_f16\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_f16_prog)
             << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], "
-               "\"bary_fallback_input\": {\"location\": 14}, \"f16_halves\": {\"7\": [15, 16]}}}";
+               "\"bary_fallback_input\": {\"location\": 14}, \"f16_halves\": {\"7\": [15, 16]}},\n"
+               " \"vs_ij\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_ij_prog)
+            << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": []},\n"
+               // Attribute 1 as a vec4[3] at Locations 0..2, barycentrics at 3 (the layout rdna2spirv gives a PS
+               // whose only input is the computed pair's attribute).
+               " \"ps_ij\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_ij_prog)
+            << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], \"inputs\": [1], "
+               "\"bary_fallback_input\": {\"location\": 3, \"per_vertex\": {\"1\": 0}}},\n"
+               // The block relocated to 4..6 next to an ordinary input at 0, barycentrics at 1 (the VS output
+               // location the block reads).
+               " \"ps_ij_reloc\": {\"stage\": \"ps\", \"fssm_sha256\": \""
+            << leonida::sha256_hex(ps_ij_reloc_prog)
+            << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], \"inputs\": [0, 1], "
+               "\"bary_fallback_input\": {\"location\": 1, \"per_vertex\": {\"1\": 4}}},\n"
+               " \"ps_ij_nomap\": {\"stage\": \"ps\", \"fssm_sha256\": \""
+            << leonida::sha256_hex(ps_ij_nomap_prog)
+            << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], \"inputs\": [1], "
+               "\"bary_fallback_input\": {\"location\": 3}}}";
     }
 
     constexpr UINT kSize = 16;
@@ -637,6 +872,93 @@ int main() {
                 }
             }
             std::printf("ps_bary_f16 (combined f16_halves relocation + bary GS): all 256 pixels OK\n");
+        }
+
+        // 5. Computed I/J pairs: the GS hands the PS the triangle's three values of VS output 1 (element k = vertex
+        //    k), which the PS weights itself. Every pixel gets the same sum whatever its position; the barycentric
+        //    channel still has to be the perspective-correct one of draw 1.
+        {
+            int want[4]{};
+            for (int c = 0; c < 4; ++c) {
+                want[c] = to_unorm8(kIjWeights[0] * kIjValues[0][c] + kIjWeights[1] * kIjValues[1][c] +
+                                    kIjWeights[2] * kIjValues[2][c]);
+            }
+            // The nearest wrong answer: the same weights on any other order of the three vertices.
+            int nearest = 255;
+            const int orders[5][3] = {{0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+            for (const auto& o : orders) {
+                int worst = 0;
+                for (int c = 0; c < 2; ++c) {  // red and green: the channels both draws write
+                    const int v = to_unorm8(kIjWeights[0] * kIjValues[o[0]][c] + kIjWeights[1] * kIjValues[o[1]][c] +
+                                            kIjWeights[2] * kIjValues[o[2]][c]);
+                    worst = (std::max)(worst, std::abs(v - want[c]));
+                }
+                nearest = (std::min)(nearest, worst);
+            }
+            EXPECT(nearest >= 15);
+
+            const auto want_bary_y = [&](UINT col, UINT row) {
+                const float ndc_x = -1.0f + 2.0f * (float(col) + 0.5f) / float(kSize);
+                const float ndc_y = +1.0f - 2.0f * (float(row) + 0.5f) / float(kSize);
+                const float l1 = 0.25f * (ndc_x + 1.0f);
+                const float l2 = 0.25f * (ndc_y + 1.0f);
+                const float l0 = 1.0f - l1 - l2;
+                return to_unorm8((l1 / 2.0f) / (l0 / 1.0f + l1 / 2.0f + l2 / 4.0f));
+            };
+
+            // 5a. The block at Locations 0..2, barycentrics at 3: vec4(comb.rgb, bary.y).
+            {
+                auto pd = make_pso_desc(vs_ij_c, ps_ij_c);
+                Ref<ID3D12PipelineState> pso;
+                EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso.p))) && pso.p);
+                std::vector<std::uint8_t> pixels;
+                EXPECT(draw_and_readback(pso.p, pixels));
+                for (UINT row = 0; row < kSize; ++row) {
+                    for (UINT col = 0; col < kSize; ++col) {
+                        const auto* px = pixels.data() + row * 256 + col * 4;
+                        const int by = want_bary_y(col, row);
+                        if (std::abs(int(px[0]) - want[0]) > 1 || std::abs(int(px[1]) - want[1]) > 1 ||
+                            std::abs(int(px[2]) - want[2]) > 1 || std::abs(int(px[3]) - by) > 2) {
+                            std::fprintf(stderr, "ps_ij (%u,%u): got (%u,%u,%u,%u) want (%d,%d,%d,%d)\n", col, row,
+                                         px[0], px[1], px[2], px[3], want[0], want[1], want[2], by);
+                            return 1;
+                        }
+                    }
+                }
+                const auto* mid = pixels.data() + (kSize / 2) * 256 + (kSize / 2) * 4;
+                std::printf("ps_ij (per-vertex block at 0..2): center=(%u,%u,%u,%u), all 256 pixels OK\n",
+                            mid[0], mid[1], mid[2], mid[3]);
+            }
+
+            // 5b. The block relocated to 4..6, an ordinary input at 0, barycentrics at 1:
+            //     vec4(comb.r, comb.g, bary.y, attr0.z).
+            {
+                auto pd = make_pso_desc(vs_ij_c, ps_ij_reloc_c);
+                Ref<ID3D12PipelineState> pso;
+                EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso.p))) && pso.p);
+                std::vector<std::uint8_t> pixels;
+                EXPECT(draw_and_readback(pso.p, pixels));
+                for (UINT row = 0; row < kSize; ++row) {
+                    for (UINT col = 0; col < kSize; ++col) {
+                        const auto* px = pixels.data() + row * 256 + col * 4;
+                        const int by = want_bary_y(col, row);
+                        if (std::abs(int(px[0]) - want[0]) > 1 || std::abs(int(px[1]) - want[1]) > 1 ||
+                            std::abs(int(px[2]) - by) > 2 || std::abs(int(px[3]) - 191) > 1) {
+                            std::fprintf(stderr, "ps_ij_reloc (%u,%u): got (%u,%u,%u,%u) want (%d,%d,%d,191)\n", col,
+                                         row, px[0], px[1], px[2], px[3], want[0], want[1], by);
+                            return 1;
+                        }
+                    }
+                }
+                std::printf("ps_ij_reloc (per-vertex block at 4..6 + ordinary input): all 256 pixels OK\n");
+            }
+
+            // 5c. The same PS with no per_vertex in its index entry: the vec4[3] input is refused, not mislinked.
+            {
+                auto pd = make_pso_desc(vs_ij_c, ps_ij_nomap_c);
+                Ref<ID3D12PipelineState> bad;
+                EXPECT(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&bad.p)) == E_FAIL && !bad.p);
+            }
         }
 
         // 4a & 4b. Refusals: non-triangle topology -> E_INVALIDARG; explicit GS -> E_NOTIMPL.
