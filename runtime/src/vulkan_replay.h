@@ -5199,9 +5199,10 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
             if (graphics.depth_bounds_test && vk.set_depth_bounds) {
-                const float mn = draw->min_depth_bounds;
-                const float mx = draw->max_depth_bounds;
-                const bool empty = (mn != mn) || (mx != mx) || mn > mx || mn > 1.0f || mx < 0.0f;
+                // D3D12: NaN converts to 0 silently; then the range is clamped, an inverted one is empty.
+                const float mn = draw->min_depth_bounds != draw->min_depth_bounds ? 0.0f : draw->min_depth_bounds;
+                const float mx = draw->max_depth_bounds != draw->max_depth_bounds ? 0.0f : draw->max_depth_bounds;
+                const bool empty = mn > mx || mn > 1.0f || mx < 0.0f;
                 vk.set_depth_bounds(command_buffer, empty ? 1.0f : (mn < 0.0f ? 0.0f : mn),
                                     empty ? 0.0f : (mx > 1.0f ? 1.0f : mx));
             }

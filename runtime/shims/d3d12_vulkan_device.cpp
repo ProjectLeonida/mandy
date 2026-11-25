@@ -7691,7 +7691,10 @@ leonida::cached_pso::Key pipeline_key(const D3D12_COMPUTE_PIPELINE_STATE_DESC& d
     return leonida::sha256_hex(key.data());
 }
 
-leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+// `extra` carries fields only a console stream has (back-face masks, depth bounds); they are hashed into the same key,
+// as the cached blob holds just the first 64 characters. Without it the key is the plain description's.
+leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
+                                      const leonida::cached_pso::KeyBuilder* extra = nullptr) {
     leonida::cached_pso::KeyBuilder key;
     key.tag("graphics");
     key_root_signature(key, desc.pRootSignature);
@@ -7741,6 +7744,7 @@ leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& 
         .u32(desc.NumRenderTargets);
     for (const DXGI_FORMAT format : desc.RTVFormats) key.u32(format);
     key.u32(desc.DSVFormat).u32(desc.SampleDesc.Count).u32(desc.SampleDesc.Quality).u32(desc.NodeMask);
+    if (extra) key.bytes(extra->data().data(), extra->data().size());
     return leonida::sha256_hex(key.data());
 }
 
@@ -11655,7 +11659,7 @@ public:
             leonida::cached_pso::KeyBuilder extra;
             extra.u32(stream.back_masks?1u:0u).u32(stream.back_stencil.read).u32(stream.back_stencil.write)
                 .u32(stream.extras.depth_bounds_test?1u:0u);
-            pipeline->set_cache_key(pipeline_key(stream.graphics)+leonida::sha256_hex(extra.data()));
+            pipeline->set_cache_key(pipeline_key(stream.graphics,&extra));
         }
         if(!rt::d3d12_xs::attach_pso_record(pipeline,std::move(record))){pipeline->Release();return E_OUTOFMEMORY;}
         pipeline->set_pending_stream(stream.has_cs);
