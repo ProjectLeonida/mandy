@@ -366,3 +366,76 @@ def test_preview_keeps_partial_bc_blocks(tmp_path: Path, monkeypatch: pytest.Mon
         assert png.getpixel((8, 7)) == (0, 255, 0)
         assert png.getpixel((7, 8)) == (0, 0, 255)
         assert png.getpixel((8, 8)) == (255, 255, 255)
+
+
+def synthetic_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, header_text: str | None = None) -> None:
+    """A 256-byte blob plus a matching 64K D_X header, so only the guard under test can fail."""
+    (tmp_path / "blob.bin").write_bytes(bytes(range(256)))
+    text = header_text if header_text is not None else (
+        header(["0"] * 8).replace("// 0", "// 0", 1)
+        + "const ADDR_SW_PATINFO GFX10_SW_64K_D_X_PATINFO[] =\n{\n"
+        "    {   0,    0,    0,    0,    0, } , // 1 pipes 8 bpe\n};\n"
+    )
+    path = tmp_path / "swizzle.h"
+    path.write_text(text, encoding="utf-8")
+    monkeypatch.setenv("AMD_SWIZZLE_HEADER", str(path))
+
+
+def test_rejects_non_positive_dimensions(tmp_path, monkeypatch):
+    # Before: --width 0 or a negative width reached numpy and died with
+    # UnidentifiedImageError / "negative dimensions are not allowed".
+    synthetic_case(tmp_path, monkeypatch)
+    for width, height in (("0", "4"), ("4", "0"), ("-4", "4")):
+        result = cli(tmp_path, "--width", width, "--height", height)
+        assert result.returncode == 2, result.stderr
+        assert "at least 1" in result.stderr, result.stderr
+        assert "Traceback" not in result.stderr, result.stderr
+
+
+def test_rejects_negative_offset(tmp_path, monkeypatch):
+    # Before: -1 sliced from the end of the blob and still reported success.
+    synthetic_case(tmp_path, monkeypatch)
+    result = cli(tmp_path, "--width", "4", "--height", "4", "--offset", "-1")
+    assert result.returncode == 2, result.stderr
+    assert "must not be negative" in result.stderr, result.stderr
+
+
+def test_rejects_offset_past_the_end(tmp_path, monkeypatch):
+    # Before: an offset beyond the file left an empty buffer and exited 0 with no output at all.
+    synthetic_case(tmp_path, monkeypatch)
+    result = cli(tmp_path, "--width", "4", "--height", "4", "--offset", "999")
+    assert result.returncode == 2, result.stderr
+    assert "past the end" in result.stderr, result.stderr
+
+
+def test_reports_when_no_pattern_matches(tmp_path, monkeypatch):
+    # Before: a --modes value that matches no table printed nothing and still exited 0.
+    synthetic_case(tmp_path, monkeypatch)
+    result = cli(tmp_path, "--width", "4", "--height", "4", "--modes", "no-such-mode")
+    assert result.returncode == 2, result.stderr
+    assert "no swizzle pattern produced an image" in result.stderr, result.stderr
+
+
+def test_reports_a_missing_or_malformed_header(tmp_path, monkeypatch):
+    # Before: the default header path is a Windows-shaped placeholder, so a missing header
+    # surfaced as a raw FileNotFoundError traceback.
+    (tmp_path / "blob.bin").write_bytes(bytes(range(256)))
+    monkeypatch.setenv("AMD_SWIZZLE_HEADER", str(tmp_path / "absent.h"))
+    missing = cli(tmp_path, "--width", "4", "--height", "4")
+    assert missing.returncode == 2, missing.stderr
+    assert "cannot read the addrlib pattern header" in missing.stderr, missing.stderr
+    assert "Traceback" not in missing.stderr, missing.stderr
+
+    synthetic_case(tmp_path, monkeypatch, header_text="not a header at all\n")
+    malformed = cli(tmp_path, "--width", "4", "--height", "4")
+    assert malformed.returncode == 2, malformed.stderr
+    assert "does not look like" in malformed.stderr, malformed.stderr
+
+
+@needs_numpy
+def test_a_valid_run_still_succeeds(tmp_path, monkeypatch):
+    synthetic_case(tmp_path, monkeypatch)
+    result = cli(tmp_path, "--width", "4", "--height", "4", "--out", str(tmp_path / "out.png"))
+    assert result.returncode == 0, result.stderr
+    assert "GFX10_SW_64K_D_X_PATINFO" in result.stdout, result.stdout
+    assert (tmp_path / "out.png").exists()
