@@ -202,6 +202,8 @@ FIXTURES = {
     "ps_w64_c_lane_id": ("C", _c_lane_id, {}),
     "ps_w64_c_vote_stale": ("C", _c_vote_stale, {}),
     "ps_w64_c_vote_else": ("C", _c_vote_else, {}),
+    "ps_w64_c_vote_rewrite": ("C", _c_vote_stale, {}),     # SHADER-820, #4620 (@AwkGrep256)
+    "ps_w64_c_vote_exec": ("C", _c_vote_stale, {}),        # SHADER-820 on EXEC, #4620 (@shdann, @sennecools)
     "ps_w64_c_scc_vote": ("C", _c_scc_vote, {}),
     "ps_w64_c_execz_sgpr": ("C", _c_execz_sgpr, {}),
     "vs_w64_a_skip": ("A", _vs_a_skip, VS_ENV),

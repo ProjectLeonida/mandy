@@ -366,6 +366,88 @@ class SoundnessRegressions(unittest.TestCase):
             "s_cbranch_scc0 3", "s_and_saveexec_b64 s[18:19], vcc", "v_add_nc_u32_e32 v6, 3, v0",
             "s_mov_b64 exec, s[18:19]"])
 
+    def test_vote_on_exec_then_a_new_exec_is_unsafe(self):
+        # @shdann on #4620: put() skips EXEC, so ("vote", "exec") outlived a new EXEC from an op that leaves SCC
+        # alone; the branch voted on the old EXEC (only lane 2) while the run side used the launch mask: v6 = 9 in
+        # lanes 32..63 of one 64-lane wave, 0 in two 32-lane waves
+        tail = ["s_cbranch_scc0 1", "v_add_nc_u32_e32 v6, 9, v6"]
+        for name, vote, new_exec in (
+                ("vs_exec_vote_saveexec_mov", "s_and_saveexec_b64 s[12:13], vcc", "s_mov_b64 exec, s[10:11]"),
+                ("vs_exec_vote_and_mov", "s_and_b64 exec, exec, vcc", "s_mov_b64 exec, s[10:11]"),
+                ("vs_exec_vote_saveexec_cselect", "s_and_saveexec_b64 s[12:13], vcc",
+                 "s_cselect_b64 exec, s[10:11], s[10:11]")):
+            with self.subTest(name=name):
+                self.assert_tier_c_and_diverges(name, ["v_cmp_eq_u32_e32 vcc, 2, v0", vote, new_exec] + tail)
+        # the vote from a lane count over a narrowed EXEC, then EXEC restored before the branch
+        self.assert_tier_c_and_diverges("vs_exec_vote_bcnt", [
+            "v_cmp_eq_u32_e32 vcc, 2, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_bcnt1_i32_b64 s6, exec",
+            "s_mov_b64 exec, s[12:13]"] + tail)
+        # s_cmp_eq_u64 exec, 0 tags SCC as a 3-tuple ("vote", "exec", "empty"): rewriting EXEC must clear it too
+        for name, new_exec, br in (
+                ("vs_exec_vote_cmp_eq_mov", "s_mov_b64 exec, s[10:11]", "s_cbranch_scc1 1"),
+                ("vs_exec_vote_cmp_eq_cselect", "s_cselect_b64 exec, s[10:11], s[10:11]", "s_cbranch_scc1 1"),
+        ):
+            with self.subTest(name=name):
+                self.assert_tier_c_and_diverges(name, [
+                    "v_cmp_eq_u32_e32 vcc, 2, v0", "s_and_saveexec_b64 s[12:13], vcc",
+                    "s_cmp_eq_u64 exec, 0", new_exec, br, "v_add_nc_u32_e32 v6, 9, v6"],
+                    contains=["tainted-branch"])
+
+    def test_s_cselect_exec_reads_scc_taint(self):
+        # s_cselect_b64 exec, ... reads implicit SCC: when SCC holds a wave-wide vote or stale scalar compare,
+        # halves can select different EXEC masks and must be rejected as tainted-exec
+        for name, body in (
+                ("vs_cselect_exec_saveexec", [
+                    "s_mov_b64 s[10:11], exec", "v_cmp_eq_u32_e32 vcc, 2, v0",
+                    "s_and_saveexec_b64 s[12:13], vcc", "s_cselect_b64 exec, s[10:11], 0",
+                    "v_add_nc_u32_e32 v6, 9, v6"]),
+                ("vs_cselect_exec_vote", [
+                    "s_mov_b64 s[10:11], exec", "v_cmp_eq_u32_e32 vcc, 2, v0",
+                    "s_cmp_lg_u64 vcc, 0", "s_cselect_b64 exec, s[10:11], 0",
+                    "v_add_nc_u32_e32 v6, 9, v6"]),
+                ("vs_cselect_exec_stale_scc", [
+                    "s_mov_b64 s[10:11], exec", "s_mov_b32 s5, 1",
+                    "v_cmp_eq_u32_e32 vcc, 2, v0", "s_cbranch_vccz 1",
+                    "s_mov_b32 s5, 0", "s_cmp_eq_u32 s5, 0",
+                    "s_cselect_b64 exec, s[10:11], 0", "v_add_nc_u32_e32 v6, 9, v6"]),
+        ):
+            with self.subTest(name=name):
+                self.assert_tier_c_and_diverges(name, body, contains=["tainted-exec"])
+
+    def test_vote_on_exec_that_stays_or_is_revoted_stays_a(self):
+        # an EXEC write that sets SCC from the new EXEC votes again, so the branch votes on what it runs
+        for name, body in (
+                ("vs_exec_vote_kept", ["v_cmp_eq_u32_e32 vcc, 2, v0", "s_and_saveexec_b64 s[12:13], vcc",
+                                       "s_cbranch_scc0 1", "v_add_nc_u32_e32 v6, 9, v6", "s_mov_b64 exec, s[12:13]"]),
+                ("vs_exec_vote_revoted", ["v_cmp_eq_u32_e32 vcc, 2, v0", "s_and_saveexec_b64 s[12:13], vcc",
+                                          "v_cmp_eq_u32_e32 vcc, 3, v0", "s_mov_b64 exec, s[12:13]",
+                                          "s_and_saveexec_b64 s[14:15], vcc", "s_cbranch_scc0 1",
+                                          "v_add_nc_u32_e32 v6, 9, v6", "s_mov_b64 exec, s[12:13]"])):
+            with self.subTest(name=name):
+                (tier, reasons, _), asm = meta_of(name, vs(body))
+                self.assertEqual(tier, "A", f"{name}: got {tier}, reasons={reasons}")
+                self.assertEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)), name)
+
+    def test_ps_vote_exec_rewrite_and_vcmpx_are_tainted_branch(self):
+        # Pure-Python pixel-shader classification checks mirroring ps_w64_c_vote_exec, ps_w64_c_vote_rewrite,
+        # and v_cmpx overwriting EXEC without rewriting SCC (runs without llvm-mc).
+        for name, body in (
+                ("ps_vote_exec_shape", [
+                    "v_cmp_eq_u32_e32 vcc, 0, v0", "s_and_saveexec_b64 s[12:13], vcc",
+                    "s_mov_b64 exec, s[10:11]", "s_cbranch_scc0 1", "v_mov_b32_e32 v6, 1"]),
+                ("ps_vote_rewrite_shape", [
+                    "v_cmp_eq_u32_e32 vcc, 0, v0", "s_and_b64 s[20:21], exec, vcc",
+                    "s_cmp_lg_u64 s[20:21], 0", "v_cmp_le_u32_e64 s[20:21], 0, v0",
+                    "s_cbranch_scc0 3", "s_and_b64 exec, exec, s[20:21]",
+                    "v_mov_b32_e32 v6, 1", "s_mov_b64 exec, s[10:11]"]),
+                ("ps_vote_vcmpx", [
+                    "v_cmp_lt_u32_e32 vcc, 40, v0", "s_and_saveexec_b64 s[12:13], vcc",
+                    "v_cmpx_eq_u32_e32 vcc, 2, v0", "s_cbranch_scc0 1",
+                    "v_mov_b32_e32 v6, 1", "s_mov_b64 exec, s[12:13]"]),
+        ):
+            with self.subTest(name=name):
+                self.assert_ps_tier(name, body, "C", reasons=["tainted-branch"])
+
     def test_vote_on_an_unchanged_or_revoted_mask_stays_a(self):
         for name, body in (
                 ("vs_vote_unchanged", self.STALE_VOTE_HEAD + self.STALE_VOTE_TAIL),
@@ -394,6 +476,9 @@ class SoundnessRegressions(unittest.TestCase):
                                              "s_andn2_saveexec_b64 s[12:13], s[12:13]",
                                              "v_mov_b32_e32 v6, 7",
                                              "s_mov_b64 exec, s[10:11]"]),
+                ("vs_clean_cselect_exec", ["s_cmp_eq_u32 s4, 64",
+                                            "s_cselect_b64 exec, s[10:11], exec",
+                                            "v_mov_b32_e32 v6, 5"]),
         ):
             lines = vs(body)
             (tier, reasons, _), asm = meta_of(name, lines)
