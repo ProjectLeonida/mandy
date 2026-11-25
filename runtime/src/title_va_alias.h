@@ -44,12 +44,15 @@ public:
     using TableScanner = void (*)(void* context, std::uint64_t table_va, std::uint32_t descriptors);
 
     // [title_va, title_va + bytes) is reached as [shader_va, shader_va + bytes). A range that overlaps a live one
-    // replaces it (the title has placed a new buffer over pages it released). False for an empty or wrapping range.
+    // replaces it (the title has placed a new buffer over pages it released). False for a null, empty or wrapping range.
     bool add(std::uint64_t title_va, std::uint64_t bytes, std::uint64_t shader_va) {
-        if (!bytes || title_va > UINT64_MAX - bytes) return false;
+        if (!title_va || !bytes || title_va > UINT64_MAX - bytes) return false;
         std::unique_lock lock(mutex_);
+        std::map<std::uint64_t, Range> replacement;
+        replacement.emplace(title_va, Range{title_va + bytes, shader_va});
+        auto node = replacement.extract(replacement.begin());
         erase_overlapping(title_va, title_va + bytes);
-        ranges_[title_va] = {title_va + bytes, shader_va};
+        ranges_.insert(std::move(node));
         count_.store(ranges_.size(), std::memory_order_release);
         return true;
     }
@@ -127,15 +130,22 @@ public:
         return false;
     }
 
-    // The free span around `va` (not in any range): [lo, hi). A copy made for `va` must stay inside it, so it never
-    // replaces a range another buffer still uses.
+    // The free span around `va` (not in any range): [lo, hi), or [va, va) when `va` already lies inside a range.
+    // A copy made for `va` must stay inside it, so it never replaces a range another buffer still uses.
     void gap(std::uint64_t va, std::uint64_t& lo, std::uint64_t& hi) const {
         std::shared_lock lock(mutex_);
         lo = 0;
         hi = UINT64_MAX;
         auto it = ranges_.upper_bound(va);
         if (it != ranges_.end()) hi = it->first;
-        if (it != ranges_.begin()) lo = std::prev(it)->second.end;
+        if (it != ranges_.begin()) {
+            const std::uint64_t prev_end = std::prev(it)->second.end;
+            if (prev_end > va) {
+                lo = hi = va;
+                return;
+            }
+            lo = prev_end;
+        }
     }
 
     // shader_va, and when `va` is in the title's memory with no copy yet, a copy made by the device's resolver.
@@ -197,17 +207,21 @@ public:
     // is left as it was and counted.
     void add_title_memory(std::uint64_t base, std::uint64_t bytes) {
         if (!base || !bytes || base > UINT64_MAX - bytes) return;
-        std::uint64_t begin = base, end = base + bytes;
+        const std::uint64_t begin = base, end = base + bytes;
         std::unique_lock lock(memory_mutex_);
         // A commit inside a reserved range, or two that overlap, are one range.
         auto it = memory_.upper_bound(begin);
         if (it != memory_.begin() && std::prev(it)->second > begin) --it;
-        while (it != memory_.end() && it->first < end) {
-            begin = std::min(begin, it->first);
-            end = std::max(end, it->second);
-            it = memory_.erase(it);
+        std::uint64_t merged_begin = begin, merged_end = end;
+        for (auto scan = it; scan != memory_.end() && scan->first < end; ++scan) {
+            merged_begin = std::min(merged_begin, scan->first);
+            merged_end = std::max(merged_end, scan->second);
         }
-        memory_[begin] = end;
+        std::map<std::uint64_t, std::uint64_t> replacement;
+        replacement.emplace(merged_begin, merged_end);
+        auto node = replacement.extract(replacement.begin());
+        while (it != memory_.end() && it->first < end) it = memory_.erase(it);
+        memory_.insert(std::move(node));
     }
     void remove_title_memory(std::uint64_t base) {
         std::unique_lock lock(memory_mutex_);
@@ -252,9 +266,11 @@ public:
     }
     std::uint64_t pulled() const { return pulled_.load(std::memory_order_relaxed); }
 
-    // The end of the first title range that overlaps [lo, hi), or 0 when none does. The GPU address arena keeps its
-    // own allocations out of these ranges, so one number is never both an arena address and a title address.
+    // The end of the first title range that overlaps [lo, hi), or 0 when none does (including an empty range). The
+    // GPU address arena keeps its own allocations out of these ranges, so one number is never both an arena address
+    // and a title address.
     std::uint64_t title_overlap_end(std::uint64_t lo, std::uint64_t hi) const {
+        if (lo >= hi) return 0;
         std::shared_lock lock(memory_mutex_);
         auto it = memory_.upper_bound(lo);
         if (it != memory_.begin() && std::prev(it)->second > lo) return std::prev(it)->second;

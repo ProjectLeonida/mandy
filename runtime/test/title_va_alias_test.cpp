@@ -4,6 +4,25 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <new>
+
+// Single-threaded failure injection for strong-exception-safety checks.
+static int allocations_before_failure = -1;
+void* operator new(std::size_t size) {
+    if (allocations_before_failure == 0) {
+        allocations_before_failure = -1;
+        throw std::bad_alloc();
+    }
+    if (allocations_before_failure > 0) --allocations_before_failure;
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t size) { return operator new(size); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -16,6 +35,7 @@ int main() {
     constexpr std::uint64_t arena = 0x2340000;
     // Empty: identity everywhere.
     EXPECT(a.size() == 0 && a.shader_va(title) == title && a.shader_va(0) == 0);
+    EXPECT(!a.add(0, size, arena));                   // null title VA
     EXPECT(!a.add(title, 0, arena));                  // empty range
     EXPECT(!a.add(UINT64_MAX - 4, 16, arena));        // wraps
     EXPECT(a.add(title, size, arena) && a.size() == 1);
@@ -27,12 +47,18 @@ int main() {
     EXPECT(a.shader_va(title - 1) == title - 1);
     EXPECT(a.shader_va(title + size) == title + size);
     EXPECT(a.shader_va(arena) == arena);
-    // The free span around an address: between the ranges, so a window made for it never covers one.
+    // The free span around an address: between the ranges, or empty [va, va) when va already lies inside one.
     std::uint64_t lo = 1, hi = 1;
     a.gap(title + size + 5, lo, hi);
     EXPECT(lo == title + size && hi == UINT64_MAX);
     a.gap(title - 5, lo, hi);
     EXPECT(lo == 0 && hi == title);
+    a.gap(title, lo, hi);
+    EXPECT(lo == title && hi == title);
+    a.gap(title + 0x100, lo, hi);
+    EXPECT(lo == title + 0x100 && hi == title + 0x100);
+    a.gap(title + size - 1, lo, hi);
+    EXPECT(lo == title + size - 1 && hi == title + size - 1);
     // Without a device's resolver, resolve only translates what was added, and counts it.
     EXPECT(a.resolve(title + 4, 4, leonida::TitleVaAliases::root_view) == arena + 4);
     EXPECT(a.resolve(title - 4, 4, leonida::TitleVaAliases::root_view) == title - 4);
@@ -46,8 +72,39 @@ int main() {
     a.add_title_memory(0x40010000, 0x1000);
     EXPECT(a.title_memory(0x40080000, mlo, mhi) && mlo == 0x40000000 && mhi == 0x40100000);
     EXPECT(!a.title_memory(0x40100000, mlo, mhi) && !a.title_memory(0x3FFFFFFF, mlo, mhi));
+    // title_overlap_end: overlaps only non-empty intervals [lo, hi).
+    EXPECT(a.title_overlap_end(0x3FFF0000, 0x40000000) == 0);
+    EXPECT(a.title_overlap_end(0x3FFF0000, 0x40000001) == 0x40100000);
+    EXPECT(a.title_overlap_end(0x40080000, 0x40090000) == 0x40100000);
+    EXPECT(a.title_overlap_end(0x40080000, 0x40080000) == 0);  // empty interval inside title memory
+    EXPECT(a.title_overlap_end(0x40090000, 0x40080000) == 0);  // inverted interval inside title memory
+    // Strong exception safety: overlapping add_title_memory / add must keep prior ranges intact on std::bad_alloc.
+    {
+        bool threw = false;
+        allocations_before_failure = 0;
+        try {
+            a.add_title_memory(0x40080000, 0x100000);
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        }
+        allocations_before_failure = -1;
+        EXPECT(threw);
+        EXPECT(a.title_memory(0x40080000, mlo, mhi) && mlo == 0x40000000 && mhi == 0x40100000);
+    }
     a.remove_title_memory(0x40000000);
     EXPECT(!a.title_memory(0x40080000, mlo, mhi));
+    {
+        bool threw = false;
+        allocations_before_failure = 0;
+        try {
+            (void)a.add(title + 0x8000, size, 0x5000000);
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        }
+        allocations_before_failure = -1;
+        EXPECT(threw);
+        EXPECT(a.size() == 1 && a.shader_va(title) == arena && a.shader_va(title + 0x8000) == arena + 0x8000);
+    }
     // A wrapping target (an import below heap_base) is kept as is: modular arithmetic.
     constexpr std::uint64_t below = 0xFFFFFFFFFFF00000ull;
     EXPECT(a.add(title + 0x100000, size, below) && a.shader_va(title + 0x100010) == below + 0x10);
