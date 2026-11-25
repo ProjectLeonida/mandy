@@ -777,6 +777,55 @@ int main() {
         EXPECT(uncap.target_interval_us == 0 && near(uncap.drift_us, 0.0) && uncap.p50_us == period);
     }
 
+    // set_uncapped(true) wakes a waiter already blocked on the vblank grid or latency throttle immediately.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 1));
+        auto wait = wait_async(pacer, infinite_timeout_ms);
+        EXPECT(blocked(wait));
+        pacer.set_uncapped(true);
+        EXPECT(wait.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready);
+        const Result r = wait.get();
+        EXPECT(r.hr == pacer_hr::ok && r.token == 1);
+    }
+
+    // Saturating timeout deadline: a finite timeout near UINT64_MAX must not wrap below start and falsely time out.
+    {
+        ManualFrameClock clock;
+        clock.advance_us(no_deadline - 100000ull);
+        FramePacer pacer(clock);
+        EXPECT(pacer.set_frame_interval(period, 1, 0) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(frame_event_origin, 0, 0) == pacer_hr::ok);
+        auto wait = wait_async(pacer, 5000u);  // start + 5,000,000 us would wrap uint64_t without saturation
+        EXPECT(blocked(wait));
+        clock.advance_us(period);
+        EXPECT(wait.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready);
+        const Result r = wait.get();
+        EXPECT(r.hr == pacer_hr::ok && r.token == 1);
+    }
+
+    // SteadyFrameClock::wait with a huge deadline (> INT64_MAX) must wait rather than spinning on a negative wrap.
+    {
+        SteadyFrameClock clock;
+        std::mutex m;
+        std::condition_variable cv;
+        bool done = false;
+        std::thread waiter([&] {
+            std::unique_lock lock(m);
+            clock.wait(lock, cv, std::uint64_t(std::numeric_limits<std::int64_t>::max()) + 1000ull);
+            done = true;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        {
+            std::lock_guard lock(m);
+            EXPECT(!done);  // still waiting (did not wrap negative and return immediately)
+        }
+        cv.notify_all();
+        waiter.join();
+        EXPECT(done);
+    }
+
     std::printf("frame_pacer_test: all cases pass\n");
     return 0;
 }

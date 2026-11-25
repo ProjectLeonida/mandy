@@ -79,8 +79,17 @@ public:
                                  std::chrono::steady_clock::now() - start_).count());
     }
     void wait(std::unique_lock<std::mutex>& lock, std::condition_variable& cv, std::uint64_t deadline_us) override {
-        if (deadline_us == no_deadline) cv.wait(lock);
-        else cv.wait_until(lock, start_ + std::chrono::microseconds(deadline_us));
+        if (deadline_us == no_deadline) {
+            cv.wait(lock);
+            return;
+        }
+        const std::uint64_t now = now_us();
+        if (deadline_us <= now) return;
+        // Bound the relative wait duration so converting uint64_t microseconds to signed std::chrono::microseconds
+        // (and adding to steady_clock::now()) can never wrap negative or overflow time_point; callers loop on wake.
+        constexpr std::uint64_t max_wait_us = 86'400'000'000ull;  // 24 hours
+        const std::uint64_t rem = std::min(deadline_us - now, max_wait_us);
+        cv.wait_for(lock, std::chrono::microseconds(rem));
     }
 
 private:
@@ -427,7 +436,13 @@ public:
 
     // The fps cap off (LEONIDA_PRESENT_UNCAP; see the top comment): waits never block and presents count as shown
     // at once. Registration and suspension keep meaning what they did; the flag survives suspend/resume.
-    void set_uncapped(bool on) { std::lock_guard guard(mutex_); uncapped_ = on; }
+    void set_uncapped(bool on) {
+        {
+            std::lock_guard guard(mutex_);
+            uncapped_ = on;
+        }
+        cv_.notify_all();
+    }
     bool uncapped() const { std::lock_guard guard(mutex_); return uncapped_; }
 
     // Frame-time percentiles, mean drift against the active target interval, and origin-to-present latency over
@@ -558,8 +573,10 @@ private:
         const bool is_origin = (event == frame_event_origin);
         const bool token_on_timeout = (flags & frame_wait_flag_token_on_timeout) != 0;
         const std::uint64_t start = clock_.now_us();
-        const std::uint64_t give_up = timeout_ms == infinite_timeout_ms ? no_deadline
-                                                                         : start + std::uint64_t(timeout_ms) * 1000;
+        const std::uint64_t timeout_us = std::uint64_t(timeout_ms) * 1000u;
+        const std::uint64_t give_up =
+            timeout_ms == infinite_timeout_ms ? no_deadline
+            : (timeout_us > no_deadline - start ? no_deadline : start + timeout_us);
         for (;;) {
             if (shutdown_ || suspended_ || !interval_set_) return pacer_hr::invalid_state;
             if (is_origin ? !event_armed_[frame_event_origin]
