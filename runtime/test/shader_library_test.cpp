@@ -624,6 +624,17 @@ int main() {
     CHECK(!JsonReader("\"\\u00").parse(json));
     CHECK(JsonReader("\"\\u0041\"").parse(json) && json.string == "A");
 
+    {
+        Json supplementary;
+        CHECK(JsonReader(R"({"\uD834\uDD1E": "\uDBFF\uDFFF"})").parse(supplementary));
+        const auto* value = supplementary.find("\xf0\x9d\x84\x9e");
+        CHECK(value && value->string == "\xf4\x8f\xbf\xbf");
+        for (const char* invalid : {R"("\uD800")", R"("\uDC00")", R"("\uD800\u0041")", R"("\uD800\uD80")"}) {
+            Json unpaired;
+            CHECK(!JsonReader(invalid).parse(unpaired));
+        }
+    }
+
     const auto shader = container({{dynamic, 600}});
     CHECK(dxbc_part(shader, "PRIV").size() == 4 && !dxbc_part(shader, "DXIL").empty() && dxbc_part(shader, "RTS0").empty());
     CHECK(fssm_program(shader) == skewed(600));

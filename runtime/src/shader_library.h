@@ -574,6 +574,17 @@ private:
         return -1;
     }
 
+    bool hex_quad(unsigned& code) {
+        if (text_.size() - pos_ < 4) return false;
+        code = 0;
+        for (int i = 0; i < 4; ++i) {
+            const int digit = hex_digit(text_[pos_++]);
+            if (digit < 0) return false;
+            code = code << 4 | unsigned(digit);
+        }
+        return true;
+    }
+
     bool string(std::string& out) {
         if (pos_ >= text_.size() || text_[pos_++] != '"') return false;
         while (pos_ < text_.size()) {
@@ -593,20 +604,27 @@ private:
             case 'r': out.push_back('\r'); break;
             case 't': out.push_back('\t'); break;
             case 'u': {
-                if (pos_ + 4 > text_.size()) return false;
-                unsigned code = 0;
-                for (int i = 0; i < 4; ++i) {  // exactly four hex digits
-                    const int digit = hex_digit(text_[pos_++]);
-                    if (digit < 0) return false;
-                    code = code << 4 | unsigned(digit);
+                unsigned code;
+                if (!hex_quad(code)) return false;
+                if (code >= 0xd800 && code <= 0xdbff) {
+                    unsigned low;
+                    if (!literal("\\u") || !hex_quad(low) || low < 0xdc00 || low > 0xdfff) return false;
+                    code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+                } else if (code >= 0xdc00 && code <= 0xdfff) {
+                    return false;
                 }
                 if (code < 0x80) {
                     out.push_back(char(code));
                 } else if (code < 0x800) {
                     out.push_back(char(0xc0 | (code >> 6)));
                     out.push_back(char(0x80 | (code & 0x3f)));
-                } else {  // surrogate pairs are kept as two 3-byte sequences; index names are ASCII
+                } else if (code < 0x10000) {
                     out.push_back(char(0xe0 | (code >> 12)));
+                    out.push_back(char(0x80 | ((code >> 6) & 0x3f)));
+                    out.push_back(char(0x80 | (code & 0x3f)));
+                } else {
+                    out.push_back(char(0xf0 | (code >> 18)));
+                    out.push_back(char(0x80 | ((code >> 12) & 0x3f)));
                     out.push_back(char(0x80 | ((code >> 6) & 0x3f)));
                     out.push_back(char(0x80 | (code & 0x3f)));
                 }
