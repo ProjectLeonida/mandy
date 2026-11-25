@@ -10,7 +10,6 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest import mock
 import urllib.parse
 import urllib.request
 from unittest import mock
@@ -293,6 +292,32 @@ class TestGalleryServer(unittest.TestCase):
                 self.assertIn(name, textures)
                 self.assertEqual(textures[name]["format"], expected)
                 self.assertEqual(textures[name]["preview"], textures[name]["url"])
+
+    def test_png_thumbnail_falls_back_to_uppercase_dds(self) -> None:
+        # GALLERY-THUMB-UPPERCASE-DDS: the catalog lists upper.DDS and the gallery asks for upper.png as its
+        # thumbnail. On a case-sensitive filesystem the fallback's upper.dds is not that file, so it was a 404.
+        # A case-sensitive isfile stands in for one here, on Windows and macOS too.
+        with open(os.path.join(self.textures_dir, "upper.DDS"), "wb") as f:
+            f.write(_make_1x1_rgba_dds())
+        real_isfile = os.path.isfile
+
+        def case_sensitive_isfile(path) -> bool:
+            folder, name = os.path.split(os.fspath(path))
+            try:
+                return real_isfile(path) and name in os.listdir(folder or ".")
+            except OSError:
+                return False
+
+        with mock.patch("os.path.isfile", case_sensitive_isfile):
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/textures/upper.png", timeout=3) as r:
+                self.assertEqual(r.status, 200)
+                self.assertEqual(r.headers["Content-Type"], "image/png")
+                self.assertTrue(r.read().startswith(b"\x89PNG"))
+            # A name that matches nothing in any case is still a 404.
+            with self.assertRaises(urllib.error.HTTPError) as missing:
+                urllib.request.urlopen(f"http://127.0.0.1:{self.port}/textures/nothing.png", timeout=3)
+            self.assertEqual(missing.exception.code, 404)
+            missing.exception.close()
 
     def test_dds_selection_by_catalog_url(self) -> None:
         # Two RGBA8 layers with a 2x2 and 1x1 mip each.

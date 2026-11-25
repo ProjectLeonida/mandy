@@ -103,6 +103,23 @@ def host_allowed(host: str | None) -> bool:
     return name in _LOOPBACK_HOSTS
 
 
+def dds_sibling(path: str) -> str | None:
+    """The file in path's folder whose name matches path's name in any case (upper.DDS for upper.dds), or None.
+
+    path is already inside the textures folder (safe_subpath), and a sibling in the same folder stays inside it."""
+    folder, name = os.path.split(path)
+    try:
+        entries = sorted(os.listdir(folder))
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.lower() == name.lower():
+            candidate = os.path.join(folder, entry)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
 def safe_subpath(base_dir: str, rel: str) -> str | None:
     """Resolve a relative URL path safely inside base_dir, or return None."""
     if not base_dir or not isinstance(rel, str) or not rel or "\x00" in rel:
@@ -217,6 +234,9 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
                 if dds_cand is None:
                     self.send_error(403, "Forbidden")
                     return
+                if not os.path.isfile(dds_cand):
+                    # A texture named upper.DDS: on a case-sensitive filesystem stem + ".dds" misses it.
+                    dds_cand = dds_sibling(dds_cand) or dds_cand
                 if os.path.isfile(dds_cand) and dds_png:
                     try:
                         png_bytes = dds_png.dds_file_to_png_bytes(dds_cand, max_size=1024)
