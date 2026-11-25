@@ -222,8 +222,11 @@ public:
     const leonida::CommandList& commands() const { return list_; }
     // The descriptor tables this recording binds (console VAs), for the scan before a submission.
     const std::vector<std::pair<std::uint64_t, std::uint32_t>>& tables() const { return tables_; }
-    // The pipeline states and root signatures the recording names (it holds a reference to each until Reset).
+    // The pipeline states and root signatures the recording names (it holds a reference to each until Reset), and
+    // the objects a shim handed it with hold_until_reset.
     const std::vector<IUnknown*>& pinned() const { return held_; }
+    // rt::d3d12::hold_until_reset: an object the recording uses that its caller does not keep (a shim's own scratch).
+    void hold_for_recording(IUnknown* object) { hold(object); }
     bool needs_all_sampled_views() const {
         if (directly_indexed_) return true;
         for (const auto& command : list_.commands()) {
@@ -2188,7 +2191,8 @@ public:
 
     // What a held batch (queue_holds.h) keeps alive until it has run: the pipeline states and root signatures its
     // lists name, which the application may release and Reset away as soon as ExecuteCommandLists returns. Resources
-    // are not held (a D3D12 application keeps them until the fence it signals; the docs, section 4.4, list this).
+    // are not held (a D3D12 application keeps them until the fence it signals; the docs, section 4.4, list this),
+    // except a shim's own the recording uses (hold_until_reset), which are pinned with them.
     static std::shared_ptr<void> pin_lists(const std::vector<const GraphicsCommandList*>& lists) {
         auto objects = std::shared_ptr<std::vector<IUnknown*>>(new std::vector<IUnknown*>, [](auto* held) {
             for (IUnknown* object : *held) object->Release();
@@ -2814,6 +2818,13 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
     if (!l) return false;
     front = l->front_stencil_ref();
     back = l->back_stencil_ref();
+    return true;
+}
+
+bool hold_until_reset(ID3D12GraphicsCommandList* list, IUnknown* object) {
+    GraphicsCommandList* l = GraphicsCommandList::from(list);
+    if (!l || !object) return false;
+    l->hold_for_recording(object);
     return true;
 }
 

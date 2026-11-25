@@ -95,7 +95,8 @@ Useful switches:
   This switch covers imports only; it does not affect the D3D12 outcomes.
 * `LEONIDA_SKIP_CPU_CHECK=1` skips the AVX preflight of `--init` and `--run`, which otherwise exits 4 with one line
   naming the missing feature on a host without AVX (a QEMU `qemu64` guest; under Rosetta, set
-  `ROSETTA_ADVERTISE_AVX=1` instead). The game itself still needs AVX, so this is for the #UD emulation work.
+  `ROSETTA_ADVERTISE_AVX=1` instead). The game itself still needs AVX, so this is for the #UD emulation work (see
+  [cpu_features.md](cpu_features.md#hosts-without-avx) for what works on a host without AVX).
 * `LEONIDA_SKIP_INT3=1` (with `--trace`) steps over each int3 in guest code and logs it once per address as an
   `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
@@ -135,6 +136,35 @@ Useful switches:
   package drive is read-only); the package itself is never written. Set `LEONIDA_WRITE_DIR` to override that folder
   for one run (it wins over `--overlay`). For a fresh first-run profile, also set `LEONIDA_SAVE_DIR` to a separate
   empty directory for the local game-save provider.
+
+### Under Wine on Linux
+
+The prefix has to supply a `d3d12.dll` that exports `D3D12SerializeVersionedRootSignature`, because the executable
+imports it. Wine's own `d3d12.dll` does not answer that export for the runtime's shim, and the failure is quiet:
+the D3D12 trace ends at about 1,658 calls, the startup trace ends in an access violation inside the executable,
+and the one line that names the cause is
+`[rt] d3d12_xs: host d3d12.dll has no D3D12SerializeVersionedRootSignature`. The run never reaches
+`CreateRootSignature`.
+
+Copying the DLLs a Proton prefix installs is not enough on its own: Wine keeps preferring its own copy next to
+them. Name them in the overrides.
+
+```bash
+GE=$HOME/GE-Proton11-13-x86_64/files/lib/wine
+cp "$GE/vkd3d-proton/x86_64-windows/d3d12.dll" \
+   "$GE/vkd3d-proton/x86_64-windows/d3d12core.dll" \
+   "$GE/dxvk/x86_64-windows/dxgi.dll" "$WINEPREFIX/drive_c/windows/system32/"
+export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n,b"
+export LEONIDA_D3D12=vulkan
+export LEONIDA_SHADERS='Z:\path\to\shaders\spirv'
+wine ./gta6rt.exe --run 'Z:\path\to\game_scarlett_master.exe' --game-dir 'Z:\path\to\the\package' \
+     --trace /tmp/boot.jsonl --trace-d3d12
+```
+
+With those three DLLs and the override, the same prefix reaches the frame loop: about 1.4 million D3D12 calls in
+90 s, no exception, `PresentX ready`, against 1,658 calls and an access violation without them, measured on Wine
+11.13 (GE-Proton 11-13) with an RDNA2 iGPU. A prefix that Proton itself created already carries these files and
+needs no override.
 
 ## 3. Triage order
 

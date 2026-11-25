@@ -344,10 +344,10 @@ What is implemented (all of it testable without the game):
   that reaches past the end of the buffer stops there, as the hardware's bounds check would.
   - Values follow D3D's rules (`runtime/src/uav_clear.h`): Uint copies the low bits of each value into its channel
     with no conversion, whatever the format's type; Float converts (UNORM/SNORM clamp and round to nearest, NaN is
-    0; 16-bit and the packed 11/10-bit floats round to nearest even). A raw or structured view takes value 0 for
-    every 32-bit word (Float: its bits). D3D11 calls Float on an integer view invalid and D3D12 does not say; here
-    the value is converted (toward zero, clamped, NaN 0) so the result is defined. These are checked against
-    hand-computed elements in `d3d12_uav_clear_test`.
+    0; 16-bit and the packed 11/10-bit floats round toward zero, a finite value too large becoming the largest
+    finite). A raw or structured view takes value 0 for every 32-bit word (Float: its bits). D3D11 calls Float on an
+    integer view invalid and D3D12 does not say; here the value is converted (toward zero, clamped, NaN 0) so the
+    result is defined. These are checked against hand-computed elements in `d3d12_uav_clear_test`.
   - Buffers: elements of up to 4 bytes repeat in every aligned word, so `vkCmdFillBuffer` writes the aligned middle
     and `vkCmdCopyBuffer` copies the unaligned ends from it (an 8-bit view at an odd offset, say). 8- and 16-byte
     elements are written with `vkCmdUpdateBuffer` (up to 64 KiB) and doubled with copies. A rectangle is an

@@ -1905,12 +1905,68 @@ bool console_heap_shadow_enabled() {
 // What a T# the title wrote itself into a console descriptor heap came to (bind_title_image, after Resource).
 // not_tsharp: words with an image TYPE that do not decode as a T#: data, not a descriptor (the retail heap's last
 // 27 MiB are also the slot-133 pool, whose buffers sit there; T14 in ref/GAP-ANALYSIS-2.md).
-enum class TitleImage { known, bound, unknown, refused, not_tsharp };
+// TitleImage is defined in d3d12_com.h.
 class Resource;
 struct DeviceState;
 // `why`, when given, says what refused a T#: the first refusals are logged with their words (scan_console_slots).
 TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWords& words, const char** why = nullptr);
 struct TitleTexture;  // a texture the title keeps in its own memory (TitleTexture, after Resource)
+
+// The first refused T#s of each reason, with where they sit in the heap and their words, and counts of the
+// distinct slots refused overall and per reason (a slot is scanned again every pass over the heap).
+struct UnboundTsharpTracker {
+    std::mutex mutex;
+    std::set<std::size_t> total_slots;
+    std::map<std::string, std::set<std::size_t>> slots_by_reason;
+    std::map<std::string, std::uint64_t> counts_by_reason;
+    std::map<std::string, unsigned> logged;
+    std::uint64_t total_refusals = 0;
+
+    void note(std::uint64_t heap_va, std::size_t offset, const leonida::gfx10::ImageWords& words, const char* why) {
+        std::lock_guard lock(mutex);
+        const std::string reason = why ? why : "?";
+        ++total_refusals;
+        ++counts_by_reason[reason];
+        if (total_slots.size() >= 262144) return;  // enough to say how many
+        const bool fresh_overall = total_slots.insert(offset).second;
+        const bool fresh_reason = slots_by_reason[reason].insert(offset).second;
+        unsigned& n = logged[reason];
+        if ((!fresh_overall && !fresh_reason) || n >= 6) return;
+        ++n;
+        std::fprintf(stderr,
+                     "[rt] d3d12: unbound T# in console heap 0x%llx at +0x%zx (%zu distinct slots so far, %zu for '%s'): %s: "
+                     "%08x %08x %08x %08x %08x %08x %08x %08x\n",
+                     static_cast<unsigned long long>(heap_va), offset, total_slots.size(),
+                     slots_by_reason[reason].size(), reason.c_str(), reason.c_str(), words[0],
+                     words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    }
+
+    UnboundTsharpStats stats() {
+        std::lock_guard lock(mutex);
+        UnboundTsharpStats s;
+        s.total_distinct_slots = total_slots.size();
+        s.total_refusals = total_refusals;
+        for (const auto& [reason, slots] : slots_by_reason) {
+            s.by_reason[reason].distinct_slots = slots.size();
+            s.by_reason[reason].total_refusals = counts_by_reason[reason];
+        }
+        return s;
+    }
+
+    void reset() {
+        std::lock_guard lock(mutex);
+        total_slots.clear();
+        slots_by_reason.clear();
+        counts_by_reason.clear();
+        logged.clear();
+        total_refusals = 0;
+    }
+};
+
+UnboundTsharpTracker& unbound_tsharp_tracker() {
+    static UnboundTsharpTracker tracker;
+    return tracker;
+}
 
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
 class Resource;
@@ -3231,6 +3287,7 @@ struct DeviceState {
         // Since the last log line.
         std::uint64_t copied = 0, vsharps = 0, unbacked = 0, retried = 0;
         std::uint64_t images[5] = {};  // by TitleImage
+        std::map<std::string, std::uint64_t> refused_reasons;
         double ms = 0, pages_ms = 0, fix_ms = 0, retry_ms = 0;  // ms: all; the others its parts
     };
     std::mutex console_heap_mutex;  // taken before title_window_mutex, shadow_mutex and descriptor_mutex
@@ -3283,8 +3340,11 @@ struct DeviceState {
             if (leonida::gfx10::is_image(words)) {
                 const char* why = nullptr;
                 const TitleImage result = bind_title_image(*this, words, &why);
-                if (result == TitleImage::unknown || result == TitleImage::refused)
+                if (result == TitleImage::unknown || result == TitleImage::refused) {
                     note_refused_tsharp(heap, slot * kDescriptorSize, words, why);
+                    if (result == TitleImage::refused)
+                        ++heap.refused_reasons[why ? why : "?"];
+                }
                 ++heap.images[unsigned(result)];
                 settled = result != TitleImage::unknown && result != TitleImage::refused;
                 if (result == TitleImage::not_tsharp) std::memset(w, 0, 16);
@@ -3379,24 +3439,9 @@ struct DeviceState {
         heap.retried += visited;
     }
 
-    // The first refused T#s of each reason, with where they sit in the heap and their words, and a count of the
-    // distinct slots refused (a slot is scanned again every pass over the heap).
     void note_refused_tsharp(ConsoleHeap& heap, std::size_t offset, const leonida::gfx10::ImageWords& words,
                              const char* why) {
-        static std::mutex mutex;
-        static std::map<std::string, unsigned> logged;
-        static std::set<std::size_t> slots;
-        std::lock_guard lock(mutex);
-        if (slots.size() >= 262144) return;  // enough to say how many
-        const bool fresh = slots.insert(offset).second;
-        unsigned& n = logged[why ? why : "?"];
-        if (!fresh || n >= 6) return;
-        ++n;
-        std::fprintf(stderr,
-                     "[rt] d3d12: unbound T# in console heap 0x%llx at +0x%zx (%zu distinct slots so far): %s: "
-                     "%08x %08x %08x %08x %08x %08x %08x %08x\n",
-                     static_cast<unsigned long long>(heap.console_va), offset, slots.size(), why ? why : "?", words[0],
-                     words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+        unbound_tsharp_tracker().note(heap.console_va, offset, words, why);
     }
 
     void refresh_console_heap(ConsoleHeap& heap) {  // console_heap_mutex held
@@ -3494,6 +3539,13 @@ struct DeviceState {
                          static_cast<unsigned long long>(heap->images[unsigned(TitleImage::unknown)]),
                          static_cast<unsigned long long>(heap->images[unsigned(TitleImage::refused)]),
                          static_cast<unsigned long long>(heap->images[unsigned(TitleImage::not_tsharp)]));
+            std::string refused_breakdown;
+            for (const auto& [reason, count] : heap->refused_reasons)
+                refused_breakdown += (refused_breakdown.empty() ? "" : "; ") + reason + " " + std::to_string(count);
+            if (!refused_breakdown.empty())
+                std::fprintf(stderr, "[rt] d3d12: console descriptor heap 0x%llx unbound T#s by reason: %s\n",
+                             static_cast<unsigned long long>(heap->console_va), refused_breakdown.c_str());
+            heap->refused_reasons.clear();
             heap->copied = heap->vsharps = heap->unbacked = heap->retried = heap->deferred_fixes = 0;
             for (auto& n : heap->images) n = 0;
             heap->ms = heap->pages_ms = heap->fix_ms = heap->retry_ms = 0;
@@ -10284,7 +10336,10 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
             const auto alias = leonida::title_gpu_views::other_view(image.address);
             if (auto* candidate = device.gpu_placements.find(image.address, alias, matches)) owner = candidate;
         }
-        if (!owner) return TitleImage::unknown;
+        if (!owner) {
+            if (why) *why = "no texture at T# address";
+            return TitleImage::unknown;
+        }
         const Resource& r = *owner;
         image.address = r.image_address();  // release this key with its actual owner
         const D3D12_RESOURCE_DESC& d = r.desc();
@@ -10300,10 +10355,10 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
         if (!r.descriptor_image()) return refuse("the texture has no image");
         if (!type_fits) return refuse("T# type or samples do not fit the texture");
         if (!msaa && image.first_mip + image.mip_count > d.MipLevels) return refuse("T# names mips the texture lacks");
+        if (image.type == g::ImageType::cube && !(r.format() && layers >= 6))
+            return refuse("cube T# on fewer than six layers");
         if (!volume && image.first_layer + image.layer_count > layers)
             return refuse("T# names layers the texture lacks");
-        if (image.type == g::ImageType::cube && !(r.format() && image.layer_count >= 6))
-            return refuse("cube T# on fewer than six layers");
         const bool storage = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !msaa &&
                              r.aspects() == VK_IMAGE_ASPECT_COLOR_BIT;
         if (!device.bind_image_locked(words, image, r.descriptor_image(), r.format(), r.aspects(), storage,
@@ -11679,6 +11734,7 @@ public:
     bool upload_in_vram() const { return state_.upload_in_vram; }
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
+    DeviceState& state() { return state_; }
     const DeviceState& state() const { return state_; }
     HRESULT create_native_graphics(const leonida::native_pso::GraphicsDesc& desc, REFIID iid, void** out) {
         const auto* shaders = state_.library();
@@ -18569,6 +18625,38 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;
     return d->create_console_descriptor_heap(desc, console_address, console_size, riid, out);
+}
+
+UnboundTsharpStats unbound_tsharp_stats() {
+    return unbound_tsharp_tracker().stats();
+}
+
+void reset_unbound_tsharp_stats() {
+    unbound_tsharp_tracker().reset();
+}
+
+void note_refused_tsharp_for_test(std::uint64_t heap_va, std::size_t offset,
+                                  const std::array<std::uint32_t, 8>& words, const char* why) {
+    leonida::gfx10::ImageWords w;
+    std::memcpy(w.data(), words.data(), sizeof(w));
+    unbound_tsharp_tracker().note(heap_va, offset, w, why);
+}
+
+TitleImage test_bind_title_image(ID3D12Device* device, const std::array<std::uint32_t, 8>& words,
+                                 const char** why) {
+    if (!device) return TitleImage::not_tsharp;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (!d) return TitleImage::not_tsharp;
+    leonida::gfx10::ImageWords w;
+    std::memcpy(w.data(), words.data(), sizeof(w));
+    return bind_title_image(d->state(), w, why);
+}
+
+std::uint64_t resource_image_address(ID3D12Resource* resource) {
+    if (!resource) return 0;
+    const Resource* r = Resource::from<Resource>(resource);
+    return r ? r->image_address() : 0;
 }
 
 std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {
