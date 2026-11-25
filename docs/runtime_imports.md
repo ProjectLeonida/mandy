@@ -179,6 +179,12 @@ they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_
 
 The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so the same dry run lists 23.
 
+The rest of the table's rows have shims now: `d3d12_xs.dll`'s `D3D12ConfigureVirtualMemoryX`
+(`runtime/shims/d3d12_xs.cpp`), `XCRDAPI.dll`'s `DStorageGetFactory` (served as `xcrdapi.dll` by
+`runtime/shims/dstorage.cpp`), `chad.dll`'s 5 and `xapu.dll`'s 5 (`runtime/shims/xapu_chad.cpp`) and
+`AcpHal.dll`'s 9 (`runtime/shims/acphal.cpp`). The table above was measured before those shims and
+still lists them as unimplemented; they are served now, so the same dry run lists 0.
+
 `--init` on the same files also exits 0 with nothing on stderr. Its `--trace` file has 15 lines: the four package DLLs'
 `DllMain(DLL_PROCESS_ATTACH)` each return 1, the executable's two TLS callbacks run at process attach (reason 1) and
 again at detach (reason 0), and there is no `exception`, `error` or `unimplemented_call` event. So none of the 30
@@ -268,10 +274,11 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
 
 ## When an unimplemented import is called
 
-The table above has no unimplemented imports, but the game executable will. A call to one used to return 0
-silently, which for an `HRESULT` function is `S_OK` with its out parameters never written; the caller then carries on
-with stale pointers and fails somewhere unrelated. `LEONIDA_UNIMPLEMENTED` chooses what the thunk does instead
-(details in `runtime/README.md`):
+The table above has no unimplemented imports, but the game executable will. The same dry run now lists 0
+for it (the correction notes above), so this section describes the policy for a future import. A call to one
+used to return 0 silently, which for an `HRESULT` function is `S_OK` with its out parameters never written;
+the caller then carries on with stale pointers and fails somewhere unrelated. `LEONIDA_UNIMPLEMENTED`
+chooses what the thunk does instead (details in `runtime/README.md`):
 
 - `log` (default): print the name once, return 0. Unchanged.
 - `fail`: return `E_NOTIMPL` for imports known to return `HRESULT`, 0 otherwise.

@@ -9,6 +9,12 @@ how many call sites each has, the constants those sites pass, and how each site 
 code or data of the executable is quoted. Measured at `main` `1cc6e3c1` with `tools/import_call_sites.py`; the argument
 registers before each call were read by hand.
 
+The 30 this page counts were measured before the shims landed, and all of them bind now: the eight in
+`xmem.dll` and `d3d12_xs.dll` (`runtime/shims/xmem.cpp` and `runtime/shims/d3d12_xs.cpp`), the audio
+coprocessor's 19 (`runtime/shims/xapu_chad.cpp` and `runtime/shims/acphal.cpp`), `xg_xs.dll`'s 2
+(`runtime/shims/xg_xs.cpp`) and `XCRDAPI.dll`'s `DStorageGetFactory` (served as `xcrdapi.dll` by
+`runtime/shims/dstorage.cpp`). The dry run now lists 0 unimplemented for the executable.
+
 ```powershell
 python -I tools/import_call_sites.py game_scarlett_master.exe --dll AcpHal.dll --dll xapu.dll --dll chad.dll `
     --dll xg_xs.dll --dll XCRDAPI.dll
@@ -62,6 +68,10 @@ with a result queue, connected once and torn down once. How `chad.dll`'s handle 
 
 `DStorageGetFactory` has the shape of the public DirectStorage function `DStorageGetFactory(REFIID, void**)`. #4348 is an
 open pull request for it.
+
+It is served now: `runtime/shims/dstorage.cpp` answers it for `xcrdapi.dll`, the module the executable
+imports, as well as `dstorage_xs.dll` and `dstorage.dll`; `xg_xs.dll`'s two are in
+`runtime/shims/xg_xs.cpp`.
 
 ## What the executable already does about a failure
 
