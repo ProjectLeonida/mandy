@@ -2380,6 +2380,18 @@ struct DeviceState {
     std::uint64_t unbacked_requests = 0;      // title addresses no backing could be made for (zero-size views)
 
     rt::d3d12::GeometryViews geometry;
+    static void forget_geometry_alias(std::uintptr_t source, std::size_t, VkDeviceSize va) {
+        auto& aliases = leonida::title_va_aliases();
+        aliases.remove(source, va);
+        if (const auto twin = leonida::title_gpu_views::other_view(source)) aliases.remove(twin, va);
+    }
+    void drain_geometry_releases() {
+        if (!context || !geometry.has_pending_reclaim()) return;
+        const std::uint64_t retire_ticket = context->submitted_retire_ticket();
+        const std::uint64_t completed_ticket =
+            geometry.has_retired() || leonida::geometry_writes::has_released() ? context->completed_retire_ticket() : 0;
+        geometry.drain_released(*this, retire_ticket, completed_ticket, forget_geometry_alias);
+    }
     static rt::d3d12::GeometryCopy copy_geometry(std::uint8_t* to, const std::uint8_t* from, std::size_t size) {
         using Result = rt::d3d12::GeometryCopy;
         if (!leonida::texture_memory_readable(reinterpret_cast<std::uintptr_t>(from), size)) return Result::unreadable;
@@ -2388,6 +2400,7 @@ struct DeviceState {
     std::uint64_t geometry_va(std::uint64_t guest, std::uint64_t span, bool read_only) {
         if (!geometry.cap() || !span || !guest || !watch_shadow_writes()) return 0;
         const auto cpu = leonida::title_gpu_views::to_cpu(guest, span);
+        if (geometry.should_reclaim(cpu, span)) drain_geometry_releases();
         auto& aliases = leonida::title_va_aliases();
         const auto alias = aliases.shader_va(cpu, span);
         if (alias != cpu) return alias;
@@ -2610,8 +2623,11 @@ struct DeviceState {
             if (aliases.shader_va(extent.start) == extent.start) aliases.add(extent.start, extent.size, shader);
         } else {
             bool geometry_copy = false;
-            if (geometry.cap() && watch_shadow_writes() && !context->knows_buffer_va(extent.start, extent.size))
-                shader = geometry.resolve(*this, extent.start, extent.size, copy_geometry), geometry_copy = shader != 0;
+            if (geometry.cap() && watch_shadow_writes() && !context->knows_buffer_va(extent.start, extent.size)) {
+                if (geometry.should_reclaim(extent.start, extent.size)) drain_geometry_releases();
+                shader = geometry.resolve(*this, extent.start, extent.size, copy_geometry);
+                geometry_copy = shader != 0;
+            }
             if (!shader) shader = make_title_window(extent.start, extent.size);
             if (!shader) {
                 out = 0;
@@ -2734,6 +2750,7 @@ struct DeviceState {
         const auto cpu = leonida::title_gpu_views::to_host_view(static_cast<std::uintptr_t>(va),
                                                                 static_cast<std::uintptr_t>(span));
         if (context->knows_buffer_va(cpu, span)) return 0;
+        if (geometry.should_reclaim(cpu, span)) drain_geometry_releases();
         const std::uint64_t copy = geometry.resolve(*this, cpu, span, copy_geometry);
         if (!copy) return 0;
         std::lock_guard lock(title_window_mutex);
@@ -11253,6 +11270,7 @@ public:
                 full = refreshed_present_.exchange(serial, std::memory_order_relaxed) != serial;
             }
             state_.refresh_shadows(full || per_frame < 2, full);
+            state_.drain_geometry_releases();
             // LEONIDA_GEOMETRY_ASYNC=1 (for runs that only need the title to go on): the geometry copies are brought
             // up to date on a worker of ours, started here and not waited for, instead of on the title's GPU submit
             // thread (speed-27: 230-330 ms a refresh after the load, a VirtualQuery and VirtualProtect per written

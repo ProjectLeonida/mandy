@@ -4,20 +4,24 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <iterator>
+#include <map>
 #include <vector>
 #include <vulkan/vulkan.h>
 
 namespace rt::d3d12 {
 
 // Storage for shader-addressed mirrors when the main arena has no usable offset.
-// A window lasts for the lifetime of the device, so these blocks only grow.
+// Sub-ranges freed via free() are coalesced for reuse; an empty block releases its Vulkan buffer and memory.
 class TitleBufferWindows {
     struct Block {
         VkBuffer buffer{};
         VkDeviceMemory memory{};
         VkDeviceAddress address{};
-        VkDeviceSize capacity{}, used{};
+        VkDeviceSize capacity{}, used{}, reserved_bytes{};
         std::uint8_t* mapped{};
+        std::size_t live{};
+        std::map<VkDeviceSize, VkDeviceSize> free_ranges;  // offset -> size, coalesced
     };
     std::vector<Block> blocks_;
     VkDeviceSize reserved_{};
@@ -33,23 +37,35 @@ class TitleBufferWindows {
 
 public:
     VkDeviceSize reserved() const { return reserved_; }
+    std::size_t block_count() const { return blocks_.size(); }
 
     template<class Device>
     bool allocate(Device& d, VkDeviceSize bytes, VkDeviceSize& offset, std::uint8_t*& mapped,
                   bool device_local = false, VkDeviceSize cap = UINT64_MAX, bool* at_cap = nullptr) {
+        if (!bytes) return false;
         const VkDeviceSize alignment = device_local ? 16 : 65536;
         constexpr VkDeviceSize block_size = 4ull << 20;
         auto take = [&](Block& b) {
-            const auto start = (b.used + alignment - 1) & ~(alignment - 1);
-            if (start > b.capacity || bytes > b.capacity - start) return false;
-            mapped = b.mapped + start;
-            offset = b.address - d.arena.address + start;
-            b.used = start + bytes;
-            return true;
+            for (auto it = b.free_ranges.begin(); it != b.free_ranges.end(); ++it) {
+                const VkDeviceSize range_start = it->first;
+                const VkDeviceSize range_end = range_start + it->second;
+                const VkDeviceSize start = (range_start + alignment - 1) & ~(alignment - 1);
+                if (start < range_start || start > range_end || bytes > range_end - start) continue;
+                b.free_ranges.erase(it);
+                if (start > range_start) b.free_ranges.emplace(range_start, start - range_start);
+                const VkDeviceSize end = start + bytes;
+                if (end < range_end) b.free_ranges.emplace(end, range_end - end);
+                if (end > b.used) b.used = end;
+                ++b.live;
+                mapped = b.mapped + start;
+                offset = b.address - d.arena.address + start;
+                return true;
+            }
+            return false;
         };
         if (!blocks_.empty() && take(blocks_.back())) return true;
-        // A large view may start a new slab while smaller views still fit earlier tails.
-        // Use those tails even after the budget can no longer accommodate another slab.
+        // A large view may start a new slab while smaller views still fit earlier tails or freed holes.
+        // Use those even after the budget can no longer accommodate another slab.
         if (device_local && blocks_.size() > 1)
             for (std::size_t i = blocks_.size() - 1; i != 0; --i)
                 if (take(blocks_[i - 1])) return true;
@@ -64,12 +80,13 @@ public:
             failed_at_ = std::chrono::steady_clock::now();
             return false;
         };
-        Block b{};
-        b.capacity = std::max(bytes, block_size);
-        if (b.capacity > cap - reserved_) {
+        const VkDeviceSize remaining_cap = reserved_ < cap ? cap - reserved_ : 0;
+        if (bytes > remaining_cap) {
             if (at_cap) *at_cap = true;
             return false;
         }
+        Block b{};
+        b.capacity = std::max(bytes, std::min(block_size, remaining_cap));
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = b.capacity;
         info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
@@ -77,7 +94,7 @@ public:
         if (vk.vkCreateBuffer(d.info.device, &info, nullptr, &b.buffer) != VK_SUCCESS) return failed();
         VkMemoryRequirements req{};
         vk.vkGetBufferMemoryRequirements(d.info.device, b.buffer, &req);
-        if (req.size > cap - reserved_) {
+        if (req.size > remaining_cap) {
             if (at_cap) *at_cap = true;
             vk.vkDestroyBuffer(d.info.device, b.buffer, nullptr);
             return false;
@@ -106,12 +123,14 @@ public:
             // A positive 47-bit offset works with both generations of the translated V# decoder.
             if (b.address && biased < (1ull << 47) && b.capacity <= (1ull << 47) - biased) {
                 b.mapped = static_cast<std::uint8_t*>(host);
-                blocks_.push_back(b);
+                b.reserved_bytes = req.size;
+                b.free_ranges.emplace(0, b.capacity);
+                blocks_.push_back(std::move(b));
                 reserved_ += req.size;
                 if (blocks_.size() == 1 || !(blocks_.size() & (blocks_.size() - 1)))
                     std::fprintf(stderr, "[rt] d3d12: title buffer shadows outside the arena: %zu blocks, "
                                          "new block %llu KiB at shader VA 0x%llx\n", blocks_.size(),
-                                 static_cast<unsigned long long>(b.capacity >> 10),
+                                 static_cast<unsigned long long>(blocks_.back().capacity >> 10),
                                  static_cast<unsigned long long>(biased));
                 return take(blocks_.back());
             }
@@ -120,6 +139,47 @@ public:
         vk.vkDestroyBuffer(d.info.device, b.buffer, nullptr);
         if (b.memory) vk.vkFreeMemory(d.info.device, b.memory, nullptr);
         return failed();
+    }
+
+    // Returns [offset, offset + bytes) to its block for reuse; destroys the block once no live allocations remain.
+    // Caller must guarantee no in-flight GPU work references this range.
+    template<class Device>
+    bool free(Device& d, VkDeviceSize offset, VkDeviceSize bytes) {
+        if (!bytes) return false;
+        const VkDeviceAddress bda = d.arena.address + offset;
+        for (auto it = blocks_.begin(); it != blocks_.end(); ++it) {
+            Block& b = *it;
+            if (bda < b.address || bda - b.address >= b.capacity) continue;
+            const VkDeviceSize start = bda - b.address;
+            if (bytes > b.capacity - start) return false;
+            VkDeviceSize merged_begin = start;
+            VkDeviceSize merged_end = start + bytes;
+            auto next = b.free_ranges.lower_bound(start);
+            if (next != b.free_ranges.begin()) {
+                auto prev = std::prev(next);
+                if (prev->first + prev->second >= merged_begin) {
+                    merged_begin = prev->first;
+                    merged_end = std::max(merged_end, prev->first + prev->second);
+                    next = b.free_ranges.erase(prev);
+                }
+            }
+            while (next != b.free_ranges.end() && next->first <= merged_end) {
+                merged_end = std::max(merged_end, next->first + next->second);
+                next = b.free_ranges.erase(next);
+            }
+            b.free_ranges.emplace(merged_begin, merged_end - merged_begin);
+            if (b.live > 0) --b.live;
+            if (b.live == 0) {
+                d.context->vk.vkUnmapMemory(d.info.device, b.memory);
+                d.context->vk.vkDestroyBuffer(d.info.device, b.buffer, nullptr);
+                d.context->vk.vkFreeMemory(d.info.device, b.memory, nullptr);
+                reserved_ -= b.reserved_bytes;
+                blocks_.erase(it);
+                failed_ = false;
+            }
+            return true;
+        }
+        return false;
     }
     // Allocations refused at once because a new block failed less than kRetryAfter ago.
     std::uint64_t quick_refusals() const { return quick_refusals_; }

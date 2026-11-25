@@ -145,7 +145,12 @@ void free_title_block(void* p) {
     if (p) leonida::title_va_aliases().remove_title_memory(reinterpret_cast<uintptr_t>(p));
     const size_t size = block_size(p);
     free_block(p);
-    if (p) leonida::title_memory_map::changed(p, size ? size : 1);
+    if (p) {
+        const auto from = reinterpret_cast<uintptr_t>(p);
+        const size_t bytes = size ? size : 1;
+        leonida::title_memory_map::changed(p, bytes);
+        leonida::geometry_writes::note_released(from, from + bytes);
+    }
 }
 
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
@@ -1823,8 +1828,13 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
     const uintptr_t end = start + page_count * kPhysicalPageSize;
     const UnmapCause cause(page_array ? "XMemMapPhysicalPages (remap)" : "XMemMapPhysicalPages (unmap)");
     if (!page_array) {
-        const FaultLockExclusive view_lock;
-        return unmap_range_locked(start, end) ? address : nullptr;
+        bool ok = false;
+        {
+            const FaultLockExclusive view_lock;
+            ok = unmap_range_locked(start, end);
+        }
+        if (ok) leonida::geometry_writes::note_released(start, end);
+        return ok ? address : nullptr;
     }
     const Window* const window = find_window(start, page_count * kPhysicalPageSize);
     if (!window) {
@@ -2196,6 +2206,14 @@ BOOL title_release(void* address, SIZE_T size, DWORD free_type, const void* call
 BOOL title_free_impl(LPVOID address, SIZE_T size, DWORD free_type) {
     drain_fault_notes();
     const bool releases = (free_type & MEM_RELEASE) && !(free_type & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS));
+    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+    uintptr_t release_end = 0;
+    if (releases && address) allocation_extent(address, release_end);
+    uintptr_t decommit_end = 0;
+    if ((free_type & MEM_DECOMMIT) && address) {
+        decommit_end = size ? start + size : leonida::title_write_watch::end_of(start);
+        if (decommit_end <= start) allocation_extent(address, decommit_end);
+    }
     BOOL result;
     if (releases) {
         result = title_release(address, size, free_type, _ReturnAddress());
@@ -2213,6 +2231,10 @@ BOOL title_free_impl(LPVOID address, SIZE_T size, DWORD free_type) {
     if (result && (free_type & MEM_DECOMMIT)) note_unwatched_change(address, size, 0, true);
     if (result && (free_type & MEM_RELEASE) && !(free_type & MEM_PRESERVE_PLACEHOLDER))
         leonida::title_write_watch::remove(reinterpret_cast<uintptr_t>(address));
+    if (result && releases && release_end > start)
+        leonida::geometry_writes::note_released(start, release_end);
+    if (result && (free_type & MEM_DECOMMIT) && decommit_end > start)
+        leonida::geometry_writes::note_released(start, decommit_end);
     return result;
 }
 
@@ -2434,6 +2456,7 @@ bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uint
             if (!mirror && r.spec.kind == 2) {
                 const UnmapCause cause("CopyPageMappingsBatchX (unmap range)");
                 ok = unmap_range(r.at, r.at + bytes);
+                if (ok) leonida::geometry_writes::note_released(r.at, r.at + bytes);
             } else if (!mirror && !slot31_runs()) {
                 for (uint32_t j = 0; j < r.spec.count; ++j) {
                     const auto at = r.at + uint64_t(j) * kPhysicalPageSize;

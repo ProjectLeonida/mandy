@@ -20,8 +20,34 @@ struct State {
     host_heap::map<std::uintptr_t, Cell> cells;
     std::atomic<std::uint64_t> serial{1};
     std::atomic<std::size_t> count{0};
+    std::mutex released_mutex;
+    host_heap::vector<std::pair<std::uintptr_t, std::uintptr_t>> released;
+    std::atomic<bool> has_released{false};
 };
 inline State& state() { static State s; return s; }
+
+inline bool has_released() { return state().has_released.load(std::memory_order_acquire); }
+
+// Records a title address range [begin, end) that was released or unmapped so GeometryViews can evict its views.
+// Uses host_heap and a separate leaf lock so xmem can call it without contending with the write-fault handler.
+inline void note_released(std::uintptr_t begin, std::uintptr_t end) {
+    auto& s = state();
+    if (end <= begin || !s.count.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(s.released_mutex);
+    if (s.released.size() < 65536) s.released.emplace_back(begin, end);
+    s.has_released.store(true, std::memory_order_release);
+}
+
+template<class Out>
+inline void take_released(Out& out) {
+    out.clear();
+    auto& s = state();
+    if (!s.has_released.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(s.released_mutex);
+    out.assign(s.released.begin(), s.released.end());
+    s.released.clear();
+    s.has_released.store(false, std::memory_order_release);
+}
 
 inline Cell* acquire(std::uintptr_t va) {
     auto& s = state();
