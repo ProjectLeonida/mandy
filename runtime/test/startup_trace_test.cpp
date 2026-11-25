@@ -330,7 +330,9 @@ void test_trace(const fs::path& dir) {
     // The four transfers to address 0, in the order they were made.
     std::vector<const std::string*> nulls;
     for (auto& l : lines)
-        if (l.find("\"kind\":\"exception\"") != std::string::npos && l.find("\"at\":\"0x0\"") != std::string::npos)
+        // The faulting address, not a "runs" entry (whose "at" names a page and can also be 0x0).
+        if (l.find("\"kind\":\"exception\"") != std::string::npos &&
+            l.find("\"at\":\"0x0\",\"access\"") != std::string::npos)
             nulls.push_back(&l);
     check(nulls.size() == 4, "each transfer to a null pointer is an exception at 0x0 (" +
                                  std::to_string(nulls.size()) + ")");
