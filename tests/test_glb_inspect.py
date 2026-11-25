@@ -210,6 +210,34 @@ class GlbInspectTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('baseColorTexture="tile.png"', result.stdout)
 
+    def test_scene_inventory_preserves_root_order_and_default(self):
+        doc = {"nodes": [{"name": "Rig"}, {"name": "Body"}],
+               "scenes": [{}, {"name": "Preview", "nodes": [1, 0]}]}
+        for default in (None, 1):
+            if default is not None:
+                doc["scene"] = default
+            data = glb(doc)
+            report = glb_inspect.build_report(glb_inspect.parse_glb(data), len(data))
+            self.assertEqual(report["default_scene"], default)
+            self.assertNotIn("scene_issue", report)
+            self.assertEqual(report["scenes"][0]["issues"], [])
+            self.assertEqual(report["scenes"][1]["roots"], [{"node": 1, "name": "Body"},
+                                                           {"node": 0, "name": "Rig"}])
+            self.assertIn('root node=1 name="Body"', glb_inspect.format_report(report))
+
+    def test_scene_inventory_identifies_invalid_references(self):
+        doc = {"scene": 1, "nodes": [{}],
+               "scenes": [{"nodes": [0, 0, False, {}, 9]}, None, {"nodes": []}]}
+        data = glb(doc)
+        report = glb_inspect.build_report(glb_inspect.parse_glb(data), len(data))
+        self.assertEqual(report["scene_issue"], "default scene does not reference a scene")
+        self.assertEqual(report["invalid_counts"], {"scenes": 1})
+        self.assertEqual(report["scenes"][0]["issues"], ["nodes[1] repeats root node 0",
+            "nodes[2] does not reference a node", "nodes[3] does not reference a node",
+            "nodes[4] does not reference a node"])
+        self.assertEqual(report["scenes"][1]["index"], 2)
+        self.assertIn("non-empty array", report["scenes"][1]["issues"][0])
+
     def test_minimal_triangle_mesh_and_material(self):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "triangle.glb")
