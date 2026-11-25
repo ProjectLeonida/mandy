@@ -1839,7 +1839,10 @@ class Gen:
             self.emit(f"OpStore %vcc_hi {self.load_reg('sgpr', s['r'] + 1)}")
             return
         if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
-            self.emit(f"OpStore %vcc {self.mask_src(s)}")
+            m = self.mask_src(s)
+            self.emit(f"OpStore %vcc {m}")
+            if self.wave64 and d["t"] == "vcc":
+                self.emit(f"OpStore %vcc_hi {m}")
             return
         if d["k"] != "sgpr" or d.get("n") != 2:
             raise Unsupported("s_mov_b64 destination")
@@ -6375,6 +6378,8 @@ class Gen:
                 self.emit(f"{cur} = OpLoad %uint %vcc")
                 self.emit(f"{new} = OpSelect %uint {inh} {v} {cur}")
                 self.emit(f"OpStore %vcc {new}")
+                if h:
+                    self.emit(f"OpStore %vcc_hi {new}")
             return
         self.mask_dst(d, v)
 
@@ -6502,9 +6507,27 @@ class Gen:
             self.emit(f"{v} = OpLoad %uint %vcc_hi")
             return v if self.holds_lane_mask(a) else self._scalar_word_lane_bit(v)
         if a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
-            v = self.tmp()
-            self.emit(f"{v} = OpLoad %uint %vcc")
-            return v if not self.wave32_vcc_pointer or self.holds_lane_mask(a) else self._scalar_word_lane_bit(v)
+            if self.holds_lane_mask(a):
+                v = self.tmp()
+                self.emit(f"{v} = OpLoad %uint %vcc")
+                return v
+            lane = self.wave_lane()
+            if a["t"] == "vcc_hi":
+                # Wave64 32-bit vcc_hi holding plain data: lane L takes bit (L & 31) of %vcc_hi.
+                v = self.tmp()
+                self.emit(f"{v} = OpLoad %uint %vcc_hi")
+                return self._scalar_word_lane_bit(v, lane)
+            word = self.tmp()
+            self.emit(f"{word} = OpLoad %uint %vcc")
+            if a["t"] == "vcc" and wide and self.wave64:
+                # Wave64 64-bit VCC holding plain data: lanes 0..31 read %vcc and 32..63 read %vcc_hi,
+                # matching the SGPR-pair fallback above. A missed lane mask keeps 0 / ~0 in both halves.
+                hi, up, sel = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{hi} = OpLoad %uint %vcc_hi")
+                self.emit(f"{up} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+                self.emit(f"{sel} = OpSelect %uint {up} {hi} {word}")
+                word = sel
+            return self._scalar_word_lane_bit(word, lane)
         if a["k"] == "special" and a["t"] in ("exec", "exec_lo", "exec_hi"):
             return self.exec_value()
         if a["k"] == "imm":
@@ -6652,6 +6675,8 @@ class Gen:
                 self.store_reg("sgpr", d["r"] + 1, v)
         elif d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
             self.emit(f"OpStore %vcc {v}")
+            if self.wave64 and d["t"] == "vcc":
+                self.emit(f"OpStore %vcc_hi {v}")
         elif d["k"] == "special" and d["t"] == "vcc_hi" and not self.wave64:
             self.emit(f"OpStore %vcc_hi {v}")
         else:
