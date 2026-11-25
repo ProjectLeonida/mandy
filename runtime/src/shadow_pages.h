@@ -87,6 +87,14 @@ inline void log_protect_refused(int error) {
                  error);
 }
 
+class ShadowPages;
+// Between trackers (defined after the list of them). other_guards: in `out`, one byte per page of [from, to), 1 for the
+// pages another tracker than `self` made read-only and still keeps so. forget_foreign_elsewhere: pages of [from, to)
+// that `self` made read-only are writable now, so no other tracker takes them for unchanged.
+inline void other_guards(const ShadowPages* self, std::uintptr_t from, std::uintptr_t to,
+                         leonida::host_heap::vector<std::uint8_t>& out);
+inline void forget_foreign_elsewhere(const ShadowPages* self, std::uintptr_t from, std::uintptr_t to);
+
 // The title's pages behind slot-133 shadow buffers and title windows, and which of them the title wrote since the
 // copies were last brought up to date. Nothing says which pages a title writes, so the pages say it themselves: once
 // copied, a read-write page is made read-only (its cache attribute kept: PAGE_READONLY | PAGE_WRITECOMBINE for a
@@ -96,8 +104,14 @@ inline void log_protect_refused(int error) {
 //   - read-write pages were written (or newly committed, or newly mapped by xmem): made read-only, then copied. A
 //     write landing between the two faults again, so it reaches the next refresh at the latest;
 //   - pages this tracker made read-only weren't written: skipped;
-//   - other readable pages (read-only or copy-on-write pages of the title's own, pages another tracker protected)
-//     can't be watched: copied every time, as before;
+//   - pages another tracker made read-only (a console descriptor heap's tracker over the memory a slot-133 buffer is
+//     placed on) are copied, and then passed over like the tracker's own (kForeign): the other tracker has the title's
+//     write fault, and the fault handler tells every tracker over the address. The mark is cleared by that (reopen),
+//     by a file shim's opening of the pages (reopen_range), by the other tracker giving the pages up
+//     (forget_foreign_elsewhere) and by a change in the title's memory map (kRequery), like what is known of any page.
+//     Copying them at every submission (27.6 MiB of each, in the retail title) took 10 of its 22 ms;
+//   - other readable pages (read-only or copy-on-write pages of the title's own) can't be watched: copied every time,
+//     as before;
 //   - pages not committed, or not readable, are zero in the copies (written once);
 //   - pages xmem reports mapped at another address too (title_page_watch.h) are copied every time: a write
 //     through the other address doesn't fault here;
@@ -135,6 +149,7 @@ inline void log_protect_refused(int error) {
 class ShadowPages {
     template <class T>
     using Vector = leonida::host_heap::vector<T>;
+    using Bits = std::uint16_t;  // a page's state_: the flags below
 
 public:
     static constexpr std::uintptr_t kPage = 0x1000;
@@ -157,7 +172,7 @@ public:
     // Every page made read-only here is read-write again: the title's pages outlive the buffer.
     void reopen_all() {
         AcquireSRWLockExclusive(&lock_);
-        if (std::any_of(state_.begin(), state_.end(), [](std::uint8_t s) { return s & kProtected; }))
+        if (std::any_of(state_.begin(), state_.end(), [](Bits s) { return s & kProtected; }))
             reopen_locked(first_, last_);
         ReleaseSRWLockExclusive(&lock_);
     }
@@ -227,17 +242,19 @@ public:
                 }))
             full_walk = true;
         refresh_walked_all_ = full_walk;
+        if (full_walk)  // nothing is known to have stayed as it was
+            for (Bits& s : state_) s &= ~kForeign;
         refresh_protects_ = 0;
         if (generation != alias_generation_) {
             alias_generation_ = generation;
-            for (std::uint8_t& s : state_) s &= ~kAliased;
+            for (Bits& s : state_) s &= ~kAliased;
             leonida::title_page_aliases::for_each_in(first_, last_, [&](std::uintptr_t va) {
                 const std::uintptr_t from = std::max(va, first_), to = std::min(va + kBlock, last_);
                 for (std::uintptr_t p = from; p < to; p += kPage) state_[(p - first_) / kPage] |= kAliased;
             });
         }
         if (pinned_) {
-            for (std::uint8_t& s : state_) s &= ~kPinned;
+            for (Bits& s : state_) s &= ~kPinned;
             pinned_ = false;
         }
         leonida::kernel_writes::for_each_pin(first_, last_, [&](std::uintptr_t from, std::uintptr_t to) {
@@ -263,7 +280,7 @@ public:
                 reader_, watch_runs_,
                 [&](std::uintptr_t from, std::uintptr_t to) {
                     for (std::uintptr_t p = from; p < to; p += kPage) {
-                        std::uint8_t& s = state_[(p - first_) / kPage];
+                        Bits& s = state_[(p - first_) / kPage];
                         if (!(s & kHot)) continue;  // asked over a gap between hot pages: guarded
                         refresh_written_ += (s & kClean) != 0;
                         s &= ~kClean;
@@ -292,7 +309,7 @@ public:
             // the journal (kRequery) anyway. speed-16/17/18: 730-820 VirtualQuery calls a refresh, ~19 us each under
             // Wine (NtQueryVirtualMemory waits for Wine's virtual-memory lock, which the mapping threads hold), a
             // fifth of the submitting thread's time.
-            const auto skip = [&](std::uint8_t s) {
+            const auto skip = [&](Bits s) {
                 return unchanged(s) || (!copy_aliased_ && (s == kAliased || s == kZero || s == (kZero | kAliased)));
             };
             if (!full_walk && skip(state_[i0])) {
@@ -327,7 +344,7 @@ public:
                         zeroed_.back().bytes += bytes;
                     else
                         zeroed_.push_back({offset, bytes, false});
-                    state_[i] = std::uint8_t(kZero | (state_[i] & (kAliased | kPinned | kWatched)));
+                    state_[i] = Bits(kZero | (state_[i] & (kAliased | kPinned | kWatched)));
                 }
                 break;
             case Kind::writable:
@@ -340,11 +357,11 @@ public:
                     case Watch::clean: break;  // write-watched, not written since it was copied
                     case Watch::written:       // write-watched: written since, or not known yet
                         for (std::size_t k = i; k < j; ++k)
-                            state_[k] = std::uint8_t((state_[k] & ~(kZero | kProtected)) | kClean);
+                            state_[k] = Bits((state_[k] & ~(kZero | kProtected | kForeign)) | kClean);
                         add_job(i, j, streaming, Copy::write_watched);
                         break;
                     case Watch::open:  // write-watched, but pinned for a kernel write: copied until the pin ends
-                        for (std::size_t k = i; k < j; ++k) state_[k] &= ~(kZero | kProtected | kClean);
+                        for (std::size_t k = i; k < j; ++k) state_[k] &= ~(kZero | kProtected | kClean | kForeign);
                         add_job(i, j, streaming, Copy::write_watched);
                         break;
                     case Watch::guard:
@@ -362,7 +379,7 @@ public:
                 add_job(i0, i1, streaming, Copy::copy_on_write);
                 break;
             }
-            for (std::size_t i = i0; i < i1; ++i) state_[i] &= std::uint8_t(~kRequery);  // queried now
+            for (std::size_t i = i0; i < i1; ++i) state_[i] &= Bits(~kRequery);  // queried now
             at = next;
         }
         // Remember the generation from before the walk, so a change during the walk triggers another one.
@@ -391,7 +408,7 @@ public:
         AcquireSRWLockExclusive(&lock_);
         if (first < first_) {
             const std::size_t n = (first_ - first) / kPage;
-            state_.insert(state_.begin(), n, std::uint8_t(0));
+            state_.insert(state_.begin(), n, Bits(0));
             idle_.insert(idle_.begin(), n, std::uint8_t(0));
             cover_.insert(cover_.begin(), n, 0u);
             first_ = first;
@@ -416,6 +433,7 @@ public:
         const std::size_t at = (other.first_ - first_) / kPage;
         for (std::size_t i = 0; i < other.state_.size(); ++i) {
             state_[at + i] |= other.state_[i];
+            if (state_[at + i] & kProtected) state_[at + i] &= ~kForeign;  // guarded here now
             cover_[at + i] += other.cover_[i];
             idle_[at + i] = other.idle_[i];
         }
@@ -433,7 +451,7 @@ public:
         pinned_ |= other.pinned_;
         watch_ = watch_ && other.watch_;
         faults_.fetch_add(other.faults(), std::memory_order_relaxed);
-        std::fill(other.state_.begin(), other.state_.end(), std::uint8_t(0));
+        std::fill(other.state_.begin(), other.state_.end(), Bits(0));
         other.targets_.clear();
         ReleaseSRWLockExclusive(&other.lock_);
         index_targets();
@@ -477,6 +495,7 @@ public:
         const auto it =
             std::find_if(targets_.begin(), targets_.end(), [shadow](const Target& t) { return t.shadow == shadow; });
         if (it == targets_.end()) return false;
+        const std::uintptr_t removed_begin = it->begin, removed_end = it->end;
         AcquireSRWLockExclusive(&lock_);
         const std::size_t i_end = (((it->end + kPage - 1) & ~(kPage - 1)) - first_) / kPage;
         for (std::size_t i = ((it->begin & ~(kPage - 1)) - first_) / kPage; i < i_end;) {
@@ -493,8 +512,36 @@ public:
         targets_.erase(it);
         index_targets();
         watch_generation_ = ~std::uint64_t(0);  // recounts the write-watched pages covered
+        const std::uintptr_t from = std::max(removed_begin & ~(kPage - 1), first_);
+        const std::uintptr_t to = std::min((removed_end + kPage - 1) & ~(kPage - 1), last_);
+        ReleaseSRWLockExclusive(&lock_);
+        forget_foreign_elsewhere(this, from, to);  // the pages made writable above: no one else keeps them as copied
+        return true;
+    }
+
+    // For another tracker's refresh (other_guards, with g_shadow_pages_lock held shared): marks in `out`, one byte per
+    // page from `out_first` on, the pages of [from, to) this tracker made read-only and still has so. Doesn't wait:
+    // false, nothing marked, when the lock is busy (a refresh, a fault); the pages are copied again then.
+    bool guards(std::uintptr_t from, std::uintptr_t to, Vector<std::uint8_t>& out, std::uintptr_t out_first) {
+        from = std::max(from, first_);
+        to = std::min(to, last_);
+        if (from >= to) return true;
+        if (!TryAcquireSRWLockExclusive(&lock_)) return false;
+        for (std::uintptr_t p = from; p < to; p += kPage)
+            if (state_[(p - first_) / kPage] & kProtected) out[(p - out_first) / kPage] = 1;
         ReleaseSRWLockExclusive(&lock_);
         return true;
+    }
+
+    // Pages of [from, to) that another tracker made read-only were opened (that tracker's end, or its giving them up,
+    // forget_foreign_elsewhere): they are copied at the next refresh.
+    void forget_foreign(std::uintptr_t from, std::uintptr_t to) {
+        from = std::max(from & ~(kPage - 1), first_);
+        to = std::min((to + kPage - 1) & ~(kPage - 1), last_);
+        if (from >= to) return;
+        AcquireSRWLockExclusive(&lock_);
+        forget_foreign_locked(from, to);
+        ReleaseSRWLockExclusive(&lock_);
     }
 
     // From a file shim, before the kernel writes [from, to): the pages there this tracker protected are writable again,
@@ -506,7 +553,7 @@ public:
         AcquireSRWLockExclusive(&lock_);
         bool guarded = false;
         for (std::size_t i = (from - first_) / kPage, i1 = (to - first_) / kPage; i < i1; ++i) {
-            state_[i] &= ~kClean;
+            state_[i] &= ~(kClean | kForeign);  // the kernel writes it: whoever keeps it read-only, it is not unchanged
             guarded |= (state_[i] & kProtected) != 0;
         }
         if (guarded) reopen_locked(from, to);
@@ -523,6 +570,10 @@ public:
     bool reopen(std::uintptr_t address) {
         AcquireSRWLockExclusive(&lock_);
         const std::size_t index = (address - first_) / kPage;
+        // A write to this address faulted, whoever's guard it was: the pages of its 64 KiB block that another tracker
+        // kept read-only are writable now (that tracker reopens its whole block), so none of them is unchanged.
+        const std::uintptr_t block_first = address & ~(kBlock - 1);
+        forget_foreign_locked(std::max(block_first, first_), std::min(block_first + kBlock, last_));
         bool retry = (state_[index] & kProtected) != 0;
         if (retry) {
             const std::uintptr_t block = address & ~(kBlock - 1);
@@ -538,7 +589,7 @@ public:
             faults_.fetch_add(1, std::memory_order_relaxed);
             for (std::size_t i = i0; i < i1; ++i) {
                 if (!watched[i - i0] || (state_[i] & kProtected)) continue;
-                state_[i] = std::uint8_t((state_[i] | kHot) & ~kClean);
+                state_[i] = Bits((state_[i] | kHot) & ~kClean);
                 idle_[i] = 0;
                 runs_stale_ = true;
             }
@@ -552,7 +603,7 @@ public:
     }
 
 private:
-    enum : std::uint8_t {
+    enum : Bits {
         kProtected = 1,  // made read-only here: unchanged since it was copied
         kZero = 2,       // zero in the copies (not committed when last looked at)
         kAliased = 4,    // xmem maps its physical page at another address too
@@ -561,6 +612,7 @@ private:
         kClean = 32,     // hot, and not written since it was copied after an asking
         kHot = 64,       // write-watched and asked about at every refresh, never guarded
         kRequery = 128,  // its mapping, commitment or protection changed (title_memory_map): queried at the next walk
+        kForeign = 256,  // read-only, made so by another tracker (guards()), copied: unchanged until it is reopened
     };
     // Refreshes a hot block may go without a write before it is guarded again.
     static constexpr std::uint8_t kCool = 64;
@@ -579,14 +631,20 @@ private:
     // How a committed, readable page is watched: by the kernel (clean, written or, pinned or aliased, open) or by
     // a guard.
     enum class Watch { clean, written, open, guard };
-    static Watch watch_of(std::uint8_t s) {
+    static Watch watch_of(Bits s) {
         if ((s & (kWatched | kHot)) != (kWatched | kHot)) return Watch::guard;
         if (s & (kAliased | kPinned)) return Watch::open;
         return s & kClean ? Watch::clean : Watch::written;
     }
     // A page known unchanged since the last refresh, which one that doesn't walk everything passes over.
-    static bool unchanged(std::uint8_t s) {
-        return s == kProtected || s == (kWatched | kProtected) || s == (kWatched | kHot | kClean);
+    static bool unchanged(Bits s) {
+        return s == kProtected || s == (kWatched | kProtected) || s == (kWatched | kHot | kClean) || s == kForeign ||
+               s == (kWatched | kForeign);
+    }
+
+    // With the lock held: no page of [from, to) (inside the covered pages) is known to be an unchanged foreign one.
+    void forget_foreign_locked(std::uintptr_t from, std::uintptr_t to) {
+        for (std::size_t i = (from - first_) / kPage, i1 = (to - first_) / kPage; i < i1; ++i) state_[i] &= ~kForeign;
     }
 
     // A hot page `p` was found written: its block is not idle.
@@ -620,7 +678,7 @@ private:
             const bool unwatched = state_[i] & (kAliased | kPinned);
             std::size_t j = i + 1;
             while (j < i1 && bool(state_[j] & (kAliased | kPinned)) == unwatched) ++j;
-            for (std::size_t k = i; k < j; ++k) state_[k] &= ~(kZero | kProtected);
+            for (std::size_t k = i; k < j; ++k) state_[k] &= ~(kZero | kProtected | kForeign);
             if (!unwatched && watch_) protect(i, j, current);
             if (unwatched && !copy_aliased_ && (state_[i] & kAliased)) {
                 i = j;
@@ -634,29 +692,49 @@ private:
         }
     }
 
-    // Guarded pages [i, j) of a read-only region: pages this tracker protected are as the last refresh left them;
-    // any other is copied again.
+    // Guarded pages [i, j) of a read-only region: pages this tracker protected, and pages another tracker did that were
+    // copied since (kForeign), are as the last refresh left them; any other is copied again.
     void guard_read_only(std::size_t i0, std::size_t i1, bool streaming) {
         for (std::size_t i = i0; i < i1;) {
-            const bool clean = (state_[i] & (kProtected | kAliased | kPinned)) == kProtected;
+            const bool clean = quiet(state_[i]);
             std::size_t j = i + 1;
-            while (j < i1 && ((state_[j] & (kProtected | kAliased | kPinned)) == kProtected) == clean) ++j;
+            while (j < i1 && quiet(state_[j]) == clean) ++j;
             if (!clean && !(!copy_aliased_ && (state_[i] & kAliased))) {
-                for (std::size_t k = i; k < j; ++k) state_[k] &= ~kZero;
+                for (std::size_t k = i; k < j; ++k) state_[k] &= ~(kZero | kForeign);
                 add_job(i, j, streaming,
                         state_[i] & kAliased  ? Copy::aliased
                         : state_[i] & kPinned ? Copy::pinned
                                               : Copy::read_only);
+                note_foreign(i, j);
             }
             i = j;
         }
+    }
+
+    // A read-only page left as it is at this refresh: one this tracker made read-only, or another's that was copied
+    // since (and has not been reopened, or changed, since).
+    static bool quiet(Bits s) {
+        if (s & (kAliased | kPinned)) return false;
+        return (s & kProtected) || (s & (kForeign | kRequery)) == kForeign;
+    }
+
+    // The pages [i, j) were read-only and not this tracker's, and are copied now. The ones another tracker made
+    // read-only (and so reopens when the title writes there: the fault handler tells every tracker over the address,
+    // reopen()) need no copy at the next refresh unless it did: they are marked, and a write, a kernel write
+    // (reopen_range), the end of the other tracker's guard (forget_foreign), or a change in the title's memory map
+    // (kRequery) clears the mark. Other read-only pages (the title's own) are copied at every refresh, as before.
+    void note_foreign(std::size_t i, std::size_t j) {
+        Vector<std::uint8_t> theirs(j - i, 0);
+        other_guards(this, first_ + i * kPage, first_ + j * kPage, theirs);
+        for (std::size_t k = i; k < j; ++k)
+            if (theirs[k - i] && !(state_[k] & (kAliased | kPinned))) state_[k] |= kForeign;
     }
 
     // With the lock held, when this tracker opens a new write-watch reader: no page is clean until that reader has
     // asked and the walk has copied it. The runs may have closed (their reservation released) and come back over a
     // reservation made at the same address since, which a page's watched mark alone doesn't tell (re-review of #61).
     void forget_clean() {
-        for (std::uint8_t& page : state_) page &= std::uint8_t(~kClean);
+        for (Bits& page : state_) page &= Bits(~kClean);
     }
 
     // With the lock held, after the write-watched reservations changed: which pages are write-watched now. A page
@@ -670,7 +748,7 @@ private:
             for (; i < upto; ++i)
                 if (bool(state_[i] & kWatched) != watched)
                     state_[i] =
-                        std::uint8_t((state_[i] & ~(kWatched | kClean | kHot | kZero)) | (watched ? kWatched : 0));
+                        Bits((state_[i] & ~(kWatched | kClean | kHot | kZero)) | (watched ? kWatched : 0));
         };
         leonida::title_write_watch::for_each_in(first_, last_, [&](std::uintptr_t from, std::uintptr_t to) {
             side((from - first_) / kPage, false);
@@ -842,7 +920,7 @@ private:
     std::uintptr_t begin_ = 0, end_ = 0;   // the targets' bytes: the first start and the furthest end
     std::uintptr_t first_ = 0, last_ = 0;  // the pages covered
     SRWLOCK lock_ = SRWLOCK_INIT;          // state_, cover_, the targets, and the protection of the pages
-    Vector<std::uint8_t> state_;           // per 4 KiB page
+    Vector<Bits> state_;                   // per 4 KiB page
     Vector<std::uint32_t> cover_;          // per 4 KiB page: the targets that read it
     Vector<Target> targets_;               // by start
     Vector<std::uintptr_t> reach_;         // see index_targets
@@ -901,9 +979,13 @@ inline LONG CALLBACK shadow_write_fault(EXCEPTION_POINTERS* info) {
     // page both guarded is not left writable while its shadow takes it for unchanged.
     constexpr std::uintptr_t kTile = leonida::geometry_writes::tile_size;
     const std::uintptr_t tile = address & ~(kTile - 1);
+    const std::uintptr_t block = address & ~(ShadowPages::kBlock - 1);
     AcquireSRWLockShared(&g_shadow_pages_lock);
     for (ShadowPages* pages : shadow_pages_list()) {
-        if (pages->contains(address)) retry |= pages->reopen(address);  // reopened, or another thread's fault did
+        if (pages->contains(address))
+            retry |= pages->reopen(address);  // reopened, or another thread's fault did
+        else if (pages->first() < block + ShadowPages::kBlock && block < pages->last())
+            pages->forget_foreign(block, block + ShadowPages::kBlock);  // a tracker over the address reopened this block
         if (tile_reopened && pages->first() < tile + kTile && tile < pages->last()) pages->reopen_range(tile, tile + kTile);
     }
     ReleaseSRWLockShared(&g_shadow_pages_lock);
@@ -944,6 +1026,8 @@ struct ShadowPagesDeleter {
         pages->reopen_all();
         AcquireSRWLockExclusive(&g_shadow_pages_lock);
         std::erase(shadow_pages_list(), pages);
+        // Its pages are writable now, with no fault to tell the trackers that took them for unchanged read-only ones.
+        for (ShadowPages* other : shadow_pages_list()) other->forget_foreign(pages->first(), pages->last());
         ReleaseSRWLockExclusive(&g_shadow_pages_lock);
         delete pages;
     }
@@ -960,6 +1044,23 @@ inline ShadowPagesPtr make_shadow_pages(const std::uint8_t* pages, std::uint8_t*
         ReleaseSRWLockExclusive(&g_shadow_pages_lock);
     }
     return ShadowPagesPtr(tracker);
+}
+
+inline void other_guards(const ShadowPages* self, std::uintptr_t from, std::uintptr_t to,
+                         leonida::host_heap::vector<std::uint8_t>& out) {
+    // Not waiting for anything: this runs under a tracker's lock, and the fault handler holds this one while it waits
+    // for trackers' locks. A tracker that can't be asked is a tracker whose pages are copied again.
+    if (!TryAcquireSRWLockShared(&g_shadow_pages_lock)) return;
+    for (ShadowPages* other : shadow_pages_list())
+        if (other != self && other->first() < to && from < other->last()) other->guards(from, to, out, from);
+    ReleaseSRWLockShared(&g_shadow_pages_lock);
+}
+
+inline void forget_foreign_elsewhere(const ShadowPages* self, std::uintptr_t from, std::uintptr_t to) {
+    AcquireSRWLockShared(&g_shadow_pages_lock);
+    for (ShadowPages* other : shadow_pages_list())
+        if (other != self && other->first() < to && from < other->last()) other->forget_foreign(from, to);
+    ReleaseSRWLockShared(&g_shadow_pages_lock);
 }
 
 }  // namespace leonida::shadow_pages
