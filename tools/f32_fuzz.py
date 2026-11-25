@@ -723,6 +723,11 @@ def same(want, got):
     return want == got
 
 
+def oracle_words_match(want_words, got):
+    return all(same(w, g) or (k >= 2 and same(w | 0x400000 if is_nan(w) else w, g))
+               for k, (w, g) in enumerate(zip(want_words, got)))
+
+
 def check(op, vals, srcs, e64, out_mods):
     try:
         want = model(op, vals, srcs, out_mods)
@@ -735,9 +740,18 @@ def check(op, vals, srcs, e64, out_mods):
     if status != "ok":
         return status, got
     want_words = [want[0], want[1], vals[obs[0]], vals[obs[1]]]
-    if all(same(w, g) or (k >= 2 and same(w | 0x400000 if is_nan(w) else w, g)) for k, (w, g) in
-           enumerate(zip(want_words, got))):
+    if oracle_words_match(want_words, got):
         return "match", None
+    # The model does not have the measured omod quirk (a -0 result becomes +0 where the omod is active), so the
+    # translator's answer is judged against KNOWN_DEVIATIONS too, as the hardware path does (hw_verdict). The
+    # translator targets the game's MODE (HW_PRIMARY), the mode the deviation is measured under.
+    case = Case(op, vals, srcs, e64, out_mods)
+    for fn in KNOWN_DEVIATIONS.values():
+        alt = fn(case, want)
+        if alt is not None:
+            alt_words = [alt[0], alt[1], vals[obs[0]], vals[obs[1]]]
+            if oracle_words_match(alt_words, got):
+                return "match", None
     return "mismatch", (want_words, got, text)
 
 

@@ -86,6 +86,25 @@ class HarnessTests(unittest.TestCase):
         status, _ = ff.check("v_rcp_f32", vals, [(0, {})], False, [])
         self.assertEqual(status, "undefined")
 
+    def test_check_accepts_the_omod_neg_zero_deviation(self):
+        # ceil(-0.75) is -0 and the model's mul:2 keeps it -0, but the measured hardware omod turns a -0 result
+        # into +0 (KNOWN_DEVIATIONS omod_neg_zero): the translator's +0 is a match, not a false positive
+        # (the f32_fuzz translator-oracle finding on coordination issue #14, seed 53 program 246).
+        vals = [ff.bits(-0.75)] + [0] * 8
+        status, detail = ff.check("v_ceil_f32", vals, [(0, {})], True, ["mul:2"])
+        self.assertEqual(status, "match", detail)
+
+    def test_check_still_flags_a_real_mismatch_with_omod(self):
+        # The deviation only excuses the -0/+0 word: any other wrong word is still a mismatch.
+        vals = [ff.bits(-0.75)] + [0] * 8
+        real = ff.run_translated
+        ff.run_translated = lambda text, name="ps_f32_fuzz": ("ok", [ff.bits(1.0), 0, vals[0], vals[0]])
+        try:
+            status, _ = ff.check("v_ceil_f32", vals, [(0, {})], True, ["mul:2"])
+        finally:
+            ff.run_translated = real
+        self.assertEqual(status, "mismatch")
+
     def test_denormal_operand_is_skipped(self):
         vals = [0x00000001, ff.bits(1.0)] + [0] * 7
         status, detail = ff.check("v_add_f32", vals, [(0, {}), (1, {})], False, [])
