@@ -142,6 +142,27 @@ int main() {
         check(pass() == 4 && probes == 0, "a pass with no change probes nothing");
     }
 
+    {
+        leonida::TitleTextureChunkHashes hashes;
+        const auto chunk_bytes = leonida::TitleTextureChunkHashes::chunk_bytes;
+        check(!hashes.ready(), "a texture with no accepted snapshot has no audit baseline");
+        const auto hash = [](std::size_t offset, std::size_t bytes) { return std::uint64_t(offset + bytes); };
+        hashes.snapshot(2 * chunk_bytes + 31, hash);
+        check(hashes.ready(), "an accepted snapshot installs the audit baseline");
+        const auto first = hashes.next(), second = hashes.next(), tail = hashes.next(), wrapped = hashes.next();
+        check(first.offset == 0 && first.bytes == chunk_bytes && first.hash == chunk_bytes,
+              "first audit chunk covers the start of the footprint");
+        check(second.offset == chunk_bytes && second.bytes == chunk_bytes && second.hash == 2 * chunk_bytes,
+              "second audit chunk follows without depending on the first read succeeding");
+        check(tail.offset == 2 * chunk_bytes && tail.bytes == 31 && tail.hash == 2 * chunk_bytes + 31,
+              "partial tail hashes exactly the remaining bytes");
+        check(wrapped.offset == 0 && wrapped.hash == first.hash, "the audit wraps without modifying the baseline");
+        hashes.snapshot(17, hash);
+        const auto replacement = hashes.next();
+        check(replacement.offset == 0 && replacement.bytes == 17 && replacement.hash == 17,
+              "a new accepted upload resets the cursor and replaces the old footprint");
+    }
+
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }
