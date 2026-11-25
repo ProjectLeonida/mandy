@@ -5,8 +5,9 @@ file(WRITE "${TEST_DIR}/index.json" "not JSON\n")
 # test (the command is the host CMake), so the script runs the tool through it itself.
 function(check_invalid option)
   execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}" "${option}" ${ARGN}
-                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
-  if(NOT code STREQUAL "2" OR NOT log MATCHES "${option} requires a valid value")
+                  RESULT_VARIABLE code OUTPUT_QUIET ERROR_VARIABLE log TIMEOUT 5)
+  string(STRIP "${log}" log)
+  if(NOT code STREQUAL "2" OR NOT log STREQUAL "${option} requires a valid value")
     message(FATAL_ERROR "${option} ${ARGN}: expected usage error, got ${code}\n${log}")
   endif()
 endfunction()
@@ -24,6 +25,29 @@ check_invalid(--slow -0.5)
 check_invalid(--slow 1.2.3)  # strtod must consume the whole token, not just its numeric prefix
 check_invalid(--stage --graphics-only)
 check_invalid(--stats)
+check_invalid(--memory-limit-mib)
+check_invalid(--memory-limit-mib --isolate)
+check_invalid(--memory-limit-mib 0 --isolate)
+check_invalid(--memory-limit-mib -1 --isolate)
+check_invalid(--memory-limit-mib 1.5 --isolate)
+check_invalid(--memory-limit-mib 128MiB --isolate)
+check_invalid(--memory-limit-mib 18446744073709551616 --isolate)
+check_invalid(--memory-limit-mib 17592186044416 --isolate) # Parses as uint64_t, but overflows in bytes.
+
+function(check_memory_limit expected)
+  execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}" --memory-limit-mib 128 ${ARGN}
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  if(NOT code STREQUAL "2" OR NOT log MATCHES "${expected}")
+    message(FATAL_ERROR "memory limit ${ARGN}: expected '${expected}', got ${code}\n${log}")
+  endif()
+endfunction()
+if(WINDOWS_TARGET)
+  check_memory_limit("--memory-limit-mib requires the --isolate parent")
+  check_memory_limit("--memory-limit-mib requires the --isolate parent" --isolate --isolate-child)
+  check_memory_limit("index.json: " --isolate)
+else()
+  check_memory_limit("--memory-limit-mib is supported only on Windows" --isolate)
+endif()
 
 function(check_protected_input name)
   execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}" ${ARGN}
@@ -85,5 +109,34 @@ foreach(bytes -1 1.5 4294967296)
                   RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
   if(NOT code STREQUAL "2" OR NOT log MATCHES "at byte [0-9]+")
     message(FATAL_ERROR "pc_tail.bytes=${bytes}: expected a malformed index, got ${code}\n${log}")
+  endif()
+endforeach()
+
+# Exercise the real runner through child startup without compiling a shader.
+# Disable drivers and select a nonexistent device as a fallback for older loaders.
+file(WRITE "${TEST_DIR}/index.json" "{\"synthetic\":{\"stage\":\"cs\"}}\n")
+foreach(mode unguarded guarded)
+  set(memory_args)
+  if(mode STREQUAL "guarded")
+    if(NOT WINDOWS_TARGET)
+      continue()
+    endif()
+    set(memory_args --memory-limit-mib 128)
+  endif()
+  execute_process(COMMAND "${CMAKE_COMMAND}" -E env "VK_LOADER_DRIVERS_DISABLE=~all~"
+                  "LEONIDA_VK_DEVICE=leonida-cli-test-no-such-device" ${RUNNER}
+                  "${TOOL}" "${TEST_DIR}" --isolate ${memory_args}
+                  RESULT_VARIABLE code OUTPUT_VARIABLE out ERROR_VARIABLE log TIMEOUT 10)
+  if(NOT code STREQUAL "1" OR NOT log MATCHES "a child process failed during setup \\(exit status 1\\)"
+     OR log MATCHES "could not run an isolation child|bisecting" OR out MATCHES "MODULE CRASH")
+    message(FATAL_ERROR "${mode}: expected a child setup failure, got ${code}\n${out}\n${log}")
+  endif()
+  if(mode STREQUAL "guarded")
+    if(NOT log MATCHES "job commit: limit 134217728 bytes, peak [1-9][0-9]* bytes"
+       OR NOT log MATCHES "(job limit involvement unconfirmed|job memory limit event observed); exit status 1")
+      message(FATAL_ERROR "Expected guarded child telemetry and raw status\n${log}")
+    endif()
+  elseif(log MATCHES "job commit:")
+    message(FATAL_ERROR "Unexpected job telemetry with the memory option omitted\n${log}")
   endif()
 endforeach()
