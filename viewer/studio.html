@@ -564,6 +564,7 @@ function applyTranslations() {
 
 let allModels = [];
 let selectedModel = null;
+let shownModel = null;
 const modelPages = new Map();
 let allTextures = [];
 let activeCategory = 'ALL';
@@ -734,6 +735,7 @@ function disposeModel(root) {
 
 function loadModel(url, name, category, size) {
   const loadId = ++modelLoadId;
+  const requested = selectedModel;
   const bar = document.getElementById('loading-bar');
   bar.style.transform = 'scaleX(0.4)';
 
@@ -748,6 +750,7 @@ function loadModel(url, name, category, size) {
       disposeModel(currentMesh);
     }
     currentMesh = gltf.scene;
+    shownModel = requested;
     scene.add(currentMesh);
 
     let verts = 0;
@@ -785,8 +788,15 @@ function loadModel(url, name, category, size) {
     if (loadId !== modelLoadId) return;
     bar.style.transform = 'scaleX(0)';
     console.error('Error loading model:', err);
+    // The viewport and the statistics still show the previous model (or none), so the list goes back to it.
+    selectModel(shownModel);
     alert('Не удалось загрузить 3D модель: ' + name);
   });
+}
+
+function selectModel(model) {
+  selectedModel = model;
+  document.querySelectorAll('.model-item').forEach(el => el.classList.toggle('active', el.model === model));
 }
 
 async function loadModels() {
@@ -897,6 +907,7 @@ function renderAccordionList() {
       pageRows.replaceChildren(...list.slice(start, end).map(m => {
         const item = document.createElement('div');
         item.className = 'model-item';
+        item.model = m;
         if (m === selectedModel) item.classList.add('active');
         item.innerHTML = `
           <div class="m-name">${escapeHtml(m.name)}</div>
@@ -906,9 +917,7 @@ function renderAccordionList() {
           </div>
         `;
         item.onclick = () => {
-          document.querySelectorAll('.model-item').forEach(el => el.classList.remove('active'));
-          selectedModel = m;
-          item.classList.add('active');
+          selectModel(m);
           loadModel(m.url, m.name, m.category, m.size);
         };
         return item;
