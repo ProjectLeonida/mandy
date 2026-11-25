@@ -19,7 +19,14 @@ class TitleBufferWindows {
         VkDeviceSize capacity{}, used{};
         std::uint8_t* mapped{};
     };
+    struct AddrEntry {
+        VkDeviceAddress address{};
+        std::size_t index{};
+    };
     std::vector<Block> blocks_;
+    std::vector<AddrEntry> by_address_;
+    std::vector<std::size_t> open_tails_;  // earlier slabs (< back) with >= 16 bytes free after 16-byte alignment
+    VkDeviceSize max_open_tail_{};
     VkDeviceSize reserved_{};
     // A new block's allocation failed at this time: none is tried again for kRetryAfter. After the story load the
     // driver refused every 4 MiB block (VK_ERROR_OUT_OF_HOST_MEMORY), and each V# that wanted a copy tried again,
@@ -31,15 +38,23 @@ class TitleBufferWindows {
     bool local_refused_ = false;  // device-local blocks refused once: host memory from then on
     std::uint64_t quick_refusals_ = 0;
 
+    static VkDeviceSize tail_space(const Block& b, VkDeviceSize alignment) {
+        if (b.used > UINT64_MAX - (alignment - 1)) return 0;
+        const auto start = (b.used + alignment - 1) & ~(alignment - 1);
+        return start < b.capacity ? b.capacity - start : 0;
+    }
+
 public:
     VkDeviceSize reserved() const { return reserved_; }
 
     template<class Device>
     bool allocate(Device& d, VkDeviceSize bytes, VkDeviceSize& offset, std::uint8_t*& mapped,
                   bool device_local = false, VkDeviceSize cap = UINT64_MAX, bool* at_cap = nullptr) {
+        if (!bytes) return false;
         const VkDeviceSize alignment = device_local ? 16 : 65536;
         constexpr VkDeviceSize block_size = 4ull << 20;
         auto take = [&](Block& b) {
+            if (b.used > UINT64_MAX - (alignment - 1)) return false;
             const auto start = (b.used + alignment - 1) & ~(alignment - 1);
             if (start > b.capacity || bytes > b.capacity - start) return false;
             mapped = b.mapped + start;
@@ -50,9 +65,22 @@ public:
         if (!blocks_.empty() && take(blocks_.back())) return true;
         // A large view may start a new slab while smaller views still fit earlier tails.
         // Use those tails even after the budget can no longer accommodate another slab.
-        if (device_local && blocks_.size() > 1)
-            for (std::size_t i = blocks_.size() - 1; i != 0; --i)
-                if (take(blocks_[i - 1])) return true;
+        if (device_local && !open_tails_.empty() && bytes <= max_open_tail_) {
+            VkDeviceSize observed_max = 0;
+            bool scanned_all = true;
+            for (std::size_t k = open_tails_.size(); k-- > 0;) {
+                Block& b = blocks_[open_tails_[k]];
+                if (take(b)) {
+                    if (tail_space(b, 16) == 0) open_tails_.erase(open_tails_.begin() + std::ptrdiff_t(k));
+                    scanned_all = false;
+                    return true;
+                }
+                const VkDeviceSize rem = tail_space(b, 16);
+                if (rem == 0) open_tails_.erase(open_tails_.begin() + std::ptrdiff_t(k));
+                else if (rem > observed_max) observed_max = rem;
+            }
+            if (scanned_all) max_open_tail_ = observed_max;
+        }
         auto& vk = d.context->vk;
         if (!vk.vkGetBufferDeviceAddress) return false;
         if (failed_ && std::chrono::steady_clock::now() - failed_at_ < kRetryAfter) {
@@ -66,7 +94,7 @@ public:
         };
         Block b{};
         b.capacity = std::max(bytes, block_size);
-        if (b.capacity > cap - reserved_) {
+        if (reserved_ > cap || b.capacity > cap - reserved_) {
             if (at_cap) *at_cap = true;
             return false;
         }
@@ -77,7 +105,7 @@ public:
         if (vk.vkCreateBuffer(d.info.device, &info, nullptr, &b.buffer) != VK_SUCCESS) return failed();
         VkMemoryRequirements req{};
         vk.vkGetBufferMemoryRequirements(d.info.device, b.buffer, &req);
-        if (req.size > cap - reserved_) {
+        if (reserved_ > cap || req.size > cap - reserved_) {
             if (at_cap) *at_cap = true;
             vk.vkDestroyBuffer(d.info.device, b.buffer, nullptr);
             return false;
@@ -102,18 +130,31 @@ public:
             VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             address.buffer = b.buffer;
             b.address = vk.vkGetBufferDeviceAddress(d.info.device, &address);
-            const auto biased = b.address - d.arena.address;
             // A positive 47-bit offset works with both generations of the translated V# decoder.
-            if (b.address && biased < (1ull << 47) && b.capacity <= (1ull << 47) - biased) {
-                b.mapped = static_cast<std::uint8_t*>(host);
-                blocks_.push_back(b);
-                reserved_ += req.size;
-                if (blocks_.size() == 1 || !(blocks_.size() & (blocks_.size() - 1)))
-                    std::fprintf(stderr, "[rt] d3d12: title buffer shadows outside the arena: %zu blocks, "
-                                         "new block %llu KiB at shader VA 0x%llx\n", blocks_.size(),
-                                 static_cast<unsigned long long>(b.capacity >> 10),
-                                 static_cast<unsigned long long>(biased));
-                return take(blocks_.back());
+            if (b.address && b.address >= d.arena.address) {
+                const auto biased = b.address - d.arena.address;
+                if (biased < (1ull << 47) && b.capacity <= (1ull << 47) - biased) {
+                    if (!blocks_.empty()) {
+                        const VkDeviceSize rem = tail_space(blocks_.back(), 16);
+                        if (rem > 0) {
+                            open_tails_.push_back(blocks_.size() - 1);
+                            if (rem > max_open_tail_) max_open_tail_ = rem;
+                        }
+                    }
+                    b.mapped = static_cast<std::uint8_t*>(host);
+                    const std::size_t idx = blocks_.size();
+                    blocks_.push_back(b);
+                    const auto pos = std::lower_bound(by_address_.begin(), by_address_.end(), b.address,
+                                                      [](const AddrEntry& e, VkDeviceAddress a) { return e.address < a; });
+                    by_address_.insert(pos, {b.address, idx});
+                    reserved_ += req.size;
+                    if (blocks_.size() == 1 || !(blocks_.size() & (blocks_.size() - 1)))
+                        std::fprintf(stderr, "[rt] d3d12: title buffer shadows outside the arena: %zu blocks, "
+                                             "new block %llu KiB at shader VA 0x%llx\n", blocks_.size(),
+                                     static_cast<unsigned long long>(b.capacity >> 10),
+                                     static_cast<unsigned long long>(biased));
+                    return take(blocks_.back());
+                }
             }
             vk.vkUnmapMemory(d.info.device, b.memory);
         }
@@ -125,15 +166,15 @@ public:
     std::uint64_t quick_refusals() const { return quick_refusals_; }
 
     bool lookup(VkDeviceAddress address, std::uint64_t& host, std::uint64_t& remaining) const {
-        for (const auto& b : blocks_) {
-            const auto delta = address - b.address;
-            if (delta < b.used) {
-                host = reinterpret_cast<std::uintptr_t>(b.mapped) + delta;
-                remaining = b.used - delta;
-                return true;
-            }
-        }
-        return false;
+        const auto it = std::upper_bound(by_address_.begin(), by_address_.end(), address,
+                                         [](VkDeviceAddress a, const AddrEntry& e) { return a < e.address; });
+        if (it == by_address_.begin()) return false;
+        const Block& b = blocks_[(it - 1)->index];
+        const auto delta = address - b.address;
+        if (delta >= b.used) return false;
+        host = reinterpret_cast<std::uintptr_t>(b.mapped) + delta;
+        remaining = b.used - delta;
+        return true;
     }
 
     // Device idle. No tracker writes into the blocks after this point.
@@ -145,7 +186,12 @@ public:
             d.context->vk.vkFreeMemory(d.info.device, b.memory, nullptr);
         }
         blocks_.clear();
+        by_address_.clear();
+        open_tails_.clear();
+        max_open_tail_ = 0;
         reserved_ = 0;
+        failed_ = false;
+        local_refused_ = false;
     }
 };
 }  // namespace rt::d3d12

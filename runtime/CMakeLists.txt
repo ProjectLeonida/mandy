@@ -4365,6 +4365,10 @@ if(TARGET Vulkan::Headers)
     add_executable(subgroup_size_test test/subgroup_size_test.cpp)
     target_link_libraries(subgroup_size_test PRIVATE Vulkan::Headers)
     add_test(NAME subgroup_size COMMAND subgroup_size_test)
+    # TitleBufferWindows cap/bias guards, O(log B) lookup, and tail reuse (shims/d3d12_title_buffer_windows.h).
+    add_executable(title_buffer_windows_test test/title_buffer_windows_test.cpp)
+    target_link_libraries(title_buffer_windows_test PRIVATE Vulkan::Headers)
+    add_test(NAME title_buffer_windows COMMAND title_buffer_windows_test)
     add_executable(conservative_raster_test test/conservative_raster_test.cpp)
     add_test(NAME conservative_raster COMMAND conservative_raster_test)
     # The GPU address arena's size from LEONIDA_ARENA_MB and synthetic device buffer limits.
