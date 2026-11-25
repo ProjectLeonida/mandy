@@ -3009,6 +3009,12 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_resource_desc_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_resource_desc COMMAND d3d12_resource_desc_test)
 
+    # Process-local policy and environment parsing for indirect draws (shims/d3d12_indirect_draw_policy.h).
+    add_executable(d3d12_indirect_draw_policy_test test/d3d12_indirect_draw_policy_test.cpp)
+    target_compile_definitions(d3d12_indirect_draw_policy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_indirect_draw_policy_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_indirect_draw_policy COMMAND d3d12_indirect_draw_policy_test)
+
     # Multi-viewport & multi-scissor rendering (RSSetViewports / RSSetScissorRects 1..16) against host D3D12.
     add_executable(d3d12_multi_viewport_test test/d3d12_multi_viewport_test.cpp)
     target_link_libraries(d3d12_multi_viewport_test PRIVATE gta6rt_d3d12_com d3d12 dxgi dxguid)
