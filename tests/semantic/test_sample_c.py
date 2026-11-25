@@ -93,13 +93,30 @@ class SampleC(unittest.TestCase):
             return None
         self.assertEqual((loaded_from(bias), loaded_from(ref)), (4, 5))
 
-    def test_3d_c_lz_forms_are_refused(self):
+    def test_3d_dref_forms_are_refused(self):
         for op, fixture_name in (("image_sample_c_lz", "dref_3d_c_lz.asm"),
                                  ("image_sample_c_lz_o", "dref_3d_c_lz_o.asm")):
             fixture = Path(__file__).with_name("fixtures") / fixture_name
             with self.subTest(op=op), self.assertRaisesRegex(support.rdna2spirv.Unsupported,
                                                                op + " 3D depth comparison"):
                 support.translate_lines("ps_dref3d", fixture.read_text(encoding="utf-8").splitlines())
+        for op, regs in (("image_sample_c", "v[4:7]"),
+                         ("image_sample_c_o", "v[4:8]"),
+                         ("image_sample_c_b", "v[4:8]"),
+                         ("image_sample_c_b_o", "v[4:9]"),
+                         ("image_sample_c_cl", "v[4:8]"),
+                         ("image_sample_c_cl_o", "v[4:9]"),
+                         ("image_sample_c_b_cl", "v[4:9]"),
+                         ("image_sample_c_b_cl_o", "v[4:10]")):
+            with self.subTest(op=op), self.assertRaisesRegex(support.rdna2spirv.Unsupported,
+                                                               op + " 3D depth comparison"):
+                translate("ps_dref3d", f"{op} v11, {regs}, {DESC} dmask:0x1 dim:SQ_RSRC_IMG_3D")
+
+    def test_3d_non_dref_clamp_forms_remain_accepted(self):
+        for op, regs in (("image_sample_cl", "v[4:7]"), ("image_sample_cl_o", "v[4:8]")):
+            with self.subTest(op=op):
+                spv = translate("ps_sample3dcl", f"{op} v9, {regs}, {DESC} dmask:0x1 dim:SQ_RSRC_IMG_3D")
+                self.assertIn("OpImageSampleImplicitLod", spv)
 
     def test_c_lz_supported_dimensions_remain_accepted(self):
         for op, regs, dim in (("image_sample_c_lz", "v[4:6]", "2D"),
