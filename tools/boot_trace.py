@@ -334,7 +334,14 @@ def format_text(summary: dict, limit: int) -> str:
             out.append(f"  kinds: {kinds}")
         if startup["modules"]:
             # A relocated module is marked: triage step 1 asks whether the executable sits at its preferred base.
-            names = [m["module"] + (" (relocated)" if m.get("relocated") else "") for m in startup["modules"]]
+            names = []
+            for module in startup["modules"]:
+                name = module.get("module")
+                if not isinstance(name, str) or not name:
+                    name = "<unknown module>"
+                if module.get("relocated"):
+                    name += " (relocated)"
+                names.append(name)
             out.append(f"  modules ({len(names)}): {_tail(names, limit)}")
         out.append(f"  tls callbacks: {startup['tls_callbacks']}")
         if callback := startup.get("last_tls_callback"):
