@@ -821,12 +821,14 @@ struct GraphicsPipeline {
     std::uint32_t zero_step_slots = 0;    // per-instance slots with InstanceDataStepRate 0: stride 0 at draw time
     std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
     bool mesh = false;                    // a mesh shader instead of a vertex shader: drawn by DispatchMesh only
+    bool tessellation = false;            // a hull/domain pair: needs a patch list
     bool viewport_with_count = false;     // pipeline uses VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
-    // and stencil. Null when it cannot be built.
+    // and stencil. A tessellation variant also fixes the IA patch size. Null when it cannot be built.
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     static constexpr std::uint32_t rectangle_stage = 1u << 9;
+    static constexpr unsigned patch_points_shift = 10;  // patch size minus one in the variant key
     // IA topology requiring a fourth-corner geometry stage. Zero when the PSO already contains the stage.
     std::uint32_t rectangle_variant_topology = 0;
     std::function<VkPipeline(std::uint32_t flags)> variant;
@@ -2374,6 +2376,11 @@ inline void copy_depth_uav(const ReplayFunctions& vk, VkCommandBuffer cb, const 
 
 namespace detail {
 
+// D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST through _32_CONTROL_POINT_PATCHLIST.
+inline constexpr std::uint32_t patch_control_points(std::uint32_t topology) {
+    return topology >= 33 && topology <= 64 ? topology - 32 : 0;
+}
+
 // Resolves a draw's pipeline, attachments and buffers. Attachment views take the pipeline's formats, so a
 // typeless texture is viewed as the format the pipeline renders.
 template<typename Resolve>
@@ -2388,6 +2395,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     // A null pipeline with a variant builder is one built at its first draw: variant 0 (all slots bound).
     if (!pipeline || (!pipeline->pipeline && !pipeline->variant)) return unresolved_at(__LINE__);
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
+    const auto patch_points = draw.mesh ? 0 : patch_control_points(draw.topology);
+    if (pipeline->tessellation != (patch_points != 0)) return ReplayResult::invalid_draw;
     if (draw.mesh && !vk.draw_mesh_tasks) return unsupported_at(__LINE__);
     if (pipeline->viewport_with_count && (!vk.set_viewport_with_count || !vk.set_scissor_with_count))
         return unsupported_at(__LINE__);
@@ -2461,6 +2470,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
+    if (patch_points) unbound |= (patch_points - 1) << GraphicsPipeline::patch_points_shift;
     if (unbound || !p.pipeline) {
         p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
         if (!p.pipeline && pipeline->async_build && !strict_replay()) {
@@ -2564,7 +2574,7 @@ inline bool strip_topology(VkPrimitiveTopology topology) {
            topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
 }
 
-// D3D_PRIMITIVE_TOPOLOGY -> VkPrimitiveTopology (patch lists are not modelled).
+// D3D_PRIMITIVE_TOPOLOGY -> VkPrimitiveTopology for non-patch draws. Patch topology is fixed in the PSO.
 inline VkPrimitiveTopology vulkan_topology(std::uint32_t topology) {
     switch (topology) {
     case 1: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
@@ -4875,7 +4885,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             }
             // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
             // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
-            if (!draw->mesh) {
+            if (!draw->mesh && !graphics.tessellation) {
                 const VkPrimitiveTopology topology = draw->topology == topology_quad_list && !draw->indexed
                     ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : detail::vulkan_topology(draw->topology);
                 vk.set_primitive_topology(command_buffer, topology);

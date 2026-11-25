@@ -477,6 +477,7 @@ private:
             enable_legacy_formatless_features && features.features.shaderStorageImageWriteWithoutFormat;
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
         enable.multiViewport = features.features.multiViewport;  // d3d12_multi_viewport_test, where available
+        enable.tessellationShader = features.features.tessellationShader;
         enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 

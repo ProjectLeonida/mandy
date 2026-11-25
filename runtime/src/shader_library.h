@@ -841,7 +841,7 @@ struct SignatureElement {
 struct ShaderEntry {
     std::string name;
     std::string spv_file;  // optional "<prefix><spv>" filename when the index key is a hash
-    std::string stage;     // "vs", "ps", "cs", "ms", "gs"
+    std::string stage;     // "vs", "hs", "ds", "gs", "ps", "cs", "ms"
     std::string fssm_sha256;
     std::string fspx_code_sha256;   // an FSPX program (docs/fspx.md): the SHA-256 of its kind-6 bytes
     std::string fspx_state_sha256;  // and of its kind-0 entry (dispatch state)

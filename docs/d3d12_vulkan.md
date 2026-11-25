@@ -10,7 +10,7 @@ hand-written RDNA2 run through the translator in `d3d12_translated_draw_test`, a
 set and the host PC device otherwise. Root signatures (packed into the 32 user-data dwords), graphics and compute
 PSOs, draws, dispatches, `ExecuteIndirect`, and presentation through `PresentX` or a DXGI swapchain are implemented
 and have GPU tests; which present path the game uses is still open (question 6). Shader-resource views of buffers,
-pipeline-state streams (`CreatePipelineState`), tessellation and stream-output pipelines are not implemented, and
+pipeline-state streams (`CreatePipelineState`) and stream-output pipelines are not implemented, and
 mesh shaders are reported as not supported (stream PSOs and mesh shaders: D3D-29, #1712). The device reports
 `RaytracingTier` as `NOT_SUPPORTED`, yet `BuildRaytracingAccelerationStructure` builds XDXR BVH4 structures on the
 GPU (section 4.8).** This is the plan for
@@ -984,10 +984,16 @@ The compute path, end to end:
     standalone device enables where the GPU has it and reports in `VulkanDeviceInfo::features`; without it such a
     PSO is `E_NOTIMPL`. The PSO's topology type must be `TRIANGLE`, the GS's input (`E_INVALIDARG` otherwise). The
     push-constant range names the geometry stage only on such a device (`d3d12_geometry_test`).
-  - **Refused with a log:** hull and domain stages, stream output, MSAA, set-0 bindings, and two stages
+  - **Tessellation (D3D-TESSELLATION):** a PSO with `HS` and `DS` uses the `hs` and `ds` shader-library entries
+    as Vulkan tessellation control and evaluation modules. The standalone device enables `tessellationShader` if
+    available. The pair requires a `PATCH` PSO and a 1–32-control-point patch list at draw time. Replay uses
+    `VkPipelineTessellationStateCreateInfo::patchControlPoints` in the existing PSO variant cache, keyed by patch
+    size and unbound attachments. Both stages receive the same user-data push constants as the vertex and pixel
+    stages. Shader translation for HS/DS and combining tessellation with a geometry shader remain open.
+  - **Refused with a log:** stream output, MSAA, set-0 bindings, and two stages
     that both read their code base (question 14, section 5.2). More than eight render targets is `E_INVALIDARG`.
   - **Push constants:** both PSO paths declare the 144-byte block as one range. Its stage flags are the whole
-    stage table the graphics path accepts, and the replay pushes with the same flags. A device whose
+    stage table the graphics path uses, and the replay pushes with the same flags. A device whose
     `maxPushConstantsSize` is below 144 (#224's `push_constants_need_fallback`) has every PSO refused, with the
     limit in the log, until the uniform-buffer tail exists.
 

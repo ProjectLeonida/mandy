@@ -7000,7 +7000,7 @@ public:
         if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
         if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
-        for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
+        for (const auto& [key, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         modules_.clear();
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
@@ -7100,9 +7100,9 @@ public:
         return native_owner_ ? native_owner_->subgroup_requests() : subgroup_requests_;
     }
 
-    // A VS (+ GS) (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the
+    // A VS (+ HS/DS or GS) (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the
     // VS's input signature by semantic name and index: location = the element's register, the translator's rule
-    // (docs/design.md, "Vertex fetch"). Refused with a log: hull and domain stages, stream output, the centre
+    // (docs/design.md, "Vertex fetch"). A hull/domain pair takes patch-list IA topologies. Refused: stream output, the centre
     // multisample pattern, two stages that both read their code base, and state that needs a Vulkan feature the
     // device lacks (including the geometryShader feature a GS needs). A GS takes triangles; the sample count may
     // be above one. Viewport, scissor, topology, vertex strides, stencil reference and blend factor are dynamic,
@@ -7206,8 +7206,19 @@ public:
             if (rt0.BlendEnable && rt0.LogicOpEnable) return E_INVALIDARG;
             if (rt0.LogicOpEnable && unsigned(rt0.LogicOp) > D3D12_LOGIC_OP_OR_INVERTED) return E_INVALIDARG;
         }
-        if (desc.HS.BytecodeLength || desc.DS.BytecodeLength || desc.StreamOutput.NumEntries) {
-            return stream_unsupported("graphics pipeline stage not supported yet (hull/domain/stream output):", 0);
+        const bool hull = desc.HS.BytecodeLength != 0;
+        const bool domain = desc.DS.BytecodeLength != 0;
+        const bool tessellation = hull && domain;
+        // The console also uses topology values outside the PC enum's range.
+        const auto topology_type = std::bit_cast<std::uint32_t>(desc.PrimitiveTopologyType);
+        if (!mesh && (hull != domain || tessellation != (topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)))
+            return E_INVALIDARG;
+        if (tessellation && (!desc.HS.pShaderBytecode || !desc.DS.pShaderBytecode)) return E_INVALIDARG;
+        if (tessellation && !device_.info.features.tessellationShader) {
+            return stream_unsupported("hull and domain shaders need Vulkan tessellationShader; stage", 0);
+        }
+        if (desc.StreamOutput.NumEntries) {
+            return stream_unsupported("graphics pipeline stream output is not supported yet; entries", desc.StreamOutput.NumEntries);
         }
         // A geometry shader is the translator's Vulkan geometry stage (docs/design.md, "Geometry shaders"): it takes
         // triangles and emits a triangle strip. It needs the geometryShader feature, and the PSO's topology type must
@@ -7216,11 +7227,13 @@ public:
         if (geometry && !device_.info.features.geometryShader) {
             return stream_unsupported("geometry shaders need the Vulkan geometryShader feature; stage", 0);
         }
+        if (geometry && tessellation) {
+            log_once("combined tessellation and geometry shader pipelines are not supported yet; stage", 0);
+            return E_NOTIMPL;
+        }
         // The console's rectangle topology type (19) draws as triangles through a generated geometry stage that adds
         // each rectangle's fourth corner (src/rect_list_geometry.h); it needs the same device feature, and no GS of
         // the application's own.
-        // Decode the ABI field as bits. The console's value is outside the PC enum's range.
-        const auto topology_type = std::bit_cast<std::uint32_t>(desc.PrimitiveTopologyType);
         const bool rect_list = !mesh && topology_type == leonida::topology_type_rect_list;
         if (rect_list && (geometry || !device_.info.features.geometryShader)) {
             log_once("a rectangle-list pipeline needs the geometryShader feature and no geometry shader; stage", 0);
@@ -7259,10 +7272,12 @@ public:
             std::vector<std::uint8_t> fssm;
             std::vector<std::uint32_t> words;
         };
-        Stage stages[3] = {mesh ? Stage{"ms", VK_SHADER_STAGE_MESH_BIT_EXT, *ms}
-                                : Stage{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS},
-                           {"gs", VK_SHADER_STAGE_GEOMETRY_BIT, desc.GS},
-                           {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
+        Stage stages[] = {mesh ? Stage{"ms", VK_SHADER_STAGE_MESH_BIT_EXT, *ms}
+                               : Stage{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS},
+                          {"gs", VK_SHADER_STAGE_GEOMETRY_BIT, desc.GS},
+                          {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS},
+                          {"hs", VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, desc.HS},
+                          {"ds", VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, desc.DS}};
         // stage_infos.size() indexes the recipe's per-stage required-size structs: one for every table entry.
         static_assert(std::size(stages) <= std::size(decltype(recipe_.required_sizes){}),
                       "Recipe::required_sizes needs an entry per graphics stage");
@@ -7385,15 +7400,14 @@ public:
         if (std::getenv("LEONIDA_LOG_EXE_PIPELINES")) log_exe_pipeline(stages[0].entry, stages[2].entry, desc);
         // --f16-interp-fallback (SHADER-378): align/synthesize VS decoded f16 halves for this (VS, PS) pair before
         // creating the shader modules so colliding PS and high-param producers link within MoltenVK's 30 locations.
-        // stages[] is {vs, gs, ps} since geometry shaders joined graphics PSOs (#2109): the PS is stages[2], and with a
-        // GS the PS reads the GS's outputs, not the VS's, so the VS/PS halves link only applies without one.
+        // The PS reads from the last pre-rasterization stage: this link only applies to a direct VS->PS pair.
         Stage& vs_stage = stages[0];
-        Stage& gs_stage = stages[1];
         Stage& ps_stage = stages[2];
-        if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && gs_stage.entry) {
-            log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
+        const bool direct_vertex_pixel = !geometry && !tessellation;
+        if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && !direct_vertex_pixel) {
+            log_once("--f16-interp-fallback needs a direct VS->PS link; an intermediate stage is present", 0);
         }
-        if (vs_stage.entry && ps_stage.entry && !gs_stage.entry &&
+        if (vs_stage.entry && ps_stage.entry && direct_vertex_pixel &&
             (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty())) {
             std::string link_error;
             if (!leonida::link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
@@ -7425,7 +7439,7 @@ public:
             return stream_unsupported("graphics shader requires an unavailable storesAndAtomics feature");
         }
         const auto topology_bits = std::bit_cast<std::uint32_t>(desc.PrimitiveTopologyType);
-        if (!mesh && topology_bits != leonida::topology_type_rect_list)
+        if (!mesh && !tessellation && topology_bits != leonida::topology_type_rect_list)
             graphics_.rectangle_variant_topology = leonida::topology_rect_list;
 
         for (Stage& stage : stages) {
@@ -7569,6 +7583,7 @@ public:
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT: assembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
+        case D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH: assembly.topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST; break;
         default:
             log_once("primitive topology type not supported:", topology_type);
             return E_INVALIDARG;
@@ -7780,9 +7795,10 @@ public:
         // Every stage this path accepts reads the user SGPRs, so the range covers the whole stage table, not only the
         // stages present. A stage added to the table (geometry, mesh) is covered without touching this.
         // (The geometry bit only where the device has the stage: a range may not name a stage it cannot run.)
-        for (const Stage& stage : stages)
-            if (stage.bit != VK_SHADER_STAGE_GEOMETRY_BIT || device_.info.features.geometryShader)
-                graphics_.push_stages |= stage.bit;
+        graphics_.push_stages = stages[0].bit | VK_SHADER_STAGE_FRAGMENT_BIT;
+        if (device_.info.features.geometryShader) graphics_.push_stages |= VK_SHADER_STAGE_GEOMETRY_BIT;
+        if (tessellation)
+            graphics_.push_stages |= VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
         const VkPushConstantRange push{graphics_.push_stages, 0, sizeof(leonida::ShaderUserData)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
@@ -7798,6 +7814,7 @@ public:
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
         graphics_.mesh = mesh;
+        graphics_.tessellation = tessellation;
         recipe_.mesh = mesh;
         recipe_.stages = std::move(stage_infos);
         recipe_.attributes = std::move(attributes);
@@ -8162,8 +8179,8 @@ private:
     struct Recipe {
         bool mesh = false;  // no vertex input or input assembly state, and no dynamic topology or strides
         std::vector<VkPipelineShaderStageCreateInfo> stages;
-        // One per entry of create_graphics's stage table (VS, GS, PS), static_assert there; what `stages` chain.
-        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[3]{};
+        // The stage infos reference these subgroup-size structs for as long as the PSO lives.
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[5]{};
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
         std::vector<VkVertexInputBindingDivisorDescriptionEXT> divisors;
@@ -8181,6 +8198,8 @@ private:
     VkPipeline build(std::uint32_t unbound, const char* trigger, VkPipelineCreateFlags flags = 0,
                      VkResult* status = nullptr) {
         CompileActivity activity(device_.active_compiles);
+        const std::uint32_t patch_points = graphics_.tessellation
+            ? (unbound >> leonida::GraphicsPipeline::patch_points_shift) + 1 : 0;
         const Recipe& r = recipe_;
         std::vector<VkFormat> colors = graphics_.color_formats;
         for (std::size_t slot = 0; slot < colors.size(); ++slot)
@@ -8234,7 +8253,7 @@ private:
             graphics_.viewport_with_count ? VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT : VK_DYNAMIC_STATE_VIEWPORT;
         dyn_list[dyn_count++] =
             graphics_.viewport_with_count ? VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT : VK_DYNAMIC_STATE_SCISSOR;
-        if (!r.mesh) {
+        if (!r.mesh && !patch_points) {
             dyn_list[dyn_count++] = VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY;
             dyn_list[dyn_count++] = VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE;
         }
@@ -8278,6 +8297,8 @@ private:
                 stages[i].module = module;
             }
         }
+        VkPipelineTessellationStateCreateInfo tessellation{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
+        tessellation.patchControlPoints = patch_points;
         VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
         // A triangle-family pipeline drawn as a rectangle list: the same stages plus the generated geometry stage.
         std::vector<VkPipelineShaderStageCreateInfo> rectangle_stages;
@@ -8333,6 +8354,7 @@ private:
         info.pStages = pipeline_stages.data();
         info.pVertexInputState = r.mesh ? nullptr : &vertex_input;  // ignored with a mesh stage; null for clarity
         info.pInputAssemblyState = r.mesh ? nullptr : &r.assembly;
+        info.pTessellationState = patch_points ? &tessellation : nullptr;
         info.pViewportState = &viewport;
         info.pRasterizationState = &raster;
         info.pMultisampleState = &multisample;
@@ -8428,7 +8450,7 @@ private:
         if (!pipeline) {
             if (leonida::pipeline_profile::enabled())
                 std::fprintf(stderr, "[rt] pso-variant failed stage=%s mask=%u\n", recipe_.mesh ? "ms" : "vs", unbound);
-            log_once("a pipeline variant for unbound attachment slots could not be built; slots", int(unbound));
+            log_once("a graphics pipeline variant could not be built; key", int(unbound));
             return VK_NULL_HANDLE;
         }
         variants_.emplace(unbound, pipeline);
@@ -8438,7 +8460,7 @@ private:
     // Where a lazy graphics pipeline's stage modules come from, in recipe_.stages order (stage_words).
     struct StageSource {
         enum Kind : std::uint8_t { library, rect_list, depth_only } kind = library;
-        std::uint8_t slot = 0;       // library: the create_graphics stage table entry (0 VS or MS, 1 GS, 2 PS)
+        std::uint8_t slot = 0;       // library: the create_graphics stage table entry (VS/MS, GS, PS, HS, DS)
         bool depth24 = false;        // library: the D24 fragment patch applies
         const leonida::ShaderEntry* entry = nullptr;  // library: the translated shader
     };
@@ -16413,6 +16435,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     enable.logicOp = chosen_features.logicOp;
     enable.depthClamp = chosen_features.depthClamp;
     enable.multiViewport = chosen_features.multiViewport;
+    enable.tessellationShader = chosen_features.tessellationShader;
     enable.geometryShader = chosen_features.geometryShader;  // translated geometry shaders (195 in the corpus)
     // What translated shaders declare (the index's `features`): 64-bit integers in most of the corpus (25,803 of
     // 26,503 entries), doubles, 16-bit integers, clip and cull distances in a few vertex shaders, formatless image

@@ -3472,9 +3472,12 @@ if(TARGET Vulkan::Headers)
       set(LEONIDA_TEST_VS_FULLSCREEN ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_fullscreen.spv)
       set(LEONIDA_TEST_VS_INT ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_draw_int.spv)
       set(LEONIDA_TEST_GS_DOUBLE ${CMAKE_CURRENT_BINARY_DIR}/generated/gs_double.spv)
+      set(LEONIDA_TEST_HS_PATCH ${CMAKE_CURRENT_BINARY_DIR}/generated/tess_patch_hs.spv)
+      set(LEONIDA_TEST_DS_PATCH ${CMAKE_CURRENT_BINARY_DIR}/generated/tess_patch_ds.spv)
       foreach(pair "vs_draw.vert;${LEONIDA_TEST_VS}" "ps_draw.frag;${LEONIDA_TEST_PS}"
                    "ps_draw_uint.frag;${LEONIDA_TEST_PS_UINT}" "vs_fullscreen.vert;${LEONIDA_TEST_VS_FULLSCREEN}" "vs_draw_int.vert;${LEONIDA_TEST_VS_INT}"
-                   "gs_double.geom;${LEONIDA_TEST_GS_DOUBLE}")
+                   "gs_double.geom;${LEONIDA_TEST_GS_DOUBLE}" "tess_patch.tesc;${LEONIDA_TEST_HS_PATCH}"
+                   "tess_patch.tese;${LEONIDA_TEST_DS_PATCH}")
         list(GET pair 0 source)
         list(GET pair 1 output)
         add_custom_command(
@@ -3623,6 +3626,18 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_graphics_direct_heaps_off COMMAND d3d12_graphics_direct_heaps_test --off)
       set_tests_properties(d3d12_graphics_direct_heaps d3d12_graphics_direct_heaps_off PROPERTIES SKIP_RETURN_CODE 77)
       set_tests_properties(d3d12_graphics_direct_heaps_off PROPERTIES ENVIRONMENT LEONIDA_GRAPHICS_DIRECT_HEAPS=0)
+      add_executable(d3d12_tessellation_test test/d3d12_tessellation_test.cpp
+                     ${LEONIDA_TEST_VS_FULLSCREEN} ${LEONIDA_TEST_HS_PATCH} ${LEONIDA_TEST_DS_PATCH}
+                     ${LEONIDA_TEST_FS_SOLID})
+      target_link_libraries(d3d12_tessellation_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_tessellation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS_FULLSCREEN}"
+                                 LEONIDA_TEST_HS_SPV="${LEONIDA_TEST_HS_PATCH}"
+                                 LEONIDA_TEST_DS_SPV="${LEONIDA_TEST_DS_PATCH}"
+                                 LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_FS_SOLID}")
+      target_compile_options(d3d12_tessellation_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_tessellation COMMAND d3d12_tessellation_test)
+      set_tests_properties(d3d12_tessellation PROPERTIES SKIP_RETURN_CODE 77)
       # D3D-309: D24 depth bias and 24-bit depth in draws, with and without a pixel shader and with a geometry shader
       # (src/depth24_fragment.h).
       set(LEONIDA_TEST_VS_DEPTH ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_depth.spv)
