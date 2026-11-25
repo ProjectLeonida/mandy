@@ -332,7 +332,9 @@ int main() {
 
     // 5. XDXR precedence: when xdxr_copy / xdxr_postbuild are set, KHR paths are bypassed cleanly.
     {
-        vk.xdxr_copy = [](VkCommandBuffer, std::uint64_t, std::uint64_t, std::uint64_t bytes, std::uint32_t mode) {
+        vk.xdxr_copy = [](VkCommandBuffer, std::uint64_t, std::uint64_t, std::uint64_t bytes, std::uint32_t mode,
+                          std::uint64_t source_bytes) {
+            expect(source_bytes > 0, "XDXR copy carries the source size");
             ops.push_back(Op::xdxr_copy);
             xdxr_copy_bytes.push_back(bytes);
             xdxr_copy_modes.push_back(mode);
