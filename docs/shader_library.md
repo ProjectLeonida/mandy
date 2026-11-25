@@ -152,9 +152,8 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
 
 * It writes `fspx/<name>.code` and `fspx/<name>.json`, the layout `fspx_unpack.py` writes and `rdna2spirv.py`
   reads (`native_blob`, `cs_dispatch_state`). A compute program also gets `fspx/<name>.state`, its record's state
-  blob (FSPX kind 0) as it is, whose SHA-256 is the index's `fspx_state_sha256`; in the 1.0.2.1 `shaders.rpf` library,
-  every compute program has one distinct state-blob index across `library.json`'s `compute` table (2,684 programs,
-  2,693 records). It also writes `index.json` with each program's stage, and
+  blob (FSPX kind 0) as it is, whose SHA-256 is the index's `fspx_state_sha256`; every compute program has exactly one
+  (2,684 programs, 2,693 records). It also writes `index.json` with each program's stage, and
   `library.json` with the header and both pipeline tables, stage to program name. Programs are named
   `lib_<stage>_<index>`.
 * `--disasm` writes `disasm/<name>.s` for the code after the prologue, as `fspx_unpack.py --disasm` does.
@@ -168,10 +167,9 @@ The output is game data and must stay in your work folder. `tests/test_shader_li
 archives by hand and covers the header, both tables, the size checks, the search in an archive and the digest
 walk. It also checks the `--carve` copy, the translator's reads of the compute sidecar and the compute `.state`.
 
-**In the build.** `make_game.py`'s `shaders` stage runs this for the compute stage after the BVH step
-(`library_shaders`): `--stages cs --disasm --carve` into `<work>/shaders/library`, then `translate()` shards
-`rdna2spirv.py` across `--jobs` and merges into `<work>/shaders/spirv/library` with the stage's `--wave64-emulate`
-and fallback flags. The runtime's shader library
+**In the build.** `make_game.py`'s `shaders` stage runs this for the compute stage after the FSPX step
+(`library_shaders`): `--stages cs --disasm --carve` into `<work>/shaders/library`, then `rdna2spirv.py` into
+`<work>/shaders/spirv/library` with the stage's `--wave64-emulate` and fallback flags. The runtime's shader library
 reads that index next to `fspx/` and finds its entries by `fspx_code_sha256` and `fspx_state_sha256`
 ([fspx.md](fspx.md), "Build and run-time lookup"). That is how the executable creates these pipelines: it reads the
 library through DirectStorage zlib requests and passes each compute record's four parts to Xbox device slot 67,
@@ -179,6 +177,29 @@ library through DirectStorage zlib requests and passes each compute record's fou
 them and the state key is the record's state blob. The step is redone as a whole when `shaders.rpf`, the tools,
 `llvm-mc`, the wave64 mode or the flags change (`library_build.json`, written last), and a clash of both keys between
 different modules fails it, as for the FSPX step. Graphics pipelines are not translated by the build.
+
+### Resuming a compute-only batch on Linux
+
+Run `tools/shader_library.py` with `--stages cs --disasm --jobs 2` and the carved containers, or select the
+kind-6 hashes with `--compute-hashes`. For an unpacked library with its input `index.json`, use the compute batch.
+
+```sh
+python3 -I scripts/translate_pipeline_compute.py /path/to/unpacked --out /path/to/spirv/library --wave64-emulate
+```
+
+Use a dedicated output folder. The two workers run at nice 19. Each has a 768 MiB address-space limit and uses one
+SPIRV-Tools process at a time (four processes total). `--jobs 1` uses a single worker and `--memory-mib` changes
+the per-process limit. A rerun checks each module against its checksum and the listing, source container, FSPX
+sidecars, toolchain and wave mode. It retries failures. Only validated modules enter the runtime index. Its
+atomic replacement follows both workers, so an interrupted run leaves the previous index readable. A partial
+run exits nonzero and writes the reasons to `failures.json`, keyed by kind-6 and kind-0 SHA-256. Old modules
+can still be used by a runtime that already opened the preceding index.
+
+Among 2,680 compute programs, 46 start with two 12-byte literal-bearing VOP3 NOP hash carriers. Their body
+starts at byte 24. The three-record form starts at byte 36. The no-op measurements are in `docs/fspx.md`.
+A hash literal can resemble an instruction. `shader_library.py` excludes both complete carrier records before
+looking for the end of the program. LLVM input uses one dword per line, including within multiword instructions,
+so its diagnostic for an invalid word echoes at most four source bytes.
 
 ## 5. Translation
 
@@ -199,9 +220,16 @@ What stops the rest, by the translator's message:
   run into `vcc` (SGPRs 106 and 107): `s_load_dwordx8`/`x4`/`x16` writing `s[100:107]`, `s[104:107]` or
   `s[92:107]`, and image instructions whose resource is `s[100:107]`. In the compute programs alone that is 37,952
   SMEM, 22,248 MIMG and 2,298 MUBUF words. The same words with the register field one tuple lower decode; with
-  `gfx1030` they don't either. The FSSM shaders don't use these tuples; the pipeline builds use them often. A decoder
-  fallback for these encodings would cover most of the remaining programs. The translator already reads
-  `[s100,...,vcc_lo,vcc_hi]` lists (design.md *Scalar/buffer memory*).
+  `gfx1030` they don't either. The FSSM shaders don't use these tuples; the pipeline builds use them often. The translator
+  now decodes these words from the blob with `rdna2_decode` (`restore_vcc_tuples`) and reads them as the
+  `[s100,...,vcc_lo,vcc_hi]` lists it already takes (design.md *Scalar/buffer memory*); synthetic cases are in
+  `tests/semantic/test_vcc_tuple_fallback.py`. The junk llvm-mc prints at such a word's second dword is often longer
+  than that dword (an 8-byte `exp`, say) and swallows the instruction after the tuple too, so the words after a restored
+  instruction are decoded from the blob until the stream is back at one llvm-mc printed. A word llvm-mc itself rejected
+  is not taken for swallowed code and stays refused. They are decoded for the program's own wave size: in wave64 a
+  swallowed VOP3 compare writes an SGPR pair. The table above was measured before both changes. Measured since,
+  over the 2,684 compute programs (llvm-mc 21.1.8): 1,816 translate with the tuples alone and 2,567 with the swallowed
+  instructions, all of which pass `spirv-val`; the modules of the 1,816 are byte-identical.
 * **443: an instruction llvm-mc prints with another encoding than the blob's** (`v_fma_mix*`, `v_interp_p2_f16`):
   the existing `check_printed_encodings` refusal.
 * **90 CS: "CS thread-group-size SGPR"**: RSRC2 `TG_SIZE_EN`, which no FSSM compute shader sets.
