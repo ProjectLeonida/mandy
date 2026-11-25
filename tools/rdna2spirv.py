@@ -3786,8 +3786,24 @@ class Gen:
             inst -= 0x1000            # the raw 12-bit field from a tool that prints it unsigned: same offset
         if not -0x800 <= inst <= 0x7FF:
             raise Unsupported(f"{op} offset:{inst}")     # not a 12-bit value: don't guess an address
-        if (saddr["k"] == "sgpr" and saddr.get("n") == 2) or (saddr["k"] == "slist" and len(saddr["r"]) == 2):
-            lo, hi = self.sgpr_words(saddr, 2)
+        if ((saddr["k"] == "sgpr" and saddr.get("n") == 2)
+                or (saddr["k"] == "slist" and len(saddr["r"]) == 2)
+                or (saddr["k"] == "special" and saddr["t"] == "vcc")):
+            if saddr["k"] == "special":
+                pair_words = []
+                for slot in ("vcc_lo", "vcc_hi"):
+                    half = {"k": "special", "t": slot}
+                    if self.holds_lane_mask(half):
+                        if self.emulate:
+                            raise Unsupported(op + " emulated wave64 lane-mask pointer")
+                        pair_words.append(self.lane_mask_word(half))
+                    else:
+                        t = self.tmp()
+                        self.emit(f"{t} = OpLoad %uint {'%vcc' if slot == 'vcc_lo' else '%vcc_hi'}")
+                        pair_words.append(t)
+                lo, hi = pair_words
+            else:
+                lo, hi = self.sgpr_words(saddr, 2)
             voff = self.load_reg("vgpr", vaddr["r"])
             l64, h64, sh, base, v64, va = (self.tmp() for _ in range(6))
             self.emit(f"{l64} = OpUConvert %ulong {lo}")
@@ -10434,11 +10450,20 @@ class Gen:
         elif op == "s_getpc_b64":
             # Address of the next instruction: code base (push constants 34-35: where the runtime put this shader's
             # FSSM blob in the Xbox VA window) + offset of the next instruction within the blob.
-            if a[0]["k"] != "sgpr" or a[0].get("n") != 2:
+            d = a[0] if len(a) == 1 else None
+            if d is not None and d["k"] == "sgpr" and d.get("n") == 2 and d["r"] % 2 == 0 and 0 <= d["r"] <= 104:
+                slots = (d["r"], d["r"] + 1)
+            elif d is not None and d["k"] == "special" and d.get("t") == "vcc":
+                slots = ("vcc_lo", "vcc_hi")
+            elif d is not None and d["k"] == "special" and d.get("t") == "null":
+                slots = None
+            else:
                 raise Unsupported("s_getpc_b64 destination")
             if not ins.get("enc"):
                 # Without the `; encoding:` bytes the instruction's size, and so the next PC, is unknown.
                 raise Unsupported("s_getpc_b64 without encoding")
+            if slots is None:
+                return
             nxt = ins["pc"] + len(ins["enc"]) // 2
             lo, hi, s, rlo, c, rhi = (self.tmp() for _ in range(6))
             self.emit(f"{lo} = OpLoad %uint %ud_code_lo_p")
@@ -10447,8 +10472,11 @@ class Gen:
             self.emit(f"{rlo} = OpCompositeExtract %uint {s} 0")
             self.emit(f"{c} = OpCompositeExtract %uint {s} 1")
             self.emit(f"{rhi} = OpIAdd %uint {hi} {c}")
-            self.store_reg("sgpr", a[0]["r"], rlo)
-            self.store_reg("sgpr", a[0]["r"] + 1, rhi)
+            for slot, val in zip(slots, (rlo, rhi)):
+                if isinstance(slot, int):
+                    self.store_reg("sgpr", slot, val)
+                else:
+                    self.emit(f"OpStore {'%vcc' if slot == 'vcc_lo' else '%vcc_hi'} {val}")
             self.uses_codebase = True
             self.cu(3), self.cu(4)
         elif op in ("s_add_i32", "s_sub_i32", "s_min_u32", "s_max_u32", "s_xor_b32", "s_andn2_b32",
@@ -16864,10 +16892,27 @@ def halves_analysis(g, blocks, succ):
         raise Unsupported("wave64 graphics tier C: " + ", ".join(g.w64g["reasons"]))
 
 
+def _far_branch_pair(a):
+    if a["k"] == "sgpr" and a.get("n") == 2 and a["r"] % 2 == 0 and 0 <= a["r"] <= 104:
+        return (a["r"], a["r"] + 1)
+    if a["k"] == "special" and a.get("t") == "vcc":
+        return ("vcc_lo", "vcc_hi")
+    return None
+
+
+def _far_branch_slot(a):
+    if a["k"] == "sgpr" and a.get("n", 1) == 1:
+        return a["r"]
+    if a["k"] == "special" and a.get("t") in ("vcc_lo", "vcc_hi"):
+        return a["t"]
+    return None
+
+
 def fold_far_branches(insns):
-    """s_getpc_b64 s[a:a+1]; s_add_u32 sa, sa, K; s_addc_u32 sa+1, sa+1, 0|-1; s_setpc_b64 s[a:a+1] is a far
-    branch (s_branch only reaches +-32K dwords): the target is the address after s_getpc plus K. Fold the four
-    instructions into one s_branch with an explicit byte target so the CFG sees an ordinary branch."""
+    """s_getpc_b64 s[a:a+1]; s_add_u32 sa, sa, K; s_addc_u32 sa+1, sa+1, 0|-1; s_setpc_b64 s[a:a+1] (for an
+    even-aligned SGPR pair `s[a:a+1]` or `vcc`) is a far branch (s_branch only reaches +-32K dwords): the target is
+    the address after s_getpc plus K. Fold the four instructions into one s_branch with an explicit byte target so
+    the CFG sees an ordinary branch."""
     out, i = [], 0
     while i < len(insns):
         w = insns[i:i + 4]
@@ -16875,8 +16920,12 @@ def fold_far_branches(insns):
         if len(w) == 4 and all(x.get("enc") for x in w) and ops4 in (["s_getpc_b64", "s_add_u32", "s_addc_u32", "s_setpc_b64"],
                                     ["s_getpc_b64", "s_sub_u32", "s_subb_u32", "s_setpc_b64"]):
             g, ad, ac, sp = w
-            r = g["args"][0].get("r") if g["args"] and g["args"][0]["k"] == "sgpr" else None
-            ok = r is not None and                 [x.get("r") for x in ad["args"][:2]] == [r, r] and ad["args"][2]["k"] == "imm" and                 [x.get("r") for x in ac["args"][:2]] == [r + 1, r + 1] and ac["args"][2]["k"] == "imm" and                 sp["args"] and sp["args"][0].get("r") == r
+            pair = _far_branch_pair(g["args"][0]) if g["args"] else None
+            ok = (pair is not None
+                  and len(ad["args"]) >= 3 and len(ac["args"]) >= 3 and bool(sp["args"])
+                  and [_far_branch_slot(x) for x in ad["args"][:2]] == [pair[0], pair[0]] and ad["args"][2]["k"] == "imm"
+                  and [_far_branch_slot(x) for x in ac["args"][:2]] == [pair[1], pair[1]] and ac["args"][2]["k"] == "imm"
+                  and _far_branch_pair(sp["args"][0]) == pair)
             if ok:
                 k = ad["args"][2]["v"] & 0xFFFFFFFF
                 hi = ac["args"][2]["v"] & 0xFFFFFFFF
@@ -16888,7 +16937,7 @@ def fold_far_branches(insns):
                     k = -k
             if ok:
                 out.append({"op": "s_branch", "args": [], "mods": [], "pc": g["pc"],
-                            "enc": "".join(x["enc"] for x in w), "target": g["pc"] + 4 + k})
+                            "enc": "".join(x["enc"] for x in w), "target": g["pc"] + len(g["enc"]) // 2 + k})
                 i += 4
                 continue
         out.append(insns[i])
@@ -17927,8 +17976,12 @@ def translate(path):
     w64_marks = {base_op(i["op"]) for i in insns
                  if WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]]))}
     strict_w64 = bool(w64_marks)
-    code_w64 = strict_w64 or any(base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc")
-                                                                            for x in i["args"]) for i in insns)
+    code_w64 = strict_w64 or any(
+        base_op(i["op"]).endswith("_b64")
+        and base_op(i["op"]) not in ("s_getpc_b64", "s_setpc_b64", "s_swappc_b64")
+        and any(x.get("t") in ("exec", "vcc") for x in i["args"])
+        for i in insns
+    )
     code_w32 = any(WAVE32_RE.search(i["op"]) for i in insns)
     # Authoritative wave size from the FSSM header flags at 0xD4 bit 5 (0x20 = wave32, 0 = wave64;
     # verified with 0 contradictions across all 26,503 corpus blobs). Falls back to the code-marker

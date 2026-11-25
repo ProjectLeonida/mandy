@@ -735,12 +735,18 @@ def mark_vcc_data_moves(blocks, succ):
         for ins in block:
             op, args = _lane_masks.base_op(ins["op"]), ins["args"]
             _, may_write, kill = _scalar_rw(ins)
-            if raw and op == "s_mov_b64" and args[1].get("t") == "vcc" and args[0]["k"] == "sgpr":
+            if raw and op == "s_mov_b64" and len(args) >= 2 and args[1].get("t") == "vcc" and args[0]["k"] == "sgpr":
                 ins["vcc_data_pair"] = True
             if may_write & vcc:
-                raw = bool(kill & vcc and (
-                    ins.get("vcc_data_pair") or (op.startswith(("s_load_", "s_buffer_load_"))
-                                                 and (args[0]["k"] == "slist" or args[0].get("t") == "vcc"))))
+                if (raw and not (kill & vcc) and args and args[0].get("t") in ("vcc_lo", "vcc_hi")
+                        and op in ("s_add_u32", "s_addc_u32", "s_sub_u32", "s_subb_u32")):
+                    pass
+                else:
+                    raw = bool(kill & vcc and (
+                        ins.get("vcc_data_pair")
+                        or (op == "s_getpc_b64" and args and args[0].get("t") == "vcc")
+                        or (op.startswith(("s_load_", "s_buffer_load_"))
+                            and (args[0]["k"] == "slist" or args[0].get("t") == "vcc"))))
 
 
 def _postdominators(succ):

@@ -270,6 +270,9 @@ def step(state, ins, wave64=True):
             put(state, a[0], None, wave64)
     else:
         put(state, a[0], None, wave64)
+        if (not wave64 and a[0]["k"] == "special" and a[0].get("t") == "vcc"
+                and op in ("s_getpc_b64", "s_load_dwordx2", "s_buffer_load_dwordx2")):
+            state.pop("vcc_hi", None)
         if ((op.startswith("v_") and "_co_" in op)
                 or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")) and len(a) > 1:
             put(state, a[1], MASK, wave64)                      # carry/sign/scale lane mask of VOP3b ops
