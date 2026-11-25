@@ -30,6 +30,8 @@ file(TO_NATIVE_PATH "${FIXTURE}/spirv" shaders)
 get_filename_component(guest_dir "${GUEST}" DIRECTORY)
 # Set here rather than as the test's ENVIRONMENT, before starting gta6rt on native Windows.
 set(ENV{LEONIDA_D3D12} vulkan)
+# tiny_guest_draw calls the command list through the Windows SDK vtable.
+set(ENV{LEONIDA_D3D12_LISTS} pc)
 set(ENV{LEONIDA_SHADERS} "${shaders}")
 
 execute_process(
