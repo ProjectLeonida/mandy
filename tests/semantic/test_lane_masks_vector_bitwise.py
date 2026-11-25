@@ -213,25 +213,27 @@ class _VectorBitwiseMixin:
         want_andor = [((i & 1 == 0) and i < 10) or (i & 2 == 0) for i in range(self.wave_size)]
         want_xnor = [(i & 1 == 0) == (i < 10) for i in range(self.wave_size)]
         want_bfi = [(i < 10) if (i & 1 == 0) else (i & 2 == 0) for i in range(self.wave_size)]
-        cnt_andor = sum(want_andor)
-        cnt_xnor = sum(want_xnor)
-        cnt_bfi = sum(want_bfi)
-        # The mask VGPRs hold the whole wave's mask word (a VALU read of a mask operand is a data
-        # read), stored in every lane by the mask writes; the low word covers lanes 0-31.
-        word_andor = sum(1 << i for i in range(32) if want_andor[i])
-        word_xnor = sum(1 << i for i in range(32) if want_xnor[i])
-        word_bfi = sum(1 << i for i in range(32) if want_bfi[i])
         for lane in range(self.wave_size):
             base = lane * 36
-            self.assertEqual(mem[base], word_andor, f"lane {lane} raw and_or")
-            self.assertEqual(mem[base + 4], word_xnor, f"lane {lane} raw xnor")
-            self.assertEqual(mem[base + 8], word_bfi, f"lane {lane} raw bfi")
-            self.assertEqual(mem[base + 12], 20 if want_andor[lane] else 10, f"lane {lane} cndmask and_or")
-            self.assertEqual(mem[base + 16], 40 if want_xnor[lane] else 30, f"lane {lane} cndmask xnor")
-            self.assertEqual(mem[base + 20], 60 if want_bfi[lane] else 50, f"lane {lane} cndmask bfi")
-            self.assertEqual(mem[base + 24], cnt_andor, f"lane {lane} bcnt and_or")
-            self.assertEqual(mem[base + 28], cnt_xnor, f"lane {lane} bcnt xnor")
-            self.assertEqual(mem[base + 32], cnt_bfi, f"lane {lane} bcnt bfi")
+            # The mask reads run while EXEC is narrowed to lanes < 10, so the wave-mask gather is
+            # suppressed (mask_word_read_ok: a group op can't be relied on to see lanes EXEC has
+            # off — MoltenVK, #1397 review). Each lane's mask operand read keeps its own 0 / ~0
+            # bit and the bitwise ops still update every lane, so each lane stores its own bit of
+            # the composed mask: ~0 where the lane is in it, 0 elsewhere.
+            self.assertEqual(mem[base], 0xFFFFFFFF if want_andor[lane] else 0,
+                             f"lane {lane} raw and_or")
+            self.assertEqual(mem[base + 4], 0xFFFFFFFF if want_xnor[lane] else 0,
+                             f"lane {lane} raw xnor")
+            self.assertEqual(mem[base + 8], 0xFFFFFFFF if want_bfi[lane] else 0,
+                             f"lane {lane} raw bfi")
+            # readfirstlane broadcasts lane 0's result — ~0 in each case — so every lane takes the
+            # mask-set arm and bcnt counts the whole wave's bits.
+            self.assertEqual(mem[base + 12], 20, f"lane {lane} cndmask and_or")
+            self.assertEqual(mem[base + 16], 40, f"lane {lane} cndmask xnor")
+            self.assertEqual(mem[base + 20], 60, f"lane {lane} cndmask bfi")
+            self.assertEqual(mem[base + 24], self.wave_size, f"lane {lane} bcnt and_or")
+            self.assertEqual(mem[base + 28], self.wave_size, f"lane {lane} bcnt xnor")
+            self.assertEqual(mem[base + 32], self.wave_size, f"lane {lane} bcnt bfi")
 
     def test_readfirstlane_mask_vgpr_dst_gets_wave_word(self):
         mem = _run_cs(
@@ -321,6 +323,124 @@ class TestVectorBitwiseDataControl(unittest.TestCase):
                 self.assertEqual(mem[base], SENTINEL, f"inactive lane {lane} and_or")
                 self.assertEqual(mem[base + 4], SENTINEL, f"inactive lane {lane} xnor")
                 self.assertEqual(mem[base + 8], SENTINEL, f"inactive lane {lane} bfi")
+
+
+class TestScalarMaskNumberReads(unittest.TestCase):
+    """A scalar ALU op that reads a lane mask as a number gets the wave's mask word, not this
+    lane's 0 / ~0 bit (MASK_NUMBER_READERS, ported from #1043's NUMBER_READERS). Mask moves and
+    mask logic ops keep the bit so the saveexec/restore and mask-copy idioms still work."""
+
+    def _run(self, lines, wave_size=32, emulate=False):
+        prologue = ["s_mov_b64 exec, -1"] if wave_size == 64 else []
+        body = prologue + lines + [
+            "v_lshlrev_b32_e32 v9, 2, v0",
+            "buffer_store_dword v4, v9, s[0:3], 0 offen",
+            "s_endpgm",
+        ]
+        mem = _run_cs("cs_scalar_masknum", body, wave_size=wave_size, emulate=emulate)
+        return {mem[4 * lane] for lane in range(wave_size) if 4 * lane in mem}
+
+    def test_scalar_add_reads_mask_word(self):
+        # wave32: mask of lanes < 10 -> word 0x3FF. wave64: mask of lanes < 43 -> the s10 operand
+        # is the low half, all 32 low lanes set -> 0xFFFFFFFF. The scalar op is uniform: every
+        # lane's v4 is the same word + 0x1234.
+        for wave, lanes, dst, word in ((32, 10, "s10", 0x3FF), (64, 43, "s[10:11]", 0xFFFFFFFF)):
+            with self.subTest(wave=wave):
+                got = self._run(
+                    [f"v_cmp_gt_u32_e64 {dst}, {lanes}, v0",
+                     "s_add_u32 s20, s10, 0x1234",
+                     "v_mov_b32_e32 v4, s20"], wave_size=wave)
+                self.assertEqual(got, {(word + 0x1234) & 0xFFFFFFFF})
+
+    def test_scalar_readers_table(self):
+        # A representative slice of MASK_NUMBER_READERS on wave32: mask of lanes < 10 -> 0x3FF.
+        setup = ["v_cmp_gt_u32_e64 s10, 10, v0"]
+        cases = {
+            "s_add_u32 s20, s10, 0x1234": (0x3FF + 0x1234) & 0xFFFFFFFF,
+            "s_sub_u32 s20, s10, 0x1234": (0x3FF - 0x1234) & 0xFFFFFFFF,
+            "s_mul_i32 s20, s10, 0x1234": (0x3FF * 0x1234) & 0xFFFFFFFF,
+            "s_lshl_b32 s20, s10, 3": (0x3FF << 3) & 0xFFFFFFFF,
+            "s_lshr_b32 s20, s10, 3": 0x3FF >> 3,
+            "s_brev_b32 s20, s10": int(f"{0x3FF:032b}"[::-1], 2),
+            "s_min_u32 s20, s10, 0x1234": min(0x3FF, 0x1234),
+            "s_max_u32 s20, s10, 0x1234": max(0x3FF, 0x1234),
+        }
+        for op, want in cases.items():
+            with self.subTest(op=op):
+                got = self._run(setup + [op, "v_mov_b32_e32 v4, s20"])
+                self.assertEqual(got, {want})
+
+    def test_mask_copy_keeps_bit_then_scalar_reads_word(self):
+        # s_mov_b32 is not a number reader: the copy stays a mask (per-lane bit), and the scalar
+        # add on the copy still gathers the word because lane_masks tracks s11 as a mask.
+        got = self._run(["v_cmp_gt_u32_e64 s10, 10, v0", "s_mov_b32 s11, s10",
+                         "s_add_u32 s20, s11, 1", "v_mov_b32_e32 v4, s20"])
+        self.assertEqual(got, {0x400})
+
+    def test_exec_as_data_gathers_exec_word(self):
+        # exec_lo narrowed to lanes < 10 by saveexec: the EXEC operand's own word still gathers —
+        # lanes off in EXEC contribute 0 either way, so every driver agrees.
+        got = self._run(["v_cmp_gt_u32_e64 s10, 10, v0",
+                         "s_and_saveexec_b32 s12, s10",
+                         "s_add_u32 s20, exec_lo, 1",
+                         "s_mov_b32 exec_lo, s12",
+                         "v_mov_b32_e32 v4, s20"])
+        self.assertEqual(got, {0x3FF + 1})
+
+
+class TestMaskDataReadExecGate(unittest.TestCase):
+    """A lane-mask data read gathers the wave's mask word with a group op only while every lane the
+    word covers is EXEC-active: drivers differ on whether lanes EXEC has off still vote (MoltenVK's
+    group ops saw only the lanes a narrowed EXEC left on, #1397 review). Otherwise the read keeps
+    this lane's 0 / ~0 — the pre-#1397 answer — and an EXEC operand's own word still gathers, since
+    lanes off in EXEC contribute 0 either way."""
+
+    def _lines(self, tail):
+        return [
+            "v_and_b32 v1, 1, v0",
+            "v_cmp_eq_u32_e64 vcc_lo, v1, 1",     # VCC = odd lanes, 0xAAAAAAAA
+            f"v_mov_b32_e32 v2, {SENTINEL:#x}",    # sentinel: lanes EXEC leaves off keep it
+            "s_mov_b32 exec_lo, 0x55555555",      # EXEC = even lanes
+        ] + tail + [
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "buffer_store_dword v2, v3, s[0:3], 0 offen",
+            "s_endpgm",
+        ]
+
+    def test_vcc_read_under_narrowed_exec_keeps_lane_bit(self):
+        lines = self._lines(["v_mov_b32_e32 v2, vcc_lo"])
+        spv, _ = _translate_cs("cs_maskdata_narrowed", lines, wave_size=32, emulate=False)
+        self.assertNotIn("OpGroupNonUniformBitwiseOr", spv)
+        mem = _run_cs("cs_maskdata_narrowed_run", lines, wave_size=32, emulate=False)
+        for lane in range(32):
+            # EXEC-active even lanes store their own VCC bit (0: VCC is the odd lanes); odd lanes
+            # are off in EXEC — the store doesn't run — which is the per-lane answer, not the
+            # 0xAAAAAAAA word a gather would have produced.
+            if lane & 1:
+                self.assertNotIn(lane * 4, mem, f"lane {lane}")
+            else:
+                self.assertEqual(mem[lane * 4], 0, f"lane {lane}")
+
+    def test_vcc_read_after_exec_restore_gathers(self):
+        lines = self._lines(["s_mov_b32 exec_lo, -1", "v_mov_b32_e32 v2, vcc_lo"])
+        spv, _ = _translate_cs("cs_maskdata_restored", lines, wave_size=32, emulate=False)
+        self.assertIn("OpGroupNonUniformBitwiseOr", spv)
+        mem = _run_cs("cs_maskdata_restored_run", lines, wave_size=32, emulate=False)
+        want = sum(1 << i for i in range(1, 32, 2))     # 0xAAAAAAAA, every lane
+        for lane in range(32):
+            self.assertEqual(mem[lane * 4], want, f"lane {lane}")
+
+    def test_exec_read_under_narrowed_exec_still_gathers(self):
+        lines = self._lines(["v_mov_b32_e32 v2, exec_lo"])
+        spv, _ = _translate_cs("cs_execdata_narrowed", lines, wave_size=32, emulate=False)
+        self.assertIn("OpGroupNonUniformBitwiseOr", spv)
+        mem = _run_cs("cs_execdata_narrowed_run", lines, wave_size=32, emulate=False)
+        for lane in range(32):
+            # EXEC's word is 0x55555555; only the even lanes EXEC leaves on store it.
+            if lane & 1:
+                self.assertNotIn(lane * 4, mem, f"lane {lane}")
+            else:
+                self.assertEqual(mem[lane * 4], 0x55555555, f"lane {lane}")
 
 
 if __name__ == "__main__":

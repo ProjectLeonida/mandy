@@ -923,6 +923,9 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
                 if sacc[1]:
                     mem_w = True
 
+        if ins.get("mask_words"):       # a lane mask read as a number (rdna2spirv._mask_data_operand)
+            return False, _EMPTY_MEM_STATS, 0, (), ()
+
         # 2. Cross-lane mask readers (`wave_mask`, `wave_equal`, live-SCC `scc_from_mask`).
         a = ins["args"]
         mask_chk = m[11]
@@ -1229,6 +1232,9 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                     if sacc[1]:
                         mem_w = True
 
+            if ins.get("mask_words"):
+                clean = False
+                continue
             a = ins["args"]
             mask_chk = m[11]
             if mask_chk:
@@ -1470,7 +1476,7 @@ def _insn_may_barrier_with_meta(ins, meta, lane_masks, scc_live):
     if meta[1]:
         return False
     flags = meta[8]
-    if flags & _FLAG_ALWAYS_BARRIER or _vcc_pair_collects_mask(ins, lane_masks):
+    if flags & _FLAG_ALWAYS_BARRIER or ins.get("mask_words") or _vcc_pair_collects_mask(ins, lane_masks):
         return True
     mask_chk = meta[11]
     if not mask_chk:

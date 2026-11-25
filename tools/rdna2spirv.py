@@ -256,6 +256,23 @@ SOPC_SRC32_SPECIALS = frozenset({
 })
 SOPC_SRC64_SPECIALS = frozenset({"vcc", "exec", "null"})
 
+# Ops that read a lane-mask operand as a plain number even though the destination is not a VGPR
+# (the scalar ALU set; the v_* entries already qualify through their VGPR destinations). Ported from
+# PR #1043's lane_masks.NUMBER_READERS so scalar readers (s_add_u32 s20, s10, K after v_cmp wrote s10)
+# see the wave's mask word, not this lane's 0 / ~0 bit. Mask-preserving ops (s_mov_b32, the MASK_SOP2
+# logic ops, saveexec/wrexec) are deliberately absent: a mask moving or combining as a mask keeps the
+# per-lane bit mask_src readers rely on. _sdwa / _dpp / _dpp8 forms are excluded at the check site.
+MASK_NUMBER_READERS = frozenset((
+    "s_add_u32", "s_add_i32", "s_sub_u32", "s_sub_i32", "s_addc_u32", "s_subb_u32", "s_mul_i32",
+    "s_mul_hi_u32", "s_mul_hi_i32", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32", "s_bfe_u32", "s_bfe_i32",
+    "s_min_u32", "s_min_i32", "s_max_u32", "s_max_i32", "s_brev_b32",
+    "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32",
+    "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_lshlrev_b32", "v_lshrrev_b32",
+    "v_ashrrev_i32", "v_mul_lo_u32", "v_mul_hi_u32", "v_min_u32", "v_max_u32", "v_min_i32",
+    "v_max_i32", "v_bfe_u32", "v_bfe_i32", "v_add3_u32", "v_lshl_add_u32", "v_add_lshl_u32",
+    "v_bcnt_u32_b32",
+))
+
 # Runs of lane-local VALU instructions share one `if (active)` instead of an OpSelect per VGPR write (Gen.insns).
 # VALU ops that are not lane-local: they read other lanes, write a lane mask, SCC or EXEC, or write a carry or
 # other scalar result in every lane (v_add_co_u32's mask goes to inactive lanes too).
@@ -350,6 +367,10 @@ class Gen:
         self.uses_wave_bits = False    # a whole lane mask gathered from the wave (OpGroupNonUniformBitwiseOr)
         self.uses_quad = False         # s_wqm on a lane mask (OpGroupNonUniformQuadSwap)
         self.lane_masks = {}           # id(instruction) -> registers holding a lane mask there (lane_masks.py)
+        self.exec_state_at = {}        # id(instruction) -> ((lo clean, lo tag), (hi clean, hi tag))
+        self.mask_exec_sigs = {}       # mask register -> [(blk, pos, EXEC sig)] while it held a mask
+        self.ins_pos = {}              # id(instruction) -> (block, position)
+        self.exec_reach = []           # block -> bitmask of blocks reachable in >= 1 step
         self.ever_mask = set()         # SGPRs that held a lane mask anywhere in the shader (conservative)
         self.cur_masks = {}
         self.vcc_scalar_pointer = False
@@ -512,7 +533,8 @@ class Gen:
         k = a["k"]
         if ((k == "sgpr" and a.get("n", 1) == 1) or
                 (k == "special" and a.get("t") in ("exec_lo", "exec_hi", "vcc", "vcc_lo", "vcc_hi"))) \
-                and self.holds_lane_mask(a) and self.mask_read_is_data():
+                and self.holds_lane_mask(a) and self.mask_read_is_data() \
+                and self.mask_word_read_ok(a, self.cur_ins):
             # The operand holds this lane's 0 / ~0 bit of a lane mask; a data read wants the whole wave's
             # mask word (the same in every lane), as the SOP ops that read a mask as a number already do
             # (lane_mask_word). Until now a VALU read (v_mov_b32 v6, s16 after v_cmp wrote s16) gave each
@@ -520,6 +542,10 @@ class Gen:
             # Only when the destination is a VGPR: a mask moving into an SGPR, EXEC or VCC keeps this
             # lane's bit, which mask_src readers rely on. A VGPR that stays a mask keeps the word too —
             # mask_src extracts this lane's bit back out when a mask consumer reads one.
+            # mask_word_read_ok keeps the gather for the cases every driver answers the same: lanes
+            # EXEC has off may not vote in a group op (MoltenVK's did not, #1397 review), so a VCC or
+            # mask-SGPR word is only gathered while its lanes are all EXEC-active; an EXEC operand's
+            # word is the current EXEC itself and gathers correctly either way.
             v = self.lane_mask_word(a)
         elif k in ("vgpr", "sgpr"):
             if a.get("n", 1) != 1:
@@ -561,17 +587,24 @@ class Gen:
             v = self.sdwa_src(v, a)
         return self.modify(v, a)
 
-    def mask_read_is_data(self):
-        """Whether the instruction being translated (self.cur_ins) consumes a lane mask as plain data.
+    def mask_read_is_data(self, ins=None):
+        """Whether the instruction being translated (self.cur_ins, or `ins`) consumes a lane mask as plain data.
         A VGPR destination means the mask operand is read as a 32-bit value — the whole wave's mask word,
         which is what hardware holds and what the VGPR then stores (a mask that stays in a VGPR keeps the
         word too; mask_src extracts this lane's bit back out for mask consumers). Anything else — an SGPR,
         EXEC or VCC destination — keeps this lane's 0 / ~0 bit, which mask_src readers rely on."""
-        ins = self.cur_ins
+        ins = self.cur_ins if ins is None else ins
         if ins is None:
             return False
         a = ins["args"]
-        if not a or a[0]["k"] != "vgpr":
+        if not a:
+            return False
+        if base_op(ins["op"]) in MASK_NUMBER_READERS and not ins["op"].endswith(("_sdwa", "_dpp", "_dpp8")):
+            # A scalar (or plain vector) number op reads the mask operand as data even with an SGPR
+            # destination: s_add_u32 s20, s10, K wants the wave's mask word in s20 (#1043's
+            # NUMBER_READERS). Mask moves and mask logic ops are not listed, so they keep the bit.
+            return True
+        if a[0]["k"] != "vgpr":
             return False
         if base_op(ins["op"]) == "v_writelane_b32":
             # A mask parked in one lane of a VGPR comes back through v_readlane as this lane's bit: the
@@ -1787,19 +1820,504 @@ class Gen:
         not listed: it already stores the wave's mask word, so reading it is a plain register load. The mask
         state is the one lane_masks.py precomputed for this instruction (self.lane_masks), since lane_local
         runs before the instruction is translated."""
-        masks = self.lane_masks.get(id(ins))
-        if not masks:
+        masks = self.lane_masks.get(id(ins)) or {}
+        return any(self._mask_data_operand(x, masks, ins) for x in ins["args"][1:])
+
+    def _mask_data_operand(self, x, masks, ins):
+        """Whether src_u will materialize operand `x`'s lane mask as the wave's mask word for `ins`
+        (a subgroup op or, under --wave64-emulate, an exchange round): `masks` is the lane_masks state
+        for ins — self.lane_masks[id(ins)], the same dict self.cur_masks holds while translating."""
+        if x["k"] == "sgpr":
+            if x.get("n", 1) != 1 or x["r"] not in masks:
+                return False
+        elif x["k"] == "special":
+            t = x.get("t", "")
+            if not (t in ("exec_lo", "exec_hi") or
+                    (t in ("vcc", "vcc_lo") and "vcc" in masks) or
+                    (t == "vcc_hi" and ("vcc" if self.wave64 else "vcc_hi") in masks)):
+                return False
+        else:
             return False
-        for x in ins["args"][1:]:
-            if x["k"] == "sgpr" and x.get("n", 1) == 1 and x["r"] in masks:
-                return True
-            if x["k"] == "special":
-                t = x.get("t", "")
-                if t in ("exec_lo", "exec_hi") or \
-                        (t in ("vcc", "vcc_lo") and "vcc" in masks) or \
-                        (t == "vcc_hi" and ("vcc" if self.wave64 else "vcc_hi") in masks):
-                    return True
-        return False
+        return self.mask_read_is_data(ins) and self.mask_word_read_ok(x, ins, masks)
+
+    def mask_operand_halves(self, a, masks=None):
+        """The EXEC halves ('lo' = lanes 0-31, 'hi' = lanes 32-63) that must be all-ones for a wave_mask
+        gather of operand `a` to see every lane the operand's word covers; empty for an EXEC operand —
+        its word IS the current EXEC, so lanes off in it contribute 0 whether they vote or not — and
+        None when `a` is not a lane-mask operand at all. `masks` is the lane_masks state for an SGPR
+        operand's half (self.cur_masks while translating, the per-instruction state while planning)."""
+        if self.emulate:
+            return frozenset()      # the exchange round sees every lane whatever EXEC says
+        if a["k"] == "special":
+            t = a.get("t", "")
+            if t.startswith("exec"):
+                return frozenset()
+            if t in ("exec_hi", "vcc_hi"):
+                return frozenset(("hi",)) if self.wave64 else frozenset(("lo",))
+            return frozenset(("lo",))    # vcc / vcc_lo: the b32 data read yields the low word
+        if a["k"] == "sgpr" and a.get("n", 1) == 1:
+            state = self.cur_masks if masks is None else masks
+            if self.wave64 and state.get(a["r"]) == lane_masks.MASK_HI:
+                return frozenset(("hi",))
+            return frozenset(("lo",))
+        return None
+
+    def mask_word_read_ok(self, a, ins, masks=None):
+        """Whether a data read of lane-mask operand `a` in `ins` may gather the wave's mask word.
+        The gather is a group op over the lanes EXEC leaves active: drivers differ on whether lanes
+        EXEC has off still vote — NVIDIA, AMD and KosmicKrisp return the whole subgroup's bits,
+        MoltenVK's ballot/reduce saw only the lanes a narrowed EXEC left on and produced the EXEC
+        value instead of the frozen mask word (#1397 review, cs_mask_vgpr_exec). A gather is exact
+        whenever every lane that can hold a set bit of the mask is EXEC-active, so the read is
+        allowed while EXEC's needed half is provably all-ones, and otherwise only when the mask was
+        a mask exclusively under this same EXEC narrowing (mask_exec_sigs: every EXEC state seen
+        while the register held a mask is this one, so no lane outside it can hold a bit). Where
+        neither holds, src_u keeps this lane's 0 / ~0, the pre-#1397 answer. An EXEC operand needs
+        no such guarantee (its off lanes contribute 0 either way) and --wave64-emulate exchanges
+        through workgroup memory, which every lane runs."""
+        halves = self.mask_operand_halves(a, masks)
+        if halves is None:
+            return False
+        if not halves:
+            return True
+        st = self.exec_state_at.get(id(ins))
+        if st is None:
+            return self.exec_static_true
+        key = self._mask_sig_key(a)
+        sigs = self.mask_exec_sigs.get(key)
+        if not sigs:
+            return False
+        pos = self.ins_pos.get(id(ins))
+        bi, pi = pos if pos is not None else (0, 0)
+        reach_bi = 1 << bi
+        self_loop = bool(self.exec_reach[bi] & reach_bi)
+        for h in halves:
+            i = 0 if h == "lo" else 1
+            rstate = st[i]
+            if rstate[0] == "c":
+                continue
+            for bj, pj, sig in sigs:
+                # Only signatures whose instruction can reach this read constrain the value:
+                # same block needs an earlier position (or a loop back-edge), another block must
+                # reach this one in the CFG.
+                if bj == bi:
+                    if not (pj < pi or self_loop):
+                        continue
+                elif not (self.exec_reach[bj] & reach_bi):
+                    continue
+                if not self._exec_covers(sig[i], rstate):
+                    return False
+        return True
+
+    @staticmethod
+    def _exec_covers(w, r):
+        """Whether every lane EXEC-active under half-state `w` is also active under `r` — the
+        condition for a mask written under `w` to have all its set bits visible to a group op
+        running under `r`. Half-states: ("c",) all lanes, ("k", v) the constant mask v, ("n", tag)
+        an unknown narrowing identified by the instruction that made it (None never matches)."""
+        if w[0] == "n" and w[1] is None:
+            return False        # an unknown narrowing never provably covers anything
+        if w == r:
+            return True
+        if w[0] == "c":
+            return r[0] == "c"
+        if w[0] == "k":
+            return r[0] == "k" and (w[1] & ~r[1] & 0xFFFFFFFF) == 0
+        return r[0] == "n" and r[1] is not None and w[1] == r[1]
+
+    def _mask_sig_key(self, a):
+        """The lane_masks state key a mask operand's writes are recorded under (mask_exec_sigs)."""
+        if a["k"] == "sgpr":
+            return a["r"]
+        t = a.get("t", "")
+        if t in ("vcc", "vcc_lo") or (t == "vcc_hi" and self.wave64):
+            return "vcc"
+        if t == "vcc_hi":
+            return "vcc_hi"
+        return None
+
+    @staticmethod
+    def _ex_const(v):
+        """A constant EXEC half-state: all-ones folds to clean."""
+        v &= 0xFFFFFFFF
+        return ("c",) if v == 0xFFFFFFFF else ("k", v)
+
+    # Scalar ops that provably leave SCC alone (branches and stores read or ignore it; s_mov and
+    # the non-ALU scalar ops never write it). Anything else starting with "s_" may write SCC and
+    # resets the tracked value — losing precision is safe, keeping a stale one is not.
+    _SCC_KEEPS = frozenset((
+        "s_mov_b32", "s_mov_b64", "s_movrelsd_2_b32", "s_movreld_b32", "s_movreld_b64",
+        "s_nop", "s_endpgm", "s_waitcnt", "s_barrier", "s_sleep", "s_branch", "s_cbranch",
+        "s_cbranch_execz", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz",
+        "s_cbranch_vccnz", "s_set", "s_setpc_b64", "s_getpc_b64",
+        "s_get_waveid_in_workgroup", "s_sendmsg", "s_dcache_inv", "s_dcache_wb",
+        "s_dcache_inv_vol", "s_icache_inv", "s_trap", "s_rfe", "s_memtime",
+        "s_memrealtime",
+    ))
+    _SCC_KEEP_PREFIXES = ("s_store", "s_buffer_store", "s_wait", "s_branch", "s_cbranch",
+                          "s_sendmsg", "s_dcache", "s_icache", "s_getpc", "s_setpc")
+
+    def _const_of(self, a, sconst, ex):
+        """The constant 32-bit value of a scalar operand, or None. EXEC halves resolve through
+        the tracked EXEC state so `s_cmp s, exec_lo`-style compares can fold too."""
+        if a["k"] == "imm":
+            return a.get("v", 0) & 0xFFFFFFFF
+        if a["k"] == "sgpr":
+            return sconst.get(a["r"]) if a.get("n", 1) == 1 else None
+        if a["k"] == "special":
+            t = a.get("t", "")
+            h = ex[0] if t == "exec_lo" else ex[1] if t == "exec_hi" else None
+            if h is not None:
+                return 0xFFFFFFFF if h[0] == "c" else h[1] if h[0] == "k" else None
+            if t == "null":
+                return 0
+        return None
+
+    def _cmp_scc(self, op, ins, sconst, ex):
+        """Fold a compare's SCC when both sources are constant; None when they are not (or the
+        predicate/width is outside the implemented set — safe under-approximation)."""
+        if op.startswith("s_bitcmp"):
+            return None
+        name = op
+        for p in ("s_cmpk_", "s_cmp_"):
+            if name.startswith(p):
+                name = name[len(p):]
+                break
+        else:
+            return None
+        a = ins["args"]
+        if len(a) < 2:
+            return None
+        x = self._const_of(a[-2], sconst, ex)
+        y = self._const_of(a[-1], sconst, ex)
+        if x is None or y is None:
+            return None
+        for sep in ("_u32", "_i32", "_u64", "_i64"):
+            if name.endswith(sep):
+                pred, ty = name[: -len(sep)], sep
+                break
+        else:
+            return None
+        if ty != "_u32" and ty != "_i32":
+            return None
+        sx = x - 0x100000000 if ty == "_i32" and x & 0x80000000 else x
+        sy = y - 0x100000000 if ty == "_i32" and y & 0x80000000 else y
+        if pred == "eq":
+            r = sx == sy
+        elif pred == "ne" or pred == "lg":
+            r = sx != sy
+        elif pred == "lt":
+            r = sx < sy
+        elif pred == "le":
+            r = sx <= sy
+        elif pred == "gt":
+            r = sx > sy
+        elif pred == "ge":
+            r = sx >= sy
+        else:
+            return None
+        return int(r)
+
+    def _scc_step(self, scc, ins, sconst, ex):
+        op = base_op(ins["op"])
+        if not op.startswith("s_"):
+            return scc
+        if "cmp" in op or "bitcmp" in op:
+            return self._cmp_scc(op, ins, sconst, ex)
+        if op in self._SCC_KEEPS or op.startswith(self._SCC_KEEP_PREFIXES):
+            return scc
+        return None
+
+    def _mov_sgpr_vals(self, src, regs, ex, alias, sconst):
+        """Values a scalar s_mov writes into dst regs: int = constant, ("al", halves) = the
+        register now aliases an EXEC half-state (a saved EXEC), None = unknown."""
+        out = []
+        if src is None:
+            return [None] * len(regs)
+        if src["k"] == "imm":
+            v = src.get("v", 0)
+            if len(regs) == 2:
+                return [v & 0xFFFFFFFF, (v >> 32) & 0xFFFFFFFF]
+            return [v & 0xFFFFFFFF]
+        if src["k"] == "sgpr":
+            n = src.get("n", 1)
+            for i, d in enumerate(regs):
+                s = src["r"] + i if n == 2 else src["r"]
+                if s in sconst:
+                    out.append(sconst[s])
+                elif s in alias:
+                    out.append(("al", alias[s]))
+                else:
+                    out.append(None)
+            return out
+        if src["k"] == "special":
+            t = src.get("t", "")
+            vals = []
+            for i in range(len(regs)):
+                h = ex[0] if (t == "exec_lo" or (t == "exec" and i == 0)) else \
+                    ex[1] if (t == "exec_hi" or (t == "exec" and i == 1)) else None
+                if h is None:
+                    vals.append(None)
+                elif h[0] == "c":
+                    vals.append(0xFFFFFFFF)
+                elif h[0] == "k":
+                    vals.append(h[1])
+                else:
+                    vals.append(None)
+            return vals
+        return [None] * len(regs)
+
+    def _exec_src_ex(self, src, h, ex, alias, sconst, ins, wide):
+        """EXEC half-state a scalar source gives EXEC half `h` when moved in."""
+        i = 0 if h == "lo" else 1
+        if src["k"] == "imm":
+            v = src.get("v", 0)
+            if wide:
+                v = (v >> (32 * i)) & 0xFFFFFFFF
+            return self._ex_const(v & 0xFFFFFFFF)
+        if src["k"] == "sgpr":
+            n = src.get("n", 1)
+            r = src["r"] + i if wide and n == 2 else src["r"]
+            if r in sconst:
+                return self._ex_const(sconst[r])
+            al = alias.get(r)
+            if al is not None and al[i] is not None:
+                return al[i]
+            return ("n", id(ins))
+        if src["k"] == "special":
+            t = src.get("t", "")
+            if t == "exec_lo":
+                return ex[0]
+            if t == "exec_hi":
+                return ex[1]
+            if t == "exec":
+                return ex[i]
+        return ("n", id(ins))
+
+    def _exec_write(self, ex, ins, alias, sconst, scc):
+        """EXEC pair after an EXEC-writing instruction. s_mov resolves its source — a constant
+        gives a constant half-state, a register that aliases a saved EXEC restores that state,
+        anything else starts a fresh unknown narrowing. s_cselect with a known SCC resolves to
+        its chosen source the same way (the `exec, -1, exec` restore idiom). Every other EXEC
+        write narrows (or changes) EXEC in a way we cannot name, so the affected halves get
+        this instruction's tag."""
+        op, a = base_op(ins["op"]), ins["args"]
+        lo, hi = ex
+
+        def halves_of(t):
+            if t == "exec_hi":
+                return ("hi",)
+            if t == "exec_lo":
+                return ("lo",)
+            return ("lo", "hi") if self.wave64 else ("lo",)
+
+        dsts = []
+        if a and a[0]["k"] == "special" and a[0].get("t", "").startswith("exec"):
+            dsts.append(a[0])
+        if op in VOP3_TWO_DESTS and len(a) > 1 and a[1]["k"] == "special" \
+                and a[1].get("t", "").startswith("exec"):
+            dsts.append(a[1])
+        if op in ("s_mov_b32", "s_mov_b64") and dsts and len(a) >= 2:
+            src = a[1]
+            wide = op.endswith("b64")
+        elif op in ("s_cselect_b32", "s_cselect_b64") and dsts and len(a) >= 3 \
+                and scc is not None:
+            src = a[1] if scc else a[2]      # D = SCC ? src0 : src1
+            wide = op.endswith("b64")
+        else:
+            src = None
+        if src is not None:
+            for d in dsts:
+                for h in halves_of(d["t"]):
+                    v = self._exec_src_ex(src, h, ex, alias, sconst, ins, wide)
+                    if h == "lo":
+                        lo = v
+                    else:
+                        hi = v
+            return lo, hi
+        if dsts:
+            affected = set(h for d in dsts for h in halves_of(d["t"]))
+        elif self.wave64 and op.endswith("_b32"):
+            affected = {"lo"}          # the _b32 saveexec/wrexec forms touch EXEC_LO only
+        else:
+            affected = {"lo", "hi"} if self.wave64 else {"lo"}
+        tag = ("n", id(ins))
+        return (tag if "lo" in affected else lo,
+                tag if "hi" in affected else hi)
+
+    def _exec_step(self, st, ins):
+        """One instruction's effect on the analysis state (ex, alias, sconst, scc):
+        ex = (lo, hi) EXEC half-states, ("c",) clean / ("k", v) constant / ("n", tag) unknown
+        narrowing; alias = {sgpr: (loEX|None, hiEX|None)} registers holding a saved EXEC value;
+        sconst = {sgpr: constant}; scc = 0/1/None."""
+        ex, alias, sconst, scc = st
+        op, a = base_op(ins["op"]), ins["args"]
+        alias = dict(alias)
+        sconst = dict(sconst)
+        pre_ex = ex
+
+        # Scalar destination bookkeeping: constants and saved-EXEC aliases, invalidated by any
+        # other write to the register.
+        if op in ("s_mov_b32", "s_mov_b64") and a and a[0]["k"] == "sgpr" and len(a) >= 2:
+            d = a[0]
+            regs = list(range(d["r"], d["r"] + d.get("n", 1)))
+            vals = self._mov_sgpr_vals(a[1], regs, ex, alias, sconst)
+            for r, v in zip(regs, vals):
+                if v is None:
+                    sconst.pop(r, None)
+                    alias.pop(r, None)
+                elif isinstance(v, tuple):
+                    alias[r] = v[1]
+                    sconst.pop(r, None)
+                else:
+                    sconst[r] = v
+                    alias.pop(r, None)
+        else:
+            dsts = []
+            if a and a[0]["k"] == "sgpr":
+                dsts.append(a[0])
+            if op in VOP3_TWO_DESTS and len(a) > 1 and a[1]["k"] == "sgpr":
+                dsts.append(a[1])
+            for d in dsts:
+                for r in range(d["r"], d["r"] + d.get("n", 1)):
+                    sconst.pop(r, None)
+                    alias.pop(r, None)
+
+        # saveexec/wrexec write their destination the EXEC value from *before* this instruction.
+        if ("saveexec" in op or "wrexec" in op) and a and a[0]["k"] == "sgpr":
+            d = a[0]
+            pair = (pre_ex[0], None) if self.wave64 and op.endswith("_b32") else pre_ex
+            for i, r in enumerate(range(d["r"], d["r"] + d.get("n", 1))):
+                alias[r] = (pair[0], None) if i == 0 else (None, pair[1])
+                sconst.pop(r, None)
+
+        if writes_exec(ins):
+            ex = self._exec_write(ex, ins, alias, sconst, scc)
+        scc = self._scc_step(scc, ins, sconst, ex)
+        return ex, alias, sconst, scc
+
+    @staticmethod
+    def _ex_merge(x, y):
+        """Meet of two EXEC half-states: equal states merge to themselves; an identical
+        narrowing tag on both sides survives; anything else is an unknown narrowing."""
+        if x == y:
+            return x
+        if x[0] == "n" and y[0] == "n" and x[1] is not None and x[1] == y[1]:
+            return x
+        return ("n", None)
+
+    def _state_merge(self, a, b):
+        """Meet of two analysis states at a control-flow join: EXEC halves meet pairwise,
+        register facts survive only where both sides agree, SCC survives only when equal."""
+        ex = (self._ex_merge(a[0][0], b[0][0]), self._ex_merge(a[0][1], b[0][1]))
+        alias = {r: v for r, v in a[1].items() if b[1].get(r) == v}
+        sconst = {r: v for r, v in a[2].items() if b[2].get(r) == v}
+        scc = a[3] if a[3] == b[3] else None
+        return ex, alias, sconst, scc
+
+    def mark_exec_state(self, blocks, succ):
+        """self.exec_state_at[id(ins)] = (lo, hi) EXEC half-states just before ins, from a
+        must-analysis over the CFG — a block's entry state is the meet of its predecessors'
+        exits and _exec_step walks each block in order. mask_exec_sigs then records, for every
+        register lane_masks knows holds a mask, every EXEC state seen while it did: a mask's
+        set bits can only sit on lanes EXEC left active at its writes, so a gather is exact
+        only when every such signature's lanes are covered by the read's EXEC — see
+        mask_word_read_ok and _exec_covers."""
+        n_blocks = len(blocks)
+        entry = [None] * n_blocks
+        out = [None] * n_blocks
+        clean = ("c",)
+        top = ((clean, clean), {}, {}, None)
+        entry[0] = top
+        work = [0]
+        queued = {0}
+        while work:
+            n = work.pop()
+            queued.discard(n)
+            st = entry[n]
+            for ins in blocks[n]:
+                st = self._exec_step(st, ins)
+            if out[n] == st:
+                continue
+            out[n] = st
+            for s in succ[n]:
+                if not (0 <= s < n_blocks):
+                    continue
+                e = entry[s]
+                merged = st if e is None else self._state_merge(e, st)
+                if e is None or merged != e:
+                    entry[s] = merged
+                    if s not in queued:
+                        work.append(s)
+                        queued.add(s)
+        self.exec_state_at = {}
+        self.ins_pos = {}
+        for n, blk in enumerate(blocks):
+            st = entry[n] if entry[n] is not None else top
+            for p, ins in enumerate(blk):
+                self.exec_state_at[id(ins)] = st[0]
+                self.ins_pos[id(ins)] = (n, p)
+                st = self._exec_step(st, ins)
+        # exec_reach[b] = bitmask of blocks reachable from b in one or more steps; a set bit on b
+        # itself means b loops back to its top.
+        self.exec_reach = [0] * n_blocks
+        for b in range(n_blocks):
+            seen = 0
+            stack = [s for s in succ[b] if 0 <= s < n_blocks]
+            while stack:
+                s = stack.pop()
+                if seen >> s & 1:
+                    continue
+                seen |= 1 << s
+                stack.extend(t for t in succ[s] if 0 <= t < n_blocks)
+            self.exec_reach[b] = seen
+        # mask_exec_sigs[reg] = [(blk, pos, exec sig), ...]: every EXEC state seen at an
+        # instruction where lane_masks says the register holds a mask. A mask's set bits can only
+        # sit on lanes EXEC left active when they were written, so a gather under EXEC state T is
+        # exact only when every such signature that can reach the read agrees on T for the half
+        # the operand covers — see mask_word_read_ok. Signatures are recorded at the pre-state of
+        # each instruction; an instruction that itself writes EXEC (s_and_saveexec's saved mask,
+        # v_cmpx) produced its mask dst under the *pre-write* EXEC, so that state is added too.
+        self.mask_exec_sigs = {}
+        for n, blk in enumerate(blocks):
+            prev_exec_write = False
+            prev_sig = None
+            for p, ins in enumerate(blk):
+                sig = self.exec_state_at[id(ins)]
+                extra = prev_sig if prev_exec_write else None
+                prev_exec_write = writes_exec(ins)
+                prev_sig = sig
+                regs = self.lane_masks.get(id(ins))
+                if not regs:
+                    continue
+                for r in regs:
+                    lst = self.mask_exec_sigs.setdefault(r, [])
+                    if not lst or lst[-1][0] != n or lst[-1][2] != sig:
+                        lst.append((n, p, sig))
+                    if extra is not None and (not lst or lst[-1][2] != extra):
+                        lst.append((n, p, extra))
+        # Block boundaries: a mask dst of a predecessor's last EXEC-writing instruction was
+        # produced under that instruction's pre-state EXEC; add it for the masks live at entry.
+        preds = [[] for _ in range(n_blocks)]
+        for b in range(n_blocks):
+            for s in succ[b]:
+                if 0 <= s < n_blocks:
+                    preds[s].append(b)
+        for n, blk in enumerate(blocks):
+            if not blk:
+                continue
+            extras = []
+            for p in preds[n]:
+                pblk = blocks[p]
+                if pblk and writes_exec(pblk[-1]):
+                    extras.append(self.exec_state_at[id(pblk[-1])])
+            if not extras:
+                continue
+            for r in self.lane_masks.get(id(blk[0]), {}):
+                lst = self.mask_exec_sigs.setdefault(r, [])
+                for e in extras:
+                    if not lst or lst[-1][2] != e:
+                        lst.append((n, 0, e))
 
     def insns(self, seq):
         """Translate seq, a straight run of instructions (no branch among them). A run of at least MIN_ACTIVE_RUN
@@ -6245,6 +6763,17 @@ class Gen:
         self.ever_mask = {r for m in self.lane_masks.values() for r in m if isinstance(r, int)}
         slots = lane_masks.parked(blocks[0], self.lane_masks)
         self.parked = {slot: self.SGPRS + i for i, slot in enumerate(slots)}
+        self.mark_exec_state(blocks[0], blocks[1])
+        # Instructions whose lane-mask data read will gather the wave's mask word (src_u's
+        # lane_mask_word path, gated by mask_word_read_ok) are cross-lane exchanges for the
+        # wave64-emulation planner: it must not fold them into a lane-local region or schedule
+        # a barrier beside them (wave64_emulate_opt checks ins["mask_words"]).
+        for blk in blocks[0]:
+            for ins in blk:
+                words = tuple(i for i, x in enumerate(ins["args"])
+                              if i and self._mask_data_operand(x, self.lane_masks.get(id(ins), {}), ins))
+                if words:
+                    ins["mask_words"] = words
 
     def mask_half(self, a):
         """For a 32-bit lane-mask operand in wave64, return 'lo' (lanes 0-31), 'hi' (lanes 32-63), or None."""
