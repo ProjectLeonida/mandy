@@ -10874,7 +10874,10 @@ class Gen:
                     self.emit(f"{conv} = OpBitcast %uint {ci}")
                 else:
                     self.emit(f"{conv} = OpConvertFToU %uint {cl}")
-                self.emit(f"{lo} = OpBitwiseAnd %uint {conv} {self.cu(0xFFFF)}")
+                # BitFieldUExtract, not And & 0xFFFF: the signed form's conv is a Bitcast of an %int
+                # ConvertFToS, and NVIDIA's shader compiler miscompiles that And feeding the
+                # preserve-high-half merge (same workaround as the VOP3 16-bit integer ops).
+                self.emit(f"{lo} = OpBitFieldUExtract %uint {conv} {self.cu(0)} {self.cu(16)}")
                 if not dhi:
                     self.write_lo16(a[0], lo)
                 else:
@@ -10934,7 +10937,8 @@ class Gen:
                 self.emit(f"{conv} = OpBitcast %uint {ci}")
             else:
                 self.emit(f"{conv} = OpConvertFToU %uint {rn}")
-            self.emit(f"{lo} = OpBitwiseAnd %uint {conv} {self.cu(0xFFFF)}")
+            # Same NVIDIA And-&-0xFFFF workaround as v_cvt_i16_f16 above.
+            self.emit(f"{lo} = OpBitFieldUExtract %uint {conv} {self.cu(0)} {self.cu(16)}")
             if not dhi:
                 self.write_lo16(a[0], lo)
             else:
@@ -14011,7 +14015,9 @@ class Gen:
             self.emit(f"{clamped} = OpExtInst %int %glsl SClamp {value} {self.as_int(self.cu(0xFFFF8000))} "
                       f"{self.as_int(self.cu(0x7FFF))}")
             self.emit(f"{raw} = OpBitcast %uint {clamped}")
-            self.emit(f"{half} = OpBitwiseAnd %uint {raw} {self.cu(0xFFFF)}")
+            # BitFieldUExtract, not And & 0xFFFF: raw is a Bitcast of an %int SClamp and the result
+            # reaches preserve-high-half merges (d16 image/buffer stores); NVIDIA miscompiles the And.
+            self.emit(f"{half} = OpBitFieldUExtract %uint {raw} {self.cu(0)} {self.cu(16)}")
         else:
             self.emit(f"{half} = OpExtInst %uint %glsl UMin {bits} {self.cu(0xFFFF)}")
         return half
