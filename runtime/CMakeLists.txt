@@ -2104,6 +2104,29 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(d3d12_r9g9b9e5_uav_test PRIVATE
         LEONIDA_TEST_CS_R9G9B9E5_UAV_SPV="${LEONIDA_TEST_CS_R9G9B9E5_UAV}")
     endif()
+    # D3D-RGB9E5-UINT-ALIAS-VIEW: on the title's device (behind the Xbox-ABI proxy) R32_UINT and R9G9B9E5_SHAREDEXP
+    # UAV textures take SRVs in each other's format; compute stores packed words through an R32_UINT UAV and a second
+    # dispatch samples them through an R9G9B9E5 SRV of the same texture. A device without the proxy keeps refusing.
+    add_executable(d3d12_rgb9e5_alias_view_test test/d3d12_rgb9e5_alias_view_test.cpp)
+    target_link_libraries(d3d12_rgb9e5_alias_view_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_rgb9e5_alias_view_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_rgb9e5_alias_view_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_rgb9e5_alias_view COMMAND d3d12_rgb9e5_alias_view_test)
+    set_tests_properties(d3d12_rgb9e5_alias_view PROPERTIES SKIP_RETURN_CODE 77)
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      # The same store-then-sample shader as d3d12_r9g9b9e5_uav_test, compiled to an output of this test's own.
+      set(LEONIDA_TEST_CS_RGB9E5_ALIAS ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_rgb9e5_alias_view.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_CS_RGB9E5_ALIAS}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_RGB9E5_ALIAS}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_r9g9b9e5_uav.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_r9g9b9e5_uav.comp
+        COMMENT "Compiling cs_r9g9b9e5_uav.comp for d3d12_rgb9e5_alias_view_test"
+        VERBATIM)
+      target_sources(d3d12_rgb9e5_alias_view_test PRIVATE ${LEONIDA_TEST_CS_RGB9E5_ALIAS})
+      target_compile_definitions(d3d12_rgb9e5_alias_view_test PRIVATE
+        LEONIDA_TEST_CS_RGB9E5_ALIAS_SPV="${LEONIDA_TEST_CS_RGB9E5_ALIAS}")
+    endif()
 
     # Debug markers as VK_EXT_debug_utils labels, and private data on every object (D3D-24).
     add_executable(d3d12_debug_markers_test test/d3d12_debug_markers_test.cpp)

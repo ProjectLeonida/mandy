@@ -243,6 +243,10 @@ struct Format {
     VkFormat uint_backed = VK_FORMAT_UNDEFINED;
     // A 96-bit R32G32B32 format, held in the R32G32B32A32 image `format` names (ResourceBinding::rgb96).
     bool rgb96 = false;
+    // A texture of the title's whose shader-resource views may also take the other format of the R32_UINT /
+    // R9G9B9E5_SHAREDEXP pair (DeviceState::rgb9e5_alias): E5B9G9R9 for an R32_UINT texture, R32_UINT for an
+    // R9G9B9E5 one. Its image is mutable and lists both. UNDEFINED for every other texture.
+    VkFormat alias = VK_FORMAT_UNDEFINED;
 };
 
 // 96-bit textures are always RGBA32 images, even where the GPU has an RGB32 one (most have none with optimal
@@ -526,6 +530,15 @@ struct TextureCreateInfo {
             format_list.viewFormatCount = 2;
             format_list.pViewFormats = view_formats.data();
             info.pNext = &format_list;
+        } else if (format.alias) {
+            // R32_UINT and E5B9G9R9_UFLOAT_PACK32 are both in Vulkan's 32-bit compatibility class, so one mutable
+            // image takes views of both. Its own format keeps every usage; a view in the other one restricts itself
+            // to SAMPLED_BIT (bind_image). An R32_UINT-backed R9G9B9E5 UAV texture (above) already lists the pair.
+            info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            view_formats = {format.format, format.alias};
+            format_list.viewFormatCount = 2;
+            format_list.pViewFormats = view_formats.data();
+            info.pNext = &format_list;
         }
     }
 
@@ -641,6 +654,16 @@ struct DeviceState {
     // GPUs), backed by a mutable image of the UNORM format of the same order. The host runtime makes such textures.
     bool rgba8_srgb_uav_emulated = false;
     bool bgra8_srgb_uav_emulated = false;
+
+    // The title's device: its outer identity is the Xbox-ABI proxy (rt::d3d12::set_device_outer, which
+    // D3D12XboxCreateDevice calls). The console's R32_UINT / R9G9B9E5 views (rgb9e5_alias), which desktop D3D12
+    // refuses, are made on it only; a device without the proxy (create_vulkan_device alone, as the PC tests and the
+    // WARP parity comparisons use it) keeps the PC rule.
+    bool title_device = false;
+    // Whether the GPU makes the mutable images rgb9e5_alias asks for: an R32_UINT one listing E5B9G9R9_UFLOAT_PACK32,
+    // and an E5B9G9R9 one (R9G9B9E5 UAV textures with native storage) listing R32_UINT. Read once at device creation.
+    bool rgb9e5_alias_uint = false;
+    bool rgb9e5_alias_e5 = false;
 
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
@@ -864,6 +887,50 @@ struct DeviceState {
         return image_format_properties2(info.physical, &query, &props) == VK_SUCCESS;
     }
 
+    // Whether a mutable `image` image with the usages a UAV texture gets (TextureCreateInfo) can list `view` too, and
+    // `view` can be sampled: what rgb9e5_alias needs for the pair.
+    bool probe_alias_pair(VkFormat image, VkFormat view) const {
+        if (!image_format_properties2 || !storage_usable(image) || !sampled_usable(image) || !sampled_usable(view))
+            return false;
+        const VkFormat view_formats[2] = {image, view};
+        VkImageFormatListCreateInfo list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+        list.viewFormatCount = 2;
+        list.pViewFormats = view_formats;
+        VkPhysicalDeviceImageFormatInfo2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, &list};
+        query.format = image;
+        query.type = VK_IMAGE_TYPE_2D;
+        query.tiling = VK_IMAGE_TILING_OPTIMAL;
+        query.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (color_attachment_usable(image)) query.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        query.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        VkImageFormatProperties2 props{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+        return image_format_properties2(info.physical, &query, &props) == VK_SUCCESS;
+    }
+
+    // D3D-RGB9E5-UINT-ALIAS-VIEW. The console title packs light as R9G9B9E5_SHAREDEXP bits into R32_UINT textures
+    // from compute shaders, which cannot store that format, and samples them through R9G9B9E5_SHAREDEXP
+    // shader-resource views of the same texture (sky, probes, bounced light, cloud and sky volumes). The console
+    // allows such a view; desktop D3D12 refuses it, and so does image_descriptor on a PC device. On the title's device
+    // a texture of the pair gets the other format as Format::alias: its image is mutable and lists both, and its SRVs
+    // may name either (image_descriptor). Only textures a shader can write and read (ALLOW_UNORDERED_ACCESS, no
+    // DENY_SHADER_RESOURCE, single-sampled) get it: the packed light is written by compute, and a mutable image may
+    // lose the driver's compression, so every other R32_UINT texture keeps its plain image. The reverse view (R32_UINT
+    // of an R9G9B9E5 UAV texture) costs nothing where the texture is already an R32_UINT-backed image (no E5B9G9R9
+    // storage, as on NVIDIA). UNDEFINED: no alias.
+    VkFormat rgb9e5_alias(const D3D12_RESOURCE_DESC& desc, const Format& format) const {
+        if (!title_device || !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
+            (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) || desc.SampleDesc.Count > 1)
+            return VK_FORMAT_UNDEFINED;
+        if (desc.Format == DXGI_FORMAT_R32_UINT && format.format == VK_FORMAT_R32_UINT && rgb9e5_alias_uint)
+            return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+        if (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP &&
+            (format.uint_backed == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 ||
+             (format.format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && rgb9e5_alias_e5)))
+            return VK_FORMAT_R32_UINT;
+        return VK_FORMAT_UNDEFINED;
+    }
+
     // The limits apply to this exact combination of format, type, tiling, usage, create flags and pNext format list.
     HRESULT check_image_support(const VkImageCreateInfo& create) const {
         VkImageFormatProperties limits{};
@@ -967,8 +1034,17 @@ struct DeviceState {
         return VK_SAMPLE_COUNT_1_BIT;
     }
 
-    // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks included.
+    // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks and the title's R32_UINT /
+    // R9G9B9E5 alias included. Committed and placed creation and GetResourceAllocationInfo all ask here, so the size a
+    // placement is measured with is the size of the image made (reserved textures drop the alias: create_sparse_image).
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
+        Format format = base_texture_format(desc);
+        if (format.format != VK_FORMAT_UNDEFINED) format.alias = rgb9e5_alias(desc, format);
+        return format;
+    }
+
+    // texture_format without the alias.
+    Format base_texture_format(const D3D12_RESOURCE_DESC& desc) const {
         if (!xr_bias_compatible(desc)) return {};
         if (desc.Format == DXGI_FORMAT_A8_UNORM &&
             (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
@@ -1167,9 +1243,11 @@ struct DeviceState {
     // Gives the T# `words` a view in set 0 and an entry in the hash table, unless it has them. `storage`: shaders
     // write through it too (an unordered-access view), so it also goes into the storage arrays, which are
     // shorter. False when set 0 cannot show the image; the descriptor then finds the fallback at index 0.
+    // `alias_format`: the other format of a title texture's R32_UINT / R9G9B9E5 pair (Format::alias), or UNDEFINED.
     bool bind_image(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image, VkImage vk_image,
                     VkFormat image_format, VkImageAspectFlags aspects, bool storage,
-                    bool allow_channel_cast = false, VkFormat uint_backed = VK_FORMAT_UNDEFINED) {
+                    bool allow_channel_cast = false, VkFormat uint_backed = VK_FORMAT_UNDEFINED,
+                    VkFormat alias_format = VK_FORMAT_UNDEFINED) {
         namespace g = leonida::gfx10;
         std::lock_guard lock(descriptor_mutex);
         if (!bindless) return false;
@@ -1201,6 +1279,11 @@ struct DeviceState {
         const VkFormat logical_format = uint_backed ? uint_backed : image_format;
         VkFormat view_format =
             stencil ? image_format : g::vulkan_view_format(logical_format, image.format, allow_channel_cast);
+        // A shader-resource T# in the other format of the pair (image_descriptor made it for SRVs only): R32_UINT has
+        // one channel and E5B9G9R9 three, so no channel-order match exists and the pair is named outright.
+        const bool alias_view = !stencil && !storage && alias_format != VK_FORMAT_UNDEFINED &&
+                                image.format == g::format_from_vulkan(alias_format);
+        if (alias_view) view_format = alias_format;
         VkFormat channels_format = view_format;  // whose channels the T#'s swizzle selects from
         // A B4G4R4A4 render target stored as RGBA8 (no 4444 format renders on this device): a 16-bit view of the
         // 32-bit image is not allowed, so its 4_4_4_4 T# reads the RGBA8 image (which holds the logical R, G, B, A)
@@ -1230,7 +1313,8 @@ struct DeviceState {
         view_info.viewType = g::vulkan_view_type(image.type);
         view_info.format = view_format;
         VkImageViewUsageCreateInfo sampled_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
-        if (uint_backed) {
+        // The image's storage and attachment usages are its own format's; E5B9G9R9 has neither on most GPUs.
+        if (uint_backed || alias_view) {
             sampled_usage.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
             view_info.pNext = &sampled_usage;
         }
@@ -1891,6 +1975,7 @@ public:
     }
     bool has_castable_formats() const { return !castable_formats_.empty(); }
     VkFormat uint_backed() const { return uint_backed_; }  // Format::uint_backed
+    VkFormat alias_format() const { return alias_format_; }  // Format::alias: the title's R32_UINT / R9G9B9E5 pair
     VkImageAspectFlags aspects() const { return aspects_; }
     bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
@@ -2164,7 +2249,11 @@ public:
 
     HRESULT create_sparse_image() {
         auto& vk = device_.context->vk;
-        const auto format = device_.texture_format(desc_);
+        auto format = device_.texture_format(desc_);
+        // A reserved texture keeps the PC rule for R32_UINT / R9G9B9E5 views: sparse residency on a mutable image is
+        // a combination nothing has measured yet, and whether the title packs light into reserved textures is not
+        // known.
+        format.alias = VK_FORMAT_UNDEFINED;
         TextureCreateInfo create(desc_, format, false);
         create.info.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
                              VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
@@ -2251,17 +2340,20 @@ public:
             view_formats_ = castable;
             if (std::find(view_formats_.begin(), view_formats_.end(), format.format) == view_formats_.end())
                 view_formats_.push_back(format.format);
-            if (format.uint_backed) {
-                // An unsigned-backed UAV texture needs both its formats whatever the list names (TextureCreateInfo).
-                for (VkFormat pair : {format.format, format.uint_backed})
-                    if (std::find(view_formats_.begin(), view_formats_.end(), pair) == view_formats_.end())
-                        view_formats_.push_back(pair);
-            }
+            // An unsigned-backed UAV texture needs both its formats whatever the list names, and so does a texture
+            // of the title's R32_UINT / R9G9B9E5 pair (TextureCreateInfo).
+            for (VkFormat pair : {format.uint_backed, format.alias})
+                if (pair && std::find(view_formats_.begin(), view_formats_.end(), pair) == view_formats_.end())
+                    view_formats_.push_back(pair);
             info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
             create.format_list.viewFormatCount = std::uint32_t(view_formats_.size());
             create.format_list.pViewFormats = view_formats_.data();
-            create.format_list.pNext = info.pNext;
-            info.pNext = &create.format_list;
+            // TextureCreateInfo may have chained this same list already (an unsigned-backed or aliased texture):
+            // chaining it again would point it at itself.
+            if (info.pNext != &create.format_list) {
+                create.format_list.pNext = info.pNext;
+                info.pNext = &create.format_list;
+            }
         }
         const std::uint32_t samples = info.samples;
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
@@ -2367,6 +2459,7 @@ public:
         binding.sampled_in_general = device_.bindless != nullptr;
         format_ = format.format;
         uint_backed_ = format.uint_backed;
+        alias_format_ = format.alias;
         aspects_ = format.aspects;
         image_address_ = device_.next_image_address.fetch_add(256);
         binding_ = binding;
@@ -2717,6 +2810,7 @@ private:
     std::vector<VkFormat> view_formats_;  // creation-time castable list; empty means no restriction
     std::vector<DXGI_FORMAT> castable_formats_;  // the same list as the application gave it
     VkFormat uint_backed_ = VK_FORMAT_UNDEFINED;
+    VkFormat alias_format_ = VK_FORMAT_UNDEFINED;  // Format::alias
     std::uint64_t image_address_ = 0;  // what a T# names the texture by
     bool rgb96_ = false;
     VkImageAspectFlags aspects_ = 0;
@@ -4781,9 +4875,9 @@ private:
     std::shared_ptr<ShaderCacheStore> store_;
 };
 
-// The T# of a view: what the shader gets to know about it, in the structure the console's shaders read.
-// False (with a log) for a view set 0 cannot show yet.
-bool image_descriptor(const Resource& resource, const TextureView& view, leonida::gfx10::Image& out) {
+// The T# of a view: what the shader gets to know about it, in the structure the console's shaders read. `storage`:
+// an unordered-access view. False (with a log) for a view set 0 cannot show yet.
+bool image_descriptor(const Resource& resource, const TextureView& view, bool storage, leonida::gfx10::Image& out) {
     namespace g = leonida::gfx10;
     const D3D12_RESOURCE_DESC& desc = resource.desc();
     // Plane 1 of a depth-stencil texture is its stencil, viewed as X24_TYPELESS_G8_UINT (D24S8) or
@@ -4835,7 +4929,13 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     // 4_4_4_4 as on the console, and bind_image views the RGBA8 image with the 4444 view's channels.
     const bool rgba8_4444 = desc.Format == DXGI_FORMAT_B4G4R4A4_UNORM && resource.format() == VK_FORMAT_R8G8B8A8_UNORM;
     if (rgba8_4444) named = VK_FORMAT_A4R4G4B4_UNORM_PACK16;
-    if (volume) {
+    // A shader-resource view of a title texture of the R32_UINT / R9G9B9E5_SHAREDEXP pair in the pair's other format
+    // (Format::alias, DeviceState::rgb9e5_alias): the image is mutable and lists it. Unordered-access views keep the
+    // PC rule: the title stores the packed words through R32_UINT, and most GPUs have no E5B9G9R9 storage.
+    const bool alias_view = !storage && !stencil && resource.alias_format() != VK_FORMAT_UNDEFINED &&
+                            ((desc.Format == DXGI_FORMAT_R32_UINT && view.format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) ||
+                             (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && view.format == DXGI_FORMAT_R32_UINT));
+    if (volume && !alias_view) {
         const bool compatible = vulkan_format(desc.Format, false).typeless
             ? desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS &&
               (view.format == DXGI_FORMAT_R8G8B8A8_UNORM || view.format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
@@ -4881,7 +4981,9 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             log_once("view format from another typeless family (B8G8R8X8 and B8G8R8A8):", int(view.format));
             return false;
         }
-        if ((view.format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) != (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) {
+        // The PC rule, which desktop D3D12 applies; the console lifts it for the title's R32_UINT / R9G9B9E5 pair.
+        if ((view.format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) != (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) &&
+            !alias_view) {
             log_once("incompatible R9G9B9E5 view format:", int(view.format));
             return false;
         }
@@ -4917,6 +5019,8 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         view_format = named;
     } else if (code && rgba8_4444) {
         view_format = resource.format();
+    } else if (code && alias_view) {
+        view_format = named;  // the other format of the pair, which the image lists (R32_UINT has no RGB channels)
     } else if (code) {
         view_format = g::vulkan_view_format(resource_format, code, resource.has_view_format_list());
     }
@@ -5179,6 +5283,8 @@ public:
             state_.probe_uint_backed_uav(VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM);
         state_.bgra8_srgb_uav_emulated =
             state_.probe_uint_backed_uav(VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_B8G8R8A8_UNORM);
+        state_.rgb9e5_alias_uint = state_.probe_alias_pair(VK_FORMAT_R32_UINT, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32);
+        state_.rgb9e5_alias_e5 = state_.probe_alias_pair(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, VK_FORMAT_R32_UINT);
         memory_properties(info.physical, &state_.memory);
         {
             char text[4] = {};
@@ -5673,7 +5779,11 @@ public:
     }
     bool bind_sampler(const leonida::gfx10::SamplerWords& words) { return state_.bind_sampler(words); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
-    void set_outer(IUnknown* outer) { outer_ = outer; }
+    // Set right after creation, before the title calls anything (D3D12XboxCreateDevice); DeviceState::title_device.
+    void set_outer(IUnknown* outer) {
+        outer_ = outer;
+        state_.title_device = rt::d3d12_xs::is_device_proxy(outer);
+    }
 
     UINT STDMETHODCALLTYPE GetNodeCount() override { return 1; }
 
@@ -8631,11 +8741,11 @@ private:
     void write_image_descriptor(const Resource& resource, const TextureView& view,
                                 D3D12_CPU_DESCRIPTOR_HANDLE destination, bool storage) {
         leonida::gfx10::Image image{};
-        if (!image_descriptor(resource, view, image)) return;
+        if (!image_descriptor(resource, view, storage, image)) return;
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
         const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
                                                   resource.aspects(), storage, resource.has_view_format_list(),
-                                                  resource.uint_backed());
+                                                  resource.uint_backed(), resource.alias_format());
         if (registered && resource.sparse_image()) state_.context->note_shader_image(resource.id());
         if (leonida::gfx10::multisampled(image.type) && !registered) return;
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
