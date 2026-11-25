@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <unordered_map>
 
 #define EXPECT(condition)                                                    \
     do {                                                                     \
@@ -39,7 +40,7 @@ PFN_vkAllocateMemory g_allocate = nullptr;
 PFN_vkCreateDescriptorPool g_create_pool = nullptr;
 VkPhysicalDeviceMemoryProperties g_memory{};
 
-enum class Fail { none, device_local, all };
+enum class Fail { none, device_local, all, device_lost };
 Fail g_fail = Fail::none;
 bool g_fail_pools = false;
 unsigned g_allocations = 0, g_pools = 0, g_refused = 0;
@@ -48,6 +49,7 @@ VKAPI_ATTR VkResult VKAPI_CALL allocate_memory(VkDevice device, const VkMemoryAl
                                                const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
     const bool local =
         (g_memory.memoryTypes[info->memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+    if (g_fail == Fail::device_lost) return VK_ERROR_DEVICE_LOST;
     if (g_fail == Fail::all || (g_fail == Fail::device_local && local)) {
         ++g_refused;
         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -66,9 +68,82 @@ VKAPI_ATTR VkResult VKAPI_CALL create_pool(VkDevice device, const VkDescriptorPo
     return g_create_pool(device, info, callbacks, pool);
 }
 
+// What each image descriptor names (by set, binding and element) and which views exist, recorded from the calls the
+// set makes: after a flush that returns true, the current set must not name a view that has been destroyed. The
+// device destroys a removed texture's views right after remove_image, also while flushes keep the old table. A
+// view's serial tells a destroyed view from a later one that got the same handle.
+struct Named {
+    VkImageView view;
+    std::uint64_t serial;
+};
+PFN_vkUpdateDescriptorSets g_update = nullptr;
+PFN_vkAllocateDescriptorSets g_allocate_sets = nullptr;
+PFN_vkCreateImageView g_create_view = nullptr;
+PFN_vkDestroyImageView g_destroy_view = nullptr;
+std::unordered_map<VkDescriptorSet, std::unordered_map<std::uint64_t, Named>> g_named;
+std::unordered_map<VkImageView, std::uint64_t> g_alive;
+std::uint64_t g_serial = 0;
+
+VKAPI_ATTR VkResult VKAPI_CALL create_view_hook(VkDevice device, const VkImageViewCreateInfo* info,
+                                                const VkAllocationCallbacks* callbacks, VkImageView* view) {
+    const VkResult result = g_create_view(device, info, callbacks, view);
+    if (result == VK_SUCCESS) g_alive[*view] = ++g_serial;
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL destroy_view_hook(VkDevice device, VkImageView view, const VkAllocationCallbacks* callbacks) {
+    g_alive.erase(view);
+    g_destroy_view(device, view, callbacks);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL allocate_sets_hook(VkDevice device, const VkDescriptorSetAllocateInfo* info,
+                                                  VkDescriptorSet* sets) {
+    const VkResult result = g_allocate_sets(device, info, sets);
+    if (result == VK_SUCCESS)
+        for (std::uint32_t i = 0; i < info->descriptorSetCount; ++i) g_named[sets[i]].clear();
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL update_sets_hook(VkDevice device, std::uint32_t write_count,
+                                            const VkWriteDescriptorSet* writes, std::uint32_t copy_count,
+                                            const VkCopyDescriptorSet* copies) {
+    for (std::uint32_t i = 0; i < write_count; ++i) {
+        const VkWriteDescriptorSet& write = writes[i];
+        if (write.descriptorType != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
+            write.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+            continue;
+        for (std::uint32_t k = 0; k < write.descriptorCount; ++k) {
+            const VkImageView view = write.pImageInfo[k].imageView;
+            const auto alive = g_alive.find(view);
+            g_named[write.dstSet][(std::uint64_t(write.dstBinding) << 32) | (write.dstArrayElement + k)] = {
+                view, alive == g_alive.end() ? 0 : alive->second};
+        }
+    }
+    g_update(device, write_count, writes, copy_count, copies);
+}
+
+// How many image descriptors of `set` name a view that no longer exists; the first one is printed.
+unsigned dangling(VkDescriptorSet set) {
+    unsigned count = 0;
+    for (const auto& [slot, named] : g_named[set]) {
+        if (!named.view) continue;
+        const auto alive = g_alive.find(named.view);
+        if (alive != g_alive.end() && alive->second == named.serial) continue;
+        if (!count++)
+            std::fprintf(stderr, "vk_bindless_grow: the current set's binding %u element %u names a destroyed view\n",
+                         unsigned(slot >> 32), unsigned(slot & 0xffffffffu));
+    }
+    return count;
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_proc(VkDevice device, const char* name) {
     if (!std::strcmp(name, "vkAllocateMemory")) return reinterpret_cast<PFN_vkVoidFunction>(allocate_memory);
     if (!std::strcmp(name, "vkCreateDescriptorPool")) return reinterpret_cast<PFN_vkVoidFunction>(create_pool);
+    if (!std::strcmp(name, "vkUpdateDescriptorSets")) return reinterpret_cast<PFN_vkVoidFunction>(update_sets_hook);
+    if (!std::strcmp(name, "vkAllocateDescriptorSets"))
+        return reinterpret_cast<PFN_vkVoidFunction>(allocate_sets_hook);
+    if (!std::strcmp(name, "vkCreateImageView")) return reinterpret_cast<PFN_vkVoidFunction>(create_view_hook);
+    if (!std::strcmp(name, "vkDestroyImageView")) return reinterpret_cast<PFN_vkVoidFunction>(destroy_view_hook);
     return g_get(device, name);
 }
 
@@ -98,8 +173,10 @@ int main() {
                          (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
                      !(flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     }
-    const auto create_view = device.fn<PFN_vkCreateImageView>("vkCreateImageView");
-    const auto destroy_view = device.fn<PFN_vkDestroyImageView>("vkDestroyImageView");
+    g_update = device.fn<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets");
+    g_allocate_sets = device.fn<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets");
+    g_create_view = device.fn<PFN_vkCreateImageView>("vkCreateImageView");
+    g_destroy_view = device.fn<PFN_vkDestroyImageView>("vkDestroyImageView");
     const VkImage image = device.image(VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT);
     EXPECT(image);
 
@@ -144,7 +221,7 @@ int main() {
             info.format = VK_FORMAT_R8G8B8A8_UNORM;
             info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             VkImageView view = VK_NULL_HANDLE;
-            return create_view(device.device, &info, nullptr, &view) == VK_SUCCESS ? view : VK_NULL_HANDLE;
+            return create_view_hook(device.device, &info, nullptr, &view) == VK_SUCCESS ? view : VK_NULL_HANDLE;
         };
         const auto add = [&]() -> bool {
             const VkImageView view = make_view();
@@ -161,7 +238,7 @@ int main() {
         const auto remove = [&](const Live& entry) {
             set.erase_key(entry.key);
             set.remove_image(ImageDimension::dim_2d, entry.index);
-            destroy_view(device.device, entry.view, nullptr);
+            destroy_view_hook(device.device, entry.view, nullptr);
         };
 
         // 1. Churn.
@@ -185,7 +262,7 @@ int main() {
             set.insert_key(rebound.key, index);
             EXPECT(set.flush_replaces_table());
             set.remove_image(ImageDimension::dim_2d, rebound.index);
-            destroy_view(device.device, rebound.view, nullptr);
+            destroy_view_hook(device.device, rebound.view, nullptr);
             rebound.index = index;
             rebound.view = view;
             EXPECT(frame());
@@ -255,8 +332,12 @@ int main() {
             set.insert_key(extra.back(), live.back().index);
         }
         EXPECT(set.flush_replaces_table());
+        g_fail = Fail::device_lost;
+        EXPECT(!frame(true) && set.last_failure_result() == VK_ERROR_DEVICE_LOST && !set.last_flush_degraded());
+        g_fail = Fail::all;
         EXPECT(frame(true));
         EXPECT(set.last_flush_degraded() && set.degraded_flushes() == 1);
+        EXPECT(dangling(set.set()) == 0);
         EXPECT(set.last_failure() != nullptr && set.table_buffer_bytes() == bytes);
         EXPECT(set.flush_replaces_table());  // still owed
         // A texture goes while the GPU's table is stale: that table still maps its key to its index, so the index is
@@ -268,12 +349,14 @@ int main() {
         EXPECT(set.free_images(ImageDimension::dim_2d) == free_before);
         EXPECT(frame(true));  // and again: never a failed flush
         EXPECT(set.degraded_flushes() == 2 && set.free_images(ImageDimension::dim_2d) == free_before);
+        EXPECT(dangling(set.set()) == 0);
         EXPECT(add() && live.back().index != gone.index);
         g_fail = Fail::none;
         g_fail_pools = false;
         const std::uint64_t made = set.generations_made();
         EXPECT(frame(true));
         EXPECT(!set.last_flush_degraded() && set.generations_made() == made + 1);
+        EXPECT(dangling(set.set()) == 0);
         EXPECT(set.free_images(ImageDimension::dim_2d) == free_before);  // the held index is back; add() took one
         EXPECT(set.table_buffer_bytes() >= table.size_bytes() && !set.flush_replaces_table());
         std::printf("pressure: %llu host fallbacks, %llu in-place rewrites, %llu degraded flushes (%s), table %zu "
