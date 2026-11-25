@@ -61,6 +61,7 @@ import anim_index  # noqa: E402
 from file_mode import published_mode  # noqa: E402
 import glb_writer  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 import skin_streams  # noqa: E402
 
 SYSTEM = 0x50000000
@@ -618,10 +619,6 @@ def parse_offset(text):
         raise argparse.ArgumentTypeError(f"not an offset: {text!r}") from None
 
 
-def same_path(first, second):
-    return anim_clips.same_output_path(first, second)
-
-
 def export(args):
     started = time.monotonic()
     report = {"archive": os.path.basename(args.archive), "parts": [], "clips": [], "counts": collections.Counter()}
@@ -772,11 +769,11 @@ def main(argv=None):
     outputs = [p for p in (args.out, args.report) if p]
     for o in outputs:
         for i in inputs:
-            if os.path.exists(o) and same_path(i, o):
+            if os.path.exists(o) and same_report_path(i, o):
                 ap.error(f"{o} is an input; refusing to overwrite it")
     if args.report and os.path.isdir(args.report):
         ap.error(f"--report is a directory: {args.report}")
-    if args.out and args.report and same_path(args.out, args.report):
+    if args.out and args.report and same_report_path(args.out, args.report):
         ap.error("the GLB and the report are the same path")
     if args.clip or args.dictionary is not None:
         if args.coverage:
