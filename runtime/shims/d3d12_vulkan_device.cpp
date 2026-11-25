@@ -8771,8 +8771,8 @@ public:
         if (vs_stage.entry && ps_stage.entry && !gs_stage.entry &&
             (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty())) {
             std::string link_error;
-            if (!leonida::link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
-                                          &link_error, device_.f16_half_top_location)) {
+            if (!link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
+                                 &link_error)) {
                 std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
                 return E_FAIL;
             }
@@ -9815,10 +9815,22 @@ private:
         return true;
     }
 
+    bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const leonida::ShaderEntry& vs_entry,
+                         std::vector<std::uint32_t>& ps_words, const leonida::ShaderEntry& ps_entry,
+                         std::string* error) const {
+        return leonida::link_f16_halves(vs_words, vs_entry, ps_words, ps_entry, error,
+                                        device_.f16_half_top_location);
+    }
+
+public:
     bool stage_words(std::vector<std::vector<std::uint32_t>>& words, std::string& why) const {
         const leonida::ShaderLibrary* library = device_.library();
         if (!library) {
             why = "no shader library";
+            return false;
+        }
+        if (sources_.empty()) {
+            why = "not a lazy pipeline";
             return false;
         }
         words.assign(sources_.size(), {});
@@ -9840,7 +9852,7 @@ private:
         }
         if (f16_linked_) {
             if (vs == SIZE_MAX || ps == SIZE_MAX ||
-                !leonida::link_f16_halves(words[vs], *sources_[vs].entry, words[ps], *sources_[ps].entry, &why))
+                !link_f16_halves(words[vs], *sources_[vs].entry, words[ps], *sources_[ps].entry, &why))
                 return false;
         }
         for (std::size_t i = 0; i < sources_.size(); ++i) {
@@ -9863,6 +9875,7 @@ private:
         return true;
     }
 
+private:
     // Built on first use and kept until the PSO is released (replay may call this from any queue).
     VkPipeline variant(std::uint32_t unbound, const char* trigger) {
         std::unique_lock lock(variants_mutex_, std::defer_lock);
@@ -11197,8 +11210,10 @@ public:
                     VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT | VK_SAMPLE_COUNT_16_BIT;
                 state_.no_output_sample_counts =
                     static_cast<UINT>(props.limits.framebufferNoAttachmentsSampleCounts & kD3D12SampleCounts);
-                state_.f16_half_top_location = leonida::f16_half_top_location(
-                    props.limits.maxVertexOutputComponents, props.limits.maxFragmentInputComponents);
+                state_.f16_half_top_location = info.f16_half_top_location != 0
+                    ? info.f16_half_top_location
+                    : leonida::f16_half_top_location(
+                          props.limits.maxVertexOutputComponents, props.limits.maxFragmentInputComponents);
             }
             if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"))) {
@@ -17570,6 +17585,16 @@ std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
     return p && (p->compute() || p->graphics()) ? &p->subgroup_requests() : nullptr;
+}
+
+bool pipeline_stage_words(ID3D12PipelineState* pipeline, std::vector<std::vector<std::uint32_t>>& words,
+                          std::string& why) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    if (!p) {
+        why = "not a PipelineState";
+        return false;
+    }
+    return p->stage_words(words, why);
 }
 
 long live_pipeline_states() { return live_pipeline_state_count.load(); }

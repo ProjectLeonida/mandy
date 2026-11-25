@@ -1688,6 +1688,7 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET dstorage_test)
     add_test(NAME dstorage COMMAND dstorage_test)
+    set_tests_properties(dstorage PROPERTIES TIMEOUT 120)
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
@@ -3628,7 +3629,7 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(dxgi_host_parity_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(dxgi_host_parity_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME dxgi_host_parity COMMAND dxgi_host_parity_test)
-    set_tests_properties(dxgi_host_parity PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(dxgi_host_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
     # Host-parity test for DXGI waitable swap chain frame-latency semaphore behavior.
     add_executable(dxgi_waitable_latency_test test/dxgi_waitable_latency_test.cpp)
@@ -3637,7 +3638,7 @@ if(TARGET Vulkan::Headers)
     target_compile_options(dxgi_waitable_latency_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME dxgi_waitable_latency COMMAND dxgi_waitable_latency_test)
     set_tests_properties(dxgi_waitable_latency PROPERTIES
-      SKIP_RETURN_CODE 77
+      SKIP_RETURN_CODE 77 TIMEOUT 120
       FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
     # Synthetic (no GPU): VulkanSwapchain's DXGI BufferCount contract when Vulkan returns more images than the

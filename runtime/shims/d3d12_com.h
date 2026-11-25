@@ -112,6 +112,8 @@ struct VulkanDeviceInfo {
     bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted enabled on this device.
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
+    // Top location for relocated f16 halves (0: read from device limits; non-zero: override for testing low-limit devices).
+    std::uint32_t f16_half_top_location = 0;
     // maxBufferSize and maxMemoryAllocationSize, which cap the GPU address arena (src/arena_size.h). 0: read from
     // the physical device when the D3D12 device is created; a test sets smaller ones to simulate a device.
     VkDeviceSize max_buffer_size = 0;
@@ -576,6 +578,9 @@ std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
 // What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
+// The linked SPIR-V stage modules for a lazy pipeline (in recipe stages order); false when not a lazy pipeline.
+bool pipeline_stage_words(ID3D12PipelineState* pipeline, std::vector<std::vector<std::uint32_t>>& words,
+                          std::string& why);
 // PSOs of any Vulkan device not yet deleted, counting one whose deletion waits for its running build (tests).
 long live_pipeline_states();
 
