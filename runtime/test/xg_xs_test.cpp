@@ -415,6 +415,62 @@ int main() {
         for (unsigned pass = 0; pass < 3; ++pass) poll([] { return true; });
         check(polled == std::vector<int>{4}, "an expired wall budget advances past priority entries to the next texture");
 
+        // LEONIDA_TITLE_EVERY_BUDGET_US: the marked textures (mapped or stale) are visited from a cursor of their own
+        // until the budget runs out; the unmarked ones are the round robin's and are skipped here.
+        {
+            Entry m1{true, false, 11}, u1{false, false, 12}, s1{false, true, 13}, m2{true, false, 14};
+            Entry u2{false, false, 15}, s2{false, true, 16};
+            std::map<std::uint64_t, Entry*> marked{{100, &m1}, {200, &u1}, {300, &s1}, {400, &m2}, {500, &u2}};
+            std::uint64_t every = 0;
+            std::vector<int> seen;
+            std::vector<int> urgent_ids;  // stands for "mapped and never filled"
+            const auto is_urgent = [&](const Entry& t) {
+                return std::find(urgent_ids.begin(), urgent_ids.end(), t.id) != urgent_ids.end();
+            };
+            const auto visit_marked = [&](auto exhausted) {
+                const auto snapshot = leonida::title_texture_snapshot(marked);
+                leonida::visit_marked_title_textures(
+                    snapshot, every,
+                    [&](Entry& t) {
+                        seen.push_back(t.id);
+                        urgent_ids.erase(std::remove(urgent_ids.begin(), urgent_ids.end(), t.id), urgent_ids.end());
+                    },
+                    is_urgent, exhausted);
+            };
+            visit_marked([] { return false; });
+            check(seen == std::vector<int>{11, 13, 14}, "without a limit every marked texture is visited once, in order");
+            seen.clear();
+            for (unsigned pass = 0; pass < 4; ++pass) visit_marked([] { return true; });
+            check(seen == std::vector<int>{11, 13, 14, 11},
+                  "a budget spent after each visit moves one marked texture a pass and wraps");
+            seen.clear();
+            marked.erase(300);
+            marked[350] = &s2;
+            visit_marked([&] { return seen.size() == 2; });
+            check(seen == std::vector<int>{16, 14}, "the cursor survives an erased entry and reaches a new stale one");
+            seen.clear();
+            visit_marked([] { return true; });
+            check(seen == std::vector<int>{11}, "the pass after resumes past the last visited entry");
+            // The cursor now points past 100 (m1). Mark m2 (at 400) urgent, as a mapped texture never filled: it is
+            // visited first whatever the budget, and once filled (no longer urgent) it is not visited a second time
+            // in the same pass's rotation.
+            seen.clear();
+            urgent_ids = {14};
+            visit_marked([] { return true; });
+            check(seen == std::vector<int>{14, 16}, "an urgent texture is visited first, then one rotation step");
+            seen.clear();
+            urgent_ids = {14};
+            visit_marked([] { return false; });
+            check(seen == std::vector<int>{14, 11, 16},
+                  "with no limit an urgent texture is still visited once, not again in the rotation");
+            seen.clear();
+            const std::vector<std::pair<std::uint64_t, Entry*>> none;
+            leonida::visit_marked_title_textures(
+                none, every, [&](Entry& t) { seen.push_back(t.id); }, [](const Entry&) { return true; },
+                [] { return false; });
+            check(seen.empty(), "an empty registry visits nothing");
+        }
+
         // A fill made during a pass submits, and that submission destroys a retired image whose destructor erases its
         // registry entry; the registry mutex is recursive for its owner on Windows, so the erase lands inside the pass.
         // A walk over a snapshot keeps every entry of the pass alive and in order, which a walk over the registry

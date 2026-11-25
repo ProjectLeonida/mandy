@@ -12473,11 +12473,29 @@ public:
         }
         const auto every_start = clock::now();
         stats.written_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(every_start - now).count();
-        for (const auto& entry : entries)
-            if (entry.second->mapped || entry.second->stale) {
-                ++stats.every_pass_visits;
-                visit(*entry.second);
-            }
+        // LEONIDA_TITLE_EVERY_BUDGET_US (0, the default: no limit, as before): the mapped and stale textures are
+        // visited for at most this long a pass, in address order from where the last pass stopped, instead of all of
+        // them every pass (thousands during a streaming burst on retail, 30-75 ms a pass). The texture that crosses
+        // the limit is finished; one not reached keeps its mark and waits for a later pass.
+        static const std::uint64_t every_budget_us = setting("LEONIDA_TITLE_EVERY_BUDGET_US", 0);
+        if (!every_budget_us) {
+            for (const auto& entry : entries)
+                if (entry.second->mapped || entry.second->stale) {
+                    ++stats.every_pass_visits;
+                    visit(*entry.second);
+                }
+        } else {
+            leonida::visit_marked_title_textures(
+                entries, title_every_cursor_,
+                [&](TitleTexture& t) {
+                    ++stats.every_pass_visits;
+                    visit(t);
+                },
+                // A mapped texture never filled yet does not wait for its turn: the title has written it and the GPU
+                // has nothing of it (a video plane of #1827 would show frozen until its turn came).
+                [](const TitleTexture& t) { return t.mapped && !t.fills; },
+                [&] { return clock::now() - every_start >= std::chrono::microseconds(every_budget_us); });
+        }
         if (TitleTexture* t = next_rolling ? next_rolling : first_rolling) {
             title_rolling_cursor_ = t->address + 1;
             const auto start = clock::now();
@@ -12485,7 +12503,8 @@ public:
             stats.hash_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
         }
         stats.every_pass_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - every_start).count();
-        // The budget is the round robin's: mapped and stale textures above are checked every pass whatever it is.
+        // The budget is the round robin's: mapped and stale textures above are checked every pass whatever it is
+        // (unless LEONIDA_TITLE_EVERY_BUDGET_US limits them).
         const auto first_bytes = checked, first_hash_ns = stats.hash_ns;
         if (check_budget) {
             const auto sweep_start = clock::now();
@@ -12772,6 +12791,8 @@ private:
         geometry_refresher_->wake.notify_one();
     }
     std::uint64_t title_refresh_cursor_ = 0;                       // under title_texture_mutex
+    std::uint64_t title_rolling_cursor_ = 0;                       // likewise
+    std::uint64_t title_every_cursor_ = 0;                         // likewise: LEONIDA_TITLE_EVERY_BUDGET_US's resume point
     std::uint64_t title_rolling_cursor_ = 0;                       // likewise
     std::uint64_t title_map_generation_ = 0;                       // likewise: the map changes the passes have seen
     std::chrono::steady_clock::time_point title_retry_all_{};      // likewise
