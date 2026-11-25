@@ -44,6 +44,7 @@
 #include "../src/vulkan_mesh_limits.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
+#include "../src/compile_status.h"
 #include "../src/pipeline_cache_file.h"
 #include "../src/pipeline_profile.h"
 #include "../src/submit_phases.h"
@@ -2187,6 +2188,7 @@ UnboundTsharpTracker& unbound_tsharp_tracker() {
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
 class Resource;
 struct DeviceState {
+    leonida::CompileStatus compile_status;
     std::mutex mapped_texture_mutex;
     std::set<Resource*> mapped_textures;
     std::atomic<unsigned> map_count{};
@@ -10462,7 +10464,9 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
             // VK_PIPELINE_COMPILE_REQUIRED (a success code, no pipeline) when the shared cache does not have it.
             pipeline_info.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
             const ULONGLONG asked = GetTickCount64();
-            created = vk.vkCreateComputePipelines(dev, shared, 1, &pipeline_info, nullptr, &built);
+            created = device_.compile_status.track(entry->name, [&] {
+                return vk.vkCreateComputePipelines(dev, shared, 1, &pipeline_info, nullptr, &built);
+            });
             probe_ms = GetTickCount64() - asked;
             pipeline_info.flags &= ~VkPipelineCreateFlags(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT);
             from_shared = created == VK_SUCCESS && built;
@@ -10477,7 +10481,9 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
         }
         if (!from_shared) {
             const ULONGLONG at = GetTickCount64();
-            created = vk.vkCreateComputePipelines(dev, cache, 1, &pipeline_info, nullptr, &built);
+            created = device_.compile_status.track(entry->name, [&] {
+                return vk.vkCreateComputePipelines(dev, cache, 1, &pipeline_info, nullptr, &built);
+            });
             driver_ms = GetTickCount64() - at;
         }
         compiling.name.store(nullptr, std::memory_order_release);
@@ -12068,7 +12074,9 @@ private:
         const leonida::dev_status::Build dev_build(r.mesh ? "mesh pipeline" : "graphics pipeline");
         const leonida::pipeline_profile::DriverCall profile(r.mesh ? "ms" : "vs", lazy_ ? "lazy" : "eager",
                                                          program, fragment, unbound);
-        const auto result = device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1, &info, nullptr, &pipeline);
+        const auto result = device_.compile_status.track([&] {
+            return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1, &info, nullptr, &pipeline);
+        });
         if (status) *status = result;
         profile.finish(int(result));
         trace.end(trigger, profile_shaders_.c_str(), unbound, bytes, result);
