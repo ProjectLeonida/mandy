@@ -30,7 +30,14 @@ public:
         return Object::QueryInterface(iid, out);
     }
     HRESULT STDMETHODCALLTYPE GetDevice(REFIID iid, void** out) override { return backing->GetDevice(iid, out); }
+#if defined(__MINGW32__)
+    D3D12_RESOURCE_DESC* STDMETHODCALLTYPE GetDesc(D3D12_RESOURCE_DESC* out) override {
+        if (out) *out = backing->GetDesc();
+        return out;
+    }
+#else
     D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override { return backing->GetDesc(); }
+#endif
     D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return address_; }
     HRESULT STDMETHODCALLTYPE GetHeapProperties(D3D12_HEAP_PROPERTIES* props, D3D12_HEAP_FLAGS* flags) override {
         return backing->GetHeapProperties(props, flags);
@@ -60,6 +67,8 @@ public:
     template<class Create>
     HRESULT create(UINT64 address, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_ALLOCATION_INFO allocation,
                    const D3D12_CLEAR_VALUE* clear, bool opaque_layout, REFIID iid, void** out, Create create_backing) {
+        if (out) *out = nullptr;
+        if (!out) return E_POINTER;
         if (!address || !allocation.Alignment || address % allocation.Alignment || !allocation.SizeInBytes ||
             allocation.SizeInBytes > UINT64_MAX - address)
             return E_INVALIDARG;
@@ -114,6 +123,19 @@ public:
         }
     }
 
+    void clear() {
+        std::lock_guard lock(mutex_);
+        ranges_.clear();
+    }
+    std::size_t size() const {
+        std::lock_guard lock(mutex_);
+        return ranges_.size();
+    }
+    bool empty() const {
+        std::lock_guard lock(mutex_);
+        return ranges_.empty();
+    }
+
 private:
     // Dimension, mip/sample counts and layout are fixed by the slot handler. The effective alignment and byte
     // interval have already been validated. All remaining usage and image geometry must match for data inheritance.
@@ -135,7 +157,7 @@ private:
         std::weak_ptr<ID3D12Resource> backing;
         bool opaque_layout;
     };
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::multimap<UINT64, Range> ranges_;
 };
 
