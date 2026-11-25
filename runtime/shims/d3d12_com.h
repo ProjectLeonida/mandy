@@ -32,6 +32,7 @@
 
 #include "../src/root_signature.h"
 #include "../src/subgroup_size.h"
+#include "../src/vulkan_memory_budget.h"
 
 namespace leonida {
 class VulkanPresenter;
@@ -255,6 +256,9 @@ struct VulkanDeviceInfo {
     bool draw_indirect_count_enabled = false;
     // Both VK_KHR_maintenance5 and robustBufferAccess2 (with core robustBufferAccess) are enabled.
     bool robust_index_view = false;
+    // VK_EXT_memory_budget is enabled on `device`: vulkan_vram_budget reads the GPU memory in use and the budget
+    // from it (the title HUD's VRAM figure). Without it that figure is not available.
+    bool memory_budget = false;
     std::uint32_t max_draw_indirect_count = 1;
 };
 
@@ -300,6 +304,10 @@ leonida::ResourceId uav_image_resource(ID3D12Resource* resource, std::uint64_t a
 VkBuffer vulkan_buffer(ID3D12Resource* resource);
 // What a device from create_vulkan_device* was created with (enabled features included), or null. For tests.
 const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device);
+// The GPU memory a device from create_vulkan_device* (or its Xbox-ABI proxy) uses and may use, from
+// VK_EXT_memory_budget, read now (src/vulkan_memory_budget.h). Not available without the extension or the device.
+// Any thread: the title HUD calls it from its own, at most once per refresh.
+leonida::VramBudget vulkan_vram_budget(ID3D12Device* device);
 // The device's pipeline workers (src/pipeline_workers.h) and what they have compiled; zeros without any. For tests.
 leonida::PipelineWorkers::Stats pipeline_worker_stats(ID3D12Device* device);
 // True when a slot-133 buffer is a shadow copied from the title's pages, false when they were imported. For tests.

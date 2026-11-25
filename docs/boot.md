@@ -122,8 +122,12 @@ Useful switches:
   (`runtime/shims/title_hud.h`). It updates twice a second with:
   - the frame rate and the average and worst frame time from PresentX, or, when no frame came in that half
     second, how long since the last one (a hang reads "0 fps, no frame for 12.5 s");
-  - the process's private memory and working set;
-  - its local GPU memory against the DXGI budget, and its shared GPU memory;
+  - the process's private memory (its commit charge; Wine fills only `PagefileUsage`, which is the same figure)
+    and working set;
+  - its GPU memory: in use and the budget over the device-local heaps, and in use in the other heaps, read from
+    the Vulkan device through `VK_EXT_memory_budget`. Without that extension it falls back to DXGI's
+    `QueryVideoMemoryInfo`, which reads 0 under Wine; with neither the field reads `VRAM n/a`, not a false 0.
+    Both memory figures and their text come from `runtime/src/memory_figures.h`, which the dev overlay shows too;
   - the graphics and compute pipelines created, and the seconds spent in `vkCreate*Pipelines` in the last half
     second. A pipeline compiled in the frame shows up there as a hitch. This needs `LEONIDA_MEM_PROBE`; without it
     the field reads `PSO -`.
@@ -133,7 +137,9 @@ Useful switches:
 * `LEONIDA_DEV_OVERLAY=1` (Windows) shows what the runtime is doing in a small click-through window over the top left
   corner of the title's window, while that window is in front (`runtime/src/dev_overlay.h`): frames and submissions a
   second, where a submission's CPU time goes, the phase that is running now and for how long, pipeline builds in
-  flight, indirect draws emitted and skipped, cores, memory. The figures cover the last two seconds. It has its own
+  flight, indirect draws emitted and skipped, cores, free RAM, and the same private memory and GPU memory figures as
+  `LEONIDA_TITLE_HUD` (`VRAM n/a` without `VK_EXT_memory_budget`). The device publishes its GPU memory figure, and
+  the overlay and the HUD read it at most once per half second. The rates cover the last two seconds. It has its own
   thread, so it also counts while the title presents nothing, and it is in no capture. `LEONIDA_TITLE_HUD` shows frame
   times and compile times in the title bar instead; both can be on.
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their

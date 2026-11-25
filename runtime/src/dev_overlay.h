@@ -3,11 +3,13 @@
 // window that says how the boot is doing: frames and submissions a second, where a submission's CPU time goes and which
 // phase runs now, pipeline builds, indirect draws, CPU, memory. It is its own window with its own thread and GDI text,
 // so it keeps counting while the title shows no frames for seconds (pipeline builds, a stalled submission), it is in no
-// captured frame, and it changes nothing the GPU does. It only reads counters: submit_phases.h, indirect_draw_stats.h
-// and dev_status.h. LEONIDA_TITLE_HUD (shims/title_hud.h) is the other view: frame times, memory and compile time in the
+// captured frame, and it changes nothing the GPU does. It only reads counters: submit_phases.h, indirect_draw_stats.h,
+// dev_status.h, and memory_figures.h for the private memory and the device's GPU memory, which LEONIDA_TITLE_HUD
+// (shims/title_hud.h) shows with the same text. The HUD is the other view: frame times, memory and compile time in the
 // window's title bar.
 #include "dev_status.h"
 #include "indirect_draw_stats.h"
+#include "memory_figures.h"
 #include "submit_phases.h"
 
 #ifdef _WIN32
@@ -50,7 +52,9 @@ struct Sample {
     std::uint64_t built = 0;
     std::string build;                                  // the last one started
     unsigned long long drawn = 0, skipped = 0;          // indirect draws so far
-    double cores = 0, process_gb = 0, free_gb = 0;
+    double cores = 0, free_gb = 0;
+    memory_figures::ProcessMemory ram;                  // private memory and working set
+    VramBudget vram;                                    // the device's VK_EXT_memory_budget; "n/a" without it
 };
 
 // The text of one sample: pure, for the test.
@@ -82,8 +86,9 @@ inline std::vector<std::string> lines(const Sample& s, double age) {
     out.emplace_back(text);
     std::snprintf(text, sizeof text, "indirect draws: %llu drawn, %llu skipped", s.drawn, s.skipped);
     out.emplace_back(text);
-    std::snprintf(text, sizeof text, "%.1f cores, %.1f GB used, %.1f GB RAM free", s.cores, s.process_gb, s.free_gb);
+    std::snprintf(text, sizeof text, "%.1f cores, %.1f GB RAM free", s.cores, s.free_gb);
     out.emplace_back(text);
+    out.emplace_back(memory_figures::ram_text(s.ram) + "   " + memory_figures::vram_text(s.vram));
     return out;
 }
 
@@ -206,9 +211,8 @@ private:
             const std::uint64_t used = grown(ticks(kernel) + ticks(user), cpu_);
             if (s.seconds > 0) s.cores = double(used) * 1e-7 / s.seconds;
         }
-        PROCESS_MEMORY_COUNTERS memory{sizeof memory};
-        if (GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof memory))
-            s.process_gb = double(memory.WorkingSetSize) / double(1u << 30);
+        s.ram = memory_figures::process_memory();
+        s.vram = memory_figures::latest_vram();  // reads the device at most once per 500 ms
         MEMORYSTATUSEX status{sizeof status};
         if (GlobalMemoryStatusEx(&status)) s.free_gb = double(status.ullAvailPhys) / double(1u << 30);
         lines_ = lines(s, sp::process_age());
