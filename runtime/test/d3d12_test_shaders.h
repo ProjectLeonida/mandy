@@ -166,9 +166,25 @@ inline D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURC
     return barrier;
 }
 
+// Owns one COM reference. `ref = {}` releases it like reset() does: the assignment a test writes to drop an object
+// mid-test. Without this move assignment that line copied the null pointer over `p` and never called Release, and an
+// object the test meant to free kept the device alive to the end (the slot 133 "leak" of RT-SLOT133-STANDIN-LEAK:
+// VUID-vkDestroyDevice-device-05137 with ~60 objects). Copies are refused: two Refs on one reference release it twice.
 template<class T>
 struct Ref {
     T* p = nullptr;
+    Ref() = default;
+    Ref(const Ref&) = delete;
+    Ref& operator=(const Ref&) = delete;
+    Ref(Ref&& other) noexcept : p(other.p) { other.p = nullptr; }
+    Ref& operator=(Ref&& other) noexcept {
+        if (this != &other) {
+            reset();
+            p = other.p;
+            other.p = nullptr;
+        }
+        return *this;
+    }
     ~Ref() { reset(); }
     void reset() {
         if (p) p->Release();

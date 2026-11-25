@@ -2919,6 +2919,14 @@ if(TARGET Vulkan::Headers)
     add_test(NAME xbox_d16s8_surface COMMAND xbox_d16s8_surface_test)
     set_tests_properties(xbox_d16s8_surface PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20
                          ENVIRONMENT "LEONIDA_CONSOLE_D16S8=native")
+    # Slot 133 textures leave nothing of the device behind once released; validation errors are counted through
+    # vkDestroyDevice, where a device object left alive is reported (run it with LEONIDA_VK_VALIDATION=1).
+    add_executable(xbox_slot133_teardown_test test/xbox_slot133_teardown_test.cpp shims/d3d12_xs_device.cpp
+                   shims/d3d12_xs_pso_stream.cpp)
+    target_link_libraries(xbox_slot133_teardown_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(xbox_slot133_teardown_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_VULKAN_DEVICE)
+    add_test(NAME xbox_slot133_teardown COMMAND xbox_slot133_teardown_test)
+    set_tests_properties(xbox_slot133_teardown PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_executable(xbox_gpu_label_test test/xbox_gpu_label_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp)
     target_link_libraries(xbox_gpu_label_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(xbox_gpu_label_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_VULKAN_DEVICE)
