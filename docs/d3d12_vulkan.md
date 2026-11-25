@@ -1075,6 +1075,36 @@ The compute path, end to end:
     measurements; `emit_ms` measures Vulkan command recording, `gpu_ms` brackets replay after draining the clears,
     and `frame_ms` includes recording, submission, readback and waiting for GPU completion. Those are serialized
     synthetic frame costs, not the game's FPS. Timings have no pass/fail threshold.
+    `--bench-mixed` adds runs of 2/3 draws split by UAV barriers, actual pipeline switches or color/depth target
+    switches, and direct runs interrupted by a single indirect draw. Its mixed case repeats 12 draw commands:
+    2 direct, switch pipeline, 3 direct, switch targets, 2 direct, 1 indirect, 3 direct, barrier, 1 direct;
+    a barrier separates repetitions. Both target pairs are checked against independent pixel/depth expectations.
+    The default correctness run also covers this mixed case. Indirect/mixed cases print `SKIP` on a device
+    without `drawIndirectFirstInstance`; barrier/pipeline/target benchmarks still run. The fixture uses a
+    hand-written triangle and is not evidence of the frequency of compatible runs in a retail workload.
+
+    `LEONIDA_RENDERING_SCOPE_STATS=1` enables aggregate-only scope diagnostics (D3D-REPLAY-SCOPE-METRICS).
+    The default emitter has no per-draw counter updates; a cached environment check selects an instrumented
+    template once per emitted list, including when device-fault checkpoints are enabled. The instrumented
+    emitter accumulates locally and merges once per list under a process-wide lock. Reports appear at 1/2/4/8/...
+    emitted lists and at normal exit if the totals have changed; abnormal termination can leave a partial report.
+    No identities, addresses, shader contents or title text are recorded.
+
+    - `draws` counts non-skipped application draw commands reaching emission, including indirect commands, each
+      counted once irrespective of GPU arguments or quad expansion. `skipped` counts dropped stateful draw
+      commands separately. `indirect` is a subset of `draws`; `eligible` counts direct commands allowed to carry a
+      scope forward (no skip, indirect arguments, helper or statistics segment endpoint).
+    - `scopes` counts application draw rendering scopes, excluding scopes owned by clears and other helpers.
+      `shared_draws = draws - scopes` counts avoided per-draw scope pairs. `max_run` is the largest number of
+      application draw commands in a scope; `runs` bins scopes at 1/2/3/4–7/8–15/16–63/64–255/256+ commands.
+    - `ends` assigns exactly one reason to each closed draw scope. For an ineligible draw the first applicable
+      reason is skipped/indirect/helper/statistics; otherwise pipeline identity precedes attachment/area/layer
+      changes. Non-draw commands use barrier/copy/clear/query/predicate/dispatch/label/other. An isolated indirect
+      or helper draw can end both its preceding run and its own singleton scope, so reasons count scope ends,
+      rather than boundary commands. `list_end` closes any remaining scope.
+    - Totals count CPU replay attempts across all queues, including re-emitted lists and work that later fails
+      to submit or complete. They measure reuse opportunities, not completed GPU draws, frame time or retail FPS.
+      Disable the counters and validation when collecting benchmark timings.
   - **Viewport:** it is flipped (negative height), because translated vertex shaders write D3D clip coordinates;
     front-face winding then matches D3D12's.
   - Only the first viewport and scissor are used, and primitive restart is not modelled yet.

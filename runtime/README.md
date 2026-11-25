@@ -318,6 +318,7 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 
 | variable | default | what it changes |
 |---|---|---|
+| `LEONIDA_RENDERING_SCOPE_STATS` | unset | *Diagnostic.* Exactly `1` enables aggregate draw rendering-scope counters in `src/vulkan_replay.h`: emitted/eligible/indirect/skipped draw commands, scopes, shared draws, run-length histogram and scope-end reasons. Counts are cumulative replay attempts, including repeated lists, rather than completed GPU work or FPS. Reports contain fixed labels and totals only, at powers of two emitted lists and normal exit. See [section 3.2](../docs/d3d12_vulkan.md#32-record-and-replay) for definitions. |
 | `LEONIDA_LAZY_PIPELINES` | on | Graphics pipelines are built at their first draw. `0` builds each at `CreatePipelineState`, as before; the title creates far more pipelines at startup than it draws with. |
 | `LEONIDA_LAZY_COMPUTE` | on | Compute pipelines are built at the first dispatch that names them, or earlier by the warm-up thread. `0` builds each at `CreateComputePipelineState`. |
 | `LEONIDA_COMPUTE_WARMUP_MAX_BYTES` | `1048576` | The largest SPIR-V module, in bytes, the background warm-up thread (`LEONIDA_COMPUTE_WARMUP`) builds ahead of its first dispatch. Larger modules wait for that dispatch. |

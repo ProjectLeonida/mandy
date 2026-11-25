@@ -119,7 +119,7 @@ struct Fixture {
     VkShaderModule vs{}, fs{};
     VkQueryPool timestamps{};
     GraphicsPipeline graphics;
-    ResourceBinding color_binding, depth_binding;
+    ResourceBinding color_binding, depth_binding, argument_binding;
     VkPhysicalDeviceProperties properties{};
     std::uint32_t timestamp_bits = 0;
 
@@ -140,6 +140,13 @@ struct Fixture {
         depth = d.image(depth_format, side, side, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
         readback = d.buffer(pixels * (sizeof(float) * 4 + sizeof(float)), VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mapped);
         if (!color || !depth || !readback || !mapped) return false;
+        void* arguments = nullptr;
+        argument_binding.buffer = d.buffer(sizeof(VkDrawIndirectCommand), VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, &arguments);
+        argument_binding.size = sizeof(VkDrawIndirectCommand);
+        argument_binding.indirect_arguments = true;
+        if (!argument_binding.buffer || !arguments) return false;
+        const VkDrawIndirectCommand triangle{3, 1, 0, 0};
+        std::memcpy(arguments, &triangle, sizeof(triangle));
         const auto view = [&](VkImage image, VkFormat format, VkImageAspectFlags aspects, VkImageView& out) {
             VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             info.image = image;
@@ -259,7 +266,9 @@ struct Fixture {
         FN(set_blend_constants, PFN_vkCmdSetBlendConstants, "vkCmdSetBlendConstants");
         FN(draw, PFN_vkCmdDraw, "vkCmdDraw");
         FN(draw_indexed, PFN_vkCmdDrawIndexed, "vkCmdDrawIndexed");
+        FN(draw_indirect, PFN_vkCmdDrawIndirect, "vkCmdDrawIndirect");
 #undef FN
+        vk.draw_indirect_first_instance = d.enabled.drawIndirectFirstInstance == VK_TRUE;
         vk.begin_rendering = count_begin;
         vk.end_rendering = count_end;
         vk.graphics_pipeline = [&](std::uintptr_t id) { return id == 1 ? &graphics : nullptr; };
@@ -331,21 +340,46 @@ double median(std::vector<double> values) {
     return values[values.size() / 2];
 }
 
-bool run_case(Fixture& f, std::uint32_t count, std::uint32_t run_length, bool benchmark) {
+enum class Workload { barrier, pipeline, target, indirect, mixed };
+constexpr const char* workload_name(Workload workload) {
+    return std::array{"barrier", "pipeline", "target", "indirect", "mixed"}[unsigned(workload)];
+}
+
+bool run_case(Fixture& f, std::uint32_t count, std::uint32_t run_length, bool benchmark,
+              Workload workload = Workload::barrier, Fixture* alternate = nullptr) {
     CommandList list;
-    auto views = std::make_shared<DrawViews>();
-    views->render_target_count = 1;
-    views->render_targets[0] = {1, 0, 0, 1};
-    std::vector<std::array<float, 4>> expected(pixels);
-    std::vector<float> expected_depth(pixels, 1);
+    std::array<std::shared_ptr<DrawViews>, 2> views;
+    for (unsigned target = 0; target < 2; ++target) {
+        views[target] = std::make_shared<DrawViews>();
+        views[target]->render_target_count = 1;
+        views[target]->render_targets[0] = {target ? 4u : 1u, 0, 0, 1};
+    }
+    const bool two_targets = workload == Workload::target || workload == Workload::mixed;
+    std::array expected{std::vector<std::array<float, 4>>(pixels), std::vector<std::array<float, 4>>(pixels)};
+    std::array expected_depth{std::vector<float>(pixels, 1), std::vector<float>(pixels, 1)};
+    unsigned expected_scopes = 0, previous_target = 0, previous_pipeline = 1;
+    bool previous_indirect = false;
     for (std::uint32_t i = 0; i < count; ++i) {
         // A global UAV barrier must finish a rendering scope. Identical barriers in baseline and optimized
         // replay measure short compatible runs as well as the best case where the whole list is compatible.
-        if (run_length && i && i % run_length == 0 && !list.uav_barrier({0})) return false;
+        const bool mixed = workload == Workload::mixed;
+        const unsigned phase = i % 12;
+        const bool barrier = mixed ? i && (phase == 0 || phase == 11) :
+            workload == Workload::barrier && run_length && i && i % run_length == 0;
+        const unsigned pipeline = mixed ? (phase >= 2 && phase <= 10 ? 2 : 1) :
+            workload == Workload::pipeline ? 1 + (i / run_length) % 2 : 1;
+        const unsigned target = mixed ? unsigned(phase >= 5 && phase <= 10) :
+            workload == Workload::target ? (i / run_length) % 2 : 0;
+        const bool indirect = mixed ? phase == 7 :
+            workload == Workload::indirect && i % (run_length + 1) == run_length;
+        if (!i || barrier || pipeline != previous_pipeline || target != previous_target || indirect || previous_indirect)
+            ++expected_scopes;
+        previous_pipeline = pipeline; previous_target = target; previous_indirect = indirect;
+        if (barrier && !list.uav_barrier({0})) return false;
         Draw draw;
-        draw.pipeline = 1;
-        draw.views = views;
-        draw.depth = {2, 0, 0, 1};
+        draw.pipeline = pipeline;
+        draw.views = views[target];
+        draw.depth = {target ? 5u : 2u, 0, 0, 1};
         draw.viewport = {0, 0, float(side), float(side), 0, 1};
         const auto pixel = i * 37 % pixels, x = pixel % side, y = pixel / side;
         draw.scissor = {std::int32_t(x), std::int32_t(y), std::int32_t(x + 1), std::int32_t(y + 1)};
@@ -356,16 +390,32 @@ bool run_case(Fixture& f, std::uint32_t count, std::uint32_t run_length, bool be
         const auto depth = depth_at(i);
         for (unsigned k = 0; k < 4; ++k) draw.user_data[k] = std::bit_cast<std::uint32_t>(color[k]);
         draw.user_data[4] = std::bit_cast<std::uint32_t>(depth);
-        if (!list.draw(std::move(draw))) return false;
-        if (depth <= expected_depth[pixel]) {
-            for (unsigned k = 0; k < 3; ++k) expected[pixel][k] = color[k] * 0.5f + expected[pixel][k] * 0.5f;
-            expected[pixel][3] = 0.5f;
-            expected_depth[pixel] = depth;
+        if (!(indirect ? list.draw_indirect(std::move(draw), {3, 0, sizeof(VkDrawIndirectCommand), 1}) :
+                        list.draw(std::move(draw)))) return false;
+        if (depth <= expected_depth[target][pixel]) {
+            for (unsigned k = 0; k < 3; ++k)
+                expected[target][pixel][k] = color[k] * 0.5f + expected[target][pixel][k] * 0.5f;
+            expected[target][pixel][3] = 0.5f;
+            expected_depth[target][pixel] = depth;
         }
     }
     if (!list.close()) return false;
     auto vk = f.functions();
-    const auto resolve = [&](ResourceId id) { return id == 1 ? &f.color_binding : id == 2 ? &f.depth_binding : nullptr; };
+    vk.graphics_pipeline = [&](std::uintptr_t id) {
+        return id == 1 ? &f.graphics : id == 2 && alternate ? &alternate->graphics : nullptr;
+    };
+    vk.image_view = [&](const ResourceBinding& binding, const VkImageSubresourceRange&) {
+        for (const auto* fixture : {&f, alternate}) {
+            if (!fixture) continue;
+            if (binding.image == fixture->color) return fixture->color_view;
+            if (binding.image == fixture->depth) return fixture->depth_view;
+        }
+        return VkImageView{};
+    };
+    const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
+        return id == 1 ? &f.color_binding : id == 2 ? &f.depth_binding : id == 3 ? &f.argument_binding :
+            id == 4 && alternate ? &alternate->color_binding : id == 5 && alternate ? &alternate->depth_binding : nullptr;
+    };
     PreparedList prepared;
     const auto ready = prepare(list, resolve, vk, prepared);
     if (ready != ReplayResult::success || prepared.draw_count != count) {
@@ -381,6 +431,7 @@ bool run_case(Fixture& f, std::uint32_t count, std::uint32_t run_length, bool be
         const auto start = Clock::now();
         if (!f.d.run([&](VkCommandBuffer cb) {
             f.clear(cb);
+            if (two_targets) alternate->clear(cb);
             if (f.timestamps) {
                 // Finish the common clear/transition work before the interval starts. These execution stages
                 // cover both earlier writes and the following timestamp, independently of the CPU record time.
@@ -395,6 +446,7 @@ bool run_case(Fixture& f, std::uint32_t count, std::uint32_t run_length, bool be
             if (f.timestamps)
                 f.d.fn<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, f.timestamps, 1);
             f.read(cb);
+            if (two_targets) alternate->read(cb);
             return true;
         })) return false;
         const auto frame_time = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
@@ -410,40 +462,43 @@ bool run_case(Fixture& f, std::uint32_t count, std::uint32_t run_length, bool be
                 gpu_ms.push_back(double((values[1] - values[0]) & mask) * f.properties.limits.timestampPeriod / 1e6);
             }
         }
-        const auto* color = static_cast<const float*>(f.mapped);
-        const auto* depth = color + pixels * 4;
-        for (unsigned p = 0; p < pixels; ++p) {
-            for (unsigned k = 0; k < 4; ++k) {
-                if (!std::isfinite(color[p * 4 + k]) || std::abs(color[p * 4 + k] - expected[p][k]) > 1e-6f) {
-                    std::fprintf(stderr, "draws=%u pixel=%u component=%u got=%g expected=%g\n", count, p, k,
-                                 double(color[p * 4 + k]), double(expected[p][k]));
+        for (unsigned target = 0; target < (two_targets ? 2u : 1u); ++target) {
+            const auto* color = static_cast<const float*>(target ? alternate->mapped : f.mapped);
+            const auto* depth = color + pixels * 4;
+            for (unsigned p = 0; p < pixels; ++p) {
+                for (unsigned k = 0; k < 4; ++k) {
+                    if (!std::isfinite(color[p * 4 + k]) || std::abs(color[p * 4 + k] - expected[target][p][k]) > 1e-6f) {
+                        std::fprintf(stderr, "draws=%u target=%u pixel=%u component=%u got=%g expected=%g\n", count, target,
+                                     p, k, double(color[p * 4 + k]), double(expected[target][p][k]));
+                        return false;
+                    }
+                }
+                if (depth[p] != expected_depth[target][p]) {
+                    std::fprintf(stderr, "draws=%u target=%u depth pixel=%u got=%g expected=%g\n", count, target,
+                                 p, double(depth[p]), double(expected_depth[target][p]));
                     return false;
                 }
             }
-            if (depth[p] != expected_depth[p]) {
-                std::fprintf(stderr, "draws=%u depth pixel=%u got=%g expected=%g\n", count, p, double(depth[p]),
-                             double(expected_depth[p]));
-                return false;
-            }
         }
-        const auto expected_scopes = run_length ? (count + run_length - 1) / run_length : 1u;
         if (begins != expected_scopes || ends != begins) ok = false;
     }
-    std::printf("draws=%u run_length=%u scopes=%u/%u pixel-depth-blend=PASS emit_ms=%.4f frame_ms=%.4f gpu_ms=%.4f\n",
-                count, run_length ? run_length : count, begins, ends, median(emit_ms), median(frame_ms),
+    std::printf("draws=%u run_length=%u workload=%s scopes=%u/%u pixel-depth-blend=PASS emit_ms=%.4f frame_ms=%.4f gpu_ms=%.4f\n",
+                count, workload == Workload::mixed ? 0u : run_length ? run_length : count, workload_name(workload),
+                begins, ends, median(emit_ms), median(frame_ms),
                 gpu_ms.empty() ? 0.0 : median(gpu_ms));
     if (!ok) std::fprintf(stderr, "expected %u rendering scope(s), got %u/%u\n",
-                         run_length ? (count + run_length - 1) / run_length : 1u, begins, ends);
+                         expected_scopes, begins, ends);
     return ok;
 }
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc > 2 || (argc == 2 && std::strcmp(argv[1], "--bench"))) {
-        std::fprintf(stderr, "usage: vk_rendering_scope_test [--bench]\n");
+    if (argc > 2 || (argc == 2 && std::strcmp(argv[1], "--bench") && std::strcmp(argv[1], "--bench-mixed"))) {
+        std::fprintf(stderr, "usage: vk_rendering_scope_test [--bench|--bench-mixed]\n");
         return 2;
     }
     vktest::Device device;
+    device.request_draw_indirect_first_instance = true;
     const auto status = device.initialize();
     if (status != vktest::DeviceStatus::ready) return status == vktest::DeviceStatus::unavailable ? 77 : 1;
     VkFormatProperties format{};
@@ -464,10 +519,25 @@ int main(int argc, char** argv) {
     if (!fixture.initialize()) return 1;
     bool ok = run_case(fixture, 4096, 0, false);
     ok = run_case(fixture, 4096, 2048, false) && ok;
-    if (argc == 2) {
+    Fixture alternate{device};
+    if (!alternate.initialize()) return 1;
+    if (device.enabled.drawIndirectFirstInstance) {
+        ok = run_case(fixture, 4096, 0, false, Workload::mixed, &alternate) && ok;
+    } else std::puts("SKIP: indirect/mixed cases require drawIndirectFirstInstance");
+    if (argc == 2 && !std::strcmp(argv[1], "--bench")) {
         for (const auto count : {1000u, 10000u})
             for (const auto run_length : {1u, 4u, 16u, 64u, 0u})
                 ok = run_case(fixture, count, run_length, true) && ok;
+    } else if (argc == 2) {
+        for (const auto count : {1000u, 10000u}) {
+            for (const auto workload : {Workload::barrier, Workload::pipeline, Workload::target, Workload::indirect}) {
+                if (workload == Workload::indirect && !device.enabled.drawIndirectFirstInstance) continue;
+                for (const auto run_length : {2u, 3u})
+                    ok = run_case(fixture, count, run_length, true, workload, &alternate) && ok;
+            }
+            if (device.enabled.drawIndirectFirstInstance)
+                ok = run_case(fixture, count, 0, true, Workload::mixed, &alternate) && ok;
+        }
     }
     return ok && device.validation_errors() == 0 ? 0 : 1;
 }

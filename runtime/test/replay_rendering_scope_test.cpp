@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -252,11 +253,12 @@ struct Fixture {
 
     detail::PreparedDraw& at(std::size_t command) { return prepared.draws[prepared.commands[command].draw]; }
     detail::Prepared& add_command() { return prepared.commands.emplace_back(); }
-    void emit() {
+    void emit(scope_stats::Counts* counts = nullptr) {
         if (!list.closed()) check(list.close(), "list closes");
         check(list.commands().size() == prepared.commands.size(), "prepared commands match the list");
         Recorder::current = &recorder;
-        leonida::emit(prepared, VK_NULL_HANDLE, vk);
+        if (counts) emit_commands_impl<false, true>(prepared, VK_NULL_HANDLE, vk, nullptr, nullptr, nullptr, counts);
+        else leonida::emit(prepared, VK_NULL_HANDLE, vk);
         check(!recorder.rendering && recorder.ends == recorder.scopes.size(), "list ends with all rendering scopes closed");
     }
 };
@@ -396,9 +398,17 @@ void non_draw_boundaries() {
             p.binding = Fixture::attachment(1).binding; p.range = Fixture::attachment(1).range;
             p.clear_format = p.binding.format;
         }
-        f.add_draw(); f.add_draw(); f.emit();
+        f.add_draw(); f.add_draw();
+        scope_stats::Counts counts;
+        f.emit(&counts);
         check(f.recorder.scopes.size() == 2 && f.recorder.draws.size() == 3,
               "barrier, copy, dispatch and image clear each split consecutive draw runs");
+        const auto reason = std::array{scope_stats::End::barrier, scope_stats::End::copy,
+                                      scope_stats::End::dispatch, scope_stats::End::clear}[kind];
+        check(counts.draws == 3 && counts.eligible == 3 && counts.scopes == 2 &&
+              counts.runs[0] == 1 && counts.runs[1] == 1 && counts.ends[unsigned(reason)] == 1 &&
+              counts.ends[unsigned(scope_stats::End::list_end)] == 1,
+              "non-draw boundaries report application scopes and their actual end reasons");
     }
     Fixture rect;
     rect.add_draw();
@@ -407,7 +417,11 @@ void non_draw_boundaries() {
     p.binding = Fixture::attachment(1).binding; p.range = Fixture::attachment(1).range;
     p.view = Fixture::attachment(1).view; p.clear_format = p.binding.format;
     p.rects = {{{{0, 0}, {16, 16}}, 0, 1}};
-    rect.add_draw(); rect.emit();
+    rect.add_draw();
+    scope_stats::Counts rect_counts;
+    rect.emit(&rect_counts);
+    check(rect_counts.draws == 2 && rect_counts.scopes == 2 && rect_counts.runs[0] == 2,
+          "internal rectangle-clear rendering is excluded from draw scope metrics");
     check(actions(rect.recorder) == std::vector<std::string>{"begin", "draw", "end", "begin", "clear_rect", "end", "begin", "draw", "end"},
           "rectangle clears own a separate balanced rendering scope");
 }
@@ -426,7 +440,9 @@ void ineligible_draws() {
         if (kind == 3) p.indirect_clamp.buffer = handle<VkBuffer>(71);
         if (kind == 4) p.statistics_end = 0;
         if (kind == 5) p.statistics_begin = 1;
-        f.add_draw(); f.add_draw(); f.emit();
+        f.add_draw(); f.add_draw();
+        scope_stats::Counts counts;
+        f.emit(&counts);
         check(f.recorder.scopes.size() == (kind == 0 ? 2u : 3u),
               "skipped, indirect, helper and statistics-endpoint draws cannot carry rendering into the next draw");
         auto expected = std::vector<std::string>{"begin", "draw", "end"};
@@ -440,6 +456,13 @@ void ineligible_draws() {
         }
         expected.insert(expected.end(), {"begin", "draw", "draw", "end"});
         check(actions(f.recorder) == expected, "ineligible draw closes before helpers and immediately after its draw");
+        const auto reason = kind == 0 ? scope_stats::End::skipped : kind == 1 ? scope_stats::End::indirect :
+                            kind < 4 ? scope_stats::End::helper : scope_stats::End::statistics;
+        check(counts.draws == (kind == 0 ? 3u : 4u) && counts.skipped == (kind == 0 ? 1u : 0u) &&
+              counts.eligible == 3 && counts.indirect == (kind == 1 ? 1u : 0u) &&
+              counts.scopes == f.recorder.scopes.size() && counts.max_run == 2 &&
+              counts.ends[unsigned(reason)] == (kind == 0 ? 1u : 2u),
+              "ineligible draws count skipped inputs and both scope ends around an isolated draw");
     }
     for (bool mesh : {false, true}) {
         Fixture f;
@@ -463,7 +486,12 @@ void queries_predicates_labels_and_list_end() {
     f.add_draw(); f.add_draw();
     check(f.list.end_query({1, d3d12_query::occlusion, 0}), "query ends"); f.add_command();
     f.prepared.queries.push_back({}); f.prepared.queries.back().command = 4; f.prepared.queries.back().heap = &f.query;
-    f.add_draw(); f.emit();
+    f.add_draw();
+    scope_stats::Counts query_counts;
+    f.emit(&query_counts);
+    check(query_counts.scopes == 3 && query_counts.ends[unsigned(scope_stats::End::query)] == 2 &&
+          query_counts.ends[unsigned(scope_stats::End::list_end)] == 1,
+          "query boundaries have one reason per completed scope");
     check(actions(f.recorder) == std::vector<std::string>{"begin", "draw", "end", "reset_query", "begin_query", "begin", "draw", "draw", "end", "end_query", "begin", "draw", "end"},
           "query commands end rendering before query resets and endpoints");
 
@@ -471,7 +499,11 @@ void queries_predicates_labels_and_list_end() {
     predicate.add_draw();
     check(predicate.list.set_predication({8, 0, d3d12_predication::equal_zero}), "predicate records");
     predicate.add_command().predicate.scratch = handle<VkBuffer>(81);
-    predicate.add_draw(); predicate.add_draw(); predicate.emit();
+    predicate.add_draw(); predicate.add_draw();
+    scope_stats::Counts predicate_counts;
+    predicate.emit(&predicate_counts);
+    check(predicate_counts.ends[unsigned(scope_stats::End::predicate)] == 1 && predicate_counts.scopes == 2,
+          "predicate capture closes the preceding scope before the next run");
     check(actions(predicate.recorder) == std::vector<std::string>{"begin", "draw", "end", "capture_predicate", "begin_predicate", "begin", "draw", "draw", "end", "end_predicate"},
           "predicate capture and final conditional-rendering closure execute outside rendering");
 
@@ -484,6 +516,69 @@ void queries_predicates_labels_and_list_end() {
     check(label.recorder.scopes.size() == 2 && label.recorder.ends == 2,
           "emitting another list never reuses a scope from the previous emit call");
 }
+
+void diagnostics() {
+    Fixture f;
+    constexpr std::array lengths{1u, 2u, 3u, 4u, 7u, 8u, 15u, 16u, 63u, 64u, 255u, 256u};
+    for (unsigned run = 0; run < lengths.size(); ++run) {
+        if (run) { check(f.list.uav_barrier({0}), "histogram barrier records"); f.add_command(); }
+        for (unsigned i = 0; i < lengths[run]; ++i) f.add_draw();
+    }
+    scope_stats::Counts counts;
+    f.emit(&counts);
+    check(counts.lists == 1 && counts.draws == std::accumulate(lengths.begin(), lengths.end(), 0u) &&
+          counts.scopes == lengths.size() && counts.max_run == 256 &&
+          counts.runs == std::array<std::uint64_t, 8>{1, 1, 1, 2, 2, 2, 2, 1},
+          "real emitted runs populate every histogram bucket, including its lower and upper edges");
+    check(std::accumulate(counts.runs.begin(), counts.runs.end(), std::uint64_t{}) == counts.scopes &&
+          std::accumulate(counts.ends.begin(), counts.ends.end(), std::uint64_t{}) == counts.scopes,
+          "every application scope has exactly one histogram bucket and end reason");
+    scope_stats::Counts repeated;
+    f.emit(&repeated);
+    counts.add(repeated);
+    check(counts.lists == 2 && counts.scopes == 24 && counts.max_run == 256 && counts.runs[7] == 2,
+          "replayed lists add counts while preserving the maximum run");
+
+    Fixture switches;
+    switches.add_draw(); switches.add_draw();
+    auto b = switches.add_draw(); switches.at(b).graphics = &switches.other;
+    b = switches.add_draw(); switches.at(b).graphics = &switches.other;
+    switches.at(b).pipeline = handle<VkPipeline>(75);
+    b = switches.add_draw(); switches.at(b).colors[0] = Fixture::attachment(3);
+    b = switches.add_draw(); switches.at(b).colors[0] = Fixture::attachment(3);
+    switches.at(b).area.width = 320;
+    scope_stats::Counts changed;
+    switches.emit(&changed);
+    check(changed.ends[unsigned(scope_stats::End::pipeline)] == 3 &&
+          changed.ends[unsigned(scope_stats::End::attachments)] == 1 && changed.scopes == 5,
+          "pipeline identity takes precedence over attachment changes; extent changes count as attachments");
+
+    Fixture empty;
+    scope_stats::Counts nothing;
+    empty.emit(&nothing);
+    check(nothing.lists == 1 && nothing.draws == 0 && nothing.scopes == 0 && nothing.max_run == 0,
+          "empty lists do not fabricate a zero-length scope");
+
+    Fixture checkpointed;
+    checkpointed.add_draw(); checkpointed.add_draw();
+    check(checkpointed.list.close(), "checkpointed list closes");
+    static unsigned checkpoint_calls;
+    checkpoint_calls = 0;
+    CheckpointSubmission submission;
+    submission.sequence = 1;
+    submission.lists.resize(1);
+    const std::unordered_map<std::uintptr_t, CheckpointShaders> names;
+    const CheckpointRecorder recorder{+[](VkCommandBuffer, const void* marker) {
+        check(marker != nullptr, "each draw retains its device-fault checkpoint"); ++checkpoint_calls;
+    }, submission, names, 0};
+    Recorder::current = &checkpointed.recorder;
+    scope_stats::Counts with_checkpoints;
+    emit_commands_impl<true, true>(checkpointed.prepared, VK_NULL_HANDLE, checkpointed.vk,
+                                   nullptr, nullptr, &recorder, &with_checkpoints);
+    check(checkpoint_calls == 2 && with_checkpoints.draws == 2 && with_checkpoints.scopes == 1 &&
+          checkpointed.recorder.ends == 1 && !checkpointed.recorder.rendering,
+          "scope diagnostics and per-draw device-fault checkpoints work together");
+}
 }
 
 int main() {
@@ -493,6 +588,7 @@ int main() {
     non_draw_boundaries();
     ineligible_draws();
     queries_predicates_labels_and_list_end();
+    diagnostics();
     if (ok) std::puts("replay rendering scopes: PASS (synthetic CPU recording)");
     return ok ? 0 : 1;
 }

@@ -35,6 +35,7 @@
 
 #include "command_list.h"
 #include "indirect_draw_stats.h"
+#include "rendering_scope_stats.h"
 #include "deferred_image_binding.h"
 #include "vulkan_device_fault.h"
 #include "depth24.h"
@@ -4359,9 +4360,10 @@ inline void close_labels(VkCommandBuffer command_buffer, const ReplayFunctions& 
 // `open_labels` counts the debug labels begun and not yet ended in this command buffer: an EndEvent with none open
 // is dropped (Vulkan requires a matching begin), and the caller ends what is still open before it ends the buffer
 // (close_labels). Without it, the list's own events are balanced at its end.
-template<bool Checkpoints>
-inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_buffer, const ReplayFunctions& vk,
-                          LayoutTracker* tracker, std::uint32_t* open_labels, const CheckpointRecorder* checkpoints) {
+template<bool Checkpoints, bool Profile = false>
+inline void emit_commands_impl(const PreparedList& prepared, VkCommandBuffer command_buffer, const ReplayFunctions& vk,
+                              LayoutTracker* tracker, std::uint32_t* open_labels, const CheckpointRecorder* checkpoints,
+                              scope_stats::Counts* collected = nullptr) {
     std::uint32_t own_labels = 0;
     std::uint32_t& labels = open_labels ? *open_labels : own_labels;
     const auto commands = prepared.list->commands();
@@ -4372,10 +4374,16 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
     VkConditionalRenderingBeginInfoEXT predicate{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
     std::size_t next_query = 0;
     const detail::PreparedDraw* rendering_draw = nullptr;
-    const auto end_rendering = [&] {
+    std::uint64_t run_length = 0;
+    if constexpr (Profile) ++collected->lists;
+    const auto end_rendering = [&](scope_stats::End reason = scope_stats::End::list_end) {
         if (rendering_draw) {
             vk.end_rendering(command_buffer);
             rendering_draw = nullptr;
+            if constexpr (Profile) {
+                collected->finish(run_length, reason);
+                run_length = 0;
+            }
         }
     };
     // A dispatch honours conditional rendering and a copy does not (the layer runs copies unpredicated), so the
@@ -4404,10 +4412,45 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             !next_draw->quad_indices.buffer && !p.indirect_clamp.buffer &&
             p.statistics_end == detail::PreparedQuery::no_segment &&
             p.statistics_begin == detail::PreparedQuery::no_segment;
+        scope_stats::End boundary = scope_stats::End::other;
+        if constexpr (Profile) {
+            // The first applicable reason wins. Reasons count scope ends, so an isolated indirect/helper draw
+            // can close both the preceding direct run and its own singleton scope for the same reason.
+            if (next_draw) {
+                if (next_draw->skipped) { ++collected->skipped; boundary = scope_stats::End::skipped; }
+                else {
+                    ++collected->draws;
+                    collected->eligible += keep_rendering;
+                    collected->indirect += raster.arguments != nullptr;
+                    boundary = raster.arguments ? scope_stats::End::indirect :
+                        next_draw->quad_indices.buffer || p.indirect_clamp.buffer ? scope_stats::End::helper :
+                        !keep_rendering ? scope_stats::End::statistics :
+                        rendering_draw && (rendering_draw->graphics != next_draw->graphics ||
+                                           rendering_draw->pipeline != next_draw->pipeline) ? scope_stats::End::pipeline :
+                        scope_stats::End::attachments;
+                }
+            } else if (std::holds_alternative<TransitionBarrier>(command) || std::holds_alternative<UavBarrier>(command) ||
+                       std::holds_alternative<AliasingBarrier>(command) || std::holds_alternative<GlobalBarrier>(command) ||
+                       std::holds_alternative<BufferBarrier>(command) || std::holds_alternative<TextureBarrier>(command))
+                boundary = scope_stats::End::barrier;
+            else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
+                     std::holds_alternative<CopyResource>(command) || std::holds_alternative<AtomicCopyBuffer>(command) ||
+                     std::holds_alternative<ResolveSubresource>(command) ||
+                     std::holds_alternative<CopyAccelerationStructure>(command))
+                boundary = scope_stats::End::copy;
+            else if (std::holds_alternative<ClearRenderTarget>(command) || std::holds_alternative<ClearDepthStencil>(command) ||
+                     std::holds_alternative<ClearUnorderedAccess>(command)) boundary = scope_stats::End::clear;
+            else if (std::holds_alternative<BeginQuery>(command) || std::holds_alternative<EndQuery>(command) ||
+                     std::holds_alternative<ResolveQueries>(command)) boundary = scope_stats::End::query;
+            else if (std::holds_alternative<Predication>(command)) boundary = scope_stats::End::predicate;
+            else if (std::holds_alternative<Dispatch>(command) || std::holds_alternative<ExecuteIndirect>(command))
+                boundary = scope_stats::End::dispatch;
+            else if (std::holds_alternative<DebugMarker>(command)) boundary = scope_stats::End::label;
+        }
         // Close before queries, barriers, copies, predicate changes, helper dispatches and segment resets. Even a
         // dropped draw ends the run: only consecutive compatible direct draws share a scope.
         if (rendering_draw && (!keep_rendering || !detail::same_rendering_scope(*rendering_draw, *next_draw)))
-            end_rendering();
+            end_rendering(boundary);
         if (next_query < prepared.queries.size() && prepared.queries[next_query].command == i) {
             if constexpr (Checkpoints)
                 if (std::holds_alternative<ResolveQueries>(command))
@@ -5195,6 +5238,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             const Draw* draw = raster.state;
             const detail::PreparedDraw& d = prepared.draws[p.draw];
             if (d.skipped) continue;  // could not be resolved in prepare: dropped
+            if constexpr (Profile) ++run_length;
             if constexpr (Checkpoints)
                 checkpoints->record(command_buffer, i, CheckpointKind::draw,
                                     d.pipeline, draw->pipeline);
@@ -5367,13 +5411,25 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             } else {
                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
             }
-            if (!keep_rendering) end_rendering();
+            if (!keep_rendering) end_rendering(boundary);
         }
     }
     end_rendering();
     // Predication does not carry over to the next command list.
     if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
     if (!open_labels) close_labels(command_buffer, vk, own_labels);
+}
+
+template<bool Checkpoints>
+inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_buffer, const ReplayFunctions& vk,
+                          LayoutTracker* tracker, std::uint32_t* open_labels, const CheckpointRecorder* checkpoints) {
+    if (scope_stats::enabled()) {
+        scope_stats::Counts counts;
+        emit_commands_impl<Checkpoints, true>(prepared, command_buffer, vk, tracker, open_labels, checkpoints, &counts);
+        scope_stats::publish(counts);
+    } else {
+        emit_commands_impl<Checkpoints>(prepared, command_buffer, vk, tracker, open_labels, checkpoints);
+    }
 }
 
 inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, const ReplayFunctions& vk,
