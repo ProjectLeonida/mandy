@@ -4,8 +4,9 @@
 //
 // It loses the device on purpose, so it runs only with LEONIDA_AFTERMATH_FAULT_TEST=1; otherwise, without the
 // Aftermath DLL, or without an NVIDIA GPU it prints SKIP and exits 77. A page fault only: no hang, no TDR.
-// LEONIDA_AFTERMATH_DIR picks the dump folder (default %TEMP%\leonida_aftermath_test).
+// LEONIDA_AFTERMATH_DIR picks the dump folder (default <temp>\aftermath_test_<pid>, per run).
 #include "vulkan_loader.h"
+#include "test_temp_dir.h"
 
 #include "vulkan_aftermath.h"
 #include "vulkan_device_fault.h"
@@ -58,7 +59,7 @@ int main() {
     SetEnvironmentVariableA("LEONIDA_AFTERMATH", "1");
     SetEnvironmentVariableA("LEONIDA_AFTERMATH_KEEP_SPIRV", "1");  // the decoder maps the pc into our module
     if (!std::getenv("LEONIDA_AFTERMATH_DIR")) {
-        const auto dir = std::filesystem::temp_directory_path() / "leonida_aftermath_test";
+        const auto dir = testfiles::process_temp_dir("aftermath_test");
         SetEnvironmentVariableW(L"LEONIDA_AFTERMATH_DIR", dir.c_str());
     }
     if (!leonida::aftermath::enable()) {
