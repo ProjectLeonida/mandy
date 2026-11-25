@@ -77,26 +77,18 @@ public:
     // The address a shader must be given for `va` from the ranges added so far: translated inside one, unchanged
     // elsewhere. No copy is made here.
     std::uint64_t shader_va(std::uint64_t va, std::uint64_t bytes = 1) const {
-        if (!count_.load(std::memory_order_acquire)) return va;  // the common case: no title range at all
-        std::shared_lock lock(mutex_);
-        auto it = ranges_.upper_bound(va);
-        if (it == ranges_.begin()) return va;
-        --it;
-        if (va >= it->second.end || bytes > it->second.end - va) return va;
-        return it->second.shader_va + (va - it->first);
+        Mapping mapping;
+        if (!find_mapping(va, mapping) || bytes > mapping.end - va) return va;
+        return mapping.shader_va + (va - mapping.title_va);
     }
 
     // The range that holds `va`: true with `shader_va` what `va` becomes and `available` the bytes from `va` to the
     // range's end, all reached through the one copy. False when no range holds `va`.
     bool range_of(std::uint64_t va, std::uint64_t& shader_va, std::uint64_t& available) const {
-        if (!count_.load(std::memory_order_acquire)) return false;
-        std::shared_lock lock(mutex_);
-        auto it = ranges_.upper_bound(va);
-        if (it == ranges_.begin()) return false;
-        --it;
-        if (va >= it->second.end) return false;
-        shader_va = it->second.shader_va + (va - it->first);
-        available = it->second.end - va;
+        Mapping mapping;
+        if (!find_mapping(va, mapping)) return false;
+        shader_va = mapping.shader_va + (va - mapping.title_va);
+        available = mapping.end - va;
         return true;
     }
 
@@ -319,6 +311,37 @@ public:
     std::uint64_t untranslated(Kind kind) const { return untranslated_[kind].load(std::memory_order_relaxed); }
 
 private:
+    bool find_mapping(std::uint64_t va, Mapping& out) const {
+        if (!count_.load(std::memory_order_acquire)) return false;
+        // Cache locally repeated hits. Disjoint inserts leave them valid, while removals and
+        // overlapping inserts invalidate them. A miss still checks the live table.
+        struct Cache {
+            Mapping mapping;
+            std::uint64_t instance, invalidations, last_uncached;
+        };
+        static thread_local Cache cached{};
+        if (va - cached.mapping.title_va < cached.mapping.end - cached.mapping.title_va &&
+            cached.instance == instance_ && cached.invalidations == invalidations()) {
+            out = cached.mapping;
+            return true;
+        }
+        const auto previous = cached.last_uncached;
+        cached.last_uncached = va;
+        const std::shared_lock lock(mutex_);
+        auto it = ranges_.upper_bound(va);
+        if (it == ranges_.begin()) return false;
+        --it;
+        if (va >= it->second.end) return false;
+        out = {it->first, it->second.end, it->second.shader_va};
+        // A random query should not evict a repeatedly used range.
+        if (previous - out.title_va < out.end - out.title_va) {
+            cached.mapping = out;
+            cached.instance = instance_;
+            cached.invalidations = invalidations_.load(std::memory_order_relaxed);
+        }
+        return true;
+    }
+
     struct Range {
         std::uint64_t end;        // exclusive
         std::uint64_t shader_va;  // what the range's first byte becomes
@@ -338,6 +361,9 @@ private:
     std::map<std::uint64_t, Range> ranges_;  // by title VA
     std::atomic<std::size_t> count_{0};
     std::atomic<std::uint64_t> invalidations_{};
+    // A new table can occupy the same address as an earlier table on this thread.
+    static inline std::atomic<std::uint64_t> next_instance_{0};
+    const std::uint64_t instance_ = next_instance_.fetch_add(1, std::memory_order_relaxed);
     std::mutex hook_mutex_;
     void* hook_context_ = nullptr;
     void* maker_context_ = nullptr;

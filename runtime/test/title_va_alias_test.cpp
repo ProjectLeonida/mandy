@@ -4,6 +4,9 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <latch>
+#include <memory>
+#include <thread>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -85,6 +88,49 @@ int main() {
     a.remove(title, arena);
     a.remove(title + 0x40000, 0x7000000);
     EXPECT(a.size() == 0);
+
+    // Use the same cached range from both APIs, with bounds checked at each address.
+    EXPECT(a.add(title, size, arena));
+    EXPECT(a.shader_va(title + 16) == arena + 16);
+    EXPECT(a.range_of(title + 32, to, room) && to == arena + 32 && room == size - 32);
+    EXPECT(a.shader_va(title + size - 1, 2) == title + size - 1);
+    EXPECT(!a.range_of(title + size, to, room));
+    EXPECT(a.add(title + 2 * size, size, arena + 2 * size));
+    a.remove(title, arena);
+    EXPECT(a.shader_va(title + 16) == title + 16 && !a.range_of(title + 32, to, room));
+
+    // A replacement on another thread invalidates a reader's cached range.
+    EXPECT(a.add(title, size, arena));
+    std::latch cached(1), replaced(1);
+    std::uint64_t warm = 0, observed_to = 0, observed_room = 0;
+    bool found = false;
+    std::thread reader([&] {
+        a.shader_va(title + 1);
+        warm = a.shader_va(title + 2);
+        cached.count_down();
+        replaced.wait();
+        found = a.range_of(title + 3, observed_to, observed_room);
+    });
+    cached.wait();
+    const bool added = a.add(title, size / 2, arena + size);
+    replaced.count_down();
+    reader.join();
+    EXPECT(added && warm == arena + 2);
+    EXPECT(found && observed_to == arena + size + 3 && observed_room == size / 2 - 3);
+
+    // The same object address and invalidation count can belong to a new table.
+    using Aliases = leonida::TitleVaAliases;
+    alignas(Aliases) std::byte storage[sizeof(Aliases)];
+    auto* same_address = std::construct_at(reinterpret_cast<Aliases*>(storage));
+    EXPECT(same_address->add(title, size, arena));
+    EXPECT(same_address->shader_va(title + 4) == arena + 4);
+    EXPECT(same_address->shader_va(title + 8) == arena + 8);
+    std::destroy_at(same_address);
+    same_address = std::construct_at(reinterpret_cast<Aliases*>(storage));
+    EXPECT(same_address->add(title, size, arena + size));
+    EXPECT(same_address->shader_va(title + 12) == arena + size + 12);
+    std::destroy_at(same_address);
+
     std::printf("title_va_alias: translation inside a title-placed range, identity outside it and after release\n");
     return 0;
 }
