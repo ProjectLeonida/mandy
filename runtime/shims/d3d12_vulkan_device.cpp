@@ -32,6 +32,7 @@
 #include "../src/value_write_sink.h"
 #include "../src/arena_blocks.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/vsharp_range.h"
 #include "../src/depth24_fragment.h"
 #include "../src/rgba4_fragment.h"
 #include "../src/dual_source_fragment.h"
@@ -150,7 +151,9 @@ void log_once(const char* what, int value) {
     if (first_diagnostic(what, value)) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
 }
 
-// Matches the offset interpretation of the selected shader pack.
+// LEONIDA_IMPORT_BELOW_ARENA: title memory below the arena may be imported. Every pack the translator writes reads
+// a V# base sign-extended from bit 47 (docs/design.md, "Heap-relative buffer device addresses"), so this only
+// decides whether such an import is kept and which reading of an already-written base is tried first.
 bool signed_vsharp_offsets() {
     static const bool on = [] {
         wchar_t value[2]{};
@@ -2884,10 +2887,11 @@ struct DeviceState {
         // a buffer registered in gpu_backings or the geometry copies is ever accepted, so LEONIDA_IMPORT_BELOW_ARENA
         // still decides alone whether title memory is imported there.
         const auto encodable = [&](uint64_t offset) {
-            const uint64_t limit = signed_vsharp_offsets() ? mask / 2 : mask;
-            if (offset <= limit) return bytes - 1 <= limit - offset;
-            return offset >= UINT64_MAX - mask / 2 &&
-                   bytes - 1 <= mask / 2 - offset; // unsigned distance across zero
+            // Every translated shader reads a V# base as a 48-bit value sign-extended from bit 47 (docs/design.md,
+            // "Heap-relative buffer device addresses"): a positive offset must stay below 2^47, because one in
+            // [2^47, 2^48) is read 2^48 lower. LEONIDA_IMPORT_BELOW_ARENA only decides whether title memory may be
+            // imported below the arena.
+            return leonida::vsharp_offset_fits(offset, bytes);
         };
         const auto backed = [&](uint64_t offset) {
             if (!encodable(offset)) return false;
@@ -5886,6 +5890,22 @@ public:
             buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
             if (buffer_va_) buffer_va_ += offset;
             gpu_va_ = buffer_va_;
+        }
+        // An import above the arena whose offset needs bit 47 cannot be named by a V# either: the 48-bit base field
+        // is read sign-extended from bit 47, so the shader would read a title VA wrapped to 0xffff.... Same answer:
+        // a shadow in the arena is used.
+        if (buffer_va_ && device_.arena.address && buffer_va_ >= device_.arena.address &&
+            ((buffer_va_ - device_.arena.address) >> 47) != 0) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr,
+                             "[rt] d3d12: an import of title memory at %p (%llu bytes) needs bit 47 above the arena "
+                             "(device address 0x%llx, arena 0x%llx), outside the 47-bit V# range: a shadow in the "
+                             "arena is used instead\n",
+                             address, static_cast<unsigned long long>(desc_.Width),
+                             static_cast<unsigned long long>(buffer_va_),
+                             static_cast<unsigned long long>(device_.arena.address));
+            return decline(E_NOTIMPL);
         }
         // An import the driver put below the arena cannot be named by a V#: the V# keeps 48 bits of (device address
         // - heap_base), which is negative there, and the translated shaders zero-extend it, so they read 2^48 above

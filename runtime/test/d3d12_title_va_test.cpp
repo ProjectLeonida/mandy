@@ -23,6 +23,7 @@
 #include "../src/gfx10_descriptors.h"
 #include "../src/shader_library.h"
 #include "../src/title_va_alias.h"
+#include "../src/vsharp_range.h"
 #include "../src/title_page_watch.h"
 #include "../src/title_geometry_watch.h"
 
@@ -185,7 +186,7 @@ int check_kind(Context& c, const char* kind, DWORD protect, int& checks) {
     const std::uint64_t shader_va = leonida::title_va_aliases().shader_va(title_va);
     EXPECT(shader_va != title_va);
     const bool arena_copy = shader_va < c.arena;
-    const bool vsharp_fits = (shader_va >> 48) == 0;
+    const bool vsharp_fits = leonida::vsharp_offset_fits(shader_va + std::uint64_t(kSrvWord) * 4, kBytes);
 
     // The data, written after the buffers exist.
     auto* words = static_cast<std::uint32_t*>(pages);
