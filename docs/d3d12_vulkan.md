@@ -1623,7 +1623,7 @@ The copies:
   `LEONIDA_STREAM_BUFFER_WINDOWS=0` requires the window to fit in the arena.
 - `LEONIDA_GEOMETRY_MB` sets the memory cap for streamed buffer views. The default is 0.
   A positive cap enables persistent copies of placed buffer SRVs and buffer descriptors in title memory.
-  The copies go in device-local host-visible memory. Without Resizable BAR that is the 256 MiB BAR window, which
+  The copies prefer device-local host-visible memory. Without Resizable BAR that is the 256 MiB BAR window, which
   the default arena can fill; a block that finds no room there goes to host-visible system memory (logged once).
   A GPU-only reservation uses its paired CPU mapping. Matching source ranges share one copy.
   The resource descriptor heap keeps its console indices and original CPU bytes. Its shader-visible copy
