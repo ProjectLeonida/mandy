@@ -1621,8 +1621,10 @@ The copies:
   cannot fit between the title's address reservations can use a separate mapped buffer. The buffer's device address
   must fit as a positive 47-bit offset from the arena base. The same window cap and dirty-page refresh apply.
   `LEONIDA_STREAM_BUFFER_WINDOWS=0` requires the window to fit in the arena.
-- `LEONIDA_GEOMETRY_MB` sets the device-local memory cap for streamed buffer views. The default is 0.
+- `LEONIDA_GEOMETRY_MB` sets the memory cap for streamed buffer views. The default is 0.
   A positive cap enables persistent copies of placed buffer SRVs and buffer descriptors in title memory.
+  The copies go in device-local host-visible memory. Without Resizable BAR that is the 256 MiB BAR window, which
+  the default arena can fill; a block that finds no room there goes to host-visible system memory (logged once).
   A GPU-only reservation uses its paired CPU mapping. Matching source ranges share one copy.
   The resource descriptor heap keeps its console indices and original CPU bytes. Its shader-visible copy
   encodes each resolved buffer's offset from the arena base. CPU writes through either physical mapping,
@@ -1678,7 +1680,8 @@ The runtime allocates image keys from `0x100000000` (4 GiB) in 256-byte steps, a
     `runtime/src/vulkan_memory.h`, beside D3D-96's `resizable_bar`). Without Resizable BAR the only `DEVICE_LOCAL | HOST_VISIBLE` type sits in a
     heap of 256 MiB or less (214 MiB on an RTX 3090 with driver 616.56), so the 256 MiB default arena lands in
     system memory there. Asking that heap for it broke VUID-vkAllocateMemory-pAllocateInfo-01713 even though the
-    driver returned `VK_SUCCESS` (reported by CharlyRien).
+    driver returned `VK_SUCCESS` (reported by CharlyRien). A heap of exactly 256 MiB does hold it: on an RX 7900 XT
+    without Resizable BAR (AMD 32.0.32029.2010) the arena fills the whole BAR heap.
 - M4+: allocate the arena `DEVICE_LOCAL` and stage CPU writes (descriptor heaps, shader blobs, buffer uploads)
   through a host-visible staging buffer, copied before the commands that use them. The hash table is not in the
   arena either: it is a normal storage buffer in `DEVICE_LOCAL` memory, uploaded from a mapped staging copy before

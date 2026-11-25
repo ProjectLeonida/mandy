@@ -20,6 +20,7 @@ class TitleBufferWindows {
     };
     std::vector<Block> blocks_;
     VkDeviceSize reserved_{};
+    bool logged_host_fallback_ = false;
 
 public:
     VkDeviceSize reserved() const { return reserved_; }
@@ -63,9 +64,21 @@ public:
             vk.vkDestroyBuffer(d.info.device, b.buffer, nullptr);
             return false;
         }
-        b.memory = d.allocate(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                                  (device_local ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0),
+        constexpr VkMemoryPropertyFlags host_access =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        b.memory = d.allocate(req, host_access | (device_local ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0),
                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true);
+        if (!b.memory && device_local) {
+            // Without Resizable BAR the only device-local host-visible heap is the 256 MiB BAR window, and the
+            // default GPU address arena can fill it. A view in system memory is slower to read but still correct.
+            b.memory = d.allocate(req, host_access, 0, nullptr, true);
+            if (b.memory && !logged_host_fallback_) {
+                logged_host_fallback_ = true;
+                std::fprintf(stderr, "[rt] d3d12: no device-local host-visible memory left for a %llu KiB block of "
+                                     "buffer views, so it is in system memory\n",
+                             static_cast<unsigned long long>(b.capacity >> 10));
+            }
+        }
         void* host{};
         if (b.memory && vk.vkBindBufferMemory(d.info.device, b.buffer, b.memory, 0) == VK_SUCCESS &&
             vk.vkMapMemory(d.info.device, b.memory, 0, VK_WHOLE_SIZE, 0, &host) == VK_SUCCESS) {
