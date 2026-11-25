@@ -19,12 +19,14 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -60,7 +62,7 @@ struct State {
     std::uint64_t module_bytes = 0, modules_made = 0, module_bytes_made = 0;
     std::uint64_t graphics_live = 0, compute_live = 0, graphics_made = 0, compute_made = 0;
     std::uint64_t graphics_ns = 0, compute_ns = 0;  // time inside vkCreate*Pipelines
-    std::uint64_t installed = 0;
+    bool installed = false;
     ULONGLONG started = 0;
 };
 
@@ -239,15 +241,16 @@ inline VKAPI_ATTR void VKAPI_CALL destroy_pipeline(VkDevice device, VkPipeline p
 
 // Wraps the runtime's function table (leonida::VulkanDeviceFunctions). Once per process: the first device wins.
 template<typename Functions>
-void install(Functions& vk) {
-    if (!interval_seconds()) return;
+bool install(Functions& vk) {
+    if (!interval_seconds()) return false;
     State& s = state();
     std::lock_guard lock(s.mutex);
-    if (s.installed++) return;
+    if (s.installed) return false;
     if (!vk.vkAllocateMemory || !vk.vkFreeMemory || !vk.vkMapMemory || !vk.vkUnmapMemory ||
         !vk.vkCreateShaderModule || !vk.vkDestroyShaderModule || !vk.vkCreateGraphicsPipelines ||
         !vk.vkCreateComputePipelines || !vk.vkDestroyPipeline)
-        return;
+        return false;
+    s.installed = true;
     s.started = GetTickCount64();
     s.allocate = vk.vkAllocateMemory, vk.vkAllocateMemory = allocate_memory;
     s.free = vk.vkFreeMemory, vk.vkFreeMemory = free_memory;
@@ -259,6 +262,7 @@ void install(Functions& vk) {
     s.create_compute = vk.vkCreateComputePipelines, vk.vkCreateComputePipelines = create_compute_pipelines;
     s.destroy_pipeline = vk.vkDestroyPipeline, vk.vkDestroyPipeline = destroy_pipeline;
     std::fprintf(stderr, "[rt] mem-probe: installed, every %u s\n", interval_seconds());
+    return true;
 }
 
 // ---- /proc/self/smaps, classified ----
@@ -552,19 +556,42 @@ inline void sample(const DeviceFacts& facts) {
                  read_rollup().c_str());
 }
 
-// Starts the sampling thread (once). The thread runs until the process ends.
-inline void start(DeviceFacts facts) {
-    const unsigned seconds = interval_seconds();
-    if (!seconds) return;
-    static std::once_flag once;
-    std::call_once(once, [&] {
-        std::thread([facts = std::move(facts), seconds] {
-            for (;;) {
-                Sleep(seconds * 1000);
-                sample(facts);
-            }
-        }).detach();
-    });
+// Own the sampler on the device whose state its callbacks read.
+class Sampler {
+public:
+    Sampler(DeviceFacts facts, unsigned seconds)
+        : thread_([this, facts = std::move(facts), seconds] {
+              std::unique_lock lock(mutex_);
+              while (!wake_.wait_for(lock, std::chrono::seconds(seconds), [this] { return stopping_; })) {
+                  lock.unlock();
+                  sample(facts);
+                  lock.lock();
+              }
+              lock.unlock();
+              sample(facts);
+          }) {}
+    ~Sampler() {
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+        }
+        wake_.notify_one();
+        thread_.join();
+    }
+    Sampler(const Sampler&) = delete;
+    Sampler& operator=(const Sampler&) = delete;
+
+private:
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    bool stopping_ = false;
+    std::thread thread_;
+};
+
+inline std::unique_ptr<Sampler> start(DeviceFacts facts) {
+    if (const unsigned seconds = interval_seconds())
+        return std::make_unique<Sampler>(std::move(facts), seconds);
+    return nullptr;
 }
 
 }  // namespace leonida::mem_probe
