@@ -10792,6 +10792,7 @@ public:
         layout.graphics_console = pixel.ok;
         layout.graphics_ok = graphics_ok;
         layout.compute_ok = compute.ok;
+        layout.compute_spill_bytes = compute.ok ? compute.spill_dwords * sizeof(std::uint32_t) : 0;
         if (compute.ok && !compute.spill_dwords) layout.compute_arguments_end = compute.end_sgpr;
         // Vertex, pixel and geometry shaders share the s8 layout and one user-data block (a non-compute stage
         // refuses a spill, so pixel.ok means every argument is inline).
@@ -10809,7 +10810,10 @@ public:
             }
             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
                                          compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr,
-                                         table_view_descriptors(parsed.sig.params[i])});
+                                         table_view_descriptors(parsed.sig.params[i]),
+                                         compute.ok && compute.spill_dword[i] != rt::rootsig::kNoSpill
+                                             ? compute.spill_dword[i] * sizeof(std::uint32_t)
+                                             : rt::rootsig::kNoSpill});
         }
         register_static_samplers(parsed.sig);
         auto* signature = new RootSignature(

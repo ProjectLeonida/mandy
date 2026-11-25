@@ -194,6 +194,7 @@ public:
     explicit GraphicsCommandList(D3D12_COMMAND_LIST_TYPE type) : type_(type) {}
     ~GraphicsCommandList() override {
         stop_recording();
+        spill_chunks_.clear();
         release_held();
     }
 
@@ -244,6 +245,7 @@ public:
         invalid_ = false;
         calls_.clear();
         tables_.clear();
+        spill_chunks_.clear();  // borrowed pointers below are owned by held_
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) set_initial_pipeline(state);  // reset_state holds it
@@ -957,7 +959,9 @@ public:
         if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
             if (!compute_pipeline_ || !compute_.layout) return check(false);
             cmd.pipeline = compute_pipeline_;
-            cmd.user_data = compute_user_data();
+
+            if (!snapshot_compute_user_data(cmd.user_data)) return;
+
         }
         check(list_.execute_indirect(cmd));
     }
@@ -1282,6 +1286,16 @@ private:
     struct RootState {
         const RootArgumentLayout* layout = nullptr;
         std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> data{};
+        std::vector<std::uint32_t> spill_data;
+    };
+
+    struct SpillChunk {
+        ID3D12Resource* resource = nullptr;  // borrowed from held_
+        ID3D12Heap* heap = nullptr;          // borrowed from held_
+        std::uint8_t* mapped = nullptr;
+        D3D12_GPU_VIRTUAL_ADDRESS gpu_va = 0;
+        std::uint64_t capacity = 0;
+        std::uint64_t used = 0;
     };
 
     // D3D12 leaves root arguments undefined after a root-signature change; they start at zero here. Setting the
@@ -1302,6 +1316,10 @@ private:
         hold(signature);  // state.layout points into it
         state.layout = layout;
         state.data = {};
+        state.spill_data.clear();
+        if (layout && is_compute(state) && layout->compute_ok && layout->compute_spill_bytes)
+            state.spill_data.resize((layout->compute_spill_bytes + sizeof(std::uint32_t) - 1) /
+                                    sizeof(std::uint32_t));
         // CreateRootSignature accepted it for the other bind point only (its log line says why).
         if (layout && !(is_compute(state) ? layout->compute_ok : layout->graphics_ok)) {
             stub(is_compute(state) ? "SetComputeRootSignature(signature that does not fit the compute layout)"
@@ -1311,11 +1329,6 @@ private:
     }
 
     bool is_compute(const RootState& state) const { return &state == &compute_; }
-
-    // The parameter's first user-data dword at this bind point (RootArgumentLayout).
-    std::uint32_t first_dword(const RootState& state, const RootArgumentLayout::Parameter& p) const {
-        return is_compute(state) ? p.compute_offset : p.user_offset;
-    }
 
     // The parameter, if it exists and has the expected type; null after recording an invalid call.
     const RootArgumentLayout::Parameter* parameter(RootState& state, UINT index, rt::rootsig::ParamType type) {
@@ -1327,12 +1340,21 @@ private:
         return &state.layout->parameters[index];
     }
 
-    // Dwords beyond the 32 user registers are what the console spills to memory; that layout is still open.
-    void write(RootState& state, std::uint32_t dword, std::uint32_t value) {
-        if (dword < rt::rootsig::kMaxUserSgprs)
-            state.data[dword] = value;
-        else
-            stub("root arguments beyond 32 user-data dwords (spill not modelled)");
+    // Compute arguments after the first one that does not fit in s4..s31 use the measured packed spill array.
+    void write(RootState& state, const RootArgumentLayout::Parameter& p, std::uint32_t relative_dword,
+               std::uint32_t value) {
+        if (is_compute(state) && p.compute_spill_offset != rt::rootsig::kNoSpill) {
+            const std::uint64_t byte_offset = std::uint64_t(p.compute_spill_offset) +
+                                              std::uint64_t(relative_dword) * sizeof(std::uint32_t);
+            const std::uint64_t dword = byte_offset / sizeof(std::uint32_t);
+            if (byte_offset % sizeof(std::uint32_t) || dword >= state.spill_data.size()) return check(false);
+            state.spill_data[static_cast<std::size_t>(dword)] = value;
+            return;
+        }
+        const std::uint32_t first = is_compute(state) ? p.compute_offset : p.user_offset;
+        const std::uint64_t dword = std::uint64_t(first) + relative_dword;
+        if (first == rt::rootsig::kNoSgpr || dword >= rt::rootsig::kMaxUserSgprs) return check(false);
+        state.data[static_cast<std::size_t>(dword)] = value;
     }
 
     void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
@@ -1354,8 +1376,7 @@ private:
         if (!p) return;
         if ((count && !data) || std::uint64_t(offset) + count > p->constant_count) return check(false);
         const auto* values = static_cast<const std::uint32_t*>(data);
-        const std::uint32_t first = first_dword(state, *p);
-        for (UINT i = 0; i < count; ++i) write(state, first + offset + i, values[i]);
+        for (UINT i = 0; i < count; ++i) write(state, *p, offset + i, values[i]);
     }
 
     void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type) {
@@ -1366,10 +1387,7 @@ private:
             return;
         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
         if (!p) return;
-        // A root view into the title's own memory (a slot-133 buffer, a constant ring) gets the console VA of a GPU
-        // copy of it, so the shader's heap_base + VA reaches it (src/title_va_alias.h). A descriptor table is in one
-        // of the layer's heaps: kept, and its buffer V#s are rewritten the same way before each submission.
-        // A table in a console descriptor heap is read from the heap's arena copy (console_descriptor_table_va).
+        // Route title buffers and descriptor tables through their console GPU address aliases before recording.
         if (type == rt::rootsig::ParamType::Descriptor)
             va = leonida::title_va_aliases().resolve(va, kRootViewBytes, leonida::TitleVaAliases::root_view);
         else
@@ -1377,12 +1395,10 @@ private:
         if (type != rt::rootsig::ParamType::Descriptor && va && p->table_descriptors &&
             (tables_.empty() || tables_.back().first != va))
             tables_.push_back({va, p->table_descriptors});
-        const std::uint32_t first = first_dword(state, *p);
-        write(state, first, std::uint32_t(va));
-        // In the console layouts a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
-        // live below 4 GiB); a root view keeps both halves. pack()'s graphics layout gives every address two dwords.
+        write(state, *p, 0, std::uint32_t(va));
+        // Console descriptor tables occupy one dword; root views retain both address halves.
         const bool console = is_compute(state) || state.layout->graphics_console;
-        if (!(console && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
+        if (!(console && type == rt::rootsig::ParamType::Table)) write(state, *p, 1, std::uint32_t(va >> 32));
     }
 
     D3D12_COMMAND_LIST_TYPE type_;
@@ -1393,6 +1409,7 @@ private:
     UINT back_stencil_ref_ = 0;
     RootState compute_;
     RootState graphics_;
+    std::vector<SpillChunk> spill_chunks_;
     std::uintptr_t compute_pipeline_ = 0;
     bool unregistered_pipeline_ = false;  // the bound PSO has no pipeline here (a stub): see set_pipeline
     std::uintptr_t graphics_pipeline_ = 0;
@@ -1644,7 +1661,97 @@ private:
             }
         }
         note_direct_heap_indexing(compute_.layout);
-        check(list_.dispatch({compute_pipeline_, compute_user_data(), x, y, z}));
+
+        std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> user_data{};
+        if (!snapshot_compute_user_data(user_data)) return;
+        check(list_.dispatch({compute_pipeline_, user_data, x, y, z}));
+    }
+
+    bool snapshot_compute_user_data(std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs>& user_data) {
+        user_data = compute_user_data();
+        if (compute_.spill_data.empty()) return true;
+
+        const std::uint64_t bytes = std::uint64_t(compute_.spill_data.size()) * sizeof(std::uint32_t);
+        SpillChunk* chunk = spill_chunks_.empty() ? nullptr : &spill_chunks_.back();
+        std::uint64_t offset = chunk ? (chunk->used + sizeof(std::uint32_t) - 1) &
+                                           ~(std::uint64_t(sizeof(std::uint32_t)) - 1)
+                                     : 0;
+        if (chunk && (offset > chunk->capacity || bytes > chunk->capacity - offset)) {
+            chunk = nullptr;
+        }
+        if (!chunk) {
+            IUnknown* const owner = attached_device();
+            ID3D12Device* device = nullptr;
+            if (!owner || FAILED(owner->QueryInterface(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device))) ||
+                !device) {
+                std::fprintf(stderr, "[rt] d3d12: compute root spill could not resolve its D3D12 device\n");
+                check(false);
+                return false;
+            }
+
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            const std::uint64_t previous_capacity = spill_chunks_.empty() ? 0 : spill_chunks_.back().capacity;
+            const std::uint64_t geometric_capacity = previous_capacity > UINT64_MAX / 2
+                                                         ? UINT64_MAX
+                                                         : previous_capacity * 2;
+            desc.Width = std::max<std::uint64_t>({std::uint64_t(64 * 1024), bytes, geometric_capacity});
+            desc.Height = 1;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.SampleDesc.Count = 1;
+            desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            D3D12_HEAP_DESC heap_desc{};
+            heap_desc.SizeInBytes = desc.Width;
+            heap_desc.Properties.Type = D3D12_HEAP_TYPE_UPLOAD;
+            heap_desc.Properties.CreationNodeMask = 1;
+            heap_desc.Properties.VisibleNodeMask = 1;
+            heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+            ID3D12Heap* heap = nullptr;
+            HRESULT created = device->CreateHeap(&heap_desc, __uuidof(ID3D12Heap),
+                                                 reinterpret_cast<void**>(&heap));
+            ID3D12Resource* resource = nullptr;
+            if (SUCCEEDED(created) && heap)
+                created = device->CreatePlacedResource(heap, 0, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                       __uuidof(ID3D12Resource),
+                                                       reinterpret_cast<void**>(&resource));
+            device->Release();
+            if (FAILED(created) || !resource) {
+                if (resource) resource->Release();
+                if (heap) heap->Release();
+                std::fprintf(stderr, "[rt] d3d12: compute root spill buffer creation failed with 0x%08lx\n",
+                             static_cast<unsigned long>(created));
+                check(false);
+                return false;
+            }
+
+            void* mapped = nullptr;
+            const D3D12_RANGE no_read{0, 0};
+            const HRESULT map_result = resource->Map(0, &no_read, &mapped);
+            const D3D12_GPU_VIRTUAL_ADDRESS gpu_va = resource->GetGPUVirtualAddress();
+            if (FAILED(map_result) || !mapped || !gpu_va) {
+                resource->Release();
+                if (heap) heap->Release();
+                std::fprintf(stderr, "[rt] d3d12: compute root spill buffer mapping/address failed\n");
+                check(false);
+                return false;
+            }
+            hold(resource);
+            hold(heap);  // release the placed resource before its backing heap
+            heap->Release();
+            resource->Release();
+            spill_chunks_.push_back({resource, heap, static_cast<std::uint8_t*>(mapped), gpu_va, desc.Width, 0});
+            chunk = &spill_chunks_.back();
+            offset = 0;
+        }
+
+        std::memcpy(chunk->mapped + offset, compute_.spill_data.data(), static_cast<std::size_t>(bytes));
+        chunk->used = offset + bytes;
+        const std::uint64_t spill_va = chunk->gpu_va + offset;
+        user_data[0] = static_cast<std::uint32_t>(spill_va);
+        user_data[1] = static_cast<std::uint32_t>(spill_va >> 32);
+        return true;
+
     }
 
     // The views block a draw records. Rebuilt only when the render targets or the bound vertex buffers change.

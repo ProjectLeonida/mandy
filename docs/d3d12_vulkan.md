@@ -838,8 +838,9 @@ The compute path, end to end:
   - Shader programs (FSSM blobs) are copied in as the code base.
 - **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place in two layouts:
   `pack()` for the graphics bind point and `pack_stage(Stage::Compute)` for the compute one (from s4, one dword per
-  table; section 3.5, D3D-448). A signature neither can place (more than 32 user dwords: the spill layout is open; the
-  translated shaders have no below-base spill-pointer candidates) is refused with both reasons; one only a single layout places is created with a log line, and binding it at the other bind point
+  table; section 3.5, D3D-448). Compute parameters that do not fit inline and every later parameter are packed into
+  the measured spill array. Graphics still has no spill layout; a signature neither layout can place is refused, and
+  one only a single layout places is created with a log line. Binding it at the other bind point
   invalidates the list. Before
   that it answers as the host runtime does (`compare_invalid_arguments`, "root signature:", RTX 5070 / 621.14):
   `S_FALSE` for a null output whatever the blob, then `E_INVALIDARG` for a node other than node 0 or a DXBC
@@ -1868,7 +1869,11 @@ Taken together this disagrees with the packing above (from s0, two dwords per ta
 in root order from the stage base, each while it fits whole, a constant taking one dword per value, a root
 CBV/SRV/UAV two (its 64-bit VA), a descriptor table **one** (the 32-bit VA of its first descriptor; the heaps live
 below 4 GiB). A parameter that does not fit goes, with every later one, to the spill array behind `s[0:1]`
-(section 7), which is not modelled, so such a signature is refused. How each part is known:
+(section 7), packed in root order with no padding: constants take 4 bytes per value, root views 8 bytes and tables
+4 bytes. At recording time the runtime snapshots those bytes into a host-visible upload-heap buffer placed in the GPU
+address arena and writes its arena-relative console GPU VA to `s[0:1]` for that dispatch; the command list keeps the
+resource and heap alive until reset or release. Other stages
+still reject spills because their per-stage base and spill ABI are not measured. How each part is known:
 - **Compute, base s4: measured three ways.**
   - The console compiler's output (section 7).
   - The package's FidelityFX DLL, whose 29 compute containers carry their `RTS0` next to the console-compiled
@@ -1883,14 +1888,14 @@ below 4 GiB). A parameter that does not fit goes, with every later one, to the s
 - **Vertex/pixel/geometry s8 and mesh s16: a hypothesis.** It rests on the census above only; no signature
   confirms these bases, and visibility is not modelled (every parameter takes its place in every stage).
 
-The runtime uses the console layout for the **compute** bind point only. Graphics keeps `pack()`: every stage of a
+The runtime uses the console layout and spill array for the **compute** bind point only. Graphics keeps `pack()`: every stage of a
 pipeline reads `s0..s31` from one push-constant block at offset 0 (`tools/rdna2spirv.py`, `ShaderUserData` in
 `runtime/src/vulkan_replay.h`), so a mesh shader (base s16) and a pixel shader (base s8) in one pipeline would need
 the same root argument at two offsets. That needs per-stage user-data windows in the translator's push-constant
 contract (D3D-448 follow-up). A root signature carries both layouts; one that only one of them can place is
 created, and binding it at the other bind point invalidates the command list (`Close` returns `E_INVALIDARG`).
-`s0..s3` of a compute dispatch are the driver's block; the layer leaves them zero (109 CS read `s1` as a constant,
-42 `s3`; their meaning is open).
+For compute dispatches without spills, the layer leaves `s0..s3` zero (109 CS read `s1` as a constant, 42 `s3`; their
+meaning is open). With a spill, `s0:s1` carry the measured spill-array pointer; `s2:s3` remain zero.
 
 **Measured: a real signature beside the count it produced.** `tools/fspx_unpack.py` decodes `COMPUTE_PGM_RSRC2` of
 each of the 29 compute programs in `amd_fidelityfx_upscaler_xbox.dll`, and its `USER_SGPR` field is the count the
@@ -1929,9 +1934,11 @@ Still open: which CBV index lands in which pair. The four pairs do appear in dec
 package proves that order, and every parameter in these 29 is `D3D12_SHADER_VISIBILITY_ALL`, so they say nothing
 about the visibility question below.
 
-Spill policy: a signature needing more than 32 user SGPRs, or more than the 64-dword D3D12 cost limit, is
-refused loudly (`pack` returns the offending parameter) instead of being truncated. The console spills through
-`__XB_GetRootSignatureSpillPointer`; until that layout is measured, refusing is the only correct behaviour.
+Spill policy: signatures over the 64-dword D3D12 cost limit are refused. The graphics `pack()` layout still refuses
+parameters beyond its 32-dword window. Compute uses the measured spill policy described in section 3.5: parameters
+from the first one that does not fit are copied in root order into a host-visible upload-heap buffer placed in the GPU
+address arena, whose arena-relative console GPU VA is put in `s[0:1]` for each dispatch. This path is implemented, but remains to be validated against the executable's
+actual spilled shaders.
 
 Measured (D3D-315): zero below-base spill-pointer candidates in the translated shaders.
 `python -I tools/root_spill_census.py <spirv/index.json> --carve <dxbc/index.json> --expect-no-spill` exits 0 on
@@ -1958,7 +1965,8 @@ What this does not settle:
 - **A spill behind a pointer at or above the base.** It reads the same as a table pointer, so the census can't
   tell the two apart.
 
-The spill layout stays unimplemented: no shader in the translated set reads a candidate a spill could sit behind.
+The census only describes the translated shader corpus at the time it was generated; its lack of below-base reads does
+not rule out runtime-created signatures that spill. The runtime now implements the measured compute spill convention.
 
 Reconciliation: `tools/root_sig_contract.py` checks a candidate root signature against every shader's
 `user_sgpr_reads` from `spirv/index.json` (const32 vs constant dwords, 64-bit VAs vs view/table pairs) and fails
@@ -2028,10 +2036,9 @@ Things that can invalidate this simple model, all **Open**:
   so the executable's pipeline table would settle it; `tests/test_user_sgpr_census.py` shows that the two models
   give different counts. Mesh shaders (base s16) and the compute signatures are not covered here.
 - **Root signature larger than 32 dwords.** D3D12 allows up to 64 dwords. The console has 32 user SGPRs, so a
-  driver must spill the rest to memory, probably behind a pointer in the user data. The current shader contract has
-  no representation for that. The likely answer is that this game keeps its root signatures small (bindless
-  descriptors, a few constants), but it must be measured. If a large root signature appears, the spill layout has
-  to be reverse-engineered from the shader's loads. Measured on the shader side (D3D-315, spill policy above):
+  driver spills the remaining compute parameters through the pointer in user data. The runtime implements the
+  measured compute layout; validation against a game dispatch that actually spills is still needed. Measured on the
+  shader side (D3D-315, spill policy above):
   zero below-base spill-pointer candidates in the translated shaders. The root signatures themselves, and how many
   exceed the budget, are still to be dumped from the executable.
 - **Direct heap indexing.** The bound heap base and stride are not root parameters. Measured (D3D-329, section
