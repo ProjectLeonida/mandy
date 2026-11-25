@@ -256,7 +256,7 @@ acceptance only.
 
 A SPIR-V module larger than 4 MiB is "large". [#884](https://github.com/ItsNotRexed/Leonida/issues/884)
 showed why that matters: several compiles that each needed gigabytes of host RAM ran at the same time. Large
-modules now share a memory budget (`runtime/test/large_module_gate.h`): each one reserves 512 bytes of RAM per
+modules now share a memory budget (`runtime/src/large_module_gate.h`): each one reserves 512 bytes of RAM per
 SPIR-V byte, and they enter the driver while their reservations fit three quarters of the memory available when
 the run starts, up to `--jobs` of them. One large module always gets in when none is compiling, so a module
 bigger than the whole budget still compiles, alone among the large ones. Small modules are never held back. On
