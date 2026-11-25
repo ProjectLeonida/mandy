@@ -2453,6 +2453,21 @@ if(TARGET Vulkan::Headers)
                          ENVIRONMENT "LEONIDA_SERIAL_BIG_COMPILES=1;LEONIDA_BIG_COMPILE_BUDGET_MB=4096")
     set_tests_properties(d3d12_big_compute_unlimited PROPERTIES
                          ENVIRONMENT "LEONIDA_SERIAL_BIG_COMPILES=0;LEONIDA_BIG_COMPILE_BUDGET_MB=1")
+    # The pipeline compiler's workers under LEONIDA_ASYNC_PIPELINES=1, with a large compute module's build held in flight:
+    # with more than one worker the small pipelines a submission asks for are built meanwhile, with one they wait, as
+    # before the pool. The builds run on the compiler's threads, which get the loader's stack as the title's do.
+    add_executable(d3d12_compile_pool_test test/d3d12_compile_pool_test.cpp)
+    target_link_libraries(d3d12_compile_pool_test PRIVATE gta6rt_d3d12_com psapi)
+    target_compile_definitions(d3d12_compile_pool_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_compile_pool_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(d3d12_compile_pool_test PRIVATE /STACK:${GTA6RT_STACK})
+    add_test(NAME d3d12_compile_pool COMMAND d3d12_compile_pool_test)
+    add_test(NAME d3d12_compile_pool_one_thread COMMAND d3d12_compile_pool_test)
+    add_test(NAME d3d12_compile_pool_four_threads COMMAND d3d12_compile_pool_test)
+    set_tests_properties(d3d12_compile_pool d3d12_compile_pool_one_thread d3d12_compile_pool_four_threads PROPERTIES
+                         SKIP_RETURN_CODE 77 TIMEOUT 600 FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    set_tests_properties(d3d12_compile_pool_one_thread PROPERTIES ENVIRONMENT "LEONIDA_COMPILE_THREADS=1")
+    set_tests_properties(d3d12_compile_pool_four_threads PROPERTIES ENVIRONMENT "LEONIDA_COMPILE_THREADS=4")
     # ExecuteCommandLists refuses a list whose type isn't the queue's (debug-layer message 836).
     add_executable(d3d12_queue_list_type_test test/d3d12_queue_list_type_test.cpp)
     target_link_libraries(d3d12_queue_list_type_test PRIVATE gta6rt_d3d12_com)
@@ -3720,8 +3735,15 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(d3d12_compile_teardown_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}")
       target_compile_options(d3d12_compile_teardown_test PRIVATE /W4 /permissive- /utf-8)
+      # Three times: with the compiler's default number of workers, with the one thread there was before the pool,
+      # and with 4, which is more than the default of a machine with fewer than 8 logical processors.
       add_test(NAME d3d12_compile_teardown COMMAND d3d12_compile_teardown_test)
-      set_tests_properties(d3d12_compile_teardown PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+      add_test(NAME d3d12_compile_teardown_one_thread COMMAND d3d12_compile_teardown_test)
+      add_test(NAME d3d12_compile_teardown_four_threads COMMAND d3d12_compile_teardown_test)
+      set_tests_properties(d3d12_compile_teardown d3d12_compile_teardown_one_thread d3d12_compile_teardown_four_threads
+                           PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+      set_tests_properties(d3d12_compile_teardown_one_thread PROPERTIES ENVIRONMENT "LEONIDA_COMPILE_THREADS=1")
+      set_tests_properties(d3d12_compile_teardown_four_threads PROPERTIES ENVIRONMENT "LEONIDA_COMPILE_THREADS=4")
       # A buffer at the title's own VA (device slot 133) read by the same shader through a root view and a V#.
       add_executable(d3d12_title_va_test test/d3d12_title_va_test.cpp shims/d3d12_xs_device.cpp
                      test/xmem_geometry_aliases_stub.cpp ${LEONIDA_TEST_CS})
@@ -4364,6 +4386,17 @@ if(TARGET Vulkan::Headers)
       target_compile_options(replay_pipeline_compile_unlock_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME replay_pipeline_compile_unlock COMMAND replay_pipeline_compile_unlock_test)
+
+    if(WIN32)
+      # The rules of the workers that run LEONIDA_ASYNC_PIPELINES builds, the warm-up and the cache checkpoint
+      # (shims/d3d12_pipeline_compile.h), with made-up jobs: no Vulkan device, no GPU.
+      add_executable(pipeline_compiler_pool_test test/pipeline_compiler_pool_test.cpp)
+      target_link_libraries(pipeline_compiler_pool_test PRIVATE Vulkan::Headers Threads::Threads)
+      target_compile_definitions(pipeline_compiler_pool_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(pipeline_compiler_pool_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME pipeline_compiler_pool COMMAND pipeline_compiler_pool_test)
+      set_tests_properties(pipeline_compiler_pool PROPERTIES TIMEOUT 180)
+    endif()
     add_executable(replay_quad_list_test test/replay_quad_list_test.cpp)
     target_link_libraries(replay_quad_list_test PRIVATE Vulkan::Headers)
     if(WIN32)

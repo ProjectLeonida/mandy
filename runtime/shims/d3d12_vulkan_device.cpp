@@ -9492,9 +9492,9 @@ private:
     }
 
     // Lazy compute pipelines are also built in the background, smallest module first, so most exist before their
-    // first dispatch. One low-priority thread; modules over LEONIDA_COMPUTE_WARMUP_MAX_BYTES of SPIR-V (default
-    // 1 MiB) are left to their first dispatch, since some take the driver minutes each. LEONIDA_COMPUTE_WARMUP=0
-    // turns the thread off. A queued build holds no reference: a PSO released first drops it (last_release).
+    // first dispatch. The compiler's low-priority workers, all but one of them at most (PipelineCompiler); modules over
+    // LEONIDA_COMPUTE_WARMUP_MAX_BYTES of SPIR-V (default 1 MiB) are left to their first dispatch, since some take
+    // the driver minutes each. LEONIDA_COMPUTE_WARMUP=0 turns the warm-up off. A queued build holds no reference: a PSO released first drops it (last_release).
     // The startup cache checkpoint is the device's job, not this PSO's: ~Device cancels it before the cache goes.
     void maybe_checkpoint(VkPipelineCache cache) {
         if (!cache || !startup_cache_checkpoints_enabled()) return;
@@ -9534,6 +9534,15 @@ private:
             if (!it->second.handle) ++it->second.skips;
             if (!inserted) return it->second.handle;
         }
+        // A demanded build of a large module is heavy for the compiler's workers, as the warm-up is: one of them stays
+        // free for the small builds a submission asks for (PipelineCompiler, the lane rule). 1 MiB of SPIR-V or more
+        // is very large, demanded or not: one of those at a time (LEONIDA_COMPILE_HEAVY_MAX). By size alone, whatever
+        // LEONIDA_SERIAL_BIG_COMPILES says about memory.
+        const std::uint64_t huge_estimate = leonida::large_module_estimate(leonida::PipelineCompiles::large_spirv_bytes);
+        const auto size = (compute ? pipeline_.estimate : graphics_.estimate) >= huge_estimate
+                              ? PipelineCompiler::Size::huge
+                              : compute && big_compute(stage_bytes_) ? PipelineCompiler::Size::large
+                                                                     : PipelineCompiler::Size::regular;
         bool queued = false;
         try {
             queued = PipelineCompiler::instance().submit(compile_owner(), &device_, warm_bytes, [this, compute, warm, unbound] {
@@ -9558,7 +9567,7 @@ private:
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "[rt] pipeline compile worker failed: %s\n", e.what());
                 }
-            });
+            }, size);
         } catch (...) {
         }
         // Not queued (refused by a stop that came after the check above, or out of memory): no request stays

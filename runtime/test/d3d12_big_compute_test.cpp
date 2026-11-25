@@ -123,6 +123,10 @@ struct Hooks {
         std::lock_guard lock(mutex);
         return started.size();
     }
+    std::size_t large_creates() {
+        std::lock_guard lock(mutex);
+        return std::size_t(std::count_if(started.begin(), started.end(), [](const Start& s) { return s.large; }));
+    }
 } hooks;
 
 struct Tracked {
@@ -863,26 +867,51 @@ bool warmup(const Setup& setup) {
     hooks.reset();
     hooks.closed = true;
     hooks.linger = 100ms;
+    // The warm-up's builds run on the compiler's workers (LEONIDA_COMPILE_THREADS): whichever of them takes a job is
+    // one of the warm-up's threads. All but one of them may be in the warm-up, and wait at the gate, at a time.
+    struct WarmThreads {
+        std::mutex mutex;
+        std::set<std::thread::id> ids;
+        WarmThreads() {
+            rt::d3d12::PipelineCompiler::instance().set_job_probe([this](const void*) {
+                std::lock_guard lock(mutex);
+                ids.insert(std::this_thread::get_id());
+            });
+        }
+        ~WarmThreads() { rt::d3d12::PipelineCompiler::instance().set_job_probe(nullptr); }
+        bool has(std::thread::id id) {
+            std::lock_guard lock(mutex);
+            return ids.contains(id);
+        }
+    } warm;
     CHECK(pipelines.create(dev.p));
     if (!hooks.wait_large(1)) {
         hooks.open();
         CHECK(!"the warm-up thread compiles a large one");
     }
-    std::thread::id warm;
+    std::thread::id first_thread;
     int first = -1;
     {
         std::lock_guard lock(hooks.mutex);
         for (const Start& s : hooks.started)
-            if (s.large) warm = s.thread, first = s.program;
+            if (s.large) first_thread = s.thread, first = s.program;
     }
-    CHECK(first == 0);  // their sizes rise with their numbers
-    const std::vector<unsigned> wanted = {4, 5, 3, 1};  // 1 is what the warm-up thread builds after 0
+    // Their sizes rise with their numbers, so one worker takes 0 first. Several take the first ones together, and
+    // whichever reaches the gate first is the one in the driver.
+    CHECK(first >= 0 && first < int(kBig));
+    if (rt::d3d12::PipelineCompiler::instance().threads() == 1) CHECK(first == 0);
+    CHECK(warm.has(first_thread));
+    // Four of the others, among them the next the warm-up builds (1 after 0).
+    std::vector<unsigned> wanted;
+    for (const unsigned n : {4u, 5u, 3u, 1u, 0u})
+        if (int(n) != first && wanted.size() < 4) wanted.push_back(n);
     CHECK(frame.create(dev.p, pipelines, wanted, false));
-    const std::size_t before = hooks.creates();
+    // The large ones: the warm-up's small ones may still be starting on the compiler's other workers.
+    const std::size_t before = hooks.large_creates();
     ReplayResult result = ReplayResult::unsupported;
     std::thread submitting([&] { result = frame.submit(); });
     std::this_thread::sleep_for(500ms);
-    const bool waits = hooks.creates() == before;  // the place is taken
+    const bool waits = hooks.large_creates() == before;  // the place is taken
     hooks.open();
     submitting.join();
     const bool done = result == ReplayResult::success && frame.right();
@@ -901,11 +930,11 @@ bool warmup(const Setup& setup) {
     std::erase_if(started, [](const Start& s) { return !s.large; });
     std::set<int> built;
     for (std::size_t i = 1; i <= wanted.size(); ++i) {
-        CHECK(started[i].thread != warm);  // none of the warm-up's between two of the submission's
+        CHECK(!warm.has(started[i].thread));  // none of the warm-up's between two of the submission's
         built.insert(started[i].program);
     }
     CHECK(built == std::set<int>(wanted.begin(), wanted.end()));
-    for (std::size_t i = wanted.size() + 1; i < started.size(); ++i) CHECK(started[i].thread == warm);
+    for (std::size_t i = wanted.size() + 1; i < started.size(); ++i) CHECK(warm.has(started[i].thread));
     return true;
 }
 

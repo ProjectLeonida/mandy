@@ -18,7 +18,9 @@
 //   exit          stop_pipeline_compiles with a device alive: the queue goes, later builds are refused, a warm-up
 //                 is skipped and a dispatch (LEONIDA_ASYNC_PIPELINES on) builds its pipeline in place and runs;
 //                 save_pipeline_caches_at_exit then writes the session cache with the device alive, once.
-// After each case the compiler's thread is gone and the process's thread count is back where it was.
+// After each case the compiler's threads are gone and the process's thread count is back where it was.
+// Run with the compiler's default number of workers and with LEONIDA_COMPILE_THREADS=1 and 4 (runtime/CMakeLists.txt):
+// "the worker" below is whichever of them has the job.
 // No game data: the shader is test/glsl/cs_user_data.comp, the programs are made-up FSSM bytes.
 #include "shader_fixture_path.h"
 #include "test_temp_dir.h"
@@ -39,6 +41,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -348,22 +351,32 @@ bool drain(PipelineCompiler& compiler) {
     return done.wait(120000);
 }
 
-// Holds the worker in a job of no device until open() (or the end of the scope).
+// Holds every worker in a job of no device until open() (or the end of the scope): one small demanded job for each
+// (LEONIDA_COMPILE_THREADS), each under an owner of its own, so nothing that is queued meanwhile starts.
 struct Gate {
-    Event entered, opened, left;
+    struct Hold {
+        Event entered, left;
+    };
+    Event opened;
+    std::vector<std::unique_ptr<Hold>> holds;
     explicit Gate(PipelineCompiler& compiler) {
-        static const int gate = 0;
-        compiler.submit(&gate, nullptr, 0, [this] {
-            entered.set();
-            opened.wait(INFINITE);
-            left.set();
-        });
-        entered.wait();
+        static const char owners[rt::d3d12::kMaxCompileThreads] = {};
+        const unsigned workers = compiler.threads();
+        for (unsigned i = 0; i < workers; ++i) holds.push_back(std::make_unique<Hold>());
+        for (unsigned i = 0; i < workers; ++i) {
+            Hold* const hold = holds[i].get();
+            compiler.submit(&owners[i], nullptr, 0, [this, hold] {
+                hold->entered.set();
+                opened.wait(INFINITE);
+                hold->left.set();
+            });
+        }
+        for (const auto& hold : holds) hold->entered.wait();
     }
     void open() { opened.set(); }
     ~Gate() {
         opened.set();
-        left.wait();  // the job is out of this object before its events close
+        for (const auto& hold : holds) hold->left.wait();  // the jobs are out of this object before its events close
     }
 };
 
@@ -432,6 +445,7 @@ int main() {
         d.instance_proc(d.instance, "vkGetPhysicalDeviceProperties2"))(d.physical, &properties);
     const bool caches = driver.driverID != VK_DRIVER_ID_MESA_LLVMPIPE;
     const auto session_file = cache_dir / "pipeline_cache.session.bin";
+    std::printf("workers: %u\n", compiler.threads());
 
     // --- cache: one PSO built by the warm-up thread; the device writes the session cache at teardown -------------
     {

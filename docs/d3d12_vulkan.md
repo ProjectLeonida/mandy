@@ -2420,22 +2420,45 @@ Pipeline creation:
   compute programs and drops their dispatches, direct and indirect; the first dropped dispatch of each is logged.
   It is a way past a program that hangs the GPU while the program or its input is fixed, not a fix.
   `LEONIDA_STARTUP_CACHE_CHECKPOINTS=1` also schedules a snapshot after a successful pipeline build,
-  at most once per 120 seconds. It starts on the compile worker when queued builds have drained and the device
-  has no active builds. These snapshots have an additional 512 MiB ceiling. The driver fills a mapped staging
+  at most once per 120 seconds. It starts on a compile worker when queued builds have drained, no worker is in a build
+  and the device has no active builds. These snapshots have an additional 512 MiB ceiling. The driver fills a mapped staging
   file directly. A successful snapshot atomically replaces the session. An interrupted write preserves the
   previous cache; the next launch removes unheld staging files older than ten minutes.
   `LEONIDA_TRACE_PIPELINE_COMPILE=1` records each graphics and compute build's trigger, thread, elapsed time,
   SPIR-V size, shader names and Vulkan application-cache feedback (1 hit, 0 miss, -1 unavailable). It also
   times cache reads, merges, writes and draw/dispatch pipeline lookups that take at least 1 ms.
-  `LEONIDA_ASYNC_PIPELINES=1` schedules cold first-use builds on the warm-up worker ahead of speculative work.
+  `LEONIDA_ASYNC_PIPELINES=1` schedules cold first-use builds on the compile workers ahead of speculative work.
   Replay skips a draw or dispatch while its pipeline is pending. Later uses find the completed handle.
   A skipped dispatch can lose a one-time resource update. Synchronous first use is the default and strict
-  replay always uses it. `LEONIDA_COMPUTE_WARMUP=0` restricts the worker to pipelines requested by the title.
+  replay always uses it. `LEONIDA_COMPUTE_WARMUP=0` restricts the workers to pipelines requested by the title.
+  The compile workers (`PipelineCompiler`) run those builds, the warm-up and the cache checkpoint on
+  `LEONIDA_COMPILE_THREADS` threads below normal priority: unset, half the logical processors, at least 2 and at most
+  8; `1` is the one thread there was (RT-ASYNC-COMPILE-POOL). A worker takes the first job it may start: the builds a
+  draw or dispatch asked for in the order they came, then the warm-up's by module size, then the checkpoint. All but
+  one of the workers at most are in heavy builds at a time, which are the warm-up's and the demanded ones of large
+  pipelines (below; by size, whatever `LEONIDA_SERIAL_BIG_COMPILES` says), so one worker is left for a small build a
+  submission asked for: it no longer waits behind a module the driver takes minutes over, or behind the warm-up. Of
+  the very large builds, 1 MiB of SPIR-V or more, one runs at a time, demanded or not
+  (`LEONIDA_COMPILE_HEAVY_MAX=<n>`; `0`: no limit of their own): the memory gate lets in what fits the free memory,
+  and a driver may fail modules it takes half an hour over when it compiles several side by side. A large build
+  waits for its place at the memory gate (below) inside its job, and counts as heavy while it waits. One PSO has one
+  build at a time, the next of its variants after the one that runs. A checkpoint starts only when no worker is in a
+  build, and gives way to one that starts while it reads the cache's size. With several workers the pipelines become
+  ready in an order that differs from run to run, and so do the draws skipped meanwhile; the driver holds memory for
+  each thread that compiles (about 50 MiB, below). The pool shortens the time a demanded pipeline is pending and does
+  not end it: a draw or dispatch is still skipped for as long as its own build takes. Measured with synthetic modules
+  no run had compiled (`d3d12_compile_pool_test measure 4194304 200 <seed>`; RTX 4060, NVIDIA 610.88, Windows 11, 12
+  logical processors, two alternating runs each, on a machine that was building other things): a dispatch asks for a
+  compute module of 4 MiB, which the driver takes 92 to 173 s over, and the next submission for 200 modules of
+  12 KiB. With 6 workers the 200 are ready 1.3 and 6.9 s after the first dispatch, 200 compiles on 5 other threads
+  inside the large one; with one thread, after 99 and 152 s, behind it. Peak commit 714 and 720 MiB against 645 and
+  681. Tested by `pipeline_compiler_pool` (the rules, with made-up jobs), `d3d12_compile_teardown` and
+  `d3d12_compile_pool` (a GPU; each with the default, 1 and 4 workers).
   A queued build holds no reference to its PSO or device (`PipelineCompiler`, `runtime/shims/d3d12_pipeline_compile.h`).
   A PSO's last release drops its queued builds and returns at once; one already running is left to finish, and the
   worker deletes the PSO after it (`PipelineState::last_release`). The PSO's device reference goes at the release, so
   the release that tears the device down waits for that build, drops the device's cache checkpoint, and the last
-  device stops and joins the worker before any Vulkan object goes; the session cache is written after that. gta6rt,
+  device stops and joins the workers before any Vulkan object goes; the session cache is written after that. gta6rt,
   which ends with the device alive, drops the queue and waits up to 2 s for a running build before `ExitProcess` and on
   a console Ctrl+C, Ctrl+Break or close; after that nothing is queued, and a first use builds in place
   (`d3d12_compile_teardown_test`).
@@ -2473,7 +2496,7 @@ Pipeline creation:
   the session cache is read at device teardown. `LEONIDA_PIPELINE_THREADS=<n>` sets the workers: unset, half the
   logical processors and at most 8; `0` compiles each pipeline on the submitting thread where `prepare()` meets it.
   Large pipelines (below) are compiled within a memory budget, and the variants of one PSO one after another.
-  `LEONIDA_ASYNC_PIPELINES=1` is not changed: its builds stay on the compile worker. Measured with synthetic programs
+  `LEONIDA_ASYNC_PIPELINES=1` is not changed: its builds stay on the compile workers (above). Measured with synthetic programs
   never compiled before and the warm-up off (RTX 3080, NVIDIA 621.24, Windows 11, 16 logical processors, 8 workers,
   three runs each): the first submission of 192 graphics pipelines takes 126 to 143 ms instead of 861 to 882, of 192
   variants 124 to 130 instead of 856 to 863, of 96 compute pipelines 74 to 81 instead of 486 to 519, and the process
