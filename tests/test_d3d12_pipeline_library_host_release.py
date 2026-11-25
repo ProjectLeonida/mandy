@@ -22,10 +22,9 @@ class PipelineLibraryHostReleaseTest(unittest.TestCase):
         self.assertIsNotNone(m, "one_step function must be defined in d3d12_pipeline_library_host_test.cpp")
         body = m.group(1)
 
-        # Ensure Release() is guarded by SUCCEEDED(hr)
+        # Ensure Release() is guarded by both hr != HRESULT(kFaulted) and SUCCEEDED(hr)
         self.assertIn("SUCCEEDED(hr)", body, "one_step must guard Release() with SUCCEEDED(hr)")
-        self.assertNotIn("hr != HRESULT(kFaulted)) static_cast<IUnknown*>(c.out)->Release()", body,
-                         "Unchecked Release() on failed HRESULT causes 0xc0000409 fail-fast")
+        self.assertIn("hr != HRESULT(kFaulted)", body, "one_step must preserve hr != HRESULT(kFaulted)")
 
 
 if __name__ == "__main__":

@@ -240,7 +240,7 @@ void one_step(Context& c, const Step& s, std::uint64_t& hr_out, std::uint64_t& o
     hr_out = std::uint64_t(std::uint32_t(hr));
     const bool written = c.out != reinterpret_cast<void*>(std::uintptr_t(0x5EED));
     output = hr == HRESULT(kFaulted) ? kFaulted : !written ? 2 : c.out ? 1 : 0;
-    if (SUCCEEDED(hr) && written && c.out) static_cast<IUnknown*>(c.out)->Release();
+    if (hr != HRESULT(kFaulted) && SUCCEEDED(hr) && written && c.out) static_cast<IUnknown*>(c.out)->Release();
 }
 
 std::string hex(const std::vector<std::uint8_t>& bytes) {
