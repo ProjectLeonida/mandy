@@ -239,6 +239,26 @@ class RunnerTest(unittest.TestCase):
                 result = cli(tmp, "-j", str(jobs))
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_package_load_tests_controls_discovery_in_both_modes(self):
+        init = (
+            "def load_tests(loader, tests, pattern):\n"
+            "    assert pattern == 'case_*.py', pattern\n"
+            "    return loader.discover(__path__[0], pattern='chosen.py')\n"
+        )
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"helper.py": "X = 1\n", "outer/__init__.py": "",
+                            "outer/pkg/__init__.py": init, "outer/pkg/chosen.py": PASS,
+                            "outer/pkg/case_excluded.py": "raise AssertionError('excluded child imported')\n",
+                            "outer/case_sibling.py": PASS})
+                result = cli(tmp, "-j", str(jobs), "-p", "case_*.py")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("excluded child imported", result.stdout + result.stderr)
+                if jobs == 1:
+                    self.assertIn("Ran 4 tests", result.stderr)
+                else:
+                    self.assertIn("3 files, 4 tests, 0 files failed", result.stdout)
+
     def test_empty_package_alone_is_not_a_false_green(self):
         # -j 1 forwards to discover, which exits 5 when nothing ran; a parallel run whose only job is an empty
         # initializer must not report success either.

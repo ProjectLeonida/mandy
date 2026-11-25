@@ -12,7 +12,8 @@ the pattern matches their basenames, not directory paths. Package `__init__.py` 
 because discover imports them and runs any TestCase they define regardless of the pattern. No matching files is an
 error in serial and parallel runs.
 
-It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py` by default, and packages below it), each in its own process from that folder, so a file sees the same import path as under discover.
+It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py` by default, and packages below it), each in its own process from that folder, so a file sees the same import path as under discover. A package's
+`load_tests` hook receives the discovery pattern and controls which tests run in that package's worker.
 
 The files can run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
 or on a single core, it runs that discover command itself. Prints the output of every failing file and one summary
@@ -37,24 +38,49 @@ import subprocess
 import sys
 import tempfile
 import time
+import unittest
 
 MAX_TIMEOUT_SECONDS = 24 * 60 * 60
 
-# The child runs the module through unittest's own program and writes the result to a file, so the count of tests
-# comes from the result object and nothing the module writes can change it. The exit codes are unittest's own: 1
-# when a test failed, 5 when nothing ran at all, 0 otherwise. The module is left unset, as `python -m unittest` leaves it, so
-# the name is imported and not looked up as an attribute of the program itself.
-CHILD_PROGRAM = (
-    "import json, os, sys, unittest\n"
-    "program = unittest.TestProgram(module=None, argv=['unittest'] + sys.argv[1:], exit=False)\n"
-    "result = program.result\n"
-    "with open(os.environ['LEONIDA_TEST_COUNT'], 'w', encoding='utf-8') as handle:\n"
-    "    json.dump({'testsRun': result.testsRun}, handle)\n"
-    "if not result.wasSuccessful():\n"
-    "    sys.exit(1)\n"
-    "elif result.testsRun == 0 and len(result.skipped) == 0:\n"
-    "    sys.exit(5)\n"
-    "sys.exit(0)\n")
+CHILD_PROGRAM = "import runpy, sys; sys.exit(runpy.run_path(sys.argv[1])['run_worker'](*sys.argv[2:]))"
+
+
+def write_worker_result(count, include_children):
+    with open(os.environ["LEONIDA_TEST_COUNT"], "w", encoding="utf-8", newline="\n") as handle:
+        json.dump({"testsRun": count, "includeChildren": include_children}, handle)
+
+
+class PackageLoader(unittest.TestLoader):
+    def __init__(self, pattern):
+        super().__init__()
+        self.pattern = pattern
+        self.include_children = False
+
+    def loadTestsFromModule(self, module, *, pattern=None):
+        self.include_children = getattr(module, "load_tests", None) is None
+        if self.include_children:
+            # Children can still run if a test in the initializer times out or crashes later.
+            write_worker_result(None, True)
+            return super().loadTestsFromModule(module, pattern=pattern)
+        # Enter through discover so a hook can call loader.discover() itself without being called recursively.
+        return unittest.TestLoader().discover(os.path.dirname(module.__file__), pattern=self.pattern,
+                                             top_level_dir=os.getcwd())
+
+
+def run_worker(module, pattern, verbosity):
+    """Run one worker's suite and report unittest's result independently of its printed output."""
+    # Import the package by its name so its initializer is not also executed as pkg.__init__.
+    target = module.removesuffix(".__init__")
+    loader = PackageLoader(pattern) if target != module else unittest.TestLoader()
+    program = unittest.TestProgram(module=None, argv=["unittest", target], testLoader=loader,
+                                   verbosity=int(verbosity), exit=False)
+    result = program.result
+    write_worker_result(result.testsRun, getattr(loader, "include_children", False))
+    if not result.wasSuccessful():
+        return 1
+    if result.testsRun == 0 and not result.skipped:
+        return 5
+    return 0
 
 
 def module_path(directory, module):
@@ -66,7 +92,7 @@ def module_path(directory, module):
 
 
 def test_modules(directory, pattern="test*.py"):
-    """Dotted names of the test modules unittest discover finds under `directory` (it enters packages only)."""
+    """Candidate module names under `directory`, including initializers of importable packages."""
     names = []
     for base, dirs, files in os.walk(directory):
         dirs[:] = sorted(d for d in dirs if os.path.isfile(os.path.join(base, d, "__init__.py")))
@@ -93,23 +119,18 @@ def positive_seconds(value):
     return seconds
 
 
-def read_count(path):
-    """The number of tests the child ran, as unittest's own result object reported it."""
+def read_worker_result(path):
     try:
         with open(path, encoding="utf-8") as handle:
-            return int(json.load(handle)["testsRun"])
+            result = json.load(handle)
+        return result["testsRun"], result["includeChildren"]
     except (OSError, ValueError, KeyError, TypeError):
-        # The child wrote no result: it did not finish, so no test is known to have run.
-        return 0
+        return None, False
 
 
-def run_module(directory, module, verbose, timeout=None):
-    """(return code, tests run, output) of `python -m unittest <target>` run from `directory`."""
-    # `python -m unittest pkg.__init__` imports pkg and then runs the same file again as pkg.__init__, so a
-    # registration in the initializer happens twice. Running the package itself imports it once; module_path() is
-    # still the initializer's path, so the jobs stay sorted by the file they run.
-    target = module[:-len(".__init__")] if module.endswith(".__init__") else module
-    cmd = [sys.executable, "-c", CHILD_PROGRAM, *(["-v"] if verbose else []), target]
+def run_module(directory, module, pattern, verbose, timeout):
+    """Return the worker's exit code, test count, output and whether to run the package's children."""
+    cmd = [sys.executable, "-c", CHILD_PROGRAM, os.path.abspath(__file__), module, pattern, "2" if verbose else "1"]
     with tempfile.TemporaryDirectory() as scratch:
         count_path = os.path.join(scratch, "count.json")
         env = dict(os.environ, LEONIDA_TEST_COUNT=count_path)
@@ -121,14 +142,14 @@ def run_module(directory, module, verbose, timeout=None):
             parts = [chunk.decode(locale.getpreferredencoding(False), errors="replace") if isinstance(chunk, bytes)
                      else chunk for chunk in (exc.stdout, exc.stderr) if chunk]
             out = "".join(parts)
-            return 1, 0, out + f"\nTIMED OUT after {timeout:g} s: {module}\n"
-        count = read_count(count_path)
+            _, include_children = read_worker_result(count_path)
+            return 1, 0, out + f"\nTIMED OUT after {timeout:g} s: {module}\n", include_children
+        count, include_children = read_worker_result(count_path)
     out = p.stdout + p.stderr
     # Discover imports every package initializer, but an empty one has no tests to run. It is included in the
     # module list so parallel runs see TestCase classes when there are any; without them, it is not a failure.
-    if p.returncode == 5 and count == 0 and module.endswith(".__init__") and "NO TESTS RAN" in p.stderr:
-        return 0, 0, out
-    return p.returncode, count, out
+    code = 0 if p.returncode == 5 and count == 0 and module.endswith(".__init__") else p.returncode
+    return code, count or 0, out, include_children
 
 
 def main(argv=None):
@@ -156,19 +177,34 @@ def main(argv=None):
             return 1
     # Largest files first: they tend to run longest, and one started last would set the wall time alone.
     modules.sort(key=lambda m: -os.path.getsize(module_path(directory, m)))
-    start, total, failed = time.monotonic(), 0, []
+    children = {}
+    for module in modules:
+        package, _, _ = module.removesuffix(".__init__").rpartition(".")
+        children.setdefault(package, []).append(module)
+
+    start, total, files_run, failed = time.monotonic(), 0, 0, []
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:
-        jobs = {pool.submit(run_module, directory, m, a.verbose, a.timeout): m for m in modules}
-        for job in concurrent.futures.as_completed(jobs):
-            code, ran, out = job.result()
-            total += ran
-            if code:
-                failed.append(jobs[job])
-                print(f"==== FAILED: {jobs[job]}\n{out}", flush=True)
-            elif a.verbose:
-                print(f"==== {jobs[job]}\n{out}", flush=True)
+        def submit(package):
+            return {pool.submit(run_module, directory, m, a.pattern, a.verbose, a.timeout): m
+                    for m in children.get(package, ())}
+
+        jobs = submit("")
+        while jobs:
+            completed, _ = concurrent.futures.wait(jobs, return_when=concurrent.futures.FIRST_COMPLETED)
+            for job in completed:
+                module = jobs.pop(job)
+                code, ran, out, include_children = job.result()
+                files_run += 1
+                total += ran
+                if include_children:
+                    jobs.update(submit(module.removesuffix(".__init__")))
+                if code:
+                    failed.append(module)
+                    print(f"==== FAILED: {module}\n{out}", flush=True)
+                elif a.verbose:
+                    print(f"==== {module}\n{out}", flush=True)
     took = time.monotonic() - start
-    summary = f"{len(modules)} files, {total} tests, {len(failed)} files failed in {took:.0f} s with {a.jobs} jobs"
+    summary = f"{files_run} files, {total} tests, {len(failed)} files failed in {took:.0f} s with {a.jobs} jobs"
     print(summary + (": " + ", ".join(sorted(failed)) if failed else ""))
     if total == 0:
         # An empty package initializer is a job that legitimately runs no tests; a run where every job did is not a
