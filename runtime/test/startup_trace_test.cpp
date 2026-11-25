@@ -9,6 +9,7 @@
 // map, unimplemented_call with the caller as module+RVA, debug_string with the text, exception with the faulting
 // RVA and access kind. No game data and no GPU are involved.
 // LEONIDA_TEST_DIR names the folder for the image and the trace, as for loader_test; the default is the temp folder.
+#include "test_temp_dir.h"
 #include <windows.h>
 
 #include <cstdint>
@@ -113,7 +114,7 @@ std::vector<uint8_t> make_image() {
 
 fs::path test_dir() {
     const char* env = std::getenv("LEONIDA_TEST_DIR");
-    fs::path dir = (env && *env ? fs::path(env) : fs::temp_directory_path()) /
+    fs::path dir = (env && *env ? fs::path(env) : testfiles::temp_dir()) /
                    ("leonida_startup_trace_" + std::to_string(GetCurrentProcessId()));
     fs::create_directories(dir);
     return dir;

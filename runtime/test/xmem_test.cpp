@@ -8,6 +8,7 @@
 // nothing committed, and one trace event per distinct (type, size). XMemVirtualAlloc accepts attribute words and console
 // graphics protection bits and commits 2 MiB guest pages; the placeholder flags pass through; physical pages keep their
 // contents across unmap and remap, alias when mapped twice, and scatter-map per address.
+#include "test_temp_dir.h"
 #include <windows.h>
 #include <malloc.h>
 #include <psapi.h>
@@ -782,7 +783,7 @@ void test_physical_pages_commit_on_touch(const PhysicalApi& api) {
     wchar_t directory[MAX_PATH]{};
     wchar_t path[MAX_PATH]{};
     bool read_ok = false;
-    if (GetTempPathW(MAX_PATH, directory) && GetTempFileNameW(directory, L"xpg", 0, path)) {
+    if (wcscpy_s(directory, testfiles::temp_dir().c_str()) == 0 && GetTempFileNameW(directory, L"xpg", 0, path)) {
         std::vector<uint32_t> pattern(kPage64k / sizeof(uint32_t));
         for (size_t i = 0; i < pattern.size(); ++i) pattern[i] = 0x7e570000u + static_cast<uint32_t>(i);
         const HANDLE out =
@@ -1229,7 +1230,7 @@ void test_heap_lock_faults(const PhysicalApi& api) {
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
 void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc) {
     wchar_t temp[MAX_PATH];
-    GetTempPathW(MAX_PATH, temp);
+    wcscpy_s(temp, testfiles::temp_dir().c_str());
     const std::wstring path =
         std::wstring(temp) + L"xmem_trace_test_" + std::to_wstring(GetCurrentProcessId()) + L".jsonl";
     DeleteFileW(path.c_str());
@@ -1322,7 +1323,7 @@ void test_transfer_memory(XMemTransferMemoryFn transfer) {
 // gta6rt --trace: one "xmem_transfer" event per distinct (type, size), none with the trace off.
 void test_transfer_trace(XMemTransferMemoryFn transfer) {
     wchar_t temp[MAX_PATH];
-    GetTempPathW(MAX_PATH, temp);
+    wcscpy_s(temp, testfiles::temp_dir().c_str());
     const std::wstring path =
         std::wstring(temp) + L"xmem_transfer_trace_test_" + std::to_wstring(GetCurrentProcessId()) + L".jsonl";
     DeleteFileW(path.c_str());
