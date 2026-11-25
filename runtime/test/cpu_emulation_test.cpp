@@ -339,6 +339,71 @@ void test_live(const ce::Host& host) {
     Code ud({0x0F, 0x0B, 0xC3});
     check(!run(ud, nullptr, nullptr, &ex) && ex == STATUS_ILLEGAL_INSTRUCTION, "ud2 still faults");
 }
+
+void test_page_edge_faults() {
+    // Guard-page and read-only faults through apply(Op::clzero), plus code ending at an unmapped page boundary.
+    if (auto* page = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
+        std::memset(page, 0xCC, 256);
+        DWORD old = 0;
+        if (VirtualProtect(page, 4096, PAGE_READONLY, &old)) {
+            CONTEXT c{};
+            c.Rax = reinterpret_cast<uint64_t>(page + 64 + 9);
+            const uint64_t rip = 0x1000;
+            c.Rip = rip;
+            EXCEPTION_RECORD fault{};
+            check(!ce::apply(dec({0x0F, 0x01, 0xFC}), &c, &fault) && c.Rip == rip,
+                  "clzero on read-only VirtualAlloc page is refused without advancing rip");
+            check(fault.ExceptionCode == STATUS_ACCESS_VIOLATION && fault.NumberParameters == 2 &&
+                      fault.ExceptionInformation[0] == 1 &&
+                      fault.ExceptionInformation[1] == reinterpret_cast<ULONG_PTR>(page + 64),
+                  "clzero on read-only page reports write fault at aligned line");
+        }
+        if (VirtualProtect(page, 4096, PAGE_READWRITE | PAGE_GUARD, &old)) {
+            CONTEXT c{};
+            c.Rax = reinterpret_cast<uint64_t>(page + 128 + 5);
+            const uint64_t rip = 0x2000;
+            c.Rip = rip;
+            EXCEPTION_RECORD fault{};
+            check(!ce::apply(dec({0x0F, 0x01, 0xFC}), &c, &fault) && c.Rip == rip,
+                  "clzero on guard page raises fault without advancing rip");
+            check(fault.ExceptionCode == STATUS_GUARD_PAGE_VIOLATION,
+                  "clzero on guard page reports STATUS_GUARD_PAGE_VIOLATION");
+            check(ce::apply(dec({0x0F, 0x01, 0xFC}), &c, &fault) && c.Rip == rip + 3,
+                  "second clzero after guard clears succeeds and advances rip");
+            bool line_zeroed = true;
+            for (int i = 128; i < 192; ++i) line_zeroed &= page[i] == 0;
+            check(line_zeroed && page[127] == 0xCC && page[192] == 0xCC,
+                  "second clzero zeroes only [128, 192)");
+        }
+        VirtualFree(page, 0, MEM_RELEASE);
+    }
+
+    // Reserve two pages and commit only the first, so byte 4096 marks an unreadable boundary.
+    if (auto* span = static_cast<uint8_t*>(VirtualAlloc(nullptr, 8192, MEM_RESERVE, PAGE_NOACCESS))) {
+        if (VirtualAlloc(span, 4096, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
+            // mov rax, rcx; clzero; ret (7 bytes) ending right at span + 4096
+            const uint8_t stub[] = {0x48, 0x89, 0xC8, 0x0F, 0x01, 0xFC, 0xC3};
+            uint8_t* const entry = span + 4096 - sizeof stub;
+            std::memcpy(entry, stub, sizeof stub);
+            FlushInstructionCache(GetCurrentProcess(), entry, sizeof stub);
+#if defined(_MSC_VER) && !defined(__clang__)
+            uint8_t fetched[15]{};
+            check(ce::read_code_seh(reinterpret_cast<uint64_t>(entry + 3), fetched, sizeof fetched) == 4 &&
+                      fetched[0] == 0x0F && fetched[1] == 0x01 && fetched[2] == 0xFC && fetched[3] == 0xC3,
+                  "read_code_seh stops cleanly at unmapped page boundary");
+            check(ce::read_code_seh(reinterpret_cast<uint64_t>(span + 4096), fetched, sizeof fetched) == 0,
+                  "read_code_seh returns 0 on unmapped page");
+#endif
+            alignas(64) uint8_t target[64];
+            std::memset(target, 0x77, sizeof target);
+            reinterpret_cast<Fn>(entry)(target, nullptr);
+            bool zeroed = true;
+            for (uint8_t b : target) zeroed &= b == 0;
+            check(zeroed, "emulated clzero at executable page boundary runs cleanly");
+        }
+        VirtualFree(span, 0, MEM_RELEASE);
+    }
+}
 }  // namespace
 
 int main() {
@@ -350,6 +415,7 @@ int main() {
                 host.clwb);
     check(ce::install(), "install the handler");
     test_live(host);
+    test_page_edge_faults();
     if (failures) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
