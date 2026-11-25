@@ -1,13 +1,29 @@
 root = true
 
+# Mirrors .gitattributes: LF everywhere except the Windows script and solution files, which are CRLF.
 [*]
 charset = utf-8
 end_of_line = lf
 insert_final_newline = true
+trim_trailing_whitespace = true
 
-[*.{bat,cmd,ps1,sln}]
+[*.ps1]
 end_of_line = crlf
 
+[*.cmd]
+end_of_line = crlf
+
+[*.bat]
+end_of_line = crlf
+
+[*.sln]
+end_of_line = crlf
+
+# Two trailing spaces are a hard line break in Markdown.
+[*.md]
+trim_trailing_whitespace = false
+
+# These existing test sources carry a UTF-8 BOM.
 [runtime/test/d3d12_depth_resolve_test.cpp]
 charset = utf-8-bom
 
