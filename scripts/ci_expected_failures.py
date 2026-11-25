@@ -16,10 +16,13 @@ import sys
 
 def judge(failed: list[str], status: int, expected: list[str]) -> tuple[int, list[str]]:
     """(exit status, GitHub Actions workflow commands to print)."""
+    failed = list(dict.fromkeys(failed))
+    expected = list(dict.fromkeys(expected))
     unexpected = [name for name in failed if name not in expected]
     lines = [f"::error::{name} failed" for name in unexpected]
-    # subprocess reports a signal as -N; the shell pipelines in runtime.yml report it as 128+N.
-    if status < 0 or 128 < status <= 255:
+    # subprocess reports a signal as -N; runtime.yml shell pipelines report 128+N;
+    # Windows abnormal terminations report unsigned NTSTATUS / Win32 exit codes > 128.
+    if status < 0 or status > 128:
         lines.append(f"::error::abnormal test runner exit {status}; the failure list may be incomplete")
         return 1, lines
     if status != 0 and not failed:
@@ -52,7 +55,8 @@ def main(argv: list[str]) -> int:
         return 2
     expected = [name for arg in argv[2:] for name in arg.split()]
     code, lines = judge(failed, status, expected)
-    print("\n".join(lines))
+    if lines:
+        print("\n".join(lines))
     return code
 
 

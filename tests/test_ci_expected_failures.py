@@ -116,5 +116,48 @@ class Main(unittest.TestCase):
         self.assertIn("'x'", err.getvalue())
 
 
+class WindowsCrashDedupAndCleanStdoutTests(unittest.TestCase):
+    def test_windows_ntstatus_exit_codes_are_abnormal(self):
+        for status in (0xC0000005, 0xC00000FD):  # 3221225477, 3221225725
+            code, lines = cef.judge(["expected_a"], status, ["expected_a"])
+            self.assertEqual(code, 1)
+            self.assertEqual(
+                lines,
+                [f"::error::abnormal test runner exit {status}; the failure list may be incomplete"],
+            )
+
+    def test_duplicate_failed_and_expected_emit_deduped_in_order(self):
+        code, lines = cef.judge(
+            ["u2", "exp_ok", "u1", "u2", "exp_ok"],
+            1,
+            ["exp_pass", "exp_ok", "exp_pass"],
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            lines,
+            [
+                "::error::u2 failed",
+                "::error::u1 failed",
+                "::notice::exp_pass passed: drop it from the expected failures",
+                "::warning::exp_ok failed, as expected until its fix is merged",
+            ],
+        )
+
+    def test_main_clean_run_emits_empty_stdout(self):
+        import contextlib
+        import io
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            failed_list = Path(tmp) / "failed.txt"
+            failed_list.write_text("", encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = cef.main([str(failed_list), "0"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.getvalue(), "")
+
+
 if __name__ == "__main__":
     unittest.main()
