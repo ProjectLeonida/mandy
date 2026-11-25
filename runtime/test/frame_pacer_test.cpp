@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <future>
 #include <limits>
+#include <memory>
 #include <thread>
 
 using namespace leonida;
@@ -86,6 +87,24 @@ int main() {
         EXPECT(pacer.tokens_issued() == 2);
     }
 
+    {
+        ManualFrameClock clock;
+        auto tokens = std::make_shared<FrameTokenSource>();
+        FramePacer pacer(clock, tokens);
+        EXPECT(pacer.token_source() == tokens);
+        const std::uint64_t outside = tokens->issue();
+        EXPECT(outside == 1 && pacer.tokens_issued() == 1);
+        EXPECT(pacer.check_present_token(outside) == pacer_hr::ok);
+        EXPECT(pacer.check_present_token(outside + 1) == pacer_hr::invalid_arg);
+        EXPECT(setup(pacer, 1));
+        clock.advance_us(period);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == outside + 1);
+        EXPECT(tokens->issue() == outside + 2);
+        EXPECT(pacer.check_present_token(outside + 2) == pacer_hr::ok);
+        EXPECT(pacer.check_present_token(outside + 3) == pacer_hr::invalid_arg);
+    }
+
     // An offset delays the event inside the period: origin n comes at n * period + offset.
     {
         ManualFrameClock clock;
@@ -134,6 +153,29 @@ int main() {
         EXPECT(blocked(next));
         clock.advance_us(period / 2);
         EXPECT(next.get().token == 2);
+    }
+
+    // wait_flag_current_token never blocks or times out: a fresh token for the newest passed origin, registered or not.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock, nullptr, true);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &token) == pacer_hr::ok &&
+               token == 1);
+        EXPECT(setup(pacer, 1));
+        clock.advance_us(period * 2 + period / 4);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &token) == pacer_hr::ok &&
+               token == 2);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &token) == pacer_hr::ok &&
+               token == 3);
+        std::uint32_t count = 1;
+        FrameStatistic stat;
+        EXPECT(pacer.get_frame_statistics(3, stat_frame_event, &count, &stat) == pacer_hr::ok);
+        EXPECT(stat.time_us == period * 2);
+        auto next = wait_async(pacer, infinite_timeout_ms);
+        EXPECT(blocked(next));
+        clock.advance_us(period * 3 / 4);
+        EXPECT(next.get().token == 4);
     }
 
     // Timeouts: 0 polls, a finite one counts fake time, the token is left alone, and a later wait still works.

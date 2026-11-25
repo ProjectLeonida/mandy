@@ -1895,10 +1895,15 @@ void update_keyboard_pad() {
     }
     clip_cursor(active && g_raw_ready && g_cursor_pos.load() == system_cursor_pos && foreground_is_ours());
     for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
-    // Timed presses on the keyboard pad, in seconds since its first update. Each press lasts 300 ms.
+    // LEONIDA_INPUT_SCRIPT="a@70,a@85,start@120" (with LEONIDA_KEYBOARD_PAD=always): timed presses on the keyboard
+    // pad, in seconds since the pad's first update, each held 300 ms. For unattended boots: the title's first prompt
+    // waits for a button with no timeout (docs/re/notes/firstframe.md, step 5). Buttons: a b x y start back lb rb
+    // up down left right. The rsup and rsdown entries replay the right-stick throws logged below.
+    int right_y = g_keyboard.right_y;
     struct ScriptedPress {
         SDL_GamepadButton button;
         double at;
+        int right_y = 0;
     };
     static const std::vector<ScriptedPress> script = [] {
         std::vector<ScriptedPress> out;
@@ -1925,6 +1930,11 @@ void update_keyboard_pad() {
             const double seconds = std::strtod(time, &tail);
             if (tail == time || !std::isfinite(seconds) || seconds < 0 ||
                 item.find_first_not_of(whitespace, tail - item.c_str()) != std::string::npos) continue;
+            if (item.compare(first, sep - first, "rsup") == 0 || item.compare(first, sep - first, "rsdown") == 0) {
+                const bool up = item.compare(first, sep - first, "rsup") == 0;
+                out.push_back({SDL_GAMEPAD_BUTTON_INVALID, seconds, up ? -kStickFull : kStickFull});
+                continue;
+            }
             for (const auto& [name, button] : names) {
                 if (item.compare(first, sep - first, name) == 0) {
                     out.push_back({button, seconds});
@@ -1944,8 +1954,13 @@ void update_keyboard_pad() {
         bool scripted[SDL_GAMEPAD_BUTTON_COUNT] = {};
         bool named[SDL_GAMEPAD_BUTTON_COUNT] = {};
         for (const auto& press : script) {
-            named[press.button] = true;
-            if (now >= press.at && now < press.at + 0.3) scripted[press.button] = true;
+            const bool held = now >= press.at && now < press.at + 0.3;
+            if (press.right_y) {
+                if (held) right_y = press.right_y;
+            } else {
+                named[press.button] = true;
+                scripted[press.button] |= held;
+            }
         }
         for (int button = 0; button < SDL_GAMEPAD_BUTTON_COUNT; ++button) {
             if (!named[button]) continue;
@@ -1961,7 +1976,7 @@ void update_keyboard_pad() {
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFTX, static_cast<Sint16>(lx * reach));
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFTY, static_cast<Sint16>(ly * reach));
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHTX, static_cast<Sint16>(g_keyboard.right_x));
-    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHTY, static_cast<Sint16>(g_keyboard.right_y));
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHTY, static_cast<Sint16>(right_y));
     // SDL maps a full-range virtual axis to the trigger, so -32768 is released, 0 half pulled, 32767 full.
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, aim ? 32767 : -32768);
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, fire ? 32767 : -32768);
@@ -2032,6 +2047,33 @@ void poll_once() {
         read_raw(d, &snap);
         const bool guide_changed = d->last_snap.guide != snap.guide;
         const bool changed = !(d->last_snap == snap);
+        // Every press is logged in LEONIDA_INPUT_SCRIPT's own form (name@seconds), so a session played by hand can
+        // be replayed unattended: join the logged items with commas. The right stick's vertical throws (what scrolls
+        // a page) are logged as rsup/rsdown. LEONIDA_INPUT_LOG=0 turns the lines off.
+        {
+            static const bool log_presses = env("LEONIDA_INPUT_LOG") != "0";
+            static const ULONGLONG log_origin = GetTickCount64();
+            if (log_presses) {
+                static const std::pair<uint32_t, const char*> kNames[] = {
+                    {GameInputGamepadA, "a"},  {GameInputGamepadB, "b"},
+                    {GameInputGamepadX, "x"},  {GameInputGamepadY, "y"},
+                    {GameInputGamepadMenu, "start"},  {GameInputGamepadView, "back"},
+                    {GameInputGamepadLeftShoulder, "lb"},  {GameInputGamepadRightShoulder, "rb"},
+                    {GameInputGamepadDPadUp, "up"},  {GameInputGamepadDPadDown, "down"},
+                    {GameInputGamepadDPadLeft, "left"},  {GameInputGamepadDPadRight, "right"}};
+                const double at = (GetTickCount64() - log_origin) / 1000.0;
+                const uint32_t pressed = snap.gamepad.buttons & ~d->last_snap.gamepad.buttons;
+                for (const auto& n : kNames)
+                    if (pressed & n.first)
+                        std::fprintf(stderr, "[rt] gameinput: press %s@%.1f (%s)\n", n.second, at, d->name.c_str());
+                const auto throw_of = [](float y) { return y > 0.6f ? 1 : y < -0.6f ? -1 : 0; };
+                const int was = throw_of(d->last_snap.gamepad.rightThumbstickY);
+                const int is = throw_of(snap.gamepad.rightThumbstickY);
+                if (is != was && is != 0)
+                    std::fprintf(stderr, "[rt] gameinput: press %s@%.1f (%s)\n", is > 0 ? "rsup" : "rsdown", at,
+                                 d->name.c_str());
+            }
+        }
         d->last_snap = snap;
         // A newly opened pad's first sample here is its baseline (active_input.h), so connecting a pad with a button
         // held changes nothing.
