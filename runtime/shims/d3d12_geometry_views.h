@@ -180,6 +180,35 @@ class GeometryViews {
         }
         return it->second == SIZE_MAX ? nullptr : tile_scratch_.data() + it->second;
     }
+    // A run of address-adjacent written tiles as one guarded copy, the way the Radeon runtime joins neighboring fetch
+    // ranges (DexNom/VIctory host.rs copy_fetch_runs, GPL-3.0-or-later): the title writes across 64 KiB boundaries, so
+    // one copy of the run skips a readability probe and a guarded copy per boundary. The tiles' read offsets are
+    // recorded so the per-tile read_tile() below reuses them; a run it cannot read whole is read tile by tile instead.
+    template<class Copy>
+    bool read_run(std::size_t first, std::size_t last, Copy& copy) {
+        const std::size_t at = tile_scratch_.size();
+        const std::size_t bytes = (last - first) * tile_size;
+        tile_scratch_.resize(at + bytes);
+        if (copy(tile_scratch_.data() + at, reinterpret_cast<const std::uint8_t*>(written_vas_[first]), bytes) !=
+            GeometryCopy::copied) {
+            tile_scratch_.resize(at);
+            return false;
+        }
+        for (std::size_t i = first; i < last; ++i)
+            tile_reads_[written_vas_[i]] = at + (i - first) * tile_size;
+        return true;
+    }
+    // Whether any view over the run [first, last) wants a tile copy (not pinned, not whole, filled already): a run no
+    // view needs is not read.
+    bool run_needed(std::size_t first, std::size_t last) const {
+        for (std::size_t i = first; i < last; ++i) {
+            for (const auto id : written_[i]->views) {
+                if (id >= marks_.size() || (marks_[id] & kPinned)) continue;
+                if (views_[id].ready) return true;
+            }
+        }
+        return false;
+    }
     template<class Copy>
     void fill(View& v, Copy& copy) {
         const auto result = copy(v.dst, reinterpret_cast<const std::uint8_t*>(v.source), v.size);
@@ -477,6 +506,7 @@ public:
         } guard{refreshing_};
         // The views over each tile written since, with those tiles (in address order, as tiles_ is): a ready view
         // copies only them, 64 KiB each, not the whole view again (LEONIDA_GEOMETRY_WHOLE_VIEWS=1: whole views).
+        // Neighboring written tiles are read as one run (read_run below), the copy-range merge VIctory uses.
         static const bool whole = [] {
             const char* v = std::getenv("LEONIDA_GEOMETRY_WHOLE_VIEWS");
             return v && *v && *v != '0';
@@ -515,6 +545,17 @@ public:
         const std::size_t changed_tiles = written_vas_.size();
         tile_reads_.clear();
         tile_scratch_.clear();
+        // Adjacent written tiles are one guarded copy. The written tiles are in address order, so group them into runs
+        // whose addresses differ by a tile, and read each run some view needs before the per-tile pass, which then
+        // reuses its bytes through read_tile(). Whole-view refreshes read nothing here: they fill whole views below.
+        if (!whole) {
+            for (std::size_t w = 0; w < written_vas_.size();) {
+                std::size_t e = w + 1;
+                while (e < written_vas_.size() && written_vas_[e] == written_vas_[e - 1] + tile_size) ++e;
+                if (e - w > 1 && run_needed(w, e)) read_run(w, e, copy);
+                w = e;
+            }
+        }
         std::size_t changed_views = 0;
         for (const Address va : written_vas_) {
             const auto tile_it = tiles_.find(va);

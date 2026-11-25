@@ -5,14 +5,15 @@
 //   2. a write into one tile of a 1 MiB view (16 tiles) copies that tile's 64 KiB again, not the view;
 //   3. a write into a tile two views share is read once and copied into both;
 //   4. two written tiles of one view are two tile copies (LEONIDA_GEOMETRY_WHOLE_VIEWS=1, whole views, fails 2-4);
-//   5. a small cap refuses past its budget without re-trying while nothing changed;
-//   6. retiring a range defers freeing until its GPU ticket completes, then returns budget and lets refused ranges retry;
-//   7. releasing every view in a sub-4 MiB block via geometry_writes::note_released destroys the block and frees its budget;
-//   8. note_released ignores ranges outside the watched tile bounds and queues ranges inside them;
-//   9. overflowing the release queue (65537 disjoint ranges) collapses to one covering range and retires covered views;
-//  10. reaping the last view in a standard 4 MiB block keeps it as a spare and the next view reuses it;
-//  11. under a cap, an unfitting 4 MiB spare is destroyed so a larger request can succeed (or fail if still over cap);
-//  12. one note_released reaches every GeometryViews instance, and a destroyed instance unsubscribes cleanly.
+//   5. two address-adjacent written tiles of one view are one 128 KiB copy (the adjacent copy-range merge).
+//   6. a small cap refuses past its budget without re-trying while nothing changed;
+//   7. retiring a range defers freeing until its GPU ticket completes, then returns budget and lets refused ranges retry;
+//   8. releasing every view in a sub-4 MiB block via geometry_writes::note_released destroys the block and frees its budget;
+//   9. note_released ignores ranges outside the watched tile bounds and queues ranges inside them;
+//  10. overflowing the release queue (65537 disjoint ranges) collapses to one covering range and retires covered views;
+//  11. reaping the last view in a standard 4 MiB block keeps it as a spare and the next view reuses it;
+//  12. under a cap, an unfitting 4 MiB spare is destroyed so a larger request can succeed (or fail if still over cap);
+//  13. one note_released reaches every GeometryViews instance, and a destroyed instance unsubscribes cleanly.
 #include <windows.h>
 
 #include <cstdint>
@@ -179,6 +180,15 @@ int main() {
     views.refresh(copy);
     check(g_copies.size() == 2 && g_copies[0] == kTile && g_copies[1] == kTile, "two written tiles, two tile copies");
     check(!std::memcmp(copy_bytes, title, kView), "the copy matches the title's pages");
+
+    // 5. Writes in two address-adjacent tiles of one view: one 128 KiB copy, not two 64 KiB ones.
+    g_copies.clear();
+    title_write(base + 6 * kTile + 7, 3);
+    title_write(base + 7 * kTile + 11, 4);
+    views.refresh(copy);
+    check(g_copies.size() == 1 && g_copies[0] == 2 * kTile, "two adjacent written tiles are one 128 KiB copy");
+    check(copy_bytes[6 * kTile + 7] == 3 && copy_bytes[7 * kTile + 11] == 4, "both adjacent tiles reached the copy");
+    check(!std::memcmp(copy_bytes, title, kView), "the copy matches the title's pages after the merged run");
 
     views.release(device);
     VirtualFree(title, 0, MEM_RELEASE);
