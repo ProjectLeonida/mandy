@@ -11197,9 +11197,8 @@ private:
             refused += (refused.empty() ? "" : "; ") + why + " " + std::to_string(n);
         std::size_t owned = 0, slot133 = 0, mapped = 0, filled = 0;
         VkDeviceSize owned_bytes = 0, placed_bytes = 0, host_heap_bytes = 0;
-        // The title pages a filled image was made from, and how much of them is still in RAM: the copy the GPU
-        // image duplicates (#1702). Only with the memory probe on, since it queries the working set per texture.
-        std::uint64_t source_bytes = 0, resident_source_bytes = 0;
+        // With the probe on, collect the CPU ranges that filled the images. Aliases may share a range.
+        std::vector<leonida::working_set::CpuRange> sources;
         const bool probe = leonida::mem_probe::interval_seconds() != 0;
         for (const auto& [address, t] : state_.title_textures) {
             (t->owned ? owned : slot133) += 1;
@@ -11208,21 +11207,27 @@ private:
             filled += t->fills > 0;
             (t->owned ? owned_bytes : placed_bytes) += t->backing_bytes;
             if (!t->device_local) host_heap_bytes += t->backing_bytes;
-            if (probe && t->fills && !t->gpu_written && t->layout_known && t->cpu && t->layout.layout.size) {
-                source_bytes += t->layout.layout.size;
-                resident_source_bytes += leonida::working_set::resident_bytes(t->cpu, t->layout.layout.size);
+            if (probe && t->fills && !t->gpu_written && t->layout_known && t->cpu && t->layout.layout.size &&
+                t->layout.layout.size <= UINT64_MAX - t->cpu) {
+                sources.push_back({t->cpu, t->cpu + t->layout.layout.size});
             }
         }
-        if (leonida::mem_probe::interval_seconds())
+        if (probe) {
+            leonida::working_set::merge_cpu_ranges(sources);
+            std::uint64_t source_bytes = 0, resident_source_bytes = 0;
+            for (const auto& [begin, end] : sources) {
+                source_bytes += end - begin;
+                resident_source_bytes += leonida::working_set::resident_bytes(begin, end - begin);
+            }
             log_title_image_uses(state_.title_textures, retired_title_textures_.size(), retired_backing_, state_.zero_image_bytes.load());
-        if (leonida::mem_probe::interval_seconds())
             std::fprintf(stderr, "[rt] mem-probe: registered image backing: %.1f MiB from slot 70, %.1f MiB from slot "
                                  "133, %.1f MiB total on non-device-local types; staged fills %llu, %.3f s, buffer %.1f MiB; "
-                                 "title pages behind filled images %.1f MiB, %.1f MiB of them resident in RAM\n",
+                                 "unique title memory behind filled images %.1f MiB, %.1f MiB of it resident in RAM\n",
                          double(owned_bytes) / 1048576.0, double(placed_bytes) / 1048576.0,
                          double(host_heap_bytes) / 1048576.0, static_cast<unsigned long long>(s.staged_fills),
                          double(s.staged_ns) / 1e9, double(state_.title_upload.capacity()) / 1048576.0,
                          double(source_bytes) / 1048576.0, double(resident_source_bytes) / 1048576.0);
+        }
         std::fprintf(stderr,
                      "[rt] d3d12: title textures (%s): %llu slot-70 texture views (%zu kinds), %llu of slot-133 textures, "
                      "%llu of images made for them (%llu made, %llu over memory not readable yet, %llu retired), %llu "

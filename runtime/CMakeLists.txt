@@ -39,6 +39,17 @@ if(MSVC)
   target_link_options(root_signature_test PRIVATE /OPT:NOREF)
 endif()
 
+# The memory probe merges CPU ranges on every platform. Windows also tests the working-set query on real pages.
+add_executable(working_set_test test/working_set_test.cpp)
+if(WIN32)
+  target_compile_definitions(working_set_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_link_libraries(working_set_test PRIVATE psapi)
+endif()
+if(MSVC)
+  target_compile_options(working_set_test PRIVATE /W4 /permissive- /utf-8)
+endif()
+add_test(NAME working_set COMMAND working_set_test)
+
 option(LEONIDA_BUILD_WINDOWS_RUNTIME "Build the Windows runtime, its shims and their tests" ${WIN32})
 if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # Custom CMAKE_CXX_FLAGS can replace MSVC's default /EHsc. Require C++ stack unwinding so error
@@ -302,14 +313,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(xmem_test PRIVATE /W4 /permissive- /utf-8 $<$<CXX_COMPILER_ID:Clang>:/EHa>)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
-
-  # The memory probe's resident-bytes estimate (src/working_set.h): committed and touched pages read as resident, a
-  # reserved range and pages dropped from the working set do not.
-  add_executable(working_set_test test/working_set_test.cpp)
-  target_compile_definitions(working_set_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_compile_options(working_set_test PRIVATE /W4 /permissive- /utf-8)
-  target_link_libraries(working_set_test PRIVATE psapi)
-  add_test(NAME working_set COMMAND working_set_test)
 
   # The title's CLZERO loops rewritten to stubs on a CPU without CLZERO (src/clzero_patch.h): both loop shapes are
   # found, patched and run, so the test runs on any x86-64 CPU.

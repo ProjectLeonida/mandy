@@ -12,16 +12,36 @@ void check(bool ok, const char* what) {
         ++failures;
     }
 }
-}  // namespace
+void check_cpu_ranges() {
+    using namespace leonida::working_set;
+    constexpr std::uint64_t start = 0x100000;
+    constexpr std::uint64_t size = 128 << 10;
+    std::vector<CpuRange> ranges{{start, start + size}, {start, start + size}};
+    merge_cpu_ranges(ranges);
+    check(ranges.size() == 1 && ranges[0].begin == start && ranges[0].end == start + size,
+          "two aliases count as 128 KiB of unique CPU memory");
 
-int main() {
+    ranges = {{50, 60}, {25, 40}, {10, 30}, {20, 22}, {40, 45}, {80, 80}};
+    merge_cpu_ranges(ranges);
+    check(ranges.size() == 2 && ranges[0].begin == 10 && ranges[0].end == 45 &&
+          ranges[1].begin == 50 && ranges[1].end == 60,
+          "overlapping, nested and adjacent ranges merge without filling gaps");
+}
+
+#ifdef _WIN32
+void check_resident_ranges() {
     using leonida::working_set::resident_bytes;
     constexpr SIZE_T size = 8u << 20;
     auto* touched = static_cast<unsigned char*>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     auto* untouched = static_cast<unsigned char*>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     auto* reserved = static_cast<unsigned char*>(VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_NOACCESS));
     check(touched && untouched && reserved, "allocations");
-    if (failures) return 1;
+    if (!touched || !untouched || !reserved) {
+        if (touched) VirtualFree(touched, 0, MEM_RELEASE);
+        if (untouched) VirtualFree(untouched, 0, MEM_RELEASE);
+        if (reserved) VirtualFree(reserved, 0, MEM_RELEASE);
+        return;
+    }
     std::memset(touched, 1, size);
     const auto base = [](const void* p) { return reinterpret_cast<std::uint64_t>(p); };
 
@@ -39,7 +59,15 @@ int main() {
     VirtualFree(touched, 0, MEM_RELEASE);
     VirtualFree(untouched, 0, MEM_RELEASE);
     VirtualFree(reserved, 0, MEM_RELEASE);
-    if (failures) return 1;
     std::printf("working_set: written, untouched, reserved, half-written and trimmed ranges\n");
-    return 0;
+}
+#endif
+}  // namespace
+
+int main() {
+    check_cpu_ranges();
+#ifdef _WIN32
+    check_resident_ranges();
+#endif
+    return failures ? 1 : 0;
 }

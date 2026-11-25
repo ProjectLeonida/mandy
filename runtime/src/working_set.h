@@ -6,6 +6,7 @@
 // exact count: a range smaller than `step` pages is read from its first page only. Pages that are not committed, or
 // not mapped at all, read as not resident.
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -20,6 +21,26 @@
 namespace leonida::working_set {
 
 constexpr std::uint64_t kPage = 4096;
+
+struct CpuRange {
+    std::uint64_t begin;
+    std::uint64_t end;
+};
+
+// Texture aliases and overlapping views can refer to the same CPU bytes. Count their union.
+inline void merge_cpu_ranges(std::vector<CpuRange>& ranges) {
+    std::sort(ranges.begin(), ranges.end(), [](const CpuRange& a, const CpuRange& b) { return a.begin < b.begin; });
+    std::size_t count = 0;
+    for (const CpuRange range : ranges) {
+        if (range.begin >= range.end) continue;
+        if (count && range.begin <= ranges[count - 1].end) {
+            ranges[count - 1].end = std::max(ranges[count - 1].end, range.end);
+        } else {
+            ranges[count++] = range;
+        }
+    }
+    ranges.resize(count);
+}
 
 // Estimated resident bytes of [base, base + size): the share of sampled pages that are valid in the working set,
 // times size. 0 for an empty range or where the query is not available.
