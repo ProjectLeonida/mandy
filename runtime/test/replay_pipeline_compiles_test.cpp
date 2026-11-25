@@ -547,6 +547,80 @@ void random_submissions(PipelineWorkers& workers) {
                                                     std::to_string(succeeded));
 }
 
+// Re-preparing after a prior compile pass reuses prior outcomes (both built handles and non-strict failed compute
+// dispatches) without re-invoking build() or failing the submission.
+void prior_compiles_reuse(PipelineWorkers& workers) {
+    Registry registry({
+        {.compute = true, .pending = true, .fails = false, .with_built = true},
+        {.compute = true, .pending = true, .fails = true, .with_built = true},
+    });
+    const std::vector<CommandList> lists = record({{
+        CommandSpec{.kind = CommandSpec::dispatch, .pipeline = 1},
+        CommandSpec{.kind = CommandSpec::dispatch, .pipeline = 2},
+    }});
+    std::vector<PreparedList> prepared(1);
+    ReplayFunctions vk = functions(registry);
+    PipelineCompiles first;
+    vk.compiles = &first;
+    const ReplayResult r0 = prepare(lists[0], resolve, vk, prepared[0]);
+    check(r0 == ReplayResult::success && first.size() == 2, "prior_compiles_reuse: pass 0 collected both");
+    first.build([&](std::size_t count, const std::function<void(std::size_t)>& job) { workers.run(count, job); });
+    const ReplayResult c0 = check_compiled_pipelines(first, r0);
+    if (strict_replay()) {
+        check(c0 == ReplayResult::unresolved_resource, "prior_compiles_reuse: strict fails on failed dispatch");
+        return;
+    }
+    check(c0 == ReplayResult::success, "prior_compiles_reuse: non-strict tolerates failed dispatch");
+    check(registry.owners[0]->attempts.size() == 1 && registry.owners[1]->attempts.size() == 1,
+          "prior_compiles_reuse: each pipeline built once on pass 0");
+    // Reset the failed flag on owner 2 so any redundant build() call on pass 1 would be caught in attempts.
+    registry.owners[1]->failed = false;
+
+    PipelineCompiles second;
+    vk.compiles = &second;
+    const ReplayResult r1 = prepare(lists[0], resolve, vk, prepared[0]);
+    const ReplayResult b1 = build_pipelines(
+        second, std::span(prepared), r1,
+        [&](std::size_t count, const std::function<void(std::size_t)>& job) { workers.run(count, job); },
+        &first);
+    check(b1 == ReplayResult::success, "prior_compiles_reuse: pass 1 succeeded");
+    check(registry.owners[0]->attempts.size() == 1 && registry.owners[1]->attempts.size() == 1,
+          "prior_compiles_reuse: pass 1 did not re-invoke build() on prior failure");
+    check(prepared[0].commands[0].pipeline.pipeline == handle<VkPipeline>(0x1001),
+          "prior_compiles_reuse: built compute handle attached");
+    check(prepared[0].commands[1].pipeline.pipeline == VK_NULL_HANDLE,
+          "prior_compiles_reuse: failed compute dispatch stays dropped");
+}
+
+// Serial compilation stops at the first refused graphics draw (matching pre-unlock serial semantics and
+// d3d12_pipeline_workers::refused_graphics) instead of compiling later pipelines in the same submission.
+void serial_stops_at_refused_draw() {
+    Registry registry({
+        {.compute = false, .pending = true, .fails = false},
+        {.compute = false, .pending = true, .fails = true},
+        {.compute = false, .pending = true, .fails = false},
+        {.compute = false, .pending = true, .fails = false},
+    });
+    const std::vector<CommandList> lists = record({{
+        CommandSpec{.kind = CommandSpec::draw, .pipeline = 1},
+        CommandSpec{.kind = CommandSpec::draw, .pipeline = 2},
+        CommandSpec{.kind = CommandSpec::draw, .pipeline = 3},
+        CommandSpec{.kind = CommandSpec::draw, .pipeline = 4},
+    }});
+    std::vector<PreparedList> prepared(1);
+    ReplayFunctions vk = functions(registry);
+    PipelineCompiles compiles;
+    vk.compiles = &compiles;
+    const ReplayResult r = prepare(lists[0], resolve, vk, prepared[0]);
+    check(r == ReplayResult::success && compiles.size() == 4, "serial_stops: collected all 4 draws");
+    const ReplayResult out = build_pipelines_serial(compiles, std::span(prepared), r);
+    check(out == ReplayResult::unsupported, "serial_stops: refused draw returns unsupported");
+    check(registry.owners[0]->attempts.size() == 1 && registry.owners[1]->attempts.size() == 1,
+          "serial_stops: built first draw and attempted refused second draw");
+    check(registry.owners[2]->attempts.empty() && registry.owners[3]->attempts.empty(),
+          "serial_stops: did not compile draws past the first refused draw");
+}
+
 }  // namespace
 
 int main() {
@@ -555,8 +629,10 @@ int main() {
         cases(workers);
         if (threads) many(workers);
         reused_lists(workers);
+        prior_compiles_reuse(workers);
         random_submissions(workers);
     }
+    serial_stops_at_refused_draw();
     check(large_together == 0, "two large pipelines were built at once");
     if (failures) return 1;
     std::printf("replay_pipeline_compiles_test: passed\n");
