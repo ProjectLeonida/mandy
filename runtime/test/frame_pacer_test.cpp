@@ -368,6 +368,38 @@ int main() {
                count == 1);
     }
 
+    // Repeat presents are still paced, but the token's timestamps belong to its first frame.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 2));
+        clock.advance_us(period);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok);
+        pacer.commit_present_token(token, 1);
+
+        const auto first_presentation_is_intact = [&] {
+            std::uint32_t count = 2;
+            FrameStatistic stats[2];
+            return pacer.get_frame_statistics(token, stat_present | stat_display, &count, stats) == pacer_hr::ok &&
+                   count == 2 && stats[0].time_us == period && stats[1].time_us == period * 2;
+        };
+
+        clock.advance_us(period + 1);
+        pacer.commit_present_token(token, 1);
+        EXPECT(pacer.frames_in_flight() == 1);
+        EXPECT(first_presentation_is_intact());
+        clock.advance_us(period);
+        EXPECT(pacer.frames_in_flight() == 0);
+        EXPECT(first_presentation_is_intact());
+
+        pacer.set_uncapped(true);
+        clock.advance_us(period);
+        pacer.commit_present_token(token, 1);
+        EXPECT(first_presentation_is_intact());
+        EXPECT(pacer.pacing_summary().frames == 3);
+    }
+
     // Suspend: a blocked waiter fails, presents are refused, registration is gone after resume and must be redone;
     // tokens keep counting.
     {
