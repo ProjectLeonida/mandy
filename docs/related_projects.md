@@ -182,6 +182,24 @@ and for GFX11 the order of LLVM's `UfmtGFX11::UnifiedFormat`). The GFX11 numbers
 hardware oracle itself (a wrong FORMAT changes the fetched words); the GFX10 numbers and layout are Mesa's and not yet
 run on RDNA2 hardware.
 
+## Marvisak/VIctory
+
+<https://github.com/Marvisak/VIctory>
+
+A Windows compatibility layer that runs the same Xbox Series title's x64 code natively in its own process and
+translates console RDNA2 GPU programs to DXIL for Direct3D 12. Its README documents measured facts about the
+host-side D3D12 surface and the console shader programs; this repository already cites several of them in
+`docs/d3d12_command_objects.md`, `docs/d3d12_vulkan.md`, `docs/design.md` and `docs/runtime_imports.md`.
+
+**Licence:** GPL-3.0-or-later, compatible with this repository's licence. The rule is still facts only: no code,
+tables or comments are copied.
+
+**What we use:** the public observations already credited in those pages — the bottom-of-pipe write model for
+queue lists, the `CopyPageMappingsBatchX` argument shape and its place in the queue slots, the descriptor-selection
+pattern for per-lane buffer reads, and the offline `XPackage`/`XSystem` API behaviour. Each is used as a lead that
+Leonida reimplements independently and verifies with its own census, synthetic tests or a contributor's own copy.
+Its README status tables describe its own builds, not ours; nothing here assumes its results transfer to Leonida.
+
 ## The line
 
 | Fine | Not fine |
