@@ -8550,7 +8550,7 @@ class Gen:
         elif op == "v_fract_f64":
             # D.f64 = S0.f64 - floor(S0.f64) (RDNA2 ISA, VOP1 opcode 62), with the edges of v_fract_f32 and
             # v_fract_f16 (docs/design.md, "v_fract_f64"). Only a finite normal source reaches the driver's Floor;
-            # a NaN, an infinity and a subnormal are selected from the operand's words.
+            # a NaN, an infinity, a zero and a subnormal are selected from the operand's words.
             if len(a) != 2 or a[0]["k"] != "vgpr" or a[0].get("n") != 2:
                 raise Unsupported(op + " operands")
             dst, src = a
@@ -8558,6 +8558,10 @@ class Gen:
                     or any(mod not in ("mul:2", "mul:4", "div:2", "clamp") for mod in mods)
                     or (ins["op"].endswith("_e32") and (mods or src.get("neg") or src.get("abs")))):
                 raise Unsupported(op + " modifier")
+            if self.round_mode:
+                # x - floor(x) of a negative non-integer is rounded, and whether the instruction follows MODE.FP_ROUND
+                # is not measured; only v_add_f64 models the directed f64 rounding modes (f64_add_mode).
+                raise Unsupported(op + " under a directed MODE.FP_ROUND")
             self.uses_f64 = True
             low, high = self.f64_source_words(src, op)
             if src.get("abs"):
@@ -8585,6 +8589,13 @@ class Gen:
             fract_high = emit_u(f"OpCompositeExtract %uint {fract_words} 1")
             out_low = emit_u(f"OpSelect %uint {is_one} {self.cu(0xFFFFFFFF)} {fract_low}")
             out_high = emit_u(f"OpSelect %uint {is_one} {self.cu(0x3FEFFFFF)} {fract_high}")
+            # A zero source (of either sign) gives +0: x - x is +0, but Floor(-0.0) is a zero of either sign by the
+            # language, so a driver returning +0 would make -0 - +0 = -0.
+            magnitude_high = emit_u(f"OpBitwiseAnd %uint {high} {self.cu(0x7FFFFFFF)}")
+            magnitude_words = emit_u(f"OpBitwiseOr %uint {magnitude_high} {low}")
+            is_zero = emit_u(f"OpIEqual %bool {magnitude_words} {self.cu(0)}")
+            out_low = emit_u(f"OpSelect %uint {is_zero} {self.cu(0)} {out_low}")
+            out_high = emit_u(f"OpSelect %uint {is_zero} {self.cu(0)} {out_high}")
             exponent = emit_u(f"OpBitwiseAnd %uint {high} {self.cu(0x7FF00000)}")
             fraction_high = emit_u(f"OpBitwiseAnd %uint {high} {self.cu(0x000FFFFF)}")
             fraction = emit_u(f"OpBitwiseOr %uint {fraction_high} {low}")

@@ -190,6 +190,18 @@ class FractF64Operands(unittest.TestCase):
         self.assertNotIn("OpFMul %double", spv)
         self.assertNotIn("FClamp", spv)
 
+    def test_refused_in_a_program_that_writes_mode_fp_round(self):
+        # x - floor(x) of a negative non-integer is rounded, and only v_add_f64 models the directed f64 modes: -0.1 gives
+        # 0x3FECCCCCCCCCCCCD to nearest and 0x3FECCCCCCCCCCCCC toward zero, so the program is refused, not translated
+        # to the nearest-even word.
+        with self.assertRaises(support.rdna2spirv.Unsupported) as refused:
+            support.translate_lines("ps_fract_f64_round_mode", [
+                "s_round_mode 0xc", "v_mov_b32 v0, 0x9999999a", "v_mov_b32 v1, 0xbfb99999", FRACT,
+                "exp mrt0 v4, v5, v4, v5 done vm", "s_endpgm"])
+        self.assertIn("MODE.FP_ROUND", str(refused.exception))
+        # the same program without the write translates
+        self.assertEqual(run_bits(FRACT, 0xBFB999999999999A), 0x3FECCCCCCCCCCCCD)
+
     def test_rejects_forms_it_does_not_translate(self):
         for instruction in ("v_fract_f64 v4, v[0:1]",                       # a 32-bit destination
                             "v_fract_f64 v[4:5], v0",                       # a 32-bit source
@@ -200,6 +212,32 @@ class FractF64Operands(unittest.TestCase):
             with self.subTest(instruction=instruction):
                 with self.assertRaises(support.rdna2spirv.Unsupported):
                     support.translate_lines("ps_fract_f64_bad", [instruction, "s_endpgm"])
+
+
+class FractF64LlvmFoldWords(unittest.TestCase):
+    """The f64 words of LLVM's constant-folding test for llvm.amdgcn.fract.f64, as literals.
+
+    Origin: llvm/test/Transforms/InstSimplify/ConstProp/AMDGPU/fract.ll, `test_f64` (the fold is in
+    llvm/lib/Analysis/ConstantFolding.cpp: fmin(x - floor(x), nextDown(1.0)) in APFloat). A compile-time model, not a
+    hardware measurement. The file's other three f64 inputs, +inf, -inf and +qnan, all fold to +qnan (0x7FF8000000000000)
+    there; this translator gives the measured f32/f16 words instead (negative quiet NaN for an infinity, a NaN unchanged),
+    so they are not pinned here. LLVM's comment calls 2.0e-308 the "min normal": it is a subnormal (0x000E61ACF033D1A4).
+    """
+    CASES = (
+        ("+0.0", 0x0000000000000000, 0x0000000000000000),
+        ("-0.0", 0x8000000000000000, 0x0000000000000000),
+        ("+1.0", 0x3FF0000000000000, 0x0000000000000000),
+        ("-1.0", 0xBFF0000000000000, 0x0000000000000000),
+        ("+2.25", 0x4002000000000000, 0x3FD0000000000000),
+        ("-6.125", 0xC018800000000000, 0x3FEC000000000000),
+        ("+2.0e-308", 0x000E61ACF033D1A4, 0x000E61ACF033D1A4),
+        ("-2.0e-308", 0x800E61ACF033D1A4, 0x3FEFFFFFFFFFFFFF),
+    )
+
+    def test_translator_reproduces_llvms_fold_words(self):
+        for name, source, want in self.CASES:
+            with self.subTest(name=name):
+                self.assertEqual(run_bits(FRACT, source), want)
 
 
 class FractF64SpecialSources(unittest.TestCase):
@@ -219,6 +257,11 @@ class FractF64SpecialSources(unittest.TestCase):
                     self.assertEqual(run_bits(FRACT, source), want)
         self.assertTrue(calls, "the driver's Floor still ran; its answer for those sources is what is not used")
 
+    # Which tests would pass without the infinity select: on this interpreter inf - inf is x86's negative NaN
+    # (spirv_mini_interp.ieee_nan), which is the expected word, so test_infinities_give_the_negative_quiet_nan and the
+    # infinity rows of test_the_driver_model_changes_nothing would pass even if the translated code left an infinity to
+    # the subtraction. Only the test below, which makes that NaN the positive one, fails without the select (checked by
+    # mutation: two failures, both its sources).
     def test_an_infinity_gives_the_negative_nan_whatever_nan_the_subtraction_makes(self):
         # inf - inf is left to the hardware by the language: the interpreter returns x86's negative NaN, an ARM
         # CPU or a driver may return the positive one. The translated code does not depend on it.
@@ -226,6 +269,23 @@ class FractF64SpecialSources(unittest.TestCase):
             for source in (0x7FF0000000000000, 0xFFF0000000000000):
                 with self.subTest(source=hex(source)):
                     self.assertEqual(run_bits(FRACT, source), NEG_QNAN)
+
+    def test_a_zero_source_gives_plus_zero_whatever_floor_of_minus_zero_is(self):
+        # Floor(-0.0) is a zero of either sign by the language. A driver that returns +0 makes -0 - (+0) = -0 unless the
+        # zero is selected from the operand's words.
+        class Math:
+            def __getattr__(self, name):
+                return getattr(math, name)
+
+            @staticmethod
+            def copysign(magnitude, sign):
+                return 0.0 if magnitude == 0.0 else math.copysign(magnitude, sign)
+
+        with patch.object(spirv_mini_interp, "math", Math()):
+            for source in (POS_ZERO, NEG_ZERO):
+                with self.subTest(source=hex(source)):
+                    self.assertEqual(run_bits(FRACT, source), POS_ZERO)
+            self.assertEqual(run_bits(FRACT, 0x3FF4000000000000), 0x3FD0000000000000)   # the model changes nothing else
 
     def test_the_selection_is_what_keeps_a_negative_subnormal_below_one(self):
         # Without it the driver model gives Floor(-subnormal) = -0 and a result of -subnormal; this is the check that
