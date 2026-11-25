@@ -356,6 +356,7 @@ def f16_interp_fallback() -> bool:
 
 _PER_VERTEX = []
 _BARYCENTRIC_FALLBACK = []
+_EXPLICIT_LOD_BIAS = []
 
 
 def _device_per_vertex():
@@ -385,6 +386,32 @@ def _device_barycentric_fallback():
             pass
         _BARYCENTRIC_FALLBACK.append(answer)
     return _BARYCENTRIC_FALLBACK[0]
+
+
+def _device_explicit_lod_bias():
+    """explicit_lod_bias from tools/vk_subgroup_info.py (MoltenVK), cached per suite, or None."""
+    if not _EXPLICIT_LOD_BIAS:
+        answer = None
+        try:
+            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
+                               capture_output=True, text=True, timeout=60)
+            answer = json.loads(r.stdout.strip().splitlines()[-1]).get("explicit_lod_bias")
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            pass
+        _EXPLICIT_LOD_BIAS.append(answer)
+    return _EXPLICIT_LOD_BIAS[0]
+
+
+def explicit_lod_bias() -> bool:
+    """LEONIDA_EXPLICIT_LOD_BIAS=1 (or 0): translate with --explicit-lod-bias, so an explicit-LOD sample takes the
+    S# LOD_BIAS in the shader. Unset, it is on where the driver drops mipLodBias there: tools/vk_subgroup_info.py
+    reports explicit_lod_bias true (MoltenVK)."""
+    v = (os.environ.get("LEONIDA_EXPLICIT_LOD_BIAS") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return _device_explicit_lod_bias() is True
 
 
 def w64_emulated() -> bool:
@@ -942,6 +969,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--f16-interp-fallback")
         if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
             cmd.append("--texel-offset-fallback")
+        if explicit_lod_bias():   # the S# LOD bias added to explicit LODs, which MoltenVK's sampler drops
+            cmd.append("--explicit-lod-bias")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
             cmd.append("--mesh-compute")
         if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1

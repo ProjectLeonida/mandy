@@ -1775,7 +1775,7 @@ WAVE64_MODES = ("auto", "on", "off")
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
                   ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
-                  ("--compact-spirv", "compact_spirv"))
+                  ("--compact-spirv", "compact_spirv"), ("--explicit-lod-bias", "explicit_lod_bias"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -1890,6 +1890,18 @@ def runtime_gpu_info() -> dict:
         return info if isinstance(info, dict) and "error" not in info else {}
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return {}
+
+
+def runtime_gpu_explicit_lod_bias():
+    """explicit_lod_bias as tools/vk_subgroup_info.py answers for the GPU the runtime would use: True where the driver
+    drops the sampler's mipLodBias (MoltenVK), None when it can't tell."""
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
+                           capture_output=True, text=True, timeout=60)
+        v = json.loads(r.stdout.strip().splitlines()[-1]).get("explicit_lod_bias")
+        return None if v is None else bool(v)
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
 
 
 def runtime_gpu_per_vertex():
@@ -3025,6 +3037,9 @@ def main() -> int:
     ap.add_argument("--texel-offset-fallback", action="store_true",
                     help="fold the run-time texel offset of image_sample*_o into the coordinate, for devices "
                          "without VK_KHR_maintenance8")
+    ap.add_argument("--explicit-lod-bias", action="store_true",
+                    help="apply the S# LOD bias in the shaders, for a driver whose sampler drops it; on by itself "
+                         "when the runtime's GPU is on MoltenVK")
     ap.add_argument("--f16-interp-fallback", action="store_true",
                     help="16-bit interpolation from decoded halves the vertex/mesh shader exports instead of "
                          "PerVertexKHR inputs; on by itself when the runtime's GPU can't use them (MoltenVK)")
@@ -3122,6 +3137,14 @@ def main() -> int:
             a.f16_interp_fallback = True
         elif per_vertex is None:
             a.f16_interp_fallback = keep_recorded_fallback("--f16-interp-fallback", work)
+    if "shaders" in stages and not a.explicit_lod_bias:
+        drops_bias = runtime_gpu_explicit_lod_bias()
+        if drops_bias is True:
+            log("shaders: the GPU the runtime would use drops the sampler's LOD bias (MoltenVK): translating with "
+                "--explicit-lod-bias")
+            a.explicit_lod_bias = True
+        elif drops_bias is None:
+            a.explicit_lod_bias = keep_recorded_fallback("--explicit-lod-bias", work)
     if "shaders" in stages:
         if a.bary_fallback:
             # Command-line precedence: --bary-fallback wins over LEONIDA_BARY_FALLBACK=0.

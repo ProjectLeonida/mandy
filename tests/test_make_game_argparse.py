@@ -364,6 +364,7 @@ class JobsHandlingTest(unittest.TestCase):
                                         patch("make_game.wave64_settings", return_value=(True, True)) as probe, \
                                         patch("make_game.runtime_gpu_per_vertex", return_value=None), \
                                         patch("make_game.runtime_gpu_barycentric_fallback", return_value=None), \
+                                        patch("make_game.runtime_gpu_explicit_lod_bias", return_value=None), \
                                         patch("make_game.runtime_gpu_max_push_constants", return_value=None), \
                                         patch("make_game.runtime_gpu_mesh_draws_crash", return_value=None):
                                     ret = make_game.main()

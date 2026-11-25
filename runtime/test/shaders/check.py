@@ -1593,6 +1593,9 @@ SAMPLER_CASES = [("point", ssharp_words(1), (0, 1)),                       # 0 /
                  ("point min_lod 1", ssharp_words(1, min_lod=1), (0, 1)),  # 1 / 1: MIN_LOD clamps an explicit LOD too
                  ("point bias +1", ssharp_words(1, bias=1), (0, 1)),       # 1 / 1: the S# bias applies to an explicit LOD
                  ("point bias -1", ssharp_words(1, bias=-1), (0, 1)),      # 0 / 0
+                 # +-0.3 keeps LOD 0 / 1 on levels 0 / 1; the bias counted twice (+-0.6) moves one of them
+                 ("point bias +0.3", ssharp_words(1, bias=0.3), (0, 1)),   # 0 / 1
+                 ("point bias -0.3", ssharp_words(1, bias=-0.3), (0, 1)),  # 0 / 1
                  ("none", ssharp_words(0), (0, 1)),                        # 0 / 0: MIP_FILTER_NONE reads the base level
                  ("none min_lod 1", ssharp_words(0, min_lod=1), (0, 1)),   # 0 / 0: and ignores the LOD clamp
                  ("point base 1", ssharp_words(1), (1, 1))]                # 1 / 1: the T#'s BASE_LEVEL starts the view

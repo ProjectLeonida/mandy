@@ -1068,7 +1068,7 @@ class SamplerMipChecks(unittest.TestCase):
 
     def test_levels_follow_the_s_and_t_fields(self):
         want = {"point": (0, 1), "point max_lod 0": (0, 0), "point min_lod 1": (1, 1), "point bias +1": (1, 1),
-                "point bias -1": (0, 0), "none": (0, 0), "none min_lod 1": (0, 0), "point base 1": (1, 1)}
+                "point bias -1": (0, 0), "point bias +0.3": (0, 1), "point bias -0.3": (0, 1), "none": (0, 0), "none min_lod 1": (0, 0), "point base 1": (1, 1)}
         self.assertEqual({name for name, _, _ in check.SAMPLER_CASES}, set(want))
         for name, words, view in check.SAMPLER_CASES:
             with self.subTest(name=name):
