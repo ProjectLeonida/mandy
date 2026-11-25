@@ -1,0 +1,26 @@
+GPU:        NVIDIA GeForce RTX 3070 (Ampere / GA104, 8 GB), subgroup 32..32
+Driver:     NVIDIA 610.88 (proprietary), Vulkan 1.4.341
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32)
+OS:         Windows 11 Pro, 10.0.26300
+Commit:     21625bca8c675c62f9dbffc318ce6a59d57faf31 (main, 2026-11-24)
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools, Windows, AMDGPU target), SPIRV-Tools v2026.4,
+            CMake 4.4.4 + llvm-mingw clang 23.1.6 (Ninja, RelWithDebInfo), Python 3.15.2
+run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val
+            native:                 197/248 passed, 49 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  229/248 passed, 17 skipped, 2 failed
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (native and emulated alike): exit 1, "r32 sint (sint view):
+            64 bad, texel(5,3) = 2071"; the tfe status VGPR is read but never written (#31) - the same
+            pair, and the same numbers, as the Radeon 780M, RTX 3070 Ti and RTX 4070 records. Not rerun with #98.
+Skipped:    native: the wave64 compute cases ("no 64-wide compute subgroup on this device"), the 64-wide
+            fragment case, and the 16 documented "run by d3d12_*_test / w64_graphics.py" cases.
+            Emulated: the same 16 documented cases, plus the 64-wide fragment one.
+Notes:
+- Built with CMake 4.4.4 + Ninja and llvm-mingw clang 23.1.6, with
+  -DLEONIDA_BUILD_WINDOWS_RUNTIME=OFF: the portable Vulkan tools only (no MSVC or Windows SDK on this
+  machine). The full Windows runtime/D3D12 tests are not built, which is why the 16 documented cases
+  skip instead of running.
+- No game files involved: run_gpu_tests.py assembles its own RDNA2 fixtures with llvm-mc and runs the
+  translated SPIR-V on the Vulkan device.
+- All other cases were exact: the pixel cases 4096/4096 and the compute values exact. The two tfe
+  failures are the only failures and match the known NVIDIA result.
+- AI-assisted (DeepSeek v4.1 Flash 1017). No game data, nothing online.
