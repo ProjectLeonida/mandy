@@ -110,7 +110,7 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
                 "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
                 "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_andn2_exec",
                 "cs_mask_vgpr_exec", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi",
-                "cs_w32_exec_computed")
+                "cs_w32_exec_computed", "cs_w32_min3_med3_16")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
@@ -151,6 +151,9 @@ CS_DUMPS = [*CS_DPP, ("cs_smem_vcc_base", CS_SMEM_VCC), ("cs_store", CS_STORE), 
             ("cs_w32_fcmpswap", [0, 0x3F800000, 0x7FC00000, 0x3F800000, 0x80000000, 0x40400000, 0x3F800000, 0x7FC00000]),
             ("cs_w32_new_ops", [0x55, 0x8001, 0xC0000000, 0x80014000, 0x4000FFFF, 0x77, 0x99, 0x1234]),
             ("cs_w32_misc_ext", [0x0FFF0FFF, 0xE2C4A688, 0x0007FFFF, 0x7FFF8000, 0xFFFE0002, 0xFFFF0005, 0x509, 0xCAFEF00D]),
+            # 16-bit three-operand min3/max3/med3 with op_sel and dest-half preservation (cs_w32_min3_med3_16.asm)
+            ("cs_w32_min3_med3_16", [0xCAFE8000, 0x3C00BEEF, 0x12348000, 0x00055678,
+                                     0x9ABC7FFF, 0xFFFFDEF0, 0x4321FFF6, 0x80008765]),
             ("cs_w32_salu64", [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE]),
             # SHADER-85: 8-bit LDS reads into one half of a VGPR, the other half kept
             ("cs_w32_lds_u8_d16", [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234]),
@@ -1293,10 +1296,10 @@ def vcmpx_forms_narrow_skip(out):
 # Dump words a driver gets wrong with or without SignedZeroInfNanPreserve, by the first word of the device name on
 # vk_compute_test's "device: ..." line. Only these words go unjudged there. Shared with run_gpu_tests.py.
 # - Apple GPUs (MoltenVK) return +0 for cs_signed_zero_nan's -0 products, words 0, 2 and 3 (v_mul_f32, v_pk_mul_f16,
-#   v_mul_f16; #1203, SHADER-182).
+#   v_mul_f16; #1203, SHADER-182), and +0 (0xCAFE0000 vs 0xCAFE8000) for cs_w32_min3_med3_16 word 0 (NMin(-0.0, +0.0)).
 # - Mesa llvmpipe returns 0 in word 5, the NaN check of 0 * inf (an inline-constant 0), while its other NaN checks give
 #   1 (#664, Mesa with LLVM 21.1.8). The CI runs the GPU tests on llvmpipe.
-UNJUDGED_WORDS = {"Apple": {"cs_signed_zero_nan": (0, 2, 3)},
+UNJUDGED_WORDS = {"Apple": {"cs_signed_zero_nan": (0, 2, 3), "cs_w32_min3_med3_16": (0,)},
                   "llvmpipe": {"cs_signed_zero_nan": (5,)}}
 
 

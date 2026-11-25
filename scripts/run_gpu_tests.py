@@ -1212,7 +1212,7 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
                       "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_barrier_early_end",
                       "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_w64x_cmp_sdst", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_andn2_exec",
-                      "cs_mask_vgpr_exec", "cs_w32_exec_computed", "cs_w64_exec_computed"):
+                      "cs_mask_vgpr_exec", "cs_w32_exec_computed", "cs_w64_exec_computed", "cs_w32_min3_med3_16"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
@@ -1238,6 +1238,9 @@ def run_suite(a, work: str) -> int:
                 "cs_w32_fcmpswap": [0, 0x3F800000, 0x7FC00000, 0x3F800000, 0x80000000, 0x40400000, 0x3F800000, 0x7FC00000],
                 "cs_w32_new_ops": [0x55, 0x8001, 0xC0000000, 0x80014000, 0x4000FFFF, 0x77, 0x99, 0x1234],
                 "cs_w32_misc_ext": [0x0FFF0FFF, 0xE2C4A688, 0x0007FFFF, 0x7FFF8000, 0xFFFE0002, 0xFFFF0005, 0x509, 0xCAFEF00D],
+                # 16-bit three-operand min3/max3/med3 with op_sel and dest-half preservation (cs_w32_min3_med3_16.asm)
+                "cs_w32_min3_med3_16": [0xCAFE8000, 0x3C00BEEF, 0x12348000, 0x00055678,
+                                        0x9ABC7FFF, 0xFFFFDEF0, 0x4321FFF6, 0x80008765],
                 "cs_w32_salu64": [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE],
                 # SHADER-85: ds_read_u8/i8_d16[_hi] (cs_w32_lds_u8_d16.asm header)
                 "cs_w32_lds_u8_d16": [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234],
@@ -1343,7 +1346,7 @@ def run_suite(a, work: str) -> int:
                                   "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
                                   "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_dpp_cmp", "cs_w32_andn2_exec",
-                                  "cs_w32_exec_computed") and not emulated and not partial
+                                  "cs_w32_exec_computed", "cs_w32_min3_med3_16") and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)
