@@ -123,6 +123,41 @@ class RelativePaths(unittest.TestCase):
 
 
 class WorkDirectory(unittest.TestCase):
+    def test_simultaneous_cli_runs_cannot_share_an_explicit_work_directory(self):
+        ext = ".exe" if os.name == "nt" else ""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build = root / "build"
+            build.mkdir()
+            for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS:
+                (build / (tool + ext)).touch()
+            work = root / "work"
+            options = ["--build", str(build), "--filter", "no_matching_shader"]
+
+            def contender(directory):
+                return subprocess.run(
+                    [sys.executable, "-I", run_gpu_tests.__file__, *options, "--work", str(directory)],
+                    capture_output=True, text=True, timeout=10,
+                )
+
+            def owner_suite(_args, _directory):
+                blocked = contender(work)
+                self.assertEqual(blocked.returncode, 2, blocked.stderr)
+                self.assertIn("cannot lock GPU test directory", blocked.stderr)
+                self.assertIn("use a different --work", blocked.stderr)
+                separate = contender(root / "other-work")
+                self.assertEqual(separate.returncode, 2, separate.stderr)
+                self.assertIn("matched no GPU test cases", separate.stderr)
+                return 1  # The lock must also be released when a run fails.
+
+            with patch.object(sys, "argv", [run_gpu_tests.__file__, *options, "--work", str(work)]), \
+                    patch.object(run_gpu_tests, "run_suite", side_effect=owner_suite):
+                self.assertEqual(run_gpu_tests.main(), 1)
+
+            retry = contender(work)
+            self.assertEqual(retry.returncode, 2, retry.stderr)
+            self.assertIn("matched no GPU test cases", retry.stderr)
+
     def test_file_blocking_work_directory_is_a_cli_error(self):
         ext = ".exe" if os.name == "nt" else ""
         for blocked_child in ("", "spirv"):

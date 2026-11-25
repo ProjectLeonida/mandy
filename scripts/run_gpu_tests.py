@@ -6,6 +6,7 @@ Usage:
 --llvm-mc (or LLVM_MC) is a path or a whole command, e.g. "wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc".
 """
 import argparse
+from contextlib import ExitStack, contextmanager
 import json
 import math
 import os
@@ -767,7 +768,7 @@ def main() -> int:
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"),
                     help="CMake build folder; with the Visual Studio generator the RelWithDebInfo/Release/... "
                          "subfolder that has the test programs is found by itself")
-    ap.add_argument("--work", default=None)
+    ap.add_argument("--work", default=None, help="artifact directory to keep for replay; one run can use it at a time")
     ap.add_argument("--filter", default="")
     ap.add_argument("--require-pass", action="store_true", help="exit 1 if no GPU test passes")
     ap.add_argument("--assembler", choices=("auto", "spirv-as", "python"), default="auto",
@@ -828,10 +829,35 @@ def main() -> int:
                   "short name, so the test programs and the Vulkan SDK tools can't open files in it. Pass --work "
                   "with a folder whose path they can, such as C:\\leonida_gpu_work.", file=sys.stderr)
             return 2
-        return run_suite(a, native)
+        with ExitStack() as active:
+            if a.work is not None:
+                try:
+                    active.enter_context(hold_work_directory(native))
+                except OSError as exc:
+                    print(f"error: cannot lock GPU test directory {work}; use a different --work directory "
+                          f"for simultaneous runs ({exc.strerror or exc})", file=sys.stderr)
+                    return 2
+            return run_suite(a, native)
     finally:
         if a.work is None:
             shutil.rmtree(work, ignore_errors=True)
+
+
+@contextmanager
+def hold_work_directory(work: str):
+    """Keep the generated modules, metadata and readbacks exclusive until the last check."""
+    # Keep the file after closing it so two processes never lock different files at this path.
+    with open(os.path.join(work, ".gpu-tests.lock"), "a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
 
 
 def _w64_graphics_only() -> frozenset:
