@@ -492,6 +492,8 @@ private:
         enable.multiViewport = features.features.multiViewport;  // d3d12_multi_viewport_test, where available
         enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
         enable.dualSrcBlend = features.features.dualSrcBlend;  // d3d12_translated_draw_test --dual-source
+        enable.shaderClipDistance = features.features.shaderClipDistance;  // d3d12_bary_fallback_test, where available
+        enable.shaderCullDistance = features.features.shaderCullDistance;  // d3d12_bary_fallback_test, where available
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.
