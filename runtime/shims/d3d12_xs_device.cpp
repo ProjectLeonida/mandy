@@ -3128,6 +3128,9 @@ void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D1
 HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
                                             std::uint64_t w2, std::uint64_t w3, const IID* riid, void** out) {
     note_slot(62);
+    static std::atomic<unsigned> logged_calls{0};
+    const unsigned call = logged_calls.fetch_add(1, std::memory_order_relaxed);
+    const bool trace_call = call < 512;
     if (w2 || w3) {
         static std::atomic<bool> logged{false};
         if (!logged.exchange(true, std::memory_order_relaxed))
@@ -3137,7 +3140,16 @@ HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPU
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!riid) return E_POINTER;
-    return self->real->CreateComputePipelineState(desc, *riid, out);
+    if (trace_call)
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 62 compute PSO #%u desc=%p root=%p shader=%p bytes=%zu\n",
+                     call + 1, static_cast<const void*>(desc),
+                     desc ? static_cast<void*>(desc->pRootSignature) : nullptr,
+                     desc ? desc->CS.pShaderBytecode : nullptr, desc ? desc->CS.BytecodeLength : std::size_t(0));
+    const HRESULT hr = self->real->CreateComputePipelineState(desc, *riid, out);
+    if (trace_call)
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 62 compute PSO #%u returned 0x%08lx object=%p\n", call + 1,
+                     static_cast<unsigned long>(hr), *out);
+    return hr;
 }
 
 // The Xbox slot 41 is CreateCommandSignature at its PC position, (desc, root signature, riid, out), but a console

@@ -581,6 +581,13 @@ void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULON
     }
     if (new_placeholder || window) {
         void* const result = reserve_placeholder(address, size, base_granularity);
+        if (size >= (1ULL << 30))
+            std::fprintf(stderr,
+                         "[rt] xmem: XMemVirtualAlloc large window size=%zu allocType=0x%08lx attrs=0x%llx "
+                         "protect=0x%08lx -> %p (error=%lu)\n",
+                         size, static_cast<unsigned long>(allocation_type),
+                         static_cast<unsigned long long>(attributes), static_cast<unsigned long>(protect), result,
+                         static_cast<unsigned long>(result ? ERROR_SUCCESS : GetLastError()));
         if (result && window) {
             const std::lock_guard lock(g_phys_mutex);
             record_window(result, size, host_prot);
@@ -820,16 +827,25 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
     }
     const uint64_t count = *page_count;
     if (count == 0) return TRUE;
+    const bool trace_large = count >= (1u << 14);
+    if (trace_large)
+        std::fprintf(stderr, "[rt] xmem: XMemAllocatePhysicalPages begin attrs=0x%llx pages=%llu bytes=%llu\n",
+                     static_cast<unsigned long long>(attributes), static_cast<unsigned long long>(count),
+                     static_cast<unsigned long long>(count * kPhysicalPageSize));
 
     const std::lock_guard lock(g_phys_mutex);
     if (count > g_free_slots.size() + (kPageSlotLimit - g_next_slot)) {
         *page_count = 0;
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        if (trace_large)
+            std::fprintf(stderr, "[rt] xmem: XMemAllocatePhysicalPages failed: page-number slots exhausted\n");
         return FALSE;
     }
     if (!install_physical_page_fault_handler()) {
         *page_count = 0;
         SetLastError(ERROR_NOT_SUPPORTED);
+        if (trace_large)
+            std::fprintf(stderr, "[rt] xmem: XMemAllocatePhysicalPages failed: page-fault handler unavailable\n");
         return FALSE;
     }
     const uint64_t bytes = count * kPhysicalPageSize;  // below 2^37: count is below 2^21
@@ -837,12 +853,20 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
                                              static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
     if (!handle) {
         *page_count = 0;
+        const DWORD error = GetLastError();
+        if (trace_large)
+            std::fprintf(stderr, "[rt] xmem: XMemAllocatePhysicalPages CreateFileMapping failed error=%lu\n",
+                         static_cast<unsigned long>(error));
         return FALSE;
     }
     // From host_heap: the unmap that drops the last reference frees it under g_fault_lock.
     const auto section = std::allocate_shared<Section>(leonida::host_heap::Allocator<Section>{}, handle);
     if (!section->scratch) {
         *page_count = 0;
+        const DWORD error = GetLastError();
+        if (trace_large)
+            std::fprintf(stderr, "[rt] xmem: XMemAllocatePhysicalPages section map failed error=%lu\n",
+                         static_cast<unsigned long>(error));
         return FALSE;
     }
     for (uint64_t i = 0; i < count; ++i) {
@@ -857,6 +881,10 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
         g_pages[page] = PhysicalPage{section, i * kPhysicalPageSize};
         page_array[i] = page;
     }
+    if (trace_large)
+        std::fprintf(stderr, "[rt] xmem: XMemAllocatePhysicalPages succeeded pages=%llu first=0x%llx last=0x%llx\n",
+                     static_cast<unsigned long long>(count), static_cast<unsigned long long>(page_array[0]),
+                     static_cast<unsigned long long>(page_array[count - 1]));
     return TRUE;
 }
 
@@ -894,6 +922,10 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
 // page number that is not a live page fails with the pages before it mapped and the rest of the range unmapped.
 void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint64_t* page_array) {
     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+    const bool trace_large = page_count >= (1u << 14);
+    if (trace_large)
+        std::fprintf(stderr, "[rt] xmem: XMemMapPhysicalPages begin base=%p pages=%llu pageArray=%p\n", address,
+                     static_cast<unsigned long long>(page_count), static_cast<const void*>(page_array));
     if (!aligned_page_address(start) || page_count > (std::numeric_limits<uintptr_t>::max)() / kPhysicalPageSize ||
         start > (std::numeric_limits<uintptr_t>::max)() - page_count * kPhysicalPageSize) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -909,9 +941,13 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
     const Window* const window = find_window(start, page_count * kPhysicalPageSize);
     if (!window) {
         SetLastError(ERROR_INVALID_ADDRESS);
+        if (trace_large)
+            std::fprintf(stderr, "[rt] xmem: XMemMapPhysicalPages failed: no reserved window error=%lu\n",
+                         static_cast<unsigned long>(GetLastError()));
         return nullptr;
     }
     const DWORD protect = view_protect(*window);
+
     if (!unmap_range(start, end)) return nullptr;
     for (uint64_t i = 0; i < page_count;) {
         if (page_array[i] == 0) {
@@ -921,6 +957,10 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         const auto it = g_pages.find(page_array[i]);
         if (it == g_pages.end()) {
             SetLastError(ERROR_INVALID_PARAMETER);
+            if (trace_large)
+                std::fprintf(stderr, "[rt] xmem: XMemMapPhysicalPages invalid page at index %llu id=0x%llx\n",
+                             static_cast<unsigned long long>(i),
+                             static_cast<unsigned long long>(page_array[i]));
             return nullptr;
         }
         View view{1, it->second.section, it->second.offset, protect};
@@ -934,7 +974,14 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         }
         {
             const FaultLockExclusive view_lock;
-            if (!map_view(start + i * kPhysicalPageSize, view)) return nullptr;
+            if (!map_view(start + i * kPhysicalPageSize, view)) {
+                const DWORD error = GetLastError();
+                if (trace_large)
+                    std::fprintf(stderr, "[rt] xmem: XMemMapPhysicalPages map failed at page %llu count=%llu error=%lu\n",
+                                 static_cast<unsigned long long>(i), static_cast<unsigned long long>(view.count),
+                                 static_cast<unsigned long>(error));
+                return nullptr;
+            }
         }
         // After the fault lock: page_array is the title's memory, and a read of it that faults would wait for the
         // lock on this thread. g_mapped and the aliases are g_phys_mutex's; the fault handler reads neither.
@@ -944,7 +991,12 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
             note_mapping(page_array[i + k], at, true);
         }
         i += view.count;
+
     }
+    if (trace_large)
+        std::fprintf(stderr, "[rt] xmem: XMemMapPhysicalPages succeeded base=%p pages=%llu end=%p\n", address,
+                     static_cast<unsigned long long>(page_count),
+                     reinterpret_cast<void*>(start + page_count * kPhysicalPageSize));
     return address;
 }
 
