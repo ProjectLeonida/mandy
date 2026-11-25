@@ -54,7 +54,7 @@ Les résultats GPU de toutes les plateformes sont regroupés dans le dossier
 
 - **Votre propre copie** du paquet Xbox Series, version `1.0.2.1` : le dossier qui contient `MicrosoftGame.Config` et
   les archives `.rpf`, sous forme de fichiers lisibles sur le disque.
-- **Windows 10/11 x64**, avec environ **400 Go libres** pour les fichiers de travail (tailles affichées par l'Explorateur Windows, en Gio). Ils peuvent aller sur un autre
+- **Windows 10/11 x64**, avec environ **400 Go libres** pour les fichiers de travail. Ils peuvent aller sur un autre
   disque avec `--work`.
 - [Python 3.12+](https://www.python.org/downloads/) (cochez « Add python.exe to PATH » à l'installation).
 - [SDK .NET 8](https://dotnet.microsoft.com/download/dotnet/8.0).
@@ -125,9 +125,10 @@ La compilation utilise trois dossiers, et chacun peut être sur son propre disqu
 | travail | `--work` (par défaut `<out>\work`) | `shaders` (extraits, désassemblés, traduits) et `assets` (exports) | environ 30 Go + environ 370 Go | seulement `shaders\spirv` (`shader_path.txt`) |
 | portage | `--out` (par défaut `Documents\Leonida`) | `gta6rt.exe`, sa DLL, les fichiers de chemins, le cache de pipelines, `overlay` | petit | oui |
 
-La vérification de l'espace libre ne compte que le disque de `--work`, car c'est là que vont les gros fichiers. Le
-jeu ne lit rien dans `<work>\assets` : avec un petit SSD, gardez sur le SSD ce que le jeu charge et mettez les exports
-sur un disque dur, en deux passes :
+Les tailles indiquées sont celles qu'affiche l'Explorateur Windows, c'est-à-dire des Gio : 400 Gio font environ 430 Go
+en unités décimales. La vérification de l'espace libre ne compte que le disque de `--work`, car c'est là que vont les
+gros fichiers. Le jeu ne lit rien dans `<work>\assets` : avec un petit SSD, gardez sur le SSD ce que le jeu charge et
+mettez les exports sur un disque dur, en deux passes :
 
 ```powershell
 # sur le SSD : le paquet, le portage et les shaders traduits (environ 30 Go de fichiers de travail)
