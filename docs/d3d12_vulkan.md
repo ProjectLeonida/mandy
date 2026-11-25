@@ -3042,14 +3042,13 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   Where the provider (`Resource::enable_depth_stencil_uav`) has no unordered-access form of a texture it answers
   `E_INVALIDARG` or `E_NOTIMPL`, and slots 76 and 133 then make the texture without unordered access, as before the
   provider: slot 76 as a committed depth-stencil texture, slot 133 through its stand-in (the title-placed texture, or
-  the committed one). The first such refusal per slot is logged. That is the console D16S8 format (118) on a GPU with
-  D24S8 attachments (every NVIDIA card): `pc_format()` makes it as `D24_UNORM_S8_UINT`, which the provider does not
-  take; a real boot stopped on an int3 after slot 133 returned that refusal. Its UAVs then write no
-  descriptor, as for the slot 25 stand-in. Any other failure (out of memory, the backing itself, a refused placement)
-  is passed on as before. Follow-up: teach `enable_depth_stencil_uav` the D24S8-made form of format 118 (its widened
-  path already serves a D16S8 target stored as `D32_SFLOAT_S8_UINT`), so these textures keep their UAVs on NVIDIA
-  too. `xs_proxy_mock` checks the refusal against a mock provider, and `xbox_d16s8_refused_uav` on a GPU with
-  `LEONIDA_CONSOLE_D16S8=d24`.
+  the committed one). The first such refusal per slot is logged (`xs_proxy_mock` checks the refusal against a mock
+  provider). Any other failure (out of memory, the backing itself, a refused placement) is passed on as before.
+  Console D16S8 (format 118) made as `D24_UNORM_S8_UINT` via `pc_format()` (the default on GPUs with D24S8
+  attachments, such as NVIDIA) keeps its UAVs through the widened `R16_TYPELESS` + `R8_UINT` storage planes:
+  plane-0 barriers convert between 24-bit UNORM words in transfer scratch and `R32_SFLOAT` via `Depth24Converter`
+  and blit between the intermediate `R32_FLOAT` image and `R16_UNORM` (viewed as `R16_UINT` or `R16_UNORM`), while
+  plane 1 copies stencil bytes directly (`xbox_d16s8_d24_storage` with `LEONIDA_CONSOLE_D16S8=d24`).
 - Legacy and enhanced texture transitions copy the selected planes and layers to or from their storage images.
   Fence-ordered graphics and compute queues can share UAV access. A dedicated compute family can perform
   the plane transfer itself when `VK_KHR_maintenance10` and the format's depth/stencil copy flags allow it.

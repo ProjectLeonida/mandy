@@ -1841,6 +1841,11 @@ public:
         };
     }
 
+    bool has_depth24() {
+        std::shared_lock lock(resource_mutex_);
+        return depth24_ != nullptr;
+    }
+
     // Copies the replay stages through a buffer (depth <-> colour, vulkan_replay.h) take device-local scratch from
     // `allocate`. Without this such a copy is refused as unsupported. `extra_usage` is added to the chunks' transfer
     // usage, for configure_quad_indices.

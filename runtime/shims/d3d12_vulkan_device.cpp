@@ -5219,6 +5219,11 @@ HRESULT castable_view_formats(const Format& format, DXGI_FORMAT resource_format,
             const bool valid = format.format == VK_FORMAT_D16_UNORM
                 ? view == DXGI_FORMAT_R16_TYPELESS || view == DXGI_FORMAT_D16_UNORM ||
                   view == DXGI_FORMAT_R16_UNORM || view == DXGI_FORMAT_R16_UINT
+                : (format.xbox_depth16_stencil8 || format.d24)
+                ? view == xbox_d16s8 || view == xbox_d16_plane || view == xbox_s8_plane ||
+                  view == DXGI_FORMAT_D24_UNORM_S8_UINT || view == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+                  view == DXGI_FORMAT_X24_TYPELESS_G8_UINT || view == DXGI_FORMAT_R16_TYPELESS ||
+                  view == DXGI_FORMAT_R16_UNORM || view == DXGI_FORMAT_R16_UINT || view == DXGI_FORMAT_R8_UINT
                 : view == DXGI_FORMAT_R32G8X24_TYPELESS || view == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
                   view == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS || view == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT ||
                   view == DXGI_FORMAT_R32_FLOAT || view == DXGI_FORMAT_R8_UINT;
@@ -6824,10 +6829,13 @@ private:
     }
 
 public:
+    void mark_console_d16s8() { console_d16s8_ = true; }
+    bool console_d16s8() const { return console_d16s8_; }
+
     // The Xbox proxy calls this before publishing an allocated depth texture. Each storage plane owns a
     // regular color image with its own GFX10 address, so a UAV cannot replace the original SRV in set 0.
     HRESULT enable_depth_stencil_uav(D3D12_HEAP_FLAGS storage_heap_flags) {
-        const bool narrow_stencil = desc_.Format == xbox_d16s8;
+        const bool narrow_stencil = desc_.Format == xbox_d16s8 || console_d16s8_;
         const bool depth16 = desc_.Format == DXGI_FORMAT_R16_TYPELESS || narrow_stencil;
         if (!image_ || (!depth16 && desc_.Format != DXGI_FORMAT_R32G8X24_TYPELESS) ||
             !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
@@ -6844,7 +6852,10 @@ public:
             std::unique_ptr<Resource> conversion;
             if (widened) {
                 const auto blit = VK_FORMAT_FEATURE_2_BLIT_SRC_BIT | VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
-                if (format_ != VK_FORMAT_D32_SFLOAT_S8_UINT || (device_.optimal_features(VK_FORMAT_R16_UNORM) & blit) != blit ||
+                const bool d24_backing = format_ == VK_FORMAT_D24_UNORM_S8_UINT;
+                if ((format_ != VK_FORMAT_D32_SFLOAT_S8_UINT && !d24_backing) ||
+                    (d24_backing && !device_.context->has_depth24()) ||
+                    (device_.optimal_features(VK_FORMAT_R16_UNORM) & blit) != blit ||
                     (device_.optimal_features(VK_FORMAT_R32_SFLOAT) & blit) != blit) return E_NOTIMPL;
                 auto intermediate = plane_desc;
                 intermediate.Format = DXGI_FORMAT_R32_FLOAT;
@@ -7460,6 +7471,7 @@ private:
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
     std::unique_ptr<Resource> depth_conversion_;
     std::array<std::unique_ptr<Resource>, 2> storage_planes_;  // Xbox depth/stencil UAV, by plane
+    bool console_d16s8_ = false;  // created from Xbox format 118 (even when pc_format made it D24S8)
     VkImage shared_zero_ = VK_NULL_HANDLE;  // owned by the device
     std::unique_ptr<leonida::DeferredImageBinding> deferred_attachment_;
     std::atomic<bool> replay_seen_{false};
@@ -11412,12 +11424,15 @@ public:
         // device addresses the same scratch holds the triangle indices of indexed quad lists (quad_index_expand.h):
         // a compute pass writes them through the chunk's address and the draw binds the chunk as its index buffer.
         const bool index_scratch = info.buffer_device_address;
+        const VkBufferUsageFlags scratch_extra =
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            (index_scratch ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
         state_.context->enable_copy_scratch(
             get_device,
             [this, index_scratch](const VkMemoryRequirements& requirements) {
                 return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, index_scratch);
             },
-            index_scratch ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0, state_.families);
+            scratch_extra, state_.families);
         if (info.buffer_device_address && info.physical && info.get_instance_proc) {
             if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
@@ -14890,7 +14905,7 @@ public:
                 return;
             }
             const Resource* storage = r->depth_stencil_uav(view.plane);
-            const bool raw_narrow = storage && r->desc().Format == xbox_d16s8 && view.plane == 0 &&
+            const bool raw_narrow = storage && (r->desc().Format == xbox_d16s8 || r->console_d16s8()) && view.plane == 0 &&
                                     (view.format == DXGI_FORMAT_R16_UINT ||
                                      (storage->desc().Format == DXGI_FORMAT_R16_TYPELESS && view.format == DXGI_FORMAT_R16_UNORM));
             if (!storage || (!raw_narrow && view.format != storage->desc().Format)) {
@@ -16995,6 +17010,7 @@ private:
                              TitleImageOrigin origin = TitleImageOrigin::ordinary) {
         if (out) *out = nullptr;
         if (!heap || !desc) return E_INVALIDARG;
+        const bool from_xbox_d16s8 = desc->Format == xbox_d16s8;
         D3D12_RESOURCE_DESC canonical = *desc;
         canonical.Format = pc_format(canonical.Format);  // the console's D16S8 family as D24S8
         desc = &canonical;
@@ -17003,6 +17019,7 @@ private:
             return E_INVALIDARG;
         }
         auto* resource = new Resource(state_, *desc, *heap, heap_flags);
+        if (from_xbox_d16s8) resource->mark_console_d16s8();
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
