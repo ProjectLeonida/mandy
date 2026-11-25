@@ -419,6 +419,68 @@ int main() {
         CHECK(vs_w == vs_orig && ps_w == ps_orig);
     }
 
+    // 11. Failure during VS demotion (OpAccessChain on static half) or ID bound overflow leaves BOTH VS and PS
+    //     untouched even when PS would otherwise be relocated.
+    {
+        ShaderEntry vs_e, ps_e;
+        vs_e.f16_halves = {{0, {28, 29}}, {1, {26, 27}}};
+        ps_e.f16_halves = {{0, {14, 15}}};  // collides with VS raw 0..15 -> triggers PS relocation
+        auto vs_w = build_vs(0x00010500u, 16, vs_e.f16_halves);
+        // Inject OpAccessChain addressing param 1's lo static half (id = 10 + 16 + 2 = 28) inside main before OpReturn.
+        Module m;
+        CHECK(m.parse(vs_w));
+        const std::uint32_t ptr_id = m.alloc_id();
+        std::vector<Inst> patched;
+        for (const Inst& inst : m.insts) {
+            if (inst.opcode == kOpReturn) {
+                patched.push_back(make_inst(kOpAccessChain, {5, ptr_id, 28u}));
+            }
+            patched.push_back(inst);
+        }
+        m.insts = std::move(patched);
+        vs_w = m.serialize();
+
+        auto ps_w = build_ps(0x00010500u, {0, 1}, ps_e.f16_halves);
+        const auto vs_orig = vs_w, ps_orig = ps_w;
+        std::string err;
+        CHECK(!link_f16_halves(vs_w, vs_e, ps_w, ps_e, &err));
+        CHECK(!err.empty());
+        CHECK(vs_w == vs_orig && ps_w == ps_orig);
+
+        // ID bound overflow on synthesis leaves both untouched.
+        ShaderEntry vs_ov_e, ps_ov_e;
+        ps_ov_e.f16_halves = {{0, {14, 15}}};
+        auto vs_ov = build_vs(0x00010500u, 16, {});
+        vs_ov[3] = 0xffffffffu;
+        auto ps_ov = build_ps(0x00010500u, {0, 1}, ps_ov_e.f16_halves);
+        const auto vs_ov_orig = vs_ov, ps_ov_orig = ps_ov;
+        err.clear();
+        CHECK(!link_f16_halves(vs_ov, vs_ov_e, ps_ov, ps_ov_e, &err));
+        CHECK(!err.empty());
+        CHECK(vs_ov == vs_ov_orig && ps_ov == ps_ov_orig);
+    }
+
+    // 12. Malformed SPIR-V (truncated instruction inside function body) is still rejected even when metadata matches.
+    {
+        ShaderEntry vs_e, ps_e;
+        vs_e.f16_halves = {{0, {28, 29}}};
+        ps_e.f16_halves = {{0, {28, 29}}};
+        auto vs_w = build_vs(0x00010500u, 2, vs_e.f16_halves);
+        auto ps_w = build_ps(0x00010500u, {0, 1}, ps_e.f16_halves);
+        // Append a 3-word OpStore missing its final operand so the instruction runs past the end.
+        vs_w.push_back((3u << 16) | kOpStore);
+        vs_w.push_back(9u);
+        std::string err;
+        CHECK(!link_f16_halves(vs_w, vs_e, ps_w, ps_e, &err));
+        CHECK(!err.empty());
+
+        auto vs_ok = build_vs(0x00010500u, 2, vs_e.f16_halves);
+        ps_w.push_back((10u << 16) | kOpReturn);  // claims 10 words past end
+        err.clear();
+        CHECK(!link_f16_halves(vs_ok, vs_e, ps_w, ps_e, &err));
+        CHECK(!err.empty());
+    }
+
     std::printf("spirv_f16_halves_test: all checks passed\n");
     return 0;
 }

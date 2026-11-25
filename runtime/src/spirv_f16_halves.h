@@ -137,7 +137,7 @@ struct Module {
             const std::uint32_t head = words[pos];
             const std::uint32_t wc = head >> 16;
             const std::uint16_t op = std::uint16_t(head & 0xffffu);
-            if (wc == 0 || pos + wc > words.size()) return false;
+            if (wc == 0 || wc > words.size() - pos) return false;
             Inst inst;
             inst.opcode = op;
             inst.words.assign(words.begin() + std::ptrdiff_t(pos), words.begin() + std::ptrdiff_t(pos + wc));
@@ -202,14 +202,68 @@ inline std::string decode_literal_string(std::span<const std::uint32_t> words) {
     return s;
 }
 
-inline std::size_t entry_point_interface_start(const Inst& ep) {
+inline std::size_t entry_point_interface_start(std::span<const std::uint32_t> words) {
     // OpEntryPoint <ExecModel> <EntryPointId> <Name...> <InterfaceIds...>
-    for (std::size_t i = 3; i < ep.words.size(); ++i) {
-        const std::uint32_t w = ep.words[i];
+    for (std::size_t i = 3; i < words.size(); ++i) {
+        const std::uint32_t w = words[i];
         if ((w & 0x000000ffu) == 0 || (w & 0x0000ff00u) == 0 || (w & 0x00ff0000u) == 0 || (w & 0xff000000u) == 0)
             return i + 1;
     }
-    return ep.words.size();
+    return words.size();
+}
+
+inline std::size_t entry_point_interface_start(const Inst& ep) {
+    return entry_point_interface_start(std::span<const std::uint32_t>(ep.words));
+}
+
+inline void emit_words(std::vector<std::uint32_t>& out, std::uint16_t opcode,
+                       std::initializer_list<std::uint32_t> operands) {
+    out.push_back((std::uint32_t(1 + operands.size()) << 16) | opcode);
+    out.insert(out.end(), operands.begin(), operands.end());
+}
+
+// Validates SPIR-V instruction framing in one flat pass and collects global OpVariables of `storage_class` that carry
+// `OpDecorate <id> Location <loc>` (first variable found at that location). Also reports the offset of the first
+// OpFunction (or `words.size()` if none) and whether any OpDecorate appeared after it.
+inline bool validate_and_collect_located_vars(std::span<const std::uint32_t> words, std::uint32_t storage_class,
+                                              std::map<std::uint32_t, std::uint32_t>& by_loc,
+                                              std::size_t* first_fn_pos = nullptr,
+                                              bool* has_post_fn_decorate = nullptr) {
+    if (words.size() < 5 || words[0] != kSpirvMagic || words[3] == 0) return false;
+    by_loc.clear();
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> loc_decos;
+    std::vector<std::uint32_t> matching_vars;
+    std::size_t fn_pos = words.size();
+    bool post_fn_dec = false;
+    std::size_t pos = 5;
+    while (pos < words.size()) {
+        const std::uint32_t head = words[pos];
+        const std::uint32_t wc = head >> 16;
+        if (wc == 0 || wc > words.size() - pos) return false;
+        const std::uint16_t op = std::uint16_t(head & 0xffffu);
+        if (fn_pos == words.size()) {
+            if (op == kOpFunction) {
+                fn_pos = pos;
+            } else if (op == kOpDecorate && wc >= 4 && words[pos + 2] == kDecorationLocation) {
+                loc_decos.emplace_back(words[pos + 1], words[pos + 3]);
+            } else if (op == kOpVariable && wc >= 4 && words[pos + 3] == storage_class) {
+                matching_vars.push_back(words[pos + 2]);
+            }
+        } else if (op == kOpDecorate) {
+            post_fn_dec = true;
+            if (wc >= 4 && words[pos + 2] == kDecorationLocation)
+                loc_decos.emplace_back(words[pos + 1], words[pos + 3]);
+        }
+        pos += wc;
+    }
+    if (first_fn_pos) *first_fn_pos = fn_pos;
+    if (has_post_fn_decorate) *has_post_fn_decorate = post_fn_dec;
+    std::sort(matching_vars.begin(), matching_vars.end());
+    for (const auto& [target, loc] : loc_decos) {
+        if (std::binary_search(matching_vars.begin(), matching_vars.end(), target))
+            by_loc.emplace(loc, target);
+    }
+    return true;
 }
 
 // Collects global OpVariables of `storage_class` that carry `OpDecorate <id> Location <loc>`.
@@ -258,12 +312,17 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
     if (ps_entry.f16_halves.empty() && vs_entry.f16_halves.empty()) return true;
 
     using namespace spirv_detail;
-    Module vs_mod, ps_mod;
-    if (!vs_mod.parse(vs_words)) return fail("f16_halves: malformed VS SPIR-V");
-    if (!ps_mod.parse(ps_words)) return fail("f16_halves: malformed PS SPIR-V");
-
-    const auto vs_outputs = collect_located_vars(vs_mod, kStorageOutput);
-    const auto ps_inputs = collect_located_vars(ps_mod, kStorageInput);
+    std::map<std::uint32_t, std::uint32_t> vs_outputs, ps_inputs;
+    std::size_t vs_first_fn = vs_words.size();
+    bool vs_has_post_fn_decorate = false;
+    if (!validate_and_collect_located_vars(vs_words, kStorageOutput, vs_outputs, &vs_first_fn,
+                                           &vs_has_post_fn_decorate))
+        return fail("f16_halves: malformed VS SPIR-V");
+    std::size_t ps_first_fn = ps_words.size();
+    bool ps_has_post_fn_decorate = false;
+    if (!validate_and_collect_located_vars(ps_words, kStorageInput, ps_inputs, &ps_first_fn,
+                                           &ps_has_post_fn_decorate))
+        return fail("f16_halves: malformed PS SPIR-V");
 
     std::set<std::uint32_t> vs_static_half_locs;
     for (const auto& [param, pair] : vs_entry.f16_halves) {
@@ -352,8 +411,8 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
         }
     }
 
-    // Patch PS OpDecorate Location in place if we relocated any PS half input.
-    bool ps_changed = false;
+    // Collect in-place PS OpDecorate Location patches (committed only after VS succeeds).
+    std::vector<std::pair<std::size_t, std::uint32_t>> ps_patches;
     if (!keep_ps_locs) {
         std::map<std::uint32_t, std::uint32_t> ps_var_new_loc;
         for (const auto& [param, old_pair] : ps_entry.f16_halves) {
@@ -363,64 +422,70 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
                 if (it != ps_inputs.end()) ps_var_new_loc[it->second] = new_pair[h];
             }
         }
-        for (Inst& inst : ps_mod.insts) {
-            if (inst.opcode == kOpDecorate && inst.words.size() >= 4 && inst.words[2] == kDecorationLocation) {
-                const auto it = ps_var_new_loc.find(inst.words[1]);
-                if (it != ps_var_new_loc.end() && inst.words[3] != it->second) {
-                    inst.words[3] = it->second;
-                    ps_changed = true;
-                }
+        const std::size_t ps_scan_end = ps_has_post_fn_decorate ? ps_words.size() : ps_first_fn;
+        for (std::size_t pos = 5; pos < ps_scan_end;) {
+            const std::uint32_t head = ps_words[pos];
+            const std::uint32_t wc = head >> 16;
+            const std::uint16_t op = std::uint16_t(head & 0xffffu);
+            if (op == kOpDecorate && wc >= 4 && ps_words[pos + 2] == kDecorationLocation) {
+                const auto it = ps_var_new_loc.find(ps_words[pos + 1]);
+                if (it != ps_var_new_loc.end() && ps_words[pos + 3] != it->second)
+                    ps_patches.emplace_back(pos + 3, it->second);
             }
+            pos += wc;
         }
     }
 
-    // Inspect VS types, globals, entry point, and uses of existing static f16_halves variables.
+    // Inspect VS preamble (types, globals, entry point) directly over the flat word stream.
     std::uint32_t float_ty = 0, uint_ty = 0, v2float_ty = 0, v4float_ty = 0;
     std::uint32_t ptr_out_v4_ty = 0, ptr_priv_v4_ty = 0, null_v4_id = 0, glsl_id = 0;
     std::map<std::uint32_t, std::uint32_t> ptr_pointee;     // ptr_type_id -> pointee_type_id
     std::map<std::uint32_t, std::uint32_t> var_ptr_type;    // var_id -> ptr_type_id
     std::uint32_t vs_entry_fn = 0;
-    std::size_t vs_ep_idx = vs_mod.insts.size();
+    std::size_t vs_ep_pos = vs_words.size();
 
-    for (std::size_t idx = 0; idx < vs_mod.insts.size(); ++idx) {
-        const Inst& inst = vs_mod.insts[idx];
-        if (inst.opcode == kOpExtInstImport && inst.words.size() >= 3) {
-            if (decode_literal_string(std::span<const std::uint32_t>(inst.words).subspan(2)) == "GLSL.std.450")
-                glsl_id = inst.words[1];
-        } else if (inst.opcode == kOpEntryPoint && inst.words.size() >= 4 && inst.words[1] == kExecModelVertex) {
-            if (vs_ep_idx == vs_mod.insts.size()) {
-                vs_ep_idx = idx;
-                vs_entry_fn = inst.words[2];
+    for (std::size_t pos = 5; pos < vs_first_fn;) {
+        const std::uint32_t head = vs_words[pos];
+        const std::uint32_t wc = head >> 16;
+        const std::uint16_t op = std::uint16_t(head & 0xffffu);
+        const std::uint32_t* w = vs_words.data() + pos;
+        if (op == kOpExtInstImport && wc >= 3) {
+            if (decode_literal_string(std::span<const std::uint32_t>(w + 2, wc - 2)) == "GLSL.std.450")
+                glsl_id = w[1];
+        } else if (op == kOpEntryPoint && wc >= 4 && w[1] == kExecModelVertex) {
+            if (vs_ep_pos == vs_words.size()) {
+                vs_ep_pos = pos;
+                vs_entry_fn = w[2];
             }
-        } else if (inst.opcode == kOpTypeFloat && inst.words.size() == 3 && inst.words[2] == 32) {
-            float_ty = inst.words[1];
-        } else if (inst.opcode == kOpTypeInt && inst.words.size() == 4 && inst.words[2] == 32 && inst.words[3] == 0) {
-            uint_ty = inst.words[1];
-        } else if (inst.opcode == kOpTypeVector && inst.words.size() == 4) {
-            if (float_ty && inst.words[2] == float_ty && inst.words[3] == 2) v2float_ty = inst.words[1];
-            if (float_ty && inst.words[2] == float_ty && inst.words[3] == 4) v4float_ty = inst.words[1];
-        } else if (inst.opcode == kOpTypePointer && inst.words.size() == 4) {
-            ptr_pointee[inst.words[1]] = inst.words[3];
-            if (v4float_ty && inst.words[3] == v4float_ty) {
-                if (inst.words[2] == kStorageOutput) ptr_out_v4_ty = inst.words[1];
-                if (inst.words[2] == kStoragePrivate) ptr_priv_v4_ty = inst.words[1];
+        } else if (op == kOpTypeFloat && wc == 3 && w[2] == 32) {
+            float_ty = w[1];
+        } else if (op == kOpTypeInt && wc == 4 && w[2] == 32 && w[3] == 0) {
+            uint_ty = w[1];
+        } else if (op == kOpTypeVector && wc == 4) {
+            if (float_ty && w[2] == float_ty && w[3] == 2) v2float_ty = w[1];
+            if (float_ty && w[2] == float_ty && w[3] == 4) v4float_ty = w[1];
+        } else if (op == kOpTypePointer && wc == 4) {
+            ptr_pointee[w[1]] = w[3];
+            if (v4float_ty && w[3] == v4float_ty) {
+                if (w[2] == kStorageOutput) ptr_out_v4_ty = w[1];
+                if (w[2] == kStoragePrivate) ptr_priv_v4_ty = w[1];
             }
-        } else if (inst.opcode == kOpConstantNull && inst.words.size() == 3 && v4float_ty && inst.words[1] == v4float_ty) {
-            null_v4_id = inst.words[2];
-        } else if (inst.opcode == kOpVariable && inst.words.size() >= 4) {
-            var_ptr_type[inst.words[2]] = inst.words[1];
-        } else if (inst.opcode == kOpFunction) {
-            break;
+        } else if (op == kOpConstantNull && wc == 3 && v4float_ty && w[1] == v4float_ty) {
+            null_v4_id = w[2];
+        } else if (op == kOpVariable && wc >= 4) {
+            var_ptr_type[w[2]] = w[1];
         }
+        pos += wc;
     }
-    if (vs_ep_idx == vs_mod.insts.size() || !vs_entry_fn) return fail("f16_halves: VS has no Vertex entry point");
+    if (vs_ep_pos == vs_words.size() || !vs_entry_fn) return fail("f16_halves: VS has no Vertex entry point");
 
-    // Check which existing VS variables are addressed by OpAccessChain (those cannot be trivially demoted to Private).
-    std::set<std::uint32_t> access_chained_vars;
-    for (const Inst& inst : vs_mod.insts) {
-        if ((inst.opcode == kOpAccessChain || inst.opcode == kOpInBoundsAccessChain) && inst.words.size() >= 4)
-            access_chained_vars.insert(inst.words[3]);
-    }
+    const auto is_v4float_var = [&](std::uint32_t vid) {
+        if (!v4float_ty) return false;
+        const auto pty = var_ptr_type.find(vid);
+        if (pty == var_ptr_type.end()) return false;
+        const auto pt = ptr_pointee.find(pty->second);
+        return pt != ptr_pointee.end() && pt->second == v4float_ty;
+    };
 
     // Decide per VS static f16_halves entry: reuse (update Location) or demote (Output -> Private, drop Location).
     std::map<std::uint32_t, std::uint32_t> vs_var_new_loc;
@@ -438,12 +503,25 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
             for (const auto& it : {lo_it, hi_it}) {
                 if (it == vs_outputs.end()) continue;
                 const std::uint32_t vid = it->second;
-                const auto pty = var_ptr_type.find(vid);
-                const bool is_v4 = pty != var_ptr_type.end() && v4float_ty && ptr_pointee[pty->second] == v4float_ty;
-                if (!is_v4 || access_chained_vars.count(vid))
+                if (!is_v4float_var(vid))
                     return fail("f16_halves: cannot demote non-vec4 or access-chained VS static half output");
                 demote_vars.insert(vid);
             }
+        }
+    }
+
+    // Only scan function bodies for OpAccessChain when there is actually a static half variable to demote.
+    if (!demote_vars.empty()) {
+        std::vector<std::uint32_t> demote_sorted(demote_vars.begin(), demote_vars.end());
+        for (std::size_t pos = vs_first_fn; pos < vs_words.size();) {
+            const std::uint32_t head = vs_words[pos];
+            const std::uint32_t wc = head >> 16;
+            const std::uint16_t op = std::uint16_t(head & 0xffffu);
+            if ((op == kOpAccessChain || op == kOpInBoundsAccessChain) && wc >= 4 &&
+                std::binary_search(demote_sorted.begin(), demote_sorted.end(), vs_words[pos + 3])) {
+                return fail("f16_halves: cannot demote non-vec4 or access-chained VS static half output");
+            }
+            pos += wc;
         }
     }
 
@@ -466,8 +544,7 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
         sp.hi_loc = target_pair[1];
         const auto raw_it = vs_raw_outputs.find(param);
         if (raw_it != vs_raw_outputs.end()) {
-            const auto pty = var_ptr_type.find(raw_it->second);
-            if (pty == var_ptr_type.end() || !v4float_ty || ptr_pointee[pty->second] != v4float_ty)
+            if (!is_v4float_var(raw_it->second))
                 return fail("f16_halves: VS param " + std::to_string(param) + " output is not vec4 float");
             sp.src_var = raw_it->second;
         } else {
@@ -476,63 +553,76 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
         synth.push_back(sp);
     }
 
+    std::uint32_t next_id = vs_words[3];
+    bool id_overflow = false;
+    const auto alloc_id = [&]() -> std::uint32_t {
+        if (next_id == 0xffffffffu) {
+            id_overflow = true;
+            return 0;
+        }
+        return next_id++;
+    };
+
     // Create any missing types / GLSL.std.450 import needed for demotion or synthesis.
-    std::vector<Inst> new_types;
+    std::vector<std::uint32_t> new_types;
     const bool need_glsl = std::any_of(synth.begin(), synth.end(), [](const SynthParam& s) { return s.src_var != 0; });
     bool insert_glsl = false;
     if (need_glsl && !glsl_id) {
-        glsl_id = vs_mod.alloc_id();
+        glsl_id = alloc_id();
         insert_glsl = true;
     }
     if ((!synth.empty() || !demote_vars.empty()) && !float_ty) {
-        float_ty = vs_mod.alloc_id();
-        new_types.push_back(make_inst(kOpTypeFloat, {float_ty, 32}));
+        float_ty = alloc_id();
+        emit_words(new_types, kOpTypeFloat, {float_ty, 32});
     }
     if (need_glsl && !uint_ty) {
-        uint_ty = vs_mod.alloc_id();
-        new_types.push_back(make_inst(kOpTypeInt, {uint_ty, 32, 0}));
+        uint_ty = alloc_id();
+        emit_words(new_types, kOpTypeInt, {uint_ty, 32, 0});
     }
     if (need_glsl && !v2float_ty) {
-        v2float_ty = vs_mod.alloc_id();
-        new_types.push_back(make_inst(kOpTypeVector, {v2float_ty, float_ty, 2}));
+        v2float_ty = alloc_id();
+        emit_words(new_types, kOpTypeVector, {v2float_ty, float_ty, 2});
     }
     if ((!synth.empty() || !demote_vars.empty()) && !v4float_ty) {
-        v4float_ty = vs_mod.alloc_id();
-        new_types.push_back(make_inst(kOpTypeVector, {v4float_ty, float_ty, 4}));
+        v4float_ty = alloc_id();
+        emit_words(new_types, kOpTypeVector, {v4float_ty, float_ty, 4});
     }
     if (!synth.empty() && !ptr_out_v4_ty) {
-        ptr_out_v4_ty = vs_mod.alloc_id();
-        new_types.push_back(make_inst(kOpTypePointer, {ptr_out_v4_ty, kStorageOutput, v4float_ty}));
+        ptr_out_v4_ty = alloc_id();
+        emit_words(new_types, kOpTypePointer, {ptr_out_v4_ty, kStorageOutput, v4float_ty});
     }
     if (!demote_vars.empty() && !ptr_priv_v4_ty) {
-        ptr_priv_v4_ty = vs_mod.alloc_id();
-        new_types.push_back(make_inst(kOpTypePointer, {ptr_priv_v4_ty, kStoragePrivate, v4float_ty}));
+        ptr_priv_v4_ty = alloc_id();
+        emit_words(new_types, kOpTypePointer, {ptr_priv_v4_ty, kStoragePrivate, v4float_ty});
     }
     if (need_null_v4 && !null_v4_id) {
-        null_v4_id = vs_mod.alloc_id();
-        new_types.push_back(make_inst(kOpConstantNull, {v4float_ty, null_v4_id}));
+        null_v4_id = alloc_id();
+        emit_words(new_types, kOpConstantNull, {v4float_ty, null_v4_id});
     }
 
     // Allocate Output OpVariables for synthesized params.
-    std::vector<Inst> new_decorates;
-    std::vector<Inst> new_vars;
+    std::vector<std::uint32_t> new_decorates;
+    std::vector<std::uint32_t> new_vars;
+    new_decorates.reserve(synth.size() * 8);
+    new_vars.reserve(synth.size() * 8);
     for (SynthParam& sp : synth) {
-        sp.lo_var = vs_mod.alloc_id();
-        sp.hi_var = vs_mod.alloc_id();
-        new_decorates.push_back(make_inst(kOpDecorate, {sp.lo_var, kDecorationLocation, sp.lo_loc}));
-        new_decorates.push_back(make_inst(kOpDecorate, {sp.hi_var, kDecorationLocation, sp.hi_loc}));
-        new_vars.push_back(make_inst(kOpVariable, {ptr_out_v4_ty, sp.lo_var, kStorageOutput}));
-        new_vars.push_back(make_inst(kOpVariable, {ptr_out_v4_ty, sp.hi_var, kStorageOutput}));
+        sp.lo_var = alloc_id();
+        sp.hi_var = alloc_id();
+        emit_words(new_decorates, kOpDecorate, {sp.lo_var, kDecorationLocation, sp.lo_loc});
+        emit_words(new_decorates, kOpDecorate, {sp.hi_var, kDecorationLocation, sp.hi_loc});
+        emit_words(new_vars, kOpVariable, {ptr_out_v4_ty, sp.lo_var, kStorageOutput});
+        emit_words(new_vars, kOpVariable, {ptr_out_v4_ty, sp.hi_var, kStorageOutput});
     }
 
-    // Rebuild VS instruction stream in exact SPIR-V logical layout order.
+    // Rebuild VS directly into one flat word vector in exact SPIR-V logical layout order.
     // Demoted OpVariables are emitted right after new_types (before the first OpFunction) so ptr_priv_v4_ty is
     // always defined before every OpVariable that uses it.
-    const bool drop_private_from_ep = vs_mod.header[1] < kSpirvVersion14;
-    std::vector<Inst> demoted_var_insts;
-    std::vector<Inst> out_insts;
-    out_insts.reserve(vs_mod.insts.size() + new_types.size() + new_decorates.size() + new_vars.size() +
-                      synth.size() * 32);
+    const bool drop_private_from_ep = vs_words[1] < kSpirvVersion14;
+    std::vector<std::uint32_t> demoted_var_words;
+    std::vector<std::uint32_t> out_words;
+    out_words.reserve(vs_words.size() + new_types.size() + new_decorates.size() + new_vars.size() +
+                      synth.size() * 144 + 16);
+    out_words.insert(out_words.end(), vs_words.begin(), vs_words.begin() + 5);
 
     bool glsl_inserted = !insert_glsl;
     bool decorates_inserted = new_decorates.empty();
@@ -540,120 +630,143 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
     bool in_entry_fn = false;
     bool found_entry_return = false;
 
-    for (std::size_t idx = 0; idx < vs_mod.insts.size(); ++idx) {
-        Inst inst = vs_mod.insts[idx];
+    for (std::size_t pos = 5; pos < vs_words.size();) {
+        const std::uint32_t head = vs_words[pos];
+        const std::uint32_t wc = head >> 16;
+        const std::uint16_t op = std::uint16_t(head & 0xffffu);
+        const std::uint32_t* w = vs_words.data() + pos;
 
         // Insert OpExtInstImport "GLSL.std.450" right before OpMemoryModel if the module didn't already have it.
-        if (!glsl_inserted && inst.opcode == kOpMemoryModel) {
+        if (!glsl_inserted && op == kOpMemoryModel) {
             // "GLSL.std.450\0" -> 4 little-endian words: 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000
-            out_insts.push_back(
-                make_inst(kOpExtInstImport, {glsl_id, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0x00000000u}));
+            emit_words(out_words, kOpExtInstImport, {glsl_id, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0x00000000u});
             glsl_inserted = true;
         }
 
         // Insert new OpDecorate instructions at the end of the Annotations section (before the first type/global).
-        if (!decorates_inserted && !is_pre_type_opcode(inst.opcode)) {
-            out_insts.insert(out_insts.end(), new_decorates.begin(), new_decorates.end());
+        if (!decorates_inserted && !is_pre_type_opcode(op)) {
+            out_words.insert(out_words.end(), new_decorates.begin(), new_decorates.end());
             decorates_inserted = true;
         }
 
         // Insert new Types / Constants, demoted Private OpVariables, and new Output OpVariables before OpFunction.
-        if (!globals_inserted && inst.opcode == kOpFunction) {
-            out_insts.insert(out_insts.end(), new_types.begin(), new_types.end());
-            out_insts.insert(out_insts.end(), demoted_var_insts.begin(), demoted_var_insts.end());
-            out_insts.insert(out_insts.end(), new_vars.begin(), new_vars.end());
+        if (!globals_inserted && op == kOpFunction) {
+            out_words.insert(out_words.end(), new_types.begin(), new_types.end());
+            out_words.insert(out_words.end(), demoted_var_words.begin(), demoted_var_words.end());
+            out_words.insert(out_words.end(), new_vars.begin(), new_vars.end());
             globals_inserted = true;
         }
 
+        // When no epilogue synthesis is needed and all header/preamble edits are done, bulk-copy the function section.
+        if (op == kOpFunction && synth.empty() && !vs_has_post_fn_decorate && glsl_inserted && decorates_inserted &&
+            globals_inserted) {
+            out_words.insert(out_words.end(), vs_words.begin() + std::ptrdiff_t(pos), vs_words.end());
+            break;
+        }
+
         // Update Vertex OpEntryPoint interface list.
-        if (idx == vs_ep_idx) {
-            const std::size_t if_start = entry_point_interface_start(inst);
-            std::vector<std::uint32_t> operands(inst.words.begin() + 1, inst.words.begin() + std::ptrdiff_t(if_start));
-            for (std::size_t i = if_start; i < inst.words.size(); ++i) {
-                const std::uint32_t id = inst.words[i];
+        if (pos == vs_ep_pos) {
+            const std::span<const std::uint32_t> ep_span(w, wc);
+            const std::size_t if_start = entry_point_interface_start(ep_span);
+            const std::size_t head_idx = out_words.size();
+            out_words.push_back(0);  // patched below once final word count is known
+            out_words.insert(out_words.end(), w + 1, w + if_start);
+            for (std::size_t i = if_start; i < wc; ++i) {
+                const std::uint32_t id = w[i];
                 if (drop_private_from_ep && demote_vars.count(id)) continue;
-                operands.push_back(id);
+                out_words.push_back(id);
             }
             for (const SynthParam& sp : synth) {
-                operands.push_back(sp.lo_var);
-                operands.push_back(sp.hi_var);
+                out_words.push_back(sp.lo_var);
+                out_words.push_back(sp.hi_var);
             }
-            out_insts.push_back(make_inst_vec(kOpEntryPoint, operands));
+            const std::size_t ep_wc = out_words.size() - head_idx;
+            if (ep_wc > 0xffffu) return fail("f16_halves: Vertex OpEntryPoint exceeds SPIR-V word count limit");
+            out_words[head_idx] = (std::uint32_t(ep_wc) << 16) | kOpEntryPoint;
+            pos += wc;
             continue;
         }
 
         // Update Location or strip interface-only decorations on static VS f16_halves outputs.
-        if (inst.opcode == kOpDecorate && inst.words.size() >= 3) {
-            const std::uint32_t target = inst.words[1];
-            const std::uint32_t dec = inst.words[2];
-            if (demote_vars.count(target) && is_interface_only_decoration(dec)) continue;
-            if (dec == kDecorationLocation && inst.words.size() >= 4) {
-                const auto it = vs_var_new_loc.find(target);
-                if (it != vs_var_new_loc.end()) inst.words[3] = it->second;
+        if (op == kOpDecorate && wc >= 3) {
+            const std::uint32_t target = w[1];
+            const std::uint32_t dec = w[2];
+            if (demote_vars.count(target) && is_interface_only_decoration(dec)) {
+                pos += wc;
+                continue;
             }
-            out_insts.push_back(std::move(inst));
+            const std::size_t base = out_words.size();
+            out_words.insert(out_words.end(), w, w + wc);
+            if (dec == kDecorationLocation && wc >= 4) {
+                const auto it = vs_var_new_loc.find(target);
+                if (it != vs_var_new_loc.end()) out_words[base + 3] = it->second;
+            }
+            pos += wc;
             continue;
         }
 
         // Demote unneeded static VS f16_halves OpVariable from Output to Private (emitted after new_types).
-        if (!globals_inserted && inst.opcode == kOpVariable && inst.words.size() >= 4 &&
-            demote_vars.count(inst.words[2])) {
-            inst.words[1] = ptr_priv_v4_ty;
-            inst.words[3] = kStoragePrivate;
-            demoted_var_insts.push_back(std::move(inst));
+        if (!globals_inserted && op == kOpVariable && wc >= 4 && demote_vars.count(w[2])) {
+            const std::size_t base = demoted_var_words.size();
+            demoted_var_words.insert(demoted_var_words.end(), w, w + wc);
+            demoted_var_words[base + 1] = ptr_priv_v4_ty;
+            demoted_var_words[base + 3] = kStoragePrivate;
+            pos += wc;
             continue;
         }
 
         // Track Vertex entry function and inject UnpackHalf2x16 epilogue before every OpReturn inside it.
-        if (inst.opcode == kOpFunction && inst.words.size() >= 3 && inst.words[2] == vs_entry_fn) {
+        if (op == kOpFunction && wc >= 3 && w[2] == vs_entry_fn) {
             in_entry_fn = true;
-        } else if (inst.opcode == kOpFunctionEnd && in_entry_fn) {
+        } else if (op == kOpFunctionEnd && in_entry_fn) {
             in_entry_fn = false;
-        } else if (in_entry_fn && inst.opcode == kOpReturn && !synth.empty()) {
+        } else if (in_entry_fn && op == kOpReturn && !synth.empty()) {
             found_entry_return = true;
             for (const SynthParam& sp : synth) {
                 if (sp.src_var == 0) {
-                    out_insts.push_back(make_inst(kOpStore, {sp.lo_var, null_v4_id}));
-                    out_insts.push_back(make_inst(kOpStore, {sp.hi_var, null_v4_id}));
+                    emit_words(out_words, kOpStore, {sp.lo_var, null_v4_id});
+                    emit_words(out_words, kOpStore, {sp.hi_var, null_v4_id});
                     continue;
                 }
-                const std::uint32_t raw_id = vs_mod.alloc_id();
-                out_insts.push_back(make_inst(kOpLoad, {v4float_ty, raw_id, sp.src_var}));
+                const std::uint32_t raw_id = alloc_id();
+                emit_words(out_words, kOpLoad, {v4float_ty, raw_id, sp.src_var});
                 std::array<std::uint32_t, 4> lo_c{}, hi_c{};
                 for (std::uint32_t c = 0; c < 4; ++c) {
-                    const std::uint32_t e_id = vs_mod.alloc_id();
-                    const std::uint32_t u_id = vs_mod.alloc_id();
-                    const std::uint32_t h2_id = vs_mod.alloc_id();
-                    const std::uint32_t a_id = vs_mod.alloc_id();
-                    const std::uint32_t b_id = vs_mod.alloc_id();
-                    out_insts.push_back(make_inst(kOpCompositeExtract, {float_ty, e_id, raw_id, c}));
-                    out_insts.push_back(make_inst(kOpBitcast, {uint_ty, u_id, e_id}));
-                    out_insts.push_back(make_inst(kOpExtInst, {v2float_ty, h2_id, glsl_id, kGlslUnpackHalf2x16, u_id}));
-                    out_insts.push_back(make_inst(kOpCompositeExtract, {float_ty, a_id, h2_id, 0}));
-                    out_insts.push_back(make_inst(kOpCompositeExtract, {float_ty, b_id, h2_id, 1}));
+                    const std::uint32_t e_id = alloc_id();
+                    const std::uint32_t u_id = alloc_id();
+                    const std::uint32_t h2_id = alloc_id();
+                    const std::uint32_t a_id = alloc_id();
+                    const std::uint32_t b_id = alloc_id();
+                    emit_words(out_words, kOpCompositeExtract, {float_ty, e_id, raw_id, c});
+                    emit_words(out_words, kOpBitcast, {uint_ty, u_id, e_id});
+                    emit_words(out_words, kOpExtInst, {v2float_ty, h2_id, glsl_id, kGlslUnpackHalf2x16, u_id});
+                    emit_words(out_words, kOpCompositeExtract, {float_ty, a_id, h2_id, 0});
+                    emit_words(out_words, kOpCompositeExtract, {float_ty, b_id, h2_id, 1});
                     lo_c[c] = a_id;
                     hi_c[c] = b_id;
                 }
-                const std::uint32_t lo_vec = vs_mod.alloc_id();
-                const std::uint32_t hi_vec = vs_mod.alloc_id();
-                out_insts.push_back(make_inst(kOpCompositeConstruct, {v4float_ty, lo_vec, lo_c[0], lo_c[1], lo_c[2], lo_c[3]}));
-                out_insts.push_back(make_inst(kOpCompositeConstruct, {v4float_ty, hi_vec, hi_c[0], hi_c[1], hi_c[2], hi_c[3]}));
-                out_insts.push_back(make_inst(kOpStore, {sp.lo_var, lo_vec}));
-                out_insts.push_back(make_inst(kOpStore, {sp.hi_var, hi_vec}));
+                const std::uint32_t lo_vec = alloc_id();
+                const std::uint32_t hi_vec = alloc_id();
+                emit_words(out_words, kOpCompositeConstruct, {v4float_ty, lo_vec, lo_c[0], lo_c[1], lo_c[2], lo_c[3]});
+                emit_words(out_words, kOpCompositeConstruct, {v4float_ty, hi_vec, hi_c[0], hi_c[1], hi_c[2], hi_c[3]});
+                emit_words(out_words, kOpStore, {sp.lo_var, lo_vec});
+                emit_words(out_words, kOpStore, {sp.hi_var, hi_vec});
             }
         }
 
-        out_insts.push_back(std::move(inst));
+        out_words.insert(out_words.end(), w, w + wc);
+        pos += wc;
     }
 
+    if (id_overflow) return fail("f16_halves: SPIR-V ID bound overflow");
     if (!synth.empty() && !found_entry_return)
         return fail("f16_halves: Vertex entry point has no OpReturn to emit decoded halves");
     if (!glsl_inserted || !decorates_inserted || !globals_inserted)
         return fail("f16_halves: unexpected VS SPIR-V layout");
 
-    vs_mod.insts = std::move(out_insts);
-    vs_words = vs_mod.serialize();
-    if (ps_changed) ps_words = ps_mod.serialize();
+    out_words[3] = next_id;
+    vs_words = std::move(out_words);
+    for (const auto& [word_idx, new_loc] : ps_patches) ps_words[word_idx] = new_loc;
     return true;
 }
 
