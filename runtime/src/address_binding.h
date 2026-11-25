@@ -147,6 +147,8 @@ struct State {
     VkPhysicalDeviceAddressBindingReportFeaturesEXT feature{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT};
     VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
+    VkInstance messenger_instance = VK_NULL_HANDLE;
+    PFN_vkDestroyDebugUtilsMessengerEXT destroy_messenger = nullptr;
     bool on = false;
 };
 
@@ -225,8 +227,26 @@ inline void install_messenger(VkInstance instance, PFN_vkGetInstanceProcAddr get
                            VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
     info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT;
     info.pfnUserCallback = &on_message;
-    const VkResult r = create(instance, &info, nullptr, &state().messenger);
+    State& s = state();
+    const VkResult r = create(instance, &info, nullptr, &s.messenger);
+    if (r == VK_SUCCESS) {
+        s.messenger_instance = instance;
+        s.destroy_messenger = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+            get(instance, "vkDestroyDebugUtilsMessengerEXT"));
+    } else {
+        s.messenger = VK_NULL_HANDLE;
+    }
     std::fprintf(stderr, "[rt] address-binding: messenger %s\n", r == VK_SUCCESS ? "installed" : "failed");
+}
+
+// Before vkDestroyInstance: a messenger may not outlive its instance. What it recorded stays.
+inline void uninstall_messenger(VkInstance instance) {
+    State& s = state();
+    if (!s.messenger || s.messenger_instance != instance) return;
+    if (s.destroy_messenger) s.destroy_messenger(instance, s.messenger, nullptr);
+    s.messenger = VK_NULL_HANDLE;
+    s.messenger_instance = VK_NULL_HANDLE;
+    s.on = false;
 }
 
 // At a device fault: what the driver had bound at and around `address`, on stderr.

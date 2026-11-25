@@ -11584,7 +11584,10 @@ public:
         state_.context.reset();
         state_.image_memory.reset();  // the context's deferred queue gave its ranges back
         if (owned_.device) owned_.destroy_device(owned_.device, nullptr);
-        if (owned_.instance) owned_.destroy_instance(owned_.instance, nullptr);
+        if (owned_.instance) {
+            leonida::address_binding::uninstall_messenger(owned_.instance);
+            owned_.destroy_instance(owned_.instance, nullptr);
+        }
     }
 
     bool ok() const { return state_.context && state_.context->loaded(); }
@@ -17640,6 +17643,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (has_debug_utils) leonida::address_binding::install_messenger(owned.instance, get);
     const auto fail = [&](const char* why) {
         std::fprintf(stderr, "[rt] d3d12: %s\n", why);
+        leonida::address_binding::uninstall_messenger(owned.instance);
         owned.destroy_instance(owned.instance, nullptr);
         return E_FAIL;
     };
