@@ -550,6 +550,12 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(console_registry_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(console_registry_test PRIVATE /OPT:NOREF)
 
+  # Console resource allocation sizing and placement helper unit tests (CPU-only, no GPU or game data).
+  add_executable(xs_alloc_size_test test/xs_alloc_size_test.cpp)
+  target_include_directories(xs_alloc_size_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xs_alloc_size_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xs_alloc_size_test PRIVATE /W4 /permissive- /utf-8)
+
   # Synthetic tests for the atomic API reference lifecycle.
   add_executable(api_ref_state_test test/api_ref_state_test.cpp)
   target_include_directories(api_ref_state_test PRIVATE
@@ -1597,6 +1603,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET console_registry_test)
     add_test(NAME console_registry COMMAND console_registry_test)
+  endif()
+  if(WIN32 AND TARGET xs_alloc_size_test)
+    add_test(NAME xs_alloc_size COMMAND xs_alloc_size_test)
   endif()
   if(WIN32 AND TARGET api_ref_state_test)
     add_test(NAME api_ref_state COMMAND api_ref_state_test)

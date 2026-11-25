@@ -22,10 +22,12 @@
 #include <d3d12.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace rt::d3d12_xs {
 
@@ -80,7 +82,7 @@ inline UINT64 console_render_target_size(const D3D12_RESOURCE_DESC& desc) {
     if (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) return 0;
     if (desc.SampleDesc.Count > 1) return 0;
     const std::size_t element_bytes = render_target_element_bytes(desc.Format);
-    if (!element_bytes || !desc.Width || !desc.Height || !desc.DepthOrArraySize) return 0;
+    if (!element_bytes || !desc.Width || desc.Width > UINT32_MAX || !desc.Height || !desc.DepthOrArraySize) return 0;
 
     const UINT full_chain = static_cast<UINT>(std::bit_width(std::max<UINT64>(desc.Width, desc.Height)));
     const UINT mips = desc.MipLevels ? std::min<UINT>(desc.MipLevels, full_chain) : full_chain;
@@ -99,9 +101,14 @@ inline UINT64 console_render_target_size(const D3D12_RESOURCE_DESC& desc) {
             tail = true;
             break;
         }
-        slice += surface.tiled_size();
+        const UINT64 mip_bytes = surface.tiled_size();
+        if (mip_bytes > UINT64_MAX - slice) return 0;
+        slice += mip_bytes;
     }
-    if (tail) slice += kConsoleTileBytes;
+    if (tail) {
+        if (kConsoleTileBytes > UINT64_MAX - slice) return 0;
+        slice += kConsoleTileBytes;
+    }
     const UINT64 slices = desc.DepthOrArraySize;
     if (slice > UINT64_MAX / slices) return 0;
     return slice * slices;
@@ -138,7 +145,8 @@ inline DepthPlanes console_depth_planes(DXGI_FORMAT format) {
 inline UINT64 console_depth_stencil_size(const D3D12_RESOURCE_DESC& desc) {
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return 0;
     if (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) return 0;
-    if (desc.SampleDesc.Count > 1 || !desc.Width || !desc.Height || !desc.DepthOrArraySize) return 0;
+    if (desc.SampleDesc.Count > 1 || !desc.Width || desc.Width > UINT32_MAX || !desc.Height || !desc.DepthOrArraySize)
+        return 0;
     const DepthPlanes planes = console_depth_planes(desc.Format);
     if (!planes.depth) return 0;
     const UINT full_chain = static_cast<UINT>(std::bit_width(std::max<UINT64>(desc.Width, desc.Height)));
@@ -160,9 +168,14 @@ inline UINT64 console_depth_stencil_size(const D3D12_RESOURCE_DESC& desc) {
                 tail = true;
                 break;
             }
-            slice += surface.tiled_size();
+            const UINT64 mip_bytes = surface.tiled_size();
+            if (mip_bytes > UINT64_MAX - slice) return 0;
+            slice += mip_bytes;
         }
-        if (tail) slice += kConsoleTileBytes;
+        if (tail) {
+            if (kConsoleTileBytes > UINT64_MAX - slice) return 0;
+            slice += kConsoleTileBytes;
+        }
     }
     const UINT64 slices = desc.DepthOrArraySize;
     if (!slice || slice > UINT64_MAX / slices) return 0;
@@ -200,8 +213,9 @@ inline bool console_texture_layout(const D3D12_RESOURCE_DESC& desc, UINT64& size
 }
 
 // Rounds up to a multiple of `to`, stopping at the last multiple below 2^64 instead of wrapping (as the PC device's
-// totals do).
+// totals do). Returns `value` unchanged when `to <= 1`.
 inline UINT64 align_up_saturating(UINT64 value, UINT64 to) {
+    if (to <= 1) return value;
     return value > UINT64_MAX - (to - 1) ? UINT64_MAX / to * to : (value + to - 1) / to * to;
 }
 
@@ -217,51 +231,86 @@ inline UINT64 align_up_saturating(UINT64 value, UINT64 to) {
 template <class PcOne>
 bool console_placement(const D3D12_RESOURCE_DESC* descs, UINT count, PcOne pc_one,
                        D3D12_RESOURCE_ALLOCATION_INFO& total, D3D12_RESOURCE_ALLOCATION_INFO1* each) {
-    if (!descs) return false;
+    if (!descs || !count) return false;
+    struct ConsoleOverride {
+        UINT64 xg_size = 0;
+        UINT64 xg_alignment = 0;
+        UINT64 rt_size = 0;
+        UINT64 ds_size = 0;
+        bool has_xg = false;
+    };
+    constexpr UINT kInlineCap = 16;
+    std::array<ConsoleOverride, kInlineCap> inline_overrides{};
+    std::vector<ConsoleOverride> heap_overrides;
+    ConsoleOverride* overrides = inline_overrides.data();
+    if (count > kInlineCap) {
+        heap_overrides.resize(count);
+        overrides = heap_overrides.data();
+    }
+
+    // Compute each description's console rule once before querying pc_one, so lists with no
+    // console-sized resources exit early without calling pc_one or repeating XG layout work.
     bool any_target = false;
-    for (UINT i = 0; i < count && !any_target; ++i) {
-        UINT64 xg_size = 0, xg_alignment = 0;
-        any_target = console_render_target_size(descs[i]) != 0 || console_depth_stencil_size(descs[i]) != 0 ||
-                     console_texture_layout(descs[i], xg_size, xg_alignment);
+    for (UINT i = 0; i < count; ++i) {
+        ConsoleOverride& ov = overrides[i];
+        const UINT flags = descs[i].Flags;
+        if (flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ov.rt_size = console_render_target_size(descs[i]);
+        if (flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ov.ds_size = console_depth_stencil_size(descs[i]);
+        if (!(flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) {
+            ov.has_xg = console_texture_layout(descs[i], ov.xg_size, ov.xg_alignment);
+        }
+        any_target = any_target || ov.rt_size != 0 || ov.ds_size != 0 || ov.has_xg;
     }
     if (!any_target) return false;
-    // Two passes when `each` is wanted: the first decides, the second writes, so a refusal or a list that does not
-    // grow leaves the array as the PC device filled it.
-    for (const bool write : {false, true}) {
-        if (write && !each) break;
-        bool grows = false;
-        UINT64 end = 0, alignment = 1;
-        for (UINT i = 0; i < count; ++i) {
-            D3D12_RESOURCE_ALLOCATION_INFO one = pc_one(i);
-            if (one.SizeInBytes == UINT64_MAX || !one.Alignment) return false;
-            UINT64 size = one.SizeInBytes;
-            // A texture only the CPU fills takes XG's size and alignment, whichever way they differ.
-            if (UINT64 xg_size = 0, xg_alignment = 0; console_texture_layout(descs[i], xg_size, xg_alignment)) {
-                if (xg_size != size || xg_alignment != one.Alignment) grows = true;
-                size = xg_size;
-                one.Alignment = xg_alignment;
-            }
-            const UINT64 console = console_render_target_size(descs[i]);
-            if (console > size) {
-                size = align_up_saturating(console, one.Alignment);
+
+    // Stage `each` entries before publishing so a pc_one refusal or unchanged layout leaves `each` untouched,
+    // without re-running pc_one or the console layout helpers in a second pass.
+    std::array<D3D12_RESOURCE_ALLOCATION_INFO1, kInlineCap> inline_each{};
+    std::vector<D3D12_RESOURCE_ALLOCATION_INFO1> heap_each;
+    D3D12_RESOURCE_ALLOCATION_INFO1* staged = nullptr;
+    if (each) {
+        if (count <= kInlineCap) {
+            staged = inline_each.data();
+        } else {
+            heap_each.resize(count);
+            staged = heap_each.data();
+        }
+    }
+
+    bool grows = false;
+    UINT64 end = 0, alignment = 1;
+    for (UINT i = 0; i < count; ++i) {
+        D3D12_RESOURCE_ALLOCATION_INFO one = pc_one(i);
+        if (one.SizeInBytes == UINT64_MAX || !one.Alignment) return false;
+        UINT64 size = one.SizeInBytes;
+        const ConsoleOverride& ov = overrides[i];
+        // A texture only the CPU fills takes XG's size and alignment, whichever way they differ.
+        if (ov.has_xg) {
+            if (ov.xg_size != size || ov.xg_alignment != one.Alignment) grows = true;
+            size = ov.xg_size;
+            one.Alignment = ov.xg_alignment;
+        }
+        if (ov.rt_size > size) {
+            size = align_up_saturating(ov.rt_size, one.Alignment);
+            grows = true;
+        }
+        // A depth-stencil target takes its console size whichever way it differs (console_depth_stencil_size).
+        if (ov.ds_size) {
+            const UINT64 planes = align_up_saturating(ov.ds_size, one.Alignment);
+            if (planes != size) {
+                size = planes;
                 grows = true;
             }
-            // A depth-stencil target takes its console size whichever way it differs (console_depth_stencil_size).
-            if (const UINT64 depth = console_depth_stencil_size(descs[i])) {
-                const UINT64 planes = align_up_saturating(depth, one.Alignment);
-                if (planes != size) {
-                    size = planes;
-                    grows = true;
-                }
-            }
-            const UINT64 offset = align_up_saturating(end, one.Alignment);
-            if (write) each[i] = {offset, one.Alignment, size};
-            end = size > UINT64_MAX - offset ? UINT64_MAX : offset + size;
-            alignment = std::max(alignment, one.Alignment);
         }
-        if (!grows) return false;
-        total = {align_up_saturating(end, alignment), alignment};
+        const UINT64 offset = align_up_saturating(end, one.Alignment);
+        if (staged) staged[i] = {offset, one.Alignment, size};
+        end = size > UINT64_MAX - offset ? UINT64_MAX : offset + size;
+        alignment = std::max(alignment, one.Alignment);
     }
+    if (!grows) return false;
+    total = {align_up_saturating(end, alignment), alignment};
+    if (each) std::memcpy(each, staged, static_cast<std::size_t>(count) * sizeof(D3D12_RESOURCE_ALLOCATION_INFO1));
     return true;
 }
 
