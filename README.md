@@ -49,6 +49,8 @@ Original author's Git Mirror: https://git.notrexed.dev/notrexed/Leonida
 
 ## Project status
 
+The Windows integration provides a reproducible build and launch procedure for the offline first-run controller prompts. [First-run UI instructions](docs/first_run_ui.md)
+
 **Early. The game does not boot yet.** Everything that can be done without the game's executable is in place, so
 work on booting can start as soon as one is available to a developer.
 
@@ -65,7 +67,7 @@ work on booting can start as soon as one is available to a developer.
 | Audio banks (AWC: Opus, XMA2) | ✅ Exported whole. Opus repackaged **losslessly** as Ogg Opus; PCM (codec 0/2) as WAV; XMA2 decoded with ffmpeg. `--wav` adds 16-bit PCM WAV ([notes](docs/audio.md)) |
 | Music/radio config | ? Measured. **1,589** audio-config records with exact durations and AWC stream ids; station grouping and content-id lists; no per-track start offsets ([notes](docs/audio_config.md)) |
 | PE loader and import shims | ⚠️ Runs a stand-in executable end to end (`gta6rt --run`: CRT startup, statics, heap, files, threads, GDK imports through the shims, exit code back). Controllers through a GameInput shim on SDL3 (any controller SDL supports, rumble, DualSense trigger effects and lightbar; built when SDL3 is installed or with `-DLEONIDA_SDL3_FETCH=ON`, [notes](docs/gameinput.md)). `--trace-d3d12` logs every D3D12 call and its outcome for the first boot. Untested against the real executable |
-| Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, committed, placed and reserved resources, render-target and depth views (3D targets included), texture views and samplers (2D, cube, 1D and 3D views, the depth and stencil planes of depth-stencil textures, packed formats such as B5G6R5, B4G4R4A4 and R9G9B9E5, buffer SRVs — raw, structured and typed; they go into the bindless set), root signatures, pipelines and query heaps, and draws run on Vulkan. Barriers, clears, uploads, copies (BC included), colour resolves, predication, CPU-side texture reads and writes, and occlusion, timestamp and pipeline-statistics queries run on Vulkan, checked on one GPU. The console-shaped command-list proxy, the measured `PresentX` queue slots (30/32, layout-detected) wired to the presentation core, and `AllocateUploadMemory` (list slot 148, a mapped-upload arena whose addresses translate to buffer device addresses in root descriptors and IA/SO views) cover the console-ABI surface the package measures. Still open: the console list tail and the descriptor-table record model ([plan](docs/d3d12_vulkan.md)) |
+| Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, committed, placed and reserved resources, render-target and depth views (3D targets included), texture views and samplers (2D, cube, 1D and 3D views, the depth and stencil planes of depth-stencil textures, packed formats such as B5G6R5, B4G4R4A4 and R9G9B9E5, buffer SRVs — raw, structured and typed; they go into the bindless set), root signatures, pipelines and query heaps, and draws run on Vulkan. Barriers, clears, uploads, copies (BC included), colour resolves, predication, CPU-side texture reads and writes, and occlusion, timestamp and pipeline-statistics queries run on Vulkan, checked on one GPU. The console-shaped command-list proxy, the measured `PresentX` queue slots (30/32, layout-detected) wired to the presentation core, and `AllocateUploadMemory` (list slot 148, a mapped-upload arena whose addresses translate to buffer device addresses in root descriptors and IA/SO views) cover the console-ABI surface the package measures. Still open: the console list tail and the descriptor-table record model ([plan](docs/d3d12_vulkan.md), [console ABI](docs/d3d12_xs_console_abi.md)) |
 | Ray tracing (BVH) | ⚠️ In progress. `BuildRaytracingAccelerationStructure` builds BLASes and TLASes on the GPU in the console's XDXR BVH4 layout (the default; `LEONIDA_RT_AS=khr` uses Vulkan's own acceleration structures instead), which the translated shaders walk themselves through `image_bvh_intersect_ray` (all four triangle node types, TRI0-TRI3, with the barycentric remap byte); the GPU builder writes TRI0 and TRI1 leaves. Updates refit instead of rebuilding, and clone, compaction and the compacted/current postbuild sizes work; checked against a CPU reference on synthetic scenes. The build descriptions are recovered from the package's `XboxBvhBuilder.dll` ([notes](docs/xdxr.md)). The game's `*_bvh4.rpf` packs are measured: offline-built, dehydrated BLASes that rehydrate through that DLL with their geometry from the drawables in `levels.rpf` (measured on 8 of the 10 sampled BLAS; [notes](docs/bvh.md)). Not done in the builder: serialization. TRI1 pairing (no memory saved yet) and BOX16 nodes for `MINIMIZE_MEMORY` BLASes (an assumed switch) are in ([notes](docs/bvh.md)). Open: whether the game rehydrates the packs or rebuilds them ([#313](https://github.com/ItsNotRexed/Leonida/issues/313)) |
 
 The table above is written by hand. To measure it on your own checkout (unit and runtime tests, which rows of
@@ -140,6 +142,29 @@ can sit on another drive. The runtime maps the package in place, so a read-only 
 files in `work/shaders/dxbc/disasm` in place: the next run checks them against the list in `disasm.done` and
 disassembles the missing ones again (all of them for a folder whose `disasm.done` predates that list), then
 translates every shader again. A `disasm` folder that is a symlink is refused when the stage has to clear it.
+
+**Disk space and drives:** the build uses three folders, and each can be on its own drive:
+
+| Folder | Flag | What is in it | Size | Read when playing |
+|---|---|---|---|---|
+| your package | `--game` | your copy of the game; only read, never written | as copied | yes, in place (`game_path.txt`) |
+| work | `--work` (default `<out>\work`) | `shaders` (carved, disassembled, translated) and `assets` (exports) | about 30 GB + about 370 GB | only `shaders\spirv` (`shader_path.txt`) |
+| port | `--out` (default `Documents\Leonida`) | `gta6rt.exe`, its DLL, the path files, the pipeline cache, `overlay` | small | yes |
+
+The free-space check before a build counts the `--work` drive only, because that is where the large files go.
+Nothing in `<work>\assets` is read by the game, so with a small SSD you can keep what the game loads on the SSD and
+put the exports on a hard drive, in two runs:
+
+```powershell
+# on the SSD: the package, the port and the translated shaders (about 30 GB of work files)
+python -I make_game.py --game "S:\Games\package" --out "S:\Games\Leonida" --work "S:\Games\Leonida\work" --stages check,shaders,runtime,pipelines
+# on the hard drive: the asset exports (about 370 GB), only for the asset tools
+python -I make_game.py --game "S:\Games\package" --out "S:\Games\Leonida" --work "H:\leonida-assets" --stages check,assets
+```
+
+The second run does not rebuild the runtime, so `shader_path.txt` keeps pointing at the SSD. Pass the same
+`--work` again for later runs of each stage so they resume. A single `--work "H:\leonida-work"` also works; the
+game then loads its translated shaders from that drive.
 
 **From a terminal**, with the same behaviour and more control:
 
@@ -259,6 +284,10 @@ in `<work>/shaders/spirv` using `shader_path.txt` beside `gta6rt.exe`. Set `LEON
 | Research tools | PE/RTTI inspection, raw carving, texture tiling probes, GPU test harnesses | `tools/`, `runtime/test/` |
 | Progress dashboard | One offline page of what passes, what changed since it last passed and what blocks next, built from test results and the docs' own tables; nothing is written inside the repo | `tools/progress_dashboard.py` |
 
+Localized string tables are decoded by `tools/text_tables.py` ([docs/text.md](docs/text.md)); their language is
+guessed from script (kana, hangul, CJK, Cyrillic, Arabic) or Latin words, and subtitles are joined to dialogue lines
+across languages.
+
 The translator's runtime contract (user SGPRs, push constants, memory model, bindless images, vertex fetch,
 system values) and all the format notes are in [docs/design.md](docs/design.md); the format, asset, runtime
 and validation notes are indexed in [docs/README.md](docs/README.md). The Xbox D3D12 plan is in
@@ -274,7 +303,7 @@ The biggest open pieces:
   [docs/design.md](docs/design.md)); still open are the vertex-shader input layout (`v0` = `VertexIndex` is
   unverified if the console runs VS as NGG) and wave64 cross-half code in VS/PS/GS on 32-wide subgroups.
 - **Xbox D3D12 → Vulkan**: mesh-shader draws, indirect draw state and stream output are still open; #313 tracks the
-  remaining method surface, and nothing has been checked against the real executable yet ([plan and status](docs/d3d12_vulkan.md)).
+  remaining method surface. The Windows integration exercises the first-run UI. [Plan and status](docs/d3d12_vulkan.md)
 - **Model recovery**: investigate the 71 unrecovered fragment candidates in [`levels.rpf`](docs/models.md#full-archive-re-count-at-e293917).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Never attach game files, extracted assets or generated shaders to issues or
