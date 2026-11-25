@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 namespace leonida::submit_phases {
 
@@ -59,22 +60,46 @@ inline double process_age() {
     if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
     GetSystemTimeAsFileTime(&now);
     const auto ticks = [](const FILETIME& f) { return (std::uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
-    return double(ticks(now) - ticks(created)) * 1e-7;
+    const std::uint64_t n = ticks(now), c = ticks(created);
+    return n >= c ? double(n - c) * 1e-7 : 0.0;
 #else
     return 0;
 #endif
 }
 
+inline constexpr std::int64_t kNsPerSecond = 1000000000LL;
+inline constexpr std::int64_t kDefaultPeriodSeconds = 5;
+inline constexpr std::uint64_t kMaxPeriodSeconds =
+    static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)() / kNsPerSecond);
+
+// Parses LEONIDA_SUBMIT_PHASES_SECONDS (non-negative decimal seconds; 0 disables the periodic line).
+// Missing, empty, negative or non-numeric text uses the 5 s default; huge values saturate safely without
+// signed int64 overflow.
+inline std::int64_t parse_period_ns(const char* text) {
+    if (!text) return kDefaultPeriodSeconds * kNsPerSecond;
+    while (*text == ' ' || *text == '\t') ++text;
+    if (*text < '0' || *text > '9') return kDefaultPeriodSeconds * kNsPerSecond;
+    std::uint64_t seconds = 0;
+    while (*text >= '0' && *text <= '9') {
+        const std::uint64_t digit = static_cast<std::uint64_t>(*text - '0');
+        if (seconds > (kMaxPeriodSeconds - digit) / 10)
+            seconds = kMaxPeriodSeconds;
+        else
+            seconds = seconds * 10 + digit;
+        ++text;
+    }
+    while (*text == ' ' || *text == '\t') ++text;
+    if (*text != '\0') return kDefaultPeriodSeconds * kNsPerSecond;
+    return static_cast<std::int64_t>(seconds) * kNsPerSecond;
+}
+
 inline std::int64_t period_ns() {
-    static const std::int64_t value = [] {
-        const char* text = std::getenv("LEONIDA_SUBMIT_PHASES_SECONDS");
-        const unsigned long long s = text && *text ? std::strtoull(text, nullptr, 10) : 5;
-        return std::int64_t(s) * 1000000000;
-    }();
+    static const std::int64_t value = parse_period_ns(std::getenv("LEONIDA_SUBMIT_PHASES_SECONDS"));
     return value;
 }
 
 inline void add(Phase p, std::uint64_t ns) {
+    if (p >= kCount) return;
     Totals& t = totals();
     t.ns[p].fetch_add(ns, std::memory_order_relaxed);
     std::uint64_t m = t.max_ns[p].load(std::memory_order_relaxed);
@@ -82,12 +107,18 @@ inline void add(Phase p, std::uint64_t ns) {
     }
 }
 
-// Times its own lifetime into a phase.
+// Times its own lifetime into a phase. When the periodic line is disabled (period == 0), skips the
+// steady_clock reads and atomic updates completely.
 struct Scope {
     Phase phase;
-    std::int64_t start = now_ns();
+    bool active = period_ns() > 0;
+    std::int64_t start = active ? now_ns() : 0;
     explicit Scope(Phase p) : phase(p) {}
-    ~Scope() { add(phase, std::uint64_t(now_ns() - start)); }
+    ~Scope() {
+        if (!active) return;
+        const std::int64_t dt = now_ns() - start;
+        if (dt > 0) add(phase, static_cast<std::uint64_t>(dt));
+    }
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;
 };
@@ -101,7 +132,7 @@ inline void submitted() {
     t.thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
     const std::int64_t period = period_ns();
-    if (!period) return;
+    if (period <= 0) return;
     const std::int64_t now = now_ns();
     std::int64_t last = t.last_log.load(std::memory_order_relaxed);
     if (!last) {
