@@ -140,6 +140,9 @@ public:
 
 private:
     void initialise(Module& m);
+    void initialise_all(Module** failed = nullptr);
+    void unmap_module(Module* m);
+    void rollback_load(size_t order_before, size_t init_before);
     static void set_initialised(Module& m, bool value);
     Module* find_narrow_module(const std::string& dll_lower) const;  // caller holds mutex_
     Module* find_wide_module(const std::wstring& basename) const;    // caller holds mutex_
