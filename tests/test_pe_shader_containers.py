@@ -6,6 +6,7 @@ strings that occur in ordinary code.
 """
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -73,6 +74,111 @@ def ildn(name: str) -> bytes:
         f"XboxBvhBuilder\\{name}.pdb"
     ).encode()
     return b"\x00\x00" + struct.pack("<H", len(path)) + path
+
+
+def packed(dxbc: bytes, trailing: bytes = b"", stored=None, size=None, level: int = -1) -> bytes:
+    """A compressed container as the image stores it: the stored size, the constant 0x000DDCE7, the stored size
+    again, the inflated size and a raw deflate stream. Both stored sizes count from the constant."""
+    compressor = zlib.compressobj(level, wbits=-15)
+    stream = compressor.compress(dxbc) + compressor.flush() + trailing
+    first, second = stored or (12 + len(stream),) * 2
+    return struct.pack("<IIII", first, 0xDDCE7, second, len(dxbc) if size is None else size) + stream
+
+
+class PackedContainerTests(unittest.TestCase):
+    """A console program stored compressed is found, described by its inflated bytes and extracted inflated."""
+
+    def setUp(self):
+        self.native = container([(b"DXIL", dxil_payload("packed")), (b"ILDN", ildn("PackedPS"))])
+        self.plain = container([(b"DXIL", dxil_payload("plain")), (b"ILDN", ildn("PlainCS"))])
+
+    def test_packed_program_is_listed_after_the_plain_containers(self):
+        record = packed(self.native)
+        image = bytes(7) + record + bytes(5) + self.plain
+        records, rejected = psc.inspect(image, "synthetic.exe")
+        self.assertEqual(rejected, [])
+        self.assertEqual([r["name"] for r in records], ["PlainCS", "PackedPS"])
+        plain, found = records
+        self.assertEqual((plain["offset"], plain["size"]), (7 + len(record) + 5, len(self.plain)))
+        self.assertNotIn("stored_size", plain)
+        # offset is that of the constant; the sizes before and after it count from there
+        self.assertEqual((found["offset"], found["stored_size"]), (7 + 4, len(record) - 4))
+        self.assertEqual((found["size"], found["sha256"]), (len(self.native), hashlib.sha256(self.native).hexdigest()))
+        self.assertTrue(found["has_xbch"])
+        self.assertEqual([c["fourcc"] for c in found["chunks"]], ["DXIL", "ILDN"])
+
+    def test_only_a_whole_console_container_counts(self):
+        other = container([(b"SFI0", bytes(8))])                       # a container, but no console program
+        good = packed(self.native)
+        n = len(good) - 4
+        cases = {
+            "no console program": packed(other),
+            "bytes after the stream": packed(self.native, trailing=b"junk"),
+            "cut short": good[:-1],
+            "first stored size differs": packed(self.native, stored=(n + 1, n)),
+            "second stored size differs": packed(self.native, stored=(n, n - 1)),
+            "inflated size too small": packed(self.native, size=len(self.native) - 1),
+            "inflated size too large": packed(self.native, size=len(self.native) + 1),
+            "stored size of the header alone": struct.pack("<IIII", 12, 0xDDCE7, 12, len(self.native)),
+            "not a deflate stream": struct.pack("<IIII", 20, 0xDDCE7, 20, 64) + b"\xff" * 8,
+            "not a container": packed(b"x" * 64),
+            "two containers": packed(self.native + self.native),
+            "container and padding": packed(self.native + bytes(4)),
+            "constant at the start of the file": good[4:],
+        }
+        for name, record in cases.items():
+            with self.subTest(name):
+                records, _ = psc.inspect(record + self.plain, "synthetic.exe")
+                self.assertEqual([r["name"] for r in records], ["PlainCS"])
+        records, _ = psc.inspect(good + self.plain, "synthetic.exe")    # the control
+        self.assertEqual([r["name"] for r in records], ["PlainCS", "PackedPS"])
+
+    def test_stored_blocks_list_the_container_once(self):
+        # Level 0 writes stored blocks, so the container sits in the stream as it is and the plain scan finds it.
+        record = packed(self.native, level=0)
+        self.assertIn(self.native, record)
+        records, _ = psc.inspect(record + self.plain, "synthetic.exe")
+        self.assertEqual([(r["name"], "stored_size" in r) for r in records], [("PackedPS", False), ("PlainCS", False)])
+
+    def test_extract_writes_the_inflated_container(self):
+        image = packed(self.native) + self.plain + packed(self.native, trailing=b"junk")
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "synthetic.exe")
+            with open(src, "wb") as f:
+                f.write(image)
+            out, report = os.path.join(tmp, "out"), os.path.join(tmp, "report.json")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                self.assertEqual(psc.main([src, "--extract", out, "--json", report, "--verbose"]), 0)
+            self.assertIn("2 container(s)", stdout.getvalue())
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                self.assertEqual([e["file"] for e in json.load(f)], ["PlainCS.dxbc", "PackedPS.dxbc"])
+            for file, expected in (("PlainCS.dxbc", self.plain), ("PackedPS.dxbc", self.native)):
+                with open(os.path.join(out, file), "rb") as f:
+                    self.assertEqual(f.read(), expected)
+            with open(report, encoding="utf-8") as f:
+                rows = json.load(f)
+            first = len(packed(self.native))
+            self.assertEqual([(r["offset"], r.get("stored_size"), r["size"]) for r in rows],
+                             [(first, None, len(self.plain)), (4, first - 4, len(self.native))])
+
+    def test_random_headers_raise_nothing(self):
+        rng = random.Random(0xDDCE7)
+        good = packed(self.native)
+        for _ in range(2000):
+            data = bytearray(rng.randbytes(rng.randrange(0, 300)))
+            if rng.random() < 0.5:
+                data += good
+                for _ in range(rng.randrange(1, 4)):                    # damage a few bytes of a real record
+                    data[rng.randrange(len(data) - len(good), len(data))] = rng.randrange(256)
+            elif len(data) >= 16:
+                at = rng.randrange(0, len(data) - 15)
+                n = rng.randrange(0, 64)
+                data[at : at + 16] = struct.pack("<IIII", n, 0xDDCE7, n, rng.randrange(0, 200))
+            try:
+                psc.inspect(bytes(data), "fuzz.exe")
+            except Exception as e:  # noqa: BLE001 - any exception is the failure being asserted
+                self.fail(f"inspect raised {type(e).__name__}: {e}")
 
 
 class ContainerTests(unittest.TestCase):

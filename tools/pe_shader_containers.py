@@ -241,7 +241,11 @@ def inspect(data: bytes, image: str) -> tuple[list[dict], list[int]]:
         records, _ = inspect_raw(dxbc, image)
         if records and records[0]["offset"] == 0 and records[0]["has_xbch"]:
             record = records[0]
-            record.update(offset=offset, stored_size=u32(data, offset + 4))
+            stored = u32(data, offset + 4)
+            # An uncompressed deflate block may have been found by the plain scan.
+            if any(offset < r["offset"] < offset + stored and r["sha256"] == record["sha256"] for r in found):
+                continue
+            record.update(offset=offset, stored_size=stored)
             found.append(record)
     return found, rejected
 
