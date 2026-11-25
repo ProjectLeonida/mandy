@@ -3,7 +3,9 @@
     python -I tests/test_leonida_tui.py
 """
 import ctypes
+import io
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -441,6 +443,106 @@ class SetupDefaultsTest(unittest.TestCase):
             cfg = leonida_tui.run_setup(4, default_overlap=True)
         self.assertEqual(cfg.jobs, 3)
         self.assertFalse(cfg.overlap)
+
+
+class PumpProcessTimeoutTest(unittest.TestCase):
+    def setUp(self):
+        with leonida_tui._live_procs_lock:
+            self._saved_procs = set(leonida_tui._live_procs)
+            leonida_tui._live_procs.clear()
+
+    def tearDown(self):
+        with leonida_tui._live_procs_lock:
+            leonida_tui._live_procs.clear()
+            leonida_tui._live_procs.update(self._saved_procs)
+
+    def test_timeout_terminates_only_timed_out_child_posix(self):
+        class FakeProc:
+            def __init__(self, pid):
+                self.pid = pid
+                self.stdout = io.StringIO("")
+                self.returncode = None
+                self.terminated = False
+                self.killed = False
+                self.wait_calls = 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                if self.returncode is None:
+                    raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+        hung = FakeProc(1001)
+        sibling = FakeProc(1002)
+        leonida_tui.register_live_process(sibling)
+
+        with mock.patch.object(leonida_tui.os, "name", "posix"):
+            rc = leonida_tui.pump_process(hung, stage=None, board=None)
+
+        self.assertEqual(rc, -15)
+        self.assertTrue(hung.terminated)
+        self.assertFalse(sibling.terminated)
+        self.assertFalse(sibling.killed)
+        with leonida_tui._live_procs_lock:
+            self.assertIn(sibling, leonida_tui._live_procs)
+            self.assertNotIn(hung, leonida_tui._live_procs)
+
+    def test_timeout_terminates_only_timed_out_child_windows(self):
+        class FakeProc:
+            def __init__(self, pid):
+                self.pid = pid
+                self.stdout = io.StringIO("")
+                self.returncode = None
+                self.terminated = False
+                self.killed = False
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                if self.returncode is None:
+                    raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.killed = True
+
+        hung = FakeProc(2001)
+        sibling = FakeProc(2002)
+        leonida_tui.register_live_process(sibling)
+        taskkill_calls = []
+
+        def fake_run(cmd, **kwargs):
+            taskkill_calls.append(cmd)
+            if str(hung.pid) in cmd:
+                hung.returncode = 1
+            return SimpleNamespace(returncode=0)
+
+        with mock.patch.object(leonida_tui.os, "name", "nt"), \
+                mock.patch.object(leonida_tui.subprocess, "run", side_effect=fake_run):
+            rc = leonida_tui.pump_process(hung, stage=None, board=None)
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(taskkill_calls, [["taskkill", "/F", "/T", "/PID", "2001"]])
+        self.assertFalse(sibling.terminated)
+        self.assertFalse(sibling.killed)
+        with leonida_tui._live_procs_lock:
+            self.assertIn(sibling, leonida_tui._live_procs)
+            self.assertNotIn(hung, leonida_tui._live_procs)
 
 
 if __name__ == "__main__":
