@@ -64,8 +64,11 @@ def listing_and_blob(program, variant="invalid"):
         if text is not None:
             lines.append(f"\t{text:<40}{encoding(raw)}")
             continue
-        second = bytes.fromhex(raw)[4:8]
+        raw_bytes = bytes.fromhex(raw)
         lines.append(INVALID)
+        if len(raw_bytes) == 4:
+            continue
+        second = raw_bytes[4:8]
         if variant == "invalid":
             lines.append(INVALID)
         elif variant == "junk":         # the second word decodes as an instruction of its own, bytes as stored
@@ -151,6 +154,66 @@ class VccTupleFallbackTest(unittest.TestCase):
         restored = rdna2spirv.restore_skipped_instructions([], mimg_nsa1, 0, 12)
         self.assertEqual(len(restored), 1)
         self.assertEqual((restored[0]["pc"], len(restored[0]["enc"]) // 2), (0, 12))
+
+    def test_skipped_data_word_before_branch_target_is_not_restored(self):
+        # An unreachable data word skipped by s_branch whose bytes equal the first dword of a vcc-tuple load must
+        # not be restored across the branch target instruction that immediately follows it.
+        program = SET_SGPR_V + [
+            ("s_branch 1", "01 00 82 bf"),
+            (None, "02 19 2c f4"),
+            ("v_mov_b32_e32 v10, 7", "87 02 14 7e"),
+            ("v_mov_b32_e32 v6, 0x3000", "ff 02 0c 7e 00 30 00 00"),
+            ("global_store_dword v6, v10, s[0:1]", "00 80 70 dc 06 0a 00 00"),
+            ("s_endpgm", "00 00 81 bf"),
+        ]
+        mem = run(translate(program), {})
+        self.assertEqual(mem.get(OUT), 7)
+
+    def test_skipped_data_word_before_branch_target_vcc_load(self):
+        # Same skipped data word right before a real vcc-tuple load at the branch target: the data word is skipped
+        # and the real vcc-tuple load at the target is restored cleanly across all three listing variants.
+        program = SET_SGPR_V + [
+            ("s_branch 1", "01 00 82 bf"),
+            (None, "02 19 2c f4"),
+            (None, LOAD_X8_VCC), WAIT,
+            ("v_mov_b32_e32 v10, s100", "64 02 14 7e"), ("v_mov_b32_e32 v11, s105", "69 02 16 7e"),
+            ("v_mov_b32_e32 v12, vcc_lo", "6a 02 18 7e"), ("v_mov_b32_e32 v13, vcc_hi", "6b 02 1a 7e"),
+        ] + STORE_X4
+        words = [0x22220000 + i for i in range(8)]
+        for variant in PROGRAM_VARIANTS:
+            with self.subTest(printed_as=variant):
+                mem = run(translate(program, variant), {BASE + 4 * i: w for i, w in enumerate(words)})
+                self.assertEqual([mem.get(OUT + 4 * i) for i in range(4)], [words[0], words[5], words[6], words[7]])
+
+    def test_data_word_after_endpgm_before_branch_target_is_not_restored(self):
+        # An unreachable data word after s_endpgm right before a branch target is likewise ignored.
+        program = SET_SGPR_V + [
+            ("s_cmp_eq_i32 s4, s4", "04 04 00 bf"),
+            ("s_cbranch_scc1 2", "02 00 85 bf"),
+            ("s_endpgm", "00 00 81 bf"),
+            (None, "02 19 2c f4"),
+            ("v_mov_b32_e32 v10, 7", "87 02 14 7e"),
+            ("v_mov_b32_e32 v6, 0x3000", "ff 02 0c 7e 00 30 00 00"),
+            ("global_store_dword v6, v10, s[0:1]", "00 80 70 dc 06 0a 00 00"),
+            ("s_endpgm", "00 00 81 bf"),
+        ]
+        mem = run(translate(program), {})
+        self.assertEqual(mem.get(OUT), 7)
+
+    def test_fallthrough_into_data_word_before_branch_target_refused(self):
+        # When fall-through reaches a data word equal to the first dword of a vcc-tuple load right before a branch
+        # target, restore_skipped_instructions must not swallow the branch target; reachable_code refuses it.
+        program = SET_SGPR_V + [
+            ("s_cmp_eq_i32 s4, s4", "04 04 00 bf"),
+            ("s_cbranch_scc1 1", "01 00 85 bf"),
+            (None, "02 19 2c f4"),
+            ("v_mov_b32_e32 v10, 7", "87 02 14 7e"),
+            ("v_mov_b32_e32 v6, 0x3000", "ff 02 0c 7e 00 30 00 00"),
+            ("global_store_dword v6, v10, s[0:1]", "00 80 70 dc 06 0a 00 00"),
+            ("s_endpgm", "00 00 81 bf"),
+        ]
+        with self.assertRaisesRegex(rdna2spirv.Unsupported, "fall-through into undecodable words"):
+            translate(program)
 
 
 if __name__ == "__main__":

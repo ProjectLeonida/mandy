@@ -17550,36 +17550,69 @@ def restore_skipped_instructions(insns, blob, code_start, code_end):
     s[100:107], a buffer resource in s[104:107]): it skips the first word as invalid and then prints the second word
     as an instruction of its own, one that is junk or does not match the blob (docs/shader_library.md section 5).
     The pure-Python decoder reads such a word as a VCCTuple list, [s100,...,s105,vcc_lo,vcc_hi], the form the
-    translator takes for these instructions. Every blob dword in the code range that no matched instruction covers
-    is offered to it. Recover VCC tuples, DPP comparisons and the measured signed-byte dot half swap.
-    Instructions printed inside the words of a restored one are dropped. The instructions already carry
+    translator takes for these instructions. Only uncovered offsets reached from code_start by fall-through or
+    branches (including folded far branches) are offered to it, so unreachable embedded data words skipped by a
+    branch or after s_endpgm are never decoded across a following branch target; recover VCC tuples, DPP
+    comparisons and the measured signed-byte dot half swap only when no reachable branch targets an interior
+    dword. Instructions printed inside the words of a restored one are dropped. The instructions already carry
     their blob offsets in "pc"; returns the list sorted by it."""
     import rdna2_decode
     covered = set()
     for ins in insns:
         if not ins.get("normalized"):
             covered.update(range(ins["pc"], ins["pc"] + len(ins["enc"]) // 2, 4))
+    folded = fold_far_branches([ins for ins in insns if "op" in ins])
+    by_pc = {ins["pc"]: ins for ins in folded
+             if all(o in covered for o in range(ins["pc"], ins["pc"] + len(ins["enc"]) // 2, 4))}
     stop = min(len(blob), code_end if code_end is not None else len(blob))
-    restored, at = [], code_start
-    while at + 8 <= stop:
-        found = None if at in covered else rdna2_decode.decode_bytes(blob[at:min(at + 20, stop)])["insns"][:1]
-        if found and found[0]["pc"] == 0 and (
-                (found[0]["op"].startswith("v_cmp_") and found[0]["op"].endswith("_f32_dpp"))
-                # tedin7 (upstream PR #281): LLVM skips this VOP3P form. Admit only opcode 0x16,
-                # op_sel=2, op_sel_hi=5, no clamp or neg, with all reserved encoding bits clear.
-                or (found[0]["op"] == "v_dot4_i32_i8" and
-                    int.from_bytes(blob[at:at + 4], "little") >> 8 == 0xCC1650 and blob[at + 7] >> 3 == 1)
-                or any(a["k"] == "slist" and ("vcc_lo" in a["r"] or "vcc_hi" in a["r"]) for a in found[0]["args"])):
-            ins = found[0]
-            nbytes = len(ins["enc"]) // 2
-            if at + nbytes <= stop:
-                ins["pc"] = at
-                restored.append(ins)
-                at += nbytes
+    restored, restored_covered, reachable_targets = [], set(), set()
+    seen, work = set(), [code_start]
+    while work:
+        at = work.pop()
+        while code_start <= at < stop and at not in seen:
+            seen.add(at)
+            ins = by_pc.get(at)
+            if ins is not None:
+                op = base_op(ins["op"])
+                nxt = at + len(ins["enc"]) // 2
+                if op in BRANCHES:
+                    imm = next((x for x in ins["args"] if x["k"] == "imm"), None)
+                    v = (imm["v"] & 0xFFFF) if imm else 0
+                    tgt = ins["target"] if "target" in ins else nxt + 4 * (v - 0x10000 if v & 0x8000 else v)
+                    reachable_targets.add(tgt)
+                    work.append(tgt)
+                    if op == "s_branch":
+                        break
+                if op in ("s_endpgm", "s_setpc_b64"):
+                    break
+                at = nxt
                 continue
-        at += 4
+            if at in covered or at in restored_covered or at + 8 > stop:
+                break
+            found = rdna2_decode.decode_bytes(blob[at:min(at + 20, stop)])["insns"][:1]
+            if found and found[0]["pc"] == 0 and (
+                    (found[0]["op"].startswith("v_cmp_") and found[0]["op"].endswith("_f32_dpp"))
+                    # tedin7 (upstream PR #281): LLVM skips this VOP3P form. Admit only opcode 0x16,
+                    # op_sel=2, op_sel_hi=5, no clamp or neg, with all reserved encoding bits clear.
+                    or (found[0]["op"] == "v_dot4_i32_i8" and
+                        int.from_bytes(blob[at:at + 4], "little") >> 8 == 0xCC1650 and blob[at + 7] >> 3 == 1)
+                    or any(a["k"] == "slist" and ("vcc_lo" in a["r"] or "vcc_hi" in a["r"])
+                           for a in found[0]["args"])):
+                r = found[0]
+                nbytes = len(r["enc"]) // 2
+                if (at + nbytes <= stop
+                        and not any(o in restored_covered for o in range(at, at + nbytes, 4))):
+                    r["pc"] = at
+                    restored.append(r)
+                    restored_covered.update(range(at, at + nbytes, 4))
+                    at += nbytes
+                    continue
+            break
+    restored = [r for r in restored
+                if not any(o in reachable_targets for o in range(r["pc"] + 4, r["pc"] + len(r["enc"]) // 2, 4))]
     if not restored:
         return insns
+    restored.sort(key=lambda r: r["pc"])
     # Both streams are in program order. A shader can contain thousands of recovered tuples.
     spans = iter((r["pc"], r["pc"] + len(r["enc"]) // 2) for r in restored)
     span = next(spans, None)
