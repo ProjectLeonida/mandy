@@ -59,7 +59,7 @@ FLAG_WRITERS = {
     "and": "NZCVPA", "sub": "NZCVPA", "xor": "NZCVPA", "cmp": "NZCVPA",
     "test": "NZCVPA", "neg": "NZCVPA",
     "inc": "NZVPA", "dec": "NZVPA",
-    "shl": "NZCP", "shr": "NZCP", "sar": "NZCP", "sal": "NZCP",
+    "shl": "NZCP", "shr": "NZCP", "sar": "NZCP", "sal": "NZCP", "shld": "NZCVP", "shrd": "NZCVP",
     "rol": "C", "ror": "C", "rcl": "C", "rcr": "C",
     "imul": "CV", "mul": "CV",
     "bsf": "Z", "bsr": "Z",
@@ -164,6 +164,8 @@ OF = {
     0xA0: ("pushseg", "fs"), 0xA1: ("popseg", "fs"), 0xA8: ("pushseg", "gs"), 0xA9: ("popseg", "gs"),
     0xA2: ("cpuid", "sys"),
     0xA3: ("bt", "Ev Gv"), 0xAB: ("bts", "Ev Gv"), 0xB3: ("btr", "Ev Gv"), 0xBB: ("btc", "Ev Gv"),
+    0xA4: ("shld", "Ev Gv Ib"), 0xA5: ("shld", "Ev Gv c"),
+    0xAC: ("shrd", "Ev Gv Ib"), 0xAD: ("shrd", "Ev Gv c"),
     0xAF: ("imul", "Gv Ev"), 0xBC: ("bsf", "Gv Ev"), 0xBD: ("bsr", "Gv Ev"),
     0xB0: ("cmpxchg", "Eb Gb"), 0xB1: ("cmpxchg", "Ev Gv"),
     0xB8: ("popcnt_jmpe", "Gv Ev"), 0xB9: ("ud1", "Ev"), 0xBA: ("grp8", "Ev Ib"),
@@ -421,6 +423,9 @@ def _classify(ins, mnem, cc_index, state):
         ins.kind = "shift"
         ins.flags_w = FLAG_WRITERS[mnem]
         ins.flags_r = FLAG_READERS.get(mnem, "")
+    elif mnem in ("shld", "shrd"):
+        ins.kind = "dshift"
+        ins.flags_w = FLAG_WRITERS[mnem]
     elif mnem in ("imul", "mul", "div", "idiv"):
         ins.kind = "mul"
         ins.flags_w = FLAG_WRITERS.get(mnem, "")
@@ -2178,6 +2183,94 @@ class FunctionTranslator:
         a.mov(GMAP[4], GMAP[5])
         a.ldr_post(GMAP[5], GMAP[4], 8)
 
+    def _emit_dshift(self, ins):
+        a = self.asm
+        m = ins.mnem
+        dst, src, cnt = ins.ops
+        sz = self._op_size(dst)
+        sf = 1 if sz == 8 else 0
+        width = sz * 8
+        need = self.needed.get(ins.addr, set())
+        flaggy = bool(need) or ins.addr in self.mat
+        need_c = "C" in need or ins.addr in self.mat
+        need_v = "V" in need or ins.addr in self.mat
+        is_imm = cnt[0] == "i"
+        if is_imm:
+            cval = (cnt[1] & 0x3F) if width == 64 else (cnt[1] & 0x1F)
+            if cval == 0:
+                return
+        else:
+            a.mov(T1, GMAP[1], sf=0)
+            a.and_i(T1, T1, 0x3F if width == 64 else 0x1F, sf=0)
+            skip = self._skip_lbl()
+            a.cbz(T1, skip, sf=0)
+        self._load(ins, dst, T2)  # original dst for CF/OF
+        self._load(ins, src, GTMP)
+        if width == 16:
+            if m == "shld":
+                a.orr_r(T0, GTMP, T2, sf=0, shift=0, imm6=16)  # (dst << 16) | src
+                if is_imm:
+                    a.lsl(T0, T0, cval, sf=0)
+                else:
+                    a.lslv(T0, T0, T1, sf=0)
+                a.lsr(T0, T0, 16, sf=0)
+            else:
+                a.orr_r(T0, T2, GTMP, sf=0, shift=0, imm6=16)  # (src << 16) | dst
+                if is_imm:
+                    a.lsr(T0, T0, cval, sf=0)
+                else:
+                    a.lsrv(T0, T0, T1, sf=0)
+                a.uxth(T0, T0)
+        elif is_imm:
+            if m == "shld":
+                a.extr(T0, T2, GTMP, width - cval, sf)
+            else:
+                a.extr(T0, GTMP, T2, cval, sf)
+        else:
+            a.movz(T3, width, 0, sf=0)
+            a.sub_r(T3, T3, T1, sf=0)
+            if m == "shld":
+                a.lslv(T0, T2, T1, sf)
+                a.lsrv(T3, GTMP, T3, sf)
+            else:
+                a.lsrv(T0, T2, T1, sf)
+                a.lslv(T3, GTMP, T3, sf)
+            a.orr_r(T0, T0, T3, sf)
+        self._store(ins, dst, T0)
+        if flaggy:
+            if width == 16:
+                a.sxth(T3, T0, sf=0)
+                a.tst_r(T3, T3, sf=0)
+            else:
+                a.tst_r(T0, T0, sf)
+            if need_c:
+                if is_imm:
+                    if cval > width:
+                        a.movz(T3, 0, 0, sf=0)
+                    elif m == "shld":
+                        a.ubfx(T3, T2, width - cval, 1, sf)
+                    else:
+                        a.ubfx(T3, T2, cval - 1, 1, sf)
+                else:
+                    if m == "shld":
+                        a.movz(T3, width, 0, sf=0)
+                        a.sub_r(T3, T3, T1, sf=0)
+                    else:
+                        a.sub(T3, T1, 1, sf=0)
+                    a.lsrv(T3, T2, T3, sf)
+                    a.and_i(T3, T3, 1, sf=0)
+                self._set_cf(T3)
+            if need_v:
+                a.eor_r(T3, T2, T0, sf)
+                a.ubfx(T3, T3, width - 1, 1, sf)
+                a.mrs_nzcv(GTMP)
+                a.bfi(GTMP, T3, 28, 1)
+                a.msr_nzcv(GTMP)
+            self._stash_res(ins, T0)
+            self._maybe_mkflags(ins)
+        if not is_imm:
+            a.label(skip)
+
     def _emit_one(self, ins):
         k, m = ins.kind, ins.mnem
         if k == "mov":
@@ -2192,6 +2285,8 @@ class FunctionTranslator:
             self._emit_xchg(ins)
         elif k == "conv":
             self._emit_conv(ins)
+        elif k == "dshift":
+            self._emit_dshift(ins)
         elif k == "shift":
             self._emit_shift(ins)
         elif k == "mul":
