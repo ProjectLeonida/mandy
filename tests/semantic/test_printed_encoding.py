@@ -6,6 +6,9 @@ blob reads as a low-half compare in the listing. translate() used to compare pri
 listings with undecodable words (the re-anchoring path); now a clean listing with a code range and a blob next to it
 is checked too, with the same exceptions (same_encoding). Hand-built listing and blob, no game data.
 
+One dropped field is restored instead of refused: llvm-mc prints no op_sel_hi on v_dot4_i32_i8, and a stored
+op_sel_hi 5 on an inline integer S1 is taken from the blob (restore_dot4_inline_sel).
+
     python -I tests/semantic/test_printed_encoding.py -v
 """
 import os
@@ -29,10 +32,10 @@ CODE_START = 0x100
 NAME = "ps_printed_encoding"
 
 
-def listing(program, start=CODE_START, end=None, how="scan"):
+def listing(program, start=CODE_START, end=None, how="scan", mcpu="gfx1013", invalid=0):
     size = sum(len(bytes.fromhex(enc)) for _, enc in program)
     end = start + size if end is None else end
-    lines = [f"; {NAME}  code 0x{start:x}..0x{end:x} ({how}), gfx1013, 0 invalid words"]
+    lines = [f"; {NAME}  code 0x{start:x}..0x{end:x} ({how}), {mcpu}, {invalid} invalid words"]
     for text, enc in program:
         printed = ",".join(f"0x{b:02x}" for b in bytes.fromhex(enc))
         lines.append(f"\t{text:<40}; encoding: [{printed}]")
@@ -80,6 +83,51 @@ class PrintedEncodingTest(unittest.TestCase):
                                     end=len(stored))
                 with self.assertRaises(rdna2spirv.Unsupported):
                     self.translate(different, stored)
+
+    def test_dot4_inline_integer_uses_stored_high_half_selector(self):
+        # llvm-mc 23.1.5 (gfx1030) prints this line, with op_sel_hi 7 in its encoding, for every stored op_sel_hi.
+        # With op_sel_hi 5 stored (byte 7 0x0c), byte pairs 2..3 read the low half of the inline 10 again, so the
+        # second 1 in v1 multiplies 10 a second time: 20, not 10.
+        program = [
+            ("v_mov_b32_e32 v1, 0x10001", "ff 02 02 7e 01 00 01 00"),
+            ("v_mov_b32_e32 v3, 0", "80 02 06 7e"),
+            ("v_dot4_i32_i8 v8, v1, 10, v3", "08 40 16 cc 01 15 0d 1c"),
+            ("exp mrt0 v8, v8, v8, v8 done vm", "0f 18 00 f8 08 08 08 08"),
+            PROGRAM[-1],
+        ]
+        replicated = with_byte(program, 2, 7, 0x0c)
+        refused = {
+            "src0": with_byte(replicated, 2, 4, 0x02),                       # another register than the one printed
+            "op_sel_hi 4": with_byte(program, 2, 7, 0x04),                   # other dropped selectors are not guessed
+            "op_sel_hi 3": with_byte(program, 2, 1, 0x00),
+            "op_sel_hi 1": with_byte(replicated, 2, 1, 0x00),
+            "clamp": with_byte(replicated, 2, 1, 0xc0),
+            "neg_lo": with_byte(replicated, 2, 7, 0x2c),
+            "neg_hi": with_byte(replicated, 2, 1, 0x41),
+        }
+        # The same selector on a register S1 is dropped by llvm-mc as well and stays refused.
+        register = [program[0], program[1], ("v_dot4_i32_i8 v8, v1, v2, v3", "08 40 16 cc 01 05 0e 1c")] + program[3:]
+        for invalid in (0, 1):
+            tail = b"\xff" * (4 * invalid)  # Unreachable word after s_endpgm exercises re-anchoring.
+            error = "reachable instruction with normalized encoding" if invalid else "a field the disassembler dropped"
+
+            def shown(lines):
+                text = listing(lines, end=len(blob(lines)) + len(tail), mcpu="gfx1030", invalid=invalid)
+                return text + (b"; warning: invalid instruction encoding\n" if invalid else b"")
+
+            for native, expected in ((program, 10), (replicated, 20)):
+                with self.subTest(reanchor=bool(tail), expected=expected):
+                    self.assertEqual(mrt0_words(self.translate(shown(program), blob(native) + tail)), [expected] * 4)
+            for what, native in refused.items():
+                with self.subTest(reanchor=bool(tail), stored=what):
+                    with self.assertRaisesRegex(rdna2spirv.Unsupported, error):
+                        self.translate(shown(program), blob(native) + tail)
+            with self.subTest(reanchor=bool(tail), stored="register S1"):
+                with self.assertRaisesRegex(rdna2spirv.Unsupported, error):
+                    self.translate(shown(register), blob(with_byte(register, 2, 7, 0x0c)) + tail)
+            for bad_text in (b"10, v3 clamp", b"10"):
+                with self.subTest(reanchor=bool(tail), text=bad_text), self.assertRaises(rdna2spirv.Unsupported):
+                    self.translate(shown(program).replace(b"10, v3", bad_text), blob(replicated) + tail)
 
     def test_dropped_vopc_op_sel_is_refused(self):
         # The blob holds v_cmp_lt_f16_e64 with op_sel:[1,0] (word 0 bit 11); LLVM printed it without.

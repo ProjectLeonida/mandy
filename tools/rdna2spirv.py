@@ -17445,6 +17445,8 @@ def restore_dot4_inline_sel(ins, raw, printed):
     """LLVM prints default op_sel_hi on a signed-byte dot with a replicated low inline integer half."""
     if ins["op"] != "v_dot4_i32_i8" or len(raw) != 8 or len(printed) != 8:
         return False
+    if len(ins["args"]) != 4 or ins["mods"]:
+        return False
     w0, w1 = struct.unpack("<II", raw)
     if (w0 >> 8 != 0xCC1640 or w1 >> 27 != 1 or not 128 <= (w1 >> 9 & 511) <= 208 or
             struct.pack("<II", w0, w1 | (1 << 28)) != printed):
