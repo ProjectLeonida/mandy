@@ -4104,6 +4104,21 @@ when it cannot sample the submission lock for that long. A progress warning leav
 device state intact. The driver checkpoint and fault-info queries run after Vulkan reports device loss. This mode
 is off by default.
 
+Each fault address is also looked up in this process (RT-FAULT-ADDRESS-OWNER). On Windows, `VirtualQuery` of the
+same number gives the region's base, allocation base, state, protection and type. A GPU address isn't a CPU one,
+but a host import, a range of the title's memory and a raw CPU pointer that reached a shader all share the
+number. With `LEONIDA_ADDRESS_BINDINGS=1` as well, the device enables `VK_EXT_device_address_binding_report`, and
+a debug messenger records the GPU virtual address range of every buffer, image and allocation the driver binds
+and unbinds (`runtime/src/address_binding.h`). The fault report then lists, for each address:
+- the live objects that contain its page;
+- the live objects that end nearest below it and start nearest above it;
+- up to 16 recently unbound objects that held it, with their type, range, handle and the times they were bound
+  and unbound.
+
+"Nothing live or recently unbound there" means that no object of this device had that GPU address. On an
+RTX 5070 Ti the world-start loss of 1.0.2.1 reported write addresses far above every bound range, at about 50,000
+binds. The record keeps the last 16,384 unbinds and costs one map entry per live binding.
+
 For a local pre-submit inspection, also set `LEONIDA_COMPUTE_INPUTS` to comma-separated shader name fragments and
 `LEONIDA_COMPUTE_INPUT_SLOTS` to comma-separated decimal `root/slot` pairs. For example, `4/86,5/0,5/2,7/0` reads
 four 32-byte descriptors. The probe logs the bound heap and root layout, the saved user SGPRs, observed descriptor
