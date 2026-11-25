@@ -21,6 +21,7 @@
 
 #include "../shims/shims.h"
 #include "../src/pe_loader.h"
+#include "test_temp_dir.h"
 
 namespace {
 
@@ -423,7 +424,7 @@ int main() {
             }
         }
 
-        const std::filesystem::path out_dir = std::filesystem::temp_directory_path() / "leonida_bink_audio";
+        const std::filesystem::path out_dir = testfiles::writable_temp_dir() / "leonida_bink_audio";
         std::filesystem::create_directories(out_dir, ec);
         const std::string stem = movie.stem().string();
         for (auto& t : tracks) {

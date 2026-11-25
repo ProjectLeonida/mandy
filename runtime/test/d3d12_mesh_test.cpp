@@ -18,6 +18,7 @@
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
+#include "test_temp_dir.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/d3d12_xs_pso_stream.h"
@@ -124,8 +125,11 @@ int main(int argc, char** argv) {
     ms_container[36 + 8 + 2] = 13;  // DXIL mesh shader kind
     ms_old_container[36 + 8 + 2] = 13;
     const auto vs_container = shader_container(vs_program);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_mesh_test";
-    std::filesystem::create_directories(library);
+    const auto library = testfiles::scratch_dir("leonida_mesh_test_" + std::to_string(GetCurrentProcessId()));
+    if (library.empty()) {
+        std::fprintf(stderr, "SKIP: no writable directory for the shader library\n");
+        return 77;
+    }
     std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_old.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);

@@ -17,6 +17,7 @@
 // ps_depth_write.frag, gs_depth.geom). No game data.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
+#include "test_temp_dir.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/depth24.h"
@@ -228,8 +229,11 @@ int main() {
     const auto ps_empty_program = fssm_program({0x50530309, 0xbf810000});
     const auto ps_write_program = fssm_program({0x50530310, 0xbf810000});
     const auto gs_program = fssm_program({0x47530309, 0xbf810000});
-    const auto library = std::filesystem::temp_directory_path() / "leonida_depth24_draw_test";
-    std::filesystem::create_directories(library);
+    const auto library = testfiles::scratch_dir("leonida_depth24_draw_test_" + std::to_string(GetCurrentProcessId()));
+    if (library.empty()) {
+        std::fprintf(stderr, "SKIP: no writable directory for the shader library\n");
+        return 77;
+    }
     const auto copy = std::filesystem::copy_options::overwrite_existing;
     std::filesystem::copy_file(LEONIDA_TEST_VS_DEPTH_SPV, library / "vs_depth.spv", copy);
     std::filesystem::copy_file(LEONIDA_TEST_PS_DEPTH_EMPTY_SPV, library / "ps_depth_empty.spv", copy);

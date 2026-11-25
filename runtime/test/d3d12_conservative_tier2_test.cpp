@@ -1,6 +1,7 @@
 // Tier 2: tight uncertainty, exact and post-snap degenerates. RGB independently encodes varying colour,
 // constant depth and facing. No game data.
 #include "conservative_raster_fixture.h"
+#include "test_temp_dir.h"
 using namespace conservative_test;
 
 namespace {
@@ -112,8 +113,8 @@ int main(int argc, char** argv) {
     const auto vs_program=d3d12test::fssm_program({0x54325653,0xbf810000});
     const auto ps_program=d3d12test::fssm_program({0x54325053,0xbf810000});
     const auto vs_bytes=d3d12test::shader_container(vs_program),ps_bytes=d3d12test::shader_container(ps_program);
-    const auto directory=std::filesystem::temp_directory_path()/("leonida_conservative_tier2_"+std::to_string(GetCurrentProcessId()));
-    std::filesystem::create_directories(directory);
+    const auto directory=testfiles::scratch_dir("leonida_conservative_tier2_"+std::to_string(GetCurrentProcessId()));
+    if(directory.empty()){std::fprintf(stderr,"SKIP: no writable directory for the shader library\n");return 77;}
     std::filesystem::copy_file(LEONIDA_CONSERVATIVE_TIER2_VS,directory/"vs.spv",std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_CONSERVATIVE_TIER2_PS,directory/"ps.spv",std::filesystem::copy_options::overwrite_existing);
     {

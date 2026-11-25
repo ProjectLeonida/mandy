@@ -26,6 +26,7 @@
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
 #include "../src/pe_loader.h"
+#include "test_temp_dir.h"
 
 namespace {
 
@@ -112,8 +113,9 @@ std::vector<uint8_t> make_image() {
 }
 
 fs::path test_dir() {
-    const char* env = std::getenv("LEONIDA_TEST_DIR");
-    fs::path dir = (env && *env ? fs::path(env) : fs::temp_directory_path()) /
+    // writable_temp_dir() honors LEONIDA_TEST_DIR and falls back to a writable folder when the environment has no
+    // usable temp directory: temp_directory_path() names C:\Windows with TMP/TEMP/USERPROFILE unset.
+    fs::path dir = testfiles::writable_temp_dir() /
                    ("leonida_startup_trace_" + std::to_string(GetCurrentProcessId()));
     fs::create_directories(dir);
     return dir;

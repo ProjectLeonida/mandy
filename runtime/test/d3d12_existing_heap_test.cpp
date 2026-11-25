@@ -10,6 +10,7 @@
 #include "../shims/xg_xs_layout.h"
 #include "vk_test_device.h"
 #include "host_adapter.h"
+#include "test_temp_dir.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../src/title_page_watch.h"

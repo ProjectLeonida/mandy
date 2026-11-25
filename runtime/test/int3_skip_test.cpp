@@ -9,6 +9,7 @@
 
 #include "shims.h"
 #include "startup_trace.h"
+#include "test_temp_dir.h"
 
 namespace {
 

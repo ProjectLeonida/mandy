@@ -11,6 +11,7 @@
 // Set LEONIDA_VK_VALIDATION=1 for VK_LAYER_KHRONOS_validation; any validation error fails the test, except that
 // the NVIDIA layer's known sRGB-swapchain STORAGE check makes the run skip rather than pass or fail.
 #include "vk_test_device.h"
+#include "test_temp_dir.h"
 #include "xbox_present_readback_size.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
@@ -509,9 +510,10 @@ int main() {
         // 0 planes: a black frame, and no token is needed. With the D3D12 trace on, each PresentX writes one line
         // with its outcome, a refused call included; with it off, none.
         {
-            std::error_code ignored;
+            // writable_temp_dir(): temp_directory_path() names C:\Windows with TMP/TEMP/USERPROFILE unset, where
+            // the trace file cannot be opened and the capture reads as empty.
             const std::filesystem::path trace_file =
-                std::filesystem::temp_directory_path(ignored) / "leonida_xbox_present_trace.txt";
+                testfiles::writable_temp_dir() / "leonida_xbox_present_trace.txt";
             std::string trace, untraced;
             HRESULT blank = E_FAIL, refused = S_OK, refused_untraced = S_OK;
             bool captured = false, captured_untraced = false;
@@ -528,6 +530,7 @@ int main() {
                 refused_untraced = xbox.PresentX(3, &plane, nullptr);
                 untraced = capture.finish();
             }
+            std::error_code ignored;
             std::filesystem::remove(trace_file, ignored);
             EXPECT(captured && captured_untraced);
             EXPECT(blank == S_OK);

@@ -114,6 +114,7 @@ static int estimate_and_memory_query() {
 #if defined(__linux__)
 #include <filesystem>
 #include <fstream>
+#include "test_temp_dir.h"
 
 static void write_file(const std::filesystem::path& p, const char* text) {
     std::filesystem::create_directories(p.parent_path());
@@ -124,7 +125,9 @@ static int cgroup_limits_are_read_up_the_tree() {
     // Before: only MemAvailable was read, so under systemd-run -p MemoryMax=... (or in a container) the budget was
     // the whole machine's and the checker could be killed by its own cgroup.
     namespace fs = std::filesystem;
-    const fs::path root = fs::temp_directory_path() / ("lmg_test_" + std::to_string(::getpid()));
+    const auto base = testfiles::writable_temp_dir();
+    CHECK(!base.empty());
+    const fs::path root = base / ("lmg_test_" + std::to_string(::getpid()));
     fs::remove_all(root);
     write_file(root / "self", "0::/user.slice/app.scope\n");
     write_file(root / "cg/user.slice/memory.max", "10000\n");

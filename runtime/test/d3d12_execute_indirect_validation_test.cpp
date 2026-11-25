@@ -3,6 +3,7 @@
 // then executes valid ExecuteIndirect dispatches on the Vulkan GPU with validation enabled. No game data.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
+#include "test_temp_dir.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../src/shader_library.h"
@@ -350,9 +351,12 @@ int main() {
     // Write minimal synthetic compute shader fixture for positive ExecuteIndirect dispatch.
     std::vector<std::uint8_t> program = fssm_program({0x2200u, 0x11u, 0x22u, 0x33u});
     const auto container = shader_container(program);
-    const auto fixture = std::filesystem::temp_directory_path() /
-                         ("leonida_exec_ind_val_" + std::to_string(GetCurrentProcessId()));
-    std::filesystem::create_directories(fixture);
+    const auto fixture = testfiles::scratch_dir("leonida_exec_ind_val_" +
+                                              std::to_string(GetCurrentProcessId()));
+    if (fixture.empty()) {
+        std::fprintf(stderr, "SKIP: no writable directory for the shader fixture\n");
+        return 77;
+    }
     {
         std::ofstream spv(fixture / "noop.spv", std::ios::binary);
         spv.write(reinterpret_cast<const char*>(kMinimalComputeSpv.data()),

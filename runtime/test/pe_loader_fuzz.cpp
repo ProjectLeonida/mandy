@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "pe_loader.h"
+#include "test_temp_dir.h"
 
 #if defined(__SANITIZE_ADDRESS__)
 // From the ASan runtime (sanitizer/asan_interface.h, which the VS Build Tools do not ship).
@@ -934,13 +935,13 @@ int main(int argc, char** argv) {
     SetUnhandledExceptionFilter(&on_unhandled);
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 
-    char env_dir[MAX_PATH];
-    size_t env_n = 0;
-    if (getenv_s(&env_n, env_dir, "LEONIDA_TEST_DIR") == 0 && env_n > 1)
-        g_dir = std::filesystem::path(env_dir) / ("loader_fuzz_" + std::to_string(GetCurrentProcessId()));
-    else
-        g_dir = std::filesystem::temp_directory_path() / ("leonida_loader_fuzz_" + std::to_string(GetCurrentProcessId()));
-    std::filesystem::create_directories(g_dir);
+    // scratch_dir honors LEONIDA_TEST_DIR first and falls back to a writable folder when the environment has no
+    // usable temp directory (temp_directory_path() names C:\Windows with TMP/TEMP/USERPROFILE unset).
+    g_dir = testfiles::scratch_dir("leonida_loader_fuzz_" + std::to_string(GetCurrentProcessId()));
+    if (g_dir.empty()) {
+        std::fprintf(stderr, "cannot create the scratch folder: no writable directory\n");
+        return 1;
+    }
     struct Cleanup {
         ~Cleanup() {
             std::error_code ec;

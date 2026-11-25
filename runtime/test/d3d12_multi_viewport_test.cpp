@@ -9,6 +9,7 @@
 #include "vk_test_device.h"
 #include "host_wine.h"
 #include "d3d12_test_shaders.h"
+#include "test_temp_dir.h"
 #include "../shims/d3d12_com.h"
 #include "../src/shader_library.h"
 
@@ -363,9 +364,12 @@ int main() {
 
     const auto vs_program = d3d12test::fssm_program({0x56534d56u, 0xbf810000u});
     const auto ps_program = d3d12test::fssm_program({0x50534d56u, 0xbf810000u});
-    const auto library = std::filesystem::temp_directory_path() /
-                         ("leonida_multi_viewport_test_" + std::to_string(GetCurrentProcessId()));
-    std::filesystem::create_directories(library);
+    const auto library = testfiles::scratch_dir("leonida_multi_viewport_test_" +
+                                              std::to_string(GetCurrentProcessId()));
+    if (library.empty()) {
+        std::fprintf(stderr, "SKIP: no writable directory for the shader library\n");
+        return 77;
+    }
     CHECK(write_spv(library / "vs.spv", make_multi_vp_vs_spv()));
     CHECK(write_spv(library / "ps.spv", make_col_ps_spv()));
     {

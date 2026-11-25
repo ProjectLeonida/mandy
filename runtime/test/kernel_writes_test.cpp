@@ -18,6 +18,7 @@
 
 #include "../src/title_geometry_watch.h"
 #include "../src/title_page_watch.h"
+#include "test_temp_dir.h"
 
 namespace {
 

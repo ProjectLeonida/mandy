@@ -12,6 +12,7 @@
 // The shaders are GLSL written to the translator's runtime contract; nothing is drawn. No game data.
 #include "d3d12_test_shaders.h"
 #include "shader_fixture_path.h"
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../src/shader_library.h"
@@ -121,8 +122,12 @@ int main() {
     const auto atomic_program = fssm_program({0x50530a70, 0xbf810000});
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
     const auto atomic_container = shader_container(atomic_program);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_stores_atomics_test";
-    std::filesystem::create_directories(library);
+    const testfiles::ScratchDir library_scratch("leonida_stores_atomics_test");  // removed on every way out of main
+    const auto& library = library_scratch.path();
+    if (!std::filesystem::is_directory(library)) {
+        std::fprintf(stderr, "SKIP: no writable directory for the shader library\n");
+        return 77;
+    }
     const struct { const char* compiled; const char* name; } files[] = {
         {LEONIDA_TEST_VS_FULLSCREEN_SPV, "vs_fullscreen.spv"},
         {LEONIDA_TEST_PS_SPV, "ps_draw.spv"},

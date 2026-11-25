@@ -28,6 +28,7 @@
 #include "d3d12_xs_desc_clean.h"
 #include "d3d12_xs_device.h"
 #include "host_wine.h"
+#include "test_temp_dir.h"
 #include "shims.h"
 #include "../src/frame_pacer.h"
 #include "../src/shader_library.h"

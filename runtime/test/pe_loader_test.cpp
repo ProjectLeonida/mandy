@@ -23,6 +23,7 @@
 
 #include "base_reservation.h"
 #include "pe_loader.h"
+#include "test_temp_dir.h"
 
 namespace {
 
@@ -177,7 +178,8 @@ struct TempDir {
     fs::path path;
 
     TempDir() {
-        path = fs::temp_directory_path() / ("leonida_pe_loader_test_" + std::to_string(GetCurrentProcessId()));
+        path = testfiles::writable_temp_dir() /
+               ("leonida_pe_loader_test_" + std::to_string(GetCurrentProcessId()));
         std::error_code ec;
         fs::remove_all(path, ec);
         fs::create_directories(path);
