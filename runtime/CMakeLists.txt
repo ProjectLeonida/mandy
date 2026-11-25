@@ -1457,6 +1457,8 @@ if(BUILD_TESTING)
   add_test(NAME spirv_f16_halves COMMAND spirv_f16_halves_test)
   add_executable(dual_source_fragment_test test/dual_source_fragment_test.cpp)
   add_test(NAME dual_source_fragment COMMAND dual_source_fragment_test)
+  add_executable(spirv_bary_fallback_test test/spirv_bary_fallback_test.cpp)
+  add_test(NAME spirv_bary_fallback COMMAND spirv_bary_fallback_test)
   # Optional: skips unless LEONIDA_SHADERS names a translated work folder (<work>/shaders/spirv).
   add_executable(shader_library_corpus_test test/shader_library_corpus_test.cpp)
   add_test(NAME shader_library_corpus COMMAND shader_library_corpus_test)
@@ -3302,6 +3304,14 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_f16_halves_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_f16_halves COMMAND d3d12_f16_halves_test)
     set_tests_properties(d3d12_f16_halves PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Per-pipeline --bary-fallback GS synthesis (RT-BARY-FALLBACK-PSO): perspective barycentrics + ClipDistance + f16 halves.
+    add_executable(d3d12_bary_fallback_test test/d3d12_bary_fallback_test.cpp shims/d3d12_xs_device.cpp)
+    target_link_libraries(d3d12_bary_fallback_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_bary_fallback_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_bary_fallback_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_bary_fallback COMMAND d3d12_bary_fallback_test)
+    set_tests_properties(d3d12_bary_fallback PROPERTIES SKIP_RETURN_CODE 77)
 
     # PresentX and the frame events on the Vulkan device (shims/xbox_present.h), checked on swapchain pixels.
     add_executable(xbox_present_test test/xbox_present_test.cpp)
