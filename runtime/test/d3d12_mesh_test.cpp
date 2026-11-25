@@ -59,6 +59,7 @@ using DepthStencilSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPT
 using RasterizerSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC>;
 using Rasterizer2Subobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2, D3D12_RASTERIZER_DESC2>;
 using MaskSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT>;
+using DsvFormatSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT>;
 
 // Subobjects appended one after another: each is pointer-aligned and a multiple of the pointer size, so the bytes
 // are what a struct of the same members would hold.
@@ -716,6 +717,104 @@ int main(int argc, char** argv) {
             if (!d.mesh_shader_queries) EXPECT(mesh_only.CInvocations == 0);
         } else {
             std::printf("pipelineStatisticsQuery not available: the D3D-291 statistics check is skipped\n");
+        }
+
+        // RT-DEPTHBOUNDS-STREAM-EXTRAS: a console stream is realized on first use (PipelineState::resolve_type), not
+        // when it is created, and that path must carry DepthBoundsTestEnable like the eager one. The mesh shader
+        // writes depth 0. With the bounds on, OMSetDepthBounds(0.5, 1) must discard it (the target keeps its clear
+        // colour) and OMSetDepthBounds(0, 1) must keep it (red). A realization that drops the flag draws red twice.
+        if (!pc_only && o2.DepthBoundsTestSupported) {
+            D3D12_DEPTH_STENCIL_DESC1 bounded{};
+            bounded.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+            bounded.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            bounded.DepthBoundsTestEnable = TRUE;
+            Stream console_bounds;
+            console_bounds.add(RootSubobject{.inner = root.p});
+            console_bounds.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(24), D3D12_SHADER_BYTECODE>{.inner = ms});
+            console_bounds.add(PsSubobject{.inner = ps}).add(TargetsSubobject{.inner = one_target()});
+            console_bounds.add(DepthStencil1Subobject{.inner = bounded});
+            console_bounds.add(DsvFormatSubobject{.inner = DXGI_FORMAT_D32_FLOAT});
+            console_bounds.add(MaskSubobject{.inner = UINT_MAX});
+            Ref<ID3D12PipelineState> bounds_console;
+            using CreateConsole = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+            const auto bounds_desc = console_bounds.desc();
+            EXPECT(SUCCEEDED(reinterpret_cast<CreateConsole>(slot(device.p, 86))(device.p, &bounds_desc,
+                                                                                 IID_PPV_ARGS(&bounds_console.p))) &&
+                   bounds_console.p);
+
+            Ref<ID3D12Resource> bounds_target, bounds_depth;
+            D3D12_RESOURCE_DESC bounds_rt_desc = rt_desc;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &bounds_rt_desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&bounds_target.p))));
+            D3D12_RESOURCE_DESC depth_desc = rt_desc;
+            depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
+            depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &depth_desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&bounds_depth.p))));
+            const D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1,
+                                                           D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            Ref<ID3D12DescriptorHeap> dsv_heap, bounds_rtv_heap;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&dsv_heap_desc, IID_PPV_ARGS(&dsv_heap.p))));
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&bounds_rtv_heap.p))));
+            const D3D12_CPU_DESCRIPTOR_HANDLE dsv{
+                SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(dsv_heap.p, 9))(dsv_heap.p))};
+            const D3D12_CPU_DESCRIPTOR_HANDLE bounds_rtv{
+                SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(bounds_rtv_heap.p, 9))(bounds_rtv_heap.p))};
+            device->CreateDepthStencilView(bounds_depth.p, nullptr, dsv);
+            device->CreateRenderTargetView(bounds_target.p, nullptr, bounds_rtv);
+
+            // One frame per bounds pair; returns the pixel at (8, 8), inside the quad the mesh draw covers.
+            bool first_frame = true;
+            UINT64 bounds_fence = 3;
+            const auto bounded_pixel = [&](float lo, float hi) {
+                std::array<std::uint8_t, 4> pixel{};
+                if (!SUCCEEDED(allocator->Reset()) || !SUCCEEDED(list->Reset(allocator.p, bounds_console.p))) return pixel;
+                D3D12_RESOURCE_BARRIER in[2] = {
+                    transition(bounds_target.p, first_frame ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_SOURCE,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET),
+                    transition(bounds_depth.p, first_frame ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                               D3D12_RESOURCE_STATE_DEPTH_WRITE)};
+                list->ResourceBarrier(first_frame ? 2 : 1, in);
+                first_frame = false;
+                list->ClearRenderTargetView(bounds_rtv, blue, 0, nullptr);
+                list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+                list->SetGraphicsRootSignature(root.p);
+                list->RSSetViewports(1, &viewport);
+                list->RSSetScissorRects(1, &scissor);
+                list->OMSetRenderTargets(1, &bounds_rtv, FALSE, &dsv);
+                list6->OMSetDepthBounds(lo, hi);
+                list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+                list->SetGraphicsRootConstantBufferView(1, upload_va);
+                list6->DispatchMesh(2, 2, 1);
+                D3D12_RESOURCE_BARRIER out = transition(bounds_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1, &out);
+                D3D12_TEXTURE_COPY_LOCATION to{};
+                to.pResource = readback.p;
+                to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                to.PlacedFootprint = {0, {DXGI_FORMAT_R8G8B8A8_UNORM, size, size, 1, 256}};
+                D3D12_TEXTURE_COPY_LOCATION from{};
+                from.pResource = bounds_target.p;
+                from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+                if (list->Close() != S_OK) return pixel;
+                ID3D12CommandList* one[] = {list.p};
+                queue->ExecuteCommandLists(1, one);
+                if (rt::d3d12::last_execute_result(queue.p) != leonida::ReplayResult::success) return pixel;
+                ++bounds_fence;
+                if (FAILED(queue->Signal(fence.p, bounds_fence)) || FAILED(fence->SetEventOnCompletion(bounds_fence, nullptr)))
+                    return pixel;
+                void* got = nullptr;
+                if (FAILED(readback->Map(0, nullptr, &got))) return pixel;
+                std::memcpy(pixel.data(), static_cast<const std::uint8_t*>(got) + 8 * 256 + 8 * 4, 4);
+                readback->Unmap(0, nullptr);
+                return pixel;
+            };
+            const std::array<std::uint8_t, 4> red{255, 0, 0, 255}, clear_blue{0, 0, 255, 255};
+            EXPECT(bounded_pixel(0.0f, 1.0f) == red);         // depth 0 is inside [0, 1]
+            EXPECT(bounded_pixel(0.5f, 1.0f) == clear_blue);  // outside [0.5, 1]: discarded only if the flag arrived
         }
 
         for (auto* r : {&upload, &readback, &target}) r->reset();

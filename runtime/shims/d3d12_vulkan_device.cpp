@@ -8143,7 +8143,7 @@ public:
                 const auto* record=rt::d3d12_xs::find_pso_record(this);
                 PipelineStream stream{};
                 HRESULT hr=record?parse_pipeline_stream(record->desc(),stream):E_INVALIDARG;
-                if(SUCCEEDED(hr))hr=stream.has_cs?create_compute(stream.compute):create_graphics(stream.graphics,&stream.ms,&stream.as);
+                if(SUCCEEDED(hr))hr=stream.has_cs?create_compute(stream.compute):create_graphics(stream.graphics,&stream.ms,&stream.as,stream.back_masks?&stream.back_stencil:nullptr,&stream.extras);
             });
         }
         return registered_ && (is_graphics_==graphics);
@@ -11646,7 +11646,17 @@ public:
         if(!record)return E_INVALIDARG;
         auto* pipeline=new PipelineState(state_);
         pipeline->attach_device(identity());
-        pipeline->set_cache_key(stream.has_cs?pipeline_key(stream.compute):pipeline_key(stream.graphics));
+        if(stream.has_cs) {
+            pipeline->set_cache_key(pipeline_key(stream.compute));
+        } else {
+            // The stream description carries fields the plain graphics description cannot:
+            // DEPTH_STENCIL2 back-face masks and the depth-bounds enable. Mix them in so two
+            // console PSOs differing only in these do not share one cache key.
+            leonida::cached_pso::KeyBuilder extra;
+            extra.u32(stream.back_masks?1u:0u).u32(stream.back_stencil.read).u32(stream.back_stencil.write)
+                .u32(stream.extras.depth_bounds_test?1u:0u);
+            pipeline->set_cache_key(pipeline_key(stream.graphics)+leonida::sha256_hex(extra.data()));
+        }
         if(!rt::d3d12_xs::attach_pso_record(pipeline,std::move(record))){pipeline->Release();return E_OUTOFMEMORY;}
         pipeline->set_pending_stream(stream.has_cs);
         return hand_out(pipeline,iid,out);
