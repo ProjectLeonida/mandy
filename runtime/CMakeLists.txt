@@ -765,6 +765,16 @@ if(BUILD_TESTING)
     endif()
     target_link_libraries(title_window_test PRIVATE user32)
     add_test(NAME title_window COMMAND title_window_test)
+
+    # LEONIDA_TITLE_HUD's counters in the title bar of another thread's window (shims/title_hud.h): user32 and DXGI.
+    add_executable(title_hud_test test/title_hud_test.cpp)
+    target_include_directories(title_hud_test PRIVATE shims)
+    target_compile_definitions(title_hud_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    if(MSVC)
+      target_compile_options(title_hud_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    target_link_libraries(title_hud_test PRIVATE Vulkan::Headers user32 psapi)
+    add_test(NAME title_hud COMMAND title_hud_test)
   endif()
 
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
@@ -1720,7 +1730,7 @@ if(BUILD_TESTING)
     # game's exact exit code comes back through the relaunch.
     add_test(NAME run_tiny_first_run_ui COMMAND gta6rt --first-run-ui $<TARGET_FILE:tiny_game> -- hello 42 first-run-ui)
     set_tests_properties(run_tiny_first_run_ui PROPERTIES
-      ENVIRONMENT "LEONIDA_ARENA_MB=768;LEONIDA_D3D12=;LEONIDA_PIPELINE_COMPILE="
+      ENVIRONMENT "LEONIDA_ARENA_MB=768;LEONIDA_D3D12=;LEONIDA_PIPELINE_COMPILE=;LEONIDA_KEYBOARD_PAD="
       PASS_REGULAR_EXPRESSION "tiny_game: PASS first-run UI caller override"
       FAIL_REGULAR_EXPRESSION "tiny_game: FAIL")
     add_test(NAME run_tiny_game_fixed COMMAND gta6rt --run $<TARGET_FILE:tiny_game_fixed> -- hello 42)
@@ -2571,7 +2581,7 @@ if(TARGET Vulkan::Headers)
 
     # ClearUnorderedAccessViewUint/Float on buffers and textures, read back through D3D12.
     add_executable(d3d12_uav_clear_test test/d3d12_uav_clear_test.cpp)
-    target_link_libraries(d3d12_uav_clear_test PRIVATE gta6rt_d3d12_com)
+    target_link_libraries(d3d12_uav_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_uav_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_uav_clear_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_uav_clear COMMAND d3d12_uav_clear_test)
@@ -4319,6 +4329,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(indirect_dispatch_count_alloc_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME indirect_dispatch_count_alloc COMMAND indirect_dispatch_count_alloc_test)
+    # IndirectArgumentClamp queue-family sharing, bind-retry cleanup, slot zeroing, offset alignment, and concurrency (no GPU).
+    add_executable(indirect_clamp_safety_test test/indirect_clamp_safety_test.cpp)
+    target_link_libraries(indirect_clamp_safety_test PRIVATE Vulkan::Headers Threads::Threads)
+    if(WIN32)
+      target_compile_definitions(indirect_clamp_safety_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME indirect_clamp_safety COMMAND indirect_clamp_safety_test)
     # A buffer UAV clear writes where its resource starts in a shared VkBuffer (no GPU).
     add_executable(replay_uav_clear_offset_test test/replay_uav_clear_offset_test.cpp)
     target_link_libraries(replay_uav_clear_offset_test PRIVATE Vulkan::Headers)
@@ -4337,6 +4354,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_query_edges_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_query_edges COMMAND replay_query_edges_test)
+    # Stateful indirect draw topology coverage and per-reason indirect_stats counters (no GPU or game data).
+    add_executable(indirect_topology_and_stats_test test/indirect_topology_and_stats_test.cpp)
+    target_link_libraries(indirect_topology_and_stats_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(indirect_topology_and_stats_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME indirect_topology_and_stats COMMAND indirect_topology_and_stats_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)

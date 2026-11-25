@@ -337,8 +337,9 @@ What is implemented (all of it testable without the game):
 - **UAV clears** (`ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat`). The CPU handle's slot is read
   while recording as the GFX10 descriptor a shader would load (section 3.4), so the clear works with any
   view-creation code that writes them and with descriptors the game builds itself; the GPU handle is not needed.
-  A T# gives the view's format (FORMAT plus DST_SEL, which tells BGRA from RGBA), mip and layers; a 3D view clears
-  every slice of its mip. A V# gives a byte range: its address minus the resource's `GetGPUVirtualAddress`, and
+  A T# gives the view's format (FORMAT plus DST_SEL, which tells BGRA from RGBA), mip and layers. A tagged 3D
+  UAV selects `FirstWSlice` and `WSize`. An untagged 3D T# covers every slice of the bound resource's selected
+  mip. A V# gives a byte range: its address minus the resource's `GetGPUVirtualAddress`, and
   NUM_RECORDS bytes (stride 0, no format: raw), records (a stride: structured) or elements (a format: typed). A view
   that reaches past the end of the buffer stops there, as the hardware's bounds check would.
   - Values follow D3D's rules (`runtime/src/uav_clear.h`): Uint copies the low bits of each value into its channel
@@ -366,16 +367,18 @@ What is implemented (all of it testable without the game):
   - Textures: the values become one element of the view's format, and that element is cleared into the image as
     the value that decodes it in the image's own format, so a typeless texture viewed as UINT gets exactly the bits
     asked for. Exact for every typed-UAV format except the SNORM pattern `0x80..` (Vulkan writes -1.0 as `0x81..`)
-    and NaN payloads. A whole view is `vkCmdClearColorImage`; rectangles are `vkCmdClearAttachments` in a
-    dynamic-rendering scope, so a texture created with `ALLOW_UNORDERED_ACCESS` also gets `COLOR_ATTACHMENT` usage
-    when its format supports it. Both run in place in `GENERAL`, the UAV layout. Rectangle clears of volumes, or of
-    formats without attachment support, are refused as `unsupported`.
+    and NaN payloads on the Vulkan color-clear paths. A whole, matching-format 3D mip uses `vkCmdClearColorImage`.
+    Direct lists can use `vkCmdClearAttachments` for rectangles on attachment-capable 1D/2D images.
+    Unpredicated partial 3D W ranges (`FirstWSlice`/`WSize`) and 3D XY rectangles use the same transfer path
+    on direct and compute lists. It encodes the clear value in the view format, fills up to 64 KiB of scratch,
+    and copies tiles one Z slice at a time in `GENERAL`. This requires matching view and backing formats, with
+    the existing exception for emulated `R9G9B9E5` on `R32_UINT`.
   - The clear is fenced as the UAV state widened to transfers, so a following UAV barrier, transition, or enhanced
     barrier from `SYNC_CLEAR_UNORDERED_ACCESS_VIEW` sees it.
-  - Under `SetPredication`, a whole-view texture clear runs as one rectangle through the attachment path, as
-    render-target clears do, so conditional rendering applies. Buffer clears, and texture clears that cannot use an
-    attachment, are transfers that conditional rendering does not cover; they run unconditionally and are counted
-    with the copies (`unpredicated_copies`).
+  - Under `SetPredication`, a direct list clears an attachment-capable 1D/2D UAV through its attachment view.
+    A whole view becomes one rectangle so conditional rendering applies. Buffer clears and the direct-list
+    whole-mip transfer fallback run unconditionally and count toward `unpredicated_copies`. Direct and compute
+    lists refuse predicated partial-W or rectangular 3D clears before submission.
 - **Layout tracking** (`LayoutTracker`): the current Vulkan layout of every image subresource, so barriers start
   from the real layout instead of the application's `before`. This is how implicit promotion and decay work: a
   texture in `COMMON` sits in `GENERAL`, which every promotable access can use, so a later barrier naming the
@@ -1960,8 +1963,8 @@ The layer's descriptor model:
   The emulated RGB9E5 raw `R32_UINT` storage view is formatted and is exempt. Vulkan 1.3 permits these SPIR-V
   capabilities even without the legacy `shaderStorageImage{Read,Write}WithoutFormat` feature bits. The
   caller-owned device test leaves both legacy bits off and masks each per-format bit to verify safe rejection.
-  `ClearUnorderedAccessView*` refuses partial W ranges and 1D/3D format reinterprets: the transfer clear
-  cannot target a slice interval or guarantee preserving the reinterpreted bits.
+  `ClearUnorderedAccessView*` reads the W range from these descriptor bytes even after a descriptor copy.
+  General 1D/3D backing-format reinterpretation remains unsupported.
   Shader access to the new UAVs requires `robustImageAccess` (whole-mip CPU clears do not).
   A separate native D3D12 probe on the RTX 4090 and UHD 770 clipped typed writes to the view's W range.
   WARP 10.0.26100.9818 rebased the view but did not clip writes past a finite `WSize` in that probe. The
@@ -2369,7 +2372,12 @@ Pipeline creation:
   and pipeline-cache UUID. When the file is absent or incompatible, the runtime starts with an empty cache.
   The offline checker matches the runtime's layout and subgroup request for compute shaders with no descriptor
   bindings and the standard 144-byte push-constant range.
-  The runtime writes its own `pipeline_cache.session.bin` on device teardown. A compatible session file
+  The runtime writes its own `pipeline_cache.session.bin` on device teardown, and, since a title never releases its
+  device, when `gta6rt` ends with the device alive: at the run's exit, at a console close and from an
+  unhandled-exception filter (a fault in the title or its DLLs, the int3 after a device loss). The title's own
+  `SetUnhandledExceptionFilter` is served by the runtime, which keeps its filter first and passes the exception on.
+  That exit write (`save_pipeline_caches_at_exit`, `shims/d3d12_compile_exit.h`) waits 1 s for a build still running
+  on a title thread, then writes the pipelines finished so far, with 3 s for the write itself. A compatible session file
   initializes the live cache directly if there is no offline seed. With both files present the session cache
   merges into the offline seed. `LEONIDA_DIRECT_SESSION_CACHE=0` also uses a merge when only the session exists.
   The files must match the Vulkan vendor, device and pipeline-cache UUID. Vulkan supplies an opaque snapshot.
