@@ -14,6 +14,8 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <array>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -387,6 +389,38 @@ struct BindlessRoom {
     std::uint32_t samplers = 0;
 };
 BindlessRoom bindless_room(ID3D12Device* device);
+
+// What a T# the title wrote itself into a console descriptor heap came to (bind_title_image).
+enum class TitleImage { known, bound, unknown, refused, not_tsharp };
+
+// Statistics on unbound T# descriptors refused during console descriptor heap binding.
+struct UnboundTsharpReasonStats {
+    std::size_t distinct_slots = 0;
+    std::uint64_t total_refusals = 0;
+};
+
+struct UnboundTsharpStats {
+    std::map<std::string, UnboundTsharpReasonStats> by_reason;
+    std::size_t total_distinct_slots = 0;
+    std::uint64_t total_refusals = 0;
+};
+
+// Returns statistics on unbound T# descriptor refusals across console descriptor heaps.
+UnboundTsharpStats unbound_tsharp_stats();
+// Resets unbound T# refusal statistics (for testing).
+void reset_unbound_tsharp_stats();
+// Records an unbound T# refusal (for testing).
+void note_refused_tsharp_for_test(std::uint64_t heap_va, std::size_t offset,
+                                  const std::array<std::uint32_t, 8>& words, const char* why);
+
+// Simulates console descriptor heap T# binding for a synthetic descriptor against registered resources.
+// Returns TitleImage::bound on success, TitleImage::refused on rule violation (with *why set to the refusal string),
+// or TitleImage::unknown / TitleImage::not_tsharp.
+TitleImage test_bind_title_image(ID3D12Device* device, const std::array<std::uint32_t, 8>& words,
+                                 const char** why = nullptr);
+
+// Returns the internal image address registered for a resource in the device's image table.
+std::uint64_t resource_image_address(ID3D12Resource* resource);
 // Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
 // the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
 // already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be
@@ -577,6 +611,14 @@ void set_global_realtime_privilege_override_for_test(int state);
 // `list`. The values are kept for the future pipeline path, which is what would apply them. False when `list` is
 // not one of this module's command lists.
 bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT& back);
+
+// Makes `list` hold a reference to `object` until its next Reset or its release, as it holds the pipeline states it
+// names: for an object only the recording uses, such as a shim's own scratch buffer. A list is Reset once it has
+// been executed (or a held batch, src/queue_holds.h, keeps it pinned until it has run), and a resource released
+// after its submission is destroyed through the device's deferred queue once that submission has retired, so the
+// object outlives every GPU use the recording makes of it. False when `list` is not one of this module's command
+// lists or `object` is null.
+bool hold_until_reset(ID3D12GraphicsCommandList* list, IUnknown* object);
 
 // A copy of the commands `list` has recorded so far, for tests of what a bundle puts into its parent. False when
 // `list` is not one of this module's command lists.
