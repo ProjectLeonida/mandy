@@ -188,8 +188,12 @@ struct DescriptorRange {
     SIZE_T real_start;
     SIZE_T stride;
     bool mapped;
+    bool shader_visible;
     const DeviceProxy* device;
     const HeapProxy* heap;
+    // Per-slot 64-bit fingerprints of what was last synced from custom_start into real_start for shader-visible
+    // title-backed heaps. Initialized to 0 so pre-filled non-zero descriptors sync on first submit.
+    std::vector<std::uint64_t> fingerprints;
 };
 
 // Immortal: late COM Release calls during process teardown may still unregister a heap or check the table.
@@ -215,13 +219,16 @@ DescriptorHeapBackingFree g_heap_free = nullptr;
 bool g_heap_alloc_explicit = false;
 
 bool register_descriptor_range(const DeviceProxy* device, const HeapProxy* heap, SIZE_T custom_start,
-                               SIZE_T byte_size, SIZE_T real_start, SIZE_T stride) {
+                               SIZE_T byte_size, SIZE_T real_start, SIZE_T stride, bool shader_visible) {
     if (custom_start == 0 || byte_size == 0 || custom_start > (std::numeric_limits<SIZE_T>::max)() - byte_size)
         return false;
     const bool mapped = device->descriptor_mapping && device->descriptor_mapping(heap->real, real_start, byte_size);
     try {
+        std::vector<std::uint64_t> fingerprints;
+        if (shader_visible && stride == 32 && real_start != custom_start) fingerprints.assign(byte_size / stride, 0);
         std::lock_guard lock(descriptor_range_mutex());
-        descriptor_ranges().push_back({custom_start, custom_start + byte_size, real_start, stride, mapped, device, heap});
+        descriptor_ranges().push_back({custom_start, custom_start + byte_size, real_start, stride, mapped,
+                                       shader_visible, device, heap, std::move(fingerprints)});
         g_custom_range_count.store(descriptor_ranges().size(), std::memory_order_release);
         return true;
     } catch (const std::bad_alloc&) {
@@ -291,11 +298,22 @@ bool local_accessible(std::uint64_t address, std::uint64_t bytes, bool write) {
     return true;
 }
 
+// Non-zero 64-bit fingerprint for a non-zero 32-byte descriptor slot; 0 if and only if all 32 bytes are 0.
+std::uint64_t descriptor_slot_fingerprint(const std::uint64_t w[4]) {
+    if ((w[0] | w[1] | w[2] | w[3]) == 0) return 0;
+    std::uint64_t h = 0xcbf29ce484222325ull;
+    for (int i = 0; i < 4; ++i) {
+        h ^= w[i] + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        h *= 0x100000001b3ull;
+    }
+    return h ? h : 1ull;
+}
+
 void local_write_through(const DeviceProxy* device, D3D12_CPU_DESCRIPTOR_HANDLE custom, SIZE_T count) {
     if (!local_desc_mirror() || !custom.ptr || !count) return;
     if (!g_custom_range_count.load(std::memory_order_acquire)) return;
     std::lock_guard lock(descriptor_range_mutex());
-    const auto& ranges = descriptor_ranges();
+    auto& ranges = descriptor_ranges();
     for (auto it = ranges.rbegin(); it != ranges.rend(); ++it) {
         if (it->device != device || custom.ptr < it->custom_start || custom.ptr >= it->custom_end) continue;
         const SIZE_T offset = custom.ptr - it->custom_start;
@@ -307,11 +325,92 @@ void local_write_through(const DeviceProxy* device, D3D12_CPU_DESCRIPTOR_HANDLE 
         if (real == custom.ptr || (!it->mapped && !local_accessible(real, bytes, false)) ||
             !local_accessible(custom.ptr, bytes, true)) return;
         std::memcpy(reinterpret_cast<void*>(custom.ptr), reinterpret_cast<const void*>(real), bytes);
+        if (!it->fingerprints.empty() && it->stride == kLocalDescriptorBytes) {
+            const SIZE_T first = offset / kLocalDescriptorBytes;
+            for (SIZE_T i = 0; i < count && first + i < it->fingerprints.size(); ++i) {
+                std::uint64_t w[4]{};
+                std::memcpy(w, reinterpret_cast<const void*>(custom.ptr + i * kLocalDescriptorBytes), sizeof(w));
+                it->fingerprints[first + i] = descriptor_slot_fingerprint(w);
+            }
+        }
         static std::atomic<bool> said{false};
         if (!said.exchange(true))
             std::fprintf(stderr, "[rt] d3d12_xs: local: descriptors written for a title-backed heap are also stored at the "
                                  "title's address\n");
         return;
+    }
+}
+
+// Pulls direct CPU writes from a custom-backed source heap into its real backing before CopyDescriptors* reads it.
+void local_sync_source(const DeviceProxy* device, D3D12_CPU_DESCRIPTOR_HANDLE custom, SIZE_T count) {
+    if (!local_desc_mirror() || !custom.ptr || !count) return;
+    if (!g_custom_range_count.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(descriptor_range_mutex());
+    auto& ranges = descriptor_ranges();
+    for (auto it = ranges.rbegin(); it != ranges.rend(); ++it) {
+        if (it->device != device || custom.ptr < it->custom_start || custom.ptr >= it->custom_end) continue;
+        const SIZE_T offset = custom.ptr - it->custom_start;
+        if (!it->stride || offset % it->stride || count > (it->custom_end - custom.ptr) / it->stride) return;
+        const SIZE_T bytes = count * it->stride;
+        if (offset > (std::numeric_limits<SIZE_T>::max)() - it->real_start) return;
+        const SIZE_T real = it->real_start + offset;
+        if (real == custom.ptr || !local_accessible(custom.ptr, bytes, false) ||
+            (!it->mapped && !local_accessible(real, bytes, true))) return;
+        if (it->stride == kLocalDescriptorBytes) {
+            const SIZE_T first = offset / kLocalDescriptorBytes;
+            for (SIZE_T i = 0; i < count; ++i) {
+                const SIZE_T at = i * kLocalDescriptorBytes;
+                std::uint64_t w[4]{};
+                std::memcpy(w, reinterpret_cast<const void*>(custom.ptr + at), sizeof(w));
+                const std::uint64_t fp = descriptor_slot_fingerprint(w);
+                if (!fp && (it->fingerprints.empty() || first + i >= it->fingerprints.size() ||
+                            it->fingerprints[first + i] == 0))
+                    continue;
+                std::memcpy(reinterpret_cast<void*>(real + at), w, sizeof(w));
+                if (first + i < it->fingerprints.size()) it->fingerprints[first + i] = fp;
+            }
+        } else {
+            std::memcpy(reinterpret_cast<void*>(real), reinterpret_cast<const void*>(custom.ptr), bytes);
+        }
+        return;
+    }
+}
+
+// Before ExecuteCommandLists, copies any pre-filled or title-byte-copied descriptors from mapped (shader-visible)
+// custom-backed heaps into their GPU-arena real backing using per-slot 64-bit fingerprints.
+void local_sync_shader_visible_heaps(const DeviceProxy* device) {
+    if (!local_desc_mirror() || g_custom_range_count.load(std::memory_order_acquire) == 0) return;
+    std::size_t synced = 0;
+    {
+        std::lock_guard lock(descriptor_range_mutex());
+        for (DescriptorRange& range : descriptor_ranges()) {
+            if ((device && range.device != device) || !range.shader_visible || range.stride != kLocalDescriptorBytes ||
+                range.real_start == range.custom_start || range.fingerprints.empty())
+                continue;
+            const SIZE_T bytes = range.fingerprints.size() * kLocalDescriptorBytes;
+            if (!local_accessible(range.custom_start, bytes, false) ||
+                (!range.mapped && !local_accessible(range.real_start, bytes, true)))
+                continue;
+            auto* dst = reinterpret_cast<std::uint8_t*>(range.real_start);
+            for (SIZE_T i = 0; i < range.fingerprints.size(); ++i) {
+                const SIZE_T at = i * kLocalDescriptorBytes;
+                std::uint64_t w[4]{};
+                std::memcpy(w, reinterpret_cast<const void*>(range.custom_start + at), sizeof(w));
+                const std::uint64_t fp = descriptor_slot_fingerprint(w);
+                if (fp == range.fingerprints[i]) continue;
+                std::memcpy(dst + at, w, sizeof(w));
+                range.fingerprints[i] = fp;
+                ++synced;
+            }
+        }
+    }
+    if (synced > 0) {
+        static std::atomic<std::uint64_t> calls{0};
+        const std::uint64_t n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n & (n - 1)) == 0)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: synced %zu title-written descriptors into shader-visible GPU arena (sync #%llu)\n",
+                         synced, static_cast<unsigned long long>(n));
     }
 }
 
@@ -933,7 +1032,8 @@ void** get_heap_vtable() {
 
 HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFIID riid, void** out,
                           SIZE_T custom_cpu_start = 0, SIZE_T custom_byte_size = 0, SIZE_T real_cpu_start = 0,
-                          DescriptorHeapBackingFree custom_free = nullptr, SIZE_T stride = 0) {
+                          DescriptorHeapBackingFree custom_free = nullptr, SIZE_T stride = 0,
+                          bool shader_visible = false) {
     if (!real || !device) return E_POINTER;
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -952,7 +1052,8 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
     proxy_add_ref(device);  // the heap keeps its Xbox-ABI device alive for GetDevice
 
     if (custom_cpu_start != 0 &&
-        !register_descriptor_range(device, proxy, custom_cpu_start, custom_byte_size, real_cpu_start, stride)) {
+        !register_descriptor_range(device, proxy, custom_cpu_start, custom_byte_size, real_cpu_start, stride,
+                                   shader_visible)) {
         delete proxy;
         proxy_release(device);
         return E_OUTOFMEMORY;
@@ -1720,6 +1821,7 @@ std::uint64_t queue_present_x(ChildProxy*, std::uint64_t, std::uint64_t, std::ui
 // list proxy replaced by its real list (a bundle on the list side unwraps the same way at the console's
 // ExecuteBundle); the real queue never sees a proxy.
 std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word) {
+    local_sync_shader_visible_heaps(self->device);
     // The array holds what the title got from the proxy: list proxies are replaced by the real lists in a copy, as
     // for every other array of objects the real device or queue reads.
     UnwrappedArray unwrapped_lists;
@@ -3440,7 +3542,8 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     }
 
     hr = create_heap_proxy(heap, self, *riid, out, custom_cpu_start, custom_byte_size, real_cpu_start,
-                           custom_cpu_start ? free_fn : nullptr, stride);
+                           custom_cpu_start ? free_fn : nullptr, stride,
+                           desc && (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0);
     // LOCAL DIAGNOSTIC (fsdraw): which CPU start the title gets for this heap
     if (leonida::local_diagnostics()) {
         static std::atomic<int> logged{0};
@@ -3538,7 +3641,10 @@ void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DE
                 src_heap.resize(num_src);
                 src = src_heap.data();
             }
-            for (UINT i = 0; i < num_src; ++i) src[i] = translate_cpu_handle(self, src_starts[i]);
+            for (UINT i = 0; i < num_src; ++i) {
+                local_sync_source(self, src_starts[i], src_sizes ? src_sizes[i] : 1);
+                src[i] = translate_cpu_handle(self, src_starts[i]);
+            }
             src_out = src;
         }
     } catch (const std::bad_alloc&) {
@@ -3552,6 +3658,7 @@ void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DE
 void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D12_CPU_DESCRIPTOR_HANDLE dest_start,
                                    D3D12_CPU_DESCRIPTOR_HANDLE src_start, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     note_slot(24);
+    local_sync_source(self, src_start, num_descriptors);
     const D3D12_CPU_DESCRIPTOR_HANDLE dest = translate_cpu_handle(self, dest_start);
     const D3D12_CPU_DESCRIPTOR_HANDLE src = translate_cpu_handle(self, src_start);
     self->real->CopyDescriptorsSimple(num_descriptors, dest, src, type);
