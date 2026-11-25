@@ -24,6 +24,14 @@ constexpr std::uint32_t kPcResourceFlagsMask =
 // Not constexpr: 0x101 is outside the unfixed enum's value range, which clang-cl rejects in a constant expression.
 inline const auto kXboxTiledResourceLayout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
 
+// True when layout is a console-specific layout word (such as 0x101, 0x102, 0x105) rather than a standard PC layout.
+inline bool is_xbox_resource_layout(D3D12_TEXTURE_LAYOUT layout) {
+    return layout != D3D12_TEXTURE_LAYOUT_UNKNOWN &&
+           layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR &&
+           layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE &&
+           layout != D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE;
+}
+
 // The console allows a depth-stencil texture to allow unordered access too (measured locally at a title's call sites:
 // a 2D R32G8X24_TYPELESS texture with ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS, sized through slot 25), but the PC
 // runtime refuses that pair, and Vulkan has no depth format with storage support to make it with. Stand-in: such a
