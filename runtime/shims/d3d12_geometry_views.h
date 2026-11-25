@@ -202,8 +202,10 @@ class GeometryViews {
     // view needs is not read.
     bool run_needed(std::size_t first, std::size_t last) const {
         for (std::size_t i = first; i < last; ++i) {
-            for (const auto id : written_[i]->views) {
-                if (id >= marks_.size() || (marks_[id] & kPinned)) continue;
+            const auto tile = tiles_.find(written_vas_[i]);
+            if (tile == tiles_.end()) continue;
+            for (const auto id : tile->second.views) {
+                if (id >= marks_.size() || (marks_[id] & kPinned) || !views_[id].alive) continue;
                 if (views_[id].ready) return true;
             }
         }
@@ -517,8 +519,7 @@ public:
         // filled yet is filled whole, once.
         marks_.assign(views_.size(), 0);
         // Both lists are cleared here, at the start: if a read or a guarded copy below throws, the next refresh must
-        // not find addresses in written_vas_ whose tiles written_ no longer holds.
-        written_.clear();
+        // not find addresses in written_vas_ whose tile set no longer holds.
         written_vas_.clear();
         // The pass over the watched tiles makes a VirtualQuery and a VirtualProtect for each written one (tens of
         // milliseconds to a few hundred under Wine). resolve() waits for mutex_, and a new V# resolved while a
