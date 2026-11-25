@@ -5,15 +5,19 @@ differential runs. Standard library only; no GPU, no game files.
 The family is v_cvt_flr_i32_f32, v_cvt_rpi_i32_f32, v_cvt_norm_i16_f16, v_cvt_norm_u16_f16 (VOP1) and
 v_cvt_pknorm_i16_f32, v_cvt_pknorm_u16_f32, v_cvt_pknorm_i16_f16, v_cvt_pknorm_u16_f16 (VOP3).
 """
+import contextlib
+import io
 import itertools
 import os
 import random
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOL = os.path.join(ROOT, "tools", "cvt_diff.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import cvt_diff as c  # noqa: E402  (puts tests/semantic on sys.path)
 import test_alu_cvt_flr_rpi as fr  # noqa: E402
@@ -293,6 +297,50 @@ class Translated(unittest.TestCase):
                 self.assertEqual(c.run_one(lines, "ps_cvt_short", tmp), ("mismatch", "exported 2 words, want 4"))
         finally:
             c.translate_listing = real
+
+
+class ArgumentValidation(unittest.TestCase):
+    """--max-ops and --programs must be at least 1, like tools/cf_diff.py's usage errors.
+
+    Before this, `--max-ops 0` died with `ValueError: empty range in randint(1, 0)` after the sweep and edge grid
+    had run, and `--programs 0` (or negative) skipped the random stage and exited 0 on the sweep alone, which
+    reads as a full pass. Both are now rejected before any work, with exit 2 and one usage line on stderr.
+    """
+
+    def command(self, *args):
+        return subprocess.run([sys.executable, "-I", TOOL, *args], cwd=ROOT,
+                              capture_output=True, text=True, timeout=60)
+
+    def _rejected(self, argv, message):
+        proc = self.command("--no-sweep", *argv)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn(message, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(proc.stdout, "")           # rejected before any stage ran
+
+    def test_max_ops_zero_is_rejected(self):
+        self._rejected(["--max-ops", "0"], "--max-ops must be at least 1")
+
+    def test_max_ops_negative_is_rejected(self):
+        self._rejected(["--max-ops", "-1"], "--max-ops must be at least 1")
+
+    def test_programs_zero_is_rejected(self):
+        self._rejected(["--programs", "0"], "--programs must be at least 1")
+
+    def test_programs_negative_is_rejected(self):
+        self._rejected(["--programs", "-2"], "--programs must be at least 1")
+
+    def test_a_valid_short_run_still_matches(self):
+        proc = self.command("--no-sweep", "--programs", "4", "--seed", "3", "--max-ops", "4")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("random: 4/4 programs match, 0 mismatch", proc.stdout)
+
+    def test_main_accepts_an_argv_list(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+            c.main(["--max-ops", "0"])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("--max-ops must be at least 1", err.getvalue())
 
 
 if __name__ == "__main__":
