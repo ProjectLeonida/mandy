@@ -1859,6 +1859,37 @@ int check_mapped_bc_array(ID3D12Device* device) {
     return 0;
 }
 
+// Model a device that supports host image copies, with two per-image exceptions.
+PFN_vkGetInstanceProcAddr original_instance_proc;
+PFN_vkGetPhysicalDeviceFormatProperties2 original_format_properties;
+PFN_vkGetPhysicalDeviceImageFormatProperties2 original_image_properties;
+
+VKAPI_ATTR void VKAPI_CALL without_r8_host_transfer(VkPhysicalDevice device, VkFormat format,
+                                                     VkFormatProperties2* properties) {
+    original_format_properties(device, format, properties);
+    if (format != VK_FORMAT_R8_UNORM) return;
+    for (auto* p = static_cast<VkBaseOutStructure*>(properties->pNext); p; p = p->pNext)
+        if (p->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3)
+            reinterpret_cast<VkFormatProperties3*>(p)->optimalTilingFeatures &=
+                ~VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL without_bc1_host_usage(VkPhysicalDevice device,
+                                                      const VkPhysicalDeviceImageFormatInfo2* info,
+                                                      VkImageFormatProperties2* properties) {
+    if (info->format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK && (info->usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT))
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    return original_image_properties(device, info, properties);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL per_format_instance_proc(VkInstance instance, const char* name) {
+    if (std::strcmp(name, "vkGetPhysicalDeviceFormatProperties2") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(without_r8_host_transfer);
+    if (std::strcmp(name, "vkGetPhysicalDeviceImageFormatProperties2") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(without_bc1_host_usage);
+    return original_instance_proc(instance, name);
+}
+
 void print_cases(const std::vector<Case>& cases, const char* who) {
     for (const Case& c : cases)
         std::printf("%s: %-44s hr=0x%08lX size=%llu align=%llu type=%d cpu=%d pool=%d flags=0x%x\n", who, c.name,
@@ -1903,6 +1934,18 @@ int main() {
             failures += check_shared_bc_placements(ours.p);
             failures += check_mapped_plane(ours.p);
             failures += check_mapped_bc_array(ours.p);
+
+            original_instance_proc = vk.instance_proc;
+            original_format_properties =
+                vk.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties2>("vkGetPhysicalDeviceFormatProperties2");
+            original_image_properties =
+                vk.instance_fn<PFN_vkGetPhysicalDeviceImageFormatProperties2>("vkGetPhysicalDeviceImageFormatProperties2");
+            auto per_format = info;
+            per_format.get_instance_proc = per_format_instance_proc;
+            Ref<ID3D12Device> limited;
+            if (FAILED(rt::d3d12::create_vulkan_device(per_format, IID_PPV_ARGS(&limited.p)))) return 1;
+            failures += check_mapped_plane(limited.p);
+            failures += check_mapped_bc_array(limited.p);
         }
         {
             // Without host image copies a title image is filled through the staged upload, a linear plane too.
