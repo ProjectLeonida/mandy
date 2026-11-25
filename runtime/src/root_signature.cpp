@@ -379,24 +379,26 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
         p.visibility = static_cast<Visibility>(vis);
         if (dtype == 1) {
             p.type = ParamType::Constants;
-            if (!u32_at(poff, p.shader_register) || !u32_at(poff + 4, p.register_space) ||
-                !u32_at(poff + 8, p.num_values)) {
+            const size_t base = static_cast<size_t>(poff);
+            if (!u32_at(base, p.shader_register) || !u32_at(base + 4, p.register_space) ||
+                !u32_at(base + 8, p.num_values)) {
                 out.error = "truncated RTS0 constants payload";
                 return out;
             }
         } else if (dtype == 2 || dtype == 3 || dtype == 4) {
             p.type = ParamType::Descriptor;
             uint32_t dflags = 0;
+            const size_t base = static_cast<size_t>(poff);
             const size_t need = flags_v11 ? 12 : 8;
-            if (poff > size || need > size - static_cast<size_t>(poff)) {
+            if (base > size || need > size - base) {
                 out.error = "truncated RTS0 descriptor payload";
                 return out;
             }
-            if (!u32_at(poff, p.descriptor_register) || !u32_at(poff + 4, p.descriptor_space)) {
+            if (!u32_at(base, p.descriptor_register) || !u32_at(base + 4, p.descriptor_space)) {
                 out.error = "truncated RTS0 descriptor payload";
                 return out;
             }
-            if (flags_v11 && !u32_at(poff + 8, dflags)) {
+            if (flags_v11 && !u32_at(base + 8, dflags)) {
                 out.error = "truncated RTS0 descriptor flags";
                 return out;
             }
