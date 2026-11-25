@@ -220,7 +220,9 @@ Stages: `check` always runs first; then `shaders`, `assets` and `runtime` run to
 depend on each other). `pipelines` starts once the translated shaders are ready and, when this run includes runtime,
 that stage has finished rebuilding `vk_pipeline_check`, so it can overlap the rest of assets; it creates every
 translated shader on your GPU driver, reports any it has to skip, and saves a pipeline cache to `pipeline_cache.bin`
-in `--out` (the runtime doesn't load that cache yet, so it doesn't speed up the first boot). The shader translation
+in `--out` (the runtime doesn't load that cache yet, so it doesn't speed up the first boot). `pipeline_done.json`
+beside it lists the shaders already built for this GPU, driver and checker, so a later run only builds the ones whose
+SPIR-V changed ([docs/pipeline_check.md](docs/pipeline_check.md#shard-caches-and-the-done-list)). The shader translation
 is the longest CPU step: it runs on `--jobs` processes (half the CPU threads by default). When shaders and assets
 share the machine, that budget is split between them and passed to `rpf9dump` as `--jobs`; a solo assets run still
 lets `rpf9dump` use every core. Progress lines include percent and a rough ETA for translation shards, asset steps,

@@ -44,6 +44,15 @@ Build with `make_game.py --stages shaders --compact-spirv` to run SPIRV-Tools lo
 | `--isolate` | POSIX only: check in child processes, `--isolate-batch N` modules at a time (default 256), so a crashing module is recorded as `MODULE CRASH` and the pass continues. Not compatible with `--stats`. |
 | `--inflight-file F` | Keep the modules currently in the driver in F as `name<TAB>phase` lines. It is rewritten by the watchdog and when a large module enters or leaves, and emptied at the end; `make_game.py`'s pipelines stage reads it. |
 | `--skip-file F` | Do not compile modules named one per line in F; each is reported as `MODULE CRASH` and counted as a failed pipeline. `make_game.py` writes F after a crash so the next run checks the rest. |
+| `--names-file F` | Check only the index entries named one per line in F (applied before `--start`/`--count`); a name the index lacks is a usage error. |
+| `--done-file F` | At the end, write the modules that passed to F, one per line and sorted: module created, and pipeline created or skipped for a missing feature or stub, with the cache saved. Not with `--isolate`. |
+
+Two other modes take no spirv dir:
+
+| Command | Meaning |
+|---|---|
+| `vk_pipeline_check --device-info` | Print `device-info vendor=… device=… driver=… api=… uuid=<pipelineCacheUUID> name=…` for the device a check would use (`LEONIDA_VK_DEVICE` applies). |
+| `vk_pipeline_check --merge <out> <in>...` | Load `<out>` if it exists, add each input with `vkMergePipelineCaches` and save `<out>` atomically. An input whose header names another vendor, device or `pipelineCacheUUID` (`runtime/test/pipeline_cache_header.h`), or that cannot be read, fails the merge with exit 1 and leaves `<out>` as it was; an `<out>` of another device is replaced. |
 
 `--isolate-child` is internal to the parent/child protocol and is not meant to be passed directly. A module with a missing partner stub is skipped; without `--isolate`, a driver crash ends the run.
 
@@ -347,8 +356,10 @@ that size. Which threads the game creates pipelines on is not known without its 
 ## Build-stage batches (BUILD-1030)
 
 `make_game.py` runs the pipelines stage in fresh checker processes over at most **500 index entries** each, on
-Windows and POSIX. The ranges partition the same name-sorted index as `--start` / `--count`, including the final
-short range. Each finished process saves to the same `pipeline_cache.bin`, and the next loads that checkpoint.
+Windows and POSIX. The ranges partition the name-sorted list of modules still to check (with a checker before
+`--merge`, the whole index, selected by `--start` / `--count`), including the final short range. Each process writes
+its own shard cache, merged into `pipeline_cache.bin` at the end (next section); with a checker before `--merge`,
+each finished process saves to the same `pipeline_cache.bin`, and the next loads that checkpoint.
 This bounds each invocation to a range that can be split further if concurrent heavy compiles exceed available
 memory. A work folder with at most 500 entries keeps the single invocation. An older checker without the range
 options keeps the older invocation; rebuild the runtime to get batching.
@@ -377,6 +388,54 @@ cannot complete even alone fails with a diagnostic rather than being counted as 
 bounded coverage and cache checkpoints, collective memory-crash recovery, a genuinely crashing module, validation
 failures, interruptions, setup failures, inconclusive probes and compatibility with older checkers. It needs no
 game files or GPU.
+
+## Shard caches and the done-list
+
+With one shared `pipeline_cache.bin`, every one of the 53 processes of a full run loaded the whole cache and saved it
+back: on an RTX 4070 SUPER (NVIDIA 621.01) the full set's cache is 9.6 GB, and that load and save took 1-2 minutes per
+process. A run after a translator change also checked all 26,503 modules again, even the unchanged ones (they compile
+from the cache, but each process still pays the load and save). With a checker that has `--merge`, the stage instead:
+
+- gives each process (and each single-module crash probe and the BVH builder pass) its own empty cache,
+  `pipeline_shards/NNNNN.bin` in `--out`, and its batch through `--names-file`;
+- merges the shards into `pipeline_cache.bin` once at the end (`--merge`), then removes them. A run that was stopped
+  (Ctrl+C, a setup error, the crash retries running out) keeps its shards, and the next run merges them. A run with a
+  validation failure still merges what was built, as each process's own cache save did before;
+- records each module its `--done-file` names in `pipeline_done.json` in `--out`, with the SHA-256 of its `.spv` and
+  of its index entry and the shard it went to. A later run skips the modules recorded with the same hashes, so after
+  a translator change only the modules whose SPIR-V (or index entry) changed are built. The XboxBvhBuilder pass is
+  recorded the same way by a hash of its `index.json` and `.spv` files, so an unchanged corpus starts no process and
+  needs no merge.
+
+The whole list is tied to one identity: vendor and device ID, driver version and `pipelineCacheUUID`
+(`--device-info`), the checker, the partner stubs in `stubs/` and the list's format. A change of any of them builds
+everything again (and drops leftover shards). The checker is named by the SHA-256 of its sources when it is the
+current build in this checkout's `runtime/build` (the `cl.exe` fallback of `scripts/build_runtime.ps1` relinks it on
+every runtime stage), otherwise by the SHA-256 of the executable. Entries already merged hold only while
+`pipeline_cache.bin` has the size and modification time the last merge left; deleting the cache builds everything
+again. A module that failed, crashed the driver or was not checked is not on the list, so it is checked on every run
+as before. The first run over a `pipeline_cache.bin` from before the done-list keeps the old per-process load and save,
+so what that cache holds still compiles from it; later runs use shards.
+
+The cache holds the same pipelines as before: each module's pipeline is created by the same checker with the same
+device setup, only into a smaller cache that is merged afterwards. `runtime/test/check_vk_pipeline_merge.py` (CTest
+`vk_pipeline_check_merge`) checks this on the GPU: two caches of three synthetic compute shaders each, merged, seed a
+run over all six with six application-cache hits, and the first cache alone with three. `pipeline_cache_header` tests
+the header check without a device, and `tests/test_make_game_pipeline_batches.py` runs the stage's crash recovery with
+both checker generations plus the done-list cases (resume, changed module, changed driver or checker, failed merge).
+
+Measured on an RTX 4070 SUPER (NVIDIA 621.01, Windows 11), `--jobs 2`, `__GL_SHADER_DISK_CACHE=0`, 400 synthetic compute
+shaders in batches of 50 (8 processes), seconds, two runs each:
+
+| | Full run | Rerun, nothing changed | Rerun, 20 modules changed |
+|---|---:|---:|---:|
+| one shared cache | 2.9 / 3.0 | 2.3 / 2.4 | 2.2 / 2.5 |
+| shards + done-list | 3.2 / 3.5 | 0.22 / 0.25 | 0.76 / 0.86 |
+
+That cache is 2.8 MB, so this measures the per-process and per-module work, not the cache I/O, which is what dominates
+the real corpus: the stage no longer loads or saves the cache per process, and merges once. The checker also reads
+its seed cache in one call now; loading a 2 GiB cache file took 21.6 s before (a character-by-character copy) and
+1.7 s after, on the same machine.
 
 ## Crash isolation (`--isolate`)
 

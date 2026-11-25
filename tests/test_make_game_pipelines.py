@@ -135,8 +135,13 @@ class PipelinesCrashRetryTest(unittest.TestCase):
                 raise SystemExit(1)
             return code
         logs = []
+
+        def legacy(exe, *options):
+            # A checker before --merge: shard caches and the done-list are tested in
+            # test_make_game_pipeline_batches.py; these tests pin the --start/--count protocol it still gets.
+            return supports and "--merge" not in options
         with mock.patch.object(make_game, "pipeline_check_exe", return_value="vk_pipeline_check.exe"), \
-                mock.patch.object(make_game, "checker_supports", return_value=supports), \
+                mock.patch.object(make_game, "checker_supports", side_effect=legacy), \
                 mock.patch.object(make_game, "run", side_effect=fake_run), \
                 mock.patch.object(make_game, "log", logs.append):
             try:

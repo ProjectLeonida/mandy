@@ -44,13 +44,27 @@
 //   --skip-file F modules named in F (one per line) are not compiled: each is reported as MODULE CRASH and counted
 //                 as a failed pipeline, as --isolate does for a module that killed the driver. make_game.py writes F
 //                 after a crash, so the next run checks everything else instead of dying on the same module.
+//   --names-file F  check only the index entries named in F (one per line), before --start/--count; a name that
+//                 is not in the index is a usage error. make_game.py gives each process its batch this way.
+//   --done-file F at the end of the pass, F lists (one per line, sorted) the modules that passed: module created and
+//                 pipeline created or skipped for a missing feature or stub, and the cache saved. Failed, crashed
+//                 (--skip-file) and BIG SKIP modules are left out. Not with --isolate.
 //   test hook     VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL] simulates a process crash
 //                 just before the pipeline of a matching module is created. For testing --isolate and the
 //                 pipelines stage's retry.
+//
+// Two other modes, without a spirv dir:
+//   vk_pipeline_check --device-info   print "device-info vendor=0x.. device=0x.. driver=0x.. api=0x.. uuid=<32 hex>
+//                 name=<device name>" for the device a check would use (LEONIDA_VK_DEVICE applies), then exit 0.
+//   vk_pipeline_check --merge <out cache> <in cache>...   load <out cache> if it exists, add every input with
+//                 vkMergePipelineCaches and save <out cache> atomically. An input written by another device or driver
+//                 (pipeline_cache_header.h) or that cannot be read fails the merge (exit 1) and <out cache> is left
+//                 as it was. make_game.py's pipelines stage merges its shard caches this way.
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "../src/pipeline_cache_file.h"
 #include "pipeline_cache_snapshot.h"
+#include "pipeline_cache_header.h"
 #include "large_module_gate.h"
 #include "pipeline_summary.h"
 #include "../src/spirv_words.h"
@@ -794,11 +808,36 @@ int main(int argc, char** argv) {
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
             "[--max-bytes N] [--large-module-bytes N] [--large-parallel N] [--stage all|cs|graphics | --compute-only | --graphics-only] "
             "[--stats FILE] [--cache-feedback] [--isolate [--isolate-batch N]] [--inflight-file F] "
-            "[--skip-file F]\n");
+            "[--skip-file F] [--names-file F] [--done-file F]\n"
+            "       vk_pipeline_check --device-info\n"
+            "       vk_pipeline_check --merge <out cache> <in cache>...\n");
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
-    std::string dir = argv[1], cache_path, stats_path, inflight_path, skip_path;
+    enum class Mode { check, device_info, merge };
+    const std::string_view first = argv[1];
+    const Mode mode = first == "--device-info" ? Mode::device_info : first == "--merge" ? Mode::merge : Mode::check;
+    std::string dir = argv[1], cache_path, stats_path, inflight_path, skip_path, names_path, done_path;
+    std::vector<std::string> merge_inputs;
+    if (mode == Mode::device_info && argc != 2) {
+        std::fprintf(stderr, "--device-info takes no other arguments\n");
+        return 2;
+    }
+    if (mode == Mode::merge) {
+        if (argc < 4) {
+            std::fprintf(stderr, "--merge needs an output cache and at least one input cache\n");
+            return 2;
+        }
+        cache_path = argv[2];
+        merge_inputs.assign(argv + 3, argv + argc);
+        for (const auto& input : merge_inputs) {
+            std::error_code error;
+            if (input == cache_path || std::filesystem::equivalent(input, cache_path, error)) {
+                std::fprintf(stderr, "error: --merge output %s is also an input\n", cache_path.c_str());
+                return 2;
+            }
+        }
+    }
     bool cache_given = false;   // an empty cache_path alone can't tell "not given" from an empty argument
     uint32_t jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
     size_t start = 0, count = 0, max_bytes = 0;
@@ -808,7 +847,7 @@ int main(int argc, char** argv) {
     std::string stage_filter = "all";
     bool cache_feedback = false, isolate = false, iso_child = false;
     size_t isolate_batch = 256;
-    for (int i = 2; i < argc; i++) {
+    for (int i = 2; mode == Mode::check && i < argc; i++) {
         std::string a = argv[i];
         auto value = [&]() -> std::string_view {
             if (i + 1 == argc || std::string_view(argv[i + 1]).starts_with("--")) return {};
@@ -849,6 +888,8 @@ int main(int argc, char** argv) {
         else if (a == "--stats") valid = !(stats_path = value()).empty();
         else if (a == "--inflight-file") valid = !(inflight_path = value()).empty();
         else if (a == "--skip-file") valid = !(skip_path = value()).empty();
+        else if (a == "--names-file") valid = !(names_path = value()).empty();
+        else if (a == "--done-file") valid = !(done_path = value()).empty();
         else if (a == "--cache-feedback") cache_feedback = true;
         else if (a == "--isolate") isolate = true;
         else if (a == "--isolate-child") iso_child = true;   // internal: the parent's child runs
@@ -881,6 +922,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--isolate cannot be combined with --stats\n");
         return 2;
     }
+    if (isolate && !done_path.empty()) {   // each child would overwrite the list of the one before
+        std::fprintf(stderr, "--isolate cannot be combined with --done-file\n");
+        return 2;
+    }
 #ifdef _WIN32
     if (iso_child) SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 #endif
@@ -893,11 +938,13 @@ int main(int argc, char** argv) {
     // These inputs already exist on a valid invocation. Compare file identity so aliases are also protected.
     for (const auto& [option, output] : {std::pair{"cache path", &cache_path},
                                         std::pair{"--stats", &stats_path},
-                                        std::pair{"--inflight-file", &inflight_path}}) {
+                                        std::pair{"--inflight-file", &inflight_path},
+                                        std::pair{"--done-file", &done_path}}) {
         if (output->empty()) continue;
         const char* input = nullptr;
         if (same_file(*output, index_path)) input = "index.json";
         else if (!skip_path.empty() && same_file(*output, skip_path)) input = "--skip-file";
+        else if (!names_path.empty() && same_file(*output, names_path)) input = "--names-file";
         if (input) {
             std::fprintf(stderr, "error: %s must not overwrite %s\n", option, input);
             return 2;
@@ -917,20 +964,43 @@ int main(int argc, char** argv) {
         }
     }
 
+    std::set<std::string> only_names;   // --names-file: the batch make_game.py gave this process
+    if (!names_path.empty()) {
+        std::ifstream nf(names_path);
+        if (!nf) {
+            std::fprintf(stderr, "error: cannot read --names-file %s\n", names_path.c_str());
+            return 2;
+        }
+        for (std::string line; std::getline(nf, line);) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (!line.empty()) only_names.insert(line);
+        }
+    }
+
     std::string index_err;
     bool index_unreadable = false;
-    auto index = read_index(index_path, index_err, index_unreadable);
+    // --device-info and --merge read no index: the work list stays empty and only the device is set up.
+    auto index = mode == Mode::check ? read_index(index_path, index_err, index_unreadable)
+                                     : decltype(read_index(index_path, index_err, index_unreadable)){};
     if (!index_err.empty()) {
         std::fprintf(stderr, index_unreadable ? "error: cannot read %s/index.json: %s\n" : "error: malformed JSON in %s/index.json: %s\n",
                      dir.c_str(), index_err.c_str());
         return 2;
     }
-    std::fprintf(stderr, "%zu shaders in index\n", index.size());
+    if (mode == Mode::check) std::fprintf(stderr, "%zu shaders in index\n", index.size());
+    for (const auto& name : only_names) {
+        if (!index.count(name)) {
+            std::fprintf(stderr, "error: --names-file names %s, which is not in %s\n", name.c_str(), index_path.c_str());
+            return 2;
+        }
+    }
 
-    // Build work list: index order (sorted by name), optionally filtered by stage, then [start, start + count).
+    // Build work list: index order (sorted by name), optionally filtered by --names-file and stage, then
+    // [start, start + count).
     using Item = std::pair<const std::string*, const ShaderMeta*>;
     std::vector<Item> all;
     for (auto& [name, meta] : index) {
+        if (!names_path.empty() && !only_names.count(name)) continue;
         if (stage_filter == "cs" && meta.stage != "cs") continue;
         if (stage_filter == "graphics" && !is_graphics_stage(meta.stage)) continue;
         all.push_back({&name, &meta});
@@ -954,6 +1024,8 @@ int main(int argc, char** argv) {
         if (cache_feedback) pass.push_back("--cache-feedback");
         if (!inflight_path.empty()) pass.insert(pass.end(), {"--inflight-file", inflight_path});
         if (!skip_path.empty()) pass.insert(pass.end(), {"--skip-file", skip_path});
+        // The children's --start/--count index the same filtered list, so they need the same filter.
+        if (!names_path.empty()) pass.insert(pass.end(), {"--names-file", names_path});
         struct Agg { uint32_t mod_ok = 0, mod_bad = 0, pipe_ok = 0, pipe_bad = 0, pipe_skip = 0, big = 0, crashed = 0, fb[3] = {}; };
         std::map<std::string, Agg> agg;
         std::vector<std::string> crashes;
@@ -1102,6 +1174,13 @@ int main(int argc, char** argv) {
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
+    if (mode == Mode::device_info) {
+        // What a saved cache is tied to (its header) plus the driver version: make_game.py's done-list key.
+        std::printf("device-info vendor=0x%04x device=0x%04x driver=0x%08x api=0x%08x uuid=%s name=%s\n",
+                    props.vendorID, props.deviceID, props.driverVersion, props.apiVersion,
+                    leonida::vk_test::uuid_hex(props.pipelineCacheUUID).c_str(), props.deviceName);
+        return 0;
+    }
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
     VkPhysicalDeviceVulkan11Properties indexing_limits{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
     // Vulkan12Properties already includes the float controls (do not chain both promoted structs).
@@ -1410,9 +1489,25 @@ int main(int argc, char** argv) {
     VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     std::vector<char> seed;
     if (!cache_path.empty()) {  // resume: pipelines already in the cache compile instantly
-        std::ifstream cf(cache_path, std::ios::binary);
-        seed.assign(std::istreambuf_iterator<char>(cf), {});
+        // One read of the whole file: a character-by-character copy took 21 s for 2 GiB (Windows 11, NVMe).
+        std::ifstream cf(cache_path, std::ios::binary | std::ios::ate);
+        const std::streamoff size = cf ? std::streamoff(cf.tellg()) : std::streamoff(0);
+        if (size > 0) {
+            seed.resize(size_t(size));
+            cf.seekg(0);
+            if (!cf.read(seed.data(), size)) seed.clear();   // unreadable: start empty, as a missing file does
+        }
         if (!seed.empty()) std::fprintf(stderr, "seeded the pipeline cache with %zu bytes from %s\n", seed.size(), cache_path.c_str());
+    }
+    if (mode == Mode::merge && !seed.empty()) {
+        // An output from another GPU or driver holds nothing this device can use: start the merge empty instead.
+        const std::string why = leonida::vk_test::pipeline_cache_mismatch(seed.data(), seed.size(), props.vendorID,
+                                                                          props.deviceID, props.pipelineCacheUUID);
+        if (!why.empty()) {
+            std::fprintf(stderr, "note: %s is not this device's cache (%s); it is replaced\n", cache_path.c_str(),
+                         why.c_str());
+            std::vector<char>().swap(seed);
+        }
     }
     pci.initialDataSize = seed.size(); pci.pInitialData = seed.empty() ? nullptr : seed.data();
     VkPipelineCache cache = VK_NULL_HANDLE;
@@ -1441,6 +1536,56 @@ int main(int argc, char** argv) {
         }
     };
 
+    if (mode == Mode::merge) {
+        // One input in memory at a time: a shard is read, handed to the driver, merged and freed before the next.
+        LOADD(vkMergePipelineCaches); LOADD(vkDestroyPipelineCache);
+        size_t merged = 0, skipped_empty = 0;
+        uint64_t merged_bytes = 0;
+        for (const auto& input : merge_inputs) {
+            std::ifstream in(input, std::ios::binary | std::ios::ate);
+            const std::streamoff size = in ? std::streamoff(in.tellg()) : std::streamoff(-1);
+            std::vector<char> data(size > 0 ? size_t(size) : 0);
+            if (size > 0) {
+                in.seekg(0);
+                in.read(data.data(), size);
+            }
+            if (size < 0 || !in) {
+                std::fprintf(stderr, "error: cannot read %s; %s is left as it was\n", input.c_str(), cache_path.c_str());
+                return 1;
+            }
+            if (data.empty()) {   // a process that saved nothing (no pipeline was created)
+                ++skipped_empty;
+                continue;
+            }
+            const std::string why = leonida::vk_test::pipeline_cache_mismatch(data.data(), data.size(), props.vendorID,
+                                                                              props.deviceID, props.pipelineCacheUUID);
+            if (!why.empty()) {
+                std::fprintf(stderr, "error: %s is not this device's cache (%s); %s is left as it was\n",
+                             input.c_str(), why.c_str(), cache_path.c_str());
+                return 1;
+            }
+            VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+            info.initialDataSize = data.size();
+            info.pInitialData = data.data();
+            VkPipelineCache source = VK_NULL_HANDLE;
+            if (VkResult r = vkCreatePipelineCache(dev, &info, nullptr, &source)) {
+                std::fprintf(stderr, "error: vkCreatePipelineCache for %s failed: %d\n", input.c_str(), r);
+                return 1;
+            }
+            const VkResult r = vkMergePipelineCaches(dev, cache, 1, &source);
+            vkDestroyPipelineCache(dev, source, nullptr);
+            if (r) {
+                std::fprintf(stderr, "error: vkMergePipelineCaches with %s failed: %d\n", input.c_str(), r);
+                return 1;
+            }
+            ++merged;
+            merged_bytes += data.size();
+        }
+        std::printf("merged %zu cache(s), %llu bytes%s\n", merged, static_cast<unsigned long long>(merged_bytes),
+                    skipped_empty ? (", " + std::to_string(skipped_empty) + " empty input(s) skipped").c_str() : "");
+        return save_cache(true) ? 0 : 1;
+    }
+
     const auto worker_count = static_cast<unsigned>(std::min<size_t>(jobs, work.size()));
     std::fprintf(stderr, "checking %zu shaders [%zu, %zu) (stage=%s) on %u threads\n",
                  work.size(), lo, hi, stage_filter.c_str(), worker_count);
@@ -1467,6 +1612,12 @@ int main(int argc, char** argv) {
                          large_gate.max_inflight());
     }
     std::map<std::string, uint32_t> modules_ok, modules_bad, big_skipped;
+    std::set<std::string> passed_names;   // --done-file: modules with no failure (guarded by mu)
+    auto record_passed = [&](const std::string& name) {
+        if (done_path.empty()) return;
+        std::lock_guard<std::mutex> g(mu);
+        passed_names.insert(name);
+    };
     std::map<std::string, StageStats> stats;
     std::map<std::string, VkShaderModule> stub_cache;
     std::atomic<size_t> next{0}, done{0};
@@ -1522,6 +1673,8 @@ int main(int argc, char** argv) {
         auto& st = stats[stage];
         st.pipes_skipped++;
         st.skip_reasons[reason]++;
+        // --done-file: this device skips it the same way every time, so there is nothing to build again
+        if (!done_path.empty()) passed_names.insert(name);
         std::printf("SKIPPED %s (%s)\n", name.c_str(), reason.c_str());
     };
 
@@ -1677,6 +1830,7 @@ int main(int argc, char** argv) {
                 if (mod_ok) modules_ok[stage]++;
                 else { modules_bad[stage]++; std::printf("MODULE FAIL %s\n", name.c_str()); }
             }
+            bool passed = mod_ok;   // --done-file: cleared below when the pipeline fails
             if (mod_ok && stage == "cs") {
                 const std::string miss = check_missing_feature(meta);
                 if (!miss.empty()) {
@@ -1714,6 +1868,7 @@ int main(int argc, char** argv) {
                     VkPipeline p = VK_NULL_HANDLE;
                     maybe_simulate_crash(name);
                     VkResult r = vkCreateComputePipelines(dev, cache, 1, &cpi, nullptr, &p);
+                    passed = r == VK_SUCCESS;
                     const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                     if (r == VK_SUCCESS) write_stats(name, stage, VK_SHADER_STAGE_COMPUTE_BIT, p);
                     if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
@@ -1888,6 +2043,7 @@ int main(int argc, char** argv) {
                         VkPipeline p = VK_NULL_HANDLE;
                         maybe_simulate_crash(name);
                         VkResult r = vkCreateGraphicsPipelines(dev, cache, 1, &gpci, nullptr, &p);
+                        passed = r == VK_SUCCESS;
                         const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                         if (r == VK_SUCCESS) write_stats(name, stage, stage_bit(stage), p);
                         if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
@@ -1898,6 +2054,7 @@ int main(int argc, char** argv) {
                 record_skip(name, stage, "unsupported stage " + stage);
             }
             if (sm) vkDestroyShaderModule(dev, sm, nullptr);
+            if (passed) record_passed(name);
             {   // out of the driver on every path (a pipeline, a skip, a failed module)
                 std::lock_guard<std::mutex> g(mu);
                 if (inflight.erase(std::this_thread::get_id()) && inflight.empty()) write_inflight();
@@ -2013,6 +2170,16 @@ int main(int argc, char** argv) {
                     large_module_bytes);
     std::printf("wall time: %.1fs on %u threads\n", elapsed(), worker_count);
     const bool cache_saved = save_cache(true);  // keep successful pipelines even if another entry failed
+    if (!done_path.empty()) {
+        // Only what reached the saved cache is done: without a cache save, the list is written empty.
+        std::string list;   // sorted and each name once: a std::set
+        if (cache_saved)
+            for (const auto& name : passed_names) list += name + '\n';
+        if (const auto error = write_pipeline_cache_file(done_path, list.data(), list.size())) {
+            std::fprintf(stderr, "cannot write --done-file %s: %s\n", done_path.c_str(), error.message().c_str());
+            check_failed = true;
+        }
+    }
     if (stats_out) {
         const bool write_failed = std::ferror(stats_out) != 0;
         const bool close_failed = std::fclose(stats_out) != 0;
