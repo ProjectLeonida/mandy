@@ -7,6 +7,10 @@ path or to a whole command, as for the shaders stage). Listings, synthetic FSSM 
 staged in a temporary directory. After validation, the build writes <out>/spirv/<name>.spv and the translator
 metadata.
 
+A source llvm-mc cannot assemble for gfx1013 says so in a comment line of its own (TEXT_ONLY_MARK below,
+cs_dpp_cmp.asm): it is not sent to llvm-mc, and its instruction lines are the listing, as scripts/run_gpu_tests.py
+takes them.
+
 Compute shaders can override the default header with leading "; group: X,Y,Z" and "; rsrc2: 0x..." comments.
 A shader whose header has "; fssm-at: 0xOFFSET" and "; fssm-data: 0xWORD ..." comments also gets a synthetic
 FSSM program (the magic, zeros up to OFFSET, then the words): it is published as <out>/fssm/<name>.fssm and its
@@ -71,6 +75,22 @@ def barycentric_fallback():
         return answer.get("barycentric_fallback") is True
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return False
+
+
+# A comment line a .asm carries when llvm-mc cannot assemble it (cs_dpp_cmp.asm: a VOPC compare in DPP form).
+# scripts/run_gpu_tests.py has the same line; tests/test_shader_build_text_only.py checks that the two agree.
+TEXT_ONLY_MARK = "; run_gpu_tests: text only, llvm-mc has no gfx1013 encoding for an instruction here"
+
+
+def text_only_listing(name, raw):
+    """The listing rdna2spirv.py reads for a source that carries TEXT_ONLY_MARK: its instruction lines as they are,
+    as assemble_to_s of scripts/run_gpu_tests.py writes them (the translator reads straight-line code from the text
+    alone). None for every other source, which llvm-mc assembles."""
+    if not any(ln.strip() == TEXT_ONLY_MARK for ln in raw.splitlines()):
+        return None
+    lines = [f"; {name}  code 0x0..0x0 (synthetic), gfx1013, 0 invalid words"]
+    lines += ["\t" + ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.lstrip().startswith(";")]
+    return "\n".join(lines) + "\n"
 
 
 def asm_mattr(path):
@@ -155,20 +175,23 @@ def translate_tests(work, names):
         raw = Path(asm_path).read_text(encoding="utf-8")
         if shift and n.startswith("cs_"):
             raw = shift_user_data(raw, shift)
-        mattr = asm_mattr(asm_path)
-        cmd = MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
-        if n in CLIP_CASES:
-            cmd.append(f"-defsym=PARAM_SLOT={CLIP_CASES[n]}")
-        if mattr:
-            cmd.append(f"-mattr={mattr}")
-        cmd.append("-show-encoding")
-        # Feed the text on stdin: an LLVM_MC command that runs in WSL cannot open a Windows path argument.
-        r = mc_command.run(cmd, input=raw, capture_output=True, text=True)
-        if r.returncode or "error:" in r.stderr:
-            sys.exit(f"{n}.asm did not assemble:\n{r.stderr}")
-        # rdna2spirv.py rejects assembler directives such as the "\t.text" llvm-mc prints first.
-        code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
-        (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{code}", encoding="utf-8", newline="\n")
+        listing = text_only_listing(n, raw)
+        if listing is None:
+            mattr = asm_mattr(asm_path)
+            cmd = MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+            if n in CLIP_CASES:
+                cmd.append(f"-defsym=PARAM_SLOT={CLIP_CASES[n]}")
+            if mattr:
+                cmd.append(f"-mattr={mattr}")
+            cmd.append("-show-encoding")
+            # Feed the text on stdin: an LLVM_MC command that runs in WSL cannot open a Windows path argument.
+            r = mc_command.run(cmd, input=raw, capture_output=True, text=True)
+            if r.returncode or "error:" in r.stderr:
+                sys.exit(f"{n}.asm did not assemble:\n{r.stderr}")
+            # rdna2spirv.py rejects assembler directives such as the "\t.text" llvm-mc prints first.
+            code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
+            listing = f"; {n}  hand-written test\n{code}"
+        (disasm / (n + ".s")).write_text(listing, encoding="utf-8", newline="\n")
         program = None if n.startswith("cs_") else asm_fssm(asm_path)
         if program:   # where the translator looks for a program to hash, as in the game's work folder
             (fssm / (n + ".fssm")).write_bytes(program)
