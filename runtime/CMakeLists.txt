@@ -4452,6 +4452,10 @@ if(TARGET Vulkan::Headers)
     # Title-placed buffer VAs (device slot 133) and the console VA shaders reach them by (src/title_va_alias.h).
     add_executable(title_va_alias_test test/title_va_alias_test.cpp)
     add_test(NAME title_va_alias COMMAND title_va_alias_test)
+    # Ranges a shader wrote into a title window, copied back to the title's pages after the refresh
+    # (src/title_write_back.h).
+    add_executable(title_write_back_test test/title_write_back_test.cpp)
+    add_test(NAME title_write_back COMMAND title_write_back_test)
     if(WIN32)
       # A refused title window never hands a shader a raw address, and a stream pool's GPU-only alias and CPU view
       # share one mapping (src/title_window_plan.h, src/title_page_watch.h title_gpu_views).
