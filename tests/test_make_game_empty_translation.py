@@ -280,7 +280,7 @@ class ShadersStageTest(unittest.TestCase):
     def plan(self):
         return os.path.join(self.spirv, make_game.SHARD_PLAN)
 
-    def run_stage(self):
+    def run_stage(self, fallbacks=(), need_tool=lambda *a: None):
         ran = []
 
         def fake_py(tool, *args):
@@ -296,11 +296,11 @@ class ShadersStageTest(unittest.TestCase):
             write(os.path.join(self.spirv, "index.json"), json.dumps({"shader_0": {"stage": "ps"}}))
 
         with mock.patch.object(make_game, "py", fake_py), \
-                mock.patch.object(make_game, "need", lambda *a: None), \
+                mock.patch.object(make_game, "need", need_tool), \
                 mock.patch.object(make_game, "translate", fake_translate), \
                 mock.patch.object(make_game, "llvm_mc_signature", return_value="test llvm-mc 21"), \
                 mock.patch.object(make_game, "log", lambda *a: None):
-            make_game.shaders(os.path.join(self.work, "game"), self.work, 2)
+            make_game.shaders(os.path.join(self.work, "game"), self.work, 2, fallbacks=fallbacks)
         return ran
 
     def test_an_empty_saved_index_is_translated_again_without_its_plan(self):
@@ -309,6 +309,15 @@ class ShadersStageTest(unittest.TestCase):
         write(self.plan(), "{}")
         self.assertEqual(self.run_stage(), ["translate"])
         self.assertFalse(os.path.exists(self.plan()))
+
+    def test_full_compact_translation_checks_for_spirv_opt_before_starting(self):
+        def need_tool(name, _hint):
+            if name == "spirv-opt":
+                raise SystemExit(1)
+
+        with self.assertRaises(SystemExit):
+            self.run_stage(fallbacks=("--compact-spirv",), need_tool=need_tool)
+        self.assertFalse(os.path.exists(self.index()))
 
     def test_a_saved_index_that_names_a_shader_is_kept(self):
         self.run_stage()

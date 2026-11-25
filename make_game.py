@@ -1343,6 +1343,8 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         if not os.path.isfile(translated):
             need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
             need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
+            if "--compact-spirv" in fallbacks:
+                need("spirv-opt", "Install SPIRV-Tools with spirv-opt to use --compact-spirv.")
             log(f"shaders: translating RDNA2 to SPIR-V on {jobs} processes (the longest step)")
             # The mode and the translator's digest go down before the translation starts, while there is no
             # index.json: a stop at any point then leaves either no index (translated again) or an index with the
