@@ -134,11 +134,13 @@ def _maskable_b32(x):
     )
 
 
-def lane_slot(vgpr, lane):
+def lane_slot(vgpr, lane, wave64=True):
     """State key for a mask parked in one lane of a VGPR, or None unless both operands are plain."""
-    if vgpr["k"] != "vgpr" or lane["k"] != "imm":
+    if vgpr["k"] != "vgpr" or vgpr.get("n", 1) != 1 or lane["k"] != "imm":
         return None
-    return ("lane", vgpr["r"], lane["v"] & 63)
+    if vgpr.get("abs") or vgpr.get("neg") or lane.get("abs") or lane.get("neg"):
+        return None
+    return ("lane", vgpr["r"], lane["v"] & (63 if wave64 else 31))
 
 
 def wave32_vcc_pair_op(op, args):
@@ -176,16 +178,18 @@ def step(state, ins, wave64=True):
     if op == "v_readfirstlane_b32" and len(a) == 2:                             # sD = vS, the same in every lane
         put(state, a[0], kind(state, a[1], wave64), wave64)
         return
-    if op == "v_writelane_b32" and len(a) == 3 and lane_slot(a[0], a[2]):       # vD[lane] = sS
-        state.pop(("v", a[0]["r"]), None)
-        k = kind(state, a[1], wave64)
-        if k is None:
-            state.pop(lane_slot(a[0], a[2]), None)
-        else:
-            state[lane_slot(a[0], a[2])] = k
-        return
+    if op == "v_writelane_b32" and len(a) == 3:                                 # vD[lane] = sS
+        slot = lane_slot(a[0], a[2], wave64)
+        if slot is not None:
+            state.pop(("v", a[0]["r"]), None)
+            k = kind(state, a[1], wave64)
+            if k is None:
+                state.pop(slot, None)
+            else:
+                state[slot] = k
+            return
     if op == "v_readlane_b32" and len(a) == 3:                                  # sD = vS[lane]
-        put(state, a[0], state.get(lane_slot(a[1], a[2])), wave64)
+        put(state, a[0], state.get(lane_slot(a[1], a[2], wave64)), wave64)
         return
     if op.startswith("v_cmp"):
         # Handle v_cmp before VGPR clobber (defensive for 2-operand forms with implicit vcc).
@@ -275,14 +279,14 @@ def step(state, ins, wave64=True):
             put(state, a[1], MASK, wave64)                      # carry/sign/scale lane mask of VOP3b ops
 
 
-def parked(blocks, masks):
+def parked(blocks, masks, wave64=True):
     """The (vgpr, lane) slots some v_readlane_b32 fetches a mask from, given analyse()'s result."""
     found = set()
     for blk in blocks:
         for ins in blk:
             a = ins["args"]
             if base_op(ins["op"]) == "v_readlane_b32" and len(a) == 3:
-                slot = lane_slot(a[1], a[2])
+                slot = lane_slot(a[1], a[2], wave64)
                 if slot in masks.get(id(ins), ()):
                     found.add(slot[1:])
     return sorted(found)

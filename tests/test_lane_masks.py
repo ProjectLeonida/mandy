@@ -376,6 +376,42 @@ def test_wave32_vcc_hi_isolation():
     assert out_w64 == {}
 
 
+def test_wave32_parked_lane_wraps_mod_32():
+    mk = ins("v_cmp_lt_u32_e64", s(6), v(0), imm(2))
+    use = ins("s_bcnt1_i32_b32", s(8), s(7))
+
+    # In wave32, lane 32 aliases lane 0 (32 & 31 == 0): writing plain data to lane 32 invalidates lane 0.
+    blk_overwrite = [
+        mk,
+        ins("v_writelane_b32", v(5), s(6), imm(0)),
+        ins("v_writelane_b32", v(5), s(9), imm(32)),
+        ins("v_readlane_b32", s(7), v(5), imm(0)),
+        use,
+    ]
+    out_ov = L.analyse([blk_overwrite], [[]], wave64=False)[0][id(use)]
+    assert 7 not in out_ov and ("lane", 5, 0) not in out_ov
+
+    # Symmetrically, parking a mask in lane 32 in wave32 is fetched back from lane 0 as parked slot (5, 0).
+    blk_alias = [
+        mk,
+        ins("v_writelane_b32", v(5), s(6), imm(32)),
+        ins("v_readlane_b32", s(7), v(5), imm(0)),
+        use,
+    ]
+    masks_alias = L.analyse([blk_alias], [[]], wave64=False)[0]
+    assert 7 in masks_alias[id(use)] and ("lane", 5, 0) in masks_alias[id(use)]
+    assert L.parked([blk_alias], masks_alias, wave64=False) == [(5, 0)]
+
+    # In wave64, lane 32 and lane 0 stay distinct.
+    out_w64 = L.analyse([blk_overwrite], [[]], wave64=True)[0][id(use)]
+    assert 7 in out_w64 and ("lane", 5, 0) in out_w64
+
+    # Multi-dword or modified operands are never plain parked lane slots.
+    assert L.lane_slot({"k": "vgpr", "r": 5, "n": 2}, imm(0), wave64=False) is None
+    assert L.lane_slot({"k": "vgpr", "r": 5, "n": 1, "neg": True}, imm(0), wave64=False) is None
+    assert L.lane_slot(v(5), {"k": "imm", "v": 0, "neg": True}, wave64=False) is None
+
+
 if __name__ == "__main__":
     test_straight_line()
     test_joins()
@@ -387,4 +423,5 @@ if __name__ == "__main__":
     test_writelane_sdwa_dpp_swaps_stores_and_div_scale()
     test_v_and_or_xnor_bfi_track_vector_masks()
     test_wave32_vcc_hi_isolation()
+    test_wave32_parked_lane_wraps_mod_32()
     print("ok")

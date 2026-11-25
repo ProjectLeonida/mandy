@@ -6166,7 +6166,7 @@ class Gen:
         # lane_masks merges a mask on one path with plain data on another by dropping the register,
         # so "not in cur_masks" does not prove it is data on every path. Keep a conservative set.
         self.ever_mask = {r for m in self.lane_masks.values() for r in m if isinstance(r, int)}
-        slots = lane_masks.parked(blocks[0], self.lane_masks)
+        slots = lane_masks.parked(blocks[0], self.lane_masks, wave64=self.wave64)
         self.parked = {slot: self.SGPRS + i for i, slot in enumerate(slots)}
 
     def mask_half(self, a):
@@ -8797,7 +8797,7 @@ class Gen:
                 # shuffle would index a lane the 32-lane subgroup of a VS/PS/GS may not have (lane >= 32).
                 self.dst(a[0], self.src_u(a[1]))
                 return
-            slot = lane_masks.lane_slot(a[1], a[2])
+            slot = lane_masks.lane_slot(a[1], a[2], wave64=self.wave64)
             if slot in self.cur_masks:
                 # A lane mask parked there by v_writelane (a saved EXEC, when the shader ran out of SGPRs): this
                 # lane's bit comes back, from the slot the write kept it in. The shuffle would hand every lane
@@ -8820,7 +8820,7 @@ class Gen:
             self.dst(a[0], r)
         elif op == "v_writelane_b32":
             # vD[lane] = sS: only the named lane changes (independent of EXEC, as on hardware).
-            slot = lane_masks.lane_slot(a[0], a[2])
+            slot = lane_masks.lane_slot(a[0], a[2], wave64=self.wave64)
             if slot and slot[1:] in self.w64_scalar_spills:
                 self.store_reg("sgpr", self.parked[slot[1:]], self.src_u(a[1]))
                 return
