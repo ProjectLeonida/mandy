@@ -498,6 +498,19 @@ bool owns_bundled_module_handle(void* module) {
     return false;
 }
 
+bool bundled_module_path(void* module, std::wstring& path) {
+    for (const auto& entry : snapshot_bundled_loaders())
+        if (entry.ops->module_path && entry.ops->module_path(entry.ctx, module, path)) return true;
+    return false;
+}
+
+void* main_bundled_module() {
+    for (const auto& entry : snapshot_bundled_loaders())
+        if (entry.ops->main_module)
+            if (void* h = entry.ops->main_module(entry.ctx)) return h;
+    return nullptr;
+}
+
 void add_xmem_allocation_hooks(const void* owner, const XMemAllocationHooks* hooks) {
     if (!owner || !hooks) return;
     std::lock_guard lock(xmem_hooks_mutex());

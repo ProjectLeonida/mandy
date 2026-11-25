@@ -199,34 +199,97 @@ HMODULE WINAPI load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags) {
     return LoadLibraryExW(name, file, flags);
 }
 
-// GetModuleHandle answers for an owned module as if it were loaded (the GDK may probe before it loads), and for any
-// bundled package module already mapped by the native loader.
+// GetModuleHandle answers for an owned module as if it were loaded (the GDK may probe before it loads), for any
+// bundled package module already mapped by the native loader, and for NULL when a mapped executable is active.
 HMODULE WINAPI get_module_handle_a(LPCSTR name) {
-    if (name) {
-        if (HMODULE h = owned_handle(name)) return h;
-        const std::string dll = module_name(name);
-        if (!dll.empty())
-            if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
+    if (!name) {
+        if (void* main = main_bundled_module()) {
+            SetLastError(ERROR_SUCCESS);
+            return reinterpret_cast<HMODULE>(main);
+        }
+        return GetModuleHandleA(nullptr);
     }
+    if (HMODULE h = owned_handle(name)) return h;
+    const std::string dll = module_name(name);
+    if (!dll.empty())
+        if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
     return GetModuleHandleA(name);
 }
 
 HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
-    if (name) {
-        if (ascii_basename(name)) {
-            const std::string path = narrow(name);
-            if (HMODULE h = owned_handle(path)) return h;
-            const std::string dll = module_name(path);
-            if (!dll.empty())
-                if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
-        } else {
-            // Outside ASCII: by the wide basename (narrow() would turn it into '?'), as for load_library_w.
-            const std::wstring dll = module_name_w(name);
-            if (!dll.empty())
-                if (void* h = find_loaded_bundled_module_w(dll)) return reinterpret_cast<HMODULE>(h);
+    if (!name) {
+        if (void* main = main_bundled_module()) {
+            SetLastError(ERROR_SUCCESS);
+            return reinterpret_cast<HMODULE>(main);
         }
+        return GetModuleHandleW(nullptr);
+    }
+    if (ascii_basename(name)) {
+        const std::string path = narrow(name);
+        if (HMODULE h = owned_handle(path)) return h;
+        const std::string dll = module_name(path);
+        if (!dll.empty())
+            if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
+    } else {
+        // Outside ASCII: by the wide basename (narrow() would turn it into '?'), as for load_library_w.
+        const std::wstring dll = module_name_w(name);
+        if (!dll.empty())
+            if (void* h = find_loaded_bundled_module_w(dll)) return reinterpret_cast<HMODULE>(h);
     }
     return GetModuleHandleW(name);
+}
+
+bool resolve_module_filename(HMODULE module, std::wstring& wide) {
+    if (!module) return bundled_module_path(nullptr, wide);
+    if (const Pseudo* p = pseudo(module)) {
+        wide.assign(p->dll.begin(), p->dll.end());
+        return true;
+    }
+    return bundled_module_path(module, wide);
+}
+
+template <typename CharT>
+DWORD copy_module_filename(const std::basic_string<CharT>& text, CharT* out, DWORD size) {
+    if (size == 0) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    if (!out) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    const size_t n = text.size();
+    if (n >= static_cast<size_t>(size)) {
+        const size_t copy = static_cast<size_t>(size) - 1;
+        if (copy) std::memcpy(out, text.data(), copy * sizeof(CharT));
+        out[copy] = 0;
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return size;
+    }
+    std::memcpy(out, text.data(), (n + 1) * sizeof(CharT));
+    SetLastError(ERROR_SUCCESS);
+    return static_cast<DWORD>(n);
+}
+
+DWORD WINAPI get_module_file_name_w(HMODULE module, LPWSTR filename, DWORD size) {
+    std::wstring wide;
+    if (!resolve_module_filename(module, wide)) return GetModuleFileNameW(module, filename, size);
+    return copy_module_filename(wide, filename, size);
+}
+
+DWORD WINAPI get_module_file_name_a(HMODULE module, LPSTR filename, DWORD size) {
+    std::wstring wide;
+    if (!resolve_module_filename(module, wide)) return GetModuleFileNameA(module, filename, size);
+    std::string ansi;
+    if (!wide.empty()) {
+        const int needed = WideCharToMultiByte(CP_ACP, 0, wide.data(), static_cast<int>(wide.size()), nullptr, 0,
+                                               nullptr, nullptr);
+        if (needed <= 0) return 0;
+        ansi.resize(static_cast<size_t>(needed));
+        WideCharToMultiByte(CP_ACP, 0, wide.data(), static_cast<int>(wide.size()), ansi.data(), needed, nullptr,
+                            nullptr);
+    }
+    return copy_module_filename(ansi, filename, size);
 }
 
 FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
@@ -300,6 +363,8 @@ BOOL WINAPI disable_thread_calls(HMODULE module) {
     {dll, "LoadLibraryExW", reinterpret_cast<void*>(&rt::shims::library_loader::load_library_ex_w)},                   \
     {dll, "GetModuleHandleA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_a)},               \
     {dll, "GetModuleHandleW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_w)},               \
+    {dll, "GetModuleFileNameA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_file_name_a)},          \
+    {dll, "GetModuleFileNameW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_file_name_w)},          \
     {dll, "GetProcAddress", reinterpret_cast<void*>(&rt::shims::library_loader::get_proc_address)},                    \
     {dll, "FreeLibrary", reinterpret_cast<void*>(&rt::shims::library_loader::free_library)},                           \
     {dll, "DisableThreadLibraryCalls", reinterpret_cast<void*>(&rt::shims::library_loader::disable_thread_calls)}

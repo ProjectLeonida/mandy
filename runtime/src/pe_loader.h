@@ -30,10 +30,12 @@ struct Module {
     std::string name;        // UTF-8 basename for diagnostics and traces, not a lookup key
     std::string narrow_key;  // legacy lower-case narrow basename; empty when it cannot round-trip
     std::filesystem::path path;
+    std::filesystem::path full_path;  // absolute path captured at map time, for GetModuleFileName*
     uint8_t* base = nullptr;
     uint64_t preferred_base = 0;
     uint32_t size = 0;
     uint32_t entry_rva = 0;
+    bool is_exe = false;
     bool relocated = false;
     bool initialised = false;
 
@@ -133,6 +135,8 @@ public:
     void* load_runtime_module_w(const std::wstring& basename, uint32_t flags, bool& handled);
     void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
     bool owns_module_handle(void* module_handle) const;
+    bool module_path(void* module_handle, std::wstring& out_path) const;
+    void* main_module_handle() const;
 
 private:
     void initialise(Module& m);

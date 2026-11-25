@@ -1046,6 +1046,14 @@ void* bundled_load_w(void* ctx, const std::wstring& basename, uint32_t flags, bo
     return static_cast<Loader*>(ctx)->load_runtime_module_w(basename, flags, handled);
 }
 
+bool bundled_module_path_op(void* ctx, void* module, std::wstring& path) {
+    return static_cast<Loader*>(ctx)->module_path(module, path);
+}
+
+void* bundled_main_module_op(void* ctx) {
+    return static_cast<Loader*>(ctx)->main_module_handle();
+}
+
 const shims::BundledModuleOps kBundledOps{
     &bundled_find_loaded,
     &bundled_load,
@@ -1053,6 +1061,8 @@ const shims::BundledModuleOps kBundledOps{
     &bundled_owns_handle,
     &bundled_find_loaded_w,
     &bundled_load_w,
+    &bundled_module_path_op,
+    &bundled_main_module_op,
 };
 
 // Marks what a run-time load maps as a dynamic load for as long as it is in scope (the caller holds the mutex).
@@ -1308,6 +1318,24 @@ bool Loader::owns_module_handle(void* module_handle) const {
     return false;
 }
 
+bool Loader::module_path(void* module_handle, std::wstring& out_path) const {
+    std::lock_guard lock(mutex_);
+    for (const Module* m : order_) {
+        if (module_handle ? (m->base == module_handle) : m->is_exe) {
+            out_path = m->full_path.native();
+            return true;
+        }
+    }
+    return false;
+}
+
+void* Loader::main_module_handle() const {
+    std::lock_guard lock(mutex_);
+    for (const Module* m : order_)
+        if (m->is_exe) return static_cast<void*>(m->base);
+    return nullptr;
+}
+
 // x64 has no frame-pointer chain to fall back on: without its .pdata registered, an exception raised in (or passing
 // through) a mapped image can't be dispatched past that frame, and the process dies. Images the system loader maps
 // are found through its own module list; ours are VirtualAlloc'd, so they are registered as dynamic function tables.
@@ -1415,6 +1443,12 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     m->name = name;
     m->narrow_key = narrow_key;
     m->path = path;
+    {
+        std::error_code ec;
+        const std::filesystem::path abs = std::filesystem::absolute(path, ec);
+        m->full_path = ec ? path : abs.lexically_normal();
+    }
+    m->is_exe = (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) == 0;
     m->preferred_base = oh.ImageBase;
     m->size = oh.SizeOfImage;
     m->entry_rva = oh.AddressOfEntryPoint;

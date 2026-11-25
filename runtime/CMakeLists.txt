@@ -1015,6 +1015,27 @@ if(BUILD_TESTING)
       COMMAND dll_thread_calls_test "$<TARGET_FILE:dll_thread_calls>"
     )
 
+    # GetModuleFileNameA/W and GetModuleHandleA/W(nullptr) for a mapped executable, bundled DLLs, and owned shims.
+    add_executable(library_loader_test
+      test/library_loader_test.cpp
+      src/pe_loader.cpp
+      shims/library_loader.cpp
+      shims/registry.cpp
+      shims/xmem.cpp
+    )
+    target_include_directories(library_loader_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/shims
+    )
+    target_compile_definitions(library_loader_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(library_loader_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(library_loader_test PRIVATE /OPT:NOREF)
+    target_link_libraries(library_loader_test PRIVATE psapi)
+    add_dependencies(library_loader_test tiny_exe tiny_dll gta6rt_tls_host)
+    add_test(NAME library_loader
+      COMMAND library_loader_test "$<TARGET_FILE:tiny_exe>" "$<TARGET_FILE:tiny_dll>"
+    )
+
     # The host GameInput path (docs/gameinput.md): mapped code that imports GameInputCreate from GameInput.dll, with no
     # GameInput shim linked. Needs the SDK's gameinput.lib and GameInput.h to build the fixture, and a GameInput.dll on
     # the machine to run (the test skips with 77 only when Windows cannot load GameInput.dll). No game files.
