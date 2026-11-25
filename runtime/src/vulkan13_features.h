@@ -18,6 +18,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -47,7 +48,8 @@ public:
     void query(VkPhysicalDevice physical, std::uint32_t api_version, PFN_vkGetPhysicalDeviceFeatures2 features2,
                PFN_vkEnumerateDeviceExtensionProperties enumerate_extensions) {
         core = api_version >= VK_API_VERSION_1_3;
-        pipeline_cache_control=false;enable_pipeline_cache_control=false;
+        pipeline_cache_control = false;
+        enable_pipeline_cache_control = false;
         dynamic_rendering = synchronization2 = subgroup_size_control = compute_full_subgroups = false;
         extended_dynamic_state = false;
         if (!features2) return;
@@ -59,15 +61,27 @@ public:
             pipeline_cache_control = f13.pipelineCreationCacheControl == VK_TRUE;
             synchronization2 = f13.synchronization2 == VK_TRUE;
             subgroup_size_control = f13.subgroupSizeControl == VK_TRUE;
-            compute_full_subgroups = f13.computeFullSubgroups == VK_TRUE;
+            compute_full_subgroups = subgroup_size_control && f13.computeFullSubgroups == VK_TRUE;
             extended_dynamic_state = true;  // core in 1.3, no feature bit
             return;
         }
         if (api_version < VK_API_VERSION_1_2 || !enumerate_extensions) return;
-        std::uint32_t count = 0;
-        enumerate_extensions(physical, nullptr, &count, nullptr);
-        std::vector<VkExtensionProperties> extensions(count);
-        enumerate_extensions(physical, nullptr, &count, extensions.data());
+        std::vector<VkExtensionProperties> extensions;
+        constexpr int kMaxEnumAttempts = 4;
+        VkResult enum_res = VK_ERROR_INITIALIZATION_FAILED;
+        for (int attempt = 0; attempt < kMaxEnumAttempts; ++attempt) {
+            std::uint32_t count = 0;
+            enum_res = enumerate_extensions(physical, nullptr, &count, nullptr);
+            if (enum_res != VK_SUCCESS || count == 0) return;
+            extensions.resize(count);
+            enum_res = enumerate_extensions(physical, nullptr, &count, extensions.data());
+            if (enum_res == VK_SUCCESS) {
+                extensions.resize(count < extensions.size() ? count : extensions.size());
+                break;
+            }
+            if (enum_res != VK_INCOMPLETE) return;
+        }
+        if (enum_res != VK_SUCCESS) return;
         bool has_dynamic_rendering = false, has_synchronization2 = false, has_eds = false, has_eds2 = false;
         bool has_subgroup_control = false;
         for (const auto& e : extensions) {
@@ -119,7 +133,7 @@ public:
             enable13_.pipelineCreationCacheControl = pipeline_cache_control && enable_pipeline_cache_control ? VK_TRUE : VK_FALSE;
             enable13_.synchronization2 = VK_TRUE;
             enable13_.subgroupSizeControl = subgroup_size_control ? VK_TRUE : VK_FALSE;
-            enable13_.computeFullSubgroups = compute_full_subgroups ? VK_TRUE : VK_FALSE;
+            enable13_.computeFullSubgroups = subgroup_size_control && compute_full_subgroups ? VK_TRUE : VK_FALSE;
             return &enable13_;
         }
         if (subgroup_size_control) {
@@ -175,9 +189,24 @@ private:
 // 1.3 core names (vkCmdPipelineBarrier2, vkCmdBeginRendering, vkCmdSetPrimitiveTopology, ...) and serves the enabled
 // extension's vkCmdPipelineBarrier2KHR, vkCmdSetPrimitiveTopologyEXT and the like, which have the same signatures.
 inline PFN_vkVoidFunction device_proc_or_khr(PFN_vkGetDeviceProcAddr get, VkDevice device, const char* name) {
+    if (!get || !name || !name[0]) return nullptr;
     if (const PFN_vkVoidFunction function = get(device, name)) return function;
-    if (const PFN_vkVoidFunction function = get(device, (std::string(name) + "KHR").c_str())) return function;
-    return get(device, (std::string(name) + "EXT").c_str());
+    const std::size_t len = std::strlen(name);
+    char stack_buf[256];
+    if (len + 4 <= sizeof(stack_buf)) {
+        std::memcpy(stack_buf, name, len);
+        std::memcpy(stack_buf + len, "KHR", 4);
+        if (const PFN_vkVoidFunction function = get(device, stack_buf)) return function;
+        std::memcpy(stack_buf + len, "EXT", 4);
+        return get(device, stack_buf);
+    }
+    std::string suffixed;
+    suffixed.reserve(len + 3);
+    suffixed.assign(name, len);
+    suffixed.append("KHR", 3);
+    if (const PFN_vkVoidFunction function = get(device, suffixed.c_str())) return function;
+    suffixed.replace(len, 3, "EXT", 3);
+    return get(device, suffixed.c_str());
 }
 
 } // namespace leonida

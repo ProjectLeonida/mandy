@@ -30,6 +30,11 @@ struct FakeDevice {
     VkBool32 eds2 = VK_FALSE;
     int features2_calls = 0;
     int enum_calls = 0;
+    VkResult count_result = VK_SUCCESS;
+    VkResult fill_result = VK_SUCCESS;
+    int incomplete_retries = 0;         // return VK_INCOMPLETE on fill this many times before succeeding
+    std::uint32_t count_override = 0;   // if non-zero on count query, report this count
+    bool short_fill = false;            // write fewer extensions than allocated and poison trailing slot
     std::vector<VkStructureType> queried_types;
 };
 
@@ -39,10 +44,33 @@ VKAPI_ATTR VkResult VKAPI_CALL fake_enumerate_extensions(
     VkPhysicalDevice, const char*, std::uint32_t* count, VkExtensionProperties* properties) {
     ++g_device->enum_calls;
     if (!properties) {
-        *count = static_cast<std::uint32_t>(g_device->extensions.size());
+        if (g_device->count_result != VK_SUCCESS) {
+            *count = 999999u;  // poisoned count that must not be trusted on error
+            return g_device->count_result;
+        }
+        *count = g_device->count_override
+                     ? g_device->count_override
+                     : static_cast<std::uint32_t>(g_device->extensions.size());
         return VK_SUCCESS;
     }
+    if (g_device->incomplete_retries > 0) {
+        --g_device->incomplete_retries;
+        *count = 0;
+        return VK_INCOMPLETE;
+    }
+    if (g_device->fill_result != VK_SUCCESS) {
+        return g_device->fill_result;
+    }
     const std::uint32_t n = static_cast<std::uint32_t>(g_device->extensions.size());
+    if (g_device->short_fill && *count >= 2 && n >= 2) {
+        // Only write the first entry and place the second required extension in the trailing slot beyond *count.
+        std::memset(&properties[0], 0, sizeof(properties[0]));
+        std::memcpy(properties[0].extensionName, g_device->extensions[0], std::strlen(g_device->extensions[0]));
+        std::memset(&properties[1], 0, sizeof(properties[1]));
+        std::memcpy(properties[1].extensionName, g_device->extensions[1], std::strlen(g_device->extensions[1]));
+        *count = 1;
+        return VK_SUCCESS;
+    }
     const std::uint32_t write = *count < n ? *count : n;
     for (std::uint32_t i = 0; i < write; ++i) {
         std::memset(&properties[i], 0, sizeof(properties[i]));
@@ -449,6 +477,103 @@ int main() {
         lookup.ext_name = nullptr;
         EXPECT(device_proc_or_khr(fake_get_device_proc, VK_NULL_HANDLE, "vkCmdBeginRendering") == nullptr);
         EXPECT(lookup.queries.size() == 3);
+
+        // Null callback, null name, and empty name return null without dereferencing.
+        lookup.queries.clear();
+        EXPECT(device_proc_or_khr(nullptr, VK_NULL_HANDLE, "vkCmdPipelineBarrier2") == nullptr);
+        EXPECT(device_proc_or_khr(fake_get_device_proc, VK_NULL_HANDLE, nullptr) == nullptr);
+        EXPECT(device_proc_or_khr(fake_get_device_proc, VK_NULL_HANDLE, "") == nullptr);
+        EXPECT(lookup.queries.empty());
+
+        // Long symbol name (> 256 bytes) exercises the heap fallback cleanly for KHR and EXT suffixes.
+        const std::string long_base(300, 'a');
+        const std::string long_khr = long_base + "KHR";
+        const std::string long_ext = long_base + "EXT";
+        lookup.core_name = nullptr;
+        lookup.khr_name = long_khr.c_str();
+        lookup.ext_name = nullptr;
+        lookup.queries.clear();
+        EXPECT(device_proc_or_khr(fake_get_device_proc, VK_NULL_HANDLE, long_base.c_str()) == stub_khr);
+        EXPECT(lookup.queries.size() == 2 && lookup.queries[1] == long_khr);
+
+        lookup.khr_name = nullptr;
+        lookup.ext_name = long_ext.c_str();
+        lookup.queries.clear();
+        EXPECT(device_proc_or_khr(fake_get_device_proc, VK_NULL_HANDLE, long_base.c_str()) == stub_ext);
+        EXPECT(lookup.queries.size() == 3 && lookup.queries[2] == long_ext);
+    }
+
+    // Vulkan 1.2 extension enumeration error handling: count failure, zero count, fill failure, VK_INCOMPLETE retry,
+    // persistent VK_INCOMPLETE termination, and short fill truncation.
+    {
+        // 1. Count query returns an error: must not allocate or issue a fill call.
+        FakeDevice dev;
+        dev.extensions = {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME};
+        dev.dynamic_rendering = dev.synchronization2 = VK_TRUE;
+        dev.count_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        g_device = &dev;
+        Vulkan13Features v13;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, fake_enumerate_extensions);
+        EXPECT(!v13.usable() && dev.enum_calls == 1 && dev.features2_calls == 0);
+
+        // 2. Zero extensions reported: returns after the count query without a redundant fill call.
+        dev = FakeDevice{};
+        dev.dynamic_rendering = dev.synchronization2 = VK_TRUE;
+        g_device = &dev;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, fake_enumerate_extensions);
+        EXPECT(!v13.usable() && dev.enum_calls == 1 && dev.features2_calls == 0);
+
+        // 3. Fill query returns an error: must not inspect extension entries or query features2.
+        dev = FakeDevice{};
+        dev.extensions = {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME};
+        dev.dynamic_rendering = dev.synchronization2 = VK_TRUE;
+        dev.fill_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        g_device = &dev;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, fake_enumerate_extensions);
+        EXPECT(!v13.usable() && dev.enum_calls == 2 && dev.features2_calls == 0);
+
+        // 4. Transient VK_INCOMPLETE on fill retries and succeeds on the next attempt.
+        dev = FakeDevice{};
+        dev.extensions = {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME};
+        dev.dynamic_rendering = dev.synchronization2 = VK_TRUE;
+        dev.incomplete_retries = 1;
+        g_device = &dev;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, fake_enumerate_extensions);
+        EXPECT(v13.usable() && dev.enum_calls == 4 && dev.features2_calls == 1);
+
+        // 5. Persistent VK_INCOMPLETE stops after bounded attempts without querying features2.
+        dev = FakeDevice{};
+        dev.extensions = {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME};
+        dev.dynamic_rendering = dev.synchronization2 = VK_TRUE;
+        dev.incomplete_retries = 10;
+        g_device = &dev;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, fake_enumerate_extensions);
+        EXPECT(!v13.usable() && dev.enum_calls == 8 && dev.features2_calls == 0);
+
+        // 6. Short fill (driver writes fewer properties than count) ignores trailing unwritten slots.
+        dev = FakeDevice{};
+        dev.extensions = {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME};
+        dev.dynamic_rendering = dev.synchronization2 = VK_TRUE;
+        dev.short_fill = true;
+        g_device = &dev;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, fake_enumerate_extensions);
+        EXPECT(!v13.usable() && dev.enum_calls == 2 && dev.features2_calls == 0);
+    }
+
+    // Vulkan 1.3 gates compute_full_subgroups on subgroup_size_control, matching Vulkan 1.2.
+    {
+        FakeDevice dev;
+        dev.dynamic_rendering = VK_TRUE;
+        dev.synchronization2 = VK_TRUE;
+        dev.subgroup_size_control = VK_FALSE;
+        dev.compute_full_subgroups = VK_TRUE;
+        g_device = &dev;
+        Vulkan13Features v13;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_3, fake_get_features2, nullptr);
+        EXPECT(v13.usable() && !v13.subgroup_size_control && !v13.compute_full_subgroups);
+        void* head = v13.enable(nullptr);
+        const auto* enable13 = static_cast<const VkPhysicalDeviceVulkan13Features*>(head);
+        EXPECT(enable13->subgroupSizeControl == VK_FALSE && enable13->computeFullSubgroups == VK_FALSE);
     }
 
     std::printf("vulkan13_features: all checks passed\n");
