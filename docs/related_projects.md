@@ -40,6 +40,12 @@ specification. Do not paste even a small function "to save time".
 
 <https://github.com/realdody/americas-recomp>
 
+> **Availability (checked 24 November 2026):** the repository, its `xbox-series` branch and its issue #179 return
+> 404, so they are not publicly reachable at this address. The cause is not confirmed (deleted, made private, renamed
+> or moved). Links to it in [d3d12_vulkan.md](d3d12_vulkan.md), [d3d12_command_objects.md](d3d12_command_objects.md) and
+> [shader_validation.md](shader_validation.md) may not open, and the licence and `REUSE.toml` details below are as this page
+> recorded them, not re-checked. The rule below is unchanged.
+
 A **GPL-2.0-only** fork of [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5), on its `xbox-series` branch. It
 recompiles the same Xbox Series shaders and has run the package's DLLs against a PC D3D12 device behind an Xbox-ABI
 proxy. Since 2026-11-22 its pull requests are limited to collaborators and its README points contributors here.
@@ -79,32 +85,23 @@ fix should go upstream, not into a copy.
 
 ## meetox80/6stars
 
-<https://github.com/meetox80/6stars> — a macOS Swift/Metal engine that renders the world out of RPF9,
-with a Swift `RPFKit` format library and 44 Python research scripts. Independent work: it likewise
-does not decode the TOC.
-
-**Licence: none.** The repository has no `LICENSE` file (GitHub reports `license: null`); only the
-vendored cimgui/imgui carry MIT. With no grant, default copyright applies and the project is
-**all rights reserved** — stricter than PercyStar. **No 6stars code, comment, identifier or table may
-be copied into Leonida.**
-
-**What we use it for:** corroboration and a small number of hypotheses. As an independent reading of
-the same formats it matches our `CEntityDef` member hashes (9/9), the PRD0 header, the navmesh tile
-header, the meshlet group header and the PSIN/LSCH field layout. Its stream-role predicates and
-navmesh surface bits are recorded as hypotheses and tested from our own package, never copied.
-Where it disagrees with us (ETPF format and tile mode, the RDS5 codec field, `atArray` type `0x5C`,
-PSO member hashing) our measurements are the validated ones.
 <https://github.com/meetox80/6stars>
 
-A macOS Swift/Metal engine that reads the world from RPF9, with its own archive index and format readers.
+A macOS Swift/Metal engine that renders the world out of RPF9, with its own archive index, a Swift `RPFKit` format
+library and 44 Python research scripts. Independent work: it likewise does not decode the TOC.
 
-**Licence: none.** There is no `LICENSE` file and GitHub reports no licence, so all rights are reserved.
-**No 6stars code, comments, identifiers or tables may be copied into Leonida.**
+**Licence: none.** The repository has no `LICENSE` file (GitHub reports `license: null`); only the vendored
+cimgui/imgui carry MIT. With no grant, default copyright applies and the project is **all rights reserved** —
+stricter than PercyStar. **No 6stars code, comments, identifiers or tables may be copied into Leonida.**
 
-**What we use it for:** corroboration. Its RPF9 stream-boundary predicate and PRD0 member type codes were
+**What we use it for:** corroboration and a small number of hypotheses. As an independent reading of the same formats
+it matches our `CEntityDef` member hashes (9/9), the PRD0 header, the navmesh tile header, the meshlet group header
+and the PSIN/LSCH field layout. Its stream-role predicates and navmesh surface bits are recorded as hypotheses and
+tested from our own package, never copied. Its RPF9 stream-boundary predicate and PRD0 member type codes were
 re-measured against this package before entering [rpf.md](rpf.md) and [world.md](world.md); its navmesh
-road/pavement bit labels did not reproduce and are not used. The navmesh polygon `+4` packing it reads is the one
-our decoder already validates ([navmesh.md](navmesh.md)).
+road/pavement bit labels did not reproduce and are not used. The navmesh polygon `+4` packing it reads is the one our
+decoder already validates ([navmesh.md](navmesh.md)). Where it disagrees with us (ETPF format and tile mode, the RDS5
+codec field, `atArray` type `0x5C`, PSO member hashing) our measurements are the validated ones.
 
 ## p-portela/SCARAB
 

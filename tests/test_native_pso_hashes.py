@@ -1,4 +1,6 @@
 """tools/native_pso_hashes.py on hand-built DXBC containers and indexes: no game data."""
+import contextlib
+import io
 import json
 import os
 import struct
@@ -125,6 +127,13 @@ class NativePsoHashesTest(unittest.TestCase):
     def test_no_index(self):
         self.assertEqual(tool.main(["x", self.dxbc, self.spirv]), 1)
         self.assertEqual(tool.main(["x"]), 2)
+
+    def test_help_exits_zero(self):
+        for flag in ("-h", "--help"):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(tool.main(["x", flag]), 0)
+            self.assertIn("native_hashes.txt", out.getvalue())
 
     def test_a_shared_digest_requires_the_same_stage(self):
         shared = container(bytes([9]) * 16)

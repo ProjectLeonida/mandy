@@ -96,6 +96,9 @@ def write(spirv: str, table: dict) -> str:
 
 
 def main(argv) -> int:
+    if argv[1:] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
     if len(argv) != 3:
         print(__doc__.strip().splitlines()[0], file=sys.stderr)
         print("usage: native_pso_hashes.py <dxbc dir> <spirv dir>", file=sys.stderr)
@@ -112,4 +115,8 @@ def main(argv) -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main(sys.argv))
