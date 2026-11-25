@@ -215,7 +215,7 @@ def parse(blob, schema=False):
         "error": "",
     }
     structs = enums = None
-    lsch_seen = lenm_seen = False
+    lsns_seen = lsch_seen = lenm_seen = False
     lsch_error = lenm_error = ""
     if first < HEADER or first > len(blob):
         record["error"] = f"first section offset {first} is outside the file"
@@ -251,7 +251,8 @@ def parse(blob, schema=False):
             if record["checksum_size"] is None:
                 record["checksum_size"] = section["checksum_size"]
                 record["checksum"] = section["checksum"]
-        elif tag == b"LSNS":
+        elif tag == b"LSNS" and not lsns_seen:
+            lsns_seen = True
             try:
                 blocks = decode_lsns(blob[payload_off:offset + size])
             except ValueError as e:
@@ -323,7 +324,7 @@ def input_paths(src):
         yield src
         return
     for name in sorted(os.listdir(src)):
-        if not name.endswith(".bin"):
+        if not name.lower().endswith(".bin"):
             continue
         path = os.path.join(src, name)
         if os.path.isfile(path):
@@ -400,13 +401,13 @@ def count(text):
     return value
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description="Index PSIN metadata containers.")
     ap.add_argument("src", help="PSIN file or directory of carved .bin streams")
     ap.add_argument("--json", action="store_true", help="write records and summary as JSON")
     ap.add_argument("--schema", action="store_true", help="include the decoded LSCH structs and LENM enums")
     ap.add_argument("--limit", type=count, help="stop after this many PSIN files")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     if not os.path.exists(a.src):   # files_in took any non-file for a folder: a typo ended in a traceback
         print(f"ERROR: {a.src}: no such file or folder", file=sys.stderr)

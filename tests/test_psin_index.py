@@ -195,6 +195,23 @@ class TestLsns(unittest.TestCase):
         self.assertEqual(summary["lsns_kinds"], {"0x101": 2, "0x11c": 1})
         self.assertEqual((summary["lsns_decoded"], summary["lsns_records"], summary["lsns_errors"]), (2, 4, 0))
 
+    def test_first_lsns_error_is_not_overwritten_by_duplicate_section(self):
+        record = P.parse(make_psin([("LSNS", b"\x01"), ("LSNS", make_lsns([(0x101, bytes(16))]))]))
+        self.assertIsNone(record["lsns_blocks"])
+        self.assertIsNone(record["lsns_records"])
+        self.assertIn("shorter than", record["lsns_error"])
+        summary = P.summarize([record])
+        self.assertEqual((summary["lsns_decoded"], summary["lsns_errors"], summary["lsns_kinds"]), (0, 1, {}))
+
+    def test_duplicate_valid_lsns_keeps_first_and_consistent_summary(self):
+        first = make_lsns([(0x101, bytes(16)), (0x102, bytes(32))])
+        second = make_lsns([(0x201, bytes(16))])
+        record = P.parse(make_psin([("LSNS", first), ("LSNS", second)]))
+        self.assertEqual((record["lsns_blocks"], record["lsns_records"]), (2, 3))
+        summary = P.summarize([record])
+        self.assertEqual(summary["lsns_records"], 3)
+        self.assertEqual(summary["lsns_kinds"], {"0x101": 1, "0x102": 1})
+
 
 class TestSchema(unittest.TestCase):
     def test_lsch_layout(self):
@@ -404,6 +421,14 @@ class TestCli(unittest.TestCase):
                 code, err = run_main([tmp])
             self.assertEqual(code, 2)
             self.assertIn("Permission denied", err)
+
+    def test_uppercase_bin_extension_is_indexed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("00000001.BIN", "00000002.Bin"):
+                with open(os.path.join(tmp, name), "wb") as f:
+                    f.write(make_psin([("LSCH", b"")]))
+            records = P.collect(tmp)
+        self.assertEqual([r["file"] for r in records], ["00000001.BIN", "00000002.Bin"])
 
 
 def run_main(argv):
