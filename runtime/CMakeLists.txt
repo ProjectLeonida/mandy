@@ -765,16 +765,6 @@ if(BUILD_TESTING)
     endif()
     target_link_libraries(title_window_test PRIVATE user32)
     add_test(NAME title_window COMMAND title_window_test)
-
-    # LEONIDA_TITLE_HUD's counters in the title bar of another thread's window (shims/title_hud.h): user32 and DXGI.
-    add_executable(title_hud_test test/title_hud_test.cpp)
-    target_include_directories(title_hud_test PRIVATE shims)
-    target_compile_definitions(title_hud_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-    if(MSVC)
-      target_compile_options(title_hud_test PRIVATE /W4 /permissive- /utf-8)
-    endif()
-    target_link_libraries(title_hud_test PRIVATE Vulkan::Headers user32 psapi)
-    add_test(NAME title_hud COMMAND title_hud_test)
   endif()
 
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
@@ -1845,6 +1835,18 @@ if(TARGET Vulkan::Headers)
   add_executable(vulkan_device_fault_test test/vulkan_device_fault_test.cpp)
   target_link_libraries(vulkan_device_fault_test PRIVATE Vulkan::Headers)
   add_test(NAME vulkan_device_fault COMMAND vulkan_device_fault_test)
+
+  # The title HUD reads the memory probe header, which includes Vulkan types.
+  if(WIN32 AND BUILD_TESTING)
+    add_executable(title_hud_test test/title_hud_test.cpp)
+    target_include_directories(title_hud_test PRIVATE shims)
+    target_compile_definitions(title_hud_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    if(MSVC)
+      target_compile_options(title_hud_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    target_link_libraries(title_hud_test PRIVATE Vulkan::Headers user32 psapi)
+    add_test(NAME title_hud COMMAND title_hud_test)
+  endif()
 
   foreach(tool vk_harness vk_ps_sweep vk_texture_test vk_sampler_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
           vk_bindless_test vk_image_fuzz vk_descriptor_bench depth24_convert_test vk_predicate_capture_test vk_predicated_copy_test
