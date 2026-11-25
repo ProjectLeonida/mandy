@@ -470,9 +470,28 @@ int main() {
             return SUCCEEDED(queue->Signal(fence.p, ++signalled));
         };
 
+        // The capture files on disk so far (LEONIDA_CAPTURE_LIMIT is 4, so at most frames 1 to 4).
+        const auto capture_files = [&]() -> std::uint64_t {
+            std::uint64_t files = 0;
+            for (int i = 1; i <= 4; ++i) {
+                wchar_t path[MAX_PATH + 32]{};
+                swprintf_s(path, L"%s\\frame_%05d.ppm", capture_dir, i);
+                if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) ++files;
+            }
+            return files;
+        };
+
         // Every present is counted unless the surface reported it out of date, which the driver may do around a
-        // resize; the double counts those.
-        for (int i = 0; i < 60; ++i) EXPECT(frame(1));
+        // resize; the double counts those. Each present due a capture file has written it by the time it returns,
+        // with the presenter and the device still alive: a run ends in that state (gta6rt's ExitProcess destroys
+        // neither), so a file left for the next present or the presenter's destructor is lost, and N presents
+        // gave N-1 files. Checked with the other capture checks below, after the files are removed.
+        std::uint64_t capture_late = 0;  // the first present whose file was not on disk when it returned
+        for (int i = 0; i < 60; ++i) {
+            EXPECT(frame(1));
+            const std::uint64_t shown = presenter->presented();
+            if (capture_dir[0] && !capture_late && shown <= 4 && capture_files() != shown) capture_late = shown;
+        }
         EXPECT(presenter->presented() == 60 - driver::out_of_date);
         const VkExtent2D first = presenter->extent();
         EXPECT(first.width == width && first.height == height);
@@ -685,10 +704,14 @@ int main() {
                     std::fabs(b - (red ? 0 : 230)) <= 3.0) ++matching;
             }
             std::printf("capture: %d correct images, %d index rows, %d matching frame colours\n", exact_files, lines, matching);
+            if (capture_late)
+                std::printf("capture: the file of frame %llu was not on disk when its present returned\n",
+                            static_cast<unsigned long long>(capture_late));
             index.close();
             DeleteFileA((std::string(narrow) + "\\index.txt").c_str());
             RemoveDirectoryA(narrow);
             EXPECT(exact_files == 4 && lines == 4 && matching == 4);
+            EXPECT(!capture_late);
         }
 
         presenter.reset();  // before the device's queue and resources go
