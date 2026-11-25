@@ -56,9 +56,9 @@ This page collects the setup steps and the problems testers have run into so far
 
 ## Build the test programs
 
-On a Windows runtime build with Vulkan enabled, CMake only registers `d3d12_translated_draw`, `d3d12_m2_textured`,
-`d3d12_m2_formats`, `d3d12_m3_frame`, `d3d12_m4_compute` and `d3d12_buffer_uav` when it finds `llvm-mc`,
-`spirv-as` and `spirv-val`. It registers `d3d12_subgroup` only when it finds `llvm-mc` and `glslangValidator`.
+On a Windows runtime build with Vulkan enabled, CMake only registers `d3d12_translated_draw`, `d3d12_rect_list`,
+`d3d12_quad_index`, `d3d12_m2_textured`, `d3d12_m2_formats`, `d3d12_m3_frame`, `d3d12_m4_compute` and
+`d3d12_buffer_uav` when it finds `llvm-mc`, `spirv-as` and `spirv-val`. It registers `d3d12_subgroup` only when it finds `llvm-mc` and `glslangValidator`.
 Without `glslangValidator`, other tests are also omitted, including `d3d12_compute`, `d3d12_draw`,
 `d3d12_set0_compute` and `d3d12_mesh`; some registered tests run only part of their checks. These tests can be
 **absent**, not reported as skipped, when their build prerequisites are missing, so a passing `ctest` percentage
@@ -172,6 +172,25 @@ python -I runtime/test/shaders/check.py <out dir> <folder with the test programs
 ```
 
 For D3D12/runtime tests, `LEONIDA_VK_VALIDATION=1` enables `VK_LAYER_KHRONOS_validation`. When running with validation, set `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` if MSI Afterburner (RivaTuner) or OBS is installed: their overlay layers can add unsupported swapchain usage, and in an elevated (administrator) terminal the loader ignores `VK_LOADER_LAYERS_DISABLE=~implicit~` (see "Known problems").
+
+On Windows, `run_gpu_tests.py` assembles and translates the D3D-78 fixture and runs the UAV readback and WARP
+comparison from the same build folder. Use `--filter cs_texture_uav` to run only this case:
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = "1"
+python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_texture_uav
+```
+
+Use the actual configuration subfolder for the executables with a multi-config generator. The native Windows
+case reports SKIP without WARP or a sufficiently capable Vulkan device; failed translation, a missing test
+executable on Windows, and readback mismatches fail the runner. Devices without sliced 3D views still run the 1D,
+array and whole-mip cases and check that partial views are refused.
+
+CTest runs the same D3D-78 descriptor creation, copy, range/refusal and clear checks with `--descriptors-only`.
+That mode requires Vulkan, but not a translated shader or WARP. The GPU runner still exercises dispatch and readback.
+
+Use `--filter cs_imgload_mip` to check 2D `image_load_mip` on FLOAT (UNORM), UINT and SINT sampled views with
+both full-width and D16 loads; mip 0 contains decoy data and mip 1 holds the expected texels.
 
 `vk_compute_test`, `vk_bindless_test` and `vk_image_fuzz` read `LEONIDA_VK_VALIDATION` too (`vk_compute_test`
 through `runtime/test/vk_validation.h`): each validation message goes to stderr and a validation error makes the
@@ -383,6 +402,28 @@ subgroups in another order print `not available`, a skip. Measured
 on an Apple M3 Max (MoltenVK 1.4.2 and 1.4.3): 17 workgroup shapes from 1 to 1024 invocations, partial last
 subgroups, with and without full subgroups and register pressure, all 32 lanes in order. A device whose default
 isn't the requested size still prints `not available`, and those tests skip.
+
+`cs_w32_salu_ext` runs 38 scalar ALU ops that no other fixture runs: `s_sub_i32`, `s_andn2_b32`, `s_orn2_b32`,
+`s_xor_b32`, `s_ashr_i32`, `s_mul_hi_u32`, `s_lshl3_add_u32`, `s_lshl4_add_u32`, `s_pack_ll_b32_b16`,
+`s_pack_hh_b32_b16`, `s_abs_i32`, `s_bcnt0_i32_b32`, `s_bitset0_b32`, `s_bitset1_b32`, `s_brev_b32`, `s_flbit_i32`,
+`s_flbit_i32_b32`, `s_sext_i32_i8`, the six `s_cmp_*_i32`, `s_cmp_gt_u32`, `s_cmp_le_u32`, `s_bitcmp0_b32`,
+`s_bitcmp1_b32`, `s_addk_i32`, `s_mulk_i32`, `s_cmovk_i32`, `s_ashr_i64`, `s_lshl_b64`, `s_lshr_b64`,
+`s_bcnt0_i32_b64`, `s_bitset0_b64`, `s_cmov_b64` and `s_ff0_i32_b64`. Its sixteen operand words arrive in `s4..s19`
+through `VKC_SGPRS`, so each op reaches the driver as SPIR-V: a scalar op on literals is folded by the translator
+(the "Chained scalar constant folding" row of [design.md](design.md)) and only its result is stored. One thread stores
+every destination and four words of SCC bits: SCC after each op that writes it, each run on operands that set it
+and on operands that clear it; each compare and bit test both ways, the signed and the unsigned ones on words that
+tell the two apart; and SCC after each op that must keep it, set to 1 and to 0 in turn before them. The 73 expected
+words are literals in `check.py`, derived in the fixture's header, and `tests/test_gpu_salu_ext.py` recomputes them
+from the fixture's own instruction lines with the reference of `tools/salu_diff.py`, the model that was compared
+with hardware. Both GPU runners compare the whole 80-word heap, the untouched fill after the results included. Run
+it alone with `python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_w32_salu_ext --require-pass`.
+On an RTX 4070 Ti (NVIDIA 620.70.06, Linux) and on llvmpipe (Mesa 26.2.6, LLVM 23.1.4) all 80 words match. Nine
+translator rules broken one at a time each failed it on both: `s_ashr_i32` shifting in zeros (word 8),
+`s_lshlN_add_u32` taking SCC from the add's carry alone (word 69), `s_abs_i32` negating (word 17), `s_mulk_i32` and
+`s_addk_i32` zero-extending their immediate (words 37 and 21), `s_cmovk_i32` ignoring SCC (word 38), the 64-bit
+shifts taking their count modulo 32 and `s_ashr_i64` shifting in zeros (word 51), and the 64-bit shifts taking SCC
+from the low dword alone (word 72).
 
 `cs_w32_shift64` checks `v_lshlrev_b64`, `v_lshrrev_b64` and `v_ashrrev_i64` with 64 memory-fed cases:
 eight boundary values crossed with counts 0, 1, 31, 32, 33, 63, 64 and 65. The expected values come from Python
