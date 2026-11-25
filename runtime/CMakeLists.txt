@@ -765,6 +765,7 @@ if(BUILD_TESTING)
     endif()
     target_link_libraries(title_window_test PRIVATE user32)
     add_test(NAME title_window COMMAND title_window_test)
+    set_tests_properties(title_window PROPERTIES SKIP_RETURN_CODE 77)  # no interactive window station (SSH, service)
 
     # LEONIDA_TITLE_HUD's counters in the title bar of another thread's window (shims/title_hud.h): user32 and DXGI.
     add_executable(title_hud_test test/title_hud_test.cpp)

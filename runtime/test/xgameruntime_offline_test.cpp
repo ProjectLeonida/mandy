@@ -15,6 +15,7 @@
 #include <XTaskQueue.h>
 
 #include "shims.h"
+#include "window_station.h"
 
 namespace rt::shims {
 long xgameruntime_offline_game_events();
@@ -379,13 +380,20 @@ int main() {
           "XLaunchUri is not available offline");
     check(at<AcquireDeferral>(launcher, 4)(launcher, nullptr) == E_POINTER,
           "XDisplayAcquireTimeoutDeferral rejects null out pointer");
-    check(at<AcquireDeferral>(launcher, 4)(launcher, &deferral) == S_OK && deferral != nullptr,
-          "XDisplayAcquireTimeoutDeferral acquires a display power request handle");
-    void* second = nullptr;
-    check(at<AcquireDeferral>(launcher, 4)(launcher, &second) == S_OK && second && second != deferral,
-          "concurrent display deferrals have distinct handles");
-    at<CloseDeferral>(launcher, 5)(launcher, second);
-    at<CloseDeferral>(launcher, 5)(launcher, deferral);
+    const HRESULT acquired = at<AcquireDeferral>(launcher, 4)(launcher, &deferral);
+    if (acquired == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) && !has_interactive_window_station()) {
+        // No desktop to keep on: the request is refused, and the shim passes that on with nothing to close.
+        check(deferral == nullptr, "a refused display deferral leaves no handle");
+        std::printf("SKIP display deferral handles: no interactive window station (an SSH or service session)\n");
+    } else {
+        check(acquired == S_OK && deferral != nullptr,
+              "XDisplayAcquireTimeoutDeferral acquires a display power request handle");
+        void* second = nullptr;
+        check(at<AcquireDeferral>(launcher, 4)(launcher, &second) == S_OK && second && second != deferral,
+              "concurrent display deferrals have distinct handles");
+        at<CloseDeferral>(launcher, 5)(launcher, second);
+        at<CloseDeferral>(launcher, 5)(launcher, deferral);
+    }
     at<CloseDeferral>(launcher, 5)(launcher, nullptr);
     check(true, "XDisplayCloseTimeoutDeferralHandle closes handle and ignores null");
     GUID other = kLauncherClass;
