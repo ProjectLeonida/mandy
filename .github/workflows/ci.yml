@@ -163,7 +163,10 @@ jobs:
     needs: change-scope
     if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    # The Windows leg does not fit in 10 minutes. On windows-latest, 14 of 23 runs on 24 November 2026 were cancelled
+    # at 10, each time with test_mutations.py the only file still running (250-381 s there, 25-42 s on Linux), and the
+    # 9 that finished spent 374-577 s in the test step. The Linux leg, the one pull requests run, takes 3-5 minutes.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 20 || 10 }}
     strategy:
       matrix:
         # Pull requests run the Linux leg only: in 914 sampled pull request runs the Windows leg never failed while the
