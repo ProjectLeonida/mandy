@@ -166,8 +166,10 @@ class FoldingVolumeTests(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.p("reports"))), [])
 
     def test_a_folder_that_does_not_exist_is_not_created(self):
-        self.assertFalse(report_paths.same_name_on_folding_volume(self.p("missing", "R.json"),
-                                                                  self.p("missing", "r.json")))
+        # The answer still follows the volume: a caller can ask before the writer creates the output parent.
+        self.assertEqual(report_paths.same_name_on_folding_volume(self.p("missing", "R.json"),
+                                                                  self.p("missing", "r.json")),
+                         self.volume_folds_case())
         self.assertFalse(os.path.exists(self.p("missing")))
 
     def test_same_report_path_asks_the_volume_when_the_name_rules_disagree(self):

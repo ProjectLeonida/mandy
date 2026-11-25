@@ -59,9 +59,21 @@ def same_name_on_folding_volume(first, second):
     os.path.normcase folds case only on Windows and the `pathconf` probe above answers only on macOS, so a Linux
     mount that ignores case (vfat, exFAT, CIFS) would pass `R.json` and `r.json` as two reports and let the second
     one overwrite the first. Ask the volume itself: create one spelling in a scratch folder beside the reports and
-    look for the other. Names that differ by more than case are never one file, so that costs nothing.
+    look for the other. When the report folder does not exist yet, the scratch folder goes beside the nearest
+    existing parent instead; the report folder is not created. Names that differ by more than case are never one
+    file, so that costs nothing.
     """
     return _same_resolved_name(os.path.realpath(first), os.path.realpath(second))
+
+
+def _existing_directory(path):
+    """The nearest existing directory at or above `path`, or None when there is none."""
+    while path and not os.path.isdir(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+    return path or None
 
 
 def _same_resolved_name(first, second):
@@ -73,7 +85,18 @@ def _same_resolved_name(first, second):
     try:
         if not os.path.samefile(first_dir, second_dir):
             return False
-        with tempfile.TemporaryDirectory(prefix=".leonida-report-", dir=first_dir) as probe:
+        probe_dir = first_dir
+    except OSError:
+        # A writer commonly asks before it creates the output folder. Missing folders that have the same spelling
+        # (or one differing only by case) can still be one folder on a folding volume; probe beside their nearest
+        # existing parent without creating the output folder itself.
+        if first_dir != second_dir and first_dir.casefold() != second_dir.casefold():
+            return False
+        probe_dir = _existing_directory(first_dir)
+        if probe_dir is None:
+            return False
+    try:
+        with tempfile.TemporaryDirectory(prefix=".leonida-report-", dir=probe_dir) as probe:
             with open(os.path.join(probe, first_name), "xb"):
                 return os.path.exists(os.path.join(probe, second_name))
     except OSError:
