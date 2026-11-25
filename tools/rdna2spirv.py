@@ -6397,6 +6397,25 @@ class Gen:
         self.emit(f"{z} = OpSelect %uint {any_} {self.cu(1)} {self.cu(0)}")
         self.emit(f"OpStore %scc {z}")
 
+    def _wqm_dst_is_lane_mask(self, d):
+        """True when a plain-data s_wqm write to `d` produces a register tracked as a lane mask."""
+        if d["k"] != "special":
+            return False
+        t = d.get("t", "")
+        if t.startswith("exec"):
+            return True
+        if t not in ("vcc", "vcc_lo", "vcc_hi") or self.cur_ins is None:
+            return False
+        st = dict(self.cur_masks)
+        for x in self.cur_ins["args"][1:]:
+            if x.get("k") == "sgpr" and x.get("n", 1) == 1:
+                r = x["r"]
+                if r not in st and self.sgpr_imm.get(r) in (0, 0xFFFFFFFF):
+                    st[r] = lane_masks.EITHER
+        lane_masks.step(st, self.cur_ins, self.wave64)
+        key = "vcc_hi" if (not self.wave64 and t == "vcc_hi") else "vcc"
+        return st.get(key) in lane_masks.MASK_KINDS
+
     def wqm(self, op, a):
         """s_wqm_b32 / s_wqm_b64: D = every quad (4 consecutive bits) of S0 that has a bit set becomes 1111;
         SCC = D != 0. A lane mask is one bit per lane here (this lane's), so the quad's bits are gathered with
@@ -6416,6 +6435,13 @@ class Gen:
             words = [self.load_reg("sgpr", src["r"]), self.load_reg("sgpr", src["r"] + 1)]
         elif op.endswith("b64") and src["k"] == "imm":
             words = [self.cu(src["v"] & 0xFFFFFFFF), self.cu((src["v"] >> 32) & 0xFFFFFFFF)]
+        elif op.endswith("b64") and src["k"] == "special" and src.get("t") == "vcc":
+            lo, hi = self.tmp(), self.tmp()
+            self.emit(f"{lo} = OpLoad %uint %vcc")
+            self.emit(f"{hi} = OpLoad %uint %vcc_hi")
+            words = [lo, hi]
+        elif op.endswith("b64") and src["k"] == "special" and src.get("t") == "null":
+            words = [self.cu(0), self.cu(0)]
         else:
             words = [self.src_u(src)] + ([self.cu(0)] if op.endswith("b64") else [])
         res = [self.wqm_word(w) for w in words]
@@ -6424,21 +6450,29 @@ class Gen:
             self.store_reg("sgpr", d["r"], res[0])
             if len(res) == 2:
                 self.store_reg("sgpr", d["r"] + 1, res[1])
-        elif not self.wave64 and d["k"] == "special" and d.get("t") == "vcc_hi":
-            self.emit(f"OpStore %vcc_hi {res[0]}")
+        elif d["k"] == "special" and d.get("t") == "null":
+            pass
+        elif d["k"] == "special" and d.get("t") == "m0":
+            self.emit(f"OpStore %m0 {res[0]}")
+        elif d["k"] == "special" and d.get("t") in ("vcc", "vcc_lo", "vcc_hi") and not self._wqm_dst_is_lane_mask(d):
+            if d["t"] == "vcc_hi":
+                self.emit(f"OpStore %vcc_hi {res[0]}")
+            else:
+                self.emit(f"OpStore %vcc {res[0]}")
+                if len(res) == 2:
+                    self.emit(f"OpStore %vcc_hi {res[1]}")
         else:
-            # EXEC / VCC filled from data: this lane takes its own bit of the result.
+            # EXEC / mask-valued VCC filled from data: this lane takes its own bit of the result.
             lane = self.wave_lane()
-            sh, b, pick = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
             word = res[0]
             if len(res) == 2:
                 hi, word = self.tmp(), self.tmp()
                 self.emit(f"{hi} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
                 self.emit(f"{word} = OpSelect %uint {hi} {res[1]} {res[0]}")
-            self.emit(f"{b} = OpBitFieldUExtract %uint {word} {sh} {self.cu(1)}")
-            self.emit(f"{pick} = OpSelect %uint {self.tmp_bool_nz(b)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+            pick = self._scalar_word_lane_bit(word, lane)
             self.put_mask(d, pick, half)
+            if self.wave64 and d["k"] == "special" and d.get("t") == "vcc_hi":
+                self.emit(f"OpStore %vcc_hi {res[0]}")
         nz = res[0]
         if len(res) == 2:
             nz = self.tmp()
