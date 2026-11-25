@@ -132,56 +132,83 @@ void fixed_cases() {
     check(bound.longest() == 0x40 && at(bound, 0x20040) == 0, "re-registering replaces the size");
     bound.erase(0x20000, 2);
     check(bound.longest() == 0 && bound.size() == 0, "an empty index has no bound");
+
+    // Near-UINT64_MAX ranges and overflow-safe lookups.
+    Index top;
+    constexpr std::uint64_t kMax = ~std::uint64_t(0);
+    top.insert(kMax - 15, 16, 1);   // [kMax - 15, kMax] exact top of address space
+    top.insert(kMax - 31, 100, 2);  // wraps past kMax in naive arithmetic
+    check(at(top, kMax, 1) == 1, "last byte of address space hits closest range");
+    check(at(top, kMax - 15, 16) == 1, "exact 16-byte view up to UINT64_MAX fits closer range");
+    check(at(top, kMax - 15, 17) == 2, "17-byte view spills to wrapping outer range");
+    check(at(top, kMax, 50) == 2, "multi-byte view starting at UINT64_MAX fits outer range");
+    check(at(top, kMax, 200) == 1, "oversized view at UINT64_MAX falls back to closest range");
+    check(top.covers(kMax - 15, 16) && top.covers(kMax - 15, 17) && !top.covers(kMax - 15, 200),
+          "covers() stays overflow-safe near UINT64_MAX");
+
+    // Copy and move semantics preserve all ranges and lookup results.
+    Index copied(top);
+    check(copied.size() == 2 && copied.longest() == 100 && at(copied, kMax - 15, 17) == 2,
+          "copy constructor preserves ranges");
+    Index moved(std::move(copied));
+    check(moved.size() == 2 && copied.size() == 0 && at(moved, kMax, 1) == 1, "move constructor transfers ownership");
 }
 
 void allocation_failures() {
-    for (bool replace : {false, true}) {
-        for (std::uint64_t size : {0x40u, 0x100u, 0x400u}) {
-            // New entries allocate a range and a size node; replacement only needs a size node.
-            for (int fail_after = 0; fail_after < (replace ? 1 : 2); ++fail_after) {
-                Index index;
-                index.insert(0x1000, 0x100, 1);
-                index.insert(0x2000, 0x100, 2);  // equal sizes must retain separate multiset entries
-                const std::uint64_t va = replace ? 0x1000 : 0x3000;
-                const std::uintptr_t id = replace ? 1 : 3;
-                bool threw = false;
-                allocations_before_failure = fail_after;
-                try {
-                    index.insert(va, size, id);
-                } catch (const std::bad_alloc&) {
-                    threw = true;
-                }
-                allocations_before_failure = -1;
-                check(threw, "injected insert allocation failure reached");
-                Index::Hit first{}, second{};
-                const bool unchanged = index.size() == 2 && index.longest() == 0x100 &&
-                    index.find(0x1000, first) && first.id == 1 && first.size == 0x100 &&
-                    index.find(0x2000, second) && second.id == 2 && second.size == 0x100 &&
-                    at(index, 0x10ff) == 1 && at(index, 0x1100) == 0 && at(index, 0x3000) == 0;
-                check(unchanged, "failed insert preserves ranges and lookup bound");
-                if (!unchanged) continue;  // do not erase an inconsistent index in the negative control
-
-                if (replace && size == 0x100) {
-                    // A failed same-size replacement can look unchanged while silently dropping a size node.
-                    index.erase(0x2000, 2);
-                    const bool counted = index.size() == 1 && index.longest() == 0x100;
-                    check(counted, "failed same-size replacement retains both size entries");
-                    if (!counted) continue;
-                    index.insert(0x2000, 0x100, 2);
-                }
-
-                index.insert(va, size, id);
-                Index::Hit retried{};
-                check(index.size() == (replace ? 2u : 3u) && index.find(va, retried) &&
-                      retried.id == id && retried.size == size, "insert succeeds after allocation failure");
-                check(index.longest() == (size > 0x100 ? size : 0x100), "retry updates the lookup bound");
-                index.erase(va, id);
-                check(index.longest() == 0x100 && at(index, 0x20ff) == 2,
-                      "erasing retried range keeps the other size entry");
-                index.erase(0x1000, 1);
-                index.erase(0x2000, 2);
-                check(index.size() == 0 && index.longest() == 0, "all size entries disappear after erase");
+    for (std::uint64_t size : {0x40u, 0x100u, 0x400u}) {
+        // Replacement of an existing (va, id) updates the node in place without allocating at all.
+        {
+            Index index;
+            index.insert(0x1000, 0x100, 1);
+            index.insert(0x2000, 0x100, 2);
+            bool threw = false;
+            allocations_before_failure = 0;
+            try {
+                index.insert(0x1000, size, 1);
+            } catch (const std::bad_alloc&) {
+                threw = true;
             }
+            allocations_before_failure = -1;
+            check(!threw, "in-place replacement allocates nothing");
+            Index::Hit hit{};
+            check(index.size() == 2 && index.find(0x1000, hit) && hit.id == 1 && hit.size == size &&
+                  index.longest() == (size > 0x100 ? size : 0x100),
+                  "in-place replacement updates size and longest bound");
+        }
+
+        // Inserting a new entry allocates one node; failure leaves the tree unchanged and retry succeeds.
+        {
+            Index index;
+            index.insert(0x1000, 0x100, 1);
+            index.insert(0x2000, 0x100, 2);
+            bool threw = false;
+            allocations_before_failure = 0;
+            try {
+                index.insert(0x3000, size, 3);
+            } catch (const std::bad_alloc&) {
+                threw = true;
+            }
+            allocations_before_failure = -1;
+            check(threw, "injected insert allocation failure reached");
+            Index::Hit first{}, second{};
+            const bool unchanged = index.size() == 2 && index.longest() == 0x100 &&
+                index.find(0x1000, first) && first.id == 1 && first.size == 0x100 &&
+                index.find(0x2000, second) && second.id == 2 && second.size == 0x100 &&
+                at(index, 0x10ff) == 1 && at(index, 0x1100) == 0 && at(index, 0x3000) == 0;
+            check(unchanged, "failed insert preserves ranges and lookup bound");
+            if (!unchanged) continue;
+
+            index.insert(0x3000, size, 3);
+            Index::Hit retried{};
+            check(index.size() == 3 && index.find(0x3000, retried) &&
+                  retried.id == 3 && retried.size == size, "insert succeeds after allocation failure");
+            check(index.longest() == (size > 0x100 ? size : 0x100), "retry updates the lookup bound");
+            index.erase(0x3000, 3);
+            check(index.longest() == 0x100 && at(index, 0x20ff) == 2,
+                  "erasing retried range keeps the other size entry");
+            index.erase(0x1000, 1);
+            index.erase(0x2000, 2);
+            check(index.size() == 0 && index.longest() == 0, "all size entries disappear after erase");
         }
     }
 }
@@ -325,6 +352,20 @@ void time_miss_after_free() {
     }
     std::printf("miss past %llu buffers: fresh index %.1f ns, after a freed 1 GiB buffer %.1f ns%s\n",
                 (unsigned long long)count, ns[0], ns[1], sink ? " (hit?)" : "");
+
+    // A miss in a gap between small buffers while a live 1 GiB buffer sits lower in the address space (the
+    // title-memory VB/IB miss case when a large arena/placed buffer is alive): O(log N) instead of O(N).
+    Index with_live_large;
+    with_live_large.insert(0x1000, std::uint64_t(1) << 30, 1);  // [0x1000, 0x40001000)
+    for (std::uint64_t i = 0; i < count; ++i)
+        with_live_large.insert(0x50000000 + i * 512, 256, i + 2);  // gaps of 256 bytes after each small buffer
+    const std::uint64_t gap_va = 0x50000000 + (count - 1) * 512 + 300;
+    check(at(with_live_large, gap_va) == 0, "gap past a live 1 GiB buffer is a miss");
+    const auto t0 = clock::now();
+    for (int i = 0; i < lookups; ++i) sink += at(with_live_large, gap_va + std::uint64_t(i % 64));
+    const double gap_ns = std::chrono::duration<double, std::nano>(clock::now() - t0).count() / lookups;
+    std::printf("miss in gap with live 1 GiB buffer below %llu small buffers: %.1f ns/lookup%s\n",
+                (unsigned long long)count, gap_ns, sink ? " (hit?)" : "");
 }
 
 } // namespace
