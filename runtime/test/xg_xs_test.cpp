@@ -699,6 +699,37 @@ int main() {
     check(create(&d, &computer) == E_NOTIMPL && computer, "unsupported texture keeps a safe fallback object");
     check(slot<LayoutFn>(computer, 2)(computer, &l) == E_NOTIMPL && l.size == 8192 &&
           slot<RefFn>(computer, 1)(computer) == 1, "fallback leaves caller outputs untouched and is safe to release");
+
+    // Second-model (port) copy validation: 3D render-target texture falls back to console_texture_layout.h.
+    {
+        ResourceDesc vol_rt{4, 0, 8, 8, 4, 1, DXGI_FORMAT_R8_UNORM, 1, 0, 0x105, kRenderTarget};
+        Texture primary_check{};
+        check(!build_texture(vol_rt, primary_check), "3D render target uses the second layout model");
+        void* port_comp = nullptr;
+        if (make(create, vol_rt, port_comp, "create 3D SW_4KB_S second-model computer")) {
+            const uint64_t sz = slot<SizeFn>(port_comp, 3)(port_comp);
+            std::vector<uint8_t> ptiled(size_t(sz), 0);
+            std::vector<uint8_t> plinear(8 * 8 * 4), pback(8 * 8 * 4, 0);
+            for (size_t i = 0; i < plinear.size(); ++i) plinear[i] = uint8_t(i + 1);
+            auto pinto = slot<IntoFn>(port_comp, 8);
+            auto pfrom = slot<FromFn>(port_comp, 9);
+            auto poff = slot<OffsetFn>(port_comp, 6);
+            check(pinto(port_comp, ptiled.data(), 0, 0, plinear.data(), 8, 64) == S_OK &&
+                      pfrom(port_comp, pback.data(), 0, 0, 0, ptiled.data(), 8, 64) == S_OK && pback == plinear,
+                  "second-model 3D copy_into/copy_from round-trips");
+            check(pinto(port_comp, ptiled.data(), 0, 0, plinear.data(), 8, 32) == E_INVALIDARG,
+                  "second-model copy_into rejects undersized 3D depth pitch");
+            check(pfrom(port_comp, pback.data(), 0, 0, 1, ptiled.data(), 8, 64) == E_INVALIDARG,
+                  "second-model copy_from rejects nonzero sample");
+            check(pinto(port_comp, ptiled.data(), 0, 0, ptiled.data(), 8, 64) == E_INVALIDARG &&
+                      pfrom(port_comp, ptiled.data(), 0, 0, 0, ptiled.data(), 8, 64) == E_INVALIDARG,
+                  "second-model copies reject overlapping buffers");
+            check(poff(port_comp, 0, 0, 1, 0, 0, 0, nullptr) != 0 &&
+                      poff(port_comp, 0, 0, 1, 0, 0, 1, nullptr) == 0,
+                  "second-model element_offset rejects nonzero sample");
+            slot<RefFn>(port_comp, 1)(port_comp);
+        }
+    }
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

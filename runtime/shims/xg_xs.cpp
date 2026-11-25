@@ -189,8 +189,12 @@ HRESULT copy_subresource(const Texture& t, uint32_t plane, uint32_t subresource,
     if (leonida::gfx10::tiling_detail::overlap(
             {source, Into ? linear_size : layout.size}, {destination, Into ? layout.size : linear_size}))
         return E_INVALIDARG;
-    std::vector<uint64_t> columns;
-    copy_elements<Into>(t, subresource % layout.mips, slice, source, destination, row_pitch, slice_pitch, columns);
+    try {
+        static thread_local std::vector<uint64_t> columns;
+        copy_elements<Into>(t, subresource % layout.mips, slice, source, destination, row_pitch, slice_pitch, columns);
+    } catch (const std::bad_alloc&) {
+        return E_OUTOFMEMORY;
+    }
     return S_OK;
 }
 
@@ -539,9 +543,14 @@ std::optional<CopyArgs> copy_args(const Computer* c, uint32_t plane, uint32_t su
     if (mip >= l.mips.size()) return std::nullopt;
     const ct::Mip& m = l.mips[mip];
     const uint64_t bytes = uint64_t{m.width} * l.desc.element_bytes;
+    if (row < bytes) return std::nullopt;
     const uint64_t depths = l.subresource_depth(mip);
+    if (m.height == 0 || depths == 0) return std::nullopt;
+    const uint64_t one_slice = uint64_t{m.height - 1} * row + bytes;
+    if (depths > 1 && depth < one_slice) return std::nullopt;
     // Every factor is at most 2^32, so each product fits in 64 bits; the sum is checked against size_t below.
-    const uint64_t linear = (depths - 1) * depth + uint64_t{m.height - 1} * row + bytes;
+    const uint64_t linear = (depths - 1) * depth + one_slice;
+    if (p.offset > std::numeric_limits<uint64_t>::max() - l.size) return std::nullopt;
     const uint64_t tiled = p.offset + l.size;
     if (linear > std::numeric_limits<size_t>::max() || tiled > std::numeric_limits<size_t>::max())
         return std::nullopt;
@@ -575,7 +584,12 @@ HRESULT __stdcall copy_into(Computer* c, uint8_t* tiled, uint32_t plane, uint32_
     const auto a = copy_args(c, plane, subresource, row, depth);
     if (!a || !tiled || !linear) return kInvalidArg;
     const size_t offset = static_cast<size_t>(a->plane->offset);
-    const ct::Error e = a->plane->layout.tile(tiled + offset, a->tiled - offset, a->mip, a->slice, linear, a->linear,
+    const size_t plane_bytes = a->tiled - offset;
+    if (leonida::gfx10::tiling_detail::overlap(
+            {reinterpret_cast<const std::byte*>(linear), a->linear},
+            {reinterpret_cast<std::byte*>(tiled + offset), plane_bytes}))
+        return kInvalidArg;
+    const ct::Error e = a->plane->layout.tile(tiled + offset, plane_bytes, a->mip, a->slice, linear, a->linear,
                                               row, depth);
     if (e != ct::Error::ok) warn_copy(c, "copy into", subresource, e);
     // The texture's image on the PC GPU is filled from this memory: tell the D3D12 layer it changed.
@@ -584,12 +598,18 @@ HRESULT __stdcall copy_into(Computer* c, uint8_t* tiled, uint32_t plane, uint32_
 }
 
 // (linear, plane, subresource, sample, tiled base, row pitch, depth pitch).
-HRESULT __stdcall copy_from(Computer* c, uint8_t* linear, uint32_t plane, uint32_t subresource, uint32_t /*sample*/,
+HRESULT __stdcall copy_from(Computer* c, uint8_t* linear, uint32_t plane, uint32_t subresource, uint32_t sample,
                             const uint8_t* tiled, uint32_t row, uint32_t depth) {
+    if (sample != 0) return kInvalidArg;
     const auto a = copy_args(c, plane, subresource, row, depth);
     if (!a || !tiled || !linear) return kInvalidArg;
     const size_t offset = static_cast<size_t>(a->plane->offset);
-    const ct::Error e = a->plane->layout.detile(tiled + offset, a->tiled - offset, a->mip, a->slice, linear, a->linear,
+    const size_t plane_bytes = a->tiled - offset;
+    if (leonida::gfx10::tiling_detail::overlap(
+            {reinterpret_cast<const std::byte*>(tiled + offset), plane_bytes},
+            {reinterpret_cast<std::byte*>(linear), a->linear}))
+        return kInvalidArg;
+    const ct::Error e = a->plane->layout.detile(tiled + offset, plane_bytes, a->mip, a->slice, linear, a->linear,
                                                 row, depth);
     if (e != ct::Error::ok) warn_copy(c, "copy out of", subresource, e);
     return result(e);
@@ -647,9 +667,9 @@ HRESULT __stdcall tiling(Computer* c, uint32_t* tiles, PackedMips* packed, uint3
 // (plane, mip, x, y, z or slice, sample, bit position): an element's byte offset from the texture's start, 0 if
 // outside. VIctory measured the title reading texels of a 128x4 4KB_S texture on the CPU through it.
 uint64_t __stdcall element_offset(Computer* c, uint32_t plane, uint32_t mip, uint64_t x, uint32_t y, uint32_t z,
-                                  uint32_t /*sample*/, uint32_t* bit) {
+                                  uint32_t sample, uint32_t* bit) {
     if (bit) *bit = 0;
-    if (plane >= c->texture.planes.size()) return 0;
+    if (sample != 0 || plane >= c->texture.planes.size()) return 0;
     const ct::Plane& p = c->texture.planes[plane];
     const uint32_t x32 = x > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max()
                                                                   : static_cast<uint32_t>(x);
