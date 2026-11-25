@@ -22,8 +22,10 @@ import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 
 ID = re.compile(r"(?:Interface|Class) Id: `([0-9a-fA-F-]{36})`")
 INHERITS = re.compile(r"Inherits: (?:\[(I\w+)\]|IUnknown\b)")
@@ -136,9 +138,29 @@ def main(argv: list[str] | None = None) -> int:
     parent = os.path.dirname(os.path.abspath(a.out))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(table, f, indent=1, sort_keys=True)
-        f.write("\n")
+    try:
+        mode = stat.S_IMODE(os.stat(a.out).st_mode)
+    except FileNotFoundError:
+        current_umask = os.umask(0)
+        os.umask(current_umask)
+        mode = 0o666 & ~current_umask
+    fd, tmp = tempfile.mkstemp(dir=parent)
+    try:
+        os.chmod(tmp, mode)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(table, f, indent=1, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, a.out)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     print(f"{len(table['classes'])} classes, {len(table['interfaces'])} interfaces -> {a.out}")
     return 0
 
