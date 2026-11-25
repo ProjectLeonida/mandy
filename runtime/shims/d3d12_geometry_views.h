@@ -516,6 +516,9 @@ public:
         // 30-80 ms). A view over a tile that cannot be guarded yet (retry) is left as it is this time; a view not
         // filled yet is filled whole, once.
         marks_.assign(views_.size(), 0);
+        // Both lists are cleared here, at the start: if a read or a guarded copy below throws, the next refresh must
+        // not find addresses in written_vas_ whose tiles written_ no longer holds.
+        written_.clear();
         written_vas_.clear();
         // The pass over the watched tiles makes a VirtualQuery and a VirtualProtect for each written one (tens of
         // milliseconds to a few hundred under Wine). resolve() waits for mutex_, and a new V# resolved while a
@@ -549,9 +552,12 @@ public:
         // whose addresses differ by a tile, and read each run some view needs before the per-tile pass, which then
         // reuses its bytes through read_tile(). Whole-view refreshes read nothing here: they fill whole views below.
         if (!whole) {
+            constexpr std::size_t kMaxRunBytes = 1u << 20;  // as the stream pool's extents: no run allocates more
+            const std::size_t max_tiles = (std::max)(std::size_t(1), kMaxRunBytes / tile_size);
             for (std::size_t w = 0; w < written_vas_.size();) {
                 std::size_t e = w + 1;
-                while (e < written_vas_.size() && written_vas_[e] == written_vas_[e - 1] + tile_size) ++e;
+                while (e < written_vas_.size() && e - w < max_tiles && written_vas_[e] == written_vas_[e - 1] + tile_size)
+                    ++e;
                 if (e - w > 1 && run_needed(w, e)) read_run(w, e, copy);
                 w = e;
             }
@@ -600,7 +606,6 @@ public:
         }
         for (std::size_t id = 0; id < marks_.size(); ++id)
             if ((marks_[id] & (kWhole | kPinned)) == kWhole && views_[id].alive) fill(views_[id], copy);
-        written_vas_.clear();
         if (uploaded_ != before) ++dirty_refreshes_;
         refilled_ += uploaded_ - before;
         const auto end = std::chrono::steady_clock::now();
