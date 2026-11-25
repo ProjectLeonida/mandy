@@ -6076,7 +6076,7 @@ class Gen:
     @staticmethod
     def _maskable_b32(x):
         return x["k"] in ("sgpr", "imm") or (
-            x["k"] == "special" and (x.get("t", "").startswith(("exec", "vcc")) or x.get("t") == "null")
+            x["k"] == "special" and (x.get("t", "").startswith(("exec", "vcc")) or x.get("t") in ("null", "m0", "scc", "src_scc"))
         )
 
     def _mask_b32_dst_half(self, d, srcs):
@@ -6529,6 +6529,17 @@ class Gen:
             self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
             self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
             return r
+        if a["k"] == "special" and a.get("t") in ("m0", "scc", "src_scc"):
+            v = self.src_u(a)
+            if wide and self.wave64:
+                lane = self.wave_lane()
+                hi = self.tmp()
+                self.emit(f"{hi} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+                bit = self._scalar_word_lane_bit(v, lane)
+                r = self.tmp()
+                self.emit(f"{r} = OpSelect %uint {hi} {self.cu(0)} {bit}")
+                return r
+            return self._scalar_word_lane_bit(v)
         raise Unsupported("mask operand")
 
     def is_mask_op(self, x):
