@@ -1964,6 +1964,18 @@ struct DeviceState {
     VkPipelineCache pipeline_cache_handle = VK_NULL_HANDLE;
     std::atomic<ULONGLONG> next_checkpoint{GetTickCount64() + 120000};
     std::atomic<unsigned> active_compiles{0};
+    // vkSetDebugUtilsObjectNameEXT when the instance enabled VK_EXT_debug_utils, else null. Compute pipelines carry
+    // their shader's name, so a crash-diagnostic dump or a capture names the dispatch that faulted.
+    PFN_vkSetDebugUtilsObjectNameEXT set_object_name = nullptr;
+
+    void name_object(VkObjectType type, std::uint64_t handle, const char* name) const {
+        if (!set_object_name || !handle || !name || !*name) return;
+        VkDebugUtilsObjectNameInfoEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT};
+        info.objectType = type;
+        info.objectHandle = handle;
+        info.pObjectName = name;
+        set_object_name(this->info.device, &info);
+    }
 
     VkPipelineCache pipeline_cache() {
         std::call_once(pipeline_cache_once, [this] {
@@ -9159,6 +9171,8 @@ private:
         if (took >= 2000)
             std::fprintf(stderr, "[rt] d3d12: compute pipeline %s took %.1f s to build (%zu B SPIR-V)\n",
                          entry->name.c_str(), double(took) / 1000.0, bytes);
+        device_.name_object(VK_OBJECT_TYPE_PIPELINE, std::uint64_t(reinterpret_cast<std::uintptr_t>(built)),
+                            entry->name.c_str());
         maybe_checkpoint(cache);
         pipeline_.pipeline = built;
         compute_failed_ = false;
@@ -11142,6 +11156,7 @@ public:
             load(labels.queue_begin, "vkQueueBeginDebugUtilsLabelEXT");
             load(labels.queue_end, "vkQueueEndDebugUtilsLabelEXT");
             state_.context->enable_debug_labels(labels);
+            load(state_.set_object_name, "vkSetDebugUtilsObjectNameEXT");
             if (!state_.context->debug_labels())
                 std::fprintf(stderr, "[rt] d3d12: VK_EXT_debug_utils entry points missing; debug markers are off\n");
         }
