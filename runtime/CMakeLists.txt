@@ -334,6 +334,15 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(acphal_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(acphal_test PRIVATE /OPT:NOREF)
 
+  # Console identity: device type resolution and OEM ConsoleMode mapping.
+  add_executable(console_identity_test
+    test/console_identity_test.cpp
+  )
+  target_include_directories(console_identity_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(console_identity_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(console_identity_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(console_identity_test PRIVATE /OPT:NOREF)
+
   if(TARGET leonida_xma2_decoder)
     target_link_libraries(gta6rt PRIVATE leonida_xma2_decoder)
     target_link_libraries(acphal_test PRIVATE leonida_xma2_decoder)
@@ -1538,6 +1547,9 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET acphal_test)
     add_test(NAME acphal COMMAND acphal_test)
     add_test(NAME acphal_noncached_only COMMAND acphal_test --noncached-only)
+  endif()
+  if(WIN32 AND TARGET console_identity_test)
+    add_test(NAME console_identity COMMAND console_identity_test)
   endif()
   if(WIN32 AND TARGET xapu_chad_test)
     add_test(NAME xapu_chad COMMAND xapu_chad_test)
