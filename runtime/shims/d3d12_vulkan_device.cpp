@@ -1422,6 +1422,41 @@ bool startup_cache_checkpoints_enabled() {
 }
 
 // Writes the session cache at a startup checkpoint or during device teardown. The size cap applies to either write.
+// RT-PIPELINE-CACHE-GROWTH-STALL: says once when the title's builds keep compiling but the driver's cache stops
+// growing, so the next run would compile them again (pipeline_cache_store::GrowthWatch). The size is taken when the
+// cache is created and at every session save, also one over the write limit.
+std::mutex& pipeline_cache_growth_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+leonida::pipeline_cache_store::GrowthWatch& pipeline_cache_growth() {
+    static leonida::pipeline_cache_store::GrowthWatch watch;
+    return watch;
+}
+
+void note_pipeline_cache_size(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache) {
+    std::size_t size = 0;
+    if (!cache || !vk.vkGetPipelineCacheData || vk.vkGetPipelineCacheData(device, cache, &size, nullptr) != VK_SUCCESS)
+        return;
+    std::lock_guard lock(pipeline_cache_growth_mutex());
+    pipeline_cache_growth().observe(size, leonida::pipeline_profile::compiled_builds().load());
+}
+
+void report_pipeline_cache_growth(std::size_t size) {
+    const auto compiled = leonida::pipeline_profile::compiled_builds().load();
+    std::lock_guard lock(pipeline_cache_growth_mutex());
+    auto& watch = pipeline_cache_growth();
+    const std::size_t before = watch.bytes();
+    const unsigned long long builds = compiled - watch.compiled();
+    if (watch.stalled(size, compiled))
+        std::fprintf(stderr, "[rt] d3d12: the Vulkan pipeline cache grew %zu bytes (to %zu) over %llu pipeline builds "
+                             "that compiled: the driver no longer keeps new pipelines, so the next run compiles them "
+                             "again. A large pipeline_cache.bin or pipeline_cache.session.bin can cause it "
+                             "(docs/d3d12_vulkan.md, pipeline caches)\n",
+                     size > before ? size - before : 0, size, builds);
+}
+
 void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache,
                                  bool checkpoint = false, const char* op = nullptr) {
     if (!cache || !vk.vkGetPipelineCacheData) return;
@@ -1433,6 +1468,7 @@ void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDev
     std::size_t size = 0;
     if (vk.vkGetPipelineCacheData(device, cache, &size, nullptr) != VK_SUCCESS ||
         size <= sizeof(VkPipelineCacheHeaderVersionOne)) return;
+    report_pipeline_cache_growth(size);
     if (size > limit) {
         std::fprintf(stderr, "[rt] d3d12: pipeline cache is %zu bytes, over the %zu-byte write limit\n", size, limit);
         return;
@@ -1985,6 +2021,7 @@ struct DeviceState {
                 else if (!direct_session_cache())
                     merge_session_pipeline_cache(vk, info.device, pipeline_cache_handle, pso_identity);
             }
+            note_pipeline_cache_size(vk, info.device, pipeline_cache_handle);
         });
         // Without EXTERNALLY_SYNCHRONIZED_BIT the driver synchronizes concurrent pipeline creation using this cache.
         return pipeline_cache_handle;
