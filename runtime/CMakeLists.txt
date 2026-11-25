@@ -323,6 +323,12 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(xg_xs_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xg_xs_test PRIVATE /OPT:NOREF)
 
+  # copy_elements of xg_xs_layout.h: fixed-width element copies against the runtime-sized loop, byte for byte.
+  add_executable(texel_copy_test test/texel_copy_test.cpp)
+  target_include_directories(texel_copy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(texel_copy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(texel_copy_test PRIVATE /W4 /permissive- /utf-8)
+
   # acphal shim ABI test: resolves the registered acphal.dll exports through the registry.
   add_executable(acphal_test
     test/acphal_test.cpp
@@ -1522,6 +1528,7 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xg_xs_test)
     add_test(NAME xg_xs COMMAND xg_xs_test)
+    add_test(NAME texel_copy COMMAND texel_copy_test)
   endif()
   if(WIN32 AND TARGET acphal_test)
     add_test(NAME acphal COMMAND acphal_test)
