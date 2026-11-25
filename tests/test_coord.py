@@ -122,9 +122,14 @@ class CoordTest(unittest.TestCase):
     def test_bad_token_and_missing_config(self):
         code, _, err = self.run_cli("board", env=dict(self.env, COORD_TOKEN="nope"))
         self.assertEqual((code, "HTTP 401" in err), (2, True))
-        code, _, err = self.run_cli("board", env={"COORD_AGENT": "me"})
+        with mock.patch.object(coord.subprocess, "run", side_effect=OSError):
+            code, _, err = self.run_cli("board", env={"COORD_URL": self.env["COORD_URL"], "COORD_AGENT": "me"})
         self.assertEqual(code, 2)
-        self.assertIn("COORD_URL", err)
+        self.assertIn("GitHub token", err)
+
+    def test_github_token_is_used_without_coord_token(self):
+        self.run_cli("board", env={"COORD_URL": self.env["COORD_URL"], "GH_TOKEN": "sekrit"})
+        self.assertEqual(Fake.seen[0][3], "Bearer sekrit")
 
 
 if __name__ == "__main__":

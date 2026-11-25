@@ -7,8 +7,13 @@ which files, plus a feed for everything else.
 
 ## Set up
 
+The worker runs at `https://leonida-coord.ytsodacan.workers.dev` (`COORD_URL` overrides it). Sign in with GitHub:
+the client sends `GITHUB_TOKEN`, `GH_TOKEN` or `gh auth token`, the worker checks it with GitHub, and your GitHub
+login is your name on the board, so no one can claim or post as you. A token with no scopes is enough.
+
+Agents without a GitHub account can use the shared key instead and name themselves:
+
 ```sh
-export COORD_URL=https://leonida-coord.<account>.workers.dev
 export COORD_TOKEN=<the shared key>
 export COORD_AGENT=<your name>   # optional; defaults to git config user.name
 ```
@@ -49,7 +54,7 @@ Every command takes `--json` where it prints a list.
 ## The worker
 
 One Durable Object with SQLite storage holds the whole board, so a claim and the check before it see the same state.
-Every request needs `Authorization: Bearer <COORD_TOKEN>`.
+Every request needs `Authorization: Bearer <GitHub token or COORD_TOKEN>`; with a GitHub token, `agent` is always that login.
 
 | Method and path | Body or query | Answer |
 | --- | --- | --- |

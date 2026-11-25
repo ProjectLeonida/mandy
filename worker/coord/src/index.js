@@ -7,7 +7,7 @@
 //   GET  /posts[?since=ISO&id=X]    the message feed, newest last
 //   POST /posts   {agent, text, id}                          say something, optionally about a claim
 //
-// Every request needs "Authorization: Bearer <COORD_TOKEN>". A claim not touched for STALE_DAYS stops blocking others.
+// Every request needs "Authorization: Bearer <COORD_TOKEN or a GitHub token>"; with a GitHub token the agent is its login. A claim not touched for STALE_DAYS stops blocking others.
 import { DurableObject } from "cloudflare:workers";
 
 const STALE_DAYS = 7;
@@ -23,12 +23,36 @@ function sameToken(a, b) {
   return diff === 0;
 }
 
+// Who is calling: the shared COORD_TOKEN (the agent names itself), or a GitHub token, checked with GitHub once and
+// remembered for 10 minutes, in which case the agent is that GitHub login and cannot be anyone else.
+const seen = new Map();
+async function githubLogin(token) {
+  const key = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token))),
+    (b) => b.toString(16).padStart(2, "0")).join("");
+  const hit = seen.get(key);
+  if (hit && hit.until > Date.now()) return hit.login;
+  const r = await fetch("https://api.github.com/user", {
+    headers: { authorization: `Bearer ${token}`, "user-agent": "leonida-coord", accept: "application/vnd.github+json" },
+  });
+  if (!r.ok) return null;
+  const login = (await r.json()).login;
+  if (seen.size > 1000) seen.clear();
+  seen.set(key, { login, until: Date.now() + 6e5 });
+  return login;
+}
+
 export default {
   async fetch(request, env) {
-    if (!env.COORD_TOKEN) return json({ error: "COORD_TOKEN is not set on the worker" }, 500);
-    const auth = request.headers.get("authorization") || "";
-    if (!sameToken(auth.replace(/^Bearer\s+/i, ""), env.COORD_TOKEN)) return json({ error: "unauthorized" }, 401);
-    return env.BOARD.get(env.BOARD.idFromName("board")).fetch(request);
+    const token = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
+    let login = "";
+    if (!(env.COORD_TOKEN && sameToken(token, env.COORD_TOKEN))) {
+      login = token ? await githubLogin(token) : null;
+      if (!login) return json({ error: "unauthorized: send COORD_TOKEN or a GitHub token" }, 401);
+    }
+    const headers = new Headers(request.headers);
+    headers.delete("x-coord-login");
+    if (login) headers.set("x-coord-login", login);
+    return env.BOARD.get(env.BOARD.idFromName("board")).fetch(new Request(request, { headers }));
   },
 };
 
@@ -86,12 +110,14 @@ export class Board extends DurableObject {
     const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
     try {
       const body = request.method === "POST" ? await request.json() : {};
+      const login = request.headers.get("x-coord-login");
+      if (login) body.agent = login;
       if (request.method === "GET" && parts[0] === "claims" && parts.length === 1)
         return json(this.rows(url.searchParams.has("all")));
 
       if (request.method === "GET" && parts[0] === "check") {
         const hits = this.overlap(cleanFiles(url.searchParams.get("files")), str(url.searchParams.get("id"), MAX.id, "id"),
-          str(url.searchParams.get("agent"), MAX.agent, "agent"));
+          login || str(url.searchParams.get("agent"), MAX.agent, "agent"));
         return json(hits, hits.length ? 409 : 200);
       }
 
@@ -106,7 +132,7 @@ export class Board extends DurableObject {
           ON CONFLICT(id) DO UPDATE SET agent=excluded.agent, title=excluded.title, files=excluded.files,
           note=excluded.note, updated=excluded.updated, done=NULL`, id, agent, title, JSON.stringify(files), note, now, now);
         this.post(agent, id, `claimed ${id}${title ? `: ${title}` : ""}${files.length ? ` (${files.join(", ")})` : ""}`);
-        return json({ ok: true, id, overlap: hits }, 201);
+        return json({ ok: true, id, agent, overlap: hits }, 201);
       }
 
       if (request.method === "POST" && parts[0] === "claims" && parts[2] === "done" && parts.length === 3) {

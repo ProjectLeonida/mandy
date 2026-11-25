@@ -18,8 +18,9 @@ The worker keeps claims (ID, agent, files, note) and a message feed:
 - `post` and `read` are the feed: questions, handoffs, "I'm halfway through X". A post with `--id` keeps that claim
   fresh.
 
-Set `COORD_URL` (the worker's address) and `COORD_TOKEN` (its shared key). `COORD_AGENT` names you; it defaults to
-`git config user.name`. Standard library only; no game files.
+`COORD_URL` overrides the worker's address. Sign in with GitHub: the client sends `GITHUB_TOKEN`, `GH_TOKEN` or
+`gh auth token`, and the worker names you by that GitHub login. Or set `COORD_TOKEN`, the worker's shared key, and
+name yourself with `COORD_AGENT` (default `git config user.name`). Standard library only; no game files.
 """
 from __future__ import annotations
 
@@ -31,6 +32,8 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+
+DEFAULT_URL = "https://leonida-coord.ytsodacan.workers.dev"
 
 
 class CoordError(Exception):
@@ -48,12 +51,23 @@ def agent_name() -> str:
     return name or os.environ.get("USER", "") or "agent"
 
 
+def auth_token() -> str:
+    """COORD_TOKEN if set, else a GitHub token: GITHUB_TOKEN, GH_TOKEN or `gh auth token`."""
+    for name in ("COORD_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"):
+        if os.environ.get(name, "").strip():
+            return os.environ[name].strip()
+    try:
+        return subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def call(method: str, path: str, body: dict | None = None, query: dict | None = None) -> tuple[int, object]:
     """One request to the worker; returns (status, decoded JSON). 409 is an answer, not an error."""
-    base = os.environ.get("COORD_URL", "").rstrip("/")
-    token = os.environ.get("COORD_TOKEN", "")
+    base = os.environ.get("COORD_URL", DEFAULT_URL).rstrip("/")
+    token = auth_token()
     if not base or not token:
-        raise CoordError("set COORD_URL and COORD_TOKEN (see docs/coordination.md)")
+        raise CoordError("set COORD_URL, and COORD_TOKEN or a GitHub token (see docs/coordination.md)")
     url = base + path
     if query:
         url += "?" + urllib.parse.urlencode({k: v for k, v in query.items() if v})
@@ -144,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"not claimed, {args.id} overlaps:")
                 print("\n".join(claim_line(c) for c in res.get("overlap", [])))
                 return 1
-            print(f"claimed {args.id} as {me}")
+            print(f"claimed {args.id} as {res.get('agent') or me}")
             return 0
         if args.cmd == "done":
             call("POST", f"/claims/{urllib.parse.quote(args.id, safe='')}/done", {"agent": me, "note": args.note})
