@@ -308,6 +308,7 @@ int main() {
         srv_struct_b(elements), srv_typed(elements), srv_null(elements);
     {
         rt::d3d12::VulkanDeviceInfo info{};
+        info.prepare_on_bind=d.prepare_on_bind;
         info.get_instance_proc = d.instance_proc;
         info.instance = d.instance;
         info.physical = d.physical;

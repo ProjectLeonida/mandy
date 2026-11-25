@@ -12,7 +12,10 @@
 //             D3D12_SAMPLER_DESC prefix is passed. The PC slot 61 is CreateMetaCommand. Measured on the retail title's
 //             boot. Only for a caller in a guest-mapped image (set_console_caller, below); a host caller reaches the
 //             PC CreateMetaCommand.
-//   slot 57   DeserializeGraphicsPipelineStateX(desc, iid, out): converts the Xbox 0x68-byte native graphics PSO
+//   slot 57   the native graphics pipeline state (desc, iid, out). The factory of set_device_native_graphics_factory
+//             (below) is asked first with the whole 0x108-byte description (leonida::native_pso::GraphicsDesc); when
+//             it answers E_NOTIMPL (none set, no catalogue, or a plan it cannot build) the call goes on as
+//             DeserializeGraphicsPipelineStateX(desc, iid, out): converts the Xbox 0x68-byte native graphics PSO
 //             description (+0x00 root signature, +0x08/+0x10 state blob, +0x18/+0x20 pipeline input-layout blob,
 //             +0x28/+0x30 and +0x48/+0x50 bare RDNA2 programs, +0x38/+0x40 and +0x58/+0x60 kind-2 stage blobs) to
 //             D3D12_GRAPHICS_PIPELINE_STATE_DESC and forwards to PC CreateGraphicsPipelineState (slot 10). When the
@@ -27,6 +30,11 @@
 //             Layout per VIctory: 14 resource dwords shaped as D3D12_RESOURCE_DESC, 16 view dwords whose first 10 are
 //             the PC view description and 10-11 the memory's address. A buffer view gets its V#; a texture the PC
 //             null view (no texture exists for the title's memory yet).
+//             A shader-resource view that gets nothing this way asks the providers below before the null view:
+//             the raw texture view provider for a 2D texture shape, and for the measured raw buffer shape (PR 7066,
+//             eugen1763: a desktop D3D12_RESOURCE_DESC of a buffer, a desktop D3D12_SHADER_RESOURCE_VIEW_DESC with
+//             R32_TYPELESS, BUFFER and RAW followed at once by a D3D12_GPU_VIRTUAL_ADDRESS) the device's resource
+//             provider, which names the buffer a slot-133 call registered for that address.
 //   slot 71   the same for an unordered-access view. The PC slot 71 is CreateSamplerFeedbackUnorderedAccessView.
 //   slot 74   (pointer, u32, pointer): not measured, returns S_OK. The PC slot 74 is ShaderCacheControl(kinds, control),
 //             which reads the first word as flags and returns E_INVALIDARG. Nothing is written, the PC device is not called.
@@ -38,7 +46,9 @@
 //             in RDX (the PC form is `this` in RCX, return buffer in RDX). Slot 25 (GetResourceAllocationInfo, also a
 //             struct wider than 8 bytes) takes the same form by the same rule. Both accept either form.
 //   slot 133  CreatePlacedResourceX(va, desc, state, clear, riid, out) -> a buffer on the title's pages at va, made by
-//             the handler of set_placed_at_va_handler (below). Where that cannot be made, PC CreateCommittedResource
+//             the handler of set_placed_at_va_handler (below); a depth-stencil texture with unordered access goes to
+//             the depth provider (set_depth_stencil_uav_provider) when one is set. Where neither can make it, PC
+//             CreateCommittedResource
 //             on a DEFAULT heap, with the Xbox flag bits dropped and an all-ones state as COMMON: not backed by the
 //             memory at va.
 //   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The 32-byte Xbox desc starts with
@@ -120,6 +130,8 @@ namespace leonida {
 class FrameTokenSource;
 }
 
+namespace leonida::native_pso { struct GraphicsDesc; }
+
 namespace rt::d3d12_xs {
 
 // Wraps `real` and returns the requested device interface through `out`. Takes ownership of one reference to
@@ -159,6 +171,64 @@ D3D_FEATURE_LEVEL max_feature_level(ID3D12Device* device);
 using DxgiAdapterProvider = HRESULT (*)(ID3D12Device* real, REFIID riid, void** out);
 // `device` is the proxy or its DXGI pointer. False, with a line on stderr, when it is neither: nothing is set then.
 bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider);
+// The Vulkan backend installs its own graphics PSO factory on its outer Xbox device.
+class PsoStreamRecord;
+using NativeStreamFactory = HRESULT (*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC&, REFIID, void**,
+                                        std::unique_ptr<PsoStreamRecord>);
+void set_native_stream_factory(void* device, NativeStreamFactory factory);
+using NativeGraphicsFactory = HRESULT (*)(ID3D12Device*, const leonida::native_pso::GraphicsDesc&, REFIID, void**);
+void set_device_native_graphics_factory(void* device, NativeGraphicsFactory factory);
+// Finds the buffer resource that holds a console GPU virtual address, for device slot 70. `real` is the device behind
+// the proxy; `bytes` is how many bytes from `va` the caller wants, so a resource that holds all of them is preferred
+// over a shorter alias. Returns the resource with a reference added (the proxy releases it), or null when no resource holds
+// `va`; `start` and `size` are then unused, otherwise the resource's first VA and size in bytes.
+using ResourceByVaProvider = ID3D12Resource* (*)(ID3D12Device* real, std::uint64_t va, std::uint64_t bytes,
+                                                std::uint64_t* start, std::uint64_t* size);
+// `device` is the proxy or its DXGI pointer. False, with a line on stderr, when it is neither. Without a provider slot
+// 70 does not look for a buffer by its address.
+bool set_device_resource_provider(void* device, ResourceByVaProvider provider);
+using TextureLeaseProvider = void (*)(IUnknown* resource, void* pages, std::size_t size, UINT layout);
+void set_texture_lease_provider(void* device, TextureLeaseProvider provider);
+using RawTextureViewProvider = bool (*)(ID3D12Device*, const D3D12_RESOURCE_DESC&, const D3D12_SHADER_RESOURCE_VIEW_DESC&,
+                                        std::uint64_t, D3D12_CPU_DESCRIPTOR_HANDLE);
+void set_raw_texture_view_provider(void* device, RawTextureViewProvider provider);
+using ConsoleConstantView = bool (*)(ID3D12Device*, const D3D12_CONSTANT_BUFFER_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+void set_constant_view_provider(void* device, ConsoleConstantView provider);
+// Installed by the Vulkan backend before handing the device to callers. Reports whether the exact
+// CPU span belongs to the heap's live mapped allocation. PC descriptor handles may be opaque.
+// (From the patch descriptor-write-through of Sigtryggur-Mani-Gudmundsson/graphics-runtime-patches at d9a0bc1b,
+// GPL-3.0.)
+using DescriptorMappingProvider = bool (*)(ID3D12DescriptorHeap* heap, SIZE_T start, SIZE_T bytes);
+void set_descriptor_mapping_provider(void* device, DescriptorMappingProvider provider);
+// Called before publishing an Xbox resource when the backend can implement its depth/stencil UAV views.
+using DepthStencilUavProvider = HRESULT (*)(ID3D12Resource* resource, D3D12_HEAP_FLAGS storage_heap_flags);
+inline bool depth_uav_description(const D3D12_RESOURCE_DESC& desc) {
+    constexpr auto flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    return (desc.Flags & flags) == flags && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+           (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format == DXGI_FORMAT_R16_TYPELESS ||
+            desc.Format == static_cast<DXGI_FORMAT>(118)) &&
+           desc.DepthOrArraySize && desc.MipLevels == 1 && desc.SampleDesc.Count == 1;
+}
+using ValidateDepthPlacement = bool (*)(const D3D12_RESOURCE_DESC& native, std::uint32_t layout,
+                                        const D3D12_CLEAR_VALUE* clear);
+bool set_depth_stencil_uav_provider(void* device, DepthStencilUavProvider provider,
+                                    ValidateDepthPlacement validate_placement = nullptr);
+
+// The Vulkan implementation uses this private interface to look up an image for view creation.
+inline constexpr GUID kVulkanResourceTag{0x9b3e5f12, 0x7c48, 0x4d0e, {0xa6, 0xb1, 0x2f, 0x8d, 0x4c, 0x7e, 0x9a, 0x35}};
+
+// Identically placed Xbox depth textures have distinct COM identities but refer to one GPU image and layout.
+// Only these wrappers carry a backing pointer. Every other resource retains its ordinary pointer-valued IR ID.
+struct PlacedDepthInterface : ID3D12Resource {
+    ID3D12Resource* backing = nullptr;
+};
+inline std::atomic<const void*> placed_depth_vtable{nullptr};
+inline const ID3D12Resource* texture_backing(const ID3D12Resource* resource) {
+    const void* vtable = placed_depth_vtable.load(std::memory_order_acquire);
+    if (resource && vtable && *reinterpret_cast<const void* const*>(resource) == vtable)
+        return static_cast<const PlacedDepthInterface*>(resource)->backing;
+    return resource;
+}
 // The device proxy an IDXGIDevice pointer handed out by one belongs to, or null.
 void* device_proxy_from_dxgi_device(void* dxgi_device);
 // The device proxy itself, given the proxy or its DXGI pointer; null for anything else.
@@ -196,10 +266,12 @@ IUnknown* real_object_behind_proxy(const void* object);
 // not create it itself: the device behind it does, through this handler, which the Vulkan layer registers
 // (rt::d3d12::create_buffer_at_host_address). With none registered, a PC device behind the proxy, or a handler
 // that fails (a texture, a range the import refuses), the slot creates the committed stand-in described at the top.
+// A depth-stencil texture with unordered access goes to the proxy's depth provider first when one is set.
+// `clear` is the title's clear value for a render target or depth-stencil texture, else null.
 // `layout` is the title's third argument, a D3D12_BARRIER_LAYOUT (0xFFFFFFFF = UNDEFINED), measured on a retail
 // boot: 0x6 SHADER_RESOURCE, 0x3 UNORDERED_ACCESS, as PC CreatePlacedResource2 takes it.
 using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc,
-                                      std::uint32_t layout, REFIID riid, void** out);
+                                      std::uint32_t layout, REFIID riid, void** out, const D3D12_CLEAR_VALUE* clear);
 void set_placed_at_va_handler(PlacedAtVaHandler handler);
 
 // Called by slot 133 for a buffer, before the handler, with the buffer's range [va, va + width). gta6rt registers
@@ -209,6 +281,9 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler);
 // called. With none registered nothing is done.
 using PlacedAtVaPagesHook = bool (*)(const void* va, std::size_t bytes);
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook);
+using PinnedTexturePages = std::shared_ptr<std::uint8_t> (*)(const void*, std::size_t);
+void set_texture_page_provider(PinnedTexturePages hook);
+std::shared_ptr<std::uint8_t> pin_texture_pages(const void* address, std::size_t size);
 
 // Device slot 14's console-extended CreateDescriptorHeap: the description is the PC 16-byte shape followed by a
 // console VA and a size (issue #313). The proxy does not create the heap itself: the device behind it registers this
@@ -245,7 +320,8 @@ std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* devic
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14 (descriptor heap proxy), 17-24 (CPU descriptor handle translation), 26 (the
 // console's struct-return form), 31/34/35/45/46/50 (proxies unwrapped),
-// 32 and 36 (fence proxies), 48/73 and 78/79/80/81 (the Xbox slots above, at their configured indices), 55, 62, 67, 70,
+// 32 and 36 (fence proxies), 48/73 and 78/79/80/81 (the Xbox slots above, at their configured indices), 13 (the
+// console's format queries), 55, 57, 62, 67, 70,
 // 74, 76, 86, 101, 108 and 127. Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap
 // proxy, and device slot 9 is CreateCommandAllocator, which the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
@@ -255,6 +331,9 @@ bool device_slot_overridden(unsigned slot);
 // installed every caller is a host one. D3D12XboxCreateDevice installs rt::shims::mapped_image_base.
 using ConsoleCaller = bool (*)(std::uint64_t address);
 void set_console_caller(ConsoleCaller classify);
+// True on the calling thread while the proxy forwards a CheckFeatureSupport (device slot 13) that a console caller
+// made, so the device behind it can answer the console's formats.
+bool console_feature_query() noexcept;
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
 // (no reference added), or null when the pointer is not such a proxy.

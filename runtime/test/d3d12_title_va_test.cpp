@@ -551,9 +551,151 @@ int check_geometry_slab_tails(Context& c) {
     return 0;
 }
 
+// Bind the same interior GPU handle first through a short graphics table, then a wide compute table.
+// Update its last CBV after Close and again before resubmitting the identical list.
+// (Adapted from the tests of the patches descriptor-table-refresh and descriptor-write-through of
+// Sigtryggur-Mani-Gudmundsson/graphics-runtime-patches at d9a0bc1b, GPL-3.0.)
+int check_rebound_tables(Context& c, ID3D12RootSignature* narrow, bool mirror, bool api_copy) {
+    constexpr UINT selected = 64;
+    const auto alloc_backing = [](std::size_t n, std::uint64_t) -> void* {
+        return VirtualAlloc(nullptr, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    };
+    const auto free_backing = [](void* p, std::uint64_t) { VirtualFree(p, 0, MEM_RELEASE); };
+    Ref<ID3D12DescriptorHeap> heap;
+    const D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, selected + 4,
+                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    rt::d3d12_xs::set_descriptor_heap_allocator(alloc_backing, free_backing);
+    const HRESULT created = c.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap.p));
+    rt::d3d12_xs::set_descriptor_heap_allocator(nullptr, nullptr);
+    EXPECT(created == S_OK);
+    const UINT step = c.device->GetDescriptorHandleIncrementSize(hd.Type);
+    const auto cpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 9))(heap.p);
+    const auto gpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 10))(heap.p);
+    const auto real = rt::d3d12_xs::translate_cpu_descriptor_handle(c.device, {SIZE_T(cpu)});
+    EXPECT(real.ptr && real.ptr != cpu && gpu && step == 32);
+
+    const D3D12_HEAP_PROPERTIES def{D3D12_HEAP_TYPE_DEFAULT}, up{D3D12_HEAP_TYPE_UPLOAD},
+        rb{D3D12_HEAP_TYPE_READBACK};
+    Ref<ID3D12Resource> upload, source, out, readback;
+    const auto data_desc = buffer_desc(2 * kBytes);
+    const auto result_desc = buffer_desc(kBytes);
+    const auto uav_desc = buffer_desc(kBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    EXPECT(c.device->CreateCommittedResource(&up, {}, &data_desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                             nullptr, IID_PPV_ARGS(&upload.p)) == S_OK);
+    EXPECT(c.device->CreateCommittedResource(&def, {}, &data_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                             nullptr, IID_PPV_ARGS(&source.p)) == S_OK);
+    EXPECT(c.device->CreateCommittedResource(&def, {}, &uav_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                             nullptr, IID_PPV_ARGS(&out.p)) == S_OK);
+    EXPECT(c.device->CreateCommittedResource(&rb, {}, &result_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                             nullptr, IID_PPV_ARGS(&readback.p)) == S_OK);
+    std::uint32_t* input = nullptr;
+    EXPECT(upload->Map(0, nullptr, reinterpret_cast<void**>(&input)) == S_OK);
+    for (UINT i = 0; i < 2 * kElements; ++i) input[i] = 0x10500000u + 37 * i;
+    upload->Unmap(0, nullptr);
+    Ref<ID3D12CommandAllocator> alloc;
+    Ref<ID3D12GraphicsCommandList> list;
+    EXPECT(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc.p)) == S_OK);
+    EXPECT(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.p, c.pso, IID_PPV_ARGS(&list.p)) == S_OK);
+    const auto transition_resource = [&](ID3D12Resource* resource, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, from, to};
+        list->ResourceBarrier(1, &barrier);
+    };
+    list->CopyBufferRegion(source.p, 0, upload.p, 0, data_desc.Width);
+    transition_resource(source.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    ID3D12DescriptorHeap* heaps[] = {heap.p};
+    list->SetDescriptorHeaps(1, heaps);
+    const D3D12_GPU_DESCRIPTOR_HANDLE table{gpu + step};
+    list->SetGraphicsRootSignature(narrow);
+    list->SetGraphicsRootDescriptorTable(2, table);
+    list->SetComputeRootSignature(c.root);
+    list->SetComputeRootDescriptorTable(2, table);
+    list->SetGraphicsRootDescriptorTable(2, table);
+    const UINT args[] = {selected, 0xfffffffbu};
+    list->SetComputeRoot32BitConstants(0, 2, args, 0);
+    list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    list->Dispatch(1, 1, 1);
+    transition_resource(out.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(readback.p, 0, out.p, 0, kBytes);
+    transition_resource(out.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    transition_resource(source.p, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    EXPECT(list->Close() == S_OK);
+
+    // Build two real CBVs in a CPU-only staging heap. Only raw CPU writes reach the title-owned slots below.
+    Ref<ID3D12DescriptorHeap> staging;
+    const D3D12_DESCRIPTOR_HEAP_DESC staging_desc{hd.Type, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    EXPECT(c.inner->CreateDescriptorHeap(&staging_desc, IID_PPV_ARGS(&staging.p)) == S_OK);
+    const auto staging_cpu = staging->GetCPUDescriptorHandleForHeapStart();
+    unsigned matched[2]{};
+    bool api_slots_correct = true;
+    for (UINT pass = 0; pass < 2; ++pass) {
+        const D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{source->GetGPUVirtualAddress() + kBytes * pass, kBytes};
+        const D3D12_CPU_DESCRIPTOR_HANDLE src{staging_cpu.ptr + pass * step};
+        // The reference uses the producer of the slot under test. Xbox CreateCBV
+        // addresses 16-byte rows. A PC descriptor copied through the API retains its byte layout.
+        const bool xbox_cbv = api_copy && pass == 0;
+        (xbox_cbv ? c.device : c.inner)->CreateConstantBufferView(&cbv, src);
+        leonida::gfx10::BufferWords words{};
+        std::memcpy(words.data(), reinterpret_cast<const void*>(src.ptr), sizeof(words));
+        leonida::gfx10::Buffer reference_cbv{};
+        EXPECT(leonida::gfx10::decode(words, reference_cbv));
+        // The device writes the console's 16-byte rows for both producers unless LEONIDA_CBV_RAW=1.
+        wchar_t raw_env[2]{};
+        const bool rows = xbox_cbv || !(GetEnvironmentVariableW(L"LEONIDA_CBV_RAW", raw_env, 2) == 1 && raw_env[0] == L'1');
+        EXPECT(reference_cbv.stride == (rows ? 16u : 0u));
+        EXPECT(reference_cbv.num_records == (rows ? kBytes / 16u : kBytes));
+        const void* copy_from = reinterpret_cast<const void*>(src.ptr);
+        if (api_copy) {
+            // Write to a shader-visible slot outside the bound table. The game copies from its CPU backing.
+            const D3D12_CPU_DESCRIPTOR_HANDLE from{static_cast<SIZE_T>(cpu + (selected + 3) * step)};
+            copy_from = reinterpret_cast<const void*>(from.ptr);
+            if (pass == 0) {
+                DWORD previous = 0;
+                EXPECT(VirtualProtect(reinterpret_cast<void*>(cpu), hd.NumDescriptors * step, PAGE_READONLY, &previous));
+                c.device->CreateConstantBufferView(&cbv, from);
+                EXPECT(vsharp_base(from.ptr) == 0);
+                EXPECT(VirtualProtect(reinterpret_cast<void*>(cpu), hd.NumDescriptors * step, previous, &previous));
+                c.device->CreateConstantBufferView(&cbv, from);
+            } else {
+                c.device->CopyDescriptorsSimple(1, from, src, hd.Type);
+            }
+            const void* reference = reinterpret_cast<const void*>(src.ptr);
+            const auto* inner = reinterpret_cast<const void*>(real.ptr + (selected + 3) * step);
+            const bool real_match = std::memcmp(inner, reference, step) == 0;
+            const bool title_match = std::memcmp(copy_from, reference, step) == 0;
+            std::printf("API slot %u: real matches staging=%d, title matches staging=%d\n", pass, real_match, title_match);
+            api_slots_correct &= real_match && (mirror ? title_match : vsharp_base(from.ptr) == 0);
+        }
+        for (UINT slot_index : {0u, 1 + selected, 2 + selected})
+            std::memcpy(reinterpret_cast<void*>(cpu + slot_index * step), copy_from, step);
+        ID3D12CommandList* lists[] = {list.p};
+        c.queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(c.queue) == leonida::ReplayResult::success);
+        EXPECT(c.queue->Signal(c.fence, ++c.fence_value) == S_OK);
+        EXPECT(c.fence->SetEventOnCompletion(c.fence_value, nullptr) == S_OK);
+        void* mapped = nullptr;
+        EXPECT(readback->Map(0, nullptr, &mapped) == S_OK);
+        const auto* got = static_cast<const std::uint32_t*>(mapped);
+        for (UINT i = 0; i < kElements; ++i)
+            matched[pass] += got[i] == (mirror ? 0x10500000u + 37 * (kElements * pass + i) : 0u);
+        readback->Unmap(0, nullptr);
+        EXPECT(vsharp_base(real.ptr) == 0 && vsharp_base(real.ptr + (selected + 2) * step) == 0);
+    }
+    std::printf("rebound table (%s): %u/%u and %u/%u GPU words matched on consecutive submissions\n",
+                mirror ? "updated CBV" : "null CBV", matched[0], kElements, matched[1], kElements);
+    EXPECT(api_slots_correct && matched[0] == kElements && matched[1] == kElements);
+    return 0;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool api_copy_off = argc == 2 && std::strcmp(argv[1], "--api-descriptor-copy-off") == 0;
+    const bool mirror_off = api_copy_off || (argc == 2 && std::strcmp(argv[1], "--rebound-tables-off") == 0);
+    const bool second_device = argc == 2 && std::strcmp(argv[1], "--rebound-second-device") == 0;
+    const bool api_copy = api_copy_off || (argc == 2 && std::strcmp(argv[1], "--api-descriptor-copy") == 0);
+    const bool rebind = api_copy || mirror_off || second_device || (argc == 2 && std::strcmp(argv[1], "--rebound-tables") == 0);
     const char* setting = std::getenv("LEONIDA_GEOMETRY_MB");
     const bool geometry = setting && std::atoi(setting) > 0;
     vktest::Device d;
@@ -591,6 +733,9 @@ int main() {
         if (geometry) info.host_pointer_alignment = d.host_pointer_alignment;
         info.subgroup = d.subgroup;
         info.shader_dir = library.string();
+        // Keep another compatibility device alive over the same physical GPU. Each owns its own arena.
+        Ref<ID3D12Device> first;
+        if (second_device) EXPECT(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&first.p)) == S_OK);
         ID3D12Device* inner = nullptr;  // owned by the proxy, as in d3d12_compute_test
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -600,7 +745,7 @@ int main() {
 
         // [0] two constants (s4, s5), [1] a root UAV (s6:s7), [2] a one-descriptor table (s8): the console compute
         // layout cs_user_data.comp reads.
-        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, 0};
+        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, rebind ? 65u : 1u, 1, 0, 0};
         D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants = {0, 0, 2};
@@ -639,6 +784,16 @@ int main() {
         c.fence = fence.p;
         c.arena = rt::d3d12::device_arena_size(device.p);
         EXPECT(c.arena > 0);
+        if (rebind) {
+            range.NumDescriptors = 1;
+            const auto narrow_blob = serialize(root_desc);
+            Ref<ID3D12RootSignature> narrow;
+            EXPECT(!narrow_blob.empty());
+            EXPECT(device->CreateRootSignature(0, narrow_blob.data(), narrow_blob.size(), IID_PPV_ARGS(&narrow.p)) == S_OK);
+            EXPECT(check_rebound_tables(c, narrow.p, !mirror_off, api_copy) == 0);
+            EXPECT(d.validation_errors() == 0);
+            return 0;
+        }
         if (check_kind(c, "read-write", PAGE_READWRITE, checks)) return 1;
         if (check_kind(c, "write-combined", PAGE_READWRITE | PAGE_WRITECOMBINE, checks)) return 1;
         if (check_title_memory(c, checks, geometry)) return 1;

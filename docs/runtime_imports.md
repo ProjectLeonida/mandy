@@ -163,17 +163,23 @@ policy "other" (none is counted as returning an `HRESULT`), and they come from s
 | `xapu.dll` | 5: `XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`, `XApuEnqueueCommand`, `XApuGetResultCount` | the audio processing unit |
 | `AcpHal.dll` | 9: `AcpHalAllocateShapeContexts`, `AcpHalCreate`, `AcpHalReleaseShapeContexts`, `ApuAlloc`, `ApuCreateHeap`, `ApuFree`, `ApuIsVirtualAddressValid`, `ApuMapApuAddress`, `ApuMapVirtualAddress` | the audio hardware layer |
 
-The game executable imports two functions from `xg_xs.dll`, the console's texture layout library.
-`XGSuggestSwizzleMode` writes the Xbox layout encoding `0x100 | mode`, including when its output aliases the
-description. `XGCreateTextureComputer` returns a refcounted computer for supported layouts. Slot 2 writes the Series
-layout, slot 8 copies linear source rows into a subresource, and slot 10 reports 64 KiB tiled-resource geometry.
-Rows and tile extents are computed in storage elements, so block-compressed formats use one 4x4 block as an element.
-Packed mips share a block at the start of each slice, followed by the other mips from smallest to largest.
-The shim covers single-sample linear textures, 2D 4 KiB standard and 64 KiB standard/display textures, and single-mip
-4 KiB standard volumes. Unsupported descriptions return a failure and a fallback object because two measured
-callers dereference the output without checking the HRESULT. Set `LEONIDA_XG_TRACE=1` to log the first 1024 calls
-per entry point. See [the source notes](../runtime/shims/xg_xs_THIRD_PARTY.md) and `xg_xs_test`. The table above
-predates the shim.
+The game executable imports two functions from `xg_xs.dll`, the console's texture layout library:
+`XGSuggestSwizzleMode` (2 call sites, in the helper that fills a texture description) and `XGCreateTextureComputer`
+(4 call sites, which use slots 1, 2, 8 and 10 of the returned object's vtable). `runtime/shims/xg_xs.cpp` answers them
+from a model of the console's texture layouts, `runtime/src/console_texture_layout.h` (AMD addrlib's GFX10 rules for
+the linear, 256 B, 4 KiB and 64 KiB modes: block shapes, mip tails, the micro tile patterns, a separate stencil plane),
+ported with the computer's method table and layout structure from Marvisak/VIctory (GPL-3.0-or-later, `xg.rs` and `texture.rs`
+at `d2a4bae1f`). `XGSuggestSwizzleMode` writes `0x100 | mode` (linear for 1D, `64KB_Z_X` for depth, `64KB_R_X` for
+render targets, else `4KB_S`); the computer fills the layout (slot 2), gives an element's offset (slot 6), copies a
+subresource into (slot 8) and out of (slot 9) tiled memory, and reports the 64 KiB tiling (slot 10). Not modelled:
+compression metadata planes, and addressing or copies for the pipe/bank XOR modes and MSAA (`E_NOTIMPL`). A description
+it cannot lay out still gets a computer in the out pointer with `E_INVALIDARG`, because two of the four callers ignore
+the HRESULT and call through the object at once; that object answers every slot with `E_NOTIMPL` and writes nothing.
+`xg_xs_test` covers the model (hand-checked addresses, mip tails, a bijection and round trip over every element) and the
+shim's slots. The table above was measured before this shim and still lists these two as unimplemented; they are served
+now.
+Set `LEONIDA_XG_TRACE=1` to log the first 1024 calls per entry point; the source notes are in
+[xg_xs_THIRD_PARTY.md](../runtime/shims/xg_xs_THIRD_PARTY.md).
 
 Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
 they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
@@ -186,6 +192,20 @@ The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so
 again at detach (reason 0), and there is no `exception`, `error` or `unimplemented_call` event. So none of the 30
 unimplemented imports is reached by the TLS callbacks or the `DllMain`s.
 
+The executable's audio imports `xapu.dll` (`XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`,
+`XApuEnqueueCommand`, `XApuGetResultCount`) and `chad.dll` (`XDspActivate`, `XDspConnectWithMaximumStreamLimit`,
+`XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand`) are served by `runtime/shims/xapu_chad.cpp`. The shapes were
+read statically from the executable's call sites: one each, four for `XApuEnqueueCommand`. Both connects succeed with
+a handle; the APU connect also returns a zeroed shared buffer the title writes stream input to and reads output from.
+Commands are accepted and not processed, so the audio stays silent. A stream open (type 1) and a stream close
+(type 2) each queue one result of the same type and slot, because the title frees a stream id only when the close
+result arrives. `XDspActivate` writes its two outputs as pointers to zeroed memory, which the title reads as "command
+done" after each `XDspSubmitCommand`. `XApuConnect` leaves its first argument, a global of the title, untouched. The
+buffer size (128 stream slots), the two results and the zeroed DSP status are hypotheses, explained in the file.
+`xapu_chad_test` calls all ten in those shapes. With `--trace`, the first call of each, and the first command of each type, is an
+`audio_queue` event.
+The table above was measured before this shim and still lists these ten as unimplemented; they are served now. The call shapes agree with `docs/audio_hal_exe_calls.md`, which was measured with `tools/import_call_sites.py`.
+
 What this does not show: `--run` has not been run, so the entry point has not been called and no import is known to be
 reached on the way to the first frame. A bound import is not a working one (the binding only says a function with
 that name exists), and an unimplemented import stops the run only if the title calls it
@@ -194,6 +214,19 @@ functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo
 outbound and name-resolution calls among them, loopback only (see the Winsock2 section below), and the remaining
 imports bind to the host's. `winhttp.dll` is served by the offline shim, which opens none. Known gap: `dnsapi.dll`
 (`DnsQuery*`) is not shimmed, so a title that calls it reaches the host's resolver.
+
+## Audio hardware (`AcpHal.dll`)
+
+The game executable imports nine functions from `AcpHal.dll`, the console's audio hardware layer.
+`runtime/shims/acphal.cpp` serves them; the argument shapes come from a static read of the executable's call sites
+(one thunk per import, 16 call sites in all), and the names of the parameters and object slots are hypotheses.
+`ApuCreateHeap` reserves one block of ordinary memory for both sizes it is given, `ApuAlloc` and `ApuFree` manage it
+first fit, and an APU address is a fixed 32-bit base plus the offset in it, so `ApuMapVirtualAddress` and
+`ApuMapApuAddress` are arithmetic and `ApuIsVirtualAddressValid` checks a live block and the alignment.
+`AcpHalAllocateShapeContexts` fills zeroed 64-byte contexts per count, and `AcpHalCreate` returns an object whose
+calls succeed and do nothing: there is no audio processor, so the game gets no sound from this path. Its boot checks
+fail hard, which is why every call succeeds. `acphal_test` covers the call shapes.
+The table under [The retail executable](#the-retail-executable-rt-5) was measured before this shim and still lists these nine as unimplemented; they are served now.
 
 ## Console paths and the write overlay
 

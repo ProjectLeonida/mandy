@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "d3d12_com.h"
 
 #include "d3d12_stubs.h"  // generated
@@ -209,6 +210,15 @@ public:
     const std::vector<std::pair<std::uint64_t, std::uint32_t>>& tables() const { return tables_; }
     // The pipeline states and root signatures the recording names (it holds a reference to each until Reset).
     const std::vector<IUnknown*>& pinned() const { return held_; }
+    bool needs_all_sampled_views() const {
+        if (directly_indexed_) return true;
+        for (const auto& command : list_.commands()) {
+            if (std::holds_alternative<leonida::ExecuteIndirect>(command)) return true;
+            if (tables_.empty() && (std::holds_alternative<leonida::Draw>(command) ||
+                                   std::holds_alternative<leonida::Dispatch>(command))) return true;
+        }
+        return false;
+    }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
     UINT back_stencil_ref() const { return back_stencil_ref_; }
     D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base() const { return cbv_srv_uav_base_; }
@@ -244,6 +254,7 @@ public:
         invalid_ = false;
         calls_.clear();
         tables_.clear();
+        directly_indexed_ = false;
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) set_initial_pipeline(state);  // reset_state holds it
@@ -532,19 +543,30 @@ public:
         for (UINT i = 0; i < count; ++i) {
             const auto& b = barriers[i];
             switch (b.Type) {
-            case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION:
-                check(list_.transition({resource_id(b.Transition.pResource), b.Transition.Subresource,
-                                        static_cast<std::uint32_t>(b.Transition.StateBefore),
-                                        static_cast<std::uint32_t>(b.Transition.StateAfter)},
-                                       static_cast<std::uint32_t>(b.Flags)));
+            case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION: {
+                const auto& t = b.Transition;
+                const auto logical = resource_id(t.pResource);
+                const bool was_storage = (t.StateBefore & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) != 0;
+                const bool storage = (t.StateAfter & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) != 0;
+                const auto pair = (was_storage || storage) ? xbox_depth_storage(t.pResource) : XboxDepthStorage{};
+                auto before = t.StateBefore;
+                if (pair.colour && was_storage != storage && !(b.Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)) {
+                    check(copy_depth_storage(logical, pair, storage, {t.Subresource}));
+                    before = D3D12_RESOURCE_STATE_COPY_DEST;
+                }
+                check(list_.transition({pair.colour && storage ? pair.colour : logical, t.Subresource,
+                                        u(before), u(t.StateAfter)}, u(b.Flags)));
                 break;
+            }
             case D3D12_RESOURCE_BARRIER_TYPE_ALIASING:
                 check(!b.Flags && list_.aliasing_barrier({resource_id(b.Aliasing.pResourceBefore),
                                                           resource_id(b.Aliasing.pResourceAfter)}));
                 break;
-            case D3D12_RESOURCE_BARRIER_TYPE_UAV:
-                check(!b.Flags && list_.uav_barrier({resource_id(b.UAV.pResource)}));
+            case D3D12_RESOURCE_BARRIER_TYPE_UAV: {
+                const auto pair = xbox_depth_storage(b.UAV.pResource);
+                check(!b.Flags && list_.uav_barrier({pair.colour ? pair.colour : resource_id(b.UAV.pResource)}));
                 break;
+            }
             default:
                 check(false);
             }
@@ -582,13 +604,25 @@ public:
                 case D3D12_BARRIER_TYPE_TEXTURE: {
                     const auto& b = group[g].pTextureBarriers[i];
                     const auto& r = b.Subresources;
-                    if (!list_.barrier(leonida::TextureBarrier{
-                            u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore), u(b.AccessAfter), u(b.LayoutBefore),
-                            u(b.LayoutAfter), resource_id(b.pResource),
-                            {r.IndexOrFirstMipLevel, r.NumMipLevels, r.FirstArraySlice, r.NumArraySlices,
-                             r.FirstPlane, r.NumPlanes},
-                            u(b.Flags)}) &&
-                        reject()) {
+                    leonida::TextureBarrier barrier{
+                        u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore), u(b.AccessAfter), u(b.LayoutBefore),
+                        u(b.LayoutAfter), resource_id(b.pResource),
+                        {r.IndexOrFirstMipLevel, r.NumMipLevels, r.FirstArraySlice, r.NumArraySlices, r.FirstPlane,
+                         r.NumPlanes}, u(b.Flags)};
+                    const bool was_storage = storage_access(b.LayoutBefore, b.AccessBefore);
+                    const bool storage = storage_access(b.LayoutAfter, b.AccessAfter);
+                    const auto pair = (was_storage || storage) ? xbox_depth_storage(b.pResource) : XboxDepthStorage{};
+                    if (pair.colour) {
+                        if (was_storage != storage && b.SyncAfter != D3D12_BARRIER_SYNC_SPLIT &&
+                            b.LayoutBefore != D3D12_BARRIER_LAYOUT_UNDEFINED && !(b.Flags & D3D12_TEXTURE_BARRIER_FLAG_DISCARD)) {
+                            check(copy_depth_storage(barrier.resource, pair, storage, barrier.range));
+                            barrier.sync_before = leonida::d3d12_sync::copy;
+                            barrier.access_before = leonida::d3d12_access::copy_dest;
+                            barrier.layout_before = leonida::d3d12_layout::copy_dest;
+                        }
+                        if (storage) barrier.resource = pair.colour;
+                    }
+                    if (!list_.barrier(barrier) && reject()) {
                         std::fprintf(stderr,
                                      "[rt] d3d12:   texture barrier sync 0x%x->0x%x access 0x%x->0x%x layout %u->%u "
                                      "mips %u+%u layers %u+%u planes %u+%u flags 0x%x\n",
@@ -1067,9 +1101,47 @@ public:
         check(list_.copy_acceleration_structure({dest, source, static_cast<std::uint32_t>(mode)}));
     }
 
+    bool xbox_label(const leonida::label::Write& op) { return list_.write_gpu_label(op); }
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
 
 private:
+    static bool storage_access(D3D12_BARRIER_LAYOUT layout, D3D12_BARRIER_ACCESS access) {
+        return (access & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS) ||
+               layout == D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS ||
+               layout == D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS ||
+               layout == D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS;
+    }
+
+    bool copy_depth_storage(leonida::ResourceId depth, XboxDepthStorage pair, bool to_storage,
+                            const leonida::BarrierSubresourceRange& r) {
+        namespace access = leonida::d3d12_access;
+        namespace sync = leonida::d3d12_sync;
+        const auto from = to_storage ? depth : pair.colour, to = to_storage ? pair.colour : depth;
+        // The two images can be in GENERAL for bindless use. Order prior depth writes, unordered writes and
+        // readers of the destination even when Vulkan does not need a layout transition.
+        if (!list_.barrier(leonida::GlobalBarrier{sync::all, sync::copy,
+                    access::depth_stencil_write | access::depth_stencil_read | access::unordered_access |
+                    access::shader_resource | access::copy_source | access::copy_dest,
+                    access::copy_source | access::copy_dest})) return false;
+        if (!r.mip_count && r.index_or_first_mip == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)
+            return list_.copy_resource({to, from});
+        const auto one = [&](UINT subresource) {
+            leonida::CopyTexture copy{};
+            copy.src.resource = from;
+            copy.dst.resource = to;
+            copy.src.subresource = copy.dst.subresource = subresource;
+            return list_.copy_texture(copy);
+        };
+        if (!r.mip_count) return r.index_or_first_mip < pair.mips * pair.layers && one(r.index_or_first_mip);
+        if (r.first_plane || r.plane_count != 1 || !r.layer_count ||
+            r.first_layer >= pair.layers || r.layer_count > pair.layers - r.first_layer ||
+            r.index_or_first_mip >= pair.mips || r.mip_count > pair.mips - r.index_or_first_mip) return false;
+        for (UINT layer = r.first_layer; layer < r.first_layer + r.layer_count; ++layer)
+            for (UINT mip = r.index_or_first_mip; mip < r.index_or_first_mip + r.mip_count; ++mip)
+                if (!one(layer * pair.mips + mip)) return false;
+        return true;
+    }
+
     static bool valid_postbuild_info_type(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_TYPE type) {
         switch (type) {
         case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE:
@@ -1246,12 +1318,24 @@ private:
         if (g::is_image(words)) {
             g::Image image{};
             if (!g::decode(words, image)) return false;
+            out.resource = uav_image_resource(resource, image.address);
+            if (!out.resource) return false;
             const bool volume = image.type == g::ImageType::image_3d;
+            const auto pair = xbox_depth_storage(resource);
+            if (pair.colour) out.resource = pair.colour;
+            if (g::partial_volume_uav(words, image)) {
+                // Transfer clears operate on a whole 3D mip, not a storage image view. Refuse instead of
+                // overwriting slices outside the UAV; a sliced clear needs a separate replay path.
+                stub("ClearUnorderedAccessView of a partial 3D mip");
+                return false;
+            }
             out.buffer = false;
             out.format = std::uint32_t(descriptor_format(image.format, image.swizzle));
             out.mip = image.first_mip;
             out.first_layer = volume ? 0 : image.first_layer;  // a 3D view clears every slice of its mip
             out.layer_count = volume ? 1 : image.layer_count;
+            out.exact_clear_format = volume || image.type == g::ImageType::image_1d ||
+                                     image.type == g::ImageType::image_1d_array;
             return out.format != VK_FORMAT_UNDEFINED;
         }
         g::BufferWords buffer_words{};
@@ -1301,6 +1385,7 @@ private:
         if (layout && layout == state.layout) return;
         hold(signature);  // state.layout points into it
         state.layout = layout;
+        if (layout && (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED)) directly_indexed_ = true;
         state.data = {};
         // CreateRootSignature accepted it for the other bind point only (its log line says why).
         if (layout && !(is_compute(state) ? layout->compute_ok : layout->graphics_ok)) {
@@ -1374,9 +1459,12 @@ private:
             va = leonida::title_va_aliases().resolve(va, kRootViewBytes, leonida::TitleVaAliases::root_view);
         else
             va = console_descriptor_table_va(va);
-        if (type != rt::rootsig::ParamType::Descriptor && va && p->table_descriptors &&
-            (tables_.empty() || tables_.back().first != va))
-            tables_.push_back({va, p->table_descriptors});
+        if (type != rt::rootsig::ParamType::Descriptor && va && p->table_descriptors) {
+            if (!tables_.empty() && tables_.back().first == va)
+                tables_.back().second = std::max(tables_.back().second, p->table_descriptors);
+            else
+                tables_.emplace_back(va, p->table_descriptors);
+        }
         const std::uint32_t first = first_dword(state, *p);
         write(state, first, std::uint32_t(va));
         // In the console layouts a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
@@ -1405,6 +1493,7 @@ private:
     leonida::IndexBufferView index_{};
     // SetGraphicsRootDescriptorTable / SetComputeRootDescriptorTable: VA, CBV/SRV/UAV slots the signature declares
     std::vector<std::pair<std::uint64_t, std::uint32_t>> tables_;
+    bool directly_indexed_ = false;
     // The span a root view may read: D3D12's largest constant buffer (4096 x 16 bytes).
     static constexpr std::uint64_t kRootViewBytes = 65536;
     leonida::Viewport viewport_{};
@@ -1999,6 +2088,11 @@ public:
             recorded.push_back(&list->commands());
             graphics.push_back(list);
         }
+        if (!context_.publish_cpu_textures()) {
+            last_result_=leonida::ReplayResult::unresolved_resource;
+            d3d12_trace::record(method,"failed");
+            return;
+        }
         // Buffer V#s the title wrote into a bound table itself may name its own memory: rewritten to a GPU copy's
         // console VA before the copies are refreshed for this submission (src/title_va_alias.h).
         {
@@ -2034,10 +2128,41 @@ public:
             }
             if (!tables.empty()) {
                 const auto start = std::chrono::steady_clock::now();
-                for (const auto& [table, descriptors] : tables) leonida::title_va_aliases().scan_table(table, descriptors);
+                for (const auto& [table, descriptors] : tables) {
+                    // A table VA is an offset in this device's arena, so its own scanner reads it; the process-wide
+                    // hook belongs to the first device that registered and serves a context without a scanner.
+                    if (!context_.scan_table(table, descriptors))
+                        leonida::title_va_aliases().scan_table(table, descriptors);
+                    if (!context_.prepare_sample_table(table, descriptors)) {
+                        last_result_ = leonida::ReplayResult::unresolved_resource;
+                        d3d12_trace::record(method, "failed");
+                        return;
+                    }
+                }
                 leonida::title_va_aliases().note_scan(std::uint64_t(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
                         .count()));
+            }
+        }
+        for (const auto* list : graphics) {
+            for (const auto& command : list->commands().commands()) {
+                leonida::ResourceId resource = 0;
+                if (const auto* b=std::get_if<leonida::TransitionBarrier>(&command)) {
+                    if (b->after & (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE|D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
+                        resource=b->resource;
+                } else if (const auto* b=std::get_if<leonida::TextureBarrier>(&command)) {
+                    if (b->access_after & D3D12_BARRIER_ACCESS_SHADER_RESOURCE) resource=b->resource;
+                }
+                if (resource && !context_.prepare_sample_table(resource,0)) {
+                    last_result_=leonida::ReplayResult::unresolved_resource;
+                    d3d12_trace::record(method,"failed");
+                    return;
+                }
+            }
+            if (list->needs_all_sampled_views() && !context_.prepare_sample_table(0,0)) {
+                last_result_ = leonida::ReplayResult::unresolved_resource;
+                d3d12_trace::record(method,"failed");
+                return;
             }
         }
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
@@ -2337,6 +2462,11 @@ private:
 };
 
 }  // namespace
+
+bool record_gpu_label(ID3D12GraphicsCommandList* list,const leonida::label::Write& write) {
+    auto* own=GraphicsCommandList::from(list);
+    return own && own->xbox_label(write);
+}
 
 HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t queue_family,
                              const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out, IUnknown* device,

@@ -16,6 +16,7 @@
 // that makes a GPU copy for an address in the title's memory that has none yet, and a scanner that rewrites the
 // buffer V#s of a bound descriptor table before a submission. Without hooks the table only translates what was
 // added to it, so it is tested without a GPU (title_va_alias_test).
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -266,6 +267,9 @@ public:
         resolver_ = nullptr;
         scanner_ = nullptr;
     }
+    // The resolver alone, for a device that scans its descriptor tables itself.
+    void set_resolver(void* context, Resolver resolver) { set_hooks(context, resolver, nullptr); }
+    void clear_resolver(void* context) { clear_hooks(context); }
 
     std::size_t size() const { return count_.load(std::memory_order_acquire); }
     std::uint64_t translated(Kind kind) const { return translated_[kind].load(std::memory_order_relaxed); }

@@ -46,6 +46,24 @@ using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);  // heap slot 9: ha
 
 namespace {
 
+struct TitleGeometryPages {
+    static constexpr UINT bytes_per_view = 3 * 1024 * 1024;
+    static constexpr UINT count = 7;
+    std::byte* base = nullptr;
+    ~TitleGeometryPages() {
+        if (base) {
+            leonida::title_va_aliases().remove_title_memory(reinterpret_cast<UINT64>(base));
+            VirtualFree(base,0,MEM_RELEASE);
+        }
+    }
+    bool allocate() {
+        base = static_cast<std::byte*>(VirtualAlloc(nullptr,SIZE_T(bytes_per_view)*count,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
+        if(!base) return false;
+        leonida::title_va_aliases().add_title_memory(reinterpret_cast<UINT64>(base),SIZE_T(bytes_per_view)*count);
+        return true;
+    }
+};
+
 struct Vertex {
     float x, y;
     std::uint8_t r, g, b, a;
@@ -399,7 +417,15 @@ int main(int argc, char** argv) {
         // State for the draws; the pipeline came with CreateCommandList.
         list->SetGraphicsRootSignature(root.p);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        const D3D12_VERTEX_BUFFER_VIEW vbv{vertex_buffer->GetGPUVirtualAddress(), sizeof(vertices), sizeof(Vertex)};
+        const bool large_batch = std::getenv("LEONIDA_TEST_GEOMETRY_BATCH") != nullptr;
+        TitleGeometryPages title_vertices;
+        D3D12_VERTEX_BUFFER_VIEW vbv{vertex_buffer->GetGPUVirtualAddress(), sizeof(vertices), sizeof(Vertex)};
+        if (large_batch) {
+            EXPECT(title_vertices.allocate());
+            std::memcpy(title_vertices.base,vertices,sizeof(vertices));
+            vbv.BufferLocation=reinterpret_cast<UINT64>(title_vertices.base);
+            vbv.SizeInBytes=TitleGeometryPages::bytes_per_view;
+        }
         constexpr UINT vertex_after_window = (65536 + sizeof(Vertex) - 1) / sizeof(Vertex);
         if (title_vertex) {
             std::memcpy(title_pages.get() + vertex_after_window * sizeof(Vertex), vertices, sizeof(vertices));
@@ -470,6 +496,18 @@ int main(int argc, char** argv) {
         list->SetGraphicsRoot32BitConstants(0, 2, down_right, 0);
         list->DrawIndexedInstanced(6, 1, 0, 0, 0);
 
+        if (large_batch) {
+            // More live bytes than the old 16 MiB ring. These zero-area triangles genuinely consume
+            // six separate CPU-backed views without changing the reference image of the five prior draws.
+            list->SetPipelineState(pso.p);
+            for (UINT i=1; i<TitleGeometryPages::count; ++i) {
+                const D3D12_VERTEX_BUFFER_VIEW extra{reinterpret_cast<UINT64>(title_vertices.base)+
+                    UINT64(i)*TitleGeometryPages::bytes_per_view,TitleGeometryPages::bytes_per_view,sizeof(Vertex)};
+                list->IASetVertexBuffers(0,1,&extra);
+                list->DrawInstanced(3,1,0,0);
+            }
+            list->IASetVertexBuffers(0,1,&vbv);
+        }
         D3D12_RESOURCE_BARRIER to_copy = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                     D3D12_RESOURCE_STATE_COPY_SOURCE);
         list->ResourceBarrier(1, &to_copy);
@@ -1204,7 +1242,12 @@ int main(int argc, char** argv) {
         allocator.reset();
         queue.reset();
         fence.reset();
-        EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
+        // The device keeps the buffers it made over the title's vertex pages until it goes (make_title_buffer), and
+        // each holds a reference: the large batch leaves seven of them.
+        if (std::getenv("LEONIDA_TEST_GEOMETRY_BATCH"))
+            EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) >= 1);
+        else
+            EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
 
     unsigned mismatches = 0;

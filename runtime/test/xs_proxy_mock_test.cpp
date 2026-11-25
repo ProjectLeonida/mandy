@@ -17,6 +17,7 @@
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/xmem.h"
 #include "../src/d3d12_xs_frame_events.h"
+#include "../src/native_pso.h"
 
 #include <d3d12.h>
 #include <windows.h>
@@ -114,7 +115,8 @@ struct Mock {
     std::uint64_t args[kMockSlots][6];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
     D3D12_COMMAND_QUEUE_DESC queue_desc;  // device: the description of its last CreateCommandQueue (slot 8)
-    IUnknown* held;                      // ID3D12Object::SetPrivateDataInterface (slot 5): one reference, until destroyed
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv;  // device: the description CreateShaderResourceView (slot 18) last received
+    IUnknown* held;                     // ID3D12Object::SetPrivateDataInterface (slot 5): one reference, until destroyed
     std::uint64_t tail[kMockSlots][3];   // device slots 27/53: the words after the fifth (a6..a8), as received
     bool words_only;                     // device slot 27: record the words and return S_OK, creating nothing
     UINT om_rtv_count;                   // list slot 46 (OMSetRenderTargets): captured RTV/DSV handles
@@ -338,6 +340,8 @@ std::uint64_t mock_allocation_info(std::uint64_t ret, std::uint64_t count, std::
 std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     const std::uint64_t a1 = words[0], a2 = words[1], a3 = words[2], a4 = words[3], a5 = words[4], a6 = words[5];
     if (m->kind == Kind::device) {
+        // The description lives on the caller's stack only for the call, so it is copied while the call is active.
+        if (slot == 18 && a2 >= 0x10000) std::memcpy(&m->srv, reinterpret_cast<const void*>(a2), sizeof(m->srv));
         switch (slot) {
             case 8:                                                                           // CreateCommandQueue
                 if (a1) std::memcpy(&m->queue_desc, reinterpret_cast<const void*>(a1), sizeof(m->queue_desc));
@@ -871,7 +875,7 @@ int check_levels() {
             static std::uint32_t seen_layout = 0;
             const xs::PlacedAtVaHandler handler = [](ID3D12Device* real_device, void* va,
                                                      const D3D12_RESOURCE_DESC& desc, std::uint32_t layout,
-                                                     REFIID iid, void** out) -> HRESULT {
+                                                     REFIID iid, void** out, const D3D12_CLEAR_VALUE*) -> HRESULT {
                 seen_layout = layout;
                 seen_real = real_device;
                 seen_va = va;
@@ -920,7 +924,7 @@ int check_levels() {
                 return hook_result;
             };
             const xs::PlacedAtVaHandler handler = [](ID3D12Device*, void*, const D3D12_RESOURCE_DESC&, std::uint32_t,
-                                                     REFIID, void** out) -> HRESULT {
+                                                     REFIID, void** out, const D3D12_CLEAR_VALUE*) -> HRESULT {
                 handler_at = ++order;
                 *out = reinterpret_cast<void*>(0x1331);
                 return S_OK;
@@ -1543,6 +1547,86 @@ int check_placed_resource_x() {
     return 0;
 }
 
+// The same stand-in with LEONIDA_SLOT133_LAYOUT_WORD=1 (its own process: the switch is read once): the fourth word is
+// a D3D12_BARRIER_LAYOUT. A device without ID3D12Device10 gets the legacy state of that layout through
+// CreateCommittedResource; one with it gets CreateCommittedResource3 and the layout as given.
+int run_slot133_layout_word() {
+    g_label = "xs_proxy_mock --slot133-layout";
+    EXPECT(_putenv_s("LEONIDA_SLOT133_LAYOUT_WORD", "1") == 0);
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    constexpr std::uint64_t kVa = 0x7f0000000000ull;
+    constexpr std::uint32_t kXboxFlag = 0x20000;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = 1 << 20;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+    buffer.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | kXboxFlag);
+    D3D12_RESOURCE_DESC target = buffer;
+    target.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    target.Width = 64;
+    target.Height = 32;
+    target.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    target.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | kXboxFlag);
+    const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8G8B8A8_UNORM, {{0, 0, 0, 1}}};
+    void* resource = nullptr;
+
+    // A buffer is COMMON whatever word it came with.
+    EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 2, word(&clear), word(&kResourceIid), word(&resource))) == S_OK);
+    EXPECT(resource && mock->calls[27] == 1 && g_committed.state == D3D12_RESOURCE_STATE_COMMON && !g_committed.clear);
+    EXPECT(g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
+    EXPECT(release(resource) == 0);
+    // RENDER_TARGET (2) is that state, with the clear value.
+    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 2, word(&clear), word(&kResourceIid), word(&resource))) == S_OK);
+    EXPECT(mock->calls[27] == 2 && g_committed.state == D3D12_RESOURCE_STATE_RENDER_TARGET && g_committed.clear == &clear);
+    EXPECT(g_committed.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET &&
+           g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
+    EXPECT(release(resource) == 0);
+    // SHADER_RESOURCE (6) is the shader-resource states, not INDEX_BUFFER | RENDER_TARGET.
+    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 6, 0, word(&kResourceIid), word(&resource))) == S_OK);
+    EXPECT(mock->calls[27] == 3 && g_committed.state == D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    EXPECT(release(resource) == 0);
+    // UNORDERED_ACCESS (3), and the all-ones layout (UNDEFINED) as COMMON.
+    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 3, 0, word(&kResourceIid), word(&resource))) == S_OK);
+    EXPECT(mock->calls[27] == 4 && g_committed.state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    EXPECT(release(resource) == 0);
+    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 0xFFFFFFFFu, 0, word(&kResourceIid), word(&resource))) ==
+           S_OK);
+    EXPECT(mock->calls[27] == 5 && g_committed.state == D3D12_RESOURCE_STATE_COMMON);
+    EXPECT(release(resource) == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    // A PC device with ID3D12Device10: CreateCommittedResource3 with the layout as given, never CreateCommittedResource.
+    Mock* mock10 = nullptr;
+    void* device10 = make_device(mock10, 10, true);
+    EXPECT(device10);
+    g_committed3 = {};
+    EXPECT(hr_of(raw6(device10, 133, kVa, word(&target), 6, word(&clear), word(&kResourceIid), word(&resource))) ==
+           S_OK);
+    EXPECT(resource && g_committed3.calls == 1 && mock10->calls[27] == 0);
+    EXPECT(g_committed3.layout == 6 && g_committed3.clear == &clear && !g_committed3.session &&
+           g_committed3.castable_count == 0 && g_committed3.riid == &kResourceIid);
+    EXPECT(g_committed3.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET &&
+           g_committed3.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN && g_committed3.desc.Width == 64);
+    EXPECT(release(resource) == 0);
+    // A buffer goes in UNDEFINED whatever word it came with, and without a clear value.
+    EXPECT(hr_of(raw6(device10, 133, kVa, word(&buffer), 2, word(&clear), word(&kResourceIid), word(&resource))) ==
+           S_OK);
+    EXPECT(g_committed3.calls == 2 && g_committed3.layout == 0xFFFFFFFFu && !g_committed3.clear);
+    EXPECT(release(resource) == 0);
+    EXPECT(release(device10) == 0 && mock10->refs == 0);
+#endif
+    std::printf("%s: with LEONIDA_SLOT133_LAYOUT_WORD=1 the stand-in reads the fourth word as a barrier layout\n",
+                g_label);
+    return 0;
+}
+
 // ---- 7. Xbox device slots from the public HLE (48, 73, 78, 79, 80) and the retail title (41) ----
 //
 // A device that answers ID3D12Device11 (80 PC slots) is the Vulkan layer's shape: slots 78/79 are inside its table
@@ -2013,8 +2097,8 @@ int run_env_slots(bool valid, bool on_slot74 = false, bool on_slot70 = false) {
         EXPECT(release(allocator) == 0);
 
         // The presenter answers frame statistics at 101 only (81 is not routed, so the mock refuses it); PresentX
-        // stays at 30, SuspendX answers at 33, and ResumeX, asked for 30, is unrouted, so 32 gets the console tail's
-        // S_OK without reaching the presenter.
+        // stays at 30, SuspendX answers at 33, and ResumeX, asked for 30, is unrouted, so 32 is refused on a device
+        // with a presenter attached, without reaching the presenter.
         EnvPresenter env{};
         xs::PresentationHandler h{};
         h.context = &env;
@@ -2040,7 +2124,7 @@ int run_env_slots(bool valid, bool on_slot74 = false, bool on_slot70 = false) {
         EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&count), 0)) == E_NOTIMPL && env.stats == 1);
         EXPECT(hr_of(raw(queue, 30, 1, 0, 0)) == S_OK && env.present == 1);
         EXPECT(hr_of(raw(queue, 33)) == S_OK && env.suspend == 1);
-        EXPECT(hr_of(raw(queue, 32)) == S_OK && env.resume == 0);
+        EXPECT(hr_of(raw(queue, 32)) == E_NOTIMPL && env.resume == 0);
         EXPECT(xs::set_presentation_handler(device, nullptr));
         EXPECT(release(queue) == 0);
     } else {
@@ -2347,6 +2431,55 @@ int check_resource_allocation_info() {
 
 // ---- 8. Device slot 70: a view from raw words, never the PC CreatePlacedResource1 ----
 
+// What the layer's resource provider knows: one buffer at [kBufferStart, kBufferStart + kBufferSize).
+Mock* g_buffer = nullptr;
+constexpr std::uint64_t kBufferStart = 0x10000, kBufferSize = 0x400;
+
+std::uint64_t g_asked_bytes = 0;  // the byte count the proxy last asked the provider to cover
+
+ID3D12Resource* find_buffer(ID3D12Device*, std::uint64_t va, std::uint64_t bytes, std::uint64_t* start,
+                            std::uint64_t* size) {
+    g_asked_bytes = bytes;
+    if (!g_buffer || va < kBufferStart || va >= kBufferStart + kBufferSize) return nullptr;
+    *start = kBufferStart;
+    *size = kBufferSize;
+    ++g_buffer->refs;  // the provider hands out a reference; the proxy releases it
+    return reinterpret_cast<ID3D12Resource*>(g_buffer);
+}
+
+// The measured retail shape: a desktop buffer description, then a raw R32_TYPELESS view description with the VA right
+// after it.
+struct RawShape {
+    D3D12_RESOURCE_DESC resource;
+    struct {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view;
+        D3D12_GPU_VIRTUAL_ADDRESS va;
+    } view;
+};
+
+RawShape raw_shape(std::uint64_t va, std::uint64_t width) {
+    RawShape shape{};
+    shape.resource.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    shape.resource.Width = width;
+    shape.resource.Height = 1;
+    shape.resource.DepthOrArraySize = 1;
+    shape.resource.MipLevels = 1;
+    shape.resource.SampleDesc.Count = 1;
+    shape.resource.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    shape.view.view.Format = DXGI_FORMAT_R32_TYPELESS;
+    shape.view.view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    shape.view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    shape.view.view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    shape.view.va = va;
+    return shape;
+}
+
+bool is_null_view(const Mock* mock) {
+    return mock->args[18][0] == 0 && mock->srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D &&
+           mock->srv.Format == DXGI_FORMAT_R8G8B8A8_UNORM && mock->srv.Texture2D.MipLevels == 1 &&
+           mock->srv.Shader4ComponentMapping == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+}
+
 int check_slot70() {
     // Level 9 has the PC slot 70; level 0 does not (44 PC slots). Neither may reach CreatePlacedResource1.
     for (const int level : {9, 0}) {
@@ -2412,6 +2545,61 @@ int check_slot74() {
     return 0;
 }
 
+// A raw buffer view of a registered VA: the view is of that resource, from (va - start) / 4, as wide as the
+// description says. Every other shape, and a VA no buffer holds, still gets the null view.
+int check_slot70_raw_buffer() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    g_buffer = new_mock(Kind::resource);
+    g_buffer->refs = 1;
+    EXPECT(xs::set_device_resource_provider(device, &find_buffer));
+    const std::uint64_t destination = 0x7000;
+
+    // 0x100 bytes at +0x40 of the buffer.
+    RawShape shape = raw_shape(kBufferStart + 0x40, 0x100);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[70] == 0 && mock->calls[18] == 1 && mock->args[18][0] == word(g_buffer) &&
+           mock->args[18][2] == destination);
+    EXPECT(mock->srv.Format == DXGI_FORMAT_R32_TYPELESS && mock->srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER &&
+           (mock->srv.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) && mock->srv.Buffer.FirstElement == 0x10 &&
+           mock->srv.Buffer.NumElements == 0x40 && mock->srv.Buffer.StructureByteStride == 0 &&
+           mock->srv.Shader4ComponentMapping == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+    EXPECT(g_buffer->refs == 1);  // the proxy released the reference the provider added
+    EXPECT(g_asked_bytes == 0x100);  // it asks for a buffer that holds the whole width, so an alias that does wins
+
+    // A width that runs past the buffer is cut at its end: (0x400 - 0x3f0) / 4 elements.
+    shape = raw_shape(kBufferStart + 0x3f0, 0x1000);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == 2 && mock->args[18][0] == word(g_buffer) && mock->srv.Buffer.FirstElement == 0xfc &&
+           mock->srv.Buffer.NumElements == 4);
+
+    // A VA no buffer holds: the null view, and nothing is left referenced.
+    shape = raw_shape(kBufferStart + kBufferSize + 0x40, 0x100);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == 3 && is_null_view(mock) && g_buffer->refs == 1);
+
+    // A known VA but not a raw R32_TYPELESS buffer view (a typed view; a texture description): the null view.
+    shape = raw_shape(kBufferStart + 0x40, 0x100);
+    shape.view.view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == 4 && is_null_view(mock));
+    shape = raw_shape(kBufferStart + 0x40, 0x100);
+    shape.resource.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == 5 && is_null_view(mock) && g_buffer->refs == 1);
+
+    // No provider: the null view as well.
+    EXPECT(xs::set_device_resource_provider(device, nullptr));
+    shape = raw_shape(kBufferStart + 0x40, 0x100);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == 6 && is_null_view(mock) && mock->calls[70] == 0);
+
+    g_buffer = nullptr;
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    return 0;
+}
+
 // ---- 7. Device slot 25, GetResourceAllocationInfo: a render target takes whole console tiles ----
 
 D3D12_RESOURCE_DESC target_desc(std::uint64_t width, UINT height, DXGI_FORMAT format, UINT slices = 1) {
@@ -2426,6 +2614,82 @@ D3D12_RESOURCE_DESC target_desc(std::uint64_t width, UINT height, DXGI_FORMAT fo
     d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);  // the Xbox tiled layout word
     d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     return d;
+}
+
+// ---- Device slot 57, the native graphics pipeline state: the factory first, the PC description as the fallback ----
+
+HRESULT g_factory_result = E_NOTIMPL;
+unsigned g_factory_calls = 0;
+ID3D12Device* g_factory_device = nullptr;
+const void* g_factory_root = nullptr;
+void* const kFactoryPipeline = reinterpret_cast<void*>(0x5757);
+
+HRESULT native_factory(ID3D12Device* real, const leonida::native_pso::GraphicsDesc& desc, REFIID, void** out) {
+    ++g_factory_calls;
+    g_factory_device = real;
+    g_factory_root = desc.root_signature;
+    if (SUCCEEDED(g_factory_result)) *out = kFactoryPipeline;
+    return g_factory_result;
+}
+
+// A description with no stage and no state blob: the fallback builds its PC description from defaults and hands it
+// to the device's CreateGraphicsPipelineState (PC slot 10), which the mock records.
+int check_slot57_native_graphics() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    const IID pipeline_iid = __uuidof(ID3D12PipelineState);
+    leonida::native_pso::GraphicsDesc desc{};
+    desc.root_signature = reinterpret_cast<const void*>(0x4004);
+    void* out = reinterpret_cast<void*>(0x1111);
+
+    // No factory: the PC description path, as before there was one.
+    EXPECT(hr_of(raw(device, 57, word(&desc), word(&pipeline_iid), word(&out))) == S_OK);
+    EXPECT(mock->calls[10] == 1 && mock->args[10][2] == word(&out) && mock->calls[57] == 0 && out == nullptr);
+
+    // A factory that cannot build the description (no catalogue, a stage it does not know) answers E_NOTIMPL: it was
+    // asked once, with the device behind the proxy and the description, and the PC description path then runs.
+    xs::set_device_native_graphics_factory(device, &native_factory);
+    g_factory_result = E_NOTIMPL;
+    out = reinterpret_cast<void*>(0x1111);
+    EXPECT(hr_of(raw(device, 57, word(&desc), word(&pipeline_iid), word(&out))) == S_OK);
+    EXPECT(g_factory_calls == 1 && g_factory_device == reinterpret_cast<ID3D12Device*>(mock) &&
+           g_factory_root == desc.root_signature);
+    EXPECT(mock->calls[10] == 2 && mock->args[10][2] == word(&out) && out == nullptr);
+
+    // A factory that builds it: its pipeline is the answer and the PC description path is not asked.
+    g_factory_result = S_OK;
+    out = nullptr;
+    EXPECT(hr_of(raw(device, 57, word(&desc), word(&pipeline_iid), word(&out))) == S_OK);
+    EXPECT(g_factory_calls == 2 && out == kFactoryPipeline && mock->calls[10] == 2);
+
+    // A refusal other than E_NOTIMPL is the title's answer; nothing falls back.
+    for (const HRESULT refusal : {E_INVALIDARG, E_OUTOFMEMORY, E_FAIL}) {
+        const unsigned asked = g_factory_calls;
+        g_factory_result = refusal;
+        out = reinterpret_cast<void*>(0x1111);
+        EXPECT(hr_of(raw(device, 57, word(&desc), word(&pipeline_iid), word(&out))) == refusal);
+        EXPECT(g_factory_calls == asked + 1 && out == nullptr && mock->calls[10] == 2);
+    }
+
+    // A description the proxy cannot read is refused before the factory sees it, and does not fall back either.
+    g_factory_result = S_OK;
+    void* reserved = VirtualAlloc(nullptr, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
+    EXPECT(reserved);
+    const unsigned asked = g_factory_calls;
+    out = reinterpret_cast<void*>(0x1111);
+    EXPECT(hr_of(raw(device, 57, word(reserved), word(&pipeline_iid), word(&out))) == E_INVALIDARG);
+    EXPECT(g_factory_calls == asked && out == nullptr && mock->calls[10] == 2);
+    VirtualFree(reserved, 0, MEM_RELEASE);
+
+    // The factory removed again: back to the PC description path.
+    xs::set_device_native_graphics_factory(device, nullptr);
+    out = reinterpret_cast<void*>(0x1111);
+    EXPECT(hr_of(raw(device, 57, word(&desc), word(&pipeline_iid), word(&out))) == S_OK);
+    EXPECT(g_factory_calls == asked && mock->calls[10] == 3 && mock->calls[57] == 0);
+
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    return 0;
 }
 
 int check_render_target_sizes() {
@@ -3543,6 +3807,7 @@ int check_console_command_list() {
         const std::uint64_t upload = raw(list_proxy, 148, 2048, 512, 0, 0);
         EXPECT(upload != 0);
         EXPECT(upload % 512 == 0);
+        std::memset(reinterpret_cast<void*>(upload), 0x5a, 2048);
     }
     EXPECT(xs::list_slot_hits(148) == 1);
     EXPECT(xs::list_slot_first_call_seen(148));
@@ -3739,13 +4004,14 @@ int check_presentation_wiring() {
     UINT count = 3;
     EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&count), 0)) == S_FALSE && count == 0 && p.stats_calls == 1);
 
-    // Queue slot 30 routes to PresentX while attached. SuspendX and ResumeX have no default route, so 31/32 get the
-    // console tail's S_OK and never reach the presenter (the env mode, run_env_slots, routes them).
+    // Queue slot 30 routes to PresentX while attached. SuspendX and ResumeX have no default route, so 31/32 are refused
+    // on a device with a presenter attached and never reach the presenter (the env mode, run_env_slots, routes them).
     EXPECT(hr_of(raw(queue, 30, 1, 0x1000, 0x2000)) == S_OK && p.present_calls == 1 && p.last_planes == 1);
-    EXPECT(hr_of(raw(queue, 31, 0)) == S_OK && p.suspend_calls == 0);
-    EXPECT(hr_of(raw(queue, 32)) == S_OK && p.resume_calls == 0);
+    EXPECT(hr_of(raw(queue, 31, 0)) == E_NOTIMPL && p.suspend_calls == 0);
+    EXPECT(hr_of(raw(queue, 32)) == E_NOTIMPL && p.resume_calls == 0);
 
-    // Detached, the beyond-PC queue slots fall back to the console tail and the presenter is not called again.
+    // Detached, a device that had a presenter attached does not fall back to its own presenter or the console tail:
+    // queue slots 30 to 32 are refused and the presenter is not called again.
     EXPECT(xs::set_presentation_handler(device, nullptr));
     // Unattached GetFrameStatisticsX: no statistics yet (S_OK and a zero count), never the PC slot 81.
     UINT none = 7;
@@ -3754,14 +4020,15 @@ int check_presentation_wiring() {
     none = 7;
     EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&none), 0)) == E_POINTER && none == 7 && p.stats_calls == 1);
     EXPECT(hr_of(raw(device, 81, 77, 0x1a, 0, 0)) == E_POINTER && p.stats_calls == 1);
-    EXPECT(hr_of(raw(queue, 30, 1, 0, 0)) != E_NOTIMPL && p.present_calls == 1);
+    EXPECT(hr_of(raw(queue, 30, 1, 0, 0)) == E_NOTIMPL && p.present_calls == 1);
 
     EXPECT(release(queue) == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
 
     // PresentX is one slot per layout, never both. A queue is in the older layout (PresentX at 30) until a fence
     // reaches slot 16 or 17, which only the newer layout's Signal and Wait take; from then on PresentX is two slots
-    // later, at 32, and slot 30 is another console method there: S_OK, and the presenter is not called.
+    // later, at 32, and slot 30 is another console method there; with a presenter attached the slot of the other
+    // layout is refused, and the presenter is not called.
     Mock* newer_mock = nullptr;
     void* newer_device = make_device(newer_mock, 11, true);
     void* newer_queue = make_queue(newer_device);
@@ -3772,10 +4039,10 @@ int check_presentation_wiring() {
     nh.context = &np;
     EXPECT(xs::set_presentation_handler(newer_device, &nh));
     EXPECT(hr_of(raw(newer_queue, 30, 1, 0x1000, 0x2000)) == S_OK && np.present_calls == 1);
-    EXPECT(hr_of(raw(newer_queue, 32, 1, 0x1000, 0x2000)) == S_OK && np.present_calls == 1);
+    EXPECT(hr_of(raw(newer_queue, 32, 1, 0x1000, 0x2000)) == E_NOTIMPL && np.present_calls == 1);
     EXPECT(hr_of(raw(newer_queue, 16, word(newer_fence), 1)) == S_OK);
     EXPECT(hr_of(raw(newer_queue, 32, 2, 0x1000, 0x2000)) == S_OK && np.present_calls == 2 && np.last_planes == 2);
-    EXPECT(hr_of(raw(newer_queue, 30, 1, 0x1000, 0x2000)) == S_OK && np.present_calls == 2);
+    EXPECT(hr_of(raw(newer_queue, 30, 1, 0x1000, 0x2000)) == E_NOTIMPL && np.present_calls == 2);
     EXPECT(xs::set_presentation_handler(newer_device, nullptr));
     EXPECT(release(newer_queue) == 0 && release(newer_fence) == 0);
     EXPECT(release(newer_device) == 0 && newer_mock->refs == 0);
@@ -3792,6 +4059,7 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[1], "--env-slots-invalid") == 0) return run_env_slots(false);
         if (std::strcmp(argv[1], "--env-slots-74") == 0) return run_env_slots(true, true);
         if (std::strcmp(argv[1], "--env-slots-70") == 0) return run_env_slots(true, false, true);
+        if (std::strcmp(argv[1], "--slot133-layout") == 0) return run_slot133_layout_word();
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
@@ -3800,7 +4068,8 @@ int main(int argc, char** argv) {
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_lists() ||
         check_signalx_detection() || check_list_tail_names() || check_console_command_list() ||
         check_custom_heap_properties() ||
-        check_resource_allocation_info() || check_slot70() || check_committed_resource3_x() ||
+        check_resource_allocation_info() || check_slot70() || check_slot70_raw_buffer() ||
+        check_slot57_native_graphics() || check_committed_resource3_x() ||
         check_descriptor_heap_hooks() ||
         check_render_target_sizes() ||
         check_allocation_descriptions_cleaned() ||
