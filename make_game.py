@@ -314,12 +314,21 @@ def need(exe: str, hint: str) -> str:
 
 
 # ---------------------------------------------------------------- check
-def versions() -> list:
+@functools.cache
+def versions() -> list[dict]:
+    versions_path = Path(VERSIONS)
+    if not versions_path.is_dir():
+        return []
+    
     out = []
-    for name in sorted(os.listdir(VERSIONS)):
-        if name.endswith(".json"):
-            with open(os.path.join(VERSIONS, name), encoding="utf-8") as f:
-                out.append(json.load(f))
+    for file_path in sorted(versions_path.glob("*.json")):
+        try:
+            data = json.loads(file_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                data.setdefault("_manifest", file_path.name)
+                out.append(data)
+        except (OSError, json.JSONDecodeError) as e:
+            fail(f"Could not read version manifest {file_path.name}: {e}")
     return out
 
 
