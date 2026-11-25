@@ -241,9 +241,65 @@ void check_read_file_first_touch(const std::filesystem::path& root) {
     g_first_touch = nullptr;
 }
 
+// --trace-opens, in a process of its own because the budgets are per process: with the startup trace on, the first
+// 600 successful opens are "file_open" events and the rest are not, a failed open keeps its own event and budget, an
+// open with the trace off writes nothing, and the last error of a successful OPEN_ALWAYS is the one the open left.
+void check_successful_open_trace(const std::filesystem::path& root) {
+    const auto package = root / "package";
+    const auto overlay = root / "overlay";
+    write_path(package / "off.txt", "off");
+    write_path(overlay / "existing.txt", "on");
+    rt::fs::configure(package, overlay);
+    const auto wide = resolve<CreateFileWFn>("kernel32.dll", "CreateFileW");
+    const auto second = resolve<CreateFile2Fn>("api-ms-win-core-file-l1-2-0.dll", "CreateFile2");
+    check(wide && second, "both file-open imports resolve");
+    if (!wide || !second) return;
+
+    const auto open_read = [&](const wchar_t* path) {
+        HANDLE h = wide(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        return h != INVALID_HANDLE_VALUE && CloseHandle(h);
+    };
+    check(open_read(L"GAME:\\off.txt"), "a file opens before tracing starts");
+    const auto trace = root / "trace.jsonl";
+    if (!rt::startup_trace::open(trace.c_str())) {
+        check(false, "open the trace file");
+        return;
+    }
+    HANDLE h = second(L"GAME:\\existing.txt", GENERIC_READ, FILE_SHARE_READ, OPEN_ALWAYS, nullptr);
+    const DWORD error = GetLastError();
+    check(h != INVALID_HANDLE_VALUE && error == ERROR_ALREADY_EXISTS, "OPEN_ALWAYS preserves its success last-error");
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    bool all_opened = true;
+    for (unsigned i = 0; i < 601; ++i) {
+        if (!open_read(L"GAME:\\existing.txt")) all_opened = false;
+    }
+    check(all_opened, "file opens still succeed beyond the trace limit");
+    check(!open_read(L"GAME:\\missing.txt") && GetLastError() == ERROR_FILE_NOT_FOUND,
+          "a missing file still returns its native error");
+    rt::startup_trace::close();
+
+    std::ifstream in(trace);
+    unsigned wide_events = 0, second_events = 0, failed_events = 0;
+    bool fields_match = true, off_path_absent = true;
+    for (std::string line; std::getline(in, line);) {
+        if (line.find("off.txt") != std::string::npos) off_path_absent = false;
+        if (line.find("\"kind\":\"file_open_failed\"") != std::string::npos) ++failed_events;
+        if (line.find("\"kind\":\"file_open\"") == std::string::npos) continue;
+        if (line.find("\"api\":\"CreateFileW\"") != std::string::npos) ++wide_events;
+        if (line.find("\"api\":\"CreateFile2\"") != std::string::npos) ++second_events;
+        if (line.find("\"path\":\"GAME:\\\\existing.txt\"") == std::string::npos ||
+            line.find("\"access\":" + std::to_string(GENERIC_READ) + ",") == std::string::npos ||
+            line.find("\"caller\":\"host:") == std::string::npos) fields_match = false;
+    }
+    check(second_events == 1, "CreateFile2 emits a success event");
+    check(wide_events == 599, "CreateFileW fills the remaining success budget");
+    check(wide_events + second_events == 600 && fields_match, "600 events contain the guest path, access and caller");
+    check(failed_events == 1 && off_path_absent, "failure reporting is independent and disabled tracing emits nothing");
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     // A folder of this run's own: Wine hands each fresh prefix the same small process ids, so a folder named after
     // the process id alone can be one an earlier run left behind.
     LARGE_INTEGER now{};
@@ -256,8 +312,12 @@ int main() {
     // An exception from one check (std::filesystem throws on a host error) ends the checks, not the run: it is a
     // failure, the folder is still removed and the summary is still printed.
     try {
-        check_read_file_first_touch(root / "first_touch");
-        run_checks(root);
+        if (argc == 2 && std::string(argv[1]) == "--trace-opens") {
+            check_successful_open_trace(root);
+        } else {
+            check_read_file_first_touch(root / "first_touch");
+            run_checks(root);
+        }
     } catch (const std::exception& e) {
         check(false, (std::string("the checks run to the end (stopped by: ") + e.what() + ")").c_str());
     }

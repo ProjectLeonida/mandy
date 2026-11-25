@@ -604,6 +604,7 @@ from the ANSI code page.
 | `xmem_attributes` | the first `XMemAlloc`, `XMemFree`, `XMemAllocDefault`, `XMemFreeDefault` and `XMemVirtualAlloc` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (not for the frees), `caller` (module+RVA) |
 | `xmem_physical_pages` | the first `XMemAllocatePhysicalPages` for each distinct attribute word | `api`, `attributes`, `pages`, `caller` |
 | `file_open_failed` | a guest `CreateFileW`/`CreateFile2` that fails (at most 256 events) | `api`, `path` (as the title passed it), `error` (Win32), `caller` (module+RVA) |
+| `file_open` | a guest `CreateFileW`/`CreateFile2` that succeeds (the first 600, counted apart from the failures) | `api`, `path` (as the title passed it), `access` (the requested access mask), `caller` |
 | `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over | `at` (module+RVA) |
 | `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
 | `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames) |
