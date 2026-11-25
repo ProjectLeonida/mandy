@@ -20,6 +20,14 @@ import run_gpu_tests
 
 
 class PythonAssemblerTests(unittest.TestCase):
+    def test_native_assembler_error_preserves_undecodable_diagnostics(self):
+        run = subprocess.run
+        child = [sys.executable, "-c", "import sys; sys.stderr.buffer.write(b'bad operand \\xff'); sys.exit(1)"]
+        with patch.object(run_gpu_tests.subprocess, "run", side_effect=lambda _, **kw: run(child, **kw)):
+            with self.assertRaises(RuntimeError) as raised:
+                run_gpu_tests.spirv_as("", "unused.spv")
+        self.assertIn(r"bad operand \xff", str(raised.exception))
+
     def test_resolve_assembler_auto_and_explicit(self) -> None:
         self.assertEqual(run_gpu_tests.resolve_assembler("python"), "python")
         self.assertEqual(run_gpu_tests.resolve_assembler("spirv-as"), "spirv-as")

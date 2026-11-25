@@ -169,7 +169,7 @@ def spirv_as(asm_text: str, out_spv: str, assembler: str = "spirv-as") -> None:
         return
     try:
         p = subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-o", out_spv, "-"],
-                           input=asm_text, capture_output=True, text=True)
+                           input=asm_text, capture_output=True, encoding="utf-8", errors="backslashreplace")
     except FileNotFoundError:
         raise RuntimeError("spirv-as not found on PATH (use --assembler python to assemble with tools/spirv_asm.py)") from None
     except OSError as exc:
