@@ -14,6 +14,8 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <array>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -60,9 +62,10 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
                             void** out, IUnknown* device = nullptr, ID3D12PipelineState* initial_state = nullptr);
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
                      void** out, IUnknown* device = nullptr);
-HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
-                                 IUnknown* device = nullptr);
-bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride);
+HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, UINT packed_size, REFIID riid, void** out,
+                                 IUnknown* device, std::span<const D3D12_INDIRECT_ARGUMENT_DESC> prefix);
+bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride,
+                            bool& terminal_only);
 
 // ID3D12Device1::SetEventOnMultipleFenceCompletion on fences from create_fence: sets `event` once every fence
 // (D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL) or any fence (_ANY) has reached its value; a null event blocks until then.
@@ -171,6 +174,10 @@ struct VulkanDeviceInfo {
     bool swapchain_colorspace = false;
     // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
     bool image_view_min_lod = false;
+    // VK_EXT_robustness2 with nullDescriptor is enabled on `device`: set 0's storage-array fallbacks are null
+    // descriptors, so stores and atomics through a null UAV are dropped (src/vulkan_bindless.h). Without it they are
+    // 1x1 images of their own, apart from the sampled fallbacks the null SRVs read.
+    bool null_descriptor = false;
     // VK_KHR_vertex_attribute_divisor or VK_EXT_vertex_attribute_divisor with vertexAttributeInstanceRateDivisor.
     bool vertex_attribute_divisor = false;
     // Pixel-shader extensions translated shaders can declare, each enabled with its feature where the GPU has it:
@@ -210,6 +217,20 @@ struct VulkanDeviceInfo {
     // VK_EXT_mesh_shader's meshShaderQueries feature is enabled on `device`, so the clipping invocations of a mesh
     // segment come from a mesh-primitives query (D3D-MESH-CLIPPING-COUNTER). Without it they read 0.
     bool mesh_shader_queries = false;
+    // VK_EXT_transform_feedback with its transformFeedback feature is enabled on `device` (D3D-302): an
+    // SO_STATISTICS heap is a real VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool, begun and ended indexed on the
+    // stream. StreamOutput PSOs are still refused and SOSetTargets is still not implemented.
+    bool transform_feedback = false;
+    // VK_EXT_transform_feedback's geometryStreams feature is offered by the device. The device-enable chain requests
+    // it when present so the pipeline cache key matches vk_pipeline_check; nothing rasterizes a stream other than 0.
+    bool transform_feedback_geometry_streams = false;
+    // VK_EXT_transform_feedback's transformFeedbackQueries property (D3D-302): the device can begin/end a
+    // VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT query. Without it an SO_STATISTICS heap is made without a pool and
+    // every SO_STATISTICS query resolves zero, even when the transformFeedback feature is enabled.
+    bool transform_feedback_queries = false;
+    // The device's maxTransformFeedbackStreams property: an SO_STATISTICS_STREAMn query runs only for n below it.
+    // Streams from this count up (to the D3D12 maximum of four) run nothing and resolve zero.
+    std::uint32_t max_transform_feedback_streams = 0;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
@@ -228,6 +249,13 @@ struct VulkanDeviceInfo {
     // minImportedHostPointerAlignment): OpenExistingHeapFromAddress backs a heap with the caller's own committed
     // memory. Zero: existing heaps stay unsupported.
     VkDeviceSize host_pointer_alignment = 0;
+    // Must describe the feature enabled on this logical device, not merely advertised by the GPU.
+    bool draw_indirect_first_instance = false;
+    bool multi_draw_indirect = false;
+    bool draw_indirect_count_enabled = false;
+    // Both VK_KHR_maintenance5 and robustBufferAccess2 (with core robustBufferAccess) are enabled.
+    bool robust_index_view = false;
+    std::uint32_t max_draw_indirect_count = 1;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -337,6 +365,9 @@ bool device_sparse_buffer_tiles(ID3D12Device* device);
 
 // The size in bytes of the device's GPU address arena, or 0 without one. For tests.
 std::uint64_t device_arena_size(ID3D12Device* device);
+// Copies `bytes` of the device's GPU address arena at console VA `va` (what shaders read there: a heap's GPU copy,
+// the null slots after it) into `out`. False without an arena or when the range is not inside it. For tests.
+bool read_arena(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes);
 
 // The blocks of device memory that textures share (src/image_memory.h): how many, their bytes, and the textures in
 // them. For tests.
@@ -372,6 +403,38 @@ struct BindlessRoom {
     std::uint32_t samplers = 0;
 };
 BindlessRoom bindless_room(ID3D12Device* device);
+
+// What a T# the title wrote itself into a console descriptor heap came to (bind_title_image).
+enum class TitleImage { known, bound, unknown, refused, not_tsharp };
+
+// Statistics on unbound T# descriptors refused during console descriptor heap binding.
+struct UnboundTsharpReasonStats {
+    std::size_t distinct_slots = 0;
+    std::uint64_t total_refusals = 0;
+};
+
+struct UnboundTsharpStats {
+    std::map<std::string, UnboundTsharpReasonStats> by_reason;
+    std::size_t total_distinct_slots = 0;
+    std::uint64_t total_refusals = 0;
+};
+
+// Returns statistics on unbound T# descriptor refusals across console descriptor heaps.
+UnboundTsharpStats unbound_tsharp_stats();
+// Resets unbound T# refusal statistics (for testing).
+void reset_unbound_tsharp_stats();
+// Records an unbound T# refusal (for testing).
+void note_refused_tsharp_for_test(std::uint64_t heap_va, std::size_t offset,
+                                  const std::array<std::uint32_t, 8>& words, const char* why);
+
+// Simulates console descriptor heap T# binding for a synthetic descriptor against registered resources.
+// Returns TitleImage::bound on success, TitleImage::refused on rule violation (with *why set to the refusal string),
+// or TitleImage::unknown / TitleImage::not_tsharp.
+TitleImage test_bind_title_image(ID3D12Device* device, const std::array<std::uint32_t, 8>& words,
+                                 const char** why = nullptr);
+
+// Returns the internal image address registered for a resource in the device's image table.
+std::uint64_t resource_image_address(ID3D12Resource* resource);
 // Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
 // the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
 // already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be
@@ -505,6 +568,8 @@ std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
 // What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
+// PSOs of any Vulkan device not yet deleted, counting one whose deletion waits for its running build (tests).
+long live_pipeline_states();
 
 // Unwraps an Xbox-ABI heap proxy if needed and inspects one of this module's descriptor heaps; returns its owning
 // device identity pointer, or nullptr when `heap` is null or belongs to another implementation.
@@ -529,6 +594,16 @@ bool write_placed_texture_view(ID3D12Device* device, bool unordered, const std::
 // lies elsewhere, the matching VA in that copy; any other VA unchanged.
 D3D12_GPU_VIRTUAL_ADDRESS console_descriptor_table_va(D3D12_GPU_VIRTUAL_ADDRESS va);
 
+// XDXR acceleration-structure commands (docs/d3d12_vulkan.md 4.8) of a list of `device`: every address the command
+// writes or reads, as the title named it, becomes the VA shaders reach that memory by (src/title_va_alias.h: a
+// slot-133 buffer's import or shadow, a window of the title's memory, a geometry copy), checked to hold every byte the
+// builder touches there. False (logged by the device) when an address has no such copy: the command must not be
+// recorded, since heap_base + a title address is no allocation. True and unchanged when `device` is not a Vulkan
+// device of this module or builds KHR structures.
+bool resolve_acceleration_structure_build(IUnknown* device, leonida::BuildAccelerationStructure& build);
+bool resolve_acceleration_structure_copy(IUnknown* device, leonida::CopyAccelerationStructure& copy);
+bool resolve_acceleration_structure_postbuild(IUnknown* device, leonida::AccelerationStructurePostbuild& info);
+
 // Reads the shader-visible descriptor heap GPU base addresses currently bound on `list` (0 when unbound).
 // Returns false when `list` is not one of this module's command lists.
 bool bound_descriptor_heap_bases(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS& cbv_srv_uav,
@@ -550,6 +625,14 @@ void set_global_realtime_privilege_override_for_test(int state);
 // `list`. The values are kept for the future pipeline path, which is what would apply them. False when `list` is
 // not one of this module's command lists.
 bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT& back);
+
+// Makes `list` hold a reference to `object` until its next Reset or its release, as it holds the pipeline states it
+// names: for an object only the recording uses, such as a shim's own scratch buffer. A list is Reset once it has
+// been executed (or a held batch, src/queue_holds.h, keeps it pinned until it has run), and a resource released
+// after its submission is destroyed through the device's deferred queue once that submission has retired, so the
+// object outlives every GPU use the recording makes of it. False when `list` is not one of this module's command
+// lists or `object` is null.
+bool hold_until_reset(ID3D12GraphicsCommandList* list, IUnknown* object);
 
 // A copy of the commands `list` has recorded so far, for tests of what a bundle puts into its parent. False when
 // `list` is not one of this module's command lists.

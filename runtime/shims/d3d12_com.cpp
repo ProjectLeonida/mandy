@@ -4,10 +4,13 @@
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
 #include "d3d12_fence_waiter.h"
+#include "d3d12_feature_compat.h"
+#include "d3d12_indirect_draw_policy.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/title_va_alias.h"
+#include "../src/title_page_watch.h"  // title_gpu_views::to_host_view
 #include "../src/fsdraw_probe.h"  // LOCAL DIAGNOSTIC
 #include "../src/local_diagnostics.h"
 
@@ -144,15 +147,26 @@ public:
     // {9a4e1c2b-55d8-4f7a-b012-3c8e7a1f6d90}
     static constexpr GUID kTag{0x9a4e1c2b, 0x55d8, 0x4f7a, {0xb0, 0x12, 0x3c, 0x8e, 0x7a, 0x1f, 0x6d, 0x90}};
 
-    CommandSignature(leonida::IndirectKind kind, UINT byte_stride) : kind_(kind), stride_(byte_stride) {}
+    CommandSignature(leonida::IndirectKind kind, UINT byte_stride, UINT packed_size,
+                     std::span<const D3D12_INDIRECT_ARGUMENT_DESC> prefix)
+        : kind_(kind), stride_(byte_stride), packed_size_(packed_size), terminal_only_(prefix.empty()) {
+        // The caller may free the description immediately. Single-operation signatures allocate nothing.
+        if (!prefix.empty() && (kind == leonida::IndirectKind::draw || kind == leonida::IndirectKind::draw_indexed))
+            graphics_writes_.assign(prefix.begin(), prefix.end());
+    }
 
     leonida::IndirectKind kind() const { return kind_; }
     UINT stride() const { return stride_; }
+    UINT packed_size() const { return packed_size_; }
+    bool terminal_only() const { return terminal_only_; }
+    const auto& graphics_writes() const { return graphics_writes_; }
     static CommandSignature* from(IUnknown* object) { return Child::from<CommandSignature>(object); }
 
 private:
     leonida::IndirectKind kind_;
-    UINT stride_;
+    UINT stride_, packed_size_;
+    bool terminal_only_;  // no root, vertex, or index updates before the terminal operation
+    std::vector<D3D12_INDIRECT_ARGUMENT_DESC> graphics_writes_;
 };
 
 class CommandAllocator final
@@ -208,8 +222,11 @@ public:
     const leonida::CommandList& commands() const { return list_; }
     // The descriptor tables this recording binds (console VAs), for the scan before a submission.
     const std::vector<std::pair<std::uint64_t, std::uint32_t>>& tables() const { return tables_; }
-    // The pipeline states and root signatures the recording names (it holds a reference to each until Reset).
+    // The pipeline states and root signatures the recording names (it holds a reference to each until Reset), and
+    // the objects a shim handed it with hold_until_reset.
     const std::vector<IUnknown*>& pinned() const { return held_; }
+    // rt::d3d12::hold_until_reset: an object the recording uses that its caller does not keep (a shim's own scratch).
+    void hold_for_recording(IUnknown* object) { hold(object); }
     bool needs_all_sampled_views() const {
         if (directly_indexed_) return true;
         for (const auto& command : list_.commands()) {
@@ -552,6 +569,7 @@ public:
         if (!any_nonempty_viewport()) return;  // as record_draw: nothing is rasterized
         leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, {}, 0, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
+        note_direct_heap_indexing(graphics_.layout);
         draw.mesh = true;
         draw.viewports = draw_viewports();
         check(list_.draw(std::move(draw)));
@@ -954,11 +972,16 @@ public:
     void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* signature, UINT max_command_count,
                                            ID3D12Resource* argument_buffer, UINT64 argument_buffer_offset,
                                            ID3D12Resource* count_buffer, UINT64 count_buffer_offset) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
-        leonida::IndirectKind kind = leonida::IndirectKind::draw;
-        UINT stride = 0;
-        if (!command_signature_info(signature, kind, stride) || !argument_buffer)
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
+            type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE)
             return check(false);
+        const auto* sig = CommandSignature::from(signature);
+        if (!sig || !argument_buffer) return check(false);
+        const auto kind = sig->kind();
+        const UINT stride = sig->stride();
+        const bool terminal_only = sig->terminal_only();
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE && (count_buffer || !terminal_only))
+            return check(false);  // only a fixed count and one operation are legal in a bundle
         const auto arg_desc = argument_buffer->GetDesc();
         if (arg_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || argument_buffer_offset % 4 != 0)
             return check(false);
@@ -991,29 +1014,33 @@ public:
             if (argument_buffer_offset > arg_desc.Width || arg_desc.Width - argument_buffer_offset < required)
                 return check(false);
         }
+        if (!leonida::indirect_records_fit(arg_desc.Width, argument_buffer_offset, max_command_count,
+                                          stride, sig->packed_size()))
+            return check(false);
         if (kind == leonida::IndirectKind::dispatch_mesh) {
             // Not replayed yet (#3777 replays it as vkCmdDrawMeshTasksIndirectEXT): nothing is recorded, and the
             // first such call says so. The list stays valid.
-            static std::atomic<bool> logged{false};
-            if (!logged.exchange(true, std::memory_order_relaxed))
-                std::fprintf(stderr, "[rt] d3d12: ExecuteIndirect with a DISPATCH_MESH signature is not replayed yet; "
-                                     "nothing was recorded\n");
+            leonida::indirect_stats::skip(leonida::indirect_stats::Event::record_skip, leonida::indirect_stats::mesh);
             return;
         }
-        leonida::ExecuteIndirect cmd{};
-        cmd.kind = kind;
-        cmd.stride = stride;
-        cmd.max_count = max_command_count;
-        cmd.argument_buffer = resource_id(argument_buffer);
-        cmd.argument_offset = argument_buffer_offset;
-        cmd.count_buffer = count_buffer ? resource_id(count_buffer) : 0;
-        cmd.count_offset = count_buffer ? count_buffer_offset : 0;
-        if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
-            if (!compute_pipeline_ || !compute_.layout) return check(false);
-            cmd.pipeline = compute_pipeline_;
-            cmd.user_data = compute_user_data();
+        if (!terminal_only && (kind == leonida::IndirectKind::draw || kind == leonida::IndirectKind::draw_indexed)) {
+            if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
+            // Compound draw emission is not yet supported. Reset the written bindings even if no
+            // records execute. Bundle nesting and prefixes were already rejected above for bundles.
+            leonida::indirect_stats::skip(leonida::indirect_stats::Event::record_skip, leonida::indirect_stats::compound);
+            if (!list_.closed()) reset_indirect_graphics_bindings(sig->graphics_writes());
+            return;
         }
-        check(list_.execute_indirect(cmd));
+        const leonida::IndirectDrawArgs args{resource_id(argument_buffer), argument_buffer_offset, stride,
+                                             max_command_count, count_buffer ? resource_id(count_buffer) : 0,
+                                             count_buffer_offset};
+        // Preserve call position, not the bundle's incomplete draw state. No COM pointer is dereferenced
+        // later: the signature is decoded now, and the app owns resource lifetimes through GPU completion.
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+            defer([kind, args](GraphicsCommandList& parent) { parent.record_indirect(kind, true, args); }, true);
+            return;
+        }
+        record_indirect(kind, terminal_only, args);
     }
 
     void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(
@@ -1086,6 +1113,14 @@ public:
             }
         }
         const std::uint64_t built = cmd.dst_va;
+        // The D3D12 rules (alignment, a source for an update) on the addresses as the title gave them.
+        if (!cmd.dst_va || cmd.dst_va % 256 || !cmd.scratch_va || cmd.scratch_va % 256 ||
+            (cmd.update && (!cmd.src_va || cmd.src_va % 256)))
+            return check(false);
+        // The addresses the builder reaches the memory by. One with no GPU copy (logged by the device) leaves the
+        // build out, with its postbuild values: the list stays valid, nothing is written through heap_base + a title
+        // address, and the destination keeps what it had.
+        if (!resolve_acceleration_structure_build(attached_device(), cmd)) return;
         const bool recorded = list_.build_acceleration_structure(std::move(cmd));
         check(recorded);
         if (!recorded) return;
@@ -1095,6 +1130,8 @@ public:
             info.dest_va = postbuild[i].DestBuffer;
             info.type = static_cast<std::uint32_t>(postbuild[i].InfoType);
             info.sources = {built};
+            if (!info.dest_va || info.dest_va % 8) return check(false);
+            if (!resolve_acceleration_structure_postbuild(attached_device(), info)) continue;
             const bool ok = list_.acceleration_structure_postbuild(std::move(info));
             check(ok);
             if (!ok) return;
@@ -1110,6 +1147,10 @@ public:
         info.dest_va = desc->DestBuffer;
         info.type = static_cast<std::uint32_t>(desc->InfoType);
         info.sources.assign(sources, sources + count);
+        if (!info.dest_va || info.dest_va % 8) return check(false);
+        for (const auto va : info.sources)
+            if (!va || va % 256) return check(false);
+        if (!resolve_acceleration_structure_postbuild(attached_device(), info)) return;  // logged; left out
         check(list_.acceleration_structure_postbuild(std::move(info)));
     }
 
@@ -1118,7 +1159,10 @@ public:
                                                                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!valid_copy_mode(mode)) return check(false);
-        check(list_.copy_acceleration_structure({dest, source, static_cast<std::uint32_t>(mode)}));
+        leonida::CopyAccelerationStructure copy{dest, source, static_cast<std::uint32_t>(mode)};
+        if (!copy.dst_va || !copy.src_va || copy.dst_va % 256 || copy.src_va % 256) return check(false);
+        if (!resolve_acceleration_structure_copy(attached_device(), copy)) return;  // logged; left out
+        check(list_.copy_acceleration_structure(copy));
     }
 
     bool xbox_label(const leonida::label::Write& op) { return list_.write_gpu_label(op); }
@@ -1311,7 +1355,8 @@ private:
 
     void clear_unordered_access(D3D12_CPU_DESCRIPTOR_HANDLE view, ID3D12Resource* resource, bool is_float,
                                 const std::array<std::uint32_t, 4>& values, UINT count, const D3D12_RECT* rects) {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);  // no clear is allowed in a bundle
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_COMPUTE)
+            return check(false);
         leonida::UavView target{};
         if (!view.ptr || !resource || !unordered_access_view(view, resource, target)) return check(false);
         check(list_.clear_unordered_access(target, is_float, values, to_rects(count, rects)));
@@ -1343,17 +1388,26 @@ private:
             const bool volume = image.type == g::ImageType::image_3d;
             const auto pair = xbox_depth_storage(resource);
             if (pair.colour) out.resource = pair.colour;
-            if (g::partial_volume_uav(words, image)) {
-                // Transfer clears operate on a whole 3D mip, not a storage image view. Refuse instead of
-                // overwriting slices outside the UAV; a sliced clear needs a separate replay path.
-                stub("ClearUnorderedAccessView of a partial 3D mip");
-                return false;
-            }
             out.buffer = false;
             out.format = std::uint32_t(descriptor_format(image.format, image.swizzle));
             out.mip = image.first_mip;
-            out.first_layer = volume ? 0 : image.first_layer;  // a 3D view clears every slice of its mip
-            out.layer_count = volume ? 1 : image.layer_count;
+            if (volume) {
+                g::VolumeUavRange slices{};
+                if (g::volume_uav_range(words, image, slices)) {
+                    out.first_layer = slices.first_w;
+                    out.layer_count = slices.w_size;
+                } else {
+                    // Untagged T#s select the entire resource mip, even if DEPTH describes a smaller or larger view.
+                    const auto desc = resource->GetDesc();
+                    const auto depth = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                                           ? std::uint32_t(desc.DepthOrArraySize) : image.depth;
+                    out.first_layer = 0;
+                    out.layer_count = std::max(1u, depth >> image.first_mip);
+                }
+            } else {
+                out.first_layer = image.first_layer;
+                out.layer_count = image.layer_count;
+            }
             out.exact_clear_format = volume || image.type == g::ImageType::image_1d ||
                                      image.type == g::ImageType::image_1d_array;
             return out.format != VK_FORMAT_UNDEFINED;
@@ -1486,16 +1540,16 @@ private:
         // copy of it, so the shader's heap_base + VA reaches it (src/title_va_alias.h). A descriptor table is in one
         // of the layer's heaps: kept, and its buffer V#s are rewritten the same way before each submission.
         // A table in a console descriptor heap is read from the heap's arena copy (console_descriptor_table_va).
-        if (type == rt::rootsig::ParamType::Descriptor)
+        if (type == rt::rootsig::ParamType::Descriptor) {
+            const std::uint64_t raw = va;
             va = leonida::title_va_aliases().resolve(va, kRootViewBytes, leonida::TitleVaAliases::root_view);
-        else
+            // No copy for the title's memory: the root view is 0, so the shader reads the arena's zero page instead
+            // of storing at heap_base + a raw title address.
+            if (!va && raw) leonida::note_unbacked_view("root view", raw, kRootViewBytes);
+        } else
             va = console_descriptor_table_va(va);
-        if (type != rt::rootsig::ParamType::Descriptor && va && p->table_descriptors) {
-            if (!tables_.empty() && tables_.back().first == va)
-                tables_.back().second = std::max(tables_.back().second, p->table_descriptors);
-            else
-                tables_.emplace_back(va, p->table_descriptors);
-        }
+        if (type != rt::rootsig::ParamType::Descriptor && va && p->table_descriptors)
+            remember_table(va, p->table_descriptors);
         const std::uint32_t first = first_dword(state, *p);
         if (first == rt::rootsig::kNoSgpr) return spilled();
         write(state, first, std::uint32_t(va));
@@ -1613,13 +1667,22 @@ private:
         if ((cbv && cbv != cbv_srv_uav_heap_) || (smp && smp != sampler_heap_)) check(false);
     }
 
-    void note_direct_heap_indexing(const RootArgumentLayout* layout) const {
+    void remember_table(uint64_t base, uint32_t slots) {
+        if (!tables_.empty() && tables_.back().first == base)
+            tables_.back().second = std::max(tables_.back().second, slots);
+        else
+            tables_.emplace_back(base, slots);
+    }
+
+    void note_direct_heap_indexing(const RootArgumentLayout* layout) {
         if (!layout) return;
         if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) {
             if (!cbv_srv_uav_heap_)
                 note_once("draw/dispatch uses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no CBV/SRV/UAV heap bound");
-            else
+            else {
+                remember_table(cbv_srv_uav_base_, cbv_srv_uav_heap_->GetDesc().NumDescriptors);
                 note_once("CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED heap base tracked on list");
+            }
         }
         if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) {
             if (!sampler_heap_)
@@ -1656,21 +1719,61 @@ private:
         set_pipeline(state);
     }
 
+    void reset_indirect_graphics_bindings(std::span<const D3D12_INDIRECT_ARGUMENT_DESC> writes) {
+        static constexpr std::array<UINT, D3D12_MAX_ROOT_COST> zeros{};
+        for (const auto& arg : writes) {
+            switch (arg.Type) {
+            case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
+                if (arg.VertexBuffer.Slot >= vertex_buffers_.size()) return check(false);
+                set_vertex_buffers(arg.VertexBuffer.Slot, 1, nullptr);
+                break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: set_index_buffer(nullptr); break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
+                if (arg.Constant.Num32BitValuesToSet > zeros.size()) return check(false);
+                constants(graphics_, arg.Constant.RootParameterIndex, arg.Constant.Num32BitValuesToSet,
+                          zeros.data(), arg.Constant.DestOffsetIn32BitValues);
+                break;
+            case compat::kIndirectArgumentIncrementingConstant:
+                // The two leading UINTs have the same ABI on SDKs predating IncrementingConstant.
+                constants(graphics_, arg.Constant.RootParameterIndex, 1, zeros.data(), arg.Constant.DestOffsetIn32BitValues);
+                break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+                address(graphics_, arg.ConstantBufferView.RootParameterIndex, 0, rt::rootsig::ParamType::Descriptor);
+                break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+                address(graphics_, arg.ShaderResourceView.RootParameterIndex, 0, rt::rootsig::ParamType::Descriptor);
+                break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW:
+                address(graphics_, arg.UnorderedAccessView.RootParameterIndex, 0, rt::rootsig::ParamType::Descriptor);
+                break;
+            default: return check(false);  // signature creation excludes other non-terminal arguments
+            }
+        }
+    }
+
     void set_vertex_buffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) {
         if (count) draw_views_stale_ = true;
         for (UINT i = 0; i < count; ++i) {
-            if (views) leonida::title_va_aliases().note(views[i].BufferLocation, leonida::TitleVaAliases::vertex_view);
-            if (views) leonida::title_va_aliases().want_buffer(views[i].BufferLocation, views[i].SizeInBytes);
-            vertex_buffers_[start + i] = views ? leonida::VertexBufferView{views[i].BufferLocation, views[i].SizeInBytes,
+            // A stream pool's GPU-only alias becomes the CPU view of the same pages (rule B, gfxgeom section 6): the
+            // buffer made for it, and every other view naming that range, then use one host-readable address.
+            const std::uint64_t va = views
+                                         ? leonida::title_gpu_views::to_host_view(views[i].BufferLocation,
+                                                                                  views[i].SizeInBytes)
+                                         : 0;
+            if (views) leonida::title_va_aliases().note(va, leonida::TitleVaAliases::vertex_view);
+            if (views) leonida::title_va_aliases().want_buffer(va, views[i].SizeInBytes);
+            vertex_buffers_[start + i] = views ? leonida::VertexBufferView{va, views[i].SizeInBytes,
                                                                           views[i].StrideInBytes}
                                                : leonida::VertexBufferView{};
         }
     }
 
     void set_index_buffer(const D3D12_INDEX_BUFFER_VIEW* view) {
-        if (view) leonida::title_va_aliases().note(view->BufferLocation, leonida::TitleVaAliases::index_view);
-        if (view) leonida::title_va_aliases().want_buffer(view->BufferLocation, view->SizeInBytes);
-        index_ = view ? leonida::IndexBufferView{view->BufferLocation, view->SizeInBytes, u(view->Format)}
+        const std::uint64_t va =
+            view ? leonida::title_gpu_views::to_host_view(view->BufferLocation, view->SizeInBytes) : 0;
+        if (view) leonida::title_va_aliases().note(va, leonida::TitleVaAliases::index_view);
+        if (view) leonida::title_va_aliases().want_buffer(va, view->SizeInBytes);
+        index_ = view ? leonida::IndexBufferView{va, view->SizeInBytes, u(view->Format)}
                       : leonida::IndexBufferView{};
     }
 
@@ -1678,14 +1781,19 @@ private:
     // 32-bit shader VA, then the sampler heap's, each only when the signature has its flag. `slot` is the first
     // dword after the arguments (RootArgumentLayout::*_arguments_end). The heaps are snapshotted for each command,
     // so rebinding a heap cannot change a recorded draw or dispatch.
-    std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> with_direct_heaps(const RootState& state,
-                                                                             std::uint32_t slot) const {
-        auto data = state.data;
+    void write_direct_heaps(const RootState& state, std::uint32_t slot,
+                            std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs>& data) const {
         const auto flags = state.layout->flags;
         if ((flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) && slot < data.size())
             data[slot++] = static_cast<std::uint32_t>(cbv_srv_uav_base_);
         if ((flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) && slot < data.size())
             data[slot] = static_cast<std::uint32_t>(sampler_base_);
+    }
+
+    std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> with_direct_heaps(const RootState& state,
+                                                                             std::uint32_t slot) const {
+        auto data = state.data;
+        write_direct_heaps(state, slot, data);
         return data;
     }
 
@@ -1697,7 +1805,7 @@ private:
     // Direct and indirect dispatches. Putting the resource heap first and the sampler heap next is a hypothesis
     // with partial evidence (docs/d3d12_vulkan.md section 3.4, tools/compute_heap_layout_census.py). A heap with no
     // inline user-data dword left is reported once per heap kind and the explicit arguments are kept.
-    std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> compute_user_data() const {
+    std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> compute_user_data() {
         note_direct_heap_indexing(compute_.layout);
         static const bool enabled = direct_heaps_enabled("LEONIDA_COMPUTE_DIRECT_HEAPS");
         if (!enabled) return compute_.data;
@@ -1754,8 +1862,8 @@ private:
                               end + (resource ? 1u : 0u));
             std::fprintf(stderr,
                          "[rt] d3d12: graphics direct heaps: resource heap %s, sampler heap %s, after %u dwords of "
-                         "explicit arguments from s8 (first draw; LEONIDA_GRAPHICS_DIRECT_HEAPS=0 restores the "
-                         "old arguments)\n",
+                         "explicit arguments from s8 (first draw; LEONIDA_GRAPHICS_DIRECT_HEAPS=0 "
+                         "restores the old arguments)\n",
                          resource_at, sampler_at, end - 8);
         }
         return with_direct_heaps(graphics_, end);
@@ -1815,6 +1923,51 @@ private:
             draw_viewports_stale_ = false;
         }
         return draw_viewports_;
+    }
+
+    void record_indirect(leonida::IndirectKind kind, bool terminal_only, const leonida::IndirectDrawArgs& args) {
+        if (kind == leonida::IndirectKind::draw || kind == leonida::IndirectKind::draw_indexed) {
+            if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
+            // A valid zero-count call records nothing, even if graphics state has not been set.
+            if (!args.max_count) return;
+            // Both direct-list calls and deferred bundle calls reach this point after validation.
+            // Compound signatures already applied their root/IA postconditions in ExecuteIndirect.
+            if (indirect_draws_disabled()) {
+                leonida::indirect_stats::skip(leonida::indirect_stats::Event::record_skip, leonida::indirect_stats::disabled);
+                return check(!list_.closed());
+            }
+            const bool indexed = kind == leonida::IndirectKind::draw_indexed;
+            // Only single-operation signatures inherit all graphics state. A padded stride alone cannot
+            // distinguish one of those from a signature with root or IA arguments before the DRAW.
+            namespace stats = leonida::indirect_stats;
+            const auto skip = [](stats::Reason reason) { stats::skip(stats::Event::record_skip, reason); };
+            if (!terminal_only) return skip(stats::compound);
+            if (!graphics_pipeline_) return skip(stats::pipeline);
+            if (!graphics_.layout) return skip(stats::root_layout);
+            if (!stats::topology_supported(topology_)) return skip(stats::topology);
+            if (indexed && (!index_.va || !index_.size ||
+                            (index_.format != DXGI_FORMAT_R16_UINT && index_.format != DXGI_FORMAT_R32_UINT)))
+                return skip(stats::index_view);
+            if (!any_nonempty_viewport()) return skip(stats::viewport);
+            note_direct_heap_indexing(graphics_.layout);
+            record_raster_draw(indexed, 0, 0, 0, 0, 0, &args);
+            return;
+        }
+        leonida::ExecuteIndirect cmd{};
+        cmd.kind = kind;
+        cmd.stride = args.stride;
+        cmd.max_count = args.max_count;
+        cmd.argument_buffer = args.argument_buffer;
+        cmd.argument_offset = args.argument_offset;
+        cmd.count_buffer = args.count_buffer;
+        cmd.count_offset = args.count_offset;
+        if (kind == leonida::IndirectKind::dispatch && args.max_count) {  // the pipeline and root arguments a Dispatch would record
+            if (!compute_pipeline_ || !compute_.layout) return check(false);
+            note_direct_heap_indexing(compute_.layout);
+            cmd.pipeline = compute_pipeline_;
+            cmd.user_data = compute_user_data();
+        }
+        check(list_.execute_indirect(cmd));
     }
 
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
@@ -1904,11 +2057,20 @@ private:
             }
         }
         if (!any_nonempty_viewport()) return;
+        record_raster_draw(indexed, count, instances, first, base_vertex, first_instance);
+    }
+
+    // The same bindings and dynamic state must be frozen at the call for both APIs. Only the source of the
+    // draw arguments differs: values here for a direct draw, or a GPU buffer read later at execution.
+    void record_raster_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance,
+                            const leonida::IndirectDrawArgs* indirect = nullptr) {
         leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};
         draw.viewports = draw_viewports();
-        check(list_.draw(std::move(draw)));
+        const bool recorded = indirect ? list_.draw_indirect(std::move(draw), *indirect) : list_.draw(std::move(draw));
+        if (indirect && recorded) leonida::indirect_stats::note(leonida::indirect_stats::Event::recorded);
+        check(recorded);
     }
 };
 
@@ -2029,7 +2191,8 @@ public:
 
     // What a held batch (queue_holds.h) keeps alive until it has run: the pipeline states and root signatures its
     // lists name, which the application may release and Reset away as soon as ExecuteCommandLists returns. Resources
-    // are not held (a D3D12 application keeps them until the fence it signals; the docs, section 4.4, list this).
+    // are not held (a D3D12 application keeps them until the fence it signals; the docs, section 4.4, list this),
+    // except a shim's own the recording uses (hold_until_reset), which are pinned with them.
     static std::shared_ptr<void> pin_lists(const std::vector<const GraphicsCommandList*>& lists) {
         auto objects = std::shared_ptr<std::vector<IUnknown*>>(new std::vector<IUnknown*>, [](auto* held) {
             for (IUnknown* object : *held) object->Release();
@@ -2625,20 +2788,22 @@ bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue) {
     return q && q->uses_calibrated_timestamps();
 }
 
-HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
-                                 IUnknown* device) {
+HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, UINT packed_size, REFIID riid, void** out,
+                                 IUnknown* device, std::span<const D3D12_INDIRECT_ARGUMENT_DESC> prefix) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    auto* sig = new CommandSignature(kind, byte_stride);
+    auto* sig = new CommandSignature(kind, byte_stride, packed_size, prefix);
     sig->attach_device(device);
     return hand_out(sig, riid, out);
 }
 
-bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride) {
+bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride,
+                            bool& terminal_only) {
     const CommandSignature* s = CommandSignature::from(signature);
     if (!s) return false;
     kind = s->kind();
     byte_stride = s->stride();
+    terminal_only = s->terminal_only();
     return true;
 }
 
@@ -2653,6 +2818,13 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
     if (!l) return false;
     front = l->front_stencil_ref();
     back = l->back_stencil_ref();
+    return true;
+}
+
+bool hold_until_reset(ID3D12GraphicsCommandList* list, IUnknown* object) {
+    GraphicsCommandList* l = GraphicsCommandList::from(list);
+    if (!l || !object) return false;
+    l->hold_for_recording(object);
     return true;
 }
 

@@ -1721,10 +1721,7 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     if (!m->base)
         m->base = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(oh.ImageBase), oh.SizeOfImage,
                                                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    if (!m->base) {
-        const auto relocs = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
-        if (!relocs.Size)
-            throw std::runtime_error(m->name + ": preferred base is taken and the image has no relocations");
+    if (!m->base) {  // whether the image may move is decided at the relocation step below
         m->base = static_cast<uint8_t*>(VirtualAlloc(nullptr, oh.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!m->base) throw std::runtime_error(m->name + ": VirtualAlloc failed");
     }
@@ -1749,10 +1746,19 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     }
 
     int64_t delta = reinterpret_cast<int64_t>(m->base) - static_cast<int64_t>(oh.ImageBase);
-    if (delta) {
-        m->relocated = true;
-        const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
-        if (!dir.Size) throw std::runtime_error(m->name + ": the image has no relocations and isn't at its base");
+    // A moved image with a relocation table is fixed up, whatever IMAGE_FILE_RELOCS_STRIPPED says. Without a table,
+    // the flag refuses the move; with the flag clear the image is moved and nothing is fixed up, so it is trusted to
+    // hold no absolute addresses. The Windows 11 loader does all three (runtime/README.md); that move is logged so
+    // it shows in traces. base_reservation::needed still keeps the main image's range free when it has no
+    // relocation directory, so a main image is moved this way only where the range could not be had.
+    const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+    if (delta) m->relocated = true;
+    if (delta && !dir.Size && (nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED))
+        throw std::runtime_error(m->name + ": preferred base is taken and the image's relocations are stripped");
+    if (delta && !dir.Size)
+        std::fprintf(stderr, "[rt] loader: %s: preferred base %#llx is taken, moved to %p with no relocations\n",
+                     m->name.c_str(), static_cast<unsigned long long>(oh.ImageBase), static_cast<void*>(m->base));
+    if (delta && dir.Size) {
         require_range(m->name, dir.VirtualAddress, dir.Size, m->size, "the relocation table");
         auto* block = at<IMAGE_BASE_RELOCATION>(m->base, dir.VirtualAddress);
         auto* end = reinterpret_cast<uint8_t*>(block) + dir.Size;
