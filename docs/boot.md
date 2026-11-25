@@ -1,13 +1,9 @@
 # First boot: the runbook and the two traces
 
-**Status: `--dry-run` and `--init` have been run on the retail executable; `--run` has not.** The package in the
-repository's test corpus does not contain `game_scarlett_master.exe` (RT-5); the dry-run on an executable supplied
-separately maps it and leaves 30 imports unimplemented, and `--init` runs its TLS callbacks and the package DLLs'
-`DllMain`s without an exception
-([`runtime_imports.md`](runtime_imports.md#the-retail-executable-rt-5)), so this page is still the procedure and the
-trace tool for the first boot. Outbound `ws2_32.dll` and `winhttp.dll` calls are restricted offline by the shims
-(`ws2_offline.cpp` permits loopback only; `winhttp_offline.cpp` refuses all requests), though running with the network
-off remains good defence in depth. Nothing here quotes game data; a real trace stays on the player's machine.
+The Windows integration has a dedicated [offline first-run UI profile](first_run_ui.md). The original dry-run
+and initialization measurements used a separately supplied executable and identified 30 unimplemented imports.
+The Winsock shim restricts connections to loopback and the WinHTTP shim refuses outbound requests. Keep retail runs
+offline and traces on the player's machine. [Original import measurements](runtime_imports.md#the-retail-executable-rt-5)
 
 ## 1. What the first boot produces
 
@@ -104,13 +100,29 @@ Useful switches:
   `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
+* `LEONIDA_STUB_PIPELINES=1` creates a pipeline whose translated shader is missing (no shader library, or no entry
+  for its program) as a no-op stub instead of failing `CreateGraphicsPipelineState` / `CreateComputePipelineState`.
+  The stub is never registered, so `SetPipelineState` binds no PSO and its draws and dispatches are no-ops (D3D-482).
+  Diagnostic only, like `LEONIDA_SKIP_INT3`: it follows a boot past every pipeline the title creates without
+  translating or running a game shader, so nothing the title draws reaches the screen. Each stub is logged with a
+  power-of-two count.
+* During `--run` on Vulkan, the runtime paints the package shell splash when the title shows its window. The first
+  direct queue presents it on the window's swapchain. Startup clears keep the splash visible until the first
+  non-black output replaces it. The runtime reads `ShellVisuals/SplashScreenImage` from
+  `MicrosoftGame.Config` or `SplashScreen/Image` from `appxmanifest.xml`, preserves the image's aspect ratio and
+  uses the same swapchain for PresentX. A surface without readback hands off at the first title present.
+  Set `LEONIDA_PACKAGE_SPLASH=0` to disable the splash.
 * `LEONIDA_VK_VALIDATION=1` enables the Khronos validation layer with the Vulkan backend (startup overhead; it is a
   diagnostic).
+* `LEONIDA_DEVICE_FAULT=1` enables Vulkan device-loss diagnostics and checkpoints where available. The first
+  observed loss prints a `[rt] device-fault:` report to stderr.
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their
   implicit layers add swapchain usage that shows up as validation errors ([testing.md](testing.md), "Known
   problems").
 * `--overlay DIR` sends the guest's writes to DIR instead of the default `<game-dir>\overlay` (useful when the
-  package drive is read-only); the package itself is never written.
+  package drive is read-only); the package itself is never written. Set `LEONIDA_WRITE_DIR` to override that folder
+  for one run (it wins over `--overlay`). For a fresh first-run profile, also set `LEONIDA_SAVE_DIR` to a separate
+  empty directory for the local game-save provider.
 
 ## 3. Triage order
 
@@ -125,6 +137,17 @@ Read the startup trace first; the first event that is not the expected one is th
    TLS index. The summary shows the address and phase of the last observed TLS callback
    (`last_tls_callback` in JSON). The loader records it before invoking the callback, so the record gives no
    completion result. The loader's own TLS is checked by `run_tiny_game_tls`.
+   An access violation in CRT startup before the first D3D12 call can be the TLS index instead: code built with
+   `/GA` reads its thread-local data at module index 0 without `_tls_index`, and index 0 belongs to `gta6rt.exe`
+   (stop 4 of [retail_boot_chain.md](retail_boot_chain.md)). `load()` rewrites those reads in a mapped executable
+   so that they reach the image's own block, and every other mapped module with a TLS directory has an index of
+   its own ([`runtime/README.md`](../runtime/README.md), "PE loader"). The stderr log has one
+   `[rt] loader: <image>: <N> index-0 TLS reads` line for the executable; `N` 0 on an image that faults there
+   means its reads have a shape the rewrite does not know. `LEONIDA_TLS_GA_PATCH=0` turns the rewrite off, to
+   see the stop without it. `loader_tls` checks both ways with a synthetic `/GA` executable mapped beside a DLL
+   that has TLS of its own, on the loading thread and on a new one, and `run_tiny_game_ga_tls` runs a `/GA`
+   build of the stand-in game through `gta6rt --run`. Not confirmed here on the retail executable: that needs
+   game files.
 4. **`exception`** — code, `at`, access/address and the stack frames. The loader's vectored handler only records,
    so the process behaviour is the same with or without the trace. When the report reaches `--limit`, it reserves
    the final slot for the last observed exception. The trace also includes handled exceptions, so the last

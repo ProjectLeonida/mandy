@@ -83,10 +83,106 @@ bool inside(VkDeviceSize begin, VkDeviceSize end) {
     }
     return true;
 }
+
+// UAV clears of B5G6R5, B5G5R5A1 and B4G4R4A4 textures. The packed words are what ClearUnorderedAccessViewFloat/Uint
+// leave on WARP for the same values (no channel sits at a rounding midpoint).
+void packed_16bit_texture_clears() {
+    using namespace leonida;
+    struct Case {
+        const char* name;
+        VkFormat format;
+        std::array<std::uint32_t, 4> max;  // of R, G, B, A; 0: no such channel
+        std::uint32_t red, green, blue, alpha, mixed, uint_word;
+    };
+    constexpr Case cases[] = {
+        {"B5G6R5", VK_FORMAT_R5G6B5_UNORM_PACK16, {31, 63, 31, 0}, 0xf800, 0x07e0, 0x001f, 0x0000, 0x45ec, 0x0843},
+        {"B5G5R5A1", VK_FORMAT_A1R5G5B5_UNORM_PACK16, {31, 31, 31, 1}, 0x7c00, 0x03e0, 0x001f, 0x8000, 0xa2ec, 0x8443},
+        {"B4G4R4A4", VK_FORMAT_A4R4G4B4_UNORM_PACK16, {15, 15, 15, 15}, 0x0f00, 0x00f0, 0x000f, 0xf000, 0x94b6, 0xf123}};
+    ReplayFunctions vk{};
+    vk.pipeline_barrier = barrier;
+    vk.clear_color_image = clear_image;
+    vk.begin_rendering = begin_rendering;
+    vk.end_rendering = end_rendering;
+    vk.clear_attachments = clear_attachments;
+    vk.image_view = [](const ResourceBinding& b, const VkImageSubresourceRange&) {
+        requested_view_format = b.format;
+        return reinterpret_cast<VkImageView>(std::uintptr_t{0x2000});
+    };
+    const auto run = [&](VkFormat backing, bool attachment, VkFormat view, bool is_float,
+                         const std::array<std::uint32_t, 4>& values) {
+        reset_texture_capture();
+        ResourceBinding tex{};
+        tex.image = reinterpret_cast<VkImage>(std::uintptr_t{0x3000});
+        tex.format = backing;
+        tex.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        tex.width = tex.height = 8;
+        tex.mip_levels = tex.array_layers = 1;
+        tex.color_attachment = attachment;
+        CommandList list;
+        list.clear_unordered_access({2, false, std::uint32_t(view), 0, 0, 0, 0, 0, 1}, is_float, values, {});
+        list.close();
+        return replay(list, VK_NULL_HANDLE, [&](ResourceId id) { return id == 2 ? &tex : nullptr; }, vk) ==
+               ReplayResult::success;
+    };
+    const auto check = [](bool ok, const Case& c, const char* what) {
+        char text[128];
+        std::snprintf(text, sizeof text, "%s UAV clear: %s", c.name, what);
+        expect(ok, text);
+    };
+    const auto floats = [](float r, float g, float b, float a) {
+        return std::array<std::uint32_t, 4>{std::bit_cast<std::uint32_t>(r), std::bit_cast<std::uint32_t>(g),
+                                            std::bit_cast<std::uint32_t>(b), std::bit_cast<std::uint32_t>(a)};
+    };
+    for (const Case& c : cases) {
+        const struct {
+            const char* what;
+            bool is_float;
+            std::array<std::uint32_t, 4> values;
+            std::uint32_t word;
+        } clears[] = {{"Float red", true, floats(1, 0, 0, 0), c.red},
+                      {"Float green", true, floats(0, 1, 0, 0), c.green},
+                      {"Float blue", true, floats(0, 0, 1, 0), c.blue},
+                      {"Float alpha", true, floats(0, 0, 0, 1), c.alpha},
+                      {"Float mixed", true, floats(0.25f, 0.75f, 0.4f, 0.6f), c.mixed},
+                      {"Uint", false, {1, 2, 3, 0xffffffffu}, c.uint_word}};
+        for (const auto& clear : clears)  // an R16_UINT image takes the packed word itself
+            check(run(VK_FORMAT_R16_UINT, false, c.format, clear.is_float, clear.values) && image_clears == 1 &&
+                      attachment_clears == 0 && captured_color.uint32[0] == clear.word,
+                  c, clear.what);
+
+        // An image of the format itself takes the channels the word holds.
+        const std::array<std::uint32_t, 4> raw{1, 2, 3, 0xffffffffu};
+        bool channels = run(c.format, true, c.format, false, raw) && image_clears == 1 && attachment_clears == 0;
+        for (unsigned i = 0; i < 4; ++i)
+            channels &= c.max[i] == 0 || captured_color.float32[i] == float(raw[i] & c.max[i]) / float(c.max[i]);
+        check(channels, c, "image of the same format");
+
+        // Every packed word survives decode() and encode().
+        bool round_trip = true;
+        for (std::uint32_t word = 0; word < 0x10000 && round_trip; ++word) {
+            uav_clear::Element element{}, again{};
+            element.size = 2;
+            element.bytes[0] = std::uint8_t(word);
+            element.bytes[1] = std::uint8_t(word >> 8);
+            VkClearColorValue color{};
+            round_trip = uav_clear::decode(c.format, element, color) &&
+                         uav_clear::encode(c.format, true, std::bit_cast<std::array<std::uint32_t, 4>>(color.float32), again) &&
+                         again.size == 2 && again.bytes == element.bytes;
+        }
+        check(round_trip, c, "decode/encode round trip");
+    }
+    // The render-target + UAV B5G5R5A1 texture the device backs with R16_UINT clears through its A1R5G5B5 view.
+    check(run(VK_FORMAT_R16_UINT, true, VK_FORMAT_A1R5G5B5_UNORM_PACK16, true, floats(1, 0, 0, 1)) &&
+              attachment_clears == 1 && image_clears == 0 &&
+              requested_view_format == VK_FORMAT_A1R5G5B5_UNORM_PACK16 && captured_color.float32[0] == 1.0f &&
+              captured_color.float32[1] == 0.0f && captured_color.float32[2] == 0.0f && captured_color.float32[3] == 1.0f,
+          cases[1], "R16_UINT-backed render target");
+}
 }  // namespace
 
 int main() {
     using namespace leonida;
+    packed_16bit_texture_clears();
     constexpr VkDeviceSize at = 65536, bytes = 256;
     ResourceBinding range{};
     range.buffer = reinterpret_cast<VkBuffer>(std::uintptr_t{0x1000});
@@ -221,6 +317,44 @@ int main() {
     tex.mip_levels = 2;
     tex.array_layers = 4;
     tex.color_attachment = true;
+
+    // A dedicated compute family has no rendering commands. A rectangular clear fills transfer scratch and
+    // copies the clipped rectangle to the requested array slices without disturbing adjacent pixels.
+    {
+        auto image = tex;
+        image.format = VK_FORMAT_R8_UINT;
+        auto compute = tex_vk;
+        compute.graphics_family = false;
+        compute.queue_stages = detail::queue_stages_compute;
+        compute.begin_rendering = nullptr;
+        compute.image_view = {};
+        VkDeviceSize requested_bytes = 0;
+        compute.copy_scratch = [&](VkDeviceSize size, VkBuffer& buffer, VkDeviceSize& offset) {
+            requested_bytes = size;
+            buffer = scratch;
+            offset = 256;
+            return true;
+        };
+        static std::vector<VkBufferImageCopy> copies;
+        compute.copy_buffer_to_image = [](VkCommandBuffer, VkBuffer, VkImage, VkImageLayout layout,
+                                          std::uint32_t count, const VkBufferImageCopy* regions) {
+            expect(layout == VK_IMAGE_LAYOUT_GENERAL && count == 1, "one compute clear transfer in UAV layout");
+            copies.push_back(regions[0]);
+        };
+        const std::array<Rect, 2> rects{{{-1, 2, 3, 4}, {1, 3, 2, 4}}};
+        writes.clear();
+        expect(run_tex(image, {2, false, VK_FORMAT_R8_UINT, 0, 0, 0, 0, 1, 2}, false, {0x39,0,0,0},
+                       rects, &compute) == ReplayResult::success, "rectangle UAV clear on compute-only family");
+        expect(requested_bytes == 12 && writes.size() == 1 && writes[0].kind == 'f' && writes[0].offset == 256 &&
+               writes[0].size == 12 && copies.size() == 2 && attachment_clears == 0, "one fill and two rectangle copies");
+        if (copies.size() == 2) {
+            const auto& r = copies[0];
+            expect(r.bufferOffset == 256 && r.imageOffset.x == 0 && r.imageOffset.y == 2 &&
+                   r.imageExtent.width == 3 && r.imageExtent.height == 2 &&
+                   r.imageSubresource.baseArrayLayer == 1 && r.imageSubresource.layerCount == 2 &&
+                   copies[1].imageOffset.x == 1 && copies[1].imageOffset.y == 3, "clipped pixels and exactly two layers");
+        }
+    }
 
     const auto fbits = [](float f) { return std::bit_cast<std::uint32_t>(f); };
     // R16G16_TYPELESS (SFLOAT) cleared as R16G16_UNORM Float(1.0, 1.0): uses R16G16_UNORM view and float32 {1, 1}.

@@ -104,15 +104,24 @@ public:
     bool sampler_filter_minmax = false;
     bool vertex_attribute_divisor = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
+    bool storage_image_extended_formats = false; // typed r8ui storage images
+    bool maintenance10 = false;  // depth/stencil transfers on non-graphics families, per format
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
     bool request_depth_range_unrestricted = false;
     bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted enabled
+    // VK_KHR_maintenance5 enabled, where VK_FORMAT_A8_UNORM_KHR can be sampled and blended as a colour attachment, as
+    // gta6rt enables it (VulkanDeviceInfo::a8_render_target).
+    bool a8_render_target = false;
+    bool sliced_3d_uav = false;    // imageSlicedViewOf3D and robustImageAccess enabled
+    bool robust_image_access = false;
     // create(true) only: VK_KHR (else EXT) swapchain_maintenance1 and its feature enabled, with the surface half on the
     // instance, so a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per present.
     bool swapchain_maintenance1 = false;
     bool shader_fma = false;       // VK_KHR_shader_fma and shaderFmaFloat32 enabled (OpFmaKHR, rdna2spirv.py --fma khr)
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
+    bool prepare_on_bind=false;
+    bool cold_graphics_compile = false;
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
     bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
     bool request_buffer_device_address = false;  // set before create(): enable bufferDeviceAddress where supported
@@ -126,6 +135,7 @@ public:
     leonida::SubgroupSizeCaps subgroup;
     bool custom_border_color = false;  // VK_EXT_custom_border_color and customBorderColors enabled
     bool custom_border_color_without_format = false;
+    bool shader_output_viewport_index = false;  // Vulkan 1.2 shaderOutputViewportIndex enabled
     // VK_EXT_external_memory_host is enabled when non-zero: its minImportedHostPointerAlignment.
     VkDeviceSize host_pointer_alignment = 0;
 
@@ -176,6 +186,17 @@ public:
     bool create(bool presentation = false) { return initialize(presentation) == DeviceStatus::ready; }
 
     DeviceStatus initialize(bool presentation = false) {
+        return initialize_device(presentation, false, true);
+    }
+
+    // Headless UAV tests can request sliced views and opt out of legacy formatless storage image features.
+    DeviceStatus initialize(bool enable_sliced_3d_uav, bool enable_legacy_formatless_features) {
+        return initialize_device(false, enable_sliced_3d_uav, enable_legacy_formatless_features);
+    }
+
+private:
+    DeviceStatus initialize_device(bool presentation, bool enable_sliced_3d_uav,
+                                   bool enable_legacy_formatless_features) {
         const auto failure = [](const char* call, VkResult result) {
             std::fprintf(stderr, "%s failed (VkResult %d)\n", call, static_cast<int>(result));
             return DeviceStatus::failed;
@@ -335,7 +356,9 @@ public:
         std::printf("device: %s%s%s\n", chosen.deviceName, v13_.core ? "" : " (Vulkan 1.2 + KHR extensions)",
                     validation ? " (validation on)" : "");
 
-        VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+        VkPhysicalDeviceVulkan13Features features13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+                                                     v13_.core ? &features13 : nullptr};
         VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &features11};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features12};
         features2_of(physical, &features);
@@ -375,8 +398,17 @@ public:
                     subgroup.subgroup_size_control ? "on" : "off", subgroup.compute_full_subgroups ? "on" : "off");
         // shaderDrawParameters, where available: translated vertex shaders will read BaseVertex and BaseInstance once PR 436
         // (zero-based VS ids) is in; harmless before.
+        const char* compile_mode = std::getenv("LEONIDA_PIPELINE_COMPILE");
+        const bool cache_only = compile_mode && std::strcmp(compile_mode, "cache-only") == 0;
+        v13_.enable_pipeline_cache_control = cache_only && v13_.core && v13_.pipeline_cache_control;
+        cold_graphics_compile = v13_.enable_pipeline_cache_control;
+        prepare_on_bind = compile_mode && std::strcmp(compile_mode, "on-demand") == 0;
         VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                                                   v13_.enable(conditional_rendering ? &enable_conditional : nullptr)};
+        if (v13_.core) {
+            robust_image_access = features13.robustImageAccess == VK_TRUE;
+            static_cast<VkPhysicalDeviceVulkan13Features*>(enable11.pNext)->robustImageAccess = robust_image_access;
+        }
         enable11.shaderDrawParameters = features11.shaderDrawParameters;
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
         enable12.timelineSemaphore = VK_TRUE;
@@ -401,6 +433,8 @@ public:
         enable12.descriptorBindingPartiallyBound = partially_bound;
         sampler_filter_minmax = features12.samplerFilterMinmax == VK_TRUE;
         enable12.samplerFilterMinmax = sampler_filter_minmax;
+        shader_output_viewport_index = features12.shaderOutputViewportIndex == VK_TRUE;
+        enable12.shaderOutputViewportIndex = shader_output_viewport_index;
         enable12.bufferDeviceAddress = VK_TRUE;
 
         const std::uint32_t graphics_count = std::max(1u, std::min(queue_count_wanted, family_queue_count));
@@ -430,14 +464,20 @@ public:
             sharing_.push_back(f);
         }
         VkPhysicalDeviceFeatures enable{};
+        storage_image_extended_formats = features.features.shaderStorageImageExtendedFormats == VK_TRUE;
+        enable.shaderStorageImageExtendedFormats = storage_image_extended_formats;
         enable.textureCompressionBC = features.features.textureCompressionBC;  // BC uploads, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 (index features)
         bc = features.features.textureCompressionBC == VK_TRUE;
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
+        enable.shaderStorageImageReadWithoutFormat =
+            enable_legacy_formatless_features && features.features.shaderStorageImageReadWithoutFormat;
+        enable.shaderStorageImageWriteWithoutFormat =
+            enable_legacy_formatless_features && features.features.shaderStorageImageWriteWithoutFormat;
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
+        enable.multiViewport = features.features.multiViewport;  // d3d12_multi_viewport_test, where available
         enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
-        enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 for their addresses
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.
@@ -502,6 +542,55 @@ public:
             host_copy.pNext = *v13_.next();  // after the conditional rendering features, if any
             *v13_.next() = &host_copy;
         }
+        // VK_EXT_external_memory_host where the device has it (OpenExistingHeapFromAddress).
+        for (const auto& extension : extensions) {
+            if (std::strcmp(extension.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) != 0) continue;
+            VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_memory{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &host_memory};
+            instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(physical, &properties);
+            host_pointer_alignment = host_memory.minImportedHostPointerAlignment;
+        }
+
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+        if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance5};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            VkFormatProperties a8{};
+            instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+                physical, VK_FORMAT_A8_UNORM_KHR, &a8);
+            const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                                                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+                                                VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+            a8_render_target =
+                maintenance5.maintenance5 == VK_TRUE && (a8.optimalTilingFeatures & needed) == needed;
+        }
+        if (a8_render_target) {
+            maintenance5.pNext = *v13_.next();
+            *v13_.next() = &maintenance5;
+        }
+#endif
+
+        const char* sliced_name = VK_EXT_IMAGE_SLICED_VIEW_OF_3D_EXTENSION_NAME;
+        VkPhysicalDeviceImageSlicedViewOf3DFeaturesEXT sliced{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_SLICED_VIEW_OF_3D_FEATURES_EXT};
+        if (enable_sliced_3d_uav && robust_image_access &&
+            std::any_of(extensions.begin(), extensions.end(), [&](const auto& e) {
+                return std::strcmp(e.extensionName, sliced_name) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &sliced};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            sliced_3d_uav = sliced.imageSlicedViewOf3D == VK_TRUE;
+            if (sliced_3d_uav) {
+                sliced.pNext = *v13_.next();
+                *v13_.next() = &sliced;
+            }
+        }
 
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
         // VK_KHR_shader_fma where the device has it: translated shaders built with --fma khr use OpFmaKHR.
@@ -556,16 +645,6 @@ public:
             *v13_.next() = &custom_border;
         }
 
-        // VK_EXT_external_memory_host where the device has it (OpenExistingHeapFromAddress).
-        for (const auto& extension : extensions) {
-            if (std::strcmp(extension.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) != 0) continue;
-            VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_memory{
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
-            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &host_memory};
-            instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(physical, &properties);
-            host_pointer_alignment = host_memory.minImportedHostPointerAlignment;
-        }
-
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
         device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
         device_info.pQueueCreateInfos = queue_infos.data();
@@ -586,7 +665,26 @@ public:
         if (vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        if (a8_render_target) device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+#endif
         if (host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+        if (sliced_3d_uav) device_extensions.push_back(sliced_name);
+#ifdef VK_KHR_maintenance10
+        VkPhysicalDeviceMaintenance10FeaturesKHR maint10{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_10_FEATURES_KHR};
+        if (v13_.core && all_queue_types && std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_KHR_MAINTENANCE_10_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maint10};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            maintenance10 = maint10.maintenance10 == VK_TRUE;
+            if (maintenance10) {
+                maint10.pNext = *v13_.next();
+                *v13_.next() = &maint10;
+                device_extensions.push_back(VK_KHR_MAINTENANCE_10_EXTENSION_NAME);
+            }
+        }
+#endif
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);
 #if defined(VK_KHR_swapchain_maintenance1)
@@ -637,6 +735,7 @@ public:
         return result == VK_SUCCESS ? DeviceStatus::ready : failure("vkCreateCommandPool", result);
     }
 
+public:
     bool depth_format_usable(VkFormat format) const {
         VkFormatProperties properties{};
         instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(physical, format,

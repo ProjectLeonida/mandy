@@ -295,6 +295,7 @@ def counts_only(summary: dict) -> dict:
             dllmain_failed=startup["dllmain"]["failed"],
             unimplemented_imports=len(startup["unimplemented"]),
             int3_skipped=len(startup["int3_skipped"]),
+            xmem_physical_pages_count=startup["kinds"].get("xmem_physical_pages", 0),
             exit_observed=startup["exit"] is not None,
         )
     if d3d12 := summary["d3d12"]:
