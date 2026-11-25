@@ -249,8 +249,9 @@ def _machin_pi_bounds(bits):
 
     Machin's formula pi = 16 atan(1/5) - 4 atan(1/239), each arctangent summed as the alternating series
     sum (-1)^k / ((2k+1) x^(2k+1)) in fixed point with 64 guard bits. Every term is floored once and the dropped
-    tail is smaller than the last term kept, so each sum is off by less than (terms + 1) units of 2**-(bits+64); the
-    bounds widen the result by that much, times the 16 and 4 multipliers."""
+    tail is smaller than the last term kept, so each sum is off by less than (terms + 2) units of 2**-(bits+64) (each
+    floored term is off by under one unit, and so is the tail); the bounds widen the result by that much, times the
+    16 and 4 multipliers."""
     g = bits + 64
     one = 1 << g
 
@@ -3606,7 +3607,7 @@ class Gen:
         e(f"{t['nh']} = OpSelect %uint {t['n_lt']} {t['nh1']} {t['nh2']}")
         e(f"{t['nl']} = OpSelect %uint {t['n_lt']} {t['nl1']} {self.cu(0)}")
         # value = window * 2^scale with its top bit at p: biased exponent p + scale + 1023
-        #       = p + 970 - shift, plus 128 when exponent(S0) >= 1968 (1 .. 1150 here: always normal).
+        #       = p + 970 - shift, plus 128 when exponent(S0) >= 1968 (the field is 26 .. 1022 over the translated domain: always normal).
         e(f"{t['big']} = OpUGreaterThanEqual %bool {t['e']} {self.cu(1968)}")
         e(f"{t['bias']} = OpSelect %uint {t['big']} {self.cu(970 + 128)} {self.cu(970)}")
         e(f"{t['eb0']} = OpIAdd %uint {t['p']} {t['bias']}")

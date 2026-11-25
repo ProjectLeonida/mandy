@@ -178,7 +178,8 @@ class TrigPreopValues(unittest.TestCase):
 
     def test_s1_bits_above_four_are_not_read(self):
         # Inline integers 32..34 and 64, a literal with bit 5 set, and literals that are negative as an i32.
-        for s1, c in (("32", 0), ("33", 1), ("34", 2), ("64", 0), ("0x41", 1), ("0xffffffe2", 2), ("0x80000000", 0)):
+        for s1, c in (("32", 0), ("33", 1), ("34", 2), ("64", 0), ("65", 1), ("0x41", 1), ("0xffffffe2", 2),
+                      ("0x80000000", 0)):
             self.assertEqual(run(program(0, 0x40900000, s1)), ref_trig_preop(c, d2u(1024.0)), s1)
 
     def test_s0_source_forms(self):
@@ -220,6 +221,74 @@ class TrigPreopValues(unittest.TestCase):
                 self.assertEqual((lo, hi), (want & 0xFFFFFFFF, want >> 32), f"lane {lane}")
             else:
                 self.assertEqual((lo, hi), (SENT_LO, SENT_HI), f"inactive lane {lane}")
+
+
+class TrigPreopLlvmFoldWords(unittest.TestCase):
+    """The expected words of LLVM's constant-folding tests for llvm.amdgcn.trig.preop.f64, written out as literals.
+
+    Origin: llvm/test/Transforms/InstCombine/AMDGPU/amdgcn-intrinsics.ll, the `trig_preop_constfold*` functions (the
+    22 whose segment S1[4:0] is 0..2; the others return 0 for an out-of-range segment and are refused here). They are
+    compile-time folds written by LLVM's AMDGPU developers with bit-exact CHECK words, not hardware measurements; the
+    reference above does not produce these words. Rows are (LLVM function name without its prefix, S0 bits, the S1
+    the LLVM test passes, expected result). The LLVM names `..._mantissa1__segment1` and `..._mantissaX__segment1` pass
+    S1 = 0, not 1; the S1 column is what the test passes.
+    """
+    CASES = (
+        ("inf_0", 0x7FF0000000000000, 0, 0x0B43DD63F5F2F8BD),
+        ("ninf_0", 0xFFF0000000000000, 0, 0x0B43DD63F5F2F8BD),
+        ("constfold", 0x407596F5C28F5C29, 2, 0x394A6EE06DB14ACC),
+        ("constfold_neg32_segment", 0x407596F5C28F5C29, -32, 0x3FE45F306DC9C882),
+        ("constfold_exponent0_mantissa0__segment0", 0x0000000000000000, 0, 0x3FE45F306DC9C882),
+        ("constfold_exponent0_mantissa1__segment0", 0x000FFFFFFFFFFFFF, 0, 0x3FE45F306DC9C882),
+        ("constfold_exponent0_mantissaX__segment0", 0x0004A7F09D5F47D4, 0, 0x3FE45F306DC9C882),
+        ("constfold_exponent0_mantissa0__segment2", 0x0000000000000000, 2, 0x394A6EE06DB14ACC),
+        ("constfold_exponent0_mantissa1__segment2", 0x000FFFFFFFFFFFFF, 2, 0x394A6EE06DB14ACC),
+        ("constfold_exponent0_mantissaX__segment2", 0x00094A6EE06DB14A, 2, 0x394A6EE06DB14ACC),
+        ("constfold_exponent1607_mantissa0__segment0", 0x6470000000000000, 0, 0x1EC8135A2FBF209C),
+        ("constfold_exponent1607_mantissa1__segment1", 0x647FFFFFFFFFFFFF, 0, 0x1EC8135A2FBF209C),
+        ("constfold_exponent1607_mantissaX__segment1", 0x6471B791D6398353, 0, 0x1EC8135A2FBF209C),
+        ("constfold_exponent1607_mantissa0__segment2", 0x6470000000000000, 2, 0x181272117E2EF7E4),
+        ("constfold_exponent1607_mantissa1__segment2", 0x647FFFFFFFFFFFFF, 2, 0x181272117E2EF7E4),
+        ("constfold_exponent1607_mantissaX__segment2", 0x647272117E2EF7E4, 2, 0x181272117E2EF7E4),
+        ("constfold_exponent1968_mantissa0__segment0", 0x7B00000000000000, 0, 0x10374F463F669E5F),
+        ("constfold_exponent1968_mantissa1__segment0", 0x7B0FFFFFFFFFFFFF, 0, 0x10374F463F669E5F),
+        ("constfold_exponent1968_mantissax__segment0", 0x7B074F463F669E5F, 0, 0x10374F463F669E5F),
+        ("constfold_exponent1968_mantissa0__segment2", 0x7B00000000000000, 2, 0x098F2F8BD9E839CE),
+        ("constfold_exponent1968_mantissa1__segment2", 0x7B0FFFFFFFFFFFFF, 2, 0x098F2F8BD9E839CE),
+        ("constfold_exponent1968_mantissaX__segment2", 0x7B0A2F8BD9E839CE, 2, 0x098F2F8BD9E839CE),
+    )
+
+    def test_there_are_twenty_two_cases(self):
+        self.assertEqual(len(self.CASES), 22)
+
+    def test_translator_reproduces_every_in_domain_llvm_word(self):
+        for name, s0, s1, want in self.CASES:
+            with self.subTest(name=name):
+                self.assertEqual(run(program(s0 & 0xFFFFFFFF, s0 >> 32, s1)), want)
+
+
+class TrigPreopRegisterShapes(unittest.TestCase):
+    S0 = 0x7FD0000000000000     # exponent field 2045: shift 968 + 53 * segment
+
+    def export(self, lines, outs):
+        spv = support.translate_lines("ps_trig_preop_f64", lines + [f"exp mrt0 {outs} done vm", "s_endpgm"])
+        w = support.mrt0_words(spv)
+        return [w[0] | (w[1] << 32), w[2] | (w[3] << 32)]
+
+    def test_destination_is_the_same_pair_as_s0(self):
+        # S0's high word is read before either destination word is written.
+        lines = program(self.S0 & 0xFFFFFFFF, self.S0 >> 32, 1)[:2] + ["v_trig_preop_f64 v[4:5], v[4:5], 1"]
+        self.assertEqual(self.export(lines, "v4, v5, v4, v5")[0], ref_trig_preop(1, self.S0))
+
+    def test_destination_overlaps_s0(self):
+        lines = program(self.S0 & 0xFFFFFFFF, self.S0 >> 32, 1)[:2] + ["v_trig_preop_f64 v[5:6], v[4:5], 1"]
+        self.assertEqual(self.export(lines, "v5, v6, v5, v6")[0], ref_trig_preop(1, self.S0))
+
+    def test_two_uses_in_one_program(self):
+        lines = program(self.S0 & 0xFFFFFFFF, self.S0 >> 32, 0)[:2] + [
+            "v_trig_preop_f64 v[0:1], v[4:5], 0", "v_trig_preop_f64 v[2:3], v[4:5], 2"]
+        got = self.export(lines, "v0, v1, v2, v3")
+        self.assertEqual(got, [ref_trig_preop(0, self.S0), ref_trig_preop(2, self.S0)])
 
 
 class TrigPreopRefusals(unittest.TestCase):
