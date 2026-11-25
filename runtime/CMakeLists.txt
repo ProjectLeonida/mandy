@@ -303,6 +303,14 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
 
+  # The memory probe's resident-bytes estimate (src/working_set.h): committed and touched pages read as resident, a
+  # reserved range and pages dropped from the working set do not.
+  add_executable(working_set_test test/working_set_test.cpp)
+  target_compile_definitions(working_set_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(working_set_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_libraries(working_set_test PRIVATE psapi)
+  add_test(NAME working_set COMMAND working_set_test)
+
   # The title's CLZERO loops rewritten to stubs on a CPU without CLZERO (src/clzero_patch.h): both loop shapes are
   # found, patched and run, so the test runs on any x86-64 CPU.
   add_executable(clzero_patch_test test/clzero_patch_test.cpp)

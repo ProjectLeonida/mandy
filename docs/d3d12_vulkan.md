@@ -2803,7 +2803,10 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   slice can be reused. Large images, dedicated-only images, and failed pool allocations use individual memory
   allocations. `LEONIDA_TITLE_IMAGE_POOL=0` selects individual allocation for every image. With
   `LEONIDA_MEM_PROBE` enabled, the texture census also reports logical Vulkan backing bytes for the registered
-  slot-70 and slot-133 images and the portion on non-device-local types.
+  slot-70 and slot-133 images and the portion on non-device-local types. It also reports the title pages behind the images
+  it has filled from memory, and how much of them is resident in RAM, sampled with `QueryWorkingSetEx` (one page
+  in 16, `runtime/src/working_set.h`): the CPU-side copy the GPU image duplicates (#1702). Images the GPU writes
+  (render targets, depth, unordered access) are not filled from memory and are left out.
 - Sampled title images can use device-local memory even when Vulkan host image copies require a
   host-visible memory type. The runtime queries the same image with and without host-transfer usage.
   When only the latter permits plain device-local backing, it detiles the complete image into a reusable
