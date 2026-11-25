@@ -442,6 +442,56 @@ class TestMaskDataReadExecGate(unittest.TestCase):
             else:
                 self.assertEqual(mem[lane * 4], 0x55555555, f"lane {lane}")
 
+    def test_exec_copy_roundtrip_keeps_mask_gather(self):
+        # `s_mov_b32 s4, exec_lo` copies EXEC under an unknown narrowing and `s_mov_b32 exec_lo, s4`
+        # restores the same value — EXEC is unchanged, so a mask written under that narrowing must
+        # still gather. The copy has to carry the narrowing's tag into `alias`: without it the
+        # restore minted a fresh tag in _exec_src_ex, mask_exec_sigs coverage failed and the read
+        # kept this lane's 0 / ~0 bit where `s_mov_b32 exec_lo, -1` gathered the word (#1397 review).
+        lines = [
+            "v_mov_b32_e32 v7, -1",
+            "v_readfirstlane_b32 s7, v7",        # s7 = 0xffffffff, not a tracked constant
+            "s_mov_b32 exec_lo, s7",             # EXEC = unknown narrowing, runtime all-ones
+            "v_and_b32 v1, 1, v0",
+            "v_cmp_ne_u32_e64 s10, v1, 0",       # odd-lane mask written under that EXEC
+            "s_mov_b32 s4, exec_lo",
+            "s_mov_b32 exec_lo, s4",
+            "v_mov_b32_e32 v2, s10",
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "buffer_store_dword v2, v3, s[0:3], 0 offen",
+            "s_endpgm",
+        ]
+        spv, _ = _translate_cs("cs_maskdata_exec_copy", lines, wave_size=32, emulate=False)
+        self.assertIn("OpGroupNonUniformBitwiseOr", spv)
+        mem = _run_cs("cs_maskdata_exec_copy_run", lines, wave_size=32, emulate=False)
+        want = sum(1 << i for i in range(1, 32, 2))    # 0xAAAAAAAA, every lane
+        for lane in range(32):
+            self.assertEqual(mem[lane * 4], want, f"lane {lane}")
+
+    def test_exec_copy_roundtrip_keeps_mask_gather_wave64(self):
+        # Same round-trip on the exec_lo half of a wave64 EXEC: the VCC mask's low word must still
+        # gather while exec_hi stays clean.
+        lines = [
+            "s_mov_b64 exec, -1",                # wave64 marker (and a clean EXEC to start)
+            "v_mov_b32_e32 v7, -1",
+            "v_readfirstlane_b32 s7, v7",
+            "s_mov_b32 exec_lo, s7",             # exec_lo = unknown narrowing, runtime all-ones
+            "v_and_b32 v1, 1, v0",
+            "v_cmp_ne_u32_e64 vcc, v1, 0",
+            "s_mov_b32 s4, exec_lo",
+            "s_mov_b32 exec_lo, s4",
+            "v_mov_b32_e32 v2, vcc_lo",
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "buffer_store_dword v2, v3, s[0:3], 0 offen",
+            "s_endpgm",
+        ]
+        spv, _ = _translate_cs("cs_maskdata_exec_copy_w64", lines, wave_size=64, emulate=False)
+        self.assertIn("OpGroupNonUniformBitwiseOr", spv)
+        mem = _run_cs("cs_maskdata_exec_copy_w64_run", lines, wave_size=64, emulate=False)
+        want = sum(1 << i for i in range(1, 32, 2))    # 0xAAAAAAAA, the vcc_lo word
+        for lane in range(64):
+            self.assertEqual(mem[lane * 4], want, f"lane {lane}")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2054,8 +2054,12 @@ class Gen:
             t = src.get("t", "")
             vals = []
             for i in range(len(regs)):
-                h = ex[0] if (t == "exec_lo" or (t == "exec" and i == 0)) else \
-                    ex[1] if (t == "exec_hi" or (t == "exec" and i == 1)) else None
+                if t == "exec_lo" or (t == "exec" and i == 0):
+                    h, hi = ex[0], False
+                elif t == "exec_hi" or (t == "exec" and i == 1):
+                    h, hi = ex[1], True
+                else:
+                    h, hi = None, False
                 if h is None:
                     vals.append(None)
                 elif h[0] == "c":
@@ -2063,7 +2067,11 @@ class Gen:
                 elif h[0] == "k":
                     vals.append(h[1])
                 else:
-                    vals.append(None)
+                    # An EXEC copy under an unknown narrowing holds that narrowing's value: alias
+                    # the half-state (as saveexec does) so `s_mov_b32 exec_lo, sD` restores the
+                    # same tag and mask_exec_sigs coverage still holds — a plain None would mint a
+                    # fresh tag in _exec_src_ex and suppress gathers that are exact (#1397 review).
+                    vals.append(("al", (None, h) if hi else (h, None)))
             return vals
         return [None] * len(regs)
 
