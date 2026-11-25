@@ -3,7 +3,8 @@ that tests/semantic/test_ps_semantics.py then FAILS for the shader that exercise
 
 Each mutation is an exact-text replacement that must match exactly once (so a refactor that moves the code makes
 this test fail loudly instead of silently mutating nothing). The repository's own tools/ is never modified.
-Each baseline run on the unmutated copy must pass first.
+The whole of test_ps_semantics.py must pass on an unmutated copy first. The mutations then share one copy: each
+starts from the original file, runs only the test it must break, and puts the original back.
 """
 import os
 import re
@@ -77,18 +78,24 @@ MUTATIONS = [
 ]
 
 
-def run_semantics(tools_dir):
+def run_semantics(tools_dir, test=None):
+    """Run test_ps_semantics.py, or only its TranslatorSemantics.<test>, in a new process against tools_dir."""
     # The child finds test_ps_semantics through PYTHONPATH, not cwd=HERE: Windows refuses a working directory longer
     # than 258 characters (WinError 267), which a checkout in a deep folder reaches.
     path = os.pathsep.join(filter(None, [HERE, os.environ.get("PYTHONPATH")]))
+    # No bytecode anywhere in the child: the mutations rewrite the translator in place, and a .pyc cached for an
+    # earlier mutant of the same size, written in the same second, would be run instead of the source.
     env = dict(os.environ, LEONIDA_TOOLS_DIR=tools_dir, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=path)
-    p = subprocess.run([sys.executable, "-m", "unittest", "test_ps_semantics", "-v"], env=env,
+    name = f"test_ps_semantics.TranslatorSemantics.{test}" if test else "test_ps_semantics"
+    p = subprocess.run([sys.executable, "-m", "unittest", name, "-v"], env=env,
                        capture_output=True, text=True, timeout=300)
     return p.returncode, p.stdout + p.stderr
 
 
 def failed_tests(output):
-    return set(re.findall(r"^(?:FAIL|ERROR): (test_\w+)", output, re.M))
+    # Only tests of TranslatorSemantics count. A name the class does not have fails as well, as
+    # "ERROR: test_x (unittest.loader._FailedTest.test_x)", and must not pass for a mutation's expected test.
+    return set(re.findall(r"^(?:FAIL|ERROR): (test_\w+) \(test_ps_semantics\.TranslatorSemantics\b", output, re.M))
 
 
 def apply_mutation(path, old, new):
@@ -121,14 +128,21 @@ class MutationTests(unittest.TestCase):
             self.assertEqual(rc, 0, out)
 
     def test_each_mutation_is_caught(self):
-        for label, fname, old, new, expect in MUTATIONS:
-            with self.subTest(mutation=label), tempfile.TemporaryDirectory() as tmp:
-                tools = self.make_copy(tmp)
-                path = os.path.join(tools, fname)
-                apply_mutation(path, old, new)
-                rc, out = run_semantics(tools)
-                self.assertNotEqual(rc, 0, f"mutation not detected: {label}\n{out}")
-                self.assertIn(expect, failed_tests(out), f"{label}: expected {expect} to fail\n{out}")
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = self.make_copy(tmp)
+            for label, fname, old, new, expect in MUTATIONS:
+                with self.subTest(mutation=label):
+                    path = os.path.join(tools, fname)
+                    with open(path, "rb") as f:
+                        original = f.read()
+                    try:
+                        apply_mutation(path, old, new)
+                        rc, out = run_semantics(tools, expect)
+                    finally:
+                        with open(path, "wb") as f:     # the next mutation starts from the original again
+                            f.write(original)
+                    self.assertNotEqual(rc, 0, f"mutation not detected: {label}\n{out}")
+                    self.assertIn(expect, failed_tests(out), f"{label}: expected {expect} to fail\n{out}")
 
     def test_anchors_match_crlf_translator_copies(self):
         # Regression: on a CRLF checkout of tools/ the four multiline anchors (v_bfe_i32, v_subrev_co_ci_u32,
