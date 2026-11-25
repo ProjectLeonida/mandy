@@ -257,7 +257,16 @@ int check_console_heap(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fe
         else EXPECT(zero_size(words));
     }
     EXPECT(restored == 16);
-    std::printf("128 settled zero descriptors, %u restored in 64 submissions\n", restored);
+    // A slot written now with the words the first refresh had no copy for: the refresh that copies the write asks
+    // for them again rather than reuse that answer (fix_vsharp's answers last one pass over the heap).
+    put(140, raw_vsharp(unmapped));
+    queue->ExecuteCommandLists(1, lists);
+    EXPECT(SUCCEEDED(queue->Signal(fence, ++fence_value)));
+    EXPECT(SUCCEEDED(fence->SetEventOnCompletion(fence_value, nullptr)));
+    std::uint32_t rewritten[8];
+    EXPECT(rt::d3d12::read_arena(device, shader_va + 140 * kDescriptor, rewritten, sizeof(rewritten)));
+    EXPECT(base_of(rewritten) == b.arena_va && rewritten[2]);
+    std::printf("128 settled zero descriptors, %u restored in 64 submissions, a rewritten one at once\n", restored);
     leonida::title_va_aliases().remove(unmapped, b.arena_va);
 
     // The null guard: past the heap's last slot, up to kHeapIndexReach from its start, every byte reads 0.
