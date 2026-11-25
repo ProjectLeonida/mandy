@@ -3,7 +3,7 @@
 > [!NOTE]
 > La documentation en anglais ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) et
 > [`docs/README.md`](../../README.md)) **fait foi**. Ce guide ne reprend que les instructions stables d'installation
-> et de compilation (synchronisé avec le commit `aa2988cc`). Pour l'état d'avancement du projet, qui change tous les
+> et de compilation (synchronisé avec le commit `604ddff0`). Pour l'état d'avancement du projet, qui change tous les
 > jours, consultez le [`README.md`](../../../README.md).
 
 ## Ce qu'est Leonida
@@ -20,7 +20,15 @@ système de la console est réimplémenté sous forme de shims.
 > joignez et ne partagez jamais ces fichiers dans une issue ou une pull request (voir
 > [`CONTRIBUTING.md`](../../../CONTRIBUTING.md)).
 
-Le projet en est à ses débuts : **le jeu ne démarre pas encore**.
+> [!NOTE]
+> **Ce dépôt prend la suite du [projet Leonida de NotRexed](https://github.com/ItsNotRexed/Leonida).** L'auteur
+> d'origine a quitté le projet ; le développement continue ici avec tout l'historique des commits.
+
+Le projet en est à ses débuts : **rien n'est encore jouable**. Sur `main`, le jeu démarre à partir de votre copie,
+sous Windows et sous Linux avec Proton : il affiche la vidéo de lancement, les pages du premier lancement et l'écran
+d'accueil (qui répondent à la manette ou au clavier), puis va au bout du chargement du mode histoire et entre dans la
+phase du monde. Aucune première image du monde n'a encore été vérifiée. Voir
+[le premier lancement sous Windows](../../first_run_ui.md) et [le rapport Linux/Proton](../../linux_proton.md).
 
 ## Plateformes
 
@@ -29,7 +37,9 @@ Rien n'est jouable, sur aucune plateforme. Ce qui tourne aujourd'hui :
 - **Windows** : tout (`make_game.py`, les outils, et le runtime `gta6rt` avec la couche D3D12 → Vulkan et ses tests).
 - **Linux** : le traducteur, les outils de ressources et les outils de test GPU Vulkan tournent nativement (testés
   sur RADV et NVIDIA). Le runtime est du code Windows : il se compile en croisé avec clang-cl et xwin, et ses tests
-  tournent sous Wine ou Proton. Le jeu est prévu pour tourner de la même façon (#217).
+  tournent sous Wine ou Proton. Le jeu tourne de la même façon, sous Proton avec la couche D3D12 sur Vulkan natif,
+  pour l'instant jusqu'à la fin du chargement du mode histoire. `./Build.sh` lance la compilation ;
+  [`docs/linux.md`](../../linux.md) donne les paquets et les étapes.
 - **macOS (Apple Silicon)** : les outils Python et les outils de test Vulkan tournent nativement, sur MoltenVK
   (Homebrew) ou KosmicKrisp. Le runtime tourne sous Wine, comme sous Linux. Limites connues : pas d'étape geometry ni
   de `VK_EXT_mesh_shader`, sous-groupes de 32 (les shaders wave64 sont émulés) et la gestion des flottants de
@@ -37,14 +47,14 @@ Rien n'est jouable, sur aucune plateforme. Ce qui tourne aujourd'hui :
 - **AMD RDNA1 (RX 5000)** : une cible prise en charge, proche du RDNA2 de la console ; ses sous-groupes de 64
   exécutent les shaders wave64 nativement.
 
-Les résultats GPU de toutes les plateformes sont regroupés dans
-l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
+Les résultats GPU de toutes les plateformes sont regroupés dans le dossier
+[`gpu-test-results/`](../../../gpu-test-results).
 
 ## Prérequis
 
 - **Votre propre copie** du paquet Xbox Series, version `1.0.2.1` : le dossier qui contient `MicrosoftGame.Config` et
   les archives `.rpf`, sous forme de fichiers lisibles sur le disque.
-- **Windows 10/11 x64**, avec environ **350 Go libres** pour les fichiers de travail. Ils peuvent aller sur un autre
+- **Windows 10/11 x64**, avec environ **400 Go libres** pour les fichiers de travail (tailles affichées par l'Explorateur Windows, en Gio). Ils peuvent aller sur un autre
   disque avec `--work`.
 - [Python 3.12+](https://www.python.org/downloads/) (cochez « Add python.exe to PATH » à l'installation).
 - [SDK .NET 8](https://dotnet.microsoft.com/download/dotnet/8.0).
@@ -67,7 +77,8 @@ l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
     ```
 
     Voir [`docs/design.md`](../../design.md#disassembling-shaders) pour les détails.
-  - Sous Linux, un `llvm-mc` présent dans le `PATH` suffit.
+  - Sous Linux, un `llvm-mc` présent dans le `PATH` suffit, tout comme une version numérotée installée par la
+    distribution, par exemple `llvm-21` sous Ubuntu (`llvm-mc-21`, `/usr/lib/llvm-21/bin/llvm-mc`).
 - **Visual Studio 2022** avec la charge de travail *Développement Desktop en C++* et le **SDK Windows `10.0.26100` ou
   plus récent**, pour l'étape `runtime` (le runtime utilise les root signatures 1.2, absentes des SDK plus anciens).
 - [ffmpeg](https://ffmpeg.org/download.html) dans le `PATH` *(facultatif : décode les flux XMA2, et obligatoire avec
@@ -80,11 +91,12 @@ l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
 1. Installez les prérequis ci-dessus.
 2. Clonez le dépôt **avec son sous-module** :
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/ubiquitarianism/leonida
    ```
    Un « Download ZIP » depuis GitHub n'inclut pas `third_party/rpf9-explorer` : la compilation le récupère si `git`
    est installé, et sinon vous dit quoi faire.
-3. Double-cliquez sur **`Build.bat`**.
+3. Double-cliquez sur **`Build.bat`**. Sous Linux ou macOS, lancez plutôt **`./Build.sh`** dans un terminal (voir
+   [`docs/linux.md`](../../linux.md) pour Linux).
 
 Le script trouve votre copie tout seul : il cherche dans Téléchargements, Bureau, Documents (y compris là où Windows
 les range, par exemple dans OneDrive), Games, votre dossier utilisateur et à la racine de chaque disque, sur deux
@@ -102,6 +114,31 @@ qu'aux outils de ressources, et `--wav` ajoute plusieurs fois la taille de l'Ogg
 place : si son disque est en lecture seule, passez `gta6rt --overlay <dossier accessible en écriture>` (c'est une
 option de `gta6rt`, pas de `make_game.py`). Ne supprimez pas les fichiers `.s` de `work/shaders/dxbc/disasm` : sans
 eux et sans `work/shaders/spirv/index.json`, l'étape `shaders` peut sembler terminée avec zéro shader.
+
+### Espace disque et disques
+
+La compilation utilise trois dossiers, et chacun peut être sur son propre disque :
+
+| Dossier | Option | Contenu | Taille | Lu pendant le jeu |
+|---|---|---|---|---|
+| votre paquet | `--game` | votre copie du jeu ; seulement lue, jamais modifiée | sa taille | oui, sur place (`game_path.txt`) |
+| travail | `--work` (par défaut `<out>\work`) | `shaders` (extraits, désassemblés, traduits) et `assets` (exports) | environ 30 Go + environ 370 Go | seulement `shaders\spirv` (`shader_path.txt`) |
+| portage | `--out` (par défaut `Documents\Leonida`) | `gta6rt.exe`, sa DLL, les fichiers de chemins, le cache de pipelines, `overlay` | petit | oui |
+
+La vérification de l'espace libre ne compte que le disque de `--work`, car c'est là que vont les gros fichiers. Le
+jeu ne lit rien dans `<work>\assets` : avec un petit SSD, gardez sur le SSD ce que le jeu charge et mettez les exports
+sur un disque dur, en deux passes :
+
+```powershell
+# sur le SSD : le paquet, le portage et les shaders traduits (environ 30 Go de fichiers de travail)
+python -I make_game.py --game "S:\Games\package" --out "S:\Games\Leonida" --work "S:\Games\Leonida\work" --stages check,shaders,runtime,pipelines
+# sur le disque dur : les exports de ressources (environ 370 Go), utiles seulement aux outils de ressources
+python -I make_game.py --game "S:\Games\package" --out "S:\Games\Leonida" --work "H:\leonida-assets" --stages check,assets
+```
+
+La deuxième passe ne recompile pas le runtime : `shader_path.txt` pointe donc toujours vers le SSD. Repassez le même
+`--work` aux exécutions suivantes de chaque étape pour qu'elles reprennent. Un seul `--work "H:\leonida-work"`
+marche aussi ; le jeu charge alors ses shaders traduits depuis ce disque.
 
 ### Depuis un terminal (`make_game.py`)
 
@@ -137,7 +174,7 @@ encore ce cache.
 - **Ce qui est refait automatiquement** : la compilation enregistre la commande et la version de `llvm-mc`, les
   sources du traducteur et le décodeur des ressources (`third_party/rpf9-explorer` et `tools/rpf9dump`). Si l'un
   d'eux change, seule l'étape concernée est refaite (désassemblage, traduction ou export des modèles et textures).
-- **`--work`** : choisissez un disque avec au moins 350 Go libres. La traduction des shaders est l'étape la plus
+- **`--work`** : choisissez un disque avec au moins 400 Go libres. La traduction des shaders est l'étape la plus
   longue ; elle utilise par défaut la moitié des threads du processeur (réglable avec `--jobs`).
 - **`--wav`** : désactivé par défaut, car le WAV PCM 16 bits est plusieurs fois plus volumineux que l'Ogg Opus.
 - **Linux et Wine/Proton** : `make_game.py` fonctionne aussi sous Linux. L'étape `pipelines` utilise
@@ -177,7 +214,7 @@ encore ce cache.
    [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
 
 Le [guide des tests GPU](../../testing.md) explique comment lancer les tests sans aucun fichier du jeu. Publiez vos
-résultats dans l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166), un commentaire par GPU et par
-pilote.
+résultats par une pull request qui ajoute un fichier dans [`gpu-test-results/`](../../../gpu-test-results), au même
+format que les fichiers déjà présents.
 
-[coord]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+[coord]: https://github.com/ubiquitarianism/leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
