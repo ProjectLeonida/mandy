@@ -606,9 +606,11 @@ int check_title_placed_all(ID3D12Device* device) {
     failures += check_title_placed(device, "VirtualAlloc range", pages, size);
     failures += check_placed_texture_views(device, pages);
     // Inside a page, as the title places small UAV buffers (64-byte aligned, found in review on an RTX 5090): the
-    // import starts at the page and the buffer is bound at the offset.
+    // import starts at the page and the buffer is bound at the offset. Also check a 16-byte slice 64 bytes from the
+    // end of the committed range, where 256-byte uniform-buffer size rounding would run past the page.
     failures += check_title_placed(device, "64 bytes into a page", static_cast<char*>(pages) + 64, 0x1000 - 64);
     failures += check_host_prefix_buffers(device);
+    failures += check_title_placed(device, "16 bytes near the end of the range", static_cast<char*>(pages) + size - 64, 16);
     VirtualFree(pages, 0, MEM_RELEASE);
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(size), nullptr);
     void* view = section ? MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size) : nullptr;
