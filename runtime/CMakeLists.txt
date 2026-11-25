@@ -765,6 +765,16 @@ if(BUILD_TESTING)
     endif()
     target_link_libraries(title_window_test PRIVATE user32)
     add_test(NAME title_window COMMAND title_window_test)
+
+    # LEONIDA_TITLE_HUD's counters in the title bar of another thread's window (shims/title_hud.h): user32 and DXGI.
+    add_executable(title_hud_test test/title_hud_test.cpp)
+    target_include_directories(title_hud_test PRIVATE shims)
+    target_compile_definitions(title_hud_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    if(MSVC)
+      target_compile_options(title_hud_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    target_link_libraries(title_hud_test PRIVATE Vulkan::Headers user32 psapi)
+    add_test(NAME title_hud COMMAND title_hud_test)
   endif()
 
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
@@ -1392,6 +1402,8 @@ if(BUILD_TESTING)
   add_test(NAME shader_library COMMAND shader_library_test)
   add_executable(native_pso_blend_test test/native_pso_blend_test.cpp)
   add_test(NAME native_pso_blend COMMAND native_pso_blend_test)
+  add_executable(native_pso_depth_test test/native_pso_depth_test.cpp)
+  add_test(NAME native_pso_depth COMMAND native_pso_depth_test)
   if(WIN32)
     # The slot 57 factory retries only a pipeline that blends a B4G4R4A4 stand-in target (d3d12.h types).
     add_executable(native_pso_fallback_test test/native_pso_fallback_test.cpp)
@@ -1399,6 +1411,8 @@ if(BUILD_TESTING)
   endif()
   add_executable(spirv_f16_halves_test test/spirv_f16_halves_test.cpp)
   add_test(NAME spirv_f16_halves COMMAND spirv_f16_halves_test)
+  add_executable(dual_source_fragment_test test/dual_source_fragment_test.cpp)
+  add_test(NAME dual_source_fragment COMMAND dual_source_fragment_test)
   # Optional: skips unless LEONIDA_SHADERS names a translated work folder (<work>/shaders/spirv).
   add_executable(shader_library_corpus_test test/shader_library_corpus_test.cpp)
   add_test(NAME shader_library_corpus COMMAND shader_library_corpus_test)
@@ -1716,7 +1730,7 @@ if(BUILD_TESTING)
     # game's exact exit code comes back through the relaunch.
     add_test(NAME run_tiny_first_run_ui COMMAND gta6rt --first-run-ui $<TARGET_FILE:tiny_game> -- hello 42 first-run-ui)
     set_tests_properties(run_tiny_first_run_ui PROPERTIES
-      ENVIRONMENT "LEONIDA_ARENA_MB=768;LEONIDA_D3D12=;LEONIDA_PIPELINE_COMPILE="
+      ENVIRONMENT "LEONIDA_ARENA_MB=768;LEONIDA_D3D12=;LEONIDA_PIPELINE_COMPILE=;LEONIDA_KEYBOARD_PAD="
       PASS_REGULAR_EXPRESSION "tiny_game: PASS first-run UI caller override"
       FAIL_REGULAR_EXPRESSION "tiny_game: FAIL")
     add_test(NAME run_tiny_game_fixed COMMAND gta6rt --run $<TARGET_FILE:tiny_game_fixed> -- hello 42)
@@ -2567,7 +2581,7 @@ if(TARGET Vulkan::Headers)
 
     # ClearUnorderedAccessViewUint/Float on buffers and textures, read back through D3D12.
     add_executable(d3d12_uav_clear_test test/d3d12_uav_clear_test.cpp)
-    target_link_libraries(d3d12_uav_clear_test PRIVATE gta6rt_d3d12_com)
+    target_link_libraries(d3d12_uav_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_uav_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_uav_clear_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_uav_clear COMMAND d3d12_uav_clear_test)
@@ -2644,6 +2658,8 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_existing_heap_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_existing_heap_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_existing_heap COMMAND d3d12_existing_heap_test)
+    add_test(NAME d3d12_host_prefix COMMAND d3d12_existing_heap_test --host-prefix-only)
+    set_tests_properties(d3d12_host_prefix PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(d3d12_existing_heap PROPERTIES SKIP_RETURN_CODE 77)
     # The same with write watching off: the guarded cases only, the concurrent writers among them.
     add_test(NAME d3d12_existing_heap_no_write_watch COMMAND d3d12_existing_heap_test)
@@ -3189,17 +3205,18 @@ if(TARGET Vulkan::Headers)
       get_filename_component(LEONIDA_SPIRV_TOOLS_DIR ${LEONIDA_SPIRV_AS} DIRECTORY)
       file(TO_NATIVE_PATH "${LEONIDA_SPIRV_TOOLS_DIR}" LEONIDA_SPIRV_TOOLS_NATIVE)
       set(LEONIDA_M15_FILES ${LEONIDA_M15_DIR}/spirv/index.json ${LEONIDA_M15_DIR}/fssm/vs_m15.fssm
-                            ${LEONIDA_M15_DIR}/fssm/ps_m15.fssm)
+                            ${LEONIDA_M15_DIR}/fssm/ps_m15.fssm ${LEONIDA_M15_DIR}/fssm/ps_m15_dual.fssm)
       add_custom_command(
         OUTPUT ${LEONIDA_M15_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M15_DIR}
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${LEONIDA_M15_DIR} vs_m15 ps_m15
+                ${LEONIDA_M15_DIR} vs_m15 ps_m15 ps_m15_dual
         DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m15.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m15.asm
-        COMMENT "Translating vs_m15 and ps_m15 for the translated draw test"
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m15_dual.asm
+        COMMENT "Translating vs_m15, ps_m15 and ps_m15_dual for the translated draw test"
         VERBATIM)
       add_executable(d3d12_translated_draw_test test/d3d12_translated_draw_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
                      ${LEONIDA_M15_FILES})
@@ -3213,6 +3230,11 @@ if(TARGET Vulkan::Headers)
       add_test(NAME xbox_derived_mask_restore COMMAND d3d12_translated_draw_test --derived-restore)
 
       set_tests_properties(d3d12_translated_draw PROPERTIES SKIP_RETURN_CODE 77)
+      # Dual-source blending (RT-DUAL-SOURCE-BLEND): with lazy pipelines (the default) and built at creation.
+      add_test(NAME d3d12_dual_source_draw COMMAND d3d12_translated_draw_test --dual-source)
+      add_test(NAME d3d12_dual_source_draw_eager COMMAND d3d12_translated_draw_test --dual-source)
+      set_tests_properties(d3d12_dual_source_draw d3d12_dual_source_draw_eager PROPERTIES SKIP_RETURN_CODE 77)
+      set_tests_properties(d3d12_dual_source_draw_eager PROPERTIES ENVIRONMENT "LEONIDA_LAZY_PIPELINES=0")
 
       # The console's rectangle and quad lists (src/rect_list_geometry.h), through the same translated vs_m15 / ps_m15.
       # The files are d3d12_translated_draw_test's: a second target that lists them runs the translation a second
@@ -3466,7 +3488,7 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_unmapped_vsharp_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_VULKAN_DEVICE)
     target_compile_options(d3d12_unmapped_vsharp_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_unmapped_vsharp COMMAND d3d12_unmapped_vsharp_test)
-    set_tests_properties(d3d12_unmapped_vsharp PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_CONSOLE_FIX_US=0")
+    set_tests_properties(d3d12_unmapped_vsharp PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(d3d12_indirect_zero_test test/d3d12_indirect_zero_test.cpp)
     target_link_libraries(d3d12_indirect_zero_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_indirect_zero_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -3631,6 +3653,10 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_geometry_views COMMAND d3d12_title_va_test)
       set_tests_properties(d3d12_geometry_views PROPERTIES ENVIRONMENT "LEONIDA_GEOMETRY_MB=16" SKIP_RETURN_CODE 77)
       set_tests_properties(d3d12_title_va PROPERTIES SKIP_RETURN_CODE 77)
+      # Past LEONIDA_TITLE_WINDOWS_MB a view of the title's memory is never its raw VA (#1537): with no other backing it
+      # is written zero-size, and a dispatch through it reads zeros.
+      add_test(NAME d3d12_title_window_cap COMMAND d3d12_title_va_test --window-cap)
+      set_tests_properties(d3d12_title_window_cap PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_TITLE_WINDOWS_MB=0")
       add_test(NAME d3d12_api_descriptor_copy COMMAND d3d12_title_va_test --api-descriptor-copy)
       set_tests_properties(d3d12_api_descriptor_copy PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_DESC_MIRROR=1")
       add_test(NAME d3d12_api_descriptor_copy_off COMMAND d3d12_title_va_test --api-descriptor-copy-off)
@@ -4303,6 +4329,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(indirect_dispatch_count_alloc_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME indirect_dispatch_count_alloc COMMAND indirect_dispatch_count_alloc_test)
+    # IndirectArgumentClamp queue-family sharing, bind-retry cleanup, slot zeroing, offset alignment, and concurrency (no GPU).
+    add_executable(indirect_clamp_safety_test test/indirect_clamp_safety_test.cpp)
+    target_link_libraries(indirect_clamp_safety_test PRIVATE Vulkan::Headers Threads::Threads)
+    if(WIN32)
+      target_compile_definitions(indirect_clamp_safety_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME indirect_clamp_safety COMMAND indirect_clamp_safety_test)
     # A buffer UAV clear writes where its resource starts in a shared VkBuffer (no GPU).
     add_executable(replay_uav_clear_offset_test test/replay_uav_clear_offset_test.cpp)
     target_link_libraries(replay_uav_clear_offset_test PRIVATE Vulkan::Headers)
@@ -4321,6 +4354,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_query_edges_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_query_edges COMMAND replay_query_edges_test)
+    # Stateful indirect draw topology coverage and per-reason indirect_stats counters (no GPU or game data).
+    add_executable(indirect_topology_and_stats_test test/indirect_topology_and_stats_test.cpp)
+    target_link_libraries(indirect_topology_and_stats_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(indirect_topology_and_stats_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME indirect_topology_and_stats COMMAND indirect_topology_and_stats_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
@@ -4362,6 +4402,17 @@ if(TARGET Vulkan::Headers)
       target_compile_options(arena_blocks_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME arena_blocks COMMAND arena_blocks_test)
+    add_executable(title_window_plan_bounds_test test/title_window_plan_bounds_test.cpp)
+    if(WIN32 AND MSVC)
+      target_compile_options(title_window_plan_bounds_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME title_window_plan_bounds COMMAND title_window_plan_bounds_test)
+    # Host-RAM bitset of live console resource-heap V# slots (src/console_heap_vsharp_slots.h).
+    add_executable(console_heap_vsharp_slots_test test/console_heap_vsharp_slots_test.cpp)
+    if(WIN32 AND MSVC)
+      target_compile_options(console_heap_vsharp_slots_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME console_heap_vsharp_slots COMMAND console_heap_vsharp_slots_test)
     # Queue construction cleans its Vulkan handles if holder registration runs out of host memory.
     add_executable(vk_host_texture_order_test test/vk_host_texture_order_test.cpp)
     target_link_libraries(vk_host_texture_order_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})

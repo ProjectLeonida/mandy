@@ -116,6 +116,18 @@ Useful switches:
   diagnostic).
 * `LEONIDA_DEVICE_FAULT=1` enables Vulkan device-loss diagnostics and checkpoints where available. The first
   observed loss prints a `[rt] device-fault:` report to stderr.
+* `LEONIDA_TITLE_HUD=1` shows live counters in the title bar of the window the title presents in
+  (`runtime/shims/title_hud.h`). It updates twice a second with:
+  - the frame rate and the average and worst frame time from PresentX, or, when no frame came in that half
+    second, how long since the last one (a hang reads "0 fps, no frame for 12.5 s");
+  - the process's private memory and working set;
+  - its local GPU memory against the DXGI budget, and its shared GPU memory;
+  - the graphics and compute pipelines created, and the seconds spent in `vkCreate*Pipelines` in the last half
+    second. A pipeline compiled in the frame shows up there as a hitch. This needs `LEONIDA_MEM_PROBE`; without it
+    the field reads `PSO -`.
+  - the time since the first present.
+
+  A thread of its own sets the text with `SendMessageTimeout`, so a busy window thread never holds a present.
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their
   implicit layers add swapchain usage that shows up as validation errors ([testing.md](testing.md), "Known
   problems").

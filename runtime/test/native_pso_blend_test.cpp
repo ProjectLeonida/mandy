@@ -83,9 +83,14 @@ void mapping() {
     check(colour && colour->src == 3 && colour->dst == 4 && colour->src_alpha == SRC_ALPHA &&
               colour->dst_alpha == INV_SRC_ALPHA,
           "SRC_COLOR/INV_SRC_COLOR stay colour factors, and alpha reads them as SRC_ALPHA/INV_SRC_ALPHA");
-    // Not built here: dual-source factors (the translator declares no second pixel-shader output), BOTH_SRC_ALPHA
-    // (not on gfx10) and a COMB_FCN past 4.
-    check(!np::d3d12_target_blend(0xf1010f01, 0xf), "a dual-source (SRC1) target is not built");
+    // Dual-source (RT-DUAL-SOURCE-BLEND): 0xf1010f01 is colour ONE/SRC1_COLOR, alpha ONE/SRC1_ALPHA.
+    check(same(*np::d3d12_target_blend(0xf1010f01, 0xf), true, ONE, 16, ADD, ONE, 18, ADD, 0xf),
+          "0xf1010f01: D3D12_BLEND_SRC1_COLOR and D3D12_BLEND_SRC1_ALPHA");
+    check(np::d3d12_target_blend(0xf2011001, 0xf)->dst == 17 && np::d3d12_target_blend(0xf2011001, 0xf)->dst_alpha == 19,
+          "0xf2011001: INV_SRC1_COLOR and INV_SRC1_ALPHA");
+    check(np::d3d12_target_blend(0x40000f0f, 0xf)->src_alpha == 18,
+          "without SEPARATE_ALPHA_BLEND, alpha reads SRC1_COLOR as SRC1_ALPHA");
+    // Not built here: BOTH_SRC_ALPHA (not on gfx10) and a COMB_FCN past 4.
     check(!np::d3d12_target_blend(0x6000010b, 0xf), "BOTH_SRC_ALPHA is not built");
     check(!np::d3d12_target_blend(0x600001a1, 0xf), "COMB_FCN 5 is not built");
     // A disabled target with a dual-source pattern left in it is still a plain disabled target.
@@ -96,7 +101,7 @@ void mapping() {
 void pipeline() {
     np::BlendRegisters r;
     r.target_mask = 0x01f;  // target 0: R G B A, target 1: R, target 2: none
-    r.blend = {0xe5010504, 0x80000000, 0x80000000, 0xf1010f01, 0xf1010f01, 0xf1010f01, 0xf1010f01, 0xf1010f01};
+    r.blend = {0xe5010504, 0x80000000, 0x80000000, 0x6000010b, 0x6000010b, 0x6000010b, 0x6000010b, 0x6000010b};
     const auto t = np::d3d12_blend(r, 3);
     check(t && (*t)[0].enable && (*t)[0].write_mask == 0xf && !(*t)[1].enable && (*t)[1].write_mask == 0x1 &&
               (*t)[2].write_mask == 0,
