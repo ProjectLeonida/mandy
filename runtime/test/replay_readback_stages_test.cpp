@@ -243,7 +243,7 @@ int main() {
     // which may target a host-readable buffer, so prepare() must request a COMPUTE_SHADER_BIT -> HOST flush.
     {
         ReplayFunctions xdxr_vk = vk;
-        xdxr_vk.xdxr_postbuild = [](VkCommandBuffer, std::uint64_t, std::uint64_t) {};
+        xdxr_vk.xdxr_postbuild = [](VkCommandBuffer, std::uint64_t, std::uint64_t, std::uint32_t) {};
         xdxr_vk.buffer_at = [&](std::uint64_t va, std::uint64_t& size, VkBuffer& buf, VkDeviceSize& off) {
             if (va == 0x10000 && size <= 64) {
                 buf = readback_buf.buffer;
