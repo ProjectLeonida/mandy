@@ -56,9 +56,11 @@ the layout the comments at their top describe (`/opt/leonida` for traces, overla
   characters before).
 - **Window:** frames are presented in the title's own window; `LEONIDA_PRESENT_WINDOW=own|hidden` chooses otherwise.
 
-Three setup mistakes each give a blank or empty picture without an error: the executable's embedded shaders missing
+Three setup mistakes each give a blank or empty picture: the executable's embedded shaders missing
 from the library (`exe/index.json`), a build without SDL3 (no pad), and a BCPack predictor file that was never
-generated (`tools/build_dstorage_history.py`; without it the loading art and most BC7 textures stay empty).
+generated (`tools/build_dstorage_history.py`; without it the loading art and most BC7 textures stay empty). The
+runtime's DStorage open line now names a missing predictor, and the runtime stage warns when the `--if-needed`
+generation did not produce the profile.
 
 ## What a healthy boot looks like (Linux machine)
 

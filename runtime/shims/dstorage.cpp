@@ -465,7 +465,10 @@ const leonida::bcpack::Calibration* bcpack_history() {
         }
         FILE* raw = nullptr;
         if (_wfopen_s(&raw, path.c_str(), L"rb") || !raw) {
-            log_once("history-open", "could not open the local BCPack predictor profile");
+            log_once("history-open",
+                     "could not open the local BCPack predictor profile (LEONIDA_DSTORAGE_HISTORY or "
+                     "<work>/bcpack/history.bcph); loading art and most BC7 textures stay empty until "
+                     "tools/build_dstorage_history.py generates it");
             return {};
         }
         std::unique_ptr<FILE, decltype(&std::fclose)> file(raw, &std::fclose);
