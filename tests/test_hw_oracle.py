@@ -502,6 +502,37 @@ class Unavailable(unittest.TestCase):
                 unittest.mock.patch.dict(os.environ, {"LEONIDA_HOST_CC": cl}):
             self.assertEqual(runner.find_cc(), ("msvc", cl))                   # the override may be cl.exe
 
+    def test_vcvars_of_a_prerelease_visual_studio(self):
+        # vswhere lists a Preview or Insiders install only with -prerelease. A stable install is asked for first, so a
+        # machine with both keeps the stable one.
+        with tempfile.TemporaryDirectory() as tmp:
+            installer = os.path.join(tmp, "Microsoft Visual Studio", "Installer")
+            os.makedirs(installer)
+            open(os.path.join(installer, "vswhere.exe"), "wb").close()
+            bats = {}
+            for name in ("Stable", "Preview"):
+                build = os.path.join(tmp, name, "VC", "Auxiliary", "Build")
+                os.makedirs(build)
+                bats[name] = os.path.join(build, "vcvars64.bat")
+                open(bats[name], "wb").close()
+            calls = []
+
+            def vswhere(stable):
+                def run(argv, **kwargs):
+                    calls.append(argv)
+                    found = os.path.join(tmp, "Preview") if "-prerelease" in argv else stable
+                    return unittest.mock.Mock(stdout=found + "\r\n")
+                return run
+            with unittest.mock.patch.dict(os.environ, {"ProgramFiles(x86)": tmp}):
+                with unittest.mock.patch.object(runner.subprocess, "run", side_effect=vswhere("")):
+                    self.assertEqual(runner.find_vcvars(), bats["Preview"])
+                self.assertEqual(["-prerelease" in argv for argv in calls], [False, True])
+                calls.clear()
+                stable = os.path.join(tmp, "Stable")
+                with unittest.mock.patch.object(runner.subprocess, "run", side_effect=vswhere(stable)):
+                    self.assertEqual(runner.find_vcvars(), bats["Stable"])
+                self.assertEqual(len(calls), 1)                                # no prerelease lookup after a hit
+
     def test_host_compiler_commands(self):
         work = os.path.join(os.sep, "w")
         self.assertEqual(runner.build_command("gcc", "gcc", "a.c", "o.exe", work), ["gcc", "-O1", "a.c", "-o", "o.exe"])
