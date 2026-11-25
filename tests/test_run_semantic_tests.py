@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -61,6 +62,15 @@ def cli(*argv):
 
 
 class RunnerTest(unittest.TestCase):
+    def test_scratch_failure_is_a_module_failure(self):
+        with patch.object(r.tempfile, "TemporaryDirectory", side_effect=PermissionError("access denied")), \
+                patch.object(r.subprocess, "run") as run:
+            code, count, output = r.run_module(".", "test_fixture", False)
+        self.assertEqual((code, count), (1, 0))
+        self.assertIn("test_fixture", output)
+        self.assertIn("access denied", output)
+        run.assert_not_called()
+
     def test_parallel_timeout_reports_partial_output_and_keeps_healthy_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"helper.py": "X = 1\n", "test_hang.py": HANG,

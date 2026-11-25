@@ -110,7 +110,11 @@ def run_module(directory, module, verbose, timeout=None):
     # still the initializer's path, so the jobs stay sorted by the file they run.
     target = module[:-len(".__init__")] if module.endswith(".__init__") else module
     cmd = [sys.executable, "-c", CHILD_PROGRAM, *(["-v"] if verbose else []), target]
-    with tempfile.TemporaryDirectory() as scratch:
+    try:
+        scratch_directory = tempfile.TemporaryDirectory()
+    except OSError as exc:
+        return 1, 0, f"cannot create a temporary test directory for {module}: {exc}"
+    with scratch_directory as scratch:
         count_path = os.path.join(scratch, "count.json")
         env = dict(os.environ, LEONIDA_TEST_COUNT=count_path)
         try:
