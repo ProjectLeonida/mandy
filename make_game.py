@@ -3025,9 +3025,17 @@ class PipelineDoneList:
             # and saves it), so what it already holds compiles from the cache instead of again from scratch.
             self.migrating = bool((_file_stamp(cache) or {}).get("size"))
         elif previous.get("identity") != self.identity:
-            log("pipelines: the GPU, driver, checker or partner stubs changed since the done-list was written; "
-                "building every module again")
-            shutil.rmtree(self.shards, ignore_errors=True)
+            old_device = (previous.get("identity") or {}).get("device")
+            if old_device == self.identity["device"]:
+                # Same GPU and driver, another checker or stubs: every module is checked again, but the pipelines
+                # pipeline_cache.bin already holds are still this driver's, so this run checkpoints into it as the
+                # first run does and they compile from it. Leftover shards are this driver's too: merged at the end.
+                log("pipelines: the checker or partner stubs changed since the done-list was written; checking every "
+                    "module again, from the existing pipeline_cache.bin")
+                self.migrating = bool((_file_stamp(cache) or {}).get("size"))
+            else:
+                log("pipelines: the GPU or driver changed since the done-list was written; building every module again")
+                shutil.rmtree(self.shards, ignore_errors=True)
         else:
             records = dict(previous.get("modules") or {})
             if isinstance(previous.get("bvh"), dict):

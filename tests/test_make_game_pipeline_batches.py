@@ -370,13 +370,34 @@ class ShardedPipelineBatchesTest(PipelineBatchesTest):
                               (self.spirv / "stubs" / "vs_0.spv").write_bytes(b"stub")),
         }
         self.assertEqual(self.invoke()[0], 0)
+        cache = str(self.out / "pipeline_cache.bin")
         for what, change in changes.items():
             with self.subTest(what=what):
-                since = len(self.calls("completed"))
+                since, commands = len(self.calls("completed")), len(self.commands)
                 change()
                 code, _, err = self.invoke()
                 self.assertEqual(code, 0, err)
                 self.assertEqual(sorted(self.checked(since)), self.names)
+                targets = {c[2] for c in self.commands[commands:] if c[1] != "--merge"}
+                if what in ("checker", "stubs"):
+                    # Same driver: what the cache holds is still valid, so the checks load it instead of starting
+                    # empty shards, and the next change goes to shards again.
+                    self.assertEqual(targets, {cache})
+                    self.assertFalse(self.done_list()["migrating"])
+                else:
+                    self.assertNotIn(cache, targets)
+
+    def test_a_new_checker_keeps_leftover_shards_of_the_same_driver(self):
+        code, _, _ = self.invoke({"interrupt_at": "m_03"})
+        self.assertNotEqual(code, 0)
+        self.assertTrue((self.shard_dir() / "00001.bin").exists())
+        self.fingerprint = "sources:other"
+        code, _, err = self.invoke()
+        self.assertEqual(code, 0, err)
+        # No pipeline_cache.bin yet, so the new checker's checks go to new shards; the old one is merged with them.
+        self.assertEqual([os.path.basename(p) for p in self.merges()[-1]][0], "00001.bin")
+        self.assertFalse(self.shard_dir().exists())
+        self.assertEqual(sorted(set(self.cache())), self.names)
 
     def test_an_interrupted_run_keeps_its_shards_and_the_next_run_finishes_the_rest(self):
         code, _, _ = self.invoke({"interrupt_at": "m_03"})

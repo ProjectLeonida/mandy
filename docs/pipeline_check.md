@@ -408,8 +408,10 @@ from the cache, but each process still pays the load and save). With a checker t
   needs no merge.
 
 The whole list is tied to one identity: vendor and device ID, driver version and `pipelineCacheUUID`
-(`--device-info`), the checker, the partner stubs in `stubs/` and the list's format. A change of any of them builds
-everything again (and drops leftover shards). The checker is named by the SHA-256 of its sources when it is the
+(`--device-info`), the checker, the partner stubs in `stubs/` and the list's format. A change of any of them checks
+every module again. A new GPU or driver also drops leftover shards and starts from empty caches (the old cache is of
+no use to it). A new checker or new stubs on the same driver instead checkpoint into the existing `pipeline_cache.bin`
+for that one run, as the first run does, so the pipelines it holds compile from it; leftover shards are merged. The checker is named by the SHA-256 of its sources when it is the
 current build in this checkout's `runtime/build` (the `cl.exe` fallback of `scripts/build_runtime.ps1` relinks it on
 every runtime stage), otherwise by the SHA-256 of the executable. Entries already merged hold only while
 `pipeline_cache.bin` has the size and modification time the last merge left; deleting the cache builds everything
