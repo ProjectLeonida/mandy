@@ -50,6 +50,8 @@ EXPECT = {
     "ps_w64_c_lane_id": ("C", ["lane-id"], None),
     "ps_w64_c_vote_stale": ("C", ["stale-scalar", "unsafe-vote-branch"], None),
     "ps_w64_c_vote_else": ("C", ["unsafe-vote-branch"], None),
+    "ps_w64_c_vote_rewrite": ("C", ["tainted-branch"], None),
+    "ps_w64_c_vote_exec": ("C", ["tainted-branch"], None),
     "ps_w64_c_scc_vote": ("C", ["cross-lane"], None),
     "ps_w64_c_execz_sgpr": ("C", ["stale-scalar", "unsafe-execz-branch"], None),
     "vs_w64_a_skip": ("A", [], []),

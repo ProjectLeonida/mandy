@@ -1288,8 +1288,15 @@ class Analysis:
             T["scc"] = X
             st["g"]["scc"] = ("vote", "exec")
             return
-        if a and _regs(a[0]) == ["exec"] or (not dests and "exec" in operands(ins)[2]):
+        defs = operands(ins)[2]
+        if a and _regs(a[0]) == ["exec"] or (not dests and "exec" in defs):
             # s_mov / s_and / s_or / s_xor / s_andn2 ... with EXEC as the destination, or v_cmpx
+            # SHADER-820 for EXEC (@shdann on #4620): put() skips EXEC, so a vote on EXEC outlived a new EXEC from an
+            # op that leaves SCC alone (s_mov_b64, s_cselect_b64/s_cmov_b64, v_cmpx); the branch then voted on the old
+            # EXEC while the run side used the new one. The tag goes; ops that write SCC from the new EXEC set it again.
+            scc_kept = op.startswith("v_") or op in ("s_mov_b64", "s_cselect_b64", "s_cmov_b64") or "scc" not in defs
+            if scc_kept and st["g"].get("scc") == ("vote", "exec"):
+                del st["g"]["scc"]
             srcregs = [x for x in srcs if _regs(x) != ["exec"]]
             x0 = srcregs[0] if srcregs else None
             if op.startswith("v_cmpx"):
@@ -1326,7 +1333,7 @@ class Analysis:
                         if mt & b and not (b & ELECT):
                             violation("tainted-exec")
                             break
-            if op.startswith("s_") and op != "s_mov_b64":
+            if not scc_kept:
                 T["scc"] = X
                 st["g"]["scc"] = ("vote", "exec")
             return
@@ -1334,6 +1341,8 @@ class Analysis:
         self.tok[site] = (None, None, False)
         st["xg"], st["f"] = None, False
         st["ua"] = st["u"]
+        if st["g"].get("scc") == ("vote", "exec"):     # any other new EXEC ends a vote on the old one too
+            del st["g"]["scc"]
 
     def scalar_def_since_exec(self, n, i, r):
         """Whether VGPR r was last written in block n before instruction i, after the block's last EXEC write, from
