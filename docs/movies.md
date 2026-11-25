@@ -182,6 +182,10 @@ build dependency. With that copy:
 
 ### Decode coverage over the whole archive
 
+The package-gated Bink audio and video tests clean up their per-process diagnostic output on normal exit, including
+handled failures. Set `LEONIDA_KEEP_BINK_OUTPUT=1` for a run whose BGRA, PPM, PCM, or WAV output you need to inspect.
+The test prints the retained directory's path. Keep these artifacts local.
+
 The two package-gated runtime tests were run on every stream of `movies.rpf`, one at a time: each stream is copied
 from its `bink_index.py` offset and size to one temp file, the test runs on it, and the file is overwritten by the
 next. Both tests map the package's `Bink2Scarlett.dll` with `rt::Loader` and bind its two `xmem.dll` imports to the

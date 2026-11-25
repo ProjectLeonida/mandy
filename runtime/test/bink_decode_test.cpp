@@ -5,9 +5,10 @@
 //   LEONIDA_MOVIE=<file.bk2>          (a carved Bink 2 stream)
 //   LEONIDA_GOTO=<frame>              (optional: also BinkGoto that frame)
 //   LEONIDA_RUN_DLLMAIN=1             (optional: call the image entry point as DllMain before BinkOpen)
+//   LEONIDA_KEEP_BINK_OUTPUT=1        (optional: retain diagnostic BGRA and PPM files)
 //
 // With either required variable unset the test prints "SKIP (no package/movie)" and exits 77 (CTest skip).
-// Output frames are written under %TEMP%\leonida_bink and are never committed.
+// Output frames use a per-process scratch folder and are never committed.
 #include <windows.h>
 
 #include <algorithm>
@@ -123,18 +124,22 @@ size_t distinct_bytes(const std::vector<uint8_t>& bytes) {
 
 void write_raw(const std::filesystem::path& path, const std::vector<uint8_t>& bytes) {
     std::ofstream f(path, std::ios::binary);
-    if (!f) fatal("cannot write " + path.string());
+    if (!f) throw std::runtime_error("cannot write " + path.string());
     f.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)bytes.size());
+    f.close();
+    if (!f) throw std::runtime_error("cannot finish writing " + path.string());
 }
 
 void write_ppm(const std::filesystem::path& path, const std::vector<uint8_t>& bgra, uint32_t w, uint32_t h) {
     std::ofstream f(path, std::ios::binary);
-    if (!f) fatal("cannot write " + path.string());
+    if (!f) throw std::runtime_error("cannot write " + path.string());
     f << "P6\n" << w << ' ' << h << "\n255\n";
     for (size_t i = 0; i + 3 < bgra.size(); i += 4) {
         const char rgb[3] = {(char)bgra[i + 2], (char)bgra[i + 1], (char)bgra[i]};
         f.write(rgb, 3);
     }
+    f.close();
+    if (!f) throw std::runtime_error("cannot finish writing " + path.string());
 }
 
 struct BinkApi {
@@ -246,8 +251,12 @@ int main() {
 
         const uint32_t pitch = header.width * 4;
         std::vector<uint8_t> frame((size_t)pitch * header.height);
-        const auto out_dir = testfiles::process_temp_dir("leonida_bink");
-        std::filesystem::create_directories(out_dir, ec);
+        testfiles::ScratchDir output("leonida_bink");
+        const auto& out_dir = output.path();
+        if (env("LEONIDA_KEEP_BINK_OUTPUT") == "1") {
+            output.keep();
+            std::printf("keeping Bink diagnostic output in %s\n", out_dir.string().c_str());
+        }
         const std::string stem = movie.stem().string();
 
         auto decode = [&](uint32_t index, const char* label) {
@@ -278,10 +287,12 @@ int main() {
         const uint64_t hash1 = decode(1, "next");
         std::printf("frame 0 vs frame 1: %s\n", hash0 == hash1 ? "identical" : "different");
 
-        if (!env("LEONIDA_GOTO").empty()) {
+        const std::string goto_arg = env("LEONIDA_GOTO");
+        if (!goto_arg.empty()) {
             char* end = nullptr;
-            unsigned long target = std::strtoul(env("LEONIDA_GOTO").c_str(), &end, 10);
-            if (!end || *end || target >= header.frames) fatal("LEONIDA_GOTO is not a frame in this movie");
+            const unsigned long target = std::strtoul(goto_arg.c_str(), &end, 10);
+            if (end == goto_arg.c_str() || *end || target >= header.frames)
+                throw std::runtime_error("LEONIDA_GOTO is not a frame in this movie");
             api.go_to(handle, (uint32_t)target, 0);
             const uint64_t hash_goto = decode((uint32_t)target, "goto");
             std::printf("frame 0 vs goto %lu: %s\n", target, hash0 == hash_goto ? "identical" : "different");

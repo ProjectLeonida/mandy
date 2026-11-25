@@ -31,7 +31,8 @@ inline std::filesystem::path process_temp_dir(std::string_view name) {
 }
 
 // process_temp_dir(name), emptied and created on construction (a crashed run may have left the same name behind) and
-// removed with its contents on destruction, so early returns don't leave one folder per failed run.
+// removed with its contents on destruction unless keep() was requested, so early returns don't leave one folder
+// per failed run.
 class ScratchDir {
 public:
     explicit ScratchDir(std::string_view name) : path_(process_temp_dir(name)) {
@@ -41,6 +42,7 @@ public:
         if (ec) std::fprintf(stderr, "cannot create %s: %s\n", path_.string().c_str(), ec.message().c_str());
     }
     ~ScratchDir() {
+        if (kept_) return;
         std::error_code ec;
         std::filesystem::remove_all(path_, ec);
     }
@@ -48,9 +50,11 @@ public:
     ScratchDir& operator=(const ScratchDir&) = delete;
 
     const std::filesystem::path& path() const { return path_; }
+    void keep() { kept_ = true; }
 
 private:
     std::filesystem::path path_;
+    bool kept_ = false;
 };
 
 // Copies `from` (a file the build compiled into the test, LEONIDA_TEST_*_SPV) to `to`, overwriting it. Returns false
