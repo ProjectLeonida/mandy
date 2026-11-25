@@ -1606,8 +1606,10 @@ int check_rereserved(ID3D12Device* device) {
 // write-watched one (kept hot, so every submission asks about it) and a plain one (guarded), while submissions run back
 // to back and:
 //   - threads take the process heap's lock (HeapLock, as HeapAlloc does inside, and the heap gate above: every
-//     allocation waits for them), _aligned_malloc and _aligned_free under it and write a guarded page: a fault, with
-//     the heap's lock held, at every submission;
+//     allocation waits for them), HeapAlloc and HeapFree a block under it and write a guarded page: a fault, with
+//     the heap's lock held, at every submission. HeapAlloc, not this program's _aligned_malloc: the title's comes
+//     down to HeapAlloc, but a debug CRT's takes the CRT's own heap lock first, which the threads below hold while
+//     they wait for the process heap, so a toucher holding HeapLock would deadlock with them without the handler;
 //   - threads _aligned_malloc and _aligned_free blocks of every size class without it;
 //   - a thread keeps the write-watched half hot;
 //   - threads change the write-watch record (a reservation added and removed), the journal (mark), the alias set and
@@ -1673,10 +1675,10 @@ int check_heap_lock_faults(ID3D12Device* device) {
                     for (std::uint8_t round = 1; !stop.load(std::memory_order_relaxed); ++round) {
                         AcquireSRWLockExclusive(&g_heap_gate);
                         HeapLock(heap);
-                        void* block = _aligned_malloc(64 + (round % 32) * 160, 16);
+                        void* block = HeapAlloc(heap, 0, 64 + (round % 32) * 160);
                         for (SIZE_T at = t * 64; at < committed; at += 0x10000)  // a byte per block
                             *reinterpret_cast<volatile std::uint8_t*>(guarded + at) = round;
-                        _aligned_free(block);
+                        HeapFree(heap, 0, block);
                         HeapUnlock(heap);
                         ReleaseSRWLockExclusive(&g_heap_gate);
                         progress.fetch_add(1, std::memory_order_relaxed);
