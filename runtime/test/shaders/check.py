@@ -1638,16 +1638,36 @@ def sampler_mismatch(data, words, view):
     return ""
 
 
-# The pixel shaders judged by sampler_test: ps_ssharp (image_sample_lz and image_sample), ps_ssharp_ld (image_sample_l
-# and image_sample_d) and ps_ssharp_b (image_sample_lz and image_sample_b). Each writes an explicit-LOD-0 sample and an
-# LOD-1 sample, so the same SAMPLER_CASES expectations hold for all three.
-SAMPLER_FIXTURES = ("ps_ssharp", "ps_ssharp_ld", "ps_ssharp_b")
+def sampler_compare_mismatch(data, words, view):
+    """ps_ssharp_c: the first pixel whose (c_lz, c_lz, c, c) is not the compare result of the level the S# and T#
+    select (vk_sampler_test --dref: depth 0.25 in level 0 and 0.75 in level 1, reference 0.5, LESS_EQUAL), or ""."""
+    if len(data) != SAMPLER_SIZE ** 2 * 16:
+        return f"expected {SAMPLER_SIZE ** 2} RGBA32F pixels, got {len(data)} bytes"
+    explicit, implicit = (float(sampler_level(words, view, lod) == 1) for lod in (0, 1))
+    want = (explicit, explicit, implicit, implicit)
+    for i, got in enumerate(struct.iter_unpack("<4f", data)):
+        if any(not math.isclose(g, w, rel_tol=0, abs_tol=1e-6) for g, w in zip(got, want)):
+            y, x = divmod(i, SAMPLER_SIZE)
+            return f"({x},{y}): {tuple(round(g, 4) for g in got)} != {want}"
+    return ""
+
+
+# The pixel shaders judged by sampler_test and the vk_sampler_test mode each needs. Each writes an explicit-LOD-0 sample
+# and an LOD-1 sample, so the same SAMPLER_CASES expectations hold for all: ps_ssharp (image_sample_lz and
+# image_sample), ps_ssharp_ld (image_sample_l and image_sample_d), ps_ssharp_b (image_sample_lz and image_sample_b),
+# ps_ssharp_cube and ps_ssharp_3d (image_sample_lz and image_sample on a cube and a volume) and ps_ssharp_c
+# (image_sample_c_lz and image_sample_c on a depth texture, judged as compare results).
+SAMPLER_FIXTURES = {"ps_ssharp": (), "ps_ssharp_ld": (), "ps_ssharp_b": (), "ps_ssharp_cube": ("--cube",),
+                    "ps_ssharp_3d": ("--3d",), "ps_ssharp_c": ("--dref",)}
+SSHARP_LESS_EQUAL = 3 << 12   # S# word 0 DEPTH_COMPARE_FUNC [14:12] = LESS_EQUAL (Vulkan's VK_COMPARE_OP_LESS_OR_EQUAL)
 
 
 def sampler_test(tools, spirv, ps="ps_ssharp"):
     """A SAMPLER_FIXTURES shader: every SAMPLER_CASES S#/T# pair drawn with vk_sampler_test and judged per pixel by
     sampler_level. A grey level-1 texel differs from every level-0 texel in both channels, so a wrong level fails at
-    each pixel."""
+    each pixel; ps_ssharp_c's compare reads 0 on level 0 and 1 on level 1."""
+    mode = SAMPLER_FIXTURES[ps]
+    dref = "--dref" in mode
     shaders = [os.path.join(spirv, name + ".spv") for name in ("vs_ids", ps)]
     for path in shaders:
         if not os.path.isfile(path):
@@ -1656,14 +1676,16 @@ def sampler_test(tools, spirv, ps="ps_ssharp"):
         for name, words, view in SAMPLER_CASES:
             raw = Path(tmp) / "pixels.raw"
             raw.unlink(missing_ok=True)
-            code, out = run(os.path.join(tools, "vk_sampler_test" + EXE), *shaders, raw,
+            if dref:
+                words = (words[0] | SSHARP_LESS_EQUAL, *words[1:])
+            code, out = run(os.path.join(tools, "vk_sampler_test" + EXE), *mode, *shaders, raw,
                             *(f"{w:x}" for w in words), *(str(v) for v in view))
             if code == UNSUPPORTED:
                 m = re.search(r"unsupported: .*", out)
                 return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
             if code or not raw.is_file():
                 return f"{name}: {failure(code, out, 3)}"
-            problem = sampler_mismatch(raw.read_bytes(), words, view)
+            problem = (sampler_compare_mismatch if dref else sampler_mismatch)(raw.read_bytes(), words, view)
             if problem:
                 return f"{name}: {problem}"
     return ""

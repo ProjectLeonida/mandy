@@ -3,7 +3,15 @@
 // and sampler those keys name. Unlike vk_texture_test, which binds a fixed nearest sampler and one level, the
 // VkSampler here is vulkan_sampler(decode(S#)) and the view's levels come from decode(T#).
 //
-//   vk_sampler_test <vs_ids.spv> <ps_ssharp.spv> <out.raw> <s0> <s1> <s2> <s3> [<base level> <last level>]
+//   vk_sampler_test [--cube|--3d|--dref] <vs_ids.spv> <ps_ssharp.spv> <out.raw> <s0> <s1> <s2> <s3> [<base> <last>]
+//
+// The mode picks the texture and the binding the translator reads it from (--explicit-lod-bias's forms):
+//   (none)  2D RGBA8 at binding 0, as described below.
+//   --cube  a cube-compatible 2D RGBA8 image with 6 layers, every layer the same, viewed as the 6-layer 2D array the
+//           translator samples a cube through (binding 3).
+//   --3d    a 3D RGBA8 image, 128x128x2 then 64x64x1, every slice the same (binding 6).
+//   --dref  a 2D D32_SFLOAT image whose level 0 holds 0.25 and level 1 0.75 (binding 0, depth aspect); the S# carries
+//           the compare function, so a reference of 0.5 with LESS_OR_EQUAL reads 0 on level 0 and 1 on level 1.
 //
 // S# words are hex. The T# is encode() of a 128x128 RGBA8 image with two levels, with BASE_LEVEL and LAST_LEVEL as
 // given (default 0 and 1). Level 0 has four solid quadrants: red, green, blue and yellow. Level 1 is solid grey
@@ -20,6 +28,7 @@
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -52,8 +61,18 @@ std::vector<std::uint32_t> read_spv(const char* path) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    enum class Mode { flat, cube, volume, dref } mode = Mode::flat;
+    if (argc > 1 && argv[1][0] == '-' && argv[1][1] == '-') {
+        if (!std::strcmp(argv[1], "--cube")) mode = Mode::cube;
+        else if (!std::strcmp(argv[1], "--3d")) mode = Mode::volume;
+        else if (!std::strcmp(argv[1], "--dref")) mode = Mode::dref;
+        else { std::fprintf(stderr, "unknown mode %s\n", argv[1]); return 2; }
+        --argc;
+        ++argv;
+    }
     if (argc != 8 && argc != 10) {
-        std::fprintf(stderr, "usage: vk_sampler_test <vs.spv> <fs.spv> <out.raw> <s0> <s1> <s2> <s3> [<base> <last>]\n");
+        std::fprintf(stderr, "usage: vk_sampler_test [--cube|--3d|--dref] <vs.spv> <fs.spv> <out.raw> <s0> <s1> <s2> <s3> "
+                             "[<base> <last>]\n");
         return 2;
     }
     namespace gfx10 = leonida::gfx10;
@@ -275,20 +294,84 @@ int main(int argc, char** argv) {
     CHECK(make_buffer(table_words.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &table_buffer, &table_map));
     std::memcpy(table_map, table_words.data(), table_words.size() * 4);
 
-    // Textures. RGBA8 in memory order; level 1 grey has r = g = 128/255, unlike every level-0 colour.
-    constexpr VkFormat texture_format = VK_FORMAT_R8G8B8A8_UNORM;
+    // Textures. RGBA8 in memory order; level 1 grey has r = g = 128/255, unlike every level-0 colour. Every cube
+    // layer and 3D slice holds the same level, so a layer or slice coordinate can't change the colour. --dref: depth
+    // 0.25 in level 0 and 0.75 in level 1.
+    const bool depth_mode = mode == Mode::dref;
+    const VkFormat texture_format = depth_mode ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+    const VkImageAspectFlags aspect = depth_mode ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    const std::uint32_t layers = mode == Mode::cube ? 6 : 1;
+    const std::uint32_t depth0 = mode == Mode::volume ? 2 : 1;
+    const auto level_depth = [&](std::uint32_t level) { return std::max(depth0 >> level, 1u); };
     constexpr std::uint32_t quadrant[2][2] = {{0xff0000ffu, 0xff00ff00u}, {0xffff0000u, 0xff00ffffu}};
     constexpr std::uint32_t grey = 0xff808080u, magenta = 0xffff00ffu;
+    std::uint32_t depth_words[2];
+    {
+        const float d[2] = {0.25f, 0.75f};
+        std::memcpy(depth_words, d, sizeof d);
+    }
     std::vector<std::uint32_t> texels;
-    for (std::uint32_t y = 0; y < TW; y++)
-        for (std::uint32_t x = 0; x < TW; x++) texels.push_back(quadrant[y >= TW / 2][x >= TW / 2]);
-    texels.resize(texels.size() + (TW / 2) * (TW / 2), grey);
-    VkImage fallback, texture;
-    VkImageView fallback_view, texture_view;
-    CHECK(make_image(texture_format, 1, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, &fallback));
-    CHECK(make_view(fallback, texture_format, 0, 1, &fallback_view));
-    CHECK(make_image(texture_format, TW, TW, levels, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, &texture));
-    CHECK(make_view(texture, gfx10::vulkan_format(view_of.format), view_of.first_mip, view_of.mip_count, &texture_view));
+    for (std::uint32_t level = 0; level < levels; ++level) {
+        const std::uint32_t side = TW >> level;
+        for (std::uint32_t copy = 0; copy < layers * level_depth(level); ++copy)
+            for (std::uint32_t y = 0; y < side; y++)
+                for (std::uint32_t x = 0; x < side; x++)
+                    texels.push_back(depth_mode ? depth_words[level]
+                                                : level ? grey : quadrant[y >= side / 2][x >= side / 2]);
+    }
+    const auto make_texture = [&](VkImageType type, VkFormat format, VkExtent3D extent, std::uint32_t mips,
+                                  std::uint32_t array_layers, VkImageCreateFlags flags, VkImage* img) {
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.flags = flags;
+        ii.imageType = type;
+        ii.format = format;
+        ii.extent = extent;
+        ii.mipLevels = mips;
+        ii.arrayLayers = array_layers;
+        ii.samples = VK_SAMPLE_COUNT_1_BIT;
+        ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VkResult r = vkCreateImage(dev, &ii, nullptr, img);
+        if (r) return r;
+        VkMemoryRequirements mr;
+        vkGetImageMemoryRequirements(dev, *img, &mr);
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = mr.size;
+        ai.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkDeviceMemory m;
+        r = vkAllocateMemory(dev, &ai, nullptr, &m);
+        return r ? r : vkBindImageMemory(dev, *img, m, 0);
+    };
+    const auto make_texture_view = [&](VkImage img, VkImageViewType type, VkFormat format, VkImageAspectFlags view_aspect,
+                                       std::uint32_t base, std::uint32_t count, std::uint32_t array_layers,
+                                       VkImageView* view) {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = img;
+        vi.viewType = type;
+        vi.format = format;
+        vi.subresourceRange = {view_aspect, base, count, 0, array_layers};
+        return vkCreateImageView(dev, &vi, nullptr, view);
+    };
+    // Index 0 of every bound array is a magenta 1x1 fallback of the array's dimension.
+    VkImage fallback, fallback3d = VK_NULL_HANDLE, texture;
+    VkImageView fallback_view, fallback_extra = VK_NULL_HANDLE, texture_view;
+    CHECK(make_texture(VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {1, 1, 1}, 1, 1, 0, &fallback));
+    CHECK(make_view(fallback, VK_FORMAT_R8G8B8A8_UNORM, 0, 1, &fallback_view));
+    if (mode == Mode::cube)
+        CHECK(make_texture_view(fallback, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
+                                0, 1, 1, &fallback_extra));
+    if (mode == Mode::volume) {
+        CHECK(make_texture(VK_IMAGE_TYPE_3D, VK_FORMAT_R8G8B8A8_UNORM, {1, 1, 1}, 1, 1, 0, &fallback3d));
+        CHECK(make_texture_view(fallback3d, VK_IMAGE_VIEW_TYPE_3D, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
+                                1, &fallback_extra));
+    }
+    CHECK(make_texture(mode == Mode::volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, texture_format, {TW, TW, depth0},
+                       levels, layers, mode == Mode::cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u, &texture));
+    const VkImageViewType view_type = mode == Mode::cube ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                                      : mode == Mode::volume ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
+    CHECK(make_texture_view(texture, view_type, depth_mode ? texture_format : gfx10::vulkan_format(view_of.format),
+                            aspect, view_of.first_mip, view_of.mip_count, layers, &texture_view));
+    // The binding the translator reads this dimension from (set 0): images (0), images_arr (3) or images_3d (6).
+    const std::uint32_t texture_binding = mode == Mode::cube ? 3u : mode == Mode::volume ? 6u : 0u;
     VkBuffer upload;
     void* upload_map;
     const VkDeviceSize texture_offset = 256, texture_bytes = texels.size() * 4;
@@ -346,17 +429,20 @@ int main(int argc, char** argv) {
     VkFramebuffer framebuffer;
     CHECK(vkCreateFramebuffer(dev, &fbi, nullptr, &framebuffer));
 
-    // Set 0 as the translator expects it: binding 0 images[], 1 samplers[], 2 the descriptor hash table.
-    VkDescriptorSetLayoutBinding b[3]{};
+    // Set 0 as the translator expects it: binding 0 images[], 1 samplers[], 2 the descriptor hash table, and for
+    // --cube / --3d the array the texture sits in, images_arr (3) or images_3d (6).
+    const bool extra = texture_binding != 0;
+    VkDescriptorSetLayoutBinding b[4]{};
     b[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     b[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLER, 2, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     b[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    b[3] = {texture_binding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dli.bindingCount = 3;
+    dli.bindingCount = extra ? 4 : 3;
     dli.pBindings = b;
     VkDescriptorSetLayout dsl;
     CHECK(vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dsl));
-    const VkDescriptorPoolSize sizes[3]{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2}, {VK_DESCRIPTOR_TYPE_SAMPLER, 2},
+    const VkDescriptorPoolSize sizes[3]{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4}, {VK_DESCRIPTOR_TYPE_SAMPLER, 2},
                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 1;
@@ -370,11 +456,15 @@ int main(int argc, char** argv) {
     dai.pSetLayouts = &dsl;
     VkDescriptorSet ds;
     CHECK(vkAllocateDescriptorSets(dev, &dai, &ds));
+    // Image 1 is the texture in its own array; binding 0 keeps the 2D fallback there when the texture sits elsewhere.
     const VkDescriptorImageInfo images[2]{{VK_NULL_HANDLE, fallback_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                                          {VK_NULL_HANDLE, texture_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+                                          {VK_NULL_HANDLE, extra ? fallback_view : texture_view,
+                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+    const VkDescriptorImageInfo extra_images[2]{{VK_NULL_HANDLE, fallback_extra, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                                {VK_NULL_HANDLE, texture_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
     const VkDescriptorImageInfo sampler_infos[2]{{samplers[0]}, {samplers[1]}};
     const VkDescriptorBufferInfo table_info{table_buffer, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet writes[3]{};
+    VkWriteDescriptorSet writes[4]{};
     for (auto& w : writes) {
         w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w.dstSet = ds;
@@ -385,7 +475,10 @@ int main(int argc, char** argv) {
     writes[1].pImageInfo = sampler_infos;
     writes[2].dstBinding = 2; writes[2].descriptorCount = 1; writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[2].pBufferInfo = &table_info;
-    vkUpdateDescriptorSets(dev, 3, writes, 0, nullptr);
+    writes[3].dstBinding = texture_binding; writes[3].descriptorCount = 2;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[3].pImageInfo = extra_images;
+    vkUpdateDescriptorSets(dev, extra ? 4 : 3, writes, 0, nullptr);
 
     // Pipeline.
     VkShaderModule modules[2];
@@ -479,25 +572,30 @@ int main(int argc, char** argv) {
     CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
     const VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     CHECK(vkBeginCommandBuffer(cmd, &begin));
-    for (int t = 0; t < 2; ++t) {
-        const std::uint32_t mips = t ? levels : 1;
+    // The fallbacks take the magenta word at offset 0; the texture every level, all layers or slices at once.
+    struct Upload { VkImage image; std::uint32_t mips, layers; VkImageAspectFlags aspect; bool texture; };
+    std::vector<Upload> uploads{{fallback, 1, 1, VK_IMAGE_ASPECT_COLOR_BIT, false}};
+    if (fallback3d) uploads.push_back({fallback3d, 1, 1, VK_IMAGE_ASPECT_COLOR_BIT, false});
+    uploads.push_back({texture, levels, layers, aspect, true});
+    for (const Upload& u : uploads) {
         VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        ib.image = t ? texture : fallback;
-        ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1};
+        ib.image = u.image;
+        ib.subresourceRange = {u.aspect, 0, u.mips, 0, u.layers};
         ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
-        VkDeviceSize offset = t ? texture_offset : 0;
-        for (std::uint32_t level = 0; level < mips; ++level) {
-            const std::uint32_t side = t ? TW >> level : 1;
+        VkDeviceSize offset = u.texture ? texture_offset : 0;
+        for (std::uint32_t level = 0; level < u.mips; ++level) {
+            const std::uint32_t side = u.texture ? TW >> level : 1;
+            const std::uint32_t slices = u.texture ? level_depth(level) : 1;
             VkBufferImageCopy c{};
             c.bufferOffset = offset;
-            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
-            c.imageExtent = {side, side, 1};
+            c.imageSubresource = {u.aspect, level, 0, u.layers};
+            c.imageExtent = {side, side, slices};
             vkCmdCopyBufferToImage(cmd, upload, ib.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
-            offset += VkDeviceSize(side) * side * 4;
+            offset += VkDeviceSize(side) * side * slices * u.layers * 4;
         }
         ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         ib.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
