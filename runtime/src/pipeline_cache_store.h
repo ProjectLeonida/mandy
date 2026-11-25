@@ -66,4 +66,42 @@ inline bool header_matches(const void* data, std::size_t size, const cached_pso:
            std::memcmp(bytes + 16, identity.cache_uuid, sizeof(identity.cache_uuid)) == 0;
 }
 
+// Whether the driver still keeps the pipelines the title compiles (RT-PIPELINE-CACHE-GROWTH-STALL). A driver can stop
+// adding to a large cache without any error. Measured on NVIDIA 610.88 (RTX 5060 Ti): after a 2 s compile, a 1.23 GB
+// or 1.35 GB cache came back from vkGetPipelineCacheData the same size to the byte, where an empty cache grew ~210 KiB
+// for the same module; an older cache of other pipelines stopped at 4.9 GB, so there is no fixed size to test.
+// Instead two sizes of the live cache are compared with the builds that compiled in between (pipeline_profile::
+// compiled_builds): each one adds tens to hundreds of KiB when the driver keeps it.
+inline constexpr unsigned long long stalled_after_builds = 16;
+inline constexpr std::size_t stalled_below_bytes = std::size_t{64} << 10;  // 64 KiB
+
+class GrowthWatch {
+public:
+    // The cache's size and the compiled-build count when it is created, or at a save.
+    void observe(std::size_t bytes, unsigned long long compiled) {
+        bytes_ = bytes;
+        compiled_ = compiled;
+        known_ = true;
+    }
+
+    // At a later size: true once, the first time at least stalled_after_builds builds compiled since the last
+    // observation while the cache grew by less than stalled_below_bytes. The new size is recorded either way.
+    bool stalled(std::size_t bytes, unsigned long long compiled) {
+        const bool stall = known_ && !reported_ && compiled >= compiled_ && compiled - compiled_ >= stalled_after_builds &&
+                           bytes < bytes_ + stalled_below_bytes;
+        if (stall) reported_ = true;
+        observe(bytes, compiled);
+        return stall;
+    }
+
+    std::size_t bytes() const { return bytes_; }
+    unsigned long long compiled() const { return compiled_; }
+
+private:
+    std::size_t bytes_ = 0;
+    unsigned long long compiled_ = 0;
+    bool known_ = false;
+    bool reported_ = false;
+};
+
 }  // namespace leonida::pipeline_cache_store

@@ -87,7 +87,48 @@ static int test_header() {
     return 0;
 }
 
+static int test_growth() {
+    using store::GrowthWatch;
+    constexpr auto builds = store::stalled_after_builds;
+    constexpr auto kept = store::stalled_below_bytes;
+    // No size at creation: nothing to compare with yet, and the first save becomes the reference.
+    GrowthWatch fresh;
+    CHECK(!fresh.stalled(1000, builds * 4));
+    CHECK(fresh.stalled(1000, builds * 5));
+    // A cache that grows with its builds is fine at any size.
+    GrowthWatch growing;
+    growing.observe(std::size_t{1} << 30, 10);
+    CHECK(!growing.stalled((std::size_t{1} << 30) + kept, 10 + builds));
+    CHECK(growing.bytes() == (std::size_t{1} << 30) + kept);
+    CHECK(growing.compiled() == 10 + builds);
+    // Too few builds compiled to tell: a few cache-sized misses can be refused for other reasons.
+    GrowthWatch few;
+    few.observe(5000, 0);
+    CHECK(!few.stalled(5000, builds - 1));
+    // Enough compiled builds and less than stalled_below_bytes of growth: said once, then never again.
+    GrowthWatch stuck;
+    stuck.observe(1346482377, 100);
+    CHECK(stuck.stalled(1346482377 + kept - 1, 100 + builds));
+    CHECK(!stuck.stalled(1346482377 + kept - 1, 100 + builds * 3));
+    // Builds and growth are counted from the previous save: growth then, none now.
+    GrowthWatch interval;
+    interval.observe(2000, 0);
+    CHECK(!interval.stalled(2000 + kept * 8, builds * 3));
+    CHECK(interval.stalled(2000 + kept * 8, builds * 4));
+    // Too few builds at one save still moves the reference to that save.
+    GrowthWatch moved;
+    moved.observe(2000, 0);
+    CHECK(!moved.stalled(2000, builds - 1));
+    CHECK(moved.stalled(2000, builds * 2 - 1));
+    // A count that went backwards (a second device's counter view) is not read as a huge number of builds.
+    GrowthWatch backwards;
+    backwards.observe(3000, 50);
+    CHECK(!backwards.stalled(3000, 10));
+    return 0;
+}
+
 int main() {
     if (const int failed = test_limit()) return failed;
-    return test_header();
+    if (const int failed = test_header()) return failed;
+    return test_growth();
 }

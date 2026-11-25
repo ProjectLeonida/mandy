@@ -2375,6 +2375,15 @@ Pipeline creation:
   The files must match the Vulkan vendor, device and pipeline-cache UUID. Vulkan supplies an opaque snapshot.
   Replacing part of the previous file would corrupt it.
   `LEONIDA_PIPELINE_CACHE_BYTES` caps session writes (256 MiB by default, zero disables the session file).
+  A driver can stop keeping new pipelines once its cache is large, with no error. On NVIDIA 610.88 (RTX 5060 Ti),
+  a 1.23 GB or 1.35 GB cache came back from `vkGetPipelineCacheData` the same size to the byte after a 2 s compile
+  (with the 1.35 GB one the next process compiled the pipeline again; a hit then comes only from the driver's own
+  disk cache), where an empty cache grew ~210 KiB and served the next process in 0.01 s. In the game, seeded with the 1.23 GB file, 68 of ~110 builds over 200 ms were slow again in the next
+  run; started with no seed, 5 of 164 were. An older cache of other pipelines stopped growing at 4.9 GB, so the point
+  is not a fixed size. The runtime takes the cache's size when it creates it and at each session save, counts the
+  title's builds that took at least 200 ms (a hit takes a few milliseconds), and says once when 16 or more of them
+  compiled while the cache grew by less than 64 KiB. The remedy is a smaller seed: without `pipeline_cache.bin`, the
+  session file holds only what the title builds.
   `LEONIDA_SKIP_COMPUTE=<part of a name>[,<part>...]` (`all`: every compute program) never builds the matching
   compute programs and drops their dispatches, direct and indirect; the first dropped dispatch of each is logged.
   It is a way past a program that hangs the GPU while the program or its input is fixed, not a fix.
