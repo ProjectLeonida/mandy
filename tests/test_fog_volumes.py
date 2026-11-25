@@ -331,6 +331,41 @@ class FogVolumesTests(unittest.TestCase):
         self.assertEqual((offs, complete, incomplete), ([], 0, 0))
         self.assertEqual(seen, [61])
 
+    def test_a_header_on_a_range_boundary_is_found_once(self):
+        # A range searched for the 2-byte zlib header only up to its end, so a header starting at end - 1 matched
+        # in neither range: the next one starts at end, after the header's first byte. The resource then vanished
+        # for some --jobs values and not others. Each split point around the header must find it exactly once.
+        comp = zlib.compress(build_synthetic_fog_0x7a([{"IsBox": 1}, {"IsBox": 0}]))
+        at = 0x100
+        buf = b"9FPR" + b"\x00" * (at - 4) + comp + b"\x00" * 64
+        with tempfile.TemporaryDirectory() as td:
+            rpf = os.path.join(td, "split.rpf")
+            with open(rpf, "wb") as f:
+                f.write(buf)
+            for split in (at - 1, at, at + 1, at + 2, at + len(comp) // 2):
+                with self.subTest(split=split):
+                    first = fv._scan_rpf_chunk((rpf, 0, split))
+                    second = fv._scan_rpf_chunk((rpf, split, len(buf)))
+                    self.assertEqual(first[0] + second[0], [at])
+                    self.assertEqual(first[1] + second[1], 1)
+                    self.assertEqual(first[2] + second[2], 0)
+
+    def test_jobs_do_not_change_what_is_found(self):
+        # The case that was reported: 8 MiB + 2 bytes split by --jobs 2 into two 4 MiB + 1 ranges, with a resource at
+        # 4 MiB, one byte before the boundary. --jobs 1 scans one range and always found it.
+        comp = zlib.compress(build_synthetic_fog_0x7a([{"IsBox": 1}, {"IsBox": 0}]))
+        size, at = 8 * 1024 * 1024 + 2, 4 * 1024 * 1024
+        buf = bytearray(size)
+        buf[0:4] = b"9FPR"
+        buf[at:at + len(comp)] = comp
+        with tempfile.TemporaryDirectory() as td:
+            rpf = os.path.join(td, "boundary.rpf")
+            with open(rpf, "wb") as f:
+                f.write(buf)
+            for jobs in (1, 2):
+                with self.subTest(jobs=jobs):
+                    self.assertEqual(fv._scan_rpf_offsets(rpf, jobs=jobs), ([at], 1, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
