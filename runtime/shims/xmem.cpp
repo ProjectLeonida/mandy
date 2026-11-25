@@ -102,11 +102,21 @@ void free_title_block(void* p) {
 
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
     note_attributes("XMemAlloc", attributes, size, _ReturnAddress());
+    // A title that exports __XMemAllocationHooks__ takes its own allocations. The pair is used only when both
+    // callbacks are set, so a title alloc never meets the shim heap's free.
+    if (const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
+        hooks && hooks->alloc && hooks->free)
+        return hooks->alloc(size, attributes);
     return title_block(size);
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
     note_attributes("XMemFree", attributes, kNoSize, _ReturnAddress());
+    if (const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
+        hooks && hooks->alloc && hooks->free) {
+        hooks->free(p, attributes);
+        return;
+    }
     free_title_block(p);
 }
 

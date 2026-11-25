@@ -1581,6 +1581,25 @@ void print_result() {
 
 }  // namespace
 
+// __XMemAllocationHooks__ test doubles: XMemAlloc/XMemFree forward through the registered pair.
+void*(__stdcall* g_hook_default_alloc)(size_t, uint64_t) = nullptr;
+void(__stdcall* g_hook_default_free)(void*, uint64_t) = nullptr;
+int g_alloc_hook_calls = 0;
+int g_free_hook_calls = 0;
+uint64_t g_hook_last_attr = 0;
+
+void* __stdcall test_alloc_hook(size_t size, uint64_t attributes) {
+    ++g_alloc_hook_calls;
+    g_hook_last_attr = attributes;
+    return g_hook_default_alloc(size, attributes);
+}
+
+void __stdcall test_free_hook(void* ptr, uint64_t attributes) {
+    ++g_free_hook_calls;
+    g_hook_last_attr = attributes;
+    g_hook_default_free(ptr, attributes);
+}
+
 int main(int argc, char** argv) {
     std::printf("xmem_test: registered xmem.dll shim ABI\n");
 
@@ -1649,6 +1668,43 @@ int main(int argc, char** argv) {
         test_write_watch_rereserve(virtual_alloc, get_write_watch, reset_write_watch);
 
     if (alloc_default && free_default) test_default_alloc(alloc, free_mem, alloc_default, free_default);
+    if (alloc_default && free_default) {
+        g_hook_default_alloc = alloc_default;
+        g_hook_default_free = free_default;
+        g_alloc_hook_calls = 0;
+        g_free_hook_calls = 0;
+        g_hook_last_attr = 0;
+
+        const rt::shims::XMemAllocationHooks hooks{&test_alloc_hook, &test_free_hook};
+        static char s_hooks_owner = 0;
+        rt::shims::add_xmem_allocation_hooks(&s_hooks_owner, &hooks);
+        void* const p1 = alloc(128, 0xf0814000ULL);
+        check(p1 != nullptr, "__XMemAllocationHooks__ alloc hook returns non-null");
+        check(g_alloc_hook_calls == 1 && g_hook_last_attr == 0xf0814000ULL,
+              "XMemAlloc forwards to registered alloc hook with attributes");
+        void* const p2 = alloc_default(64, 0x3ULL);
+        check(p2 != nullptr && g_alloc_hook_calls == 1,
+              "XMemAllocDefault bypasses registered alloc hook");
+        free_default(p2, 0x3ULL);
+        check(g_free_hook_calls == 0, "XMemFreeDefault bypasses registered free hook");
+        free_mem(p1, 0xf0814000ULL);
+        check(g_free_hook_calls == 1 && g_hook_last_attr == 0xf0814000ULL,
+              "XMemFree forwards to registered free hook with attributes");
+
+        rt::shims::remove_xmem_allocation_hooks(&s_hooks_owner);
+        void* const p3 = alloc(64, 0x1ULL);
+        check(p3 != nullptr && g_alloc_hook_calls == 1, "clearing allocation hooks restores default XMemAlloc");
+        free_mem(p3, 0x1ULL);
+        check(g_free_hook_calls == 1, "clearing allocation hooks restores default XMemFree");
+
+        const rt::shims::XMemAllocationHooks half{&test_alloc_hook, nullptr};
+        rt::shims::add_xmem_allocation_hooks(&s_hooks_owner, &half);
+        void* const p4 = alloc(64, 0x1ULL);
+        check(p4 != nullptr && g_alloc_hook_calls == 1, "a half-null hook pair is not called");
+        free_mem(p4, 0x1ULL);
+        check(g_free_hook_calls == 1, "a half-null hook pair leaves XMemFree on the default path");
+        rt::shims::remove_xmem_allocation_hooks(&s_hooks_owner);
+    }
     if (tools_mem) check(tools_mem() == FALSE, "XMemIsToolsMemAvailable returns FALSE (no devkit tools memory)");
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);
