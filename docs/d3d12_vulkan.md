@@ -1845,7 +1845,10 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    No sampler-indexing entry had a matched layout. Putting the resource heap first when both flags are set, then the
    sampler in the next dword, remains a hypothesis. D3D-329's adjacent SGPR examples alone do not establish it.
    The runtime snapshots the bound resource and sampler heap pointers in that order after the explicit
-   arguments for direct and indirect compute dispatches with an inline signature. An unbound heap contributes
+   arguments for direct and indirect compute dispatches with an inline signature. Bound console descriptor heap
+   base addresses are remapped through `console_descriptor_table_va` so that user SGPRs receive the arena copy's
+   shader virtual address (where GPU descriptor reads land, preventing `READ_INVALID` device loss during world
+   load), while unshadowed host heaps remain unchanged. An unbound heap contributes
    zero, and rebinding affects later commands. A heap that cannot fit in the inline user data is reported once,
    and a signature whose compute arguments spill gets nothing written (logged once). Set
    `LEONIDA_COMPUTE_DIRECT_HEAPS=0` to restore the previous compute arguments.

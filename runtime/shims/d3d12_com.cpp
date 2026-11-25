@@ -1680,7 +1680,8 @@ private:
             if (!cbv_srv_uav_heap_)
                 note_once("draw/dispatch uses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no CBV/SRV/UAV heap bound");
             else {
-                remember_table(cbv_srv_uav_base_, cbv_srv_uav_heap_->GetDesc().NumDescriptors);
+                const auto shader_va = console_descriptor_table_va(cbv_srv_uav_base_);
+                remember_table(shader_va, cbv_srv_uav_heap_->GetDesc().NumDescriptors);
                 note_once("CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED heap base tracked on list");
             }
         }
@@ -1784,10 +1785,14 @@ private:
     void write_direct_heaps(const RootState& state, std::uint32_t slot,
                             std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs>& data) const {
         const auto flags = state.layout->flags;
-        if ((flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) && slot < data.size())
-            data[slot++] = static_cast<std::uint32_t>(cbv_srv_uav_base_);
-        if ((flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) && slot < data.size())
-            data[slot] = static_cast<std::uint32_t>(sampler_base_);
+        if ((flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) && slot < data.size()) {
+            const D3D12_GPU_VIRTUAL_ADDRESS va = console_descriptor_table_va(cbv_srv_uav_base_);
+            data[slot++] = static_cast<std::uint32_t>(va);
+        }
+        if ((flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) && slot < data.size()) {
+            const D3D12_GPU_VIRTUAL_ADDRESS va = console_descriptor_table_va(sampler_base_);
+            data[slot] = static_cast<std::uint32_t>(va);
+        }
     }
 
     std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> with_direct_heaps(const RootState& state,
@@ -1853,13 +1858,17 @@ private:
             const bool resource = layout.flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
             const bool sampler = layout.flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
             char resource_at[48] = "none", sampler_at[48] = "none";
-            if (resource)
+            if (resource) {
+                const auto va = console_descriptor_table_va(cbv_srv_uav_base_);
                 std::snprintf(resource_at, sizeof resource_at, "0x%llx at s%u",
-                              static_cast<unsigned long long>(std::uint32_t(cbv_srv_uav_base_)), end);
-            if (sampler && end + (resource ? 1u : 0u) < rt::rootsig::kMaxUserSgprs)
+                              static_cast<unsigned long long>(std::uint32_t(va)), end);
+            }
+            if (sampler && end + (resource ? 1u : 0u) < rt::rootsig::kMaxUserSgprs) {
+                const auto va = console_descriptor_table_va(sampler_base_);
                 std::snprintf(sampler_at, sizeof sampler_at, "0x%llx at s%u",
-                              static_cast<unsigned long long>(std::uint32_t(sampler_base_)),
+                              static_cast<unsigned long long>(std::uint32_t(va)),
                               end + (resource ? 1u : 0u));
+            }
             std::fprintf(stderr,
                          "[rt] d3d12: graphics direct heaps: resource heap %s, sampler heap %s, after %u dwords of "
                          "explicit arguments from s8 (first draw; LEONIDA_GRAPHICS_DIRECT_HEAPS=0 "
