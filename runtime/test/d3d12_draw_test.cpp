@@ -104,6 +104,7 @@ int main(int argc, char** argv) {
         return 77;
     }
     EXPECT(device_status == vktest::DeviceStatus::ready);
+    if (d.below_shader_push_constant_contract("d3d12_draw_test")) return 77;
     if (indirect_pixels && !d.enabled.drawIndirectFirstInstance) {
         std::fprintf(stderr, "SKIP: drawIndirectFirstInstance is unavailable\n");
         return 77;

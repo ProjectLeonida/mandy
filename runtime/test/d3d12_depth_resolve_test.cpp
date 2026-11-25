@@ -325,6 +325,7 @@ int main() {
     const auto device_status = vk.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
+    if (vk.below_shader_push_constant_contract("d3d12_depth_resolve_test")) return 77;
     const unsigned errors_before = vk.validation_errors();
     VkPhysicalDeviceDepthStencilResolveProperties resolve{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
     VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &resolve};

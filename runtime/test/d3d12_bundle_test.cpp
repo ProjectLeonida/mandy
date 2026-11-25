@@ -932,6 +932,7 @@ int main(int argc, char** argv) {
         return 77;
     }
     REQUIRE(device_status == vktest::DeviceStatus::ready);
+    if (vk.below_shader_push_constant_contract("d3d12_bundle_test")) return 77;
     if (layer_indirect && (!vk.enabled.drawIndirectFirstInstance || !vk.robust_index_view)) {
         std::fprintf(stderr, "SKIP: bundle draw pair requires drawIndirectFirstInstance and a bounded robust index view\n");
         return 77;

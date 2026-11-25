@@ -345,6 +345,7 @@ int main() {
         return 77;
     }
     REQUIRE(status == vktest::DeviceStatus::ready);
+    if (vk.below_shader_push_constant_contract("d3d12_execute_indirect_validation_test")) return 77;
     const unsigned errors_before = vk.validation_errors();
 
     // Write minimal synthetic compute shader fixture for positive ExecuteIndirect dispatch.

@@ -360,6 +360,7 @@ int main() {
         std::printf("GPU lacks multiViewport or shaderOutputViewportIndex; skipping\n");
         return 77;
     }
+    if (vk.below_shader_push_constant_contract("d3d12_multi_viewport_test")) return 77;
 
     const auto vs_program = d3d12test::fssm_program({0x56534d56u, 0xbf810000u});
     const auto ps_program = d3d12test::fssm_program({0x50534d56u, 0xbf810000u});

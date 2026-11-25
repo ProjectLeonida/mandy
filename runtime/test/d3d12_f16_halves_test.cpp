@@ -180,6 +180,7 @@ int main() {
         return 77;
     }
     EXPECT(status == vktest::DeviceStatus::ready);
+    if (d.below_shader_push_constant_contract("d3d12_f16_halves_test")) return 77;
 
     const auto vs_prog = fssm_program({0x56530378, 0xbf810000});
     const auto ps1_prog = fssm_program({0x50530378, 0x00000001});

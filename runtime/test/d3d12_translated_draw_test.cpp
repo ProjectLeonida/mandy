@@ -131,6 +131,7 @@ int main(int argc, char** argv) {
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
     EXPECT(device_status == vktest::DeviceStatus::ready);
+    if (d.below_shader_push_constant_contract("d3d12_translated_draw_test")) return 77;
     if (dual && !d.enabled.dualSrcBlend) return 77;  // a device without dual-source blending: ctest skips
 
     // The translator-style library the build wrote, and the FSSM programs its index entries are keyed by.

@@ -71,6 +71,7 @@ int main() {
         return 77;
     }
     EXPECT(status == vktest::DeviceStatus::ready);
+    if (vk_dev.below_shader_push_constant_contract("d3d12_pso_validation_test")) return 77;
 
     // Prepare translated shader library for our Vulkan-backed D3D12 device.
     const auto vs_pos_prog = fssm_program({0x56531001, 0xbf810000});
