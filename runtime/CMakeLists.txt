@@ -1999,6 +1999,12 @@ if(TARGET Vulkan::Headers)
                "-DWANT=${LEONIDA_PIPELINE_CHECK_STACK}"
                -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_stack_reserve.cmake")
     endif()
+    if(Python3_FOUND AND NOT CMAKE_CROSSCOMPILING)
+      add_test(NAME vk_pipeline_check_bary_fallback COMMAND "${Python3_EXECUTABLE}" -I
+               "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_pipeline_bary_fallback.py"
+               --ctest --exe "$<TARGET_FILE:vk_pipeline_check>")
+      set_tests_properties(vk_pipeline_check_bary_fallback PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
     add_test(NAME depth24_convert COMMAND depth24_convert_test)
     set_tests_properties(depth24_convert PROPERTIES SKIP_RETURN_CODE 77)
     # Self-checking Vulkan tests with no shaders or game data; each exits 77 without a Vulkan device (TEST-514).

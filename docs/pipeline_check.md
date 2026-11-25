@@ -1,10 +1,17 @@
 # GPU pipeline corpus check
 
 `runtime/test/vk_pipeline_check.cpp` creates a `VkShaderModule` for every entry in the translator's
-`index.json` and, for compute shaders, a real compute pipeline with the runtime's descriptor and push
-constant contract. It is a driver-level check: it proves the modules and pipelines are accepted by
-the Vulkan implementation, not that the shader results are correct. Value-level checks are in
-`docs/shader_validation.md`.
+`index.json` and builds a Vulkan pipeline with the runtime's descriptor and push-constant contract:
+compute pipelines for `cs` entries, and dynamic-rendering graphics pipelines paired with minimal partner
+stubs from `<spirv dir>/stubs/` (`tools/spirv_stubs.py`) for `vs`, `ps`, `ms` and `gs` entries. When a
+pixel shader carries `"bary_fallback_input": {"location": N}` (`tools/rdna2spirv.py --bary-fallback`, for
+GPUs without `VK_KHR_fragment_shader_barycentric`), the checker synthesizes the triangle pass-through
+geometry shader in memory (`runtime/src/spirv_bary_fallback.h`) and checks the three-stage `VS + GS + PS`
+pipeline, skipping with `no geometryShader` (or `no shaderClipDistance` / `no shaderCullDistance` when
+the partner VS exports clip or cull distances) if the device lacks the required feature, and counting an
+incompatible `VS`/`PS` interface as a pipeline failure. It is a driver-level check: it proves the modules
+and pipelines are accepted by the Vulkan implementation, not that the shader results are correct.
+Value-level checks are in `docs/shader_validation.md`.
 
 Timing and memory figures in this page were measured with `MESA_SHADER_CACHE_DISABLE=true`. Without it, RADV's
 on-disk shader cache (`~/.cache/mesa_shader_cache`, about 1.1 GB after a full corpus run) turns a repeated module
