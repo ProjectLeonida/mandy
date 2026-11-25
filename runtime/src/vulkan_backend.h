@@ -11,6 +11,7 @@
 #endif
 #include "binary_occlusion_spirv.h"
 #include "buffer_va_index.h"
+#include "image_memory.h"
 #include "occlusion_sum_spirv.h"
 #include "queue_holds.h"
 #include "retire_tickets.h"
@@ -426,6 +427,7 @@ private:
 };
 
 struct SparseResource;
+using ImageMemory = ImageMemoryPool<VkDeviceMemory>;
 
 // Zero-allocation O(1) Ring Buffer deferred deletion queue tied to the device timeline semaphore.
 class DeferredDeletionQueue {
@@ -437,6 +439,7 @@ public:
         sparse_resource,
         buffer,
         device_memory,
+        image_memory,  // an ImageMemory::Range*, deleted: its bytes go back to their block
         acceleration_structure,
         framebuffer,
     };
@@ -522,6 +525,9 @@ public:
             case Kind::device_memory:
                 vk.vkFreeMemory(device, reinterpret_cast<VkDeviceMemory>(item.handle), nullptr);
                 break;
+            case Kind::image_memory:
+                delete reinterpret_cast<ImageMemory::Range*>(item.handle);
+                break;
             case Kind::acceleration_structure:
                 if (vk.vkDestroyAccelerationStructureKHR)
                     vk.vkDestroyAccelerationStructureKHR(
@@ -549,6 +555,22 @@ private:
     BindlessReleaseFn bindless_release_fn_ = nullptr;
     void* bindless_release_user_ = nullptr;
 };
+
+// Sets a device's lost flag and says so once, on stderr, at the moment it is first seen. From then on every fence of
+// the device reads UINT64_MAX and device calls return DXGI_ERROR_DEVICE_REMOVED, so a title takes its own
+// device-removed path (on the retail boot an int3 at game_scarlett_master.exe+0x2474606, reached from its frame wait
+// reading a fence's completed value as ~0); without this line that later stop is the first sign of the loss.
+// True when this call set the flag. device_lost_reports counts the lines said in this process (for tests).
+inline std::atomic<unsigned> device_lost_reports{0};
+inline bool set_device_lost(std::atomic<bool>& flag, const char* where) noexcept {
+    if (flag.exchange(true, std::memory_order_acq_rel)) return false;
+    device_lost_reports.fetch_add(1, std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "[rt] vulkan: the device was lost (%s); its fences now read UINT64_MAX and device calls return "
+                 "DXGI_ERROR_DEVICE_REMOVED\n",
+                 where);
+    return true;
+}
 
 // Centralized single-thread fence dispatcher using Vulkan 1.2 vkWaitSemaphores(VK_SEMAPHORE_WAIT_ANY_BIT).
 // Eliminates per-fence OS threads and 10ms polling: a synthetic timeline semaphore (wakeup_sem_) at index 0
@@ -822,7 +844,7 @@ private:
             epoch_cv_.notify_all();
 
             if (res == VK_ERROR_DEVICE_LOST || device_lost_.load(std::memory_order_acquire)) {
-                device_lost_.store(true, std::memory_order_release);
+                set_device_lost(device_lost_, "vkWaitSemaphores in the fence dispatcher returned VK_ERROR_DEVICE_LOST");
                 std::vector<Entry> drained = std::move(pending_);
                 pending_.clear();
                 dispatch_outside_lock(lock, drained, signal_event_);
@@ -852,7 +874,8 @@ private:
                 pending_.resize(write);
                 for (Entry& e : pending_) ready.push_back(std::move(e));
                 pending_.clear();
-                device_lost_.store(true, std::memory_order_release);
+                set_device_lost(device_lost_,
+                                "vkGetSemaphoreCounterValue in the fence dispatcher returned VK_ERROR_DEVICE_LOST");
                 dispatch_outside_lock(lock, ready, signal_event_);
                 return;
             }
@@ -1546,8 +1569,8 @@ public:
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
     std::mutex& submit_mutex() { return submit_mutex_; }
 
-    void mark_device_lost() noexcept {
-        device_lost_.store(true, std::memory_order_release);
+    void mark_device_lost(const char* where = "a Vulkan call returned VK_ERROR_DEVICE_LOST") noexcept {
+        set_device_lost(device_lost_, where);
         if (fence_dispatcher_) {
             try {
                 fence_dispatcher_->notify_device_lost();

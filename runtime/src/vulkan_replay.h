@@ -43,6 +43,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <map>
@@ -1420,20 +1421,23 @@ inline bool zero_compressed_image(const ReplayFunctions& vk, VkCommandBuffer com
         }
     }
     if (!zero_buf && vk.copy_scratch && vk.fill_buffer) {
-        // Round up to a multiple of fmt.bytes (8 or 16, always a multiple of 4 for vkCmdFillBuffer).
-        const VkDeviceSize fill_bytes = ((needed + fmt.bytes - 1) / fmt.bytes) * fmt.bytes;
+        // vkCmdFillBuffer requires 4-byte aligned dstOffset and size (VUID-vkCmdFillBuffer-dstOffset-00024 /
+        // -size-00028), while vkCmdCopyBufferToImage requires fmt.bytes alignment (1, 2, 4, 8, or 16).
+        // Uncompressed 1B/2B color formats reach this path on copy-only queues (!can_clear).
+        const VkDeviceSize align = std::max<VkDeviceSize>(4, fmt.bytes);
+        const VkDeviceSize fill_bytes = ((needed + align - 1) / align) * align;
         VkBuffer scratch = VK_NULL_HANDLE;
         VkDeviceSize offset = 0;
         if (vk.copy_scratch(fill_bytes, scratch, offset)) {
-            const VkDeviceSize align = fmt.bytes;
             const VkDeviceSize pad = (align - (offset % align)) % align;
-            if (fill_bytes >= pad + fmt.bytes) {
-                vk.fill_buffer(command_buffer, scratch, offset + pad, fill_bytes - pad, 0);
+            const VkDeviceSize usable = fill_bytes > pad ? ((fill_bytes - pad) / align) * align : 0;
+            if (usable >= fmt.bytes) {
+                vk.fill_buffer(command_buffer, scratch, offset + pad, usable, 0);
                 memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
                 zero_buf = scratch;
                 zero_off = offset + pad;
-                zero_cap = fill_bytes - pad;
+                zero_cap = usable;
             }
         }
     }
@@ -3502,6 +3506,20 @@ inline void close_labels(VkCommandBuffer command_buffer, const ReplayFunctions& 
 // `open_labels` counts the debug labels begun and not yet ended in this command buffer: an EndEvent with none open
 // is dropped (Vulkan requires a matching begin), and the caller ends what is still open before it ends the buffer
 // (close_labels). Without it, the list's own events are balanced at its end.
+inline bool order_buffer_copies() {
+    static const bool enabled = [] {
+#ifdef _WIN32
+        char value[2]{};
+        std::size_t length = 0;
+        return getenv_s(&length, value, sizeof value, "LEONIDA_ORDER_BUFFER_COPIES") != 0 || length != 2 || value[0] != '0';
+#else
+        const char* value = std::getenv("LEONIDA_ORDER_BUFFER_COPIES");
+        return !value || value[0] != '0' || value[1];
+#endif
+    }();
+    return enabled;
+}
+
 inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, const ReplayFunctions& vk,
                  LayoutTracker* tracker = nullptr, std::uint32_t* open_labels = nullptr) {
     std::uint32_t own_labels = 0;
@@ -3815,6 +3833,14 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.emit_predicated_copy(command_buffer, p.predicated_copy);
                 begin_statistics();
             } else if (!p.buffer_copies.empty()) {
+                // Transfer dependency from natterman12, ubiquitarianism/leonida PR #354 (GPL-3.0).
+                // D3D12 orders buffer copies even across lists on one queue. A previous transfer write can
+                // overlap this copy's source or destination without an application barrier.
+                if (vk.pipeline_barrier && order_buffer_copies()) {
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT);
+                }
                 vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
                                p.buffer_copies.data());
             } else if (p.staged) {

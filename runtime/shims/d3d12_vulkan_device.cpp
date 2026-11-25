@@ -569,6 +569,8 @@ struct DeviceState {
         create.pQueueFamilyIndices = families.data();
     }
     std::unique_ptr<leonida::VulkanContext> context;
+    // The blocks textures share (allocate_image). Freed after the context, whose deferred queue holds ranges of them.
+    std::unique_ptr<leonida::ImageMemory> image_memory;
     VkPhysicalDeviceMemoryProperties memory{};
     // D3D-96: upload-heap buffers prefer DEVICE_LOCAL | HOST_VISIBLE memory, so the GPU reads them from VRAM. Only
     // with Resizable BAR (leonida::resizable_bar); LEONIDA_UPLOAD_SYSMEM=1 keeps them in system memory to compare.
@@ -614,7 +616,22 @@ struct DeviceState {
         return pipeline_cache_handle;
     }
 
-    QueueClock clock;  // what every queue's GetClockCalibration uses
+    QueueClock clock;  // device-wide calibration entry points
+    std::vector<std::uint32_t> timestamp_bits;
+
+    QueueClock clock_for(std::uint32_t family) const {
+        QueueClock result = clock;
+        result.timestamp_valid_bits = leonida::queue_family_timestamp_bits(timestamp_bits, family);
+        return result;
+    }
+
+    bool copy_timestamps_supported() const {
+        // Copy queues can fall back to a graphics queue when their own pool is busy.
+        const bool has_copy_pool = !info.command_queues.empty() && !info.copy_queues.empty();
+        const auto dedicated_copy = has_copy_pool ? std::optional{info.copy_family} : std::nullopt;
+        return context->timestamp_period() > 0 && leonida::copy_queue_timestamp_families_supported(
+            timestamp_bits, info.queue_family, dedicated_copy);
+    }
     PFN_vkGetPhysicalDeviceFormatProperties2 format_properties2 = nullptr;
     // True when VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks native STORAGE_IMAGE but mutable R32_UINT+{R32_UINT,E5B9G9R9}
     // is supported, so R9G9B9E5_SHAREDEXP UAV textures are backed by R32_UINT with separate storage/sampled views.
@@ -1413,6 +1430,23 @@ struct DeviceState {
         }
         return VK_NULL_HANDLE;
     }
+
+    // A range of a device-local block for a texture, or null: the texture is too large to share one, or device-local
+    // memory has no room for another block, and the caller makes its own allocation as it would without the blocks.
+    std::unique_ptr<leonida::ImageMemory::Range> allocate_image(const VkMemoryRequirements& requirements,
+                                                                VkMemoryPropertyFlags& chosen) {
+        for (const std::uint32_t i : leonida::memory_type_order(memory, requirements.memoryTypeBits,
+                                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                                                                requirements.size)) {
+            const VkDeviceSize block = leonida::image_block_bytes(memory.memoryHeaps[memory.memoryTypes[i].heapIndex].size);
+            if (requirements.size > block / 8) continue;
+            if (auto range = image_memory->allocate(i, requirements.size, requirements.alignment, block)) {
+                chosen = memory.memoryTypes[i].propertyFlags;
+                return range;
+            }
+        }
+        return nullptr;
+    }
 };
 
 // The Vulkan format for a texture this layer can create, with the D24 fallback; VK_FORMAT_UNDEFINED, after a log
@@ -1833,6 +1867,8 @@ public:
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
         if (buffer_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, buffer_);
         if (memory_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory_);
+        if (image_range_)
+            device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_memory, image_range_.release());
     }
 
     leonida::ResourceId id() const { return resource_id(this); }
@@ -2261,6 +2297,10 @@ public:
         // (NVIDIA Pascal / 582.78: memoryTypeBits == 0), or fail to allocate one. Staging copies do not need
         // that usage, so recreate the image without it and continue on that path, as for a refused format above.
         VkMemoryRequirements requirements{};
+        // Render targets and depth buffers keep their own allocations: there are few of them, and a driver may give one
+        // a better place.
+        constexpr D3D12_RESOURCE_FLAGS attachment =
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         for (;;) {
             vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
             // NVIDIA's Pascal driver (582.78 on a GTX 1050 Ti) reports HOST_IMAGE_TRANSFER for the format and creates
@@ -2269,6 +2309,14 @@ public:
             // branch on any GPU with force_host_transfer_retry.
             bool retry = host_transfer_ &&
                          (requirements.memoryTypeBits == 0 || device_.info.force_host_transfer_retry);
+            if (!(desc_.Flags & attachment) && !host_transfer_)
+                image_range_ = device_.allocate_image(requirements, memory_flags_);
+            if (image_range_) {
+                if (vk.vkBindImageMemory(device_.info.device, image_, image_range_->memory(), image_range_->offset()) ==
+                    VK_SUCCESS)
+                    break;
+                return E_OUTOFMEMORY;
+            }
             if (!retry) {
                 memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
                 if (memory_ && vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) == VK_SUCCESS) break;
@@ -2333,6 +2381,8 @@ public:
         // Never used yet: the first command that touches a part zero-fills it and moves it to the layout of the
         // state that command expects (vulkan_replay.h, initialize), so no submission is needed here.
         device_.context->add_resource(id(), binding, VK_IMAGE_LAYOUT_UNDEFINED);
+        // A shader may read it before any command names it: D3D12 gives zeros, and a reused range holds an older texture.
+        if (image_range_ && image_range_->reused() && !binding.not_zeroed) device_.context->note_shader_image(id());
         return S_OK;
     }
 
@@ -2660,6 +2710,7 @@ private:
     VkImage image_ = VK_NULL_HANDLE;
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
+    std::unique_ptr<leonida::ImageMemory::Range> image_range_;  // a texture's, instead of memory_
     VkMemoryPropertyFlags memory_flags_ = 0;
     VkAccelerationStructureKHR accel_ = VK_NULL_HANDLE;
     void* mapped_ = nullptr;
@@ -5011,13 +5062,16 @@ public:
         switch (desc.Type) {
         case h::occlusion: info.queryType = VK_QUERY_TYPE_OCCLUSION; break;
         case h::timestamp:
-        case h::copy_queue_timestamp:
-            if (!(device_.context->timestamp_period() > 0)) {
+        case h::copy_queue_timestamp: {
+            const bool supported = desc.Type == D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP
+                                       ? device_.copy_timestamps_supported() : device_.context->timestamp_period() > 0;
+            if (!supported) {
                 log_once("timestamp query heap: the queue writes no timestamps; type", desc.Type);
                 return E_NOTIMPL;
             }
             info.queryType = VK_QUERY_TYPE_TIMESTAMP;
             break;
+        }
         case h::so_statistics:
             // The layer has no stream output: a graphics PSO with StreamOutput entries is refused (E_NOTIMPL) and
             // SOSetTargets is not implemented, so no primitive ever reaches a stream and every query of this heap
@@ -5199,6 +5253,17 @@ public:
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
                                                                       info.buffer_device_address);
+        state_.image_memory = std::make_unique<leonida::ImageMemory>(
+            [device = info.device, make = state_.context->vk.vkAllocateMemory](std::uint32_t type, std::uint64_t bytes) {
+                VkMemoryAllocateInfo block{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                block.allocationSize = bytes;
+                block.memoryTypeIndex = type;
+                VkDeviceMemory out = VK_NULL_HANDLE;
+                return make(device, &block, nullptr, &out) == VK_SUCCESS ? out : VkDeviceMemory(VK_NULL_HANDLE);
+            },
+            [device = info.device, free = state_.context->vk.vkFreeMemory](VkDeviceMemory block) {
+                free(device, block, nullptr);
+            });
         state_.context->mesh_queries = info.mesh_shader_queries;
         state_.context->set_depth_range_unrestricted(info.depth_range_unrestricted);
         if (info.physical && state_.format_properties) {
@@ -5277,6 +5342,14 @@ public:
         queue_families(info.physical, &family_count, nullptr);
         std::vector<VkQueueFamilyProperties> families(family_count);
         queue_families(info.physical, &family_count, families.data());
+        state_.timestamp_bits.reserve(family_count);
+        for (std::uint32_t i = 0; i < family_count; ++i) {
+            // Timestamp writes alone can work on a transfer-only family. Resetting the query and resolving it
+            // with vkCmdCopyQueryPoolResults require a graphics- or compute-capable family as well.
+            const auto& family = families[i];
+            const bool can_resolve = (family.queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) != 0;
+            state_.timestamp_bits.push_back(can_resolve ? family.timestampValidBits : 0);
+        }
         if (info.queue_family < family_count) {
             const auto& family = families[info.queue_family];
             if (family.timestampValidBits)
@@ -5573,6 +5646,7 @@ public:
         if (state_.pipeline_cache_handle)
             state_.context->vk.vkDestroyPipelineCache(state_.info.device, state_.pipeline_cache_handle, nullptr);
         state_.context.reset();
+        state_.image_memory.reset();  // the context's deferred queue gave its ranges back
         if (owned_.device) owned_.destroy_device(owned_.device, nullptr);
         if (owned_.instance) owned_.destroy_instance(owned_.instance, nullptr);
     }
@@ -5784,7 +5858,7 @@ public:
         if (state_.info.command_queues.empty())
             return d3d12_trace::result(method, create_command_queue(*state_.context, state_.info.queue,
                                                                      state_.info.queue_family, *desc, riid, out,
-                                                                     identity(), state_.clock));
+                                                                     identity(), state_.clock_for(state_.info.queue_family)));
         // A VkQueue of the type's own family first, then the graphics family; shared when every one is in use.
         const bool compute = desc->Type == D3D12_COMMAND_LIST_TYPE_COMPUTE;
         const bool copy = desc->Type == D3D12_COMMAND_LIST_TYPE_COPY;
@@ -5816,7 +5890,7 @@ public:
         const VkQueue queue = own_pool ? own_queues[slot] : state_.info.command_queues[slot];
         const std::uint32_t family = own_pool ? own_family : state_.info.queue_family;
         return d3d12_trace::result(method, create_command_queue(*state_.context, queue, family, *desc, riid, out,
-                                                                 identity(), state_.clock, std::move(lease)));
+                                                                 identity(), state_.clock_for(family), std::move(lease)));
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out) override {
@@ -7748,7 +7822,7 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS3)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS3*>(data);
             *opts = {};
-            opts->CopyQueueTimestampQueriesSupported = FALSE;
+            opts->CopyQueueTimestampQueriesSupported = state_.copy_timestamps_supported();
             // Only typeless resources set VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT.
             opts->CastingFullyTypedFormatSupported = FALSE;
             opts->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE;
@@ -8684,16 +8758,6 @@ private:
         if (!state_.luid.LowPart && !state_.luid.HighPart) log_once("the Vulkan driver reports no device LUID;", 0);
 
         state_.clock.get_device_proc = get_device;
-        const auto families_of = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
-            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
-        if (families_of) {
-            std::uint32_t count = 0;
-            families_of(info.physical, &count, nullptr);
-            std::vector<VkQueueFamilyProperties> families(count);
-            families_of(info.physical, &count, families.data());
-            if (info.queue_family < count)
-                state_.clock.timestamp_valid_bits = families[info.queue_family].timestampValidBits;
-        }
         if (!info.calibrated_timestamps) return;
         // The KHR names first; the EXT ones are aliases with the same signatures.
         auto domains_of = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(
@@ -9118,6 +9182,16 @@ std::uint64_t device_arena_size(ID3D12Device* device) {
     if (!real) real = device;
     const Device* d = Device::from<Device>(real);
     return d ? d->state().arena.size : 0;
+}
+
+ImageMemoryStats image_memory_stats(ID3D12Device* device) {
+    if (!device) return {};
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    const Device* d = Device::from<Device>(real);
+    if (!d || !d->state().image_memory) return {};
+    const auto stats = d->state().image_memory->stats();
+    return {stats.blocks, stats.block_bytes, stats.ranges};
 }
 
 namespace {

@@ -832,7 +832,13 @@ static_assert(kQueueSlots * sizeof(void*) <= 4096 && kFenceSlots * sizeof(void*)
                   kAllocatorSlots * sizeof(void*) <= 4096,
               "a table must fit in the first page of its reservation");
 
+constexpr unsigned kQueueExecuteCommandLists = 10;   // (UINT, ID3D12CommandList* const*)
 constexpr unsigned kQueueSignal = 14, kQueueWait = 15;  // (ID3D12Fence*, UINT64)
+constexpr unsigned kQueueGetTimestampFrequency = 16, kQueueGetDesc = 18;  // the PC slots
+bool is_console_caller(const void* address);  // defined with the device proxy
+constexpr unsigned kQueueExecuteCommandListsX = 35;  // console ExecuteCommandLists(count, lists) variant
+static_assert(kQueueExecuteCommandLists < kQueuePublicSlots && kQueueExecuteCommandListsX < kQueueSlots,
+              "queue execution slots must stay within their respective tables");
 
 struct ChildProxy {
     void** vtable;          // offset 0: the caller's ID3D12CommandQueue* / ID3D12Fence* points here
@@ -841,6 +847,9 @@ struct ChildProxy {
     void** real_vtable;
     unsigned slot_count;    // public slots the real object implements; the rest of the table is refused
     std::atomic<unsigned long> refs;
+    // Allocators only: callback and context recorded by console slot 9 (SetAllocatorCallbackX).
+    std::atomic<std::uintptr_t> allocator_callback{0};
+    std::atomic<std::uintptr_t> allocator_callback_context{0};
 };
 
 template <ChildKind K>
@@ -873,10 +882,12 @@ const char* child_public_name(unsigned slot) {
     if (slot < 8) return object[slot];
     if constexpr (K == ChildKind::queue) {
         if (slot < kQueuePublicSlots) return queue[slot - 8];
+        if (slot == kQueueExecuteCommandListsX) return "ExecuteCommandListsX";
     } else if constexpr (K == ChildKind::fence) {
         if (slot < kFence1PublicSlots) return fence[slot - 8];
     } else {
         if (slot == 8) return "Reset";
+        if (slot == 9) return "SetAllocatorCallbackX";
     }
     return nullptr;
 }
@@ -1249,8 +1260,11 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                                      std::uint64_t, std::uint64_t);
             auto** const real_vtable = *reinterpret_cast<void***>(self->real);
             UnwrappedArray heaps;
-            if constexpr (Slot == 10) {
+            if constexpr (pc == 10) {
+                // Reset(allocator, pso): console slot 10, and slot 139 as the retail title calls it. The title hands
+                // its allocator proxy; the real list takes the real one (and a wrapped pipeline state the same way).
                 a1 = unwrap_object(a1);
+                a2 = unwrap_object(a2);
                 self->pin_cursor_at_limit();
             } else if constexpr (Slot == kConsoleExecuteBundle) {
                 a1 = unwrap_object(a1);
@@ -1349,6 +1363,20 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;  // diagnostics only: the fault goes on to the title's handlers or the crash
 }
 
+std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word) {
+    // The array holds what the title got from the proxy: list proxies are replaced by the real lists in a copy, as
+    // for every other array of objects the real device or queue reads.
+    UnwrappedArray unwrapped_lists;
+    if (!unwrapped_lists.fill(lists_word, static_cast<UINT>(count_word))) return hr_to_u64(E_OUTOFMEMORY);
+    if (unwrapped_lists.data()) lists_word = unwrapped_lists.data();
+    // Pass zero-extended UINT in 64-bit RDX so both 32-bit PC implementations and 64-bit mock thunks see clean count.
+    using ExecuteFn = void(WINAPI*)(void*, std::uint64_t, ID3D12CommandList* const*);
+    reinterpret_cast<ExecuteFn>(self->real_vtable[kQueueExecuteCommandLists])(
+        self->real, static_cast<std::uint64_t>(static_cast<UINT>(count_word)),
+        reinterpret_cast<ID3D12CommandList* const*>(lists_word));
+    return 0;
+}
+
 // PresentX is at queue slot 30 in an older runtime layout and 32 in a newer one (public corroboration, XCL; see
 // docs/d3d12_vulkan.md). 30 is the default and LEONIDA_XS_PRESENT_X_SLOT sets the other. SuspendX and ResumeX have no
 // default: 0 means not routed, so they answer only when their variable is set.
@@ -1402,6 +1430,28 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                              reinterpret_cast<void**>(a2)));
     } else {
         note_child_slot<K>(Slot);
+        if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandListsX) {
+            d3d12_trace::record(child_trace_name<K>(Slot));
+            return queue_execute_command_lists(self, a1, a2);
+        }
+        if constexpr (K == ChildKind::allocator && Slot == 9) {
+            // Console-only ID3D12CommandAllocator::SetAllocatorCallbackX(callback, context, ...), observed past the
+            // 9-slot PC chain on the retail executable (call shape: function pointer, context, plus trailing words).
+            // The PC/Vulkan layer manages command-buffer backing directly without invoking a title allocator callback,
+            // so record the callback and context on the proxy and return S_OK while leaving slots 10+ refused.
+            self->allocator_callback.store(static_cast<std::uintptr_t>(a1), std::memory_order_relaxed);
+            self->allocator_callback_context.store(static_cast<std::uintptr_t>(a2), std::memory_order_relaxed);
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: allocator slot 9 (SetAllocatorCallbackX) recorded "
+                             "(callback=0x%llx context=0x%llx a3=0x%llx a4=0x%llx)\n",
+                             static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                             static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+            }
+            d3d12_trace::record(child_trace_name<K>(Slot));
+            return hr_to_u64(S_OK);
+        }
         if (Slot >= self->slot_count) {
             if constexpr (K == ChildKind::queue) {
                 const XboxQueueSlotRoutes& qroutes = xbox_queue_slot_routes();
@@ -1438,6 +1488,22 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             return hr_to_u64(E_NOTIMPL);
         }
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
+        if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandLists) {
+            return queue_execute_command_lists(self, a1, a2);
+        }
+        if constexpr (K == ChildKind::queue && Slot == kQueueGetDesc) {
+            // Queue slot 18 is GetDesc on the PC: a struct return, 16 bytes written through the hidden pointer. The
+            // retail title calls slot 18 with one pointer to 8 bytes, the shape of GetTimestampFrequency(UINT64*),
+            // which the console layout with two methods inserted at 14/15 has there (PC slot 16). Forwarded as
+            // GetDesc it wrote a whole description over the title's 8 bytes and what follows them. The title's call
+            // therefore goes to the frequency getter, the only reading that cannot overrun its argument; a host
+            // caller (set_console_caller, as device slots 61 and 74) keeps the PC GetDesc.
+            if (is_console_caller(_ReturnAddress())) {
+                using Fn = HRESULT(WINAPI*)(void*, UINT64*);
+                return hr_to_u64(reinterpret_cast<Fn>(self->real_vtable[kQueueGetTimestampFrequency])(
+                    self->real, reinterpret_cast<UINT64*>(a1)));
+            }
+        }
         if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
         UnwrappedArray unwrapped_lists;
         if constexpr (K == ChildKind::queue && Slot == 10) {
@@ -3178,9 +3244,26 @@ unsigned fence_proxy_slot_count(const void* fence) {
 
 unsigned queue_proxy_table_size() { return kQueueSlots; }
 unsigned fence_proxy_table_size() { return kFenceSlots; }
+
+bool queue_slot_overridden(unsigned slot) {
+    return slot <= 2 || slot == 7 || slot == kQueueSignal || slot == kQueueWait ||
+           slot == kQueueExecuteCommandListsX;
+}
 unsigned allocator_proxy_table_size() { return kAllocatorSlots; }
 unsigned allocator_proxy_slot_count(const void* allocator) {
     return is_allocator_proxy(allocator) ? static_cast<const ChildProxy*>(allocator)->slot_count : 0;
+}
+
+std::uintptr_t allocator_proxy_callback(const void* allocator) {
+    return is_allocator_proxy(allocator)
+               ? static_cast<const ChildProxy*>(allocator)->allocator_callback.load(std::memory_order_relaxed)
+               : 0;
+}
+
+std::uintptr_t allocator_proxy_callback_context(const void* allocator) {
+    return is_allocator_proxy(allocator)
+               ? static_cast<const ChildProxy*>(allocator)->allocator_callback_context.load(std::memory_order_relaxed)
+               : 0;
 }
 
 unsigned long command_object_proxy_ref_count(const void* object) {

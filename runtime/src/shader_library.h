@@ -247,8 +247,21 @@ inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, co
         const std::size_t distance = std::size_t(distance_base[d]) + in.bits(distance_extra[d]);
         if (in.failed() || distance > out.size()) return ZlibError::data;
         if (out.size() > limit || length > limit - out.size()) return ZlibError::limit;
-        const std::size_t from = out.size() - distance;
-        for (std::size_t i = 0; i < length; ++i) out.push_back(out[from + i]);
+        const std::size_t start = out.size();
+        out.resize(start + length);
+        auto* dest = out.data() + start;
+        if (distance == 1) {
+            std::fill_n(dest, length, dest[-1]);
+        } else {
+            // Overlapping matches repeat their first distance bytes. Each copy reads only completed output.
+            std::size_t copied = std::min(distance, length);
+            std::memcpy(dest, dest - distance, copied);
+            while (copied < length) {
+                const auto count = std::min(copied, length - copied);
+                std::memcpy(dest + copied, dest, count);
+                copied += count;
+            }
+        }
     }
 }
 
@@ -351,9 +364,16 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
     const std::size_t at = 2 + reader.position();
     if (at > in.size() || in.size() - at < 4) return fail(ZlibError::data);
     std::uint32_t a = 1, b = 0;
-    for (const std::uint8_t x : out) {
-        a = (a + x) % 65521;
-        b = (b + a) % 65521;
+    // At most 5,552 bytes of 0xff fit in both 32-bit accumulators between reductions.
+    for (std::span<const std::uint8_t> tail(out); !tail.empty();) {
+        const auto block = tail.first(std::min<std::size_t>(tail.size(), 5552));
+        for (const auto x : block) {
+            a += x;
+            b += a;
+        }
+        a %= 65521;
+        b %= 65521;
+        tail = tail.subspan(block.size());
     }
     const std::uint32_t expected = (std::uint32_t(in[at]) << 24) | (std::uint32_t(in[at + 1]) << 16) |
                                    (std::uint32_t(in[at + 2]) << 8) | in[at + 3];

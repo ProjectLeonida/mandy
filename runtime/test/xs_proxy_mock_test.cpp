@@ -1064,9 +1064,21 @@ int check_allocators() {
         EXPECT(xs::is_allocator_proxy(allocator) && word(xs::allocator_proxy_real_allocator(allocator)) == word(real));
         EXPECT(mock->args[9][0] == D3D12_COMMAND_LIST_TYPE_DIRECT && real->refs == 1);
         EXPECT(xs::allocator_proxy_slot_count(allocator) == 9 && xs::device_proxy_ref_count(device) == device_refs + 1);
-        // Reset (slot 8) reaches the real allocator; every slot past it up to the table end is refused.
+        // Reset (slot 8) reaches the real allocator; slot 9 (SetAllocatorCallbackX) records callback/context and
+        // succeeds without touching the real vtable; every slot past 9 up to the table end is refused.
         EXPECT(hr_of(raw(allocator, 8)) == S_OK && real->calls[8] == 1);
-        for (unsigned slot = 9; slot < xs::allocator_proxy_table_size(); ++slot)
+        EXPECT(xs::allocator_proxy_callback(allocator) == 0 && xs::allocator_proxy_callback_context(allocator) == 0);
+        EXPECT(xs::allocator_proxy_callback(nullptr) == 0 && xs::allocator_proxy_callback_context(device) == 0);
+        constexpr std::uintptr_t fake_cb = 0x12345678u;
+        constexpr std::uintptr_t fake_ctx = 0x9abcdef0u;
+        const std::uint64_t slot9_hits_before = xs::allocator_slot_hits(9);
+        EXPECT(hr_of(raw(allocator, 9, fake_cb, fake_ctx, 0, 0xfeedfaceu)) == S_OK && real->calls[9] == 0);
+        EXPECT(xs::allocator_slot_hits(9) == slot9_hits_before + 1 && xs::allocator_slot_first_call_seen(9));
+        EXPECT(xs::allocator_proxy_callback(allocator) == fake_cb &&
+               xs::allocator_proxy_callback_context(allocator) == fake_ctx);
+        EXPECT(hr_of(raw(allocator, 9, 0, 0)) == S_OK && real->calls[9] == 0);
+        EXPECT(xs::allocator_proxy_callback(allocator) == 0 && xs::allocator_proxy_callback_context(allocator) == 0);
+        for (unsigned slot = 10; slot < xs::allocator_proxy_table_size(); ++slot)
             EXPECT(hr_of(raw(allocator, slot)) == E_NOTIMPL && real->calls[slot] == 0);
         // The tag and the real object stay hidden: QueryInterface answers only the modelled interfaces.
         void* found = reinterpret_cast<void*>(1);
@@ -1349,6 +1361,58 @@ int check_xbox_slots() {
     std::printf("%s: ID3D12Device11 is not in this SDK; Xbox slot 80's beyond-table case is not built\n", g_label);
     return 0;
 #endif
+}
+
+// ---- 7b. Xbox queue ExecuteCommandLists variant (queue slot 35 -> PC slot 10) ----
+
+int check_xbox_queue_slots() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    void* queue = make_queue(device);
+    EXPECT(queue);
+    Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
+    xs::reset_device_proxy_stats();
+
+    EXPECT(xs::queue_slot_overridden(35) && xs::queue_slot_overridden(14) && xs::queue_slot_overridden(15));
+    EXPECT(!xs::queue_slot_overridden(10) && !xs::queue_slot_overridden(34) && !xs::queue_slot_overridden(36));
+
+    // Real objects, not numbers: the array is read to replace list proxies by their real lists, as slot 10's is.
+    Mock* const list_a = new_mock(Kind::command_list);
+    Mock* const list_b = new_mock(Kind::command_list);
+    void* lists[2] = {list_a, list_b};
+    EXPECT(raw(queue, 35, (0xdeadbeefull << 32) | 2ull, word(lists)) == 0);
+    EXPECT(xs::queue_slot_hits(35) == 1 && xs::queue_slot_first_call_seen(35));
+    EXPECT(xs::queue_slot_hits(10) == 0);
+    EXPECT(queue_mock->calls[35] == 0 && queue_mock->calls[10] == 1);
+    EXPECT(queue_mock->args[10][0] == 2);
+    EXPECT(queue_mock->array[10][0] == word(list_a) && queue_mock->array[10][1] == word(list_b));
+    EXPECT(lists[0] == list_a && lists[1] == list_b);  // the caller's array is not written
+
+    EXPECT(raw(queue, 35, 0, 0) == 0);
+    EXPECT(xs::queue_slot_hits(35) == 2 && queue_mock->calls[35] == 0 && queue_mock->calls[10] == 2);
+    EXPECT(queue_mock->args[10][0] == 0 && queue_mock->args[10][1] == 0);
+
+    // Queue slot 18. The title's call (one pointer to 8 bytes) is the frequency getter, PC slot 16, and never the
+    // PC slot 18 (GetDesc), which would write a 16-byte description through that pointer. A host caller, under a
+    // classifier and with none installed, keeps the PC slot 18.
+    std::uint64_t frequency[3] = {0xA5A5A5A5A5A5A5A5ull, 0xA5A5A5A5A5A5A5A5ull, 0xA5A5A5A5A5A5A5A5ull};
+    xs::set_console_caller([](std::uint64_t) { return true; });
+    raw(queue, 18, word(&frequency[1]));
+    EXPECT(queue_mock->calls[16] == 1 && queue_mock->calls[18] == 0 && queue_mock->args[16][0] == word(&frequency[1]));
+    EXPECT(frequency[0] == 0xA5A5A5A5A5A5A5A5ull && frequency[2] == 0xA5A5A5A5A5A5A5A5ull);
+    xs::set_console_caller([](std::uint64_t) { return false; });
+    D3D12_COMMAND_QUEUE_DESC host_desc{};
+    raw(queue, 18, word(&host_desc));
+    EXPECT(queue_mock->calls[16] == 1 && queue_mock->calls[18] == 1 && queue_mock->args[18][0] == word(&host_desc));
+    xs::set_console_caller(nullptr);
+    raw(queue, 18, word(&host_desc));
+    EXPECT(queue_mock->calls[16] == 1 && queue_mock->calls[18] == 2);
+
+    EXPECT(release(queue) == 0 && release(device) == 0 && mock->refs == 0);
+    std::printf("%s: queue slot 35 routes ExecuteCommandLists(count, lists) to PC slot 10 with UINT count masking\n",
+                g_label);
+    return 0;
 }
 
 // ---- 8. Environment overrides for the Xbox device slots (one process each, read once) ----
@@ -1885,8 +1949,10 @@ int check_tail(bool want_guarded) {
     // Signal (14) still reaches the real queue, with the real fence.
     EXPECT(hr_of(raw(queue, 14, word(fence), 5)) == S_OK && queue_mock->calls[14] == 1 &&
            queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
-    for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot)
+    for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
+        if (xs::queue_slot_overridden(slot)) continue;
         EXPECT(hr_of(raw(queue, slot)) == E_NOTIMPL && queue_mock->calls[slot] == 0);
+    }
     for (unsigned slot = 12; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
     EXPECT(release(queue) == 0 && release(fence) == 0 && release(device) == 0 && mock->refs == 0);
@@ -2288,6 +2354,7 @@ int check_console_command_list() {
     EXPECT(xs::console_to_pc_list_slot(60) == 58);   // EndEvent
     EXPECT(xs::console_to_pc_list_slot(61) == 59);   // ExecuteIndirect
     EXPECT(xs::console_to_pc_list_slot(85) == 16);   // CopyTextureRegion
+    EXPECT(xs::console_to_pc_list_slot(139) == 10);  // Reset, as the retail title calls it
     EXPECT(xs::console_to_pc_list_slot(146) == 80);  // GCL7 Barrier
     EXPECT(xs::console_to_pc_list_slot(148) == xs::kListNotForwarded); // AllocateUploadMemory
 
@@ -2390,6 +2457,15 @@ int check_console_command_list() {
     EXPECT(hr_of(raw(list_proxy, 10, word(allocator), 0, 0, 0)) == S_OK);
     EXPECT(real_list->calls[10] == 1);
     EXPECT(real_list->args[10][0] == word(real_allocator));
+    std::memcpy(&c18, reinterpret_cast<const void*>(base + 0x18), sizeof(c18));
+    EXPECT(c18 == expected_limit);
+
+    // Console slot 139 is Reset as the retail title calls it: the same PC slot 10, allocator unwrapped, cursor
+    // re-pinned, and the list's own slot 139 never reached.
+    std::memcpy(reinterpret_cast<void*>(base + 0x18), &zero, sizeof(zero));
+    EXPECT(hr_of(raw(list_proxy, 139, word(allocator), 0, 0, 0)) == S_OK);
+    EXPECT(real_list->calls[10] == 2 && real_list->calls[139] == 0);
+    EXPECT(real_list->args[10][0] == word(real_allocator) && real_list->args[10][1] == 0);
     std::memcpy(&c18, reinterpret_cast<const void*>(base + 0x18), sizeof(c18));
     EXPECT(c18 == expected_limit);
 
@@ -2600,6 +2676,7 @@ int main(int argc, char** argv) {
         check_render_target_layout() ||
         check_committed_resource_leases() ||
         check_slot74() ||
+        check_xbox_queue_slots() ||
         check_presentation_wiring())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);

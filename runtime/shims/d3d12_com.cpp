@@ -1731,7 +1731,7 @@ public:
         for (const auto& command : list.commands().commands()) {
             const auto range = leonida::query_range(command);
             if (range.count && range.type == leonida::d3d12_query::timestamp &&
-                context_.query_heap_type(range.heap) == other)
+                (!timestamp_family_supported() || context_.query_heap_type(range.heap) == other))
                 return false;
         }
         return true;
@@ -1790,14 +1790,18 @@ public:
     }
 
     // Ticks per second of the timestamps EndQuery writes: one tick is timestampPeriod nanoseconds. Every D3D12
-    // queue of the device shares one VkQueue, so they share one frequency. E_FAIL when that queue has no
-    // timestamps (timestampValidBits 0), as D3D12 reports for a queue that does not support them.
+    // device has one timestamp period, but individual queue families may not write timestamps.
     HRESULT STDMETHODCALLTYPE GetTimestampFrequency(UINT64* frequency) override {
         if (!frequency) return E_INVALIDARG;
         const double period = context_.timestamp_period();
-        if (!(period > 0)) return E_FAIL;
+        if (!(period > 0) || !timestamp_family_supported()) return E_FAIL;
         *frequency = static_cast<UINT64>(1e9 / period + 0.5);
         return S_OK;
+    }
+
+    bool timestamp_family_supported() const {
+        // The low-level queue factory also accepts caller-owned queues without a QueueClock.
+        return !clock_.get_device_proc || clock_.timestamp_valid_bits != 0;
     }
 
     // Queue labels, in order with the submissions around them.

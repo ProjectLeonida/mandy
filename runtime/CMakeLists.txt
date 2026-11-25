@@ -584,6 +584,11 @@ if(BUILD_TESTING)
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)
+  # Textures sharing blocks of device memory (runtime/src/image_memory.h): pure stdlib, counted fake allocations.
+  add_executable(image_memory_test test/image_memory_test.cpp)
+  find_package(Threads REQUIRED)
+  target_link_libraries(image_memory_test PRIVATE Threads::Threads)
+  add_test(NAME image_memory COMMAND image_memory_test)
 
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
@@ -1856,6 +1861,14 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(d3d12_queue_wait PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     add_test(NAME d3d12_queue_wait_timeout COMMAND d3d12_queue_wait_test --timeout-control)
     set_tests_properties(d3d12_queue_wait_timeout PROPERTIES SKIP_RETURN_CODE 77 WILL_FAIL TRUE TIMEOUT 10)
+    # Textures share blocks of device memory, and a reused range neither leaks old texels nor touches its neighbours.
+    add_executable(d3d12_texture_memory_test test/d3d12_texture_memory_test.cpp)
+    target_link_libraries(d3d12_texture_memory_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_texture_memory_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_texture_memory_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_texture_memory COMMAND d3d12_texture_memory_test)
+    set_tests_properties(d3d12_texture_memory PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
     # ExecuteCommandLists refuses a list whose type isn't the queue's (debug-layer message 836).
     add_executable(d3d12_queue_list_type_test test/d3d12_queue_list_type_test.cpp)
     target_link_libraries(d3d12_queue_list_type_test PRIVATE gta6rt_d3d12_com)

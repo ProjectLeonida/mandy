@@ -562,6 +562,22 @@ int main() {
     CHECK(zlib_inflate(stored, out) && out.size() == 40);
     for (std::uint8_t i = 0; i < 40; ++i) CHECK(out[i] == i);
     CHECK(zlib_inflate(fixed, out) && out == bytes("hello hello hello leonida"));
+    {
+        // Python zlib.compress(b'\xff' * 5553 + b'abc' * 5553). Exercises overlapping
+        // matches with periods one and three across multiple Adler reduction boundaries.
+        const std::vector<std::uint8_t> repeated = {
+            0x78, 0x9c, 0xed, 0xc2, 0x41, 0x11, 0x00, 0x00, 0x08, 0x03, 0xa0, 0xac,
+            0xd3, 0xfe, 0x19, 0x66, 0x0d, 0x1f, 0x70, 0xb4, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xbc, 0x90, 0x59, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0xd5, 0x3c, 0x7b, 0xa2, 0x71,
+            0x87, 0x48,
+        };
+        std::vector<std::uint8_t> expected(5553, 0xff);
+        for (int i = 0; i < 5553; ++i) expected.insert(expected.end(), {'a', 'b', 'c'});
+        CHECK(zlib_inflate(repeated, out, expected.size()) && out == expected);
+        ZlibError why{};
+        CHECK(!zlib_inflate(repeated, out, expected.size() - 1, &why) && why == ZlibError::limit);
+    }
     CHECK(zlib_inflate(dynamic, out) && out == skewed(600));
     CHECK(sha256_hex(out) == "9cd6848f765bff2a9f42a8b42f6164042dad67d3e9f82e0044ddc7d1ecdeebb2");
     auto broken = dynamic;
