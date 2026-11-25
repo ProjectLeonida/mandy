@@ -291,11 +291,11 @@ struct Fixture {
         const VkImageSubresourceRange color_range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         const VkImageSubresourceRange depth_range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
         const VkClearColorValue zero{};
-        const VkClearDepthStencilValue far{1, 0};
+        const VkClearDepthStencilValue depth_clear{1, 0};
         d.fn<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(cb, color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero,
                                                              1, &color_range);
         d.fn<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(cb, depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                                                           &far, 1, &depth_range);
+                                                                           &depth_clear, 1, &depth_range);
         barrier(cb, color, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
             VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
