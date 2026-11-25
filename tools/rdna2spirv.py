@@ -7742,7 +7742,8 @@ class Gen:
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {first}")
             self.dst(a[0], r)
         elif op in ("image_sample_o", "image_sample_lz_o", "image_sample_l_o", "image_sample_b_o",
-                    "image_sample_c_lz_o", "image_sample_c_o", "image_sample_c_b_o", "image_sample_cl_o", "image_sample_b_cl_o",
+                    "image_sample_c_lz_o", "image_sample_c_l_o", "image_sample_c_o", "image_sample_c_b_o", "image_sample_cl_o",
+                    "image_sample_b_cl_o",
                     "image_sample_c_cl_o", "image_sample_c_b_cl_o") or                 op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
                     "image_sample_c_l", "image_sample_c", "image_sample_c_b", "image_sample_cl", "image_sample_b_cl", "image_sample_c_cl",
                     "image_sample_c_b_cl",
@@ -13373,11 +13374,20 @@ class Gen:
         if vdata["k"] != "vgpr":          # `off`, an SGPR or a constant where the VGPR range of the result goes
             raise Unsupported(op + " destination")
         addr = self.addr_regs(a[1])
-        if op == "image_sample_c_l":
-            # Vulkan Dref returns one scalar. Other component masks require the depth view's swizzle.
-            if (dim != "dim:SQ_RSRC_IMG_2D" or dmask != 1 or len(addr) != (3 if a16 else 4)
-                    or any(m not in (dim, dm, "a16", "d16") for m in mods)):
-                raise Unsupported(op + " needs scalar 2D depth comparison")
+        if op in ("image_sample_c_l", "image_sample_c_l_o"):
+            # A depth comparison returns one value (docs/design.md, "image_sample_c_l"). Refused: a 3D image, which
+            # Vulkan has no Dref form for (VUID-StandaloneSpirv-OpImage-04777); a component mask other than X, whose
+            # other channels the depth view's swizzle would have to supply; the status words of tfe / lwe; and any
+            # other modifier. The address is [offset,] z-compare, the coordinates, then the LOD (LLVM
+            # AMDGPUSampleVariant: offset, z-compare, coordinates, lod): under a16 the offset and the compare keep
+            # a dword each and the coordinates and the LOD pack in pairs.
+            if dim == "dim:SQ_RSRC_IMG_3D":
+                raise Unsupported(op + " 3D depth comparison has no Vulkan form")
+            if dmask != 1 or any(m not in (dim, dm, "a16", "d16") for m in mods):
+                raise Unsupported(op + " needs scalar depth comparison (dmask:0x1, no tfe/lwe)")
+            fixed = (1 if op.endswith("_o") else 0) + 1
+            if len(addr) != fixed + ((ncoord + 2) // 2 if a16 else ncoord + 1):
+                raise Unsupported(op + " address width")
         img_idx = self.desc_lookup_sgpr(a[2], 8)
         img = None              # a coherent image_load reads the storage view, not this sampled one
         if not coherent:
@@ -13675,7 +13685,7 @@ class Gen:
             else:
                 uv = self.tmp()
                 self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
-            lod = f[ncoord] if kind == "_l" and len(f) > ncoord else "%f0"
+            lod = f[ncoord] if kind in ("_l", "_c_l") and len(f) > ncoord else "%f0"
             if typed_sample:
                 # The aliases image_read_typed declares are indexed by the dimension it reads: a cube samples its
                 # 6-layer 2D-array view, which is what `img` was loaded from above.
@@ -13699,7 +13709,7 @@ class Gen:
                                       dmask, vdata, d16, sample)
                 return
             res = self.tmp()
-            if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz", "_c", "_c_b"):
+            if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz", "_c_l", "_c", "_c_b"):
                 raise Unsupported(op)
             implicit = kind in ("", "_b", "_c", "_c_b") and self.stage == "ps"
             # A min-LOD clamp (_cl): MinLod goes with the implicit-LOD forms and Grad. Without derivatives (outside the
@@ -14517,7 +14527,7 @@ class Gen:
         """--texel-offset-fallback: return (uv + offset / size of the sampled level, implicit-LOD gradients or None).
 
         The level is 0 for _lz / _c_lz (and for implicit samples outside the PS, which sample LOD 0), the given LOD
-        for _l, and OpImageQueryLod's for implicit samples (plus the bias for _b), rounded the way the S#'s
+        for _l / _c_l, and OpImageQueryLod's for implicit samples (plus the bias for _b), rounded the way the S#'s
         MIP_FILTER (word 2 [27:26]) selects a level and clamped to the image's levels: floored for linear, nearest
         with a tie rounding up (floor(lod + 0.5), as an RTX 5070 samples LOD 0.5 at mip 1 and image_query_probe.py
         records for RDNA2) for point and for the value 3, which the runtime also samples as nearest, and 0 for
@@ -14540,7 +14550,7 @@ class Gen:
             uvs = self.tmp()
             self.emit(f"{uvs} = OpVectorShuffle %v2float {uv} {uv} 0 1")
         level_f = None
-        if kind == "_l":
+        if kind in ("_l", "_c_l"):
             level_f = lod if lod is not None else "%f0"
         elif implicit:
             q, qx = self.tmp(), self.tmp()

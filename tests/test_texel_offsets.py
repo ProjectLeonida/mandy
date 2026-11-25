@@ -32,6 +32,8 @@ FORMS = [   # (instruction, SPIR-V op that takes the Offset, offset components)
     (f"image_sample_c_o v4, v[10:12], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D a16", "OpImageSampleDrefImplicitLod", 2),
     (f"image_sample_cl_o v[4:5], v[10:13], {DESC} dmask:0x3 dim:SQ_RSRC_IMG_2D", "OpImageSampleImplicitLod", 2),
     (f"image_sample_c_b_cl_o v4, v[10:15], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D", "OpImageSampleDrefImplicitLod", 2),
+    (f"image_sample_c_l_o v4, v[10:14], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D", "OpImageSampleDrefExplicitLod", 2),
+    (f"image_sample_c_l_o v4, v[10:13], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D a16", "OpImageSampleDrefExplicitLod", 2),
     (f"image_gather4_lz_o v[4:7], v[10:12], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D", "OpImageGather", 2),
 ]
 
@@ -257,6 +259,24 @@ def test_fallback_level_follows_mip_filter(mip, lod, level, tmp_path, fallback):
     assert _folded_level(_sample_l_o(tmp_path, word2), lod) == level
     # A run-time S# (nothing written to s18 in the shader) picks the same level from the word's value.
     assert _folded_level(_sample_l_o(tmp_path), lod, word2=word2) == level
+
+
+@pytest.mark.parametrize("mip,lod,level", [
+    (MIP_POINT, 0.75, 1),
+    (MIP_POINT, 0.25, 0),
+    (MIP_POINT, 0.5, 1),
+    (MIP_POINT, 9.0, 3),      # clamped to the last of 4 levels
+    (MIP_LINEAR, 0.75, 0),
+    (MIP_LINEAR, 1.99, 1),
+    (MIP_NONE, 2.75, 0),
+])
+def test_fallback_level_of_sample_c_l_o_follows_its_lod_and_mip_filter(mip, lod, level, tmp_path, fallback):
+    """image_sample_c_l_o has an explicit LOD like image_sample_l_o: the fold reads that mip level, not level 0 as
+    the _lz forms do (v14 is the LOD here)."""
+    sample = f"image_sample_c_l_o v4, v[10:14], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D"
+    word2 = mip << 26 | 0x00500000
+    spv = translate_listing(tmp_path, PROLOGUE + f"\ns_mov_b32 s18, 0x{word2:x}\n" + sample)
+    assert _folded_level(spv, lod) == level
 
 
 def test_fallback_literal_mip_filter_emits_one_rounding(tmp_path, fallback):
