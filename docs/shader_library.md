@@ -176,7 +176,32 @@ library through DirectStorage zlib requests and passes each compute record's fou
 `DeserializeComputePipelineStateX`, as kinds 0, 1, 6 and 7, so the code key is the program's bytes as the table gives
 them and the state key is the record's state blob. The step is redone as a whole when `shaders.rpf`, the tools,
 `llvm-mc`, the wave64 mode or the flags change (`library_build.json`, written last), and a clash of both keys between
-different modules fails it, as for the FSPX step. Graphics pipelines are not translated by the build.
+different modules fails it, as for the FSPX step.
+
+For device slot 57 the same build unpacks the PS, VS and MS selections into `<work>/shaders/fspx_gfx`.
+It disassembles the pipeline-specific kind-6 bytes and translates them into `<work>/shaders/spirv/fspx_gfx`.
+Each published row names its stage and the SHA-256 of the entire kind-6 program, including its prologue. The
+source container supplies signatures and PSV0 when available. Run the usual `make_game.py --stages shaders`
+with the same game, work folder and translation options to add this index to an existing workspace. Compute
+and graphics have separate build markers. The graphics marker also records the output index digest and the
+number of extracted and translated programs. A missing module or a truncated index triggers a graphics rebuild.
+
+In the original build shell, use the paths for that workspace and any adapter options used for its first
+translation. The two CTests draw with hand-built native descriptions and check the GPU pixels.
+
+```powershell
+python -I make_game.py --game $game --work $work --out $port --stages shaders
+ctest --test-dir $build -C RelWithDebInfo -R '^xbox_native_fspx_(draw|mesh)$' --output-on-failure
+```
+
+On 1.0.2.1 the 25,471 graphics records reference 18,837 distinct programs in the three identified stages.
+In both native-wave64 and wave64-emulation builds, 9,671 of 9,996 PS, 1,342 of 1,343 VS and 7,480 of 7,498 MS
+translated and passed `spirv-val`. Every published key matched the complete extracted program. Of the identified
+programs, 18,829 have a 36-byte prologue and eight have the 24-byte two-carrier form. Looking up all stages
+by raw code alone covered 24,983 records. The per-record layout digests linked all stages to the DXBC catalog
+for 25,450 records. Two records also name the unidentified slot-6 program. A record
+with all of its stage links still needs a valid root signature, fixed-function state and a device that supports
+its pipeline before it can draw. [Slot 57 and native shader lookup](fspx.md)
 
 ### Resuming a compute-only batch on Linux
 
