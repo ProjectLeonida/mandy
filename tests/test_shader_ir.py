@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 from unittest import mock
 
@@ -328,6 +329,40 @@ class ParseFileTests(unittest.TestCase):
         self.assertEqual(info["code_start"], 0x1000)
         self.assertEqual(info["insns"], [])
         self.assertEqual(info["invalid"], 0)
+
+    def test_empty_file_and_last_line_without_a_newline(self):
+        info = shader_ir.parse_file(self.write(""))
+        self.assertEqual((info["code_start"], info["code_end"], info["insns"], info["invalid"]), (0, None, [], 0))
+        info = shader_ir.parse_file(self.write("; tail code 0x20..0x28\n\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]"))
+        self.assertEqual((info["code_start"], info["code_end"]), (0x20, 0x28))
+        self.assertEqual([(i["op"], i["pc"], i["enc"]) for i in info["insns"]], [("s_endpgm", 0x20, "000081bf")])
+
+    def test_long_message_tail_is_counted_a_line_at_a_time(self):
+        # llvm-mc prints its whole input line under every invalid word. The messages of a program given as one line
+        # are then far larger than its instructions: 400 bad words in 2,048 synthetic bytes leave about 6 MB here.
+        # They are counted, but the listing is not held in memory for it (the read buffer is 128 KiB at most).
+        echoed = " ".join(["0xff"] * 2048)
+        bad = 400
+        path = self.write(
+            "; big code 0x00000000..0x00000800\n"
+            "\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf]\n"
+            "\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n"
+            "\n; --- llvm-mc messages ---\n"
+            + "".join(f"; <stdin>:1:{1 + 5 * k}: warning: invalid instruction encoding\n; {echoed}\n"
+                      f"; {' ' * (5 * k)}^\n" for k in range(bad))
+        )
+        size = os.path.getsize(path)
+        self.assertGreater(size, 4 << 20)
+        tracemalloc.start()
+        try:
+            info = shader_ir.parse_file(path)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(info["invalid"], bad)
+        self.assertEqual([(i["op"], i["pc"]) for i in info["insns"]], [("s_nop", 0), ("s_endpgm", 4)])
+        self.assertEqual(info["code_end"], 0x800)
+        self.assertLess(peak, size // 4, "parse_file held the message tail in memory")
 
 
 class CliInputTest(unittest.TestCase):
