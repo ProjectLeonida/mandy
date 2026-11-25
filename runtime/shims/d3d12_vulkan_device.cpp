@@ -53,6 +53,7 @@
 #include "../src/spirv_f16_halves.h"
 #include "../src/spirv_stores.h"
 #include "../src/title_va_alias.h"
+#include "../src/title_vsharp_guard.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
@@ -2097,6 +2098,21 @@ struct DeviceState {
     std::atomic<std::size_t> title_window_count{0};  // title_windows.size(), read without the mutex
     std::uint64_t title_window_bytes = 0;
     std::uint64_t title_window_cap = 64ull << 20;
+    std::uint64_t vsharp_guard_scratch = UINT64_MAX;
+    bool vsharp_guard_scratch_tried = false;
+
+    std::uint64_t ensure_vsharp_guard_scratch() {
+        std::lock_guard lock(title_window_mutex);
+        if (!vsharp_guard_scratch_tried) {
+            vsharp_guard_scratch_tried = true;
+            VkDeviceSize scratch = 0;
+            if (arena.mapped && arena_allocate(kTitleWindowAlign, kTitleWindowAlign, scratch, arena_buffer)) {
+                std::memset(arena.mapped + scratch, 0, std::size_t(kTitleWindowAlign));
+                vsharp_guard_scratch = scratch;
+            }
+        }
+        return vsharp_guard_scratch;
+    }
 
     rt::d3d12::GeometryViews geometry;
     static rt::d3d12::GeometryCopy copy_geometry(std::uint8_t* to, const std::uint8_t* from, std::size_t size) {
@@ -2132,6 +2148,8 @@ struct DeviceState {
             return !flag || std::string_view(flag) != "0";
         }();
         if (context->knows_buffer_va(va)) return false;  // an upload or readback buffer's biased VA, say
+        const std::uint64_t cpu_va = leonida::title_gpu_views::to_cpu(va, bytes);
+        if (cpu_va != va) va = cpu_va;
         if (va < arena.size) {
             // Below the arena's size an address is an arena address unless the title's own memory is there (its
             // heap is: arena_allocate keeps out of those ranges).
@@ -2242,8 +2260,37 @@ struct DeviceState {
         // Slots the title wrote in its own backing of this heap, if it gave the heap one.
         aliases.pull_descriptors(arena.mapped + table_va, std::size_t(end - table_va));
         if (sampler) return;  // S# words describe sampling state. They have no buffer address to translate.
-        for (VkDeviceSize at = table_va; at + 16 <= end; at += kDescriptorSize)
-            rebase_title_vsharp(reinterpret_cast<std::uint32_t*>(arena.mapped + at), aliases);
+        for (VkDeviceSize at = table_va; at + 16 <= end; at += kDescriptorSize) {
+            auto* w = reinterpret_cast<std::uint32_t*>(arena.mapped + at);
+            if (!rebase_title_vsharp(w, aliases)) guard_untranslated_title_vsharp(w, aliases);
+        }
+    }
+
+    bool guard_untranslated_title_vsharp(std::uint32_t* w, leonida::TitleVaAliases& aliases) {
+        std::uint64_t raw_va = 0, span = 0;
+        const bool guarded = leonida::title_vsharp_guard::redirect_untranslated_vsharp(
+            w, arena.size,
+            [](std::uint64_t va, std::uint64_t bytes) { return leonida::title_gpu_views::to_cpu(va, bytes); },
+            [&](std::uint64_t base) {
+                std::uint64_t host{}, remaining{};
+                return (context && context->knows_buffer_va(base)) ||
+                       (geometry.cap() && geometry.lookup(arena.address + base, host, remaining));
+            },
+            [&](std::uint64_t va) {
+                std::uint64_t lo = 0, hi = 0;
+                return aliases.title_memory(va, lo, hi);
+            },
+            [&]() { return ensure_vsharp_guard_scratch(); }, &raw_va, &span);
+        if (guarded) {
+            static std::atomic<std::uint64_t> count{0};
+            const std::uint64_t n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 8 || (n & (n - 1)) == 0)
+                std::fprintf(stderr,
+                             "[rt] d3d12: guarded untranslated title V# #%llu (raw VA 0x%llx, span %llu B -> zero-extent scratch)\n",
+                             static_cast<unsigned long long>(n), static_cast<unsigned long long>(raw_va),
+                             static_cast<unsigned long long>(span));
+        }
+        return guarded;
     }
 
     // A buffer V# (its first four dwords at `w`) whose base is in the title's own memory gets the console VA of a GPU
@@ -2257,30 +2304,32 @@ struct DeviceState {
         if (base < arena.size || (geometry.cap() && geometry.lookup(arena.address + base, host, remaining))) return false;
         const std::uint32_t stride = (w1 >> 16) & 0x3FFFu;
         const std::uint64_t span = std::uint64_t(w2) * (stride ? stride : 1);
+        const std::uint64_t cpu_base = leonida::title_gpu_views::to_cpu(base, span);
+        const leonida::gfx10::BufferWords words{w0, w1, w2, w3};
+        leonida::gfx10::Buffer desc{};
+        const bool decoded = leonida::gfx10::decode(words, desc);
         std::uint64_t to{};
-        if (geometry.cap()) {
-            const leonida::gfx10::BufferWords words{w0, w1, w2, w3};
-            leonida::gfx10::Buffer desc{};
-            if (leonida::gfx10::decode(words, desc)) {
-                // Untyped heap slots can contain ordinary pointers or other data. Large extents with
-                // no format or fields outside our buffer encoding need independent evidence of a view.
-                // An explicit table or a placed SRV can still establish the backing for those words.
-                if (!make_window && span > kTitleWindowMax &&
-                    (!desc.format || leonida::gfx10::encode(desc) != words)) {
-                    to = geometry.find(leonida::title_gpu_views::to_cpu(base, span), span);
-                    if (!to) return false;
-                } else {
-                    to = geometry_va(base, span, false);
-                }
+        if (geometry.cap() && decoded) {
+            // Untyped heap slots can contain ordinary pointers or other data. Large extents with
+            // no format or fields outside our buffer encoding need independent evidence of a view.
+            // An explicit table or a placed SRV can still establish the backing for those words.
+            if (!make_window && span > kTitleWindowMax &&
+                (!desc.format || leonida::gfx10::encode(desc) != words)) {
+                to = geometry.find(cpu_base, span);
+            } else {
+                to = geometry_va(base, span, false);
             }
         }
 
-        // A heap scan sees free-list links, raw data and inactive slots. Only explicit bindings may
-        // request general-purpose windows. The heap can reuse an existing one or make a geometry mirror.
-        if (!to) to = make_window ? aliases.resolve(base, span, leonida::TitleVaAliases::table_view)
-                                  : aliases.shader_va(base, span);
+        // Allow general-purpose windows for explicit bindings or decoded title-memory V#s within kTitleWindowMax so
+        // directly-indexed buffer descriptors receive real arena backing when geometry views do not claim them.
+        std::uint64_t title_lo = 0, title_hi = 0;
+        const bool allow_window =
+            make_window || (decoded && span > 0 && span <= kTitleWindowMax && aliases.title_memory(cpu_base, title_lo, title_hi));
+        if (!to) to = allow_window ? aliases.resolve(cpu_base, span, leonida::TitleVaAliases::table_view)
+                                   : aliases.shader_va(cpu_base, span);
 
-        if (to == base || (to >> 48)) return false;
+        if (!to || to == base || to == cpu_base || (to >> 48)) return false;
         w[0] = std::uint32_t(to);
         w[1] = (w1 & 0xFFFF0000u) | std::uint32_t((to >> 32) & 0xFFFFu);
         return true;
@@ -2513,6 +2562,7 @@ struct DeviceState {
             if (rebase_title_vsharp(w, aliases, !heap.scratch)) {
                 ++heap.vsharps;
             } else {
+                guard_untranslated_title_vsharp(w, aliases);
                 // The title's memory with no copy yet (a page not committed when it was looked at) is tried again.
                 const std::uint64_t base = std::uint64_t(w[0]) | (std::uint64_t(w[1] & 0xFFFFu) << 32);
                 std::uint64_t lo = 0, hi = 0;
