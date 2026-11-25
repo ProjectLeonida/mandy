@@ -12802,7 +12802,6 @@ private:
     std::uint64_t title_refresh_cursor_ = 0;                       // under title_texture_mutex
     std::uint64_t title_rolling_cursor_ = 0;                       // likewise
     std::uint64_t title_every_cursor_ = 0;                         // likewise: LEONIDA_TITLE_EVERY_BUDGET_US's resume point
-    std::uint64_t title_rolling_cursor_ = 0;                       // likewise
     std::uint64_t title_map_generation_ = 0;                       // likewise: the map changes the passes have seen
     std::chrono::steady_clock::time_point title_retry_all_{};      // likewise
     leonida::TitleWriteRanges title_map_changes_;                  // likewise, scratch
