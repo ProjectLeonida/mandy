@@ -2083,6 +2083,7 @@ if(TARGET Vulkan::Headers)
   if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     set(_null_descriptors_spv ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_null_descriptors.spv)
     add_custom_command(OUTPUT ${_null_descriptors_spv}
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/generated
       COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${_null_descriptors_spv}
               ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_null_descriptors.comp
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_null_descriptors.comp
