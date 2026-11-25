@@ -169,6 +169,19 @@ inline D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURC
 template<class T>
 struct Ref {
     T* p = nullptr;
+    Ref() = default;
+    // One owner: a copy would Release twice, and `ref = {}` must Release what it held.
+    Ref(const Ref&) = delete;
+    Ref& operator=(const Ref&) = delete;
+    Ref(Ref&& other) noexcept : p(other.p) { other.p = nullptr; }
+    Ref& operator=(Ref&& other) noexcept {
+        if (this != &other) {
+            reset();
+            p = other.p;
+            other.p = nullptr;
+        }
+        return *this;
+    }
     ~Ref() { reset(); }
     void reset() {
         if (p) p->Release();
