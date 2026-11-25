@@ -22,8 +22,9 @@ VK_KHR_shader_fma; the test programs enable it when the device has it, else they
 With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are translated with --bary-fallback, and
 each gets a pass-through geometry shader, <name>.bary_gs.spv, that check.py draws it with (tools/bary_fallback_gs.py).
 With the variable unset, build.py/check.py follow the Mesa ANV probe automatically.
-Under that or LEONIDA_F16_INTERP_FALLBACK=1, ps_ij_computed isn't built: its computed I/J pair needs PerVertexKHR
-inputs, and check.py reports it as SKIP.
+A PS with a computed I/J pair (ps_ij_computed) also reads the three vertices' values of the attribute through that
+geometry shader. Under LEONIDA_F16_INTERP_FALLBACK=1, ps_ij_computed isn't built: its computed I/J pair needs the
+per-vertex values, which that fallback doesn't have, and check.py reports it as SKIP.
 With LEONIDA_PC_TAIL_UBO=1, every shader is translated with --pc-tail-ubo (s0..s31 in 128 push-constant bytes, the
 heap base and code base in a uniform block at set 1), for devices whose maxPushConstantsSize is 128; set it for
 check.py too, whose test programs then bind that block (runtime/test/vk_pc_tail.h).
@@ -45,7 +46,7 @@ import mc_command  # noqa: E402
 
 MC = mc_command.mc_command()
 RSRC2, GROUP = 0x8088, (64, 1, 1)
-# Not built under LEONIDA_BARY_FALLBACK=1 or LEONIDA_F16_INTERP_FALLBACK=1 (see main).
+# Not built under LEONIDA_F16_INTERP_FALLBACK=1 (see main).
 NEEDS_PER_VERTEX_INPUTS = ("ps_ij_computed",)
 sys.path.insert(0, HERE)  # this script is also run with python -I
 from compute_fixture import compute_header, shift_user_data, user_data_shift  # noqa: E402
@@ -221,12 +222,13 @@ def main():
     if skipped:
         print("not built (need a DXBC container with signatures):", ", ".join(skipped))
     names = [n for n in names if n not in skipped]
-    # A computed I/J pair needs PerVertexKHR inputs, which both fallbacks take away: the translator refuses it there,
-    # and check.py and run_gpu_tests.py report it as SKIP. Leave it out instead of losing the whole batch.
-    if barycentric_fallback() or os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":
+    # A computed I/J pair needs the three vertices' values, which --f16-interp-fallback doesn't have (--bary-fallback
+    # gets them from its geometry shader): the translator refuses it there, and check.py and run_gpu_tests.py report
+    # it as SKIP. Leave it out instead of losing the whole batch.
+    if os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1" and not barycentric_fallback():
         per_vertex = [n for n in names if n in NEEDS_PER_VERTEX_INPUTS]
         if per_vertex:
-            print("not built (computed I/J pairs need PerVertexKHR inputs, off under the fallback):",
+            print("not built (computed I/J pairs need per-vertex inputs, off under --f16-interp-fallback):",
                   ", ".join(per_vertex))
         names = [n for n in names if n not in per_vertex]
     if not names:

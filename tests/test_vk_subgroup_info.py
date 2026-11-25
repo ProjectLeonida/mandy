@@ -69,6 +69,7 @@ class FakeDevice:
         vk_info.VK_SHADER_STAGE_COMPUTE_BIT | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT
     )
     fragment_shader_barycentric: bool = True
+    geometry_shader: bool = True
     max_push_constants_size: int = 256
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
     vendor_id: int = 0
@@ -250,6 +251,10 @@ class FakeVulkan:
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.synchronization2)
             elif stype == 1000225002:  # VkPhysicalDeviceSubgroupSizeControlFeaturesEXT
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.subgroup_size_control)
+            elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
+                ctypes.c_uint32.from_address(
+                    node_addr + vk_info.FEATURES2_GEOMETRY_SHADER
+                ).value = int(dev.geometry_shader)
             elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR:
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.fragment_shader_barycentric)
         expected = {
@@ -814,6 +819,7 @@ class QueryTest(unittest.TestCase):
                     "native64_compute": want_native64 or label == "missing_mesh_stage_bit",
                     "native64": want_native64,
                     "per_vertex_inputs": True,
+                    "geometry_shader": True,
                     "barycentric_fallback": False,
                     "max_push_constants_size": 256,
                     "vendor_id": 0,
@@ -829,6 +835,14 @@ class QueryTest(unittest.TestCase):
             with self.subTest(limit=limit):
                 res, _vk = self._run_query(FakeDevice(max_push_constants_size=limit))
                 self.assertEqual(res["max_push_constants_size"], limit)
+
+    def test_geometry_shader_bit(self):
+        """geometryShader is VkPhysicalDeviceFeatures' 5th bool, 16 bytes into VkPhysicalDeviceFeatures2."""
+        self.assertEqual(vk_info.FEATURES2_GEOMETRY_SHADER, 32)
+        for want in (True, False):
+            with self.subTest(geometry_shader=want):
+                res, _vk = self._run_query(FakeDevice(geometry_shader=want))
+                self.assertIs(res["geometry_shader"], want)
 
     def test_per_vertex_inputs(self):
         """PerVertexKHR needs fragmentShaderBarycentric, and MoltenVK can't compile it to MSL either way."""

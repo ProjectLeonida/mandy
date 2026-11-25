@@ -8,6 +8,10 @@ pixel shader's vec4 inputs from each vertex unchanged and adds (1,0,0), (0,1,0),
 vertices. Default (perspective) interpolation of those gives the perspective-correct barycentrics, the value
 BaryCoordKHR has, so the pixel shader's .y/.z are AMD's i/j.
 
+An attribute a computed I/J pair reads (SHADER-177) is listed in "bary_fallback_input" under "per_vertex", with the
+first of three locations: the geometry shader writes the three vertices' values of the attribute there, as a Flat
+vec4[3] (element k = vertex k) at every vertex it emits, which the pixel shader weights with its own I/J.
+
     python -I tools/bary_fallback_gs.py <spirv dir>      # <name>.bary_gs.spv per such PS in index.json
 
     python -I tools/bary_fallback_gs.py <spirv dir> --pair VS PS
@@ -28,16 +32,26 @@ import tempfile
 SUFFIX = ".bary_gs"   # <ps name>.bary_gs.spvasm / .spv next to the pixel shader
 
 
-def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0):
+def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0, per_vertex=None):
     """SPIR-V assembly for a triangle pass-through GS: Position and the vec4 inputs at `locations`, copied per vertex,
-    plus the one-hot barycentric vec3 at `bary_location`."""
-    locations = sorted(set(int(n) for n in locations))
+    plus the one-hot barycentric vec3 at `bary_location`. `per_vertex` maps an attribute (an input location) to the
+    first of three output locations that get its three vertices' values as a Flat vec4[3] instead of a copy."""
+    per_vertex = {int(n): int(b) for n, b in (per_vertex or {}).items()}
+    locations = sorted(set(int(n) for n in locations) - set(per_vertex))
     if type(bary_location) is not int or bary_location < 0:
         raise ValueError(f"bary location must be a non-negative integer, got {bary_location!r}")
     if bary_location in locations:
         raise ValueError(f"bary location {bary_location} collides with a pass-through location")
+    claimed = set(locations) | {int(bary_location)}
+    for n, b in sorted(per_vertex.items()):
+        block = {b, b + 1, b + 2}
+        if b < 0 or block & claimed:
+            raise ValueError(f"per-vertex locations {b}..{b + 2} of attribute {n} collide with another output")
+        claimed |= block
     ins = [f"%in{n}" for n in locations]
     outs = [f"%out{n}" for n in locations]
+    pv_ins = [f"%pvin{n}" for n in sorted(per_vertex)]
+    pv_outs = [f"%pvout{n}" for n in sorted(per_vertex)]
     if type(clip_count) is not int or not 0 <= clip_count <= 8:
         raise ValueError("clip distance count must be an integer from 0 to 8")
     if type(cull_count) is not int or not 0 <= cull_count <= 8:
@@ -48,7 +62,7 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
     kind = "cull" if cull_count else "clip"
     builtin = kind.title() + "Distance"
     distance_iface = [f"%in_{kind}", f"%out_{kind}"] if count else []
-    iface = " ".join(["%in_pos", "%out_pos", *ins, *outs, "%out_bary", *distance_iface])
+    iface = " ".join(["%in_pos", "%out_pos", *ins, *outs, *pv_ins, *pv_outs, "%out_bary", *distance_iface])
     lines = [
         "OpCapability Geometry",
         *([f"OpCapability {builtin}"] if count else []),
@@ -64,6 +78,9 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
           if count else []),
         *[f"OpDecorate %in{n} Location {n}" for n in locations],
         *[f"OpDecorate %out{n} Location {n}" for n in locations],
+        *[f"OpDecorate %pvin{n} Location {n}" for n in sorted(per_vertex)],
+        *[d for n, b in sorted(per_vertex.items())
+          for d in (f"OpDecorate %pvout{n} Location {b}", f"OpDecorate %pvout{n} Flat")],
         f"OpDecorate %out_bary Location {int(bary_location)}",
         "%void = OpTypeVoid",
         "%fn = OpTypeFunction %void",
@@ -78,6 +95,7 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
         "%ptr_in_v4 = OpTypePointer Input %v4float",
         "%ptr_out_v4 = OpTypePointer Output %v4float",
         "%ptr_out_v3 = OpTypePointer Output %v3float",
+        *(["%ptr_out_arr = OpTypePointer Output %arr"] if per_vertex else []),
         *([f"%{kind}_count = OpConstant %uint {count}",
            f"%{kind} = OpTypeArray %float %{kind}_count",
            f"%triangle_{kind} = OpTypeArray %{kind} %uint_3",
@@ -94,6 +112,8 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
         "%out_pos = OpVariable %ptr_out_v4 Output",
         *[f"{v} = OpVariable %ptr_in_arr Input" for v in ins],
         *[f"{v} = OpVariable %ptr_out_v4 Output" for v in outs],
+        *[f"{v} = OpVariable %ptr_in_arr Input" for v in pv_ins],
+        *[f"{v} = OpVariable %ptr_out_arr Output" for v in pv_outs],
         "%out_bary = OpVariable %ptr_out_v3 Output",
         *([f"%in_{kind} = OpVariable %ptr_in_triangle_{kind} Input", f"%out_{kind} = OpVariable %ptr_out_{kind} Output"]
           if count else []),
@@ -105,6 +125,11 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
             p, x = f"%p{v}_{src[1:]}", f"%x{v}_{src[1:]}"
             lines += [f"{p} = OpAccessChain %ptr_in_v4 {src} %int_{v}", f"{x} = OpLoad %v4float {p}",
                       f"OpStore {dst} {x}"]
+        for src, dst in zip(pv_ins, pv_outs):     # the triangle's three values, the same at every vertex
+            for k in range(3):
+                p, x, q = f"%p{v}_{src[1:]}_{k}", f"%x{v}_{src[1:]}_{k}", f"%q{v}_{dst[1:]}_{k}"
+                lines += [f"{p} = OpAccessChain %ptr_in_v4 {src} %int_{k}", f"{x} = OpLoad %v4float {p}",
+                          f"{q} = OpAccessChain %ptr_out_v4 {dst} %int_{k}", f"OpStore {q} {x}"]
         if count:
             lines += [f"%{kind}_ptr{v} = OpAccessChain %ptr_in_{kind} %in_{kind} %int_{v}",
                       f"%distances{v} = OpLoad %{kind} %{kind}_ptr{v}", f"OpStore %out_{kind} %distances{v}"]
@@ -156,7 +181,7 @@ def _helpers_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] 
         if not fb:
             continue
         path = os.path.join(spirv_dir, name + SUFFIX + suffix + ".spvasm")
-        shader = gs_spvasm(meta.get("inputs", []), fb["location"], clip_count, cull_count)
+        shader = gs_spvasm(meta.get("inputs", []), fb["location"], clip_count, cull_count, fb.get("per_vertex"))
         yield path, shader
 
 
