@@ -77,6 +77,8 @@ class PeImage:
             # 0x3c holds e_lfanew. Saying "no MZ header" here would blame a signature that is present.
             raise PeFormatError(f"file is {len(data)} bytes, shorter than the 64-byte MS-DOS header")
         self.nt = struct.unpack_from("<I", data, 0x3C)[0]
+        if self.nt < 0x40:
+            raise PeFormatError(f"file is {len(data)} bytes, PE header at 0x{self.nt:x} overlaps the 64-byte MS-DOS header")
         if self.nt + 24 > len(data):
             raise PeFormatError(f"file is {len(data)} bytes, too short to hold the PE header at 0x{self.nt:x}")
         if data[self.nt:self.nt + 4] != b"PE\0\0":
@@ -100,6 +102,10 @@ class PeImage:
         self.size_of_headers = struct.unpack_from("<I", data, opt + 60)[0]
         self.subsystem = struct.unpack_from("<H", data, opt + 68)[0]
         self.dll_characteristics = struct.unpack_from("<H", data, opt + 70)[0]
+        if self.size_of_image == 0:
+            raise PeFormatError("invalid SizeOfImage 0")
+        if self.size_of_headers > self.size_of_image:
+            raise PeFormatError(f"SizeOfHeaders {self.size_of_headers} exceeds SizeOfImage {self.size_of_image}")
 
         # NumberOfRvaAndSizes counts the data directories: a slot past it is not a directory, whatever bytes it
         # holds (runtime/src/pe_loader.cpp reads them the same way). The count is the dword before the table.
@@ -243,42 +249,151 @@ def _imports(img: PeImage, kind: str, index: int, delay: bool = False) -> list[d
     return entries
 
 
-def _exports(img: PeImage) -> list[str]:
+def _inspect_exports(img: PeImage) -> dict:
     rva, size = img.directory(DIR_EXPORT)
     if not rva or size < 40:
-        return []
+        return {
+            "exports": [],
+            "forwarders": {},
+            "invalid_export_count": 0,
+            "invalid_exports": [],
+        }
     at = img.offset(rva, 40)
     if at is None:
         start = img.offset(rva)
         if start is not None and start + 40 > len(img.data):
             raise PeFormatError("truncated export directory")
-        return []
+        return {
+            "exports": [],
+            "forwarders": {},
+            "invalid_export_count": 0,
+            "invalid_exports": [],
+        }
     (_chars, _stamp, _major, _minor, _name, base, functions, name_count, addr_functions,
      addr_names, addr_ordinals) = struct.unpack_from("<IIHHIIIIIII", img.data, at)
 
-    def has_export_at(index: int) -> bool:
-        if index >= functions:
-            return False
-        # A zero RVA marks an unused slot. An RVA inside the export directory is a valid forwarder.
-        slot = img.offset(addr_functions + index * 4, 4)
-        return slot is not None and struct.unpack_from("<I", img.data, slot)[0] != 0
+    dir_begin = rva
+    dir_end = rva + size
 
-    named, names = set(), []
+    def get_export_rva(index: int) -> int | None:
+        if index >= functions:
+            return None
+        slot = img.offset(addr_functions + index * 4, 4)
+        if slot is None:
+            return None
+        return struct.unpack_from("<I", img.data, slot)[0]
+
+    names = []
+    forwarders = {}
+    forwarder_info = {}
+    invalid_exports = []
+    invalid_export_count = 0
+
+    def record_invalid(key: str, ord_num: int, exp_rva: int, reason: str) -> None:
+        nonlocal invalid_export_count
+        invalid_export_count += 1
+        if len(invalid_exports) < 5:
+            invalid_exports.append({
+                "symbol": key,
+                "ordinal": ord_num,
+                "rva": hex(exp_rva),
+                "reason": reason,
+            })
+
+    def process_export(key: str, index: int, exp_rva: int) -> None:
+        ord_num = base + index
+        if dir_begin <= exp_rva < dir_end:
+            target = img.string_at(exp_rva)
+            if not target:
+                record_invalid(key, ord_num, exp_rva, "unreadable_forwarder")
+                target = "?"
+            else:
+                dot = target.rfind(".")
+                if dot <= 0 or dot + 1 >= len(target) or any(ord(c) < 0x20 or ord(c) >= 0x7F for c in target):
+                    record_invalid(key, ord_num, exp_rva, "malformed_forwarder")
+                else:
+                    fwd_sym = target[dot + 1:]
+                    if fwd_sym.startswith("#"):
+                        ord_str = fwd_sym[1:]
+                        if not ord_str.isdigit() or int(ord_str) <= 0 or int(ord_str) > 0xFFFF:
+                            record_invalid(key, ord_num, exp_rva, "malformed_forwarder")
+            forwarders[key] = target
+            forwarder_info[key] = (ord_num, exp_rva, target)
+        elif exp_rva >= img.size_of_image:
+            record_invalid(key, ord_num, exp_rva, "out_of_bounds")
+
+    named = set()
     for i in range(min(name_count, MAX_ENTRIES)):
         name_at = img.offset(addr_names + i * 4, 4)
         ord_at = img.offset(addr_ordinals + i * 2, 2)
         if name_at is None or ord_at is None:
             break
+        symbol_rva = struct.unpack_from("<I", img.data, name_at)[0]
+        symbol = img.string_at(symbol_rva)
+        key = symbol if symbol is not None else "?"
         index = struct.unpack_from("<H", img.data, ord_at)[0]
-        if not has_export_at(index):
+        if index >= functions:
+            record_invalid(key, base + index, 0, "out_of_range_ordinal")
             continue
-        symbol = img.string_at(struct.unpack_from("<I", img.data, name_at)[0])
-        names.append(symbol if symbol is not None else "?")
+        exp_rva = get_export_rva(index)
+        if exp_rva is None or exp_rva == 0:
+            continue
+        names.append(key)
+        process_export(key, index, exp_rva)
         named.add(index)
+
     for i in range(min(functions, MAX_ENTRIES)):
-        if i not in named and has_export_at(i):
-            names.append(f"#{base + i}")
-    return names
+        if i not in named:
+            exp_rva = get_export_rva(i)
+            if exp_rva is not None and exp_rva != 0:
+                key = f"#{base + i}"
+                names.append(key)
+                process_export(key, i, exp_rva)
+
+    own_mod = img.string_at(_name) if _name else ""
+
+    def _stem(m: str) -> str:
+        s = m.lower()
+        return s[:-4] if s.endswith(".dll") else s
+
+    own_stem = _stem(own_mod) if own_mod else ""
+    if own_stem:
+        for fwd_key, (ord_num, exp_rva, target) in forwarder_info.items():
+            if target == "?" or "." not in target:
+                continue
+            dot = target.rfind(".")
+            if dot <= 0 or _stem(target[:dot]) != own_stem:
+                continue
+            visited = [fwd_key]
+            curr_target = target
+            has_loop = False
+            while True:
+                c_dot = curr_target.rfind(".")
+                if c_dot <= 0 or _stem(curr_target[:c_dot]) != own_stem:
+                    break
+                next_sym = curr_target[c_dot + 1:]
+                if next_sym in visited or len(visited) >= 8:
+                    has_loop = True
+                    break
+                if next_sym not in forwarders:
+                    break
+                visited.append(next_sym)
+                curr_target = forwarders[next_sym]
+                if curr_target == "?":
+                    break
+            if has_loop:
+                record_invalid(fwd_key, ord_num, exp_rva, "forwarder_loop")
+
+    return {
+        "exports": names,
+        "forwarders": forwarders,
+        "invalid_export_count": invalid_export_count,
+        "invalid_exports": invalid_exports,
+    }
+
+
+def _exports(img: PeImage) -> list[str]:
+    return _inspect_exports(img)["exports"]
 
 
 def _export_module_name(img: PeImage) -> str:
@@ -314,6 +429,203 @@ def _tls_callbacks(img: PeImage) -> int:
             break
         count += 1
     return count
+
+
+def _inspect_pdata(img: PeImage) -> dict:
+    """Exception Directory (.pdata / DIR_EXCEPTION = 3) validation and function table parsing.
+
+    Matches runtime/src/pe_loader.cpp (Loader::register_unwind) bounds, sorting, non-overlapping intervals,
+    and zero-length entries (e.g. symcryptk.dll). Non-x64 architectures (e.g. x86, ARM64) do not use x64
+    12-byte RUNTIME_FUNCTION tables and are gracefully rejected with informative format metadata.
+    """
+    rva, size = img.directory(DIR_EXCEPTION)
+    present = bool(rva and size)
+    if not present:
+        return {
+            "present": False,
+            "rva": "0x0",
+            "size": 0,
+            "entry_count": 0,
+            "parsed_count": 0,
+            "trailing_bytes": 0,
+            "mapped": False,
+            "truncated": False,
+            "zero_length_count": 0,
+            "inverted_count": 0,
+            "out_of_bounds_count": 0,
+            "unsorted_count": 0,
+            "overlap_count": 0,
+            "min_begin": None,
+            "max_end": None,
+            "valid": True,
+            "sample_errors": [],
+        }
+
+    is_x64 = img.machine == 0x8664
+    is_arm64 = img.machine == 0xAA64
+    entry_size = 8 if is_arm64 else 12
+    entry_count = size // entry_size
+    trailing_bytes = size % entry_size
+
+    bounds = img._range(rva)
+
+    if not is_x64:
+        if is_arm64:
+            fmt = "arm64"
+            reason = "ARM64 architecture uses 8-byte packed unwind records (not 12-byte RUNTIME_FUNCTION)"
+        elif img.machine == 0x14C:
+            fmt = "non-x64"
+            reason = "x86 architecture uses stack-based SEH (no 12-byte RUNTIME_FUNCTION table)"
+        else:
+            fmt = f"unsupported ({MACHINES.get(img.machine, hex(img.machine))})"
+            reason = f"unsupported machine architecture 0x{img.machine:x} (not x86-64)"
+        if bounds is None:
+            mapped = False
+            truncated = False
+        else:
+            start, end = bounds
+            mapped = True
+            needed_bytes = entry_count * entry_size
+            truncated = max(0, end - start) < needed_bytes
+        return {
+            "present": True,
+            "rva": hex(rva),
+            "size": size,
+            "entry_count": entry_count,
+            "parsed_count": 0,
+            "trailing_bytes": trailing_bytes,
+            "mapped": mapped,
+            "truncated": truncated,
+            "zero_length_count": 0,
+            "inverted_count": 0,
+            "out_of_bounds_count": 0,
+            "unsorted_count": 0,
+            "overlap_count": 0,
+            "min_begin": None,
+            "max_end": None,
+            "valid": True,
+            "sample_errors": [],
+            "format": fmt,
+            "rejection_reason": reason,
+        }
+
+    if bounds is None:
+        return {
+            "present": True,
+            "rva": hex(rva),
+            "size": size,
+            "entry_count": entry_count,
+            "parsed_count": 0,
+            "trailing_bytes": trailing_bytes,
+            "mapped": False,
+            "truncated": False,
+            "zero_length_count": 0,
+            "inverted_count": 0,
+            "out_of_bounds_count": 0,
+            "unsorted_count": 0,
+            "overlap_count": 0,
+            "min_begin": None,
+            "max_end": None,
+            "valid": False,
+            "sample_errors": [{"index": 0, "begin": "0x0", "end": "0x0", "unwind": "0x0", "reason": "unmapped"}],
+        }
+
+    start, end = bounds
+    available = max(0, end - start)
+    needed_bytes = entry_count * 12
+    truncated = available < needed_bytes
+    can_parse = min(needed_bytes, available) // 12
+    parsed_count = can_parse
+    mv = memoryview(img.data)
+    pdata_view = mv[start:start + can_parse * 12]
+
+    previous_begin = 0
+    previous_end = 0
+    min_begin = None
+    max_end = None
+    zero_length_count = 0
+    inverted_count = 0
+    out_of_bounds_count = 0
+    unsorted_count = 0
+    overlap_count = 0
+    sample_errors = []
+
+    def add_error(idx: int, b: int, e: int, u: int, reason: str) -> None:
+        if len(sample_errors) < 5:
+            sample_errors.append({
+                "index": idx,
+                "begin": hex(b),
+                "end": hex(e),
+                "unwind": hex(u),
+                "reason": reason,
+            })
+
+    for i, (b, e, u) in enumerate(struct.iter_unpack("<III", pdata_view)):
+        if min_begin is None or b < min_begin:
+            min_begin = b
+        if max_end is None or e > max_end:
+            max_end = e
+
+        entry_failed = False
+
+        if b == e:
+            zero_length_count += 1
+        elif e < b:
+            inverted_count += 1
+            add_error(i, b, e, u, "inverted")
+            entry_failed = True
+
+        info = u & ~1
+        if (b > img.size_of_image or e > img.size_of_image
+                or info > img.size_of_image or (img.size_of_image - info < 4)):
+            out_of_bounds_count += 1
+            if not entry_failed:
+                add_error(i, b, e, u, "out_of_bounds")
+                entry_failed = True
+
+        if i > 0:
+            if b < previous_begin:
+                unsorted_count += 1
+                if not entry_failed:
+                    add_error(i, b, e, u, "unsorted")
+                    entry_failed = True
+            elif b < previous_end:
+                overlap_count += 1
+                if not entry_failed:
+                    add_error(i, b, e, u, "overlap")
+                    entry_failed = True
+
+        previous_begin = b
+        if e >= b:
+            previous_end = max(previous_end, e)
+
+    valid = (
+        not truncated
+        and inverted_count == 0
+        and out_of_bounds_count == 0
+        and unsorted_count == 0
+        and overlap_count == 0
+    )
+
+    return {
+        "present": True,
+        "rva": hex(rva),
+        "size": size,
+        "entry_count": entry_count,
+        "parsed_count": parsed_count,
+        "trailing_bytes": trailing_bytes,
+        "mapped": True,
+        "truncated": truncated,
+        "zero_length_count": zero_length_count,
+        "inverted_count": inverted_count,
+        "out_of_bounds_count": out_of_bounds_count,
+        "unsorted_count": unsorted_count,
+        "overlap_count": overlap_count,
+        "min_begin": hex(min_begin) if min_begin is not None else None,
+        "max_end": hex(max_end) if max_end is not None else None,
+        "valid": valid,
+        "sample_errors": sample_errors,
+    }
 
 
 _apiset_cache: dict[str, bool] = {}
@@ -416,12 +728,13 @@ def _inspect(path: str, game_dir: str | None) -> dict:
     for entry in imports:
         entry["where"] = classify_dll(entry["dll"], game_dir)
 
-    exports = _exports(img)
+    exp = _inspect_exports(img)
+    exports = exp["exports"]
     own_names = (os.path.basename(path), _export_module_name(img))
     loads = dll_strings(img.data, {i["dll"].lower() for i in imports}, own_names)
     for entry in loads:
         entry["where"] = classify_dll(entry["name"], game_dir)
-    pdata_rva, pdata_size = img.directory(DIR_EXCEPTION)
+    pdata = _inspect_pdata(img)
     reloc_rva, reloc_size = img.directory(DIR_BASERELOC)
 
     return {
@@ -440,19 +753,66 @@ def _inspect(path: str, game_dir: str | None) -> dict:
         "imports": imports,
         "export_count": len(exports),
         "exports": exports,
-        "pdata_functions": pdata_size // 12 if pdata_rva and pdata_size >= 12 else 0,
+        "forwarders": exp["forwarders"],
+        "forwarder_count": len(exp["forwarders"]),
+        "invalid_export_count": exp["invalid_export_count"],
+        "invalid_exports": exp["invalid_exports"],
+        "pdata_functions": pdata["entry_count"],
+        "pdata": pdata,
         "tls_callbacks": _tls_callbacks(img),
         "runtime_load_candidates": loads,
     }
 
 
 def to_markdown(r: dict) -> str:
+    pdata_summary = f"{r['pdata_functions']:,}"
+    p = r.get("pdata")
+    if p and p.get("present"):
+        if p.get("format"):
+            pdata_summary += f" ({p['format']})"
+        elif p.get("valid"):
+            notes = []
+            if p.get("zero_length_count"):
+                notes.append(f"{p['zero_length_count']} zero-length")
+            if p.get("trailing_bytes"):
+                notes.append(f"{p['trailing_bytes']} trailing bytes ignored")
+            suffix = f", {', '.join(notes)}" if notes else ""
+            pdata_summary += f" (OK{suffix})"
+        else:
+            issues = []
+            if not p.get("mapped"):
+                issues.append("unmapped")
+            if p.get("truncated"):
+                issues.append("truncated")
+            if p.get("inverted_count"):
+                issues.append(f"{p['inverted_count']} inverted")
+            if p.get("out_of_bounds_count"):
+                issues.append(f"{p['out_of_bounds_count']} out of bounds")
+            if p.get("unsorted_count"):
+                issues.append(f"{p['unsorted_count']} unsorted")
+            if p.get("overlap_count"):
+                issues.append(f"{p['overlap_count']} overlapping")
+            pdata_summary += f" (INVALID: {', '.join(issues)})"
+
+    exp_summary = f"{r['export_count']:,}"
+    fwd_count = r.get("forwarder_count", 0)
+    inv_count = r.get("invalid_export_count", 0)
+    exp_parts = []
+    if fwd_count > 0:
+        exp_parts.append(f"{fwd_count} forwarded")
+    if inv_count > 0:
+        inv_details = [f"{inv['symbol']} ({inv['reason']})" for inv in r.get("invalid_exports", [])]
+        details_str = f": {', '.join(inv_details)}" if inv_details else ""
+        exp_parts.append(f"INVALID: {inv_count} invalid{details_str}")
+    if exp_parts:
+        exp_summary += f" ({'; '.join(exp_parts)})"
+
     out = [f"# {r['file']}", "",
            f"- {r['machine']}, {'DLL' if r['is_dll'] else 'EXE'}, subsystem {r['subsystem']}, {r['size']:,} bytes",
            f"- image base {r['image_base']}, size {r['size_of_image']:,}, entry RVA {r['entry_rva']}",
            f"- relocations: {'yes' if r['has_relocs'] else 'NO (must load at preferred base)'}; "
            f"ASLR flag: {r['dynamic_base']}",
-           f"- .pdata functions: {r['pdata_functions']:,}; TLS callbacks: {r['tls_callbacks']}; exports: {r['export_count']}",
+           f"- .pdata functions: {pdata_summary}; TLS callbacks: {r['tls_callbacks']}; exports: {exp_summary}",
            "", "## Sections", "", "| name | rva | vsize | exec | write | entropy | |", "|---|---|---|---|---|---|---|"]
     for s in r["sections"]:
         flag = "**encrypted?**" if s["looks_encrypted"] else ""
@@ -480,6 +840,16 @@ def to_markdown(r: dict) -> str:
             out.append("")
             out.append(", ".join(f"`{f}`" for f in imp["functions"]))
             out.append("")
+    forwarders = r.get("forwarders", {})
+    if forwarders:
+        out += ["", "## Forwarded Exports", "", "| export | target |", "|---|---|"]
+        items = sorted(forwarders.items())
+        for exp_name, target in items[:50]:
+            esc_name = exp_name.replace("|", r"\|")
+            esc_target = target.replace("|", r"\|")
+            out.append(f"| `{esc_name}` | `{esc_target}` |")
+        if len(items) > 50:
+            out.append(f"| ... and {len(items) - 50} more | |")
     return "\n".join(out) + "\n"
 
 
@@ -565,7 +935,15 @@ def main(argv: list[str] | None = None) -> int:
             continue
         enc = [s["name"] for s in r["sections"] if s["looks_encrypted"]]
         shim = sum(len(i["functions"]) for i in r["imports"] if i["where"] == "shim")
-        print(f"{r['file']:<40} {r['machine']:<7} subsys={r['subsystem']!s:<7} pdata={r['pdata_functions']:<7} "
+        pdata_status = ""
+        p = r.get("pdata")
+        if p and p.get("present"):
+            if p.get("format"):
+                pdata_status = p["format"]
+            else:
+                pdata_status = "OK" if p.get("valid") else "INVALID"
+        pdata_col = f"{r['pdata_functions']} {pdata_status}".strip()
+        print(f"{r['file']:<40} {r['machine']:<7} subsys={r['subsystem']!s:<7} pdata={pdata_col:<9} "
               f"shim-imports={shim:<5} encrypted={','.join(enc) or '-'}")
     return rc
 

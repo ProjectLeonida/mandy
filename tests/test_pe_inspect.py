@@ -976,5 +976,341 @@ class SectionBoundaryReadTest(unittest.TestCase):
                 self.assertEqual(pe_inspect._tls_callbacks(pe_inspect.PeImage(bytes(image2))), 1)
 
 
+class TestExportForwarders(unittest.TestCase):
+    def inspect_buf(self, buf: bytes) -> dict:
+        return pe_inspect._inspect_exports(pe_inspect.PeImage(buf))
+
+    def test_case1_normal_exports_and_unused_slots(self):
+        """Case 1: Normal code exports + unused zero-RVA slot skipped (forwarders empty, invalid_export_count 0)."""
+        data = with_exports([0x1000, 0, 0x1010], {0: "Alpha", 2: "Beta"}, base=1)
+        exp = self.inspect_buf(data)
+        self.assertEqual(exp["exports"], ["Alpha", "Beta"])
+        self.assertEqual(exp["forwarders"], {})
+        self.assertEqual(exp["invalid_export_count"], 0)
+        self.assertEqual(exp["invalid_exports"], [])
+
+    def test_case2_named_forwarded_export(self):
+        """Case 2: Named forwarded export (RVA inside export directory [0x1700, 0x1800))."""
+        data = with_exports([0x1000, FORWARDER], {0: "NormalFunc", 1: "Sleep"}, base=10)
+        exp = self.inspect_buf(data)
+        self.assertEqual(exp["exports"], ["NormalFunc", "Sleep"])
+        self.assertEqual(exp["forwarders"], {"Sleep": "other.Target"})
+        self.assertEqual(exp["invalid_export_count"], 0)
+
+        with tempfile.NamedTemporaryFile(suffix=".dll", delete=False) as f:
+            f.write(data)
+            f.flush()
+            tmp_path = f.name
+        try:
+            report = pe_inspect.inspect(tmp_path, None)
+            md = pe_inspect.to_markdown(report)
+            self.assertIn("(1 forwarded)", md)
+            self.assertIn("## Forwarded Exports", md)
+            self.assertIn("| `Sleep` | `other.Target` |", md)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_case3_ordinal_only_forwarder(self):
+        """Case 3: Ordinal-only forwarded export (index not in named)."""
+        data = with_exports([0x1000, FORWARDER], {0: "Func"}, base=10)
+        exp = self.inspect_buf(data)
+        self.assertEqual(exp["exports"], ["Func", "#11"])
+        self.assertEqual(exp["forwarders"], {"#11": "other.Target"})
+        self.assertEqual(exp["invalid_export_count"], 0)
+
+    def test_case4_aliased_named_forwarders(self):
+        """Case 4: Two export names mapping to the same forwarded EAT index."""
+        data = with_exports([FORWARDER], {0: "AliasA"}, base=1)
+        buf = bytearray(data)
+        place(buf, 0x1700, struct.pack("<IIHHIIIIIII", 0, 0, 0, 0, 0x1780, 1, 1, 2,
+                                       EXPORT_FUNCS, 0x1C00, 0x1C80))
+        place(buf, 0x1C00, struct.pack("<II", 0x1D00, 0x1D10))
+        place(buf, 0x1C80, struct.pack("<HH", 0, 0))
+        place(buf, 0x1D00, b"AliasA\0")
+        place(buf, 0x1D10, b"AliasB\0")
+        exp = self.inspect_buf(bytes(buf))
+        self.assertEqual(exp["exports"], ["AliasA", "AliasB"])
+        self.assertEqual(exp["forwarders"], {"AliasA": "other.Target", "AliasB": "other.Target"})
+        self.assertEqual(exp["invalid_export_count"], 0)
+
+    def test_case5_out_of_bounds_export_rva(self):
+        """Case 5: Out-of-bounds export RVA (>= size_of_image)."""
+        data = with_exports([0x3000], {0: "BadFunc"}, base=10)
+        exp = self.inspect_buf(data)
+        self.assertEqual(exp["exports"], ["BadFunc"])
+        self.assertEqual(exp["invalid_export_count"], 1)
+        self.assertEqual(len(exp["invalid_exports"]), 1)
+        self.assertEqual(exp["invalid_exports"][0]["symbol"], "BadFunc")
+        self.assertEqual(exp["invalid_exports"][0]["reason"], "out_of_bounds")
+
+        with tempfile.NamedTemporaryFile(suffix=".dll", delete=False) as f:
+            f.write(data)
+            f.flush()
+            tmp_path = f.name
+        try:
+            report = pe_inspect.inspect(tmp_path, None)
+            md = pe_inspect.to_markdown(report)
+            self.assertIn("INVALID: 1 invalid: BadFunc (out_of_bounds)", md)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_case6_unreadable_forwarder_and_error_cap(self):
+        """Case 6: Unreadable forwarder string and invalid error cap at <= 5."""
+        buf = bytearray(build_image())
+        dir_entry = 0x58 + 112 + pe_inspect.DIR_EXPORT * 8
+        struct.pack_into("<II", buf, dir_entry, 0x1700, 0x2000)
+        place(buf, 0x1700, struct.pack("<IIHHIIIIIII", 0, 0, 0, 0, 0x1780, 1, 1, 1,
+                                       EXPORT_FUNCS, 0x1C00, 0x1C80))
+        place(buf, EXPORT_FUNCS, struct.pack("<I", 0x3500))
+        place(buf, 0x1C00, struct.pack("<I", 0x1D00))
+        place(buf, 0x1C80, struct.pack("<H", 0))
+        place(buf, 0x1D00, b"BrokenFwd\0")
+        exp = self.inspect_buf(bytes(buf))
+        self.assertEqual(exp["forwarders"], {"BrokenFwd": "?"})
+        self.assertEqual(exp["invalid_export_count"], 1)
+        self.assertEqual(exp["invalid_exports"][0]["reason"], "unreadable_forwarder")
+
+        bad_slots = [0x4000 + i * 0x100 for i in range(8)]
+        bad_names = {i: f"Bad{i}" for i in range(8)}
+        data_bad = with_exports(bad_slots, bad_names, base=1)
+        exp_bad = self.inspect_buf(data_bad)
+        self.assertEqual(exp_bad["invalid_export_count"], 8)
+        self.assertEqual(len(exp_bad["invalid_exports"]), 5)
+
+    def test_case7_combined_forwarder_and_invalid_summary(self):
+        """Case 7: DLL with both valid forwarder and invalid export displays both in markdown."""
+        data = with_exports([0x1000, FORWARDER, 0x3000], {1: "Fwd|Func", 2: "BadFunc"}, base=10)
+        with tempfile.NamedTemporaryFile(suffix=".dll", delete=False) as f:
+            f.write(data)
+            f.flush()
+            tmp_path = f.name
+        try:
+            report = pe_inspect.inspect(tmp_path, None)
+            md = pe_inspect.to_markdown(report)
+            self.assertIn("(1 forwarded; INVALID: 1 invalid: BadFunc (out_of_bounds))", md)
+            self.assertIn("| `Fwd\\|Func` | `other.Target` |", md)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_case8_out_of_range_ordinal_and_small_dir_size(self):
+        """Case 8: Ordinal index >= functions recorded as invalid, dir_size < 40 returns empty."""
+        data = with_exports([0x1000], {0: "NormalFunc"}, base=1)
+        buf = bytearray(data)
+        # Point the ordinal table to index 5 while NumberOfFunctions is 1
+        place(buf, 0x1C80, struct.pack("<H", 5))
+        exp = self.inspect_buf(bytes(buf))
+        self.assertNotIn("NormalFunc", exp["exports"])
+        self.assertEqual(exp["exports"], ["#1"])
+        self.assertEqual(exp["forwarders"], {})
+        self.assertEqual(exp["invalid_export_count"], 1)
+        self.assertEqual(len(exp["invalid_exports"]), 1)
+        self.assertEqual(exp["invalid_exports"][0]["symbol"], "NormalFunc")
+        self.assertEqual(exp["invalid_exports"][0]["ordinal"], 6)
+        self.assertEqual(exp["invalid_exports"][0]["reason"], "out_of_range_ordinal")
+
+        # When slot is 0, exports is empty, but out-of-range ordinal is still recorded
+        data_zero = with_exports([0], {0: "NormalFunc"}, base=1)
+        buf_zero = bytearray(data_zero)
+        place(buf_zero, 0x1C80, struct.pack("<H", 5))
+        exp_zero = self.inspect_buf(bytes(buf_zero))
+        self.assertEqual(exp_zero["exports"], [])
+        self.assertEqual(exp_zero["invalid_export_count"], 1)
+
+        # dir_size < 40 returns empty dict
+        dir_entry = 0x58 + 112 + pe_inspect.DIR_EXPORT * 8
+        struct.pack_into("<II", buf, dir_entry, 0x1700, 39)
+        exp_small = self.inspect_buf(bytes(buf))
+        self.assertEqual(exp_small["exports"], [])
+        self.assertEqual(exp_small["forwarders"], {})
+        self.assertEqual(exp_small["invalid_export_count"], 0)
+
+    def test_case9_out_of_range_ordinal_markdown_report(self):
+        """Case 9: Markdown report includes out_of_range_ordinal invalid export."""
+        data = with_exports([0x1000], {0: "NormalFunc"}, base=1)
+        buf = bytearray(data)
+        place(buf, 0x1C80, struct.pack("<H", 5))
+        with tempfile.NamedTemporaryFile(suffix=".dll", delete=False) as f:
+            f.write(buf)
+            f.flush()
+            tmp_path = f.name
+        try:
+            report = pe_inspect.inspect(tmp_path, None)
+            md = pe_inspect.to_markdown(report)
+            self.assertIn("INVALID: 1 invalid: NormalFunc (out_of_range_ordinal)", md)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_case10_malformed_forwarder_targets(self):
+        """Case 10: Malformed forwarder target strings recorded as malformed_forwarder."""
+        bad_targets = [
+            b"nodot\0",
+            b".leadingdot\0",
+            b"trailingdot.\0",
+            b"other.#\0",
+            b"other.#notanumber\0",
+            b"other.#0\0",
+            b"other.#70000\0",
+            b"bad\x01target.Func\0",
+        ]
+        for target_bytes in bad_targets:
+            with self.subTest(target=target_bytes):
+                data = bytearray(with_exports([FORWARDER], {0: "TestFunc"}, base=1))
+                place(data, FORWARDER, target_bytes)
+                exp = self.inspect_buf(bytes(data))
+                self.assertEqual(exp["invalid_export_count"], 1)
+                self.assertEqual(exp["invalid_exports"][0]["symbol"], "TestFunc")
+                self.assertEqual(exp["invalid_exports"][0]["reason"], "malformed_forwarder")
+
+    def test_case11_intra_module_forwarder_self_loop(self):
+        """Case 11: Forwarder targeting itself in the same module is recorded as forwarder_loop."""
+        # sample.dll exporting Sleep -> sample.Sleep or sample.dll.Sleep
+        for target in (b"sample.Sleep\0", b"sample.dll.Sleep\0"):
+            with self.subTest(target=target):
+                data = bytearray(with_exports([FORWARDER], {0: "Sleep"}, base=1))
+                place(data, FORWARDER, target)
+                exp = self.inspect_buf(bytes(data))
+                self.assertEqual(exp["invalid_export_count"], 1)
+                self.assertEqual(exp["invalid_exports"][0]["symbol"], "Sleep")
+                self.assertEqual(exp["invalid_exports"][0]["reason"], "forwarder_loop")
+
+                with tempfile.NamedTemporaryFile(suffix=".dll", delete=False) as f:
+                    f.write(data)
+                    f.flush()
+                    tmp_path = f.name
+                try:
+                    report = pe_inspect.inspect(tmp_path, None)
+                    md = pe_inspect.to_markdown(report)
+                    self.assertIn("INVALID: 1 invalid: Sleep (forwarder_loop)", md)
+                finally:
+                    os.unlink(tmp_path)
+
+    def test_case12_intra_module_forwarder_cyclic_loop(self):
+        """Case 12: Mutual/cyclic intra-module forwarders (Alpha -> Beta, Beta -> Alpha)."""
+        fwd_a = 0x1790
+        fwd_b = 0x17B0
+        data = bytearray(with_exports([fwd_a, fwd_b], {0: "Alpha", 1: "Beta"}, base=1))
+        place(data, fwd_a, b"sample.Beta\0")
+        place(data, fwd_b, b"sample.Alpha\0")
+        exp = self.inspect_buf(bytes(data))
+        self.assertEqual(exp["invalid_export_count"], 2)
+        symbols = {inv["symbol"] for inv in exp["invalid_exports"]}
+        self.assertEqual(symbols, {"Alpha", "Beta"})
+        for inv in exp["invalid_exports"]:
+            self.assertEqual(inv["reason"], "forwarder_loop")
+
+    def test_case13_intra_module_forwarder_depth_limit(self):
+        """Case 13: Forwarder chain >= 8 within the same module is detected as a loop."""
+        # Chain F0 -> F1 -> ... -> F8
+        slots = []
+        names = {}
+        base_addr = 0x1790
+        for k in range(9):
+            addr = base_addr + k * 11
+            slots.append(addr)
+            names[k] = f"F{k}"
+        data = bytearray(with_exports(slots, names, base=1))
+        for k in range(8):
+            addr = base_addr + k * 11
+            place(data, addr, f"sample.F{k+1}\0".encode())
+        # The 9th points to an external module (valid in isolation)
+        place(data, base_addr + 8 * 11, b"kernel32.Sleep\0")
+
+        exp = self.inspect_buf(bytes(data))
+        # F0's chain length reaches 8, so F0 triggers forwarder_loop
+        f0_inv = [inv for inv in exp["invalid_exports"] if inv["symbol"] == "F0"]
+        self.assertEqual(len(f0_inv), 1)
+        self.assertEqual(f0_inv[0]["reason"], "forwarder_loop")
+
+    def test_case14_pe_header_edge_cases(self):
+        """Case 14: e_lfanew overlapping DOS header, SizeOfImage 0, SizeOfHeaders > SizeOfImage."""
+        base_data = build_image()
+
+        # e_lfanew < 0x40
+        data_short_nt = bytearray(base_data)
+        struct.pack_into("<I", data_short_nt, 0x3C, 0x20)
+        with self.assertRaisesRegex(pe_inspect.PeFormatError, "overlaps the 64-byte MS-DOS header"):
+            pe_inspect.PeImage(bytes(data_short_nt))
+
+        # SizeOfImage == 0
+        data_zero_img = bytearray(base_data)
+        struct.pack_into("<I", data_zero_img, 0x58 + 56, 0)
+        with self.assertRaisesRegex(pe_inspect.PeFormatError, "invalid SizeOfImage 0"):
+            pe_inspect.PeImage(bytes(data_zero_img))
+
+        # SizeOfHeaders > SizeOfImage
+        data_hdr_overflow = bytearray(base_data)
+        struct.pack_into("<I", data_hdr_overflow, 0x58 + 60, 0x4000)
+        with self.assertRaisesRegex(pe_inspect.PeFormatError, "exceeds SizeOfImage"):
+            pe_inspect.PeImage(bytes(data_hdr_overflow))
+
+
+class TestExceptionDirectoryArchitectureValidation(unittest.TestCase):
+    """Clean-room unit tests ensuring non-x64 machine architectures (e.g. i386, ARM64)
+    gracefully reject 12-byte RUNTIME_FUNCTION parsing with informative diagnostics."""
+
+    def test_x86_machine_exception_directory_rejected_as_non_x64(self):
+        # 32-bit x86 image (IMAGE_FILE_MACHINE_I386 = 0x14C)
+        data = build_image(is64=False, with_directories=True)
+        img = pe_inspect.PeImage(data)
+        pdata = pe_inspect._inspect_pdata(img)
+        self.assertTrue(pdata["present"])
+        self.assertEqual(pdata["format"], "non-x64")
+        self.assertEqual(pdata["parsed_count"], 0)
+        self.assertIn("x86", pdata["rejection_reason"])
+        self.assertIn("stack-based SEH", pdata["rejection_reason"])
+
+        with tempfile.NamedTemporaryFile(suffix=".dll", delete=False) as f:
+            f.write(data)
+            f.flush()
+            tmp_path = f.name
+        try:
+            report = pe_inspect.inspect(tmp_path, None)
+            md = pe_inspect.to_markdown(report)
+            self.assertIn("(non-x64)", md)
+            self.assertNotIn("(OK)", md)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_arm64_machine_exception_directory_rejected_as_arm64(self):
+        # ARM64 image (IMAGE_FILE_MACHINE_ARM64 = 0xAA64)
+        buf = bytearray(build_image(is64=True, with_directories=True))
+        # Change machine to ARM64 (0xAA64) at FileHeader + 0 (0x44)
+        struct.pack_into("<H", buf, 0x44, 0xAA64)
+        # Give 32 bytes of pdata (4 entries of 8-byte ARM64 records)
+        dir_entry = 0x58 + 112 + pe_inspect.DIR_EXCEPTION * 8
+        struct.pack_into("<II", buf, dir_entry, 0x1800, 32)
+        img = pe_inspect.PeImage(bytes(buf))
+        pdata = pe_inspect._inspect_pdata(img)
+        self.assertTrue(pdata["present"])
+        self.assertEqual(pdata["format"], "arm64")
+        self.assertEqual(pdata["entry_count"], 4)  # 32 // 8
+        self.assertEqual(pdata["parsed_count"], 0)
+        self.assertIn("ARM64", pdata["rejection_reason"])
+        self.assertIn("8-byte", pdata["rejection_reason"])
+
+        with tempfile.NamedTemporaryFile(suffix=".dll", delete=False) as f:
+            f.write(buf)
+            f.flush()
+            tmp_path = f.name
+        try:
+            report = pe_inspect.inspect(tmp_path, None)
+            md = pe_inspect.to_markdown(report)
+            self.assertIn("(arm64)", md)
+            self.assertNotIn("(OK)", md)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_unknown_architecture_exception_directory_rejected(self):
+        # ARM Thumb-2 (0x1C4)
+        buf = bytearray(build_image(is64=False, with_directories=True))
+        struct.pack_into("<H", buf, 0x44, 0x01C4)
+        img = pe_inspect.PeImage(bytes(buf))
+        pdata = pe_inspect._inspect_pdata(img)
+        self.assertTrue(pdata["present"])
+        self.assertIn("unsupported", pdata["format"])
+        self.assertEqual(pdata["parsed_count"], 0)
+        self.assertIn("unsupported machine", pdata["rejection_reason"])
+
+
 if __name__ == "__main__":
     unittest.main()
