@@ -2472,7 +2472,8 @@ The trace will enumerate them.
   - `DEPTH_STENCIL2`'s per-face read and write masks go to each face's `VkStencilOpState` (the front face's in the
     description, the back face's beside it), so `OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported` is TRUE:
     with `OMSetFrontAndBackStencilRef`'s per-face references, both of that cap's parts.
-  - `RASTERIZER1`/`2`'s float depth bias is truncated to the integer the PSO path takes, with a log.
+  - `RASTERIZER1`/`2`'s `FLOAT DepthBias` is preserved verbatim in both
+    `VkPipelineRasterizationStateCreateInfo::depthBiasConstantFactor` and the D24-as-D32 fragment-bias path.
 - **Mesh PSO:** the MS (`ms` index entry by FSSM hash) and PS on the mesh stage. It has no vertex input or input
   assembly; the input layout, topology type and strip cut are ignored, as D3D12 ignores them for mesh PSOs. Topology
   and strides are not dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065/07066). Creation

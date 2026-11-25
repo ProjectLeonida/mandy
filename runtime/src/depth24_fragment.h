@@ -34,16 +34,16 @@
 namespace leonida {
 
 struct Depth24Bias {
-    int constant = 0;     // D3D12_RASTERIZER_DESC::DepthBias
-    float slope = 0.0f;   // SlopeScaledDepthBias
-    float clamp = 0.0f;   // DepthBiasClamp: > 0 caps the bias, < 0 floors it, 0 leaves it
+    float constant = 0.0f;  // D3D12_RASTERIZER_DESC::DepthBias / RASTERIZER1/2 FLOAT DepthBias
+    float slope = 0.0f;     // SlopeScaledDepthBias
+    float clamp = 0.0f;     // DepthBiasClamp: > 0 caps the bias, < 0 floors it, 0 leaves it
     float levels = 16777215.0f;
-    bool any() const { return constant != 0 || slope != 0.0f; }
+    bool any() const { return constant != 0.0f || slope != 0.0f; }
 };
 
-// D3D's constant term in float: (float)DepthBias * r, with r the float nearest 1 / (2^24 - 1).
-inline float depth24_bias_constant(int bias, float levels=16777215.0f) {
-    return float(bias) * float(1.0 / double(levels));
+// D3D's constant term in float: DepthBias * r, with r the float nearest 1 / (2^24 - 1) (or the packed16 level count).
+inline float depth24_bias_constant(float bias, float levels = 16777215.0f) {
+    return bias * float(1.0 / double(levels));
 }
 
 namespace spirv24 {

@@ -7791,6 +7791,11 @@ struct StencilFaceMasks {
     UINT8 write = D3D12_DEFAULT_STENCIL_WRITE_MASK;
 };
 
+struct GraphicsStreamExtras {
+    bool has_float_depth_bias = false;
+    float depth_bias = 0.0f;
+};
+
 struct PipelineStream {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics{};
     bool back_masks = false;  // DEPTH_STENCIL2: back_stencil holds the back face's masks
@@ -7798,6 +7803,7 @@ struct PipelineStream {
     D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
     D3D12_SHADER_BYTECODE ms{};
     D3D12_SHADER_BYTECODE as{};
+    GraphicsStreamExtras extras{};
     bool has_cs = false;
     bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
 };
@@ -7984,7 +7990,8 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
                 bias = d.DepthBias;
             }
             r.DepthBias = INT(bias);
-            if (ok && FLOAT(r.DepthBias) != bias) log_once("a fractional depth bias is truncated; bias x1000", int(bias * 1000));
+            out.extras.has_float_depth_bias = ok;
+            out.extras.depth_bias = bias;
             break;
         }
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
@@ -8210,7 +8217,9 @@ public:
         if (seen.insert(line).second) std::fprintf(stderr, "%s\n", line);
     }
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
-                            const D3D12_SHADER_BYTECODE* as = nullptr, const StencilFaceMasks* back_masks = nullptr) {
+                            const D3D12_SHADER_BYTECODE* as = nullptr,
+                            const StencilFaceMasks* back_masks = nullptr,
+                            const GraphicsStreamExtras* extras = nullptr) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
@@ -8369,9 +8378,11 @@ public:
                      int(samples));
             depth24_fragment = false;
         }
-        const leonida::Depth24Bias depth24_bias{desc.RasterizerState.DepthBias,
-                                                desc.RasterizerState.SlopeScaledDepthBias,
-                                                desc.RasterizerState.DepthBiasClamp,packed16_fallback?65535.0f:16777215.0f};
+        const float depth_bias =
+            (extras && extras->has_float_depth_bias) ? extras->depth_bias : float(desc.RasterizerState.DepthBias);
+        const leonida::Depth24Bias depth24_bias{depth_bias, desc.RasterizerState.SlopeScaledDepthBias,
+                                              desc.RasterizerState.DepthBiasClamp,
+                                              packed16_fallback ? 65535.0f : 16777215.0f};
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
             const std::span<const std::uint8_t> raw_bytes{
@@ -8693,9 +8704,9 @@ public:
         raster.frontFace = r.FrontCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
         // The D24-as-D32 pixel stage applies the bias itself, in D24 units (depth24_fragment above): the
         // rasterizer's bias stays off and zero, so its clamp needs no depthBiasClamp feature either.
-        raster.depthBiasEnable = !depth24_fragment && (r.DepthBias || r.SlopeScaledDepthBias != 0.0f);
+        raster.depthBiasEnable = !depth24_fragment && (depth_bias != 0.0f || r.SlopeScaledDepthBias != 0.0f);
         if (raster.depthBiasEnable) {
-            raster.depthBiasConstantFactor = float(r.DepthBias);
+            raster.depthBiasConstantFactor = depth_bias;
             raster.depthBiasClamp = r.DepthBiasClamp;
             raster.depthBiasSlopeFactor = r.SlopeScaledDepthBias;
         }
@@ -13751,7 +13762,8 @@ public:
         pipeline->attach_device(identity());
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
                                          : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as,
-                                                                     stream.back_masks ? &stream.back_stencil : nullptr);
+                                                                     stream.back_masks ? &stream.back_stencil : nullptr,
+                                                                     &stream.extras);
         if (FAILED(hr)) {
             pipeline->Release();
             return finish(hr);

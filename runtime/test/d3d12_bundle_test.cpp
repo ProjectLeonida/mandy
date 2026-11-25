@@ -750,6 +750,159 @@ bool layer_checks(ID3D12Device* device, const std::vector<std::uint8_t>& vs, con
             return false;
         }
     }
+
+    // RASTERIZER1 and RASTERIZER2 stream subobjects preserve FLOAT DepthBias (checked with a D24 depth target
+    // cleared to 0.0f and GREATER depth test: 0.0f bias fails against 0.0f, while 1.5f bias pushes above 0.0f).
+    {
+        Rig r;
+        CHECK(r.init(device, vs, ps));
+        Ref<ID3D12Device2> dev2;
+        CHECK(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dev2.p))));
+        struct alignas(void*) SubRootSig {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+            ID3D12RootSignature* v = nullptr;
+        };
+        struct alignas(void*) SubShader {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t{};
+            D3D12_SHADER_BYTECODE v{};
+        };
+        struct alignas(void*) SubInput {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT;
+            D3D12_INPUT_LAYOUT_DESC v{};
+        };
+        struct alignas(void*) SubTopology {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY;
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE v = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        };
+        struct alignas(void*) SubRtv {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
+            D3D12_RT_FORMAT_ARRAY v{};
+        };
+        struct alignas(void*) SubDsvFormat {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT;
+            DXGI_FORMAT v = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        };
+        struct alignas(void*) SubDepth {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL;
+            D3D12_DEPTH_STENCIL_DESC v{};
+        };
+        struct alignas(void*) SubRast1 {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1;
+            D3D12_RASTERIZER_DESC1 v{};
+        };
+        struct alignas(void*) SubRast2 {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2;
+            D3D12_RASTERIZER_DESC2 v{};
+        };
+        static const D3D12_INPUT_ELEMENT_DESC elems[2] = {
+            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+            {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D12_APPEND_ALIGNED_ELEMENT,
+             D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        };
+        const D3D12_DEPTH_STENCIL_DESC depth_greater{TRUE, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_COMPARISON_FUNC_GREATER};
+
+        D3D12_RESOURCE_DESC dsv_tex{};
+        dsv_tex.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        dsv_tex.Width = dsv_tex.Height = target_px;
+        dsv_tex.DepthOrArraySize = dsv_tex.MipLevels = 1;
+        dsv_tex.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        dsv_tex.SampleDesc.Count = 1;
+        dsv_tex.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        D3D12_CLEAR_VALUE dsv_clear{};
+        dsv_clear.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+        Ref<ID3D12Resource> depth_target;
+        CHECK(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &dsv_tex,
+                                                        D3D12_RESOURCE_STATE_DEPTH_WRITE, &dsv_clear,
+                                                        IID_PPV_ARGS(&depth_target.p))));
+        Ref<ID3D12DescriptorHeap> dsv_heap;
+        const D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        CHECK(SUCCEEDED(device->CreateDescriptorHeap(&dsv_heap_desc, IID_PPV_ARGS(&dsv_heap.p))));
+        const D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_heap->GetCPUDescriptorHandleForHeapStart();
+        device->CreateDepthStencilView(depth_target.p, nullptr, dsv);
+
+        const auto make_r1 = [&](FLOAT bias, Ref<ID3D12PipelineState>& out) {
+            struct Stream {
+                SubRootSig rs;
+                SubShader vs;
+                SubShader ps;
+                SubInput ia;
+                SubTopology top;
+                SubRtv rtv;
+                SubDsvFormat dsv_fmt;
+                SubDepth ds;
+                SubRast1 r1;
+            } s{};
+            s.rs.v = r.root1.p;
+            s.vs = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs.data(), vs.size()}};
+            s.ps = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {ps.data(), ps.size()}};
+            s.ia.v = {elems, 2};
+            s.rtv.v.NumRenderTargets = 1;
+            s.rtv.v.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            s.ds.v = depth_greater;
+            s.r1.v.FillMode = D3D12_FILL_MODE_SOLID;
+            s.r1.v.CullMode = D3D12_CULL_MODE_NONE;
+            s.r1.v.DepthBias = bias;
+            s.r1.v.DepthClipEnable = TRUE;
+            const D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(s), &s};
+            return SUCCEEDED(dev2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&out.p)));
+        };
+        const auto make_r2 = [&](FLOAT bias, Ref<ID3D12PipelineState>& out) {
+            struct Stream {
+                SubRootSig rs;
+                SubShader vs;
+                SubShader ps;
+                SubInput ia;
+                SubTopology top;
+                SubRtv rtv;
+                SubDsvFormat dsv_fmt;
+                SubDepth ds;
+                SubRast2 r2;
+            } s{};
+            s.rs.v = r.root1.p;
+            s.vs = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs.data(), vs.size()}};
+            s.ps = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {ps.data(), ps.size()}};
+            s.ia.v = {elems, 2};
+            s.rtv.v.NumRenderTargets = 1;
+            s.rtv.v.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            s.ds.v = depth_greater;
+            s.r2.v.FillMode = D3D12_FILL_MODE_SOLID;
+            s.r2.v.CullMode = D3D12_CULL_MODE_NONE;
+            s.r2.v.DepthBias = bias;
+            s.r2.v.DepthClipEnable = TRUE;
+            const D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(s), &s};
+            return SUCCEEDED(dev2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&out.p)));
+        };
+        Ref<ID3D12PipelineState> r1_zero, r1_bias, r2_bias;
+        CHECK(make_r1(0.0f, r1_zero));
+        CHECK(make_r1(1.5f, r1_bias));
+        CHECK(make_r2(1.5f, r2_bias));
+
+        const auto draw_quad = [&](ID3D12PipelineState* pso, const char* expected) {
+            std::string grid_text;
+            HRESULT close = S_OK;
+            if (!r.render([&](Rig& rig, ID3D12GraphicsCommandList* l) {
+                    const D3D12_VIEWPORT viewport{0, 0, target_px, target_px, 0, 1};
+                    const D3D12_RECT scissor{0, 0, LONG(target_px), LONG(target_px)};
+                    l->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+                    l->OMSetRenderTargets(1, &rig.rtv, FALSE, &dsv);
+                    l->RSSetViewports(1, &viewport);
+                    l->RSSetScissorRects(1, &scissor);
+                    l->SetPipelineState(pso);
+                    l->SetGraphicsRootSignature(rig.root1.p);
+                    rig.vertices(l, vb_quad);
+                    rig.offset(l, 0, 0);
+                    rig.tint(l, tint_red);
+                    l->IASetPrimitiveTopology(strip);
+                    l->DrawInstanced(4, 1, 0, 0);
+                }, grid_text, close))
+                return false;
+            return close == S_OK && grid_text == expected;
+        };
+        CHECK(draw_quad(r1_zero.p, BLANK4 " " BLANK4));
+        CHECK(draw_quad(r1_bias.p, ROWS4("RRRRBBBB") " " BLANK4));
+        CHECK(draw_quad(r2_bias.p, ROWS4("RRRRBBBB") " " BLANK4));
+    }
     return true;
 }
 
