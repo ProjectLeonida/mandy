@@ -18,6 +18,16 @@ fail and one summary line; `-j N` sets how many run at once (`-j 1` is the disco
 every file's output. Files run side by side, so a test writes only into its own temporary folder (`tempfile`), never
 to a fixed path, and does not rely on another file having run first.
 
+The processes of a parallel run share what they compile: the first file that imports a module compiles it into a
+temporary folder, the others read it from there, and the folder is removed when the run ends. This is for
+`tools/rdna2spirv.py`: importing it from source takes 7.2 s on Python 3.14.7 and 7.5 s on 3.13.13 (Windows 11),
+because since 3.12 CPython's tokenizer copies the rest of a source string at every f-string `{` and the file has
+some 4,800 f-strings (run as a script it is read line by line and starts in 0.4 s). Most files here set
+`sys.dont_write_bytecode` before they import it, so where no `__pycache__` entry exists for it each one compiled it
+again. That is every file when the environment forbids bytecode (`PYTHONDONTWRITEBYTECODE`, `-B`): on 8 cores the
+478 files other than `test_m*.py` took 533 s that way and take 93 s now, the same as with bytecode allowed. A file
+run on its own with `python -m unittest` still compiles the translator itself.
+
 Every file here must call `tools/rdna2spirv.py` (directly, through `support.py`, or by running the tool) and assert
 on what it emitted. A test that reimplements the instruction in Python passes whatever the translator does, so it is
 not a regression test. `tests/test_semantic_translator_use.py` enforces this; the interpreter self-tests and the
