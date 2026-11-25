@@ -20,6 +20,7 @@
 // same handler records their text without a shim.
 //
 // The file can quote whatever the game prints: it stays on the player's machine (AGENTS.md, "No game data").
+// A successful query adds the memory region containing the address of an access violation.
 #pragma once
 
 #include <windows.h>
