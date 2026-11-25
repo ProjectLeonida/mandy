@@ -432,11 +432,49 @@ int test_change_tracking() {
     EXPECT(table.read_slots(0, 0, nullptr));
 
     // Direct write_to_buffer matches build_gpu_buffer byte-for-byte for both clear_pad modes.
+    table.write_to_buffer(nullptr, false);
     for (bool clear_pad : {false, true}) {
         const auto expected = table.build_gpu_buffer(clear_pad);
         std::vector<std::uint32_t> direct(table.size_dwords(), 0xccccccccu);
         table.write_to_buffer(direct.data(), clear_pad);
         EXPECT(direct == expected);
+    }
+
+    // Multi-slot read_slots matches build_gpu_buffer across partial and full ranges.
+    {
+        const auto full = table.build_gpu_buffer(false);
+        const std::uint32_t cap = std::uint32_t(table.capacity());
+        std::vector<std::uint32_t> sub(std::size_t(cap) * 10, 0xddddddddu);
+        EXPECT(table.read_slots(0, cap, sub.data()));
+        EXPECT(std::memcmp(sub.data(), full.data() + 1, std::size_t(cap) * 10 * sizeof(std::uint32_t)) == 0);
+        std::vector<std::uint32_t> mid(7 * 10, 0xeeeeeeeeu);
+        EXPECT(table.read_slots(5, 7, mid.data()));
+        EXPECT(std::memcmp(mid.data(), full.data() + 1 + 5 * 10, 7 * 10 * sizeof(std::uint32_t)) == 0);
+    }
+
+    // Once all_changed_ is set (after clear or grow), subsequent inserts do not accumulate changed_slots_.
+    {
+        table.clear();
+        EXPECT(table.insert(k1, 11));
+        EXPECT(table.insert(k2, 22));
+        const DescriptorTable::Changes c = table.take_changes();
+        EXPECT(c.all && c.slots.empty());
+    }
+
+    // Repeated mutations without flushing compact changed_slots_ without falsely setting changes.all.
+    {
+        DescriptorTable small(16);
+        small.take_changes();
+        for (std::uint32_t iter = 0; iter < 64; ++iter) {
+            EXPECT(small.insert(k1, iter + 1));
+            EXPECT(small.insert(k2, iter + 100));
+        }
+        const DescriptorTable::Changes c = small.take_changes();
+        EXPECT(!c.all && !c.slots.empty() && c.slots.size() <= small.capacity());
+        std::vector<std::uint32_t> uniq = c.slots;
+        std::sort(uniq.begin(), uniq.end());
+        uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+        EXPECT(uniq.size() == 2);
     }
     return 0;
 }

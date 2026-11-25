@@ -6,11 +6,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 namespace leonida {
@@ -100,6 +102,10 @@ struct DescriptorEntry {
     std::uint32_t pad = 0; // 0 when empty, kSlotOccupiedMarker when occupied
 };
 static_assert(sizeof(DescriptorEntry) == 40);
+static_assert(std::is_trivially_copyable_v<DescriptorEntry>);
+static_assert(offsetof(DescriptorEntry, key) == 0);
+static_assert(offsetof(DescriptorEntry, index) == 32);
+static_assert(offsetof(DescriptorEntry, pad) == 36);
 
 class DescriptorTable {
 public:
@@ -225,13 +231,19 @@ public:
     // Word 0 is mask; followed by entries[mask + 1] of 10 dwords: key[8], index, pad.
     std::vector<std::uint32_t> build_gpu_buffer(bool clear_pad = false) const {
         std::lock_guard lock(mutex_);
-        std::vector<std::uint32_t> out(1 + entries_.size() * 10, 0);
+        std::vector<std::uint32_t> out(1 + entries_.size() * 10);
         out[0] = mask_;
-        for (std::size_t s = 0; s < entries_.size(); ++s) {
-            const std::size_t base = 1 + s * 10;
-            std::memcpy(&out[base], entries_[s].key, sizeof(entries_[s].key));
-            out[base + 8] = entries_[s].index;
-            out[base + 9] = clear_pad ? 0 : entries_[s].pad;
+        if (!entries_.empty()) {
+            if (!clear_pad) {
+                std::memcpy(out.data() + 1, entries_.data(), entries_.size() * sizeof(DescriptorEntry));
+            } else {
+                std::uint32_t* dst = out.data() + 1;
+                for (const auto& entry : entries_) {
+                    std::memcpy(dst, &entry, offsetof(DescriptorEntry, pad));
+                    dst[9] = 0;
+                    dst += 10;
+                }
+            }
         }
         return out;
     }
@@ -260,12 +272,7 @@ public:
         if (count > 0 && !dest) return false;
         std::lock_guard lock(mutex_);
         if (first > entries_.size() || count > entries_.size() - first) return false;
-        for (std::uint32_t i = 0; i < count; ++i) {
-            const DescriptorEntry& entry = entries_[first + i];
-            std::memcpy(dest + i * 10, entry.key, sizeof(entry.key));
-            dest[i * 10 + 8] = entry.index;
-            dest[i * 10 + 9] = entry.pad;
-        }
+        if (count > 0) std::memcpy(dest, &entries_[first], std::size_t(count) * sizeof(DescriptorEntry));
         return true;
     }
 
@@ -276,18 +283,28 @@ public:
         auto* out = static_cast<std::uint8_t*>(dest);
         std::memcpy(out, &mask_, sizeof(mask_));
         out += sizeof(mask_);
+        if (entries_.empty()) return;
+        if (!clear_pad) {
+            std::memcpy(out, entries_.data(), entries_.size() * sizeof(DescriptorEntry));
+            return;
+        }
+        const std::uint32_t zero = 0;
         for (const auto& entry : entries_) {
-            std::uint32_t slot[10];
-            std::memcpy(slot, entry.key, sizeof(entry.key));
-            slot[8] = entry.index;
-            slot[9] = clear_pad ? 0 : entry.pad;
-            std::memcpy(out, slot, sizeof(slot));
-            out += sizeof(slot);
+            std::memcpy(out, &entry, offsetof(DescriptorEntry, pad));
+            std::memcpy(out + offsetof(DescriptorEntry, pad), &zero, sizeof(zero));
+            out += sizeof(DescriptorEntry);
         }
     }
 
 private:
-    void mark(std::uint32_t slot) { changed_slots_.push_back(slot); }
+    void mark(std::uint32_t slot) {
+        if (all_changed_) return;
+        changed_slots_.push_back(slot);
+        if (changed_slots_.size() > entries_.size()) {
+            std::sort(changed_slots_.begin(), changed_slots_.end());
+            changed_slots_.erase(std::unique(changed_slots_.begin(), changed_slots_.end()), changed_slots_.end());
+        }
+    }
 
     // All eight slots for the incoming key are occupied. Try moving one resident
     // to the first empty slot beyond that window, within its own eight probes.
@@ -314,8 +331,8 @@ private:
     }
 
     InsertResult insert_locked(const std::uint32_t key[8], std::uint32_t index) {
+        const std::uint32_t h = hash_descriptor_key(key, hash_kind_);
         while (true) {
-            const std::uint32_t h = hash_descriptor_key(key, hash_kind_);
             int empty_slot = -1;
 
             for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
