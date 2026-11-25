@@ -632,6 +632,11 @@ def main():
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
+    if args.max_ops < 1:
+        ap.error("--max-ops must be at least 1")
+    if args.programs < 1:
+        ap.error("--programs must be at least 1")
+
     if args.list_ops:
         for op, form in OP_FORMS.items():
             tag = "gfx103x" if op in GFX103X_OPS else "gfx908 syntax"
