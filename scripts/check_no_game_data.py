@@ -42,6 +42,7 @@ MAGICS = (
     ("RPF9 archive", 0, b"9FPR"),
     ("RPF9 archive", 0, b"RPF9"),
     ("TTPF texture pool", 0, b"TTPF"),
+    ("local BCPack predictor profile", 0, b"BCPHIST1"),
     ("RAGE resource", 0, b"RSC7"),
     ("RAGE resource", 0, b"RSC8"),
     ("RAGE resource", 0, b"RSCC"),
