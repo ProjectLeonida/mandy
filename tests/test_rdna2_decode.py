@@ -91,6 +91,16 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 self.assertEqual(invalid, 0)
                 self.assertIn(op + " v1, v2, v3, v4", asm)
 
+    def test_vop3_0x16b_v_mul_lo_i32(self):
+        # VOP3 opcode 0x16b, vdst=v1, src0=v2 (0x102), src1=v3 (0x103): (0xD4000000 | (0x16b<<16) | 1), ((0x103<<9) | 0x102)
+        code = words(0xD56B0001, 0x00020702)
+        info = rdna2_decode.decode_bytes(code)
+        self.assertEqual(info["invalid"], 0)
+        self.assertEqual(info["insns"][0]["op"], "v_mul_lo_i32")
+        asm, invalid, _ = shader_disasm.disasm(code, "gfx1013", backend="python")
+        self.assertEqual(invalid, 0)
+        self.assertIn("v_mul_lo_i32 v1, v2, v3", asm)
+
     def test_sopp_endpgm_branch_and_waitcnt(self):
         # s_waitcnt vmcnt(0) lgkmcnt(0) = 0xBF8C0070; s_cbranch_scc1 -4 = 0xBF85FFFC;
         # s_branch -20 = 0xBF82FFEC; s_endpgm = 0xBF810000
