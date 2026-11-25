@@ -548,6 +548,27 @@ inline bool a8_mixed_backing(VkFormat a, VkFormat b) {
 #endif
 }
 
+// Two depth formats whose depth aspect has the same encoding but which are not the same VkFormat: D32_SFLOAT and
+// D32_SFLOAT_S8_UINT, D16_UNORM and D16_UNORM_S8_UINT, X8_D24_UNORM_PACK32 and D24_UNORM_S8_UINT. D3D12 copies the
+// depth plane between them; Vulkan's vkCmdCopyImage requires depth/stencil formats to match exactly
+// (VUID-vkCmdCopyImage-srcImage-01548), and an NVIDIA driver handed D32_SFLOAT_S8_UINT -> D32_SFLOAT writes past the
+// end of the D32 image (the world-start WRITE_INVALID). The replay stages these through a buffer, where the depth
+// aspect has the same texel layout on both sides.
+inline bool depth_format_pair(VkFormat a, VkFormat b) {
+    const auto encoding = [](VkFormat format) -> int {
+        switch (format) {
+        case VK_FORMAT_D32_SFLOAT:
+        case VK_FORMAT_D32_SFLOAT_S8_UINT: return 32;
+        case VK_FORMAT_X8_D24_UNORM_PACK32:
+        case VK_FORMAT_D24_UNORM_S8_UINT: return 24;
+        case VK_FORMAT_D16_UNORM:
+        case VK_FORMAT_D16_UNORM_S8_UINT: return 16;
+        default: return 0;
+        }
+    };
+    return a != b && encoding(a) && encoding(a) == encoding(b);
+}
+
 inline bool depth_colour_pair(const ResourceBinding& a, const ResourceBinding& b) {
     const auto family = [](VkFormat format) -> int {
         switch (format) {
@@ -967,7 +988,7 @@ inline ReplayResult unsupported_at(int line) {
 
 // The pipelines of a submission that are not built yet. prepare() adds each of them once and goes on; build_pipelines()
 // then compiles them all and puts them where prepare() left them out. Holds pointers to registered pipelines: valid
-// while the context's resource lock is held.
+// while the context's pipeline lock is held.
 class PipelineCompiles {
 public:
     // Where a prepared command finds its pipeline: an index for `built`, plus one; 0 when it needs none.
@@ -992,12 +1013,33 @@ public:
     VkPipeline built(Ticket ticket) const { return jobs_[ticket - 1].built; }
     const std::vector<Use>& uses() const { return uses_; }  // in the order of the commands
 
+    // Whether this batch already attempted (pipeline, flags); writes its outcome (built handle or VK_NULL_HANDLE) to `out`.
+    bool lookup(const GraphicsPipeline* graphics, const ComputePipeline* compute, std::uint32_t flags,
+                VkPipeline& out) const {
+        const void* const pipeline = graphics ? static_cast<const void*>(graphics) : compute;
+        const auto it = tickets_.find({pipeline, flags});
+        if (it == tickets_.end()) return false;
+        out = jobs_[it->second - 1].built;
+        return true;
+    }
+
+    // Whether this batch already attempted the job named by `other`'s `ticket`.
+    bool contains_ticket(const PipelineCompiles& other, Ticket ticket) const {
+        VkPipeline unused = VK_NULL_HANDLE;
+        const Job& job = other.jobs_[ticket - 1];
+        return lookup(job.graphics, job.compute, job.flags, unused);
+    }
+
     // Compiles all of them through run(count, job) (PipelineWorkers::run): the large ones one after another, as without
-    // workers, beside the others.
+    // workers, beside the others. Jobs already attempted in `prior` reuse that outcome without re-invoking build().
     template<typename Run>
-    void build(Run&& run) {
+    void build(Run&& run, const PipelineCompiles* prior = nullptr) {
         std::vector<std::size_t> single, large;
-        for (std::size_t i = 0; i < jobs_.size(); ++i) (is_large(jobs_[i]) ? large : single).push_back(i);
+        for (std::size_t i = 0; i < jobs_.size(); ++i) {
+            if (prior && prior->lookup(jobs_[i].graphics, jobs_[i].compute, jobs_[i].flags, jobs_[i].built)) continue;
+            (is_large(jobs_[i]) ? large : single).push_back(i);
+        }
+        if (single.empty() && large.empty()) return;
         const auto compile = [this](std::size_t i) {
             Job& job = jobs_[i];
             job.built = job.graphics ? job.graphics->variant(job.flags) : job.compute->build(job.compute->build_context);
@@ -1009,6 +1051,26 @@ public:
             else
                 for (const std::size_t each : large) compile(each);
         });
+    }
+
+    // Compiles jobs serially in command order without workers, stopping at the first fatal refusal (a failed draw, a
+    // failed indirect dispatch, or any failed dispatch under strict_replay()). Matches serial prepare() short-circuit
+    // semantics while allowing the caller to compile outside resource_mutex_.
+    void build_serial(const PipelineCompiles* prior = nullptr) {
+        std::vector<bool> done(jobs_.size(), false);
+        for (const Use& use : uses_) {
+            const std::size_t i = use.ticket - 1;
+            if (!done[i]) {
+                done[i] = true;
+                Job& job = jobs_[i];
+                if (!prior || !prior->lookup(job.graphics, job.compute, job.flags, job.built)) {
+                    job.built =
+                        job.graphics ? job.graphics->variant(job.flags) : job.compute->build(job.compute->build_context);
+                }
+            }
+            if (!jobs_[i].built && (use.user == User::draw || use.user == User::indirect_dispatch || strict_replay()))
+                return;
+        }
     }
 
 private:
@@ -1306,7 +1368,7 @@ struct Prepared {
     // A depth <-> colour copy: the source into `staged` (image to buffer), then `staged` into the destination.
     VkBuffer staged = VK_NULL_HANDLE;
     std::vector<VkBufferImageCopy> staged_reads, staged_writes;
-    VkDeviceSize clear_pattern_bytes = 0;      // rectangular UAV clear on a compute-only queue
+    VkDeviceSize clear_pattern_bytes = 0;      // staged transfer UAV clear (compute-only rects or sliced/rect 3D)
     std::vector<VkImageSubresourceRange> discards;  // DiscardResource: the subresources to discard
     VkBuffer write_buffer = VK_NULL_HANDLE;          // WriteBufferImmediate: where the address lands
     VkDeviceSize write_offset = 0;
@@ -1589,6 +1651,13 @@ inline VkImageSubresourceRange planes_for_layout(const ResourceBinding& resource
 
 inline VkExtent2D mip_extent(const ResourceBinding& resource, std::uint32_t mip) {
     return {std::max(1u, resource.width >> mip), std::max(1u, resource.height >> mip)};
+}
+
+// Nonempty, clipped rectangle. The entire constant pattern fits in one vkCmdUpdateBuffer for wide texels.
+inline VkExtent2D volume_clear_tile(VkExtent2D rect, std::uint32_t texel_bytes) {
+    const std::uint32_t max_texels = 65536 / texel_bytes;
+    const auto width = std::min(rect.width, max_texels);
+    return {width, std::min(rect.height, max_texels / width)};
 }
 
 // Into `out`, replacing what it held: a kept PreparedList entry reuses the vector's storage.
@@ -2192,7 +2261,9 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         return ReplayResult::invalid_copy;
     if (buffer.size > UINT64_MAX - buffer.buffer_offset) return ReplayResult::invalid_copy;
     const VkDeviceSize backing_offset = buffer.buffer_offset + offset;
-    if (backing_offset % alignment && !copy.tile_footprint) return unsupported_at(__LINE__);
+    // A host-import prefix may be word aligned without being texel aligned (e.g. +4 for RGBA16).
+    // The replay stages those copies through aligned scratch; VkBufferCopy still needs word alignment.
+    if (backing_offset % alignment && backing_offset % 4 && !copy.tile_footprint) return unsupported_at(__LINE__);
     VkBufferImageCopy region{};
     region.bufferOffset = backing_offset;
     region.bufferRowLength = placed.row_pitch / format.bytes * format.block;
@@ -2212,13 +2283,13 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     return ReplayResult::success;
 }
 
-// CopyTiles accepts arbitrary byte offsets into its linear buffer, while VkBufferImageCopy requires texel/block
+// CopyTiles byte offsets and word-aligned imported host prefixes may violate VkBufferImageCopy texel/block
 // alignment (VUID-vkCmdCopyBufferToImage-dstImage-07975). Stage only the occupied texels/blocks through aligned
 // transfer scratch; leave partial-tile padding alone.
 inline bool stage_unaligned_tile(const ReplayFunctions& vk, Prepared& p, const ResourceBinding& image,
                                  const BlockFormat& fmt, bool upload) {
     auto& region = p.buffer_image_copies.front();
-    if (!fmt.bytes || !fmt.block || image.rgb96 ||
+    if (!vk.copy_buffer || !fmt.bytes || !fmt.block || image.rgb96 ||
         (image.depth24_as_float && region.imageSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT))
         return false;
     const VkDeviceSize blocks_w = (VkDeviceSize(region.imageExtent.width) + fmt.block - 1) / fmt.block;
@@ -2549,7 +2620,9 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
             return ReplayResult::success;
         };
         if (draw.mesh) return skip(indirect_stats::mesh);
-        if (draw.topology != 4) return skip(indirect_stats::topology);
+        static_assert(indirect_stats::topology_supported(topology_rect_list) &&
+                      !indirect_stats::topology_supported(topology_quad_list));
+        if (!indirect_stats::topology_supported(draw.topology)) return skip(indirect_stats::topology);
         if (!vk.draw_indirect_first_instance) return skip(indirect_stats::first_instance);
         if (!entry_available) return skip(indirect_stats::entry);
         if (draw.indexed && !vk.bind_robust_index_view) return skip(indirect_stats::robust_index);
@@ -2665,13 +2738,19 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
     if (unbound || !p.pipeline) {
-        if (vk.compiles && pipeline->variant && pipeline->built && !pipeline->async_build) {
+        const bool indirect_rect_variant = arguments && (unbound & GraphicsPipeline::rectangle_stage);
+        if (vk.compiles && pipeline->variant && pipeline->built && !pipeline->async_build && !indirect_rect_variant) {
             p.pipeline = pipeline->built(unbound);
             if (!p.pipeline) p.compile = vk.compiles->add(*pipeline, unbound);
         } else {
             p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
             if (!p.pipeline && pipeline->async_build && !strict_replay()) {
                 if (arguments) indirect_stats::skip(indirect_stats::Event::replay_skip, indirect_stats::pending_pipeline);
+                p.skipped = true;
+                return ReplayResult::success;
+            }
+            if (!p.pipeline && !pipeline->async_build && indirect_rect_variant) {
+                indirect_stats::skip(indirect_stats::Event::replay_skip, indirect_stats::topology);
                 p.skipped = true;
                 return ReplayResult::success;
             }
@@ -2902,30 +2981,50 @@ public:
     std::vector<detail::PreparedKhrPostbuild> khr_postbuilds;
 };
 
-// Ends the preparation of a submission whose prepare() calls used `compiles` and returned `result` (the first that
-// failed, if any): builds the pipelines through run(count, job), puts them into `lists`, and returns what the calls would
-// have returned had they built each pipeline themselves. Every use in `compiles` comes from a command before the one that
-// failed, so a pipeline that cannot be built counts first, at the earliest command that uses it: it fails the list of a
-// draw or an indirect dispatch, and a dispatch is dropped as prepare() drops one.
-template<typename Run>
-ReplayResult build_pipelines(PipelineCompiles& compiles, std::span<PreparedList> lists, ReplayResult result,
-                             Run&& run) {
-    if (compiles.empty()) return result;
-    compiles.build(run);
+// Checks the outcomes of a compiled PipelineCompiles batch against `result` (the first prepare() failure, if any).
+// Every use in `compiles` comes from a command before the one that failed, so a pipeline that cannot be built counts
+// first, at the earliest command that uses it: it fails the list of a draw or an indirect dispatch, and a dispatch is
+// dropped as prepare() drops one. Non-strict failed dispatches already logged in `prior` are not logged twice.
+inline ReplayResult check_compiled_pipelines(const PipelineCompiles& compiles, ReplayResult result,
+                                             const PipelineCompiles* prior = nullptr) {
     for (const PipelineCompiles::Use& use : compiles.uses()) {
         if (compiles.built(use.ticket)) continue;
         if (use.user == PipelineCompiles::User::draw) return unsupported_at(__LINE__);
         if (use.user == PipelineCompiles::User::indirect_dispatch || strict_replay()) return unresolved_at(__LINE__);
-        unresolved_at(__LINE__);
+        if (!prior || !prior->contains_ticket(compiles, use.ticket)) unresolved_at(__LINE__);
     }
-    if (result != ReplayResult::success) return result;
+    return result;
+}
+
+inline ReplayResult finish_compiled_pipelines(const PipelineCompiles& compiles, std::span<PreparedList> lists,
+                                              ReplayResult result, const PipelineCompiles* prior = nullptr) {
+    const ReplayResult checked = check_compiled_pipelines(compiles, result, prior);
+    if (checked != ReplayResult::success) return checked;
     for (PreparedList& list : lists) {
         for (detail::Prepared& command : list.commands)
             if (command.compile) command.pipeline.pipeline = compiles.built(command.compile);
         for (std::size_t i = 0; i < list.draw_count; ++i)
             if (list.draws[i].compile) list.draws[i].pipeline = compiles.built(list.draws[i].compile);
     }
-    return result;
+    return checked;
+}
+
+// Ends the preparation of a submission whose prepare() calls used `compiles` and returned `result` (the first that
+// failed, if any): builds the pipelines through run(count, job), puts them into `lists`, and returns what the calls would
+// have returned had they built each pipeline themselves.
+template<typename Run>
+ReplayResult build_pipelines(PipelineCompiles& compiles, std::span<PreparedList> lists, ReplayResult result,
+                             Run&& run, const PipelineCompiles* prior = nullptr) {
+    if (compiles.empty()) return result;
+    compiles.build(run, prior);
+    return finish_compiled_pipelines(compiles, lists, result, prior);
+}
+
+inline ReplayResult build_pipelines_serial(PipelineCompiles& compiles, std::span<PreparedList> lists,
+                                           ReplayResult result, const PipelineCompiles* prior = nullptr) {
+    if (compiles.empty()) return result;
+    compiles.build_serial(prior);
+    return finish_compiled_pipelines(compiles, lists, result, prior);
 }
 
 inline ReplayResult plan_occlusion_segments(PreparedList& out) {
@@ -3067,8 +3166,8 @@ inline void plan_statistics_segments(PreparedList& out) {
 }
 
 // Overlapping pipeline-statistics queries (D3D-252): the same physical-segment layout the occlusion planner
-// builds, in the statistics pool. Each Begin and End of a statistics query â€” and every non-timestamp resolve
-// while one runs, because its helper dispatch would be counted â€” closes the one open physical query and opens
+// builds, in the statistics pool. Each Begin and End of a statistics query — and every non-timestamp resolve
+// while one runs, because its helper dispatch would be counted — closes the one open physical query and opens
 // a new one, so each logical query keeps a contiguous slot range and its result is the sum of that range
 // (statistics_sum.comp). A Begin or End of another query kind leaves the segments alone.
 inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
@@ -3453,36 +3552,46 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                              : view_format != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
             const bool reinterpret = view_format != p.binding.format && attachment && view_attachable && !packed_rgb9e5;
             if (view.exact_clear_format && view_format != p.binding.format && !packed_rgb9e5)
-                return ReplayResult::unsupported;
+                return unsupported_at(__LINE__);
             const VkFormat clear_format = reinterpret ? view_format : p.binding.format;
             if (!uav_clear::decode(clear_format, p.element, p.clear_color))
                 return unsupported_at(__LINE__);
             if (reinterpret) p.clear_format = view_format;
-            // Compute list barriers have no attachment stages, and a dedicated compute queue cannot render.
-            // Copy the encoded texel bits from a filled buffer. Transfers cannot implement a predicated clear.
-            if ((vk.queue_stages & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) &&
-                (!uav->rects.empty() || reinterpret || predicated)) {
-                if (predicated || p.binding.volume || !vk.copy_scratch || !vk.fill_buffer || !vk.copy_buffer_to_image ||
-                    (p.element.size != 1 && p.element.size != 2 && p.element.size != 4))
-                    return ReplayResult::unsupported;
+            // A 3D transfer clear covers a whole mip and a compute-only queue cannot render rectangles.
+            // Copy the encoded texel bits instead. These copies cannot implement a predicated clear.
+            const bool sliced = p.binding.volume && view.layer_count != std::max(1u, p.binding.depth >> view.mip);
+            const bool stage_volume = p.binding.volume && (sliced || !uav->rects.empty());
+            const bool stage_compute = (vk.queue_stages & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) &&
+                                       (!uav->rects.empty() || reinterpret || predicated);
+            if (stage_volume || stage_compute) {
+                if (predicated) return unsupported_at(__LINE__);
+                if (stage_volume && view_format != p.binding.format && !packed_rgb9e5)
+                    return unsupported_at(__LINE__);
+                if (!vk.copy_scratch || !vk.copy_buffer_to_image ||
+                    (p.element.size <= 4 ? !vk.fill_buffer : (!stage_volume || !vk.update_buffer)))
+                    return unsupported_at(__LINE__);
                 const auto rects = uav->rects.empty() ? std::span<const Rect>(&whole_view, 1) :
                                                         std::span<const Rect>(uav->rects);
-                detail::clip(rects, detail::mip_extent(p.binding, view.mip), view.layer_count, p.rects);
+                detail::clip(rects, detail::mip_extent(p.binding, view.mip), p.range.layerCount, p.rects);
                 if (p.rects.empty()) { p.skip = true; continue; }
                 for (const auto& rect : p.rects) {
                     VkBufferImageCopy region{};
-                    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, view.mip, view.first_layer, view.layer_count};
+                    region.imageSubresource = {p.range.aspectMask, view.mip, p.range.baseArrayLayer, p.range.layerCount};
                     region.imageOffset = {rect.rect.offset.x, rect.rect.offset.y, 0};
                     region.imageExtent = {rect.rect.extent.width, rect.rect.extent.height, 1};
-                    const VkDeviceSize pixels = VkDeviceSize(region.imageExtent.width) * region.imageExtent.height;
-                    const VkDeviceSize stride = VkDeviceSize(view.layer_count) * p.element.size;
-                    if (pixels > (UINT64_MAX - 3) / stride) return ReplayResult::unsupported;
+                    const auto tile = stage_volume ? detail::volume_clear_tile(rect.rect.extent, p.element.size)
+                                                   : rect.rect.extent;
+                    const VkDeviceSize pixels = VkDeviceSize(tile.width) * tile.height;
+                    const VkDeviceSize stride = VkDeviceSize(p.range.layerCount) * p.element.size;
+                    if (pixels > (UINT64_MAX - 3) / stride) return unsupported_at(__LINE__);
+                    // Pad only the private pattern for vkCmdFillBuffer; copies use the exact image extent.
                     p.clear_pattern_bytes = std::max(p.clear_pattern_bytes, (pixels * stride + 3) & ~VkDeviceSize(3));
                     p.staged_writes.push_back(region);
                 }
                 VkDeviceSize offset = 0;
-                if (!vk.copy_scratch(p.clear_pattern_bytes, p.staged, offset) || !p.staged || offset % 4)
-                    return ReplayResult::unsupported;
+                if (!vk.copy_scratch(p.clear_pattern_bytes, p.staged, offset) || !p.staged ||
+                    offset % std::max(4u, p.element.size) || offset > UINT64_MAX - p.clear_pattern_bytes)
+                    return unsupported_at(__LINE__);
                 for (auto& region : p.staged_writes) region.bufferOffset = offset;
                 continue;
             }
@@ -3562,7 +3671,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                      static_cast<unsigned long long>(n));
                 }
                 const ResourceBinding& image = upload ? p.binding : p.source;
-                if (result == ReplayResult::success && texture_copy->tile_footprint && !p.buffer_image_copies.empty()) {
+                if (result == ReplayResult::success && !p.buffer_image_copies.empty()) {
                     const auto& region = p.buffer_image_copies.front();
                     const BlockFormat fmt = copy_block_format(image, region.imageSubresource.aspectMask);
                     const std::uint32_t alignment =
@@ -3627,7 +3736,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             if (result == ReplayResult::success && !p.image_copies.empty() &&
                 (p.image_copies[0].srcSubresource.aspectMask != p.image_copies[0].dstSubresource.aspectMask ||
-                 a8_mixed_backing(p.source.format, p.binding.format))) {
+                 a8_mixed_backing(p.source.format, p.binding.format) ||
+                 depth_format_pair(p.source.format, p.binding.format))) {
                 // Depth <-> colour: vkCmdCopyImage cannot mix aspects, so each region goes image -> scratch -> image,
                 // tightly packed. Depth aspects want 4-byte buffer offsets; 16 covers every texel size here. The two
                 // backings of A8_UNORM take the same route: one byte per texel on both sides, but Vulkan does not
@@ -4614,7 +4724,27 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                         detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
                                                VK_PIPELINE_STAGE_TRANSFER_BIT);
-                        vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, layout, 1, &region);
+                        if (!p.binding.volume) {
+                            vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, layout, 1, &region);
+                            continue;
+                        }
+                        // Tiles within this rectangle are disjoint. Reuse the same scratch texels for every
+                        // tile and W slice; keep only one region per clipped rectangle in the prepared list.
+                        const auto tile = detail::volume_clear_tile({region.imageExtent.width, region.imageExtent.height},
+                                                                    p.element.size);
+                        auto piece = region;
+                        for (std::uint32_t z = 0; z < uav->view.layer_count; ++z) {
+                            piece.imageOffset.z = std::int32_t(uav->view.first_layer + z);
+                            for (std::uint32_t y = 0; y < region.imageExtent.height; y += tile.height) {
+                                piece.imageOffset.y = region.imageOffset.y + std::int32_t(y);
+                                piece.imageExtent.height = std::min(tile.height, region.imageExtent.height - y);
+                                for (std::uint32_t x = 0; x < region.imageExtent.width; x += tile.width) {
+                                    piece.imageOffset.x = region.imageOffset.x + std::int32_t(x);
+                                    piece.imageExtent.width = std::min(tile.width, region.imageExtent.width - x);
+                                    vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, layout, 1, &piece);
+                                }
+                            }
+                        }
                     }
                 });
                 continue;
