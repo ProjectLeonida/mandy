@@ -2436,8 +2436,10 @@ Pipeline creation:
   8; `1` is the one thread there was (RT-ASYNC-COMPILE-POOL). A worker takes the first job it may start: the builds a
   draw or dispatch asked for in the order they came, then the warm-up's by module size, then the checkpoint. All but
   one of the workers at most are in heavy builds at a time, which are the warm-up's and the demanded ones of large
-  pipelines (below; by size, whatever `LEONIDA_SERIAL_BIG_COMPILES` says), so one worker is left for a small build a
-  submission asked for: it no longer waits behind a module the driver takes minutes over, or behind the warm-up. Of
+  pipelines (below; by size, whatever `LEONIDA_SERIAL_BIG_COMPILES` says), so one worker is left for a build that is
+  not heavy and a submission asked for: it no longer waits behind a module the driver takes minutes over, or behind
+  the warm-up. Light builds are not limited, so graphics pipelines below the large size (a mesh pipeline of a few
+  hundred KiB, say) can still occupy every worker at once. Of
   the very large builds, 1 MiB of SPIR-V or more, one runs at a time, demanded or not
   (`LEONIDA_COMPILE_HEAVY_MAX=<n>`; `0`: no limit of their own): the memory gate lets in what fits the free memory,
   and a driver may fail modules it takes half an hour over when it compiles several side by side. A large build
