@@ -15648,6 +15648,13 @@ public:
         D3D12_RESOURCE_DESC canonical = *desc;
         canonical.Format = pc_format(canonical.Format);  // the console's D16S8 family as D24S8
         desc = &canonical;
+        // Its clear value too, or the clear format's family (118) would not match the resource's (D24S8) below.
+        D3D12_CLEAR_VALUE canonical_clear{};
+        if (clear) {
+            canonical_clear = *clear;
+            canonical_clear.Format = pc_format(canonical_clear.Format);
+            clear = &canonical_clear;
+        }
         if (heap->host_address()) {
             // An existing heap is not an arena range, and the placed path addresses resources by arena offset.
             log_once("a placed resource in an existing heap (OpenExistingHeapFromAddress) is not supported yet; "
