@@ -1,9 +1,42 @@
 #pragma once
 
+#include <cstring>
+
 #include "xg_xs_layout.h"
 #include "../src/vulkan_backend.h"
 
 namespace rt::d3d12 {
+
+namespace detail {
+
+// Scan mapped staging memory in 64-byte unrolled uint64_t chunks rather than byte-by-byte std::any_of, reducing
+// uncached write-combined read transactions when inspecting whether a newly uploaded title image is still all zero.
+inline bool has_nonzero_bytes(const std::uint8_t* data, std::size_t bytes) {
+    if (!data || !bytes) return false;
+    std::size_t i = 0;
+    for (; i + 64 <= bytes; i += 64) {
+        std::uint64_t w0, w1, w2, w3, w4, w5, w6, w7;
+        std::memcpy(&w0, data + i + 0, 8);
+        std::memcpy(&w1, data + i + 8, 8);
+        std::memcpy(&w2, data + i + 16, 8);
+        std::memcpy(&w3, data + i + 24, 8);
+        std::memcpy(&w4, data + i + 32, 8);
+        std::memcpy(&w5, data + i + 40, 8);
+        std::memcpy(&w6, data + i + 48, 8);
+        std::memcpy(&w7, data + i + 56, 8);
+        if ((w0 | w1 | w2 | w3 | w4 | w5 | w6 | w7) != 0) return true;
+    }
+    for (; i + 8 <= bytes; i += 8) {
+        std::uint64_t w;
+        std::memcpy(&w, data + i, 8);
+        if (w != 0) return true;
+    }
+    for (; i < bytes; ++i)
+        if (data[i] != 0) return true;
+    return false;
+}
+
+}  // namespace detail
 
 // A ring of upload buffers and command buffers per device, used under the title-texture registry lock.
 // A whole image (including arrays and compressed mip tails) is detiled into the mapped buffer of the next slot.
@@ -27,12 +60,19 @@ public:
     void release(Device& d) {
         auto& vk = d.context->vk;
         wait_all(d);
-        for (auto& slot : slots_) release_buffer(d, slot);
+        for (auto& slot : slots_) {
+            release_buffer(d, slot);
+            slot.command = VK_NULL_HANDLE;
+            slot.value = 0;
+        }
         if (pool_) vk.vkDestroyCommandPool(d.info.device, pool_, nullptr);
         if (ready_) vk.vkDestroySemaphore(d.info.device, ready_, nullptr);
         pool_ = VK_NULL_HANDLE;
-        for (auto& slot : slots_) slot.command = VK_NULL_HANDLE;
         ready_ = VK_NULL_HANDLE;
+        next_ = 0;
+        value_ = 0;
+        consumers_.clear();
+        regions_.clear();
     }
 
     template<class Device>
@@ -42,8 +82,8 @@ public:
         const auto block = leonida::copy_block_format(image, VK_IMAGE_ASPECT_COLOR_BIT);
         const auto mips = layout.layout.mips;
         const auto layers = layout.array;
-        if (!block.bytes || block.bytes != layout.format.bytes || !mips || mips > image.mip_levels ||
-            !layers || layers > image.array_layers) return false;
+        if (!tiled || !block.block || !block.bytes || block.bytes != layout.format.bytes || !mips ||
+            mips > image.mip_levels || !layers || layers > image.array_layers) return false;
 
         regions_.clear();
         VkDeviceSize bytes = 0;
@@ -54,15 +94,19 @@ public:
                 copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1};
                 copy.imageExtent = {std::max(1u, image.width >> level), std::max(1u, image.height >> level),
                                     image.volume ? std::max(1u, image.depth >> level) : 1u};
-                if (mip.width_elements != (copy.imageExtent.width + block.block - 1) / block.block ||
-                    mip.height_elements != (copy.imageExtent.height + block.block - 1) / block.block ||
+                if (mip.width_elements != 1u + (copy.imageExtent.width - 1u) / block.block ||
+                    mip.height_elements != 1u + (copy.imageExtent.height - 1u) / block.block ||
                     (image.volume && mip.depth != copy.imageExtent.depth)) return false;
                 // Vulkan requires offsets aligned to four bytes and to the texel block size.
-                const auto align = 4u * block.bytes;
-                copy.bufferOffset = bytes + (align - bytes % align) % align;
+                const VkDeviceSize align = VkDeviceSize(4u) * block.bytes;
+                const VkDeviceSize rem = bytes % align;
+                const VkDeviceSize pad = rem ? align - rem : 0;
+                if (pad > UINT64_MAX - bytes) return false;
+                copy.bufferOffset = bytes + pad;
                 const VkDeviceSize row = VkDeviceSize(mip.width_elements) * block.bytes;
+                if (!mip.height_elements || row > UINT32_MAX / mip.height_elements) return false;
                 const VkDeviceSize slice = row * mip.height_elements;
-                if (slice > UINT32_MAX || (UINT64_MAX - copy.bufferOffset) / copy.imageExtent.depth < slice) return false;
+                if ((UINT64_MAX - copy.bufferOffset) / copy.imageExtent.depth < slice) return false;
                 bytes = copy.bufferOffset + slice * copy.imageExtent.depth;
                 regions_.push_back(copy);
             }
@@ -77,8 +121,8 @@ public:
             auto* dst = slot.mapped + copy.bufferOffset;
             xg_xs::copy_elements<false>(layout, level, copy.imageSubresource.baseArrayLayer, tiled, dst, row, slice, columns);
             if (inspect && !nonzero)
-                nonzero = std::any_of(dst, dst + VkDeviceSize(slice) * copy.imageExtent.depth,
-                                      [](std::uint8_t c) { return c != 0; });
+                nonzero = detail::has_nonzero_bytes(
+                    dst, static_cast<std::size_t>(VkDeviceSize(slice) * copy.imageExtent.depth));
         }
 
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers};
@@ -131,6 +175,7 @@ private:
             slot.value = 0;
             return true;
         }
+        if (!vk.vkWaitSemaphores) return false;
         VkSemaphoreWaitInfo done{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
         done.semaphoreCount = 1;
         done.pSemaphores = &ready_;
