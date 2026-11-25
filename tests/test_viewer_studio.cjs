@@ -28,7 +28,11 @@ function fakeElement() {
     };
 }
 
-class Vector3 { set() { return this; } sub() { return this; } }
+class Vector3 {
+    set(x, y, z) { Object.assign(this, { x, y, z }); return this; }
+    toArray() { return [this.x, this.y, this.z]; }
+    sub() { return this; }
+}
 class Disposable { disposed = false; dispose() { this.disposed = true; } }
 
 function loadStudio() {
@@ -43,24 +47,33 @@ function loadStudio() {
         alert: message => alerts.push(message), console: { error() {} },
         THREE: {
             MeshStandardMaterial: Disposable, MeshNormalMaterial: Disposable, Vector3,
-            Box3: class { setFromObject() { return this; } getCenter(v) { return v; } getSize(v) { return v; } },
+            Box3: class {
+                setFromObject(model) { this.side = model.side; return this; }
+                getCenter(v) { return v.set(0, 0, 0); }
+                getSize(v) { return v.set(this.side, this.side, this.side); }
+            },
             GLTFLoader: class { load(url, onLoad, onProgress, onError) { loads.push({ url, onLoad, onError }); } },
         },
     });
     vm.runInContext(script, context);
     vm.runInContext(`
         scene = { objects: new Set(), add(o) { this.objects.add(o); }, remove(o) { this.objects.delete(o); } };
-        camera = { position: new THREE.Vector3() };
-        controls = { target: new THREE.Vector3(), update() {} };`, context);
+        camera = { position: new THREE.Vector3().set(0, 2, 5) };
+        controls = {
+            target: new THREE.Vector3().set(0, 0, 0), update() {},
+            saveState() { this.eye = camera.position.toArray(); this.center = this.target.toArray(); },
+            reset() { camera.position.set(...this.eye); this.target.set(...this.center); },
+        };
+        controls.saveState();`, context);
     return { context, elements, loads, alerts, run: code => vm.runInContext(code, context) };
 }
 
-function fakeModel() {
+function fakeModel(side = 1) {
     const geometry = Object.assign(new Disposable(), { attributes: { position: { count: 3 } }, index: null });
     const texture = Object.assign(new Disposable(), { isTexture: true });
     const material = Object.assign(new Disposable(), { map: texture });
     const mesh = { isMesh: true, geometry, material, userData: {} };
-    return { position: new Vector3(), userData: {}, parts: [geometry, material, texture],
+    return { side, position: new Vector3(), userData: {}, parts: [geometry, material, texture],
         traverse(visit) { visit(this); visit(mesh); } };
 }
 
@@ -146,6 +159,22 @@ test('switching models in clay mode disposes the old model\'s geometry, material
     assert.deepEqual(modelA.parts.map(part => part.disposed), [true, true, true]);
     assert.deepEqual(modelB.parts.map(part => part.disposed), [false, false, false]);
     assert.equal(studio.run('clayMaterial.disposed'), false);
+});
+
+test('Reset Camera returns to the fitted view of the currently loaded model', () => {
+    const studio = loadStudio();
+    let previousEye = studio.run('camera.position.toArray()');
+    for (const side of [20, 4]) {
+        studio.run(`loadModel('/models/box.glb', 'box.glb', '', 1)`);
+        studio.loads.at(-1).onLoad({ scene: fakeModel(side) });
+        const eye = studio.run('camera.position.toArray()');
+        const target = studio.run('controls.target.toArray()');
+        assert.notDeepEqual(eye, previousEye);
+        studio.run('camera.position.set(30, 5, 25); controls.target.set(1, 1, 1); resetCamera()');
+        assert.deepEqual(studio.run('camera.position.toArray()'), eye);
+        assert.deepEqual(studio.run('controls.target.toArray()'), target);
+        previousEye = eye;
+    }
 });
 
 test('paging a large model category keeps one page and restores the selected row when returning', () => {
