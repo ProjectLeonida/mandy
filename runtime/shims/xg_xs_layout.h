@@ -392,44 +392,14 @@ inline void copy_tiled_row(const Byte* __restrict source, Byte* __restrict desti
         const Byte* __restrict src_ptr = source + linear_base;
         for (uint32_t x = 0; x < count; ++x) {
             Byte* dst_ptr = destination + tiled_base + columns[x];
-            if constexpr (Width == 1) {
-                *dst_ptr = *src_ptr;
-            } else if constexpr (Width == 2) {
-                *reinterpret_cast<uint16_t*>(dst_ptr) = *reinterpret_cast<const uint16_t*>(src_ptr);
-            } else if constexpr (Width == 4) {
-                *reinterpret_cast<uint32_t*>(dst_ptr) = *reinterpret_cast<const uint32_t*>(src_ptr);
-            } else if constexpr (Width == 8) {
-                *reinterpret_cast<uint64_t*>(dst_ptr) = *reinterpret_cast<const uint64_t*>(src_ptr);
-            } else if constexpr (Width == 16) {
-                uint64_t* dst64 = reinterpret_cast<uint64_t*>(dst_ptr);
-                const uint64_t* src64 = reinterpret_cast<const uint64_t*>(src_ptr);
-                dst64[0] = src64[0];
-                dst64[1] = src64[1];
-            } else {
-                std::memcpy(dst_ptr, src_ptr, bytes);
-            }
+            std::memcpy(dst_ptr, src_ptr, bytes);
             src_ptr += bytes;
         }
     } else {
         Byte* __restrict dst_ptr = destination + linear_base;
         for (uint32_t x = 0; x < count; ++x) {
             const Byte* src_ptr = source + tiled_base + columns[x];
-            if constexpr (Width == 1) {
-                *dst_ptr = *src_ptr;
-            } else if constexpr (Width == 2) {
-                *reinterpret_cast<uint16_t*>(dst_ptr) = *reinterpret_cast<const uint16_t*>(src_ptr);
-            } else if constexpr (Width == 4) {
-                *reinterpret_cast<uint32_t*>(dst_ptr) = *reinterpret_cast<const uint32_t*>(src_ptr);
-            } else if constexpr (Width == 8) {
-                *reinterpret_cast<uint64_t*>(dst_ptr) = *reinterpret_cast<const uint64_t*>(src_ptr);
-            } else if constexpr (Width == 16) {
-                uint64_t* dst64 = reinterpret_cast<uint64_t*>(dst_ptr);
-                const uint64_t* src64 = reinterpret_cast<const uint64_t*>(src_ptr);
-                dst64[0] = src64[0];
-                dst64[1] = src64[1];
-            } else {
-                std::memcpy(dst_ptr, src_ptr, bytes);
-            }
+            std::memcpy(dst_ptr, src_ptr, bytes);
             dst_ptr += bytes;
         }
     }
