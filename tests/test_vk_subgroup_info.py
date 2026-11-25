@@ -846,6 +846,29 @@ class QueryTest(unittest.TestCase):
                 self.assertIs(res["barycentric_fallback"], want)
         self.assertEqual(vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, 6)
 
+    def test_lod_bias_is_measured_only_when_asked(self):
+        """--lod-bias adds tools/vk_lod_bias.py's answer for the chosen device; without it nothing runs on the GPU."""
+        import vk_lod_bias
+        with mock.patch.object(vk_lod_bias, "measure", return_value=(True, "drops")) as measure:
+            res, _vk = self._run_query(FakeDevice())
+            self.assertNotIn("explicit_lod_bias", res)
+            measure.assert_not_called()
+            vk = FakeVulkan(devices=(FakeDevice(),))
+            with mock.patch.object(vk_info, "load_vulkan", return_value=vk):
+                res = vk_info.query(lod_bias=True)
+        self.assertIs(res["explicit_lod_bias"], True)
+        self.assertEqual(res["explicit_lod_bias_reason"], "drops")
+        self.assertEqual(measure.call_args.args[1].value, 0x20000001)   # the chosen device's handle
+
+    def test_a_lod_bias_measurement_that_fails_is_unknown(self):
+        import vk_lod_bias
+        vk = FakeVulkan(devices=(FakeDevice(),))
+        with mock.patch.object(vk_lod_bias, "measure", side_effect=OSError("device lost")), \
+                mock.patch.object(vk_info, "load_vulkan", return_value=vk):
+            res = vk_info.query(lod_bias=True)
+        self.assertIsNone(res["explicit_lod_bias"])
+        self.assertIn("device lost", res["explicit_lod_bias_reason"])
+
     def test_barycentric_fallback_rejects_an_intel_windows_fake(self):
         """Intel Windows uses its Windows driver ID, not ANV; the fake must carry Intel's vendor ID."""
         res, _vk = self._run_query(FakeDevice(name="Intel Arc", vendor_id=0x8086, device_id=0xE20B,

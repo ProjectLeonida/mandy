@@ -1,10 +1,12 @@
-"""tools/lod_bias_probe.py: whether the sampler applies mipLodBias is measured from three vk_sampler_test draws.
+"""tools/lod_bias_probe.py: tools/vk_subgroup_info.py --lod-bias first, else three vk_sampler_test draws.
 
-No GPU: build.py and vk_sampler_test are replaced by fakes that write the readback a driver would give. The probe
-answers True only when LOD_BIAS +1 and -1 both read the no-bias levels, False when both move as check.py expects,
-and None for a wrong no-bias draw, a mixed answer, a failed draw or missing test programs.
+No GPU: vk_subgroup_info.py, build.py and vk_sampler_test are replaced by fakes. An answer from vk_subgroup_info.py
+is used as it is, with no draw. Without one, the draw answers True only when LOD_BIAS +1 and -1 both read the
+no-bias levels, False when both move as check.py expects, and None for a wrong no-bias draw, a mixed answer, a
+failed draw or missing test programs.
 Standard library only; no game files.
 """
+import json
 import os
 import struct
 import subprocess
@@ -29,10 +31,13 @@ def image(level_lz, level_implicit):
 class FakeRuns:
     """subprocess.run for the probe: build.py writes the two modules, vk_sampler_test the levels `levels(bias)`."""
 
-    def __init__(self, levels, draw_rc=0):
-        self.levels, self.draw_rc = levels, draw_rc
+    def __init__(self, levels, draw_rc=0, info=None):
+        self.levels, self.draw_rc, self.info, self.draws = levels, draw_rc, info, 0
 
     def __call__(self, cmd, **kw):
+        if cmd[-1] == "--lod-bias":   # vk_subgroup_info.py --lod-bias
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(self.info or {"explicit_lod_bias": None}), "")
+        self.draws += 1
         if cmd[-2:] == ["vs_ids", "ps_ssharp"]:
             spirv = Path(cmd[-3]) / "spirv"
             spirv.mkdir(parents=True, exist_ok=True)
@@ -60,6 +65,10 @@ class ProbeTest(unittest.TestCase):
         with mock.patch.object(lod_bias_probe.subprocess, "run", fake):
             return lod_bias_probe.probe(self.build.name)
 
+    def run_draw(self, fake):
+        with mock.patch.object(lod_bias_probe.subprocess, "run", fake):
+            return lod_bias_probe.draw_probe(self.build.name)
+
     def test_a_driver_that_applies_the_bias(self):
         self.assertIs(self.run_probe(FakeRuns(applied))[0], False)
 
@@ -80,9 +89,28 @@ class ProbeTest(unittest.TestCase):
 
     def test_no_test_programs_is_unknown(self):
         with tempfile.TemporaryDirectory() as empty:
-            answer, reason = lod_bias_probe.probe(empty)
+            answer, reason = lod_bias_probe.draw_probe(empty)
         self.assertIsNone(answer)
         self.assertIn("vk_sampler_test", reason)
+
+    def test_a_measured_answer_needs_no_draw(self):
+        for answer in (True, False):
+            with self.subTest(answer=answer):
+                fake = FakeRuns(lambda bias: (1, 0), info={"explicit_lod_bias": answer, "explicit_lod_bias_reason": "m"})
+                self.assertEqual(self.run_probe(fake), (answer, "m"))
+                self.assertEqual(fake.draws, 0)
+
+    def test_an_error_from_vk_subgroup_info_falls_back_to_the_draw(self):
+        fake = FakeRuns(lambda bias: (0, 1), info={"error": "RuntimeError: no Vulkan device"})
+        self.assertIs(self.run_probe(fake)[0], True)
+        self.assertGreater(fake.draws, 0)
+
+    def test_without_test_programs_only_the_measurement_answers(self):
+        fake = FakeRuns(applied)
+        with mock.patch.object(lod_bias_probe.subprocess, "run", fake):
+            answer, _ = lod_bias_probe.probe(None)
+        self.assertIsNone(answer)
+        self.assertEqual(fake.draws, 0)
 
     def test_the_probe_translates_without_the_flag(self):
         seen = {}

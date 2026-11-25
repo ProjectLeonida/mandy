@@ -90,11 +90,20 @@ CLIP_CASES = {"vs_clip": 1, "vs_clip_param4": 4, "vs_clip_undeclared": 1}
 
 
 def explicit_lod_bias():
-    """LEONIDA_EXPLICIT_LOD_BIAS=1: translate with --explicit-lod-bias, where the sampler drops mipLodBias. build.py
-    doesn't measure it (it also runs inside the CMake build, before the test programs exist): scripts/run_gpu_tests.py
-    measures it with tools/lod_bias_probe.py, and `python -I tools/lod_bias_probe.py --build <test programs>` answers
-    for check.py's runs."""
-    return (os.environ.get("LEONIDA_EXPLICIT_LOD_BIAS") or "").strip().lower() in ("1", "true", "yes", "on")
+    """LEONIDA_EXPLICIT_LOD_BIAS=1 (or 0). Unset, it is on where tools/vk_subgroup_info.py --lod-bias measures that
+    the sampler drops mipLodBias (one compute dispatch from Python, no test programs needed), the rule of
+    scripts/run_gpu_tests.py. No answer leaves it off."""
+    v = (os.environ.get("LEONIDA_EXPLICIT_LOD_BIAS") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py"), "--lod-bias"],
+                           capture_output=True, text=True, timeout=60)
+        return json.loads(r.stdout.strip().splitlines()[-1]).get("explicit_lod_bias") is True
+    except (OSError, ValueError, IndexError, AttributeError, subprocess.SubprocessError):
+        return False
 
 
 def asm_fssm_fields(path):

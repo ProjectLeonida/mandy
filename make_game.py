@@ -1893,13 +1893,15 @@ def runtime_gpu_info() -> dict:
 
 
 def runtime_gpu_explicit_lod_bias():
-    """tools/lod_bias_probe.py's answer for the GPU the runtime would use: True where it measures that the sampler drops
-    mipLodBias (MoltenVK on an Apple M3, not on an M5 Pro), False where it applies it, None when it can't tell (no
-    vk_sampler_test in runtime/build/linux or runtime/build yet, or no answer)."""
-    exe = "vk_sampler_test" + (".exe" if os.name == "nt" else "")
-    builds = [os.path.join(ROOT, "runtime", "build", *p) for p in (("linux",), (), ("RelWithDebInfo",), ("Release",))]
-    build = next((b for b in builds if os.path.isfile(os.path.join(b, exe))), None)
-    if build is None:
+    """explicit_lod_bias as tools/vk_subgroup_info.py --lod-bias measures it on the GPU the runtime would use (one
+    compute dispatch): True where the sampler drops mipLodBias (MoltenVK on an Apple M3, not on an M5 Pro), False
+    where it applies it, None when it can't tell."""
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py"), "--lod-bias"],
+                           capture_output=True, text=True, timeout=60)
+        v = json.loads(r.stdout.strip().splitlines()[-1]).get("explicit_lod_bias")
+        return None if v is None else bool(v)
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return None
     try:
         r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "lod_bias_probe.py"), "--build", build],
@@ -3045,7 +3047,7 @@ def main() -> int:
                          "without VK_KHR_maintenance8")
     ap.add_argument("--explicit-lod-bias", action="store_true",
                     help="apply the S# LOD bias in the shaders, for a driver whose sampler drops it; on by itself "
-                         "where tools/lod_bias_probe.py measures that (MoltenVK on an Apple M3, not on an M5 Pro)")
+                         "where tools/vk_subgroup_info.py --lod-bias measures that (MoltenVK on an Apple M3, not an M5 Pro)")
     ap.add_argument("--f16-interp-fallback", action="store_true",
                     help="16-bit interpolation from decoded halves the vertex/mesh shader exports instead of "
                          "PerVertexKHR inputs; on by itself when the runtime's GPU can't use them (MoltenVK)")
@@ -3146,8 +3148,8 @@ def main() -> int:
     if "shaders" in stages and not a.explicit_lod_bias:
         drops_bias = runtime_gpu_explicit_lod_bias()
         if drops_bias is True:
-            log("shaders: tools/lod_bias_probe.py measures that the GPU the runtime would use drops the sampler's LOD "
-                "bias: translating with --explicit-lod-bias")
+            log("shaders: tools/vk_subgroup_info.py --lod-bias measures that the GPU the runtime would use drops the "
+                "sampler's LOD bias: translating with --explicit-lod-bias")
             a.explicit_lod_bias = True
         elif drops_bias is None:
             a.explicit_lod_bias = keep_recorded_fallback("--explicit-lod-bias", work)

@@ -1,10 +1,13 @@
 """Measure whether the Vulkan driver applies VkSamplerCreateInfo::mipLodBias, for rdna2spirv.py --explicit-lod-bias.
 
-    python -I tools/lod_bias_probe.py --build <folder with vk_sampler_test> [--json]
+    python -I tools/lod_bias_probe.py [--build <folder with vk_sampler_test>]
 
 The answer is measured, not looked up: MoltenVK 1.4.2 drops the sampler's bias on an Apple M3 (ps_ssharp fails on
-main) but applies it on an Apple M5 Pro (ps_ssharp passes on main), so a driver ID can't decide. The probe
-translates runtime/test/shaders/vs_ids and ps_ssharp *without* the flag into a temporary folder (build.py with
+main) but applies it on an Apple M5 Pro (ps_ssharp passes on main), so a driver ID can't decide.
+
+First it asks tools/vk_subgroup_info.py --lod-bias, which measures it with one compute dispatch from Python
+(tools/vk_lod_bias.py) and needs no built test programs, llvm-mc or SPIR-V tools. Only when that has no answer and
+--build names the test programs does it fall back to the draw below. The draw translates runtime/test/shaders/vs_ids and ps_ssharp *without* the flag into a temporary folder (build.py with
 LEONIDA_EXPLICIT_LOD_BIAS=0), then draws them with vk_sampler_test three times: no bias, LOD_BIAS +1 and -1 (S# words
 from check.py's ssharp_words). ps_ssharp's mrt0 is (lz.r, lz.g, implicit.r, implicit.g): the explicit sample at LOD
 0 and the derivative one at LOD 1, on a two-level texture.
@@ -34,8 +37,30 @@ sys.path.insert(0, SHADERS)
 import check  # noqa: E402  (ssharp_words, sampler_mismatch, the SAMPLER_SIZE readback layout)
 
 
-def probe(build: str, timeout: int = 120):
-    """(True | False | None, reason)."""
+def subgroup_info_answer(timeout: int = 120):
+    """(True | False | None, reason) from tools/vk_subgroup_info.py --lod-bias."""
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "vk_subgroup_info.py"), "--lod-bias"],
+                           capture_output=True, text=True, timeout=timeout)
+        answer = json.loads(r.stdout.strip().splitlines()[-1])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError) as e:
+        return None, f"vk_subgroup_info.py --lod-bias: {e}"
+    if "error" in answer:
+        return None, f"vk_subgroup_info.py --lod-bias: {answer['error']}"
+    return answer.get("explicit_lod_bias"), answer.get("explicit_lod_bias_reason", "")
+
+
+def probe(build: str | None = None, timeout: int = 120):
+    """(True | False | None, reason): vk_subgroup_info.py's measurement, else the vk_sampler_test draw."""
+    answer, reason = subgroup_info_answer(timeout)
+    if answer is not None or not build:
+        return answer, reason
+    drawn, why = draw_probe(build, timeout)
+    return drawn, why if drawn is not None else f"{reason}; {why}"
+
+
+def draw_probe(build: str, timeout: int = 120):
+    """(True | False | None, reason) from three vk_sampler_test draws of ps_ssharp."""
     tool = os.path.join(build, "vk_sampler_test" + EXE)
     if not os.path.isfile(tool):
         return None, f"no vk_sampler_test{EXE} in {build}"
@@ -48,7 +73,13 @@ def probe(build: str, timeout: int = 120):
             return None, f"build.py: {e}"
         shaders = [os.path.join(tmp, "spirv", n + ".spv") for n in ("vs_ids", "ps_ssharp")]
         if r.returncode or not all(os.path.isfile(s) for s in shaders):
-            return None, "build.py could not translate vs_ids and ps_ssharp: " + (r.stdout + r.stderr).strip()[-300:]
+            out = (r.stdout + r.stderr).strip()
+            if "llvm-mc" in out and "could not be started" in out:
+                # Homebrew's llvm is keg-only: say what to set instead of a bare "could not be started".
+                sys.path.insert(0, HERE)
+                import mc_command  # noqa: E402
+                return None, "the draw needs llvm-mc to translate ps_ssharp: " + mc_command.install_hint()
+            return None, "build.py could not translate vs_ids and ps_ssharp: " + out[-300:]
         view = (0, 1)
 
         def draw(bias):
@@ -84,7 +115,7 @@ def probe(build: str, timeout: int = 120):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--build", required=True, help="the folder with vk_sampler_test (the GPU test programs)")
+    ap.add_argument("--build", help="the folder with vk_sampler_test, for the draw fallback (the GPU test programs)")
     a = ap.parse_args(argv)
     answer, reason = probe(a.build)
     print(json.dumps({"explicit_lod_bias": answer, "reason": reason}))

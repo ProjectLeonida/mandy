@@ -1,6 +1,7 @@
-# The shader fixtures use test/shaders/build.py, its local imports and the scripts it runs (tools/rdna2spirv.py
-# and tools/vk_subgroup_info.py, whose answer picks --bary-fallback). Track the shader-stage dependencies in
-# make_game.py's TRANSLATION_SOURCES here too, including the native PSO catalog writer.
+# The shader fixtures use test/shaders/build.py, its local imports and the scripts it runs (tools/rdna2spirv.py,
+# tools/vk_subgroup_info.py, whose answer picks --bary-fallback, and tools/vk_lod_bias.py, which its --lod-bias
+# measurement imports for --explicit-lod-bias). Track the shader-stage dependencies in make_game.py's
+# TRANSLATION_SOURCES here too, including the native PSO catalog writer.
 # Every add_custom_command that runs build.py DEPENDS on this list, so an edit to a helper such as tools/spirv_asm.py
 # rebuilds the test shaders instead of leaving the last build's SPIR-V in place (BUILD-1064).
 # tests/test_cmake_translator_deps.py fails when an import is missing here or a build.py rule doesn't use the list.
@@ -32,6 +33,7 @@ set(LEONIDA_TRANSLATOR_DEPS
     ${_leonida_repo}/tools/spirv_loop_guard.py
     ${_leonida_repo}/tools/spirv_opt.py
     ${_leonida_repo}/tools/spirv_stubs.py
+    ${_leonida_repo}/tools/vk_lod_bias.py
     ${_leonida_repo}/tools/vk_subgroup_info.py
     ${_leonida_repo}/tools/wave64_emulate_opt.py
     ${_leonida_repo}/tools/wave64_halves.py)

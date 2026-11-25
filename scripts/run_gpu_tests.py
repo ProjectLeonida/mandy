@@ -389,15 +389,13 @@ def _device_barycentric_fallback():
 
 
 def _device_explicit_lod_bias(build: str | None):
-    """tools/lod_bias_probe.py's answer for the device the tests run on (cached per suite), or None: it draws ps_ssharp
-    translated without the flag and looks whether the sampler moved the level for LOD_BIAS +1 and -1."""
+    """tools/lod_bias_probe.py's answer for the device the tests run on (cached per suite), or None: vk_subgroup_info.py
+    --lod-bias's compute measurement, else (with the test programs) ps_ssharp drawn without the flag."""
     if not _EXPLICIT_LOD_BIAS:
         answer = None
         try:
-            if not build:
-                raise OSError("no test programs")
-            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "lod_bias_probe.py"), "--build", build],
-                               capture_output=True, text=True, timeout=300)
+            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "lod_bias_probe.py"),
+                                *(["--build", build] if build else [])], capture_output=True, text=True, timeout=300)
             answer = json.loads(r.stdout.strip().splitlines()[-1]).get("explicit_lod_bias")
         except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             pass
