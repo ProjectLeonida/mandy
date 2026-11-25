@@ -31,6 +31,7 @@ import os
 import re
 import struct
 import sys
+import tempfile
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -639,8 +640,21 @@ def main() -> int:
         try:
             if folder:
                 os.makedirs(folder, exist_ok=True)
-            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(result, f, indent=1)
+            fd, temporary = tempfile.mkstemp(dir=folder or ".")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(result, f, indent=1)
+                os.replace(temporary, a.out)
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+                raise
         except OSError as e:
             print(f"ERROR: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
             return 2
