@@ -60,6 +60,7 @@
 #include "../src/spirv_f16_halves.h"
 #include "../src/spirv_stores.h"
 #include "../src/title_va_alias.h"
+#include "../src/console_heap_vsharp_slots.h"
 #include "../src/title_window_plan.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
@@ -3216,6 +3217,7 @@ struct DeviceState {
         std::vector<std::uint8_t> mirror;  // the title's bytes as the tracker last copied them
         std::vector<std::uint8_t> made;    // the title's bytes each arena slot was last made from
         std::vector<std::uint8_t> retry;   // per slot: not settled yet (fix_console_slot), in `retries`
+        leonida::ConsoleHeapVsharpSlots live_vsharps;  // slots whose GPU copy holds a live buffer V#
         std::vector<std::uint32_t> retries;
         std::set<std::uint32_t> empty_slots;
         std::uint32_t next_empty = 0;
@@ -3295,6 +3297,7 @@ struct DeviceState {
         if (empty) heap.empty_slots.insert(std::uint32_t(slot));
         else if (!heap.empty_slots.empty()) heap.empty_slots.erase(std::uint32_t(slot));
         std::memcpy(heap.copy + slot * kDescriptorSize, w, kDescriptorSize);
+        heap.live_vsharps.set(slot, leonida::ConsoleHeapVsharpSlots::is_live_vsharp(w));
         return settled;
     }
 
@@ -3326,6 +3329,7 @@ struct DeviceState {
                 heap.fix_over = true;
             if (heap.fix_over) {
                 std::memset(heap.copy + at, 0, kDescriptorSize);
+                heap.live_vsharps.clear(slot);
                 ++heap.deferred_fixes;
                 if (!heap.retry[slot]) {
                     heap.retry[slot] = 1;
@@ -3411,6 +3415,7 @@ struct DeviceState {
             const auto end = std::uint32_t((offset + bytes) / kDescriptorSize);
             heap.empty_slots.erase(heap.empty_slots.lower_bound(first), heap.empty_slots.lower_bound(end));
             for (auto slot = first; slot < end; ++slot) heap.retry[slot] = 0;
+            heap.live_vsharps.clear_range(first, end);
         });
         const auto t1 = clock::now();
         heap.fix_start = t1;
@@ -3423,16 +3428,13 @@ struct DeviceState {
             heap.alias_generation = alias_generation;
             heap.checked_generation = generation;
             // Even an unchanged title slot may name a buffer released since the last submission.
-            for (size_t at = 0; at + kDescriptorSize <= heap.bytes; at += kDescriptorSize) {
-                auto* w = reinterpret_cast<uint32_t*>(heap.copy + at);
-                if (!(w[3] >> 30) && (w[2] || w[6])) {
-                    const auto slot = at / kDescriptorSize;
-                    if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
-                        heap.retry[slot] = 1;
-                        heap.retries.push_back(uint32_t(slot));
-                    }
+            // Walk the host-RAM V# bitset instead of reading every slot of `heap.copy` (which may be uncached WC VRAM).
+            heap.live_vsharps.for_each([&](std::size_t slot) {
+                if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
+                    heap.retry[slot] = 1;
+                    heap.retries.push_back(uint32_t(slot));
                 }
-            }
+            });
         }
         const auto t2 = clock::now();
         // A settled zero can acquire GPU backing without a CPU map event. Probe at most eight in
@@ -3650,6 +3652,7 @@ struct DeviceState {
                 heap->previous = heap->made.data();
             }
             heap->retry.assign(std::size_t(bytes / kDescriptorSize), 0);
+            heap->live_vsharps.reset(std::size_t(bytes / kDescriptorSize));
             heap->pages = make_shadow_pages(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(console_va)),
                                             heap->input, std::size_t(bytes));
         }

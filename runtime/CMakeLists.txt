@@ -4383,6 +4383,12 @@ if(TARGET Vulkan::Headers)
       target_compile_options(title_window_plan_bounds_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME title_window_plan_bounds COMMAND title_window_plan_bounds_test)
+    # Host-RAM bitset of live console resource-heap V# slots (src/console_heap_vsharp_slots.h).
+    add_executable(console_heap_vsharp_slots_test test/console_heap_vsharp_slots_test.cpp)
+    if(WIN32 AND MSVC)
+      target_compile_options(console_heap_vsharp_slots_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME console_heap_vsharp_slots COMMAND console_heap_vsharp_slots_test)
     # Queue construction cleans its Vulkan handles if holder registration runs out of host memory.
     add_executable(vk_host_texture_order_test test/vk_host_texture_order_test.cpp)
     target_link_libraries(vk_host_texture_order_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
