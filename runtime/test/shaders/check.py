@@ -1638,10 +1638,17 @@ def sampler_mismatch(data, words, view):
     return ""
 
 
-def sampler_test(tools, spirv):
-    """ps_ssharp: every SAMPLER_CASES S#/T# pair drawn with vk_sampler_test and judged per pixel by sampler_level.
-    A grey level-1 texel differs from every level-0 texel in both channels, so a wrong level fails at each pixel."""
-    shaders = [os.path.join(spirv, name + ".spv") for name in ("vs_ids", "ps_ssharp")]
+# The pixel shaders judged by sampler_test: ps_ssharp (image_sample_lz and image_sample), ps_ssharp_ld (image_sample_l
+# and image_sample_d) and ps_ssharp_b (image_sample_lz and image_sample_b). Each writes an explicit-LOD-0 sample and an
+# LOD-1 sample, so the same SAMPLER_CASES expectations hold for all three.
+SAMPLER_FIXTURES = ("ps_ssharp", "ps_ssharp_ld", "ps_ssharp_b")
+
+
+def sampler_test(tools, spirv, ps="ps_ssharp"):
+    """A SAMPLER_FIXTURES shader: every SAMPLER_CASES S#/T# pair drawn with vk_sampler_test and judged per pixel by
+    sampler_level. A grey level-1 texel differs from every level-0 texel in both channels, so a wrong level fails at
+    each pixel."""
+    shaders = [os.path.join(spirv, name + ".spv") for name in ("vs_ids", ps)]
     for path in shaders:
         if not os.path.isfile(path):
             return f"missing {os.path.basename(path)}"
@@ -2291,7 +2298,8 @@ def main():
         results.append((name, texture_constant_test(tools, spirv, name)))
     results.append(("vs_base_ids", base_ids_test(tools, spirv)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
-    results.append(("ps_ssharp", sampler_test(tools, spirv)))
+    for name in SAMPLER_FIXTURES:
+        results.append((name, sampler_test(tools, spirv, name)))
     results.append(("ps_imgatomic", bindless_test(tools, spirv, "ps_imgatomic")))
     for name in MIP_TEST_PASSES:
         results.append((name, texture_mip_test(tools, spirv, name)))

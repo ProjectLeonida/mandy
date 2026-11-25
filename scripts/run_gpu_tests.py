@@ -28,7 +28,7 @@ from build import CLIP_CASES, clip_container, shader_source
 from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test,
                    fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test, compute_unsupported)
 from compute_fixture import compute_header
-from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
+from check import SAMPLER_CASES, SAMPLER_FIXTURES, sampler_test   # ps_ssharp*: the S#/T# mip fields (vk_sampler_test)
 from check import (CS_SMEM_VCC, CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, table_fetch_test, texture_gradient_a16_test, texture_mip_test)
@@ -722,7 +722,7 @@ OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_transl
 DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_persp_bary": "vs_persp.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
               "ps_table_fetch": "vs_ids.asm", "ps_sample_c": "vs_ids.asm", "ps_sample_c_b": "vs_ids.asm",
-              **{name: "vs_ids.asm" for name in TEXTURE_CONSTANTS}, "ps_ssharp": "vs_ids.asm", "ps_imgatomic": "vs_ids.asm",
+              **{name: "vs_ids.asm" for name in TEXTURE_CONSTANTS}, **{name: "vs_ids.asm" for name in SAMPLER_FIXTURES}, "ps_imgatomic": "vs_ids.asm",
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_clip_color.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
@@ -1473,9 +1473,9 @@ def run_suite(a, work: str) -> int:
                 results.append((name, None, f"SKIP ({reason})"))
             else:
                 results.append((name, rc == 0, verdict_line(rc, msg)))
-        elif name == "ps_ssharp":
+        elif name in SAMPLER_FIXTURES:
             # The S#/T# mip fields through vulkan_sampler() and the view range (check.py's SAMPLER_CASES).
-            problem = sampler_test(a.build, spirv_dir)
+            problem = sampler_test(a.build, spirv_dir, name)
             results.append((name, None if isinstance(problem, Skip) else not problem,
                             problem or f"{len(SAMPLER_CASES)} S#/T# cases, 4096 pixels each exact"))
         elif name in ("ps_texoff", "ps_texoff_implicit", "ps_texoff_forms"):
