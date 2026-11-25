@@ -114,6 +114,11 @@ on:
       - "tools/wave64_halves.py"
       - "tools/xdxr_bvh.py"
   workflow_dispatch:
+    inputs:
+      windows_only:
+        description: "Skip the Wine, Linux GPU-tools and macOS jobs (a measurement round that only needs the loader)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -331,7 +336,7 @@ jobs:
   wine:
     needs: windows
     # The uploaded build can still be tested under Wine if the later native tests fail.
-    if: ${{ github.event_name != 'pull_request' && !cancelled() && needs.windows.outputs.wine-artifact == 'success' }}
+    if: ${{ github.event_name != 'pull_request' && !cancelled() && needs.windows.outputs.wine-artifact == 'success' && !inputs.windows_only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -396,6 +401,7 @@ jobs:
   # Also runs the hand-written GPU tests (runtime/test/shaders) on Mesa's llvmpipe, a software Vulkan driver, so a
   # translator or harness change that breaks a test result shows up on every pull request, without a GPU.
   linux-gpu-tools:
+    if: ${{ !inputs.windows_only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -530,6 +536,7 @@ jobs:
   # Mesa's KosmicKrisp finds no device there; MoltenVK runs, with 32-wide subgroups. macos-26, not macos-15: Xcode
   # 16's libc++ has no floating-point std::from_chars (vk_pipeline_check.cpp).
   macos:
+    if: ${{ !inputs.windows_only }}
     runs-on: macos-26
     timeout-minutes: 20
     env:
