@@ -4115,19 +4115,33 @@ class Gen:
                 off = voff
         else:
             off = self.cu(inst)
+        # The hardware adds the offset to the 48-bit base without wrapping at 32 bits: index * stride is a full product
+        # and soffset is added in 64 bits (only off = vaddr + inst_offset wraps, above). The offset is therefore a
+        # ulong: index 0xFFFFFFFF with a 20-byte stride addresses base + 0x13FFFFFFEC. A 32-bit offset made that
+        # base - 20, which OOB_SELECT 2 (no check) and 3 (no index check) let through into the bytes below the buffer.
+        # No bound is added here: each mode checks what it checked before. (The non-wrapping product was observed on
+        # hardware by five-star-recomp, ThatRecompDev, GPL-3, commit b9b57e2; RDNA2 ISA 8.1.5 gives the address as
+        # base + stride * index + offset with a 48-bit base and no 32-bit limit.)
+        def u64(v):
+            t = self.tmp()
+            self.emit(f"{t} = OpUConvert %ulong {v}")
+            return t
+
+        def add64(x, y):
+            t = self.tmp()
+            self.emit(f"{t} = OpIAdd %ulong {x} {y}")
+            return t
+
         # step: bytes between consecutive dwords of a raw access, None for linear +4 (including all idxen=1 and fmt).
         step = None
         if swz_active is False:
-            if soff_zero:
-                total = off
-            else:
-                total = self.tmp()
-                self.emit(f"{total} = OpIAdd %uint {soff_v} {off}")
+            wide = u64(off)
+            if not soff_zero:
+                wide = add64(wide, u64(soff_v))
             if idx is not None:
-                m, t = self.tmp(), self.tmp()
-                self.emit(f"{m} = OpIMul %uint {idx} {stride}")
-                self.emit(f"{t} = OpIAdd %uint {total} {m}")
-                total = t
+                prod = self.tmp()
+                self.emit(f"{prod} = OpIMul %ulong {u64(idx)} {u64(stride)}")
+                wide = add64(wide, prod)
             sw3 = False
         else:
             # buffer_offset = (index / IS * stride + (off & ~3)) * IS + (index % IS) * 4 + (off & 3), IS = 2^L;
@@ -4143,14 +4157,14 @@ class Gen:
                 t = self.tmp()
                 self.emit(f"{t} = OpIMul %uint {L} {swz_u}")
                 L, Li = t, None
-            om4, ol, sh = self.tmp(), self.tmp(), self.tmp()
+            om4, ol = self.tmp(), self.tmp()
             self.emit(f"{om4} = OpBitwiseAnd %uint {off} {self.cu(0xFFFFFFFC)}")
             self.emit(f"{ol} = OpBitwiseAnd %uint {off} {self.cu(3)}")
-            msb, ms, inner, lsb, l4, im = (self.tmp() for _ in range(6))
+            msb, inner, sh, lsb, l4 = (self.tmp() for _ in range(5))
             self.emit(f"{msb} = OpShiftRightLogical %uint {idx} {L}")
-            self.emit(f"{ms} = OpIMul %uint {msb} {stride}")
-            self.emit(f"{inner} = OpIAdd %uint {ms} {om4}")
-            self.emit(f"{sh} = OpShiftLeftLogical %uint {inner} {L}")
+            self.emit(f"{inner} = OpIMul %ulong {u64(msb)} {u64(stride)}")
+            inner = add64(inner, u64(om4))
+            self.emit(f"{sh} = OpShiftLeftLogical %ulong {inner} {L}")
             if Li is not None:
                 self.emit(f"{lsb} = OpBitwiseAnd %uint {idx} {self.cu((1 << Li) - 1)}")
             else:                             # index - (index >> L << L)
@@ -4158,14 +4172,9 @@ class Gen:
                 self.emit(f"{hi_part} = OpShiftLeftLogical %uint {msb} {L}")
                 self.emit(f"{lsb} = OpISub %uint {idx} {hi_part}")
             self.emit(f"{l4} = OpShiftLeftLogical %uint {lsb} {self.cu(2)}")
-            self.emit(f"{im} = OpIAdd %uint {sh} {l4}")
-            b_off = self.tmp()
-            self.emit(f"{b_off} = OpIAdd %uint {im} {ol}")
-            if soff_zero:
-                total = b_off
-            else:
-                total = self.tmp()
-                self.emit(f"{total} = OpIAdd %uint {soff_v} {b_off}")
+            wide = add64(add64(sh, u64(l4)), u64(ol))
+            if not soff_zero:
+                wide = add64(wide, u64(soff_v))
             if elem != "fmt" and scratch_swz is not False:
                 if Li is not None:
                     step = self.cu(4 << Li)
@@ -4186,13 +4195,12 @@ class Gen:
                 self.emit(f"{ls} = OpIMul %uint {L} {stride}")
                 self.emit(f"{sw3} = OpINotEqual %bool {ls} {self.cu(0)}")
         self.uses_psb = True
-        l64, h64, sh, base, o64, addr = (self.tmp() for _ in range(6))
+        l64, h64, sh, base, addr = (self.tmp() for _ in range(5))
         self.emit(f"{l64} = OpUConvert %ulong {d0}")
         self.emit(f"{h64} = OpUConvert %ulong {hi}")
         self.emit(f"{sh} = OpShiftLeftLogical %ulong {h64} %c64_32")
         self.emit(f"{base} = OpBitwiseOr %ulong {sh} {l64}")
-        self.emit(f"{o64} = OpUConvert %ulong {total}")
-        self.emit(f"{addr} = OpIAdd %ulong {base} {o64}")
+        self.emit(f"{addr} = OpIAdd %ulong {base} {wide}")
         mode = None if lit3 is None else lit3 >> 28 & 3
         mode0_rule = mode in (None, 0) or (mode == 3 and sw3 is not False)
         need_raw = mode in (None, 3) and sw3 is not True
