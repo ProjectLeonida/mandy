@@ -1929,11 +1929,18 @@ public:
     VkSemaphore semaphore() const { return fence_.semaphore(); }
     const leonida::VulkanContext* context() const { return &context_; }
 
-    // A Vulkan timeline only increases; D3D12 allows setting a fence lower. Such a signal is reported and dropped.
-    // A queue's claim also records the value as one the GPU will signal, which a later CPU signal must not overtake.
-    bool claim(UINT64 value, bool queue = false) {
-        std::lock_guard lock(claim_mutex_);
-        return claim_locked(value, queue);
+    bool signal_on_queue(leonida::VulkanQueue& queue, UINT64 value, const leonida::VulkanQueue::PinFn& pin) {
+        std::vector<std::shared_ptr<void>> retired;
+        bool accepted;
+        {
+            std::lock_guard lock(claim_mutex_);
+            if (!can_signal_locked(value)) return true;
+            accepted = queue.enqueue_signal(semaphore(), value, retired, pin);
+            if (accepted) highest_ = queued_ = value;
+        }
+        retired.clear();
+        context_.holds().pump_ready();
+        return accepted;
     }
 
     UINT64 STDMETHODCALLTYPE GetCompletedValue() override {
@@ -1947,10 +1954,17 @@ public:
     // value, in the order the signals were made. Until then GetCompletedValue reads the GPU's progress, where D3D12
     // would already read `value`.
     HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override {
-        std::lock_guard lock(claim_mutex_);
-        if (!claim_locked(value, false)) return S_OK;
+        std::unique_lock lock(claim_mutex_);
+        if (!can_signal_locked(value)) return S_OK;
         const UINT64 queued = queued_;
-        if (held_->load() == 0 && fence_.completed() >= queued) return fence_.signal(value) ? S_OK : E_FAIL;
+        if (held_->load() == 0 && fence_.completed() >= queued) {
+            if (!fence_.signal_value(value)) return E_FAIL;
+            highest_ = value;
+            lock.unlock();
+            context_.holds().pump_ready();
+            return S_OK;
+        }
+        highest_ = value;
         held_->fetch_add(1);
         // The callback must not touch the fence, which may be released first. Released (cancel) or device lost,
         // the queue value may not be reached, and signalling then would break the same rule: the signal is dropped.
@@ -2000,14 +2014,13 @@ public:
     static Fence* from(IUnknown* object) { return Child::from<Fence>(object); }
 
 private:
-    bool claim_locked(UINT64 value, bool queue) {
+    // The current Vulkan representation supports increasing values only.
+    bool can_signal_locked(UINT64 value) const {
         if (value <= highest_) {
             std::fprintf(stderr, "[rt] d3d12: fence signal %llu is not above %llu; Vulkan timelines cannot go back\n",
                          static_cast<unsigned long long>(value), static_cast<unsigned long long>(highest_));
             return false;
         }
-        highest_ = value;
-        if (queue) queued_ = value;
         return true;
     }
 
@@ -2015,8 +2028,8 @@ private:
     leonida::VulkanFence fence_;
     D3D12_FENCE_FLAGS flags_;
     std::mutex claim_mutex_;
-    UINT64 highest_;     // the highest value claimed, from either side
-    UINT64 queued_ = 0;  // the highest value a queue will signal
+    UINT64 highest_;     // the highest value accepted from either side
+    UINT64 queued_ = 0;  // the highest value accepted by a queue
     std::shared_ptr<std::atomic<int>> held_ = std::make_shared<std::atomic<int>>(0);  // CPU signals not applied yet
 };
 
@@ -2271,8 +2284,7 @@ public:
         if (!f || f->context() != &context_ || f->attached_device() != attached_device())
             return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
-        if (!f->claim(value, true)) return d3d12_trace::result(method, S_OK);
-        return d3d12_trace::result(method, queue_.signal(f->semaphore(), value, fence_pin(fence)) ? S_OK : E_FAIL);
+        return d3d12_trace::result(method, f->signal_on_queue(queue_, value, fence_pin(fence)) ? S_OK : E_FAIL);
     }
 
     HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* fence, UINT64 value) override {

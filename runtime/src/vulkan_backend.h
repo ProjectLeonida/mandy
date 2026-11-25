@@ -2113,6 +2113,13 @@ public:
     // ID3D12Fence::Signal from the CPU. Vulkan timelines only increase: a value at or below the current one is
     // ignored (D3D12 would set it), and the caller is told.
     bool signal(std::uint64_t value) {
+        if (!signal_value(value)) return false;
+        context_.holds().pump_ready();
+        return true;
+    }
+
+    // Callers that publish their own fence state can pump ready queues after dropping their locks.
+    bool signal_value(std::uint64_t value) {
         // The dispatcher may be testing a failed counter query. Do not call completed() here:
         // it marks the context lost on a query error and prevents the dispatcher from waking.
         if (context_.is_device_lost()) return false;
@@ -2128,8 +2135,7 @@ public:
                                                         "vkSignalSemaphore");
         if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
         if (result != VK_SUCCESS) return false;
-        context_.holds().signaled(semaphore_, value);  // queues that held a batch for this value run it now
-        context_.holds().pump_ready();
+        context_.holds().signaled(semaphore_, value);
         return true;
     }
 
@@ -2366,24 +2372,30 @@ public:
     // held operations, so the fence does not run ahead of the work it follows. `pin` (called only when the Signal is
     // held) keeps the fence object alive until it has been submitted, as D3D12 does.
     bool signal(VkSemaphore fence, std::uint64_t value, const PinFn& pin = {}) {
-        bool ok = true;
         std::vector<std::shared_ptr<void>> retired;
-        {
-            std::lock_guard state(state_mutex_);
-            if (must_hold()) {
-                Deferred op;
-                op.kind = Deferred::Kind::signal;
-                op.fence = fence;
-                op.value = value;
-                if (pin) op.pins.push_back(pin());
-                hold(std::move(op));
-            } else {
-                ok = submit(VK_NULL_HANDLE, fence, value);
-            }
-            drain_pins(retired);
-        }
+        const bool ok = enqueue_signal(fence, value, retired, pin);
         retired.clear();
-        context_.holds().pump_ready();  // this Signal, or the hold above, may have made a held batch ready
+        context_.holds().pump_ready();
+        return ok;
+    }
+
+    // Admit the signal while the COM fence serializes its claims. Release retired pins and pump ready
+    // queues after dropping that lock, since either action can call back into the queue scheduler.
+    bool enqueue_signal(VkSemaphore fence, std::uint64_t value, std::vector<std::shared_ptr<void>>& retired,
+                        const PinFn& pin) {
+        bool ok = true;
+        std::lock_guard state(state_mutex_);
+        if (must_hold()) {
+            Deferred op;
+            op.kind = Deferred::Kind::signal;
+            op.fence = fence;
+            op.value = value;
+            if (pin) op.pins.push_back(pin());
+            hold(std::move(op));
+        } else {
+            ok = submit(VK_NULL_HANDLE, fence, value);
+        }
+        drain_pins(retired);
         return ok;
     }
 

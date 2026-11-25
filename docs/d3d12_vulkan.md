@@ -3140,8 +3140,11 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   Order against other work: a held `Signal(F, v)` released after an unheld `Signal(F, w)` with `w >= v` leaves the
   Vulkan signal out (timelines only increase; waits for `v` already pass), decided under the submit lock so the
   order of the checks is the order of the submissions, and the value counts as submitted only once the
-  `vkQueueSubmit` succeeded (a failed Signal releases nobody and its retry goes through); `Present` is queued behind
-  held work too (below). Fence keep-alives are released outside the queue lock, at the next `ExecuteCommandLists`,
+  `vkQueueSubmit` succeeded. The D3D12 fence reserves a value only after the CPU signal succeeds or the queue
+  accepts the signal for immediate submission or deferred execution. If a synchronous Vulkan call fails, the
+  application can retry the same value. Waiting queues are released only after a signal reaches Vulkan.
+  `Present` is queued behind held work too (below). Fence keep-alives are released outside the queue lock, at the
+  next `ExecuteCommandLists`,
   `Signal`, `Wait` or marker once their submission has completed. Edge cases:
   a queue destroyed with held operations reports them once (stderr: `queue destroyed with N held operation(s) never
   submitted: waits for a fence value (V) that no Signal reached`) and goes on without waiting, and the CPU waits on

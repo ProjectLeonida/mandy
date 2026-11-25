@@ -1,4 +1,4 @@
-// D3D12 fence device-loss reporting when vkGetSemaphoreCounterValue first discovers a lost device.
+// D3D12 fence error handling: lost-device reporting and retry after a synchronous Signal failure.
 // The injected VkResult is synthetic and never forwarded to the physical Vulkan driver. No game data.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
@@ -27,6 +27,10 @@ PFN_vkGetInstanceProcAddr real_instance = nullptr;
 PFN_vkGetDeviceProcAddr real_device = nullptr;
 PFN_vkGetSemaphoreCounterValue real_counter = nullptr;
 PFN_vkWaitSemaphores real_wait = nullptr;
+PFN_vkQueueSubmit real_submit = nullptr;
+PFN_vkSignalSemaphore real_signal = nullptr;
+std::atomic<bool> fail_next_submit{false};
+std::atomic<bool> fail_next_signal{false};
 std::atomic<VkResult> fail_next_counter{VK_SUCCESS};
 std::atomic<VkResult> fail_next_wait{VK_SUCCESS};
 std::atomic<unsigned> failed_count{0};
@@ -60,11 +64,26 @@ VKAPI_ATTR VkResult VKAPI_CALL wait_semaphores(VkDevice device, const VkSemaphor
     return real_wait(device, info, timeout);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL queue_submit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* infos,
+                                             VkFence fence) {
+    if (GetCurrentThreadId() == test_thread && fail_next_submit.exchange(false)) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    return real_submit(queue, count, infos, fence);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL signal_semaphore(VkDevice device, const VkSemaphoreSignalInfo* info) {
+    if (GetCurrentThreadId() == test_thread && fail_next_signal.exchange(false)) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    return real_signal(device, info);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char* name) {
     if (std::strcmp(name, "vkGetSemaphoreCounterValue") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(get_counter);
     if (std::strcmp(name, "vkWaitSemaphores") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(wait_semaphores);
+    if (std::strcmp(name, "vkQueueSubmit") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(queue_submit);
+    if (std::strcmp(name, "vkSignalSemaphore") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(signal_semaphore);
     return real_device(device, name);
 }
 
@@ -74,6 +93,37 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const
     return real_instance(instance, name);
 }
 }  // namespace driver
+
+bool retry_signal(ID3D12Device* device, bool fail_on_queue, bool retry_on_queue) {
+    Event complete;
+    Ref<ID3D12Fence> fence, finished;
+    Ref<ID3D12CommandQueue> producer, consumer;
+    const D3D12_COMMAND_QUEUE_DESC desc{};
+    if (!complete.handle ||
+        FAILED(device->CreateFence(2, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&finished.p))) ||
+        FAILED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&producer.p))) ||
+        FAILED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&consumer.p))))
+        return false;
+    constexpr UINT64 value = 7;
+    if (FAILED(consumer->Wait(fence.p, value)) || FAILED(consumer->Signal(finished.p, 1)) ||
+        FAILED(finished->SetEventOnCompletion(1, complete.handle)))
+        return false;
+
+    auto& injected = fail_on_queue ? driver::fail_next_submit : driver::fail_next_signal;
+    injected.store(true);
+    const auto signal = [&](bool from_queue) {
+        return from_queue ? producer->Signal(fence.p, value) : fence->Signal(value);
+    };
+    const HRESULT failed_signal = signal(fail_on_queue);
+    const bool still_armed = injected.exchange(false);
+    if (failed_signal != E_FAIL || still_armed || device->GetDeviceRemovedReason() != S_OK ||
+        fence->GetCompletedValue() != 2 || complete.ready(0))
+        return false;
+
+    return SUCCEEDED(signal(retry_on_queue)) && complete.ready(2000) &&
+           fence->GetCompletedValue() == value && finished->GetCompletedValue() == 1;
+}
 
 bool native_warp_control() {
     Ref<IDXGIFactory4> factory;
@@ -127,7 +177,29 @@ int main() {
     driver::real_wait = reinterpret_cast<PFN_vkWaitSemaphores>(
         driver::real_device(vk.device, "vkWaitSemaphores"));
     if (!driver::real_wait) return 1;
+    driver::real_submit = reinterpret_cast<PFN_vkQueueSubmit>(driver::real_device(vk.device, "vkQueueSubmit"));
+    driver::real_signal = reinterpret_cast<PFN_vkSignalSemaphore>(driver::real_device(vk.device, "vkSignalSemaphore"));
+    if (!driver::real_submit || !driver::real_signal) return 1;
     driver::test_thread = GetCurrentThreadId();
+
+    {
+        rt::d3d12::VulkanDeviceInfo info{};
+        info.get_instance_proc = driver::get_instance;
+        info.instance = vk.instance;
+        info.physical = vk.physical;
+        info.device = vk.device;
+        info.queue = vk.queue;
+        info.queue_family = vk.family;
+        Ref<ID3D12Device> device;
+        if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p)))) return 1;
+        if (!retry_signal(device.p, false, false) ||
+            !retry_signal(device.p, true, true) ||
+            !retry_signal(device.p, true, false)) {
+            std::fprintf(stderr, "failed to retry a fence Signal or release a waiting queue\n");
+            return 1;
+        }
+        std::printf("transient CPU and queue Signal failures: same-value retry releases the waiting queue\n");
+    }
 
     Event pending;
     if (!pending.handle) return 1;
