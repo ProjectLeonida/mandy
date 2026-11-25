@@ -12,6 +12,7 @@
 // Synthetic resources only; no game files.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
+#include "../src/depth24_fragment.h"
 
 #include <cstdio>
 
@@ -105,6 +106,10 @@ int main() {
         }
     }
     device->Release();
+
+    check(leonida::depth24_bias_constant(0.5f) > 0.0f &&
+              leonida::depth24_bias_constant(1.5f) > leonida::depth24_bias_constant(1.0f),
+          "depth24_bias_constant preserves fractional DepthBias", DXGI_FORMAT_D24_UNORM_S8_UINT);
 
     if (g_failures) {
         std::printf("d3d12_d24_support_test: %d checks failed\n", g_failures);
