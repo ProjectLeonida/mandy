@@ -738,6 +738,11 @@ def check(op, vals, srcs, e64, out_mods):
     if all(same(w, g) or (k >= 2 and same(w | 0x400000 if is_nan(w) else w, g)) for k, (w, g) in
            enumerate(zip(want_words, got))):
         return "match", None
+    for name, fn in KNOWN_DEVIATIONS.items():
+        alt = fn(Case(op, vals, srcs, e64, out_mods), want)
+        if alt is not None and all(same(w, g) or (k >= 2 and same(w | 0x400000 if is_nan(w) else w, g))
+                                   for k, (w, g) in enumerate(zip(alt + want_words[2:], got))):
+            return "deviation:" + name, (want_words, got, text)
     return "mismatch", (want_words, got, text)
 
 
@@ -756,7 +761,7 @@ def run_suite(programs, seed, ops, show=2, quiet=False):
 
 def translate_cases(cases, seed, show=2, quiet=False):
     """Judge each case against the translated SPIR-V. Cases of hardware-only ops are not sent to the translator."""
-    counts = {"match": 0, "mismatch": 0, "undefined": 0, "skip": {}}
+    counts = {"match": 0, "mismatch": 0, "undefined": 0, "skip": {}, "deviation": {}}
     by_op, undef_by_op, shown = {}, {}, {}
     programs = 0
     for case in cases:
@@ -768,6 +773,11 @@ def translate_cases(cases, seed, show=2, quiet=False):
         status, detail = check(op, vals, srcs, e64, out_mods)
         if status == "skip":
             counts["skip"][detail] = counts["skip"].get(detail, 0) + 1
+            continue
+        if status.startswith("deviation:"):
+            name = status.split(":", 1)[1]
+            counts["deviation"].setdefault(name, {}).setdefault(op, 0)
+            counts["deviation"][name][op] += 1
             continue
         counts[status] += 1
         if status == "undefined":
@@ -793,6 +803,9 @@ def translate_cases(cases, seed, show=2, quiet=False):
             print(f"  skip x{n}: {reason}")
         for (op, reason), n in sorted(undef_by_op.items(), key=lambda t: -t[1]):
             print(f"  undefined x{n}: {op}: {reason}")
+        for name, ops in sorted(counts["deviation"].items()):
+            print(f"  known deviation {name} x{sum(ops.values())}: " +
+                  ", ".join(f"{o} {n}" for o, n in sorted(ops.items())))
         for op, n in sorted(by_op.items(), key=lambda t: -t[1]):
             print(f"  mismatch x{n}: {op}")
     return counts, by_op, undef_by_op
