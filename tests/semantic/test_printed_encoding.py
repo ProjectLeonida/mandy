@@ -60,6 +60,23 @@ class PrintedEncodingTest(unittest.TestCase):
     def test_matching_blob_translates(self):
         self.assertIn("OpEntryPoint Fragment", self.translate(listing(PROGRAM), blob(PROGRAM)))
 
+    def test_interp_p2_f16_op_sel_hi_bit_is_ignored(self):
+        # The compiler stores op_sel_hi[2] (word 0 bit 14) set on v_interp_p2_f16 and llvm-mc re-encodes its 0
+        # default. The field names the third source's half, and that source is the attribute immediate, not a
+        # VGPR: the half actually interpolated is the `high` bit in byte 5. The pipeline library's PS builds
+        # store the bit; without this exception all of them were refused as "the blob holds ..., LLVM printed ...".
+        program = [
+            ("v_interp_p2_f16 v16, v1, attr2.z, v15 high", "10 00 5a d7 82 03 3e 04"),
+            ("exp mrt0 v16, v16, v16, v16 done vm", "0f 18 00 f8 10 10 10 10"),
+            ("s_endpgm", "00 00 81 bf"),
+        ]
+        stored = with_byte(program, 0, 1, 0x40)   # the blob's op_sel_hi[2]; LLVM printed 0
+        self.assertIn("OpEntryPoint Fragment", self.translate(listing(program), blob(stored)))
+        raw = bytes.fromhex("10 40 5a d7 82 03 3e 04")
+        printed = bytes.fromhex("10 00 5a d7 82 03 3e 04")
+        self.assertTrue(rdna2spirv.same_encoding(raw, printed, "v_interp_p2_f16", 4))
+        self.assertFalse(rdna2spirv.same_encoding(raw, printed, "v_interp_p1_f16", 4))
+
     def test_llvm19_sdwa_inline_float_uses_stored_width_and_operand(self):
         # src0_sel:WORD_1 takes the high half of the inline constant's f32 bits.
         # LLVM 19 prints it as a zero-extended half-precision literal and advances the listing by 12.

@@ -17389,7 +17389,8 @@ VOP3_TWO_DESTS = frozenset({
 def same_encoding(raw, printed, op, operand_count):
     """True if the bytes in the blob are the instruction LLVM printed. Exact match, except for fields the
     hardware ignores that LLVM re-encodes with its default: VOP3P op_sel_hi[2] (bit 14) on two-source packed
-    ops (seen: v_pk_add_f16 stored with 0, printed with 1), and unused VOP3/VOP3P SRC1 (bits 49:41) and SRC2
+    ops (seen: v_pk_add_f16 stored with 0, printed with 1), v_interp_p2_f16's stored destination op_sel bit
+    (bit 14, whose high half this op keeps, docs/design.md), and unused VOP3/VOP3P SRC1 (bits 49:41) and SRC2
     (bits 58:50) fields, which the game's compiler stores as 0 and LLVM 23 prints as 0x80 (inline constant 0;
     seen on two-source v_mul_legacy_f32/v_sub_f32/v_cmp_*_e64/v_mul_lo_u32/v_pk_mul_f16 and one-source
     v_rcp/v_log/v_sqrt_f32_e64). A used source encoded as 0 reads s0 and is not equivalent to inline zero."""
@@ -17404,6 +17405,11 @@ def same_encoding(raw, printed, op, operand_count):
     if not (vop3 or vop3p):
         return False
     op = base_op(op)
+    # v_interp_p2_f16 stores destination op_sel (bit 14) set while llvm-mc prints its 0 default. The high half of
+    # the destination is kept by this op (measured on gfx1036, tools/hw_oracle: a preset 0xdead high half survived),
+    # so the bit changes nothing; the `high` bit in byte 5 selects the attribute half, and the translator reads it.
+    if op == "v_interp_p2_f16":
+        diff &= ~(1 << 14)
     if op.startswith("v_cmpx_"):
         source_count = 2                          # EXEC is implicit on gfx10, but some listings spell it out.
     else:
