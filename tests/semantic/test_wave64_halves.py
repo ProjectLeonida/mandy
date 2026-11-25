@@ -1348,5 +1348,107 @@ class PixelShaders(unittest.TestCase):
                     self.assertEqual(slots64, slots32)
 
 
+class ImageAtomics(unittest.TestCase):
+    def _tier(self, name, lines, tier, reasons=None, idioms=None):
+        (t, r, i), _ = meta_of(name, lines)
+        self.assertEqual(t, tier, f"{name}: tier {t}, reasons {r}, idioms {i}")
+        if reasons is not None:
+            self.assertEqual(sorted(r), sorted(reasons), name)
+        if idioms is not None:
+            self.assertEqual(sorted(i), sorted(idioms), name)
+
+    def test_operands_glc_and_non_glc(self):
+        import wave64_halves
+        v10_11 = {"k": "vgpr", "r": 10, "n": 2}
+        v11 = {"k": "vgpr", "r": 11, "n": 1}
+        v12_13 = {"k": "vgpr", "r": 12, "n": 2}
+        nsa = {"k": "vlist", "regs": [("v", 12), ("v", 13)]}
+        rsrc = {"k": "sgpr", "r": 0, "n": 8}
+
+        dests, srcs, defs, uses = wave64_halves.operands({
+            "op": "image_atomic_add", "args": [v11, v12_13, rsrc], "mods": ["dmask:0x1", "unorm"],
+        })
+        self.assertEqual(dests, [])
+        self.assertEqual(srcs, [v11, v12_13, rsrc])
+        self.assertEqual((defs, uses), ([], []))
+
+        dests, srcs, _, _ = wave64_halves.operands({
+            "op": "image_atomic_cmpswap", "args": [v10_11, nsa, rsrc], "mods": ["dmask:0x3", "glc"],
+        })
+        self.assertEqual(dests, [v10_11])
+        self.assertEqual(srcs, [v10_11, nsa, rsrc])
+
+    def test_a_uniform_image_atomic(self):
+        self._tier("ps_img_a", ps([
+            "v_mov_b32_e32 v11, s18", "v_mov_b32_e32 v12, s18", "v_mov_b32_e32 v13, s19",
+            "image_atomic_add v11, v[12:13], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm",
+            "v_mov_b32_e32 v6, v11"]), "A", [], [])
+
+    def test_c_lane_id_data(self):
+        self._tier("ps_img_c_data", ps([
+            *LANE_ID, "v_mov_b32_e32 v12, s18", "v_mov_b32_e32 v13, s19",
+            "image_atomic_add v10, v[12:13], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm"]),
+            "C", ["lane-id"], [])
+
+    def test_c_lane_id_coord_vgpr_and_nsa(self):
+        self._tier("ps_img_c_coord_vec", ps([
+            *LANE_ID, "v_mov_b32_e32 v11, s18", "v_mov_b32_e32 v12, s18", "v_mov_b32_e32 v13, v10",
+            "image_atomic_add v11, v[12:13], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm"]),
+            "C", ["lane-id"], [])
+        self._tier("ps_img_c_coord_nsa", ps([
+            *LANE_ID, "v_mov_b32_e32 v11, s18", "v_mov_b32_e32 v12, s18", "v_mov_b32_e32 v13, v10",
+            "image_atomic_add v11, [v12, v13], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm"]),
+            "C", ["lane-id"], [])
+
+    def test_c_lane_count_data(self):
+        self._tier("ps_img_c_cnt", ps([
+            "s_bcnt1_i32_b64 s20, exec", "v_mov_b32_e32 v11, s20", "v_mov_b32_e32 v12, s18",
+            "v_mov_b32_e32 v13, s19",
+            "image_atomic_add v11, v[12:13], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm"]),
+            "C", ["lane-count"], [])
+
+    def test_c_glc_allocation_order_to_export(self):
+        self._tier("ps_img_c_glc", ps([
+            "v_mov_b32_e32 v11, 1", "v_mov_b32_e32 v12, s18", "v_mov_b32_e32 v13, s19",
+            "image_atomic_add v11, v[12:13], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm glc",
+            "v_mov_b32_e32 v6, v11"]), "C", ["allocation-order"], [])
+
+    def test_c_elected_constant_side_effect(self):
+        self._tier("ps_img_c_elect_const", ps([
+            "v_mbcnt_lo_u32_b32 v10, exec_lo, 0", "v_mbcnt_hi_u32_b32 v10, exec_hi, v10",
+            "v_cmp_eq_u32_e32 vcc, 0, v10", "s_and_saveexec_b64 s[14:15], vcc",
+            "v_mov_b32_e32 v11, 1", "v_mov_b32_e32 v12, s18", "v_mov_b32_e32 v13, s19",
+            "image_atomic_add v11, v[12:13], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm",
+            "s_or_b64 exec, exec, s[14:15]"]), "C", ["elected-side-effect"], ["elected-lane"])
+
+    def test_c_elected_aggregated_nonuniform_nsa_coord(self):
+        self._tier("ps_img_c_elect_nsa", ps([
+            "s_bcnt1_i32_b64 s20, exec", "v_mbcnt_lo_u32_b32 v10, exec_lo, 0",
+            "v_mbcnt_hi_u32_b32 v10, exec_hi, v10", "v_cmp_eq_u32_e32 vcc, 0, v10",
+            "s_and_saveexec_b64 s[14:15], vcc", "v_mov_b32_e32 v11, s20", "v_mov_b32_e32 v12, s18",
+            "v_mov_b32_e32 v13, v0",
+            "image_atomic_add v11, [v12, v13], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm",
+            "s_or_b64 exec, exec, s[14:15]"]), "C", ["elected-lane"], ["aggregated-atomic", "elected-lane"])
+
+    def test_b_aggregated_image_atomic(self):
+        self._tier("ps_img_b_agg", ps([
+            "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4", "s_and_saveexec_b64 s[12:13], vcc",
+            "s_bcnt1_i32_b64 s20, exec", "v_mbcnt_lo_u32_b32 v10, exec_lo, 0", "v_mbcnt_hi_u32_b32 v10, exec_hi, v10",
+            "v_cmp_eq_u32_e32 vcc, 0, v10", "s_and_saveexec_b64 s[14:15], vcc", "v_mov_b32_e32 v11, s20",
+            "v_mov_b32_e32 v12, s18", "v_mov_b32_e32 v13, s19",
+            "image_atomic_add v11, v[12:13], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm glc",
+            "s_or_b64 exec, exec, s[14:15]", "v_readfirstlane_b32 s21, v11", "v_add_nc_u32_e32 v14, s21, v10",
+            "v_lshlrev_b32_e32 v14, 2, v14", "buffer_store_dword v0, v14, s[0:3], 0 offen offset:256",
+            "s_mov_b64 exec, s[10:11]"]), "B", [], ["aggregated-atomic", "elected-lane"])
+
+    def test_c_stale_scalar_descriptor(self):
+        self._tier("ps_img_c_stale", ps([
+            "s_mov_b32 s2, 0", "v_cmp_gt_u32_e32 vcc, 40, v0", "s_cbranch_vccz 3",
+            "s_and_saveexec_b64 s[12:13], vcc", "s_mov_b32 s2, 1", "s_or_b64 exec, exec, s[12:13]",
+            "v_mov_b32_e32 v11, s18", "v_mov_b32_e32 v12, s18", "v_mov_b32_e32 v13, s19",
+            "image_atomic_add v11, v[12:13], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm"]),
+            "C", ["stale-scalar"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
