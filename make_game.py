@@ -1975,13 +1975,6 @@ def runtime_gpu_explicit_lod_bias():
         return None if v is None else bool(v)
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return None
-    try:
-        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "lod_bias_probe.py"), "--build", build],
-                           capture_output=True, text=True, timeout=300)
-        v = json.loads(r.stdout.strip().splitlines()[-1]).get("explicit_lod_bias")
-        return None if v is None else bool(v)
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
-        return None
 
 
 def runtime_gpu_per_vertex():
