@@ -1,8 +1,31 @@
 # GPU test results
 
-This page keeps a local record of GPU test runs. The project's public tracker is
-[#166](https://github.com/ItsNotRexed/Leonida/issues/166) (one comment per GPU and driver);
-post counts and pass/fail lines there, never game shaders, logs or private paths.
+This page keeps a record of GPU test runs. A new result is a pull request that adds a file to
+[`gpu-test-results/`](../gpu-test-results), in the format of the files there ([testing.md](testing.md) has how to run
+the tests); post counts and pass/fail lines, never game shaders, logs or private paths. The old public tracker,
+#166 in the original repository, went private with it on 23 November 2026.
+
+The records in [`gpu-test-results/`](../gpu-test-results) that the table and sections below do not cover yet, one row
+each; the file has the tools, the skipped cases and the reasons for each failure:
+
+| Record | GPU | Driver, OS | Commit | `run_gpu_tests.py` native | `LEONIDA_W64_EMULATE=1` | Failed |
+|---|---|---|---|---|---|---|
+| [RTX2060SUPER.txt](../gpu-test-results/RTX2060SUPER.txt) | NVIDIA GeForce RTX 2060 SUPER (Turing) | NVIDIA 621.14, Windows 11 Pro | `d42773d` | 197/248, 49 skipped, 2 failed | 229/248, 17 skipped, 2 failed | `cs_imgload_tfe`, `cs_imgload_d16_tfe` |
+| [RTX3060Ti-Windows.txt](../gpu-test-results/RTX3060Ti-Windows.txt) | NVIDIA GeForce RTX 3060 Ti (Ampere) | NVIDIA 621.14, Windows 11 Pro | `3aa9754` | 203/252, 49 skipped, 0 failed | 235/252, 17 skipped, 0 failed | none |
+| [RTX3070Ti.txt](../gpu-test-results/RTX3070Ti.txt) | NVIDIA GeForce RTX 3070 Ti (Ampere) | NVIDIA 621.24, Windows 11 | `d42773d` | 197/248, 49 skipped, 2 failed | 229/248, 17 skipped, 2 failed | `cs_imgload_tfe`, `cs_imgload_d16_tfe` |
+| [RTX4060-Nobara-three-tests.txt](../gpu-test-results/RTX4060-Nobara-three-tests.txt) | NVIDIA GeForce RTX 4060 (Ada) | NVIDIA 595.112.07, Nobara Linux 44 | `1c93c86` | 3 filtered tests: 3 passed | not run | none (three tests only) |
+| [RTX4070.txt](../gpu-test-results/RTX4070.txt) | NVIDIA GeForce RTX 4070 (Ada) | NVIDIA 617.42, Windows 11 Pro for Workstations | `c023a36` | 197/248, 49 skipped, 2 failed | 229/248, 17 skipped, 2 failed | `cs_imgload_tfe`, `cs_imgload_d16_tfe` |
+| [RTX4070Ti.txt](../gpu-test-results/RTX4070Ti.txt) | NVIDIA GeForce RTX 4070 Ti (Ada) | NVIDIA 620.70.06, CachyOS | `84347bb` | 197/248, 49 skipped, 2 failed | 229/248, 17 skipped, 2 failed | `cs_imgload_tfe`, `cs_imgload_d16_tfe` |
+| [RTX4080.txt](../gpu-test-results/RTX4080.txt) | NVIDIA GeForce RTX 4080 (Ada) | NVIDIA 621.24, Windows 11 Home | `71f99e2` | 203/252, 49 skipped, 0 failed | 235/252, 17 skipped, 0 failed | none |
+| [RTX5070.txt](../gpu-test-results/RTX5070.txt) | NVIDIA GeForce RTX 5070 (Blackwell) | NVIDIA 621.14, Windows 11 Pro | `d42773d` | 197/248, 49 skipped, 2 failed | 229/248, 17 skipped, 2 failed | `cs_imgload_tfe`, `cs_imgload_d16_tfe`; `d3d12_execute_indirect_validation` (see the record) |
+| [RTX5090.txt](../gpu-test-results/RTX5090.txt) | NVIDIA GeForce RTX 5090 (Blackwell) | NVIDIA 621.24, Windows 11 | `8f481cf` | 197/248, 49 skipped, 2 failed | 229/248, 17 skipped, 2 failed | `cs_imgload_tfe`, `cs_imgload_d16_tfe` |
+| [GTX1080.txt](../gpu-test-results/GTX1080.txt) | NVIDIA GeForce GTX 1080 (Pascal) | NVIDIA 582.78, Windows 11 Pro | `3295055` | 193/252, 59 skipped, 0 failed | 224/252, 28 skipped, 0 failed | none |
+| [RX5700XT.txt](../gpu-test-results/RX5700XT.txt) | AMD Radeon RX 5700 XT (RDNA1) | AMD 26.11.2, Windows 11 Pro | `a0e1876` (original repository) | 213/241, 28 skipped, 0 failed | 213/241, 28 skipped, 0 failed | none |
+| [Raphael-610M.txt](../gpu-test-results/Raphael-610M.txt) | AMD Radeon 610M, Ryzen 9 7900X iGPU (RDNA2) | RADV, Mesa 26.2.6, Arch Linux | `84347bb` | 230/248, 16 skipped, 2 failed | 230/248, 16 skipped, 2 failed | `cs_imgload_tfe`, `cs_imgload_d16_tfe` |
+| [GraniteRidge-9950X3D.txt](../gpu-test-results/GraniteRidge-9950X3D.txt) | AMD Radeon Graphics, Ryzen 9 9950X3D iGPU (RDNA2) | AMD 32.0.21042.62, Windows 11 Home | `3aa9754` | 235/252, 17 skipped, 0 failed | 235/252, 17 skipped, 0 failed | none |
+| [llvmpipe-arm64-Linux.txt](../gpu-test-results/llvmpipe-arm64-Linux.txt) | Mesa llvmpipe, software (arm64) | llvmpipe, Mesa 25.0.7, Debian 13 | `6293c1c` | 169/252, 83 skipped, 0 failed | `--filter cs_`: 93/121, 28 skipped, 0 failed | none |
+
+The runs written up on this page, each with a section of its own:
 
 | GPU | Driver, OS | Commit | build.py | check.py | run_gpu_tests.py | Failed | Entry |
 |---|---|---|---|---|---|---|---|
