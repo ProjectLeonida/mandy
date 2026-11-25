@@ -53,6 +53,19 @@ _INLINE_FLOAT_STR = {
     248: "0.15915494",
 }
 
+# GFX10 special source operands (RDNA2 ISA Table 21, Source Operand Encoding).
+_SPECIAL_SRCS = {
+    235: "src_shared_base",
+    236: "src_shared_limit",
+    237: "src_private_base",
+    238: "src_private_limit",
+    239: "src_pops_exiting_wave_id",
+    251: "src_vccz",
+    252: "src_execz",
+    253: "src_scc",
+    254: "src_lds_direct",
+}
+
 # VOP2 instructions that always carry a trailing 32-bit literal constant.
 _VOP2_MANDATORY_LITERAL = frozenset({
     0x20,  # v_madmk_f32 (gfx1013)
@@ -203,7 +216,7 @@ def _vreg(reg: int, n: int = 1) -> dict:
     return {"k": "vgpr", "r": reg & 0xFF, "n": max(1, n), "neg": False, "abs": False}
 
 
-def _src(code: int, n: int, lit: int | None, *, neg: bool = False, absm: bool = False) -> dict:
+def _src(code: int, n: int, lit: int | None, *, neg: bool = False, absm: bool = False, f64: bool = False) -> dict:
     """Decode a 9-bit RDNA2 source operand (0..511)."""
     if code <= 127:
         op = _sreg(code, n)
@@ -213,16 +226,16 @@ def _src(code: int, n: int, lit: int | None, *, neg: bool = False, absm: bool = 
         op = {"k": "imm", "v": -(code - 192)}
     elif code in _INLINE_FLOAT:
         op = {"k": "fimm", "v": _INLINE_FLOAT[code], "abs": False}
-    elif code == 251:
-        op = {"k": "special", "t": "src_vccz", "neg": False, "abs": False}
-    elif code == 252:
-        op = {"k": "special", "t": "src_execz", "neg": False, "abs": False}
-    elif code == 253:
-        op = {"k": "special", "t": "src_scc", "neg": False, "abs": False}
-    elif code == 254:
-        op = {"k": "special", "t": "src_lds_direct", "neg": False, "abs": False}
+    elif code in _SPECIAL_SRCS:
+        op = {"k": "special", "t": _SPECIAL_SRCS[code], "neg": False, "abs": False}
     elif code == 255:
-        op = {"k": "imm", "v": 0 if lit is None else lit}
+        val = 0 if lit is None else lit
+        op = {"k": "imm", "v": val}
+        if f64:
+            # RDNA2 places a trailing 32-bit literal in bits [63:32] of an f64 source
+            # (matching shader_ir.parse_line and rdna2spirv.f64_source_words).
+            op["f64_literal"] = True
+            op["literal_hex_digits"] = len(f"{val:x}")
     elif 256 <= code <= 511:
         op = _vreg(code - 256, n)
     else:
@@ -507,12 +520,12 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                 nbytes = 8
             op_name = name if not spec or name in ("v_nop", "v_clrexcp", "v_pipeflush", "v_readfirstlane_b32") else name + "_e32"
             args = []
-            for fn, nr, _ in spec:
+            for fn, nr, typ in spec:
                 w = _width(nr, wave32)
                 if fn == "VDST":
                     args.append(_sreg(vdst & 0x7F, 1) if name == "v_readfirstlane_b32" else _vreg(vdst, w))
                 elif fn == "SRC0":
-                    args.append(_src(src0, w, lit))
+                    args.append(_src(src0, w, lit, f64=(typ == "f64")))
             return finish(op_name, args, mods, nbytes)
 
         if hi7 == 0x3E:  # VOPC
@@ -586,13 +599,13 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                 lit = struct.unpack_from("<I", code, pc + 4)[0]
                 nbytes = 8
             args = []
-            for fn, nr, _ in spec:
+            for fn, nr, typ in spec:
                 w = _width(nr, wave32)
                 if fn == "VCC":
                     if not name.startswith("v_cmpx_"):
                         args.append(_vcc_operand(wave32))
                 elif fn == "SRC0":
-                    args.append(_src(src0, w, lit))
+                    args.append(_src(src0, w, lit, f64=(typ == "f64")))
                 elif fn == "VSRC1":
                     args.append(_vreg(vsrc1, w))
             return finish(name + "_e32", args, mods, nbytes)
@@ -972,7 +985,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         args = []
         mods = []
         is_interp_vop3 = opc in (0x200, 0x201, 0x202, 0x342, 0x343, 0x35A)
-        for fn, nr, _ in spec:
+        for fn, nr, typ in spec:
             w = _width(nr, wave32)
             if fn == "VDST":
                 if opc < 0x100:  # VOPC promoted to VOP3: VDST field actually holds SDST (7-bit)
@@ -990,15 +1003,15 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                     if opc in (0x342, 0x343, 0x35A) and ((src0 >> 8) & 1):
                         mods.append("high")
                 else:
-                    args.append(_src(src0, w, lit, neg=bool(neg & 1), absm=bool(abs_bits & 1)))
+                    args.append(_src(src0, w, lit, neg=bool(neg & 1), absm=bool(abs_bits & 1), f64=(typ == "f64")))
             elif fn == "SRC1":
                 if opc == 0x202:  # v_interp_mov_f32_e64: param selector p10/p20/p0
                     p = {0: "p10", 1: "p20", 2: "p0"}.get(src1 & 3, f"p{src1}")
                     args.append({"k": "interp", "t": p})
                 else:
-                    args.append(_src(src1, w, lit, neg=bool(neg & 2), absm=bool(abs_bits & 2)))
+                    args.append(_src(src1, w, lit, neg=bool(neg & 2), absm=bool(abs_bits & 2), f64=(typ == "f64")))
             elif fn == "SRC2":
-                args.append(_src(src2, w, lit, neg=bool(neg & 4), absm=bool(abs_bits & 4)))
+                args.append(_src(src2, w, lit, neg=bool(neg & 4), absm=bool(abs_bits & 4), f64=(typ == "f64")))
         if name in ("v_permlane16_b32", "v_permlanex16_b32"):
             # These two use op_sel bits 0 and 1 as FI and BOUND_CTRL, not as half selects. llvm-mc prints just that
             # pair, and nothing when both are 0, whatever bits 2 and 3 hold (LLVM 21.1.8, gfx1013).
@@ -1397,7 +1410,7 @@ def _format_operand(a: dict, hex_imm: bool = False) -> str:
         s = a["t"]
     elif k == "imm":
         v = a["v"]
-        s = f"0x{v:x}" if hex_imm or v >= 100 else str(v)
+        s = f"0x{v:x}" if hex_imm or a.get("f64_literal") or v >= 100 else str(v)
     elif k == "fimm":
         v = a["v"]
         s = next((txt for code, txt in _INLINE_FLOAT_STR.items() if _INLINE_FLOAT[code] == v), repr(v))
