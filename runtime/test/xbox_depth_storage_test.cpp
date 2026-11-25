@@ -121,19 +121,109 @@ int check_d16s8_d24_uav(ID3D12Device* dev, ID3D12Device* xbox) {
     VirtualFree(va, 0, MEM_RELEASE);
     VERIFY(placed_ok && placed_views_ok);
 
-    // CreateCommittedResource3 with a castable format list also keeps ALLOW_UNORDERED_ACCESS.
+    // CreateCommittedResource3 with a castable format list also keeps ALLOW_UNORDERED_ACCESS (direct and slot 127),
+    // while plain PC D24_UNORM_S8_UINT refuses R16/R8 castable views and refuses ALLOW_UNORDERED_ACCESS.
     {
         Ref<ID3D12Device10> dev10;
         VERIFY(SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dev10.p))));
         D3D12_RESOURCE_DESC1 desc1{tex.Dimension, 0, 32, 32, 1, 1, xbox_d16s8, tex.SampleDesc,
                                    D3D12_TEXTURE_LAYOUT_UNKNOWN, tex.Flags, {}};
         const DXGI_FORMAT castable[] = {xbox_d16s8, xbox_d16_plane, xbox_s8_plane,
+                                        DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                                        DXGI_FORMAT_X24_TYPELESS_G8_UINT, DXGI_FORMAT_R16_TYPELESS,
                                         DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R8_UINT};
         Ref<ID3D12Resource> c3;
         VERIFY(SUCCEEDED(dev10->CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &desc1,
                                                          D3D12_BARRIER_LAYOUT_COMMON, &clear, nullptr,
                                                          UINT(std::size(castable)), castable, IID_PPV_ARGS(&c3.p))));
         VERIFY(c3.p && c3->GetDesc().Flags == tex.Flags && c3->GetDesc().Format == DXGI_FORMAT_D24_UNORM_S8_UINT);
+        const DXGI_FORMAT bad_view = DXGI_FORMAT_R32_FLOAT;
+        Ref<ID3D12Resource> bad_c3;
+        VERIFY(dev10->CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &desc1, D3D12_BARRIER_LAYOUT_COMMON,
+                                               &clear, nullptr, 1, &bad_view, IID_PPV_ARGS(&bad_c3.p)) == E_INVALIDARG &&
+               !bad_c3.p);
+
+        // Xbox slot 127 forwards to CreateCommittedResource3 with the Xbox layout word replaced.
+        using Slot127 = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+                                         const D3D12_RESOURCE_DESC1*, D3D12_BARRIER_LAYOUT, const D3D12_CLEAR_VALUE*,
+                                         ID3D12ProtectedResourceSession*, UINT, const DXGI_FORMAT*, REFIID, void**);
+        D3D12_RESOURCE_DESC1 xbox_desc1 = desc1;
+        xbox_desc1.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+        Ref<ID3D12Resource> c3x;
+        VERIFY(SUCCEEDED(reinterpret_cast<Slot127>(slot(xbox, 127))(
+            xbox, &heap, D3D12_HEAP_FLAG_NONE, &xbox_desc1, D3D12_BARRIER_LAYOUT_COMMON, &clear, nullptr,
+            UINT(std::size(castable)), castable, IID_PPV_ARGS(&c3x.p))));
+        VERIFY(c3x.p && c3x->GetDesc().Flags == tex.Flags && c3x->GetDesc().Format == DXGI_FORMAT_D24_UNORM_S8_UINT);
+
+        // Plain PC D24_UNORM_S8_UINT: refuses ALLOW_UNORDERED_ACCESS and refuses R16/R8 castable formats.
+        D3D12_RESOURCE_DESC1 pc_d24 = desc1;
+        pc_d24.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        D3D12_CLEAR_VALUE pc_clear = clear;
+        pc_clear.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        Ref<ID3D12Resource> refused;
+        VERIFY(dev10->CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &pc_d24, D3D12_BARRIER_LAYOUT_COMMON,
+                                               &pc_clear, nullptr, 0, nullptr, IID_PPV_ARGS(&refused.p)) == E_INVALIDARG &&
+               !refused.p);
+        pc_d24.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        for (const DXGI_FORMAT narrow : {DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16_UINT,
+                                         DXGI_FORMAT_R8_UINT}) {
+            VERIFY(dev10->CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &pc_d24, D3D12_BARRIER_LAYOUT_COMMON,
+                                                   &pc_clear, nullptr, 1, &narrow, IID_PPV_ARGS(&refused.p)) ==
+                       E_INVALIDARG &&
+                   !refused.p);
+        }
+
+        // CreateCommittedResource2, CreatePlacedResource/2 (in a heap), and CreateReservedResource with format 118.
+        Ref<ID3D12Device8> dev8;
+        VERIFY(SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dev8.p))));
+        D3D12_RESOURCE_DESC1 d16_no_uav = desc1;
+        d16_no_uav.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        Ref<ID3D12Resource> c2;
+        VERIFY(SUCCEEDED(dev8->CreateCommittedResource2(&heap, D3D12_HEAP_FLAG_NONE, &d16_no_uav,
+                                                        D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, nullptr,
+                                                        IID_PPV_ARGS(&c2.p))));
+        VERIFY(c2.p && c2->GetDesc().Format == DXGI_FORMAT_D24_UNORM_S8_UINT);
+        VERIFY(dev8->CreateCommittedResource2(&heap, D3D12_HEAP_FLAG_NONE, &desc1, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                              &clear, nullptr, IID_PPV_ARGS(&refused.p)) == E_INVALIDARG &&
+               !refused.p);
+
+        D3D12_RESOURCE_DESC placed_desc{};
+        placed_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        placed_desc.Width = placed_desc.Height = 32;
+        placed_desc.DepthOrArraySize = placed_desc.MipLevels = 1;
+        placed_desc.Format = xbox_d16s8;
+        placed_desc.SampleDesc.Count = 1;
+        placed_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        const auto placed_alloc = dev->GetResourceAllocationInfo(0, 1, &placed_desc);
+        VERIFY(placed_alloc.SizeInBytes > 0 && placed_alloc.SizeInBytes != UINT64_MAX);
+        D3D12_HEAP_DESC heap_desc{placed_alloc.SizeInBytes, heap, placed_alloc.Alignment, D3D12_HEAP_FLAG_NONE};
+        Ref<ID3D12Heap> placed_heap;
+        VERIFY(SUCCEEDED(dev->CreateHeap(&heap_desc, IID_PPV_ARGS(&placed_heap.p))));
+        Ref<ID3D12Resource> heap_placed;
+        VERIFY(SUCCEEDED(dev->CreatePlacedResource(placed_heap.p, 0, &placed_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                                   &clear, IID_PPV_ARGS(&heap_placed.p))));
+        VERIFY(heap_placed.p && heap_placed->GetDesc().Format == DXGI_FORMAT_D24_UNORM_S8_UINT);
+        D3D12_RESOURCE_DESC placed_uav = placed_desc;
+        placed_uav.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        VERIFY(dev->CreatePlacedResource(placed_heap.p, 0, &placed_uav, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear,
+                                         IID_PPV_ARGS(&refused.p)) == E_INVALIDARG &&
+               !refused.p);
+        Ref<ID3D12Resource> heap_placed2;
+        VERIFY(SUCCEEDED(dev10->CreatePlacedResource2(placed_heap.p, 0, &d16_no_uav, D3D12_BARRIER_LAYOUT_COMMON,
+                                                      &clear, 0, nullptr, IID_PPV_ARGS(&heap_placed2.p))));
+        VERIFY(heap_placed2.p && heap_placed2->GetDesc().Format == DXGI_FORMAT_D24_UNORM_S8_UINT);
+        for (const DXGI_FORMAT narrow : {DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R8_UINT}) {
+            VERIFY(dev10->CreatePlacedResource2(placed_heap.p, 0, &pc_d24, D3D12_BARRIER_LAYOUT_COMMON, &pc_clear,
+                                                1, &narrow, IID_PPV_ARGS(&refused.p)) == E_INVALIDARG &&
+                   !refused.p);
+        }
+
+        // Reserved resources reject stencil formats (including format 118) because they have no tile shape.
+        D3D12_RESOURCE_DESC reserved_desc = placed_desc;
+        reserved_desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+        VERIFY(dev->CreateReservedResource(&reserved_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear,
+                                           IID_PPV_ARGS(&refused.p)) == E_INVALIDARG &&
+               !refused.p);
     }
 
     // Direct parent D24S8 attachment readback after R16_UNORM float + R16_UINT uint + R8_UINT stencil UAV clears.

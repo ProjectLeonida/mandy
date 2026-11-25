@@ -5202,7 +5202,8 @@ Format texture_format(const DeviceState& device, const D3D12_RESOURCE_DESC& desc
 // no-op. An A8 render target's VK_FORMAT_A8_UNORM_KHR image (Format::a8_as_alpha) is in a class of its own: no
 // other format can be a view format of it, so any other castable format is refused here, before Vulkan.
 HRESULT castable_view_formats(const Format& format, DXGI_FORMAT resource_format, UINT32 count,
-                              const DXGI_FORMAT* castable, std::vector<VkFormat>& out, bool depth_uav_planes = false) {
+                              const DXGI_FORMAT* castable, std::vector<VkFormat>& out, bool depth_uav_planes = false,
+                              bool console_d16s8 = false) {
     if (!count || !castable) return S_OK;
     const bool depth = (format.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
     const leonida::BlockFormat own = leonida::block_format(format.format, format.aspects);
@@ -5219,11 +5220,13 @@ HRESULT castable_view_formats(const Format& format, DXGI_FORMAT resource_format,
             const bool valid = format.format == VK_FORMAT_D16_UNORM
                 ? view == DXGI_FORMAT_R16_TYPELESS || view == DXGI_FORMAT_D16_UNORM ||
                   view == DXGI_FORMAT_R16_UNORM || view == DXGI_FORMAT_R16_UINT
-                : (format.xbox_depth16_stencil8 || format.d24)
+                : (format.xbox_depth16_stencil8 || console_d16s8)
                 ? view == xbox_d16s8 || view == xbox_d16_plane || view == xbox_s8_plane ||
-                  view == DXGI_FORMAT_D24_UNORM_S8_UINT || view == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
-                  view == DXGI_FORMAT_X24_TYPELESS_G8_UINT || view == DXGI_FORMAT_R16_TYPELESS ||
-                  view == DXGI_FORMAT_R16_UNORM || view == DXGI_FORMAT_R16_UINT || view == DXGI_FORMAT_R8_UINT
+                  (format.d24 && (view == DXGI_FORMAT_D24_UNORM_S8_UINT ||
+                                  view == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+                                  view == DXGI_FORMAT_X24_TYPELESS_G8_UINT)) ||
+                  view == DXGI_FORMAT_R16_TYPELESS || view == DXGI_FORMAT_R16_UNORM ||
+                  view == DXGI_FORMAT_R16_UINT || view == DXGI_FORMAT_R8_UINT
                 : view == DXGI_FORMAT_R32G8X24_TYPELESS || view == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
                   view == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS || view == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT ||
                   view == DXGI_FORMAT_R32_FLOAT || view == DXGI_FORMAT_R8_UINT;
@@ -15641,6 +15644,7 @@ public:
         if (out) *out = nullptr;
         auto* heap = Heap::from<Heap>(heap_interface);
         if (!heap || !desc) return d3d12_trace::result(method, E_INVALIDARG);
+        const bool from_xbox_d16s8 = desc->Format == xbox_d16s8;
         D3D12_RESOURCE_DESC canonical = *desc;
         canonical.Format = pc_format(canonical.Format);  // the console's D16S8 family as D24S8
         desc = &canonical;
@@ -15731,6 +15735,7 @@ public:
         // create_texture makes for 1D, 2D and 3D alike (arrays and mips included), as for a committed texture.
         const VkDeviceSize placed_va = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? heap->offset() + heap_offset : 0;
         auto* resource = new Resource(state_, *desc, heap->properties(), heap->flags(), placed_va);
+        if (from_xbox_d16s8) resource->mark_console_d16s8();
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (buffer) {
@@ -15742,7 +15747,8 @@ public:
                 hr = E_INVALIDARG;
             } else {
                 std::vector<VkFormat> cast_formats;
-                hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats);
+                hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats, false,
+                                           from_xbox_d16s8);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
@@ -17056,7 +17062,8 @@ private:
                 hr = E_INVALIDARG;
             } else {
                 std::vector<VkFormat> cast_formats;
-                hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats, storage_heap_flags.has_value());
+                hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats,
+                                           storage_heap_flags.has_value(), from_xbox_d16s8);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats, origin);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
                 if (SUCCEEDED(hr) && storage_heap_flags) hr = resource->enable_depth_stencil_uav(*storage_heap_flags);
