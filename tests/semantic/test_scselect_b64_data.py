@@ -380,10 +380,12 @@ class LaneMaskPreservationTests(unittest.TestCase):
                 ]
                 outs, _ = run_ps_wave(lines, wave=32)
                 want_cnt = 10 if scc else 16
+                # v3 = v_mov_b32 of mask SGPR s4: a data read gives the whole wave's mask word,
+                # the same in every lane, not this lane's 0 / ~0 bit.
+                want_s4 = sum(1 << l for l in range(32) if ((l < 10) if scc else (l >= 16)))
                 for lane in range(32):
                     in_mask = (lane < 10) if scc else (lane >= 16)
                     want_v1 = 0x55 if (scc == 0 or in_mask) else 0xAA
-                    want_s4 = MASK32 if in_mask else 0
                     self.assertEqual(outs[lane], (want_cnt, want_v1, scc, want_s4), f"lane={lane}")
 
     def test_wave64_vcc_exec_and_sgpr_masks(self):

@@ -269,6 +269,23 @@ SOPC_SRC32_SPECIALS = frozenset({
 })
 SOPC_SRC64_SPECIALS = frozenset({"vcc", "exec", "null"})
 
+# Ops that read a lane-mask operand as a plain number even though the destination is not a VGPR
+# (the scalar ALU set; the v_* entries already qualify through their VGPR destinations). Ported from
+# PR #1043's lane_masks.NUMBER_READERS so scalar readers (s_add_u32 s20, s10, K after v_cmp wrote s10)
+# see the wave's mask word, not this lane's 0 / ~0 bit. Mask-preserving ops (s_mov_b32, the MASK_SOP2
+# logic ops, saveexec/wrexec) are deliberately absent: a mask moving or combining as a mask keeps the
+# per-lane bit mask_src readers rely on. _sdwa / _dpp / _dpp8 forms are excluded at the check site.
+MASK_NUMBER_READERS = frozenset((
+    "s_add_u32", "s_add_i32", "s_sub_u32", "s_sub_i32", "s_addc_u32", "s_subb_u32", "s_mul_i32",
+    "s_mul_hi_u32", "s_mul_hi_i32", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32", "s_bfe_u32", "s_bfe_i32",
+    "s_min_u32", "s_min_i32", "s_max_u32", "s_max_i32", "s_brev_b32",
+    "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32",
+    "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_lshlrev_b32", "v_lshrrev_b32",
+    "v_ashrrev_i32", "v_mul_lo_u32", "v_mul_hi_u32", "v_min_u32", "v_max_u32", "v_min_i32",
+    "v_max_i32", "v_bfe_u32", "v_bfe_i32", "v_add3_u32", "v_lshl_add_u32", "v_add_lshl_u32",
+    "v_bcnt_u32_b32",
+))
+
 # Runs of lane-local VALU instructions share one `if (active)` instead of an OpSelect per VGPR write (Gen.insns).
 # VALU ops that are not lane-local: they read other lanes, write a lane mask, SCC or EXEC, or write a carry or
 # other scalar result in every lane (v_add_co_u32's mask goes to inactive lanes too).
@@ -524,7 +541,21 @@ class Gen:
 
     def src_u(self, a):
         k = a["k"]
-        if k in ("vgpr", "sgpr"):
+        if ((k == "sgpr" and a.get("n", 1) == 1) or
+                (k == "special" and a.get("t") in ("exec_lo", "exec_hi", "vcc", "vcc_lo", "vcc_hi"))) \
+                and self.holds_lane_mask(a) and self.mask_read_is_data():
+            # The operand holds this lane's 0 / ~0 bit of a lane mask; a data read wants the whole wave's
+            # mask word (the same in every lane), as the SOP ops that read a mask as a number already do
+            # (lane_mask_word). Until now a VALU read (v_mov_b32 v6, s16 after v_cmp wrote s16) gave each
+            # lane its own bit where hardware gives the mask itself (found by tools/crosslane_fuzz.py).
+            # Only when the destination is a VGPR: a mask moving into an SGPR, EXEC or VCC keeps this
+            # lane's bit, which mask_src readers rely on. A VGPR that stays a mask keeps the word too —
+            # mask_src extracts this lane's bit back out when a mask consumer reads one.
+            # The gather itself is eager (wave_mask): EXEC narrowing is a per-lane value in this
+            # model, not SPIR-V control flow, and mask-data readers are kept out of lane-local
+            # `if (active)` runs, so lanes off in EXEC still contribute their mask bits.
+            v = self.lane_mask_word(a)
+        elif k in ("vgpr", "sgpr"):
             if a.get("n", 1) != 1:
                 raise Unsupported("64-bit operand")
             v = self.load_reg(k, a["r"])
@@ -563,6 +594,33 @@ class Gen:
         if "sdwa_sel" in a:
             v = self.sdwa_src(v, a)
         return self.modify(v, a)
+
+    def mask_read_is_data(self, ins=None):
+        """Whether the instruction being translated (self.cur_ins, or `ins`) consumes a lane mask as plain data.
+        A VGPR destination means the mask operand is read as a 32-bit value — the whole wave's mask word,
+        which is what hardware holds and what the VGPR then stores (a mask that stays in a VGPR keeps the
+        word too; mask_src extracts this lane's bit back out for mask consumers). Anything else — an SGPR,
+        EXEC or VCC destination — keeps this lane's 0 / ~0 bit, which mask_src readers rely on."""
+        ins = self.cur_ins if ins is None else ins
+        if ins is None:
+            return False
+        a = ins["args"]
+        if not a:
+            return False
+        if base_op(ins["op"]) in MASK_NUMBER_READERS and not ins["op"].endswith(("_sdwa", "_dpp", "_dpp8")):
+            # A scalar (or plain vector) number op reads the mask operand as data even with an SGPR
+            # destination: s_add_u32 s20, s10, K wants the wave's mask word in s20 (#1043's
+            # NUMBER_READERS). Mask moves and mask logic ops are not listed, so they keep the bit.
+            return True
+        if a[0]["k"] != "vgpr":
+            return False
+        if base_op(ins["op"]) == "v_writelane_b32":
+            # A mask parked in one lane of a VGPR comes back through v_readlane as this lane's bit: the
+            # parked SGPR slot keeps the per-lane value.
+            slot = lane_masks.lane_slot(a[0], a[2])
+            if slot and slot[1:] in self.parked:
+                return False
+        return True
 
     def src_u_sign_mods(self, a):
         """A 32-bit source with its VOP3 abs/neg applied as sign-bit moves on the raw bits (abs clears bit 31, neg
@@ -1752,13 +1810,43 @@ class Gen:
         """True when ins only reads and writes this invocation's own registers, and its VGPR writes are the only
         ones EXEC gates. Each invocation is one lane, so skipping it where the lane is inactive is the same as
         keeping the old value of everything it writes: what dst()'s per-write OpSelect does. A lane mask read as
-        data is this lane's bit (only s_bcnt1, s_ff1 and v_mbcnt gather the whole wave's); a mask on its way
+        data gathers the whole wave's mask word (mask_data_src keeps such instructions out of
+        the run, since the subgroup op can't sit inside `if (active)`); a mask on its way
         through a VGPR (mask_writes) is written in every lane, so it stays out."""
         op = base_op(ins["op"])
         a = ins["args"]
         return (op.startswith("v_") and op not in NOOPS and not op.startswith(NOT_LANE_LOCAL) and "_co_" not in op
                 and not ins["op"].endswith("_dpp") and not any(m.startswith(DPP_MODS) for m in ins["mods"])
-                and bool(a) and a[0]["k"] == "vgpr" and id(ins) not in self.mask_writes)
+                and bool(a) and a[0]["k"] == "vgpr" and id(ins) not in self.mask_writes
+                and not self.mask_data_src(ins))
+
+    def mask_data_src(self, ins):
+        """Whether ins reads a lane mask as data through src_u (a mask-holding SGPR, or EXEC/VCC), which
+        materializes the whole wave's mask word with a subgroup op. That can't happen inside an active run
+        (RUN_FORBIDDEN bars OpGroup there, and inactive lanes wouldn't vote), so lane_local keeps the
+        instruction out; dst()'s per-write EXEC select gates the VGPR write instead. A mask-holding VGPR is
+        not listed: it already stores the wave's mask word, so reading it is a plain register load. The mask
+        state is the one lane_masks.py precomputed for this instruction (self.lane_masks), since lane_local
+        runs before the instruction is translated."""
+        masks = self.lane_masks.get(id(ins)) or {}
+        return any(self._mask_data_operand(x, masks, ins) for x in ins["args"][1:])
+
+    def _mask_data_operand(self, x, masks, ins):
+        """Whether src_u will materialize operand `x`'s lane mask as the wave's mask word for `ins`
+        (a subgroup op or, under --wave64-emulate, an exchange round): `masks` is the lane_masks state
+        for ins — self.lane_masks[id(ins)], the same dict self.cur_masks holds while translating."""
+        if x["k"] == "sgpr":
+            if x.get("n", 1) != 1 or x["r"] not in masks:
+                return False
+        elif x["k"] == "special":
+            t = x.get("t", "")
+            if not (t in ("exec_lo", "exec_hi") or
+                    (t in ("vcc", "vcc_lo") and "vcc" in masks) or
+                    (t == "vcc_hi" and ("vcc" if self.wave64 else "vcc_hi") in masks)):
+                return False
+        else:
+            return False
+        return self.mask_read_is_data(ins)
 
     def insns(self, seq):
         """Translate seq, a straight run of instructions (no branch among them). A run of at least MIN_ACTIVE_RUN
@@ -6253,6 +6341,16 @@ class Gen:
         self.ever_mask = {r for m in self.lane_masks.values() for r in m if isinstance(r, int)}
         slots = lane_masks.parked(blocks[0], self.lane_masks)
         self.parked = {slot: self.SGPRS + i for i, slot in enumerate(slots)}
+        # Instructions whose lane-mask data read will gather the wave's mask word (src_u's
+        # lane_mask_word path) are cross-lane exchanges for the
+        # wave64-emulation planner: it must not fold them into a lane-local region or schedule
+        # a barrier beside them (wave64_emulate_opt checks ins["mask_words"]).
+        for blk in blocks[0]:
+            for ins in blk:
+                words = tuple(i for i, x in enumerate(ins["args"])
+                              if i and self._mask_data_operand(x, self.lane_masks.get(id(ins), {}), ins))
+                if words:
+                    ins["mask_words"] = words
 
     def mask_half(self, a):
         """For a 32-bit lane-mask operand in wave64, return 'lo' (lanes 0-31), 'hi' (lanes 32-63), or None."""
@@ -6267,6 +6365,12 @@ class Gen:
             return None
         if a["k"] == "sgpr" and a.get("n", 1) == 1:
             k = self.cur_masks.get(a["r"])
+            if k == lane_masks.MASK_LO:
+                return "lo"
+            if k == lane_masks.MASK_HI:
+                return "hi"
+        if a["k"] == "vgpr" and a.get("n", 1) == 1:
+            k = self.cur_masks.get(("v", a["r"]))
             if k == lane_masks.MASK_LO:
                 return "lo"
             if k == lane_masks.MASK_HI:
@@ -6364,12 +6468,16 @@ class Gen:
             if key is not None:
                 self.x_mcache[key] = res
             return res
+        # The gather is stored to a variable of its own (eager, SHADER-529): a reader that writes a VGPR, v_mbcnt, is
+        # an OpSelect on the lane's EXEC, and SPIRV-Cross (MoltenVK) inlines a single-use gather into that ternary's
+        # taken arm. A lane that is off then never runs the subgroup op, and its bit is missing from the mask the
+        # other lanes count (SHADER-WAVEMASK-EAGER; Apple M5, MoltenVK 1.4.2, tools/crosslane_fuzz.py).
         if self.wave32_fragment:
             ballot = self.tmp()
             self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {mine}")
             word = self.wave32_ballot_word(ballot)
             self.uses_ballot = True
-            return word, self.cu(0)
+            return self.eager("%uint", word), self.cu(0)
         self.uses_wave_bits = True
         lane = self.wave_lane()
         low, sh, bit, b, lo_in, hi_in, lo, hi = (self.tmp() for _ in range(8))
@@ -6381,7 +6489,7 @@ class Gen:
         self.emit(f"{hi_in} = OpSelect %uint {low} {self.cu(0)} {b}")
         self.emit(f"{lo} = OpGroupNonUniformBitwiseOr %uint {self.cu(3)} Reduce {lo_in}")
         self.emit(f"{hi} = OpGroupNonUniformBitwiseOr %uint {self.cu(3)} Reduce {hi_in}")
-        return lo, hi
+        return self.eager("%uint", lo), self.eager("%uint", hi)
 
     def quad_any(self, v):
         """This lane's value after whole-quad mode: all ones if any of the 4 lanes of its quad (4n .. 4n+3 of the
@@ -6552,6 +6660,23 @@ class Gen:
         self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
         return r
 
+    def _vgpr_mask_lane_bit(self, word, a):
+        """This lane's 0 / ~0 bit of the lane-mask word `word` held by mask VGPR operand `a`: its own position
+        of the word — and only when the lane is in the half the register covers (a MASK_LO/MASK_HI word means
+        nothing to the other half)."""
+        half = self.mask_half(a)
+        if half is None:
+            return self._scalar_word_lane_bit(word)
+        lane = self.wave_lane()
+        in_half = self.tmp()
+        self.emit(f"{in_half} = OpULessThan %bool {lane} {self.cu(32)}"
+                  if half == "lo" else
+                  f"{in_half} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+        bit = self._scalar_word_lane_bit(word, lane)
+        r = self.tmp()
+        self.emit(f"{r} = OpSelect %uint {in_half} {bit} {self.cu(0)}")
+        return r
+
     def mask_src(self, a, wide=True):
         """A lane mask operand (sgpr pair, vcc, exec, imm) as one uint for this lane. A constant is a mask with one
         bit per lane, so lane L takes its bit L: of the 64-bit value (`wide`, the default: a 64-bit SALU operand or
@@ -6582,6 +6707,8 @@ class Gen:
             return self._scalar_word_lane_bit(word, lane)
         if a["k"] == "special" and a["t"] == "null":
             return self.cu(0)
+        if a["k"] == "vgpr" and a.get("n", 1) == 1 and ("v", a["r"]) in self.cur_masks:
+            return self._vgpr_mask_lane_bit(self.load_reg("vgpr", a["r"]), a)
         if a["k"] == "special" and a["t"] == "vcc_hi" and not self.wave64:
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %vcc_hi")
@@ -7880,11 +8007,15 @@ class Gen:
             # lane took its own value. That is the same thing only when all lanes hold the value, and after a
             # kill the dead lanes don't: where the result is an address (a loop that picks a descriptor per group
             # of lanes), they loaded from wherever their stale register pointed.
-            if a[1]["k"] == "vgpr" and ("v", a[1]["r"]) in self.cur_masks:
-                # A lane mask that went through the vector unit (three SGPRs ORed with v_or3_b32, say). The
-                # hardware reads the first lane's copy of the whole mask; here the lane's own copy is its bit.
-                self.dst(a[0], self.src_u(a[1]))
-                return
+            # A VGPR that holds a lane mask keeps the whole wave's mask word, but only in the lanes a write
+            # reached: an EXEC-gated v_mov_b32 leaves the other lanes' old word behind (SHADER-21 part 2), so
+            # this lane's own copy can be a stale half's word. Hardware reads the first active lane's copy —
+            # the broadcast below. A VGPR destination is never mask-tracked (lane_masks.put ignores VGPR
+            # writes), so it gets the broadcast word itself, as hardware leaves it; a mask-tracked SGPR or
+            # special destination gets this lane's bit of that word (_vgpr_mask_lane_bit, half-aware in
+            # wave64), the per-lane value mask_src readers rely on.
+            mask_vgpr = (a[1]["k"] == "vgpr" and a[1].get("n", 1) == 1
+                         and ("v", a[1]["r"]) in self.cur_masks)
             if self.wave32_fragment:
                 self.uses_subgroup = self.uses_ballot = True
                 v, act = self.src_u(a[1]), self.active_b()
@@ -7895,7 +8026,8 @@ class Gen:
                 self.emit(f"{lsb} = OpExtInst %uint %glsl FindILsb {word}")
                 self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.wave32_first_running_lane()}")
                 self.g_shuffle(r, v, first)
-                self.dst(a[0], r)
+                res = r if a[0]["k"] == "vgpr" or not mask_vgpr else self._vgpr_mask_lane_bit(r, a[1])
+                self.dst(a[0], res)
                 return
             if self.emulate:
                 # The wave's active lanes as two mask words and every lane's value, in one round.
@@ -7910,7 +8042,9 @@ class Gen:
                 self.emit(f"{h32} = OpIAdd %uint {h} {self.cu(32)}")
                 self.emit(f"{fh} = OpSelect %uint {hz} {h32} {self.cu(0)}")
                 self.emit(f"{first} = OpSelect %uint {lz} {l} {fh}")
-                self.dst(a[0], read(first))
+                w = read(first)
+                res = w if a[0]["k"] == "vgpr" or not mask_vgpr else self._vgpr_mask_lane_bit(w, a[1])
+                self.dst(a[0], res)
                 return
             self.uses_subgroup = self.uses_ballot = self.uses_vote = True
             v, act = self.src_u(a[1]), self.active_b()
@@ -7923,7 +8057,8 @@ class Gen:
             self.emit(f"{any_} = OpGroupNonUniformAny %bool {self.cu(3)} {act}")
             self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {first}")
-            self.dst(a[0], r)
+            res = r if a[0]["k"] == "vgpr" or not mask_vgpr else self._vgpr_mask_lane_bit(r, a[1])
+            self.dst(a[0], res)
         elif op in ("image_sample_o", "image_sample_lz_o", "image_sample_l_o", "image_sample_b_o",
                     "image_sample_c_lz_o", "image_sample_c_o", "image_sample_c_b_o", "image_sample_cl_o", "image_sample_b_cl_o",
                     "image_sample_c_cl_o", "image_sample_c_b_cl_o") or                 op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
