@@ -381,6 +381,22 @@ class ExecTests(unittest.TestCase):
                 self.assertEqual(tr.stats["unhandled"], [])
                 self.assertEqual(r, want)
 
+    def test_call_and_ret_at_any_code_length(self):
+        # The pc table follows the translated code, so it is only 4-byte aligned. With the harness
+        # MMU off, rt_dispatch's 8-byte loads from a table at 4 mod 8 took an alignment fault, and
+        # a guest ret hung for every function whose translation had the wrong number of words.
+        for pad in range(4):
+            with self.subTest(pad=pad):
+                r, tr = run(asm(
+                    *(["31 c0"] * pad),     # xor eax,eax: shifts where the pc table lands
+                    "e8 06 00 00 00",       # call helper
+                    "bf 01 00 00 00",       # mov edi,1   (return lands here)
+                    "c3",
+                    "b8 07 00 00 00",       # helper: mov eax,7
+                    "c3"))
+                self.assertEqual(tr.stats["unhandled"], [])
+                self.assertEqual(r, 1)
+
     def test_lea_and_indexed_mem(self):
         s = SCRATCH
         r, _ = run(asm(
