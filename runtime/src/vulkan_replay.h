@@ -911,7 +911,7 @@ struct GraphicsPipeline {
     // ComputePipeline::built.
     std::function<VkPipeline(std::uint32_t flags)> built;
     bool large = false;  // as ComputePipeline::large
-    std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
+    std::uint32_t samples = 1;  // expected bound attachment sample count (SampleDesc.Count; differs from rasterizationSamples under ForcedSampleCount TIR)
     bool async_build = false;
     bool nonunit_vertex_divisor = false;  // an actual instance divisor > 1, not a zero-stride emulation
     std::uint64_t estimate = 0;  // as ComputePipeline::estimate
