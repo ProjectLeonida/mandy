@@ -76,6 +76,12 @@ bool is_zero_prebuild(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INF
            info.UpdateScratchDataSizeInBytes == 0;
 }
 
+bool rt_as_off_env() {
+    char value[8] = {};
+    std::size_t length = 0;
+    return getenv_s(&length, value, "LEONIDA_RT_AS") == 0 && length > 1 && std::strcmp(value, "off") == 0;
+}
+
 // Runs valid prebuild, valid GPU BLAS+TLAS build, and valid recording cases on any DXR-capable device.
 // When check_strict_validation is true (Leonida), also asserts all invalid inputs are rejected cleanly.
 int run_suite(ID3D12Device* base_dev, const char* name, bool check_strict_validation) {
@@ -258,6 +264,102 @@ int run_suite(ID3D12Device* base_dev, const char* name, bool check_strict_valida
         if (!execute_and_wait(dev.p, queue.p, cl.p)) {
             std::fprintf(stderr, "%s: valid BLAS+TLAS GPU execution failed\n", name);
             return 1;
+        }
+
+        if (check_strict_validation && rt_as_off_env()) {
+            leonida::BuildAccelerationStructure build{};
+            leonida::CopyAccelerationStructure copy{src_va, blas_va, 0};
+            leonida::AccelerationStructurePostbuild postbuild{post_va, 0, {blas_va}};
+            if (rt::d3d12::resolve_acceleration_structure_build(dev.p, build) ||
+                rt::d3d12::resolve_acceleration_structure_copy(dev.p, copy) ||
+                rt::d3d12::resolve_acceleration_structure_postbuild(dev.p, postbuild)) {
+                std::fprintf(stderr, "%s: LEONIDA_RT_AS=off left an acceleration-structure command active on device\n",
+                             name);
+                return 1;
+            }
+
+            Ref<ID3D12Resource> post_seed, post_rb;
+            if (!make_buffer(dev.p, 64, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                             D3D12_RESOURCE_STATE_GENERIC_READ, post_seed) ||
+                !make_buffer(dev.p, 64, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+                             D3D12_RESOURCE_STATE_COPY_DEST, post_rb)) {
+                std::fprintf(stderr, "%s: failed to allocate LEONIDA_RT_AS=off postbuild buffers\n", name);
+                return 1;
+            }
+            constexpr UINT64 kSentinel = 0xDEADBEEFCAFEBABEull;
+            {
+                UINT64* mapped = nullptr;
+                D3D12_RANGE no_read{0, 0};
+                if (FAILED(post_seed->Map(0, &no_read, reinterpret_cast<void**>(&mapped))) || !mapped) return 1;
+                for (int i = 0; i < 4; ++i) mapped[i] = kSentinel;
+                D3D12_RANGE written{0, 32};
+                post_seed->Unmap(0, &written);
+            }
+
+            Ref<ID3D12CommandAllocator> off_alloc;
+            Ref<ID3D12GraphicsCommandList4> off_cl;
+            if (!make_list(dev.p, off_alloc, off_cl)) return 1;
+
+            off_cl->CopyBufferRegion(post_buf.p, 0, post_seed.p, 0, 32);
+            D3D12_RESOURCE_BARRIER to_uav{};
+            to_uav.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            to_uav.Transition.pResource = post_buf.p;
+            to_uav.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            to_uav.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            to_uav.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            off_cl->ResourceBarrier(1, &to_uav);
+
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC inline_pb{
+                post_va, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE};
+            off_cl->BuildRaytracingAccelerationStructure(&blas_desc, 1, &inline_pb);
+
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC emit_compacted{
+                post_va + 8, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE};
+            off_cl->EmitRaytracingAccelerationStructurePostbuildInfo(&emit_compacted, 1, &blas_va);
+
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC emit_current{
+                post_va + 16, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_CURRENT_SIZE};
+            off_cl->EmitRaytracingAccelerationStructurePostbuildInfo(&emit_current, 1, &blas_va);
+
+            off_cl->CopyRaytracingAccelerationStructure(
+                src_va, blas_va, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE);
+
+            D3D12_RESOURCE_BARRIER to_copy{};
+            to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            to_copy.Transition.pResource = post_buf.p;
+            to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            off_cl->ResourceBarrier(1, &to_copy);
+
+            off_cl->CopyBufferRegion(post_rb.p, 0, post_buf.p, 0, 32);
+
+            D3D12_RESOURCE_BARRIER restore_uav = to_copy;
+            restore_uav.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            restore_uav.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            off_cl->ResourceBarrier(1, &restore_uav);
+
+            if (!execute_and_wait(dev.p, queue.p, off_cl.p)) {
+                std::fprintf(stderr, "%s: LEONIDA_RT_AS=off postbuild submission failed\n", name);
+                return 1;
+            }
+
+            UINT64 observed[4] = {};
+            {
+                void* mapped = nullptr;
+                D3D12_RANGE read_range{0, 32};
+                if (FAILED(post_rb->Map(0, &read_range, &mapped)) || !mapped) return 1;
+                std::memcpy(observed, mapped, sizeof(observed));
+                D3D12_RANGE no_write{0, 0};
+                post_rb->Unmap(0, &no_write);
+            }
+            for (int i = 0; i < 4; ++i) {
+                if (observed[i] != kSentinel) {
+                    std::fprintf(stderr, "%s: LEONIDA_RT_AS=off overwrote postbuild slot %d with 0x%016llX\n",
+                                 name, i, static_cast<unsigned long long>(observed[i]));
+                    return 1;
+                }
+            }
         }
     }
 
@@ -456,19 +558,23 @@ int run_suite(ID3D12Device* base_dev, const char* name, bool check_strict_valida
             cl->BuildRaytracingAccelerationStructure(&d, 1, &pb);
         })) return 1;
 
-    if (!expect_fail("Build postbuild DestBuffer=0", [&](ID3D12GraphicsCommandList4* cl) {
-            auto d = valid_blas_desc();
-            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC pb{
-                0, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_CURRENT_SIZE};
-            cl->BuildRaytracingAccelerationStructure(&d, 1, &pb);
-        })) return 1;
+    // When LEONIDA_RT_AS=off drops the build before recording, inline postbuild DestBuffer alignment is not reached
+    // (d3d12_com.cpp leaves the build and its postbuild values out so the list stays valid).
+    if (!rt_as_off_env()) {
+        if (!expect_fail("Build postbuild DestBuffer=0", [&](ID3D12GraphicsCommandList4* cl) {
+                auto d = valid_blas_desc();
+                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC pb{
+                    0, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_CURRENT_SIZE};
+                cl->BuildRaytracingAccelerationStructure(&d, 1, &pb);
+            })) return 1;
 
-    if (!expect_fail("Build postbuild DestBuffer+4", [&](ID3D12GraphicsCommandList4* cl) {
-            auto d = valid_blas_desc();
-            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC pb{
-                post_va + 4, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_CURRENT_SIZE};
-            cl->BuildRaytracingAccelerationStructure(&d, 1, &pb);
-        })) return 1;
+        if (!expect_fail("Build postbuild DestBuffer+4", [&](ID3D12GraphicsCommandList4* cl) {
+                auto d = valid_blas_desc();
+                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC pb{
+                    post_va + 4, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_CURRENT_SIZE};
+                cl->BuildRaytracingAccelerationStructure(&d, 1, &pb);
+            })) return 1;
+    }
 
     if (!expect_fail("Build unknown Type=99", [&](ID3D12GraphicsCommandList4* cl) {
             auto d = valid_blas_desc();
@@ -637,6 +743,22 @@ int run_suite(ID3D12Device* base_dev, const char* name, bool check_strict_valida
 } // namespace
 
 int main() {
+    if (rt_as_off_env()) {
+        leonida::BuildAccelerationStructure build{};
+        leonida::CopyAccelerationStructure copy{0x2000, 0x1000, 0};
+        leonida::AccelerationStructurePostbuild postbuild{0x4000, 0, {0x1000}};
+        if (rt::d3d12::resolve_acceleration_structure_build(nullptr, build) ||
+            rt::d3d12::resolve_acceleration_structure_copy(nullptr, copy) ||
+            rt::d3d12::resolve_acceleration_structure_postbuild(nullptr, postbuild)) {
+            std::fprintf(stderr,
+                         "LEONIDA_RT_AS=off: resolve_acceleration_structure_{build,copy,postbuild} must all drop\n");
+            return 1;
+        }
+        Ref<ID3D12Device> layer;
+        if (FAILED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(layer.put())))) return 77;
+        return run_suite(layer.p, "Leonida Vulkan (LEONIDA_RT_AS=off)", true);
+    }
+
     // 1. Differential host comparators: Windows WARP and native HW D3D12 (if available and DXR-capable).
     Ref<IDXGIFactory4> factory;
     if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(factory.put())))) {
