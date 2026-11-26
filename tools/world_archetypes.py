@@ -130,10 +130,23 @@ def iter_resources(path, start=None, limit=None):
                     yield r, res["data"]
         return
     rows, _ = WI.scan_path(path, start, limit)
+    successors = {}   # folder -> {carved file: the file of the stream that followed it}
     for r in rows:
         p = os.path.join(path, r["file"]) if os.path.isdir(path) else path
         with open(p, "rb") as f:
-            yield r, f.read(WI.CAP + 1)
+            data = f.read(WI.CAP + 1)
+        # scan_path parsed the resource joined with the carved file(s) of the stream(s) that followed it (row "size"
+        # is the joined length, "file" the first file): join the same files here, or the blocks in them are lost.
+        root, current = os.path.dirname(p), os.path.basename(p)
+        while len(data) < r["size"]:
+            if root not in successors:
+                successors[root] = WI._carve_successors(root)
+            current = successors[root].get(current)
+            if current is None:
+                break
+            with open(os.path.join(root, current), "rb") as f:
+                data += f.read()
+        yield r, data
 
 
 # ---- transforms (source axes: RAGE world, Z up, metres)
