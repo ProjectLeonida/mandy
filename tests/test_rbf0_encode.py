@@ -221,6 +221,21 @@ class Refusals(unittest.TestCase):
         doc = rbf0_tree.parse_resource(short)
         self.assertEqual((doc["status"], len(doc["tree"]["attributes"]), doc["tree"]["attrs_declared"]), ("ok", 1, 2))
         self.assertEqual(rbf0_encode.encode(doc), short)
+        # Short of its count with text or a child element as its content: the decoder flags the order, but no
+        # attribute record follows the content and no value is in it, so the bytes write back exactly (9.6).
+        for content in ("text", "child"):
+            with self.subTest(content=content):
+                s = Stream().open("r", attrs=2).int("id", 1)
+                s = s.text(b"t\x00") if content == "text" else s.open("c").close()
+                blob = s.close().bytes()
+                doc = rbf0_tree.parse_resource(blob)
+                self.assertEqual(doc["status"], "ok")
+                self.assertTrue(doc["tree"].get("attribute_order_violation"))
+                self.assertEqual(rbf0_encode.encode(doc), blob)
+                # Without record offsets (a tree built by hand) the order cannot be told, so it fails closed.
+                for record in doc["tree"]["attributes"] + doc["tree"]["content"]:
+                    record.pop("offset", None)
+                self.assertEqual(self.reason(doc=doc), "order")
         # A value moved by hand from the attributes into the content would decode as an attribute again.
         doc = rbf0_tree.parse_resource(Stream().open("r", attrs=2).int("id", 1).int("n", 2).close().bytes())
         tree = doc["tree"]
