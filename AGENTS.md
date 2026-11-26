@@ -48,8 +48,8 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
   read the claims at all rather than guessing that a thing is unclaimed.
 
   Check its tables and the open pull requests first: `python -I tools/coord.py check <files> --id <ID>` asks the
-  coordination worker which open claims share those files or that ID ([docs/coordination.md](docs/coordination.md)),
-  and `tools/coord.py claim` records yours there when the issue can take no more comments. If someone has claimed the item or has a pull request for it,
+  coordination board, the thread continued off GitHub, which open claims share those files or that ID
+  ([docs/coordination.md](docs/coordination.md)), and `tools/coord.py claiming <ID> "..."` posts yours there. If someone has claimed the item or has a pull request for it,
   stop and tell the user instead of writing it a second time.
 - Put the item ID from that issue in the pull request, and `Depends on: #N` for every pull request yours builds on.
 - Found work you won't do yourself (a bug, a missing method, a stale doc, a follow-up of your own pull request)?

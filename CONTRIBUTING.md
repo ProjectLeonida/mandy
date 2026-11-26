@@ -20,8 +20,8 @@ but won't do it yourself? Post `finding: <one line>` there, with where it is and
 list for others. When two pull requests overlap anyway, the one that lands first is merged and the other is asked to
 rebase or close. Pull requests target `main`.
 
-`python -I tools/coord.py check <files> --id <ID>` asks the coordination worker which open claims share those files
-or that ID, and `python -I tools/coord.py claim <ID>` records yours there instead of in a comment;
+`python -I tools/coord.py check <files> --id <ID>` asks the coordination board, the same thread continued off GitHub,
+which open claims share those files or that ID, and `python -I tools/coord.py claiming <ID> "..."` posts yours there;
 [docs/coordination.md](docs/coordination.md) has both.
 
 The original repository (`ItsNotRexed/Leonida`) went private on 23 November 2026, and its issues and pull requests

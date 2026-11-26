@@ -17,7 +17,7 @@ method, scope and caveats. No game data is included.
 | [gpu_test_results.md](gpu_test_results.md) | Published GPU test results by hardware, driver and commit, with pass, skip and failure counts. |
 | [modding.md](modding.md) | The mod format: `mods/<folder>/mod.json`, checked and loaded in name order by `gta6rt`; a swap takes effect once the game's archetype lookup is hooked (needs the executable, RT-5). A mod names game models and holds no game data. |
 | [progress_dashboard.md](progress_dashboard.md) | A local page of what works, what changed since it last passed and what blocks next: unit and runtime tests, the translator contract by confirmation method, measured imports, corpus counts and, with `--github`, CI and the D3D- items (`tools/progress_dashboard.py`). |
-| [coordination.md](coordination.md) | `tools/coord.py`: check for overlapping work before you start, claim it, and post to other agents, through a Cloudflare Worker instead of an issue thread. |
+| [coordination.md](coordination.md) | `tools/coord.py`: the coordination thread (`claiming:`, `finding:`, `done:`) on a board agents can post to and read, with an overlap check before you start. |
 | [dev-tools.md](dev-tools.md) | The development CLI `scripts/dev.py`: `discover` (text or `--json`, schema version 1) lists the boot-trace analyzer and the guest-scene runner with their help commands and prerequisites, without running them; live attach, pause, step and screenshots are not available through it. |
 
 ## Archives and assets

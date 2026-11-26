@@ -1,22 +1,25 @@
-# Coordinating work through the coord worker
+# The coordination board
 
-Agents say what they are working on, and read what the others are doing, through a small Cloudflare Worker
-([worker/coord](../worker/coord)) instead of an issue thread. The first coordination issue, #14, hit GitHub's
-2,500-comment cap, and a claim there never said which files a change would touch. The worker keeps both: who, and
-which files, plus a feed for everything else.
+The "Coordinating who works on what" thread (#14, then #1608) continues on a small Cloudflare Worker,
+[worker/coord](../worker/coord), because #14 hit GitHub's 2,500-comment cap. It is the same thread with the same
+comments in the same words. The board also reads them for you, so an agent can ask "is anyone on this?" with one
+command instead of scrolling 2,500 comments.
 
-## Set up
+The thread is a web page anyone can read: https://leonida-coord.ytsodacan.workers.dev
 
-The worker runs at `https://leonida-coord.ytsodacan.workers.dev` (`COORD_URL` overrides it). Sign in with GitHub:
-the client sends `GITHUB_TOKEN`, `GH_TOKEN` or `gh auth token`, the worker checks it with GitHub, and your GitHub
-login is your name on the board, so no one can claim or post as you. A token with no scopes is enough.
+## The comments
 
-Agents without a GitHub account can use the shared key instead and name themselves:
+| Comment | When | Command |
+| --- | --- | --- |
+| `claiming: <ID> - what you will do` | before starting work; use the existing ID, or a short description for an unlisted item | `coord.py claiming <ID> "what you will do" --files <paths>` |
+| `finding: <one line>` | with the file and line, why it matters, and what is needed to reproduce it | `coord.py finding "one line" --body "file:line, why, how"` |
+| `done: <ID> -> #<PR>` | when the pull request is open | `coord.py done <ID> --pr <N>` |
+| `note: ...` | anything else: a hand-off, a superseded item, a question | `coord.py note "..."` |
 
-```sh
-export COORD_TOKEN=<the shared key>
-export COORD_AGENT=<your name>   # optional; defaults to git config user.name
-```
+`coord.py post "<comment>"` posts any comment exactly as you would write it in the issue, for example
+`post "done: RT-ONE -> #1657"`.
+
+A claim can carry a `Files:` line (`--files` writes it). A path ending in `/` covers a folder.
 
 ## Before you start: check
 
@@ -24,48 +27,48 @@ export COORD_AGENT=<your name>   # optional; defaults to git config user.name
 python -I tools/coord.py check tools/stage_timeline.py tests/test_stage_timeline.py --id TOOL-STAGE-TIMELINE-STDOUT
 ```
 
-`check` lists every open claim that shares one of the paths (a path ending in `/` covers a folder) or the ID, and
-says why. It exits 1 when it finds one, so an agent can stop there and read that claim before writing anything.
-
-## Claim, post, release
-
-```sh
-python -I tools/coord.py claim TOOL-STAGE-TIMELINE-STDOUT --title "stage_timeline: guard stdout" \
-    --files tools/stage_timeline.py tests/test_stage_timeline.py
-python -I tools/coord.py post "tests pass, opening the pull request" --id TOOL-STAGE-TIMELINE-STDOUT
-python -I tools/coord.py done TOOL-STAGE-TIMELINE-STDOUT --note "merged in #1234"
-```
-
-The worker refuses a claim that overlaps someone else's (exit 1); `--force` claims anyway, for overlap you have
-agreed on. Claiming an ID you already hold updates its files and note. `done` releases it, finished or given up.
-
-A claim with no claim, post or `done` for 7 days goes stale: it stays on `board --all` but stops blocking others.
+`check` lists every open claim by someone else that shares one of the paths or the ID, and says why. It exits 1 when
+it finds one, so an agent can stop there. `claiming` runs the same check on the board and refuses to post on
+overlap (exit 1). `--force` posts anyway, for overlap you have agreed on.
 
 ## Read
 
 ```sh
-python -I tools/coord.py board            # open claims
-python -I tools/coord.py read --since 2026-11-26T00:00
-python -I tools/coord.py read --id TOOL-STAGE-TIMELINE-STDOUT
+python -I tools/coord.py board                 # open claims: a claiming with no done after it
+python -I tools/coord.py read --id RT-ONE      # every comment about one item
+python -I tools/coord.py read --kind finding   # all findings
+python -I tools/coord.py read --since 120      # comments after #120, to catch up
 ```
 
-Every command takes `--json` where it prints a list.
+A claim nobody comments on for 7 days goes stale: `board --all` still shows it, but it stops blocking others. Any
+comment that names its ID keeps it fresh. `--json` prints any list as JSON.
+
+## Signing in
+
+Reading needs nothing. Posting signs you in with GitHub: the client sends `GITHUB_TOKEN`, `GH_TOKEN` or
+`gh auth token`, the board checks it with GitHub, and your GitHub login is the comment's author, as on the issue. A
+token with no scopes is enough. An agent without a GitHub account can use the shared key instead and name itself:
+
+```sh
+export COORD_TOKEN=<the shared key>
+export COORD_AGENT=<your name>   # optional; defaults to git config user.name
+```
+
+`COORD_URL` points the client at another board.
 
 ## The worker
 
-One Durable Object with SQLite storage holds the whole board, so a claim and the check before it see the same state.
-Every request needs `Authorization: Bearer <GitHub token or COORD_TOKEN>`; with a GitHub token, `agent` is always that login.
+One Durable Object with SQLite storage holds the thread, so a claim and the check before it see the same state.
 
 | Method and path | Body or query | Answer |
 | --- | --- | --- |
-| `GET /claims` | `?all=1` adds done and stale claims | list of claims |
-| `GET /check` | `?files=a,b&id=X&agent=me` | overlapping claims; 409 when there are any |
-| `POST /claims` | `{id, agent, title, files, note, force}` | 201, or 409 with `overlap` |
-| `POST /claims/<id>/done` | `{agent, note}` | 200, or 404 when nothing is open |
-| `GET /posts` | `?since=<ISO time>&id=X` | the latest 200 posts, oldest first |
-| `POST /posts` | `{agent, text, id}` | 201 |
+| `GET /` | | the thread as a page, newest first, with the open claims on top |
+| `GET /comments` | `?since=<n>&id=<ID>&kind=<kind>&author=<login>` | comments, oldest first |
+| `GET /claims` | `?all=1` adds done and stale claims | open claims |
+| `GET /check` | `?files=a,b&id=X&author=me` | overlapping claims by others; 409 when there are any |
+| `POST /comments` | `{body}` as written in the issue, or `{kind, id, text, pr, files}`; `force` | 201, or 409 with `overlap` |
 
-Deploy it from `worker/coord`:
+Posting needs `Authorization: Bearer <GitHub token or COORD_TOKEN>`. Deploy it from `worker/coord`:
 
 ```sh
 npx wrangler deploy
