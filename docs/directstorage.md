@@ -187,10 +187,12 @@ The first boot with the executable settles most of this: the dry-run report show
   ```
 
   The fitter follows the physical block offset of packed 2D mips, including those that start past the first
-  256 blocks of a stream. It combines adjacent mips from the same layer with full-stream index anchor
-  and shared-p-bit constraints. A shared p-bit can relate low red endpoint bits even when its sibling
-  mip supplies only the leading bits. These local fits preserve the recorded precision and exact reference
-  bits. A profile can still lack endpoint values or exceed the reference consistency tolerance. Such a request reports a decompression error before publication.
+  256 blocks of a stream. It fits adjacent mips from the same layer first, then pairs any stream that still
+  references an unfitted slot with the closest raw or zlib mip on the same layer across multi-level mip
+  distances, before applying full-stream index anchor and shared-p-bit constraints. A shared p-bit can relate
+  low red endpoint bits even when its sibling mip supplies only the leading bits. These local fits preserve
+  the recorded precision and exact reference bits. A profile can still lack endpoint values or exceed the
+  reference consistency tolerance. Such a request reports a decompression error before publication.
 - The four swizzle modes interleave stripes from request-wide component planes into 16 KiB (mode 1) or
   32 KiB (modes 2–4) groups. The enum names give the successive stripe widths. The shipped BC4 sample
   separates its endpoint planes from indices across the inflated source. The title's compute shader does
