@@ -1317,8 +1317,10 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     }
 
     const View to_view = view(r, dst);
+    // Any existing name, a folder too, is already there without MOVEFILE_REPLACE_EXISTING; with it a folder cannot be
+    // replaced (measured on Windows 11: ERROR_ALREADY_EXISTS, and ERROR_ACCESS_DENIED with the flag).
+    if (to_view.kind != Kind::None && (flags & MOVEFILE_REPLACE_EXISTING) == 0) return fail_bool(ERROR_ALREADY_EXISTS);
     if (to_view.kind == Kind::Directory) return fail_bool(ERROR_ACCESS_DENIED);
-    if (to_view.kind == Kind::File && (flags & MOVEFILE_REPLACE_EXISTING) == 0) return fail_bool(ERROR_ALREADY_EXISTS);
     if (!is_folder(r, parent_of(dst))) return fail_bool(ERROR_PATH_NOT_FOUND);
 
     std::error_code ec;
