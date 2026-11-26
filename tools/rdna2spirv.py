@@ -2588,6 +2588,10 @@ class Gen:
         Each dword is loaded only when it is in range per the V#'s OOB_SELECT (buffer_address; docs/design.md, Buffer
         bounds checking): for modes 0 and 3 dword i ends inside the stride / num_records, else it is 0 and memory is
         not read; modes 1 and 2 check the index / num_records once. Inactive lanes don't load."""
+        if "lds" in mods:
+            if op != "buffer_load_dword":    # ISA 8.1.9: the lds subset is dword, not dwordxN
+                raise Unsupported(op + " lds")
+            return self.buffer_load_lds(op, a, mods, 4, False)
         if any(m in mods for m in ("lds", "tfe")) or "format" in op:
             raise Unsupported(op + " form")
         n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
@@ -2640,7 +2644,10 @@ class Gen:
         """buffer_load_{u,s}byte / buffer_load_{u,s}short vD, vaddr, s[V#], soffset [offen|idxen] offset:N.
         Loads 1 or 2 bytes from V#.base + offsets, zero- or sign-extended to 32 bits. Out-of-bounds lanes
         (OOB_SELECT with element size 1 or 2) return 0 without reading memory; inactive lanes keep vD."""
-        if any(m in mods for m in ("lds", "tfe", "d16")):
+        if "lds" in mods:
+            nbytes, signed = self.BUFFER_SUB[op]
+            return self.buffer_load_lds(op, a, mods, nbytes, signed)
+        if any(m in mods for m in ("tfe", "d16")):
             raise Unsupported(op + " form")
         nbytes, signed = self.BUFFER_SUB[op]
         vd = a[0]
@@ -2655,6 +2662,16 @@ class Gen:
         self.emit(f"OpSelectionMerge {lbl_end} None")
         self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
+        val = self.buffer_sub_value(addr, step, nbytes, signed)
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        res = self.tmp()
+        self.emit(f"{res} = OpPhi %uint {val} {lbl_do} {self.cu(0)} {pre_label}")
+        self.dst(vd, res)
+
+    def buffer_sub_value(self, addr, step, nbytes, signed):
+        """The uint id of the 1- or 2-byte value at the ulong address `addr` (buffer_load_sub's read, shared with
+        the lds forms), zero- or sign-extended to 32 bits. Emitted inside the caller's guarded block."""
         alo, b3, b64, aligned, sh = (self.tmp() for _ in range(5))
         self.emit(f"{alo} = OpUConvert %uint {addr}")
         self.emit(f"{b3} = OpBitwiseAnd %uint {alo} {self.cu(3)}")
@@ -2681,11 +2698,64 @@ class Gen:
             self.emit(f"{crossed} = OpBitwiseOr %uint {lo_part} {hi_sh}")
             self.emit(f"{raw} = OpSelect %uint {cross} {crossed} {lo_part}")
             self.emit(f"{val} = {ext} %uint {raw} {self.cu(0)} {self.cu(16)}")
+        return val
+
+    def buffer_load_lds(self, op, a, mods, nbytes, signed):
+        """buffer_load_{dword,ubyte,sbyte,ushort,sshort} ... lds (RDNA2 ISA 8.1.9 "Memory Buffer Load to LDS"):
+        the fetched data goes to LDS, not a VGPR. LDS_addr = LDS_BASE + M0[15:0] + inst_offset + TIDinWave*4 bytes
+        (the figure's formula; TIDinWave is added on the LDS path even when the V#'s ADD_TID_ENABLE is clear, and
+        inst_offset is the offset:N byte offset). The VDATA field names the M# (only M0 exists on RDNA2) and is
+        ignored. The buffer read is buffer_address's, bounds-checked the same way as the VGPR forms; an
+        out-of-range read supplies 0, which is what the lane writes to LDS. The LDS write runs in active lanes
+        only and is dropped outside the wave's LDS allocation (lds_access bound = RSRC2 LDS_SIZE for CS). The
+        python decoder prints all four operands (VDATA first); llvm-mc omits VDATA on the lds forms, so a
+        three-operand listing is vaddr, srsrc, soffset."""
+        if self.stage not in ("cs", "ms") or "tfe" in mods:
+            raise Unsupported(op + " lds")
+        if len(a) == 3:
+            a = [None] + a
+        if len(a) != 4:
+            raise Unsupported(op + " operands")
+        self.uses_lds = True
+        addr, _, in_b, step = self.buffer_address(a, mods, elem=nbytes)
+        act = self.active_b()
+        cond = self.tmp()
+        self.emit(f"{cond} = OpLogicalAnd %bool {act} {in_b}")
+        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+        pre = self.current_label_placeholder()
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
+        self.emit(f"{lbl_do} = OpLabel")
+        if nbytes == 4:
+            ptr, host = self.tmp(), self.host_addr(addr)
+            self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
+            val = self.tmp()
+            self.emit(f"{val} = OpLoad %uint {self.buf_dword_ptr(ptr, host, step, 0)} Aligned 4")
+        else:
+            val = self.buffer_sub_value(addr, step, nbytes, signed)
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
         res = self.tmp()
-        self.emit(f"{res} = OpPhi %uint {val} {lbl_do} {self.cu(0)} {pre_label}")
-        self.dst(vd, res)
+        self.emit(f"{res} = OpPhi %uint {val} {lbl_do} {self.cu(0)} {pre}")   # OOB read: 0, as the VGPR form gives
+        w_do, w_end = self.tmp() + "_wdo", self.tmp() + "_wend"
+        self.emit(f"OpSelectionMerge {w_end} None")
+        self.emit(f"OpBranchConditional {act} {w_do} {w_end}")
+        self.emit(f"{w_do} = OpLabel")
+        m0, off, lane_b, laddr = (self.tmp() for _ in range(4))
+        self.emit(f"{m0} = OpLoad %uint %m0")
+        self.emit(f"{off} = OpBitwiseAnd %uint {m0} {self.cu(0xFFFF)}")
+        inst = next((int(m.split(":", 1)[1], 0) for m in mods if m.startswith("offset:")), 0)
+        if inst:
+            self.emit(f"{off} = OpIAdd %uint {off} {self.cu(inst)}")
+        self.emit(f"{lane_b} = OpShiftLeftLogical %uint {self.wave_lane()} {self.cu(2)}")
+        self.emit(f"{laddr} = OpIAdd %uint {off} {lane_b}")
+
+        def store(p):
+            self.emit(f"OpStore {p} {res} Volatile")   # as lds_store
+            return None
+        self.lds_access(laddr, 0, store, self.lds_declared if self.stage == "cs" else None)
+        self.emit(f"OpBranch {w_end}")
+        self.emit(f"{w_end} = OpLabel")
 
     # GFX10 buffer formats (from Mesa src/amd/registers/gfx10-rsrc.json, GFX10_FORMAT):
     #   code: (bytes, kind, component bit widths from bit 0)
