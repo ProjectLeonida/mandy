@@ -2433,20 +2433,24 @@ HRESULT queue_copy_page_mappings(ChildProxy* self, UINT count, const xmem::PageB
         stats.max = (std::max)(stats.max, t2 - t0);
         if (t2 - stats.since >= std::chrono::seconds(10)) {
             const auto ms = [](clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
-            // Pages changed by a table update alone (GPU-only pages with a CPU pair) and by a host map or unmap
-            // (a wineserver round trip each under Wine), since the last line.
-            static std::uint64_t table_before = 0, host_before = 0;
-            std::uint64_t table = 0, host = 0;
-            if (rt::xmem::slot31_mapping_counts_fn) rt::xmem::slot31_mapping_counts_fn(table, host);
+            // Pages changed by a table update alone (GPU-only pages with a CPU pair, and those pairs' CPU pages) and
+            // by a host map or unmap (a wineserver round trip each under Wine), since the last line, by path
+            // (rt::xmem::Slot31Counts).
+            static rt::xmem::Slot31Counts before{};
+            rt::xmem::Slot31Counts now{};
+            if (rt::xmem::slot31_mapping_counts_fn) rt::xmem::slot31_mapping_counts_fn(now);
+            const auto since = [](std::uint64_t a, std::uint64_t b) { return static_cast<unsigned long long>(a - b); };
             std::fprintf(stderr, "[rt] d3d12_xs: queue slot 31: %llu calls (%llu batches) in %.0f s: %.1f ms waiting "
                                  "for the queue, %.1f ms mapping, %.1f ms the longest call; pages %llu by table, %llu "
-                                 "by host remap\n",
+                                 "by host remap (table: %llu GPU-only, %llu CPU twins; %llu twins the title mapped "
+                                 "kept; host: %llu with no CPU pair, %llu views replaced)\n",
                          static_cast<unsigned long long>(stats.calls), static_cast<unsigned long long>(stats.ranges),
                          std::chrono::duration<double>(t2 - stats.since).count(), ms(stats.wait), ms(stats.map),
-                         ms(stats.max), static_cast<unsigned long long>(table - table_before),
-                         static_cast<unsigned long long>(host - host_before));
-            table_before = table;
-            host_before = host;
+                         ms(stats.max), since(now.table(), before.table()), since(now.host(), before.host()),
+                         since(now.gpu_pages, before.gpu_pages), since(now.twin_pages, before.twin_pages),
+                         since(now.twins_kept, before.twins_kept), since(now.unpaired_pages, before.unpaired_pages),
+                         since(now.views_replaced, before.views_replaced));
+            before = now;
             stats = {};
             stats.since = t2;
         }

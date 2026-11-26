@@ -239,7 +239,7 @@ __declspec(noinline) LEONIDA_GUARDED_NO_BUILTIN void copy_streaming(std::uint8_t
 // A copy that a page fault ends instead of killing the process: the title may decommit or remap a page between the
 // VirtualQuery that saw it committed and the read. No C++ objects here: it is a __try frame. `streaming`: for
 // write-combined pages (copy_streaming). Paid at every submission.
-bool copy_guarded(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool streaming) {
+bool copy_guarded_host(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool streaming) {
     __try {
         if (streaming) copy_streaming(to, from, bytes);
         else leonida::guarded::copy(to, from, bytes);
@@ -247,6 +247,18 @@ bool copy_guarded(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes,
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+// The same, reading the title's pages that xmem's frame table holds through their frames: a stream pool's GPU-only
+// pages and their CPU twins after queue slot 31's copies have no host view (src/title_frames.h). A frame is a section's
+// scratch view, cached memory, so it is not read streaming.
+bool copy_guarded(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool streaming) {
+    const auto at = reinterpret_cast<std::uintptr_t>(from);
+    if (!leonida::title_frames::may_hold(at, at + bytes)) return copy_guarded_host(to, from, bytes, streaming);
+    return leonida::title_frames::for_each_part(at, bytes, [&](std::uintptr_t part, std::size_t n, std::uint8_t* frame) {
+        return copy_guarded_host(to + (part - at), frame ? frame : reinterpret_cast<const std::uint8_t*>(part), n,
+                                 streaming && !frame);
+    });
 }
 
 // A 64-bit digest of the bytes of a texture the title keeps in its own memory, to tell whether they changed since its
@@ -595,6 +607,7 @@ public:
                 next = std::min(last_, reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize);
                 kind = classify(region);
             }
+            if (kind == Kind::zero) kind = table_kind(at, next);
             std::size_t i1 = (next - first_) / kPage;
             for (std::size_t i = i0 + 1; i < i1; ++i)
                 if (!cover_[i]) {  // the region goes on past the pages copies read: the rest is passed over above
@@ -804,6 +817,10 @@ public:
             if (VirtualQuery(reinterpret_cast<const void*>(at), &region, sizeof(region))) {
                 next = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
                 kind = classify(region);
+            }
+            if (kind == Kind::zero) {  // a reservation can be far larger than the new target
+                next = std::min(next, end);
+                kind = table_kind(at, next);
             }
             const std::uintptr_t from = std::max(at, begin), to = std::min(next, end);
             if (kind == Kind::zero) {
@@ -1158,7 +1175,9 @@ private:
                 continue;
             }
             b.armed = false;
-            if (!copy_aliased_ || b.peers.empty()) continue;
+            // A table page with no host view anywhere (src/title_frames.h) has no other address to guard: its own cell,
+            // which every change of its frame moves, is all there is.
+            if (!copy_aliased_ || (b.peers.empty() && !leonida::title_frames::backed(va))) continue;
             b.armed = watch::arm(va, *b.cell);
             for (const auto& [other, cell] : b.peers) b.armed = watch::arm(other, *cell) && b.armed;
             alias_arms_ += 1 + b.peers.size();
@@ -1243,6 +1262,18 @@ private:
         std::uintptr_t begin, end;  // the title's bytes
         std::uint8_t* shadow;       // where begin's byte goes
     };
+
+    // A page VirtualQuery finds unreadable may be one xmem's frame table holds: a stream pool's GPU-only page or its
+    // CPU twin after queue slot 31's copies, with no host view (src/title_frames.h). It is read through its frame, like
+    // a read-only page that is not this tracker's: never guarded here (there is nothing to protect), and clean only
+    // while its geometry watch cells say so, which xmem's table updates and its physical page's host views move (xmem
+    // marks every table page aliased). `next` is clipped to the run of pages that are alike.
+    static Kind table_kind(std::uintptr_t at, std::uintptr_t& next) {
+        if (!leonida::title_frames::may_hold(at, next)) return Kind::zero;
+        bool backed = false;
+        next = leonida::title_frames::run_end(at, next, backed);
+        return backed ? Kind::read_only : Kind::zero;
+    }
 
     static Kind classify(const MEMORY_BASIC_INFORMATION& region) {
         if (region.State != MEM_COMMIT || (region.Protect & PAGE_GUARD)) return Kind::zero;
@@ -3247,8 +3278,10 @@ struct DeviceState {
         return enabled;
     }
 
-    // A committed page the host may read: the title's reservations start uncommitted.
+    // A committed page the host may read: the title's reservations start uncommitted. A page xmem's frame table holds
+    // (no host view: src/title_frames.h) is read through its frame.
     static bool readable_page(std::uint64_t address) {
+        if (leonida::title_frames::backed(static_cast<std::uintptr_t>(address))) return true;
         MEMORY_BASIC_INFORMATION region{};
         return VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), &region,
                             sizeof(region)) &&
@@ -3260,6 +3293,15 @@ struct DeviceState {
     static std::uint64_t readable_run_end(std::uint64_t address, std::uint64_t end) {
         std::uint64_t at = address;
         while (at < end) {
+            if (leonida::title_frames::may_hold(static_cast<std::uintptr_t>(at), static_cast<std::uintptr_t>(end))) {
+                bool backed = false;
+                const std::uint64_t run = leonida::title_frames::run_end(static_cast<std::uintptr_t>(at),
+                                                                          static_cast<std::uintptr_t>(end), backed);
+                if (backed) {
+                    at = run;
+                    continue;
+                }
+            }
             MEMORY_BASIC_INFORMATION region{};
             if (!VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), &region,
                               sizeof(region)) ||
@@ -6313,6 +6355,7 @@ struct DeviceState {
         probed = true;
         int ok = 0;
         for (const std::uintptr_t va : pages) {
+            if (leonida::title_frames::backed(va)) continue;  // a table page has no host view to import
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceMemory imported = VK_NULL_HANDLE;
             VkDeviceAddress address = 0;
@@ -15538,6 +15581,14 @@ public:
                 return false;
             }
             for(std::uint64_t at=va;at<va+bytes;) {
+                // A page xmem's frame table holds (no host view: src/title_frames.h) is read through its frame.
+                bool table = false;
+                const std::uint64_t run = leonida::title_frames::run_end(std::uintptr_t(at), std::uintptr_t(va + bytes),
+                                                                         table);
+                if (table) {
+                    at = run;
+                    continue;
+                }
                 MEMORY_BASIC_INFORMATION region{};
                 if(!VirtualQuery(reinterpret_cast<const void*>(at),&region,sizeof(region)) || region.State!=MEM_COMMIT ||
                    (region.Protect & (PAGE_NOACCESS|PAGE_GUARD)) ||
@@ -15552,10 +15603,14 @@ public:
             auto lease=std::make_shared<Lease>();
             if (!st->arena_allocate(bytes,256,lease->offset,DeviceState::arena_buffer)) return false;
             lease->state=st;lease->bytes=bytes;
-            SIZE_T copied{};
             std::uint8_t* const host=st->arena_host(lease->offset,bytes);
-            if (!host || !ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<const void*>(va),host,
-                                            SIZE_T(bytes),&copied) || copied!=bytes) return false;
+            if (!host || !leonida::title_frames::for_each_part(std::uintptr_t(va), std::size_t(bytes),
+                    [&](std::uintptr_t at, std::size_t n, std::uint8_t* frame) {
+                        if (frame) return copy_guarded_host(host + (at - va), frame, n, false);
+                        SIZE_T copied{};
+                        return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at),
+                                                 host + (at - va), SIZE_T(n), &copied) && copied == n;
+                    })) return false;
             result={va,bytes,st->arena.buffer,lease->offset,std::move(lease)};
             return true;
         });
@@ -16855,9 +16910,15 @@ public:
                 const auto available = std::min(block_size, size_ - base);
                 auto* window = cache_.data() + slot * block_size;
                 if (tags_[slot] != block) {
-                    SIZE_T copied{};
-                    if (!ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<const void*>(address_+base),
-                                           window,available,&copied) || copied!=available) return false;
+                    // A page xmem's frame table holds (no host view: src/title_frames.h) is read through its frame.
+                    const auto from = static_cast<std::uintptr_t>(address_ + base);
+                    if (!leonida::title_frames::for_each_part(from, available,
+                            [&](std::uintptr_t at, std::size_t n, std::uint8_t* frame) {
+                                if (frame) return copy_guarded_host(window + (at - from), frame, n, false);
+                                SIZE_T copied{};
+                                return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at),
+                                                         window + (at - from), n, &copied) && copied == n;
+                            })) return false;
                     tags_[slot]=block;
                 }
                 const auto n=std::min(bytes,available-(offset-base));
@@ -18868,6 +18929,13 @@ public:
         const std::uint64_t start = std::max(va & ~(align - 1), lo);
         std::uint64_t end = std::min(hi, (va + std::clamp<std::uint64_t>(bytes, 1, most) + align - 1) & ~(align - 1));
         for (std::uint64_t at = start; at < end;) {  // the committed, readable part only
+            // A page xmem's frame table holds (no host view: src/title_frames.h) is read through its frame.
+            bool table = false;
+            const std::uint64_t run = leonida::title_frames::run_end(std::uintptr_t(at), std::uintptr_t(end), table);
+            if (table) {
+                at = run;
+                continue;
+            }
             MEMORY_BASIC_INFORMATION region{};
             if (!VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), &region, sizeof(region)) ||
                 region.State != MEM_COMMIT || !region.Protect || (region.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {

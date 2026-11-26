@@ -24,12 +24,19 @@ static_assert(sizeof(PageRange) == 12 && sizeof(PageBatch) == 24 && offsetof(Pag
 // Record the two measured stream-pool reservation return sites; other callers are ignored.
 void note_stream_reservation(std::uintptr_t base, std::size_t size, std::uintptr_t caller_rva);
 bool queue_page_mappings_enabled();
-// Pages the console queue's CopyPageMappingsBatchX (the range form, copy_page_mappings_fn) changed so far: by a table
-// update alone (a GPU-only page with a CPU pair) and by a host map or unmap (its paired CPU page, or a destination with
-// no pair). Each host one is a MapViewOfFile3/UnmapViewOfFile2 pair, a wineserver round trip under Wine.
-void slot31_mapping_counts(std::uint64_t& table_pages, std::uint64_t& host_pages);
+// Pages the console queue's CopyPageMappingsBatchX (the range form, copy_page_mappings_fn) changed so far, by path. By a
+// table update alone: a GPU-only page with a CPU pair, and that pair's CPU page (both read through their frames,
+// src/title_frames.h). Left as they are: paired CPU pages the title mapped itself. By a host map or unmap, each a
+// MapViewOfFile3/UnmapViewOfFile2 pair and a wineserver round trip under Wine: a destination with no CPU pair (an
+// independent-pages range), and a view found at a page the table takes over (unmapped once).
+struct Slot31Counts {
+    std::uint64_t gpu_pages = 0, twin_pages = 0, twins_kept = 0, unpaired_pages = 0, views_replaced = 0;
+    std::uint64_t table() const { return gpu_pages + twin_pages; }
+    std::uint64_t host() const { return unpaired_pages + views_replaced; }
+};
+void slot31_mapping_counts(Slot31Counts& out);
 // The same, for the command-object proxy, which is also compiled into tests without xmem: null there.
-using Slot31MappingCountsFn = void (*)(std::uint64_t& table_pages, std::uint64_t& host_pages);
+using Slot31MappingCountsFn = void (*)(Slot31Counts& out);
 inline Slot31MappingCountsFn slot31_mapping_counts_fn = nullptr;
 bool slot31_runs();
 bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uintptr_t pool,
