@@ -338,9 +338,66 @@ int differential() {
 
 }  // namespace
 
+// Many slots in a few 64 KiB blocks, as the world's heaps have them (82,000-472,000 entries looked at for 2-15
+// changes in one run when the index grouped spans by 64 KiB block): a change looks at the halves whose range overlaps
+// it, however many others share its block. 300,000 slots name 16 bytes each, in 74 blocks; a release of 48 bytes
+// overlaps three of them. An addition over a range of resolved halves looks at the waiting ones only.
+int dense_blocks_look_at_overlaps_only() {
+    constexpr std::size_t kSlots = 300000;
+    constexpr std::uint64_t kBase = 0x10000000;
+    ConsoleHeapSlotRecords records;
+    records.reset(kSlots);
+    for (std::size_t slot = 0; slot < kSlots; ++slot) {
+        const std::uint64_t base = kBase + slot * 16;
+        records.set(slot, 0, ConsoleHeapSlotRecords::resolved, base, 16, kArena + base);
+    }
+    // A slot whose 1 MiB range starts two blocks before the change, and its counter half waiting on a refused copy.
+    records.set(5, 1, ConsoleHeapSlotRecords::resolved, kBase + 0x80000 - 0x20000, 0x100000, kArena + 0x7000000);
+    std::vector<std::uint32_t> touched;
+    const SlotChange release{SlotChange::target_gone, kArena + kBase + 0x80000 + 8, kArena + kBase + 0x80000 + 48};
+    std::uint64_t before = records.looked_at();
+    records.touched(&release, 1, touched);
+    const std::uint64_t looked = records.looked_at() - before;
+    // [base + 0x80008, base + 0x80030) overlaps slots 0x8000 (from byte 8), 0x8001 and 0x8002 (to byte 0x30).
+    EXPECT(looked == 3);
+    EXPECT(touched.size() == 3 && touched[0] == 0x8000 && touched[2] == 0x8002);
+    // The same bytes by source: the 1 MiB half of slot 5 overlaps them too.
+    const SlotChange removal{SlotChange::source_gone, kBase + 0x80000 + 8, kBase + 0x80000 + 48};
+    before = records.looked_at();
+    records.touched(&removal, 1, touched);
+    EXPECT(records.looked_at() - before == 4 && touched.size() == 4 && touched[0] == 5);
+    // A half that moves leaves nothing behind: slot 0x8001 now names other bytes, so the release looks at two.
+    records.set(0x8001, 0, ConsoleHeapSlotRecords::resolved, kBase - 0x1000, 16, kArena + kBase - 0x1000);
+    before = records.looked_at();
+    records.touched(&release, 1, touched);
+    EXPECT(records.looked_at() - before == 2 && touched.size() == 2 && touched[1] == 0x8002);
+
+    // Additions: 1,000 slots wait among the 300,000 resolved ones; a backing added over the whole range looks at the
+    // 1,000 only.
+    for (std::size_t slot = 100000; slot < 101000; ++slot) {
+        const std::uint64_t base = kBase + slot * 16;
+        records.set(slot, 0, ConsoleHeapSlotRecords::waiting, base, 16, 0);
+    }
+    EXPECT(records.waiting_count() == 1000);
+    const SlotChange added{SlotChange::source_added, kBase, kBase + kSlots * 16};
+    before = records.looked_at();
+    records.touched(&added, 1, touched);
+    EXPECT(records.looked_at() - before == 1000 && touched.size() == 1000 && touched[0] == 100000);
+    // Zeroed or reset, they are gone from every index.
+    records.clear_range(0, kSlots);
+    EXPECT(records.recorded() == 0 && records.ranges() == 0);
+    before = records.looked_at();
+    records.touched(&removal, 1, touched);
+    EXPECT(records.looked_at() == before && touched.empty());
+    std::printf("dense blocks: 300,000 slots in 74 blocks of 64 KiB; a 40-byte release looks at the 3 it overlaps, "
+                "an addition over all of them at the 1,000 waiting\n");
+    return 0;
+}
+
 int main() {
     if (release_looks_at_its_slots_only()) return 1;
     if (cases()) return 1;
+    if (dense_blocks_look_at_overlaps_only()) return 1;
     if (differential()) return 1;
     std::printf("console_heap_slot_records_test: ok\n");
     return 0;
