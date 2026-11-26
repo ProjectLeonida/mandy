@@ -180,6 +180,39 @@ test('paging a large model category keeps one page and restores the selected row
     assert.equal(filtered.children.length, 1);
 });
 
+test('switching to EU relabels the stats panel, the buttons, the texture gallery and the empty lists', async () => {
+    const studio = loadStudio();
+    const ids = ['stat-name', 'stat-category', 'stat-triangles', 'stat-vertices', 'stat-size'];
+    // In the page each label is the text node in front of its value: <div>Модель: <b id="stat-name">.
+    const labels = ids.map(id => (studio.context.document.getElementById(id).previousSibling = { nodeValue: '' }));
+    studio.context.fetch = async () => ({ json: async () => ({ textures: [] }) });
+    await studio.run('loadTextures()');
+    studio.run('renderCategoryChips({}); renderAccordionList();');
+    const allChip = studio.elements.get('category-chips').children[0];
+    studio.elements.set('chip-all', allChip);
+    assert.equal(allChip.innerText, 'Все (0)');
+    assert.equal(studio.elements.get('tex-count').innerText, '0 текстур найдено');
+    assert.equal(visibleText(studio.elements.get('textures-grid').innerHTML), 'Текстуры не найдены');
+    assert.equal(visibleText(studio.elements.get('model-list').innerHTML), 'Ничего не найдено');
+
+    studio.run(`setLanguage('eu')`);
+    assert.deepEqual(labels.map(label => label.nodeValue),
+        ['Model: ', 'Category: ', 'Polygons (triangles): ', 'Vertices: ', 'File size: ']);
+    assert.equal(studio.elements.get('btn-reset-camera').innerText, 'Reset Camera');
+    assert.equal(studio.elements.get('tex-heading').innerText, 'Texture Gallery (DDS & PNG)');
+    assert.equal(allChip.innerText, 'All (0)');
+    assert.equal(studio.elements.get('tex-count').innerText, '0 textures found');
+    assert.equal(visibleText(studio.elements.get('textures-grid').innerHTML), 'No textures found');
+    assert.equal(visibleText(studio.elements.get('model-list').innerHTML), 'No models found');
+
+    studio.context.textures = Array.from({ length: 81 }, () => ({ name: 'a.png', format: 'PNG Image', size: 4, preview: '/a.png' }));
+    studio.run('allTextures = textures; renderTexturesGrid();');
+    assert.equal(visibleText(studio.elements.get('textures-grid').children.at(-1).innerHTML), 'Show all (1 more)');
+    studio.context.fetch = async () => { throw new Error('offline'); };
+    await studio.run('loadTextures()');
+    assert.equal(studio.elements.get('tex-count').innerText, 'Could not load the textures');
+});
+
 test('each model category pages independently, including a partial last page', () => {
     const studio = loadStudio();
     studio.context.models = ['Props', 'Vehicles'].flatMap(category => Array.from({ length: 101 }, (_, i) => ({
