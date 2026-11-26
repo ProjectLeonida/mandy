@@ -116,6 +116,9 @@ through the same path as a real pad: a device object, the next free player slot,
 callbacks, and UI navigation derived from its buttons. It reports no rumble motors. It is on by default in the
 focused mode, so a player without a pad can still play; `LEONIDA_KEYBOARD_PAD=off` removes it.
 
+If SDL fails to attach or open the keyboard pad, the shim retries after one second while the pad is
+enabled. Only the first failure in a continuous series is logged; turning the pad off and back on retries immediately.
+
 | key | button |
 |---|---|
 | arrow keys | d-pad |
