@@ -197,6 +197,13 @@ NTSTATUS WINAPI gen_random(BCRYPT_ALG_HANDLE hAlgorithm, PUCHAR pbBuffer, ULONG 
         if (!is_rng) return kStatusInvalidHandle;
     }
 
+    // The host takes only these two flags and refuses any other with STATUS_INVALID_PARAMETER, after the handle checks
+    // above and before a zero-byte call is answered (measured on Windows 11 for 0x4, 0x10 and 0x80000000). Checked here
+    // because neither the seeded stream nor the SystemFunction036 fallback below reads the flags: the host's refusal
+    // fell through to that fallback, and a call Windows refuses came back as a success with random bytes.
+    if (dwFlags & ~static_cast<ULONG>(BCRYPT_RNG_USE_ENTROPY_IN_BUFFER | BCRYPT_USE_SYSTEM_PREFERRED_RNG))
+        return kStatusInvalidParameter;
+
     if (cbBuffer == 0) return kStatusSuccess;
 
     if (g_seeded_mode) {
