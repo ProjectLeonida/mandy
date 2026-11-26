@@ -296,7 +296,8 @@ class TestGalleryServer(unittest.TestCase):
     def test_png_thumbnail_falls_back_to_uppercase_dds(self) -> None:
         # GALLERY-THUMB-UPPERCASE-DDS: the catalog lists upper.DDS and the gallery asks for upper.png as its
         # thumbnail. On a case-sensitive filesystem the fallback's upper.dds is not that file, so it was a 404.
-        # A case-sensitive isfile stands in for one here, on Windows and macOS too.
+        # A case-sensitive isfile stands in for one here, on Windows and macOS too. realpath stands in as well:
+        # on Windows it returns the name's real case (upper.DDS for upper.dds), which would hide the bug.
         with open(os.path.join(self.textures_dir, "upper.DDS"), "wb") as f:
             f.write(_make_1x1_rgba_dds())
         real_isfile = os.path.isfile
@@ -308,7 +309,11 @@ class TestGalleryServer(unittest.TestCase):
             except OSError:
                 return False
 
-        with mock.patch("os.path.isfile", case_sensitive_isfile):
+        def case_keeping_realpath(path, *args, **kwargs) -> str:
+            return os.path.normpath(os.path.abspath(path))
+
+        with mock.patch("os.path.isfile", case_sensitive_isfile), \
+                mock.patch("os.path.realpath", case_keeping_realpath):
             with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/textures/upper.png", timeout=3) as r:
                 self.assertEqual(r.status, 200)
                 self.assertEqual(r.headers["Content-Type"], "image/png")
