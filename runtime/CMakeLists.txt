@@ -155,6 +155,10 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       IMPORTED_LOCATION "${_xma_lib_resolved}"
       INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder"
       INTERFACE_COMPILE_DEFINITIONS LEONIDA_HAVE_XMA2_DECODER=1
+      INTERFACE_LINK_LIBRARIES "kernel32;ntdll;userenv;ws2_32;dbghelp;synchronization")
+  endif()
+  if(LEONIDA_REQUIRE_XMA2_DECODER AND NOT TARGET leonida_xma2_decoder)
+    message(FATAL_ERROR "LEONIDA_REQUIRE_XMA2_DECODER is enabled, but the Rust XMA2 decoder is unavailable")
   endif()
 
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
