@@ -2909,7 +2909,9 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   slot-70 and slot-133 images and the portion on non-device-local types. It also reports the unique CPU memory
   behind images filled from title memory and estimates how much of it is resident in RAM (#1702). The census
   merges overlapping CPU address ranges before sampling one page in 16 with `QueryWorkingSetEx`
-  (`runtime/src/working_set.h`). Images the GPU writes (render targets, depth, unordered access) are left out.
+  (`runtime/src/working_set.h`). Images the GPU writes (render targets, depth, unordered access) are left out. The
+  merge is by virtual address, so the log line says "CPU virtual bytes": two distinct views of one physical backing
+  (the same frames mapped at two addresses) count twice, in the total and in the resident part.
 - A refresh pass visits a snapshot of the title-image registry, taken under its mutex, instead of walking the
   registry itself. Filling a texture can submit, a submission destroys a retired image, and that image's destructor
   erases its registry entry. Windows' mutex is recursive for its owner, so the erase lands inside the pass, and a walk

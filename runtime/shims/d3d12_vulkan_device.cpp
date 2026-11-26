@@ -12891,7 +12891,8 @@ private:
             log_title_image_uses(state_.title_textures, retired_title_textures_.size(), retired_backing_, state_.zero_image_bytes.load());
             std::fprintf(stderr, "[rt] mem-probe: registered image backing: %.1f MiB from slot 70, %.1f MiB from slot "
                                  "133, %.1f MiB total on non-device-local types; staged fills %llu, %.3f s, buffer %.1f MiB; "
-                                 "unique title memory behind filled images %.1f MiB, %.1f MiB of it resident in RAM\n",
+                                 "CPU virtual bytes behind filled images %.1f MiB, %.1f MiB of it resident in RAM (two views "
+                                 "of one backing count twice)\n",
                          double(owned_bytes) / 1048576.0, double(placed_bytes) / 1048576.0,
                          double(host_heap_bytes) / 1048576.0, static_cast<unsigned long long>(s.staged_fills),
                          double(s.staged_ns) / 1e9, double(state_.title_upload.capacity()) / 1048576.0,

@@ -27,7 +27,9 @@ struct CpuRange {
     std::uint64_t end;
 };
 
-// Texture aliases and overlapping views can refer to the same CPU bytes. Count their union.
+// Texture aliases and overlapping views can refer to the same CPU bytes. Count their union, by virtual address: two
+// distinct virtual views of one physical backing (a placeholder mapped twice, a GPU-only alias paired with a CPU view)
+// do not overlap here, so their bytes count twice, and so does their residency.
 inline void merge_cpu_ranges(std::vector<CpuRange>& ranges) {
     std::sort(ranges.begin(), ranges.end(), [](const CpuRange& a, const CpuRange& b) { return a.begin < b.begin; });
     std::size_t count = 0;
