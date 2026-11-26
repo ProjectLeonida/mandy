@@ -176,6 +176,11 @@ struct CheckpointSubmission {
     std::vector<CheckpointDispatch> dispatches;
     std::size_t dispatch_count = 0;
     static constexpr std::size_t dispatch_limit = 64;
+    // With LEONIDA_DEVICE_FAULT_ROOTS a submission keeps up to this many of its own dispatches, so a checkpoint the
+    // driver reports early in a long compute submission still finds its dispatch. Diagnostic mode only: 64 recent
+    // submissions at about 250 bytes a dispatch is at most 16 MiB.
+    static constexpr std::size_t roots_dispatch_limit = 1024;
+    std::size_t keep = dispatch_limit;  // how many of its most recent dispatches this submission keeps
     // Numbers every recorded dispatch, across queues and submissions (the report's seq). Null: no numbers.
     std::atomic<std::uint64_t>* dispatch_seq = nullptr;
     // LEONIDA_DEVICE_MARKERS=1: this queue's marker slot, every dispatch recorded for the marker history and the seq
@@ -185,8 +190,8 @@ struct CheckpointSubmission {
     std::uint64_t open_marker = 0;
 
     void append_dispatch(CheckpointDispatch d) {
-        if (dispatches.size() < dispatch_limit) dispatches.push_back(d);
-        else dispatches[dispatch_count % dispatch_limit] = d;
+        if (dispatches.size() < keep) dispatches.push_back(d);
+        else dispatches[dispatch_count % keep] = d;
         ++dispatch_count;
     }
 };
@@ -764,6 +769,7 @@ public:
         CheckpointSubmission submission{sequence_, call, queue, kind, lists,
                 std::vector<CheckpointList>(std::min(lists, std::size_t{CheckpointMarker::max_list} + 1))};
         submission.dispatch_seq = &dispatch_seq_;
+        if (include_roots_) submission.keep = CheckpointSubmission::roots_dispatch_limit;
         if (markers_) {
             std::lock_guard lock(mutex_);
             submission.markers = markers_->target(queue);
@@ -773,8 +779,10 @@ public:
 
     void publish(CheckpointSubmission&& submission) {
         std::lock_guard lock(mutex_);
-        for (std::size_t i = submission.dispatch_count - submission.dispatches.size(); i < submission.dispatch_count; ++i)
-            dispatches_[dispatch_count_++ % dispatches_.size()] = submission.dispatches[i % submission.dispatch_limit];
+        // The global history keeps the last 64 across submissions, so only a submission's last 64 can stay in it.
+        const std::size_t copied = std::min(submission.dispatches.size(), dispatches_.size());
+        for (std::size_t i = submission.dispatch_count - copied; i < submission.dispatch_count; ++i)
+            dispatches_[dispatch_count_++ % dispatches_.size()] = submission.dispatches[i % submission.keep];
         // With LEONIDA_DEVICE_FAULT_ROOTS each recent submission keeps its own dispatches: a later submission can
         // push every one of them out of the global history before the driver reports a checkpoint in it.
         if (!include_roots_) submission.dispatches.clear();
@@ -1062,6 +1070,10 @@ private:
                     found = true;
                 }
                 if (found) ++checkpoint_dispatches_found_;
+                else if (entry.dispatch_count > entry.dispatches.size())
+                    std::fprintf(stderr, "[rt] device-fault: checkpoint dispatch not in its submission's history (it "
+                                 "recorded %zu dispatches and keeps the last %zu)\n", entry.dispatch_count,
+                                 entry.dispatches.size());
                 else std::fputs("[rt] device-fault: checkpoint dispatch not in its submission's history\n", stderr);
             }
         }
