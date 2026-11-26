@@ -172,6 +172,19 @@ class TestRules(unittest.TestCase):
         self.assertNotIn("horn_qqq", d.bases(A.MIN_TOKEN))
         self.assertIn("horn_qqq", d.bases(1))
 
+    def test_a_digit_that_ends_the_base_is_not_a_member_number(self):
+        # "2 with adjacent numbers" counts the members' numbered suffixes. The unsuffixed member of a base that ends
+        # in a digit has no suffix number either: amb_1 + amb_1_02 is no family, as horn + horn_02 is none.
+        d = A.Dictionary(["amb_1_02", "horn_02"])
+        for base, names in (("amb_1", ["amb_1", "amb_1_02"]), ("horn", ["horn", "horn_02"])):
+            with self.subTest(base):
+                self.assertEqual(A.attack(d, [base], self.index({"b": names}), ""), {})
+        # Two adjacent suffixes, or three members, still make a family on such a base.
+        for names in (["amb_1_01", "amb_1_02"], ["amb_1", "amb_1_02", "amb_1_05"]):
+            with self.subTest(names):
+                found = A.attack(d, ["amb_1"], self.index({"b": names}), "")
+                self.assertEqual(sorted(v[0] for v in found.values()), sorted(names))
+
     def test_family_ok(self):
         self.assertTrue(A.family_ok(["a_01", "a_02"]))
         self.assertFalse(A.family_ok(["a_01", "a_03"]))
