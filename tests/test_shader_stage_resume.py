@@ -16,7 +16,9 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.append(os.path.join(ROOT, "tests", "semantic"))
 import make_game  # noqa: E402
+import piecewise_parse  # noqa: E402  (ast.parse takes 7 s for tools/rdna2spirv.py on CPython 3.12)
 import shader_carve  # noqa: E402
 
 UNPACK = os.path.join(ROOT, "tools", "fssm_unpack.py")
@@ -540,7 +542,7 @@ class TranslationSourcesTest(unittest.TestCase):
                 continue
             seen.add(name)
             with open(os.path.join(make_game.TOOLS, name + ".py"), encoding="utf-8") as f:
-                tree = ast.parse(f.read())
+                tree = piecewise_parse.parse(f.read())
             for node in ast.walk(tree):                     # function-level imports too
                 if isinstance(node, ast.Import):
                     mods = [a.name for a in node.names]
@@ -565,7 +567,7 @@ class TranslationSourcesTest(unittest.TestCase):
 
         def local_imports(name: str):
             with open(os.path.join(make_game.TOOLS, name + ".py"), encoding="utf-8") as f:
-                tree = ast.parse(f.read())
+                tree = piecewise_parse.parse(f.read())
             out = []
             for node in ast.walk(tree):                     # function-level imports too
                 if isinstance(node, ast.Import):

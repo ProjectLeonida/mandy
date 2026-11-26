@@ -32,10 +32,13 @@ import ast
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.join(ROOT, "tests", "semantic"))
+import piecewise_parse  # noqa: E402  (ast.parse takes 7 s for tools/rdna2spirv.py on CPython 3.12)
 WORKFLOW = ".github/workflows/runtime.yml"
 
 # Entries that are needed for reasons a source scan cannot see: the build's own trees, the workflow, and the
@@ -93,7 +96,7 @@ def python_refs(source):
     """(modules, strings) of a Python file: what it imports, including importlib.import_module("x") and
     __import__("x"), and its string constants other than docstrings. Comments never reach the AST."""
     try:
-        tree = ast.parse(source)
+        tree = piecewise_parse.parse(source)
     except SyntaxError:
         return set(), set()
     docstrings = set()

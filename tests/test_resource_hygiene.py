@@ -7,12 +7,14 @@ import sys
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.append(str(ROOT / "tests" / "semantic"))
+import piecewise_parse  # noqa: E402  (ast.parse takes 7 s for tools/rdna2spirv.py on CPython 3.12)
 
 
 def _bare_open_calls(path: pathlib.Path) -> list[tuple[int, str]]:
     """Return (lineno, source_line) for any open(...) call not managed by a with statement."""
     src = path.read_text(encoding="utf-8")
-    tree = ast.parse(src, filename=str(path))
+    tree = piecewise_parse.parse(src, str(path))
     managed: set[int] = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.With, ast.AsyncWith)):

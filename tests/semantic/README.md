@@ -32,7 +32,10 @@ On CPython 3.12, 3.13.0 to 3.13.15 and 3.14.0 to 3.14.7 `support.py` loads the m
 `PYTHONDONTWRITEBYTECODE` is set. `piecewise_parse.py` parses a source in pieces of 300 lines and joins them into the
 tree a whole-file parse gives: under 1 s for the translator, and the same code object.
 `tests/test_piecewise_parse.py` compares the trees for every Python file of the repository and the code objects for
-some. A file that imports `rdna2spirv` before `support`, or without it, still pays the 7 s.
+some. A file that imports `rdna2spirv` before `support`, or without it, still pays the 7 s. The tests under `tests/`
+that read the translator's syntax tree (`test_runtime_paths.py`, `test_isa_coverage.py`,
+`test_shader_stage_resume.py`, `test_cmake_translator_deps.py`, `test_resource_hygiene.py`) call
+`piecewise_parse.parse` where they would call `ast.parse`, for the same reason: no `.pyc` helps a parse.
 
 What they check (`tools/rdna2spirv.py` on pixel, vertex, compute and other stages, wave32 and wave64, mostly one
 instruction family per file; the list below describes some of them, not every file):
