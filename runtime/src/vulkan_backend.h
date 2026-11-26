@@ -2612,7 +2612,9 @@ public:
                      static_cast<void*>(progress_), double(diagnostic_ms()) / 1000.0);
         context_.holds().detach(this);  // no thread releases into this queue from here on
         report_held_at_teardown();
-        context_.holds().pump_ready();  // presents queued behind what was just dropped can run
+        // Presents queued behind what was just dropped run before this returns: pump_now waits for a pass another
+        // thread (a queue's worker) may be running instead of handing the Presents to it.
+        context_.holds().pump_now();
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
             const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
@@ -2903,6 +2905,12 @@ public:
 
     bool idle() {
         flush_async();
+        // The worker's last step (the Presents behind what it released) may be in a pass another thread runs: wait
+        // for that pass, then for anything it handed back to the worker.
+        if (async_started_.load(std::memory_order_acquire) && t_worker_of_ != this) {
+            context_.holds().pump_now();
+            flush_async();
+        }
         std::lock_guard lock(context_.submit_mutex());
         const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
         return context_.observe_result(context_.vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle") == VK_SUCCESS;
@@ -4013,18 +4021,63 @@ private:
     bool ready(const Deferred& op) const { return !waits_pending(op.waits, op.wait_values); }
 
     // Holder: called by the thread whose Signal made a held operation ready (never with a queue lock held).
-    // With LEONIDA_SUBMIT_ASYNC another thread does not run this queue's held work: it asks the queue's worker,
-    // which releases it and then pumps the holds itself (so a Present behind it still runs after it).
+    // Another thread does not run this queue's held work: it asks the queue's worker, which releases it and then
+    // pumps the holds itself (so a Present behind it still runs after it). The worker is the one LEONIDA_SUBMIT_ASYNC
+    // runs the queue's calls on; without that, it is started for releases alone (LEONIDA_RELEASE_WORKER=1, off by
+    // default) and the calls still run on the caller's thread. Releasing on the signalling thread let one queue's
+    // held replay, with its first-use pipeline builds (tens of seconds each, cold), keep that thread: for the list
+    // values' releaser, that stopped every gate of every queue behind one batch.
     bool release_ready() override {
-        if (async_started_.load(std::memory_order_acquire) && t_worker_of_ != this) {
+        // The queue's own worker asks too, rather than releasing at once: it calls this from inside the holds' pump
+        // (after a call or a release of its own), and a replay run there would hold the pump for as long as its
+        // builds take, so another queue's release, handed to the pump meanwhile, would wait behind it. The worker
+        // takes its request on its next pass, right after the pump.
+        const bool on_worker = t_worker_of_ == this;
+        if (on_worker || async_started_.load(std::memory_order_acquire) || start_release_worker()) {
+            bool asked = false;
             {
                 std::lock_guard lock(inbox_mutex_);
-                release_requested_ = true;
+                if (!async_stop_) asked = release_requested_ = true;
             }
-            inbox_cv_.notify_one();
-            return false;
+            if (asked) {
+                if (!on_worker) inbox_cv_.notify_one();
+                return false;
+            }
+            // The worker is stopping (the queue is being destroyed) and takes no more requests: released here.
         }
         return release_held();
+    }
+
+    // LEONIDA_RELEASE_WORKER=1: the queue's worker is started for its held work on the first release. Unset (the
+    // default), held work runs on the thread whose Signal released it, unless LEONIDA_SUBMIT_ASYNC runs a worker.
+    static bool release_worker_enabled() {
+        static const bool on = [] {
+            const char* v = std::getenv("LEONIDA_RELEASE_WORKER");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
+
+    bool start_release_worker() {
+        if (!release_worker_enabled()) return false;
+        std::lock_guard lock(inbox_mutex_);
+        if (async_stop_) return false;
+        if (!worker_.joinable()) {
+            worker_ = std::thread([this] { async_worker(); });
+            async_started_.store(true, std::memory_order_release);
+        }
+        return true;
+    }
+
+    // A test and diagnostic switch: LEONIDA_HELD_RUN_DELAY_MS=<n> waits n ms before each held operation runs, as a
+    // slow first-use pipeline build would, so a test can tell which thread runs it and what it holds up. 0: none.
+    static unsigned held_run_delay_ms() {
+        static const unsigned ms = [] {
+            const char* v = std::getenv("LEONIDA_HELD_RUN_DELAY_MS");
+            const int n = v && *v ? std::atoi(v) : 0;
+            return n > 0 ? unsigned(n) : 0u;
+        }();
+        return ms;
     }
 
     bool release_held() {
@@ -4046,6 +4099,7 @@ private:
                         }
                     gpu_latency::held(int(kind_), int(op.kind), op.held_at, fence, value);
                 }
+                if (held_run_delay_ms()) std::this_thread::sleep_for(std::chrono::milliseconds(held_run_delay_ms()));
                 if (!context_.is_device_lost()) run(op);
                 // Only now: until it has run, the operation still counts as the oldest held one.
                 held_front_seq_.store(held_.empty() ? 0 : held_.front().seq, std::memory_order_release);
@@ -4079,7 +4133,7 @@ private:
 
     // Holder: the sequence number of the oldest held operation.
     std::uint64_t oldest_held_seq() override {
-        if (!async_on()) {
+        if (!async_started_.load(std::memory_order_acquire)) {
             std::lock_guard state(state_mutex_);
             return held_.empty() ? 0 : held_.front().seq;
         }
@@ -4559,7 +4613,8 @@ private:
     // (QueueHolds), numbered when it was called, so a Present behind it still waits for it and cross-queue order is
     // the call order. Calls that use the queue's state at once (tile mappings, idle, the destructor) first wait for
     // what is queued. A batch that fails is reported as a held one is (stderr, take_held_failure()). Off (0) by
-    // default: every call runs on the caller's thread, as before.
+    // default: every call runs on the caller's thread, as before. When it runs, the same worker releases the queue's
+    // held work (release_ready); LEONIDA_RELEASE_WORKER=1 starts it for that alone.
     static unsigned async_depth() {
         static const unsigned depth = [] {
             const char* v = std::getenv("LEONIDA_SUBMIT_ASYNC");
@@ -4642,7 +4697,7 @@ private:
                 }
                 worker_busy_ = true;
             }
-            if (release) release_held();
+            if (release) release_held_guarded();
             std::uint64_t ran_ns = 0;
             if (have) {
                 const auto start = std::chrono::steady_clock::now();
@@ -4659,16 +4714,43 @@ private:
             {
                 std::lock_guard lock(inbox_mutex_);
                 running_seq_ = 0;
-                worker_busy_ = false;
                 if (have && call.kind == Call::Kind::execute) --inbox_batches_;
                 if (have) room_cv_.notify_all();
-                idle_cv_.notify_all();
                 report_async_locked();
             }
             if (have) context_.holds().held_changed(-1);
             call = Call{};  // the copies and pins go before the pump, outside the lock
             context_.holds().pump_ready();
+            // Idle only after the pump: a Present queued behind what this pass released runs in it, and a caller
+            // waiting for the queue (flush_async) expects it done, as when the signalling thread released.
+            {
+                std::lock_guard lock(inbox_mutex_);
+                worker_busy_ = false;
+                idle_cv_.notify_all();
+            }
         }
+    }
+
+    // A release on the worker, guarded as run_call is: an exception becomes a held failure and a lost device, and the
+    // front number is brought up to date, since the operation that threw was already taken off the held list.
+    void release_held_guarded() {
+        try {
+            release_held();
+            return;
+        } catch (const std::exception& e) {
+            int none = static_cast<int>(ReplayResult::success);
+            held_failure_.compare_exchange_strong(none, static_cast<int>(ReplayResult::unsupported));
+            std::fprintf(stderr, "[rt] d3d12: the queue's worker caught an exception releasing held work (%s); the "
+                                 "device is marked lost\n", e.what());
+        } catch (...) {
+            int none = static_cast<int>(ReplayResult::success);
+            held_failure_.compare_exchange_strong(none, static_cast<int>(ReplayResult::unsupported));
+            std::fprintf(stderr, "[rt] d3d12: the queue's worker caught an exception releasing held work (not a "
+                                 "std::exception); the device is marked lost\n");
+        }
+        context_.mark_device_lost();
+        std::lock_guard state(state_mutex_);
+        held_front_seq_.store(held_.empty() ? 0 : held_.front().seq, std::memory_order_release);
     }
 
     // An exception on the worker would end the process (std::terminate) and leave the queue's callers waiting: it is
@@ -4736,6 +4818,7 @@ private:
 
     // Every 10 s, per queue: what the worker did. Called with inbox_mutex_ held.
     void report_async_locked() {
+        if (!async_on()) return;  // a worker started for releases alone (LEONIDA_RELEASE_WORKER) has no calls
         const auto now = std::chrono::steady_clock::now();
         const double s = std::chrono::duration<double>(now - async_stats_.since).count();
         if (s < 10.0) return;
@@ -4758,7 +4841,9 @@ private:
     bool flush_async() {
         if (!async_started_.load(std::memory_order_acquire) || t_worker_of_ == this) return true;
         std::unique_lock lock(inbox_mutex_);
-        const auto idle = [this] { return inbox_.empty() && !worker_busy_; };
+        // A release asked for and not yet taken counts as queued work: a caller that waits for the queue (idle, the
+        // destructor) must see what a Signal released, as when the signalling thread ran it itself.
+        const auto idle = [this] { return inbox_.empty() && !release_requested_ && !worker_busy_; };
         for (int slice = 1; slice <= 6; ++slice) {
             if (idle_cv_.wait_for(lock, std::chrono::seconds(10), idle)) return true;
             std::fprintf(stderr, "[rt] d3d12: waited %d s for a queue's worker to finish what is queued (%zu calls, "
@@ -4770,7 +4855,16 @@ private:
     }
 
     void stop_async() {
-        if (!async_started_.load(std::memory_order_acquire)) return;
+        // Under inbox_mutex_, which start_release_worker() takes too: with no worker yet, none can be started from here
+        // on. Another thread's pass can still ask this queue until the destructor detaches it, and a worker it started
+        // then would outlive the queue.
+        {
+            std::lock_guard lock(inbox_mutex_);
+            if (!worker_.joinable()) {
+                async_stop_ = true;
+                return;
+            }
+        }
         const bool drained = flush_async();
         {
             std::lock_guard lock(inbox_mutex_);

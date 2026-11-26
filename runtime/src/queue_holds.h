@@ -187,6 +187,29 @@ public:
         }
     }
 
+    // A pass run now, after any pass in progress (waited for, not handed off): when it returns, what was already
+    // released has been offered again and every Present that can run has run. For a caller that waits for a queue
+    // (VulkanQueue::idle) after its worker has finished, since the worker's own pass can hand its last step (the
+    // Presents behind what it released) to a pass another thread is running.
+    // No "nothing to do" shortcut: a pass on another thread takes a Present off the list before it runs it, so an
+    // empty list can still mean a Present in progress. Taking pump_mutex_ waits for that pass, Present included.
+    void pump_now() {
+        if (in_pump()) return;
+        {
+            std::lock_guard pump(pump_mutex_);
+            in_pump() = true;
+            dirty_.store(false, std::memory_order_release);
+            bool progress = true;
+            while (progress) {
+                progress = false;
+                for (Holder* holder : snapshot()) progress |= holder->release_ready();
+            }
+            run_barriers();
+            in_pump() = false;
+        }
+        if (dirty_.load(std::memory_order_acquire)) pump_ready();
+    }
+
 private:
     struct Barrier {
         const void* owner;
