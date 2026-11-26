@@ -316,6 +316,26 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertIn("vk_pipeline_check", err.getvalue())
         self.assertIn("b_mod", err.getvalue())
         self.assertTrue(any("cannot write pipeline_crashes.json" in line for line in logs))
+        self.assertNotIn("hashes in pipeline_crashes.json", err.getvalue())
+
+    def test_a_locked_old_crash_report_does_not_stop_the_check(self):
+        os.makedirs(self.out)
+        report = os.path.join(self.out, "pipeline_crashes.json")
+        with open(report, "w", encoding="utf-8") as f:
+            f.write('{"modules": []}')
+        real_remove = os.remove
+
+        def locked_report(path):
+            if path == report:
+                raise PermissionError(13, "another process has the report open")
+            return real_remove(path)
+
+        with mock.patch.object(make_game.os, "remove", locked_report):
+            failed, logs = self.stage(lambda args, n: 0)
+        self.assertIsNone(failed)
+        self.assertTrue(any("cannot remove old pipeline_crashes.json" in line and "may be stale" in line
+                            for line in logs), logs)
+        self.assertTrue(os.path.exists(report))
 
     def test_a_clean_run_drops_an_old_crash_report(self):
         os.makedirs(self.out)
