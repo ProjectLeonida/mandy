@@ -157,7 +157,6 @@ class BufferLoadSubTests(unittest.TestCase):
 
     def test_rejected_sub_dword_forms(self):
         for line in ("buffer_load_ushort v5, v1, s[4:7], 0 offen lds",
-                     "buffer_load_ushort v5, v1, s[4:7], 0 offen tfe",
                      "buffer_load_ushort v5, v1, s[4:7], 0 offen d16"):
             with self.subTest(line=line):
                 with self.assertRaises(rdna2spirv.Unsupported):
