@@ -72,6 +72,12 @@ frame count of the Opus packet's table-of-contents byte (RFC 6716, section 3.1) 
 `xapu_chad_test` covers the layouts and the silent path; `xapu_opus_test` covers the decoded path with a generated
 packet.
 
+The `chad.dll` signatures, structure layouts, limits and error codes come from the same project
+(`crates/victory-hle/src/modules/dsp.rs` at commit `ffe310e`), facts only; the top of `xapu_chad.cpp` lists them. They
+fit the shapes above: the title's `0x80` is the stream limit, `XDspActivate`'s two outputs are a 16-byte status block
+and the stream, and the dwords the title waits on are the status block's last completed ticket (+4) and its result
+(+0xc). Commands complete when submitted and their output is zeros: no convolution is computed.
+
 ## `xg_xs.dll` and `XCRDAPI.dll`
 
 | Import | Sites | What the sites show |

@@ -212,9 +212,10 @@ input. Activate, process, deactivate and reset commands are copied from the titl
 result in order. A process command decodes its Opus packet through `runtime/opus_decoder` (Rust over the BSD-3-Clause
 `opus-pure`) into the slot's output, honouring first frame, frame count, output length and the deinterleaved option;
 without the crate the result carries the table-of-contents frame count and silence. The layouts follow Marvisak/VIctory
-`crates/victory-hle/src/modules/apu.rs` (GPL-3.0-or-later). `XDspActivate` writes its two outputs as pointers to zeroed
-memory, which the title reads as "command done" after each `XDspSubmitCommand`; the DSP stays silent. `xapu_chad_test`
-covers the layouts, the queue and the silent path; `xapu_opus_test` the decoded path. With `--trace`, the first call of
+`crates/victory-hle/src/modules/apu.rs` (GPL-3.0-or-later). The `chad.dll` layouts, limits and error codes follow
+`crates/victory-hle/src/modules/dsp.rs` (same licence and commit): `XDspActivate` hands out a stream and its 16-byte
+status block, and each `XDspSubmitCommand` completes at once, advancing the ticket the title waits on and writing
+zeros as its output, so the DSP's reverb stays dry. `xapu_chad_test` covers the layouts, the queues and the silent path; `xapu_opus_test` the decoded path. With `--trace`, the first call of
 each, and the first command of each type, is an `audio_queue` event.
 The table above was measured before this shim and still lists these ten as unimplemented; they are served now. The call shapes agree with `docs/audio_hal_exe_calls.md`, which was measured with `tools/import_call_sites.py`.
 

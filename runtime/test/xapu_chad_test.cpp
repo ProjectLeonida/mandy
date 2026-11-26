@@ -5,7 +5,8 @@
 // accepted command, in command order, with its id echoed; the per-stream queue limit; the error codes, returned or in
 // the result; a process command's frame count taken from the Opus packet's table-of-contents byte (RFC 6716, section
 // 3.1) and clipped, with silence written; and the result event. The packets are hand-made TOC bytes, not audio.
-// chad.dll: XDspActivate hands out zeroed status and stream memory, and both disconnect.
+// chad.dll: the connect bounds and description rules with their error codes, the status block the title's wait reads,
+// one ticket per command with a silent output block, the stream limit, and handles refused once released.
 #include <windows.h>
 
 #include <cstdint>
@@ -23,7 +24,7 @@ using XApuGetResultCountFn = uint32_t(__stdcall*)(void*, uint32_t*);
 using XApuDequeueResultFn = HRESULT(__stdcall*)(void*, void*);
 using XDspConnectFn = HRESULT(__stdcall*)(void*, uint32_t, uint32_t, uint32_t, uint32_t, void**);
 using XDspActivateFn = HRESULT(__stdcall*)(void*, const void*, void**, void**);
-using XDspDeactivateFn = HRESULT(__stdcall*)(void*, uint64_t, uint64_t, uint64_t);
+using XDspDeactivateFn = HRESULT(__stdcall*)(void*);
 using XDspDisconnectFn = HRESULT(__stdcall*)(void*);
 using XDspSubmitCommandFn = HRESULT(__stdcall*)(void*, void*, uint32_t*);
 
@@ -271,21 +272,136 @@ int main() {
           "and it can be activated again");
     check(disconnect(apu, 0x20) == S_OK, "XApuDisconnect(handle, 0x20)");
 
-    // XDspConnectWithMaximumStreamLimit(buffer, u32, u32, 0x80, 1, handle*), success read as a return of 0.
-    alignas(64) static uint8_t dsp_buffer[4096];
+    // XDspConnectWithMaximumStreamLimit(base, base_bytes, ir_seconds, max_streams, max_channels, handle*); the title
+    // passes 0x80 streams and 1 channel, and reads success as a return of 0.
+    alignas(64) static uint8_t dsp_buffer[0x10000];
     void* dsp = nullptr;
-    check(dsp_connect(dsp_buffer, 0, 0, 0x80, 1, &dsp) == 0 && dsp, "XDspConnectWithMaximumStreamLimit returns 0 and a handle");
-    const uint8_t description[0x1c] = {};
+    struct Bound {
+        void* base;
+        uint32_t bytes, ir_seconds, streams, channels;
+        const char* what;
+    } const bounds[] = {
+        {nullptr, 0x10000, 0, 0x80, 1, "a null base is E_INVALIDARG"},
+        {dsp_buffer, 0xFFFF, 0, 0x80, 1, "base_bytes below 0x10000 is E_INVALIDARG"},
+        {dsp_buffer, 0x1F400001, 0, 0x80, 1, "base_bytes above 0x1F400000 is E_INVALIDARG"},
+        {dsp_buffer, 0x10000, 0x81, 0x80, 1, "ir_seconds above 0x80 is E_INVALIDARG"},
+        {dsp_buffer, 0x10000, 0, 0x101, 1, "max_streams above 0x100 is E_INVALIDARG"},
+        {dsp_buffer, 0x10000, 0, 0x80, 3, "max_channels above 2 is E_INVALIDARG"},
+    };
+    for (const Bound& b : bounds)
+        check(dsp_connect(b.base, b.bytes, b.ir_seconds, b.streams, b.channels, &dsp) == E_INVALIDARG && !dsp, b.what);
+    check(dsp_connect(nullptr, 0, 0, 0x80, 1, nullptr) == E_INVALIDARG,
+          "bad arguments are checked before the out pointer");
+    check(dsp_connect(dsp_buffer, 0x10000, 0, 0x80, 1, nullptr) == E_POINTER, "a null out pointer is E_POINTER");
+    check(dsp_connect(dsp_buffer, 0x1F400000, 0x80, 0x100, 2, &dsp) == 0 && dsp,
+          "every upper bound itself is accepted");
+    check(dsp_disconnect(dsp) == 0, "and that connection disconnects");
+    dsp = nullptr;
+    check(dsp_connect(dsp_buffer, 0x10000, 0, 2, 1, &dsp) == 0 && dsp,
+          "XDspConnectWithMaximumStreamLimit returns 0 and a handle");
+
+    // XDspActivate(handle, desc*, status*, stream*): kind, options, frames, channels, ir_floats, ir (0x1C, packed).
+#pragma pack(push, 1)
+    struct Desc {
+        uint32_t kind, options, frames, channels, ir_floats;
+        const float* ir;
+    };
+#pragma pack(pop)
+    static_assert(sizeof(Desc) == 0x1C, "the packed description");
+    struct Shape {
+        Desc desc;
+        bool valid;
+        const char* what;
+    } const shapes[] = {
+        {{1, 0, 0x200, 1, 0, nullptr}, true, "convolution, mono, 0x200 frames is valid"},
+        {{1, 0, 0x400, 2, 0, nullptr}, true, "convolution, stereo, 0x400 frames is valid"},
+        {{1, 0, 0x800, 1, 0, nullptr}, false, "convolution of 0x800 frames is refused"},
+        {{1, 0, 0x200, 3, 0, nullptr}, false, "convolution of 3 channels is refused"},
+        {{1, 0, 0x200, 0, 0, nullptr}, false, "convolution of 0 channels is refused"},
+        {{1, 4, 0x200, 1, 0, nullptr}, false, "convolution with option 0x4 is refused"},
+        {{2, 0, 0x800, 1, 0, nullptr}, true, "another kind, mono, 0x800 frames is valid"},
+        {{2, 0, 0x100, 1, 0, nullptr}, false, "another kind of 0x100 frames is refused"},
+        {{2, 0, 0x200, 2, 0, nullptr}, false, "another kind in stereo is refused"},
+        {{2, 4, 0x200, 1, 0, nullptr}, true, "another kind with option 0x4 is valid"},
+        {{1, 2, 0x200, 1, 0, nullptr}, false, "option 0x2 on a mono stream is refused"},
+        {{1, 8, 0x200, 1, 0, nullptr}, false, "option 0x8 on a mono stream is refused"},
+        {{1, 2 | 8, 0x400, 2, 0, nullptr}, true, "options 0x2 and 0x8 on a stereo convolution are valid"},
+    };
+    for (const Shape& shape : shapes) {
+        uint32_t* st = nullptr;
+        void* sp = nullptr;
+        const HRESULT hr = dsp_activate(dsp, &shape.desc, reinterpret_cast<void**>(&st), &sp);
+        bool ok = shape.valid ? hr == S_OK && st && sp : hr == E_INVALIDARG && !sp;
+        if (shape.valid && sp) ok = ok && dsp_deactivate(sp) == S_OK;
+        check(ok, shape.what);
+    }
+    const Desc reverb{1, 0, 0x200, 2, 0, nullptr};
     uint32_t* status = nullptr;
     void* stream = nullptr;
-    check(dsp_activate(dsp, description, reinterpret_cast<void**>(&status), &stream) == 0, "XDspActivate returns 0");
+    check(dsp_activate(dsp, &reverb, nullptr, &stream) == E_POINTER, "a null status out is E_POINTER");
+    check(dsp_activate(dsp, &reverb, reinterpret_cast<void**>(&status), nullptr) == E_POINTER,
+          "a null stream out is E_POINTER");
+    check(dsp_activate(nullptr, &reverb, reinterpret_cast<void**>(&status), &stream) == E_INVALIDARG,
+          "a null connection is E_INVALIDARG");
+    check(dsp_activate(dsp, nullptr, reinterpret_cast<void**>(&status), &stream) == E_INVALIDARG,
+          "a null description is E_INVALIDARG");
+    check(dsp_activate(dsp, &reverb, reinterpret_cast<void**>(&status), &stream) == 0, "XDspActivate returns 0");
     check(status && stream && static_cast<void*>(status) != stream, "XDspActivate writes both outputs");
-    uint32_t dsp_id = 0;
-    check(dsp_submit(stream, dsp_buffer, &dsp_id) == 0, "XDspSubmitCommand returns 0");
-    // What the title's wait reads: no error at +0xc and the submitted id at +4.
-    check(status && status[3] == 0 && status[1] == dsp_id, "the status block reports the submitted command as done");
-    check(dsp_deactivate(dsp, 0, 0, 0) == 0, "XDspDeactivate returns 0");
-    check(dsp_disconnect(dsp) == 0, "XDspDisconnect returns 0");
+    check(status && status[0] == 0 && status[1] == 0 && status[2] == 0 && status[3] == 0,
+          "the status block starts zeroed");
+    if (!status || !stream) return 1;
+    void* second = nullptr;
+    uint32_t* second_status = nullptr;
+    check(dsp_activate(dsp, &reverb, reinterpret_cast<void**>(&second_status), &second) == 0,
+          "a second stream fits a limit of 2");
+    void* third = nullptr;
+    uint32_t* third_status = nullptr;
+    check(dsp_activate(dsp, &reverb, reinterpret_cast<void**>(&third_status), &third) == E_OUTOFMEMORY && !third,
+          "a third is E_OUTOFMEMORY");
+
+    // XDspSubmitCommand(stream, cmd*, id*): gains, input, output, reserved (32 bytes). A stereo block of 0x200 frames
+    // is 0x400 floats.
+    struct Command {
+        float gains[2];
+        const float* input;
+        float* output;
+        uint64_t reserved;
+    };
+    static_assert(sizeof(Command) == 32, "the command");
+    static float input[0x400];
+    static float output[0x400 + 4];
+    for (float& f : input) f = 0.5f;
+    for (float& f : output) f = 1.0f;
+    Command command{{1.0f, 1.0f}, input, output, 0};
+    bool done = true;
+    for (uint32_t n = 1; n <= 3; ++n) {
+        uint32_t id = 0;  // as the title zeroes it
+        done = done && dsp_submit(stream, &command, &id) == 0 && id == n && status[0] == n && status[1] == id &&
+               status[3] == 0;
+    }
+    check(done, "each command completes at once: the ticket advances 1, 2, 3 and the status reports it with S_OK");
+    bool dsp_silent = true;
+    for (int i = 0; i < 0x400; ++i) dsp_silent = dsp_silent && output[i] == 0.0f;
+    check(dsp_silent && output[0x400] == 1.0f,
+          "the output block (frames * channels floats) is silence, nothing past it");
+    check(dsp_submit(stream, &command, nullptr) == 0 && status[1] == 4, "the ticket out pointer may be null");
+    command.output = nullptr;
+    check(dsp_submit(stream, &command, nullptr) == 0 && status[1] == 5, "so may the output");
+    check(dsp_submit(nullptr, &command, nullptr) == E_INVALIDARG, "a null stream is E_INVALIDARG");
+    check(dsp_submit(stream, nullptr, nullptr) == E_INVALIDARG, "a null command is E_INVALIDARG");
+
+    // Handles: released once, refused after.
+    check(dsp_deactivate(stream) == 0, "XDspDeactivate returns 0");
+    check(dsp_deactivate(stream) == E_INVALIDARG, "deactivating it again is E_INVALIDARG");
+    command.output = output;
+    check(dsp_submit(stream, &command, nullptr) == E_INVALIDARG, "a released stream takes no command");
+    check(dsp_deactivate(nullptr) == E_INVALIDARG, "a null stream is E_INVALIDARG");
+    check(dsp_disconnect(dsp) == 0, "XDspDisconnect with a stream still active returns 0");
+    check(dsp_deactivate(second) == E_INVALIDARG, "and that stream is released with it");
+    check(dsp_disconnect(dsp) == E_INVALIDARG, "disconnecting again is E_INVALIDARG");
+    check(dsp_disconnect(nullptr) == E_INVALIDARG, "a null connection is E_INVALIDARG");
+    check(dsp_activate(dsp, &reverb, reinterpret_cast<void**>(&status), &stream) == E_INVALIDARG,
+          "a released connection activates nothing");
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
