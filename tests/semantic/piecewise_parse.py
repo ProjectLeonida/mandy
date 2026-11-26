@@ -8,8 +8,8 @@ f-string: `update_fstring_expr` in Parser/tokenizer.c (in Parser/lexer/lexer.c f
 and `strncpy`. `import`, `compile` and `ast.parse` hand the module over as one string, so "the rest" is the rest of
 the file and the time grows with the square of its size: tools/rdna2spirv.py (1.2 MB, 4,759 f-strings with about
 12,700 fields) takes 7 s to parse and 0.1 s to turn into code. A file run as a script is read line by line and is
-not affected. CPython 3.14.8 and 3.15.0 fixed it (gh-155525); 3.12, which CI runs, only gets security fixes now and
-keeps it, and so does every 3.13 up to 3.13.15. `needed()` says whether the running interpreter is one of those.
+not affected. CPython 3.13.16, 3.14.8 and 3.15.0 fixed it (gh-155525); 3.12, which CI runs, only gets security fixes
+now and keeps it (3.12.16 has it). `needed()` says whether the running interpreter is one that still copies.
 
 What a field costs depends on how much source follows it, so the same statements are cheap in a short string:
 
@@ -62,10 +62,11 @@ _GIVE_UP = (_Whole, SyntaxError, ValueError, RecursionError, MemoryError, Overfl
 
 def needed(version=None, implementation=None):
     """True on the interpreters whose tokenizer copies the rest of the source at every f-string field: CPython
-    3.12.0 up to 3.14.7 (see the module docstring). Elsewhere a whole-file parse is as fast and simpler."""
+    3.12, 3.13.0 to 3.13.15 and 3.14.0 to 3.14.7 (see the module docstring). Elsewhere a whole-file parse is as
+    fast and simpler."""
     version = tuple((sys.version_info if version is None else version)[:3])
     implementation = sys.implementation.name if implementation is None else implementation
-    return implementation == "cpython" and (3, 12) <= version < (3, 14, 8)
+    return implementation == "cpython" and ((3, 12) <= version < (3, 13, 16) or (3, 14) <= version < (3, 14, 8))
 
 
 def parse(source, filename="<unknown>", piece_lines=PIECE_LINES):

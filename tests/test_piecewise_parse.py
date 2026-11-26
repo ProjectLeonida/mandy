@@ -748,9 +748,10 @@ class WarningsTest(unittest.TestCase):
 
 class NeededTest(unittest.TestCase):
     def test_the_interpreters_that_copy_the_source_at_every_field(self):
-        for version, expected in (((3, 10, 12), False), ((3, 11, 9), False), ((3, 12, 0), True), ((3, 12, 13), True),
-                                  ((3, 13, 0), True), ((3, 13, 15), True), ((3, 14, 0), True), ((3, 14, 7), True),
-                                  ((3, 14, 8), False), ((3, 14, 10), False), ((3, 15, 0), False), ((3, 16, 1), False)):
+        for version, expected in (((3, 10, 12), False), ((3, 11, 9), False), ((3, 12, 0), True), ((3, 12, 16), True),
+                                  ((3, 12, 99), True), ((3, 13, 0), True), ((3, 13, 15), True), ((3, 13, 16), False),
+                                  ((3, 13, 17), False), ((3, 14, 0), True), ((3, 14, 7), True), ((3, 14, 8), False),
+                                  ((3, 14, 10), False), ((3, 15, 0), False), ((3, 16, 1), False)):
             self.assertIs(pp.needed(version + ("final", 0), "cpython"), expected, version)
         self.assertIs(pp.needed((3, 12, 4, "final", 0), "pypy"), False)
         self.assertIs(pp.needed(), pp.needed(sys.version_info, sys.implementation.name))

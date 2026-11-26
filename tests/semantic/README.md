@@ -18,21 +18,21 @@ fail and one summary line; `-j N` sets how many run at once (`-j 1` is the disco
 every file's output. Files run side by side, so a test writes only into its own temporary folder (`tempfile`), never
 to a fixed path, and does not rely on another file having run first.
 
-A process that finds no valid `.pyc` of `tools/rdna2spirv.py` compiles it from source: after every edit of the
-translator (most files here set `sys.dont_write_bytecode`, so they do not leave a new one), for each mutant of
-`test_mutations.py`, and always where `PYTHONDONTWRITEBYTECODE` is set. On CPython 3.12 to 3.14.7 parsing that file
-as one string takes 7 s, because the tokenizer copies the rest of the source at every f-string field (fixed in
-3.14.8 and 3.15.0, gh-155525; CI runs 3.12, which keeps it). On those interpreters `support.py` loads the modules
-of `tools/` through `piecewise_parse.py`, which parses a source in pieces of 300 lines and joins them into the tree
-a whole-file parse gives: under 1 s for the translator, and the same code object. `tests/test_piecewise_parse.py`
-compares the trees for every Python file of the repository and the code objects for some. A file that imports
-`rdna2spirv` before `support`, or without it, still pays the 7 s.
-
 Every file here must call `tools/rdna2spirv.py` (directly, through `support.py`, or by running the tool) and assert
 on what it emitted. A test that reimplements the instruction in Python passes whatever the translator does, so it is
 not a regression test. `tests/test_semantic_translator_use.py` enforces this; the interpreter self-tests and the
 files whose subject is hand-written SPIR-V are listed there with a reason. The guard checks that a file reaches the
 translator, not that every assertion depends on it.
+
+On CPython 3.12, 3.13.0 to 3.13.15 and 3.14.0 to 3.14.7 `support.py` loads the modules of `tools/` through
+`piecewise_parse.py`. There the tokenizer copies the rest of a source string at every f-string field (fixed in
+3.13.16, 3.14.8 and 3.15.0, gh-155525; CI runs 3.12, which keeps it), so a process that finds no valid `.pyc` of
+`tools/rdna2spirv.py` spends 7 s parsing it: after every edit of the translator (most files here set
+`sys.dont_write_bytecode`, so they do not leave a new one), for each mutant of `test_mutations.py`, and always where
+`PYTHONDONTWRITEBYTECODE` is set. `piecewise_parse.py` parses a source in pieces of 300 lines and joins them into the
+tree a whole-file parse gives: under 1 s for the translator, and the same code object.
+`tests/test_piecewise_parse.py` compares the trees for every Python file of the repository and the code objects for
+some. A file that imports `rdna2spirv` before `support`, or without it, still pays the 7 s.
 
 What they check (`tools/rdna2spirv.py` on pixel, vertex, compute and other stages, wave32 and wave64, mostly one
 instruction family per file; the list below describes some of them, not every file):
