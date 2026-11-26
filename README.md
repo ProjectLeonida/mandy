@@ -52,7 +52,10 @@ Original author's Git Mirror: https://git.notrexed.dev/notrexed/Leonida
 **Early. Nothing is playable yet.** On `main`, the game boots from your own copy on native Windows and on Linux
 through Proton: it shows the launch movie, the first-run pages and the landing prompt, which respond to a pad or
 the keyboard pad, then runs the story load to its end and enters the world phase. A first world frame has not been
-verified yet on any test machine. [First-run UI on Windows](docs/first_run_ui.md) has the build and launch steps;
+verified yet on any test machine. On native Windows a scripted pad alone (`LEONIDA_INPUT_SCRIPT`, no keyboard or
+controller) gets through every first-run page, including the legal-terms page whose Confirm waits for both boxes, to
+the loading screen of the story load ([the route](docs/first_run_ui.md#through-the-first-run-pages-with-the-scripted-pad)).
+[First-run UI on Windows](docs/first_run_ui.md) has the build and launch steps;
 [the Linux/Proton report](docs/linux_proton.md) has the timings and where it stops.
 
 | What | Status |
@@ -269,6 +272,10 @@ python3 -I make_game.py --runtime-build ~/Downloads/runtime-windows
 Either way it copies `gta6rt.exe` and `gta6rt_tls_host.dll` into `--out` and writes `gta6rt.sh` next to them, which
 starts `gta6rt.exe` with `wine`, or with the Wine named by `WINE` (for Proton, its `files/bin/wine`). The same option
 skips the build on Windows.
+
+For `tools/pe_inspect.py`'s import classes on Linux, set `WINEPREFIX` to the prefix the loader runs in (or use
+`~/.wine`); without one, system DLLs are reported as `system (unverified)`
+([docs/design.md](docs/design.md#day-one-when-the-exe-is-here)).
 
 On Linux, run `<out>/gta6rt.sh --dry-run` to inspect the packaged title's imports, then
 `<out>/gta6rt.sh --init` to check TLS callbacks and DLL initialization. Use `<out>/gta6rt.sh --run` for startup.
