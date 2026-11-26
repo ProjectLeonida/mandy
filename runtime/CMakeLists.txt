@@ -201,6 +201,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/bcrypt_rng.cpp
     shims/xapu_chad.cpp
     shims/dstorage.cpp
+    shims/sysinfo.cpp
   )
   # These sources use __try to handle access violations. MSVC always catches them; clang-cl needs asynchronous
   # exceptions (as for tiny_dll below). A source file property also applies to dstorage_test.
@@ -563,6 +564,16 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(console_registry_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(console_registry_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(console_registry_test PRIVATE /OPT:NOREF)
+
+  add_executable(sysinfo_test
+    test/sysinfo_test.cpp
+    shims/sysinfo.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(sysinfo_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(sysinfo_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(sysinfo_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(sysinfo_test PRIVATE /OPT:NOREF)
 
   # Synthetic tests for the atomic API reference lifecycle.
   add_executable(api_ref_state_test test/api_ref_state_test.cpp)
@@ -1651,6 +1662,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET console_registry_test)
     add_test(NAME console_registry COMMAND console_registry_test)
+  endif()
+  if(WIN32 AND TARGET sysinfo_test)
+    add_test(NAME sysinfo COMMAND sysinfo_test)
   endif()
   if(WIN32 AND TARGET api_ref_state_test)
     add_test(NAME api_ref_state COMMAND api_ref_state_test)
