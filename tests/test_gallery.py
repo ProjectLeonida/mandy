@@ -1,4 +1,5 @@
 """Unit tests for tools/gallery.py standalone 3D Studio & Asset Gallery server."""
+import contextlib
 import functools
 import json
 import io
@@ -58,6 +59,37 @@ def _raw_get(port: int, target: str, host: str | None = "127.0.0.1", extra_heade
         while data := sock.recv(65536):
             chunks.append(data)
     return _split_response(b"".join(chunks))
+
+
+def _case_sensitive_names():
+    """Patch isfile and realpath to treat file names case-sensitively, as on Linux.
+
+    On Windows realpath returns a name's real case (upper.DDS for upper.dds) and follows a symlink whose name
+    matches in another case. Here a final name that is not in its folder in exactly that case is left as it is,
+    and a name that is there resolves as usual, symlinks included."""
+    real_isfile, real_realpath = os.path.isfile, os.path.realpath
+
+    def listed(path) -> bool:
+        folder, name = os.path.split(os.path.abspath(os.fspath(path)))
+        try:
+            return name in os.listdir(folder)
+        except OSError:
+            return False
+
+    def isfile(path) -> bool:
+        return listed(path) and real_isfile(path)
+
+    def realpath(path, *args, **kwargs) -> str:
+        if listed(path):
+            return real_realpath(path, *args, **kwargs)
+        folder, name = os.path.split(os.path.abspath(os.fspath(path)))
+        return os.path.join(real_realpath(folder, *args, **kwargs), name)
+
+    patches = (mock.patch("os.path.isfile", isfile), mock.patch("os.path.realpath", realpath))
+    stack = contextlib.ExitStack()
+    for p in patches:
+        stack.enter_context(p)
+    return stack
 
 
 class _MemoryConnection:
@@ -296,24 +328,10 @@ class TestGalleryServer(unittest.TestCase):
     def test_png_thumbnail_falls_back_to_uppercase_dds(self) -> None:
         # GALLERY-THUMB-UPPERCASE-DDS: the catalog lists upper.DDS and the gallery asks for upper.png as its
         # thumbnail. On a case-sensitive filesystem the fallback's upper.dds is not that file, so it was a 404.
-        # A case-sensitive isfile stands in for one here, on Windows and macOS too. realpath stands in as well:
-        # on Windows it returns the name's real case (upper.DDS for upper.dds), which would hide the bug.
+        # _case_sensitive_names() stands in for one, on Windows and macOS too.
         with open(os.path.join(self.textures_dir, "upper.DDS"), "wb") as f:
             f.write(_make_1x1_rgba_dds())
-        real_isfile = os.path.isfile
-
-        def case_sensitive_isfile(path) -> bool:
-            folder, name = os.path.split(os.fspath(path))
-            try:
-                return real_isfile(path) and name in os.listdir(folder or ".")
-            except OSError:
-                return False
-
-        def case_keeping_realpath(path, *args, **kwargs) -> str:
-            return os.path.normpath(os.path.abspath(path))
-
-        with mock.patch("os.path.isfile", case_sensitive_isfile), \
-                mock.patch("os.path.realpath", case_keeping_realpath):
+        with _case_sensitive_names():
             with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/textures/upper.png", timeout=3) as r:
                 self.assertEqual(r.status, 200)
                 self.assertEqual(r.headers["Content-Type"], "image/png")
@@ -549,14 +567,25 @@ class TestGalleryServer(unittest.TestCase):
                 self.assertNotIn(secret, body)
 
     def test_dds_symlink_escape_is_forbidden(self) -> None:
-        link = os.path.join(self.textures_dir, "escaped.dds")
+        outside = os.path.join(self.tmp.name, "outside.dds")
+        with open(outside, "wb") as f:
+            f.write(_make_1x1_rgba_dds())
+        # escaped.dds is the PNG fallback's own name and safe_subpath refuses it (403). escaped_upper.DDS is only
+        # found by the case-insensitive sibling search (GALLERY-DDS-SYMLINK-CONTAINMENT), which must refuse it too:
+        # nothing inside the folder is left to serve, so 404.
+        links = {"escaped.dds": 403, "escaped_upper.DDS": 404}
         try:
-            os.symlink(os.path.join(self.tmp.name, "outside.dds"), link)
+            for name in links:
+                os.symlink(outside, os.path.join(self.textures_dir, name))
         except (OSError, NotImplementedError) as exc:
             self.skipTest(f"cannot create symlink here: {exc}")
-        status, _, body = _raw_get(self.port, "/textures/escaped.png", host=f"127.0.0.1:{self.port}")
-        self.assertEqual(status, 403)
-        self.assertNotIn(b"\x89PNG", body)
+        with _case_sensitive_names():
+            for name, expected in links.items():
+                with self.subTest(name=name):
+                    target = f"/textures/{os.path.splitext(name)[0]}.png"
+                    status, _, body = _raw_get(self.port, target, host=f"127.0.0.1:{self.port}")
+                    self.assertEqual(status, expected)
+                    self.assertNotIn(b"\x89PNG", body)
 
     _GUARDED_TARGETS = ("/", "/api/models", "/api/textures", "/models/test_car.glb", "/textures/test_tex.png")
 

@@ -103,10 +103,11 @@ def host_allowed(host: str | None) -> bool:
     return name in _LOOPBACK_HOSTS
 
 
-def dds_sibling(path: str) -> str | None:
+def dds_sibling(path: str, base_dir: str) -> str | None:
     """The file in path's folder whose name matches path's name in any case (upper.DDS for upper.dds), or None.
 
-    path is already inside the textures folder (safe_subpath), and a sibling in the same folder stays inside it."""
+    The sibling goes through safe_subpath like any requested path, so a symlink named upper.DDS that points
+    outside base_dir is refused."""
     folder, name = os.path.split(path)
     try:
         entries = sorted(os.listdir(folder))
@@ -114,8 +115,12 @@ def dds_sibling(path: str) -> str | None:
         return None
     for entry in entries:
         if entry.lower() == name.lower():
-            candidate = os.path.join(folder, entry)
-            if os.path.isfile(candidate):
+            try:
+                rel = os.path.relpath(os.path.join(folder, entry), os.path.realpath(base_dir))
+            except ValueError:
+                continue
+            candidate = safe_subpath(base_dir, rel)
+            if candidate is not None and os.path.isfile(candidate):
                 return candidate
     return None
 
@@ -236,7 +241,7 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
                     return
                 if not os.path.isfile(dds_cand):
                     # A texture named upper.DDS: on a case-sensitive filesystem stem + ".dds" misses it.
-                    dds_cand = dds_sibling(dds_cand) or dds_cand
+                    dds_cand = dds_sibling(dds_cand, self.textures_dir) or dds_cand
                 if os.path.isfile(dds_cand) and dds_png:
                     try:
                         png_bytes = dds_png.dds_file_to_png_bytes(dds_cand, max_size=1024)
