@@ -1537,9 +1537,8 @@ int check_mapped_plane(ID3D12Device* device) {
     return 0;
 }
 
-// LEONIDA_TEXTURE_REFRESH_ASYNC=1 (the d3d12_mapped_plane_async test): a texture the title maps and writes, and then
-// reads on the GPU in its very first submission, has its bytes there, though the refresh pass runs on a worker: the
-// submission fills a mapped texture that was never filled before it records anything (fill_first_mapped_textures).
+// The d3d12_mapped_plane_async test (named for the refresh mode it was written for, removed since): a texture the title
+// maps and writes, and then reads on the GPU in its very first submission, has its bytes there.
 int check_mapped_plane_first_use(ID3D12Device* device) {
     const char* who = "persistent slot-133 plane, first use";
     constexpr UINT width = 256, height = 8, size = width * height;
@@ -2179,9 +2178,6 @@ int main(int argc, char** argv) {
     const bool prefix_only = argc == 2 && std::strcmp(argv[1], "--host-prefix-only") == 0;
     const bool async_plane = argc == 2 && std::strcmp(argv[1], "--mapped-plane-async") == 0;
     if (argc != 1 && !prefix_only && !async_plane) return 2;
-    if (async_plane) _putenv_s("LEONIDA_TEXTURE_REFRESH_ASYNC", "1");  // read once, at the device's first refresh
-    _putenv_s("LEONIDA_TITLE_TEXTURE_PERIOD_MS", "0");
-    _putenv_s("LEONIDA_TITLE_TEXTURE_CHECK_KB", "0");
     vktest::Device vk;
     const auto status = vk.initialize();
     if (status == vktest::DeviceStatus::unavailable) return 77;
