@@ -426,8 +426,14 @@ function stream(now = performance.now()) {
 
 // ---------- main loop ----------
 camera.position.fromArray(world.spawn);
-const startCam = parseCamHash(location.hash);
-if (startCam) { camera.position.fromArray(startCam.pos); yaw = startCam.yaw; pitch = THREE.MathUtils.clamp(startCam.pitch, -1.55, 1.55); }
+function applyCamHash(hash) {
+  const cam = parseCamHash(hash);
+  if (cam) { camera.position.fromArray(cam.pos); yaw = cam.yaw; pitch = THREE.MathUtils.clamp(cam.pitch, -1.55, 1.55); }
+}
+applyCamHash(location.hash);
+// A camera link opened in a tab that already shows the viewer changes only the hash, and the page does not reload:
+// follow it, so a pasted link, or Back and Forward between two of them, moves the camera there.
+addEventListener("hashchange", () => applyCamHash(location.hash));
 if (world.test) {
   document.getElementById("world-status").textContent = world.reason;
   document.getElementById("banner").classList.remove("hidden");
