@@ -10265,6 +10265,7 @@ struct ComputeBuildOptions {
     std::uint64_t helper_priority = 0;       // the request's urgency: 0 a dispatch, else the warm-up's module size
     bool mark_building = false;              // precompile, helper: claim the entry, skip it when another process has it
     bool key_only = false;                   // only name the journal file (journal_path), build nothing
+    bool probe_journal = true;               // a helper-sized module's file is asked without a compile (see below)
 };
 
 // A compute pipeline from a library entry: what a PSO's first dispatch, the warm-up worker and gta6rt
@@ -10386,6 +10387,13 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
         big_lock.lock();
     const bool ask_shared = journal.enabled() && !journal.has_file_data() && shared && device.pipeline_cache_seeded &&
                             device.info.pipeline_cache_control && device.journal_ask_shared.load();
+    // A module the helper would build, with a journal file: the create from the file is asked not to compile. A file
+    // the driver does not take (written by another driver build, or before a rewrite fix) would otherwise be a compile
+    // here, minutes for the largest modules with every submission of the title waiting at the compile gate. On
+    // VK_PIPELINE_COMPILE_REQUIRED the file is removed and the build goes the no-file way: to the helper.
+    const bool probe_file = options.probe_journal && journal.has_file_data() && options.use_helper &&
+                            compile_helper::wanted(bytes) && device.info.pipeline_cache_control;
+    bool stale_file = false;
 
     VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     module_info.codeSize = bytes;
@@ -10445,9 +10453,16 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
             if (!from_shared) built = VK_NULL_HANDLE;
         }
         if (!from_shared) {
+            const bool probing = probe_file && journal.seeded;
+            if (probing) pipeline_info.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
             const ULONGLONG at = GetTickCount64();
             created = vk.vkCreateComputePipelines(dev, cache, 1, &pipeline_info, nullptr, &built);
             driver_ms = GetTickCount64() - at;
+            if (probing) {
+                pipeline_info.flags &= ~VkPipelineCreateFlags(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT);
+                stale_file = created == VK_PIPELINE_COMPILE_REQUIRED;
+                if (stale_file) built = VK_NULL_HANDLE;
+            }
             // A seeded miss the cache did not take: built once more against an empty cache, so the file is rewritten
             // with this pipeline instead of as it was read.
             if (created == VK_SUCCESS && built && journal.seeded &&
@@ -10475,6 +10490,17 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
     profile.finish(int(created));
     trace.end(trigger, entry->name.c_str(), 0, bytes, created);
     if (big_lock.owns_lock()) big_lock.unlock();
+    if (stale_file) {
+        std::error_code removed;
+        std::filesystem::remove(out.journal_path, removed);
+        std::fprintf(stderr, "[rt] d3d12: pipeline journal: %s: its journal file would have been a compile here "
+                             "(%llu ms to say so); %s, and the build goes to the compile helper\n",
+                     entry->name.c_str(), static_cast<unsigned long long>(driver_ms),
+                     removed ? "the file could not be removed (built here as before)" : "the file is removed");
+        ComputeBuildOptions again = options;  // once: a file left in place is then seeded and compiled as before
+        again.probe_journal = false;
+        return build_compute_pipeline(device, compute_entry, layout, subgroup, again);
+    }
     if (probe_compiled && device.journal_ask_shared.exchange(false))
         std::fprintf(stderr, "[rt] d3d12: pipeline journal: the driver compiled %s for "
                              "FAIL_ON_PIPELINE_COMPILE_REQUIRED (%llu ms, no cache hit); built again for its journal "
