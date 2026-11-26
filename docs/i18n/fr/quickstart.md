@@ -3,7 +3,7 @@
 > [!NOTE]
 > La documentation en anglais ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) et
 > [`docs/README.md`](../../README.md)) **fait foi**. Ce guide ne reprend que les instructions stables d'installation
-> et de compilation (synchronisé avec le commit `604ddff0`). Pour l'état d'avancement du projet, qui change tous les
+> et de compilation (synchronisé avec le commit `a73a57e1`). Pour l'état d'avancement du projet, qui change tous les
 > jours, consultez le [`README.md`](../../../README.md).
 
 ## Ce qu'est Leonida
@@ -27,7 +27,10 @@ système de la console est réimplémenté sous forme de shims.
 Le projet en est à ses débuts : **rien n'est encore jouable**. Sur `main`, le jeu démarre à partir de votre copie,
 sous Windows et sous Linux avec Proton : il affiche la vidéo de lancement, les pages du premier lancement et l'écran
 d'accueil (qui répondent à la manette ou au clavier), puis va au bout du chargement du mode histoire et entre dans la
-phase du monde. Aucune première image du monde n'a encore été vérifiée. Voir
+phase du monde. Aucune première image du monde n'a encore été vérifiée. Sous Windows natif, une manette scriptée
+seule (`LEONIDA_INPUT_SCRIPT`, sans clavier ni manette) passe toutes les pages du premier lancement, y compris celle
+des conditions d'utilisation dont le bouton Confirmer attend les deux cases, jusqu'à l'écran de chargement du mode
+histoire ([le parcours](../../first_run_ui.md#through-the-first-run-pages-with-the-scripted-pad)). Voir
 [le premier lancement sous Windows](../../first_run_ui.md) et [le rapport Linux/Proton](../../linux_proton.md).
 
 ## Plateformes
@@ -159,8 +162,10 @@ demandés (ils ne dépendent pas les uns des autres). `pipelines` démarre dès 
 si l'exécution comprend `runtime`, une fois que cette étape a recompilé `vk_pipeline_check` : elle peut donc tourner
 pendant la fin d'`assets`. L'étape
 `pipelines` crée chaque shader traduit avec le pilote de votre GPU, vérifie qu'il compile, signale ceux qu'elle doit
-ignorer et enregistre un cache de pipelines dans `pipeline_cache.bin` (dans `--out`) ; le runtime ne charge pas
-encore ce cache.
+ignorer et enregistre un cache de pipelines dans `pipeline_cache.bin` (dans `--out`, qui contient aussi `gta6rt.exe`
+après l'étape `runtime`). Le runtime initialise son cache de pipelines Vulkan à partir de ce fichier quand son en-tête
+correspond au périphérique et à l'UUID du cache de pipelines ; si le fichier manque, est incompatible ou refusé par le
+pilote, il part d'un cache vide.
 
 - **`--wave64-emulate`** : traduit les shaders compute et mesh wave64 de façon exacte quelle que soit la taille des
   sous-groupes du GPU. Les GPU NVIDIA et Intel ont des sous-groupes de 32 et en ont besoin. La valeur par défaut,
