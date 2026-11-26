@@ -1644,99 +1644,32 @@ public:
         occlusion_resolve_memory_ = memory;
     }
 
-    struct HostTextureStats { std::uint64_t copies = 0, waits = 0; };
-    HostTextureStats host_texture_stats() {
-        std::lock_guard lock(submit_mutex_);
-        return host_texture_stats_;
-    }
-
-    // LOCAL FIX (deadlock on the first-run pages): the texture writes below used vkDeviceWaitIdle with the submit
-    // lock held. The device is idle only once every queue has run all it was given, and a queue whose submitted
-    // work waits on a value a later submission signals never gets there while this thread keeps the lock: a native
-    // boot sat 270 s in vkDeviceWaitIdle (title staging), then lost the device. Instead: wait for the queue
-    // timelines to pass what was submitted so far, at most `timeout`; on VK_TIMEOUT the caller skips this write (the
-    // title-texture pass tries it again) rather than freeze the title. Not covered, unlike the device wait: present
-    // and probe submissions, which have their own fences outside the retirement timelines (a present reading the
-    // image). The staged write is ordered behind them anyway (same queue, an ALL_COMMANDS barrier); the host copy
-    // is not, so a presented title texture can be written while a present still reads it (a torn frame, no fault).
-    // With submit_mutex_ held.
-    VkResult wait_submitted_locked(std::uint64_t timeout_ns, const char* what) {
-        if (is_device_lost()) return VK_ERROR_DEVICE_LOST;  // a queue's timeline may be gone already
-        const auto pending = retire_tickets_.pending_through(submitted_ticket_.load(std::memory_order_acquire));
-        if (pending.empty()) return VK_SUCCESS;
-        std::vector<VkSemaphore> semaphores;
-        std::vector<std::uint64_t> values;
-        for (const auto& [semaphore, value] : pending) {
-            semaphores.push_back(semaphore);
-            values.push_back(value);
-        }
-        VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-        wait.semaphoreCount = std::uint32_t(semaphores.size());
-        wait.pSemaphores = semaphores.data();
-        wait.pValues = values.data();
-        const VkResult r = observe_result(vk.vkWaitSemaphores(device_, &wait, timeout_ns), what);
-        if (r == VK_TIMEOUT) {
-            static std::atomic<std::uint64_t> timeouts{0};
-            const std::uint64_t n = timeouts.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (!(n & (n - 1)))
-                std::fprintf(stderr, "[rt] vulkan: %s: submitted work not done within %llu ms (%llu time(s)); the "
-                                     "write is skipped this time\n", what,
-                             static_cast<unsigned long long>(timeout_ns / 1000000), static_cast<unsigned long long>(n));
-        }
-        return r;
-    }
-    // Short: a timeout is certain when the awaited work needs this thread's lock, and the write is only skipped.
-    static constexpr std::uint64_t kTitleWriteWaitNs = 250'000'000;  // 250 ms
-
-    // CPU writes to a title texture have no application fence. Prevent another queue from
-    // claiming a new layout or submitting work between the completion check and the host copy.
-    // An unsatisfied console Wait lives in QueueHolds, outside the Vulkan queues.
-    template<class Copy>
-    VkResult write_host_texture(ResourceId id, std::uint32_t subresource, Copy&& copy) {
-        std::lock_guard layout_lock(tracker_mutex_);
-        std::lock_guard queue_lock(submit_mutex_);
-        if (tracker_.layout(id, subresource) != VK_IMAGE_LAYOUT_GENERAL) return VK_NOT_READY;
-        if (image_work_pending_) {
-            ++host_texture_stats_.waits;
-            // A device wait is a queue operation: it passes the compile gate, so it never waits in the driver behind a
-            // long pipeline create (the starved wait that loses the device after 10 s).
-            const SubmitMutex::SubmitTurn turn(submit_mutex_);
-            const auto result = wait_submitted_locked(kTitleWriteWaitNs, "vkWaitSemaphores (title texture upload)");
-            // Not done in time: VK_NOT_READY, so the caller takes its staged path (ordered on the queue) or tries
-            // again later, and the skip is not counted as a failed fill.
-            if (result == VK_TIMEOUT) return VK_NOT_READY;
-            if (result != VK_SUCCESS) return result;
-            image_work_pending_ = false;
-        }
-        if (!copy()) return VK_ERROR_UNKNOWN;
-        ++host_texture_stats_.copies;
-        return VK_SUCCESS;
-    }
-
-    // A complete CPU-side replacement of these color subresources. Serialize with replay and
-    // present while recording the old layouts, finishing prior reads and publishing the copy.
+    // A complete replacement of these color subresources from a staging buffer (TitleImageUpload): the title's CPU
+    // writes into its own texture memory, brought to the image. Serialized with replay and present while the old
+    // layouts are read and the transfer is submitted. It never waits for the GPU on the CPU: `copy(replay, pieces,
+    // waits)` records the transfer and submits it with a GPU wait on `waits`, every queue timeline value submitted so
+    // far, so it runs after all earlier work that may still read the image, on any queue, and before every submission
+    // made after it (the ones that sample the new texels). Until 2026-11 this waited on the CPU for that work for at
+    // most 250 ms and skipped the write when it was not done: a world frame takes longer, so changed textures (the
+    // planes of a video frame among them) arrived late or out of step, and the submitting thread stalled. A GPU wait
+    // cannot deadlock: every value in `waits` was submitted already, and a console Wait whose signal is not submitted
+    // yet is held in QueueHolds, outside the Vulkan queues, so the work behind these values completes without
+    // anything submitted later.
     template<class Copy>
     VkResult write_staged_title_image(ResourceId id, const VkImageSubresourceRange& range, Copy&& copy) {
         std::lock_guard layout_lock(tracker_mutex_);
         std::lock_guard queue_lock(submit_mutex_);
+        if (is_device_lost()) return VK_ERROR_DEVICE_LOST;
         LayoutPieces pieces;
         if (!tracker_.pieces(id, range, pieces) || pieces.empty()) return VK_ERROR_UNKNOWN;
-        if (image_work_pending_) {
-            const SubmitMutex::SubmitTurn turn(submit_mutex_);  // a queue operation: the compile gate (as above)
-            const auto r = wait_submitted_locked(kTitleWriteWaitNs, "vkWaitSemaphores (title staging)");
-            if (r != VK_SUCCESS) return r;
-            image_work_pending_ = false;
-        }
-        const auto r = observe_result(copy(replay_, pieces), "title staging upload");
+        const auto waits = retire_tickets_.pending_through(submitted_ticket_.load(std::memory_order_acquire));
+        const auto r = observe_result(copy(replay_, pieces, waits), "title staging upload");
         if (r == VK_SUCCESS) {
             for (const auto& p : pieces)
                 if (p.layout == VK_IMAGE_LAYOUT_UNDEFINED) tracker_.set(id, p.range, VK_IMAGE_LAYOUT_GENERAL);
         }
         return r;
     }
-
-    // Present and probe submissions have their own fences, outside the queue retirement timelines.
-    void note_image_work_locked() { image_work_pending_ = true; }
 
     // For tests and traces.
     VkImageLayout layout(ResourceId id, std::uint32_t subresource) {
@@ -2054,7 +1987,6 @@ public:
     void record_submit_locked(VkSemaphore progress, std::uint64_t value) {
         const auto ticket = submitted_ticket_.fetch_add(1, std::memory_order_acq_rel) + 1;
         retire_tickets_.record(ticket, progress, value);
-        note_image_work_locked();
     }
     void retire_queue_idle_locked(VkSemaphore progress) {
         retire_tickets_.queue_idle(progress);
@@ -2366,8 +2298,6 @@ private:
     // gate's own mutex is a leaf; a submission waits at the gate with submit_mutex_ held, for creates already in the
     // driver only (SubmitMutex::CompileTurn).
     alignas(64) SubmitMutex submit_mutex_;
-    bool image_work_pending_ = false;  // under submit_mutex_
-    HostTextureStats host_texture_stats_;  // under submit_mutex_
     RetireTickets<VkSemaphore> retire_tickets_;
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;

@@ -2913,7 +2913,7 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_host_prefix COMMAND d3d12_existing_heap_test --host-prefix-only)
     set_tests_properties(d3d12_host_prefix PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(d3d12_existing_heap PROPERTIES SKIP_RETURN_CODE 77)
-    # LEONIDA_TEXTURE_REFRESH_ASYNC=1 (set by the test itself): a mapped plane's first submission reads its bytes.
+    # A mapped plane's first submission reads its bytes.
     add_test(NAME d3d12_mapped_plane_async COMMAND d3d12_existing_heap_test --mapped-plane-async)
     set_tests_properties(d3d12_mapped_plane_async PROPERTIES SKIP_RETURN_CODE 77)
     # The same with write watching off: the guarded cases only, the concurrent writers among them.
@@ -4778,6 +4778,9 @@ if(TARGET Vulkan::Headers)
     endif()
     add_test(NAME shadow_keep COMMAND shadow_keep_test)
     # Queue construction cleans its Vulkan handles if holder registration runs out of host memory.
+    # Which title textures the refresh looks at: only those something says changed (src/title_texture_watch.h).
+    add_executable(title_texture_watch_test test/title_texture_watch_test.cpp)
+    add_test(NAME title_texture_watch COMMAND title_texture_watch_test)
     add_executable(vk_host_texture_order_test test/vk_host_texture_order_test.cpp)
     target_link_libraries(vk_host_texture_order_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     if(WIN32)

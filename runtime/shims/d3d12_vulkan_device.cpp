@@ -65,6 +65,7 @@
 #include "../src/title_geometry_watch.h"
 #include "../src/title_texture_memory.h"
 #include "../src/title_texture_refresh.h"
+#include "../src/title_texture_watch.h"
 #include "title_gpu_placements.h"
 #include "../src/spirv_f16_halves.h"
 #include "../src/spirv_stores.h"
@@ -295,14 +296,6 @@ bool hash_guarded(const std::uint8_t* p, std::size_t bytes, std::uint64_t& out, 
 }
 inline std::uint64_t hashed_bytes(std::uint64_t bytes, bool every_byte = false) {
     return bytes <= (256u << 10) || every_byte ? bytes : bytes / 32 + 64;
-}
-
-bool async_texture_refresh() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("LEONIDA_TEXTURE_REFRESH_ASYNC");
-        return v && std::strcmp(v, "1") == 0;
-    }();
-    return enabled;
 }
 // Set while this thread is inside the title-texture registry (it holds title_texture_mutex): a staged copy it makes
 // submits through a queue, whose before-submission refresh must then not take the registry again.
@@ -1566,6 +1559,7 @@ const char* fsdraw_backing(std::uint64_t title_va) {
 }
 
 // Installs the handler once. false: it couldn't be, and shadows copy every page at every submission.
+bool watch_shadow_writes();
 bool watch_shadow_writes() {
     static const bool installed = [] {
         if (!AddVectoredExceptionHandler(1, &shadow_write_fault)) return false;
@@ -1577,6 +1571,35 @@ bool watch_shadow_writes() {
 
 // A ShadowPages the fault handler knows of for its whole life: registered before it protects anything, removed once
 // its destructor has made every page writable again.
+// The geometry watch's cells as TitleTextureWatch uses them: the title texture refresh's own queue of written tiles,
+// and arming only while the write-fault handler is installed. A tile with a page not committed is not armed (a commit
+// that does not come through xmem would not be seen): its textures are looked at each refresh until it is.
+struct TitleTextureCells {
+    using Cell = leonida::geometry_writes::Cell;
+    leonida::geometry_writes::WriteQueue queue;
+    TitleTextureCells() { leonida::geometry_writes::subscribe_writes(queue); }
+    ~TitleTextureCells() { leonida::geometry_writes::unsubscribe_writes(queue); }
+    TitleTextureCells(const TitleTextureCells&) = delete;
+    TitleTextureCells& operator=(const TitleTextureCells&) = delete;
+    Cell* acquire(std::uintptr_t tile) { return leonida::geometry_writes::acquire(tile); }
+    void release(std::uintptr_t tile) { leonida::geometry_writes::release(tile); }
+    bool arm(std::uintptr_t tile, Cell& cell) {
+        for (std::uintptr_t at = tile; at < tile + leonida::geometry_writes::tile_size;) {
+            MEMORY_BASIC_INFORMATION m{};
+            if (!VirtualQuery(reinterpret_cast<const void*>(at), &m, sizeof m) || m.State != MEM_COMMIT) return false;
+            at = reinterpret_cast<std::uintptr_t>(m.BaseAddress) + m.RegionSize;
+        }
+        return leonida::geometry_writes::arm(tile, cell);
+    }
+    void aliases(std::uintptr_t tile, std::vector<std::uintptr_t>& out) {
+        if (const auto f = leonida::geometry_writes::aliases.load(std::memory_order_acquire)) f(tile, out);
+    }
+    void take_written(std::vector<std::uintptr_t>& out, bool& overflow) {
+        leonida::geometry_writes::take_written(queue, out, overflow);
+    }
+    bool enabled() const { return watch_shadow_writes(); }
+};
+
 struct ShadowPagesDeleter {
     void operator()(ShadowPages* pages) const {
         pages->reopen_all();
@@ -3018,8 +3041,10 @@ struct DeviceState {
     // defined after TitleTexture.
     std::mutex title_texture_mutex;
     std::map<std::uint64_t, std::shared_ptr<TitleTexture>> title_textures;
-    leonida::TitleTextureRangeIndex texture_ranges;
-    std::map<std::uint64_t, std::shared_ptr<TitleTexture>> mapped_title_textures;
+    // Which registered textures may have changed since their last fill (title_texture_watch.h), under
+    // title_texture_mutex: their tiles are geometry-watch cells, armed read-only.
+    TitleTextureCells texture_cells;
+    leonida::TitleTextureWatch<TitleTextureCells> texture_watch{texture_cells};
     void index_texture(const TitleTexture& t);
     void title_texture_mapped(const void* resource, std::uint64_t address);
     void title_texture_unmapped(const void* resource, std::uint64_t address);  // the title wrote texels
@@ -8524,24 +8549,6 @@ public:
     bool is_shadow() const { return shadow_ != nullptr; }  // create_shadow_buffer: a copy of title pages
     const DeviceState& device_state() const { return device_; }
     void* title_address() const { return title_address_; }  // place_at_title_address, or null
-    HRESULT upload_title_subresource(UINT subresource, void* data, UINT row, UINT slice, bool allow_staging) {
-        static const bool ordered = [] {
-            const char* value = std::getenv("LEONIDA_ORDER_TEXTURE_UPLOADS");
-            return !value || std::strcmp(value, "0");
-        }();
-        if (ordered && host_transfer_) {
-            Region r{};
-            if (!region(subresource, nullptr, r) || row != r.row_bytes || slice != row * r.rows) return E_INVALIDARG;
-            const auto result = device_.context->write_host_texture(id(), subresource, [&] { return host_copy(true, r, data); });
-            if (result == VK_SUCCESS) return S_OK;
-            if (result != VK_NOT_READY) return E_FAIL;
-            // Layout changed after the pass checked the subresources. Never submit recursively.
-            if (!allow_staging) return DXGI_ERROR_WAS_STILL_DRAWING;
-            return cpu_copy(true, subresource, nullptr, data, row, slice, false);
-        }
-        return WriteToSubresource(subresource, nullptr, data, row, slice);
-    }
-
     bool replay_seen() const { return replay_seen_.load(std::memory_order_relaxed); }
     bool staged_title() const { return staged_title_; }
     bool upload_staged_title(const rt::xg_xs::Texture& layout, const std::uint8_t* tiled,
@@ -8555,11 +8562,6 @@ public:
     std::uint32_t shader_views() const { return shader_views_.load(std::memory_order_relaxed); }
     // The element a CPU copy moves (a 4x4 block for block-compressed formats), as WriteToSubresource takes it.
     leonida::BlockFormat copy_element() const { return leonida::copy_block_format(binding_, VK_IMAGE_ASPECT_COLOR_BIT); }
-    // WriteToSubresource of this subresource is a host copy now (VK_EXT_host_image_copy, image in GENERAL), not a
-    // staged copy through a queue: the only kind a refresh before a submission may do.
-    bool host_copy_now(UINT subresource) const {
-        return host_transfer_ && device_.context->layout(id(), subresource) == VK_IMAGE_LAYOUT_GENERAL;
-    }
 
     // Default-heap buffers are ranges of the GPU address arena: console VA = offset, zeroed through the arena's host
     // mapping. Upload and readback buffers keep their own host memory; with buffer device addresses their console
@@ -9229,8 +9231,8 @@ public:
                 shared_zero_ = device_.zero_sampled_image(desc_, format, footprint.size);
         }
         std::uint32_t plain_bits = 0;
-        // A device without host copies has no other way to fill a title image: a refresh before a submission may not
-        // use a staged copy through the queue (host_copy_now). Its linear movie planes are staged too.
+        // A device without host copies stages every title image (its linear movie planes too); title fills go through
+        // the title upload whatever the image (fill_title_texture).
         const bool no_host_copy = !device_.copy_memory_to_image && cpu_visible() && samples == 1 &&
                                   !format.d24_as_float && !format.rgb96;
         if (stage_title && !shared_zero_ && allow_staged_title && origin != TitleImageOrigin::ordinary &&
@@ -13700,14 +13702,8 @@ struct TitleTexture {
     bool stale = false;                     // changed bytes not uploaded yet (budget, or no host copy then)
     leonida::TextureReadability memory;     // protected by title_texture_mutex
     std::vector<DXGI_FORMAT> formats;       // owned: the image's format and castable view formats
-    std::uint64_t hash = 0;                 // hash_guarded (sampled) of the bytes the image was last filled from
+    std::uint64_t hash = 0;                 // hash_guarded (every byte) of the bytes the image was last filled from
     bool hashed = false;
-    // A mapped texture up to 4 MiB is also hashed in full, every few passes: the title writes into it in small
-    // pieces (a glyph in a font cache, measured: Map once, many writes, no Unmap between them) that the sampling hash
-    // misses. Video planes, rewritten whole every frame, are caught by the sampled one first.
-    std::uint64_t full_hash = 0;
-    bool full_hashed = false;
-    bool every_byte() const { return mapped && (async_texture_refresh() || layout.layout.size <= (4u << 20)); }
     std::uint64_t fills = 0;
 };
 
@@ -13738,9 +13734,15 @@ bool title_xg_layout(const Resource& r, rt::xg_xs::Texture& out, std::array<std:
     return true;
 }
 
+// Whether the refresh fills the texture from memory, and so watches its pages: not a texture the GPU writes, not one
+// without a layout, and not a slot-133 texture whose layout is only guessed until the title maps it.
 void DeviceState::index_texture(const TitleTexture& t) {
-    if (async_texture_refresh())
-        texture_ranges.set(t.address, t.cpu, t.layout_known && !t.gpu_written ? t.layout.layout.size : 0);
+    const bool filled = !t.gpu_written && t.layout_known && t.resource &&
+                        !((t.layout_guessed || t.layout_from_xg) && !t.mapped && !t.stale);
+    if (filled)
+        texture_watch.track(t.address, t.cpu, t.layout.layout.size);
+    else
+        texture_watch.untrack(t.address);
 }
 
 void DeviceState::title_texture_mapped(const void* resource, std::uint64_t address) {
@@ -13749,8 +13751,8 @@ void DeviceState::title_texture_mapped(const void* resource, std::uint64_t addre
     if (it == title_textures.end() || it->second->resource != resource) return;
     TitleTexture& t = *it->second;
     t.mapped = true;
-    if (async_texture_refresh() && !t.gpu_written) mapped_title_textures[address] = it->second;
     t.memory.retry();
+    index_texture(t);  // watched from now on, and looked at by the next refresh
     // The title computes the layout of what it writes right before it maps: take it when no view gave one.
     if (!t.gpu_written && (t.layout_guessed || !t.layout_known) &&
         title_xg_layout(*static_cast<const Resource*>(resource), t.layout, t.desc)) {
@@ -13786,6 +13788,8 @@ void DeviceState::title_texture_unmapped(const void* resource, std::uint64_t add
     if (it != title_textures.end() && it->second->resource == resource) {
         it->second->stale = true;
         it->second->memory.retry();
+        index_texture(*it->second);
+        texture_watch.touch(address);
     }
 }
 
@@ -13798,7 +13802,10 @@ void DeviceState::title_texture_gone(const void* resource, std::uint64_t address
             gpu_placements.remove(address, resource);
         }
         const auto it = title_textures.find(address);
-        if (it != title_textures.end() && it->second->resource == resource) it->second->resource = nullptr;
+        if (it != title_textures.end() && it->second->resource == resource) {
+            it->second->resource = nullptr;
+            texture_watch.untrack(address);
+        }
         titles_gone.push_back({resource, address});
         titles_gone_pending.store(true, std::memory_order_release);
         return;
@@ -13810,8 +13817,7 @@ void DeviceState::title_texture_gone(const void* resource, std::uint64_t address
     }
     const auto it = title_textures.find(address);
     if (it != title_textures.end() && it->second->resource == resource) {
-        texture_ranges.erase(address);
-        mapped_title_textures.erase(address);
+        texture_watch.untrack(address);
         it->second->resource = nullptr;
         title_textures.erase(it);
     }
@@ -14564,7 +14570,6 @@ public:
             if (auto* fault = state_.context->device_fault())
                 fault->set_lost_hook([this] { rt::compute_probe::recheck(state_); });
         }
-        if (async_texture_refresh()) start_title_filler();
         state_.setup_console_heap_gpu(get_device);  // LEONIDA_CONSOLE_HEAP_GPU: the context's prelude
         state_.context->set_after_execute([this] { state_.geometry_execute_end(); });
         state_.context->set_before_execute([this] {
@@ -14605,14 +14610,7 @@ public:
             // Last, once the heap refresh, the windows and the geometry copies have made what this submission reads.
             state_.update_address_guard();
             const phases::Scope timed(phases::textures);
-            if (async_texture_refresh()) {
-                if (!t_in_title_textures) {
-                    fill_first_mapped_textures();
-                    request_title_refresh();
-                }
-            } else {
-                refresh_title_textures();
-            }
+            refresh_title_textures();
         });
         {
             char text[16] = {};
@@ -15846,257 +15844,88 @@ public:
             }
             auto& slot = state_.title_textures[address];
             if (slot && slot->owned) retire_title_texture(*slot);
-            state_.mapped_title_textures.erase(address);
             state_.index_texture(*entry);
             slot = std::move(entry);
             ++title_stats_.registered;
         }
     }
 
-    // Before every submission (VulkanContext::set_before_execute), at most once per LEONIDA_TITLE_TEXTURE_PERIOD_MS
-    // (16 by default, about a frame): the bytes of the textures filled from the title's memory are hashed, round
-    // robin, until LEONIDA_TITLE_TEXTURE_CHECK_KB have been read (4096 by default; all of a small texture, about 3%
-    // of a large one, hash_guarded), mapped slot-133 textures first and every pass; a texture whose bytes changed is
-    // filled again, up
-    // to LEONIDA_TITLE_TEXTURE_FILL_MB a pass (32 by default, OpenScarlett's batch cap), the rest at the next pass.
-    // Host copies and the private full-image uploader are safe here. Generic staging re-enters submission. No write
-    // watch on the title's pages: streaming memory would fault once a page.
+    // Before every submission (VulkanContext::set_before_execute), on the submitting thread: the textures something
+    // says may have changed since their last fill are read and, when their bytes differ from that fill's, uploaded
+    // (fill_title_texture). What says so (TitleTextureWatch, title_texture_watch.h): a write to their pages (a fault
+    // on a tile armed read-only, at every address it is mapped at), a mapping change over them, their creation or a
+    // new layout, the title's Unmap, and the writes XG and DirectStorage note (title_texel_writes). A texture nobody
+    // wrote costs nothing here. Memory a guard cannot watch (not committed, or no write-fault handler) is the one
+    // fallback: its textures are read at every refresh and uploaded only when their bytes differ.
+    //
+    // Ordering: a write the title finished before it called ExecuteCommandLists is in this pass, and its upload is
+    // submitted before this submission's command buffers, behind all earlier work on every queue on the GPU and with
+    // no CPU wait (TitleImageUpload, write_staged_title_image); this submission's draws, on whichever queue, see it.
+    // Every changed texture of the pass goes in, with no budget: the planes of a video frame land together.
     void refresh_title_textures() {
         if (t_in_title_textures) return;
         using clock = std::chrono::steady_clock;
-        static const auto setting = [](const char* name, std::uint64_t fallback) {
-            char text[16] = {};
-            size_t length = 0;
-            return getenv_s(&length, text, name) == 0 && length > 1 ? std::strtoull(text, nullptr, 10) : fallback;
-        };
-        static const auto period = std::chrono::milliseconds(setting("LEONIDA_TITLE_TEXTURE_PERIOD_MS", 16));
-        static const std::uint64_t check_budget = setting("LEONIDA_TITLE_TEXTURE_CHECK_KB", 4096) << 10;
-        static const std::uint64_t fill_budget = setting("LEONIDA_TITLE_TEXTURE_FILL_MB", 32) << 20;
-        // And at most this long filling a pass (0: no limit); a texture already started is finished.
-        static const std::uint64_t fill_budget_ns = setting("LEONIDA_TITLE_TEXTURE_FILL_MS", 8) * 1000000;
-        // Stop the background sweep at a texture boundary. Zero keeps the byte budget alone.
-        static const std::uint64_t hash_budget_us = setting("LEONIDA_TEXTURE_HASH_BUDGET_US", 400);
-        // Residency checks and uploads also cost time. Limit background work between textures;
-        // mapped textures and notified writes have already been serviced when this timer starts.
-        static const auto sweep_budget_us = setting("LEONIDA_TEXTURE_SWEEP_BUDGET_US", 400);
         const auto now = clock::now();
-        const std::int64_t ticks = now.time_since_epoch().count();
-        if (ticks - title_refreshed_.load(std::memory_order_relaxed) <
-            std::chrono::duration_cast<clock::duration>(period).count())
-            return;
-        std::unique_lock lock(state_.title_texture_mutex, std::try_to_lock);
-        if (!lock.owns_lock()) return;  // a slot-70 view is filling one; next time
-        title_refreshed_.store(ticks, std::memory_order_relaxed);
+        // Waits for a slot-70 view that is filling a texture: skipping would leave this submission a write behind.
+        // No deadlock: before_execute holds no lock, and the registry's holders never wait for this thread.
+        std::unique_lock lock(state_.title_texture_mutex);
         std::optional<InTitleTextures> inside(std::in_place);
         TitleTextureStats& stats = title_stats_;
+        auto& watch = state_.texture_watch;
         ++stats.passes;
-        // A fill this pass makes can submit, and a submission destroys a retired image, whose destructor reaches
-        // title_texture_gone while this thread holds the registry mutex: the entry stops naming the resource and is
-        // erased by drain_titles_gone after the pass. Every walk below visits a snapshot, never an iterator into the
-        // registry, and skips an entry without a resource.
-        // The worker gives journal hits priority. Rotate a small slice for direct writes with no notification.
-        const bool async = async_texture_refresh();
-        const auto entries = async ? leonida::title_texture_snapshot(state_.title_textures, title_slice_, 128)
-                                   : leonida::title_texture_snapshot(state_.title_textures);
-        if (async) title_slice_ = entries.size() == 128 ? entries.back().first + 1 : 0;
         title_pass_ = true;
-        std::uint64_t checked = 0, filled = 0, fill_pass_ns = 0;
-        const auto visit = [&](TitleTexture& t) {
-            // A slot-133 texture's guessed layout (no slot-70 view yet) is only used once the title maps it.
-            if (t.gpu_written || !t.layout_known || !t.resource ||
-                ((t.layout_guessed || t.layout_from_xg) && !t.mapped && !t.stale))
-                return;
-            const std::uint64_t span = t.layout.layout.size;
-            const bool always = t.mapped && refresh_mapped_pages();
-            // Out of this pass's fill budget (bytes or time): a texture known to need a fill (stale) waits for the
-            // next pass unprobed and unhashed; hashing it now would only find it changed again (measured: 10,000
-            // deferred textures, 600 MiB hashed a pass, during the story load).
-            const auto out_of_budget = [&] {
-                return (filled && filled + span > fill_budget) || (fill_budget_ns && fill_pass_ns >= fill_budget_ns);
-            };
-            if (t.stale && !always && out_of_budget()) {
-                ++stats.deferred;
-                return;
-            }
-            std::uint64_t hash = 0;
-            if (!title_texture_readable(t)) return;
-            const bool full_mapped = async && always;
-            checked += full_mapped ? span : hashed_bytes(span);
-            ++stats.checked;
-            const auto* bytes = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(t.cpu));
-            const auto timed_hash = [&](std::uint64_t& out, bool all = false) {
-                const auto start = clock::now();
-                const bool ok = hash_guarded(bytes, std::size_t(span), out, all);
-                stats.hash_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
-                return ok;
-            };
-            if (full_mapped) {
-                // Direct writes through a persistent Map have no journal entry. Check every byte on the
-                // worker. A large mapped plane must not hold up view creation while its hash is computed.
-                const auto address = t.address, fills = t.fills;
-                const auto start = clock::now();
-                title_pass_ = false;
-                lock.unlock();
-                const bool ok = hash_guarded(bytes, std::size_t(span), hash, true);
-                lock.lock();
-                title_pass_ = true;
-                stats.hash_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
-                const auto it = state_.title_textures.find(address);
-                if (it == state_.title_textures.end() || it->second.get() != &t || !t.resource ||
-                    !t.layout_known || t.layout.layout.size != span || t.fills != fills) return;
-                ++stats.mapped_checks;
-                if (!ok) {
-                    t.memory.defer();
-                    t.stale = true;
-                    return;
-                }
-                if (t.hashed && t.full_hashed && t.full_hash == hash && !t.stale) return;
-                ++stats.mapped_changed;
-            } else if (!timed_hash(hash)) {
-                t.memory.defer();
-                return;
-            }
-            if (!full_mapped && t.hashed && hash == t.hash && !t.stale) {
-                if (!t.every_byte() || stats.passes % 6) return;
-                std::uint64_t full = 0;
-                checked += span;
-                if (!timed_hash(full, true)) {
-                    t.memory.defer();
-                    return;
-                }
-                if (t.full_hashed && full == t.full_hash) return;
-            }
-            ++stats.changed;
-            if (!always && out_of_budget()) {
-                t.stale = true;
-                ++stats.deferred;
-                return;
-            }
-            const auto fill_start = clock::now();
-            const auto uploaded = fill_title_texture(t, false);
-            filled += uploaded;
-            if (full_mapped && uploaded) ++stats.mapped_fills;
-            if (async && t.stale) queue_title_fill(t.address);  // generic staging needs an outer fill
-            const std::uint64_t fill_ns =
-                std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - fill_start).count();
-            stats.fill_ns += fill_ns;
-            fill_pass_ns += fill_ns;
-        };
+        // A fill this pass makes can retire an image (title_texture_gone while this thread holds the registry): the
+        // entry stops naming the resource and is erased by drain_titles_gone after the pass. Entries are looked up by
+        // key each time, and one without a resource is passed over.
         bool overflow = false;
-        auto written = leonida::title_texel_writes::take(overflow);
-        // What the title memory map changed since the last pass: a texture over a change is probed again (its pages
-        // may have come or gone), the others keep their last answer (TextureReadability). Every kRetryAll, or when the
-        // journal lost some changes, all are probed again, for whatever no change reports.
-        constexpr auto kRetryAll = std::chrono::seconds(30);
+        const auto written = leonida::title_texel_writes::take(overflow);
+        stats.written_ranges += written.size();
         title_map_changes_.clear();
         std::uint64_t map_now = 0;
-        bool map_all = !leonida::title_memory_map::changes_since(
+        const bool map_all = !leonida::title_memory_map::changes_since(
             title_map_generation_, map_now, 0, UINTPTR_MAX,
             [&](std::uintptr_t from, std::uintptr_t to) { title_map_changes_.emplace_back(from, to); });
         title_map_generation_ = map_now;
-        if (now - title_retry_all_ >= kRetryAll) map_all = true;
-        if (map_all) title_retry_all_ = now;
-        leonida::merge_title_writes(title_map_changes_);
         stats.map_ranges += title_map_changes_.size();
         stats.map_all += map_all;
-        if (!written.empty() || overflow || map_all || !title_map_changes_.empty()) {
-            stats.written_ranges += written.size();
-            leonida::merge_title_writes(written);
-            const auto invalidate = [&](TitleTexture& t, bool write) {
-                if (t.gpu_written || !t.layout_known) return;
-                t.memory.retry();
-                if (write) t.stale = true;
-                if (overflow) t.hashed = false;
-            };
-            if (!async || overflow || map_all) {
-                // No fills or callbacks during invalidation; registry iterators stay valid.
-                for (const auto& [key, ptr] : state_.title_textures) {
-                    auto& t = *ptr;
-                    const auto end = t.cpu + t.layout.layout.size;
-                    const bool write = leonida::title_write_overlaps(written, t.cpu, end);
-                    if (write || map_all || overflow || leonida::title_write_overlaps(title_map_changes_, t.cpu, end))
-                        invalidate(t, write);
-                }
-            } else {
-                const auto apply = [&](const auto& ranges, bool write) {
-                    for (const auto& [from, to] : ranges)
-                        state_.texture_ranges.overlapping(from, to, [&](auto key) {
-                            auto& t = *state_.title_textures.at(key);
-                            invalidate(t, write);
-                            if (t.stale) queue_title_fill(key);
-                        });
-                };
-                apply(title_map_changes_, false);
-                apply(written, true);
-            }
-        }
-        const auto every_start = clock::now();
-        stats.written_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(every_start - now).count();
-        // LEONIDA_TITLE_EVERY_BUDGET_US (0, the default: no limit, as before) limits the synchronous pass, the one that
-        // runs before a submission on the title's submitting thread: the mapped and stale textures are visited for at
-        // most this long a pass, in address order from where the last pass stopped, instead of all of them every pass
-        // (thousands during a streaming burst on retail, 30-75 ms a pass). The texture that crosses the limit is
-        // finished; one not reached keeps its mark and waits for a later pass. With LEONIDA_TEXTURE_REFRESH_ASYNC the
-        // pass runs on the refresh worker, and the limit does not apply.
-        static const std::uint64_t every_budget_us = setting("LEONIDA_TITLE_EVERY_BUDGET_US", 0);
-        if (async) {
-            // Poll every persistent mapping each pass, independently of the bounded stale sweep.
-            const auto mapped = leonida::title_texture_snapshot(state_.mapped_title_textures);
-            for (const auto& [address, entry] : mapped) {
-                if (!entry->resource) continue;
-                const auto it = state_.title_textures.find(address);
-                if (it == state_.title_textures.end() || it->second != entry) continue;
-                ++stats.every_pass_visits;
-                visit(*entry);
-            }
-            for (const auto& entry : entries)
-                if (!entry.second->mapped && entry.second->stale) {
-                    const auto it = state_.title_textures.find(entry.first);
-                    if (it == state_.title_textures.end() || it->second != entry.second) continue;
-                    ++stats.every_pass_visits;
-                    visit(*entry.second);
-                }
-        } else if (!every_budget_us) {
-            for (const auto& entry : entries)
-                if (entry.second->mapped || entry.second->stale) {
-                    ++stats.every_pass_visits;
-                    visit(*entry.second);
-                }
+        // A mapping change: the textures over it probe their memory again (TextureReadability) and are looked at.
+        const auto remapped = [&](std::uint64_t key) {
+            const auto it = state_.title_textures.find(key);
+            if (it != state_.title_textures.end()) it->second->memory.retry();
+        };
+        if (map_all || overflow) {
+            watch.for_each_over(0, UINTPTR_MAX, remapped);
+            watch.note_changed(0, UINTPTR_MAX);
         } else {
-            leonida::visit_marked_title_textures(
-                entries, title_every_cursor_,
-                [&](TitleTexture& t) {
-                    ++stats.every_pass_visits;
-                    visit(t);
-                },
-                // A mapped texture never filled yet does not wait for its turn: the title has written it and the GPU
-                // has nothing of it (a video plane of #1827 would show frozen until its turn came).
-                [](const TitleTexture& t) { return t.mapped && !t.fills; },
-                [&] { return clock::now() - every_start >= std::chrono::microseconds(every_budget_us); });
-        }
-        stats.every_pass_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - every_start).count();
-        // The budget is the round robin's: mapped and stale textures above are checked every pass whatever it is
-        // (unless LEONIDA_TITLE_EVERY_BUDGET_US limits them).
-        const auto first_bytes = checked, first_hash_ns = stats.hash_ns;
-        if (check_budget) {
-            const auto sweep_start = clock::now();
-            // The normal hash sweep has its own cursor: a byte/time cutoff in a slice must not
-            // skip the remainder next time just because the stale-texture sweep moved ahead.
-            decltype(leonida::title_texture_snapshot(state_.title_textures)) background;
-            if (async) {
-                if (!state_.title_textures.empty() && title_refresh_cursor_ > state_.title_textures.rbegin()->first)
-                    title_refresh_cursor_ = 0;
-                background = leonida::title_texture_snapshot(state_.title_textures, title_refresh_cursor_, 128);
+            for (const auto& [from, to] : title_map_changes_) {
+                watch.for_each_over(from, to, remapped);
+                watch.note_changed(from, to);
             }
-            leonida::poll_title_textures(async ? background : entries, title_refresh_cursor_, visit, [&] {
-                if (checked - first_bytes >= check_budget ||
-                    (hash_budget_us && (stats.hash_ns - first_hash_ns) / 1000 >= hash_budget_us)) return true;
-                if (!sweep_budget_us) return false;
-                const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - sweep_start);
-                return std::uint64_t(elapsed.count()) >= sweep_budget_us;
-            });
+            // A noted write (XG, DirectStorage) can be the texture's first bytes: its memory is probed again too.
+            for (const auto& [from, to] : written) {
+                watch.for_each_over(from, to, remapped);
+                watch.note_changed(from, to);
+            }
         }
-        stats.hashed += checked;
+        title_named_.clear();
+        watch.collect([&](std::uint64_t key) { title_named_.push_back(key); });
+        std::uint64_t filled = 0;
+        for (const std::uint64_t key : title_named_) {
+            const auto it = state_.title_textures.find(key);
+            if (it == state_.title_textures.end() || !it->second->resource) continue;
+            const std::shared_ptr<TitleTexture> entry = it->second;
+            TitleTexture& t = *entry;
+            if (t.gpu_written || !t.layout_known) continue;
+            ++stats.checked;
+            watch.examine(key);  // armed before it is read: a write from now on is in the next pass
+            const auto fill_start = clock::now();
+            const std::uint64_t uploaded = fill_title_texture(t);
+            stats.fill_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - fill_start).count();
+            if (uploaded) ++stats.changed;
+            filled += uploaded;
+            // Not filled (no backing yet, a failed upload, memory not readable): looked at again next pass.
+            if (!uploaded && (t.stale || !t.hashed) && t.resource) watch.touch(key);
+        }
         stats.filled_bytes += filled;
         stats.max_pass_bytes = std::max(stats.max_pass_bytes, filled);
         std::vector<Resource*> release;
@@ -16112,14 +15941,27 @@ public:
         stats.max_refresh_ns = std::max(stats.max_refresh_ns, pass_ns);
         if (now - stats.last_log >= std::chrono::seconds(10)) {
             stats.last_log = now;
-            if (async) {
-                std::fprintf(stderr, "[rt] async texture refresh: %llu mapped checks, %llu changed or stale, %llu uploaded in pass\n",
-                             static_cast<unsigned long long>(stats.mapped_checks),
-                             static_cast<unsigned long long>(stats.mapped_changed),
-                             static_cast<unsigned long long>(stats.mapped_fills));
-                stats.mapped_checks = stats.mapped_changed = stats.mapped_fills = 0;
-            }
+            const auto& w = watch.stats();
+            const auto& l = title_watch_logged_;
+            std::fprintf(stderr,
+                         "[rt] d3d12: title texture refresh: %llu passes, %llu textures looked at (%llu of them over "
+                         "memory not watched), %llu uploaded (%.1f MiB), %llu unchanged; %llu written tiles, %llu arms "
+                         "(%llu refused), %llu queue overflows; %zu textures over %zu tiles watched, %zu not armed; "
+                         "%.3f ms a pass, %.3f at most\n",
+                         static_cast<unsigned long long>(stats.passes), static_cast<unsigned long long>(stats.checked),
+                         static_cast<unsigned long long>(w.unarmed_named - l.unarmed_named),
+                         static_cast<unsigned long long>(stats.changed), double(stats.filled_bytes) / 1048576.0,
+                         static_cast<unsigned long long>(stats.unchanged),
+                         static_cast<unsigned long long>(w.written_tiles - l.written_tiles),
+                         static_cast<unsigned long long>(w.arms - l.arms),
+                         static_cast<unsigned long long>(w.arm_failures - l.arm_failures),
+                         static_cast<unsigned long long>(w.overflows - l.overflows), watch.textures(), watch.tiles(),
+                         watch.unarmed(), double(stats.refresh_ns) * 1e-6 / double(stats.passes),
+                         double(stats.max_refresh_ns) * 1e-6);
+            title_watch_logged_ = w;
             if (leonida::fsdraw::enabled()) log_title_census("refresh");
+            stats.passes = stats.checked = stats.changed = stats.unchanged = stats.filled_bytes = 0;
+            stats.refresh_ns = stats.max_refresh_ns = stats.max_pass_bytes = 0;
         }
         inside.reset();
         lock.unlock();
@@ -16135,7 +15977,7 @@ private:
         std::map<std::string, std::uint64_t> refused;  // why a view is a null view -> views
         std::uint64_t views = 0, null_views = 0, of_slot133 = 0, of_cache = 0, made = 0, retired = 0, registered = 0,
                       refusals = 0, written_ranges = 0, unmaps = 0, unreadable = 0, pending_views = 0;
-        std::uint64_t fills = 0, fill_bytes = 0, fill_failures = 0;
+        std::uint64_t fills = 0, fill_bytes = 0, fill_failures = 0, unchanged = 0;
         std::uint64_t staged_fills = 0, staged_ns = 0;
         // refresh_title_textures, since the last log line
         std::uint64_t passes = 0, checked = 0, hashed = 0, changed = 0, deferred = 0, filled_bytes = 0,
@@ -16152,7 +15994,8 @@ private:
     };
     TitleTextureStats title_stats_;                                 // under title_texture_mutex
     bool title_pass_ = false;                                      // in refresh_title_textures, likewise
-    std::atomic<std::int64_t> title_refreshed_{0};                 // steady_clock ticks of the last pass
+    std::vector<std::uint64_t> title_named_;                       // refresh scratch, under title_texture_mutex
+    leonida::TitleTextureWatch<TitleTextureCells>::Stats title_watch_logged_;  // as of the last log line, likewise
     std::atomic<std::uint64_t> refreshed_present_{~std::uint64_t(0)};  // LEONIDA_REFRESH_PER_FRAME: present of the last full refresh
 
     // LEONIDA_TITLE_FILL_ASYNC=1 (for runs that only need the title to go on): slot-70 views no longer fill or hash
@@ -16171,7 +16014,7 @@ private:
         std::condition_variable wake;
         std::deque<std::uint64_t> queue;  // texture addresses
         std::unordered_set<std::uint64_t> queued;
-        bool stop = false, refresh = false;
+        bool stop = false;
         std::thread thread;
         std::uint64_t filled = 0, skipped = 0;
         std::vector<std::uint8_t> tiled;      // the worker's own snapshot of a texture's bytes (fill_unlocked)
@@ -16194,40 +16037,6 @@ private:
             f->thread = std::thread([this, f] { run_title_filler(*f); });
         });
     }
-    // LEONIDA_TEXTURE_REFRESH_ASYNC=1, before a submission: a mapped texture that has never been filled (a video plane
-    // the title maps, writes and draws right away) is filled here, on the submitting thread, so its first draw does not
-    // sample an empty image while the worker has not come to it yet. Everything else stays on the worker. Only when
-    // the registry is free: the worker may hold it for a fill that needs this queue, so waiting here could deadlock.
-    void fill_first_mapped_textures() {
-        std::unique_lock lock(state_.title_texture_mutex, std::try_to_lock);
-        if (!lock.owns_lock()) return;
-        std::vector<std::shared_ptr<TitleTexture>> first;
-        for (const auto& [address, t] : state_.mapped_title_textures)
-            if (t->resource && !t->fills && !t->gpu_written && t->layout_known) first.push_back(t);
-        if (first.empty()) return;
-        {
-            const InTitleTextures inside;
-            for (const auto& t : first) {
-                // A fill can submit and retire an image (title_texture_gone): look each one up again.
-                const auto it = state_.title_textures.find(t->address);
-                if (it == state_.title_textures.end() || it->second != t || !t->resource || t->fills) continue;
-                fill_title_texture(*t, false);
-                if (t->stale) queue_title_fill(t->address);  // generic staging needs an outer fill (the worker's)
-            }
-        }
-        lock.unlock();
-        state_.drain_titles_gone();
-    }
-
-    void request_title_refresh() {
-        {
-            // A busy queue can take the next submission's request. Dirty entries stay on the worker.
-            std::unique_lock lock(title_filler_->mutex, std::try_to_lock);
-            if (!lock.owns_lock() || title_filler_->refresh) return;
-            title_filler_->refresh = true;
-        }
-        title_filler_->wake.notify_one();
-    }
     void queue_title_fill(std::uint64_t address) {
         start_title_filler();
         {
@@ -16242,12 +16051,11 @@ private:
         auto since = clock::now();
         for (;;) {
             std::uint64_t address = 0;
-            bool refresh = false, fill = false;
+            bool fill = false;
             {
                 std::unique_lock lock(f.mutex);
-                f.wake.wait(lock, [&] { return f.stop || f.refresh || !f.queue.empty(); });
+                f.wake.wait(lock, [&] { return f.stop || !f.queue.empty(); });
                 if (f.stop) return;
-                refresh = std::exchange(f.refresh, false);
                 fill = !f.queue.empty();
                 if (fill) {
                     address = f.queue.front();
@@ -16255,7 +16063,6 @@ private:
                     f.queued.erase(address);
                 }
             }
-            if (refresh) refresh_title_textures();
             if (!fill) continue;
             bool filled = false;
             // A staged texture is filled without the registry lock (the title's threads creating views wait for
@@ -16265,7 +16072,6 @@ private:
             Resource* r = nullptr;
             rt::xg_xs::Texture layout{};
             std::uint64_t cpu = 0, fills = 0;
-            bool every_byte = false;
             {
                 std::lock_guard lock(state_.title_texture_mutex);
                 const InTitleTextures inside;
@@ -16281,16 +16087,15 @@ private:
                             layout = t.layout;
                             cpu = t.cpu;
                             fills = t.fills;
-                            every_byte = t.every_byte();
                         } else {
-                            filled = fill_title_texture(t, true) != 0;
+                            filled = fill_title_texture(t) != 0;
                             if (!filled) t.stale = true;
                         }
                     }
                 }
             }
             if (r) {
-                filled = fill_unlocked(address, *r, layout, cpu, fills, every_byte, f);
+                filled = fill_unlocked(address, *r, layout, cpu, fills, f);
                 r->Release();
             }
             std::size_t left = 0;
@@ -16314,17 +16119,16 @@ private:
     // The fill worker's fill of a staged texture: copy, hash and upload without the registry lock, then the result
     // under it, if the registry still names `r` at `address` and nobody filled it meanwhile.
     bool fill_unlocked(std::uint64_t address, Resource& r, const rt::xg_xs::Texture& layout, std::uint64_t cpu,
-                       std::uint64_t fills, bool every_byte, TitleFiller& f) {
+                       std::uint64_t fills, TitleFiller& f) {
         const std::uint64_t span = layout.layout.size;
         f.tiled.resize(std::size_t(span));
         const bool copied = copy_guarded(f.tiled.data(), reinterpret_cast<const std::uint8_t*>(cpu), std::size_t(span),
                                          title_memory_write_combined(cpu));
-        std::uint64_t hash = 0, full = 0;
-        bool full_hashed = false, ok = false, nonzero = false;
+        std::uint64_t hash = 0;
+        bool ok = false, nonzero = false;
         std::uint64_t staged_ns = 0;
         if (copied) {
-            hash_guarded(f.tiled.data(), f.tiled.size(), hash);
-            full_hashed = every_byte && hash_guarded(f.tiled.data(), f.tiled.size(), full, true);
+            hash_guarded(f.tiled.data(), f.tiled.size(), hash, true);
             const auto start = std::chrono::steady_clock::now();
             ok = r.upload_staged_title(layout, f.tiled.data(), f.columns, false, nonzero);
             staged_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
@@ -16352,8 +16156,6 @@ private:
         if (t.owned && !t.fills) r.publish_streamed_texture();
         t.hash = hash;
         t.hashed = true;
-        t.full_hash = full;
-        t.full_hashed = full_hashed;
         ++t.fills;
         ++title_stats_.fills;
         title_stats_.fill_bytes += span;
@@ -16399,11 +16201,7 @@ private:
         }
         geometry_refresher_->wake.notify_one();
     }
-    std::uint64_t title_slice_ = 0;  // next registry slice on the async worker
-    std::uint64_t title_refresh_cursor_ = 0;                       // under title_texture_mutex
-    std::uint64_t title_every_cursor_ = 0;                         // likewise: LEONIDA_TITLE_EVERY_BUDGET_US's resume point
-    std::uint64_t title_map_generation_ = 0;                       // likewise: the map changes the passes have seen
-    std::chrono::steady_clock::time_point title_retry_all_{};      // likewise
+    std::uint64_t title_map_generation_ = 0;                       // under title_texture_mutex: the map changes seen
     leonida::TitleWriteRanges title_map_changes_;                  // likewise, scratch
     VkDeviceSize retired_backing_ = 0;
     std::vector<std::pair<std::chrono::steady_clock::time_point, Resource*>> retired_title_textures_;  // likewise
@@ -16516,7 +16314,7 @@ private:
                        rt::xg_xs::format_info(t->desc[8]).side == rt::xg_xs::format_info(words[8]).side;
             }();
             retire_title_texture(*t);
-            state_.texture_ranges.erase(address);
+            state_.texture_watch.untrack(address);
             textures.erase(address);
             t = make_title_texture(d, words, srv, address, same_shape ? formats : std::vector<DXGI_FORMAT>{});
         } else if (t) {
@@ -16612,7 +16410,7 @@ private:
         if (title_fill_async()) {
             entry->stale = true;  // filled by the fill worker (queued below, once it is in the registry)
         } else if (!entry->memory.pending()) {
-            fill_title_texture(*entry, true);
+            fill_title_texture(*entry);
         }
         ++title_stats_.made;
         TitleTexture* t = entry.get();
@@ -16688,47 +16486,23 @@ private:
                               guard && !mapped);
     }
 
-    // LEONIDA_TITLE_VIEW_REFRESH_MS (0 by default: at every view): a texture's bytes are checked when a slot-70 view of
-    // it is written at most this often (the refresh pass still looks at it on its own period, and a stale texture is
-    // checked at once). After the load a title thread spent a fifth of its time hashing textures here, view by view
-    // (speed-24 wait sampler: refresh_title_texture < write_placed_texture_view < slot 70).
+    // At a slot-70 view of a texture: a texture never filled, or known changed, is filled now; any other change is
+    // the next refresh's (before the submission that samples the view), found by the watch, not by reading the bytes.
     void refresh_title_texture(TitleTexture& t) {
-        // LEONIDA_TITLE_FILL_ASYNC=1: a view neither hashes nor fills. A texture never filled or known stale goes to
-        // the fill worker; later changes are found by the periodic pass and the write journal, as before.
+        // LEONIDA_TITLE_FILL_ASYNC=1: a view does not fill; the texture goes to the fill worker.
         if (title_fill_async()) {
             if (!t.hashed || t.stale) queue_title_fill(t.address);
             return;
         }
-        static const auto period = std::chrono::milliseconds([] {
-            const char* v = std::getenv("LEONIDA_TITLE_VIEW_REFRESH_MS");
-            return v && *v ? std::strtoll(v, nullptr, 10) : 0ll;
-        }());
-        if (period.count() && t.hashed && !t.stale) {
-            const auto now = std::chrono::steady_clock::now();
-            if (now - t.view_checked < period) return;
-            t.view_checked = now;
-        }
-        std::uint64_t hash = 0;
-        if (!title_texture_readable(t)) return;
-        if (!hash_guarded(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(t.cpu)),
-                          std::size_t(t.layout.layout.size), hash)) {
-            t.memory.defer();
-            return;
-        }
-        if (!t.hashed || hash != t.hash || t.stale) fill_title_texture(t, true);
+        if ((!t.hashed || t.stale) && title_texture_readable(t)) fill_title_texture(t);
     }
 
-    // Snapshot the whole footprint before uploading any subresource. A concurrent unmap defers the fill.
-    // Private title staging bypasses the D3D12 submit callbacks. Generic staged copies require an outer fill.
-    std::uint64_t fill_title_texture(TitleTexture& t, bool staged) {
+    // Snapshot the whole footprint, then upload it whole through the title upload (TitleImageUpload): the transfer
+    // is submitted at once, ordered on the GPU after all earlier work and before every later submission, and nothing
+    // waits for the GPU on the CPU (VulkanContext::write_staged_title_image). It never re-enters the D3D12 submit
+    // callbacks, so the refresh before a submission may use it. A concurrent unmap defers the fill.
+    std::uint64_t fill_title_texture(TitleTexture& t) {
         const rt::xg_xs::Texture& layout = t.layout;
-        const std::uint32_t mips = layout.layout.mips, slices = layout.array;
-        if (!staged && !t.unbound_bytes && !t.resource->staged_title())
-            for (UINT sub = 0; sub < mips * slices; ++sub)
-                if (!t.resource->host_copy_now(sub)) {
-                    t.stale = true;
-                    return 0;
-                }
         const std::uint64_t span = layout.layout.size;
         if (!title_texture_readable(t)) return 0;
         title_tiled_.resize(std::size_t(span));
@@ -16753,50 +16527,32 @@ private:
             }
             t.set_resource(t.resource);
         }
+        // Every byte: a texture is read only when something says it changed, so this is its one read; bytes equal to
+        // the last fill's (a write to another texture in the same 64 KiB tile, or the same texels again) are not
+        // uploaded again.
         std::uint64_t hash = 0;
-        hash_guarded(title_tiled_.data(), title_tiled_.size(), hash);
-        t.full_hashed = t.every_byte() && hash_guarded(title_tiled_.data(), title_tiled_.size(), t.full_hash, true);
-        const bool volume = layout.layout.dimension == rt::xg_xs::kTexture3D;
+        hash_guarded(title_tiled_.data(), title_tiled_.size(), hash, true);
+        if (t.hashed && t.fills && hash == t.hash) {
+            ++title_stats_.unchanged;
+            t.stale = false;
+            return 0;
+        }
         const bool trace_pool = leonida::dstorage::trace_enabled() && leonida::title_gpu_views::other_view(t.cpu);
         bool nonzero = false;
-        bool ok = true;
-        if (t.resource->staged_title()) {
-            const auto start = std::chrono::steady_clock::now();
-            ok = t.resource->upload_staged_title(layout, title_tiled_.data(), title_columns_, trace_pool, nonzero);
-            title_stats_.staged_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - start).count();
-            if (ok) ++title_stats_.staged_fills;
-            if (!ok) log_once("staged title texture upload failed, format", int(t.resource->format()));
-        } else {
-            for (std::uint32_t slice = 0; slice < slices && ok; ++slice) {
-                for (std::uint32_t level = 0; level < mips && ok; ++level) {
-                    const auto& mip = layout.layout.plane[0].mips[level];
-                    const std::uint32_t row_pitch = mip.width_elements * layout.format.bytes;
-                    const std::uint32_t slice_pitch = row_pitch * mip.height_elements;
-                    title_linear_.resize(std::size_t(slice_pitch) * (volume ? mip.depth : 1));
-                    rt::xg_xs::copy_elements<false>(layout, level, slice, title_tiled_.data(), title_linear_.data(),
-                                                    row_pitch, slice_pitch, title_columns_);
-                    if (trace_pool && !nonzero)
-                        nonzero = std::any_of(title_linear_.begin(), title_linear_.end(), [](auto byte) { return byte != 0; });
-                    const HRESULT hr =
-                        t.resource->upload_title_subresource(level + slice * mips, title_linear_.data(), row_pitch,
-                                                             slice_pitch, staged);
-                    if (FAILED(hr)) {
-                        log_once("a title texture's subresource could not be filled; HRESULT", int(hr));
-                        ok = false;
-                    }
-                }
-            }
-        }
+        const auto start = std::chrono::steady_clock::now();
+        const bool ok = t.resource->upload_staged_title(layout, title_tiled_.data(), title_columns_, trace_pool, nonzero);
+        title_stats_.staged_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (ok) ++title_stats_.staged_fills;
+        if (!ok) log_once("staged title texture upload failed, format", int(t.resource->format()));
         if (!ok) {
             ++title_stats_.fill_failures;
             t.stale = true;
             return 0;
         }
         if (trace_pool)
-            std::fprintf(stderr, "[rt] ds-pool-fill cpu=%llx size=%llu staged=%d nonzero=%d\n",
-                         static_cast<unsigned long long>(t.cpu), static_cast<unsigned long long>(span),
-                         int(staged), int(nonzero));
+            std::fprintf(stderr, "[rt] ds-pool-fill cpu=%llx size=%llu staged=1 nonzero=%d\n",
+                         static_cast<unsigned long long>(t.cpu), static_cast<unsigned long long>(span), int(nonzero));
         if (t.owned && !t.fills) t.resource->publish_streamed_texture();
         t.hash = hash;
         t.hashed = true;
@@ -16892,10 +16648,7 @@ private:
                      static_cast<unsigned long long>(s.registered), mapped, filled,
                      static_cast<unsigned long long>(s.fills), double(s.fill_bytes) / 1048576.0,
                      static_cast<unsigned long long>(s.fill_failures));
-        const auto host = state_.context->host_texture_stats();
-        std::fprintf(stderr, "[rt] d3d12: ordered title host copies %llu, GPU waits %llu; "
-                             "slot-70 views awaiting readable memory: %llu\n",
-                     static_cast<unsigned long long>(host.copies), static_cast<unsigned long long>(host.waits),
+        std::fprintf(stderr, "[rt] d3d12: slot-70 views awaiting readable memory: %llu\n",
                      static_cast<unsigned long long>(s.pending_views));
         std::fprintf(stderr, "[rt] d3d12: title textures census (format/Layout/dimension/mips:views): %s\n",
                      census.c_str());

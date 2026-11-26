@@ -22,9 +22,19 @@ struct ReleaseQueue {
     host_heap::vector<std::pair<std::uintptr_t, std::uintptr_t>> ranges;
     std::atomic<bool> pending{false};
 };
+// A subscriber's list of the tiles notify() changed since it last took them (the title texture refresh's: it
+// examines only textures over these tiles). Past kMaxTiles it keeps only `overflow`: every tile counts as changed.
+struct WriteQueue {
+    static constexpr std::size_t kMaxTiles = 65536;
+    std::mutex mutex;  // a leaf lock, taken under State::mutex (in notify)
+    host_heap::vector<std::uintptr_t> tiles;
+    bool overflow = false;
+    std::atomic<bool> pending{false};
+};
 struct State {
     std::mutex mutex;
     host_heap::map<std::uintptr_t, Cell> cells;
+    host_heap::vector<WriteQueue*> writers;  // under mutex
     std::atomic<std::uint64_t> serial{1};
     std::atomic<std::size_t> count{0};
     // Union of every tile passed to acquire(): [watched_lo, watched_hi). Monotonic; updated under mutex.
@@ -46,6 +56,31 @@ inline void unsubscribe(ReleaseQueue& queue) {
     auto& s = state();
     std::lock_guard lock(s.subscribers_mutex);
     std::erase(s.subscribers, &queue);
+}
+
+inline void subscribe_writes(WriteQueue& queue) {
+    auto& s = state();
+    std::lock_guard lock(s.mutex);
+    if (std::find(s.writers.begin(), s.writers.end(), &queue) == s.writers.end()) s.writers.push_back(&queue);
+}
+
+inline void unsubscribe_writes(WriteQueue& queue) {
+    auto& s = state();
+    std::lock_guard lock(s.mutex);
+    std::erase(s.writers, &queue);
+}
+
+// The tiles changed since the last call (`overflow`: some were not kept, so every tile counts as changed).
+template<class Out>
+inline void take_written(WriteQueue& queue, Out& out, bool& overflow) {
+    out.clear();
+    overflow = false;
+    if (!queue.pending.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(queue.mutex);
+    out.assign(queue.tiles.begin(), queue.tiles.end());
+    queue.tiles.clear();
+    overflow = std::exchange(queue.overflow, false);
+    queue.pending.store(false, std::memory_order_release);
 }
 
 inline bool has_released(const ReleaseQueue& queue) {
@@ -195,6 +230,15 @@ inline bool notify(std::uintptr_t begin, std::uintptr_t end, Event event, bool* 
         }
         if (event == Event::mapping || event == Event::replaced) cell.mapping.store(version, std::memory_order_release);
         cell.version.store(version, std::memory_order_release);
+        for (WriteQueue* q : s.writers) {
+            std::lock_guard queue_lock(q->mutex);
+            if (q->overflow) continue;
+            if (q->tiles.size() < WriteQueue::kMaxTiles)
+                q->tiles.push_back(it->first);
+            else
+                q->overflow = true, q->tiles.clear();
+            q->pending.store(true, std::memory_order_release);
+        }
     }
     s.serial.store(version, std::memory_order_release);
     return opened;
