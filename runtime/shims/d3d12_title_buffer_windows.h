@@ -1,6 +1,9 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <utility>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -30,9 +33,41 @@ class TitleBufferWindows {
     bool failed_ = false;
     bool local_refused_ = false;  // device-local blocks refused once: host memory from then on
     std::uint64_t quick_refusals_ = 0;
+    // The blocks' (device address, capacity), readable without the owner's lock: published in order, never removed
+    // before release().
+    static constexpr std::size_t kPublished = 4096;
+    struct Published {
+        VkDeviceAddress address;
+        VkDeviceSize capacity;
+        std::uint8_t* mapped;
+        VkBuffer buffer;
+    };
+    std::array<Published, kPublished> published_{};
+    std::atomic<std::size_t> published_count_{0};
 
 public:
     VkDeviceSize reserved() const { return reserved_; }
+    // f(device address, capacity) for each block made so far; from any thread.
+    template <class F>
+    void for_each_block(F&& f) const {
+        const std::size_t n = published_count_.load(std::memory_order_acquire);
+        for (std::size_t i = 0; i < n; ++i) f(published_[i].address, published_[i].capacity);
+    }
+    // The block whose mapping holds [p, p + bytes): its buffer and the offset of p in it. From any thread.
+    bool find_mapped(const std::uint8_t* p, std::size_t bytes, VkBuffer& buffer, VkDeviceSize& offset) const {
+        const std::size_t n = published_count_.load(std::memory_order_acquire);
+        for (std::size_t i = 0; i < n; ++i) {
+            const Published& b = published_[i];
+            if (p >= b.mapped && p - b.mapped < std::ptrdiff_t(b.capacity) &&
+                bytes <= std::size_t(b.capacity) - std::size_t(p - b.mapped)) {
+                buffer = b.buffer;
+                offset = VkDeviceSize(p - b.mapped);
+                return true;
+            }
+        }
+        return false;
+    }
+    std::size_t block_count() const { return published_count_.load(std::memory_order_acquire); }
 
     template<class Device>
     bool allocate(Device& d, VkDeviceSize bytes, VkDeviceSize& offset, std::uint8_t*& mapped,
@@ -107,6 +142,10 @@ public:
             if (b.address && biased < (1ull << 47) && b.capacity <= (1ull << 47) - biased) {
                 b.mapped = static_cast<std::uint8_t*>(host);
                 blocks_.push_back(b);
+                if (const std::size_t n = published_count_.load(std::memory_order_relaxed); n < kPublished) {
+                    published_[n] = {b.address, b.capacity, b.mapped, b.buffer};
+                    published_count_.store(n + 1, std::memory_order_release);
+                }
                 reserved_ += req.size;
                 if (blocks_.size() == 1 || !(blocks_.size() & (blocks_.size() - 1)))
                     std::fprintf(stderr, "[rt] d3d12: title buffer shadows outside the arena: %zu blocks, "
@@ -145,6 +184,7 @@ public:
             d.context->vk.vkFreeMemory(d.info.device, b.memory, nullptr);
         }
         blocks_.clear();
+        published_count_.store(0, std::memory_order_release);
         reserved_ = 0;
     }
 };

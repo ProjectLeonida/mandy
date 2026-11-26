@@ -2952,6 +2952,36 @@ int check_render_target_sizes() {
     mips.MipLevels = 3;
     EXPECT(ask(&mips, 1).SizeInBytes == (135 + 40 + 12) * 65536ull);
 
+    // A texture the GPU writes through unordered access and the title also clears with the CPU through its lock
+    // with a layout word naming its mode: 0x100, linear. Its console layout is 36 slices of 32 rows
+    // of 256 bytes, 0x48000 bytes, where the PC device says 0x30000; the larger size wins, rounded to the
+    // description's alignment. The title's own layout word decides, though the PC form of the description has lost it.
+    D3D12_RESOURCE_DESC grid{};
+    grid.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    grid.Width = 32;
+    grid.Height = 32;
+    grid.DepthOrArraySize = 36;
+    grid.MipLevels = 1;
+    grid.Format = DXGI_FORMAT_R32_UINT;
+    grid.SampleDesc.Count = 1;
+    grid.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x100);
+    grid.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    EXPECT(ask(&grid, 1).SizeInBytes == 0x50000);
+    // In a list it takes its console size at its own offset.
+    const D3D12_RESOURCE_DESC grid_and_target[] = {grid, hd};
+    EXPECT(ask(grid_and_target, 2).SizeInBytes == 0x50000 + 8847360);
+    // The rule only grows: a mode XG lays out smaller (4 KiB thick blocks, 32x32x40 x 4 B = 0x28000) keeps the PC
+    // size, and so does a layout word that leaves the mode to XG, or a mode XG's model lacks.
+    D3D12_RESOURCE_DESC smaller = grid;
+    smaller.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+    EXPECT(ask(&smaller, 1).SizeInBytes == 0x30000);
+    D3D12_RESOURCE_DESC no_mode = grid;
+    no_mode.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    EXPECT(ask(&no_mode, 1).SizeInBytes == 0x30000);
+    D3D12_RESOURCE_DESC unknown_mode = grid;
+    unknown_mode.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x11b);  // SW_64KB_R_X
+    EXPECT(ask(&unknown_mode, 1).SizeInBytes == 0x30000);
+
     // The PC form (this in RCX, the buffer in RDX) is not the title's call: it gets the PC device's own size, 127
     // units of 64 KiB for the mock, so code that compares the proxy with the PC device still agrees.
     D3D12_RESOURCE_ALLOCATION_INFO pc{};

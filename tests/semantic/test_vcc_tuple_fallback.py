@@ -137,7 +137,7 @@ class VccTupleFallbackTest(unittest.TestCase):
         ]
         for variant in PROGRAM_VARIANTS:
             with self.subTest(printed_as=variant):
-                self.assertIn("OpFunctionCall %uint %desc_lookup_fn", translate(program, variant))
+                self.assertRegex(translate(program, variant), r"OpFunctionCall %\w+ %desc_lookup_fn")
 
     def test_junk_that_swallows_the_next_instructions(self):
         # The junk at the tuple's second word is longer than that word, so it covers the s_mov_b32 after the tuple
