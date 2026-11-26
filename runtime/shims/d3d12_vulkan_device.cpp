@@ -3067,14 +3067,25 @@ struct DeviceState {
     // hold what the CPU last put there, never what our GPU renders into the image, and a fill uploaded those old
     // bytes, in 64 KiB pieces as write-backs and neighbours' writes marked their tiles written. Under
     // title_texture_mutex.
-    std::map<std::uint64_t, std::pair<std::uintptr_t, std::uintptr_t>> gpu_owned;
+    struct GpuOwned {
+        std::uint64_t address = 0;  // the registry address it was placed at
+        std::uintptr_t begin = 0, end = 0;
+    };
+    std::map<const void*, GpuOwned> gpu_owned;  // by the GPU-written resource
     std::uint64_t gpu_owned_refusals = 0;
     bool over_gpu_owned(std::uintptr_t begin, std::uintptr_t end) const {
-        for (const auto& [key, range] : gpu_owned)
-            if (range.first < end && begin < range.second) return true;
+        for (const auto& [owner, range] : gpu_owned)
+            if (range.begin < end && begin < range.end) return true;
         return false;
     }
-    void add_gpu_owned(std::uint64_t key, std::uintptr_t cpu, std::uint64_t span);
+    void add_gpu_owned(const void* owner, std::uint64_t address, std::uintptr_t cpu, std::uint64_t span);
+    // The GPU-written resource is gone: the texture registered at its address (one kept there while the target
+    // covered it) is filled from memory again, and the T#s naming the address find it.
+    void drop_gpu_owned(const void* owner);
+    // T#s and slot-70 views at an address a GPU-written texture covers: resolved to its image, and the other textures'
+    // that could not be, by why (bind_title_image, place_title_view). Logged by the title texture refresh.
+    enum { kOverTargetResolved, kOverTargetFormat, kOverTargetExtent, kOverTargetRange, kOverTargetKinds };
+    std::array<std::atomic<std::uint64_t>, kOverTargetKinds> over_gpu_target{};
     // Textures named by their first descriptor since the last refresh (Resource::note_shader_view; any thread, under
     // any lock: this one is a leaf).
     std::mutex titles_named_mutex;
@@ -13910,14 +13921,25 @@ bool title_xg_layout(const Resource& r, rt::xg_xs::Texture& out, std::array<std:
 // Whether the refresh fills the texture from memory, and so watches its pages: not a texture the GPU writes, not one
 // without a layout, and not a slot-133 texture whose layout is only guessed until the title maps it.
 // The watched textures over the new range stop being filled from memory.
-void DeviceState::add_gpu_owned(std::uint64_t key, std::uintptr_t cpu, std::uint64_t span) {
-    gpu_owned[key] = {cpu, cpu + span};
+void DeviceState::add_gpu_owned(const void* owner, std::uint64_t address, std::uintptr_t cpu, std::uint64_t span) {
+    gpu_owned[owner] = {address, cpu, cpu + span};
     std::vector<std::uint64_t> over;
     texture_watch.for_each_over(cpu, cpu + span, [&](std::uint64_t k) { over.push_back(k); });
     for (const std::uint64_t k : over) {
         const auto it = title_textures.find(k);
         if (it != title_textures.end() && over_gpu_owned(it->second->cpu, it->second->cpu + it->second->layout.layout.size))
             texture_watch.untrack(k);
+    }
+}
+
+void DeviceState::drop_gpu_owned(const void* owner) {
+    const auto it = gpu_owned.find(owner);
+    if (it == gpu_owned.end()) return;
+    const std::uint64_t address = it->second.address;
+    gpu_owned.erase(it);
+    for (const std::uint64_t at : {address, std::uint64_t(leonida::title_gpu_views::other_view(address))}) {
+        const auto t = at ? title_textures.find(at) : title_textures.end();
+        if (t != title_textures.end() && t->second->resource && t->second->resource != owner) index_texture(*t->second);
     }
 }
 
@@ -14000,8 +14022,8 @@ void DeviceState::title_texture_gone(const void* resource, std::uint64_t address
         if (it != title_textures.end() && it->second->resource == resource) {
             it->second->resource = nullptr;
             texture_watch.untrack(address);
-            gpu_owned.erase(address);
         }
+        drop_gpu_owned(resource);
         titles_gone.push_back({resource, address});
         titles_gone_pending.store(true, std::memory_order_release);
         return;
@@ -14015,10 +14037,10 @@ void DeviceState::title_texture_gone(const void* resource, std::uint64_t address
     const auto it = title_textures.find(address);
     if (it != title_textures.end() && it->second->resource == resource) {
         texture_watch.untrack(address);
-        gpu_owned.erase(address);
         it->second->resource = nullptr;
         title_textures.erase(it);
     }
+    drop_gpu_owned(resource);
 }
 
 void DeviceState::drain_titles_gone() {
@@ -14108,6 +14130,39 @@ const char* DeviceState::no_texture_reason_locked(const leonida::gfx10::Image& i
                                                                       : kTsharpNoTextureLow32Other;
 }
 
+// bind_title_image's binding of the T# to `r`'s image; false with the reason. descriptor_mutex held.
+bool bind_title_image_to(DeviceState& device, const leonida::gfx10::ImageWords& words, leonida::gfx10::Image image,
+                         const Resource& r, const char*& reason, leonida::ResourceId& sparse) {
+    namespace g = leonida::gfx10;
+    image.address = r.image_address();  // release this key with its actual owner
+    const D3D12_RESOURCE_DESC& d = r.desc();
+    const bool volume = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    const bool line = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+    const bool msaa = d.SampleDesc.Count > 1;
+    const UINT layers = volume ? 1 : d.DepthOrArraySize;
+    const bool type_fits = image.type == g::ImageType::image_3d ? volume
+                           : image.type == g::ImageType::image_1d ? line && image.layer_count == 1
+                           : g::multisampled(image.type)
+                               ? msaa && !volume && !line && image.samples == d.SampleDesc.Count
+                               : !volume && !line && !msaa;
+    if (!r.descriptor_image()) return reason = "the texture has no image", false;
+    if (!type_fits) return reason = "T# type or samples do not fit the texture", false;
+    if (!msaa && image.first_mip + image.mip_count > d.MipLevels) return reason = "T# names mips the texture lacks", false;
+    if (image.type == g::ImageType::cube && !(r.format() && layers >= 6))
+        return reason = "cube T# on fewer than six layers", false;
+    if (!volume && image.first_layer + image.layer_count > layers)
+        return reason = "T# names layers the texture lacks", false;
+    const bool storage = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !msaa &&
+                         r.aspects() == VK_IMAGE_ASPECT_COLOR_BIT;
+    reason = "no view for the T#'s format or range";  // unless set 0 has no room (bind_image)
+    if (!device.bind_image_locked(words, image, r.descriptor_image(), r.format(), r.aspects(), storage,
+                                  r.has_view_format_list(), r.uint_backed(), &reason))
+        return false;
+    r.note_shader_view();  // Include descriptors written directly into title heaps.
+    if (r.sparse_image()) sparse = r.id();
+    return true;
+}
+
 TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWords& words, const char** why) {
     namespace g = leonida::gfx10;
     const auto refuse = [why](const char* reason) {
@@ -14144,42 +14199,39 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
                                     ? nullptr : static_cast<const Resource*>(found->second);
         const auto matches = [&](const Resource& r) { return TitleGpuPlacements<Resource>::matches(image, r.desc()); };
         if (owner && by_low_bits && !matches(*owner)) owner = nullptr;
-        if (!owner || !matches(*owner)) {
-            const auto alias = leonida::title_gpu_views::other_view(image.address);
-            if (auto* candidate = device.gpu_placements.find(image.address, alias, matches)) owner = candidate;
+        // A GPU-written texture placed at the address (a render target, depth or UAV texture) answers before any
+        // other texture there: its image holds what the GPU rendered, and the title's pages under it do not, so a
+        // texture filled from them shows nothing the GPU drew. Compatible: the T#'s extent and samples, and mips and
+        // layers within the target's (TitleGpuPlacements::matches); the format is any the target's image takes a view
+        // in (bind_image_locked: its own, a castable one, or one of the same block size its view list allows). With
+        // none, the other texture answers as before (counted by reason in the title texture refresh's line).
+        const auto alias = leonida::title_gpu_views::other_view(image.address);
+        Resource* gpu = by_low_bits ? nullptr : device.gpu_placements.find(image.address, alias, matches);
+        const Resource* plain = owner && owner != gpu ? owner : nullptr;
+        if (gpu) {
+            owner = gpu;
+        } else if (plain && !by_low_bits) {
+            if (const Resource* any = device.gpu_placements.find(image.address, alias, [](const Resource&) { return true; })) {
+                const D3D12_RESOURCE_DESC& d = any->desc();
+                const bool extent = d.Width != image.width || d.Height != image.height ||
+                                    (d.SampleDesc.Count > 1) != g::multisampled(image.type);
+                ++device.over_gpu_target[extent ? DeviceState::kOverTargetExtent : DeviceState::kOverTargetRange];
+            }
         }
         if (!owner) {
             if (why) *why = device.no_texture_reason_locked(image);
             note_unknown_tsharp(words, image);
             return TitleImage::unknown;
         }
-        const Resource& r = *owner;
-        image.address = r.image_address();  // release this key with its actual owner
-        const D3D12_RESOURCE_DESC& d = r.desc();
-        const bool volume = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        const bool line = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
-        const bool msaa = d.SampleDesc.Count > 1;
-        const UINT layers = volume ? 1 : d.DepthOrArraySize;
-        const bool type_fits = image.type == g::ImageType::image_3d ? volume
-                               : image.type == g::ImageType::image_1d ? line && image.layer_count == 1
-                               : g::multisampled(image.type)
-                                   ? msaa && !volume && !line && image.samples == d.SampleDesc.Count
-                                   : !volume && !line && !msaa;
-        if (!r.descriptor_image()) return refuse("the texture has no image");
-        if (!type_fits) return refuse("T# type or samples do not fit the texture");
-        if (!msaa && image.first_mip + image.mip_count > d.MipLevels) return refuse("T# names mips the texture lacks");
-        if (image.type == g::ImageType::cube && !(r.format() && layers >= 6))
-            return refuse("cube T# on fewer than six layers");
-        if (!volume && image.first_layer + image.layer_count > layers)
-            return refuse("T# names layers the texture lacks");
-        const bool storage = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !msaa &&
-                             r.aspects() == VK_IMAGE_ASPECT_COLOR_BIT;
-        const char* unbound = "no view for the T#'s format or range";  // unless set 0 has no room (bind_image)
-        if (!device.bind_image_locked(words, image, r.descriptor_image(), r.format(), r.aspects(), storage,
-                                      r.has_view_format_list(), r.uint_backed(), &unbound))
-            return refuse(unbound);
-        r.note_shader_view();  // Include descriptors written directly into title heaps.
-        if (r.sparse_image()) sparse = r.id();
+        const char* reason = nullptr;
+        if (bind_title_image_to(device, words, image, *owner, reason, sparse)) {
+            if (owner == gpu && plain) ++device.over_gpu_target[DeviceState::kOverTargetResolved];
+        } else if (owner == gpu && plain) {
+            ++device.over_gpu_target[DeviceState::kOverTargetFormat];
+            if (!bind_title_image_to(device, words, image, *plain, reason, sparse)) return refuse(reason);
+        } else {
+            return refuse(reason);
+        }
     }
     if (sparse) device.context->note_shader_image(sparse);
     return TitleImage::bound;
@@ -16078,14 +16130,22 @@ public:
         texture->mark_title_texture();
         {
             std::lock_guard lock(state_.title_texture_mutex);
-            state_.gpu_owned.erase(address);
-            if (gpu_span) state_.add_gpu_owned(address, entry->cpu, gpu_span);
+            if (gpu_span) state_.add_gpu_owned(texture, address, entry->cpu, gpu_span);
             if (entry->gpu_written && !(address & 0xff) && texture->image_address() != address) {
                 std::lock_guard descriptors(state_.descriptor_mutex);
                 state_.gpu_placements.add(address, texture);
                 state_.note_texture_change(leonida::SlotChange::texture_added, address);
             }
             auto& slot = state_.title_textures[address];
+            if (entry->gpu_written && slot && slot->resource && !slot->owned && !slot->gpu_written) {
+                // A render target placed over a texture the title placed first: the texture keeps its entry (it is
+                // filled from memory again once the target goes, drop_gpu_owned), and its T#s are bound again, to
+                // the target's image where they fit (bind_title_image).
+                std::lock_guard descriptors(state_.descriptor_mutex);
+                state_.forget_image_views_locked(slot->resource->image_address());
+                ++title_stats_.registered;
+                return;
+            }
             if (slot && slot->owned) retire_title_texture(*slot);
             state_.index_texture(*entry);
             slot = std::move(entry);
@@ -16333,6 +16393,19 @@ public:
                          static_cast<unsigned long long>(w.overflows - l.overflows), watch.textures(), watch.tiles(),
                          watch.unarmed(), double(stats.refresh_ns) * 1e-6 / double(stats.passes),
                          double(stats.max_refresh_ns) * 1e-6);
+            // Views and T#s at an address a render target (depth, UAV) texture covers, since the start: resolved to
+            // its image, or left on the other texture because its image takes no view in that format, or because the
+            // extent or samples, or the mips or layers, differ (a reinterpretation of the tiled bytes, no image view).
+            const auto& o = state_.over_gpu_target;
+            std::fprintf(stderr,
+                         "[rt] d3d12: textures over GPU-written memory: %llu views resolved to the GPU-written image; "
+                         "not resolved: %llu format, %llu extent or samples, %llu mips or layers; %llu textures not "
+                         "filled from it\n",
+                         static_cast<unsigned long long>(o[DeviceState::kOverTargetResolved].load()),
+                         static_cast<unsigned long long>(o[DeviceState::kOverTargetFormat].load()),
+                         static_cast<unsigned long long>(o[DeviceState::kOverTargetExtent].load()),
+                         static_cast<unsigned long long>(o[DeviceState::kOverTargetRange].load()),
+                         static_cast<unsigned long long>(state_.gpu_owned_refusals));
             title_watch_logged_ = w;
             if (leonida::fsdraw::enabled()) log_title_census("refresh");
             stats.passes = stats.checked = stats.busy = stats.changed = stats.unchanged = stats.filled_bytes = 0;
@@ -16671,11 +16744,16 @@ private:
         const auto it = textures.find(address);
         // An entry without a resource is one destroyed inside the registry, waiting for drain_titles_gone.
         TitleTexture* t = it == textures.end() || !it->second->resource ? nullptr : it->second.get();
-        if (!t || !TitleGpuPlacements<Resource>::matches(d, *t->resource)) {
-            if (Resource* gpu = matching_gpu_placement(d, address)) {
-                ++title_stats_.of_slot133;
-                return write_title_srv(*gpu, srv, destination, d, address);
+        // A GPU-written texture placed at the address with this description answers before the texture registered
+        // there (bind_title_image says why); with no view of it in the view's format, the registered one does.
+        if (Resource* gpu = matching_gpu_placement(d, address); gpu && (!t || t->resource != gpu)) {
+            ++title_stats_.of_slot133;
+            if (!t) return write_title_srv(*gpu, srv, destination, d, address);
+            if (write_title_srv(*gpu, srv, destination, d, address)) {
+                ++state_.over_gpu_target[DeviceState::kOverTargetResolved];
+                return true;
             }
+            ++state_.over_gpu_target[DeviceState::kOverTargetFormat];
         }
         if (t && !t->owned) {  // the title's slot-133 texture
             ++title_stats_.of_slot133;
