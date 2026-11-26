@@ -1572,8 +1572,8 @@ bool watch_shadow_writes() {
 // A ShadowPages the fault handler knows of for its whole life: registered before it protects anything, removed once
 // its destructor has made every page writable again.
 // The geometry watch's cells as TitleTextureWatch uses them: the title texture refresh's own queue of written tiles,
-// and arming only while the write-fault handler is installed. A tile with a page not committed is not armed (a commit
-// that does not come through xmem would not be seen): its textures are looked at each refresh until it is.
+// and arming only while the write-fault handler is installed. Pages not committed are left as they are (xmem's commit
+// or mapping of them bumps the cell); a tile pinned for a kernel write is busy until the write ends.
 struct TitleTextureCells {
     using Cell = leonida::geometry_writes::Cell;
     leonida::geometry_writes::WriteQueue queue;
@@ -1583,13 +1583,13 @@ struct TitleTextureCells {
     TitleTextureCells& operator=(const TitleTextureCells&) = delete;
     Cell* acquire(std::uintptr_t tile) { return leonida::geometry_writes::acquire(tile); }
     void release(std::uintptr_t tile) { leonida::geometry_writes::release(tile); }
-    bool arm(std::uintptr_t tile, Cell& cell) {
-        for (std::uintptr_t at = tile; at < tile + leonida::geometry_writes::tile_size;) {
-            MEMORY_BASIC_INFORMATION m{};
-            if (!VirtualQuery(reinterpret_cast<const void*>(at), &m, sizeof m) || m.State != MEM_COMMIT) return false;
-            at = reinterpret_cast<std::uintptr_t>(m.BaseAddress) + m.RegionSize;
-        }
-        return leonida::geometry_writes::arm(tile, cell);
+    int arm(std::uintptr_t tile, Cell& cell) {
+        bool pinned = false;
+        leonida::kernel_writes::for_each_pin(tile, tile + leonida::geometry_writes::tile_size,
+                                             [&](auto, auto) { pinned = true; });
+        if (pinned) return 0;
+        // Refused otherwise: a write raced the arming (it is in the queue), or VirtualQuery or VirtualProtect failed.
+        return leonida::geometry_writes::arm(tile, cell) ? 1 : -1;
     }
     void aliases(std::uintptr_t tile, std::vector<std::uintptr_t>& out) {
         if (const auto f = leonida::geometry_writes::aliases.load(std::memory_order_acquire)) f(tile, out);
@@ -16007,15 +16007,24 @@ public:
             const std::shared_ptr<TitleTexture> entry = it->second;
             TitleTexture& t = *entry;
             if (t.gpu_written || !t.layout_known) continue;
+            // Armed before it is read: a write from now on is in the next pass. A kernel write still in progress
+            // over it: read once it is done (its tile stays unarmed, so the next pass names it again).
+            if (watch.examine(key) == leonida::TitleTextureWatch<TitleTextureCells>::Look::busy) {
+                ++stats.busy;
+                continue;
+            }
             ++stats.checked;
-            watch.examine(key);  // armed before it is read: a write from now on is in the next pass
             const auto fill_start = clock::now();
             const std::uint64_t uploaded = fill_title_texture(t);
             stats.fill_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - fill_start).count();
             if (uploaded) ++stats.changed;
             filled += uploaded;
-            // Not filled (no backing yet, a failed upload, memory not readable): looked at again next pass.
-            if (!uploaded && (t.stale || !t.hashed) && t.resource) watch.touch(key);
+            // Not filled: with no backing yet or after a failed upload it is looked at again next pass. Memory not
+            // readable yet waits for its mapping (xmem's change names it), except a texture the title mapped, whose
+            // pages may be committed under the pointer Map gave without xmem (the probe answers each pass). Its tiles
+            // are armed again then: pages committed since the last arming have no guard yet.
+            if (!uploaded && (t.stale || !t.hashed) && t.resource && (!t.memory.pending() || t.mapped))
+                watch.note_changed(t.cpu, t.cpu + t.layout.layout.size);
         }
         stats.filled_bytes += filled;
         stats.max_pass_bytes = std::max(stats.max_pass_bytes, filled);
@@ -16035,23 +16044,25 @@ public:
             const auto& w = watch.stats();
             const auto& l = title_watch_logged_;
             std::fprintf(stderr,
-                         "[rt] d3d12: title texture refresh: %llu passes, %llu textures looked at (%llu of them over "
-                         "memory not watched), %llu uploaded (%.1f MiB), %llu unchanged; %llu written tiles, %llu arms "
-                         "(%llu refused), %llu queue overflows; %zu textures over %zu tiles watched, %zu not armed; "
-                         "%.3f ms a pass, %.3f at most\n",
+                         "[rt] d3d12: title texture refresh: %llu passes, %llu textures looked at (%llu named over "
+                         "tiles not armed, %llu left for a kernel write in progress), %llu uploaded (%.1f MiB), %llu "
+                         "unchanged; %llu written tiles, %llu arms (%llu busy, %llu refused), %llu queue overflows; %zu "
+                         "textures over %zu tiles watched, %zu tiles not armed; %.3f ms a pass, %.3f at most\n",
                          static_cast<unsigned long long>(stats.passes), static_cast<unsigned long long>(stats.checked),
                          static_cast<unsigned long long>(w.unarmed_named - l.unarmed_named),
+                         static_cast<unsigned long long>(stats.busy),
                          static_cast<unsigned long long>(stats.changed), double(stats.filled_bytes) / 1048576.0,
                          static_cast<unsigned long long>(stats.unchanged),
                          static_cast<unsigned long long>(w.written_tiles - l.written_tiles),
                          static_cast<unsigned long long>(w.arms - l.arms),
+                         static_cast<unsigned long long>(w.arm_busy - l.arm_busy),
                          static_cast<unsigned long long>(w.arm_failures - l.arm_failures),
                          static_cast<unsigned long long>(w.overflows - l.overflows), watch.textures(), watch.tiles(),
                          watch.unarmed(), double(stats.refresh_ns) * 1e-6 / double(stats.passes),
                          double(stats.max_refresh_ns) * 1e-6);
             title_watch_logged_ = w;
             if (leonida::fsdraw::enabled()) log_title_census("refresh");
-            stats.passes = stats.checked = stats.changed = stats.unchanged = stats.filled_bytes = 0;
+            stats.passes = stats.checked = stats.busy = stats.changed = stats.unchanged = stats.filled_bytes = 0;
             stats.refresh_ns = stats.max_refresh_ns = stats.max_pass_bytes = 0;
         }
         inside.reset();
@@ -16068,7 +16079,7 @@ private:
         std::map<std::string, std::uint64_t> refused;  // why a view is a null view -> views
         std::uint64_t views = 0, null_views = 0, of_slot133 = 0, of_cache = 0, made = 0, retired = 0, registered = 0,
                       refusals = 0, written_ranges = 0, unmaps = 0, unreadable = 0, pending_views = 0;
-        std::uint64_t fills = 0, fill_bytes = 0, fill_failures = 0, unchanged = 0;
+        std::uint64_t fills = 0, fill_bytes = 0, fill_failures = 0, unchanged = 0, busy = 0;
         std::uint64_t staged_fills = 0, staged_ns = 0;
         // refresh_title_textures, since the last log line
         std::uint64_t passes = 0, checked = 0, hashed = 0, changed = 0, deferred = 0, filled_bytes = 0,
