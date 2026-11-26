@@ -194,6 +194,59 @@ int main() {
         pass();
         EXPECT(looks.size() == 1 && looks[0] == Watch::Look::unwatched);
     }
+    {  // two textures in one tile, one written: both are named (the fault is per tile), exactly one is read whole
+        FakeWatch f;
+        Watch w(f);
+        static std::uint8_t memory[3 * kTile];
+        const auto at = [&](std::uintptr_t a) { return memory + (a - base); };
+        const std::uintptr_t a = base + 0x1000, b = base + 0x9000;  // 16 KiB each, in tile 0
+        const std::uintptr_t c = base + kTile - 0x2000;              // 72 KiB, tiles 0 and 1
+        const std::uint64_t sa = 0x4000, sb = 0x4000, sc = 0x12000;
+        for (std::size_t i = 0; i < sizeof memory; ++i) memory[i] = std::uint8_t(i * 7 + 1);
+        const auto hash = [](const std::uint8_t* p, std::uint64_t n) {
+            std::uint64_t h = 1469598103934665603ull;
+            for (std::uint64_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
+            return h;
+        };
+        std::map<std::uint64_t, leonida::TilePieces> pieces;
+        const std::map<std::uint64_t, std::pair<std::uintptr_t, std::uint64_t>> range{
+            {1, {a, sa}}, {2, {b, sb}}, {3, {c, sc}}};
+        for (const auto& [k, r] : range) w.track(k, r.first, r.second);
+        unsigned whole = 0;
+        std::uint64_t compared = 0;
+        std::vector<std::uintptr_t> written;
+        const auto pass = [&] {
+            std::vector<std::uint64_t> read;
+            w.collect([&](std::uint64_t k) {
+                w.examine(k, &written);
+                const auto [cpu, span] = range.at(k);
+                auto& p = pieces[k];
+                if (p.valid_for(cpu, span) &&
+                    p.unchanged(written, [&](std::uintptr_t from, std::uint64_t n) -> std::optional<std::uint64_t> {
+                        compared += n;
+                        return hash(at(from), n);
+                    }))
+                    return;
+                ++whole;
+                read.push_back(k);
+                p.compute(cpu, span, at(cpu), hash);
+            });
+            return read;
+        };
+        EXPECT((pass() == V{1, 2, 3}));  // new: read whole
+        whole = 0;
+        compared = 0;
+        memory[b - base + 5] ^= 0xff;  // texture 2 written; the fault names tile 0 (textures 1, 2 and 3)
+        f.write(b + 5);
+        EXPECT((pass() == V{2}));
+        EXPECT(whole == 1);
+        EXPECT(compared == sa + sb + 0x2000);  // 1 and 3 hashed only their parts of tile 0
+        whole = 0;
+        memory[c - base + 0x3000] ^= 0xff;  // texture 3 written in tile 1: only 3 is named, and read
+        f.write(c + 0x3000);
+        EXPECT((pass() == V{3}));
+        EXPECT(whole == 1);
+    }
     {  // a lost queue names every texture once; untrack releases the tiles
         FakeWatch f;
         Watch w(f);

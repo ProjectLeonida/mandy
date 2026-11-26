@@ -1656,6 +1656,72 @@ int check_placed_view_map_changes(ID3D12Device* device) {
     return 0;
 }
 
+// A shader view of `texture`, as a draw would name it: a title texture is filled from its memory only once a
+// descriptor names it (the refresh's upload at first use). `heap` holds the descriptor; the caller keeps it.
+int name_texture(ID3D12Device* device, ID3D12Resource* texture, Ref<ID3D12DescriptorHeap>& heap) {
+    const char* who = "naming a title texture";
+    D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    EXPECT_HR(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap.p)), S_OK);
+    device->CreateShaderResourceView(texture, nullptr, heap->GetCPUDescriptorHandleForHeapStart());
+    return 0;
+}
+
+// A texture over the memory of a GPU-written texture (a render target placed at the same title pages) is not filled
+// from those pages: they hold what the CPU last wrote there, not what the GPU rendered, and an upload of them (in
+// 64 KiB pieces, as write-backs and neighbours' writes marked tiles written) showed blocks of older frames.
+int check_texture_over_render_target(ID3D12Device* device) {
+    const char* who = "texture over a render target's memory";
+    constexpr SIZE_T bytes = 4 * 65536;
+    void* pages = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    EXPECT(pages);
+    std::memset(pages, 0x11, bytes);
+    GpuReader gpu;
+    EXPECT(!gpu.init(device, 256));
+    D3D12_RESOURCE_DESC target{};
+    target.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    target.Width = 256;
+    target.Height = 256;
+    target.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    target.SampleDesc.Count = target.DepthOrArraySize = target.MipLevels = 1;
+    target.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    Ref<ID3D12Resource> rendered;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, target, 6, IID_PPV_ARGS(&rendered.p)), S_OK);
+    // A plain texture over the target's second 64 KiB, laid out linearly (the title's XG computer for its shape).
+    constexpr UINT width = 256, height = 256;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.Format = DXGI_FORMAT_R8_UNORM;
+    desc.SampleDesc.Count = desc.DepthOrArraySize = desc.MipLevels = 1;
+    leonida::title_xg_layouts::note({UINT(desc.Dimension), UINT(desc.Format), height, 1, 1, width}, 1);
+    auto* over = static_cast<std::uint8_t*>(pages) + 65536;
+    Ref<ID3D12Resource> texture;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, over, desc, 6, IID_PPV_ARGS(&texture.p)), S_OK);
+    void* mapped = nullptr;
+    EXPECT_HR(texture->Map(0, nullptr, &mapped), S_OK);
+    Ref<ID3D12DescriptorHeap> named;
+    EXPECT(!name_texture(device, texture.p, named));
+    ID3D12CommandList* lists[]{gpu.list.p};
+    std::array<std::uint8_t, width * height> pixels{};
+    for (unsigned pass = 1; pass <= 2; ++pass) {
+        std::memset(over, 0x40 + pass, 65536);  // a CPU write (a write-back of a GPU copy, say) of one 64 KiB piece
+        gpu.queue->ExecuteCommandLists(1, lists);
+        EXPECT_HR(gpu.queue->Signal(gpu.fence.p, pass), S_OK);
+        EXPECT_HR(gpu.fence->SetEventOnCompletion(pass, gpu.done), S_OK);
+        EXPECT(WaitForSingleObject(gpu.done, 30000) == WAIT_OBJECT_0);
+        EXPECT_HR(texture->ReadFromSubresource(pixels.data(), width, UINT(pixels.size()), 0, nullptr), S_OK);
+        EXPECT(std::none_of(pixels.begin(), pixels.end(), [&](auto value) { return value == 0x40 + pass; }));
+    }
+    texture->Unmap(0, nullptr);
+    texture.p->Release();
+    texture.p = nullptr;
+    rendered.p->Release();
+    rendered.p = nullptr;
+    VirtualFree(pages, 0, MEM_RELEASE);
+    return 0;
+}
+
 // A persistent Map can become readable without notifying xmem or calling Map a second time.
 int check_mapped_plane(ID3D12Device* device) {
     const char* who = "persistent slot-133 plane";
@@ -1675,6 +1741,8 @@ int check_mapped_plane(ID3D12Device* device) {
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 6, IID_PPV_ARGS(&texture.p)), S_OK);
     void* mapped = nullptr;
     EXPECT_HR(texture->Map(0, nullptr, &mapped), S_OK);
+    Ref<ID3D12DescriptorHeap> named;  // filled from memory once a descriptor names it
+    EXPECT(!name_texture(device, texture.p, named));
     EXPECT(mapped == pages);
     ID3D12CommandList* lists[]{gpu.list.p};
     std::array<std::uint8_t, size> pixels{};
@@ -1721,6 +1789,8 @@ int check_mapped_plane_first_use(ID3D12Device* device) {
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 6, IID_PPV_ARGS(&texture.p)), S_OK);
     void* mapped = nullptr;
     EXPECT_HR(texture->Map(0, nullptr, &mapped), S_OK);
+    Ref<ID3D12DescriptorHeap> named;  // filled from memory once a descriptor names it
+    EXPECT(!name_texture(device, texture.p, named));
     EXPECT(mapped == pages);
     EXPECT_HR(gpu.allocator->Reset(), S_OK);
     EXPECT_HR(gpu.list->Reset(gpu.allocator.p, nullptr), S_OK);
@@ -2295,6 +2365,8 @@ int check_mapped_bc_array(ID3D12Device* device) {
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 6, IID_PPV_ARGS(&texture.p)), S_OK);
     void* mapped = nullptr;
     EXPECT_HR(texture->Map(0, nullptr, &mapped), S_OK);
+    Ref<ID3D12DescriptorHeap> named;  // filled from memory once a descriptor names it
+    EXPECT(!name_texture(device, texture.p, named));
     EXPECT(mapped == pages);
     std::vector<std::uint64_t> columns;
     std::vector<std::vector<std::uint8_t>> patterns(x.mips * x.depth_or_array);
@@ -2387,6 +2459,7 @@ int main(int argc, char** argv) {
             failures += check_placed_view_map_changes(ours.p);
             failures += check_shared_bc_placements(ours.p);
             failures += check_mapped_plane(ours.p);
+            failures += check_texture_over_render_target(ours.p);
             failures += check_mapped_bc_array(ours.p);
         }
         {
