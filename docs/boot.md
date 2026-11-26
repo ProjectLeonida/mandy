@@ -83,8 +83,8 @@ fresh name or delete the old one. `LEONIDA_D3D12=vulkan` selects the Vulkan-back
 traces command lists, resources and pipelines; without it the layer uses the Windows D3D12 device, and the
 `[d3d12-trace]` lines are only what the Xbox-ABI proxy forwards (device creation, queue, fence and allocator
 calls), which `boot_trace.py` summarizes without complaint. A run on the Vulkan device prints
-`[rt] d3d12: Vulkan device: <name>`; check the log for it (a runtime built without the Vulkan headers accepts the
-variable and stays on the Windows device). Keep the traces out of the repository: they can quote whatever the game prints.
+`[rt] d3d12: Vulkan device: <name>`; check the log for it (a runtime built without the Vulkan headers stays on the Windows
+device and says so in one `[rt] d3d12_xs: LEONIDA_D3D12=vulkan is set, but ...` line). Keep the traces out of the repository: they can quote whatever the game prints.
 
 Useful switches:
 
