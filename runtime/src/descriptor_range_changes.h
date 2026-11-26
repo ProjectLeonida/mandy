@@ -13,7 +13,8 @@ struct DescriptorRanges {
         std::sort(ranges.begin(), ranges.end(), [](auto a, auto b) { return a.first < b.first; });
         size_t n = 0;
         for (auto r : ranges) {
-            if (n && r.first <= ranges[n-1].last)
+            if (r.first > r.last) continue;
+            if (n && (ranges[n-1].last == UINT64_MAX || r.first <= ranges[n-1].last + 1))
                 ranges[n-1].last = (std::max)(ranges[n-1].last, r.last);
             else ranges[n++] = r;
         }
