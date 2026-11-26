@@ -17,6 +17,7 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 | NVIDIA GeForce RTX 5070 Ti (Blackwell), subgroup 32..32 | NVIDIA 617.42, Vulkan 1.4.351, Windows 11 Pro 26300 | `21625bc` | 257/257 translated and valid (run_gpu_tests.py) | run via run_gpu_tests.py | 197/248 passed, 49 skipped, 2 failed (native); 229/248 passed, 17 skipped, 2 failed (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31) | [local note](../gpu-test-results/RTX5070Ti.txt) |
 | Apple M5 Pro (16-core GPU, Metal 4), subgroup 4..32 | MoltenVK 1.4.2 (Homebrew), Vulkan 1.4.357, macOS 26.7.3 (25G342) | `d42773d07` | 280/280 translated and valid | 175/219 pass, 39 skipped, 5 failed | 183/248 passed, 61 skipped, 4 failed (native); 214/248 passed, 30 skipped, 4 failed (`LEONIDA_W64_EMULATE=1`) | `cs_fma_fused` (known row), `cs_imgload_tfe`, `cs_imgload_d16_tfe` (pass with #291), `ps_imgatomic` flake (#543) | [local note](../gpu-test-results/AppleM5Pro.txt) |
 | NVIDIA GeForce RTX 3080 (Ampere, GA102, 10 GB GDDR6X), subgroup 32..32 | NVIDIA 580.178.04, Vulkan 1.4.312, Ubuntu 26.04 LTS | `d2cd6c0` | not run | not run | 197/248 passed, 49 skipped, 2 failed (native); 229/248 passed, 17 skipped, 2 failed (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31; see #280) | [local note](../gpu-test-results/RTX3080.txt) |
+| AMD Radeon Pro WX 9100 (Vega 10 / gfx900, GCN4; MI25 board), subgroup 64..64 | RADV, Mesa 26.2.6-arch3.1, Vulkan 1.4.354, CachyOS | `86dc3d8` | 300/300 translated and valid (minus text-only `cs_dpp_cmp`) | 158/234 passed, 74 skipped, 0 failed | 209/268 passed, 58 skipped, 0 failed (native and `LEONIDA_W64_EMULATE=1` alike); ctest 106/106 passed, 2 skipped | none — first GCN4 / 64-wide entry | [local note](../gpu-test-results/WX9100.txt) |
 
 ## AMD Radeon RX 9070 GRE — 2026-11-23
 
@@ -125,3 +126,45 @@ distribution's build. The full record, with every skip by name, is in
 
 AI-assisted (Claude Code): built `main` at `84347bb`, ran `build.py`, `check.py` and `run_gpu_tests.py` native and
 emulated on this GPU, and reran the tfe pair with #98 applied.
+
+## AMD Radeon Pro WX 9100 (MI25 flash) — 2026-11-26
+
+```
+GPU:        AMD Radeon Pro WX 9100 (Vega 10 / gfx900, GCN4, PCI 1002:6861), subgroup 64..64
+            A Radeon Instinct MI25 (Vega 10, 4096 SP, 16 GB HBM2 datacenter board) flashed
+            with a WX 9100 VBIOS, per the owner; lspci and vulkaninfo report the flashed name
+Driver:     RADV (Mesa 26.2.6-arch3.1), Vulkan 1.4.354 (conformance 1.4.5.3)
+Subgroup:   64..64 (minSubgroupSize 64, maxSubgroupSize 64; fixed-width GCN4 wavefronts,
+            no requiredSubgroupSizeStages)
+Memory:     16 GiB HBM2 (16368 MiB registered by amdgpu)
+OS:         CachyOS (Arch rolling), kernel 7.3.1-1-cachyos
+Commit:     86dc3d86ee55b343b61dc29847eeb0ee950bbea3 (main, 2026-11-26)
+Tools:      llvm-mc 23.1.4, SPIRV-Tools v2026.4, CMake 4.5.1 + Ninja 1.13.2, GCC 16.2.1,
+            Python 3.14.9
+run_gpu_tests.py: 277 shaders: 276 translated, 276 pass spirv-val (cs_dpp_cmp is text-only:
+            llvm-mc has no gfx1013 encoding for its DPP VOPC compare)
+            native:                 209/268 passed, 58 skipped, 0 failed
+            LEONIDA_W64_EMULATE=1:  209/268 passed, 58 skipped, 0 failed
+build.py:   300 shaders: 300 translated, 300 pass spirv-val (the default name list minus
+            cs_dpp_cmp; the 6 mesh fixtures need a DXBC container and are not built)
+check.py:   158 of 234 pass, 74 skipped, 0 failed
+ctest (Vulkan subset, Release): 106/106 passed, 0 failed, 2 skipped
+            (shader_library_corpus: needs the LEONIDA_SHADERS corpus; vk_sync_validation:
+            needs LEONIDA_VK_VALIDATION)
+Failed:     none
+Skipped:    27 32-lane-on-request (fixed 64-wide subgroups; the wave64 tests run natively),
+            5 no VK_EXT_mesh_shader + 1 mesh shading unavailable, 4 no
+            VK_KHR_fragment_shader_barycentric, 18 run by d3d12_*_test, 1 run by
+            w64_graphics.py, 1 needs the Windows D3D12 runtime, 1 PerVertexKHR
+```
+
+The first GCN4 / 64-wide-wavefront entry in this registry: the wave64 compute suite and
+`ps_w64x_readlane` (4096/4096 exact) run natively, and `LEONIDA_W64_EMULATE=1` is identical
+because the emulation path targets 32-wide subgroup devices. The #31/#892 tfe pair passes in
+both modes ("0 bad, texel(5,3) = 71"), and `ps_texoff*` passes because this RADV device
+exposes VK_KHR_maintenance8. The full record, with every skip by name, is in
+[`gpu-test-results/WX9100.txt`](../gpu-test-results/WX9100.txt).
+
+AI-assisted: built `main` at `86dc3d86e`, ran `run_gpu_tests.py` (native and emulated),
+`build.py`, `check.py` and the ctest Vulkan subset on this GPU. Synthetic tests only; no
+game files.
