@@ -25,6 +25,7 @@ def entries(cache):
     d = cache / "pipeline_cache.d"
     if not d.exists():
         return {}
+    require(d.is_dir(), "pipeline_cache.d is not a directory")
     out = {}
     for p in d.iterdir():
         require(re.fullmatch(r"cs-[0-9a-f]{16}\.bin", p.name) and p.is_file() and
@@ -45,7 +46,10 @@ def run(exe, root, device, strict):
         if label == "local-B":
             # Bring only B into a fresh process; no session or shared cache crosses this boundary.
             (cache / "pipeline_cache.d").mkdir()
-            src, = (root / "new-B" / "pipeline_cache.d").iterdir()
+            b_dir = root / "new-B" / "pipeline_cache.d"
+            srcs = list(b_dir.iterdir()) if b_dir.is_dir() else []
+            require(len(srcs) == 1 and srcs[0].is_file(), "new-B did not leave one journal file to copy")
+            src = srcs[0]
             shutil.copy2(src, cache / "pipeline_cache.d" / src.name)
         local_before = entries(cache)
         env = {k: v for k, v in os.environ.items() if not k.upper().startswith("LEONIDA_")}
@@ -57,7 +61,8 @@ def run(exe, root, device, strict):
         if label != "cold":
             env["LEONIDA_PIPELINE_JOURNAL_SEED_DIR"] = str(seed / "pipeline_cache.d")
         p = subprocess.run([str(exe)] + (["--second-shader"] if second else []),
-                           stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
                            cwd=cache, env=env, timeout=60)
         if p.returncode == 77:
             print("SKIP: the authored compute fixture is unsupported on this device")
@@ -77,7 +82,11 @@ def run(exe, root, device, strict):
         local = entries(cache)
         if label == "cold":
             require(len(local) == 1, "cold A was not journaled")
-            source, = (seed / "pipeline_cache.d").iterdir()
+            seed_dir = seed / "pipeline_cache.d"
+            seed_entries = list(seed_dir.iterdir()) if seed_dir.is_dir() else []
+            require(len(seed_entries) == 1 and seed_entries[0].is_file(),
+                    "cold A did not leave one seed journal file")
+            source = seed_entries[0]
             # Make an erroneous hourly LRU touch observable without making the probe depend on system time.
             old = time.time_ns() - 48 * 3600 * 10**9
             os.utime(source, ns=(old, old))
@@ -95,17 +104,31 @@ def run(exe, root, device, strict):
     return 0
 
 
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("executable", type=Path, help="built d3d12_compute_journal_test.exe")
+    parser.add_argument("--device", help="optional LEONIDA_VK_DEVICE selector")
+    parser.add_argument("--require-hit", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        exe = args.executable.resolve(strict=True)
+    except OSError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if not exe.is_file() or exe.name.lower() not in ("d3d12_compute_journal_test.exe", "d3d12_compute_journal_test"):
+        print(f"ERROR: expected the compute test executable, not {exe.name}", file=sys.stderr)
+        return 2
+    try:
+        with tempfile.TemporaryDirectory(prefix="leonida-authored-journal-") as tmp:
+            return run(exe, Path(tmp), args.device, args.require_hit)
+    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
     try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, ValueError, OSError):
         pass
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("executable", type=Path, help="built d3d12_compute_journal_test.exe")
-    parser.add_argument("--device", help="optional LEONIDA_VK_DEVICE selector")
-    parser.add_argument("--require-hit", action="store_true")
-    args = parser.parse_args()
-    exe = args.executable.resolve(strict=True)
-    require(exe.name.lower() == "d3d12_compute_journal_test.exe", "expected the compute test, not the game")
-    with tempfile.TemporaryDirectory(prefix="leonida-authored-journal-") as tmp:
-        raise SystemExit(run(exe, Path(tmp), args.device, args.require_hit))
+    raise SystemExit(main())
