@@ -8749,8 +8749,16 @@ public:
         device_.title_images.emplace(va_, this);
         title_image_registered_ = true;
     }
-    // No descriptors have been built for a newly materialized raw surface.
-    void set_raw_image_address(std::uint64_t address) { image_address_ = address; }
+    // No descriptors have been built for a newly materialized raw surface. Register the title
+    // VA so ~Resource forgets views later written for it.
+    void set_raw_image_address(std::uint64_t address) {
+        if (!image_ || !image_address_ || (address & 0xff)) return;
+        device_.forget_image(image_address_);
+        device_.forget_image(address);
+        image_address_ = address;
+        device_.note_image_address(image_address_, this);
+        DeviceState::trace_image(image_address_, id(), "registered");
+    }
 
     void use_texture_lease(void* data, std::size_t size, UINT layout) {
         if (!image_ || !data) return;
