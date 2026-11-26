@@ -15,7 +15,7 @@ This page collects the setup steps and the problems testers have run into so far
 
 - **Python 3.12+**, which `make_game.py` requires (it stops with "Python 3.12 or newer is needed" on an older one, so
   its tests fail there too). `scripts/run_gpu_tests.py` on its own runs on 3.10 or newer.
-- **`llvm-mc` with the AMDGPU target** (LLVM 21+). The official LLVM Windows release has no AMDGPU target. On
+- **`llvm-mc` with the AMDGPU target** (LLVM 21+ to assemble the test fixtures, 23+ for the `shaders` stage; see below). The official LLVM Windows release has no AMDGPU target. On
   Windows, use one of:
   - `scripts\build_llvm_mc.ps1`, which builds a native `llvm-mc.exe` (needs git and the Visual Studio C++ tools);
   - conda-forge's `llvm-tools` package, whose Windows build includes the AMDGPU target;

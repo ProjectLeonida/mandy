@@ -53,7 +53,7 @@ default stages leave `runtime` out (`check,shaders,assets,pipelines`).
 
 Notes:
 
-- **llvm-mc**: Debian and Ubuntu's `llvm-21` installs it only as `llvm-mc-21` and `/usr/lib/llvm-21/bin/llvm-mc`.
+- **llvm-mc**: the `shaders` stage needs LLVM 23 or newer, so install `llvm-23` where the distribution has it. Debian and Ubuntu's `llvm-21` installs `llvm-mc` only as `llvm-mc-21` and `/usr/lib/llvm-21/bin/llvm-mc`.
   With `LLVM_MC` unset the tools use the plain `llvm-mc` when it is on `PATH` and otherwise the newest of those
   versioned names (`tools/mc_command.py`). Set `LLVM_MC` to choose another one. The `shaders` stage needs LLVM 23+
   for its pipeline library: 21.1.8's listings of 840 of its 2,684 compute programs carry 79,490 undecodable words and
