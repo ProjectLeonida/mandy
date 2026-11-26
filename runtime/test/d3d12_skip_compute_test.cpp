@@ -142,8 +142,11 @@ int main(int argc, char** argv) {
     info.shader_dir = fixture.string();
     Ref<ID3D12Device> dev;
     if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&dev.p)))) return fail("create the layer's device");
+    // The pipeline states declare the 144-byte push-constant block; a device under that (128, the Vulkan minimum,
+    // as on some AMD iGPUs) refuses them, which is a device limit, not a wrong result: SKIP like the other
+    // d3d12_* tests that check device_push_constants_need_fallback (77 is the ctest skip code here).
     if (rt::d3d12::device_push_constants_need_fallback(dev.p)) {
-        std::printf("skip compute test needs 144 push-constant bytes; this GPU has %u\n",
+        std::printf("d3d12_skip_compute_test: skipped, the pipelines need 144 push-constant bytes and this GPU has %u\n",
                     rt::d3d12::device_max_push_constants_size(dev.p));
         return 77;
     }
