@@ -49,8 +49,10 @@
     Writable folder for everything the title writes (saves, caches). Default <OutDir>\overlay.
 
 .PARAMETER InputScript
-    LEONIDA_INPUT_SCRIPT: timed pad presses, seconds since the pad's first poll (button@seconds, comma-separated;
-    buttons a b x y start back lb rb up down left right). Sets LEONIDA_KEYBOARD_PAD=always. Builds older than
+    LEONIDA_INPUT_SCRIPT: pad presses, comma-separated. `button@seconds` (e.g. a@45) is timed from the pad's first
+    poll and goes to the runtime. `button@game=3+5` / `button@session=d+5` are state-relative: this harness watches
+    LEONIDA_PEEK (every LEONIDA_PEEK_SECONDS) and injects the key once that state has been seen for the delay
+    (buttons a b x y start back lb rb up down left right). Sets LEONIDA_KEYBOARD_PAD=always. Builds older than
     main @ 8146ef690 ignore a script longer than 63 characters. Default 'a@45,a@60,a@75,a@90'.
 
 .PARAMETER NoInput
@@ -224,6 +226,35 @@ if ($Shaders) {
     $problems.Add("no shader library: pass -Shaders <work>\shaders\spirv or set LEONIDA_SHADERS")
 }
 
+# ---------------------------------------------------------------------------------------------- input
+# Absolute entries (a@45) go to the runtime as before; state-relative ones (a@session=d+5, a@game=3+5)
+# are matched here against the LEONIDA_PEEK values and injected as keys once the state has been seen
+# for the delay. The parser/state matcher is tools/boot_input_script.py (unit-tested separately).
+$absoluteScript = $InputScript
+$statePlan = @()
+$InputPlanFile = Join-Path ([System.IO.Path]::GetTempPath()) ("leonida-input-plan-" + $Name + ".json")
+if ($InputScript) {
+    $inputPy = @(Resolve-Python $Python)
+    $stateLike = $InputScript -match '@(game|session)='
+    if (-not $inputPy.Count -and $stateLike) {
+        throw "state-relative LEONIDA_INPUT_SCRIPT needs Python (python or py -3 on PATH, or -Python): $InputScript"
+    }
+    if ($inputPy.Count) {
+        $parseArgs = @()
+        if ($inputPy.Count -gt 1) { $parseArgs += $inputPy[1..($inputPy.Count - 1)] }
+        $parseArgs += @("-I", (Join-Path $RepoRoot "tools\boot_input_script.py"), "parse", $InputScript, "--out", $InputPlanFile)
+        $ErrorActionPreference = "Continue"
+        $planOut = & $inputPy[0] @parseArgs 2>&1 | ForEach-Object { "$_" }
+        $parseExit = $LASTEXITCODE
+        $ErrorActionPreference = "Stop"
+        if ($parseExit -ne 0) { throw "tools/boot_input_script.py parse failed: $($planOut -join ' ')" }
+        $plan = ($planOut -join "`n") | ConvertFrom-Json
+        $absoluteScript = [string]$plan.absolute
+        $statePlan = @($plan.state)
+        if (@($plan.rejected).Count) { Write-Warning ("ignored input entries: " + (@($plan.rejected) -join ", ")) }
+    }
+}
+
 # ------------------------------------------------------------------------------------------ environment
 
 # Defaults: used only when this shell has not set the variable. They match the Linux harness (scripts/linux-boot/).
@@ -255,7 +286,7 @@ else {
 # Per-run values: always this script's (from its parameters), whatever the shell has.
 $perRun = [ordered]@{
     LEONIDA_CAPTURE      = $(if ($NoCapture) { "" } else { $Capture })
-    LEONIDA_INPUT_SCRIPT = $InputScript
+    LEONIDA_INPUT_SCRIPT = $absoluteScript
 }
 if ($Shaders) { $perRun["LEONIDA_SHADERS"] = $Shaders }
 if ($Stacks) { $perRun["LEONIDA_STACKS"] = $Stacks }
@@ -285,6 +316,7 @@ if (-not $DigestOnly) {
     Write-Output "[boot] gta6rt  $Runtime"
     Write-Output "[boot] out     $OutDir"
     foreach ($k in $bootEnv.Keys) { if ($bootEnv[$k] -ne "") { Write-Output ("[boot] env     {0}={1}" -f $k, $bootEnv[$k]) } }
+    if ($InputScript) { Write-Output ("[boot] input     absolute='{0}' state={1}" -f $absoluteScript, @($statePlan).Count) }
     Write-Output "[boot] command $(ConvertTo-ProcessArgument $Runtime) $argLine"
 }
 
@@ -300,6 +332,7 @@ if ($DryRun) { Write-Output "[boot] dry run: nothing launched"; exit $(if ($prob
 
 $verdict = "digest of an earlier run (-DigestOnly)"
 $exitCode = 0
+$proc = $null
 if (-not $DigestOnly) {
 
     # --------------------------------------------------------------------------------------------- the lock
@@ -349,10 +382,101 @@ if (-not $DigestOnly) {
             -RedirectStandardError $LogFile -RedirectStandardOutput $StdoutFile
         $handle = $proc.Handle   # keeps the exit code readable after the process ends
         $stopped = $false
-        if (-not $proc.WaitForExit($Seconds * 1000)) {
-            $stopped = $true
-            try { Stop-Process -Id $proc.Id -Force -Confirm:$false } catch { }
-            [void]$proc.WaitForExit(20000)
+        if (-not $statePlan.Count) {
+            if (-not $proc.WaitForExit($Seconds * 1000)) {
+                $stopped = $true
+                try { Stop-Process -Id $proc.Id -Force -Confirm:$false } catch { }
+                [void]$proc.WaitForExit(20000)
+            }
+        } else {
+            # State-relative input: watch the LEONIDA_PEEK values and inject a key once a state has been seen
+            # for its delay. The key path is the keyboard pad (GetAsyncKeyState), so LEONIDA_KEYBOARD_PAD=always
+            # is set above; no window focus is needed.
+            $watchStart = Get-Date
+            $deadline = $watchStart.AddSeconds($Seconds)
+            $seen = @{ game = $null; session = $null }
+            $fired = @{}
+            $watchPeekRx = [regex]'\[rt\] peek t=(\d+)s:(.*)$'
+            $watchValRx = [regex]'0x([0-9a-f]+)=([0-9a-f?]+)'
+            $keyMap = @{ a = 0x0D; b = 0x08; x = 0x58; y = 0x59; start = 0x1B; back = 0x09
+                         lb = 0x51; rb = 0x45; up = 0x26; down = 0x28; left = 0x25; right = 0x27 }
+            if (-not ("LeonidaKeys" -as [type])) {
+                Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+[StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+[StructLayout(LayoutKind.Explicit, Size = 40)] public struct INPUT { [FieldOffset(0)] public uint type; [FieldOffset(8)] public KEYBDINPUT ki; }
+public static class LeonidaKeys {
+    [DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(uint n, INPUT[] inputs, int cb);
+    public static void Key(ushort vk, bool down) {
+        INPUT[] input = new INPUT[1];
+        input[0].type = 1; // INPUT_KEYBOARD
+        input[0].ki.wVk = vk;
+        input[0].ki.dwFlags = down ? 0u : 2u; // KEYEVENTF_KEYUP
+        SendInput(1, input, Marshal.SizeOf(typeof(INPUT)));
+    }
+}
+"@
+            }
+            $dueArgs = @()
+            if ($inputPy.Count -gt 1) { $dueArgs += $inputPy[1..($inputPy.Count - 1)] }
+            $dueArgs += @("-I", (Join-Path $RepoRoot "tools\boot_input_script.py"), "due", "--plan", $InputPlanFile)
+            $fs = $null; $reader = $null
+            try {
+                $fs = [System.IO.File]::Open($LogFile, [System.IO.FileMode]::OpenOrCreate,
+                                             [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                $reader = New-Object System.IO.StreamReader($fs)
+                while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
+                    $line = $reader.ReadLine()
+                    if ($null -eq $line) { Start-Sleep -Milliseconds 100; continue }
+                    if (-not $line.Contains("[rt] peek t=")) { continue }
+                    $m = $watchPeekRx.Match($line)
+                    if (-not $m.Success) { continue }
+                    $game = $null; $session = $null
+                    foreach ($v in $watchValRx.Matches($m.Groups[2].Value)) {
+                        $rva = $v.Groups[1].Value; $val = $v.Groups[2].Value
+                        if ($rva -eq "7446510") { $game = $val }
+                        elseif ($rva -eq "98f828c" -and $val -ne "?") {
+                            $low = $val.PadLeft(16, '0').Substring(8).TrimStart('0')
+                            $session = $(if ($low) { $low } else { "0" })
+                        }
+                    }
+                    if ($null -eq $game -and $null -eq $session) { continue }
+                    $now = ((Get-Date) - $watchStart).TotalSeconds
+                    if ($null -ne $game -and $null -eq $seen.game) { $seen.game = $now }
+                    if ($null -ne $session -and $null -eq $seen.session) { $seen.session = $now }
+                    $call = $dueArgs + @("--now", [string]$now)
+                    if ($null -ne $game) { $call += @("--game", [string]$game) }
+                    if ($null -ne $session) { $call += @("--session", [string]$session) }
+                    if ($null -ne $seen.game) { $call += @("--seen-game", [string]$seen.game) }
+                    if ($null -ne $seen.session) { $call += @("--seen-session", [string]$seen.session) }
+                    if ($fired.Keys.Count) { $call += @("--fired", (($fired.Keys | ForEach-Object { [string]$_ }) -join ",")) }
+                    $ErrorActionPreference = "Continue"
+                    $out = & $inputPy[0] @call 2>&1 | ForEach-Object { "$_" }
+                    $ErrorActionPreference = "Stop"
+                    if ($LASTEXITCODE -ne 0) { Write-Warning "boot_input_script.py due failed: $($out -join ' ')"; continue }
+                    $dueList = ($out -join "`n") | ConvertFrom-Json
+                    if ($null -eq $dueList) { continue }
+                    foreach ($d in @($dueList)) {
+                        $button = [string]$d.button
+                        if (-not $keyMap.ContainsKey($button)) { continue }
+                        $vk = [uint16]$keyMap[$button]
+                        [LeonidaKeys]::Key($vk, $true)
+                        Start-Sleep -Milliseconds 300
+                        [LeonidaKeys]::Key($vk, $false)
+                        $fired[[int]$d.index] = $true
+                        Write-Output ("[boot] input     {0} at game={1} session={2} ({3:n1}s)" -f $button, $game, $session, $now)
+                    }
+                }
+            } finally {
+                if ($reader) { $reader.Dispose() }
+                if ($fs) { $fs.Dispose() }
+            }
+            if (-not $proc.HasExited) {
+                $stopped = $true
+                try { Stop-Process -Id $proc.Id -Force -Confirm:$false } catch { }
+                [void]$proc.WaitForExit(20000)
+            }
         }
         $ran = [int]((Get-Date) - $started).TotalSeconds
         $rc = $null
@@ -366,6 +490,8 @@ if (-not $DigestOnly) {
         $mutex.Dispose()
     }
 }
+
+if ($proc) { try { $proc.Dispose() } catch { } }   # close the redirect handles before the digest reads the log
 
 # -------------------------------------------------------------------------------------------- the digest
 
@@ -390,7 +516,7 @@ $presentOk = 0; $presentFailed = 0; $presses = 0
 $shaderLine = ""; $faults = New-Object System.Collections.Generic.List[string]
 $wrapped = 0
 if (Test-Path -LiteralPath $LogFile) {
-    foreach ($line in [System.IO.File]::ReadLines($LogFile)) {
+    foreach ($line in Get-Content -LiteralPath $LogFile) {
         if ($line.Contains("XboxPresentation::PresentX")) {
             if ($line.EndsWith(" ok")) { $presentOk++ } elseif ($line.EndsWith(" failed")) { $presentFailed++ }
             continue

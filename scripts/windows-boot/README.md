@@ -14,6 +14,9 @@ powershell -NoProfile -File scripts\windows-boot\boot.ps1 -DryRun -GameDir D:\GT
 # A 200 s boot with the default unattended presses (a@45,a@60,a@75,a@90).
 powershell -NoProfile -File scripts\windows-boot\boot.ps1 -Name first -Seconds 200 -GameDir D:\GTA6pkg -Shaders E:\leonida-work\shaders\spirv
 
+# State-relative presses: A 5 s after session=3 and after session=d, instead of fixed seconds.
+powershell -NoProfile -File scripts\windows-boot\boot.ps1 -Name state -Seconds 200 -GameDir D:\GTA6pkg -Shaders E:\leonida-work\shaders\spirv -InputScript "a@session=3+5,a@session=d+5"
+
 # Extra or changed switches: trailing KEY=VALUE arguments (KEY= removes one), as run-boot.sh takes them.
 powershell -NoProfile -File scripts\windows-boot\boot.ps1 -Name split -Seconds 120 LEONIDA_PRESENT_PLANE1=0 "LEONIDA_PEEK=<rva>,<rva>,<rva>"
 
@@ -40,7 +43,7 @@ Only when your shell has not set them already (`-DryRun` prints the final list):
 | `LEONIDA_PIPELINE_CACHE_DIR` | `<out>\pipeline-cache` | one warmed cache shared by every build you boot |
 | `LEONIDA_PEEK` / `_SECONDS` | the game-state and session-state RVAs from `LEONIDA_GAME_STATE_RVA` and `LEONIDA_SESSION_STATE_RVA` (measured locally, not kept here; unset: no peek) / `5` | game state and session state (low dword), the two numbers every RESULT reports |
 | `LEONIDA_DEVICE_FAULT` | `1` | on device loss: `VK_EXT_device_fault` info, checkpoints, last replay steps |
-| `LEONIDA_KEYBOARD_PAD` | `always` (with an input script) | keyboard as a pad even unfocused, so the script's presses arrive |
+| `LEONIDA_KEYBOARD_PAD` | `always` (with an input script) | keyboard as a pad even unfocused, so the script's and the harness's state-relative presses arrive |
 | `LEONIDA_CAPTURE_EVERY` / `_LIMIT` | `60` / `40` | a swapchain read-back every 60 presents, at most 40 |
 | `DISABLE_RTSS_LAYER`, `DISABLE_VULKAN_OBS_CAPTURE` | `1` | keep third-party Vulkan overlay layers out of the process |
 
@@ -48,6 +51,12 @@ Per run, from the parameters: `LEONIDA_SHADERS` (`-Shaders`), `LEONIDA_CAPTURE` 
 turns it off), `LEONIDA_INPUT_SCRIPT` (`-InputScript`, `-NoInput` for none), `LEONIDA_STACKS` (`-Stacks 30,60`: every
 thread's call chain at those seconds, unwound in-process, which works natively where `tools/re/mdmp_unwind.py`
 cannot walk Windows' own DLLs). Other `LEONIDA_*` variables in your shell pass through and are listed.
+
+`-InputScript` entries are `button@seconds` (the runtime's timed presses) or `button@game=<hex>+<delay>` /
+`button@session=<hex>+<delay>` (state-relative). The state-relative ones are matched by this harness against the
+`LEONIDA_PEEK` values (`0x7446510` game, low dword of `0x98f828c` session) and injected as keys through the keyboard
+pad (`SendInput`; no window focus needed), once the state has been seen for the delay. They make an A/B boot press in
+the same game state when startup timing shifts; the absolute form is unchanged.
 
 The command is `gta6rt --run <exe> --game-dir <game> --overlay <out>\overlay --trace <name>.jsonl --trace-d3d12`.
 The overlay takes everything the title writes, so the package folder can stay read-only.
