@@ -37,6 +37,16 @@ class TitleBufferWindows {
     static constexpr auto kRetryAfter = std::chrono::seconds(2);
     std::chrono::steady_clock::time_point failed_at_{};
     bool failed_ = false;
+    bool address_logged_ = false;
+    unsigned failure_lines_ = 0;
+    // The first failures of each block allocation, with the Vulkan call and its result (the count is in
+    // GeometryViews' line, `allocation failures`).
+    void note_block_failure(const char* call, VkResult result, VkDeviceSize bytes) {
+        if (failure_lines_ >= 4) return;
+        ++failure_lines_;
+        std::fprintf(stderr, "[rt] d3d12: title buffer block of %llu KiB: %s failed (VkResult %d)\n",
+                     static_cast<unsigned long long>(bytes >> 10), call, int(result));
+    }
     bool local_refused_ = false;  // device-local blocks refused once: host memory from then on
     // SystemMemory: where a device_local allocation goes instead (set_system_memory; GeometryViews from
     // LEONIDA_GEOMETRY_HOST).
@@ -102,6 +112,19 @@ class TitleBufferWindows {
     }
 
 public:
+    // Whether a block at device address `address` of `capacity` bytes can be named by shaders: its offset from
+    // heap_base (`base`, the arena's address), as a V#'s 48-bit base holds it. With `signed_offsets` (every loaded
+    // module sign-extends the base) any block within 2^47 of heap_base on either side; otherwise only one above it, at
+    // a positive offset below 2^47 (the range both decoder generations read alike).
+    static bool shader_reachable(VkDeviceAddress address, VkDeviceSize capacity, VkDeviceAddress base,
+                                 bool signed_offsets) {
+        constexpr std::uint64_t k47 = 1ull << 47;
+        if (!address || !capacity || capacity > k47) return false;
+        const std::uint64_t offset = address - base;  // mod 2^64: a block below heap_base is a negative offset
+        if (offset < k47) return capacity <= k47 - offset;
+        // Below heap_base: [offset, offset + capacity) must stay within [-2^47, 2^47).
+        return signed_offsets && offset >= ~(k47 - 1);
+    }
     // Where blocks asked for as device_local go: kDeviceLocal (Resizable BAR while the driver gives it, the default),
     // kSystemCached (host memory outside VRAM, write-back where the device offers it: what VIctory gives its copies
     // of title memory) or kSystemUncached (host memory outside VRAM, write-combined). The GPU reads the system-memory
@@ -206,7 +229,10 @@ public:
         info.size = b.capacity;
         info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         d.share(info);
-        if (vk.vkCreateBuffer(d.info.device, &info, nullptr, &b.buffer) != VK_SUCCESS) return failed();
+        if (const VkResult made = vk.vkCreateBuffer(d.info.device, &info, nullptr, &b.buffer); made != VK_SUCCESS) {
+            note_block_failure("vkCreateBuffer", made, b.capacity);
+            return failed();
+        }
         VkMemoryRequirements req{};
         vk.vkGetBufferMemoryRequirements(d.info.device, b.buffer, &req);
         if (req.size > remaining_cap) {
@@ -248,14 +274,20 @@ public:
                          static_cast<unsigned long long>(req.size >> 10));
         }
         void* host{};
-        if (b.memory && vk.vkBindBufferMemory(d.info.device, b.buffer, b.memory, 0) == VK_SUCCESS &&
-            vk.vkMapMemory(d.info.device, b.memory, 0, VK_WHOLE_SIZE, 0, &host) == VK_SUCCESS) {
+        VkResult bound = VK_ERROR_OUT_OF_DEVICE_MEMORY, mapped_result = VK_ERROR_MEMORY_MAP_FAILED;
+        if (!b.memory) note_block_failure("vkAllocateMemory (DeviceState::allocate)", bound, req.size);
+        else if ((bound = vk.vkBindBufferMemory(d.info.device, b.buffer, b.memory, 0)) != VK_SUCCESS)
+            note_block_failure("vkBindBufferMemory", bound, req.size);
+        else if ((mapped_result = vk.vkMapMemory(d.info.device, b.memory, 0, VK_WHOLE_SIZE, 0, &host)) != VK_SUCCESS)
+            note_block_failure("vkMapMemory", mapped_result, req.size);
+        if (b.memory && bound == VK_SUCCESS && mapped_result == VK_SUCCESS) {
             VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             address.buffer = b.buffer;
             b.address = vk.vkGetBufferDeviceAddress(d.info.device, &address);
             const auto biased = b.address - d.arena.address;
-            // A positive 47-bit offset works with both generations of the translated V# decoder.
-            if (b.address && biased < (1ull << 47) && b.capacity <= (1ull << 47) - biased) {
+            bool signed_offsets = false;
+            if constexpr (requires { d.vsharp_offsets_signed(); }) signed_offsets = d.vsharp_offsets_signed();
+            if (shader_reachable(b.address, b.capacity, d.arena.address, signed_offsets)) {
                 b.mapped = static_cast<std::uint8_t*>(host);
                 b.reserved_bytes = req.size;
                 b.free_ranges.emplace(0, b.capacity);
@@ -275,6 +307,14 @@ public:
                                  static_cast<unsigned long long>(blocks_.back().capacity >> 10),
                                  static_cast<unsigned long long>(biased));
                 return take(blocks_.back());
+            }
+            if (!address_logged_) {
+                address_logged_ = true;
+                std::fprintf(stderr, "[rt] d3d12: title buffer block refused: its device address 0x%llx is not within "
+                                     "reach of a V# base from heap_base 0x%llx (%s offsets; later ones are counted, "
+                                     "not logged)\n",
+                             static_cast<unsigned long long>(b.address),
+                             static_cast<unsigned long long>(d.arena.address), signed_offsets ? "signed" : "unsigned");
             }
             vk.vkUnmapMemory(d.info.device, b.memory);
         }

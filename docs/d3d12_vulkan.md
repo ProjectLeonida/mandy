@@ -886,7 +886,42 @@ The compute path, end to end:
   D3D-448); the compute bind point uses it.
 - **GPU address arena** (section 3.3, when the device has `bufferDeviceAddress`): one host-visible,
   device-addressable buffer, 256 MiB by default (`LEONIDA_ARENA_MB`, at most 4095 MiB, so every VA fits 32-bit
-  table pointers).
+  table pointers). `LEONIDA_ARENA_MB` bounds the address range; with sparse binding it is not memory.
+  - **Backing blocks** (`runtime/src/arena_backing.h`). Where the device has `sparseBinding`,
+    `sparseResidencyBuffer`, `residencyNonResidentStrict`, a sparse address space at least as large as the arena and
+    a queue with the sparse binding bit to spare (`pick_arena_bind_queue`: RADV's sparse-only family), the arena is a
+    sparse buffer and its memory comes in units bound in 2 MiB blocks: a block is bound when the first allocation
+    needs it, before the allocation is handed out, and unbound once its last allocation is released and the GPU has
+    passed the retire ticket of the release (`submitted_retire_ticket() + 1`, checked at the start of every
+    `ExecuteCommandLists` against `completed_retire_ticket()`), then its memory is freed. Binds go to that queue alone
+    and are waited for there, so a bind never sits behind a submission that waits for a fence the CPU signals later.
+  - **Only with signed V# offsets.** A driver can place a sparse buffer anywhere relative to ordinary ones: RADV
+    (Mesa 26.3.1, natively and under Wine) gives sparse buffers a range of their own 64 TiB above them
+    (0xffffc00100200000 against 0xffff800100010000), so with a sparse arena every buffer outside it (geometry copies,
+    title windows and shadows outside it, upload buffers) lies below heap_base, at a negative offset. A shader that
+    sign-extends a V#'s 48-bit base (docs/design.md, "Heap-relative buffer device addresses") reaches it, since RADV
+    hands out addresses from one 2^47 half of the 48-bit space, so any two lie within 2^47 of each other. One that
+    zero-extends does not. The device counts each loaded module's `vsharp_base_sign_extended` marker
+    (`VsharpBaseCensus`, `runtime/src/shader_library.h`) and logs
+    `V# bases: signed offsets from heap_base (N of N modules sign-extend)`. The arena is sparse only when every module
+    sign-extends (or `LEONIDA_IMPORT_BELOW_ARENA=1` says to read bases signed). With older modules it stays one
+    allocation and one line says why. `TitleBufferWindows::shader_reachable` checks every block made outside the
+    arena against the same range when it is made, and a block it refuses is logged with both addresses.
+    `d3d12_title_va_game_device` and `d3d12_geometry_views_game_device` run the title-memory tests on the device the
+    game makes (with the bind queue), so on RADV their windows and geometry copies are read through negative offsets.
+  - No allocation crosses a unit: one no larger than a block stays inside one block, a larger one takes whole blocks
+    of its own. So each allocation is one run of one mapping, and the CPU reaches an arena offset through
+    `DeviceState::arena_host()` (one table read; null, with a line, for a range without memory), or
+    `ArenaBacking::with_host()` for an offset the caller does not hold (value writes, `read_arena`). A D3D12 heap in the
+    arena lends its unit's memory to reserved resources' tiles at the heap's place in that unit.
+  - The block size is measured, not tuned: a world run had about 5,000 live arena allocations averaging 160 KiB
+    (790 MiB live, 990 MiB peak end, 4,095 MiB asked). 2 MiB is a multiple of the 64 KiB sparse page, keeps a 4 GiB
+    arena within the 4,096 memory objects some Windows drivers allow (2,048 at most, about 500 at that peak), and is
+    amdgpu's large page.
+  - Without those capabilities (llvmpipe: a 2 GiB sparse address space and one queue) one allocation backs the whole
+    arena, as before, through the same accessors. `arena_backing_test` (CPU) and `arena_sparse_gpu_test` (a real
+    device; skipped without sparse binding) check both. The arena's line at device release (and with a console
+    heap's log) reads `GPU address arena: bound N MiB now (peak P, U units of 2 MiB blocks, sparse)`.
   - It is also no larger than the device's `maxBufferSize` (Vulkan 1.3) and, counting the buffer's memory
     requirement, `maxMemoryAllocationSize` (Vulkan 1.1), whichever is smaller (`runtime/src/arena_size.h`). When a
     limit cuts the request, one log line names the limit and the size used. `arena_size_test` (CPU) checks the
@@ -1710,7 +1745,9 @@ The copies:
   (so dirty-page tracking for that refresh applies to both). Windows stay until the device goes, up to
   `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default). A window that
   cannot fit between the title's address reservations can use a separate mapped buffer. The buffer's device address
-  must fit as a positive 47-bit offset from the arena base. The same window cap and dirty-page refresh apply.
+  must lie within reach of a V# base from the arena base: a positive offset below 2^47, or, when every loaded shader
+  sign-extends the base, anywhere within 2^47 on either side (`TitleBufferWindows::shader_reachable`). The same
+  window cap and dirty-page refresh apply.
   `LEONIDA_STREAM_BUFFER_WINDOWS=0` requires the window to fit in the arena.
 - **What the GPU wrote goes back.** The same return copy serves slot-133 shadows (a buffer the driver would not
   import, a compute result the title reads again): the ranges are recorded through the alias of the buffer's pages and

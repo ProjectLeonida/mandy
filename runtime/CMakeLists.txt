@@ -2132,6 +2132,20 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_semaphore_lifetime COMMAND vk_semaphore_lifetime_test)
     set_tests_properties(vk_semaphore_lifetime PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   endif()
+  # The sparse GPU address arena on a real device: bound bytes follow the allocations, a released block stays bound
+  # until the submission that read it has retired, and binds go to a queue of their own (src/arena_backing.h).
+  add_executable(arena_sparse_gpu_test test/arena_sparse_gpu_test.cpp)
+  target_link_libraries(arena_sparse_gpu_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(arena_sparse_gpu_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  if(MSVC)
+    target_compile_options(arena_sparse_gpu_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME arena_sparse_gpu COMMAND arena_sparse_gpu_test)
+    set_tests_properties(arena_sparse_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  endif()
   # The AMD breadcrumbs (LEONIDA_DEVICE_MARKERS) on a real device: after a few dispatches and a wait, the queue's
   # started and finished markers hold the last dispatch's seq. SKIP without VK_AMD_buffer_marker.
   add_executable(vk_device_markers_test test/vk_device_markers_test.cpp)
@@ -3927,6 +3941,14 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_title_va_shadow PROPERTIES ENVIRONMENT "LEONIDA_TEST_CONSOLE_SHADOW=1;LEONIDA_GEOMETRY_MB=0" SKIP_RETURN_CODE 77)
       add_test(NAME d3d12_geometry_views COMMAND d3d12_title_va_test)
       set_tests_properties(d3d12_geometry_views PROPERTIES ENVIRONMENT "LEONIDA_GEOMETRY_MB=16" SKIP_RETURN_CODE 77)
+      # The same two on the device the game makes (create_vulkan_device_standalone, with the arena's bind queue): where
+      # the GPU can, the arena is sparse, and on RADV every buffer outside it then lies 64 TiB below heap_base, so
+      # title windows, shadows and geometry copies are reached through negative (sign-extended) V# offsets.
+      add_test(NAME d3d12_title_va_game_device COMMAND d3d12_title_va_test --game-device)
+      set_tests_properties(d3d12_title_va_game_device PROPERTIES ENVIRONMENT "LEONIDA_ARENA_MB=1024" SKIP_RETURN_CODE 77)
+      add_test(NAME d3d12_geometry_views_game_device COMMAND d3d12_title_va_test --game-device)
+      set_tests_properties(d3d12_geometry_views_game_device PROPERTIES
+                           ENVIRONMENT "LEONIDA_GEOMETRY_MB=16;LEONIDA_ARENA_MB=1024" SKIP_RETURN_CODE 77)
       set_tests_properties(d3d12_title_va PROPERTIES SKIP_RETURN_CODE 77)
       # Past LEONIDA_TITLE_WINDOWS_MB a view of the title's memory is never its raw VA (#1537): with no other backing it
       # is written zero-size, and a dispatch through it reads zeros.
@@ -4717,6 +4739,14 @@ if(TARGET Vulkan::Headers)
       target_compile_options(arena_blocks_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME arena_blocks COMMAND arena_blocks_test)
+    # The GPU address arena's backing blocks with fake hooks: placement, binding, unbinding after the release ticket,
+    # the constant-time accessor and the bind queue choice (src/arena_backing.h).
+    add_executable(arena_backing_test test/arena_backing_test.cpp)
+    target_link_libraries(arena_backing_test PRIVATE Vulkan::Headers)
+    if(WIN32 AND MSVC)
+      target_compile_options(arena_backing_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME arena_backing COMMAND arena_backing_test)
     # The mem probe's breakdown line: the tally by consumer, the owner scopes and the text (src/memory_breakdown.h).
     add_executable(memory_breakdown_test test/memory_breakdown_test.cpp)
     if(WIN32 AND MSVC)

@@ -745,6 +745,50 @@ int main() {
     CHECK(!library.load(dir.string(), &error) && !error.empty());  // refused, not thrown
     std::filesystem::remove_all(dir);
 
+    // The V# base marker (`vsharp_base_sign_extended` in each module's meta, VsharpBaseCensus): the device names a
+    // buffer below heap_base only when every loaded module, sub-indexes included, sign-extends the 48-bit base. One
+    // module without the marker (an older translation) makes the offsets unsigned again.
+    {
+        const auto root = dir / "vsharp_bases";
+        const auto write_index = [](const std::filesystem::path& folder, const std::string& modules) {
+            std::filesystem::create_directories(folder);
+            std::ofstream index(folder / "index.json", std::ios::binary);
+            index << "{" << modules << "}";
+        };
+        const auto module = [](const char* name, const char* marker) {
+            std::string out = "{\"stage\": \"cs\", \"fssm_sha256\": \"" + std::string(name) + "\"";
+            if (marker) out += ", \"vsharp_base_sign_extended\": " + std::string(marker);
+            return out + "}";
+        };
+        write_index(root, "\"a\": " + module("aa", "true") + ", \"b\": " + module("bb", "true"));
+        ShaderLibrary all_signed;
+        CHECK(all_signed.load(root.string(), &error));
+        CHECK(all_signed.vsharp_base_census().sign_extended == 2 && all_signed.vsharp_base_census().zero_extended == 0);
+        CHECK(all_signed.vsharp_base_census().signed_offsets());
+
+        // An absent marker and an explicit false are both the old zero extension.
+        write_index(root, "\"a\": " + module("aa", "true") + ", \"b\": " + module("bb", nullptr) + ", \"c\": " +
+                              module("cc", "false"));
+        ShaderLibrary mixed;
+        CHECK(mixed.load(root.string(), &error));
+        CHECK(mixed.vsharp_base_census().sign_extended == 1 && mixed.vsharp_base_census().zero_extended == 2);
+        CHECK(!mixed.vsharp_base_census().signed_offsets());
+
+        // An old module in a sub-index counts as well; loading again replaces the census.
+        write_index(root, "\"a\": " + module("aa", "true"));
+        write_index(root / "library", "\"l\": " + module("ll", nullptr));
+        ShaderLibrary old_sub_index;
+        CHECK(old_sub_index.load(root.string(), &error));
+        CHECK(old_sub_index.vsharp_base_census().total() == 2 && !old_sub_index.vsharp_base_census().signed_offsets());
+        std::filesystem::remove_all(root / "library");
+        CHECK(old_sub_index.load(root.string(), &error));
+        CHECK(old_sub_index.vsharp_base_census().total() == 1 && old_sub_index.vsharp_base_census().signed_offsets());
+
+        // Nothing loaded reads a base the old way.
+        CHECK(VsharpBaseCensus{}.signed_offsets());
+        std::filesystem::remove_all(root);
+    }
+
     // The descriptor-hash marker (`descriptor_hash` in each module's meta, descriptor_table.h): absent is bare fnv1a;
     // the census covers the root index and every sub-index, and the majority decides. LEONIDA_DESCRIPTOR_HASH overrides
     // in the device, through descriptor_hash_kind_from_env.

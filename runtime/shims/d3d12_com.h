@@ -103,6 +103,13 @@ struct VulkanDeviceInfo {
     std::uint32_t copy_family = UINT32_MAX;
     std::vector<VkQueue> compute_queues;
     std::vector<VkQueue> copy_queues;
+    // A queue of its own on which the GPU address arena binds and unbinds its memory blocks (src/arena_backing.h),
+    // so a bind never waits behind the title's work. Null: the arena is one allocation, as without sparse binding.
+    VkQueue arena_bind_queue = VK_NULL_HANDLE;
+    // VkPhysicalDeviceLimits::sparseAddressSpaceSize and VkPhysicalDeviceSparseProperties::residencyNonResidentStrict:
+    // a sparse arena must fit the first, and needs the second (an unbound block reads as zero).
+    VkDeviceSize sparse_address_space = 0;
+    bool residency_non_resident_strict = false;
     bool pipeline_creation_feedback = false;
     // Vulkan 1.3 pipelineCreationCacheControl, enabled: FAIL_ON_PIPELINE_COMPILE_REQUIRED asks a cache without a compile.
     // Implies core VkPipelineCreationFeedback, which then needs no extension.
@@ -387,6 +394,15 @@ bool device_sparse_buffer_tiles(ID3D12Device* device);
 
 // The size in bytes of the device's GPU address arena, or 0 without one. For tests.
 std::uint64_t device_arena_size(ID3D12Device* device);
+// The GPU address arena's memory: its size (address range), device address (heap_base), the bytes of memory bound
+// behind it now (all of it for one allocation), whether it binds memory as allocations need it (sparse), whether the
+// device could (sparse_capable), and whether V# bases are read as signed offsets (a buffer below heap_base is
+// reachable). All zero without an arena. For tests.
+struct ArenaMemoryState {
+    std::uint64_t size = 0, address = 0, bound = 0;
+    bool sparse = false, sparse_capable = false, signed_offsets = false;
+};
+ArenaMemoryState device_arena_memory(ID3D12Device* device);
 // Copies `bytes` of the device's GPU address arena at console VA `va` (what shaders read there: a heap's GPU copy,
 // the null slots after it) into `out`. False without an arena or when the range is not inside it. For tests.
 bool read_arena(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes);

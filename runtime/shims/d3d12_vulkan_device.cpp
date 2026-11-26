@@ -33,6 +33,7 @@
 #include "../src/arena_size.h"
 #include "../src/value_write_sink.h"
 #include "../src/address_guard.h"
+#include "../src/arena_backing.h"
 #include "../src/arena_blocks.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
@@ -176,13 +177,24 @@ bool address_guard_enabled() {
     return on;
 }
 
-// Matches the offset interpretation of the selected shader pack.
-bool signed_vsharp_offsets() {
+// LEONIDA_IMPORT_BELOW_ARENA=1: an import of title memory that the driver put below the arena is kept (and V# bases
+// are read as signed offsets whatever the shader pack says).
+bool import_below_arena() {
     static const bool on = [] {
         wchar_t value[2]{};
         return GetEnvironmentVariableW(L"LEONIDA_IMPORT_BELOW_ARENA", value, 2) == 1 && value[0] == L'1';
     }();
     return on;
+}
+
+// Set by the device from its shader library (create_arena): every loaded module sign-extends a V#'s 48-bit base
+// (leonida::VsharpBaseCensus), so a buffer below heap_base is named by its negative offset.
+std::atomic<bool> g_pack_signed_vsharp_offsets{false};
+
+// Matches the offset interpretation of the selected shader pack: a V# base is a signed 48-bit offset from heap_base
+// (any buffer within 2^47 of it, on either side) or an unsigned one (only buffers above it).
+bool signed_vsharp_offsets() {
+    return import_below_arena() || g_pack_signed_vsharp_offsets.load(std::memory_order_relaxed);
 }
 
 // The CBV/SRV/UAV slots a descriptor table declares: the end of its furthest range (D3D12 appends a range at
@@ -3132,7 +3144,7 @@ struct DeviceState {
         VkDeviceSize offset = 0;
         std::uint8_t* mapped{};
         if (arena_allocate(size, kTitleWindowAlign, offset, arena_buffer)) {
-            mapped = arena.mapped + offset;
+            mapped = arena_host(offset, size);
         } else if (leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::windows);
                    stream_windows() && external_windows.allocate(*this, size, offset, mapped)) {
             external_window_made.store(true, std::memory_order_release);
@@ -3376,7 +3388,7 @@ struct DeviceState {
     // allocated).
     bool resolve_title_memory(std::uint64_t va, std::uint64_t bytes, std::uint64_t& out) {
         out = va;
-        if (!arena.mapped || !context) return false;
+        if (!arena_ready() || !context) return false;
         if (context->knows_buffer_va(va)) return false;  // an upload or readback buffer's biased VA, say
         if (va < arena.size) {
             // Below the arena's size an address is an arena address unless the title's own memory is there (its
@@ -3674,21 +3686,29 @@ struct DeviceState {
     // past the end.
     leonida::value_sink::Landing write_arena_value(std::uint64_t va, const void* bytes, unsigned size) {
         using leonida::value_sink::Landing;
-        if (!arena.mapped || va >= arena.size) return Landing::elsewhere;
+        if (!arena_ready() || va >= arena.size) return Landing::elsewhere;
         std::uint64_t title_lo = 0, title_hi = 0;
         if (leonida::title_va_aliases().title_memory(va, title_lo, title_hi)) return Landing::elsewhere;
         if (!bytes || !size || va < arena.first || size > arena.size - va) return Landing::refused;
         // A sparse resource's memory is bound by the sparse pass, not by the arena's mapping.
         if (context && context->is_sparse_va(va)) return Landing::refused;
+        // The value names an arena address, not an allocation this code holds: the store runs under the backing's
+        // shared lock, so no reclaim frees the memory under it, and an address with no memory behind it is refused.
         // An aligned value in one store, so a reader never sees half of it.
-        if (size == 4 && !(va & 3))
-            std::atomic_ref(*reinterpret_cast<std::uint32_t*>(arena.mapped + va))
-                .store(*static_cast<const std::uint32_t*>(bytes), std::memory_order_relaxed);
-        else if (size == 8 && !(va & 7))
-            std::atomic_ref(*reinterpret_cast<std::uint64_t*>(arena.mapped + va))
-                .store(*static_cast<const std::uint64_t*>(bytes), std::memory_order_relaxed);
-        else
-            std::memcpy(arena.mapped + va, bytes, size);
+        const bool stored = arena.backing.with_host(va, size, [&](std::uint8_t* host) {
+            if (size == 4 && !(va & 3))
+                std::atomic_ref(*reinterpret_cast<std::uint32_t*>(host))
+                    .store(*static_cast<const std::uint32_t*>(bytes), std::memory_order_relaxed);
+            else if (size == 8 && !(va & 7))
+                std::atomic_ref(*reinterpret_cast<std::uint64_t*>(host))
+                    .store(*static_cast<const std::uint64_t*>(bytes), std::memory_order_relaxed);
+            else
+                std::memcpy(host, bytes, size);
+        });
+        if (!stored) {
+            note_unbacked_arena(va, size);
+            return Landing::refused;
+        }
         return Landing::landed;
     }
 
@@ -3701,9 +3721,8 @@ struct DeviceState {
     std::map<std::uintptr_t, std::uintptr_t> cpu_view_heaps;
     bool known_view_heap(std::uintptr_t addr) {
         std::lock_guard lock(visible_heap_mutex);
-        const auto mapped = reinterpret_cast<std::uintptr_t>(arena.mapped);
-        if (mapped && addr >= mapped && addr - mapped < arena.size) {
-            const auto off = addr-mapped;
+        std::uint64_t off = 0;
+        if (arena.backing.offset_of(reinterpret_cast<const void*>(addr), 1, off)) {
             auto visible = visible_heaps.upper_bound(off);
             if (visible != visible_heaps.begin()) {
                 --visible;
@@ -3735,11 +3754,14 @@ struct DeviceState {
             end = table_va + std::min<VkDeviceSize>(heap.end - table_va, VkDeviceSize(slots) * kDescriptorSize);
         }
         auto& aliases = leonida::title_va_aliases();
+        // The table is in a live shader-visible heap (visible_heaps), one arena allocation: one mapping.
+        std::uint8_t* const table = arena_host(table_va, end - table_va);
+        if (!table) return;
         // Slots the title wrote in its own backing of this heap, if it gave the heap one.
-        aliases.pull_descriptors(arena.mapped + table_va, std::size_t(end - table_va));
+        aliases.pull_descriptors(table, std::size_t(end - table_va));
         if (sampler) return;  // S# words describe sampling state. They have no buffer address to translate.
         for (VkDeviceSize at = table_va; at + 16 <= end; at += kDescriptorSize) {
-            auto* words = reinterpret_cast<std::uint32_t*>(arena.mapped + at);
+            auto* words = reinterpret_cast<std::uint32_t*>(table + (at - table_va));
             if (words[3] >> 30) continue;
             if (retry_nulled_table_slot(at, words, aliases)) continue;
             const std::uint32_t original[3] = {words[0], words[1], words[2]};
@@ -3835,7 +3857,10 @@ struct DeviceState {
         if (!(w0 | w1 | w2 | w3) || (w3 >> 30)) return false;  // null, or not a buffer V# (TYPE, dword 3 bits 30-31)
         const std::uint64_t base = std::uint64_t(w0) | (std::uint64_t(w1 & 0xFFFFu) << 32);
         std::uint64_t host{}, remaining{};
-        if (base < arena.size || (geometry.cap() && geometry.lookup(arena.address + base, host, remaining))) return false;
+        // A base already rewritten to a copy below heap_base holds the low 48 bits of a negative offset.
+        const std::uint64_t written = signed_vsharp_offsets() && (base & (1ull << 47)) ? base | ~((1ull << 48) - 1) : base;
+        if (base < arena.size || (geometry.cap() && geometry.lookup(arena.address + written, host, remaining)))
+            return false;
         const std::uint32_t stride = (w1 >> 16) & 0x3FFFu;
         const std::uint64_t span = std::uint64_t(w2) * (stride ? stride : 1);
         // A V# the layer wrote for one of its own buffers that the driver put below the arena (an upload buffer in
@@ -4112,11 +4137,16 @@ struct DeviceState {
     // dwords 32-33) is its device address. It is at most 4 GiB, so every VA fits the 32-bit descriptor-table
     // pointers some shaders use, and no larger than the device's maxBufferSize and maxMemoryAllocationSize
     // (src/arena_size.h). The first 64 KiB are never handed out, so no resource has VA 0.
+    // Its memory (src/arena_backing.h): with sparse binding, 2 MiB blocks bound as allocations need them and unbound
+    // once the GPU is past their last use; without, one allocation over the whole arena (`memory`). The CPU reaches
+    // an arena offset through arena_host() (or backing.with_host for an offset the caller does not hold), never by
+    // adding it to one base pointer: a sparse arena has no single mapping.
     struct Arena {
         VkBuffer buffer = VK_NULL_HANDLE;
         bool indirect_arguments = false;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        std::uint8_t* mapped = nullptr;
+        VkDeviceMemory memory = VK_NULL_HANDLE;  // without sparse binding only
+        leonida::ArenaBacking backing;
+        bool memory_type_known = false;
         VkDeviceAddress address = 0;
         VkDeviceSize size = 0;
         VkDeviceSize first = 0;  // the first offset handed out: below it are the null region and kArenaReserved
@@ -4209,18 +4239,76 @@ struct DeviceState {
         arena_report_suppressed(what);
     }
 
+    bool arena_ready() const { return arena.backing.ready(); }
+    // How the shaders read a V#'s 48-bit base: signed, a buffer outside the arena may lie on either side of heap_base
+    // within 2^47 (TitleBufferWindows::allocate); unsigned, only above it.
+    bool vsharp_offsets_signed() const { return signed_vsharp_offsets(); }
+    // The device could bind the arena's memory as it is used (create_arena): sparse binding and residency, strict
+    // non-resident reads, and a queue of its own for the binds.
+    bool arena_sparse_capable = false;
+
+    // The CPU address of [offset, offset + bytes) of the arena, inside an allocation the caller holds (its unit
+    // cannot go while it lives), in constant time (src/arena_backing.h). Null, with a rate-limited line, when no
+    // memory is behind that range or it crosses a backing unit: a caller's bug, never a silent write elsewhere.
+    std::uint8_t* arena_host(VkDeviceSize offset, VkDeviceSize bytes) {
+        std::uint8_t* host = arena.backing.host(offset, bytes);
+        if (!host) note_unbacked_arena(offset, bytes);
+        return host;
+    }
+    void note_unbacked_arena(VkDeviceSize offset, VkDeviceSize bytes) {
+        static std::atomic<std::uint64_t> refusals{0};
+        const std::uint64_t n = refusals.fetch_add(1, std::memory_order_relaxed);
+        if (n < 16 || !(n & (n - 1)))
+            std::fprintf(stderr, "[rt] d3d12: GPU address arena: no memory behind VA 0x%llx + 0x%llx; refused (%llu "
+                                 "so far)\n",
+                         static_cast<unsigned long long>(offset), static_cast<unsigned long long>(bytes),
+                         static_cast<unsigned long long>(n + 1));
+    }
+
+    // Unbinds and frees the arena's backing units whose last allocation is gone and whose release ticket the GPU has
+    // passed (src/arena_backing.h). Called at the start of every ExecuteCommandLists, holding nothing: the completed
+    // ticket is read first (it takes the submit lock), then the arena's lock is taken.
+    void reclaim_arena() {
+        if (!context || !arena.backing.sparse()) return;
+        {
+            std::lock_guard lock(arena.mutex);
+            if (!arena.backing.has_pending()) return;
+        }
+        const std::uint64_t completed = context->completed_retire_ticket();
+        std::lock_guard lock(arena.mutex);
+        arena.backing.reclaim(completed);
+    }
+
     // A zero-size range is refused: it would share its offset with the next range, and its release would collide
     // with that range's free entry. The fit test cannot wrap: free blocks lie inside the arena (below 4 GiB).
-    bool arena_allocate(VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& out, ArenaUse use) {
-        if (!bytes || bytes > arena.size) return false;
+    bool arena_allocate(VkDeviceSize asked, VkDeviceSize alignment, VkDeviceSize& out, ArenaUse use) {
+        if (!asked || asked > arena.size) return false;
         std::lock_guard lock(arena.mutex);
+        // With sparse binding no allocation crosses a backing unit: one larger than a block takes whole blocks of its
+        // own (src/arena_backing.h). arena_release rounds the same way.
+        const VkDeviceSize bytes = arena.backing.footprint(asked);
+        alignment = arena.backing.alignment(asked, alignment);
         // Not over a range of the title's own memory: the title's heap can lie below the arena's size, and a view
         // that names an address there must mean the title's bytes (TitleVaAliases::want_buffer). The walk holds no
         // iterator across this call, so a cut made under it cannot invalidate it (src/arena_blocks.h).
-        const bool found = arena.blocks.allocate(
+        bool found = arena.blocks.allocate(
             bytes, alignment,
-            [](std::uint64_t lo, std::uint64_t hi) { return leonida::title_va_aliases().title_overlap_end(lo, hi); },
+            [this](std::uint64_t lo, std::uint64_t hi) {
+                const std::uint64_t title = leonida::title_va_aliases().title_overlap_end(lo, hi);
+                const std::uint64_t unit = arena.backing.keep_out(lo, hi);
+                return std::max(title, unit);
+            },
             out);
+        // Memory behind it before anyone can name it: bound now if its block has none.
+        if (found && !arena.backing.acquire(out, bytes)) {
+            arena.blocks.release(out, bytes);
+            found = false;
+            if (arena_report_due())
+                std::fprintf(stderr, "[rt] d3d12: GPU address arena: no memory could be bound for a %llu KiB "
+                                     "allocation (%llu MiB bound)\n",
+                             static_cast<unsigned long long>(bytes >> 10),
+                             static_cast<unsigned long long>(arena.backing.stats().bound >> 20));
+        }
         if (!found) {
             ++arena.failures;
             if (arena.log)
@@ -4267,6 +4355,14 @@ struct DeviceState {
         std::lock_guard lock(arena.mutex);
         if (!arena.size) return;
         const double mib = 1.0 / (1 << 20);
+        const auto bound = arena.backing.stats();
+        std::fprintf(stderr,
+                     "[rt] d3d12: GPU address arena: bound %.1f MiB now (peak %.1f, %llu units of %.0f MiB blocks, %s), "
+                     "%llu binds, %llu unbind batches, %llu bind failures\n",
+                     bound.bound * mib, bound.peak_bound * mib, static_cast<unsigned long long>(bound.units),
+                     arena.backing.block() * mib, arena.backing.sparse() ? "sparse" : "one allocation",
+                     static_cast<unsigned long long>(bound.binds), static_cast<unsigned long long>(bound.unbinds),
+                     static_cast<unsigned long long>(bound.bind_failures));
         std::fprintf(stderr,
                      "[rt] d3d12: GPU address arena: peak end %.1f of %.1f MiB (%.1f%%), peak live %.1f MiB "
                      "(buffers %.1f, descriptor heaps %.1f of which null guards %.1f now, shaders %.1f, heaps %.1f), %llu "
@@ -4297,12 +4393,17 @@ struct DeviceState {
         }
     }
 
-    void arena_release(VkDeviceSize offset, VkDeviceSize bytes, ArenaUse use) {
-        if (!bytes) return;
+    void arena_release(VkDeviceSize offset, VkDeviceSize asked, ArenaUse use) {
+        if (!asked) return;
+        // Every submission made so far, and the one being recorded now, may name the range: its block is unbound only
+        // once the GPU is past the next ticket (as VulkanContext::defer_destroy). An atomic read: no lock is taken.
+        const std::uint64_t ticket = context ? context->submitted_retire_ticket() + 1 : 0;
         std::lock_guard lock(arena.mutex);
+        const VkDeviceSize bytes = arena.backing.footprint(asked);
         // The range is validated and merged before the live-byte counters move: a release of a range the arena never
         // had must not change them, and a double free must not count the bytes twice.
         const auto fault = arena.blocks.release(offset, bytes);
+        if (fault == leonida::ArenaBlocks::Fault::none) arena.backing.release(offset, bytes, ticket);
         if (fault != leonida::ArenaBlocks::Fault::outside_arena) {
             backing(arena.address + offset, bytes, offset, false);
             arena.in_use -= bytes;
@@ -4460,10 +4561,18 @@ struct DeviceState {
 
 
     // [start, start + bytes) of the arena, exactly. False when any of it is taken or past the arena.
-    bool arena_allocate_at(VkDeviceSize start, VkDeviceSize bytes, ArenaUse use) {
-        if (!bytes || start > arena.size || bytes > arena.size - start) return false;
+    bool arena_allocate_at(VkDeviceSize start, VkDeviceSize asked, ArenaUse use) {
+        if (!asked || start > arena.size || asked > arena.size - start) return false;
         std::lock_guard lock(arena.mutex);
-        if (!arena.blocks.allocate_at(start, bytes)) return false;
+        // At `start` exactly, rounded as arena_allocate rounds (so arena_release gives back the same bytes): it must lie
+        // in one unit, or over blocks that have none yet.
+        const VkDeviceSize bytes = arena.backing.footprint(asked);
+        if (bytes > arena.size - start) return false;
+        if (!arena.backing.placeable(start, bytes) || !arena.blocks.allocate_at(start, bytes)) return false;
+        if (!arena.backing.acquire(start, bytes)) {
+            arena.blocks.release(start, bytes);
+            return false;
+        }
         backing(arena.address + start, bytes, start, true);
         ++arena.allocations;
         arena.in_use += bytes;
@@ -4896,7 +5005,7 @@ struct DeviceState {
     // Gives the console heap at `console_va` a GPU view: `shader_va` is where shaders read it. False when there is
     // none (the heap then stays where only the CPU sees it, as without this).
     bool add_console_heap(std::uint64_t console_va, VkDeviceSize bytes, std::uint64_t& shader_va, bool resource_heap) {
-        if (!arena.mapped || !context || !bytes || console_va > UINTPTR_MAX - bytes) return false;
+        if (!arena_ready() || !context || !bytes || console_va > UINTPTR_MAX - bytes) return false;
         auto heap = std::make_unique<ConsoleHeap>();
         heap->console_va = console_va;
         heap->bytes = bytes;
@@ -4926,7 +5035,7 @@ struct DeviceState {
                     heap->input = heap->scratch.get();
                     heap->previous = heap->scratch.get() + bytes;
                     heap->shader_va = offset;
-                    heap->copy = arena.mapped + offset;
+                    heap->copy = arena_host(offset, size);
                     heap->guard = guard;
                     heap->imported = false;
                     in_arena = true;
@@ -4986,7 +5095,8 @@ struct DeviceState {
                              "a heap index past it reads the arena's next bytes; guard MiB",
                              int(guard >> 20));
                 heap->shader_va = offset;
-                heap->copy = arena.mapped + offset;
+                heap->copy = arena_host(offset, bytes + heap->guard);
+                if (!heap->copy) return false;
             }
             std::memset(heap->copy, 0, std::size_t(bytes + heap->guard));
             if (!heap->input) {
@@ -5252,9 +5362,9 @@ struct DeviceState {
     }
     // Where [to, to + n) is on the GPU: the arena, a title-window block outside it, or a shadow's own buffer.
     bool copy_destination(const std::uint8_t* to, std::size_t n, VkBuffer& buffer, VkDeviceSize& offset) {
-        if (arena.mapped && to >= arena.mapped && to + n <= arena.mapped + arena.size) {
+        if (std::uint64_t at = 0; arena.backing.offset_of(to, n, at)) {
             buffer = arena.buffer;
-            offset = VkDeviceSize(to - arena.mapped);
+            offset = at;
             return true;
         }
         if (external_windows.find_mapped(to, n, buffer, offset)) return true;
@@ -5862,7 +5972,7 @@ struct DeviceState {
     // header keeps no magic, so guarded shaders check nothing.
     bool create_address_guard() {
         namespace ag = leonida::address_guard;
-        if (!context || !arena.mapped || arena.size < ag::kGuardEnd) return false;
+        if (!context || !arena_ready() || arena.size < ag::kGuardEnd) return false;
         auto& vk = context->vk;
         guard.table = std::make_unique<ag::AddressGuardTable>();
         VkBufferCreateInfo create{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -5888,8 +5998,11 @@ struct DeviceState {
         VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         address.buffer = guard.buffer;
         const VkDeviceAddress table = vk.vkGetBufferDeviceAddress(info.device, &address);
-        auto* header = reinterpret_cast<ag::AddressGuardHeader*>(arena.mapped + ag::kGuardHeader);
-        std::memset(arena.mapped + ag::kGuardHeader, 0, std::size_t(ag::kGuardEnd - ag::kGuardHeader));
+        // Below arena.first: the arena's permanent head, always backed.
+        std::uint8_t* const guard_page = arena_host(ag::kGuardHeader, ag::kGuardEnd - ag::kGuardHeader);
+        if (!guard_page) return false;
+        auto* header = reinterpret_cast<ag::AddressGuardHeader*>(guard_page);
+        std::memset(guard_page, 0, std::size_t(ag::kGuardEnd - ag::kGuardHeader));
         header->limit = arena.size;
         header->table = table - arena.address;
         std::atomic_thread_fence(std::memory_order_release);
@@ -5967,7 +6080,8 @@ struct DeviceState {
                              guard.overflow_logged, guard.table->blocks_used());
             }
         }
-        auto* header = reinterpret_cast<ag::AddressGuardHeader*>(arena.mapped + ag::kGuardHeader);
+        auto* header = reinterpret_cast<ag::AddressGuardHeader*>(arena_host(ag::kGuardHeader, sizeof(ag::AddressGuardHeader)));
+        if (!header) return;
         const std::uint32_t refused = std::atomic_ref(header->refused).load(std::memory_order_relaxed);
         const auto now = std::chrono::steady_clock::now();
         if (refused != guard.refused_logged && now - guard.logged >= std::chrono::seconds(1)) {
@@ -6555,8 +6669,7 @@ struct DeviceState {
             std::uint64_t copy_differs = 0, copy_differs_unrebased = 0;
             // A copy lies in the arena; an import never does (its device address is outside the arena's).
             const std::uint8_t* copy =
-                p->shadowed && p->shader_va + p->slots * kDescriptorSize <= arena.size ? arena.mapped + p->shader_va
-                                                                                       : nullptr;
+                p->shadowed ? arena.backing.host(p->shader_va, p->slots * kDescriptorSize) : nullptr;
             for (std::size_t i = 0; i < p->slots; ++i) {
                 const auto* bytes =
                     reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(p->console_va + i * kDescriptorSize));
@@ -8040,7 +8153,7 @@ public:
                                  desc_.NumDescriptors, shadowed_);
             return;
         }
-        if ((desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
+        if ((desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena_ready()) {
             // A bindless-sized resource heap (64Ki slots or more: what a shader indexes directly) is followed by null
             // slots, as a console heap's copy is (DeviceState::heap_guard_bytes); a smaller one, or one the arena has
             // no room for with them, is not.
@@ -8057,7 +8170,7 @@ public:
                 return;
             }
             in_arena_ = true;
-            cpu_ = device.arena.mapped + arena_offset_;
+            cpu_ = device.arena_host(arena_offset_, bytes + guard_);
             std::memset(cpu_, 0, std::size_t(bytes + guard_));
             if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
                 std::lock_guard lock(device.visible_heap_mutex);
@@ -8345,14 +8458,14 @@ public:
         const bool host = cpu_visible();
         leonida::ResourceBinding binding{};  // a buffer: no image
         binding.size = desc_.Width;
-        const bool use_arena = !host && device_.arena.mapped;
+        const bool use_arena = !host && device_.arena_ready();
         if (use_arena && desc_.Width > device_.arena.size) return E_OUTOFMEMORY;
         // An otherwise valid committed buffer can outgrow the largest free slice. Give it its own
         // addressable VkBuffer below, so the title can still use its arena-relative GPU VA.
         if (use_arena && device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
                                                 arena_offset_, DeviceState::arena_buffer)) {
             in_arena_ = true;
-            std::memset(device_.arena.mapped + arena_offset_, 0, std::size_t(desc_.Width));
+            std::memset(device_.arena_host(arena_offset_, desc_.Width), 0, std::size_t(desc_.Width));
             va_ = arena_offset_;
             binding.va = va_;
             binding.buffer = device_.arena.buffer;
@@ -8639,7 +8752,7 @@ public:
         // logs the same wrap). Such an import is not used: the shadow buffer in the arena answers, as when the
         // import is refused. LEONIDA_IMPORT_BELOW_ARENA=1 keeps the import (for a shader library whose programs
         // sign-extend the address).
-        if (buffer_va_ && buffer_va_ < device_.arena.address && !signed_vsharp_offsets()) {
+        if (buffer_va_ && buffer_va_ < device_.arena.address && !import_below_arena()) {
             static std::atomic<int> logged{0};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
                 std::fprintf(stderr,
@@ -8709,10 +8822,10 @@ public:
         // any buffer of the layer's; the root views and V#s the layer writes for that VA name the arena offset
         // instead (src/title_va_alias.h), a VA below 4 GiB that a root view and a V#'s 48 bits both hold. The arena
         // is host-visible, so the per-submission copy writes it in place.
-        if (device_.arena.mapped && device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+        if (device_.arena_ready() && device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
                                                            arena_offset_, DeviceState::arena_buffer)) {
             in_arena_ = true;
-            shadow_ = device_.arena.mapped + arena_offset_;
+            shadow_ = device_.arena_host(arena_offset_, desc_.Width);
             device_.add_shadow(pages, shadow_, std::size_t(desc_.Width));
             mapped_ = address;
             va_ = reinterpret_cast<std::uintptr_t>(address);
@@ -8873,17 +8986,20 @@ public:
     // A placed buffer is a range of the heap's arena memory: it has no VkBuffer of its own and its console VA is
     // where it sits in the arena. The arena is host-visible, so an upload or readback place maps that same range.
     HRESULT create_placed_buffer(std::shared_ptr<const leonida::TileHeapAllocation> heap_range) {
-        if (!device_.arena.mapped) return E_OUTOFMEMORY;
+        if (!device_.arena_ready()) return E_OUTOFMEMORY;
+        // Inside its heap's arena range, which is one allocation: one mapping.
+        std::uint8_t* const host = device_.arena_host(va_, desc_.Width);
+        if (!host) return E_OUTOFMEMORY;
         heap_range_ = std::move(heap_range);
-        if (cpu_visible()) mapped_ = device_.arena.mapped + va_;
-        std::memset(device_.arena.mapped + va_, 0, std::size_t(desc_.Width));  // a fresh place reads as zeroed
+        if (cpu_visible()) mapped_ = host;
+        std::memset(host, 0, std::size_t(desc_.Width));  // a fresh place reads as zeroed
         leonida::ResourceBinding binding{};
         binding.size = desc_.Width;
         binding.buffer = device_.arena.buffer;
         binding.indirect_arguments = device_.arena.indirect_arguments;
         binding.buffer_offset = va_;
         binding.va = va_;
-        binding.host = cpu_writable() ? device_.arena.mapped + va_ : nullptr;
+        binding.host = cpu_writable() ? host : nullptr;
         binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
                                  (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
                                   heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
@@ -10251,11 +10367,13 @@ bool DeviceState::materialize_table(std::uint64_t address, std::uint32_t slots) 
         return true;
     }
     const auto refreshed = std::min<std::uint64_t>(end-address, std::uint64_t(kViewScanLimit)*kDescriptorSize);
+    std::uint8_t* const table = arena_host(address, end-address);  // a live heap's table: one allocation
+    if (!table) return false;
     if (end-address>refreshed)
-        leonida::title_va_aliases().pull_descriptors(arena.mapped+address+refreshed,std::size_t(end-address-refreshed));
+        leonida::title_va_aliases().pull_descriptors(table+refreshed,std::size_t(end-address-refreshed));
     for (auto at=address; at<end; at+=kDescriptorSize) {
         leonida::DescriptorKey key{};
-        std::memcpy(key.data(),arena.mapped+at,sizeof(key));
+        std::memcpy(key.data(),table+(at-address),sizeof(key));
         if (leonida::gfx10::is_image(key) && !materialize_sample(key)) return false;
     }
     return true;
@@ -10269,14 +10387,24 @@ public:
 
     Heap(DeviceState& device, const D3D12_HEAP_DESC& desc) : device_(device), desc_(desc) {
         VkDeviceSize offset = 0;
-        if (device_.arena.mapped &&
+        leonida::ArenaBacking::Location place;
+        if (device_.arena_ready() &&
             device_.arena_allocate(desc_.SizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, offset,
                                    DeviceState::arena_heap)) {
+            // The heap is one arena allocation, so one backing unit: its tiles are that unit's memory, at the heap's
+            // place in it. A reserved resource binds them (vulkan_backend.h bind_tiles), so `offset` is the memory
+            // offset; the arena VA stays in arena_offset_.
+            if (!device_.arena.backing.locate(offset, desc_.SizeInBytes, place)) {
+                device_.note_unbacked_arena(offset, desc_.SizeInBytes);
+                device_.arena_release(offset, desc_.SizeInBytes, DeviceState::arena_heap);
+                return;
+            }
+            arena_offset_ = offset;
             allocation_ = std::shared_ptr<const leonida::TileHeapAllocation>(
-                new leonida::TileHeapAllocation{device_.arena.memory, offset, desc_.SizeInBytes,
+                new leonida::TileHeapAllocation{place.memory, place.memory_offset, desc_.SizeInBytes,
                                                 device_.arena.memory_type},
-                [&device](const leonida::TileHeapAllocation* allocation) {
-                    device.arena_release(allocation->offset, allocation->size, DeviceState::arena_heap);
+                [&device, offset](const leonida::TileHeapAllocation* allocation) {
+                    device.arena_release(offset, allocation->size, DeviceState::arena_heap);
                     delete allocation;
                 });
         }
@@ -10311,7 +10439,7 @@ public:
     // An existing heap: the caller's memory, not an arena range, so offset() is not a place in the arena.
     const void* host_address() const { return host_address_; }
     const std::shared_ptr<const leonida::TileHeapAllocation>& arena_range() const { return allocation_; }
-    VkDeviceSize offset() const { return allocation_->offset; }
+    VkDeviceSize offset() const { return arena_offset_; }  // the heap's arena VA (an arena heap only)
     UINT64 bytes() const { return desc_.SizeInBytes; }
     UINT64 alignment() const { return desc_.Alignment ? desc_.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; }
     const D3D12_HEAP_PROPERTIES& properties() const { return desc_.Properties; }
@@ -10364,6 +10492,7 @@ private:
     D3D12_HEAP_DESC desc_;
     const void* host_address_ = nullptr;
     std::shared_ptr<const leonida::TileHeapAllocation> allocation_;
+    VkDeviceSize arena_offset_ = 0;
     std::mutex backing_mutex_;
     std::shared_ptr<const leonida::TileHeapAllocation> tile_allocation_;
     bool placed_buffer_ = false;
@@ -11434,7 +11563,7 @@ public:
         }
         if (desc.NodeMask & ~1u) return E_INVALIDARG;
         if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags) return E_INVALIDARG;
-        if (!device_.arena.mapped) {
+        if (!device_.arena_ready()) {
             return stream_unsupported("pipelines need the GPU address arena (bufferDeviceAddress); stage", 1);
         }
         if (!push_constants_fit()) return stream_unsupported("graphics push-constant limit");
@@ -12152,7 +12281,8 @@ public:
         if (code_stage) {
             VkDeviceSize offset = 0;
             if (!device_.arena_allocate(code_stage->fssm.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
-            std::memcpy(device_.arena.mapped + offset, code_stage->fssm.data(), code_stage->fssm.size());
+            std::memcpy(device_.arena_host(offset, code_stage->fssm.size()), code_stage->fssm.data(),
+                        code_stage->fssm.size());
             code_bytes_ = code_stage->fssm.size();
             code_base_ = offset;
             graphics_.code_base = offset;
@@ -12197,7 +12327,7 @@ public:
         if (!desc.CS.pShaderBytecode || !desc.CS.BytecodeLength) return E_INVALIDARG;
         if (desc.NodeMask & ~1u) return E_INVALIDARG;
         if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags) return E_INVALIDARG;
-        if (!device_.arena.mapped) {
+        if (!device_.arena_ready()) {
             return stream_unsupported("pipelines need the GPU address arena (bufferDeviceAddress); stage", 0);
         }
         if (!push_constants_fit()) return stream_unsupported("compute push-constant limit");
@@ -12321,7 +12451,7 @@ public:
         if (entry->uses_code_base || !entry->code_base_known) {
             const auto& code = program.bytes;
             if (!device_.arena_allocate(code.size(), 256, code_base_, DeviceState::arena_shader)) return E_OUTOFMEMORY;
-            std::memcpy(device_.arena.mapped + code_base_, code.data(), code.size());
+            std::memcpy(device_.arena_host(code_base_, code.size()), code.data(), code.size());
             code_bytes_ = code.size();
             pipeline_.code_base = code_base_;
         }
@@ -14343,6 +14473,7 @@ public:
                 full = refreshed_present_.exchange(serial, std::memory_order_relaxed) != serial;
             }
             state_.drain_geometry_releases();
+            state_.reclaim_arena();
             state_.refresh_shadows(full || per_frame < 2, full);
             // LEONIDA_GEOMETRY_ASYNC=1 (for runs that only need the title to go on): the geometry copies are brought
             // up to date on a worker of ours, started here and not waited for, instead of on the title's GPU submit
@@ -14524,7 +14655,7 @@ public:
                     share.arena = true;
                     std::lock_guard lock(d.arena.mutex);
                     share.arena_reserved = d.arena.size;
-                    share.arena_bound = d.arena.size;  // one allocation behind the whole range
+                    share.arena_bound = d.arena.backing.stats().bound;
                     share.arena_in_use = d.arena.in_use;
                     for (std::size_t i = 0; i < share.arena_use.size(); ++i) share.arena_use[i] = d.arena.use_in_use[i];
                 }
@@ -14672,7 +14803,7 @@ public:
             info.queue_family < family_count && (families[info.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT);
         state_.sparse_image_tiles = sparse_aliasing && info.features.sparseResidencyImage2D &&
                                     state_.context->vk.vkGetImageSparseMemoryRequirements;
-        if (sparse_aliasing && state_.arena.memory && info.features.sparseResidencyBuffer) {
+        if (sparse_aliasing && state_.arena_ready() && info.features.sparseResidencyBuffer) {
             auto& vk = state_.context->vk;
             const auto sparse_info = state_.sparse_buffer_info(leonida::tile_size_in_bytes);
             VkBuffer sample = VK_NULL_HANDLE;
@@ -14926,11 +15057,49 @@ public:
             set = n > 0 && n < sizeof(text);
             if (set) std::fprintf(stderr, "[rt] d3d12: LEONIDA_ARENA_MB was read from the process environment, not the CRT's\n");
         }
-        const leonida::ArenaLimits limits{state_.info.max_buffer_size, state_.info.max_memory_allocation_size};
+        // A sparse buffer where the device can bind one on a queue of its own (src/arena_backing.h): memory is then
+        // bound in blocks as allocations need it, and maxMemoryAllocationSize bounds a block, not the arena. A device
+        // without it, or whose sparse address space is smaller than the arena (llvmpipe: 2 GiB), keeps one
+        // allocation behind the whole arena, reached through the same accessors.
+        //
+        // Every buffer outside the arena that a shader reaches (geometry copies, title windows and shadows outside it,
+        // upload and readback buffers) is named by its device address minus heap_base, in a V#'s 48 bits and in root
+        // views. A driver may place a sparse buffer anywhere relative to ordinary ones: RADV gives sparse buffers a
+        // range of their own 64 TiB above them (Mesa 26.3.1: 0xffffc00100200000 against 0xffff800100010000), so with a
+        // sparse arena every other buffer has a negative offset. Shaders that sign-extend the 48-bit base reach it
+        // (every address RADV hands out lies in one 2^47 half of the 48-bit space, so any two are within 2^47 of
+        // each other); older ones, which zero-extend, do not. So the arena is sparse only when every loaded module
+        // sign-extends (VsharpBaseCensus), and each block outside it is checked against that range when it is made.
+        leonida::VsharpBaseCensus bases{};
+        if (const leonida::ShaderLibrary* library = state_.library()) bases = library->vsharp_base_census();
+        g_pack_signed_vsharp_offsets.store(bases.signed_offsets(), std::memory_order_relaxed);
+        std::fprintf(stderr, "[rt] d3d12: V# bases: %s offsets from heap_base (%zu of %zu modules sign-extend)%s\n",
+                     signed_vsharp_offsets() ? "signed" : "unsigned", bases.sign_extended, bases.total(),
+                     import_below_arena() && !bases.signed_offsets() ? " (LEONIDA_IMPORT_BELOW_ARENA)" : "");
+        const bool sparse_capable = state_.info.arena_bind_queue && state_.info.features.sparseBinding &&
+                                    state_.info.features.sparseResidencyBuffer &&
+                                    state_.info.residency_non_resident_strict && vk.vkQueueBindSparse;
+        state_.arena_sparse_capable = sparse_capable;
+        if (sparse_capable && !signed_vsharp_offsets())
+            std::fprintf(stderr, "[rt] d3d12: GPU address arena: one allocation, not sparse: %zu of the %zu loaded "
+                                 "modules read a V# base unsigned, so no buffer may lie below the arena (translate the "
+                                 "shaders again to bind the arena's memory as it is used)\n",
+                         bases.zero_extended, bases.total());
+        const leonida::ArenaLimits sparse_limits{state_.info.max_buffer_size, 0};
+        const bool sparse =
+            sparse_capable && signed_vsharp_offsets() &&
+            leonida::decide_arena_size(set ? text : nullptr, sparse_limits).bytes <= state_.info.sparse_address_space;
+        const leonida::ArenaLimits limits =
+            sparse ? sparse_limits
+                   : leonida::ArenaLimits{state_.info.max_buffer_size, state_.info.max_memory_allocation_size};
         leonida::ArenaSize size = leonida::decide_arena_size(set ? text : nullptr, limits);
         auto& arena = state_.arena;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size.bytes;
+        if (sparse)
+            info.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT |
+                         // A D3D12 heap in the arena lends its blocks' memory to reserved resources' tiles too.
+                         (state_.info.features.sparseResidencyAliased ? VK_BUFFER_CREATE_SPARSE_ALIASED_BIT : 0);
         info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
@@ -14968,8 +15137,9 @@ public:
             }
         }
         // With Resizable BAR, keep the arena where its buffer may still use DEVICE_LOCAL | HOST_VISIBLE memory
-        // A large buffer can exclude that type, or require more bytes than its heap can hold.
-        if (leonida::resizable_bar(state_.memory)) {
+        // A large buffer can exclude that type, or require more bytes than its heap can hold. (A sparse arena's memory
+        // comes in blocks, which any heap holds.)
+        if (!sparse && leonida::resizable_bar(state_.memory)) {
             const VkDeviceSize asked = info.size;
             const VkDeviceSize fitted = leonida::device_local_arena_bytes(asked, [&](VkDeviceSize bytes) {
                 if (bytes == asked) return leonida::device_local_arena_fits(state_.memory, requirements);
@@ -14996,25 +15166,86 @@ public:
                                  "device's %s\n",
                          static_cast<unsigned long long>(size.bytes >> 20),
                          static_cast<unsigned long long>(size.requested >> 20), leonida::arena_cap_name(size.capped));
-        {
-            leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::arena);
-            arena.memory = state_.allocate(requirements, leonida::kArenaRequiredMemory,
-                                           leonida::kArenaPreferredMemory, nullptr, true, &arena.memory_type);
+        if (sparse) {
+            DeviceState* const st = &state_;
+            leonida::ArenaBackingHooks hooks;
+            // A unit's memory: the arena's memory type (the first unit picks it, as the one allocation did), with a
+            // device address, mapped once for its life.
+            hooks.make = [st, requirements](VkDeviceSize bytes, VkDeviceMemory& memory, std::uint8_t*& host) {
+                VkMemoryRequirements unit = requirements;
+                unit.size = bytes;
+                if (st->arena.memory_type_known) unit.memoryTypeBits &= 1u << st->arena.memory_type;
+                std::uint32_t type = 0;
+                {
+                    leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::arena);
+                    memory = st->allocate(unit, leonida::kArenaRequiredMemory, leonida::kArenaPreferredMemory,
+                                          nullptr, true, &type);
+                }
+                void* mapped = nullptr;
+                if (!memory) return false;
+                if (st->context->vk.vkMapMemory(st->info.device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+                    st->context->vk.vkFreeMemory(st->info.device, memory, nullptr);
+                    memory = VK_NULL_HANDLE;
+                    return false;
+                }
+                host = static_cast<std::uint8_t*>(mapped);
+                if (!st->arena.memory_type_known) {
+                    st->arena.memory_type = type;
+                    st->arena.memory_type_known = true;
+                }
+                return true;
+            };
+            hooks.destroy = [st](VkDeviceMemory memory) {
+                st->context->vk.vkFreeMemory(st->info.device, memory, nullptr);
+            };
+            // On the arena's own queue, which nothing else uses (VulkanDeviceInfo::arena_bind_queue): idle means
+            // this bind is done, so the range is bound (or unbound) before the allocation is handed out (or the
+            // memory freed). Under the arena's lock, the only place binds are made, which is the queue's external
+            // synchronisation.
+            hooks.bind = [st](const VkSparseMemoryBind* binds, std::uint32_t count) {
+                auto& f = st->context->vk;
+                const VkSparseBufferMemoryBindInfo buffer_binds{st->arena.buffer, count, binds};
+                VkBindSparseInfo bind{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+                bind.bufferBindCount = 1;
+                bind.pBufferBinds = &buffer_binds;
+                VkResult result = st->context->observe_result(
+                    f.vkQueueBindSparse(st->info.arena_bind_queue, 1, &bind, VK_NULL_HANDLE), "vkQueueBindSparse (arena)");
+                if (result == VK_SUCCESS)
+                    result = st->context->observe_result(f.vkQueueWaitIdle(st->info.arena_bind_queue),
+                                                         "vkQueueWaitIdle (arena binds)");
+                if (result == VK_ERROR_DEVICE_LOST) st->context->mark_device_lost();
+                return result == VK_SUCCESS;
+            };
+            if (!arena.backing.init_sparse(info.size, leonida::kArenaBlockBytes, std::move(hooks))) {
+                vk.vkDestroyBuffer(state_.info.device, arena.buffer, nullptr);
+                arena.buffer = VK_NULL_HANDLE;
+                return false;
+            }
+        } else {
+            {
+                leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::arena);
+                arena.memory = state_.allocate(requirements, leonida::kArenaRequiredMemory,
+                                               leonida::kArenaPreferredMemory, nullptr, true, &arena.memory_type);
+            }
+            void* mapped = nullptr;
+            if (!arena.memory ||
+                vk.vkBindBufferMemory(state_.info.device, arena.buffer, arena.memory, 0) != VK_SUCCESS ||
+                vk.vkMapMemory(state_.info.device, arena.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+                // Without an arena every buffer keeps its own memory; a leftover handle would make them addressable
+                // with heap base 0, so their VAs would be raw device addresses above 4 GiB.
+                vk.vkDestroyBuffer(state_.info.device, arena.buffer, nullptr);
+                if (arena.memory) vk.vkFreeMemory(state_.info.device, arena.memory, nullptr);
+                arena.buffer = VK_NULL_HANDLE;
+                arena.memory = VK_NULL_HANDLE;
+                return false;
+            }
+            arena.memory_type_known = true;
+            arena.backing.init_fixed(info.size, arena.memory, static_cast<std::uint8_t*>(mapped));
         }
-        void* mapped = nullptr;
-        if (!arena.memory || vk.vkBindBufferMemory(state_.info.device, arena.buffer, arena.memory, 0) != VK_SUCCESS ||
-            vk.vkMapMemory(state_.info.device, arena.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
-            // Without an arena every buffer keeps its own memory; a leftover handle would make them addressable
-            // with heap base 0, so their VAs would be raw device addresses above 4 GiB.
-            vk.vkDestroyBuffer(state_.info.device, arena.buffer, nullptr);
-            if (arena.memory) vk.vkFreeMemory(state_.info.device, arena.memory, nullptr);
-            arena.buffer = VK_NULL_HANDLE;
-            arena.memory = VK_NULL_HANDLE;
-            return false;
-        }
-        arena.mapped = static_cast<std::uint8_t*>(mapped);
-        std::fprintf(stderr, "[rt] d3d12: GPU address arena: %llu MiB (LEONIDA_ARENA_MB %s)\n",
-                     static_cast<unsigned long long>(info.size >> 20), set ? text : "unset");
+        std::fprintf(stderr, "[rt] d3d12: GPU address arena: %llu MiB of address range (LEONIDA_ARENA_MB %s), %s\n",
+                     static_cast<unsigned long long>(info.size >> 20), set ? text : "unset",
+                     sparse ? "sparse: memory bound in 2 MiB blocks as allocations need it"
+                            : "one allocation behind all of it");
         // LEONIDA_ARENA_NULL_MB=<n> (for compute-on boots): the first n MiB of the arena, at heap_base + 0, are zeroed
         // and never handed out, and the zero page and the quad indices move above them. A translated shader whose
         // address arithmetic starts from a null base (a scalar or flat load the translator does not bounds-check)
@@ -15027,9 +15258,28 @@ public:
             const VkDeviceSize bytes = VkDeviceSize(std::strtoull(text, nullptr, 10)) << 20;
             return bytes + kArenaReserved < info.size / 2 ? bytes : VkDeviceSize(0);
         }();
-        std::memset(arena.mapped, 0, std::size_t(null_bytes + kZeroPage));  // the null region and the zero page
+        // The head of the arena (the null region, the zero page, the quad indices and the address guard's page),
+        // which shaders read and nothing allocates: backed for the arena's life.
+        const VkDeviceSize head = std::max<VkDeviceSize>(null_bytes + kArenaReserved,
+                                                         address_guard_enabled() ? leonida::address_guard::kGuardEnd : 0);
+        std::uint8_t* head_host = nullptr;
         {
-            auto* indices = reinterpret_cast<std::uint32_t*>(arena.mapped + null_bytes + kZeroPage);
+            std::lock_guard lock(arena.mutex);
+            if (arena.backing.acquire(0, head, true)) head_host = arena.backing.host(0, head);
+        }
+        if (!head_host) {
+            std::fprintf(stderr, "[rt] d3d12: GPU address arena: no memory for its first %llu KiB\n",
+                         static_cast<unsigned long long>(head >> 10));
+            arena.backing.clear();
+            vk.vkDestroyBuffer(state_.info.device, arena.buffer, nullptr);
+            if (arena.memory) vk.vkFreeMemory(state_.info.device, arena.memory, nullptr);
+            arena.buffer = VK_NULL_HANDLE;
+            arena.memory = VK_NULL_HANDLE;
+            return false;
+        }
+        std::memset(head_host, 0, std::size_t(null_bytes + kZeroPage));  // the null region and the zero page
+        {
+            auto* indices = reinterpret_cast<std::uint32_t*>(head_host + null_bytes + kZeroPage);
             for (std::uint32_t i = 0; i < kQuadIndexCount; i += kQuadIndicesPerQuad) {
                 const std::uint32_t base = i / kQuadIndicesPerQuad * 4;
                 std::transform(leonida::quad_triangle_indices.begin(), leonida::quad_triangle_indices.end(), indices + i,
@@ -15045,18 +15295,18 @@ public:
         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
         arena.size = info.size;
         // The GPU address arena is the console's address space: the title names it by offset, so the label path
-        // has to find it (src/gpu_label_memory.h). Its address space starts at 0.
-        if (arena.mapped)
-            leonida::label::memory().track(0, static_cast<std::uintptr_t>(arena.size),
-                                           reinterpret_cast<std::uintptr_t>(arena.mapped), true);
+        // has to find it (src/gpu_label_memory.h). Its address space starts at 0. A label store to it goes through
+        // value_sink::arena (write_arena_value), which resolves the offset itself, so the region's allocation base is
+        // only its identity: the arena's device address, not a host pointer.
+        leonida::label::memory().track(0, static_cast<std::uintptr_t>(arena.size),
+                                       static_cast<std::uintptr_t>(arena.address), true);
         {
             // Under the arena's lock: an insert rebalances the tree and rewrites child links, which a walk on
             // another thread must not see half done.
             std::lock_guard lock(arena.mutex);
             // LEONIDA_ADDRESS_GUARD: the guard header and sinks at [0x70000, 0x80000) are never handed out either
             // (inside the null region when there is one, else just past the quad indices).
-            arena.first = std::max<VkDeviceSize>(null_bytes + kArenaReserved,
-                                                 address_guard_enabled() ? leonida::address_guard::kGuardEnd : 0);
+            arena.first = head;
             arena.blocks.reset(arena.first, arena.size);
             char check[2] = {};
             size_t check_length = 0;
@@ -15071,7 +15321,9 @@ public:
         length = 0;
         arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address, arena.size);
-        leonida::fsdraw::note_arena(arena.mapped, arena.size);  // LOCAL DIAGNOSTIC
+        leonida::fsdraw::note_arena(&state_, arena.size, [st = &state_](std::uint64_t va, void* out, std::size_t n) {
+            return st->arena.backing.with_host(va, n, [&](const std::uint8_t* host) { std::memcpy(out, host, n); });
+        });  // LOCAL DIAGNOSTIC
         leonida::fsdraw::backing_hook().store(&fsdraw_backing, std::memory_order_release);
         state_.context->set_zero_page(arena.buffer, null_bytes, kZeroPage);
         state_.context->set_quad_indices(arena.buffer, null_bytes + kZeroPage, kQuadIndexCount);
@@ -15079,7 +15331,7 @@ public:
         // until that submission's timeline value completes; a large indexed frame cannot wrap over itself.
         state_.context->set_geometry_provider([st=&state_](std::uint64_t va,std::uint64_t bytes,
                                                            leonida::VulkanContext::GeometryUpload& result) {
-            if (!va || !bytes || bytes>UINTPTR_MAX-va || !st->arena.mapped || bytes>st->arena.size) return false;
+            if (!va || !bytes || bytes>UINTPTR_MAX-va || !st->arena_ready() || bytes>st->arena.size) return false;
             std::uint64_t lo{},hi{};
             if (!leonida::title_va_aliases().title_memory(va,lo,hi) || bytes>hi-va) {
                 return false;
@@ -15100,8 +15352,9 @@ public:
             if (!st->arena_allocate(bytes,256,lease->offset,DeviceState::arena_buffer)) return false;
             lease->state=st;lease->bytes=bytes;
             SIZE_T copied{};
-            if (!ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<const void*>(va),st->arena.mapped+lease->offset,
-                                   SIZE_T(bytes),&copied) || copied!=bytes) return false;
+            std::uint8_t* const host=st->arena_host(lease->offset,bytes);
+            if (!host || !ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<const void*>(va),host,
+                                            SIZE_T(bytes),&copied) || copied!=bytes) return false;
             result={va,bytes,st->arena.buffer,lease->offset,std::move(lease)};
             return true;
         });
@@ -15176,9 +15429,13 @@ public:
         state_.report_arena();
         state_.destroy_address_guard();
         if (state_.context && state_.arena.buffer) {
-            leonida::fsdraw::forget_arena(state_.arena.mapped);
+            leonida::fsdraw::forget_arena(&state_);
             auto& vk = state_.context->vk;
             vk.vkDestroyBuffer(state_.info.device, state_.arena.buffer, nullptr);
+            {
+                std::lock_guard lock(state_.arena.mutex);
+                state_.arena.backing.clear();  // a sparse arena's blocks; the buffer that used them is gone
+            }
             if (state_.arena.memory) vk.vkFreeMemory(state_.info.device, state_.arena.memory, nullptr);
         }
         state_.finish_heavy_cache();
@@ -18847,7 +19104,7 @@ public:
             log_once((std::string("CreateHeap refused (") + why + "), heap type").c_str(), int(desc->Properties.Type));
             return E_INVALIDARG;
         }
-        if (!state_.arena.mapped) {
+        if (!state_.arena_ready()) {
             log_once("heaps need the GPU address arena (bufferDeviceAddress); heap size in KiB:",
                      int(desc->SizeInBytes / 1024));
             return E_NOTIMPL;
@@ -21116,6 +21373,24 @@ std::uint64_t device_arena_size(ID3D12Device* device) {
     return d ? d->state().arena.size : 0;
 }
 
+ArenaMemoryState device_arena_memory(ID3D12Device* device) {
+    if (!device) return {};
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    const Device* d = Device::from<Device>(real);
+    if (!d) return {};
+    auto& state = const_cast<DeviceState&>(d->state());  // the arena's mutex
+    ArenaMemoryState out;
+    std::lock_guard lock(state.arena.mutex);
+    out.size = state.arena.size;
+    out.address = state.arena.address;
+    out.bound = state.arena.backing.stats().bound;
+    out.sparse = state.arena.backing.sparse();
+    out.sparse_capable = state.arena_sparse_capable;
+    out.signed_offsets = state.vsharp_offsets_signed();
+    return out;
+}
+
 ImageMemoryStats image_memory_stats(ID3D12Device* device) {
     if (!device) return {};
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
@@ -21131,9 +21406,9 @@ bool read_arena(ID3D12Device* device, std::uint64_t va, void* out, std::size_t b
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     if (!real) real = device;
     const Device* d = Device::from<Device>(real);
-    if (!d || !d->state().arena.mapped || va > d->state().arena.size || bytes > d->state().arena.size - va) return false;
-    std::memcpy(out, d->state().arena.mapped + va, bytes);
-    return true;
+    // Any arena address (a diagnostic's): read under the backing's shared lock, refused where no memory is.
+    if (!d || !d->state().arena_ready()) return false;
+    return d->state().arena.backing.with_host(va, bytes, [&](const std::uint8_t* host) { std::memcpy(out, host, bytes); });
 }
 
 namespace {
@@ -21808,6 +22083,36 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
             queue_infos.push_back(q);
         }
     }
+    // The GPU address arena binds its memory blocks on a queue nothing else submits to (src/arena_backing.h): a bind
+    // then never waits behind a submission that waits for a fence the CPU signals later. A family with the sparse
+    // binding bit and a queue to spare, a sparse-only family first (RADV has one). None: the arena stays one
+    // allocation.
+    std::uint32_t arena_bind_family = UINT32_MAX, arena_bind_index = 0;
+    if (chosen_features.sparseBinding && chosen_features.sparseResidencyBuffer && chosen12.bufferDeviceAddress) {
+        std::vector<std::uint32_t> used(family_count, 0);
+        for (const auto& q : queue_infos) used[q.queueFamilyIndex] = q.queueCount;
+        const auto picked_bind = leonida::pick_arena_bind_queue(families.data(), family_count, used.data(),
+                                                                std::uint32_t(priorities.size()));
+        arena_bind_family = picked_bind.family;
+        arena_bind_index = picked_bind.index;
+        if (arena_bind_family != UINT32_MAX) {
+            bool listed = false;
+            for (auto& q : queue_infos)
+                if (q.queueFamilyIndex == arena_bind_family) {
+                    ++q.queueCount;
+                    listed = true;
+                }
+            if (!listed) {
+                VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+                q.queueFamilyIndex = arena_bind_family;
+                q.queueCount = 1;
+                q.pQueuePriorities = priorities.data();
+                queue_infos.push_back(q);
+            }
+        }
+    }
+    info.sparse_address_space = chosen.limits.sparseAddressSpaceSize;
+    info.residency_non_resident_strict = chosen.sparseProperties.residencyNonResidentStrict == VK_TRUE;
     VkPhysicalDeviceFeatures enable{};
     enable.sparseBinding = chosen_features.sparseBinding;
     enable.sparseResidencyBuffer = chosen_features.sparseResidencyBuffer;
@@ -22272,6 +22577,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         info.copy_queues.push_back(q);
     }
     info.queue = info.command_queues[0];
+    if (arena_bind_family != UINT32_MAX) get_queue(owned.device, arena_bind_family, arena_bind_index, &info.arena_bind_queue);
     info.max_push_constants_size = chosen.limits.maxPushConstantsSize;
     info.push_constants_need_fallback = (info.max_push_constants_size < 144);
     std::fprintf(stderr, "[rt] d3d12: Vulkan device: %s (maxPushConstantsSize: %u bytes)\n", chosen.deviceName,

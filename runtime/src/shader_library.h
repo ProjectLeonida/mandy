@@ -953,6 +953,19 @@ inline bool descriptor_hash_kind_from_env(const char* value, DescriptorHashKind*
     return false;
 }
 
+// How the loaded modules read a buffer V#'s 48-bit base (docs/design.md, "Heap-relative buffer device addresses"): a
+// module translated since the marker sign-extends it (index.json meta `"vsharp_base_sign_extended": true`), so a base
+// may name a buffer on either side of heap_base, within 2^47; an older module zero-extends it, so only a positive
+// offset below 2^48 reaches the right address. One zero-extending module is enough to forbid a negative offset: the
+// runtime has one heap_base and one V# encoding for every shader.
+struct VsharpBaseCensus {
+    std::size_t sign_extended = 0;
+    std::size_t zero_extended = 0;
+    std::size_t total() const { return sign_extended + zero_extended; }
+    // Every loaded module reads the base sign-extended (true with none loaded: nothing reads it the old way).
+    bool signed_offsets() const { return zero_extended == 0; }
+};
+
 class ShaderLibrary {
 public:
     // Reads <dir>/index.json, then the indexes of the programs make_game.py translates from the package's DLLs and the
@@ -1015,6 +1028,7 @@ public:
         exe_count_ = 0;
         descriptor_hash_census_ = {};
         descriptor_table_census_ = {};
+        vsharp_base_census_ = {};
         for (const char* folder : {"fspx", "fspx_gfx"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
@@ -1043,6 +1057,9 @@ public:
     DescriptorTableLayout descriptor_table_layout() const {
         return majority_descriptor_table_layout(descriptor_table_census_);
     }
+    // How the loaded modules read a V#'s 48-bit base: the device names buffers below heap_base (negative offsets) only
+    // when every one of them sign-extends it.
+    const VsharpBaseCensus& vsharp_base_census() const { return vsharp_base_census_; }
     // Entries loaded from <dir>/fspx/index.json and <dir>/library/index.json. A corpus of RPF containers never
     // reaches these: their programs come from FidelityFX DLLs and the pipeline library, so callers comparing reached
     // entries with size() must leave them out.
@@ -1223,6 +1240,7 @@ private:
             exe_count_ = 0;
             descriptor_hash_census_ = {};
             descriptor_table_census_ = {};
+            vsharp_base_census_ = {};
         }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
@@ -1325,6 +1343,11 @@ private:
                 ++descriptor_table_census_.tagged;
             else
                 ++descriptor_table_census_.plain;
+            // How this module reads a V#'s 48-bit base (VsharpBaseCensus). Absent is the old zero extension.
+            if (const Json* sx = meta.find("vsharp_base_sign_extended"); sx && sx->kind == Json::Kind::boolean && sx->boolean)
+                ++vsharp_base_census_.sign_extended;
+            else
+                ++vsharp_base_census_.zero_extended;
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
             if (by_fspx && (prefix == "fspx/" || prefix == "library/")) ++fspx_count_;
@@ -1349,6 +1372,7 @@ private:
     Entries fspx_entries_;
     DescriptorHashCensus descriptor_hash_census_;
     DescriptorTableCensus descriptor_table_census_;
+    VsharpBaseCensus vsharp_base_census_;
 };
 
 } // namespace leonida
