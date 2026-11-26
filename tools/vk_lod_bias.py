@@ -4,11 +4,13 @@ tools/vk_subgroup_info.py --lod-bias calls measure() for the device it picks and
 "explicit_lod_bias". The same MoltenVK 1.4.2 drops the sampler's bias on an Apple M3 and applies it on an Apple M5
 Pro (#1774), so the answer is measured, not looked up: a 4x4 R32_SFLOAT image gets 0.0 in level 0 and 1.0 in level 1
 (vkCmdClearColorImage), and one compute invocation samples it at explicit LOD 0 through a sampler with mipLodBias 0
-and one with +1 (nearest filters and mips, clamp to edge), writing both texels to a host-visible buffer.
+and one with +1 (nearest filters and mips, clamp to edge), plus once at explicit LOD 1 with no bias, writing the three
+texels to a host-visible buffer. The LOD 1 read is the control: it must return 1.0, or level 1 was never cleared (or
+mip selection is broken) and a biased 0.0 would not mean the bias was dropped.
 
-* plain 0.0, biased 1.0   -> False: the sampler applies the bias (rdna2spirv.py --explicit-lod-bias would count it twice)
-* plain 0.0, biased 0.0   -> True: the sampler drops it (translate with --explicit-lod-bias)
-* anything else, or any Vulkan error -> None, with the reason
+* plain 0.0, biased 1.0, level 1 1.0   -> False: the sampler applies the bias (--explicit-lod-bias would count it twice)
+* plain 0.0, biased 0.0, level 1 1.0   -> True: the sampler drops it (translate with rdna2spirv.py --explicit-lod-bias)
+* anything else, or any Vulkan error   -> None, with the reason
 
 The shader is SHADER_WORDS, compiled from this GLSL with glslangValidator -V -g0 --target-env vulkan1.0:
 
@@ -16,10 +18,11 @@ The shader is SHADER_WORDS, compiled from this GLSL with glslangValidator -V -g0
     layout(local_size_x = 1) in;
     layout(set = 0, binding = 0) uniform sampler2D plain;
     layout(set = 0, binding = 1) uniform sampler2D biased;
-    layout(set = 0, binding = 2) buffer Out { float r[2]; };
+    layout(set = 0, binding = 2) buffer Out { float r[3]; };
     void main() {
         r[0] = textureLod(plain, vec2(0.5), 0.0).r;
         r[1] = textureLod(biased, vec2(0.5), 0.0).r;
+        r[2] = textureLod(plain, vec2(0.5), 1.0).r;
     }
 
 Standard library only (ctypes); 64-bit struct layouts, as vk_subgroup_info.py. No game files.
@@ -28,16 +31,16 @@ import ctypes
 import struct
 
 SHADER_WORDS = (
-    0x07230203, 0x00010000, 0x0008000b, 0x00000027, 0x00000000, 0x00020011, 0x00000001, 0x0006000b, 0x00000001,
+    0x07230203, 0x00010000, 0x0008000b, 0x0000002d, 0x00000000, 0x00020011, 0x00000001, 0x0006000b, 0x00000001,
     0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0005000f, 0x00000005,
     0x00000004, 0x6e69616d, 0x00000000, 0x00060010, 0x00000004, 0x00000011, 0x00000001, 0x00000001, 0x00000001,
     0x00040047, 0x00000009, 0x00000006, 0x00000004, 0x00030047, 0x0000000a, 0x00000003, 0x00050048, 0x0000000a,
     0x00000000, 0x00000023, 0x00000000, 0x00040047, 0x0000000c, 0x00000021, 0x00000002, 0x00040047, 0x0000000c,
     0x00000022, 0x00000000, 0x00040047, 0x00000012, 0x00000021, 0x00000000, 0x00040047, 0x00000012, 0x00000022,
     0x00000000, 0x00040047, 0x0000001f, 0x00000021, 0x00000001, 0x00040047, 0x0000001f, 0x00000022, 0x00000000,
-    0x00040047, 0x00000026, 0x0000000b, 0x00000019, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002,
+    0x00040047, 0x0000002c, 0x0000000b, 0x00000019, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002,
     0x00030016, 0x00000006, 0x00000020, 0x00040015, 0x00000007, 0x00000020, 0x00000000, 0x0004002b, 0x00000007,
-    0x00000008, 0x00000002, 0x0004001c, 0x00000009, 0x00000006, 0x00000008, 0x0003001e, 0x0000000a, 0x00000009,
+    0x00000008, 0x00000003, 0x0004001c, 0x00000009, 0x00000006, 0x00000008, 0x0003001e, 0x0000000a, 0x00000009,
     0x00040020, 0x0000000b, 0x00000002, 0x0000000a, 0x0004003b, 0x0000000b, 0x0000000c, 0x00000002, 0x00040015,
     0x0000000d, 0x00000020, 0x00000001, 0x0004002b, 0x0000000d, 0x0000000e, 0x00000000, 0x00090019, 0x0000000f,
     0x00000006, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x0003001b, 0x00000010,
@@ -46,15 +49,18 @@ SHADER_WORDS = (
     0x00000014, 0x00000016, 0x00000015, 0x00000015, 0x0004002b, 0x00000006, 0x00000017, 0x00000000, 0x00040017,
     0x00000018, 0x00000006, 0x00000004, 0x0004002b, 0x00000007, 0x0000001a, 0x00000000, 0x00040020, 0x0000001c,
     0x00000002, 0x00000006, 0x0004002b, 0x0000000d, 0x0000001e, 0x00000001, 0x0004003b, 0x00000011, 0x0000001f,
-    0x00000000, 0x00040017, 0x00000024, 0x00000007, 0x00000003, 0x0004002b, 0x00000007, 0x00000025, 0x00000001,
-    0x0006002c, 0x00000024, 0x00000026, 0x00000025, 0x00000025, 0x00000025, 0x00050036, 0x00000002, 0x00000004,
-    0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x00000010, 0x00000013, 0x00000012, 0x00070058,
-    0x00000018, 0x00000019, 0x00000013, 0x00000016, 0x00000002, 0x00000017, 0x00050051, 0x00000006, 0x0000001b,
-    0x00000019, 0x00000000, 0x00060041, 0x0000001c, 0x0000001d, 0x0000000c, 0x0000000e, 0x0000000e, 0x0003003e,
-    0x0000001d, 0x0000001b, 0x0004003d, 0x00000010, 0x00000020, 0x0000001f, 0x00070058, 0x00000018, 0x00000021,
-    0x00000020, 0x00000016, 0x00000002, 0x00000017, 0x00050051, 0x00000006, 0x00000022, 0x00000021, 0x00000000,
-    0x00060041, 0x0000001c, 0x00000023, 0x0000000c, 0x0000000e, 0x0000001e, 0x0003003e, 0x00000023, 0x00000022,
-    0x000100fd, 0x00010038
+    0x00000000, 0x0004002b, 0x0000000d, 0x00000024, 0x00000002, 0x0004002b, 0x00000006, 0x00000026, 0x3f800000,
+    0x00040017, 0x0000002a, 0x00000007, 0x00000003, 0x0004002b, 0x00000007, 0x0000002b, 0x00000001, 0x0006002c,
+    0x0000002a, 0x0000002c, 0x0000002b, 0x0000002b, 0x0000002b, 0x00050036, 0x00000002, 0x00000004, 0x00000000,
+    0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x00000010, 0x00000013, 0x00000012, 0x00070058, 0x00000018,
+    0x00000019, 0x00000013, 0x00000016, 0x00000002, 0x00000017, 0x00050051, 0x00000006, 0x0000001b, 0x00000019,
+    0x00000000, 0x00060041, 0x0000001c, 0x0000001d, 0x0000000c, 0x0000000e, 0x0000000e, 0x0003003e, 0x0000001d,
+    0x0000001b, 0x0004003d, 0x00000010, 0x00000020, 0x0000001f, 0x00070058, 0x00000018, 0x00000021, 0x00000020,
+    0x00000016, 0x00000002, 0x00000017, 0x00050051, 0x00000006, 0x00000022, 0x00000021, 0x00000000, 0x00060041,
+    0x0000001c, 0x00000023, 0x0000000c, 0x0000000e, 0x0000001e, 0x0003003e, 0x00000023, 0x00000022, 0x0004003d,
+    0x00000010, 0x00000025, 0x00000012, 0x00070058, 0x00000018, 0x00000027, 0x00000025, 0x00000016, 0x00000002,
+    0x00000026, 0x00050051, 0x00000006, 0x00000028, 0x00000027, 0x00000000, 0x00060041, 0x0000001c, 0x00000029,
+    0x0000000c, 0x0000000e, 0x00000024, 0x0003003e, 0x00000029, 0x00000028, 0x000100fd, 0x00010038
 )
 
 u32, u64, f32, vp = ctypes.c_uint32, ctypes.c_uint64, ctypes.c_float, ctypes.c_void_p
@@ -254,7 +260,7 @@ def measure(vk, physical_device, extensions=()):
                                                               whole), "vkDestroyImageView")
         samplers = [make("vkCreateSampler", SamplerCreateInfo(31, None, 0, 0, 0, 0, 2, 2, 2, bias, 0, 1.0, 0, 0, 0.0,
                                                               1000.0, 0, 0), "vkDestroySampler") for bias in (0.0, 1.0)]
-        buffer = make("vkCreateBuffer", BufferCreateInfo(12, None, 0, 8, 0x20, 0, 0, None), "vkDestroyBuffer")
+        buffer = make("vkCreateBuffer", BufferCreateInfo(12, None, 0, 12, 0x20, 0, 0, None), "vkDestroyBuffer")
         breq = MemoryRequirements()
         vk.vkGetBufferMemoryRequirements(dev, buffer, ctypes.byref(breq))
         buffer_mem = make("vkAllocateMemory", MemoryAllocateInfo(5, None, breq.size,
@@ -317,8 +323,8 @@ def measure(vk, physical_device, extensions=()):
         fences = (u64 * 1)(fence)
         _check("vkWaitForFences", vk.vkWaitForFences(dev, 1, fences, 1, 10_000_000_000))
         mapped = ctypes.c_void_p()
-        _check("vkMapMemory", vk.vkMapMemory(dev, buffer_mem, 0, 8, 0, ctypes.byref(mapped)))
-        plain, biased = struct.unpack("<2f", ctypes.string_at(mapped, 8))
+        _check("vkMapMemory", vk.vkMapMemory(dev, buffer_mem, 0, 12, 0, ctypes.byref(mapped)))
+        plain, biased, level1 = struct.unpack("<3f", ctypes.string_at(mapped, 12))
         vk.vkUnmapMemory(dev, buffer_mem)
     except VkFailure as e:
         return None, str(e)
@@ -327,11 +333,17 @@ def measure(vk, physical_device, extensions=()):
             for call, handle in reversed(destroy):
                 getattr(vk, call)(dev, handle, None)
             vk.vkDestroyDevice(dev, None)
-    return verdict(plain, biased)
+    return verdict(plain, biased, level1)
 
 
-def verdict(plain: float, biased: float):
-    """The answer from the two texels: level 0 holds 0.0 and level 1 holds 1.0."""
+def verdict(plain: float, biased: float, level1: float):
+    """The answer from the three texels: level 0 holds 0.0 and level 1 holds 1.0.
+
+    `level1` is the control read at explicit LOD 1: unless it is 1.0, a biased 0.0 could come from a level 1 that was
+    never cleared rather than from a dropped bias, so there is no answer.
+    """
+    if level1 != 1.0:
+        return None, f"control read at LOD 1 gave {level1}, not 1.0 (level 1 not cleared or not selected)"
     if plain == 0.0 and biased == 1.0:
         return False, "the sampler applies mipLodBias (+1 reads level 1)"
     if plain == 0.0 and biased == 0.0:
