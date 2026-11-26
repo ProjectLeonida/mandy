@@ -30,9 +30,13 @@ except ImportError:   # run as a script
 # Vulkan format name -> FORMAT field value, per family. GFX12 renumbers again and is not built here.
 IMG_FORMATS = {
     "gfx10": {"R8G8B8A8_UNORM": 56, "R16G16B16A16_SFLOAT": 71, "R32G32B32A32_SFLOAT": 77, "R32_SFLOAT": 22,
-              "R8G8B8A8_UINT": 60, "R8G8B8A8_SINT": 61},
+              "R8G8B8A8_UINT": 60, "R8G8B8A8_SINT": 61,
+              "R8_UINT": 5, "R8_SINT": 6, "R16_UINT": 11, "R16_SINT": 12,
+              "R8G8_UINT": 18, "R8G8_SINT": 19, "R16G16_SINT": 28},
     "gfx11": {"R8G8B8A8_UNORM": 42, "R16G16B16A16_SFLOAT": 57, "R32G32B32A32_SFLOAT": 63, "R32_SFLOAT": 22,
-              "R8G8B8A8_UINT": 46, "R8G8B8A8_SINT": 47},
+              "R8G8B8A8_UINT": 46, "R8G8B8A8_SINT": 47,
+              "R8_UINT": 5, "R8_SINT": 6, "R16_UINT": 11, "R16_SINT": 12,
+              "R8G8_UINT": 18, "R8G8_SINT": 19, "R16G16_SINT": 28},
 }
 SQ_RSRC_IMG_2D = 9
 SEL_0, SEL_1, SEL_X, SEL_Y, SEL_Z, SEL_W = 0, 1, 4, 5, 6, 7   # SQ_SEL_*: DST_SEL values

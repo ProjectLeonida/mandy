@@ -7,7 +7,8 @@ for that T# format. A texel fetch is a memory read: no filtering, no borders, no
 
 What this covers today: 2D `image_load`, nonzero `dmask` values, `R8G8B8A8_UNORM`, `R16G16B16A16_SFLOAT`,
 `R32G32B32A32_SFLOAT` and `R32_SFLOAT`, at sizes that divide the 64x64 draw (8/16/32/64), every texel read
-at least once.
+at least once. `--op image_load_pck` / `image_load_pck_sgn` run on the hardware oracle only: the raw texel
+dwords, including texels under 4 bytes.
 
 Integer coverage uses 8-bit UINT/SINT sampled images (the translator reads them through uint/sint aliases of the
 sampled array) and converts loaded integers to exactly representable floats.
@@ -18,13 +19,16 @@ Oracles (--oracle translator|hw|translator,hw): translator (default) is the path
 compute kernels natively on the AMD GPU through tools/hw_oracle/ (docs/shader_validation.md, "Hardware oracle for the
 image fetches"): a linear texture in device memory, a T# built for the GPU's family (hw_oracle/tsharp.py: GFX11 on
 gfx11xx, GFX10 on gfx103x), `image_load ... dmask:.. dim:SQ_RSRC_IMG_2D unorm` for every texel, every result register
-stored and compared word for word with this file's CPU model. It tests the MODEL (and, with translator,hw, shows what
+stored and compared word for word with this file's CPU model. `--op` picks the fetch: `image_load` (default), or
+`image_load_pck` / `image_load_pck_sgn`, which return the raw texel dwords (no `unorm`) and which the CPU model
+`pck_oracle` covers, sub-4-byte texels included; the translator oracle does not translate them and is skipped.
+It tests the MODEL (and, with translator,hw, shows what
 the translator did on a case the hardware disagrees with). A local gfx1150 is RDNA3.5, not RDNA2: a match supports the
 model, it does not prove RDNA2. --negative-control checks that deliberately wrong models and a wrong T# FORMAT are caught.
 
 Usage:
     python -I tools/image_fuzz.py [--programs N] [--seed S] [--build DIR] [--work DIR] [--show]
-    python -I tools/image_fuzz.py --oracle hw [--programs N] [--seed S] [--negative-control]
+    python -I tools/image_fuzz.py --oracle hw [--op image_load_pck|image_load_pck_sgn] [--programs N] [--seed S] [--negative-control]
     python -I tools/image_fuzz.py --self-test
 
 Exit code: 0 when every case matches, 1 on a mismatch, 2 on a setup or harness error, 77 when --oracle hw was asked
@@ -63,6 +67,18 @@ FORMATS = {
     "R8G8B8A8_UINT": ("R8G8B8A8_UINT", 60, 4, "uint8"),
     "R8G8B8A8_SINT": ("R8G8B8A8_SINT", 61, 4, "sint8"),
 }
+# Texel formats only the hardware oracle's pck ops run: sub-4-byte texels the raw-dword model covers. The
+# translator oracle has no image_load model for them and the pck ops never reach it.
+PCK_FORMATS = {
+    "R8_UINT": ("R8_UINT", 5, 1, "raw"),
+    "R8_SINT": ("R8_SINT", 6, 1, "raw"),
+    "R16_UINT": ("R16_UINT", 11, 2, "raw"),
+    "R16_SINT": ("R16_SINT", 12, 2, "raw"),
+    "R8G8_UINT": ("R8G8_UINT", 18, 2, "raw"),
+    "R8G8_SINT": ("R8G8_SINT", 19, 2, "raw"),
+    "R16G16_SINT": ("R16G16_SINT", 28, 4, "raw"),
+}
+HW_FORMATS = {**FORMATS, **PCK_FORMATS}
 SIZES = (8, 16, 32, 64)
 # The default run reaches only the first two masks. Use a gap to check that selected components pack down.
 DMASKS = (0xf, 0x5, *range(1, 0x5), *range(0x6, 0xf))
@@ -155,13 +171,15 @@ def pixel_shader(width: int, height: int, dmask: int = 0xf, model: str = "") -> 
 
 def make_texels(fmt_name: str, width: int, height: int, rng: random.Random):
     """Raw texel bytes and the T# words (the key; word 1 carries FORMAT for the translator)."""
-    vk_format, code, bpp, model = FORMATS[fmt_name]
+    vk_format, code, bpp, model = HW_FORMATS[fmt_name]
     # A fifth of the values are specials: a fetch is a memory read, so NaN/inf/+-0/denormal payloads must
     # survive it unchanged (the comparison treats every NaN as equal to every NaN).
     specials = [0.0, -0.0, float("inf"), float("-inf"), float("nan"), 1e-40, -1e-40]
     raw = bytearray()
     for _ in range(width * height):
-        if model in ("unorm8", "uint8", "sint8"):
+        if model == "raw":
+            raw += rng.randbytes(bpp)
+        elif model in ("unorm8", "uint8", "sint8"):
             raw += bytes([rng.randrange(256), rng.randrange(256), rng.randrange(256), rng.randrange(256)])
         elif model == "half4":
             for _ in range(4):
@@ -202,6 +220,36 @@ def oracle(fmt_name: str, texels: bytes, width: int, height: int) -> list:
         else:
             texel.append([struct.unpack_from("<f", chunk, 0)[0], 0.0, 0.0, 1.0])
     return texel
+
+
+def pck_oracle(fmt, texel_bytes, dmask, sgn):
+    """The dwords `image_load_pck` (`sgn` false) / `image_load_pck_sgn` (`sgn` true) store for every texel:
+    four per texel, the registers dmask does not write holding the sentinels. Measured on gfx1036
+    (docs/shader_validation.md): the texel's S bytes (S = bytes per texel from the T# FORMAT) form
+    ceil(S/4) little-endian dwords - a texel under 4 bytes is one dword, zero-extended, or sign-extended
+    from bit 8*S-1 for the _sgn form - dmask bit i selects dword i (0 past the last) and the selected
+    dwords pack into consecutive VGPRs. The format's numeric type does not matter."""
+    bpp = HW_FORMATS[fmt][2]
+    n_dwords = 1 if bpp < 4 else bpp // 4
+    sentinels = [0] * 4 if "no_sentinels" in PERTURB else [f32_bits(v) for v in SENTINELS]
+    words = []
+    for i in range(0, len(texel_bytes), bpp):
+        chunk = texel_bytes[i:i + bpp]
+        if bpp < 4:
+            dword = int.from_bytes(chunk, "little")
+            if sgn and dword >> (8 * bpp - 1):
+                dword |= ~((1 << (8 * bpp)) - 1) & 0xFFFFFFFF
+            dwords = [dword]
+        else:
+            dwords = [int.from_bytes(chunk[j:j + 4], "little") for j in range(0, bpp, 4)]
+        if "dmask_in_place" in PERTURB:
+            regs = [(dwords[r] if r < n_dwords else 0) if dmask & (1 << r) else sentinels[r]
+                    for r in range(4)]
+        else:
+            regs = [dwords[r] if r < n_dwords else 0 for r in range(4) if dmask & (1 << r)]
+            regs += sentinels[len(regs):]
+        words.extend(regs)
+    return words
 
 
 def texel_of_pixel(x: int, y: int, width: int, height: int) -> tuple:
@@ -357,12 +405,13 @@ def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf, d
 
 HW_CHUNK = 24            # kernels per assembled module: each carries its texture, up to 64 KB of data
 WAVES = (32, 64)         # alternated from case to case: a texel fetch must not depend on the wave size
-FORMAT_ORDER = list(FORMATS)
+FORMAT_ORDER = list(HW_FORMATS)
 _X, _Y, _Z, _W, _0, _1 = (tsharp.SEL_X, tsharp.SEL_Y, tsharp.SEL_Z, tsharp.SEL_W, tsharp.SEL_0, tsharp.SEL_1)
 # DST_SEL per model. A one-channel format reads (r, 0, 0, 1): what the translator's image view gives it
 # (format_swizzle in runtime/src/gfx10_descriptors.h) and what the CPU model says.
 FORMAT_SWIZZLE = {"unorm8": (_X, _Y, _Z, _W), "half4": (_X, _Y, _Z, _W), "float4": (_X, _Y, _Z, _W),
-                  "float1": (_X, _0, _0, _1), "uint8": (_X, _Y, _Z, _W), "sint8": (_X, _Y, _Z, _W)}
+                  "float1": (_X, _0, _0, _1), "uint8": (_X, _Y, _Z, _W), "sint8": (_X, _Y, _Z, _W),
+                  "raw": (_X, _Y, _Z, _W)}
 
 
 class Case:
@@ -402,6 +451,18 @@ PERTURBATIONS = {
     "dmask_in_place": "dmask components stay in their own register instead of packing downwards",
     "no_sentinels": "registers dmask does not write read as 0 instead of keeping their value",
     "transpose": "texel (x, y) read as (y, x)",
+    "pck_sgn_zero_extend": "image_load_pck_sgn zero-extends a sub-4-byte texel instead of sign-extending",
+}
+# The --op each perturbation can affect; the negative control only requires the ones for the run's op.
+PERTURB_OPS = {
+    "unorm_256": ("image_load",),
+    "swap_rb": ("image_load",),
+    "sint_unsigned": ("image_load",),
+    "alpha_zero": ("image_load",),
+    "dmask_in_place": ("image_load", "image_load_pck", "image_load_pck_sgn"),
+    "no_sentinels": ("image_load", "image_load_pck", "image_load_pck_sgn"),
+    "transpose": ("image_load", "image_load_pck", "image_load_pck_sgn"),
+    "pck_sgn_zero_extend": ("image_load_pck_sgn",),
 }
 
 
@@ -409,9 +470,18 @@ def f32_bits(value: float) -> int:
     return struct.unpack("<I", struct.pack("<f", value))[0]
 
 
-def expected_words(fmt_name, texels, width, height, dmask):
+def expected_words(fmt_name, texels, width, height, dmask, op="image_load"):
     """The dwords the hardware stores for every texel (texel index * 4 words): the four result registers after an
-    image_load with this dmask, written over the sentinels. Integer formats come back as integers, the rest as f32."""
+    image_load with this dmask, written over the sentinels. Integer formats come back as integers, the rest as f32.
+    The pck ops come back as the raw texel dwords pck_oracle models."""
+    if op != "image_load":
+        sgn = op == "image_load_pck_sgn" and "pck_sgn_zero_extend" not in PERTURB
+        words = pck_oracle(fmt_name, texels, dmask, sgn)
+        if "transpose" in PERTURB:
+            groups = [words[i:i + 4] for i in range(0, len(words), 4)]
+            words = [w for i in range(width * height)
+                     for w in groups[(i % width) * height + i // width]]
+        return words
     _, _, bpp, model = FORMATS[fmt_name]
     values = oracle(fmt_name, texels, width, height)
     if "unorm_256" in PERTURB and model == "unorm8":
@@ -442,15 +512,15 @@ def word_equal(have: int, want: int, model: str) -> bool:
     """Bit equality; for the float formats any NaN equals any NaN (payloads are not modelled)."""
     if have == want:
         return True
-    if model in ("uint8", "sint8"):
+    if model in ("uint8", "sint8", "pck"):
         return False
     return all((x & 0x7F800000) == 0x7F800000 and x & 0x007FFFFF for x in (have, want))
 
 
-def compare_hw(case, got):
+def compare_hw(case, got, op="image_load"):
     """Mismatches (texel x, y, register, want, have) of one case's output words against the model."""
-    want = expected_words(case.fmt, case.data[0], case.width, case.height, case.dmask)
-    model = FORMATS[case.fmt][3]
+    want = expected_words(case.fmt, case.data[0], case.width, case.height, case.dmask, op)
+    model = "pck" if op != "image_load" else FORMATS[case.fmt][3]
     problems = []
     if len(got) != len(want):
         return [(-1, -1, -1, len(want), len(got))]
@@ -461,19 +531,31 @@ def compare_hw(case, got):
     return problems
 
 
-def hw_kernel(arch, case, fmt_override=None):
-    """The native kernel of a case (fmt_override: build the T# with another format's code, for the negative control)."""
-    bpp = FORMATS[case.fmt][2]
+def hw_kernel(arch, case, fmt_override=None, op="image_load"):
+    """The native kernel of a case (fmt_override: build the T# with another format's code, for the negative control).
+    op: the fetch; the pck forms replace the opcode and drop `unorm`, as tsharp.kernel_lines emits image_load."""
+    bpp = HW_FORMATS[case.fmt][2]
     texture = tsharp.lay_out(case.data[0], case.width, case.height, bpp)
     lines = tsharp.kernel_lines(arch, case.index, fmt_override or case.fmt, case.width, case.height, bpp,
-                                case.dmask, texture, FORMAT_SWIZZLE[FORMATS[case.fmt][3]])
+                                case.dmask, texture, FORMAT_SWIZZLE[HW_FORMATS[case.fmt][3]])
+    if op != "image_load":
+        lines = [_pck_line(ln, op) for ln in lines]
     threads, _ = tsharp.lanes(case.width, case.height)
     return hw_asm.Kernel(lines, case.wave, threads, case.width * case.height * 4, raw=True)
 
 
+def _pck_line(line, op):
+    """kernel_lines' `image_load ... unorm` as `op` (the pck forms return raw bits: no `unorm`)."""
+    if "image_load " not in line:
+        return line
+    line = line.replace("image_load ", op + " ", 1)
+    return line[:-6] if line.endswith(" unorm") else line
+
+
 def run_hw(oracle, cases, a, quiet=False, fmt_override=None):
     """Run every case natively and judge it against the model. Returns (stats, mismatching cases, {index: words})."""
-    kernels = [hw_kernel(oracle.arch, c, fmt_override(c) if fmt_override else None) for c in cases]
+    op = getattr(a, "op", "image_load")
+    kernels = [hw_kernel(oracle.arch, c, fmt_override(c) if fmt_override else None, op=op) for c in cases]
     stats = {}
     failed, words = [], {}
     for c, got in zip(cases, oracle.run(kernels)):
@@ -488,7 +570,7 @@ def run_hw(oracle, cases, a, quiet=False, fmt_override=None):
             print(f"ERROR {c.name} [hw]: the texture in the kernel is not 256-byte aligned (every word is the poison)")
             continue
         words[c.index] = got
-        problems = compare_hw(c, got)
+        problems = compare_hw(c, got, op)
         if not problems:
             st["match"] += 1
             continue
@@ -506,21 +588,33 @@ def run_hw(oracle, cases, a, quiet=False, fmt_override=None):
 def negative_control(oracle, cases, a):
     """Every deliberately wrong model, and a kernel with the wrong T# FORMAT, must be caught by the hardware words:
     the real model passes, each perturbed one has to mismatch on at least one case. Exit 0 when all are caught."""
+    op = getattr(a, "op", "image_load")
     _, failed, words = run_hw(oracle, cases, a)
     ran = [c for c in cases if c.index in words]
     code = 1 if failed or not ran else 0
     print(f"unperturbed model: {len(failed)} of {len(ran)} cases mismatch")
     for name, what in PERTURBATIONS.items():
+        if op not in PERTURB_OPS[name]:
+            print(f"perturbation {name} ({what}): not applicable to {op}, skipped")
+            continue
         PERTURB.add(name)
         try:
-            n = sum(bool(compare_hw(c, words[c.index])) for c in ran)
+            n = sum(bool(compare_hw(c, words[c.index], op)) for c in ran)
         finally:
             PERTURB.discard(name)
         print(f"perturbation {name} ({what}): caught by {n} of {len(ran)} cases" + ("" if n else "   <-- NOT CAUGHT"))
         code = code or (0 if n else 1)
 
     def wrong_of(fmt):
-        return FORMAT_ORDER[(FORMAT_ORDER.index(fmt) + 1) % len(FORMAT_ORDER)]
+        # image_load_pck ignores the FORMAT's numeric type (measured: R8G8B8A8_UINT/SINT/UNORM, R16_UINT/SINT and
+        # R8G8_UINT/SINT give the same words), so a wrong FORMAT is only visible when it changes the texel size:
+        # for the pck ops take the next format of another size.
+        i = FORMAT_ORDER.index(fmt)
+        for k in range(1, len(FORMAT_ORDER)):
+            other = FORMAT_ORDER[(i + k) % len(FORMAT_ORDER)]
+            if op == "image_load" or HW_FORMATS[other][2] != HW_FORMATS[fmt][2]:
+                return other
+        return FORMAT_ORDER[(i + 1) % len(FORMAT_ORDER)]
     _, bad, _ = run_hw(oracle, cases, a, quiet=True, fmt_override=lambda c: wrong_of(c.fmt))
     for fmt in dict.fromkeys(c.fmt for c in cases):
         n_all = sum(c.fmt == fmt for c in cases)
@@ -547,6 +641,10 @@ def self_test() -> int:
     assert texel_of_pixel(63, 63, 64, 64) == (63, 63)
     asm = pixel_shader(16, 8)
     assert "\timage_load" in asm and "16.0" in asm and "8.0" in asm
+    # The measured pck values (docs/shader_validation.md): raw texel dwords, sign-extended for _sgn under 4 bytes.
+    assert pck_oracle("R8G8B8A8_UNORM", bytes([0x81, 0x7f, 0xff, 0x02]), 0xf, False) == [0x02ff7f81, 0, 0, 0]
+    assert pck_oracle("R8_UINT", bytes([0x81]), 0x1, False) == [0x81, 0x40000000, 0x40400000, 0x40800000]
+    assert pck_oracle("R8_UINT", bytes([0x81]), 0x1, True) == [0xFFFFFF81, 0x40000000, 0x40400000, 0x40800000]
     print(f"image_fuzz self-test: ok ({len(FORMATS)} formats, {DRAW}x{DRAW} draw)")
     return 0
 
@@ -584,7 +682,12 @@ def main() -> int:
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
     ap.add_argument("--work", help="keep each run's generated files in a new subfolder here")
     ap.add_argument("--show", action="store_true")
-    ap.add_argument("--formats", default=",".join(FORMATS))
+    ap.add_argument("--formats", default=None,
+                    help="comma-separated formats (default: every format the selected op models: the translator "
+                         "set for image_load, plus the sub-4-byte texel formats for the pck ops)")
+    ap.add_argument("--op", default="image_load", choices=("image_load", "image_load_pck", "image_load_pck_sgn"),
+                    help="hw: the fetch opcode. The pck forms return the raw texel dwords (no unorm) and add the "
+                         "sub-4-byte texel formats; the translator oracle does not translate them and is skipped")
     ap.add_argument("--oracle", default="translator",
                     help="comma-separated: translator (default; the shader through the translator and Vulkan), hw (the same "
                          "fetches as native kernels on the AMD GPU through tools/hw_oracle/; exit 77 when it is not "
@@ -606,13 +709,27 @@ def main() -> int:
         ap.error("--oracle takes translator, hw or translator,hw")
     if a.negative_control and "hw" not in backends:
         ap.error("--negative-control needs --oracle hw")
-    formats = [f.strip() for f in a.formats.split(",") if f.strip()]
+    formats = ([f.strip() for f in a.formats.split(",") if f.strip()] if a.formats is not None
+               else list(HW_FORMATS if a.op != "image_load" else FORMATS))
     if not formats:
         ap.error("--formats must select at least one format")
-    unknown = [f for f in formats if f not in FORMATS]
+    unknown = [f for f in formats if f not in HW_FORMATS]
     if unknown:
-        print(f"unknown format(s): {', '.join(unknown)}; known: {', '.join(FORMATS)}", file=sys.stderr)
+        print(f"unknown format(s): {', '.join(unknown)}; known: {', '.join(HW_FORMATS)}", file=sys.stderr)
         return 2
+    if a.op == "image_load":
+        pck_only = [f for f in formats if f in PCK_FORMATS]
+        if pck_only:
+            print(f"{', '.join(pck_only)}: only the pck ops model these formats "
+                  f"(--op image_load_pck or image_load_pck_sgn)", file=sys.stderr)
+            return 2
+    if a.op != "image_load" and "translator" in backends:
+        # The translator does not translate the pck ops; the hardware oracle is the only model for them.
+        print(f"oracle translator: {a.op} is not translated, skipping it "
+              f"(the hardware oracle's pck_oracle is the model)")
+        backends = tuple(t for t in backends if t != "translator")
+        if not backends:
+            return 77
     if a.programs < 1:
         print("--programs must be at least 1", file=sys.stderr)
         return 2
@@ -679,7 +796,7 @@ def main() -> int:
                 return max(code, negative_control(hw_oracle, cases, a))
             stats, failed_cases, _ = run_hw(hw_oracle, cases, a)
             for wave, st in sorted(stats.items()):
-                print(f"image_load wave{wave} hw: " + ", ".join(f"{k} {v}" for k, v in st.items()))
+                print(f"{a.op} wave{wave} hw: " + ", ".join(f"{k} {v}" for k, v in st.items()))
             if "translator" in backends:
                 for c in failed_cases:
                     seen = verdicts.get(c.index, "not run")
