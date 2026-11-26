@@ -222,8 +222,8 @@ that name exists), and an unimplemented import stops the run only if the title c
 ([When an unimplemented import is called](#when-an-unimplemented-import-is-called)). The executable imports 25
 functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`). The `ws2_offline` shim now serves the
 outbound and name-resolution calls among them, loopback only (see the Winsock2 section below), and the remaining
-imports bind to the host's. `winhttp.dll` is served by the offline shim, which opens none. Known gap: `dnsapi.dll`
-(`DnsQuery*`) is not shimmed, so a title that calls it reaches the host's resolver.
+imports bind to the host's. `winhttp.dll` is served by the offline shim, which opens none. `dnsapi.dll` has an
+offline shim too, which answers loopback names only (see the DNS client section below).
 
 ## Audio hardware (`AcpHal.dll`)
 
@@ -840,6 +840,45 @@ aliases, external refusals using RFC 5737 / RFC 3849 / `.invalid` targets, the `
 `WSASERVICE_NOT_FOUND` refusal, wildcard-bind narrowing, a `ConnectEx` pointer from `WSAIoctl` connecting to a loopback
 listener, a local loopback UDP round-trip, loopback binds for sends on unbound UDP sockets (with a control showing
 the host's own `sendto` binds to `0.0.0.0`), and the multicast and `WSAJoinLeaf` refusals.
+
+## DNS client (`dnsapi.dll`) offline
+
+A title that called `dnsapi.dll`, by import or after a run-time load, reached the host's DNS client, which sends a
+query for any name, and updates, server checks and DNS-SD (multicast DNS on the local link) too. This was the known
+gap next to the WinHTTP and Winsock2 shims. `runtime/shims/dnsapi_offline.cpp` vets the documented functions that can
+send. Like `ws2_32.dll`, the module stays
+host-owned (`owns_dll`), so `LoadLibrary` returns the real module and the functions that send nothing
+(`DnsRecordListFree`, `DnsFree`, `DnsQueryConfig`, `DnsCancelQuery`, the name helpers) are the host's:
+
+- `DnsQuery_A`, `DnsQuery_W`, `DnsQuery_UTF8` and `DnsQueryEx` answer only `localhost` (any case, with or without
+  the trailing dot) and loopback literals (`127.0.0.0/8` in plain decimal, `::1`, `::ffff:127.0.0.0/104`), the names
+  the Winsock2 lookups let through. The shim passes those to the host with the network switched off:
+  `DNS_QUERY_NO_WIRE_QUERY`, `NO_NETBT`, `NO_MULTICAST` and `NO_HOSTS_FILE` are added, and `WIRE_ONLY`,
+  `MULTICAST_ONLY`, `BYPASS_CACHE` and `RETURN_MESSAGE` are removed, since the host refuses them next to
+  `NO_WIRE_QUERY` with `ERROR_INVALID_PARAMETER`. Server lists (`pExtra`, `pDnsServerList`, version 3's custom
+  servers) are dropped. The host answers these names itself (measured on Windows 11: `localhost` as `127.0.0.1` and
+  `::1`, a literal as its own record), so the records are its own and the title frees them as usual.
+- Every other name fails with `DNS_ERROR_RECORD_DOES_NOT_EXIST` and no records. That is the host's own answer for a
+  name it cannot resolve with `DNS_QUERY_NO_WIRE_QUERY` (measured). The resolver cache, the hosts file, the machine's
+  own name (an empty name) and other literals are not consulted, so a title neither reaches the network nor reads
+  what other programs resolved. `0127.0.0.1` is refused, as in the Winsock2 lookups.
+- `DnsQueryEx` always completes before it returns, also when the request has a completion callback, and then the
+  callback is not called. The host does the same for a name it answers locally (measured: `localhost` with a
+  callback returns 0 at once), so no shim query is ever pending and `DnsCancelQuery` stays the host's. The host's
+  argument checks are kept for refused names too: a null request, result or name, a result `Version` other than 1,
+  or a request `Version` other than 1, 2 or 3 is `ERROR_INVALID_PARAMETER`.
+- `DnsQueryRaw`, `DnsModifyRecordsInSet_A/W/UTF8`, `DnsReplaceRecordSetA/W/UTF8`, `DnsServiceBrowse`,
+  `DnsServiceResolve`, `DnsServiceRegister`, `DnsServiceDeRegister` and `DnsStartMulticastQuery` fail with
+  `ERROR_NETWORK_UNREACHABLE` (the Win32 counterpart of Winsock2's `WSAENETUNREACH`) before anything is sent. They
+  read no argument, and no completion callback is ever called. The `DnsService*` functions are the ones the GDK's
+  games partition of `windns.h` offers, besides the free functions.
+- `DnsValidateServerStatus` succeeds and reports `DNS_VALSVR_ERROR_UNREACHABLE`; the server is never asked.
+
+Each refused name or function is logged once (`[rt] dnsapi: offline, refused <function> <name>`). Undocumented
+exports (`DnsQueryExA/W/UTF8`, `DnsValidateServer_A/W` and the internal `Dns_*` and `Socket_*` helpers) are not
+covered. `runtime/test/dnsapi_offline_test.cpp` (ctest `dnsapi_offline`) checks the bindings, the loopback answers
+(also when the title asks for the wire, a server list or a callback), the refusals with `.invalid` names and RFC 5737
+/ RFC 3849 literals, and that no refused function calls back; only loopback names reach the host's DNS client.
 
 ## What this proves and what it does not
 

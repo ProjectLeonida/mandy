@@ -181,6 +181,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/file_system.cpp
     shims/winhttp_offline.cpp
     shims/ws2_offline.cpp
+    shims/dnsapi_offline.cpp
     shims/xmem.cpp
     shims/xg_xs.cpp
     shims/acphal.cpp
@@ -485,6 +486,18 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(ws2_offline_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(ws2_offline_test PRIVATE /OPT:NOREF)
   target_link_libraries(ws2_offline_test PRIVATE ws2_32)
+
+  # Offline DNS client for mapped images (dnsapi.dll answers loopback names only); no network is touched.
+  add_executable(dnsapi_offline_test
+    test/dnsapi_offline_test.cpp
+    shims/dnsapi_offline.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(dnsapi_offline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(dnsapi_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(dnsapi_offline_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(dnsapi_offline_test PRIVATE /OPT:NOREF)
+  target_link_libraries(dnsapi_offline_test PRIVATE dnsapi ws2_32)
 
   # COM lifecycle and helper shims for api-ms-win-core-com-l1-1-*.dll.
   add_executable(com_shim_test
@@ -1619,6 +1632,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET ws2_offline_test)
     add_test(NAME ws2_offline COMMAND ws2_offline_test)
+  endif()
+  if(WIN32 AND TARGET dnsapi_offline_test)
+    add_test(NAME dnsapi_offline COMMAND dnsapi_offline_test)
   endif()
   if(WIN32 AND TARGET com_shim_test)
     add_test(NAME com_shim COMMAND com_shim_test)
