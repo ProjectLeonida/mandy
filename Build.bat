@@ -9,31 +9,32 @@ echo  ==========================================
 echo       L E O N I D A  -  Game Builder
 echo  ==========================================
 echo.
-set "PY="
+set "PY_EXE="
+set "PY_ARG="
 for %%V in (3.14 3.13 3.12 3) do (
-  if not defined PY (
-    py -%%V -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" >nul 2>nul && set "PY=py -%%V"
+  if not defined PY_EXE (
+    py -%%V -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" >nul 2>nul && (set "PY_EXE=py" & set "PY_ARG=-%%V")
   )
 )
-if not defined PY (
+if not defined PY_EXE (
   where python >nul 2>nul && (
-    python -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" >nul 2>nul && set "PY=python"
+    python -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" >nul 2>nul && set "PY_EXE=python"
   )
 )
 rem No Python on PATH: look for a per-user install (python.org or winget, "Add to PATH" unticked), else offer to install one.
-if not defined PY call :find_user_python
-if not defined PY call :offer_python
-if not defined PY (
+if not defined PY_EXE call :find_user_python
+if not defined PY_EXE call :offer_python
+if not defined PY_EXE (
   echo Python 3.12 or newer is needed: https://www.python.org/downloads/
   echo Tick "Add python.exe to PATH" during setup, then run Build.bat again.
-  pause
+  if not defined LEONIDA_NO_PAUSE pause
   exit /b 1
 )
-%PY% -I "%~dp0make_game.py" %*
+"%PY_EXE%" %PY_ARG% -I "%~dp0make_game.py" %*
 set "RC=%ERRORLEVEL%"
 echo.
 if "%RC%"=="0" (echo Done.) else (echo The build stopped. Read the message above.)
-pause
+if not defined LEONIDA_NO_PAUSE pause
 exit /b %RC%
 
 rem ---- Helpers (only reached by "call"; the script exits above) ----
@@ -45,9 +46,9 @@ for /f "delims=" %%D in ('dir /b /ad /o-n "%LOCALAPPDATA%\Programs\Python\Python
 exit /b 0
 
 :try_python
-if defined PY exit /b 0
-if not exist %1 exit /b 0
-%1 -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" >nul 2>nul && set PY="%~1"
+if defined PY_EXE exit /b 0
+if not exist "%~1" exit /b 0
+"%~1" -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" >nul 2>nul && set "PY_EXE=%~1"
 exit /b 0
 
 rem Ask first, then install Python 3.12 for this user only (no admin): winget if present, else the pinned
@@ -62,7 +63,10 @@ where winget >nul 2>nul && goto :py_winget
 :py_download
 set "PYURL=https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
 set "PYSHA=67B5635E80EA51072B87941312D00EC8927C4DB9BA18938F7AD2D27B328B95FB"
-set "PYEXE=%TEMP%\leonida-python-3.12.10-amd64.exe"
+set "PYTMP=%TEMP%"
+if not defined PYTMP set "PYTMP=%LOCALAPPDATA%\Temp"
+if not defined PYTMP set "PYTMP=%~dp0"
+set "PYEXE=%PYTMP%\leonida-python-3.12.10-amd64.exe"
 if defined LEONIDA_PY_INSTALL_DRYRUN goto :py_dry_download
 echo Downloading Python 3.12.10 from python.org ...
 powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -UseBasicParsing -Uri $env:PYURL -OutFile $env:PYEXE; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $env:PYEXE).Hash -ine $env:PYSHA) { Remove-Item -LiteralPath $env:PYEXE -Force; exit 3 }"
@@ -89,7 +93,7 @@ if defined LEONIDA_PY_INSTALL_DRYRUN goto :py_dry_winget
 echo Installing Python 3.12 with winget ...
 call %PYWG%
 call :find_user_python
-if defined PY exit /b 0
+if defined PY_EXE exit /b 0
 echo winget did not install Python; trying the python.org installer instead.
 goto :py_download
 
