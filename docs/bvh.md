@@ -1081,7 +1081,10 @@ is the same; only the node records and their offsets change, and
 `GetRaytracingAccelerationStructurePrebuildInfo` gives the smaller size when it gets the same flag. Each child box
 is rounded outward to halves (min toward -inf, max toward +inf) from the exact box, which the builder keeps in its
 accumulators, so the rounding does not add up from level to level. The rounding is integer code, because `packHalf2x16`
-rounds in an implementation-defined way (AMD's driver rounds toward zero). Beyond the half range a bound becomes
+rounds in an implementation-defined way (AMD's driver rounds toward zero). The half's sign is extracted as
+`(u & 0x80000000) >> 16`, not `(u >> 16) & 0x8000`: the AMD Windows shader compiler (driver 24.10.24, Vulkan
+1.3.280, gfx1035) miscompiles the shift-then-mask form, and every BOX16 box then has flipped half signs —
+`check-build` fails all box16 cases while BOX32 is unaffected; NVIDIA is unaffected either way. Beyond the half range a bound becomes
 +-inf on its outward side and +-65504 on its inward side, so an empty slot (min +inf, max -inf) is still empty. A
 bound smaller than the smallest normal half (2^-14) in magnitude becomes 0 or +-2^-14, whichever is on its outward
 side, never a half denormal: a decoder that flushes those to zero would make the box smaller. `tools/xdxr_bvh.py`
