@@ -120,6 +120,16 @@ bool valid_format(const WAVEFORMATEX* f) {
     return IsEqualGUID(sub, kSubtypeFloat) || IsEqualGUID(sub, kSubtypePcm);
 }
 
+// A description that is not a format at all. Windows refuses it with E_INVALIDARG, not as an unsupported format
+// (measured on Windows 11 with Initialize and IsFormatSupported): no channels, no rate or no sample size, a block or
+// byte rate that does not follow from them, or WAVE_FORMAT_EXTENSIBLE without room for its extension.
+bool malformed_format(const WAVEFORMATEX* f) {
+    if (f->nChannels == 0 || f->nSamplesPerSec == 0 || f->wBitsPerSample == 0) return true;
+    if (f->nBlockAlign != f->nChannels * f->wBitsPerSample / 8) return true;
+    if (f->nAvgBytesPerSec != static_cast<uint64_t>(f->nSamplesPerSec) * f->nBlockAlign) return true;
+    return f->wFormatTag == WAVE_FORMAT_EXTENSIBLE && f->cbSize < 22;
+}
+
 bool is_mix_format(const WAVEFORMATEX* f) {
     return f->nSamplesPerSec == kSampleRate && f->nChannels == kChannels && f->wBitsPerSample == 32 && is_float(f);
 }
@@ -264,6 +274,7 @@ public:
         if (mode == AUDCLNT_SHAREMODE_EXCLUSIVE) return AUDCLNT_E_UNSUPPORTED_FORMAT;
         if (mode != AUDCLNT_SHAREMODE_SHARED) return E_INVALIDARG;
         if (!closest) return E_POINTER;
+        if (malformed_format(format)) return E_INVALIDARG;
         if (!valid_format(format)) return AUDCLNT_E_UNSUPPORTED_FORMAT;
         if (is_mix_format(format)) return S_OK;
         *closest = alloc_mix_format();
@@ -308,7 +319,8 @@ public:
         if (!initialized_) return AUDCLNT_E_NOT_INITIALIZED;
         if (running_) return AUDCLNT_E_NOT_STOPPED;
         if (pending_) return AUDCLNT_E_BUFFER_OPERATION_PENDING;
-        if (written_ == 0 && played_ == 0) return S_FALSE;
+        // S_OK also when there was nothing to reset (a stream never started, or reset already), as Windows answers
+        // (measured on Windows 11), not the S_FALSE the reference names.
         written_ = played_ = played_at_anchor_ = 0;
         return S_OK;
     }
@@ -383,10 +395,13 @@ public:
         *data = frames ? scratch_.data() : nullptr;
         return S_OK;
     }
-    HRESULT release_buffer(UINT32 frames) {
+    HRESULT release_buffer(UINT32 frames, DWORD flags) {
         Lock l(lock_);
         if (!initialized_) return AUDCLNT_E_NOT_INITIALIZED;
         if (!pending_) return frames ? AUDCLNT_E_OUT_OF_ORDER : S_OK;
+        // A render packet takes AUDCLNT_BUFFERFLAGS_SILENT and nothing else but bit 31: the capture flags and every
+        // other bit are E_INVALIDARG, checked before the size, and the packet stays pending (measured on Windows 11).
+        if (frames && (flags & ~(static_cast<DWORD>(AUDCLNT_BUFFERFLAGS_SILENT) | 0x80000000u))) return E_INVALIDARG;
         if (frames > pending_frames_) return AUDCLNT_E_INVALID_SIZE;
         // A write after the stream ran dry plays from now on (advance re-anchors), as a device fed silence in the gap.
         advance(qpc_now());
@@ -438,11 +453,13 @@ private:
         if (mode == AUDCLNT_SHAREMODE_EXCLUSIVE) return AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
         if (mode != AUDCLNT_SHAREMODE_SHARED) return E_INVALIDARG;
         if (flags & AUDCLNT_STREAMFLAGS_LOOPBACK) return AUDCLNT_E_WRONG_ENDPOINT_TYPE;
+        Lock l(lock_);
+        // A client initialized already says so before it looks at the format, as Windows does (measured).
+        if (initialized_) return AUDCLNT_E_ALREADY_INITIALIZED;
+        if (malformed_format(format)) return E_INVALIDARG;
         // Any PCM or float format is taken, not only the mix format: the samples are thrown away, so there is
         // nothing to convert, and a title never fails here for asking without AUTOCONVERTPCM.
         if (!valid_format(format)) return AUDCLNT_E_UNSUPPORTED_FORMAT;
-        Lock l(lock_);
-        if (initialized_) return AUDCLNT_E_ALREADY_INITIALIZED;
         rate_ = format->nSamplesPerSec;
         channels_ = format->nChannels;
         block_ = format->nBlockAlign;
@@ -528,7 +545,9 @@ class RenderClient final : public Service<IAudioRenderClient> {
 public:
     using Service::Service;
     HRESULT STDMETHODCALLTYPE GetBuffer(UINT32 frames, BYTE** data) override { return client_->get_buffer(frames, data); }
-    HRESULT STDMETHODCALLTYPE ReleaseBuffer(UINT32 frames, DWORD) override { return client_->release_buffer(frames); }
+    HRESULT STDMETHODCALLTYPE ReleaseBuffer(UINT32 frames, DWORD flags) override {
+        return client_->release_buffer(frames, flags);
+    }
 };
 
 class Clock final : public Service<IAudioClock> {
@@ -623,6 +642,7 @@ HRESULT AudioClient::GetService(REFIID riid, void** ppv) {
     else if (IsEqualIID(riid, __uuidof(IAudioClock))) made = new (std::nothrow) Clock(this);
     else if (IsEqualIID(riid, __uuidof(ISimpleAudioVolume))) made = new (std::nothrow) SimpleVolume(this);
     else if (IsEqualIID(riid, __uuidof(IAudioStreamVolume))) made = new (std::nothrow) StreamVolume(this);
+    else if (IsEqualIID(riid, __uuidof(IAudioCaptureClient))) return AUDCLNT_E_WRONG_ENDPOINT_TYPE;  // as on a render device
     else {
         log_missing_iid_once("IAudioClient::GetService", riid);
         return E_NOINTERFACE;
