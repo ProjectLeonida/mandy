@@ -1509,8 +1509,9 @@ if(BUILD_TESTING)
   # Which SPIR-V modules declare a storage image or buffer they may write (src/spirv_stores.h), on hand-built words.
   add_executable(spirv_stores_test test/spirv_stores_test.cpp)
   add_test(NAME spirv_stores COMMAND spirv_stores_test)
-  add_executable(list_value_wait_budget_test test/list_value_wait_budget_test.cpp)
-  add_test(NAME list_value_wait_budget COMMAND list_value_wait_budget_test)
+  # When a held console memory wait may go without its value (src/list_value_progress.h), on hand-built states.
+  add_executable(list_value_progress_test test/list_value_progress_test.cpp)
+  add_test(NAME list_value_progress COMMAND list_value_progress_test)
   add_executable(shader_fixture_path_test test/shader_fixture_path_test.cpp)
   add_test(NAME shader_fixture_path COMMAND shader_fixture_path_test)
   add_executable(resource_tiling_test test/resource_tiling_test.cpp)

@@ -310,6 +310,11 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
 // of another kind. For the console fence's slot-12 mirror (d3d12_xs_device.cpp).
 bool fence_callback_at(ID3D12Fence* fence, std::uint64_t value, std::function<void()> fn);
 
+// Whether a Signal of at least `value` has reached the GPU for `fence` (or the CPU set it): false while the layer
+// holds that Signal behind a wait it has not seen satisfied (src/queue_holds.h). True for a fence of another kind. For
+// the console list values' pump (d3d12_xs_list_values.h): work held that way is not running.
+bool fence_signal_submitted(ID3D12Fence* fence, std::uint64_t value);
+
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
 // Resolves the resource that a UAV clear writes. Xbox depth/stencil UAVs name one of two color images by T#.
