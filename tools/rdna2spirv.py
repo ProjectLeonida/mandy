@@ -19934,7 +19934,8 @@ def merge_shard_parts(out):
     return merged
 
 
-SPAWN_RETRY_SECONDS = 2.0
+# The longest run of refusals measured was 3.8 s, with every hardware thread busy at the workers' priority.
+SPAWN_RETRY_SECONDS = 10.0
 _NOT_ENOUGH_QUOTA = 1816  # ERROR_NOT_ENOUGH_QUOTA
 
 
@@ -19942,9 +19943,13 @@ def _run_spirv_tool(cmd, **kwargs):
     # A Windows job's active-process limit can still count a tool that has just exited, and CreateProcess then
     # refuses the next one with ERROR_NOT_ENOUGH_QUOTA: the compute worker's job allows itself and one tool
     # (scripts/compute_workers_win.py). The refused tool never started, so it is started again for a bounded time.
-    deadline = time.monotonic() + SPAWN_RETRY_SECONDS
+    # Same backoff as tools/replace_retry.py, kept apart because that one retries a rename, not a process start.
+    start = time.monotonic()
+    deadline = start + SPAWN_RETRY_SECONDS
     delay = 0.005
+    attempts = 0
     while True:
+        attempts += 1
         try:
             return subprocess.run(cmd, **kwargs)
         except FileNotFoundError as exc:
@@ -19953,7 +19958,11 @@ def _run_spirv_tool(cmd, **kwargs):
                 exc.filename = cmd[0]
             raise
         except OSError as exc:
-            if getattr(exc, "winerror", None) != _NOT_ENOUGH_QUOTA or time.monotonic() >= deadline:
+            if getattr(exc, "winerror", None) != _NOT_ENOUGH_QUOTA:
+                raise
+            if time.monotonic() >= deadline:
+                exc.add_note(f"{cmd[0]}: refused {attempts} times in {time.monotonic() - start:.1f} s "
+                             f"(SPAWN_RETRY_SECONDS = {SPAWN_RETRY_SECONDS})")
                 raise
         time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
         delay = min(delay * 2, 0.1)

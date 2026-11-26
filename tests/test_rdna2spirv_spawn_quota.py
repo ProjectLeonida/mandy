@@ -73,6 +73,10 @@ class RunSpirvToolTests(unittest.TestCase):
         self.assertGreater(run.call_count, 1)
         self.assertLessEqual(self.clock.now, rdna2spirv.SPAWN_RETRY_SECONDS)
         self.assertGreaterEqual(self.clock.now, rdna2spirv.SPAWN_RETRY_SECONDS - max(self.clock.sleeps))
+        # The traceback says the retry ran out, not only what the first refusal said.
+        self.assertEqual(raised.exception.__notes__,
+                         [f"spirv-as: refused {run.call_count} times in {self.clock.now:.1f} s "
+                          f"(SPAWN_RETRY_SECONDS = {rdna2spirv.SPAWN_RETRY_SECONDS})"])
 
     def test_other_errors_are_not_retried(self):
         for error in (win_error(5), OSError(errno.ENOMEM, "out of memory")):
@@ -81,6 +85,7 @@ class RunSpirvToolTests(unittest.TestCase):
                     with self.assertRaises(OSError) as raised:
                         rdna2spirv._run_spirv_tool(["spirv-val"])
                 self.assertIs(raised.exception, error)
+                self.assertFalse(hasattr(error, "__notes__"))
                 self.assertEqual(run.call_count, 1)
         self.assertEqual(self.clock.sleeps, [])
 
