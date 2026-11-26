@@ -69,10 +69,13 @@ def needed(version=None, implementation=None):
     return implementation == "cpython" and ((3, 12) <= version < (3, 13, 16) or (3, 14) <= version < (3, 14, 8))
 
 
-def parse(source, filename="<unknown>", piece_lines=PIECE_LINES):
+def parse(source, filename="<unknown>", piece_lines=None):
     """The module tree of `source` (str, or the bytes of a file): what `ast.parse(source, filename)` returns, and
-    the same exception for a source with an error."""
-    tree = parse_pieces(source, filename, piece_lines)
+    the same exception for a source with an error. It is built from pieces where `needed()` says a whole-file parse
+    is the slow way, or where the caller names `piece_lines`; elsewhere the whole-file parse is the faster one."""
+    tree = None
+    if piece_lines is not None or needed():
+        tree = parse_pieces(source, filename, piece_lines or PIECE_LINES)
     if tree is None:
         tree = compile(source, filename, "exec", ast.PyCF_ONLY_AST, dont_inherit=True)
     return tree

@@ -92,6 +92,14 @@ def error_facts(call, *args):
     return None
 
 
+def outcome(parse, *args):
+    """What `parse` makes of a source: the dump of its tree, or what the error it raises says."""
+    try:
+        return dump(parse(*args))
+    except (SyntaxError, ValueError):
+        return error_facts(parse, *args)
+
+
 def code_facts(code):
     """Everything a code object holds as plain values, the code objects among its constants included."""
     return (code.co_name, code.co_qualname, code.co_filename, code.co_firstlineno, code.co_flags, code.co_argcount,
@@ -693,13 +701,16 @@ class ErrorsTest(unittest.TestCase):
                     self.assertEqual(dump(pp.parse(source, "f.py", 1)), dump(whole(source)))
 
     def test_barry_as_flufl_is_parsed_whole(self):
-        # the one __future__ import that changes the grammar for the rest of the file
-        accepted = "from __future__ import barry_as_FLUFL\na = 1\nb = a <> 2\n"
-        refused = "from __future__ import barry_as_FLUFL\na = 1\nb = a != 2\n"
-        self.assertIsNone(pp.parse_pieces(accepted, "<test>", 1))
-        self.assertEqual(dump(pp.parse(accepted, "<test>", 1)), dump(whole(accepted)))
-        self.assertIsNotNone(error_facts(whole, refused))
-        self.assertEqual(error_facts(pp.parse, refused, "<test>", 1), error_facts(whole, refused))
+        # The one __future__ import that changes the grammar for the rest of the file. Which of `<>` and `!=` the
+        # parser then takes depends on the release: 3.12.16, 3.13.13 and 3.14.7 read the import from the source
+        # (_PyPegen_checked_future_import), 3.12.1 and 3.13.0 look at the compile flags only. So nothing is said
+        # here about which one is right: the pieces give up, and `parse` gives what this interpreter's compile gives.
+        sources = [f"from __future__ import barry_as_FLUFL\na = 1\nb = a {operator} 2\n" for operator in ("<>", "!=")]
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertIsNone(pp.parse_pieces(source, "<test>", 1))
+                self.assertEqual(outcome(pp.parse, source, "<test>", 1), outcome(whole, source))
+        self.assertEqual(sorted(error_facts(whole, source) is None for source in sources), [False, True])
 
 
 class WarningsTest(unittest.TestCase):
@@ -755,6 +766,17 @@ class NeededTest(unittest.TestCase):
             self.assertIs(pp.needed(version + ("final", 0), "cpython"), expected, version)
         self.assertIs(pp.needed((3, 12, 4, "final", 0), "pypy"), False)
         self.assertIs(pp.needed(), pp.needed(sys.version_info, sys.implementation.name))
+
+    def test_parse_takes_pieces_where_they_are_needed_or_asked_for(self):
+        source = "".join(f"a{i} = f'{{{i}}}'\n" for i in range(pp.PIECE_LINES + 40))
+        expected = dump(whole(source))
+        for needed, sizes, pieces in ((True, (), 1), (False, (), 0), (False, (7,), 1), (True, (7,), 1)):
+            with self.subTest(needed=needed, sizes=sizes):
+                with mock.patch.object(pp, "needed", return_value=needed), \
+                        mock.patch.object(pp, "parse_pieces", wraps=pp.parse_pieces) as parse_pieces:
+                    self.assertEqual(dump(pp.parse(source, "<test>", *sizes)), expected)
+                size = sizes[0] if sizes else pp.PIECE_LINES
+                self.assertEqual(parse_pieces.call_args_list, [mock.call(source, "<test>", size)] * pieces)
 
 
 class RepositoryTest(unittest.TestCase):
