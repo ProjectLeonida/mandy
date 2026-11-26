@@ -4,7 +4,8 @@
 // checks that wsock32.dll resolves its shared entries to the same wrappers, and verifies that external addresses
 // (RFC 5737 192.0.2.1 / RFC 3849 2001:db8::1), .invalid hostnames, octal-looking 0127.0.0.1 and name-service queries
 // are refused in-process while loopback (127.0.0.1 / ::1 / localhost) still works. Sends on unbound UDP sockets bind
-// them to loopback, and multicast joins (setsockopt on both DLLs, WSAJoinLeaf) are refused. Nothing touches the network.
+// them to loopback, and multicast joins (setsockopt on both DLLs, WSAJoinLeaf) are refused. WSAConnectByName reaches
+// localhost from IPv4, IPv6-only and dual-mode sockets. Nothing touches the network.
 #ifndef _WINSOCK_DEPRECATED_NO_WARNINGS
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #endif
@@ -422,6 +423,98 @@ int main() {
         closesocket(ext);
         closesocket(client);
         closesocket(listener);
+    }
+
+    // 8. WSAConnectByName reaches "localhost" from every socket Windows reaches it from. Windows tries ::1 and then
+    // 127.0.0.1; an IPv6 socket with IPV6_V6ONLY set (the default) reaches only ::1, so the shim's literal follows it.
+    {
+        const auto tcp_listener = [&](int family, char (&service)[8]) {
+            const SOCKET l = socket(family, SOCK_STREAM, IPPROTO_TCP);
+            sockaddr_storage addr{};
+            int len = 0;
+            if (family == AF_INET) {
+                *reinterpret_cast<sockaddr_in*>(&addr) = make_v4(127, 0, 0, 1, 0);
+                len = sizeof(sockaddr_in);
+            } else {
+                auto* v6 = reinterpret_cast<sockaddr_in6*>(&addr);
+                v6->sin6_family = AF_INET6;
+                reinterpret_cast<uint8_t*>(&v6->sin6_addr)[15] = 1;  // ::1
+                len = sizeof(sockaddr_in6);
+            }
+            service[0] = '\0';
+            if (l != INVALID_SOCKET && sh_bind(l, reinterpret_cast<const sockaddr*>(&addr), len) == 0 &&
+                listen(l, 4) == 0 && getsockname(l, reinterpret_cast<sockaddr*>(&addr), &len) == 0) {
+                const uint16_t port = family == AF_INET ? reinterpret_cast<sockaddr_in*>(&addr)->sin_port
+                                                        : reinterpret_cast<sockaddr_in6*>(&addr)->sin6_port;
+                std::snprintf(service, sizeof(service), "%u", static_cast<unsigned>(ntohs(port)));
+            }
+            return l;
+        };
+        // Connects s to "localhost" through the A or W shim; returns the remote address family (0 on failure) and
+        // points remote_bytes at the remote address.
+        sockaddr_storage remote{};
+        const auto connect_localhost = [&](SOCKET s, const char* service, bool wide, const uint8_t** remote_bytes) {
+            remote = sockaddr_storage{};
+            DWORD remote_len = sizeof(remote);
+            timeval timeout{5, 0};
+            BOOL ok = FALSE;
+            if (wide) {
+                wchar_t node_w[] = L"localhost";
+                wchar_t service_w[8] = {};
+                for (int i = 0; i < 7 && service[i]; ++i) service_w[i] = static_cast<wchar_t>(service[i]);
+                ok = sh_connect_name_w(s, node_w, service_w, nullptr, nullptr, &remote_len,
+                                       reinterpret_cast<LPSOCKADDR>(&remote), &timeout, nullptr);
+            } else {
+                ok = sh_connect_name_a(s, "localhost", service, nullptr, nullptr, &remote_len,
+                                       reinterpret_cast<LPSOCKADDR>(&remote), &timeout, nullptr);
+            }
+            *remote_bytes = remote.ss_family == AF_INET
+                                ? reinterpret_cast<const uint8_t*>(&reinterpret_cast<sockaddr_in*>(&remote)->sin_addr)
+                                : reinterpret_cast<const uint8_t*>(&reinterpret_cast<sockaddr_in6*>(&remote)->sin6_addr);
+            return ok ? static_cast<int>(remote.ss_family) : 0;
+        };
+        const auto is_v6_loopback = [](const uint8_t* b) {
+            for (int i = 0; i < 15; ++i) {
+                if (b[i]) return false;
+            }
+            return b[15] == 1;
+        };
+
+        char service4[8], service6[8];
+        const SOCKET listener4 = tcp_listener(AF_INET, service4);
+        check(service4[0] != '\0', "IPv4 loopback TCP listener is up");
+        const uint8_t* remote_ip = nullptr;
+
+        const SOCKET client4 = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        check(connect_localhost(client4, service4, false, &remote_ip) == AF_INET && remote_ip[0] == 127,
+              "WSAConnectByNameA connects an IPv4 socket to localhost at 127.0.0.1");
+        closesocket(client4);
+
+        const SOCKET listener6 = tcp_listener(AF_INET6, service6);
+        if (service6[0]) {
+            const SOCKET v6only = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+            check(connect_localhost(v6only, service6, false, &remote_ip) == AF_INET6 && is_v6_loopback(remote_ip),
+                  "WSAConnectByNameA connects an IPv6-only socket to localhost at ::1");
+            closesocket(v6only);
+
+            const SOCKET v6only_w = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+            check(connect_localhost(v6only_w, service6, true, &remote_ip) == AF_INET6 && is_v6_loopback(remote_ip),
+                  "WSAConnectByNameW connects an IPv6-only socket to localhost at ::1");
+            closesocket(v6only_w);
+
+            // A dual-mode socket keeps 127.0.0.1, which it reaches as ::ffff:127.0.0.1.
+            const SOCKET dual = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+            DWORD off = 0;
+            check(setsockopt(dual, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char*>(&off), sizeof(off)) == 0 &&
+                      connect_localhost(dual, service4, false, &remote_ip) == AF_INET6 && remote_ip[10] == 0xff &&
+                      remote_ip[11] == 0xff && remote_ip[12] == 127,
+                  "WSAConnectByNameA connects a dual-mode IPv6 socket to localhost at ::ffff:127.0.0.1");
+            closesocket(dual);
+        } else {
+            std::printf("SKIP IPv6 loopback unavailable: WSAConnectByName on IPv6 sockets\n");
+        }
+        if (listener6 != INVALID_SOCKET) closesocket(listener6);
+        closesocket(listener4);
     }
 
     // Implicit binds, multicast joins and WSAJoinLeaf. A send on an unbound datagram socket binds it to the wildcard
