@@ -137,6 +137,22 @@ class SurveyTest(SetupCase):
         self.programs("runtime/build")
         self.assertEqual((self.survey()["more_missing"], self.survey()["levels"][2]["ready"]), ([], True))
 
+    def test_the_printed_commands_work_as_printed(self):
+        # A build folder with a space is one argument, and an llvm-mc named only on this command line is passed on.
+        self.programs("gpu build")
+        self.listings(1)
+        self.outputs["wsl"] = AMDGPU
+        levels = self.levels(build="gpu build", raw_llvm_mc="wsl -e llvm-mc")
+        self.assertEqual(levels["subset"]["command"], 'python -I scripts/run_gpu_tests.py --build "gpu build" '
+                                                      "--disasm-dir tests/semantic/fixtures/disasm")
+        self.assertEqual(levels["full"]["command"],
+                         'python -I scripts/run_gpu_tests.py --build "gpu build" --llvm-mc "wsl -e llvm-mc"')
+        self.assertTrue(levels["full"]["ready"])
+        # From LLVM_MC the runner reads it itself.
+        with mock.patch.dict(os.environ, {"LLVM_MC": "wsl -e llvm-mc"}):
+            self.assertEqual(self.levels(build="gpu build")["full"]["command"],
+                             'python -I scripts/run_gpu_tests.py --build "gpu build"')
+
     def test_llvm_mc_can_be_a_whole_command(self):
         self.outputs["wsl"] = AMDGPU
         mc = self.survey(raw_llvm_mc="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")["llvm_mc"]
@@ -210,7 +226,8 @@ class ReportTest(SetupCase):
         self.outputs.clear()
         self.assertIn("GPU:        none reported by vulkaninfo\n", self.run_tool()[1])
         report = json.loads(self.run_tool("--json")[1])
-        self.assertEqual(sorted(report), ["build", "gpus", "levels", "listings", "llvm_mc", "more_missing", "spirv_as", "spirv_val"])
+        self.assertEqual(sorted(report), ["build", "gpus", "levels", "listings", "llvm_mc", "llvm_mc_option", "more_missing", "spirv_as",
+                                          "spirv_val"])
         self.assertEqual([level["level"] for level in report["levels"]], ["semantic", "subset", "full"])
         self.assertIn("a Vulkan device: vulkaninfo reports none", report["levels"][1]["missing"])
 

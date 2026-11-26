@@ -114,6 +114,7 @@ def survey(root=ROOT, build=None, raw_llvm_mc=None):
         "spirv_as": tool("spirv-as"), "spirv_val": tool("spirv-val"),
         "gpus": gpus(output_of(["vulkaninfo"])),
         "build": test_programs(root, [build] if build else BUILDS),
+        "llvm_mc_option": raw_llvm_mc,
         "more_missing": [],
         "listings": listings,
     }
@@ -123,6 +124,12 @@ def survey(root=ROOT, build=None, raw_llvm_mc=None):
         state["more_missing"] = [n for n in MORE_PROGRAMS if not os.path.isfile(os.path.join(folder, n + ext))]
     state["levels"] = levels(state, build)
     return state
+
+
+def quoted(text):
+    """`text` as one argument of a shell command: in double quotes when it has a space, which PowerShell, cmd
+    and POSIX shells all take."""
+    return f'"{text}"' if " " in text else text
 
 
 def levels(state, build=None):
@@ -141,7 +148,7 @@ def levels(state, build=None):
         no_mc = []
     more = ([f"the test programs {', '.join(state['more_missing'])} in {where}: cmake --build without --target "
              "builds them (the d3d12 one on Windows only)"] if state.get("more_missing") else [])
-    run = f"python -I scripts/run_gpu_tests.py --build {where}"
+    run = f"python -I scripts/run_gpu_tests.py --build {quoted(where)}"
     return [
         {"level": "semantic", "ready": True, "missing": [],
          "command": "python -I scripts/run_semantic_tests.py tests/semantic"},
@@ -149,7 +156,8 @@ def levels(state, build=None):
          "missing": common + ([] if state["listings"] else [f"the listings in {FIXTURES}"]),
          "command": f"{run} --disasm-dir {FIXTURES}"},
         {"level": "full", "ready": not common and not no_mc and not more, "missing": common + more + no_mc,
-         "command": run},
+         # An llvm-mc named on this command line is not in LLVM_MC: the runner has to be told as well.
+         "command": run + (f" --llvm-mc {quoted(state['llvm_mc_option'])}" if state.get("llvm_mc_option") else "")},
     ]
 
 
