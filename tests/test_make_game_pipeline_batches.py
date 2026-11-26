@@ -35,7 +35,9 @@ if sys.argv[1] == "--merge":
         f.write(json.dumps([str(p) for p in inputs]) + "\n")
     if control.get("merge_exit"):
         sys.exit(control["merge_exit"])
-    merged = json.loads(out.read_text(encoding="utf-8")) if out.exists() else []
+    # like the real merge, an output seed of another GPU or driver is replaced
+    seed = out.read_text(encoding="utf-8") if out.exists() else "[]"
+    merged = [] if seed.startswith("foreign") else json.loads(seed)
     for p in inputs:
         merged += json.loads(p.read_text(encoding="utf-8"))
     out.write_text(json.dumps(merged), encoding="utf-8", newline="\n")
@@ -148,7 +150,7 @@ class PipelineBatchesTest(unittest.TestCase):
         with mock.patch.object(make_game, "pipeline_check_exe", return_value="synthetic-checker"), \
                 mock.patch.object(make_game, "checker_supports", side_effect=supports), \
                 mock.patch.object(make_game, "checker_device_info", side_effect=lambda exe: dict(self.device)), \
-                mock.patch.object(make_game, "checker_fingerprint", side_effect=lambda exe: self.fingerprint), \
+                mock.patch.object(make_game, "checker_fingerprint", side_effect=lambda exe: self.fingerprint),                 mock.patch.object(make_game, "pipeline_cache_device", side_effect=self.cache_device), \
                 mock.patch.object(make_game, "PIPELINE_BATCH_SIZE", 3, create=True), \
                 mock.patch.object(make_game, "run", side_effect=run), \
                 mock.patch.object(make_game, "log", side_effect=logs.append), contextlib.redirect_stderr(err):
@@ -157,6 +159,25 @@ class PipelineBatchesTest(unittest.TestCase):
             except SystemExit as exc:
                 return exc.code, logs, err.getvalue()
         return 0, logs, err.getvalue()
+
+    def cache_device(self, path):
+        """The stand-in cache has no Vulkan header: it is this device's unless a test marks it foreign."""
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except OSError:
+            return None
+        if text.startswith("foreign"):
+            return 0x1002, 0x73BF, "22" * 16
+        return int(self.device["vendor"], 16), int(self.device["device"], 16), self.device["uuid"]
+
+    def extra_set(self, name, modules=("x_0",), control=None):
+        folder = self.spirv / name
+        folder.mkdir(exist_ok=True)
+        (folder / "index.json").write_text(json.dumps({m: {} for m in modules}), encoding="utf-8", newline="\n")
+        (folder / "control.json").write_text(json.dumps(control or {}), encoding="utf-8", newline="\n")
+        for m in modules:
+            (folder / (m + ".spv")).write_bytes(f"{name}/{m}".encode())
+        return folder
 
     def calls(self, event=None):
         path = self.spirv / "calls.jsonl"
@@ -183,6 +204,18 @@ class PipelineBatchesTest(unittest.TestCase):
                          self.names + ["b_0"])
         rows = [json.loads(line) for line in (bvh / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual([row["selected"] for row in rows if row["event"] == "completed"], [["b_0"]])
+
+    def test_fspx_and_exe_pipelines_are_added_to_the_runtime_seed_but_not_library(self):
+        self.extra_set("fspx", ["f_0", "f_1"])
+        self.extra_set("exe", ["e_0"])
+        self.extra_set("library", ["l_0"])
+        self.extra_set("fspx_gfx", ["g_0"])
+        code, _, err = self.invoke()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(json.loads((self.out / "pipeline_cache.bin").read_text(encoding="utf-8"))),
+                         sorted(self.names + ["f_0", "f_1", "e_0"]))
+        self.assertFalse(any(c[1] in (str(self.spirv / "library"), str(self.spirv / "fspx_gfx"))
+                             for c in self.commands))
 
     def test_collective_memory_crash_splits_without_skipping_healthy_modules(self):
         code, logs, err = self.invoke({"max_batch": 2})
@@ -441,6 +474,73 @@ class ShardedPipelineBatchesTest(PipelineBatchesTest):
         self.assertEqual(self.invoke()[0], 0)
         self.assertEqual((bvh_runs(), len(self.merges())), (2, 2))
         self.assertEqual(self.cache(), self.names + ["b_0", "b_0"])
+
+    def test_fspx_and_exe_run_again_only_when_their_shaders_change(self):
+        fspx = self.extra_set("fspx", ["f_0", "f_1"])
+        exe = self.extra_set("exe", ["e_0"])
+        runs = lambda folder: sum(1 for c in self.commands if c[1] == str(folder))   # noqa: E731
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual((runs(fspx), runs(exe), len(self.merges())), (1, 1, 1))
+        self.assertEqual(sorted(self.done_list()["extras"]), ["exe", "fspx"])
+        self.assertTrue(all(r["shard"] is None for r in self.done_list()["extras"].values()))
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual((runs(fspx), runs(exe), len(self.merges())), (1, 1, 1))
+        (fspx / "f_1.spv").write_bytes(b"fspx, retranslated")
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual((runs(fspx), runs(exe), len(self.merges())), (2, 1, 2))
+
+    def test_a_failing_extra_set_is_not_recorded_but_the_rest_is_merged(self):
+        self.extra_set("fspx", ["f_0"], control={"invalid": "f_0"})
+        exe = self.extra_set("exe", ["e_0"])
+        code, _, _ = self.invoke()
+        self.assertNotEqual(code, 0)
+        self.assertEqual(len(self.merges()), 1)
+        self.assertEqual(sorted(self.done_list()["extras"]), ["exe"])
+        self.assertIn("e_0", self.cache())
+        self.assertEqual(sum(1 for c in self.commands if c[1] == str(exe)), 1, "the next set still runs")
+
+    def test_a_done_list_from_before_the_extra_sets_keeps_its_bvh_record(self):
+        bvh = self.extra_set("bvh", ["b_0"])
+        self.assertEqual(self.invoke()[0], 0)
+        doc = self.done_list()
+        doc["bvh"] = doc.pop("extras")["bvh"]
+        (self.out / "pipeline_done.json").write_text(json.dumps(doc), encoding="utf-8", newline="\n")
+        before = len(self.calls("started"))
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual(len(self.calls("started")), before)
+        self.assertEqual(sum(1 for c in self.commands if c[1] == str(bvh)), 1)
+        self.assertNotIn("bvh", self.done_list())
+        self.assertEqual(sorted(self.done_list()["extras"]), ["bvh"])
+
+    def test_an_outside_write_to_the_cache_keeps_the_done_list(self):
+        self.assertEqual(self.invoke()[0], 0)
+        # e.g. the checker run straight into pipeline_cache.bin for another shader set: larger and newer
+        cache = self.out / "pipeline_cache.bin"
+        cache.write_text(json.dumps(self.cache() + ["outside_0", "outside_1"]), encoding="utf-8", newline="\n")
+        before = len(self.calls("started"))
+        code, logs, err = self.invoke()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.calls("started")), before, "nothing is checked again")
+        self.assertTrue(any("keeping the done-list" in line for line in logs), logs)
+        self.assertEqual(sorted(self.done_list()["modules"]), self.names)
+        self.assertEqual(self.done_list()["cache"]["size"], cache.stat().st_size)
+        code, logs, err = self.invoke()   # the new stamp is recorded, so it is not reported again
+        self.assertEqual(code, 0, err)
+        self.assertFalse(any("keeping the done-list" in line for line in logs), logs)
+
+    def test_a_shrunken_or_foreign_cache_checks_its_modules_again_and_says_why(self):
+        for what, text, reason in (("shrank", "[]", "shrank from"),
+                                   ("foreign", "foreign" + " " * 4096, "not by this GPU and driver")):
+            with self.subTest(what=what):
+                self.assertEqual(self.invoke()[0], 0)
+                (self.out / "pipeline_cache.bin").write_text(text, encoding="utf-8", newline="\n")
+                since = len(self.calls("completed"))
+                code, logs, err = self.invoke()
+                self.assertEqual(code, 0, err)
+                self.assertEqual(sorted(self.checked(since)), self.names)
+                self.assertTrue(any(reason in line and "7 module(s)" in line for line in logs), logs)
+                (self.out / "pipeline_cache.bin").unlink()
+                (self.out / "pipeline_done.json").unlink()
 
     def test_a_removed_cache_builds_everything_again(self):
         self.assertEqual(self.invoke()[0], 0)

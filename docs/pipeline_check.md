@@ -396,16 +396,19 @@ back: on an RTX 4070 SUPER (NVIDIA 621.01) the full set's cache is 9.6 GB, and t
 process. A run after a translator change also checked all 26,503 modules again, even the unchanged ones (they compile
 from the cache, but each process still pays the load and save). With a checker that has `--merge`, the stage instead:
 
-- gives each process (and each single-module crash probe and the BVH builder pass) its own empty cache,
+- gives each process (and each single-module crash probe and each pass over an extra set) its own empty cache,
   `pipeline_shards/NNNNN.bin` in `--out`, and its batch through `--names-file`;
 - merges the shards into `pipeline_cache.bin` once at the end (`--merge`), then removes them. A run that was stopped
   (Ctrl+C, a setup error, the crash retries running out) keeps its shards, and the next run merges them. A run with a
   validation failure still merges what was built, as each process's own cache save did before;
 - records each module its `--done-file` names in `pipeline_done.json` in `--out`, with the SHA-256 of its `.spv` and
   of its index entry and the shard it went to. A later run skips the modules recorded with the same hashes, so after
-  a translator change only the modules whose SPIR-V (or index entry) changed are built. The XboxBvhBuilder pass is
-  recorded the same way by a hash of its `index.json` and `.spv` files, so an unchanged corpus starts no process and
-  needs no merge.
+  a translator change only the modules whose SPIR-V (or index entry) changed are built;
+- after the main set, checks the extra sets the runtime seed needs, each whole in one process: `bvh/`
+  (XboxBvhBuilder), `fspx/` (the FidelityFX DLL's compute programs) and `exe/` (the executable's own programs). Each
+  is recorded under `extras` by a hash of its `index.json` and `.spv` files, so an unchanged corpus starts no process
+  and needs no merge. `library/` and `fspx_gfx/` are not checked: on NVIDIA the seed does not hit for them ([#1608](https://github.com/ubiquitarianism/leonida/issues/1608)). A
+  set that fails is not recorded and fails the stage, but the other sets and the merge still run.
 
 The whole list is tied to one identity: vendor and device ID, driver version and `pipelineCacheUUID`
 (`--device-info`), the checker, the partner stubs in `stubs/` and the list's format. A change of any of them checks
@@ -413,9 +416,10 @@ every module again. A new GPU or driver also drops leftover shards and starts fr
 no use to it). A new checker or new stubs on the same driver instead checkpoint into the existing `pipeline_cache.bin`
 for that one run, as the first run does, so the pipelines it holds compile from it; leftover shards are merged. The checker is named by the SHA-256 of its sources when it is the
 current build in this checkout's `runtime/build` (the `cl.exe` fallback of `scripts/build_runtime.ps1` relinks it on
-every runtime stage), otherwise by the SHA-256 of the executable. Entries already merged hold only while
-`pipeline_cache.bin` has the size and modification time the last merge left; deleting the cache builds everything
-again. A module that failed, crashed the driver or was not checked is not on the list, so it is checked on every run
+every runtime stage), otherwise by the SHA-256 of the executable. Entries already merged into `pipeline_cache.bin`
+are kept when something else writes to it (a checker run straight into it only adds pipelines), and dropped, with a
+line saying why, only when the cache is gone or empty, is smaller than the last merge left it, or its header names
+another vendor, device or `pipelineCacheUUID`; deleting the cache builds everything again. A module that failed, crashed the driver or was not checked is not on the list, so it is checked on every run
 as before. The first run over a `pipeline_cache.bin` from before the done-list keeps the old per-process load and save,
 so what that cache holds still compiles from it; later runs use shards.
 
