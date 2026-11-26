@@ -49,6 +49,19 @@ class StageOfCacheTest(unittest.TestCase):
             os.remove(os.path.join(os.path.dirname(listing), "..", "index.json"))
             self.assertEqual(rdna2spirv.stage_of("shader", listing), "ms")
 
+    def test_a_missing_index_is_not_cached(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "root")
+            disasm = os.path.join(root, "disasm")
+            os.makedirs(disasm)
+            listing = os.path.join(disasm, "shader.s")
+            with open(listing, "w", encoding="utf-8", newline="\n") as f:
+                f.write("\ts_endpgm\n")
+            self.assertEqual(rdna2spirv.stage_of("shader", listing), "?")
+            with open(os.path.join(root, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump([{"file": "shader.dxbc", "stage": "cs"}], f)
+            self.assertEqual(rdna2spirv.stage_of("shader", listing), "cs")
+
 
 if __name__ == "__main__":
     unittest.main()

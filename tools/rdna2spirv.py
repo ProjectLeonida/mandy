@@ -17034,7 +17034,7 @@ def stage_of(name, path):
             with open(idx, encoding="utf-8") as f:
                 for e in json.load(f):
                     stages[e["file"][:-5]] = e["stage"]
-        _STAGES[key] = stages
+            _STAGES[key] = stages
     return stages.get(name) or (name[:2].lower() if name[2:3] == "_" else "?")
 
 
