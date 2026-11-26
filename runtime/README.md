@@ -164,6 +164,11 @@ them the CPU runs them and the handler never sees them. Each emulated instructio
 hot loop of them is slow; patching such a site in place is a later step. `cpu_emulation_test` runs every form for
 real: natively on a Zen host, through the handler on an Intel one.
 
+Pre-Haswell `AVX1 + SSE4.2` hosts (Intel Sandy Bridge and Ivy Bridge) also lack VEX-encoded `BMI1`/`BMI2`, `MOVBE`,
+and `LZCNT`: `src/bmi_emulation.h` emulates `BMI1`, `BMI2` and `MOVBE` on `#UD`, and `Loader::protect_sections`
+patches `.pdata` and leaf `TZCNT`/`LZCNT` sites (`F3 0F BC`/`F3 0F BD`, which otherwise execute without faulting as
+`BSF`/`BSR`) to stubs or `#UD` traps (`LEONIDA_LZCNT_PATCH=0` disables the load-time rewrite).
+
 `module_names` checks native and mapped renamed DLLs, distinct Unicode identities, basename cache
 reuse, existing ACP aliases, the wide and case-insensitive lookups, export execution, and path errors. On native Windows with Python available,
 `run_module_names` compares original renamed EXEs through native execution and `--dry-run`, `--init`,
