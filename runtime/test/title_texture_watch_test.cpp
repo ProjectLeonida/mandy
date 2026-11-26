@@ -20,7 +20,7 @@ struct FakeWatch {
     std::map<std::uintptr_t, Cell> cells;
     std::vector<std::uintptr_t> queue;
     std::map<std::uintptr_t, std::vector<std::uintptr_t>> alias;  // tile -> its other addresses
-    std::set<std::uintptr_t> unarmable;
+    std::set<std::uintptr_t> unarmable, pinned;
     bool on = true, overflow = false;
     std::uint64_t serial = 1;
 
@@ -33,10 +33,11 @@ struct FakeWatch {
         auto it = cells.find(tile);
         if (it != cells.end() && !--it->second.refs) cells.erase(it);
     }
-    bool arm(std::uintptr_t tile, Cell& c) {
-        if (unarmable.count(tile)) return false;
+    int arm(std::uintptr_t tile, Cell& c) {
+        if (pinned.count(tile)) return 0;
+        if (unarmable.count(tile)) return -1;
         c.armed = true;
-        return true;
+        return 1;
     }
     void aliases(std::uintptr_t tile, std::vector<std::uintptr_t>& out) {
         if (const auto it = alias.find(tile); it != alias.end()) out = it->second;
@@ -167,6 +168,32 @@ int main() {
         EXPECT((collect(w) == V{6}));
         EXPECT((collect(w) == V{6}));
     }
+    {  // a kernel write in progress: named, but busy (not to be read) until the pin ends; then read once
+        FakeWatch f;
+        Watch w(f);
+        w.track(2, base, 2 * kTile);
+        collect(w);
+        f.write(base + kTile);
+        f.pinned.insert(base + kTile);
+        std::vector<Watch::Look> looks;
+        const auto pass = [&] {
+            looks.clear();
+            w.collect([&](std::uint64_t k) { looks.push_back(w.examine(k)); });
+        };
+        pass();
+        EXPECT(looks.size() == 1 && looks[0] == Watch::Look::busy);
+        pass();
+        EXPECT(looks.size() == 1 && looks[0] == Watch::Look::busy);
+        f.pinned.clear();
+        pass();
+        EXPECT(looks.size() == 1 && looks[0] == Watch::Look::armed);
+        pass();
+        EXPECT(looks.empty());
+        f.unarmable.insert(base);  // a guard that cannot be set: read every time
+        f.write(base);
+        pass();
+        EXPECT(looks.size() == 1 && looks[0] == Watch::Look::unwatched);
+    }
     {  // a lost queue names every texture once; untrack releases the tiles
         FakeWatch f;
         Watch w(f);
@@ -182,6 +209,7 @@ int main() {
         EXPECT(w.tiles() == 0 && w.textures() == 0);
     }
     if (failures) return 1;
-    std::puts("title texture watch: new, untouched, one page, two addresses, remap, every frame, unarmable, lost queue");
+    std::puts("title texture watch: new, untouched, one page, two addresses, remap, every frame, unarmable, kernel "
+              "write in progress, lost queue");
     return 0;
 }
