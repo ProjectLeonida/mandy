@@ -40,11 +40,58 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <utility>
 #include <vector>
 
 namespace leonida {
+
+// A texture's bytes in each 64 KiB tile it covers, hashed as of its last read. When some of its tiles were written
+// (TitleTextureWatch::examine's `written`), only its bytes in those tiles are hashed again: equal, and the texture is
+// unchanged without being read whole. A write to a neighbour in the same tile costs that texture its share of the
+// tile, not a read of all of it. The faults that report writes are per tile (the geometry watch's cells reopen a
+// whole tile, which the geometry copies sharing them depend on), so this is the finest the watch can tell apart.
+struct TilePieces {
+    static constexpr std::uintptr_t kTile = 0x10000;
+    std::uintptr_t cpu = 0;
+    std::uint64_t span = 0;
+    std::vector<std::uint64_t> hashes;  // per tile from cpu's tile on
+
+    // The texture's bytes [cpu, cpu + span) inside `tile`, as an offset from cpu and a length.
+    static std::pair<std::uint64_t, std::uint64_t> part(std::uintptr_t cpu, std::uint64_t span, std::uintptr_t tile) {
+        const std::uintptr_t from = (std::max)(cpu, tile), to = (std::min)(std::uintptr_t(cpu + span), tile + kTile);
+        return from < to ? std::pair<std::uint64_t, std::uint64_t>{from - cpu, to - from}
+                         : std::pair<std::uint64_t, std::uint64_t>{0, 0};
+    }
+    bool valid_for(std::uintptr_t at, std::uint64_t bytes) const {
+        return cpu == at && span == bytes && !hashes.empty();
+    }
+    // From a whole copy of the texture's bytes: hash(pointer, length) of each tile's part.
+    template<class Hash>
+    void compute(std::uintptr_t at, std::uint64_t bytes, const std::uint8_t* copy, Hash&& hash) {
+        cpu = at;
+        span = bytes;
+        hashes.clear();
+        for (std::uintptr_t tile = at & ~(kTile - 1); tile < at + bytes; tile += kTile) {
+            const auto [offset, length] = part(at, bytes, tile);
+            hashes.push_back(hash(copy + offset, length));
+        }
+    }
+    // Whether the texture's parts in `written` hash as before: hash(title address, length) reads them where they are.
+    // False when a part differs, cannot be read (hash returns nullopt) or is not known.
+    template<class Hash>
+    bool unchanged(const std::vector<std::uintptr_t>& written, Hash&& hash) const {
+        for (const std::uintptr_t tile : written) {
+            const std::size_t i = (tile - (cpu & ~(kTile - 1))) / kTile;
+            if (tile < (cpu & ~(kTile - 1)) || i >= hashes.size()) return false;
+            const auto [offset, length] = part(cpu, span, tile);
+            const auto h = hash(cpu + offset, length);
+            if (!h || *h != hashes[i]) return false;
+        }
+        return true;
+    }
+};
 
 template<class Watch, class Key = std::uint64_t>
 class TitleTextureWatch {
@@ -157,6 +204,16 @@ public:
                 for (const Key k : it->second.textures)
                     if (dirty_.insert(k).second) ++stats_.unarmed_named;
             }
+        // The tiles written as of now, for examine()'s `written`: the first texture examined over a tile arms it again,
+        // and the others over it must still see it written.
+        pass_written_.clear();
+        for (const Key k : dirty_) {
+            const auto it = textures_.find(k);
+            if (it == textures_.end()) continue;
+            for (std::uintptr_t a = it->second.first; a < it->second.last; a += kTile)
+                if (const auto t = tiles_.find(a); t != tiles_.end() && (t->second.stale || unarmed_.count(a)))
+                    pass_written_.insert(a);
+        }
         named_.assign(dirty_.begin(), dirty_.end());
         dirty_.clear();
         stats_.named += named_.size();
@@ -169,13 +226,16 @@ public:
 
     // Before the texture's bytes are read for an upload: its tiles that changed (or were never armed) are armed
     // again, so a write from now on is seen by the next collect(). Tiles not armed are tried at the next collect().
-    Look examine(Key key) {
+    // `written` (optional) gets those tiles: the only ones whose bytes can differ from the texture's last read.
+    Look examine(Key key, std::vector<std::uintptr_t>* written = nullptr) {
+        if (written) written->clear();
         const auto it = textures_.find(key);
         if (it == textures_.end()) return Look::unwatched;
         Look look = Look::armed;
         for (std::uintptr_t a = it->second.first; a < it->second.last; a += kTile) {
             const auto t = tiles_.find(a);
             if (t == tiles_.end()) continue;
+            if (written && (pass_written_.count(a) || t->second.stale || unarmed_.count(a))) written->push_back(a);
             const int armed = arm(a, t->second);
             if (!armed) look = Look::busy;
             else if (armed < 0 && look == Look::armed) look = Look::unwatched;
@@ -278,6 +338,7 @@ private:
     std::map<Key, Texture> textures_;
     std::set<std::uintptr_t> unarmed_;
     std::set<Key> dirty_, over_;
+    std::set<std::uintptr_t> pass_written_;  // the tiles written as the last collect() found them
     std::vector<Key> named_;
     std::vector<std::uintptr_t> written_, aliases_;
     Stats stats_;

@@ -3062,6 +3062,29 @@ struct DeviceState {
     TitleTextureCells texture_cells;
     leonida::TitleTextureWatch<TitleTextureCells> texture_watch{texture_cells};
     void index_texture(const TitleTexture& t);
+    // The CPU-view ranges of the registered GPU-written textures (render targets, depth, unordered access), by their
+    // registry address. A texture over such memory is not filled from it (index_texture): the title's pages there
+    // hold what the CPU last put there, never what our GPU renders into the image, and a fill uploaded those old
+    // bytes, in 64 KiB pieces as write-backs and neighbours' writes marked their tiles written. Under
+    // title_texture_mutex.
+    std::map<std::uint64_t, std::pair<std::uintptr_t, std::uintptr_t>> gpu_owned;
+    std::uint64_t gpu_owned_refusals = 0;
+    bool over_gpu_owned(std::uintptr_t begin, std::uintptr_t end) const {
+        for (const auto& [key, range] : gpu_owned)
+            if (range.first < end && begin < range.second) return true;
+        return false;
+    }
+    void add_gpu_owned(std::uint64_t key, std::uintptr_t cpu, std::uint64_t span);
+    // Textures named by their first descriptor since the last refresh (Resource::note_shader_view; any thread, under
+    // any lock: this one is a leaf).
+    std::mutex titles_named_mutex;
+    std::vector<std::uint64_t> titles_named;
+    std::atomic<bool> titles_named_pending{false};
+    void title_texture_named(std::uint64_t address) {
+        std::lock_guard lock(titles_named_mutex);
+        titles_named.push_back(address);
+        titles_named_pending.store(true, std::memory_order_release);
+    }
     void title_texture_mapped(const void* resource, std::uint64_t address);
     void title_texture_unmapped(const void* resource, std::uint64_t address);  // the title wrote texels
     void title_texture_gone(const void* resource, std::uint64_t address);
@@ -8630,7 +8653,12 @@ public:
     }
     // Map and the destructor notify the registry for a slot-133 placement.
     void mark_title_texture() { title_texture_ = true; }
-    void note_shader_view() const { shader_views_.fetch_add(1, std::memory_order_relaxed); }
+    // Every descriptor of the texture (a D3D12 view, a slot-70 view, a T# the title wrote into a console heap) comes
+    // here. The first one of a title texture tells the registry, which fills it from memory only from then on.
+    void note_shader_view() const {
+        if (!shader_views_.fetch_add(1, std::memory_order_relaxed) && title_texture_ && title_address_)
+            device_.title_texture_named(reinterpret_cast<std::uint64_t>(title_address_));
+    }
     std::uint32_t shader_views() const { return shader_views_.load(std::memory_order_relaxed); }
     // The element a CPU copy moves (a 4x4 block for block-compressed formats), as WriteToSubresource takes it.
     leonida::BlockFormat copy_element() const { return leonida::copy_block_format(binding_, VK_IMAGE_ASPECT_COLOR_BIT); }
@@ -13777,6 +13805,7 @@ struct TitleTexture {
     leonida::TextureReadability memory;     // protected by title_texture_mutex
     std::vector<DXGI_FORMAT> formats;       // owned: the image's format and castable view formats
     std::uint64_t hash = 0;                 // hash_guarded (every byte) of the bytes the image was last filled from
+    leonida::TilePieces pieces;             // and of its part in each 64 KiB tile (the refresh's reads)
     bool hashed = false;
     std::uint64_t fills = 0;
 };
@@ -13810,9 +13839,30 @@ bool title_xg_layout(const Resource& r, rt::xg_xs::Texture& out, std::array<std:
 
 // Whether the refresh fills the texture from memory, and so watches its pages: not a texture the GPU writes, not one
 // without a layout, and not a slot-133 texture whose layout is only guessed until the title maps it.
+// The watched textures over the new range stop being filled from memory.
+void DeviceState::add_gpu_owned(std::uint64_t key, std::uintptr_t cpu, std::uint64_t span) {
+    gpu_owned[key] = {cpu, cpu + span};
+    std::vector<std::uint64_t> over;
+    texture_watch.for_each_over(cpu, cpu + span, [&](std::uint64_t k) { over.push_back(k); });
+    for (const std::uint64_t k : over) {
+        const auto it = title_textures.find(k);
+        if (it != title_textures.end() && over_gpu_owned(it->second->cpu, it->second->cpu + it->second->layout.layout.size))
+            texture_watch.untrack(k);
+    }
+}
+
+// Not one nothing names yet either: a texture no descriptor names is not read, uploaded or watched (the title may
+// fill it over many passes before its first view); its first descriptor (title_texture_named) brings it in, and it is
+// read whole and uploaded before the submission that made that descriptor. An image made for slot-70 views is named
+// by the view it is made for.
 void DeviceState::index_texture(const TitleTexture& t) {
-    const bool filled = !t.gpu_written && t.layout_known && t.resource &&
+    const bool filled = !t.gpu_written && t.layout_known && t.resource && (t.owned || t.resource->shader_views()) &&
                         !((t.layout_guessed || t.layout_from_xg) && !t.mapped && !t.stale);
+    if (filled && over_gpu_owned(t.cpu, t.cpu + t.layout.layout.size)) {
+        ++gpu_owned_refusals;
+        texture_watch.untrack(t.address);
+        return;
+    }
     if (filled)
         texture_watch.track(t.address, t.cpu, t.layout.layout.size);
     else
@@ -13880,6 +13930,7 @@ void DeviceState::title_texture_gone(const void* resource, std::uint64_t address
         if (it != title_textures.end() && it->second->resource == resource) {
             it->second->resource = nullptr;
             texture_watch.untrack(address);
+            gpu_owned.erase(address);
         }
         titles_gone.push_back({resource, address});
         titles_gone_pending.store(true, std::memory_order_release);
@@ -13894,6 +13945,7 @@ void DeviceState::title_texture_gone(const void* resource, std::uint64_t address
     const auto it = title_textures.find(address);
     if (it != title_textures.end() && it->second->resource == resource) {
         texture_watch.untrack(address);
+        gpu_owned.erase(address);
         it->second->resource = nullptr;
         title_textures.erase(it);
     }
@@ -15927,9 +15979,28 @@ public:
                 std::memcpy(entry->desc.data(), &d, sizeof(d));
             }
         }
+        // The memory a GPU-written texture covers: what the console's GPU renders there, our GPU renders into the image
+        // instead. Its console footprint (XG's default layout), or its image's size if larger or unknown.
+        std::uint64_t gpu_span = 0;
+        if (entry->gpu_written) {
+            rt::xg_xs::ResourceDesc d{};
+            d.dimension = std::uint32_t(desc.Dimension);
+            d.width = desc.Width;
+            d.height = desc.Height;
+            d.depth_or_array = desc.DepthOrArraySize;
+            d.mips = desc.MipLevels;
+            d.format = std::uint32_t(desc.Format);
+            d.samples = 1;
+            rt::xg_xs::Texture layout{};
+            const char* why = nullptr;
+            gpu_span = std::max<std::uint64_t>(title_layout(d, layout, why) ? layout.layout.size : 0,
+                                               texture->image_backing_bytes());
+        }
         texture->mark_title_texture();
         {
             std::lock_guard lock(state_.title_texture_mutex);
+            state_.gpu_owned.erase(address);
+            if (gpu_span) state_.add_gpu_owned(address, entry->cpu, gpu_span);
             if (entry->gpu_written && !(address & 0xff) && texture->image_address() != address) {
                 std::lock_guard descriptors(state_.descriptor_mutex);
                 state_.gpu_placements.add(address, texture);
@@ -16000,6 +16071,21 @@ public:
                 watch.note_changed(from, to);
             }
         }
+        if (state_.titles_named_pending.load(std::memory_order_acquire)) {
+            std::vector<std::uint64_t> named;
+            {
+                std::lock_guard lock(state_.titles_named_mutex);
+                named.swap(state_.titles_named);
+                state_.titles_named_pending.store(false, std::memory_order_relaxed);
+            }
+            for (const std::uint64_t address : named) {
+                const auto it = state_.title_textures.find(address);
+                if (it != state_.title_textures.end() && it->second->resource && !watch.tracked(address)) {
+                    state_.index_texture(*it->second);
+                    ++stats.first_named;
+                }
+            }
+        }
         title_named_.clear();
         watch.collect([&](std::uint64_t key) { title_named_.push_back(key); });
         // Not filled: with no backing yet or after a failed upload it is looked at again next pass. Memory not
@@ -16030,9 +16116,13 @@ public:
                     not_filled(t);
                     continue;
                 }
+                if (job.whole) {
+                    ++stats.read_whole;
+                    t.pieces = std::move(job.pieces);
+                }
                 if (job.unchanged) {
                     rt::d3d12::TitleImageUpload::unreserve(*job.slot);
-                    ++stats.unchanged;
+                    ++(job.whole ? stats.unchanged : stats.unchanged_parts);
                     t.stale = false;
                     continue;
                 }
@@ -16078,7 +16168,7 @@ public:
             if (t.gpu_written || !t.layout_known) continue;
             // Armed before it is read: a write from now on is in the next pass. A kernel write still in progress
             // over it: read once it is done (its tile stays unarmed, so the next pass names it again).
-            if (watch.examine(key) == leonida::TitleTextureWatch<TitleTextureCells>::Look::busy) {
+            if (watch.examine(key, &title_written_) == leonida::TitleTextureWatch<TitleTextureCells>::Look::busy) {
                 ++stats.busy;
                 continue;
             }
@@ -16105,6 +16195,13 @@ public:
             job.slot = slot;
             job.span = t.layout.layout.size;
             job.previous = t.hashed && t.fills ? std::optional<std::uint64_t>(t.hash) : std::nullopt;
+            // Only some of its tiles written: those parts are compared first, in place (read_title_job).
+            const std::size_t tiles = std::size_t(((t.cpu + job.span + 0xffff) & ~std::uint64_t(0xffff)) -
+                                                  (t.cpu & ~std::uint64_t(0xffff))) >> 16;
+            job.pieces = t.pieces;
+            job.compare = job.previous && t.pieces.valid_for(t.cpu, job.span) && !title_written_.empty() &&
+                          title_written_.size() < tiles;
+            if (job.compare) job.written = title_written_;
             job.write_combined = title_memory_write_combined(t.cpu);
             job.trace = leonida::dstorage::trace_enabled() && leonida::title_gpu_views::other_view(t.cpu);
             batch_bytes += job.span;
@@ -16129,16 +16226,27 @@ public:
             stats.last_log = now;
             const auto& w = watch.stats();
             const auto& l = title_watch_logged_;
+            // Registered textures that would be filled from memory but no descriptor names yet: not read, not
+            // watched (index_texture), whatever the title writes into them.
+            std::size_t unnamed = 0;
+            for (const auto& [address, entry] : state_.title_textures)
+                unnamed += entry->resource && !entry->gpu_written && entry->layout_known && !entry->owned &&
+                           !entry->resource->shader_views();
             std::fprintf(stderr,
-                         "[rt] d3d12: title texture refresh: %llu passes, %llu textures looked at (%llu named over "
-                         "tiles not armed, %llu left for a kernel write in progress), %llu uploaded (%.1f MiB), %llu "
-                         "unchanged; %llu written tiles, %llu arms (%llu busy, %llu refused), %llu queue overflows; %zu "
-                         "textures over %zu tiles watched, %zu tiles not armed; %.3f ms a pass, %.3f at most\n",
+                         "[rt] d3d12: title texture refresh: %llu passes; %llu textures written or new, %llu read whole, "
+                         "%llu found unchanged by their written parts alone, %llu left for a kernel write in progress, "
+                         "%llu named over tiles not armed; %llu uploaded (%.1f MiB), %llu read whole and unchanged; %llu "
+                         "named for the first time, %zu not named by any descriptor (not read); %llu written tiles, "
+                         "%llu arms (%llu busy, %llu refused), %llu queue overflows; %zu textures over %zu tiles "
+                         "watched, %zu tiles not armed; %.3f ms a pass, %.3f at most\n",
                          static_cast<unsigned long long>(stats.passes), static_cast<unsigned long long>(stats.checked),
-                         static_cast<unsigned long long>(w.unarmed_named - l.unarmed_named),
+                         static_cast<unsigned long long>(stats.read_whole),
+                         static_cast<unsigned long long>(stats.unchanged_parts),
                          static_cast<unsigned long long>(stats.busy),
+                         static_cast<unsigned long long>(w.unarmed_named - l.unarmed_named),
                          static_cast<unsigned long long>(stats.changed), double(stats.filled_bytes) / 1048576.0,
                          static_cast<unsigned long long>(stats.unchanged),
+                         static_cast<unsigned long long>(stats.first_named), unnamed,
                          static_cast<unsigned long long>(w.written_tiles - l.written_tiles),
                          static_cast<unsigned long long>(w.arms - l.arms),
                          static_cast<unsigned long long>(w.arm_busy - l.arm_busy),
@@ -16149,6 +16257,7 @@ public:
             title_watch_logged_ = w;
             if (leonida::fsdraw::enabled()) log_title_census("refresh");
             stats.passes = stats.checked = stats.busy = stats.changed = stats.unchanged = stats.filled_bytes = 0;
+            stats.read_whole = stats.unchanged_parts = stats.first_named = 0;
             stats.refresh_ns = stats.max_refresh_ns = stats.max_pass_bytes = 0;
         }
         inside.reset();
@@ -16166,6 +16275,7 @@ private:
         std::uint64_t views = 0, null_views = 0, of_slot133 = 0, of_cache = 0, made = 0, retired = 0, registered = 0,
                       refusals = 0, written_ranges = 0, unmaps = 0, unreadable = 0, pending_views = 0;
         std::uint64_t fills = 0, fill_bytes = 0, fill_failures = 0, unchanged = 0, busy = 0;
+        std::uint64_t read_whole = 0, unchanged_parts = 0, first_named = 0;
         std::uint64_t staged_fills = 0, staged_ns = 0;
         // refresh_title_textures, since the last log line
         std::uint64_t passes = 0, checked = 0, hashed = 0, changed = 0, deferred = 0, filled_bytes = 0,
@@ -16183,6 +16293,7 @@ private:
     TitleTextureStats title_stats_;                                 // under title_texture_mutex
     bool title_pass_ = false;                                      // in refresh_title_textures, likewise
     std::vector<std::uint64_t> title_named_;                       // refresh scratch, under title_texture_mutex
+    std::vector<std::uintptr_t> title_written_;                    // likewise
     // One texture of a refresh batch: what the serial part found (the slot reserved for it, the last fill's hash) and
     // what a TitleReadPool thread read (read_title_job).
     struct TitleJob {
@@ -16191,6 +16302,9 @@ private:
         rt::d3d12::TitleImageUpload::Slot* slot = nullptr;
         std::uint64_t span = 0, hash = 0;
         std::optional<std::uint64_t> previous;
+        leonida::TilePieces pieces;                // the texture's, then (read whole) the new ones
+        std::vector<std::uintptr_t> written;       // its tiles written since its last read (compare)
+        bool compare = false, whole = false;
         bool write_combined = false, trace = false, copied = false, unchanged = false, nonzero = false;
         std::vector<std::uint8_t> tiled;
         std::vector<std::uint64_t> columns;
@@ -16771,11 +16885,27 @@ private:
     // last fill's, the detile into the reserved upload slot. Touches only the job's own buffers and slot.
     void read_title_job(TitleJob& job) {
         const TitleTexture& t = *job.entry;
+        job.whole = false;
+        // Its parts in the tiles written since its last read, hashed where they are: equal, and it is unchanged.
+        if (job.compare && job.pieces.unchanged(job.written, [](std::uintptr_t from, std::uint64_t bytes) {
+                std::uint64_t h = 0;
+                return hash_guarded(reinterpret_cast<const std::uint8_t*>(from), std::size_t(bytes), h, true)
+                           ? std::optional<std::uint64_t>(h) : std::nullopt;
+            })) {
+            job.copied = job.unchanged = true;
+            return;
+        }
+        job.whole = true;
         job.tiled.resize(std::size_t(job.span));
         job.copied = copy_guarded(job.tiled.data(), reinterpret_cast<const std::uint8_t*>(t.cpu), std::size_t(job.span),
                                   job.write_combined);
         if (!job.copied) return;
         hash_guarded(job.tiled.data(), job.tiled.size(), job.hash, true);
+        job.pieces.compute(t.cpu, job.span, job.tiled.data(), [](const std::uint8_t* p, std::uint64_t bytes) {
+            std::uint64_t h = 0;
+            hash_guarded(p, std::size_t(bytes), h, true);
+            return h;
+        });
         job.unchanged = job.previous && *job.previous == job.hash;
         if (job.unchanged) return;
         job.nonzero = false;
