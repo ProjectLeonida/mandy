@@ -84,6 +84,19 @@ public:
         count_.store(ranges_.size(), std::memory_order_release);
     }
 
+    // A copy that answered for [title_va, title_va + bytes) at shader_va went, whether or not it had a range here (a
+    // geometry copy that vsharp_address or a placed view reached through GeometryViews directly has none): what was
+    // translated through it is stale. Recorded as a removal would be: the console heaps translate the slots in the
+    // range again (invalidations, changed_ranges), and the GPU key table drops answers into shader_va (take_removed).
+    void forget_copy(std::uint64_t title_va, std::uint64_t bytes, std::uint64_t shader_va) {
+        if (!bytes) return;
+        std::unique_lock lock(mutex_);
+        changes_.record(title_va, bytes);
+        note_removed(shader_va, bytes);
+        invalidations_.fetch_add(1, std::memory_order_release);
+        generation_.fetch_add(1, std::memory_order_release);
+    }
+
     // The address a shader must be given for `va` from the ranges added so far: translated inside one, unchanged
     // elsewhere. No copy is made here.
     std::uint64_t shader_va(std::uint64_t va, std::uint64_t bytes = 1) const {

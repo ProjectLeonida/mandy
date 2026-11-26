@@ -2577,6 +2577,45 @@ struct DeviceState {
     std::uint64_t unbacked_requests = 0;      // title addresses no backing could be made for (zero-size views)
 
     rt::d3d12::GeometryViews geometry;
+    // A retired geometry view: its alias ranges go, and so does every answer made through it without one
+    // (vsharp_address and placed views take geometry_va() directly), by its CPU and its GPU-twin address.
+    static void forget_geometry_alias(std::uintptr_t source, std::size_t size, VkDeviceSize va) {
+        auto& aliases = leonida::title_va_aliases();
+        aliases.remove(source, va);
+        aliases.forget_copy(source, size, va);
+        if (const auto twin = leonida::title_gpu_views::other_view(source)) {
+            aliases.remove(twin, va);
+            aliases.forget_copy(twin, size, va);
+        }
+    }
+    // Before the submission's console heap slots are translated (refresh_shadows): a view retired here is answered
+    // by nothing from now on. It is freed only after every replay in progress has recorded its submissions and those
+    // have completed (GeometryViews::kAfterExecutes, execute_end): this submission's own lists, recorded before, and
+    // another queue's replay that translated its slots before this retirement may still name it. A ticket read here
+    // would be one short of this submission, which records its own only after before_execute_ (and with an idle GPU
+    // the view would be reaped in this very call).
+    void drain_geometry_releases() {
+        if (!context || !geometry.has_pending_reclaim()) return;
+        const std::uint64_t completed_ticket = geometry.has_retired() ? context->completed_retire_ticket() : 0;
+        geometry.drain_released(*this, rt::d3d12::GeometryViews::kAfterExecutes, completed_ticket,
+                                forget_geometry_alias);
+    }
+    // ExecuteCommandLists replays in progress, for GeometryViews::kAfterExecutes (see drain_geometry_releases).
+    static std::vector<std::uint64_t>& geometry_execute_serials() {
+        thread_local std::vector<std::uint64_t> serials;
+        return serials;
+    }
+    void geometry_execute_begin() {
+        if (!geometry.cap()) return;
+        geometry_execute_serials().push_back(geometry.execute_begin());
+    }
+    void geometry_execute_end() {
+        auto& serials = geometry_execute_serials();
+        if (!geometry.cap() || serials.empty()) return;
+        const std::uint64_t serial = serials.back();
+        serials.pop_back();
+        geometry.execute_end(serial, [this] { return context->submitted_retire_ticket(); });
+    }
     static rt::d3d12::GeometryCopy copy_geometry(std::uint8_t* to, const std::uint8_t* from, std::size_t size) {
         using Result = rt::d3d12::GeometryCopy;
         if (!leonida::texture_memory_readable(reinterpret_cast<std::uintptr_t>(from), size)) return Result::unreadable;
@@ -2745,8 +2784,10 @@ struct DeviceState {
             if (aliases.shader_va(extent.start) == extent.start) aliases.add(extent.start, extent.size, shader);
         } else {
             bool geometry_copy = false;
-            if (geometry.cap() && watch_shadow_writes() && !context->knows_buffer_va(extent.start, extent.size))
-                shader = geometry.resolve(*this, extent.start, extent.size, copy_geometry), geometry_copy = shader != 0;
+            if (geometry.cap() && watch_shadow_writes() && !context->knows_buffer_va(extent.start, extent.size)) {
+                shader = geometry.resolve(*this, extent.start, extent.size, copy_geometry);
+                geometry_copy = shader != 0;
+            }
             if (!shader) shader = make_title_window(extent.start, extent.size);
             if (!shader) {
                 out = 0;
@@ -3343,6 +3384,16 @@ struct DeviceState {
     std::atomic<uint64_t> backing_generation{};  // every add and release
     std::mutex backing_mutex;
     leonida::BufferVaIndex<uint64_t> gpu_backings;
+    // A title-window or geometry-copy block was destroyed (TitleBufferWindows::destroy_block; its GPU work completed):
+    // as for a released backing, the backed table cuts it and the key entries and heap slots answering into it go at
+    // the next refresh, so no table names the freed memory.
+    void title_block_gone(VkDeviceAddress address, VkDeviceSize bytes) {
+        std::lock_guard lock(backing_mutex);
+        if (filter_heap_releases()) backing_changes.record(address, bytes);
+        backing_generation.fetch_add(1, std::memory_order_relaxed);
+        released_backings.fetch_add(1, std::memory_order_release);
+        if (heap_gpu) released_ranges.emplace_back(address - arena.address, bytes);
+    }
     void backing(VkDeviceAddress address, uint64_t bytes, uint64_t id, bool add) {
         std::lock_guard lock(backing_mutex);
         if (filter_heap_releases()) backing_changes.record(address, bytes);
@@ -4573,7 +4624,7 @@ struct DeviceState {
     std::vector<leonida::ConsoleHeapRange> gpu_ranges;
     leonida::ConsoleHeapSpans gpu_backed, gpu_ask;
     std::uint64_t gpu_backed_generation = ~0ull, gpu_ask_generation = ~0ull;
-    std::size_t gpu_backed_blocks = ~std::size_t(0);
+    std::uint64_t gpu_backed_blocks = ~0ull;  // the title-window blocks' layout generations at the last rebuild
     std::chrono::steady_clock::time_point gpu_backed_at{};
     std::vector<std::uint32_t> gpu_queue_scratch;
     bool gpu_rescan = false, gpu_rescan_after_resolve = false;
@@ -5206,7 +5257,7 @@ struct DeviceState {
     void update_gpu_backed(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& gone) {
         const auto start = std::chrono::steady_clock::now();
         const std::uint64_t generation = backing_generation.load(std::memory_order_relaxed);
-        const std::size_t blocks = geometry.pool().block_count() + external_windows.block_count();
+        const std::uint64_t blocks = geometry.pool().layout_generation() + external_windows.layout_generation();
         const bool changed = generation != gpu_backed_generation || blocks != gpu_backed_blocks;
         if (changed && (gpu_backed_generation == ~0ull || start - gpu_backed_at >= std::chrono::milliseconds(100))) {
             gpu_backed_generation = generation;
@@ -6941,7 +6992,8 @@ Format texture_format(const DeviceState& device, const D3D12_RESOURCE_DESC& desc
 // no-op. An A8 render target's VK_FORMAT_A8_UNORM_KHR image (Format::a8_as_alpha) is in a class of its own: no
 // other format can be a view format of it, so any other castable format is refused here, before Vulkan.
 HRESULT castable_view_formats(const Format& format, DXGI_FORMAT resource_format, UINT32 count,
-                              const DXGI_FORMAT* castable, std::vector<VkFormat>& out, bool depth_uav_planes = false) {
+                              const DXGI_FORMAT* castable, std::vector<VkFormat>& out, bool depth_uav_planes = false,
+                              bool console_d16s8 = false) {
     if (!count || !castable) return S_OK;
     const bool depth = (format.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
     const leonida::BlockFormat own = leonida::block_format(format.format, format.aspects);
@@ -6958,6 +7010,13 @@ HRESULT castable_view_formats(const Format& format, DXGI_FORMAT resource_format,
             const bool valid = format.format == VK_FORMAT_D16_UNORM
                 ? view == DXGI_FORMAT_R16_TYPELESS || view == DXGI_FORMAT_D16_UNORM ||
                   view == DXGI_FORMAT_R16_UNORM || view == DXGI_FORMAT_R16_UINT
+                : (format.xbox_depth16_stencil8 || console_d16s8)
+                ? view == xbox_d16s8 || view == xbox_d16_plane || view == xbox_s8_plane ||
+                  (format.d24 && (view == DXGI_FORMAT_D24_UNORM_S8_UINT ||
+                                  view == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+                                  view == DXGI_FORMAT_X24_TYPELESS_G8_UINT)) ||
+                  view == DXGI_FORMAT_R16_TYPELESS || view == DXGI_FORMAT_R16_UNORM ||
+                  view == DXGI_FORMAT_R16_UINT || view == DXGI_FORMAT_R8_UINT
                 : view == DXGI_FORMAT_R32G8X24_TYPELESS || view == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
                   view == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS || view == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT ||
                   view == DXGI_FORMAT_R32_FLOAT || view == DXGI_FORMAT_R8_UINT;
@@ -8569,10 +8628,13 @@ private:
     }
 
 public:
+    void mark_console_d16s8() { console_d16s8_ = true; }
+    bool console_d16s8() const { return console_d16s8_; }
+
     // The Xbox proxy calls this before publishing an allocated depth texture. Each storage plane owns a
     // regular color image with its own GFX10 address, so a UAV cannot replace the original SRV in set 0.
     HRESULT enable_depth_stencil_uav(D3D12_HEAP_FLAGS storage_heap_flags) {
-        const bool narrow_stencil = desc_.Format == xbox_d16s8;
+        const bool narrow_stencil = desc_.Format == xbox_d16s8 || console_d16s8_;
         const bool depth16 = desc_.Format == DXGI_FORMAT_R16_TYPELESS || narrow_stencil;
         if (!image_ || (!depth16 && desc_.Format != DXGI_FORMAT_R32G8X24_TYPELESS) ||
             !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
@@ -8589,7 +8651,10 @@ public:
             std::unique_ptr<Resource> conversion;
             if (widened) {
                 const auto blit = VK_FORMAT_FEATURE_2_BLIT_SRC_BIT | VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
-                if (format_ != VK_FORMAT_D32_SFLOAT_S8_UINT || (device_.optimal_features(VK_FORMAT_R16_UNORM) & blit) != blit ||
+                const bool d24_backing = format_ == VK_FORMAT_D24_UNORM_S8_UINT;
+                if ((format_ != VK_FORMAT_D32_SFLOAT_S8_UINT && !d24_backing) ||
+                    (d24_backing && !device_.context->has_depth24()) ||
+                    (device_.optimal_features(VK_FORMAT_R16_UNORM) & blit) != blit ||
                     (device_.optimal_features(VK_FORMAT_R32_SFLOAT) & blit) != blit) return E_NOTIMPL;
                 auto intermediate = plane_desc;
                 intermediate.Format = DXGI_FORMAT_R32_FLOAT;
@@ -9228,6 +9293,7 @@ private:
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
     std::unique_ptr<Resource> depth_conversion_;
     std::array<std::unique_ptr<Resource>, 2> storage_planes_;  // Xbox depth/stencil UAV, by plane
+    bool console_d16s8_ = false;  // created from Xbox format 118 (even when pc_format made it D24S8)
     VkImage shared_zero_ = VK_NULL_HANDLE;  // owned by the device
     std::unique_ptr<leonida::DeferredImageBinding> deferred_attachment_;
     std::atomic<bool> replay_seen_{false};
@@ -13477,7 +13543,8 @@ public:
                                                                   indirect);
         if (info.device_fault_diagnostics) {
             state_.context->configure_device_fault(get_device,
-                {info.device_fault_info, info.device_checkpoints, info.device_diagnostics_config});
+                {info.device_fault_info, info.device_checkpoints, info.device_diagnostics_config, info.device_markers},
+                &state_.memory);
             state_.context->add_diagnostic_queue(info.queue);
             for (auto queue : info.command_queues) state_.context->add_diagnostic_queue(queue);
             for (auto queue : info.compute_queues) state_.context->add_diagnostic_queue(queue);
@@ -13493,6 +13560,7 @@ public:
         }
         if (async_texture_refresh()) start_title_filler();
         state_.setup_console_heap_gpu(get_device);  // LEONIDA_CONSOLE_HEAP_GPU: the context's prelude
+        state_.context->set_after_execute([this] { state_.geometry_execute_end(); });
         state_.context->set_before_execute([this] {
             namespace phases = leonida::submit_phases;
             // LEONIDA_REFRESH_PER_FRAME (for runs that only need the title to go on): 1 = the slot-133 shadows, title
@@ -13505,11 +13573,13 @@ public:
                 const char* v = std::getenv("LEONIDA_REFRESH_PER_FRAME");
                 return v && *v ? std::atoi(v) : 0;
             }();
+            state_.geometry_execute_begin();
             bool full = true;
             if (per_frame) {
                 const std::uint64_t serial = phases::totals().present_serial.load(std::memory_order_relaxed);
                 full = refreshed_present_.exchange(serial, std::memory_order_relaxed) != serial;
             }
+            state_.drain_geometry_releases();
             state_.refresh_shadows(full || per_frame < 2, full);
             // LEONIDA_GEOMETRY_ASYNC=1 (for runs that only need the title to go on): the geometry copies are brought
             // up to date on a worker of ours, started here and not waited for, instead of on the title's GPU submit
@@ -13706,12 +13776,15 @@ public:
         // device addresses the same scratch holds the triangle indices of indexed quad lists (quad_index_expand.h):
         // a compute pass writes them through the chunk's address and the draw binds the chunk as its index buffer.
         const bool index_scratch = info.buffer_device_address;
+        const VkBufferUsageFlags scratch_extra =
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            (index_scratch ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
         state_.context->enable_copy_scratch(
             get_device,
             [this, index_scratch](const VkMemoryRequirements& requirements) {
                 return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, index_scratch);
             },
-            index_scratch ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0, state_.families);
+            scratch_extra, state_.families);
         if (info.buffer_device_address && info.physical && info.get_instance_proc) {
             if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
@@ -17311,7 +17384,7 @@ public:
                 return;
             }
             const Resource* storage = r->depth_stencil_uav(view.plane);
-            const bool raw_narrow = storage && r->desc().Format == xbox_d16s8 && view.plane == 0 &&
+            const bool raw_narrow = storage && (r->desc().Format == xbox_d16s8 || r->console_d16s8()) && view.plane == 0 &&
                                     (view.format == DXGI_FORMAT_R16_UINT ||
                                      (storage->desc().Format == DXGI_FORMAT_R16_TYPELESS && view.format == DXGI_FORMAT_R16_UNORM));
             if (!storage || (!raw_narrow && view.format != storage->desc().Format)) {
@@ -18047,9 +18120,17 @@ public:
         if (out) *out = nullptr;
         auto* heap = Heap::from<Heap>(heap_interface);
         if (!heap || !desc) return d3d12_trace::result(method, E_INVALIDARG);
+        const bool from_xbox_d16s8 = desc->Format == xbox_d16s8;
         D3D12_RESOURCE_DESC canonical = *desc;
         canonical.Format = pc_format(canonical.Format);  // the console's D16S8 family as D24S8
         desc = &canonical;
+        // Its clear value too, or the clear format's family (118) would not match the resource's (D24S8) below.
+        D3D12_CLEAR_VALUE canonical_clear{};
+        if (clear) {
+            canonical_clear = *clear;
+            canonical_clear.Format = pc_format(canonical_clear.Format);
+            clear = &canonical_clear;
+        }
         if (heap->host_address()) {
             // An existing heap is not an arena range, and the placed path addresses resources by arena offset.
             log_once("a placed resource in an existing heap (OpenExistingHeapFromAddress) is not supported yet; "
@@ -18137,6 +18218,7 @@ public:
         // create_texture makes for 1D, 2D and 3D alike (arrays and mips included), as for a committed texture.
         const VkDeviceSize placed_va = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? heap->offset() + heap_offset : 0;
         auto* resource = new Resource(state_, *desc, heap->properties(), heap->flags(), placed_va);
+        if (from_xbox_d16s8) resource->mark_console_d16s8();
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (buffer) {
@@ -18148,7 +18230,8 @@ public:
                 hr = E_INVALIDARG;
             } else {
                 std::vector<VkFormat> cast_formats;
-                hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats);
+                hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats, false,
+                                           from_xbox_d16s8);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
@@ -19416,6 +19499,7 @@ private:
                              TitleImageOrigin origin = TitleImageOrigin::ordinary) {
         if (out) *out = nullptr;
         if (!heap || !desc) return E_INVALIDARG;
+        const bool from_xbox_d16s8 = desc->Format == xbox_d16s8;
         D3D12_RESOURCE_DESC canonical = *desc;
         canonical.Format = pc_format(canonical.Format);  // the console's D16S8 family as D24S8
         desc = &canonical;
@@ -19424,6 +19508,7 @@ private:
             return E_INVALIDARG;
         }
         auto* resource = new Resource(state_, *desc, *heap, heap_flags);
+        if (from_xbox_d16s8) resource->mark_console_d16s8();
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -19460,7 +19545,8 @@ private:
                 hr = E_INVALIDARG;
             } else {
                 std::vector<VkFormat> cast_formats;
-                hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats, storage_heap_flags.has_value());
+                hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats,
+                                           storage_heap_flags.has_value(), from_xbox_d16s8);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats, origin);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
                 if (SUCCEEDED(hr) && storage_heap_flags) hr = resource->enable_depth_stencil_uav(*storage_heap_flags);
@@ -21331,12 +21417,15 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         (device_fault[0] == '1' || device_fault[0] == '2')) {
         info.device_fault_diagnostics = true;
         const bool with_config = device_fault[0] == '1';
+        // LEONIDA_DEVICE_MARKERS=1: also VK_AMD_buffer_marker, for the AMD breadcrumbs (vulkan_device_markers.h).
         const auto fault = fault_features.enable(info.physical, vkGetPhysicalDeviceFeatures2, extensions,
                                                  device_extensions, device_info,
-                                                 {true, with_config, leonida::aftermath::extra_config_flags()});
+                                                 {true, with_config, leonida::aftermath::extra_config_flags(),
+                                                  leonida::device_markers_requested()});
         info.device_fault_info = fault.fault;
         info.device_checkpoints = fault.checkpoints;
         info.device_diagnostics_config = fault.diagnostics_config;
+        info.device_markers = fault.markers;
     } else if (aftermath) {
         // The diagnostics config alone: shader debug info, resource tracking and automatic checkpoints in the dump.
         const auto fault = fault_features.enable(info.physical, vkGetPhysicalDeviceFeatures2, extensions,
@@ -21344,6 +21433,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                                                  {false, true, leonida::aftermath::extra_config_flags()});
         info.device_diagnostics_config = fault.diagnostics_config;
     }
+    if (leonida::device_markers_requested() && !info.device_fault_diagnostics)
+        std::fprintf(stderr, "[rt] device-markers: unavailable: LEONIDA_DEVICE_MARKERS=1 needs LEONIDA_DEVICE_FAULT=1 "
+                             "or 2\n");
     if (aftermath && !info.device_diagnostics_config)
         std::fprintf(stderr, "[rt] aftermath: VK_NV_device_diagnostics_config unavailable; the dump has no shader "
                              "debug info, resource tracking or checkpoints\n");
