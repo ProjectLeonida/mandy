@@ -40,16 +40,20 @@ public:
         ready_ = VK_NULL_HANDLE;
     }
 
+    struct Slot;
+
+    // One upload in three steps, so the detile of several textures can run on several threads while the transfers
+    // are still recorded and submitted one by one, in order (Device::refresh_title_textures):
+    //   reserve (serial): the copy regions, a free slot and its buffer;
+    //   fill (any thread, one slot each): the detile into the slot's mapped buffer;
+    //   commit (serial): the transfer recorded and submitted; or unreserve when the bytes turned out unchanged.
     template<class Device>
-    bool write(Device& d, leonida::ResourceId id, const leonida::ResourceBinding& image,
-               const xg_xs::Texture& layout, const std::uint8_t* tiled, std::vector<std::uint64_t>& columns,
-               bool inspect, bool& nonzero) {
+    Slot* reserve(Device& d, const leonida::ResourceBinding& image, const xg_xs::Texture& layout) {
         const auto block = leonida::copy_block_format(image, VK_IMAGE_ASPECT_COLOR_BIT);
         const auto mips = layout.layout.mips;
         const auto layers = layout.array;
         if (!block.bytes || block.bytes != layout.format.bytes || !mips || mips > image.mip_levels ||
-            !layers || layers > image.array_layers) return false;
-
+            !layers || layers > image.array_layers) return nullptr;
         regions_.clear();
         VkDeviceSize bytes = 0;
         for (unsigned layer = 0; layer < layers; ++layer) {
@@ -61,21 +65,30 @@ public:
                                     image.volume ? std::max(1u, image.depth >> level) : 1u};
                 if (mip.width_elements != (copy.imageExtent.width + block.block - 1) / block.block ||
                     mip.height_elements != (copy.imageExtent.height + block.block - 1) / block.block ||
-                    (image.volume && mip.depth != copy.imageExtent.depth)) return false;
+                    (image.volume && mip.depth != copy.imageExtent.depth)) return nullptr;
                 // Vulkan requires offsets aligned to four bytes and to the texel block size.
                 const auto align = 4u * block.bytes;
                 copy.bufferOffset = bytes + (align - bytes % align) % align;
                 const VkDeviceSize row = VkDeviceSize(mip.width_elements) * block.bytes;
                 const VkDeviceSize slice = row * mip.height_elements;
-                if (slice > UINT32_MAX || (UINT64_MAX - copy.bufferOffset) / copy.imageExtent.depth < slice) return false;
+                if (slice > UINT32_MAX || (UINT64_MAX - copy.bufferOffset) / copy.imageExtent.depth < slice)
+                    return nullptr;
                 bytes = copy.bufferOffset + slice * copy.imageExtent.depth;
                 regions_.push_back(copy);
             }
         }
-        Slot* free = take_slot(d);
-        if (!free || !prepare(d, *free, bytes)) return false;
-        Slot& slot = *free;
-        for (const auto& copy : regions_) {
+        Slot* slot = take_slot(d);
+        if (!slot || !prepare(d, *slot, bytes)) return nullptr;
+        slot->regions = regions_;
+        slot->reserved = true;
+        return slot;
+    }
+
+    // Thread-safe for distinct slots: reads only `tiled` and writes only the slot's buffer and `columns`.
+    static void fill(Slot& slot, const leonida::ResourceBinding& image, const xg_xs::Texture& layout,
+                     const std::uint8_t* tiled, std::vector<std::uint64_t>& columns, bool inspect, bool& nonzero) {
+        const auto block = leonida::copy_block_format(image, VK_IMAGE_ASPECT_COLOR_BIT);
+        for (const auto& copy : slot.regions) {
             const auto level = copy.imageSubresource.mipLevel;
             const auto& mip = layout.layout.plane[0].mips[level];
             const auto row = mip.width_elements * block.bytes, slice = row * mip.height_elements;
@@ -85,8 +98,15 @@ public:
                 nonzero = std::any_of(dst, dst + VkDeviceSize(slice) * copy.imageExtent.depth,
                                       [](std::uint8_t c) { return c != 0; });
         }
+    }
 
-        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers};
+    static void unreserve(Slot& slot) { slot.reserved = false; }
+
+    template<class Device>
+    bool commit(Device& d, leonida::ResourceId id, const leonida::ResourceBinding& image,
+                const xg_xs::Texture& layout, Slot& slot) {
+        slot.reserved = false;
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, layout.layout.mips, 0, layout.array};
         const auto result = d.context->write_staged_title_image(id, range, [&](const leonida::ReplayFunctions& replay,
                                                                                const leonida::LayoutPieces& pieces,
                                                                                const auto& waits) {
@@ -103,7 +123,7 @@ public:
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
             vk.vkCmdCopyBufferToImage(slot.command, slot.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                      static_cast<std::uint32_t>(regions_.size()), regions_.data());
+                                      static_cast<std::uint32_t>(slot.regions.size()), slot.regions.data());
             for (const auto& piece : pieces)
                 leonida::detail::image_barrier(replay, slot.command, image, piece.range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     piece.layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_IMAGE_LAYOUT_GENERAL : piece.layout,
@@ -115,7 +135,16 @@ public:
         return result == VK_SUCCESS;
     }
 
-private:
+    template<class Device>
+    bool write(Device& d, leonida::ResourceId id, const leonida::ResourceBinding& image,
+               const xg_xs::Texture& layout, const std::uint8_t* tiled, std::vector<std::uint64_t>& columns,
+               bool inspect, bool& nonzero) {
+        Slot* slot = reserve(d, image, layout);
+        if (!slot) return false;
+        fill(*slot, image, layout, tiled, columns, inspect, nonzero);
+        return commit(d, id, image, layout, *slot);
+    }
+
     static constexpr std::size_t kMaxSlots = 64;
     struct Slot {
         VkBuffer buffer{};
@@ -124,7 +153,11 @@ private:
         VkDeviceSize capacity = 0;
         VkCommandBuffer command{};
         std::uint64_t value = 0;  // the ready_ value its last transfer signals; 0: none submitted
+        bool reserved = false;    // between reserve() and commit()/unreserve()
+        std::vector<VkBufferImageCopy> regions;
     };
+
+private:
 
     // Waits (outside every lock but the registry's) until the slot's last transfer has completed.
     template<class Device>
@@ -162,6 +195,7 @@ private:
             reached = 0;
         Slot* oldest = nullptr;
         for (auto& slot : slots_) {
+            if (slot->reserved) continue;
             if (!slot->value || slot->value <= reached) {
                 slot->value = 0;
                 return slot.get();
@@ -169,7 +203,7 @@ private:
             if (!oldest || slot->value < oldest->value) oldest = slot.get();
         }
         if (slots_.size() < kMaxSlots) return slots_.emplace_back(std::make_unique<Slot>()).get();
-        return wait_slot(d, *oldest) ? oldest : nullptr;
+        return oldest && wait_slot(d, *oldest) ? oldest : nullptr;
     }
 
     template<class Device>
