@@ -424,5 +424,102 @@ class UnpinnedSubgroup(unittest.TestCase):
         self.assertIsNone(unpinned_subgroup(""))
 
 
+class LdsFuzzCliTests(unittest.TestCase):
+    @staticmethod
+    def _lds_mod():
+        import os
+        import sys
+        tools_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        import lds_fuzz
+        return lds_fuzz
+
+    def test_model_only_rejects_hw_only_flags(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stderr
+
+        lf = self._lds_mod()
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_cases = (
+                ["--programs", "1", "--model-only", "--keep", tmp],
+                ["--programs", "1", "--oracle", "hw", "--model-only", "--keep", tmp],
+                ["--programs", "1", "--oracle", "hw", "--model-only", "--negative-control"],
+                ["--programs", "1", "--oracle", "hw", "--model-only", "--minimize"],
+            )
+            for argv in bad_cases:
+                err = io.StringIO()
+                with redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+                    lf.main(argv)
+                self.assertEqual(ctx.exception.code, 2, argv)
+                self.assertIn("--oracle hw", err.getvalue())
+
+    def test_keep_and_only_reject_invalid_values_upfront(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stderr
+
+        lf = self._lds_mod()
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = os.path.join(tmp, "not_a_dir")
+            with open(blocker, "wb") as f:
+                f.write(b"x")
+            for bad_keep in ("", blocker):
+                err = io.StringIO()
+                with redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+                    lf.main(["--programs", "1", "--oracle", "hw", "--keep", bad_keep])
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn("--keep", err.getvalue())
+
+            for bad_only in ("-1", "0,-1", "0,"):
+                err = io.StringIO()
+                with redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+                    lf.main(["--programs", "1", "--model-only", "--only", bad_only])
+                self.assertEqual(ctx.exception.code, 2, bad_only)
+                self.assertIn("--only", err.getvalue())
+
+    def test_translate_and_run_gpu_use_utf8_replace_and_bom_index(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest import mock
+
+        lf = self._lds_mod()
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "work"
+            work.mkdir()
+            progs = lf.programs(1, 1, (64,))
+
+            seen_runs = []
+
+            def fake_subproc(cmd, **kwargs):
+                seen_runs.append(kwargs)
+                spirv_dir = work / "spirv"
+                spirv_dir.mkdir(parents=True, exist_ok=True)
+                with open(spirv_dir / "index.json", "wb") as f:
+                    f.write(b'\xef\xbb\xbf{"ok": true}\n')
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(lf.mc_command, "mc_command", return_value=["llvm-mc"]), \
+                    mock.patch.object(lf.mc_command, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), \
+                    mock.patch.object(lf, "compute_header", return_value=b"\x00" * 16), \
+                    mock.patch.object(lf.subprocess, "run", side_effect=fake_subproc):
+                idx = lf.translate(progs, work, emulate=False)
+            self.assertEqual(idx, {"ok": True})
+            self.assertEqual(seen_runs[-1]["encoding"], "utf-8")
+            self.assertEqual(seen_runs[-1]["errors"], "replace")
+
+            fake_exe = Path(tmp) / ("vk_compute_test.exe" if os.name == "nt" else "vk_compute_test")
+            fake_exe.write_bytes(b"")
+            with mock.patch.object(lf.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="ok", stderr="")) as mrun:
+                rc, msg = lf.run_gpu(progs[0], Path(tmp) / "p.spv", tmp, {}, False, Path(tmp) / "d.bin")
+            self.assertEqual((rc, msg), (0, "ok"))
+            self.assertEqual(mrun.call_args.kwargs["encoding"], "utf-8")
+            self.assertEqual(mrun.call_args.kwargs["errors"], "replace")
+
+
 if __name__ == "__main__":
     unittest.main()

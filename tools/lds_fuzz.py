@@ -808,11 +808,11 @@ def translate(progs, work, emulate, pc_tail=False):
         cmd.append("--wave64-emulate")
     if pc_tail:
         cmd.append("--pc-tail-ubo")
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     index = spirv / "index.json"
     if not index.exists():
         raise RuntimeError(f"rdna2spirv.py exited {r.returncode} without an index.json:\n{(r.stdout + r.stderr)[-2000:]}")
-    return json.loads(index.read_text(encoding="utf-8")) if index.exists() else {}
+    return json.loads(index.read_text(encoding="utf-8-sig")) if index.exists() else {}
 
 
 def run_gpu(p, spv, build, index_entry, emulate, dump, pc_tail=False):
@@ -830,7 +830,7 @@ def run_gpu(p, spv, build, index_entry, emulate, dump, pc_tail=False):
         env["VKC_SUBGROUP_SIZE"] = "32"
     if index_entry.get("subgroup_size") and not emulate:
         env["VKC_SUBGROUP_SIZE"] = str(index_entry["subgroup_size"])
-    r = subprocess.run(args, capture_output=True, text=True, env=env)
+    r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
     return r.returncode, (r.stdout + r.stderr).strip()
 
 
@@ -1104,7 +1104,7 @@ def show(seed, index, wave, no_exec=(), arch=None, **opts):
         print(f"; hypothesis, op {i}: {p.ops[i]['hyp']}")
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--programs", type=int, default=50)
     ap.add_argument("--seed", type=int, default=1)
@@ -1140,7 +1140,7 @@ def main():
     ap.add_argument("--negative-control", action="store_true",
                     help="after the hardware run, re-judge its words with every perturbed model; exit 1 if one is "
                          "not caught")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     a.pc_tail_ubo = a.pc_tail_ubo or pc_tail_env()
     if a.programs < 1 or a.max_report < 1:
         ap.error("--programs and --max-report must be at least 1")
@@ -1164,8 +1164,10 @@ def main():
     backends = tuple(dict.fromkeys(t.strip() for t in a.oracle.split(",")))
     if not backends or any(t not in ("translator", "hw") for t in backends):
         ap.error("--oracle takes translator, hw or translator,hw")
-    if (a.perturb or a.negative_control or a.minimize or a.keep) and "hw" not in backends and not a.model_only:
-        ap.error("--perturb, --negative-control, --minimize and --keep need --oracle hw")
+    if (a.perturb or a.negative_control or a.minimize or a.keep is not None) and ("hw" not in backends or a.model_only):
+        ap.error("--perturb, --negative-control, --minimize and --keep need --oracle hw (without --model-only)")
+    if a.keep is not None and (not a.keep or (os.path.exists(a.keep) and not os.path.isdir(a.keep))):
+        ap.error("--keep requires a directory path")
     if a.show is not None:
         parts = a.show.split(":")
         try:
@@ -1185,10 +1187,15 @@ def main():
     waves = (64, 32) if a.wave == "both" else (int(a.wave),)
     progs = programs(a.seed, a.programs, waves, tuple(a.no_exec), **a.opts)
     if a.only is not None:
+        tokens = [x.strip() for x in a.only.split(",")]
         try:
-            keep = {int(x) for x in a.only.split(",")}
+            if any(not tok for tok in tokens):
+                raise ValueError
+            keep = {int(tok) for tok in tokens}
         except ValueError:
-            ap.error("--only takes a comma-separated list of program indices")
+            ap.error("--only takes a comma-separated list of non-negative program indices")
+        if any(x < 0 for x in keep):
+            ap.error("--only takes non-negative program indices")
         progs = [p for p in progs if int(p.name.split("_")[3]) in keep]
         if not progs:
             ap.error("--only matches no program (the indices must be below --programs)")
