@@ -157,6 +157,26 @@ tests to verify the ordering of submissions and writes in Leonida's own implemen
 [victory-readme]: https://github.com/Marvisak/VIctory/blob/ffe310eb2098e52169f4c44db5ffdabf43a72622/README.md#license
 [victory-gpu]: https://github.com/Marvisak/VIctory/blob/ffe310eb2098e52169f4c44db5ffdabf43a72622/crates/victory-gpu/Cargo.toml
 
+## codec-d/cool_fox
+
+<https://github.com/codec-d/cool_fox>
+
+A Rust fork of Marvisak/VIctory (by way of fxceless/victory-fork) with the same host Direct3D 12 back end, tuned for
+AMD RDNA 3. Its [README][cool-fox-readme] reports reaching the world on one RX 7900 XTX machine, at low frame rates,
+as of 2026-11-25.
+
+**Licence:** GPL-3.0-or-later (`LICENSE` and the README). Its [asset policy][cool-fox-assets] names one file the
+licence does not cover, the BCPack tables `bcpack-tables.bin`, shipped by its owner's decision. Leonida does not take
+that file.
+
+**What we use it for:** prior art only, read for ideas; no code is taken. Two ideas from its
+[findings][cool-fox-findings] are being reimplemented now: a texture slot shows a texture only after its upload ran
+(RT-TITLE-TEXTURE-SHOW-AFTER-UPLOAD), and indirect dispatches above 65,535 groups (RT-INDIRECT-DISPATCH-GROUP-LIMIT).
+
+[cool-fox-readme]: https://github.com/codec-d/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/README.md#where-it-stands-2026-11-25
+[cool-fox-assets]: https://github.com/codec-d/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/docs/asset-policy.md#the-one-exception
+[cool-fox-findings]: https://github.com/codec-d/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/docs/findings.md#faults-found-and-what-they-were
+
 ## microsoft/libHttpClient
 
 <https://github.com/microsoft/libHttpClient>
