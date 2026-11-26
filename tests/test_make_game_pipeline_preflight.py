@@ -1,4 +1,4 @@
-"""make_game.py: a missing vk_pipeline_check is reported in preflight, before a long shader build.
+"""make_game.py: pipelines stage preflight checks (gta6rt.exe, Wine off Windows, VULKAN_SDK on Windows).
 
     python -I tests/test_make_game_pipeline_preflight.py
 
@@ -25,48 +25,58 @@ class PreflightEnv:
         self.addCleanup(tmp.cleanup)
         self.root = tmp.name
         self.work = os.path.join(self.root, "work")
+        self.out = os.path.join(self.root, "out")
         os.makedirs(self.work)
-        # Satisfy every other prerequisite so only the checker under test can make preflight fail.
+        os.makedirs(self.out)
+        # Satisfy every other prerequisite so only the pipelines requirements under test can make preflight fail.
         for patcher in (mock.patch("sys.version_info", (3, 12, 0)),
                         mock.patch.dict(os.environ, {"LLVM_MC": "llvm-mc"}),
                         mock.patch("shutil.which", return_value="/bin/tool"),
-                        mock.patch("shutil.disk_usage", return_value=mock.Mock(free=500 * 2**30))):
+                        mock.patch("shutil.disk_usage", return_value=mock.Mock(free=500 * 2**30)),
+                        mock.patch.object(make_game, "ROOT", self.root)):
             patcher.start()
             self.addCleanup(patcher.stop)
 
     def write_shader_index(self):
         spirv = os.path.join(self.work, "shaders", "spirv")
-        os.makedirs(spirv)
-        with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8") as f:
-            f.write('{"shader_0": {}}')   # a finished translation is never empty
+        os.makedirs(spirv, exist_ok=True)
+        with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            f.write('{"shader_0": {}}\n')
 
-    def assert_preflight_fails(self, stages, match):
+    def write_runtime_exe(self, folder=None):
+        dest = folder or self.out
+        os.makedirs(dest, exist_ok=True)
+        path = os.path.join(dest, "gta6rt.exe")
+        with open(path, "wb"):
+            pass
+        return path
+
+    def assert_preflight_fails(self, stages, match, **kw):
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
             with self.assertRaises(SystemExit) as ctx:
-                make_game.preflight(stages, self.work)
+                make_game.preflight(stages, self.work, out=self.out, **kw)
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn(match, err.getvalue())
         return err.getvalue()
 
 
 class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
-    def test_pipelines_without_checker_fails_in_preflight(self):
-        with mock.patch("os.name", "nt"), mock.patch.object(make_game, "pipeline_check_exe", return_value=None):
-            err = self.assert_preflight_fails(["shaders", "pipelines"], "vk_pipeline_check")
-        self.assertIn("Install these first, then run the build again:", err)
+    def test_pipelines_without_runtime_or_exe_fails_in_preflight(self):
+        for platform in ("nt", "posix"):
+            with self.subTest(platform=platform), mock.patch("os.name", platform):
+                err = self.assert_preflight_fails(["shaders", "pipelines"], "gta6rt.exe")
+                self.assertIn("Install these first, then run the build again:", err)
 
-    def test_main_does_not_start_shaders_when_checker_is_missing(self):
+    def test_main_does_not_start_shaders_when_runtime_exe_is_missing(self):
         game = os.path.join(self.root, "game")
-        out = os.path.join(self.root, "out")
         os.makedirs(game)
-        argv = ["make_game.py", "--game", game, "--work", self.work, "--out", out,
+        argv = ["make_game.py", "--game", game, "--work", self.work, "--out", self.out,
                 "--stages", "shaders,pipelines", "--no-tui"]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("os.name", "nt"), \
                 mock.patch.object(make_game, "below_normal"), \
                 mock.patch.object(make_game, "check", return_value={"expected_exe": "game.exe"}), \
-                mock.patch.object(make_game, "pipeline_check_exe", return_value=None), \
                 mock.patch.object(make_game, "shaders") as shaders, \
                 mock.patch.object(make_game, "pipelines") as pipelines, \
                 mock.patch.object(make_game, "log"), \
@@ -77,54 +87,71 @@ class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
         shaders.assert_not_called()
         pipelines.assert_not_called()
 
-    def test_checker_already_built_still_requires_shaders(self):
-        with mock.patch("os.name", "nt"), \
-                mock.patch.object(make_game, "pipeline_check_exe", return_value="vk_pipeline_check.exe"):
+    def test_exe_already_built_still_requires_shaders(self):
+        self.write_runtime_exe()
+        with mock.patch("os.name", "nt"):
             self.assert_preflight_fails(["pipelines"], "No translated shaders yet")
 
-    def test_checker_already_built_passes_preflight(self):
+    def test_exe_in_out_passes_preflight(self):
         self.write_shader_index()
-        with mock.patch.object(make_game, "pipeline_check_exe", return_value="/bin/vk_pipeline_check"):
-            make_game.preflight(["pipelines"], self.work)
+        self.write_runtime_exe(self.out)
+        for platform in ("nt", "posix"):
+            with self.subTest(platform=platform), mock.patch("os.name", platform):
+                make_game.preflight(["pipelines"], self.work, out=self.out)
 
-    @unittest.skipUnless(os.name == "posix", "requires POSIX execute permissions")
-    def test_non_executable_linux_checker_without_cmake_fails_preflight(self):
-        self.write_shader_index()
-        checker_dir = os.path.join(self.root, "runtime", "build", "linux")
-        os.makedirs(checker_dir)
-        checker = os.path.join(checker_dir, "vk_pipeline_check")
-        with open(checker, "wb"):
-            pass
-        os.chmod(checker, 0o644)
-        with mock.patch.object(make_game, "ROOT", self.root), \
-                mock.patch("shutil.which", return_value=None), \
-                mock.patch.object(make_game, "build_pipeline_check") as build:
-            self.assert_preflight_fails(["pipelines"], "CMake 3.24 or newer")
-        build.assert_not_called()
-
-    def test_runtime_stage_builds_the_checker_so_it_is_not_required(self):
-        # On Windows runtime produces vk_pipeline_check.exe when the Vulkan SDK is installed.
+    def test_runtime_stage_builds_gta6rt_so_existing_exe_is_not_required(self):
         self.write_shader_index()
         with mock.patch("os.name", "nt"), \
                 mock.patch.dict(os.environ, {"VULKAN_SDK": r"C:\Vulkan"}), \
-                mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=True), \
-                mock.patch.object(make_game, "pipeline_check_exe", return_value=None):
-            make_game.preflight(["runtime", "pipelines"], self.work)
+                mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=True):
+            make_game.preflight(["runtime", "pipelines"], self.work, out=self.out)
 
-    def test_runtime_without_vulkan_sdk_does_not_build_the_checker(self):
-        # scripts/build_runtime.ps1 builds vk_pipeline_check.exe only 'if defined VULKAN_SDK': a combined
-        # Windows run without it would still spend hours in the shaders stage and fail in pipelines.
+    def test_windows_runtime_and_pipelines_without_vulkan_sdk_fails_preflight(self):
         for sdk in (None, ""):
             with self.subTest(sdk=sdk), mock.patch("os.name", "nt"), \
                     mock.patch.dict(os.environ), \
-                    mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=True), \
-                    mock.patch.object(make_game, "pipeline_check_exe", return_value=None):
+                    mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=True):
                 if sdk is None:
                     os.environ.pop("VULKAN_SDK", None)
                 else:
                     os.environ["VULKAN_SDK"] = sdk
                 err = self.assert_preflight_fails(["runtime", "pipelines"], "VULKAN_SDK")
-                self.assertIn("vk_pipeline_check", err)
+                self.assertIn("gta6rt.exe", err)
+
+    def test_windows_prebuilt_runtime_with_pipelines_does_not_require_vulkan_sdk(self):
+        self.write_shader_index()
+        build = os.path.join(self.root, "prebuilt")
+        os.makedirs(build)
+        for name in make_game.RUNTIME_FILES:
+            with open(os.path.join(build, name), "wb"):
+                pass
+        env = {k: v for k, v in os.environ.items() if k != "VULKAN_SDK"}
+        with mock.patch("os.name", "nt"), mock.patch.dict(os.environ, env, clear=True):
+            make_game.preflight(["runtime", "pipelines"], self.work, runtime_build=build, out=self.out)
+
+    def test_posix_pipelines_requires_wine_or_wine_env(self):
+        self.write_shader_index()
+        self.write_runtime_exe(self.out)
+        env = {k: v for k, v in os.environ.items() if k != "WINE"}
+        with mock.patch("os.name", "posix"), \
+                mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch("shutil.which", side_effect=lambda t: None if t == "wine" else "/bin/tool"):
+            self.assert_preflight_fails(["pipelines"], "Wine")
+        # Setting WINE to an existing executable file satisfies preflight even when wine is not on PATH.
+        with mock.patch("os.name", "posix"), \
+                mock.patch.dict(os.environ, {"WINE": sys.executable}), \
+                mock.patch("shutil.which", return_value=None):
+            make_game.preflight(["pipelines"], self.work, out=self.out)
+
+    def test_posix_runtime_and_pipelines_requires_wine(self):
+        self.write_shader_index()
+        env = {k: v for k, v in os.environ.items() if k != "WINE"}
+        with mock.patch("os.name", "posix"), \
+                mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(make_game, "cross_build_missing", return_value=[]), \
+                mock.patch.object(make_game, "cross_configure"), \
+                mock.patch("shutil.which", side_effect=lambda t: None if t == "wine" else "/bin/tool"):
+            self.assert_preflight_fails(["runtime", "pipelines"], "Wine")
 
     def run_runtime_preflight(self, system, vulkan_sdk, runtime_build=None):
         with mock.patch("os.name", system), \
@@ -135,7 +162,7 @@ class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
                 os.environ.pop("VULKAN_SDK", None)
             else:
                 os.environ["VULKAN_SDK"] = vulkan_sdk
-            make_game.preflight(["runtime"], self.work, runtime_build=runtime_build)
+            make_game.preflight(["runtime"], self.work, runtime_build=runtime_build, out=self.out)
         return [call.args[0] for call in log.call_args_list]
 
     def test_runtime_without_vulkan_sdk_warns_that_the_vulkan_device_may_be_missing(self):
@@ -162,141 +189,12 @@ class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
             self.assertFalse([line for line in self.run_runtime_preflight("posix", None)
                               if "VULKAN_SDK" in line])
 
-    def test_missing_checker_is_listed_with_other_missing_prerequisites(self):
+    def test_missing_exe_is_listed_with_other_missing_prerequisites(self):
         with mock.patch("os.name", "nt"), \
-                mock.patch("shutil.which", side_effect=lambda t: None if t == "llvm-mc" else "/bin/tool"), \
-                mock.patch.object(make_game, "pipeline_check_exe", return_value=None):
-            err = self.assert_preflight_fails(["shaders", "pipelines"], "vk_pipeline_check")
+                mock.patch("shutil.which", side_effect=lambda t: None if t == "llvm-mc" else "/bin/tool"):
+            err = self.assert_preflight_fails(["shaders", "pipelines"], "gta6rt.exe")
         self.assertIn("llvm-mc (LLVM 21+ with the AMDGPU target)", err)
-        self.assertEqual(err.count("vk_pipeline_check"), 1)
-
-
-
-class LinuxPipelineCheckTest(PreflightEnv, unittest.TestCase):
-    """Off Windows preflight builds the checker itself once every other prerequisite is there."""
-
-    def setUp(self):
-        super().setUp()
-        for patcher in (mock.patch("os.name", "posix"),
-                        mock.patch.object(make_game, "pipeline_check_exe", return_value=None)):
-            patcher.start()
-            self.addCleanup(patcher.stop)
-
-    def test_missing_shader_index_stops_before_building_checker(self):
-        with mock.patch.object(make_game, "pipeline_check_exe", side_effect=[None, None, "/bin/vk_pipeline_check"]), \
-                mock.patch.object(make_game, "build_pipeline_check") as build:
-            self.assert_preflight_fails(["pipelines"], "No translated shaders yet")
-        build.assert_not_called()
-
-    def test_builds_the_checker_after_the_checks(self):
-        self.write_shader_index()
-        with mock.patch.object(make_game, "pipeline_check_exe", side_effect=[None, None, "/bin/vk_pipeline_check"]), \
-                mock.patch.object(make_game, "build_pipeline_check") as build:
-            make_game.preflight(["pipelines"], self.work, jobs=3)
-        build.assert_called_once_with(3)
-
-    def test_a_checker_built_where_it_isnt_looked_for_fails_in_preflight(self):
-        with mock.patch.object(make_game, "build_pipeline_check") as build:
-            self.assert_preflight_fails(["shaders", "pipelines"], "delete runtime/build/linux")
-        build.assert_called_once()
-
-    def test_missing_built_checker_does_not_initialize_asset_submodule(self):
-        with mock.patch.object(make_game, "dotnet_sdk_ok", return_value=True), \
-                mock.patch.object(make_game, "build_pipeline_check") as build, \
-                mock.patch.object(make_game, "ensure_submodule") as initialize:
-            self.assert_preflight_fails(["shaders", "assets", "pipelines"], "delete runtime/build/linux")
-        build.assert_called_once()
-        initialize.assert_not_called()
-
-    def test_without_cmake_nothing_is_built(self):
-        with mock.patch("shutil.which", side_effect=lambda t: None if t == "cmake" else "/bin/tool"), \
-                mock.patch.object(make_game, "build_pipeline_check") as build:
-            err = self.assert_preflight_fails(["pipelines"], "CMake 3.24 or newer")
-        self.assertIn("vk_pipeline_check", err)
-        build.assert_not_called()
-
-    def test_another_missing_prerequisite_stops_before_the_build(self):
-        with mock.patch("shutil.which", side_effect=lambda t: None if t == "llvm-mc" else "/bin/tool"), \
-                mock.patch.object(make_game, "build_pipeline_check") as build:
-            self.assert_preflight_fails(["shaders", "pipelines"], "llvm-mc")
-        build.assert_not_called()
-
-    def test_a_built_checker_is_not_rebuilt(self):
-        self.write_shader_index()
-        with mock.patch.object(make_game, "pipeline_check_exe", return_value="/bin/vk_pipeline_check"), \
-                mock.patch.object(make_game, "build_pipeline_check") as build:
-            make_game.preflight(["pipelines"], self.work)
-        build.assert_not_called()
-
-    def put_checker_older_than_its_source(self):
-        """runtime/build/linux/vk_pipeline_check built before its source last changed (a pull since the build)."""
-        build = os.path.join(self.root, "runtime", "build", "linux")
-        test = os.path.join(self.root, "runtime", "test")
-        os.makedirs(build)
-        os.makedirs(test)
-        checker = os.path.join(build, "vk_pipeline_check")
-        for path, text in ((checker, ""), (os.path.join(test, "vk_pipeline_check.cpp"), '#include "gate.h"\n'),
-                           (os.path.join(test, "gate.h"), "")):
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text)
-        os.utime(checker, (1_000_000, 1_000_000))
-        os.utime(os.path.join(test, "vk_pipeline_check.cpp"), (500_000, 500_000))
-        return checker
-
-    def test_a_checker_older_than_its_sources_is_rebuilt(self):
-        # Old #7148: a checker from before a pull was taken as it was, and the stage checked with the old program.
-        self.write_shader_index()
-        checker = self.put_checker_older_than_its_source()
-        with mock.patch.object(make_game, "ROOT", self.root),                 mock.patch.object(make_game, "pipeline_check_exe", return_value=checker),                 mock.patch.object(make_game, "build_pipeline_check") as build:
-            self.assertEqual(make_game.stale_checker(checker), ["runtime/test/gate.h"])
-            make_game.preflight(["pipelines"], self.work, jobs=4)
-        build.assert_called_once_with(4)
-
-    def test_a_current_checker_in_the_build_folder_is_not_rebuilt(self):
-        self.write_shader_index()
-        checker = self.put_checker_older_than_its_source()
-        future = os.path.getmtime(os.path.join(self.root, "runtime", "test", "gate.h")) + 60
-        os.utime(checker, (future, future))
-        with mock.patch.object(make_game, "ROOT", self.root),                 mock.patch.object(make_game, "pipeline_check_exe", return_value=checker),                 mock.patch.object(make_game, "build_pipeline_check") as build:
-            self.assertEqual(make_game.stale_checker(checker), [])
-            make_game.preflight(["pipelines"], self.work)
-        build.assert_not_called()
-
-    def test_a_stale_checker_without_cmake_is_used_with_a_warning(self):
-        self.write_shader_index()
-        checker = self.put_checker_older_than_its_source()
-        with mock.patch.object(make_game, "ROOT", self.root),                 mock.patch("shutil.which", side_effect=lambda t: None if t == "cmake" else "/bin/tool"),                 mock.patch.object(make_game, "pipeline_check_exe", return_value=checker),                 mock.patch.object(make_game, "build_pipeline_check") as build:
-            make_game.preflight(["pipelines"], self.work)
-            build.assert_not_called()
-            with mock.patch.object(make_game, "log") as log,                     mock.patch.object(make_game, "checker_supports", side_effect=SystemExit(0)):
-                with self.assertRaises(SystemExit):
-                    make_game.pipelines(self.work, os.path.join(self.root, "out"))
-        warning = log.call_args_list[0].args[0]
-        self.assertIn("WARNING", warning)
-        self.assertIn("runtime/test/gate.h", warning)
-        self.assertIn("cmake --build runtime/build/linux --target vk_pipeline_check", warning)
-
-    def test_a_checker_outside_the_build_folder_is_not_compared(self):
-        # --runtime-build and the like: their time stamps say nothing about this checkout's sources.
-        self.put_checker_older_than_its_source()
-        elsewhere = os.path.join(self.root, "elsewhere", "vk_pipeline_check")
-        os.makedirs(os.path.dirname(elsewhere))
-        with open(elsewhere, "w", encoding="utf-8"):
-            pass
-        os.utime(elsewhere, (1_000_000, 1_000_000))
-        with mock.patch.object(make_game, "ROOT", self.root):
-            self.assertEqual(make_game.stale_checker(elsewhere), [])
-
-    def test_the_build_uses_the_readme_folder(self):
-        with mock.patch.object(make_game, "ROOT", self.root), \
-                mock.patch.object(make_game, "log"), \
-                mock.patch.object(make_game, "run") as run:
-            make_game.build_pipeline_check(2)
-        configure, build = (c.args[0] for c in run.call_args_list)
-        folder = os.path.join(self.root, "runtime", "build", "linux")
-        self.assertEqual(configure[:5], ["cmake", "-S", os.path.join(self.root, "runtime"), "-B", folder])
-        self.assertEqual(build, ["cmake", "--build", folder, "--parallel", "2", "--target", "vk_pipeline_check"])
-        self.assertIn("Vulkan headers", run.call_args_list[1].kwargs["hint"])
+        self.assertEqual(err.count("gta6rt.exe"), 1)
 
 
 if __name__ == "__main__":

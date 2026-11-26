@@ -269,13 +269,12 @@ class StageValidationAndSequencingTest(unittest.TestCase):
                 with patch("make_game.check", return_value={"expected_exe": "Leonida.exe"}):
                     with patch("make_game.preflight"):
                         with patch("make_game.log"):
-                            with patch("make_game.pipeline_check_exe", return_value="vk_pipeline_check"):
-                                with patch("make_game.shaders", manager.shaders):
-                                    with patch("make_game.assets", manager.assets):
-                                        with patch("make_game.runtime", manager.runtime):
-                                            with patch("make_game.pipelines", manager.pipelines):
-                                                ret = make_game.main()
-                                                self.assertEqual(ret, 0)
+                            with patch("make_game.shaders", manager.shaders):
+                                with patch("make_game.assets", manager.assets):
+                                    with patch("make_game.runtime", manager.runtime):
+                                        with patch("make_game.pipelines", manager.pipelines):
+                                            ret = make_game.main()
+                                            self.assertEqual(ret, 0)
 
         manager.shaders.assert_called_once_with(
             os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), unittest.mock.ANY,
@@ -371,7 +370,8 @@ class JobsHandlingTest(unittest.TestCase):
                                     probe.assert_called_once_with("auto", mesh_compute=False)
                                     mock_preflight.assert_called_once_with(
                                         ["shaders"], os.path.abspath(work), False, None,
-                                        emulate=True, keep_emulated=True, fallbacks=(), jobs=6)
+                                        out=os.path.abspath(out), emulate=True, keep_emulated=True, fallbacks=(),
+                                        jobs=6)
                                     mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6,
                                                                          emulate=True, keep_emulated=True, fallbacks=())
 

@@ -340,8 +340,7 @@ class SerialOverlapTest(unittest.TestCase):
                     mock.patch.object(make_game, "assets", side_effect=record("assets")), \
                     mock.patch.object(make_game, "runtime", side_effect=record("runtime")), \
                     mock.patch.object(make_game, "pipelines", side_effect=record("pipelines")), \
-                    mock.patch.object(make_game, "log"), \
-                    mock.patch.object(make_game, "pipeline_check_exe", return_value="x"):
+                    mock.patch.object(make_game, "log"):
                 make_game.run_build_stages(
                     ["shaders", "assets", "runtime", "pipelines"],
                     game=game, work=work, out=out, v={}, wav=False, jobs=2,
@@ -349,8 +348,8 @@ class SerialOverlapTest(unittest.TestCase):
                     overlap=False)
         self.assertEqual(order, ["shaders", "assets", "runtime", "pipelines"])
 
-    def test_overlap_waits_for_runtime_before_pipelines_even_if_checker_exists(self):
-        """Flyander/#1797: a stale vk_pipeline_check on disk must not start pipelines mid-rebuild."""
+    def test_overlap_waits_for_runtime_before_pipelines_even_if_exe_exists(self):
+        """Flyander/#1797: a stale gta6rt.exe on disk must not start pipelines mid-rebuild."""
         import threading
         import time
 
@@ -377,7 +376,7 @@ class SerialOverlapTest(unittest.TestCase):
                     mock.patch.object(make_game, "runtime", side_effect=record("runtime", hold=0.15)), \
                     mock.patch.object(make_game, "pipelines", side_effect=record("pipelines")), \
                     mock.patch.object(make_game, "log"), \
-                    mock.patch.object(make_game, "pipeline_check_exe", return_value="stale_checker"):
+                    mock.patch.object(make_game, "runtime_exe", return_value="stale_gta6rt.exe"):
                 make_game.run_build_stages(
                     ["shaders", "assets", "runtime", "pipelines"],
                     game=game, work=work, out=out, v={}, wav=False, jobs=2,
@@ -464,7 +463,6 @@ class UnexpectedStageExceptionTest(unittest.TestCase):
                     mock.patch.object(make_game, "runtime"), \
                     mock.patch.object(make_game, "pipelines"), \
                     mock.patch.object(make_game, "log"), \
-                    mock.patch.object(make_game, "pipeline_check_exe", return_value="x"), \
                     mock.patch.object(make_game.sys, "stderr", err), \
                     self.assertRaises(SystemExit) as ctx:
                 make_game.run_build_stages(

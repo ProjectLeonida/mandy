@@ -47,9 +47,10 @@ reasons behind each step: [linux_proton.md](linux_proton.md#amd-on-linux-what-go
   with SDL3 for the keyboard pad.
 - **Shaders:** `python -I make_game.py --stages shaders --wave64-emulate off --work <work> --out <out>`. The GPU runs
   wave64 natively; emulation is not needed. (`auto` picks the same here since llvmpipe no longer decides.)
-- **Pipeline pre-compile:** `wine <build>/gta6rt.exe --precompile-pipelines --threads 16` with the run's
+- **Pipeline pre-compile:** `make_game.py --stages pipelines` (which runs `gta6rt.exe --precompile-pipelines` under
+  Wine off Windows), or `wine <build>/gta6rt.exe --precompile-pipelines --threads 16` directly, with the run's
   `LEONIDA_SHADERS`, `LEONIDA_PIPELINE_CACHE_DIR` and `LEONIDA_DEVICE_FAULT`, before the first run. It built 3,693
-  compute pipelines. Not `make_game.py --stages pipelines`: its cache never matches the runtime's driver keys.
+  compute pipelines. `make_game.py --stages pipelines` now runs this pre-compile.
   The pre-compile builds the programs `LEONIDA_SKIP_COMPUTE` names too (`--skip-listed` leaves them out) and ends
   with one line that counts what it built, what was journaled already and what it left out.
 - **Driver and OS:** `amdgpu.lockup_timeout=30000,60000,10000,10000` on the kernel command line (the default is

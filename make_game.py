@@ -27,15 +27,14 @@ Stages (each skips work that is already done, so a stopped build continues where
     runtime   build the loader (needs the game's executable to run, not to build). On Linux it is cross-built with
               clang-cl and an xwin SDK (docs/testing.md) and gta6rt.sh starts it with Wine; --runtime-build DIR
               takes a Windows build of runtime/ instead (the runtime-windows artifact of the Runtime workflow)
-    pipelines create every translated shader on your GPU's driver as a pipeline, report anything the driver
-              rejects or that has to be skipped, and save the pipeline cache next to the port (the runtime doesn't
-              load that cache yet)
+    pipelines precompile compute shaders into <out>/pipeline_cache.d with gta6rt --precompile-pipelines, reporting
+              any failures or crashing entries
 
 shaders, assets and runtime do not depend on each other and run together after check. pipelines starts once the
-translated shaders are ready and, when this run includes runtime, that stage has finished rebuilding
-vk_pipeline_check (a checker already on disk is enough only when runtime is not selected), so it can overlap
-the rest of assets. When shaders and assets share the machine, --jobs is split between them and passed to
-rpf9dump; a solo assets run still lets rpf9dump use every core.
+translated shaders are ready and, when this run includes runtime, that stage has finished building gta6rt.exe
+(a gta6rt.exe already on disk is enough only when runtime is not selected), so it can overlap the rest of assets.
+When shaders and assets share the machine, --jobs is split between them and passed to rpf9dump; a solo assets run
+still lets rpf9dump use every core.
 
 Long steps log percent and a rough ETA (shader translation shards, asset exports, XMA decode, and overall
 weighted stage completion while they overlap).
@@ -74,7 +73,6 @@ from mc_command import install_hint as mc_install_hint, mc_command, split_comman
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
-from stale_build import newer_sources  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
@@ -127,8 +125,8 @@ def fmt_duration(seconds: float) -> str:
     return f"{hours}h {minutes:02d}m"
 
 
-# Rough relative cost of each stage when run alone (docs: translate ~80 min, assets largest on disk,
-# pipelines ~2.8 h wall). Used only for overall percent while stages overlap; not a schedule.
+# Rough relative cost of each stage when run alone (translate ~80 min, assets largest on disk,
+# compute pipeline journal precompile is a long stage). Used only for overall percent while stages overlap.
 STAGE_WEIGHTS = {"shaders": 40, "assets": 45, "runtime": 2, "pipelines": 55}
 
 
@@ -900,19 +898,8 @@ def assets_bytes_on_disk(work: str) -> int:
     return total
 
 
-def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
-    """Why the pipelines stage can't run yet. Kept here so preflight can fail before a long shader build;
-    pipelines() prints its own, more detailed message when the stage is reached. On Windows the runtime stage
-    only builds the checker when VULKAN_SDK is set (scripts/build_runtime.ps1)."""
-    if runtime_selected:
-        return ("VULKAN_SDK (the runtime stage builds vk_pipeline_check only when it is set, and the pipelines "
-                "stage needs that executable)")
-    return ("vk_pipeline_check (needed by the pipelines stage; run the runtime stage on Windows, or build it "
-            "with CMake as described in README.md)")
-
-
 def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | None = None, *,
-              emulate: bool = False, keep_emulated: bool = False,
+              out: str | None = None, emulate: bool = False, keep_emulated: bool = False,
               fallbacks: tuple[str, ...] = (), jobs: int = 1) -> None:
     """Find every missing prerequisite before a long build starts, and list them all at once."""
     if "runtime" in stages and runtime_build:
@@ -940,17 +927,19 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
         missing.append("Visual Studio 2022 with 'Desktop development with C++'")
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         missing.extend(f"{s} (for the runtime stage, or pass --runtime-build)" for s in cross_build_missing())
-    # The pipelines stage needs a checker the runtime stage builds (on Windows only with VULKAN_SDK set).
+    # The pipelines stage runs gta6rt.exe --precompile-pipelines (under Wine off Windows).
     # Without this check a build with shaders and pipelines spends hours before failing at the very end.
-    if "pipelines" in stages and not pipeline_check_exe(runtime_build):
-        if os.name != "nt":
-            if not shutil.which("cmake"):
-                missing.append("CMake 3.24 or newer, a C++20 compiler and the Vulkan headers, to build "
-                               "vk_pipeline_check for the pipelines stage")
-        else:
-            runtime_building = "runtime" in stages and not runtime_build
-            if not runtime_building or not os.environ.get("VULKAN_SDK"):
-                missing.append(pipeline_check_prerequisite(runtime_building))
+    if "pipelines" in stages:
+        if "runtime" not in stages:
+            if not runtime_exe(out, runtime_build):
+                missing.append("gta6rt.exe (needed by the pipelines stage; run the runtime stage or pass "
+                               "--runtime-build)")
+        elif os.name == "nt" and not runtime_build and not os.environ.get("VULKAN_SDK"):
+            missing.append("VULKAN_SDK (the runtime stage builds gta6rt.exe with Vulkan support only when it is "
+                           "set, and the pipelines stage needs it)")
+        if os.name != "nt" and not wine_available():
+            missing.append(f"{wine_exe()} (Wine, needed to run gta6rt.exe in the pipelines stage; "
+                           "install Wine or set WINE)")
     if missing:
         fail("Install these first, then run the build again:\n  - " + "\n  - ".join(dict.fromkeys(missing)))
     if os.name == "nt" and "runtime" in stages and not runtime_build and not os.environ.get("VULKAN_SDK"):
@@ -991,16 +980,6 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
              "Free some space or choose another drive with --work." + hint)
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         cross_configure()
-    if "pipelines" in stages and os.name != "nt":
-        checker = pipeline_check_exe()
-        # A checker built before a pull is rebuilt too; cmake --build only recompiles what changed. Without CMake
-        # the pipelines stage says it is out of date and uses it.
-        if not checker or (stale_checker(checker) and shutil.which("cmake")):
-            build_pipeline_check(jobs)
-            if not pipeline_check_exe():
-                fail("vk_pipeline_check built, but not as runtime/build/linux/vk_pipeline_check (a multi-config "
-                     "generator puts it in a subfolder): unset CMAKE_GENERATOR if it names one, delete "
-                     "runtime/build/linux and run the build again.")
     if "assets" in stages:
         ensure_submodule()
 
@@ -2594,7 +2573,7 @@ def cross_configure() -> str:
     cmake_configure(build, "--toolchain", os.path.join(ROOT, "runtime", "cmake", "clang-cl-xwin.cmake"),
                     f"-DXWIN_DIR={xwin}", *tools, hint="CMake's error above says what the cross-build lacks "
                     "(docs/testing.md, \"The Windows runtime on Linux\"). Or pass --runtime-build, or drop "
-                    "runtime from --stages (the default without it: check,shaders,assets,pipelines).")
+                    "runtime and pipelines from --stages (the default without them: check,shaders,assets).")
     return build
 
 
@@ -2604,15 +2583,6 @@ def cross_build_runtime(jobs: int) -> str:
     cmake_build(build, ["gta6rt", "gta6rt_tls_host"], jobs,
                 "See the compiler output above; docs/testing.md has the cross-build's requirements.")
     return build
-
-
-def build_pipeline_check(jobs: int) -> None:
-    build = os.path.join(ROOT, "runtime", "build", "linux")
-    log("pipelines: building vk_pipeline_check")
-    cmake_configure(build)
-    cmake_build(build, ["vk_pipeline_check"], jobs,
-                "It needs a C++20 compiler and the Vulkan headers (your distribution's Vulkan headers package, "
-                "or VULKAN_SDK); the CMake output above says which is missing.")
 
 
 def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs: int = 1,
@@ -2708,28 +2678,58 @@ def positive_int(text: str) -> int:
     return value
 
 
-def pipeline_check_exe(runtime_build: str | None = None) -> str | None:
-    """Find the checker for this host, using a supplied Windows build before the local Windows build."""
+def wine_exe() -> str:
+    """Wine command for running Windows binaries off Windows (honours WINE)."""
+    return os.environ.get("WINE") or "wine"
+
+
+def wine_available() -> bool:
+    cmd = wine_exe()
+    return bool(cmd and (os.path.isfile(cmd) or shutil.which(cmd)))
+
+
+def wine_path(path: str) -> str:
+    """Absolute path formatted for a Windows process: native on Windows, Z:\\... under Wine."""
+    full = os.path.abspath(path)
+    if os.name == "nt":
+        return full
+    return "Z:" + full.replace("/", "\\")
+
+
+def _host_cache_dir(out: str, env_value: str | None) -> str:
+    if not env_value:
+        return out
+    if os.name != "nt" and len(env_value) >= 2 and env_value[0].upper() == "Z" and env_value[1] == ":":
+        return env_value[2:].replace("\\", "/") or "/"
+    return env_value
+
+
+def runtime_exe(out: str | None = None, runtime_build: str | None = None) -> str | None:
+    """Find gta6rt.exe in <out>, then --runtime-build, then this checkout's default build folder."""
     build = os.path.join(ROOT, "runtime", "build")
-    windows = os.name == "nt"
-    if windows:
-        windows_builds = (runtime_build, build) if runtime_build else (build,)
-        found = [os.path.join(d, "vk_pipeline_check.exe") for d in windows_builds]
+    default_dir = build if os.name == "nt" else cross_build_dir()
+    dirs = [d for d in (out, runtime_build, default_dir) if d]
+    return next((p for d in dirs if os.path.isfile(p := os.path.join(d, "gta6rt.exe"))), None)
+
+
+def precompile_command(exe: str, jobs: int) -> list[str]:
+    """Command line to run gta6rt --precompile-pipelines directly on Windows or under Wine elsewhere."""
+    base = [exe, "--precompile-pipelines", "--threads", str(jobs)]
+    return base if os.name == "nt" else [wine_exe(), *base]
+
+
+def precompile_env(spirv: str, out: str) -> dict[str, str]:
+    """Child environment for gta6rt --precompile-pipelines, preserving user-set shader/cache paths."""
+    env = dict(os.environ)
+    if env.get("LEONIDA_SHADERS"):
+        log(f"pipelines: using LEONIDA_SHADERS from environment: {env['LEONIDA_SHADERS']}")
     else:
-        found = [os.path.join(build, "linux", "vk_pipeline_check"), os.path.join(build, "vk_pipeline_check")]
-    return next((p for p in found if os.path.isfile(p) and (windows or os.access(p, os.X_OK))), None)
-
-
-def stale_checker(exe: str) -> list:
-    """The sources of vk_pipeline_check changed after `exe` was built, when `exe` is in this checkout's runtime/build.
-    A checker from elsewhere (--runtime-build) isn't compared: its time stamp says nothing about these sources."""
-    build = os.path.abspath(os.path.join(ROOT, "runtime", "build"))
-    try:
-        if os.path.commonpath([build, os.path.abspath(exe)]) != build:
-            return []
-    except ValueError:   # another drive
-        return []
-    return newer_sources(exe, ROOT, "vk_pipeline_check")
+        env["LEONIDA_SHADERS"] = wine_path(spirv)
+    if env.get("LEONIDA_PIPELINE_CACHE_DIR"):
+        log(f"pipelines: using LEONIDA_PIPELINE_CACHE_DIR from environment: {env['LEONIDA_PIPELINE_CACHE_DIR']}")
+    else:
+        env["LEONIDA_PIPELINE_CACHE_DIR"] = wine_path(out)
+    return env
 
 
 def require_translated_shaders(work: str) -> str:
@@ -2745,127 +2745,133 @@ def require_translated_shaders(work: str) -> str:
              "run the shaders stage again.")
     if not translated:
         # A build from before the shaders stage refused an empty merge can carry this marker.
-        fail(f"The translated shader index {index} is empty, so there is nothing to check. Run the shaders stage again.")
+        fail(f"The translated shader index {index} is empty, so there is nothing to precompile. Run the shaders stage again.")
     return spirv
 
 
+PRECOMPILE_PROGRESS_RE = re.compile(r"^\[precompile\]\s+(\d+)/(\d+)\s+")
+
+
+def read_crashed_names(cache_root: str) -> "list[str]":
+    """Entry names the runtime recorded in <cache>/pipeline_cache.d/requests/crashed.txt."""
+    path = os.path.join(cache_root, "pipeline_cache.d", "requests", "crashed.txt")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return list(dict.fromkeys(name for line in f if (name := line.strip())))
+    except OSError:
+        return []
+
+
+def _run_precompile(cmd: list[str], env: dict[str, str], progress_box: list) -> int:
+    """Run one gta6rt --precompile-pipelines process, streaming output and driving Progress/StageBoard."""
+    log("  " + " ".join(os.path.basename(str(a)) if i == 0 else str(a) for i, a in enumerate(cmd)))
+    board = leonida_tui.current_board()
+    kw: dict = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "env": env,
+    }
+    if os.name == "nt" and board is not None:
+        kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        proc = subprocess.Popen([str(a) for a in cmd], **kw)
+    except OSError as error:
+        fail(f"pipelines: could not start {cmd[0]}: {error.strerror or error}")
+    leonida_tui.register_live_process(proc)
+    try:
+        stream = proc.stdout
+        if stream is not None:
+            while True:
+                if board is not None and getattr(board, "_stop", None) is not None and board._stop.is_set():
+                    leonida_tui.kill_live_processes()
+                    break
+                raw = stream.readline()
+                if raw == "":
+                    break
+                for piece in raw.replace("\r", "\n").split("\n"):
+                    line = piece.strip()
+                    if not line:
+                        continue
+                    m = PRECOMPILE_PROGRESS_RE.match(line)
+                    if m:
+                        done, total = int(m.group(1)), int(m.group(2))
+                        prog = progress_box[0]
+                        if prog is None or prog.total != total:
+                            prog = Progress("pipelines", total, every_s=5.0)
+                            progress_box[0] = prog
+                        prog.set(done)
+                        if board is not None and total > 0:
+                            board.set_summary(f"pipelines: {done}/{total} ({100 * done // total}%)")
+                    else:
+                        log(line)
+            try:
+                stream.close()
+            except OSError:
+                pass
+        return proc.wait()
+    except BaseException:
+        _stop_procs([proc])
+        raise
+    finally:
+        leonida_tui.unregister_live_process(proc)
+
+
 def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: str | None = None) -> None:
-    exe = pipeline_check_exe(runtime_build)
-    if not exe and os.name == "nt":
-        fail("vk_pipeline_check.exe wasn't built: run the runtime stage with the Vulkan SDK installed.")
+    exe = runtime_exe(out, runtime_build)
     if not exe:
-        fail("vk_pipeline_check wasn't built. With CMake 3.24+, a C++20 compiler and the Vulkan headers and "
-             "loader installed, run: cmake -S runtime -B runtime/build/linux && "
-             "cmake --build runtime/build/linux --parallel")
-    newer = stale_checker(exe)
-    if newer:
-        rebuild = ("run the runtime stage with VULKAN_SDK set" if os.name == "nt" else
-                   "cmake --build runtime/build/linux --target vk_pipeline_check")
-        more = f" and {len(newer) - 3} more" if len(newer) > 3 else ""
-        log(f"pipelines: WARNING: {exe} is older than {', '.join(newer[:3])}{more}, so it is not this checkout's "
-            f"checker; to rebuild it, {rebuild}")
+        hint = ("run the runtime stage with the Vulkan SDK installed, or pass --runtime-build."
+                if os.name == "nt" else
+                "run the runtime stage (clang-cl + xwin) or pass --runtime-build.")
+        fail(f"gta6rt.exe was not found: {hint}")
     spirv = require_translated_shaders(work)
-    log("pipelines: creating every shader module and pipeline (compute and graphics) on this GPU")
+    threads = jobs if jobs else max(1, (os.cpu_count() or 2) // 2)
+    cmd = precompile_command(exe, threads)
+    if os.name != "nt" and cmd[0] == wine_exe() and not wine_available():
+        fail(f"'{wine_exe()}' was not found: install Wine or set WINE to run gta6rt.exe in the pipelines stage.")
     os.makedirs(out, exist_ok=True)
-    cache = os.path.join(out, "pipeline_cache.bin")
-    inflight = os.path.join(out, "pipeline_inflight.txt")
-    skip = os.path.join(out, "pipeline_crashes.txt")
     report = os.path.join(out, "pipeline_crashes.json")
-    drop(inflight, skip, report)   # every module gets a fresh chance on each run (a new translator may have fixed it)
-    # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
-    jobs_args = ["--jobs", str(jobs)] if jobs else []
-    base = [exe, spirv, cache, *jobs_args]
+    drop(report)
+    env = precompile_env(spirv, out)
+    cache_root = _host_cache_dir(out, os.environ.get("LEONIDA_PIPELINE_CACHE_DIR"))
+    log("pipelines: precompiling compute shaders into pipeline_cache.d with gta6rt")
 
-    def seed_bvh() -> None:
-        bvh = os.path.join(spirv, "bvh")
-        if not os.path.isfile(os.path.join(bvh, "index.json")):
-            return
-        log("pipelines: creating XboxBvhBuilder compute pipelines")
-        run([exe, bvh, cache, *jobs_args])
+    def collect_crashes() -> "list[str]":
+        names = read_crashed_names(cache_root)
+        if not names and cache_root != out:
+            names = read_crashed_names(out)
+        if names:
+            log(f"pipelines: WARNING: {len(names)} compute entry(ies) crashed the driver and were skipped "
+                f"(recorded in pipeline_crashes.json): {', '.join(names)}")
+            record_crashes(out, spirv, names)
+        return names
 
-    if not checker_supports(exe, "--inflight-file", "--skip-file"):
-        # An older build takes any argument it doesn't know as the cache path, so it would write the cache into
-        # pipeline_inflight.txt and exit 0. Run it as before: a module that kills it stops the stage.
-        log("pipelines: this vk_pipeline_check has no --inflight-file; rebuild the runtime stage so a module that "
-            "crashes the driver is skipped instead of stopping the stage")
-        run(base)
-        seed_bvh()
-        log("pipelines: done")
-        return
-    base += ["--inflight-file", inflight]
-    # Bound each checker invocation to a range that recovery can split further when concurrent heavy compiles
-    # exceed available memory, without starting the entire corpus again (BUILD-1030).
-    names = pipeline_names(spirv) if checker_supports(exe, "--start", "--count") else []
-    crashed: "list[str]" = []
-
-    def check_range(start: int = 0, count: "int | None" = None) -> int:
-        selection = ["--start", str(start), "--count", str(count)] if count is not None else []
-        allowed = set(names[start:start + count]) if count is not None else None
-        for _ in range(PIPELINE_CRASH_RETRIES + 1):
-            drop(inflight)   # a crash during setup must not inherit another process's in-flight module names
-            code = run(base + selection + (["--skip-file", skip] if crashed else []), check=False)
-            # Native setup failures also return 1. A finished pass writes/clears this report even when shaders
-            # fail validation; setup failures return before writing it. Do not repeat setup for every batch.
-            if code == 1 and not os.path.isfile(inflight):
-                fail("vk_pipeline_check exited with 1 before writing its work report; check Vulkan initialization "
-                     "and report-file access in the output above")
-            if code in (0, 1, 2) or interrupted(code):
-                return code
-            suspects = list(dict.fromkeys(n for n in read_names(inflight)
-                                          if n not in crashed and (allowed is None or n in allowed)))
-            # Even the last in-flight module can be innocent after other heavy compiles in the batch.
-            if count is not None or len(suspects) > 1:
-                suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n, inflight)]
-            if not suspects:
-                if count is not None and count > 1:
-                    # All suspects survived in fresh processes: do not blacklist them. Re-check the entire failed
-                    # range in smaller processes; completed earlier batches retain their cache checkpoints.
-                    log(f"pipelines: shaders {start + 1}-{start + count} exited with {exit_label(code)} without "
-                        "a reproducible module crash; retrying this range in smaller batches")
-                    half = count // 2
-                    first = check_range(start, half)
-                    if first == 2 or interrupted(first):
-                        return first
-                    second = check_range(start + half, count - half)
-                    return second or first
-                # The give-up path is exactly when a durable record matters: a module was named earlier,
-                # but the driver now aborts before it can name another one. fail() raises, so write first.
-                if crashed:
-                    record_crashes(out, spirv, crashed)
-                fail(f"vk_pipeline_check exited with {exit_label(code)} while no module could be named as the cause; "
-                     "the checker could not finish even this range in a fresh process; check available memory "
-                     "and report it if it keeps happening")
-            for n in suspects:
-                log(f"pipelines: {n} took vk_pipeline_check down ({exit_label(code)}); checking the rest without it")
-            crashed.extend(suspects)
-            with open(skip, "w", encoding="utf-8", newline="\n") as f:
-                f.write("".join(n + "\n" for n in crashed))
-        if crashed:
-            record_crashes(out, spirv, crashed)
-        fail(f"vk_pipeline_check still crashed after {PIPELINE_CRASH_RETRIES} retries; modules that took it down: "
-             + ", ".join(crashed))
-
+    progress_box: list = [None]
     code = 0
-    ranges = [(s, min(PIPELINE_BATCH_SIZE, len(names) - s))
-              for s in range(0, len(names), PIPELINE_BATCH_SIZE)] if names else [(0, None)]
-    for start, count in ranges:
-        if count is not None:
-            log(f"pipelines: checking shaders {start + 1}-{start + count} of {len(names)} in a fresh process")
-        result = check_range(start, count)
-        if result:
-            code = result   # a later successful batch must not erase an earlier validation failure
-        if result == 2 or interrupted(result):
+    for attempt in range(PIPELINE_CRASH_RETRIES + 1):
+        code = _run_precompile(cmd, env, progress_box)
+        if code == 0:
             break
-    if crashed and not code:
-        code = 1
-    if crashed:
-        record_crashes(out, spirv, crashed)
-    drop(inflight)
-    if code != 0:
-        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed (with their SPIR-V " \
-              f"hashes in pipeline_crashes.json): " + ", ".join(crashed) if crashed else ""
-        fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
-    seed_bvh()
+        if code == 2:
+            log("pipelines: WARNING: some compute entries failed or were skipped after a crash (exit 2); see the summary above")
+            break
+        if code == 1:
+            fail("pipelines: gta6rt could not open the Vulkan device or shader library (exit 1); "
+                 "see the output above")
+        if interrupted(code):
+            fail(f"pipelines: gta6rt interrupted ({exit_label(code)})")
+        if attempt < PIPELINE_CRASH_RETRIES:
+            log(f"pipelines: gta6rt crashed ({exit_label(code)}); retrying "
+                f"({attempt + 1}/{PIPELINE_CRASH_RETRIES}) so the runtime skips the in-flight entry")
+    else:
+        crashed = collect_crashes()
+        why = f"; crashed entries: {', '.join(crashed)}" if crashed else ""
+        fail(f"pipelines: gta6rt still crashed after {PIPELINE_CRASH_RETRIES} retries "
+             f"(last exit {exit_label(code)}){why}")
+
+    collect_crashes()
     log("pipelines: done")
 
 
@@ -2873,11 +2879,16 @@ def record_crashes(out: str, spirv: str, crashed: "list[str]") -> None:
     """pipeline_crashes.json: name and SHA-256 of each module that took the driver down, so a report names the
     exact translation without attaching the shader. OSError (a missing .spv) leaves that module's hash null."""
     def digest(name: str) -> "str | None":
-        try:
-            with open(os.path.join(spirv, name + ".spv"), "rb") as f:
-                return hashlib.sha256(f.read()).hexdigest()
-        except OSError:
-            return None
+        candidates = [os.path.join(spirv, name + ".spv")] + [
+            os.path.join(spirv, sub, name + ".spv") for sub in ("library", "bvh", "fspx", "fspx_compute", "exe")
+        ]
+        for path in candidates:
+            try:
+                with open(path, "rb") as f:
+                    return hashlib.sha256(f.read()).hexdigest()
+            except OSError:
+                continue
+        return None
     doc = {"modules": [{"name": n, "spv_sha256": digest(n)} for n in crashed]}
     try:
         with open(os.path.join(out, "pipeline_crashes.json"), "w", encoding="utf-8", newline="\n") as f:
@@ -2885,14 +2896,13 @@ def record_crashes(out: str, spirv: str, crashed: "list[str]") -> None:
             f.write("\n")
     except OSError as error:
         # The durable record is best-effort. A report path that cannot be written must not
-        # replace the checker diagnostic that names the modules which took the driver down.
+        # replace the diagnostic that names the modules which took the driver down.
         log(f"pipelines: cannot write pipeline_crashes.json: {error.strerror or error}")
 
 
-# How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the
-# 10 minutes since the last cache checkpoint, plus loading the cache). Looked up when pipelines() runs.
+# How many times the pipelines stage restarts gta6rt after a module takes it down; the next start moves any stale
+# in-flight entry to requests/crashed.txt and skips it.
 PIPELINE_CRASH_RETRIES = 5
-PIPELINE_BATCH_SIZE = 500   # fresh compiler process and cache checkpoint after at most this many index entries
 
 
 def interrupted(code: int) -> bool:
@@ -2905,67 +2915,6 @@ def exit_label(code: int) -> str:
     if code < 0:
         return f"signal {-code}"
     return f"{code} ({code:#010x})" if code > 255 else str(code)
-
-
-def checker_supports(exe: str, *options: str) -> bool:
-    """Whether this vk_pipeline_check build knows the options: run without arguments, it prints its usage (and exits
-    2) before touching Vulkan. Builds before --inflight-file don't reject unknown arguments, so asking is the only way
-    to tell."""
-    try:
-        r = subprocess.run([exe], capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    usage = (r.stdout or "") + (r.stderr or "")
-    return all(o in usage for o in options)
-
-
-def read_names(path: str) -> "list[str]":
-    """The module names in vk_pipeline_check's --inflight-file ("name<TAB>phase" lines)."""
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            return [n for n in (line.split("\t", 1)[0].strip() for line in f) if n]
-    except OSError:
-        return []
-
-
-def pipeline_names(spirv: str) -> "list[str]":
-    """The checker's name-sorted index (byte order, as its std::map); ranges and diagnostic probes share it."""
-    path = os.path.join(spirv, "index.json")
-    try:
-        with open(path, encoding="utf-8-sig") as f:
-            index = json.load(f)
-    except (OSError, ValueError) as e:
-        fail(f"pipelines: cannot read {path}: {getattr(e, 'strerror', None) or e}")
-    if not isinstance(index, dict):
-        fail(f"pipelines: {path} must contain a JSON object")
-    return sorted(index, key=lambda n: n.encode("utf-8"))
-
-
-def crashes_alone(exe: str, spirv: str, cache: str, name: str, inflight: str | None = None) -> bool:
-    """Confirm a crash only when this probe's fresh report names the selected module as in flight."""
-    names = pipeline_names(spirv)
-    if name not in names:
-        return False
-    args = [exe, spirv, cache, "--jobs", "1", "--start", str(names.index(name)), "--count", "1"]
-    if inflight:
-        drop(inflight)
-        args += ["--inflight-file", inflight]
-    code = run(args, check=False)
-    if code == 1 and inflight and not os.path.isfile(inflight):
-        fail(f"pipelines: checking {name} alone exited with 1 before writing its work report; "
-             "check Vulkan initialization and report-file access in the output above")
-    if interrupted(code) or code == 2:
-        fail(f"pipelines: checking {name} alone stopped with {exit_label(code)}")
-    if code in (0, 1):
-        return False
-    # The process may have died during setup or after finishing, rather than inside this module. The native
-    # report is periodic for small modules, so a fast real crash can also leave no evidence: stop conservatively
-    # in that case instead of blaming an innocent module or retrying more ranges with an unreliable checker.
-    if not inflight or name not in read_names(inflight):
-        fail(f"pipelines: checking {name} alone exited with {exit_label(code)} without a fresh report naming it "
-             "as in flight; the diagnostic result is inconclusive, so no crash is attributed to this module. "
-             "Check the checker output, available memory and report-file access before retrying")
-    return True
 
 
 def path_is_within(path: str, directory: str) -> bool:
@@ -3078,9 +3027,9 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
         if "pipelines" in stages:
             shaders_ok = wait("shaders") if "shaders" in futures else True
             if shaders_ok:
-                # When runtime is in this run it rebuilds vk_pipeline_check at the same path: wait for it so
-                # pipelines does not validate with a stale binary or race the Windows linker. A checker already
-                # on disk is enough only when this run is not rebuilding it.
+                # When runtime is in this run it rebuilds gta6rt.exe at the same path: wait for it so
+                # pipelines does not precompile with a stale binary or race the Windows linker. A gta6rt.exe
+                # already on disk is enough only when this run is not rebuilding it.
                 runtime_ok = wait("runtime") if "runtime" in futures else True
                 if runtime_ok:
                     futures["pipelines"] = ex.submit(_invoke_stage, "pipelines", fn_pipelines)
@@ -3125,9 +3074,9 @@ def main() -> int:
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
     ap.add_argument("--runtime-build", metavar="DIR", type=nonempty_path,
-                    help="a Windows build of runtime/ (gta6rt.exe and gta6rt_tls_host.dll) for the runtime stage "
-                         "instead of building it (off Windows: instead of the clang-cl + xwin cross-build); "
-                         "on Windows, also use vk_pipeline_check.exe from DIR if present")
+                    help="a Windows build of runtime/ (gta6rt.exe and gta6rt_tls_host.dll) for the runtime and "
+                         "pipelines stages instead of building it (off Windows: instead of the clang-cl + xwin "
+                         "cross-build)")
     ap.add_argument("--wave64-emulate", choices=WAVE64_MODES, default="auto",
                     help="translate wave64 compute and mesh shaders to be exact on any subgroup size (needed on "
                          "32-wide GPUs: NVIDIA, Intel). auto (default) checks GPU subgroup support and prefers "
@@ -3139,8 +3088,7 @@ def main() -> int:
                     help="run the translator's compact binary pass on all shader libraries (requires spirv-opt)")
     ap.add_argument("--no-float-controls", action="store_true",
                     help="translate without SignedZeroInfNanPreserve and DenormPreserve (Depends on: #664), for "
-                         "devices whose vk_pipeline_check skips a shader without "
-                         "shaderSignedZeroInfNanPreserveFloat32 or shaderDenormPreserveFloat16")
+                         "devices without shaderSignedZeroInfNanPreserveFloat32 or shaderDenormPreserveFloat16")
     ap.add_argument("--bary-fallback", action="store_true",
                     help="translate raw barycentric reads from an interpolated vec3 input (with a pass-through "
                          "geometry shader the runtime draws), for devices without "
@@ -3225,8 +3173,11 @@ def main() -> int:
     if a.stages is None and os.name != "nt" and not runtime_build:
         lacking = cross_build_missing()
         if lacking:
-            stages = [s for s in stages if s not in WINDOWS_ONLY]
-            log(f"{', '.join(WINDOWS_ONLY)}: left out, the cross-build needs {'; '.join(lacking)} "
+            dropped = list(WINDOWS_ONLY)
+            if "pipelines" in stages and (not runtime_exe(out, runtime_build) or not wine_available()):
+                dropped.append("pipelines")
+            stages = [s for s in stages if s not in dropped]
+            log(f"{', '.join(dropped)}: left out, the cross-build needs {'; '.join(lacking)} "
                 "(or pass --runtime-build)")
     if "shaders" in stages and not a.mesh_compute and not a.native_mesh:
         crash = runtime_gpu_mesh_draws_crash()
@@ -3282,7 +3233,7 @@ def main() -> int:
         cfg = leonida_tui.run_setup(a.jobs, default_overlap=True)
         a.jobs = leonida_tui.clamp_jobs(cfg.jobs)
         overlap = cfg.overlap
-    preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
+    preflight(stages, work, a.wav, runtime_build, out=out, emulate=emulate, keep_emulated=keep_emulated,
               fallbacks=fallbacks, jobs=a.jobs)
     if not a.out and icloud_documents():
         for note in icloud_default_notes():

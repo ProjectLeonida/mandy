@@ -1,21 +1,148 @@
-"""make_game.py: vk_pipeline_check selection and arguments in the pipelines stage.
+"""make_game.py: gta6rt --precompile-pipelines invocation, progress, env and crash handling.
 
-Standard library only; no GPU, no Vulkan SDK, no game data: the checker is mocked.
+    python -I tests/test_make_game_pipelines.py
+
+Standard library only; no GPU, no Vulkan SDK, no Wine, no game data: uses a small Python script
+as a fake gta6rt executed via sys.executable.
 """
+import hashlib
 import io
 import json
 import os
 import sys
 import tempfile
+import textwrap
 import unittest
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 import make_game  # noqa: E402
 
 
-class PipelinesJobsTest(unittest.TestCase):
+FAKE_GTA6RT = textwrap.dedent("""\
+    import json, os, sys
+
+    state_file = os.environ["FAKE_STATE"]
+    plan = json.loads(os.environ["FAKE_PLAN"])
+    if os.path.isfile(state_file):
+        with open(state_file, encoding="utf-8") as f:
+            state = json.load(f)
+    else:
+        state = {"calls": []}
+
+    idx = len(state["calls"])
+    state["calls"].append({
+        "argv": sys.argv[1:],
+        "LEONIDA_SHADERS": os.environ.get("LEONIDA_SHADERS"),
+        "LEONIDA_PIPELINE_CACHE_DIR": os.environ.get("LEONIDA_PIPELINE_CACHE_DIR"),
+        "CUSTOM_PASSTHROUGH": os.environ.get("CUSTOM_PASSTHROUGH"),
+    })
+    with open(state_file, "w", encoding="utf-8", newline="\\n") as f:
+        json.dump(state, f)
+
+    step = plan[min(idx, len(plan) - 1)]
+    cache_root = os.environ.get("FAKE_CACHE_ROOT", "")
+    req_dir = os.path.join(cache_root, "pipeline_cache.d", "requests") if cache_root else ""
+    inflight_path = os.path.join(req_dir, "inflight.txt") if req_dir else ""
+    crashed_path = os.path.join(req_dir, "crashed.txt") if req_dir else ""
+
+    # Mirror the runtime's crash recovery: stale inflight.txt -> append to crashed.txt and remove inflight.txt.
+    if inflight_path and os.path.isfile(inflight_path):
+        with open(inflight_path, encoding="utf-8") as f:
+            stale = [line.strip() for line in f if line.strip()]
+        os.remove(inflight_path)
+        if stale:
+            os.makedirs(req_dir, exist_ok=True)
+            with open(crashed_path, "a", encoding="utf-8", newline="\\n") as f:
+                for name in stale:
+                    f.write(name + "\\n")
+
+    if step.get("leave_inflight") and inflight_path:
+        os.makedirs(req_dir, exist_ok=True)
+        with open(inflight_path, "w", encoding="utf-8", newline="\\n") as f:
+            for name in step["leave_inflight"]:
+                f.write(name + "\\n")
+
+    if step.get("write_crashed") and crashed_path:
+        os.makedirs(req_dir, exist_ok=True)
+        with open(crashed_path, "w", encoding="utf-8", newline="\\n") as f:
+            for name in step["write_crashed"]:
+                f.write(name + "\\n")
+
+    for line in step.get("stderr", []):
+        print(line, file=sys.stderr, flush=True)
+    for line in step.get("stdout", []):
+        print(line, flush=True)
+    sys.exit(int(step.get("exit", 0)))
+""")
+
+
+class PipelinesRuntimeHelpersTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+
+    def touch(self, *parts):
+        path = os.path.join(self.root, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb"):
+            pass
+        return path
+
+    def test_runtime_exe_search_order_windows(self):
+        out = os.path.join(self.root, "out")
+        supplied = os.path.join(self.root, "supplied")
+        default_exe = self.touch("runtime", "build", "gta6rt.exe")
+        with mock.patch.object(make_game, "ROOT", self.root), mock.patch.object(make_game.os, "name", "nt"):
+            self.assertEqual(make_game.runtime_exe(out, supplied), default_exe)
+            supplied_exe = self.touch("supplied", "gta6rt.exe")
+            self.assertEqual(make_game.runtime_exe(out, supplied), supplied_exe)
+            out_exe = self.touch("out", "gta6rt.exe")
+            self.assertEqual(make_game.runtime_exe(out, supplied), out_exe)
+
+    def test_runtime_exe_search_order_posix(self):
+        out = os.path.join(self.root, "out")
+        supplied = os.path.join(self.root, "supplied")
+        default_exe = self.touch("runtime", "build", "windows", "gta6rt.exe")
+        with mock.patch.object(make_game, "ROOT", self.root), mock.patch.object(make_game.os, "name", "posix"):
+            self.assertEqual(make_game.runtime_exe(out, supplied), default_exe)
+            supplied_exe = self.touch("supplied", "gta6rt.exe")
+            self.assertEqual(make_game.runtime_exe(out, supplied), supplied_exe)
+            out_exe = self.touch("out", "gta6rt.exe")
+            self.assertEqual(make_game.runtime_exe(out, supplied), out_exe)
+
+    def test_precompile_command_windows_and_wine(self):
+        with mock.patch.object(make_game.os, "name", "nt"):
+            self.assertEqual(
+                make_game.precompile_command(r"C:\Port\gta6rt.exe", 6),
+                [r"C:\Port\gta6rt.exe", "--precompile-pipelines", "--threads", "6"],
+            )
+        env = {k: v for k, v in os.environ.items() if k != "WINE"}
+        with mock.patch.object(make_game.os, "name", "posix"), mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                make_game.precompile_command("/port/gta6rt.exe", 4),
+                ["wine", "/port/gta6rt.exe", "--precompile-pipelines", "--threads", "4"],
+            )
+        with mock.patch.object(make_game.os, "name", "posix"), \
+                mock.patch.dict(os.environ, {"WINE": "/opt/proton/files/bin/wine"}):
+            self.assertEqual(
+                make_game.precompile_command("/port/gta6rt.exe", 4),
+                ["/opt/proton/files/bin/wine", "/port/gta6rt.exe", "--precompile-pipelines", "--threads", "4"],
+            )
+
+    def test_wine_path_conversion(self):
+        with mock.patch.object(make_game.os, "name", "posix"), \
+                mock.patch.object(make_game.os.path, "abspath", return_value="/tmp/work/shaders/spirv"):
+            self.assertEqual(make_game.wine_path("ignored"), r"Z:\tmp\work\shaders\spirv")
+        with mock.patch.object(make_game.os, "name", "nt"), \
+                mock.patch.object(make_game.os.path, "abspath", return_value=r"D:\work\shaders\spirv"):
+            self.assertEqual(make_game.wine_path("ignored"), r"D:\work\shaders\spirv")
+
+
+class PipelinesStageTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -23,345 +150,231 @@ class PipelinesJobsTest(unittest.TestCase):
         self.game = os.path.join(self.root, "game")
         self.work = os.path.join(self.root, "work")
         self.out = os.path.join(self.root, "out")
-        spirv = os.path.join(self.work, "shaders", "spirv")
+        self.spirv = os.path.join(self.work, "shaders", "spirv")
         os.makedirs(self.game)
-        os.makedirs(spirv)
-        with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8") as f:
-            f.write('{"shader_0": {}}')   # a finished translation is never empty
+        os.makedirs(self.spirv)
+        os.makedirs(self.out)
+        with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            f.write('{"cs_a": {}, "cs_b": {}}\n')
+        self.fake_exe = os.path.join(self.out, "gta6rt.exe")
+        with open(self.fake_exe, "w", encoding="utf-8", newline="\n") as f:
+            f.write(FAKE_GTA6RT)
+        self.state_file = os.path.join(self.root, "state.json")
 
-    def checker_args(self, call):
-        with mock.patch.object(make_game, "pipeline_check_exe", return_value="vk_pipeline_check.exe"), \
-                mock.patch.object(make_game, "run", return_value=0) as run, \
-                mock.patch.object(make_game, "log", lambda *a: None):
-            call()
-        self.assertEqual(run.call_count, 1)
-        return [str(a) for a in run.call_args.args[0]]
+    def run_stage(self, plan, *, jobs=4, env_extra=None, os_name=None, runtime_build=None, board=None):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("LEONIDA_SHADERS", "LEONIDA_PIPELINE_CACHE_DIR", "WINE")}
+        env["FAKE_STATE"] = self.state_file
+        env["FAKE_PLAN"] = json.dumps(plan)
+        env["FAKE_CACHE_ROOT"] = self.out
+        env["CUSTOM_PASSTHROUGH"] = "keep-me"
+        if env_extra:
+            env.update(env_extra)
+        logs = []
+        stderr = io.StringIO()
 
-    def jobs_of(self, args):
-        self.assertEqual(args.count("--jobs"), 1, args)
-        return args[args.index("--jobs") + 1]
+        def fake_cmd(exe, threads):
+            return [sys.executable, exe, "--precompile-pipelines", "--threads", str(threads)]
 
-    def main_with(self, *extra):
-        argv = ["make_game.py", "--game", self.game, "--work", self.work, "--out", self.out,
-                "--stages", "pipelines", "--no-tui", *extra]
-        with mock.patch.object(sys, "argv", argv), mock.patch.object(make_game, "below_normal"), \
-                mock.patch.object(make_game, "check", return_value={"expected_exe": "g.exe"}), \
-                mock.patch.object(make_game, "preflight"):
-            self.assertEqual(make_game.main(), 0)
+        patches = [
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(make_game, "precompile_command", side_effect=fake_cmd),
+            mock.patch.object(make_game, "log", logs.append),
+            mock.patch("sys.stderr", stderr),
+        ]
+        if os_name is not None:
+            patches.append(mock.patch.object(make_game.os, "name", os_name))
+        if board is not None:
+            patches.append(mock.patch.object(make_game.leonida_tui, "current_board", return_value=board))
 
-    def test_the_stage_passes_its_jobs(self):
-        args = self.checker_args(lambda: make_game.pipelines(self.work, self.out, 7))
-        self.assertEqual(self.jobs_of(args), "7")
-        self.assertEqual(args[1:3], [os.path.join(self.work, "shaders", "spirv"),
-                                     os.path.join(self.out, "pipeline_cache.bin")])
+        with context_stack(patches):
+            exit_code = None
+            try:
+                make_game.pipelines(self.work, self.out, jobs, runtime_build=runtime_build)
+            except SystemExit as exc:
+                exit_code = exc.code
+        calls = []
+        if os.path.isfile(self.state_file):
+            with open(self.state_file, encoding="utf-8") as f:
+                calls = json.load(f)["calls"]
+        return exit_code, calls, logs, stderr.getvalue()
 
-    def test_jobs_on_the_command_line_reach_the_checker(self):
-        # main() clamps --jobs to the machine's hardware threads; pin them so 5 is in range anywhere (the
-        # GitHub Windows runners have 4).
-        with mock.patch.object(make_game.leonida_tui.os, "cpu_count", return_value=16):
-            self.assertEqual(self.jobs_of(self.checker_args(lambda: self.main_with("--jobs", "5"))), "5")
+    def test_args_env_progress_and_summary(self):
+        plan = [{
+            "stderr": [
+                "[precompile] 2 compute entries to build (0.1 MB of SPIR-V; 0 filtered out, 0 not buildable)",
+                "[precompile] 1/2 cs_a (128 B): compiled and journaled in 0.1 s (VkResult 0) | 1 compiled, 0 from a cache, 0 skipped, 0 failed; 0 s elapsed, ~0 s left by size",
+                "[precompile] 2/2 cs_b (128 B): compiled and journaled in 0.1 s (VkResult 0) | 2 compiled, 0 from a cache, 0 skipped, 0 failed; 0 s elapsed, ~0 s left by size",
+                "[precompile] done: 2 compiled, 0 from a cache, 0 journaled already, 0 failed, 0 not buildable, in 1 s",
+            ],
+            "exit": 0,
+        }]
+        fake_board = mock.Mock()
+        fake_board._stop = mock.Mock(is_set=mock.Mock(return_value=False))
+        code, calls, logs, err = self.run_stage(plan, jobs=7, board=fake_board)
+        self.assertIsNone(code, err)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["argv"], ["--precompile-pipelines", "--threads", "7"])
+        self.assertEqual(calls[0]["LEONIDA_SHADERS"], make_game.wine_path(self.spirv))
+        self.assertEqual(calls[0]["LEONIDA_PIPELINE_CACHE_DIR"], make_game.wine_path(self.out))
+        self.assertEqual(calls[0]["CUSTOM_PASSTHROUGH"], "keep-me")
+        # Progress parsed 1/2 and 2/2, updated TUI summary, and logged the done summary line.
+        self.assertTrue(any("pipelines: 0/2 (0%)" in line for line in logs), logs)
+        self.assertTrue(any("pipelines: 2/2 (100%)" in line for line in logs), logs)
+        self.assertTrue(any("[precompile] done: 2 compiled" in line for line in logs), logs)
+        self.assertIn("pipelines: done", logs)
+        fake_board.set_summary.assert_any_call("pipelines: 1/2 (50%)")
+        fake_board.set_summary.assert_any_call("pipelines: 2/2 (100%)")
 
-    def test_windows_reuses_the_checker_from_the_supplied_runtime_build(self):
-        supplied = os.path.join(self.root, "unpacked runtime")
+    @unittest.skipIf(os.name == "nt", "exercises POSIX WINE launcher path directly")
+    def test_posix_runs_via_wine_env_without_patching_command(self):
+        plan = [{
+            "stderr": [
+                "[precompile] 1/1 cs_a (64 B): compiled and journaled in 0.1 s (VkResult 0)",
+                "[precompile] done: 1 compiled, 0 from a cache, 0 journaled already, 0 failed, 0 not buildable, in 0 s",
+            ],
+            "exit": 0,
+        }]
+        env = {k: v for k, v in os.environ.items() if k not in ("LEONIDA_SHADERS", "LEONIDA_PIPELINE_CACHE_DIR")}
+        env.update({
+            "WINE": sys.executable,
+            "FAKE_STATE": self.state_file,
+            "FAKE_PLAN": json.dumps(plan),
+            "FAKE_CACHE_ROOT": self.out,
+        })
+        logs = []
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(make_game, "log", logs.append):
+            make_game.pipelines(self.work, self.out, 3)
+        with open(self.state_file, encoding="utf-8") as f:
+            calls = json.load(f)["calls"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["argv"], ["--precompile-pipelines", "--threads", "3"])
+        self.assertEqual(calls[0]["LEONIDA_SHADERS"], "Z:" + os.path.abspath(self.spirv).replace("/", "\\"))
+        self.assertEqual(calls[0]["LEONIDA_PIPELINE_CACHE_DIR"], "Z:" + os.path.abspath(self.out).replace("/", "\\"))
+
+    def test_user_set_shader_and_cache_env_are_preserved_and_logged(self):
+        plan = [{"stderr": ["[precompile] done: 0 compiled, 0 from a cache, 0 journaled already, 0 failed, 0 not buildable, in 0 s"], "exit": 0}]
+        custom_shaders = r"D:\custom\spirv"
+        custom_cache = r"D:\custom\cache"
+        code, calls, logs, err = self.run_stage(
+            plan,
+            env_extra={"LEONIDA_SHADERS": custom_shaders, "LEONIDA_PIPELINE_CACHE_DIR": custom_cache},
+        )
+        self.assertIsNone(code, err)
+        self.assertEqual(calls[0]["LEONIDA_SHADERS"], custom_shaders)
+        self.assertEqual(calls[0]["LEONIDA_PIPELINE_CACHE_DIR"], custom_cache)
+        self.assertTrue(any("LEONIDA_SHADERS" in line and custom_shaders in line for line in logs), logs)
+        self.assertTrue(any("LEONIDA_PIPELINE_CACHE_DIR" in line and custom_cache in line for line in logs), logs)
+
+    def test_exit_2_logs_warning_and_completes_stage(self):
+        plan = [{
+            "stderr": ["[precompile] done: 1 compiled, 0 from a cache, 0 journaled already, 1 failed, 0 not buildable, in 1 s"],
+            "exit": 2,
+        }]
+        code, calls, logs, err = self.run_stage(plan)
+        self.assertIsNone(code, err)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(any("WARNING" in line and "exit 2" in line for line in logs), logs)
+        self.assertIn("pipelines: done", logs)
+
+    def test_exit_1_fails_stage_without_retrying(self):
+        plan = [{"stderr": ["[precompile] failed to create Vulkan device"], "exit": 1}]
+        code, calls, logs, err = self.run_stage(plan)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("could not open the Vulkan device or shader library", err)
+
+    def test_interrupted_exit_does_not_retry(self):
+        # Use a direct mock on _run_precompile for exact negative/NT status codes on any platform.
+        logs = []
+        err = io.StringIO()
+        with mock.patch.object(make_game, "wine_available", return_value=True), \
+                mock.patch.object(make_game, "_run_precompile", return_value=0xC000013A) as run_mock, \
+                mock.patch.object(make_game, "log", logs.append), \
+                mock.patch("sys.stderr", err):
+            with self.assertRaises(SystemExit) as ctx:
+                make_game.pipelines(self.work, self.out, 2)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(run_mock.call_count, 1)
+        self.assertIn("interrupted", err.getvalue())
+
+    def test_crash_retries_and_writes_pipeline_crashes_json_from_crashed_txt(self):
+        lib_dir = os.path.join(self.spirv, "library")
+        os.makedirs(lib_dir)
+        blob = b"\x03\x02\x23\x07crash-spv"
+        with open(os.path.join(lib_dir, "lib_cs_00042.spv"), "wb") as f:
+            f.write(blob)
+
+        plan = [
+            {"leave_inflight": ["lib_cs_00042"], "exit": 139},
+            {
+                "stderr": ["[precompile] done: 1 compiled, 0 from a cache, 0 journaled already, 1 failed, 0 not buildable, in 1 s"],
+                "exit": 2,
+            },
+        ]
+        code, calls, logs, err = self.run_stage(plan)
+        self.assertIsNone(code, err)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(any("crashed" in line and "retrying (1/" in line for line in logs), logs)
+        self.assertTrue(any("lib_cs_00042" in line and "pipeline_crashes.json" in line for line in logs), logs)
+        report = os.path.join(self.out, "pipeline_crashes.json")
+        with open(report, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc, {"modules": [{"name": "lib_cs_00042", "spv_sha256": hashlib.sha256(blob).hexdigest()}]})
+
+    def test_crash_stops_after_retry_limit(self):
+        plan = [{"leave_inflight": ["cs_bad"], "exit": 99}]
+        with mock.patch.object(make_game, "PIPELINE_CRASH_RETRIES", 2):
+            code, calls, logs, err = self.run_stage(plan)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(calls), 3)   # initial attempt + 2 retries
+        self.assertIn("still crashed after 2 retries", err)
+        # By attempt 2, attempt 1's inflight was moved to crashed.txt, so pipeline_crashes.json is written.
+        with open(os.path.join(self.out, "pipeline_crashes.json"), encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual([m["name"] for m in doc["modules"]], ["cs_bad"])
+
+    def test_clean_run_drops_stale_pipeline_crashes_json(self):
+        report = os.path.join(self.out, "pipeline_crashes.json")
+        with open(report, "w", encoding="utf-8", newline="\n") as f:
+            f.write('{"modules": []}\n')
+        code, _, _, err = self.run_stage([{"exit": 0}])
+        self.assertIsNone(code, err)
+        self.assertFalse(os.path.exists(report))
+
+    def test_main_forwards_jobs_and_runtime_build(self):
+        supplied = os.path.join(self.root, "supplied")
         os.makedirs(supplied)
-        checker = os.path.join(supplied, "vk_pipeline_check.exe")
-        for name in (*make_game.RUNTIME_FILES, "vk_pipeline_check.exe"):
+        for name in make_game.RUNTIME_FILES:
             with open(os.path.join(supplied, name), "wb"):
                 pass
         argv = ["make_game.py", "--game", self.game, "--work", self.work, "--out", self.out,
-                "--stages", "runtime,pipelines", "--runtime-build", supplied, "--jobs", "3"]
-        # main() clamps --jobs to the hardware threads; pin them so 3 is in range anywhere (the
-        # GitHub Windows runners have 4, but a 2-vCPU machine would otherwise compare the clamped 2).
+                "--stages", "pipelines", "--runtime-build", supplied, "--jobs", "5", "--no-tui"]
         with mock.patch.object(make_game.leonida_tui.os, "cpu_count", return_value=16), \
-                mock.patch.object(sys, "argv", argv), mock.patch.object(make_game, "ROOT", self.root), \
-                mock.patch("os.name", "nt"), mock.patch.object(make_game, "below_normal"), \
+                mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(make_game, "below_normal"), \
                 mock.patch.object(make_game, "check", return_value={"expected_exe": "g.exe"}), \
-                mock.patch.object(make_game, "log"), mock.patch.object(make_game, "run") as run:
+                mock.patch.object(make_game, "preflight"), \
+                mock.patch.object(make_game, "log"), \
+                mock.patch.object(make_game, "pipelines") as stage:
             self.assertEqual(make_game.main(), 0)
-        run.assert_called_once()
-        self.assertEqual(run.call_args.args[0][0], checker)
-        self.assertEqual(self.jobs_of(run.call_args.args[0]), "3")
-
-    def test_the_default_matches_the_checker_default(self):
-        # vk_pipeline_check's own default is half the hardware threads, as is make_game.py's --jobs.
-        want = str(max(1, (os.cpu_count() or 2) // 2))
-        self.assertEqual(self.jobs_of(self.checker_args(lambda: self.main_with())), want)
-
-    def test_the_stage_log_names_compute_and_graphics_pipelines(self):
-        # The stage runs vk_pipeline_check without --stage, and its default is all: cs become compute pipelines,
-        # ps/vs/ms/gs become graphics pipelines with partner stubs, so the announce line must not claim compute only.
-        logs = []
-        with mock.patch.object(make_game, "pipeline_check_exe", return_value="vk_pipeline_check.exe"), \
-                mock.patch.object(make_game, "checker_supports", return_value=False), \
-                mock.patch.object(make_game, "run", return_value=0), \
-                mock.patch.object(make_game, "log", logs.append):
-            make_game.pipelines(self.work, self.out)
-        announce = [m for m in logs if "creating" in m]
-        self.assertEqual(len(announce), 1, logs)
-        self.assertIn("graphics", announce[0])
-        self.assertIn("compute", announce[0])
+        stage.assert_called_once_with(
+            os.path.abspath(self.work), os.path.abspath(self.out), 5, runtime_build=os.path.abspath(supplied)
+        )
 
 
-ABORT = 0x80000003   # how Windows reports the driver's LLVM abort (#884)
+class context_stack:
+    def __init__(self, patches):
+        self._patches = patches
 
+    def __enter__(self):
+        for p in self._patches:
+            p.start()
 
-class PipelinesCrashRetryTest(unittest.TestCase):
-    """A module that takes vk_pipeline_check down is skipped and the rest is checked; the checker is scripted."""
-
-    def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.work = os.path.join(tmp.name, "work")
-        self.out = os.path.join(tmp.name, "out")
-        self.spirv = os.path.join(self.work, "shaders", "spirv")
-        os.makedirs(self.spirv)
-        with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8") as f:
-            f.write('{"b_mod": {}, "a_mod": {}, "c_mod": {}}')
-        self.inflight = os.path.join(self.out, "pipeline_inflight.txt")
-        self.skip = os.path.join(self.out, "pipeline_crashes.txt")
-        self.calls = []
-
-    def stage(self, script, supports=True):
-        """script(args, call_number) -> exit code; it may write the in-flight file first."""
-        def fake_run(args, hint="", check=True, **kw):
-            args = [str(a) for a in args]
-            self.calls.append(args)
-            code = script(args, len(self.calls))
-            if code in (0, 1) and "--inflight-file" in args:
-                # A native checker that finishes its shader pass clears this report, even on validation failure.
-                with open(args[args.index("--inflight-file") + 1], "w", encoding="utf-8", newline="\n") as f:
-                    f.write("")
-            if check and code != 0:   # as run() does
-                raise SystemExit(1)
-            return code
-        logs = []
-        with mock.patch.object(make_game, "pipeline_check_exe", return_value="vk_pipeline_check.exe"), \
-                mock.patch.object(make_game, "checker_supports", return_value=supports), \
-                mock.patch.object(make_game, "run", side_effect=fake_run), \
-                mock.patch.object(make_game, "log", logs.append):
-            try:
-                make_game.pipelines(self.work, self.out)
-                return None, logs
-            except SystemExit:
-                return sys.stderr, logs
-
-    def inflight_is(self, *names):
-        """As vk_pipeline_check writes it: name<TAB>phase, where a module can die in either phase."""
-        with open(self.inflight, "w", encoding="utf-8") as f:
-            f.write("".join(f"{n}\t{'module' if i % 2 else 'pipeline'}\n" for i, n in enumerate(names)))
-
-    def skipped(self, args):
-        return args[args.index("--skip-file") + 1] if "--skip-file" in args else None
-
-    def is_probe(self, args):
-        return ("--count" in args and args[args.index("--count") + 1] == "1"
-                and "--jobs" in args and args[args.index("--jobs") + 1] == "1")
-
-    def test_bom_marked_index_reaches_the_native_checker_and_preserves_range(self):
-        with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8-sig", newline="\n") as f:
-            f.write('{"b_mod": {}, "a_mod": {}, "c_mod": {}}')
-        failed, _ = self.stage(lambda args, n: 0)
-        self.assertIsNone(failed)
-        self.assertEqual(len(self.calls), 1)
-        self.assertEqual(self.calls[0][self.calls[0].index("--count") + 1], "3")
-        self.assertEqual(make_game.pipeline_names(self.spirv), ["a_mod", "b_mod", "c_mod"])
-
-    def test_a_named_module_is_skipped_and_the_rest_checked(self):
-        def script(args, n):
-            if self.is_probe(args):
-                self.inflight_is("b_mod")
-                return ABORT   # it must reproduce alone before it is added to the crash list
-            if n == 1:
-                self.inflight_is("b_mod")
-                return ABORT
-            self.assertEqual(self.skipped(args), self.skip)
-            with open(self.skip, encoding="utf-8") as f:
-                self.assertEqual(f.read(), "b_mod\n")
-            return 1   # the skipped module counts as failed
-        err = io.StringIO()
-        with mock.patch("sys.stderr", err):
-            failed, logs = self.stage(script)
-        self.assertIsNotNone(failed)
-        self.assertEqual(len(self.calls), 3)
-        self.assertIn("--inflight-file", self.calls[0])
-        self.assertIsNone(self.skipped(self.calls[0]))
-        self.assertTrue(any("b_mod took vk_pipeline_check down" in m and "0x80000003" in m for m in logs), logs)
-        self.assertIn("1 module(s) took the driver down", err.getvalue())
-        self.assertIn("b_mod", err.getvalue())
-        self.assertFalse(os.path.exists(self.inflight))
-
-    def test_several_in_flight_are_tried_alone_and_only_the_crasher_is_skipped(self):
-        def script(args, n):
-            if self.is_probe(args):   # the global index is name-sorted, so a_mod=0, b_mod=1, c_mod=2
-                self.assertEqual(args[args.index("--count") + 1], "1")
-                if args[args.index("--start") + 1] == "2":
-                    self.inflight_is("c_mod")
-                return ABORT if args[args.index("--start") + 1] == "2" else 0
-            if n == 1:
-                self.inflight_is("a_mod", "c_mod")
-                return ABORT
-            with open(self.skip, encoding="utf-8") as f:
-                self.assertEqual(f.read(), "c_mod\n")
-            return 1
-        with mock.patch("sys.stderr", io.StringIO()):
-            failed, _ = self.stage(script)
-        self.assertIsNotNone(failed)
-        starts = [c[c.index("--start") + 1] for c in self.calls if self.is_probe(c)]
-        self.assertEqual(starts, ["0", "2"])
-
-    def test_a_crash_with_nothing_in_flight_stops_after_reaching_one_entry(self):
-        err = io.StringIO()
-        with mock.patch("sys.stderr", err):
-            failed, _ = self.stage(lambda args, n: ABORT)
-        self.assertIsNotNone(failed)
-        self.assertEqual(len(self.calls), 2)   # range of 3, then its first single-entry subrange
-        self.assertIn("no module could be named", err.getvalue())
-
-    def test_ctrl_c_is_not_retried(self):
-        def script(args, n):
-            self.inflight_is("b_mod")
-            return 0xC000013A
-        with mock.patch("sys.stderr", io.StringIO()):
-            failed, _ = self.stage(script)
-        self.assertIsNotNone(failed)
-        self.assertEqual(len(self.calls), 1)
-
-    def test_the_retries_stop(self):
-        all_names = [f"m{i}" for i in range(20)]
-        with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
-            json.dump({name: {} for name in all_names}, f)
-        names = iter(all_names)
-        def script(args, n):
-            if self.is_probe(args):
-                self.inflight_is(sorted(all_names)[int(args[args.index("--start") + 1])])
-                return ABORT
-            self.inflight_is(next(names))
-            return ABORT
-        err = io.StringIO()
-        with mock.patch("sys.stderr", err):
-            failed, _ = self.stage(script)
-        self.assertIsNotNone(failed)
-        self.assertEqual(len([c for c in self.calls if not self.is_probe(c)]), make_game.PIPELINE_CRASH_RETRIES + 1)
-        self.assertIn("still crashed after", err.getvalue())
-
-    def test_the_crash_report_names_the_module_and_its_spirv_hash(self):
-        blob = b"\x03\x02\x23\x07"
-        with open(os.path.join(self.spirv, "b_mod.spv"), "wb") as f:
-            f.write(blob)
-
-        def script(args, n):
-            if self.is_probe(args):
-                self.inflight_is("b_mod")
-                return ABORT
-            if n == 1:
-                self.inflight_is("b_mod")
-                return ABORT
-            return 1
-
-        err = io.StringIO()
-        with mock.patch("sys.stderr", err):
-            failed, _ = self.stage(script)
-        self.assertIsNotNone(failed)
-        with open(os.path.join(self.out, "pipeline_crashes.json"), encoding="utf-8") as f:
-            doc = json.load(f)
-        self.assertEqual(doc, {"modules": [{"name": "b_mod", "spv_sha256":
-                                            __import__("hashlib").sha256(blob).hexdigest()}]})
-        self.assertIn("pipeline_crashes.json", err.getvalue())
-
-    def test_the_crash_report_survives_a_range_that_cannot_name_a_module(self):
-        # A module was already named and recorded, then the driver aborts without naming
-        # another one. The give-up path must keep the report instead of skipping it.
-        blob = b"\x03\x02\x23\x07"
-        with open(os.path.join(self.spirv, "b_mod.spv"), "wb") as f:
-            f.write(blob)
-        named = []
-
-        def script(args, n):
-            if self.is_probe(args):
-                self.inflight_is("b_mod")
-                return ABORT
-            if not named:
-                named.append(n)
-                self.inflight_is("b_mod")
-            return ABORT
-
-        err = io.StringIO()
-        with mock.patch("sys.stderr", err):
-            failed, _ = self.stage(script)
-        self.assertIsNotNone(failed)
-        self.assertIn("no module could be named", err.getvalue())
-        with open(os.path.join(self.out, "pipeline_crashes.json"), encoding="utf-8") as f:
-            doc = json.load(f)
-        self.assertEqual([m["name"] for m in doc["modules"]], ["b_mod"])
-        self.assertEqual(doc["modules"][0]["spv_sha256"],
-                         __import__("hashlib").sha256(blob).hexdigest())
-
-    def test_a_failed_crash_report_does_not_hide_the_checker_diagnostic(self):
-        # The report is best-effort: a path that cannot be written warns, then the normal
-        # checker failure still names the modules.
-        os.makedirs(os.path.join(self.out, "pipeline_crashes.json"))
-
-        def script(args, n):
-            if self.is_probe(args):
-                self.inflight_is("b_mod")
-                return ABORT
-            if n == 1:
-                self.inflight_is("b_mod")
-                return ABORT
-            return 1
-
-        with mock.patch("sys.stderr", io.StringIO()):
-            err, logs = self.stage(script)
-        self.assertIsNotNone(err)
-        self.assertIn("vk_pipeline_check", err.getvalue())
-        self.assertIn("b_mod", err.getvalue())
-        self.assertTrue(any("cannot write pipeline_crashes.json" in line for line in logs))
-
-    def test_a_clean_run_drops_an_old_crash_report(self):
-        os.makedirs(self.out)
-        report = os.path.join(self.out, "pipeline_crashes.json")
-        with open(report, "w", encoding="utf-8") as f:
-            f.write('{"modules": []}')
-        failed, _ = self.stage(lambda args, n: 0)
-        self.assertIsNone(failed)
-        self.assertFalse(os.path.exists(report))
-
-    def test_a_clean_run_is_one_call_and_an_old_skip_list_is_dropped(self):
-        os.makedirs(self.out)
-        with open(self.skip, "w", encoding="utf-8") as f:
-            f.write("b_mod\n")   # from an earlier build: every module gets a fresh chance
-        failed, logs = self.stage(lambda args, n: 0)
-        self.assertIsNone(failed)
-        self.assertEqual(len(self.calls), 1)
-        self.assertIsNone(self.skipped(self.calls[0]))
-        self.assertFalse(os.path.exists(self.skip))
-        self.assertIn("pipelines: done", logs)
-
-
-    def test_an_older_checker_gets_the_old_invocation(self):
-        # Before --inflight-file the checker took unknown arguments as the cache path (it would write the cache into
-        # pipeline_inflight.txt), so an older build runs as before: one call, no new flags, a crash stops the stage.
-        def script(args, n):
-            self.inflight_is("b_mod")
-            return ABORT
-        with mock.patch("sys.stderr", io.StringIO()):
-            failed, logs = self.stage(script, supports=False)
-        self.assertIsNotNone(failed)
-        self.assertEqual(len(self.calls), 1)
-        self.assertNotIn("--inflight-file", self.calls[0])
-        self.assertNotIn("--skip-file", self.calls[0])
-        self.assertTrue(any("has no --inflight-file" in m for m in logs), logs)
-
-    def test_support_is_read_from_the_usage_line(self):
-        new = "usage: vk_pipeline_check <spirv dir> ... [--inflight-file F] [--skip-file F]\n"
-        old = "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--isolate [--isolate-batch N]]\n"
-        for usage, want in ((new, True), (old, False)):
-            done = mock.Mock(stdout="", stderr=usage, returncode=2)
-            with mock.patch.object(make_game.subprocess, "run", return_value=done) as sp:
-                self.assertEqual(make_game.checker_supports("vk.exe", "--inflight-file", "--skip-file"), want)
-            self.assertEqual(sp.call_args.args[0], ["vk.exe"])   # no arguments: usage only, no Vulkan
-        with mock.patch.object(make_game.subprocess, "run", side_effect=OSError("not an executable")):
-            self.assertFalse(make_game.checker_supports("vk.exe", "--inflight-file"))
+    def __exit__(self, *exc):
+        for p in reversed(self._patches):
+            p.stop()
+        return False
 
 
 if __name__ == "__main__":
