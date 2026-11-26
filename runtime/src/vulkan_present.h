@@ -654,7 +654,6 @@ private:
             const SubmitMutex::SubmitTurn turn(context_.submit_mutex());  // a queue operation: the compile gate
             submitted = context_.observe_result(context_.queue_submit(queue_, 1, &submit_info, frame.done),
                                                 "vkQueueSubmit (present)");
-            if (submitted == VK_SUCCESS) context_.note_image_work_locked();
             if (submitted != VK_SUCCESS) rollback();
             if (submitted == VK_SUCCESS && inspect) {
                 result = finish_startup_frame(frame, image, show_title);
@@ -932,7 +931,6 @@ private:
             std::lock_guard lock(context_.submit_mutex());
             submitted = context_.observe_result(context_.queue_submit(queue_, 1, &submit_info, probe_fence_),
                                                 "vkQueueSubmit (present probe)");
-            if (submitted == VK_SUCCESS) context_.note_image_work_locked();
         }
         if (submitted != VK_SUCCESS ||
             context_.observe_result(vkWaitForFences_(device, 1, &probe_fence_, VK_TRUE, 5'000'000'000ull),

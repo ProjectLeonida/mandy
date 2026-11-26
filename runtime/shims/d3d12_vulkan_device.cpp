@@ -8298,24 +8298,6 @@ public:
     bool is_shadow() const { return shadow_ != nullptr; }  // create_shadow_buffer: a copy of title pages
     const DeviceState& device_state() const { return device_; }
     void* title_address() const { return title_address_; }  // place_at_title_address, or null
-    HRESULT upload_title_subresource(UINT subresource, void* data, UINT row, UINT slice, bool allow_staging) {
-        static const bool ordered = [] {
-            const char* value = std::getenv("LEONIDA_ORDER_TEXTURE_UPLOADS");
-            return !value || std::strcmp(value, "0");
-        }();
-        if (ordered && host_transfer_) {
-            Region r{};
-            if (!region(subresource, nullptr, r) || row != r.row_bytes || slice != row * r.rows) return E_INVALIDARG;
-            const auto result = device_.context->write_host_texture(id(), subresource, [&] { return host_copy(true, r, data); });
-            if (result == VK_SUCCESS) return S_OK;
-            if (result != VK_NOT_READY) return E_FAIL;
-            // Layout changed after the pass checked the subresources. Never submit recursively.
-            if (!allow_staging) return DXGI_ERROR_WAS_STILL_DRAWING;
-            return cpu_copy(true, subresource, nullptr, data, row, slice, false);
-        }
-        return WriteToSubresource(subresource, nullptr, data, row, slice);
-    }
-
     bool replay_seen() const { return replay_seen_.load(std::memory_order_relaxed); }
     bool staged_title() const { return staged_title_; }
     bool upload_staged_title(const rt::xg_xs::Texture& layout, const std::uint8_t* tiled,
@@ -8329,11 +8311,6 @@ public:
     std::uint32_t shader_views() const { return shader_views_.load(std::memory_order_relaxed); }
     // The element a CPU copy moves (a 4x4 block for block-compressed formats), as WriteToSubresource takes it.
     leonida::BlockFormat copy_element() const { return leonida::copy_block_format(binding_, VK_IMAGE_ASPECT_COLOR_BIT); }
-    // WriteToSubresource of this subresource is a host copy now (VK_EXT_host_image_copy, image in GENERAL), not a
-    // staged copy through a queue: the only kind a refresh before a submission may do.
-    bool host_copy_now(UINT subresource) const {
-        return host_transfer_ && device_.context->layout(id(), subresource) == VK_IMAGE_LAYOUT_GENERAL;
-    }
 
     // Default-heap buffers are ranges of the GPU address arena: console VA = offset, zeroed through the arena's host
     // mapping. Upload and readback buffers keep their own host memory; with buffer device addresses their console
@@ -9000,8 +8977,8 @@ public:
                 shared_zero_ = device_.zero_sampled_image(desc_, format, footprint.size);
         }
         std::uint32_t plain_bits = 0;
-        // A device without host copies has no other way to fill a title image: a refresh before a submission may not
-        // use a staged copy through the queue (host_copy_now). Its linear movie planes are staged too.
+        // A device without host copies stages every title image (its linear movie planes too); title fills go through
+        // the title upload whatever the image (fill_title_texture).
         const bool no_host_copy = !device_.copy_memory_to_image && cpu_visible() && samples == 1 &&
                                   !format.d24_as_float && !format.rgb96;
         if (stage_title && !shared_zero_ && allow_staged_title && origin != TitleImageOrigin::ordinary &&
@@ -15603,7 +15580,7 @@ public:
                 return;
             }
             const auto fill_start = clock::now();
-            const auto uploaded = fill_title_texture(t, false);
+            const auto uploaded = fill_title_texture(t);
             filled += uploaded;
             if (full_mapped && uploaded) ++stats.mapped_fills;
             if (async && t.stale) queue_title_fill(t.address);  // generic staging needs an outer fill
@@ -15841,7 +15818,7 @@ private:
                 // A fill can submit and retire an image (title_texture_gone): look each one up again.
                 const auto it = state_.title_textures.find(t->address);
                 if (it == state_.title_textures.end() || it->second != t || !t->resource || t->fills) continue;
-                fill_title_texture(*t, false);
+                fill_title_texture(*t);
                 if (t->stale) queue_title_fill(t->address);  // generic staging needs an outer fill (the worker's)
             }
         }
@@ -15913,7 +15890,7 @@ private:
                             fills = t.fills;
                             every_byte = t.every_byte();
                         } else {
-                            filled = fill_title_texture(t, true) != 0;
+                            filled = fill_title_texture(t) != 0;
                             if (!filled) t.stale = true;
                         }
                     }
@@ -16242,7 +16219,7 @@ private:
         if (title_fill_async()) {
             entry->stale = true;  // filled by the fill worker (queued below, once it is in the registry)
         } else if (!entry->memory.pending()) {
-            fill_title_texture(*entry, true);
+            fill_title_texture(*entry);
         }
         ++title_stats_.made;
         TitleTexture* t = entry.get();
@@ -16345,20 +16322,15 @@ private:
             t.memory.defer();
             return;
         }
-        if (!t.hashed || hash != t.hash || t.stale) fill_title_texture(t, true);
+        if (!t.hashed || hash != t.hash || t.stale) fill_title_texture(t);
     }
 
-    // Snapshot the whole footprint before uploading any subresource. A concurrent unmap defers the fill.
-    // Private title staging bypasses the D3D12 submit callbacks. Generic staged copies require an outer fill.
-    std::uint64_t fill_title_texture(TitleTexture& t, bool staged) {
+    // Snapshot the whole footprint, then upload it whole through the title upload (TitleImageUpload): the transfer
+    // is submitted at once, ordered on the GPU after all earlier work and before every later submission, and nothing
+    // waits for the GPU on the CPU (VulkanContext::write_staged_title_image). It never re-enters the D3D12 submit
+    // callbacks, so the refresh before a submission may use it. A concurrent unmap defers the fill.
+    std::uint64_t fill_title_texture(TitleTexture& t) {
         const rt::xg_xs::Texture& layout = t.layout;
-        const std::uint32_t mips = layout.layout.mips, slices = layout.array;
-        if (!staged && !t.unbound_bytes && !t.resource->staged_title())
-            for (UINT sub = 0; sub < mips * slices; ++sub)
-                if (!t.resource->host_copy_now(sub)) {
-                    t.stale = true;
-                    return 0;
-                }
         const std::uint64_t span = layout.layout.size;
         if (!title_texture_readable(t)) return 0;
         title_tiled_.resize(std::size_t(span));
@@ -16386,47 +16358,22 @@ private:
         std::uint64_t hash = 0;
         hash_guarded(title_tiled_.data(), title_tiled_.size(), hash);
         t.full_hashed = t.every_byte() && hash_guarded(title_tiled_.data(), title_tiled_.size(), t.full_hash, true);
-        const bool volume = layout.layout.dimension == rt::xg_xs::kTexture3D;
         const bool trace_pool = leonida::dstorage::trace_enabled() && leonida::title_gpu_views::other_view(t.cpu);
         bool nonzero = false;
-        bool ok = true;
-        if (t.resource->staged_title()) {
-            const auto start = std::chrono::steady_clock::now();
-            ok = t.resource->upload_staged_title(layout, title_tiled_.data(), title_columns_, trace_pool, nonzero);
-            title_stats_.staged_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - start).count();
-            if (ok) ++title_stats_.staged_fills;
-            if (!ok) log_once("staged title texture upload failed, format", int(t.resource->format()));
-        } else {
-            for (std::uint32_t slice = 0; slice < slices && ok; ++slice) {
-                for (std::uint32_t level = 0; level < mips && ok; ++level) {
-                    const auto& mip = layout.layout.plane[0].mips[level];
-                    const std::uint32_t row_pitch = mip.width_elements * layout.format.bytes;
-                    const std::uint32_t slice_pitch = row_pitch * mip.height_elements;
-                    title_linear_.resize(std::size_t(slice_pitch) * (volume ? mip.depth : 1));
-                    rt::xg_xs::copy_elements<false>(layout, level, slice, title_tiled_.data(), title_linear_.data(),
-                                                    row_pitch, slice_pitch, title_columns_);
-                    if (trace_pool && !nonzero)
-                        nonzero = std::any_of(title_linear_.begin(), title_linear_.end(), [](auto byte) { return byte != 0; });
-                    const HRESULT hr =
-                        t.resource->upload_title_subresource(level + slice * mips, title_linear_.data(), row_pitch,
-                                                             slice_pitch, staged);
-                    if (FAILED(hr)) {
-                        log_once("a title texture's subresource could not be filled; HRESULT", int(hr));
-                        ok = false;
-                    }
-                }
-            }
-        }
+        const auto start = std::chrono::steady_clock::now();
+        const bool ok = t.resource->upload_staged_title(layout, title_tiled_.data(), title_columns_, trace_pool, nonzero);
+        title_stats_.staged_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (ok) ++title_stats_.staged_fills;
+        if (!ok) log_once("staged title texture upload failed, format", int(t.resource->format()));
         if (!ok) {
             ++title_stats_.fill_failures;
             t.stale = true;
             return 0;
         }
         if (trace_pool)
-            std::fprintf(stderr, "[rt] ds-pool-fill cpu=%llx size=%llu staged=%d nonzero=%d\n",
-                         static_cast<unsigned long long>(t.cpu), static_cast<unsigned long long>(span),
-                         int(staged), int(nonzero));
+            std::fprintf(stderr, "[rt] ds-pool-fill cpu=%llx size=%llu staged=1 nonzero=%d\n",
+                         static_cast<unsigned long long>(t.cpu), static_cast<unsigned long long>(span), int(nonzero));
         if (t.owned && !t.fills) t.resource->publish_streamed_texture();
         t.hash = hash;
         t.hashed = true;
@@ -16522,10 +16469,7 @@ private:
                      static_cast<unsigned long long>(s.registered), mapped, filled,
                      static_cast<unsigned long long>(s.fills), double(s.fill_bytes) / 1048576.0,
                      static_cast<unsigned long long>(s.fill_failures));
-        const auto host = state_.context->host_texture_stats();
-        std::fprintf(stderr, "[rt] d3d12: ordered title host copies %llu, GPU waits %llu; "
-                             "slot-70 views awaiting readable memory: %llu\n",
-                     static_cast<unsigned long long>(host.copies), static_cast<unsigned long long>(host.waits),
+        std::fprintf(stderr, "[rt] d3d12: slot-70 views awaiting readable memory: %llu\n",
                      static_cast<unsigned long long>(s.pending_views));
         std::fprintf(stderr, "[rt] d3d12: title textures census (format/Layout/dimension/mips:views): %s\n",
                      census.c_str());
