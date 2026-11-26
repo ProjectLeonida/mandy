@@ -72,12 +72,14 @@ def mrt0_words(spvasm, **run_options):
 def varyings(spvasm, attrs, bary):
     """Input values for a translated PS, given {attribute n: three per-vertex vec4s of the producer's raw 32-bit
     words} and the barycentric weights `bary` of vertices 0..2, as Vulkan hands them over: a PerVertexKHR input gets
-    the three vertices, a Flat one vertex 0, any other the words read as f32 and interpolated; %bary gets `bary`."""
+    the three vertices, a Flat one vertex 0, any other the words read as f32 and interpolated; %bary gets `bary`.
+    A Flat vec4[3] (--bary-fallback's per-vertex attribute) gets the three vertices, as its geometry shader writes
+    them."""
     f = lambda w: struct.unpack("<f", struct.pack("<I", w))[0]    # noqa: E731
     out = {"%bary": tuple(bary)}
     for n, verts in attrs.items():
         name, fv = f"%in_attr{n}", [tuple(f(w) for w in v) for v in verts]
-        if f"OpDecorate {name} PerVertexKHR" in spvasm:
+        if f"OpDecorate {name} PerVertexKHR" in spvasm or f"{name} = OpVariable %_ptr_Input_pv4 Input" in spvasm:
             out[name] = tuple(fv)
         elif f"OpDecorate {name} Flat" in spvasm:
             out[name] = fv[0]

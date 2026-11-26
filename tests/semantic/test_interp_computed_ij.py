@@ -18,13 +18,18 @@ Refused instead of guessed (Unsupported, naming the pattern): a source that is n
 written, or a pristine copy in the wrong role, is the #1224 guard's refusal (interp_pair_src, at
 emission); here: a computed pair whose p1 partial is rewritten or read between the ops (its hardware value P10*I is then
 observable), one whose ops are not in a single basic block (the captured I would not dominate the p2), a
-dangling op without its partner, and any computed pair under --bary-fallback, which has no PerVertexKHR
-inputs. A pristine pair (v0/v1 nothing writes) keeps the interpolated-input read: no PerVertexKHR.
+dangling op without its partner, and any computed pair under --f16-interp-fallback alone, which has no
+per-vertex inputs. Under --bary-fallback (also with --f16-interp-fallback) the attribute is a Flat vec4[3] that the
+pass-through geometry shader fills with the three vertices' values: ComputedIJBaryFallback. A pristine pair (v0/v1 nothing writes) keeps the interpolated-input read: no PerVertexKHR.
 
 Pipodi's straight-line scan over the corpus found the affected 213 PS (upper bound; issue #1218,
 comment 7076614458); the classification and counts are in docs/design.md's SHADER-177 row.
 """
+import os
+import shutil
 import struct
+import subprocess
+import tempfile
 import unittest
 
 import support
@@ -286,20 +291,9 @@ class ComputedIJRefusals(unittest.TestCase):
                  "s_endpgm"]
         self.refuse(lines, "the pair's ops are not in one basic block")
 
-    def test_computed_pair_under_bary_fallback(self):
-        old = rdna2spirv.BARY_FALLBACK
-        rdna2spirv.BARY_FALLBACK = True
-        try:
-            self.refuse(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
-                         "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
-                         "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"],
-                        "computed I/J pair under --bary-fallback")
-        finally:
-            rdna2spirv.BARY_FALLBACK = old
-
     def test_computed_pair_under_f16_interp_fallback(self):
         # --f16-interp-fallback reads decoded halves from the producer: no per-vertex inputs to
-        # weight with a computed pair (same regime as --bary-fallback)
+        # weight with a computed pair (--bary-fallback gets them from its geometry shader: ComputedIJBaryFallback)
         old = rdna2spirv.F16_HALVES
         rdna2spirv.F16_HALVES = True
         try:
@@ -309,6 +303,151 @@ class ComputedIJRefusals(unittest.TestCase):
                         "computed I/J pair under --f16-interp-fallback")
         finally:
             rdna2spirv.F16_HALVES = old
+
+
+# The ComputedIJ programs, for the --bary-fallback comparison.
+_ZERO = ["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
+         "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+         "v_interp_p1_f32_e32 v3, v0, attr0.y", "v_interp_p2_f32_e32 v3, v1, attr0.y",
+         "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"]
+_PROGRAMS = {
+    "zeroed": _ZERO,
+    "snapped": ["v_mov_b32_e32 v0, 0.25", "v_mov_b32_e32 v1, 0.25",
+                "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                "v_interp_p1_f32_e32 v3, v0, attr0.y", "v_interp_p2_f32_e32 v3, v1, attr0.y",
+                "v_interp_p1_f32_e32 v4, v0, attr0.z", "v_interp_p2_f32_e32 v4, v1, attr0.z",
+                "exp mrt0 v2, v3, v4, v2 done vm", "s_endpgm"],
+    "offset": ["v_mov_b32_e32 v10, v0", "v_mul_f32_e32 v11, 0.5, v1",
+               "v_mov_b32_e32 v0, v10", "v_mov_b32_e32 v1, v11",
+               "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+               "v_interp_p1_f32_e32 v3, v0, attr0.y", "v_interp_p2_f32_e32 v3, v1, attr0.y",
+               "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"],
+    "swapped": ["v_mov_b32_e32 v14, v1", "v_mov_b32_e32 v15, v0",
+                "v_mov_b32_e32 v0, v14", "v_mov_b32_e32 v1, v15",
+                "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                "v_interp_p1_f32_e32 v3, v0, attr0.y", "v_interp_p2_f32_e32 v3, v1, attr0.y",
+                "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"],
+    "j_between": ["v_mov_b32_e32 v16, 1.0", "v_mov_b32_e32 v0, v15",
+                  "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_mul_f32_e32 v1, 0.25, v16",
+                  "v_interp_p2_f32_e32 v2, v1, attr0.x", "v_interp_p1_f32_e32 v3, v0, attr0.y",
+                  "v_mul_f32_e32 v1, 0.5, v16", "v_interp_p2_f32_e32 v3, v1, attr0.y",
+                  "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"],
+    "mov": ["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
+            "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+            "v_interp_mov_f32_e32 v3, p0, attr0.z",
+            "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"],
+    "mov_p10_p20": ["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
+                    "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                    "v_interp_mov_f32_e32 v3, p10, attr0.y", "v_interp_mov_f32_e32 v4, p20, attr0.z",
+                    "exp mrt0 v2, v3, v4, v3 done vm", "s_endpgm"],
+}
+
+
+class ComputedIJBaryFallback(unittest.TestCase):
+    """--bary-fallback: a computed pair's attribute is a Flat vec4[3] its geometry shader fills with the three vertices'
+    values (tools/bary_fallback_gs.py, "per_vertex" in bary_fallback_input), weighted as on the PerVertexKHR path."""
+
+    def translate(self, asm, bary=True, f16=False):
+        old = rdna2spirv.BARY_FALLBACK, rdna2spirv.F16_HALVES
+        rdna2spirv.BARY_FALLBACK, rdna2spirv.F16_HALVES = bary, f16
+        try:
+            spv = support.translate_lines("ps_ij_fb", asm)
+            meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
+        finally:
+            rdna2spirv.BARY_FALLBACK, rdna2spirv.F16_HALVES = old
+        return spv, meta
+
+    def words(self, spv, attrs=None):
+        return support.mrt0_words(spv, inputs=support.varyings(spv, attrs or {0: ATTR0}, BARY))
+
+    def test_same_values_as_the_per_vertex_path(self):
+        for name, asm in _PROGRAMS.items():
+            with self.subTest(program=name):
+                native, _ = self.translate(asm, bary=False)
+                fb, _ = self.translate(asm)
+                self.assertEqual(self.words(fb), self.words(native))
+
+    def test_module_has_no_per_vertex_khr(self):
+        spv, meta = self.translate(_ZERO)
+        self.assertNotIn("PerVertexKHR", spv)
+        self.assertNotIn("FragmentBarycentricKHR", spv)
+        self.assertNotIn("SPV_KHR_fragment_shader_barycentric", spv)
+        self.assertIn("%in_attr0 = OpVariable %_ptr_Input_pv4 Input", spv)
+        self.assertIn("OpDecorate %in_attr0 Flat", spv)
+        self.assertIn("OpDecorate %in_attr0 Location 0", spv)
+        fb = meta["bary_fallback_input"]
+        self.assertEqual(fb["per_vertex"], {"0": 0})
+        self.assertNotIn(fb["location"], (0, 1, 2))
+        self.assertEqual(meta["inputs"], [0])        # the producer's attribute, for the geometry shader
+        self.assertNotIn("fragmentShaderBarycentric", meta["features"])
+
+    def test_the_array_avoids_other_inputs(self):
+        """attr1 read at location 1: attr0's three locations go past it (2..4), %bary to the free location 0."""
+        spv, meta = self.translate(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
+                                    "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                                    "v_interp_mov_f32_e32 v3, p0, attr1.x",
+                                    "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"])
+        fb = meta["bary_fallback_input"]
+        self.assertEqual(fb["per_vertex"], {"0": 2})
+        self.assertEqual(fb["location"], 0)
+        self.assertIn("OpDecorate %in_attr0 Location 2", spv)
+        self.assertIn("OpDecorate %in_attr1 Location 1", spv)
+        self.assertEqual(meta["inputs"], [0, 1])
+
+    def test_f16_pair_with_the_f16_fallback_too(self):
+        """NVIDIA Pascal takes both fallbacks: a computed f16 pair decodes the three vertices' raw words rather than
+        the producer's decoded halves, and gives the PerVertexKHR path's halves."""
+        lo_hi = ((0.5, -4.0), (1.5, 8.0), (2.5, 16.0))
+        attrs = {0: [(struct.unpack("<I", struct.pack("<ee", lo, hi))[0], 0, 0, 0) for lo, hi in lo_hi]}
+        asm = ["v_mov_b32_e32 v0, 0.5", "v_mov_b32_e32 v1, 0",
+               "v_interp_p1ll_f16 v2, v0, attr0.x", "v_interp_p2_f16 v2, v1, attr0.x, v2",
+               "v_interp_p1ll_f16 v3, v0, attr0.x high", "v_interp_p2_f16 v3, v1, attr0.x, v3 high",
+               "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"]
+        native, _ = self.translate(asm, bary=False)
+        fb, meta = self.translate(asm, f16=True)
+        self.assertNotIn("%in_f16h0", fb)
+        self.assertNotIn("PerVertexKHR", fb)
+        self.assertEqual(meta["bary_fallback_input"]["per_vertex"], {"0": 0})
+        w = self.words(fb, attrs)
+        self.assertEqual(w, self.words(native, attrs))
+        self.assertEqual(f"{w[0] & 0xFFFF:#06x}", "0x3c00")
+        self.assertEqual(f"{w[1] & 0xFFFF:#06x}", "0x4000")
+
+    def test_f16_fallback_alone_still_refuses(self):
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            self.translate(_ZERO, bary=False, f16=True)
+        self.assertIn("computed I/J pair under --f16-interp-fallback", str(cm.exception))
+
+    def test_geometry_shader_writes_the_three_vertices(self):
+        import bary_fallback_gs
+        _, meta = self.translate(_ZERO)
+        fb = meta["bary_fallback_input"]
+        gs = bary_fallback_gs.gs_spvasm(meta["inputs"], fb["location"], per_vertex=fb["per_vertex"])
+        self.assertIn("OpDecorate %pvin0 Location 0", gs)
+        self.assertIn("OpDecorate %pvout0 Location 0", gs)
+        self.assertIn("OpDecorate %pvout0 Flat", gs)
+        self.assertNotIn("%out0 ", gs)                 # not also passed through as an interpolated copy
+        for v in range(3):                            # at every emitted vertex, element k = vertex k's value
+            for k in range(3):
+                self.assertIn(f"%p{v}_pvin0_{k} = OpAccessChain %ptr_in_v4 %pvin0 %int_{k}", gs)
+                self.assertIn(f"%q{v}_pvout0_{k} = OpAccessChain %ptr_out_v4 %pvout0 %int_{k}", gs)
+        with self.assertRaises(ValueError):           # the array may not overlap a pass-through or %bary
+            bary_fallback_gs.gs_spvasm([0, 1], 4, per_vertex={0: 1})
+        with self.assertRaises(ValueError):
+            bary_fallback_gs.gs_spvasm([0], 2, per_vertex={0: 0})
+
+    @unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"), "needs spirv-as and spirv-val")
+    def test_geometry_shader_validates(self):
+        """attr1 passed through, attr0's three vertices at 2..4, %bary at 0 (test_the_array_avoids_other_inputs)."""
+        import bary_fallback_gs
+        with tempfile.TemporaryDirectory() as tmp:
+            asm, spv = os.path.join(tmp, "gs.spvasm"), os.path.join(tmp, "gs.spv")
+            with open(asm, "w", encoding="utf-8") as f:
+                f.write(bary_fallback_gs.gs_spvasm([0, 1], 0, per_vertex={0: 2}))
+            for cmd in (["spirv-as", "--target-env", "vulkan1.2", asm, "-o", spv],
+                        ["spirv-val", "--target-env", "vulkan1.2", spv]):
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
 
 if __name__ == "__main__":
