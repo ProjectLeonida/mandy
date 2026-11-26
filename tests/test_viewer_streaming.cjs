@@ -374,7 +374,11 @@ test('the bounds overlay creates helpers on the first G press and reuses them', 
     helpers.forEach((helper, i) => assert.equal(boundsGroup.children[i], helper));
 });
 
-test('Shift speeds the camera up and Ctrl slows it down, on either side of the keyboard', async () => {
+test('Shift (either side) speeds the camera up and C slows it down; Ctrl does not, and the help says so', async () => {
+    // With a movement key held, Ctrl makes browser shortcuts a page cannot all cancel: Ctrl+W closes the tab.
+    const help = html.match(/<div id="help">([\s\S]*?)<\/div>/)[1];
+    assert.match(help, /<kbd>C<\/kbd> slow/);
+    assert.doesNotMatch(help, /Ctrl/);
     class Vector3 {
         constructor(x = 0, y = 0, z = 0) { Object.assign(this, { x, y, z }); }
         set(x, y, z) { return Object.assign(this, { x, y, z }); }
@@ -432,8 +436,10 @@ test('Shift speeds the camera up and Ctrl slows it down, on either side of the k
     close(climb(), 4);
     close(climb('ShiftLeft'), 20);
     close(climb('ShiftRight'), 20);
-    close(climb('ControlLeft'), 0.8);
-    close(climb('ControlRight'), 0.8);
+    close(climb('KeyC'), 0.8);
+    close(climb('ShiftLeft', 'KeyC'), 4);
+    close(climb('ControlLeft'), 4);
+    close(climb('ControlRight'), 4);
     // A wheel changes the speed by 1.15 per notch; a sideways scroll (a trackpad pan, deltaX only) must not.
     // A wheel changes the speed by 1.15 per notch; a sideways scroll (a trackpad pan, deltaX only) must not.
     const wheel = handlers.get('wheel');
