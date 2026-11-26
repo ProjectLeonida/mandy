@@ -75,6 +75,13 @@ WAVE64_PLAN = True
 # Vulkan minimum is 16384. The translator runs offline, so it records the exact total as lds_bytes in index.json and
 # the runtime compares that with the device's limit before it creates the pipeline. spirv-val checks neither.
 MAX_SHARED_BYTES = 65536
+# --max-mesh-shared-memory: the same cap for a mesh shader's Workgroup memory (the LDS array, %ms_counts and
+# %x_buf), against maxMeshSharedMemorySize. 0 (the default) checks nothing, so every mesh shader that translates
+# today still does: a 64 KiB LDS array plus the 4-byte %ms_counts is already over 64 KiB, and the runtime checks
+# lds_bytes against the device's own limit before it creates the pipeline. Pass a device's maxMeshSharedMemorySize
+# (28672 is the VK_EXT_mesh_shader minimum) to refuse at translation, with the byte counts, what that device can't
+# run. A --mesh-compute module is GLCompute and keeps the compute cap above.
+MAX_MESH_SHARED_BYTES = 0
 WAVE64_GRAPHICS = "warn"   # --wave64-graphics: tier C wave64 VS/PS/GS (not exact on 32-wide subgroups): warn | error | off
 W64G_COUNTS = Counter()   # tiers of the wave64 VS/PS/GS translated so far, for the summary line
 # --bary-fallback: raw barycentric reads come from an ordinary perspective-interpolated vec3 input (the location is
@@ -16684,6 +16691,20 @@ def assemble(gen):
             raise Unsupported(f"CS workgroup memory {wg} B (LDS {lds_b} B + "
                               f"{'wave64 exchange' if gen.emulate else 'barrier rounds'} {gen.x_buf_bytes()} B) "
                               f"over maxComputeSharedMemorySize {MAX_SHARED_BYTES} B")
+    if ms:
+        # A mesh shader's Workgroup memory is its LDS array (PSV0's shared size grown to the furthest ds offset,
+        # a power of two), the 4-byte %ms_counts and, under --wave64-emulate, %x_buf: the same total lds_bytes
+        # records. A MeshEXT module answers to maxMeshSharedMemorySize (Vulkan minimum 28672,
+        # VK_EXT_mesh_shader); --mesh-compute emits GLCompute and runs as a compute shader, so it keeps the
+        # compute cap. There is no LDS allocation to shrink to: the array is already the program's need.
+        lds_b = 4 * gen.lds_dwords if gen.uses_lds else 0
+        wg = lds_b + gen.x_buf_bytes() + 4
+        limit, limit_name = ((MAX_SHARED_BYTES, "maxComputeSharedMemorySize") if msc else
+                             (MAX_MESH_SHARED_BYTES, "maxMeshSharedMemorySize"))
+        if limit and wg > limit:
+            raise Unsupported(f"MS workgroup memory {wg} B (LDS {lds_b} B"
+                              + (f" + wave64 exchange {gen.x_buf_bytes()} B" if gen.emulate else "")
+                              + f" + %ms_counts 4 B) over {limit_name} {limit} B")
     if gen.frag_inputs or bary:
         dec += ["OpDecorate %frag_coord BuiltIn FragCoord"]
         gvars += ["%frag_coord = OpVariable %_ptr_Input_v4 Input"]
@@ -19735,7 +19756,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["gs_input_locations"] = sorted(r for r, sv in g.gs["in"] if sv != 1)
         m["gs_output_locations"] = sorted(r for r, sv in g.gs["out"] if sv != 1)
     # Every Workgroup byte of a compute shader (LDS + %x_buf of the emulation or the barrier rounds; SHADER-309): the
-    # runtime compares it with the device's maxComputeSharedMemorySize. A mesh shader also has its 4-byte %ms_counts.
+    # runtime compares it with the device's maxComputeSharedMemorySize, and a mesh shader's (LDS + %ms_counts + %x_buf)
+    # with its maxMeshSharedMemorySize, both capped at translation by --max-shared-memory / --max-mesh-shared-memory.
     lds = (4 * g.lds_dwords if g.uses_lds else 0) + (g.x_buf_bytes() if g.cs or g.emulate else 0) + (4 if g.ms else 0)
     if lds:
         m["lds_bytes"] = lds
@@ -20071,7 +20093,7 @@ def _out_inside_input(src, out):
 
 
 def main():
-    global MAX_SHARED_BYTES, MAX_STRUCTURED_DEPTH, LOOP_LIMIT, DESCRIPTOR_HASH, DESCRIPTOR_TABLE
+    global MAX_SHARED_BYTES, MAX_MESH_SHARED_BYTES, MAX_STRUCTURED_DEPTH, LOOP_LIMIT, DESCRIPTOR_HASH, DESCRIPTOR_TABLE
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("--out", required=True)
@@ -20133,6 +20155,12 @@ def main():
                          "(default %(default)s, the 64 KiB hard cap): over it the LDS array shrinks to the program's "
                          "need, or the shader is refused (Unsupported). The device's own maxComputeSharedMemorySize "
                          "(32768 on some drivers) is checked by the runtime against lds_bytes in index.json")
+    ap.add_argument("--max-mesh-shared-memory", type=int, default=MAX_MESH_SHARED_BYTES, metavar="BYTES",
+                    help="cap on a mesh shader's workgroup memory, its LDS plus %%ms_counts and what "
+                         "--wave64-emulate adds (default 0: no check; 28672 is the VK_EXT_mesh_shader minimum "
+                         "maxMeshSharedMemorySize): over it the shader is refused (Unsupported). The device's own "
+                         "maxMeshSharedMemorySize is checked by the runtime against lds_bytes in index.json; a "
+                         "--mesh-compute module is compute and uses --max-shared-memory")
     ap.add_argument("--pc-tail-ubo", action="store_true",
                     help="keep only s0..s31 (128 bytes) in push constants and read the heap base, code base and "
                          "--mesh-compute output address from a uniform block at set 1, binding 0 (metadata: pc_tail), "
@@ -20175,6 +20203,7 @@ def main():
     if ancestor and not os.path.isdir(ancestor):
         ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
+    MAX_MESH_SHARED_BYTES = a.max_mesh_shared_memory
     DESCRIPTOR_HASH = a.descriptor_hash
     DESCRIPTOR_TABLE = a.descriptor_table
     LOOP_LIMIT = a.loop_limit
