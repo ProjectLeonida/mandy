@@ -1283,7 +1283,10 @@ class StructuredEmulationTests(unittest.TestCase):
 
     def test_single_wave_inline_all_zero_switch_and_loop_carried_war(self):
         # 64-thread and partial 40-thread shaders with live-out scalars, loop-carried store->load->store WAR/RAW,
-        # and v_readfirstlane emit 0 OpSwitch cases and 0 x_spills while staying bit-exact.
+        # and v_readfirstlane emit 0 OpSwitch cases and 0 x_spills while staying bit-exact on both scheduling
+        # orders. Their exchange barriers sit under `%pc`-only guards, which a single wave takes as one, so the
+        # barrier fallback of translate() does not apply to them (docs/design.md, "Wave64 emulation:
+        # single-wave barrier fallback").
         insns = [
             ("s_mov_b64 exec, -1", 4),
             ("s_mov_b32 s16, 10", 4),

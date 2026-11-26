@@ -375,14 +375,78 @@ def match_version(game: str):
     return next((v for v in versions() if not probe_mismatches(game, v)), None)
 
 
+def manifest_presence(game: str, version: dict) -> tuple[int, list[str], list[str], list[str]]:
+    """How much of a version's manifest the folder holds, from names and sizes only: (files present with the
+    manifest's size, the names that are missing or not a regular file, the names with another size, and
+    "name (reason)" for each file whose metadata can't be read). As in probe_mismatches(), only a name that is not
+    there counts as missing: a file that exists but can't be read (permissions, a drive error) is listed apart."""
+    matched, missing, wrong, unreadable = 0, [], [], []
+    for rel, info in version["files"].items():
+        try:
+            st = os.stat(os.path.join(game, *rel.split("/")))
+        except (FileNotFoundError, NotADirectoryError):
+            missing.append(rel)
+            continue
+        except OSError as error:
+            unreadable.append(f"{rel} ({error.strerror or error})")
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            missing.append(rel)
+        elif st.st_size != info["size"]:
+            wrong.append(rel)
+        else:
+            matched += 1
+    return matched, missing, wrong, unreadable
+
+
+def partial_version_message(game: str, version: dict) -> str | None:
+    """The message for a folder that holds at least half of a version's manifest files with their sizes but misses
+    a probe file, so it is an incomplete copy of that version rather than another game. None below half, and None
+    when a probe file is there with another size: a download that stopped early leaves files missing, while a probe
+    with another size (MicrosoftGame.Config above all) is what a complete copy of another build looks like, so
+    load_version() keeps its "not a supported version" message, which lists those sizes."""
+    total = len(version["files"])
+    matched, missing, wrong, unreadable = manifest_presence(game, version)
+    if not total or not matched or 2 * matched < total:
+        return None
+    if any(name in wrong for name in PROBES):
+        return None
+    files = version["files"]
+    name = f"{version['title']} {version['version']}"
+    head = f"an incomplete copy of {name}" if missing or wrong else f"{name}, but not every file could be checked"
+    lines = [f"This looks like {head}: {matched} of {total} manifest files are present with matching sizes."]
+    if missing:
+        lines.append(f"{len(missing)} file(s) missing ({sum(files[n]['size'] for n in missing):,} bytes):")
+        lines += [f"  missing  {n}" for n in missing]
+    if wrong:
+        lines.append(f"{len(wrong)} file(s) with another size (still being copied or downloaded?):")
+        lines += [f"  wrong size  {n} (expected {files[n]['size']:,} bytes)" for n in wrong]
+    if unreadable:
+        lines.append(f"Cannot read file metadata for {len(unreadable)} file(s) (not counted as missing):")
+        lines += [f"  cannot read  {n}" for n in unreadable]
+    if missing or wrong:
+        lines.append(f"Finish the download or copy of version {version['version']} into {game}, then build again.")
+    if unreadable:
+        lines.append("Make those files readable for this user (check their permissions and the drive), then build "
+                     "again.")
+    return "\n".join(lines)
+
+
 def load_version(game: str) -> dict:
-    reports = []
+    reports, candidates = [], []
     for version in versions():
         mismatches = probe_mismatches(game, version)
         if not mismatches:
             return version
+        candidates.append(version)
         reports.append(f"  {version['title']} {version['version']}\n    " + "\n    ".join(mismatches))
     notes = "".join(f"\n{container_message(p, h)}" for p, h in containers_in(game))
+    # A copy that stopped downloading early misses a probe file but holds most of one version: say which and what
+    # is missing instead of calling it unsupported. The closest version (most files present) is named.
+    partial = max(candidates, key=lambda v: manifest_presence(game, v)[0], default=None)
+    message = partial_version_message(game, partial) if partial else None
+    if message:
+        fail(message + notes)
     fail("This doesn't look like a supported version of the game. Point --game at the folder that holds "
          "MicrosoftGame.Config and the .rpf archives.\nSupported:\n"
          + "\n".join(reports or ["  No version manifests found."]) + notes)
@@ -1815,26 +1879,54 @@ def keep_recorded_fallback(flag: str, work: str) -> bool:
     return True
 
 
-def smallest_max_subgroup(vulkaninfo_text: str):
-    """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None."""
+def max_subgroup_decider(vulkaninfo_text: str):
+    """(size, device, left_out): the smallest maxSubgroupSize vulkaninfo reports (text or --json output), the name
+    of the device that reports it (None when the output names no devices), and the names of the CPU devices left
+    out. A CPU device (llvmpipe, lavapipe, SwiftShader) only counts when no other device is listed: the runtime
+    ranks it below every GPU (runtime/src/vulkan_device_filter.h, tools/vk_subgroup_info.py device_rank), and
+    llvmpipe's maxSubgroupSize of 8 would otherwise turn emulation on beside a GPU with native wave64. size is
+    None when it can't be told."""
     size = r'maxSubgroupSize"?\s*[=:]\s*(\d+)'
     # A device's own name is the least indented one; deeper ones (VK_KHR_maintenance7's layered APIs, e.g.
     # MoltenVK's Metal device, in both the text and the --json output) belong to the device above them.
-    names = list(re.finditer(r'(?m)^([ \t]*)"?deviceName"?\s*[=:]', vulkaninfo_text))
+    names = list(re.finditer(r'(?m)^([ \t]*)"?deviceName"?\s*[=:]\s*"?([^"\n]*)', vulkaninfo_text))
     depth = min((len(m.group(1)) for m in names), default=0)
-    starts = [m.start() for m in names if len(m.group(1)) == depth]
-    if not starts:
+    devices = [m for m in names if len(m.group(1)) == depth]
+    if not devices:
         sizes = [int(n) for n in re.findall(size, vulkaninfo_text)]
-        return min(sizes) if sizes else None
+        return (min(sizes) if sizes else None), None, []
+    # deviceType sits beside deviceName in VkPhysicalDeviceProperties (just before it in the text output; the
+    # --json output may order the keys differently), so each device takes the nearest one at the same depth.
+    types = [(m.start(), m.group(2)) for m in
+             re.finditer(r'(?m)^([ \t]*)"?deviceType"?\s*[=:]\s*"?([A-Z_0-9]+)', vulkaninfo_text)
+             if len(m.group(1)) == depth]
+
+    def is_cpu(pos):
+        if not types:
+            return False
+        kind = min(types, key=lambda t: abs(t[0] - pos))[1]
+        return kind.endswith("TYPE_CPU") or kind == "4"
+
     # One section per device (a 1.3 device can print the size twice, in two property structs): one value each,
     # and a device that prints none makes the answer unknown rather than being left out of the smallest.
     per_device = []
-    for a, b in zip(starts, starts[1:] + [len(vulkaninfo_text)]):
-        sizes = [int(n) for n in re.findall(size, vulkaninfo_text[a:b])]
-        if not sizes:
-            return None
-        per_device.append(min(sizes))
-    return min(per_device)
+    ends = [m.start() for m in devices[1:]] + [len(vulkaninfo_text)]
+    for m, end in zip(devices, ends):
+        sizes = [int(n) for n in re.findall(size, vulkaninfo_text[m.start():end])]
+        per_device.append((min(sizes) if sizes else None, m.group(2).strip().rstrip(","), is_cpu(m.start())))
+    gpus = [d for d in per_device if not d[2]]
+    left_out = [d[1] for d in per_device if d[2]] if gpus else []
+    counted = gpus or per_device
+    if any(d[0] is None for d in counted):
+        return None, None, left_out
+    smallest = min(counted, key=lambda d: d[0])
+    return smallest[0], smallest[1], left_out
+
+
+def smallest_max_subgroup(vulkaninfo_text: str):
+    """The smallest maxSubgroupSize vulkaninfo reports (text or --json output), or None; CPU devices only count when
+    no GPU is listed (max_subgroup_decider)."""
+    return max_subgroup_decider(vulkaninfo_text)[0]
 
 
 def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, bool]:
@@ -1842,7 +1934,8 @@ def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, boo
     shader is only exact without it when the GPU gives it 64-wide subgroups; with it, it is exact on any subgroup
     size, at the cost of a workgroup barrier per segment. "auto" keeps emulation off on native-wave64 RDNA1/2
     under the AMD Windows driver. Elsewhere it turns emulation on unless every Vulkan device reports
-    maxSubgroupSize >= 64 and the runtime probe does not rule out native wave64."""
+    maxSubgroupSize >= 64 and the runtime probe does not rule out native wave64; a CPU device (llvmpipe) only
+    counts when no GPU is listed (max_subgroup_decider)."""
     if mode == "on":
         return True, False
     if mode == "off":
@@ -1863,24 +1956,28 @@ def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, boo
             "(#857), so auto uses native wave64 and rebuilds emulated outputs (--wave64-emulate on to force emulation)")
         return False, False
     exe = shutil.which("vulkaninfo")
-    size = None
+    size, decider, left_out = None, None, []
     if exe:
         try:
             r = subprocess.run([exe], capture_output=True, text=True, errors="replace", timeout=120)
-            size = smallest_max_subgroup(r.stdout)
+            size, decider, left_out = max_subgroup_decider(r.stdout)
         except (OSError, subprocess.SubprocessError):
             size = None
+    if left_out:
+        log(f"shaders: left out of the wave64 choice, as the runtime never picks a CPU device beside a GPU: "
+            f"{', '.join(left_out)}")
     if size is None:
         log("shaders: couldn't read the GPU's subgroup size from vulkaninfo: wave64 emulation on "
             "(exact on every GPU; --wave64-emulate off to skip it on a GPU with 64-wide subgroups)")
         return True, True
     on = size < 64
+    by = f" ({decider})" if decider else ""
     if not on and native64 is False:
         stages = "compute" if compute_only else "both compute and mesh"
-        log(f"shaders: smallest maximum subgroup size is {size}, but the Vulkan query found no 64-wide path for "
+        log(f"shaders: smallest maximum subgroup size is {size}{by}, but the Vulkan query found no 64-wide path for "
             f"{stages} (fixed default size or required-size control): wave64 emulation on")
         return True, True
-    log(f"shaders: smallest maximum subgroup size is {size}: wave64 emulation {'on' if on else 'off'}")
+    log(f"shaders: smallest maximum subgroup size is {size}{by}: wave64 emulation {'on' if on else 'off'}")
     return on, True
 
 
