@@ -1931,7 +1931,8 @@ def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, boo
     if exe:
         try:
             r = subprocess.run([exe], capture_output=True, text=True, errors="replace", timeout=120)
-            size = smallest_max_subgroup(r.stdout)
+            if r.returncode == 0:
+                size = smallest_max_subgroup(r.stdout)
         except (OSError, subprocess.SubprocessError):
             size = None
     if size is None:
@@ -2524,6 +2525,11 @@ def wine_launcher(out: str, work: str, image: str) -> str:
 here=$(dirname "$(readlink -f "$0")")
 if [ "$#" -eq 1 ] && {{ [ "$1" = --dry-run ] || [ "$1" = --init ] || [ "$1" = --run ]; }}; then
     game=$(cat "$here/game_path.txt" && printf .) || exit 1
+    # A relative WINE (a Proton build's files/bin/wine) names a file from the caller's folder, not the game's.
+    case ${{WINE-}} in
+        /*) ;;
+        */*) WINE=$PWD/$WINE ;;
+    esac
     cd "${{game%.}}" || exit 1
     image={shlex.quote(image)}
     if [ ! -f "./$image" ]; then
@@ -2738,7 +2744,12 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     inflight = os.path.join(out, "pipeline_inflight.txt")
     skip = os.path.join(out, "pipeline_crashes.txt")
     report = os.path.join(out, "pipeline_crashes.json")
-    drop(inflight, skip, report)   # every module gets a fresh chance on each run (a new translator may have fixed it)
+    drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
+    try:
+        drop(report)
+    except OSError as error:
+        log(f"pipelines: cannot remove old pipeline_crashes.json ({error.strerror or error}). "
+            "That report may be stale.")
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
     jobs_args = ["--jobs", str(jobs)] if jobs else []
     base = [exe, spirv, cache, *jobs_args]
@@ -2825,20 +2836,20 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             break
     if crashed and not code:
         code = 1
-    if crashed:
-        record_crashes(out, spirv, crashed)
+    report_written = bool(crashed) and record_crashes(out, spirv, crashed)
     drop(inflight)
     if code != 0:
-        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed (with their SPIR-V " \
-              f"hashes in pipeline_crashes.json): " + ", ".join(crashed) if crashed else ""
+        report_note = " (with their SPIR-V hashes in pipeline_crashes.json)" if report_written else ""
+        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed{report_note}: " \
+              + ", ".join(crashed) if crashed else ""
         fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
     seed_bvh()
     log("pipelines: done")
 
 
-def record_crashes(out: str, spirv: str, crashed: "list[str]") -> None:
-    """pipeline_crashes.json: name and SHA-256 of each module that took the driver down, so a report names the
-    exact translation without attaching the shader. OSError (a missing .spv) leaves that module's hash null."""
+def record_crashes(out: str, spirv: str, crashed: "list[str]") -> bool:
+    """Write name and SHA-256 of each module that took the driver down to pipeline_crashes.json and return whether
+    it was written. OSError (a missing .spv) leaves that module's hash null."""
     def digest(name: str) -> "str | None":
         try:
             with open(os.path.join(spirv, name + ".spv"), "rb") as f:
@@ -2850,11 +2861,12 @@ def record_crashes(out: str, spirv: str, crashed: "list[str]") -> None:
         with open(os.path.join(out, "pipeline_crashes.json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump(doc, f, indent=1)
             f.write("\n")
+        return True
     except OSError as error:
         # The durable record is best-effort. A report path that cannot be written must not
         # replace the checker diagnostic that names the modules which took the driver down.
         log(f"pipelines: cannot write pipeline_crashes.json: {error.strerror or error}")
-
+        return False
 
 # How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the
 # 10 minutes since the last cache checkpoint, plus loading the cache). Looked up when pipelines() runs.
