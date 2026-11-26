@@ -199,7 +199,8 @@ private:
 // VkDevice crashed).
 //   - A PSO's last Release does not wait for its running build, which can be a dispatch-worker build of a module the
 //     driver takes minutes over: after_running() drops its queued jobs and hands the PSO's deletion to the worker,
-//     to run when that build returns (PipelineState::last_release). The PSO lets its device reference go at once.
+//     to run when that build returns (PipelineState::last_release). One job per owner runs at a time, so that
+//     deletion never overlaps another build of the same PSO. The PSO lets its device reference go at once.
 //   - A device's teardown waits: cancel() drops its queued jobs (by owner or device) and waits for its running one
 //     and what runs after it, so an in-flight vkCreate*Pipelines finishes before the device's objects go.
 //   - The worker thread runs while a device is alive (retain/release): the last device's release stops and joins it.
@@ -419,10 +420,15 @@ private:
     }
 
     // The first job this worker may take, most urgent first: any job for the general worker, a graphics job for the
-    // graphics one.
+    // graphics one, skipping any job whose owner already has a running build. One job per owner runs at a time, so a
+    // PSO's deletion after its running build (after_running) never overlaps another build of it.
     std::multimap<std::size_t, Job>::iterator next_locked(bool graphics_only) {
-        if (!graphics_only) return jobs_.begin();
-        return std::find_if(jobs_.begin(), jobs_.end(), [](const auto& entry) { return entry.second.graphics; });
+        return std::find_if(jobs_.begin(), jobs_.end(), [this, graphics_only](const auto& entry) {
+            if (graphics_only && !entry.second.graphics) return false;
+            const void* owner = entry.second.owner;
+            // A finished entry may still be running what comes after its job (the PSO's deletion): it counts too.
+            return std::none_of(running_.begin(), running_.end(), [owner](const Running& r) { return r.owner == owner; });
+        });
     }
 
     void run(std::uint64_t generation, bool graphics_only) {
@@ -462,6 +468,7 @@ private:
             running_.erase(std::find_if(running_.begin(), running_.end(), [me](const Running& r) {
                 return r.thread == me;
             }));
+            wake_.notify_all();
             done_.notify_all();
         }
     }
