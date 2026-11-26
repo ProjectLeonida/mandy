@@ -111,6 +111,7 @@ struct VulkanDeviceInfo {
     bool device_fault_info = false;
     bool device_checkpoints = false;
     bool device_diagnostics_config = false;
+    bool device_markers = false;  // VK_AMD_buffer_marker enabled for LEONIDA_DEVICE_MARKERS=1
     bool separate_depth_stencil_layouts = true;
     bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted enabled on this device.
     std::uint32_t max_push_constants_size = 0;
@@ -168,6 +169,9 @@ struct VulkanDeviceInfo {
     bool occlusion_query_precise = false;
     bool prepare_on_bind = false;
     bool cold_graphics_compile = false;  // Driver supports a cache-only create and reports when compilation is pending.
+    // pipelineCreationCacheControl is on for the heavy pipeline cache (src/heavy_pipeline_cache.h): a pipeline the
+    // offline cache does not have is created against the cache of pipeline_cache.heavy.bin, written back as it grows.
+    bool heavy_pipeline_cache = false;
     bool pipeline_statistics_query = false;
     bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
     // VK_KHR_swapchain_maintenance1 (or VK_EXT_swapchain_maintenance1) and its swapchainMaintenance1 feature are

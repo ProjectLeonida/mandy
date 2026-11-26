@@ -126,6 +126,14 @@ struct DeviceProxy {
     // The console runtime layout this title was built against (docs/d3d12_xs_console_abi.md §4): the queue proxy
     // writes it on detection and every object shares it — the queue/list slot tails shift +2 under the newer one.
     std::atomic<unsigned char> console_layout{0};  // 0 unknown, 1 older, 2 newer
+    // The real (translated) CPU handles that hold a render-target view the title created with no resource (device
+    // slot 20 with a null resource), for console list slot 52: on the console, clearing such a view does nothing.
+    // The real device's descriptor cannot tell (the Vulkan layer writes the same empty record for a view it could not
+    // make, and the PC runtime's handles are opaque), so the proxy keeps the mark itself. A view made there with a
+    // resource, or a descriptor copy over it, removes it.
+    std::mutex null_rtv_lock;
+    std::set<SIZE_T> null_rtvs;
+    std::atomic<std::size_t> null_rtv_count{0};  // null_rtvs.size(), read without the lock on the clear path
     // Set by create_device_proxy: false hands real (PC-shaped) lists back from CreateCommandList for callers
     // compiled against the PC headers.
     bool console_lists = true;
@@ -195,6 +203,10 @@ struct HeapProxy {
     SIZE_T custom_byte_size;
     SIZE_T real_cpu_start;
     DescriptorHeapBackingFree custom_free;
+    // An RTV heap's real CPU range, [rtv_real_start, +rtv_real_bytes): the null-view marks in it
+    // (DeviceProxy::null_rtvs) are dropped when the heap goes, so a later heap at the same address starts unmarked.
+    SIZE_T rtv_real_start = 0;
+    SIZE_T rtv_real_bytes = 0;
 };
 
 struct DescriptorRange {
@@ -385,6 +397,81 @@ void local_mirror_table(const DeviceProxy* device, std::uint64_t gpu_handle) {
                          static_cast<unsigned long long>(copied), static_cast<unsigned long long>(slots));
         return;
     }
+}
+
+// ---- Render-target views made with no resource (DeviceProxy::null_rtvs) ----
+
+// Device slot 20 wrote an RTV at the real handle `ptr`: marked when the title passed no resource, unmarked otherwise.
+void mark_null_rtv(DeviceProxy* device, SIZE_T ptr, bool no_resource) {
+    if (!ptr || (!no_resource && device->null_rtv_count.load(std::memory_order_acquire) == 0)) return;
+    std::lock_guard lock(device->null_rtv_lock);
+    try {
+        if (no_resource)
+            device->null_rtvs.insert(ptr);
+        else
+            device->null_rtvs.erase(ptr);
+    } catch (const std::bad_alloc&) {
+        // The mark is lost: a clear of this view keeps the PC list's answer, as before the mark existed.
+    }
+    device->null_rtv_count.store(device->null_rtvs.size(), std::memory_order_release);
+}
+
+bool is_null_rtv(DeviceProxy* device, SIZE_T ptr) {
+    if (!ptr || device->null_rtv_count.load(std::memory_order_acquire) == 0) return false;
+    std::lock_guard lock(device->null_rtv_lock);
+    return device->null_rtvs.count(ptr) != 0;
+}
+
+// A descriptor copy moves the marks with the descriptors: `count` RTV descriptors from the real handle `src` to
+// `dest`, `increment` bytes apart. Caller holds null_rtv_lock.
+void copy_null_rtv_marks_locked(DeviceProxy* device, SIZE_T dest, SIZE_T src, UINT count, UINT increment) {
+    for (UINT i = 0; i < count; ++i) {
+        const SIZE_T to = dest + static_cast<SIZE_T>(i) * increment;
+        if (device->null_rtvs.count(src + static_cast<SIZE_T>(i) * increment))
+            device->null_rtvs.insert(to);
+        else
+            device->null_rtvs.erase(to);
+    }
+}
+
+// CopyDescriptors / CopyDescriptorsSimple of RTVs, after the copy, with the handles the real device got. A null
+// size array means ranges of one descriptor, as in D3D12. Nothing to do while no view is marked: a copy can only
+// move a mark, never make one.
+void copy_null_rtv_marks(DeviceProxy* device, UINT num_dest, const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts,
+                         const UINT* dest_sizes, UINT num_src, const D3D12_CPU_DESCRIPTOR_HANDLE* src_starts,
+                         const UINT* src_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    if (type != D3D12_DESCRIPTOR_HEAP_TYPE_RTV || device->null_rtv_count.load(std::memory_order_acquire) == 0) return;
+    if (!dest_starts || !src_starts) return;
+    const UINT increment = device->real->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    if (!increment) return;
+    std::lock_guard lock(device->null_rtv_lock);
+    try {
+        UINT d = 0, s = 0, d_used = 0, s_used = 0;
+        while (d < num_dest && s < num_src) {
+            const UINT d_size = dest_sizes ? dest_sizes[d] : 1;
+            const UINT s_size = src_sizes ? src_sizes[s] : 1;
+            if (d_used == d_size) { ++d; d_used = 0; continue; }
+            if (s_used == s_size) { ++s; s_used = 0; continue; }
+            const UINT d_left = d_size - d_used, s_left = s_size - s_used;
+            const UINT run = d_left < s_left ? d_left : s_left;
+            copy_null_rtv_marks_locked(device, dest_starts[d].ptr + static_cast<SIZE_T>(d_used) * increment,
+                                       src_starts[s].ptr + static_cast<SIZE_T>(s_used) * increment, run, increment);
+            d_used += run;
+            s_used += run;
+        }
+    } catch (const std::bad_alloc&) {
+    }
+    device->null_rtv_count.store(device->null_rtvs.size(), std::memory_order_release);
+}
+
+// An RTV heap was released: its real handles can name another heap's views from now on, so no mark may outlive it.
+void drop_null_rtv_marks(DeviceProxy* device, SIZE_T start, SIZE_T bytes) {
+    if (!device || !start || !bytes || device->null_rtv_count.load(std::memory_order_acquire) == 0) return;
+    const SIZE_T end = start > (std::numeric_limits<SIZE_T>::max)() - bytes ? (std::numeric_limits<SIZE_T>::max)()
+                                                                             : start + bytes;
+    std::lock_guard lock(device->null_rtv_lock);
+    device->null_rtvs.erase(device->null_rtvs.lower_bound(start), device->null_rtvs.lower_bound(end));
+    device->null_rtv_count.store(device->null_rtvs.size(), std::memory_order_release);
 }
 
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
@@ -825,6 +912,7 @@ unsigned long heap_release(HeapProxy* self) {
     const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (refs == 0) {
         if (self->custom_cpu_start != 0) unregister_descriptor_range(self);
+        drop_null_rtv_marks(self->device, self->rtv_real_start, self->rtv_real_bytes);
         void* const backing = reinterpret_cast<void*>(self->custom_cpu_start);
         const DescriptorHeapBackingFree free_fn = self->custom_free;
         ID3D12DescriptorHeap* real = self->real;
@@ -2201,6 +2289,12 @@ HRESULT queue_copy_page_mappings(ChildProxy* self, UINT count, const xmem::PageB
     if (!map && rt::xmem::copy_page_mappings_fn) map = &copy_page_mappings_default;
     if (!map || !count) return S_OK;
     if (!batches || flags) return E_INVALIDARG;
+    // Which implementation remaps, once: a boot's read-fault reports belong to that route's tests.
+    static std::atomic<bool> route_logged{false};
+    if (!route_logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] d3d12_xs: CopyPageMappingsBatchX remaps through %s\n",
+                     map == &copy_page_mappings_default ? "xmem's range callback (copy_page_mappings_fn)"
+                                                        : "the installed batch hook (set_copy_page_mappings_hook)");
     auto* queue = reinterpret_cast<ID3D12CommandQueue*>(self->real);
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
@@ -2752,6 +2846,32 @@ struct UploadArena {
 
 constexpr std::size_t kUploadChunkMin = 8 << 20;  // one chunk serves a title's whole frame of uploads
 
+// LEONIDA_UPLOAD_LOG=1 (diagnostic): each upload chunk (its CPU base, device address and size), and the first 96 and
+// then every 8192nd AllocateUploadMemory result as an offset into its chunk, so the addresses the title builds
+// descriptors from can be matched with the memory it was handed.
+inline bool upload_log() {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_UPLOAD_LOG");
+        return v && *v == '1';
+    }();
+    return on;
+}
+inline void log_upload_result(const UploadChunk* chunk, std::uint64_t result, std::uint64_t size,
+                              std::uint64_t alignment) {
+    if (!upload_log() || !chunk) return;
+    static std::atomic<std::uint64_t> calls{0};
+    const std::uint64_t n = ++calls;
+    if (n > 96 && (n % 8192)) return;
+    const std::uint64_t base = reinterpret_cast<std::uint64_t>(chunk->cpu_base);
+    std::fprintf(stderr,
+                 "[rt] upload-log: #%llu result 0x%llx = chunk 0x%llx + offset 0x%llx (size %llu, alignment %llu; "
+                 "chunk device address 0x%llx)\n",
+                 static_cast<unsigned long long>(n), static_cast<unsigned long long>(result),
+                 static_cast<unsigned long long>(base), static_cast<unsigned long long>(result - base),
+                 static_cast<unsigned long long>(size), static_cast<unsigned long long>(alignment),
+                 static_cast<unsigned long long>(chunk->gpu_base));
+}
+
 UploadChunk* upload_chunk_new(DeviceProxy* device, std::size_t size) {
     auto* chunk = new (std::nothrow) UploadChunk{};
     if (!chunk) return nullptr;
@@ -2777,6 +2897,24 @@ UploadChunk* upload_chunk_new(DeviceProxy* device, std::size_t size) {
         chunk->resource = resource;
         chunk->cpu_base = static_cast<std::uint8_t*>(cpu);
         chunk->gpu_base = resource->GetGPUVirtualAddress();
+        // LEONIDA_UPLOAD_ALIAS=1 (experiment): the title takes the pointer AllocateUploadMemory hands it for a GPU
+        // address too (the console's memory is unified) and writes it into the descriptors it builds itself. Entered in
+        // the title VA table, the chunk's CPU range answers with the chunk's console VA (its device address minus
+        // heap_base), so a V# the title wrote with such a pointer is rewritten to the chunk instead of left empty. A
+        // chunk below the arena has a negative console VA, usable in a V# only with LEONIDA_IMPORT_BELOW_ARENA=1.
+        static const bool alias = [] {
+            const char* v = std::getenv("LEONIDA_UPLOAD_ALIAS");
+            return v && *v == '1';
+        }();
+        if (alias) {
+            const bool added = leonida::title_va_aliases().add(reinterpret_cast<std::uint64_t>(chunk->cpu_base),
+                                                               chunk->size, chunk->gpu_base);
+            std::fprintf(stderr, "[rt] d3d12_xs: upload chunk 0x%llx (%llu bytes) entered as an alias of console VA "
+                                 "0x%llx: %s\n",
+                         static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(chunk->cpu_base)),
+                         static_cast<unsigned long long>(chunk->size), static_cast<unsigned long long>(chunk->gpu_base),
+                         added ? "ok" : "refused");
+        }
         return chunk;
     }
     if (resource) resource->Release();
@@ -2824,7 +2962,9 @@ std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_
         const std::size_t aligned = (chunk->used + (alignment - 1)) & ~(static_cast<std::size_t>(alignment) - 1);
         if (aligned >= chunk->used && aligned <= chunk->size && need <= chunk->size - aligned) {
             chunk->used = aligned + need;
-            return reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+            const std::uint64_t result = reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+            log_upload_result(chunk, result, size, alignment);
+            return result;
         }
     }
     const std::size_t chunk_size = need + alignment > kUploadChunkMin ? need + alignment : kUploadChunkMin;
@@ -2838,7 +2978,14 @@ std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_
     arena->chunks = chunk;
     const std::size_t aligned = (alignment - 1) & ~(static_cast<std::size_t>(alignment) - 1);  // 0-based
     chunk->used = aligned + need;
-    return reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+    if (upload_log())
+        std::fprintf(stderr, "[rt] upload-log: new chunk at 0x%llx, device address 0x%llx, %llu bytes (%s)\n",
+                     static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(chunk->cpu_base)),
+                     static_cast<unsigned long long>(chunk->gpu_base), static_cast<unsigned long long>(chunk->size),
+                     chunk->resource ? "mapped upload buffer" : "VirtualAlloc fallback");
+    const std::uint64_t result = reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+    log_upload_result(chunk, result, size, alignment);
+    return result;
 }
 
 // An address inside an upload chunk becomes the chunk's device address plus the offset; anything else — a
@@ -2861,6 +3008,9 @@ void destroy_upload_state(void* upload_state) {
     for (UploadChunk* chunk = arena->chunks; chunk;) {
         UploadChunk* next = chunk->next;
         if (chunk->resource) {
+            const char* alias = std::getenv("LEONIDA_UPLOAD_ALIAS");
+            if (alias && *alias == '1')
+                leonida::title_va_aliases().remove(reinterpret_cast<std::uint64_t>(chunk->cpu_base), chunk->gpu_base);
             chunk->resource->Unmap(0, nullptr);
             chunk->resource->Release();
         } else {
@@ -3312,6 +3462,101 @@ void note_bundle_value_op(ConsoleValueOp op) {
                      op == ConsoleValueOp::write32 || op == ConsoleValueOp::write64 ? "write" : "wait");
 }
 
+// ---- Console list slot 146: Barrier(NumBarrierGroups, pBarrierGroups) -> GCL7 Barrier (PC 80) ----
+//
+// The title records texture barriers with no resource, which the console takes as a global memory and execution
+// barrier. A PC texture barrier needs a resource (the Vulkan layer's list goes into its error state, so Close fails
+// and the submission is dropped), so each such barrier becomes a D3D12_GLOBAL_BARRIER with the same sync and access;
+// its layouts, subresource range and flags have nothing to apply to. A texture group with both kinds is split into
+// runs in their order: texture runs point into the title's array, global runs into the call's own storage. A call
+// with nothing to convert is forwarded with the title's own pointer.
+constexpr UINT32 kMaxConsoleBarrierGroups = 1024;     // the measured calls pass one group
+constexpr UINT32 kMaxConsoleBarriersPerGroup = 65536;
+
+struct ConsoleBarrierStorage {  // lives for one call, on the recording thread's stack
+    std::vector<D3D12_BARRIER_GROUP> groups;
+    std::vector<D3D12_GLOBAL_BARRIER> globals;
+};
+
+// The groups to forward: `in` when nothing needs converting, `storage.groups` when something does, null with
+// `reason` set when the array cannot be read safely and the call is refused. `out_count` is the group count to pass.
+const D3D12_BARRIER_GROUP* console_barrier_groups(UINT32 count, const D3D12_BARRIER_GROUP* in,
+                                                  ConsoleBarrierStorage& storage, UINT32& out_count,
+                                                  const char*& reason) {
+    const auto refuse = [&reason](const char* why) -> const D3D12_BARRIER_GROUP* {
+        reason = why;
+        return nullptr;
+    };
+    out_count = count;
+    if (count == 0) return in;  // nothing to read: the PC call is a no-op either way
+    if (!in) return refuse("null group array with a nonzero count");
+    if (count > kMaxConsoleBarrierGroups) return refuse("group count over the limit");
+    std::size_t null_textures = 0, texture_barriers = 0;
+    for (UINT32 g = 0; g < count; ++g) {
+        const D3D12_BARRIER_GROUP& group = in[g];
+        if (group.Type != D3D12_BARRIER_TYPE_GLOBAL && group.Type != D3D12_BARRIER_TYPE_TEXTURE &&
+            group.Type != D3D12_BARRIER_TYPE_BUFFER)
+            return refuse("unknown barrier group type");
+        if (group.NumBarriers > kMaxConsoleBarriersPerGroup) return refuse("barrier count over the limit");
+        if (group.NumBarriers && !group.pGlobalBarriers)  // the union's pointer, whichever member the type names
+            return refuse("null barrier array with a nonzero count");
+        if (group.Type != D3D12_BARRIER_TYPE_TEXTURE) continue;
+        texture_barriers += group.NumBarriers;
+        for (UINT32 i = 0; i < group.NumBarriers; ++i)
+            if (!group.pTextureBarriers[i].pResource) ++null_textures;
+    }
+    if (null_textures == 0) return in;
+    try {
+        storage.globals.reserve(null_textures);  // exact: the groups point into it, so it never reallocates
+        storage.groups.reserve(count + texture_barriers);
+        for (UINT32 g = 0; g < count; ++g) {
+            const D3D12_BARRIER_GROUP& group = in[g];
+            if (group.Type != D3D12_BARRIER_TYPE_TEXTURE) {
+                storage.groups.push_back(group);
+                continue;
+            }
+            const D3D12_TEXTURE_BARRIER* barriers = group.pTextureBarriers;
+            for (UINT32 i = 0; i < group.NumBarriers;) {
+                const UINT32 start = i;
+                const bool no_resource = !barriers[i].pResource;
+                while (i < group.NumBarriers && !barriers[i].pResource == no_resource) ++i;
+                D3D12_BARRIER_GROUP run{};
+                run.NumBarriers = i - start;
+                if (no_resource) {
+                    run.Type = D3D12_BARRIER_TYPE_GLOBAL;
+                    run.pGlobalBarriers = storage.globals.data() + storage.globals.size();
+                    for (UINT32 k = start; k < i; ++k)
+                        storage.globals.push_back(D3D12_GLOBAL_BARRIER{barriers[k].SyncBefore, barriers[k].SyncAfter,
+                                                                       barriers[k].AccessBefore,
+                                                                       barriers[k].AccessAfter});
+                } else {
+                    run.Type = D3D12_BARRIER_TYPE_TEXTURE;
+                    run.pTextureBarriers = barriers + start;
+                }
+                storage.groups.push_back(run);
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        return refuse("out of memory converting the groups");
+    }
+    out_count = static_cast<UINT32>(storage.groups.size());
+    return storage.groups.data();
+}
+
+// Logged once per reason. The call is dropped whole: nothing of it reaches the PC list.
+void log_refused_barrier(const char* reason, UINT32 count, const void* groups) {
+    static std::mutex lock;
+    static std::set<const char*> seen;  // the reasons are string literals
+    std::lock_guard guard(lock);
+    try {
+        if (!seen.insert(reason).second) return;
+    } catch (const std::bad_alloc&) {
+        return;
+    }
+    std::fprintf(stderr, "[rt] d3d12_xs: list slot 146 (Barrier) refused, nothing recorded: %s (%u groups at %p)\n",
+                 reason, count, groups);
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -3532,6 +3777,36 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 // ClearRenderTargetView(RenderTargetView, ColorRGBA, NumRects, pRects): translate the RTV handle.
                 a1 = static_cast<std::uint64_t>(
                     translate_cpu_handle(self->device, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a1)}).ptr);
+                // A view the title made with no resource: the console clear does nothing, and the PC list would
+                // take the view as invalid and fail its Close. Any other view goes to the PC list as before.
+                if (is_null_rtv(self->device, static_cast<SIZE_T>(a1))) {
+                    static std::atomic<bool> logged{false};
+                    if (first_call(logged))
+                        std::fprintf(stderr, "[rt] d3d12_xs: list slot 52 (ClearRenderTargetView) of a view made with "
+                                             "no resource skipped, as on the console (handle 0x%llx)\n",
+                                     static_cast<unsigned long long>(a1));
+                    return 0;
+                }
+            } else if constexpr (Slot == kConsoleBarrier) {
+                // Barrier(NumBarrierGroups, pBarrierGroups): console_barrier_groups above.
+                ConsoleBarrierStorage storage;
+                UINT32 count = 0;
+                const char* reason = nullptr;
+                const D3D12_BARRIER_GROUP* groups = console_barrier_groups(
+                    static_cast<UINT32>(a1), reinterpret_cast<const D3D12_BARRIER_GROUP*>(a2), storage, count, reason);
+                if (reason) {
+                    log_refused_barrier(reason, static_cast<UINT32>(a1), reinterpret_cast<const void*>(a2));
+                    return 0;
+                }
+                if (groups && groups == storage.groups.data()) {
+                    static std::atomic<bool> logged{false};
+                    if (first_call(logged))
+                        std::fprintf(stderr, "[rt] d3d12_xs: list slot 146 (Barrier): texture barriers with no "
+                                             "resource recorded as global barriers, as on the console\n");
+                }
+                return reinterpret_cast<ForwardFn>(real_vtable[pc])(self->real, count,
+                                                                  reinterpret_cast<std::uint64_t>(groups), a3, a4,
+                                                                  a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
             } else if constexpr (Slot == kConsoleClearUavUint || Slot == kConsoleClearUavFloat) {
                 // ClearUnorderedAccessViewUint/Float(ViewGPUHandle, ViewCPUHandle, pResource, Values, NumRects,
                 //                                    pRects): keep GPU handle, translate CPU handle.
@@ -4516,6 +4791,15 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
 
     hr = create_heap_proxy(heap, self, *riid, out, custom_cpu_start, custom_byte_size, real_cpu_start,
                            custom_cpu_start ? free_fn : nullptr, stride);
+    if (SUCCEEDED(hr) && desc && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV && is_heap_proxy(*out)) {
+        // The null-view marks are kept by real handle (mark_null_rtv); heap_release drops those in this range.
+        const UINT inc = self->real->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        auto* proxy = static_cast<HeapProxy*>(*out);
+        proxy->rtv_real_start =
+            real_cpu_start ? real_cpu_start : raw_heap_get_cpu_handle(heap, *reinterpret_cast<void***>(heap)).ptr;
+        if (inc && desc->NumDescriptors <= (std::numeric_limits<SIZE_T>::max)() / inc)
+            proxy->rtv_real_bytes = static_cast<SIZE_T>(desc->NumDescriptors) * inc;
+    }
     if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC (fsdraw): which CPU start the title gets for this heap
         static std::atomic<int> logged{0};
         if (logged.fetch_add(1) < 32)
@@ -4566,7 +4850,9 @@ void proxy_create_uav(DeviceProxy* self, ID3D12Resource* resource, ID3D12Resourc
 void proxy_create_rtv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(20);
-    self->real->CreateRenderTargetView(resource, desc, translate_cpu_handle(self, dest));
+    const D3D12_CPU_DESCRIPTOR_HANDLE real_dest = translate_cpu_handle(self, dest);
+    self->real->CreateRenderTargetView(resource, desc, real_dest);
+    mark_null_rtv(self, real_dest.ptr, resource == nullptr);  // for console list slot 52 (DeviceProxy::null_rtvs)
 }
 
 void proxy_create_dsv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc,
@@ -4587,6 +4873,7 @@ void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DE
     note_slot(23);
     if (g_custom_range_count.load(std::memory_order_acquire) == 0) {
         self->real->CopyDescriptors(num_dest, dest_starts, dest_sizes, num_src, src_starts, src_sizes, type);
+        copy_null_rtv_marks(self, num_dest, dest_starts, dest_sizes, num_src, src_starts, src_sizes, type);
         return;
     }
     constexpr UINT kInline = 32;
@@ -4621,6 +4908,7 @@ void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DE
     self->real->CopyDescriptors(num_dest, dest_out, dest_sizes, num_src, src_out, src_sizes, type);
     for (UINT i = 0; dest_starts && i < num_dest; ++i)
         local_write_through(self, dest_starts[i], dest_sizes ? dest_sizes[i] : 1);
+    copy_null_rtv_marks(self, num_dest, dest_out, dest_sizes, num_src, src_out, src_sizes, type);
 }
 
 void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D12_CPU_DESCRIPTOR_HANDLE dest_start,
@@ -4630,6 +4918,7 @@ void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D1
     const D3D12_CPU_DESCRIPTOR_HANDLE src = translate_cpu_handle(self, src_start);
     self->real->CopyDescriptorsSimple(num_descriptors, dest, src, type);
     local_write_through(self, dest_start, num_descriptors);
+    copy_null_rtv_marks(self, 1, &dest, &num_descriptors, 1, &src, &num_descriptors, type);
     if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC (fsdraw): where the title copies its descriptors, and what lands there
         static std::atomic<std::uint64_t> copies{0};
         const std::uint64_t n = ++copies;
