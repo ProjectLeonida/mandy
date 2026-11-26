@@ -1132,6 +1132,7 @@ public:
         if (loaded_ && gpu_labels_.initialize(device, get)) {
             replay_.gpu_label = [this](VkCommandBuffer cb, const label::Write& write) { gpu_labels_.record(cb, write); };
         }
+        if (loaded_ && gpu_profile::enabled()) gpu_profile_.configure(device, get);  // LEONIDA_GPU_PROFILE=1
         replay_.pipeline_barrier = vk.vkCmdPipelineBarrier;
         replay_.clear_color_image = vk.vkCmdClearColorImage;
         replay_.clear_depth_stencil_image = vk.vkCmdClearDepthStencilImage;
@@ -1313,6 +1314,7 @@ public:
         progress_watch_ = {};  // stop before queues, timelines or diagnostic state go away
         gpu_labels_.stop(device_);
         fence_dispatcher_.reset();
+        gpu_profile_.stop();  // after the fence callbacks that hold its recordings
         deletion_queue_.drain(UINT64_MAX, device_, vk);
         for (const auto& [key, framebuffer] : resolve_framebuffers_)
             vk.vkDestroyFramebuffer(device_, framebuffer, nullptr);
@@ -1536,6 +1538,14 @@ public:
     // (timestampValidBits 0). Set by the device before any queue uses it.
     double timestamp_period() const { return timestamp_period_; }
     void set_timestamp_period(double period) { timestamp_period_ = period; }
+    // timestampValidBits by queue family, 0 for one that cannot reset or resolve queries. Set by the device before any
+    // queue uses it; LEONIDA_GPU_PROFILE profiles the queues of the families with bits.
+    void set_timestamp_bits(std::vector<std::uint32_t> bits) { timestamp_bits_ = std::move(bits); }
+    std::uint32_t timestamp_bits(std::uint32_t family) const {
+        return family < timestamp_bits_.size() ? timestamp_bits_[family] : 0;
+    }
+    // LEONIDA_GPU_PROFILE=1: the GPU time per pipeline (vulkan_gpu_profile.h). Tests read its sums.
+    gpu_profile::Profiler& gpu_profile() { return gpu_profile_; }
     // True where a timestamp resolve must be ordered explicitly after the timestamps it copies (MoltenVK on Apple
     // GPUs, docs/d3d12_vulkan.md section 4.6). Set by the device before any queue uses it.
     bool order_timestamp_copies() const { return order_timestamp_copies_; }
@@ -1607,18 +1617,21 @@ public:
         std::unique_lock lock(pipeline_mutex_);
         pipelines_[id] = pipeline;
         if (shader && device_fault_) device_fault_->pipeline_names[id] = {shader};
+        if (shader && gpu_profile::enabled()) profile_names_[id] = {shader};
     }
     void remove_pipeline(std::uintptr_t id) {
         std::unique_lock lock(pipeline_mutex_);
         pipelines_.erase(id);
         graphics_pipelines_.erase(id);
         if (device_fault_) device_fault_->pipeline_names.erase(id);
+        if (gpu_profile::enabled()) profile_names_.erase(id);
     }
     void add_graphics_pipeline(std::uintptr_t id, const GraphicsPipeline& pipeline,
                                const CheckpointShaders* shaders = nullptr) {
         std::unique_lock lock(pipeline_mutex_);
         graphics_pipelines_[id] = pipeline;
         if (shaders && device_fault_) device_fault_->pipeline_names[id] = *shaders;
+        if (shaders && gpu_profile::enabled()) profile_names_[id] = *shaders;
     }
     // Workers for the pipelines a submission needs and that are not built yet. Null (the default): compiled serially on
     // the submitting thread once resource_mutex_ is released. Replacing it waits for submissions that are compiling, and
@@ -2358,6 +2371,9 @@ private:
     std::function<void(bool)> bindless_commit_;
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
+    std::vector<std::uint32_t> timestamp_bits_;  // by queue family (set_timestamp_bits)
+    gpu_profile::Profiler gpu_profile_;          // LEONIDA_GPU_PROFILE=1
+    gpu_profile::NameMap profile_names_;         // its pipeline names, guarded by pipeline_mutex_
     bool order_timestamp_copies_ = false;
     VkPhysicalDeviceMemoryProperties occlusion_resolve_memory_{};
     label::Completions gpu_labels_;
@@ -3562,6 +3578,16 @@ private:
             return queue_unsupported(__LINE__);
         }
         replay.bindless_set = context_.bindless_current_ ? context_.bindless_current_() : VK_NULL_HANDLE;
+        // LEONIDA_GPU_PROFILE=1: the submission's query pool is reset and its first timestamp written here, after the
+        // failure path above (which submits the buffer without a recording); dropped unless the buffer is submitted.
+        std::unique_ptr<gpu_profile::Recording> profile;
+        if (gpu_profile::enabled()) {
+            std::size_t commands = 0;
+            for (const CommandList* list : lists) commands += list->commands().size();
+            profile = context_.gpu_profile_.begin(command_buffer, int(kind_), context_.timestamp_period(),
+                                                  context_.timestamp_bits(family_), commands, &context_.profile_names_);
+            replay.gpu_profile = profile.get();
+        }
         const bool bindless_uploaded = std::exchange(context_.bindless_upload_pending_, false);
         // Layout changes go into the tracker itself, journalled, and are undone unless the submission reaches the
         // queue (tracker_mutex_ is held from here to the commit, so nothing else sees them meanwhile).
@@ -3663,6 +3689,7 @@ private:
             readback_stages |= list.readback_src_stages;
         }
         close_labels(command_buffer, replay, open_labels);
+        if (profile) profile->finish(command_buffer);
         // Only flush GPU writes to the host domain when this batch actually wrote to a readback buffer.
         if (wrote_readback) {
             const VkPipelineStageFlags2 allowed = queue_supported_stages(kind_);
@@ -3704,6 +3731,14 @@ private:
         }
         const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0,
                                                execute_call ? &diagnostics : nullptr);
+        if (profile && submitted) {
+            // Read once this submission (ticket submitted_ on progress_) is done; the pool is reused after that.
+            profile->mark_submitted();
+            std::shared_ptr<gpu_profile::Recording> recording(std::move(profile));
+            context_.enqueue_fence_callback(progress_, submitted_, [profiler = &context_.gpu_profile_, recording] {
+                profiler->resolve(*recording);
+            });
+        }
         if (mesh_draws)
             std::fprintf(stderr, "[rt] pso-mesh unix_ms=%lld draws=%u submitted=%d\n",
                          pipeline_profile::unix_ms(), mesh_draws, int(submitted));

@@ -37,6 +37,7 @@
 #include "indirect_draw_stats.h"
 #include "deferred_image_binding.h"
 #include "vulkan_device_fault.h"
+#include "vulkan_gpu_profile.h"
 #include "depth24.h"
 #include "quad_index_expand.h"
 #include "rect_list_geometry.h"
@@ -1153,6 +1154,9 @@ struct ReplayFunctions {
     // Set: prepare() leaves pipelines that are not built to it instead of building each on the spot.
     PipelineCompiles* compiles = nullptr;
     std::function<void(VkCommandBuffer, const label::Write&)> gpu_label;
+    // LEONIDA_GPU_PROFILE=1 (vulkan_gpu_profile.h): this submission's timestamps around each run of draws or
+    // dispatches of one pipeline. Null: no profile, and the replay records nothing for it.
+    gpu_profile::Recording* gpu_profile = nullptr;
     // Set 0 for the pipelines that declare one (their own `bindless_set` is only the marker): the device's current
     // generation of it, which a flush may have replaced since the pipeline was made. Null: the pipeline's.
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;
@@ -4672,6 +4676,29 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
         const auto raster = draw_command(command);
+        // LEONIDA_GPU_PROFILE=1: before anything of the command is recorded, so that the helper passes of a draw or
+        // dispatch (index expansion, indirect clamp, counted dispatch) count for it. A command that records no draw
+        // or dispatch here (dropped, skipped, still compiling) neither starts nor ends a run.
+        if (vk.gpu_profile) {
+            auto& profile = *vk.gpu_profile;
+            if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
+                if (p.pipeline.pipeline) profile.work(command_buffer, gpu_profile::Kind::compute, dispatch->pipeline);
+            } else if (const auto* indirect = std::get_if<ExecuteIndirect>(&command)) {
+                if (indirect->kind == IndirectKind::dispatch) {
+                    if (!indirect->pipeline || p.pipeline.pipeline || !(p.pipeline.async_build || p.pipeline.skipped))
+                        profile.work(command_buffer, gpu_profile::Kind::compute, indirect->pipeline);
+                } else if (vk.external_graphics_scope) {
+                    profile.work(command_buffer, gpu_profile::Kind::graphics, 0);  // the caller's pipeline
+                }
+            } else if (raster.state) {
+                if (!prepared.draws[p.draw].skipped)
+                    profile.work(command_buffer,
+                                 raster.state->mesh ? gpu_profile::Kind::mesh : gpu_profile::Kind::graphics,
+                                 raster.state->pipeline);
+            } else {
+                profile.other(command_buffer);
+            }
+        }
         if (next_query < prepared.queries.size() && prepared.queries[next_query].command == i) {
             if constexpr (Checkpoints)
                 if (std::holds_alternative<ResolveQueries>(command))

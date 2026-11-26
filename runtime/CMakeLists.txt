@@ -2204,6 +2204,34 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(vk_overlapping_occlusion vk_overlapping_occlusion_no_statistics
                            PROPERTIES SKIP_RETURN_CODE 77)
     endif()
+    # LEONIDA_GPU_PROFILE (src/vulkan_gpu_profile.h): known dispatches and a draw through VulkanQueue, each pipeline
+    # reported under its name with its calls, runs and a GPU time that grows with its work; prints the cost when on.
+    add_executable(vk_gpu_profile_test test/vk_gpu_profile_test.cpp)
+    target_link_libraries(vk_gpu_profile_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    if(WIN32)
+      target_compile_definitions(vk_gpu_profile_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    else()
+      find_package(Threads REQUIRED)
+      target_link_libraries(vk_gpu_profile_test PRIVATE Threads::Threads)
+    endif()
+    if(MSVC)
+      target_compile_options(vk_gpu_profile_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    foreach(stage comp vert)
+      set(source "${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/gpu_profile_spin.${stage}")
+      set(output "${CMAKE_CURRENT_BINARY_DIR}/gpu_profile_spin.${stage}.spv")
+      add_custom_command(OUTPUT "${output}"
+                         COMMAND "${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.0
+                                 -o "${output}" "${source}"
+                         DEPENDS "${source}" VERBATIM)
+      target_sources(vk_gpu_profile_test PRIVATE "${output}")
+    endforeach()
+    if(BUILD_TESTING)
+      add_test(NAME vk_gpu_profile COMMAND vk_gpu_profile_test
+               "${CMAKE_CURRENT_BINARY_DIR}/gpu_profile_spin.comp.spv"
+               "${CMAKE_CURRENT_BINARY_DIR}/gpu_profile_spin.vert.spv")
+      set_tests_properties(vk_gpu_profile PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
   endif()
   # CPU-only: the ranking that makes these harnesses prefer a native ICD over Mesa's Dozen (#915). No GPU needed.
   add_executable(vk_device_pick_test test/vk_device_pick_test.cpp)
