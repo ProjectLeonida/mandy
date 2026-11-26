@@ -15531,7 +15531,11 @@ public:
                 watch.for_each_over(from, to, remapped);
                 watch.note_changed(from, to);
             }
-            for (const auto& [from, to] : written) watch.note_changed(from, to);
+            // A noted write (XG, DirectStorage) can be the texture's first bytes: its memory is probed again too.
+            for (const auto& [from, to] : written) {
+                watch.for_each_over(from, to, remapped);
+                watch.note_changed(from, to);
+            }
         }
         title_named_.clear();
         watch.collect([&](std::uint64_t key) { title_named_.push_back(key); });
