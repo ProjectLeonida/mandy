@@ -693,10 +693,23 @@ bool access_faults(volatile uint32_t* address, bool write);
 
 // The same hook on a GPU-only destination: the title reserves a CPU-mappable range and a GPU-only one of the same size
 // right after it (title_gpu_views), and the D3D12 layer reads the GPU-only range's memory at the CPU range's address.
-// A batch copy onto the GPU-only range maps the same pages at the CPU range too, so that memory becomes readable there.
+// A batch copy onto the GPU-only range maps the same pages at the CPU range, so that memory becomes readable there,
+// and gives the GPU-only pages their physical pages in xmem's table alone: no host view there, as on the console,
+// where the call edits GPU page tables only. One host map per page, not two (rt::xmem::slot31_mapping_counts).
 void test_copy_page_mappings_cpu_view(const PhysicalApi& api) {
     const auto copy = rt::xmem::copy_page_mappings_fn;
     if (!copy) return;  // test_copy_page_mappings reports it
+    uint64_t table0 = 0, host0 = 0;
+    rt::xmem::slot31_mapping_counts(table0, host0);
+    const auto counted = [&](uint64_t table, uint64_t host) {
+        uint64_t t = 0, h = 0;
+        rt::xmem::slot31_mapping_counts(t, h);
+        const bool ok = t - table0 == table && h - host0 == host;
+        if (!ok)
+            std::fprintf(stderr, "  slot-31 pages so far: %llu by table, %llu by host remap\n",
+                         static_cast<unsigned long long>(t - table0), static_cast<unsigned long long>(h - host0));
+        return ok;
+    };
     constexpr uint64_t kPool = 2, kPair = 3;
     auto* const pool = static_cast<uint8_t*>(api.virtual_alloc(
         nullptr, kPool * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
@@ -724,28 +737,31 @@ void test_copy_page_mappings_cpu_view(const PhysicalApi& api) {
         return !access_faults(reinterpret_cast<volatile uint32_t*>(const_cast<uint8_t*>(page)), false);
     };
     check(copy(gpu, pool, kPool, false), "a run of pool pages maps onto the GPU-only range");
-    check(readable(gpu) && page_holds(gpu, 0x7300u), "the GPU-only range shows the pool pages");
+    check(!readable(gpu) && !readable(gpu + kPage64k), "the GPU-only range has no host view: a table entry only");
+    check(counted(kPool, kPool), "one host remap per page (its CPU pair), the GPU-only page by table");
     check(readable(cpu) && readable(cpu + kPage64k), "the paired CPU range is readable after the copy");
     check(readable(cpu) && readable(cpu + kPage64k) && page_holds(cpu, 0x7300u) && page_holds(cpu + kPage64k, 0x7301u),
           "the paired CPU range shows the same bytes as the pool");
     check(!readable(cpu + 2 * kPage64k), "a CPU page past the copied run stays unmapped");
     if (readable(cpu + kPage64k)) {
         static_cast<volatile uint32_t*>(static_cast<void*>(cpu + kPage64k))[1] = 0xc0ffee32;
-        check(read_u32(pool + kPage64k, 4) == 0xc0ffee32 && read_u32(gpu + kPage64k, 4) == 0xc0ffee32,
-              "a write at the CPU range is seen in the pool and the GPU-only range: one memory");
+        check(read_u32(pool + kPage64k, 4) == 0xc0ffee32, "a write at the CPU range is seen in the pool: one memory");
     }
 
     // A GPU-only source whose page is mapped only at its CPU range is found there.
     check(api.map(cpu + 2 * kPage64k, 1, &pages[0]) == cpu + 2 * kPage64k, "a page maps at the CPU range alone");
     check(copy(other, gpu + 2 * kPage64k, 1, false), "a copy from the GPU-only range maps");
+    check(counted(kPool, kPool + 1), "a destination with no CPU pair is mapped on the host");
     check(readable(other) && page_holds(other, 0x7300u),
           "a GPU-only source page unmapped there is looked up at its CPU range");
 
     // A CPU page the title mapped itself is the title's: a copy onto its GPU-only page, or an unmap of it, changes the
     // GPU-only page alone (the console's CopyPageMappingsBatchX edits only that range's page table).
     check(copy(gpu + 2 * kPage64k, pool + kPage64k, 1, false), "a copy onto a GPU-only page whose CPU page is the title's");
-    check(readable(gpu + 2 * kPage64k) && page_holds(gpu + 2 * kPage64k, 0x7301u),
-          "the GPU-only page shows the copied pool page");
+    check(counted(kPool + 1, kPool + 1), "the GPU-only page took the pool page by table alone");
+    // The table is what later copies read: a copy from that GPU-only page brings the pool page it was given.
+    check(copy(other, gpu + 2 * kPage64k, 1, false) && readable(other) && page_holds(other, 0x7301u),
+          "a copy from the GPU-only page finds the page its table entry holds");
     check(readable(cpu + 2 * kPage64k) && page_holds(cpu + 2 * kPage64k, 0x7300u),
           "the title's own mapping at the paired CPU page is kept, not replaced by the copy");
     check(copy(gpu + 2 * kPage64k, nullptr, 1, false), "a null source unmaps a GPU-only page whose CPU page is the title's");
@@ -756,6 +772,18 @@ void test_copy_page_mappings_cpu_view(const PhysicalApi& api) {
     // A null source unmaps both ranges where the CPU pages are the copy's own.
     check(copy(gpu, nullptr, kPool, false), "a null source unmaps the GPU-only range");
     check(!readable(gpu) && !readable(cpu) && !readable(cpu + kPage64k), "the paired CPU range is unmapped with it");
+    check(copy(other, gpu, 1, false) && !readable(other), "the GPU-only page's table entry is gone: a copy of it is a hole");
+
+    // A page the title mapped itself into the GPU-only range (XMemMapPhysicalPages) is a host view: a copy onto it
+    // unmaps that view once and keeps the page in the table; the title's own unmap of the range clears the table too.
+    check(api.map(gpu, 1, &pages[1]) == gpu && readable(gpu) && page_holds(gpu, 0x7301u),
+          "the title maps a page into the GPU-only range itself");
+    check(copy(gpu, pool, 1, false) && !readable(gpu), "a copy onto it replaces the host view by a table entry");
+    check(copy(other, gpu, 1, false) && readable(other) && page_holds(other, 0x7300u),
+          "the table entry holds the copied page");
+    // The copy mapped the pool page at the CPU twin too; unmapped there as well, nothing names it any more.
+    check(api.map(gpu, 1, nullptr) == gpu && api.map(cpu, 1, nullptr) == cpu, "the title unmaps both pages");
+    check(copy(other, gpu, 1, false) && !readable(other), "after the title's unmap the table entry is gone");
 
     api.map(other, 1, nullptr);
     api.map(cpu, kPair, nullptr);

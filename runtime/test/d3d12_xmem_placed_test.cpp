@@ -227,7 +227,13 @@ int queue_remap_default_route(ID3D12Device* real, ID3D12Device* proxy) {
     const auto completion = WaitForSingleObject(remapped, 10000);
     CloseHandle(remapped);
     EXPECT(completion == WAIT_OBJECT_0);
-    EXPECT(dst[0] == 40 && dst[kPage64k] == 41);  // the GPU-only pages, found through the pool's CPU alias
+    // The GPU-only pages took the pool's pages (found through its CPU alias) in xmem's table alone: no host view there,
+    // as on the console. A copy from them shows what the table holds.
+    EXPECT(state_is(dst, MEM_RESERVE) && state_is(dst + kPage64k, MEM_RESERVE));
+    auto* probe = window(PAGE_READWRITE);
+    EXPECT(probe && rt::xmem::copy_page_mappings_fn &&
+           rt::xmem::copy_page_mappings_fn(probe, dst, n, false) && probe[0] == 40 && probe[kPage64k] == 41);
+    EXPECT(rt::xmem::copy_page_mappings_fn(probe, nullptr, n, false));
     EXPECT(cpu[0] == 40);                         // a CPU twin with no mapping of the title's follows the copy
     EXPECT(cpu[kPage64k] == 77);                  // the title's own page is kept
 
