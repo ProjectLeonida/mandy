@@ -16,7 +16,10 @@
 // that makes a GPU copy for an address in the title's memory that has none yet, and a scanner that rewrites the
 // buffer V#s of a bound descriptor table before a submission. Without hooks the table only translates what was
 // added to it, so it is tested without a GPU (title_va_alias_test).
+#include "descriptor_range_changes.h"
 #include <algorithm>
+#include "buffer_va_index.h"
+
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -42,6 +45,9 @@ public:
     // memory (an arena VA, a buffer of the layer's).
     using Resolver = bool (*)(void* context, std::uint64_t va, std::uint64_t bytes, std::uint64_t& shader_va);
     using TableScanner = void (*)(void* context, std::uint64_t table_va, std::uint32_t descriptors);
+    // Every binding resolved to a copy of the title's memory: [va, va + bytes) as they are reached at (the device keeps
+    // them for the copy back after the submission, see DeviceState::write_back_titles).
+    using Noter = void (*)(void* context, std::uint64_t va, std::uint64_t bytes);
 
     // [title_va, title_va + bytes) is reached as [shader_va, shader_va + bytes). A range that overlaps a live one
     // replaces it (the title has placed a new buffer over pages it released). False for an empty or wrapping range.
@@ -49,8 +55,11 @@ public:
         if (!bytes || title_va > UINT64_MAX - bytes) return false;
         std::unique_lock lock(mutex_);
         erase_overlapping(title_va, title_va + bytes);
+        changes_.record(title_va, bytes);
         ranges_[title_va] = {title_va + bytes, shader_va};
+        by_shader_.insert(shader_va, bytes, title_va);
         count_.store(ranges_.size(), std::memory_order_release);
+        generation_.fetch_add(1, std::memory_order_release);
         return true;
     }
 
@@ -68,10 +77,27 @@ public:
         std::unique_lock lock(mutex_);
         const auto it = ranges_.find(title_va);
         if (it != ranges_.end() && it->second.shader_va == shader_va) {
+            changes_.record(it->first, it->second.end - it->first);
+            by_shader_.erase(shader_va, title_va);
+            note_removed(it->second.shader_va, it->second.end - it->first);
             ranges_.erase(it);
             invalidations_.fetch_add(1, std::memory_order_release);
+            generation_.fetch_add(1, std::memory_order_release);
         }
         count_.store(ranges_.size(), std::memory_order_release);
+    }
+
+    // A copy that answered for [title_va, title_va + bytes) at shader_va went, whether or not it had a range here (a
+    // geometry copy that vsharp_address or a placed view reached through GeometryViews directly has none): what was
+    // translated through it is stale. Recorded as a removal would be: the console heaps translate the slots in the
+    // range again (invalidations, changed_ranges), and the GPU key table drops answers into shader_va (take_removed).
+    void forget_copy(std::uint64_t title_va, std::uint64_t bytes, std::uint64_t shader_va) {
+        if (!bytes) return;
+        std::unique_lock lock(mutex_);
+        changes_.record(title_va, bytes);
+        note_removed(shader_va, bytes);
+        invalidations_.fetch_add(1, std::memory_order_release);
+        generation_.fetch_add(1, std::memory_order_release);
     }
 
     // The address a shader must be given for `va` from the ranges added so far: translated inside one, unchanged
@@ -113,6 +139,16 @@ public:
         for (const auto& [start, range] : ranges_) out.push_back({start, range.end, range.shader_va});
     }
 
+    // Whether `shader_va` lies in the copy of a range added so far: an address the layer itself wrote for the title
+    // (a window, a geometry copy, a slot-133 shadow or import), which a later scan of the same descriptor sees again.
+    // A binary search over the copies' addresses (source_of_vsharp walks every range).
+    bool shader_side(std::uint64_t shader_va) const {
+        if (!count_.load(std::memory_order_acquire)) return false;
+        std::shared_lock lock(mutex_);
+        BufferVaIndex<std::uint64_t>::Hit hit{};
+        return by_shader_.find(shader_va, hit);
+    }
+
     // Debug-only inverse lookup. V#s retain 48 bits, so an import below heap_base wraps.
     bool source_of_vsharp(std::uint64_t base, std::uint64_t& title, std::uint64_t& available) const {
         constexpr std::uint64_t mask = (1ull << 48) - 1;
@@ -147,6 +183,7 @@ public:
         std::uint64_t to = shader_va(va);
         if (to != va) {
             translated_[kind].fetch_add(1, std::memory_order_relaxed);
+            note_reached(va, bytes);
             return to;
         }
         Resolver resolver;
@@ -158,6 +195,7 @@ public:
         }
         if (!resolver || !resolver(context, va, bytes, to)) return va;
         (to != va ? translated_ : untranslated_)[kind].fetch_add(1, std::memory_order_relaxed);
+        if (to != va) note_reached(va, bytes);
         return to;
     }
 
@@ -165,6 +203,18 @@ public:
     // whether it is in a title range.
     void note(std::uint64_t va, Kind kind) {
         if (va && shader_va(va) != va) untranslated_[kind].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // [va, va + bytes) is reached as a copy of the title's memory: the device keeps it for the copy back.
+    void note_reached(std::uint64_t va, std::uint64_t bytes) {
+        Noter noter;
+        void* context;
+        {
+            std::lock_guard lock(hook_mutex_);
+            noter = noter_;
+            context = hook_context_;
+        }
+        if (noter) noter(context, va, bytes);
     }
 
     // Before a submission: the device rewrites the buffer V#s of the `descriptors` slots the root signature declares
@@ -208,11 +258,15 @@ public:
             it = memory_.erase(it);
         }
         memory_[begin] = end;
+        memory_generation_.fetch_add(1, std::memory_order_release);
     }
     void remove_title_memory(std::uint64_t base) {
         std::unique_lock lock(memory_mutex_);
         memory_.erase(base);
+        memory_generation_.fetch_add(1, std::memory_order_release);
     }
+    // Bumped whenever title_memory_ranges() changes.
+    std::uint64_t memory_generation() const { return memory_generation_.load(std::memory_order_acquire); }
     // LOCAL DIAGNOSTIC (mem probe): every title range, [begin, end), in address order.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> title_memory_ranges() const {
         std::shared_lock lock(memory_mutex_);
@@ -307,13 +361,47 @@ public:
         hook_context_ = nullptr;
         resolver_ = nullptr;
         scanner_ = nullptr;
+        noter_ = nullptr;
     }
     // The resolver alone, for a device that scans its descriptor tables itself.
     void set_resolver(void* context, Resolver resolver) { set_hooks(context, resolver, nullptr); }
     void clear_resolver(void* context) { clear_hooks(context); }
+    // Set after set_hooks, so the hook (and its context) stays the device's: what reached a copy of the title's memory.
+    void set_noter(Noter noter) {
+        std::lock_guard lock(hook_mutex_);
+        noter_ = noter;
+    }
 
     std::size_t size() const { return count_.load(std::memory_order_acquire); }
     std::uint64_t invalidations() const { return invalidations_.load(std::memory_order_acquire); }
+    bool changed_ranges(uint64_t& cursor, DescriptorRanges& ranges) const {
+        std::shared_lock lock(mutex_);
+        return changes_.read(cursor, ranges);
+    }
+    // Bumped by every add and every removal: a copy of mappings() is current while it has not moved.
+    std::uint64_t generation() const { return generation_.load(std::memory_order_acquire); }
+    // Diagnostics (fsdraw): the title VA a shader VA was made from, the reverse of translate; a linear scan.
+    bool title_of_shader(std::uint64_t shader_va, std::uint64_t& title_va, std::uint64_t& range_va,
+                         std::uint64_t& range_bytes) const {
+        std::shared_lock lock(mutex_);
+        for (const auto& [va, r] : ranges_)
+            if (shader_va >= r.shader_va && shader_va - r.shader_va < r.end - va) {
+                title_va = va + (shader_va - r.shader_va);
+                range_va = va;
+                range_bytes = r.end - va;
+                return true;
+            }
+        return false;
+    }
+    // LEONIDA_CONSOLE_HEAP_GPU: the shader-VA ranges of the ranges removed (or replaced) since the last take, so a
+    // GPU table translated through them can drop what it derived. Nothing is kept until recording is turned on.
+    void record_removals(bool on) { record_removals_.store(on, std::memory_order_relaxed); }
+    void take_removed(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) {
+        out.clear();
+        if (!record_removals_.load(std::memory_order_relaxed)) return;
+        std::unique_lock lock(mutex_);
+        out.swap(removed_);
+    }
     void note_translation(Kind kind) { translated_[kind].fetch_add(1, std::memory_order_relaxed); }
     std::uint64_t translated(Kind kind) const { return translated_[kind].load(std::memory_order_relaxed); }
     std::uint64_t untranslated(Kind kind) const { return untranslated_[kind].load(std::memory_order_relaxed); }
@@ -331,19 +419,35 @@ private:
             if (previous->second.end > begin) it = previous;
         }
         if (it != ranges_.end() && it->first < end) invalidations_.fetch_add(1, std::memory_order_release);
-        while (it != ranges_.end() && it->first < end) it = ranges_.erase(it);
+        while (it != ranges_.end() && it->first < end) {
+            changes_.record(it->first, it->second.end - it->first);
+            by_shader_.erase(it->second.shader_va, it->first);
+            note_removed(it->second.shader_va, it->second.end - it->first);
+            it = ranges_.erase(it);
+        }
     }
 
+    // mutex_ held exclusively.
+    void note_removed(std::uint64_t shader_va, std::uint64_t bytes) {
+        if (record_removals_.load(std::memory_order_relaxed)) removed_.push_back({shader_va, bytes});
+    }
+
+    DescriptorRangeChanges changes_;
     mutable std::shared_mutex mutex_;
     std::map<std::uint64_t, Range> ranges_;  // by title VA
+    BufferVaIndex<std::uint64_t> by_shader_;  // the same ranges by shader VA (id: the title VA); copies may overlap
     std::atomic<std::size_t> count_{0};
     std::atomic<std::uint64_t> invalidations_{};
+    std::atomic<std::uint64_t> generation_{};
+    std::atomic<bool> record_removals_{false};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> removed_;  // (shader VA, bytes), when recorded
     std::mutex hook_mutex_;
     void* hook_context_ = nullptr;
     void* maker_context_ = nullptr;
     BufferMaker maker_ = nullptr;
     Resolver resolver_ = nullptr;
     TableScanner scanner_ = nullptr;
+    Noter noter_ = nullptr;
     void* source_context_ = nullptr;
     DescriptorSource source_ = nullptr;
     std::atomic<std::uint64_t> pulled_{0};
@@ -352,6 +456,7 @@ private:
     std::atomic<std::uint64_t> scans_{0}, scan_ns_{0}, scan_max_ns_{0};
     mutable std::shared_mutex memory_mutex_;
     std::map<std::uint64_t, std::uint64_t> memory_;  // the title's memory: base -> end
+    std::atomic<std::uint64_t> memory_generation_{};
 };
 
 // The process's table: the device's title ranges and hooks, read by the command lists and descriptor writers.
@@ -360,10 +465,23 @@ inline TitleVaAliases& title_va_aliases() {
     return aliases;
 }
 
-// One diagnostic per descriptor-writing path.
+// One diagnostic per descriptor-writing path. Called per descriptor write on the unbacked path, so the sites already
+// told (string literals: their addresses) are looked up without the lock first.
 inline void note_unbacked_view(const char* site, std::uint64_t va, std::uint64_t bytes) {
+    static std::atomic<const char*> told[8] = {};
+    for (const auto& t : told)
+        if (t.load(std::memory_order_relaxed) == site) return;
     static std::mutex mutex;
     static std::map<std::string, bool> sites;
+    {
+        std::lock_guard lock(mutex);
+        for (auto& t : told) {
+            const char* none = nullptr;
+            if (t.load(std::memory_order_relaxed) == site ||
+                t.compare_exchange_strong(none, site, std::memory_order_relaxed))
+                break;
+        }
+    }
     {
         std::lock_guard lock(mutex);
         if (!sites.emplace(site, true).second) return;

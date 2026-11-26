@@ -1211,7 +1211,7 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
-                      "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_barrier_early_end",
+                      "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w64x_partial_swizzle", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_barrier_early_end",
 "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_w64x_cmp_sdst", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_wrxchg2_ext", "cs_w32_wrxchg2st64", "cs_w32_andn2_exec",
                       "cs_mask_vgpr_exec", "cs_w32_exec_computed", "cs_w64_exec_computed"):
             cs_dump_wants = {
@@ -1303,6 +1303,7 @@ def run_suite(a, work: str) -> int:
                 "cs_w64x_lds_war": [1032, 1063, 1000, 1031, 2032, 2063, 2000, 2031],
                 "cs_w64x_partial": [40, 40, 528, 0, 0, 532, 539, 524820],
                 "cs_w64x_partial_scmp": [0, 1, 0, 1, 1, 1, 1, 0],     # s_cmp mask, -1 in a partial wave
+                "cs_w64x_partial_swizzle": [508, 523, 0, 0, 528, 0, 531, 0],   # swizzle from a missing lane: 0
                 "cs_w32_partial_scmp": [0, 1, 1, 0, 1, 1, 1, 1],      # the same in a 20-thread wave32
                 # ds_permute_b32 in a 20-thread wave32: a never-launched source lane sends nothing (.asm header)
                 "cs_w32_partial_permute": [0, 29, 127, 0, 1, 0, 134, 113],
@@ -1338,10 +1339,12 @@ def run_suite(a, work: str) -> int:
             # as check.py does, where the device has none
             # (vk_compute_test exits 77) instead of reporting a failure. With LEONIDA_W64_EMULATE=1 they were
             # translated with --wave64-emulate and run on any subgroup size.
-            # cs_w64x_partial and cs_w64x_partial_scmp (40-thread groups) can't have full subgroups: they ask for
-            # size 64 without them.
+            # cs_w64x_partial, cs_w64x_partial_scmp and cs_w64x_partial_swizzle (40-thread groups) can't have full
+            # subgroups: they ask for size 64 without them. With LEONIDA_W64_EMULATE=1 they ask for 32, the width the
+            # emulation is for, as check.py's partial_wave_test does. RADV defaults compute to 64, and there
+            # cs_w64x_partial_swizzle came out right even before its missing-lane reads were fixed; at 32 it did not.
             emulated = w64_emulated()
-            partial = name in ("cs_w64x_partial", "cs_w64x_partial_scmp")
+            partial = name in ("cs_w64x_partial", "cs_w64x_partial_scmp", "cs_w64x_partial_swizzle")
             wave64 = name not in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
                                   "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
                                   "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops",
@@ -1351,8 +1354,8 @@ def run_suite(a, work: str) -> int:
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
                                   "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_dpp_cmp", "cs_w32_andn2_exec",
                                   "cs_w32_exec_computed") and not emulated and not partial
-            if partial and not emulated:
-                cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
+            if partial:
+                cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="32" if emulated else "64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)
                 cs_env = dict(os.environ, **WAVE32_LANE_ENV)
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
