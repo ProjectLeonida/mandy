@@ -565,6 +565,7 @@ function applyTranslations() {
   document.getElementById('tex-heading').innerText = t.texHeading;
   const allChip = document.getElementById('chip-all');
   if (allChip) allChip.innerText = `${t.allCategories} (${allModels.length})`;
+  for (const { chip, cat, count } of categoryChips) chip.innerText = `${categoryLabel(cat)} (${count})`;
   if (texturesLoaded) document.getElementById('tex-count').innerText = `${allTextures.length} ${t.texCountSuffix}`;
   // Each stats label is the text node in front of its value (<div>Модель: <b id="stat-name">).
   for (const [id, key] of [['stat-name', 'statModel'], ['stat-category', 'statCategory'],
@@ -582,6 +583,7 @@ let selectedModel = null;
 const modelPages = new Map();
 let allTextures = [];
 let texturesLoaded = false;
+const categoryChips = [];  // { chip, cat, count } of the category filter chips, relabelled on a language switch
 let activeCategory = 'ALL';
 let modelSearchQuery = '';
 let texSearchQuery = '';
@@ -829,6 +831,7 @@ async function loadModels() {
 function renderCategoryChips(categories) {
   const container = document.getElementById('category-chips');
   container.innerHTML = '';
+  categoryChips.length = 0;
 
   const allChip = document.createElement('div');
   allChip.className = 'filter-chip active';
@@ -840,10 +843,17 @@ function renderCategoryChips(categories) {
   Object.entries(categories).forEach(([cat, count]) => {
     const chip = document.createElement('div');
     chip.className = 'filter-chip';
-    chip.innerText = `${cat} (${count})`;
+    chip.innerText = `${categoryLabel(cat)} (${count})`;
     chip.onclick = () => selectCategory(cat, chip);
     container.appendChild(chip);
+    categoryChips.push({ chip, cat, count });
   });
+}
+
+// The server names each category in both languages ("Транспорт (Vehicles)"); catNames gives the name to show, and
+// the server's name stays the filter key. A name catNames does not list is shown as it is.
+function categoryLabel(cat) {
+  return I18N[currentLang].catNames[cat] || cat;
 }
 
 function selectCategory(cat, chipElem) {
@@ -897,7 +907,7 @@ function renderAccordionList() {
     const header = document.createElement('div');
     header.className = 'cat-header';
     header.innerHTML = `
-      <span>${escapeHtml(cat)} <span class="badge">${list.length}</span></span>
+      <span>${escapeHtml(categoryLabel(cat))} <span class="badge">${list.length}</span></span>
       <span class="arrow">▼</span>
     `;
 

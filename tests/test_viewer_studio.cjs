@@ -213,6 +213,27 @@ test('switching to EU relabels the stats panel, the buttons, the texture gallery
     assert.equal(studio.elements.get('tex-count').innerText, 'Could not load the textures');
 });
 
+test('category chips and headers show the catNames of the chosen language and keep the server name as the filter', () => {
+    const studio = loadStudio();
+    studio.context.models = [
+        { name: 'car.glb', folder: 'veh', category: 'Транспорт (Vehicles)', size: 4, url: '/models/car.glb' },
+        { name: 'odd.glb', folder: 'x', category: 'Custom', size: 4, url: '/models/odd.glb' },
+    ];
+    studio.run(`allModels = models; renderCategoryChips({'Транспорт (Vehicles)': 1, Custom: 1}); renderAccordionList();`);
+    const chips = () => studio.elements.get('category-chips').children.slice(1).map(chip => chip.innerText);
+    const headers = () => studio.elements.get('model-list').children.map(group => visibleText(group.children[0].innerHTML).trim());
+    assert.deepEqual(chips(), ['Транспорт (1)', 'Custom (1)']);
+    assert.deepEqual(headers().map(text => text.split(/\s+/)[0]), ['Транспорт', 'Custom']);
+
+    studio.run(`setLanguage('eu')`);
+    assert.deepEqual(chips(), ['Vehicles (1)', 'Custom (1)']);
+    assert.deepEqual(headers().map(text => text.split(/\s+/)[0]), ['Vehicles', 'Custom']);
+    // The chip still filters by the server's name.
+    studio.run(`selectCategory('Транспорт (Vehicles)', document.getElementById('category-chips').children[1])`);
+    assert.equal(studio.run('activeCategory'), 'Транспорт (Vehicles)');
+    assert.deepEqual(headers().map(text => text.split(/\s+/)[0]), ['Vehicles']);
+});
+
 test('each model category pages independently, including a partial last page', () => {
     const studio = loadStudio();
     studio.context.models = ['Props', 'Vehicles'].flatMap(category => Array.from({ length: 101 }, (_, i) => ({
