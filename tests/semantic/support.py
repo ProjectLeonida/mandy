@@ -1,10 +1,13 @@
 """Shared helpers for the translator tests (standard library only)."""
 import gc
+import importlib.machinery
 import os
 import struct
 import sys
 import tempfile
 import warnings
+
+import piecewise_parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -12,8 +15,48 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
 FIXTURE_DIR = os.path.join(HERE, "fixtures", "disasm")
 
+
+class PiecewiseLoader(importlib.machinery.SourceFileLoader):
+    """Compiles a module from the tree piecewise_parse.py builds: the same code object as the usual loader's,
+    without the 6 s CPython 3.12 to 3.14.7 spends on rdna2spirv.py's f-strings when it parses the file as one
+    string. A valid .pyc is still used first, and a source the pieces cannot give goes to the usual compile."""
+
+    def source_to_code(self, data, path, *args, **kwargs):
+        try:
+            tree = piecewise_parse.parse_pieces(data, path)
+            if tree is not None:
+                return super().source_to_code(tree, path, *args, **kwargs)
+        except Exception:       # nothing to report from here: the usual compile says what is wrong, in its words
+            pass
+        return super().source_to_code(data, path, *args, **kwargs)
+
+
+class ToolsFinder:
+    """Hands the modules of TOOLS_DIR to PiecewiseLoader. It asks PathFinder, so sys.path decides which file a
+    name means exactly as it does without this finder; a name found anywhere else, or one that is not a plain
+    source file, is left to the finders after it."""
+
+    @staticmethod
+    def find_spec(name, path=None, target=None):
+        if path is not None or not os.path.isfile(os.path.join(TOOLS_DIR, name + ".py")):
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(name, path, target)
+        loader = getattr(spec, "loader", None)
+        if type(loader) is not importlib.machinery.SourceFileLoader or not _same_folder(loader.path, TOOLS_DIR):
+            return None
+        spec.loader = PiecewiseLoader(loader.name, loader.path)
+        return spec
+
+
+def _same_folder(path, folder):
+    return os.path.normcase(os.path.dirname(os.path.abspath(path))) == os.path.normcase(os.path.abspath(folder))
+
+
 sys.dont_write_bytecode = True      # never drop __pycache__ into the tree under test
 sys.path.insert(0, TOOLS_DIR)
+# Only where the tokenizer has that cost; just before PathFinder, which would otherwise load these modules.
+if piecewise_parse.needed() and importlib.machinery.PathFinder in sys.meta_path:
+    sys.meta_path.insert(sys.meta_path.index(importlib.machinery.PathFinder), ToolsFinder)
 import rdna2spirv  # noqa: E402  (path set above)
 from spirv_mini_interp import run_fragment  # noqa: E402
 
