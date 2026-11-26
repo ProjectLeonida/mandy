@@ -348,3 +348,84 @@ test('hostile texture preview URLs and format labels render escaped across both 
         }
     }
 });
+
+// A model as GLTFLoader returns it: two meshes share Body, a third has a material array, one node is not a mesh.
+function inspectedModel(bodyName = 'Body') {
+    const texture = image => ({ isTexture: true, image, dispose() {} });
+    const albedo = texture({ width: 1024, height: 512 });
+    const body = { name: bodyName, map: albedo, normalMap: texture({ naturalWidth: 512, naturalHeight: 512, width: 0 }),
+        roughnessMap: null, emissiveMap: albedo, aoMap: texture(null), dispose() {} };
+    const flat = { name: '', vertexColors: false, map: null, dispose() {} };
+    const painted = { name: 'Decals', vertexColors: true, map: null, dispose() {} };
+    const mesh = material => ({ isMesh: true, material, userData: {},
+        geometry: { attributes: { position: { count: 3 } }, index: null, dispose() {} } });
+    // disposeModel calls dispose() on a material array itself (claimed separately as VIEWER-DISPOSE-RESOURCES), so the
+    // array carries one: these tests are about the details panel, not disposal.
+    const nodes = [mesh(body), mesh(body), mesh(Object.assign([flat, painted], { dispose() {} })),
+        { isMesh: false, userData: {} }];
+    return { position: new Vector3(), userData: {}, traverse(visit) { visit(this); nodes.forEach(visit); } };
+}
+
+function materialRows(studio) {
+    return studio.elements.get('stat-material-list').innerHTML.split('<div class="mat-row">').slice(1);
+}
+
+test('the stats panel lists the model\'s size, meshes, materials and the textures each material uses', () => {
+    const studio = loadStudio();
+    studio.context.THREE.Box3 = class {
+        setFromObject() { return this; }
+        getCenter(v) { return v; }
+        getSize(v) { return Object.assign(v, { x: 4.5234, y: 1.4, z: 0.021549 }); }
+    };
+    studio.run(`setShadingMode('clay'); loadModel('/models/car.glb', 'car.glb', '', 1);`);
+    studio.loads[0].onLoad({ scene: inspectedModel() });
+    assert.equal(studio.elements.get('stat-dimensions').innerText, '4.52 × 1.4 × 0.0215 m');
+    // 3 meshes, 3 materials (clay mode shows the model's own, not the studio clay), 3 textures (albedo is used twice).
+    assert.equal(studio.elements.get('stat-parts').innerText, '3 / 3 / 3');
+    assert.equal(studio.elements.get('stat-materials').hidden, false);
+    const rows = materialRows(studio);
+    assert.deepEqual(rows.map(visibleText), [
+        'Body · мешей: 2map 1024×512normalMap 512×512emissiveMap 1024×512aoMap ?',
+        '(без имени) · мешей: 1без текстур',
+        'Decals · мешей: 1цвета вершин',
+    ]);
+    // Only the material with neither a texture nor vertex colours is marked.
+    assert.deepEqual(rows.map(row => row.includes('class="mat-none"')), [false, true, false]);
+});
+
+test('material names render as text and the details follow the language switch', () => {
+    const studio = loadStudio();
+    studio.run(`loadModel('/models/x.glb', 'x.glb', '', 1);`);
+    studio.loads[0].onLoad({ scene: inspectedModel(HOSTILE) });
+    const [hostile] = materialRows(studio);
+    assert.deepEqual(tagShape(hostile), ['<b>', '</b>', '<div class="">', '</div>', '<div class="">', '</div>',
+        '<div class="">', '</div>', '<div class="">', '</div>', '</div>']);
+    assert.ok(visibleText(hostile).startsWith(HOSTILE + ' · '));
+    studio.run(`setLanguage('eu')`);
+    assert.equal(studio.elements.get('t-stat-dimensions').innerText, 'Size (W × H × D):');
+    assert.equal(studio.elements.get('t-stat-parts').innerText, 'Meshes / materials / textures:');
+    assert.equal(studio.elements.get('t-stat-materials').innerText, 'Materials and textures');
+    assert.deepEqual(materialRows(studio).slice(1).map(visibleText),
+        ['(unnamed) · meshes: 1no texture', 'Decals · meshes: 1vertex colours']);
+});
+
+test('the details belong to the model shown: a failed load keeps them, an empty model hides the material list', () => {
+    const studio = loadStudio();
+    studio.run('renderModelDetails()');
+    assert.equal(studio.elements.get('stat-parts').innerText, '—');
+    assert.equal(studio.elements.get('stat-materials').hidden, true);
+    studio.run(`loadModel('/models/a.glb', 'a.glb', '', 1); loadModel('/models/b.glb', 'b.glb', '', 1);`);
+    studio.loads[1].onLoad({ scene: inspectedModel() });
+    studio.loads[0].onLoad({ scene: inspectedModel('stale') });
+    studio.run(`loadModel('/models/c.glb', 'c.glb', '', 1);`);
+    studio.loads[2].onError(new Error('download failed'));
+    assert.equal(studio.elements.get('stat-parts').innerText, '3 / 3 / 3');
+    assert.ok(visibleText(materialRows(studio)[0]).startsWith('Body · '));
+    // The default Box3 stub gives no numeric size: the panel says so instead of printing NaN.
+    assert.equal(studio.elements.get('stat-dimensions').innerText, '—');
+    studio.run(`loadModel('/models/empty.glb', 'empty.glb', '', 1);`);
+    studio.loads[3].onLoad({ scene: { position: new Vector3(), userData: {}, traverse(visit) { visit(this); } } });
+    assert.equal(studio.elements.get('stat-parts').innerText, '0 / 0 / 0');
+    assert.equal(studio.elements.get('stat-materials').hidden, true);
+    assert.equal(studio.elements.get('stat-material-list').innerHTML, '');
+});
