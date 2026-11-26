@@ -33,7 +33,7 @@ struct Write {
 };
 std::vector<Write> writes;
 std::uint32_t words[2 * DeviceMarkers::max_queues];
-bool mapped = false, unmapped = false, freed = false;
+bool mapped = false, unmapped = false, freed = false, fail_map = false;
 
 VKAPI_ATTR VkResult VKAPI_CALL create_buffer(VkDevice, const VkBufferCreateInfo* info, const VkAllocationCallbacks*,
                                              VkBuffer* buffer) {
@@ -52,6 +52,7 @@ VKAPI_ATTR VkResult VKAPI_CALL allocate(VkDevice, const VkMemoryAllocateInfo* in
 }
 VKAPI_ATTR VkResult VKAPI_CALL bind(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize) { return VK_SUCCESS; }
 VKAPI_ATTR VkResult VKAPI_CALL map(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkMemoryMapFlags, void** out) {
+    if (fail_map) return VK_ERROR_MEMORY_MAP_FAILED;
     std::memset(words, 0xcd, sizeof(words));
     *out = words;
     mapped = true;
@@ -295,6 +296,33 @@ int main() {
     if (int failed = recorded(true)) return failed;
     if (int failed = recorded(false)) return failed;
     if (int failed = extension_request()) return failed;
+    {
+        // Regression: memoryTypeCount > VK_MAX_MEMORY_TYPES must not read OOB or shift >= 32.
+        VkPhysicalDeviceMemoryProperties oversized{};
+        oversized.memoryTypeCount = VK_MAX_MEMORY_TYPES + 8;
+        EXPECT(DeviceMarkers::memory_type(oversized, 0xffffffffu) == UINT32_MAX);
+
+        // Regression: null get_proc_addr must return an error rather than dereferencing null.
+        DeviceMarkers null_loader;
+        EXPECT(null_loader.create(nullptr, VK_NULL_HANDLE, memory_types(), false) == VK_ERROR_EXTENSION_NOT_PRESENT);
+
+        // Regression: empty MarkerTarget must ignore started/finished safely.
+        MarkerTarget empty_target{};
+        empty_target.started(VK_NULL_HANDLE, 1);
+        empty_target.finished(VK_NULL_HANDLE, 1);
+
+        // Regression: failed vkMapMemory must not call vkUnmapMemory in ~DeviceMarkers.
+        mapped = unmapped = freed = false;
+        fail_map = true;
+        {
+            DeviceMarkers failed_map;
+            EXPECT(failed_map.create(get_proc, fake_handle<VkDevice>(1), memory_types(), false) ==
+                   VK_ERROR_MEMORY_MAP_FAILED);
+            EXPECT(!failed_map.ready());
+        }
+        fail_map = false;
+        EXPECT(!mapped && !unmapped && freed);
+    }
     std::puts("vulkan_device_markers: ok");
     return 0;
 }
