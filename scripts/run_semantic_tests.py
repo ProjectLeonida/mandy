@@ -98,11 +98,12 @@ BYTECODE_CACHE_VARIABLE = "LEONIDA_BYTECODE_CACHE"
 # stale, or was never written because the importing file sets `sys.dont_write_bytecode` (most of this suite does, to
 # keep `__pycache__` out of the tree), is compiled by the first child that needs it and read back by all the others.
 #
-# It matters because CPython tokenizes a source *string* in time quadratic in its f-string replacement fields: since
-# 3.12 every `{` copies the rest of the buffer (`update_fstring_expr` in 3.12's Parser/tokenizer.c). Importing
-# tools/rdna2spirv.py, 1.2 MB with some 4,800 f-strings, takes 7.2 s on 3.14.7 and 7.5 s on 3.13.13 (Windows 11; 0.1 s
-# of it is code generation) against under 0.1 s from bytecode, and each file of the suite paid that. Run as a script
-# the same file starts in 0.4 s, because a file is tokenized line by line.
+# It matters because CPython from 3.12 up to 3.13.15 and 3.14.7 tokenizes a source *string* in time quadratic in its
+# f-string replacement fields: every `{` copies the rest of the buffer (`update_fstring_expr` in 3.12's
+# Parser/tokenizer.c). 3.13.16, 3.14.8 and 3.15.0 fixed that (gh-155525); 3.12.16 still has it, and CI runs 3.12.
+# Importing tools/rdna2spirv.py, 1.2 MB with some 4,800 f-strings, takes 7.2 s on 3.14.7 and 7.5 s on 3.13.13
+# (Windows 11; 0.1 s of it is code generation) against under 0.1 s from bytecode, and each file of the suite paid
+# that. Run as a script the same file starts in 0.4 s, because a file is tokenized line by line.
 #
 # `source_to_code` is what the import system calls when it has no valid bytecode file for a module, so a module whose
 # `__pycache__` entry is current never comes here. An entry is named after the path and the bytes of the source it was
