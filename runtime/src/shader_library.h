@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -873,6 +874,8 @@ struct ShaderEntry {
     std::vector<std::uint32_t> outputs;             // pixel/vertex shaders: output locations written
     // --f16-interp-fallback: param/attr index -> {low_half_location, high_half_location} (SHADER-378).
     std::map<std::uint32_t, std::array<std::uint32_t, 2>> f16_halves;
+    // --bary-fallback: input location where a pass-through GS supplies one-hot barycentrics (RT-BARY-FALLBACK-PSO).
+    std::optional<std::uint32_t> bary_fallback_location;
     // The S#s the shader builds from immediates (the index's literal_samplers): no heap slot names them, so a
     // pipeline that uses the shader registers them in the bindless set itself (docs/design.md, Literal samplers).
     std::vector<std::array<std::uint32_t, 4>> literal_samplers;
@@ -1299,6 +1302,13 @@ private:
                     }
                     if (!ok) continue;
                     e.f16_halves[std::uint32_t(param)] = {u32(&val.array[0]), u32(&val.array[1])};
+                }
+            }
+            if (const Json* bf = meta.find("bary_fallback_input"); bf && bf->kind == Json::Kind::object) {
+                if (const Json* loc = bf->find("location"); loc && loc->kind == Json::Kind::number &&
+                    loc->number >= 0.0 && loc->number <= 4294967295.0 &&
+                    double(std::uint32_t(loc->number)) == loc->number) {
+                    e.bary_fallback_location = std::uint32_t(loc->number);
                 }
             }
             if (const Json* l = meta.find("literal_samplers"); l && l->kind == Json::Kind::array) {

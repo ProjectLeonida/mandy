@@ -497,6 +497,8 @@ private:
         enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
         enable.dualSrcBlend = features.features.dualSrcBlend;  // d3d12_translated_draw_test --dual-source
         enable.depthBounds = features.features.depthBounds;  // depth-bounds PSOs (d3d12_mesh_test), where available
+        enable.shaderClipDistance = features.features.shaderClipDistance;  // d3d12_bary_fallback_test, where available
+        enable.shaderCullDistance = features.features.shaderCullDistance;  // d3d12_bary_fallback_test, where available
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.

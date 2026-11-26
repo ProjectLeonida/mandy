@@ -1289,6 +1289,40 @@ int main() {
 
     CHECK(huffman_lut_checks() == 0);
 
+    // bary_fallback_input.location: exact non-negative u32 parsed; absent or malformed values stay nullopt.
+    {
+        const auto dir = std::filesystem::temp_directory_path() / "leonida_shader_library_bary_test";
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+        const std::string h0(64, 'a'), h1(64, 'b'), h2(64, 'c'), h3(64, 'd'), h4(64, 'e');
+        {
+            std::ofstream out(dir / "index.json", std::ios::binary | std::ios::trunc);
+            out << "{\"ps_ok\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << h0
+                << "\", \"bary_fallback_input\": {\"location\": 3}},\n"
+                   " \"ps_zero\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << h1
+                << "\", \"bary_fallback_input\": {\"location\": 0}},\n"
+                   " \"ps_neg\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << h2
+                << "\", \"bary_fallback_input\": {\"location\": -1}},\n"
+                   " \"ps_frac\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << h3
+                << "\", \"bary_fallback_input\": {\"location\": 1.5}},\n"
+                   " \"ps_none\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << h4 << "\"}}";
+        }
+        ShaderLibrary lib;
+        std::string err;
+        CHECK(lib.load(dir, &err));
+        const ShaderEntry* ok = lib.find("ps", h0);
+        const ShaderEntry* zero = lib.find("ps", h1);
+        const ShaderEntry* neg = lib.find("ps", h2);
+        const ShaderEntry* frac = lib.find("ps", h3);
+        const ShaderEntry* none = lib.find("ps", h4);
+        CHECK(ok && ok->bary_fallback_location.has_value() && *ok->bary_fallback_location == 3u);
+        CHECK(zero && zero->bary_fallback_location.has_value() && *zero->bary_fallback_location == 0u);
+        CHECK(neg && !neg->bary_fallback_location.has_value());
+        CHECK(frac && !frac->bary_fallback_location.has_value());
+        CHECK(none && !none->bary_fallback_location.has_value());
+        std::filesystem::remove_all(dir);
+    }
+
     std::printf("SHA-256, inflate (stored/fixed/dynamic), JSON, FSSM extraction, FSPX programs and index lookup OK\n");
     return 0;
 }
