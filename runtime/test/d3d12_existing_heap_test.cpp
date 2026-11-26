@@ -223,7 +223,7 @@ int check_import(ID3D12Device* device, bool supported) {
 // pagefile-backed section with EPERM (measured on an RX 9060 XT under Wine, found in review), while NVIDIA and
 // AMD's Windows driver import it. The fallback is checked to exist; the readback below needs the import. Since the shadow fallback
 // keeps the title's VA, a refused import still reads back through the shadow.
-int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT64 size, bool may_refuse = false) {
+int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT64 size, bool may_refuse = false, bool buffers_only = false) {
     const char* who = "vulkan slot-133 buffer";
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -231,6 +231,8 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    const std::vector<std::uint8_t> initial(static_cast<std::uint8_t*>(pages),
+                                             static_cast<std::uint8_t*>(pages) + size);
     Ref<ID3D12Resource> buffer;
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer.p)), S_OK);
     if (may_refuse && buffer->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages)) {
@@ -239,6 +241,7 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
         return 0;
     }
     EXPECT(buffer->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages));
+    EXPECT(std::memcmp(pages, initial.data(), initial.size()) == 0);
     auto* bytes = static_cast<std::uint8_t*>(pages);
     for (UINT64 i = 0; i < size; ++i) bytes[i] = static_cast<std::uint8_t>(i * 131u + 7u);
 
@@ -271,6 +274,102 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     const bool same = std::memcmp(mapped, pages, static_cast<size_t>(size)) == 0;
     readback->Unmap(0, nullptr);
     EXPECT(same);
+
+    // Reverse the copy: a real import writes the caller's pages, including for sub-page allocations.
+    D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+    Ref<ID3D12Resource> upload;
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                     D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                     IID_PPV_ARGS(&upload.p))));
+    std::vector<std::uint8_t> reversed(static_cast<size_t>(size));
+    for (size_t i = 0; i < reversed.size(); ++i) reversed[i] = static_cast<std::uint8_t>(i * 17u + 0x39u);
+    EXPECT(SUCCEEDED(upload->Map(0, nullptr, &mapped)));
+    std::memcpy(mapped, reversed.data(), reversed.size());
+    upload->Unmap(0, nullptr);
+    EXPECT(SUCCEEDED(allocator->Reset()));
+    EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {buffer.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST};
+    list->ResourceBarrier(1, &barrier);
+    list->CopyBufferRegion(buffer.p, 0, upload.p, 0, size);
+    EXPECT(SUCCEEDED(list->Close()));
+    queue->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+    EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)));
+    done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    EXPECT(done != nullptr && SUCCEEDED(fence->SetEventOnCompletion(2, done)));
+    const DWORD waited = WaitForSingleObject(done, 10000);
+    CloseHandle(done);
+    EXPECT(waited == WAIT_OBJECT_0);
+    // A refused import (`may_refuse`) is a shadow at the same VA: filled from the pages before every submission but
+    // never written back, so only a real import shows the copy in the caller's pages.
+    if (!(may_refuse && rt::d3d12::title_shadow_buffer(buffer.p))) {
+        EXPECT(std::memcmp(pages, reversed.data(), reversed.size()) == 0);
+    }
+
+    if (buffers_only) {
+        // RGBA16 requires an 8-byte Vulkan buffer-image offset, while an imported host prefix may be +4.
+        // Exercise both directions and verify every untouched host byte, including row padding.
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = 1;
+        td.Height = 2;
+        td.DepthOrArraySize = td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+        td.SampleDesc.Count = 1;
+        D3D12_HEAP_PROPERTIES gpu_heap{D3D12_HEAP_TYPE_DEFAULT};
+        Ref<ID3D12Resource> image;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&gpu_heap, D3D12_HEAP_FLAG_NONE, &td,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&image.p))));
+        D3D12_TEXTURE_COPY_LOCATION linear{};
+        linear.pResource = buffer.p;
+        linear.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        linear.PlacedFootprint.Footprint = {td.Format, 1, 2, 1, 256};
+        D3D12_TEXTURE_COPY_LOCATION tex{};
+        tex.pResource = image.p;
+        tex.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        barrier.Transition = {buffer.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        list->ResourceBarrier(1, &barrier);
+        list->CopyTextureRegion(&tex, 0, 0, 0, &linear, nullptr);
+        EXPECT(SUCCEEDED(list->Close()));
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)));
+        done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        EXPECT(done && SUCCEEDED(fence->SetEventOnCompletion(3, done)));
+        const DWORD uploaded = WaitForSingleObject(done, 10000);
+        CloseHandle(done);
+        EXPECT(uploaded == WAIT_OBJECT_0);
+        std::memset(pages, 0x6d, static_cast<size_t>(size));
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        D3D12_RESOURCE_BARRIER transitions[2] = {barrier, barrier};
+        transitions[0].Transition = {image.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        transitions[1].Transition = {buffer.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                     D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST};
+        list->ResourceBarrier(2, transitions);
+        list->CopyTextureRegion(&linear, 0, 0, 0, &tex, nullptr);
+        EXPECT(SUCCEEDED(list->Close()));
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 4)));
+        done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        EXPECT(done && SUCCEEDED(fence->SetEventOnCompletion(4, done)));
+        const DWORD downloaded = WaitForSingleObject(done, 10000);
+        CloseHandle(done);
+        EXPECT(downloaded == WAIT_OBJECT_0);
+        for (size_t i = 0; i < static_cast<size_t>(size); ++i) {
+            const bool texel = i < 8 || (i >= 256 && i < 264);
+            EXPECT(bytes[i] == (texel ? reversed[i] : 0x6d));
+        }
+        return 0;
+    }
 
     D3D12_RESOURCE_DESC texture = desc;
     texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -480,6 +579,25 @@ int check_title_placed_shadow(ID3D12Device* device, const char* kind, void* page
     return 0;
 }
 
+// Independent of OpenExistingHeapFromAddress: only actual imported-buffer copies and surrounding-byte checks.
+int check_host_prefix_buffers(ID3D12Device* device) {
+    constexpr SIZE_T size = 4 * 0x10000;
+    auto* pages = static_cast<unsigned char*>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!pages) return 1;
+    int failures = 0;
+    for (unsigned prefix : {0u, 4u, 8u, 16u, 32u, 64u}) {
+        std::memset(pages, 0xa5, size);
+        failures += check_title_placed(device, "host prefix buffer", pages + prefix, 0x1000 - prefix,
+                                      false, true);
+        for (unsigned i = 0; i < prefix; ++i) failures += pages[i] != 0xa5;
+        for (SIZE_T i = 0x1000; i < size; ++i) failures += pages[i] != 0xa5;
+    }
+    VirtualFree(pages, 0, MEM_RELEASE);
+    std::printf("host prefix buffers: 0/4/8/16/32/64-byte offsets, bidirectional buffer/texture copies and surrounding bytes: %s\n",
+                failures ? "FAIL" : "PASS");
+    return failures;
+}
+
 int check_title_placed_all(ID3D12Device* device) {
     constexpr SIZE_T size = 4 * 0x10000;
     int failures = 0;
@@ -490,6 +608,7 @@ int check_title_placed_all(ID3D12Device* device) {
     // Inside a page, as the title places small UAV buffers (64-byte aligned, found in review on an RTX 5090): the
     // import starts at the page and the buffer is bound at the offset.
     failures += check_title_placed(device, "64 bytes into a page", static_cast<char*>(pages) + 64, 0x1000 - 64);
+    failures += check_host_prefix_buffers(device);
     VirtualFree(pages, 0, MEM_RELEASE);
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(size), nullptr);
     void* view = section ? MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size) : nullptr;
@@ -1283,6 +1402,58 @@ int check_mapped_plane(ID3D12Device* device) {
     return 0;
 }
 
+// LEONIDA_TEXTURE_REFRESH_ASYNC=1 (the d3d12_mapped_plane_async test): a texture the title maps and writes, and then
+// reads on the GPU in its very first submission, has its bytes there, though the refresh pass runs on a worker: the
+// submission fills a mapped texture that was never filled before it records anything (fill_first_mapped_textures).
+int check_mapped_plane_first_use(ID3D12Device* device) {
+    const char* who = "persistent slot-133 plane, first use";
+    constexpr UINT width = 256, height = 8, size = width * height;
+    void* pages = VirtualAlloc(nullptr, 65536, MEM_RESERVE, PAGE_NOACCESS);
+    EXPECT(pages);
+    EXPECT(VirtualAlloc(pages, size, MEM_COMMIT, PAGE_READWRITE) == pages);
+    std::memset(pages, 61, size);
+    GpuReader gpu;
+    EXPECT(!gpu.init(device, size));
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.Format = DXGI_FORMAT_R8_UNORM;
+    desc.SampleDesc.Count = desc.DepthOrArraySize = desc.MipLevels = 1;
+    leonida::title_xg_layouts::note({UINT(desc.Dimension), UINT(desc.Format), height, 1, 1, width}, 1);
+    Ref<ID3D12Resource> texture;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 6, IID_PPV_ARGS(&texture.p)), S_OK);
+    void* mapped = nullptr;
+    EXPECT_HR(texture->Map(0, nullptr, &mapped), S_OK);
+    EXPECT(mapped == pages);
+    EXPECT_HR(gpu.allocator->Reset(), S_OK);
+    EXPECT_HR(gpu.list->Reset(gpu.allocator.p, nullptr), S_OK);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Transition = {texture.p, 0, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE};
+    gpu.list->ResourceBarrier(1, &barrier);
+    D3D12_TEXTURE_COPY_LOCATION src{texture.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    D3D12_TEXTURE_COPY_LOCATION dst{gpu.readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    dst.PlacedFootprint.Footprint = {desc.Format, width, height, 1, width};
+    gpu.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    EXPECT_HR(gpu.list->Close(), S_OK);
+    ID3D12CommandList* lists[]{gpu.list.p};
+    gpu.queue->ExecuteCommandLists(1, lists);
+    EXPECT_HR(gpu.queue->Signal(gpu.fence.p, 1), S_OK);
+    EXPECT_HR(gpu.fence->SetEventOnCompletion(1, gpu.done), S_OK);
+    EXPECT(WaitForSingleObject(gpu.done, 30000) == WAIT_OBJECT_0);
+    void* read = nullptr;
+    EXPECT_HR(gpu.readback->Map(0, nullptr, &read), S_OK);
+    const auto* bytes = static_cast<const std::uint8_t*>(read);
+    const bool filled = std::all_of(bytes, bytes + size, [](auto value) { return value == 61; });
+    gpu.readback->Unmap(0, nullptr);
+    EXPECT(filled);
+    texture->Unmap(0, nullptr);
+    texture.p->Release();
+    texture.p = nullptr;
+    VirtualFree(pages, 0, MEM_RELEASE);
+    return 0;
+}
+
 // Several threads write the same watched pages while submissions keep making them read-only again. Two threads that
 // fault on one page race: the first fault reopens it, a submission can protect it again before the second fault is
 // handled, and the second write must still be retried, not refused (refused, the process ends: seen natively). After
@@ -1869,7 +2040,11 @@ void print_cases(const std::vector<Case>& cases, const char* who) {
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool prefix_only = argc == 2 && std::strcmp(argv[1], "--host-prefix-only") == 0;
+    const bool async_plane = argc == 2 && std::strcmp(argv[1], "--mapped-plane-async") == 0;
+    if (argc != 1 && !prefix_only && !async_plane) return 2;
+    if (async_plane) _putenv_s("LEONIDA_TEXTURE_REFRESH_ASYNC", "1");  // read once, at the device's first refresh
     _putenv_s("LEONIDA_TITLE_TEXTURE_PERIOD_MS", "0");
     _putenv_s("LEONIDA_TITLE_TEXTURE_CHECK_KB", "0");
     vktest::Device vk;
@@ -1892,6 +2067,20 @@ int main() {
         info.bindless_partially_bound = vk.partially_bound;
         info.robust_image_access = vk.robust_image_access;  // a Texture3D UAV is bound only with it
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
+        if (prefix_only) {
+            if (!vk.host_pointer_alignment) return 77;
+            const int result = check_host_prefix_buffers(ours.p);
+            return result || vk.validation_errors() ? 1 : 0;
+        }
+        if (async_plane) {
+            int result = vk.host_image_copy ? check_mapped_plane_first_use(ours.p) : 0;
+            auto no_host_copy = info;  // the staged upload too
+            no_host_copy.host_image_copy = false;
+            Ref<ID3D12Device> staged;
+            if (FAILED(rt::d3d12::create_vulkan_device(no_host_copy, IID_PPV_ARGS(&staged.p)))) return 1;
+            result += check_mapped_plane_first_use(staged.p);
+            return result || vk.validation_errors() ? 1 : 0;
+        }
         failures += check(ours.p, "vulkan");
         const std::vector<Case> vulkan_cases = open_cases(ours.p);
         print_cases(vulkan_cases, "vulkan");
@@ -1903,6 +2092,15 @@ int main() {
             failures += check_shared_bc_placements(ours.p);
             failures += check_mapped_plane(ours.p);
             failures += check_mapped_bc_array(ours.p);
+        }
+        {
+            // Without host image copies a title image is filled through the staged upload, a linear plane too.
+            auto no_host_copy = info;
+            no_host_copy.host_image_copy = false;
+            Ref<ID3D12Device> staged;
+            if (FAILED(rt::d3d12::create_vulkan_device(no_host_copy, IID_PPV_ARGS(&staged.p)))) return 1;
+            failures += check_mapped_plane(staged.p);
+            failures += check_mapped_bc_array(staged.p);
         }
         failures += check_written_pages_all(ours.p);
         {
