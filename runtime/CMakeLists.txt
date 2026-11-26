@@ -2793,6 +2793,10 @@ if(TARGET Vulkan::Headers)
     # LEONIDA_TEXTURE_REFRESH_ASYNC=1 (set by the test itself): a mapped plane's first submission reads its bytes.
     add_test(NAME d3d12_mapped_plane_async COMMAND d3d12_existing_heap_test --mapped-plane-async)
     set_tests_properties(d3d12_mapped_plane_async PROPERTIES SKIP_RETURN_CODE 77)
+    # LEONIDA_TITLE_FILL_ASYNC=1 and a slow fill worker (set by the test itself): a staged slot-70 texture's T# names
+    # its image only once its first upload is submitted (RT-TITLE-TEXTURE-SHOW-AFTER-UPLOAD).
+    add_test(NAME d3d12_title_show_after_upload COMMAND d3d12_existing_heap_test --title-show-after-upload)
+    set_tests_properties(d3d12_title_show_after_upload PROPERTIES SKIP_RETURN_CODE 77)
     # The same with write watching off: the guarded cases only, the concurrent writers among them.
     add_test(NAME d3d12_existing_heap_no_write_watch COMMAND d3d12_existing_heap_test)
     set_tests_properties(d3d12_existing_heap_no_write_watch PROPERTIES SKIP_RETURN_CODE 77
