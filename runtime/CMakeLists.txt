@@ -4815,6 +4815,12 @@ if(TARGET Vulkan::Headers)
       target_compile_options(shadow_keep_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME shadow_keep COMMAND shadow_keep_test)
+    # The host's reads of title pages only xmem's frame table holds (src/title_frames.h).
+    add_executable(title_frames_test test/title_frames_test.cpp)
+    if(WIN32 AND MSVC)
+      target_compile_options(title_frames_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME title_frames COMMAND title_frames_test)
     # Queue construction cleans its Vulkan handles if holder registration runs out of host memory.
     # Which title textures the refresh looks at: only those something says changed (src/title_texture_watch.h).
     add_executable(title_texture_watch_test test/title_texture_watch_test.cpp)

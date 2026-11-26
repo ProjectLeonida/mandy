@@ -244,6 +244,14 @@ inline bool read_value(std::uint64_t address, bool wide, std::uint64_t& value) {
     value = 0;
     if (!address) return false;
     const SIZE_T bytes = wide ? 8 : 4;
+    // A page xmem's frame table holds (no host view: src/title_frames.h) is read in its frame, in one access when the
+    // value is aligned (it then lies inside one page).
+    leonida::title_frames::Frame frame;
+    if (address % bytes == 0 && leonida::title_frames::find(static_cast<std::uintptr_t>(address), frame)) {
+        value = wide ? reinterpret_cast<const volatile std::uint64_t*>(frame.bytes)[0]
+                     : reinterpret_cast<const volatile std::uint32_t*>(frame.bytes)[0];
+        return true;
+    }
     const auto* at = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address));
     std::uint64_t last = 0;
     for (int attempt = 0; attempt < 4; ++attempt) {
