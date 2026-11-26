@@ -81,7 +81,7 @@ def instructions(lines):
 
 def classify(window, base, stored):
     """Look back from a store-back of `stored` into [base+18h]. Return a site dict or None."""
-    chain, size, load, bases, broken = {stored}, 0, None, {base}, False
+    chain, size, load, load_base, bases, broken = {stored}, 0, None, None, {base}, False
     touched = {stored}  # every register the cursor passed through, for counting stores
     span = []
     for addr, mnem, ops in reversed(window):
@@ -91,8 +91,8 @@ def classify(window, base, stored):
         if mnem == "mov" and (cp := COPY.match(ops)) and cp.group(1) in bases:
             bases.add(cp.group(2))  # `mov rbx,rcx`: the list is in both
         if load is None and not broken:
-            if mnem == "mov" and (lm := LOAD.match(ops)) and lm.group(1) in chain and lm.group(2) in bases:
-                load = addr
+            if mnem == "mov" and (lm := LOAD.match(ops)) and lm.group(1) in chain:
+                load, load_base = addr, lm.group(2)  # its base is checked after the walk, below
             elif mnem == "lea" and (le := LEA.match(ops)) and le.group(1) in chain:
                 chain.discard(le.group(1))  # defined here; older values of it are not the cursor
                 chain.add(le.group(2))
@@ -102,6 +102,10 @@ def classify(window, base, stored):
                 size += int(am.group(2), 16)
             elif ops.split(",", 1)[0] in chain and mnem not in ("cmp", "test") and not mnem.startswith("j"):
                 broken = True  # the stored value was computed from something other than the cursor
+    # The walk runs backwards, so a copy `mov rbx,rcx` that comes before a load through rcx is only seen after the
+    # load: check the load's base against every register the list was copied through.
+    if load is not None and load_base not in bases:
+        load, broken = None, True  # the cursor came from another structure's +18h
     span.reverse()
     stores, header, limit, target, evidence = 0, None, None, None, False
     limit_regs = {}  # register -> limit offset, for `mov rdx,[list+30h]` ... `cmp rcx,rdx`
