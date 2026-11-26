@@ -20,6 +20,11 @@ but won't do it yourself? Post `finding: <one line>` there, with where it is and
 list for others. When two pull requests overlap anyway, the one that lands first is merged and the other is asked to
 rebase or close. Pull requests target `main`.
 
+GitHub's search does not find pull requests by the files they change. `python -I scripts/pr_overlap.py <file or
+folder>...` lists the open pull requests that change them, from git alone (no token, no API call). Run with no
+argument on your branch, it lists the ones that change what the branch changes and says which of them it conflicts
+with, which is what the template's `Depends on:` line asks for.
+
 The original repository (`ItsNotRexed/Leonida`) went private on 23 November 2026, and its issues and pull requests
 went with it. A `#N` in the docs, in a code comment or in a commit message from before that date is an **old**
 number and links nowhere now, including the two this page used to send you to: #166 (GPU test results) and #313
