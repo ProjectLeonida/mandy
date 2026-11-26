@@ -1,16 +1,17 @@
-"""Computed I/J interpolation without PerVertexKHR (--f16-interp-fallback and --bary-fallback).
+"""Computed I/J interpolation without PerVertexKHR (--f16-interp-fallback).
 
 Verifies the uniform %entry screen-quad barycentric Jacobian lowering (OpCapability DerivativeControl +
-OpDPdxFine / OpDPdyFine + integer IEEE-754 normal determinant guard):
-  * exact perspective-projected 2x2 pixel quad evaluation (w0 != w1 != w2) for snapped constants,
-    zeroed provoking-vertex reads, sub-pixel offsets, halved weights, and J written between p1 and p2;
-  * --f16-interp-fallback (alone and combined with --bary-fallback) on both f32 and decoded low/high f16
-    attributes, including dynamic f16_halves packing and bary_fallback_gs pass-through compatibility;
+FragmentBarycentricKHR + OpDPdxFine / OpDPdyFine + integer IEEE-754 normal determinant guard):
+  * exact perspective-projected 2x2 pixel quad evaluation (w0 != w1 != w2) at 64x64 and 1920x1080 for
+    snapped constants, zeroed provoking-vertex reads, sub-pixel offsets, halved weights, and J written
+    between p1 and p2;
+  * --f16-interp-fallback (without --bary-fallback) on both f32 and decoded low/high f16 attributes,
+    including fragmentShaderBarycentric feature recording and v_interp_p1lv_f16 vsrc2 invariance;
   * non-uniform per-lane branching / EXEC masking (all OpDPdxFine / OpDPdyFine instructions stay in %entry);
   * degenerate zero-area, signed-zero, subnormal, infinite, and NaN barycentric determinants fall back
     cleanly to P_c without OpFDiv-by-zero or non-finite contamination;
-  * existing refusals (mixed flat+smooth f32, v_interp_mov_f32 p10/p20, computed f32 on 16-bit-flagged
-    interpolant) remain intact.
+  * existing refusals (--bary-fallback, mixed flat+smooth f32, v_interp_mov_f32 p10/p20, computed f32 on
+    16-bit-flagged interpolant) remain intact.
 
 Hand-written synthetic programs only; no game files.
 """
@@ -29,7 +30,6 @@ import unittest
 import support
 import rdna2spirv
 import spirv_asm
-import bary_fallback_gs
 from spirv_mini_interp import f32, half_to_float, run_quad
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -159,6 +159,8 @@ class ComputedIJDerivativeFallbackTests(unittest.TestCase):
         self.assertNotIn("PerVertexKHR", spv)
         self.assertIn("OpDecorate %bary BuiltIn BaryCoordKHR", spv)
         self.assertIn("DerivativeControl", meta["capabilities"])
+        self.assertIn("FragmentBarycentricKHR", meta["capabilities"])
+        self.assertIn("fragmentShaderBarycentric", meta["features"])
         self.assertNotIn("DerivativeControl", meta["features"])
         quad, ij = perspective_quad_inputs(spv, ortho_verts, {0: uv_words}, pixel_xy=(16.5, 24.5))
         outs = run_quad(spv, lambda lane: quad[lane])
@@ -306,6 +308,98 @@ class ComputedIJDerivativeFallbackTests(unittest.TestCase):
                 "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
                 "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm",
             ], f16=True, fssm=bytes(fssm))
+
+    def test_p1lv_f16_computed_ij_uses_interpolated_attribute_not_vsrc2(self):
+        """Like the non-computed path, computed-I/J v_interp_p1lv_f16 takes P_0 from the interpolated attribute
+        rather than reading vsrc2: varying v10 leaves %reg_v10 unread and produces identical quad outputs."""
+        def make_lines(v10_imm: str) -> list[str]:
+            return [
+                f"v_mov_b32_e32 v10, {v10_imm}",
+                "v_mov_b32_e32 v0, 0.25",
+                "v_mov_b32_e32 v1, 0.5",
+                "v_interp_p1lv_f16 v2, v0, attr1.x, v10",
+                "v_interp_p2_f16 v2, v1, attr1.x, v2",
+                "exp mrt0 v2, v2, v2, v2 done vm",
+                "s_endpgm",
+            ]
+
+        spv_zero, _ = translate_with("ps_p1lv_ij_0", make_lines("0"), f16=True, bary=False)
+        spv_one, _ = translate_with("ps_p1lv_ij_1", make_lines("0x3f800000"), f16=True, bary=False)
+        self._validate_spirv(spv_zero)
+        self._validate_spirv(spv_one)
+        self.assertIn("OpStore %reg_v10 ", spv_zero)
+        self.assertIn("OpStore %reg_v10 ", spv_one)
+        self.assertNotIn("OpLoad %uint %reg_v10", spv_zero)
+        self.assertNotIn("OpLoad %uint %reg_v10", spv_one)
+        strip_v10 = lambda s: [ln for ln in s.splitlines()
+                               if "OpStore %reg_v10 " not in ln and not ln.startswith("%c3f800000 =")]
+        self.assertEqual(strip_v10(spv_zero), strip_v10(spv_one))
+
+        quad0, _ = perspective_quad_inputs(spv_zero, self.VERTS_PERSP, {1: self.ATTR1_WORDS})
+        quad1, _ = perspective_quad_inputs(spv_one, self.VERTS_PERSP, {1: self.ATTR1_WORDS})
+        outs0 = run_quad(spv_zero, lambda lane: quad0[lane])
+        outs1 = run_quad(spv_one, lambda lane: quad1[lane])
+        # LO_HALVES = (1.5, 3.5, 5.5) at (0.25, 0.5) -> 1.5 + 0.25*2.0 + 0.5*4.0 = 4.0 (f16 0x4400).
+        for lane in range(4):
+            self.assertEqual(outs0[lane]["%out_mrt0"], outs1[lane]["%out_mrt0"])
+            self.assertEqual(outs0[lane]["%out_mrt0"][0] & 0xFFFF, 0x4400)
+
+    def test_1080p_perspective_precision_subpixel_vs_full_viewport_jump(self):
+        """At 1920x1080 with perspective W = (1.0, 2.5, 4.0), sub-pixel barycentric shifts stay within ~5e-6, while
+        ~1,000-pixel jumps to fixed constants reflect 1-pixel binary32 input quantization (< 2e-3, <= 1 f16 ulp) and
+        agree with an exact binary64 Jacobian solve on the same binary32 quad inputs within 2e-6."""
+        verts_1080p = ((0.0, 0.0, 1.0), (1920.0, 0.0, 2.5), (0.0, 1080.0, 4.0))
+        subpix_lines = [
+            "v_add_f32_e32 v8, 0x38800000, v0",     # I + 2^-14 (~0.1 px at 1080p)
+            "v_add_f32_e32 v9, 0xb8800000, v1",     # J - 2^-14
+            "v_interp_p1_f32_e32 v2, v8, attr0.y",
+            "v_interp_p2_f32_e32 v2, v9, attr0.y",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv_sub, _ = translate_with("ps_ij_1080p_sub", subpix_lines, f16=True, bary=False)
+        self._validate_spirv(spv_sub)
+
+        raw_lines = [ln for ln in FIXTURE.read_text(encoding="utf-8").splitlines()
+                     if ln.strip() and not ln.strip().startswith(";")]
+        spv_fix, _ = translate_with("ps_ij_1080p_fix", raw_lines, f16=True, bary=False)
+        attrs = {0: self.ATTR0_WORDS, 1: self.ATTR1_WORDS}
+        p0_y, p1_y, p2_y = (v[1] for v in self.ATTR0_FLOATS)
+        delta = bits_f32(0x38800000)
+
+        for qx, qy in ((1794.5, 50.5), (1580.5, 96.5), (640.5, 360.5), (32.5, 900.5)):
+            with self.subTest(quad_xy=(qx, qy)):
+                q_sub, ij_sub = perspective_quad_inputs(spv_sub, verts_1080p, {0: self.ATTR0_WORDS}, pixel_xy=(qx, qy))
+                outs_sub = run_quad(spv_sub, lambda lane, qs=q_sub: qs[lane])
+                for lane in range(4):
+                    it = f32(ij_sub[lane][0] + delta)
+                    jt = f32(ij_sub[lane][1] - delta)
+                    want_sub = p0_y + it * (p1_y - p0_y) + jt * (p2_y - p0_y)
+                    self.assertLess(abs(bits_f32(outs_sub[lane]["%out_mrt0"][0]) - want_sub), 5e-6)
+
+                q_fix, ij_fix = perspective_quad_inputs(spv_fix, verts_1080p, attrs, pixel_xy=(qx, qy))
+                outs_fix = run_quad(spv_fix, lambda lane, qf=q_fix: qf[lane])
+                for lane in range(4):
+                    got = [bits_f32(w) for w in outs_fix[lane]["%out_mrt0"]]
+                    if ij_fix[lane][0] > f32(0.2):
+                        # Binary64 Jacobian solve on the identical binary32 quad inputs: proves error is input rounding.
+                        x0, x1 = lane & ~1, (lane & ~1) | 1
+                        y0, y1 = lane & ~2, (lane & ~2) | 2
+                        ic, jc = ij_fix[lane]
+                        pc = q_fix[lane]["%in_attr0"][1]
+                        dix = q_fix[x1]["%bary"][1] - q_fix[x0]["%bary"][1]
+                        diy = q_fix[y1]["%bary"][1] - q_fix[y0]["%bary"][1]
+                        djx = q_fix[x1]["%bary"][2] - q_fix[x0]["%bary"][2]
+                        djy = q_fix[y1]["%bary"][2] - q_fix[y0]["%bary"][2]
+                        det64 = dix * djy - diy * djx
+                        alp64 = ((0.25 - ic) * djy - (0.25 - jc) * diy) / det64
+                        bet64 = (dix * (0.25 - jc) - djx * (0.25 - ic)) / det64
+                        ref64 = pc + alp64 * (q_fix[x1]["%in_attr0"][1] - q_fix[x0]["%in_attr0"][1]) + (
+                            bet64 * (q_fix[y1]["%in_attr0"][1] - q_fix[y0]["%in_attr0"][1]))
+                        self.assertLess(abs(got[1] - 3.0), 2e-3)
+                        self.assertLess(abs(got[1] - ref64), 2e-6)
+                    # Channel 2 exports v_cvt_f32_f16(v3), where I' = J' = 0 targets LO_HALVES[0] = 1.5 (<= 1 f16 ulp).
+                    self.assertLessEqual(abs(got[2] - 1.5), 2**-10)
 
 
 if __name__ == "__main__":

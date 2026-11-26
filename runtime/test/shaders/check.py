@@ -2096,7 +2096,8 @@ def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if name == "ps_ij_computed" and BARY_FALLBACK:
         # Before the .spv check: under --bary-fallback the translator refuses a computed I/J pair (no .spv).
-        return Skip("SKIP (computed I/J pairs need PerVertexKHR inputs: no --bary-fallback)")
+        return Skip("SKIP (computed I/J pairs need PerVertexKHR inputs or BaryCoordKHR; "
+                    "unsupported under --bary-fallback)")
     if not os.path.isfile(path):
         return f"missing {name}.spv"
     if name == "ps_cbv_modulate":

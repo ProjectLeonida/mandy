@@ -694,9 +694,10 @@ class SubgroupPinSkip(unittest.TestCase):
 
 
 class ComputedIJWithoutPerVertexInputs(unittest.TestCase):
-    """ps_ij_computed (SHADER-177): without PerVertexKHR inputs (--bary-fallback, --f16-interp-fallback, the latter on
-    by default on MoltenVK) the translator refuses the computed I/J pair, so there is no .spv. Both runners SKIP it
-    there, before their missing-.spv check; a missing .spv without a fallback stays a translation failure."""
+    """ps_ij_computed (SHADER-177): under --bary-fallback (neither PerVertexKHR inputs nor BaryCoordKHR) the translator
+    refuses the computed I/J pair, so there is no .spv; --f16-interp-fallback alone lowers it via DerivativeControl +
+    BaryCoordKHR. Both runners SKIP it under --bary-fallback before their missing-.spv check; a missing .spv without
+    --bary-fallback stays a translation failure."""
     NAME = "ps_ij_computed"
 
     def run_suite(self, bary, f16):
@@ -716,7 +717,8 @@ class ComputedIJWithoutPerVertexInputs(unittest.TestCase):
         for f16 in (False, True):
             with self.subTest(f16=f16):
                 rc, out = self.run_suite(True, f16)
-                self.assertIn("SKIP (computed I/J pairs need PerVertexKHR inputs", out)
+                self.assertIn("SKIP (computed I/J pairs need PerVertexKHR inputs or BaryCoordKHR; "
+                              "unsupported under --bary-fallback)", out)
                 self.assertIn("0/1 passed, 1 skipped", out)
                 self.assertNotIn("missing .spv", out)
                 self.assertEqual(rc, 0, out)
