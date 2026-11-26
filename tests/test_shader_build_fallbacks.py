@@ -50,13 +50,13 @@ class BuildUnderFallbackTest(unittest.TestCase):
     def fake_translate(self, work, names):
         """What rdna2spirv.py leaves in <work>/spirv: a module and an index entry per shader it validated."""
         self.asked.append(list(names))
-        fallback = any(os.environ.get(v) == "1" for v in FALLBACKS)
+        bary = os.environ.get("LEONIDA_BARY_FALLBACK") == "1"
         spirv = Path(work) / "spirv"
         spirv.mkdir(parents=True)
         index = {}
         for n in names:
-            if n == "ps_ij_computed" and fallback:
-                continue   # "computed I/J pair under --f16-interp-fallback: no PerVertexKHR inputs"
+            if n == "ps_ij_computed" and bary:
+                continue   # "computed I/J pair under --bary-fallback: no PerVertexKHR inputs"
             (spirv / (n + ".spv")).write_bytes(b"\x03\x02\x23\x07")
             (spirv / (n + ".spvasm")).write_text("; SPIR-V\n", encoding="utf-8")
             index[n] = {"stage": n[:2]}
@@ -67,6 +67,7 @@ class BuildUnderFallbackTest(unittest.TestCase):
         stubs = {"spirv_stubs": types.SimpleNamespace(generate_for_index=lambda *a: None),
                  "bary_fallback_gs": types.SimpleNamespace(build_for_index=lambda *a: None)}
         clean = {k: v for k, v in os.environ.items() if k not in FALLBACKS}
+        clean.setdefault("LEONIDA_BARY_FALLBACK", "0")
         stdout = io.StringIO()
         with mock.patch.dict(os.environ, {**clean, **env}, clear=True), \
                 mock.patch.dict(sys.modules, stubs), \
@@ -79,17 +80,24 @@ class BuildUnderFallbackTest(unittest.TestCase):
                 status = e.code
         return status, stdout.getvalue()
 
-    def test_each_fallback_builds_the_rest_without_ps_ij_computed(self):
-        for var in FALLBACKS:
-            with self.subTest(fallback=var):
-                self.fresh()
-                status, printed = self.run_build(["cs_store", "ps_ij_computed"], {var: "1"})
-                self.assertEqual(status, 0, printed)
-                self.assertEqual(self.asked, [["cs_store"]])
-                self.assertTrue((self.out / "spirv" / "cs_store.spv").is_file())
-                self.assertFalse((self.out / "spirv" / "ps_ij_computed.spv").exists())
-                self.assertIn("ps_ij_computed", printed)
-                self.assertIn("PerVertexKHR", printed)
+    def test_bary_fallback_builds_the_rest_without_ps_ij_computed(self):
+        self.fresh()
+        status, printed = self.run_build(["cs_store", "ps_ij_computed"], {"LEONIDA_BARY_FALLBACK": "1"})
+        self.assertEqual(status, 0, printed)
+        self.assertEqual(self.asked, [["cs_store"]])
+        self.assertTrue((self.out / "spirv" / "cs_store.spv").is_file())
+        self.assertFalse((self.out / "spirv" / "ps_ij_computed.spv").exists())
+        self.assertIn("ps_ij_computed", printed)
+        self.assertIn("PerVertexKHR", printed)
+
+    def test_f16_interp_fallback_builds_ps_ij_computed(self):
+        self.fresh()
+        status, printed = self.run_build(["cs_store", "ps_ij_computed"],
+                                         {"LEONIDA_F16_INTERP_FALLBACK": "1", "LEONIDA_BARY_FALLBACK": "0"})
+        self.assertEqual(status, 0, printed)
+        self.assertEqual(self.asked, [["cs_store", "ps_ij_computed"]])
+        self.assertTrue((self.out / "spirv" / "cs_store.spv").is_file())
+        self.assertTrue((self.out / "spirv" / "ps_ij_computed.spv").is_file())
 
     def test_missing_mullit_fixture_is_not_accepted_as_a_build_target(self):
         status, printed = self.run_build(["ps_mullit"], {})
@@ -97,10 +105,16 @@ class BuildUnderFallbackTest(unittest.TestCase):
         self.assertEqual(self.asked, [])
 
     def test_the_whole_list_builds_under_a_fallback(self):
-        # Before: "Translation did not produce validated SPIR-V for: ps_ij_computed", and an empty <out>/spirv.
-        status, printed = self.run_build([], {"LEONIDA_F16_INTERP_FALLBACK": "1"})
+        # Under LEONIDA_BARY_FALLBACK=1 ps_ij_computed is skipped; under LEONIDA_F16_INTERP_FALLBACK=1 alone it builds.
+        status, printed = self.run_build([], {"LEONIDA_BARY_FALLBACK": "1"})
         self.assertEqual(status, 0, printed)
         self.assertNotIn("ps_ij_computed", self.asked[0])
+        published = {p.stem for p in (self.out / "spirv").glob("*.spv")}
+        self.assertEqual(published, set(self.asked[0]))
+        self.fresh()
+        status, printed = self.run_build([], {"LEONIDA_F16_INTERP_FALLBACK": "1", "LEONIDA_BARY_FALLBACK": "0"})
+        self.assertEqual(status, 0, printed)
+        self.assertIn("ps_ij_computed", self.asked[0])
         published = {p.stem for p in (self.out / "spirv").glob("*.spv")}
         self.assertEqual(published, set(self.asked[0]))
         self.assertIn("ps_interp_f16_high", published)   # the f16 halves still translate under this fallback

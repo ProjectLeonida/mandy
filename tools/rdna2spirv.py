@@ -317,6 +317,7 @@ class Gen:
         self.param_max = -1         # VS/MS: the highest exp paramN (--f16-interp-fallback keeps halves above it)
         self.f16_half_outs = {}     # VS/MS, --f16-interp-fallback: param n -> its two decoded-half output names
         self.ij_capture = {}        # computed-I/J pairs: pair key -> the I float id the p1 loaded (SHADER-177)
+        self.ij_deriv = {}          # PS without PerVertexKHR: (input_name, comp) -> tag for quad-derivative IJ
         self.uses_psb = False
         self.uses_active = False
         self.vm_latch = False      # PS: EXEC can change after a `vm` or color export, so EXEC at those is kept
@@ -14873,6 +14874,34 @@ class Gen:
         self.emit(f"{t} = OpBitcast %float {u}")
         return t
 
+    def ij_quad_eval(self, name, comp, ij):
+        """Evaluate P(i, j) = P0 + i*(P1 - P0) + j*(P2 - P0) without PerVertexKHR inputs (--f16-interp-fallback).
+        Because perspective-correct BaryCoordKHR (%bary) already absorbs 1/w, any smooth input P
+        satisfies P^(q) = P0 + I^(q)*(P1 - P0) + J^(q)*(P2 - P0) identically at every lane q of the 2x2 pixel quad.
+        %entry precomputes the uniform 2x2 screen-quad Jacobian of (I, J) and (P_c, dPdxFine, dPdyFine); each site
+        emits pure scalar ALU P_c + alpha*dPdxFine + beta*dPdyFine (falling back to P_c on a degenerate determinant),
+        so sites inside non-uniform branches or loops execute no derivative instructions."""
+        key = (name, comp)
+        tag = self.ij_deriv.setdefault(key, len(self.ij_deriv))
+        i, j = ij
+        di, dj, na0, na1, na, alp, nb0, nb1, nb, bet, mx, s, my, r0, r = (self.tmp() for _ in range(15))
+        self.emit(f"{di} = OpFSub %float {i} %ij_ic")
+        self.emit(f"{dj} = OpFSub %float {j} %ij_jc")
+        self.emit(f"{na0} = OpFMul %float {di} %ij_djy")
+        self.emit(f"{na1} = OpFMul %float {dj} %ij_diy")
+        self.emit(f"{na} = OpFSub %float {na0} {na1}")
+        self.emit(f"{alp} = OpFMul %float {na} %ij_idet")
+        self.emit(f"{nb0} = OpFMul %float %ij_dix {dj}")
+        self.emit(f"{nb1} = OpFMul %float %ij_djx {di}")
+        self.emit(f"{nb} = OpFSub %float {nb0} {nb1}")
+        self.emit(f"{bet} = OpFMul %float {nb} %ij_idet")
+        self.emit(f"{mx} = OpFMul %float {alp} %ijx_{tag}")
+        self.emit(f"{s} = OpFAdd %float %ijc_{tag} {mx}")
+        self.emit(f"{my} = OpFMul %float {bet} %ijy_{tag}")
+        self.emit(f"{r0} = OpFAdd %float {s} {my}")
+        self.emit(f"{r} = OpSelect %float %ij_nz {r0} %ijc_{tag}")
+        return r
+
     def attribute(self, n, comp, flat=False, half=None, ij=None, vertex_delta=None):
         """Component `comp` of fragment input attribute n (declared as a vec4 Input at Location n).
 
@@ -14885,11 +14914,15 @@ class Gen:
 
         --f16-interp-fallback: an f16 read (`half` 0/1) of an attribute in f16_halves is component `comp` of the smooth
         input at f16_half_location(n, half), which the producer fills with that half decoded to f32 (F16_HALVES).
-        Other reads of such an attribute take the raw word as on any location (smooth, or flat = provoking vertex)."""
+        Other reads of such an attribute take the raw word as on any location (smooth, or flat = provoking vertex).
+        Without per_vertex (--f16-interp-fallback), a computed-I/J read (`ij` not None) evaluates
+        P(i, j) from the smooth input's %entry quad derivatives through `ij_quad_eval`."""
         if half is not None and n in self.f16_halves:
             name = f"%in_f16h{n}_{half}"
             self.inputs.setdefault(name, None)  # resolved in assemble() once every raw attribute is known
             self.interpolated.add(name)
+            if ij is not None:
+                return self.ij_quad_eval(name, comp, ij)
             p, v = self.tmp(), self.tmp()
             self.emit(f"{p} = OpAccessChain %_ptr_Input_float {name} {self.cu(comp)}")
             self.emit(f"{v} = OpLoad %float {p}")
@@ -14899,6 +14932,8 @@ class Gen:
         if not flat:
             self.interpolated.add(name)
         if n not in self.per_vertex:
+            if ij is not None:
+                return self.ij_quad_eval(name, comp, ij)
             p, v = self.tmp(), self.tmp()
             self.emit(f"{p} = OpAccessChain %_ptr_Input_float {name} {self.cu(comp)}")
             self.emit(f"{v} = OpLoad %float {p}")
@@ -15954,7 +15989,7 @@ def assemble(gen):
         if gen.uses_viewport:
             iface += ["%out_viewport"]
     iface += [f"%vin{reg}" for reg, _ in gen.vertex_inputs] + ["%user_data"] + (["%pc_tail"] if gen.uses_pc_tail else [])
-    bary = any(str(c).startswith("bary") for c in gen.frag_inputs.values()) or bool(gen.per_vertex)
+    bary = any(str(c).startswith("bary") for c in gen.frag_inputs.values()) or bool(gen.per_vertex) or bool(gen.ij_deriv)
     # --bary-fallback: %bary is a plain input at the lowest location no attribute uses, so no capability or
     # extension. Lowest free, not one past the highest: a PS whose only input is attr30 would otherwise put it at 31,
     # past what drivers with 128 input components accept (#804 review).
@@ -15986,6 +16021,8 @@ def assemble(gen):
         (["ImageQuery"] if gen.uses_query else []) + (["Sampled1D"] if gen.uses_tex_1d else []) + \
         (["MinLod"] if gen.uses_minlod else []) + (["ImageGatherExtended"] if gen.uses_img_offset else []) + \
         (["FragmentBarycentricKHR"] if bary_builtin else [])
+    if gen.ij_deriv:
+        caps.append("DerivativeControl")
     if gen.uses_vote:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformVote") if c not in caps]
     if gen.uses_ballot or gen.uses_bcast_first:
@@ -16671,6 +16708,33 @@ def assemble(gen):
                 continue
             fn += [f"%fc{c} = OpCompositeExtract %float %fc {c}", f"%fcu{c} = OpBitcast %uint %fc{c}",
                    f"%fcp{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(r)}", f"OpStore %fcp{c} %fcu{c}"]
+    elif gen.ij_deriv:
+        fn += ["%bc = OpLoad %v3float %bary"]
+    if gen.ij_deriv:
+        # Uniform %entry screen-quad barycentric Jacobian for computed-I/J pairs without PerVertexKHR.
+        # Test IEEE-754 normal range (0x00800000 <= |det|_bits < 0x7F800000) on integer bits so +-0, subnormals,
+        # +-inf and NaNs fall back cleanly to P_c without OpFDiv-by-zero or MoltenVK OpFOrdNotEqual NaN hazards.
+        fn += ["%ij_ic = OpCompositeExtract %float %bc 1",
+               "%ij_jc = OpCompositeExtract %float %bc 2",
+               "%ij_dix = OpDPdxFine %float %ij_ic",
+               "%ij_diy = OpDPdyFine %float %ij_ic",
+               "%ij_djx = OpDPdxFine %float %ij_jc",
+               "%ij_djy = OpDPdyFine %float %ij_jc",
+               "%ij_ad = OpFMul %float %ij_dix %ij_djy",
+               "%ij_bc_m = OpFMul %float %ij_diy %ij_djx",
+               "%ij_det = OpFSub %float %ij_ad %ij_bc_m",
+               "%ij_du = OpBitcast %uint %ij_det",
+               f"%ij_dabs = OpBitwiseAnd %uint %ij_du {gen.cu(0x7FFFFFFF)}",
+               f"%ij_dlo = OpUGreaterThanEqual %bool %ij_dabs {gen.cu(0x00800000)}",
+               f"%ij_dhi = OpULessThan %bool %ij_dabs {gen.cu(0x7F800000)}",
+               "%ij_nz = OpLogicalAnd %bool %ij_dlo %ij_dhi",
+               "%ij_sdet = OpSelect %float %ij_nz %ij_det %f1",
+               "%ij_idet = OpFDiv %float %f1 %ij_sdet"]
+        for (iname, icomp), tag in sorted(gen.ij_deriv.items(), key=lambda kv: kv[1]):
+            fn += [f"%ijp_{tag} = OpAccessChain %_ptr_Input_float {iname} {gen.cu(icomp)}",
+                   f"%ijc_{tag} = OpLoad %float %ijp_{tag}",
+                   f"%ijx_{tag} = OpDPdxFine %float %ijc_{tag}",
+                   f"%ijy_{tag} = OpDPdyFine %float %ijc_{tag}"]
     for reg, ctype in gen.vertex_inputs:
         vt = {1: "%v4uint_in", 2: "%v4int_in"}.get(ctype, "%v4float")
         st = {1: "%uint", 2: "%int"}.get(ctype, "%float")
@@ -17288,11 +17352,12 @@ def interp_ij_analysis(insns, g):
     keeping its bit-identical .spv. Refused here (Unsupported, naming the pattern): a computed pair
     whose ops are not in one basic block (the captured I would not dominate the p2), whose shared
     partial register -- the f32 vdst, or the f16 p2's fourth operand naming the p1's vdst -- is written
-    between the ops, or read between them by anything but a p2's partial operand, any computed site
-    under --bary-fallback or --f16-interp-fallback (neither has PerVertexKHR inputs), and a computed v_interp_*_f32 on a 16-bit-flagged
-    interpolant (which half the 32-bit op reads is not established). Over the corpus all of these are
-    empty: 213 PS hold computed pairs, every pair sits in one block, and no partial is touched
-    between the ops.
+    between the ops, or read between them by anything but a p2's partial operand, any computed pair under
+    --bary-fallback (no PerVertexKHR inputs), and a computed v_interp_*_f32 on a 16-bit-flagged interpolant
+    (which half the 32-bit op reads is not established). Under --f16-interp-fallback (without --bary-fallback),
+    Gen.ij_quad_eval weights the smooth input via its %entry 2x2 screen-quad barycentric Jacobian instead of
+    refusing. Over the corpus all refused classes are empty under --f16-interp-fallback: 213 PS hold candidate
+    pairs (207 reaching), every pair sits in one block, and no partial is touched between the ops.
 
     Returns the set of attribute numbers the computed pairs need in g.per_vertex."""
     P1 = ("v_interp_p1_f32", "v_interp_p1ll_f16", "v_interp_p1lv_f16")
@@ -17491,9 +17556,6 @@ def interp_ij_analysis(insns, g):
         attrs.add(s["attr"])
     if attrs and BARY_FALLBACK:
         raise Unsupported("computed I/J pair under --bary-fallback: no PerVertexKHR inputs")
-    if attrs and F16_HALVES:
-        # --f16-interp-fallback reads decoded halves from the producer: no per-vertex inputs either
-        raise Unsupported("computed I/J pair under --f16-interp-fallback: no PerVertexKHR inputs")
     return attrs
 
 
@@ -18516,8 +18578,11 @@ def _translate(path):
     if stage == "ps":
         g.v_interp_copy = interp_copy_sources(insns)   # before v_interp runs: I/J guards (SHADER-177)
         # SHADER-177: annotate v_interp sites whose I/J operand is a computed pair, and let those
-        # attributes be read per-vertex (attribute() weights them with the operand values).
-        g.per_vertex |= interp_ij_analysis(insns, g)
+        # attributes be read per-vertex when PerVertexKHR is available; under --f16-interp-fallback
+        # (without --bary-fallback), Gen.ij_quad_eval evaluates them from smooth inputs + %entry fine derivatives.
+        ij_attrs = interp_ij_analysis(insns, g)
+        if not F16_HALVES:
+            g.per_vertex |= ij_attrs
         if any("ij" in i for i in insns):
             # Computed v_interp sites load their I/J VGPRs at runtime; no_bary above stripped all
             # v_interp sources, so an untouched (or conditionally/EXEC-masked written) v0/v1 still

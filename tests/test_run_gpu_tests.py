@@ -712,29 +712,33 @@ class ComputedIJWithoutPerVertexInputs(unittest.TestCase):
                 rc = rgt.run_suite(args, tmp)
             return rc, out.getvalue()
 
-    def test_run_gpu_tests_skips_under_either_fallback(self):
-        for bary, f16 in ((True, False), (False, True)):
-            with self.subTest(bary=bary, f16=f16):
-                rc, out = self.run_suite(bary, f16)
+    def test_run_gpu_tests_skips_under_bary_fallback(self):
+        for f16 in (False, True):
+            with self.subTest(f16=f16):
+                rc, out = self.run_suite(True, f16)
                 self.assertIn("SKIP (computed I/J pairs need PerVertexKHR inputs", out)
                 self.assertIn("0/1 passed, 1 skipped", out)
                 self.assertNotIn("missing .spv", out)
                 self.assertEqual(rc, 0, out)
 
-    def test_run_gpu_tests_missing_spv_without_fallback_still_fails(self):
-        rc, out = self.run_suite(False, False)
-        self.assertIn("missing .spv (translation failed)", out)
-        self.assertEqual(rc, 1, out)
+    def test_run_gpu_tests_missing_spv_without_bary_fallback_fails(self):
+        for f16 in (False, True):
+            with self.subTest(f16=f16):
+                rc, out = self.run_suite(False, f16)
+                self.assertIn("missing .spv (translation failed)", out)
+                self.assertEqual(rc, 1, out)
 
     def test_check_py_skips_before_its_spv_check(self):
         import check
         with tempfile.TemporaryDirectory() as tmp:
-            for bary, f16 in ((True, False), (False, True)):
-                with self.subTest(bary=bary, f16=f16), \
-                        patch.object(check, "BARY_FALLBACK", bary), patch.object(check, "F16_HALVES", f16):
+            for f16 in (False, True):
+                with self.subTest(bary=True, f16=f16), \
+                        patch.object(check, "BARY_FALLBACK", True), patch.object(check, "F16_HALVES", f16):
                     self.assertIsInstance(check.pixel_test("unused", tmp, self.NAME), check.Skip)
-            with patch.object(check, "BARY_FALLBACK", False), patch.object(check, "F16_HALVES", False):
-                self.assertEqual(check.pixel_test("unused", tmp, self.NAME), f"missing {self.NAME}.spv")
+            for f16 in (False, True):
+                with self.subTest(bary=False, f16=f16), \
+                        patch.object(check, "BARY_FALLBACK", False), patch.object(check, "F16_HALVES", f16):
+                    self.assertEqual(check.pixel_test("unused", tmp, self.NAME), f"missing {self.NAME}.spv")
 
 
 class F16InterpUnderBaryFallback(unittest.TestCase):
