@@ -10628,7 +10628,7 @@ public:
         if (device_.context.get() != &context || desc_.Properties.Type != D3D12_HEAP_TYPE_DEFAULT ||
             (desc_.Flags & denied) || host_address_) return {};
         std::lock_guard lock(backing_mutex_);
-        if (!image && device_.tiles_share_arena()) {
+        if (!image && device_.tiles_share_arena() && (memory_types & (1u << device_.arena.memory_type))) {
             if (tile_allocation_) return {};
             arena_tiles_ = true;
             return allocation_;
@@ -10639,7 +10639,7 @@ public:
         if (placed_buffer_ || (image && placed_image_)) return {};
         if (!tile_allocation_) {
             std::uint32_t memory_type = 0;
-            if (!image) memory_types = device_.sparse_buffer_memory_types;
+            if (!image && (memory_types & device_.sparse_buffer_memory_types)) memory_types &= device_.sparse_buffer_memory_types;
             const VkMemoryRequirements requirements{desc_.SizeInBytes, leonida::tile_size_in_bytes,
                                                     memory_types};
             const auto memory = device_.allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
