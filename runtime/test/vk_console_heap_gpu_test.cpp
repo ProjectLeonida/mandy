@@ -55,6 +55,20 @@ int keys_on_cpu() {
     EXPECT(keys.size() == 1);
     EXPECT(keys.erase_overlapping(0x5008, 0x5009) == 1);
     EXPECT(keys.size() == 0);
+    // Ranges near UINT64_MAX (e.g. sign-extended 48-bit VAs): to + span must not wrap past UINT64_MAX.
+    {
+        const ConsoleHeapKeys::Key hi_key{10, 0, 1, 0}, edge_key{11, 0, 1, 0}, lo_key{12, 0, 1, 0};
+        EXPECT(keys.put(hi_key, UINT64_MAX - 15, 64, false));
+        EXPECT(keys.put(lo_key, UINT64_MAX - 32, 8, false));
+        EXPECT(keys.erase_overlapping(UINT64_MAX - 8, UINT64_MAX) == 1);
+        EXPECT(keys.find(hi_key) < 0 && keys.find(lo_key) >= 0);
+        EXPECT(keys.put(edge_key, UINT64_MAX - 1, 2, false));
+        EXPECT(keys.erase_overlapping(UINT64_MAX - 1, UINT64_MAX) == 1);
+        EXPECT(keys.find(edge_key) < 0 && keys.find(lo_key) >= 0);
+        EXPECT(keys.erase_overlapping(UINT64_MAX - 16, UINT64_MAX) == 0);
+        EXPECT(keys.find(lo_key) >= 0);
+        EXPECT(keys.erase(lo_key) && keys.size() == 0);
+    }
     // Fill one probe chain: the 17th key with the same start finds no slot.
     // V#s whose words differ only in high bits (bases megabytes apart): the hash must still spread them. Bare FNV-1a
     // put all of these in one probe chain.
@@ -494,6 +508,62 @@ int main() {
         EXPECT(dw[8192] == 0 && dw[32768 + 4096] == 0);
     }
     std::puts("console heap pass, queued copies: ok");
+    {
+        // Failed-submission rollback must not clobber newer queued slot flags (kZeroFirst) or reorder copies.
+        constexpr std::uint32_t kSlotKeep = 1, kSlotZero = 2;
+        const std::array<std::uint32_t, 8> keep_words{0x12345678u, 0x9abcdef0u, 0x0fedcba9u, 0x80000001u,
+                                                      0x11112222u, 0x33334444u, 0x55556666u, 0x77778888u};
+        const std::array<std::uint32_t, 8> zero_words{0x2468ace0u, 0x13579bdfu, 0x01020304u, 0x80000002u,
+                                                      0xaaaaaaaau, 0xbbbbbbbbu, 0xccccccccu, 0xddddddddu};
+        std::memcpy(in + 8 * kSlotKeep, keep_words.data(), 32);
+        std::memcpy(in + 8 * kSlotZero, zero_words.data(), 32);
+        std::memset(out, 0xcd, std::size_t(kSlots) * 32);
+
+        constexpr VkDeviceSize kCopyBytes = 8192;
+        void* copy_src_data = nullptr;
+        void* copy_dst_data = nullptr;
+        const VkBuffer copy_src = d.buffer(kCopyBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &copy_src_data);
+        const VkBuffer copy_dst = d.buffer(kCopyBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &copy_dst_data);
+        EXPECT(copy_src && copy_dst && copy_src_data && copy_dst_data);
+        std::memset(copy_src_data, 0x11, 4096);
+        std::memset(static_cast<std::uint8_t*>(copy_src_data) + 4096, 0x22, 4096);
+        std::memset(copy_dst_data, 0, kCopyBytes);
+
+        auto keep1 = std::make_shared<int>(1);
+        auto keep2 = std::make_shared<int>(2);
+        std::weak_ptr<int> watch1 = keep1, watch2 = keep2;
+
+        gpu.queue(heap, kSlotKeep | leonida::ConsoleHeapGpu::kZeroFirst);
+        gpu.queue(heap, kSlotZero);
+        gpu.queue_copy(copy_src, 0, copy_dst, 0, 4096, keep1);
+        keep1.reset();
+        bool recorded = false;
+        d.run([&](VkCommandBuffer cb) {
+            recorded = gpu.record(cb);
+            return false;  // keep Pass 1 uncommitted to test rollback
+        });
+        EXPECT(recorded && !watch1.expired());
+        // Newer updates arrive after record() and before Pass 1's rollback commit(false, 0).
+        gpu.queue(heap, kSlotKeep);
+        gpu.queue(heap, kSlotZero | leonida::ConsoleHeapGpu::kZeroFirst);
+        gpu.queue_copy(copy_src, 4096, copy_dst, 4096, 4096, keep2);
+        keep2.reset();
+        gpu.commit(false, 0);
+        EXPECT(!watch1.expired() && !watch2.expired());
+
+        bool recorded2 = false;
+        EXPECT(d.run([&](VkCommandBuffer cb) { return recorded2 = gpu.record(cb); }));
+        EXPECT(recorded2);
+        gpu.commit(true, 12);
+        gpu.drain(12, [](int, std::uint32_t, std::uint32_t) {}, [](int) {});
+        EXPECT(watch1.expired() && watch2.expired());
+        EXPECT(!std::memcmp(out + 8 * kSlotKeep, keep_words.data(), 32));
+        EXPECT(!out[8 * kSlotZero] && !out[8 * kSlotZero + 1] && !out[8 * kSlotZero + 2] && !out[8 * kSlotZero + 3]);
+        EXPECT(!std::memcmp(out + 8 * kSlotZero + 4, zero_words.data() + 4, 16));
+        const auto* cd = static_cast<const std::uint8_t*>(copy_dst_data);
+        for (std::size_t i = 0; i < 4096; ++i) EXPECT(cd[i] == 0x11 && cd[4096 + i] == 0x22);
+    }
+    std::puts("console heap pass, rollback preserves newer flags and copies: ok");
     c.t.backed.clear();
     c.t.ask = {{0, ~0ull}};  // everything asks again: the overflow cases below need their misses
     gpu.set_spans(leonida::ConsoleHeapGpu::backed_table, c.t.backed);
