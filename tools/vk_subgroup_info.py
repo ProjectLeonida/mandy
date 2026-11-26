@@ -176,6 +176,35 @@ def load_vulkan():
     raise RuntimeError("no Vulkan loader found (" + ", ".join(names) + ")")
 
 
+VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR = 0x1
+PORTABILITY_ENUMERATION = b"VK_KHR_portability_enumeration"
+
+
+class ExtensionProperties(ctypes.Structure):
+    _fields_ = [("extensionName", ctypes.c_char * 256), ("specVersion", ctypes.c_uint32)]
+
+
+def portability_enumeration(vk):
+    """A one-name array for ppEnabledExtensionNames when the Vulkan loader (LEONIDA_VULKAN_LOADER on macOS) offers
+    VK_KHR_portability_enumeration, else None. MoltenVK opened directly needs no opt-in."""
+    if sys.platform != "darwin" or not os.environ.get("LEONIDA_VULKAN_LOADER"):
+        return None
+    enumerate_ = getattr(vk, "vkEnumerateInstanceExtensionProperties", None)
+    if enumerate_ is None:
+        return None
+    vp = ctypes.c_void_p
+    enumerate_.argtypes = [vp, vp, vp]
+    count = ctypes.c_uint32()
+    if enumerate_(None, ctypes.byref(count), None) != 0 or not count.value:
+        return None
+    props = (ExtensionProperties * count.value)()
+    if enumerate_(None, ctypes.byref(count), props) not in (0, 5):   # VK_SUCCESS, VK_INCOMPLETE
+        return None
+    if not any(p.extensionName == PORTABILITY_ENUMERATION for p in props[:count.value]):
+        return None
+    return (ctypes.c_char_p * 1)(PORTABILITY_ENUMERATION)
+
+
 def rdna2_amd_windows(vendor_id: int, device_id: int, driver_id: int) -> bool:
     """An RDNA2 GPU under AMD's proprietary (Windows) driver: the one whose compiler crashes on #857's modules."""
     return (vendor_id == AMD_VENDOR_ID and driver_id == VK_DRIVER_ID_AMD_PROPRIETARY
@@ -256,6 +285,13 @@ def query(*, stage_caps=False) -> dict:
     vk.vkDestroyInstance.argtypes = [vp, vp]
     app = AppInfo(VK_STRUCTURE_TYPE_APPLICATION_INFO, None, b"leonida-subgroup-info", 1, None, 0, VK_API_VERSION_1_3)
     info = InstanceInfo(VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, None, 0, ctypes.pointer(app), 0, None, 0, None)
+    portability = portability_enumeration(vk)
+    if portability is not None:
+        # Behind the Vulkan loader on a Mac, MoltenVK is a portability driver that the loader lists only for an
+        # instance that opts in, as runtime/test/vulkan_loader.h does for the C++ test tools.
+        info.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
+        info.enabledExtensionCount = 1
+        info.ppEnabledExtensionNames = ctypes.cast(portability, ctypes.c_void_p)
     inst = ctypes.c_void_p()
     r = vk.vkCreateInstance(ctypes.byref(info), None, ctypes.byref(inst))
     if r != 0:

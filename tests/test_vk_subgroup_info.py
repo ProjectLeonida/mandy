@@ -470,6 +470,44 @@ class LoadVulkanTest(unittest.TestCase):
                 vk_info.load_vulkan()
 
 
+class PortabilityEnumerationTest(unittest.TestCase):
+    """Behind the Vulkan loader on a Mac, MoltenVK is listed only for an instance that opts in."""
+
+    @staticmethod
+    def loader(names):
+        def enumerate_(_layer, count, props):
+            count = ctypes.cast(count, ctypes.POINTER(ctypes.c_uint32))
+            if props is None:
+                count[0] = len(names)
+                return 0
+            arr = ctypes.cast(props, ctypes.POINTER(vk_info.ExtensionProperties))
+            for i, n in enumerate(names[:count[0]]):
+                arr[i].extensionName = n
+            return 0
+
+        class Loader:
+            vkEnumerateInstanceExtensionProperties = staticmethod(enumerate_)
+        return Loader()
+
+    def test_opts_in_through_the_loader_on_macos(self):
+        vk = self.loader([b"VK_KHR_surface", b"VK_KHR_portability_enumeration"])
+        with mock.patch.object(vk_info.sys, "platform", "darwin"), \
+                mock.patch.dict(os.environ, {"LEONIDA_VULKAN_LOADER": "/x/libvulkan.1.dylib"}):
+            names = vk_info.portability_enumeration(vk)
+        self.assertIsNotNone(names)
+        self.assertEqual(names[0], b"VK_KHR_portability_enumeration")
+
+    def test_no_opt_in_without_the_extension_or_the_loader(self):
+        with mock.patch.object(vk_info.sys, "platform", "darwin"), \
+                mock.patch.dict(os.environ, {"LEONIDA_VULKAN_LOADER": "/x/libvulkan.1.dylib"}):
+            self.assertIsNone(vk_info.portability_enumeration(self.loader([b"VK_KHR_surface"])))
+        with mock.patch.object(vk_info.sys, "platform", "darwin"), mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(vk_info.portability_enumeration(self.loader([b"VK_KHR_portability_enumeration"])))
+        with mock.patch.object(vk_info.sys, "platform", "linux"), \
+                mock.patch.dict(os.environ, {"LEONIDA_VULKAN_LOADER": "/x/libvulkan.1.dylib"}):
+            self.assertIsNone(vk_info.portability_enumeration(self.loader([b"VK_KHR_portability_enumeration"])))
+
+
 class PhysicalDevicesTest(unittest.TestCase):
     def _make_enum_vk(self, steps):
         """Build a minimal vk object whose vkEnumeratePhysicalDevices replays (status, handles) steps."""

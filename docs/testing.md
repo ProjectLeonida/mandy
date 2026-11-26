@@ -53,7 +53,12 @@ This page collects the setup steps and the problems testers have run into so far
   - Linux: CMake 3.24+, GCC or Clang, and the Vulkan headers and loader. The headers should be recent enough
     for `VK_KHR_maintenance8`; older ones still build, but skip what needs it.
   - macOS: `brew install llvm molten-vk vulkan-headers vulkan-loader spirv-tools vulkan-tools`. The test programs
-    load MoltenVK directly; set `LEONIDA_VULKAN_LOADER` to use the Vulkan loader instead.
+    load MoltenVK directly; set `LEONIDA_VULKAN_LOADER` to use the Vulkan loader instead. Through the loader, the
+    C++ tools and `tools/vk_subgroup_info.py` opt in to `VK_KHR_portability_enumeration`, so MoltenVK is listed (pick
+    it with `VK_DRIVER_FILES=$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json`). That is the way to run with
+    `LEONIDA_VK_VALIDATION=1` on a Mac: `brew install vulkan-validationlayers`, then set
+    `VK_LAYER_PATH=$(brew --prefix)/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d` and
+    `DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix)/lib`.
 
 ## Build the test programs
 
