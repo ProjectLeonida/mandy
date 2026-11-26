@@ -19934,14 +19934,29 @@ def merge_shard_parts(out):
     return merged
 
 
+SPAWN_RETRY_SECONDS = 2.0
+_NOT_ENOUGH_QUOTA = 1816  # ERROR_NOT_ENOUGH_QUOTA
+
+
 def _run_spirv_tool(cmd, **kwargs):
-    try:
-        return subprocess.run(cmd, **kwargs)
-    except FileNotFoundError as exc:
-        # Windows CreateProcess omits the executable name from WinError 2.
-        if getattr(exc, "winerror", None) == 2 and exc.filename is None:
-            exc.filename = cmd[0]
-        raise
+    # A Windows job's active-process limit can still count a tool that has just exited, and CreateProcess then
+    # refuses the next one with ERROR_NOT_ENOUGH_QUOTA: the compute worker's job allows itself and one tool
+    # (scripts/compute_workers_win.py). The refused tool never started, so it is started again for a bounded time.
+    deadline = time.monotonic() + SPAWN_RETRY_SECONDS
+    delay = 0.005
+    while True:
+        try:
+            return subprocess.run(cmd, **kwargs)
+        except FileNotFoundError as exc:
+            # Windows CreateProcess omits the executable name from WinError 2.
+            if getattr(exc, "winerror", None) == 2 and exc.filename is None:
+                exc.filename = cmd[0]
+            raise
+        except OSError as exc:
+            if getattr(exc, "winerror", None) != _NOT_ENOUGH_QUOTA or time.monotonic() >= deadline:
+                raise
+        time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+        delay = min(delay * 2, 0.1)
 
 
 # Keep resource bindings, specialization constants and stage interfaces used by the runtime linker.
