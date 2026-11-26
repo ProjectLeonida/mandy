@@ -59,7 +59,7 @@ class SetupCase(unittest.TestCase):
     def output_of(self, cmd, timeout=60):
         return self.outputs.get(os.path.basename(cmd[0]))
 
-    def programs(self, folder, names=setup.PROGRAMS):
+    def programs(self, folder, names=setup.PROGRAMS + setup.MORE_PROGRAMS):
         os.makedirs(os.path.join(self.root, folder), exist_ok=True)
         for name in names:
             with open(os.path.join(self.root, folder, name + (".exe" if os.name == "nt" else "")), "w"):
@@ -122,6 +122,20 @@ class SurveyTest(SetupCase):
         self.assertEqual(state["llvm_mc"], {"command": "llvm-mc", "version": "23.1.6", "amdgpu": True})
         self.assertEqual((state["levels"][2]["ready"], state["levels"][2]["missing"]), (True, []))
         self.assertEqual(state["levels"][2]["command"], "python -I scripts/run_gpu_tests.py --build runtime/build")
+
+    def test_the_full_run_needs_the_programs_its_texture_fixtures_start(self):
+        # The runner checks for three programs; the full run starts four more and fails their fixtures without.
+        self.programs("runtime/build", setup.PROGRAMS + ("vk_texture_test",))
+        self.listings(1)
+        self.on_path.add("llvm-mc")
+        self.outputs["llvm-mc"] = AMDGPU
+        state = self.survey()
+        self.assertEqual(state["more_missing"], ["vk_bindless_test", "vk_sampler_test", "d3d12_texture_uav_test"])
+        subset, full = state["levels"][1], state["levels"][2]
+        self.assertEqual((subset["ready"], full["ready"], len(full["missing"])), (True, False, 1))
+        self.assertIn("vk_bindless_test, vk_sampler_test, d3d12_texture_uav_test in runtime/build", full["missing"][0])
+        self.programs("runtime/build")
+        self.assertEqual((self.survey()["more_missing"], self.survey()["levels"][2]["ready"]), ([], True))
 
     def test_llvm_mc_can_be_a_whole_command(self):
         self.outputs["wsl"] = AMDGPU
@@ -196,7 +210,7 @@ class ReportTest(SetupCase):
         self.outputs.clear()
         self.assertIn("GPU:        none reported by vulkaninfo\n", self.run_tool()[1])
         report = json.loads(self.run_tool("--json")[1])
-        self.assertEqual(sorted(report), ["build", "gpus", "levels", "listings", "llvm_mc", "spirv_as", "spirv_val"])
+        self.assertEqual(sorted(report), ["build", "gpus", "levels", "listings", "llvm_mc", "more_missing", "spirv_as", "spirv_val"])
         self.assertEqual([level["level"] for level in report["levels"]], ["semantic", "subset", "full"])
         self.assertIn("a Vulkan device: vulkaninfo reports none", report["levels"][1]["missing"])
 

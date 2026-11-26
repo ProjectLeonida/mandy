@@ -10,7 +10,8 @@ only when a run stops. This looks once and says what is there and how far it get
 - `subset`: `run_gpu_tests.py --disasm-dir tests/semantic/fixtures/disasm`, the fixtures that are kept as
   listings, assembled by tools/spirv_asm.py when spirv-as is missing. Needs the three test programs and a GPU,
   but neither llvm-mc nor SPIRV-Tools.
-- `full`: every fixture of runtime/test/shaders. Needs llvm-mc with the AMDGPU target as well.
+- `full`: every fixture of runtime/test/shaders. Needs llvm-mc with the AMDGPU target as well, and the test
+  programs the texture, sampler and bindless fixtures start.
 
 For each level it prints the command, or what is missing for it. It also names the GPUs `vulkaninfo` reports with
 their subgroup range: a device whose largest subgroup is below 64 runs the wave64 fixtures only with
@@ -34,6 +35,8 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 
 PROGRAMS = ("vk_compute_test", "vk_store_test", "vk_harness")     # REQUIRED_TEST_PROGRAMS of run_gpu_tests.py
+# What the full run starts as well: without one of them its fixtures fail with "could not start".
+MORE_PROGRAMS = ("vk_texture_test", "vk_bindless_test", "vk_sampler_test", "d3d12_texture_uav_test")
 CONFIGS = ("", "RelWithDebInfo", "Release")
 BUILDS = ("runtime/build", "runtime/build/linux", "runtime/build/windows")
 FIXTURES = "tests/semantic/fixtures/disasm"
@@ -111,8 +114,13 @@ def survey(root=ROOT, build=None, raw_llvm_mc=None):
         "spirv_as": tool("spirv-as"), "spirv_val": tool("spirv-val"),
         "gpus": gpus(output_of(["vulkaninfo"])),
         "build": test_programs(root, [build] if build else BUILDS),
+        "more_missing": [],
         "listings": listings,
     }
+    if state["build"]:
+        folder = state["build"] if os.path.isabs(state["build"]) else os.path.join(root, state["build"])
+        ext = ".exe" if os.name == "nt" else ""
+        state["more_missing"] = [n for n in MORE_PROGRAMS if not os.path.isfile(os.path.join(folder, n + ext))]
     state["levels"] = levels(state, build)
     return state
 
@@ -131,6 +139,8 @@ def levels(state, build=None):
         no_mc = [f"an llvm-mc with the AMDGPU target: {mc['command']} has none (the official Windows build lacks it)"]
     else:
         no_mc = []
+    more = ([f"the test programs {', '.join(state['more_missing'])} in {where}: cmake --build without --target "
+             "builds them (the d3d12 one on Windows only)"] if state.get("more_missing") else [])
     run = f"python -I scripts/run_gpu_tests.py --build {where}"
     return [
         {"level": "semantic", "ready": True, "missing": [],
@@ -138,7 +148,8 @@ def levels(state, build=None):
         {"level": "subset", "ready": not common and state["listings"] > 0,
          "missing": common + ([] if state["listings"] else [f"the listings in {FIXTURES}"]),
          "command": f"{run} --disasm-dir {FIXTURES}"},
-        {"level": "full", "ready": not common and not no_mc, "missing": common + no_mc, "command": run},
+        {"level": "full", "ready": not common and not no_mc and not more, "missing": common + more + no_mc,
+         "command": run},
     ]
 
 
