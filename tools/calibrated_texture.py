@@ -269,7 +269,10 @@ class LocalDecoder:
         )
         if expected > ttpf.MAX_OUTPUT:
             raise ValueError("DDS exceeds output limit")
-        grids = [
+        # The DDS mip grid. The stored grid can be wider or taller (17x13 BC1 stores its 8x6 child as 3x2 blocks,
+        # DDS holds 2x2): each mip is read on its stored grid, which also sets the tile pitch, and then cropped to
+        # this one, as ttpf_mips._visible_rows does for the regular export.
+        visible = [
             ((max(1, width >> i) + 3) // 4, (max(1, height >> i) + 3) // 4)
             for i in range(levels)
         ]
@@ -277,6 +280,7 @@ class LocalDecoder:
             # Mode-1 arrays group source slices by mip. DDS groups mips by slice.
             layout = ttpf.array_surface_layout(width, height, faces, levels, bs, 4, tile)
             bw, bh = layout["block_w"], layout["block_h"]
+            grids = [(mip["blocks_w"], mip["blocks_h"]) for mip in layout["mips"]]
             offsets = {
                 mip["index"]: (mip["offset"], mip["tile_x"], mip["tile_y"], mip["slice_stride"])
                 for mip in layout["mips"]
@@ -305,7 +309,14 @@ class LocalDecoder:
                 )
                 if at.max() + bs > d["base"] + span:
                     raise ValueError("Texture crosses its allocation boundary")
-                payload.extend(self.surface(at, bs, profile))
+                blocks = self.surface(at, bs, profile)
+                vw, vh = visible[i]
+                if vw > w or vh > h:
+                    raise ValueError(f"Mip {i} stores {w}x{h} blocks, fewer than its {vw}x{vh} DDS blocks")
+                if (vw, vh) == (w, h):
+                    payload.extend(blocks)
+                else:
+                    payload.extend(b"".join(blocks[r * w * bs:(r * w + vw) * bs] for r in range(vh)))
         return ttpf.dds_bytes(
             width, height, fmt, count, linear, bytes(payload), array_size=faces
         )
