@@ -1,5 +1,7 @@
 #pragma once
 #include <algorithm>
+#include <bit>
+#include <map>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -7,6 +9,48 @@
 namespace leonida {
 
 using TitleWriteRanges = std::vector<std::pair<std::uintptr_t, std::uintptr_t>>;
+
+// Store each texture once, in the smallest aligned power-of-two page containing its CPU range.
+// A journal interval needs only the overlapping pages at each occupied size. Aliases keep distinct keys.
+class TitleTextureRangeIndex {
+    using Address = std::uint64_t;
+    struct Range { Address first, last; };
+    using PageKey = std::pair<Address, Address>;  // page, registry key
+    std::map<unsigned, std::map<PageKey, Range>> pages_;
+    std::map<Address, std::pair<unsigned, Address>> location_;
+    static Address page(Address at, unsigned shift) { return shift == 64 ? 0 : at >> shift; }
+
+public:
+    void erase(Address key) {
+        const auto where = location_.find(key);
+        if (where == location_.end()) return;
+        const auto [shift, number] = where->second;
+        auto level = pages_.find(shift);
+        level->second.erase({number, key});
+        if (level->second.empty()) pages_.erase(level);
+        location_.erase(where);
+    }
+    void set(Address key, Address first, Address bytes) {
+        erase(key);
+        if (!bytes) return;
+        const Address last = first + std::min(bytes - 1, UINT64_MAX - first);
+        const unsigned shift = unsigned(std::bit_width(first ^ last));
+        const Address number = page(first, shift);
+        pages_[shift][{number, key}] = {first, last};
+        location_[key] = {shift, number};
+    }
+    template<class Visit>
+    void overlapping(Address from, Address to, Visit visit) const {
+        if (from >= to) return;
+        for (const auto& [shift, entries] : pages_) {
+            const Address last = page(to - 1, shift);
+            for (auto it = entries.lower_bound({page(from, shift), 0});
+                 it != entries.end() && it->first.first <= last; ++it) {
+                if (it->second.first < to && from <= it->second.last) visit(it->first.second);
+            }
+        }
+    }
+};
 
 // Sorted, disjoint half-open intervals let each texture find its first possible writer by end address.
 inline void merge_title_writes(TitleWriteRanges& writes) {
@@ -34,10 +78,13 @@ inline bool title_write_overlaps(const TitleWriteRanges& writes, std::uintptr_t 
 // the walk would step through a freed node. The list holds a reference to each entry, so an entry erased during the
 // pass is still alive when its turn comes.
 template<class Registry>
-std::vector<std::pair<std::uint64_t, typename Registry::mapped_type>> title_texture_snapshot(const Registry& textures) {
+std::vector<std::pair<std::uint64_t, typename Registry::mapped_type>> title_texture_snapshot(
+    const Registry& textures, std::uint64_t start = 0, std::size_t limit = SIZE_MAX) {
     std::vector<std::pair<std::uint64_t, typename Registry::mapped_type>> entries;
-    entries.reserve(textures.size());
-    for (const auto& [address, texture] : textures) entries.emplace_back(address, texture);
+    const auto count = std::min(textures.size(), limit);
+    entries.reserve(count);
+    for (auto it = textures.lower_bound(start); it != textures.end() && entries.size() < count; ++it)
+        entries.emplace_back(it->first, it->second);
     return entries;
 }
 

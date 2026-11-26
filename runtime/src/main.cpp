@@ -9,6 +9,13 @@
 //   gta6rt --init <image> [--game-dir DIR] [--overlay DIR]
 //       The same mapping, then each loaded DLL's TLS callbacks and DllMain(DLL_PROCESS_ATTACH) are run.
 //
+//   gta6rt --precompile-pipelines [--threads N] [--big-threads N] [--big-bytes N] [--all] [--smallest-first]
+//          [--limit N] [--min-bytes N] [--max-bytes N] [--filter PART]... [--list]
+//       No game: creates the Vulkan device as --run does and builds every compute pipeline of the shader library
+//       (LEONIDA_SHADERS) into the pipeline journal and the driver's cache, so a title's first dispatch of a large one
+//       does not stall it. Resumable: entries already journaled are skipped (--all: built anyway). See
+//       shims/d3d12_precompile.h.
+//
 //   gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [--trace FILE] [-- game arguments...]
 //       The same, then the EXE's own TLS callbacks and its entry point, on a game thread. The game's argv and
 //       command line are <exe name> plus the arguments after "--"; exit/ExitProcess from the game end the run
@@ -149,6 +156,7 @@ void start_title_peek(std::uint8_t* base) {
 #include "mods.h"
 #include "pe_loader.h"
 #include "thread_stacks.h"
+#include "dev_overlay.h"
 #include "thread_sampler.h"
 #include "title_page_watch.h"
 #include "title_geometry_watch.h"
@@ -156,7 +164,9 @@ void start_title_peek(std::uint8_t* base) {
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/file_system.h"
 #ifdef LEONIDA_VULKAN_DEVICE
+#include "vulkan_device_fault.h"
 #include "../shims/d3d12_compile_exit.h"
+#include "../shims/d3d12_precompile.h"
 #include "../shims/package_splash.h"
 #endif
 #include "../shims/process_shim.h"
@@ -224,9 +234,65 @@ int usage() {
                  "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE]\n"
                  "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
                  "       gta6rt --first-run-ui <exe> [--game-dir DIR] [--overlay DIR] [--trace FILE]\n"
-                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
+                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n"
+                 "       gta6rt --precompile-pipelines [--threads N] [--big-threads N] [--big-bytes N] [--all] [--smallest-first] [--limit N] [--min-bytes N] [--max-bytes N] [--filter PART]... [--list] [--via-helper]\n"
+                 "       gta6rt --compile-server [--parent PID] [--threads N] [--idle-threads N] [--idle-exit SECONDS]\n");
     return 2;
 }
+
+#ifdef LEONIDA_VULKAN_DEVICE
+// gta6rt --precompile-pipelines ...: argv[1] is the mode.
+int precompile_main(int argc, wchar_t** argv) {
+    rt::d3d12::PrecompileOptions options;
+    const auto number = [&](int& i, auto& out) {
+        if (i + 1 >= argc) return false;
+        wchar_t* end = nullptr;
+        const unsigned long long v = std::wcstoull(argv[++i], &end, 10);
+        if (!end || *end) return false;
+        out = static_cast<std::remove_reference_t<decltype(out)>>(v);
+        return true;
+    };
+    for (int i = 2; i < argc; ++i) {
+        const std::wstring a = argv[i];
+        bool ok = true;
+        if (a == L"--threads") ok = number(i, options.threads);
+        else if (a == L"--big-threads") ok = number(i, options.big_threads);
+        else if (a == L"--big-bytes") ok = number(i, options.big_bytes);
+        else if (a == L"--limit") ok = number(i, options.limit);
+        else if (a == L"--min-bytes") ok = number(i, options.min_bytes);
+        else if (a == L"--max-bytes") ok = number(i, options.max_bytes);
+        else if (a == L"--all") options.rebuild = true;
+        else if (a == L"--smallest-first") options.smallest_first = true;
+        else if (a == L"--list") options.dry_run = true;
+        else if (a == L"--via-helper") options.via_helper = true;
+        else if (a == L"--filter" && i + 1 < argc) {
+            const std::wstring part = argv[++i];
+            options.filters.emplace_back(part.begin(), part.end());  // library names are ASCII
+        } else ok = false;
+        if (!ok) return usage();
+    }
+    return rt::d3d12::precompile_compute_pipelines(options);
+}
+
+// gta6rt --compile-server [--parent PID] [--threads N] [--idle-threads N] [--idle-exit SECONDS]
+// (shims/d3d12_compile_helper.h).
+int compile_server_main(int argc, wchar_t** argv) {
+    rt::d3d12::CompileServerOptions options;
+    for (int i = 2; i < argc; ++i) {
+        const std::wstring a = argv[i];
+        if (i + 1 >= argc) return usage();
+        wchar_t* end = nullptr;
+        const unsigned long long v = std::wcstoull(argv[++i], &end, 10);
+        if (!end || *end) return usage();
+        if (a == L"--parent") options.parent_pid = static_cast<unsigned long>(v);
+        else if (a == L"--threads") options.threads = static_cast<unsigned>(v);
+        else if (a == L"--idle-threads") options.idle_threads = static_cast<unsigned>(v);
+        else if (a == L"--idle-exit") options.idle_exit_s = static_cast<unsigned>(v);
+        else return usage();
+    }
+    return rt::d3d12::compile_server(options);
+}
+#endif
 
 }  // namespace
 
@@ -292,6 +358,10 @@ static BOOL WINAPI show_package_window(HWND window, int command) {
 #endif
 
 int wmain(int argc, wchar_t** argv) {
+#ifdef LEONIDA_VULKAN_DEVICE
+    if (argc > 1 && std::wstring(argv[1]) == L"--precompile-pipelines") return precompile_main(argc, argv);
+    if (argc > 1 && std::wstring(argv[1]) == L"--compile-server") return compile_server_main(argc, argv);
+#endif
     std::filesystem::path image, game_dir, overlay_dir, mods_dir;
     uint32_t archetype_lookup_rva = 0;  // --archetype-lookup RVA[,ARG]: the game's archetype lookup by hash
     int archetype_lookup_arg = 0;
@@ -436,6 +506,8 @@ int wmain(int argc, wchar_t** argv) {
     rt::d3d12_trace::set_enabled(trace_d3d12);
     // Slot 133 imports the title's pages; xmem commits them on first touch, so they are committed first.
     rt::d3d12_xs::set_placed_at_va_pages_hook(&rt::xmem::commit_physical_range);
+    if (rt::xmem::slot31_runs() && rt::xmem::queue_page_mappings_enabled())
+        rt::d3d12_xs::set_copy_page_mappings_hook(&rt::xmem::copy_page_mappings);
     // So do the file shims' reads, whose kernel writes do not fault them in: on ERROR_NOACCESS (title_page_watch.h).
     leonida::geometry_writes::aliases.store(&rt::xmem::geometry_aliases);
     leonida::kernel_writes::set_committer(&rt::xmem::commit_physical_range);
@@ -541,7 +613,9 @@ int wmain(int argc, wchar_t** argv) {
             std::fprintf(stderr, "error: %s has no entry point\n", main_module.name.c_str());
             return 1;
         }
-        const std::wstring paths = L"console paths: GAME: -> " + game_dir.native() + L", writes -> " + overlay_dir.native();
+        const std::filesystem::path scratch_dir = rt::fs::scratch_dir();
+        const std::wstring paths = L"console paths: GAME: -> " + game_dir.native() + L", writes -> " +
+                                   overlay_dir.native() + L", T: -> " + scratch_dir.native();
         const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
         DWORD mode;
         bool printed = false;
@@ -554,19 +628,25 @@ int wmain(int argc, wchar_t** argv) {
         if (!printed) {
             const auto game = game_dir.u8string();
             const auto overlay = overlay_dir.u8string();
-            std::printf("console paths: GAME: -> %s, writes -> %s\n",
-                        reinterpret_cast<const char*>(game.c_str()), reinterpret_cast<const char*>(overlay.c_str()));
+            const auto scratch = scratch_dir.u8string();
+            std::printf("console paths: GAME: -> %s, writes -> %s, T: -> %s\n",
+                        reinterpret_cast<const char*>(game.c_str()), reinterpret_cast<const char*>(overlay.c_str()),
+                        reinterpret_cast<const char*>(scratch.c_str()));
         }
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
         keep_title_watchdog_kicked(main_module.base);
         start_title_peek(main_module.base);
+        leonida::dev_overlay::start();  // LEONIDA_DEV_OVERLAY=1
         leonida::thread_sampler::start(main_module.base, main_module.size);  // LEONIDA_SAMPLE_MS (diagnostic)
 #ifdef LEONIDA_VULKAN_DEVICE
         SetConsoleCtrlHandler(&stop_compiles_on_console_exit, TRUE);
         previous_fatal_filter = SetUnhandledExceptionFilter(&save_caches_on_fatal_exception);
 #endif
         int code;
+#ifdef LEONIDA_VULKAN_DEVICE
+        leonida::thread_stack_hook.store(&rt::print_thread_stacks_now, std::memory_order_release);
+#endif
         {
             auto stacks = rt::start_thread_stacks();
             code = rt::process::run_entry(main_module.base + main_module.entry_rva);

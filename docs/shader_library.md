@@ -178,7 +178,7 @@ them and the state key is the record's state blob. The step is redone as a whole
 `llvm-mc`, the wave64 mode or the flags change (`library_build.json`, written last), and a clash of both keys between
 different modules fails it, as for the FSPX step. Graphics pipelines are not translated by the build.
 
-### Resuming a compute-only batch on Linux
+### Resuming a compute-only batch on Linux or native Windows
 
 Run `tools/shader_library.py` with `--stages cs --disasm --jobs 2` and the carved containers, or select the
 kind-6 hashes with `--compute-hashes`. For an unpacked library with its input `index.json`, use the compute batch.
@@ -187,13 +187,26 @@ kind-6 hashes with `--compute-hashes`. For an unpacked library with its input `i
 python3 -I scripts/translate_pipeline_compute.py /path/to/unpacked --out /path/to/spirv/library --wave64-emulate
 ```
 
-Use a dedicated output folder. The two workers run at nice 19. Each has a 768 MiB address-space limit and uses one
-SPIRV-Tools process at a time (four processes total). `--jobs 1` uses a single worker and `--memory-mib` changes
-the per-process limit. A rerun checks each module against its checksum and the listing, source container, FSPX
+Use a dedicated output folder and a stable, trusted SPIRV-Tools installation on PATH. On Linux the two workers
+run at nice 19. Each has a 768 MiB address-space limit and uses one SPIRV-Tools process at a time (four processes
+total). On native Windows CPython, a BelowNormal coordinator and up to two gated workers run with a 768 MiB
+**committed memory** cap per process (not total virtual address space). Each worker's kill-on-close Job permits
+only itself and one tool process. The parent verifies job membership before sending work; the child rechecks the
+effective limits. A no-share file open keeps the pack exclusive through worker exit. An incompatible outer Job
+or a failed limit/lock check stops the build; there is no unbounded Windows mode. A hard stop can leave temporary
+scratch files, but cannot partially replace the index. `--jobs 1` uses a single translating worker and
+`--memory-mib` changes the per-process limit. A rerun checks each module against its checksum and the listing, source container, FSPX
 sidecars, toolchain and wave mode. It retries failures. Only validated modules enter the runtime index. Its
 atomic replacement follows both workers, so an interrupted run leaves the previous index readable. A partial
 run exits nonzero and writes the reasons to `failures.json`, keyed by kind-6 and kind-0 SHA-256. Old modules
 can still be used by a runtime that already opened the preceding index.
+
+The coordinator and each shard explicitly apply `--wave64-emulate`, `--loop-limit`, `--descriptor-hash` and
+`--compact-spirv`; requesting compaction requires both translator support and `spirv-opt`. The cache key includes
+those settings, compiler sources, builder and tool hashes. `.compute-cache/worker-receipt.json` records the exact
+options and input-name digest for each shard; compare its `index_sha256` with the actual published index before
+using it. This is an audit file, not a completion marker. A pre-upgrade cache key is not reused as evidence for
+a new builder.
 
 Among 2,680 compute programs, 46 start with two 12-byte literal-bearing VOP3 NOP hash carriers. Their body
 starts at byte 24. The three-record form starts at byte 36. The no-op measurements are in `docs/fspx.md`.

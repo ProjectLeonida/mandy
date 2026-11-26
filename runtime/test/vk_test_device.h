@@ -130,6 +130,7 @@ public:
     std::uint32_t max_draw_indirect_count = 0;
     bool request_draw_indirect_first_instance = false; // enable the core feature only for positive indirect draws
     bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
+    bool pipeline_cache_control() const { return v13_.core && v13_.pipeline_creation_cache_control; }
     bool request_buffer_device_address = false;  // set before create(): enable bufferDeviceAddress where supported
     bool buffer_device_address = false;  // enabled: buffer() memory and buffers can be addressed (device_address())
     bool conservative_rasterization = false; // VK_EXT_conservative_rasterization enabled where available
@@ -189,6 +190,7 @@ public:
 
     unsigned validation_errors() const { return validation_error_count(); }
     unsigned known_validation_errors() const { return known_validation_error_count(); }
+    bool pipeline_cache_control_enabled() const { return v13_.core && v13_.pipeline_creation_cache_control; }
 
     // presentation: also enable VK_KHR_surface + VK_KHR_win32_surface and VK_KHR_swapchain (Windows only).
     bool create(bool presentation = false) { return initialize(presentation) == DeviceStatus::ready; }
@@ -492,6 +494,7 @@ private:
         enable.multiViewport = features.features.multiViewport;  // d3d12_multi_viewport_test, where available
         enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
         enable.dualSrcBlend = features.features.dualSrcBlend;  // d3d12_translated_draw_test --dual-source
+        enable.depthBounds = features.features.depthBounds;  // depth-bounds PSOs (d3d12_mesh_test), where available
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.

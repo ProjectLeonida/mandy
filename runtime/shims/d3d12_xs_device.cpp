@@ -32,6 +32,7 @@
 #endif
 #include "d3d12_xs_placed_depth.h"
 #include "d3d12_trace.h"
+#include "../src/fsdraw_probe.h"  // LEONIDA_FSDRAW_PROBE gates the fsdraw lines here
 #include "../src/native_pso.h"
 #include "xmem.h"  // rt::xmem::copy_page_mappings_fn for queue slot 31
 #include "d3d12_xs_alloc_size.h"
@@ -1070,9 +1071,9 @@ struct FenceMirror;
 // Queue slots that take queue_order: the ones that may put work on the queue or change page mappings. Not the debug
 // markers (SetMarker, BeginEvent, EndEvent: 11-13 in both layouts) and not slot 18, a getter in both layouts (the
 // older layout's GetDesc, the newer one's GetTimestampFrequency). The title's render thread calls slot 18 every frame
-// (t+0x2484180, vtable +0x90, then 1/frequency), and under queue_order it waited for whole submissions on the submit
-// thread (15-20 ms each, ~24 a frame): 44 % of its samples in speed-26. Slots 16-17 and 19-20 keep the lock: which of
-// them are getters depends on the layout (16-17 are Signal/Wait in the newer one).
+// and a queued frequency query can wait for whole submissions. Slots 16-17 and 19-20 keep the lock here:
+// which of them are getters depends on the layout (16-17 are Signal/Wait in the newer one). The caller drops the lock
+// for a 16/17 call that passes no fence: that is the older layout's frequency/calibration getter, not Signal/Wait.
 constexpr bool queue_slot_orders_work(unsigned slot) {
     if (slot < 8 || slot > kQueueExecuteCommandListsX) return false;
     if (slot >= 11 && slot <= 13) return false;  // SetMarker, BeginEvent, EndEvent
@@ -1096,7 +1097,7 @@ struct ChildProxy {
     std::mutex queue_order;  // serializes queue work across a host-side page remap
     // Queue slot 31's fence, made at its first call and signalled with a rising value at each (under queue_order);
     // kept for the queue's life. It was a new fence a call: a Vulkan timeline semaphore made and destroyed per batch.
-    Microsoft::WRL::ComPtr<ID3D12Fence> map_fence;
+    ID3D12Fence* map_fence = nullptr;
     std::uint64_t map_fence_value = 0;
     std::atomic<unsigned char> queue_layout{kQueueLayoutUnknown};
     // Allocators only: callback and context recorded by console slot 9 (SetAllocatorCallbackX).
@@ -1213,8 +1214,30 @@ void reset_child_stats() {
 //
 // The descriptor's code pointer is not called: the measured run goes on without it, and its contract (when it runs,
 // on which thread, with what) is not known. The first call is logged with its arguments.
+// LEONIDA_MIRROR_LAG=1: how late the mirror shows a value the GPU has reached. Each mirror also has the device's
+// fence-wait thread call back the moment the timeline reaches the next value (it only notes when); the refresh that
+// then writes that value adds now - that moment to the stats. LEONIDA_MIRROR_EXACT=1: that callback writes the
+// mirror itself and asks for the next value, so the title sees a completion as soon as our dispatcher does (the
+// thread-pool wait stays as the backstop for rewinds).
+struct FenceMirror;
+struct MirrorLink {  // shared with the fence-wait callbacks; destroy_child clears `mirror` before the fence goes
+    SRWLOCK lock = SRWLOCK_INIT;
+    FenceMirror* mirror = nullptr;            // under lock
+    std::atomic<std::uint64_t> reached_value{0};  // the value the callback saw, 0: none outstanding
+    std::atomic<std::int64_t> reached_at{0};      // QueryPerformanceCounter when it saw it
+};
+bool mirror_lag_enabled() {
+    static const bool on = [] { const char* v = std::getenv("LEONIDA_MIRROR_LAG"); return v && *v == '1'; }();
+    return on;
+}
+bool mirror_exact_enabled() {
+    static const bool on = [] { const char* v = std::getenv("LEONIDA_MIRROR_EXACT"); return v && *v == '1'; }();
+    return on;
+}
+
 struct FenceMirror {
     alignas(8) volatile std::uint64_t completed = 0;  // what the title reads through slot 12's pointer
+    std::shared_ptr<MirrorLink> link;  // LEONIDA_MIRROR_LAG / LEONIDA_MIRROR_EXACT only
     ID3D12Fence* fence = nullptr;  // the real fence; the proxy holds the reference
     SRWLOCK lock = SRWLOCK_INIT;   // orders refreshes
     HANDLE event = nullptr;        // auto-reset; the real fence sets it at the armed value
@@ -1223,12 +1246,87 @@ struct FenceMirror {
     std::atomic<bool> arm_failed{false};
 };
 
-std::uint64_t refresh_mirror(FenceMirror* m) {
+void note_mirror_lag(std::int64_t ticks, bool exact);
+
+std::uint64_t refresh_mirror(FenceMirror* m, bool exact = false) {
     AcquireSRWLockExclusive(&m->lock);
     const std::uint64_t value = m->fence->GetCompletedValue();
-    if (m->completed != value) m->completed = value;
+    const bool advanced = m->completed != value;
+    if (advanced) m->completed = value;
     ReleaseSRWLockExclusive(&m->lock);
+    if (advanced && m->link && value != ~std::uint64_t{0}) {
+        std::uint64_t reached = m->link->reached_value.load(std::memory_order_acquire);
+        if (reached && reached <= value && m->link->reached_value.compare_exchange_strong(reached, 0)) {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            note_mirror_lag(now.QuadPart - m->link->reached_at.load(std::memory_order_acquire), exact);
+        }
+    }
     return value;
+}
+
+// Every 10 s with LEONIDA_MIRROR_LAG: from our dispatcher seeing a fence reach a value to the mirror showing it.
+void note_mirror_lag(std::int64_t ticks, bool exact) {
+    static LARGE_INTEGER frequency = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+    static std::atomic<std::uint64_t> count{0}, total_us{0}, max_us{0}, over_1ms{0}, exact_count{0};
+    static std::atomic<ULONGLONG> last{0};
+    const std::uint64_t us = ticks > 0 ? std::uint64_t(ticks) * 1000000 / std::uint64_t(frequency.QuadPart) : 0;
+    count.fetch_add(1, std::memory_order_relaxed);
+    exact_count.fetch_add(exact, std::memory_order_relaxed);
+    total_us.fetch_add(us, std::memory_order_relaxed);
+    over_1ms.fetch_add(us > 1000, std::memory_order_relaxed);
+    for (std::uint64_t m = max_us.load(); us > m && !max_us.compare_exchange_weak(m, us);) {
+    }
+    const ULONGLONG now = GetTickCount64();
+    ULONGLONG was = last.load(std::memory_order_relaxed);
+    if (!was) {
+        last.compare_exchange_strong(was, now);
+        return;
+    }
+    if (now - was < 10000 || !last.compare_exchange_strong(was, now)) return;
+    const std::uint64_t n = count.exchange(0);
+    std::fprintf(stderr, "[rt] d3d12_xs: fence slot 12 mirror lag (dispatcher saw the value -> mirror shows it): %llu "
+                         "updates in %.0f s (%llu written by the exact callback), avg %.0f us, max %llu us, %llu over 1 ms\n",
+                 static_cast<unsigned long long>(n), double(now - was) / 1000.0,
+                 static_cast<unsigned long long>(exact_count.exchange(0)),
+                 n ? double(total_us.exchange(0)) / double(n) : 0.0,
+                 static_cast<unsigned long long>(max_us.exchange(0)), static_cast<unsigned long long>(over_1ms.exchange(0)));
+}
+
+// Asks the fence-wait thread for a callback when the fence reaches `value`. Once per call chain: the dispatcher runs a
+// callback at once when it is stopping or the device is lost, which would otherwise ask again without end.
+thread_local int t_mirror_arming = 0;  // this thread is inside arm_mirror_callback
+
+void arm_mirror_callback(const std::shared_ptr<MirrorLink>& link, ID3D12Fence* fence, std::uint64_t value) {
+#ifndef LEONIDA_VULKAN_DEVICE
+    (void)link, (void)fence, (void)value;  // no fence-wait thread to ask: the thread-pool wait alone
+#else
+    if (t_mirror_arming) return;
+    ++t_mirror_arming;
+    rt::d3d12::fence_callback_at(fence, value, [link] {
+        // Run at once inside the arming call (dispatcher stopping): this thread may hold link->lock already.
+        if (t_mirror_arming) return;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        AcquireSRWLockExclusive(&link->lock);
+        FenceMirror* m = link->mirror;
+        if (m) {
+            const std::uint64_t seen = m->fence->GetCompletedValue();
+            if (seen != ~std::uint64_t{0}) {
+                // Only a value the mirror does not show yet: one another path (slot 12, a CPU Signal) already wrote
+                // would otherwise stay outstanding until the next advance and count that wait as lag.
+                if (!link->reached_value.load(std::memory_order_acquire) && m->completed < seen) {
+                    link->reached_at.store(now.QuadPart, std::memory_order_release);
+                    link->reached_value.store(seen, std::memory_order_release);
+                }
+                if (mirror_exact_enabled()) refresh_mirror(m, true);
+                arm_mirror_callback(link, m->fence, seen + 1);
+            }
+        }
+        ReleaseSRWLockExclusive(&link->lock);
+    });
+    --t_mirror_arming;
+#endif
 }
 
 void wait_for_fence_progress(FenceMirror* mirror) {
@@ -1287,6 +1385,11 @@ FenceMirror* fence_mirror(ChildProxy* self) {
     if (!m && (m = new (std::nothrow) FenceMirror)) {
         m->fence = reinterpret_cast<ID3D12Fence*>(self->real);
         refresh_mirror(m);
+        if (mirror_lag_enabled() || mirror_exact_enabled()) {
+            m->link = std::make_shared<MirrorLink>();
+            m->link->mirror = m;
+            arm_mirror_callback(m->link, m->fence, m->completed + 1);
+        }
         m->event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (m->event) m->wait = CreateThreadpoolWait(on_fence_progress, m, nullptr);
         if (m->wait) {
@@ -1344,7 +1447,14 @@ void destroy_child(ChildProxy* self) {
         CloseThreadpoolWait(mirror->wait);
         g_mirrors_live.fetch_sub(1, std::memory_order_relaxed);
     }
+    if (mirror && mirror->link) {  // a fence-wait callback still pending (or running) no longer reaches the mirror
+        AcquireSRWLockExclusive(&mirror->link->lock);
+        mirror->link->mirror = nullptr;
+        ReleaseSRWLockExclusive(&mirror->link->lock);
+    }
+    ID3D12Fence* const map_fence = self->map_fence;  // queue slot 31's; an async mapping in flight holds its own
     delete self;
+    if (map_fence) map_fence->Release();
     const unsigned long left = real ? real->Release() : 0;
     if (mirror) {
         if (mirror->event && left == 0) CloseHandle(mirror->event);
@@ -1928,8 +2038,8 @@ bool slot31_async() {
 
 struct AsyncMapping {
     CopyPageMappingsHook map;
-    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
-    std::uint64_t value;
+    ID3D12Fence* fence = nullptr;
+    std::uint64_t value = 0;
     std::vector<xmem::PageBatch> batches;
     std::vector<std::vector<xmem::PageRange>> ranges;
     std::uintptr_t pool;
@@ -1957,6 +2067,7 @@ struct AsyncMapper {
             }
             const auto t0 = clock::now();
             HRESULT hr = job.fence->SetEventOnCompletion(job.value, nullptr);
+            job.fence->Release();  // the reference the call took for this job: the queue may be gone by now
             const auto t1 = clock::now();
             bool ok = SUCCEEDED(hr) &&
                       job.map(std::uint32_t(job.batches.size()), job.batches.data(), job.pool, job.pages, job.flags);
@@ -2081,6 +2192,9 @@ bool copy_page_mappings_default(std::uint32_t count, const xmem::PageBatch* batc
 //   call return before the remap, as on the console; an error is logged and counted then, not returned.
 // With LEONIDA_LIST_VALUES=0 (no gates), without the value fences or the list-value threads, or when the queue's Wait
 // for the remap cannot be submitted, the call waits for the earlier work, however long, as it did before.
+// With LEONIDA_SLOT31_ASYNC=1 neither: the call signals the queue map fence and returns, and the async worker
+// maps once the GPU passes it (slot31_async), in call order. The remap runs xmem's copy_page_mappings
+// (g_copy_page_mappings) on every path, deferred or not.
 HRESULT queue_copy_page_mappings(ChildProxy* self, UINT count, const xmem::PageBatch* batches,
                                  std::uintptr_t pool, UINT pages, UINT flags) {
     auto map = g_copy_page_mappings.load(std::memory_order_acquire);
@@ -2088,13 +2202,19 @@ HRESULT queue_copy_page_mappings(ChildProxy* self, UINT count, const xmem::PageB
     if (!map || !count) return S_OK;
     if (!batches || flags) return E_INVALIDARG;
     auto* queue = reinterpret_cast<ID3D12CommandQueue*>(self->real);
-    if (list_values::enabled() && !self->values)
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    HRESULT hr = S_OK;
+    bool deferred = false;  // the remap is the list-value releaser's now: nothing is mapped here
+    // LEONIDA_SLOT31_ASYNC=1 asks for the async worker below instead of the bounded wait and the gate.
+    const bool gated = list_values::enabled() && !slot31_async();
+    if (gated && !self->values)
         self->values = list_values::QueueValues::create(self->device->real, queue);
-    if (list_values::QueueValues* values = list_values::enabled() ? self->values.get() : nullptr) {
+    if (list_values::QueueValues* values = gated ? self->values.get() : nullptr) {
         auto& counters = list_values::counters();
         list_values::Pump& pump = list_values::Pump::get();
         const std::uint64_t point = ++values->written_value;
-        HRESULT hr = queue->Signal(values->written, point);
+        hr = queue->Signal(values->written, point);
         if (FAILED(hr)) return hr;
         // The bound is kept with a high-resolution timer: a plain timed wait rounds to the system tick (15.6 ms),
         // which would defer at once or hold queue_order for two ticks. Neither handle is ever closed: a fence may still
@@ -2102,14 +2222,12 @@ HRESULT queue_copy_page_mappings(ChildProxy* self, UINT count, const xmem::PageB
         static thread_local const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         static thread_local const HANDLE timer =
             CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        using Clock = std::chrono::steady_clock;
-        const auto started = Clock::now();
-        const auto deadline = started + std::chrono::milliseconds(kPageMappingWaitMs);
+        const auto deadline = t0 + std::chrono::milliseconds(kPageMappingWaitMs);
         bool reached = values->written->GetCompletedValue() >= point;
         if (!reached && event && SUCCEEDED(values->written->SetEventOnCompletion(point, event))) {
             for (;;) {
                 reached = values->written->GetCompletedValue() >= point;
-                const auto now = Clock::now();
+                const auto now = clock::now();
                 if (reached || now >= deadline) break;
                 const auto left = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count();
                 LARGE_INTEGER due{};
@@ -2124,7 +2242,7 @@ HRESULT queue_copy_page_mappings(ChildProxy* self, UINT count, const xmem::PageB
         }
         list_values::raise_to(counters.remap_wait_us_max,
                               static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                                             Clock::now() - started)
+                                                             clock::now() - t0)
                                                              .count()));
         // After stop_list_values (the process is ending) the queue's gates are not signalled any more and its earlier
         // work may never run: the remap is done now rather than holding queue_order until ExitProcess.
@@ -2153,55 +2271,51 @@ HRESULT queue_copy_page_mappings(ChildProxy* self, UINT count, const xmem::PageB
                                          error, copy->batches.size(), reinterpret_cast<void*>(copy->pool),
                                          copy->pages);
                     })) {
-                    const std::uint64_t deferred =
+                    const std::uint64_t so_far =
                         counters.remaps_deferred.fetch_add(1, std::memory_order_relaxed) + 1;
-                    if (deferred == 1 || (deferred & (deferred - 1)) == 0)
+                    if (so_far == 1 || (so_far & (so_far - 1)) == 0)
                         std::fprintf(stderr, "[rt] d3d12_xs: CopyPageMappingsBatchX waits behind held queue work: "
                                              "the remap runs when the queue gets there (%llu deferred so far)\n",
-                                     static_cast<unsigned long long>(deferred));
-                    return S_OK;
+                                     static_cast<unsigned long long>(so_far));
+                    deferred = true;
                 }
-                // stop_list_values came in between: nothing opens the gate any more; the remap is done now.
+                // Otherwise stop_list_values came in between: nothing opens the gate any more; the remap is done now.
             } else {
                 hr = values->written->SetEventOnCompletion(point, nullptr);  // not deferred: wait, as before
                 if (FAILED(hr)) return hr;
             }
         }
-        if (values->written->GetCompletedValue() == UINT64_MAX) return DXGI_ERROR_DEVICE_REMOVED;
-        list_values::bump(counters.remaps_now);
-        if (!map(count, batches, pool, pages, flags)) {
-            const DWORD error = GetLastError();
-            return error ? HRESULT_FROM_WIN32(error) : E_FAIL;
+        if (!deferred) {
+            if (values->written->GetCompletedValue() == UINT64_MAX) hr = DXGI_ERROR_DEVICE_REMOVED;
+            else list_values::bump(counters.remaps_now);
         }
-        return S_OK;
-    }
-    HRESULT hr = S_OK;
-    if (!self->map_fence) {
-        hr = self->device->real->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(self->map_fence.GetAddressOf()));
-        if (FAILED(hr)) return hr;
-        if (!self->map_fence) return E_FAIL;
-    }
-    ID3D12Fence* const fence = self->map_fence.Get();
-    const std::uint64_t value = ++self->map_fence_value;
-    using clock = std::chrono::steady_clock;
-    const auto t0 = clock::now();
-    hr = queue->Signal(fence, value);
-    if (SUCCEEDED(hr) && slot31_async()) {
-        AsyncMapping job{map, self->map_fence, value, {}, {}, pool, pages, flags};
-        job.batches.assign(batches, batches + count);
-        job.ranges.resize(count);
-        for (UINT b = 0; b < count; ++b) {
-            if (batches[b].count && batches[b].ranges)
-                job.ranges[b].assign(batches[b].ranges, batches[b].ranges + batches[b].count);
-            job.batches[b].ranges = job.ranges[b].data();
+    } else {
+        if (!self->map_fence) {
+            hr = self->device->real->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&self->map_fence));
+            if (FAILED(hr)) return hr;
+            if (!self->map_fence) return E_FAIL;
         }
-        async_mapper().push(std::move(job));
-        return S_OK;
+        ID3D12Fence* const fence = self->map_fence;
+        const std::uint64_t value = ++self->map_fence_value;
+        hr = queue->Signal(fence, value);
+        if (SUCCEEDED(hr) && slot31_async()) {
+            AsyncMapping job{map, fence, value, {}, {}, pool, pages, flags};
+            job.batches.assign(batches, batches + count);
+            job.ranges.resize(count);
+            for (UINT b = 0; b < count; ++b) {
+                if (batches[b].count && batches[b].ranges)
+                    job.ranges[b].assign(batches[b].ranges, batches[b].ranges + batches[b].count);
+                job.batches[b].ranges = job.ranges[b].data();
+            }
+            fence->AddRef();  // the worker releases it: destroy_child releases the queue's own reference
+            async_mapper().push(std::move(job));
+            return S_OK;
+        }
+        if (SUCCEEDED(hr)) hr = fence->SetEventOnCompletion(value, nullptr);
+        if (SUCCEEDED(hr) && fence->GetCompletedValue() == UINT64_MAX) hr = DXGI_ERROR_DEVICE_REMOVED;
     }
-    if (SUCCEEDED(hr)) hr = fence->SetEventOnCompletion(value, nullptr);
-    if (SUCCEEDED(hr) && fence->GetCompletedValue() == UINT64_MAX) hr = DXGI_ERROR_DEVICE_REMOVED;
     const auto t1 = clock::now();
-    if (SUCCEEDED(hr) && !map(count, batches, pool, pages, flags)) {
+    if (SUCCEEDED(hr) && !deferred && !map(count, batches, pool, pages, flags)) {
         const DWORD error = GetLastError();
         hr = error ? HRESULT_FROM_WIN32(error) : E_FAIL;
     }
@@ -2260,8 +2374,28 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
     } else {
         note_child_slot<K>(Slot);
         std::unique_lock<std::mutex> queue_order;
-        if constexpr (K == ChildKind::queue && queue_slot_orders_work(Slot))
-            queue_order = std::unique_lock(self->queue_order);
+        // Both queue-order fixes: only work that orders on the queue takes queue_order. The markers do not, and
+        // neither does slot 18 - an ExecuteCommandListsX holds it for its whole replay, which can include building a
+        // pipeline for minutes, while the title's render thread asks the timestamp frequency every frame (a frozen
+        // frame loop, measured). 16/17 keep the lock when a fence comes with them (the newer layout's Signal/Wait);
+        // without one they are the older layout's frequency/calibration getter. 19/20 are the newer layout's
+        // GetClockCalibration and GetDesc (PC 17/18 shifted by two): getters there, so no lock once that layout is
+        // known (the title uses it natively); in the older layout they keep it. Queues only: for other proxy kinds
+        // a1 is not an object pointer and must not be read.
+        if constexpr (K == ChildKind::queue) {
+            bool orders = queue_slot_orders_work(Slot);
+            if (orders && (Slot == 16 || Slot == 17))
+                orders = proxy_real_object(reinterpret_cast<const void*>(a1)) != nullptr;
+            if (orders && (Slot == 19 || Slot == 20)) {
+                const unsigned char own = self->queue_layout.load(std::memory_order_relaxed);
+                const bool newer = own == ChildProxy::kQueueLayoutNewer ||
+                                   (own == ChildProxy::kQueueLayoutUnknown &&
+                                    self->device->console_layout.load(std::memory_order_relaxed) ==
+                                        ChildProxy::kQueueLayoutNewer);
+                if (newer) orders = false;
+            }
+            if (orders) queue_order = std::unique_lock(self->queue_order);
+        }
         // CopyPageMappingsBatchX when something can remap: a hook (set_copy_page_mappings_hook) or xmem. Without
         // either (a proxy compiled without xmem) the slot keeps the answer every unmodelled queue slot past the
         // public chain gets below: console-only S_OK, or E_NOTIMPL on a queue whose presentation is managed outside.
@@ -3442,10 +3576,38 @@ void WINAPI list_clear_depth_stencil_view(ListProxy* self, D3D12_CPU_DESCRIPTOR_
     reinterpret_cast<ClearDsvFn>(real_vtable[pc])(self->real, translated, flags, depth, stencil, num_rects, rects);
 }
 
+// OMSetDepthBoundsX (console slot 70 in the newer layout, this package's) -> ID3D12GraphicsCommandList1::
+// OMSetDepthBounds (PC slot 62). Its FLOAT arguments arrive in XMM1 and XMM2, which list_slot's integer thunk would
+// lose, so it has a typed thunk too. In the older layout slot 70 is a memory write (console_value_op), which this
+// thunk cannot see: LEONIDA_DEPTH_BOUNDS_SLOT70=0 keeps the generic thunk for such a title.
+constexpr unsigned kConsoleOMSetDepthBounds = 70, kPcOMSetDepthBounds = 62;
+void WINAPI list_om_set_depth_bounds(ListProxy* self, FLOAT min, FLOAT max) {
+    std::uint32_t lo = 0, hi = 0;
+    std::memcpy(&lo, &min, sizeof lo);
+    std::memcpy(&hi, &max, sizeof hi);
+    const unsigned char layout = self->device->console_layout.load(std::memory_order_relaxed);
+    note_list_slot(kConsoleOMSetDepthBounds, lo, hi, 0, 0, layout);
+    if (layout == kConsoleLayoutOlder) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: list slot 70 in the older layout is a memory write the depth-bounds "
+                                 "thunk drops; run with LEONIDA_DEPTH_BOUNDS_SLOT70=0\n");
+        return;
+    }
+    if (kPcOMSetDepthBounds >= self->pc_slot_count) return;
+    using Fn = void(WINAPI*)(IUnknown*, FLOAT, FLOAT);
+    auto** const real_vtable = *reinterpret_cast<void***>(self->real);
+    reinterpret_cast<Fn>(real_vtable[kPcOMSetDepthBounds])(self->real, min, max);
+}
+
 template <std::size_t... I>
 void fill_list_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&list_slot<static_cast<unsigned>(I)>) ), ...);
     vtable[kConsoleClearDepthStencilView] = reinterpret_cast<void*>(&list_clear_depth_stencil_view);
+    wchar_t v[4]{};
+    const DWORD n = GetEnvironmentVariableW(L"LEONIDA_DEPTH_BOUNDS_SLOT70", v, 4);
+    if (!(n == 1 && v[0] == L'0'))
+        vtable[kConsoleOMSetDepthBounds] = reinterpret_cast<void*>(&list_om_set_depth_bounds);
 }
 
 void** get_list_vtable() {
@@ -4354,8 +4516,7 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
 
     hr = create_heap_proxy(heap, self, *riid, out, custom_cpu_start, custom_byte_size, real_cpu_start,
                            custom_cpu_start ? free_fn : nullptr, stride);
-    // LOCAL DIAGNOSTIC (fsdraw): which CPU start the title gets for this heap
-    if (leonida::local_diagnostics()) {
+    if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC (fsdraw): which CPU start the title gets for this heap
         static std::atomic<int> logged{0};
         if (logged.fetch_add(1) < 32)
             std::fprintf(stderr, "[rt] fsdraw: heap type %d num %u flags 0x%x console %d: title CPU start 0x%llx (custom "
@@ -4469,8 +4630,7 @@ void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D1
     const D3D12_CPU_DESCRIPTOR_HANDLE src = translate_cpu_handle(self, src_start);
     self->real->CopyDescriptorsSimple(num_descriptors, dest, src, type);
     local_write_through(self, dest_start, num_descriptors);
-    // LOCAL DIAGNOSTIC (fsdraw): where the title copies its descriptors, and what lands there
-    if (leonida::local_diagnostics()) {
+    if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC (fsdraw): where the title copies its descriptors, and what lands there
         static std::atomic<std::uint64_t> copies{0};
         const std::uint64_t n = ++copies;
         if (n <= 24 || n % 600 == 0 || n % 600 == 1) {
@@ -5740,7 +5900,8 @@ HRESULT proxy_create_state_object(DeviceProxy* self, const D3D12_STATE_OBJECT_DE
 // D3D12_RESOURCE_FLAGS are normalized on the copy before the PC call.
 void apply_console_placement(const D3D12_RESOURCE_DESC* descs, UINT count, D3D12_RESOURCE_ALLOCATION_INFO& info,
                              D3D12_RESOURCE_ALLOCATION_INFO1* each,
-                             const std::function<D3D12_RESOURCE_ALLOCATION_INFO(UINT)>& pc_one, unsigned slot);
+                             const std::function<D3D12_RESOURCE_ALLOCATION_INFO(UINT)>& pc_one, unsigned slot,
+                             const D3D12_RESOURCE_DESC* title_descs);
 
 std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2,
                                                   std::uint64_t a3, std::uint64_t a4, std::uint64_t a5) {
@@ -5815,7 +5976,7 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
     if (info1 && !pc.empty())
         apply_console_placement(pc.data(), count, *ret, info1, [&](UINT i) {
             return D3D12_RESOURCE_ALLOCATION_INFO{info1[i].SizeInBytes, info1[i].Alignment};
-        }, 108);
+        }, 108, raw_descs);
     return reinterpret_cast<std::uint64_t>(ret);
 }
 
@@ -6103,13 +6264,15 @@ StructReturnCall struct_return_call(std::uint64_t a0, std::uint64_t a1) {
 
 // The console size of a list of descriptions (d3d12_xs_alloc_size.h): the PC device's answer with every console render
 // target laid out at its console size, each at its own alignment. `info` is the PC answer and is replaced only when
-// the console layout is larger. `each` is the per-description array of slot 56, or null.
+// the console layout is larger. `each` is the per-description array of slot 56, or null. `title_descs` is the
+// title's own array when `descs` is its PC form (the layout words the PC form drops), else null.
 void apply_console_placement(const D3D12_RESOURCE_DESC* descs, UINT count, D3D12_RESOURCE_ALLOCATION_INFO& info,
                              D3D12_RESOURCE_ALLOCATION_INFO1* each,
-                             const std::function<D3D12_RESOURCE_ALLOCATION_INFO(UINT)>& pc_one, unsigned slot) {
+                             const std::function<D3D12_RESOURCE_ALLOCATION_INFO(UINT)>& pc_one, unsigned slot,
+                             const D3D12_RESOURCE_DESC* title_descs) {
     if (info.SizeInBytes == UINT64_MAX) return;
     D3D12_RESOURCE_ALLOCATION_INFO console{};
-    if (!console_placement(descs, count, pc_one, console, each)) return;
+    if (!console_placement(descs, count, pc_one, console, each, title_descs)) return;
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed))
         std::fprintf(stderr,
@@ -6117,6 +6280,22 @@ void apply_console_placement(const D3D12_RESOURCE_DESC* descs, UINT count, D3D12
                      "description(s)\n",
                      slot, static_cast<unsigned long long>(console.SizeInBytes),
                      static_cast<unsigned long long>(info.SizeInBytes), static_cast<unsigned>(count));
+    // The first few textures the title writes with the CPU through its lock that took their console layout's size
+    // (console_unordered_access_size).
+    static std::atomic<int> uav_logged{0};
+    for (UINT i = 0; descs && i < count && uav_logged.load(std::memory_order_relaxed) < 8; ++i) {
+        const D3D12_RESOURCE_DESC& d = descs[i];
+        const UINT layout = static_cast<UINT>((title_descs ? title_descs : descs)[i].Layout);
+        const UINT64 written = console_unordered_access_size(d, layout);
+        if (!written || uav_logged.fetch_add(1, std::memory_order_relaxed) >= 8) continue;
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot %u: unordered-access texture dimension %d %llux%ux%u mips %u format %d "
+                     "layout 0x%x takes its console layout's %llu B (list %llu B, PC %llu B)\n",
+                     slot, static_cast<int>(d.Dimension), static_cast<unsigned long long>(d.Width), d.Height,
+                     unsigned(d.DepthOrArraySize), unsigned(d.MipLevels), static_cast<int>(d.Format), layout,
+                     static_cast<unsigned long long>(written), static_cast<unsigned long long>(console.SizeInBytes),
+                     static_cast<unsigned long long>(info.SizeInBytes));
+    }
     // A list with a depth-stencil target may come out smaller than the PC answer (console_depth_stencil_size).
     bool depth = false;
     for (UINT i = 0; descs && i < count && !depth; ++i) {
@@ -6185,7 +6364,7 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     // own code and tests, which compare with the PC device) gets the PC device's answer unchanged.
     if (call.console_abi)
         apply_console_placement(descs, desc_count, info, nullptr,
-                                [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
+                                [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25, title_descs);
     // LEONIDA_LOG_ALLOCINFO=1: every call, with the calling thread (the title sums a batch of these against a fixed
     // pool and asserts when the batch does not fit).
     static const bool log_all = [] {
@@ -6238,7 +6417,7 @@ void* WINAPI proxy_get_resource_allocation_info1(std::uint64_t a0, std::uint64_t
         auto& info = *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret);
         apply_console_placement(descs, n, info, each, [&](UINT i) {
             return D3D12_RESOURCE_ALLOCATION_INFO{each[i].SizeInBytes, each[i].Alignment};
-        }, 56);
+        }, 56, nullptr);
     }
     return returned;
 }
