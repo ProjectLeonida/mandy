@@ -260,6 +260,17 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual((row["signature"], row["count"], row["detail"]),
                          ("psin", 2, "tags=LSCH,CHKS;field8=22;complete=1"))
 
+    def test_text_is_judged_on_the_same_512_bytes_as_a_carved_file(self):
+        # _printable samples 512 bytes. The archive scan kept only 256, so a stream whose first 306 bytes are
+        # printable read as text from an archive and as raw from its carved file.
+        data = b"name=" + b"a" * 301 + bytes(range(256)) + bytes(44)
+        rpf = os.path.join(self.root, "text_head.rpf")
+        with open(rpf, "wb") as f:
+            f.write(b"9FPR" + struct.pack("<I", 16) + bytes(8) + zlib.compress(data) + bytes(64))
+        (row,), _ = restofworld_index.scan_rpf(rpf)
+        self.assertEqual(row["signature"], restofworld_index.classify(data, 0, len(data))["signature"])
+        self.assertNotEqual(row["signature"], "text")
+
     def test_scan_limit(self):
         limit = self.offsets[2] - 0x100 - 1
         rows, summary = restofworld_index.scan_rpf(self.rpf, limit=limit)
