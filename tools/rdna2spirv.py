@@ -7824,13 +7824,16 @@ class Gen:
         zero = self.cu(0)
         src0 = self.tmp()
         self.emit(f"{src0} = OpSelect %uint {src_ok} {shuffled} {zero}")
-        src0 = self.modify(src0, src)
         if dpp8 is not None or bound:
             write = enabled
         else:
             write = self.tmp()
             self.emit(f"{write} = OpLogicalAnd %bool {enabled} {src_ok}")
         args[1] = {"k": "ssa", "v": src0}
+        if src.get("neg"):
+            args[1]["neg"] = True
+        if src.get("abs"):
+            args[1]["abs"] = True
         if compare:
             # Every lane is enabled and an invalid source reads 0 (checked above), so the compare's own EXEC guard
             # is the only one: the mask write is the plain compare's.
