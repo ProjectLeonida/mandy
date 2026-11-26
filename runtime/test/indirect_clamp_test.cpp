@@ -2,8 +2,8 @@
 //
 //   - in-range records of every kind (draw, draw indexed, dispatch, mesh dispatch) come back bit-identical, and the
 //     pass counts nothing as clamped;
-//   - a garbage record is bounded (2^24 vertices, 2^26 vertex instances, 65 535 groups per dimension, 2^20 groups per
-//     dispatch) instead of asking for billions of groups;
+//   - a garbage record is bounded (2^26 vertex instances, 65 535 groups per dimension, 2^20 groups per dispatch)
+//     instead of asking for billions of groups, and a draw record of 2^23 vertices or more runs empty and free;
 //   - a counted batch clamps the count to max_command_count and empties the records past it;
 //   - a batch whose records fit but whose total work passes the 2^27 budget runs all but the records that no longer
 //     fit, so thousands of garbage records cannot run for seconds.
@@ -167,17 +167,42 @@ int main() {
         CHECK(out.counters.records_clamped == 0 && out.counters.counts_clamped == 0);
     }
 
-    // 2. A draw that asks for four billion vertices in four billion instances is cut to 2^24 vertices, and the
-    //    instances to what keeps count * instances within 2^26.
+    // 2. A draw that asks for four billion vertices in four billion instances is an unfilled slot: it runs empty,
+    //    keeping its locations, and charges nothing.
     {
         const std::uint32_t values[4] = {0xFFFFFFF0u, 0xFFFFFFFFu, 4, 6};
         Clamped out{};
         CHECK(env.run(leonida::indirect_clamp_draw, 16, 1, 4, values, nullptr, out));
         const auto words = record(out, 0, 4);
-        CHECK(words[0] == leonida::indirect_clamp_max_vertices);
-        CHECK(words[1] == leonida::indirect_clamp_max_vertex_instances / leonida::indirect_clamp_max_vertices);
+        CHECK(words[0] == 0 && words[1] == 0);
         CHECK(words[2] == 4 && words[3] == 6);
-        CHECK(out.counters.records_clamped == 1);
+        CHECK(out.counters.records_clamped == 1 && out.counters.over_budget == 0);
+    }
+
+    // 2b. Just under the unfilled count a draw is a draw: its vertices stay, and its instances are cut to what keeps
+    //     count * instances within 2^26. At the unfilled count it runs empty.
+    {
+        const std::uint32_t most = leonida::indirect_clamp_unfilled_draw - 1;
+        const std::uint32_t values[4 * 2] = {most, 100, 0, 0, leonida::indirect_clamp_unfilled_draw, 1, 0, 0};
+        Clamped out{};
+        CHECK(env.run(leonida::indirect_clamp_draw, 16, 2, 4, values, nullptr, out));
+        const auto under = record(out, 0, 4);
+        CHECK(under[0] == most && under[1] == leonida::indirect_clamp_max_vertex_instances / most);
+        CHECK(record(out, 1, 4)[0] == 0 && record(out, 1, 4)[1] == 0);
+        CHECK(out.counters.records_clamped == 2);
+    }
+
+    // 2c. Garbage counts ahead of a real draw in one list: before, each was cut to 2^24 vertices and charged them, so
+    //     eight used up the 2^27 budget and every later draw ran empty. Now they are free and the real draw runs.
+    {
+        std::vector<std::uint32_t> values;
+        for (std::uint32_t r = 0; r < 16; ++r) values.insert(values.end(), {0x01000000u + r, 1, 0, 0});
+        const std::uint32_t valid[] = {300, 2, 3, 4};
+        values.insert(values.end(), valid, valid + 4);
+        Clamped out{};
+        CHECK(env.run(leonida::indirect_clamp_draw, 16, 17, 4, values.data(), nullptr, out));
+        CHECK(out.counters.over_budget == 0 && out.counters.records_clamped == 16);
+        CHECK(record(out, 16, 4) == std::vector<std::uint32_t>(valid, valid + 4));
     }
 
     // 3. A counted draw: the count is clamped to max_command_count, and the records past min(count, max) are empty.
@@ -210,14 +235,23 @@ int main() {
         CHECK(out.counters.counts_clamped == 1);
     }
 
-    // 4. An indexed draw keeps its two locations and its first instance, and bounds its index count.
+    // 4. An indexed draw keeps its two locations and its first instance: an unfilled index count runs empty, and a
+    //    real one keeps its indices with the instances bounded.
     {
         const std::uint32_t values[5] = {0xFFFFFFFFu, 0xFFFFFFFFu, 10, 20, 30};
         Clamped out{};
         CHECK(env.run(leonida::indirect_clamp_draw_indexed, 20, 1, 5, values, nullptr, out));
         const auto words = record(out, 0, 5);
-        CHECK(words[0] == leonida::indirect_clamp_max_vertices);
-        CHECK(words[1] == leonida::indirect_clamp_max_vertex_instances / leonida::indirect_clamp_max_vertices);
+        CHECK(words[0] == 0 && words[1] == 0);
+        CHECK(words[2] == 10 && words[3] == 20 && words[4] == 30);
+        CHECK(out.counters.records_clamped == 1);
+    }
+    {
+        const std::uint32_t values[5] = {3000, 0xFFFFFFFFu, 10, 20, 30};
+        Clamped out{};
+        CHECK(env.run(leonida::indirect_clamp_draw_indexed, 20, 1, 5, values, nullptr, out));
+        const auto words = record(out, 0, 5);
+        CHECK(words[0] == 3000 && words[1] == leonida::indirect_clamp_max_vertex_instances / 3000);
         CHECK(words[2] == 10 && words[3] == 20 && words[4] == 30);
         CHECK(out.counters.records_clamped == 1);
     }
@@ -300,7 +334,7 @@ int main() {
 
     // Three calls on one list consume two full draw allowances. A fresh list starts at zero.
     {
-        const std::uint32_t args[] = {1u << 24, 4, 0, 0};
+        const std::uint32_t args[] = {1u << 22, 16, 0, 0};  // 2^26 units: half the list budget, a real draw
         std::memcpy(env.arguments_map, args, sizeof(args));
         auto batch = clamp.batch();
         leonida::ClampedIndirect jobs[4]{};
@@ -331,7 +365,7 @@ int main() {
     //    clamped, none falls back to the application's buffer; the calls past the slots only lose their counters.
     {
         std::memset(env.arguments_map, 0, size_t(env.argument_bytes));
-        const std::uint32_t huge[4] = {0xFFFFFFF0u, 0xFFFFFFFFu, 4, 6};
+        const std::uint32_t huge[4] = {0x00400000u, 0xFFFFFFFFu, 4, 6};  // 2^22 vertices: a draw, its instances cut
         std::memcpy(env.arguments_map, huge, sizeof huge);
         std::memset(env.readback_map, 0xcd, size_t(env.readback_bytes));
         const auto before = clamp.counters();
@@ -362,7 +396,9 @@ int main() {
             });
             CHECK(ok);
             const auto* words = static_cast<const std::uint32_t*>(env.readback_map);
-            CHECK(words[0] == leonida::indirect_clamp_max_vertices && words[2] == 4 && words[3] == 6);
+            CHECK(words[0] == 0x00400000u &&
+                  words[1] == leonida::indirect_clamp_max_vertex_instances / 0x00400000u && words[2] == 4 &&
+                  words[3] == 6);
         }
         clamp.retire(VK_NULL_HANDLE, 0);
         clamp.collect();
