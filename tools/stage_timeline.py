@@ -77,7 +77,11 @@ def main():
     ap.add_argument("log")
     ap.add_argument("--json", action="store_true", help="print the stages and presses as JSON")
     a = ap.parse_args()
-    peeks, presses = read(a.log)
+    try:
+        peeks, presses = read(a.log)
+    except OSError as e:  # a wrong path or a folder is one line, not a traceback
+        print(f"stage_timeline: error: cannot read {a.log}: {e.strerror or e}", file=sys.stderr)
+        return 2
     if not peeks:
         print("no peek lines: run with LEONIDA_PEEK=0x7446510,0x98f828c,0x7453ed0", file=sys.stderr)
         return 1
