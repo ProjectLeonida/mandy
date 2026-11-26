@@ -24,6 +24,13 @@ static_assert(sizeof(PageRange) == 12 && sizeof(PageBatch) == 24 && offsetof(Pag
 // Record the two measured stream-pool reservation return sites; other callers are ignored.
 void note_stream_reservation(std::uintptr_t base, std::size_t size, std::uintptr_t caller_rva);
 bool queue_page_mappings_enabled();
+// Pages the console queue's CopyPageMappingsBatchX (the range form, copy_page_mappings_fn) changed so far: by a table
+// update alone (a GPU-only page with a CPU pair) and by a host map or unmap (its paired CPU page, or a destination with
+// no pair). Each host one is a MapViewOfFile3/UnmapViewOfFile2 pair, a wineserver round trip under Wine.
+void slot31_mapping_counts(std::uint64_t& table_pages, std::uint64_t& host_pages);
+// The same, for the command-object proxy, which is also compiled into tests without xmem: null there.
+using Slot31MappingCountsFn = void (*)(std::uint64_t& table_pages, std::uint64_t& host_pages);
+inline Slot31MappingCountsFn slot31_mapping_counts_fn = nullptr;
 bool slot31_runs();
 bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uintptr_t pool,
                         std::uint32_t pool_pages, std::uint32_t flags);

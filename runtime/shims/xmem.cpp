@@ -533,6 +533,18 @@ using HostUnorderedMap =
 using AddressSet = std::set<uintptr_t, std::less<uintptr_t>, leonida::host_heap::Allocator<uintptr_t>>;
 HostUnorderedMap<uintptr_t, uint64_t> g_mapped;            // mapped 64 KiB address -> page number
 HostUnorderedMap<uint64_t, AddressSet> g_page_addresses;  // page number -> the addresses it is mapped at
+// Pages of a GPU-only range that the console queue's CopyPageMappingsBatchX gave a physical page: in g_mapped, with no
+// host view. Nothing on the host reads a GPU-only address: the D3D12 layer and DirectStorage read the paired CPU range
+// (title_gpu_views::to_cpu), the runtime reads a page by its number through the section's scratch view (host_page), and
+// the title's CPU never touches it (the range is PAGE_NOACCESS on the console). So the copy there is a table update, as
+// it is on the console, where it edits GPU page tables only. With g_phys_mutex held.
+// A table page is not one of its physical page's host addresses (note_mapping, g_page_addresses, the alias peers):
+// no host write can come through it and no host guard can be set on it, so a page mapped at its CPU twin and at a
+// table page is not aliased for the slot-133 shadows and the geometry watch, which act on host addresses only.
+AddressSet g_table_pages;
+// Pages CopyPageMappingsBatchX mapped (or unmapped) by the table alone, and those that took a host view: the paired
+// CPU page, or a destination with no CPU pair (rt::xmem::slot31_mapping_counts).
+std::atomic<uint64_t> g_slot31_table_pages{0}, g_slot31_host_pages{0};
 // The same aliases, for readers that must not wait behind g_phys_mutex (geometry_aliases, from the D3D12 layer's
 // submission thread: speed-16 and re-1 had it waiting there behind the streaming workers' scatter batches and the
 // render thread's queue slot 31, which hold g_phys_mutex through every MapViewOfFile3). Only addresses whose page is
@@ -1046,6 +1058,11 @@ struct UnmapCause {
 // sees the failure.
 bool unmap_range_locked(uintptr_t start, uintptr_t end) {
     g_unmaps[g_unmap_count++ % kUnmapRecords] = {start, end, GetTickCount64(), t_unmap_cause};
+    // Table-only pages of a GPU-only range (g_table_pages) have no view: they leave the table here.
+    for (auto table = g_table_pages.lower_bound(start); table != g_table_pages.end() && *table < end;) {
+        g_mapped.erase(*table);
+        table = g_table_pages.erase(table);
+    }
     auto it = g_views.upper_bound(start);
     if (it != g_views.begin()) {
         const auto prev = std::prev(it);
@@ -2023,6 +2040,39 @@ bool title_mapped_twin(uintptr_t address, uintptr_t gpu, bool unmap) {
     return true;
 }
 
+// With g_phys_mutex held. Gives the GPU-only page at `gpu` physical page `page` (0: none) in the table alone: no host
+// view, no host call, unless a view is there already (one the title mapped with XMemMapPhysicalPages, or a zero page a
+// fault planted), which is unmapped first. What the GPU-side copies follow is the paired CPU page, mapped by the
+// caller; the GPU-only address itself is told as a host remap would tell it, except that it is not one of the
+// physical page's host addresses (g_table_pages).
+bool map_table_page(uintptr_t gpu, uint64_t page) {
+    if (page && !g_pages.contains(page)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    if (const auto was = g_table_pages.find(gpu); was != g_table_pages.end()) {
+        const auto mapped = g_mapped.find(gpu);
+        if (mapped != g_mapped.end() && mapped->second == page) return true;
+        if (mapped != g_mapped.end()) g_mapped.erase(mapped);
+        g_table_pages.erase(was);
+    } else {
+        bool viewed;
+        {
+            const FaultLockShared faults;
+            viewed = view_covers(gpu);
+        }
+        if (viewed && !unmap_page(gpu)) return false;  // also drops its g_mapped entry
+    }
+    if (page) {
+        g_mapped[gpu] = page;
+        g_table_pages.insert(gpu);
+    }
+    leonida::title_memory_map::changed(gpu, gpu + kPhysicalPageSize);
+    leonida::geometry_writes::notify(gpu, gpu + kPhysicalPageSize, leonida::geometry_writes::Event::replaced);
+    g_slot31_table_pages.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 bool copy_page_mappings(void* destination, const void* source, uint64_t pages, bool repeat_first) {
     const uintptr_t to = reinterpret_cast<uintptr_t>(destination);
     const uintptr_t from = reinterpret_cast<uintptr_t>(source);
@@ -2046,11 +2096,14 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
             const uintptr_t gpu = to + i * kPhysicalPageSize, cpu = cpu_to + i * kPhysicalPageSize;
             {
                 const UnmapCause cause("CopyPageMappingsBatchX (unmap)");
-                if (!unmap_page(gpu)) return false;
+                // A GPU-only page with a CPU pair leaves the table; any other destination is unmapped on the host.
+                if (!(cpu_window ? map_table_page(gpu, 0) : unmap_page(gpu))) return false;
+                if (!cpu_window) g_slot31_host_pages.fetch_add(1, std::memory_order_relaxed);
             }
             if (!cpu_window || title_mapped_twin(cpu, gpu, true)) continue;
             const UnmapCause cause("CopyPageMappingsBatchX (unmap paired CPU page)");
             if (!unmap_page(cpu)) return false;
+            g_slot31_host_pages.fetch_add(1, std::memory_order_relaxed);
         }
         return true;
     }
@@ -2075,13 +2128,24 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
         const uint64_t page = found[static_cast<size_t>(i)];
         const uintptr_t gpu = to + i * kPhysicalPageSize, cpu = cpu_to + i * kPhysicalPageSize;
         const UnmapCause cause(page ? "CopyPageMappingsBatchX (remap)" : "CopyPageMappingsBatchX (hole)");
-        if (!map_page(gpu, page, protect, MapOwner::slot31)) return false;
-        if (cpu_window && !title_mapped_twin(cpu, gpu, false) && !map_page(cpu, page, cpu_protect, MapOwner::mirror))
-            return false;
+        // The GPU-only page of a paired range is a table entry (map_table_page); a destination without a CPU pair is
+        // read where it is, so it is mapped on the host as before.
+        if (cpu_window) {
+            if (!map_table_page(gpu, page)) return false;
+        } else {
+            if (!map_page(gpu, page, protect, MapOwner::slot31)) return false;
+            g_slot31_host_pages.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (cpu_window && !title_mapped_twin(cpu, gpu, false)) {
+            if (!map_page(cpu, page, cpu_protect, MapOwner::mirror)) return false;
+            g_slot31_host_pages.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     return true;
 }
 [[maybe_unused]] const bool g_copy_page_mappings_set =(rt::xmem::copy_page_mappings_fn = &copy_page_mappings, true);
+[[maybe_unused]] const bool g_slot31_mapping_counts_set =
+    (rt::xmem::slot31_mapping_counts_fn = &rt::xmem::slot31_mapping_counts, true);
 
 // The title's write watching, on reservations it made with MEM_WRITE_WATCH. One xmem write-watched for the shadows
 // (reserve_watched) is refused as the host refuses a region that is not write-watched ((UINT)-1,
@@ -2650,6 +2714,11 @@ void geometry_aliases(std::uintptr_t va, std::vector<std::uintptr_t>& addresses)
 }
 
 std::uint64_t zero_pages_taken() { return g_zero_pages.next; }
+
+void slot31_mapping_counts(std::uint64_t& table_pages, std::uint64_t& host_pages) {
+    table_pages = g_slot31_table_pages.load(std::memory_order_relaxed);
+    host_pages = g_slot31_host_pages.load(std::memory_order_relaxed);
+}
 
 void set_fault_race_hook(FaultRaceHook hook) { g_fault_race_hook.store(hook, std::memory_order_release); }
 
