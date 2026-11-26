@@ -22,6 +22,7 @@
 #include "bmi_emulation.h"
 #include "clzero_patch.h"
 #include "cpu_emulation.h"
+#include "isa_jit_patch.h"
 
 namespace rt {
 
@@ -2215,6 +2216,21 @@ void Loader::protect_sections(Module& m) {
             std::fprintf(stderr,
                          "[rt] loader: %s: %zu CLZERO loops run from stubs at %p (%zu bytes), not as a #UD per line\n",
                          m.name.c_str(), patched.sites, static_cast<void*>(patched.stubs), patched.stub_bytes);
+    }
+    {
+        const auto isa = rt::isa_jit_patch::patch_image(m.base, m.size);
+        if (isa.stubs && isa.stub_bytes) {
+            std::unique_lock lock(ranges_mutex_);
+            ranges_.push_back({reinterpret_cast<uint64_t>(isa.stubs),
+                               static_cast<uint32_t>(isa.stub_bytes), m.name + "[isa-stubs]"});
+        }
+        if (isa.inplace_sites || isa.bmi_stubs || isa.avx2_stubs || isa.fma3_stubs) {
+            std::fprintf(stderr,
+                         "[rt] loader: %s: native AVX1/x64 acceleration: %zu in-place, %zu BMI, %zu AVX2 (%zu fused 4B), "
+                         "%zu FMA3 stubs at %p (%zu KiB)\n",
+                         m.name.c_str(), isa.inplace_sites, isa.bmi_stubs, isa.avx2_stubs, isa.avx2_fused_4b,
+                         isa.fma3_stubs, static_cast<void*>(isa.stubs), (isa.stub_bytes + 1023u) / 1024u);
+        }
     }
     static const auto bmi_host = rt::bmi_emulation::detect_host();
     if ((!bmi_host.bmi1 || !bmi_host.lzcnt) && rt::bmi_emulation::lzcnt_patch_enabled()) {

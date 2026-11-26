@@ -424,6 +424,12 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(avx2_emulation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(avx2_emulation_test PRIVATE /W4 /permissive- /utf-8)
 
+  # Ahead-of-time AVX1 + SSE4.2 native stub compiler and in-place VEX rewriter (src/isa_jit_patch.h).
+  add_executable(isa_jit_patch_test test/isa_jit_patch_test.cpp)
+  target_include_directories(isa_jit_patch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(isa_jit_patch_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(isa_jit_patch_test PRIVATE /W4 /permissive- /utf-8)
+
   # Xbox DirectStorage (DStorageGetFactory under dstorage_xs.dll, xcrdapi.dll and dstorage.dll) over synthetic files:
   # GAME: paths through the file shims, queues, status arrays, fences and errors. No GPU, no game data.
   set(dstorage_vectors "${CMAKE_CURRENT_BINARY_DIR}/dstorage_vectors.inc")
@@ -1682,6 +1688,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET avx2_emulation_test)
     add_test(NAME avx2_emulation COMMAND avx2_emulation_test)
+  endif()
+  if(WIN32 AND TARGET isa_jit_patch_test)
+    add_test(NAME isa_jit_patch COMMAND isa_jit_patch_test)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
