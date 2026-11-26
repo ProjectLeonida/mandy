@@ -258,15 +258,29 @@ The runtime's model:
   a gate fence that is signalled once memory compares true. The Vulkan layer holds the queue's later work behind
   that wait without blocking the submitting thread (`src/queue_holds.h`). The pump only decides; a second thread,
   the releaser, signals the gates, because that Signal runs the work the layer held behind them (the held
-  submission, the shadow refresh, a deferred Present), and the pump keeps landing writes and timing gates out
-  meanwhile.
-- A gate opens after `LEONIDA_VALUE_WAIT_TIMEOUT_MS` (default 200) whatever memory holds, counted from when the
-  gates before it on its queue opened, and logged once per address. An address that timed out three times in a row
-  (the last 256 addresses are counted) gets 4 ms. Once four gates in a row timed out, so does every wait for an
-  address no wait was ever met for, until a gate cut short is met within its 4 ms; a wait cut short that memory
-  meets within the rest of the full timeout gives its address the full timeout from then on.
-  `LEONIDA_LIST_VALUES=0` drops both methods, as before. After `stop_list_values` (the process is ending) nothing
-  new is landed or opened.
+  submission, the shadow refresh, a deferred Present), and the pump keeps landing writes and looking at gates
+  meanwhile. Other queues' work, which does not wait for the gate, goes on.
+- A gate is held until memory compares true, however long that takes: there is no timeout. It goes without its
+  value only when nothing else can make progress (`src/list_value_progress.h`): the releaser is idle, no title
+  `ExecuteCommandLists` is in progress, and no write group or remap of the pump runs on the GPU (one whose Signal the
+  layer holds behind a gate, a relayed wait or a title fence is not running). Then, for a queue's first held gate:
+  - **cycle**: what would write its value is held behind a gate that depends, through further held writes, on its
+    own queue: released at once;
+  - **present**: the title has presented since the gate was held (the present stands behind the held work): the
+    oldest gate that no held write could meet goes; a gate whose writer is held behind another queue's gate waits for
+    that one, so a chain unwinds in order;
+  - **stalled**: the title has made no queue call for 2 s and the gate has stood as long: its threads wait for the
+    held work (a deadlock through the title's CPU).
+  At device loss every gate goes. Each release is logged with the gate, its queue, the wait (address, comparison,
+  reference, memory) and the reason; a released wait is then watched for 10 s and, if memory meets it, counted and
+  logged with how much later (`met after release`). The periodic `list values so far` line counts gates held, met and
+  released unmet by reason, and names the oldest gate still held. The rule follows VIctory-Belobug-AMD's queue line
+  (`crates/victory-gpu/src/queue/behind.rs` `step`, `queue.rs` `release_held`: a held wait is forced only at a present
+  with nothing else runnable). The fixed 200 ms timeout (`LEONIDA_VALUE_WAIT_TIMEOUT_MS`) and its 4 ms demotions are
+  gone: at the slow frames of a Linux world run (seconds a frame), 14-63 gates per run timed out with memory one
+  step below a rising reference, the writer's value not there yet. `LEONIDA_LIST_VALUES=0` drops both methods, as
+  before. After `stop_list_values` (the process is ending) nothing new is landed or opened, and a held gate does not
+  delay it.
 - Queue slot 31 (`CopyPageMappingsBatchX`, section 4) waits at most 16 ms for the queue's earlier work. Work held
   behind a gate takes longer: the remap is then deferred to the releaser, which runs it once the queue's write
   fence passes the call's point and only then opens a gate the queue's later work waits on, so the GPU sees the
