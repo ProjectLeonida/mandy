@@ -4,7 +4,7 @@
 //   3. Unexported PS Input Location: zero-filled via OpConstantNull without declaring a dangling GS Input.
 //   4. VS ClipDistance[2] and CullDistance[3] forwarding (capabilities, BuiltIn arrays, no duplicate types).
 //   5. Combined link_f16_halves + build_bary_fallback_gs: f16 relocation preserves bary_location and forwards relocated halves.
-//   6. Clean refusals: mixed ClipDistance + CullDistance, ShaderLayer / ShaderViewportIndex, non-vec3 collision at bary_location.
+//   6. Clean refusals: ShaderLayer / ShaderViewportIndex, non-vec3 collision at bary_location.
 //   7. Computed I/J pairs (RT-BARY-FALLBACK-PER-VERTEX): a PS `Flat vec4[3]` Input named by `per_vertex` gets the
 //      triangle's three values of the VS output it maps, with shared GS Inputs, zero-fill and clean refusals.
 // Optional `--dump-dir <dir>` writes each synthesized GS binary for external `spirv-val` inspection.
@@ -241,8 +241,8 @@ struct GsInspection {
     int end_primitives = 0;
     bool has_in_pos = false;
     bool has_out_pos = false;
-    std::uint32_t builtin_dist_in = 0;
-    std::uint32_t builtin_dist_out = 0;
+    std::set<std::uint32_t> builtin_dist_in;
+    std::set<std::uint32_t> builtin_dist_out;
 };
 
 bool verify_gs_module(const std::vector<std::uint32_t>& words, GsInspection& out) {
@@ -376,8 +376,8 @@ bool verify_gs_module(const std::vector<std::uint32_t>& words, GsInspection& out
                 if (storage == kStorageInput) out.has_in_pos = true;
                 if (storage == kStorageOutput) out.has_out_pos = true;
             } else if (inst.words[3] == 3 || inst.words[3] == 4) {
-                if (storage == kStorageInput) out.builtin_dist_in = inst.words[3];
-                if (storage == kStorageOutput) out.builtin_dist_out = inst.words[3];
+                if (storage == kStorageInput) out.builtin_dist_in.insert(inst.words[3]);
+                if (storage == kStorageOutput) out.builtin_dist_out.insert(inst.words[3]);
             }
         } else if (inst.words[2] == kDecorationLocation) {
             const std::uint32_t loc = inst.words[3];
@@ -475,7 +475,7 @@ int main(int argc, char** argv) {
         GsInspection ins;
         CHECK(verify_gs_module(gs, ins));
         CHECK(ins.caps.count(32) == 1 && !ins.caps.count(33));
-        CHECK(ins.builtin_dist_in == 3 && ins.builtin_dist_out == 3);
+        CHECK(ins.builtin_dist_in == std::set<std::uint32_t>{3} && ins.builtin_dist_out == std::set<std::uint32_t>{3});
         maybe_dump(dump_dir, "gs_clip2", gs);
     }
 
@@ -491,7 +491,7 @@ int main(int argc, char** argv) {
         GsInspection ins;
         CHECK(verify_gs_module(gs, ins));
         CHECK(ins.caps.count(33) == 1 && !ins.caps.count(32));
-        CHECK(ins.builtin_dist_in == 4 && ins.builtin_dist_out == 4);
+        CHECK(ins.builtin_dist_in == std::set<std::uint32_t>{4} && ins.builtin_dist_out == std::set<std::uint32_t>{4});
         CHECK(ins.out_loc_vec_len[0] == 3 && ins.out_loc_vec_len[1] == 4);
         maybe_dump(dump_dir, "gs_cull3", gs);
     }
@@ -524,16 +524,30 @@ int main(int argc, char** argv) {
         maybe_dump(dump_dir, "gs_f16_linked", gs);
     }
 
-    // 6. Refusals leave caller's gs_words untouched.
+    // 6. Mixed ClipDistance and CullDistance use independent built-ins and capabilities.
+    {
+        const auto vs_mixed = build_vs({.raw_locs = {0}, .clip_count = 1, .cull_count = 1});
+        const auto ps_ok = build_ps({0}, {}, 1);
+        std::vector<std::uint32_t> gs;
+        std::string err;
+        BaryFallbackGsInfo info{};
+        CHECK(build_bary_fallback_gs(vs_mixed, ps_ok, 1, gs, &info, &err));
+        CHECK(info.clip_count == 1 && info.cull_count == 1);
+        GsInspection ins;
+        CHECK(verify_gs_module(gs, ins));
+        CHECK(ins.caps.count(32) == 1 && ins.caps.count(33) == 1);
+        CHECK(ins.builtin_dist_in == (std::set<std::uint32_t>{3, 4}));
+        CHECK(ins.builtin_dist_out == (std::set<std::uint32_t>{3, 4}));
+        maybe_dump(dump_dir, "gs_mixed_clip_cull", gs);
+    }
+
+    // 7. Refusals leave caller's gs_words untouched.
     {
         const std::vector<std::uint32_t> sentinel = {0xdeadbeefu};
         std::vector<std::uint32_t> gs = sentinel;
         std::string err;
 
-        // Mixed ClipDistance + CullDistance.
-        const auto vs_mixed = build_vs({.raw_locs = {0}, .clip_count = 1, .cull_count = 1});
         const auto ps_ok = build_ps({0}, {}, 1);
-        CHECK(!build_bary_fallback_gs(vs_mixed, ps_ok, 1, gs, nullptr, &err) && !err.empty() && gs == sentinel);
 
         // ShaderLayer (69) and ShaderViewportIndex (70).
         const auto vs_layer = build_vs({.raw_locs = {0}, .extra_caps = {69}});
@@ -550,7 +564,7 @@ int main(int argc, char** argv) {
         CHECK(!build_bary_fallback_gs(vs_ok, ps_collide, 1, gs, nullptr, &err) && !err.empty() && gs == sentinel);
     }
 
-    // 7. Computed I/J pairs: bary_fallback_input.per_vertex (attribute -> first of three locations).
+    // 8. Computed I/J pairs: bary_fallback_input.per_vertex (attribute -> first of three locations).
     using PerVertexMap = std::map<std::uint32_t, std::uint32_t>;
     // 7a. The shape of a translated computed-I/J PS: attribute 0 as a Flat vec4[3] at Locations 0..2, barycentrics
     //     at 3.
