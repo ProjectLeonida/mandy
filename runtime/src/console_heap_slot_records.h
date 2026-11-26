@@ -108,9 +108,10 @@ public:
     std::uint64_t ranges_looked_at() const { return groups_looked_at_; }  // groups compared by touched(), all calls
 
     // Half `half` (0: the buffer V#, 1: the UAV counter V#) of `slot` now names [base, base + span) and resolved as
-    // `state` says (none or a V# state), its copy at `target` (0: none; see above). span 0 counts as 1.
+    // `state` says (none or a V# state), its copy at `target` (0: none; see above). span 0 counts as 1. `geometry`:
+    // its resolution asked for a geometry copy (fix_vsharp's copy_geometry), which waiting_answer tells apart.
     void set(std::size_t slot, unsigned half, State state, std::uint64_t base, std::uint64_t span,
-             std::uint64_t target) {
+             std::uint64_t target, bool geometry = false) {
         if (slot >= slots_ || half > 1 || is_texture(state)) return;
         if (state == none) {
             drop(std::uint32_t(slot * 2 + half));
@@ -118,7 +119,7 @@ public:
         }
         if (!span) span = 1;
         const Range ranges[2] = {range(base, span), target ? range(target, span) : Range{}};
-        place(std::uint32_t(slot * 2 + half), state, base, ranges);
+        place(std::uint32_t(slot * 2 + half), state, geometry ? kGeometry : 0, base, ranges);
     }
 
     // The T# of `slot` names `address` (its base) and is bound or waits as `state` (a T# state) says. The slot's
@@ -127,7 +128,27 @@ public:
         if (slot >= slots_ || !is_texture(state)) return;
         drop(std::uint32_t(slot * 2 + 1));
         const Range ranges[2] = {range(address, 1), Range{}};
-        place(std::uint32_t(slot * 2), state, address, ranges);
+        place(std::uint32_t(slot * 2), state, 0, address, ranges);
+    }
+
+    // What a V# naming [base, base + span) resolves to while another half of the same range waits: nothing, as for
+    // that half (`state` waiting or waiting_room, `target` its refused copy). Sound because a waiting record is fixed
+    // again by every change that could let it resolve (touched): while one waits, no change since its fix concerns
+    // its range, so the same lookups give the same answer. The caller applies the changes made since first (they may
+    // not be on a record yet). A V# that asks for a geometry copy takes only a half that asked for one too.
+    bool waiting_answer(std::uint64_t base, std::uint64_t span, bool geometry, State& state, std::uint64_t& target) {
+        if (!span) span = 1;
+        const auto it = indexes_[kSource].by_range.find(range(base, span));
+        if (it == indexes_[kSource].by_range.end()) return false;
+        const Group& g = groups_[it->second];
+        const std::vector<std::uint32_t>* list = !g.keys[2].empty() ? &g.keys[2]
+                                                 : !geometry && !g.keys[1].empty() ? &g.keys[1] : nullptr;
+        if (!list) return false;
+        const Half& h = halves_[list->front()];
+        // One that asks for no copy waits for a backing only, not for geometry room.
+        state = !geometry && h.state == waiting_room ? waiting : State(h.state);
+        target = h.group[kTarget] ? groups_[h.group[kTarget] - 1].start : 0;
+        return true;
     }
 
     void clear(std::size_t slot) {
@@ -166,7 +187,7 @@ public:
     void touched(const SlotChange* changes, std::size_t count, std::vector<std::uint32_t>& out) {
         out.clear();
         if (!++epoch_) {  // after 2^32 calls: no group may look visited
-            for (auto& g : groups_) g.seen[0] = g.seen[1] = 0;
+            for (auto& g : groups_) g.seen[0] = g.seen[1] = g.seen[2] = 0;
             epoch_ = 1;
         }
         bool room[2] = {};
@@ -203,6 +224,7 @@ public:
 
 private:
     static constexpr int kSource = 0, kTarget = 1, kTexture = 2;
+    static constexpr std::uint8_t kGeometry = 1;  // Half::flags: the resolution asked for a geometry copy
     static constexpr std::uint64_t kMaxSpan = (std::uint64_t(1) << 56) - 1;
     static constexpr unsigned kClasses = 65;
 
@@ -223,6 +245,7 @@ private:
         std::uint32_t place[2];  // the record's place in that group's list for its state
         std::uint32_t room;      // its place in room_ while it waits for room
         std::uint8_t state;
+        std::uint8_t flags;      // kGeometry
     };
     struct Free {
         void operator()(Half* p) const { std::free(p); }
@@ -230,12 +253,14 @@ private:
     using ByStart = std::multimap<std::uint64_t, std::uint32_t>;  // start -> group id
     struct Group {
         std::uint64_t start = 0, end = 0;
-        std::vector<std::uint32_t> keys[2];  // [0] settled records (resolved, bound), [1] waiting ones
+        // [0] settled records (resolved, bound), [1] waiting ones, [2] waiting V# halves that asked for a geometry copy
+        std::vector<std::uint32_t> keys[3];
         int index = 0;
         unsigned cls = 0;
         ByStart::iterator at{};          // in by_start[cls]
-        ByStart::iterator waiting_at{};  // in waiting_by_start, while keys[1] is not empty
-        std::uint32_t seen[2] = {};      // the touched() call that last visited each list (epoch_)
+        ByStart::iterator waiting_at{};  // in waiting_by_start, while keys[1] or keys[2] is not empty
+        std::uint32_t seen[3] = {};      // the touched() call that last visited each list (epoch_)
+        bool waits() const { return !keys[1].empty() || !keys[2].empty(); }
     };
     struct Index {
         std::unordered_map<Range, std::uint32_t, RangeHash> by_range;  // -> group id
@@ -252,7 +277,9 @@ private:
     static unsigned length_class(std::uint64_t length) {
         return length <= 1 ? 0u : unsigned(64 - std::countl_zero(length - 1));
     }
-    static int list_of(State state) { return is_waiting(state) ? 1 : 0; }
+    static int list_of(State state, std::uint8_t flags) {
+        return !is_waiting(state) ? 0 : (flags & kGeometry) ? 2 : 1;
+    }
     // The index group[n] of a record in `state` is in.
     static int index_of(State state, int n) { return is_texture(state) ? kTexture : n; }
     // The room list a record in `state` is in, or -1.
@@ -267,17 +294,19 @@ private:
     }
 
     // Records `key` in `state` under ranges[0] (and ranges[1], a V#'s target); what is unchanged stays where it is.
-    void place(std::uint32_t key, State state, std::uint64_t base, const Range (&ranges)[2]) {
+    void place(std::uint32_t key, State state, std::uint8_t flags, std::uint64_t base, const Range (&ranges)[2]) {
         Half& h = halves_[key];
         const State old = State(h.state);
         for (int n = 0; n < 2; ++n) {
             const std::uint32_t group = h.group[n];
-            const bool keep = group && list_of(old) == list_of(state) && index_of(old, n) == index_of(state, n) &&
-                              groups_[group - 1].start == ranges[n].start && groups_[group - 1].end == ranges[n].end;
+            const bool keep = group && list_of(old, h.flags) == list_of(state, flags) &&
+                              index_of(old, n) == index_of(state, n) && groups_[group - 1].start == ranges[n].start &&
+                              groups_[group - 1].end == ranges[n].end;
             if (keep) continue;
-            detach(n, key);  // in the list of the old state, which h.state still holds
-            if (ranges[n].end) attach(n, index_of(state, n), key, ranges[n], state);
+            detach(n, key);  // in the list of the old state, which h.state and h.flags still hold
+            if (ranges[n].end) attach(n, index_of(state, n), key, ranges[n], list_of(state, flags));
         }
+        h.flags = flags;
         if (room_of(old) != room_of(state)) {
             leave_room(key);
             if (room_of(state) >= 0) {
@@ -299,6 +328,7 @@ private:
         leave_room(key);
         count(State(h.state), -1);
         h.state = none;
+        h.flags = 0;
         h.base = 0;
     }
 
@@ -313,7 +343,7 @@ private:
         room.pop_back();
     }
 
-    void attach(int n, int which, std::uint32_t key, Range r, State state) {
+    void attach(int n, int which, std::uint32_t key, Range r, int list_index) {
         Index& index = indexes_[which];
         auto [it, made] = index.by_range.try_emplace(r, 0);
         if (made) {
@@ -335,12 +365,13 @@ private:
             it->second = id;
         }
         Group& g = groups_[it->second];
-        auto& list = g.keys[list_of(state)];
+        const bool waited = g.waits();
+        auto& list = g.keys[list_index];
         Half& h = halves_[key];
         h.group[n] = it->second + 1;
         h.place[n] = std::uint32_t(list.size());
         list.push_back(key);
-        if (list_of(state) == 1 && list.size() == 1) g.waiting_at = index.waiting_by_start.emplace(g.start, it->second);
+        if (list_index && !waited) g.waiting_at = index.waiting_by_start.emplace(g.start, it->second);
     }
 
     // Takes `key` out of its group[n], from the list of its current state.
@@ -350,15 +381,15 @@ private:
         const std::uint32_t id = h.group[n] - 1;
         Group& g = groups_[id];
         Index& index = indexes_[g.index];
-        const int which_list = list_of(State(h.state));
+        const int which_list = list_of(State(h.state), h.flags);
         auto& list = g.keys[which_list];
         const std::uint32_t at = h.place[n], last = list.back();
         list[at] = last;
         halves_[last].place[n] = at;
         list.pop_back();
         h.group[n] = 0;
-        if (which_list == 1 && list.empty()) index.waiting_by_start.erase(g.waiting_at);
-        if (!g.keys[0].empty() || !g.keys[1].empty()) return;
+        if (which_list && !g.waits()) index.waiting_by_start.erase(g.waiting_at);
+        if (!g.keys[0].empty() || g.waits()) return;
         index.by_range.erase(Range{g.start, g.end});
         index.by_start[g.cls].erase(g.at);
         if (index.by_start[g.cls].empty()) index.used[g.cls >> 6] &= ~(std::uint64_t(1) << (g.cls & 63));
@@ -383,6 +414,7 @@ private:
              ++it) {
             ++groups_looked_at_;
             visit(groups_[it->second], 1, out);
+            visit(groups_[it->second], 2, out);
         }
     }
 
@@ -402,6 +434,7 @@ private:
                     if (g.end <= lo) continue;
                     visit(g, 0, out);
                     visit(g, 1, out);
+                    visit(g, 2, out);
                 }
             }
     }

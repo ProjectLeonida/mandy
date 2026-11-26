@@ -2176,6 +2176,20 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    waiting slots, a texture made after the T# was written, at the first submission after it appears. T#s are a third
    index of the same kind, keyed by their address: a texture change visits exactly the T#s recorded for that address,
    and the records waiting for room are kept in a list per kind, which a change saying room was made visits whole.
+   The title rebuilds T#s of the layer's textures from 32 bits: the unbound T#s of one world run named 0x7f0000021400
+   for the layer's 0x100021400, and 0x2ef600 for 0x1002ef600 (bits 32-39 clear, 0x7f or 0 in bits 40-47). Such an
+   address outside the title's memory names the layer's texture with the same low 32 bits (`tsharp_texture_key`,
+   while fewer than 2^24 texture addresses were handed out): `bind_title_image` looks it up there, and the T# waits
+   under that address, where the texture's creation is announced. Before, such T#s waited under the title's form,
+   which no arrival names, and the run showed no refill at all; `d3d12_tsharp_refill_test` writes both forms before
+   the texture exists and expects them bound at the first submission after it appears.
+   A V# the title rewrote whose range another half of the heap waits for is answered as that half was
+   (`ConsoleHeapSlotRecords::waiting_answer`), without walking the alias table, backings, geometry copies and title
+   memory again: a waiting record is fixed again by every change that could let it resolve, so while it waits its
+   answer stands. The changes noted since the submission's list was taken are applied to the heap first
+   (`sync_slot_changes`), and the submission's own changes before the rewritten slots, so an answer is never older
+   than a change that concerns it. In one world run 70% of the 2,100 rewritten V# halves a submission resolved to
+   nothing at about 9 µs each.
    Console resource heap copies and shader-visible CBV/SRV/UAV heaps with at least 65,536 slots request
    64 MiB of zeroed padding after their last descriptor. `LEONIDA_HEAP_GUARD_MB` sets the padding in MiB
    (0 disables it). When arena space is tight, allocation can fall back to the heap alone. Only indices

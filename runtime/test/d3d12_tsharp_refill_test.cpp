@@ -197,7 +197,9 @@ int main() {
 
         // The console heap, written before it is made: 60,000 T#s at addresses no texture will have (a range of the
         // address space the layer never gives textures, 256 apart), then the one to come, last.
-        constexpr UINT slots = waiting + 1;
+        // After it, the same texture's T# as the title rebuilds it from 32 bits (run 58: 0x7f0000021400 for the
+        // layer's 0x100021400, and the low 32 bits alone): both must wait for the texture and bind when it comes.
+        constexpr UINT slots = waiting + 3;
         constexpr std::uint64_t bytes = std::uint64_t(slots) * kDescriptor;
         auto* title = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         EXPECT(title);
@@ -206,6 +208,13 @@ int main() {
             std::memcpy(title + std::size_t(i) * kDescriptor, words.data(), sizeof(words));
         }
         std::memcpy(title + std::size_t(waiting) * kDescriptor, refill_words.data(), sizeof(refill_words));
+        const auto title_form = at_address(probe_words, 0x7f0000000000ull | (refill_address & 0xffffffffull));
+        const auto low_form = at_address(probe_words, refill_address & 0xffffffffull);
+        std::memcpy(title + std::size_t(waiting + 1) * kDescriptor, title_form.data(), sizeof(title_form));
+        std::memcpy(title + std::size_t(waiting + 2) * kDescriptor, low_form.data(), sizeof(low_form));
+        std::uint32_t title_key[8], low_key[8];
+        std::memcpy(title_key, title_form.data(), sizeof(title_key));
+        std::memcpy(low_key, low_form.data(), sizeof(low_key));
         const D3D12_DESCRIPTOR_HEAP_DESC console_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots,
                                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Ref<ID3D12DescriptorHeap> console_heap;
@@ -220,6 +229,8 @@ int main() {
         std::uint32_t key[8];
         std::memcpy(key, refill_words.data(), sizeof(key));
         EXPECT(rt::d3d12::bindless_hash_lookup(device.p, key) == 0);  // no texture yet: the slot waits
+        EXPECT(rt::d3d12::bindless_hash_lookup(device.p, title_key) == 0);
+        EXPECT(rt::d3d12::bindless_hash_lookup(device.p, low_key) == 0);
 
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
@@ -293,11 +304,16 @@ int main() {
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(results.data(), mapped, results.size());
         EXPECT(rt::d3d12::bindless_hash_lookup(device.p, key) != 0);
+        // The title's 32-bit forms of the same address were fixed at that submission too.
+        EXPECT(rt::d3d12::bindless_hash_lookup(device.p, title_key) != 0);
+        EXPECT(rt::d3d12::bindless_hash_lookup(device.p, low_key) != 0);
 
         // The texture goes: its T# leaves the hash table at once (a shader reading the slot gets the fallback), and
         // the next submission takes the slot's record back to waiting.
         texture.reset();
         EXPECT(rt::d3d12::bindless_hash_lookup(device.p, key) == 0);
+        EXPECT(rt::d3d12::bindless_hash_lookup(device.p, title_key) == 0);
+        EXPECT(rt::d3d12::bindless_hash_lookup(device.p, low_key) == 0);
         EXPECT(SUCCEEDED(allocator->Reset()));
         EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
         EXPECT(list->Close() == S_OK);
