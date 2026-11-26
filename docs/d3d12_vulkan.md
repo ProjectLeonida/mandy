@@ -96,7 +96,7 @@ enough for the bundled middleware's `d3d12_xs` calls, not for the game. The laye
   out)`, `n` = 1..4 records of 0x14c bytes: a u32 tag, then the payload at +4) patches a copy of that stream and creates
   the PSO through the same path. Tags 0 (`D3D12_DEPTH_STENCIL_DESC`, on DEPTH_STENCIL or DEPTH_STENCIL1), 1
   (`D3D12_RASTERIZER_DESC`), 2 (`D3D12_BLEND_DESC`) and 3 (sample mask) are the TomBox layout (GPL-3.0,
-  `create_derived_pso_x`), checked against the title's record writes in the retail build (RVA 0x2479f40): tag 1 is the
+  `create_derived_pso_x`), checked against the title's record writes in the retail build: tag 1 is the
   rasterizer (0x2c bytes, always record 0 when present), tag 0 the DEPTH_STENCIL (0x34), tag 2 the BLEND (0x148). Tag 3 (sample mask, from TomBox)
   is served although that function does not write it. Tag 5 (0x16 bytes: 16 zero bytes, then the StencilReadMask and
   StencilWriteMask bytes at the DEPTH_STENCIL offsets 0x10/0x11, then zeros) overlays only those two bytes of the base's
@@ -337,16 +337,17 @@ What is implemented (all of it testable without the game):
 - **UAV clears** (`ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat`). The CPU handle's slot is read
   while recording as the GFX10 descriptor a shader would load (section 3.4), so the clear works with any
   view-creation code that writes them and with descriptors the game builds itself; the GPU handle is not needed.
-  A T# gives the view's format (FORMAT plus DST_SEL, which tells BGRA from RGBA), mip and layers; a 3D view clears
-  every slice of its mip. A V# gives a byte range: its address minus the resource's `GetGPUVirtualAddress`, and
+  A T# gives the view's format (FORMAT plus DST_SEL, which tells BGRA from RGBA), mip and layers. A tagged 3D
+  UAV selects `FirstWSlice` and `WSize`. An untagged 3D T# covers every slice of the bound resource's selected
+  mip. A V# gives a byte range: its address minus the resource's `GetGPUVirtualAddress`, and
   NUM_RECORDS bytes (stride 0, no format: raw), records (a stride: structured) or elements (a format: typed). A view
   that reaches past the end of the buffer stops there, as the hardware's bounds check would.
   - Values follow D3D's rules (`runtime/src/uav_clear.h`): Uint copies the low bits of each value into its channel
     with no conversion, whatever the format's type; Float converts (UNORM/SNORM clamp and round to nearest, NaN is
-    0; 16-bit and the packed 11/10-bit floats round to nearest even). A raw or structured view takes value 0 for
-    every 32-bit word (Float: its bits). D3D11 calls Float on an integer view invalid and D3D12 does not say; here
-    the value is converted (toward zero, clamped, NaN 0) so the result is defined. These are checked against
-    hand-computed elements in `d3d12_uav_clear_test`.
+    0; 16-bit and the packed 11/10-bit floats round toward zero, a finite value too large becoming the largest
+    finite). A raw or structured view takes value 0 for every 32-bit word (Float: its bits). D3D11 calls Float on an
+    integer view invalid and D3D12 does not say; here the value is converted (toward zero, clamped, NaN 0) so the
+    result is defined. These are checked against hand-computed elements in `d3d12_uav_clear_test`.
   - Buffers: elements of up to 4 bytes repeat in every aligned word, so `vkCmdFillBuffer` writes the aligned middle
     and `vkCmdCopyBuffer` copies the unaligned ends from it (an 8-bit view at an odd offset, say). 8- and 16-byte
     elements are written with `vkCmdUpdateBuffer` (up to 64 KiB) and doubled with copies. A rectangle is an
@@ -366,16 +367,18 @@ What is implemented (all of it testable without the game):
   - Textures: the values become one element of the view's format, and that element is cleared into the image as
     the value that decodes it in the image's own format, so a typeless texture viewed as UINT gets exactly the bits
     asked for. Exact for every typed-UAV format except the SNORM pattern `0x80..` (Vulkan writes -1.0 as `0x81..`)
-    and NaN payloads. A whole view is `vkCmdClearColorImage`; rectangles are `vkCmdClearAttachments` in a
-    dynamic-rendering scope, so a texture created with `ALLOW_UNORDERED_ACCESS` also gets `COLOR_ATTACHMENT` usage
-    when its format supports it. Both run in place in `GENERAL`, the UAV layout. Rectangle clears of volumes, or of
-    formats without attachment support, are refused as `unsupported`.
+    and NaN payloads on the Vulkan color-clear paths. A whole, matching-format 3D mip uses `vkCmdClearColorImage`.
+    Direct lists can use `vkCmdClearAttachments` for rectangles on attachment-capable 1D/2D images.
+    Unpredicated partial 3D W ranges (`FirstWSlice`/`WSize`) and 3D XY rectangles use the same transfer path
+    on direct and compute lists. It encodes the clear value in the view format, fills up to 64 KiB of scratch,
+    and copies tiles one Z slice at a time in `GENERAL`. This requires matching view and backing formats, with
+    the existing exception for emulated `R9G9B9E5` on `R32_UINT`.
   - The clear is fenced as the UAV state widened to transfers, so a following UAV barrier, transition, or enhanced
     barrier from `SYNC_CLEAR_UNORDERED_ACCESS_VIEW` sees it.
-  - Under `SetPredication`, a whole-view texture clear runs as one rectangle through the attachment path, as
-    render-target clears do, so conditional rendering applies. Buffer clears, and texture clears that cannot use an
-    attachment, are transfers that conditional rendering does not cover; they run unconditionally and are counted
-    with the copies (`unpredicated_copies`).
+  - Under `SetPredication`, a direct list clears an attachment-capable 1D/2D UAV through its attachment view.
+    A whole view becomes one rectangle so conditional rendering applies. Buffer clears and the direct-list
+    whole-mip transfer fallback run unconditionally and count toward `unpredicated_copies`. Direct and compute
+    lists refuse predicated partial-W or rectangular 3D clears before submission.
 - **Layout tracking** (`LayoutTracker`): the current Vulkan layout of every image subresource, so barriers start
   from the real layout instead of the application's `before`. This is how implicit promotion and decay work: a
   texture in `COMMON` sits in `GENERAL`, which every promotable access can use, so a later barrier naming the
@@ -484,6 +487,13 @@ What is implemented (all of it testable without the game):
     `E_INVALIDARG` for such a render target, since no other format can view its image. Without that format,
     render targets are refused as before; depth-stencil and UAV creation are
     unsupported for this format.
+  - A `CopyTextureRegion` of the depth plane between two depth formats with the same depth encoding but not the
+    same `VkFormat` (`D32_SFLOAT_S8_UINT` and `D32_SFLOAT`, `D16_UNORM_S8_UINT` and `D16_UNORM`,
+    `D24_UNORM_S8_UINT` and `X8_D24_UNORM_PACK32`) goes image → transfer scratch → image too, depth aspect on both
+    sides (`vulkan_replay.h`, `depth_format_pair`; `replay_copy_offset_test`). `vkCmdCopyImage` requires
+    depth/stencil formats to match exactly (`VUID-vkCmdCopyImage-srcImage-01548`), and an NVIDIA driver (RTX 4070
+    Laptop, 621.40) handed the `D32_SFLOAT_S8_UINT` → `D32_SFLOAT` pair wrote past the end of the `D32_SFLOAT`
+    image: the world-start `WRITE_INVALID` device loss, with the fault at the first byte after the image.
   - reserved resources and `GetResourceTiling` (section 4.2);
   - query heaps for occlusion, timestamps and pipeline statistics, and `GetTimestampFrequency` on the queue
     (section 4.6);
@@ -500,8 +510,36 @@ What is implemented (all of it testable without the game):
     and the initial state or `D3D12_BARRIER_LAYOUT` is not used, because new textures start `UNDEFINED` and move
     on first use. The newer arguments are answered as the PC runtime answers them. `d3d12_method_variants_test`
     compares each answer below with the host runtime live, measured on an RTX 4090 (driver 621.14):
-  - `CreateCommandSignature` (`ID3D12CommandSignature`) and `ID3D12GraphicsCommandList::ExecuteIndirect` (including
-    GPU-written `CountBuffer` via Vulkan 1.2 core `vkCmdDrawIndirectCount` / `vkCmdDrawIndexedIndirectCount`).
+  - `CreateCommandSignature` and `ExecuteIndirect`: a signature consisting of a single DRAW or DRAW_INDEXED
+    operation inherits the graphics state of its command list. The Vulkan replay snapshots the same pipeline, root
+    data, render targets, IA bindings and raster state as a direct draw, then reads the records on the GPU inside
+    that draw's rendering scope. A padded stride is supported; it is not evidence that a signature is simple.
+    A compound graphics signature still emits no draw, but its written VB/IB and root bindings are reset for the
+    next command, even if no record is interpreted. Untouched slots and previously recorded draws retain their state.
+    See the [D3D12 state-leakage contract](https://microsoft.github.io/DirectX-Specs/d3d/IndirectDrawing.html#state-leakage).
+    Fixed- and GPU-counted batches use the device's enabled indirect features and limits. The current graphics
+    path covers triangle lists on direct command lists. A bundle can defer a single operation with no count
+    buffer: its argument-buffer identity and byte offset are recorded once; each `ExecuteBundle` captures the
+    direct parent's state at that call. Count buffers and compound signatures remain invalid in bundles.
+    `d3d12_bundle_indirect_warp` and `d3d12_bundle_indirect_layer` compare DRAW and DRAW_INDEXED against direct
+    pixels with two different parent bindings; the layer fixture also checks marker order and captured views.
+    Compound graphics signatures, non-unit instance divisors
+    and unsupported capabilities stay guarded. A GPU-counted draw currently requires
+    `maxDrawIndirectCount == UINT32_MAX`: Vulkan also limits the raw counter value, not just the caller's maximum.
+    To omit indirect graphics without changing direct drawing or compute, set
+    `LEONIDA_INDIRECT_DRAWS=off` before starting the process. This applies to the Vulkan-backed D3D12
+    command list, including ordinary bundle draws when replayed on a parent. Validation and compound
+    root/IA resets still happen. Only exact lowercase `off` disables drawing; unset, empty, and other
+    values (including the old `raw` spelling) retain the normal capability-checked path. There is no
+    bare draw mode. The former `raw` setting logs an obsolescence notice on first policy use.
+    Each skip reason logs once. Progress lines give cumulative recorded commands, Vulkan emissions,
+    recording skips and replay skips. Replaying a command list can emit a recorded command more than once.
+    By default, a GPU pass bounds draw vertex/index and instance counts, dispatch group counts, and total
+    work across each command list (2^27 units). Unfilled all-ones records produce zero work and spend no budget.
+    Cumulative observed clamp and zero counts are reported every 60 presented frames. Counted calls read at most MaxCommandCount records. The stateful draw or dispatch reads
+    private scratch. Exhausting the diagnostic counter slots only disables readback of those counters.
+    `LEONIDA_INDIRECT_CLAMP=0` disables this pass. `LEONIDA_INDIRECT_GROUP_BUDGET=N` further bounds each
+    indirect dispatch, preserving X first, then Y and Z (1–65535 groups). It also works with the clamp disabled.
   - Optional `VK_KHR_acceleration_structure` + `VK_KHR_deferred_host_operations` + `VK_KHR_ray_query`:
     `ID3D12Device5::GetRaytracingAccelerationStructurePrebuildInfo`, `ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure`
     (BLAS + TLAS), `vkGetBufferDeviceAddress` in `ID3D12Resource::GetGPUVirtualAddress()`, and RT-aware `UAV`
@@ -674,7 +712,16 @@ side inwards:
     storage view gets an index the storage arrays hold, and a read-only one goes above where there is room.
     Index 0 is reserved, so 256 descriptors hold 255 live views in each 1D-array storage binding.
   - Index 0 of every array is a fallback (a 1x1 image of zeros, a nearest clamping sampler), because a miss is
-    index 0.
+    index 0. It stands for a null descriptor (a zero T#, an empty heap slot, a view the layer refused) and is of
+    the kind the instruction asks for: the translator picks the binding by the instruction's dimension (a cube
+    reads the 2D-array binding) and the view by the T#'s class, so each dimension and class reads zeros. The
+    storage arrays' fallbacks never share an image with the sampled ones, so a store or atomic through a null
+    UAV cannot show in a later read through a null SRV. Where the device has `VK_EXT_robustness2`'s
+    `nullDescriptor` (`VulkanDeviceInfo::null_descriptor`, enabled alone) they are null descriptors, and the
+    store or atomic is dropped and a load reads zero, as on the console; without it they are 1x1 images of their
+    own. A null V# (all zeros) needs no fallback: every access through it is out of range (`NUM_RECORDS` 0), so
+    loads give 0 and stores and atomics do nothing (`tests/semantic/test_null_vsharp.py`). Checked on the GPU by
+    `vk_null_descriptor_test` (every dimension and class, both kinds of storage fallback).
   - Changes are queued and written by `flush()`, one write a slot, so a view that is removed before the next
     flush is never written.
   - `flush()` also uploads the table to its buffer: device-local memory, written from a mapped staging copy when
@@ -741,7 +788,14 @@ descriptor, as D3D12 refuses it), and stencil-plane views (`PlaneSlice` 1, as
 `X24_TYPELESS_G8_UINT` or `X32_TYPELESS_G8X24_UINT`) are an 8_UINT T# that set 0 shows through the stencil
 aspect, in its float-typed sampled arrays like other single-sampled UINT views. Other gaps include descriptors
 the game writes itself, which need
-the execute-time scan of section 3.4 (only descriptors made through the device are registered); the literal S#s of shaders (`literal_samplers` in the index),
+the execute-time scan of section 3.4 (only descriptors made through the device are registered). A retail
+descriptor heap census (BL-4, measuring the primary 1,245,184-slot console CBV/SRV/UAV heap across submissions
+50, 500, and 5000 on RTX 5070 / Windows 11) confirms the slot distribution: 910,244 empty slots; 327,543 single-dword
+free-list links (`value = slot_index + 1`, ending at `0xFFFFFFFF`); 261 T# with layer-assigned addresses above 4 GiB;
+5,840 V# (3,024 with a null base, 2,816 with a sub-4-GiB arena base); 1,296 slots containing interleaved constant data
+(IEEE-754 floats); and zero bare 32-bit GPU addresses. Console descriptors do not store standalone 32-bit pointer words;
+buffer and image base addresses are packed into standard 48-bit V# and T# records conforming to the arena layout
+(modeled by model-level reference contract suite `tests/test_descriptor_address_translation.py`); the literal S#s of shaders (`literal_samplers` in the index),
 which `rt::d3d12::register_samplers` registers without a heap slot but which nothing passes to it yet (the call at
 pipeline creation comes with the shader index, #291);
 custom border colours without VK_EXT_custom_border_color, and minimum/maximum filters, anisotropy or mirror-once addressing without the Vulkan
@@ -835,6 +889,17 @@ The compute path, end to end:
     `LEONIDA_ARENA_LOG=1` also logs one line per VA handed out, per refused allocation, and per upload or readback
     buffer VA outside the arena.
   - Default-heap buffers are 64 KiB-aligned ranges in it, zeroed through its mapping; their console VA is the offset.
+  - Every access to its free-block map is under the arena's mutex, and a walk holds no iterator across a call
+    (`runtime/src/arena_blocks.h`): each step reads a block's offset and size, lets its iterator go, looks the next
+    block up from the map again, and re-finds a candidate by offset before it cuts it. A map access outside the lock
+    makes a concurrent walk step into a node an insert rebalanced away or a release freed — measured once: an access
+    violation reading the nil flag of a null map child at 0x19, inside `arena_allocate` for a slot-133 shadow buffer
+    (the arena's first block used to be inserted by `create_arena` with no lock, and an insert rewrites child links).
+    The arena checks `free + live == size - reserved` on every allocation and release (O(1)) and walks the whole
+    block map only when that fails or `LEONIDA_ARENA_CHECK=1` is set; a `double_free` or a release of a range past
+    the arena (`outside_arena`) is reported instead of being let into the map, and those lines are rate-limited to
+    one per 5 s. `arena_blocks_test` (CPU) covers first fit, coalescing, a title keep-out, the walk cut under it, the
+    bad releases and one lock with many threads.
   - Shader-visible descriptor heaps also live in it: the CPU handle is its host mapping and the GPU handle is the VA,
     so descriptor bytes the application writes itself are what shaders load.
   - Upload and readback buffers keep their own memory, and their VA is their device address minus the heap base.
@@ -1221,11 +1286,22 @@ and any validation error fails them.
   `IDXGIFactory4::CreateSwapChainForHwnd`, `IDXGISwapChain3::GetCurrentBackBufferIndex`, `GetBuffer` + `GetDesc()`,
   backbuffer `CreateRenderTargetView` + clear + readback verification + `Present`, and `ResizeBuffers` with 0
   validation errors.
+- `d3d12_stateful_indirect_pixels`, `d3d12_stateful_indirect_multi_pixels` and
+  `d3d12_stateful_indirect_counted_pixels`: positive D3D12-to-Vulkan graphics tests. Compare every readback
+  pixel with both a direct-draw reference and a known pattern for each draw kind; the counted variant fills
+  its argument and count buffers by GPU copy before use.
 - `d3d12_indirect_rt_test`: validates `ID3D12Device::CreateCommandSignature` + `ExecuteIndirect` with a GPU
-  `CountBuffer` (`vkCmdDrawIndirectCount`, `count = 0` skipped and `count = 1` rendered) and optional
+  `CountBuffer` (`vkCmdDrawIndirectCount`, `count = 0` skipped and `count = 1` rendered), a draw whose record asks
+  for four billion instances (clamped on the GPU, section 4.7), and a native Vulkan counted-draw reference over the
+  same suballocated argument/count offsets (`count = 0` leaves the clear colour, `count = 1` renders; it is
+  independent of the D3D12 command replay); optional
   `VK_KHR_acceleration_structure` + `VK_KHR_ray_query` (`GetRaytracingAccelerationStructurePrebuildInfo`, BLAS + TLAS
   `BuildRaytracingAccelerationStructure`, and a `RayQueryKHR` compute shader verifying hit vs. miss; clean SKIP on
   GPUs without RT).
+- `indirect_clamp_test`: the `ExecuteIndirect` argument clamp pass itself (section 4.7), with no game files: every
+  argument kind (draw, draw indexed, dispatch, mesh dispatch) and the counted variants, in-range records
+  bit-identical, garbage records bounded, records and counts past `max_command_count` empty, and the per-batch work
+  budget saturating; clean SKIP without a Vulkan device.
 - `d3d12_gcl8_test`: the public `ID3D12GraphicsCommandList8` surface: `QueryInterface` for its IID,
   `OMSetFrontAndBackStencilRef(1, 2)` with the recorded values, and the reference count around the query. It
   creates only an allocator and a list, so it needs no GPU or Vulkan loader.
@@ -1621,6 +1697,18 @@ The copies:
   cannot fit between the title's address reservations can use a separate mapped buffer. The buffer's device address
   must fit as a positive 47-bit offset from the arena base. The same window cap and dirty-page refresh apply.
   `LEONIDA_STREAM_BUFFER_WINDOWS=0` requires the window to fit in the arena.
+- A **window that is refused** (the budget is spent, the arena is full, or the pages are not committed yet) is backed
+  by a persistent geometry copy of exactly the requested range (`LEONIDA_GEOMETRY_MB`) instead; when no copy can be
+  made either, the view is written with **no base and no records** — loads return 0 and stores are dropped. A raw
+  title address is never left in a V# or a root view: `heap_base + a raw VA` is not an allocation, and a store there
+  loses the device. The refusal and the count of zero-size views are logged.
+- A **stream pool** (the title's CPU view paired with a 16-24 GiB GPU-only
+  alias) is not windowed per request. The GPU-only pages are translated to the CPU view of the same frames (rule B in
+  that note), and **one mapping serves a page-aligned readable run** of the pool (at most 1 MiB, a geometry copy when
+  the cap allows, a window otherwise). Both addresses of the pair are entered in the table, so a V# naming either
+  reaches that one mapping instead of asking for a second one; `LEONIDA_GEOMETRY_MB` is the preferred backing.
+  Acceleration-structure destinations and scratch also resolve through the table, and a structure no window holds
+  whole gets a copy of its whole range, so the BVH builder's commands are recorded.
 - `LEONIDA_GEOMETRY_MB` sets the device-local memory cap for streamed buffer views. The default is 0.
   A positive cap enables persistent copies of placed buffer SRVs and buffer descriptors in title memory.
   A GPU-only reservation uses its paired CPU mapping. Matching source ranges share one copy.
@@ -1679,6 +1767,15 @@ The runtime allocates image keys from `0x100000000` (4 GiB) in 256-byte steps, a
     heap of 256 MiB or less (214 MiB on an RTX 3090 with driver 616.56), so the 256 MiB default arena lands in
     system memory there. Asking that heap for it broke VUID-vkAllocateMemory-pAllocateInfo-01713 even though the
     driver returned `VK_SUCCESS` (reported by CharlyRien).
+  - With Resizable BAR a driver can still leave the `DEVICE_LOCAL | HOST_VISIBLE` type out of a large buffer's
+    `memoryTypeBits`. On an RTX 5070 Ti (NVIDIA 617.42, Windows 11) an arena-shaped buffer of 4,090 MiB may use
+    it and one of 4,092 MiB may not, so `LEONIDA_ARENA_MB=4096` (4,095 MiB) put the whole arena in system memory.
+    `create_arena` tries smaller sizes in 16 MiB steps, by at most an eighth, and keeps the largest whose
+    requirements allow that type and fit its heap. Placing the arena in ReBAR does not guarantee a reduction in
+    host commit. An [RTX 4080 comparison](https://github.com/ubiquitarianism/leonida/pull/1732#issuecomment-7159574385)
+    confirmed ReBAR placement and measured higher process private bytes. The runtime logs the size cap:
+    `GPU address arena: 4080 MiB of the 4095 MiB asked for, capped by the device's Resizable BAR memory types`.
+    Without Resizable BAR nothing changes.
 - M4+: allocate the arena `DEVICE_LOCAL` and stage CPU writes (descriptor heaps, shader blobs, buffer uploads)
   through a host-visible staging buffer, copied before the commands that use them. The hash table is not in the
   arena either: it is a normal storage buffer in `DEVICE_LOCAL` memory, uploaded from a mapped staging copy before
@@ -1754,7 +1851,10 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    No sampler-indexing entry had a matched layout. Putting the resource heap first when both flags are set, then the
    sampler in the next dword, remains a hypothesis. D3D-329's adjacent SGPR examples alone do not establish it.
    The runtime snapshots the bound resource and sampler heap pointers in that order after the explicit
-   arguments for direct and indirect compute dispatches with an inline signature. An unbound heap contributes
+   arguments for direct and indirect compute dispatches with an inline signature. Bound console descriptor heap
+   base addresses are remapped through `console_descriptor_table_va` so that user SGPRs receive the arena copy's
+   shader virtual address (where GPU descriptor reads land, preventing `READ_INVALID` device loss during world
+   load), while unshadowed host heaps remain unchanged. An unbound heap contributes
    zero, and rebinding affects later commands. A heap that cannot fit in the inline user data is reported once,
    and a signature whose compute arguments spill gets nothing written (logged once). Set
    `LEONIDA_COMPUTE_DIRECT_HEAPS=0` to restore the previous compute arguments.
@@ -1769,11 +1869,18 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    and mesh from s16 (issue #14, comment 7143020922, on a `boot-prototype` run; not reproduced in this
    repository). A mesh signature that fills the window leaves no room there: a heap past s31 of the mesh shader
    (push dword 24 or later) is logged once. A signature that keeps the s0 graphics layout, or whose arguments fill
-   s31, gets none (logged once). `d3d12_graphics_direct_heaps_test` checks the recorded draws and what a vertex
-   and a pixel shader read, with and without the flags; `d3d12_mesh_test` checks that a mesh draw records the
-   vertex draw's dwords, a resource-only rebind, a signature ending at s30 and one on the s0 layout (recorded
-   arguments only; no GPU read through a mesh shader). Set `LEONIDA_GRAPHICS_DIRECT_HEAPS=0` to restore the
-   previous draw arguments.
+   s31, gets none (logged once). `d3d12_graphics_direct_heaps_test` checks the recorded draws and reads back
+   what vertex and pixel shaders saw with and without the flags. On a mesh-capable device it also checks the
+   heap pointers read by the mesh and pixel stages after a rebind. `d3d12_mesh_test` checks the recorded dwords
+   for a vertex draw, a resource-only rebind, a signature ending at s30 and one on the s0 layout.
+   Set `LEONIDA_GRAPHICS_DIRECT_HEAPS=0` to restore the previous draw arguments.
+   Missing console V# backing leaves a settled zero descriptor. Every 32 submissions a heap probes up to
+   eight of these slots in round-robin order, including independent UAV-counter failures.
+   Console resource heap copies and shader-visible CBV/SRV/UAV heaps with at least 65,536 slots request
+   64 MiB of zeroed padding after their last descriptor. `LEONIDA_HEAP_GUARD_MB` sets the padding in MiB
+   (0 disables it). When arena space is tight, allocation can fall back to the heap alone. Only indices
+   inside the reserved padding read null slots. Console slots containing data instead of a recognized image
+   or buffer descriptor have their first 16 bytes cleared in the GPU copy. The title keeps its original bytes.
 3. **Game-built descriptor memory.** The game writes raw T#/S# bytes into a heap itself, without calling
    `CreateShaderResourceView`. The shaders then read those bytes exactly as in case 1.
 
@@ -1873,8 +1980,8 @@ The layer's descriptor model:
   The emulated RGB9E5 raw `R32_UINT` storage view is formatted and is exempt. Vulkan 1.3 permits these SPIR-V
   capabilities even without the legacy `shaderStorageImage{Read,Write}WithoutFormat` feature bits. The
   caller-owned device test leaves both legacy bits off and masks each per-format bit to verify safe rejection.
-  `ClearUnorderedAccessView*` refuses partial W ranges and 1D/3D format reinterprets: the transfer clear
-  cannot target a slice interval or guarantee preserving the reinterpreted bits.
+  `ClearUnorderedAccessView*` reads the W range from these descriptor bytes even after a descriptor copy.
+  General 1D/3D backing-format reinterpretation remains unsupported.
   Shader access to the new UAVs requires `robustImageAccess` (whole-mip CPU clears do not).
   A separate native D3D12 probe on the RTX 4090 and UHD 770 clipped typed writes to the view's W range.
   WARP 10.0.26100.9818 rebased the view but did not clip writes past a finite `WSize` in that probe. The
@@ -2068,7 +2175,21 @@ sets them, and it does so twice.
 
 `amd_fidelityfx_upscaler_xbox.dll` does neither. Its 29 `RTS0` parts carry `Flags = 0`, and no instruction in it uses
 the constant `0x3000000`. So the bits are not a property of every console root signature; this builder adds them. The
-game executable is not in the package, so whether its root signatures carry them is open.
+retail executable's root signatures do not carry them either (old upstream PR 7140): its direct call passes a 1.1
+description with `Flags = 0x80` (`LOCAL_ROOT_SIGNATURE`), and its root-signature decoder reads `Flags` as a
+zero-extended 16-bit value.
+
+The mask stays unconditional, because it can't touch a public flag: it clears bits 24-31
+(`kXboxRootSignatureFlagHighByte`, `runtime/shims/d3d12_xs_rootsig.h`), and every public
+`D3D12_ROOT_SIGNATURE_FLAGS` value is in bits 0-11 (the highest is `SAMPLER_HEAP_DIRECTLY_INDEXED`, `0x800`). So it is
+safe on every descriptor and blob, whatever built it. `root_sig_public_flags_test` pins this:
+
+- the helpers keep every flag value in `[0, 0xFFFF]`;
+- the shims' serializers give the host's blob byte for byte for each public flag the host takes. Where the host
+  refuses only `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` or `SAMPLER_HEAP_DIRECTLY_INDEXED` (Windows 10's in-box `d3d12.dll`),
+  they serialize on purpose: the blob is the host's blob without those bits, with the full flags in `RTS0` and a valid
+  container hash (`kDirectlyIndexedFlags`, `runtime/shims/d3d12_xs_rootsig.h`);
+- a blob with `0x03000080` comes back as `0x80`.
 
 **Version 1.2 on older runtimes.** The in-box `d3d12.dll` of Windows 10 (measured on 22H2, 10.0.19045, without the
 Agility SDK) and of Windows 11 23H2 (#361) serializes root signatures only up to 1.1. On Windows 10 it rejects even an
@@ -2282,7 +2403,12 @@ Pipeline creation:
   and pipeline-cache UUID. When the file is absent or incompatible, the runtime starts with an empty cache.
   The offline checker matches the runtime's layout and subgroup request for compute shaders with no descriptor
   bindings and the standard 144-byte push-constant range.
-  The runtime writes its own `pipeline_cache.session.bin` on device teardown. A compatible session file
+  The runtime writes its own `pipeline_cache.session.bin` on device teardown, and, since a title never releases its
+  device, when `gta6rt` ends with the device alive: at the run's exit, at a console close and from an
+  unhandled-exception filter (a fault in the title or its DLLs, the int3 after a device loss). The title's own
+  `SetUnhandledExceptionFilter` is served by the runtime, which keeps its filter first and passes the exception on.
+  That exit write (`save_pipeline_caches_at_exit`, `shims/d3d12_compile_exit.h`) waits 1 s for a build still running
+  on a title thread, then writes the pipelines finished so far, with 3 s for the write itself. A compatible session file
   initializes the live cache directly if there is no offline seed. With both files present the session cache
   merges into the offline seed. `LEONIDA_DIRECT_SESSION_CACHE=0` also uses a merge when only the session exists.
   The files must match the Vulkan vendor, device and pipeline-cache UUID. Vulkan supplies an opaque snapshot.
@@ -2296,13 +2422,112 @@ Pipeline creation:
   has no active builds. These snapshots have an additional 512 MiB ceiling. The driver fills a mapped staging
   file directly. A successful snapshot atomically replaces the session. An interrupted write preserves the
   previous cache; the next launch removes unheld staging files older than ten minutes.
+  While the compute warm-up has builds queued that idle checkpoint never starts, and a boot that ends by a crash,
+  a device loss or a kill never reaches teardown, so neither file used to keep that boot's compute pipelines.
+  Compute pipelines are therefore journaled one file each (`src/pipeline_cache_journal.h`):
+  `pipeline_cache.d/cs-<hash>.bin` beside the session file, named by a hash of the SPIR-V words, the stage flags and
+  subgroup request, the push-constant range and the bindless layout. A build creates a `VkPipelineCache` from its
+  file (if the header names this device and pipeline-cache UUID) and creates the pipeline against it; when the
+  driver reports a compile (creation feedback without `APPLICATION_PIPELINE_CACHE_HIT`, or no file), that cache is
+  written back to the file at once, through a staging file renamed over it. Without a file, and with
+  `pipelineCreationCacheControl`, the shared cache is first asked with
+  `VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT` when it was seeded from a file, so the offline seed
+  still serves a first boot. NVIDIA 630.20 answers that flag with a compiled pipeline (seconds) instead of
+  `VK_PIPELINE_COMPILE_REQUIRED`, so the first answer that took 250 ms or more without the cache-hit bit stops the
+  asking, and that pipeline is built again against its journal cache so it gets a file (a fast answer without the
+  bit is the driver's own disk cache, and a valid one; `LEONIDA_PIPELINE_JOURNAL_ASK_SHARED=0`: never ask). All
+  driver calls of a compute build (shader module, journal cache, pipeline) run in one turn of the compile gate, with
+  no file I/O in it: from the journal a build takes milliseconds, the warm-up worker makes them back to back, and
+  three warm boots whose cache and module calls were outside the gate lost the device in a `vkQueueSubmit` 20-25 s
+  in (no GPU fault, no TDR). The files take 2-3 MiB a pipeline on that driver (about 3.6 GiB for the 1700 a boot
+  builds); `LEONIDA_PIPELINE_JOURNAL_BYTES` (32 GiB by default) caps them. At a device's first pipeline, staging files
+  older than ten minutes are removed and, past the budget, the least recently used files until three quarters of it
+  is left: a file's modification time is its last use (written, or touched, at most hourly, when a build finds its
+  pipeline there), so files no build names any more after a translator regeneration go first.
+  Measured on an RTX 4070 Ti (driver 630.20): 17 compute modules of 0.6-0.7 MB SPIR-V took 222 s to compile and
+  0.04 s to create from their cache; a boot's ~1000 warm-up builds of 128 KiB or more took 81 s cold and 1.8 s from
+  the journal, and the submissions' compile-gate waits went from 77 s to none. Nsight Aftermath crash dumps
+  (`LEONIDA_AFTERMATH=1`) appear to make the driver compile again whatever the caches hold: boots loading the same
+  317 MB session file logged no compute build of 2 s or more without Aftermath and 88-95 with it. The
+  VK_NV_device_diagnostics_config flags alone do not (vk_pipeline_check `--nv-diagnostics`: 17 of 17 cache hits).
+  `LEONIDA_PIPELINE_JOURNAL=0` (or `LEONIDA_PIPELINE_CACHE_BYTES=0`) turns the journal off.
+  `LEONIDA_PIPELINE_CACHE_DIR=<folder>` moves the journal with the other files, so builds of gta6rt in several
+  folders can share one; the file names and the driver's checks keep a pipeline from one build from being taken
+  for another's.
+  `gta6rt --precompile-pipelines [--threads N] [--big-threads N] [--all] [--smallest-first] [--limit N]
+  [--min-bytes N] [--max-bytes N] [--filter PART]... [--list]` fills the journal ahead of play, with no game: it
+  creates the Vulkan device as `--run` does (so the same environment gives the same journal names and driver keys:
+  LEONIDA_SHADERS, LEONIDA_PIPELINE_CACHE_DIR, and LEONIDA_DEVICE_FAULT/LEONIDA_AFTERMATH, whose diagnostics config
+  makes other pipelines) and builds every compute entry of the library through the dispatch path
+  (`build_compute_pipeline`), largest first, on below-normal-priority threads. Entries with a usable journal file are
+  skipped (only their header is read), so it can be stopped and started again. Running as gta6rt.exe it also fills
+  NVIDIA's disk cache, which that driver keys by the executable's name. Measured on an RTX 4070 Ti (driver 630.20),
+  4 threads: modules of 3.6-5.8 MB took 46-145 s each, 12 in 312 s, about 3.5 GB of host memory each while in the
+  driver (14.5 GB peak for four). Graphics pipelines are not covered: they are built at a title's draw from its PSO
+  description and the bound formats, and take milliseconds.
+  `LEONIDA_COMPILE_HELPER=1` (`shims/d3d12_compile_helper.h`) keeps first-ever compiles out of the title's process:
+  the driver's locks, which a long `vkCreateComputePipelines` holds and a `vkQueueSubmit` of the same process waits
+  for, are per process. A compute build of `LEONIDA_COMPILE_HELPER_MIN_BYTES` or more (128 KiB) with no journal file
+  writes a request beside the journal (`requests/<name>.req`: the entry and a priority, 0 for a use, the module size
+  for a warm-up) and starts the helper at the first one (`gta6rt --compile-server --parent <pid>`, the same executable
+  and environment, so the same device and journal names). With asynchronous builds (`LEONIDA_ASYNC_PIPELINES=1`, the
+  intended mode) nothing waits: the build answers deferred, the variant goes back to idle, the dispatch is skipped and
+  counted, and each later use looks at the request (a file check, the module is not read again) until the journal
+  file is there and the pipeline is created from it, a cache hit. A warm-up only asks, in either mode, so the warm-up
+  worker writes its requests ahead and the helper's threads (`LEONIDA_COMPILE_HELPER_THREADS`, 2) build them in
+  parallel, the most urgent first; a warm-up the helper builds is never held back while the title submits. Without
+  asynchronous builds a dispatch waits for its file, holding nothing of the driver's (`LEONIDA_COMPILE_HELPER_WAIT_MS`,
+  default 120 s, 0 for no limit). A failure (`requests/<name>.failed`, the helper gone) builds the pipeline here as
+  before, and so does a request that is no longer listed (`<name>.req` gone with no answer) or one still pending after
+  `LEONIDA_COMPILE_HELPER_PENDING_MS` (default 120 s): the helper cannot hold a dispatch forever. The helper
+  checks that its journal name is the one asked for before it compiles (the name is a hash of the module and the
+  device, no driver call), ends with the process that started it, runs alone per journal,
+  and with nothing asked fills the rest of the library, smallest module first, on
+  `LEONIDA_COMPILE_HELPER_IDLE_THREADS` (1, always one fewer than its threads) at idle priority; the journal names it
+  worked out are kept in `requests/names.idx` (with each module's size and time and what the names depend on), so a
+  later helper does not read every module again. `requests/<name>.building` is a lock file a process holds for the
+  whole build (no sharing, deleted by the OS when that process ends, killed or not), whose contents name the process:
+  the helper and `--precompile-pipelines` leave an entry its holder is building to it, and a file no process holds is
+  stale whatever process id it names. Measured, RTX 4070 Ti,
+  driver 630.20, a boot with an empty journal and the helper waiting (no asynchronous builds): the helper compiled 171
+  pipelines of 128 KiB or more (148 s in its driver), every one of them was a hit in the title's process (at most
+  2 ms), and no submission waited at the compile gate.
+  Under Proton, pass a Wine path, for example
+  `LEONIDA_PIPELINE_CACHE_DIR='Z:\opt\leonida\cache'`. Async warm-up workers publish to the same directory.
+  For a disposable session, `LEONIDA_PIPELINE_JOURNAL_SEED_DIR=<absolute existing directory>` can name a separate,
+  trusted read-only set of per-key compute journal files. The runtime prefers a compatible writable entry, then tries
+  the same key in the seed; both use the existing size and device/driver header checks. A seed hit neither copies an
+  entry nor refreshes its mtime. All writes, LRU touches, staging cleanup, eviction and byte accounting belong to the
+  writable journal only, including replacement of an incompatible local file. The seed must be distinct from the
+  writable `pipeline_cache.d`, not its ancestor or descendant; an explicitly unusable or overlapping root disables
+  the journal. This setting does not grant access or authenticate cache data. Use only trusted, privately produced
+  files on a read-only mount/ACL with stable, disjoint directories and no linked files between them. Leave unset for
+  the original single-directory behavior. Per-key names are unchanged: externally precompiled files for the same
+  pipeline identity can be read without a persistent *writable* shared journal.
+  During normal runtime, a compatible local or external entry is used before requesting the helper.
+  The offline precompiler and compile-server instead read and populate only the writable journal, even
+  when a separate seed is configured. An external hit is not a published response to a helper request;
+  its readiness check still requires a compatible file at the requested writable path. Both modes validate
+  the configured directory pair before enabling journaling.
+  To check the two tiers without game files, build `d3d12_compute_journal_test`, then run
+  `python scripts/check_compute_journal_overlay.py <path-to-d3d12_compute_journal_test.exe> --require-hit`.
+  This uses four fresh processes, two authored compute shaders and a disposable cache. It checks dispatch results,
+  reported application-cache hits (where supported), local publications, and that old seed contents/mtime stay put.
   `LEONIDA_TRACE_PIPELINE_COMPILE=1` records each graphics and compute build's trigger, thread, elapsed time,
   SPIR-V size, shader names and Vulkan application-cache feedback (1 hit, 0 miss, -1 unavailable). It also
   times cache reads, merges, writes and draw/dispatch pipeline lookups that take at least 1 ms.
-  `LEONIDA_ASYNC_PIPELINES=1` schedules cold first-use builds on the warm-up worker ahead of speculative work.
-  Replay skips a draw or dispatch while its pipeline is pending. Later uses find the completed handle.
-  A skipped dispatch can lose a one-time resource update. Synchronous first use is the default and strict
-  replay always uses it. `LEONIDA_COMPUTE_WARMUP=0` restricts the worker to pipelines requested by the title.
+  `LEONIDA_ASYNC_PIPELINES=1` schedules cold first-use builds on the warm-up worker ahead of speculative work; how long
+  a submission waits for them, and what is skipped, is "Pipelines still being built" below. Strict replay builds
+  synchronously and waits for every build. `LEONIDA_COMPUTE_WARMUP=0` restricts the worker to pipelines requested by
+  the title.
+  A queued build holds no reference to its PSO or device (`PipelineCompiler`, `runtime/shims/d3d12_pipeline_compile.h`).
+  A PSO's last release drops its queued builds and returns at once; one already running is left to finish, and the
+  worker deletes the PSO after it (`PipelineState::last_release`). The PSO's device reference goes at the release, so
+  the release that tears the device down waits for that build, drops the device's cache checkpoint, and the last
+  device stops and joins the worker before any Vulkan object goes; the session cache is written after that. gta6rt,
+  which ends with the device alive, drops the queue and waits up to 2 s for a running build before `ExitProcess` and on
+  a console Ctrl+C, Ctrl+Break or close; after that nothing is queued, and a first use builds in place
+  (`d3d12_compile_teardown_test`).
   `GetCachedBlob` records the vendor, device, driver version, `pipelineCacheUUID` and a SHA-256 of the description
   without `Flags`, sealed by a checksum (`runtime/src/cached_pso.h`). The answers are the host's, measured on an
   RTX 3060 and WARP: the same description is accepted; another
@@ -2326,6 +2551,69 @@ Pipeline creation:
     serialized size and bytes are each device's own (the host's empty library is 900 bytes, the layer's 16).
   - Not compared: the calls the host runtime faults on (`Serialize(nullptr, n)`, `StorePipeline` with a null PSO,
     `Load*` with a null name or description); the layer answers `E_INVALIDARG` for each.
+- Compiles at draw time: the first draw of a graphics pipeline, the first dispatch of a compute pipeline the warm-up
+  has not built, and each variant are compiled for the submission that needs them. `prepare()` leaves each one that is
+  not built yet to `PipelineCompiles`, once per pipeline and variant; `VulkanQueue::execute_now` then compiles them
+  side by side on the device's workers (`runtime/src/pipeline_workers.h`), the submitting thread among them, and writes
+  the command buffer when all are built. Every draw and dispatch has its own pipeline: none is left to a later frame. A
+  pipeline the driver refuses has the result it had when `prepare()` built it: a draw or an indirect dispatch fails the
+  submission, a dispatch is dropped (strict replay: fails it too). The resource lock is held while they compile, as it
+  is when each is compiled alone, so a PSO released meanwhile waits for the submission. The workers have ended before
+  the session cache is read at device teardown. `LEONIDA_PIPELINE_THREADS=<n>` sets the workers: unset, half the
+  logical processors and at most 8; `0` compiles each pipeline on the submitting thread where `prepare()` meets it.
+  Large pipelines (below) are compiled within a memory budget, and the variants of one PSO one after another.
+  `LEONIDA_ASYNC_PIPELINES=1` is not changed: its builds stay on the compile worker. Measured with synthetic programs
+  never compiled before and the warm-up off (RTX 3080, NVIDIA 621.24, Windows 11, 16 logical processors, 8 workers,
+  three runs each): the first submission of 192 graphics pipelines takes 126 to 143 ms instead of 861 to 882, of 192
+  variants 124 to 130 instead of 856 to 863, of 96 compute pipelines 74 to 81 instead of 486 to 519, and the process
+  holds about 50 MiB more (the driver keeps memory for each thread that compiles). One `VkPipelineCache` is enough: one
+  cache per thread, merged, was about as fast. Tested by `pipeline_workers`, `replay_pipeline_compiles` and
+  `d3d12_pipeline_workers`.
+- Large pipelines: a compile takes the driver some hundred bytes of memory for each byte of SPIR-V
+  ([pipeline_check.md](pipeline_check.md), "Limiting concurrent compilation of large modules"), so compute modules over
+  128 KiB and graphics pipelines of 1 MiB or more compile side by side only while their estimates (512 bytes for each
+  byte of SPIR-V) fit a budget: three quarters of the smaller of the free RAM and the room under the commit limit, read
+  again whenever a place at the gate (`runtime/src/large_module_gate.h`, one for the process) is given or returned. One
+  always gets in when none is, so a pipeline larger than the budget compiles alone. An estimate counts in full until
+  the compile ends, although the driver has taken part of it by then. They get in in the order they came; while the
+  first in line does not fit, the next behind it that does may pass, as long as all that have passed it would fit the
+  budget together with it, so that a stream of small ones does not keep it out. The ones a submission waits for (and
+  those of `LEONIDA_ASYNC_PIPELINES`) go before the warm-up's, which take a quarter of the budget at most and none while
+  a submission that has large ones is compiling on its workers. A thread that waits for its place holds no PSO's lock,
+  and one that has a place waits for none. `PipelineCompiles::build` gives a submission
+  as many jobs for large ones as its smallest could be in at once, largest first; where the next one does not fit, the
+  job compiles small ones in the meantime. `LEONIDA_SERIAL_BIG_COMPILES=1` compiles them one after another instead, as
+  before there was a budget, `=0` has no limit, `LEONIDA_BIG_COMPILE_BUDGET_MB` fixes the budget. Measured with
+  synthetic integer modules never compiled before and the warm-up off (RTX 3080, NVIDIA 621.24, Ryzen 7 5800X3D, 8
+  workers and the submitting thread, three alternating runs each): the first submission of 16 modules of 256 KiB takes
+  0.8 s instead of 4.0 to 4.8 s, 16 of 512 KiB 2.0 to 2.2 s instead of 10.2 to 11.4, 15 of 1 MiB 5.8 to 6.1 s instead
+  of 29.2 to 31.2, 12 of 0.5 to 2 MiB 8.0 to 10.5 s instead of 38.9 to 39.9. While the 15 of 1 MiB compile, private
+  memory peaks 656 to 676 MiB over what it was, instead of 140 to 147 (one compile takes 85 to 131 bytes for each byte
+  of SPIR-V here, and the driver keeps memory for each thread that compiles). With a budget of 1536 MiB, two at once,
+  they take 18.5 s and peak 202 MiB over. Not measured: other drivers, and the title. Tested by `big_compile_gate`,
+  `replay_pipeline_compiles` and `d3d12_big_compute`.
+
+**Pipelines still being built** (`PipelineState::queue_build` in `runtime/shims/d3d12_vulkan_device.cpp`). Lazy
+pipelines are built at first use, and on the 4070 Ti (NVIDIA 630.20) a large compute pipeline takes the driver 3-10 s,
+some 37 s. A submission builds the ones it needs through `PipelineCompiles` and `PipelineWorkers` (above), with
+`resource_mutex_` released while they compile and the large ones within the memory budget of `LargeModuleGate`.
+#2098 had a second path here, a pre-pass in `VulkanQueue::execute` that built them one after another on the
+submitting thread; at the maintainers' decision it was replaced by this one when #2098 was merged.
+
+- **Asynchronous builds** (`LEONIDA_ASYNC_PIPELINES=1`). Prepare asks `queue_build`, which answers the handle once
+  built and otherwise queues one compile-worker job at replay's priority and answers null: the draw or dispatch is
+  skipped, the list's other commands replay as recorded, and a later submission uses the pipeline. The job also starts
+  at record time already: at `SetPipelineState` for compute and at each draw for graphics, with the variant its bound
+  targets give (`request_pipeline_build`). A compute build the compile helper is still making (`LEONIDA_COMPILE_HELPER`)
+  publishes nothing, so its next use asks again.
+- **Warm-ups while the title submits.** A compute warm-up holds the compile gate for its whole create, and every
+  submission waits behind it: a native boot's submissions waited 140 s in all at the gate behind compute warm-ups, and
+  past the story load the worker went through 694 warm-ups of modules over 128 KiB (those over 640 KiB take 4-25 s
+  each) against 25 such builds a dispatch asked for (measured with a 128 KiB limit). With
+  `LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES=<n>` a warm-up of a module over n bytes of SPIR-V is not started while the
+  title submits (a submission in the last second, `src/pipeline_wait.h`); the pipeline is built at its first use
+  instead. Opt-in: unset or 0, every warm-up runs, as on `main`, and `LargeModuleGate` (#1889) orders them behind a
+  submission's compiles. Smaller warm-ups, and every warm-up before the first submission, run as before.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.
@@ -2784,11 +3072,20 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   allocations. `LEONIDA_TITLE_IMAGE_POOL=0` selects individual allocation for every image. With
   `LEONIDA_MEM_PROBE` enabled, the texture census also reports logical Vulkan backing bytes for the registered
   slot-70 and slot-133 images and the portion on non-device-local types.
+- A refresh pass visits a snapshot of the title-image registry, taken under its mutex, instead of walking the
+  registry itself. Filling a texture can submit, a submission destroys a retired image, and that image's destructor
+  erases its registry entry. Windows' mutex is recursive for its owner, so the erase lands inside the pass, and a walk
+  over the map itself would step into a freed node (measured: an access violation reading the nil flag of a null
+  child, 0x19, in `Device::refresh_title_textures`). The snapshot also holds a reference to each entry, so an entry
+  retired during the pass is still alive when its turn comes.
 - Sampled title images can use device-local memory even when Vulkan host image copies require a
   host-visible memory type. The runtime queries the same image with and without host-transfer usage.
   When only the latter permits plain device-local backing, it detiles the complete image into a reusable
   staging buffer and transfers all its mips and layers together. Linear slot-133 placements retain host
-  copies. An allocation failure retries the original host-copyable image. `LEONIDA_TITLE_IMAGE_STAGING=0`
+  copies. On a device without `VK_EXT_host_image_copy` every colour title image, linear placements too, takes the
+  staged upload: the refresh before a submission has no other way to fill one, and without it the title's textures
+  stayed zero (a flat green intro movie). An allocation failure retries the original host-copyable image.
+  `LEONIDA_TITLE_IMAGE_STAGING=0`
   restores the original placement policy. With `LEONIDA_MEM_PROBE`, each title image class logs its
   Vulkan memory type mask, mask without host transfer, and selected type.
 - `WriteToSubresource`/`ReadFromSubresource` (implemented in `d3d12_vulkan_device.cpp`) complete before they
@@ -2861,6 +3158,16 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   image when both layouts are opaque, since D3D12 leaves an alias's contents undefined until reinitialized, and is
   refused only for a non-opaque layout. Before this, the retail boot stopped on the title's assert while it created
   its D16 depth targets on an RDNA2 iGPU under RADV. A refused depth placement is logged (no trace line covers it).
+  Where the provider (`Resource::enable_depth_stencil_uav`) has no unordered-access form of a texture it answers
+  `E_INVALIDARG` or `E_NOTIMPL`, and slots 76 and 133 then make the texture without unordered access, as before the
+  provider: slot 76 as a committed depth-stencil texture, slot 133 through its stand-in (the title-placed texture, or
+  the committed one). The first such refusal per slot is logged (`xs_proxy_mock` checks the refusal against a mock
+  provider). Any other failure (out of memory, the backing itself, a refused placement) is passed on as before.
+  Console D16S8 (format 118) made as `D24_UNORM_S8_UINT` via `pc_format()` (the default on GPUs with D24S8
+  attachments, such as NVIDIA) keeps its UAVs through the widened `R16_TYPELESS` + `R8_UINT` storage planes:
+  plane-0 barriers convert between 24-bit UNORM words in transfer scratch and `R32_SFLOAT` via `Depth24Converter`
+  and blit between the intermediate `R32_FLOAT` image and `R16_UNORM` (viewed as `R16_UINT` or `R16_UNORM`), while
+  plane 1 copies stencil bytes directly (`xbox_d16s8_d24_storage` with `LEONIDA_CONSOLE_D16S8=d24`).
 - Legacy and enhanced texture transitions copy the selected planes and layers to or from their storage images.
   Fence-ordered graphics and compute queues can share UAV access. A dedicated compute family can perform
   the plane transfer itself when `VK_KHR_maintenance10` and the format's depth/stencil copy flags allow it.
@@ -3365,7 +3672,11 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   `WaitFrameEventX` returns at the next origin with the next token (1, 2, 3, ...; 0 is the null token) and does not
   return while `latency` presented frames are still waiting for their vblank. A frame presented before the origin event
   is armed is not paced (`PresentX` does not hold it for a vblank), so it is shown at once and never waits for a vblank:
-  blank presents of a loading screen do not delay the first wait. A wait that comes late returns at once
+  blank presents of a loading screen do not delay the first wait. At most `latency` frames are in flight once the event
+  is armed: a present into a full queue (several presents with no wait between them) replaces the newest queued frame
+  and takes its vblank, like a mailbox, so the replaced frame is never shown (no display statistic) and the older ones
+  keep their vblanks. However many presents come between two waits, the next wait passes when the oldest frame is
+  shown. A wait that comes late returns at once
   with the newest passed origin; the missed ones are skipped. A finite timeout gives
   `HRESULT_FROM_WIN32(WAIT_TIMEOUT)`; nothing registered, or suspended, gives `HRESULT_FROM_WIN32(ERROR_INVALID_STATE)`.
   `LEONIDA_PRESENT_UNCAP` (any non-empty value other than "0", read when the object is made) takes the frame-rate
@@ -3381,8 +3692,11 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   `SuspendX`/`ResumeX` so suspended pauses are excluded), computing nearest-rank `p50`/`p95`/`p99` and the mean drift
   against the active target interval (`FramePacer::pacing_summary()`). On teardown after at least one present,
   `XboxPresentation` logs a single `[rt] present: pacing summary ...` line on stderr, which `tools/boot_trace.py`
-  surfaces beside the D3D12 call counts. Confirmed on a fake clock by `frame_pacer_test` (known 100-frame distribution,
-  positive and negative drift, ring-buffer wrap-around, suspend/resume exclusion, uncapped mode) and by
+  surfaces beside the D3D12 call counts. The intervals are between `PresentX` calls, not between frames shown: a frame
+  replaced in a full queue (see the latency limit above) still counts as a present with its real interval, so the
+  percentiles describe the title's present cadence, and a burst of presents between two waits shows up as short
+  intervals. Confirmed on a fake clock by `frame_pacer_test` (known 100-frame distribution,
+  positive and negative drift, ring-buffer wrap-around, suspend/resume exclusion, uncapped mode, replaced frames) and by
   `tests/test_boot_trace.py`.
 - *`PresentX`*: 0 planes presents a black frame (no token needed). 1 plane blits plane 0's first resource (a
   single-sample 2D colour texture in `PRESENT`) to the swapchain image, limited to `pSrcViewRects[0]` when set
@@ -3578,8 +3892,11 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
 - *Frame capture* (`LEONIDA_CAPTURE=<dir>`, `LEONIDA_CAPTURE_EVERY=<n>`, `LEONIDA_CAPTURE_LIMIT=<n>`): writes
   every n-th presented frame (default 30, at most 24) to `<dir>/frame_NNNNN.ppm`, a binary P6 of the swapchain image
   converted to 8-bit RGB, and appends one line per frame to `<dir>/index.txt` with the extent and the mean RGB. Off
-  unless the variable is set, and the folder is created. This is what a check reads when it has to know what the
-  layer actually presented: the window is not readable in every setup (under Wine it is not even mapped), and the
+  unless the variable is set, and the folder is created. Disk-only sampling copies frames 1, 1+n, 1+2n, … to host
+  staging until the file limit is reached; intervening frames still present normally. This avoids a full-image
+  transfer on every present when only occasional samples were requested. An explicit continuous readback request
+  and the temporary splash inspection still copy each frame they need. This lets a check inspect what the layer
+  actually presented: the window is not readable in every setup (under Wine it is not even mapped), and the
   mean is enough to tell a real frame from a black one. `d3d12_present_test` turns it on and checks the files against
   the colour it clears to.
 - *`SuspendX`/`ResumeX`*: suspend drops the interval, the origin event and the frames in flight, wakes blocked waits
@@ -3601,7 +3918,8 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   (placement, point/bilinear, alpha overlay, HDR10 and PQ conversions, refusals; against a CPU model), token errors,
   statistics, suspend/resume, `ImmediateThresholdPercent` with a late frame at several thresholds (immediate mode
   chosen, or not for 0, below the lateness, on time) and with `LEONIDA_PRESENT_NO_TEAR=1`, 30 frames at 60 Hz in real
-  time; skipped, exit 77, without a Vulkan device). `frame_pacer_test` also sweeps `decide_present_sync`.
+  time; skipped, exit 77, without a Vulkan device). `frame_pacer_test` also sweeps `decide_present_sync`, and checks
+  that 1000 presents between two waits leave at most `latency` frames in flight (latency 1, 2 and 3).
 
 ### 4.6 Queries
 
@@ -3624,15 +3942,20 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   (`compare_invalid_arguments`, "query heap:", RTX 5070 / 621.14): `E_INVALIDARG` for no queries, a node other than
   node 0, or a type past `PIPELINE_STATISTICS1` (7), checked before the output; a valid description with a null
   output is then `E_UNEXPECTED`, not `S_FALSE`.
-- **Stream-output statistics** (D3D-302). The layer has no stream output: a graphics PSO with `StreamOutput`
-  entries is refused and `SOSetTargets` is not implemented, so no primitive reaches a stream and every
-  `SO_STATISTICS_STREAM0..3` query counts 0 written and 0 needed. An `SO_STATISTICS` heap is therefore made without
-  a `VkQueryPool`: `BeginQuery`/`EndQuery` record nothing in Vulkan (D3D12's call rules are still kept, and the
+- **Stream-output statistics** (D3D-302). The layer still refuses `StreamOutput` PSOs and does not implement
+  `SOSetTargets`, so no primitive reaches a stream yet. With `VK_EXT_transform_feedback` enabled on the device
+  (`D3D-TRANSFORM-FEEDBACK-DEVICE`) and its `transformFeedbackQueries` property set, an `SO_STATISTICS` heap is a
+  real `VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT` pool begun and ended indexed on the stream
+  (`vkCmdBeginQueryIndexedEXT` / `vkCmdEndQueryIndexedEXT`), and `ResolveQueryData` copies the two 64-bit results per
+  query (16 bytes: `NumPrimitivesWritten`, `PrimitivesStorageNeeded`), in the same order; with no stream output they
+  are 0. A stream at or above the device's `maxTransformFeedbackStreams` runs nothing and resolves zero, as if the
+  heap had no pool. Without the feature, the property, or a nonzero `maxTransformFeedbackStreams`, the heap is made
+  without a `VkQueryPool`: `BeginQuery`/`EndQuery` run nothing in Vulkan (D3D12's call rules are still kept, and the
   heap's queries track ended or not as the others do), they overlap no other query, and `ResolveQueryData` writes
-  zeros (`vkCmdFillBuffer`, 16 bytes per query: `NumPrimitivesWritten`, `PrimitivesStorageNeeded`), with no
-  statistics split since nothing is dispatched. When stream output lands, the heap becomes a
-  `VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT` pool begun with `vkCmdBeginQueryIndexedEXT` on the stream, whose two
-  results are in the same order.
+  zeros (`vkCmdFillBuffer`, 16 bytes per query), with no statistics split since nothing is dispatched. Two
+  overlapping `SO_STATISTICS` queries on one stream would be two active indexed queries in one pool
+  (`VUID-vkCmdBeginQueryIndexedEXT-queryPool-04753`), so `prepare()` refuses such a list
+  (`ReplayResult::invalid_query`); queries on different streams are fine.
 - **Recording.** The list keeps D3D12's rules for the calls: timestamps only have `EndQuery`; every other query is
   begun and ended in the same list with the same type, is not begun again while it runs, and is not resolved while
   it runs; resolve offsets are multiples of 8. A list closed with a query still running reports `E_INVALIDARG` and
@@ -3769,6 +4092,26 @@ Not implemented yet:
   one Vulkan indirect call. Use a compute expansion pass that writes a Vulkan-shaped indirect buffer, or
   `VK_NV_device_generated_commands` on NVIDIA. Start with the simple signatures; the trace will show which
   signatures the game creates.
+- The indirect arguments are clamped on the GPU before the command reads them (D3D-17's replay,
+  `runtime/src/vulkan_indirect_clamp.h`, shader `runtime/src/indirect_clamp.comp`). The title's own compute writes
+  them, and a pass the replay drops (an async pipeline that is not built yet, a stub pipeline,
+  `LEONIDA_SKIP_COMPUTE`) or mistranslates leaves whatever the memory held: a dispatch of billions of groups or a
+  draw of four billion vertices runs until the host resets the display driver. One small compute pass per
+  `ExecuteIndirect` call copies the active records into device-local scratch with their values bounded - 2^24
+  vertices or indices, 2^26 vertex instances (count times instances), 65 535 groups per dimension, 2^20 groups per
+  dispatch and a 2^27-unit work budget per call that saturates through an atomic compare-and-swap - and writes an
+  empty record past `min(count, max_command_count)` and past the budget, and the clamped count word a `*Count` draw
+  then reads (so the count is at most `maxDrawCount`, VUID-vkCmdDrawIndirectCount-countBuffer-02717). The indirect
+  command reads that scratch. A draw emits the pass before its rendering scope opens: `vkCmdCopyBuffer` and a
+  memory barrier with a transfer access are not allowed inside a dynamic-rendering scope. The records are
+  bit-identical to the application's when they are within the limits, the argument and count buffers are left
+  untouched, and the scratch comes from a per-submission pool (`vulkan_scratch.h`) that a list with many indirect
+  calls reuses. `LEONIDA_INDIRECT_CLAMP=0` reads the application's buffer again, as before. The pass's counters
+  (records checked, records clamped, counts clamped, records past the budget) are copied to one host-visible slot
+  per call, read once the submission completes, logged in full at the first use and then rate-limited. Covered by
+  `indirect_clamp_test` (every kind and the counted variants,
+  in-range and garbage records, the budget), by `d3d12_m4_compute_test` (a garbage dispatch record beside the
+  in-range one) and by `d3d12_indirect_rt_test` (a draw whose instance count is garbage).
 - Predication (`SetPredication`) maps to `VK_EXT_conditional_rendering` (D3D-18). Done: `GraphicsCommandList::
   SetPredication` records a `Predication` command (`runtime/src/command_list.h`; offset 8-byte aligned, op
   `EQUAL_ZERO` or `NOT_EQUAL_ZERO`, a null buffer turns it off). The replay (`runtime/src/vulkan_replay.h`) begins
@@ -3926,7 +4269,11 @@ to be recovered from call sites (or the NDA GDK headers, if a developer has acce
 | Mesh shader tier | Public `D3D12_MESH_SHADER_TIER` | `VK_EXT_mesh_shader`; the 9,282 translated mesh shaders make this a hard requirement for any content that uses them. |
 | Wave MMA | Public `D3D12_WAVE_MMA_TIER` | Not used: no shader sets `WAVE_MMA` in SFI0 and none contains `v_mfma`/`v_wmma` (all 26,503, `tools/feature_scan.py`). Answer the tier query truthfully; no cooperative-matrix mapping is needed. |
 | Enhanced barriers | Public Xbox Series `D3D12_BARRIER_GROUP` | `VK_KHR_synchronization2`; implement directly. |
+| List slot 146: texture barrier with no resource | The retail title records `D3D12_BARRIER_TYPE_TEXTURE` barriers whose `pResource` is null in its `Barrier(NumBarrierGroups, pBarrierGroups)` calls; on the console such a barrier is a global memory and execution barrier | `d3d12_xs_device.cpp` turns each into a `D3D12_GLOBAL_BARRIER` with the same `SyncBefore`/`SyncAfter`/`AccessBefore`/`AccessAfter` (layouts, subresource range and flags dropped) before it calls GCL7 `Barrier` (PC slot 80). A texture group with both kinds is split into runs, in order, in storage that lives for the call; a call with nothing to convert goes through with the title's own pointer. Without this the PC list goes into its error state, `Close` fails and `ExecuteCommandLists` drops the submission. A group array the proxy cannot read safely (null with a nonzero count, a group type it does not know, more than 1,024 groups or 65,536 barriers in one group) is refused whole, nothing recorded, and logged once per reason. **Confirmed by the mock tests only** (`xs_proxy_mock_test`), not by a retail run. |
+| List slot 52: clear of an RTV made with no resource | The title creates some render-target views with `CreateRenderTargetView(nullptr, ...)` and clears them every frame; on the console that clear does nothing | The device proxy marks the real handle when device slot 20 gets no resource; a view made there with a resource removes the mark, and `CopyDescriptors`/`CopyDescriptorsSimple` of RTVs move it with the descriptors. Releasing an RTV heap drops the marks in its real CPU range, so a heap made later at the same address starts unmarked. List slot 52 skips the clear of a marked view (logged the first time) and the list stays valid. The mark is the proxy's own because the real descriptor cannot tell: the Vulkan layer writes the same empty record for a view it could not make, and a PC runtime's handles are opaque. Any other view, valid or not, still reaches `ClearRenderTargetView` (PC slot 48); RTV records the title copies with its own `memcpy` are not followed. **Confirmed by the mock tests only** (`xs_proxy_mock_test`), not by a retail run. |
 | XDXR batched/streaming BVH | `XboxBvhBuilder.dll` exports | See 4.8. |
+
+The null-resource barrier and null-view clear behaviour were first reported by luizwidmer/palmetto.
 
 ### 4.10 Debug markers and private data
 
@@ -3988,6 +4335,36 @@ when it cannot sample the submission lock for that long. A progress warning leav
 device state intact. The driver checkpoint and fault-info queries run after Vulkan reports device loss. This mode
 is off by default.
 
+Each dispatch line carries a `seq`: a number every recorded dispatch gets, across queues and submissions, in the
+order the submissions were recorded. The list keeps the last 64, so its numbers can have gaps where a submission
+recorded more than that.
+
+**AMD breadcrumbs.** NVIDIA's checkpoints say where a queue stopped; RADV has none. With `LEONIDA_DEVICE_MARKERS=1`
+as well, on a device with `VK_AMD_buffer_marker`, every numbered dispatch writes its `seq` into its queue's slot of
+one persistent buffer twice (`src/vulkan_device_markers.h`): at top of pipe before the dispatch (started) and at
+bottom of pipe after it (finished), with `vkCmdWriteBufferMarker2AMD` (or `vkCmdWriteBufferMarkerAMD` without
+synchronization2). A bottom-of-pipe write waits for all earlier work on the queue, so the finished value is the last
+dispatch before which everything had completed, and the queue's dispatches after it up to the started value are the
+ones the GPU began and did not finish. The oldest of them is the likely hang. The buffer is host-visible and
+coherent, in system memory where the device has such a type, so it can still be read after a device loss. The loss
+and stall reports then add lines like these (the shader names are made up):
+
+```
+[rt] device-markers: AMD buffer markers, read after the device loss; best-effort: only what the GPU wrote before it stopped, and a reset may have lost the last writes
+[rt] device-markers: queue 0000000012345678 (compute) finished seq=1203 started seq=1205; started, not finished: 1204 1205
+[rt] device-markers: likely hang: seq=1204 execute=88 queue=0000000012345678 (compute) list=0 command=17 shader=cs_example_a
+[rt] device-markers: queue 00000000123456a0 (direct) idle: finished seq=1199, nothing started after it; next submitted seq=1206 not started (waiting, or behind other work of the queue)
+[rt] device-fault: submitted dispatch seq=1204 execute=88 queue=0000000012345678 (compute) list=0 command=17 shader=cs_example_a groups=64,1,1 <- likely hang (device-markers)
+```
+
+A separate history of the last 16,384 dispatches names the likely hang when it has already left the 64-entry list.
+An idle queue (finished equals started) is not called hung: if it still has dispatches submitted, it was waiting
+on a semaphore or stuck in work that is not a dispatch (a draw, a copy). The values are what the GPU wrote before
+it stopped; after a loss and a ring reset they may be stale, so read them as a pointer, not a proof. The cost with
+the switch on is two marker writes per dispatch (a command-processor write and an end-of-pipe event, no wait) plus
+one entry in the history; with it off nothing is recorded. Without the extension, or without
+`LEONIDA_DEVICE_FAULT`, the runtime logs one `device-markers: unavailable` line and runs as before.
+
 For a local pre-submit inspection, also set `LEONIDA_COMPUTE_INPUTS` to comma-separated shader name fragments and
 `LEONIDA_COMPUTE_INPUT_SLOTS` to comma-separated decimal `root/slot` pairs. For example, `4/86,5/0,5/2,7/0` reads
 four 32-byte descriptors. The probe logs the bound heap and root layout, the saved user SGPRs, observed descriptor
@@ -4028,7 +4405,8 @@ uint32 mask;                 // slot count - 1
 struct entry {               // 10 uints = 40 bytes
     uint32 key[8];           // T#: 8 dwords; S#: 4 dwords then 0xFFFFFFFF x4
     uint32 index;            // bindless index
-    uint32 pad;              // unused by the shader
+    uint32 kind;             // 0 empty; bit 31 occupied; bits 0..5 the sampled arrays the index is bound in,
+                             // bits 8..11 its storage arrays (one bit per ImageDimension)
 } entries[mask + 1];
 ```
 
@@ -4041,6 +4419,18 @@ struct entry {               // 10 uints = 40 bytes
   `runtime/test/descriptor_table_test.cpp`.
 - Probe: `slot = (h + k) & mask` for `k = 0..7`; the first entry whose eight key dwords match yields its
   `index`; no match yields 0.
+- `kind` says which arrays that index is good for, because it was given out in the T#'s own dimension's index space
+  (`runtime/src/vulkan_bindless.h`, `ImageDimension`): bit `d` is dimension `d`'s sampled array, bit `8 + d` its
+  storage arrays. A module whose `index.json` meta says `"descriptor_table": "tagged"` reads it and uses the index
+  only in an array the entry names, else index 0 of the array its instruction reads; an absent key is the old plain
+  layout, which reads only the index. `DescriptorTable::insert` takes the kind, and `BindlessSet::image_kind_at`
+  derives it from what was bound at the index (its own arrays, storage views, and the 2D copy of a 2D-array image's
+  first layer, whose slot records that image as its owner so another dimension's image with the same slot number does
+  not inherit it). One layout serves the device: any module whose meta says `tagged` makes the table tagged, because
+  the kind word is additive (a plain module ignores the word and reads the index, which the tagged layout keeps at
+  the same place), so a plain majority never turns it off; no tagged module is the old plain layout.
+  `LEONIDA_DESCRIPTOR_TABLE=plain|tagged` overrides, and the runtime says so loudly when an override forces plain
+  while tagged modules exist.
 - The layer must keep the table sparse enough that no live key needs more than eight probes. When all eight slots are occupied,
   the runtime tries to move one resident to the next empty slot within that resident's own probe window.
   A relocation requires an idle flush because it overwrites a live slot. Grow when this fails or when the next
@@ -4048,8 +4438,9 @@ struct entry {               // 10 uints = 40 bytes
   the rebuild, at a point where no in-flight command buffer reads the old table.
 - Insert on `CreateShaderResourceView`, `CreateUnorderedAccessView`, `CreateSampler`, `CopyDescriptors` and heap
   scans. A duplicate key updates the index in place.
-- Index 0 is the fallback: a 1×1 texture and a default sampler (and a valid dummy storage image for the storage
-  arrays). The translator returns 0 on a miss, so index 0 must always be valid.
+- Index 0 is the fallback: a 1×1 texture and a default sampler (and, for the storage arrays, a null descriptor
+  with `VK_EXT_robustness2` `nullDescriptor` or else a storage image apart from the sampled ones). The translator
+  returns 0 on a miss, so index 0 must always be valid.
 - The table buffer is a normal storage buffer, not part of the arena. It can be host-visible and updated directly
   (host-coherent, or flushed before submit); if the game is sensitive to PCIe traffic, stage it like any other
   upload. The shader only reads it.

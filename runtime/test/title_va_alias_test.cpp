@@ -67,6 +67,62 @@ int main() {
     EXPECT(a.shader_va(title + 0x8000) == title + 0x8000);
     a.remove(title + 0x100000, below);
     EXPECT(a.size() == 0 && a.shader_va(title + 0x100010) == title + 0x100010);
+    // range_of: what a BVH build checks its bytes against (the whole range must lie in one copy), and mappings, the
+    // table a TLAS build translates its instances' BLAS addresses with.
+    std::uint64_t to = 0, room = 0;
+    std::vector<leonida::TitleVaAliases::Mapping> table;
+    a.mappings(table);
+    EXPECT(table.empty() && !a.range_of(title, to, room));
+    EXPECT(a.add(title + 0x40000, size, 0x7000000) && a.add(title, size, arena));
+    EXPECT(a.range_of(title + 0x100, to, room) && to == arena + 0x100 && room == size - 0x100);
+    EXPECT(a.range_of(title + size - 1, to, room) && to == arena + size - 1 && room == 1);
+    EXPECT(!a.range_of(title + size, to, room) && !a.range_of(title - 1, to, room));
+    EXPECT(a.resolve(title + 0x40010, 64, leonida::TitleVaAliases::bvh_address) == 0x7000010);
+    EXPECT(a.translated(leonida::TitleVaAliases::bvh_address) == 1);
+    a.mappings(table);
+    EXPECT(table.size() == 2 && table[0].title_va == title && table[0].end == title + size &&
+           table[0].shader_va == arena && table[1].title_va == title + 0x40000 && table[1].shader_va == 0x7000000);
+    a.remove(title, arena);
+    a.remove(title + 0x40000, 0x7000000);
+    EXPECT(a.size() == 0);
+    // Replacing part of an alias removes the entire old interval. Other heaps read independently.
+    std::uint64_t cursor = 0;
+    leonida::DescriptorRanges past;
+    EXPECT(a.changed_ranges(cursor, past));
+    auto second = cursor;
+    EXPECT(a.add(title, size, arena));
+    EXPECT(a.add(title+16, 32, arena+4096));
+    for (auto* reader : {&cursor, &second}) {
+        leonida::DescriptorRanges delta;
+        EXPECT(a.changed_ranges(*reader, delta));
+        delta.merge();
+        EXPECT(delta.overlaps(title+size-1, 1) && delta.overlaps(title-16, 17));
+        EXPECT(!delta.overlaps(title+size, 1) && !delta.overlaps(title-16, 16));
+    }
+    leonida::DescriptorRangeChanges backing;
+    for (unsigned i = 0; i < 4097; ++i) backing.record(UINT64_MAX-3, 4);
+    cursor = 0;
+    EXPECT(!backing.read(cursor, past));
+    backing.record(UINT64_MAX-3, 4);
+    leonida::DescriptorRanges last;
+    EXPECT(backing.read(cursor,last));
+    last.merge();
+    EXPECT(last.overlaps(UINT64_MAX,1) && !last.overlaps(0,1));
+    // shader_side: whether an address is one the layer wrote for the title (inside some range's copy), so a scan that
+    // sees an already rewritten V# again leaves it alone rather than taking it for an unmapped address.
+    EXPECT(!a.shader_side(arena));
+    EXPECT(a.add(title, size, arena) && a.add_twin(title + 0x200000, title + 0x400000, 0x1000, 0x9000000));
+    EXPECT(a.shader_side(arena) && a.shader_side(arena + size - 1) && !a.shader_side(arena + size));
+    EXPECT(a.shader_side(0x9000fff) && !a.shader_side(0x9001000) && !a.shader_side(title));
+    a.remove(title + 0x200000, 0x9000000);
+    EXPECT(a.shader_side(0x9000000));  // the twin still names it
+    a.remove(title + 0x400000, 0x9000000);
+    EXPECT(!a.shader_side(0x9000000));
+    // A range replaced by an overlapping one leaves the index with the new copy only.
+    EXPECT(a.add(title + 0x100, 0x100, 0xA000000));
+    EXPECT(!a.shader_side(arena) && a.shader_side(0xA0000ff) && !a.shader_side(0xA000100));
+    a.remove(title + 0x100, 0xA000000);
+    EXPECT(a.size() == 0 && !a.shader_side(0xA000000));
     std::printf("title_va_alias: translation inside a title-placed range, identity outside it and after release\n");
     return 0;
 }

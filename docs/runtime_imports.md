@@ -64,6 +64,16 @@ Since the library-loader shims (`runtime/shims/library_loader.cpp`), a module's 
 
 The process shim (`runtime/shims/process.cpp`) serves `ExitProcess` and `GetCommandLineA/W` the same way: through `kernel32`, `kernelbase`, and `api-ms-win-core-processthreads-l1-1-0` and `api-ms-win-core-processenvironment-l1-1-0`, the sets the API-set umbrella libraries (`OneCore_apiset.lib`, `mincore.lib`) bind them to. `vcomp140.dll` imports `ExitProcess` from the first of these. The UCRT's `_get_narrow_winmain_command_line` and `_get_wide_winmain_command_line` are served too, so a `WinMain` executable gets the game's command line as `lpCmdLine`. `abort()` raises `SIGABRT` when the guest installed a handler (the guest's `signal()` import binds to the host CRT, so its table is the one raised here); with the default or ignore disposition, or a handler that returns, the run still ends with code 3. `run_tiny_game_abort_exit_codes` compares that with a native run of the stand-in image. The table above is `gta6rt --dry-run` on each DLL at the commit that added this paragraph.
 
+The lifecycle shim (`runtime/shims/lifecycle.cpp`) serves `RegisterAppStateChangeNotification` and
+`UnregisterAppStateChangeNotification` under `api-ms-win-core-psm-appnotify-l1-1-0`, `-l1-1-1` and `kernelbase.dll`, and
+`CreateWindowExW`/`CreateWindowExA` under `user32.dll` and the two `ext-ms-win-rtcore-ntuser-window-l1-1-*` sets, and
+`CreateWindowExA` under `ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0`. The title's import table names
+`RegisterAppStateChangeNotification` from `api-ms-win-core-psm-appnotify-l1-1-0` and `CreateWindowExA` from that ANSI
+set (`tools/pe_inspect.py`). Only the title's first top-level window (no parent, not a child, not a tool window) is fitted to the work area and hooked: its
+`SC_CLOSE` runs the registered suspend callbacks with `quiesced` TRUE under the registration lock, then the run ends
+through the title's own `ExitProcess`, so the host finishes its cleanup. A 1 s deadline ends the run the same way if the
+callbacks have not returned.
+
 The shims added since account for the rest of the difference from the first version of the table. The UCRT's `_configure_narrow_argv`, `_configure_wide_argv`, `__p___argc`, `__p___wargv` and `abort` are served by `runtime/shims/process.cpp`, which is why almost every DLL gained one or two. The file-system calls listed in *Console paths and the write overlay* below (`CreateFile2`, `CopyFile2`, `CreateDirectoryW`, `FindFirstFileExW`, `SetFileAttributesW` and the rest) account for `msvcp140.dll`, `vcomp140.dll`, `Bink2Scarlett.dll`'s `CreateFile2` and part of the two HTTP clients. `winhttp.dll` is a module the shims own (*WinHTTP offline* below), so every `WinHttp*` import binds to it: 15 in `libHttpClient.GDK.dll` (all 16 but `WinHttpCrackUrl`) and 15 in `XCurl.dll` (all but `WinHttpQueryOption`). That is why the two HTTP clients moved the most: 11 to 26 and 9 to 24 shim imports.
 
 The UCRT argv configuration imports honor the executable's startup mode. Each run starts with `argc == 0` and
@@ -280,10 +290,17 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   passed to the host unchanged. `--game-dir` defaults to the image's folder. `gta6rt` makes it and `--overlay`
   absolute at startup, so a bare image name (`gta6rt --run game.exe` from the game folder) and a relative folder
   both keep naming the same place after the title changes its current directory (CTest `run_tiny_game_dir`).
-  `G:\` is the same folder as `GAME:`, and `T:\` is a scratch folder, `<overlay>\.gta6rt-temp`, that `GAME:` does
-  not see (RT-218; the other console layers map those two drives this way, and only the executable can say which
-  spelling GTA VI uses). A path under `--game-dir` or the overlay is always a host path, so a package that sits on
-  a host drive `G:` keeps working, and with no folders configured `G:` and `T:` stay host drives.
+  `G:\` is the same folder as `GAME:`, and `T:\` is a scratch folder that `GAME:` does not see (RT-218; the other
+  console layers map those two drives this way, and only the executable can say which spelling GTA VI uses). Each
+  process has its own, `<overlay>\.gta6rt-temp\<YYYYMMDD-HHMMSS-mmm>-pid<id>` (start time in UTC and process id,
+  `rt::fs::scratch_dir()`, named on the startup line), as the console's temporary drive is empty at launch and
+  shared with no other run: with one folder for all runs, a `CREATE_NEW` of a name an earlier run left failed with
+  `ERROR_FILE_EXISTS` (old upstream issue 7913). `rt::fs::reserve_unique_dir` reserves it once per overlay with a
+  create-only `CreateDirectoryW`; a name that already exists (a reused process id in the same millisecond) is skipped
+  for `-2`, `-3`, ... up to 1000 names, after which `T:` paths fail with `ERROR_INVALID_NAME` and the reason is
+  printed once. Earlier runs' folders are kept, never reused, and `T:\..` cannot reach them. A path under
+  `--game-dir` or the overlay is always a host path, so a package that sits on a host drive `G:` keeps working, and
+  with no folders configured `G:` and `T:` stay host drives.
   `T:\` is a drive root like `GAME:\`: its folder is made on the first `T:` call, so it is a folder before anything
   is written there, and removing or moving it fails with `ERROR_ACCESS_DENIED`.
 - An open that can write, and `DeleteFile`, use the overlay: `--overlay DIR`, default `<game-dir>\overlay`. A
@@ -307,7 +324,9 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   package has, fails with `ERROR_ALREADY_EXISTS`; a missing parent with `ERROR_PATH_NOT_FOUND`.
 - `RemoveDirectory*` needs the folder empty in the title's view (`ERROR_DIR_NOT_EMPTY` otherwise). An overlay folder is
   removed; a package folder is hidden by a `.gta6rt-dir` marker inside its marker folder, and stays on disk. A marker
-  folder on its own (left by a file deleted below it) does not hide anything.
+  folder on its own (left by a file deleted below it) does not hide anything. A remove and a write-open or
+  `CreateDirectory*` inside the folder on another thread are ordered as on the host: one goes first, and the create
+  fails with `ERROR_PATH_NOT_FOUND` or the remove with `ERROR_DIR_NOT_EMPTY`, never both succeeding.
 - `MoveFile*` writes the destination in the overlay. A package file is copied there and its old name deleted by a
   marker; an overlay file or an overlay-only folder is renamed. An existing destination needs
   `MOVEFILE_REPLACE_EXISTING` even when only the package has it. Moving a package folder fails with
@@ -400,6 +419,22 @@ functions their public reference pages show returning `void`, `bool` or `int` (f
 families are not listed. The sources are the Microsoft Learn pages for the D3D12/DXGI functions and the GDK reference
 (`gaming/gdk/docs/reference/system/<family>/functions/<name>`); `D3D12XboxCreateDevice` is matched by name from the
 measurement in `d3d12_vulkan.md`, because its page could not be found.
+
+### Delay imports and thread events: where the loader differs from Windows
+
+- **Delay imports are bound eagerly.** `Loader::bind_imports` (`runtime/src/pe_loader.cpp`) binds the delay-import
+  table at load time, like the import table, so `--dry-run` shows the whole import surface. A delay-loaded DLL or
+  function that nothing serves becomes an unimplemented thunk, which follows `LEONIDA_UNIMPLEMENTED` at its first
+  call (return 0 by default). On Windows the delay-load helper raises `0xC06D007E` (module not found) or
+  `0xC06D007F` (procedure not found) at that call instead, and a title can catch it and take a fallback; that fallback
+  never runs here. `--trace` writes a `delay_import_unimplemented` event (`module`, `import`) for each such import
+  when the image is loaded.
+- **Thread events reach TLS callbacks in TLS slot order.** A new thread's `DLL_THREAD_ATTACH` runs the mapped
+  modules' TLS callbacks in the order of their TLS slots (`DLL_THREAD_DETACH` in reverse). A module takes the lowest
+  free slot when it is mapped, before its imports are loaded, so the executable's callbacks run before those of the
+  DLLs it imports; a slot freed by an unloaded module goes to the next one. Windows does not document its order, so a
+  title that depends on DLL-first order would see a difference here. Mapped DLLs' `DllMain` gets no thread events
+  (`runtime/README.md`, PE loader).
 
 ## Run-time loaded modules
 
