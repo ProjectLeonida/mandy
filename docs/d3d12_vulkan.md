@@ -886,7 +886,28 @@ The compute path, end to end:
   D3D-448); the compute bind point uses it.
 - **GPU address arena** (section 3.3, when the device has `bufferDeviceAddress`): one host-visible,
   device-addressable buffer, 256 MiB by default (`LEONIDA_ARENA_MB`, at most 4095 MiB, so every VA fits 32-bit
-  table pointers).
+  table pointers). `LEONIDA_ARENA_MB` bounds the address range; with sparse binding it is not memory.
+  - **Backing blocks** (`runtime/src/arena_backing.h`). Where the device has `sparseBinding`,
+    `sparseResidencyBuffer`, `residencyNonResidentStrict`, a sparse address space at least as large as the arena and
+    a queue with the sparse binding bit to spare (`pick_arena_bind_queue`: RADV's sparse-only family), the arena is a
+    sparse buffer and its memory comes in units bound in 2 MiB blocks: a block is bound when the first allocation
+    needs it, before the allocation is handed out, and unbound once its last allocation is released and the GPU has
+    passed the retire ticket of the release (`submitted_retire_ticket() + 1`, checked at the start of every
+    `ExecuteCommandLists` against `completed_retire_ticket()`), then its memory is freed. Binds go to that queue alone
+    and are waited for there, so a bind never sits behind a submission that waits for a fence the CPU signals later.
+  - No allocation crosses a unit: one no larger than a block stays inside one block, a larger one takes whole blocks
+    of its own. So each allocation is one run of one mapping, and the CPU reaches an arena offset through
+    `DeviceState::arena_host()` (one table read; null, with a line, for a range without memory), or
+    `ArenaBacking::with_host()` for an offset the caller does not hold (value writes, `read_arena`). A D3D12 heap in the
+    arena lends its unit's memory to reserved resources' tiles at the heap's place in that unit.
+  - The block size is measured, not tuned: a world run had about 5,000 live arena allocations averaging 160 KiB
+    (790 MiB live, 990 MiB peak end, 4,095 MiB asked). 2 MiB is a multiple of the 64 KiB sparse page, keeps a 4 GiB
+    arena within the 4,096 memory objects some Windows drivers allow (2,048 at most, about 500 at that peak), and is
+    amdgpu's large page.
+  - Without those capabilities (llvmpipe: a 2 GiB sparse address space and one queue) one allocation backs the whole
+    arena, as before, through the same accessors. `arena_backing_test` (CPU) and `arena_sparse_gpu_test` (a real
+    device; skipped without sparse binding) check both. The arena's line at device release (and with a console
+    heap's log) reads `GPU address arena: bound N MiB now (peak P, U units of 2 MiB blocks, sparse)`.
   - It is also no larger than the device's `maxBufferSize` (Vulkan 1.3) and, counting the buffer's memory
     requirement, `maxMemoryAllocationSize` (Vulkan 1.1), whichever is smaller (`runtime/src/arena_size.h`). When a
     limit cuts the request, one log line names the limit and the size used. `arena_size_test` (CPU) checks the

@@ -103,6 +103,13 @@ struct VulkanDeviceInfo {
     std::uint32_t copy_family = UINT32_MAX;
     std::vector<VkQueue> compute_queues;
     std::vector<VkQueue> copy_queues;
+    // A queue of its own on which the GPU address arena binds and unbinds its memory blocks (src/arena_backing.h),
+    // so a bind never waits behind the title's work. Null: the arena is one allocation, as without sparse binding.
+    VkQueue arena_bind_queue = VK_NULL_HANDLE;
+    // VkPhysicalDeviceLimits::sparseAddressSpaceSize and VkPhysicalDeviceSparseProperties::residencyNonResidentStrict:
+    // a sparse arena must fit the first, and needs the second (an unbound block reads as zero).
+    VkDeviceSize sparse_address_space = 0;
+    bool residency_non_resident_strict = false;
     bool pipeline_creation_feedback = false;
     // Vulkan 1.3 pipelineCreationCacheControl, enabled: FAIL_ON_PIPELINE_COMPILE_REQUIRED asks a cache without a compile.
     // Implies core VkPipelineCreationFeedback, which then needs no extension.

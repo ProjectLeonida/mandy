@@ -104,8 +104,13 @@ Backing backing(State& state, std::uint64_t base) {
         // block after it starts, without holding an iterator the block map could cut.
         std::uint64_t block_offset = 0, block_size = 0, next = state.arena.size;
         if (state.arena.blocks.free_at(base, block_offset, block_size, next)) return {"arena-free"};
-        return {alias ? "arena-shadow" : "arena", source, reinterpret_cast<std::uint64_t>(state.arena.mapped) + base,
-                alias ? std::min<std::uint64_t>(room, next - base) : next - base};
+        // The CPU address of base in the backing unit that holds it; the range reported stops at the unit's end.
+        const std::uint64_t span = std::min<std::uint64_t>(alias ? std::min<std::uint64_t>(room, next - base)
+                                                                 : next - base,
+                                                           state.arena.backing.room(base));
+        if (!span) return {"arena-unbacked"};
+        return {alias ? "arena-shadow" : "arena", source,
+                reinterpret_cast<std::uint64_t>(state.arena.backing.host(base, span)), span};
     }
     if (alias) {
         std::uint64_t host{}, bytes{};
@@ -257,7 +262,8 @@ void recheck(State& state) {
         else
             for (const auto& [offset, heap] : state.visible_heaps)
                 if (heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && heap.end <= state.arena.size)
-                    scan("arena", offset, state.arena.mapped + offset, heap.end - offset);
+                    if (const std::uint8_t* host = state.arena.backing.host(offset, heap.end - offset))
+                        scan("arena", offset, host, heap.end - offset);
     }
 }
 
