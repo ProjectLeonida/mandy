@@ -5367,6 +5367,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             for (std::uint32_t k = 0; k < records; ++k) {
                 vk.dispatch_indirect(command_buffer, indirect_buffer, arguments + VkDeviceSize(k) * stride);
             }
+            if constexpr (Checkpoints) checkpoints->dispatched(command_buffer);
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
                    xdxr_build && vk.xdxr_record) {
             vk.xdxr_record(command_buffer, *xdxr_build, p.xdxr_blases);
@@ -5483,6 +5484,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             }
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
+            if constexpr (Checkpoints) checkpoints->dispatched(command_buffer);
         } else if (raster.state) {
             const Draw* draw = raster.state;
             const detail::PreparedDraw& d = prepared.draws[p.draw];
