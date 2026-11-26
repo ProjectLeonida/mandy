@@ -307,6 +307,74 @@ class TestJsonGuard(unittest.TestCase):
         with open(out, encoding="utf-8") as f:
             self.assertEqual(json.load(f)["payloads"], 5)
 
+    def test_utf8_bom_index_and_recursion_error(self):
+        index_path = os.path.join(self.dx, "index.json")
+        raw = self.read(index_path)
+        with open(index_path, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + raw)
+        r = V.survey(self.dx, disasm_fn=fake_disasm)
+        self.assertEqual(r["payloads"], 5)
+
+        err = io.StringIO()
+        with mock.patch.object(V.json, "load", side_effect=RecursionError("too deep")), \
+                contextlib.redirect_stderr(err):
+            code = V.main([self.dx])
+        self.assertEqual(code, 2)
+        lines = err.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_limit_validation_and_trailing_separator_json_guard(self):
+        for bad_limit in (0, -1):
+            with self.subTest(bad_limit=bad_limit):
+                with self.assertRaises(ValueError):
+                    V.survey(self.dx, limit=bad_limit)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    with self.assertRaises(SystemExit) as cm:
+                        V.main([self.dx, "--limit", str(bad_limit)])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("must be at least 1", err.getvalue())
+
+        for sep in ("/", "\\"):
+            with self.subTest(sep=sep):
+                self.assertIn("is a directory", self.refuse(os.path.join(self._tmp.name, "dir_out") + sep))
+
+    def test_atomic_json_creates_parent_ends_with_lf_and_cleans_on_failure(self):
+        out = os.path.join(self._tmp.name, "nested", "dir", "report.json")
+        with mock.patch.object(V, "default_disasm", side_effect=fake_disasm), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = V.main([self.dx, "--json", out])
+        self.assertEqual(code, 0)
+        raw = self.read(out)
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertNotIn(b"\r\n", raw)
+
+        # Simulated write and replace failures must preserve existing report and leave no staging files.
+        out_dir = os.path.dirname(out)
+
+        def fail_dump(_obj, f, **_kw):
+            f.write("{partial")
+            raise OSError("disk full")
+
+        for patch_target, effect in (
+            ((V.json, "dump"), fail_dump),
+            ((V.replace_retry, "replace"), OSError("replace denied")),
+        ):
+            with self.subTest(target=patch_target[1]):
+                err = io.StringIO()
+                with (
+                    mock.patch.object(V, "default_disasm", side_effect=fake_disasm),
+                    mock.patch.object(patch_target[0], patch_target[1], side_effect=effect),
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(err),
+                ):
+                    rc = V.main([self.dx, "--json", out])
+                self.assertEqual(rc, 2)
+                self.assertIn("cannot write", err.getvalue())
+                self.assertEqual(self.read(out), raw)
+                self.assertEqual([n for n in os.listdir(out_dir) if n.startswith(".vs-layout-")], [])
+
 
 if __name__ == "__main__":
     unittest.main()
