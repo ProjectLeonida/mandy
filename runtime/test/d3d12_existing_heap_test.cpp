@@ -1722,6 +1722,64 @@ int check_texture_over_render_target(ID3D12Device* device) {
     return 0;
 }
 
+// A plain texture and a render target at one address, in either order: a slot-70 view of the plain texture's
+// description is a view of the render target's image (what the GPU renders there), and once the target is gone, of
+// the plain texture's own image again.
+int check_view_over_render_target(ID3D12Device* device) {
+    const char* who = "view over a render target";
+    if (!rt::d3d12::bindless_set_layout(device)) return 0;
+    constexpr SIZE_T bytes = 4 * 65536;
+    D3D12_RESOURCE_DESC plain{};
+    plain.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    plain.Width = 256;
+    plain.Height = 256;
+    plain.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    plain.SampleDesc.Count = plain.DepthOrArraySize = plain.MipLevels = 1;
+    D3D12_RESOURCE_DESC target = plain;
+    target.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const auto view = [&](void* pages, const D3D12_RESOURCE_DESC& desc, std::uint64_t& image) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = desc.Format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        std::array<UINT, 14> resource{};
+        std::array<UINT, 16> words{};
+        std::memcpy(resource.data(), &desc, sizeof(desc));
+        std::memcpy(words.data(), &srv, sizeof(srv));
+        leonida::gfx10::ImageWords slot{};
+        if (!rt::d3d12::write_placed_texture_view(device, false, resource.data(), words.data(),
+                                                  reinterpret_cast<UINT64>(pages), {reinterpret_cast<SIZE_T>(slot.data())}))
+            return false;
+        leonida::gfx10::Image decoded{};
+        if (!leonida::gfx10::decode(slot, decoded)) return false;
+        image = decoded.address;
+        return true;
+    };
+    for (const bool target_first : {false, true}) {
+        void* pages = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        EXPECT(pages);
+        Ref<ID3D12Resource> texture, rendered;
+        if (target_first)
+            EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, target, 6, IID_PPV_ARGS(&rendered.p)), S_OK);
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, plain, 6, IID_PPV_ARGS(&texture.p)), S_OK);
+        if (!target_first)
+            EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, target, 6, IID_PPV_ARGS(&rendered.p)), S_OK);
+        std::uint64_t of_plain = 0, of_target = 0;
+        EXPECT(view(pages, target, of_target));
+        EXPECT(view(pages, plain, of_plain));
+        EXPECT(of_plain == of_target);  // the plain texture's view shows the target's image
+        rendered.p->Release();
+        rendered.p = nullptr;
+        EXPECT(view(pages, plain, of_plain));
+        EXPECT(of_plain != of_target);  // the target is gone: the plain texture's own image again
+        texture.p->Release();
+        texture.p = nullptr;
+        VirtualFree(pages, 0, MEM_RELEASE);
+    }
+    return 0;
+}
+
 // A persistent Map can become readable without notifying xmem or calling Map a second time.
 int check_mapped_plane(ID3D12Device* device) {
     const char* who = "persistent slot-133 plane";
@@ -2460,6 +2518,7 @@ int main(int argc, char** argv) {
             failures += check_shared_bc_placements(ours.p);
             failures += check_mapped_plane(ours.p);
             failures += check_texture_over_render_target(ours.p);
+            failures += check_view_over_render_target(ours.p);
             failures += check_mapped_bc_array(ours.p);
         }
         {
