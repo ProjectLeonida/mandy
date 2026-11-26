@@ -55,6 +55,23 @@ def barycentric_fallback():
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return False
 
+
+def f16_interp_fallback():
+    """LEONIDA_F16_INTERP_FALLBACK=1 (or 0), as build.py reads it; unset, on where tools/vk_subgroup_info.py reports
+    per_vertex_inputs false (MoltenVK), the answer build.py and scripts/run_gpu_tests.py take too."""
+    v = (os.environ.get("LEONIDA_F16_INTERP_FALLBACK") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    try:
+        tools = os.path.abspath(os.path.join(HERE, "..", "..", "..", "tools"))
+        r = subprocess.run([sys.executable, "-I", os.path.join(tools, "vk_subgroup_info.py")],
+                           capture_output=True, text=True, timeout=60)
+        return json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs") is False
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return False
+
 # The programs every run needs. Multi-config CMake generators (Visual Studio, Xcode, Ninja Multi-Config) put each of
 # them in build/<Config> instead of build/ (TEST-38).
 TEST_PROGRAMS = ("vk_compute_test", "vk_store_test", "vk_harness")
@@ -754,9 +771,10 @@ PK_MUL_LO_WORDS = [0x00009E88, 0x03675433, 0x00230000, 0x00077F6C] * 2
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
 # LEONIDA_BARY_FALLBACK=1/0 overrides the device probe for raw barycentrics. Unset, Mesa ANV selects the fallback.
 BARY_FALLBACK = barycentric_fallback()
-# LEONIDA_F16_INTERP_FALLBACK=1 (as build.py reads it): *_f16 interps were translated from decoded-half inputs, with no
-# PerVertexKHR inputs at all, so the translator refuses a computed I/J pair (ps_ij_computed) there.
-F16_HALVES = os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1"
+# The f16 interpolation fallback (LEONIDA_F16_INTERP_FALLBACK, else the device, as build.py decides it): *_f16 interps
+# were translated from decoded-half inputs, with no PerVertexKHR inputs at all, so the translator refuses a computed
+# I/J pair (ps_ij_computed) there.
+F16_HALVES = f16_interp_fallback()
 W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               ("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
               ("cs_w64x_writelane", [4660, 77, 99, 2748, 0, 0, 4660, 99]),
