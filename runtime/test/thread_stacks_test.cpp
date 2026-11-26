@@ -200,8 +200,14 @@ void fault_stacks() {
     // Binary: the capture must hold the bytes the diagnostics wrote, with their own line endings.
     const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(file), _O_BINARY);
     _dup2(fd, _fileno(stderr));
+    // The report also goes to the crash log (RT-CRASH-LOG): a temporary one here, never the user's.
+    const std::string crash_log = std::string(dir) + "leonida_thread_stacks_crash_" +
+                                  std::to_string(GetCurrentProcessId()) + ".log";
+    std::remove(crash_log.c_str());
+    SetEnvironmentVariableA("LEONIDA_CRASH_LOG", crash_log.c_str());
     g_fault_caller_fn = here();  // fault_stacks itself: the chain must reach it above the fault
     const int value = run_fault();
+    SetEnvironmentVariableA("LEONIDA_CRASH_LOG", nullptr);
     _dup2(saved, _fileno(stderr));
     _close(saved);
     _close(fd);  // the last CRT reference to `file`, so this closes the handle
@@ -244,6 +250,20 @@ void fault_stacks() {
     check(in_fault_here >= 0, "the chain reaches the function the fault happened in");
     check(in_caller > in_fault_here, "and unwinds out of it to the function that called it");
     check(capture.find("[rt] stacks test: ") != std::string::npos, "the other threads are snapshotted too");
+
+    // The registers and the host line are printed, and the whole report is in the crash log, after a dated header.
+    check(capture.find("[rt] fault test: rip=") != std::string::npos, "the faulting context's registers are printed");
+    check(capture.find("[rt] fault test: host: Windows ") != std::string::npos, "so is the host line");
+    std::ifstream log_in(crash_log, std::ios::binary);
+    const std::string logged{std::istreambuf_iterator<char>(log_in), std::istreambuf_iterator<char>()};
+    log_in.close();
+    std::remove(crash_log.c_str());
+    check(logged.rfind("==== ", 0) == 0 && logged.find(" UTC, process ") != std::string::npos,
+          "the crash log's report starts with its dated header");
+    check(logged.find("[rt] fault test: read of 0xc at ") != std::string::npos &&
+              logged.find("(faulting thread):\n") != std::string::npos &&
+              logged.find("[rt] stacks test: ") != std::string::npos,
+          "and holds the fault, the faulting thread's chain and the other threads");
 }
 
 void parse() {

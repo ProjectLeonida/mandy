@@ -1892,6 +1892,10 @@ if(NOT TARGET Vulkan::Headers)
     FetchContent_MakeAvailable(VulkanHeaders)
   endif()
 endif()
+# The text of a fatal-fault report and LEONIDA_CRASH_LOG's choice (src/crash_report.h): portable, no Windows.
+add_executable(crash_report_test test/crash_report_test.cpp)
+add_test(NAME crash_report COMMAND crash_report_test)
+
 if(TARGET Vulkan::Headers)
   add_executable(vulkan_device_fault_test test/vulkan_device_fault_test.cpp)
   target_link_libraries(vulkan_device_fault_test PRIVATE Vulkan::Headers)
