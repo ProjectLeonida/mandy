@@ -742,12 +742,11 @@ class TestLaneMaskInteractionAndNegativeControls(unittest.TestCase):
                 ])
                 self.assertEqual(got, 0x10 if "movk" in op_line else 0xF00)
 
-        # Also verify s_addk_i32 / s_mulk_i32 / s_bitset0_b32 / s_bitset1_b32 clear lane-mask tracking.
+        # Also verify s_addk_i32 / s_mulk_i32 clear lane-mask tracking (s_bitset0/1_b32 on a lane mask
+        # keep lane-mask tracking and mutate only the addressed lane's bit; see test_bitset32_mask.py).
         for op_line in (
             "s_addk_i32 s0, 8",
             "s_mulk_i32 s0, 4",
-            "s_bitset0_b32 s0, 0",
-            "s_bitset1_b32 s0, 3",
         ):
             with self.subTest(op=op_line):
                 spv = translate_lines([

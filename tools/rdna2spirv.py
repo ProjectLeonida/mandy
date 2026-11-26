@@ -9284,15 +9284,37 @@ class Gen:
                     self.emit(f"{want} = OpNot %uint {mk}")
                     self.emit(f"{r} = OpBitwiseAnd %uint {old} {want}")
                 self.store_reg("sgpr", d["r"] + half, r)
-        elif op == "s_bitset1_b32":
-            # sD |= 1 << (src & 31)   (sD is both source and destination)
-            b = self.src_u(a[1])
-            m, sh, old, r = (self.tmp() for _ in range(4))
+        elif op in ("s_bitset0_b32", "s_bitset1_b32"):
+            # sD = sD & ~(1 << (src & 31)) / sD | (1 << (src & 31)); sD is both source and destination, SCC unchanged.
+            # When sD holds a lane mask (exec_lo/hi, vcc_lo/hi, or a mask SGPR), mutate only the addressed lane's bit.
+            b = self.lane_mask_word(a[1]) if self.holds_lane_mask(a[1]) else self.src_u(a[1])
+            m = self.tmp()
             self.emit(f"{m} = OpBitwiseAnd %uint {b} {self.cu(31)}")
-            self.emit(f"{sh} = OpShiftLeftLogical %uint {self.cu(1)} {m}")
-            self.emit(f"{old} = OpCopyObject %uint {self.src_u(a[0])}")
-            self.emit(f"{r} = OpBitwiseOr %uint {old} {sh}")
-            self.dst(a[0], r)
+            if self.holds_lane_mask(a[0]):
+                half = self.mask_half(a[0]) if self.wave64 else None
+                tgt = m
+                if half == "hi":
+                    tgt = self.tmp()
+                    self.emit(f"{tgt} = OpIAdd %uint {m} {self.cu(32)}")
+                hit, r = self.tmp(), self.tmp()
+                self.emit(f"{hit} = OpIEqual %bool {self.wave_lane()} {tgt}")
+                old = (self.exec_value() if (a[0]["k"] == "special" and a[0].get("t", "").startswith("exec"))
+                       else self.mask_src(a[0], wide=False))
+                self.emit(f"{r} = OpSelect %uint {hit} {self.cu(0xFFFFFFFF if op == 's_bitset1_b32' else 0)} {old}")
+                self.put_mask(a[0], r, half)
+                if self.wave64 and a[0]["k"] == "special" and a[0].get("t") == "vcc_hi":
+                    self.emit(f"OpStore %vcc_hi {r}")
+            else:
+                sh, old, r = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{sh} = OpShiftLeftLogical %uint {self.cu(1)} {m}")
+                self.emit(f"{old} = OpCopyObject %uint {self.src_u(a[0])}")
+                if op == "s_bitset1_b32":
+                    self.emit(f"{r} = OpBitwiseOr %uint {old} {sh}")
+                else:
+                    n = self.tmp()
+                    self.emit(f"{n} = OpNot %uint {sh}")
+                    self.emit(f"{r} = OpBitwiseAnd %uint {old} {n}")
+                self.dst(a[0], r)
         elif op in ("v_mul_hi_u32_u24", "v_mul_hi_i32_i24"):
             # High 32 bits of the 48-bit product of the low 24 bits of each source: zero-extended for u24,
             # sign-extended from bit 23 for i24 (RDNA2 ISA). The low 32 bits are v_mul_u32_u24 / v_mul_i32_i24.
@@ -9707,14 +9729,6 @@ class Gen:
             c, r = self.tmp(), self.tmp()
             self.emit(f"{c} = OpBitCount %uint {x}")
             self.emit(f"{r} = OpIAdd %uint {c} {acc}")
-            self.dst(a[0], r)
-        elif op == "s_bitset0_b32":
-            b = self.src_u(a[1])
-            m, sh, n, r = (self.tmp() for _ in range(4))
-            self.emit(f"{m} = OpBitwiseAnd %uint {b} {self.cu(31)}")
-            self.emit(f"{sh} = OpShiftLeftLogical %uint {self.cu(1)} {m}")
-            self.emit(f"{n} = OpNot %uint {sh}")
-            self.emit(f"{r} = OpBitwiseAnd %uint {self.src_u(a[0])} {n}")
             self.dst(a[0], r)
         elif op in ("s_min_i32", "s_max_i32"):
             x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
