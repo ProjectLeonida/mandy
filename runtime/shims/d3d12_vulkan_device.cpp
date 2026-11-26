@@ -10103,17 +10103,20 @@ public:
 
     bool enabled() const { return enabled_; }
     bool has_file_data() const { return !file_.data.empty(); }
+    bool from_seed() const { return file_.from_seed; }  // the data came from the read-only seed overlay
     bool found() const { return enabled_ && built_ && !write_; }  // the pipeline came out of the journal file
     bool written() const { return written_; }                     // publish() wrote the file
 
-    void load(std::filesystem::path path) {
+    // `use_seed` false: the seed overlay's file is read as absent (one the driver already refused in this build).
+    void load(std::filesystem::path path, bool use_seed = true) {
         const auto& vk = device_.context->vk;
         if (!vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache || !vk.vkGetPipelineCacheData) return;
         enabled_ = true;
         path_ = std::move(path);
         namespace journal = leonida::pipeline_journal;
         const auto role = compile_helper::build_host.load() ? journal::ReadRole::materialize_local : journal::ReadRole::runtime;
-        file_ = journal::read_with_seed(path_, pipeline_journal_roots().seed, device_.pso_identity, role);
+        file_ = journal::read_with_seed(path_, use_seed ? pipeline_journal_roots().seed : std::filesystem::path{},
+                                        device_.pso_identity, role);
     }
 
     // In the build's driver turn.
@@ -10266,6 +10269,7 @@ struct ComputeBuildOptions {
     bool mark_building = false;              // precompile, helper: claim the entry, skip it when another process has it
     bool key_only = false;                   // only name the journal file (journal_path), build nothing
     bool probe_journal = true;               // a helper-sized module's file is asked without a compile (see below)
+    bool skip_seed = false;                  // the seed overlay's file was refused: read as absent, left untouched
 };
 
 // A compute pipeline from a library entry: what a PSO's first dispatch, the warm-up worker and gta6rt
@@ -10346,7 +10350,7 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
             out.skipped = true;
             return out;
         }
-        journal.load(path);
+        journal.load(path, !options.skip_seed);
         // LOCAL FIX (compile helper, d3d12_compile_helper.h): no file, so this would be a compile in this process,
         // where the driver's lock it holds stops the title's submissions. The helper process compiles it into the file
         // instead, and the create below is a hit. Asked without waiting, the build answers deferred and is asked
@@ -10364,7 +10368,7 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
             } else {
                 const ULONGLONG asked = GetTickCount64();
                 if (helper.build(path, entry->name, device.pso_identity, &why)) {
-                    journal.load(path);
+                    journal.load(path, !options.skip_seed);
                     std::fprintf(stderr, "[rt] d3d12: compile helper built %s in %.1f s (%zu B SPIR-V, %s)\n",
                                  entry->name.c_str(), double(GetTickCount64() - asked) / 1000.0, bytes, trigger);
                 } else {
@@ -10394,6 +10398,7 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
     const bool probe_file = options.probe_journal && journal.has_file_data() && options.use_helper &&
                             compile_helper::wanted(bytes) && device.info.pipeline_cache_control;
     bool stale_file = false;
+    bool stale_seed = false;  // the refused file is the seed overlay's: it stays, and the retry reads it as absent
 
     VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     module_info.codeSize = bytes;
@@ -10461,6 +10466,7 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
             if (probing) {
                 pipeline_info.flags &= ~VkPipelineCreateFlags(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT);
                 stale_file = created == VK_PIPELINE_COMPILE_REQUIRED;
+                stale_seed = stale_file && journal.from_seed();
                 if (stale_file) built = VK_NULL_HANDLE;
             }
             // A seeded miss the cache did not take: built once more against an empty cache, so the file is rewritten
@@ -10491,14 +10497,19 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
     trace.end(trigger, entry->name.c_str(), 0, bytes, created);
     if (big_lock.owns_lock()) big_lock.unlock();
     if (stale_file) {
+        // A local file is removed. The seed overlay is read-only and stays as it is; the retry reads it as absent,
+        // so the build goes the no-file way too and the helper's file is written locally.
         std::error_code removed;
-        std::filesystem::remove(out.journal_path, removed);
+        if (!stale_seed) std::filesystem::remove(out.journal_path, removed);
         std::fprintf(stderr, "[rt] d3d12: pipeline journal: %s: its journal file would have been a compile here "
                              "(%llu ms to say so); %s, and the build goes to the compile helper\n",
                      entry->name.c_str(), static_cast<unsigned long long>(driver_ms),
-                     removed ? "the file could not be removed (built here as before)" : "the file is removed");
+                     stale_seed ? "the seed's file is left and read as absent"
+                     : removed  ? "the file could not be removed (built here as before)"
+                                : "the file is removed");
         ComputeBuildOptions again = options;  // once: a file left in place is then seeded and compiled as before
         again.probe_journal = false;
+        again.skip_seed = stale_seed;
         return build_compute_pipeline(device, compute_entry, layout, subgroup, again);
     }
     if (probe_compiled && device.journal_ask_shared.exchange(false))
