@@ -12497,7 +12497,7 @@ public:
                           int(desc.PrimitiveTopologyType), desc.SampleDesc.Count);
             leonida::fsdraw::note_pipeline(id(), text);
         }
-        if (device_.info.device_checkpoints) {
+        if (device_.info.device_checkpoints || leonida::gpu_profile::enabled()) {  // names for both reports
             leonida::CheckpointShaders shaders{};
             for (std::size_t i = 0; i < std::size(stages); ++i)
                 if (stages[i].entry) shaders[i] = stages[i].entry->name.c_str();
@@ -12645,7 +12645,9 @@ public:
             pipeline_.code_base = code_base_;
         }
         device_.context->add_pipeline(id(), pipeline_,
-                                      device_.info.device_fault_diagnostics ? entry->name.c_str() : nullptr);
+                                      device_.info.device_fault_diagnostics || leonida::gpu_profile::enabled()
+                                          ? entry->name.c_str()
+                                          : nullptr);
         registered_ = true;
         if (pipeline_.build && !pipeline_.skipped) warmup_enqueue(this, spirv_bytes);
         return S_OK;
@@ -14962,6 +14964,7 @@ public:
             const bool can_resolve = (family.queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) != 0;
             state_.timestamp_bits.push_back(can_resolve ? family.timestampValidBits : 0);
         }
+        state_.context->set_timestamp_bits(state_.timestamp_bits);  // the queues LEONIDA_GPU_PROFILE can time
         if (info.queue_family < family_count) {
             const auto& family = families[info.queue_family];
             if (family.timestampValidBits)

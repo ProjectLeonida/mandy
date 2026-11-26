@@ -1,0 +1,21 @@
+#version 450
+// vk_gpu_profile_test: a dispatch whose GPU time grows with s0, the loop count (the translator's 144-byte user-data
+// block: s0..s31, heap base, code base). Each invocation writes its result, so the loop is kept.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) buffer Results {
+    uint value[];
+} results;
+
+layout(push_constant) uniform UserData {
+    uint s[32];
+    uvec2 heap_base;
+    uvec2 code_base;
+} pc;
+
+void main() {
+    const uint x = gl_GlobalInvocationID.x;
+    uint v = x;
+    for (uint i = 0; i < pc.s[0]; ++i) v = (v * 1664525u + 1013904223u) ^ (v >> 13);
+    results.value[x] = v;
+}
