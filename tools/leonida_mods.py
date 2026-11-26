@@ -639,6 +639,9 @@ def run_gui(args: argparse.Namespace, initial_mods_dir: str | None) -> int:
         from tkinter import filedialog, messagebox, ttk
     except ImportError as exc:
         hint = ("on Windows install Python from python.org with Tcl/Tk" if os.name == "nt" else
+                # Homebrew's Python ships without Tkinter: it is a separate formula per Python version.
+                f"brew install python-tk@{sys.version_info[0]}.{sys.version_info[1]} (or use the python.org installer)"
+                if sys.platform == "darwin" else
                 "install your distribution's Tkinter package (Debian and Ubuntu: sudo apt install python3-tk)")
         raise ModsError(f"Tkinter is not installed; {hint}") from exc
 

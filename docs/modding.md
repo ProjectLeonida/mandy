@@ -38,7 +38,7 @@ paths that climb out of the package, links and manifests the runtime would rejec
 copies game data.
 
 On Windows, double-click **`Mods.bat`** for the Tkinter window (on Linux and macOS, run **`./Mods.sh`**; it needs
-Tkinter, `python3-tk` on Debian and Ubuntu): choose the port folder, install a ZIP or folder,
+Tkinter, `python3-tk` on Debian and Ubuntu, `brew install python-tk@3.N` for Homebrew's Python 3.N): choose the port folder, install a ZIP or folder,
 toggle a mod, create a swap, pack or remove one, and launch `gta6rt` normally or as a dry run. The GUI uses the same
 standard-library code as the CLI below.
 
