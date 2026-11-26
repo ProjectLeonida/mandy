@@ -819,6 +819,10 @@ works for loopback traffic:
   file. Numeric loopback literals pass through unchanged.
 - `ConnectEx` and `WSASendMsg` from `WSAIoctl` are the host's own pointers, fetched for the socket they are called on
   (each Winsock provider has its own), after the same loopback check.
+- `connect` and `WSAConnect` also pass the two forms that dissolve a datagram socket's association instead of reaching
+  a peer: an `AF_UNSPEC` address, and `0.0.0.0` or `::` with port 0 (measured on Windows 11: the socket is no longer
+  connected and takes datagrams from any address again; a TCP socket gets the host's error). `0.0.0.0` with a port is
+  still refused.
 - `bind` narrows wildcard binds (`0.0.0.0`, `::`) to loopback (`127.0.0.1`, `::1`) and refuses other non-loopback
   addresses with `WSAEADDRNOTAVAIL`.
 - A send to a loopback address on an unbound socket (`sendto`, `WSASendTo`, `WSASendMsg`, `WSAJoinLeaf`) would bind it
@@ -838,8 +842,9 @@ works for loopback traffic:
 `runtime/test/ws2_offline_test.cpp` (ctest `ws2_offline`) verifies name and ordinal bindings, the `wsock32.dll`
 aliases, external refusals using RFC 5737 / RFC 3849 / `.invalid` targets, the `0127.0.0.1` refusal, the
 `WSASERVICE_NOT_FOUND` refusal, wildcard-bind narrowing, a `ConnectEx` pointer from `WSAIoctl` connecting to a loopback
-listener, a local loopback UDP round-trip, loopback binds for sends on unbound UDP sockets (with a control showing
-the host's own `sendto` binds to `0.0.0.0`), and the multicast and `WSAJoinLeaf` refusals.
+listener, a local loopback UDP round-trip, a UDP association dissolved by each of the disconnect forms, loopback binds
+for sends on unbound UDP sockets (with a control showing the host's own `sendto` binds to `0.0.0.0`), and the multicast
+and `WSAJoinLeaf` refusals.
 
 ## What this proves and what it does not
 
