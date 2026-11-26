@@ -150,7 +150,7 @@ _SCALAR_NO_SCC_PREFIXES = (
     "s_mov", "s_cselect", "s_load", "s_buffer_load", "s_getpc",
     "s_nop", "s_waitcnt", "s_clause", "s_inst_prefetch", "s_pack",
     "s_mul_i32", "s_mul_hi", "s_mulk", "s_ff", "s_flbit", "s_bfm",
-    "s_get_waveid",
+    "s_bitset", "s_get_waveid",
 )
 
 # Bounded caches for opcode normalization and static per-opcode classification.
@@ -249,7 +249,8 @@ def _get_op_meta(raw_op):
         returns = (op.startswith(("ds_read", "ds_bpermute", "ds_permute", "ds_swizzle", "ds_consume", "ds_append"))
                    or "_rtn" in op)
         rw_mode = _RW_DS_RET if returns else _RW_DS_NORET
-    elif op in ("s_addk_i32", "s_mulk_i32", "s_cmovk_i32"):
+    elif op in ("s_addk_i32", "s_mulk_i32", "s_cmovk_i32",
+                "s_bitset0_b32", "s_bitset1_b32", "s_bitset0_b64", "s_bitset1_b64"):
         rw_mode = _RW_SOPK_RW
     elif op == "s_movk_i32":
         rw_mode = _RW_DEFAULT

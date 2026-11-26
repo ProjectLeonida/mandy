@@ -798,6 +798,71 @@ class LocalExecFoldTests(unittest.TestCase):
         for lane in range(64):
             self.assertEqual(mem[lane * 4], 5, f"lane {lane}: stale scalar s9 after s_cbranch_execz")
 
+    def test_bitset_rmw_keeps_scalar_live_out_of_lane_local_execz_fold(self):
+        # s_bitset0/1_b32/b64 preserve all untouched bits of their destination SGPR(s) and do not write SCC.
+        sgpr = lambda r, n=1: {"k": "sgpr", "r": r, "n": n}
+        imm = lambda v: {"k": "imm", "v": v}
+        for op, nregs, bit in (
+            ("s_bitset0_b32", 1, 0),
+            ("s_bitset1_b32", 1, 3),
+            ("s_bitset0_b64", 2, 0),
+            ("s_bitset1_b64", 2, 33),
+        ):
+            ins = {"op": op, "args": [sgpr(4, nregs), imm(bit)], "mods": ()}
+            rd, mw, mk = wave64_emulate_opt._scalar_rw(ins)
+            want = ((1 << nregs) - 1) << 4
+            self.assertEqual((rd, mw, mk), (want, want, want), op)
+            self.assertFalse(wave64_emulate_opt.writes_scc(ins), op)
+
+        import spirv_asm
+
+        insns_b32 = [
+            ("s_mov_b32 s4, 0", 4),
+            ("v_cmp_eq_u32_e64 s[12:13], 0, v0", 8),
+            ("s_and_saveexec_b64 s[10:11], s[12:13]", 4),
+            ("s_cbranch_execz 1", 4),
+            ("s_mov_b32 s4, -1", 4),
+            ("s_mov_b64 exec, s[10:11]", 4),
+            ("s_bitset0_b32 s4, 0", 4),
+            ("v_mov_b32_e32 v1, s4", 4),
+            ("v_lshlrev_b32_e32 v2, 2, v0", 4),
+            ("buffer_store_dword v1, v2, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        for wg in ((64, 1, 1), (128, 1, 1)):
+            with self.subTest(op="s_bitset0_b32", wg=wg):
+                spv, _ = _translate_encoded(f"cs_bitset0_b32_{wg[0]}", insns_b32, wg, emulate=True)
+                self.assertGreaterEqual(spv.count("OpAtomicOr"), 1)
+                self.assertEqual(spirv_asm.assemble(spv, target_env="vulkan1.2")[:4], struct.pack("<I", 0x07230203))
+                mem, _ = run_emulated_workgroup(spv, wg, push_constants=VSHARP + [0] * 28)
+                for lane in range(wg[0]):
+                    want = 0xFFFFFFFE if lane < 64 else 0
+                    self.assertEqual(mem[lane * 4], want, f"wg={wg} lane={lane}")
+
+        insns_b64 = [
+            ("s_mov_b64 s[4:5], 0", 4),
+            ("v_cmp_eq_u32_e64 s[12:13], 0, v0", 8),
+            ("s_and_saveexec_b64 s[10:11], s[12:13]", 4),
+            ("s_cbranch_execz 1", 4),
+            ("s_mov_b64 s[4:5], 4", 4),
+            ("s_mov_b64 exec, s[10:11]", 4),
+            ("s_bitset1_b64 s[4:5], 0", 4),
+            ("s_bitset1_b64 s[4:5], 33", 4),
+            ("v_mov_b32_e32 v1, s4", 4),
+            ("v_mov_b32_e32 v2, s5", 4),
+            ("v_lshlrev_b32_e32 v3, 3, v0", 4),
+            ("buffer_store_dword v1, v3, s[0:3], 0 offen", 8),
+            ("buffer_store_dword v2, v3, s[0:3], 0 offen offset:4", 8),
+            ("s_endpgm", 4),
+        ]
+        spv64, _ = _translate_encoded("cs_bitset1_b64_64", insns_b64, (64, 1, 1), emulate=True)
+        self.assertGreaterEqual(spv64.count("OpAtomicOr"), 1)
+        self.assertEqual(spirv_asm.assemble(spv64, target_env="vulkan1.2")[:4], struct.pack("<I", 0x07230203))
+        mem64, _ = run_emulated_workgroup(spv64, (64, 1, 1), push_constants=VSHARP + [0] * 28)
+        for lane in range(64):
+            self.assertEqual(mem64[lane * 8], 5, f"lo lane {lane}")
+            self.assertEqual(mem64[lane * 8 + 4], 2, f"hi lane {lane}")
+
     def test_negative_store_and_crosslane_and_exec_widen_not_folded(self):
         cases = [
             ("multi_store", [
