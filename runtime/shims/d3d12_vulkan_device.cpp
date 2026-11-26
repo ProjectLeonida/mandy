@@ -8621,6 +8621,8 @@ public:
     void* title_address() const { return title_address_; }  // place_at_title_address, or null
     bool replay_seen() const { return replay_seen_.load(std::memory_order_relaxed); }
     bool staged_title() const { return staged_title_; }
+    // The image as the title upload writes it (TitleImageUpload::reserve, fill and commit).
+    const leonida::ResourceBinding& title_binding() const { return binding_; }
     bool upload_staged_title(const rt::xg_xs::Texture& layout, const std::uint8_t* tiled,
                              std::vector<std::uint64_t>& columns, bool inspect, bool& nonzero) {
         std::lock_guard lock(device_.title_upload_mutex);
@@ -16000,7 +16002,74 @@ public:
         }
         title_named_.clear();
         watch.collect([&](std::uint64_t key) { title_named_.push_back(key); });
+        // Not filled: with no backing yet or after a failed upload it is looked at again next pass. Memory not
+        // readable yet waits for its mapping (xmem's change names it), except a texture the title mapped, whose
+        // pages may be committed under the pointer Map gave without xmem (the probe answers each pass). Its tiles
+        // are armed again then: pages committed since the last arming have no guard yet.
+        const auto not_filled = [&](TitleTexture& t) {
+            if ((t.stale || !t.hashed) && t.resource && (!t.memory.pending() || t.mapped))
+                watch.note_changed(t.cpu, t.cpu + t.layout.layout.size);
+        };
+        // The textures named are read and detiled by several threads (TitleReadPool) in batches, and their transfers
+        // recorded and submitted here, one by one in key order, before this submission: the reads of different
+        // textures are independent, the submissions are what the ordering needs. Everything under the registry lock,
+        // which the pass holds throughout.
         std::uint64_t filled = 0;
+        title_jobs_.clear();
+        std::uint64_t batch_bytes = 0;
+        const auto fill_start = clock::now();
+        const auto run_batch = [&] {
+            if (title_jobs_.empty()) return;
+            title_read_pool().run(title_jobs_.size(), [this](std::size_t i) { read_title_job(title_jobs_[i]); });
+            for (TitleJob& job : title_jobs_) {
+                TitleTexture& t = *job.entry;
+                if (!job.copied) {  // the section changed after VirtualQuery: keep the last upload and retry
+                    rt::d3d12::TitleImageUpload::unreserve(*job.slot);
+                    t.memory.defer();
+                    t.stale = true;
+                    not_filled(t);
+                    continue;
+                }
+                if (job.unchanged) {
+                    rt::d3d12::TitleImageUpload::unreserve(*job.slot);
+                    ++stats.unchanged;
+                    t.stale = false;
+                    continue;
+                }
+                bool ok = false;
+                {
+                    const auto start = clock::now();
+                    std::lock_guard upload(state_.title_upload_mutex);
+                    ok = state_.title_upload.commit(state_, job.resource->id(), job.resource->title_binding(),
+                                                    t.layout, *job.slot);
+                    stats.staged_ns +=
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
+                }
+                if (!ok) {
+                    log_once("staged title texture upload failed, format", int(job.resource->format()));
+                    ++stats.fill_failures;
+                    t.stale = true;
+                    not_filled(t);
+                    continue;
+                }
+                ++stats.staged_fills;
+                if (job.trace)
+                    std::fprintf(stderr, "[rt] ds-pool-fill cpu=%llx size=%llu staged=1 nonzero=%d\n",
+                                 static_cast<unsigned long long>(t.cpu), static_cast<unsigned long long>(job.span),
+                                 int(job.nonzero));
+                if (t.owned && !t.fills) job.resource->publish_streamed_texture();
+                t.hash = job.hash;
+                t.hashed = true;
+                t.stale = false;
+                ++t.fills;
+                ++stats.fills;
+                ++stats.changed;
+                stats.fill_bytes += job.span;
+                filled += job.span;
+            }
+            title_jobs_.clear();
+            batch_bytes = 0;
+        };
         for (const std::uint64_t key : title_named_) {
             const auto it = state_.title_textures.find(key);
             if (it == state_.title_textures.end() || !it->second->resource) continue;
@@ -16014,18 +16083,35 @@ public:
                 continue;
             }
             ++stats.checked;
-            const auto fill_start = clock::now();
-            const std::uint64_t uploaded = fill_title_texture(t);
-            stats.fill_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - fill_start).count();
-            if (uploaded) ++stats.changed;
-            filled += uploaded;
-            // Not filled: with no backing yet or after a failed upload it is looked at again next pass. Memory not
-            // readable yet waits for its mapping (xmem's change names it), except a texture the title mapped, whose
-            // pages may be committed under the pointer Map gave without xmem (the probe answers each pass). Its tiles
-            // are armed again then: pages committed since the last arming have no guard yet.
-            if (!uploaded && (t.stale || !t.hashed) && t.resource && (!t.memory.pending() || t.mapped))
-                watch.note_changed(t.cpu, t.cpu + t.layout.layout.size);
+            if (!title_texture_readable(t) || !back_title_texture(t)) {
+                not_filled(t);
+                continue;
+            }
+            rt::d3d12::TitleImageUpload::Slot* slot = nullptr;
+            {
+                std::lock_guard upload(state_.title_upload_mutex);
+                slot = state_.title_upload.reserve(state_, t.resource->title_binding(), t.layout);
+            }
+            if (!slot) {
+                log_once("staged title texture upload failed, format", int(t.resource->format()));
+                ++stats.fill_failures;
+                t.stale = true;
+                not_filled(t);
+                continue;
+            }
+            TitleJob& job = title_jobs_.emplace_back();
+            job.entry = entry;
+            job.resource = t.resource;
+            job.slot = slot;
+            job.span = t.layout.layout.size;
+            job.previous = t.hashed && t.fills ? std::optional<std::uint64_t>(t.hash) : std::nullopt;
+            job.write_combined = title_memory_write_combined(t.cpu);
+            job.trace = leonida::dstorage::trace_enabled() && leonida::title_gpu_views::other_view(t.cpu);
+            batch_bytes += job.span;
+            if (title_jobs_.size() >= kTitleBatch || batch_bytes >= kTitleBatchBytes) run_batch();
         }
+        run_batch();
+        stats.fill_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - fill_start).count();
         stats.filled_bytes += filled;
         stats.max_pass_bytes = std::max(stats.max_pass_bytes, filled);
         std::vector<Resource*> release;
@@ -16097,6 +16183,24 @@ private:
     TitleTextureStats title_stats_;                                 // under title_texture_mutex
     bool title_pass_ = false;                                      // in refresh_title_textures, likewise
     std::vector<std::uint64_t> title_named_;                       // refresh scratch, under title_texture_mutex
+    // One texture of a refresh batch: what the serial part found (the slot reserved for it, the last fill's hash) and
+    // what a TitleReadPool thread read (read_title_job).
+    struct TitleJob {
+        std::shared_ptr<TitleTexture> entry;
+        Resource* resource = nullptr;  // the texture's, held by the registry for the pass
+        rt::d3d12::TitleImageUpload::Slot* slot = nullptr;
+        std::uint64_t span = 0, hash = 0;
+        std::optional<std::uint64_t> previous;
+        bool write_combined = false, trace = false, copied = false, unchanged = false, nonzero = false;
+        std::vector<std::uint8_t> tiled;
+        std::vector<std::uint64_t> columns;
+    };
+    static constexpr std::size_t kTitleBatch = 16;                 // jobs read at once (and upload slots reserved)
+    static constexpr std::uint64_t kTitleBatchBytes = 64ull << 20; // or this many bytes of them
+    std::deque<TitleJob> title_jobs_;                              // refresh scratch, under title_texture_mutex
+    class TitleReadPool;
+    std::unique_ptr<TitleReadPool> title_read_pool_;
+    std::once_flag title_read_pool_once_;
     leonida::TitleTextureWatch<TitleTextureCells>::Stats title_watch_logged_;  // as of the last log line, likewise
     std::atomic<std::uint64_t> refreshed_present_{~std::uint64_t(0)};  // LEONIDA_REFRESH_PER_FRAME: present of the last full refresh
 
@@ -16615,20 +16719,7 @@ private:
             t.stale = true;
             return 0;
         }
-        if (!t.owned && t.unbound_bytes) {
-            if (!t.resource->image()) {
-                t.stale = true;
-                return 0;
-            }
-            t.set_resource(t.resource);
-        }
-        if (t.owned && t.unbound_bytes) {
-            if (!t.resource->back_streamed_texture()) {
-                t.stale = true;
-                return 0;
-            }
-            t.set_resource(t.resource);
-        }
+        if (!back_title_texture(t)) return 0;
         // Every byte: a texture is read only when something says it changed, so this is its one read; bytes equal to
         // the last fill's (a write to another texture in the same 64 KiB tile, or the same texels again) are not
         // uploaded again.
@@ -16663,6 +16754,103 @@ private:
         ++title_stats_.fills;
         title_stats_.fill_bytes += span;
         return span;
+    }
+
+    // A texture whose image has no memory yet gets it before its first fill. False (and stale) when it cannot.
+    bool back_title_texture(TitleTexture& t) {
+        if (!t.unbound_bytes) return true;
+        if (t.owned ? !t.resource->back_streamed_texture() : !t.resource->image()) {
+            t.stale = true;
+            return false;
+        }
+        t.set_resource(t.resource);
+        return true;
+    }
+
+    // A pass's read of one texture, on a TitleReadPool thread: the bytes, their hash, and, when they differ from the
+    // last fill's, the detile into the reserved upload slot. Touches only the job's own buffers and slot.
+    void read_title_job(TitleJob& job) {
+        const TitleTexture& t = *job.entry;
+        job.tiled.resize(std::size_t(job.span));
+        job.copied = copy_guarded(job.tiled.data(), reinterpret_cast<const std::uint8_t*>(t.cpu), std::size_t(job.span),
+                                  job.write_combined);
+        if (!job.copied) return;
+        hash_guarded(job.tiled.data(), job.tiled.size(), job.hash, true);
+        job.unchanged = job.previous && *job.previous == job.hash;
+        if (job.unchanged) return;
+        job.nonzero = false;
+        rt::d3d12::TitleImageUpload::fill(*job.slot, job.resource->title_binding(), t.layout, job.tiled.data(),
+                                          job.columns, job.trace, job.nonzero);
+    }
+
+    // A few threads of ours for the refresh's reads: run(n, f) calls f(0..n-1) on them and on the calling thread,
+    // and returns when all are done.
+    class TitleReadPool {
+    public:
+        explicit TitleReadPool(unsigned threads) {
+            for (unsigned i = 0; i < threads; ++i) threads_.emplace_back([this] { serve(); });
+        }
+        ~TitleReadPool() {
+            {
+                std::lock_guard lock(mutex_);
+                stop_ = true;
+            }
+            wake_.notify_all();
+            for (auto& thread : threads_) thread.join();
+        }
+        TitleReadPool(const TitleReadPool&) = delete;
+        TitleReadPool& operator=(const TitleReadPool&) = delete;
+        void run(std::size_t count, std::function<void(std::size_t)> work) {
+            {
+                std::lock_guard lock(mutex_);
+                work_ = std::move(work);
+                count_ = count;
+                next_.store(0, std::memory_order_relaxed);
+                busy_ = threads_.size();
+                ++generation_;
+            }
+            wake_.notify_all();
+            drain(work_);
+            std::unique_lock lock(mutex_);
+            done_.wait(lock, [&] { return busy_ == 0; });
+            work_ = nullptr;
+        }
+
+    private:
+        void drain(const std::function<void(std::size_t)>& work) {
+            for (std::size_t i; (i = next_.fetch_add(1, std::memory_order_relaxed)) < count_;) work(i);
+        }
+        void serve() {
+            std::uint64_t seen = 0;
+            for (;;) {
+                std::function<void(std::size_t)> work;
+                {
+                    std::unique_lock lock(mutex_);
+                    wake_.wait(lock, [&] { return stop_ || generation_ != seen; });
+                    if (stop_) return;
+                    seen = generation_;
+                    work = work_;
+                }
+                drain(work);
+                std::lock_guard lock(mutex_);
+                if (!--busy_) done_.notify_all();
+            }
+        }
+        std::mutex mutex_;
+        std::condition_variable wake_, done_;
+        std::function<void(std::size_t)> work_;
+        std::size_t count_ = 0, busy_ = 0;
+        std::atomic<std::size_t> next_{0};
+        std::uint64_t generation_ = 0;
+        bool stop_ = false;
+        std::vector<std::thread> threads_;
+    };
+    TitleReadPool& title_read_pool() {
+        std::call_once(title_read_pool_once_, [this] {
+            const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+            title_read_pool_ = std::make_unique<TitleReadPool>(std::clamp(cores / 4, 1u, 7u));
+        });
+        return *title_read_pool_;
     }
 
     static bool title_memory_write_combined(std::uint64_t address) {
