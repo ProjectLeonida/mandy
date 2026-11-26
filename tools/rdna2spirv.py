@@ -19695,19 +19695,22 @@ def merge_shard_parts(out):
     return merged
 
 
-def _run_tool(cmd, *, input=None, text=False, cwd=None):
+_ORIG_SUBPROCESS_RUN = subprocess.run
+
+
+def _run_tool(cmd, *, input=None, text=False, cwd=None, timeout=None, env=None, **_ignored):
     """Run an external SPIR-V tool and terminate it cleanly if interrupted (SIGINT/SIGTERM)."""
     stdin_mode = subprocess.PIPE if input is not None else None
     try:
         p = subprocess.Popen(cmd, stdin=stdin_mode, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=text, cwd=cwd)
+                             text=text, cwd=cwd, env=env)
     except FileNotFoundError as exc:
         # Windows CreateProcess omits the executable name from WinError 2.
         if getattr(exc, "winerror", None) == 2 and exc.filename is None:
             exc.filename = cmd[0]
         raise
     try:
-        out, err = p.communicate(input=input)
+        out, err = p.communicate(input=input, timeout=timeout)
     except BaseException:
         if p.poll() is None:
             try:
@@ -19732,7 +19735,9 @@ def _run_tool(cmd, *, input=None, text=False, cwd=None):
 
 
 def _run_spirv_tool(cmd, **kwargs):
-    return _run_tool(cmd, input=kwargs.get("input"), text=kwargs.get("text", False), cwd=kwargs.get("cwd"))
+    if subprocess.run is not _ORIG_SUBPROCESS_RUN:
+        return subprocess.run(cmd, **kwargs)
+    return _run_tool(cmd, **kwargs)
 
 
 def _clean_stale_spirv_temps(out):
