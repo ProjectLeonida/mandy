@@ -671,6 +671,28 @@ have an empty map reference array, selector -1 and `parentIndex` -1.
 All 330 entities have `parentInstance` -1. These checks establish authored associations for the measured
 terrain records. Nondefault batch instances and the runtime switching distance remain open.
 
+### Finding your way in the viewer (the `M` map)
+
+A placed world is kilometres across, and the viewer loads only what is near the camera. `M` in
+`viewer/index.html` opens a map of the whole world from above, drawn from `world.json` alone: one rectangle per
+chunk (its `cell` when the record has one, otherwise the X/Z extent of its `bounds`), +x to the right and +z down,
+so north (RAGE +Y, glTF -Z) is at the top of a placed world.
+
+- A chunk's colour is what the streaming code is doing with it: not loaded, loading, loaded, or failed (its three
+  attempts are used up). With LOD sets several tiers share a cell, and the cell shows the busiest one.
+- The arrow is the camera and its view direction, the ring the spawn point, and in a world without `lod_bands` the
+  circle is the 1,400 m radius inside which chunks load.
+- The line under the map names the point under the cursor in glTF metres, in a placed world also as RAGE X and Y
+  (the numbers `--region` takes), and the chunk there with its state, which is how a chunk that fails to load is
+  found by id.
+- A click moves the camera to that point. Its height stays, unless full-detail geometry (`hd`, `orphan_hd` or a
+  chunk without a tier) reaches higher there: then it arrives 10 m above the top of those chunks' bounds.
+- The wheel over the map zooms it about the cursor, up to 64 times.
+
+Opening the map releases a locked mouse, because the map is used with the cursor; a click beside the map locks it
+again, and the map stays open while flying. `node --test tests/test_viewer_map.cjs` runs the map's code from the
+page against synthetic manifests.
+
 ### Measured
 
 On the 1.0.2.1 package, `levels.rpf`, Linux, 88 cores, `--no-textures`, 256 m chunks. Models were exported with
