@@ -1896,6 +1896,10 @@ if(TARGET Vulkan::Headers)
   add_executable(vulkan_device_fault_test test/vulkan_device_fault_test.cpp)
   target_link_libraries(vulkan_device_fault_test PRIVATE Vulkan::Headers)
   add_test(NAME vulkan_device_fault COMMAND vulkan_device_fault_test)
+  # The AMD breadcrumbs (LEONIDA_DEVICE_MARKERS): seq numbering, marker writes and the likely-hang verdict, on the CPU.
+  add_executable(vulkan_device_markers_test test/vulkan_device_markers_test.cpp)
+  target_link_libraries(vulkan_device_markers_test PRIVATE Vulkan::Headers)
+  add_test(NAME vulkan_device_markers COMMAND vulkan_device_markers_test)
   # The submit lock's owner tracking, waiter count, submit handoff and compile gate (SubmitMutex), on the CPU.
   if(WIN32)
     add_executable(submit_mutex_test test/submit_mutex_test.cpp)
@@ -2047,6 +2051,20 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vk_semaphore_lifetime COMMAND vk_semaphore_lifetime_test)
     set_tests_properties(vk_semaphore_lifetime PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  endif()
+  # The AMD breadcrumbs (LEONIDA_DEVICE_MARKERS) on a real device: after a few dispatches and a wait, the queue's
+  # started and finished markers hold the last dispatch's seq. SKIP without VK_AMD_buffer_marker.
+  add_executable(vk_device_markers_test test/vk_device_markers_test.cpp)
+  target_link_libraries(vk_device_markers_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_device_markers_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_device_markers_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_device_markers COMMAND vk_device_markers_test)
+    set_tests_properties(vk_device_markers PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   endif()
   # With LEONIDA_VK_VALIDATION=1: synchronization validation reports a missing barrier (and not a present one), so
   # the other GPU tests' "0 validation errors" was checked by an active layer. 77 without validation or a device.
@@ -3245,11 +3263,11 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(xbox_d16s8_storage PROPERTIES
                          ENVIRONMENT "LEONIDA_TEST_D16S8_UAV=1;LEONIDA_CONSOLE_D16S8=native" SKIP_RETURN_CODE 77 TIMEOUT 30)
     set_tests_properties(xbox_depth_storage PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
-    # Made as D24S8, a D16S8 depth-stencil texture with unordered access is refused by the depth provider; slots 76
-    # and 133 make it without unordered access instead (d24 forces what a GPU with D24S8 attachments chooses).
-    add_test(NAME xbox_d16s8_refused_uav COMMAND xbox_depth_storage_test)
-    set_tests_properties(xbox_d16s8_refused_uav PROPERTIES
-                         ENVIRONMENT "LEONIDA_TEST_D16S8_REFUSED_UAV=1;LEONIDA_CONSOLE_D16S8=d24" SKIP_RETURN_CODE 77 TIMEOUT 30)
+    # Made as D24S8 (the default on GPUs with D24S8 attachments, e.g. NVIDIA), a D16S8 depth-stencil texture keeps
+    # its UAVs through the widened R16_TYPELESS + R8_UINT planes and Depth24Converter.
+    add_test(NAME xbox_d16s8_d24_storage COMMAND xbox_depth_storage_test)
+    set_tests_properties(xbox_d16s8_d24_storage PROPERTIES
+                         ENVIRONMENT "LEONIDA_TEST_D16S8_UAV=1;LEONIDA_CONSOLE_D16S8=d24" SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_executable(xbox_d16s8_surface_test test/xbox_d16s8_surface_test.cpp)
     target_link_libraries(xbox_d16s8_surface_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(xbox_d16s8_surface_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

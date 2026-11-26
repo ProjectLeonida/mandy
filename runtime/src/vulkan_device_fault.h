@@ -2,6 +2,8 @@
 
 #include <vulkan/vulkan.h>
 
+#include "vulkan_device_markers.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -13,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <memory>
 #include <cstring>
 #include <mutex>
 #include <span>
@@ -28,6 +31,7 @@ struct DeviceFaultExtensions {
     bool fault = false;
     bool checkpoints = false;
     bool diagnostics_config = false;
+    bool markers = false;  // VK_AMD_buffer_marker (LEONIDA_DEVICE_MARKERS=1, vulkan_device_markers.h)
 };
 
 // What a device asks for. LEONIDA_DEVICE_FAULT=1 wants all of it; LEONIDA_AFTERMATH=1 alone (vulkan_aftermath.h) only
@@ -36,6 +40,7 @@ struct DeviceFaultRequest {
     bool fault = true;               // VK_EXT_device_fault and VK_NV_device_diagnostic_checkpoints
     bool diagnostics_config = true;  // VK_NV_device_diagnostics_config
     VkDeviceDiagnosticsConfigFlagsNV extra_flags = 0;  // added to the default config flags below
+    bool markers = false;            // VK_AMD_buffer_marker, when the device has it
 };
 
 // Owns the feature structures until vkCreateDevice returns.
@@ -65,13 +70,15 @@ struct DeviceFaultFeatures {
         }
         const DeviceFaultExtensions enabled{has_fault && fault.deviceFault == VK_TRUE,
                                             request.fault && has(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME),
-                                            has_config && diagnostics.diagnosticsConfig == VK_TRUE};
+                                            has_config && diagnostics.diagnosticsConfig == VK_TRUE,
+                                            request.markers && has(VK_AMD_BUFFER_MARKER_EXTENSION_NAME)};
         if (enabled.fault) {
             extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
             fault.pNext = const_cast<void*>(device.pNext);
             device.pNext = &fault;
         }
         if (enabled.checkpoints) extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+        if (enabled.markers) extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
         if (enabled.diagnostics_config) {
             extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
             diagnostics.pNext = const_cast<void*>(device.pNext);
@@ -156,6 +163,7 @@ struct CheckpointDispatch {
     std::uint32_t max_count, stride;
     std::array<std::uint32_t, 32> roots;
     bool indirect;
+    std::uint64_t seq = 0;  // the report's dispatch number, counted over every recorded dispatch (CheckpointRecorder)
 };
 
 struct CheckpointSubmission {
@@ -168,6 +176,13 @@ struct CheckpointSubmission {
     std::vector<CheckpointDispatch> dispatches;
     std::size_t dispatch_count = 0;
     static constexpr std::size_t dispatch_limit = 64;
+    // Numbers every recorded dispatch, across queues and submissions (the report's seq). Null: no numbers.
+    std::atomic<std::uint64_t>* dispatch_seq = nullptr;
+    // LEONIDA_DEVICE_MARKERS=1: this queue's marker slot, every dispatch recorded for the marker history and the seq
+    // whose finished marker is still to be written after its dispatch (CheckpointRecorder::dispatched).
+    MarkerTarget markers;
+    std::vector<MarkedDispatch> marked;
+    std::uint64_t open_marker = 0;
 
     void append_dispatch(CheckpointDispatch d) {
         if (dispatches.size() < dispatch_limit) dispatches.push_back(d);
@@ -204,10 +219,25 @@ struct CheckpointRecorder {
                   std::uintptr_t count = 0, std::uint64_t count_offset = 0,
                   std::uint32_t max_count = 0, std::uint32_t stride = 0) const {
         const auto names = pipeline_names.find(id);
+        const char* shader = names != pipeline_names.end() ? names->second[0] : nullptr;
+        const std::uint64_t seq =
+            submission.dispatch_seq ? submission.dispatch_seq->fetch_add(1, std::memory_order_relaxed) + 1 : 0;
         submission.append_dispatch({submission.execute_call, submission.queue, submission.queue_kind, list, command,
-            names != pipeline_names.end() ? names->second[0] : nullptr, groups, args, count,
-            offset, count_offset, max_count, stride, roots, indirect});
+            shader, groups, args, count, offset, count_offset, max_count, stride, roots, indirect, seq});
+        if (submission.markers) {
+            submission.marked.push_back({seq, submission.execute_call, submission.queue, submission.queue_kind,
+                                         static_cast<std::uint32_t>(list), static_cast<std::uint32_t>(command), shader});
+            submission.markers.started(buffer, seq);
+            submission.open_marker = seq;
+        }
         record(buffer, command, CheckpointKind::dispatch, pipeline, id);
+    }
+
+    // After the dispatch call(s) that dispatch() announced: its finished marker.
+    void dispatched(VkCommandBuffer buffer) const {
+        if (!submission.open_marker) return;
+        submission.markers.finished(buffer, submission.open_marker);
+        submission.open_marker = 0;
     }
 };
 
@@ -545,7 +575,10 @@ struct SubmitRecord {
 
 class DeviceFaultDiagnostics {
 public:
-    DeviceFaultDiagnostics(PFN_vkGetDeviceProcAddr get, VkDevice device, DeviceFaultExtensions enabled)
+    // `memory` and `synchronization2` are for the AMD markers (enabled.markers): where their buffer goes and whether
+    // vkCmdWriteBufferMarker2AMD may be used.
+    DeviceFaultDiagnostics(PFN_vkGetDeviceProcAddr get, VkDevice device, DeviceFaultExtensions enabled,
+                           const VkPhysicalDeviceMemoryProperties* memory = nullptr, bool synchronization2 = false)
         : device_(device) {
 #define LEONIDA_FAULT_LOAD(name) name = reinterpret_cast<PFN_##name>(get(device, #name))
         if (enabled.fault) LEONIDA_FAULT_LOAD(vkGetDeviceFaultInfoEXT);
@@ -558,6 +591,17 @@ public:
         std::fprintf(stderr, "[rt] device-fault: enabled (fault info %s, checkpoints %s, NVIDIA diagnostics config %s)\n",
                      vkGetDeviceFaultInfoEXT ? "on" : "unavailable", checkpoint_command() ? "on" : "unavailable",
                      enabled.diagnostics_config ? "on" : "unavailable");
+        if (enabled.markers) enable_markers(get, memory, synchronization2);
+        else if (device_markers_requested())
+            std::fprintf(stderr, "[rt] device-markers: unavailable: the device has no VK_AMD_buffer_marker\n");
+    }
+
+    bool markers_on() const { return markers_ != nullptr; }
+
+    // The queue's marker slot as the GPU last wrote it ({0, 0} without markers).
+    MarkerSlot marker_slot(VkQueue queue) {
+        std::lock_guard lock(mutex_);
+        return markers_ ? markers_->read(queue) : MarkerSlot{};
     }
 
     PFN_vkCmdSetCheckpointNV checkpoint_command() const {
@@ -565,8 +609,12 @@ public:
     }
 
     void add_queue(VkQueue queue) {
-        if (!queue || !vkGetQueueCheckpointDataNV) return;
+        if (!queue) return;
         std::lock_guard lock(mutex_);
+        if (markers_ && !markers_->add_queue(queue))
+            std::fprintf(stderr, "[rt] device-markers: no slot for queue %p (%u queues have one)\n",
+                         static_cast<void*>(queue), DeviceMarkers::max_queues);
+        if (!vkGetQueueCheckpointDataNV) return;
         if (std::find(queues_.begin(), queues_.end(), queue) == queues_.end()) queues_.push_back(queue);
     }
 
@@ -713,8 +761,14 @@ public:
     // Called under the context's tracker lock, in replay order.
     CheckpointSubmission begin_submission(std::uint64_t call, VkQueue queue, const char* kind, std::size_t lists) {
         if (!++sequence_) ++sequence_;  // 0 is reserved for invalid markers
-        return {sequence_, call, queue, kind, lists,
+        CheckpointSubmission submission{sequence_, call, queue, kind, lists,
                 std::vector<CheckpointList>(std::min(lists, std::size_t{CheckpointMarker::max_list} + 1))};
+        submission.dispatch_seq = &dispatch_seq_;
+        if (markers_) {
+            std::lock_guard lock(mutex_);
+            submission.markers = markers_->target(queue);
+        }
+        return submission;
     }
 
     void publish(CheckpointSubmission&& submission) {
@@ -722,6 +776,9 @@ public:
         for (std::size_t i = submission.dispatch_count - submission.dispatches.size(); i < submission.dispatch_count; ++i)
             dispatches_[dispatch_count_++ % dispatches_.size()] = submission.dispatches[i % submission.dispatch_limit];
         submission.dispatches.clear();
+        if (history_)
+            for (const auto& d : submission.marked) history_->push(d);
+        submission.marked.clear();
         recent_[submission.sequence % recent_.size()] = std::move(submission);
     }
 
@@ -745,8 +802,9 @@ public:
     void report_stall(const char* reason, std::uint64_t submitted, std::uint64_t retired) {
         std::fprintf(stderr, "[rt] device-stall: %s for 15 s; submitted ticket %" PRIu64
                              ", last observed retired ticket %" PRIu64 "\n", reason, submitted, retired);
-        // NV checkpoints and EXT fault data require a lost device. The CPU ring is valid at any time.
-        dump_dispatches();
+        // NV checkpoints and EXT fault data require a lost device. The CPU ring and the AMD markers are valid at any
+        // time.
+        dump_dispatches(report_markers(false));
         // LEONIDA_STALL_CHECKPOINTS=1 (diagnostic): ask for the checkpoints anyway. A hang (Xid 109) the driver
         // recovers from without losing the device otherwise names no program; outside the lost state the call is
         // out of the extension's contract, which the NVIDIA driver has answered so far.
@@ -763,14 +821,87 @@ public:
         }
     }
 
+    // LEONIDA_DEVICE_MARKERS=1: each queue's marker slot judged against the marker history, printed; returns the
+    // likely hangs (the oldest started, unfinished dispatch of each queue) for dump_dispatches to mark.
+    std::vector<std::uint64_t> report_markers(bool lost) noexcept {
+        std::vector<std::uint64_t> hangs;
+        if (!markers_) return hangs;
+        try {
+            std::lock_guard lock(mutex_);
+            std::fprintf(stderr, "[rt] device-markers: AMD buffer markers, read %s; best-effort: %s\n",
+                         lost ? "after the device loss" : "while the device is still up",
+                         lost ? "only what the GPU wrote before it stopped, and a reset may have lost the last writes"
+                              : "the GPU may still be writing them");
+            for (VkQueue queue : markers_->queues()) {
+                const MarkerQueueReport r = judge_markers(queue, markers_->read(queue), *history_);
+                if (!r.slot.started && !r.slot.finished && !r.next_queued) continue;  // never marked a dispatch
+                const char* kind = r.queue_kind ? r.queue_kind : "?";
+                if (r.idle()) {
+                    std::fprintf(stderr, "[rt] device-markers: queue %p (%s) idle: finished seq=%u, nothing started "
+                                         "after it", static_cast<void*>(queue), kind, unsigned(r.slot.finished));
+                    if (r.next_queued)
+                        std::fprintf(stderr, "; next submitted seq=%" PRIu64 " not started (waiting, or behind other "
+                                             "work of the queue)", r.next_queued);
+                    std::fputc('\n', stderr);
+                    continue;
+                }
+                std::string line = "[rt] device-markers: queue " + hex(queue) + " (" + kind + ") finished seq=" +
+                                   std::to_string(r.slot.finished) + " started seq=" + std::to_string(r.slot.started) +
+                                   "; started, not finished:";
+                for (std::size_t i = 0; i < r.unfinished.size() && i < 16; ++i)
+                    line += " " + std::to_string(r.unfinished[i]);
+                if (r.unfinished.size() > 16) line += " (+" + std::to_string(r.unfinished.size() - 16) + ")";
+                if (r.missing) line += " (no longer in the marker history)";
+                line += '\n';
+                std::fputs(line.c_str(), stderr);
+                if (!r.likely_hang) continue;
+                hangs.push_back(r.likely_hang);
+                history_->for_each([&](const MarkedDispatch& d) {
+                    if (d.seq != r.likely_hang) return;
+                    std::fprintf(stderr, "[rt] device-markers: likely hang: seq=%" PRIu64 " execute=%" PRIu64
+                                         " queue=%p (%s) list=%u command=%u shader=%s\n",
+                                 d.seq, d.execute_call, static_cast<void*>(d.queue), kind, d.list, d.command,
+                                 d.shader ? d.shader : "-");
+                });
+            }
+        } catch (...) {
+            std::fprintf(stderr, "[rt] device-markers: marker collection failed\n");
+        }
+        return hangs;
+    }
+
 private:
-    void dump_dispatches() {
+    void enable_markers(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceMemoryProperties* memory,
+                        bool synchronization2) {
+        auto markers = std::make_unique<DeviceMarkers>();
+        const VkResult result =
+            memory ? markers->create(get, device_, *memory, synchronization2) : VK_ERROR_INITIALIZATION_FAILED;
+        if (result != VK_SUCCESS) {
+            std::fprintf(stderr, "[rt] device-markers: unavailable: the marker buffer could not be made (%d)\n",
+                         int(result));
+            return;
+        }
+        std::fprintf(stderr, "[rt] device-markers: on (VK_AMD_buffer_marker, %s): each dispatch writes its seq at top "
+                             "and bottom of pipe\n",
+                     markers->synchronization2() ? "vkCmdWriteBufferMarker2AMD" : "vkCmdWriteBufferMarkerAMD");
+        history_ = std::make_unique<MarkerHistory>();
+        markers_ = std::move(markers);
+    }
+
+    template<typename Handle>
+    static std::string hex(Handle handle) {
+        char text[24];
+        std::snprintf(text, sizeof(text), "%p", static_cast<void*>(handle));
+        return text;
+    }
+
+    void dump_dispatches(const std::vector<std::uint64_t>& hangs = {}) {
         std::lock_guard lock(mutex_);
         const auto n = std::min(dispatch_count_, dispatches_.size());
         for (std::size_t i = dispatch_count_ - n; i < dispatch_count_; ++i) {
             const auto& d = dispatches_[i % dispatches_.size()];
-            std::fprintf(stderr, "[rt] device-fault: submitted dispatch seq=%zu execute=%" PRIu64
-                         " queue=%p (%s) list=%zu command=%zu shader=%s ", i + 1, d.execute_call,
+            std::fprintf(stderr, "[rt] device-fault: submitted dispatch seq=%" PRIu64 " execute=%" PRIu64
+                         " queue=%p (%s) list=%zu command=%zu shader=%s ", d.seq, d.execute_call,
                          static_cast<void*>(d.queue), d.queue_kind, d.list, d.command, d.shader ? d.shader : "-");
             if (d.indirect)
                 std::fprintf(stderr, "indirect args=0x%" PRIxPTR "+0x%" PRIx64 " count=0x%" PRIxPTR
@@ -781,6 +912,8 @@ private:
                 std::fputs(" roots=", stderr);
                 for (auto word : d.roots) std::fprintf(stderr, "%08x ", word);
             }
+            if (d.seq && std::find(hangs.begin(), hangs.end(), d.seq) != hangs.end())
+                std::fputs(" <- likely hang (device-markers)", stderr);
             std::fputc('\n', stderr);
         }
     }
@@ -808,7 +941,7 @@ private:
             print_thread_stacks(0, "device lost");
         } catch (...) {
         }
-        dump_dispatches();
+        dump_dispatches(report_markers(true));
         try {
             std::function<void()> hook;
             {
@@ -973,6 +1106,9 @@ private:
     }();
     std::array<CheckpointDispatch, CheckpointSubmission::dispatch_limit> dispatches_{};
     std::size_t dispatch_count_ = 0;
+    std::atomic<std::uint64_t> dispatch_seq_{0};  // the last seq handed out (CheckpointRecorder::dispatch)
+    std::unique_ptr<DeviceMarkers> markers_;      // LEONIDA_DEVICE_MARKERS=1 on a device with VK_AMD_buffer_marker
+    std::unique_ptr<MarkerHistory> history_;      // with markers_, under mutex_
     std::array<CheckpointSubmission, 64> recent_;
 };
 

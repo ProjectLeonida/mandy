@@ -152,8 +152,11 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
 
 * It writes `fspx/<name>.code` and `fspx/<name>.json`, the layout `fspx_unpack.py` writes and `rdna2spirv.py`
   reads (`native_blob`, `cs_dispatch_state`). A compute program also gets `fspx/<name>.state`, its record's state
-  blob (FSPX kind 0) as it is, whose SHA-256 is the index's `fspx_state_sha256`; every compute program has exactly one
-  (2,684 programs, 2,693 records). It also writes `index.json` with each program's stage, and
+  blob (FSPX kind 0) as it is, whose SHA-256 is the index's `fspx_state_sha256`; in the 1.0.2.1 `shaders.rpf` library,
+  every compute program has one distinct state-blob index across `library.json`'s `compute` table (2,684 programs,
+  2,693 records). A program that records use with different state blobs is written once per distinct state, the
+  first under its name and each further one as `<name>_state_<blob index>`, so each pair of keys has an entry
+  (the library measured above has no such program). It also writes `index.json` with each program's stage, and
   `library.json` with the header and both pipeline tables, stage to program name. Programs are named
   `lib_<stage>_<index>`.
 * `--disasm` writes `disasm/<name>.s` for the code after the prologue, as `fspx_unpack.py --disasm` does.
@@ -162,6 +165,8 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
   interface.
 * `--save` writes the reassembled library. A saved file is also accepted as input.
 * `--stages` limits the output to some stages.
+* `--compute-hashes FILE` instead writes only the compute programs whose code has one of the SHA-256 digests listed
+  in `FILE` (`fspx_code_sha256`), with every state they are used with. A digest no compute program has is an error.
 
 The output is game data and must stay in your work folder. `tests/test_shader_library.py` builds libraries and
 archives by hand and covers the header, both tables, the size checks, the search in an archive and the digest
