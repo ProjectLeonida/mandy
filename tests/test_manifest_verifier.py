@@ -187,6 +187,32 @@ class TestManifestVerifier(unittest.TestCase):
         entries = mv.load_manifest(flat_path)
         self.assertEqual(len(entries), len(SYNTHETIC_SIZES))
 
+    def test_flat_manifest_verifies_a_file_named_files(self) -> None:
+        directory = os.path.join(self.root, "flat-files")
+        os.mkdir(directory)
+        payload = b"synthetic payload"
+        with open(os.path.join(directory, "files"), "wb") as f:
+            f.write(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        for entry in ({"size": len(payload), "sha256": digest}, digest):
+            with self.subTest(entry=entry):
+                path = os.path.join(self.root, "files_manifest.json")
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump({"files": entry}, f)
+                report = mv.verify_manifest(directory, path, strict=True)
+                self.assertTrue(report.passed)
+                self.assertEqual(report.matched, ["files"])
+
+    def test_wrapped_manifest_accepts_files_named_sha256_and_size(self) -> None:
+        digest = hashlib.sha256(b"synthetic payload").hexdigest()
+        path = os.path.join(self.root, "wrapped_manifest.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"files": {"sha256": digest, "size": digest}}, f)
+        self.assertEqual(mv.load_manifest(path), {
+            "sha256": {"size": None, "sha256": digest},
+            "size": {"size": None, "sha256": digest},
+        })
+
     def test_load_manifest_flat_skips_metadata_keys(self) -> None:
         flat_path = os.path.join(self.root, "manifest_flat_meta.json")
         doc = {
