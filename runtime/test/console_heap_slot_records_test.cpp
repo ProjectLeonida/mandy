@@ -499,10 +499,58 @@ int dense_blocks_look_at_overlaps_only() {
     return 0;
 }
 
+// What one world run showed (130-210 changes a submission, 60,000-135,000 records looked at for 1,300-2,600 slots
+// fixed): waiting V#s with large spans were looked at by every addition inside their span, though only a range that
+// holds a V#'s base can back it, and a record named by many changes of one submission was looked at once per change.
+// 5,000 waiting halves of 4 GiB each over one title range; 200 additions inside it, none holding their bases, look at
+// none; one that holds 10 of the bases looks at those 10. 200 removals of one submission that all overlap the same
+// 5,000 resolved halves look at each once.
+int changes_look_at_each_record_once() {
+    constexpr std::size_t kSlots = 20000;
+    constexpr std::uint64_t kTitle = 0x200000000000ull, kSpan = 1ull << 32;
+    ConsoleHeapSlotRecords records;
+    records.reset(kSlots);
+    for (std::size_t slot = 0; slot < 5000; ++slot)
+        records.set(slot, 0, ConsoleHeapSlotRecords::waiting, kTitle + slot * 0x100, kSpan, 0);
+    std::vector<SlotChange> added;
+    for (std::uint64_t i = 0; i < 200; ++i) {
+        const std::uint64_t lo = kTitle + 0x10000000 + i * 0x100000;  // past every base, inside every span
+        added.push_back({SlotChange::source_added, lo, lo + 0x10000});
+    }
+    std::vector<std::uint32_t> touched;
+    std::uint64_t before = records.looked_at();
+    records.touched(added.data(), added.size(), touched);
+    EXPECT(records.looked_at() - before == 0 && touched.empty());
+    const SlotChange holds{SlotChange::source_added, kTitle + 0x100 * 20, kTitle + 0x100 * 30};
+    before = records.looked_at();
+    records.touched(&holds, 1, touched);
+    EXPECT(records.looked_at() - before == 10 && touched.size() == 10 && touched[0] == 20);
+
+    for (std::size_t slot = 5000; slot < 10000; ++slot)
+        records.set(slot, 0, ConsoleHeapSlotRecords::resolved, kTitle, kSpan, kArena + 0x100000);
+    std::vector<SlotChange> gone;
+    for (std::uint64_t i = 0; i < 200; ++i)
+        gone.push_back({SlotChange::target_gone, kArena + 0x100000 + i * 0x10000, kArena + 0x100000 + i * 0x10000 + 64});
+    before = records.looked_at();
+    records.touched(gone.data(), gone.size(), touched);
+    EXPECT(records.looked_at() - before == 5000 && touched.size() == 5000);
+    // A removal and an addition in one call over the same waiting half: looked at once in the source index. The 5,000
+    // resolved halves the removal names by source are looked at there once more (once per index, at most twice).
+    gone.push_back({SlotChange::source_gone, kTitle, kTitle + 0x100});
+    gone.push_back({SlotChange::source_added, kTitle, kTitle + 0x100});
+    before = records.looked_at();
+    records.touched(gone.data(), gone.size(), touched);
+    EXPECT(records.looked_at() - before == 10001 && touched.size() == 5001);
+    std::printf("once a call: 200 additions inside 5,000 waiting 4 GiB spans look at none, one holding 10 bases at 10; "
+                "200 removals over 5,000 resolved halves look at each once\n");
+    return 0;
+}
+
 int main() {
     if (release_looks_at_its_slots_only()) return 1;
     if (cases()) return 1;
     if (dense_blocks_look_at_overlaps_only()) return 1;
+    if (changes_look_at_each_record_once()) return 1;
     if (differential()) return 1;
     if (textures()) return 1;
     if (room()) return 1;

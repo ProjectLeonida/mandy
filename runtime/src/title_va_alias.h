@@ -249,14 +249,18 @@ public:
         // A commit inside a reserved range, or two that overlap, are one range.
         auto it = memory_.upper_bound(begin);
         if (it != memory_.begin() && std::prev(it)->second > begin) --it;
+        bool inside = false;  // the range is one there already (a commit inside a reserve): nothing new
         while (it != memory_.end() && it->first < end) {
+            inside |= it->first <= begin && it->second >= end;
             begin = std::min(begin, it->first);
             end = std::max(end, it->second);
             it = memory_.erase(it);
         }
         memory_[begin] = end;
         memory_generation_.fetch_add(1, std::memory_order_release);
-        notify(Change::memory_added, base, bytes, 0);
+        // The whole merged range: a V# can only be backed through the range that holds its base, which may be an
+        // older one this extends.
+        if (!inside) notify(Change::memory_added, begin, end - begin, 0);
     }
     void remove_title_memory(std::uint64_t base) {
         std::unique_lock lock(memory_mutex_);

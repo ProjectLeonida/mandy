@@ -28,10 +28,14 @@
 // which a change saying room was made visits whole.
 //
 // The bound: a change visits exactly the records it concerns - a release or removal the V# halves whose recorded
-// range overlaps it, an addition the waiting ones among them, a texture gone the T#s naming its address, a texture
-// added the waiting ones, room made the records waiting for that room - and looked_at() counts those and nothing
-// else. The groups walked to find them are the overlapping ones plus, per class, those that start less than 2^c
-// before the change and end before it: each costs one comparison, never a slot. Memory: 32 bytes a half (64 a slot,
+// range overlaps it, an addition the waiting ones whose range starts inside it (a V# resolves only through a range
+// that holds its base or its refused target, so an addition that does not hold the start cannot settle it; the
+// groups with waiting records are kept by start a second time for this), a texture gone the T#s naming its address,
+// a texture added the waiting ones, room made the records waiting for that room - and each of them once an index a
+// touched() call (a V# half at most twice: by source and by target), however many of the call's changes name it.
+// looked_at() counts those and nothing else. The groups walked to
+// find them are the ones visited plus, for a removal, per class, those that start less than 2^c before the change and
+// end before it: each costs one comparison, never a slot. Memory: 32 bytes a half (64 a slot,
 // allocated with calloc, so pages of slots never written are never touched), and per distinct range a group (two lists
 // of 4 bytes a record, a hash entry and an ordered-map entry).
 // Portable, standard library only: console_heap_slot_records_test exercises it without a GPU.
@@ -155,8 +159,16 @@ public:
     //   target_added, source_added: the same, waiting halves only (a resolved one stays valid until something goes);
     //   texture_gone: T#s naming the address lo, bound or waiting; texture_added: those waiting;
     //   geometry_room: V# halves waiting for room; texture_room: T#s waiting for room (each list once a call).
+    //   An addition finds the waiting records whose range starts inside it: a V# resolves only through a backing,
+    //   alias range, copy or title memory that holds its base (or a backing that holds its refused target), so one
+    //   that does not hold the start cannot settle it. A removal finds every record whose range overlaps it.
+    // A record is looked at once an index a call at most, however many of the changes name it.
     void touched(const SlotChange* changes, std::size_t count, std::vector<std::uint32_t>& out) {
         out.clear();
+        if (!++epoch_) {  // after 2^32 calls: no group may look visited
+            for (auto& g : groups_) g.seen[0] = g.seen[1] = 0;
+            epoch_ = 1;
+        }
         bool room[2] = {};
         for (std::size_t i = 0; i < count; ++i) {
             const SlotChange& change = changes[i];
@@ -164,16 +176,20 @@ public:
             case SlotChange::geometry_room: room[0] = true; continue;
             case SlotChange::texture_room: room[1] = true; continue;
             case SlotChange::texture_gone:
+                if (change.lo != UINT64_MAX) find(kTexture, change.lo, change.lo + 1, out);
+                continue;
             case SlotChange::texture_added:
-                if (change.lo != UINT64_MAX)
-                    find(kTexture, change.lo, change.lo + 1, change.kind == SlotChange::texture_added, out);
+                if (change.lo != UINT64_MAX) find_waiting(kTexture, change.lo, change.lo + 1, out);
                 continue;
             default: break;
             }
             if (change.hi <= change.lo) continue;
-            const bool target = change.kind == SlotChange::target_gone || change.kind == SlotChange::target_added;
-            const bool waiting_only = change.kind == SlotChange::target_added || change.kind == SlotChange::source_added;
-            find(target ? kTarget : kSource, change.lo, change.hi, waiting_only, out);
+            switch (change.kind) {
+            case SlotChange::target_gone: find(kTarget, change.lo, change.hi, out); break;
+            case SlotChange::source_gone: find(kSource, change.lo, change.hi, out); break;
+            case SlotChange::target_added: find_waiting(kTarget, change.lo, change.hi, out); break;
+            default: find_waiting(kSource, change.lo, change.hi, out); break;
+            }
         }
         for (int which = 0; which < 2; ++which)
             if (room[which])
@@ -217,12 +233,15 @@ private:
         std::vector<std::uint32_t> keys[2];  // [0] settled records (resolved, bound), [1] waiting ones
         int index = 0;
         unsigned cls = 0;
-        ByStart::iterator at{};
+        ByStart::iterator at{};          // in by_start[cls]
+        ByStart::iterator waiting_at{};  // in waiting_by_start, while keys[1] is not empty
+        std::uint32_t seen[2] = {};      // the touched() call that last visited each list (epoch_)
     };
     struct Index {
         std::unordered_map<Range, std::uint32_t, RangeHash> by_range;  // -> group id
         std::array<ByStart, kClasses> by_start;
         std::uint64_t used[2] = {};  // a bit per class that holds a group (classes 0-63, 64)
+        ByStart waiting_by_start;    // the groups with waiting records, by start
     };
 
     static Range range(std::uint64_t start, std::uint64_t span) {
@@ -321,6 +340,7 @@ private:
         h.group[n] = it->second + 1;
         h.place[n] = std::uint32_t(list.size());
         list.push_back(key);
+        if (list_of(state) == 1 && list.size() == 1) g.waiting_at = index.waiting_by_start.emplace(g.start, it->second);
     }
 
     // Takes `key` out of its group[n], from the list of its current state.
@@ -329,14 +349,16 @@ private:
         if (!h.group[n]) return;
         const std::uint32_t id = h.group[n] - 1;
         Group& g = groups_[id];
-        auto& list = g.keys[list_of(State(h.state))];
+        Index& index = indexes_[g.index];
+        const int which_list = list_of(State(h.state));
+        auto& list = g.keys[which_list];
         const std::uint32_t at = h.place[n], last = list.back();
         list[at] = last;
         halves_[last].place[n] = at;
         list.pop_back();
         h.group[n] = 0;
+        if (which_list == 1 && list.empty()) index.waiting_by_start.erase(g.waiting_at);
         if (!g.keys[0].empty() || !g.keys[1].empty()) return;
-        Index& index = indexes_[g.index];
         index.by_range.erase(Range{g.start, g.end});
         index.by_start[g.cls].erase(g.at);
         if (index.by_start[g.cls].empty()) index.used[g.cls >> 6] &= ~(std::uint64_t(1) << (g.cls & 63));
@@ -344,7 +366,28 @@ private:
         free_groups_.push_back(id);
     }
 
-    void find(int which, std::uint64_t lo, std::uint64_t hi, bool waiting_only, std::vector<std::uint32_t>& out) {
+    // A list of `g` into `out`, unless this call has visited it already.
+    void visit(Group& g, int list, std::vector<std::uint32_t>& out) {
+        if (g.seen[list] == epoch_) return;
+        g.seen[list] = epoch_;
+        for (const std::uint32_t key : g.keys[list]) {
+            ++looked_at_;
+            out.push_back(key >> 1);
+        }
+    }
+
+    // The waiting records of index `which` whose range starts in [lo, hi): only groups that hold some are walked.
+    void find_waiting(int which, std::uint64_t lo, std::uint64_t hi, std::vector<std::uint32_t>& out) {
+        const Index& index = indexes_[which];
+        for (auto it = index.waiting_by_start.lower_bound(lo); it != index.waiting_by_start.end() && it->first < hi;
+             ++it) {
+            ++groups_looked_at_;
+            visit(groups_[it->second], 1, out);
+        }
+    }
+
+    // Every record of index `which` whose range overlaps [lo, hi).
+    void find(int which, std::uint64_t lo, std::uint64_t hi, std::vector<std::uint32_t>& out) {
         const Index& index = indexes_[which];
         for (unsigned word = 0; word < 2; ++word)
             for (std::uint64_t used = index.used[word]; used; used &= used - 1) {
@@ -354,14 +397,11 @@ private:
                 const std::uint64_t reach = c >= 64 ? UINT64_MAX : (std::uint64_t(1) << c);
                 const std::uint64_t first = lo >= reach ? lo - reach + 1 : 0;
                 for (auto it = groups.lower_bound(first); it != groups.end() && it->first < hi; ++it) {
-                    const Group& g = groups_[it->second];
+                    Group& g = groups_[it->second];
                     ++groups_looked_at_;
                     if (g.end <= lo) continue;
-                    for (int list = waiting_only ? 1 : 0; list < 2; ++list)
-                        for (const std::uint32_t key : g.keys[list]) {
-                            ++looked_at_;
-                            out.push_back(key >> 1);
-                        }
+                    visit(g, 0, out);
+                    visit(g, 1, out);
                 }
             }
     }
@@ -374,6 +414,7 @@ private:
     std::vector<std::uint32_t> free_groups_;
     std::size_t recorded_ = 0, waiting_ = 0, textures_count_ = 0, textures_waiting_ = 0;
     std::uint64_t looked_at_ = 0, groups_looked_at_ = 0;
+    std::uint32_t epoch_ = 0;  // touched() calls, for Group::seen
 };
 
 }  // namespace leonida
