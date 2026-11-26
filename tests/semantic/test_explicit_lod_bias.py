@@ -142,6 +142,18 @@ class ExplicitLodBias(unittest.TestCase):
         self.assertTrue(all(lod_operand(s) == "%f0" for s in off), off)
         self.assertRegex(defn(spv, lod_operand(on[0])), r"^OpFAdd %float %f0 %\w+$")
 
+    def test_compute_cl_clamps_after_the_bias(self):
+        # Vulkan clamps the biased LOD: max(0 + bias, minlod), as _b_cl's max(bias, minlod), not max(0, minlod) + bias
+        for op, vaddr in (("image_sample_cl", "v[2:4]"), ("image_sample_c_cl", "v[2:5]")):
+            with self.subTest(op=op):
+                line = f"{op} v[6:7], {vaddr}, s[8:15], s[16:19] dmask:0x3 {D2}"
+                off = translate("cs_lb_cl_off", literal_ssharp(0x100), line, False)
+                self.assertRegex(defn(off, lod_operand(samples(off)[0])), r"^OpExtInst %float %glsl FMax %f0 %\w+$")
+                spv = translate("cs_lb_cl_on", literal_ssharp(0x100), line, True)
+                m = re.match(r"^OpExtInst %float %glsl FMax (%\w+) %\w+$", defn(spv, lod_operand(samples(spv)[0])))
+                self.assertTrue(m, samples(spv))
+                self.assertRegex(defn(spv, m.group(1)), r"^OpFAdd %float %f0 %\w+$")
+
 
 if __name__ == "__main__":
     unittest.main()

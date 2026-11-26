@@ -13909,16 +13909,18 @@ class Gen:
             # PS) the base LOD is 0 (or bias for _b / _c_b) and the clamp raises it, so the explicit LOD is
             # max(base, clamp) and no MinLod operand.
             lod_zero = "%f0"
+            if EXPLICIT_LOD_BIAS and not implicit and kind in ("", "_c_lz", "_c"):
+                # Outside the PS these forms are explicit-LOD samples at lod_zero (_b / _c_b carry it in their bias).
+                # The bias goes in before the _cl clamp below: Vulkan clamps the biased LOD, max(bias, minlod).
+                lod_zero = self.add_ssharp_lod_bias(lod_zero, a[3]["r"] + 2)
             if minlod is not None and not implicit and kind not in ("_d", "_b", "_c_b"):
+                base = lod_zero
                 lod_zero = self.tmp()
-                self.emit(f"{lod_zero} = OpExtInst %float %glsl FMax %f0 {minlod}")
+                self.emit(f"{lod_zero} = OpExtInst %float %glsl FMax {base} {minlod}")
             bias_lod = bias
             if kind in ("_b", "_c_b") and not implicit and minlod is not None:
                 bias_lod = self.tmp()
                 self.emit(f"{bias_lod} = OpExtInst %float %glsl FMax {bias} {minlod}")
-            if EXPLICIT_LOD_BIAS and not implicit and kind in ("", "_c_lz", "_c"):
-                # Outside the PS these forms are explicit-LOD samples at lod_zero (_b / _c_b carry it in their bias).
-                lod_zero = self.add_ssharp_lod_bias(lod_zero, a[3]["r"] + 2)
             # Implicit samples without a bias of their own take the S# bias as a Bias operand.
             sbias = (self.ssharp_lod_bias(a[3]["r"] + 2)
                      if EXPLICIT_LOD_BIAS and implicit and kind in ("", "_c") else None)
