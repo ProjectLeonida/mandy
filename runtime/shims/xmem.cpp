@@ -906,11 +906,16 @@ void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULON
             // the host is part way through changing.
             const FaultLockExclusive view_lock;
             if (!isolate_placeholder(address, size)) return nullptr;
-            if (window)
+            if (window) {
                 replace_window(g_fault_windows, reinterpret_cast<uintptr_t>(address), size, host_prot, true);
-            else
+                leonida::title_reservations::add(reinterpret_cast<uintptr_t>(address), size);
+            } else {
                 replaced = placeholder_api().virtual_alloc2(GetCurrentProcess(), address, size, host_type | MEM_RESERVE,
                                                             host_prot, nullptr, 0);
+                // Ordinary memory now, which the title commits with VirtualAlloc: not a reservation of xmem's.
+                leonida::title_reservations::forget(reinterpret_cast<uintptr_t>(address),
+                                                    reinterpret_cast<uintptr_t>(address) + size);
+            }
         }
         if (!window) return replaced;
         // A reserve-only replacement stays a placeholder: the physical pages are mapped into it.
@@ -925,6 +930,7 @@ void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULON
             {
                 const FaultLockExclusive faults;
                 replace_window(g_fault_windows, reinterpret_cast<uintptr_t>(result), size, host_prot, false);
+                leonida::title_reservations::add(reinterpret_cast<uintptr_t>(result), size);
             }
             // Diagnostic (temporary): the windows a fault can be inside.
             std::fprintf(stderr, "[rt] xmem: window reserve %p size %llu protect 0x%lx\n", result,
@@ -936,6 +942,7 @@ void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULON
                 const FaultLockExclusive lock;
                 forget_range(g_title_placeholders, base, base + size);  // a release the table missed
                 g_title_placeholders[base] = Window{size, host_prot};
+                leonida::title_reservations::add(base, size);
             }
             std::fprintf(stderr, "[rt] xmem: placeholder reserve %p size %llu\n", result,
                          static_cast<unsigned long long>(size));
@@ -1694,6 +1701,7 @@ bool install_physical_page_fault_handler() {
         placeholder_api();
         leonida::host_heap::handle();
         leonida::geometry_writes::state();
+        leonida::title_reservations::state();
         char flag[4]{};
         g_pool_zero_pages = GetEnvironmentVariableA("LEONIDA_POOL_ZERO_PAGES", flag, sizeof(flag)) == 1 && flag[0] == '1';
         return AddVectoredExceptionHandler(1, &physical_page_fault) != nullptr;
@@ -2276,6 +2284,9 @@ BOOL title_free_impl(LPVOID address, SIZE_T size, DWORD free_type) {
     } else {
         result = VirtualFree(address, size, free_type);
     }
+    // Every release, also of a reservation xmem's tables missed, before the journal names its pages: the host can
+    // reserve the space again for memory the shadows would otherwise take as settled.
+    if (result && releases && release_end > start) leonida::title_reservations::forget(start, release_end);
     // A release of size 0 frees the whole reservation, whose extent is not known here: a change anywhere.
     if (result && size) leonida::title_memory_map::changed(address, size);
     else if (result) leonida::title_memory_map::changed();
