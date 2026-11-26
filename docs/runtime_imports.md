@@ -815,8 +815,9 @@ works for loopback traffic:
 - `connect`, `WSAConnect`, `ConnectEx`, `sendto`, `WSASendTo`, `WSASendMsg`, `WSAConnectByNameA/W` and
   `WSAConnectByList` allow only IPv4 loopback (`127.0.0.0/8`), IPv6 loopback (`::1`) and IPv4-mapped loopback
   (`::ffff:127.0.0.0/104`); everything else fails with `WSAENETUNREACH`.
-- `WSAConnectByNameA/W` pass `localhost` to the host as the literal `127.0.0.1`, so the host never reads its hosts
-  file. Numeric loopback literals pass through unchanged.
+- `WSAConnectByNameA/W` pass `localhost` to the host as a loopback literal, so the host never reads its hosts file:
+  `::1` for an IPv6 socket with `IPV6_V6ONLY` set (Windows' default for `AF_INET6`, which cannot reach `127.0.0.1`),
+  `127.0.0.1` for an IPv4 or dual-mode socket. Numeric loopback literals pass through unchanged.
 - `ConnectEx` and `WSASendMsg` from `WSAIoctl` are the host's own pointers, fetched for the socket they are called on
   (each Winsock provider has its own), after the same loopback check.
 - `bind` narrows wildcard binds (`0.0.0.0`, `::`) to loopback (`127.0.0.1`, `::1`) and refuses other non-loopback
@@ -836,7 +837,8 @@ works for loopback traffic:
 - `WSALookupServiceBeginA/W` (name-service queries) always fail with `WSASERVICE_NOT_FOUND`.
 
 `runtime/test/ws2_offline_test.cpp` (ctest `ws2_offline`) verifies name and ordinal bindings, the `wsock32.dll`
-aliases, external refusals using RFC 5737 / RFC 3849 / `.invalid` targets, the `0127.0.0.1` refusal, the
+aliases, `WSAConnectByNameA/W` to `localhost` on IPv4, IPv6-only and dual-mode sockets, external refusals using
+RFC 5737 / RFC 3849 / `.invalid` targets, the `0127.0.0.1` refusal, the
 `WSASERVICE_NOT_FOUND` refusal, wildcard-bind narrowing, a `ConnectEx` pointer from `WSAIoctl` connecting to a loopback
 listener, a local loopback UDP round-trip, loopback binds for sends on unbound UDP sockets (with a control showing
 the host's own `sendto` binds to `0.0.0.0`), and the multicast and `WSAJoinLeaf` refusals.
