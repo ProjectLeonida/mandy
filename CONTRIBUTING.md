@@ -55,6 +55,10 @@ number and links nowhere now, including the two this page used to send you to: #
   files with no `__main__` block or an `import pytest` (they need the packages in `tests/requirements.txt`) run with
   `python -m pytest tests/test_<name>.py` instead, as [AGENTS.md](AGENTS.md) describes; under `python -I` they fail
   to import or run nothing.
+- Which tests exercise what you changed: `python -I scripts/tests_for.py` for your branch, or with files or folders
+  as arguments. It lists the tests that import or name each file, the ctest tests whose programs are built from
+  it, and the commands that run them; it runs nothing itself. Run those while you iterate and the whole suites once
+  before the pull request.
 - Runtime tests: `cmake -S runtime -B runtime/build`, `cmake --build runtime/build --config RelWithDebInfo`, then
   `ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure`. The CPU tests that need no game data are configured
   on Windows; Linux and macOS configure the portable subset (`gta6rt` and the shims are Windows-only). Tests that need the retail package read `LEONIDA_GAME_DIR` (and `LEONIDA_MOVIE` for the Bink
