@@ -69,7 +69,7 @@ reasons behind each step: [linux_proton.md](linux_proton.md#amd-on-linux-what-go
   | `LEONIDA_TITLE_WATCHDOG=0`, `LEONIDA_TITLE_WATCHDOG_KICK=<trap RVA>,<kick RVA>` | the title's hang watchdog ([above](#settings-every-platform-needs)) |
   | `LEONIDA_DEVICE_TYPE=6`, `LEONIDA_MAP_READBACK=1`, `LEONIDA_FRAME_PACING=1`, `LEONIDA_PRESENT_NO_TEAR=1` | taken over from the NVIDIA report below; their effect on AMD was not measured one by one |
   | `LEONIDA_ARENA_MB=4095`, `LEONIDA_TITLE_WINDOWS_MB=4096`, `LEONIDA_GEOMETRY_MB=6144` | room for the title's buffers in the world |
-  | `LEONIDA_CONSOLE_RELEASE_FILTER=1`, `LEONIDA_SHADOW_ALIAS_MS=5000`, `LEONIDA_CONSOLE_FIX_US=0` | carried from earlier boot runs; their effect here was not measured one by one |
+  | `LEONIDA_SHADOW_ALIAS_MS=5000`, `LEONIDA_CONSOLE_FIX_US=0` | carried from earlier boot runs; their effect here was not measured one by one |
   | `LEONIDA_DEVICE_FAULT=1` | a device-loss report if the GPU hangs |
   | `LEONIDA_KEYBOARD_PAD=always` | the keyboard as the pad |
 

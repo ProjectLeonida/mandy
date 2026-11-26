@@ -2081,8 +2081,18 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    heap pointers read by the mesh and pixel stages after a rebind. `d3d12_mesh_test` checks the recorded dwords
    for a vertex draw, a resource-only rebind, a signature ending at s30 and one on the s0 layout.
    Set `LEONIDA_GRAPHICS_DIRECT_HEAPS=0` to restore the previous draw arguments.
-   Missing console V# backing leaves a settled zero descriptor. Every 32 submissions a heap probes up to
-   eight of these slots in round-robin order, including independent UAV-counter failures.
+   Missing console V# backing leaves a zero descriptor in the copy. Each V# half of a console resource heap's copy
+   (the buffer V# and the UAV counter) has a record in host RAM of what it resolved to: the title's base and span,
+   the device address its copy names, and whether it resolved or waits (`src/console_heap_slot_records.h`, written
+   only by `fix_console_slot`). Two indexes find the halves near a range, by base and by target, per power-of-two
+   span class and 64 KiB-or-larger granule. Releases (a backing, a title-window or geometry block), alias ranges
+   removed or replaced (`TitleVaAliases` tells its listeners as it happens, `forget_copy` included) and additions
+   (a backing, an alias range, title memory) go on an unbounded per-device list; at the next submission each heap
+   fixes again exactly the slots whose records a change touches: a release or removal every half naming it, an
+   addition the waiting halves over it. Nothing walks the heap or reads the copy for this. A zeroed range, a slot
+   the title rewrote and a heap destroyed drop their records. `console_heap_slot_records_test` checks that a release
+   of a buffer 10 of 60,010 slots name looks at those 10, and compares the copy with a full re-resolution through
+   random writes, releases, additions and alias changes.
    Console resource heap copies and shader-visible CBV/SRV/UAV heaps with at least 65,536 slots request
    64 MiB of zeroed padding after their last descriptor. `LEONIDA_HEAP_GUARD_MB` sets the padding in MiB
    (0 disables it). When arena space is tight, allocation can fall back to the heap alone. Only indices
