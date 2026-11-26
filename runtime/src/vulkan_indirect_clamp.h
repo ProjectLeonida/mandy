@@ -61,6 +61,9 @@ inline constexpr std::uint32_t indirect_clamp_mesh = 3;
 
 // What the pass bounds, as indirect_clamp.comp states them.
 inline constexpr std::uint32_t indirect_clamp_max_vertices = 1u << 24;
+// A draw record of this many vertices or indices an instance, or more, is unfilled: it runs empty and charges nothing
+// (RT-INDIRECT-DRAW-UNFILLED-COUNT), so garbage counts cannot use up the list budget ahead of the real draws.
+inline constexpr std::uint32_t indirect_clamp_unfilled_draw = 1u << 23;
 inline constexpr std::uint32_t indirect_clamp_max_vertex_instances = 1u << 26;
 inline constexpr std::uint32_t indirect_clamp_max_group_dimension = 65535u;
 inline constexpr std::uint32_t indirect_clamp_max_groups = 1u << 20;

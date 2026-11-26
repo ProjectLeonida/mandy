@@ -9,6 +9,11 @@
 // charging the list budget. The command list charges its work (vertices, indices, or groups * 64) against 2^27 units with
 // an atomic CAS, so thousands of garbage records cannot run for seconds either.
 //
+// A draw record of 2^23 vertices (or indices) an instance or more is a slot the title has not filled, not a draw: it
+// runs empty and charges nothing, so a few of them cannot use up the list budget and empty every real draw after them
+// (RT-INDIRECT-DRAW-UNFILLED-COUNT; a census in codec-d/cool_fox's fork of VIctory found 90 records of 2^24 in one
+// list, its docs/findings.md and crates/victory-gpu/src/indirect.rs; no code of it is used).
+//
 // The bounds cut legitimate work beyond them, so they are generous: 2^24 vertices (or indices), 2^26 vertex instances,
 // 65 535 groups per dimension, 2^20 groups per dispatch, and mesh dispatches charged 128 threads per group. The
 // console's mesh dispatch is one-dimensional; the output uses one group in y and z.
@@ -39,6 +44,7 @@ layout(push_constant) uniform Params {
 
 // One ExecuteIndirect batch's limits. A record that asks for more runs empty instead of for seconds.
 const uint max_vertices = 1u << 24u;          // vertices or indices in one draw
+const uint unfilled_draw = 1u << 23u;         // vertices or indices an instance from which a draw record is unfilled
 const uint max_vertex_instances = 1u << 26u;  // vertex (or index) count times instance count
 const uint max_group_dimension = 65535u;      // groups in x, y or z
 const uint max_groups = 1u << 20u;            // groups in one dispatch or mesh dispatch
@@ -101,7 +107,8 @@ void main() {
         // A draw or an indexed draw: count, instances, then the two (or three) locations, copied as they are.
         const uint count = p.arguments.data[src];
         const uint instances = p.arguments.data[src + 1u];
-        uint index_count = min(count, max_vertices);
+        // An unfilled record (a count of 2^23 or more) runs empty, free: cost 0, so it leaves the budget alone.
+        uint index_count = count >= unfilled_draw ? 0u : min(count, max_vertices);
         uint instance_count = min(instances, max_vertex_instances / max(index_count, 1u));
         if (index_count == 0u) instance_count = 0u;
         clamped = index_count != count || instance_count != instances ? 1u : 0u;
