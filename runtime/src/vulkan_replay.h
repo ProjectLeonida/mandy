@@ -1461,6 +1461,9 @@ struct DepthUavCopy {
     ResourceBinding conversion{};
     VkBuffer scratch;
     VkDeviceSize offset;
+    VkBuffer depth24_scratch = VK_NULL_HANDLE;
+    VkDeviceSize depth24_scratch_offset = 0;
+    std::vector<Depth24Job> depth24_parts;
     bool to_storage;
 };
 
@@ -2588,10 +2591,13 @@ void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const
 // Vulkan cannot copy a depth or stencil image aspect directly to or from a color image. The transfer
 // buffer preserves the native D16, D32 or S8 bits. Only the requested layers and planes are copied, even when the device
 // requires both parent aspects to transition layouts together. A storage descriptor always names GENERAL.
+template<typename RunDepth24, typename EndStatistics, typename BeginStatistics>
 inline void copy_depth_uav(const ReplayFunctions& vk, VkCommandBuffer cb, const Prepared& p, const DepthUavCopy& copy,
-                           VkImageLayout parent_layout, LayoutTracker* tracker) {
+                           VkImageLayout parent_layout, LayoutTracker* tracker, RunDepth24&& run_depth24,
+                           EndStatistics&& end_statistics, BeginStatistics&& begin_statistics) {
     constexpr auto all = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     constexpr auto transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    constexpr auto compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     constexpr VkAccessFlags any = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     const auto parent_access = copy.to_storage ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
     const auto child_access = copy.to_storage ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT;
@@ -2619,10 +2625,12 @@ inline void copy_depth_uav(const ReplayFunctions& vk, VkCommandBuffer cb, const 
         child_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         // Last use of this staging range was a read by CopyBufferToImage, possibly on the previous barrier.
         memory_barrier(vk, cb, VK_ACCESS_TRANSFER_READ_BIT, transfer, VK_ACCESS_TRANSFER_WRITE_BIT, transfer);
-        // A D32 depth aspect and R32_FLOAT colour carry the same bits through transfer scratch. The
-        // intermediate colour image permits a real normalized blit between R32_FLOAT and R16_UNORM;
-        // shaders see the latter's exact bits through an R16_UINT view.
+        // A D32 depth aspect and R32_FLOAT colour carry the same bits through transfer scratch. A native D24
+        // depth aspect carries 24-bit UNORM words in copy.scratch and converts to/from floats in depth24_scratch
+        // via Depth24Converter. The intermediate R32_FLOAT colour image then permits a normalized blit to/from
+        // R16_UNORM; shaders see the latter's exact bits through an R16_UINT (or R16_UNORM) view.
         const bool convert = plane == 0 && copy.conversion.image;
+        const bool d24_convert = convert && !copy.depth24_parts.empty();
         const VkImage colour = convert ? copy.conversion.image : child.image;
         VkImageBlit blit{};
         if (convert) {
@@ -2640,14 +2648,40 @@ inline void copy_depth_uav(const ReplayFunctions& vk, VkCommandBuffer cb, const 
                 memory_barrier(vk, cb, VK_ACCESS_TRANSFER_WRITE_BIT, transfer, VK_ACCESS_TRANSFER_READ_BIT, transfer);
             }
         }
-        vk.copy_image_to_buffer(cb, copy.to_storage ? p.binding.image : colour, VK_IMAGE_LAYOUT_GENERAL,
-                                copy.scratch, 1, copy.to_storage ? &parent_region : &child_region);
-        memory_barrier(vk, cb, VK_ACCESS_TRANSFER_WRITE_BIT, transfer, VK_ACCESS_TRANSFER_READ_BIT, transfer);
-        vk.copy_buffer_to_image(cb, copy.scratch, copy.to_storage ? colour : p.binding.image, VK_IMAGE_LAYOUT_GENERAL,
-                                1, copy.to_storage ? &child_region : &parent_region);
-        if (convert && copy.to_storage) {
+        if (d24_convert) {
+            child_region.bufferOffset = copy.depth24_scratch_offset;
+            if (copy.to_storage) {
+                vk.copy_image_to_buffer(cb, p.binding.image, VK_IMAGE_LAYOUT_GENERAL, copy.scratch, 1, &parent_region);
+                memory_barrier(vk, cb, VK_ACCESS_TRANSFER_WRITE_BIT, transfer,
+                               VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, compute);
+                end_statistics();
+                for (const auto& part : copy.depth24_parts) run_depth24(part);
+                begin_statistics();
+                memory_barrier(vk, cb, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, compute,
+                               VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, transfer);
+                vk.copy_buffer_to_image(cb, copy.depth24_scratch, colour, VK_IMAGE_LAYOUT_GENERAL, 1, &child_region);
+                memory_barrier(vk, cb, VK_ACCESS_TRANSFER_WRITE_BIT, transfer, VK_ACCESS_TRANSFER_READ_BIT, transfer);
+                vk.blit_image(cb, colour, VK_IMAGE_LAYOUT_GENERAL, child.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
+            } else {
+                vk.copy_image_to_buffer(cb, colour, VK_IMAGE_LAYOUT_GENERAL, copy.depth24_scratch, 1, &child_region);
+                memory_barrier(vk, cb, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+                               transfer | compute, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, compute);
+                end_statistics();
+                for (const auto& part : copy.depth24_parts) run_depth24(part);
+                begin_statistics();
+                memory_barrier(vk, cb, VK_ACCESS_SHADER_WRITE_BIT, compute, VK_ACCESS_TRANSFER_READ_BIT, transfer);
+                vk.copy_buffer_to_image(cb, copy.scratch, p.binding.image, VK_IMAGE_LAYOUT_GENERAL, 1, &parent_region);
+            }
+        } else {
+            vk.copy_image_to_buffer(cb, copy.to_storage ? p.binding.image : colour, VK_IMAGE_LAYOUT_GENERAL,
+                                    copy.scratch, 1, copy.to_storage ? &parent_region : &child_region);
             memory_barrier(vk, cb, VK_ACCESS_TRANSFER_WRITE_BIT, transfer, VK_ACCESS_TRANSFER_READ_BIT, transfer);
-            vk.blit_image(cb, colour, VK_IMAGE_LAYOUT_GENERAL, child.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
+            vk.copy_buffer_to_image(cb, copy.scratch, copy.to_storage ? colour : p.binding.image, VK_IMAGE_LAYOUT_GENERAL,
+                                    1, copy.to_storage ? &child_region : &parent_region);
+            if (convert && copy.to_storage) {
+                memory_barrier(vk, cb, VK_ACCESS_TRANSFER_WRITE_BIT, transfer, VK_ACCESS_TRANSFER_READ_BIT, transfer);
+                vk.blit_image(cb, colour, VK_IMAGE_LAYOUT_GENERAL, child.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
+            }
         }
         image_barrier(vk, cb, child, color, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                       child_access, transfer, any, all);
@@ -3138,6 +3172,8 @@ inline bool has_helper_dispatch(const PreparedList& out, std::size_t i) {
     const auto& p = out.commands[i];
     if (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 || p.counted_dispatch.indirect)
         return true;
+    if (p.depth_uav_copy != UINT32_MAX && !out.depth_uav_copies[p.depth_uav_copy].depth24_parts.empty())
+        return true;
     return std::holds_alternative<Draw>(out.list->commands()[i]) && p.draw < out.draws.size() &&
            out.draws[p.draw].quad_indices.buffer;
 }
@@ -3477,8 +3513,27 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         copy.scratch = plane_scratch;
         copy.offset = plane_offset;
         copy.to_storage = after;
+        if (copy.conversion.image && p.binding.format == VK_FORMAT_D24_UNORM_S8_UINT) {
+            if (!vk.depth24_prepare || !vk.depth24_run ||
+                (vk.queue_stages && !(vk.queue_stages & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)) ||
+                texels > UINT32_MAX || (statistics_active && !statistics_helpers))
+                return ReplayResult::unsupported;
+            Depth24Job job{};
+            job.to_float = after;
+            job.app = plane_scratch;
+            job.app_offset = plane_offset;
+            job.app_size = plane_offset + bytes;
+            job.width = p.binding.width;
+            job.height = p.binding.height;
+            job.slices = p.range.layerCount;
+            job.app_row_words = job.width;
+            job.app_slice_words = std::uint32_t(texels);
+            if (!vk.depth24_prepare(job, copy.depth24_parts)) return ReplayResult::unsupported;
+            copy.depth24_scratch = job.scratch;
+            copy.depth24_scratch_offset = job.scratch_offset;
+        }
         p.depth_uav_copy = static_cast<std::uint32_t>(out.depth_uav_copies.size());
-        out.depth_uav_copies.push_back(copy);
+        out.depth_uav_copies.push_back(std::move(copy));
         return ReplayResult::success;
     };
 
@@ -4592,9 +4647,11 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
         vk.depth24_run(command_buffer, job);
         if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
     };
-    const auto finish_depth_uav_barrier = [&](const detail::Prepared& p, VkImageLayout layout) {
+    const auto finish_depth_uav_barrier = [&](const detail::Prepared& p, VkImageLayout layout,
+                                              auto&& end_statistics, auto&& begin_statistics) {
         if (p.depth_uav_copy != UINT32_MAX) {
-            detail::copy_depth_uav(vk, command_buffer, p, prepared.depth_uav_copies[p.depth_uav_copy], layout, tracker);
+            detail::copy_depth_uav(vk, command_buffer, p, prepared.depth_uav_copies[p.depth_uav_copy], layout, tracker,
+                                   run_depth24, end_statistics, begin_statistics);
         } else if (p.order_depth_uav) {
             // A UAV-to-UAV texture barrier names the parent, but the actual shader accesses target its children.
             detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
@@ -4677,7 +4734,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 detail::image_barrier(vk, command_buffer, p.binding, piece.range, piece.layout, new_layout,
                                       from.access, from.stages, to.access, to.stages);
             if (tracker) tracker->set(id, range, new_layout);
-            finish_depth_uav_barrier(p, new_layout);
+            finish_depth_uav_barrier(p, new_layout, end_statistics, begin_statistics);
         } else if (std::holds_alternative<UavBarrier>(command)) {
             const VulkanAccess uav = vulkan_access(d3d12_state::unordered_access, false);
             VkAccessFlags src_access = VK_ACCESS_SHADER_WRITE_BIT;
@@ -4777,7 +4834,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 vk.pipeline_barrier2(command_buffer, &dependency);
             }
             if (tracker && !release) tracker->set(id, range, new_layout);
-            if (!release) finish_depth_uav_barrier(p, new_layout);
+            if (!release) finish_depth_uav_barrier(p, new_layout, end_statistics, begin_statistics);
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
             if (p.skip) continue;
             if constexpr (Checkpoints) checkpoints->record(command_buffer, i, CheckpointKind::clear);
@@ -5310,6 +5367,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             for (std::uint32_t k = 0; k < records; ++k) {
                 vk.dispatch_indirect(command_buffer, indirect_buffer, arguments + VkDeviceSize(k) * stride);
             }
+            if constexpr (Checkpoints) checkpoints->dispatched(command_buffer);
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
                    xdxr_build && vk.xdxr_record) {
             vk.xdxr_record(command_buffer, *xdxr_build, p.xdxr_blases);
@@ -5426,6 +5484,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             }
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
+            if constexpr (Checkpoints) checkpoints->dispatched(command_buffer);
         } else if (raster.state) {
             const Draw* draw = raster.state;
             const detail::PreparedDraw& d = prepared.draws[p.draw];

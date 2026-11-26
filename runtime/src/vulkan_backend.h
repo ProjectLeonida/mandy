@@ -1325,8 +1325,11 @@ public:
 
     bool loaded() const { return loaded_; }
 
-    void configure_device_fault(PFN_vkGetDeviceProcAddr get, DeviceFaultExtensions enabled) {
-        device_fault_ = std::make_unique<DeviceFaultDiagnostics>(get, device_, enabled);
+    // `memory`: the physical device's memory types, for the AMD marker buffer (enabled.markers).
+    void configure_device_fault(PFN_vkGetDeviceProcAddr get, DeviceFaultExtensions enabled,
+                                const VkPhysicalDeviceMemoryProperties* memory = nullptr) {
+        device_fault_ = std::make_unique<DeviceFaultDiagnostics>(get, device_, enabled, memory,
+                                                                 vk.vkCmdPipelineBarrier2 != nullptr);
         device_fault_->set_submit_lock(&submit_mutex_);
         if (fence_dispatcher_) fence_dispatcher_->set_device_fault(device_fault_.get());
         if (loaded_) progress_watch_ = std::jthread([this](std::stop_token stop) { watch_queue_progress(stop); });
@@ -1887,6 +1890,9 @@ public:
         return it == device_fault_->pipeline_names.end() ? nullptr : it->second[0];
     }
     void set_before_execute(std::function<void()> before) { before_execute_ = std::move(before); }
+    // Called at the end of every ExecuteCommandLists replay that called before_execute_, however it returns: by then
+    // the submissions it made are recorded, so submitted_retire_ticket() covers them.
+    void set_after_execute(std::function<void()> after) { after_execute_ = std::move(after); }
     // GPU work the lists of a submission depend on, recorded at the start of its command buffer by a queue that can
     // run compute (the console heap translation pass, src/console_heap_gpu.h): `record` returns true when it recorded
     // something, and `commit` follows that submit (true: it reached the queue; the ticket is a retire ticket at or
@@ -1918,6 +1924,11 @@ public:
         replay_.depth24_run = [this](VkCommandBuffer command_buffer, const Depth24Job& job) {
             depth24_->run(command_buffer, job);
         };
+    }
+
+    bool has_depth24() {
+        std::shared_lock lock(resource_mutex_);
+        return depth24_ != nullptr;
     }
 
     // Copies the replay stages through a buffer (depth <-> colour, vulkan_replay.h) take device-local scratch from
@@ -2392,6 +2403,7 @@ private:
         resolve_passes_;
     std::map<std::tuple<VkImage, VkImage, VkImageView, VkImageView, VkRenderPass>, VkFramebuffer> resolve_framebuffers_;
     std::function<void()> before_execute_;
+    std::function<void()> after_execute_;
     InputProbe input_probe_;
     TableScanner table_scanner_;
     GeometryProvider geometry_provider_;
@@ -3151,6 +3163,12 @@ private:
             if (context_.is_device_lost() || !wait_for_room()) return queue_unsupported(__LINE__);
         }
         if (context_.before_execute_) context_.before_execute_();
+        struct AfterExecute {
+            VulkanContext& context;
+            ~AfterExecute() {
+                if (context.after_execute_) context.after_execute_();
+            }
+        } after_execute{context_};
         // The rest of this call is the replay phase; the submission is counted when it returns, however it returns.
         struct Replayed {
             std::int64_t start = submit_phases::now_ns();
