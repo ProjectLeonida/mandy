@@ -1325,8 +1325,11 @@ public:
 
     bool loaded() const { return loaded_; }
 
-    void configure_device_fault(PFN_vkGetDeviceProcAddr get, DeviceFaultExtensions enabled) {
-        device_fault_ = std::make_unique<DeviceFaultDiagnostics>(get, device_, enabled);
+    // `memory`: the physical device's memory types, for the AMD marker buffer (enabled.markers).
+    void configure_device_fault(PFN_vkGetDeviceProcAddr get, DeviceFaultExtensions enabled,
+                                const VkPhysicalDeviceMemoryProperties* memory = nullptr) {
+        device_fault_ = std::make_unique<DeviceFaultDiagnostics>(get, device_, enabled, memory,
+                                                                 vk.vkCmdPipelineBarrier2 != nullptr);
         device_fault_->set_submit_lock(&submit_mutex_);
         if (fence_dispatcher_) fence_dispatcher_->set_device_fault(device_fault_.get());
         if (loaded_) progress_watch_ = std::jthread([this](std::stop_token stop) { watch_queue_progress(stop); });

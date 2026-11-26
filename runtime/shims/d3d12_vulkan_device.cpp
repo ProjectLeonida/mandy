@@ -13543,7 +13543,8 @@ public:
                                                                   indirect);
         if (info.device_fault_diagnostics) {
             state_.context->configure_device_fault(get_device,
-                {info.device_fault_info, info.device_checkpoints, info.device_diagnostics_config});
+                {info.device_fault_info, info.device_checkpoints, info.device_diagnostics_config, info.device_markers},
+                &state_.memory);
             state_.context->add_diagnostic_queue(info.queue);
             for (auto queue : info.command_queues) state_.context->add_diagnostic_queue(queue);
             for (auto queue : info.compute_queues) state_.context->add_diagnostic_queue(queue);
@@ -21416,12 +21417,15 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         (device_fault[0] == '1' || device_fault[0] == '2')) {
         info.device_fault_diagnostics = true;
         const bool with_config = device_fault[0] == '1';
+        // LEONIDA_DEVICE_MARKERS=1: also VK_AMD_buffer_marker, for the AMD breadcrumbs (vulkan_device_markers.h).
         const auto fault = fault_features.enable(info.physical, vkGetPhysicalDeviceFeatures2, extensions,
                                                  device_extensions, device_info,
-                                                 {true, with_config, leonida::aftermath::extra_config_flags()});
+                                                 {true, with_config, leonida::aftermath::extra_config_flags(),
+                                                  leonida::device_markers_requested()});
         info.device_fault_info = fault.fault;
         info.device_checkpoints = fault.checkpoints;
         info.device_diagnostics_config = fault.diagnostics_config;
+        info.device_markers = fault.markers;
     } else if (aftermath) {
         // The diagnostics config alone: shader debug info, resource tracking and automatic checkpoints in the dump.
         const auto fault = fault_features.enable(info.physical, vkGetPhysicalDeviceFeatures2, extensions,
@@ -21429,6 +21433,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                                                  {false, true, leonida::aftermath::extra_config_flags()});
         info.device_diagnostics_config = fault.diagnostics_config;
     }
+    if (leonida::device_markers_requested() && !info.device_fault_diagnostics)
+        std::fprintf(stderr, "[rt] device-markers: unavailable: LEONIDA_DEVICE_MARKERS=1 needs LEONIDA_DEVICE_FAULT=1 "
+                             "or 2\n");
     if (aftermath && !info.device_diagnostics_config)
         std::fprintf(stderr, "[rt] aftermath: VK_NV_device_diagnostics_config unavailable; the dump has no shader "
                              "debug info, resource tracking or checkpoints\n");

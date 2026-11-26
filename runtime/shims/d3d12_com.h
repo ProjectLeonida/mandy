@@ -111,6 +111,7 @@ struct VulkanDeviceInfo {
     bool device_fault_info = false;
     bool device_checkpoints = false;
     bool device_diagnostics_config = false;
+    bool device_markers = false;  // VK_AMD_buffer_marker enabled for LEONIDA_DEVICE_MARKERS=1
     bool separate_depth_stencil_layouts = true;
     bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted enabled on this device.
     std::uint32_t max_push_constants_size = 0;
