@@ -326,7 +326,8 @@ counts once in each (`Index.streams` in `tools/awc_names.py`):
 `story000.rpf` is 74.1% named: dialogue is named almost entirely, because conversation data lists every key.
 `audio.rpf` is 5.7% named. Its sound effects, ambience and music have no list, so only numbered families are
 found. Without the one `story000_restofworld.rpf` conversation stream, 1,019 dialogue streams stay unnamed. When two
-accepted families claim the same id in one bank (3 rows), the first family in sorted base order keeps it.
+accepted families claim the same id in one bank (3 rows), the larger family keeps it; between families of the
+same size, the first in sorted base order does.
 
 The output names game files: keep it local, and do not commit it or attach it to an issue.
 
