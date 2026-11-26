@@ -169,7 +169,7 @@ def batch_convert(
     tex_index = _build_texture_index(texture_dir)
     tex_cache = TextureCache()
 
-    tasks = [
+    tasks = (
         (
             os.path.join(in_dir, f),
             os.path.join(out_dir, os.path.splitext(f)[0] + ".glb"),
@@ -179,29 +179,43 @@ def batch_convert(
             tex_cache,
         )
         for f in obj_files
-    ]
+    )
 
-    total = len(tasks)
-    succeeded = 0
-    failed = 0
-    failures: list[tuple[str, str]] = []          # (model, error): counted and named
-    dropped_textures: list[tuple[str, str, str]] = []
-
+    total = len(obj_files)
+    failures = []
+    dropped_textures = []
+    reports = {}
     max_workers = jobs if jobs and jobs > 0 else (os.cpu_count() or 4)
-
+    remaining = enumerate(tasks)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for ok, path, err, dropped in executor.map(convert_single, tasks):
-            if ok:
-                succeeded += 1
-            else:
-                failed += 1
-                failures.append((path, err))
-            dropped_textures.extend((path, tex, why) for tex, why in dropped)
+        pending = {}
+        while True:
+            for _ in range(2 * max_workers - len(pending)):
+                item = next(remaining, None)
+                if item is None:
+                    break
+                index, task = item
+                pending[executor.submit(convert_single, task)] = index
+            if not pending:
+                break
+            ready, _ = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in ready:
+                index = pending.pop(future)
+                ok, path, err, dropped = future.result()
+                if not ok or dropped:
+                    reports[index] = (ok, path, err, dropped)
+
+    # Workers finish out of order. Keep CLI diagnostics in input order.
+    for index in sorted(reports):
+        ok, path, err, dropped = reports[index]
+        if not ok:
+            failures.append((path, err))
+        dropped_textures.extend((path, tex, why) for tex, why in dropped)
 
     return {
         "total": total,
-        "succeeded": succeeded,
-        "failed": failed,
+        "succeeded": total - len(failures),
+        "failed": len(failures),
         "failures": failures,
         "dropped_textures": dropped_textures,
     }

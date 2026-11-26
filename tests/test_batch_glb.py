@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -150,6 +151,37 @@ class TestBatchGlb(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("converted 1/1 models", result.stdout)
+
+    def test_bounds_pending_models_and_preserves_report_order(self) -> None:
+        futures = batch_glb.concurrent.futures
+        outstanding = 0
+        peak = 0
+
+        class CountedFuture(futures.Future):
+            def result(self, timeout=None):
+                nonlocal outstanding
+                outstanding -= 1
+                return super().result(timeout)
+
+        class Pool(futures.Executor):
+            def submit(self, fn, task):
+                nonlocal outstanding, peak
+                outstanding += 1
+                peak = max(peak, outstanding)
+                future = CountedFuture()
+                future.set_result((False, task[0], "error", [("texture", "reason")]))
+                return future
+
+        with tempfile.TemporaryDirectory() as root:
+            for i in range(25):
+                (Path(root) / f"{i:02}.obj").touch()
+            order = [os.path.join(root, name) for name in os.listdir(root)]
+            with mock.patch.object(futures, "ThreadPoolExecutor", return_value=Pool()):
+                stats = batch_glb.batch_convert(root, root, jobs=2)
+        self.assertLessEqual(peak, 4)
+        self.assertEqual(stats["failed"], len(order))
+        self.assertEqual([path for path, _ in stats["failures"]], order)
+        self.assertEqual([path for path, _, _ in stats["dropped_textures"]], order)
 
     def test_batch_convert_synthetic(self) -> None:
         with tempfile.TemporaryDirectory() as in_dir, tempfile.TemporaryDirectory() as out_dir:
