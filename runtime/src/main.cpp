@@ -36,33 +36,37 @@
 #include <system_error>
 #include <vector>
 
+#include <algorithm>
 #include <cstring>
+
+#include "title_watchdog.h"
 
 namespace {
 
-// The retail executable (1.0.2.1) runs a hang watchdog thread (function at RVA 0x2215a60): when the game's main loop
-// has not set its "kick" byte (RVA 0x71b6331) for 30 one-second ticks, it calls a crash callback and then writes to
-// address 0 (`movl $0, 0` at RVA 0x2215c35). Under the runtime the game thread can legitimately stall for longer than
-// that, e.g. while the driver compiles pipelines against a cold cache (first boot after a driver update), and the
-// title then kills itself. By default the watchdog stays armed, as on the console. With LEONIDA_TITLE_WATCHDOG=0, and
-// only when that exact trap instruction sits where it does in this build, a runtime thread sets the kick byte twice a
-// second so the title's watchdog never fires.
-constexpr std::uint32_t kWatchdogTrapRva = 0x2215c35;
-constexpr std::uint32_t kWatchdogKickRva = 0x71b6331;
-constexpr unsigned char kWatchdogTrap[] = {0xC7, 0x04, 0x25, 0, 0, 0, 0, 0, 0, 0, 0};  // movl $0, 0x0
+// The title's hang watchdog (title_watchdog.h has what it is and where). This is the title's image base once the trap
+// instruction has been found where this build has it, and null for any other build: nothing below touches the
+// watchdog's addresses then.
+std::uint8_t* volatile title_watchdog_image = nullptr;
+
+void find_title_watchdog(std::uint8_t* base, std::size_t image_bytes) {
+    namespace wd = leonida::title_watchdog;
+    MEMORY_BASIC_INFORMATION trap{};
+    if (VirtualQuery(base + wd::kTrapRva, &trap, sizeof(trap)) && trap.State == MEM_COMMIT &&
+        wd::trap_present(base, image_bytes))
+        title_watchdog_image = base;
+}
 
 void keep_title_watchdog_kicked(std::uint8_t* base) {
+    namespace wd = leonida::title_watchdog;
     char value[4]{};
     if (GetEnvironmentVariableA("LEONIDA_TITLE_WATCHDOG", value, sizeof(value)) != 1 || value[0] != '0') return;
-    MEMORY_BASIC_INFORMATION trap{}, kick{};
-    if (!VirtualQuery(base + kWatchdogTrapRva, &trap, sizeof(trap)) || trap.State != MEM_COMMIT ||
-        std::memcmp(base + kWatchdogTrapRva, kWatchdogTrap, sizeof(kWatchdogTrap)) != 0)
-        return;  // not the build this was measured on: leave the title's watchdog alone
+    if (title_watchdog_image != base) return;  // not the build this was measured on: leave the title's watchdog alone
+    MEMORY_BASIC_INFORMATION kick{};
     const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-    if (!VirtualQuery(base + kWatchdogKickRva, &kick, sizeof(kick)) || kick.State != MEM_COMMIT ||
+    if (!VirtualQuery(base + wd::kKickRva, &kick, sizeof(kick)) || kick.State != MEM_COMMIT ||
         !(kick.Protect & writable))
         return;
-    volatile std::uint8_t* const byte = base + kWatchdogKickRva;
+    volatile std::uint8_t* const byte = base + wd::kKickRva;
     const HANDLE thread = CreateThread(
         nullptr, 0,
         [](LPVOID p) -> DWORD {
@@ -327,8 +331,40 @@ static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI title_set_unhandled_exception_filter(
         InterlockedExchangePointer(&title_fatal_filter, reinterpret_cast<void*>(filter)));
 }
 
+// RT-WATCHDOG-FIRED-NOTE: the title's hang watchdog ends a stalled run with a write to address 0, and the log then
+// showed only an access violation in title code, which reads as a fault of the layer or of whatever came just before
+// it. When the fault is that write (title_watchdog.h, fired()), say what it was, once. Nothing else changes: the
+// exception goes on as before.
+static void report_title_watchdog(const EXCEPTION_POINTERS* info) {
+    namespace wd = leonida::title_watchdog;
+    std::uint8_t* const image = title_watchdog_image;
+    const EXCEPTION_RECORD* const record = info->ExceptionRecord;
+    if (!image || !info->ContextRecord || record->NumberParameters < 2) return;
+    wd::Fault fault;
+    fault.image_base = reinterpret_cast<std::uintptr_t>(image);
+    fault.instruction = reinterpret_cast<std::uintptr_t>(record->ExceptionAddress);
+    fault.write = record->ExceptionInformation[0] == 1;
+    fault.address = record->ExceptionInformation[1];
+    // The stack from the stack pointer up, as far as its committed region goes.
+    const auto sp = static_cast<std::uintptr_t>(info->ContextRecord->Rsp);
+    MEMORY_BASIC_INFORMATION region{};
+    if (sp % sizeof(std::uint64_t) == 0 && VirtualQuery(reinterpret_cast<const void*>(sp), &region, sizeof(region)) &&
+        region.State == MEM_COMMIT && !(region.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+        const auto end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+        fault.stack = reinterpret_cast<const std::uint64_t*>(sp);
+        fault.stack_words = std::min<std::size_t>(wd::kStackWords, (end - sp) / sizeof(std::uint64_t));
+    }
+    if (!wd::fired(fault)) return;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::fprintf(stderr, "[rt] %s\n", wd::kFiredNote);
+        std::fflush(stderr);
+    });
+}
+
 static LONG WINAPI save_caches_on_fatal_exception(EXCEPTION_POINTERS* info) {
     const DWORD code = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionCode : 0;
+    if (code == EXCEPTION_ACCESS_VIOLATION) report_title_watchdog(info);
     if (code != EXCEPTION_STACK_OVERFLOW) {
         // Several title threads can fault at once (measured: eight within a second). The first writes; the others
         // wait here for it, so none of them reaches the title's filter, which may end the process, mid-write.
@@ -635,6 +671,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
+        find_title_watchdog(main_module.base, main_module.size);
         keep_title_watchdog_kicked(main_module.base);
         start_title_peek(main_module.base);
         leonida::dev_overlay::start();  // LEONIDA_DEV_OVERLAY=1
