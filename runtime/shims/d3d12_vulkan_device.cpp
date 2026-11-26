@@ -2349,6 +2349,22 @@ class Resource;
 struct DeviceState;
 // `why`, when given, says what refused a T#: the first refusals are logged with their words (scan_console_slots).
 TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWords& words, const char** why = nullptr);
+// Why a T# found no room (bind_image_locked): set 0's array of its dimension, or that array's storage range, was full.
+// A console heap's slot record keeps such a T# waiting for room (DeviceState::fix_console_slot).
+constexpr const char* kTsharpArrayFull = "the bindless array of the T#'s dimension is full";
+constexpr const char* kTsharpStorageFull = "the bindless storage arrays of the T#'s dimension are full";
+// Why a T# found no texture (TitleImage::unknown), by what its address is (bind_title_image): the title's memory (a
+// texture the title placed there without any call the layer sees); an address of the layer's own textures
+// (Resource::image_address: 1 << 32 and up, 256 apart) whose texture is gone; an address whose low 32 bits are one of
+// those (the title rebuilt the T# with other high bits) and whose texture is there with the T#'s shape, there with
+// another shape, or gone; or none of these (no memory of the title's or texture of ours: data that decodes as a T#,
+// or an address the layer does not know).
+constexpr const char* kTsharpNoTextureTitleMemory = "no texture at the T# address: title memory";
+constexpr const char* kTsharpNoTextureGone = "no texture at the T# address: a texture of ours that is gone";
+constexpr const char* kTsharpNoTextureLow32Same = "no texture at the T# address: its low 32 bits name a texture of ours of its shape";
+constexpr const char* kTsharpNoTextureLow32Other = "no texture at the T# address: its low 32 bits name a texture of ours of another shape";
+constexpr const char* kTsharpNoTextureLow32Gone = "no texture at the T# address: its low 32 bits name a texture of ours that is gone";
+constexpr const char* kTsharpNoTextureNothing = "no texture at the T# address: no title memory and no texture of ours";
 struct TitleTexture;  // a texture the title keeps in its own memory (TitleTexture, after Resource)
 
 // The first refused T#s of each reason, with where they sit in the heap and their words, and counts of the
@@ -3003,7 +3019,9 @@ struct DeviceState {
         if (!leonida::texture_memory_readable(reinterpret_cast<std::uintptr_t>(from), size)) return Result::unreadable;
         return copy_guarded(to, from, size, false) ? Result::copied : Result::interrupted;
     }
-    std::uint64_t geometry_va(std::uint64_t guest, std::uint64_t span, bool read_only) {
+    // `refused` (when given) is set when a copy was asked for and refused (no room under the cap, or no block): it may
+    // be made once geometry copies are freed (GeometryViews::free_generation).
+    std::uint64_t geometry_va(std::uint64_t guest, std::uint64_t span, bool read_only, bool* refused = nullptr) {
         if (!geometry.cap() || !span || !guest || !watch_shadow_writes()) return 0;
         const auto cpu = leonida::title_gpu_views::to_cpu(guest, span);
         auto& aliases = leonida::title_va_aliases();
@@ -3019,7 +3037,9 @@ struct DeviceState {
                     return geometry.find(cpu, span);
             }
         }
-        return geometry.resolve(*this, cpu, span, copy_geometry);
+        const std::uint64_t va = geometry.resolve(*this, cpu, span, copy_geometry);
+        if (!va && refused) *refused = true;
+        return va;
     }
 
     // LEONIDA_STREAM_BUFFER_WINDOWS=0: a window may not come from a block outside the arena.
@@ -3914,8 +3934,10 @@ struct DeviceState {
     // `refused` (when given): for an answer of 0, the copy an alias range named that was not backed (0: none), so the
     // console heap's slot record is found again when a backing is added there.
     uint64_t vsharp_address(uint64_t base, uint64_t bytes, leonida::TitleVaAliases::Kind kind = leonida::TitleVaAliases::created_view,
-                            bool make_window = true, bool try_geometry = false, uint64_t* refused = nullptr) {
+                            bool make_window = true, bool try_geometry = false, uint64_t* refused = nullptr,
+                            bool* refused_room = nullptr) {
         if (refused) *refused = 0;
+        if (refused_room) *refused_room = false;
         if (!base || !bytes) return 0;
         auto& aliases = leonida::title_va_aliases();
         constexpr uint64_t mask = (1ull << 48) - 1;
@@ -3956,7 +3978,7 @@ struct DeviceState {
         // Read the other way: bit 47 as a sign, for a below-arena buffer's V# the layer wrote itself.
         if (offset == base && base <= mask && (base & (1ull << 47)) && backed(base | ~mask)) return base | ~mask;
         if (try_geometry) {
-            to = geometry_va(base, bytes, false);
+            to = geometry_va(base, bytes, false, refused_room);
             if (to && encodable(to)) return path(3), to;
         }
         uint64_t lo{}, hi{};
@@ -4027,11 +4049,14 @@ struct DeviceState {
         const bool copy_geometry = leonida::gfx10::decode(words, desc) &&
             (path != VsharpPath::scratch || span <= kTitleWindowMax || (desc.format && leonida::gfx10::encode(desc) == words));
         uint64_t refused = 0;
+        bool refused_room = false;
         const auto to = vsharp_address(base, span, leonida::TitleVaAliases::table_view,
-                                       path != VsharpPath::scratch, copy_geometry, &refused);
+                                       path != VsharpPath::scratch, copy_geometry, &refused, &refused_room);
         if (record) {
-            // The copy's device address (mod 2^64: a buffer below the arena has a negative offset).
-            record->state = to ? leonida::ConsoleHeapSlotRecords::resolved : leonida::ConsoleHeapSlotRecords::waiting;
+            // The copy's device address (mod 2^64: a buffer below the arena has a negative offset). A geometry copy
+            // refused for room is asked for again when copies are freed (SlotChange::geometry_room).
+            using Records = leonida::ConsoleHeapSlotRecords;
+            record->state = to ? Records::resolved : refused_room ? Records::waiting_room : Records::waiting;
             record->base = base;
             record->span = span;
             record->target = to ? arena.address + to : refused ? arena.address + refused : 0;
@@ -4295,7 +4320,8 @@ struct DeviceState {
     //     the console VA of a GPU copy (rebase_title_vsharp), and an unregistered T# is bound (bind_title_image).
     //     The tracker copies into a host mirror of the title's bytes, and only the slots whose bytes differ from what
     //     their arena slot was made from (a second host copy) are fixed and written there again; a T# that found no
-    //     texture and a V# into title memory with no copy yet are tried at every submission until they do. Pages xmem
+    //     texture and a V# that found no backing are recorded as waiting (ConsoleHeap::records) and fixed again when a
+    //     texture, backing, alias or room comes for them (apply_slot_changes), never by looking again. Pages xmem
     //     maps at two addresses are copied at every submission, and fixing all their slots each time, reading the
     //     arena (uncached device memory) to do it, cost more than a frame (295 ms a submission for the 4 MiB of the
     //     retail heap in use, RTX 4070 Ti).
@@ -4328,12 +4354,18 @@ struct DeviceState {
         ShadowPagesPtr pages;
         std::vector<std::uint8_t> mirror;  // the title's bytes as the tracker last copied them
         std::vector<std::uint8_t> made;    // the title's bytes each arena slot was last made from
-        std::vector<std::uint8_t> retry;   // per slot: not settled yet (fix_console_slot), in `retries`
-        // A resource heap's V# halves: what each resolved to (fix_console_slot), so a change of the address space
-        // re-fixes the slots it touches (apply_slot_changes), and a V# whose buffer comes later is fixed when it does.
+        // Per slot: in `retries`. On the CPU path a slot LEONIDA_CONSOLE_FIX_US deferred (fix_deferred_slots); in the
+        // GPU mode (refresh_console_heap_gpu) also a T# whose texture is still to come (retry_console_tsharps).
+        std::vector<std::uint8_t> retry;
+        // A resource heap's V# halves and T#s: what each resolved to or waits for (fix_console_slot), so a change of
+        // the address space or of the textures re-fixes the slots it touches (apply_slot_changes), and a V# whose
+        // buffer or a T# whose texture comes later is fixed when it does.
         leonida::ConsoleHeapSlotRecords records;
         std::vector<std::uint32_t> retries;
-        std::size_t retry_at = 0;  // where retry_console_slots goes on
+        std::size_t retry_at = 0;  // where retry_console_tsharps goes on (GPU mode)
+        // Since the last log line: T# fixes left waiting (for a texture at their address, or room), and T#s that
+        // waited and are bound now.
+        std::uint64_t texture_waits = 0, texture_refills = 0;
         // fix_console_slots' budget, for the current refresh, and the slots it nulled since the last log line
         std::chrono::steady_clock::time_point fix_start{};
         bool fix_over = false;
@@ -4429,12 +4461,17 @@ struct DeviceState {
     }
 
     // Slot `slot` of a heap copy, as the title wrote it, fixed up as described above, and the only writer of a
-    // resource heap's slot records. True when it is settled: not a T# whose texture is still to come. A sampler heap
-    // holds S#s: copied as written.
-    bool fix_console_slot(ConsoleHeap& heap, std::size_t slot) {
+    // resource heap's slot records. A T# that found no texture, or one that does not fit it, is recorded as waiting
+    // for the texture at its address (or for room in its bindless array): a texture registered, replaced or gone there
+    // fixes the slot again (apply_slot_changes), and nothing looks at it before. A sampler heap holds S#s: copied as
+    // written.
+    void fix_console_slot(ConsoleHeap& heap, std::size_t slot) {
         std::uint32_t w[kDescriptorSize / 4];
         std::memcpy(w, heap.previous + slot * kDescriptorSize, kDescriptorSize);
-        bool settled = true, vsharp = false;
+        bool vsharp = false;
+        using Records = leonida::ConsoleHeapSlotRecords;
+        Records::State texture = Records::none;
+        std::uint64_t texture_address = 0;
         VsharpRecord halves[2];
         const VsharpPath path = heap.scratch ? VsharpPath::scratch : VsharpPath::shadow;
         if (!heap.resource_heap || !(w[0] | w[1] | w[2] | w[3])) {
@@ -4459,14 +4496,26 @@ struct DeviceState {
             if (leonida::gfx10::is_image(words)) {
                 const char* why = nullptr;
                 const TitleImage result = bind_title_image(*this, words, &why);
-                if (result == TitleImage::unknown || result == TitleImage::refused) {
+                const bool unbound = result == TitleImage::unknown || result == TitleImage::refused;
+                if (unbound) {
                     note_refused_tsharp(heap, slot * kDescriptorSize, words, why);
-                    if (result == TitleImage::refused)
-                        ++heap.refused_reasons[why ? why : "?"];
+                    ++heap.refused_reasons[why ? why : "?"];
                 }
                 ++heap.images[unsigned(result)];
-                settled = result != TitleImage::unknown && result != TitleImage::refused;
-                if (result == TitleImage::not_tsharp) std::memset(w, 0, 16);
+                if (result == TitleImage::not_tsharp) {
+                    std::memset(w, 0, 16);
+                } else {
+                    leonida::gfx10::Image image{};
+                    leonida::gfx10::decode(words, image);
+                    texture_address = image.address;
+                    texture = !unbound ? Records::texture_bound
+                              : why == kTsharpArrayFull || why == kTsharpStorageFull ? Records::texture_waiting_room
+                                                                                     : Records::texture_waiting;
+                    if (unbound) ++heap.texture_waits;
+                    else if (Records::is_waiting(heap.records.state(slot, 0)) &&
+                             heap.records.base(slot, 0) == texture_address)
+                        ++heap.texture_refills;  // the T# waited for this address and is bound now
+                }
             } else {
                 // Neither a buffer V# (TYPE is not 0) nor a T# the layer can decode: data the title keeps in the slot.
                 // No image is found by these words (the bindless lookup misses, as for a null T#), but a shader that
@@ -4482,10 +4531,11 @@ struct DeviceState {
                 for (unsigned half = 0; half < 2; ++half)
                     heap.records.set(slot, half, halves[half].state, halves[half].base, halves[half].span,
                                      halves[half].target);
+            else if (texture != Records::none)
+                heap.records.set_texture(slot, texture, texture_address);
             else
                 heap.records.clear(slot);
         }
-        return settled;
     }
 
     // Diagnostics only: the class of a changed slot, and whether its V# halves were seen before (ConsoleHeap::changed).
@@ -4519,7 +4569,7 @@ struct DeviceState {
     // The slots on [offset, offset + bytes) of a heap copy's mirror, just brought up to date: each that differs from
     // what its arena slot was made from is written there and fixed up.
     // LEONIDA_CONSOLE_FIX_US limits the fixing in one submission (0, the default: no limit). Past it a changed slot is
-    // written as a null descriptor and left to retry_console_slots: after the story load the title rewrote up to
+    // written as a null descriptor and fixed at a later submission (fix_deferred_slots): after the story load the title rewrote up to
     // 3.7 MiB of its heap at once and one submission spent 28 s fixing it (speed-8). A shader reads such a slot as
     // empty until its turn comes, so a limit changes results: at the first world frame lib_cs_01144 read the size it
     // divides by from a nulled buffer slot and its loops never ended, which lost the device.
@@ -4559,20 +4609,43 @@ struct DeviceState {
                 }
                 continue;
             }
-            if (fix_console_slot(heap, slot)) {
-                heap.retry[slot] = 0;
-            } else if (!heap.retry[slot]) {
-                heap.retry[slot] = 1;
-                heap.retries.push_back(std::uint32_t(slot));
-            }
+            heap.retry[slot] = 0;
+            fix_console_slot(heap, slot);
         }
+    }
+
+    // The slots LEONIDA_CONSOLE_FIX_US deferred at an earlier submission (null in the copy meanwhile): fixed first,
+    // under the same budget; those past it wait for the next submission. Nothing else is in the list on this path.
+    void fix_deferred_slots(ConsoleHeap& heap) {
+        static const std::uint64_t budget_us = [] {
+            char text[16] = {};
+            const DWORD n = GetEnvironmentVariableA("LEONIDA_CONSOLE_FIX_US", text, sizeof(text));
+            return n > 0 && n < sizeof(text) ? std::strtoull(text, nullptr, 10) : 0ull;
+        }();
+        std::size_t done = 0;
+        for (; done < heap.retries.size(); ++done) {
+            if (budget_us && !(++heap.fix_count & 15) &&
+                std::chrono::steady_clock::now() - heap.fix_start >= std::chrono::microseconds(budget_us)) {
+                heap.fix_over = true;
+                break;
+            }
+            const std::uint32_t slot = heap.retries[done];
+            if (!heap.retry[slot]) continue;  // rewritten or zeroed since
+            heap.retry[slot] = 0;
+            fix_console_slot(heap, slot);
+            ++heap.retried;
+        }
+        heap.retries.erase(heap.retries.begin(), heap.retries.begin() + std::ptrdiff_t(done));
     }
 
     // The changes since the last submission (slot_changes), applied to a resource heap's copy: each slot whose record
     // a change touches is fixed again - a V# whose backing, copy or alias range went, so the copy never names freed
-    // memory, and a waiting V# over which a backing, alias range or title memory was added. Only the slots near the
-    // changed ranges are looked at (ConsoleHeapSlotRecords::touched); nothing reads the copy.
+    // memory, a waiting V# over which a backing, alias range or title memory was added or for which geometry room was
+    // made, and a T# whose texture was registered, replaced or went at its address, or that waited for room in its
+    // bindless array when entries were freed. Only the slots the changes name are looked at
+    // (ConsoleHeapSlotRecords::touched); nothing reads the copy.
     std::vector<std::uint32_t> slot_change_scratch;  // console_heap_mutex
+    std::uint64_t geometry_room_seen = 0;  // geometry.free_generation() at the last refresh (console_heap_mutex)
     void apply_slot_changes(ConsoleHeap& heap, const std::vector<leonida::SlotChange>& changes) {
         if (!heap.resource_heap || changes.empty()) return;
         const auto start = std::chrono::steady_clock::now();
@@ -4581,46 +4654,10 @@ struct DeviceState {
         heap.record_changes += changes.size();
         heap.record_looked += heap.records.looked_at() - looked;
         heap.record_refixed += slot_change_scratch.size();
+        // A slot deferred by the fix budget (null in the copy) is fixed from its list, not here.
         for (const std::uint32_t slot : slot_change_scratch)
-            if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
-                heap.retry[slot] = 1;
-                heap.retries.push_back(slot);
-            }
+            if (!heap.retry[slot]) fix_console_slot(heap, slot);
         heap.record_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    }
-
-    // The slots of a heap copy not settled yet: fixed again, and kept while they are still not. Round robin, for at
-    // most LEONIDA_CONSOLE_RETRY_US a submission (500 by default, 0: all of them every time): during the story load
-    // thousands of T#s name textures that come much later, and trying them all at every submission cost hundreds of
-    // milliseconds each. One not reached waits a few submissions more for its texture.
-    void retry_console_slots(ConsoleHeap& heap) {
-        static const std::uint64_t budget_us = [] {
-            char text[16] = {};
-            const DWORD n = GetEnvironmentVariableA("LEONIDA_CONSOLE_RETRY_US", text, sizeof(text));
-            return n > 0 && n < sizeof(text) ? std::strtoull(text, nullptr, 10) : 500ull;
-        }();
-        const auto start = std::chrono::steady_clock::now();
-        std::size_t i = heap.retry_at, visited = 0;
-        const std::size_t total = heap.retries.size();
-        while (visited < total && !heap.retries.empty()) {
-            if (i >= heap.retries.size()) i = 0;
-            const std::uint32_t slot = heap.retries[i];
-            ++visited;
-            // Rewritten or zeroed since, or settled now: out of the list (the last one takes its place, seen later).
-            const bool settled = !heap.retry[slot] || fix_console_slot(heap, slot);
-            if (settled) {
-                heap.retry[slot] = 0;
-                heap.retries[i] = heap.retries.back();
-                heap.retries.pop_back();
-            } else {
-                ++i;
-            }
-            if (budget_us && !(visited & 31) &&
-                std::chrono::steady_clock::now() - start >= std::chrono::microseconds(budget_us))
-                break;
-        }
-        heap.retry_at = i;
-        heap.retried += visited;
     }
 
     void note_refused_tsharp(ConsoleHeap& heap, std::size_t offset, const leonida::gfx10::ImageWords& words,
@@ -4651,17 +4688,18 @@ struct DeviceState {
         heap.fix_start = t1;
         heap.fix_over = false;
         heap.fix_count = 0;
-        heap.pages->for_each_copied([&](std::size_t offset, std::size_t bytes) { fix_console_slots(heap, offset, bytes); });
-        // Even an unchanged title slot may name a buffer released since the last submission: the slots the changes
-        // touch are fixed again, found by their records.
-        if (changes) apply_slot_changes(heap, *changes);
         const auto t2 = clock::now();
-        // T#s whose texture is not there yet, and slots the fix budget deferred.
-        if (!heap.retries.empty()) retry_console_slots(heap);
+        // Slots the fix budget deferred at an earlier submission (LEONIDA_CONSOLE_FIX_US; none without it).
+        if (!heap.retries.empty()) fix_deferred_slots(heap);
         const auto t3 = clock::now();
+        heap.pages->for_each_copied([&](std::size_t offset, std::size_t bytes) { fix_console_slots(heap, offset, bytes); });
+        // Even an unchanged title slot may name a buffer released since the last submission, or wait for a buffer or
+        // texture that came: the slots the changes touch are fixed again, found by their records.
+        if (changes) apply_slot_changes(heap, *changes);
+        const auto t4 = clock::now();
         heap.pages_ms += ms(t0, t1);
-        heap.fix_ms += ms(t1, t2);
         heap.retry_ms += ms(t2, t3);
+        heap.fix_ms += ms(t1, t2) + ms(t3, t4);
     }
 
     // Before every submission, ahead of the slot-133 shadows.
@@ -4684,6 +4722,11 @@ struct DeviceState {
             std::lock_guard taken(slot_change_mutex);
             changes.swap(slot_changes);
         }
+        // Geometry copies freed since (GeometryViews::reap): the V# halves refused a copy for lack of room ask again.
+        if (const std::uint64_t freed = geometry.free_generation(); freed != geometry_room_seen) {
+            geometry_room_seen = freed;
+            changes.push_back({leonida::SlotChange::geometry_room, 0, 1});
+        }
         for (const auto& heap : console_heaps) {
             const auto start = std::chrono::steady_clock::now();
             refresh_console_heap(*heap, &changes);
@@ -4698,11 +4741,11 @@ struct DeviceState {
             heap->log_time = start;
             std::fprintf(stderr,
                          "[rt] d3d12: console descriptor heap 0x%llx (%s): submissions up to %llu %s %.1f KiB each "
-                         "in %.3f ms on average (pages %.3f, fixing copied slots %.3f, %llu left to retries past the "
-                         "budget, retrying %.3f: %.1f slots a "
-                         "submission, %zu waiting), %llu write faults; %llu title V#s rebased, %llu with no copy given "
-                         "no records (%zu V# halves waiting for a backing), T#s %llu known, %llu bound, %llu "
-                         "naming no texture, %llu refused, %llu words that are no V# or T# (data, null in the copy)\n",
+                         "in %.3f ms on average (pages %.3f, fixing slots %.3f, %llu deferred past the budget, "
+                         "deferred ones %.3f: %.1f slots a submission, %zu left), %llu write faults; %llu title V#s "
+                         "rebased, %llu with no copy given no records (%zu V# halves waiting for a backing), T#s %llu "
+                         "known, %llu bound, %llu naming no texture, %llu refused, %llu words that are no V# or T# "
+                         "(data, null in the copy)\n",
                          static_cast<unsigned long long>(heap->console_va), heap->imported ? "imported" : "copy",
                          static_cast<unsigned long long>(heap->refreshes), "copied",
                          double(heap->copied) / 1024.0 / count,
@@ -4736,13 +4779,21 @@ struct DeviceState {
                              static_cast<unsigned long long>(paths[4]), static_cast<unsigned long long>(paths[5]));
                 // What releases, alias changes and additions cost: per submission, the changes taken, the record
                 // entries looked at to find their slots, and the slots fixed again (apply_slot_changes).
+                // T#s: those in the heap now, those of them waiting (for a texture at their address, or room), and
+                // since the last line the T# fixes that left one waiting and the waiting ones bound by a texture that
+                // came (refills).
                 std::fprintf(stderr,
                              "[rt] d3d12: console descriptor heap 0x%llx slot records per submission: %.1f changes, "
-                             "%.1f slots looked at, %.1f fixed again, %.3f ms; %zu V# halves recorded\n",
+                             "%.1f slots looked at, %.1f fixed again, %.3f ms; %zu V# halves recorded; T#s %zu "
+                             "recorded, %zu waiting for a texture; since the last line %llu T# fixes left waiting, "
+                             "%llu refills\n",
                              static_cast<unsigned long long>(heap->console_va), double(heap->record_changes) / count,
                              double(heap->record_looked) / count, double(heap->record_refixed) / count,
-                             heap->record_ms / count, heap->records.recorded());
+                             heap->record_ms / count, heap->records.recorded(), heap->records.textures(),
+                             heap->records.textures_waiting(), static_cast<unsigned long long>(heap->texture_waits),
+                             static_cast<unsigned long long>(heap->texture_refills));
                 for (auto& n : heap->changed) n = 0;
+                heap->texture_waits = heap->texture_refills = 0;
                 heap->vsharp_halves = heap->vsharp_repeats = 0;
                 heap->record_changes = heap->record_looked = heap->record_refixed = 0;
                 heap->record_ms = 0;
@@ -7314,8 +7365,8 @@ struct DeviceState {
             const Refusal refusal = bindless->image_refusal(dimension, entry.storage != VK_NULL_HANDLE, sampled_class);
             if (why)
                 *why = refusal == Refusal::no_array       ? "set 0 has no array for the T#'s dimension"
-                       : refusal == Refusal::storage_full ? "the bindless storage arrays of the T#'s dimension are full"
-                                                          : "the bindless array of the T#'s dimension is full";
+                       : refusal == Refusal::storage_full ? kTsharpStorageFull
+                                                          : kTsharpArrayFull;
             if (refusal != Refusal::no_array &&
                 first_diagnostic("a bindless image array is full; dimension", int(dimension))) {
                 // Whether the array holds live textures or stale views: the T#s it holds, the textures they name,
@@ -7369,7 +7420,18 @@ struct DeviceState {
     void note_image_address(std::uint64_t address, const void* resource) {
         std::lock_guard lock(descriptor_mutex);
         images_by_address[address] = resource;
+        note_texture_change(leonida::SlotChange::texture_added, address);
     }
+    // A texture registered, replaced or gone at `address`: the console heaps' T#s naming it (by that address or by
+    // the other view of texture-pool memory, title_gpu_views) are fixed again at the next submission.
+    void note_texture_change(leonida::SlotChange::Kind kind, std::uint64_t address) {
+        if (!address) return;
+        note_slot_change(kind, address, 1);
+        if (const std::uint64_t other = leonida::title_gpu_views::other_view(address))
+            note_slot_change(kind, other, 1);
+    }
+    // Why no texture answers a T# (bind_title_image; descriptor_mutex held): the kTsharpNoTexture* reasons.
+    const char* no_texture_reason_locked(const leonida::gfx10::Image& image);
     // LEONIDA_TRACE_TEXTURE=<address>[,<address>...] (hex, the base a T# names): the resource id of an image registered
     // at that address, so a draw's T# can be followed to the passes that write it (fsdraw rt0, UAV views, copies).
     static void trace_image(std::uint64_t address, leonida::ResourceId id, const char* where) {
@@ -7403,21 +7465,29 @@ struct DeviceState {
         images_by_address.erase(address);
         forget_image_views_locked(address);
     }
+    // Its T#s stop naming it at once (a shader's lookup of their words misses from the next table flush on); the
+    // console heap slots that held them wait for the next texture at the address (note_texture_change), and the
+    // indices freed let T#s that found their array full bind.
     void forget_image_views_locked(std::uint64_t address) {
+        note_texture_change(leonida::SlotChange::texture_gone, address);
         if (!bindless) return;
+        bool freed = false;
         const auto [first, last] = image_keys.equal_range(address);
         for (auto it = first; it != last; ++it) {
             const auto entry = image_entries.find(it->second);
             bindless->erase_key(it->second);
             release(entry->second);
             image_entries.erase(entry);
+            freed = true;
         }
         image_keys.erase(first, last);
         std::erase_if(replaced_images, [&](const ImageEntry& entry) {
             if (entry.address != address) return false;
             release(entry);
+            freed = true;
             return true;
         });
+        if (freed) note_slot_change(leonida::SlotChange::texture_room, 0, 1);
     }
 
     // Gives the S# `words` a sampler in set 0 and an entry in the hash table, unless it has them.
@@ -9194,6 +9264,8 @@ public:
             for (const auto& [words, image] : pending.mapped().keys)
                 device_.bind_image_locked(words, image, image_, format_, aspects_, false, has_view_format_list(),
                                           uint_backed_);
+            // Its image is there now: title-written T#s refused while it had none are fixed again.
+            device_.note_texture_change(leonida::SlotChange::texture_added, image_address_);
         }
         deferred_stream_ = false;
     }
@@ -13507,6 +13579,7 @@ void DeviceState::title_texture_gone(const void* resource, std::uint64_t address
             // reads gpu_placements under descriptor_mutex alone, so the placement must not outlive the resource.
             std::lock_guard descriptors(descriptor_mutex);
             gpu_placements.remove(address, resource);
+            note_texture_change(leonida::SlotChange::texture_gone, address);
         }
         const auto it = title_textures.find(address);
         if (it != title_textures.end() && it->second->resource == resource) it->second->resource = nullptr;
@@ -13518,6 +13591,7 @@ void DeviceState::title_texture_gone(const void* resource, std::uint64_t address
     {
         std::lock_guard descriptors(descriptor_mutex);
         gpu_placements.remove(address, resource);
+        note_texture_change(leonida::SlotChange::texture_gone, address);
     }
     const auto it = title_textures.find(address);
     if (it != title_textures.end() && it->second->resource == resource) {
@@ -13599,6 +13673,22 @@ void note_unknown_tsharp(const leonida::gfx10::ImageWords& words, const leonida:
     }
 }
 
+const char* DeviceState::no_texture_reason_locked(const leonida::gfx10::Image& image) {
+    std::uint64_t lo = 0, hi = 0;
+    if (leonida::title_va_aliases().title_memory(image.address, lo, hi)) return kTsharpNoTextureTitleMemory;
+    // The layer's own texture addresses: 1 << 32 and up, 256 apart (Resource::image_address).
+    constexpr std::uint64_t ours = std::uint64_t(1) << 32;
+    const std::uint64_t next = next_image_address.load(std::memory_order_relaxed);
+    if (image.address >= ours && image.address < next) return kTsharpNoTextureGone;
+    const std::uint64_t low = ours | (image.address & 0xffffffffull);
+    if (low >= next) return kTsharpNoTextureNothing;
+    const auto found = images_by_address.find(low);
+    if (found == images_by_address.end()) return kTsharpNoTextureLow32Gone;
+    const auto& owner = *static_cast<const Resource*>(found->second);
+    return TitleGpuPlacements<Resource>::matches(image, owner.desc()) ? kTsharpNoTextureLow32Same
+                                                                      : kTsharpNoTextureLow32Other;
+}
+
 TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWords& words, const char** why) {
     namespace g = leonida::gfx10;
     const auto refuse = [why](const char* reason) {
@@ -13631,7 +13721,7 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
             if (auto* candidate = device.gpu_placements.find(image.address, alias, matches)) owner = candidate;
         }
         if (!owner) {
-            if (why) *why = "no texture at T# address";
+            if (why) *why = device.no_texture_reason_locked(image);
             note_unknown_tsharp(words, image);
             return TitleImage::unknown;
         }
@@ -15427,6 +15517,7 @@ public:
             if (entry->gpu_written && !(address & 0xff) && texture->image_address() != address) {
                 std::lock_guard descriptors(state_.descriptor_mutex);
                 state_.gpu_placements.add(address, texture);
+                state_.note_texture_change(leonida::SlotChange::texture_added, address);
             }
             auto& slot = state_.title_textures[address];
             if (slot && slot->owned) retire_title_texture(*slot);

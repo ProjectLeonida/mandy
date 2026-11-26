@@ -2112,6 +2112,27 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    of a buffer 10 of 60,010 slots name looks at those 10, that a 40-byte release among 300,000 slots packed into 74
    blocks of 64 KiB looks at the 3 it overlaps, and compares the copy with a full re-resolution through random
    writes, releases, additions and alias changes.
+   A title-written T# has a record too, under the exact base address it names (`bind_title_image` looks textures up
+   by that address, or by the other view of texture-pool memory): bound, or waiting for a texture there (no texture,
+   or one whose type, samples, mips, layers, image or views do not fit the T#), or waiting for room in its bindless
+   array. A texture registered, replaced or published at an address (`note_image_address`, a title texture's
+   placement, a streamed texture's image), or gone from it (`forget_image`, a placement removed), goes on the same
+   list, and the next submission fixes again exactly the T#s naming that address; freed bindless entries fix the
+   T#s waiting for room. Nothing looks at a waiting T# otherwise: before, a round robin tried the waiting slots again
+   for 500 µs a submission (`LEONIDA_CONSOLE_RETRY_US`), which in world runs took tens of submissions to come round
+   and counted every look as a T# "naming no texture" again. A texture that goes takes its T#s out of the descriptor
+   hash table at once (`forget_image_views_locked`), so a shader reading the slot gets the fallback; the slot then
+   waits for the next texture at the address, which a texture streamed out and back in needs. A V# half whose
+   geometry copy was refused for lack of room waits for room the same way: the slots are fixed again when geometry
+   copies are freed (`GeometryViews::free_generation`), not only when something is added over their base.
+   A T# with no texture at its address is counted by what the address is (`unbound T#s by reason` in the heap's log
+   line): title memory, a texture of the layer's own that is gone, an address whose low 32 bits are one of the
+   layer's texture addresses with other high bits (the texture there with the T#'s shape, with another, or gone),
+   or none of these. The heap's `slot records` line gives the T#s recorded, those waiting, the T# fixes that left
+   one waiting and the refills since the last line. `d3d12_tsharp_refill_test` samples, through the last of 60,001
+   waiting slots, a texture made after the T# was written, at the first submission after it appears. T#s are a third
+   index of the same kind, keyed by their address: a texture change visits exactly the T#s recorded for that address,
+   and the records waiting for room are kept in a list per kind, which a change saying room was made visits whole.
    Console resource heap copies and shader-visible CBV/SRV/UAV heaps with at least 65,536 slots request
    64 MiB of zeroed padding after their last descriptor. `LEONIDA_HEAP_GUARD_MB` sets the padding in MiB
    (0 disables it). When arena space is tight, allocation can fall back to the heap alone. Only indices

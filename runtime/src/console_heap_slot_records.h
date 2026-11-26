@@ -1,30 +1,39 @@
 #pragma once
-// What each buffer V# of a console resource heap's GPU copy resolved to (docs/d3d12_vulkan.md section 3.4), kept in
-// host RAM so that a change of the address space re-fixes exactly the slots it touches.
+// What each buffer V# and title-written T# of a console resource heap's GPU copy resolved to (docs/d3d12_vulkan.md
+// section 3.4), kept in host RAM so that a change of the address space re-fixes exactly the slots it touches.
 //
-// A slot of the copy is the title's descriptor with its V# bases rewritten (DeviceState::fix_console_slot). What a
-// base became depends on things that change after the slot was written: a buffer or window released, an alias range
-// removed, a geometry copy retired, or (for a base nothing backed yet) a buffer, alias or title memory added. Without
-// a record of which slot resolved into which range, a change could only be applied by walking every live slot. Here
-// each V# half (the buffer V# and the UAV counter V# of a slot) records:
+// A slot of the copy is the title's descriptor with its V# bases rewritten and its T# bound (DeviceState::
+// fix_console_slot). What a base became depends on things that change after the slot was written: a buffer or window
+// released, an alias range removed, a geometry copy retired, a texture registered, replaced or gone at an address, or
+// (for a base nothing backed yet) a buffer, alias or title memory added. Without a record of which slot resolved into
+// which range, a change could only be applied by walking every live slot. Here each V# half (the buffer V# and the
+// UAV counter V# of a slot) records:
 //   - source: the bytes the title's V# names, [base, base + span) (the base is the V#'s 48 bits);
 //   - target: the device addresses its GPU copy names, [target, target + span); for a half that resolved to nothing,
 //     those of a copy that was found but refused (not backed yet), or none;
-//   - state: resolved, waiting (written with no base and no records until something backs it) or none.
+//   - state: resolved, waiting (written with no base and no records until something backs it), waiting_room (as
+//     waiting, and its geometry copy was refused for lack of room) or none.
+// The T# of a slot has a record too (set_texture), in the first half: the address it names (its base), and whether a
+// texture bound it or it waits for one (texture_waiting_room: refused because its bindless array was full). Title-
+// written T#s are looked up by their exact base address (bind_title_image), so a third index holds them by that
+// address alone.
 //
-// Two indexes, by source and by target, hold the halves by their exact range. The halves that name the same range
-// share one group (the title writes the same V# into thousands of slots), which keeps them in two lists, resolved and
-// waiting, with each half's place in its list, so a half moves or goes in O(1) and no list holds a stale entry. The
-// groups are ordered by start, separately for each power-of-two class of their length: a group of class c (length at
-// most 2^c) overlaps [lo, hi) only if it starts in (lo - 2^c, hi), so a query searches each class in use once and walks
-// only the groups that start there.
+// The three indexes (V# source, V# target, T# address) hold the records by their exact range (a T#'s is its address
+// and the byte after it). The records that name the same range share one group (the title writes the same descriptor
+// into thousands of slots), which keeps them in two lists, settled (resolved, bound) and waiting, with each record's
+// place in its list, so a record moves or goes in O(1) and no list holds a stale entry. The groups are ordered by
+// start, separately for each power-of-two class of their length: a group of class c (length at most 2^c) overlaps
+// [lo, hi) only if it starts in (lo - 2^c, hi), so a query searches each class in use once and walks only the groups
+// that start there. Records waiting for room are also kept in one list per kind (V# halves, T#s), with their place,
+// which a change saying room was made visits whole.
 //
-// The bound: a change visits exactly the halves whose recorded range overlaps it (a release or removal: resolved and
-// waiting ones; an addition: waiting ones only); looked_at() counts those and nothing else. The groups walked to find
-// them are the overlapping ones plus, per class, those that start less than 2^c before the change and end before it:
-// each costs one comparison, never a slot. Memory: 20 bytes a half (40 a slot, allocated with calloc, so pages of
-// slots never written are never touched), and per distinct range a group (two lists of 4 bytes a half, a hash entry
-// and an ordered-map entry).
+// The bound: a change visits exactly the records it concerns - a release or removal the V# halves whose recorded
+// range overlaps it, an addition the waiting ones among them, a texture gone the T#s naming its address, a texture
+// added the waiting ones, room made the records waiting for that room - and looked_at() counts those and nothing
+// else. The groups walked to find them are the overlapping ones plus, per class, those that start less than 2^c
+// before the change and end before it: each costs one comparison, never a slot. Memory: 32 bytes a half (64 a slot,
+// allocated with calloc, so pages of slots never written are never touched), and per distinct range a group (two lists
+// of 4 bytes a record, a hash entry and an ordered-map entry).
 // Portable, standard library only: console_heap_slot_records_test exercises it without a GPU.
 #include <algorithm>
 #include <array>
@@ -42,10 +51,14 @@ namespace leonida {
 // One change since the last submission, as a range; hi is exclusive and greater than lo.
 struct SlotChange {
     enum Kind : std::uint8_t {
-        target_gone,   // device addresses: a backing released, a copy's block destroyed, an alias range's copy gone
-        source_gone,   // V# bases: an alias range removed or replaced, or a copy that answered for it gone
-        target_added,  // device addresses: a backing added (a refused alias target may be backed now)
-        source_added,  // V# bases: an alias range or title memory added, or a backing added at those arena offsets
+        target_gone,    // device addresses: a backing released, a copy's block destroyed, an alias range's copy gone
+        source_gone,    // V# bases: an alias range removed or replaced, or a copy that answered for it gone
+        target_added,   // device addresses: a backing added (a refused alias target may be backed now)
+        source_added,   // V# bases: an alias range or title memory added, or a backing added at those arena offsets
+        texture_gone,   // a T# address (lo; hi = lo + 1): the texture registered there went or was replaced
+        texture_added,  // a T# address: a texture registered or replaced there, or its image published
+        geometry_room,  // geometry copies were freed: halves refused a copy for lack of room may get one (no range)
+        texture_room,   // bindless image entries were freed: T#s refused for a full array may bind (no range)
     };
     Kind kind;
     std::uint64_t lo, hi;
@@ -53,7 +66,21 @@ struct SlotChange {
 
 class ConsoleHeapSlotRecords {
 public:
-    enum State : std::uint8_t { none = 0, resolved = 1, waiting = 2 };
+    // V# halves: resolved, waiting (for a backing over its base or target), waiting_room (and for geometry room).
+    // T#s (the first half): texture_bound, texture_waiting (for a texture at its address), texture_waiting_room (and
+    // for room in its bindless array).
+    enum State : std::uint8_t {
+        none = 0,
+        resolved = 1,
+        waiting = 2,
+        waiting_room = 3,
+        texture_bound = 4,
+        texture_waiting = 5,
+        texture_waiting_room = 6,
+    };
+    static bool is_vsharp(State s) { return s >= resolved && s <= waiting_room; }
+    static bool is_texture(State s) { return s >= texture_bound; }
+    static bool is_waiting(State s) { return s == waiting || s == waiting_room || s >= texture_waiting; }
 
     void reset(std::size_t slots) {
         slots_ = slots;
@@ -61,46 +88,42 @@ public:
         halves_.reset(slots ? static_cast<Half*>(std::calloc(slots * 2, sizeof(Half))) : nullptr);
         if (slots && !halves_) slots_ = 0;
         for (auto& index : indexes_) index = Index{};
+        for (auto& room : room_) room.clear();
         groups_.clear();
         free_groups_.clear();
-        recorded_ = waiting_ = 0;
+        recorded_ = waiting_ = textures_count_ = textures_waiting_ = 0;
         looked_at_ = groups_looked_at_ = 0;
     }
     std::size_t slots() const { return slots_; }
-    std::size_t recorded() const { return recorded_; }      // halves in state resolved or waiting
-    std::size_t waiting_count() const { return waiting_; }  // halves in state waiting
-    std::size_t ranges() const { return groups_.size() - free_groups_.size(); }  // distinct ranges, both indexes
-    std::uint64_t looked_at() const { return looked_at_; }  // halves visited by touched(), all calls
+    std::size_t recorded() const { return recorded_; }      // V# halves resolved or waiting
+    std::size_t waiting_count() const { return waiting_; }  // V# halves waiting (for a backing or room)
+    std::size_t textures() const { return textures_count_; }  // T# records, bound or waiting
+    std::size_t textures_waiting() const { return textures_waiting_; }  // T#s waiting for a texture or room
+    std::size_t ranges() const { return groups_.size() - free_groups_.size(); }  // distinct ranges, all indexes
+    std::uint64_t looked_at() const { return looked_at_; }  // records visited by touched(), all calls
     std::uint64_t ranges_looked_at() const { return groups_looked_at_; }  // groups compared by touched(), all calls
 
     // Half `half` (0: the buffer V#, 1: the UAV counter V#) of `slot` now names [base, base + span) and resolved as
-    // `state` says, its copy at `target` (0: none; see above). span 0 counts as 1.
+    // `state` says (none or a V# state), its copy at `target` (0: none; see above). span 0 counts as 1.
     void set(std::size_t slot, unsigned half, State state, std::uint64_t base, std::uint64_t span,
              std::uint64_t target) {
-        if (slot >= slots_ || half > 1) return;
-        const auto key = std::uint32_t(slot * 2 + half);
-        Half& h = halves_[key];
+        if (slot >= slots_ || half > 1 || is_texture(state)) return;
         if (state == none) {
-            if (h.state != none) {
-                for (int which = 0; which < 2; ++which) detach(which, key);
-                count(State(h.state), -1);
-                h.state = none;
-            }
+            drop(std::uint32_t(slot * 2 + half));
             return;
         }
         if (!span) span = 1;
         const Range ranges[2] = {range(base, span), target ? range(target, span) : Range{}};
-        for (int which = 0; which < 2; ++which) {
-            const std::uint32_t group = h.group[which];
-            const bool keep = group && h.state == state && groups_[group - 1].start == ranges[which].start &&
-                              groups_[group - 1].end == ranges[which].end;
-            if (keep) continue;
-            detach(which, key);
-            if (ranges[which].end) attach(which, key, ranges[which], state);
-        }
-        count(State(h.state), -1);
-        h.state = state;
-        count(state, +1);
+        place(std::uint32_t(slot * 2 + half), state, base, ranges);
+    }
+
+    // The T# of `slot` names `address` (its base) and is bound or waits as `state` (a T# state) says. The slot's
+    // second half is no V# then: its record goes.
+    void set_texture(std::size_t slot, State state, std::uint64_t address) {
+        if (slot >= slots_ || !is_texture(state)) return;
+        drop(std::uint32_t(slot * 2 + 1));
+        const Range ranges[2] = {range(address, 1), Range{}};
+        place(std::uint32_t(slot * 2), state, address, ranges);
     }
 
     void clear(std::size_t slot) {
@@ -111,37 +134,59 @@ public:
         end = (std::min)(end, slots_);
         for (std::size_t slot = first; slot < end; ++slot)
             for (unsigned half = 0; half < 2; ++half)
-                if (halves_[slot * 2 + half].state != none) set(slot, half, none, 0, 0, 0);
+                if (halves_[slot * 2 + half].state != none) drop(std::uint32_t(slot * 2 + half));
     }
 
+    std::uint64_t base(std::size_t slot, unsigned half) const {
+        return slot < slots_ && half < 2 ? halves_[slot * 2 + half].base : 0;
+    }
     State state(std::size_t slot, unsigned half) const {
         return slot < slots_ && half < 2 ? State(halves_[slot * 2 + half].state) : none;
     }
     std::uint64_t target(std::size_t slot, unsigned half) const {
         if (slot >= slots_ || half > 1) return 0;
-        const std::uint32_t group = halves_[slot * 2 + half].group[kTarget];
-        return group ? groups_[group - 1].start : 0;
+        const Half& h = halves_[slot * 2 + half];
+        return is_vsharp(State(h.state)) && h.group[1] ? groups_[h.group[1] - 1].start : 0;
     }
 
     // The slots `changes` touch, each once, ascending, appended to `out` (cleared first):
-    //   target_gone: halves whose [target, target + span) overlaps the range (whatever their state);
-    //   source_gone: halves whose [base, base + span) overlaps it;
-    //   target_added, source_added: the same, waiting halves only (a resolved one stays valid until something goes).
+    //   target_gone: V# halves whose [target, target + span) overlaps the range (whatever their state);
+    //   source_gone: V# halves whose [base, base + span) overlaps it;
+    //   target_added, source_added: the same, waiting halves only (a resolved one stays valid until something goes);
+    //   texture_gone: T#s naming the address lo, bound or waiting; texture_added: those waiting;
+    //   geometry_room: V# halves waiting for room; texture_room: T#s waiting for room (each list once a call).
     void touched(const SlotChange* changes, std::size_t count, std::vector<std::uint32_t>& out) {
         out.clear();
+        bool room[2] = {};
         for (std::size_t i = 0; i < count; ++i) {
             const SlotChange& change = changes[i];
+            switch (change.kind) {
+            case SlotChange::geometry_room: room[0] = true; continue;
+            case SlotChange::texture_room: room[1] = true; continue;
+            case SlotChange::texture_gone:
+            case SlotChange::texture_added:
+                if (change.lo != UINT64_MAX)
+                    find(kTexture, change.lo, change.lo + 1, change.kind == SlotChange::texture_added, out);
+                continue;
+            default: break;
+            }
             if (change.hi <= change.lo) continue;
             const bool target = change.kind == SlotChange::target_gone || change.kind == SlotChange::target_added;
             const bool waiting_only = change.kind == SlotChange::target_added || change.kind == SlotChange::source_added;
             find(target ? kTarget : kSource, change.lo, change.hi, waiting_only, out);
         }
+        for (int which = 0; which < 2; ++which)
+            if (room[which])
+                for (const std::uint32_t key : room_[which]) {
+                    ++looked_at_;
+                    out.push_back(key >> 1);
+                }
         std::sort(out.begin(), out.end());
         out.erase(std::unique(out.begin(), out.end()), out.end());
     }
 
 private:
-    static constexpr int kSource = 0, kTarget = 1;
+    static constexpr int kSource = 0, kTarget = 1, kTexture = 2;
     static constexpr std::uint64_t kMaxSpan = (std::uint64_t(1) << 56) - 1;
     static constexpr unsigned kClasses = 65;
 
@@ -154,10 +199,13 @@ private:
             return std::hash<std::uint64_t>{}(r.start ^ (r.end * 0x9e3779b97f4a7c15ull));
         }
     };
-    // Zero-initialised by calloc: no group (ids are 1-based), state none.
+    // Zero-initialised by calloc: no group (ids are 1-based), state none. A V# half is in the source index (group[0])
+    // and, with a target, the target index (group[1]); a T# in the texture index (group[0]).
     struct Half {
-        std::uint32_t group[2];  // the source and the target group, id + 1, 0: none
-        std::uint32_t place[2];  // the half's place in that group's list for its state
+        std::uint64_t base;      // the V#'s base or the T#'s address, as given
+        std::uint32_t group[2];  // id + 1, 0: none
+        std::uint32_t place[2];  // the record's place in that group's list for its state
+        std::uint32_t room;      // its place in room_ while it waits for room
         std::uint8_t state;
     };
     struct Free {
@@ -166,7 +214,8 @@ private:
     using ByStart = std::multimap<std::uint64_t, std::uint32_t>;  // start -> group id
     struct Group {
         std::uint64_t start = 0, end = 0;
-        std::vector<std::uint32_t> keys[2];  // [0] resolved halves, [1] waiting halves
+        std::vector<std::uint32_t> keys[2];  // [0] settled records (resolved, bound), [1] waiting ones
+        int index = 0;
         unsigned cls = 0;
         ByStart::iterator at{};
     };
@@ -184,14 +233,68 @@ private:
     static unsigned length_class(std::uint64_t length) {
         return length <= 1 ? 0u : unsigned(64 - std::countl_zero(length - 1));
     }
-    static int list_of(State state) { return state == waiting ? 1 : 0; }
+    static int list_of(State state) { return is_waiting(state) ? 1 : 0; }
+    // The index group[n] of a record in `state` is in.
+    static int index_of(State state, int n) { return is_texture(state) ? kTexture : n; }
+    // The room list a record in `state` is in, or -1.
+    static int room_of(State state) { return state == waiting_room ? 0 : state == texture_waiting_room ? 1 : -1; }
 
     void count(State state, int delta) {
-        if (state != none) recorded_ += std::size_t(std::ptrdiff_t(delta));
-        if (state == waiting) waiting_ += std::size_t(std::ptrdiff_t(delta));
+        const std::size_t d = std::size_t(std::ptrdiff_t(delta));
+        if (is_vsharp(state)) recorded_ += d;
+        if (state == waiting || state == waiting_room) waiting_ += d;
+        if (is_texture(state)) textures_count_ += d;
+        if (state == texture_waiting || state == texture_waiting_room) textures_waiting_ += d;
     }
 
-    void attach(int which, std::uint32_t key, Range r, State state) {
+    // Records `key` in `state` under ranges[0] (and ranges[1], a V#'s target); what is unchanged stays where it is.
+    void place(std::uint32_t key, State state, std::uint64_t base, const Range (&ranges)[2]) {
+        Half& h = halves_[key];
+        const State old = State(h.state);
+        for (int n = 0; n < 2; ++n) {
+            const std::uint32_t group = h.group[n];
+            const bool keep = group && list_of(old) == list_of(state) && index_of(old, n) == index_of(state, n) &&
+                              groups_[group - 1].start == ranges[n].start && groups_[group - 1].end == ranges[n].end;
+            if (keep) continue;
+            detach(n, key);  // in the list of the old state, which h.state still holds
+            if (ranges[n].end) attach(n, index_of(state, n), key, ranges[n], state);
+        }
+        if (room_of(old) != room_of(state)) {
+            leave_room(key);
+            if (room_of(state) >= 0) {
+                auto& room = room_[room_of(state)];
+                h.room = std::uint32_t(room.size());
+                room.push_back(key);
+            }
+        }
+        count(old, -1);
+        h.state = state;
+        h.base = base;
+        count(state, +1);
+    }
+
+    void drop(std::uint32_t key) {
+        Half& h = halves_[key];
+        if (h.state == none) return;
+        for (int n = 0; n < 2; ++n) detach(n, key);
+        leave_room(key);
+        count(State(h.state), -1);
+        h.state = none;
+        h.base = 0;
+    }
+
+    void leave_room(std::uint32_t key) {
+        Half& h = halves_[key];
+        const int which = room_of(State(h.state));
+        if (which < 0) return;
+        auto& room = room_[which];
+        const std::uint32_t last = room.back();
+        room[h.room] = last;
+        halves_[last].room = h.room;
+        room.pop_back();
+    }
+
+    void attach(int n, int which, std::uint32_t key, Range r, State state) {
         Index& index = indexes_[which];
         auto [it, made] = index.by_range.try_emplace(r, 0);
         if (made) {
@@ -206,6 +309,7 @@ private:
             Group& g = groups_[id];
             g.start = r.start;
             g.end = r.end;
+            g.index = which;
             g.cls = length_class(r.end - r.start);
             g.at = index.by_start[g.cls].emplace(r.start, id);
             index.used[g.cls >> 6] |= std::uint64_t(1) << (g.cls & 63);
@@ -214,24 +318,25 @@ private:
         Group& g = groups_[it->second];
         auto& list = g.keys[list_of(state)];
         Half& h = halves_[key];
-        h.group[which] = it->second + 1;
-        h.place[which] = std::uint32_t(list.size());
+        h.group[n] = it->second + 1;
+        h.place[n] = std::uint32_t(list.size());
         list.push_back(key);
     }
 
-    void detach(int which, std::uint32_t key) {
+    // Takes `key` out of its group[n], from the list of its current state.
+    void detach(int n, std::uint32_t key) {
         Half& h = halves_[key];
-        if (!h.group[which]) return;
-        const std::uint32_t id = h.group[which] - 1;
+        if (!h.group[n]) return;
+        const std::uint32_t id = h.group[n] - 1;
         Group& g = groups_[id];
         auto& list = g.keys[list_of(State(h.state))];
-        const std::uint32_t place = h.place[which], last = list.back();
-        list[place] = last;
-        halves_[last].place[which] = place;
+        const std::uint32_t at = h.place[n], last = list.back();
+        list[at] = last;
+        halves_[last].place[n] = at;
         list.pop_back();
-        h.group[which] = 0;
+        h.group[n] = 0;
         if (!g.keys[0].empty() || !g.keys[1].empty()) return;
-        Index& index = indexes_[which];
+        Index& index = indexes_[g.index];
         index.by_range.erase(Range{g.start, g.end});
         index.by_start[g.cls].erase(g.at);
         if (index.by_start[g.cls].empty()) index.used[g.cls >> 6] &= ~(std::uint64_t(1) << (g.cls & 63));
@@ -263,10 +368,11 @@ private:
 
     std::size_t slots_ = 0;
     std::unique_ptr<Half[], Free> halves_;
-    std::array<Index, 2> indexes_;
+    std::array<Index, 3> indexes_;
+    std::array<std::vector<std::uint32_t>, 2> room_;  // 0: V# halves in waiting_room, 1: T#s in texture_waiting_room
     std::vector<Group> groups_;
     std::vector<std::uint32_t> free_groups_;
-    std::size_t recorded_ = 0, waiting_ = 0;
+    std::size_t recorded_ = 0, waiting_ = 0, textures_count_ = 0, textures_waiting_ = 0;
     std::uint64_t looked_at_ = 0, groups_looked_at_ = 0;
 };
 
