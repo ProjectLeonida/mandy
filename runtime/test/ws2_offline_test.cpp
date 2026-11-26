@@ -356,6 +356,99 @@ int main() {
         closesocket(recv_sock);
     }
 
+    // 5b. connect and WSAConnect to an all-zero address dissolve a datagram socket's association (connect's remarks;
+    // Windows 11 does it for 0.0.0.0:0, [::]:0 and AF_UNSPEC). Nothing is sent, so the shim passes them to the host.
+    {
+        const auto loop_udp = [&](sockaddr_in& bound) {
+            const SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            const sockaddr_in loop = make_v4(127, 0, 0, 1, 0);
+            int len = sizeof(bound);
+            const DWORD timeout_ms = 2000;
+            if (sh_bind(s, reinterpret_cast<const sockaddr*>(&loop), sizeof(loop)) != 0 ||
+                getsockname(s, reinterpret_cast<sockaddr*>(&bound), &len) != 0 ||
+                setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms))) {
+                bound = sockaddr_in{};
+            }
+            return s;
+        };
+        const auto not_connected = [](SOCKET s) {
+            sockaddr_storage peer{};
+            int peer_len = sizeof(peer);
+            return getpeername(s, reinterpret_cast<sockaddr*>(&peer), &peer_len) == SOCKET_ERROR &&
+                   WSAGetLastError() == WSAENOTCONN;
+        };
+        sockaddr_in addr_a{}, addr_b{}, addr_s{};
+        const SOCKET a = loop_udp(addr_a);
+        const SOCKET b = loop_udp(addr_b);
+        const SOCKET s = loop_udp(addr_s);
+        check(addr_a.sin_port && addr_b.sin_port && addr_s.sin_port, "three loopback UDP sockets are bound");
+        const auto* to_a = reinterpret_cast<const sockaddr*>(&addr_a);
+        const sockaddr_in zero4 = make_v4(0, 0, 0, 0, 0);
+        const auto* zero = reinterpret_cast<const sockaddr*>(&zero4);
+
+        check(sh_connect(s, to_a, sizeof(addr_a)) == 0 && !not_connected(s), "connect associates the socket with A");
+        check(sh_connect(s, zero, sizeof(zero4)) == 0, "connect to 0.0.0.0:0 succeeds on a connected UDP socket");
+        check(not_connected(s), "after it getpeername fails with WSAENOTCONN");
+        check(send(s, "x", 1, 0) == SOCKET_ERROR && WSAGetLastError() == WSAENOTCONN,
+              "after it send fails with WSAENOTCONN");
+        char got[8] = {};
+        check(sh_sendto(b, "b", 1, 0, reinterpret_cast<const sockaddr*>(&addr_s), sizeof(addr_s)) == 1 &&
+                  recv(s, got, sizeof(got), 0) == 1 && got[0] == 'b',
+              "after it a datagram from B arrives (a connected socket takes only its peer's)");
+
+        check(sh_wsa_connect(s, to_a, sizeof(addr_a), nullptr, nullptr, nullptr, nullptr) == 0 &&
+                  sh_wsa_connect(s, zero, sizeof(zero4), nullptr, nullptr, nullptr, nullptr) == 0 && not_connected(s),
+              "WSAConnect to 0.0.0.0:0 dissolves the association too");
+
+        sockaddr_in unspec{};
+        unspec.sin_family = AF_UNSPEC;
+        check(sh_connect(s, to_a, sizeof(addr_a)) == 0 &&
+                  sh_connect(s, reinterpret_cast<const sockaddr*>(&unspec), sizeof(unspec)) == 0 && not_connected(s),
+              "connect to an AF_UNSPEC address dissolves the association");
+
+        // Only the disconnect forms pass: the unspecified address with a port stays refused before the host.
+        const sockaddr_in zero_port = make_v4(0, 0, 0, 0, 4321);
+        WSASetLastError(0);
+        check(sh_connect(s, to_a, sizeof(addr_a)) == 0 &&
+                  sh_connect(s, reinterpret_cast<const sockaddr*>(&zero_port), sizeof(zero_port)) == SOCKET_ERROR &&
+                  WSAGetLastError() == WSAENETUNREACH && !not_connected(s),
+              "connect still refuses 0.0.0.0:4321 with WSAENETUNREACH and keeps the association");
+
+        // A TCP socket has no association to dissolve: the host refuses both forms.
+        const SOCKET tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        WSASetLastError(0);
+        check(sh_connect(tcp, zero, sizeof(zero4)) == SOCKET_ERROR && WSAGetLastError() == WSAEADDRNOTAVAIL,
+              "connect to 0.0.0.0:0 on a TCP socket fails with the host's WSAEADDRNOTAVAIL");
+        WSASetLastError(0);
+        check(sh_connect(tcp, reinterpret_cast<const sockaddr*>(&unspec), sizeof(unspec)) == SOCKET_ERROR &&
+                  WSAGetLastError() == WSAEAFNOSUPPORT,
+              "connect to AF_UNSPEC on a TCP socket fails with the host's WSAEAFNOSUPPORT");
+        closesocket(tcp);
+
+        const SOCKET s6 = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+        const SOCKET a6 = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+        if (s6 != INVALID_SOCKET && a6 != INVALID_SOCKET) {
+            sockaddr_in6 loop6{};
+            loop6.sin6_family = AF_INET6;
+            reinterpret_cast<uint8_t*>(&loop6.sin6_addr)[15] = 1;  // ::1
+            sockaddr_in6 addr_a6{};
+            int len6 = sizeof(addr_a6);
+            const bool bound6 = sh_bind(s6, reinterpret_cast<const sockaddr*>(&loop6), sizeof(loop6)) == 0 &&
+                                sh_bind(a6, reinterpret_cast<const sockaddr*>(&loop6), sizeof(loop6)) == 0 &&
+                                getsockname(a6, reinterpret_cast<sockaddr*>(&addr_a6), &len6) == 0;
+            sockaddr_in6 zero6{};
+            zero6.sin6_family = AF_INET6;
+            check(bound6 && sh_connect(s6, reinterpret_cast<const sockaddr*>(&addr_a6), sizeof(addr_a6)) == 0 &&
+                      sh_connect(s6, reinterpret_cast<const sockaddr*>(&zero6), sizeof(zero6)) == 0 && not_connected(s6),
+                  "connect to [::]:0 dissolves an IPv6 UDP socket's association");
+        }
+        if (a6 != INVALID_SOCKET) closesocket(a6);
+        if (s6 != INVALID_SOCKET) closesocket(s6);
+        closesocket(s);
+        closesocket(b);
+        closesocket(a);
+    }
+
     // 6. Name-service queries are refused with WSASERVICE_NOT_FOUND.
     {
         const auto sh_lookup_w = resolve<LookupBeginWFn>("WSALookupServiceBeginW");
