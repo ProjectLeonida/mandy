@@ -248,14 +248,18 @@ inline constexpr std::uint32_t f16_half_top_location(std::uint32_t max_vertex_ou
 //
 // Returns true on success (including the no-op fast path when no patching is needed). On failure returns false and
 // writes a concise reason to `*error` if non-null; the caller's word vectors are only replaced on success.
+// `raw_vs_locations`, when non-null, receives on success the Locations of the VS's raw outputs as they were before
+// linking (every located Output but its own static halves): a decoded half may take a Location no raw output
+// used, and the --bary-fallback geometry stage must not read it as that attribute (spirv_bary_fallback.h).
 inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEntry& vs_entry,
                             std::vector<std::uint32_t>& ps_words, const ShaderEntry& ps_entry,
-                            std::string* error = nullptr, std::uint32_t top_location = 29) {
+                            std::string* error = nullptr, std::uint32_t top_location = 29,
+                            std::set<std::uint32_t>* raw_vs_locations = nullptr) {
     const auto fail = [&](const std::string& msg) {
         if (error) *error = msg;
         return false;
     };
-    if (ps_entry.f16_halves.empty() && vs_entry.f16_halves.empty()) return true;
+    if (ps_entry.f16_halves.empty() && vs_entry.f16_halves.empty() && !raw_vs_locations) return true;
 
     using namespace spirv_detail;
     Module vs_mod, ps_mod;
@@ -289,6 +293,11 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
     for (const auto& [loc, var_id] : ps_inputs) {
         if (!ps_static_half_locs.count(loc)) ps_raw_locs.insert(loc);
     }
+    // A computed-I/J input (--bary-fallback `per_vertex`) is a vec4[3] with one Location decoration that takes three
+    // Locations: a half placed on the second or third would overlap it.
+    for (const auto& [attr, base] : ps_entry.bary_fallback_per_vertex) {
+        if (base <= UINT32_MAX - 2u && ps_inputs.count(base)) ps_raw_locs.insert({base, base + 1u, base + 2u});
+    }
 
     // Fast path: every PS half pair is already exported at the exact same locations by VS, all static halves fit
     // within 0..top_location, and no unused VS static half collides with a raw PS input.
@@ -313,7 +322,10 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
             if (!already_linked) break;
         }
     }
-    if (already_linked) return true;
+    if (already_linked) {
+        if (raw_vs_locations) *raw_vs_locations = vs_raw_locs;
+        return true;
+    }
 
     // Choose paired [lo, hi] locations for every param in ps_entry.f16_halves.
     // Keep PS's existing locations unchanged whenever none collides with VS/PS raw outputs/inputs or exceeds top_location.
@@ -654,6 +666,7 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
     vs_mod.insts = std::move(out_insts);
     vs_words = vs_mod.serialize();
     if (ps_changed) ps_words = ps_mod.serialize();
+    if (raw_vs_locations) *raw_vs_locations = std::move(vs_raw_locs);
     return true;
 }
 

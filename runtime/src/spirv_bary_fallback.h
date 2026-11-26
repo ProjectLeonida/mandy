@@ -44,13 +44,17 @@ struct BaryFallbackGsInfo {
 
 // `per_vertex` is the index entry's `bary_fallback_input.per_vertex` (`ShaderEntry::bary_fallback_per_vertex`):
 // attribute (VS output location) -> first of the three PS input locations of its `Flat vec4<f32>[3]`.
+// `raw_vs_locations`: when the VS went through link_f16_halves, the Locations of its raw outputs before linking
+// (link_f16_halves' `raw_vs_locations`). A computed-I/J attribute is forwarded only from one of them; a decoded half
+// that linking put on an attribute's Location the VS did not export leaves that attribute zero-filled.
 inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
                                    std::span<const std::uint32_t> ps_words,
                                    std::uint32_t bary_location,
                                    const std::map<std::uint32_t, std::uint32_t>& per_vertex,
                                    std::vector<std::uint32_t>& gs_words,
                                    BaryFallbackGsInfo* out_info = nullptr,
-                                   std::string* error = nullptr) {
+                                   std::string* error = nullptr,
+                                   const std::set<std::uint32_t>* raw_vs_locations = nullptr) {
     const auto fail = [&](const std::string& msg) {
         if (error) *error = msg;
         return false;
@@ -284,7 +288,8 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
             }
         }
         PerVertex pv{attr, base, false};
-        if (const auto vs_it = vs_out_loc_pointee.find(attr); vs_it != vs_out_loc_pointee.end()) {
+        if (const auto vs_it = vs_out_loc_pointee.find(attr);
+            vs_it != vs_out_loc_pointee.end() && (!raw_vs_locations || raw_vs_locations->count(attr))) {
             if (!vs_v4float_tys.count(vs_it->second))
                 return fail("bary_fallback: VS Output at Location " + std::to_string(attr) + " is not vec4<f32>");
             pv.forwarded = true;

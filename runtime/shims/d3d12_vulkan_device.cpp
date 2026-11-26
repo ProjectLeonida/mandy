@@ -11018,11 +11018,12 @@ public:
         if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && gs_stage.entry) {
             log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
         }
+        std::set<std::uint32_t> raw_vs_locations;  // the VS's raw outputs before f16 linking, for the bary GS
         if (vs_stage.entry && ps_stage.entry && !gs_stage.entry &&
             (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty())) {
             std::string link_error;
             if (!link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
-                                 &link_error, bary_fallback)) {
+                                 &link_error, bary_fallback, &raw_vs_locations)) {
                 std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
                 return E_FAIL;
             }
@@ -11124,7 +11125,7 @@ public:
             if (!leonida::build_bary_fallback_gs(vs_stage.words, ps_stage.words,
                                                  *ps_stage.entry->bary_fallback_location,
                                                  ps_stage.entry->bary_fallback_per_vertex, words, &bary_info,
-                                                 &bary_error)) {
+                                                 &bary_error, f16_linked_ ? &raw_vs_locations : nullptr)) {
                 std::fprintf(stderr, "[rt] d3d12: %s\n", bary_error.c_str());
                 return E_FAIL;
             }
@@ -12172,10 +12173,11 @@ private:
 
     bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const leonida::ShaderEntry& vs_entry,
                          std::vector<std::uint32_t>& ps_words, const leonida::ShaderEntry& ps_entry,
-                         std::string* error, bool bary_fallback = false) const {
+                         std::string* error, bool bary_fallback = false,
+                         std::set<std::uint32_t>* raw_vs_locations = nullptr) const {
         const std::uint32_t top_loc =
             bary_fallback ? device_.bary_f16_half_top_location : device_.f16_half_top_location;
-        return leonida::link_f16_halves(vs_words, vs_entry, ps_words, ps_entry, error, top_loc);
+        return leonida::link_f16_halves(vs_words, vs_entry, ps_words, ps_entry, error, top_loc, raw_vs_locations);
     }
 
 public:
@@ -12206,10 +12208,11 @@ public:
             if (source.slot == 0) vs = i;
             if (source.slot == 2) ps = i;
         }
+        std::set<std::uint32_t> raw_vs_locations;  // as in create_graphics: the VS's raw outputs before f16 linking
         if (f16_linked_) {
             if (vs == SIZE_MAX || ps == SIZE_MAX ||
                 !link_f16_halves(words[vs], *sources_[vs].entry, words[ps], *sources_[ps].entry, &why,
-                                 bary_fallback_))
+                                 bary_fallback_, &raw_vs_locations))
                 return false;
         }
         for (std::size_t i = 0; i < sources_.size(); ++i) {
@@ -12227,7 +12230,7 @@ public:
                     !leonida::build_bary_fallback_gs(words[vs], words[ps],
                                                      *sources_[ps].entry->bary_fallback_location,
                                                      sources_[ps].entry->bary_fallback_per_vertex, words[i], nullptr,
-                                                     &why))
+                                                     &why, f16_linked_ ? &raw_vs_locations : nullptr))
                     return false;
             } else if (sources_[i].kind == StageSource::depth_only) {
                 words[i] = leonida::depth24_depth_only_fragment(depth24_bias_);

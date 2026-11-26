@@ -6,7 +6,8 @@
 //   5. Combined link_f16_halves + build_bary_fallback_gs: f16 relocation preserves bary_location and forwards relocated halves.
 //   6. Clean refusals: mixed ClipDistance + CullDistance, ShaderLayer / ShaderViewportIndex, non-vec3 collision at bary_location.
 //   7. Computed I/J pairs (RT-BARY-FALLBACK-PER-VERTEX): a PS `Flat vec4[3]` Input named by `per_vertex` gets the
-//      triangle's three values of the VS output it maps, with shared GS Inputs, zero-fill and clean refusals.
+//      triangle's three values of the VS output it maps, with shared GS Inputs, zero-fill and clean refusals; after
+//      f16 linking, only from the VS's raw outputs, and with the block's three Locations kept free of halves.
 // Optional `--dump-dir <dir>` writes each synthesized GS binary for external `spirv-val` inspection.
 // No GPU or game files required.
 #include "../src/spirv_bary_fallback.h"
@@ -603,6 +604,76 @@ int main(int argc, char** argv) {
         CHECK((ins.out_pv_locs == std::set<std::uint32_t>{1, 4}));
         CHECK(ins.out_pv_stores == 9 && ins.out_pv_null_stores == 3);
         maybe_dump(dump_dir, "gs_per_vertex_zero_fill", gs);
+    }
+
+    // 7f. With --f16-interp-fallback linking first (as create_graphics does): the VS exports attributes 0 and 27, not
+    //     29. The PS halves at 27/28 collide with VS raw 27, so linking moves them to 29/28, and the VS now has an
+    //     output at Location 29. The computed-I/J array of attribute 29 must stay zero-filled. (Reported by
+    //     @marcelofrayha with a GPU draw that read 0.5 instead of 0.)
+    {
+        ShaderEntry vs_e, ps_e;
+        ps_e.bary_fallback_location = 3;
+        ps_e.bary_fallback_per_vertex = {{29, 0}};
+        ps_e.f16_halves = {{0, {27, 28}}};
+        auto vs = build_vs({.raw_locs = {0, 27}});
+        auto ps = build_ps({}, {}, 3, ps_e.f16_halves, {0});
+        std::set<std::uint32_t> raw;
+        std::string err;
+        CHECK(link_f16_halves(vs, vs_e, ps, ps_e, &err, 29, &raw));
+        CHECK((raw == std::set<std::uint32_t>{0, 27}));
+        std::vector<std::uint32_t> with_raw, without_raw;
+        CHECK(build_bary_fallback_gs(vs, ps, 3, ps_e.bary_fallback_per_vertex, with_raw, nullptr, &err, &raw));
+        GsInspection ins;
+        CHECK(verify_gs_module(with_raw, ins));
+        CHECK((ins.out_pv_locs == std::set<std::uint32_t>{0}));
+        CHECK(ins.out_pv_stores == 0 && ins.out_pv_null_stores == 3);
+        // Without the raw set the decoded half at 29 is what would be forwarded: the case this guards.
+        CHECK(build_bary_fallback_gs(vs, ps, 3, ps_e.bary_fallback_per_vertex, without_raw, nullptr, &err));
+        GsInspection old;
+        CHECK(verify_gs_module(without_raw, old) && old.out_pv_stores == 9 && old.out_pv_null_stores == 0);
+        maybe_dump(dump_dir, "gs_per_vertex_f16_missing_raw", with_raw);
+    }
+
+    // 7g. The same for a static VS half that linking leaves in place (its fast path): VS halves at 28/29, PS has none.
+    {
+        ShaderEntry vs_e, ps_e;
+        vs_e.f16_halves = {{0, {28, 29}}};
+        ps_e.bary_fallback_location = 3;
+        ps_e.bary_fallback_per_vertex = {{29, 0}};
+        auto vs = build_vs({.raw_locs = {0}, .static_halves = vs_e.f16_halves});
+        const auto vs_before = vs;
+        auto ps = build_ps({}, {}, 3, {}, {0});
+        std::set<std::uint32_t> raw;
+        std::string err;
+        CHECK(link_f16_halves(vs, vs_e, ps, ps_e, &err, 29, &raw));
+        CHECK(vs == vs_before && (raw == std::set<std::uint32_t>{0}));
+        std::vector<std::uint32_t> gs;
+        CHECK(build_bary_fallback_gs(vs, ps, 3, ps_e.bary_fallback_per_vertex, gs, nullptr, &err, &raw));
+        GsInspection ins;
+        CHECK(verify_gs_module(gs, ins));
+        CHECK(ins.in_locs.empty() && ins.out_pv_stores == 0 && ins.out_pv_null_stores == 3);
+        maybe_dump(dump_dir, "gs_per_vertex_f16_static_half", gs);
+    }
+
+    // 7h. Linking keeps a relocated PS half off all three Locations of a computed-I/J block, not only its first:
+    //     block 25..27, PS halves at 28/29 colliding with VS raw 28, so 27 must not be chosen.
+    {
+        ShaderEntry vs_e, ps_e;
+        ps_e.bary_fallback_location = 3;
+        ps_e.bary_fallback_per_vertex = {{5, 25}};
+        ps_e.f16_halves = {{0, {28, 29}}};
+        auto vs = build_vs({.raw_locs = {5, 28}});
+        auto ps = build_ps({}, {}, 3, ps_e.f16_halves, {25});
+        std::set<std::uint32_t> raw;
+        std::string err;
+        CHECK(link_f16_halves(vs, vs_e, ps, ps_e, &err, 29, &raw));
+        std::vector<std::uint32_t> gs;
+        CHECK(build_bary_fallback_gs(vs, ps, 3, ps_e.bary_fallback_per_vertex, gs, nullptr, &err, &raw));
+        GsInspection ins;
+        CHECK(verify_gs_module(gs, ins));
+        CHECK((ins.out_pv_locs == std::set<std::uint32_t>{25}) && ins.out_pv_stores == 9);
+        CHECK(!ins.in_locs.count(26) && !ins.in_locs.count(27));
+        maybe_dump(dump_dir, "gs_per_vertex_f16_block_reserved", gs);
     }
 
     // 7d. A mapping the PS does not declare is ignored: the module is the one built without it.
