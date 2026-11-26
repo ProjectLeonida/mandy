@@ -5,11 +5,12 @@ Supports legacy and DX10 DDS headers across uncompressed 32-bit formats
 legacy 24-bit RGB layouts (BGR8/RGB8, e.g. the D3DFMT_R8G8B8 byte order), the DX10 16-bit packed
 B5G6R5_UNORM and B5G5R5A1_UNORM (5- and 6-bit channels widened by bit replication, as for BC1 endpoints),
 the DX10 8-bit R8 and R8G8 formats (UNORM, SNORM, UINT, SINT), the 64-bit R16G16B16A16 UNORM, SNORM and
-FLOAT formats, and block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
+FLOAT formats, and block-compressed formats (BC1 to BC7).
 
 BC7 covers all eight modes. Decoding DXGI 97/98/99 (typeless, UNORM, UNORM_SRGB)
 preserves the stored RGBA8 values. The reserved mode (no mode bit in the first
-byte) decodes as transparent black. BC6H is not supported.
+byte) decodes as transparent black. Signed and unsigned BC6H use linear RGB clamped to
+the preview range [0, 1] and opaque alpha. Typeless BC6H requires a signedness choice.
 DXT2, DXT4 and premultiplied DX10 images are converted to straight alpha for PNG.
 For tagged sRGB images, unpremultiplication and downscaling use linear light. The PNG stores sRGB bytes.
 
@@ -126,6 +127,8 @@ _DXGI_MAP: dict[int, str] = {
     82: "BC5",
     83: "BC5",
     84: "BC5_SNORM",
+    95: "BC6H_UF16",
+    96: "BC6H_SF16",
     97: "BC7",
     98: "BC7",
     99: "BC7",
@@ -201,7 +204,7 @@ _BC7_UNQUANTIZE = {
 # Output byte for interpolated R, G, B, A under rotation 0-3 (A swaps with R, G or B).
 _BC7_ROTATIONS = ((0, 1, 2, 3), (3, 1, 2, 0), (0, 3, 2, 1), (0, 1, 3, 2))
 _BC7_RESERVED_BLOCK = bytes(64)
-_BC7_BLOCK_CACHE_LIMIT = 4096
+_BPTC_BLOCK_CACHE_LIMIT = 4096
 
 
 def _bc7_partition_layouts() -> tuple:
@@ -1364,18 +1367,19 @@ def _decode_bc7_block(block: int) -> bytes:
     return bytes(out)
 
 
-def _decode_bc7(data: bytes | bytearray | memoryview, offset: int, width: int, height: int) -> bytes:
+def _decode_bptc(data: memoryview, width: int, height: int, fmt: str) -> bytes:
     blocks_x = (width + 3) // 4
     blocks_y = (height + 3) // 4
     expected = blocks_x * blocks_y * 16
-    if len(data) - offset < expected:
-        raise DdsError(f"Truncated BC7 payload: {len(data) - offset} bytes (need {expected})")
+    if len(data) < expected:
+        raise DdsError(f"Truncated {fmt} payload: {len(data)} bytes (need {expected})")
+    if fmt != "BC7":
+        from ttpf_mips import decode_bc6h_block
 
     out = bytearray(width * height * 4)
     row_stride = width * 4
     cache: dict[bytes, bytes] = {}
-    from_bytes = int.from_bytes
-    pos = offset
+    pos = 0
 
     for by in range(blocks_y):
         py0 = by * 4
@@ -1389,8 +1393,15 @@ def _decode_bc7(data: bytes | bytearray | memoryview, offset: int, width: int, h
             pos += 16
             block_rgba = cache.get(key)
             if block_rgba is None:
-                block_rgba = _decode_bc7_block(from_bytes(key, "little"))
-                if len(cache) < _BC7_BLOCK_CACHE_LIMIT:
+                if fmt == "BC7":
+                    block_rgba = _decode_bc7_block(int.from_bytes(key, "little"))
+                else:
+                    pixels = decode_bc6h_block(key, 0, signed=fmt == "BC6H_SF16")
+                    block = bytearray([0, 0, 0, 255] * 16)
+                    for i, rgb in enumerate(pixels):
+                        block[i * 4:i * 4 + 3] = bytes(int(min(1.0, max(0.0, v)) * 255 + 0.5) for v in rgb)
+                    block_rgba = bytes(block)
+                if len(cache) < _BPTC_BLOCK_CACHE_LIMIT:
                     cache[key] = block_rgba
 
             px0 = bx * 4
@@ -1469,8 +1480,8 @@ def _decode_plane(data: bytes | bytearray | memoryview, plane: _Plane, info: _Dd
         rgba = _decode_r9g9b9e5(payload, width, height, pitch)
     elif fmt in ("R8_UNORM", "R8G8_UNORM", "R8_SNORM", "R8_UINT", "R8_SINT", "R16_UNORM", "R32_FLOAT", "A8_UNORM"):
         rgba = _decode_channels(payload, width, height, pitch, fmt)
-    elif fmt == "BC7":
-        rgba = _decode_bc7(payload, 0, width, height)
+    elif fmt in ("BC7", "BC6H_UF16", "BC6H_SF16"):
+        rgba = _decode_bptc(payload, width, height, fmt)
     else:
         raise DdsError(f"Unsupported DDS format: {fmt}")
 
