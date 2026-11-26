@@ -826,8 +826,9 @@ private:
             std::copy(std::begin(moved), std::end(moved), std::begin(last_moved_));
         }
         std::fprintf(stderr,
-                     "[rt] d3d12_xs: list values so far: %llu writes recorded, %llu submitted, %llu landed, %llu "
-                     "failed; %llu waits recorded, %llu met at submission, %llu relayed; %llu gates held, %llu met, "
+                     "[rt] d3d12_xs: list values so far: %llu writes recorded (once per recording), %llu submitted "
+                     "(once per execution: recorded but never submitted is a list the title did not execute), %llu "
+                     "landed, %llu failed; %llu waits recorded, %llu met at submission, %llu relayed; %llu gates held, %llu met, "
                      "%llu timed out "
                      "(%llu short, %llu demotions, %llu met late); %llu cuts (%llu deferred to a query's end, %llu "
                      "failed), %llu on bundles; releaser %llu signals, %.1f ms, longest %.2f ms, %llu stalls; longest pump pass "
