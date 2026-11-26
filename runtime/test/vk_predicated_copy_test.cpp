@@ -35,7 +35,7 @@ int main() {
     d.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(d.physical,&properties);
     auto limits=properties.limits;
     // Smaller advertised limits force both dispatch and descriptor-window splits on ordinary GPUs.
-    limits.maxStorageBufferRange=static_cast<std::uint32_t>(std::max<VkDeviceSize>(256,limits.minStorageBufferOffsetAlignment));
+    limits.maxStorageBufferRange=static_cast<std::uint32_t>(std::max<VkDeviceSize>(64,limits.minStorageBufferOffsetAlignment)+3);
     limits.maxComputeWorkGroupCount[0]=1;
     VulkanContext context(d.device_proc,d.device,true,true);
     context.set_occlusion_resolve_memory(memory);
@@ -57,6 +57,10 @@ int main() {
     ResourceBinding b{};b.buffer=dst;b.buffer_offset=3;b.size=bytes-3;b.host_readable=true;
     ResourceBinding p{};p.buffer=pred;p.size=16;
     context.add_resource(1,a);context.add_resource(2,b);context.add_resource(3,p);
+    ResourceBinding clear_binding = b;
+    clear_binding.buffer_offset = 4;
+    clear_binding.size = bytes - 4;
+    context.add_resource(6, clear_binding);
     // D3D-162: capture/rebind and executing/suppressed copy dispatches inside one empty statistics query.
     VkQueryPool statistics = VK_NULL_HANDLE;
     void* statistics_data = nullptr;
@@ -75,7 +79,11 @@ int main() {
     EXPECT(list.set_predication({3,0,d3d12_predication::equal_zero}));
     EXPECT(list.copy_buffer({2,4,1,2,4096}));  // high-word-only condition; offsets include arena prefixes
     EXPECT(list.copy_buffer({2,6000,2,4,33})); // dependent, non-overlapping copy within one VkBuffer
+    const UavView clear{6, true, VK_FORMAT_R32G32B32A32_UINT, 7200, 160, 16, 0, 0, 0};
+    const std::array<std::uint32_t, 4> pattern{0x10203040, 0x50607080, 0x90a0b0c0, 0xd0e0f001};
+    EXPECT(list.clear_unordered_access(clear, false, pattern));
     EXPECT(list.set_predication({3,8,d3d12_predication::equal_zero}));
+    EXPECT(list.clear_unordered_access(clear, false, {}));
     EXPECT(list.copy_buffer({2,0,1,0,3}));    // suppressed: preserves destination prefix exactly
     EXPECT(list.set_predication({3,0,d3d12_predication::not_equal_zero}));
     EXPECT(list.copy_buffer({2,7000,1,0,37}));// suppressed: high word must not be truncated
@@ -89,6 +97,9 @@ int main() {
     std::memcpy(expected.data()+7,input.data()+3,4096);
     std::memcpy(expected.data()+6003,expected.data()+7,33);
     std::memcpy(expected.data()+5003,input.data()+1,17);
+    for (unsigned i = 0; i < clear.size; ++i)
+        expected[clear_binding.buffer_offset + clear.offset + i] =
+            static_cast<unsigned char>(pattern[(i / 4) % 4] >> (8 * (i % 4)));
     const CommandList* pointer=&list;
     // A device without the helper must submit nothing, rather than run a transfer unconditionally.
     EXPECT(queue.execute({&pointer,1})==ReplayResult::unsupported);

@@ -4175,12 +4175,17 @@ Not implemented yet:
   The embedded shader is generated from `predicated_copy.comp`
   with glslang 16.6.0 (`-V --target-env vulkan1.2 -Os`) and validated for Vulkan 1.2.
 
+  Buffer `ClearUnorderedAccessViewUint` and `ClearUnorderedAccessViewFloat` under a predicate use the same
+  compute path. Each dispatch repeats the encoded UAV element across the validated byte range, preserving
+  its position across descriptor windows. It uses the same capability gate and query segmentation as predicated
+  buffer copies.
+
   Open:
   - Texture copies, `CopyResource` and resolves. Vulkan's conditional rendering does not cover transfer
     commands, so these still run unconditionally and `PreparedList::unpredicated_copies` counts them.
 
   - Draws, dispatches and `ExecuteIndirect` are covered by conditional rendering as soon as they are replayed
-    (D3D-3, D3D-4, D3D-17); `ClearUnorderedAccessView*` and `ResolveSubresource` need the same check when added.
+    (D3D-3, D3D-4, D3D-17). Image UAV clears that use transfer commands still need a conditional path.
 
 ### 4.8 Ray tracing and XDXR
 
