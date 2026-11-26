@@ -10,7 +10,8 @@
 //     and kernelbase.dll;
 //   - CreateWindowExW / CreateWindowExA on user32.dll and ext-ms-win-rtcore-ntuser-window-* (CreateWindowExA also on
 //     the -ansi- set), fitting the title's first top-level window into the primary monitor work area and
-//     subclassing it so SC_CLOSE runs registered suspend callbacks before the run ends.
+//     subclassing it, in the window's own character set, so SC_CLOSE runs registered suspend callbacks before the run
+//     ends.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -116,6 +117,8 @@ void trigger_suspend_and_exit() {
     }).detach();
 }
 
+// One procedure per character set, so the hook keeps the window's own (see install_window_hook).
+template <bool Unicode>
 LRESULT CALLBACK lifecycle_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == WM_SYSCOMMAND && (wparam & 0xFFF0u) == SC_CLOSE) {
         trigger_suspend_and_exit();
@@ -128,16 +131,32 @@ LRESULT CALLBACK lifecycle_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         g_title_window.compare_exchange_strong(expected, nullptr);  // a later main window may be claimed
     }
     auto original = reinterpret_cast<WNDPROC>(prop);
-    if (!original) return DefWindowProcW(hwnd, message, wparam, lparam);
-    return CallWindowProcW(original, hwnd, message, wparam, lparam);
+    if constexpr (Unicode) {
+        if (!original) return DefWindowProcW(hwnd, message, wparam, lparam);
+        return CallWindowProcW(original, hwnd, message, wparam, lparam);
+    } else {
+        if (!original) return DefWindowProcA(hwnd, message, wparam, lparam);
+        return CallWindowProcA(original, hwnd, message, wparam, lparam);
+    }
 }
 
+// Subclasses with the window's own character set. Setting a W procedure on an ANSI window (the retail title creates
+// its window with CreateWindowExA) makes it a Unicode window: IsWindowUnicode turns TRUE, and every text message the
+// title posts and dispatches with the A functions is converted to Unicode for the hook and back for the title's
+// procedure. Under a UTF-8 code page that round trip breaks WM_CHAR's bytes: an "e" with an acute accent posted as
+// C3 A9 reached the title's procedure as 83 C3 A9 C2 (measured on Windows 11), while an A procedure passes it as is.
 void install_window_hook(HWND hwnd) {
     if (!hwnd) return;
-    const LONG_PTR prev = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
-    if (!prev || reinterpret_cast<WNDPROC>(prev) == &lifecycle_wnd_proc) return;
+    const bool unicode = IsWindowUnicode(hwnd) != FALSE;
+    const WNDPROC hook = unicode ? &lifecycle_wnd_proc<true> : &lifecycle_wnd_proc<false>;
+    const LONG_PTR prev = unicode ? GetWindowLongPtrW(hwnd, GWLP_WNDPROC) : GetWindowLongPtrA(hwnd, GWLP_WNDPROC);
+    if (!prev || reinterpret_cast<WNDPROC>(prev) == hook) return;
     SetPropW(hwnd, kTitleProcProp, reinterpret_cast<HANDLE>(prev));
-    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&lifecycle_wnd_proc));
+    if (unicode) {
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(hook));
+    } else {
+        SetWindowLongPtrA(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(hook));
+    }
 }
 
 // Before CreateWindowEx: a candidate is a top-level, non-child, non-tool window. Returns whether it is one, and fits
