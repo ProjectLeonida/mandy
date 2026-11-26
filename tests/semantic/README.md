@@ -19,7 +19,9 @@ every file's output. Files run side by side, so a test writes only into its own 
 to a fixed path, and does not rely on another file having run first.
 
 The processes of a parallel run share what they compile: the first file that imports a module compiles it into a
-temporary folder, the others read it from there, and the folder is removed when the run ends. This is for
+temporary folder, the others read it from there, and the folder is removed when the run ends. A file that imports
+the module before that entry is written compiles it too, so the files a run starts with compile it once per job.
+This is for
 `tools/rdna2spirv.py`: importing it from source takes 7.2 s on Python 3.14.7 and 7.5 s on 3.13.13 (Windows 11),
 because CPython's tokenizer copies the rest of a source string at every f-string `{` and the file has some 4,800
 f-strings (run as a script it is read line by line and starts in 0.4 s). CPython fixed that in 3.13.16, 3.14.8 and

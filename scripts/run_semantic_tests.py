@@ -21,9 +21,9 @@ line, and exits 1 if a file fails, none is found, or no test ran. Standard libra
 The count of tests comes from unittest's own result object, not from its output: a module that writes a line shaped like unittest's summary to stderr - a nested runner, or an atexit handler that runs after unittest's own summary - cannot change it.
 
 In a parallel run the processes share the modules they compile through a temporary folder that is removed when the
-run ends, so the translator is compiled once per run instead of once per file (BYTECODE_CACHE_PROGRAM has the
-reason). Nothing is written into the tree for it, and a file's own `sys.dont_write_bytecode` still keeps
-`__pycache__` out of it.
+run ends, so the translator is compiled once per job, by the files a run starts with, instead of once per file
+(BYTECODE_CACHE_PROGRAM has the reason). Nothing is written into the tree for it, and a file's own
+`sys.dont_write_bytecode` still keeps `__pycache__` out of it.
 
 `--timeout SECONDS` limits each module subprocess in parallel mode, or the entire discover subprocess with
 `-j 1`. The value must be positive and at most 86400 seconds (24 hours), keeping it within platform wait limits.
@@ -96,7 +96,10 @@ BYTECODE_CACHE_VARIABLE = "LEONIDA_BYTECODE_CACHE"
 
 # Installed in every child before it imports its test module. A source module whose own bytecode file is missing or
 # stale, or was never written because the importing file sets `sys.dont_write_bytecode` (most of this suite does, to
-# keep `__pycache__` out of the tree), is compiled by the first child that needs it and read back by all the others.
+# keep `__pycache__` out of the tree), is compiled by the first child that needs it and read back by the others. A
+# child that needs it before that entry is written compiles it too: the jobs of a run start together, so the
+# translator is compiled once per job (4 times in a run of 16 files with 4 jobs, 8 times with 8) and read by every
+# file after those.
 #
 # It matters because CPython from 3.12 up to 3.13.15 and 3.14.7 tokenizes a source *string* in time quadratic in its
 # f-string replacement fields: every `{` copies the rest of the buffer (`update_fstring_expr` in 3.12's
