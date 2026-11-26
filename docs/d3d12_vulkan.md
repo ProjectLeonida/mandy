@@ -2101,13 +2101,16 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    only by `fix_console_slot`). Two indexes, by base and by target, hold the halves by their exact range: halves
    naming the same range share one group (with a resolved and a waiting list, each half's place in it kept, so a
    half moves or goes in O(1)), and the groups are ordered by start per power-of-two class of their length. A change
-   visits exactly the halves whose range overlaps it (an addition: the waiting ones only); the groups it compares to
-   find them are those plus, per class, the ones that start less than one class length before it and end before it.
+   visits exactly the halves whose range overlaps it; an addition visits the waiting halves whose range starts inside
+   it, since a V# resolves only through a backing, alias range, copy or title memory that holds its base (title memory
+   is told as the merged range that holds it); each half once per index in a submission, however many changes name
+   it. The groups compared to find them are those plus, for a removal, per class, the ones that start less than one
+   class length before it and end before it.
    Releases (a backing, a title-window or geometry block), alias ranges
    removed or replaced (`TitleVaAliases` tells its listeners as it happens, `forget_copy` included) and additions
    (a backing, an alias range, title memory) go on an unbounded per-device list; at the next submission each heap
    fixes again exactly the slots whose records a change touches: a release or removal every half naming it, an
-   addition the waiting halves over it. Nothing walks the heap or reads the copy for this. A zeroed range, a slot
+   addition the waiting halves whose base it holds. Nothing walks the heap or reads the copy for this. A zeroed range, a slot
    the title rewrote and a heap destroyed drop their records. `console_heap_slot_records_test` checks that a release
    of a buffer 10 of 60,010 slots name looks at those 10, that a 40-byte release among 300,000 slots packed into 74
    blocks of 64 KiB looks at the 3 it overlaps, and compares the copy with a full re-resolution through random
