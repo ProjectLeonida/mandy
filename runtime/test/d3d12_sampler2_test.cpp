@@ -449,7 +449,8 @@ int main() {
                 if (host_nn)
                     EXPECT(host2(desc2(point)) != host2(desc2(point, D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES)));
             } else {
-                std::printf("no host D3D12 device: edge cases checked against their recorded answers only\n");
+                std::printf("no host D3D12 reference (Wine, or no device): edge cases checked against their recorded "
+                            "answers only\n");
             }
         }
 

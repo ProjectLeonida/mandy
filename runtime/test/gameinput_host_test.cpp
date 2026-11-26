@@ -6,8 +6,9 @@
 //   - GameInputCreate succeeds from mapped code, and the library answers GetCurrentTimestamp;
 //   - GetCurrentReading says either "reading" or "no reading found": no crash, no other error. With a gamepad attached
 //     GetGamepadState must succeed on the reading; the test passes with or without one.
-// Skips (exit 77) only where Windows itself cannot load GameInput.dll (asked before mapping, with LoadLibraryExW).
-// When the DLL is there, an import that binds to nothing is a failure, not a skip. No game files.
+// Skips (exit 77) only where Windows itself cannot load GameInput.dll (asked before mapping, with LoadLibraryExW),
+// and under Wine, whose GameInput.dll is a stub: there the loader's binding is checked and the stub's answers are
+// not. When the DLL is there, an import that binds to nothing is a failure, not a skip. No game files.
 #include <windows.h>
 
 #include <cstdio>
@@ -64,6 +65,21 @@ int main(int argc, char** argv) {
                 ++seen;
             }
         check(seen == 1 && binding == rt::Binding::Host, "the GameInput.dll import binds to the host's copy");
+
+        // Wine's GameInput.dll is a stub: GameInputCreate returns E_NOTIMPL and GetCurrentTimestamp E_FAIL, so its
+        // answers say nothing about the loader. The binding above is the one part observable there, and a wrong one
+        // is still a failure (checked) rather than a skip.
+        const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+        if (wine) {
+            FreeLibrary(host_gameinput);
+            if (g_failures) {
+                std::printf("gameinput_host_test: FAILED (%d failures)\n", g_failures);
+                return 1;
+            }
+            std::printf("SKIP: Wine's GameInput.dll is a stub (GameInputCreate returns E_NOTIMPL, GetCurrentTimestamp "
+                        "E_FAIL), so only the import binding can be checked here\n");
+            return 77;
+        }
 
         loader.initialise();
         const auto probe = reinterpret_cast<ProbeFn>(m.exports.at("gameinput_host_probe"));

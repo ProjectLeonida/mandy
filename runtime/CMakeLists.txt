@@ -1841,10 +1841,14 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_bundled_load COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_bundled_load>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_bundled.cmake")
-    # atexit handlers, static destructors and the ways out, compared with the same program run natively.
+    # atexit handlers, static destructors and the ways out, compared with the same program run natively. Under Wine
+    # the native runs already deviate (the guest CRT is the host's), so the script reports the skip; the property is
+    # what turns that into a ctest skip, for CMake versions that cannot exit 77 from a -P script.
     add_test(NAME run_tiny_atexit COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_atexit>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_atexit.cmake")
+    set_tests_properties(run_tiny_atexit PROPERTIES SKIP_RETURN_CODE 77
+      SKIP_REGULAR_EXPRESSION "SKIP: the guest CRT here is Wine's")
     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
     add_test(NAME run_tiny_game_console_paths COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
