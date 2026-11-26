@@ -306,7 +306,8 @@ class PipelinesStageTest(unittest.TestCase):
             f.write(blob)
 
         plan = [
-            {"leave_inflight": ["lib_cs_00042"], "exit": 139},
+            # The runtime writes "<name> <key>" (runtime/src/precompile_inflight.h); the stage reports the name.
+            {"leave_inflight": ["lib_cs_00042 0123456789abcdef"], "exit": 139},
             {
                 "stderr": ["[precompile] done: 1 compiled, 0 from a cache, 0 journaled already, 1 failed, 0 not buildable, in 1 s"],
                 "exit": 2,
@@ -321,6 +322,18 @@ class PipelinesStageTest(unittest.TestCase):
         with open(report, encoding="utf-8") as f:
             doc = json.load(f)
         self.assertEqual(doc, {"modules": [{"name": "lib_cs_00042", "spv_sha256": hashlib.sha256(blob).hexdigest()}]})
+        # One warning for the crashed entry, not a second generic one for the same exit 2; it says how to retry.
+        warnings = [line for line in logs if "WARNING" in line]
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("--all", warnings[0])
+
+    def test_exit_3_another_precompile_fails_with_its_own_message(self):
+        plan = [{"stderr": ["[precompile] another --precompile-pipelines is using X (error 32)"], "exit": 3}]
+        code, calls, logs, err = self.run_stage(plan)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("another gta6rt --precompile-pipelines is using this pipeline journal", err)
+        self.assertNotIn("Vulkan device", err)
 
     def test_crash_stops_after_retry_limit(self):
         plan = [{"leave_inflight": ["cs_bad"], "exit": 99}]

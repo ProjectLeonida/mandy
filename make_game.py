@@ -2757,7 +2757,8 @@ def read_crashed_names(cache_root: str) -> "list[str]":
     path = os.path.join(cache_root, "pipeline_cache.d", "requests", "crashed.txt")
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
-            return list(dict.fromkeys(name for line in f if (name := line.strip())))
+            # "<name> <key>" per line (runtime/src/precompile_inflight.h); the key says which build crashed.
+            return list(dict.fromkeys(line.strip().rsplit(" ", 1)[0] for line in f if line.strip()))
     except OSError:
         return []
 
@@ -2844,7 +2845,8 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             names = read_crashed_names(out)
         if names:
             log(f"pipelines: WARNING: {len(names)} compute entry(ies) crashed the driver and were skipped "
-                f"(recorded in pipeline_crashes.json): {', '.join(names)}")
+                f"(recorded in pipeline_crashes.json): {', '.join(names)}. The stage tries one again once it is "
+                "translated again or the driver changes; gta6rt --precompile-pipelines --all tries them all now")
             record_crashes(out, spirv, names)
         return names
 
@@ -2855,11 +2857,13 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         if code == 0:
             break
         if code == 2:
-            log("pipelines: WARNING: some compute entries failed or were skipped after a crash (exit 2); see the summary above")
             break
         if code == 1:
             fail("pipelines: gta6rt could not open the Vulkan device or shader library (exit 1); "
                  "see the output above")
+        if code == 3:
+            fail("pipelines: another gta6rt --precompile-pipelines is using this pipeline journal (exit 3); "
+                 "let it finish or stop it, then run the stage again")
         if interrupted(code):
             fail(f"pipelines: gta6rt interrupted ({exit_label(code)})")
         if attempt < PIPELINE_CRASH_RETRIES:
@@ -2871,7 +2875,8 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         fail(f"pipelines: gta6rt still crashed after {PIPELINE_CRASH_RETRIES} retries "
              f"(last exit {exit_label(code)}){why}")
 
-    collect_crashes()
+    if not collect_crashes() and code == 2:
+        log("pipelines: WARNING: some compute pipelines failed to build (exit 2); see the summary above")
     log("pipelines: done")
 
 

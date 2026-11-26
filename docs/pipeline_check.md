@@ -351,6 +351,11 @@ that size. Which threads the game creates pipelines on is not known without its 
 journal in `<out>/pipeline_cache.d` with matching device features and driver keys. If a driver crash kills `gta6rt`
 mid-build, `make_game.py` retries up to `PIPELINE_CRASH_RETRIES` times so the runtime can move stale entries from
 `pipeline_cache.d/requests/inflight.txt` to `requests/crashed.txt` and skip them, then writes `<out>/pipeline_crashes.json`.
+A crash is held against that module file on that device and driver: once the module is translated again or the
+driver changes, the next run builds it again, and a build that returns clears it from the list.
+`gta6rt --precompile-pipelines --all` tries every recorded entry again now. Exit 3 means another precompile holds
+the journal folder (`requests/precompile.lock`). For tests, `LEONIDA_PRECOMPILE_CRASH_TEST=<entry name>` ends the
+precompile just before that entry's pipeline create, as a driver crash there would.
 
 `vk_pipeline_check` remains a standalone diagnostic tool (and CI test binary) for corpus-wide module/pipeline checks,
 Mesa DRM-shim profiling, `--stats`, `--cache-feedback`, and `--isolate` crash bisection.

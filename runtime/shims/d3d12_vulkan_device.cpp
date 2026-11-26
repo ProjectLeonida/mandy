@@ -55,6 +55,7 @@
 #include "../src/pipeline_cache_journal.h"
 #include "../src/pipeline_order.h"
 #include "../src/pipeline_prewarm.h"
+#include "../src/precompile_inflight.h"
 #include "../src/large_module_gate.h"
 #include "../src/dev_status.h"
 #include "../src/conservative_raster.h"
@@ -23491,6 +23492,71 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
         return 0;
     }
 
+    // One precompile per journal folder, so that what requests/inflight.txt lists at a start can only be a dead run's
+    // (precompile_inflight.h). The lock goes with the process, however it ends. Exit 3: another run has the folder.
+    const std::filesystem::path requests = pipeline_journal_dir() / L"requests";
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(requests, ec);
+    }
+    const HANDLE run_lock = CreateFileW((requests / L"precompile.lock").c_str(), GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
+                                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (run_lock == INVALID_HANDLE_VALUE) {
+        std::fprintf(stderr, "[precompile] another --precompile-pipelines is using %ls (error %lu)\n",
+                     requests.c_str(), GetLastError());
+        return 3;
+    }
+    // A crash is held against what was built: this module file (its size and last write, so a new translation of it
+    // is a new key, with no read of the module) on this device and driver. --all tries every one again.
+    const std::uint32_t driver = host.state().pso_identity.driver, device_id = host.state().pso_identity.device;
+    const auto crash_key = [&](const leonida::ShaderEntry& entry) {
+        leonida::pipeline_journal::Hasher hash;
+        hash.text("precompile-crash");
+        hash.value(driver);
+        hash.value(device_id);
+        std::error_code ec;
+        const std::filesystem::path file = library->spirv_path(entry);
+        const std::uint64_t size = std::filesystem::file_size(file, ec);
+        const auto written = std::filesystem::last_write_time(file, ec).time_since_epoch().count();
+        hash.value(ec ? 0 : size);
+        hash.value(static_cast<std::int64_t>(ec ? 0 : written));
+        char text[17];
+        std::snprintf(text, sizeof text, "%016llx", static_cast<unsigned long long>(hash.digest()));
+        return std::string(text);
+    };
+    leonida::precompile_inflight::Record inflight(requests, options.rebuild);
+    char crash_buffer[512]{};  // LEONIDA_PRECOMPILE_CRASH_TEST: an entry name, for tests only
+    const DWORD crash_length = GetEnvironmentVariableA("LEONIDA_PRECOMPILE_CRASH_TEST", crash_buffer, sizeof crash_buffer);
+    const char* crash_test = crash_length && crash_length < sizeof crash_buffer ? crash_buffer : nullptr;
+    for (const auto& [name, key] : inflight.left_in_flight())
+        std::fprintf(stderr, "[precompile] %s: the last run died while the driver built it\n", name.c_str());
+    std::vector<std::string> keys;
+    keys.reserve(jobs.size());
+    std::size_t crashed = 0;
+    std::uint64_t crashed_bytes = 0;
+    {
+        std::vector<Job> kept;
+        kept.reserve(jobs.size());
+        for (const Job& job : jobs) {
+            std::string key = crash_key(*job.entry);
+            if (inflight.is_crashed(job.entry->name, key)) {
+                ++crashed;
+                crashed_bytes += job.bytes;
+                std::fprintf(stderr, "[precompile] %s: not built (a run died building this module on this driver; "
+                                     "listed in %ls, a new translation or driver or --all tries it again)\n",
+                             job.entry->name.c_str(), inflight.crashed_path().c_str());
+                continue;
+            }
+            kept.push_back(job);
+            keys.push_back(std::move(key));
+        }
+        jobs.swap(kept);
+        total_bytes -= crashed_bytes;
+    }
+    if (crashed)
+        std::fprintf(stderr, "[precompile] %zu compute entries to build after leaving out %zu that crashed a run\n",
+                     jobs.size(), crashed);
+
     std::atomic<std::size_t> next{0};
     std::mutex progress_mutex;
     std::size_t done = 0, compiled = 0, skipped = 0, hits = 0, failed = 0, journaled = 0, elsewhere = 0;
@@ -23517,11 +23583,15 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
             build_options.use_helper = options.via_helper;
             build_options.mark_building = !options.via_helper;  // an entry another process is compiling is left to it
             ComputeBuild build;
+            inflight.begin(job.entry->name, keys[i]);  // on disk before the driver sees the module
+            // Tests: end the process here, as a driver crash inside this module's create would.
+            if (crash_test && job.entry->name == crash_test) TerminateProcess(GetCurrentProcess(), 0xC0000005u);
             try {
                 build = host.build(*job.entry, build_options);
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "[precompile] %s: %s\n", job.entry->name.c_str(), e.what());
             }
+            inflight.end(job.entry->name);
             host.destroy(build.pipeline);
             if (big) {
                 std::lock_guard lock(big_mutex);
@@ -23553,11 +23623,13 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
     // One line for the whole run: what was built, what was there already, and what was left out and why.
     std::fprintf(stderr, "[precompile] done: %zu built (%zu compiled, %zu from a cache), %zu journaled already, %zu "
                          "being built by another process, %zu failed; left out: %zu of %zu listed in "
-                         "LEONIDA_SKIP_COMPUTE%s, %zu not buildable, %zu filtered out; in %.0f s\n",
+                         "LEONIDA_SKIP_COMPUTE%s, %zu not buildable, %zu filtered out%s; in %.0f s\n",
                  compiled + hits, compiled, hits, journaled, elsewhere, failed, listed_left_out, listed,
                  options.skip_listed ? " (--skip-listed)" : "", not_buildable, filtered,
+                 crashed ? (", " + std::to_string(crashed) + " crashed a run").c_str() : "",
                  std::chrono::duration<double>(Clock::now() - began).count());
-    return failed ? 2 : 0;
+    CloseHandle(run_lock);
+    return failed || crashed ? 2 : 0;
 }
 
 // What a compute pipeline's journal name depends on besides its module: a name remembered for a module is good for
