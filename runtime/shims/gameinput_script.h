@@ -164,6 +164,20 @@ inline uint32_t ui_navigation(const gi::GameInputGamepadState& g) {
     return u;
 }
 
+// With SDL3 the script drives the keyboard pad, and the pad's update is also where the script is read. A script with
+// the pad off is therefore never parsed and no press ever happens: the title waits at its first prompt and the log has
+// nothing about the script. The SDL3 shim prints this line once for that case. Null when there is nothing to say: no
+// script (unset, or only white space), or a pad for it to drive.
+inline const char* pad_off_note(const std::string& script_text, bool keyboard_pad_on) {
+    if (keyboard_pad_on) return nullptr;
+    const bool has_script = std::any_of(script_text.begin(), script_text.end(),
+                                        [](unsigned char c) { return !std::isspace(c); });
+    if (!has_script) return nullptr;
+    return "LEONIDA_INPUT_SCRIPT is set but the keyboard pad is off, so the script is not read and no scripted "
+           "press will happen: with SDL3 the script drives the keyboard pad (set LEONIDA_KEYBOARD_PAD=always for an "
+           "unattended run, or 1)";
+}
+
 // An environment variable in lower case, of any length (a script is easily longer than a fixed buffer, and a value
 // that did not fit used to read as unset). Empty when unset.
 inline std::string env_lower(const char* name) {
