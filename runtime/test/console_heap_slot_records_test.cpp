@@ -336,12 +336,119 @@ int differential() {
     return 0;
 }
 
+// T# records (set_texture): a T# waits on the exact address it names; a texture registered there touches the slots
+// waiting on it and only those; a texture gone touches the bound ones; a slot rewritten while waiting leaves no
+// stale entry; many slots on one texture; V# and T# changes never touch each other's records.
+int textures() {
+    using R = ConsoleHeapSlotRecords;
+    R records;
+    records.reset(70000);
+    constexpr std::uint64_t kTex = 0x100000100ull, kOther = 0x100000200ull, kNear = 0x100000300ull,
+                            kRebound = 0x100000400ull;
+    std::vector<std::uint32_t> out;
+    const auto touched = [&](SlotChange::Kind kind, std::uint64_t address) {
+        const SlotChange change{kind, address, address + 1};
+        records.touched(&change, 1, out);
+        return out;
+    };
+    // 60,000 T#s wait on kTex, 10 on kOther, 5 are bound to kNear (each address another texture).
+    for (std::uint32_t slot = 0; slot < 60000; ++slot) records.set_texture(slot, R::texture_waiting, kTex);
+    for (std::uint32_t slot = 60000; slot < 60010; ++slot) records.set_texture(slot, R::texture_waiting, kOther);
+    for (std::uint32_t slot = 60010; slot < 60015; ++slot) records.set_texture(slot, R::texture_bound, kNear);
+    EXPECT(records.textures() == 60015 && records.textures_waiting() == 60010 && records.recorded() == 0);
+    // A texture at kOther: its 10 slots, looking at 10 entries.
+    std::uint64_t looked = records.looked_at();
+    EXPECT(touched(SlotChange::texture_added, kOther).size() == 10 && out.front() == 60000 && out.back() == 60009);
+    EXPECT(records.looked_at() - looked == 10);
+    // A texture added where no T# waits, or where only bound ones are: nothing.
+    EXPECT(touched(SlotChange::texture_added, kOther + 0x1000).empty());
+    EXPECT(touched(SlotChange::texture_added, kNear).empty());
+    // V# changes over those addresses never touch T# records.
+    for (const auto kind : {SlotChange::target_gone, SlotChange::source_gone, SlotChange::target_added,
+                            SlotChange::source_added}) {
+        const SlotChange change{kind, kTex - 0x10000, kTex + 0x10000};
+        records.touched(&change, 1, out);
+        EXPECT(out.empty());
+    }
+    // The texture at kNear goes: its bound slots, which the fix makes waiting.
+    EXPECT(touched(SlotChange::texture_gone, kNear).size() == 5);
+    for (std::uint32_t slot = 60010; slot < 60015; ++slot) records.set_texture(slot, R::texture_waiting, kNear);
+    EXPECT(records.textures_waiting() == 60015);
+    // Slot 7 is rewritten while waiting: now a T# of kOther, then a V#, then zeroed. Each time kTex no longer names it.
+    records.set_texture(7, R::texture_waiting, kOther);
+    EXPECT(touched(SlotChange::texture_added, kTex).size() == 59999);
+    EXPECT(touched(SlotChange::texture_added, kOther).size() == 11);
+    records.set(7, 0, R::resolved, 0x5000, 256, kArena + 0x5000);
+    EXPECT(touched(SlotChange::texture_added, kOther).size() == 10);
+    EXPECT(records.textures() == 60014 && records.recorded() == 1);
+    records.clear(7);
+    EXPECT(touched(SlotChange::texture_gone, kOther).size() == 10 && records.recorded() == 0);
+    // The texture comes: the fix binds all 59,999; a later texture added there touches none (they wait no more), a
+    // texture gone touches them all again.
+    for (std::uint32_t slot = 0; slot < 60000; ++slot)
+        if (slot != 7) records.set_texture(slot, R::texture_bound, kTex);
+    EXPECT(touched(SlotChange::texture_added, kTex).empty());
+    EXPECT(touched(SlotChange::texture_gone, kTex).size() == 59999);
+    // Rebinding the same address many times leaves one entry per slot (the bucket is cleaned as it grows).
+    for (int round = 0; round < 8; ++round)
+        for (std::uint32_t slot = 0; slot < 100; ++slot)
+            records.set_texture(slot, round & 1 ? R::texture_bound : R::texture_waiting, kRebound);
+    looked = records.looked_at();
+    EXPECT(touched(SlotChange::texture_gone, kRebound).size() == 100);
+    EXPECT(records.looked_at() - looked <= 200);
+    std::printf("textures: a texture registered touches only the T#s waiting on its address (10 of 60,015, 10 looked "
+                "at); one gone touches the bound ones; rewritten slots leave no stale entry; V# changes touch none\n");
+    return 0;
+}
+
+// Waiting for room: a V# half refused a geometry copy for lack of room is fixed again when copies are freed
+// (geometry_room) whatever its address; a T# refused for a full bindless array when entries are freed (texture_room).
+// The A1 gap: such a half has no target, so no target change ever found it.
+int room() {
+    using R = ConsoleHeapSlotRecords;
+    R records;
+    records.reset(64);
+    records.set(1, 0, R::waiting_room, 0x7000000000ull, 4096, 0);  // geometry refused for room
+    records.set(2, 0, R::waiting, 0x7000100000ull, 4096, 0);       // nothing at its base
+    records.set(3, 1, R::waiting_room, 0x7000200000ull, 64, 0);    // the counter half
+    records.set_texture(4, R::texture_waiting_room, 0x100000400ull);
+    records.set_texture(5, R::texture_waiting, 0x100000500ull);
+    std::vector<std::uint32_t> out;
+    const SlotChange geometry{SlotChange::geometry_room, 0, 1}, textures{SlotChange::texture_room, 0, 1};
+    records.touched(&geometry, 1, out);
+    EXPECT(out == std::vector<std::uint32_t>({1, 3}));
+    records.touched(&textures, 1, out);
+    EXPECT(out == std::vector<std::uint32_t>({4}));
+    // Both at once, each list once; duplicates of one change count once.
+    const SlotChange both[] = {geometry, textures, geometry};
+    records.touched(both, 3, out);
+    EXPECT(out == std::vector<std::uint32_t>({1, 3, 4}));
+    // Resolved since (a copy was made): out of the list; waiting for an address alone: still found by the address.
+    records.set(1, 0, R::resolved, 0x7000000000ull, 4096, kArena + 0x10000);
+    records.set_texture(4, R::texture_waiting, 0x100000400ull);
+    records.touched(both, 3, out);
+    EXPECT(out == std::vector<std::uint32_t>({3}));
+    const SlotChange added{SlotChange::texture_added, 0x100000400ull, 0x100000401ull};
+    records.touched(&added, 1, out);
+    EXPECT(out == std::vector<std::uint32_t>({4}));
+    // A room waiter is also found by its base, as any waiting half.
+    const SlotChange source{SlotChange::source_added, 0x7000200000ull, 0x7000200040ull};
+    records.touched(&source, 1, out);
+    EXPECT(out == std::vector<std::uint32_t>({3}));
+    EXPECT(records.waiting_count() == 2 && records.textures_waiting() == 2);
+    std::printf("room: geometry room touches only the halves refused a copy (2 of 3 waiting), texture room only the "
+                "T#s refused for a full array; resolved ones leave the lists\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     if (release_looks_at_its_slots_only()) return 1;
     if (cases()) return 1;
     if (differential()) return 1;
+    if (textures()) return 1;
+    if (room()) return 1;
     std::printf("console_heap_slot_records_test: ok\n");
     return 0;
 }

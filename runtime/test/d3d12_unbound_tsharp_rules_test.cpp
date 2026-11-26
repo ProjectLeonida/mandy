@@ -374,8 +374,55 @@ int main() {
             const char* why = nullptr;
             const auto result = rt::d3d12::test_bind_title_image(device.p, words, &why);
             check(result == rt::d3d12::TitleImage::unknown, "unknown address returns TitleImage::unknown");
-            check(why && std::string(why) == "no texture at T# address",
-                  "unknown address explains no texture at T# address");
+            check(why && std::string(why) == "no texture at the T# address: no title memory and no texture of ours",
+                  "unknown address explains no texture at the T# address, and what the address is");
+        }
+
+        // The classes of an address with no texture: one of ours that is gone, and one whose low 32 bits name one of
+        // ours (of the T#'s shape, of another, or gone) with other high bits.
+        {
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            desc.Width = 16;
+            desc.Height = 4;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            desc.SampleDesc.Count = 1;
+            Ref<ID3D12Resource> texture;
+            check(SUCCEEDED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+                                                            D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                            IID_PPV_ARGS(texture.put()))),
+                  "created a 16x4 texture");
+            const std::uint64_t addr = rt::d3d12::resource_image_address(texture.p);
+            check(addr >> 32 == 1, "the layer's texture addresses start at 1 << 32");
+            g::Image img{};
+            img.address = 0x7f0000000000ull | (addr & 0xffffffffull);
+            img.type = g::ImageType::image_2d;
+            img.format = g::format_from_vulkan(VK_FORMAT_R8G8B8A8_UNORM);
+            img.width = 16;
+            img.height = 4;
+            img.layer_count = 1;
+            img.mip_count = 1;
+            const auto reason = [&](const g::Image& image) {
+                const char* why = nullptr;
+                const auto result = rt::d3d12::test_bind_title_image(device.p, g::encode(image), &why);
+                return result == rt::d3d12::TitleImage::unknown && why ? std::string(why) : std::string("?");
+            };
+            check(reason(img) == "no texture at the T# address: its low 32 bits name a texture of ours of its shape",
+                  "other high bits, same shape");
+            g::Image other = img;
+            other.width = 32;
+            check(reason(other) ==
+                      "no texture at the T# address: its low 32 bits name a texture of ours of another shape",
+                  "other high bits, another shape");
+            texture.put();  // released: its address leaves the device's table
+            check(reason(img) == "no texture at the T# address: its low 32 bits name a texture of ours that is gone",
+                  "other high bits, texture gone");
+            g::Image gone = img;
+            gone.address = addr;
+            check(reason(gone) == "no texture at the T# address: a texture of ours that is gone",
+                  "the address of a texture of ours that is gone");
         }
 
         // Not a valid T# (decode failure)
