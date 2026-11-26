@@ -17023,14 +17023,19 @@ def stage_of(name, path):
     """Shader stage from the carve index (the DXIL program header in each container), not the name."""
     global _STAGES
     if _STAGES is None:
-        import json
-        idx = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "index.json")
         _STAGES = {}
+    idx = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "index.json")
+    key = os.path.normcase(os.path.realpath(idx))
+    stages = _STAGES.get(key)
+    if stages is None:
+        import json
+        stages = {}
         if os.path.isfile(idx):
             with open(idx, encoding="utf-8") as f:
                 for e in json.load(f):
-                    _STAGES[e["file"][:-5]] = e["stage"]
-    return _STAGES.get(name) or (name[:2].lower() if name[2:3] == "_" else "?")
+                    stages[e["file"][:-5]] = e["stage"]
+        _STAGES[key] = stages
+    return stages.get(name) or (name[:2].lower() if name[2:3] == "_" else "?")
 
 
 # Wave64 markers in the instruction text. Besides EXEC/VCC forms, 64-bit lane-mask SOP1/SOP2 ops
