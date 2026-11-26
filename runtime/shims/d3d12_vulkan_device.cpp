@@ -1417,6 +1417,10 @@ const std::filesystem::path& pipeline_journal_dir() {
     return pipeline_journal_roots().writable;
 }
 
+// The offline seed's size (pipeline_cache.bin) when the device cache was created from it, 0 otherwise: the save limit
+// does not count it (pipeline_cache_store::over_save_limit).
+std::atomic<std::size_t> g_offline_seed_bytes{0};
+
 // LEONIDA_PIPELINE_CACHE_BYTES, in bytes; 0 turns the session file off. One line for a value that is not a number.
 std::size_t pipeline_cache_save_limit() {
     char text[32] = {};
@@ -1489,6 +1493,7 @@ VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_ca
         return VK_NULL_HANDLE;
     }
     std::fprintf(stderr, "[rt] d3d12: loaded %zu bytes from %s\n", seed.size(), name);
+    if (!session) g_offline_seed_bytes.store(seed.size(), std::memory_order_relaxed);
     if (trace_pipeline_compile())
         std::fprintf(stderr, "[rt] pipeline-cache op=load bytes=%zu map_us=%lld driver_us=%lld file=%s\n",
                      seed.size(), mapped-start, compile_us()-mapped, name);
@@ -1629,16 +1634,17 @@ bool startup_cache_checkpoints_enabled() {
 void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache,
                                  bool checkpoint = false, const char* op = nullptr) {
     if (!cache || !vk.vkGetPipelineCacheData) return;
-    auto limit = pipeline_cache_save_limit();
-    // The output is an opaque Vulkan blob. A prefix is not an incremental cache.
-    if (checkpoint) limit = (std::min)(limit, std::size_t{512} << 20);
+    // The output is an opaque Vulkan blob. A prefix is not an incremental cache, so past the limit nothing is written.
+    const auto limit = pipeline_cache_save_limit();
     if (!limit) return;
     const auto start = compile_us();
     std::size_t size = 0;
     if (vk.vkGetPipelineCacheData(device, cache, &size, nullptr) != VK_SUCCESS ||
         size <= sizeof(VkPipelineCacheHeaderVersionOne)) return;
-    if (size > limit) {
-        std::fprintf(stderr, "[rt] d3d12: pipeline cache is %zu bytes, over the %zu-byte write limit\n", size, limit);
+    const std::size_t seed = g_offline_seed_bytes.load(std::memory_order_relaxed);
+    if (leonida::pipeline_cache_store::over_save_limit(size, seed, limit)) {
+        std::fprintf(stderr, "[rt] d3d12: pipeline cache is %zu bytes (%zu of them the offline seed), over the "
+                             "%zu-byte write limit for what a session adds\n", size, seed, limit);
         return;
     }
     const auto queried = compile_us();
@@ -19820,9 +19826,10 @@ bool stop_pipeline_compiles(unsigned wait_ms) {
     return idle;
 }
 
-// How long an exit save waits for the write itself (save_session_pipeline_cache): a 77 MiB cache was measured at about
-// 36 ms (fill and publish), so this only bounds a driver that blocks the read.
-constexpr unsigned kExitCacheWriteMs = 3000;
+// How long an exit save waits for the write itself (save_session_pipeline_cache). Measured fill and publish: a 77 MiB
+// cache about 36 ms; 1.87 GB 1.4 s and 2.9 GB 1.3-1.6 s (NVIDIA, Windows 11, NVMe), so about 2.2 s at the 4 GiB
+// default limit. The wait ends with the write; the bound only covers a driver or disk that blocks.
+constexpr unsigned kExitCacheWriteMs = 6000;
 
 bool save_pipeline_caches_at_exit(unsigned wait_ms) {
     if (exit_cache_saved.exchange(true)) return false;  // once: a crash during the normal exit's save does not redo it

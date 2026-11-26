@@ -2413,13 +2413,14 @@ Pipeline creation:
   merges into the offline seed. `LEONIDA_DIRECT_SESSION_CACHE=0` also uses a merge when only the session exists.
   The files must match the Vulkan vendor, device and pipeline-cache UUID. Vulkan supplies an opaque snapshot.
   Replacing part of the previous file would corrupt it.
-  `LEONIDA_PIPELINE_CACHE_BYTES` caps session writes (256 MiB by default, zero disables the session file).
+  `LEONIDA_PIPELINE_CACHE_BYTES` caps what a session adds, at a checkpoint or at teardown (an offline `pipeline_cache.bin` seed, which the driver hands back as part of the union, is not counted; 4 GiB by default, zero disables
+  the session file).
   `LEONIDA_SKIP_COMPUTE=<part of a name>[,<part>...]` (`all`: every compute program) never builds the matching
   compute programs and drops their dispatches, direct and indirect; the first dropped dispatch of each is logged.
   It is a way past a program that hangs the GPU while the program or its input is fixed, not a fix.
   `LEONIDA_STARTUP_CACHE_CHECKPOINTS=1` also schedules a snapshot after a successful pipeline build,
   at most once per 120 seconds. It starts on the compile worker when queued builds have drained and the device
-  has no active builds. These snapshots have an additional 512 MiB ceiling. The driver fills a mapped staging
+  has no active builds. The driver fills a mapped staging
   file directly. A successful snapshot atomically replaces the session. An interrupted write preserves the
   previous cache; the next launch removes unheld staging files older than ten minutes.
   While the compute warm-up has builds queued that idle checkpoint never starts, and a boot that ends by a crash,
