@@ -1890,7 +1890,9 @@ void update_keyboard_pad() {
     clip_cursor(active && g_raw_ready && g_cursor_pos.load() == system_cursor_pos && foreground_is_ours());
     for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
     // LEONIDA_INPUT_SCRIPT="a@70,a@85,start@120" (with LEONIDA_KEYBOARD_PAD=always): timed presses on the keyboard
-    // pad, in seconds since the pad's first update, each held 300 ms. For unattended boots: the title's first prompt
+    // pad, in seconds since the pad's first update, each held 300 ms or its own button@seconds:hold, and then until the
+    // title has read the pads kReads times since it began (never past kMaxHold seconds, or the hold if it is longer, so
+    // a title that stops reading does not keep the button). For unattended boots: the title's first prompt
     // waits for a button with no timeout (docs/re/notes/firstframe.md, step 5). The parser, the timeline and the
     // button names are gameinput_script.h's, shared with the scripted pad of a build without SDL3.
     namespace script = rt::gameinput::script;
@@ -1902,7 +1904,21 @@ void update_keyboard_pad() {
                          s.presses.size(), s.rejected);
         return s;
     }();
-    if (!scripted.empty()) {
+    // LEONIDA_INPUT_FILE=<path> (local, for headless runs whose display takes no keyboard input): every line appended
+    // to the file names one button of gameinput_script.h's table ("a", "down", ...) and becomes a press at once, held
+    // like a scripted one (300 ms and six readings, at most 5 s). The file is read again at most every 250 ms.
+    struct FilePress {
+        uint32_t bit;
+        double at;
+        uint64_t began;
+        bool started;
+    };
+    static std::vector<FilePress> file_presses;
+    static const std::string input_file = [] {
+        const char* v = std::getenv("LEONIDA_INPUT_FILE");
+        return std::string(v ? v : "");
+    }();
+    if (!scripted.empty() || !input_file.empty()) {
         static const ULONGLONG origin = GetTickCount64();
         const double now = (GetTickCount64() - origin) / 1000.0;
         script::Held held{};
@@ -1911,15 +1927,51 @@ void update_keyboard_pad() {
         static std::vector<uint64_t> began(scripted.presses.size(), 0);
         static std::vector<char> started(scripted.presses.size(), 0);
         const uint64_t calls = g_reading_calls.load(std::memory_order_relaxed);
+        if (!input_file.empty()) {
+            static ULONGLONG last_read = 0;
+            static std::size_t lines_done = 0;
+            const ULONGLONG tick = GetTickCount64();
+            if (tick - last_read >= 250) {
+                last_read = tick;
+                if (FILE* f = std::fopen(input_file.c_str(), "r")) {
+                    char line[64];
+                    std::size_t n = 0;
+                    while (std::fgets(line, sizeof(line), f)) {
+                        if (++n <= lines_done) continue;
+                        lines_done = n;
+                        std::string name(line);
+                        while (!name.empty() && (name.back() == '\n' || name.back() == '\r' || name.back() == ' '))
+                            name.pop_back();
+                        bool known = false;
+                        for (const script::Button& b : script::kButtons)
+                            if (name == b.name) {
+                                file_presses.push_back({b.bit, now, 0, false});
+                                known = true;
+                            }
+                        std::fprintf(stderr, "[rt] gameinput: input file line %zu \"%s\" at %.1f s%s\n", n,
+                                     name.c_str(), now, known ? "" : " (unknown button, ignored)");
+                    }
+                    std::fclose(f);
+                }
+            }
+            for (auto& p : file_presses) {
+                if (now < p.at || now >= p.at + kMaxHold) continue;
+                if (!p.started) {
+                    p.started = true;
+                    p.began = calls;
+                }
+                if (now < p.at + 0.3 || calls - p.began < kReads) held.buttons |= p.bit;
+            }
+        }
         for (std::size_t i = 0; i < scripted.presses.size(); ++i) {
             const auto& press = scripted.presses[i];
             bool active = false;
-            if (now >= press.at && now < press.at + kMaxHold) {
+            if (now >= press.at && now < press.at + std::max(press.hold, kMaxHold)) {
                 if (!started[i]) {
                     started[i] = 1;
                     began[i] = calls;
                 }
-                active = now < press.at + 0.3 || calls - began[i] < kReads;
+                active = now < press.at + press.hold || calls - began[i] < kReads;
             }
             if (!active) continue;
             if (press.stick) held.stick = press.stick;
@@ -1927,7 +1979,7 @@ void update_keyboard_pad() {
         }
         if (held.stick) right_y = held.stick > 0 ? -kStickFull : kStickFull;  // SDL's +Y is down
         for (const script::Button& b : script::kButtons) {
-            if (!(scripted.named & b.bit)) continue;
+            if (!(scripted.named & b.bit) && input_file.empty()) continue;
             const auto button = static_cast<SDL_GamepadButton>(b.sdl);
             SDL_SetJoystickVirtualButton(g_keyboard.js, button, (held.buttons & b.bit) || down[button]);
         }
@@ -2446,13 +2498,13 @@ public:
         struct Stats {
             std::mutex mu;
             uint64_t calls[3][3] = {};  // method x (null, aggregate, a device)
-            uint64_t found[3] = {}, pressed[3] = {};
+            uint64_t found[3] = {}, pressed[3] = {}, a_pressed[3] = {};
             std::map<std::string, std::pair<uint64_t, uint64_t>> by_device;  // name -> (readings, with buttons)
             uint64_t since = 0;
         };
         static Stats st;
         std::string name;
-        bool buttons = false;
+        bool buttons = false, a_button = false;
         if (SUCCEEDED(hr) && got) {
             IGameInputDevice* d = nullptr;
             got->GetDevice(&d);
@@ -2461,7 +2513,10 @@ public:
                 d->Release();
             }
             GameInputGamepadState g{};
-            if (got->GetGamepadState(&g)) buttons = g.buttons != 0;
+            if (got->GetGamepadState(&g)) {
+                buttons = g.buttons != 0;
+                a_button = (g.buttons & GameInputGamepadA) != 0;
+            }
         }
         const int arg = !asked ? 0 : as_device(asked)->info.deviceFamily == GameInputFamilyAggregate ? 1 : 2;
         std::lock_guard lock(st.mu);
@@ -2469,6 +2524,7 @@ public:
         if (SUCCEEDED(hr) && got) {
             ++st.found[method];
             st.pressed[method] += buttons;
+            st.a_pressed[method] += a_button;
             auto& e = st.by_device[name];
             ++e.first;
             e.second += buttons;
@@ -2480,10 +2536,10 @@ public:
         std::string line;
         for (int m = 0; m < 3; ++m) {
             char t[200];
-            std::snprintf(t, sizeof(t), " %s %llu/%llu/%llu found %llu pressed %llu;", methods[m],
+            std::snprintf(t, sizeof(t), " %s %llu/%llu/%llu found %llu pressed %llu A %llu;", methods[m],
                           (unsigned long long)st.calls[m][0], (unsigned long long)st.calls[m][1],
                           (unsigned long long)st.calls[m][2], (unsigned long long)st.found[m],
-                          (unsigned long long)st.pressed[m]);
+                          (unsigned long long)st.pressed[m], (unsigned long long)st.a_pressed[m]);
             line += t;
         }
         for (const auto& [n, c] : st.by_device) {
@@ -2496,6 +2552,7 @@ public:
         std::memset(st.calls, 0, sizeof(st.calls));
         std::memset(st.found, 0, sizeof(st.found));
         std::memset(st.pressed, 0, sizeof(st.pressed));
+        std::memset(st.a_pressed, 0, sizeof(st.a_pressed));
         st.by_device.clear();
         st.since = now;
     }
