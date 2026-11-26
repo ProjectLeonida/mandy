@@ -895,6 +895,20 @@ The compute path, end to end:
     passed the retire ticket of the release (`submitted_retire_ticket() + 1`, checked at the start of every
     `ExecuteCommandLists` against `completed_retire_ticket()`), then its memory is freed. Binds go to that queue alone
     and are waited for there, so a bind never sits behind a submission that waits for a fence the CPU signals later.
+  - **Only with signed V# offsets.** A driver can place a sparse buffer anywhere relative to ordinary ones: RADV
+    (Mesa 26.3.1, natively and under Wine) gives sparse buffers a range of their own 64 TiB above them
+    (0xffffc00100200000 against 0xffff800100010000), so with a sparse arena every buffer outside it (geometry copies,
+    title windows and shadows outside it, upload buffers) lies below heap_base, at a negative offset. A shader that
+    sign-extends a V#'s 48-bit base (docs/design.md, "Heap-relative buffer device addresses") reaches it, since RADV
+    hands out addresses from one 2^47 half of the 48-bit space, so any two lie within 2^47 of each other. One that
+    zero-extends does not. The device counts each loaded module's `vsharp_base_sign_extended` marker
+    (`VsharpBaseCensus`, `runtime/src/shader_library.h`) and logs
+    `V# bases: signed offsets from heap_base (N of N modules sign-extend)`. The arena is sparse only when every module
+    sign-extends (or `LEONIDA_IMPORT_BELOW_ARENA=1` says to read bases signed). With older modules it stays one
+    allocation and one line says why. `TitleBufferWindows::shader_reachable` checks every block made outside the
+    arena against the same range when it is made, and a block it refuses is logged with both addresses.
+    `d3d12_title_va_game_device` and `d3d12_geometry_views_game_device` run the title-memory tests on the device the
+    game makes (with the bind queue), so on RADV their windows and geometry copies are read through negative offsets.
   - No allocation crosses a unit: one no larger than a block stays inside one block, a larger one takes whole blocks
     of its own. So each allocation is one run of one mapping, and the CPU reaches an arena offset through
     `DeviceState::arena_host()` (one table read; null, with a line, for a range without memory), or
@@ -1730,7 +1744,9 @@ The copies:
   (so dirty-page tracking for that refresh applies to both). Windows stay until the device goes, up to
   `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default). A window that
   cannot fit between the title's address reservations can use a separate mapped buffer. The buffer's device address
-  must fit as a positive 47-bit offset from the arena base. The same window cap and dirty-page refresh apply.
+  must lie within reach of a V# base from the arena base: a positive offset below 2^47, or, when every loaded shader
+  sign-extends the base, anywhere within 2^47 on either side (`TitleBufferWindows::shader_reachable`). The same
+  window cap and dirty-page refresh apply.
   `LEONIDA_STREAM_BUFFER_WINDOWS=0` requires the window to fit in the arena.
 - **What the GPU wrote goes back.** The same return copy serves slot-133 shadows (a buffer the driver would not
   import, a compute result the title reads again): the ranges are recorded through the alias of the buffer's pages and

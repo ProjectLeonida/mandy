@@ -394,6 +394,15 @@ bool device_sparse_buffer_tiles(ID3D12Device* device);
 
 // The size in bytes of the device's GPU address arena, or 0 without one. For tests.
 std::uint64_t device_arena_size(ID3D12Device* device);
+// The GPU address arena's memory: its size (address range), device address (heap_base), the bytes of memory bound
+// behind it now (all of it for one allocation), whether it binds memory as allocations need it (sparse), whether the
+// device could (sparse_capable), and whether V# bases are read as signed offsets (a buffer below heap_base is
+// reachable). All zero without an arena. For tests.
+struct ArenaMemoryState {
+    std::uint64_t size = 0, address = 0, bound = 0;
+    bool sparse = false, sparse_capable = false, signed_offsets = false;
+};
+ArenaMemoryState device_arena_memory(ID3D12Device* device);
 // Copies `bytes` of the device's GPU address arena at console VA `va` (what shaders read there: a heap's GPU copy,
 // the null slots after it) into `out`. False without an arena or when the range is not inside it. For tests.
 bool read_arena(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes);

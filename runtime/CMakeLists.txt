@@ -3941,6 +3941,14 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_title_va_shadow PROPERTIES ENVIRONMENT "LEONIDA_TEST_CONSOLE_SHADOW=1;LEONIDA_GEOMETRY_MB=0" SKIP_RETURN_CODE 77)
       add_test(NAME d3d12_geometry_views COMMAND d3d12_title_va_test)
       set_tests_properties(d3d12_geometry_views PROPERTIES ENVIRONMENT "LEONIDA_GEOMETRY_MB=16" SKIP_RETURN_CODE 77)
+      # The same two on the device the game makes (create_vulkan_device_standalone, with the arena's bind queue): where
+      # the GPU can, the arena is sparse, and on RADV every buffer outside it then lies 64 TiB below heap_base, so
+      # title windows, shadows and geometry copies are reached through negative (sign-extended) V# offsets.
+      add_test(NAME d3d12_title_va_game_device COMMAND d3d12_title_va_test --game-device)
+      set_tests_properties(d3d12_title_va_game_device PROPERTIES ENVIRONMENT "LEONIDA_ARENA_MB=1024" SKIP_RETURN_CODE 77)
+      add_test(NAME d3d12_geometry_views_game_device COMMAND d3d12_title_va_test --game-device)
+      set_tests_properties(d3d12_geometry_views_game_device PROPERTIES
+                           ENVIRONMENT "LEONIDA_GEOMETRY_MB=16;LEONIDA_ARENA_MB=1024" SKIP_RETURN_CODE 77)
       set_tests_properties(d3d12_title_va PROPERTIES SKIP_RETURN_CODE 77)
       # Past LEONIDA_TITLE_WINDOWS_MB a view of the title's memory is never its raw VA (#1537): with no other backing it
       # is written zero-size, and a dispatch through it reads zeros.

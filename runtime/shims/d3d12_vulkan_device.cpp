@@ -177,13 +177,24 @@ bool address_guard_enabled() {
     return on;
 }
 
-// Matches the offset interpretation of the selected shader pack.
-bool signed_vsharp_offsets() {
+// LEONIDA_IMPORT_BELOW_ARENA=1: an import of title memory that the driver put below the arena is kept (and V# bases
+// are read as signed offsets whatever the shader pack says).
+bool import_below_arena() {
     static const bool on = [] {
         wchar_t value[2]{};
         return GetEnvironmentVariableW(L"LEONIDA_IMPORT_BELOW_ARENA", value, 2) == 1 && value[0] == L'1';
     }();
     return on;
+}
+
+// Set by the device from its shader library (create_arena): every loaded module sign-extends a V#'s 48-bit base
+// (leonida::VsharpBaseCensus), so a buffer below heap_base is named by its negative offset.
+std::atomic<bool> g_pack_signed_vsharp_offsets{false};
+
+// Matches the offset interpretation of the selected shader pack: a V# base is a signed 48-bit offset from heap_base
+// (any buffer within 2^47 of it, on either side) or an unsigned one (only buffers above it).
+bool signed_vsharp_offsets() {
+    return import_below_arena() || g_pack_signed_vsharp_offsets.load(std::memory_order_relaxed);
 }
 
 // The CBV/SRV/UAV slots a descriptor table declares: the end of its furthest range (D3D12 appends a range at
@@ -3800,7 +3811,10 @@ struct DeviceState {
         if (!(w0 | w1 | w2 | w3) || (w3 >> 30)) return false;  // null, or not a buffer V# (TYPE, dword 3 bits 30-31)
         const std::uint64_t base = std::uint64_t(w0) | (std::uint64_t(w1 & 0xFFFFu) << 32);
         std::uint64_t host{}, remaining{};
-        if (base < arena.size || (geometry.cap() && geometry.lookup(arena.address + base, host, remaining))) return false;
+        // A base already rewritten to a copy below heap_base holds the low 48 bits of a negative offset.
+        const std::uint64_t written = signed_vsharp_offsets() && (base & (1ull << 47)) ? base | ~((1ull << 48) - 1) : base;
+        if (base < arena.size || (geometry.cap() && geometry.lookup(arena.address + written, host, remaining)))
+            return false;
         const std::uint32_t stride = (w1 >> 16) & 0x3FFFu;
         const std::uint64_t span = std::uint64_t(w2) * (stride ? stride : 1);
         // A V# the layer wrote for one of its own buffers that the driver put below the arena (an upload buffer in
@@ -4180,6 +4194,12 @@ struct DeviceState {
     }
 
     bool arena_ready() const { return arena.backing.ready(); }
+    // How the shaders read a V#'s 48-bit base: signed, a buffer outside the arena may lie on either side of heap_base
+    // within 2^47 (TitleBufferWindows::allocate); unsigned, only above it.
+    bool vsharp_offsets_signed() const { return signed_vsharp_offsets(); }
+    // The device could bind the arena's memory as it is used (create_arena): sparse binding and residency, strict
+    // non-resident reads, and a queue of its own for the binds.
+    bool arena_sparse_capable = false;
 
     // The CPU address of [offset, offset + bytes) of the arena, inside an allocation the caller holds (its unit
     // cannot go while it lives), in constant time (src/arena_backing.h). Null, with a rate-limited line, when no
@@ -8686,7 +8706,7 @@ public:
         // logs the same wrap). Such an import is not used: the shadow buffer in the arena answers, as when the
         // import is refused. LEONIDA_IMPORT_BELOW_ARENA=1 keeps the import (for a shader library whose programs
         // sign-extend the address).
-        if (buffer_va_ && buffer_va_ < device_.arena.address && !signed_vsharp_offsets()) {
+        if (buffer_va_ && buffer_va_ < device_.arena.address && !import_below_arena()) {
             static std::atomic<int> logged{0};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
                 std::fprintf(stderr,
@@ -14995,12 +15015,33 @@ public:
         // bound in blocks as allocations need it, and maxMemoryAllocationSize bounds a block, not the arena. A device
         // without it, or whose sparse address space is smaller than the arena (llvmpipe: 2 GiB), keeps one
         // allocation behind the whole arena, reached through the same accessors.
+        //
+        // Every buffer outside the arena that a shader reaches (geometry copies, title windows and shadows outside it,
+        // upload and readback buffers) is named by its device address minus heap_base, in a V#'s 48 bits and in root
+        // views. A driver may place a sparse buffer anywhere relative to ordinary ones: RADV gives sparse buffers a
+        // range of their own 64 TiB above them (Mesa 26.3.1: 0xffffc00100200000 against 0xffff800100010000), so with a
+        // sparse arena every other buffer has a negative offset. Shaders that sign-extend the 48-bit base reach it
+        // (every address RADV hands out lies in one 2^47 half of the 48-bit space, so any two are within 2^47 of
+        // each other); older ones, which zero-extend, do not. So the arena is sparse only when every loaded module
+        // sign-extends (VsharpBaseCensus), and each block outside it is checked against that range when it is made.
+        leonida::VsharpBaseCensus bases{};
+        if (const leonida::ShaderLibrary* library = state_.library()) bases = library->vsharp_base_census();
+        g_pack_signed_vsharp_offsets.store(bases.signed_offsets(), std::memory_order_relaxed);
+        std::fprintf(stderr, "[rt] d3d12: V# bases: %s offsets from heap_base (%zu of %zu modules sign-extend)%s\n",
+                     signed_vsharp_offsets() ? "signed" : "unsigned", bases.sign_extended, bases.total(),
+                     import_below_arena() && !bases.signed_offsets() ? " (LEONIDA_IMPORT_BELOW_ARENA)" : "");
         const bool sparse_capable = state_.info.arena_bind_queue && state_.info.features.sparseBinding &&
                                     state_.info.features.sparseResidencyBuffer &&
                                     state_.info.residency_non_resident_strict && vk.vkQueueBindSparse;
+        state_.arena_sparse_capable = sparse_capable;
+        if (sparse_capable && !signed_vsharp_offsets())
+            std::fprintf(stderr, "[rt] d3d12: GPU address arena: one allocation, not sparse: %zu of the %zu loaded "
+                                 "modules read a V# base unsigned, so no buffer may lie below the arena (translate the "
+                                 "shaders again to bind the arena's memory as it is used)\n",
+                         bases.zero_extended, bases.total());
         const leonida::ArenaLimits sparse_limits{state_.info.max_buffer_size, 0};
         const bool sparse =
-            sparse_capable &&
+            sparse_capable && signed_vsharp_offsets() &&
             leonida::decide_arena_size(set ? text : nullptr, sparse_limits).bytes <= state_.info.sparse_address_space;
         const leonida::ArenaLimits limits =
             sparse ? sparse_limits
@@ -21284,6 +21325,24 @@ std::uint64_t device_arena_size(ID3D12Device* device) {
     if (!real) real = device;
     const Device* d = Device::from<Device>(real);
     return d ? d->state().arena.size : 0;
+}
+
+ArenaMemoryState device_arena_memory(ID3D12Device* device) {
+    if (!device) return {};
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    const Device* d = Device::from<Device>(real);
+    if (!d) return {};
+    auto& state = const_cast<DeviceState&>(d->state());  // the arena's mutex
+    ArenaMemoryState out;
+    std::lock_guard lock(state.arena.mutex);
+    out.size = state.arena.size;
+    out.address = state.arena.address;
+    out.bound = state.arena.backing.stats().bound;
+    out.sparse = state.arena.backing.sparse();
+    out.sparse_capable = state.arena_sparse_capable;
+    out.signed_offsets = state.vsharp_offsets_signed();
+    return out;
 }
 
 ImageMemoryStats image_memory_stats(ID3D12Device* device) {
