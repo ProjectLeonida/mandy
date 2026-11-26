@@ -1067,6 +1067,11 @@ struct TileMapping {
     bool operator==(const TileMapping&) const = default;
 };
 
+struct SparseImageTileInfo {
+    TileShape shape{};
+    std::uint32_t element_bytes = 0;
+};
+
 struct SparseResource {
     SparseResource(VkDevice device, const VulkanDeviceFunctions& vk) : device(device), vk(vk) {}
     SparseResource(const SparseResource&) = delete;
@@ -1081,6 +1086,7 @@ struct SparseResource {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkImage image = VK_NULL_HANDLE;
     VkExtent2D image_extent{};
+    SparseImageTileInfo image_tile{};
     std::uint64_t tile_count = 0;
     std::uint32_t memory_types = 0;
     std::map<std::uint64_t, TileMapping> mapped;
@@ -4164,7 +4170,7 @@ private:
             if (page.heap && !(resource->memory_types & (1u << page.heap->memory_type))) return false;
             const VkDeviceMemory memory = page.heap ? page.heap->memory : VK_NULL_HANDLE;
             if (resource->image) {
-                constexpr auto shape = element_tile_shape(false, 4);
+                const auto shape = resource->image_tile.shape;
                 const auto extent = resource->image_extent;
                 const auto columns = 1 + (extent.width - 1) / shape.width;
                 const auto x = std::uint32_t(index % columns) * shape.width;

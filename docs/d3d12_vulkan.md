@@ -1802,8 +1802,8 @@ and updating `heap_base` for all subsequent commands; do it at a frame boundary,
 fit on smaller PC GPUs. This is a product requirement, not something the layer can hide.
 
 **Reserved resources.** `CreateReservedResource` and the queue tile APIs use Vulkan sparse binding for buffers and
-compatible single-mip RGBA8 2D textures (section 4.2). Other descriptions have fully allocated backing. Wider
-texture coverage and the game's use of tile streaming remain open.
+compatible single-mip, single-layer 2D textures in typed, uncompressed color formats (section 4.2).
+Supported reserved descriptions that cannot use sparse binding have fully allocated backing.
 
 ### 3.4 Descriptor heaps and the bindless model
 
@@ -3031,14 +3031,21 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   - Drivers that exclude the host-visible arena memory type from sparse buffers (including NVIDIA 621.01 on the
     RTX 3090) use a dedicated device-local allocation per heap for its tiles. A heap with this dedicated backing
     cannot mix placed buffers and sparse mappings.
-  - D3D-285 extends these mappings to single-sample `R8G8B8A8_UNORM` reserved 2D textures with one mip, one
-    layer and no resource flags. The Vulkan image must support sparse aliases and zero reads from unmapped tiles,
-    with 128 × 128 color blocks aligned to 64 KiB. Images requiring an opaque mip tail or separately bound metadata
-    keep the fully allocated fallback. The image is transitioned while still unbound and kept in `GENERAL` so
-    mapping an alias preserves contents. Image tiles use dedicated device-local heap memory and can alias tiles
-    of compatible sparse images. Buffer and placed-resource aliases with texture tiles are outside this path.
-  - `CopyTiles` transfers RGBA8 tiles in either direction. Partial edge blocks use the full 512-byte linear row
-    pitch and transfer only in-bounds texels. Byte-unaligned offsets use transfer scratch.
+  - Reserved 2D textures can use sparse mappings for typed, uncompressed color formats with matching native
+    storage, one standard mip, one layer, one sample and no resource flags. For 1-, 2-, 4-, 8- and 16-byte texels
+    the tile shapes are 256×256, 256×128, 128×128, 128×64 and 64×64 respectively. Vulkan must report the same
+    shape, 64 KiB alignment, compatible device-local memory, a single color requirement and no opaque mip tail.
+    The existing RGBA8 path also accepts a small mip that D3D reports as packed when Vulkan exposes it as a
+    standard sparse mip. This path requires sparse aliases and zero reads from unmapped tiles. The image is
+    transitioned while still unbound and kept in `GENERAL`. Two images can share a heap page's contents when
+    their Vulkan formats belong to the same compatibility class, their sparse block shapes match and both accept
+    the heap memory type. A write through one alias needs a memory dependency before the other alias reads or
+    writes that page. [Vulkan sparse memory aliasing](https://docs.vulkan.org/spec/latest/chapters/sparsemem.html#sparsememory-sparse-memory-aliasing).
+    BC, typeless resources and emulated formats retain their existing handling.
+  - `CopyTiles` advances by 64 KiB per tile in either direction. At a right or bottom edge it copies the in-bounds
+    texels using a full tile's linear row pitch (256, 512 or 1024 bytes). A buffer offset that needs more
+    alignment for the Vulkan transfer uses scratch. `d3d12_sparse_formats_test` checks format admission,
+    mapping and copy behavior on native D3D12 WARP and Vulkan.
     `d3d12_texture_tiles_test` compares initially unmapped tiles, column mappings, aliases, and a fence-delayed
     remap with native D3D12, including clipped edges and byte-unaligned offsets.
 - `D3D12_RESOURCE_DESC::Layout`: the public `ROW_MAJOR` and `64KB_STANDARD_SWIZZLE` values plus the Xbox `0x101`

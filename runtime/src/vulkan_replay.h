@@ -2372,7 +2372,9 @@ inline bool stage_unaligned_tile(const ReplayFunctions& vk, Prepared& p, const R
     const VkDeviceSize slice_bytes = row_bytes * rows;
     const VkDeviceSize total_bytes = slice_bytes * depth;
     VkDeviceSize scratch_offset = 0;
-    if (!total_bytes || !vk.copy_scratch || !vk.copy_scratch(total_bytes, p.tile_scratch, scratch_offset)) return false;
+    if (!total_bytes || !vk.copy_scratch || !vk.copy_scratch(total_bytes, p.tile_scratch, scratch_offset) ||
+        !p.tile_scratch || scratch_offset % std::max(4u, fmt.bytes) || scratch_offset > UINT64_MAX - total_bytes)
+        return false;
     const auto app_offset = region.bufferOffset;
     const auto add_copy = [&](VkDeviceSize linear, VkDeviceSize scratch, VkDeviceSize bytes) {
         p.tile_rows.push_back(upload ? VkBufferCopy{linear, scratch, bytes} : VkBufferCopy{scratch, linear, bytes});
@@ -3810,7 +3812,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     const BlockFormat fmt = copy_block_format(image, region.imageSubresource.aspectMask);
                     const std::uint32_t alignment =
                         (region.imageSubresource.aspectMask & depth_stencil_aspects) || image.rgb96 ? 4 : fmt.bytes;
-                    if (alignment > 1 && region.bufferOffset % alignment &&
+                    // CopyTiles accepts arbitrary byte offsets. Transfer-only queues also require word
+                    // alignment for a buffer-image copy, even for one- and two-byte texels.
+                    const auto required = texture_copy->tile_footprint ? std::max(4u, alignment) : alignment;
+                    if (required > 1 && region.bufferOffset % required &&
                         !detail::stage_unaligned_tile(vk, p, image, fmt, upload))
                         return unsupported_at(__LINE__);
                 }

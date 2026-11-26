@@ -78,6 +78,7 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
 std::shared_ptr<const leonida::TileHeapAllocation> tile_heap(ID3D12Heap* heap, const leonida::VulkanContext& context,
                                                            bool image, std::uint32_t memory_types);
 bool is_sparse_image(ID3D12Resource* resource);
+leonida::SparseImageTileInfo sparse_image_tile_info(ID3D12Resource* resource);
 
 // Colour image used for unordered accesses to an Xbox single-plane depth surface.
 struct XboxDepthStorage {

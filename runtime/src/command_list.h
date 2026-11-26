@@ -340,7 +340,7 @@ struct CopyTexture {
     CopyLocation src;
     bool has_box;
     CopyBox box;
-    bool tile_footprint = false;  // RGBA8 CopyTiles: rows in a linear 64 KiB tile, at any byte offset
+    bool tile_footprint = false;  // CopyTiles: rows in a linear 64 KiB tile, at any byte offset
 };
 
 // CopyResource: every subresource, or the whole buffer.

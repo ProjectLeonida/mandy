@@ -40,6 +40,7 @@ namespace rt::d3d12 {
 struct TileGrid {
     std::uint64_t columns = 0;
     std::uint64_t rows = 0;
+    leonida::SparseImageTileInfo image_tile{};
 };
 
 static TileGrid tile_grid(ID3D12Resource* resource) {
@@ -47,13 +48,13 @@ static TileGrid tile_grid(ID3D12Resource* resource) {
     const auto desc = resource->GetDesc();
     if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && desc.Width)
         return {1 + (desc.Width - 1) / leonida::tile_size_in_bytes, 1};
-    if (!is_sparse_image(resource)) return {};
-    constexpr auto shape = leonida::element_tile_shape(false, 4);
-    return {1 + (desc.Width - 1) / shape.width, 1 + (desc.Height - 1) / shape.height};
+    const auto tile = sparse_image_tile_info(resource);
+    if (!tile.element_bytes) return {};
+    return {1 + (desc.Width - 1) / tile.shape.width, 1 + (desc.Height - 1) / tile.shape.height, tile};
 }
 
 static bool append_tile_regions(const D3D12_TILED_RESOURCE_COORDINATE* start, const D3D12_TILE_REGION_SIZE* size,
-                                TileGrid grid, std::vector<leonida::TileRegion>& regions) {
+                                const TileGrid& grid, std::vector<leonida::TileRegion>& regions) {
     const auto x = start ? start->X : 0;
     const auto y = start ? start->Y : 0;
     if ((start && (start->Z || start->Subresource)) || x >= grid.columns || y >= grid.rows) return false;
@@ -710,14 +711,15 @@ public:
             (!to_linear && direction != D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE))
             return check(false);
         const auto tiled_id = resource_id(tiled), linear_id = resource_id(linear);
-        if (is_sparse_image(tiled)) {
+        if (grid.image_tile.element_bytes) {
             const auto buffer = linear->GetDesc();
             const auto desc = tiled->GetDesc();
             const auto count = size->UseBox ? std::uint64_t(size->Width) * size->Height : size->NumTiles;
             if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || buffer.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
                 linear_offset > buffer.Width || count > (buffer.Width - linear_offset) / leonida::tile_size_in_bytes)
                 return check(false);
-            constexpr auto shape = leonida::element_tile_shape(false, 4);
+            const auto shape = grid.image_tile.shape;
+            const auto row_pitch = shape.width * grid.image_tile.element_bytes;
             const leonida::CopyLocation image{tiled_id, false, 0, 0, 0, 0, 0, 0};
             for (const auto& region : regions) {
                 for (std::uint64_t tile = region.first; tile < region.first + region.count; ++tile) {
@@ -726,7 +728,7 @@ public:
                     const auto width = std::min(shape.width, std::uint32_t(desc.Width) - x);
                     const auto height = std::min(shape.height, desc.Height - y);
                     const leonida::CopyLocation footprint{
-                        linear_id, true, 0, linear_offset, shape.width, shape.height, 1, shape.width * 4};
+                        linear_id, true, 0, linear_offset, shape.width, shape.height, 1, row_pitch};
                     auto copy = to_linear
                         ? leonida::CopyTexture{footprint, 0, 0, 0, image, true, {x, y, 0, x + width, y + height, 1}}
                         : leonida::CopyTexture{image, x, y, 0, footprint, true, {0, 0, 0, width, height, 1}};

@@ -7575,7 +7575,10 @@ public:
     VkImage bound_image() const { return descriptor_image(); }
     // A deferred placed image with no memory yet, other than one that shows the shared zero image meanwhile.
     bool deferrable_sample() const { return !shared_zero_ && unbound_attachment(); }
-    bool sparse_image() const { return sparse_image_; }
+    bool sparse_image() const { return sparse_image_ != nullptr; }
+    leonida::SparseImageTileInfo sparse_image_tile_info() const {
+        return sparse_image_ ? sparse_image_->image_tile : leonida::SparseImageTileInfo{};
+    }
     VkBuffer buffer() const { return buffer_; }
     const D3D12_RESOURCE_DESC& desc() const { return desc_; }
     bool rgba4_render_backing() const {return desc_.Format==DXGI_FORMAT_B4G4R4A4_UNORM && format_==VK_FORMAT_R8G8B8A8_UNORM;}
@@ -8118,19 +8121,23 @@ public:
         return S_OK;
     }
 
-    HRESULT create_sparse_image() {
+    HRESULT create_sparse_image(leonida::SparseImageTileInfo tile) {
         auto& vk = device_.context->vk;
         const auto format = device_.texture_format(desc_);
         TextureCreateInfo create(desc_, format, false);
         create.info.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
                              VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+        // CopyTiles transfers the logical format's bytes verbatim. An emulated backing cannot use these tiles.
+        if (format.format != vulkan_format(desc_.Format, false).format) return E_NOTIMPL;
         HRESULT support = device_.check_image_support(create.info);
         if (FAILED(support)) return support == E_INVALIDARG ? E_NOTIMPL : support;
         device_.share(create.info);
         auto sparse = std::make_shared<leonida::SparseResource>(device_.info.device, vk);
         const auto result = vk.vkCreateImage(device_.info.device, &create.info, nullptr, &sparse->image);
         if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) return E_NOTIMPL;
-        if (result != VK_SUCCESS) return E_OUTOFMEMORY;
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) return E_OUTOFMEMORY;
+        if (result == VK_ERROR_DEVICE_LOST) return DXGI_ERROR_DEVICE_REMOVED;
+        if (result != VK_SUCCESS) return E_FAIL;
 
         VkMemoryRequirements requirements{};
         vk.vkGetImageMemoryRequirements(device_.info.device, sparse->image, &requirements);
@@ -8143,20 +8150,22 @@ public:
         if (count != 1) return E_NOTIMPL;  // exactly one color aspect, with no separately bound metadata
         VkSparseImageMemoryRequirements image_requirements{};
         vk.vkGetImageSparseMemoryRequirements(device_.info.device, sparse->image, &count, &image_requirements);
-        constexpr auto shape = leonida::element_tile_shape(false, 4);
+        const auto shape = tile.shape;
         const auto& properties = image_requirements.formatProperties;
         const auto granularity = properties.imageGranularity;
-        if (properties.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || granularity.width != shape.width ||
-            granularity.height != shape.height || granularity.depth != 1 ||
+        if (properties.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+            (properties.flags & VK_SPARSE_IMAGE_FORMAT_NONSTANDARD_BLOCK_SIZE_BIT) ||
+            granularity.width != shape.width || granularity.height != shape.height || granularity.depth != shape.depth ||
             !image_requirements.imageMipTailFirstLod || image_requirements.imageMipTailSize)
             return E_NOTIMPL;
 
+        sparse->image_tile = tile;
         sparse->image_extent = {create.info.extent.width, create.info.extent.height};
         sparse->tile_count = (1 + (sparse->image_extent.width - 1) / shape.width) *
                              std::uint64_t(1 + (sparse->image_extent.height - 1) / shape.height);
         sparse->memory_types = requirements.memoryTypeBits;
         image_ = sparse->image;
-        sparse_image_ = true;
+        sparse_image_ = sparse;
         format_ = format.format;
         aspects_ = format.aspects;
         image_address_ = device_.next_image_address.fetch_add(256);
@@ -8167,6 +8176,7 @@ public:
         binding_.aspects = aspects_;
         binding_.width = sparse->image_extent.width;
         binding_.height = sparse->image_extent.height;
+        binding_.sampled = (create.info.usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0;
         // An unbound tile reads as zero. Keep the layout stable once the image can share memory with an alias.
         binding_.not_zeroed = true;
         binding_.simultaneous_access = true;
@@ -9288,7 +9298,7 @@ private:
     bool aliased_ = false;            // va_ is in leonida::title_va_aliases(), reached at title_alias_
     std::uint64_t title_alias_ = 0;
     bool reserved_ = false;
-    bool sparse_image_ = false;
+    std::shared_ptr<const leonida::SparseResource> sparse_image_;
     bool placed_ = false;
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
     std::unique_ptr<Resource> depth_conversion_;
@@ -19625,6 +19635,7 @@ private:
             return d3d12_trace::result(method, E_INVALIDARG);
         }
         D3D12_RESOURCE_DESC backing = *desc;
+        leonida::SparseImageTileInfo sparse_tile{};
         const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return d3d12_trace::result(method, E_INVALIDARG);
@@ -19643,6 +19654,14 @@ private:
                 return d3d12_trace::result(method, E_INVALIDARG);
             }
             backing.MipLevels = desc->MipLevels;
+            // RGBA8 already accepts small tail-free Vulkan images even when GetResourceTiling calls mip 0 packed.
+            if (tiling.standard_mips == 1 || backing.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                const auto format = vulkan_format(backing.Format, false);
+                const auto block = leonida::block_format(format.format, format.aspects);
+                if (format.aspects == VK_IMAGE_ASPECT_COLOR_BIT && !format.typeless && !format.rgb96 && block.block == 1 &&
+                    std::uint64_t(tiling.shape.width) * tiling.shape.height * block.bytes == leonida::tile_size_in_bytes)
+                    sparse_tile = {tiling.shape, block.bytes};
+            }
         }
         if (const char* why = committed_resource_refusal(heap, D3D12_HEAP_FLAG_NONE, backing, state, clear,
                                                          acceleration_structures(), state_.uma)) {
@@ -19668,13 +19687,13 @@ private:
             }
             resource = sparse;
         } else if (state_.sparse_image_tiles && backing.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-                   backing.Format == DXGI_FORMAT_R8G8B8A8_UNORM && backing.Width && backing.Width <= UINT32_MAX &&
+                   sparse_tile.element_bytes && backing.Width && backing.Width <= UINT32_MAX &&
                    backing.Height && backing.DepthOrArraySize == 1 && backing.MipLevels == 1 &&
                    backing.SampleDesc.Count == 1 && !backing.SampleDesc.Quality &&
                    backing.Flags == D3D12_RESOURCE_FLAG_NONE && !clear && !castable_count) {
             auto* sparse = new Resource(state_, backing, heap, D3D12_HEAP_FLAG_NONE);
             sparse->attach_device(identity());
-            hr = sparse->create_sparse_image();
+            hr = sparse->create_sparse_image(sparse_tile);
             if (SUCCEEDED(hr)) resource = sparse;
             else {
                 sparse->Release();
@@ -19901,6 +19920,11 @@ XboxDepthStorage xbox_depth_storage(ID3D12Resource* resource) {
 bool is_sparse_image(ID3D12Resource* resource) {
     const auto* object = Resource::from<Resource>(resource);
     return object && object->sparse_image();
+}
+
+leonida::SparseImageTileInfo sparse_image_tile_info(ID3D12Resource* resource) {
+    const auto* object = Resource::from<Resource>(resource);
+    return object ? object->sparse_image_tile_info() : leonida::SparseImageTileInfo{};
 }
 
 static HRESULT enable_depth_stencil_uav(ID3D12Resource* resource, D3D12_HEAP_FLAGS storage_heap_flags) {
