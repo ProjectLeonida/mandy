@@ -680,9 +680,13 @@ side inwards:
       covers a full 2048-sampler D3D12 heap plus room for literal and static S#s.
     - 2D images: up to 65536.
     - storage arrays: up to 4096 each, capped by their dimension's sampled array or by 256 for storage-only 1D arrays.
-    - 2D-array images up to 16384, 3D and 1D images up to 4096 each (the title streams more cube maps, texture
-      arrays and 1D lookups than the defaults hold: each distinct T# of one takes its own index, and a native boot
-      filled the 1024 2D-array and 256 1D indices during the story load).
+    - 2D-array, 3D and 1D images: up to 65536 each, as many as 2D, grown together (one count for the three while the
+      limits stop them short of it), so no dimension is favoured. A texture keeps an index for each distinct T# of
+      it for as long as it lives, and which dimensions its textures have is the title's choice: a native boot
+      filled the default 1024 2D-array and 256 1D indices during the story load, and world runs filled the 4096 1D
+      indices of the sizes before this with 4092 T#s of 4090 live 1D textures. The bound is memory, not the
+      device's limits (RADV allows 8388606 sampled images): every element of every array is in each generation's
+      descriptor pool, used or not.
 
     Growth leaves 64 descriptors of each limit to the other sets of a pipeline layout. It also stays within
     `maxPerSetDescriptors`, which never shrinks the default counts, because a layout past it may still be
@@ -698,9 +702,18 @@ side inwards:
     shader reads the fallback. `d3d12_descriptor_test` then fills each short array to its last index and checks that
     the next view and sampler are refused.
     The MS arrays keep their default counts. On an RTX 5070 (driver 621.24, 1048576 of each type
-    and 4000 samplers) the set has 65536 2D images, 3936 samplers, 16384 2D-array, 4096 3D and 4096 1D images and
-    4096 storage indices in each dimension: 152929 descriptors, 5-10 MiB at 32-64 bytes a descriptor. The device prints the counts it chose, and
-    `bindless_sizing_test` checks the rules on synthetic limits.
+    and 4000 samplers) the set has 65536 2D, 2D-array, 3D and 1D images each, 3936 samplers and 4096 storage indices
+    in each dimension: 325729 descriptors with the MS pairs, 10-20 MiB at 32-64 bytes a descriptor. RADV (Mesa 26.3,
+    the Raphael iGPU and the RX 7900 XTX) and llvmpipe get the same image counts and 4096 samplers. The device prints
+    the counts it chose (`bindless set:`), `bindless_sizing_test` checks the rules on synthetic limits, and
+    `vk_bindless_dimensions_test` reads 5000 live 1D, 2D-array and 3D images each through their indices in a set
+    sized from the device's own limits.
+  - A T# the title writes into a console descriptor heap that set 0 has no room for is refused, and counted in the
+    heap's `unbound T#s by reason` line, as `the bindless array of the T#'s dimension is full` (or `the bindless
+    storage arrays of the T#'s dimension are full` for a UAV whose dimension has free indices only above the shorter
+    storage arrays), not as `no view for the T#'s format or range`. The first such refusal of a dimension also logs
+    `a bindless image array is full; dimension N (name)` with the indices, the T#s and textures that hold them and how
+    many of those textures are still registered at their address (a texture's indices go back when it goes).
   - An image view has one index in its dimension (2D, 2D array, 3D, 1D, 2DMS, 2DMS array or 1D array), shared by the
     bindings for that dimension. The runtime adds sampled-image bindings in pairs for 2DMS and 2DMS array:
     20/21 for floating-point and normalized color, 22/23 for unsigned integers, and 24/25 for signed integers.

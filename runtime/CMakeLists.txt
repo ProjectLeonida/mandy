@@ -2284,6 +2284,34 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_null_descriptor COMMAND vk_null_descriptor_test)
     set_tests_properties(vk_null_descriptor PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  # More than 4096 live 1D, 2D-array and 3D images, each read through its bindless index, in a set sized from the
+  # device's limits; a full array's refusal reason and indices coming back. The shader is GLSL; without
+  # glslangValidator the test skips.
+  add_executable(vk_bindless_dimensions_test test/vk_bindless_dimensions_test.cpp)
+  target_link_libraries(vk_bindless_dimensions_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_bindless_dimensions_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_bindless_dimensions_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    set(_bindless_dimensions_spv ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_bindless_dimensions.spv)
+    add_custom_command(OUTPUT ${_bindless_dimensions_spv}
+      COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${_bindless_dimensions_spv}
+              ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_bindless_dimensions.comp
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_bindless_dimensions.comp
+      COMMENT "Compiling the bindless dimensions test shader" VERBATIM)
+    target_sources(vk_bindless_dimensions_test PRIVATE ${_bindless_dimensions_spv})
+    target_compile_definitions(vk_bindless_dimensions_test PRIVATE
+                               LEONIDA_TEST_BINDLESS_DIMENSIONS_SPV="${_bindless_dimensions_spv}")
+  else()
+    message(STATUS "glslangValidator not found: vk_bindless_dimensions_test skips")
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_bindless_dimensions COMMAND vk_bindless_dimensions_test)
+    set_tests_properties(vk_bindless_dimensions PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   # CPU-only: the bindless set's array sizes from synthetic device limits.
   add_executable(bindless_sizing_test test/bindless_sizing_test.cpp)
   target_link_libraries(bindless_sizing_test PRIVATE Vulkan::Headers)

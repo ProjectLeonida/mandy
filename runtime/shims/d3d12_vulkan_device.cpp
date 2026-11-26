@@ -7083,7 +7083,9 @@ struct DeviceState {
 
     // Gives the T# `words` a view in set 0 and an entry in the hash table, unless it has them. `storage`: shaders
     // write through it too (an unordered-access view), so it also goes into the storage arrays, which are
-    // shorter. False when set 0 cannot show the image; the descriptor then finds the fallback at index 0.
+    // shorter. False when set 0 cannot show the image; the descriptor then finds the fallback at index 0. `why`, when
+    // given, is set to the reason when it is that set 0 has no room (or no array) for the image's dimension, and left
+    // alone otherwise (no view could be made for the T#).
     bool bind_image(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image, VkImage vk_image,
                     VkFormat image_format, VkImageAspectFlags aspects, bool storage,
                     bool allow_channel_cast = false, VkFormat uint_backed = VK_FORMAT_UNDEFINED) {
@@ -7093,7 +7095,8 @@ struct DeviceState {
     }
     bool bind_image_locked(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image,
                            VkImage vk_image, VkFormat image_format, VkImageAspectFlags aspects, bool storage,
-                           bool allow_channel_cast = false, VkFormat uint_backed = VK_FORMAT_UNDEFINED) {
+                           bool allow_channel_cast = false, VkFormat uint_backed = VK_FORMAT_UNDEFINED,
+                           const char** why = nullptr) {
         namespace g = leonida::gfx10;
         if (!bindless) return false;
         auto pending = pending_image_keys.find(vk_image);
@@ -7138,7 +7141,7 @@ struct DeviceState {
         const bool sampled_only = uint_backed || (view_format != image_format && view_format != VK_FORMAT_UNDEFINED);
         return bind_image_views_locked(words, image, vk_image, view_format, channels_format,
                                        uint_backed ? image_format : view_format, aspects, true, storage, {},
-                                       sampled_only);
+                                       sampled_only, why);
     }
     // The same for a view whose formats the caller has worked out: `view_format` of the sampled view (made when
     // `sampled`), `channels_format` whose channels the T#'s swizzle selects from, `storage_format` of the storage view.
@@ -7152,7 +7155,7 @@ struct DeviceState {
     bool bind_image_views_locked(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image,
                                  VkImage vk_image, VkFormat view_format, VkFormat channels_format,
                                  VkFormat storage_format, VkImageAspectFlags aspects, bool sampled, bool storage,
-                                 VolumeSlices slices, bool sampled_only) {
+                                 VolumeSlices slices, bool sampled_only, const char** why = nullptr) {
         namespace g = leonida::gfx10;
         if (!bindless) {
             if (storage) log_once("unordered-access view needs the Vulkan bindless set; type", int(image.type));
@@ -7307,24 +7310,37 @@ struct DeviceState {
                 vk.vkDestroyImageView(info.device, entry.mirror_storage, nullptr);
                 entry.mirror_storage = VK_NULL_HANDLE;
             }
-            if (first_diagnostic("a bindless image array is full; dimension", int(dimension))) {
+            using Refusal = leonida::BindlessSet::ImageRefusal;
+            const Refusal refusal = bindless->image_refusal(dimension, entry.storage != VK_NULL_HANDLE, sampled_class);
+            if (why)
+                *why = refusal == Refusal::no_array       ? "set 0 has no array for the T#'s dimension"
+                       : refusal == Refusal::storage_full ? "the bindless storage arrays of the T#'s dimension are full"
+                                                          : "the bindless array of the T#'s dimension is full";
+            if (refusal != Refusal::no_array &&
+                first_diagnostic("a bindless image array is full; dimension", int(dimension))) {
                 // Whether the array holds live textures or stale views: the T#s it holds, the textures they name,
-                // and the most T#s of one texture (a texture whose T#s keep changing, a streamed mip clamp say,
-                // keeps an index for each until it goes).
-                std::size_t entries = 0, replaced = 0, most = 0;
+                // the most T#s of one texture (a texture whose T#s keep changing, a streamed mip clamp say, keeps an
+                // index for each until it goes), and how many of those textures are still the one registered at
+                // their address (a texture leaves the set when the one registered there goes: forget_image).
+                std::size_t entries = 0, replaced = 0, most = 0, registered = 0;
                 std::map<std::uint64_t, std::size_t> per_texture;
                 for (const auto& [key, held] : image_entries)
                     if (held.dimension == dimension) {
                         ++entries;
                         most = std::max(most, ++per_texture[held.address]);
                     }
+                for (const auto& texture : per_texture) registered += images_by_address.count(texture.first);
                 for (const auto& held : replaced_images) replaced += held.dimension == dimension;
+                constexpr const char* names[] = {"2D", "2D array", "3D", "1D", "1D array", "2D MS", "2D MS array"};
                 std::fprintf(stderr,
-                             "[rt] d3d12: a bindless image array is full; dimension %d: %u indices, %zu T#s of %zu "
-                             "textures (at most %zu T#s of one), %zu replaced views kept; further T#s of this "
-                             "dimension read the fallback\n",
-                             int(dimension), bindless->image_capacity(dimension), entries, per_texture.size(), most,
-                             replaced);
+                             "[rt] d3d12: a bindless image array is full; dimension %d (%s)%s: %u indices, %u in the "
+                             "storage arrays, %zu T#s of %zu textures (%zu registered at their address, at most %zu "
+                             "T#s of one), %zu replaced views kept; further T#s of this dimension read the "
+                             "fallback\n",
+                             int(dimension), names[int(dimension)],
+                             refusal == Refusal::storage_full ? ", its storage range" : "",
+                             bindless->image_capacity(dimension), bindless->storage_capacity(dimension), entries,
+                             per_texture.size(), registered, most, replaced);
             }
             if (entry.sampled) vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
             if (entry.storage) vk.vkDestroyImageView(info.device, entry.storage, nullptr);
@@ -13640,9 +13656,10 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
             return refuse("T# names layers the texture lacks");
         const bool storage = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !msaa &&
                              r.aspects() == VK_IMAGE_ASPECT_COLOR_BIT;
+        const char* unbound = "no view for the T#'s format or range";  // unless set 0 has no room (bind_image)
         if (!device.bind_image_locked(words, image, r.descriptor_image(), r.format(), r.aspects(), storage,
-                                      r.has_view_format_list(), r.uint_backed()))
-            return refuse("no view for the T#'s format or range");
+                                      r.has_view_format_list(), r.uint_backed(), &unbound))
+            return refuse(unbound);
         r.note_shader_view();  // Include descriptors written directly into title heaps.
         if (r.sparse_image()) sparse = r.id();
     }
