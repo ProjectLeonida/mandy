@@ -58,7 +58,16 @@ This page collects the setup steps and the problems testers have run into so far
     it with `VK_DRIVER_FILES=$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json`). That is the way to run with
     `LEONIDA_VK_VALIDATION=1` on a Mac: `brew install vulkan-validationlayers`, then set
     `VK_LAYER_PATH=$(brew --prefix)/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d` and
-    `DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix)/lib`.
+    `DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix)/lib`. On MoltenVK 1.4.2 the layer reports three messages that are
+    not test failures. `VUID-RuntimeSpirv-shaderDenormPreserveFloat16-06296` and
+    `VUID-VkShaderModuleCreateInfo-pCode-08740` come from `DenormPreserve 16`, which MoltenVK does not report support
+    for; that is the documented trade-off (design.md, "Float controls (f16 denormals)").
+    `VUID-vkCreateDescriptorSetLayout-support-09582` comes from `vk_bindless_test`, `vk_bindless_grow_test` and
+    `vk_null_descriptor_test`, whose bindless set has about 11,800 descriptors. MoltenVK's
+    `vkGetDescriptorSetLayoutSupport` answers false above `maxPerSetDescriptors`, which it computes as 4 × (31 buffers + 256 textures + 16 samplers) =
+    1212, from its per-stage counts without Metal argument buffers. Yet it reports update-after-bind limits far above
+    that, and the draws through the full set read back exact. Hide the three with
+    `VK_LAYER_MESSAGE_ID_FILTER=VUID-RuntimeSpirv-shaderDenormPreserveFloat16-06296,VUID-VkShaderModuleCreateInfo-pCode-08740,VUID-vkCreateDescriptorSetLayout-support-09582`.
 
 ## Build the test programs
 
