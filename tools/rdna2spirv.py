@@ -16968,11 +16968,12 @@ def assemble(gen):
 # whose only 64-bit integers are that idiom doesn't need the Int64 capability (Vulkan shaderInt64, which Intel's
 # drivers lack, #313): lower_addr64 rewrites it to (low, high) pairs of 32-bit words, OpIAddCarry / OpISubBorrow
 # carrying into the high word, compares high word first, and bitcasts the pair (a uvec2) to the pointer, as
-# GL_EXT_buffer_reference_uvec2 does. A shader with any other 64-bit integer use (64-bit multiplies, shifts by a
-# variable amount or by more than 32, a 64-bit OpPhi or variable) is left exactly as it was and keeps Int64.
+# GL_EXT_buffer_reference_uvec2 does. A 64-bit multiply (the swizzled buffer offset's index * stride) and a left
+# shift by a 32-bit value (its element-size log) are lowered too. A shader with any other 64-bit integer use (a right
+# shift by a variable amount, a 64-bit OpPhi or variable) is left exactly as it was and keeps Int64.
 # --int64-addresses turns the lowering off.
 _A64_PRODUCERS = ("OpUConvert", "OpShiftLeftLogical", "OpShiftRightLogical", "OpBitwiseOr", "OpBitwiseAnd", "OpIAdd",
-                  "OpISub", "OpSConvert", "OpBitcast", "OpShiftRightArithmetic")
+                  "OpISub", "OpSConvert", "OpBitcast", "OpShiftRightArithmetic", "OpIMul")
 # 64-bit compares of two addresses: high words first, then the low words.
 _A64_CMP = {"OpULessThan": ("OpULessThan", False), "OpULessThanEqual": ("OpULessThanEqual", False),
             "OpUGreaterThan": ("OpULessThan", True), "OpUGreaterThanEqual": ("OpULessThanEqual", True),
@@ -17007,7 +17008,8 @@ def lower_addr64(text):
     if not t64:
         return text
     v64 = set(c64) | set(prod)
-    # a shift's amount: a 64-bit or 32-bit constant of 1..32 (the 48-bit sign extension of host_addr shifts by 16)
+    # a shift's amount: a 64-bit or 32-bit constant of 1..32 (the 48-bit sign extension of host_addr shifts by 16), or
+    # for a left shift any 32-bit value (the swizzled buffer offset shifts by the element size's log, a V# field)
     shift = {r: v for r, v in {**c32, **c64}.items() if 1 <= v <= 32}
     narrow = {r: v for r, v in narrow.items() if v in v64}
     for res, (op, a) in list(cmp.items()):       # a compare of two 64-bit values; any other compare is left alone
@@ -17021,7 +17023,9 @@ def lower_addr64(text):
              (op == "OpBitcast" and len(a) == 1 and a[0] in v64) or \
              (op in ("OpShiftLeftLogical", "OpShiftRightLogical", "OpShiftRightArithmetic") and len(a) == 2 and
               a[0] in v64 and a[1] in shift) or \
-             (op in ("OpBitwiseOr", "OpBitwiseAnd", "OpIAdd", "OpISub") and len(a) == 2 and a[0] in v64 and
+             (op == "OpShiftLeftLogical" and len(a) == 2 and a[0] in v64 and a[1] not in v64 and
+              rtype.get(a[1]) == "%uint") or \
+             (op in ("OpBitwiseOr", "OpBitwiseAnd", "OpIAdd", "OpISub", "OpIMul") and len(a) == 2 and a[0] in v64 and
               a[1] in v64)
         if not ok:
             return text
@@ -17051,6 +17055,47 @@ def lower_addr64(text):
                 pair[res] = (a[0], const(0))
             elif op == "OpBitcast":                      # between the 64-bit integer types: the same words
                 pair[res] = pair[a[0]]
+            elif op == "OpShiftLeftLogical" and a[1] not in shift:
+                # A left shift by a 32-bit value k (0..63 matter; SPIR-V leaves a shift by 32 or more undefined, so
+                # each word's shift stays under 32): k & 31 on both words with the bits that cross, then the words
+                # move up one if k >= 32.
+                n += 1
+                (xl, xh), k, p = pair[a[0]], a[1], f"%a64_{n}"
+                out += [f"         {p}k = OpBitwiseAnd %uint {k} {const(31)}",
+                        f"         {p}r = OpISub %uint {const(31)} {p}k",
+                        f"         {p}l = OpShiftLeftLogical %uint {xl} {p}k",
+                        f"         {p}a = OpShiftLeftLogical %uint {xh} {p}k",
+                        f"         {p}b = OpShiftRightLogical %uint {xl} {p}r",     # lo >> (31 - k) >> 1: 0 when k = 0
+                        f"         {p}c = OpShiftRightLogical %uint {p}b {const(1)}",
+                        f"         {p}h = OpBitwiseOr %uint {p}a {p}c",
+                        f"         {p}g = OpUGreaterThanEqual %bool {k} {const(32)}",
+                        f"         {p}L = OpSelect %uint {p}g {const(0)} {p}l",
+                        f"         {p}H = OpSelect %uint {p}g {p}l {p}h"]
+                pair[res] = (p + "L", p + "H")
+            elif op == "OpIMul":
+                # The low 64 bits of the product: the low words' full product (its high word from the four 16-bit
+                # half products, with plain 32-bit multiplies, so the test interpreters can run it too), plus each
+                # low word times the other's high word into the high word (the rest lies above 64 bits).
+                n += 1
+                (xl, xh), (yl, yh), p = pair[a[0]], pair[a[1]], f"%a64_{n}"
+                h16, c16 = const(0xFFFF), const(16)
+                out += [f"         {p}l = OpIMul %uint {xl} {yl}",
+                        f"         {p}x0 = OpBitwiseAnd %uint {xl} {h16}", f"         {p}x1 = OpShiftRightLogical %uint {xl} {c16}",
+                        f"         {p}y0 = OpBitwiseAnd %uint {yl} {h16}", f"         {p}y1 = OpShiftRightLogical %uint {yl} {c16}",
+                        f"         {p}p00 = OpIMul %uint {p}x0 {p}y0", f"         {p}p01 = OpIMul %uint {p}x0 {p}y1",
+                        f"         {p}p10 = OpIMul %uint {p}x1 {p}y0", f"         {p}p11 = OpIMul %uint {p}x1 {p}y1",
+                        f"         {p}m0 = OpShiftRightLogical %uint {p}p00 {c16}",
+                        f"         {p}m1 = OpBitwiseAnd %uint {p}p01 {h16}", f"         {p}m2 = OpBitwiseAnd %uint {p}p10 {h16}",
+                        f"         {p}m3 = OpIAdd %uint {p}m0 {p}m1", f"         {p}m = OpIAdd %uint {p}m3 {p}m2",
+                        f"         {p}c0 = OpShiftRightLogical %uint {p}p01 {c16}", f"         {p}c1 = OpShiftRightLogical %uint {p}p10 {c16}",
+                        f"         {p}c2 = OpShiftRightLogical %uint {p}m {c16}",
+                        f"         {p}c3 = OpIAdd %uint {p}p11 {p}c0", f"         {p}c4 = OpIAdd %uint {p}c3 {p}c1",
+                        f"         {p}c = OpIAdd %uint {p}c4 {p}c2",
+                        f"         {p}a = OpIMul %uint {xl} {yh}",
+                        f"         {p}b = OpIMul %uint {xh} {yl}",
+                        f"         {p}d = OpIAdd %uint {p}c {p}a",
+                        f"         {p}h = OpIAdd %uint {p}d {p}b"]
+                pair[res] = (p + "l", p + "h")
             elif op == "OpShiftLeftLogical" and shift[a[1]] == 32:
                 pair[res] = (const(0), pair[a[0]][0])
             elif op == "OpShiftRightLogical" and shift[a[1]] == 32:
