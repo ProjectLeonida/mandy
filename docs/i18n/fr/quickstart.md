@@ -32,7 +32,7 @@ phase du monde. Aucune première image du monde n'a encore été vérifiée. Voi
 
 ## Plateformes
 
-Rien n'est jouable, sur aucune plateforme. Ce qui tourne aujourd'hui :
+Comme indiqué plus haut, rien n'est encore jouable, sur aucune plateforme. Ce qui tourne aujourd'hui :
 
 - **Windows** : tout (`make_game.py`, les outils, et le runtime `gta6rt` avec la couche D3D12 → Vulkan et ses tests).
 - **Linux** : le traducteur, les outils de ressources et les outils de test GPU Vulkan tournent nativement (testés
