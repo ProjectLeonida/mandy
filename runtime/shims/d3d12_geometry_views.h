@@ -337,6 +337,9 @@ public:
         }
     }
 
+    // The blocks the copies live in (TitleBufferWindows::for_each_block), without the views' locks.
+    const TitleBufferWindows& pool() const { return pool_; }
+
     bool lookup(VkDeviceAddress bda, std::uint64_t& host, std::uint64_t& bytes, std::uint64_t* source = nullptr,
                 bool* populated = nullptr) const {
         std::shared_lock lock(structure_mutex_);

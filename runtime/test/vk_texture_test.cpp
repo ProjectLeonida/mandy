@@ -327,7 +327,7 @@ int main(int argc, char** argv) {
     leonida::DescriptorTable desc_table(16);
     // The heap already holds the original key. Change only the registered key for the miss control.
     if (fetch_miss) tsharp[7] ^= 1;
-    desc_table.insert(tsharp, 1);
+    desc_table.insert(tsharp, 1, leonida::kind_sampled_bit(cube ? 1 : 0));
     desc_table.insert(ssharp, 1);
     const auto table = desc_table.build_gpu_buffer(true);
     VkBuffer tb; VkDeviceMemory tbm; void* tbp;

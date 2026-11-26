@@ -375,14 +375,78 @@ def match_version(game: str):
     return next((v for v in versions() if not probe_mismatches(game, v)), None)
 
 
+def manifest_presence(game: str, version: dict) -> tuple[int, list[str], list[str], list[str]]:
+    """How much of a version's manifest the folder holds, from names and sizes only: (files present with the
+    manifest's size, the names that are missing or not a regular file, the names with another size, and
+    "name (reason)" for each file whose metadata can't be read). As in probe_mismatches(), only a name that is not
+    there counts as missing: a file that exists but can't be read (permissions, a drive error) is listed apart."""
+    matched, missing, wrong, unreadable = 0, [], [], []
+    for rel, info in version["files"].items():
+        try:
+            st = os.stat(os.path.join(game, *rel.split("/")))
+        except (FileNotFoundError, NotADirectoryError):
+            missing.append(rel)
+            continue
+        except OSError as error:
+            unreadable.append(f"{rel} ({error.strerror or error})")
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            missing.append(rel)
+        elif st.st_size != info["size"]:
+            wrong.append(rel)
+        else:
+            matched += 1
+    return matched, missing, wrong, unreadable
+
+
+def partial_version_message(game: str, version: dict) -> str | None:
+    """The message for a folder that holds at least half of a version's manifest files with their sizes but misses
+    a probe file, so it is an incomplete copy of that version rather than another game. None below half, and None
+    when a probe file is there with another size: a download that stopped early leaves files missing, while a probe
+    with another size (MicrosoftGame.Config above all) is what a complete copy of another build looks like, so
+    load_version() keeps its "not a supported version" message, which lists those sizes."""
+    total = len(version["files"])
+    matched, missing, wrong, unreadable = manifest_presence(game, version)
+    if not total or not matched or 2 * matched < total:
+        return None
+    if any(name in wrong for name in PROBES):
+        return None
+    files = version["files"]
+    name = f"{version['title']} {version['version']}"
+    head = f"an incomplete copy of {name}" if missing or wrong else f"{name}, but not every file could be checked"
+    lines = [f"This looks like {head}: {matched} of {total} manifest files are present with matching sizes."]
+    if missing:
+        lines.append(f"{len(missing)} file(s) missing ({sum(files[n]['size'] for n in missing):,} bytes):")
+        lines += [f"  missing  {n}" for n in missing]
+    if wrong:
+        lines.append(f"{len(wrong)} file(s) with another size (still being copied or downloaded?):")
+        lines += [f"  wrong size  {n} (expected {files[n]['size']:,} bytes)" for n in wrong]
+    if unreadable:
+        lines.append(f"Cannot read file metadata for {len(unreadable)} file(s) (not counted as missing):")
+        lines += [f"  cannot read  {n}" for n in unreadable]
+    if missing or wrong:
+        lines.append(f"Finish the download or copy of version {version['version']} into {game}, then build again.")
+    if unreadable:
+        lines.append("Make those files readable for this user (check their permissions and the drive), then build "
+                     "again.")
+    return "\n".join(lines)
+
+
 def load_version(game: str) -> dict:
-    reports = []
+    reports, candidates = [], []
     for version in versions():
         mismatches = probe_mismatches(game, version)
         if not mismatches:
             return version
+        candidates.append(version)
         reports.append(f"  {version['title']} {version['version']}\n    " + "\n    ".join(mismatches))
     notes = "".join(f"\n{container_message(p, h)}" for p, h in containers_in(game))
+    # A copy that stopped downloading early misses a probe file but holds most of one version: say which and what
+    # is missing instead of calling it unsupported. The closest version (most files present) is named.
+    partial = max(candidates, key=lambda v: manifest_presence(game, v)[0], default=None)
+    message = partial_version_message(game, partial) if partial else None
+    if message:
+        fail(message + notes)
     fail("This doesn't look like a supported version of the game. Point --game at the folder that holds "
          "MicrosoftGame.Config and the .rpf archives.\nSupported:\n"
          + "\n".join(reports or ["  No version manifests found."]) + notes)

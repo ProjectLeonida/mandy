@@ -782,7 +782,8 @@ W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               ("cs_w64x_cmp_sdst", [10240, 6144, 2053, 8224, 7714, 6184, 4144, 5])]
 # A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
-                ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
+                ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0]),
+                ("cs_w64x_partial_swizzle", [508, 523, 0, 0, 528, 0, 531, 0])]
 PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               # exp mrt0 done (no vm) with every lane on, EXEC off afterwards: written (.asm header, measured on gfx1036)
               "ps_exp_color_mask": (0x40000000, 0x40800000, 0x40000000, 0x40800000),

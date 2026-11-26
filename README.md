@@ -272,6 +272,10 @@ Either way it copies `gta6rt.exe` and `gta6rt_tls_host.dll` into `--out` and wri
 starts `gta6rt.exe` with `wine`, or with the Wine named by `WINE` (for Proton, its `files/bin/wine`). The same option
 skips the build on Windows.
 
+For `tools/pe_inspect.py`'s import classes on Linux, set `WINEPREFIX` to the prefix the loader runs in (or use
+`~/.wine`); without one, system DLLs are reported as `system (unverified)`
+([docs/design.md](docs/design.md#day-one-when-the-exe-is-here)).
+
 On Linux, run `<out>/gta6rt.sh --dry-run` to inspect the packaged title's imports, then
 `<out>/gta6rt.sh --init` to check TLS callbacks and DLL initialization. Use `<out>/gta6rt.sh --run` for startup.
 These commands use the package in `game_path.txt`, the port's `overlay` for writes, and Vulkan by default.

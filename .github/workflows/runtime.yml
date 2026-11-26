@@ -114,12 +114,16 @@ on:
       - "tools/wave64_halves.py"
       - "tools/xdxr_bvh.py"
   workflow_dispatch:
+  # Daily default-branch snapshot, staggered after CI; ordinary pushes keep coalescing.
+  schedule:
+    - cron: "53 3 * * *"
 
 permissions:
   contents: read
 
 concurrency:
   # Coalesce superseded pending pushes per branch without canceling an active main build.
+  # Scheduled/manual runs already use run_id and cannot be replaced by queued pushes.
   group: runtime-${{ github.event_name }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 

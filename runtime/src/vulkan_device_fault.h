@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +16,8 @@
 #include <cstring>
 #include <mutex>
 #include <span>
+#include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -244,6 +247,302 @@ inline void run_device_lost_hook() noexcept {
     if (const auto hook = device_lost_hook.load(std::memory_order_acquire)) hook();
 }
 
+// LOCAL DIAGNOSTIC (early device loss): what the submit lock, the recent submissions and the other threads were
+// doing when a submission stalled or the device was lost.
+inline std::int64_t diagnostic_ms() {
+    static const auto start = std::chrono::steady_clock::now();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+}
+
+#ifdef _WIN32
+extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void);
+inline std::uint32_t diagnostic_thread_id() { return static_cast<std::uint32_t>(GetCurrentThreadId()); }
+#else
+inline std::uint32_t diagnostic_thread_id() { return 0; }
+#endif
+
+// Set by gta6rt's main (src/thread_stacks.cpp): prints the call chain of thread `tid`, or of every other thread
+// when `tid` is 0. Unset in the tests.
+inline std::atomic<void (*)(std::uint32_t tid, const char* why) noexcept> thread_stack_hook{nullptr};
+
+inline void print_thread_stacks(std::uint32_t tid, const char* why) noexcept {
+    if (const auto hook = thread_stack_hook.load(std::memory_order_acquire)) hook(tid, why);
+}
+
+// The compute pipeline vkCreateComputePipelines is building now (one at a time is enough: the reports name the one
+// set last), for the submit-lock hold report. Names are ShaderLibrary strings, valid until device teardown.
+struct DriverCompile {
+    std::atomic<const char*> name{nullptr};
+    std::atomic<const char*> trigger{nullptr};
+    std::atomic<std::int64_t> since_ms{0};
+    std::atomic<std::size_t> bytes{0};
+};
+inline DriverCompile driver_compile;
+
+// VulkanContext's submit lock, which also remembers who holds it, since when and how many threads wait for it. A
+// submit or an idle wait blocked inside the driver holds it for as long as it blocks; the stall watchdog and the loss
+// report name that thread, and a hold of a second or more is logged when it ends.
+class SubmitMutex {
+public:
+    static constexpr std::int64_t kLongHoldMs = 1000;
+    // How long let_submit_finish(true) keeps letting queued submitters go first before the caller goes ahead anyway,
+    // so a steady stream of submits cannot hold the compile worker back for ever. Waiting out the holder itself is
+    // not capped: entering the driver while a submit is inside it is what lost the device.
+    static constexpr std::int64_t kHandoffCapMs = 250;
+
+    void lock() {
+        if (mutex_.try_lock()) {
+            taken();
+            return;
+        }
+        // Counted until this thread owns the lock (owner_ set), so let_submit_finish never sees neither.
+        waiting_.fetch_add(1, std::memory_order_relaxed);
+        mutex_.lock();
+        taken();
+        waiting_.fetch_sub(1, std::memory_order_relaxed);
+    }
+    bool try_lock() {
+        if (!mutex_.try_lock()) return false;
+        taken();
+        return true;
+    }
+    void unlock() {
+        const std::int64_t since = since_.load(std::memory_order_relaxed);
+        const std::uint32_t owner = owner_.load(std::memory_order_relaxed);
+        owner_.store(0, std::memory_order_relaxed);
+        releases_.fetch_add(1);  // seq_cst with the handoff_waiters_ load: no let_submit_finish misses this release
+        mutex_.unlock();
+        if (handoff_waiters_.load()) {
+            std::lock_guard lock(handoff_mutex_);
+            released_.notify_all();
+        }
+        const std::int64_t now = diagnostic_ms();
+        if (now - since >= kLongHoldMs)
+            std::fprintf(stderr, "[rt] submit-lock: held %lld ms by thread %u, t=%.3f..%.3f s\n",
+                         static_cast<long long>(now - since), owner, double(since) / 1000.0, double(now) / 1000.0);
+    }
+
+    std::uint32_t owner() const { return owner_.load(std::memory_order_relaxed); }
+    std::int64_t since_ms() const { return since_.load(std::memory_order_relaxed); }
+    // Threads blocked in lock() (try_lock never counts).
+    std::uint32_t waiting() const { return waiting_.load(std::memory_order_relaxed); }
+
+    // Called before the driver calls that build pipelines: waits for a submit in progress to finish (unless this
+    // thread is the one submitting). Measured on NVIDIA 630.20 (three early losses): back-to-back pipeline creates on
+    // the compile worker keep re-taking a driver lock that vkQueueSubmit waits for; after 10 s of that wait the driver
+    // returns VK_ERROR_DEVICE_LOST, with no GPU fault and no TDR. Not entering the driver while a submit is in it lets
+    // the submit take that lock between two creates.
+    // `queued` (the compile worker): also lets the submitters queued behind the holder go first - std::mutex is not
+    // fair, so without that the worker's next create could get in ahead of them - for at most `cap_ms`; past it the
+    // hold in progress is the last one waited for. The wait never takes the lock itself (taking it could queue behind
+    // every submitter that re-takes it), it waits for the hold it saw to end. Returns how many milliseconds it waited.
+    std::int64_t let_submit_finish(bool queued = true, std::int64_t cap_ms = kHandoffCapMs) {
+        const std::uint32_t self = diagnostic_thread_id();
+        if (owner_.load(std::memory_order_relaxed) == self) return 0;  // this thread submits: nothing to let through
+        const auto queue = [&] { return queued && waiting_.load(std::memory_order_relaxed) != 0; };
+        std::uint64_t seen = releases_.load();
+        const auto held = [&] {
+            seen = releases_.load();  // read before the owner: a hold that ends after this changes it
+            return owner_.load() != 0;
+        };
+        if (!held() && !queue()) return 0;
+        const std::int64_t start = diagnostic_ms();
+        for (;;) {
+            const bool over = diagnostic_ms() - start >= cap_ms;
+            if (held()) {
+                wait_release(seen);
+                if (!queued || over) break;
+            } else if (!queue() || over) {
+                break;
+            } else {
+                std::this_thread::yield();  // a queued submitter is between its wake-up and taking the lock
+            }
+        }
+        return diagnostic_ms() - start;
+    }
+
+    // The compile gate. A queue submission never enters the driver while a pipeline create is in it: measured on
+    // NVIDIA 630.20 (wf6), a vkQueueSubmit that entered while the warm-up thread was inside one long
+    // vkCreateComputePipelines waited 10 s in the driver and returned VK_ERROR_DEVICE_LOST; let_submit_finish cannot
+    // help once the create is already running. Creates pass the gate shared, a submission exclusively, and a create
+    // that arrives while a submission waits queues behind it, so a submission waits only for the creates already in
+    // the driver. A long compile then stalls the submitting thread here, in our code, instead of in the driver.
+    // No deadlock: a create holds the gate only across its vkCreate*Pipelines and a submission only across its
+    // vkQueueSubmit, and neither driver call waits for anything of ours. LEONIDA_COMPILE_GATE=0 turns it off.
+    class CompileTurn {  // around vkCreate*Pipelines
+    public:
+        explicit CompileTurn(SubmitMutex& gate) : gate_(gate), waited_(gate.enter_compile()) {}
+        ~CompileTurn() { gate_.leave_compile(); }
+        CompileTurn(const CompileTurn&) = delete;
+        CompileTurn& operator=(const CompileTurn&) = delete;
+        std::int64_t waited_ms() const { return waited_; }
+
+    private:
+        SubmitMutex& gate_;
+        std::int64_t waited_;
+    };
+    class SubmitTurn {  // around vkQueueSubmit, with the submit lock held
+    public:
+        explicit SubmitTurn(SubmitMutex& gate) : gate_(gate) { gate.enter_submit(); }
+        ~SubmitTurn() { gate_.leave_submit(); }
+        SubmitTurn(const SubmitTurn&) = delete;
+        SubmitTurn& operator=(const SubmitTurn&) = delete;
+
+    private:
+        SubmitMutex& gate_;
+    };
+
+    static bool compile_gate_enabled() {
+        static const bool on = [] {
+            const char* value = std::getenv("LEONIDA_COMPILE_GATE");
+            return !(value && !std::strcmp(value, "0"));
+        }();
+        return on;
+    }
+
+    // The thread waiting in enter_submit for creates to leave the driver, or 0.
+    std::uint32_t gate_waiter() const { return gate_waiter_.load(std::memory_order_relaxed); }
+
+    struct GateStats {
+        std::uint64_t submits = 0;         // submissions that had to wait for a create
+        std::int64_t submit_ms = 0, submit_max_ms = 0;
+        std::uint64_t creates = 0;         // creates that waited behind a submission
+        std::int64_t create_ms = 0, create_max_ms = 0;
+    };
+    GateStats gate_stats() {
+        std::lock_guard lock(gate_mutex_);
+        return stats_;
+    }
+
+    std::int64_t enter_compile() {
+        if (!compile_gate_enabled()) return 0;
+        std::unique_lock lock(gate_mutex_);
+        std::int64_t waited = 0;
+        if (submits_) {
+            const std::int64_t start = diagnostic_ms();
+            gate_changed_.wait(lock, [&] { return submits_ == 0; });
+            waited = diagnostic_ms() - start;
+            ++stats_.creates;
+            stats_.create_ms += waited;
+            stats_.create_max_ms = (std::max)(stats_.create_max_ms, waited);
+        }
+        ++compiles_;
+        return waited;
+    }
+    void leave_compile() {
+        if (!compile_gate_enabled()) return;
+        std::lock_guard lock(gate_mutex_);
+        if (--compiles_ == 0 && submits_) gate_changed_.notify_all();
+    }
+
+    std::int64_t enter_submit() {
+        if (!compile_gate_enabled()) return 0;
+        std::unique_lock lock(gate_mutex_);
+        ++submits_;
+        if (!compiles_) return 0;
+        const std::uint32_t self = diagnostic_thread_id();
+        gate_waiter_.store(self, std::memory_order_relaxed);
+        const std::int64_t start = diagnostic_ms();
+        const GateWait what{self, compiles_, driver_compile.name.load(std::memory_order_acquire),
+                            driver_compile.trigger.load(std::memory_order_relaxed),
+                            driver_compile.bytes.load(std::memory_order_relaxed)};
+        std::int64_t next_note = 2000;
+        while (!gate_changed_.wait_for(lock, std::chrono::milliseconds(250), [&] { return compiles_ == 0; })) {
+            const std::int64_t waited = diagnostic_ms() - start;
+            if (waited < next_note) continue;
+            next_note = waited + 5000;
+            note_gate_wait("has waited", what, waited);
+        }
+        gate_waiter_.store(0, std::memory_order_relaxed);
+        const std::int64_t waited = diagnostic_ms() - start;
+        ++stats_.submits;
+        stats_.submit_ms += waited;
+        stats_.submit_max_ms = (std::max)(stats_.submit_max_ms, waited);
+        // Every wait of 500 ms or more, and the first 32 of 50 ms or more.
+        if (waited >= 500 || (waited >= 50 && logged_waits_ < 32)) {
+            ++logged_waits_;
+            note_gate_wait("waited", what, waited);
+        }
+        return waited;
+    }
+    void leave_submit() {
+        if (!compile_gate_enabled()) return;
+        std::lock_guard lock(gate_mutex_);
+        if (--submits_ == 0) gate_changed_.notify_all();
+    }
+
+private:
+    void taken() {
+        since_.store(diagnostic_ms(), std::memory_order_relaxed);
+        owner_.store(diagnostic_thread_id(), std::memory_order_relaxed);
+    }
+
+    // Until a hold ends after `seen` releases.
+    void wait_release(std::uint64_t seen) {
+        handoff_waiters_.fetch_add(1);
+        {
+            std::unique_lock lock(handoff_mutex_);
+            released_.wait(lock, [&] { return releases_.load() != seen; });
+        }
+        handoff_waiters_.fetch_sub(1);
+    }
+
+    // With gate_mutex_ held.
+    // The creates a submission found in the driver: how many, and the compute one named last (graphics creates are
+    // not named). Names are ShaderLibrary strings, valid until device teardown.
+    struct GateWait {
+        std::uint32_t thread;
+        std::uint32_t creates;
+        const char* name;
+        const char* trigger;
+        std::size_t bytes;
+    };
+    void note_gate_wait(const char* how, const GateWait& what, std::int64_t waited) const {
+        std::fprintf(stderr, "[rt] compile-gate: vkQueueSubmit on thread %u %s %lld ms for %u pipeline create(s) to "
+                             "leave the driver (compute %s, %zu B SPIR-V, %s) at t=%.3f s; %llu such waits so far, "
+                             "%lld ms in all, longest %lld ms\n",
+                     what.thread, how, static_cast<long long>(waited), what.creates, what.name ? what.name : "-",
+                     what.name ? what.bytes : std::size_t{0}, what.name && what.trigger ? what.trigger : "-",
+                     double(diagnostic_ms()) / 1000.0, static_cast<unsigned long long>(stats_.submits),
+                     static_cast<long long>(stats_.submit_ms), static_cast<long long>(stats_.submit_max_ms));
+    }
+
+    std::mutex mutex_;
+    std::atomic<std::uint32_t> owner_{0};
+    std::atomic<std::int64_t> since_{0};
+    std::atomic<std::uint32_t> waiting_{0};
+    std::atomic<std::uint64_t> releases_{0};  // unlocks so far
+    std::atomic<std::uint32_t> handoff_waiters_{0};
+    std::mutex handoff_mutex_;  // leaf
+    std::condition_variable released_;
+
+    std::mutex gate_mutex_;  // leaf: guards the gate counts and stats
+    std::condition_variable gate_changed_;
+    std::uint32_t compiles_ = 0;  // creates in the driver
+    std::uint32_t submits_ = 0;   // submissions waiting for them or in the driver
+    std::atomic<std::uint32_t> gate_waiter_{0};
+    GateStats stats_;
+    unsigned logged_waits_ = 0;
+};
+
+// One vkQueueSubmit of a VulkanQueue: its waits, its signals and how long the call took (-1: not returned yet).
+struct SubmitRecord {
+    static constexpr std::size_t max_waits = 6;
+    std::int64_t at_ms = 0;
+    std::int64_t took_ms = -1;
+    int result = 1;
+    VkQueue queue = VK_NULL_HANDLE;
+    const char* kind = "";
+    VkSemaphore progress = VK_NULL_HANDLE;
+    std::uint64_t ticket = 0;
+    VkSemaphore fence = VK_NULL_HANDLE;
+    std::uint64_t fence_value = 0;
+    std::uint32_t buffers = 0;
+    std::uint32_t waits = 0;
+    std::array<VkSemaphore, max_waits> wait_semaphores{};
+    std::array<std::uint64_t, max_waits> wait_values{};
+};
+
 class DeviceFaultDiagnostics {
 public:
     DeviceFaultDiagnostics(PFN_vkGetDeviceProcAddr get, VkDevice device, DeviceFaultExtensions enabled)
@@ -254,6 +553,7 @@ public:
             LEONIDA_FAULT_LOAD(vkCmdSetCheckpointNV);
             LEONIDA_FAULT_LOAD(vkGetQueueCheckpointDataNV);
         }
+        LEONIDA_FAULT_LOAD(vkGetSemaphoreCounterValue);
 #undef LEONIDA_FAULT_LOAD
         std::fprintf(stderr, "[rt] device-fault: enabled (fault info %s, checkpoints %s, NVIDIA diagnostics config %s)\n",
                      vkGetDeviceFaultInfoEXT ? "on" : "unavailable", checkpoint_command() ? "on" : "unavailable",
@@ -272,6 +572,141 @@ public:
 
     std::uint64_t next_execute_call() { return ++execute_calls_; }
 
+    void set_submit_lock(const SubmitMutex* lock) { submit_lock_ = lock; }
+
+    // Called under the submit lock, before and after the vkQueueSubmit it describes.
+    std::size_t begin_submit(const SubmitRecord& record) {
+        std::lock_guard lock(mutex_);
+        const std::size_t at = submit_count_++;
+        submits_[at % submits_.size()] = record;
+        return at;
+    }
+    void end_submit(std::size_t at, std::int64_t took_ms, VkResult result) {
+        std::lock_guard lock(mutex_);
+        if (submit_count_ - at > submits_.size()) return;
+        auto& record = submits_[at % submits_.size()];
+        record.took_ms = took_ms;
+        record.result = int(result);
+    }
+
+    // The holder of the submit lock has kept it for `held_ms`: its call chain and what was submitted last.
+    void report_submit_lock_holder(std::uint32_t owner, std::int64_t held_ms) {
+        std::fprintf(stderr, "[rt] submit-lock: thread %u has held it for %lld ms (t=%.3f s)\n", owner,
+                     static_cast<long long>(held_ms), double(diagnostic_ms()) / 1000.0);
+        if (const char* name = driver_compile.name.load(std::memory_order_acquire)) {
+            const char* trigger = driver_compile.trigger.load(std::memory_order_relaxed);
+            std::fprintf(stderr, "[rt] submit-lock: vkCreateComputePipelines has been building %s (%zu B SPIR-V, %s) "
+                                 "for %lld ms\n",
+                         name, driver_compile.bytes.load(std::memory_order_relaxed), trigger ? trigger : "?",
+                         static_cast<long long>(diagnostic_ms() - driver_compile.since_ms.load(std::memory_order_relaxed)));
+        }
+        if (submit_lock_ && submit_lock_->gate_waiter() == owner) {
+            // Not in the driver: waiting at the compile gate for the create named above (SubmitMutex::CompileTurn).
+            std::fprintf(stderr, "[rt] submit-lock: thread %u is waiting at the compile gate, not in the driver\n", owner);
+            return;
+        }
+        // Every thread, the holder included: what the driver waits for may be another thread's work. No counters
+        // here (dump_submits would block in the driver behind the holder); the loss report has them. A long hold can
+        // also be a legitimate vkDeviceWaitIdle: the stacks of the first three holds, then at most one a minute.
+        const std::int64_t now = diagnostic_ms();
+        if (stack_reports_ >= 3 && now - last_stack_report_ms_ < 60000) return;
+        ++stack_reports_;
+        last_stack_report_ms_ = now;
+        print_thread_stacks(0, "submit-lock hold");
+    }
+
+    // Before `semaphore` is destroyed (~VulkanFence, ~VulkanQueue): the ring stops naming it, so no report reads the
+    // counter of a destroyed semaphore. Waits for a report that is reading counters now.
+    void forget(VkSemaphore semaphore) {
+        if (!semaphore) return;
+        std::lock_guard reading(read_mutex_);
+        if (stalled_progress_ == semaphore) stalled_progress_ = VK_NULL_HANDLE;
+        std::lock_guard lock(mutex_);
+        for (auto& r : submits_) {
+            if (r.progress == semaphore) r.progress = VK_NULL_HANDLE;
+            if (r.fence == semaphore) r.fence = VK_NULL_HANDLE;
+            for (auto& wait : r.wait_semaphores)
+                if (wait == semaphore) wait = VK_NULL_HANDLE;
+        }
+    }
+
+    // Once a second from the progress watch, without the submit lock: when the oldest submission in the ring that
+    // has not finished is 4 s old, the ring with every counter as it is now, once per such submission.
+    void check_submit_progress() {
+        std::lock_guard reading(read_mutex_);  // the semaphores read below outlive this call (forget)
+        const std::vector<SubmitRecord> records = submit_records();
+        if (!vkGetSemaphoreCounterValue) return;
+        const std::int64_t now = diagnostic_ms();
+        for (const auto& r : records) {
+            if (r.took_ms < 0 || r.result != VK_SUCCESS || !r.progress) continue;
+            std::uint64_t done = 0;
+            if (vkGetSemaphoreCounterValue(device_, r.progress, &done) != VK_SUCCESS) return;
+            if (done >= r.ticket) continue;
+            // Age from when vkQueueSubmit returned: the call itself may have waited at the compile gate.
+            if (now - (r.at_ms + r.took_ms) < 4000) return;  // the oldest unfinished one is young
+            if (r.progress == stalled_progress_ && r.ticket == stalled_ticket_) return;
+            stalled_progress_ = r.progress;
+            stalled_ticket_ = r.ticket;
+            std::fprintf(stderr, "[rt] gpu-stall: %s queue %p ticket %llu submitted at t=%.3f s not done after %lld ms "
+                                 "(progress %llu)\n",
+                         r.kind, static_cast<void*>(r.queue), static_cast<unsigned long long>(r.ticket),
+                         double(r.at_ms) / 1000.0, static_cast<long long>(now - r.at_ms),
+                         static_cast<unsigned long long>(done));
+            dump_submits_reading();
+            return;
+        }
+    }
+
+    // The last submissions, oldest first, with every semaphore's counter now (? once the device is lost, or for a
+    // semaphore destroyed since).
+    void dump_submits() {
+        std::lock_guard reading(read_mutex_);
+        dump_submits_reading();
+    }
+
+private:
+    std::vector<SubmitRecord> submit_records() {
+        std::vector<SubmitRecord> records;
+        std::lock_guard lock(mutex_);
+        const std::size_t n = std::min(submit_count_, submits_.size());
+        records.reserve(n);
+        for (std::size_t i = submit_count_ - n; i < submit_count_; ++i) records.push_back(submits_[i % submits_.size()]);
+        return records;
+    }
+
+    // dump_submits with read_mutex_ held.
+    void dump_submits_reading() {
+        const std::vector<SubmitRecord> records = submit_records();
+        // Every semaphore the ring names is non-null when recorded: null is one destroyed since (forget).
+        const auto counter = [&](VkSemaphore semaphore) -> std::string {
+            std::uint64_t value = 0;
+            if (!semaphore) return "destroyed";
+            if (!vkGetSemaphoreCounterValue || vkGetSemaphoreCounterValue(device_, semaphore, &value) != VK_SUCCESS)
+                return "?";
+            return std::to_string(value);
+        };
+        const std::int64_t now = diagnostic_ms();
+        for (const auto& r : records) {
+            std::string line = "[rt] submit-ring: t=" + std::to_string(double(r.at_ms) / 1000.0) + " s " + r.kind +
+                               " queue=" + std::to_string(reinterpret_cast<std::uintptr_t>(r.queue)) +
+                               " buffers=" + std::to_string(r.buffers) + " ticket=" + std::to_string(r.ticket) +
+                               " progress=" + counter(r.progress) + " took=" +
+                               (r.took_ms < 0 ? "pending(" + std::to_string(now - r.at_ms) + " ms)"
+                                              : std::to_string(r.took_ms) + " ms") +
+                               " result=" + std::to_string(r.result);
+            if (r.fence || r.fence_value)
+                line += " signal=" + std::to_string(pipeline_handle(r.fence)) + ":" + std::to_string(r.fence_value) +
+                        " now " + counter(r.fence);
+            for (std::uint32_t i = 0; i < r.waits && i < SubmitRecord::max_waits; ++i)
+                line += " wait=" + std::to_string(pipeline_handle(r.wait_semaphores[i])) + ":" +
+                        std::to_string(r.wait_values[i]) + " now " + counter(r.wait_semaphores[i]);
+            if (r.waits > SubmitRecord::max_waits) line += " (+" + std::to_string(r.waits - SubmitRecord::max_waits) + " waits)";
+            line += '\n';
+            std::fputs(line.c_str(), stderr);
+        }
+    }
+
+public:
     // Accessed under the context's resource lock. Reports read the names copied into the ring instead.
     std::unordered_map<std::uintptr_t, CheckpointShaders> pipeline_names;
 
@@ -292,7 +727,16 @@ public:
 
     static VkResult observe(DeviceFaultDiagnostics* diagnostics, VkResult result, const char* operation) noexcept {
         if (result == VK_ERROR_DEVICE_LOST) {
-            if (diagnostics) diagnostics->report(operation);
+            if (diagnostics) {
+                diagnostics->report(operation);
+            } else {
+                // Without LEONIDA_DEVICE_FAULT a loss was silent: the title only saw ~0 in its fence words.
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true, std::memory_order_relaxed))
+                    std::fprintf(stderr, "[rt] vulkan: VK_ERROR_DEVICE_LOST from %s at t=%.3f s on thread %u "
+                                         "(LEONIDA_DEVICE_FAULT=1 for the fault report)\n",
+                                 operation, double(diagnostic_ms()) / 1000.0, diagnostic_thread_id());
+            }
             run_device_lost_hook();
         }
         return result;
@@ -354,6 +798,16 @@ private:
     void report(const char* operation) noexcept {
         if (reported_.exchange(true, std::memory_order_relaxed)) return;
         std::fprintf(stderr, "[rt] device-fault: VK_ERROR_DEVICE_LOST from %s\n", operation);
+        try {
+            const std::int64_t now = diagnostic_ms();
+            const std::uint32_t owner = submit_lock_ ? submit_lock_->owner() : 0;
+            std::fprintf(stderr, "[rt] device-fault: t=%.3f s on thread %u; submit lock held by thread %u for %lld ms\n",
+                         double(now) / 1000.0, diagnostic_thread_id(), owner,
+                         owner ? static_cast<long long>(now - submit_lock_->since_ms()) : 0LL);
+            dump_submits();
+            print_thread_stacks(0, "device lost");
+        } catch (...) {
+        }
         dump_dispatches();
         try {
             std::function<void()> hook;
@@ -455,6 +909,36 @@ private:
                              pipeline.shaders[2] ? pipeline.shaders[2] : "-");
             }
         }
+        // LOCAL DIAGNOSTIC (post-load GPU faults): the work in flight is between the bottom-of-pipe checkpoint (last
+        // command finished) and the top-of-pipe one (last command started) of the same list. Every pipeline bound in
+        // that window, so the faulting program is among them; the dispatch ring above only keeps the last 64
+        // dispatches of all queues, and those were from another queue in the fault this was added for.
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto top = CheckpointMarker::decode(reinterpret_cast<std::uintptr_t>(data[i].pCheckpointMarker));
+            if (!top.submission || !(static_cast<std::uint64_t>(data[i].stage) & VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT))
+                continue;
+            std::uint32_t from = 0;  // no bottom-of-pipe checkpoint in this list: from its start
+            for (std::uint32_t j = 0; j < count; ++j) {
+                const auto bottom = CheckpointMarker::decode(reinterpret_cast<std::uintptr_t>(data[j].pCheckpointMarker));
+                if (bottom.submission == top.submission && bottom.list == top.list &&
+                    (static_cast<std::uint64_t>(data[j].stage) & VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT))
+                    from = bottom.command;
+            }
+            const auto& entry = recent_[top.submission % recent_.size()];
+            if (entry.sequence != top.submission || entry.queue != queue || top.list >= entry.lists.size()) continue;
+            const auto& shaders = entry.lists[top.list].shaders;
+            // The pipeline bound when `from` ran, then every change up to the top-of-pipe command.
+            auto it = std::upper_bound(shaders.begin(), shaders.end(), from,
+                                       [](auto command, const auto& change) { return command < change.command; });
+            if (it != shaders.begin()) --it;
+            for (; it != shaders.end() && it->command <= top.command; ++it)
+                std::fprintf(stderr, "[rt] device-fault: in flight (submission %u list %u, commands %u..%u): command %u "
+                                     "pipeline=0x%" PRIx64 " shaders=%s %s %s\n",
+                             top.submission, top.list, from, top.command, unsigned(it->command),
+                             pipeline_handle(it->pipeline.handle), it->pipeline.shaders[0] ? it->pipeline.shaders[0] : "-",
+                             it->pipeline.shaders[1] ? it->pipeline.shaders[1] : "-",
+                             it->pipeline.shaders[2] ? it->pipeline.shaders[2] : "-");
+        }
     }
 
     template<typename Handle>
@@ -467,9 +951,20 @@ private:
     PFN_vkGetDeviceFaultInfoEXT vkGetDeviceFaultInfoEXT = nullptr;
     PFN_vkCmdSetCheckpointNV vkCmdSetCheckpointNV = nullptr;
     PFN_vkGetQueueCheckpointDataNV vkGetQueueCheckpointDataNV = nullptr;
+    PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue = nullptr;
+    const SubmitMutex* submit_lock_ = nullptr;
+    std::array<SubmitRecord, 96> submits_{};  // under mutex_
+    std::size_t submit_count_ = 0;
+    unsigned stack_reports_ = 0;  // report_submit_lock_holder: the progress watch's thread only
+    std::int64_t last_stack_report_ms_ = 0;
+    VkSemaphore stalled_progress_ = VK_NULL_HANDLE;  // under read_mutex_
+    std::uint64_t stalled_ticket_ = 0;
     std::atomic<bool> reported_{false};
     std::atomic<std::uint64_t> execute_calls_{0};
     std::uint32_t sequence_ = 0;
+    // Held while a report reads the counters of the semaphores in the ring, and by forget before one is destroyed.
+    // Before mutex_; the submit path never takes it.
+    std::mutex read_mutex_;
     std::mutex mutex_;  // leaf lock, guards queues_ and recent_
     std::vector<VkQueue> queues_;
     const bool include_roots_ = [] {
