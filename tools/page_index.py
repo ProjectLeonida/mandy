@@ -9,6 +9,8 @@ The pointer is a virtual offset into the logical resource after subtracting 0x50
 and not necessarily an offset inside this zlib stream. If the table or a payload crosses the inflated stream
 end, the next zlib stream in archive order continues the same resource. This tool concatenates only as many
 continuation streams as the declared table and entry ranges require, then reports exact virtual boundaries.
+A continuation can be shorter than the carver's 64-byte cutoff; in an archive such a stream is taken only as a
+continuation (a carved directory holds none).
 
 The header has no key: what earlier reports called a 64-bit key at +0x60 is the first payload byte on
 29,297 of 29,298 measured pages. This tool reports `payload_at_0x60` instead.
@@ -48,6 +50,7 @@ from report_paths import same_report_path  # noqa: E402
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 BASE = 0x50000000
 HEADER_SIZE = 0x60
+MIN_STREAM = 64       # the carver's cutoff: a shorter inflated stream is taken only as a continuation
 PAGE_UNIT = 0x10000   # 64 KiB: the unit a resource's declared +0x20 count is compared against
 MAX_CONTINUATIONS = 16
 Q28_UNREAD = "q28 table ends past the streams read for q38"
@@ -119,7 +122,7 @@ def scan_rpf(path, start=None, limit=None):
                 except zlib.error:
                     pos = s + 1
                     continue
-                if not d.eof or len(out) < 64:
+                if not d.eof or not out:
                     pos = s + 1
                     continue
                 used = p - s - len(d.unused_data)
@@ -300,7 +303,13 @@ def index_streams(streams, progress=None):
         return (page, data, [])
 
     for offset, stored, data in streams:
-        streams_seen += 1
+        if len(data) < MIN_STREAM:
+            # Below the carver's cutoff a stream is only ever a continuation, as in tools/navmesh_decode.py
+            # (docs/navmesh.md recovers 16-48 byte 0DRP continuations), and is not counted as a stream.
+            if waiting is None:
+                continue
+        else:
+            streams_seen += 1
         if progress and streams_seen % 2000 == 0:
             progress(streams_seen, len(pages))
         if waiting is not None:
