@@ -90,6 +90,38 @@ struct Model {
         slots[slot] = {a, b};
         fix(slot);
     }
+    // As the device fixes a slot the title rewrote: the changes noted so far are applied first (sync_slot_changes),
+    // then a half whose range another half waits for takes its answer (waiting_answer) instead of resolving.
+    std::uint64_t answered = 0, stale_answers = 0;
+    void write_answered(std::size_t slot, Words a, Words b = Words{}) {
+        apply();
+        slots[slot] = {a, b};
+        ++fixes;
+        for (unsigned half = 0; half < 2; ++half) {
+            const Words& w = slots[slot][half];
+            ConsoleHeapSlotRecords::State state{};
+            std::uint64_t target = 0;
+            if (w.span && records.waiting_answer(w.base, w.span, false, state, target)) {
+                ++answered;
+                records.set(slot, half, state, w.base, w.span, target);
+                copy[slot][half] = 0;
+                // The answer must be what resolving now gives, not only after the next submission's changes.
+                std::uint64_t refused = 0;
+                if (resolve(w.base, w.span, refused)) ++stale_answers;
+                continue;
+            }
+            if (!w.span) {
+                records.set(slot, half, ConsoleHeapSlotRecords::none, 0, 0, 0);
+                copy[slot][half] = 0;
+                continue;
+            }
+            std::uint64_t refused = 0;
+            const std::uint64_t to = resolve(w.base, w.span, refused);
+            records.set(slot, half, to ? ConsoleHeapSlotRecords::resolved : ConsoleHeapSlotRecords::waiting, w.base,
+                        w.span, to ? to : refused);
+            copy[slot][half] = to;
+        }
+    }
     void zero(std::size_t slot) {
         slots[slot] = {};
         copy[slot] = {0, 0};
@@ -286,7 +318,8 @@ int differential() {
                 Model::Words a{pick(2) ? pick(64) * kGranule / 2 + pick(0x800) : titles[pick(6)] + pick(0x80000), span};
                 Model::Words b{};
                 if (!pick(4)) b = {pick(64) * kGranule / 2, 4};
-                m.write(slot, a, b);
+                if (pick(2)) m.write_answered(slot, a, b);
+                else m.write(slot, a, b);
                 break;
             }
             case 3: m.zero(slot); break;
@@ -327,12 +360,13 @@ int differential() {
             return 1;
         }
     }
-    EXPECT(m.records.recorded() > 0);
+    EXPECT(m.records.recorded() > 0 && m.answered > 0 && m.stale_answers == 0);
     // The model's address space is a few MiB, so most changes touch most of it: this case checks results, not cost.
     std::printf("differential: 400 rounds, copy equal to a full re-resolution after each; %llu entries looked at, "
-                "%llu slots fixed again, %zu halves recorded at the end\n",
+                "%llu slots fixed again, %zu halves recorded at the end; %llu rewritten halves answered by a waiting "
+                "one of their range\n",
                 static_cast<unsigned long long>(looked), static_cast<unsigned long long>(touched),
-                m.records.recorded());
+                m.records.recorded(), static_cast<unsigned long long>(m.answered));
     return 0;
 }
 

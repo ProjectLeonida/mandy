@@ -409,8 +409,13 @@ int main() {
                 const auto result = rt::d3d12::test_bind_title_image(device.p, g::encode(image), &why);
                 return result == rt::d3d12::TitleImage::unknown && why ? std::string(why) : std::string("?");
             };
-            check(reason(img) == "no texture at the T# address: its low 32 bits name a texture of ours of its shape",
-                  "other high bits, same shape");
+            // The title's 32-bit form of the texture's address (bits 32-39 clear, 0x7f above) with the texture's shape
+            // binds it (tsharp_texture_key); another shape does not.
+            {
+                const char* why = nullptr;
+                check(rt::d3d12::test_bind_title_image(device.p, g::encode(img), &why) == rt::d3d12::TitleImage::bound,
+                      "other high bits, same shape: bound to the texture with those low 32 bits");
+            }
             g::Image other = img;
             other.width = 32;
             check(reason(other) ==
