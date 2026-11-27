@@ -110,27 +110,44 @@ bool mirror_heap_ready() {
         const char* v = std::getenv("LEONIDA_TITLE_HEAP");
         if (v && std::strcmp(v, "0") == 0) return false;
         uintptr_t base = 0;
+        bool write_watched = false;
+        const bool want_watch = leonida::title_write_watch::enabled();
         // Not "plain": every committed page is fed to the mirror as it is committed, so a pointer the title wrote reads
-        // its bytes without anything naming the range first.
+        // its bytes without anything naming the range first. Try MEM_WRITE_WATCH on this private reservation (never
+        // combined with MEM_LARGE_PAGES, MEM_PHYSICAL, or section views), falling back silently to MEM_RESERVE.
         leonida::title_mirror_space::take(kTitleHeapBytes, 0x10000, false, [&](std::uint64_t at) {
-            void* const made = VirtualAlloc(reinterpret_cast<void*>(static_cast<uintptr_t>(at)), kTitleHeapBytes,
-                                            MEM_RESERVE, PAGE_READWRITE);
-            base = reinterpret_cast<uintptr_t>(made);
-            return made != nullptr;
+            base = leonida::TitleHeap::reserve(
+                [&](bool try_ww) -> uintptr_t {
+                    if (try_ww && !want_watch) return 0;
+                    void* const made =
+                        VirtualAlloc(reinterpret_cast<void*>(static_cast<uintptr_t>(at)), kTitleHeapBytes,
+                                     MEM_RESERVE | (try_ww ? MEM_WRITE_WATCH : 0), PAGE_READWRITE);
+                    return reinterpret_cast<uintptr_t>(made);
+                },
+                write_watched);
+            return base != 0;
         });
+        if (base && write_watched) leonida::title_write_watch::add(base, kTitleHeapBytes);
         leonida::TitleHeap::Hooks hooks;
-        hooks.commit = [](uintptr_t at, size_t bytes) {
+        hooks.commit = [write_watched](uintptr_t at, size_t bytes) {
             if (!VirtualAlloc(reinterpret_cast<void*>(at), bytes, MEM_COMMIT, PAGE_READWRITE)) return false;
+            if (write_watched) leonida::title_write_watch::mark(at, at + bytes);
             feed_heap_pages(at, bytes, true);
             return true;
         };
-        hooks.decommit = [](uintptr_t at, size_t bytes) {
+        hooks.decommit = [write_watched](uintptr_t at, size_t bytes) {
             feed_heap_pages(at, bytes, false);
             VirtualFree(reinterpret_cast<void*>(at), bytes, MEM_DECOMMIT);
+            if (write_watched) leonida::title_write_watch::mark(at, at + bytes);
         };
-        const bool ok = base && mirror_heap().init(base, kTitleHeapBytes, std::move(hooks));
-        std::fprintf(stderr, "[rt] xmem: XMemAlloc blocks come from %s\n",
-                     ok ? "the runtime's heap in the page mirror's range" : "a heap the host places");
+        const bool ok = base && mirror_heap().init(base, kTitleHeapBytes, std::move(hooks), write_watched);
+        if (!ok && base) {
+            if (write_watched) leonida::title_write_watch::remove(base);
+            VirtualFree(reinterpret_cast<void*>(base), 0, MEM_RELEASE);
+        }
+        std::fprintf(stderr, "[rt] xmem: XMemAlloc blocks come from %s%s\n",
+                     ok ? "the runtime's heap in the page mirror's range" : "a heap the host places",
+                     ok && write_watched ? " (MEM_WRITE_WATCH)" : "");
         return ok;
     }();
     return ready;

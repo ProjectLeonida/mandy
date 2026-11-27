@@ -7,27 +7,22 @@
 //     policy (written()), and the page is copied before the next submission and guarded again. A page written once a
 //     minute costs one fault a minute.
 //   - hot: the page is left writable and copied before every submission, with no fault. A page the title writes in
-//     most frames costs a copy a submission instead of a fault and a re-arm a frame; under Wine a fault and a re-arm
+//     most submissions costs a copy a submission instead of a fault and a re-arm; under Wine a fault and a re-arm
 //     cost far more than copying 64 KiB.
-// A page moves by its history across two tiers, keeping O(dirty + hot + recently-written) active lists (never walking
-// quiet cold pages):
-//   - submission-hot: one bit per submission interval (frame() ends one); written in at least kPromote of the last
-//     kHistory submissions, and it turns hot (unguarded, copied every submission). Probed for one submission every
-//     kProbe submissions and demoted when quiet.
-//   - frame-hot: one bit per presented frame (present_frame() ends one); written in at least kFramePromote of the last
-//     kFrameHistory presented frames. On low-submission frames (<= kFrameHotMaxSubs submissions/frame, e.g. video or
-//     menus), frame-hot pages are left unguarded (copied every submission, probed every kFrameProbe frames) so they
-//     stop faulting. On high-submission frames (> kFrameHotMaxSubs submissions/frame), frame-hot pages stay guarded
-//     unless they are also submission-hot, avoiding 30x/frame redundant copies while still tracking frame-hotness and
-//     never dropping mid-frame CPU writes.
+// A page moves by its history, one bit a submission interval (frame() ends one), keeping O(dirty + hot + recent)
+// active lists (never walking quiet cold pages): written in at least kPromote of the last kHistory submissions, and it
+// turns hot at the end of the interval; a hot page is guarded again for one interval every kProbe intervals, and turns
+// cold when such a probe interval sees no write. Measured under Wine on this machine: a 64 KiB copy is ~10 us, a fault
+// 2-3 us with a handler that reopens in one call and a re-arm 4 us, so a page written in under half the submissions
+// (including 1/frame pages) is cheaper cold; kPromote = 6 of 8 keeps only truly intra-frame hot pages uncovered and
+// avoids copying quiet pages on empty submissions.
 //
-// Nothing is missed in between: a guarded page is armed before it is reported dirty (collect() arms, then names it),
-// so a write during the owner's copy faults and is in the next collect(); an unguarded page is named at every collect()
-// from then on; and any page leaving unguarded returns to the dirty list so the next collect() arms and copies it once
-// more before relying on its guard.
+// Nothing is missed in between: a page is armed before it is reported dirty (collect() arms, then names it), so a
+// write during the owner's copy faults and is in the next collect(); a page that turns hot is named at every collect()
+// from then on, and one that turns cold stays armed (or returns to the dirty list to be armed and copied once more).
 //
 // The unit is the guard's: kPage (64 KiB, the geometry watch's tile and the mirror's page). Guard is the host side:
-//   bool arm(std::uintptr_t page);     // read-only now; false when it cannot be (then the page is treated as hot)
+//   bool arm(std::uintptr_t page);     // read-only now; false when it cannot be (then the page is copied every time)
 //   void disarm(std::uintptr_t page);  // writable now (a page turning hot, or leaving the policy)
 // Optional batched arming:
 //   void arm_batch(const std::uintptr_t* pages, std::uint8_t* results, std::size_t count);  // results[i]: 1 armed, 0 failed
@@ -48,22 +43,16 @@ template<class Guard>
 class TitleWritePolicy {
 public:
     static constexpr std::uintptr_t kPage = 0x10000;
-    static constexpr unsigned kHistory = 8;          // submission intervals of history a page keeps
-    static constexpr unsigned kPromote = 3;          // written in this many of them: submission-hot
-    static constexpr unsigned kProbe = 32;           // a submission-hot page is guarded again for one interval every kProbe
-    static constexpr unsigned kFrameHistory = 4;     // presented frames of history a page keeps
-    static constexpr unsigned kFramePromote = 3;     // written in this many of them: frame-hot
-    static constexpr unsigned kFrameProbe = 16;      // an unguarded frame-hot page is probed every kFrameProbe frames
-    static constexpr unsigned kFrameHotMaxSubs = 4;  // keep frame-hot pages unguarded only when subs/frame <= this
+    static constexpr unsigned kHistory = 8;  // submission intervals of history a page keeps
+    static constexpr unsigned kPromote = 6;  // written in this many of them: hot
+    static constexpr unsigned kProbe = 32;   // a hot page is guarded again for one interval every this many intervals
 
     struct Stats {
         std::uint64_t faults = 0;          // written() on a guarded page
-        std::uint64_t hot_copies = 0;      // pages named because they are unguarded (hot)
+        std::uint64_t hot_copies = 0;      // pages named because they are hot
         std::uint64_t cold_copies = 0;     // pages named because they were written while guarded
         std::uint64_t arms = 0, arm_failures = 0, promotions = 0, demotions = 0;
-        std::size_t hot = 0, cold = 0;     // pages unguarded vs guarded now
-        std::size_t frame_hot = 0;         // pages classified frame-hot now
-        std::uint64_t frame_promotions = 0, frame_demotions = 0;
+        std::size_t hot = 0, cold = 0;     // pages in each set now
         std::uint64_t batched_arm_calls = 0;
     };
 
@@ -115,11 +104,10 @@ public:
         p.armed = false;
         p.written = true;
         p.history |= 1;
-        p.frame_history |= 1;
-        p.written_this_frame = true;
-        if (!p.unguarded()) add_dirty(page, p);
-        if (!p.sub_hot) add_history(page, p);
-        if (!p.frame_hot) add_frame_history(page, p);
+        if (!p.hot) {
+            add_dirty(page, p);
+            add_history(page, p);
+        }
     }
 
     // Before a submission: every page the owner must copy, each once, after it was armed again where it is cold, so a
@@ -127,12 +115,11 @@ public:
     // Runs in O(hot + dirty) without walking untouched cold pages.
     template<class Copy>
     void collect(Copy&& copy) {
-        ++subs_in_frame_;
         to_copy_.clear();
         to_arm_.clear();
         for (const std::uintptr_t address : hot_list_) {
             Page& p = pages_.find(address)->second;
-            if (!p.probe && !p.frame_probe) {
+            if (!p.probe) {
                 ++stats_.hot_copies;
                 to_copy_.push_back(address);
                 continue;
@@ -140,9 +127,8 @@ public:
             if (!p.written && p.armed) continue;  // guarded all along and not written: the copy is current
             if (!p.armed) {
                 to_arm_.push_back(address);
-            } else {
-                if (p.probe == 1) p.probe = 2;
-                if (p.frame_probe == 1) p.frame_probe = 2;
+            } else if (p.probe == 1) {
+                p.probe = 2;
             }
             p.written = false;
             ++stats_.hot_copies;
@@ -151,7 +137,7 @@ public:
         for (std::size_t i = 0; i < dirty_list_.size();) {
             const std::uintptr_t address = dirty_list_[i];
             Page& p = pages_.find(address)->second;
-            if (p.unguarded() || (!p.written && p.armed)) {
+            if (p.hot || (!p.written && p.armed)) {
                 erase_dirty_at(i);
                 continue;
             }
@@ -177,9 +163,8 @@ public:
                 if (!p.armed) {
                     ++stats_.arm_failures;  // copied every time, as a hot page
                 } else {
-                    if (p.probe == 1) p.probe = 2;              // guarded from here: next submission interval is probed
-                    if (p.frame_probe == 1) p.frame_probe = 2;  // guarded from here: next presented frame is probed
-                    if (!p.unguarded()) erase_dirty(p);         // clean and guarded: leaves the dirty list
+                    if (p.probe == 1) p.probe = 2;  // guarded from here: next interval is probed
+                    if (!p.hot) erase_dirty(p);     // clean and guarded: leaves the dirty list
                 }
             }
         }
@@ -187,7 +172,7 @@ public:
         for (const std::uintptr_t address : to_copy_) copy(address);
     }
 
-    // A submission interval ended: submission histories move on, and submission-hot pages change sets.
+    // A submission interval ended: histories move on, and hot and cold pages change sets.
     // Runs in O(hot + recently-written cold) without walking quiet cold pages.
     void frame() {
         ++frame_;
@@ -196,21 +181,19 @@ public:
         for (std::size_t i = 0; i < hot_list_.size();) {
             const std::uintptr_t address = hot_list_[i];
             Page& p = pages_.find(address)->second;
-            if (!p.sub_hot) {
-                ++i;
-                continue;
-            }
             bool demoted = false;
             if (p.probe == 2) {
                 p.probe = 3;  // armed at the collect just before: the interval from here is observed
             } else if (p.probe == 3) {
-                // The interval after the arming saw no write: no longer submission-hot (stays armed if leaving hot).
+                // The interval after the arming saw no write: no longer hot (stays armed).
                 p.probe = 0;
                 if (!(p.history & 1) && p.armed) {
                     demoted = true;
-                    p.sub_hot = false;
+                    p.hot = false;
+                    --stats_.hot;
+                    ++stats_.cold;
                     ++stats_.demotions;
-                } else if (p.armed && !p.frame_probe) {
+                } else if (p.armed) {
                     guard_.disarm(address);
                     p.armed = false;
                 }
@@ -220,18 +203,8 @@ public:
             }
             p.history = std::uint16_t((p.history << 1) & kHistoryMask);
             if (demoted) {
-                if (!want_unguarded(p)) {
-                    erase_hot_at(i);
-                    --stats_.hot;
-                    ++stats_.cold;
-                    if (p.written || !p.armed) add_dirty(address, p);
-                } else {
-                    if (p.armed && !p.frame_probe) {
-                        guard_.disarm(address);
-                        p.armed = false;
-                    }
-                    ++i;
-                }
+                erase_hot_at(i);
+                if (p.written || !p.armed) add_dirty(address, p);
                 if (p.history != 0) demoted_.push_back(address);
             } else {
                 ++i;
@@ -240,17 +213,19 @@ public:
         for (std::size_t i = 0; i < history_active_.size();) {
             const std::uintptr_t address = history_active_[i];
             Page& p = pages_.find(address)->second;
-            if (p.sub_hot) {
+            if (p.hot) {
                 erase_history_at(i);
                 continue;
             }
             if (unsigned(std::popcount(unsigned(p.history & kHistoryMask))) >= kPromote) {
-                p.sub_hot = true;
+                p.hot = true;
                 p.probe = 0;
+                --stats_.cold;
+                ++stats_.hot;
                 ++stats_.promotions;
-                if (!p.unguarded()) {
-                    enter_unguarded(address, p);
-                } else if (p.armed && !p.frame_probe) {
+                add_hot(address, p);
+                erase_dirty(p);
+                if (p.armed) {
                     guard_.disarm(address);
                     p.armed = false;
                 }
@@ -266,173 +241,26 @@ public:
         demoted_.clear();
     }
 
-    // A presented frame ended (called once per Present): advances the 4-frame history and updates frame-hot pages in
-    // O(frame_hot + written_this_frame). On low-submission frames (<= kFrameHotMaxSubs subs/frame), frame-hot pages
-    // are kept unguarded (copied every submission, probed every kFrameProbe frames); on high-submission frames they
-    // remain guarded (unless also submission-hot) so 1-write/frame buffers never trigger 30x redundant copies and
-    // never miss mid-frame CPU writes.
-    void present_frame() {
-        ++presented_frames_;
-        last_frame_subs_ = subs_in_frame_;
-        subs_in_frame_ = 0;
-        const bool next_unguarded = last_frame_subs_ <= kFrameHotMaxSubs;
-        if (next_unguarded != frame_hot_unguarded_) {
-            frame_hot_unguarded_ = next_unguarded;
-            for (const std::uintptr_t address : frame_hot_list_) {
-                Page& p = pages_.find(address)->second;
-                if (next_unguarded) {
-                    if (!p.unguarded()) enter_unguarded(address, p);
-                } else if (!p.sub_hot && p.unguarded()) {
-                    leave_unguarded(address, p);
-                }
-            }
-        }
-        const bool probe = presented_frames_ % kFrameProbe == 0;
-        frame_demoted_.clear();
-        for (std::size_t i = 0; i < frame_hot_list_.size();) {
-            const std::uintptr_t address = frame_hot_list_[i];
-            Page& p = pages_.find(address)->second;
-            bool demoted = false;
-            if (!p.unguarded()) {
-                // High-sub mode: page stayed guarded all frame, so written_this_frame is exact.
-                p.frame_probe = 0;
-                const bool wrote = p.written_this_frame;
-                p.frame_history = std::uint8_t((p.frame_history << 1) & kFrameHistoryMask);
-                if (!wrote && unsigned(std::popcount(unsigned(p.frame_history))) < 2) demoted = true;
-            } else if (!p.sub_hot) {
-                // Low-sub mode: unguarded solely via frame-hot; periodic frame probe detects quiet pages.
-                if (p.frame_probe == 2) {
-                    if (p.written_this_frame) {
-                        p.frame_probe = 0;
-                        if (p.armed) {
-                            guard_.disarm(address);
-                            p.armed = false;
-                        }
-                    } else {
-                        p.frame_probe = 3;
-                    }
-                } else if (p.frame_probe == 3) {
-                    p.frame_probe = 0;
-                    if (!p.written_this_frame && p.armed) {
-                        demoted = true;
-                    } else if (p.armed) {
-                        guard_.disarm(address);
-                        p.armed = false;
-                    }
-                } else if (probe && !p.frame_probe) {
-                    p.frame_probe = 1;
-                    p.written = true;
-                }
-                p.frame_history = std::uint8_t((p.frame_history << 1) & kFrameHistoryMask);
-            } else {
-                // Also submission-hot: stays active in frame history while sub_hot manages its guard.
-                p.frame_probe = 0;
-                p.frame_history = std::uint8_t(((p.frame_history << 1) | 1u) & kFrameHistoryMask);
-            }
-            p.written_this_frame = false;
-            if (demoted) {
-                p.frame_hot = false;
-                ++stats_.frame_demotions;
-                erase_frame_hot_at(i);
-                if (p.unguarded() && !want_unguarded(p)) {
-                    leave_unguarded(address, p);
-                    ++stats_.demotions;
-                }
-                if (p.frame_history != 0) frame_demoted_.push_back(address);
-            } else {
-                ++i;
-            }
-        }
-        for (std::size_t i = 0; i < frame_history_active_.size();) {
-            const std::uintptr_t address = frame_history_active_[i];
-            Page& p = pages_.find(address)->second;
-            p.written_this_frame = false;
-            if (p.frame_hot) {
-                erase_frame_history_at(i);
-                continue;
-            }
-            if (unsigned(std::popcount(unsigned(p.frame_history & kFrameHistoryMask))) >= kFramePromote) {
-                p.frame_hot = true;
-                p.frame_probe = 0;
-                add_frame_hot(address, p);
-                ++stats_.frame_promotions;
-                if (!p.unguarded() && want_unguarded(p)) {
-                    enter_unguarded(address, p);
-                    ++stats_.promotions;
-                }
-                p.frame_history = std::uint8_t((p.frame_history << 1) & kFrameHistoryMask);
-                erase_frame_history_at(i);
-            } else {
-                p.frame_history = std::uint8_t((p.frame_history << 1) & kFrameHistoryMask);
-                if (p.frame_history == 0) erase_frame_history_at(i);
-                else ++i;
-            }
-        }
-        for (const std::uintptr_t address : frame_demoted_) add_frame_history(address, pages_.find(address)->second);
-        frame_demoted_.clear();
-        stats_.frame_hot = frame_hot_list_.size();
-    }
-
     const Stats& stats() const { return stats_; }
     bool hot(std::uintptr_t page) const {
         const auto it = pages_.find(page & ~(kPage - 1));
-        return it != pages_.end() && it->second.unguarded();
-    }
-    bool sub_hot(std::uintptr_t page) const {
-        const auto it = pages_.find(page & ~(kPage - 1));
-        return it != pages_.end() && it->second.sub_hot;
-    }
-    bool frame_hot(std::uintptr_t page) const {
-        const auto it = pages_.find(page & ~(kPage - 1));
-        return it != pages_.end() && it->second.frame_hot;
+        return it != pages_.end() && it->second.hot;
     }
 
 private:
     static constexpr std::uint16_t kHistoryMask = std::uint16_t((1u << kHistory) - 1);
-    static constexpr std::uint8_t kFrameHistoryMask = std::uint8_t((1u << kFrameHistory) - 1);
     static constexpr std::uint32_t kNoIndex = ~std::uint32_t(0);
 
     struct Page {
-        std::uint32_t hot_index = kNoIndex;         // index in hot_list_ when unguarded
-        std::uint32_t dirty_index = kNoIndex;       // index in dirty_list_ when guarded and needing arm/copy
-        std::uint32_t history_index = kNoIndex;     // index in history_active_ when !sub_hot with non-zero history
-        std::uint32_t frame_hot_index = kNoIndex;   // index in frame_hot_list_ when frame_hot
-        std::uint32_t frame_hist_index = kNoIndex;  // index in frame_history_active_ when !frame_hot with frame_history
-        std::uint16_t history = 0;                  // bit 0: this submission interval
-        std::uint8_t frame_history = 0;             // bit 0: this presented frame
-        std::uint8_t probe = 0;                     // submission-hot probe: 1 asked, 2 armed at last collect, 3 observed
-        std::uint8_t frame_probe = 0;               // frame-hot probe: 1 asked, 2 armed at last collect, 3 observed
-        bool sub_hot = false;
-        bool frame_hot = false;
-        bool written_this_frame = false;
+        std::uint32_t hot_index = kNoIndex;      // index in hot_list_ when hot
+        std::uint32_t dirty_index = kNoIndex;    // index in dirty_list_ when cold and needing arm/copy
+        std::uint32_t history_index = kNoIndex;  // index in history_active_ when cold with non-zero history
+        std::uint16_t history = 0;               // bit 0: this submission interval
+        std::uint8_t probe = 0;                  // hot probe: 1 asked, 2 armed at last collect, 3 observed
+        bool hot = false;
         bool armed = false;
         bool written = false;
-
-        bool unguarded() const { return hot_index != kNoIndex; }
     };
-
-    bool want_unguarded(const Page& p) const { return p.sub_hot || (p.frame_hot && frame_hot_unguarded_); }
-
-    void enter_unguarded(std::uintptr_t address, Page& p) {
-        if (p.unguarded()) return;
-        add_hot(address, p);
-        erase_dirty(p);
-        --stats_.cold;
-        ++stats_.hot;
-        if (p.armed) {
-            guard_.disarm(address);
-            p.armed = false;
-        }
-    }
-    void leave_unguarded(std::uintptr_t address, Page& p) {
-        if (!p.unguarded()) return;
-        erase_hot(p);
-        p.probe = 0;
-        p.frame_probe = 0;
-        --stats_.hot;
-        ++stats_.cold;
-        if (p.written || !p.armed) add_dirty(address, p);
-    }
 
     void add_hot(std::uintptr_t address, Page& p) {
         if (p.hot_index != kNoIndex) return;
@@ -485,52 +313,15 @@ private:
         if (p.history_index != kNoIndex) erase_history_at(p.history_index);
     }
 
-    void add_frame_hot(std::uintptr_t address, Page& p) {
-        if (p.frame_hot_index != kNoIndex) return;
-        p.frame_hot_index = std::uint32_t(frame_hot_list_.size());
-        frame_hot_list_.push_back(address);
-    }
-    void erase_frame_hot_at(std::size_t idx) {
-        const std::uintptr_t addr = frame_hot_list_[idx];
-        const std::uintptr_t last = frame_hot_list_.back();
-        frame_hot_list_[idx] = last;
-        if (last != addr) pages_.find(last)->second.frame_hot_index = std::uint32_t(idx);
-        frame_hot_list_.pop_back();
-        pages_.find(addr)->second.frame_hot_index = kNoIndex;
-    }
-    void erase_frame_hot(Page& p) {
-        if (p.frame_hot_index != kNoIndex) erase_frame_hot_at(p.frame_hot_index);
-    }
-
-    void add_frame_history(std::uintptr_t address, Page& p) {
-        if (p.frame_hist_index != kNoIndex) return;
-        p.frame_hist_index = std::uint32_t(frame_history_active_.size());
-        frame_history_active_.push_back(address);
-    }
-    void erase_frame_history_at(std::size_t idx) {
-        const std::uintptr_t addr = frame_history_active_[idx];
-        const std::uintptr_t last = frame_history_active_.back();
-        frame_history_active_[idx] = last;
-        if (last != addr) pages_.find(last)->second.frame_hist_index = std::uint32_t(idx);
-        frame_history_active_.pop_back();
-        pages_.find(addr)->second.frame_hist_index = kNoIndex;
-    }
-    void erase_frame_history(Page& p) {
-        if (p.frame_hist_index != kNoIndex) erase_frame_history_at(p.frame_hist_index);
-    }
-
     typename std::unordered_map<std::uintptr_t, Page>::iterator
     erase_page(typename std::unordered_map<std::uintptr_t, Page>::iterator it) {
         Page& p = it->second;
         if (p.armed) guard_.disarm(it->first);
-        const bool was_hot = p.unguarded();
+        const bool was_hot = p.hot;
         erase_hot(p);
         erase_dirty(p);
         erase_history(p);
-        erase_frame_hot(p);
-        erase_frame_history(p);
         --(was_hot ? stats_.hot : stats_.cold);
-        stats_.frame_hot = frame_hot_list_.size();
         return pages_.erase(it);
     }
 
@@ -551,18 +342,11 @@ private:
     std::vector<std::uintptr_t> hot_list_;
     std::vector<std::uintptr_t> dirty_list_;
     std::vector<std::uintptr_t> history_active_;
-    std::vector<std::uintptr_t> frame_hot_list_;
-    std::vector<std::uintptr_t> frame_history_active_;
     std::vector<std::uintptr_t> to_copy_;
     std::vector<std::uintptr_t> to_arm_;
     std::vector<std::uint8_t> arm_results_;
     std::vector<std::uintptr_t> demoted_;
-    std::vector<std::uintptr_t> frame_demoted_;
     std::uint64_t frame_ = 0;
-    std::uint64_t presented_frames_ = 0;
-    std::uint64_t subs_in_frame_ = 0;
-    std::uint64_t last_frame_subs_ = 0;
-    bool frame_hot_unguarded_ = false;
     Stats stats_;
 };
 

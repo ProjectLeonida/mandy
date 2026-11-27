@@ -1,21 +1,22 @@
 #pragma once
-// HotColdTracking: the page mirror's tracking (TitleMirrorTracking, src/title_mirror_tracking.h) with the two-tier
-// hot/cold policy of src/title_write_policy.h over the geometry watch's cells, plus zero-fault MEM_WRITE_WATCH
+// HotColdTracking: the page mirror's tracking (TitleMirrorTracking, src/title_mirror_tracking.h) with the hot/cold
+// policy of src/title_write_policy.h over the geometry watch's cells, plus region-batched zero-fault MEM_WRITE_WATCH
 // tracking (title_write_watch) for pages inside write-watched private reservations.
 //
 // - Guarded pages (sections / ordinary pages without MEM_WRITE_WATCH): watched through geometry_writes cells, with
 //   contiguous 64 KiB re-arms batched into single VirtualProtect syscalls in CellGuard::arm_batch(). One collect() is
-//   one submission interval; on_present() advances the frame-hot tier once per presented frame.
-// - Write-watched pages (title_write_watch::contains): queried via title_write_watch::ask() (GetWriteWatch with
-//   WRITE_WATCH_FLAG_RESET) before copies, with zero guard faults, zero VirtualProtect syscalls, and zero interference
-//   with geometry_writes::hot_tiles().
+//   one submission interval; only pages written in >= 6 of 8 submissions stay unguarded.
+// - Write-watched pages (title_write_watch::contains): queried via cached region-batched runs in
+//   title_write_watch::ask() (GetWriteWatch with WRITE_WATCH_FLAG_RESET) in O(regions + dirty) without walking
+//   ww_pages_ on steady-state submissions, with zero guard faults, zero VirtualProtect syscalls, and zero interference
+//   with geometry_writes::hot_tiles(). Uncommitted holes inside a reservation are never bridged.
 #include "title_mirror_tracking.h"
 #include "title_write_policy.h"
 
 #include <algorithm>
 #include <cstdint>
-#include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -40,13 +41,21 @@ public:
             if (!ww_reader_) ww_reader_ = title_write_watch::open_reader();
             ww_pages_.insert(addr);
             ww_initial_.push_back(addr);
+            ww_runs_dirty_ = true;
             return;
         }
         watch_guarded(addr);
     }
     void unwatch(std::uint64_t page) override {
         const std::uintptr_t addr = std::uintptr_t(page) & ~(Policy::kPage - 1);
-        if (ww_pages_.erase(addr)) return;
+        if (ww_pages_.erase(addr)) {
+            ww_runs_dirty_ = true;
+            if (ww_pages_.empty()) {
+                ww_runs_.clear();
+                ww_initial_.clear();
+            }
+            return;
+        }
         const auto it = guard_.cells.find(addr);
         if (it == guard_.cells.end()) return;
         policy_.remove(addr, addr + Policy::kPage);
@@ -55,8 +64,6 @@ public:
         geometry_writes::release(addr);
         guard_.cells.erase(it);
     }
-    // Called once per presented frame (e.g. when submit_phases::totals().present_serial advances).
-    void on_present() { policy_.present_frame(); }
 
     void collect(std::vector<std::uint64_t>& out) override {
         out.clear();
@@ -86,8 +93,6 @@ public:
         return now - std::exchange(refused_seen_, now);
     }
     const auto& stats() const { return policy_.stats(); }
-    std::size_t write_watched_pages() const { return ww_pages_.size(); }
-    std::uint64_t write_watched_copies() const { return ww_copies_; }
     // A cold page whose guard no write has reached since it was armed (TitleMirrorTracking::unwritten). A hot or
     // write-watched page returns false (conservative).
     bool unwritten(std::uint64_t page) override {
@@ -100,46 +105,110 @@ public:
     }
 
 private:
+    static constexpr std::uintptr_t kWwMergeGap = 0x100000;      // bridge committed gaps <= 1 MiB inside a reservation
+    static constexpr std::uintptr_t kMaxWwRunBytes = 0x4000000;  // cap each GetWriteWatch call at 64 MiB (16k 4K pages)
+
     void watch_guarded(std::uintptr_t addr) {
         if (guard_.cells.count(addr)) return;
         guard_.cells.emplace(addr, geometry_writes::acquire(addr));
         policy_.add(addr, addr + Policy::kPage);  // copied (and armed) at the next collect
     }
 
-    void collect_write_watched(std::vector<std::uint64_t>& out) {
+    // Advances across contiguous MEM_COMMIT regions starting at `from`, capped at `limit`.
+    static std::uintptr_t committed_end_from(std::uintptr_t from, std::uintptr_t limit) {
+        std::uintptr_t p = from;
+        while (p < limit) {
+            MEMORY_BASIC_INFORMATION m{};
+            if (!VirtualQuery(reinterpret_cast<const void*>(p), &m, sizeof m) || m.State != MEM_COMMIT) break;
+            const std::uintptr_t region_end = reinterpret_cast<std::uintptr_t>(m.BaseAddress) + m.RegionSize;
+            if (region_end <= p) break;
+            p = (std::min)(limit, region_end);
+        }
+        return p;
+    }
+
+    // Rebuilds cached region-batched runs from ww_pages_. Called only when ww_pages_ or title_write_watch reservations
+    // change; steady-state collect() reuses ww_runs_ directly in O(runs + dirty).
+    void rebuild_ww_runs() {
         ww_runs_.clear();
-        ww_dirty_.clear();
-        ww_refused_.clear();
-        std::uintptr_t run_from = 0, run_to = 0, run_limit = 0;
-        for (const std::uintptr_t page : ww_pages_) {
-            if (run_from != run_to && page == run_to && page + Policy::kPage <= run_limit) {
-                run_to += Policy::kPage;
+        ww_runs_dirty_ = false;
+        ww_gen_ = title_write_watch::generation();
+        if (ww_pages_.empty()) return;
+
+        ww_sorted_.assign(ww_pages_.begin(), ww_pages_.end());
+        std::sort(ww_sorted_.begin(), ww_sorted_.end());
+
+        std::uintptr_t run_from = 0, run_to = 0;
+        std::uintptr_t reg_end = 0;         // end of current title_write_watch reservation
+        std::uintptr_t run_commit_end = 0;  // verified unbroken MEM_COMMIT end starting from run_from
+
+        for (const std::uintptr_t page : ww_sorted_) {
+            const std::uintptr_t page_end = page + Policy::kPage;
+            if (page_end <= page) {
+                ww_refused_.push_back(page);
                 continue;
             }
-            if (run_from != run_to) ww_runs_.emplace_back(run_from, run_to);
-            const std::uintptr_t limit = title_write_watch::end_of(page);
-            if (!limit || page + Policy::kPage > limit) {
+            if (page >= reg_end) {
+                if (run_from != run_to) {
+                    ww_runs_.emplace_back(run_from, run_to);
+                    run_from = run_to = run_commit_end = 0;
+                }
+                reg_end = title_write_watch::end_of(page);
+            }
+            if (!reg_end || page_end > reg_end) {
                 ww_refused_.push_back(page);
-                run_from = run_to = run_limit = 0;
                 continue;
+            }
+            if (run_from != run_to) {
+                const std::uintptr_t gap = page - run_to;
+                const std::uintptr_t merged_bytes = page_end - run_from;
+                if (merged_bytes <= kMaxWwRunBytes && gap <= kWwMergeGap) {
+                    if (run_commit_end < page_end && run_commit_end >= run_to) {
+                        const std::uintptr_t cap =
+                            reg_end - run_from > kMaxWwRunBytes ? run_from + kMaxWwRunBytes : reg_end;
+                        run_commit_end = committed_end_from(run_commit_end, cap);
+                    }
+                    if (run_commit_end >= page_end) {
+                        run_to = page_end;
+                        continue;
+                    }
+                }
+                ww_runs_.emplace_back(run_from, run_to);
+                run_from = run_to = run_commit_end = 0;
             }
             run_from = page;
-            run_to = page + Policy::kPage;
-            run_limit = limit;
+            run_to = page_end;
+            const std::uintptr_t cap = reg_end - run_from > kMaxWwRunBytes ? run_from + kMaxWwRunBytes : reg_end;
+            run_commit_end = committed_end_from(run_from, cap);
         }
         if (run_from != run_to) ww_runs_.emplace_back(run_from, run_to);
+    }
+
+    void collect_write_watched(std::vector<std::uint64_t>& out) {
+        ww_dirty_.clear();
+        ww_refused_.clear();
+        ww_retry_runs_.clear();
+
+        if (ww_runs_dirty_ || ww_gen_ != title_write_watch::generation()) rebuild_ww_runs();
+
+        const auto record_dirty = [&](std::uintptr_t from, std::uintptr_t to) {
+            for (std::uintptr_t p = from & ~(Policy::kPage - 1); p < to;) {
+                if (ww_pages_.count(p)) ww_dirty_.push_back(p);
+                if (to - p <= Policy::kPage) break;
+                p += Policy::kPage;
+            }
+        };
 
         if (!ww_runs_.empty()) {
             title_write_watch::ask(
-                ww_reader_, ww_runs_,
+                ww_reader_, ww_runs_, record_dirty,
                 [&](std::uintptr_t from, std::uintptr_t to) {
-                    for (std::uintptr_t p = from & ~(Policy::kPage - 1); p < to;) {
-                        if (ww_pages_.count(p)) ww_dirty_.push_back(p);
-                        if (to - p <= Policy::kPage) break;
-                        p += Policy::kPage;
+                    // A multi-page run whose reservation still exists may have acquired an uncommitted hole since
+                    // ww_runs_ was cached: split and retry its watched pages before falling back to guards.
+                    if (to - from > Policy::kPage && title_write_watch::contains(from)) {
+                        ww_retry_runs_.emplace_back(from, to);
+                        return;
                     }
-                },
-                [&](std::uintptr_t from, std::uintptr_t to) {
                     for (std::uintptr_t p = from & ~(Policy::kPage - 1); p < to;) {
                         if (ww_pages_.count(p)) ww_refused_.push_back(p);
                         if (to - p <= Policy::kPage) break;
@@ -147,21 +216,53 @@ private:
                     }
                 });
         }
+
+        if (!ww_retry_runs_.empty()) {
+            ww_runs_dirty_ = true;
+            ww_split_runs_.clear();
+            for (const auto& [from, to] : ww_retry_runs_) {
+                // The first ask() already advanced ww_reader_'s journal cursor, so any write journaled by another
+                // reader or title_write_watch::mark() before it would be skipped by a second ask(). Mark every
+                // watched page in the refused run dirty conservatively, then split-ask to reset kernel bits and find
+                // any individual page that genuinely lost write-watching.
+                record_dirty(from, to);
+                for (std::uintptr_t p = from & ~(Policy::kPage - 1); p < to;) {
+                    if (ww_pages_.count(p)) ww_split_runs_.emplace_back(p, p + Policy::kPage);
+                    if (to - p <= Policy::kPage) break;
+                    p += Policy::kPage;
+                }
+            }
+            if (!ww_split_runs_.empty()) {
+                title_write_watch::ask(
+                    ww_reader_, ww_split_runs_, [](std::uintptr_t, std::uintptr_t) {},
+                    [&](std::uintptr_t from, std::uintptr_t to) {
+                        for (std::uintptr_t p = from & ~(Policy::kPage - 1); p < to;) {
+                            if (ww_pages_.count(p)) ww_refused_.push_back(p);
+                            if (to - p <= Policy::kPage) break;
+                            p += Policy::kPage;
+                        }
+                    });
+            }
+        }
+
         for (const std::uintptr_t p : ww_initial_)
             if (ww_pages_.count(p)) ww_dirty_.push_back(p);
         ww_initial_.clear();
 
         // Any page whose MEM_WRITE_WATCH reservation disappeared falls back to guarded tracking without losing a write.
-        for (const std::uintptr_t p : ww_refused_) {
-            if (ww_pages_.erase(p)) {
-                watch_guarded(p);
-                ww_dirty_.push_back(p);
+        if (!ww_refused_.empty()) {
+            ww_runs_dirty_ = true;
+            for (const std::uintptr_t p : ww_refused_) {
+                if (ww_pages_.erase(p)) {
+                    watch_guarded(p);
+                    ww_dirty_.push_back(p);
+                }
             }
+            if (ww_pages_.empty()) ww_runs_.clear();
         }
         if (!ww_dirty_.empty()) {
             std::sort(ww_dirty_.begin(), ww_dirty_.end());
             ww_dirty_.erase(std::unique(ww_dirty_.begin(), ww_dirty_.end()), ww_dirty_.end());
-            ww_copies_ += ww_dirty_.size();
             const bool had_guarded = !out.empty();
             for (const std::uintptr_t p : ww_dirty_) out.push_back(p);
             if (had_guarded) {
@@ -354,12 +455,16 @@ private:
 
     // Write-watched private pages (MEM_WRITE_WATCH via title_write_watch): zero guard faults, zero VirtualProtect.
     std::uint64_t ww_reader_ = 0;
-    std::set<std::uintptr_t> ww_pages_;
+    std::uint64_t ww_gen_ = 0;
+    bool ww_runs_dirty_ = false;
+    std::unordered_set<std::uintptr_t> ww_pages_;
+    std::vector<std::uintptr_t> ww_sorted_;
     std::vector<std::uintptr_t> ww_initial_;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> ww_runs_;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> ww_retry_runs_;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> ww_split_runs_;
     std::vector<std::uintptr_t> ww_dirty_;
     std::vector<std::uintptr_t> ww_refused_;
-    std::uint64_t ww_copies_ = 0;
 };
 
 }  // namespace leonida
