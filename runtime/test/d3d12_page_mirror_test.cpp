@@ -7,7 +7,10 @@
 //      over the view faults, the page's home is filled again once);
 //   3. a remap of the GPU-only page (another physical page) is a rebind: the next read sees the new page, and no host
 //      remap was made;
-//   4. a page of the reservation nothing is mapped at reads zero, with no fault.
+//   4. a page of the reservation nothing is mapped at reads zero, with no fault;
+//   5. ordinary memory (committed XMemVirtualAlloc pages) is mirrored when a reader names it: a constant-buffer view
+//      keeps the title's address as its base, the GPU reads the bytes and a later title write there, and a binding of
+//      it is served by the mirror's chunk.
 // Exit 77 when the device makes no page mirror (no sparse aliased strict buffers or capture-replay addresses: llvmpipe).
 // No shaders, no game data.
 #include "../shims/d3d12_com.h"
@@ -108,6 +111,39 @@ int test() {
 
     // 4. A page of the reservation with nothing mapped.
     EXPECT(gpu_word(device.p, std::uintptr_t(dst) + 5 * kPage64k) == 0);
+
+    // 5. Ordinary memory (an XMemVirtualAlloc region of committed pages) is mirrored when a reader names it: a
+    //    constant-buffer view over it keeps the title's address as its V# base (heap_base + it is the mirror, no copy),
+    //    the GPU reads the bytes there, and a title write reaches it at the next refresh. A draw's binding of it is
+    //    served by the mirror's chunk.
+    auto* plain = static_cast<std::uint8_t*>(reserve(nullptr, 2 * kPage64k, MEM_RESERVE | MEM_COMMIT, 0, PAGE_READWRITE));
+    EXPECT(plain && leonida::title_mirror_space::contains(std::uintptr_t(plain)));
+    auto* plain_words = reinterpret_cast<volatile std::uint32_t*>(plain);
+    plain_words[0x40] = 0x61000040u;
+    std::uint64_t unnamed = 64;
+    EXPECT(!rt::d3d12::page_mirror_buffer_at(device.p, std::uintptr_t(plain), unnamed));  // not named yet
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    Ref<ID3D12DescriptorHeap> heap;
+    EXPECT(SUCCEEDED(device.p->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    const D3D12_CPU_DESCRIPTOR_HANDLE handle = heap.p->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC view{std::uintptr_t(plain), 0x200};
+    device.p->CreateConstantBufferView(&view, handle);
+    std::uint32_t vsharp[4]{};
+    std::memcpy(vsharp, reinterpret_cast<const void*>(handle.ptr), sizeof(vsharp));
+    const std::uint64_t base = std::uint64_t(vsharp[0]) | (std::uint64_t(vsharp[1] & 0xffffu) << 32);
+    EXPECT(base == (std::uintptr_t(plain) & 0xFFFFFFFFFFFFull));
+    EXPECT(gpu_word(device.p, std::uintptr_t(plain) + 0x100) == 0x61000040u);
+    std::thread([&] { plain_words[0x40] = 0x61000041u; }).join();
+    EXPECT(gpu_word(device.p, std::uintptr_t(plain) + 0x100) == 0x61000041u);
+    std::uint64_t binding = 0x200;
+    EXPECT(rt::d3d12::page_mirror_buffer_at(device.p, std::uintptr_t(plain), binding) && binding == 0x200);
+    // The second page, named on its own (a vertex view's range), and a GPU-only page (physical: mirrored as mapped).
+    plain_words[kPage64k / 4] = 0x62000000u;
+    EXPECT(rt::d3d12::page_mirror_name(device.p, std::uintptr_t(plain) + kPage64k, 64));
+    EXPECT(gpu_word(device.p, std::uintptr_t(plain) + kPage64k) == 0x62000000u);
+    std::uint64_t pool_binding = 256;
+    EXPECT(rt::d3d12::page_mirror_buffer_at(device.p, std::uintptr_t(dst), pool_binding));
 
     const auto end = rt::d3d12::page_mirror_state(device.p);
     std::printf("page mirror: heap_base 0x%llx, %llu pages in %llu homes over %llu chunk(s); slot-31 copies, a title "

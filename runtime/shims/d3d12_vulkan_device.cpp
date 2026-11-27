@@ -3295,6 +3295,11 @@ struct DeviceState {
             if (why) *why = reason;
             return std::uint64_t(0);
         };
+        // The page mirror holds the title's bytes at heap_base + the address the GPU names (a GPU-only page reads its
+        // own physical page there, not its CPU view's), so no copy is made.
+        if (span && guest && page_mirror.mirror && leonida::title_va_aliases().shader_va(guest, span) == guest &&
+            page_mirror_resolve(guest, span))
+            return guest;
         if (!geometry.cap() || !span || !guest || !watch_shadow_writes()) return no(NoCopy::no_geometry);
         const auto cpu = leonida::title_gpu_views::to_cpu(guest, span);
         auto& aliases = leonida::title_va_aliases();
@@ -3598,6 +3603,8 @@ struct DeviceState {
     // called with it held.
     bool device_reachable(std::uint64_t va, bool buffers_checked = false) {
         if (va < arena.size) return true;
+        // Title memory the page mirror holds: heap_base + va is its chunk.
+        if (page_mirror.mirror && page_mirror_resolve(va, 1)) return true;
         const bool wrapped = va < (1ull << 48) && (va >> 47);
         const std::uint64_t candidates[2] = {va, wrapped ? va | ~((1ull << 48) - 1) : va};
         auto& aliases = leonida::title_va_aliases();
@@ -3657,6 +3664,11 @@ struct DeviceState {
         std::lock_guard lock(title_window_mutex);
         if (const std::uint64_t made = aliases.shader_va(va); made != va) {  // another thread made it meanwhile
             out = made;
+            return true;
+        }
+        // The page mirror: the address itself (heap_base + va), no window, extent or copy.
+        if (page_mirror_resolve(va, want)) {
+            out = va;
             return true;
         }
         // A stream pool's address: one mapping for its readable run, shared by both of its views.
@@ -3727,7 +3739,10 @@ struct DeviceState {
         const std::uint64_t span = std::max<std::uint64_t>(bytes, 1);
         auto& aliases = leonida::title_va_aliases();
         std::uint64_t lo = 0, hi = 0;
-        if (!geometry.cap() || !watch_shadow_writes() || !aliases.title_memory(va, lo, hi) || span > hi - va) return 0;
+        if (!aliases.title_memory(va, lo, hi) || span > hi - va) return 0;
+        // In the page mirror the structure is the title's own pages (their homes keep what the GPU writes).
+        if (page_mirror_resolve(va, span)) return va;
+        if (!geometry.cap() || !watch_shadow_writes()) return 0;
         const auto cpu = leonida::title_gpu_views::to_host_view(static_cast<std::uintptr_t>(va),
                                                                 static_cast<std::uintptr_t>(span));
         if (context->knows_buffer_va(cpu, span)) return 0;
@@ -4273,6 +4288,12 @@ struct DeviceState {
             aliases.note_translation(kind);
             return path(0), to;
         }
+        // Title memory the page mirror holds: the V# names it as the title wrote it (heap_base + base is the mirror).
+        if (page_mirror.mirror) {
+            uint64_t lo{}, hi{};
+            if (aliases.title_memory(base, lo, hi) && bytes <= hi - base && page_mirror_resolve(base, bytes))
+                return path(6), base;
+        }
         // An already rewritten descriptor carries only the low 48 bits.
         uint64_t offset = base;
         if (signed_vsharp_offsets() && base <= mask && (base & (1ull << 47))) offset |= ~mask;
@@ -4294,7 +4315,7 @@ struct DeviceState {
         return path(5), 0;
     }
     // vsharp_address's outcomes (diagnostics): alias hit, alias refused, arena VA, geometry copy, window, none.
-    static constexpr unsigned kVsharpPathCount = 6;
+    static constexpr unsigned kVsharpPathCount = 7;
     std::array<std::atomic<std::uint64_t>, kVsharpPathCount> vsharp_paths{};
 
     // LEONIDA_UNBACKED_VSHARP=1 (diagnostic): the buffer V#s fix_vsharp writes empty because nothing backs their base.
@@ -4516,8 +4537,17 @@ struct DeviceState {
         std::unique_ptr<leonida::TitleMirrorTracking> tracking;
         std::vector<std::uint64_t> written;
         std::unordered_set<std::uintptr_t> fed_now;  // pages a change of this refresh mapped (filled already)
+        // Ordinary title memory (not physical pages) in the mirror's range: base -> end of each such reservation, the
+        // runs of it whose pages are mirrored (merged: begin -> end), and those pages. Mirrored as readers name it
+        // (page_mirror_resolve): each page its own home, filled from the page itself. A release or decommit there
+        // (geometry_writes::note_released) unmaps them.
+        std::map<std::uint64_t, std::uint64_t> plain, ensured;
+        std::set<std::uint64_t> identity;
+        leonida::geometry_writes::ReleaseQueue released;
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> released_ranges;
         // Since the last log line.
         std::uint64_t refreshes = 0, fed = 0, dirty = 0, uploads = 0, batches = 0, binds = 0, arm_failures = 0;
+        std::uint64_t resolved = 0, resolve_refused = 0, identity_mapped = 0, identity_released = 0, clipped = 0;
         double ms = 0;
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
     } page_mirror;
@@ -4589,7 +4619,7 @@ struct DeviceState {
             requirements.size = leonida::TitleMirror::kUnitBytes;
             requirements.alignment = leonida::TitleMirror::kPage;
             requirements.memoryTypeBits = sparse_buffer_memory_types;
-            leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::geometry);
+            leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::mirror);
             out = allocate(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             void* mapped = nullptr;
@@ -4623,6 +4653,11 @@ struct DeviceState {
         };
         page_mirror.mirror = std::make_unique<leonida::TitleMirror>(std::move(hooks));
         page_mirror.tracking = std::make_unique<leonida::GuardTracking>();
+        leonida::geometry_writes::subscribe(page_mirror.released);
+        // A vertex, index, copy or indirect-argument address no buffer of ours holds is looked up in the mirror.
+        context->set_mirror_buffer([this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
+            return page_mirror_buffer(va, size, buffer, offset);
+        });
         leonida::title_frames::attach_fn.load(std::memory_order_acquire)(this, &page_mirror_feed);
         std::fprintf(stderr, "[rt] d3d12: page mirror on: the title's reservations in [0x%llx, 0x%llx) at heap_base + "
                              "their address (0x%llx up), bound to one home per physical page\n",
@@ -4644,9 +4679,115 @@ struct DeviceState {
     }
     std::uint64_t page_mirror_address(std::uint64_t va) const { return arena.address + va; }
 
+    // Title memory [va, va + bytes) as a reader names it (a V#, a root view, a vertex or index view, a stream-pool
+    // range): true when the mirror holds all of it, and then the shader VA of the range is `va` itself (heap_base +
+    // va). Physical pages are in the mirror as xmem maps them; ordinary memory is mirrored here, page by page, the first
+    // time a reader names it (watched first, then filled; bound at this submission's flush). False (the caller keeps
+    // its old backing) when the mirror is off, a page lies outside every chunk, or more than kMirrorNameMax of
+    // ordinary memory not mirrored yet is named at once (a V# with a wild size: counted).
+    static constexpr std::uint64_t kMirrorNameMax = std::uint64_t(256) << 20;
+    bool page_mirror_resolve(std::uint64_t va, std::uint64_t bytes) {
+        if (!page_mirror.mirror) return false;
+        std::lock_guard lock(page_mirror.mutex);
+        return page_mirror_resolve_locked(va, bytes, true);
+    }
+    // The reservations xmem placed since the last look get chunks, and the ordinary ones are known as such
+    // (page_mirror.mutex held).
+    void sync_mirror_space_locked() {
+        auto& m = page_mirror;
+        const std::uint64_t g = leonida::title_mirror_space::generation();
+        if (g == m.space_generation) return;
+        m.space_generation = g;
+        m.plain.clear();
+        leonida::title_mirror_space::for_each_taken([&](std::uint64_t base, std::uint64_t end, bool plain) {
+            m.mirror->cover(base, end);
+            if (plain) m.plain[base] = end;
+        });
+    }
+    bool page_mirror_resolve_locked(std::uint64_t va, std::uint64_t bytes, bool make) {
+        auto& m = page_mirror;
+        if (!bytes || va + bytes < va) return false;
+        sync_mirror_space_locked();
+        constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
+        const std::uint64_t end = va + bytes;
+        for (std::uint64_t c = va & ~(leonida::TitleMirror::kChunk - 1); c < end; c += leonida::TitleMirror::kChunk)
+            if (!m.mirror->covers(c)) return false;
+        auto it = m.plain.upper_bound(va);
+        if (it != m.plain.begin() && std::prev(it)->second > va) --it;
+        for (; it != m.plain.end() && it->first < end; ++it) {
+            const std::uint64_t from = std::max(it->first, va) & ~(kPage - 1);
+            const std::uint64_t to = (std::min(it->second, end) + kPage - 1) & ~(kPage - 1);
+            if (ensured_covers(from, to)) continue;
+            if (!make) return false;
+            if (to - from > kMirrorNameMax) {
+                ++m.resolve_refused;
+                return false;
+            }
+            const std::uint64_t ticket = context->submitted_retire_ticket() + 1;
+            for (std::uint64_t page = from; page < to; page += kPage) {
+                if (m.mirror->mirrored(page)) continue;
+                m.tracking->watch(page);  // before the fill: a write after it is in the next collect
+                m.mirror->map(page, reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(page)), nullptr, ticket);
+                m.identity.insert(page);
+                ++m.identity_mapped;
+            }
+            ensure_run(from, to);
+        }
+        ++m.resolved;
+        return true;
+    }
+    // The merged runs of mirrored ordinary memory (page_mirror.mutex held).
+    bool ensured_covers(std::uint64_t from, std::uint64_t to) const {
+        const auto& e = page_mirror.ensured;
+        auto it = e.upper_bound(from);
+        if (it == e.begin()) return false;
+        --it;
+        return it->first <= from && it->second >= to;
+    }
+    void ensure_run(std::uint64_t from, std::uint64_t to) {
+        auto& e = page_mirror.ensured;
+        auto it = e.upper_bound(from);
+        if (it != e.begin() && std::prev(it)->second >= from) --it;
+        while (it != e.end() && it->first <= to) {
+            from = std::min(from, it->first);
+            to = std::max(to, it->second);
+            it = e.erase(it);
+        }
+        e[from] = to;
+    }
+    // VulkanContext's mirror lookup (set_mirror_buffer): the chunk and offset that hold [va, va + size), when the mirror
+    // holds all of it already (named before: nothing is mirrored during a replay, whose binds would land after it). A
+    // range that runs past its chunk is cut at the chunk's end (counted): a buffer binding cannot span two chunks.
+    bool page_mirror_buffer(std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
+        if (!page_mirror.mirror || !size) return false;
+        std::lock_guard lock(page_mirror.mutex);
+        if (!page_mirror_resolve_locked(va, size, false) || !page_mirror.mirror->chunk_at(va, buffer, offset)) return false;
+        const std::uint64_t room = leonida::TitleMirror::kChunk - offset;
+        if (size > room) {
+            size = room;
+            ++page_mirror.clipped;
+        }
+        return true;
+    }
+    // Last in the before-execute hook, once every reader of this submission has named what it reads: the binds noted
+    // since the last batch go in one, and every queue's next submission waits for it (the ordering rule).
+    void flush_page_mirror() {
+        auto& m = page_mirror;
+        if (!m.mirror) return;
+        std::lock_guard lock(m.mutex);
+        if (m.mirror->flush(m.value + 1)) {
+            ++m.value;
+            ++m.batches;
+            m.binds += m.mirror->last_batch();
+            context->note_mirror_bind(m.timeline, m.value);
+        }
+    }
+
     void destroy_page_mirror() {
         if (!page_mirror.mirror) return;
         if (const auto attach = leonida::title_frames::attach_fn.load(std::memory_order_acquire)) attach(this, nullptr);
+        context->set_mirror_buffer({});
+        leonida::geometry_writes::unsubscribe(page_mirror.released);
         std::lock_guard lock(page_mirror.mutex);
         page_mirror.tracking.reset();
         page_mirror.mirror.reset();
@@ -4665,10 +4806,7 @@ struct DeviceState {
         if (!m.mirror) return;
         const auto start = std::chrono::steady_clock::now();
         std::lock_guard lock(m.mutex);
-        if (const std::uint64_t g = leonida::title_mirror_space::generation(); g != m.space_generation) {
-            m.space_generation = g;
-            leonida::title_mirror_space::for_each_taken([&](std::uint64_t base, std::uint64_t end) { m.mirror->cover(base, end); });
-        }
+        sync_mirror_space_locked();
         m.taken.clear();
         AcquireSRWLockExclusive(&m.feed_lock);
         for (auto& change : m.feed) m.taken.push_back(std::move(change));
@@ -4685,17 +4823,24 @@ struct DeviceState {
             m.mirror->map(change.page, change.frame, std::move(change.keep), ticket);
         }
         m.taken.clear();
+        // Ordinary memory released or decommitted: its mirrored pages leave (named again, they are mirrored again).
+        leonida::geometry_writes::take_released(m.released, m.released_ranges);
+        for (const auto& [from, to] : m.released_ranges) {
+            for (auto page = m.identity.lower_bound(from & ~(leonida::TitleMirror::kPage - 1));
+                 page != m.identity.end() && *page < to;) {
+                m.tracking->unwatch(*page);
+                m.mirror->map(*page, nullptr, nullptr, ticket);
+                ++m.identity_released;
+                page = m.identity.erase(page);
+            }
+            for (auto run = m.ensured.begin(); run != m.ensured.end();)
+                run = run->first < to && from < run->second ? m.ensured.erase(run) : std::next(run);
+        }
         m.tracking->collect(m.written);  // re-watched before the copies below
         for (const std::uint64_t page : m.written)
             if (!m.fed_now.count(std::uintptr_t(page)) && m.mirror->dirty(page)) ++m.dirty;
         m.arm_failures += m.tracking->take_refused();
         m.uploads += m.mirror->upload();
-        if (m.mirror->flush(m.value + 1)) {
-            ++m.value;
-            ++m.batches;
-            m.binds += m.mirror->last_batch();
-            context->note_mirror_bind(m.timeline, m.value);
-        }
         m.mirror->retire(context->completed_retire_ticket());
         ++m.refreshes;
         const auto now = std::chrono::steady_clock::now();
@@ -4706,7 +4851,8 @@ struct DeviceState {
                          "[rt] d3d12: page mirror: %llu pages mirrored, %llu homes in %llu units (%llu MiB), %llu chunks "
                          "(%llu not placed); in %.0f s: %llu refreshes, %llu changes fed, %llu pages written, %llu "
                          "uploads, %llu binds in %llu batches, %llu arms refused, %.3f ms a refresh; changes outside "
-                         "the chunks %llu, views clipped 0 (chunks are contiguous)\n",
+                         "the chunks %llu; readers: %llu ranges resolved into it, %llu refused, %llu ordinary pages "
+                         "mirrored and %llu released, %llu buffer bindings cut at a chunk's end\n",
                          static_cast<unsigned long long>(c.pages), static_cast<unsigned long long>(c.homes),
                          static_cast<unsigned long long>(c.units),
                          static_cast<unsigned long long>(c.units * (leonida::TitleMirror::kUnitBytes >> 20)),
@@ -4716,8 +4862,12 @@ struct DeviceState {
                          static_cast<unsigned long long>(m.uploads), static_cast<unsigned long long>(m.binds),
                          static_cast<unsigned long long>(m.batches), static_cast<unsigned long long>(m.arm_failures),
                          m.refreshes ? m.ms / double(m.refreshes) : 0.0,
-                         static_cast<unsigned long long>(c.unmirrored_changes));
+                         static_cast<unsigned long long>(c.unmirrored_changes),
+                         static_cast<unsigned long long>(m.resolved), static_cast<unsigned long long>(m.resolve_refused),
+                         static_cast<unsigned long long>(m.identity_mapped),
+                         static_cast<unsigned long long>(m.identity_released), static_cast<unsigned long long>(m.clipped));
             m.refreshes = m.fed = m.dirty = m.uploads = m.batches = m.binds = m.arm_failures = 0;
+            m.resolved = m.resolve_refused = m.identity_mapped = m.identity_released = m.clipped = 0;
             m.ms = 0;
             m.since = now;
         }
@@ -5519,7 +5669,7 @@ struct DeviceState {
                              "[rt] d3d12: console descriptor heap 0x%llx changed slots per submission: %.1f zero, %.1f "
                              "V# pairs, %.1f T#s, %.1f other; V# halves %.1f, %.1f%% seen before; V# resolutions since "
                              "the last line: alias %llu, alias refused %llu, arena %llu, geometry %llu, window %llu, "
-                             "none %llu\n",
+                             "none %llu, page mirror %llu\n",
                              static_cast<unsigned long long>(heap->console_va), double(heap->changed[0]) / count,
                              double(heap->changed[1]) / count, double(heap->changed[2]) / count,
                              double(heap->changed[3]) / count, double(heap->vsharp_halves) / count,
@@ -5527,7 +5677,8 @@ struct DeviceState {
                                                  : 0.0,
                              static_cast<unsigned long long>(paths[0]), static_cast<unsigned long long>(paths[1]),
                              static_cast<unsigned long long>(paths[2]), static_cast<unsigned long long>(paths[3]),
-                             static_cast<unsigned long long>(paths[4]), static_cast<unsigned long long>(paths[5]));
+                             static_cast<unsigned long long>(paths[4]), static_cast<unsigned long long>(paths[5]),
+                             static_cast<unsigned long long>(paths[6]));
                 // What releases, alias changes and additions cost: per submission, the changes taken, the record
                 // entries looked at to find their slots, and the slots fixed again (apply_slot_changes).
                 // T#s: those in the heap now, those of them waiting (for a texture at their address, or room), and
@@ -15286,6 +15437,7 @@ public:
             }
             // Last, once the heap refresh, the windows and the geometry copies have made what this submission reads.
             state_.update_address_guard();
+            state_.flush_page_mirror();
             const phases::Scope timed(phases::textures);
             refresh_title_textures();
         });
@@ -15446,6 +15598,14 @@ public:
                     share.arena_bound = d.arena.backing.stats().bound;
                     share.arena_in_use = d.arena.in_use;
                     for (std::size_t i = 0; i < share.arena_use.size(); ++i) share.arena_use[i] = d.arena.use_in_use[i];
+                }
+                if (d.page_mirror.mirror) {
+                    std::lock_guard held(d.page_mirror.mutex);
+                    const auto c = d.page_mirror.mirror->counters();
+                    share.mirror = true;
+                    share.mirror_homes = c.homes;
+                    share.mirror_pages = c.pages;
+                    share.mirror_chunks = c.chunks;
                 }
                 std::lock_guard lock(d.descriptor_mutex);  // the bindless set's lock (ExecuteCommandLists' flush)
                 if (const auto* bindless = d.bindless.get()) share.bindless_table_bytes = bindless->table_buffer_bytes();
@@ -19855,6 +20015,8 @@ public:
     // LEONIDA_TITLE_BUFFERS_MB (512 by default).
     void make_title_buffer(std::uint64_t va, std::uint64_t bytes) {
         if (!&context()) return;
+        // The page mirror holds these pages: the draw reads them there (VulkanContext's mirror lookup), no buffer.
+        if (state_.page_mirror_resolve(va, std::max<std::uint64_t>(bytes, 1))) return;
         static const bool check_size = [] {
             wchar_t flag[2]{};
             return !(GetEnvironmentVariableW(L"LEONIDA_TITLE_BUFFER_COVERAGE", flag, 2) == 1 && flag[0] == L'0');
@@ -22392,6 +22554,7 @@ bool page_mirror_gpu_read(ID3D12Device* device, std::uint64_t title_va, void* ou
     auto& state = const_cast<DeviceState&>(d->state());
     if (!state.page_mirror.mirror || !state.context) return false;
     state.refresh_page_mirror();
+    state.flush_page_mirror();
     VkBuffer chunk = VK_NULL_HANDLE;
     VkDeviceSize offset = 0;
     std::uint64_t wait = 0;
@@ -22452,6 +22615,23 @@ bool page_mirror_gpu_read(ID3D12Device* device, std::uint64_t title_va, void* ou
     vk.vkDestroyBuffer(dev, readback, nullptr);
     if (memory) vk.vkFreeMemory(dev, memory, nullptr);
     return ok;
+}
+
+bool page_mirror_buffer_at(ID3D12Device* device, std::uint64_t va, std::uint64_t& size) {
+    ID3D12Device* real = device ? rt::d3d12_xs::device_proxy_real_device(device) : nullptr;
+    if (!real) real = device;
+    const Device* d = real ? Device::from<Device>(real) : nullptr;
+    if (!d) return false;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    return const_cast<DeviceState&>(d->state()).page_mirror_buffer(va, size, buffer, offset);
+}
+
+bool page_mirror_name(ID3D12Device* device, std::uint64_t va, std::uint64_t bytes) {
+    ID3D12Device* real = device ? rt::d3d12_xs::device_proxy_real_device(device) : nullptr;
+    if (!real) real = device;
+    const Device* d = real ? Device::from<Device>(real) : nullptr;
+    return d && const_cast<DeviceState&>(d->state()).page_mirror_resolve(va, bytes);
 }
 
 ArenaMemoryState device_arena_memory(ID3D12Device* device) {

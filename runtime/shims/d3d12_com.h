@@ -425,6 +425,11 @@ PageMirrorState page_mirror_state(ID3D12Device* device);
 // reads at a title-written address there) into `out` with the GPU, after the mirror's last bind. False when the mirror is
 // off or the address is not in one of its chunks. For tests.
 bool page_mirror_gpu_read(ID3D12Device* device, std::uint64_t title_va, void* out, std::size_t bytes);
+// Whether a draw's or copy's binding of title memory [va, va + size) would be served by the page mirror (VulkanContext's
+// mirror lookup): it must have been named before. `size` comes back cut at the chunk's end. For tests.
+bool page_mirror_buffer_at(ID3D12Device* device, std::uint64_t va, std::uint64_t& size);
+// Names [va, va + bytes) to the page mirror as a reader would (page_mirror_resolve). For tests.
+bool page_mirror_name(ID3D12Device* device, std::uint64_t va, std::uint64_t bytes);
 
 // The blocks of device memory that textures share (src/image_memory.h): how many, their bytes, and the textures in
 // them. For tests.
