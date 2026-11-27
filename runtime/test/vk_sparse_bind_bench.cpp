@@ -33,7 +33,7 @@ constexpr VkDeviceSize kPool = 256ull << 20;             // the frames: 4,096 pa
 #define DEVICE_FUNCTIONS(X) \
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) \
     X(vkAllocateMemory) X(vkFreeMemory) X(vkQueueBindSparse) X(vkCreateSemaphore) X(vkDestroySemaphore) \
-    X(vkWaitSemaphores) X(vkDeviceWaitIdle)
+    X(vkWaitSemaphores) X(vkDeviceWaitIdle) X(vkGetBufferDeviceAddress)
 #define DECLARE(name) PFN_##name name = nullptr;
 FUNCTIONS(DECLARE)
 DEVICE_FUNCTIONS(DECLARE)
@@ -98,6 +98,8 @@ int main() {
     queue.pQueuePriorities = priorities.data();
     VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     enable12.timelineSemaphore = VK_TRUE;
+    enable12.bufferDeviceAddress = v12.bufferDeviceAddress;
+    enable12.bufferDeviceAddressCaptureReplay = v12.bufferDeviceAddressCaptureReplay;
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &enable12};
     enable.features.sparseBinding = VK_TRUE;
     enable.features.sparseResidencyBuffer = VK_TRUE;
@@ -206,6 +208,42 @@ int main() {
         row("unbind, contiguous VAs", n, true, false, 0, n >= 1024 ? 5 : 21);
     }
     if (features.features.sparseResidencyAliased) row("aliased: one page at many VAs", 256, false, false, 1, 21);
+    // Placement: can a sparse buffer be made at a device address of our choosing (bufferDeviceAddressCaptureReplay,
+    // VkBufferOpaqueCaptureAddressCreateInfo)? If so, a mirror chunk could sit at heap_base + the title's address,
+    // and a V# or pointer the title wrote into its own memory would reach it unchanged.
+    std::printf("bufferDeviceAddressCaptureReplay %d\n", int(v12.bufferDeviceAddressCaptureReplay));
+    if (v12.bufferDeviceAddress && v12.bufferDeviceAddressCaptureReplay && vkGetBufferDeviceAddress) {
+        const auto place = [&](std::uint64_t want, VkDeviceSize bytes) {
+            VkBufferOpaqueCaptureAddressCreateInfo at{VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO};
+            at.opaqueCaptureAddress = want;
+            VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &at};
+            info.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT |
+                         VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+            info.size = bytes;
+            info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+            VkBuffer made = VK_NULL_HANDLE;
+            const VkResult r = vkCreateBuffer(device, &info, nullptr, &made);
+            std::uint64_t got = 0;
+            if (r == VK_SUCCESS) {
+                VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+                address.buffer = made;
+                got = vkGetBufferDeviceAddress(device, &address);
+            }
+            std::printf("  sparse %llu MiB at 0x%016llx: %s, address 0x%016llx\n",
+                        static_cast<unsigned long long>(bytes >> 20), static_cast<unsigned long long>(want),
+                        r == VK_SUCCESS ? (got == want ? "placed" : "made elsewhere") : "refused",
+                        static_cast<unsigned long long>(got));
+            return made;
+        };
+        // A heap base low in the upper half, and chunks at heap_base + title addresses seen under Wine.
+        const std::uint64_t heap = 0xffff800100000000ull;
+        std::vector<VkBuffer> placed;
+        for (const std::uint64_t title : {0ull, 0x0000000600000000ull, 0x00000075e0000000ull, 0x000000d340000000ull,
+                                          0x00007fb3a0000000ull, 0x00007fb7a0000000ull, 0x00007ffe00000000ull})
+            placed.push_back(place(heap + title, VkDeviceSize(3) << 30));
+        for (VkBuffer b : placed)
+            if (b) vkDestroyBuffer(device, b, nullptr);
+    }
     // A remap's rate: 2,000 pages a second in batches of 32 (the logs' queue slot 31: tens of pages a call).
     {
         const auto t0 = Clock::now();
