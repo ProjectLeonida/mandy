@@ -51,9 +51,11 @@ Usage: `python -I tools/vk_subgroup_info.py --help` lists the options.
 """
 import argparse
 import ctypes
+import functools
 import json
 import os
 import sys
+from pathlib import Path
 
 VK_STRUCTURE_TYPE_APPLICATION_INFO = 0
 VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1
@@ -80,10 +82,6 @@ RDNA1_DEVICE_IDS = (0x7310, 0x7312, 0x7318, 0x7319, 0x731A, 0x731B, 0x731E, 0x73
 # crash reports from 0x13C0, 0x164E, 0x73BF (RX 6800) and 0x73DF (RX 6700).
 RDNA2_DEVICE_IDS = ((0x73A0, 0x73FF), (0x7420, 0x743F), (0x163F, 0x163F), (0x1435, 0x1435), (0x1681, 0x1681),
                     (0x1506, 0x1506), (0x164E, 0x164E), (0x13C0, 0x13C0))
-# gfx90c (GCN 5) iGPUs: the CHIP_RENOIR entries of Linux amdgpu's chipset table (amdgpu_drv.c), i.e. Renoir, Lucienne,
-# Cezanne and Barcelo. #5933's wrong BaryCoordKHR was measured on 0x15E7 (Vega 8 of a Ryzen 7 5825U). Other GCN 5
-# parts (Raven/Picasso gfx902, Vega 10/12/20 cards) are a different GPU and are not tested, so they are not listed.
-GFX90C_DEVICE_IDS = (0x15E7, 0x1636, 0x1638, 0x164C)
 DRIVER_PROPS_SIZE = 536     # sizeof(VkPhysicalDeviceDriverProperties): 16 + driverID + 2 x char[256] + version, padded
 BARY_FEATURES_SIZE = 24     # sizeof(VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR): 16 + one VkBool32
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
@@ -182,18 +180,31 @@ def rdna2_amd_windows(vendor_id: int, device_id: int, driver_id: int) -> bool:
             and any(lo <= device_id <= hi for lo, hi in RDNA2_DEVICE_IDS))
 
 
-def gfx90c_amd_windows(vendor_id: int, device_id: int, driver_id: int) -> bool:
-    """A gfx90c (GCN 5) iGPU under AMD's proprietary (Windows) driver, whose native BaryCoordKHR is wrong (#5933)."""
-    return (vendor_id == AMD_VENDOR_ID and driver_id == VK_DRIVER_ID_AMD_PROPRIETARY
-            and device_id in GFX90C_DEVICE_IDS)
+@functools.cache
+def _shader_driver_rules():
+    """Read the same rules the C++ checker compiles in, without needing a runtime build."""
+    table = Path(__file__).resolve().parents[1] / "runtime" / "src" / "shader_driver_rules.inc"
+    rules = []
+    for line in table.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("//"):
+            continue
+        path, driver, vendor, device = line.removeprefix("LEONIDA_SHADER_DRIVER_RULE(").removesuffix(")").split(",")
+        rules.append((path, int(driver, 0), int(vendor, 0), int(device, 0)))
+    return rules
+
+
+def native_shader_driver_issue(path, driver_id, vendor_id=None, device_id=None):
+    return any(path == rule_path and driver_id == driver and
+               (vendor == 0 or vendor_id == vendor) and (device == 0 or device_id == device)
+               for rule_path, driver, vendor, device in _shader_driver_rules())
 
 
 def barycentric_fallback(vendor_id: int, device_id: int, driver_id: int) -> bool:
     """Drivers that expose native barycentrics but return wrong BaryCoordKHR values for translated pixel shaders:
     Mesa ANV (BaryCoordKHR.i zero on Intel Arc, SHADER-925) and AMD's Windows driver on gfx90c (wrong third
     component, #5933)."""
-    return (driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA
-            or gfx90c_amd_windows(vendor_id, device_id, driver_id))
+    return native_shader_driver_issue("barycentric", driver_id, vendor_id, device_id)
 
 
 def physical_devices(vk, instance):

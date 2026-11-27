@@ -953,6 +953,27 @@ inline bool descriptor_hash_kind_from_env(const char* value, DescriptorHashKind*
     return false;
 }
 
+// The runtime's optional indexes, in lookup order. The read-only pack check scans the same set.
+inline constexpr const char* shader_index_subdirectories[] = {"fspx", "fspx_compute", "fspx_gfx", "bvh", "exe", "library"};
+
+inline bool read_shader_index(const std::filesystem::path& index, Json& root, std::string& error) {
+    std::ifstream file(index, std::ios::binary);
+    if (!file) {
+        const auto path = index.u8string();
+        error = "cannot open " + std::string(path.begin(), path.end());
+        return false;
+    }
+    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    constexpr std::string_view utf8_bom = "\xef\xbb\xbf";
+    std::string_view json(text);
+    if (json.starts_with(utf8_bom)) json.remove_prefix(utf8_bom.size());
+    if (!JsonReader(json).parse(root) || root.kind != Json::Kind::object) {
+        error = "index.json is not a JSON object";
+        return false;
+    }
+    return true;
+}
+
 class ShaderLibrary {
 public:
     // Reads <dir>/index.json, then the indexes of the programs make_game.py translates from the package's DLLs and the
@@ -989,7 +1010,7 @@ public:
         } catch (...) {
             return fail("index.json could not be read");
         }
-        for (const char* sub_folder : {"fspx", "fspx_compute", "fspx_gfx", "bvh", "exe", "library"}) {
+        for (const char* sub_folder : shader_index_subdirectories) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = folder / sub_folder;
@@ -1199,18 +1220,9 @@ private:
     // adds its entries under "<prefix><name>", the path of their modules relative to the main folder.
     template<typename Fail>
     bool load_index(const std::filesystem::path& dir, const std::string& prefix, Fail&& fail) {
-        const auto index = dir / "index.json";
-        std::ifstream file(index, std::ios::binary);
-        if (!file) {
-            const auto path = index.u8string();
-            return fail("cannot open " + std::string(path.begin(), path.end()));
-        }
-        const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        constexpr std::string_view utf8_bom = "\xef\xbb\xbf";
-        std::string_view json(text);
-        if (json.starts_with(utf8_bom)) json.remove_prefix(utf8_bom.size());
         Json root;
-        if (!JsonReader(json).parse(root) || root.kind != Json::Kind::object) return fail("index.json is not a JSON object");
+        std::string error;
+        if (!read_shader_index(dir / "index.json", root, error)) return fail(error);
         if (prefix.empty()) {
             dir_ = dir;
             entries_.clear();

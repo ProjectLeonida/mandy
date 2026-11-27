@@ -289,7 +289,7 @@ class MainWiringTest(unittest.TestCase):
                          (("--mesh-compute", "--pc-tail-ubo"),) * 2)
 
     def test_runtime_gpu_mesh_draws_crash_reads_the_probe(self):
-        intel = make_game.VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS
+        intel = 5  # VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS
         for raw, want in (({"driver_id": intel, "mesh_in_supported_stages": True}, True),
                           ({"driver_id": intel, "mesh_in_supported_stages": False}, False),
                           ({"driver_id": intel}, False),
