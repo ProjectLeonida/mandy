@@ -4876,6 +4876,14 @@ if(TARGET Vulkan::Headers)
       target_compile_options(title_frames_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME title_frames COMMAND title_frames_test)
+    # The page mirror's hooks for descriptor heaps read in place: a second binding of a range's pages, and a filter on
+    # the fill path (src/title_mirror.h). No GPU.
+    add_executable(title_mirror_hooks_test test/title_mirror_hooks_test.cpp)
+    target_link_libraries(title_mirror_hooks_test PRIVATE Vulkan::Headers)
+    if(WIN32 AND MSVC)
+      target_compile_options(title_mirror_hooks_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME title_mirror_hooks COMMAND title_mirror_hooks_test)
     # Queue construction cleans its Vulkan handles if holder registration runs out of host memory.
     # Which title textures the refresh looks at: only those something says changed (src/title_texture_watch.h).
     add_executable(title_texture_watch_test test/title_texture_watch_test.cpp)
