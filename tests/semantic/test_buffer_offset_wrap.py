@@ -9,6 +9,7 @@ commit b9b57e2. The expected memory below is written out by hand.)
     python -I tests/semantic/test_buffer_offset_wrap.py -v
 """
 import os
+import re
 import sys
 import unittest
 
@@ -22,6 +23,7 @@ if TOOLS_DIR not in sys.path:
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import spirv_opt
 from spirv_mini_interp import run_workgroup
 from test_loop_ballot_barrier import _translate_cs
 
@@ -32,13 +34,13 @@ RAW, DISABLED, STRUCTURED_OFFSET = 0x31016FAC, 0x21016FAC, 0x01016FAC
 SENTINEL, VALUE = 0xA5A5A5A5, 77
 
 
-def indexed(index, literal_word3=None):
+def indexed(index, literal_word3=None, stride=STRIDE, records=BYTES):
     """Store VALUE at `index` of the view in s[0:3], load it back and write what was read to the output view."""
     lines = []
     view = "s[0:3]"
     if literal_word3 is not None:
         # The same descriptor from immediates, which the translator folds: the mode is known when translating.
-        lines += [f"s_mov_b32 s8, {BASE:#x}", f"s_mov_b32 s9, {STRIDE << 16:#x}", f"s_mov_b32 s10, {BYTES:#x}",
+        lines += [f"s_mov_b32 s8, {BASE:#x}", f"s_mov_b32 s9, {stride << 16:#x}", f"s_mov_b32 s10, {records:#x}",
                   f"s_mov_b32 s11, {literal_word3:#x}"]
         view = "s[8:11]"
     return lines + [
@@ -51,22 +53,31 @@ def indexed(index, literal_word3=None):
         "s_endpgm"]
 
 
-SOFFSET = [
-    # off = 0xFFFFFFF0 (32-bit, as the hardware forms it), then soffset 0x20 is added in 64 bits: 0x1_0000_0010.
-    "v_mov_b32_e32 v1, -16",
-    f"v_mov_b32_e32 v2, {VALUE}",
-    "s_mov_b32 s12, 32",
-    "buffer_store_dword v2, v1, s[0:3], s12 offen",
-    "buffer_load_dword v3, v1, s[0:3], s12 offen",
-    "v_lshlrev_b32_e32 v4, 2, v0",
-    "buffer_store_dword v3, v4, s[4:7], 0 offen",
-    "s_endpgm"]
+def soffset_case(voff, soff, byte=False):
+    """Store VALUE at voff + soff in s[0:3], load it back and write what was read to the output view."""
+    store_op = "buffer_store_byte" if byte else "buffer_store_dword"
+    load_op = "buffer_load_ubyte" if byte else "buffer_load_dword"
+    return [
+        f"v_mov_b32_e32 v1, {voff}",
+        f"v_mov_b32_e32 v2, {VALUE}",
+        f"s_mov_b32 s12, {soff}",
+        f"{store_op} v2, v1, s[0:3], s12 offen",
+        f"{load_op} v3, v1, s[0:3], s12 offen",
+        "v_lshlrev_b32_e32 v4, 2, v0",
+        "buffer_store_dword v3, v4, s[4:7], 0 offen",
+        "s_endpgm"]
+
+
+# off = 0xFFFFFFF0 (32-bit, as the hardware forms it), then soffset 0x20 is added in 64 bits: 0x1_0000_0010.
+SOFFSET = soffset_case(-16, 32)
 
 
 class BufferOffsetWrapTests(unittest.TestCase):
-    def run_case(self, lines, word3, stride=STRIDE, records=BYTES):
+    def run_case(self, lines, word3, stride=STRIDE, records=BYTES, extra_addresses=()):
         module, _ = _translate_cs("cs_buffer_offset_wrap", lines, threads=LANES)
         memory = {address: SENTINEL for address in range(BASE - 64, BASE + 128, 4)}
+        for address in extra_addresses:
+            memory[address] = SENTINEL
         before = dict(memory)
         result = run_workgroup(
             module, LANES, LANES,
@@ -77,7 +88,8 @@ class BufferOffsetWrapTests(unittest.TestCase):
         return view, before, [result[OUTPUT + 4 * lane] for lane in range(LANES)]
 
     def test_index_inside_the_buffer_is_stored_and_read(self):
-        for name, word3, literal in (("raw", RAW, None), ("raw literal", RAW, RAW), ("disabled", DISABLED, None)):
+        for name, word3, literal in (("raw", RAW, None), ("raw literal", RAW, RAW),
+                                     ("disabled", DISABLED, None), ("disabled literal", DISABLED, DISABLED)):
             with self.subTest(mode=name):
                 view, before, read = self.run_case(indexed(2, literal), word3)
                 before[BASE + 2 * STRIDE] = VALUE
@@ -93,6 +105,45 @@ class BufferOffsetWrapTests(unittest.TestCase):
                 self.assertEqual(view, before)
                 self.assertEqual(read, [0] * LANES)
 
+    def test_32bit_boundary_fits_and_first_overflow_is_rejected(self):
+        top_aligned = 0xFFFFFFFC
+        for name, literal in (("disabled", None), ("disabled literal", DISABLED)):
+            with self.subTest(kind="idxen", mode=name, edge="fits"):
+                view, before, read = self.run_case(
+                    indexed("0x3fffffff", literal, stride=4), DISABLED, stride=4,
+                    extra_addresses=(BASE + top_aligned,))
+                before[BASE + top_aligned] = VALUE
+                self.assertEqual(view, before)
+                self.assertEqual(read, [VALUE] * LANES)
+            with self.subTest(kind="idxen", mode=name, edge="overflow"):
+                view, before, read = self.run_case(
+                    indexed("0x40000000", literal, stride=4), DISABLED, stride=4,
+                    extra_addresses=(BASE + top_aligned,))
+                self.assertEqual(view, before)
+                self.assertEqual(read, [0] * LANES)
+        with self.subTest(kind="soffset", edge="fits"):
+            view, before, read = self.run_case(
+                soffset_case(-8, 4), DISABLED, stride=0, extra_addresses=(BASE + top_aligned,))
+            before[BASE + top_aligned] = VALUE
+            self.assertEqual(view, before)
+            self.assertEqual(read, [VALUE] * LANES)
+        with self.subTest(kind="soffset", edge="overflow"):
+            view, before, read = self.run_case(
+                soffset_case(-4, 4), DISABLED, stride=0, extra_addresses=(BASE + top_aligned,))
+            self.assertEqual(view, before)
+            self.assertEqual(read, [0] * LANES)
+        with self.subTest(kind="byte_soffset", edge="0xffffffff_fits"):
+            view, before, read = self.run_case(
+                soffset_case(-4, 3, byte=True), DISABLED, stride=0, extra_addresses=(BASE + top_aligned,))
+            before[BASE + top_aligned] = (SENTINEL & 0x00FFFFFF) | (VALUE << 24)
+            self.assertEqual(view, before)
+            self.assertEqual(read, [VALUE] * LANES)
+        with self.subTest(kind="byte_soffset", edge="0x100000000_overflow"):
+            view, before, read = self.run_case(
+                soffset_case(-4, 4, byte=True), DISABLED, stride=0, extra_addresses=(BASE + top_aligned,))
+            self.assertEqual(view, before)
+            self.assertEqual(read, [0] * LANES)
+
     def test_structured_modes_already_refuse_the_index(self):
         view, before, read = self.run_case(indexed(-1), STRUCTURED_OFFSET, records=8)
         self.assertEqual(view, before)
@@ -103,6 +154,22 @@ class BufferOffsetWrapTests(unittest.TestCase):
         view, before, read = self.run_case(SOFFSET, DISABLED, stride=0)
         self.assertEqual(view, before)
         self.assertEqual(read, [0] * LANES)
+
+    def test_fit_predicate_checks_high_32_bits_without_u64_max_compare(self):
+        # NVIDIA 580.82.07 NVVM fails pipeline creation on `OpULessThanEqual %bool wide 0xFFFFFFFF`
+        # (and `OpULessThan %bool wide 0x100000000`) when a literal V# folds `wide` to `0 + idx * stride`.
+        for name, literal in (("disabled literal", DISABLED), ("raw literal", RAW)):
+            spvasm, _ = _translate_cs("cs_buffer_offset_wrap_pred", indexed(2, literal, stride=64, records=5),
+                                      threads=LANES)
+            for variant, text in (("raw", spvasm), ("opt", spirv_opt.optimize(spvasm))):
+                with self.subTest(mode=name, variant=variant):
+                    self.assertNotRegex(text, r"OpULessThanEqual %bool %\S+ %clffffffff\b")
+                    self.assertNotRegex(text, r"OpULessThan %bool %\S+ %cl100000000\b")
+                    shifts = re.findall(r"(%\S+)\s*=\s*OpShiftRightLogical %ulong %\S+ %c64_32\b", text)
+                    self.assertTrue(shifts, "expected 64-bit right shift by 32 for offset-fit check")
+                    self.assertTrue(
+                        any(re.search(rf"OpIEqual %bool {re.escape(hi)} %cl0\b", text) for hi in shifts),
+                        "expected high-32-bit zero comparison for offset-fit check")
 
 
 if __name__ == "__main__":
