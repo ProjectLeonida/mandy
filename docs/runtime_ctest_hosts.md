@@ -72,6 +72,34 @@ Each was rerun three times alone with `ctest -R '^name$' --repeat until-fail:3`;
 - This run was from an interactive desktop session, where `xgameruntime_offline` and `xgameruntime_offline_hdr` pass (`0.11 s` and `0.03 s`); over a non-interactive SSH session they fail `XDisplayAcquireTimeoutDeferral`.
 - The implicit Vulkan layers were disabled (`VK_LOADER_LAYERS_DISABLE=~implicit~`): this machine has OBS and RenderDoc layers installed.
 
+## Re-measured on `main` `d1dff794` (27 November 2026)
+
+Two days later, same card and same Windows 10 19045 host, five rows of the tables above re-run three times each
+(`ctest -R '^name$' --timeout 300`). This is a targeted re-run, not a new full-suite figure: the counts in "The two
+runs" still describe `58be9cdf`.
+
+| Test | 25 November | 27 November, `main` `d1dff794` | Covers it now |
+|---|---|---|---|
+| `d3d12_subresource_copy` | failed, line 391 (`CPU copies (host image copy): the steps differ from the host's`) | **passes 3/3** (0.55–0.56 s) | [#1364](https://github.com/ubiquitarianism/leonida/pull/1364), merged 24 November |
+| `d3d12_r9g9b9e5_uav` | failed, line 669 (CPU-heap `HOST_TRANSFER` texture gets `E_OUTOFMEMORY`) | **passes 3/3** (0.31–0.32 s) | [#1364](https://github.com/ubiquitarianism/leonida/pull/1364) |
+| `d3d12_existing_heap` | failed, line 196 (`0x80004001`) | still fails 3/3; each run logs `texture memory unavailable: 2048 bytes, alignment 1024, type bits 0x0 (vk format 9 256x8)` twice | [#1894](https://github.com/ubiquitarianism/leonida/pull/1894): with its head `2d258c8c` applied to this tree the test passes 3/3 and each run logs `title image has no host-transfer memory type, using staging for Vulkan format` |
+| `d3d12_heap_properties` | failed on the `0x8007000e` CPU-heap rows | still fails 3/3, now on exactly two rows: `placed buffer` and `placed texture, DEFAULT heap, ALLOW_ALL` give `0x0` in the layer and `0x80070057` on the host | [#1389](https://github.com/ubiquitarianism/leonida/pull/1389) |
+| `d3d12_vulkan_device` | failed (the `CreateHeap` comparison) | still fails 3/3; the last compared row is now `invalid arguments heap: HARDWARE_PROTECTED: an older host runtime (Windows 10, Windows 11 23H2) refuses it (ours 0x00000000, host 0x80070057)` | [#1389](https://github.com/ubiquitarianism/leonida/pull/1389) |
+
+Both remaining `d3d12_heap_properties` rows are the same host fact. This GPU reports
+`D3D12_RESOURCE_HEAP_TIER_1`, and `D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES` (the value `0`, no `DENY` flag) is
+heap tier 2 and greater only, so the host refuses the two `ALLOW_ALL` cases with `E_INVALIDARG` while the
+`ALLOW_ONLY_*` rows match. The layer accepts them because the console it imitates is tier 2; what has to change is the
+host comparison in the test, which is what #1389 does.
+
+The `HARDWARE_PROTECTED` row is the same kind of host gate: Windows 10's `d3d12.dll` refuses the flag with
+`E_INVALIDARG`, and the layer, like the console, accepts it. Also #1389.
+
+`d3d12_existing_heap` is not a heap-flag case. The layer builds the title's 256x8 Vulkan format-9 image (2048 bytes,
+alignment 1024), finds no host-transfer memory type for it and the placed import fails; #1894 stages that upload. The
+sub-page host buffer imports named above for this test ([#1458](https://github.com/ubiquitarianism/leonida/pull/1458))
+are a different path and are still open.
+
 ## What follows
 
 The 5 reproduced and the 6 native-only are the actionable list (5 + 6 = 11 failures). Since this run: [#1364](https://github.com/ubiquitarianism/leonida/pull/1364) fixed the Pascal `HOST_TRANSFER` CPU-heap image failure behind `d3d12_subresource_copy`, `d3d12_r9g9b9e5_uav` and the `0x8007000e` rows of `d3d12_heap_properties` and `d3d12_vulkan_device`; open pull requests cover the remaining host-tier-1 heap comparisons ([#1389](https://github.com/ubiquitarianism/leonida/pull/1389)), sub-page host buffer imports on 256-byte UBO GPUs (`d3d12_existing_heap`, [#1458](https://github.com/ubiquitarianism/leonida/pull/1458)), `d3d12_subgroup` ([#1328](https://github.com/ubiquitarianism/leonida/pull/1328)), `d3d12_set_descriptor_heaps` ([#1353](https://github.com/ubiquitarianism/leonida/pull/1353)), `root_signature_oracle` ([#988](https://github.com/ubiquitarianism/leonida/pull/988)), `d3d12_close_parity` ([#989](https://github.com/ubiquitarianism/leonida/pull/989)), `d3d12_pso_validation` ([#967](https://github.com/ubiquitarianism/leonida/pull/967), [#1377](https://github.com/ubiquitarianism/leonida/pull/1377)), and `xdxr_build_check`'s timeout ([#1424](https://github.com/ubiquitarianism/leonida/pull/1424)).
