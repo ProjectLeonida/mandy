@@ -17,7 +17,11 @@
 //     was written (dirty(): the geometry watch's cells say so: a guard fault, a kernel write, a remap);
 //   - flush(): the binds noted since the last one go in one batch, which signals a value the next submission of every
 //     queue waits for (the ordering rule: a submission after a remap in call order never reads a page whose bind has
-//     not landed). A home unbound everywhere is freed once the submissions that could read it have retired.
+//     not landed). A home unbound everywhere is freed once the submissions that could read it have retired;
+//   - aliases (alias()): a range of title pages also bound at an address of the caller's (a console descriptor heap's
+//     table address below 4 GiB), each page there with a home of its own, the filtered copy, which hooks.filter fills
+//     from the title's bytes whenever they change. The page's own home stays the title's bytes exactly: a V# or a
+//     pointer of the title into those pages reads what the title wrote, and only the alias reads filtered bytes.
 //
 // No Vulkan call here: the device (or a test) passes hooks, as for src/arena_backing.h. Not thread-safe: the caller
 // serialises (the device under its mirror mutex).
@@ -47,10 +51,11 @@ struct TitleMirrorHooks {
     std::function<bool(const std::vector<VkSparseBufferMemoryBindInfo>& binds, std::uint64_t value)> bind;
     // Copies a physical page's 64 KiB into its home; false when its bytes cannot be read (the home keeps zeros).
     std::function<bool(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes)> copy;
-    // Fills the home of a page inside a filtered range (filter_range) in place of `copy`: the title's bytes at `from`
-    // (the page shown at title address `va`) in, what the GPU reads into `to`. `fresh`: the home holds nothing of an
-    // earlier fill (made now, or the page's filter changed), so every byte must be written; otherwise `to` still holds
-    // this filter's last output for the same page. The title's bytes are never written. False as for `copy`.
+    // Fills the filtered copy of a page in an aliased range (alias): the title's bytes at `from` (the page shown at
+    // title address `va`) in, what the GPU reads at the alias into `to`. Called after the page's own home took the
+    // title's bytes, when they changed. `fresh`: the copy holds nothing of an earlier fill (made now, or a failed fill
+    // zeroed it), so every byte must be written; otherwise `to` still holds this filter's last output for the same page.
+    // The title's bytes and the page's own home are never written. False as for `copy` (the copy is zeroed).
     std::function<bool(std::uint64_t va, std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool fresh)> filter;
 };
 
@@ -65,7 +70,7 @@ public:
         std::uint64_t chunks = 0, chunk_failures = 0, homes = 0, units = 0, pages = 0;  // now
         std::uint64_t binds = 0, unbinds = 0, batches = 0, uploads = 0, upload_failures = 0, homes_freed = 0;  // so far
         std::uint64_t unmirrored_changes = 0;  // feed entries outside every chunk
-        std::uint64_t filtered = 0;            // fills through hooks.filter (filter_range), of the uploads
+        std::uint64_t filtered = 0;            // fills of an alias's filtered copy through hooks.filter
         // Bytes the uploads copied into homes, bytes write_back() copied to the title's pages, and 256-byte pieces
         // both sides had changed (the title's bytes kept), so far.
         std::uint64_t uploaded_bytes = 0, written_back_bytes = 0, conflicts = 0;
@@ -113,88 +118,86 @@ public:
         const auto page = pages_.find(va);
         if (page != pages_.end()) {
             if (page->second == frame) return;
-            // A home filtered for this page that other pages still show is filled as they need it.
+            // A filtered copy made for this page: another aliased page showing the same home takes it over (filled
+            // whole for that page), else it goes with this page.
             if (const auto shown = homes_.find(page->second);
-                shown != homes_.end() && shown->second.filter_va == va && shown->second.refs > 1) {
-                shown->second.filter_va = 0;
+                shown != homes_.end() && shown->second.copy && shown->second.filter_va == va) {
+                std::uint64_t other_va = 0;
                 for (const auto& [other, other_frame] : pages_)
-                    if (other != va && other_frame == page->second && filtered(other)) shown->second.filter_va = other;
-                mark_fresh(shown->second, page->second);
+                    if (other != va && other_frame == page->second && aliased(other)) other_va = other;
+                if (other_va) {
+                    shown->second.filter_va = other_va;
+                    fill_copy(shown->second, page->second, true);
+                } else {
+                    drop_copy(shown->second, ticket);
+                }
             }
             release_home(page->second, ticket);
             pages_.erase(page);
         }
         if (!frame) {
             note_bind(va, VK_NULL_HANDLE, 0);
+            note_alias_bind(va, VK_NULL_HANDLE, 0);
             ++counters_.unbinds;
             return;
         }
         Home* home = home_of(frame, std::move(keep), va);
         if (!home) {
             note_bind(va, VK_NULL_HANDLE, 0);
+            note_alias_bind(va, VK_NULL_HANDLE, 0);
             return;
         }
         ++home->refs;
         pages_[va] = frame;
         note_bind(va, units_[home->unit].memory, VkDeviceSize(home->slot) * kPage);
+        if (aliased(va)) {
+            if (!home->copy) make_copy(*home, frame, va);
+            if (home->copy) note_alias_bind(va, units_[home->copy_unit].memory, VkDeviceSize(home->copy_slot) * kPage);
+            else note_alias_bind(va, VK_NULL_HANDLE, 0);  // no room: the alias reads zero there
+        }
         ++counters_.binds;
     }
 
-    // [lo, hi) of the title's address space (whole pages) is also bound into `buffer` at `offset` + (va - lo): each page
-    // of it shows its home there too, follows its remaps and unmaps, and goes in the same batches as the chunk binds, so
-    // the same wait orders a reader of either address. A console descriptor heap uses it to be read at an offset below
-    // 4 GiB of the arena (32-bit descriptor-table pointers). Pages not mapped are left unbound there (they read zero).
+    // [lo, hi) of the title's address space (whole pages) is also bound into `buffer` at `offset` + (va - lo), each page
+    // there with a home of its own, the filtered copy: hooks.filter fills it from the title's bytes now and whenever the
+    // page is filled again, it follows the page's remaps and unmaps, and its binds go in the same batches as the chunk
+    // binds, so the same wait orders a reader of either address. The page's own home, at the title's address, keeps
+    // the title's bytes. A console descriptor heap uses it to be read filtered at an offset below 4 GiB of the arena
+    // (32-bit descriptor-table pointers). Pages not mapped are left unbound there (they read zero).
     void alias(std::uint64_t lo, std::uint64_t hi, VkBuffer buffer, VkDeviceSize offset) {
         aliases_[lo] = {hi, buffer, offset};
-        for (const auto& [va, frame] : pages_)
-            if (va >= lo && va < hi) {
-                const auto home = homes_.find(frame);
-                if (home != homes_.end())
-                    note_alias_bind(va, units_[home->second.unit].memory, VkDeviceSize(home->second.slot) * kPage);
-            }
+        for (const auto& [va, frame] : pages_) {
+            if (va < lo || va >= hi) continue;
+            const auto home = homes_.find(frame);
+            if (home == homes_.end()) continue;
+            if (!home->second.copy) make_copy(home->second, frame, va);
+            if (home->second.copy)
+                note_alias_bind(va, units_[home->second.copy_unit].memory, VkDeviceSize(home->second.copy_slot) * kPage);
+        }
     }
-    // The alias at `lo` goes: its pages are unbound there.
-    void unalias(std::uint64_t lo) {
+    // The alias at `lo` goes: its pages are unbound there, and their filtered copies are freed after `ticket`.
+    void unalias(std::uint64_t lo, std::uint64_t ticket) {
         const auto it = aliases_.find(lo);
         if (it == aliases_.end()) return;
         const Alias alias = it->second;
         for (const auto& [va, frame] : pages_)
-            if (va >= lo && va < alias.hi) alias_pending_[alias.buffer][alias.offset + (va - lo)] =
-                {alias.offset + (va - lo), kPage, VK_NULL_HANDLE, 0, 0};
+            if (va >= lo && va < alias.hi) {
+                alias_pending_[alias.buffer][alias.offset + (va - lo)] =
+                    {alias.offset + (va - lo), kPage, VK_NULL_HANDLE, 0, 0};
+                const auto home = homes_.find(frame);
+                if (home != homes_.end() && home->second.copy && home->second.filter_va == va)
+                    drop_copy(home->second, ticket);
+            }
         aliases_.erase(it);
     }
-
-    // [lo, hi) of the title's address space (whole pages) is filtered: the home of a page there is filled through
-    // hooks.filter instead of a plain copy, now (fresh) and whenever the page is filled again. A home that pages at two
-    // addresses show is filtered when one of them is in a filtered range (a page's home holds one set of bytes).
-    void filter_range(std::uint64_t lo, std::uint64_t hi) {
-        filters_[lo] = hi;
-        for (const auto& [va, frame] : pages_)
-            if (va >= lo && va < hi) refilter(frame, va);
-    }
-    // Filtered no more: the homes there are filled again as plain copies.
-    void unfilter_range(std::uint64_t lo) {
-        const auto it = filters_.find(lo);
-        if (it == filters_.end()) return;
-        const std::uint64_t hi = it->second;
-        filters_.erase(it);
-        for (auto& [frame, home] : homes_)
-            if (home.filter_va >= lo && home.filter_va < hi) {
-                home.filter_va = 0;
-                mark_fresh(home, frame);
-            }
-    }
-    // Whether the page at `va` lies in a filtered range: its home holds the filter's bytes, not the title's, so nothing
-    // may be copied back from it to the title's page.
-    bool filtered_at(std::uint64_t va) const { return filtered(va & ~(kPage - 1)); }
-    // The home of the page at `va`, mapped (its host bytes): what a filter's caller writes one changed slot into
-    // between fills. Null when the page is not mapped.
-    std::uint8_t* home_bytes(std::uint64_t va) {
+    // The filtered copy of the aliased page at `va`, mapped (its host bytes): what a filter's caller writes one
+    // changed slot into between fills. Null when the page is not mapped or has no copy.
+    std::uint8_t* copy_bytes(std::uint64_t va) {
         const auto page = pages_.find(va & ~(kPage - 1));
         if (page == pages_.end()) return nullptr;
         const auto home = homes_.find(page->second);
-        if (home == homes_.end()) return nullptr;
-        return units_[home->second.unit].host + std::size_t(home->second.slot) * kPage;
+        if (home == homes_.end() || !home->second.copy) return nullptr;
+        return units_[home->second.copy_unit].host + std::size_t(home->second.copy_slot) * kPage;
     }
 
     // The page at `va` was written (its physical page's bytes changed): its home is filled again, once however many
@@ -227,14 +230,22 @@ public:
     // The mirrored pages of [begin, end) that have a home, in address order: what write_back reads. The caller copies
     // their homes out with the GPU: a home in device-local memory is not read by the CPU (an uncached read over the bus
     // costs about 1.7 us per 8 bytes: 14.5 s for the 64 MiB one submission's write-back may cover).
-    // Filtered homes are left out (write_back never reads them).
+    // Every home holds the title's bytes (an alias's filtered copy is a second home, never read back).
     void homes_in(std::uint64_t begin, std::uint64_t end, std::vector<std::uint64_t>& out) const {
         for (std::uint64_t page = begin & ~(kPage - 1); page < end; page += kPage) {
             const auto mapped = pages_.find(page);
             if (mapped == pages_.end()) continue;
-            const auto home = homes_.find(mapped->second);
-            if (home != homes_.end() && !home->second.filter_va) out.push_back(page);
+            if (homes_.count(mapped->second)) out.push_back(page);
         }
+    }
+    // The home of the page at `va`, mapped (its host bytes): the title's bytes as the GPU reads them at the title's
+    // address. Null when the page is not mapped.
+    std::uint8_t* home_bytes(std::uint64_t va) {
+        const auto page = pages_.find(va & ~(kPage - 1));
+        if (page == pages_.end()) return nullptr;
+        const auto home = homes_.find(page->second);
+        if (home == homes_.end()) return nullptr;
+        return units_[home->second.unit].host + std::size_t(home->second.slot) * kPage;
     }
 
     // What the GPU wrote into the homes of the mirrored pages of [begin, end) goes to the title's pages, merged at the
@@ -259,8 +270,6 @@ public:
             const auto found = homes_.find(mapped->second);
             if (found == homes_.end()) continue;
             Home& home = found->second;
-            // A filtered home holds the filter's bytes, not the title's: nothing of it is ever written back.
-            if (home.filter_va) continue;
             const std::uint8_t* gpu = staged(page);
             if (!gpu) continue;
             const std::size_t k0 = std::size_t((std::max(begin, page) - page) / kPiece);
@@ -279,9 +288,12 @@ public:
                 if (!write(page + k * kPiece, gpu + k * kPiece, kPiece)) continue;
                 home.sums[k] = now;
                 written += kPiece;
+                if (home.copy) home.refilter = true;  // the title's bytes changed: its filtered copy follows
             }
         }
         counters_.written_back_bytes += written;
+        for (auto& [frame, home] : homes_)
+            if (home.refilter) fill_copy(home, frame, false);
         return written;
     }
 
@@ -372,8 +384,12 @@ private:
         std::shared_ptr<void> keep;
         bool dirty = false;
         std::unique_ptr<std::uint64_t[]> sums = std::make_unique<std::uint64_t[]>(kPieces);
-        std::uint64_t filter_va = 0;  // a filtered page that shows it (filter_range), 0: filled by copy
-        bool fresh = true;            // the next fill writes every byte (hooks.filter's `fresh`)
+        // The filtered copy (alias): its own slot, bound at the alias of `filter_va`, the aliased page it was made for.
+        bool copy = false;
+        std::uint32_t copy_unit = 0, copy_slot = 0;
+        std::uint64_t filter_va = 0;
+        bool fresh = true;       // the copy's next fill writes every byte (hooks.filter's `fresh`)
+        bool refilter = false;   // the title's bytes changed outside an upload (write_back): fill the copy
     };
     struct Alias {
         std::uint64_t hi;
@@ -397,88 +413,82 @@ private:
         std::uint8_t* to = units_[home.unit].host + std::size_t(home.slot) * kPage;
         alignas(64) std::uint8_t title[kPiece];
         bool failed = false;
-        if (home.filter_va && hooks_.filter) {
-            // A filtered page (a console heap read in place): its sums are of the title's bytes the filter last read,
-            // so the compare below is the title's bytes against the title's bytes; the filter, after it, writes the
-            // home - every byte when fresh, else the slots that changed - whenever a piece of the title's page did.
-            // The home's bytes are the filter's, never compared with a sum (write_back skips it).
-            const bool fresh = whole || home.fresh;
-            std::size_t changed = 0;
-            for (std::size_t k = 0; k < kPieces; ++k) {
-                const std::uint8_t* from = frame + k * kPiece;
-                if (!(hooks_.copy ? hooks_.copy(title, from, kPiece) : (std::memcpy(title, from, kPiece), true)))
-                    std::memset(title, 0, kPiece);
-                const std::uint64_t sum = shadow_keep::sum_of(title, kPiece);
-                if (sum == home.sums[k]) continue;
-                home.sums[k] = sum;
-                ++changed;
+        std::size_t changed = 0;
+        for (std::size_t k = 0; k < kPieces; ++k) {
+            const std::uint8_t* from = frame + k * kPiece;
+            if (!(hooks_.copy ? hooks_.copy(title, from, kPiece) : (std::memcpy(title, from, kPiece), true))) {
+                std::memset(title, 0, kPiece);
+                failed = true;
             }
-            if (fresh || changed) {
-                home.fresh = false;
-                if (!hooks_.filter(home.filter_va, to, frame, kPage, fresh)) {
-                    std::memset(to, 0, kPage);
-                    home.fresh = true;  // zeros now: the next fill writes all again
-                    failed = true;
-                }
-                counters_.uploaded_bytes += (fresh ? kPieces : changed) * kPiece;
-                ++counters_.filtered;
-            }
-        } else {
-            // A home filtered until now (or zeroed by a failed fill) is copied whole once.
-            const bool all = whole || home.fresh;
-            home.fresh = false;
-            for (std::size_t k = 0; k < kPieces; ++k) {
-                const std::uint8_t* from = frame + k * kPiece;
-                if (!(hooks_.copy ? hooks_.copy(title, from, kPiece) : (std::memcpy(title, from, kPiece), true))) {
-                    std::memset(title, 0, kPiece);
-                    failed = true;
-                }
-                const std::uint64_t sum = shadow_keep::sum_of(title, kPiece);
-                if (!all && sum == home.sums[k]) continue;
-                std::memcpy(to + k * kPiece, title, kPiece);
-                home.sums[k] = sum;
-                counters_.uploaded_bytes += kPiece;
-            }
+            const std::uint64_t sum = shadow_keep::sum_of(title, kPiece);
+            if (!whole && sum == home.sums[k]) continue;
+            ++changed;
+            std::memcpy(to + k * kPiece, title, kPiece);
+            home.sums[k] = sum;
+            counters_.uploaded_bytes += kPiece;
         }
+        // The filtered copy follows the title's bytes: refilled when a piece of them changed (the filter itself finds
+        // which slots), and whole when it holds nothing yet.
+        if (home.copy && (changed || home.fresh || home.refilter)) fill_copy(home, frame, false);
         if (failed) ++counters_.upload_failures;
         ++counters_.uploads;
     }
 
     Home* home_of(std::uint8_t* frame, std::shared_ptr<void> keep, std::uint64_t va) {
-        if (const auto it = homes_.find(frame); it != homes_.end()) {
-            if (!it->second.filter_va && filtered(va)) refilter(frame, va);
-            return &it->second;
-        }
+        if (const auto it = homes_.find(frame); it != homes_.end()) return &it->second;
         std::uint32_t unit = 0, slot = 0;
         if (!take_slot(unit, slot)) return nullptr;
         Home& home = homes_[frame];
         home.unit = unit;
         home.slot = slot;
         home.keep = std::move(keep);
-        home.filter_va = filtered(va) ? va : 0;
         fill(home, frame, true);
+        (void)va;
         return &home;
     }
 
-    bool filtered(std::uint64_t va) const {
-        auto it = filters_.upper_bound(va);
-        if (it == filters_.begin()) return false;
+    bool aliased(std::uint64_t va) const {
+        auto it = aliases_.upper_bound(va);
+        if (it == aliases_.begin()) return false;
         --it;
-        return va < it->second;
+        return va < it->second.hi;
     }
-    // The home of `frame` is filtered for the page at `va` from its next fill, which writes every byte.
-    void refilter(std::uint8_t* frame, std::uint64_t va) {
-        const auto home = homes_.find(frame);
-        if (home == homes_.end()) return;
-        home->second.filter_va = va;
-        mark_fresh(home->second, frame);
-    }
-    void mark_fresh(Home& home, std::uint8_t* frame) {
-        home.fresh = true;
-        if (!home.dirty) {
-            home.dirty = true;
-            dirty_.push_back(frame);
+    // A filtered copy for `home`, made for the aliased page at `va` and filled whole now. No room: none (counted).
+    void make_copy(Home& home, const std::uint8_t* frame, std::uint64_t va) {
+        if (!take_slot(home.copy_unit, home.copy_slot)) {
+            ++counters_.upload_failures;
+            return;
         }
+        home.copy = true;
+        home.filter_va = va;
+        home.fresh = true;
+        fill_copy(home, frame, true);
+    }
+    // Fills the filtered copy from the title's page through hooks.filter (`whole`: every byte).
+    void fill_copy(Home& home, const std::uint8_t* frame, bool whole) {
+        home.refilter = false;
+        if (!home.copy) return;
+        std::uint8_t* to = units_[home.copy_unit].host + std::size_t(home.copy_slot) * kPage;
+        const bool fresh = whole || home.fresh;
+        home.fresh = false;
+        const bool ok = hooks_.filter ? hooks_.filter(home.filter_va, to, frame, kPage, fresh)
+                        : hooks_.copy  ? hooks_.copy(to, frame, kPage)
+                                       : (std::memcpy(to, frame, kPage), true);
+        if (!ok) {
+            std::memset(to, 0, kPage);
+            home.fresh = true;  // zeros now: the next fill writes all again
+            ++counters_.upload_failures;
+        }
+        ++counters_.filtered;
+    }
+    // The filtered copy goes, after `ticket` (the submissions that could read it at the alias).
+    void drop_copy(Home& home, std::uint64_t ticket) {
+        if (!home.copy) return;
+        freed_.push_back({home.copy_unit, home.copy_slot, ticket});
+        home.copy = false;
+        home.filter_va = 0;
+        home.fresh = true;
+        home.refilter = false;
     }
     // The bind of the page at `va` into every alias over it, into the next batch.
     void note_alias_bind(std::uint64_t va, VkDeviceMemory memory, VkDeviceSize offset) {
@@ -512,6 +522,7 @@ private:
     void release_home(std::uint8_t* frame, std::uint64_t ticket) {
         const auto it = homes_.find(frame);
         if (it == homes_.end() || --it->second.refs) return;
+        drop_copy(it->second, ticket);
         freed_.push_back({it->second.unit, it->second.slot, ticket});
         homes_.erase(it);
     }
@@ -519,7 +530,6 @@ private:
     void note_bind(std::uint64_t va, VkDeviceMemory memory, VkDeviceSize offset) {
         const std::uint64_t chunk = va / kChunk;
         pending_[chunk][va - chunk * kChunk] = {va - chunk * kChunk, kPage, memory, offset, 0};
-        note_alias_bind(va, memory, offset);
     }
 
     TitleMirrorHooks hooks_;
@@ -530,9 +540,8 @@ private:
     std::vector<std::uint8_t*> dirty_;
     std::deque<Freed> freed_;
     std::map<std::uint64_t, std::map<VkDeviceSize, VkSparseMemoryBind>> pending_;  // chunk -> offset -> next bind
-    std::map<std::uint64_t, Alias> aliases_;                    // title address -> [it, hi) also bound there
+    std::map<std::uint64_t, Alias> aliases_;                    // title address -> [it, hi) also bound there, filtered
     std::map<VkBuffer, std::map<VkDeviceSize, VkSparseMemoryBind>> alias_pending_;  // buffer -> offset -> next bind
-    std::map<std::uint64_t, std::uint64_t> filters_;            // filtered ranges: lo -> hi
     Counters counters_;
     std::size_t last_batch_ = 0;
 

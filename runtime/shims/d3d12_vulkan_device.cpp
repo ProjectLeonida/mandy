@@ -5895,7 +5895,7 @@ struct DeviceState {
                     continue;
                 }
                 heap.records.set(slot, half, Records::waiting, base, span, 0);
-                h[0] = h[1] = h[2] = 0;
+                h[0] = h[1] = h[2] = h[3] = 0;  // null whole: no three words of four (a stride or format left over)
                 ++heap.vsharps_deferred;
                 defer = true;
             }
@@ -5942,8 +5942,8 @@ struct DeviceState {
         heap.pending_changes.clear();
         for (const std::uint32_t slot : heap.touched_scratch) {
             const std::uint64_t va = heap.console_va + std::uint64_t(slot) * kDescriptorSize;
-            if (std::uint8_t* home = page_mirror.mirror->home_bytes(va))
-                filter_slot_locked(heap, slot, home + (va & (leonida::TitleMirror::kPage - 1)));
+            if (std::uint8_t* copy = page_mirror.mirror->copy_bytes(va))
+                filter_slot_locked(heap, slot, copy + (va & (leonida::TitleMirror::kPage - 1)));
             // A page not mapped is filtered whole when it is.
         }
         heap.record_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -6038,7 +6038,10 @@ struct DeviceState {
                     }
                     const VsharpResult result = fix_vsharp(h, path, &done[i].halves[half], &heap, false);
                     if (result == VsharpResult::rebased) ++heap.vsharps;
-                    if (result == VsharpResult::empty) ++heap.unbacked;
+                    if (result == VsharpResult::empty) {
+                        ++heap.unbacked;
+                        h[3] = 0;  // null whole in the filtered copy, never three words of four
+                    }
                 }
             } else {
                 leonida::gfx10::ImageWords words;
@@ -6071,7 +6074,7 @@ struct DeviceState {
             if (std::memcmp(heap.previous + std::size_t(slot) * kDescriptorSize, jobs[i].words, kDescriptorSize))
                 continue;  // rewritten since: filtered again, and deferred again if it needs this
             const std::uint64_t va = heap.console_va + std::uint64_t(slot) * kDescriptorSize;
-            std::uint8_t* home = page_mirror.mirror ? page_mirror.mirror->home_bytes(va) : nullptr;
+            std::uint8_t* home = page_mirror.mirror ? page_mirror.mirror->copy_bytes(va) : nullptr;
             if (!home) continue;
             const Done& d = done[i];
             if (d.texture != Records::none) {
@@ -6545,19 +6548,18 @@ struct DeviceState {
                 console_copy_ranges.emplace_back(console_va, bytes);
             }
             in_place_heaps.fetch_add(1, std::memory_order_release);
-            // Filtered before any page of it is filled (its pages named to the mirror last: ordinary memory is
-            // mirrored then), and in the arena with the mirror's next batch.
+            // Its pages keep the title's bytes at the title's address; at the table address in the arena each has a
+            // filtered copy of its own (TitleMirror::alias), bound with the mirror's next batch.
             std::lock_guard mirror(page_mirror.mutex);
             page_mirror.in_place.push_back(&h);
-            page_mirror.mirror->filter_range(console_va, console_va + bytes);
             page_mirror.mirror->alias(console_va, console_va + bytes, arena.buffer, offset);
             page_mirror_resolve_locked(console_va, bytes, true);
             console_heaps.push_back(std::move(owned));
         }
         std::fprintf(stderr,
-                     "[rt] d3d12: console CBV/SRV/UAV descriptor heap 0x%llx (%llu KiB): read in place, its pages in the "
-                     "page mirror bound again at heap_base + 0x%llx and filtered as they are filled; %llu KiB of null "
-                     "slots after it with nothing bound\n",
+                     "[rt] d3d12: console CBV/SRV/UAV descriptor heap 0x%llx (%llu KiB): read in place, its pages the "
+                     "title's bytes in the page mirror and a filtered copy of each at heap_base + 0x%llx (the table "
+                     "address), refilled as they change; %llu KiB of null slots after it with nothing bound\n",
                      static_cast<unsigned long long>(console_va), static_cast<unsigned long long>(bytes >> 10),
                      static_cast<unsigned long long>(offset), static_cast<unsigned long long>((reserved - bytes) >> 10));
         return true;
@@ -6769,16 +6771,14 @@ struct DeviceState {
         console_heap_ranges().remove(console_va);
         heap->pages.reset();
         if (heap->in_place) {
-            // Its pages leave the arena (unbound in the mirror's next batch, flushed here) and their homes are filled as
-            // copies again; the arena range is free once what was submitted, which may read it, has retired.
+            // Its pages leave the arena (unbound in the mirror's next batch, flushed here) and their filtered copies are
+            // freed; the arena range is free once what was submitted, which may read it, has retired.
             in_place_heaps.fetch_sub(1, std::memory_order_acq_rel);
             {
                 std::lock_guard lock(page_mirror.mutex);
                 std::erase(page_mirror.in_place, heap.get());
-                if (page_mirror.mirror) {
-                    page_mirror.mirror->unalias(console_va);
-                    page_mirror.mirror->unfilter_range(console_va);
-                }
+                if (page_mirror.mirror)
+                    page_mirror.mirror->unalias(console_va, context->submitted_retire_ticket() + 1);
             }
             refresh_page_mirror();
             flush_page_mirror();

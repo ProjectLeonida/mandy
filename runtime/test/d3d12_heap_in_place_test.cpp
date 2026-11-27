@@ -16,7 +16,12 @@
 //      view had made a texture of the layer's first, named by a T# the title writes itself (its dword 6 the title's, so
 //      the T# is found by its address), binds: tag and index (the slot-70 texture's retirement used to take the
 //      address from the placed one, and the T# found no texture); when the texture goes the slot reads the fallback
-//      (0: vulkan_bindless.h's 1x1 zeros), and a texture placed again at the address binds it again.
+//      (0: vulkan_bindless.h's 1x1 zeros), and a texture placed again at the address binds it again;
+//   7. data the title keeps inline in a heap page (four words a compute program reads as sizes, which look like a V# with
+//      a base nothing holds) and a V# of the title pointing at them: after a slot of the same page is rewritten (the
+//      filter runs), the V#'s address (the title's address, through the mirror) reads the title's four words exactly,
+//      the table address reads the filtered entries (that "V#" null whole, the rewritten slot filtered), and the
+//      title's bytes are unchanged. With one filtered home bound at both addresses, the V# read [0 0 0 720].
 // Exit 77 when the device makes no page mirror (llvmpipe). No shaders, no game data.
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
@@ -198,12 +203,19 @@ int test() {
     std::memcpy(nobody_words, title + kDescriptor, sizeof(nobody_words));
     EXPECT(base_of(nobody_words) == nobody);
 
-    // No write-back from the heap: a store the GPU makes into the heap's pages (through the mirror at the title's
-    // address) is never copied over the title's bytes, which are not the home's.
+    // A store the GPU makes into the heap's pages through the title's address (a V# of the title into its heap) goes
+    // back to the title's bytes as any page's does: the home there is the title's bytes. The table address, a filtered
+    // copy of its own, takes it as a rewrite: these words read as a T# naming no texture, left as written there
+    // apart from dword 6, which is the fallback (0) while nothing binds it.
     const std::uint32_t stored[8] = {0xdead0001u, 0xdead0002u, 0xdead0003u, 0xdead0004u, 5, 6, 7, 8};
     EXPECT(rt::d3d12::page_mirror_gpu_write(device.p, std::uintptr_t(title) + 5 * kDescriptor, stored, sizeof(stored)));
-    EXPECT(rt::d3d12::page_mirror_write_back(device.p, std::uintptr_t(title), kPages * kPage64k) == 0);
-    for (unsigned i = 0; i < kDescriptor; ++i) EXPECT(title[5 * kDescriptor + i] == 0);
+    EXPECT(rt::d3d12::page_mirror_write_back(device.p, std::uintptr_t(title), kPages * kPage64k) > 0);
+    EXPECT(!std::memcmp(title + 5 * kDescriptor, stored, sizeof(stored)));
+    std::uint32_t stored_entry[8]{};
+    EXPECT(rt::d3d12::arena_gpu_read(device.p, shader_va + 5 * kDescriptor, stored_entry, sizeof(stored_entry)));
+    for (unsigned i = 0; i < 8; ++i)
+        EXPECT(stored_entry[i] == (i == leonida::gfx10::kTsharpIndexDword ? 0u : stored[i]));
+    std::thread([&] { std::memset(title + 5 * kDescriptor, 0, kDescriptor); }).join();  // as before, for the cases below
 
     // 5. The T#: dword 6 carries the tag and the texture's index, the other words as written; the title's dword 6 is
     // its own.
@@ -282,6 +294,36 @@ int test() {
         rt::d3d12::set_device_outer(device.p, nullptr);
         xbox.reset();
         EXPECT(map(pixels, 1, nullptr) == pixels && free_pages(1, &pixel_page));
+    }
+
+    // 7. Inline data in the heap's page, read through a V# of the title.
+    {
+        const std::uint32_t sizes[4] = {512, 256, 1280, 720};  // a "V#" of base 0x100_00000200, nothing there
+        const std::uint64_t data_va = std::uintptr_t(title) + 10 * kDescriptor;
+        const auto pointer = raw_vsharp(data_va, sizeof(sizes));
+        std::thread([&] {
+            std::memcpy(title + 10 * kDescriptor, sizes, sizeof(sizes));
+            put(11, pointer);
+        }).join();
+        std::uint32_t table[2][8]{};
+        EXPECT(rt::d3d12::arena_gpu_read(device.p, shader_va + 10 * kDescriptor, table, sizeof(table)));
+        // A slot of the same page rewritten: the filter runs over the page again.
+        const auto other = raw_vsharp(arena_va + 1024, 64);
+        std::thread([&] { put(1, other); }).join();
+        EXPECT(rt::d3d12::arena_gpu_read(device.p, shader_va + 10 * kDescriptor, table, sizeof(table)));
+        std::uint32_t through_vsharp[4]{};
+        EXPECT(rt::d3d12::page_mirror_gpu_read(device.p, data_va, through_vsharp, sizeof(through_vsharp)));
+        std::printf("inline data: through the V# [%u %u %u %u], through the table [%u %u %u %u]\n", through_vsharp[0],
+                    through_vsharp[1], through_vsharp[2], through_vsharp[3], table[0][0], table[0][1], table[0][2],
+                    table[0][3]);
+        EXPECT(!std::memcmp(through_vsharp, sizes, sizeof(sizes)));                   // the title's words, exactly
+        EXPECT(!(table[0][0] | table[0][1] | table[0][2] | table[0][3]));             // null whole in the table
+        EXPECT(!std::memcmp(table[1], pointer.data(), sizeof(pointer)));              // the V#: mirrored, as written
+        std::uint32_t rewritten_entry[8]{};
+        EXPECT(rt::d3d12::arena_gpu_read(device.p, shader_va + kDescriptor, rewritten_entry, kDescriptor));
+        EXPECT(!std::memcmp(rewritten_entry, other.data(), sizeof(other)));           // filtered: an arena V#
+        EXPECT(!std::memcmp(title + 10 * kDescriptor, sizes, sizeof(sizes)));         // the title's bytes unchanged
+        EXPECT(!std::memcmp(title + 11 * kDescriptor, pointer.data(), sizeof(pointer)));
     }
 
     // 3. The null slots after the heap.
