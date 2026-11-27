@@ -12466,6 +12466,8 @@ public:
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
         graphics_.mesh = mesh;
         graphics_.depth_bounds = depth_bounds;
+        graphics_.depth_writes = depth.depthWriteEnable != VK_FALSE;
+        graphics_.stencil_writes = depth.stencilTestEnable && (depth.front.writeMask || depth.back.writeMask);
         recipe_.mesh = mesh;
         recipe_.stages = std::move(stage_infos);
         recipe_.attributes = std::move(attributes);
@@ -13159,7 +13161,13 @@ private:
         info.pViewportState = &viewport;
         info.pRasterizationState = &raster;
         info.pMultisampleState = &multisample;
-        info.pDepthStencilState = &r.depth;
+        VkPipelineDepthStencilStateCreateInfo depth = r.depth;
+        if (unbound & leonida::GraphicsPipeline::read_only_depth) depth.depthWriteEnable = VK_FALSE;
+        if (unbound & leonida::GraphicsPipeline::read_only_stencil) {
+            depth.front.writeMask = 0;
+            depth.back.writeMask = 0;
+        }
+        info.pDepthStencilState = &depth;
         info.pColorBlendState = &blend;
         info.pDynamicState = &dynamic;
         info.flags=flags;
@@ -18122,6 +18130,17 @@ public:
                 view = {};
             }
             if (r->desc().Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) view = {};
+            if (view.resource && desc && desc->Flags) {
+                constexpr UINT kValidFlags = D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL;
+                const UINT flags = static_cast<UINT>(desc->Flags);
+                if (flags & ~kValidFlags) {
+                    log_once("depth-stencil view flags not supported:", flags);
+                    view = {};
+                } else {
+                    if (flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH) view.dsv_flags |= leonida::dsv_read_only_depth;
+                    if (flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL) view.dsv_flags |= leonida::dsv_read_only_stencil;
+                }
+            }
         } else if (resource) {
             stub("ID3D12Device::CreateDepthStencilView(resource from another device)");
         }
