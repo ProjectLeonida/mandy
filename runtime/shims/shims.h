@@ -69,6 +69,9 @@ struct BundledModuleOps {
     // (library_loader's W entries use them when a name has a character outside ASCII). Either may be null.
     void* (*find_loaded_w)(void* ctx, const std::wstring& basename);
     void* (*load_bundled_w)(void* ctx, const std::wstring& basename, uint32_t flags, bool& handled);
+    // Optional path and primary-executable queries for GetModuleFileName* and GetModuleHandle(nullptr). Either may be null.
+    bool (*module_path)(void* ctx, void* module, std::wstring& path);
+    void* (*main_module)(void* ctx);
 };
 void add_bundled_loader(void* ctx, const BundledModuleOps* ops);
 void remove_bundled_loader(void* ctx);
@@ -79,6 +82,8 @@ void* find_loaded_bundled_module_w(const std::wstring& basename);
 void* load_bundled_module_w(const std::wstring& basename, uint32_t flags, bool& handled);
 void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle);
 bool owns_bundled_module_handle(void* module);
+bool bundled_module_path(void* module, std::wstring& path);
+void* main_bundled_module();
 
 // Title-exported __XMemAllocationHooks__ (GDK XMEM_ALLOCATION_HOOKS): the console runtime routes internal
 // allocations (including D3D12 descriptor heaps) through these callbacks when the mapped image exports the struct.
