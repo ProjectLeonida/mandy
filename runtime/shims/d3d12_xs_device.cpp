@@ -387,7 +387,8 @@ void local_mirror_table(const DeviceProxy* device, std::uint64_t gpu_handle) {
         const std::uint64_t offset = (gpu_handle - gpu_start) / kLocalDescriptorBytes * kLocalDescriptorBytes;
         const std::uint64_t slots = (std::min<std::uint64_t>)(kLocalMirrorSlots, (bytes - offset) / kLocalDescriptorBytes);
         const SIZE_T copy_bytes = slots * kLocalDescriptorBytes;
-        if (!local_accessible(range.real_start + offset, copy_bytes, true)) return;
+        // On Wine, VirtualQuery can report a live vkMapMemory span as MEM_FREE (as in local_write_through).
+        if (!range.mapped && !local_accessible(range.real_start + offset, copy_bytes, true)) return;
         const auto copied = copy_title_slots(reinterpret_cast<std::uint8_t*>(range.real_start + offset),
                                              range.custom_start + offset, copy_bytes);
         static std::atomic<int> said{0};
@@ -5036,6 +5037,9 @@ void proxy_create_sampler_x(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, s
     // A destination in the title's own descriptor range is translated to the real heap's, as device slots 17 to 24 do.
     handle = translate_cpu_handle(self, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(dest)});
     self->real->CreateSampler(desc, handle);
+    // And stored at the title's address for a title-backed heap, as slot 22 does: a title that copies its samplers
+    // from that memory would otherwise copy zeros.
+    local_write_through(self, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(dest)}, 1);
 }
 
 // The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out), named
