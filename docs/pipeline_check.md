@@ -353,6 +353,11 @@ journal in `<out>/pipeline_cache.d` with matching device features and driver key
 largest first, can spend hours on a few modules of several MiB), and `--skip-listed` when `LEONIDA_SKIP_COMPUTE` is
 set. On Windows it also passes `--parent <its pid>`: the runtime stops when `make_game.py` ends, so a closed stage
 leaves no `gta6rt` holding the journal (a Wine process cannot watch a host process).
+It sets `LEONIDA_DEVICE_FAULT=1` unless the environment has it (any value, empty included, is passed on): that is
+what `scripts/windows-boot/boot.ps1` boots with, and on NVIDIA it turns on the driver's diagnostics config, which is
+part of every journal file's name (`nv-diagnostics-config` in `d3d12_vulkan_device.cpp`), so a journal built with
+another value gives a boot no hits. Run the stage with the value the boot uses (`2`, or empty for a plain `gta6rt
+--run`).
 
 The runtime keeps the entries inside the driver in `pipeline_cache.d/requests/inflight.txt` (`<name> <key>`, the key
 made from the module file and the driver; `runtime/src/precompile_inflight.h`). A stop the runtime is told about

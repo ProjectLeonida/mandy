@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import textwrap
@@ -38,6 +39,7 @@ FAKE_GTA6RT = textwrap.dedent("""\
         "LEONIDA_SHADERS": os.environ.get("LEONIDA_SHADERS"),
         "LEONIDA_PIPELINE_CACHE_DIR": os.environ.get("LEONIDA_PIPELINE_CACHE_DIR"),
         "CUSTOM_PASSTHROUGH": os.environ.get("CUSTOM_PASSTHROUGH"),
+        "LEONIDA_DEVICE_FAULT": os.environ.get("LEONIDA_DEVICE_FAULT"),
     })
     with open(state_file, "w", encoding="utf-8", newline="\\n") as f:
         json.dump(state, f)
@@ -214,7 +216,7 @@ class PipelinesStageTest(unittest.TestCase):
 
     def run_stage(self, plan, *, jobs=4, env_extra=None, os_name=None, runtime_build=None, board=None):
         env = {k: v for k, v in os.environ.items()
-               if k not in ("LEONIDA_SHADERS", "LEONIDA_PIPELINE_CACHE_DIR", "WINE")}
+               if k not in ("LEONIDA_SHADERS", "LEONIDA_PIPELINE_CACHE_DIR", "LEONIDA_DEVICE_FAULT", "WINE")}
         env["FAKE_STATE"] = self.state_file
         env["FAKE_PLAN"] = json.dumps(plan)
         env["FAKE_CACHE_ROOT"] = self.out
@@ -275,6 +277,7 @@ class PipelinesStageTest(unittest.TestCase):
         self.assertEqual(calls[0]["LEONIDA_SHADERS"], make_game.wine_path(self.spirv))
         self.assertEqual(calls[0]["LEONIDA_PIPELINE_CACHE_DIR"], make_game.wine_path(self.out))
         self.assertEqual(calls[0]["CUSTOM_PASSTHROUGH"], "keep-me")
+        self.assertEqual(calls[0]["LEONIDA_DEVICE_FAULT"], "1")  # as boot.ps1, so the boot reads this journal
         # Progress parsed 1/2 and 2/2, updated TUI summary, and logged the done summary line.
         self.assertTrue(any("pipelines: 0/2 (0%)" in line for line in logs), logs)
         self.assertTrue(any("pipelines: 2/2 (100%)" in line for line in logs), logs)
@@ -322,6 +325,21 @@ class PipelinesStageTest(unittest.TestCase):
         self.assertEqual(calls[0]["LEONIDA_PIPELINE_CACHE_DIR"], custom_cache)
         self.assertTrue(any("LEONIDA_SHADERS" in line and custom_shaders in line for line in logs), logs)
         self.assertTrue(any("LEONIDA_PIPELINE_CACHE_DIR" in line and custom_cache in line for line in logs), logs)
+
+    def test_user_set_device_fault_is_kept(self):
+        # 2 (the fault report without NVIDIA's diagnostics config) and an empty value (off) are passed on as they are.
+        for value in ("2", ""):
+            code, calls, logs, err = self.run_stage([{"exit": 0}], env_extra={"LEONIDA_DEVICE_FAULT": value})
+            self.assertIsNone(code, err)
+            self.assertEqual(calls[-1]["LEONIDA_DEVICE_FAULT"], value)
+            self.assertTrue(any("LEONIDA_DEVICE_FAULT from environment" in line for line in logs), logs)
+
+    def test_device_fault_matches_the_boot_script(self):
+        # The stage's default is what scripts/windows-boot/boot.ps1 boots with, read from the script itself.
+        with open(os.path.join(ROOT, "scripts", "windows-boot", "boot.ps1"), encoding="utf-8-sig") as f:
+            match = re.search(r'^\s*LEONIDA_DEVICE_FAULT\s*=\s*"([^"]*)"', f.read(), re.M)
+        self.assertIsNotNone(match)
+        self.assertEqual(make_game.PIPELINE_DEVICE_FAULT, match.group(1))
 
     def test_exit_2_logs_warning_and_completes_stage(self):
         plan = [{

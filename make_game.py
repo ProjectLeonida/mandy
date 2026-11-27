@@ -2738,7 +2738,21 @@ def precompile_env(spirv: str, out: str) -> dict[str, str]:
         log(f"pipelines: using LEONIDA_PIPELINE_CACHE_DIR from environment: {env['LEONIDA_PIPELINE_CACHE_DIR']}")
     else:
         env["LEONIDA_PIPELINE_CACHE_DIR"] = wine_path(out)
+    # On NVIDIA LEONIDA_DEVICE_FAULT=1 turns on the driver's diagnostics config, which compiles other pipelines and
+    # is part of every journal file's name (d3d12_vulkan_device.cpp, "nv-diagnostics-config"). The boot script sets it
+    # (scripts/windows-boot/boot.ps1), so the journal is built as the boot reads it; a boot with another value (unset,
+    # or 2: the fault report without the config) needs the stage run with that value.
+    if "LEONIDA_DEVICE_FAULT" in env:
+        log(f"pipelines: using LEONIDA_DEVICE_FAULT from environment: {env['LEONIDA_DEVICE_FAULT'] or '(empty)'}")
+    else:
+        env["LEONIDA_DEVICE_FAULT"] = PIPELINE_DEVICE_FAULT
+        log(f"pipelines: LEONIDA_DEVICE_FAULT={PIPELINE_DEVICE_FAULT}, as scripts/windows-boot/boot.ps1 boots; "
+            "a boot with another value reads none of this journal on NVIDIA, so run the stage with that value")
     return env
+
+
+# What scripts/windows-boot/boot.ps1 sets LEONIDA_DEVICE_FAULT to; the pipelines stage builds the journal the same way.
+PIPELINE_DEVICE_FAULT = "1"
 
 
 def require_translated_shaders(work: str) -> str:
