@@ -46,6 +46,7 @@
 #include "../src/dstorage_trace.h"
 #include "../src/gpu_label_memory.h"
 #include "../src/title_frames.h"
+#include "../src/title_mirror_space.h"
 #include "../src/title_page_watch.h"
 #include "../src/title_geometry_watch.h"
 #include "../src/title_va_alias.h"
@@ -576,6 +577,25 @@ HostUnorderedMap<uintptr_t, AddressList> g_alias_peers;
 // The frames of g_table_frames, under g_frame_lock (declared with it).
 HostUnorderedMap<uintptr_t, TableFrame> g_table_frames;
 
+// The page mirror's feed (src/title_frames.h, Feed), under g_phys_mutex.
+leonida::title_frames::Feed g_mirror_feed = nullptr;
+void* g_mirror_context = nullptr;
+
+// With g_phys_mutex held: the page at `address` shows physical page `page` now (0: nothing), for the page mirror.
+void feed_mirror(uintptr_t address, uint64_t page) {
+    if (!g_mirror_feed || !leonida::title_mirror_space::contains(address)) return;
+    if (page) {
+        if (const auto backing = g_pages.find(page); backing != g_pages.end() && backing->second.section &&
+                                                     backing->second.section->scratch) {
+            g_mirror_feed(g_mirror_context, address,
+                          static_cast<uint8_t*>(backing->second.section->scratch) + backing->second.offset,
+                          backing->second.section);
+            return;
+        }
+    }
+    g_mirror_feed(g_mirror_context, address, nullptr, {});
+}
+
 // With g_phys_mutex held, and g_alias_lock exclusive: the table page `table`'s alias peers are the host addresses of
 // its physical page (`addresses`). A table page is not one of those addresses itself (no write can come through it),
 // but a write through any of them changes its bytes: the shadows and the watches guard it there.
@@ -626,6 +646,7 @@ void note_mapping(uint64_t page, uintptr_t address, bool mapped) {
         if (tables != g_page_tables.end())
             for (const uintptr_t table : tables->second) notify(table, table + kPhysicalPageSize, Event::mapping);
     }
+    feed_mirror(address, mapped ? page : 0);
     if (addresses.empty()) g_page_addresses.erase(page);
 }
 
@@ -659,6 +680,7 @@ void note_table_page(uintptr_t table, uint64_t was, uint64_t page) {
         ReleaseSRWLockExclusive(&g_frame_lock);
     }
     leonida::title_page_aliases::set(table, page != 0);
+    feed_mirror(table, page);
     const std::unique_lock aliases(g_alias_lock);
     const auto addresses = page ? g_page_addresses.find(page) : g_page_addresses.end();
     set_table_peers_locked(table, addresses != g_page_addresses.end() ? &addresses->second : nullptr);
@@ -1021,8 +1043,21 @@ void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULON
         record_window(address, size, host_prot, caller, true);
         return address;
     }
+    // A reservation the title lets the host place goes into the page mirror's range (src/title_mirror_space.h), so a V#
+    // or pointer the title writes with its address reaches the mirror at heap_base + the address. `reserve(at)` makes
+    // the reservation at `at`; null when the range is spent or the host refused every address tried (then the host
+    // places it, as before).
+    const auto in_mirror_space = [&](auto&& reserve) -> void* {
+        void* made = nullptr;
+        leonida::title_mirror_space::take(size, base_granularity, [&](std::uint64_t at) {
+            made = reserve(reinterpret_cast<void*>(static_cast<uintptr_t>(at)));
+            return made != nullptr;
+        });
+        return made;
+    };
     if (new_placeholder || window) {
-        void* const result = reserve_placeholder(address, size, base_granularity);
+        void* placed = address ? nullptr : in_mirror_space([&](void* at) { return reserve_placeholder(at, size, base_granularity); });
+        void* const result = placed ? placed : reserve_placeholder(address, size, base_granularity);
         if (result && window) {
             const std::lock_guard lock(g_phys_mutex);
             record_window(result, size, host_prot, caller, false);
@@ -1047,6 +1082,12 @@ void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULON
         return result;
     }
     if (page_mode == kXmemLargePages && address == nullptr) {
+        if (void* placed = in_mirror_space([&](void* at) {
+                return reserve_watched(host_type | MEM_RESERVE, at, size, [&](DWORD type) {
+                    return placeholder_api().virtual_alloc2(GetCurrentProcess(), at, size, type, host_prot, nullptr, 0);
+                });
+            }))
+            return placed;
         MEM_ADDRESS_REQUIREMENTS requirements{};
         requirements.Alignment = kXmemPageSize2m;
         MEM_EXTENDED_PARAMETER parameter{};
@@ -1056,6 +1097,13 @@ void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULON
             return placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size, type, host_prot, &parameter, 1);
         });
     }
+    // A reservation (or a commit at no given address, which reserves too) the host would place.
+    if (!address && (host_type & (MEM_RESERVE | MEM_COMMIT)))
+        if (void* placed = in_mirror_space([&](void* at) {
+                return reserve_watched(host_type | MEM_RESERVE, at, size,
+                                       [&](DWORD type) { return VirtualAlloc(at, size, type, host_prot); });
+            }))
+            return placed;
     return reserve_watched(host_type, address, size,
                            [&](DWORD type) { return VirtualAlloc(address, size, type, host_prot); });
 }
@@ -2859,6 +2907,31 @@ void slot31_mapping_counts(Slot31Counts& out) {
 
 // The D3D12 layer and DirectStorage reach table pages through their frames (src/title_frames.h), and guard them at
 // their physical pages' host addresses.
+// title_frames' Attach (src/title_frames.h): the page mirror's feed from now on, after every page of the mirror's range
+// mapped now (the views, then the table pages), all under g_phys_mutex.
+void attach_mirror(void* context, leonida::title_frames::Feed feed) {
+    const std::lock_guard lock(g_phys_mutex);
+    g_mirror_feed = feed;
+    g_mirror_context = context;
+    if (!feed) return;
+    {
+        const FaultLockShared faults;
+        for (const auto& [base, view] : g_views) {
+            if (view.zero || !view.section || !view.section->scratch) continue;
+            for (uint64_t i = 0; i < view.count; ++i) {
+                const uintptr_t at = base + i * kPhysicalPageSize;
+                if (!leonida::title_mirror_space::contains(at)) continue;
+                feed(context, at, static_cast<uint8_t*>(view.section->scratch) + view.offset + i * kPhysicalPageSize,
+                     view.section);
+            }
+        }
+    }
+    for (const auto& [at, frame] : g_table_frames)
+        if (leonida::title_mirror_space::contains(at) && frame.section && frame.section->scratch)
+            feed(context, at, static_cast<uint8_t*>(frame.section->scratch) + frame.offset, frame.section);
+}
+[[maybe_unused]] const bool g_mirror_attach_set = (leonida::title_frames::attach_fn = &attach_mirror, true);
+
 [[maybe_unused]] const bool g_title_frames_set =
     (leonida::title_frames::set_lookup(&table_frame, &geometry_aliases), true);
 

@@ -136,4 +136,14 @@ bool for_each_part(std::uintptr_t from, std::size_t size, F&& f) {
     return host >= to || f(host, std::size_t(to - host), static_cast<std::uint8_t*>(nullptr));
 }
 
+// The page mirror's change feed (src/title_mirror.h): xmem tells it of every change of what a 64 KiB page of
+// src/title_mirror_space.h's range shows, in the order the changes are made: the page shows the physical page whose
+// bytes are at `frame` (its section's scratch view, kept alive by `keep`), or nothing (`frame` null). Called with xmem's
+// locks held (g_phys_mutex, sometimes the fault lock): the feed only queues, on memory that is not the process heap's.
+using Feed = void (*)(void* context, std::uintptr_t page, std::uint8_t* frame, const std::shared_ptr<void>& keep);
+// xmem's side: from now on every change goes to `feed` (null: none any more); the pages mapped now are fed first, under
+// the same lock as the changes, so none is missed or fed twice.
+using Attach = void (*)(void* context, Feed feed);
+inline std::atomic<Attach> attach_fn{nullptr};
+
 }  // namespace leonida::title_frames
