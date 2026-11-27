@@ -4444,7 +4444,7 @@ struct DeviceState {
                 return VsharpResult::rebased;
             }
             note_unbacked_vsharp(base, span, stride, w);
-            w[0] = w[1] = w[2] = w[3] = 0;  // null whole, never three words of four
+            w[0] = w[1] = w[2] = 0;
             return VsharpResult::empty;
         }
         uint64_t refused = 0;
@@ -4473,7 +4473,7 @@ struct DeviceState {
                              where, (unsigned long long)base, (unsigned long long)span);
             }
             note_unbacked_vsharp(base, span, stride, w);
-            w[0] = w[1] = w[2] = w[3] = 0;  // null whole, never three words of four
+            w[0] = w[1] = w[2] = 0;
             return VsharpResult::empty;
         }
         if ((to & ((1ull << 48) - 1)) == base) return VsharpResult::unchanged;
@@ -6034,7 +6034,10 @@ struct DeviceState {
                     }
                     const VsharpResult result = fix_vsharp(h, path, &done[i].halves[half], &heap, false);
                     if (result == VsharpResult::rebased) ++heap.vsharps;
-                    if (result == VsharpResult::empty) ++heap.unbacked;
+                    if (result == VsharpResult::empty) {
+                        ++heap.unbacked;
+                        h[3] = 0;  // null whole in the filtered copy, never three words of four
+                    }
                 }
             } else {
                 leonida::gfx10::ImageWords words;
