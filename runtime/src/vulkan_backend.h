@@ -1704,6 +1704,36 @@ public:
         return r;
     }
 
+    // Atomic batched variant of write_staged_title_image: acquires tracker_mutex_ and submit_mutex_ ONCE for all
+    // targets, collects every target's LayoutPieces + cross-queue waits, invokes `copy(replay, all_pieces, waits)`,
+    // and transitions UNDEFINED -> GENERAL in tracker_ ONLY if `copy` returns VK_SUCCESS.
+    struct StagedImageTarget {
+        ResourceId id{};
+        VkImageSubresourceRange range{};
+    };
+    template<class Copy>
+    VkResult write_staged_title_images(std::span<const StagedImageTarget> targets, Copy&& copy) {
+        if (targets.empty()) return VK_SUCCESS;
+        std::lock_guard layout_lock(tracker_mutex_);
+        std::lock_guard queue_lock(submit_mutex_);
+        if (is_device_lost()) return VK_ERROR_DEVICE_LOST;
+        std::vector<LayoutPieces> all_pieces(targets.size());
+        for (std::size_t i = 0; i < targets.size(); ++i) {
+            if (!tracker_.pieces(targets[i].id, targets[i].range, all_pieces[i]) || all_pieces[i].empty())
+                return VK_ERROR_UNKNOWN;
+        }
+        const auto waits = retire_tickets_.pending_through(submitted_ticket_.load(std::memory_order_acquire));
+        const auto r = observe_result(copy(replay_, all_pieces, waits), "title staging upload batch");
+        if (r == VK_SUCCESS) {
+            for (std::size_t i = 0; i < targets.size(); ++i) {
+                for (const auto& p : all_pieces[i])
+                    if (p.layout == VK_IMAGE_LAYOUT_UNDEFINED)
+                        tracker_.set(targets[i].id, p.range, VK_IMAGE_LAYOUT_GENERAL);
+            }
+        }
+        return r;
+    }
+
     // For tests and traces.
     VkImageLayout layout(ResourceId id, std::uint32_t subresource) {
         std::lock_guard lock(tracker_mutex_);
@@ -4530,6 +4560,8 @@ private:
                     held_.pop_front();
                 }
 
+                const bool stop_for_barrier = batch_ops.back().barrier_after;
+
                 Deferred& first = batch_ops.front();
                 active_seq_ = first.seq;
                 update_held_front_seq_locked();
@@ -4616,6 +4648,7 @@ private:
                 active_seq_ = 0;
                 update_held_front_seq_locked();
                 released = true;
+                if (stop_for_barrier) break;
                 continue;
             }
 

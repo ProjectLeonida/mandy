@@ -415,7 +415,7 @@ inline std::vector<std::pair<std::uintptr_t, std::uintptr_t>> take(bool& overflo
     if (!s.pending.load(std::memory_order_acquire)) return {};
     std::lock_guard lock(s.mutex);
     overflow = std::exchange(s.overflow, false);
-    s.pending.store(false, std::memory_order_relaxed);
+    s.pending.store(false, std::memory_order_release);
     return std::exchange(s.ranges, {});
 }
 

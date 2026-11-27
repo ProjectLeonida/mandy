@@ -2211,6 +2211,11 @@ struct PageMappingCopy {
     std::uintptr_t pool = 0;
     UINT pages = 0, flags = 0;
 
+    PageMappingCopy(const PageMappingCopy&) = delete;
+    PageMappingCopy& operator=(const PageMappingCopy&) = delete;
+    PageMappingCopy(PageMappingCopy&&) = delete;
+    PageMappingCopy& operator=(PageMappingCopy&&) = delete;
+
     PageMappingCopy(UINT count, const xmem::PageBatch* in, std::uintptr_t pool_, UINT pages_, UINT flags_)
         : batches(in, in + count), pool(pool_), pages(pages_), flags(flags_) {
         std::size_t total_ranges = 0;
@@ -2219,8 +2224,8 @@ struct PageMappingCopy {
         range_storage.reserve(total_ranges);
         for (UINT b = 0; b < count; ++b) {
             if (!in[b].ranges || !in[b].count) {
-                if (!in[b].ranges) batches[b].ranges = nullptr;
-                continue;  // xmem refuses a batch with ranges but no array; it still sees none
+                batches[b].ranges = nullptr;
+                continue;  // xmem refuses a batch with ranges but no array; zero-count batches need no dangling ptr
             }
             const std::size_t offset = range_storage.size();
             range_storage.insert(range_storage.end(), in[b].ranges, in[b].ranges + in[b].count);

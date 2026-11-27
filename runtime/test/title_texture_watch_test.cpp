@@ -313,7 +313,8 @@ int main() {
         EXPECT(f.hot_tile_calls == calls_before);  // hot_tiles() was completely skipped on quiet passes!
         EXPECT(w.stats().hot_skips >= 5);
 
-        // One hot page that DOES overlap texture #42: only texture #42 is named, and arm() is not redundantly called.
+        // One hot page that DOES overlap texture #42: only texture #42 is named, and examine() still delegates to
+        // watch_.arm() so kernel-write pin checks (Look::busy) and concurrent set_hot(false) transitions stay safe.
         f.hot.push_back(base + 41 * kTile);
         EXPECT(w.may_have_work());
         const std::uint64_t arms_before = w.stats().arms;
@@ -325,7 +326,7 @@ int main() {
         EXPECT((seen == V{42}));
         EXPECT(w.hot_overlap() == 1);
         EXPECT(w.may_have_work());  // overlapping hot tile stays active
-        EXPECT(w.stats().arms == arms_before);  // skipped redundant arm() on hot tile
+        EXPECT(w.stats().arms == arms_before + 1);  // delegates to watch_.arm() for pin & set_hot(false) safety
 
         // Tile cools down (TitleMirror::set_hot(false) removes from hot and queues write):
         f.hot.pop_back();

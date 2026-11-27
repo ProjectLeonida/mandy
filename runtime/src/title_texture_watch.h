@@ -571,16 +571,9 @@ private:
             }
             tile.mapping = mapping;
         }
-        // A tile currently held hot by TitleMirror is left writable in geometry_writes (arm() is a no-op under its
-        // mutex). Skip the redundant arm call while it has no un-hot peers; when it cools down, set_hot(false) bumps
-        // its version and queues it so the next collect() re-arms it cleanly.
-        if (tile.hot_gen == pass_gen_ && tile.peers.empty()) {
-            tile.version = tile.primary->version.load(std::memory_order_acquire);
-            tile.stale = false;
-            remove_unarmed(tile);
-            return 1;
-        }
         // The version is read before arming: a write between the two moves it, and the next collect() sees that.
+        // Always delegate through watch_.arm() even on hot tiles so kernel_writes pin checks (Look::busy) still run
+        // and a concurrent set_hot(false) cannot leave a writable page silently marked armed.
         std::uint64_t version = tile.primary->version.load(std::memory_order_acquire);
         for (const auto& [peer, cell] : tile.peers)
             version = (std::max)(version, cell->version.load(std::memory_order_acquire));

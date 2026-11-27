@@ -308,55 +308,43 @@ int main() {
         EXPECT(bg.batch_calls == 2 && bg.batch_pages == 19 && bg.sorted_ok);
         EXPECT(bg.armed.size() == 16);
     }
-    {  // two-tier per-frame promotion (advance_frame): pages written once every 30 submissions promote within
-       // kFramePromote frames without taking faults every frame, and has_pending_work() is O(1) false when clean.
+    {  // O(1) clean fast-path (has_pending_work) + unconditional disarm on hot promotion even when !p.armed
         Fake f;
         Policy policy(f);
         f.policy = &policy;
         policy.add(kBase, kBase + kPages * kPage);
         EXPECT(policy.has_pending_work());
         policy.collect([&](std::uintptr_t p) { f.take(p); });
-        EXPECT(!policy.has_pending_work());  // all 64 pages armed & clean: O(1) clean fast-path returns false!
+        EXPECT(!policy.has_pending_work());  // all 64 pages armed & clean: O(1) fast-path is false
 
-        constexpr unsigned kSubsPerFrame = 30;
-        std::uint64_t steady_frame_hot_faults = 0;
-        for (unsigned frame = 1; frame <= 40; ++frame) {
-            const unsigned write_sub = (frame - 1) % kSubsPerFrame;  // vary which of the 30 subs writes page 0
-            for (unsigned sub = 0; sub < kSubsPerFrame; ++sub) {
-                if (sub == write_sub) {
-                    const std::uint64_t before = f.faults_by_page[kBase];
-                    f.write(kBase + (frame * 17 + sub) % kPage, std::uint8_t(frame + sub));
-                    // After kFramePromote frames, page 0 stays unguarded except during kFrameProbe's probe window.
-                    const unsigned probe_phase = frame % Policy::kFrameProbe;
-                    if (frame > Policy::kFramePromote + 1 && probe_phase != 1 && probe_phase != 2)
-                        steady_frame_hot_faults += f.faults_by_page[kBase] - before;
-                }
-                if (frame % 10 == 0 && sub == 5) {
-                    f.write(kBase + kPage + frame, std::uint8_t(frame));
-                }
-                policy.collect([&](std::uintptr_t p) { f.take(p); });
-                EXPECT(f.same(kBase) && f.same(kBase + kPage));
-                policy.frame();
-            }
-            policy.advance_frame();
+        // A single write decays out of history_active_ over kHistory quiet submissions, then returns to clean.
+        f.write(kBase, 42);
+        EXPECT(policy.has_pending_work());
+        policy.collect([&](std::uintptr_t p) { f.take(p); });
+        EXPECT(f.same(kBase));
+        for (unsigned sub = 0; sub < Policy::kHistory; ++sub) {
+            policy.frame();
+            policy.collect([&](std::uintptr_t) {});
         }
-        EXPECT(policy.frame_hot(kBase));
-        EXPECT(policy.hot(kBase));
-        EXPECT(!policy.sub_hot(kBase));       // 1/30 subs is frame-hot, not submission-hot
-        EXPECT(!policy.hot(kBase + kPage));   // 1/10 frames stays cold
-        EXPECT(steady_frame_hot_faults == 0);
-
-        // Stop writing page 0: after a probe cycle across quiet 30-sub frames, it demotes and has_pending_work() is false.
-        for (unsigned frame = 0; frame < Policy::kFrameProbe + 4; ++frame) {
-            for (unsigned sub = 0; sub < kSubsPerFrame; ++sub) {
-                policy.collect([&](std::uintptr_t p) { f.take(p); });
-                policy.frame();
-            }
-            policy.advance_frame();
-        }
-        EXPECT(!policy.hot(kBase) && !policy.frame_hot(kBase));
+        EXPECT(!policy.hot(kBase));
         EXPECT(!policy.has_pending_work());
-        std::puts("two-tier advance_frame: 1/30-sub per-frame page promoted with zero steady faults, clean fast-path ok");
+
+        // Promote page 0 when a write lands AFTER collect() (so !p.armed at frame()): guard_.disarm() must still run.
+        for (unsigned sub = 0; sub < Policy::kPromote; ++sub) {
+            f.write(kBase + sub, std::uint8_t(sub + 1));
+            policy.collect([&](std::uintptr_t p) { f.take(p); });
+            if (sub + 1 == Policy::kPromote) f.write(kBase + 99, 77);  // opens OS page -> p.armed == false
+            policy.frame();
+        }
+        EXPECT(policy.hot(kBase));
+        EXPECT(policy.has_pending_work());
+        for (unsigned sub = 0; sub < 2 * Policy::kProbe; ++sub) {
+            policy.collect([&](std::uintptr_t p) { f.take(p); });
+            policy.frame();
+        }
+        EXPECT(!policy.hot(kBase));
+        EXPECT(!policy.has_pending_work());
+        std::puts("clean fast-path & unconditional disarm on hot promotion: ok");
     }
     if (failures) return 1;
     std::puts("title write policy: hot pages stop faulting, cold pages fault once an interval, nothing missed");

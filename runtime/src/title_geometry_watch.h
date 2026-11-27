@@ -43,6 +43,7 @@ struct State {
     host_heap::map<std::uintptr_t, Cell> cells;
     host_heap::vector<std::uintptr_t> hot;  // the tiles of the cells with hot > 0, under mutex
     std::atomic<std::size_t> hot_count{0};
+    std::atomic<std::uint64_t> hot_generation{0};
     host_heap::vector<WriteQueue*> writers;  // under mutex
     std::atomic<std::uint64_t> serial{1};
     std::atomic<std::size_t> count{0};
@@ -226,6 +227,7 @@ inline void release(std::uintptr_t va) {
         if (it->second.hot) {
             std::erase(s.hot, va);
             s.hot_count.store(s.hot.size(), std::memory_order_release);
+            s.hot_generation.fetch_add(1, std::memory_order_release);
         }
         // A page reopened here may also be one a slot-133 shadow keeps read-only (both guard the title's geometry):
         // it is writable now with no fault to tell that shadow, which then walks its pages again.
@@ -309,6 +311,7 @@ inline void set_hot(std::uintptr_t va, bool hot) {
         s.serial.store(version, std::memory_order_release);
     }
     s.hot_count.store(s.hot.size(), std::memory_order_release);
+    s.hot_generation.fetch_add(1, std::memory_order_release);
 }
 
 // The tiles some owner holds hot: written, for every subscriber, at every look.

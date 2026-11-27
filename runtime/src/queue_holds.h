@@ -293,7 +293,12 @@ public:
                 bool progress = true;
                 while (progress) {
                     progress = false;
-                    for (Holder* holder : snapshot()) progress |= holder->release_ready();
+                    for (Holder* holder : snapshot()) {
+                        if (holder->release_ready()) {
+                            progress = true;
+                            run_barriers();  // fire any barrier (e.g. Present) satisfied before draining post-barrier work
+                        }
+                    }
                 }
                 run_barriers();
             }

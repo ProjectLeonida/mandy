@@ -3191,6 +3191,7 @@ struct DeviceState {
     // A window is a read-side mirror, so without this a UAV or a raw write lands in the copy and the title never sees
     // it (#1537, the WRITE_INVALID stop at the world start).
     std::mutex title_write_back_mutex;  // its own: taken under shadow_mutex, never the other way round
+    std::atomic<bool> has_title_write_back{false};
     std::map<std::uint64_t, std::uint64_t> title_write_back;  // start -> end, of the submission about to run
     std::deque<std::pair<std::uint64_t, std::map<std::uint64_t, std::uint64_t>>> title_write_back_pending;  // by ticket
     std::uint64_t title_write_back_refused = 0;               // ranges past the caps, logged once
@@ -3259,45 +3260,6 @@ struct DeviceState {
         pool_spans.erase(it);
         pool_span_count.store(pool_spans.size(), std::memory_order_relaxed);
         ++pool_spans_retired;
-    }
-    // ExecuteCommandLists replays in progress, for GeometryViews::kAfterExecutes (see drain_geometry_releases).
-    // A plain aggregate on purpose: a C++ thread_local with a destructor in gta6rt.exe adds TLS callbacks to the image
-    // the loader's TLS index-0 move must not have (pe_loader.cpp reserve_tls_index0; VulkanContext::stage_xdxr_table
-    // keeps its range list a member for the same reason). A std::vector here made the title's CRT abort at startup.
-    struct GeometryExecuteSerials {
-        static constexpr unsigned kCapacity = 32;  // a replay has not been seen nested this deep
-        std::uint64_t serials[kCapacity]{};
-        unsigned count{};
-        unsigned skipped{};  // replays begun while the stack was full: the innermost, ended first
-    };
-    static GeometryExecuteSerials& geometry_execute_serials() {
-        thread_local GeometryExecuteSerials serials;
-        return serials;
-    }
-    void geometry_execute_begin() {
-        if (!geometry.cap()) return;
-        auto& serials = geometry_execute_serials();
-        if (serials.count == GeometryExecuteSerials::kCapacity) {
-            static std::atomic<bool> logged{false};
-            if (!logged.exchange(true))
-                std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists nested more than %u deep; a geometry view retired "
-                                     "in the extra replay is not deferred to it\n",
-                             GeometryExecuteSerials::kCapacity);
-            ++serials.skipped;
-            return;
-        }
-        serials.serials[serials.count++] = geometry.execute_begin();
-    }
-    void geometry_execute_end() {
-        if (!geometry.cap()) return;
-        auto& serials = geometry_execute_serials();
-        if (serials.skipped != 0) {
-            --serials.skipped;
-            return;
-        }
-        if (serials.count == 0) return;
-        const std::uint64_t serial = serials.serials[--serials.count];
-        geometry.execute_end(serial, [this] { return context->submitted_retire_ticket(); });
     }
     static rt::d3d12::GeometryCopy copy_geometry(std::uint8_t* to, const std::uint8_t* from, std::size_t size) {
         using Result = rt::d3d12::GeometryCopy;
@@ -3504,6 +3466,7 @@ struct DeviceState {
             scan = title_write_back.erase(scan);
         title_write_back.emplace(merged_begin, merged_end);
         title_write_back_bytes += added_bytes;
+        has_title_write_back.store(true, std::memory_order_release);
     }
 
     // What the GPU wrote into those copies goes back to the title's pages, so a later read by the title or the next
@@ -3513,7 +3476,7 @@ struct DeviceState {
     // coalesced into the next unretired batch rather than force-drained early. All drained batches are merged into one
     // disjoint sorted list so each mirrored page is read back at most once per call.
     void write_back_titles() {
-        if (!context) return;
+        if (!context || !has_title_write_back.load(std::memory_order_acquire)) return;
         const std::uint64_t done = context->completed_retire_ticket();
         std::vector<std::pair<std::uint64_t, std::uint64_t>> raw;
         {
@@ -3547,6 +3510,8 @@ struct DeviceState {
                              "unretired batches until they retire; batches:",
                              1);
             }
+            if (title_write_back.empty() && title_write_back_pending.empty())
+                has_title_write_back.store(false, std::memory_order_release);
         }
         if (raw.empty()) return;
         std::sort(raw.begin(), raw.end());
@@ -4639,6 +4604,25 @@ struct DeviceState {
         };
         SRWLOCK feed_lock = SRWLOCK_INIT;
         leonida::host_heap::vector<Change> feed;
+        std::atomic<bool> feed_pending{false};
+        std::atomic<std::uint64_t> space_gen_atomic{0};
+        std::atomic<bool> in_place_pending{false};
+        std::atomic<std::uint32_t> refresh_in_flight{0};
+        std::atomic<std::uint32_t> flush_in_flight{0};
+        std::atomic<std::uint64_t> fast_refreshes{0};
+        std::atomic<std::uint64_t> resolved_fast{0};
+        std::atomic<std::int64_t> since_ns_atomic{
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count()};
+        // Read-mostly snapshot of chunk coverage + plain/ensured intervals so title recording threads calling
+        // page_mirror_resolve() take a shared lock and never contend on page_mirror.mutex against async workers.
+        // Lock order: page_mirror.mutex -> resolve_cache.mutex (never reversed).
+        struct ResolveCache {
+            std::shared_mutex mutex;
+            std::uint64_t space_generation = 0;
+            std::vector<std::uint64_t> chunks;
+            std::map<std::uint64_t, std::uint64_t> plain, ensured;
+        } resolve_cache;
         std::vector<Change> taken;
         // Which mirrored pages the host wrote (src/title_mirror_tracking.h): a policy behind a small interface, the
         // plainest correct one (a guard on every page) until a measured one replaces it.
@@ -4693,6 +4677,7 @@ struct DeviceState {
         auto& m = static_cast<DeviceState*>(context)->page_mirror;
         AcquireSRWLockExclusive(&m.feed_lock);
         m.feed.push_back({page, frame, keep});
+        m.feed_pending.store(true, std::memory_order_release);
         ReleaseSRWLockExclusive(&m.feed_lock);
     }
 
@@ -4909,7 +4894,46 @@ struct DeviceState {
     // ordinary memory not mirrored yet is named at once (a V# with a wild size: counted).
     static constexpr std::uint64_t kMirrorNameMax = std::uint64_t(256) << 20;
     bool page_mirror_resolve(std::uint64_t va, std::uint64_t bytes) {
-        if (!page_mirror.mirror) return false;
+        if (!page_mirror.mirror || !bytes || va + bytes < va) return false;
+        // Fast shared-lock check for already-covered & already-ensured ranges (avoids page_mirror.mutex contention
+        // between title recording threads and async queue submit workers).
+        {
+            auto& rc = page_mirror.resolve_cache;
+            std::shared_lock shared(rc.mutex);
+            if (rc.space_generation == leonida::title_mirror_space::generation() && !rc.chunks.empty()) {
+                constexpr std::uint64_t kChunk = leonida::TitleMirror::kChunk;
+                constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
+                const std::uint64_t end = va + bytes;
+                bool covered = true;
+                for (std::uint64_t c = va & ~(kChunk - 1); c < end; c += kChunk) {
+                    if (!std::binary_search(rc.chunks.begin(), rc.chunks.end(), c)) {
+                        covered = false;
+                        break;
+                    }
+                    if (c > UINT64_MAX - kChunk) break;
+                }
+                if (covered) {
+                    bool all_ensured = true;
+                    auto it = rc.plain.upper_bound(va);
+                    if (it != rc.plain.begin() && std::prev(it)->second > va) --it;
+                    for (; it != rc.plain.end() && it->first < end; ++it) {
+                        const std::uint64_t from = std::max(it->first, va) & ~(kPage - 1);
+                        const std::uint64_t to = (std::min(it->second, end) + kPage - 1) & ~(kPage - 1);
+                        auto eit = rc.ensured.upper_bound(from);
+                        if (eit == rc.ensured.begin() || std::prev(eit)->first > from || std::prev(eit)->second < to) {
+                            all_ensured = false;
+                            break;
+                        }
+                    }
+                    if (all_ensured) {
+                        page_mirror.resolved_fast.fetch_add(1, std::memory_order_relaxed);
+                        return true;
+                    }
+                } else {
+                    return false;
+                }
+            }
+        }
         std::lock_guard lock(page_mirror.mutex);
         return page_mirror_resolve_locked(va, bytes, true);
     }
@@ -4921,10 +4945,31 @@ struct DeviceState {
         if (g == m.space_generation) return;
         m.space_generation = g;
         m.plain.clear();
+        std::vector<std::uint64_t> covered_chunks;
         leonida::title_mirror_space::for_each_taken([&](std::uint64_t base, std::uint64_t end, bool plain) {
             m.mirror->cover(base, end);
             if (plain) m.plain[base] = end;
+            constexpr std::uint64_t kChunk = leonida::TitleMirror::kChunk;
+            for (std::uint64_t c = base & ~(kChunk - 1); c < end; c += kChunk) {
+                if (m.mirror->covers(c)) covered_chunks.push_back(c);
+                if (c > UINT64_MAX - kChunk) break;
+            }
         });
+        std::sort(covered_chunks.begin(), covered_chunks.end());
+        covered_chunks.erase(std::unique(covered_chunks.begin(), covered_chunks.end()), covered_chunks.end());
+        {
+            std::unique_lock rc_lock(m.resolve_cache.mutex);
+            // TitleMirror never removes covered chunks until destroy_page_mirror(), so union monotonically to keep
+            // resolve_cache.chunks 100% identical to m.mirror->covers() even if a reservation is later released.
+            m.resolve_cache.chunks.insert(m.resolve_cache.chunks.end(), covered_chunks.begin(), covered_chunks.end());
+            std::sort(m.resolve_cache.chunks.begin(), m.resolve_cache.chunks.end());
+            m.resolve_cache.chunks.erase(std::unique(m.resolve_cache.chunks.begin(), m.resolve_cache.chunks.end()),
+                                         m.resolve_cache.chunks.end());
+            m.resolve_cache.plain = m.plain;
+            m.resolve_cache.ensured = m.ensured;
+            m.resolve_cache.space_generation = g;
+        }
+        m.space_gen_atomic.store(g, std::memory_order_release);
     }
     bool page_mirror_resolve_locked(std::uint64_t va, std::uint64_t bytes, bool make) {
         auto& m = page_mirror;
@@ -4978,6 +5023,8 @@ struct DeviceState {
             it = e.erase(it);
         }
         e[from] = to;
+        std::unique_lock rc_lock(page_mirror.resolve_cache.mutex);
+        page_mirror.resolve_cache.ensured = e;
     }
     // A slot-133 buffer over mirrored title memory (Resource::create_mirror_buffer): the chunk and offset that hold
     // all of [va, va + bytes), naming it to the mirror first. False when the mirror does not hold all of it or it
@@ -5249,8 +5296,16 @@ struct DeviceState {
     void flush_page_mirror() {
         auto& m = page_mirror;
         if (!m.mirror) return;
+        // O(1) lock-free clean fast-path: verify BOTH no pending binds AND no concurrent flush in flight (seq_cst
+        // after reading has_pending_binds() ensures another queue cannot slip past before note_mirror_bind() runs).
+        if (!m.mirror->has_pending_binds() && m.flush_in_flight.load(std::memory_order_seq_cst) == 0) return;
         std::unique_lock lock(m.mutex, std::defer_lock);
         leonida::submit_phases::lock_timed(lock);
+        m.flush_in_flight.fetch_add(1, std::memory_order_seq_cst);
+        struct FlushGuard {
+            std::atomic<std::uint32_t>& n;
+            ~FlushGuard() { n.fetch_sub(1, std::memory_order_release); }
+        } in_flight{m.flush_in_flight};
         if (m.mirror->flush(m.value + 1)) {
             ++m.value;
             ++m.batches;
@@ -5266,6 +5321,13 @@ struct DeviceState {
         leonida::geometry_writes::unsubscribe(page_mirror.released);
         std::lock_guard readback_lock(page_mirror.readback_mutex);
         std::lock_guard lock(page_mirror.mutex);
+        {
+            std::unique_lock rc_lock(page_mirror.resolve_cache.mutex);
+            page_mirror.resolve_cache.chunks.clear();
+            page_mirror.resolve_cache.plain.clear();
+            page_mirror.resolve_cache.ensured.clear();
+            page_mirror.resolve_cache.space_generation = 0;
+        }
         page_mirror.tracking.reset();
         page_mirror.mirror.reset();
         destroy_readback_locked();
@@ -5283,13 +5345,40 @@ struct DeviceState {
         auto& m = page_mirror;
         if (!m.mirror) return;
         const auto start = std::chrono::steady_clock::now();
+        const std::int64_t start_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count();
+        // O(1) lock-free clean-submission fast-path: skip locking page_mirror.mutex when no reservations, feeds,
+        // releases, hot/dirty pages, retired homes, or in-place heap slot changes are pending and the 10 s log is not
+        // due.
+        {
+            const bool log_due = (start_ns - m.since_ns_atomic.load(std::memory_order_acquire)) >= 10'000'000'000ll;
+            const bool in_place_dirty =
+                in_place_heaps.load(std::memory_order_acquire) != 0 &&
+                (slot_change_count.load(std::memory_order_acquire) != 0 ||
+                 m.in_place_pending.load(std::memory_order_acquire));
+            if (!log_due && !in_place_dirty &&
+                leonida::title_mirror_space::generation() == m.space_gen_atomic.load(std::memory_order_acquire) &&
+                !m.feed_pending.load(std::memory_order_acquire) &&
+                !leonida::geometry_writes::has_released(m.released) && !m.tracking->has_pending_work() &&
+                !m.mirror->has_dirty() && !m.mirror->has_retired_homes() &&
+                m.refresh_in_flight.load(std::memory_order_seq_cst) == 0) {
+                m.fast_refreshes.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
         std::unique_lock lock(m.mutex, std::defer_lock);
         leonida::submit_phases::lock_timed(lock);
+        m.refresh_in_flight.fetch_add(1, std::memory_order_seq_cst);
+        struct RefreshGuard {
+            std::atomic<std::uint32_t>& n;
+            ~RefreshGuard() { n.fetch_sub(1, std::memory_order_release); }
+        } in_flight{m.refresh_in_flight};
         sync_mirror_space_locked();
         m.taken.clear();
         AcquireSRWLockExclusive(&m.feed_lock);
         for (auto& change : m.feed) m.taken.push_back(std::move(change));
         m.feed.clear();
+        m.feed_pending.store(false, std::memory_order_release);
         ReleaseSRWLockExclusive(&m.feed_lock);
         const std::uint64_t ticket = context->submitted_retire_ticket() + 1;
         m.fed_now.clear();
@@ -5308,6 +5397,7 @@ struct DeviceState {
         m.taken.clear();
         // Ordinary memory released or decommitted: its mirrored pages leave (named again, they are mirrored again).
         leonida::geometry_writes::take_released(m.released, m.released_ranges);
+        bool ensured_changed = false;
         // Only pages the range holds whole: a freed heap block leaves the rest of its page to the blocks around it.
         for (const auto& [from, to] : m.released_ranges) {
             constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
@@ -5321,8 +5411,18 @@ struct DeviceState {
                 page = m.identity.erase(page);
             }
             if (to - from >= kPage)  // a run that lost a page is named again (pages still there map to themselves)
-                for (auto run = m.ensured.begin(); run != m.ensured.end();)
-                    run = run->first < to && from < run->second ? m.ensured.erase(run) : std::next(run);
+                for (auto run = m.ensured.begin(); run != m.ensured.end();) {
+                    if (run->first < to && from < run->second) {
+                        run = m.ensured.erase(run);
+                        ensured_changed = true;
+                    } else {
+                        ++run;
+                    }
+                }
+        }
+        if (ensured_changed) {
+            std::unique_lock rc_lock(m.resolve_cache.mutex);
+            m.resolve_cache.ensured = m.ensured;
         }
         m.tracking->collect(m.written);  // re-watched before the copies below
         for (const std::uint64_t page : m.written)
@@ -5335,12 +5435,17 @@ struct DeviceState {
         // The changes noted since (a buffer released, a texture come): the slots of heaps read in place they touch are
         // filtered again into their homes now, before the pages written since are.
         for (ConsoleHeap* heap : m.in_place) apply_in_place_changes(*heap);
+        m.in_place_pending.store(false, std::memory_order_release);
         m.uploads += m.mirror->upload();
-        m.mirror->retire(context->completed_retire_ticket());
+        if (m.mirror->last_upload_bytes() != 0 || !m.fed_now.empty())
+            leonida::submit_phases::note_change(leonida::submit_phases::change_pages);
+        if (m.mirror->has_retired_homes()) m.mirror->retire(context->completed_retire_ticket());
         ++m.refreshes;
         const auto now = std::chrono::steady_clock::now();
         m.ms += std::chrono::duration<double, std::milli>(now - start).count();
         if (now - m.since >= std::chrono::seconds(10)) {
+            m.refreshes += m.fast_refreshes.exchange(0, std::memory_order_relaxed);
+            m.resolved += m.resolved_fast.exchange(0, std::memory_order_relaxed);
             const auto c = m.mirror->counters();
             const auto policy = m.tracking->stats();
             const std::uint64_t presents =
@@ -5398,6 +5503,9 @@ struct DeviceState {
             m.written_back = m.buffers = 0;
             m.ms = 0;
             m.since = now;
+            m.since_ns_atomic.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count(),
+                std::memory_order_release);
         }
     }
 
@@ -6661,28 +6769,41 @@ struct DeviceState {
         // Every change since the last submission, for every heap; one made from now on (by another thread, or by a
         // fix below making a window) is applied at the next submission.
         std::vector<leonida::SlotChange> changes;
-        // A heap read in place reads the list in the mirror's refresh (apply_in_place_changes, under the mirror's lock):
-        // the list is taken under that lock too, so the entries it has not read yet are kept for it.
-        std::unique_lock mirror(page_mirror.mutex, std::defer_lock);
-        if (in_place_heaps.load(std::memory_order_acquire)) leonida::submit_phases::lock_timed(mirror);
-        {
-            std::lock_guard taken(slot_change_mutex);
-            changes.swap(slot_changes);
-            slot_change_count.store(0, std::memory_order_release);
+        const bool have_slot_changes = slot_change_count.load(std::memory_order_acquire) != 0;
+        const std::uint64_t freed_gen = geometry.free_generation();
+        if (have_slot_changes || freed_gen != geometry_room_seen) {
+            // A heap read in place reads the list in the mirror's refresh (apply_in_place_changes, under the mirror's
+            // lock): the list is taken under that lock too, so the entries it has not read yet are kept for it.
+            // Always swap slot_changes whenever entering this block so heap->changes_seen = 0 stays consistent with
+            // slot_changes and never skips a trailing geometry_room change.
+            std::unique_lock mirror(page_mirror.mutex, std::defer_lock);
+            if (in_place_heaps.load(std::memory_order_acquire)) leonida::submit_phases::lock_timed(mirror);
+            {
+                std::lock_guard taken(slot_change_mutex);
+                changes.swap(slot_changes);
+                slot_change_count.store(0, std::memory_order_release);
+            }
+            // Geometry copies freed since (GeometryViews::reap): the V# halves refused a copy for lack of room ask
+            // again.
+            if (freed_gen != geometry_room_seen) {
+                geometry_room_seen = freed_gen;
+                changes.push_back({leonida::SlotChange::geometry_room, 0, 1});
+            }
+            bool pushed_in_place = false;
+            for (const auto& heap : console_heaps) {
+                if (heap->in_place && mirror.owns_lock()) {
+                    const std::size_t from = std::min(heap->changes_seen, changes.size());
+                    if (from < changes.size()) {
+                        heap->pending_changes.insert(heap->pending_changes.end(),
+                                                     changes.begin() + std::ptrdiff_t(from), changes.end());
+                        pushed_in_place = true;
+                    }
+                }
+                heap->changes_seen = 0;  // of the list noted from now on
+            }
+            if (pushed_in_place) page_mirror.in_place_pending.store(true, std::memory_order_release);
+            if (mirror.owns_lock()) mirror.unlock();
         }
-        // Geometry copies freed since (GeometryViews::reap): the V# halves refused a copy for lack of room ask again.
-        if (const std::uint64_t freed = geometry.free_generation(); freed != geometry_room_seen) {
-            geometry_room_seen = freed;
-            changes.push_back({leonida::SlotChange::geometry_room, 0, 1});
-        }
-        for (const auto& heap : console_heaps) {
-            if (heap->in_place && mirror.owns_lock())
-                heap->pending_changes.insert(heap->pending_changes.end(),
-                                             changes.begin() + std::ptrdiff_t(std::min(heap->changes_seen, changes.size())),
-                                             changes.end());
-            heap->changes_seen = 0;  // of the list noted from now on
-        }
-        if (mirror.owns_lock()) mirror.unlock();
         for (const auto& heap : console_heaps) {
             const auto start = std::chrono::steady_clock::now();
             const std::uint64_t copied_before = heap->copied, retried_before = heap->retried;
@@ -15847,24 +15968,14 @@ bool DeviceState::page_mirror_texture_chunk(std::uint64_t cpu, std::uint64_t gpu
                                             VkSemaphore& timeline, std::uint64_t& value) {
     if (!page_mirror.mirror || !bytes) return false;
     // Lock order: title_texture_mutex -> page_mirror.mutex (acyclic: nothing under page_mirror.mutex ever takes
-    // title_texture_mutex). Called AFTER watch.examine() has re-armed the texture's tiles:
-    //   - If xmem fed any physical-page remap between refresh_page_mirror() (T0) and now (T2), drain and flush the
-    //     mirror first so sparse chunk bindings and `page_mirror.value` include the remap.
-    //   - For any page of the texture where !tracking->unwritten(p) (a T1 CPU write, hot page, or write-watched page),
-    //     sync that page into its TitleMirror home now so GPU detile/copy never sees stale pre-T1 bytes.
-    bool feed_pending = false;
-    {
-        AcquireSRWLockShared(&page_mirror.feed_lock);
-        feed_pending = !page_mirror.feed.empty();
-        ReleaseSRWLockShared(&page_mirror.feed_lock);
-    }
-    if (feed_pending) {
-        refresh_page_mirror();
-        flush_page_mirror();
-    }
+    // title_texture_mutex). Called AFTER watch.examine() has re-armed the texture's tiles and AFTER
+    // refresh_title_textures() drained any pre-pass xmem feed. Never call refresh_page_mirror()/flush_page_mirror()
+    // mid-batch (that could unbind pages already queued for earlier textures in the same batch): if a new remap
+    // landed mid-batch, return false so this texture safely uses the CPU path.
     std::lock_guard lock(page_mirror.mutex);
+    if (page_mirror.feed_pending.load(std::memory_order_acquire)) return false;
     constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
-    const auto check_va = [&](std::uint64_t va) -> bool {
+    const auto check_va = [&](std::uint64_t va, bool is_cpu_view) -> bool {
         if (!va || va + bytes < va) return false;
         VkBuffer buf = VK_NULL_HANDLE;
         VkDeviceSize off = 0;
@@ -15877,7 +15988,11 @@ bool DeviceState::page_mirror_texture_chunk(std::uint64_t cpu, std::uint64_t gpu
         }
         bool need_upload = false;
         for (std::uint64_t p = va & ~(kPage - 1); p < end; p += kPage) {
-            if (!page_mirror.tracking || !page_mirror.tracking->unwritten(p)) {
+            // For the CPU view, cold pages untouched since T0 have tracking->unwritten(p) == true (zero extra copy).
+            // For a dual-view GPU address (va != cpu), shadow_write_fault bumps the CPU view's cell, so always sync
+            // into the mirror home (unless the corresponding CPU page is provably unwritten).
+            const bool clean_cpu = is_cpu_view && page_mirror.tracking && page_mirror.tracking->unwritten(p);
+            if (!clean_cpu) {
                 if (page_mirror.mirror->dirty(p)) {
                     need_upload = true;
                     if (page_mirror.readback_in_flight)
@@ -15894,8 +16009,8 @@ bool DeviceState::page_mirror_texture_chunk(std::uint64_t cpu, std::uint64_t gpu
         value = page_mirror.value;
         return true;
     };
-    if (check_va(cpu)) return true;
-    if (gpu && gpu != cpu && check_va(gpu)) return true;
+    if (check_va(cpu, true)) return true;
+    if (gpu && gpu != cpu && check_va(gpu, false)) return true;
     return false;
 }
 
@@ -16786,7 +16901,13 @@ public:
                 fault->set_lost_hook([this] { rt::compute_probe::recheck(state_); });
         }
         state_.setup_console_heap_gpu(get_device);  // LEONIDA_CONSOLE_HEAP_GPU: the context's prelude
-        state_.context->set_after_execute([this] { state_.geometry_execute_end(); });
+        state_.context->set_on_enqueue_execute([this] {
+            return state_.geometry.cap() ? state_.geometry.execute_enqueue() : 0;
+        });
+        state_.context->set_on_finish_execute([this](std::uint64_t serial) {
+            if (serial && state_.geometry.cap())
+                state_.geometry.execute_end(serial, [this] { return state_.context->submitted_retire_ticket(); });
+        });
         state_.context->set_before_execute([this] {
             namespace phases = leonida::submit_phases;
             // LEONIDA_REFRESH_PER_FRAME (for runs that only need the title to go on): 1 = the slot-133 shadows, title
@@ -16799,7 +16920,6 @@ public:
                 const char* v = std::getenv("LEONIDA_REFRESH_PER_FRAME");
                 return v && *v ? std::atoi(v) : 0;
             }();
-            state_.geometry_execute_begin();
             {
                 const phases::Scope timed(phases::shadows);
                 // First, while pending_ sparse binds are empty and before any map()/upload() mutates homes or agreed
@@ -18176,7 +18296,8 @@ public:
                 leonida::title_memory_map::generation() ==
                     title_map_generation_atomic_.load(std::memory_order_acquire) &&
                 !state_.titles_named_pending.load(std::memory_order_acquire) &&
-                !state_.titles_gone_pending.load(std::memory_order_acquire)) {
+                !state_.titles_gone_pending.load(std::memory_order_acquire) &&
+                title_refresh_in_flight_.load(std::memory_order_seq_cst) == 0) {
                 title_fast_passes_.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
@@ -18184,6 +18305,11 @@ public:
         // Waits for a slot-70 view that is filling a texture: skipping would leave this submission a write behind.
         // No deadlock: before_execute holds no lock, and the registry's holders never wait for this thread.
         std::unique_lock lock(state_.title_texture_mutex);
+        title_refresh_in_flight_.fetch_add(1, std::memory_order_seq_cst);
+        struct TitleRefreshGuard {
+            std::atomic<std::uint32_t>& n;
+            ~TitleRefreshGuard() { n.fetch_sub(1, std::memory_order_release); }
+        } in_flight{title_refresh_in_flight_};
         std::optional<InTitleTextures> inside(std::in_place);
         TitleTextureStats& stats = title_stats_;
         auto& watch = state_.texture_watch;
@@ -18235,7 +18361,7 @@ public:
             {
                 std::lock_guard named_lock(state_.titles_named_mutex);
                 named.swap(state_.titles_named);
-                state_.titles_named_pending.store(false, std::memory_order_relaxed);
+                state_.titles_named_pending.store(false, std::memory_order_release);
             }
             for (const std::uint64_t address : named) {
                 const auto it = state_.title_textures.find(address);
@@ -18346,7 +18472,6 @@ public:
                     item.id = job.resource->id();
                     item.image = job.resource->title_binding();
                     item.layout = &t.layout;
-                    item.unsafe_undefined = !t.owned && !t.fills;
                     item.mirror_buffer = job.mirror_buffer;
                     item.mirror_offset = job.mirror_offset;
                     item.mirror_chunk_size = job.mirror_chunk_size;
@@ -18385,7 +18510,6 @@ public:
                 item.id = job.resource->id();
                 item.image = job.resource->title_binding();
                 item.layout = &t.layout;
-                item.unsafe_undefined = !t.owned && !t.fills;
                 item.slot = job.slot;
                 title_batch_items_.push_back(item);
                 title_batch_job_indices_.push_back(i);
@@ -18449,6 +18573,14 @@ public:
             batch_bytes = 0;
         };
         const bool gpu_detile_on = leonida::title_gpu_detile_enabled();
+        // Drain any xmem physical-page remap that landed between refresh_page_mirror() (T0) and watch.collect() (T2)
+        // ONCE before starting the batch loop (never mid-batch, which could unbind pages already queued for earlier
+        // textures in the same batch).
+        if (gpu_detile_on && !title_named_.empty() &&
+            state_.page_mirror.feed_pending.load(std::memory_order_acquire)) {
+            state_.refresh_page_mirror();
+            state_.flush_page_mirror();
+        }
         for (const std::uint64_t key : title_named_) {
             const auto it = state_.title_textures.find(key);
             if (it == state_.title_textures.end() || !it->second->resource) continue;
@@ -18505,7 +18637,8 @@ public:
                             job.compare = true;
                             job.written = title_written_;
                         }
-                        if (title_jobs_.size() >= kTitleBatch) run_batch();
+                        if (kind == rt::d3d12::TitleImageUpload::UploadKind::mirror_detile) batch_bytes += job.span;
+                        if (title_jobs_.size() >= kTitleBatch || batch_bytes >= kTitleBatchBytes) run_batch();
                         continue;
                     }
                 }
@@ -18586,7 +18719,7 @@ public:
                          static_cast<unsigned long long>(stats.busy),
                          static_cast<unsigned long long>(w.unarmed_named - l.unarmed_named),
                          static_cast<unsigned long long>(stats.changed), double(stats.filled_bytes) / 1048576.0,
-                         static_cast<unsigned long long>(stats.staged_fills),
+                         static_cast<unsigned long long>(stats.staged_fills - stats.staged_fills_logged),
                          static_cast<unsigned long long>(stats.gpu_linear_fills),
                          static_cast<unsigned long long>(stats.gpu_detile_fills),
                          static_cast<unsigned long long>(stats.unchanged),
@@ -18612,6 +18745,7 @@ public:
             if (leonida::fsdraw::enabled()) log_title_census("refresh");
             stats.passes = stats.fast_passes = stats.checked = stats.busy = stats.changed = stats.unchanged =
                 stats.filled_bytes = 0;
+            stats.staged_fills_logged = stats.staged_fills;
             stats.gpu_linear_fills = stats.gpu_detile_fills = 0;
             std::fprintf(stderr,
                          "[rt] d3d12: title textures read whole, by why: %llu never filled, %llu with no part hashes, "
@@ -18659,7 +18793,7 @@ private:
         // them (examine, readability, slot reservation), the read threads' work (and of it the detile, summed over the
         // threads), and the transfers' recording and submission (staged_ns); bytes read whole.
         std::uint64_t collect_ns = 0, examine_ns = 0, read_ns = 0, detile_ns = 0, read_bytes = 0;
-        std::uint64_t staged_fills = 0, staged_ns = 0;
+        std::uint64_t staged_fills = 0, staged_fills_logged = 0, staged_ns = 0;
         std::uint64_t gpu_linear_fills = 0, gpu_detile_fills = 0, fast_passes = 0;
         // refresh_title_textures, since the last log line
         std::uint64_t passes = 0, checked = 0, hashed = 0, changed = 0, deferred = 0, filled_bytes = 0,
@@ -18713,6 +18847,7 @@ private:
     std::atomic<std::int64_t> retired_earliest_ns_{0};
     std::atomic<std::int64_t> title_last_log_ns_{0};
     std::atomic<std::uint64_t> title_fast_passes_{0};
+    std::atomic<std::uint32_t> title_refresh_in_flight_{0};
     struct TitleChunk {
         std::size_t job, first, end;  // tiles [first, end) of title_jobs_[job]
     };
