@@ -544,7 +544,7 @@ class Gen:
         self.wave64 = False        # compiled for 64-lane waves (64-bit EXEC writes, exec_hi, v_mbcnt_hi, ...)
         self.cur_uniform_readlane = False
         self.w64g = None           # wave64 VS/PS/GS: wave64_halves.analyse() result (tier, reasons, rewrite sites)
-        self.w64_scalar_spills = set()  # (vgpr, lane) pure scalar spill slots lowered to self.parked (SHADER-10)
+        self.scalar_spills = set() # (vgpr, lane) pure scalar spill slots lowered to self.parked (all waves/stages)
         self.emulate = False       # --wave64-emulate: exact wave64 on any subgroup size (cs/ms; see x_round)
         self.emulate_inline = False  # emulate: current block emits direct inline barriers (no x_split)
         self.emulate_plan = None   # emulate: structured plan from wave64_emulate_opt.plan_structured_emulation
@@ -6487,8 +6487,10 @@ class Gen:
         # lane_masks merges a mask on one path with plain data on another by dropping the register,
         # so "not in cur_masks" does not prove it is data on every path. Keep a conservative set.
         self.ever_mask = {r for m in self.lane_masks.values() for r in m if isinstance(r, int)}
-        slots = lane_masks.parked(blocks[0], self.lane_masks)
-        self.parked = {slot: self.SGPRS + i for i, slot in enumerate(slots)}
+        slots = lane_masks.parked(blocks[0], self.lane_masks, wave64=self.wave64)
+        self.scalar_spills = set(lane_masks.scalar_spills(blocks[0], blocks[1], wave64=self.wave64))
+        all_slots = sorted(set(slots) | self.scalar_spills)
+        self.parked = {slot: self.SGPRS + i for i, slot in enumerate(all_slots)}
 
     def mask_half(self, a):
         """For a 32-bit lane-mask operand in wave64, return 'lo' (lanes 0-31), 'hi' (lanes 32-63), or None."""
@@ -9139,17 +9141,17 @@ class Gen:
                 # shuffle would index a lane the 32-lane subgroup of a VS/PS/GS may not have (lane >= 32).
                 self.dst(a[0], self.src_u(a[1]))
                 return
-            slot = lane_masks.lane_slot(a[1], a[2])
+            slot = lane_masks.lane_slot(a[1], a[2], self.wave64)
+            if slot and slot[1:] in self.scalar_spills:
+                # Pure scalar-spill VGPR (never used as a vector operand): reload from the parked scalar slot
+                # instead of shuffling from a lane that may be inactive (small fragment waves, discards, or
+                # wave64 lanes >= 32 on 32-wide subgroups).
+                self.dst(a[0], self.load_reg("sgpr", self.parked[slot[1:]]))
+                return
             if slot in self.cur_masks:
                 # A lane mask parked there by v_writelane (a saved EXEC, when the shader ran out of SGPRs): this
                 # lane's bit comes back, from the slot the write kept it in. The shuffle would hand every lane
                 # the bit of the one lane the mask was parked in.
-                self.dst(a[0], self.load_reg("sgpr", self.parked[slot[1:]]))
-                return
-            if slot and slot[1:] in self.w64_scalar_spills:
-                # SHADER-10: wave64_halves proved this VGPR is pure scalar-spill storage (never read as a vector
-                # operand), so spills across all 64 lanes (including 32..63) reload from the parked scalar slot
-                # instead of shuffling from an out-of-range lane on a 32-wide subgroup.
                 self.dst(a[0], self.load_reg("sgpr", self.parked[slot[1:]]))
                 return
             self.uses_subgroup = True
@@ -9162,8 +9164,8 @@ class Gen:
             self.dst(a[0], r)
         elif op == "v_writelane_b32":
             # vD[lane] = sS: only the named lane changes (independent of EXEC, as on hardware).
-            slot = lane_masks.lane_slot(a[0], a[2])
-            if slot and slot[1:] in self.w64_scalar_spills:
+            slot = lane_masks.lane_slot(a[0], a[2], self.wave64)
+            if slot and slot[1:] in self.scalar_spills:
                 self.store_reg("sgpr", self.parked[slot[1:]], self.src_u(a[1]))
                 return
             self.uses_subgroup = True
@@ -17554,7 +17556,7 @@ def halves_analysis(g, blocks, succ):
     for slot in g.w64g.get("scalar_spills", ()):
         if slot not in g.parked:
             g.parked[slot] = g.SGPRS + len(g.parked)
-        g.w64_scalar_spills.add(slot)
+        g.scalar_spills.add(slot)
     W64G_COUNTS[g.w64g["tier"]] += 1
     if g.w64g["tier"] == "C" and WAVE64_GRAPHICS == "error":
         raise Unsupported("wave64 graphics tier C: " + ", ".join(g.w64g["reasons"]))
