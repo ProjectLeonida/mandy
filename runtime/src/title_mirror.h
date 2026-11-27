@@ -32,6 +32,7 @@
 #include <map>
 #include <memory>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace leonida {
@@ -223,13 +224,33 @@ public:
         return n;
     }
 
+    // The mirrored pages of [begin, end) that have a home, in address order: what write_back reads. The caller copies
+    // their homes out with the GPU: a home in device-local memory is not read by the CPU (an uncached read over the bus
+    // costs about 1.7 us per 8 bytes: 14.5 s for the 64 MiB one submission's write-back may cover).
+    // Filtered homes are left out (write_back never reads them).
+    void homes_in(std::uint64_t begin, std::uint64_t end, std::vector<std::uint64_t>& out) const {
+        for (std::uint64_t page = begin & ~(kPage - 1); page < end; page += kPage) {
+            const auto mapped = pages_.find(page);
+            if (mapped == pages_.end()) continue;
+            const auto home = homes_.find(mapped->second);
+            if (home != homes_.end() && !home->second.filter_va) out.push_back(page);
+        }
+    }
+
     // What the GPU wrote into the homes of the mirrored pages of [begin, end) goes to the title's pages, merged at the
     // 256-byte piece against the sums both sides last agreed on: a piece only the GPU changed is written back with
     // `write(va, bytes, n)` (and agreed on again); a piece only the title changed waits for the upload; a piece both
-    // changed keeps the title's bytes and is counted. Call it once the submissions that could write the range have
-    // completed. Returns the bytes written back.
+    // changed keeps the title's bytes and is counted. staged(page) gives the page's home as the GPU left it (a copy the
+    // caller made once the submissions that could write it completed, with nothing filled since), or nullptr to skip
+    // the page. Returns the bytes written back.
+    // The same, reading each home where it lies (host memory: the tests' homes; the device copies its homes out first).
     template <class Write>
     std::uint64_t write_back(std::uint64_t begin, std::uint64_t end, Write&& write) {
+        return write_back(begin, end, [this](std::uint64_t page) -> const std::uint8_t* { return home_bytes(page); },
+                          std::forward<Write>(write));
+    }
+    template <class Staged, class Write>
+    std::uint64_t write_back(std::uint64_t begin, std::uint64_t end, Staged&& staged, Write&& write) {
         std::uint64_t written = 0;
         alignas(64) std::uint8_t title[kPiece];
         for (std::uint64_t page = begin & ~(kPage - 1); page < end; page += kPage) {
@@ -240,7 +261,8 @@ public:
             Home& home = found->second;
             // A filtered home holds the filter's bytes, not the title's: nothing of it is ever written back.
             if (home.filter_va) continue;
-            const std::uint8_t* gpu = units_[home.unit].host + std::size_t(home.slot) * kPage;
+            const std::uint8_t* gpu = staged(page);
+            if (!gpu) continue;
             const std::size_t k0 = std::size_t((std::max(begin, page) - page) / kPiece);
             const std::size_t k1 = std::size_t((std::min(end, page + kPage) - page + kPiece - 1) / kPiece);
             for (std::size_t k = k0; k < k1; ++k) {
