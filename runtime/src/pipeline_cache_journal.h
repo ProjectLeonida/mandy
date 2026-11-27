@@ -17,6 +17,12 @@
 // The hash only picks the file. Whether the pipeline in it may be used is the driver's decision: it checks the blob
 // header (vendor, device, pipeline-cache UUID; checked here first too, so a driver update starts over) and its own key.
 //
+// Each file starts with a stamp naming the binary that wrote it (stamp_bytes: magic, size, a hash of the executable),
+// then the blob. The driver's own key can hold more than the header shows: on NVIDIA 621.40 files were found to give
+// hits only to the gta6rt build that wrote them. So gta6rt --precompile-pipelines counts a file as done only when this
+// binary wrote it (entry_current); a file from another build is built against again, which takes milliseconds when the
+// driver still takes it. Files without a stamp (older runtimes) are read like files from another build.
+//
 // Upkeep (tidy, at the first pipeline of a device): staging files a killed writer left behind are removed once they are
 // ten minutes old, and past LEONIDA_PIPELINE_JOURNAL_BYTES the least recently used files go until three quarters of
 // it is left. A file's modification time is its last use: written, or touched when a build found its pipeline there.
@@ -29,6 +35,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -48,6 +55,33 @@ inline constexpr std::uint32_t key_version = 1;
 
 // A file larger than this is not read (a corrupt or foreign file; one pipeline's cache is a few MiB at most).
 inline constexpr std::size_t entry_read_limit = std::size_t{256} << 20;
+
+// The stamp before the blob: "LPJ1", its own size, then the writing binary's build (little-endian, like the host).
+inline constexpr std::uint32_t stamp_magic = 0x314a504c;  // "LPJ1"
+inline constexpr std::size_t stamp_bytes = 16;
+
+struct Stamp {
+    bool present = false;
+    std::uint64_t build = 0;  // 0: the writer did not know its own build
+};
+
+inline Stamp read_stamp(const void* data, std::size_t size) {
+    Stamp stamp;
+    if (!data || size < stamp_bytes) return stamp;
+    const auto* p = static_cast<const std::uint8_t*>(data);
+    if (pipeline_cache_store::read_u32(p) != stamp_magic || pipeline_cache_store::read_u32(p + 4) != stamp_bytes)
+        return stamp;
+    stamp.present = true;
+    stamp.build = std::uint64_t(pipeline_cache_store::read_u32(p + 8)) |
+                  (std::uint64_t(pipeline_cache_store::read_u32(p + 12)) << 32);
+    return stamp;
+}
+
+inline void put_stamp(void* out, std::uint64_t build) {
+    auto* p = static_cast<std::uint8_t*>(out);
+    const std::uint64_t fields[2] = {std::uint64_t(stamp_magic) | (std::uint64_t(stamp_bytes) << 32), build};
+    for (int i = 0; i < 16; ++i) p[i] = static_cast<std::uint8_t>(fields[i / 8] >> (8 * (i % 8)));
+}
 
 // 64-bit FNV-1a. Not cryptographic: it names a file, and a collision costs one compile, not a wrong pipeline.
 class Hasher {
@@ -80,6 +114,27 @@ public:
 private:
     std::uint64_t hash_ = 0xcbf29ce484222325ull;
 };
+
+// A binary's build, for the stamp: a hash of the file's contents (0 when it cannot be read). Any rebuild of the
+// executable is another build, whatever its name or folder; a copy of it is the same one.
+inline std::uint64_t file_build(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return 0;
+    Hasher hash;
+    hash.text("binary");
+    std::vector<char> chunk(std::size_t{1} << 20);
+    std::uint64_t total = 0;
+    while (file) {
+        file.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+        const auto got = static_cast<std::size_t>(file.gcount());
+        if (!got) break;
+        hash.bytes(chunk.data(), got);
+        total += got;
+    }
+    if (file.bad() || !total) return 0;
+    hash.value(total);
+    return hash.digest() ? hash.digest() : 1;  // 0 means unknown
+}
 
 // <dir>/<kind>-<key as 16 lowercase hex digits>.bin
 inline std::filesystem::path entry_path(const std::filesystem::path& dir, const char* kind, std::uint64_t key) {
@@ -125,10 +180,16 @@ inline Roots resolve_roots(const std::filesystem::path& local, const std::filesy
 
 // The selected compatible bytes plus metadata for the *writable* leaf as the build found it.
 struct EntryFile {
-    std::vector<char> data;   // compatible local bytes, else compatible seed bytes; empty when neither is usable
+    std::vector<char> data;   // compatible local bytes, else compatible seed bytes, stamp removed; empty when neither
     bool from_seed = false;   // an external hit must not refresh either the immutable seed or a stale local file
     std::uint64_t bytes = 0;  // its size on disk, whatever its contents (0: none): what a rewrite replaces
     std::filesystem::file_time_type used{};  // its modification time: its last use
+    Stamp stamp;              // of the file `data` came from
+
+    // `data` came from a file another binary than `build` wrote (or one without a stamp).
+    bool other_build(std::uint64_t build) const {
+        return !data.empty() && !(stamp.present && stamp.build && stamp.build == build);
+    }
 };
 
 inline EntryFile read_entry_file(const std::filesystem::path& path, const cached_pso::Identity& identity,
@@ -143,30 +204,65 @@ inline EntryFile read_entry_file(const std::filesystem::path& path, const cached
     std::ifstream file(path, std::ios::binary);
     if (!file) return entry;
     entry.data.resize(static_cast<std::size_t>(size));
-    if (!file.read(entry.data.data(), static_cast<std::streamsize>(entry.data.size())) ||
-        !pipeline_cache_store::header_matches(entry.data.data(), entry.data.size(), identity))
+    if (!file.read(entry.data.data(), static_cast<std::streamsize>(entry.data.size()))) {
         entry.data.clear();
+        return entry;
+    }
+    entry.stamp = read_stamp(entry.data.data(), entry.data.size());
+    if (entry.stamp.present) entry.data.erase(entry.data.begin(), entry.data.begin() + stamp_bytes);
+    if (!pipeline_cache_store::header_matches(entry.data.data(), entry.data.size(), identity)) {
+        entry.data.clear();
+        entry.stamp = {};
+    }
     return entry;
 }
 
-// The file's bytes, or empty when it is missing, unreadable, over `limit`, or its header does not name `identity`.
+// The file's blob (its stamp removed), or empty when it is missing, unreadable, over `limit`, or its header does not
+// name `identity`.
 inline std::vector<char> read_entry(const std::filesystem::path& path, const cached_pso::Identity& identity,
                                     std::size_t limit = entry_read_limit) {
     return read_entry_file(path, identity, limit).data;
 }
 
-// Whether the file is there with a header naming this device and driver: only the header is read (gta6rt
-// --precompile-pipelines asks this of thousands of files of a few MiB).
-inline bool entry_usable(const std::filesystem::path& path, const cached_pso::Identity& identity,
-                         std::size_t limit = entry_read_limit) {
+// What a file's first bytes say: whether its blob header names this device and driver, and its stamp.
+struct EntryCheck {
+    bool usable = false;
+    Stamp stamp;
+};
+
+// Only the stamp and the blob header are read (gta6rt --precompile-pipelines asks this of thousands of files of a few
+// MiB).
+inline EntryCheck check_entry(const std::filesystem::path& path, const cached_pso::Identity& identity,
+                              std::size_t limit = entry_read_limit) {
+    EntryCheck check;
     // A helper-ready file must also fit the consumer's bounded read. Check metadata, not the full payload.
     std::error_code ec;
     const auto size = std::filesystem::file_size(path, ec);
-    if (ec || size < pipeline_cache_store::header_bytes || size > limit) return false;
+    if (ec || size < pipeline_cache_store::header_bytes || size > limit) return check;
     std::ifstream file(path, std::ios::binary);
-    char header[pipeline_cache_store::header_bytes];
-    return file && file.read(header, sizeof(header)) &&
-           pipeline_cache_store::header_matches(header, sizeof(header), identity);
+    char head[stamp_bytes + pipeline_cache_store::header_bytes];
+    const std::size_t want = (std::min)(sizeof(head), static_cast<std::size_t>(size));
+    if (!file || !file.read(head, static_cast<std::streamsize>(want))) return check;
+    const Stamp stamp = read_stamp(head, want);
+    const std::size_t at = stamp.present ? stamp_bytes : 0;
+    if (!pipeline_cache_store::header_matches(head + at, want - at, identity)) return check;
+    check.usable = true;
+    check.stamp = stamp;
+    return check;
+}
+
+// Whether the file is there with a header naming this device and driver, whichever binary wrote it.
+inline bool entry_usable(const std::filesystem::path& path, const cached_pso::Identity& identity,
+                         std::size_t limit = entry_read_limit) {
+    return check_entry(path, identity, limit).usable;
+}
+
+// Whether the file is usable and this binary (`build`, nonzero) wrote it: what gta6rt --precompile-pipelines leaves
+// alone. A file from another build may still give the driver a hit, or may not; only building against it tells.
+inline bool entry_current(const std::filesystem::path& path, const cached_pso::Identity& identity, std::uint64_t build,
+                          std::size_t limit = entry_read_limit) {
+    const EntryCheck check = check_entry(path, identity, limit);
+    return check.usable && check.stamp.present && build && check.stamp.build == build;
 }
 
 enum class ReadRole { runtime, materialize_local };
@@ -178,7 +274,9 @@ inline EntryFile read_with_seed(const std::filesystem::path& local_entry, const 
     auto local = read_entry_file(local_entry, identity, limit);
     // Build hosts promise a file in the writable journal. External data must not satisfy such a request.
     if (role == ReadRole::runtime && local.data.empty() && !seed.empty()) {
-        local.data = read_entry_file(seed / local_entry.filename(), identity, limit).data;
+        auto external = read_entry_file(seed / local_entry.filename(), identity, limit);
+        local.data = std::move(external.data);
+        local.stamp = external.stamp;
         local.from_seed = !local.data.empty();
     }
     return local;
@@ -351,6 +449,14 @@ inline std::error_code write_entry(const std::filesystem::path& path, const void
     std::filesystem::create_directories(path.parent_path(), ec);
     if (ec) return ec;
     return write_pipeline_cache_file(path, static_cast<const char*>(data), size);
+}
+
+// A journal file's bytes: the stamp for `build`, then the pipeline cache blob.
+inline std::vector<char> stamped(std::uint64_t build, const void* blob, std::size_t size) {
+    std::vector<char> out(stamp_bytes + size);
+    put_stamp(out.data(), build);
+    if (size) std::memcpy(out.data() + stamp_bytes, blob, size);
+    return out;
 }
 
 }  // namespace leonida::pipeline_journal

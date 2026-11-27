@@ -227,6 +227,94 @@ static int test_entry_file(const fs::path& dir) {
     return 0;
 }
 
+// The build stamp before the blob: read and stripped, files without one read as before, and only a file this build
+// wrote is current (what gta6rt --precompile-pipelines leaves alone).
+static int test_stamp(const fs::path& dir) {
+    const auto id = identity();
+    constexpr std::uint64_t ours = 0x0123456789abcdefull, theirs = 0xfedcba9876543210ull;
+
+    // Round trip; the stamp is its own size and does not look like a blob header.
+    std::uint8_t raw[journal::stamp_bytes];
+    journal::put_stamp(raw, ours);
+    auto stamp = journal::read_stamp(raw, sizeof(raw));
+    CHECK(stamp.present && stamp.build == ours);
+    CHECK(std::memcmp(raw, "LPJ1", 4) == 0);
+    CHECK(!journal::read_stamp(raw, sizeof(raw) - 1).present);
+    CHECK(!store::header_matches(raw, sizeof(raw), id));
+    const auto bare = blob(id, 64);
+    CHECK(!journal::read_stamp(bare.data(), bare.size()).present);  // a blob alone: no stamp
+
+    // A stamped file: read_entry gives the blob alone, with the stamp beside it.
+    const auto path = journal::entry_path(dir / "stamp", "cs", 5);
+    const auto file = journal::stamped(ours, bare.data(), bare.size());
+    CHECK(file.size() == journal::stamp_bytes + bare.size());
+    CHECK(!journal::write_entry(path, file.data(), file.size()));
+    auto entry = journal::read_entry_file(path, id);
+    CHECK(entry.data == bare && entry.bytes == file.size() && entry.stamp.present && entry.stamp.build == ours);
+    CHECK(journal::read_entry(path, id) == bare);
+    CHECK(!entry.other_build(ours) && entry.other_build(theirs) && entry.other_build(0));
+    CHECK(journal::entry_usable(path, id));
+    CHECK(journal::entry_current(path, id, ours));
+    CHECK(!journal::entry_current(path, id, theirs));  // another build wrote it: built against again
+    CHECK(!journal::entry_current(path, id, 0));        // a build that does not know itself never skips
+    auto other = id;
+    other.cache_uuid[0] ^= 1;
+    CHECK(!journal::entry_usable(path, other) && !journal::entry_current(path, other, ours));
+    entry = journal::read_entry_file(path, other);
+    CHECK(entry.data.empty() && !entry.stamp.present && !entry.other_build(theirs));
+    // The read limit counts the stamp: it is what is on disk.
+    CHECK(journal::read_entry(path, id, file.size() - 1).empty() && !journal::entry_usable(path, id, file.size() - 1));
+    CHECK(journal::entry_current(path, id, ours, file.size()));
+
+    // A stamp for build 0 (a writer that could not read itself) is never current.
+    const auto zero = journal::stamped(0, bare.data(), bare.size());
+    CHECK(!journal::write_entry(path, zero.data(), zero.size()));
+    CHECK(journal::entry_usable(path, id) && !journal::entry_current(path, id, 0));
+    CHECK(journal::read_entry_file(path, id).other_build(0));
+
+    // A file an older runtime wrote (no stamp): still usable, read as from another build, never current.
+    CHECK(!journal::write_entry(path, bare.data(), bare.size()));
+    entry = journal::read_entry_file(path, id);
+    CHECK(entry.data == bare && !entry.stamp.present && entry.other_build(ours));
+    CHECK(journal::entry_usable(path, id) && !journal::entry_current(path, id, ours));
+
+    // A stamp then less than a header, or a stamp then a foreign blob: not usable.
+    CHECK(!journal::write_entry(path, file.data(), journal::stamp_bytes + 8));
+    CHECK(journal::read_entry(path, id).empty() && !journal::entry_usable(path, id));
+    const auto foreign = blob(other, 64);
+    const auto foreign_file = journal::stamped(ours, foreign.data(), foreign.size());
+    CHECK(!journal::write_entry(path, foreign_file.data(), foreign_file.size()));
+    CHECK(journal::read_entry(path, id).empty() && !journal::entry_usable(path, id));
+    CHECK(journal::read_entry(path, other) == foreign && journal::entry_current(path, other, ours));
+
+    // A seed file's stamp comes with its data.
+    const auto local = dir / "stamp-local" / "pipeline_cache.d", seed = dir / "stamp-seed";
+    const auto seed_file = journal::stamped(theirs, bare.data(), bare.size());
+    CHECK(!journal::write_entry(journal::entry_path(seed, "cs", 6), seed_file.data(), seed_file.size()));
+    const auto roots = journal::resolve_roots(local, seed);
+    entry = journal::read_with_seed(journal::entry_path(local, "cs", 6), roots.seed, id, journal::ReadRole::runtime);
+    CHECK(entry.from_seed && entry.data == bare && entry.stamp.present && entry.stamp.build == theirs);
+    CHECK(entry.other_build(ours) && !entry.other_build(theirs));
+
+    // A binary's build: its contents, not its name or folder.
+    const auto a = dir / "bin" / "gta6rt.exe", copy = dir / "bin2" / "renamed.exe", rebuilt = dir / "bin" / "b.exe";
+    std::vector<char> exe(3u << 20);  // more than one read chunk
+    for (std::size_t i = 0; i < exe.size(); ++i) exe[i] = static_cast<char>(i * 2654435761u >> 13);
+    CHECK(!journal::write_entry(a, exe.data(), exe.size()));
+    CHECK(!journal::write_entry(copy, exe.data(), exe.size()));
+    exe[exe.size() / 2] ^= 1;  // a one-byte change
+    CHECK(!journal::write_entry(rebuilt, exe.data(), exe.size()));
+    const auto build_a = journal::file_build(a);
+    CHECK(build_a != 0 && build_a == journal::file_build(a) && build_a == journal::file_build(copy));
+    CHECK(journal::file_build(rebuilt) != 0 && journal::file_build(rebuilt) != build_a);
+    CHECK(!journal::write_entry(rebuilt, exe.data(), exe.size() - 1));  // the same bytes, one fewer
+    CHECK(journal::file_build(rebuilt) != build_a);
+    CHECK(journal::file_build(dir / "bin" / "missing.exe") == 0);
+    CHECK(!journal::write_entry(rebuilt, exe.data(), 0));
+    CHECK(journal::file_build(rebuilt) == 0);  // empty: unknown
+    return 0;
+}
+
 static int test_overlay(const fs::path& dir) {
     using std::chrono::hours;
     const auto local = dir / "overlay" / "pipeline_cache.d", seed = dir / "seed";
@@ -329,6 +417,7 @@ int main() {
     if (!failed) failed = test_names();
     if (!failed) failed = test_tidy(dir);
     if (!failed) failed = test_entry_file(dir);
+    if (!failed) failed = test_stamp(dir);
     if (!failed) failed = test_overlay(dir);
     fs::remove_all(dir, ec);
     if (failed) return failed;

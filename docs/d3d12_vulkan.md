@@ -2719,7 +2719,9 @@ Pipeline creation:
   a device loss or a kill never reaches teardown, so neither file used to keep that boot's compute pipelines.
   Compute pipelines are therefore journaled one file each (`src/pipeline_cache_journal.h`):
   `pipeline_cache.d/cs-<hash>.bin` beside the session file, named by a hash of the SPIR-V words, the stage flags and
-  subgroup request, the push-constant range and the bindless layout. A build creates a `VkPipelineCache` from its
+  subgroup request, the push-constant range and the bindless layout. Each file is a 16-byte stamp (`LPJ1`, then a
+  hash of the gta6rt executable that wrote it) followed by the cache blob; files an older runtime wrote have no stamp
+  and are read as before. A build creates a `VkPipelineCache` from its
   file (if the header names this device and pipeline-cache UUID) and creates the pipeline against it; when the
   driver reports a compile (creation feedback without `APPLICATION_PIPELINE_CACHE_HIT`, or no file), that cache is
   written back to the file at once, through a staging file renamed over it. Without a file, and with
@@ -2754,7 +2756,13 @@ Pipeline creation:
   LEONIDA_SHADERS, LEONIDA_PIPELINE_CACHE_DIR, and LEONIDA_DEVICE_FAULT/LEONIDA_AFTERMATH, whose diagnostics config
   makes other pipelines) and builds every compute entry of the library through the dispatch path
   (`build_compute_pipeline`), largest first, on below-normal-priority threads. Entries with a usable journal file are
-  skipped (only their header is read), so it can be stopped and started again. Running as gta6rt.exe it also fills
+  skipped (only their stamp and header are read), so it can be stopped and started again. Only files this gta6rt
+  binary wrote count as done: on NVIDIA 621.40 a rebuilt runtime was measured getting few hits from another build's
+  files (#1608), so a file from another build, or one without a stamp, is built against again. A hit takes
+  milliseconds and the file is then stamped as this build's; a miss is compiled and the file rewritten. The run's last
+  lines say how many files came from another build and how many of them the driver still took, and the runtime's
+  journal lines count them too (`from another build: N, M of them found`). `LEONIDA_PIPELINE_JOURNAL_BUILD=<hex>`
+  stands in for the executable's hash (tests). Running as gta6rt.exe it also fills
   NVIDIA's disk cache, which that driver keys by the executable's name. Measured on an RTX 4070 Ti (driver 630.20),
   4 threads: modules of 3.6-5.8 MB took 46-145 s each, 12 in 312 s, about 3.5 GB of host memory each while in the
   driver (14.5 GB peak for four). Graphics pipelines are not covered: they are built at a title's draw from its PSO
