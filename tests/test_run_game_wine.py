@@ -29,8 +29,9 @@ REAL = ("bash", "dirname", "readlink", "mkdir", "rm", "cat", "env", "grep", "sor
 WINE_STUB = """#!/bin/sh
 if [ "$1" = wineboot ]; then exit 0; fi
 for a in "$@"; do printf '%s\\n' "$a"; done > "$STUB_LOG/wine.args"
-env | grep -E '^(LEONIDA_|MESA_VK|WINEDLL|WINEPREFIX|PULSE_SERVER|PIPEWIRE_REMOTE|DISPLAY)' | sort > "$STUB_LOG/wine.env"
+env | grep -E '^(LEONIDA_|MESA_VK|WINEDLL|WINEPREFIX|PULSE_SERVER|PIPEWIRE_REMOTE|DISPLAY|XDG_CACHE_HOME)' | sort > "$STUB_LOG/wine.env"
 pwd > "$STUB_LOG/wine.cwd"
+if [ -n "${XDG_CACHE_HOME:-}" ]; then mkdir -p "$XDG_CACHE_HOME/nvidia" && echo x >> "$XDG_CACHE_HOME/nvidia/GLCache"; fi
 echo "[rt] audio: serving the silent output endpoint (LEONIDA_AUDIO=silent): 48 kHz float 7.1" >&2
 echo "[d3d12-trace] #1 XboxID3D12CommandQueue::PresentX ok" >&2
 exit 0
@@ -86,8 +87,8 @@ class RunGameWineTest(unittest.TestCase):
                 flat += [flag, str(value)]
         return flat
 
-    def run_script(self, *args, display=":99"):
-        env = {"PATH": str(self.bin), "HOME": str(self.tmp), "STUB_LOG": str(self.log)}
+    def run_script(self, *args, display=":99", **extra):
+        env = {"PATH": str(self.bin), "HOME": str(self.tmp), "STUB_LOG": str(self.log), **extra}
         if display:
             env["DISPLAY"] = display
         return subprocess.run([str(self.bin / "bash"), str(SCRIPT), *args], cwd=self.tmp, env=env, capture_output=True, text=True,
@@ -196,6 +197,39 @@ class RunGameWineTest(unittest.TestCase):
         self.assertIn("warning: no --device: Mesa picks the Vulkan device", p.stderr)
         env = (self.log / "wine.env").read_text(encoding="utf-8")
         self.assertNotIn("MESA_VK_DEVICE_SELECT", env)
+
+    def wine_env(self):
+        return dict(line.split("=", 1) for line in (self.log / "wine.env").read_text(encoding="utf-8").splitlines())
+
+    def run_with_cache(self, out, *args, **extra):
+        self.out = self.tmp / out
+        p = self.run_script(*self.inputs(), "--visible", "--device", "1002:744C", "--seconds", "30", *args, **extra)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return p, self.wine_env()["XDG_CACHE_HOME"]
+
+    def test_without_a_cache_each_run_gets_a_fresh_one(self):
+        p, cache = self.run_with_cache("run1")
+        self.assertEqual(cache, str(self.tmp / "run1" / "session" / "cache"))
+        self.assertIn("shader cache: fresh", p.stdout)
+
+    def test_the_callers_cache_is_kept_from_run_to_run(self):
+        # The drivers' shader caches (NVIDIA's GLCache here) live under XDG_CACHE_HOME: a caller's one is used, so
+        # the second launch finds what the first compiled.
+        kept = self.tmp / "cache"
+        for n in (1, 2):
+            p, cache = self.run_with_cache(f"run{n}", XDG_CACHE_HOME=str(kept))
+            self.assertEqual(cache, str(kept))
+            self.assertIn(f"shader cache: kept in {kept}", p.stdout)
+        self.assertEqual((kept / "nvidia" / "GLCache").read_text(encoding="utf-8"), "x\nx\n")
+
+    def test_cache_option_names_the_folder_or_fresh(self):
+        named = self.tmp / "named-cache"
+        _, cache = self.run_with_cache("run1", "--cache", str(named), XDG_CACHE_HOME=str(self.tmp / "other"))
+        self.assertEqual(cache, str(named))
+        self.assertTrue((named / "nvidia" / "GLCache").is_file())
+        _, cache = self.run_with_cache("run2", "--cache", "fresh", XDG_CACHE_HOME=str(self.tmp / "other"))
+        self.assertEqual(cache, str(self.tmp / "run2" / "session" / "cache"))
+        self.assertFalse((self.tmp / "other").exists())
 
 
 if __name__ == "__main__":
