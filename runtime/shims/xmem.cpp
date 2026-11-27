@@ -94,27 +94,8 @@ HANDLE title_heap() {
         // Set LEONIDA_TITLE_HEAP=0 to use the CRT heap.
         const char* v = std::getenv("LEONIDA_TITLE_HEAP");
         if (v && std::strcmp(v, "0") == 0) return HANDLE(nullptr);
-        // In the page mirror's range (src/title_mirror_space.h), so a V# or pointer the title writes into a block
-        // reaches the mirror: a heap over a reservation there (ntdll's RtlCreateHeap with a base), up to kTitleHeapBytes.
-        // The host's own heap where that is refused.
-        HANDLE h = nullptr;
-        using RtlCreateHeapFn = PVOID(NTAPI*)(ULONG, PVOID, SIZE_T, SIZE_T, PVOID, PVOID);
-        const auto create = reinterpret_cast<RtlCreateHeapFn>(
-            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlCreateHeap")));
-        constexpr SIZE_T kTitleHeapBytes = SIZE_T(8) << 30;
-        if (create)
-            leonida::title_mirror_space::take(kTitleHeapBytes, 0x10000, true, [&](std::uint64_t at) {
-                void* const base = VirtualAlloc(reinterpret_cast<void*>(static_cast<uintptr_t>(at)), kTitleHeapBytes,
-                                                MEM_RESERVE, PAGE_READWRITE);
-                if (!base) return false;  // something of the host's there: the next address
-                h = create(0x2 /* HEAP_GROWABLE */, base, kTitleHeapBytes, 0, nullptr, nullptr);
-                if (!h) VirtualFree(base, 0, MEM_RELEASE);  // refused with a base: not tried again
-                return true;
-            });
-        const bool placed = h != nullptr;
-        if (!h) h = HeapCreate(0, 0, 0);
-        std::fprintf(stderr, "[rt] xmem: XMemAlloc blocks come from a heap of their own (%p, %s)\n", h,
-                     placed ? "in the page mirror's range" : "placed by the host");
+        const HANDLE h = HeapCreate(0, 0, 0);
+        std::fprintf(stderr, "[rt] xmem: XMemAlloc blocks come from a heap of their own (%p)\n", h);
         return h;
     }();
     return heap;

@@ -64,6 +64,7 @@
 #include "../src/title_mirror.h"
 #include "../src/title_mirror_space.h"
 #include "../src/title_mirror_tracking.h"
+#include "../src/title_mirror_hot_cold.h"
 #include "../src/guarded_copy.h"
 #include "../src/title_geometry_watch.h"
 #include "../src/title_texture_memory.h"
@@ -2670,6 +2671,8 @@ UnboundTsharpTracker& unbound_tsharp_tracker() {
 
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
 class Resource;
+leonida::VramBudget read_vram_budget(const VulkanDeviceInfo& info);  // VK_EXT_memory_budget (defined below)
+
 struct DeviceState {
     std::mutex mapped_texture_mutex;
     std::set<Resource*> mapped_textures;
@@ -4565,7 +4568,7 @@ struct DeviceState {
         std::vector<Change> taken;
         // Which mirrored pages the host wrote (src/title_mirror_tracking.h): a policy behind a small interface, the
         // plainest correct one (a guard on every page) until a measured one replaces it.
-        std::unique_ptr<leonida::TitleMirrorTracking> tracking;
+        std::unique_ptr<leonida::HotColdTracking> tracking;
         std::vector<std::uint64_t> written;
         std::unordered_set<std::uintptr_t> fed_now;  // pages a change of this refresh mapped (filled already)
         // Ordinary title memory (not physical pages) in the mirror's range: base -> end of each such reservation, the
@@ -4580,6 +4583,10 @@ struct DeviceState {
         std::uint64_t refreshes = 0, fed = 0, dirty = 0, uploads = 0, batches = 0, binds = 0, arm_failures = 0;
         std::uint64_t resolved = 0, resolve_refused = 0, identity_mapped = 0, identity_released = 0, clipped = 0;
         std::uint64_t written_back = 0, buffers = 0;
+        std::uint64_t units_local = 0, units_host = 0;  // home units by memory, all so far
+        bool last_local = true;
+        std::uint64_t presents = 0;  // present serial at the last log line
+        std::uint64_t faults_seen = 0, hot_seen = 0, cold_seen = 0;  // the tracking's counters at the last log line
         double ms = 0;
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
     } page_mirror;
@@ -4646,14 +4653,46 @@ struct DeviceState {
             page_mirror.chunks.push_back(out);
             return true;
         };
+        // Where a unit of homes goes, decided per unit as it is made: device-local memory while the device's budget
+        // (VK_EXT_memory_budget) keeps room for the title's textures and render targets after it (kHomeHeadroom, or an
+        // eighth of the budget if more), host memory otherwise; the GPU then reads those homes over the bus. A
+        // device without the budget extension, or with every heap device-local (an integrated GPU), keeps device-local.
         hooks.make_unit = [this](VkDeviceMemory& out, std::uint8_t*& host) {
             VkMemoryRequirements requirements{};
             requirements.size = leonida::TitleMirror::kUnitBytes;
             requirements.alignment = leonida::TitleMirror::kPage;
             requirements.memoryTypeBits = sparse_buffer_memory_types;
+            std::uint32_t host_types = 0;  // the sparse buffers' memory types outside device-local heaps
+            for (std::uint32_t t = 0; t < memory.memoryTypeCount; ++t)
+                if ((sparse_buffer_memory_types >> t & 1) &&
+                    !(memory.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+                    host_types |= 1u << t;
+            bool local = true;
+            if (host_types) {
+                const leonida::VramBudget budget = read_vram_budget(info);
+                if (budget.available) {
+                    constexpr std::uint64_t kHomeHeadroom = std::uint64_t(1536) << 20;
+                    const std::uint64_t headroom = std::max(kHomeHeadroom, budget.local_budget / 8);
+                    local = budget.local_usage + leonida::TitleMirror::kUnitBytes + headroom <= budget.local_budget;
+                }
+            }
+            if (!local) requirements.memoryTypeBits = host_types;
             leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::mirror);
             out = allocate(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                           local ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+            if (out) {
+                ++(local ? page_mirror.units_local : page_mirror.units_host);
+                if (local != page_mirror.last_local) {
+                    page_mirror.last_local = local;
+                    std::fprintf(stderr, "[rt] d3d12: page mirror: homes go to %s from now on (%llu units in device-local "
+                                         "memory, %llu in host memory so far)\n",
+                                 local ? "device-local memory again: the budget has room"
+                                       : "host memory (the GPU reads them over the bus): device-local memory is near "
+                                         "its budget",
+                                 static_cast<unsigned long long>(page_mirror.units_local),
+                                 static_cast<unsigned long long>(page_mirror.units_host));
+                }
+            }
             void* mapped = nullptr;
             if (!out || context->vk.vkMapMemory(info.device, out, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
                 if (out) context->vk.vkFreeMemory(info.device, out, nullptr);
@@ -4684,7 +4723,7 @@ struct DeviceState {
             return copy_guarded_host(to, from, bytes, false);
         };
         page_mirror.mirror = std::make_unique<leonida::TitleMirror>(std::move(hooks));
-        page_mirror.tracking = std::make_unique<leonida::GuardTracking>();
+        page_mirror.tracking = std::make_unique<leonida::HotColdTracking>();
         leonida::geometry_writes::subscribe(page_mirror.released);
         // A vertex, index, copy or indirect-argument address no buffer of ours holds is looked up in the mirror.
         context->set_mirror_buffer([this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
@@ -4926,13 +4965,19 @@ struct DeviceState {
         m.ms += std::chrono::duration<double, std::milli>(now - start).count();
         if (now - m.since >= std::chrono::seconds(10)) {
             const auto c = m.mirror->counters();
+            const auto policy = m.tracking->stats();
+            const std::uint64_t presents =
+                leonida::submit_phases::totals().present_serial.load(std::memory_order_relaxed);
+            const std::uint64_t frames = presents - m.presents;
             std::fprintf(stderr,
                          "[rt] d3d12: page mirror: %llu pages mirrored, %llu homes in %llu units (%llu MiB), %llu chunks "
                          "(%llu not placed); in %.0f s: %llu refreshes, %llu changes fed, %llu pages written, %llu "
                          "uploads, %llu binds in %llu batches, %llu arms refused, %.3f ms a refresh; changes outside "
                          "the chunks %llu; readers: %llu ranges resolved into it, %llu refused, %llu ordinary pages "
                          "mirrored and %llu released, %llu buffer bindings cut at a chunk's end; %llu slot-133 buffers "
-                         "made on it, %llu KiB of GPU writes copied back\n",
+                         "made on it, %llu KiB of GPU writes copied back; homes in device-local memory %llu units, in "
+                         "host memory %llu; tracking: %zu pages hot, %zu cold, %llu write faults, %llu hot and %llu "
+                         "cold copies; %.1f KiB uploaded a submission, %.1f KiB a frame\n",
                          static_cast<unsigned long long>(c.pages), static_cast<unsigned long long>(c.homes),
                          static_cast<unsigned long long>(c.units),
                          static_cast<unsigned long long>(c.units * (leonida::TitleMirror::kUnitBytes >> 20)),
@@ -4946,7 +4991,17 @@ struct DeviceState {
                          static_cast<unsigned long long>(m.resolved), static_cast<unsigned long long>(m.resolve_refused),
                          static_cast<unsigned long long>(m.identity_mapped),
                          static_cast<unsigned long long>(m.identity_released), static_cast<unsigned long long>(m.clipped),
-                         static_cast<unsigned long long>(m.buffers), static_cast<unsigned long long>(m.written_back >> 10));
+                         static_cast<unsigned long long>(m.buffers), static_cast<unsigned long long>(m.written_back >> 10),
+                         static_cast<unsigned long long>(m.units_local), static_cast<unsigned long long>(m.units_host),
+                         policy.hot, policy.cold, static_cast<unsigned long long>(policy.faults - m.faults_seen),
+                         static_cast<unsigned long long>(policy.hot_copies - m.hot_seen),
+                         static_cast<unsigned long long>(policy.cold_copies - m.cold_seen),
+                         m.refreshes ? double(m.uploads) * 64.0 / double(m.refreshes) : 0.0,
+                         frames ? double(m.uploads) * 64.0 / double(frames) : 0.0);
+            m.faults_seen = policy.faults;
+            m.hot_seen = policy.hot_copies;
+            m.cold_seen = policy.cold_copies;
+            m.presents = presents;
             m.refreshes = m.fed = m.dirty = m.uploads = m.batches = m.binds = m.arm_failures = 0;
             m.resolved = m.resolve_refused = m.identity_mapped = m.identity_released = m.clipped = 0;
             m.written_back = m.buffers = 0;
@@ -15715,6 +15770,8 @@ public:
                     share.mirror_homes = c.homes;
                     share.mirror_pages = c.pages;
                     share.mirror_chunks = c.chunks;
+                    share.mirror_units_local = d.page_mirror.units_local;
+                    share.mirror_units_host = d.page_mirror.units_host;
                 }
                 std::lock_guard lock(d.descriptor_mutex);  // the bindless set's lock (ExecuteCommandLists' flush)
                 if (const auto* bindless = d.bindless.get()) share.bindless_table_bytes = bindless->table_buffer_bytes();
@@ -22736,6 +22793,64 @@ bool page_mirror_buffer_at(ID3D12Device* device, std::uint64_t va, std::uint64_t
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceSize offset = 0;
     return const_cast<DeviceState&>(d->state()).page_mirror_buffer(va, size, buffer, offset);
+}
+
+bool page_mirror_gpu_write(ID3D12Device* device, std::uint64_t title_va, const void* data, std::size_t bytes) {
+    ID3D12Device* real = device ? rt::d3d12_xs::device_proxy_real_device(device) : nullptr;
+    if (!real) real = device;
+    const Device* d = real ? Device::from<Device>(real) : nullptr;
+    if (!d || !data || !bytes || bytes > 65536 || (bytes & 3) || (title_va & 3)) return false;
+    auto& state = const_cast<DeviceState&>(d->state());
+    if (!state.page_mirror.mirror || !state.context) return false;
+    state.refresh_page_mirror();
+    state.flush_page_mirror();
+    VkBuffer chunk = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    std::uint64_t wait = 0;
+    {
+        std::lock_guard lock(state.page_mirror.mutex);
+        if (!state.page_mirror.mirror->chunk_at(title_va, chunk, offset)) return false;
+        wait = state.page_mirror.value;
+    }
+    auto& vk = state.context->vk;
+    const VkDevice dev = state.info.device;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pool_info.queueFamilyIndex = state.info.queue_family;
+    bool ok = vk.vkCreateCommandPool(dev, &pool_info, nullptr, &pool) == VK_SUCCESS;
+    VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocate.commandPool = pool;
+    allocate.commandBufferCount = 1;
+    ok = ok && vk.vkAllocateCommandBuffers(dev, &allocate, &commands) == VK_SUCCESS;
+    if (ok) {
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        vk.vkBeginCommandBuffer(commands, &begin);
+        vk.vkCmdUpdateBuffer(commands, chunk, offset, bytes, data);
+        vk.vkEndCommandBuffer(commands);
+        VkTimelineSemaphoreSubmitInfo values{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        values.waitSemaphoreValueCount = 1;
+        values.pWaitSemaphoreValues = &wait;
+        const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, &values};
+        submit.waitSemaphoreCount = 1;
+        submit.pWaitSemaphores = &state.page_mirror.timeline;
+        submit.pWaitDstStageMask = &stage;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &commands;
+        std::lock_guard lock(state.context->submit_mutex());
+        ok = vk.vkQueueSubmit(state.info.queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS &&
+             vk.vkQueueWaitIdle(state.info.queue) == VK_SUCCESS;
+    }
+    if (pool) vk.vkDestroyCommandPool(dev, pool, nullptr);
+    return ok;
+}
+
+std::uint64_t page_mirror_write_back(ID3D12Device* device, std::uint64_t va, std::uint64_t bytes) {
+    ID3D12Device* real = device ? rt::d3d12_xs::device_proxy_real_device(device) : nullptr;
+    if (!real) real = device;
+    const Device* d = real ? Device::from<Device>(real) : nullptr;
+    return d ? const_cast<DeviceState&>(d->state()).page_mirror_write_back(va, va + bytes) : 0;
 }
 
 bool page_mirror_name(ID3D12Device* device, std::uint64_t va, std::uint64_t bytes) {

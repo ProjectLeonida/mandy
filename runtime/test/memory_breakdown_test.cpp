@@ -100,8 +100,9 @@ int text() {
     EXPECT(contains(line, " + title windows and shadows 0 (0)"));
     EXPECT(contains(line, " + upload heaps 0 (0) + staging 0 (0) + texture blocks 0 (0) + sampled textures 0 (0)"));
     EXPECT(contains(line, " + render targets and depth 1180 (1) + page mirror 0 (0)"));
-    EXPECT(contains(line, " chunks 1] + other 819 (1);"));
-    EXPECT(contains(line, "page mirror 0 (0) [homes bound 2 MiB (32), pages mirrored 40, chunks 1]"));
+    EXPECT(contains(line, " 0 host] + other 819 (1);"));
+    EXPECT(contains(line, "page mirror 0 (0) [homes bound 2 MiB (32), pages mirrored 40, chunks 1, units 0 "
+                          "device-local 0 host]"));
     EXPECT(contains(line, "imported 206 MiB (1)"));
     EXPECT(contains(line, "bindless tables 2 MiB"));
     EXPECT(contains(line, "shader modules 12 MiB SPIR-V"));

@@ -33,6 +33,7 @@ public:
         const auto it = guard_.cells.find(page);
         if (it == guard_.cells.end()) return;
         policy_.remove(std::uintptr_t(page), std::uintptr_t(page) + Policy::kPage);
+        guard_.armed.erase(page);
         geometry_writes::release(std::uintptr_t(page));
         guard_.cells.erase(it);
     }
@@ -53,13 +54,30 @@ public:
         return now - std::exchange(refused_seen_, now);
     }
     const auto& stats() const { return policy_.stats(); }
+    // A cold page whose guard no write has reached since it was armed (TitleMirrorTracking::unwritten). A hot page is
+    // never: it is left writable.
+    bool unwritten(std::uint64_t page) override {
+        if (policy_.hot(std::uintptr_t(page))) return false;
+        const auto cell = guard_.cells.find(page);
+        const auto armed = guard_.armed.find(page);
+        return cell != guard_.cells.end() && armed != guard_.armed.end() &&
+               cell->second->version.load(std::memory_order_acquire) == armed->second;
+    }
 
 private:
     struct CellGuard {
         std::unordered_map<std::uint64_t, geometry_writes::Cell*> cells;
+        std::unordered_map<std::uint64_t, std::uint64_t> armed;  // page -> its cell's version when last armed
         bool arm(std::uintptr_t page) {
             const auto it = cells.find(page);
-            return it != cells.end() && geometry_writes::arm(page, *it->second);
+            if (it == cells.end()) return false;
+            const std::uint64_t version = it->second->version.load(std::memory_order_acquire);
+            if (!geometry_writes::arm(page, *it->second)) {
+                armed.erase(page);
+                return false;
+            }
+            armed[page] = version;
+            return true;
         }
         // Writable again (a page turning hot): the cell reopens what it guarded.
         void disarm(std::uintptr_t page) {

@@ -116,6 +116,7 @@ struct DeviceShare {
     std::uint64_t bindless_table_bytes = 0;  // allocated by BindlessSet through its own function table
     bool mirror = false;  // the page mirror is on: its homes, the pages bound to them, its chunks
     std::uint64_t mirror_homes = 0, mirror_pages = 0, mirror_chunks = 0;
+    std::uint64_t mirror_units_local = 0, mirror_units_host = 0;  // its units of homes by memory
 };
 
 inline double mib(std::uint64_t bytes) { return double(bytes) / 1048576.0; }
@@ -144,9 +145,12 @@ inline std::string format(const Tally& tally, const DeviceShare& device, std::ui
             out += item;
         }
         if (Consumer(c) == Consumer::mirror && device.mirror) {
-            std::snprintf(item, sizeof item, " [homes bound %.0f MiB (%llu), pages mirrored %llu, chunks %llu]",
+            std::snprintf(item, sizeof item,
+                          " [homes bound %.0f MiB (%llu), pages mirrored %llu, chunks %llu, units %llu device-local %llu "
+                          "host]",
                           mib(device.mirror_homes * 0x10000), (unsigned long long)device.mirror_homes,
-                          (unsigned long long)device.mirror_pages, (unsigned long long)device.mirror_chunks);
+                          (unsigned long long)device.mirror_pages, (unsigned long long)device.mirror_chunks,
+                          (unsigned long long)device.mirror_units_local, (unsigned long long)device.mirror_units_host);
             out += item;
         }
     }

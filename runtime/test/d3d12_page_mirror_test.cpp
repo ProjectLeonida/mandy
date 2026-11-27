@@ -10,7 +10,9 @@
 //   4. a page of the reservation nothing is mapped at reads zero, with no fault;
 //   5. ordinary memory (committed XMemVirtualAlloc pages) is mirrored when a reader names it: a constant-buffer view
 //      keeps the title's address as its base, the GPU reads the bytes and a later title write there, and a binding of
-//      it is served by the mirror's chunk.
+//      it is served by the mirror's chunk;
+//   6. a slot-133 buffer over mirrored memory is the mirror's chunk (no shadow); the GPU's writes into it go back to
+//      the title's page, and a page written on both sides keeps the title's bytes.
 // Exit 77 when the device makes no page mirror (no sparse aliased strict buffers or capture-replay addresses: llvmpipe).
 // No shaders, no game data.
 #include "../shims/d3d12_com.h"
@@ -144,6 +146,38 @@ int test() {
     EXPECT(gpu_word(device.p, std::uintptr_t(plain) + kPage64k) == 0x62000000u);
     std::uint64_t pool_binding = 256;
     EXPECT(rt::d3d12::page_mirror_buffer_at(device.p, std::uintptr_t(dst), pool_binding));
+
+    // 6. A slot-133 buffer over mirrored memory is the mirror's chunk there: its GPU VA is the title's address, no
+    //    shadow. What the GPU writes into its home goes back to the title's page (the pieces that differ), and a page
+    //    the title wrote too keeps the title's bytes.
+    auto* placed = static_cast<std::uint8_t*>(reserve(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT, 0, PAGE_READWRITE));
+    EXPECT(placed);
+    auto* placed_words = reinterpret_cast<volatile std::uint32_t*>(placed);
+    for (unsigned i = 0; i < kPage64k / 4; i += 64) placed_words[i] = 0x71000000u + i;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = kPage64k;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    Ref<ID3D12Resource> buffer;
+    EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(device.p, placed, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer.p))));
+    EXPECT(buffer.p->GetGPUVirtualAddress() == std::uintptr_t(placed) && !rt::d3d12::title_shadow_buffer(buffer.p));
+    EXPECT(gpu_word(device.p, std::uintptr_t(placed) + 0x100) == 0x71000040u);  // and the page is guarded now
+    const std::uint32_t result[4] = {0xC0DE0001u, 0xC0DE0002u, 0xC0DE0003u, 0xC0DE0004u};
+    EXPECT(rt::d3d12::page_mirror_gpu_write(device.p, std::uintptr_t(placed) + 0x200, result, sizeof(result)));
+    EXPECT(placed_words[0x80] == 0x71000080u);  // not yet: after the submission retires
+    EXPECT(rt::d3d12::page_mirror_write_back(device.p, std::uintptr_t(placed), kPage64k) == 256);
+    EXPECT(placed_words[0x80] == 0xC0DE0001u && placed_words[0x83] == 0xC0DE0004u && placed_words[0x40] == 0x71000040u);
+    EXPECT(gpu_word(device.p, std::uintptr_t(placed) + 0x200) == 0xC0DE0001u);  // the home agrees after the refill
+    // Written on both sides: the title's write wins.
+    const std::uint32_t other[4] = {0xBAD00001u, 0xBAD00002u, 0xBAD00003u, 0xBAD00004u};
+    EXPECT(rt::d3d12::page_mirror_gpu_write(device.p, std::uintptr_t(placed) + 0x400, other, sizeof(other)));
+    std::thread([&] { placed_words[0x100] = 0x7171u; }).join();
+    EXPECT(rt::d3d12::page_mirror_write_back(device.p, std::uintptr_t(placed), kPage64k) == 0);
+    EXPECT(placed_words[0x100] == 0x7171u);
+    EXPECT(gpu_word(device.p, std::uintptr_t(placed) + 0x400) == 0x7171u);
 
     const auto end = rt::d3d12::page_mirror_state(device.p);
     std::printf("page mirror: heap_base 0x%llx, %llu pages in %llu homes over %llu chunk(s); slot-31 copies, a title "
