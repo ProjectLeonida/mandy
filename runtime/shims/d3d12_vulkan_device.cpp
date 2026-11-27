@@ -15661,6 +15661,12 @@ public:
         std::unique_lock lock(state_.title_texture_mutex, std::try_to_lock);
         if (!lock.owns_lock()) return;  // a slot-70 view is filling one; next time
         title_refreshed_.store(ticks, std::memory_order_relaxed);
+        {
+            // Give back the upload ring's large idle buffers (d3d12_title_image_upload.h). try_lock: a fill holding it
+            // is using the ring now, and this pass never waits for it.
+            std::unique_lock upload(state_.title_upload_mutex, std::try_to_lock);
+            if (upload.owns_lock()) state_.title_upload.trim(state_);
+        }
         std::optional<InTitleTextures> inside(std::in_place);
         TitleTextureStats& stats = title_stats_;
         ++stats.passes;
@@ -16648,10 +16654,12 @@ private:
             log_title_image_uses(state_.title_textures, retired_title_textures_.size(), retired_backing_, state_.zero_image_bytes.load());
         if (leonida::mem_probe::interval_seconds())
             std::fprintf(stderr, "[rt] mem-probe: registered image backing: %.1f MiB from slot 70, %.1f MiB from slot "
-                                 "133, %.1f MiB total on non-device-local types; staged fills %llu, %.3f s, buffer %.1f MiB\n",
+                                 "133, %.1f MiB total on non-device-local types; staged fills %llu, %.3f s, buffer %.1f MiB "
+                                 "(%llu released idle)\n",
                          double(owned_bytes) / 1048576.0, double(placed_bytes) / 1048576.0,
                          double(host_heap_bytes) / 1048576.0, static_cast<unsigned long long>(s.staged_fills),
-                         double(s.staged_ns) / 1e9, double(state_.title_upload.capacity()) / 1048576.0);
+                         double(s.staged_ns) / 1e9, double(state_.title_upload.capacity()) / 1048576.0,
+                         static_cast<unsigned long long>(state_.title_upload.trimmed()));
         std::fprintf(stderr,
                      "[rt] d3d12: title textures (%s): %llu slot-70 texture views (%zu kinds), %llu of slot-133 textures, "
                      "%llu of images made for them (%llu made, %llu over memory not readable yet, %llu retired), %llu "

@@ -1,7 +1,12 @@
 #pragma once
 
 #include "xg_xs_layout.h"
+#include "../src/memory_breakdown.h"
+#include "../src/title_upload_trim.h"
 #include "../src/vulkan_backend.h"
+
+#include <atomic>
+#include <chrono>
 
 namespace rt::d3d12 {
 
@@ -15,12 +20,32 @@ namespace rt::d3d12 {
 // resized or freed only after its last transfer completed (the slot's timeline value). The image needs no CPU wait:
 // later submissions on the queue are ordered after the transfer, other queues wait for it on the GPU, and a retired
 // image is destroyed through the deferred queue, after later submissions retire.
+//
+// A slot keeps its buffer between writes, but not for ever: trim() gives back a large one that has been idle for a
+// while and whose transfer has completed (src/title_upload_trim.h). Its memory counts as staging in the mem probe's
+// breakdown line.
 class TitleImageUpload {
 public:
-    VkDeviceSize capacity() const {
-        VkDeviceSize total = 0;
-        for (const auto& slot : slots_) total += slot.capacity;
-        return total;
+    // Readable without the lock (the mem probe's line): the bytes the slots hold, and how many buffers trim() freed.
+    VkDeviceSize capacity() const { return capacity_.load(std::memory_order_relaxed); }
+    std::uint64_t trimmed() const { return trimmed_.load(std::memory_order_relaxed); }
+
+    // Under the lock write() takes, never waiting for the GPU: releases each slot that title_upload_trim says to.
+    // Called from the periodic title-texture pass, so a burst of large uploads does not hold its buffers after it.
+    template<class Device>
+    void trim(Device& d) {
+        static const leonida::title_upload_trim::Settings settings = leonida::title_upload_trim::settings_from(
+            std::getenv("LEONIDA_TITLE_UPLOAD_IDLE_MS"), std::getenv("LEONIDA_TITLE_UPLOAD_KEEP_MB"));
+        if (!settings.enabled()) return;
+        const std::uint64_t now = now_ns();
+        for (auto& slot : slots_) {
+            if (!slot.capacity) continue;
+            if (leonida::title_upload_trim::release(slot.capacity, slot.last_used_ns, now, transfer_done(d, slot),
+                                                    settings)) {
+                release_buffer(d, slot);
+                trimmed_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     }
 
     template<class Device>
@@ -69,6 +94,7 @@ public:
         }
         Slot& slot = slots_[next_];
         if (!prepare(d, slot, bytes)) return false;
+        slot.last_used_ns = now_ns();
         next_ = (next_ + 1) % kSlots;
         for (const auto& copy : regions_) {
             const auto level = copy.imageSubresource.mipLevel;
@@ -118,7 +144,28 @@ private:
         VkDeviceSize capacity = 0;
         VkCommandBuffer command{};
         std::uint64_t value = 0;  // the ready_ value its last transfer signals; 0: none submitted
+        std::uint64_t last_used_ns = 0;  // when write() last used it (steady clock)
     };
+
+    static std::uint64_t now_ns() {
+        return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
+    // Whether the slot's last transfer has completed, without waiting: a counter value it has reached. A value that
+    // cannot be read counts as not done, so the buffer stays.
+    template<class Device>
+    bool transfer_done(Device& d, Slot& slot) {
+        if (!slot.value) return true;
+        if (!ready_) return false;
+        auto& vk = d.context->vk;
+        std::uint64_t reached = 0;
+        if (!vk.vkGetSemaphoreCounterValue ||
+            vk.vkGetSemaphoreCounterValue(d.info.device, ready_, &reached) != VK_SUCCESS || reached < slot.value)
+            return false;
+        slot.value = 0;
+        return true;
+    }
 
     // Waits (outside every lock but the registry's) until the slot's last transfer has completed.
     template<class Device>
@@ -153,6 +200,7 @@ private:
         slot.buffer = VK_NULL_HANDLE;
         slot.memory = VK_NULL_HANDLE;
         slot.mapped = nullptr;
+        capacity_.fetch_sub(slot.capacity, std::memory_order_relaxed);
         slot.capacity = 0;
     }
 
@@ -193,7 +241,10 @@ private:
         if (vk.vkCreateBuffer(dev, &buffer, nullptr, &slot.buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements req{};
         vk.vkGetBufferMemoryRequirements(dev, slot.buffer, &req);
-        slot.memory = d.allocate(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+        {
+            leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::staging);
+            slot.memory = d.allocate(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+        }
         void* map = nullptr;
         if (!slot.memory || vk.vkBindBufferMemory(dev, slot.buffer, slot.memory, 0) != VK_SUCCESS ||
             vk.vkMapMemory(dev, slot.memory, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) {
@@ -202,6 +253,7 @@ private:
         }
         slot.mapped = static_cast<std::uint8_t*>(map);
         slot.capacity = size;
+        capacity_.fetch_add(size, std::memory_order_relaxed);
         return true;
     }
 
@@ -250,6 +302,8 @@ private:
     std::uint64_t value_ = 0;
     std::vector<VkQueue> consumers_;
     std::vector<VkBufferImageCopy> regions_;
+    std::atomic<VkDeviceSize> capacity_{0};
+    std::atomic<std::uint64_t> trimmed_{0};
 };
 
 }  // namespace rt::d3d12

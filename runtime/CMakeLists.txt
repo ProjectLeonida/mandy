@@ -4736,6 +4736,12 @@ if(TARGET Vulkan::Headers)
       target_compile_options(memory_breakdown_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME memory_breakdown COMMAND memory_breakdown_test)
+    # When the title-texture upload ring gives an idle slot's buffer back (src/title_upload_trim.h).
+    add_executable(title_upload_trim_test test/title_upload_trim_test.cpp)
+    if(WIN32 AND MSVC)
+      target_compile_options(title_upload_trim_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME title_upload_trim COMMAND title_upload_trim_test)
     # The address guard's page table (src/address_guard.h; docs/d3d12_vulkan.md, "Address guard").
     add_executable(address_guard_test test/address_guard_test.cpp)
     if(WIN32 AND MSVC)
