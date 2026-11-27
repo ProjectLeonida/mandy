@@ -3280,27 +3280,39 @@ struct DeviceState {
         if (!leonida::texture_memory_readable(reinterpret_cast<std::uintptr_t>(from), size)) return Result::unreadable;
         return copy_guarded(to, from, size, false) ? Result::copied : Result::interrupted;
     }
+    // Why geometry_va gave no copy (diagnostics: the classes of V#s that resolve to nothing, fix_vsharp).
+    enum class NoCopy : std::uint8_t {
+        none, no_geometry, not_title, past_range, known_buffer, private_pages, refused, pool_alias, count
+    };
     // `refused` (when given) is set when a copy was asked for and refused (no room under the cap, or no block): it may
-    // be made once geometry copies are freed (GeometryViews::free_generation).
-    std::uint64_t geometry_va(std::uint64_t guest, std::uint64_t span, bool read_only, bool* refused = nullptr) {
-        if (!geometry.cap() || !span || !guest || !watch_shadow_writes()) return 0;
+    // be made once geometry copies are freed (GeometryViews::free_generation). `why`: the reason for an answer of 0.
+    std::uint64_t geometry_va(std::uint64_t guest, std::uint64_t span, bool read_only, bool* refused = nullptr,
+                              NoCopy* why = nullptr) {
+        const auto no = [why](NoCopy reason) {
+            if (why) *why = reason;
+            return std::uint64_t(0);
+        };
+        if (!geometry.cap() || !span || !guest || !watch_shadow_writes()) return no(NoCopy::no_geometry);
         const auto cpu = leonida::title_gpu_views::to_cpu(guest, span);
         auto& aliases = leonida::title_va_aliases();
         const auto alias = aliases.shader_va(cpu, span);
         if (alias != cpu) return alias;
         if (cpu == guest) {
             std::uint64_t lo{}, hi{};
-            if (!aliases.title_memory(guest, lo, hi) || span > hi - guest || context->knows_buffer_va(guest))
-                return 0;
+            if (!aliases.title_memory(guest, lo, hi)) return no(NoCopy::not_title);
+            if (span > hi - guest) return no(NoCopy::past_range);
+            if (context->knows_buffer_va(guest)) return no(NoCopy::known_buffer);
             if (!read_only && !leonida::title_gpu_views::other_view(cpu)) {
                 MEMORY_BASIC_INFORMATION region{};
-                if (!VirtualQuery(reinterpret_cast<void*>(cpu), &region, sizeof region) || region.Type != MEM_MAPPED)
-                    return geometry.find(cpu, span);
+                if (!VirtualQuery(reinterpret_cast<void*>(cpu), &region, sizeof region) || region.Type != MEM_MAPPED) {
+                    const std::uint64_t found = geometry.find(cpu, span);
+                    return found ? found : no(NoCopy::private_pages);
+                }
             }
         }
         const std::uint64_t va = geometry.resolve(*this, cpu, span, copy_geometry);
         if (!va && refused) *refused = true;
-        return va;
+        return va ? va : no(cpu != guest ? NoCopy::pool_alias : NoCopy::refused);
     }
 
     // LEONIDA_STREAM_BUFFER_WINDOWS=0: a window may not come from a block outside the arena.
@@ -4222,7 +4234,7 @@ struct DeviceState {
     // console heap's slot record is found again when a backing is added there.
     uint64_t vsharp_address(uint64_t base, uint64_t bytes, leonida::TitleVaAliases::Kind kind = leonida::TitleVaAliases::created_view,
                             bool make_window = true, bool try_geometry = false, uint64_t* refused = nullptr,
-                            bool* refused_room = nullptr) {
+                            bool* refused_room = nullptr, NoCopy* no_copy = nullptr) {
         if (refused) *refused = 0;
         if (refused_room) *refused_room = false;
         if (!base || !bytes) return 0;
@@ -4265,7 +4277,7 @@ struct DeviceState {
         // Read the other way: bit 47 as a sign, for a below-arena buffer's V# the layer wrote itself.
         if (offset == base && base <= mask && (base & (1ull << 47)) && backed(base | ~mask)) return base | ~mask;
         if (try_geometry) {
-            to = geometry_va(base, bytes, false, refused_room);
+            to = geometry_va(base, bytes, false, refused_room, no_copy);
             if (to && encodable(to)) return path(3), to;
         }
         uint64_t lo{}, hi{};
@@ -4327,13 +4339,35 @@ struct DeviceState {
         uint64_t base = 0, span = 0, target = 0;
         bool geometry = false;  // its resolution asked for a geometry copy
     };
+    // The classes of the V# halves a console heap resolves to nothing (diagnostics, the heap's log line): what their
+    // base is, as the lookups found it (note_resolution).
+    enum Nothing : unsigned {
+        nothing_refused,      // an alias range or window names a copy that is not backed
+        nothing_arena,        // an arena offset nothing backs (freed, or never handed out)
+        nothing_negative,     // bit 47 set: a below-arena form nothing backs
+        nothing_no_copy,      // no geometry copy asked for (no format, a span past the window limit)
+        nothing_not_title,    // not the title's memory and not ours: freed or never allocated
+        nothing_past_range,   // the title's memory, the span past the end of its range
+        nothing_known_buffer, // the title's memory under a buffer the device has (its V# is the buffer's)
+        nothing_private,      // the title's private pages: a heap's V# finds a copy but makes none
+        nothing_room,         // a copy refused for room or a block
+        nothing_pool_alias,   // the GPU-only view of pool memory whose copy was refused
+        nothing_other,        // no geometry copies at all, or the base is 0
+        nothing_classes
+    };
+    static constexpr const char* kNothingNames[nothing_classes] = {
+        "copy not backed", "arena offset", "bit 47", "no copy asked", "not title memory", "past its range",
+        "a buffer's", "private pages", "no room", "pool alias", "other"};
     struct ConsoleHeap;
-    // `answers` (a console heap whose title-written slot this is): a V# whose range another half of that heap waits
-    // for is answered as that half was (ConsoleHeapSlotRecords::waiting_answer), after the changes made since are
-    // applied (sync_slot_changes), so a waiting answer is never older than a change that concerns it. In the world
-    // 70% of the changed V# halves resolve to nothing, mostly with words seen before, and each such lookup walked the
-    // alias table, the backings, the geometry copies and the title memory (VirtualQuery included) again.
-    VsharpResult fix_vsharp(uint32_t* w, VsharpPath path, VsharpRecord* record = nullptr, ConsoleHeap* answers = nullptr) {
+    // `heap` (a console heap's slot): its counters (resolutions, their time, the classes of V#s that resolve to
+    // nothing). `answers` (a slot the title rewrote): a V# whose exact range another half of that heap has a record
+    // for, made the same way, takes that half's answer (ConsoleHeapSlotRecords::answer) after the changes noted since
+    // are applied (sync_slot_changes): a record is fixed again by every change that could alter its answer, so a
+    // current one gives what resolving again would. In the world 63-70% of the changed V# halves carry words seen
+    // before, and each resolution walked the alias table, the backings, the geometry copies and the title memory
+    // (VirtualQuery included) again.
+    VsharpResult fix_vsharp(uint32_t* w, VsharpPath path, VsharpRecord* record = nullptr, ConsoleHeap* heap = nullptr,
+                            bool answers = false) {
         if ((w[3] >> 30) || !w[2]) return VsharpResult::unchanged; // image, empty slot or raw pointer
         const uint64_t base = uint64_t(w[0]) | (uint64_t(w[1] & 0xffff) << 32);
         const uint32_t stride = (w[1] >> 16) & 0x3fffu;
@@ -4342,15 +4376,25 @@ struct DeviceState {
         leonida::gfx10::Buffer desc{};
         const bool copy_geometry = leonida::gfx10::decode(words, desc) &&
             (path != VsharpPath::scratch || span <= kTitleWindowMax || (desc.format && leonida::gfx10::encode(desc) == words));
-        if (answers && record && answered_by_waiting(*answers, base, span, copy_geometry, *record)) {
+        if (heap && answers && record && answered_by_record(*heap, base, span, copy_geometry, *record)) {
+            if (record->state == leonida::ConsoleHeapSlotRecords::resolved) {
+                const uint64_t to = record->target - arena.address;  // mod 2^64, as it was recorded
+                if ((to & ((1ull << 48) - 1)) == base) return VsharpResult::unchanged;
+                w[0] = uint32_t(to);
+                w[1] = (w[1] & 0xffff0000u) | uint32_t((to >> 32) & 0xffff);
+                return VsharpResult::rebased;
+            }
             note_unbacked_vsharp(base, span, stride, w);
             w[0] = w[1] = w[2] = 0;
             return VsharpResult::empty;
         }
         uint64_t refused = 0;
         bool refused_room = false;
+        NoCopy no_copy = NoCopy::none;
+        const auto start = heap ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto to = vsharp_address(base, span, leonida::TitleVaAliases::table_view,
-                                       path != VsharpPath::scratch, copy_geometry, &refused, &refused_room);
+                                       path != VsharpPath::scratch, copy_geometry, &refused, &refused_room, &no_copy);
+        if (heap) note_resolution(*heap, start, base, to, refused, copy_geometry, no_copy);
         if (record) {
             // The copy's device address (mod 2^64: a buffer below the arena has a negative offset). A geometry copy
             // refused for room is asked for again when copies are freed (SlotChange::geometry_room).
@@ -4744,8 +4788,14 @@ struct DeviceState {
         std::uint64_t texture_waits = 0, texture_refills = 0;
         // V# halves answered by a waiting half of the same range (fix_vsharp), and how many of slot_changes this
         // heap has applied since refresh_console_heaps took the list (sync_slot_changes).
-        std::uint64_t vsharps_answered = 0;
+        std::uint64_t vsharps_answered = 0, vsharps_answered_resolved = 0;
         std::size_t changes_seen = 0;
+        // Since the last log line: the full resolutions of its V# halves and their time, the classes of those that
+        // resolved to nothing, and the longest refresh with its parts (pages, changes applied, slots fixed).
+        std::uint64_t resolutions = 0;
+        double resolution_ms = 0;
+        std::uint64_t nothing[nothing_classes] = {};
+        double max_ms = 0, max_pages_ms = 0, max_changes_ms = 0, max_fix_ms = 0;
         // fix_console_slots' budget, for the current refresh, and the slots it nulled since the last log line
         std::chrono::steady_clock::time_point fix_start{};
         bool fix_over = false;
@@ -4872,15 +4922,14 @@ struct DeviceState {
             // and recorded as waiting: a backing, alias range or title memory added over it fixes the slot again
             // (apply_slot_changes).
             vsharp = true;
-            ConsoleHeap* const by = answers ? &heap : nullptr;
-            const VsharpResult result = fix_vsharp(w, path, &halves[0], by);
+            const VsharpResult result = fix_vsharp(w, path, &halves[0], &heap, answers);
             if (result == VsharpResult::rebased) ++heap.vsharps;
             // Only the GPU copy changes; the title's bytes (heap.previous) stay as written.
             if (result == VsharpResult::empty) ++heap.unbacked;
             // The slot's second V# is a UAV counter (raw, 4 bytes, in the descriptor's upper 16 bytes): a store to it at
             // heap_base + a raw title address loses the device just as one through the buffer V# does. A counter with
             // no backing is nulled and waits as the buffer V# does.
-            if (fix_vsharp(w + 4, path, &halves[1], by) == VsharpResult::empty) ++heap.unbacked;
+            if (fix_vsharp(w + 4, path, &halves[1], &heap, answers) == VsharpResult::empty) ++heap.unbacked;
         } else {
             leonida::gfx10::ImageWords words;
             std::memcpy(words.data(), w, sizeof(words));
@@ -5066,19 +5115,44 @@ struct DeviceState {
         }
         apply_slot_changes(heap, slot_change_tail);
     }
-    // fix_vsharp's answer from a waiting half of the same range in `heap`, current with every change noted so far.
-    bool answered_by_waiting(ConsoleHeap& heap, std::uint64_t base, std::uint64_t span, bool copy_geometry,
-                             VsharpRecord& record) {
+    // fix_vsharp's answer from a record of the same range in `heap`, current with every change noted so far.
+    bool answered_by_record(ConsoleHeap& heap, std::uint64_t base, std::uint64_t span, bool copy_geometry,
+                            VsharpRecord& record) {
         sync_slot_changes(heap);
-        leonida::ConsoleHeapSlotRecords::State state{};
+        using Records = leonida::ConsoleHeapSlotRecords;
+        Records::State state{};
         std::uint64_t target = 0;
-        if (!heap.records.waiting_answer(base, span, copy_geometry, state, target)) return false;
+        if (!heap.records.answer(base, span, copy_geometry, state, target)) return false;
         // Room for geometry copies is seen once a refresh (refresh_console_heaps): freed since, resolve anew.
-        if (state == leonida::ConsoleHeapSlotRecords::waiting_room && geometry.free_generation() != geometry_room_seen)
-            return false;
+        if (state == Records::waiting_room && geometry.free_generation() != geometry_room_seen) return false;
         record = {state, base, span, target, copy_geometry};
-        ++heap.vsharps_answered;
+        ++(state == Records::resolved ? heap.vsharps_answered_resolved : heap.vsharps_answered);
         return true;
+    }
+
+    // A console heap's full resolution of a V# half (fix_vsharp): counted, timed, and for an answer of nothing, its
+    // class.
+    void note_resolution(ConsoleHeap& heap, std::chrono::steady_clock::time_point start, std::uint64_t base,
+                         std::uint64_t to, std::uint64_t refused, bool copy_geometry, NoCopy no_copy) {
+        ++heap.resolutions;
+        heap.resolution_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        if (to) return;
+        Nothing kind = nothing_other;
+        if (refused) kind = nothing_refused;
+        else if (base < arena.size) kind = nothing_arena;
+        else if (base & (1ull << 47)) kind = nothing_negative;
+        else if (!copy_geometry) kind = nothing_no_copy;
+        else
+            switch (no_copy) {
+            case NoCopy::not_title: kind = nothing_not_title; break;
+            case NoCopy::past_range: kind = nothing_past_range; break;
+            case NoCopy::known_buffer: kind = nothing_known_buffer; break;
+            case NoCopy::private_pages: kind = nothing_private; break;
+            case NoCopy::refused: kind = nothing_room; break;
+            case NoCopy::pool_alias: kind = nothing_pool_alias; break;
+            default: break;
+            }
+        ++heap.nothing[kind];
     }
 
     void note_refused_tsharp(ConsoleHeap& heap, std::size_t offset, const leonida::gfx10::ImageWords& words,
@@ -5111,7 +5185,7 @@ struct DeviceState {
         heap.fix_count = 0;
         // Even an unchanged title slot may name a buffer released since the last submission, or wait for a buffer or
         // texture that came: the slots the changes touch are fixed again, found by their records. First, so the
-        // waiting records the rewritten slots below are answered by are current (answered_by_waiting).
+        // records the rewritten slots below are answered by are current (answered_by_record).
         if (changes) apply_slot_changes(heap, *changes);
         const auto t2 = clock::now();
         // Slots the fix budget deferred at an earlier submission (LEONIDA_CONSOLE_FIX_US; none without it).
@@ -5122,11 +5196,28 @@ struct DeviceState {
         heap.pages_ms += ms(t0, t1);
         heap.retry_ms += ms(t2, t3);
         heap.fix_ms += ms(t1, t2) + ms(t3, t4);
+        if (ms(t0, t4) > heap.max_ms) {
+            heap.max_ms = ms(t0, t4);
+            heap.max_pages_ms = ms(t0, t1);
+            heap.max_changes_ms = ms(t1, t2);
+            heap.max_fix_ms = ms(t2, t4);
+        }
     }
 
     // Before every submission, ahead of the slot-133 shadows.
+    // The time a submission waited for console_heap_mutex (another queue's refresh holds it), since the last log line.
+    double heap_lock_wait_ms = 0, heap_lock_wait_max_ms = 0;  // console_heap_mutex
+    std::uint64_t heap_lock_waits = 0;
     void refresh_console_heaps() {
+        const auto asked = std::chrono::steady_clock::now();
         std::lock_guard lock(console_heap_mutex);
+        {
+            const double waited =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - asked).count();
+            heap_lock_wait_ms += waited;
+            heap_lock_wait_max_ms = std::max(heap_lock_wait_max_ms, waited);
+            ++heap_lock_waits;
+        }
         const bool heap_pass = heap_gpu && console_heap_gpu_enabled();
         if (heap_pass) console_heap_gpu_begin();
         else if (heap_gpu) heap_gpu->drain(context->completed_retire_ticket(), [](int, std::uint32_t, std::uint32_t) {}, [](int) {});
@@ -5217,6 +5308,33 @@ struct DeviceState {
                              heap->records.textures_waiting(), static_cast<unsigned long long>(heap->texture_waits),
                              static_cast<unsigned long long>(heap->texture_refills),
                              static_cast<unsigned long long>(heap->vsharps_answered));
+                // Where a submission's V# fixing goes: halves answered by a current record of their range (resolved
+                // or waiting) and halves resolved anew with their time; the classes of those that resolved to
+                // nothing; the longest refresh and its parts; the waits for the heap lock (in the heaps phase too).
+                std::string classes;
+                for (unsigned i = 0; i < nothing_classes; ++i)
+                    if (heap->nothing[i])
+                        classes += (classes.empty() ? "" : ", ") + std::string(kNothingNames[i]) + " " +
+                                   std::to_string(heap->nothing[i]);
+                std::fprintf(stderr,
+                             "[rt] d3d12: console descriptor heap 0x%llx V# halves per submission: %.1f answered by a "
+                             "resolved record of their range, %.1f by a waiting one, %.1f resolved anew (%.3f ms, %.2f "
+                             "us each); resolved to nothing since the last line: %s; longest refresh %.3f ms (pages "
+                             "%.3f, changes %.3f, slots %.3f); heap lock waited %.3f ms on average, %.3f the longest\n",
+                             static_cast<unsigned long long>(heap->console_va),
+                             double(heap->vsharps_answered_resolved) / count, double(heap->vsharps_answered) / count,
+                             double(heap->resolutions) / count, heap->resolution_ms / count,
+                             heap->resolutions ? 1000.0 * heap->resolution_ms / double(heap->resolutions) : 0.0,
+                             classes.empty() ? "none" : classes.c_str(), heap->max_ms, heap->max_pages_ms,
+                             heap->max_changes_ms, heap->max_fix_ms,
+                             heap_lock_waits ? heap_lock_wait_ms / double(heap_lock_waits) : 0.0,
+                             heap_lock_wait_max_ms);
+                heap_lock_wait_ms = heap_lock_wait_max_ms = 0;
+                heap_lock_waits = 0;
+                heap->vsharps_answered_resolved = heap->resolutions = 0;
+                heap->resolution_ms = 0;
+                for (auto& n : heap->nothing) n = 0;
+                heap->max_ms = heap->max_pages_ms = heap->max_changes_ms = heap->max_fix_ms = 0;
                 for (auto& n : heap->changed) n = 0;
                 heap->texture_waits = heap->texture_refills = heap->vsharps_answered = 0;
                 heap->vsharp_halves = heap->vsharp_repeats = 0;

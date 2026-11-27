@@ -109,7 +109,7 @@ public:
 
     // Half `half` (0: the buffer V#, 1: the UAV counter V#) of `slot` now names [base, base + span) and resolved as
     // `state` says (none or a V# state), its copy at `target` (0: none; see above). span 0 counts as 1. `geometry`:
-    // its resolution asked for a geometry copy (fix_vsharp's copy_geometry), which waiting_answer tells apart.
+    // its resolution asked for a geometry copy (fix_vsharp's copy_geometry), which answer() tells apart.
     void set(std::size_t slot, unsigned half, State state, std::uint64_t base, std::uint64_t span,
              std::uint64_t target, bool geometry = false) {
         if (slot >= slots_ || half > 1 || is_texture(state)) return;
@@ -131,18 +131,23 @@ public:
         place(std::uint32_t(slot * 2), state, 0, address, ranges);
     }
 
-    // What a V# naming [base, base + span) resolves to while another half of the same range waits: nothing, as for
-    // that half (`state` waiting or waiting_room, `target` its refused copy). Sound because a waiting record is fixed
-    // again by every change that could let it resolve (touched): while one waits, no change since its fix concerns
-    // its range, so the same lookups give the same answer. The caller applies the changes made since first (they may
-    // not be on a record yet). A V# that asks for a geometry copy takes only a half that asked for one too.
-    bool waiting_answer(std::uint64_t base, std::uint64_t span, bool geometry, State& state, std::uint64_t& target) {
+    // What a V# naming [base, base + span) resolves to while another half of the same range has a record made the
+    // same way (`geometry`: both asked for a geometry copy, or neither): the same answer, `state` and `target` as that
+    // half has them. Sound because a record is fixed again by every change that could alter its answer (touched): a
+    // resolved one by every release or removal of its range or its copy, a waiting one also by every addition that
+    // could back it. While it is current, the same lookups give the same answer. The caller applies the changes noted
+    // since first (they may not be on a record yet). A waiting answer is also taken from a half that asked for a copy
+    // when this one does not (it looked further and found nothing).
+    bool answer(std::uint64_t base, std::uint64_t span, bool geometry, State& state, std::uint64_t& target) {
         if (!span) span = 1;
         const auto it = indexes_[kSource].by_range.find(range(base, span));
         if (it == indexes_[kSource].by_range.end()) return false;
         const Group& g = groups_[it->second];
-        const std::vector<std::uint32_t>* list = !g.keys[2].empty() ? &g.keys[2]
-                                                 : !geometry && !g.keys[1].empty() ? &g.keys[1] : nullptr;
+        const int geo = geometry ? 1 : 0;
+        const std::vector<std::uint32_t>* list =
+            !g.keys[kSettled + geo].empty() ? &g.keys[kSettled + geo]
+            : !g.keys[kWaiting + 1].empty() ? &g.keys[kWaiting + 1]
+            : !geometry && !g.keys[kWaiting].empty() ? &g.keys[kWaiting] : nullptr;
         if (!list) return false;
         const Half& h = halves_[list->front()];
         // One that asks for no copy waits for a backing only, not for geometry room.
@@ -187,7 +192,8 @@ public:
     void touched(const SlotChange* changes, std::size_t count, std::vector<std::uint32_t>& out) {
         out.clear();
         if (!++epoch_) {  // after 2^32 calls: no group may look visited
-            for (auto& g : groups_) g.seen[0] = g.seen[1] = g.seen[2] = 0;
+            for (auto& g : groups_)
+                for (auto& seen : g.seen) seen = 0;
             epoch_ = 1;
         }
         bool room[2] = {};
@@ -225,6 +231,7 @@ public:
 private:
     static constexpr int kSource = 0, kTarget = 1, kTexture = 2;
     static constexpr std::uint8_t kGeometry = 1;  // Half::flags: the resolution asked for a geometry copy
+    static constexpr int kSettled = 0, kWaiting = 2;  // Group::keys: + 1 for the records with kGeometry
     static constexpr std::uint64_t kMaxSpan = (std::uint64_t(1) << 56) - 1;
     static constexpr unsigned kClasses = 65;
 
@@ -253,14 +260,16 @@ private:
     using ByStart = std::multimap<std::uint64_t, std::uint32_t>;  // start -> group id
     struct Group {
         std::uint64_t start = 0, end = 0;
-        // [0] settled records (resolved, bound), [1] waiting ones, [2] waiting V# halves that asked for a geometry copy
-        std::vector<std::uint32_t> keys[3];
+        // [0] settled records (resolved, bound), [1] settled V# halves that asked for a geometry copy, [2] waiting
+        // records, [3] waiting V# halves that asked for a geometry copy
+        std::vector<std::uint32_t> keys[4];
         int index = 0;
         unsigned cls = 0;
         ByStart::iterator at{};          // in by_start[cls]
-        ByStart::iterator waiting_at{};  // in waiting_by_start, while keys[1] or keys[2] is not empty
-        std::uint32_t seen[3] = {};      // the touched() call that last visited each list (epoch_)
-        bool waits() const { return !keys[1].empty() || !keys[2].empty(); }
+        ByStart::iterator waiting_at{};  // in waiting_by_start, while keys[2] or keys[3] is not empty
+        std::uint32_t seen[4] = {};      // the touched() call that last visited each list (epoch_)
+        bool waits() const { return !keys[kWaiting].empty() || !keys[kWaiting + 1].empty(); }
+        bool empty() const { return keys[kSettled].empty() && keys[kSettled + 1].empty() && !waits(); }
     };
     struct Index {
         std::unordered_map<Range, std::uint32_t, RangeHash> by_range;  // -> group id
@@ -278,7 +287,7 @@ private:
         return length <= 1 ? 0u : unsigned(64 - std::countl_zero(length - 1));
     }
     static int list_of(State state, std::uint8_t flags) {
-        return !is_waiting(state) ? 0 : (flags & kGeometry) ? 2 : 1;
+        return (is_waiting(state) ? kWaiting : kSettled) + ((flags & kGeometry) ? 1 : 0);
     }
     // The index group[n] of a record in `state` is in.
     static int index_of(State state, int n) { return is_texture(state) ? kTexture : n; }
@@ -371,7 +380,7 @@ private:
         h.group[n] = it->second + 1;
         h.place[n] = std::uint32_t(list.size());
         list.push_back(key);
-        if (list_index && !waited) g.waiting_at = index.waiting_by_start.emplace(g.start, it->second);
+        if (list_index >= kWaiting && !waited) g.waiting_at = index.waiting_by_start.emplace(g.start, it->second);
     }
 
     // Takes `key` out of its group[n], from the list of its current state.
@@ -388,8 +397,8 @@ private:
         halves_[last].place[n] = at;
         list.pop_back();
         h.group[n] = 0;
-        if (which_list && !g.waits()) index.waiting_by_start.erase(g.waiting_at);
-        if (!g.keys[0].empty() || g.waits()) return;
+        if (which_list >= kWaiting && !g.waits()) index.waiting_by_start.erase(g.waiting_at);
+        if (!g.empty()) return;
         index.by_range.erase(Range{g.start, g.end});
         index.by_start[g.cls].erase(g.at);
         if (index.by_start[g.cls].empty()) index.used[g.cls >> 6] &= ~(std::uint64_t(1) << (g.cls & 63));
@@ -413,8 +422,8 @@ private:
         for (auto it = index.waiting_by_start.lower_bound(lo); it != index.waiting_by_start.end() && it->first < hi;
              ++it) {
             ++groups_looked_at_;
-            visit(groups_[it->second], 1, out);
-            visit(groups_[it->second], 2, out);
+            visit(groups_[it->second], kWaiting, out);
+            visit(groups_[it->second], kWaiting + 1, out);
         }
     }
 
@@ -432,9 +441,7 @@ private:
                     Group& g = groups_[it->second];
                     ++groups_looked_at_;
                     if (g.end <= lo) continue;
-                    visit(g, 0, out);
-                    visit(g, 1, out);
-                    visit(g, 2, out);
+                    for (int list = 0; list < 4; ++list) visit(g, list, out);
                 }
             }
     }
