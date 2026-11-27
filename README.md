@@ -224,11 +224,13 @@ that stage has finished rebuilding `vk_pipeline_check`, so it can overlap the re
 translated shader on your GPU driver, reports any it has to skip, and saves a pipeline cache to `pipeline_cache.bin`
 in `--out`, which also holds `gta6rt.exe` after the `runtime` stage. The runtime seeds its Vulkan pipeline cache
 from the file beside the executable when its header matches the device and pipeline cache UUID. It falls back to
-an empty cache if the file is missing, incompatible, or rejected by the driver. Shader translation is the longest
-CPU step. It runs on `--jobs` processes (half the CPU threads by default). When shaders and assets share the machine,
-that budget is split between them and passed to `rpf9dump` as `--jobs`. A solo assets run still lets `rpf9dump` use
-every core. Progress lines include percent and a rough ETA for translation shards, asset steps, and overall stage
-completion.
+an empty cache if the file is missing, incompatible, or rejected by the driver. `pipeline_done.json` beside the cache
+lists the shaders already built for this GPU, driver and checker, so a later run only builds the ones whose SPIR-V
+changed ([docs/pipeline_check.md](docs/pipeline_check.md#shard-caches-and-the-done-list)). Shader translation is the
+longest CPU step. It runs on `--jobs` processes (half the CPU threads by default). When shaders and assets share the
+machine, that budget is split between them and passed to `rpf9dump` as `--jobs`. A solo assets run still lets
+`rpf9dump` use every core. Progress lines include percent and a rough ETA for translation shards, asset steps, and
+overall stage completion.
 
 On an interactive terminal, a LEONIDA setup screen lets you set jobs and whether stages overlap, then a key-switchable
 per-stage log view (`1`–`4` / `Tab`) keeps parallel output demuxed; full stage logs go under `work/logs/`. Use

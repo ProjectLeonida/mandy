@@ -932,6 +932,9 @@ if(BUILD_TESTING)
   # vk_pipeline_check's isolate summary stage set: pure stdlib, no Vulkan device.
   add_executable(pipeline_summary_test test/pipeline_summary_test.cpp)
   add_test(NAME pipeline_summary COMMAND pipeline_summary_test)
+  # vk_pipeline_check --merge's pipeline cache header check: pure stdlib, no Vulkan device.
+  add_executable(pipeline_cache_header_test test/pipeline_cache_header_test.cpp)
+  add_test(NAME pipeline_cache_header COMMAND pipeline_cache_header_test)
   # XDXR build descriptions (docs/xdxr.md); compared with d3d12.h where the Windows SDK provides it.
   add_executable(xdxr_descs_test test/xdxr_descs_test.cpp)
   add_test(NAME xdxr_descs COMMAND xdxr_descs_test)
@@ -2111,6 +2114,15 @@ if(TARGET Vulkan::Headers)
              "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/vk_pipeline_check_cli_input"
              "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_pipeline_cli.cmake")
+    # --merge, --names-file and --done-file on six synthetic compute shaders (make_game.py's shard caches): needs a
+    # Vulkan device whose driver reports application-cache hits, else it exits 77.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_FOUND AND NOT CMAKE_CROSSCOMPILING)
+      add_test(NAME vk_pipeline_check_merge COMMAND "${Python3_EXECUTABLE}" -I
+               "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_pipeline_merge.py" "$<TARGET_FILE:vk_pipeline_check>"
+               "${CMAKE_CURRENT_BINARY_DIR}/vk_pipeline_check_merge")
+      set_tests_properties(vk_pipeline_check_merge PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
     add_test(NAME vk_texture_cube_alpha COMMAND vk_texture_test --self-test-cube-alpha)
     if(WIN32)
       # Reads SizeOfStackReserve from the built file; the program is not run, so it needs no emulator.

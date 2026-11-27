@@ -74,7 +74,7 @@ from mc_command import install_hint as mc_install_hint, mc_command, split_comman
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
-from stale_build import newer_sources  # noqa: E402
+from stale_build import newer_sources, program_sources  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
@@ -2775,13 +2775,35 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
     jobs_args = ["--jobs", str(jobs)] if jobs else []
     base = [exe, spirv, cache, *jobs_args]
+    book: "PipelineDoneList | None" = None
 
-    def seed_bvh() -> None:
-        bvh = os.path.join(spirv, "bvh")
-        if not os.path.isfile(os.path.join(bvh, "index.json")):
-            return
-        log("pipelines: creating XboxBvhBuilder compute pipelines")
-        run([exe, bvh, cache, *jobs_args])
+    def seed_extras() -> int:
+        """The shader sets beside the main index that the runtime seed needs (PIPELINE_EXTRA_SETS), each in one
+        checker process. Returns the first failing exit code with the done-list (the rest of the sets still run
+        unless it was a setup error or a stop); without it a failure stops the stage, as before."""
+        first = 0
+        for name, label in PIPELINE_EXTRA_SETS:
+            directory = os.path.join(spirv, name)
+            if not os.path.isfile(os.path.join(directory, "index.json")):
+                continue
+            if not book:
+                log(f"pipelines: creating {label} pipelines")
+                run([exe, directory, cache, *jobs_args])
+                continue
+            digest = book.directory_digest(directory)
+            if book.extra_done(name, digest):   # unchanged: no shard, so an unchanged corpus needs no merge either
+                continue
+            log(f"pipelines: creating {label} pipelines")
+            shard = book.new_shard()
+            code = run([exe, directory, shard, *jobs_args], check=False)
+            if code == 0:
+                book.record_extra(name, digest, shard)
+                continue
+            log(f"pipelines: the {label} pass ({name}/) exited with {exit_label(code)}")
+            first = first or code
+            if code == 2 or interrupted(code):
+                return code
+        return first
 
     if not checker_supports(exe, "--inflight-file", "--skip-file"):
         # An older build takes any argument it doesn't know as the cache path, so it would write the cache into
@@ -2789,21 +2811,61 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         log("pipelines: this vk_pipeline_check has no --inflight-file; rebuild the runtime stage so a module that "
             "crashes the driver is skipped instead of stopping the stage")
         run(base)
-        seed_bvh()
+        seed_extras()
         log("pipelines: done")
         return
     base += ["--inflight-file", inflight]
+    # A checker with --merge and --done-file gets shard caches and the done-list (PIPELINES-STAGE-SHARDS-AND-DONE-LIST):
+    # each process writes its own small cache instead of loading and rewriting pipeline_cache.bin, the shards are
+    # merged into it once at the end, and a module already built for this GPU, driver and checker is not built again.
+    book = PipelineDoneList(out, spirv, cache, exe) if checker_supports(exe, *PIPELINE_SHARD_OPTIONS) else None
+    batch_names = os.path.join(out, "pipeline_batch.txt")
+    batch_done = os.path.join(out, "pipeline_batch_done.txt")
     # Bound each checker invocation to a range that recovery can split further when concurrent heavy compiles
     # exceed available memory, without starting the entire corpus again (BUILD-1030).
-    names = pipeline_names(spirv) if checker_supports(exe, "--start", "--count") else []
+    if book:
+        names = book.todo
+        log(f"pipelines: {book.total - len(names)} of {book.total} modules are already built for this GPU, driver "
+            f"and checker; {len(names)} to check" + (" (checkpointing into the existing pipeline_cache.bin, as "
+                                                     "before, while the done-list is first made)" if book.migrating
+                                                     else ""))
+    else:
+        names = pipeline_names(spirv) if checker_supports(exe, "--start", "--count") else []
     crashed: "list[str]" = []
 
+    def launch(start: int, count: "int | None") -> int:
+        """One checker process over names[start:start + count] (all of the index when count is None)."""
+        skip_args = ["--skip-file", skip] if crashed else []
+        if not book:
+            selection = ["--start", str(start), "--count", str(count)] if count is not None else []
+            return run(base + selection + skip_args, check=False)
+        batch = names[start:start + count]
+        with open(batch_names, "w", encoding="utf-8", newline="\n") as f:
+            f.write("".join(n + "\n" for n in batch))
+        drop(batch_done)
+        shard = book.new_shard()
+        try:
+            return run([exe, spirv, shard, *jobs_args, "--inflight-file", inflight, "--names-file", batch_names,
+                        "--done-file", batch_done, *skip_args], check=False)
+        finally:
+            book.harvest(batch_done, shard, batch)
+
+    def probe(name: str) -> bool:
+        """crashes_alone, into its own shard with the done-list when there is one."""
+        if not book:
+            return crashes_alone(exe, spirv, cache, name, inflight)
+        drop(batch_done)
+        shard = book.new_shard()
+        try:
+            return crashes_alone(exe, spirv, shard, name, inflight, names_file=batch_names, done_file=batch_done)
+        finally:
+            book.harvest(batch_done, shard, [name])
+
     def check_range(start: int = 0, count: "int | None" = None) -> int:
-        selection = ["--start", str(start), "--count", str(count)] if count is not None else []
         allowed = set(names[start:start + count]) if count is not None else None
         for _ in range(PIPELINE_CRASH_RETRIES + 1):
             drop(inflight)   # a crash during setup must not inherit another process's in-flight module names
-            code = run(base + selection + (["--skip-file", skip] if crashed else []), check=False)
+            code = launch(start, count)
             # Native setup failures also return 1. A finished pass writes/clears this report even when shaders
             # fail validation; setup failures return before writing it. Do not repeat setup for every batch.
             if code == 1 and not os.path.isfile(inflight):
@@ -2815,7 +2877,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
                                           if n not in crashed and (allowed is None or n in allowed)))
             # Even the last in-flight module can be innocent after other heavy compiles in the batch.
             if count is not None or len(suspects) > 1:
-                suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n, inflight)]
+                suspects = [n for n in suspects if probe(n)]
             if not suspects:
                 if count is not None and count > 1:
                     # All suspects survived in fresh processes: do not blacklist them. Re-check the entire failed
@@ -2847,7 +2909,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
 
     code = 0
     ranges = [(s, min(PIPELINE_BATCH_SIZE, len(names) - s))
-              for s in range(0, len(names), PIPELINE_BATCH_SIZE)] if names else [(0, None)]
+              for s in range(0, len(names), PIPELINE_BATCH_SIZE)] if names or book else [(0, None)]
     for start, count in ranges:
         if count is not None:
             log(f"pipelines: checking shaders {start + 1}-{start + count} of {len(names)} in a fresh process")
@@ -2860,12 +2922,20 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         code = 1
     if crashed:
         record_crashes(out, spirv, crashed)
-    drop(inflight)
+    drop(inflight, batch_names, batch_done)
+    if book and code != 2 and not interrupted(code):
+        # A validation failure still keeps what was built, as each batch's own cache save did before. A stopped
+        # run keeps its shards instead, and the next run merges them.
+        if code == 0:
+            code = seed_extras()
+        if code != 2 and not interrupted(code):
+            book.merge(exe)
     if code != 0:
         why = f"; {len(crashed)} module(s) took the driver down and were counted as failed (with their SPIR-V " \
               f"hashes in pipeline_crashes.json): " + ", ".join(crashed) if crashed else ""
         fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
-    seed_bvh()
+    if not book:
+        seed_extras()
     log("pipelines: done")
 
 
@@ -2941,12 +3011,22 @@ def pipeline_names(spirv: str) -> "list[str]":
     return sorted(index, key=lambda n: n.encode("utf-8"))
 
 
-def crashes_alone(exe: str, spirv: str, cache: str, name: str, inflight: str | None = None) -> bool:
-    """Confirm a crash only when this probe's fresh report names the selected module as in flight."""
+def crashes_alone(exe: str, spirv: str, cache: str, name: str, inflight: str | None = None, *,
+                  names_file: str | None = None, done_file: str | None = None) -> bool:
+    """Confirm a crash only when this probe's fresh report names the selected module as in flight. With names_file
+    (a checker with --names-file), the module is selected by name through that file, and done_file gets the
+    checker's --done-file."""
     names = pipeline_names(spirv)
     if name not in names:
         return False
-    args = [exe, spirv, cache, "--jobs", "1", "--start", str(names.index(name)), "--count", "1"]
+    if names_file:
+        with open(names_file, "w", encoding="utf-8", newline="\n") as f:
+            f.write(name + "\n")
+        args = [exe, spirv, cache, "--jobs", "1", "--names-file", names_file]
+        if done_file:
+            args += ["--done-file", done_file]
+    else:
+        args = [exe, spirv, cache, "--jobs", "1", "--start", str(names.index(name)), "--count", "1"]
     if inflight:
         drop(inflight)
         args += ["--inflight-file", inflight]
@@ -2966,6 +3046,338 @@ def crashes_alone(exe: str, spirv: str, cache: str, name: str, inflight: str | N
              "as in flight; the diagnostic result is inconclusive, so no crash is attributed to this module. "
              "Check the checker output, available memory and report-file access before retrying")
     return True
+
+
+# Shard caches and the done-list (docs/pipeline_check.md, "Shard caches and the done-list").
+PIPELINE_SHARD_OPTIONS = ("--names-file", "--done-file", "--merge", "--device-info")
+PIPELINE_DONE_FILE = "pipeline_done.json"
+PIPELINE_SHARD_DIR = "pipeline_shards"
+PIPELINE_DONE_FORMAT = 1
+PIPELINE_MERGE_COMMAND_CHARS = 24000   # inputs per --merge call: well under Windows' 32,767-character command line
+_SHARD_NAME = re.compile(r"^(\d+)\.bin$")
+# Shader sets beside the main index that the runtime seed needs, each checked whole in one process after the main set:
+# (folder under shaders/spirv, what the log calls it). Not library/ or fspx_gfx/: on NVIDIA the seed does not hit for
+# those (#1608).
+PIPELINE_EXTRA_SETS = (("bvh", "XboxBvhBuilder compute"), ("fspx", "FidelityFX (FSPX) compute"),
+                       ("exe", f"{EXE_IMAGE} graphics"))
+
+
+def checker_device_info(exe: str) -> dict:
+    """`vk_pipeline_check --device-info` as a dict: vendor, device, driver, api, uuid (pipelineCacheUUID) and name."""
+    try:
+        r = subprocess.run([exe, "--device-info"], capture_output=True, text=True, errors="replace", timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        fail(f"pipelines: cannot run {exe} --device-info: {e}")
+    line = next((x for x in (r.stdout or "").splitlines() if x.startswith("device-info ")), None)
+    if r.returncode or not line:
+        fail(f"pipelines: vk_pipeline_check --device-info exited with {exit_label(r.returncode)}: "
+             f"{(r.stderr or r.stdout or '').strip()[-400:]}")
+    fields, _, name = line[len("device-info "):].partition(" name=")
+    info = dict(f.split("=", 1) for f in fields.split() if "=" in f)
+    info["name"] = name.strip()
+    return info
+
+
+def checker_fingerprint(exe: str) -> str:
+    """What identifies the checker's behaviour. The checker in this checkout's runtime/build, when it is not older
+    than its sources, is named by those sources, so relinking the same code keeps the done-list (the cl.exe fallback
+    of scripts/build_runtime.ps1 rebuilds it on every runtime stage). Any other checker is named by its bytes."""
+    build = os.path.abspath(os.path.join(ROOT, "runtime", "build"))
+    h = hashlib.sha256()
+    if path_is_within(os.path.abspath(exe), build) and not newer_sources(exe, ROOT, "vk_pipeline_check"):
+        sources = sorted(program_sources(ROOT, "vk_pipeline_check"),
+                         key=lambda p: os.path.relpath(p, ROOT).replace(os.sep, "/"))
+        for path in sources:
+            with open(path, "rb") as f:
+                text = f.read().replace(b"\r\n", b"\n")   # the same sources with either checkout line ending
+            h.update(os.path.relpath(path, ROOT).replace(os.sep, "/").encode() + b"\0")
+            h.update(len(text).to_bytes(8, "little") + text)
+        return "sources:" + h.hexdigest()
+    try:
+        with open(exe, "rb") as f:
+            return "exe:" + hashlib.file_digest(f, "sha256").hexdigest()
+    except OSError as e:
+        fail(f"pipelines: cannot read {exe}: {e.strerror or e}")
+
+
+def pipeline_cache_device(path: str) -> "tuple[int, int, str] | None":
+    """Vendor ID, device ID and pipelineCacheUUID (hex) from a VkPipelineCacheHeaderVersionOne, or None when the
+    file is missing, short or not a version-one header (runtime/test/pipeline_cache_header.h)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+    except OSError:
+        return None
+    if len(head) < 32:
+        return None
+    size, version, vendor, device = struct.unpack_from("<4I", head)
+    if version != 1 or size < 32:
+        return None
+    return vendor, device, head[16:32].hex()
+
+
+def _file_stamp(path: str) -> "dict | None":
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+class PipelineDoneList:
+    """pipeline_done.json and pipeline_shards/ in the output folder.
+
+    The list records each module of the shader index that a checker process built without a failure, keyed by the
+    SHA-256 of its .spv and of its index entry, together with the shard (or pipeline_cache.bin) its pipeline was saved
+    to. The whole list holds only for one identity: the GPU and driver (vendor and device ID, driver version,
+    pipelineCacheUUID), the checker (checker_fingerprint), the partner stubs and this format; any change of these
+    checks every module again. Entries saved to pipeline_cache.bin hold while that file is still this driver's and no
+    smaller than the last merge left it (_cache_doubt): a write from outside (a checker run straight into it) only
+    adds pipelines. An entry whose shard is gone is dropped. The PIPELINE_EXTRA_SETS passes are recorded
+    the same way, by a digest of their folder."""
+
+    def __init__(self, out: str, spirv: str, cache: str, exe: str):
+        self.path = os.path.join(out, PIPELINE_DONE_FILE)
+        self.shards = os.path.join(out, PIPELINE_SHARD_DIR)
+        self.cache = cache
+        index_path = os.path.join(spirv, "index.json")
+        try:
+            with open(index_path, encoding="utf-8-sig") as f:
+                index = json.load(f)
+        except (OSError, ValueError) as e:
+            fail(f"pipelines: cannot read {index_path}: {getattr(e, 'strerror', None) or e}")
+        if not isinstance(index, dict):
+            fail(f"pipelines: {index_path} must contain a JSON object")
+        device = checker_device_info(exe)
+        self.identity = {
+            "format": PIPELINE_DONE_FORMAT,
+            "device": {k: device.get(k) for k in ("vendor", "device", "driver", "uuid", "name")},
+            "checker": checker_fingerprint(exe),
+            "stubs": self._stubs_digest(os.path.join(spirv, "stubs")),
+        }
+        previous = self._load()
+        self.migrating = False
+        records: dict = {}
+        self.cache_stamp = None
+        # PIPELINE_EXTRA_SETS passes: folder -> {"digest", "shard"}, checked like a module record
+        self.extras: "dict[str, dict]" = {}
+        if previous is None:
+            # No list yet: the first run checkpoints into an existing pipeline_cache.bin as before (each process loads
+            # and saves it), so what it already holds compiles from the cache instead of again from scratch.
+            self.migrating = bool((_file_stamp(cache) or {}).get("size"))
+        elif previous.get("identity") != self.identity:
+            old_device = (previous.get("identity") or {}).get("device")
+            if old_device == self.identity["device"]:
+                # Same GPU and driver, another checker or stubs: every module is checked again, but the pipelines
+                # pipeline_cache.bin already holds are still this driver's, so this run checkpoints into it as the
+                # first run does and they compile from it. Leftover shards are this driver's too: merged at the end.
+                log("pipelines: the checker or partner stubs changed since the done-list was written; checking every "
+                    "module again, from the existing pipeline_cache.bin")
+                self.migrating = bool((_file_stamp(cache) or {}).get("size"))
+            else:
+                log("pipelines: the GPU or driver changed since the done-list was written; building every module again")
+                shutil.rmtree(self.shards, ignore_errors=True)
+        else:
+            records = dict(previous.get("modules") or {})
+            extras = dict(previous.get("extras") or {})
+            if isinstance(previous.get("bvh"), dict):   # the list before fspx/ and exe/ had only this pass
+                extras.setdefault("bvh", previous["bvh"])
+            # checked like the modules just below, under keys no module name can have
+            records.update({(None, n): r for n, r in extras.items() if isinstance(r, dict)})
+            stamp = _file_stamp(cache)
+            if previous.get("cache") != stamp:
+                doubt = self._cache_doubt(previous.get("cache"), stamp)
+                merged = sum(1 for n, r in records.items() if not r.get("shard") and isinstance(n, str))
+                if doubt:
+                    if merged:
+                        log(f"pipelines: {doubt}, so the {merged} module(s) the done-list has in it are checked again")
+                    records = {n: r for n, r in records.items() if r.get("shard")}
+                elif merged:
+                    # Something else wrote to it (a checker run straight into it, a copy back): that only adds
+                    # pipelines, so what the last merge put there is still in it.
+                    log("pipelines: pipeline_cache.bin changed since the last merge but is no smaller and is this "
+                        "driver's; keeping the done-list")
+            self.cache_stamp = stamp
+            records = {n: r for n, r in records.items()
+                       if not r.get("shard") or os.path.isfile(os.path.join(self.shards, r["shard"]))}
+            self.extras = {n[1]: records.pop(n) for n in [k for k in records if isinstance(k, tuple)]}
+            # A first run that was stopped goes on checkpointing into the cache.
+            self.migrating = bool(previous.get("migrating")) and bool((_file_stamp(cache) or {}).get("size"))
+        self.names = sorted(index, key=lambda n: n.encode("utf-8"))
+        self.total = len(self.names)
+        self.current = self._module_keys(spirv, index, records)
+        self.records = {n: r for n, r in records.items()
+                        if self.current.get(n) and r.get("spv") == self.current[n]["spv"]
+                        and r.get("meta") == self.current[n]["meta"]}
+        self.todo = [n for n in self.names if n not in self.records]
+        numbers = [int(m.group(1)) for m in map(_SHARD_NAME.match, self._listdir()) if m]
+        self.next_shard = max(numbers, default=0) + 1
+        self.save()
+
+    def _cache_doubt(self, old: "dict | None", stamp: "dict | None") -> str:
+        """Why pipeline_cache.bin may no longer hold what the last merge put in it, or "" when nothing says so.
+        Another write to it (a checker run straight into it) only adds pipelines, so a change of size or time alone
+        is no reason; a cache that is gone, shrank or names another GPU or driver in its header is."""
+        name = os.path.basename(self.cache)
+        if not stamp or not stamp["size"]:
+            return f"{name} is gone or empty"
+        if old and isinstance(old.get("size"), int) and stamp["size"] < old["size"]:
+            return f"{name} shrank from {old['size']} to {stamp['size']} bytes since the last merge"
+        device = self.identity["device"]
+        try:
+            mine = (int(device["vendor"], 16), int(device["device"], 16), str(device["uuid"]).lower())
+        except (KeyError, TypeError, ValueError):
+            return ""
+        found = pipeline_cache_device(self.cache)
+        if found != mine:
+            what = ("has no pipeline cache header" if found is None else
+                    f"was written by vendor 0x{found[0]:04x} device 0x{found[1]:04x} pipelineCacheUUID {found[2]}")
+            return f"{name} {what}, not by this GPU and driver"
+        return ""
+
+    @staticmethod
+    def _stubs_digest(stubs: str) -> str:
+        h = hashlib.sha256()
+        try:
+            names = sorted(os.listdir(stubs))
+        except OSError:
+            return ""
+        for name in names:
+            path = os.path.join(stubs, name)
+            if os.path.isfile(path):
+                with open(path, "rb") as f:
+                    data = f.read()
+                h.update(name.encode() + b"\0" + len(data).to_bytes(8, "little") + data)
+        return h.hexdigest()
+
+    def _load(self) -> "dict | None":
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                doc = json.load(f)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as e:
+            log(f"pipelines: {self.path} is unreadable ({getattr(e, 'strerror', None) or e}); starting a new one")
+            return {}
+        return doc if isinstance(doc, dict) else {}
+
+    def _listdir(self) -> "list[str]":
+        try:
+            return os.listdir(self.shards)
+        except OSError:
+            return []
+
+    @staticmethod
+    def _module_keys(spirv: str, index: dict, records: dict) -> dict:
+        """name -> {spv, meta, size, mtime_ns}, or None for a module without its .spv. A .spv with the size and
+        modification time of its record keeps the recorded hash instead of being read again."""
+        def key(name: str) -> "dict | None":
+            path = os.path.join(spirv, name + ".spv")
+            stamp = _file_stamp(path)
+            if stamp is None:
+                return None
+            old = records.get(name) or {}
+            if old.get("size") == stamp["size"] and old.get("mtime_ns") == stamp["mtime_ns"] and old.get("spv"):
+                spv = old["spv"]
+            else:
+                try:
+                    with open(path, "rb") as f:
+                        spv = hashlib.file_digest(f, "sha256").hexdigest()
+                except OSError:
+                    return None
+            meta = hashlib.sha256(json.dumps(index[name], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            return {"spv": spv, "meta": meta, **stamp}
+        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+            return dict(zip(index, pool.map(key, index)))
+
+    def new_shard(self) -> str:
+        """The cache path for the next checker process: a new shard, or pipeline_cache.bin itself while migrating."""
+        if self.migrating:
+            return self.cache
+        os.makedirs(self.shards, exist_ok=True)
+        path = os.path.join(self.shards, f"{self.next_shard:05d}.bin")
+        self.next_shard += 1
+        return path
+
+    def harvest(self, done_file: str, shard: str, batch: "list[str]") -> None:
+        """Record the modules of `batch` that the checker's --done-file lists; absent when the process died."""
+        try:
+            with open(done_file, encoding="utf-8") as f:
+                passed = {line.strip() for line in f if line.strip()}
+        except OSError:
+            passed = set()
+        where = None if self.migrating else os.path.basename(shard)
+        for name in batch:
+            if name in passed and self.current.get(name):
+                self.records[name] = {**self.current[name], "shard": where}
+        if self.migrating:
+            self.cache_stamp = _file_stamp(self.cache)
+        self.save()
+
+    @staticmethod
+    def directory_digest(directory: str) -> str:
+        """SHA-256 over the names and bytes of what the checker reads in `directory`: index.json and the .spv files."""
+        h = hashlib.sha256()
+        for name in sorted(os.listdir(directory)):
+            path = os.path.join(directory, name)
+            if os.path.isfile(path) and (name == "index.json" or name.endswith(".spv")):
+                with open(path, "rb") as f:
+                    h.update(name.encode() + b"\0" + hashlib.file_digest(f, "sha256").digest())
+        return h.hexdigest()
+
+    def extra_done(self, name: str, digest: str) -> bool:
+        return (self.extras.get(name) or {}).get("digest") == digest
+
+    def record_extra(self, name: str, digest: str, shard: str) -> None:
+        self.extras[name] = {"digest": digest, "shard": None if self.migrating else os.path.basename(shard)}
+        self.save()
+
+    def save(self) -> None:
+        doc = {"format": PIPELINE_DONE_FORMAT, "identity": self.identity, "cache": self.cache_stamp,
+               "migrating": self.migrating, "extras": dict(sorted(self.extras.items())),
+               "modules": dict(sorted(self.records.items()))}
+        staged = self.path + ".tmp"
+        with open(staged, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f, separators=(",", ":"))
+            f.write("\n")
+        replace_retry(staged, self.path)
+
+    def merge(self, exe: str) -> None:
+        """Merge every shard into pipeline_cache.bin (vk_pipeline_check --merge), then remove them. A failed merge
+        leaves the cache and the shards as they were, so the next run merges them again."""
+        if self.migrating:   # the first pass is over (the BVH pipelines went into the cache too): shards from now on
+            self.migrating = False
+            self.cache_stamp = _file_stamp(self.cache)
+            self.save()
+        shards = sorted((n for n in self._listdir() if _SHARD_NAME.match(n)), key=lambda n: int(n.split(".")[0]))
+        if not shards:
+            return
+        log(f"pipelines: merging {len(shards)} shard cache(s) into {os.path.basename(self.cache)}")
+        while shards:
+            chunk, length = [], len(exe) + len(self.cache) + 16
+            for name in shards:
+                path = os.path.join(self.shards, name)
+                if chunk and length + len(path) + 3 > PIPELINE_MERGE_COMMAND_CHARS:
+                    break
+                chunk.append(name)
+                length += len(path) + 3
+            shards = shards[len(chunk):]
+            code = run([exe, "--merge", self.cache, *(os.path.join(self.shards, n) for n in chunk)], check=False)
+            if code:
+                fail(f"pipelines: merging the shard caches into {self.cache} exited with {exit_label(code)}; the "
+                     f"shards stay in {self.shards} and the next run of this stage merges them again")
+            merged = set(chunk)
+            for record in [*self.records.values(), *self.extras.values()]:
+                if record.get("shard") in merged:
+                    record["shard"] = None
+            self.cache_stamp = _file_stamp(self.cache)
+            self.save()
+            for name in chunk:
+                drop(os.path.join(self.shards, name))
+        try:
+            os.rmdir(self.shards)
+        except OSError:
+            pass
 
 
 def path_is_within(path: str, directory: str) -> bool:
