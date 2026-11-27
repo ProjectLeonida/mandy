@@ -252,6 +252,24 @@ bool copy_guarded_host(std::uint8_t* to, const std::uint8_t* from, std::size_t b
     }
 }
 
+// Whether two byte ranges differ, one of them title memory that may go away meanwhile: false when a page faults. No
+// C++ objects here: it is a __try frame, and the compare is a loop of its own (a fault inside the CRT's memcmp never
+// reaches the __except under Wine, src/guarded_copy.h).
+__declspec(noinline) LEONIDA_GUARDED_NO_BUILTIN bool bytes_differ(const std::uint8_t* a, const std::uint8_t* b,
+                                                                  std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i)
+        if (a[i] != b[i]) return true;
+    return false;
+}
+bool differ_guarded(const std::uint8_t* a, const std::uint8_t* b, std::size_t n, bool& differs) {
+    __try {
+        differs = bytes_differ(a, b, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // The same, reading the title's pages that xmem's frame table holds through their frames: a stream pool's GPU-only
 // pages and their CPU twins after queue slot 31's copies have no host view (src/title_frames.h). A frame is a section's
 // scratch view, cached memory, so it is not read streaming.
@@ -3298,8 +3316,10 @@ struct DeviceState {
         // The page mirror holds the title's bytes at heap_base + the address the GPU names (a GPU-only page reads its
         // own physical page there, not its CPU view's), so no copy is made.
         if (span && guest && page_mirror.mirror && leonida::title_va_aliases().shader_va(guest, span) == guest &&
-            page_mirror_resolve(guest, span))
+            page_mirror_resolve(guest, span)) {
+            if (!read_only) note_title_write(guest, span);
             return guest;
+        }
         if (!geometry.cap() || !span || !guest || !watch_shadow_writes()) return no(NoCopy::no_geometry);
         const auto cpu = leonida::title_gpu_views::to_cpu(guest, span);
         auto& aliases = leonida::title_va_aliases();
@@ -3494,12 +3514,17 @@ struct DeviceState {
         if (finished.empty()) return;
         std::uint64_t written = 0, ranges = 0;
         for (const auto& [begin, end] : finished)
+        {
             for (const ShadowPagesPtr& s : shadows)
                 if (end > s->first() && begin < s->last()) {
                     const std::uint64_t bytes = s->write_back(begin, end);
                     written += bytes;
                     ranges += bytes != 0;
                 }
+            const std::uint64_t mirrored = page_mirror_write_back(begin, end);  // the page mirror's homes
+            written += mirrored;
+            ranges += mirrored != 0;
+        }
         title_write_back_total += written;
         if (!written) return;
         if (++title_write_back_calls <= 4 || !(title_write_back_calls & (title_write_back_calls - 1)))
@@ -3668,6 +3693,7 @@ struct DeviceState {
         }
         // The page mirror: the address itself (heap_base + va), no window, extent or copy.
         if (page_mirror_resolve(va, want)) {
+            note_title_write(va, want);
             out = va;
             return true;
         }
@@ -3741,7 +3767,10 @@ struct DeviceState {
         std::uint64_t lo = 0, hi = 0;
         if (!aliases.title_memory(va, lo, hi) || span > hi - va) return 0;
         // In the page mirror the structure is the title's own pages (their homes keep what the GPU writes).
-        if (page_mirror_resolve(va, span)) return va;
+        if (page_mirror_resolve(va, span)) {
+            note_title_write(va, span);
+            return va;
+        }
         if (!geometry.cap() || !watch_shadow_writes()) return 0;
         const auto cpu = leonida::title_gpu_views::to_host_view(static_cast<std::uintptr_t>(va),
                                                                 static_cast<std::uintptr_t>(span));
@@ -4291,8 +4320,10 @@ struct DeviceState {
         // Title memory the page mirror holds: the V# names it as the title wrote it (heap_base + base is the mirror).
         if (page_mirror.mirror) {
             uint64_t lo{}, hi{};
-            if (aliases.title_memory(base, lo, hi) && bytes <= hi - base && page_mirror_resolve(base, bytes))
+            if (aliases.title_memory(base, lo, hi) && bytes <= hi - base && page_mirror_resolve(base, bytes)) {
+                note_title_write(base, bytes);  // a V# has no read/write bit: its range may be written
                 return path(6), base;
+            }
         }
         // An already rewritten descriptor carries only the low 48 bits.
         uint64_t offset = base;
@@ -4548,6 +4579,7 @@ struct DeviceState {
         // Since the last log line.
         std::uint64_t refreshes = 0, fed = 0, dirty = 0, uploads = 0, batches = 0, binds = 0, arm_failures = 0;
         std::uint64_t resolved = 0, resolve_refused = 0, identity_mapped = 0, identity_released = 0, clipped = 0;
+        std::uint64_t written_back = 0, buffers = 0;
         double ms = 0;
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
     } page_mirror;
@@ -4755,6 +4787,19 @@ struct DeviceState {
         }
         e[from] = to;
     }
+    // A slot-133 buffer over mirrored title memory (Resource::create_mirror_buffer): the chunk and offset that hold
+    // all of [va, va + bytes), naming it to the mirror first. False when the mirror does not hold all of it or it
+    // spans two chunks (one buffer binding cannot): the buffer then gets its old backing.
+    bool page_mirror_chunk(std::uint64_t va, std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
+        if (!page_mirror.mirror || !bytes) return false;
+        std::lock_guard lock(page_mirror.mutex);
+        if (!page_mirror_resolve_locked(va, bytes, true) || !page_mirror.mirror->chunk_at(va, buffer, offset) ||
+            bytes > leonida::TitleMirror::kChunk - offset)
+            return false;
+        ++page_mirror.buffers;
+        return true;
+    }
+
     // VulkanContext's mirror lookup (set_mirror_buffer): the chunk and offset that hold [va, va + size), when the mirror
     // holds all of it already (named before: nothing is mirrored during a replay, whose binds would land after it). A
     // range that runs past its chunk is cut at the chunk's end (counted): a buffer binding cannot span two chunks.
@@ -4769,6 +4814,40 @@ struct DeviceState {
         }
         return true;
     }
+    // What the GPU wrote into the homes of mirrored pages of [begin, end) goes back to the title's pages, as
+    // ShadowPages::write_back does for a shadow: after the submissions that could write them have retired
+    // (write_back_titles), only the 256-byte pieces whose home differs from the title's page, and only on a page nothing
+    // wrote since it was last watched (a page written on both sides keeps the title's bytes, which are uploaded over
+    // the home before the next submission). Written through kernel_writes, which opens and pins the page and every
+    // other address of its physical page, so the readers over them take the bytes. Returns the bytes written.
+    std::uint64_t page_mirror_write_back(std::uint64_t begin, std::uint64_t end) {
+        auto& m = page_mirror;
+        if (!m.mirror || begin >= end) return 0;
+        constexpr std::uint64_t kPage = leonida::TitleMirror::kPage, kPiece = 256;
+        std::lock_guard lock(m.mutex);
+        std::uint64_t written = 0;
+        for (std::uint64_t page = begin & ~(kPage - 1); page < end; page += kPage) {
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            std::uint8_t* home = nullptr;
+            const std::uint8_t* frame = m.mirror->frame_at(page);
+            if (!frame || !m.mirror->home_at(page, memory, offset, &home) || !m.tracking->unwritten(page)) continue;
+            const std::uint64_t from = std::max(begin, page), to = std::min(end, page + kPage);
+            for (std::uint64_t at = from & ~(kPiece - 1); at < to; at += kPiece) {
+                const std::uint64_t a = std::max(at, from), b = std::min(at + kPiece, to);
+                const std::uint8_t* gpu = home + (a - page);
+                const std::uint8_t* title = frame + (a - page);
+                bool differs = false;
+                // A title page gone since (decommitted, unmapped) has nothing to write back into.
+                if (!differ_guarded(gpu, title, std::size_t(b - a), differs) || !differs) continue;
+                if (leonida::kernel_writes::write(reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)), gpu, b - a))
+                    written += b - a;
+            }
+        }
+        m.written_back += written;
+        return written;
+    }
+
     // Last in the before-execute hook, once every reader of this submission has named what it reads: the binds noted
     // since the last batch go in one, and every queue's next submission waits for it (the ordering rule).
     void flush_page_mirror() {
@@ -4852,7 +4931,8 @@ struct DeviceState {
                          "(%llu not placed); in %.0f s: %llu refreshes, %llu changes fed, %llu pages written, %llu "
                          "uploads, %llu binds in %llu batches, %llu arms refused, %.3f ms a refresh; changes outside "
                          "the chunks %llu; readers: %llu ranges resolved into it, %llu refused, %llu ordinary pages "
-                         "mirrored and %llu released, %llu buffer bindings cut at a chunk's end\n",
+                         "mirrored and %llu released, %llu buffer bindings cut at a chunk's end; %llu slot-133 buffers "
+                         "made on it, %llu KiB of GPU writes copied back\n",
                          static_cast<unsigned long long>(c.pages), static_cast<unsigned long long>(c.homes),
                          static_cast<unsigned long long>(c.units),
                          static_cast<unsigned long long>(c.units * (leonida::TitleMirror::kUnitBytes >> 20)),
@@ -4865,9 +4945,11 @@ struct DeviceState {
                          static_cast<unsigned long long>(c.unmirrored_changes),
                          static_cast<unsigned long long>(m.resolved), static_cast<unsigned long long>(m.resolve_refused),
                          static_cast<unsigned long long>(m.identity_mapped),
-                         static_cast<unsigned long long>(m.identity_released), static_cast<unsigned long long>(m.clipped));
+                         static_cast<unsigned long long>(m.identity_released), static_cast<unsigned long long>(m.clipped),
+                         static_cast<unsigned long long>(m.buffers), static_cast<unsigned long long>(m.written_back >> 10));
             m.refreshes = m.fed = m.dirty = m.uploads = m.batches = m.binds = m.arm_failures = 0;
             m.resolved = m.resolve_refused = m.identity_mapped = m.identity_released = m.clipped = 0;
+            m.written_back = m.buffers = 0;
             m.ms = 0;
             m.since = now;
         }
@@ -9656,6 +9738,33 @@ public:
     // of command lists the pages the title wrote since are copied again (ShadowPages, DeviceState::refresh_shadows).
     // One way only: what the GPU writes to the shadow is NOT copied back to the title's pages, and the next copy of
     // a page overwrites it. A title that reads GPU output at `address` needs the import.
+    // A buffer on title memory the page mirror holds (step C): bound to the mirror's chunk at heap_base + the title's
+    // address, so the GPU reads and writes the pages' homes, every view of the same pages shares them, and the
+    // per-submission shadow copy, its walk and its guards go. Its VA is the title's address; V#s and root views naming
+    // it keep that address (heap_base + it is the chunk). The CPU's Map answers the title's pages, as an import does;
+    // the GPU's writes go back to them after the submission (DeviceState::page_mirror_write_back). E_NOTIMPL when the
+    // mirror is off or does not hold the range in one chunk: an import or a shadow then answers, as before.
+    HRESULT create_mirror_buffer(void* address) {
+        const auto start = reinterpret_cast<std::uintptr_t>(address);
+        if (!address || !desc_.Width || desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return E_NOTIMPL;
+        VkBuffer chunk = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        if (!device_.page_mirror_chunk(start, desc_.Width, chunk, offset)) return E_NOTIMPL;
+        mapped_ = address;
+        va_ = start;
+        buffer_va_ = gpu_va_ = device_.page_mirror_address(start);
+        leonida::ResourceBinding binding{};
+        binding.buffer = chunk;
+        binding.indirect_arguments = true;  // the chunks carry every buffer usage (sparse_buffer_info)
+        binding.buffer_offset = offset;
+        binding.size = desc_.Width;
+        binding.host = static_cast<const std::uint8_t*>(address);
+        binding.host_readable = true;
+        binding.va = va_;
+        device_.context->add_resource(id(), binding);
+        return S_OK;
+    }
+
     HRESULT create_shadow_buffer(void* address) {
         auto& vk = device_.context->vk;
         if (!address || !desc_.Width || desc_.Width > ~UINT64(0) - D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
@@ -20194,6 +20303,8 @@ public:
         heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
         auto* resource = new Resource(state_, desc, heap, D3D12_HEAP_FLAG_NONE);
         resource->attach_device(identity());
+        // Title memory the page mirror holds: the buffer is the mirror's chunk there (no import, no shadow).
+        if (SUCCEEDED(resource->create_mirror_buffer(address))) return d3d12_trace::result(method, hand_out(resource, riid, out));
         const HRESULT hr = resource->create_host_buffer(address);
         if (hr == E_INVALIDARG) {
             resource->Release();

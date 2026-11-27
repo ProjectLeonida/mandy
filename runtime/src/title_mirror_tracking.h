@@ -27,6 +27,10 @@ public:
     virtual void watch(std::uint64_t page) = 0;
     virtual void unwatch(std::uint64_t page) = 0;
     virtual void collect(std::vector<std::uint64_t>& out) = 0;
+    // True when nothing has written the page since it was last watched (watch or collect): the mirror may then copy
+    // what the GPU wrote into its home back to the title's page. False when not known: no copy back (the title's bytes
+    // win), which a policy that cannot tell must answer.
+    virtual bool unwritten(std::uint64_t) { return false; }
     // Diagnostics since the last call: guards that could not be set.
     virtual std::uint64_t take_refused() { return 0; }
 };
@@ -50,6 +54,7 @@ public:
     void unwatch(std::uint64_t page) override {
         const auto it = cells_.find(page);
         if (it == cells_.end()) return;
+        armed_.erase(page);
         geometry_writes::release(page);
         cells_.erase(it);
     }
@@ -71,16 +76,26 @@ public:
         }
     }
     std::uint64_t take_refused() override { return std::exchange(refused_, 0); }
+    bool unwritten(std::uint64_t page) override {
+        const auto it = cells_.find(page);
+        if (it == cells_.end()) return false;
+        const auto armed = armed_.find(page);
+        return armed != armed_.end() && it->second->version.load(std::memory_order_acquire) == armed->second;
+    }
 
 private:
     void arm(std::uint64_t page, geometry_writes::Cell& cell) {
+        // The version before the guard: a write after this moves it (unwritten() then says no).
+        armed_[page] = cell.version.load(std::memory_order_acquire);
         if (geometry_writes::arm(std::uintptr_t(page), cell)) return;
+        armed_.erase(page);
         ++refused_;
         unarmed_.push_back(std::uintptr_t(page));
     }
 
     geometry_writes::WriteQueue queue_;
     std::unordered_map<std::uint64_t, geometry_writes::Cell*> cells_;
+    std::unordered_map<std::uint64_t, std::uint64_t> armed_;  // page -> its cell's version when it was last armed
     std::vector<std::uintptr_t> tiles_, unarmed_;
     std::uint64_t refused_ = 0;
 };

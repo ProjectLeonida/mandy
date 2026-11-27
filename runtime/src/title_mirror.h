@@ -193,6 +193,11 @@ public:
         return true;
     }
     bool mirrored(std::uint64_t va) const { return pages_.count(va & ~(kPage - 1)) != 0; }
+    // The physical page's bytes the mirrored page at `va` shows (its frame; for ordinary memory the page itself).
+    std::uint8_t* frame_at(std::uint64_t va) const {
+        const auto page = pages_.find(va & ~(kPage - 1));
+        return page == pages_.end() ? nullptr : page->second;
+    }
     // The chunk over `va` and the offset of `va` in it (tests and diagnostics).
     bool chunk_at(std::uint64_t va, VkBuffer& buffer, VkDeviceSize& offset) const {
         const auto it = chunks_.find(va / kChunk);
