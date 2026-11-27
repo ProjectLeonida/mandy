@@ -48,7 +48,7 @@ void failed(const char* what, const std::string& why) {
 
 // A minimal but valid x64 image: DOS stub, PE32+ headers, one .text section holding a recognisable byte pattern.
 // No imports, exports or relocations unless a case adds them.
-std::vector<uint8_t> make_image() {
+std::vector<uint8_t> make_image(uint64_t base_hint = 0x140000000) {
     std::vector<uint8_t> bytes(0x400, 0);
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(bytes.data());
     dos->e_magic = IMAGE_DOS_SIGNATURE;
@@ -59,7 +59,7 @@ std::vector<uint8_t> make_image() {
     nt->FileHeader.NumberOfSections = 1;
     nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
     nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
-    nt->OptionalHeader.ImageBase = leonida_test::free_image_base(0x140000000);
+    nt->OptionalHeader.ImageBase = leonida_test::free_image_base(base_hint);
     nt->OptionalHeader.AddressOfEntryPoint = 0x1000;
     nt->OptionalHeader.SizeOfHeaders = 0x200;
     nt->OptionalHeader.SizeOfImage = 0x2000;
@@ -560,8 +560,8 @@ void emit_store_stub(std::vector<uint8_t>& img, size_t off, uint64_t addr, uint3
 
 // make_image() plus a TLS directory and an entry point, both aimed at real machine code: a stub that stores a
 // sentinel in this process, so the test can tell a callback ran rather than only that it was parsed.
-std::vector<uint8_t> make_init_image() {
-    auto img = make_image();
+std::vector<uint8_t> make_init_image(uint64_t base_hint = 0x140000000) {
+    auto img = make_image(base_hint);
     auto* nt = nt_of(img);
     nt->FileHeader.Characteristics |= IMAGE_FILE_DLL;
     nt->OptionalHeader.AddressOfEntryPoint = 0x1040;
@@ -837,8 +837,8 @@ void expect_notifications(const char* what, const std::vector<Notification>& exp
     else failed(what, "unexpected TLS/DllMain notification count or order");
 }
 
-std::vector<uint8_t> make_lifecycle_image() {
-    auto img = make_init_image();
+std::vector<uint8_t> make_lifecycle_image(uint64_t base_hint = 0x140000000) {
+    auto img = make_init_image(base_hint);
     emit_jump_stub(img, 0x200, reinterpret_cast<uint64_t>(&observe_tls));
     emit_jump_stub(img, 0x240, reinterpret_cast<uint64_t>(&observe_dllmain));
     emit_jump_stub(img, 0x300, reinterpret_cast<uint64_t>(&observe_fls));
@@ -989,6 +989,143 @@ void test_attach_reserved() {
         else pass("a run-time load's DllMain gets a NULL lpvReserved");
     } catch (const std::exception& e) {
         failed("a run-time load's DllMain gets a NULL lpvReserved", e.what());
+    }
+
+    reset_notifications();
+    try {
+        write_image_as(make_lifecycle_image(), "attach_reserved_dynamic_w.dll");
+        rt::Loader loader(g_dir);
+        bool handled = false;
+        void* h = loader.load_runtime_module_w(L"attach_reserved_dynamic_w.dll", 0, handled);
+        if (!handled || !h) failed("a wide run-time load's DllMain gets a NULL lpvReserved", "the run-time load failed");
+        else if (!g_attach_seen) failed("a wide run-time load's DllMain gets a NULL lpvReserved", "DllMain was not called");
+        else if (g_attach_reserved) failed("a wide run-time load's DllMain gets a NULL lpvReserved", "lpvReserved was non-NULL");
+        else pass("a wide run-time load's DllMain gets a NULL lpvReserved");
+    } catch (const std::exception& e) {
+        failed("a wide run-time load's DllMain gets a NULL lpvReserved", e.what());
+    }
+}
+
+void test_failed_runtime_init_and_load_rollback() {
+    // 1. A runtime load whose TLS callback table throws before DllMain must not stay in init_order_ and poison later
+    //    unrelated runtime loads.
+    {
+        const char* what = "a runtime load that fails in TLS callbacks does not break later runtime loads";
+        reset_notifications();
+        auto bad_tls = make_lifecycle_image(0x184000000);
+        *reinterpret_cast<uint64_t*>(bad_tls.data() + 0x290) = nt_of(bad_tls)->OptionalHeader.ImageBase + 0x9000;
+        write_image_as(bad_tls, "rt_bad_tls.dll");
+        auto good = make_lifecycle_image(0x185000000);
+        write_image_as(good, "rt_after_bad_tls.dll");
+        rt::Loader loader(g_dir);
+        bool handled = false;
+        void* bad_h = loader.load_runtime_module("rt_bad_tls.dll", 0, handled);
+        void* good_h = loader.load_runtime_module("rt_after_bad_tls.dll", 0, handled);
+        if (bad_h) failed(what, "the corrupt TLS DLL unexpectedly loaded");
+        else if (loader.find_loaded_module("rt_bad_tls.dll")) failed(what, "the failed DLL stayed findable by name");
+        else if (!good_h) failed(what, "the later valid runtime load failed because of the abandoned module");
+        else pass(what);
+    }
+
+    // 2. When a runtime-loaded parent's dependency returns FALSE from DllMain, neither the failed dependency nor the
+    //    uninitialised parent stays findable by name, and a later runtime load must not execute the abandoned parent.
+    {
+        const char* what = "a runtime load whose dependency fails DllMain drops both from lookup and skips abandoned parent";
+        reset_notifications();
+        auto dep = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x186000000);
+        nt_of(dep)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+        nt_of(dep)->OptionalHeader.AddressOfEntryPoint = 0x11C0;
+        emit_jump_stub(dep, 0x3C0, reinterpret_cast<uint64_t>(&observe_dllmain));
+        write_image_as(dep, "rt_fail_dep.dll");
+
+        auto parent = make_import_image("rt_fail_dep.dll", "fwd");
+        nt_of(parent)->OptionalHeader.ImageBase = leonida_test::free_image_base(0x187000000);
+        nt_of(parent)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+        nt_of(parent)->OptionalHeader.AddressOfEntryPoint = 0x11C0;
+        emit_jump_stub(parent, 0x3C0, reinterpret_cast<uint64_t>(&observe_dllmain));
+        write_image_as(parent, "rt_fail_parent.dll");
+
+        auto unrelated = make_lifecycle_image(0x188000000);
+        write_image_as(unrelated, "rt_unrelated_good.dll");
+
+        rt::Loader loader(g_dir);
+        g_fail_attach = true;
+        bool handled = false;
+        void* p_h = loader.load_runtime_module("rt_fail_parent.dll", 0, handled);
+        g_fail_attach = false;
+        const size_t notifications_before_good = g_notifications.size();
+        void* u_h = loader.load_runtime_module("rt_unrelated_good.dll", 0, handled);
+        bool ran_parent = false;
+        for (size_t i = notifications_before_good; i < g_notifications.size(); ++i)
+            if (g_notifications[i].base != u_h) ran_parent = true;
+        if (p_h) failed(what, "the parent loaded despite its dependency returning FALSE");
+        else if (loader.find_loaded_module("rt_fail_dep.dll") || loader.find_loaded_module("rt_fail_parent.dll"))
+            failed(what, "the failed dependency or parent remained findable by name");
+        else if (!u_h) failed(what, "the unrelated DLL failed to load afterwards");
+        else if (ran_parent) failed(what, "a later runtime load ran the abandoned parent's DllMain");
+        else pass(what);
+    }
+
+    // 3. A failed Loader::load() after map_image() (e.g. corrupt unwind table) must roll back order_, ranges_, and its
+    //    static TLS slot so repeated failures do not exhaust the 16 TLS slots or expose half-mapped images.
+    {
+        const char* what = "failed loads after TLS setup roll back modules, address ranges, and static TLS slots";
+        rt::Loader loader(g_dir);
+        bool saw_tls_exhaustion = false;
+        bool saw_unexpected_error = false;
+        uint64_t leaked_addr = 0;
+        for (int i = 0; i < 20; ++i) {
+            auto bad = make_init_image(0x190000000ull + static_cast<uint64_t>(i) * 0x10000ull);
+            // Add an out-of-bounds unwind table (0x1FF8 + 12 > 0x2000) so map_image() + initialize_tls() succeed,
+            // then register_unwind() throws.
+            auto& exc = nt_of(bad)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+            exc.VirtualAddress = 0x1FF8;
+            exc.Size = sizeof(RUNTIME_FUNCTION);
+            const uint64_t probe = nt_of(bad)->OptionalHeader.ImageBase + 0x1000;
+            const auto p = write_image_as(bad, "rollback_tls_" + std::to_string(i) + ".dll");
+            try {
+                loader.load(p);
+                return failed(what, "the image with a corrupt unwind table unexpectedly loaded");
+            } catch (const std::exception& e) {
+                const std::string msg = e.what();
+                if (msg.find("static TLS slots are in use") != std::string::npos) saw_tls_exhaustion = true;
+                else if (msg.find("the exception directory runs past the image") == std::string::npos)
+                    saw_unexpected_error = true;
+            }
+            std::string mod;
+            uint32_t rva = 0;
+            if (loader.find_address(probe, mod, rva)) leaked_addr = probe;
+        }
+        if (saw_tls_exhaustion) failed(what, "failed loads leaked static TLS slots and exhausted the 16-slot pool");
+        else if (saw_unexpected_error) failed(what, "expected exception-directory failure after TLS setup");
+        else if (leaked_addr) failed(what, "failed loads left mapped ranges in Loader::find_address()");
+        else if (!loader.modules().empty()) failed(what, "failed loads left entries in loader.modules()");
+        else pass(what);
+    }
+
+    // 4. patch_ga_tls_reads handles an executable section with Misc.VirtualSize == 0 (falling back to SizeOfRawData).
+    {
+        const char* what = "GA TLS patching scans executable sections whose VirtualSize is 0";
+        auto img = make_init_image();
+        auto* nt = nt_of(img);
+        nt->FileHeader.Characteristics &= ~IMAGE_FILE_DLL;  // EXE, so /GA rewrite runs when not at index 0
+        IMAGE_FIRST_SECTION(nt)->Misc.VirtualSize = 0;      // PE/COFF: use SizeOfRawData
+        // Place `mov rax, gs:[58h]` (65 48 8B 04 25 58 00 00 00) at RVA 0x1140 (file offset 0x340).
+        const uint8_t gs58[9] = {0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0x00, 0x00, 0x00};
+        std::memcpy(img.data() + 0x340, gs58, sizeof(gs58));
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(write_image_as(img, "ga_vsize0.exe"));
+            if (m.tls_index == 0) {
+                pass(what);  // host did not hold index 0, so no rewrite needed
+            } else if (m.tls_ga_sites != 1 || m.tls_ga_slot == rt::kNoTlsIndex) {
+                failed(what, "the gs:[58h] read in the VirtualSize==0 section was not patched");
+            } else {
+                pass(what);
+            }
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
     }
 }
 
@@ -1491,6 +1628,27 @@ void test_compat_modules() {
             else pass(what);
         }
         {
+            const char* what = "a forwarded export honours LEONIDA_COMPAT_DIR over a shim";
+            const auto fwd_dll_path = compat / "testcompat_fwd.dll";
+            write_image_as(make_os_dll(0x1C2000000), "compat/testcompat_fwd.dll");
+            write_image_as(make_forwarder_image("testcompat_fwd.Answer", 0x1C0000000), "prov_compat_ok.dll");
+            write_image_as(make_forwarder_image("testshim.F", 0x1C1000000), "prov_compat_own.dll");
+            auto r_ok = bind_with_compat(compat, "prov_compat_ok.dll", "fwd", bound);
+            HMODULE h = GetModuleHandleW(fwd_dll_path.c_str());
+            auto expected = h ? reinterpret_cast<void*>(GetProcAddress(h, "Answer")) : nullptr;
+            void* bound_own = nullptr;
+            auto r_own = bind_with_compat(compat, "prov_compat_own.dll", "fwd", bound_own);
+            if (r_ok.binding != rt::Binding::Host || !expected || bound != expected ||
+                reinterpret_cast<int (*)()>(bound)() != 42)
+                failed(what, "forwarded export to compat DLL did not bind to its Answer export");
+            else if (r_own.binding != rt::Binding::Unimplemented ||
+                     bound_own == reinterpret_cast<void*>(&test_shim_function))
+                failed(what, "forwarded export to a missing compat symbol fell through to the shim");
+            else
+                pass(what);
+            while (HMODULE fh = GetModuleHandleW(fwd_dll_path.c_str())) FreeLibrary(fh);
+        }
+        {
             const char* what = "a compat file Windows cannot load is reported, not skipped";
             std::filesystem::path bad = g_dir / "compat_bad";
             std::filesystem::create_directories(bad);
@@ -1570,6 +1728,7 @@ int main() {
         test_process_detach_invalid_tls();
         test_process_detach_without_entry();
         test_attach_reserved();
+        test_failed_runtime_init_and_load_rollback();
         test_process_detach_dependencies();
         test_failed_dependency_not_registered();
         test_delay_descriptor_fields();
