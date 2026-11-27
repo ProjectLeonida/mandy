@@ -63,10 +63,10 @@ class SampledDynamicIndex(unittest.TestCase):
                 r"(%\w+) = OpSelect %uint %\w+ (%\w+) (%\w+)", asm)
                 if true_value in lookup_indices and false_value == "%c0"}
             # These T#s come from user SGPRs, not a heap slot, so they are looked up, and the index word of their
-            # dword 6 wins where it carries the tag (docs/design.md, "Bindless index in the T#"): an OpSelect whose
-            # false side is the lookup's index.
-            more |= {res for res, false_value in re.findall(
-                r"(%\w+) = OpSelect %uint %\w+ %\w+ (%\w+)", asm) if false_value in lookup_indices}
+            # dword 6 wins where it carries the tag (docs/design.md, "Bindless index in the T#"): an OpPhi of the
+            # word and the lookup's index, which runs only without the word.
+            more |= {res for res, probed in re.findall(
+                r"(%\w+) = OpPhi %uint %\w+ %\w+ (%\w+) %\w+", asm) if probed in lookup_indices}
             if more <= lookup_indices:
                 break
             lookup_indices |= more

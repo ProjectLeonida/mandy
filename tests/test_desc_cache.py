@@ -236,12 +236,12 @@ def test_lookup_result_is_broadcast_before_use():
     extracts = {ln.split()[0]: ln.split()[-2] for ln in lines
                 if "OpCompositeExtract %uint" in ln and ln.split()[-2] in results}
     # The T# here is in user SGPRs, no heap slot, so it is looked up, and the index word in its dword 6 is preferred
-    # where it carries the tag (docs/design.md, "Bindless index in the T#"): an OpSelect between the two, whose
-    # lookup side is the extract (OpSelect %uint cond word lookup).
-    selects = {ln.split()[0]: ln.split()[-1] for ln in lines
-               if "OpSelect %uint" in ln and ln.split()[-1] in extracts}
+    # where it carries the tag (docs/design.md, "Bindless index in the T#"): an OpPhi of the word and the extract,
+    # the lookup running only without the word (OpPhi %uint word pre lookup probe).
+    selects = {ln.split()[0]: ln.split()[-2] for ln in lines
+               if "OpPhi %uint" in ln and ln.split()[-2] in extracts}
     # A tagged entry returns (index, kind): each component is broadcast before use, so a broadcast reads the
-    # call, an extract of it, or that select.
+    # call, an extract of it, or that phi.
     assert results and bcast, (results, bcast)
     assert all(src in results or extracts.get(src) in results or extracts.get(selects.get(src)) in results
                for src in bcast.values()), (results, extracts, selects, bcast)

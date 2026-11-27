@@ -13814,16 +13814,24 @@ class Gen:
 
     def tsharp_lookup(self, words):
         """A T# of unknown source: its dword-6 index where the word carries one, else the hash table's answer for its
-        words (the lookup runs either way; only the few instructions the dataflow could not place come here)."""
+        words. The lookup sits in the branch taken only without the word: `ok` comes from SGPRs, so the branch is
+        uniform, and a T# from a heap the layer writes, along a path the dataflow did not follow, costs no probe."""
         self.tsharp_lookups += 1
         direct, direct_kind, ok = self.tsharp_index_word(words)
+        pre = self.current_label_placeholder()
+        probe, end = self.tmp() + "_probe", self.tmp() + "_tsharp"
+        self.emit(f"OpSelectionMerge {end} None")
+        self.emit(f"OpBranchConditional {ok} {end} {probe}")
+        self.emit(f"{probe} = OpLabel")
         idx, kind = self.desc_lookup(words, uniform=False)
+        self.emit(f"OpBranch {end}")
+        self.emit(f"{end} = OpLabel")
         out = self.tmp()
-        self.emit(f"{out} = OpSelect %uint {ok} {direct} {idx}")
+        self.emit(f"{out} = OpPhi %uint {direct} {pre} {idx} {probe}")
         out_kind = None
         if kind is not None:
             out_kind = self.tmp()
-            self.emit(f"{out_kind} = OpSelect %uint {ok} {direct_kind} {kind}")
+            self.emit(f"{out_kind} = OpPhi %uint {direct_kind} {pre} {kind} {probe}")
         return self.desc_uniform(out, out_kind)
 
     # The dimension of an instruction's image array, indexed by STORE_DIMS' index (0 2D, 1 2D array, 2 3D, 3 1D).

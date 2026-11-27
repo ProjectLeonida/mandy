@@ -81,15 +81,115 @@ def _merge(old, new, heap_loads):
     return out
 
 
+def _vgprs(ins):
+    """Every VGPR an instruction names, read or written."""
+    out = set()
+    for a in ins["args"]:
+        if a["k"] == "vgpr":
+            out.update(range(a["r"], a["r"] + a.get("n", 1)))
+        elif a["k"] == "vlist":
+            out.update(r for r in a["r"] if isinstance(r, int))
+    return out
+
+
+def _lane(sym, a):
+    """The constant lane of a v_readlane/v_writelane lane operand, or None."""
+    t = _hic._src(sym, a)
+    return t[1] & 63 if t is not None and t[0] == "const" else None
+
+
+def _spill_step(sym, ins, spill_vgprs):
+    """SGPR values parked in VGPR lanes (v_writelane_b32 / v_readlane_b32, a compiler's SGPR spill): the lane keeps the
+    tag of the SGPR written into it, as ("v", vgpr, lane), and a v_readlane of a constant lane gives it back. Any other
+    instruction naming the VGPR forgets its lanes. Run after heap_index_census.step, which has forgotten the
+    v_readlane's destination."""
+    op = _meta.base_op(ins["op"])
+    a = ins["args"]
+    if op == "v_readlane_b32":     # reads the VGPR and leaves it as it is, whatever it writes (an SGPR, VCC)
+        if len(a) >= 3 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1 and a[1]["k"] == "vgpr":
+            lane = _lane(sym, a[2])
+            tag = sym.get(("v", a[1]["r"], lane)) if lane is not None else None
+            if tag is not None:
+                sym[a[0]["r"]] = tag
+        return
+    touched = _vgprs(ins) & spill_vgprs
+    if not touched:
+        return
+    before = None
+    if op == "v_writelane_b32" and len(a) >= 3 and a[0]["k"] == "vgpr":
+        lane = _lane(sym, a[2])
+        if lane is not None:     # only that lane changes; a source other than an SGPR (VCC, a constant) is unknown
+            src = sym.get(a[1]["t"]) if a[1]["k"] == "special" and a[1].get("t") in VCC_HALVES else \
+                _hic._src(sym, a[1])
+            before = (a[0]["r"], lane, src)
+    for k in [k for k in sym if isinstance(k, tuple) and k[1] in touched]:
+        if before is None or k[1] != before[0] or k[2] == before[1]:
+            del sym[k]
+    if before is not None and before[2] is not None:
+        sym[("v", before[0], before[1])] = before[2]
+
+
+VCC_HALVES = ("vcc_lo", "vcc_hi")
+
+
+def _vcc_names(a):
+    if a["k"] == "special" and a.get("t") in ("vcc", "vcc_lo", "vcc_hi"):
+        return {"vcc_lo", "vcc_hi"} if a["t"] == "vcc" else {a["t"]}
+    if a["k"] == "slist":
+        return {r for r in a["r"] if r in VCC_HALVES}
+    return set()
+
+
+def _vcc_step(sym, ins):
+    """VCC used as two more SGPRs: a compiler short of SGPRs loads a T#'s last two dwords into vcc_lo and vcc_hi
+    (s_load_dwordx8 [s100, ..., s105, vcc_lo, vcc_hi]) or parks a pointer there. Their tags live under "vcc_lo" and
+    "vcc_hi". LLVM prints every VCC operand, the implicit ones of VOPC and carry instructions included, so any other
+    instruction naming VCC forgets them (a reader as well, which only loses precision). Run after
+    heap_index_census.step, which follows neither VCC nor a load into a register list."""
+    op = _meta.base_op(ins["op"])
+    a = ins["args"]
+    if not a:
+        return
+    if op.startswith(SCALAR_LOADS) and a[0]["k"] == "slist":
+        for i, r in enumerate(a[0]["r"]):
+            sym[r] = ("ld", ins["pc"], i)
+        return
+    if op.startswith("image_"):
+        return                      # reads its descriptor operands
+    names = set().union(*(_vcc_names(x) for x in a))
+    if not names:
+        return
+    if op == "v_readlane_b32" and len(a) >= 3 and a[0]["k"] == "special" and a[0].get("t") in VCC_HALVES \
+            and a[1]["k"] == "vgpr":
+        lane = _lane(sym, a[2])
+        tag = sym.get(("v", a[1]["r"], lane)) if lane is not None else None
+        sym.pop(a[0]["t"], None)
+        if tag is not None:
+            sym[a[0]["t"]] = tag
+        return
+    if op in ("s_mov_b64", "s_mov_b32") and len(a) >= 2 and a[0]["k"] == "sgpr" and not _vcc_names(a[0]):
+        src = ["vcc_lo", "vcc_hi"] if op == "s_mov_b64" and a[1].get("t") == "vcc" else \
+            [a[1]["t"]] if op == "s_mov_b32" and a[1].get("t") in VCC_HALVES else None
+        if src is not None:
+            for i, name in enumerate(src):
+                tag = sym.get(name)
+                if tag is not None:
+                    sym[a[0]["r"] + i] = tag
+            return
+    for name in VCC_HALVES:
+        sym.pop(name, None)
+
+
 def tsharp_operand(ins):
-    """The SGPR numbers of an image instruction's T#, or None."""
+    """The registers of an image instruction's T# (SGPR numbers, or "vcc_lo" / "vcc_hi" in a register list), or
+    None."""
     a = ins["args"]
     if not _meta.base_op(ins["op"]).startswith("image_") or len(a) < 3:
         return None
     t = a[2]
     if t["k"] == "sgpr" and t.get("n", 1) >= 8:
         return [t["r"] + i for i in range(8)]
-    if t["k"] == "slist" and len(t["r"]) >= 8 and all(isinstance(r, int) for r in t["r"][:8]):
+    if t["k"] == "slist" and len(t["r"]) >= 8 and all(isinstance(r, int) or r in VCC_HALVES for r in t["r"][:8]):
         return list(t["r"][:8])
     return None
 
@@ -112,6 +212,8 @@ def analyse(blocks, succ, user_count=32, system=()):
         answers = analyse(copies, succ, user_count, system)
         return {id(ins): answers.get(id(copy), False)
                 for ins, copy in zip(flat, (c for blk in copies for c in blk))}
+    spill_vgprs = {ins["args"][0]["r"] for ins in flat if _meta.base_op(ins["op"]) == "v_writelane_b32" and
+                   ins["args"] and ins["args"][0]["k"] == "vgpr"}
     # A load is a heap load when every path reaching it brings a heap pointer. The fixpoint below decides that as it
     # goes; a load first seen as one and later not (a join lost its pointer) is banned and the dataflow run again
     # without it, so no slot position stays derived from a load that is not a heap load in the end.
@@ -142,6 +244,9 @@ def analyse(blocks, succ, user_count=32, system=()):
                     out[id(ins)] = (regs is not None and
                                     _slot_pos(sym.get(regs[INDEX_DWORD]), heap_loads) == INDEX_DWORD)
                 _hic.step(sym, ins)
+                if spill_vgprs:
+                    _spill_step(sym, ins, spill_vgprs)
+                _vcc_step(sym, ins)
             return sym
 
         work = [0]

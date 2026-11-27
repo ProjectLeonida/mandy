@@ -7697,6 +7697,7 @@ struct DeviceState {
     std::atomic<unsigned> pending_sample_count{};
     bool materialize_sample(const leonida::DescriptorKey& key);
     bool materialize_table(std::uint64_t address,std::uint32_t slots);
+    void write_tsharp_index_words(const std::vector<leonida::DescriptorKey>& keys);
     void remember_sample(const leonida::DescriptorKey& key, const PendingSample& sample) {
         std::lock_guard lock(pending_view_mutex);
         if (pending_samples.try_emplace(key,sample).second) {
@@ -7982,6 +7983,11 @@ struct DeviceState {
         if (existing != image_entries.end()) {
             replaced_images.push_back(existing->second);  // the read-only entry of the same bytes
             existing->second = entry;
+            // The console heap slots holding these words carry the read-only entry's index in their dword 6
+            // (tsharp_index_words): fixed again at the next submission (a texture_gone change re-fixes bound T#s,
+            // under the address their records keep, tsharp_texture_key), they take this one, with its storage views.
+            if (tsharp_index_words)
+                note_texture_change(leonida::SlotChange::texture_gone, tsharp_texture_key(image.address));
         } else {
             image_entries.emplace(words, entry);
             image_keys.emplace(image.address, words);
@@ -10854,6 +10860,7 @@ bool DeviceState::materialize_table(std::uint64_t address, std::uint32_t slots) 
           for (const auto& [key,view]:pending_samples)
               if (view.owner->id() == address) keys.push_back(key); }
         for (const auto& key:keys) if (!materialize_sample(key)) return false;
+        write_tsharp_index_words(keys);
         return true;
     }
     std::uint64_t end = 0;
@@ -10873,6 +10880,7 @@ bool DeviceState::materialize_table(std::uint64_t address, std::uint32_t slots) 
         std::vector<leonida::DescriptorKey> all;
         {std::lock_guard lock(pending_view_mutex);for(const auto& [key,v]:pending_samples) all.push_back(key);}
         for(const auto& key:all) if(!materialize_sample(key)) return false;
+        write_tsharp_index_words(all);
         return true;
     }
     const auto refreshed = std::min<std::uint64_t>(end-address, std::uint64_t(kViewScanLimit)*kDescriptorSize);
@@ -10883,9 +10891,47 @@ bool DeviceState::materialize_table(std::uint64_t address, std::uint32_t slots) 
     for (auto at=address; at<end; at+=kDescriptorSize) {
         leonida::DescriptorKey key{};
         std::memcpy(key.data(),table+(at-address),sizeof(key));
-        if (leonida::gfx10::is_image(key) && !materialize_sample(key)) return false;
+        if (!leonida::gfx10::is_image(key)) continue;
+        // A deferred view's slot was written without its index word (it had no index): its key is the slot without
+        // the word, and once made the slot gets it.
+        key = leonida::gfx10::tsharp_key(key);
+        if (!materialize_sample(key)) return false;
+        if (tsharp_index_words) {
+            const std::uint32_t word = tsharp_index_word(key);
+            std::memcpy(table + (at - address) + 4 * leonida::gfx10::kTsharpIndexDword, &word, sizeof(word));
+        }
     }
     return true;
+}
+
+// The views of `keys` made at last (materialize_sample, LEONIDA_PIPELINE_COMPILE=on-demand) without a table extent to
+// name their slots: every T# of them in the layer's heaps (shader-visible, and the CPU-only ones a later
+// CopyDescriptors copies from) gets its index word (tsharp_index_word). Only while views are pending, once per batch.
+void DeviceState::write_tsharp_index_words(const std::vector<leonida::DescriptorKey>& keys) {
+    if (!tsharp_index_words || keys.empty()) return;
+    namespace g = leonida::gfx10;
+    const std::set<leonida::DescriptorKey> wanted(keys.begin(), keys.end());
+    std::vector<std::pair<std::uint8_t*, std::size_t>> ranges;
+    {
+        std::lock_guard lock(visible_heap_mutex);
+        for (const auto& [offset, heap] : visible_heaps)
+            if (heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                if (std::uint8_t* host = arena_host(offset, heap.end - offset))
+                    ranges.emplace_back(host, std::size_t(heap.end - offset));
+        for (const auto& [begin, end] : cpu_view_heaps)
+            ranges.emplace_back(reinterpret_cast<std::uint8_t*>(begin), std::size_t(end - begin));
+    }
+    std::lock_guard lock(descriptor_mutex);
+    for (const auto& [base, bytes] : ranges)
+        for (std::size_t at = 0; at + kDescriptorSize <= bytes; at += kDescriptorSize) {
+            g::ImageWords words;
+            std::memcpy(words.data(), base + at, sizeof(words));
+            if (!g::is_image(words)) continue;
+            const g::ImageWords key = g::tsharp_key(words);
+            if (!wanted.count(key)) continue;
+            const std::uint32_t word = tsharp_index_word_locked(key);
+            std::memcpy(base + at + 4 * g::kTsharpIndexDword, &word, sizeof(word));
+        }
 }
 
 class Heap final
@@ -21292,11 +21338,10 @@ private:
             log_once("shader access to 1D and 3D UAVs requires robustImageAccess; type", int(view.type));
         } else {
             const bool known_heap = state_.known_view_heap(destination.ptr);
-            // A deferred view has no index to write until a table naming it is bound, and a directly indexed heap
-            // has no such moment: with the index word (tsharp_index_words) the view is made here, as without
-            // LEONIDA_PIPELINE_COMPILE=on-demand.
+            // A deferred view has no index yet: its slot gets the index word when the view is made
+            // (materialize_table, write_tsharp_index_words).
             if (!storage && resource.deferrable_sample() && state_.info.prepare_on_bind && known_heap &&
-                !state_.tsharp_index_words && !g::multisampled(image.type)) {
+                !g::multisampled(image.type)) {
                 state_.remember_sample(words,{const_cast<Resource*>(&resource),image,view_format,channels_format});
                 std::memcpy(reinterpret_cast<void*>(destination.ptr),words.data(),sizeof(words));
                 return;
@@ -22267,7 +22312,16 @@ VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device) {
 
 std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]) {
     const leonida::BindlessSet* set = bindless_of(device);
-    return set ? set->table().lookup(key) : 0;
+    if (!set) return 0;
+    // A T# read back from one of the layer's heaps carries its index in dword 6 (tsharp_index_word): its key is the
+    // descriptor without it, and the word must name the index the table holds, which is what a shader reads.
+    namespace g = leonida::gfx10;
+    g::ImageWords words;
+    std::memcpy(words.data(), key, sizeof(words));
+    if (!g::is_image(words) || !g::has_tsharp_index(words)) return set->table().lookup(key);
+    const g::ImageWords stripped = g::tsharp_key(words);
+    const std::uint32_t index = set->table().lookup(stripped.data());
+    return index == g::tsharp_index_of(words) ? index : 0;
 }
 
 BindlessRoom bindless_room(ID3D12Device* device) {

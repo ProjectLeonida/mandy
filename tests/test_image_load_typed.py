@@ -137,6 +137,10 @@ class Module:
             assert var_op == "OpVariable" and v[1] == "Private", (var_op, v)
             words = self.defs[v[2]][1][1:]            # OpConstantComposite %fmt_mask_arr <words>
             return get(words[get(p[2])])
+        if op == "OpPhi":
+            # The T#'s index: the dword-6 word or the lookup, which runs only without the word. The T# words read
+            # 0 here (below), so the word has no tag and the lookup's side (the second pair) is the value.
+            return get(a[3])
         if op == "OpGroupNonUniformBroadcastFirst":   # One invocation: return the value (a[1] is the scope).
             return get(a[2])
         if op == "OpGroupNonUniformShuffle":          # One invocation; subgroup shuffle returns its input.

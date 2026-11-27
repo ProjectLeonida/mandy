@@ -144,6 +144,33 @@ class DescriptorSources(unittest.TestCase):
         self.assertEqual(verdicts(["s_mov_b32 s1, 0", "s_load_dwordx4 s[8:11], s[0:1], 0x20",
                                    "s_load_dwordx4 s[12:15], s[0:1], 0x38", self.SAMPLE]), [False])
 
+    def test_a_table_pointer_spilled_to_vgpr_lanes(self):
+        # A compiler parks SGPRs in VGPR lanes; the pointer read back is still the table pointer.
+        spill = ["s_mov_b32 s1, 0", "v_writelane_b32 v63, s0, 10", "v_writelane_b32 v63, s1, 11",
+                 "v_writelane_b32 v63, vcc_hi, 12", "v_readlane_b32 vcc_lo, v63, 12"]
+        back = ["v_readlane_b32 s20, v63, 10", "v_readlane_b32 s21, v63, 11",
+                "s_load_dwordx8 s[8:15], s[20:21], 0x40", self.SAMPLE]
+        self.assertEqual(verdicts(spill + back), [True])
+        # Anything else that names the VGPR, or a lane written again, forgets what the lanes held.
+        self.assertEqual(verdicts(spill + ["v_mov_b32_e32 v63, 0"] + back), [False])
+        self.assertEqual(verdicts(spill + ["s_load_dword s40, s[2:3], 0x0", "v_writelane_b32 v63, s40, 10"] + back),
+                         [False])
+
+    def test_a_tsharp_loaded_into_vcc(self):
+        # Short of SGPRs, a compiler loads a T#'s last two dwords into VCC; dword 6 is then vcc_lo.
+        load = ["s_mov_b32 s1, 0", "s_load_dwordx8 [s100,s101,s102,s103,s104,s105,vcc_lo,vcc_hi], s[0:1], 0x40",
+                "v_mov_b32_e32 v8, 1.0"]
+        use = "image_sample_lz v[0:3], v[4:5], [s100,s101,s102,s103,s104,s105,vcc_lo,vcc_hi], s[16:19] " \
+              "dmask:0xf dim:SQ_RSRC_IMG_2D"
+        self.assertEqual(verdicts(load + [use]), [True])
+        # An instruction that writes VCC (printed: VOPC and carry instructions name it) forgets what it held.
+        self.assertEqual(verdicts(load + ["v_cmp_lt_f32_e32 vcc_lo, v0, v1", use]), [False])
+        # A pointer parked in VCC and copied back is still the table pointer.
+        self.assertEqual(verdicts(["s_mov_b32 s1, 0", "v_writelane_b32 v63, s0, 10", "v_writelane_b32 v63, s1, 11",
+                                   "v_readlane_b32 vcc_lo, v63, 10", "v_readlane_b32 vcc_hi, v63, 11",
+                                   "s_mov_b64 s[20:21], vcc", "s_load_dwordx8 s[8:15], s[20:21], 0x40", self.SAMPLE]),
+                         [True])
+
     def test_other_sources_keep_the_lookup(self):
         for name, lines in (
                 ("64-bit pointer", ["s_load_dwordx8 s[8:15], s[0:1], 0x0"]),

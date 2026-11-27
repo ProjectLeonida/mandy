@@ -170,6 +170,17 @@ def classify(role, regs, sym, loads, heap_loads):
     return "unknown"
 
 
+def fspx_user_count(disasm_dir, name):
+    """USER_SGPR [5:1] of an FSPX program's COMPUTE_PGM_RSRC2 (<disasm>/../fspx/<name>.json, tools/fspx_unpack.py;
+    the pipeline library's programs have no FSSM header), or None."""
+    path = os.path.join(os.path.dirname(os.path.abspath(disasm_dir)), "fspx", name + ".json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return (int(json.load(f)["rsrc2"]) >> 1) & 31
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def census(disasm_dir, limit=None, progress=None):
     stages = hic.stage_index(disasm_dir)
     names = sorted(n[:-2] for n in os.listdir(disasm_dir) if n.endswith(".s"))
@@ -201,6 +212,8 @@ def census(disasm_dir, limit=None, progress=None):
         user = hic.USER_SGPRS
         if stage == "cs":
             user = hic.cs_user_count(disasm_dir, name)
+            if user is None:
+                user = fspx_user_count(disasm_dir, name)
             if user is None:
                 skipped["no FSSM header"] += 1
                 continue
