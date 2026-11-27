@@ -2147,6 +2147,12 @@ if(TARGET Vulkan::Headers)
     add_test(NAME arena_sparse_gpu COMMAND arena_sparse_gpu_test)
     set_tests_properties(arena_sparse_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   endif()
+  # A measurement, not a test: what page-sized sparse binds cost on the device (the page mirror's layout).
+  add_executable(vk_sparse_bind_bench test/vk_sparse_bind_bench.cpp)
+  target_link_libraries(vk_sparse_bind_bench PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_sparse_bind_bench PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
   # The AMD breadcrumbs (LEONIDA_DEVICE_MARKERS) on a real device: after a few dispatches and a wait, the queue's
   # started and finished markers hold the last dispatch's seq. SKIP without VK_AMD_buffer_marker.
   add_executable(vk_device_markers_test test/vk_device_markers_test.cpp)
