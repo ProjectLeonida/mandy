@@ -451,7 +451,11 @@ driver gives it the same cache key in both programs. Measured on Windows with an
   disabled on both devices; the runtime's device enables supported core image robustness for storage views, and so
   does the checker. Since `ba626820e` (#1723) the runtime's device enables `robustBufferAccess`, with `VK_EXT_robustness2`'s
   `robustBufferAccess2`, for bounded indexed indirect draws (`leonida::can_enable_robust_index_view`), and
-  `nullDescriptor` wherever it is offered. The checker makes the same choice with the same helper. On an RX 7900 XT
+  `nullDescriptor` wherever it is offered. The checker makes the same choice with the same helper and the same inputs,
+  the update-after-bind one being the runtime's `VulkanDeviceInfo::bindless`, and enables update-after-bind as the
+  runtime does: the sampled-image, storage-image and storage-buffer bits only where `bindless` holds, never the
+  uniform or texel buffer ones (with `robustBufferAccess` on, a device without `robustBufferAccessUpdateAfterBind`
+  may not enable any buffer one, VUID-VkDeviceCreateInfo-robustBufferAccess-10247). On an RX 7900 XT
   (driver 32.0.32029.2010) a checker that left `robustBufferAccess` off missed the runtime's cache, and matching
   `nullDescriptor` alone was not enough. Nothing else that differs between the two devices changed the key on RX 9070 XT: the checker's
   other features, the runtime's extensions, the application name.

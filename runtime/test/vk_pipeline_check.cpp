@@ -787,6 +787,14 @@ ChildRun run_child(const std::filesystem::path& exe, const std::string& dir,
     return r;
 }
 
+// The runtime's VulkanDeviceInfo::bindless (create_vulkan_device_standalone), from the supported features: what its
+// bindless set 0 needs, and whether its device enables the update-after-bind features that set uses.
+bool runtime_bindless(const VkPhysicalDeviceFeatures& f, const VkPhysicalDeviceVulkan12Features& f12) {
+    return f12.runtimeDescriptorArray && f.shaderSampledImageArrayDynamicIndexing &&
+           f.shaderStorageImageArrayDynamicIndexing && f12.descriptorBindingSampledImageUpdateAfterBind &&
+           f12.descriptorBindingStorageImageUpdateAfterBind && f12.descriptorBindingStorageBufferUpdateAfterBind;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1168,14 +1176,11 @@ int main(int argc, char** argv) {
 #ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
         // The runtime only decides this where the SDK has maintenance5, as here.
         sized_indirect = query.features.drawIndirectFirstInstance && maintenance5.maintenance5;
+        // The last input is the runtime's VulkanDeviceInfo::bindless, the update-after-bind features its device
+        // enables; this device enables the same ones below (VUID-VkDeviceCreateInfo-robustBufferAccess-10247).
         robust_index_view = leonida::can_enable_robust_index_view(
             pd, vkGetPhysicalDeviceProperties2, sized_indirect,
-            query.features.robustBufferAccess && robustness2.robustBufferAccess2,
-            // The runtime passes its bindless choice (storage-buffer update-after-bind); this device enables every
-            // supported update-after-bind feature, so any buffer one asks for the property (VUID-...-robustBufferAccess-10247).
-            q12.descriptorBindingUniformBufferUpdateAfterBind || q12.descriptorBindingStorageBufferUpdateAfterBind ||
-                q12.descriptorBindingUniformTexelBufferUpdateAfterBind ||
-                q12.descriptorBindingStorageTexelBufferUpdateAfterBind);
+            query.features.robustBufferAccess && robustness2.robustBufferAccess2, runtime_bindless(query.features, q12));
         maintenance5.pNext = nullptr;
 #endif
         (void)sized_indirect;
@@ -1230,6 +1235,16 @@ int main(int argc, char** argv) {
     robustness2.nullDescriptor = null_descriptor ? VK_TRUE : VK_FALSE;
     robustness2.robustBufferAccess2 = robust_index_view ? VK_TRUE : VK_FALSE;
     robustness2.robustImageAccess2 = VK_FALSE;
+    // Update-after-bind as the runtime enables it: the three its bindless set 0 uses, only where the whole bindless
+    // feature set is there, and never the uniform or texel buffer ones. With robustBufferAccess on and no
+    // robustBufferAccessUpdateAfterBind property, no buffer update-after-bind feature may be enabled (VUID above).
+    const bool set0_update_after_bind = runtime_bindless(f2.features, f12);
+    f12.descriptorBindingSampledImageUpdateAfterBind = set0_update_after_bind ? VK_TRUE : VK_FALSE;
+    f12.descriptorBindingStorageImageUpdateAfterBind = set0_update_after_bind ? VK_TRUE : VK_FALSE;
+    f12.descriptorBindingStorageBufferUpdateAfterBind = set0_update_after_bind ? VK_TRUE : VK_FALSE;
+    f12.descriptorBindingUniformBufferUpdateAfterBind = VK_FALSE;
+    f12.descriptorBindingUniformTexelBufferUpdateAfterBind = VK_FALSE;
+    f12.descriptorBindingStorageTexelBufferUpdateAfterBind = VK_FALSE;
     VkPhysicalDeviceMeshShaderPropertiesEXT mesh_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
     if (ext_mesh && mesh.meshShader) {
         VkPhysicalDeviceProperties2 mesh_device_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
