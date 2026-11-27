@@ -923,6 +923,19 @@ inline DescriptorTableLayout majority_descriptor_table_layout(const DescriptorTa
     return census.tagged > 0 ? DescriptorTableLayout::tagged : DescriptorTableLayout::plain;
 }
 
+// Which modules read a T#'s bindless index from its dword 6 (gfx10_descriptors.h, tsharp_index_word; tools/rdna2spirv.py
+// TSHARP_INDEX): index.json meta `"tsharp_index": "dword6"`. Such a module takes the index of a T# it loaded from a
+// heap from that word and nothing else, so the layer must write it into every heap it keeps; a module translated
+// before has no key and finds its T#s by their words in the hash table, which the written word changes (the copy's
+// dword 6 is no longer the title's). The device writes the word when any module reads it, and says so when modules
+// of both kinds are loaded: the older ones then miss the T#s of the heaps and read the fallback, so a library is to be
+// translated by one translator.
+struct TsharpIndexCensus {
+    std::size_t dword6 = 0;
+    std::size_t none = 0;
+    std::size_t total() const { return dword6 + none; }
+};
+
 // LEONIDA_DESCRIPTOR_TABLE=plain|tagged overrides the modules' vote. False when `value` is null, empty or not one
 // of the two layouts (an unrecognised value is ignored rather than failing startup).
 inline bool descriptor_table_layout_from_env(const char* value, DescriptorTableLayout* layout) {
@@ -1028,6 +1041,7 @@ public:
         exe_count_ = 0;
         descriptor_hash_census_ = {};
         descriptor_table_census_ = {};
+        tsharp_index_census_ = {};
         vsharp_base_census_ = {};
         for (const char* folder : {"fspx", "fspx_gfx"}) {
             try {
@@ -1057,6 +1071,8 @@ public:
     DescriptorTableLayout descriptor_table_layout() const {
         return majority_descriptor_table_layout(descriptor_table_census_);
     }
+    // The modules that read a T#'s index from its dword 6 (TsharpIndexCensus) and those that do not.
+    const TsharpIndexCensus& tsharp_index_census() const { return tsharp_index_census_; }
     // How the loaded modules read a V#'s 48-bit base: the device names buffers below heap_base (negative offsets) only
     // when every one of them sign-extends it.
     const VsharpBaseCensus& vsharp_base_census() const { return vsharp_base_census_; }
@@ -1240,6 +1256,7 @@ private:
             exe_count_ = 0;
             descriptor_hash_census_ = {};
             descriptor_table_census_ = {};
+            tsharp_index_census_ = {};
             vsharp_base_census_ = {};
         }
         for (const auto& [name, meta] : root.object) {
@@ -1343,6 +1360,11 @@ private:
                 ++descriptor_table_census_.tagged;
             else
                 ++descriptor_table_census_.plain;
+            // Whether this module reads a T#'s index from its dword 6 (TsharpIndexCensus). Absent is the hash lookup.
+            if (const Json* ti = meta.find("tsharp_index"); ti && ti->kind == Json::Kind::string && ti->string == "dword6")
+                ++tsharp_index_census_.dword6;
+            else
+                ++tsharp_index_census_.none;
             // How this module reads a V#'s 48-bit base (VsharpBaseCensus). Absent is the old zero extension.
             if (const Json* sx = meta.find("vsharp_base_sign_extended"); sx && sx->kind == Json::Kind::boolean && sx->boolean)
                 ++vsharp_base_census_.sign_extended;
@@ -1372,6 +1394,7 @@ private:
     Entries fspx_entries_;
     DescriptorHashCensus descriptor_hash_census_;
     DescriptorTableCensus descriptor_table_census_;
+    TsharpIndexCensus tsharp_index_census_;
     VsharpBaseCensus vsharp_base_census_;
 };
 

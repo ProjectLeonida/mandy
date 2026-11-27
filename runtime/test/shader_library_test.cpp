@@ -864,6 +864,32 @@ int main() {
         std::filesystem::remove_all(dir);
     }
 
+    // The T# index-word marker (`"tsharp_index": "dword6"`, TsharpIndexCensus): the modules that take a heap T#'s
+    // bindless index from its dword 6, which the device then writes into every heap, and the older ones (no key, or
+    // a value this runtime does not know), which look such T#s up in the hash table.
+    {
+        const auto root = dir / "tsharp_index";
+        const auto write_index = [](const std::filesystem::path& folder, const std::string& modules) {
+            std::filesystem::create_directories(folder);
+            std::ofstream index(folder / "index.json", std::ios::binary);
+            index << "{" << modules << "}";
+        };
+        const auto module = [](const char* name, const char* marker) {
+            std::string out = "{\"stage\": \"ps\", \"fssm_sha256\": \"" + std::string(name) + "\"";
+            if (marker) out += ", \"tsharp_index\": \"" + std::string(marker) + "\"";
+            return out + "}";
+        };
+        write_index(root, "\"a\": " + module("aa", "dword6") + ", \"b\": " + module("bb", nullptr) + ", \"c\": " +
+                              module("cc", "dword7") + ", \"d\": " + module("dd", "dword6"));
+        ShaderLibrary mixed;
+        CHECK(mixed.load(root.string(), &error));
+        CHECK(mixed.tsharp_index_census().dword6 == 2 && mixed.tsharp_index_census().none == 2);
+        write_index(root, "\"a\": " + module("aa", nullptr));
+        CHECK(mixed.load(root.string(), &error));  // a reload replaces the census
+        CHECK(mixed.tsharp_index_census().dword6 == 0 && mixed.tsharp_index_census().none == 1);
+        std::filesystem::remove_all(root);
+    }
+
     // The descriptor-table layout marker (`descriptor_table` in each module's meta, descriptor_table.h): absent is
     // the old plain layout. The kind word is additive - a tagged module reads it, a plain one ignores it and reads
     // the index at the same place - so one tagged module needs the tagged layout however many plain ones a merged or

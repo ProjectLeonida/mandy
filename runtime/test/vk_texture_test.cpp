@@ -151,8 +151,14 @@ int main(int argc, char** argv) {
     const VkFormat sampled_format = dref ? VK_FORMAT_D32_SFLOAT :
         (uint_mips || fetch_uint) ? VK_FORMAT_R8G8B8A8_UINT :
         (signed_mips || fetch) ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UNORM;
-    uint32_t tsharp[8] = {0x11111111, leonida::gfx10::format_from_vulkan(sampled_format) << 20, 0x33333333, 0x44440444,
-                          0x55555555, 0x66666666, 0x77777777, 0x88888888};
+    // The shaders load the T# through a descriptor-table pointer (s[ptr_sgpr], high dword 0), so they take its index
+    // from dword 6 as the layer writes it (gfx10_descriptors.h, tsharp_index_word; docs/design.md, "Bindless index in
+    // the T#"): index 1, bound in both sampled arrays they read (see the table insert below). Word 3's TYPE is 9 (2D):
+    // a word without the tag, or a dword 3 that names no image, reads the fallback.
+    const uint32_t index_word = leonida::gfx10::tsharp_index_word(1, leonida::kind_sampled_bit(0) |
+                                                                         leonida::kind_sampled_bit(1));
+    uint32_t tsharp[8] = {0x11111111, leonida::gfx10::format_from_vulkan(sampled_format) << 20, 0x33333333, 0x94440444,
+                          0x55555555, 0x66666666, index_word, 0x88888888};
     const uint32_t tsharp_va = 256;
 
     gipa = load_vulkan();
@@ -318,7 +324,13 @@ int main(int argc, char** argv) {
     const VkDeviceSize heap_bytes = heap_mb && std::atoi(heap_mb) > 0 ? VkDeviceSize(std::atoi(heap_mb)) << 20 : 65536;
     CHECK(make_buffer(heap_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, &heap, &heapm, &heapp));
     std::memset(heapp, 0, size_t(heap_bytes));
-    std::memcpy(static_cast<char*>(heapp) + tsharp_va, tsharp, 32);
+    {
+        // The miss control: a T# whose dword 6 carries no index (the title's own word) reads the fallback.
+        uint32_t in_heap[8];
+        std::memcpy(in_heap, tsharp, sizeof(in_heap));
+        if (fetch_miss) in_heap[leonida::gfx10::kTsharpIndexDword] = 0x77777777;
+        std::memcpy(static_cast<char*>(heapp) + tsharp_va, in_heap, 32);
+    }
     if (two_mip)  // The gather test loads its S# from the four words just after the T#.
         std::memcpy(static_cast<char*>(heapp) + tsharp_va + 32, ssharp, 16);
     VkBufferDeviceAddressInfo bdai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; bdai.buffer = heap;

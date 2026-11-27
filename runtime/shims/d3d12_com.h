@@ -461,7 +461,8 @@ struct BindlessStats {
 BindlessStats bindless_stats(ID3D12Device* device);
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
 // The bindless index the descriptor hash table holds for the 8 key dwords of a T# (or the 4 of an S# followed by
-// 0xFFFFFFFF x4), 0 (the fallback) when it has none or `device` has no such set. For tests.
+// 0xFFFFFFFF x4), 0 (the fallback) when it has none or `device` has no such set. A T# read from one of the layer's
+// heaps is looked up without its index word (dword 6), and gives 0 unless that word names the same index. For tests.
 std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]);
 // The free indices of that set's 2D image and sampler arrays: how many more distinct 2D T#s and S#s
 // CreateShaderResourceView and CreateSampler can register before they log that the array is full. Zeros when

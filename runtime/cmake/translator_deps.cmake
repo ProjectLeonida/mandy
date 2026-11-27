@@ -10,10 +10,12 @@ set(LEONIDA_TRANSLATOR_DEPS
     ${_leonida_repo}/runtime/test/shaders/compute_fixture.py
     ${_leonida_repo}/tools/bary_fallback_gs.py
     ${_leonida_repo}/tools/cfg_structure.py
+    ${_leonida_repo}/tools/descriptor_sources.py
     ${_leonida_repo}/tools/file_mode.py
     ${_leonida_repo}/tools/fssm_header.py
     ${_leonida_repo}/tools/fssm_unpack.py
     ${_leonida_repo}/tools/gfx10_formats.json
+    ${_leonida_repo}/tools/heap_index_census.py
     ${_leonida_repo}/tools/lane_masks.py
     ${_leonida_repo}/tools/mc_command.py
     ${_leonida_repo}/tools/native_pso_hashes.py
