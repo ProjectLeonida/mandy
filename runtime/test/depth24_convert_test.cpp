@@ -62,6 +62,38 @@ VKAPI_ATTR void VKAPI_CALL observe_host(VkCommandBuffer cb, const VkDependencyIn
     real_barrier2(cb, dep);
 }
 
+// The conversion's own barriers (vkCmdPipelineBarrier, through the context's device proc): the one before its
+// dispatch must make the copy's writes visible to the shader, and the one after must make the shader's writes
+// visible to what follows, on every queue kind that runs it (RT-DEPTH24-COPY-QUEUE-BARRIERS).
+PFN_vkGetDeviceProcAddr real_device_proc = nullptr;
+PFN_vkCmdPipelineBarrier real_barrier = nullptr;
+bool watch_dispatch_barriers = false;
+std::uint32_t to_shader_barriers = 0, from_shader_barriers = 0;
+VKAPI_ATTR void VKAPI_CALL observe_barrier(VkCommandBuffer cb, VkPipelineStageFlags src_stages,
+                                           VkPipelineStageFlags dst_stages, VkDependencyFlags flags,
+                                           std::uint32_t memory_count, const VkMemoryBarrier* memory,
+                                           std::uint32_t buffer_count, const VkBufferMemoryBarrier* buffers,
+                                           std::uint32_t image_count, const VkImageMemoryBarrier* images) {
+    if (watch_dispatch_barriers) {
+        for (std::uint32_t i = 0; i < memory_count; ++i) {
+            if ((dst_stages & VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) &&
+                (memory[i].dstAccessMask & VK_ACCESS_SHADER_READ_BIT))
+                ++to_shader_barriers;
+            if ((src_stages & VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) &&
+                (memory[i].srcAccessMask & VK_ACCESS_SHADER_WRITE_BIT))
+                ++from_shader_barriers;
+        }
+    }
+    real_barrier(cb, src_stages, dst_stages, flags, memory_count, memory, buffer_count, buffers, image_count, images);
+}
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL observing_device_proc(VkDevice device, const char* name) {
+    if (name && !std::strcmp(name, "vkCmdPipelineBarrier")) {
+        real_barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(real_device_proc(device, name));
+        return real_barrier ? reinterpret_cast<PFN_vkVoidFunction>(observe_barrier) : nullptr;
+    }
+    return real_device_proc(device, name);
+}
+
 }  // namespace
 
 int main() {
@@ -250,7 +282,8 @@ int main() {
             return VK_NULL_HANDLE;
         };
 
-        VulkanContext context(gpu.device_proc, gpu.device, true);
+        real_device_proc = gpu.device_proc;
+        VulkanContext context(observing_device_proc, gpu.device, true);
         EXPECT(context.loaded());
         context.enable_depth24(gpu.device_proc, alloc_device_local);
         context.set_occlusion_resolve_memory(mem_props);
@@ -563,9 +596,10 @@ int main() {
             std::printf("depth24: shared-buffer offsets (CopyResource, RGBA8, depth24 and rgb96 CopyTexture) ok\n");
 
             // Host-readback barrier observation across logical queue kinds: compute-converted depth24 and rgb96
-            // readbacks must emit COMPUTE_SHADER_BIT / MEMORY_WRITE_BIT -> HOST_BIT / HOST_READ_BIT on direct and
-            // compute queues (and stay within queue_supported_stages on copy queues), and a host_readable buffer UAV
-            // clear must emit a TRANSFER_BIT / TRANSFER_WRITE_BIT -> HOST_BIT / HOST_READ_BIT barrier.
+            // readbacks must emit COMPUTE_SHADER_BIT / MEMORY_WRITE_BIT -> HOST_BIT / HOST_READ_BIT on direct,
+            // compute and (on a compute-capable family) copy queues, with the conversion's own barriers keeping their
+            // shader access, and a host_readable buffer UAV clear must emit a TRANSFER_BIT / TRANSFER_WRITE_BIT ->
+            // HOST_BIT / HOST_READ_BIT barrier.
             real_barrier2 = context.vk.vkCmdPipelineBarrier2;
             EXPECT(real_barrier2 != nullptr);
             context.vk.vkCmdPipelineBarrier2 = observe_host;
@@ -584,22 +618,24 @@ int main() {
                                     VulkanQueue::QueueKind::copy}) {
                 VulkanQueue typed(context, gpu.queue, gpu.family, kind);
                 EXPECT(typed.ok());
+                // Every kind here shares the test's one compute-capable family, so a copy queue runs the conversion
+                // as well; its barriers keep the shader stage and access, and so does the host readback's.
+                constexpr VkPipelineStageFlags2 compute = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
 
                 // depth24_as_float readback
                 for (std::uint32_t i = 0; i < slice_words; ++i) arena_ptr[d24_rb_off / 4 + i] = poison_word;
                 host_barriers = 0;
                 host_src_stages = 0;
                 host_src_access = 0;
+                to_shader_barriers = from_shader_barriers = 0;
+                watch_dispatch_barriers = true;
                 EXPECT(typed.execute({&d24_ptr, 1}) == ReplayResult::success);
+                watch_dispatch_barriers = false;
                 EXPECT(typed.idle() && host_barriers == 1);
-                EXPECT((host_src_stages & ~VulkanQueue::queue_supported_stages(kind)) == 0);
-                if (kind == VulkanQueue::QueueKind::copy) {
-                    EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_TRANSFER_BIT);
-                    EXPECT(host_src_access == VK_ACCESS_2_TRANSFER_WRITE_BIT);
-                } else {
-                    EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-                    EXPECT(host_src_access == VK_ACCESS_2_MEMORY_WRITE_BIT);
-                }
+                EXPECT(to_shader_barriers >= 1 && from_shader_barriers >= 1);
+                EXPECT((host_src_stages & ~(VulkanQueue::queue_supported_stages(kind) | compute)) == 0);
+                EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+                EXPECT(host_src_access == VK_ACCESS_2_MEMORY_WRITE_BIT);
                 for (std::uint32_t i = 0; i < slice_words; ++i)
                     EXPECT(arena_ptr[d24_rb_off / 4 + i] == (arena_ptr[src_off / 4 + i] & depth24_max));
 
@@ -612,16 +648,15 @@ int main() {
                 host_barriers = 0;
                 host_src_stages = 0;
                 host_src_access = 0;
+                to_shader_barriers = from_shader_barriers = 0;
+                watch_dispatch_barriers = true;
                 EXPECT(typed.execute({&rgb96_ptr, 1}) == ReplayResult::success);
+                watch_dispatch_barriers = false;
                 EXPECT(typed.idle() && host_barriers == 1);
-                EXPECT((host_src_stages & ~VulkanQueue::queue_supported_stages(kind)) == 0);
-                if (kind == VulkanQueue::QueueKind::copy) {
-                    EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_TRANSFER_BIT);
-                    EXPECT(host_src_access == VK_ACCESS_2_TRANSFER_WRITE_BIT);
-                } else {
-                    EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-                    EXPECT(host_src_access == VK_ACCESS_2_MEMORY_WRITE_BIT);
-                }
+                EXPECT(to_shader_barriers >= 1 && from_shader_barriers >= 1);
+                EXPECT((host_src_stages & ~(VulkanQueue::queue_supported_stages(kind) | compute)) == 0);
+                EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+                EXPECT(host_src_access == VK_ACCESS_2_MEMORY_WRITE_BIT);
                 for (std::uint32_t y = 0; y < rgb96_h; ++y)
                     for (std::uint32_t x = 0; x < rgb96_w; ++x)
                         for (std::uint32_t c = 0; c < 3; ++c)

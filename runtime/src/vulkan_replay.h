@@ -1757,27 +1757,39 @@ inline constexpr VkPipelineStageFlags2 queue_stages_compute =
     queue_stages_copy | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
     VK_PIPELINE_STAGE_2_CLEAR_BIT;
 
-inline void restrict_to_queue(const ReplayFunctions& vk, VkPipelineStageFlags2& stages, VkAccessFlags2& access) {
-    if (!vk.queue_stages) return;
+// Keeps the stages and accesses a queue with `queue_stages` supports (0: any). The ReplayFunctions overloads use the
+// executing queue's own.
+inline void restrict_to_stages(VkPipelineStageFlags2 queue_stages, VkPipelineStageFlags2& stages,
+                               VkAccessFlags2& access) {
+    if (!queue_stages) return;
     VkAccessFlags2 allowed = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
                              VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_READ_BIT |
                              VK_ACCESS_2_HOST_WRITE_BIT;
-    if (vk.queue_stages & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
+    if (queue_stages & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
         allowed |= VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT |
                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
                    VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
-    stages &= vk.queue_stages;
+    stages &= queue_stages;
     if (!stages) stages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     access &= allowed;
 }
 
-inline void restrict_to_queue(const ReplayFunctions& vk, VkPipelineStageFlags& stages, VkAccessFlags& access) {
-    if (!vk.queue_stages) return;
+inline void restrict_to_stages(VkPipelineStageFlags2 queue_stages, VkPipelineStageFlags& stages,
+                               VkAccessFlags& access) {
+    if (!queue_stages) return;
     VkPipelineStageFlags2 s2 = stages;
     VkAccessFlags2 a2 = access;
-    restrict_to_queue(vk, s2, a2);
+    restrict_to_stages(queue_stages, s2, a2);
     stages = static_cast<VkPipelineStageFlags>(s2 & 0xFFFFFFFFull);
     access = static_cast<VkAccessFlags>(a2 & 0xFFFFFFFFull);
+}
+
+inline void restrict_to_queue(const ReplayFunctions& vk, VkPipelineStageFlags2& stages, VkAccessFlags2& access) {
+    restrict_to_stages(vk.queue_stages, stages, access);
+}
+
+inline void restrict_to_queue(const ReplayFunctions& vk, VkPipelineStageFlags& stages, VkAccessFlags& access) {
+    restrict_to_stages(vk.queue_stages, stages, access);
 }
 
 // A D3D12 barrier on a volume mip covers every W slice, including on devices with maintenance9.
@@ -1805,15 +1817,32 @@ inline void image_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buf
     vk.pipeline_barrier(command_buffer, src_stages, dst_stages, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
-inline void memory_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkAccessFlags src_access,
-                           VkPipelineStageFlags src_stages, VkAccessFlags dst_access, VkPipelineStageFlags dst_stages) {
-    restrict_to_queue(vk, src_stages, src_access);
-    restrict_to_queue(vk, dst_stages, dst_access);
+inline void memory_barrier_within(VkPipelineStageFlags2 queue_stages, const ReplayFunctions& vk,
+                                  VkCommandBuffer command_buffer, VkAccessFlags src_access,
+                                  VkPipelineStageFlags src_stages, VkAccessFlags dst_access,
+                                  VkPipelineStageFlags dst_stages) {
+    restrict_to_stages(queue_stages, src_stages, src_access);
+    restrict_to_stages(queue_stages, dst_stages, dst_access);
     VkMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     barrier.srcAccessMask = src_access;
     barrier.dstAccessMask = dst_access;
     vk.pipeline_barrier(command_buffer, src_stages, dst_stages, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
+inline void memory_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkAccessFlags src_access,
+                           VkPipelineStageFlags src_stages, VkAccessFlags dst_access, VkPipelineStageFlags dst_stages) {
+    memory_barrier_within(vk.queue_stages, vk, command_buffer, src_access, src_stages, dst_access, dst_stages);
+}
+
+// A barrier around the depth24/rgb96 conversion's dispatch (depth24_run). The backend installs depth24_prepare
+// only on a queue whose family runs compute, which includes a D3D12 copy queue sharing a compute-capable family,
+// whose queue_stages (queue_stages_copy) would otherwise drop the shader stage and access the dispatch needs.
+inline void depth24_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkAccessFlags src_access,
+                            VkPipelineStageFlags src_stages, VkAccessFlags dst_access, VkPipelineStageFlags dst_stages) {
+    const VkPipelineStageFlags2 queue =
+        vk.queue_stages ? vk.queue_stages | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : 0;
+    memory_barrier_within(queue, vk, command_buffer, src_access, src_stages, dst_access, dst_stages);
 }
 
 // The current layouts of a range: from the tracker, or `assumed` for an untracked image.
@@ -5093,14 +5122,14 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                     source = p.tile_scratch;
                 } else if (p.has_depth24) {
                     // The words become floats in the scratch buffer, which the copy then reads (tightly packed).
-                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    detail::depth24_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
                     end_statistics();
                     for (const auto& part : p.depth24_parts) run_depth24(part);
                     begin_statistics();
-                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                           VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    detail::depth24_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                            VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
                     converted = p.buffer_image_copies;
                     converted[0].bufferOffset = p.depth24.scratch_offset;
                     converted[0].bufferRowLength = 0;
@@ -5135,15 +5164,15 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                     region.bufferRowLength = 0;
                     region.bufferImageHeight = 0;
                     vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.depth24.scratch, 1, &region);
-                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    detail::depth24_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
                     end_statistics();
                     for (const auto& part : p.depth24_parts) run_depth24(part);
                     begin_statistics();
-                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                           VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-                                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                    detail::depth24_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
                 }
             }
         } else if (std::holds_alternative<ResolveSubresource>(command)) {

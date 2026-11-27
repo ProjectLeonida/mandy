@@ -3735,7 +3735,10 @@ private:
         close_labels(command_buffer, replay, open_labels);
         // Only flush GPU writes to the host domain when this batch actually wrote to a readback buffer.
         if (wrote_readback) {
-            const VkPipelineStageFlags2 allowed = queue_supported_stages(kind_);
+            // A copy queue on a compute-capable family runs the depth24/rgb96 conversion (depth24_prepare), whose
+            // compute writes the host must see too.
+            const VkPipelineStageFlags2 allowed =
+                queue_supported_stages(kind_) | (replay.depth24_prepare ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : 0);
             VkPipelineStageFlags2 src_stages = readback_stages & allowed;
             if (!src_stages) src_stages = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
             const bool copy_only =
