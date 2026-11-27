@@ -87,6 +87,10 @@ int text() {
     share.arena_in_use = 757 * kMiB;
     share.arena_use = {500 * kMiB, 171 * kMiB, 80 * kMiB, 6 * kMiB};
     share.bindless_table_bytes = 2 * kMiB;
+    share.mirror = true;
+    share.mirror_homes = 32;
+    share.mirror_pages = 40;
+    share.mirror_chunks = 1;
     const std::string line = mb::format(t, share, 12 * kMiB);
     std::fprintf(stderr, "%s\n", line.c_str());
     EXPECT(line.rfind("allocated 9961 MiB = arena 4095 (1) [reserved 4095, bound 4095, in use 757: buffers 500, "
@@ -95,7 +99,10 @@ int text() {
     EXPECT(contains(line, " + geometry copies 3867 (1)"));
     EXPECT(contains(line, " + title windows and shadows 0 (0)"));
     EXPECT(contains(line, " + upload heaps 0 (0) + staging 0 (0) + texture blocks 0 (0) + sampled textures 0 (0)"));
-    EXPECT(contains(line, " + render targets and depth 1180 (1) + other 819 (1);"));
+    EXPECT(contains(line, " + render targets and depth 1180 (1) + page mirror 0 (0)"));
+    EXPECT(contains(line, " 0 host] + other 819 (1);"));
+    EXPECT(contains(line, "page mirror 0 (0) [homes bound 2 MiB (32), pages mirrored 40, chunks 1, units 0 "
+                          "device-local 0 host]"));
     EXPECT(contains(line, "imported 206 MiB (1)"));
     EXPECT(contains(line, "bindless tables 2 MiB"));
     EXPECT(contains(line, "shader modules 12 MiB SPIR-V"));

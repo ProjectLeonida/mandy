@@ -32,6 +32,7 @@ enum class Consumer : std::uint8_t {
     image_blocks,   // blocks that hold many textures (ImageMemory, TitleImagePool)
     sampled,        // dedicated memory of a texture that is not an attachment
     render_target,  // dedicated memory of a colour or depth/stencil attachment
+    mirror,         // the page mirror's homes: one per physical page the GPU reads (src/title_mirror.h)
     count
 };
 
@@ -48,6 +49,7 @@ inline const char* consumer_name(Consumer c) {
         case Consumer::image_blocks: return "texture blocks";
         case Consumer::sampled: return "sampled textures";
         case Consumer::render_target: return "render targets and depth";
+        case Consumer::mirror: return "page mirror";
         default: return "?";
     }
 }
@@ -112,6 +114,9 @@ struct DeviceShare {
     // arena_in_use by kind, as DeviceState::ArenaUse: buffers, descriptor heaps, shader code, heaps
     std::array<std::uint64_t, 4> arena_use{};
     std::uint64_t bindless_table_bytes = 0;  // allocated by BindlessSet through its own function table
+    bool mirror = false;  // the page mirror is on: its homes, the pages bound to them, its chunks
+    std::uint64_t mirror_homes = 0, mirror_pages = 0, mirror_chunks = 0;
+    std::uint64_t mirror_units_local = 0, mirror_units_host = 0;  // its units of homes by memory
 };
 
 inline double mib(std::uint64_t bytes) { return double(bytes) / 1048576.0; }
@@ -137,6 +142,15 @@ inline std::string format(const Tally& tally, const DeviceShare& device, std::ui
                           mib(device.arena_reserved), mib(device.arena_bound), mib(device.arena_in_use),
                           mib(device.arena_use[0]), mib(device.arena_use[1]), mib(device.arena_use[2]),
                           mib(device.arena_use[3]));
+            out += item;
+        }
+        if (Consumer(c) == Consumer::mirror && device.mirror) {
+            std::snprintf(item, sizeof item,
+                          " [homes bound %.0f MiB (%llu), pages mirrored %llu, chunks %llu, units %llu device-local %llu "
+                          "host]",
+                          mib(device.mirror_homes * 0x10000), (unsigned long long)device.mirror_homes,
+                          (unsigned long long)device.mirror_pages, (unsigned long long)device.mirror_chunks,
+                          (unsigned long long)device.mirror_units_local, (unsigned long long)device.mirror_units_host);
             out += item;
         }
     }

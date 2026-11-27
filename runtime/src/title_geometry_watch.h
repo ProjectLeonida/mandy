@@ -172,19 +172,40 @@ inline DWORD read_only(DWORD protection) {
     }
 }
 // True when it made a page writable again.
+// Pages that are to get the same protection back are reopened together, a VirtualQuery and a VirtualProtect for each
+// region the query reports, not for each page: under Wine each call goes to the server, and a fault on a whole guarded
+// tile cost 16 us page by page against 2.6 us for one call (runtime/test/guard_fault_bench.cpp).
 inline bool reopen(std::uintptr_t va, Cell& c) {
     bool opened = false;
-    for (std::size_t i = 0; i < c.restore.size(); ++i) {
-        if (!c.restore[i]) continue;
-        void* p = reinterpret_cast<void*>(va + i * page_size);
-        MEMORY_BASIC_INFORMATION m{};
-        DWORD old{};
-        if (!VirtualQuery(p, &m, sizeof m)) continue;
-        if (m.State == MEM_COMMIT && m.Protect == read_only(c.restore[i])) {
-            if (!VirtualProtect(p, page_size, c.restore[i], &old)) continue;
-            opened = true;
+    for (std::size_t i = 0; i < c.restore.size();) {
+        if (!c.restore[i]) {
+            ++i;
+            continue;
         }
-        c.restore[i] = 0;
+        std::size_t j = i + 1;
+        while (j < c.restore.size() && c.restore[j] == c.restore[i]) ++j;
+        const DWORD restore = c.restore[i];
+        for (std::uintptr_t at = va + i * page_size, end = va + j * page_size; at < end;) {
+            MEMORY_BASIC_INFORMATION m{};
+            if (!VirtualQuery(reinterpret_cast<void*>(at), &m, sizeof m)) {
+                at += page_size;
+                continue;
+            }
+            const std::uintptr_t next = (std::min)(end, reinterpret_cast<std::uintptr_t>(m.BaseAddress) + m.RegionSize);
+            const std::uintptr_t until = next > at ? next : at + page_size;
+            bool done = true;
+            if (m.State == MEM_COMMIT && m.Protect == read_only(restore)) {
+                DWORD old{};
+                if (VirtualProtect(reinterpret_cast<void*>(at), until - at, restore, &old))
+                    opened = true;
+                else
+                    done = false;  // kept: tried again by the next reopen
+            }
+            if (done)
+                for (std::uintptr_t p = at; p < until; p += page_size) c.restore[(p - va) / page_size] = 0;
+            at = until;
+        }
+        i = j;
     }
     return opened;
 }

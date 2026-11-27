@@ -31,6 +31,8 @@
 #include "startup_trace.h"
 #include "xmem.h"
 #include "../src/title_page_watch.h"
+#include "../src/title_mirror_space.h"
+#include <memory>
 
 // The process heap as test_heap_lock_faults needs it (the same gate as d3d12_existing_heap_test's): an allocation that
 // waits while a thread holds the heap's lock. The NT heap's low-fragmentation front end serves most small sizes
@@ -879,6 +881,88 @@ void test_copy_page_mappings_reused_number(const PhysicalApi& api) {
           "the table pages read the new page behind the number, not the freed one");
     check(copy(gpu, nullptr, 1, false) && api.map(pool, 1, nullptr) == pool && api.free_pages(1, &second) == TRUE,
           "the pages are unmapped and freed");
+}
+
+// The page mirror's side of xmem (src/title_mirror_space.h, src/title_frames.h Feed): a reservation the title lets
+// xmem place lands in the mirror's range, below the address RADV's sparse range allows at heap_base + it; and every change
+// of what a page there shows (a host view mapped or unmapped, a slot-31 copy onto a GPU-only page and its twin) reaches
+// the feed in order, with the physical page's bytes, and the pages mapped before the feed was attached come first.
+struct MirrorFeedLog {
+    struct Entry {
+        uintptr_t page;
+        uint8_t* frame;
+    };
+    std::vector<Entry> entries;
+    static void feed(void* context, uintptr_t page, uint8_t* frame, const std::shared_ptr<void>&) {
+        static_cast<MirrorFeedLog*>(context)->entries.push_back({page, frame});
+    }
+    // The last entry for `page`: its frame (null: unmapped), or false when there is none.
+    bool last(uintptr_t page, uint8_t*& frame) const {
+        for (auto it = entries.rbegin(); it != entries.rend(); ++it)
+            if (it->page == page) {
+                frame = it->frame;
+                return true;
+            }
+        return false;
+    }
+};
+
+void test_mirror_space_and_feed(const PhysicalApi& api) {
+    const auto copy = rt::xmem::copy_page_mappings_fn;
+    const auto attach = leonida::title_frames::attach_fn.load();
+    check(attach != nullptr, "xmem sets the page mirror's attach hook");
+    if (!copy || !attach) return;
+    namespace space = leonida::title_mirror_space;
+    auto* const pool = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, 2 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    auto* const cpu = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, 2 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    auto* const gpu = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 2 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x3, 0x801));
+    auto* const plain = static_cast<uint8_t*>(api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT, 0x23,
+                                                                 PAGE_READWRITE));
+    check(pool && cpu && gpu && plain, "XMemVirtualAlloc reserves windows, a pair and committed memory");
+    if (!pool || !cpu || !gpu || !plain) return;
+    if (!space::enabled()) {
+        std::puts("SKIP mirror space: LEONIDA_PAGE_MIRROR=0");
+        return;
+    }
+    check(space::contains(uintptr_t(pool)) && space::contains(uintptr_t(cpu)) && space::contains(uintptr_t(gpu)) &&
+              space::contains(uintptr_t(plain)),
+          "reservations xmem places lie in the page mirror's range");
+    check(uintptr_t(cpu) < uintptr_t(gpu) && leonida::title_gpu_views::other_view(uintptr_t(gpu)) == uintptr_t(cpu),
+          "the pair is still made: the GPU-only reservation pairs with the CPU one before it");
+    plain[0] = 7;
+    check(plain[0] == 7, "committed memory placed there is usable");
+    uint64_t pages[2]{}, count = 2;
+    check(api.allocate(0x280, &count, pages) == TRUE && count == 2, "pages for the mirror test");
+    check(api.map(pool, 1, &pages[0]) == pool, "a page mapped before the feed is attached");
+    fill_page(pool, 0x7700u);
+
+    MirrorFeedLog log;
+    attach(&log, &MirrorFeedLog::feed);
+    uint8_t* frame = nullptr;
+    check(log.last(uintptr_t(pool), frame) && frame && page_holds(frame, 0x7700u),
+          "attaching feeds the pages mapped now, with their bytes");
+    const std::size_t at_attach = log.entries.size();
+    check(api.map(pool + kPage64k, 1, &pages[1]) == pool + kPage64k && log.last(uintptr_t(pool + kPage64k), frame) && frame,
+          "a host view mapped later is fed");
+    check(copy(gpu, pool, 2, false), "a slot-31 copy onto the GPU-only pair");
+    uint8_t* gpu_frame = nullptr;
+    uint8_t* twin_frame = nullptr;
+    check(log.last(uintptr_t(gpu), gpu_frame) && log.last(uintptr_t(cpu), twin_frame) && gpu_frame &&
+              gpu_frame == twin_frame && page_holds(gpu_frame, 0x7700u),
+          "the GPU-only page and its twin are fed the copied page (table updates)");
+    check(log.entries.size() > at_attach + 2, "each change is its own entry");
+    check(copy(gpu, nullptr, 2, false) && log.last(uintptr_t(gpu), gpu_frame) && !gpu_frame &&
+              log.last(uintptr_t(cpu), twin_frame) && !twin_frame,
+          "an unmap is fed as nothing shown");
+    check(api.map(pool, 2, nullptr) == pool && log.last(uintptr_t(pool), frame) && !frame, "a host unmap is fed");
+    attach(nullptr, nullptr);
+    const std::size_t detached = log.entries.size();
+    check(api.map(pool, 1, &pages[0]) == pool && log.entries.size() == detached, "nothing is fed once detached");
+    api.map(pool, 1, nullptr);
+    check(api.free_pages(2, pages) == TRUE, "the mirror test's pages are freed");
 }
 
 bool access_faults(volatile uint32_t* address, bool write) {
@@ -2825,6 +2909,7 @@ int main(int argc, char** argv) {
         test_copy_page_mappings(physical);
         test_copy_page_mappings_cpu_view(physical);
         test_copy_page_mappings_reused_number(physical);
+        test_mirror_space_and_feed(physical);
         test_stream_cpu_twin(physical);
         test_unowned_guards(physical);
         test_physical_pages_commit_on_touch(physical);

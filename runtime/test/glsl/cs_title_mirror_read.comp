@@ -1,0 +1,28 @@
+#version 460
+// The page mirror's acceptance shape (vk_title_mirror_test): a V# the title wrote into its own memory, read from a
+// buffer and then dereferenced as the translated shaders do it (heap_base + sext48(base), docs/design.md
+// "Heap-relative buffer device addresses"), as MS_VS_Depth-style code reads a V# out of a constant buffer with
+// s_buffer_load and loads through it. Each invocation reads V# i's base and the dword at base + 0x40.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 8) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint w[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Out { uint v[]; };
+
+layout(push_constant) uniform Push {
+    uint64_t heap_base;
+    uint64_t vsharps;  // 16-byte V#s, one per invocation
+    uint64_t out_words;
+    uint count;
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.count) return;
+    Words v = Words(p.vsharps + uint64_t(i) * 16ul);
+    const uint64_t base48 = uint64_t(v.w[0]) | (uint64_t(v.w[1] & 0xffffu) << 32);
+    const int64_t signed_base = (int64_t(base48) << 16) >> 16;  // sext48
+    Words target = Words(p.heap_base + uint64_t(signed_base) + 0x40ul);
+    Out(p.out_words).v[i] = target.w[0];
+}

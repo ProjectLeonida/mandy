@@ -3,6 +3,7 @@
 #include "d3d12_title_buffer_windows.h"
 #include "../src/memory_breakdown.h"
 #include "../src/title_geometry_watch.h"
+#include "../src/submit_phases.h"
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -649,7 +650,10 @@ public:
         for (std::size_t id = 0; id < marks_.size(); ++id)
             if ((marks_[id] & (kWhole | kPinned)) == kWhole && views_[id].alive) fill(views_[id], copy);
         written_vas_.clear();
-        if (uploaded_ != before) ++dirty_refreshes_;
+        if (uploaded_ != before) {
+            ++dirty_refreshes_;
+            leonida::submit_phases::note_change(leonida::submit_phases::change_geometry);  // not a "submit floor" one
+        }
         refilled_ += uploaded_ - before;
         const auto end = std::chrono::steady_clock::now();
         refresh_time_ += end - start;

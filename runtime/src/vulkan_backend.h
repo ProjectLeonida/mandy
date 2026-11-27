@@ -899,6 +899,7 @@ private:
             dispatching_.push_back(slot);
         }
         lock.unlock();
+        const submit_phases::WorkerScope busy(submit_phases::worker_fence_thread);  // the "submit frame" line
         for (std::size_t i = 0; i < entries.size(); ++i) {
             Entry& e = entries[i];
             DispatchSlot& slot = *slots[i];
@@ -1209,7 +1210,10 @@ public:
         // buffer as out of bounds, which is no reason to drop the submission.
         replay_.buffer_at = [this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
             BufferVaIndex<ResourceId>::Hit hit{};
-            if (!buffer_vas_.find(va, hit, size)) return false;  // prefers an aliasing buffer that holds all of it
+            if (!buffer_vas_.find(va, hit, size)) {  // prefers an aliasing buffer that holds all of it
+                // Title memory the page mirror holds (set_mirror_buffer): its chunk at heap_base + va.
+                return mirror_buffer_ && mirror_buffer_(va, size, buffer, offset);
+            }
             const ResourceBinding* b = resolve(hit.id);
             if (!b) return false;
             buffer = b->buffer;
@@ -1837,6 +1841,17 @@ public:
         return it == device_fault_->pipeline_names.end() ? nullptr : it->second[0];
     }
     void set_before_execute(std::function<void()> before) { before_execute_ = std::move(before); }
+    // The page mirror's lookup for buffer_at (src/title_mirror.h): the buffer and offset that hold a title address no
+    // buffer of ours holds. Set while no replay runs (device creation and destruction).
+    using MirrorBuffer = std::function<bool(std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset)>;
+    void set_mirror_buffer(MirrorBuffer lookup) { mirror_buffer_ = std::move(lookup); }
+    // The page mirror bound pages in a batch that signals `value` on `semaphore`: every queue's next submission of command
+    // lists waits for it (the bind of a remap lands before any submission made after the remap).
+    void note_mirror_bind(VkSemaphore semaphore, std::uint64_t value) {
+        std::lock_guard lock(storage_mutex_);
+        mirror_bind_semaphore_ = semaphore;
+        mirror_bind_value_ = value;
+    }
     // Called at the end of every ExecuteCommandLists replay that called before_execute_, however it returns: by then
     // the submissions it made are recorded, so submitted_retire_ticket() covers them.
     void set_after_execute(std::function<void()> after) { after_execute_ = std::move(after); }
@@ -2360,6 +2375,11 @@ private:
     // a counter that says which one: every other queue's next submission waits for it (storage_mutex_).
     VkSemaphore bindless_upload_semaphore_ = VK_NULL_HANDLE;
     std::uint64_t bindless_upload_value_ = 0;
+    // The page mirror's last bind batch (src/title_mirror.h): every queue's next submission of command lists waits for
+    // it, so none reads a page whose bind has not landed (storage_mutex_).
+    MirrorBuffer mirror_buffer_;
+    VkSemaphore mirror_bind_semaphore_ = VK_NULL_HANDLE;
+    std::uint64_t mirror_bind_value_ = 0;
     std::uint64_t bindless_upload_version_ = 0;
     std::function<bool(VkCommandBuffer)> prelude_record_;
     std::function<void(bool, std::uint64_t)> prelude_commit_;
@@ -2719,7 +2739,8 @@ public:
         bool held = false;
         std::vector<std::shared_ptr<void>> retired;  // destroyed after state_mutex_ is released
         {
-            std::lock_guard state(state_mutex_);
+            std::unique_lock state(state_mutex_, std::defer_lock);
+            submit_phases::lock_timed(state);
             if (!must_hold()) {
                 result = execute_now(lists, execute_call);
             } else if (context_.is_device_lost()) {
@@ -3105,6 +3126,8 @@ private:
     }
 
     ReplayResult execute_now(std::span<const CommandList* const> lists, std::uint64_t execute_call) {
+        // The "submit frame" line and the floor: this submission from before its first phase to after its last.
+        const submit_phases::Submission submission{int(kind_)};
         {
             const submit_phases::Scope waited(submit_phases::wait_room);
             if (context_.is_device_lost() || !wait_for_room()) return queue_unsupported(__LINE__);
@@ -3151,7 +3174,8 @@ private:
         // compiles; tracker_mutex_ is acquired lazily during prepare() only if a list uses a shared helper, and
         // otherwise right before bindless_prepare_/emit() through submit() so bindless flushes, layout emits, and
         // submissions stay in order.
-        std::shared_lock pipeline_lock(context_.pipeline_mutex_);
+        std::shared_lock pipeline_lock(context_.pipeline_mutex_, std::defer_lock);
+        submit_phases::lock_timed(pipeline_lock);
         std::shared_lock resource_lock(context_.resource_mutex_, std::defer_lock);
         std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
         // Declared after tracker_lock so any early return after depth24_->prepare() retires uncommitted scratch/pools
@@ -3210,7 +3234,7 @@ private:
         PipelineCompiles prior_compiles;
         bool has_prior_compiles = false;
         for (int pass = 0;; ++pass) {
-            resource_lock.lock();
+            submit_phases::lock_timed(resource_lock);
             bindless_commit = !transfer_only ? context_.bindless_commit_ : std::function<void(bool)>{};
             replay = context_.replay_;
             mesh_draws = 0;
@@ -3387,6 +3411,7 @@ private:
                 has_queries = has_queries || !prepared[i].queries.empty();
             }
             if (pass == 0 && !compiles.empty()) {
+                submit_phases::note_change(submit_phases::change_pipelines);  // not a floor submission
                 if (depth24_guard.active) {
                     context_.depth24_->retire(progress_, 0);
                     depth24_guard.active = false;
@@ -3625,6 +3650,11 @@ private:
                 wait_values_.push_back(context_.bindless_upload_value_);
             }
             bindless_upload_seen_ = context_.bindless_upload_version_;
+            if (context_.mirror_bind_semaphore_ && context_.mirror_bind_value_ > mirror_bind_seen_) {
+                waits_.push_back(context_.mirror_bind_semaphore_);
+                wait_values_.push_back(context_.mirror_bind_value_);
+                mirror_bind_seen_ = context_.mirror_bind_value_;
+            }
             if (kind_ != QueueKind::copy && runs_shaders)
                 storage_images.assign(context_.storage_pending_.begin(), context_.storage_pending_.end());
             if (!storage_images.empty()) context_.storage_pending_.clear();
@@ -4385,7 +4415,8 @@ private:
         const std::vector<VkPipelineStageFlags> stages(semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         VkResult res = VK_SUCCESS;
         {
-            std::lock_guard lock(context_.submit_mutex());
+            std::unique_lock lock(context_.submit_mutex(), std::defer_lock);
+            submit_phases::lock_timed(lock);  // a wait for another queue's submit is counted (the frame line)
             VkSemaphore signals[2]{progress_, VK_NULL_HANDLE};
             std::uint64_t signal_values[2]{ticket, 0};
             std::uint32_t signal_count = 1;
@@ -4439,8 +4470,10 @@ private:
                 }
                 ring_at = ring->begin_submit(record);
             }
+            const std::int64_t call_start = submit_phases::now_ns();
             res = context_.observe_result(context_.queue_submit(queue_, 1, &submit, context_.gpu_labels_.submit_fence(command_buffer)),
                                           "vkQueueSubmit");
+            submit_phases::add_part(submit_phases::part_submit_call, std::uint64_t(submit_phases::now_ns() - call_start));
             context_.gpu_labels_.submitted(command_buffer, res == VK_SUCCESS);
             if (ring) ring->end_submit(ring_at, diagnostic_ms() - submit_start, res);
             if (res == VK_SUCCESS) {
@@ -4481,6 +4514,7 @@ private:
     std::unique_ptr<OcclusionResolve> occlusion_resolve_;
     std::uint64_t storage_init_seen_ = 0;  // the storage_init_version_ this queue has waited for
     std::uint64_t bindless_upload_seen_ = 0;  // the bindless_upload_version_ this queue has waited for
+    std::uint64_t mirror_bind_seen_ = 0;      // the page mirror's bind value this queue has waited for
     std::uint64_t prelude_seen_ = 0;  // the prelude_version_ this queue has waited for (or recorded)
     std::uint64_t last_sparse_ = 0;
     std::deque<PendingBindings> pending_bindings_;
@@ -4586,6 +4620,7 @@ private:
             std::uint64_t ran_ns = 0;
             if (have) {
                 const auto start = std::chrono::steady_clock::now();
+                const submit_phases::WorkerScope busy(submit_phases::worker_submit);  // the "submit frame" line
                 run_call(call);
                 const auto end = std::chrono::steady_clock::now();
                 ran_ns = std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());

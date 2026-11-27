@@ -215,6 +215,9 @@ struct VulkanDeviceInfo {
     // arena and have console VAs (docs section 3.3), and GetGPUVirtualAddress returns those addresses; ray tracing
     // needs it too. Without it, GetGPUVirtualAddress returns 0 and pipelines cannot be created.
     bool buffer_device_address = false;
+    // bufferDeviceAddressCaptureReplay is enabled: a buffer can be made at a device address of the runtime's choosing
+    // (the page mirror's chunks at heap_base + a title address, src/title_mirror.h).
+    bool buffer_device_address_capture_replay = false;
     // Optional VK_KHR_acceleration_structure + VK_KHR_deferred_host_operations + VK_KHR_ray_query are enabled:
     // GetRaytracingAccelerationStructurePrebuildInfo and BuildRaytracingAccelerationStructure (BLAS + TLAS) work.
     bool ray_tracing = false;
@@ -411,6 +414,28 @@ ArenaMemoryState device_arena_memory(ID3D12Device* device);
 // Copies `bytes` of the device's GPU address arena at console VA `va` (what shaders read there: a heap's GPU copy,
 // the null slots after it) into `out`. False without an arena or when the range is not inside it. For tests.
 bool read_arena(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes);
+
+// The page mirror (src/title_mirror.h): whether the device made it (and why not), and what it holds. For tests.
+struct PageMirrorState {
+    bool on = false;
+    std::uint64_t heap_base = 0, pages = 0, homes = 0, chunks = 0, uploads = 0, binds = 0;
+};
+PageMirrorState page_mirror_state(ID3D12Device* device);
+// Brings the page mirror up to date as a submission does, then copies `bytes` at heap_base + `title_va` (what a shader
+// reads at a title-written address there) into `out` with the GPU, after the mirror's last bind. False when the mirror is
+// off or the address is not in one of its chunks. For tests.
+bool page_mirror_gpu_read(ID3D12Device* device, std::uint64_t title_va, void* out, std::size_t bytes);
+// Whether a draw's or copy's binding of title memory [va, va + size) would be served by the page mirror (VulkanContext's
+// mirror lookup): it must have been named before. `size` comes back cut at the chunk's end. For tests.
+bool page_mirror_buffer_at(ID3D12Device* device, std::uint64_t va, std::uint64_t& size);
+// Names [va, va + bytes) to the page mirror as a reader would (page_mirror_resolve). For tests.
+bool page_mirror_name(ID3D12Device* device, std::uint64_t va, std::uint64_t bytes);
+// Writes `bytes` (at most 64 KiB) at heap_base + `title_va` with the GPU, as a shader's store into the mirror would,
+// and waits for it. For tests.
+bool page_mirror_gpu_write(ID3D12Device* device, std::uint64_t title_va, const void* data, std::size_t bytes);
+// The copy back of what the GPU wrote into the mirror's homes over [va, va + bytes) to the title's pages, as
+// write_back_titles makes it once a submission has retired. Returns the bytes written. For tests.
+std::uint64_t page_mirror_write_back(ID3D12Device* device, std::uint64_t va, std::uint64_t bytes);
 
 // The blocks of device memory that textures share (src/image_memory.h): how many, their bytes, and the textures in
 // them. For tests.
