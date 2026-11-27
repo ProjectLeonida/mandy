@@ -67,6 +67,26 @@ struct TilePieces {
     bool valid_for(std::uintptr_t at, std::uint64_t bytes) const {
         return cpu == at && span == bytes && !hashes.empty();
     }
+    // The tiles [at, at + bytes) touches.
+    static std::size_t tiles(std::uintptr_t at, std::uint64_t bytes) {
+        return std::size_t((((at + bytes + kTile - 1) & ~(kTile - 1)) - (at & ~(kTile - 1))) / kTile);
+    }
+    // For a texture at `at`: one hash a tile, to be set by part (set_part, from any thread for distinct parts).
+    void reset(std::uintptr_t at, std::uint64_t bytes) {
+        cpu = at;
+        span = bytes;
+        hashes.assign(tiles(at, bytes), 0);
+    }
+    // The texture's hash: its parts' hashes (and its size) mixed in order, so a texture read in parts needs no second
+    // pass over its bytes.
+    std::uint64_t combined() const {
+        std::uint64_t h = 1469598103934665603ull ^ span;
+        for (const std::uint64_t part : hashes) {
+            h = (h ^ part) * 1099511628211ull;
+            h ^= h >> 29;
+        }
+        return h;
+    }
     // From a whole copy of the texture's bytes: hash(pointer, length) of each tile's part.
     template<class Hash>
     void compute(std::uintptr_t at, std::uint64_t bytes, const std::uint8_t* copy, Hash&& hash) {
