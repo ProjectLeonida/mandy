@@ -2515,7 +2515,13 @@ BOOL WINAPI TitleVirtualProtect(LPVOID address, SIZE_T size, DWORD protect, PDWO
     const auto start = reinterpret_cast<uintptr_t>(address);
     // Before the call: a fault on another thread in between must not take the title's protection for a lost guard.
     note_title_protect(start, size, protect);
+    // Our guards over the range (the slot-133 shadows', the geometry and title texture watches' cells) come off first
+    // and stay off while the call runs, as for a kernel write (a pin: no refresh guards a pinned page): the protection
+    // the call returns in `old` is the title's own, never one of our read-only guards. A title that saved such an `old`
+    // and set it back later left the page read-only with no guard to answer for it, and its next write faulted.
+    const std::uint64_t pin = leonida::kernel_writes::begin_write(address, size, nullptr);
     const BOOL result = VirtualProtect(address, size, protect, old);
+    leonida::kernel_writes::end_write(pin, false);
     if (result) {
         leonida::title_memory_map::changed(start, start + size);
         leonida::geometry_writes::notify(start, start + size, leonida::geometry_writes::Event::replaced);
