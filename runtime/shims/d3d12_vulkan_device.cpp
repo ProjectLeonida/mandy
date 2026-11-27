@@ -5525,6 +5525,9 @@ struct DeviceState {
         std::uint64_t resolutions = 0;
         double resolution_ms = 0;
         std::uint64_t nothing[nothing_classes] = {};
+        // For the arena-offset and not-title-memory classes: what the host has at the base as an address
+        // (nothing_where_kind), so a log names the memory a V# resolved to nothing names.
+        std::uint64_t nothing_where[2][5] = {};
         double max_ms = 0, max_pages_ms = 0, max_changes_ms = 0, max_fix_ms = 0;
         // Read in place (add_heap_in_place): the page mirror holds the title's heap pages, bound a second time into the
         // arena at shader_va, and fills their home through filter_heap_page. No copy, no page tracker of its own.
@@ -6138,6 +6141,17 @@ struct DeviceState {
             default: break;
             }
         ++heap.nothing[kind];
+        if (kind == nothing_arena || kind == nothing_not_title)
+            ++heap.nothing_where[kind == nothing_not_title][nothing_where_kind(base)];
+    }
+    // What the host has at `base` taken as an address: 0 image, 1 mapped, 2 private committed, 3 reserved, 4 free.
+    static unsigned nothing_where_kind(std::uint64_t base) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), &info, sizeof(info)) ||
+            info.State == MEM_FREE)
+            return 4;
+        if (info.State != MEM_COMMIT) return 3;
+        return info.Type == MEM_IMAGE ? 0 : info.Type == MEM_MAPPED ? 1 : 2;
     }
 
     void note_refused_tsharp(ConsoleHeap& heap, std::size_t offset, const leonida::gfx10::ImageWords& words,
@@ -6329,6 +6343,20 @@ struct DeviceState {
                     if (heap->nothing[i])
                         classes += (classes.empty() ? "" : ", ") + std::string(kNothingNames[i]) + " " +
                                    std::to_string(heap->nothing[i]);
+                // Where the host has those bases (nothing_where_kind).
+                for (unsigned c = 0; c < 2; ++c) {
+                    const std::uint64_t* w = heap->nothing_where[c];
+                    if (!(w[0] | w[1] | w[2] | w[3] | w[4])) continue;
+                    char text[200];
+                    std::snprintf(text, sizeof(text),
+                                  " (%s bases as host addresses: image %llu, mapped %llu, private %llu, reserved "
+                                  "%llu, free %llu)",
+                                  c ? "not title memory" : "arena offset", static_cast<unsigned long long>(w[0]),
+                                  static_cast<unsigned long long>(w[1]), static_cast<unsigned long long>(w[2]),
+                                  static_cast<unsigned long long>(w[3]), static_cast<unsigned long long>(w[4]));
+                    classes += text;
+                }
+                std::memset(heap->nothing_where, 0, sizeof(heap->nothing_where));
                 std::fprintf(stderr,
                              "[rt] d3d12: console descriptor heap 0x%llx V# halves per submission: %.1f answered by a "
                              "resolved record of their range, %.1f by a waiting one, %.1f resolved anew (%.3f ms, %.2f "
