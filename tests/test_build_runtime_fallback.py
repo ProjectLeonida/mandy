@@ -71,6 +71,31 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         self.assertTrue(wanted)
         self.assertEqual(wanted - listed, set(), "in CMake's gta6rt sources but not in the cl.exe fallback")
 
+    def test_every_non_vulkan_fallback_target_compiles_every_source_cmake_gives_it(self):
+        """BUILD-FALLBACK-PSO-STREAM: d3d12_xs_device.cpp calls PsoStreamRecord / derive_stream in
+        shims/d3d12_xs_pso_stream.cpp, which CMake added to root_sig_test and device_proxy_test while the cl.exe
+        fallback omitted it (6 LNK2019 unresolved externals). Check every non-Vulkan fallback target's .cpp list
+        against CMakeLists.txt so new shim dependencies cannot break the fallback silently."""
+        cmake = (ROOT / "runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
+        targets = (
+            ("gta6rt_tls_host", "gta6rt_tls_host.dll"),
+            ("root_sig_test", "root_sig_test.exe"),
+            ("device_proxy_test", "device_proxy_test.exe"),
+            ("descriptor_table_test", "descriptor_table_test.exe"),
+            ("command_list_test", "command_list_test.exe"),
+        )
+        for target, out_name in targets:
+            with self.subTest(target=target):
+                match = re.search(rf"add_(?:executable|library)\({target}\b(.*?)\)", cmake, re.S)
+                self.assertIsNotNone(match, f"{target} not found in runtime/CMakeLists.txt")
+                wanted = {item.replace("/", "\\") for item in match.group(1).split() if item.endswith(".cpp")}
+                self.assertTrue(wanted)
+                lines = [line for line in self.body.splitlines() if f"/Fe:{out_name}" in line]
+                self.assertEqual(len(lines), 1, f"expected one /Fe:{out_name} line in cl.exe fallback")
+                listed = set(re.findall(r'"\$src\\([^"]+\.cpp)"', lines[0]))
+                self.assertEqual(wanted - listed, set(),
+                                 f"in CMake's {target} sources but not in the cl.exe fallback")
+
     def test_every_test_source_it_compiles_exists(self):
         sources = re.findall(r'"\$src\\test\\([A-Za-z0-9_]+\.cpp)"', self.body)
         self.assertTrue(sources)
