@@ -349,6 +349,12 @@ int main(int argc, char** argv) {
         bounds.DepthBoundsTestEnable = TRUE;
         bad.add(DepthStencil1Subobject{.inner = bounds});
         {
+            // Without a depth-stencil format the test has no depth and is dropped, so the PSO is made on any device
+            // (RT-STATE-DEPTH-BOUNDS-NO-DSV); with one it needs the depth-bounds feature.
+            Ref<ID3D12PipelineState> no_dsv;
+            EXPECT(SUCCEEDED(create(device.p, bad, no_dsv)) && no_dsv.p);
+            bad.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT>{
+                .inner = DXGI_FORMAT_D32_FLOAT});
             D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2{};
             EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS2, &o2, sizeof o2)));
             Ref<ID3D12PipelineState> with_bounds;

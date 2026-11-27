@@ -11808,6 +11808,10 @@ public:
                 return E_INVALIDARG;
             }
         }
+        // Without a depth-stencil view there is no depth to test against the bounds: the test is dropped, as the
+        // native path does (d3d12_xs_native_pso.h), rather than refused on a device without depthBounds or left
+        // as a dynamic depth-bounds state with no depth attachment.
+        if (desc.DSVFormat == DXGI_FORMAT_UNKNOWN) depth_bounds = false;
         if (desc.InputLayout.NumElements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT) return E_INVALIDARG;
         if (desc.InputLayout.NumElements > 0 && !desc.InputLayout.pInputElementDescs) return E_INVALIDARG;
         for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {

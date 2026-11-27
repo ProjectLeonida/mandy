@@ -425,6 +425,57 @@ int main() {
     EXPECT(check_gfx_layer_only("gfx: DSVFormat=R32_FLOAT (color)", E_INVALIDARG,
                                 [](auto& d) { d.DSVFormat = DXGI_FORMAT_R32_FLOAT; }));
 
+    // 5b. A depth-bounds test (DEPTH_STENCIL1) without a depth-stencil format has no depth to test, so it is dropped
+    // rather than refused: this layer device enables no depthBounds feature (info.features above), so a PSO with a
+    // DSV that asks for the test is refused, and one without a DSV is made (RT-STATE-DEPTH-BOUNDS-NO-DSV).
+    {
+        Ref<ID3D12Device2> layer_dev2;
+        EXPECT(SUCCEEDED(layer_dev->QueryInterface(IID_PPV_ARGS(&layer_dev2.p))));
+        struct BoundsStream {
+            alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE root_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+            ID3D12RootSignature* root = nullptr;
+            alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE vs_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;
+            D3D12_SHADER_BYTECODE vs{};
+            alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE ps_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS;
+            D3D12_SHADER_BYTECODE ps{};
+            alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE topology_type =
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY;
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE targets_type =
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
+            D3D12_RT_FORMAT_ARRAY targets{};
+            alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE depth_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1;
+            D3D12_DEPTH_STENCIL_DESC1 depth{};
+            alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE dsv_type =
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT;
+            DXGI_FORMAT dsv = DXGI_FORMAT_UNKNOWN;
+        };
+        const auto create_bounds = [&](DXGI_FORMAT dsv) {
+            BoundsStream s;
+            s.root = layer_root.p;
+            s.vs = layer_vs_fs;
+            s.ps = layer_ps_unorm;
+            s.targets.NumRenderTargets = 1;
+            s.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            s.depth.DepthEnable = dsv != DXGI_FORMAT_UNKNOWN;
+            s.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+            s.depth.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+            s.depth.DepthBoundsTestEnable = TRUE;
+            s.dsv = dsv;
+            const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(s), &s};
+            Ref<ID3D12PipelineState> pso;
+            const HRESULT hr = layer_dev2->CreatePipelineState(&desc, IID_PPV_ARGS(&pso.p));
+            return SUCCEEDED(hr) && pso.p ? S_OK : hr;
+        };
+        const HRESULT no_dsv = create_bounds(DXGI_FORMAT_UNKNOWN);
+        if (no_dsv != S_OK)
+            std::fprintf(stderr, "FAIL [stream: depth bounds without a DSV]: layer returned 0x%08lx, expected S_OK\n",
+                         static_cast<unsigned long>(no_dsv));
+        EXPECT(no_dsv == S_OK);
+        EXPECT(create_bounds(DXGI_FORMAT_D32_FLOAT) == E_NOTIMPL);
+        checked += 2;
+    }
+
     // 6. NodeMask and Flags validation (Graphics & Compute).
     EXPECT(check_gfx_parity("gfx: NodeMask=0", S_OK, false, false, [](auto& d) { d.NodeMask = 0; }));
     EXPECT(check_gfx_parity("gfx: NodeMask=1", S_OK, false, false, [](auto& d) { d.NodeMask = 1; }));
