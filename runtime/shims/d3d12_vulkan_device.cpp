@@ -4642,7 +4642,6 @@ struct DeviceState {
         std::uint64_t units_local = 0, units_host = 0;  // home units by memory, all so far
         bool last_local = true;
         std::uint64_t presents = 0;  // present serial at the last log line
-        std::uint64_t last_present_serial = 0;  // present serial last forwarded to HotColdTracking
         std::uint64_t faults_seen = 0, hot_seen = 0, cold_seen = 0;  // the tracking's counters at the last log line
         std::uint64_t uploaded_seen = 0, conflicts_seen = 0;           // the mirror's, likewise
         // The write-back's GPU copy of the homes it looks at (page_mirror_write_back_ranges): a host-cached buffer of
@@ -5279,13 +5278,6 @@ struct DeviceState {
             if (to - from >= kPage)  // a run that lost a page is named again (pages still there map to themselves)
                 for (auto run = m.ensured.begin(); run != m.ensured.end();)
                     run = run->first < to && from < run->second ? m.ensured.erase(run) : std::next(run);
-        }
-        const std::uint64_t present_now =
-            leonida::submit_phases::totals().present_serial.load(std::memory_order_relaxed);
-        if (present_now != m.last_present_serial) {
-            const std::uint64_t delta = present_now - m.last_present_serial;
-            m.last_present_serial = present_now;
-            for (std::uint64_t i = 0; i < std::min<std::uint64_t>(delta, 4); ++i) m.tracking->on_present();
         }
         m.tracking->collect(m.written);  // re-watched before the copies below
         for (const std::uint64_t page : m.written)

@@ -175,13 +175,20 @@ public:
         return true;
     }
 
-    // f(at, bytes) for each committed range (a span or a large block), for a reader that starts late.
+    // f(at, bytes) for each maximal contiguous committed extent (coalescing adjacent spans and large blocks;
+    // never includes uncommitted holes), for a reader that starts late. Exact complement of free_runs_ in
+    // [base_, base_ + bytes_).
     template <class F>
     void for_each_committed(F&& f) const {
         std::lock_guard lock(mutex_);
-        for (std::size_t s = 0; s < span_class_.size(); ++s)
-            if (span_class_[s] != kNoClass) f(base_ + s * kSpan, kSpan);
-        for (const auto& [at, bytes] : large_) f(at, bytes);
+        if (!base_ || !bytes_) return;
+        std::uintptr_t cursor = base_;
+        const std::uintptr_t limit = base_ + bytes_;
+        for (const auto& [free_at, free_bytes] : free_runs_) {
+            if (free_at > cursor) f(cursor, free_at - cursor);
+            cursor = free_at + free_bytes;
+        }
+        if (cursor < limit) f(cursor, limit - cursor);
     }
 
     Stats stats() const {

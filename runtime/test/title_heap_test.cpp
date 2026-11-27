@@ -194,6 +194,50 @@ int main() {
         EXPECT(!plain_heap.write_watched() && !plain_heap.stats().write_watched);
     }
 
+    // 6. Committed-span tracking (for_each_committed): coalesces contiguous spans & large blocks and splits
+    //    cleanly around decommitted holes so late readers / write-watch scans never span uncommitted sub-ranges.
+    {
+        TitleHeap span_heap;
+        EXPECT(span_heap.init(base, kBytes, hooks, true));
+        auto collect_extents = [&](const TitleHeap& h) {
+            std::vector<std::pair<std::uintptr_t, std::size_t>> extents;
+            h.for_each_committed([&](std::uintptr_t at, std::size_t bytes) { extents.emplace_back(at, bytes); });
+            return extents;
+        };
+        EXPECT(collect_extents(span_heap).empty());
+
+        void* s1 = span_heap.allocate(64);             // commits 1 MiB span [base, base + 1M)
+        void* l1 = span_heap.allocate(2 * TitleHeap::kPage);  // commits 128 KiB [base + 1M, base + 1M + 128K)
+        void* l2 = span_heap.allocate(2 * TitleHeap::kPage);  // commits 128 KiB [base + 1M + 128K, base + 1M + 256K)
+        EXPECT(s1 && l1 && l2);
+        auto ext = collect_extents(span_heap);
+        EXPECT(ext.size() == 1 && ext[0].first == base &&
+               ext[0].second == TitleHeap::kSpan + 4 * TitleHeap::kPage &&
+               ext[0].second == span_heap.stats().committed);
+
+        // Releasing l1 decommits [base + 1M, base + 1M + 128K), splitting into two committed extents around the hole.
+        EXPECT(span_heap.release(l1));
+        ext = collect_extents(span_heap);
+        EXPECT(ext.size() == 2);
+        if (ext.size() == 2) {
+            EXPECT(ext[0].first == base && ext[0].second == TitleHeap::kSpan);
+            EXPECT(ext[1].first == base + TitleHeap::kSpan + 2 * TitleHeap::kPage &&
+                   ext[1].second == 2 * TitleHeap::kPage);
+            EXPECT(ext[0].second + ext[1].second == span_heap.stats().committed);
+        }
+
+        // Re-allocating into the hole re-coalesces back into a single contiguous committed extent.
+        void* l1_again = span_heap.allocate(2 * TitleHeap::kPage);
+        EXPECT(l1_again == l1);
+        ext = collect_extents(span_heap);
+        EXPECT(ext.size() == 1 && ext[0].first == base &&
+               ext[0].second == TitleHeap::kSpan + 4 * TitleHeap::kPage);
+
+        EXPECT(span_heap.release(l1_again) && span_heap.release(l2) && span_heap.release(s1));
+        ext = collect_extents(span_heap);
+        EXPECT(ext.size() == 1 && ext[0].first == base && ext[0].second == TitleHeap::kSpan);
+    }
+
     if (failures) {
         std::fprintf(stderr, "title_heap_test: %d failure(s)\n", failures);
         return 1;
