@@ -176,10 +176,14 @@ def _scan_rpf_chunk(args: tuple[str, int, int]) -> tuple[list[int], int, int]:
     incomplete_0x7a = 0
     with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
         size = len(m)
+        # A header that starts before `end` is this range's even when its second byte lies past it: the next range
+        # starts at `end`, after the header's first byte, so a search that stopped at `end` lost the resource for
+        # some --jobs values (world_census.scan_shard reads past its end the same way).
+        search_end = min(size, end + 1)
         pos = start
         while pos < end:
-            mt = ZHDR.search(m, pos, end)
-            if not mt:
+            mt = ZHDR.search(m, pos, search_end)
+            if not mt or mt.start() >= end:
                 break
             off = mt.start()
             if ((m[off] << 8) | m[off + 1]) % 31 != 0:
