@@ -28,6 +28,7 @@ class MergeCheckSafetyTests(unittest.TestCase):
         bad_argvs = (
             ["--depth", "0", "12=main"],
             ["--depth", "-1", "12=main"],
+            ["--min-length", "0", "12=main"],
             ["--min-length", "-1", "12=main"],
             ["0=main"],
             ["##12=main"],

@@ -190,16 +190,6 @@ def _positive_int(text):
     return value
 
 
-def _nonnegative_int(text):
-    try:
-        value = int(text)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {text!r}") from None
-    if value < 0:
-        raise argparse.ArgumentTypeError(f"must be non-negative, got {text!r}")
-    return value
-
-
 def _validate_ref(ref, label):
     if not ref or ref != ref.strip() or ref.startswith("-"):
         raise argparse.ArgumentTypeError(f"invalid {label} ref: {ref!r}")
@@ -220,7 +210,7 @@ def main(argv=None):
     ap.add_argument("--main", default="origin/main", type=lambda s: _validate_ref(s, "--main"),
                     help="the branch the round merges into (default origin/main)")
     ap.add_argument("--repo", default=".", help="repository folder (default: the current one)")
-    ap.add_argument("--min-length", type=_nonnegative_int, default=40,
+    ap.add_argument("--min-length", type=_positive_int, default=40,
                     help="shortest stripped line counted as a duplicate (40)")
     ap.add_argument("--depth", type=_positive_int, default=5000,
                     help="first-parent commits searched for earlier merges (5000)")
