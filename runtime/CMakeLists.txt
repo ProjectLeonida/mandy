@@ -2163,6 +2163,17 @@ if(TARGET Vulkan::Headers)
   if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
   endif()
+  # Windows glslang fast-fails (0xC0000409) in a non-ASCII working directory whatever its arguments say:
+  # the CRT resolves files through the narrow (ANSI codepage) current directory. Run it through
+  # test/glslang_ascii_cwd.py, which re-runs it with the output directory's 8.3 short form as the working
+  # directory and every path pure ASCII, so a build tree under a non-ASCII directory compiles. The variable
+  # becomes a list here, so uses below must stay unquoted; off Windows or without Python3 it stays the
+  # validator alone and nothing changes.
+  if(WIN32 AND Vulkan_GLSLANG_VALIDATOR_EXECUTABLE AND Python3_EXECUTABLE)
+    set(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE
+        "${Python3_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/test/glslang_ascii_cwd.py"
+        "${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}")
+  endif()
   if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     add_executable(vk_overlapping_occlusion_test test/vk_overlapping_occlusion_test.cpp)
     target_link_libraries(vk_overlapping_occlusion_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
@@ -2173,7 +2184,7 @@ if(TARGET Vulkan::Headers)
       set(source "${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/overlapping_occlusion.${stage}")
       set(output "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.${stage}.spv")
       add_custom_command(OUTPUT "${output}"
-                         COMMAND "${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.0
+                         COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.0
                                  -o "${output}" "${source}"
                          DEPENDS "${source}" VERBATIM)
       target_sources(vk_overlapping_occlusion_test PRIVATE "${output}")
@@ -2429,7 +2440,7 @@ if(TARGET Vulkan::Headers)
       set(source "${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/binary_occlusion.${stage}")
       set(output "${CMAKE_CURRENT_BINARY_DIR}/binary_occlusion.${stage}.spv")
       add_custom_command(OUTPUT "${output}"
-                         COMMAND "${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.0
+                         COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.0
                                  -o "${output}" "${source}"
                          DEPENDS "${source}" VERBATIM)
       target_sources(vk_binary_occlusion_test PRIVATE "${output}")
