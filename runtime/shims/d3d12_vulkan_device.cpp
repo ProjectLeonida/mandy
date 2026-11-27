@@ -4653,7 +4653,7 @@ struct DeviceState {
         std::uint64_t readback_value = 0;
         bool readback_failed = false;
         bool readback_in_flight = false;  // under `mutex`: another thread is copying homes out; note mutations below
-        std::unordered_set<std::uint64_t> readback_invalidated;  // under `mutex`: pages mapped/uploaded during copy
+        std::unordered_set<std::uint8_t*> readback_invalidated;  // under `mutex`: physical frames mapped/uploaded during copy
         std::uint64_t write_back_calls = 0, read_back_bytes = 0;
         double write_back_ms = 0, write_back_wait_ms = 0, write_back_max_ms = 0;
         double ms = 0;
@@ -4893,9 +4893,10 @@ struct DeviceState {
             const std::uint64_t ticket = context->submitted_retire_ticket() + 1;
             for (std::uint64_t page = from; page < to; page += kPage) {
                 if (m.mirror->mirrored(page)) continue;
-                if (m.readback_in_flight) m.readback_invalidated.insert(page);
+                auto* const frame = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(page));
+                if (m.readback_in_flight) m.readback_invalidated.insert(frame);
                 m.tracking->watch(page);  // before the fill: a write after it is in the next collect
-                m.mirror->map(page, reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(page)), nullptr, ticket);
+                m.mirror->map(page, frame, nullptr, ticket);
                 m.identity.insert(page);
                 ++m.identity_mapped;
             }
@@ -5155,10 +5156,10 @@ struct DeviceState {
                     } else {
                         for (std::size_t i = 0; i < slice.size(); ++i) {
                             const auto& r = slice[i];
-                            if (m.readback_invalidated.count(r.page)) {
-                                // A concurrent upload advanced home.sums while the GPU copy was in flight; re-queue
-                                // only if the page still shows the same physical frame (its GPU-only pieces remain in
-                                // the home).
+                            if (m.readback_invalidated.count(r.frame)) {
+                                // A concurrent upload or remap touched this physical frame while the GPU copy was in
+                                // flight; re-queue only if the page still shows the same frame (its GPU-only pieces
+                                // remain in the home).
                                 if (!m.mirror->has_pending(r.page) && m.mirror->frame_at(r.page) == r.frame)
                                     retry_pages.push_back(r.page);
                                 continue;
@@ -5240,7 +5241,10 @@ struct DeviceState {
         for (auto& change : m.taken) {
             ++m.fed;
             m.fed_now.insert(change.page);
-            if (m.readback_in_flight) m.readback_invalidated.insert(change.page);
+            if (m.readback_in_flight) {
+                if (std::uint8_t* old_frame = m.mirror->frame_at(change.page)) m.readback_invalidated.insert(old_frame);
+                if (change.frame) m.readback_invalidated.insert(change.frame);
+            }
             // Watched before the home is filled: a write after the fill is in the next collect.
             if (!change.frame) m.tracking->unwatch(change.page);
             else if (m.mirror->covers(change.page)) m.tracking->watch(change.page);
@@ -5254,7 +5258,8 @@ struct DeviceState {
             constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
             for (auto page = m.identity.lower_bound((from + kPage - 1) & ~(kPage - 1));
                  page != m.identity.end() && *page + kPage <= to;) {
-                if (m.readback_in_flight) m.readback_invalidated.insert(*page);
+                if (m.readback_in_flight)
+                    if (std::uint8_t* old_frame = m.mirror->frame_at(*page)) m.readback_invalidated.insert(old_frame);
                 m.tracking->unwatch(*page);
                 m.mirror->map(*page, nullptr, nullptr, ticket);
                 ++m.identity_released;
@@ -5268,7 +5273,8 @@ struct DeviceState {
         for (const std::uint64_t page : m.written)
             if (!m.fed_now.count(std::uintptr_t(page)) && m.mirror->dirty(page)) {
                 ++m.dirty;
-                if (m.readback_in_flight) m.readback_invalidated.insert(page);
+                if (m.readback_in_flight)
+                    if (std::uint8_t* dirty_frame = m.mirror->frame_at(page)) m.readback_invalidated.insert(dirty_frame);
             }
         m.arm_failures += m.tracking->take_refused();
         // The changes noted since (a buffer released, a texture come): the slots of heaps read in place they touch are
