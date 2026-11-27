@@ -60,12 +60,11 @@ struct TitleMirrorHooks {
     // zeroed it), so every byte must be written; otherwise `to` still holds this filter's last output for the same page.
     // The title's bytes and the page's own home are never written. False as for `copy` (the copy is zeroed).
     std::function<bool(std::uint64_t va, std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool fresh)> filter;
-    // Optional fast path for `filter`: called from fill() when set and the whole-page copy succeeded (after `home` and
-    // its piece sums are updated), passing the already-copied 64 KiB `scratch` buffer (no duplicate guarded copy) and
-    // the 256-bit `changed_pieces` mask (bit k set when piece [k*256, (k+1)*256) changed; all bits set when `fresh`
-    // or after a write-back refilter). Outside fill() (make_copy, write-back refilter, alias handoff, or partial-read
-    // fallback), `filter` is called if set (or `filter_pieces` with a fresh copy and all bits set when only
-    // `filter_pieces` is installed).
+    // Optional fast path for `filter`: called whenever `filter_pieces` is set, passing the already-copied 64 KiB
+    // `scratch` buffer (no duplicate guarded copy; synced with `home` and `home.sums[]`) and the 256-bit
+    // `changed_pieces` mask (bit k set when piece [k*256, (k+1)*256) changed; all bits set when `fresh` or after a
+    // write-back refilter). Falls back to `filter` (still receiving the same `scratch` snapshot) when `filter_pieces`
+    // is not set.
     std::function<bool(std::uint64_t va, std::uint8_t* to, const std::uint8_t* scratch, std::size_t bytes, bool fresh,
                        const std::array<std::uint64_t, 4>& changed_pieces)>
         filter_pieces;
@@ -129,23 +128,27 @@ public:
         }
         const auto page = pages_.find(va);
         if (page != pages_.end()) {
-            if (page->second == frame) return;
+            std::uint8_t* const old_frame = page->second;
+            if (old_frame == frame) return;
             // A filtered copy made for this page: another aliased page showing the same home takes it over (filled
-            // whole for that page), else it goes with this page.
-            if (const auto shown = homes_.find(page->second);
+            // whole for that page), else it goes with this page. Bind `h` by reference and save `old_frame` by value
+            // before sync_and_fill_copy(), which may re-entrantly insert into `pages_` / `homes_` and rehash them.
+            if (const auto shown = homes_.find(old_frame);
                 shown != homes_.end() && shown->second.copy && shown->second.filter_va == va) {
                 std::uint64_t other_va = 0;
                 for (const auto& [other, other_frame] : pages_)
-                    if (other != va && other_frame == page->second && aliased(other)) other_va = other;
+                    if (other != va && other_frame == old_frame && aliased(other)) other_va = other;
+                Home& h = shown->second;
                 if (other_va) {
-                    shown->second.filter_va = other_va;
-                    fill_copy(shown->second, page->second, true);
+                    h.filter_va = other_va;
+                    h.fresh = true;
+                    sync_and_fill_copy(h, old_frame, true);
                 } else {
-                    drop_copy(shown->second, ticket);
+                    drop_copy(h, ticket);
                 }
             }
-            release_home(page->second, ticket);
-            pages_.erase(page);
+            release_home(old_frame, ticket);
+            pages_.erase(va);
         }
         if (!frame) {
             note_bind(va, VK_NULL_HANDLE, 0);
@@ -153,7 +156,8 @@ public:
             ++counters_.unbinds;
             return;
         }
-        Home* home = home_of(frame, std::move(keep), va);
+        bool created = false;
+        Home* home = home_of(frame, std::move(keep), created);
         if (!home) {
             note_bind(va, VK_NULL_HANDLE, 0);
             note_alias_bind(va, VK_NULL_HANDLE, 0);
@@ -162,7 +166,21 @@ public:
         ++home->refs;
         pages_[va] = frame;
         note_bind(va, units_[home->unit].memory, VkDeviceSize(home->slot) * kPage);
-        if (aliased(va)) {
+        const bool is_aliased = aliased(va);
+        if (created) {
+            if (is_aliased) {
+                if (take_slot(home->copy_unit, home->copy_slot)) {
+                    home->copy = true;
+                    home->filter_va = va;
+                    home->fresh = true;
+                    note_alias_bind(va, units_[home->copy_unit].memory, VkDeviceSize(home->copy_slot) * kPage);
+                } else {
+                    ++counters_.upload_failures;
+                    note_alias_bind(va, VK_NULL_HANDLE, 0);  // no room: the alias reads zero there
+                }
+            }
+            fill(*home, frame, true);
+        } else if (is_aliased) {
             if (!home->copy) make_copy(*home, frame, va);
             if (home->copy) note_alias_bind(va, units_[home->copy_unit].memory, VkDeviceSize(home->copy_slot) * kPage);
             else note_alias_bind(va, VK_NULL_HANDLE, 0);  // no room: the alias reads zero there
@@ -178,13 +196,15 @@ public:
     // (32-bit descriptor-table pointers). Pages not mapped are left unbound there (they read zero).
     void alias(std::uint64_t lo, std::uint64_t hi, VkBuffer buffer, VkDeviceSize offset) {
         aliases_[lo] = {hi, buffer, offset};
-        for (const auto& [va, frame] : pages_) {
-            if (va < lo || va >= hi) continue;
+        std::vector<std::pair<std::uint64_t, std::uint8_t*>> matched;
+        for (const auto& [va, frame] : pages_)
+            if (va >= lo && va < hi) matched.emplace_back(va, frame);
+        for (const auto& [va, frame] : matched) {
             const auto home = homes_.find(frame);
             if (home == homes_.end()) continue;
-            if (!home->second.copy) make_copy(home->second, frame, va);
-            if (home->second.copy)
-                note_alias_bind(va, units_[home->second.copy_unit].memory, VkDeviceSize(home->second.copy_slot) * kPage);
+            Home& h = home->second;  // reference survives re-entrant homes_ rehash inside make_copy()
+            if (!h.copy) make_copy(h, frame, va);
+            if (h.copy) note_alias_bind(va, units_[h.copy_unit].memory, VkDeviceSize(h.copy_slot) * kPage);
         }
     }
     // The alias at `lo` goes: its pages are unbound there, and their filtered copies are freed after `ticket`.
@@ -550,17 +570,19 @@ private:
         counters_.written_back_bytes += written;
         for (std::uint8_t* frame : refilter_frames) {
             const auto it = homes_.find(frame);
-            if (it != homes_.end() && it->second.refilter) fill_copy(it->second, frame, false);
+            if (it != homes_.end() && it->second.refilter) sync_and_fill_copy(it->second, frame, false);
         }
     }
 
-    // Brings the home up to date with the title's page, piece by piece: `whole` (a new home) copies every piece, and
-    // otherwise only a piece the title changed since both sides last agreed, so a piece only the GPU wrote keeps the
-    // GPU's bytes (and goes back with write_back). A piece both changed takes the title's bytes. Copies the whole 64 KiB
-    // page in one hooks_.copy call, falling back to per-piece copies only when the whole-page copy fails, then updates
-    // home.sums in a tight pass and flushes changed pieces to `to` in coalesced contiguous runs (optimal for write-
-    // combined device-local homes). Never reads from `to`.
-    void fill(Home& home, const std::uint8_t* frame, bool whole) {
+    // Brings the home up to date with the title's page, piece by piece, into `fill_scratch_`: `whole` (a new home)
+    // copies every piece, and otherwise only a piece the title changed since both sides last agreed, so a piece only
+    // the GPU wrote keeps the GPU's bytes (and goes back with write_back). A piece both changed takes the title's
+    // bytes. Copies the whole 64 KiB page in one hooks_.copy call, falling back to per-piece copies only when the
+    // whole-page copy fails, then updates home.sums in a tight pass and flushes changed pieces to `to` in coalesced
+    // contiguous runs (optimal for write-combined device-local homes). Never reads from `to`. Returns whether any
+    // piece copy failed.
+    bool sync_home_from_frame(Home& home, const std::uint8_t* frame, bool whole,
+                              std::array<std::uint64_t, 4>& changed_pieces, std::size_t& changed) {
         std::uint8_t* const to = units_[home.unit].host + std::size_t(home.slot) * kPage;
         std::uint8_t* const scratch = fill_scratch_.data();
         std::uint64_t* const sums = home.sums.get();
@@ -577,8 +599,8 @@ private:
             }
         }
 
-        std::array<std::uint64_t, 4> changed_pieces{};
-        std::size_t changed = 0;
+        changed_pieces = {};
+        changed = 0;
         if (whole) {
             for (std::size_t k = 0; k < kPieces; ++k) sums[k] = shadow_keep::sum_of(scratch + k * kPiece, kPiece);
             std::memcpy(to, scratch, kPage);
@@ -648,25 +670,43 @@ private:
                 counters_.uploaded_bytes += changed * kPiece;
             }
         }
-        // The filtered copy follows the title's bytes: refilled when a piece of them changed (passing the already-
-        // copied scratch buffer and 256-bit changed-piece mask when filter_pieces is installed), and whole when it
-        // holds nothing yet.
+        return failed;
+    }
+
+    void fill(Home& home, const std::uint8_t* frame, bool whole) {
+        std::array<std::uint64_t, 4> changed_pieces{};
+        std::size_t changed = 0;
+        const bool failed = sync_home_from_frame(home, frame, whole, changed_pieces, changed);
+        // The filtered copy follows the title's bytes from the exact same `fill_scratch_` snapshot so `home.sums[]`
+        // and the filtered copy never diverge.
         if (home.copy && (changed || home.fresh || home.refilter))
-            fill_copy(home, frame, false, whole_ok ? scratch : nullptr, &changed_pieces);
+            fill_copy(home, fill_scratch_.data(), false, &changed_pieces);
         if (failed) ++counters_.upload_failures;
         ++counters_.uploads;
     }
 
-    Home* home_of(std::uint8_t* frame, std::shared_ptr<void> keep, std::uint64_t va) {
-        if (const auto it = homes_.find(frame); it != homes_.end()) return &it->second;
+    // Refreshes `home` and `home.sums[]` for any CPU-changed pieces (preserving GPU-only pieces) and filters the
+    // copy from that exact same snapshot (used by make_copy, alias handoff, and finish_write_back).
+    void sync_and_fill_copy(Home& home, const std::uint8_t* frame, bool whole_copy) {
+        std::array<std::uint64_t, 4> changed_pieces{};
+        std::size_t changed = 0;
+        const bool failed = sync_home_from_frame(home, frame, false, changed_pieces, changed);
+        if (failed) ++counters_.upload_failures;
+        fill_copy(home, fill_scratch_.data(), whole_copy, &changed_pieces);
+    }
+
+    Home* home_of(std::uint8_t* frame, std::shared_ptr<void> keep, bool& created) {
+        if (const auto it = homes_.find(frame); it != homes_.end()) {
+            created = false;
+            return &it->second;
+        }
         std::uint32_t unit = 0, slot = 0;
         if (!take_slot(unit, slot)) return nullptr;
         Home& home = homes_[frame];
         home.unit = unit;
         home.slot = slot;
         home.keep = std::move(keep);
-        fill(home, frame, true);
-        (void)va;
+        created = true;
         return &home;
     }
 
@@ -676,7 +716,8 @@ private:
         --it;
         return va < it->second.hi;
     }
-    // A filtered copy for `home`, made for the aliased page at `va` and filled whole now. No room: none (counted).
+    // A filtered copy for an existing `home`, made for the aliased page at `va` and synced/filled whole now from one
+    // snapshot so `home`, `home.sums[]`, and the filtered copy stay in sync. No room: none (counted).
     void make_copy(Home& home, const std::uint8_t* frame, std::uint64_t va) {
         if (!take_slot(home.copy_unit, home.copy_slot)) {
             ++counters_.upload_failures;
@@ -685,13 +726,13 @@ private:
         home.copy = true;
         home.filter_va = va;
         home.fresh = true;
-        fill_copy(home, frame, true);
+        sync_and_fill_copy(home, frame, true);
     }
     static constexpr std::array<std::uint64_t, 4> kAllPieces = {~std::uint64_t(0), ~std::uint64_t(0),
                                                                 ~std::uint64_t(0), ~std::uint64_t(0)};
-    // Fills the filtered copy from the title's page through hooks.filter_pieces (when called from fill() with an
-    // already-copied `scratch` buffer) or hooks.filter (`whole`: every byte).
-    void fill_copy(Home& home, const std::uint8_t* frame, bool whole, const std::uint8_t* scratch = nullptr,
+    // Fills the filtered copy from the synced `scratch` snapshot through hooks.filter_pieces (preferred) or
+    // hooks.filter (`whole`: every byte).
+    void fill_copy(Home& home, const std::uint8_t* scratch, bool whole,
                    const std::array<std::uint64_t, 4>* changed_pieces = nullptr) {
         const bool had_refilter = home.refilter;
         home.refilter = false;
@@ -700,18 +741,14 @@ private:
         const bool fresh = whole || home.fresh;
         home.fresh = false;
         bool ok = false;
-        if (hooks_.filter_pieces && scratch) {
+        if (hooks_.filter_pieces) {
             const auto& mask = (fresh || had_refilter || !changed_pieces) ? kAllPieces : *changed_pieces;
             ok = hooks_.filter_pieces(home.filter_va, to, scratch, kPage, fresh, mask);
         } else if (hooks_.filter) {
-            ok = hooks_.filter(home.filter_va, to, frame, kPage, fresh);
-        } else if (hooks_.filter_pieces) {
-            auto local = std::make_unique<std::uint8_t[]>(kPage);
-            const bool copied = hooks_.copy ? hooks_.copy(local.get(), frame, kPage)
-                                            : (std::memcpy(local.get(), frame, kPage), true);
-            if (copied) ok = hooks_.filter_pieces(home.filter_va, to, local.get(), kPage, fresh, kAllPieces);
+            ok = hooks_.filter(home.filter_va, to, scratch, kPage, fresh);
         } else {
-            ok = hooks_.copy ? hooks_.copy(to, frame, kPage) : (std::memcpy(to, frame, kPage), true);
+            std::memcpy(to, scratch, kPage);
+            ok = true;
         }
         if (!ok) {
             std::memset(to, 0, kPage);

@@ -461,9 +461,12 @@ int filter_pieces_mask_and_scratch() {
     const VkBuffer arena = fake<VkBuffer>(0x99);
     mirror.alias(kBase, kBase + kPage, arena, 0);
 
-    // Initial map: fill() runs before make_copy() (1 copy_call), then make_copy() calls hooks_.filter (outside fill).
+    // Initial map on an aliased page: fill() copies once into fill_scratch_ and calls filter_pieces fresh with all-1s
+    // mask from that exact same snapshot (zero duplicate copy, zero TOCTOU between home.sums[] and filtered copy).
     mirror.map(kBase, frame.data(), nullptr, 1);
-    EXPECT(copy_calls == 1 && f.filtered.size() == 1 && f.filtered[0].fresh && piece_calls.empty());
+    EXPECT(copy_calls == 1 && f.filtered.empty() && piece_calls.size() == 1 && piece_calls[0].va == kBase &&
+           piece_calls[0].fresh && piece_calls[0].mask[0] == ~0ull && piece_calls[0].mask[1] == ~0ull &&
+           piece_calls[0].mask[2] == ~0ull && piece_calls[0].mask[3] == ~0ull);
     EXPECT(mirror.copy_bytes(kBase)[0] == 0x5A);
 
     // Dirty refill modifying 3 pieces across 64-bit mask word boundaries: pieces 1, 64, and 255.
@@ -473,12 +476,12 @@ int filter_pieces_mask_and_scratch() {
     frame[255 * 256 + 200] = 0x33;
     EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
     EXPECT(copy_calls == 2);  // exactly 1 copy in fill(), 0 duplicate copies in filter_pieces!
-    EXPECT(f.filtered.size() == 1 && piece_calls.size() == 1);
-    EXPECT(piece_calls[0].va == kBase && !piece_calls[0].fresh);
-    EXPECT(piece_calls[0].mask[0] == (std::uint64_t(1) << 1));
-    EXPECT(piece_calls[0].mask[1] == (std::uint64_t(1) << 0));
-    EXPECT(piece_calls[0].mask[2] == 0);
-    EXPECT(piece_calls[0].mask[3] == (std::uint64_t(1) << 63));
+    EXPECT(f.filtered.empty() && piece_calls.size() == 2);
+    EXPECT(piece_calls[1].va == kBase && !piece_calls[1].fresh);
+    EXPECT(piece_calls[1].mask[0] == (std::uint64_t(1) << 1));
+    EXPECT(piece_calls[1].mask[1] == (std::uint64_t(1) << 0));
+    EXPECT(piece_calls[1].mask[2] == 0);
+    EXPECT(piece_calls[1].mask[3] == (std::uint64_t(1) << 63));
     EXPECT(mirror.copy_bytes(kBase)[1 * 256 + 7] == 0x11);
     EXPECT(mirror.copy_bytes(kBase)[64 * 256 + 3] == 0x22);
     EXPECT(mirror.copy_bytes(kBase)[255 * 256 + 200] == 0x33);
@@ -486,7 +489,7 @@ int filter_pieces_mask_and_scratch() {
 
     // Unchanged dirty upload: neither filter_pieces nor filter called.
     EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
-    EXPECT(copy_calls == 3 && piece_calls.size() == 1 && f.filtered.size() == 1);
+    EXPECT(copy_calls == 3 && piece_calls.size() == 2 && f.filtered.empty());
 
     // Only filter_pieces installed (no hooks_.filter): make_copy calls filter_pieces with all-1s mask.
     Fixture f2;
@@ -552,6 +555,153 @@ int coalesced_fill_and_write_back_soundness() {
     return 0;
 }
 
+// Regression: A -> B -> A writes across home_of() -> make_copy() (alias over mapped page), alias handoff in map(), and
+// finish_write_back(). Every filtered copy fill syncs home and home.sums[] from the exact same snapshot so reverting
+// B -> A is always detected by fill() and propagated to the filtered copy without clobbering GPU-only pieces.
+int make_copy_aba_staleness() {
+    Fixture f;
+    auto h = f.hooks();
+    std::vector<std::array<std::uint64_t, 4>> masks;
+    h.filter_pieces = [&](std::uint64_t, std::uint8_t* to, const std::uint8_t* scratch, std::size_t bytes, bool fresh,
+                          const std::array<std::uint64_t, 4>& mask) {
+        masks.push_back(mask);
+        for (std::size_t k = 0; k < bytes / 256; ++k) {
+            if (!fresh && !(mask[k >> 6] & (std::uint64_t(1) << (k & 63)))) continue;
+            for (std::size_t j = 0; j < 256; ++j) {
+                const std::uint8_t b = scratch[k * 256 + j];
+                to[k * 256 + j] = b == 0xA5 ? 0x5A : b;
+            }
+        }
+        return true;
+    };
+
+    TitleMirror mirror(std::move(h));
+    EXPECT(mirror.cover(kBase, kBase + 8 * kPage));
+    const VkBuffer arena = fake<VkBuffer>(0xAA);
+
+    // 1. alias() over an already-mapped page (make_copy path): A -> B before alias(), then B -> A on upload().
+    std::vector<std::uint8_t> frame0(kPage, 0x11);  // A
+    mirror.map(kBase, frame0.data(), nullptr, 1);
+    EXPECT(mirror.flush(1));
+    // GPU writes piece 5 (must be preserved by make_copy's piece-wise sync!).
+    mirror.home_bytes(kBase)[5 * 256 + 9] = 0xEE;
+    // Title writes B (0xA5) into piece 2 before alias() calls make_copy(), without upload().
+    frame0[2 * 256 + 4] = 0xA5;
+    mirror.alias(kBase, kBase + kPage, arena, 0);
+    EXPECT(mirror.copy_bytes(kBase)[2 * 256 + 4] == 0x5A);   // filtered B
+    EXPECT(mirror.home_bytes(kBase)[2 * 256 + 4] == 0xA5);   // home synced to B
+    EXPECT(mirror.home_bytes(kBase)[5 * 256 + 9] == 0xEE);   // GPU-only piece preserved!
+    // Title writes A (0x11) back into piece 2: upload() MUST see piece 2 changed vs home.sums[2] and update copy!
+    frame0[2 * 256 + 4] = 0x11;
+    const std::size_t calls_before = masks.size();
+    EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
+    EXPECT(masks.size() == calls_before + 1);
+    EXPECT(masks.back()[0] == (std::uint64_t(1) << 2));
+    EXPECT(mirror.copy_bytes(kBase)[2 * 256 + 4] == 0x11);
+    EXPECT(mirror.home_bytes(kBase)[2 * 256 + 4] == 0x11);
+    EXPECT(mirror.home_bytes(kBase)[5 * 256 + 9] == 0xEE);
+
+    // 2. Alias handoff in map(): two aliased VAs share one frame; A -> B before va1 unmaps, then B -> A on va2.
+    std::vector<std::uint8_t> frame1(kPage, 0x22);  // A
+    const std::uint64_t va1 = kBase + 2 * kPage;
+    const std::uint64_t va2 = kBase + 3 * kPage;
+    mirror.alias(va1, va2 + kPage, arena, 2 * kPage);
+    mirror.map(va1, frame1.data(), nullptr, 2);
+    mirror.map(va2, frame1.data(), nullptr, 2);
+    EXPECT(mirror.flush(2));
+    frame1[3 * 256 + 8] = 0xA5;  // B without upload()
+    mirror.map(va1, nullptr, nullptr, 3);  // hands off copy to va2
+    EXPECT(mirror.copy_bytes(va2)[3 * 256 + 8] == 0x5A);
+    EXPECT(mirror.home_bytes(va2)[3 * 256 + 8] == 0xA5);
+    frame1[3 * 256 + 8] = 0x22;  // revert B -> A
+    EXPECT(mirror.dirty(va2) && mirror.upload() == 1);
+    EXPECT(mirror.copy_bytes(va2)[3 * 256 + 8] == 0x22);
+    EXPECT(mirror.home_bytes(va2)[3 * 256 + 8] == 0x22);
+
+    // 3. Concurrent title A -> B write during write_back() before finish_write_back() runs, then B -> A on upload().
+    std::vector<std::uint8_t> frame2(kPage, 0x33);  // A
+    const std::uint64_t va3 = kBase + 5 * kPage;
+    mirror.alias(va3, va3 + kPage, arena, 5 * kPage);
+    mirror.map(va3, frame2.data(), nullptr, 4);
+    EXPECT(mirror.flush(4));
+    mirror.home_bytes(va3)[1 * 256 + 10] = 0x77;  // GPU writes piece 1
+    const auto write_with_race = [&](std::uint64_t dst, const std::uint8_t* bytes, std::size_t n) {
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)), bytes, n);
+        // Simulate concurrent CPU write A -> B in piece 0 before finish_write_back() refilters.
+        frame2[0 * 256 + 12] = 0xA5;
+        return true;
+    };
+    EXPECT(mirror.write_back(va3, va3 + kPage, write_with_race) == 256);
+    EXPECT(mirror.copy_bytes(va3)[1 * 256 + 10] == 0x77);
+    EXPECT(mirror.copy_bytes(va3)[0 * 256 + 12] == 0x5A);  // filtered B
+    EXPECT(mirror.home_bytes(va3)[0 * 256 + 12] == 0xA5);  // home synced to B
+    frame2[0 * 256 + 12] = 0x33;  // revert B -> A
+    EXPECT(mirror.dirty(va3) && mirror.upload() == 1);
+    EXPECT(mirror.copy_bytes(va3)[0 * 256 + 12] == 0x33);
+    EXPECT(mirror.home_bytes(va3)[0 * 256 + 12] == 0x33);
+
+    std::printf("make_copy_aba_staleness: make_copy, alias handoff, and finish_write_back sync home.sums[] on A->B->A ok\n");
+    return 0;
+}
+
+// Regression: re-entrant map() calls inside filter_pieces during alias() (make_copy) and map() (alias handoff) can
+// rehash both pages_ and homes_. Neither path may dereference invalidated unordered_map iterators.
+int reentrant_rehash_in_alias_and_handoff() {
+    Fixture f;
+    auto h = f.hooks();
+    TitleMirror* mirror_ptr = nullptr;
+    std::vector<std::uint8_t> reentrant_frames(128 * kPage, 0x44);
+    std::size_t next_reentrant = 0;
+    bool trigger_rehash = false;
+    h.filter_pieces = [&](std::uint64_t, std::uint8_t* to, const std::uint8_t* scratch, std::size_t bytes, bool,
+                          const std::array<std::uint64_t, 4>&) {
+        std::memcpy(to, scratch, bytes);
+        if (trigger_rehash && mirror_ptr) {
+            trigger_rehash = false;
+            // Insert 64 distinct pages & homes to force pages_ and homes_ rehashes mid-callback.
+            for (std::size_t i = 0; i < 64 && next_reentrant < 128; ++i, ++next_reentrant) {
+                mirror_ptr->map(kBase + (100 + next_reentrant) * kPage,
+                                &reentrant_frames[next_reentrant * kPage], nullptr, 10);
+            }
+        }
+        return true;
+    };
+
+    TitleMirror mirror(std::move(h));
+    mirror_ptr = &mirror;
+    EXPECT(mirror.cover(kBase, kBase + 300 * kPage));
+    const VkBuffer arena = fake<VkBuffer>(0xBB);
+
+    // 1. alias() over mapped pages with re-entrant homes_/pages_ rehash inside make_copy().
+    std::vector<std::uint8_t> f0(kPage, 0x12), f1(kPage, 0x34);
+    mirror.map(kBase, f0.data(), nullptr, 1);
+    mirror.map(kBase + kPage, f1.data(), nullptr, 1);
+    trigger_rehash = true;
+    mirror.alias(kBase, kBase + 2 * kPage, arena, 0);
+    EXPECT(mirror.flush(1));
+    EXPECT(mirror.copy_bytes(kBase) && mirror.copy_bytes(kBase)[0] == 0x12);
+    EXPECT(mirror.copy_bytes(kBase + kPage) && mirror.copy_bytes(kBase + kPage)[0] == 0x34);
+    EXPECT(*f.read(arena, 0) == 0x12 && *f.read(arena, kPage) == 0x34);
+
+    // 2. map() alias handoff with re-entrant pages_/homes_ rehash inside sync_and_fill_copy().
+    std::vector<std::uint8_t> shared(kPage, 0x56);
+    const std::uint64_t va1 = kBase + 10 * kPage;
+    const std::uint64_t va2 = kBase + 11 * kPage;
+    mirror.alias(va1, va2 + kPage, arena, 10 * kPage);
+    mirror.map(va1, shared.data(), nullptr, 2);
+    mirror.map(va2, shared.data(), nullptr, 2);
+    EXPECT(mirror.flush(2));
+    trigger_rehash = true;
+    mirror.map(va1, nullptr, nullptr, 3);  // hands off copy to va2, rehashes pages_/homes_, then erases va1
+    EXPECT(mirror.flush(3));
+    EXPECT(!mirror.mirrored(va1) && mirror.mirrored(va2));
+    EXPECT(mirror.copy_bytes(va2) && mirror.copy_bytes(va2)[0] == 0x56);
+    EXPECT(!f.read(arena, 10 * kPage) && *f.read(arena, 11 * kPage) == 0x56);
+
+    std::printf("reentrant_rehash_in_alias_and_handoff: alias() and map() handoff safe across pages_/homes_ rehash ok\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -563,6 +713,8 @@ int main() {
     if (batched_write_back()) return 1;
     if (filter_pieces_mask_and_scratch()) return 1;
     if (coalesced_fill_and_write_back_soundness()) return 1;
+    if (make_copy_aba_staleness()) return 1;
+    if (reentrant_rehash_in_alias_and_handoff()) return 1;
     std::printf("title_mirror_hooks_test: ok\n");
     return 0;
 }

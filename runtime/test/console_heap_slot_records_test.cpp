@@ -676,6 +676,53 @@ int deferred_clear_and_repeated_answers() {
     return 0;
 }
 
+// Regression:
+//   1. An unresolvable base >= arena.size V# recorded directly as waiting (geometry=true) wakes on source_added
+//      (late alias, backing, or extended title_memory) and answers repeated halves consistently until woken;
+//   2. A tracked non-sparse direct backing (resolved with target) wakes on target_gone when freed;
+//   3. Clearing a slot whose T# was overwritten with non-T# data removes its texture record so later texture changes
+//      never touch the slot.
+int waiting_source_added_and_tsharp_clear() {
+    using R = ConsoleHeapSlotRecords;
+    R records;
+    records.reset(32);
+    std::vector<std::uint32_t> out;
+
+    // 1. Waiting record (geometry=true) for base >= arena.size wakes on source_added.
+    constexpr std::uint64_t kLateBase = 0x100800004000ull;
+    constexpr std::uint64_t kSpan = 0x1000;
+    records.set(4, 0, R::waiting, kLateBase, kSpan, 0, true);
+    R::State state = R::none;
+    std::uint64_t target = 0;
+    EXPECT(records.answer(kLateBase, kSpan, false, state, target) && state == R::waiting && target == 0);
+    EXPECT(records.answer(kLateBase, kSpan, true, state, target) && state == R::waiting && target == 0);
+    const SlotChange late_alias{SlotChange::source_added, kLateBase - 0x4000, kLateBase + 0x10000};
+    records.touched(&late_alias, 1, out);
+    EXPECT(out == std::vector<std::uint32_t>({4}));
+
+    // 2. Non-sparse direct backing (e.g. below-arena gpu_backings or geometry copy) tracked as resolved wakes on
+    //    target_gone when that backing is freed.
+    constexpr std::uint64_t kBelowOffset = (1ull << 47) | 0x200000ull;
+    constexpr std::uint64_t kBelowBda = kArena + (kBelowOffset | ~kMask);
+    records.set(7, 0, R::resolved, kBelowOffset, 0x400, kBelowBda, false);
+    const SlotChange freed{SlotChange::target_gone, kBelowBda, kBelowBda + 0x1000};
+    records.touched(&freed, 1, out);
+    EXPECT(out == std::vector<std::uint32_t>({7}));
+
+    // 3. Prior texture record cleared when slot is overwritten with not_tsharp data.
+    constexpr std::uint64_t kTexAddr = 0x100801000000ull;
+    records.set_texture(9, R::texture_bound, kTexAddr);
+    EXPECT(records.textures() == 1);
+    records.clear(9);
+    EXPECT(records.textures() == 0 && records.state(9, 0) == R::none);
+    const SlotChange tex_gone{SlotChange::texture_gone, kTexAddr, kTexAddr + 1};
+    records.touched(&tex_gone, 1, out);
+    EXPECT(out.empty());
+
+    std::printf("waiting_source_added_and_tsharp_clear: ok\n");
+    return 0;
+}
+
 int main() {
     if (release_looks_at_its_slots_only()) return 1;
     if (cases()) return 1;
@@ -687,6 +734,7 @@ int main() {
     if (title_mirror_space_chunk_alignment()) return 1;
     if (memory_breakdown_arena_windows()) return 1;
     if (deferred_clear_and_repeated_answers()) return 1;
+    if (waiting_source_added_and_tsharp_clear()) return 1;
     std::printf("console_heap_slot_records_test: ok\n");
     return 0;
 }
