@@ -814,6 +814,10 @@ elseif(NOT WIN32)
 endif()
 
 include(CTest)
+# Every rule that writes a generated/<name> file (the GLSL test shaders, d3d12_stubs.h, ...) expects the folder to
+# exist, and only some of them make it: with -j a fresh build could run one of the others first ("Failed to open
+# file"). Make it once here, before any rule runs.
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated)
 # LEONIDA_TRANSLATOR_DEPS: what the rules that run test/shaders/build.py depend on besides their .asm files.
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/translator_deps.cmake")
 if(BUILD_TESTING)
