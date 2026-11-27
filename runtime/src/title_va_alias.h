@@ -43,6 +43,10 @@ public:
     // made: the view is then written with a zero-size range, never with the raw address). False: not the title's
     // memory (an arena VA, a buffer of the layer's).
     using Resolver = bool (*)(void* context, std::uint64_t va, std::uint64_t bytes, std::uint64_t& shader_va);
+    // Access-aware variant: receives whether the caller may write through the binding (false for read-only CBV/SRV
+    // root views so the page mirror does not queue them for GPU write-back).
+    using AccessResolver = bool (*)(void* context, std::uint64_t va, std::uint64_t bytes, bool writable,
+                                    std::uint64_t& shader_va);
     using TableScanner = void (*)(void* context, std::uint64_t table_va, std::uint32_t descriptors);
     // Every binding resolved to a copy of the title's memory: [va, va + bytes) as they are reached at (the device keeps
     // them for the copy back after the submission, see DeviceState::write_back_titles).
@@ -175,24 +179,28 @@ public:
     // A resolver that cannot back the address (no window or geometry copy fits) answers 0: the view is then written
     // with a zero-size range, never with the raw title address (heap_base + a raw VA is no allocation a shader can
     // read or write). Counted by kind: translated, or in the title's memory and left as it was.
-    std::uint64_t resolve(std::uint64_t va, std::uint64_t bytes, Kind kind) {
+    std::uint64_t resolve(std::uint64_t va, std::uint64_t bytes, Kind kind, bool writable = true) {
         if (!va) return va;
         std::uint64_t to = shader_va(va);
         if (to != va) {
             translated_[kind].fetch_add(1, std::memory_order_relaxed);
-            note_reached(va, bytes);
+            if (writable) note_reached(va, bytes);
             return to;
         }
+        AccessResolver access_resolver;
         Resolver resolver;
         void* context;
         {
             std::lock_guard lock(hook_mutex_);
+            access_resolver = access_resolver_;
             resolver = resolver_;
             context = hook_context_;
         }
-        if (!resolver || !resolver(context, va, bytes, to)) return va;
+        const bool resolved = access_resolver ? access_resolver(context, va, bytes, writable, to)
+                                              : (resolver && resolver(context, va, bytes, to));
+        if (!resolved) return va;
         (to != va ? translated_ : untranslated_)[kind].fetch_add(1, std::memory_order_relaxed);
-        if (to != va) note_reached(va, bytes);
+        if (writable && to) note_reached(va, bytes);
         return to;
     }
 
@@ -355,6 +363,15 @@ public:
         if (hook_context_) return;
         hook_context_ = context;
         resolver_ = resolver;
+        access_resolver_ = nullptr;
+        scanner_ = scanner;
+    }
+    void set_hooks(void* context, AccessResolver resolver, TableScanner scanner) {
+        std::lock_guard lock(hook_mutex_);
+        if (hook_context_) return;
+        hook_context_ = context;
+        resolver_ = nullptr;
+        access_resolver_ = resolver;
         scanner_ = scanner;
     }
     void clear_hooks(void* context) {
@@ -362,13 +379,18 @@ public:
         if (hook_context_ != context) return;
         hook_context_ = nullptr;
         resolver_ = nullptr;
+        access_resolver_ = nullptr;
         scanner_ = nullptr;
         noter_ = nullptr;
     }
     // The resolver alone, for a device that scans its descriptor tables itself.
     void set_resolver(void* context, Resolver resolver) { set_hooks(context, resolver, nullptr); }
     void clear_resolver(void* context) { clear_hooks(context); }
-    // Set after set_hooks, so the hook (and its context) stays the device's: what reached a copy of the title's memory.
+    // Set after set_hooks, so the hook (and its context) stays the device's: access-aware resolver and write noter.
+    void set_access_resolver(AccessResolver resolver) {
+        std::lock_guard lock(hook_mutex_);
+        access_resolver_ = resolver;
+    }
     void set_noter(Noter noter) {
         std::lock_guard lock(hook_mutex_);
         noter_ = noter;
@@ -465,6 +487,7 @@ private:
     void* maker_context_ = nullptr;
     BufferMaker maker_ = nullptr;
     Resolver resolver_ = nullptr;
+    AccessResolver access_resolver_ = nullptr;
     TableScanner scanner_ = nullptr;
     Noter noter_ = nullptr;
     void* source_context_ = nullptr;

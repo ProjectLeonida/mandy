@@ -222,6 +222,8 @@ public:
     const leonida::CommandList& commands() const { return list_; }
     // The descriptor tables this recording binds (console VAs), for the scan before a submission.
     const std::vector<std::pair<std::uint64_t, std::uint32_t>>& tables() const { return tables_; }
+    // Explicit GPU buffer-write destinations recorded in this list (VA, bytes), noted for write-back at execution.
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>>& write_ranges() const { return write_ranges_; }
     // The pipeline states and root signatures the recording names (it holds a reference to each until Reset), and
     // the objects a shim handed it with hold_until_reset.
     const std::vector<IUnknown*>& pinned() const { return held_; }
@@ -271,6 +273,7 @@ public:
         invalid_ = false;
         calls_.clear();
         tables_.clear();
+        write_ranges_.clear();
         directly_indexed_ = false;
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
@@ -306,6 +309,7 @@ public:
             call.run(*this);
         }
         check(list_.execute_bundle(bundle->list_, copied));
+        write_ranges_.insert(write_ranges_.end(), bundle->write_ranges_.begin(), bundle->write_ranges_.end());
     }
 
     // Root signatures, pipeline state and root arguments. The arguments are packed into the 32 user-data dwords
@@ -371,13 +375,13 @@ public:
         constants(compute_, index, count, data, offset);
     }
     void STDMETHODCALLTYPE SetComputeRootConstantBufferView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
-        address(compute_, index, va, rt::rootsig::ParamType::Descriptor);
+        address(compute_, index, va, rt::rootsig::ParamType::Descriptor, false);
     }
     void STDMETHODCALLTYPE SetComputeRootShaderResourceView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
-        address(compute_, index, va, rt::rootsig::ParamType::Descriptor);
+        address(compute_, index, va, rt::rootsig::ParamType::Descriptor, false);
     }
     void STDMETHODCALLTYPE SetComputeRootUnorderedAccessView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
-        address(compute_, index, va, rt::rootsig::ParamType::Descriptor);
+        address(compute_, index, va, rt::rootsig::ParamType::Descriptor, true);
     }
     void STDMETHODCALLTYPE SetComputeRootDescriptorTable(UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table) override {
         address(compute_, index, table.ptr, rt::rootsig::ParamType::Table);
@@ -389,13 +393,13 @@ public:
         constants(graphics_, index, count, data, offset);
     }
     void STDMETHODCALLTYPE SetGraphicsRootConstantBufferView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
-        address(graphics_, index, va, rt::rootsig::ParamType::Descriptor);
+        address(graphics_, index, va, rt::rootsig::ParamType::Descriptor, false);
     }
     void STDMETHODCALLTYPE SetGraphicsRootShaderResourceView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
-        address(graphics_, index, va, rt::rootsig::ParamType::Descriptor);
+        address(graphics_, index, va, rt::rootsig::ParamType::Descriptor, false);
     }
     void STDMETHODCALLTYPE SetGraphicsRootUnorderedAccessView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
-        address(graphics_, index, va, rt::rootsig::ParamType::Descriptor);
+        address(graphics_, index, va, rt::rootsig::ParamType::Descriptor, true);
     }
     void STDMETHODCALLTYPE SetGraphicsRootDescriptorTable(UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable");
@@ -694,6 +698,7 @@ public:
                                             UINT64 src_offset, UINT64 bytes) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyBufferRegion");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (dst && bytes) note_write_resource(dst, dst_offset, bytes);
         check(list_.copy_buffer({resource_id(dst), dst_offset, resource_id(src), src_offset, bytes}));
     }
 
@@ -719,6 +724,7 @@ public:
                 return check(false);
             constexpr auto shape = leonida::element_tile_shape(false, 4);
             const leonida::CopyLocation image{tiled_id, false, 0, 0, 0, 0, 0, 0};
+            const UINT64 linear_start = linear_offset;
             for (const auto& region : regions) {
                 for (std::uint64_t tile = region.first; tile < region.first + region.count; ++tile) {
                     const auto x = std::uint32_t(tile % grid.columns) * shape.width;
@@ -735,11 +741,14 @@ public:
                     linear_offset += leonida::tile_size_in_bytes;
                 }
             }
+            if (to_linear && linear_offset > linear_start)
+                note_write_resource(linear, linear_start, linear_offset - linear_start);
             return;
         }
         const auto& region = regions.front();
         const auto tiled_offset = region.first * leonida::tile_size_in_bytes;
         const auto bytes = region.count * leonida::tile_size_in_bytes;
+        if (bytes) note_write_resource(to_linear ? linear : tiled, to_linear ? linear_offset : tiled_offset, bytes);
         check(list_.copy_buffer(to_linear
             ? leonida::CopyBuffer{linear_id, linear_offset, tiled_id, tiled_offset, bytes, tiled_id}
             : leonida::CopyBuffer{tiled_id, tiled_offset, linear_id, linear_offset, bytes, tiled_id}));
@@ -752,6 +761,20 @@ public:
         if (!dst || !src) return check(false);
         leonida::CopyTexture copy{location(*dst), x, y, z, location(*src), box != nullptr, {}};
         if (box) copy.box = {box->left, box->top, box->front, box->right, box->bottom, box->back};
+        if (dst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT && dst->pResource) {
+            const auto desc = dst->pResource->GetDesc();
+            const auto& fp = dst->PlacedFootprint;
+            if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && desc.Width > fp.Offset) {
+                const UINT64 max_bytes = desc.Width - fp.Offset;
+                const UINT64 pitch = fp.Footprint.RowPitch;
+                const UINT64 rows = std::max<UINT64>(1, fp.Footprint.Height);
+                const UINT64 depth = std::max<UINT64>(1, fp.Footprint.Depth);
+                UINT64 bytes = max_bytes;
+                if (pitch && rows <= max_bytes / pitch && depth <= max_bytes / (pitch * rows))
+                    bytes = pitch * rows * depth;
+                note_write_resource(dst->pResource, fp.Offset, bytes);
+            }
+        }
         if (!list_.copy_texture(copy) && reject()) {
             for (const auto* l : {dst, src}) {
                 const char* side = l == dst ? "dst" : "src";
@@ -782,6 +805,11 @@ public:
             D3D12_HEAP_PROPERTIES properties{};
             if (FAILED(dst->GetHeapProperties(&properties, nullptr)) ||
                 properties.Type != D3D12_HEAP_TYPE_DEFAULT) return check(false);
+        }
+        if (dst && dst != src) {
+            const auto desc = dst->GetDesc();
+            if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && desc.Width)
+                note_write_va(dst->GetGPUVirtualAddress(), desc.Width);
         }
         check(list_.copy_resource({resource_id(dst), resource_id(src)}));
     }
@@ -890,8 +918,10 @@ public:
     void STDMETHODCALLTYPE WriteBufferImmediate(UINT count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER* params,
                                                 const D3D12_WRITEBUFFERIMMEDIATE_MODE* modes) override {
         if (count && !params) return check(false);
-        for (UINT i = 0; i < count; ++i)
+        for (UINT i = 0; i < count; ++i) {
+            note_write_va(params[i].Dest, sizeof(std::uint32_t));
             check(list_.write_immediate({params[i].Dest, params[i].Value, modes ? u(modes[i]) : 0}));
+        }
     }
 
     // GCL1. Not allowed in a bundle, as no copy is.
@@ -948,6 +978,15 @@ public:
     void STDMETHODCALLTYPE ResolveQueryData(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT first, UINT count,
                                             ID3D12Resource* dst, UINT64 offset) override {
         if (!query_allowed(type)) return check(false);
+        if (dst && count) {
+            const std::uint64_t stride =
+                type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS
+                    ? sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS)
+                    : (type >= D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 && type <= D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3)
+                          ? sizeof(D3D12_QUERY_DATA_SO_STATISTICS)
+                          : sizeof(std::uint64_t);
+            note_write_resource(dst, offset, std::uint64_t(count) * stride);
+        }
         check(list_.resolve_queries({query_heap_id(heap), u(type), first, count, resource_id(dst), offset}));
     }
 
@@ -1361,6 +1400,7 @@ private:
             }
             copy.dependencies.push_back({resource_id(dep), r.Subresource, begin, end});
         }
+        note_write_va(dst->GetGPUVirtualAddress() + dst_offset, bytes);
         check(list_.atomic_copy(copy));
     }
 
@@ -1370,6 +1410,7 @@ private:
             return check(false);
         leonida::UavView target{};
         if (!view.ptr || !resource || !unordered_access_view(view, resource, target)) return check(false);
+        if (target.buffer && target.size) note_write_va(resource->GetGPUVirtualAddress() + target.offset, target.size);
         check(list_.clear_unordered_access(target, is_float, values, to_rects(count, rects)));
     }
 
@@ -1539,10 +1580,10 @@ private:
                                  "array is not written yet)\n");
     }
 
-    void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type) {
+    void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type, bool writable = true) {
         if (list_.closed()) return;
         if (defer([=, compute = &state == &compute_](GraphicsCommandList& l) {
-                l.address(compute ? l.compute_ : l.graphics_, index, va, type);
+                l.address(compute ? l.compute_ : l.graphics_, index, va, type, writable);
             }))
             return;
         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
@@ -1553,7 +1594,7 @@ private:
         // A table in a console descriptor heap is read from the heap's arena copy (console_descriptor_table_va).
         if (type == rt::rootsig::ParamType::Descriptor) {
             const std::uint64_t raw = va;
-            va = leonida::title_va_aliases().resolve(va, kRootViewBytes, leonida::TitleVaAliases::root_view);
+            va = leonida::title_va_aliases().resolve(va, kRootViewBytes, leonida::TitleVaAliases::root_view, writable);
             // No copy for the title's memory: the root view is 0, so the shader reads the arena's zero page instead
             // of storing at heap_base + a raw title address.
             if (!va && raw) leonida::note_unbacked_view("root view", raw, kRootViewBytes);
@@ -1593,8 +1634,20 @@ private:
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
     leonida::IndexBufferView index_{};
+    void note_write_va(std::uint64_t va, std::uint64_t bytes) {
+        if (va && bytes) write_ranges_.emplace_back(va, bytes);
+    }
+    void note_write_resource(ID3D12Resource* dst, std::uint64_t offset, std::uint64_t bytes) {
+        if (!dst || !bytes) return;
+        const auto desc = dst->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || offset >= desc.Width) return;
+        const std::uint64_t base = dst->GetGPUVirtualAddress();
+        if (base) write_ranges_.emplace_back(base + offset, std::min(bytes, desc.Width - offset));
+    }
+
     // SetGraphicsRootDescriptorTable / SetComputeRootDescriptorTable: VA, CBV/SRV/UAV slots the signature declares
     std::vector<std::pair<std::uint64_t, std::uint32_t>> tables_;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> write_ranges_;
     bool directly_indexed_ = false;
     // The span a root view may read: D3D12's largest constant buffer (4096 x 16 bytes).
     static constexpr std::uint64_t kRootViewBytes = 65536;
@@ -2540,6 +2593,9 @@ public:
                 return;
             }
         }
+        for (const GraphicsCommandList* list : graphics)
+            for (const auto& [va, bytes] : list->write_ranges())
+                leonida::title_va_aliases().note_reached(va, bytes);
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success)
