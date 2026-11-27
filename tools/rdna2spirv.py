@@ -83,6 +83,12 @@ W64G_COUNTS = Counter()   # tiers of the wave64 VS/PS/GS translated so far, for 
 # (1,0,0), (0,1,0), (0,0,1) at the triangle's three vertices; interpolating those gives the perspective-correct
 # barycentrics, so .y/.z are AMD's i/j as with BaryCoordKHR.
 BARY_FALLBACK = False
+# --integer-dot-fallback: the 4x8-bit dot products (v_dot4_i32_i8, v_dot4c_i32_i8, v_dot4_u32_u8, v_dot4c_u32_u8) are
+# four extracts, multiplies and adds, as before, instead of SPV_KHR_integer_dot_product's OpSDot / OpUDot and their
+# saturating-accumulate forms (Gen.packed_dot4). For devices without shaderIntegerDotProduct (a Vulkan 1.2 device
+# without VK_KHR_shader_integer_dot_product); Vulkan 1.3 requires the feature. docs/design.md, "Signed-byte dot
+# products".
+INTEGER_DOT_FALLBACK = False
 SHADER_CLOCK = False
 FMA_KHR = False          # --fma khr: fused multiply-adds are OpFmaKHR (SPV_KHR_fma, VK_KHR_shader_fma), not GLSL Fma
 FMA_EXACT = False        # --fma exact: fused multiply-adds are emulated from single-rounded f32 ops (Gen.fma_exact)
@@ -479,6 +485,8 @@ class Gen:
         self.round_mode = False     # the program writes MODE.FP_ROUND[3:2] (f16/f64 rounding): kept in %mode_r16
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
+        self.uses_psb_vec = False      # scalar_load's wide loads: uvec2/uvec4 PhysicalStorageBuffer pointers
+        self.uses_int_dot = False      # packed_dot4 emitted OpSDot/OpUDot(AccSat): SPV_KHR_integer_dot_product
         self.uses_fma_khr = False      # an OpFmaKHR was emitted: capability FMAKHR + extension SPV_KHR_fma
         self.uses_fma_khr32 = False    # ... on f32 (feature shaderFmaFloat32)
         self.uses_fma_khr64 = False    # ... on f64 (feature shaderFmaFloat64)
@@ -8256,6 +8264,11 @@ class Gen:
             width = 16 if ("_dot2_" in op or "_dot2c_" in op) else (8 if "_dot4" in op else 4)
             signed = op.endswith(("i16", "i4"))
             clamp = "clamp" in mods
+            if width == 8:
+                packed = self.packed_dot4(x, y, acc, signed=False, clamp=clamp)
+                if packed is not None:
+                    self.dst(a[0], packed)
+                    return
             ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
             prods = []
             for off in range(0, 32, width):
@@ -12844,6 +12857,11 @@ class Gen:
                 raise Unsupported(op + " op_sel")
             x, y = self.src_u(a[1]), self.src_u(a[2])
             acc = self.src_u(a[3]) if is_vop3p else self.src_u(a[0])
+            packed = self.packed_dot4(self.dot4_halves(x, sel[0], selhi[0]), self.dot4_halves(y, sel[1], selhi[1]),
+                                      acc, signed=True, clamp=has_clamp)
+            if packed is not None:
+                self.dst(a[0], packed)
+                return
             x_offs = (16 * sel[0], 16 * sel[0] + 8, 16 * selhi[0], 16 * selhi[0] + 8)
             y_offs = (16 * sel[1], 16 * sel[1] + 8, 16 * selhi[1], 16 * selhi[1] + 8)
             dot = None
@@ -12896,6 +12914,55 @@ class Gen:
             self.export(ins)
         else:
             raise Unsupported(op)
+
+    def dot4_halves(self, x, lo_half, hi_half):
+        """The dword a 4x8-bit dot product reads under op_sel: bytes 0..1 from 16-bit half `lo_half` of `x` and bytes
+        2..3 from half `hi_half` (0 low, 1 high; the default is 0 and 1, `x` itself)."""
+        if (lo_half, hi_half) == (0, 1):
+            return x
+        lo, hi, r = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{lo} = OpBitFieldUExtract %uint {x} {self.cu(16 * lo_half)} {self.cu(16)}")
+        self.emit(f"{hi} = OpBitFieldUExtract %uint {x} {self.cu(16 * hi_half)} {self.cu(16)}")
+        self.emit(f"{r} = OpBitFieldInsert %uint {lo} {hi} {self.cu(16)} {self.cu(16)}")
+        return r
+
+    def packed_dot4(self, x, y, acc, *, signed, clamp):
+        """acc + the dot product of the four bytes of x and y as one SPV_KHR_integer_dot_product instruction, or None
+        under --integer-dot-fallback (the caller expands it).
+
+        OpSDot / OpUDot give the low 32 bits of the exact sum of the four products of the sign- (zero-) extended
+        bytes (PackedVectorFormat4x8Bit), the sum v_dot4_i32_i8 / v_dot4_u32_u8 form; adding acc wraps at 32 bits as
+        the instructions do without clamp. With clamp the hardware saturates acc + the exact sum (signed 32-bit for
+        i8, unsigned for u8; docs/design.md, "Signed-byte dot products" and "Packed integer dot products"), which is
+        OpSDotAccSat / OpUDotAccSat: "the correct result ... computed with enough precision to avoid overflow",
+        saturated to the result type. The signed forms use %int operands, so the signedness is the type's too."""
+        if INTEGER_DOT_FALLBACK:
+            return None
+        self.uses_int_dot = True
+        fmt = "PackedVectorFormat4x8BitKHR"
+        if not signed:
+            r = self.tmp()
+            if clamp:
+                self.emit(f"{r} = OpUDotAccSatKHR %uint {x} {y} {acc} {fmt}")
+            else:
+                d = self.tmp()
+                self.emit(f"{d} = OpUDotKHR %uint {x} {y} {fmt}")
+                self.emit(f"{r} = OpIAdd %uint {acc} {d}")
+            return r
+        xi, yi = self.tmp(), self.tmp()
+        self.emit(f"{xi} = OpBitcast %int {x}")
+        self.emit(f"{yi} = OpBitcast %int {y}")
+        if clamp:
+            ai, s, r = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{ai} = OpBitcast %int {acc}")
+            self.emit(f"{s} = OpSDotAccSatKHR %int {xi} {yi} {ai} {fmt}")
+            self.emit(f"{r} = OpBitcast %uint {s}")
+            return r
+        d, du, r = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{d} = OpSDotKHR %int {xi} {yi} {fmt}")
+        self.emit(f"{du} = OpBitcast %uint {d}")
+        self.emit(f"{r} = OpIAdd %uint {acc} {du}")
+        return r
 
     def scalar_load(self, op, a, mods):
         """s_load_dwordxN sD, s[p:p+1], off   -> N dwords from a 64-bit pointer, no bound
@@ -16217,6 +16284,8 @@ def assemble(gen):
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformArithmetic") if c not in caps]
     if gen.uses_quad:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformQuad") if c not in caps]
+    if gen.uses_int_dot:
+        caps += ["DotProductKHR", "DotProductInput4x8BitPackedKHR"]   # shaderIntegerDotProduct
     if gen.uses_f64:
         caps.append("Float64")
     if gen.uses_fma_khr:
@@ -16258,6 +16327,8 @@ def assemble(gen):
         caps += ["SignedZeroInfNanPreserve", "DenormPreserve"]
     pops = gen.uses_pops and gen.stage == "ps"
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
+    if gen.uses_int_dot:
+        exts.append("SPV_KHR_integer_dot_product")
     if gen.uses_fma_khr:
         exts.append("SPV_KHR_fma")
     if gen.uses_clock:
@@ -19652,7 +19723,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "MinLod": "shaderResourceMinLod", "Image1D": "shaderImage1D? (core)", "Sampled1D": "core",
              "ClipDistance": "shaderClipDistance", "CullDistance": "shaderCullDistance",
              "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex",
-             "DrawParameters": "shaderDrawParameters",
+             "DrawParameters": "shaderDrawParameters", "DotProductKHR": "shaderIntegerDotProduct",
              }     # FMAKHR: shaderFmaFloat32 / shaderFmaFloat64 (VK_KHR_shader_fma) by the width used, below
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          # How fused multiply-adds were emitted. --fma khr is already implied by the FMAKHR capability,
@@ -20103,6 +20174,9 @@ def main():
                     help="wave64 vertex, pixel and geometry shaders that are not exact on 32-wide subgroups (tier C of "
                          "tools/wave64_halves.py): warn = count them in the summary and mark them in the index, "
                          "error = refuse them (Unsupported), off = skip the analysis")
+    ap.add_argument("--integer-dot-fallback", action="store_true",
+                    help="4x8-bit dot products (v_dot4_*) as extracts, multiplies and adds instead of "
+                         "SPV_KHR_integer_dot_product, for devices without shaderIntegerDotProduct")
     ap.add_argument("--bary-fallback", action="store_true",
                     help="pixel shaders that read raw barycentrics take them from an ordinary interpolated input "
                          "(metadata: bary_fallback_input) instead of BaryCoordKHR, for devices without "
@@ -20179,6 +20253,7 @@ def main():
     DESCRIPTOR_TABLE = a.descriptor_table
     LOOP_LIMIT = a.loop_limit
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
+    global INTEGER_DOT_FALLBACK
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
     global PC_TAIL_UBO, ADDRESS_GUARD
     PC_TAIL_UBO = a.pc_tail_ubo
@@ -20193,6 +20268,7 @@ def main():
     WAVE64_EMULATE = a.wave64_emulate
     WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback
+    INTEGER_DOT_FALLBACK = a.integer_dot_fallback
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback

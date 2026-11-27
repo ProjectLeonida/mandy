@@ -43,6 +43,10 @@ public:
     // VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT, asking a pipeline cache "do you have it?" without a
     // compile (pipeline_cache_journal.h). Core 1.3 only; a 1.2 device goes without.
     bool pipeline_creation_cache_control = false;
+    // shaderIntegerDotProduct: the OpSDot / OpUDot (SPV_KHR_integer_dot_product) the translator emits for the 4x8-bit
+    // dot products unless --integer-dot-fallback (docs/design.md, "Signed-byte dot products"). Required by Vulkan
+    // 1.3; a 1.2 device goes without, and make_game.py translates for it with the fallback.
+    bool integer_dot_product = false;
 
     bool usable() const { return dynamic_rendering && synchronization2; }
 
@@ -52,7 +56,7 @@ public:
         core = api_version >= VK_API_VERSION_1_3;
         pipeline_cache_control=false;enable_pipeline_cache_control=false;
         dynamic_rendering = synchronization2 = subgroup_size_control = compute_full_subgroups = false;
-        extended_dynamic_state = pipeline_creation_cache_control = false;
+        extended_dynamic_state = pipeline_creation_cache_control = integer_dot_product = false;
         if (!features2) return;
         if (core) {
             VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
@@ -64,6 +68,7 @@ public:
             subgroup_size_control = f13.subgroupSizeControl == VK_TRUE;
             compute_full_subgroups = f13.computeFullSubgroups == VK_TRUE;
             pipeline_creation_cache_control = f13.pipelineCreationCacheControl == VK_TRUE;
+            integer_dot_product = f13.shaderIntegerDotProduct == VK_TRUE;
             extended_dynamic_state = true;  // core in 1.3, no feature bit
             return;
         }
@@ -113,6 +118,7 @@ public:
         compute_full_subgroups = from.compute_full_subgroups;
         extended_dynamic_state = from.extended_dynamic_state;
         pipeline_creation_cache_control = from.pipeline_creation_cache_control;
+        integer_dot_product = from.integer_dot_product;
     }
 
     // The structs that enable both features, ahead of `chain`; returns their head for VkPhysicalDeviceVulkan12Features'
@@ -126,6 +132,7 @@ public:
             enable13_.subgroupSizeControl = subgroup_size_control ? VK_TRUE : VK_FALSE;
             enable13_.computeFullSubgroups = compute_full_subgroups ? VK_TRUE : VK_FALSE;
             enable13_.pipelineCreationCacheControl = pipeline_creation_cache_control ? VK_TRUE : VK_FALSE;
+            enable13_.shaderIntegerDotProduct = integer_dot_product ? VK_TRUE : VK_FALSE;
             return &enable13_;
         }
         if (subgroup_size_control) {

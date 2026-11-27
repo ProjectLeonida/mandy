@@ -1214,6 +1214,27 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                 raise UnsupportedConstruct("bit-field insert beyond 32 bits (undefined in SPIR-V)")
             mk = ((1 << cnt) - 1) << off
             values[res] = ((base & ~mk) | ((ins << off) & mk)) & MASK
+        elif op in ("OpSDotKHR", "OpUDotKHR", "OpSDotAccSatKHR", "OpUDotAccSatKHR",
+                    "OpSDot", "OpUDot", "OpSDotAccSat", "OpUDotAccSat"):
+            # SPV_KHR_integer_dot_product, PackedVectorFormat4x8Bit only: the exact sum of the four products of the
+            # sign- (OpS*) or zero- (OpU*) extended bytes; plain forms keep its low bits, AccSat forms add the
+            # accumulator exactly and saturate to the result type's range (signed for OpS*, unsigned for OpU*).
+            acc_sat = "AccSat" in op
+            if a[-1] not in ("PackedVectorFormat4x8BitKHR", "PackedVectorFormat4x8Bit") or types.bits(a[0]) != 32:
+                raise UnsupportedConstruct(f"{op} other than 32-bit PackedVectorFormat4x8Bit")
+            is_signed = op.startswith("OpS")
+            x, y = val(a[1]), val(a[2])
+
+            def byte(w, i):
+                b = (w >> (8 * i)) & 0xFF
+                return b - 256 if is_signed and b & 0x80 else b
+            total = sum(byte(x, i) * byte(y, i) for i in range(4))
+            if acc_sat:
+                acc = val(a[3]) & MASK
+                total += (acc - (1 << 32) if acc >> 31 else acc) if is_signed else acc
+                lo, hi = (-(1 << 31), (1 << 31) - 1) if is_signed else (0, MASK)
+                total = min(max(total, lo), hi)
+            values[res] = total & MASK
         elif op == "OpConvertUToPtr":
             values[res] = ("psb", val(a[1]))
             pointers[res] = values[res]

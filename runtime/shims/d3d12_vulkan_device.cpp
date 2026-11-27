@@ -22739,6 +22739,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.heavy_pipeline_cache = heavy_pipeline_cache_ms() && v13.enable_pipeline_cache_control;
     info.prepare_on_bind = mode == "on-demand";
     void* v13_chain = v13.enable(ext_chain);
+    if (!v13.integer_dot_product)
+        std::fprintf(stderr, "[rt] d3d12: the GPU has no shaderIntegerDotProduct; shaders that use the 4x8-bit dot "
+                             "products need make_game.py's --integer-dot-fallback\n");
     // D3D-78 uses the core robustness and format-feature flags. Leave the Vulkan 1.2 extension path unchanged.
     if (v13.core) {
         VkPhysicalDeviceVulkan13Features supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
