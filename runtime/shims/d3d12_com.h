@@ -425,6 +425,12 @@ PageMirrorState page_mirror_state(ID3D12Device* device);
 // reads at a title-written address there) into `out` with the GPU, after the mirror's last bind. False when the mirror is
 // off or the address is not in one of its chunks. For tests.
 bool page_mirror_gpu_read(ID3D12Device* device, std::uint64_t title_va, void* out, std::size_t bytes);
+// The same at arena VA `va` (heap_base + va): what a shader reads there, a console heap read in place among it. False
+// when the mirror is off. For tests.
+bool arena_gpu_read(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes);
+// Whether the layer writes the T# index word (gfx10_descriptors.h, tsharp_index_word) into the heaps shaders read, as a
+// loaded library of modules that read it turns on. Returns what it was. For tests, which load no library.
+bool set_tsharp_index_words_for_test(ID3D12Device* device, bool on);
 // Whether a draw's or copy's binding of title memory [va, va + size) would be served by the page mirror (VulkanContext's
 // mirror lookup): it must have been named before. `size` comes back cut at the chunk's end. For tests.
 bool page_mirror_buffer_at(ID3D12Device* device, std::uint64_t va, std::uint64_t& size);

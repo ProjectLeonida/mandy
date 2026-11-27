@@ -2163,6 +2163,20 @@ if(TARGET Vulkan::Headers)
     add_test(NAME arena_sparse_gpu COMMAND arena_sparse_gpu_test)
     set_tests_properties(arena_sparse_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   endif()
+  # A console heap read in place: one home bound into a mirror chunk and into the arena shows the same bytes through
+  # both, CPU and GPU writes alike, and the unbound guard after the heap reads zero.
+  add_executable(vk_heap_alias_test test/vk_heap_alias_test.cpp)
+  target_link_libraries(vk_heap_alias_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_heap_alias_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_heap_alias_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_heap_alias COMMAND vk_heap_alias_test)
+    set_tests_properties(vk_heap_alias PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  endif()
   # The page mirror on a real device (src/title_mirror.h): a title-written V# read through a buffer reaches its page at
   # heap_base + its title address; remaps, writes and unmaps reach the next dispatch that waits for the bind.
   add_executable(vk_title_mirror_test test/vk_title_mirror_test.cpp)
@@ -2979,6 +2993,15 @@ if(TARGET Vulkan::Headers)
     target_link_options(d3d12_page_mirror_test PRIVATE /OPT:NOREF)
     add_test(NAME d3d12_page_mirror COMMAND d3d12_page_mirror_test)
     set_tests_properties(d3d12_page_mirror PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # A console heap read in place through the page mirror: the GPU reads the filtered slots below 4 GiB of the arena,
+    # the title's bytes never change, a rewrite reaches the GPU at the next refresh, zeros after the heap.
+    add_executable(d3d12_heap_in_place_test test/d3d12_heap_in_place_test.cpp shims/xmem.cpp shims/registry.cpp)
+    target_link_libraries(d3d12_heap_in_place_test PRIVATE gta6rt_d3d12_com d3d12 dxgi psapi)
+    target_compile_definitions(d3d12_heap_in_place_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_heap_in_place_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(d3d12_heap_in_place_test PRIVATE /OPT:NOREF)
+    add_test(NAME d3d12_heap_in_place COMMAND d3d12_heap_in_place_test)
+    set_tests_properties(d3d12_heap_in_place PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
     # Debug markers as VK_EXT_debug_utils labels, and private data on every object (D3D-24).
     add_executable(d3d12_debug_markers_test test/d3d12_debug_markers_test.cpp)
@@ -4887,6 +4910,14 @@ if(TARGET Vulkan::Headers)
       target_compile_options(title_frames_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME title_frames COMMAND title_frames_test)
+    # The page mirror's hooks for descriptor heaps read in place: a second binding of a range's pages, and a filter on
+    # the fill path (src/title_mirror.h). No GPU.
+    add_executable(title_mirror_hooks_test test/title_mirror_hooks_test.cpp)
+    target_link_libraries(title_mirror_hooks_test PRIVATE Vulkan::Headers)
+    if(WIN32 AND MSVC)
+      target_compile_options(title_mirror_hooks_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME title_mirror_hooks COMMAND title_mirror_hooks_test)
     # The XMemAlloc heap in the page mirror's range (src/title_heap.h).
     add_executable(title_heap_test test/title_heap_test.cpp)
     if(WIN32 AND MSVC)
