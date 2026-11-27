@@ -14,6 +14,11 @@
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return false; } \
 } while (0)
+// EXPECT for the int-returning cases below: a failed check is a mismatch (1). EXPECT's `return false` is 0 in an
+// int function, which main would read as a pass.
+#define EXPECT_MISMATCH(condition) do { \
+    if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
+} while (0)
 
 namespace {
 
@@ -292,46 +297,43 @@ int mixed_mask(ID3D12Device& device) {
 
     ComPtr<ID3D12Resource> a, b, image, upload, readback;
     const auto reserved = buffer_desc(buffer_bytes);
-    EXPECT(SUCCEEDED(device.CreateReservedResource(&reserved, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&a))));
-    EXPECT(SUCCEEDED(device.CreateReservedResource(&reserved, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&b))));
+    EXPECT_MISMATCH(SUCCEEDED(device.CreateReservedResource(&reserved, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&a))));
+    EXPECT_MISMATCH(SUCCEEDED(device.CreateReservedResource(&reserved, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&b))));
     D3D12_HEAP_DESC heap_desc{};
     heap_desc.SizeInBytes = 2 * tile_bytes;
     heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
     heap_desc.Properties.CreationNodeMask = heap_desc.Properties.VisibleNodeMask = 1;
     heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
     ComPtr<ID3D12Heap> heap;
-    EXPECT(SUCCEEDED(device.CreateHeap(&heap_desc, IID_PPV_ARGS(&heap))));
+    EXPECT_MISMATCH(SUCCEEDED(device.CreateHeap(&heap_desc, IID_PPV_ARGS(&heap))));
     D3D12_HEAP_PROPERTIES upload_heap = heap_desc.Properties, readback_heap = heap_desc.Properties;
     upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
     readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
     const auto source_desc = buffer_desc(tile_bytes);
     const auto target_desc = buffer_desc(2 * tile_bytes);
-    EXPECT(SUCCEEDED(device.CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &source_desc,
+    EXPECT_MISMATCH(SUCCEEDED(device.CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &source_desc,
                                                     D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload))));
-    EXPECT(SUCCEEDED(device.CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &target_desc,
+    EXPECT_MISMATCH(SUCCEEDED(device.CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &target_desc,
                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback))));
     constexpr auto words_per_tile = std::size_t(tile_bytes / sizeof(std::uint32_t));
     const D3D12_RANGE empty{0, 0};
     void* mapped = nullptr;
-    EXPECT(SUCCEEDED(upload->Map(0, &empty, &mapped)));
+    EXPECT_MISMATCH(SUCCEEDED(upload->Map(0, &empty, &mapped)));
     std::fill_n(static_cast<std::uint32_t*>(mapped), words_per_tile, patterns[0]);
     upload->Unmap(0, nullptr);
 
-    ComPtr<ID3D12Fence> gate, done;
-    EXPECT(SUCCEEDED(device.CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate))));
-    EXPECT(SUCCEEDED(device.CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done))));
+    ComPtr<ID3D12Fence> done;
+    EXPECT_MISMATCH(SUCCEEDED(device.CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done))));
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
-    EXPECT(SUCCEEDED(device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))));
-    EXPECT(SUCCEEDED(device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+    EXPECT_MISMATCH(SUCCEEDED(device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))));
+    EXPECT_MISMATCH(SUCCEEDED(device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
                                               IID_PPV_ARGS(&list))));
     ComPtr<ID3D12CommandQueue> queue;
     const D3D12_COMMAND_QUEUE_DESC queue_desc{};
-    EXPECT(SUCCEEDED(device.CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue))));
+    EXPECT_MISMATCH(SUCCEEDED(device.CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue))));
     Event event;
-    EXPECT(event.handle);
-    Gate open_on_exit{gate.Get()};
-    EXPECT(SUCCEEDED(queue->Wait(gate.Get(), 1)));
+    EXPECT_MISMATCH(event.handle);
 
     const D3D12_TILED_RESOURCE_COORDINATE origin{};
     const D3D12_TILE_REGION_SIZE one{1, FALSE, 0, 0, 0};
@@ -340,10 +342,10 @@ int mixed_mask(ID3D12Device& device) {
     // reuse rule must hand B the same allocation rather than refuse it.
     queue->UpdateTileMappings(a.Get(), 1, &origin, &one, heap.Get(), 1, nullptr, offsets, counts,
                               D3D12_TILE_MAPPING_FLAG_NONE);
-    EXPECT(SUCCEEDED(device.GetDeviceRemovedReason()));
+    EXPECT_MISMATCH(SUCCEEDED(device.GetDeviceRemovedReason()));
     queue->UpdateTileMappings(b.Get(), 1, &origin, &one, heap.Get(), 1, nullptr, offsets + 1, counts + 1,
                               D3D12_TILE_MAPPING_FLAG_NONE);
-    EXPECT(SUCCEEDED(device.GetDeviceRemovedReason()));
+    EXPECT_MISMATCH(SUCCEEDED(device.GetDeviceRemovedReason()));
 
     const auto submit = [&](UINT value) {
         if (FAILED(list->Close())) return false;
@@ -358,18 +360,54 @@ int mixed_mask(ID3D12Device& device) {
                WaitForSingleObject(event.handle, 15000) == WAIT_OBJECT_0;
     };
 
-    // B's tile must read A's pattern: the reuse happened, the update was not refused.
-    list->CopyTiles(b.Get(), &origin, &one, readback.Get(), 0,
+    // Seed A from the upload buffer, then read A and B back off the shared heap: B reuses A's tile, so both must
+    // read the same pattern and neither may clobber the other.
+    list->CopyTiles(a.Get(), &origin, &one, upload.Get(), 0,
+                    D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+    EXPECT_MISMATCH(submit(1));
+    EXPECT_MISMATCH(wait(1));
+    list->CopyTiles(a.Get(), &origin, &one, readback.Get(), 0,
                     D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
-    EXPECT(submit(1));
-    EXPECT(wait(1));
+    EXPECT_MISMATCH(submit(2));
+    EXPECT_MISMATCH(wait(2));
     std::uint32_t first = 0;
-    EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+    EXPECT_MISMATCH(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
     first = *static_cast<const std::uint32_t*>(mapped);
     readback->Unmap(0, &empty);
     if (first != patterns[0]) {
-        std::fprintf(stderr, "Mixed mask: buffer B tile reads %#010x, want the reused allocation's %#010x\n",
+        std::fprintf(stderr, "Mixed mask: buffer A tile reads %#010x, want the uploaded %#010x\n",
                      unsigned(first), unsigned(patterns[0]));
+        return 1;
+    }
+    list->CopyTiles(b.Get(), &origin, &one, readback.Get(), tile_bytes,
+                    D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+    EXPECT_MISMATCH(submit(3));
+    EXPECT_MISMATCH(wait(3));
+    std::uint32_t second = 0;
+    EXPECT_MISMATCH(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+    second = static_cast<const std::uint32_t*>(mapped)[tile_bytes / sizeof(std::uint32_t)];
+    readback->Unmap(0, &empty);
+    if (second != patterns[0]) {
+        std::fprintf(stderr, "Mixed mask: buffer B tile reads %#010x, want the reused allocation's %#010x\n",
+                     unsigned(second), unsigned(patterns[0]));
+        return 1;
+    }
+    // Re-read A after B was checked through the shared tile: both must still hold the reused pattern, so neither
+    // buffer may clobber the other. Zero the slot before the copy so a dropped copy cannot pass on stale contents.
+    EXPECT_MISMATCH(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+    std::fill_n(static_cast<std::uint32_t*>(mapped), words_per_tile, std::uint32_t{0});
+    readback->Unmap(0, nullptr);
+    list->CopyTiles(a.Get(), &origin, &one, readback.Get(), 0,
+                    D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+    EXPECT_MISMATCH(submit(4));
+    EXPECT_MISMATCH(wait(4));
+    std::uint32_t third = 0;
+    EXPECT_MISMATCH(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+    third = *static_cast<const std::uint32_t*>(mapped);
+    readback->Unmap(0, &empty);
+    if (third != patterns[0]) {
+        std::fprintf(stderr, "Mixed mask: buffer A tile reads %#010x after buffer B, want the reused allocation's %#010x\n",
+                     unsigned(third), unsigned(patterns[0]));
         return 1;
     }
 
@@ -387,26 +425,28 @@ int mixed_mask(ID3D12Device& device) {
                                                 IID_PPV_ARGS(&image)))) {
         queue->UpdateTileMappings(image.Get(), 1, &origin, &one, heap.Get(), 1, nullptr, offsets + 1, counts + 1,
                                   D3D12_TILE_MAPPING_FLAG_NONE);
-        EXPECT(SUCCEEDED(device.GetDeviceRemovedReason()));
+        EXPECT_MISMATCH(SUCCEEDED(device.GetDeviceRemovedReason()));
+        // Zero the readback slot before re-reading so a dropped copy cannot pass on stale contents.
+        EXPECT_MISMATCH(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+        std::fill_n(static_cast<std::uint32_t*>(mapped) + words_per_tile, words_per_tile, std::uint32_t{0});
+        readback->Unmap(0, nullptr);
         list->CopyTiles(b.Get(), &origin, &one, readback.Get(), tile_bytes,
                         D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
-        EXPECT(submit(2));
-        EXPECT(wait(2));
-        std::uint32_t second = 0;
-        EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
-        second = static_cast<const std::uint32_t*>(mapped)[tile_bytes / sizeof(std::uint32_t)];
+        EXPECT_MISMATCH(submit(5));
+        EXPECT_MISMATCH(wait(5));
+        std::uint32_t fourth = 0;
+        EXPECT_MISMATCH(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+        fourth = static_cast<const std::uint32_t*>(mapped)[tile_bytes / sizeof(std::uint32_t)];
         readback->Unmap(0, &empty);
-        if (second != patterns[0]) {
+        if (fourth != patterns[0]) {
             std::fprintf(stderr, "Mixed mask: an image changed buffer B's tile to %#010x, want %#010x\n",
-                         unsigned(second), unsigned(patterns[0]));
+                         unsigned(fourth), unsigned(patterns[0]));
             return 1;
         }
         std::puts("Mixed mask: an image on the buffer-only heap was refused and B's tile is unchanged");
     } else {
         std::puts("Mixed mask: device cannot create a reserved texture; image separation skipped");
     }
-    EXPECT(SUCCEEDED(gate->Signal(1)));
-    open_on_exit.fence = nullptr;
     std::puts("Mixed mask: a mixed dedicated|arena mask reused the dedicated allocation");
     return 0;
 }
@@ -426,7 +466,7 @@ int main() {
     }
     const int mixed = mixed_mask(*vulkan.Get());
     if (mixed == 1) return 1;
-    Results observed{};
+    Results observed{}, native{};
     if (!run(*vulkan.Get(), observed, true)) return 1;
     std::puts("Vulkan replay: 12 full tiles matched across aliased, skipped, unmapped, reused and remapped ranges");
     std::puts("A rejected update left all tile mappings intact");
