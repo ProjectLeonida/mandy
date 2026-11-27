@@ -40,6 +40,7 @@
 #include "depth24.h"
 #include "quad_index_expand.h"
 #include "rect_list_geometry.h"
+#include "target_dump.h"
 #include "uav_clear.h"
 
 #include <vulkan/vulkan.h>
@@ -884,6 +885,7 @@ struct ComputePipeline {
     // one). Null: nobody is told. Called while a submission is prepared: it must never block or allocate (the only lock it may take is a non-blocking try_lock, on the first request of a pipeline and of a variant).
     void (*requested)(void*, std::uint32_t variant) = nullptr;
     void* request_context = nullptr;
+    bool writes_storage_image = true;
 };
 
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
@@ -1358,6 +1360,7 @@ struct ReplayFunctions {
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
+    TargetDump* target_dump = nullptr;
 };
 
 namespace detail {
@@ -1832,6 +1835,120 @@ inline LayoutPieces current(const LayoutTracker* tracker, ResourceId id, const V
         out.push_back({range, assumed});
     }
     return out;
+}
+
+inline target_dump::UavImage make_target_dump_uav(const ResourceBinding& binding, const VkImageSubresourceRange& range) {
+    target_dump::UavImage uav{};
+    uav.image = binding.image;
+    uav.format = binding.format;
+    uav.aspects = binding.aspects;
+    uav.width = binding.width;
+    uav.height = binding.height;
+    uav.mip_levels = binding.mip_levels;
+    uav.array_layers = binding.array_layers;
+    uav.mip = range.baseMipLevel;
+    uav.layer = range.baseArrayLayer;
+    uav.samples = binding.samples;
+    uav.volume = binding.volume;
+    return uav;
+}
+
+inline void track_target_dump_transition(TargetDump& dump, ResourceId id, const Prepared& p,
+                                         const TransitionBarrier& transition) {
+    if (!p.binding.image) return;
+    if (transition.after & d3d12_state::unordered_access) {
+        dump.note_uav(id, make_target_dump_uav(p.binding, p.range));
+    } else {
+        dump.clear_uav(id, p.range.baseMipLevel, p.range.levelCount, p.range.baseArrayLayer, p.range.layerCount);
+    }
+}
+
+inline void track_target_dump_texture_barrier(TargetDump& dump, ResourceId id, const Prepared& p,
+                                              const TextureBarrier& texture, bool release) {
+    if (!p.binding.image) return;
+    if (!release &&
+        (texture_uav_layout(texture.layout_after) || (texture.access_after & d3d12_access::unordered_access))) {
+        dump.note_uav(id, make_target_dump_uav(p.binding, p.range));
+    } else if (release || texture.layout_after != d3d12_layout::undefined) {
+        dump.clear_uav(id, p.range.baseMipLevel, p.range.levelCount, p.range.baseArrayLayer, p.range.layerCount);
+    }
+}
+
+inline void track_target_dump_uav_clear(TargetDump& dump, ResourceId id, const Prepared& p) {
+    if (!p.binding.image) return;
+    dump.note_uav(id, make_target_dump_uav(p.binding, p.range));
+}
+
+inline void dump_dispatch_targets(TargetDump& dump, VkCommandBuffer command_buffer, bool writes_storage_image,
+                                  const LayoutTracker* tracker,
+                                  const VkConditionalRenderingBeginInfoEXT* predicate) {
+    dump.after_dispatch(
+        command_buffer, writes_storage_image,
+        [tracker](std::uint64_t id, VkImageAspectFlags aspects, std::uint32_t mip, std::uint32_t layer) {
+            if (!tracker) return true;
+            const VkImageSubresourceRange range{aspects, mip, 1, layer, 1};
+            LayoutPieces pieces;
+            if (!tracker->pieces(id, range, pieces) || pieces.empty()) return false;
+            for (const auto& piece : pieces)
+                if (piece.layout != VK_IMAGE_LAYOUT_GENERAL) return false;
+            return true;
+        },
+        predicate);
+}
+
+inline void dump_rendering_targets(TargetDump& dump, VkCommandBuffer command_buffer, const PreparedDraw& d,
+                                   const std::array<VkRenderingAttachmentInfo, max_render_targets>& colors,
+                                   const VkRenderingAttachmentInfo& depth, bool separate,
+                                   const VkConditionalRenderingBeginInfoEXT* predicate) {
+    std::vector<target_dump::TargetImage> targets;
+    targets.reserve(d.colors.size() + 1);
+    const GraphicsPipeline& graphics = *d.graphics;
+    for (std::size_t slot = 0; slot < d.colors.size(); ++slot) {
+        const auto& a = d.colors[slot];
+        if (!a.id || !a.binding.image || a.binding.samples > 1) continue;
+        VkFormat view_format = a.binding.format;
+        if (!a.binding.rgba4_render_fallback && !a.binding.rgb96 && slot < graphics.color_formats.size() &&
+            graphics.color_formats[slot] != VK_FORMAT_UNDEFINED) {
+            view_format = graphics.color_formats[slot];
+        }
+        const VkExtent2D extent = mip_extent(a.binding, a.range.baseMipLevel);
+        target_dump::TargetImage target{};
+        target.image = a.binding.image;
+        target.format = view_format;
+        target.image_format = a.binding.format;
+        target.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        target.layout_aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        target.layout = colors[slot].imageLayout;
+        target.width = extent.width;
+        target.height = extent.height;
+        target.mip = a.range.baseMipLevel;
+        target.layer = a.range.baseArrayLayer;
+        target.samples = a.binding.samples;
+        target.volume = a.binding.volume;
+        target.slot = "rt" + std::to_string(slot);
+        targets.push_back(std::move(target));
+    }
+    if (d.depth.id && d.depth.binding.image && d.depth.binding.samples <= 1 &&
+        (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) {
+        const VkExtent2D extent = mip_extent(d.depth.binding, d.depth.range.baseMipLevel);
+        const auto layout_range = planes_for_layout(d.depth.binding, d.depth.range, separate);
+        target_dump::TargetImage target{};
+        target.image = d.depth.binding.image;
+        target.format = d.depth.binding.format;
+        target.image_format = d.depth.binding.format;
+        target.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+        target.layout_aspects = layout_range.aspectMask;
+        target.layout = depth.imageLayout;
+        target.width = extent.width;
+        target.height = extent.height;
+        target.mip = d.depth.range.baseMipLevel;
+        target.layer = d.depth.range.baseArrayLayer;
+        target.samples = d.depth.binding.samples;
+        target.volume = d.depth.binding.volume;
+        target.slot = "depth";
+        targets.push_back(std::move(target));
+    }
+    dump.after_rendering(command_buffer, targets, predicate);
 }
 
 // Copies zeroes from the device's zero page or transfer scratch. A buffer can initialize block-compressed
@@ -4753,6 +4870,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                                       from.access, from.stages, to.access, to.stages);
             if (tracker) tracker->set(id, range, new_layout);
             finish_depth_uav_barrier(p, new_layout, end_statistics, begin_statistics);
+            if (vk.target_dump) detail::track_target_dump_transition(*vk.target_dump, id, p, *transition);
         } else if (std::holds_alternative<UavBarrier>(command)) {
             const VulkanAccess uav = vulkan_access(d3d12_state::unordered_access, false);
             VkAccessFlags src_access = VK_ACCESS_SHADER_WRITE_BIT;
@@ -4853,6 +4971,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             }
             if (tracker && !release) tracker->set(id, range, new_layout);
             if (!release) finish_depth_uav_barrier(p, new_layout, end_statistics, begin_statistics);
+            if (vk.target_dump) detail::track_target_dump_texture_barrier(*vk.target_dump, id, p, *texture, release);
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
             if (p.skip) continue;
             if constexpr (Checkpoints) checkpoints->record(command_buffer, i, CheckpointKind::clear);
@@ -4961,6 +5080,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             const VkImageLayout layout = image_layout(p.binding, state.layout);
             auto pieces = detail::current(tracker, id, p.range, layout);
             detail::initialize(vk, command_buffer, p.binding, id, pieces, layout, tracker);
+            if (vk.target_dump) detail::track_target_dump_uav_clear(*vk.target_dump, id, p);
             if (p.clear_pattern_bytes) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, layout, state, VK_ACCESS_TRANSFER_WRITE_BIT,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT, [&] {
@@ -5386,6 +5506,11 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             for (std::uint32_t k = 0; k < records; ++k) {
                 vk.dispatch_indirect(command_buffer, indirect_buffer, arguments + VkDeviceSize(k) * stride);
             }
+            if (vk.target_dump)
+                detail::dump_dispatch_targets(
+                    *vk.target_dump, command_buffer,
+                    !ind->pipeline || (p.pipeline.bindless_set != VK_NULL_HANDLE && p.pipeline.writes_storage_image),
+                    tracker, predicate.buffer ? &predicate : nullptr);
             if constexpr (Checkpoints) checkpoints->dispatched(command_buffer);
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
                    xdxr_build && vk.xdxr_record) {
@@ -5503,6 +5628,11 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             }
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
+            if (vk.target_dump)
+                detail::dump_dispatch_targets(
+                    *vk.target_dump, command_buffer,
+                    p.pipeline.bindless_set != VK_NULL_HANDLE && p.pipeline.writes_storage_image, tracker,
+                    predicate.buffer ? &predicate : nullptr);
             if constexpr (Checkpoints) checkpoints->dispatched(command_buffer);
         } else if (raster.state) {
             const Draw* draw = raster.state;
@@ -5709,6 +5839,9 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
             }
             vk.end_rendering(command_buffer);
+            if (vk.target_dump)
+                detail::dump_rendering_targets(*vk.target_dump, command_buffer, d, colors, depth, separate,
+                                               predicate.buffer ? &predicate : nullptr);
         }
     }
     // Predication does not carry over to the next command list.
