@@ -276,6 +276,7 @@ jobs:
           cmake -S runtime -B runtime/build -G Ninja
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DLEONIDA_D3D12_SHIM_TESTS=ON
+          -DLEONIDA_SDL3_FETCH=ON
           -DLEONIDA_REQUIRE_VULKAN=ON
           -DLEONIDA_REQUIRE_XMA2_DECODER=ON
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
