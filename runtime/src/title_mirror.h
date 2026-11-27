@@ -23,6 +23,8 @@
 // serialises (the device under its mirror mutex).
 #include <vulkan/vulkan.h>
 
+#include "shadow_keep.h"
+
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -57,6 +59,9 @@ public:
         std::uint64_t chunks = 0, chunk_failures = 0, homes = 0, units = 0, pages = 0;  // now
         std::uint64_t binds = 0, unbinds = 0, batches = 0, uploads = 0, upload_failures = 0, homes_freed = 0;  // so far
         std::uint64_t unmirrored_changes = 0;  // feed entries outside every chunk
+        // Bytes the uploads copied into homes, bytes write_back() copied to the title's pages, and 256-byte pieces
+        // both sides had changed (the title's bytes kept), so far.
+        std::uint64_t uploaded_bytes = 0, written_back_bytes = 0, conflicts = 0;
     };
 
     explicit TitleMirror(TitleMirrorHooks hooks) : hooks_(std::move(hooks)) {}
@@ -140,11 +145,49 @@ public:
             const auto home = homes_.find(frame);
             if (home == homes_.end() || !home->second.dirty) continue;
             home->second.dirty = false;
-            fill(home->second, frame);
+            fill(home->second, frame, false);
             ++n;
         }
         dirty_.clear();
         return n;
+    }
+
+    // What the GPU wrote into the homes of the mirrored pages of [begin, end) goes to the title's pages, merged at the
+    // 256-byte piece against the sums both sides last agreed on: a piece only the GPU changed is written back with
+    // `write(va, bytes, n)` (and agreed on again); a piece only the title changed waits for the upload; a piece both
+    // changed keeps the title's bytes and is counted. Call it once the submissions that could write the range have
+    // completed. Returns the bytes written back.
+    template <class Write>
+    std::uint64_t write_back(std::uint64_t begin, std::uint64_t end, Write&& write) {
+        std::uint64_t written = 0;
+        alignas(64) std::uint8_t title[kPiece];
+        for (std::uint64_t page = begin & ~(kPage - 1); page < end; page += kPage) {
+            const auto mapped = pages_.find(page);
+            if (mapped == pages_.end()) continue;
+            const auto found = homes_.find(mapped->second);
+            if (found == homes_.end()) continue;
+            Home& home = found->second;
+            const std::uint8_t* gpu = units_[home.unit].host + std::size_t(home.slot) * kPage;
+            const std::size_t k0 = std::size_t((std::max(begin, page) - page) / kPiece);
+            const std::size_t k1 = std::size_t((std::min(end, page + kPage) - page + kPiece - 1) / kPiece);
+            for (std::size_t k = k0; k < k1; ++k) {
+                const std::uint64_t agreed = home.sums[k];
+                const std::uint64_t now = shadow_keep::sum_of(gpu + k * kPiece, kPiece);
+                if (now == agreed) continue;  // the GPU did not change it
+                const std::uint8_t* from = mapped->second + k * kPiece;
+                if (!(hooks_.copy ? hooks_.copy(title, from, kPiece) : (std::memcpy(title, from, kPiece), true)))
+                    continue;  // the title's page went away
+                if (shadow_keep::sum_of(title, kPiece) != agreed) {
+                    ++counters_.conflicts;  // both changed it: the title's bytes win at the next upload
+                    continue;
+                }
+                if (!write(page + k * kPiece, gpu + k * kPiece, kPiece)) continue;
+                home.sums[k] = now;
+                written += kPiece;
+            }
+        }
+        counters_.written_back_bytes += written;
+        return written;
     }
 
     // The binds noted since the last flush, as one batch signalling `value`. False when there were none (nothing to
@@ -216,10 +259,15 @@ public:
     }
 
 private:
+    // A home and the sum of each of its 256-byte pieces as both sides last agreed on it (src/shadow_keep.h): what was
+    // filled from the title's page, or written back to it. A piece whose home differs from its sum was written by the
+    // GPU, one whose title page differs by the title.
+    static constexpr std::size_t kPiece = shadow_keep::kPiece, kPieces = kPage / kPiece;
     struct Home {
         std::uint32_t unit = 0, slot = 0, refs = 0;
         std::shared_ptr<void> keep;
         bool dirty = false;
+        std::unique_ptr<std::uint64_t[]> sums = std::make_unique<std::uint64_t[]>(kPieces);
     };
     struct Unit {
         VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -231,13 +279,26 @@ private:
         std::uint64_t ticket;
     };
 
-    void fill(Home& home, const std::uint8_t* frame) {
+    // Brings the home up to date with the title's page, piece by piece: `whole` (a new home) copies every piece, and
+    // otherwise only a piece the title changed since both sides last agreed, so a piece only the GPU wrote keeps the
+    // GPU's bytes (and goes back with write_back). A piece both changed takes the title's bytes.
+    void fill(Home& home, const std::uint8_t* frame, bool whole) {
         std::uint8_t* to = units_[home.unit].host + std::size_t(home.slot) * kPage;
-        const bool ok = hooks_.copy ? hooks_.copy(to, frame, kPage) : (std::memcpy(to, frame, kPage), true);
-        if (!ok) {
-            std::memset(to, 0, kPage);
-            ++counters_.upload_failures;
+        alignas(64) std::uint8_t title[kPiece];
+        bool failed = false;
+        for (std::size_t k = 0; k < kPieces; ++k) {
+            const std::uint8_t* from = frame + k * kPiece;
+            if (!(hooks_.copy ? hooks_.copy(title, from, kPiece) : (std::memcpy(title, from, kPiece), true))) {
+                std::memset(title, 0, kPiece);
+                failed = true;
+            }
+            const std::uint64_t sum = shadow_keep::sum_of(title, kPiece);
+            if (!whole && sum == home.sums[k]) continue;
+            std::memcpy(to + k * kPiece, title, kPiece);
+            home.sums[k] = sum;
+            counters_.uploaded_bytes += kPiece;
         }
+        if (failed) ++counters_.upload_failures;
         ++counters_.uploads;
     }
 
@@ -249,7 +310,7 @@ private:
         home.unit = unit;
         home.slot = slot;
         home.keep = std::move(keep);
-        fill(home, frame);
+        fill(home, frame, true);
         return &home;
     }
     bool take_slot(std::uint32_t& unit, std::uint32_t& slot) {
