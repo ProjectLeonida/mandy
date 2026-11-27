@@ -169,6 +169,9 @@ struct VulkanDeviceInfo {
     bool occlusion_query_precise = false;
     bool prepare_on_bind = false;
     bool cold_graphics_compile = false;  // Driver supports a cache-only create and reports when compilation is pending.
+    // pipelineCreationCacheControl is on for the heavy pipeline cache (src/heavy_pipeline_cache.h): a pipeline the
+    // offline cache does not have is created against the cache of pipeline_cache.heavy.bin, written back as it grows.
+    bool heavy_pipeline_cache = false;
     bool pipeline_statistics_query = false;
     bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
     // VK_KHR_swapchain_maintenance1 (or VK_EXT_swapchain_maintenance1) and its swapchainMaintenance1 feature are
