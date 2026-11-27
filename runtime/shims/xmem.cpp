@@ -1049,7 +1049,7 @@ void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULON
     // places it, as before).
     const auto in_mirror_space = [&](auto&& reserve) -> void* {
         void* made = nullptr;
-        leonida::title_mirror_space::take(size, base_granularity, [&](std::uint64_t at) {
+        leonida::title_mirror_space::take(size, base_granularity, !(new_placeholder || window), [&](std::uint64_t at) {
             made = reserve(reinterpret_cast<void*>(static_cast<uintptr_t>(at)));
             return made != nullptr;
         });
@@ -2404,8 +2404,21 @@ constexpr DWORD kMemTitle = 0x40000000;
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
     const DWORD type = allocation_type & ~(kMemGraphics | kMemTitle);
     const DWORD host_prot = host_protect(protect);
-    LPVOID result =
-        reserve_watched(type, address, size, [&](DWORD t) { return VirtualAlloc(address, size, t, host_prot); });
+    LPVOID result = nullptr;
+    // A reservation the host would place goes into the page mirror's range too (src/title_mirror_space.h), as an
+    // XMemVirtualAlloc one does: a V# or pointer the title writes with its address reaches the mirror.
+    if (!address && size && (type & (MEM_RESERVE | MEM_COMMIT)) && !(type & (MEM_PHYSICAL | MEM_LARGE_PAGES))) {
+        SIZE_T rounded = 0;
+        if (round_up_size(size, kXmemPageSize64k, rounded))
+            leonida::title_mirror_space::take(rounded, kXmemPageSize64k, true, [&](std::uint64_t at) {
+                void* const there = reinterpret_cast<void*>(static_cast<uintptr_t>(at));
+                result = reserve_watched(type | MEM_RESERVE, there, size,
+                                         [&](DWORD t) { return VirtualAlloc(there, size, t, host_prot); });
+                return result != nullptr;
+            });
+    }
+    if (!result)
+        result = reserve_watched(type, address, size, [&](DWORD t) { return VirtualAlloc(address, size, t, host_prot); });
     if (result) {
         leonida::title_memory_map::changed(result, size);
         leonida::title_va_aliases().add_title_memory(reinterpret_cast<uintptr_t>(result), size);

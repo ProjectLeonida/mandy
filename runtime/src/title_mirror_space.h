@@ -31,6 +31,7 @@ struct State {
     std::mutex mutex;
     std::uint64_t next = kLow;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> taken;  // [base, end), in order
+    std::vector<bool> plain;  // per taken range: ordinary memory (not physical-page windows or placeholders)
     std::atomic<std::uint64_t> generation{0};
     std::atomic<std::uint64_t> placed_bytes{0}, refused{0};
 };
@@ -53,8 +54,11 @@ inline bool contains(std::uint64_t va) { return va >= kLow && va < kHigh; }
 // The next free address for `size` bytes aligned to `alignment` (a power of two), or 0 when the range is spent. `reserve`
 // tries the host's reservation there: false (the host has something there) moves on by one chunk. Under the state's lock:
 // `reserve` must not take a lock a reserving thread holds (xmem calls this before taking any of its own).
+// `plain`: ordinary memory the title's CPU and GPU read at this address (an XMemVirtualAlloc region of committed or
+// reserved pages), mirrored page by page as readers name it; otherwise physical-page windows or placeholders, whose
+// pages xmem's feed reports as they are mapped.
 template <class Reserve>
-std::uint64_t take(std::uint64_t size, std::uint64_t alignment, Reserve&& reserve) {
+std::uint64_t take(std::uint64_t size, std::uint64_t alignment, bool plain, Reserve&& reserve) {
     State& s = state();
     if (!enabled() || !size) return 0;
     if (alignment < 0x10000) alignment = 0x10000;
@@ -65,6 +69,7 @@ std::uint64_t take(std::uint64_t size, std::uint64_t alignment, Reserve&& reserv
         if (reserve(at)) {
             s.next = at + ((size + 0xffff) & ~std::uint64_t(0xffff));
             s.taken.emplace_back(at, at + size);
+            s.plain.push_back(plain);
             s.placed_bytes.fetch_add(size, std::memory_order_relaxed);
             s.generation.fetch_add(1, std::memory_order_release);
             return at;
@@ -77,16 +82,18 @@ std::uint64_t take(std::uint64_t size, std::uint64_t alignment, Reserve&& reserv
 
 inline std::uint64_t generation() { return state().generation.load(std::memory_order_acquire); }
 
-// The reservations made so far: f(base, end) for each.
+// The reservations made so far: f(base, end, plain) for each.
 template <class F>
 void for_each_taken(F&& f) {
     State& s = state();
     std::vector<std::pair<std::uint64_t, std::uint64_t>> copy;
+    std::vector<bool> plain;
     {
         std::lock_guard lock(s.mutex);
         copy = s.taken;
+        plain = s.plain;
     }
-    for (const auto& [base, end] : copy) f(base, end);
+    for (std::size_t i = 0; i < copy.size(); ++i) f(copy[i].first, copy[i].second, bool(plain[i]));
 }
 
 }  // namespace leonida::title_mirror_space

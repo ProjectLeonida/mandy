@@ -428,6 +428,17 @@ bool page_mirror_gpu_read(ID3D12Device* device, std::uint64_t title_va, void* ou
 // The same at arena VA `va` (heap_base + va): what a shader reads there, a console heap read in place among it. False
 // when the mirror is off. For tests.
 bool arena_gpu_read(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes);
+// Whether a draw's or copy's binding of title memory [va, va + size) would be served by the page mirror (VulkanContext's
+// mirror lookup): it must have been named before. `size` comes back cut at the chunk's end. For tests.
+bool page_mirror_buffer_at(ID3D12Device* device, std::uint64_t va, std::uint64_t& size);
+// Names [va, va + bytes) to the page mirror as a reader would (page_mirror_resolve). For tests.
+bool page_mirror_name(ID3D12Device* device, std::uint64_t va, std::uint64_t bytes);
+// Writes `bytes` (at most 64 KiB) at heap_base + `title_va` with the GPU, as a shader's store into the mirror would,
+// and waits for it. For tests.
+bool page_mirror_gpu_write(ID3D12Device* device, std::uint64_t title_va, const void* data, std::size_t bytes);
+// The copy back of what the GPU wrote into the mirror's homes over [va, va + bytes) to the title's pages, as
+// write_back_titles makes it once a submission has retired. Returns the bytes written. For tests.
+std::uint64_t page_mirror_write_back(ID3D12Device* device, std::uint64_t va, std::uint64_t bytes);
 
 // The blocks of device memory that textures share (src/image_memory.h): how many, their bytes, and the textures in
 // them. For tests.

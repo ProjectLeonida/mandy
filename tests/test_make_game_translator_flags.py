@@ -191,7 +191,7 @@ class MainWiringTest(unittest.TestCase):
     """main() parses the fallback flags and hands the same tuple to preflight() and shaders()."""
 
     def run_main(self, *extra_argv, per_vertex=None, barycentric_fallback=None, max_push_constants=None,
-                 mesh_crash=False):
+                 mesh_crash=False, integer_dot=True):
         # An empty --out: main() reads the flags an existing translation was made with, and the default folder
         # is the user's own.
         out = tempfile.TemporaryDirectory()
@@ -206,6 +206,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=barycentric_fallback), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.runtime_gpu_mesh_draws_crash", return_value=mesh_crash), \
+                mock.patch("make_game.runtime_gpu_integer_dot_product", return_value=integer_dot), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
                 mock.patch("make_game.log"):
@@ -263,6 +264,21 @@ class MainWiringTest(unittest.TestCase):
                           ({}, None), ({"barycentric_fallback": "true"}, None)):
             with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
                 self.assertIs(make_game.runtime_gpu_barycentric_fallback(), want)
+
+    def test_integer_dot_fallback_follows_the_device(self):
+        """On by itself where the GPU has no shaderIntegerDotProduct (a Vulkan 1.2 device), not where it has it or
+        can't tell; asked for explicitly, it is on everywhere."""
+        self.assertEqual(self.run_main(integer_dot=False), (("--integer-dot-fallback",),) * 2)
+        self.assertEqual(self.run_main(integer_dot=True), ((), ()))
+        self.assertEqual(self.run_main(integer_dot=None), ((), ()))
+        self.assertEqual(self.run_main("--integer-dot-fallback", integer_dot=True),
+                         (("--integer-dot-fallback",),) * 2)
+
+    def test_runtime_gpu_integer_dot_product_requires_a_boolean_probe_result(self):
+        for raw, want in (({"integer_dot_product": True}, True), ({"integer_dot_product": False}, False),
+                          ({}, None), ({"integer_dot_product": 1}, None)):
+            with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
+                self.assertIs(make_game.runtime_gpu_integer_dot_product(), want)
 
     def test_pc_tail_ubo_follows_the_device(self):
         """On by itself where maxPushConstantsSize is below what the shaders need (144, or 152 with

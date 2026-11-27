@@ -87,6 +87,7 @@ public:
     // Thread-safe for distinct slots: reads only `tiled` and writes only the slot's buffer and `columns`.
     static void fill(Slot& slot, const leonida::ResourceBinding& image, const xg_xs::Texture& layout,
                      const std::uint8_t* tiled, std::vector<std::uint64_t>& columns, bool inspect, bool& nonzero) {
+        leonida::submit_phases::note_change(leonida::submit_phases::change_textures);  // not a "submit floor" one
         const auto block = leonida::copy_block_format(image, VK_IMAGE_ASPECT_COLOR_BIT);
         for (const auto& copy : slot.regions) {
             const auto level = copy.imageSubresource.mipLevel;

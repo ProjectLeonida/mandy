@@ -325,25 +325,32 @@ class SmemTranslatorGenTests(unittest.TestCase):
         self.assertTrue(g.uses_psb)
 
     def test_multi_dword_emission_counts(self):
+        # (line, uvec2 loads, uvec4 loads, single-dword loads). A multi-dword load is the fewest wide loads (uvec4,
+        # then uvec2): an s_load always, an s_buffer_load when its last dword is in range. An s_buffer_load whose
+        # bound is known only at run time keeps the per-dword path for a load that is partly out of range.
         cases = [
-            ("s_load_dword s0, s[2:3], 0", 1),
-            ("s_load_dwordx2 s[0:1], s[2:3], 0", 2),
-            ("s_load_dwordx4 s[0:3], s[4:5], 0", 4),
-            ("s_load_dwordx8 s[0:7], s[8:9], 0", 8),
-            ("s_load_dwordx16 s[0:15], s[16:17], 0", 16),
-            ("s_buffer_load_dword s0, s[4:7], 0", 1),
-            ("s_buffer_load_dwordx4 s[0:3], s[8:11], 0", 4),
-            ("s_buffer_load_dwordx8 s[0:7], s[8:11], 0", 8),
+            ("s_load_dword s0, s[2:3], 0", 0, 0, 1),
+            ("s_load_dwordx2 s[0:1], s[2:3], 0", 1, 0, 0),
+            ("s_load_dwordx4 s[0:3], s[4:5], 0", 0, 1, 0),
+            ("s_load_dwordx8 s[0:7], s[8:9], 0", 0, 2, 0),
+            ("s_load_dwordx16 s[0:15], s[16:17], 0", 0, 4, 0),
+            ("s_buffer_load_dword s0, s[4:7], 0", 0, 0, 1),
+            ("s_buffer_load_dwordx2 s[0:1], s[8:11], 0", 1, 0, 2),
+            ("s_buffer_load_dwordx4 s[0:3], s[8:11], 0", 0, 1, 4),
+            ("s_buffer_load_dwordx8 s[0:7], s[8:11], 0", 0, 2, 8),
+            ("s_buffer_load_dwordx16 s[0:15], s[16:19], 0", 0, 4, 16),
         ]
-        for line, expected_n in cases:
+        for line, v2, v4, single in cases:
             with self.subTest(line=line):
                 g = rdna2spirv.Gen("ps")
                 ins = parse_line(line)
                 g.scalar_load(ins["op"], ins["args"], ins["mods"])
                 psb_chains = [ln for ln in g.body if "OpAccessChain %_ptr_PSB_uint" in ln]
                 psb_loads = [ln for ln in g.body if "OpLoad %uint" in ln and "Aligned 4" in ln]
-                self.assertEqual(len(psb_chains), expected_n)
-                self.assertEqual(len(psb_loads), expected_n)
+                self.assertEqual(len(psb_chains), single)
+                self.assertEqual(len(psb_loads), single)
+                self.assertEqual(sum("OpLoad %v2uint_sl" in ln for ln in g.body), v2)
+                self.assertEqual(sum("OpLoad %v4uint_sl" in ln for ln in g.body), v4)
 
     def test_special_destinations_emission(self):
         for line in ("s_buffer_load_dword vcc_lo, s[0:3], 0",
@@ -502,6 +509,29 @@ class SmemBodyEvaluator:
             value = self._value(args[1] if cond else args[2])
         elif op == "OpConvertUToPtr" and ty == "%_ptr_PSB_arr":
             value = ("psb", self._value(args[0]))
+        elif op == "OpConvertUToPtr" and ty in ("%_ptr_PSB_sl_blk2", "%_ptr_PSB_sl_blk4"):
+            value = ("blk", self._value(args[0]) & MASK64, 2 if ty.endswith("2") else 4)
+        elif op == "OpAccessChain" and ty in ("%_ptr_PSB_v2uint_sl", "%_ptr_PSB_v4uint_sl"):
+            # Member 0 of the read-only block a wide load goes through: the block's own address.
+            kind, address, count = self._value(args[0])
+            if kind != "blk" or count != (2 if "v2" in ty else 4) or self._value(args[1]) != 0 or len(args) != 2:
+                raise AssertionError("unmodelled access chain: " + " ".join(words))
+            value = ("vec", address, count)
+        elif op == "OpLoad" and ty in ("%v2uint_sl", "%v4uint_sl"):
+            # A wide load reads its dwords in order, each at the vector's address + 4 * i.
+            kind, address, count = self._value(args[0])
+            if kind != "vec" or count != (2 if "v2" in ty else 4) or args[1:] != ["Aligned", "4"]:
+                raise AssertionError("unmodelled load: " + " ".join(words))
+            value = []
+            for i in range(count):
+                where = (address + 4 * i) & MASK64
+                self.reads.append(where)
+                value.append(self.memory.read_dword(where))
+        elif op == "OpCompositeExtract" and ty == "%uint":
+            vector = self._value(args[0])
+            if not isinstance(vector, list):
+                raise AssertionError("OpCompositeExtract of a non-vector: " + " ".join(words))
+            value = vector[int(args[1])]
         else:
             raise AssertionError("unmodelled instruction: " + " ".join(words))
         self.ids[result] = value

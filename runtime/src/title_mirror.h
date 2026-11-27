@@ -178,6 +178,9 @@ public:
                 mark_fresh(home, frame);
             }
     }
+    // Whether the page at `va` lies in a filtered range: its home holds the filter's bytes, not the title's, so nothing
+    // may be copied back from it to the title's page.
+    bool filtered_at(std::uint64_t va) const { return filtered(va & ~(kPage - 1)); }
     // The home of the page at `va`, mapped (its host bytes): what a filter's caller writes one changed slot into
     // between fills. Null when the page is not mapped.
     std::uint8_t* home_bytes(std::uint64_t va) {
@@ -270,6 +273,11 @@ public:
         return true;
     }
     bool mirrored(std::uint64_t va) const { return pages_.count(va & ~(kPage - 1)) != 0; }
+    // The physical page's bytes the mirrored page at `va` shows (its frame; for ordinary memory the page itself).
+    std::uint8_t* frame_at(std::uint64_t va) const {
+        const auto page = pages_.find(va & ~(kPage - 1));
+        return page == pages_.end() ? nullptr : page->second;
+    }
     // The chunk over `va` and the offset of `va` in it (tests and diagnostics).
     bool chunk_at(std::uint64_t va, VkBuffer& buffer, VkDeviceSize& offset) const {
         const auto it = chunks_.find(va / kChunk);

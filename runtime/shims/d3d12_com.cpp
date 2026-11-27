@@ -2265,6 +2265,7 @@ public:
     // value, in the order the signals were made. Until then GetCompletedValue reads the GPU's progress, where D3D12
     // would already read `value`.
     HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override {
+        const leonida::submit_phases::TitleCall call(leonida::submit_phases::part_fences);  // "submit frame" line
         std::lock_guard lock(claim_mutex_);
         if (!claim_locked(value, false)) return S_OK;
         const UINT64 queued = queued_;
@@ -2410,7 +2411,9 @@ public:
 
     void STDMETHODCALLTYPE ExecuteCommandLists(UINT count, ID3D12CommandList* const* lists) override {
         constexpr auto method = "ID3D12CommandQueue::ExecuteCommandLists";
-        std::lock_guard lock(mutex_);
+        const leonida::submit_phases::TitleCall call(leonida::submit_phases::part_lists);  // "submit frame" line
+        std::unique_lock lock(mutex_, std::defer_lock);
+        leonida::submit_phases::lock_timed(lock);
         if (count > 0 && !lists) {
             note_once("ExecuteCommandLists: null command list array with non-zero count");
             last_result_ = leonida::ReplayResult::unsupported;
@@ -2595,6 +2598,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* fence, UINT64 value) override {
         constexpr auto method = "ID3D12CommandQueue::Signal";
+        const leonida::submit_phases::TitleCall call(leonida::submit_phases::part_fences);  // "submit frame" line
         Fence* f = Fence::from(fence);
         if (!f || f->context() != &context_ || f->attached_device() != attached_device())
             return d3d12_trace::result(method, E_INVALIDARG);
@@ -2605,6 +2609,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* fence, UINT64 value) override {
         constexpr auto method = "ID3D12CommandQueue::Wait";
+        const leonida::submit_phases::TitleCall call(leonida::submit_phases::part_fences);  // "submit frame" line
         Fence* f = Fence::from(fence);
         if (!f || f->context() != &context_ || f->attached_device() != attached_device())
             return d3d12_trace::result(method, E_INVALIDARG);

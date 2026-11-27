@@ -148,6 +148,13 @@ int test() {
     std::memcpy(nobody_words, title + kDescriptor, sizeof(nobody_words));
     EXPECT(base_of(nobody_words) == nobody);
 
+    // No write-back from the heap: a store the GPU makes into the heap's pages (through the mirror at the title's
+    // address) is never copied over the title's bytes, which are not the home's.
+    const std::uint32_t stored[8] = {0xdead0001u, 0xdead0002u, 0xdead0003u, 0xdead0004u, 5, 6, 7, 8};
+    EXPECT(rt::d3d12::page_mirror_gpu_write(device.p, std::uintptr_t(title) + 5 * kDescriptor, stored, sizeof(stored)));
+    EXPECT(rt::d3d12::page_mirror_write_back(device.p, std::uintptr_t(title), kPages * kPage64k) == 0);
+    for (unsigned i = 0; i < kDescriptor; ++i) EXPECT(title[5 * kDescriptor + i] == 0);
+
     // 3. The null slots after the heap.
     std::uint32_t tail[64]{};
     std::memset(tail, 0xff, sizeof(tail));

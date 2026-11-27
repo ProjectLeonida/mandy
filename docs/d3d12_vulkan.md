@@ -2198,12 +2198,16 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    that range's rest, unbound, which reads zero. Table pointers go there as before (`console_heap_ranges`). The
    mirror fills the pages' home through a filter (`TitleMirror::filter_range`, `filter_heap_page`): the title's bytes
    are only read, and the home, the mirror's own GPU memory, gets each slot that changed since it was last filtered,
-   or that a change of the address space touched: a V# whose base lies in the arena, in the mirror or in a buffer of
-   ours as the title wrote it (`reachable_as_written`), another V# resolved as before (an interim, until every title
-   allocation is in the mirror) or with no base and no records, a T# bound as before (its bindless index in the entry
-   comes later), other words null. The changes are applied to the homes at the mirror's refresh, before the pages
-   written since are filled. A heap the mirror does not hold (a device without the mirror, memory outside its range)
-   is copied as before. `d3d12_heap_in_place_test` checks that the GPU reads the filtered slots below 4 GiB while the
+   or that a change of the address space touched: a V# whose base lies in the arena, in the mirror (named to it as
+   any reader names title memory) or in a buffer of ours as the title wrote it (`reachable_as_written`), other words
+   null. The filter runs inside the mirror's fills, under its lock, so it takes no other lock of ours: a V# the mirror
+   does not hold (an interim, until every title allocation is in the mirror) reads null until the heap's refresh
+   resolves it as a copied slot was, and a T# is bound there too (its bindless index in the entry comes later), each
+   result written into the home unless the title rewrote the slot meanwhile (`finish_in_place`). Lock order:
+   `console_heap_mutex`, then the mirror's, then the change list's. The changes are applied to the homes at the
+   mirror's refresh, before the pages written since are filled. No GPU write is ever copied back from these pages
+   (`TitleMirror::filtered_at`). A heap the mirror does not hold (a device without the mirror, memory outside its
+   range) is copied as before. `d3d12_heap_in_place_test` checks that the GPU reads the filtered slots below 4 GiB while the
    title's bytes never change, that a rewrite reaches the GPU at the next refresh, and that the null slots read zero;
    `title_mirror_hooks_test` checks the two hooks without a GPU and `vk_heap_alias_test` the second binding on a device.
    Console resource heap copies and shader-visible CBV/SRV/UAV heaps with at least 65,536 slots request

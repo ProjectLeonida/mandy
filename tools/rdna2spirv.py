@@ -83,6 +83,12 @@ W64G_COUNTS = Counter()   # tiers of the wave64 VS/PS/GS translated so far, for 
 # (1,0,0), (0,1,0), (0,0,1) at the triangle's three vertices; interpolating those gives the perspective-correct
 # barycentrics, so .y/.z are AMD's i/j as with BaryCoordKHR.
 BARY_FALLBACK = False
+# --integer-dot-fallback: the 4x8-bit dot products (v_dot4_i32_i8, v_dot4c_i32_i8, v_dot4_u32_u8, v_dot4c_u32_u8) are
+# four extracts, multiplies and adds, as before, instead of SPV_KHR_integer_dot_product's OpSDot / OpUDot and their
+# saturating-accumulate forms (Gen.packed_dot4). For devices without shaderIntegerDotProduct (a Vulkan 1.2 device
+# without VK_KHR_shader_integer_dot_product); Vulkan 1.3 requires the feature. docs/design.md, "Signed-byte dot
+# products".
+INTEGER_DOT_FALLBACK = False
 SHADER_CLOCK = False
 FMA_KHR = False          # --fma khr: fused multiply-adds are OpFmaKHR (SPV_KHR_fma, VK_KHR_shader_fma), not GLSL Fma
 FMA_EXACT = False        # --fma exact: fused multiply-adds are emulated from single-rounded f32 ops (Gen.fma_exact)
@@ -479,6 +485,8 @@ class Gen:
         self.round_mode = False     # the program writes MODE.FP_ROUND[3:2] (f16/f64 rounding): kept in %mode_r16
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
+        self.uses_psb_vec = False      # scalar_load's wide loads: uvec2/uvec4 PhysicalStorageBuffer pointers
+        self.uses_int_dot = False      # packed_dot4 emitted OpSDot/OpUDot(AccSat): SPV_KHR_integer_dot_product
         self.uses_fma_khr = False      # an OpFmaKHR was emitted: capability FMAKHR + extension SPV_KHR_fma
         self.uses_fma_khr32 = False    # ... on f32 (feature shaderFmaFloat32)
         self.uses_fma_khr64 = False    # ... on f64 (feature shaderFmaFloat64)
@@ -8256,6 +8264,11 @@ class Gen:
             width = 16 if ("_dot2_" in op or "_dot2c_" in op) else (8 if "_dot4" in op else 4)
             signed = op.endswith(("i16", "i4"))
             clamp = "clamp" in mods
+            if width == 8:
+                packed = self.packed_dot4(x, y, acc, signed=False, clamp=clamp)
+                if packed is not None:
+                    self.dst(a[0], packed)
+                    return
             ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
             prods = []
             for off in range(0, 32, width):
@@ -12844,6 +12857,11 @@ class Gen:
                 raise Unsupported(op + " op_sel")
             x, y = self.src_u(a[1]), self.src_u(a[2])
             acc = self.src_u(a[3]) if is_vop3p else self.src_u(a[0])
+            packed = self.packed_dot4(self.dot4_halves(x, sel[0], selhi[0]), self.dot4_halves(y, sel[1], selhi[1]),
+                                      acc, signed=True, clamp=has_clamp)
+            if packed is not None:
+                self.dst(a[0], packed)
+                return
             x_offs = (16 * sel[0], 16 * sel[0] + 8, 16 * selhi[0], 16 * selhi[0] + 8)
             y_offs = (16 * sel[1], 16 * sel[1] + 8, 16 * selhi[1], 16 * selhi[1] + 8)
             dot = None
@@ -12896,6 +12914,55 @@ class Gen:
             self.export(ins)
         else:
             raise Unsupported(op)
+
+    def dot4_halves(self, x, lo_half, hi_half):
+        """The dword a 4x8-bit dot product reads under op_sel: bytes 0..1 from 16-bit half `lo_half` of `x` and bytes
+        2..3 from half `hi_half` (0 low, 1 high; the default is 0 and 1, `x` itself)."""
+        if (lo_half, hi_half) == (0, 1):
+            return x
+        lo, hi, r = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{lo} = OpBitFieldUExtract %uint {x} {self.cu(16 * lo_half)} {self.cu(16)}")
+        self.emit(f"{hi} = OpBitFieldUExtract %uint {x} {self.cu(16 * hi_half)} {self.cu(16)}")
+        self.emit(f"{r} = OpBitFieldInsert %uint {lo} {hi} {self.cu(16)} {self.cu(16)}")
+        return r
+
+    def packed_dot4(self, x, y, acc, *, signed, clamp):
+        """acc + the dot product of the four bytes of x and y as one SPV_KHR_integer_dot_product instruction, or None
+        under --integer-dot-fallback (the caller expands it).
+
+        OpSDot / OpUDot give the low 32 bits of the exact sum of the four products of the sign- (zero-) extended
+        bytes (PackedVectorFormat4x8Bit), the sum v_dot4_i32_i8 / v_dot4_u32_u8 form; adding acc wraps at 32 bits as
+        the instructions do without clamp. With clamp the hardware saturates acc + the exact sum (signed 32-bit for
+        i8, unsigned for u8; docs/design.md, "Signed-byte dot products" and "Packed integer dot products"), which is
+        OpSDotAccSat / OpUDotAccSat: "the correct result ... computed with enough precision to avoid overflow",
+        saturated to the result type. The signed forms use %int operands, so the signedness is the type's too."""
+        if INTEGER_DOT_FALLBACK:
+            return None
+        self.uses_int_dot = True
+        fmt = "PackedVectorFormat4x8BitKHR"
+        if not signed:
+            r = self.tmp()
+            if clamp:
+                self.emit(f"{r} = OpUDotAccSatKHR %uint {x} {y} {acc} {fmt}")
+            else:
+                d = self.tmp()
+                self.emit(f"{d} = OpUDotKHR %uint {x} {y} {fmt}")
+                self.emit(f"{r} = OpIAdd %uint {acc} {d}")
+            return r
+        xi, yi = self.tmp(), self.tmp()
+        self.emit(f"{xi} = OpBitcast %int {x}")
+        self.emit(f"{yi} = OpBitcast %int {y}")
+        if clamp:
+            ai, s, r = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{ai} = OpBitcast %int {acc}")
+            self.emit(f"{s} = OpSDotAccSatKHR %int {xi} {yi} {ai} {fmt}")
+            self.emit(f"{r} = OpBitcast %uint {s}")
+            return r
+        d, du, r = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{d} = OpSDotKHR %int {xi} {yi} {fmt}")
+        self.emit(f"{du} = OpBitcast %uint {d}")
+        self.emit(f"{r} = OpIAdd %uint {acc} {du}")
+        return r
 
     def scalar_load(self, op, a, mods):
         """s_load_dwordxN sD, s[p:p+1], off   -> N dwords from a 64-bit pointer, no bound
@@ -13010,9 +13077,47 @@ class Gen:
         self.emit(f"{sh} = OpShiftLeftLogical %ulong {h64} %c64_32")
         self.emit(f"{addr} = OpBitwiseOr %ulong {sh} {l64}")
         self.emit(f"{full} = OpIAdd %ulong {addr} {o64}")
-        ptr = self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full, 'load', 4 * n)}")
+        ptr, host = self.tmp(), self.host_addr(full, 'load', 4 * n)
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
         self.uses_psb = True
+
+        def wide(count):
+            """Dwords 0..count-1 at the load's address as the fewest loads SPIR-V types allow: uvec4, then uvec2,
+            then one uint. Each is Aligned 4, the alignment SMEM has. One instruction's dwords are consecutive in
+            memory, so a driver can fetch them as one scalar or vector load instead of one per dword (RADV gave 6,048
+            global_load_b32, 5,935 v_readfirstlane and 5,448 64-bit compares for the 365 s_buffer_load_dwordx16
+            of an FSPX program loaded per dword).
+
+            The vectors are read through a Block whose member is NonWritable (%sl_blk2 / %sl_blk4): with it RADV
+            makes the 365 one s_load_b512 each; without it, one global_load_b128 and four v_readfirstlane per uvec4.
+            It says what SMEM is: the scalar cache is not coherent with the vector stores of the same wave, so the
+            title's code cannot rely on an SMEM load seeing its own earlier store to the same address (it would need
+            s_dcache_inv, which the translator does not model), and letting the driver order this load freely
+            against the module's stores keeps that rule rather than weakening it."""
+            got, k = [], 0
+            while k < count:
+                w = 4 if count - k >= 4 else 2 if count - k >= 2 else 1
+                if w == 1:
+                    q, v = self.tmp(), self.tmp()
+                    self.emit(f"{q} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(k)}")
+                    self.emit(f"{v} = OpLoad %uint {q} Aligned 4")
+                    got.append(v)
+                else:
+                    self.uses_psb_vec = True
+                    at = host
+                    if k:
+                        at = self.tmp()
+                        self.emit(f"{at} = OpIAdd %ulong {host} {self.cl(4 * k)}")
+                    b, q, v = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{b} = OpConvertUToPtr %_ptr_PSB_sl_blk{w} {at}")
+                    self.emit(f"{q} = OpAccessChain %_ptr_PSB_v{w}uint_sl {b} {self.cu(0)}")
+                    self.emit(f"{v} = OpLoad %v{w}uint_sl {q} Aligned 4")
+                    for j in range(w):
+                        e = self.tmp()
+                        self.emit(f"{e} = OpCompositeExtract %uint {v} {j}")
+                        got.append(e)
+                k += w
+            return got
         lim = None
         lim_val = None
         if sbuf:
@@ -13033,6 +13138,25 @@ class Gen:
                 self.emit(f"{raw} = OpIEqual %bool {stride} {self.cu(0)}")
                 self.emit(f"{lim} = OpSelect %ulong {raw} {nr64} {prod}")
         guarded = {}
+        slow_entry = None
+        if lim is not None and not (lim_val is not None and reg is None) and n > 1:
+            # Every dword in range (the last one is, so all are): one wide load, the common case. Otherwise the
+            # per-dword path below, which gives the out-of-range dwords 0 without reading them, as before.
+            last_end, all_ok = self.tmp(), self.tmp()
+            if reg is not None:
+                self.emit(f"{last_end} = OpIAdd %ulong {o64} {self.cl(4 * n)}")
+            else:
+                last_end = self.cl(imm + 4 * n)
+            self.emit(f"{all_ok} = OpUGreaterThanEqual %bool {lim} {last_end}")
+            lbl_fast, lbl_slow, lbl_join = self.tmp() + "_all", self.tmp() + "_part", self.tmp() + "_join"
+            self.emit(f"OpSelectionMerge {lbl_join} None")
+            self.emit(f"OpBranchConditional {all_ok} {lbl_fast} {lbl_slow}")
+            self.emit(f"{lbl_fast} = OpLabel")
+            fast = wide(n)
+            fast_exit = self.current_label_placeholder()
+            self.emit(f"OpBranch {lbl_join}")
+            self.emit(f"{lbl_slow} = OpLabel")
+            slow_entry = (fast, fast_exit, lbl_join)
         if lim is not None and not (lim_val is not None and reg is None):
             # A run-time bound: dword i is in range when off + 4*i + 4 <= limit, and out of range it is 0 with memory
             # not read. The ends grow with i, so "dword i in range" implies every dword before it is: one selection
@@ -13074,20 +13198,25 @@ class Gen:
                 v = self.tmp()
                 self.emit(f"{v} = OpPhi %uint {got_in[i]} {lbl_do} {self.cu(0)} {pre}")
                 guarded[i] = v
+            if slow_entry is not None:
+                fast, fast_exit, lbl_join = slow_entry
+                self.emit(f"OpBranch {lbl_join}")
+                self.emit(f"{lbl_join} = OpLabel")
+                for i in range(n):
+                    v = self.tmp()
+                    self.emit(f"{v} = OpPhi %uint {fast[i]} {fast_exit} {guarded[i]} {lbl_end}")
+                    guarded[i] = v
+        if guarded:
+            vals = [guarded[i] for i in range(n)]
+        elif lim is None:
+            vals = wide(n)
+        else:
+            # A bound known at translate time (lim_val, constant offset). The dwords in range are a prefix (their
+            # ends grow with i): one wide load for them, 0 for the rest.
+            count = sum(lim_val >= imm + 4 * i + 4 for i in range(n))
+            vals = wide(count) + [self.cu(0)] * (n - count)
         for i in range(n):
-            p, v = self.tmp(), self.tmp()
-            if i in guarded:
-                v = guarded[i]
-            elif lim is None:
-                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
-                self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
-            else:                   # a bound known at translate time (lim_val, constant offset): fold each dword
-                end_val = imm + 4 * i + 4
-                if lim_val >= end_val:
-                    self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
-                    self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
-                else:
-                    v = self.cu(0)
+            v = vals[i]
             if single_special:
                 if n == 2:          # vcc pair: low dword -> vcc_lo, high dword -> vcc_hi (data, not a lane mask)
                     self.emit(f"OpStore {'%vcc' if i == 0 else '%vcc_hi'} {v}")
@@ -16217,6 +16346,8 @@ def assemble(gen):
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformArithmetic") if c not in caps]
     if gen.uses_quad:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformQuad") if c not in caps]
+    if gen.uses_int_dot:
+        caps += ["DotProductKHR", "DotProductInput4x8BitPackedKHR"]   # shaderIntegerDotProduct
     if gen.uses_f64:
         caps.append("Float64")
     if gen.uses_fma_khr:
@@ -16258,6 +16389,8 @@ def assemble(gen):
         caps += ["SignedZeroInfNanPreserve", "DenormPreserve"]
     pops = gen.uses_pops and gen.stage == "ps"
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
+    if gen.uses_int_dot:
+        exts.append("SPV_KHR_integer_dot_product")
     if gen.uses_fma_khr:
         exts.append("SPV_KHR_fma")
     if gen.uses_clock:
@@ -16386,6 +16519,16 @@ def assemble(gen):
                   "%rt_uint = OpTypeRuntimeArray %uint", "%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint",
                   "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint"]
         dec.append("OpDecorate %rt_uint ArrayStride 4")
+        if gen.uses_psb_vec:            # dedupe_types merges these with any other uvec2 / uvec4
+            types += ["%v2uint_sl = OpTypeVector %uint 2", "%v4uint_sl = OpTypeVector %uint 4",
+                      "%_ptr_PSB_v2uint_sl = OpTypePointer PhysicalStorageBuffer %v2uint_sl",
+                      "%_ptr_PSB_v4uint_sl = OpTypePointer PhysicalStorageBuffer %v4uint_sl",
+                      "%sl_blk2 = OpTypeStruct %v2uint_sl", "%sl_blk4 = OpTypeStruct %v4uint_sl",
+                      "%_ptr_PSB_sl_blk2 = OpTypePointer PhysicalStorageBuffer %sl_blk2",
+                      "%_ptr_PSB_sl_blk4 = OpTypePointer PhysicalStorageBuffer %sl_blk4"]
+            for blk in ("%sl_blk2", "%sl_blk4"):
+                dec += [f"OpDecorate {blk} Block", f"OpMemberDecorate {blk} 0 Offset 0",
+                        f"OpMemberDecorate {blk} 0 NonWritable"]
         types += [f"{name} = OpConstant %ulong {v}" for v, name in sorted(gen.lconsts.items())]
     if tex:
         # Bindless set 0: images (binding 0), samplers (binding 1), descriptor hash table (binding 2).
@@ -17178,9 +17321,40 @@ def assemble(gen):
     else:
         tail = end_lock + "         OpReturn\n         OpFunctionEnd\n"
     insert_late_constants(gen, out, written)
-    return split_big_switch(no_contraction(dedupe_types(
+    return split_big_switch(no_contraction(scalar_loads_read_only(dedupe_types(
         "\n".join("         " + l if not l.startswith("%") or " = " not in l else l for l in out) +
-        "\n" + "\n".join(gen.body) + "\n" + tail)))
+        "\n" + "\n".join(gen.body) + "\n" + tail))))
+
+
+_PSB_POINTER_TYPE = re.compile(r"(?m)^\s*(%[\w.]+) = OpTypePointer PhysicalStorageBuffer ")
+_RESULT_OF_TYPE = re.compile(r"(?m)^\s*(%[\w.]+) = Op\w+ (%[\w.]+)")
+_MEMORY_WRITE = re.compile(r"(?m)^\s*(?:(?:%[\w.]+ = )?(OpStore|OpAtomic\w+|OpCopyMemory\w*)\b(.*)|.*\b(OpImageWrite|"
+                           r"OpImageTexelPointer)\b.*)$")
+
+
+def scalar_loads_read_only(text):
+    """Keep scalar_load's NonWritable wide loads (%sl_blk2 / %sl_blk4) only in a module that writes no memory.
+
+    NonWritable lets the driver read them as SMEM (RADV: one s_load_b512 for an s_buffer_load_dwordx16), but also
+    lets it order them freely against the module's own stores, and an s_load / s_buffer_load sees what the same
+    program stored before it (docs/design.md, Scalar/buffer memory; tools/valu_fuzz.py --family mem stores and then
+    loads it back, and RADV read the old words in 18 of 600 programs with the decoration). A module with no store,
+    atomic or image write to any memory can't reach that: nothing this dispatch runs writes what it reads."""
+    if "OpMemberDecorate %sl_blk" not in text:
+        return text
+    ptr_types = set(_PSB_POINTER_TYPE.findall(text))
+    pointers = {r for r, t in _RESULT_OF_TYPE.findall(text) if t in ptr_types}
+    for m in _MEMORY_WRITE.finditer(text):
+        if m.group(3):
+            break                                   # an image write or texel pointer: treat as a write
+        op, rest = m.group(1), m.group(2).split()
+        target = rest[0] if op in ("OpStore", "OpAtomicStore") or op.startswith("OpCopyMemory") else (
+            rest[1] if len(rest) > 1 else None)       # OpAtomicX %type %pointer ...
+        if target in pointers or op.startswith("OpCopyMemory"):
+            break
+    else:
+        return text
+    return re.sub(r"(?m)^\s*OpMemberDecorate %sl_blk[24] 0 NonWritable\n", "", text)
 
 
 # SPIR-V caps an instruction at 65,535 words. The dispatch loop's OpSwitch has one (literal, label) pair per block,
@@ -19652,7 +19826,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "MinLod": "shaderResourceMinLod", "Image1D": "shaderImage1D? (core)", "Sampled1D": "core",
              "ClipDistance": "shaderClipDistance", "CullDistance": "shaderCullDistance",
              "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex",
-             "DrawParameters": "shaderDrawParameters",
+             "DrawParameters": "shaderDrawParameters", "DotProductKHR": "shaderIntegerDotProduct",
              }     # FMAKHR: shaderFmaFloat32 / shaderFmaFloat64 (VK_KHR_shader_fma) by the width used, below
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          # How fused multiply-adds were emitted. --fma khr is already implied by the FMAKHR capability,
@@ -20103,6 +20277,9 @@ def main():
                     help="wave64 vertex, pixel and geometry shaders that are not exact on 32-wide subgroups (tier C of "
                          "tools/wave64_halves.py): warn = count them in the summary and mark them in the index, "
                          "error = refuse them (Unsupported), off = skip the analysis")
+    ap.add_argument("--integer-dot-fallback", action="store_true",
+                    help="4x8-bit dot products (v_dot4_*) as extracts, multiplies and adds instead of "
+                         "SPV_KHR_integer_dot_product, for devices without shaderIntegerDotProduct")
     ap.add_argument("--bary-fallback", action="store_true",
                     help="pixel shaders that read raw barycentrics take them from an ordinary interpolated input "
                          "(metadata: bary_fallback_input) instead of BaryCoordKHR, for devices without "
@@ -20179,6 +20356,7 @@ def main():
     DESCRIPTOR_TABLE = a.descriptor_table
     LOOP_LIMIT = a.loop_limit
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
+    global INTEGER_DOT_FALLBACK
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
     global PC_TAIL_UBO, ADDRESS_GUARD
     PC_TAIL_UBO = a.pc_tail_ubo
@@ -20193,6 +20371,7 @@ def main():
     WAVE64_EMULATE = a.wave64_emulate
     WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback
+    INTEGER_DOT_FALLBACK = a.integer_dot_fallback
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback

@@ -152,11 +152,15 @@ int filters() {
     // A range filtered after its page was mapped: refilled through the filter, fresh.
     mirror.map(kBase + kPage, &frames[kPage], nullptr, 4);
     EXPECT(mirror.home_bytes(kBase + kPage)[0] == 0x5A && f.filtered.back().fresh);  // in the range already
+    EXPECT(!mirror.filtered_at(kBase + 2 * kPage + 17));
     mirror.filter_range(kBase + 2 * kPage, kBase + 3 * kPage);
+    EXPECT(mirror.filtered_at(kBase + 2 * kPage + 17) && mirror.filtered_at(kBase + kPage) &&
+           !mirror.filtered_at(kBase + 3 * kPage));
     EXPECT(mirror.upload() == 1 && mirror.home_bytes(kBase + 2 * kPage)[0] == 0x5A && f.filtered.back().fresh &&
            f.filtered.back().va == kBase + 2 * kPage);
     // unfilter_range: copies again.
     mirror.unfilter_range(kBase);
+    EXPECT(!mirror.filtered_at(kBase + kPage) && mirror.filtered_at(kBase + 2 * kPage));
     EXPECT(mirror.upload() == 1 && mirror.home_bytes(kBase + kPage)[0] == 0xA5);
     // Never a byte of the title's written.
     frames[200] = 0xA5;

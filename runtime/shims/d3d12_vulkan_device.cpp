@@ -64,6 +64,7 @@
 #include "../src/title_mirror.h"
 #include "../src/title_mirror_space.h"
 #include "../src/title_mirror_tracking.h"
+#include "../src/title_mirror_hot_cold.h"
 #include "../src/guarded_copy.h"
 #include "../src/title_geometry_watch.h"
 #include "../src/title_texture_memory.h"
@@ -246,6 +247,24 @@ bool copy_guarded_host(std::uint8_t* to, const std::uint8_t* from, std::size_t b
     __try {
         if (streaming) copy_streaming(to, from, bytes);
         else leonida::guarded::copy(to, from, bytes);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Whether two byte ranges differ, one of them title memory that may go away meanwhile: false when a page faults. No
+// C++ objects here: it is a __try frame, and the compare is a loop of its own (a fault inside the CRT's memcmp never
+// reaches the __except under Wine, src/guarded_copy.h).
+__declspec(noinline) LEONIDA_GUARDED_NO_BUILTIN bool bytes_differ(const std::uint8_t* a, const std::uint8_t* b,
+                                                                  std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i)
+        if (a[i] != b[i]) return true;
+    return false;
+}
+bool differ_guarded(const std::uint8_t* a, const std::uint8_t* b, std::size_t n, bool& differs) {
+    __try {
+        differs = bytes_differ(a, b, n);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -2652,6 +2671,8 @@ UnboundTsharpTracker& unbound_tsharp_tracker() {
 
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
 class Resource;
+leonida::VramBudget read_vram_budget(const VulkanDeviceInfo& info);  // VK_EXT_memory_budget (defined below)
+
 struct DeviceState {
     std::mutex mapped_texture_mutex;
     std::set<Resource*> mapped_textures;
@@ -3017,7 +3038,9 @@ struct DeviceState {
         if (copy_aliased) shadow_alias_time = start;
         std::uint64_t copied = 0;
         for (const ShadowPagesPtr& s : shadows) {
-            copied += s->refresh(copy_aliased);
+            const std::uint64_t pages = s->refresh(copy_aliased);
+            if (pages) leonida::submit_phases::note_change(leonida::submit_phases::change_pages);  // not a floor one
+            copied += pages;
             shadow_queries += s->refresh_queries();
             shadow_protects += s->refresh_protects();
             shadow_walks += s->refresh_walked_all();
@@ -3295,6 +3318,13 @@ struct DeviceState {
             if (why) *why = reason;
             return std::uint64_t(0);
         };
+        // The page mirror holds the title's bytes at heap_base + the address the GPU names (a GPU-only page reads its
+        // own physical page there, not its CPU view's), so no copy is made.
+        if (span && guest && page_mirror.mirror && leonida::title_va_aliases().shader_va(guest, span) == guest &&
+            page_mirror_resolve(guest, span)) {
+            if (!read_only) note_title_write(guest, span);
+            return guest;
+        }
         if (!geometry.cap() || !span || !guest || !watch_shadow_writes()) return no(NoCopy::no_geometry);
         const auto cpu = leonida::title_gpu_views::to_cpu(guest, span);
         auto& aliases = leonida::title_va_aliases();
@@ -3489,12 +3519,17 @@ struct DeviceState {
         if (finished.empty()) return;
         std::uint64_t written = 0, ranges = 0;
         for (const auto& [begin, end] : finished)
+        {
             for (const ShadowPagesPtr& s : shadows)
                 if (end > s->first() && begin < s->last()) {
                     const std::uint64_t bytes = s->write_back(begin, end);
                     written += bytes;
                     ranges += bytes != 0;
                 }
+            const std::uint64_t mirrored = page_mirror_write_back(begin, end);  // the page mirror's homes
+            written += mirrored;
+            ranges += mirrored != 0;
+        }
         title_write_back_total += written;
         if (!written) return;
         if (++title_write_back_calls <= 4 || !(title_write_back_calls & (title_write_back_calls - 1)))
@@ -3598,6 +3633,8 @@ struct DeviceState {
     // called with it held.
     bool device_reachable(std::uint64_t va, bool buffers_checked = false) {
         if (va < arena.size) return true;
+        // Title memory the page mirror holds: heap_base + va is its chunk.
+        if (page_mirror.mirror && page_mirror_resolve(va, 1)) return true;
         const bool wrapped = va < (1ull << 48) && (va >> 47);
         const std::uint64_t candidates[2] = {va, wrapped ? va | ~((1ull << 48) - 1) : va};
         auto& aliases = leonida::title_va_aliases();
@@ -3657,6 +3694,12 @@ struct DeviceState {
         std::lock_guard lock(title_window_mutex);
         if (const std::uint64_t made = aliases.shader_va(va); made != va) {  // another thread made it meanwhile
             out = made;
+            return true;
+        }
+        // The page mirror: the address itself (heap_base + va), no window, extent or copy.
+        if (page_mirror_resolve(va, want)) {
+            note_title_write(va, want);
+            out = va;
             return true;
         }
         // A stream pool's address: one mapping for its readable run, shared by both of its views.
@@ -3727,7 +3770,13 @@ struct DeviceState {
         const std::uint64_t span = std::max<std::uint64_t>(bytes, 1);
         auto& aliases = leonida::title_va_aliases();
         std::uint64_t lo = 0, hi = 0;
-        if (!geometry.cap() || !watch_shadow_writes() || !aliases.title_memory(va, lo, hi) || span > hi - va) return 0;
+        if (!aliases.title_memory(va, lo, hi) || span > hi - va) return 0;
+        // In the page mirror the structure is the title's own pages (their homes keep what the GPU writes).
+        if (page_mirror_resolve(va, span)) {
+            note_title_write(va, span);
+            return va;
+        }
+        if (!geometry.cap() || !watch_shadow_writes()) return 0;
         const auto cpu = leonida::title_gpu_views::to_host_view(static_cast<std::uintptr_t>(va),
                                                                 static_cast<std::uintptr_t>(span));
         if (context->knows_buffer_va(cpu, span)) return 0;
@@ -4273,6 +4322,14 @@ struct DeviceState {
             aliases.note_translation(kind);
             return path(0), to;
         }
+        // Title memory the page mirror holds: the V# names it as the title wrote it (heap_base + base is the mirror).
+        if (page_mirror.mirror) {
+            uint64_t lo{}, hi{};
+            if (aliases.title_memory(base, lo, hi) && bytes <= hi - base && page_mirror_resolve(base, bytes)) {
+                note_title_write(base, bytes);  // a V# has no read/write bit: its range may be written
+                return path(6), base;
+            }
+        }
         // An already rewritten descriptor carries only the low 48 bits.
         uint64_t offset = base;
         if (signed_vsharp_offsets() && base <= mask && (base & (1ull << 47))) offset |= ~mask;
@@ -4294,7 +4351,7 @@ struct DeviceState {
         return path(5), 0;
     }
     // vsharp_address's outcomes (diagnostics): alias hit, alias refused, arena VA, geometry copy, window, none.
-    static constexpr unsigned kVsharpPathCount = 6;
+    static constexpr unsigned kVsharpPathCount = 7;
     std::array<std::atomic<std::uint64_t>, kVsharpPathCount> vsharp_paths{};
 
     // LEONIDA_UNBACKED_VSHARP=1 (diagnostic): the buffer V#s fix_vsharp writes empty because nothing backs their base.
@@ -4379,13 +4436,6 @@ struct DeviceState {
         leonida::gfx10::Buffer desc{};
         const bool copy_geometry = leonida::gfx10::decode(words, desc) &&
             (path != VsharpPath::scratch || span <= kTitleWindowMax || (desc.format && leonida::gfx10::encode(desc) == words));
-        // A heap read in place: a V# whose bytes lie in the arena, the page mirror or a buffer of ours is read as the
-        // title wrote it (heap_base + its base holds those bytes, or zero where nothing is bound), with no record.
-        if (heap && heap->in_place && reachable_as_written(base, span)) {
-            if (record) *record = {};
-            ++heap->vsharps_as_written;
-            return VsharpResult::unchanged;
-        }
         if (heap && answers && record && answered_by_record(*heap, base, span, copy_geometry, *record)) {
             if (record->state == leonida::ConsoleHeapSlotRecords::resolved) {
                 const uint64_t to = record->target - arena.address;  // mod 2^64, as it was recorded
@@ -4520,13 +4570,29 @@ struct DeviceState {
         std::vector<Change> taken;
         // Which mirrored pages the host wrote (src/title_mirror_tracking.h): a policy behind a small interface, the
         // plainest correct one (a guard on every page) until a measured one replaces it.
-        std::unique_ptr<leonida::TitleMirrorTracking> tracking;
+        std::unique_ptr<leonida::HotColdTracking> tracking;
         std::vector<std::uint64_t> written;
         std::unordered_set<std::uintptr_t> fed_now;  // pages a change of this refresh mapped (filled already)
+        // Ordinary title memory (not physical pages) in the mirror's range: base -> end of each such reservation, the
+        // runs of it whose pages are mirrored (merged: begin -> end), and those pages. Mirrored as readers name it
+        // (page_mirror_resolve): each page its own home, filled from the page itself. A release or decommit there
+        // (geometry_writes::note_released) unmaps them.
+        std::map<std::uint64_t, std::uint64_t> plain, ensured;
+        std::set<std::uint64_t> identity;
+        leonida::geometry_writes::ReleaseQueue released;
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> released_ranges;
         // Since the last log line.
         std::uint64_t refreshes = 0, fed = 0, dirty = 0, uploads = 0, batches = 0, binds = 0, arm_failures = 0;
+        std::uint64_t resolved = 0, resolve_refused = 0, identity_mapped = 0, identity_released = 0, clipped = 0;
+        std::uint64_t written_back = 0, buffers = 0;
+        std::uint64_t units_local = 0, units_host = 0;  // home units by memory, all so far
+        bool last_local = true;
+        std::uint64_t presents = 0;  // present serial at the last log line
+        std::uint64_t faults_seen = 0, hot_seen = 0, cold_seen = 0;  // the tracking's counters at the last log line
         double ms = 0;
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+        // The console heaps read in place (add_heap_in_place): their filter state is under this mutex too.
+        std::vector<ConsoleHeap*> in_place;
     } page_mirror;
 
     static void page_mirror_feed(void* context, std::uintptr_t page, std::uint8_t* frame, const std::shared_ptr<void>& keep) {
@@ -4591,14 +4657,46 @@ struct DeviceState {
             page_mirror.chunks.push_back(out);
             return true;
         };
+        // Where a unit of homes goes, decided per unit as it is made: device-local memory while the device's budget
+        // (VK_EXT_memory_budget) keeps room for the title's textures and render targets after it (kHomeHeadroom, or an
+        // eighth of the budget if more), host memory otherwise; the GPU then reads those homes over the bus. A
+        // device without the budget extension, or with every heap device-local (an integrated GPU), keeps device-local.
         hooks.make_unit = [this](VkDeviceMemory& out, std::uint8_t*& host) {
             VkMemoryRequirements requirements{};
             requirements.size = leonida::TitleMirror::kUnitBytes;
             requirements.alignment = leonida::TitleMirror::kPage;
             requirements.memoryTypeBits = sparse_buffer_memory_types;
-            leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::geometry);
+            std::uint32_t host_types = 0;  // the sparse buffers' memory types outside device-local heaps
+            for (std::uint32_t t = 0; t < memory.memoryTypeCount; ++t)
+                if ((sparse_buffer_memory_types >> t & 1) &&
+                    !(memory.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+                    host_types |= 1u << t;
+            bool local = true;
+            if (host_types) {
+                const leonida::VramBudget budget = read_vram_budget(info);
+                if (budget.available) {
+                    constexpr std::uint64_t kHomeHeadroom = std::uint64_t(1536) << 20;
+                    const std::uint64_t headroom = std::max(kHomeHeadroom, budget.local_budget / 8);
+                    local = budget.local_usage + leonida::TitleMirror::kUnitBytes + headroom <= budget.local_budget;
+                }
+            }
+            if (!local) requirements.memoryTypeBits = host_types;
+            leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::mirror);
             out = allocate(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                           local ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+            if (out) {
+                ++(local ? page_mirror.units_local : page_mirror.units_host);
+                if (local != page_mirror.last_local) {
+                    page_mirror.last_local = local;
+                    std::fprintf(stderr, "[rt] d3d12: page mirror: homes go to %s from now on (%llu units in device-local "
+                                         "memory, %llu in host memory so far)\n",
+                                 local ? "device-local memory again: the budget has room"
+                                       : "host memory (the GPU reads them over the bus): device-local memory is near "
+                                         "its budget",
+                                 static_cast<unsigned long long>(page_mirror.units_local),
+                                 static_cast<unsigned long long>(page_mirror.units_host));
+                }
+            }
             void* mapped = nullptr;
             if (!out || context->vk.vkMapMemory(info.device, out, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
                 if (out) context->vk.vkFreeMemory(info.device, out, nullptr);
@@ -4633,7 +4731,12 @@ struct DeviceState {
             return filter_heap_page(va, to, from, bytes, fresh);
         };
         page_mirror.mirror = std::make_unique<leonida::TitleMirror>(std::move(hooks));
-        page_mirror.tracking = std::make_unique<leonida::GuardTracking>();
+        page_mirror.tracking = std::make_unique<leonida::HotColdTracking>();
+        leonida::geometry_writes::subscribe(page_mirror.released);
+        // A vertex, index, copy or indirect-argument address no buffer of ours holds is looked up in the mirror.
+        context->set_mirror_buffer([this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
+            return page_mirror_buffer(va, size, buffer, offset);
+        });
         leonida::title_frames::attach_fn.load(std::memory_order_acquire)(this, &page_mirror_feed);
         std::fprintf(stderr, "[rt] d3d12: page mirror on: the title's reservations in [0x%llx, 0x%llx) at heap_base + "
                              "their address (0x%llx up), bound to one home per physical page\n",
@@ -4646,18 +4749,10 @@ struct DeviceState {
     // page of [va, va + bytes) lies in a chunk of the mirror (a page with nothing bound reads zero there), and the
     // device address that holds the title address `va`. Every submission of command lists waits for the mirror's last
     // bind (VulkanContext::note_mirror_bind), so a reader recorded after refresh_page_mirror sees what it bound.
-    // The reservations xmem placed since: chunks of the mirror over them. page_mirror.mutex held.
-    void cover_new_reservations() {
-        auto& m = page_mirror;
-        if (const std::uint64_t g = leonida::title_mirror_space::generation(); g != m.space_generation) {
-            m.space_generation = g;
-            leonida::title_mirror_space::for_each_taken([&](std::uint64_t base, std::uint64_t end) { m.mirror->cover(base, end); });
-        }
-    }
     bool page_mirror_covers(std::uint64_t va, std::uint64_t bytes) {
         if (!page_mirror.mirror || !bytes || va + bytes < va) return false;
         std::lock_guard lock(page_mirror.mutex);
-        cover_new_reservations();  // a reservation made just now (a heap in it, say) is covered at once
+        sync_mirror_space_locked();  // a reservation made just now (a heap in it, say) is covered at once
         for (std::uint64_t c = va & ~(leonida::TitleMirror::kChunk - 1); c < va + bytes; c += leonida::TitleMirror::kChunk)
             if (!page_mirror.mirror->covers(c)) return false;
         return true;
@@ -4665,28 +4760,180 @@ struct DeviceState {
     std::uint64_t page_mirror_address(std::uint64_t va) const { return arena.address + va; }
 
     // Whether a V# naming [base, base + span) can be read as the title wrote it, by a heap read in place: heap_base +
-    // its base lies in the sparse arena (where nothing is bound reads zero), in chunks of the page mirror (the same),
-    // or in a buffer of ours (one below the arena). page_mirror.mutex held: only the in-place filter asks.
-    bool reachable_as_written(std::uint64_t base, std::uint64_t span) {
+    // its base lies in the sparse arena (where nothing is bound reads zero), in title memory the mirror holds (named
+    // to it as vsharp_address's mirror path does, page_mirror_resolve_locked: ordinary memory is mirrored then;
+    // `mirrored` says so, for the write-back of what shaders store there), or in a buffer of ours (one below the
+    // arena). page_mirror.mutex held: only the in-place filter asks.
+    bool reachable_as_written(std::uint64_t base, std::uint64_t span, bool& mirrored) {
         constexpr std::uint64_t mask = (1ull << 48) - 1;
+        mirrored = false;
         if (!span) span = 1;
         std::uint64_t offset = base;
         if (signed_vsharp_offsets() && base <= mask && (base & (1ull << 47))) offset |= ~mask;
         if (offset < arena.size && span <= arena.size - offset) return true;
-        if (page_mirror.mirror && base <= mask && base + span > base) {
-            bool all = true;
-            for (std::uint64_t c = base & ~(leonida::TitleMirror::kChunk - 1); all && c < base + span;
-                 c += leonida::TitleMirror::kChunk)
-                all = page_mirror.mirror->covers(c);
-            if (all) return true;
-        }
+        if (page_mirror.mirror && offset == base && page_mirror_resolve_locked(base, span, true)) return mirrored = true;
         std::lock_guard lock(backing_mutex);
         return gpu_backings.covers(arena.address + offset, span);
+    }
+
+    // Title memory [va, va + bytes) as a reader names it (a V#, a root view, a vertex or index view, a stream-pool
+    // range): true when the mirror holds all of it, and then the shader VA of the range is `va` itself (heap_base +
+    // va). Physical pages are in the mirror as xmem maps them; ordinary memory is mirrored here, page by page, the first
+    // time a reader names it (watched first, then filled; bound at this submission's flush). False (the caller keeps
+    // its old backing) when the mirror is off, a page lies outside every chunk, or more than kMirrorNameMax of
+    // ordinary memory not mirrored yet is named at once (a V# with a wild size: counted).
+    static constexpr std::uint64_t kMirrorNameMax = std::uint64_t(256) << 20;
+    bool page_mirror_resolve(std::uint64_t va, std::uint64_t bytes) {
+        if (!page_mirror.mirror) return false;
+        std::lock_guard lock(page_mirror.mutex);
+        return page_mirror_resolve_locked(va, bytes, true);
+    }
+    // The reservations xmem placed since the last look get chunks, and the ordinary ones are known as such
+    // (page_mirror.mutex held).
+    void sync_mirror_space_locked() {
+        auto& m = page_mirror;
+        const std::uint64_t g = leonida::title_mirror_space::generation();
+        if (g == m.space_generation) return;
+        m.space_generation = g;
+        m.plain.clear();
+        leonida::title_mirror_space::for_each_taken([&](std::uint64_t base, std::uint64_t end, bool plain) {
+            m.mirror->cover(base, end);
+            if (plain) m.plain[base] = end;
+        });
+    }
+    bool page_mirror_resolve_locked(std::uint64_t va, std::uint64_t bytes, bool make) {
+        auto& m = page_mirror;
+        if (!bytes || va + bytes < va) return false;
+        sync_mirror_space_locked();
+        constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
+        const std::uint64_t end = va + bytes;
+        for (std::uint64_t c = va & ~(leonida::TitleMirror::kChunk - 1); c < end; c += leonida::TitleMirror::kChunk)
+            if (!m.mirror->covers(c)) return false;
+        auto it = m.plain.upper_bound(va);
+        if (it != m.plain.begin() && std::prev(it)->second > va) --it;
+        for (; it != m.plain.end() && it->first < end; ++it) {
+            const std::uint64_t from = std::max(it->first, va) & ~(kPage - 1);
+            const std::uint64_t to = (std::min(it->second, end) + kPage - 1) & ~(kPage - 1);
+            if (ensured_covers(from, to)) continue;
+            if (!make) return false;
+            if (to - from > kMirrorNameMax) {
+                ++m.resolve_refused;
+                return false;
+            }
+            const std::uint64_t ticket = context->submitted_retire_ticket() + 1;
+            for (std::uint64_t page = from; page < to; page += kPage) {
+                if (m.mirror->mirrored(page)) continue;
+                m.tracking->watch(page);  // before the fill: a write after it is in the next collect
+                m.mirror->map(page, reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(page)), nullptr, ticket);
+                m.identity.insert(page);
+                ++m.identity_mapped;
+            }
+            ensure_run(from, to);
+        }
+        ++m.resolved;
+        return true;
+    }
+    // The merged runs of mirrored ordinary memory (page_mirror.mutex held).
+    bool ensured_covers(std::uint64_t from, std::uint64_t to) const {
+        const auto& e = page_mirror.ensured;
+        auto it = e.upper_bound(from);
+        if (it == e.begin()) return false;
+        --it;
+        return it->first <= from && it->second >= to;
+    }
+    void ensure_run(std::uint64_t from, std::uint64_t to) {
+        auto& e = page_mirror.ensured;
+        auto it = e.upper_bound(from);
+        if (it != e.begin() && std::prev(it)->second >= from) --it;
+        while (it != e.end() && it->first <= to) {
+            from = std::min(from, it->first);
+            to = std::max(to, it->second);
+            it = e.erase(it);
+        }
+        e[from] = to;
+    }
+    // A slot-133 buffer over mirrored title memory (Resource::create_mirror_buffer): the chunk and offset that hold
+    // all of [va, va + bytes), naming it to the mirror first. False when the mirror does not hold all of it or it
+    // spans two chunks (one buffer binding cannot): the buffer then gets its old backing.
+    bool page_mirror_chunk(std::uint64_t va, std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
+        if (!page_mirror.mirror || !bytes) return false;
+        std::lock_guard lock(page_mirror.mutex);
+        if (!page_mirror_resolve_locked(va, bytes, true) || !page_mirror.mirror->chunk_at(va, buffer, offset) ||
+            bytes > leonida::TitleMirror::kChunk - offset)
+            return false;
+        ++page_mirror.buffers;
+        return true;
+    }
+
+    // VulkanContext's mirror lookup (set_mirror_buffer): the chunk and offset that hold [va, va + size), when the mirror
+    // holds all of it already (named before: nothing is mirrored during a replay, whose binds would land after it). A
+    // range that runs past its chunk is cut at the chunk's end (counted): a buffer binding cannot span two chunks.
+    bool page_mirror_buffer(std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
+        if (!page_mirror.mirror || !size) return false;
+        std::lock_guard lock(page_mirror.mutex);
+        if (!page_mirror_resolve_locked(va, size, false) || !page_mirror.mirror->chunk_at(va, buffer, offset)) return false;
+        const std::uint64_t room = leonida::TitleMirror::kChunk - offset;
+        if (size > room) {
+            size = room;
+            ++page_mirror.clipped;
+        }
+        return true;
+    }
+    // What the GPU wrote into the homes of mirrored pages of [begin, end) goes back to the title's pages, as
+    // ShadowPages::write_back does for a shadow: after the submissions that could write them have retired
+    // (write_back_titles), only the 256-byte pieces whose home differs from the title's page, and only on a page nothing
+    // wrote since it was last watched (a page written on both sides keeps the title's bytes, which are uploaded over
+    // the home before the next submission). Written through kernel_writes, which opens and pins the page and every
+    // other address of its physical page, so the readers over them take the bytes. Returns the bytes written.
+    std::uint64_t page_mirror_write_back(std::uint64_t begin, std::uint64_t end) {
+        auto& m = page_mirror;
+        if (!m.mirror || begin >= end) return 0;
+        constexpr std::uint64_t kPage = leonida::TitleMirror::kPage, kPiece = 256;
+        std::lock_guard lock(m.mutex);
+        std::uint64_t written = 0;
+        for (std::uint64_t page = begin & ~(kPage - 1); page < end; page += kPage) {
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            std::uint8_t* home = nullptr;
+            const std::uint8_t* frame = m.mirror->frame_at(page);
+            if (!frame || !m.mirror->home_at(page, memory, offset, &home) || !m.tracking->unwritten(page)) continue;
+            // A console heap read in place: its home holds the filtered slots, never to be copied over the title's.
+            if (m.mirror->filtered_at(page)) continue;
+            const std::uint64_t from = std::max(begin, page), to = std::min(end, page + kPage);
+            for (std::uint64_t at = from & ~(kPiece - 1); at < to; at += kPiece) {
+                const std::uint64_t a = std::max(at, from), b = std::min(at + kPiece, to);
+                const std::uint8_t* gpu = home + (a - page);
+                const std::uint8_t* title = frame + (a - page);
+                bool differs = false;
+                // A title page gone since (decommitted, unmapped) has nothing to write back into.
+                if (!differ_guarded(gpu, title, std::size_t(b - a), differs) || !differs) continue;
+                if (leonida::kernel_writes::write(reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)), gpu, b - a))
+                    written += b - a;
+            }
+        }
+        m.written_back += written;
+        return written;
+    }
+
+    // Last in the before-execute hook, once every reader of this submission has named what it reads: the binds noted
+    // since the last batch go in one, and every queue's next submission waits for it (the ordering rule).
+    void flush_page_mirror() {
+        auto& m = page_mirror;
+        if (!m.mirror) return;
+        std::lock_guard lock(m.mutex);
+        if (m.mirror->flush(m.value + 1)) {
+            ++m.value;
+            ++m.batches;
+            m.binds += m.mirror->last_batch();
+            context->note_mirror_bind(m.timeline, m.value);
+        }
     }
 
     void destroy_page_mirror() {
         if (!page_mirror.mirror) return;
         if (const auto attach = leonida::title_frames::attach_fn.load(std::memory_order_acquire)) attach(this, nullptr);
+        context->set_mirror_buffer({});
+        leonida::geometry_writes::unsubscribe(page_mirror.released);
         std::lock_guard lock(page_mirror.mutex);
         page_mirror.tracking.reset();
         page_mirror.mirror.reset();
@@ -4705,12 +4952,7 @@ struct DeviceState {
         if (!m.mirror) return;
         const auto start = std::chrono::steady_clock::now();
         std::lock_guard lock(m.mutex);
-        // A console heap read in place is filtered as its pages are filled (filter_heap_page): its state is under
-        // console_heap_mutex, taken after the mirror's (never the other way: nothing under console_heap_mutex takes
-        // page_mirror.mutex).
-        std::unique_lock heaps(console_heap_mutex, std::defer_lock);
-        if (in_place_heaps.load(std::memory_order_acquire)) heaps.lock();
-        cover_new_reservations();
+        sync_mirror_space_locked();
         m.taken.clear();
         AcquireSRWLockExclusive(&m.feed_lock);
         for (auto& change : m.feed) m.taken.push_back(std::move(change));
@@ -4727,37 +4969,46 @@ struct DeviceState {
             m.mirror->map(change.page, change.frame, std::move(change.keep), ticket);
         }
         m.taken.clear();
+        // Ordinary memory released or decommitted: its mirrored pages leave (named again, they are mirrored again).
+        leonida::geometry_writes::take_released(m.released, m.released_ranges);
+        for (const auto& [from, to] : m.released_ranges) {
+            for (auto page = m.identity.lower_bound(from & ~(leonida::TitleMirror::kPage - 1));
+                 page != m.identity.end() && *page < to;) {
+                m.tracking->unwatch(*page);
+                m.mirror->map(*page, nullptr, nullptr, ticket);
+                ++m.identity_released;
+                page = m.identity.erase(page);
+            }
+            for (auto run = m.ensured.begin(); run != m.ensured.end();)
+                run = run->first < to && from < run->second ? m.ensured.erase(run) : std::next(run);
+        }
         m.tracking->collect(m.written);  // re-watched before the copies below
         for (const std::uint64_t page : m.written)
             if (!m.fed_now.count(std::uintptr_t(page)) && m.mirror->dirty(page)) ++m.dirty;
         m.arm_failures += m.tracking->take_refused();
         // The changes noted since (a buffer released, a texture come): the slots of heaps read in place they touch are
         // filtered again into their homes now, before the pages written since are.
-        if (heaps.owns_lock())
-            for (const auto& heap : console_heaps)
-                if (heap->in_place) {
-                    apply_slot_changes(*heap, heap->pending_changes);
-                    heap->pending_changes.clear();
-                    sync_slot_changes(*heap);
-                }
+        for (ConsoleHeap* heap : m.in_place) apply_in_place_changes(*heap);
         m.uploads += m.mirror->upload();
-        if (m.mirror->flush(m.value + 1)) {
-            ++m.value;
-            ++m.batches;
-            m.binds += m.mirror->last_batch();
-            context->note_mirror_bind(m.timeline, m.value);
-        }
         m.mirror->retire(context->completed_retire_ticket());
         ++m.refreshes;
         const auto now = std::chrono::steady_clock::now();
         m.ms += std::chrono::duration<double, std::milli>(now - start).count();
         if (now - m.since >= std::chrono::seconds(10)) {
             const auto c = m.mirror->counters();
+            const auto policy = m.tracking->stats();
+            const std::uint64_t presents =
+                leonida::submit_phases::totals().present_serial.load(std::memory_order_relaxed);
+            const std::uint64_t frames = presents - m.presents;
             std::fprintf(stderr,
                          "[rt] d3d12: page mirror: %llu pages mirrored, %llu homes in %llu units (%llu MiB), %llu chunks "
                          "(%llu not placed); in %.0f s: %llu refreshes, %llu changes fed, %llu pages written, %llu "
                          "uploads, %llu binds in %llu batches, %llu arms refused, %.3f ms a refresh; changes outside "
-                         "the chunks %llu, views clipped 0 (chunks are contiguous)\n",
+                         "the chunks %llu; readers: %llu ranges resolved into it, %llu refused, %llu ordinary pages "
+                         "mirrored and %llu released, %llu buffer bindings cut at a chunk's end; %llu slot-133 buffers "
+                         "made on it, %llu KiB of GPU writes copied back; homes in device-local memory %llu units, in "
+                         "host memory %llu; tracking: %zu pages hot, %zu cold, %llu write faults, %llu hot and %llu "
+                         "cold copies; %.1f KiB uploaded a submission, %.1f KiB a frame\n",
                          static_cast<unsigned long long>(c.pages), static_cast<unsigned long long>(c.homes),
                          static_cast<unsigned long long>(c.units),
                          static_cast<unsigned long long>(c.units * (leonida::TitleMirror::kUnitBytes >> 20)),
@@ -4767,8 +5018,24 @@ struct DeviceState {
                          static_cast<unsigned long long>(m.uploads), static_cast<unsigned long long>(m.binds),
                          static_cast<unsigned long long>(m.batches), static_cast<unsigned long long>(m.arm_failures),
                          m.refreshes ? m.ms / double(m.refreshes) : 0.0,
-                         static_cast<unsigned long long>(c.unmirrored_changes));
+                         static_cast<unsigned long long>(c.unmirrored_changes),
+                         static_cast<unsigned long long>(m.resolved), static_cast<unsigned long long>(m.resolve_refused),
+                         static_cast<unsigned long long>(m.identity_mapped),
+                         static_cast<unsigned long long>(m.identity_released), static_cast<unsigned long long>(m.clipped),
+                         static_cast<unsigned long long>(m.buffers), static_cast<unsigned long long>(m.written_back >> 10),
+                         static_cast<unsigned long long>(m.units_local), static_cast<unsigned long long>(m.units_host),
+                         policy.hot, policy.cold, static_cast<unsigned long long>(policy.faults - m.faults_seen),
+                         static_cast<unsigned long long>(policy.hot_copies - m.hot_seen),
+                         static_cast<unsigned long long>(policy.cold_copies - m.cold_seen),
+                         m.refreshes ? double(m.uploads) * 64.0 / double(m.refreshes) : 0.0,
+                         frames ? double(m.uploads) * 64.0 / double(frames) : 0.0);
+            m.faults_seen = policy.faults;
+            m.hot_seen = policy.hot_copies;
+            m.cold_seen = policy.cold_copies;
+            m.presents = presents;
             m.refreshes = m.fed = m.dirty = m.uploads = m.batches = m.binds = m.arm_failures = 0;
+            m.resolved = m.resolve_refused = m.identity_mapped = m.identity_released = m.clipped = 0;
+            m.written_back = m.buffers = 0;
             m.ms = 0;
             m.since = now;
         }
@@ -5084,17 +5351,22 @@ struct DeviceState {
         std::uint64_t nothing[nothing_classes] = {};
         double max_ms = 0, max_pages_ms = 0, max_changes_ms = 0, max_fix_ms = 0;
         // Read in place (add_heap_in_place): the page mirror holds the title's heap pages, bound a second time into the
-        // arena at shader_va, and fills their home through filter_heap_page. No copy, no page tracker of its own:
-        // `previous` is the title's bytes each slot was last filtered from, `refix` the slots a change touched that
-        // are filtered again however their bytes look. The changes noted after the mirror's last refresh wait in
-        // `pending_changes` for the next one. Since the last log line: pages filtered, slots that changed, the time,
-        // and the presents in between (for the per-frame figures).
+        // arena at shader_va, and fills their home through filter_heap_page. No copy, no page tracker of its own.
+        // Under page_mirror.mutex, not console_heap_mutex (the filter runs inside the mirror's fills): `previous` (the
+        // title's bytes each slot was last filtered from), the records, `deferred` (the slots whose V#s the mirror does
+        // not hold or whose T# is to be bound: done outside the mirror's lock, finish_in_place), the title ranges its
+        // V#s name in the mirror (for the write-back), `pending_changes` (noted after the mirror's last look at the
+        // change list) and the counters since the last log line: pages filtered, slots that changed, the time, V#
+        // halves read as written and halves deferred, and the presents in between (per-frame figures).
         bool in_place = false;
-        std::uint64_t vsharps_as_written = 0;  // since the last log line: V# halves read as the title wrote them
-        std::vector<std::uint8_t> refix;
+        std::vector<std::uint32_t> deferred;
+        std::vector<std::uint8_t> deferred_mark;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> mirror_ranges;
         std::vector<leonida::SlotChange> pending_changes;
+        std::vector<std::uint32_t> touched_scratch;
         std::uint64_t pages_filtered = 0, slots_filtered = 0, present_mark = 0;
-        double filter_ms = 0;
+        std::uint64_t vsharps_as_written = 0, vsharps_deferred = 0;
+        double filter_ms = 0, deferred_ms = 0;
         // fix_console_slots' budget, for the current refresh, and the slots it nulled since the last log line
         std::chrono::steady_clock::time_point fix_start{};
         bool fix_over = false;
@@ -5396,63 +5668,127 @@ struct DeviceState {
         heap.record_changes += changes.size();
         heap.record_looked += heap.records.looked_at() - looked;
         heap.record_refixed += slot_change_scratch.size();
-        // A slot deferred by the fix budget (null in the copy) is fixed from its list, not here. A heap read in place
-        // is filtered again into its page's home (page_mirror.mutex held: refresh_page_mirror and the filter call this
-        // for it).
+        // A slot deferred by the fix budget (null in the copy) is fixed from its list, not here.
         for (const std::uint32_t slot : slot_change_scratch)
-            if (heap.in_place) refilter_slot(heap, slot);
-            else if (!heap.retry[slot]) fix_console_slot(heap, slot);
+            if (!heap.retry[slot]) fix_console_slot(heap, slot);
         heap.record_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
 
-    // Slot `slot` of a heap read in place, filtered again from its title bytes as last filtered (`previous`) into its
-    // page's home; nothing when the page is not mapped (its first fill filters it). page_mirror.mutex held.
-    void refilter_slot(ConsoleHeap& heap, std::size_t slot) {
-        const std::uint64_t va = heap.console_va + std::uint64_t(slot) * kDescriptorSize;
-        std::uint8_t* home = page_mirror.mirror ? page_mirror.mirror->home_bytes(va) : nullptr;
-        if (!home) return;
-        fix_console_slot(heap, slot, false, home + (va & (leonida::TitleMirror::kPage - 1)));
+    // ---- Console heaps read in place (add_heap_in_place) ----
+    // Lock order: console_heap_mutex, then page_mirror.mutex, then slot_change_mutex. The filter runs inside the
+    // mirror's fills (page_mirror.mutex held, console_heap_mutex not), so under the mirror's lock it does only what
+    // needs no other lock of ours: reachability (reachable_as_written), nulls, and the list of slots to finish. The rest
+    // - a V# the mirror does not hold resolved as before, a T# bound - is finish_in_place's, in the heap's refresh
+    // (console_heap_mutex held), outside the mirror's lock, its result written into the home under it.
+
+    // Slot `slot` of a heap read in place, from its title bytes as last filtered (`previous`), into `out` (its place
+    // in the page's home). page_mirror.mutex held.
+    void filter_slot_locked(ConsoleHeap& heap, std::size_t slot, std::uint8_t* out) {
+        using Records = leonida::ConsoleHeapSlotRecords;
+        std::uint32_t w[kDescriptorSize / 4];
+        std::memcpy(w, heap.previous + slot * kDescriptorSize, kDescriptorSize);
+        bool defer = false;
+        if (!(w[0] | w[1] | w[2] | w[3])) {
+            heap.records.clear(slot);  // a null slot stays null
+        } else if (!(w[3] >> 30)) {
+            // A buffer V# and its UAV counter: each read as written when heap_base + its base holds its bytes, else
+            // null until finish_in_place resolves it (recorded as waiting meanwhile, so a change finds it).
+            for (unsigned half = 0; half < 2; ++half) {
+                std::uint32_t* h = w + 4 * half;
+                if ((h[3] >> 30) || !h[2]) {
+                    heap.records.set(slot, half, Records::none, 0, 0, 0);
+                    continue;
+                }
+                const std::uint64_t base = std::uint64_t(h[0]) | (std::uint64_t(h[1] & 0xffff) << 32);
+                const std::uint32_t stride = (h[1] >> 16) & 0x3fffu;
+                const std::uint64_t span = std::uint64_t(h[2]) * (stride ? stride : 1);
+                bool mirrored = false;
+                if (reachable_as_written(base, span, mirrored)) {
+                    heap.records.set(slot, half, Records::none, 0, 0, 0);
+                    if (mirrored) heap.mirror_ranges.emplace_back(base, span);
+                    ++heap.vsharps_as_written;
+                    continue;
+                }
+                heap.records.set(slot, half, Records::waiting, base, span, 0);
+                h[0] = h[1] = h[2] = 0;
+                ++heap.vsharps_deferred;
+                defer = true;
+            }
+        } else {
+            leonida::gfx10::ImageWords words;
+            std::memcpy(words.data(), w, sizeof(words));
+            leonida::gfx10::Image image{};
+            if (leonida::gfx10::is_image(words) && leonida::gfx10::decode(words, image)) {
+                // As the title wrote it; bound by finish_in_place [TSHARP-INDEX: where its bindless index goes in].
+                defer = true;
+            } else {
+                heap.records.clear(slot);
+                std::memset(w, 0, 16);  // data where a V# or T# is read: null
+            }
+        }
+        std::memcpy(out, w, kDescriptorSize);
+        if (defer && !heap.deferred_mark[slot]) {
+            heap.deferred_mark[slot] = 1;
+            heap.deferred.push_back(std::uint32_t(slot));
+        }
     }
 
-    // The console heap read in place whose pages hold title address `va`, or null. console_heap_mutex held.
-    ConsoleHeap* in_place_heap_at(std::uint64_t va) {
-        for (const auto& heap : console_heaps)
-            if (heap->in_place && va - heap->console_va < heap->bytes) return heap.get();
-        return nullptr;
+    // The changes noted since the mirror last looked (and those refresh_console_heaps kept for it): the slots they
+    // touch are filtered again straight into their homes. page_mirror.mutex held (refresh_page_mirror).
+    void apply_in_place_changes(ConsoleHeap& heap) {
+        {
+            std::lock_guard taken(slot_change_mutex);
+            if (heap.changes_seen < slot_changes.size())
+                heap.pending_changes.insert(heap.pending_changes.end(),
+                                            slot_changes.begin() + std::ptrdiff_t(heap.changes_seen), slot_changes.end());
+            heap.changes_seen = slot_changes.size();
+        }
+        if (heap.pending_changes.empty()) return;
+        const auto start = std::chrono::steady_clock::now();
+        const std::uint64_t looked = heap.records.looked_at();
+        heap.records.touched(heap.pending_changes.data(), heap.pending_changes.size(), heap.touched_scratch);
+        heap.record_changes += heap.pending_changes.size();
+        heap.record_looked += heap.records.looked_at() - looked;
+        heap.record_refixed += heap.touched_scratch.size();
+        heap.pending_changes.clear();
+        for (const std::uint32_t slot : heap.touched_scratch) {
+            const std::uint64_t va = heap.console_va + std::uint64_t(slot) * kDescriptorSize;
+            if (std::uint8_t* home = page_mirror.mirror->home_bytes(va))
+                filter_slot_locked(heap, slot, home + (va & (leonida::TitleMirror::kPage - 1)));
+            // A page not mapped is filtered whole when it is.
+        }
+        heap.record_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
 
     // TitleMirrorHooks::filter for the pages of console heaps read in place: the title's page at `from` (shown at
     // `va`) in, the home `to` out. Each slot whose title bytes differ from what it was last filtered from (all of them
-    // on a fresh fill), or that a change touched, is fixed as a copied slot was: a V# reachable as written stays as the
-    // title wrote it (reachable_as_written), another one is resolved as before (an interim, until every title
-    // reservation is in the mirror) or written with no base and no records and recorded as waiting; a T# is bound as
-    // before and written as the title wrote it [TSHARP-INDEX: where the texture's bindless index goes into the entry];
-    // other words are null. The other slots keep what the home holds. The title's bytes are only read.
-    // page_mirror.mutex and console_heap_mutex held (refresh_page_mirror).
+    // on a fresh fill) is filtered (filter_slot_locked); the others keep what the home holds. The title's bytes are
+    // only read. page_mirror.mutex held.
     bool filter_heap_page(std::uint64_t va, std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool fresh) {
-        ConsoleHeap* heap = in_place_heap_at(va);
+        ConsoleHeap* heap = nullptr;
+        for (ConsoleHeap* h : page_mirror.in_place)
+            if (va - h->console_va < h->bytes) heap = h;
         if (!heap) return copy_guarded_host(to, from, bytes, false);
         const auto start = std::chrono::steady_clock::now();
-        if (heap_page_scratch.size() < bytes) heap_page_scratch.resize(bytes);
-        std::uint8_t* const title = heap_page_scratch.data();
-        if (!copy_guarded_host(title, from, bytes, false)) return false;
+        std::unique_ptr<std::uint8_t[]> title(new std::uint8_t[bytes]);  // a fill may come inside another
+        if (!copy_guarded_host(title.get(), from, bytes, false)) return false;
         std::size_t changed = 0;
         for (std::size_t at = 0; at + kDescriptorSize <= bytes; at += kDescriptorSize) {
             const std::uint64_t slot_va = va + at;
             if (slot_va - heap->console_va >= heap->bytes) {  // past the heap's end on its last page: as it is
-                std::memcpy(to + at, title + at, kDescriptorSize);
+                std::memcpy(to + at, title.get() + at, kDescriptorSize);
                 continue;
             }
             const std::size_t slot = std::size_t((slot_va - heap->console_va) / kDescriptorSize);
             std::uint8_t* previous = heap->previous + slot * kDescriptorSize;
-            if (!fresh && !heap->refix[slot] && !std::memcmp(previous, title + at, kDescriptorSize)) continue;
-            heap->refix[slot] = 0;
-            if (std::memcmp(previous, title + at, kDescriptorSize)) {
-                std::memcpy(previous, title + at, kDescriptorSize);
+            const bool same = !std::memcmp(previous, title.get() + at, kDescriptorSize);
+            if (same && !fresh) continue;
+            if (!same) {
+                std::memcpy(previous, title.get() + at, kDescriptorSize);
                 note_changed_slot(*heap, previous);
                 ++changed;
             }
-            fix_console_slot(*heap, slot, true, to + at);
+            filter_slot_locked(*heap, slot, to + at);
         }
         heap->slots_filtered += changed;
         ++heap->pages_filtered;
@@ -5460,7 +5796,105 @@ struct DeviceState {
         heap->filter_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         return true;
     }
-    std::vector<std::uint8_t> heap_page_scratch;  // console_heap_mutex
+
+    // What the filter left to do, done outside the mirror's lock: the V#s the mirror does not hold resolved as a
+    // copied slot's were (an interim, until every title allocation is in the mirror; they read null meanwhile), the
+    // T#s bound, and the write-back noted for the mirror ranges the heap's V#s name. Each result goes into the home
+    // under the lock, unless the title rewrote the slot since (then the filter has it again). console_heap_mutex held,
+    // page_mirror.mutex not.
+    void finish_in_place(ConsoleHeap& heap) {
+        struct Job {
+            std::uint32_t slot;
+            std::uint32_t words[kDescriptorSize / 4];
+        };
+        std::vector<Job> jobs;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        {
+            std::lock_guard lock(page_mirror.mutex);
+            for (const std::uint32_t slot : heap.deferred) {
+                heap.deferred_mark[slot] = 0;
+                Job& job = jobs.emplace_back();
+                job.slot = slot;
+                std::memcpy(job.words, heap.previous + std::size_t(slot) * kDescriptorSize, kDescriptorSize);
+            }
+            heap.deferred.clear();
+            ranges.swap(heap.mirror_ranges);
+        }
+        for (const auto& [base, span] : ranges) note_title_write(base, span);  // as vsharp_address's mirror path does
+        if (jobs.empty()) return;
+        const auto start = std::chrono::steady_clock::now();
+        using Records = leonida::ConsoleHeapSlotRecords;
+        const VsharpPath path = heap.scratch ? VsharpPath::scratch : VsharpPath::shadow;
+        struct Done {
+            std::uint32_t out[kDescriptorSize / 4];
+            VsharpRecord halves[2];
+            Records::State texture = Records::none;
+            std::uint64_t texture_address = 0;
+        };
+        std::vector<Done> done(jobs.size());
+        for (std::size_t i = 0; i < jobs.size(); ++i) {
+            std::uint32_t* w = done[i].out;
+            std::memcpy(w, jobs[i].words, kDescriptorSize);
+            if (!(w[3] >> 30)) {
+                for (unsigned half = 0; half < 2; ++half) {
+                    std::uint32_t* h = w + 4 * half;
+                    if ((h[3] >> 30) || !h[2]) continue;
+                    const std::uint64_t base = std::uint64_t(h[0]) | (std::uint64_t(h[1] & 0xffff) << 32);
+                    const std::uint32_t stride = (h[1] >> 16) & 0x3fffu;
+                    const std::uint64_t span = std::uint64_t(h[2]) * (stride ? stride : 1);
+                    bool mirrored = false;
+                    {
+                        std::lock_guard lock(page_mirror.mutex);
+                        if (reachable_as_written(base, span, mirrored)) continue;  // reachable since: as written
+                    }
+                    const VsharpResult result = fix_vsharp(h, path, &done[i].halves[half], &heap, false);
+                    if (result == VsharpResult::rebased) ++heap.vsharps;
+                    if (result == VsharpResult::empty) ++heap.unbacked;
+                }
+            } else {
+                leonida::gfx10::ImageWords words;
+                std::memcpy(words.data(), w, sizeof(words));
+                const char* why = nullptr;
+                const TitleImage result = bind_title_image(*this, words, &why);
+                const bool unbound = result == TitleImage::unknown || result == TitleImage::refused;
+                if (unbound) {
+                    note_refused_tsharp(heap, std::size_t(jobs[i].slot) * kDescriptorSize, words, why);
+                    ++heap.refused_reasons[why ? why : "?"];
+                    ++heap.texture_waits;
+                }
+                ++heap.images[unsigned(result)];
+                leonida::gfx10::Image image{};
+                leonida::gfx10::decode(words, image);
+                done[i].texture_address = tsharp_texture_key(image.address);
+                done[i].texture = !unbound ? Records::texture_bound
+                                  : why == kTsharpArrayFull || why == kTsharpStorageFull ? Records::texture_waiting_room
+                                                                                         : Records::texture_waiting;
+            }
+        }
+        std::lock_guard lock(page_mirror.mutex);
+        for (std::size_t i = 0; i < jobs.size(); ++i) {
+            const std::uint32_t slot = jobs[i].slot;
+            if (std::memcmp(heap.previous + std::size_t(slot) * kDescriptorSize, jobs[i].words, kDescriptorSize))
+                continue;  // rewritten since: filtered again, and deferred again if it needs this
+            const std::uint64_t va = heap.console_va + std::uint64_t(slot) * kDescriptorSize;
+            std::uint8_t* home = page_mirror.mirror ? page_mirror.mirror->home_bytes(va) : nullptr;
+            if (!home) continue;
+            const Done& d = done[i];
+            if (d.texture != Records::none) {
+                if (Records::is_waiting(heap.records.state(slot, 0)) && heap.records.base(slot, 0) == d.texture_address &&
+                    d.texture == Records::texture_bound)
+                    ++heap.texture_refills;
+                heap.records.set_texture(slot, d.texture, d.texture_address);
+            } else {
+                for (unsigned half = 0; half < 2; ++half)
+                    if (d.halves[half].state != Records::none)
+                        heap.records.set(slot, half, d.halves[half].state, d.halves[half].base, d.halves[half].span,
+                                         d.halves[half].target, d.halves[half].geometry);
+            }
+            std::memcpy(home + (va & (leonida::TitleMirror::kPage - 1)), d.out, kDescriptorSize);
+        }
+        heap.deferred_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
 
     // The changes noted since refresh_console_heaps took the list (a window this pass made, a buffer another thread
     // released), applied to `heap` now: they stay in the list for the next submission too (applying one twice only
@@ -5526,9 +5960,14 @@ struct DeviceState {
     void refresh_console_heap(ConsoleHeap& heap, const std::vector<leonida::SlotChange>* changes) {  // console_heap_mutex held
         if (heap.imported) return;  // directly imported sampler heap
         if (heap.gpu >= 0) return refresh_console_heap_gpu(heap);
-        // Read in place: filtered as the page mirror fills its pages (refresh_page_mirror, before this); the changes it
-        // has not seen yet were kept for it (refresh_console_heaps).
-        if (heap.in_place) return;
+        // Read in place: filtered as the page mirror fills its pages (refresh_page_mirror, before this); what the filter
+        // left (V#s the mirror does not hold, T#s to bind) is finished here, outside the mirror's lock.
+        if (heap.in_place) {
+            const auto start = std::chrono::steady_clock::now();
+            finish_in_place(heap);
+            heap.fix_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            return;
+        }
         using clock = std::chrono::steady_clock;
         const auto ms = [](clock::time_point a, clock::time_point b) {
             return std::chrono::duration<double, std::milli>(b - a).count();
@@ -5595,6 +6034,10 @@ struct DeviceState {
         // Every change since the last submission, for every heap; one made from now on (by another thread, or by a
         // fix below making a window) is applied at the next submission.
         std::vector<leonida::SlotChange> changes;
+        // A heap read in place reads the list in the mirror's refresh (apply_in_place_changes, under the mirror's lock):
+        // the list is taken under that lock too, so the entries it has not read yet are kept for it.
+        std::unique_lock mirror(page_mirror.mutex, std::defer_lock);
+        if (in_place_heaps.load(std::memory_order_acquire)) mirror.lock();
         {
             std::lock_guard taken(slot_change_mutex);
             changes.swap(slot_changes);
@@ -5605,24 +6048,30 @@ struct DeviceState {
             geometry_room_seen = freed;
             changes.push_back({leonida::SlotChange::geometry_room, 0, 1});
         }
-        // A heap read in place applied the list's first changes_seen entries in the mirror's refresh already; the rest
-        // wait for its next one.
         for (const auto& heap : console_heaps) {
-            if (heap->in_place)
+            if (heap->in_place && mirror.owns_lock())
                 heap->pending_changes.insert(heap->pending_changes.end(),
                                              changes.begin() + std::ptrdiff_t(std::min(heap->changes_seen, changes.size())),
                                              changes.end());
             heap->changes_seen = 0;  // of the list noted from now on
         }
+        if (mirror.owns_lock()) mirror.unlock();
         for (const auto& heap : console_heaps) {
             const auto start = std::chrono::steady_clock::now();
+            const std::uint64_t copied_before = heap->copied, retried_before = heap->retried;
             refresh_console_heap(*heap, &changes);
+            // A heap slot or page brought up to date: this submission is not one of the "submit floor" line's.
+            if (heap->copied != copied_before || heap->retried != retried_before || !changes.empty())
+                leonida::submit_phases::note_change(leonida::submit_phases::change_slots);
             heap->ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
             ++heap->refreshes;
             // A line at the first and 64th submission, then every 10 s (a crawl logs as often as a fast run).
             const bool logged = heap->refreshes == 1 || heap->refreshes == 64 ||
                                 (heap->refreshes > 64 && start - heap->log_time >= std::chrono::seconds(10));
             if (!logged) continue;
+            // A heap read in place has its filter's counters under the mirror's lock (console_heap_mutex, then it).
+            std::unique_lock in_place_counters(page_mirror.mutex, std::defer_lock);
+            if (heap->in_place) in_place_counters.lock();
             const double count = double(std::max<std::uint64_t>(1, heap->refreshes - heap->logged));
             heap->logged = heap->refreshes;
             heap->log_time = start;
@@ -5656,7 +6105,7 @@ struct DeviceState {
                              "[rt] d3d12: console descriptor heap 0x%llx changed slots per submission: %.1f zero, %.1f "
                              "V# pairs, %.1f T#s, %.1f other; V# halves %.1f, %.1f%% seen before; V# resolutions since "
                              "the last line: alias %llu, alias refused %llu, arena %llu, geometry %llu, window %llu, "
-                             "none %llu\n",
+                             "none %llu, page mirror %llu\n",
                              static_cast<unsigned long long>(heap->console_va), double(heap->changed[0]) / count,
                              double(heap->changed[1]) / count, double(heap->changed[2]) / count,
                              double(heap->changed[3]) / count, double(heap->vsharp_halves) / count,
@@ -5664,7 +6113,8 @@ struct DeviceState {
                                                  : 0.0,
                              static_cast<unsigned long long>(paths[0]), static_cast<unsigned long long>(paths[1]),
                              static_cast<unsigned long long>(paths[2]), static_cast<unsigned long long>(paths[3]),
-                             static_cast<unsigned long long>(paths[4]), static_cast<unsigned long long>(paths[5]));
+                             static_cast<unsigned long long>(paths[4]), static_cast<unsigned long long>(paths[5]),
+                             static_cast<unsigned long long>(paths[6]));
                 // What releases, alias changes and additions cost: per submission, the changes taken, the record
                 // entries looked at to find their slots, and the slots fixed again (apply_slot_changes).
                 // T#s: those in the heap now, those of them waiting (for a texture at their address, or room), and
@@ -5722,16 +6172,17 @@ struct DeviceState {
                 const double frames = double(std::max<std::uint64_t>(1, presents - heap->present_mark));
                 std::fprintf(stderr,
                              "[rt] d3d12: console descriptor heap 0x%llx read in place: per submission %.1f pages "
-                             "filtered, %.1f slots changed, %.3f ms; per frame %.1f pages, %.3f ms (%llu frames); %.1f V# "
-                             "halves a submission read as the title wrote them\n",
+                             "filtered, %.1f slots changed, %.3f ms, and %.3f ms finishing what the filter left; per "
+                             "frame %.1f pages, %.3f ms (%llu frames); V# halves a submission: %.1f read as the title "
+                             "wrote them, %.1f resolved outside the mirror\n",
                              static_cast<unsigned long long>(heap->console_va), double(heap->pages_filtered) / count,
-                             double(heap->slots_filtered) / count, heap->filter_ms / count,
-                             double(heap->pages_filtered) / frames, heap->filter_ms / frames,
+                             double(heap->slots_filtered) / count, heap->filter_ms / count, heap->deferred_ms / count,
+                             double(heap->pages_filtered) / frames, (heap->filter_ms + heap->deferred_ms) / frames,
                              static_cast<unsigned long long>(presents - heap->present_mark),
-                             double(heap->vsharps_as_written) / count);
+                             double(heap->vsharps_as_written) / count, double(heap->vsharps_deferred) / count);
                 heap->present_mark = presents;
-                heap->pages_filtered = heap->slots_filtered = heap->vsharps_as_written = 0;
-                heap->filter_ms = 0;
+                heap->pages_filtered = heap->slots_filtered = heap->vsharps_as_written = heap->vsharps_deferred = 0;
+                heap->filter_ms = heap->deferred_ms = 0;
             }
             std::string refused_breakdown;
             for (const auto& [reason, count] : heap->refused_reasons)
@@ -5861,7 +6312,7 @@ struct DeviceState {
         h.made.assign(std::size_t(bytes), 0);
         h.previous = h.made.data();
         h.retry.assign(std::size_t(bytes / kDescriptorSize), 0);
-        h.refix.assign(std::size_t(bytes / kDescriptorSize), 0);
+        h.deferred_mark.assign(std::size_t(bytes / kDescriptorSize), 0);
         h.records.reset(std::size_t(bytes / kDescriptorSize));
         h.present_mark = phases_present_serial();
         slot_records_live.store(true, std::memory_order_release);
@@ -5874,13 +6325,15 @@ struct DeviceState {
                 std::unique_lock ranges(console_copy_ranges_mutex);  // views keep the title's addresses there too
                 console_copy_ranges.emplace_back(console_va, bytes);
             }
-            console_heaps.push_back(std::move(owned));
-        }
-        in_place_heaps.fetch_add(1, std::memory_order_release);
-        {
-            std::lock_guard lock(page_mirror.mutex);
-            page_mirror.mirror->alias(console_va, console_va + bytes, arena.buffer, offset);
+            in_place_heaps.fetch_add(1, std::memory_order_release);
+            // Filtered before any page of it is filled (its pages named to the mirror last: ordinary memory is
+            // mirrored then), and in the arena with the mirror's next batch.
+            std::lock_guard mirror(page_mirror.mutex);
+            page_mirror.in_place.push_back(&h);
             page_mirror.mirror->filter_range(console_va, console_va + bytes);
+            page_mirror.mirror->alias(console_va, console_va + bytes, arena.buffer, offset);
+            page_mirror_resolve_locked(console_va, bytes, true);
+            console_heaps.push_back(std::move(owned));
         }
         std::fprintf(stderr,
                      "[rt] d3d12: console CBV/SRV/UAV descriptor heap 0x%llx (%llu KiB): read in place, its pages in the "
@@ -6094,12 +6547,14 @@ struct DeviceState {
             in_place_heaps.fetch_sub(1, std::memory_order_acq_rel);
             {
                 std::lock_guard lock(page_mirror.mutex);
+                std::erase(page_mirror.in_place, heap.get());
                 if (page_mirror.mirror) {
                     page_mirror.mirror->unalias(console_va);
                     page_mirror.mirror->unfilter_range(console_va);
                 }
             }
             refresh_page_mirror();
+            flush_page_mirror();
             context->wait_retire_ticket(context->submitted_retire_ticket());
             arena_release_unbacked(heap->shader_va, heap->bytes + heap->guard);
             arena_guard_bytes.fetch_sub(heap->guard, std::memory_order_relaxed);
@@ -6464,6 +6919,7 @@ struct DeviceState {
                     batch.swap(r->requests);
                     tsharps.swap(r->tsharps);
                 }
+                const leonida::submit_phases::WorkerScope busy(leonida::submit_phases::worker_heap_resolver);
                 for (const auto& w : tsharps)
                     if (!r->registered.count(words_hash(w))) bind(w);
                 // Those still waiting for a texture, again every 500 ms, at most 256 a round.
@@ -9762,6 +10218,33 @@ public:
     // of command lists the pages the title wrote since are copied again (ShadowPages, DeviceState::refresh_shadows).
     // One way only: what the GPU writes to the shadow is NOT copied back to the title's pages, and the next copy of
     // a page overwrites it. A title that reads GPU output at `address` needs the import.
+    // A buffer on title memory the page mirror holds (step C): bound to the mirror's chunk at heap_base + the title's
+    // address, so the GPU reads and writes the pages' homes, every view of the same pages shares them, and the
+    // per-submission shadow copy, its walk and its guards go. Its VA is the title's address; V#s and root views naming
+    // it keep that address (heap_base + it is the chunk). The CPU's Map answers the title's pages, as an import does;
+    // the GPU's writes go back to them after the submission (DeviceState::page_mirror_write_back). E_NOTIMPL when the
+    // mirror is off or does not hold the range in one chunk: an import or a shadow then answers, as before.
+    HRESULT create_mirror_buffer(void* address) {
+        const auto start = reinterpret_cast<std::uintptr_t>(address);
+        if (!address || !desc_.Width || desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return E_NOTIMPL;
+        VkBuffer chunk = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        if (!device_.page_mirror_chunk(start, desc_.Width, chunk, offset)) return E_NOTIMPL;
+        mapped_ = address;
+        va_ = start;
+        buffer_va_ = gpu_va_ = device_.page_mirror_address(start);
+        leonida::ResourceBinding binding{};
+        binding.buffer = chunk;
+        binding.indirect_arguments = true;  // the chunks carry every buffer usage (sparse_buffer_info)
+        binding.buffer_offset = offset;
+        binding.size = desc_.Width;
+        binding.host = static_cast<const std::uint8_t*>(address);
+        binding.host_readable = true;
+        binding.va = va_;
+        device_.context->add_resource(id(), binding);
+        return S_OK;
+    }
+
     HRESULT create_shadow_buffer(void* address) {
         auto& vk = device_.context->vk;
         if (!address || !desc_.Width || desc_.Width > ~UINT64(0) - D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
@@ -15543,6 +16026,7 @@ public:
             }
             // Last, once the heap refresh, the windows and the geometry copies have made what this submission reads.
             state_.update_address_guard();
+            state_.flush_page_mirror();
             const phases::Scope timed(phases::textures);
             refresh_title_textures();
         });
@@ -15703,6 +16187,16 @@ public:
                     share.arena_bound = d.arena.backing.stats().bound;
                     share.arena_in_use = d.arena.in_use;
                     for (std::size_t i = 0; i < share.arena_use.size(); ++i) share.arena_use[i] = d.arena.use_in_use[i];
+                }
+                if (d.page_mirror.mirror) {
+                    std::lock_guard held(d.page_mirror.mutex);
+                    const auto c = d.page_mirror.mirror->counters();
+                    share.mirror = true;
+                    share.mirror_homes = c.homes;
+                    share.mirror_pages = c.pages;
+                    share.mirror_chunks = c.chunks;
+                    share.mirror_units_local = d.page_mirror.units_local;
+                    share.mirror_units_host = d.page_mirror.units_host;
                 }
                 std::lock_guard lock(d.descriptor_mutex);  // the bindless set's lock (ExecuteCommandLists' flush)
                 if (const auto* bindless = d.bindless.get()) share.bindless_table_bytes = bindless->table_buffer_bytes();
@@ -17289,6 +17783,7 @@ private:
                 }
             }
             if (!fill) continue;
+            const leonida::submit_phases::WorkerScope busy(leonida::submit_phases::worker_texture_fill);
             bool filled = false;
             // A staged texture is filled without the registry lock (the title's threads creating views wait for
             // it: speed-31, 12 % of the main thread): its bytes, layout and resource are taken under the lock, the
@@ -17423,6 +17918,7 @@ private:
                         if (r->stop) return;
                         r->kick = false;
                     }
+                    const leonida::submit_phases::WorkerScope busy(leonida::submit_phases::worker_geometry);
                     state_.geometry.refresh(DeviceState::copy_geometry);
                 }
             });
@@ -17905,7 +18401,10 @@ private:
                     seen = generation_;
                     work = work_;
                 }
-                drain(work);
+                {
+                    const leonida::submit_phases::WorkerScope busy(leonida::submit_phases::worker_texture_reads);
+                    drain(work);
+                }
                 std::lock_guard lock(mutex_);
                 if (!--busy_) done_.notify_all();
             }
@@ -20112,6 +20611,8 @@ public:
     // LEONIDA_TITLE_BUFFERS_MB (512 by default).
     void make_title_buffer(std::uint64_t va, std::uint64_t bytes) {
         if (!&context()) return;
+        // The page mirror holds these pages: the draw reads them there (VulkanContext's mirror lookup), no buffer.
+        if (state_.page_mirror_resolve(va, std::max<std::uint64_t>(bytes, 1))) return;
         static const bool check_size = [] {
             wchar_t flag[2]{};
             return !(GetEnvironmentVariableW(L"LEONIDA_TITLE_BUFFER_COVERAGE", flag, 2) == 1 && flag[0] == L'0');
@@ -20289,6 +20790,8 @@ public:
         heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
         auto* resource = new Resource(state_, desc, heap, D3D12_HEAP_FLAG_NONE);
         resource->attach_device(identity());
+        // Title memory the page mirror holds: the buffer is the mirror's chunk there (no import, no shadow).
+        if (SUCCEEDED(resource->create_mirror_buffer(address))) return d3d12_trace::result(method, hand_out(resource, riid, out));
         const HRESULT hr = resource->create_host_buffer(address);
         if (hr == E_INVALIDARG) {
             resource->Release();
@@ -22712,6 +23215,7 @@ bool page_mirror_gpu_read(ID3D12Device* device, std::uint64_t title_va, void* ou
     DeviceState* state = mirror_state(device);
     if (!state || !out || !bytes) return false;
     state->refresh_page_mirror();
+    state->flush_page_mirror();
     VkBuffer chunk = VK_NULL_HANDLE;
     VkDeviceSize offset = 0;
     std::uint64_t wait = 0;
@@ -22726,13 +23230,92 @@ bool page_mirror_gpu_read(ID3D12Device* device, std::uint64_t title_va, void* ou
 bool arena_gpu_read(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes) {
     DeviceState* state = mirror_state(device);
     if (!state || !out || !bytes || va > state->arena.size || bytes > state->arena.size - va) return false;
+    // As a submission does: the mirror (heaps read in place filtered as their pages fill), the heaps (what the filter
+    // left), then the binds.
     state->refresh_page_mirror();
+    state->refresh_console_heaps();
+    state->flush_page_mirror();
     std::uint64_t wait = 0;
     {
         std::lock_guard lock(state->page_mirror.mutex);
         wait = state->page_mirror.value;
     }
     return gpu_buffer_read(*state, state->arena.buffer, va, wait, out, bytes);
+}
+
+bool page_mirror_buffer_at(ID3D12Device* device, std::uint64_t va, std::uint64_t& size) {
+    ID3D12Device* real = device ? rt::d3d12_xs::device_proxy_real_device(device) : nullptr;
+    if (!real) real = device;
+    const Device* d = real ? Device::from<Device>(real) : nullptr;
+    if (!d) return false;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    return const_cast<DeviceState&>(d->state()).page_mirror_buffer(va, size, buffer, offset);
+}
+
+bool page_mirror_gpu_write(ID3D12Device* device, std::uint64_t title_va, const void* data, std::size_t bytes) {
+    ID3D12Device* real = device ? rt::d3d12_xs::device_proxy_real_device(device) : nullptr;
+    if (!real) real = device;
+    const Device* d = real ? Device::from<Device>(real) : nullptr;
+    if (!d || !data || !bytes || bytes > 65536 || (bytes & 3) || (title_va & 3)) return false;
+    auto& state = const_cast<DeviceState&>(d->state());
+    if (!state.page_mirror.mirror || !state.context) return false;
+    state.refresh_page_mirror();
+    state.flush_page_mirror();
+    VkBuffer chunk = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    std::uint64_t wait = 0;
+    {
+        std::lock_guard lock(state.page_mirror.mutex);
+        if (!state.page_mirror.mirror->chunk_at(title_va, chunk, offset)) return false;
+        wait = state.page_mirror.value;
+    }
+    auto& vk = state.context->vk;
+    const VkDevice dev = state.info.device;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pool_info.queueFamilyIndex = state.info.queue_family;
+    bool ok = vk.vkCreateCommandPool(dev, &pool_info, nullptr, &pool) == VK_SUCCESS;
+    VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocate.commandPool = pool;
+    allocate.commandBufferCount = 1;
+    ok = ok && vk.vkAllocateCommandBuffers(dev, &allocate, &commands) == VK_SUCCESS;
+    if (ok) {
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        vk.vkBeginCommandBuffer(commands, &begin);
+        vk.vkCmdUpdateBuffer(commands, chunk, offset, bytes, data);
+        vk.vkEndCommandBuffer(commands);
+        VkTimelineSemaphoreSubmitInfo values{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        values.waitSemaphoreValueCount = 1;
+        values.pWaitSemaphoreValues = &wait;
+        const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, &values};
+        submit.waitSemaphoreCount = 1;
+        submit.pWaitSemaphores = &state.page_mirror.timeline;
+        submit.pWaitDstStageMask = &stage;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &commands;
+        std::lock_guard lock(state.context->submit_mutex());
+        ok = vk.vkQueueSubmit(state.info.queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS &&
+             vk.vkQueueWaitIdle(state.info.queue) == VK_SUCCESS;
+    }
+    if (pool) vk.vkDestroyCommandPool(dev, pool, nullptr);
+    return ok;
+}
+
+std::uint64_t page_mirror_write_back(ID3D12Device* device, std::uint64_t va, std::uint64_t bytes) {
+    ID3D12Device* real = device ? rt::d3d12_xs::device_proxy_real_device(device) : nullptr;
+    if (!real) real = device;
+    const Device* d = real ? Device::from<Device>(real) : nullptr;
+    return d ? const_cast<DeviceState&>(d->state()).page_mirror_write_back(va, va + bytes) : 0;
+}
+
+bool page_mirror_name(ID3D12Device* device, std::uint64_t va, std::uint64_t bytes) {
+    ID3D12Device* real = device ? rt::d3d12_xs::device_proxy_real_device(device) : nullptr;
+    if (!real) real = device;
+    const Device* d = real ? Device::from<Device>(real) : nullptr;
+    return d && const_cast<DeviceState&>(d->state()).page_mirror_resolve(va, bytes);
 }
 
 ArenaMemoryState device_arena_memory(ID3D12Device* device) {
@@ -23351,6 +23934,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.heavy_pipeline_cache = heavy_pipeline_cache_ms() && v13.enable_pipeline_cache_control;
     info.prepare_on_bind = mode == "on-demand";
     void* v13_chain = v13.enable(ext_chain);
+    if (!v13.integer_dot_product)
+        std::fprintf(stderr, "[rt] d3d12: the GPU has no shaderIntegerDotProduct; shaders that use the 4x8-bit dot "
+                             "products need make_game.py's --integer-dot-fallback\n");
     // D3D-78 uses the core robustness and format-feature flags. Leave the Vulkan 1.2 extension path unchanged.
     if (v13.core) {
         VkPhysicalDeviceVulkan13Features supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};

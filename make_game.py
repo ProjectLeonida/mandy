@@ -1847,7 +1847,7 @@ WAVE64_MODES = ("auto", "on", "off")
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
                   ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
-                  ("--compact-spirv", "compact_spirv"))
+                  ("--compact-spirv", "compact_spirv"), ("--integer-dot-fallback", "integer_dot_fallback"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -2007,6 +2007,13 @@ def runtime_gpu_per_vertex():
         return None if v is None else bool(v)
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return None
+
+
+def runtime_gpu_integer_dot_product():
+    """shaderIntegerDotProduct as tools/vk_subgroup_info.py answers for the GPU the runtime would use (required by
+    Vulkan 1.3, so False only on a Vulkan 1.2 device such as MoltenVK's), or None when it can't be told."""
+    v = runtime_gpu_info().get("integer_dot_product")
+    return v if isinstance(v, bool) else None
 
 
 def runtime_gpu_barycentric_fallback():
@@ -3158,6 +3165,10 @@ def main() -> int:
     ap.add_argument("--native-mesh", action="store_true",
                     help="keep native mesh shaders on Intel's Windows Vulkan driver instead of turning on "
                          "--mesh-compute (for a driver that fixes BUILD-2202's crash)")
+    ap.add_argument("--integer-dot-fallback", action="store_true",
+                    help="translate the 4x8-bit dot products (v_dot4_*) as extracts, multiplies and adds instead of "
+                         "SPV_KHR_integer_dot_product; on by itself when the runtime's GPU has no "
+                         "shaderIntegerDotProduct (a Vulkan 1.2 device)")
     ap.add_argument("--pc-tail-ubo", action="store_true",
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
@@ -3275,6 +3286,14 @@ def main() -> int:
             log(f"shaders: the GPU the runtime would use reports maxPushConstantsSize = {max_pc} (< {need_pc}): "
                 "translating with --pc-tail-ubo")
             a.pc_tail_ubo = True
+    if "shaders" in stages and not a.integer_dot_fallback:
+        integer_dot = runtime_gpu_integer_dot_product()
+        if integer_dot is False:
+            log("shaders: the GPU the runtime would use has no shaderIntegerDotProduct (a Vulkan 1.2 device): "
+                "translating with --integer-dot-fallback")
+            a.integer_dot_fallback = True
+        elif integer_dot is None:
+            a.integer_dot_fallback = keep_recorded_fallback("--integer-dot-fallback", work)
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     overlap = True
     use_tui = leonida_tui.tui_eligible(a.no_tui)
