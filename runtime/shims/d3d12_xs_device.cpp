@@ -2207,16 +2207,24 @@ AsyncMapper& async_mapper() {
 // CopyPageMappingsBatchX's batches, copied: the remap of a deferred call runs after the caller freed its arrays.
 struct PageMappingCopy {
     std::vector<xmem::PageBatch> batches;
-    std::vector<std::vector<xmem::PageRange>> ranges;
+    std::vector<xmem::PageRange> range_storage;
     std::uintptr_t pool = 0;
     UINT pages = 0, flags = 0;
 
     PageMappingCopy(UINT count, const xmem::PageBatch* in, std::uintptr_t pool_, UINT pages_, UINT flags_)
-        : batches(in, in + count), ranges(count), pool(pool_), pages(pages_), flags(flags_) {
+        : batches(in, in + count), pool(pool_), pages(pages_), flags(flags_) {
+        std::size_t total_ranges = 0;
+        for (UINT b = 0; b < count; ++b)
+            if (in[b].ranges) total_ranges += in[b].count;
+        range_storage.reserve(total_ranges);
         for (UINT b = 0; b < count; ++b) {
-            if (!in[b].ranges) continue;  // xmem refuses a batch with ranges but no array; it still sees none
-            ranges[b].assign(in[b].ranges, in[b].ranges + in[b].count);
-            batches[b].ranges = ranges[b].data();
+            if (!in[b].ranges || !in[b].count) {
+                if (!in[b].ranges) batches[b].ranges = nullptr;
+                continue;  // xmem refuses a batch with ranges but no array; it still sees none
+            }
+            const std::size_t offset = range_storage.size();
+            range_storage.insert(range_storage.end(), in[b].ranges, in[b].ranges + in[b].count);
+            batches[b].ranges = range_storage.data() + offset;
         }
     }
 };
@@ -3934,7 +3942,9 @@ IUnknown* list_real_or_null(const void* object) {
 // lock, so the fence values rise in submission order.
 class ValueSubmission {
 public:
-    explicit ValueSubmission(ChildProxy* queue) : queue_(queue) {}
+    explicit ValueSubmission(ChildProxy* queue, UINT reserve_lists = 0) : queue_(queue) {
+        if (reserve_lists) group_.reserve(reserve_lists);
+    }
 
     void add(ID3D12CommandList* list) { group_.push_back(list); }
 
@@ -3942,9 +3952,18 @@ public:
               const std::vector<list_values::Wait>& gate, const std::vector<list_values::Write>& writes) {
         // Pre-writes land with the group before the gate: behind the work submitted so far, before the queue stands
         // at the gate (stand_at submits the group first when a wait is unmet). A met gate is no gate: they then land
-        // behind the part, with its writes. The memory is read once here, for both.
+        // behind the part, with its writes. Evaluate each wait once into unmet_scratch_ so stand_at avoids repeating
+        // ReadProcessMemory loops when flush() has no prior group or writes to submit.
         bool met = true;
-        for (const list_values::Wait& w : gate) met = met && list_values::met_now(w);
+        if (!gate.empty()) {
+            unmet_scratch_.clear();
+            for (const list_values::Wait& w : gate) {
+                if (!list_values::met_now(w)) {
+                    unmet_scratch_.push_back(w);
+                    met = false;
+                }
+            }
+        }
         for (const list_values::Write& write : pre_writes) {
             writes_.push_back(write);
             // Landing before the part has run, a GPU timestamp of the part's would not be written yet: the CPU's
@@ -3997,13 +4016,18 @@ private:
             list_values::bump(counters.waits_met_at_submit, waits.size());
             return;
         }
+        // Count the subset of waits in `waits` that already compared true in part().
+        if (waits.size() > unmet_scratch_.size())
+            list_values::bump(counters.waits_met_at_submit, waits.size() - unmet_scratch_.size());
         // The work before the wait goes first; its writes are in flight from here on, so a relay can find them.
-        flush();
+        const bool had_work = !group_.empty() || !writes_.empty();
+        if (had_work) flush();
         list_values::QueueValues* values = queue_->values.get();
         if (!values) return;  // no fences: the wait runs on, as before
         std::vector<list_values::Wait> unmet;
-        for (const list_values::Wait& w : waits) {
-            if (list_values::met_now(w)) {
+        unmet.reserve(unmet_scratch_.size());
+        for (const list_values::Wait& w : unmet_scratch_) {
+            if (had_work && list_values::met_now(w)) {
                 list_values::bump(counters.waits_met_at_submit);
                 continue;
             }
@@ -4029,6 +4053,7 @@ private:
     ChildProxy* queue_;
     std::vector<ID3D12CommandList*> group_;
     std::vector<list_values::Write> writes_;
+    std::vector<list_values::Wait> unmet_scratch_;
 };
 
 bool execute_with_values(ChildProxy* self, UINT count, void* const* lists) {
@@ -4044,7 +4069,7 @@ bool execute_with_values(ChildProxy* self, UINT count, void* const* lists) {
             std::fprintf(stderr, "[rt] d3d12_xs: no fences for list memory writes and waits: their parts run "
                                  "without them\n");
     }
-    ValueSubmission submission(self);
+    ValueSubmission submission(self, count);
     for (UINT i = 0; i < count; ++i) {
         if (!is_list_proxy_impl(lists[i])) {
             const std::uint64_t entry = unwrap_object(reinterpret_cast<std::uint64_t>(lists[i]));

@@ -10,10 +10,12 @@
 //   title_write_watch::ask() (GetWriteWatch with WRITE_WATCH_FLAG_RESET) in O(regions + dirty) without walking
 //   ww_pages_ on steady-state submissions, with zero guard faults, zero VirtualProtect syscalls, and zero interference
 //   with geometry_writes::hot_tiles(). Uncommitted holes inside a reservation are never bridged.
+#include "submit_phases.h"
 #include "title_mirror_tracking.h"
 #include "title_write_policy.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
@@ -24,7 +26,11 @@ namespace leonida {
 
 class HotColdTracking final : public TitleMirrorTracking {
 public:
-    HotColdTracking() : policy_(guard_) { geometry_writes::subscribe_writes(queue_); }
+    HotColdTracking()
+        : policy_(guard_),
+          last_present_serial_(submit_phases::totals().present_serial.load(std::memory_order_relaxed)) {
+        geometry_writes::subscribe_writes(queue_);
+    }
     ~HotColdTracking() override {
         geometry_writes::unsubscribe_writes(queue_);
         if (ww_reader_) title_write_watch::close_reader(ww_reader_);
@@ -42,9 +48,11 @@ public:
             ww_pages_.insert(addr);
             ww_initial_.push_back(addr);
             ww_runs_dirty_ = true;
+            sync_pending_atomics();
             return;
         }
         watch_guarded(addr);
+        sync_pending_atomics();
     }
     void unwatch(std::uint64_t page) override {
         const std::uintptr_t addr = std::uintptr_t(page) & ~(Policy::kPage - 1);
@@ -54,6 +62,7 @@ public:
                 ww_runs_.clear();
                 ww_initial_.clear();
             }
+            sync_pending_atomics();
             return;
         }
         const auto it = guard_.cells.find(addr);
@@ -63,10 +72,18 @@ public:
         if (guard_.hot.erase(addr)) geometry_writes::set_hot(addr, false);
         geometry_writes::release(addr);
         guard_.cells.erase(it);
+        sync_pending_atomics();
     }
 
     void collect(std::vector<std::uint64_t>& out) override {
         out.clear();
+        // Sync presented-frame boundaries automatically when Present ran without an explicit advance_frame() call,
+        // before draining the new frame's queued write faults.
+        const std::uint64_t present_now = submit_phases::totals().present_serial.load(std::memory_order_relaxed);
+        if (present_now != last_present_serial_.load(std::memory_order_relaxed)) {
+            last_present_serial_.store(present_now, std::memory_order_relaxed);
+            policy_.advance_frame();
+        }
         bool overflow = false;
         geometry_writes::take_written(queue_, tiles_, overflow);
         if (overflow)
@@ -87,12 +104,38 @@ public:
         policy_.frame();  // one submission interval a collect
 
         if (!ww_pages_.empty()) collect_write_watched(out);
+        sync_pending_atomics();
     }
+
+    // Ends one presented frame for per-frame hot promotion/probing (callable at Present; idempotent with collect()'s
+    // present_serial sync).
+    void advance_frame() {
+        last_present_serial_.store(submit_phases::totals().present_serial.load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
+        policy_.advance_frame();
+        sync_pending_atomics();
+    }
+    void on_present() { advance_frame(); }
+
+    // Lock-free O(1) clean-submission check: false when no write faults are queued, no guarded pages are hot or dirty,
+    // no write-watched pages are active, and no pending frame-history shift is waiting on a completed Present.
+    bool has_pending_work() const noexcept {
+        if (queue_.pending.load(std::memory_order_acquire)) return true;
+        if (active_work_.load(std::memory_order_acquire) != 0) return true;
+        if (ww_count_.load(std::memory_order_acquire) != 0) return true;
+        return frame_history_count_.load(std::memory_order_acquire) != 0 &&
+               submit_phases::totals().present_serial.load(std::memory_order_relaxed) !=
+                   last_present_serial_.load(std::memory_order_relaxed);
+    }
+
     std::uint64_t take_refused() override {
         const std::uint64_t now = policy_.stats().arm_failures;
         return now - std::exchange(refused_seen_, now);
     }
-    const auto& stats() const { return policy_.stats(); }
+    const auto& stats() const noexcept { return policy_.stats(); }
+    bool hot(std::uint64_t page) const { return policy_.hot(std::uintptr_t(page)); }
+    bool frame_hot(std::uint64_t page) const { return policy_.frame_hot(std::uintptr_t(page)); }
+    bool sub_hot(std::uint64_t page) const { return policy_.sub_hot(std::uintptr_t(page)); }
     // A cold page whose guard no write has reached since it was armed (TitleMirrorTracking::unwritten). A hot or
     // write-watched page returns false (conservative).
     bool unwritten(std::uint64_t page) override {
@@ -447,11 +490,21 @@ private:
     };
     using Policy = TitleWritePolicy<CellGuard>;
 
+    void sync_pending_atomics() noexcept {
+        active_work_.store(policy_.hot_count() + policy_.dirty_count() + ww_initial_.size(), std::memory_order_release);
+        ww_count_.store(ww_pages_.size(), std::memory_order_release);
+        frame_history_count_.store(policy_.frame_history_count(), std::memory_order_release);
+    }
+
     CellGuard guard_;
     Policy policy_;
     geometry_writes::WriteQueue queue_;
     std::vector<std::uintptr_t> tiles_;
     std::uint64_t refused_seen_ = 0;
+    std::atomic<std::size_t> active_work_{0};
+    std::atomic<std::size_t> ww_count_{0};
+    std::atomic<std::size_t> frame_history_count_{0};
+    std::atomic<std::uint64_t> last_present_serial_{0};
 
     // Write-watched private pages (MEM_WRITE_WATCH via title_write_watch): zero guard faults, zero VirtualProtect.
     std::uint64_t ww_reader_ = 0;

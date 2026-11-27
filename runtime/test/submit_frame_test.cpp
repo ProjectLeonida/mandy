@@ -313,15 +313,16 @@ int queue_sync_and_async() {
         EXPECT(gate.signal(1));
         EXPECT(done.wait(1, 5'000'000'000ull));
         EXPECT(queue.idle());
-        EXPECT(before_calls.load(std::memory_order_acquire) == 3);  // one before_execute_() per batch
+        // b1 ran first (1), then held {b2, b3} coalesced into one before_execute_() + one submit (2).
+        EXPECT(before_calls.load(std::memory_order_acquire) == 2);
         EXPECT(db[16] == 0x11 && db[32] == 0x22 && db[48] == 0x33 && db[0] == 0x33);
         s2.reset();
         s3.reset();
         EXPECT(b1.use_count() == 1 && b3.use_count() == 1);
         EXPECT(b3->reset());  // steady-state reuse with zero allocation
 
-        // (c) Sync execute() arriving while a releaser drains [b1 (running), b2 (ready in held_)] must wait for both
-        //     ready held batches to drain and run before_execute_() for b3 synchronously before returning.
+        // (c) Sync execute() arriving while a releaser drains [b1, b2 (coalesced in held_)] must wait for the held
+        //     drain to finish and run before_execute_() for b3 synchronously before returning.
         auto b2_fresh = std::make_shared<CommandList>();
         EXPECT(b2_fresh->copy_buffer({2, 32, 1, 16, 1}) && b2_fresh->copy_buffer({2, 0, 1, 16, 1}) &&
                b2_fresh->close());
@@ -358,7 +359,7 @@ int queue_sync_and_async() {
         releaser.join();
         title.join();
         EXPECT(title_res == ReplayResult::success);
-        EXPECT(title_before_at_return.load(std::memory_order_acquire) == 3);
+        EXPECT(title_before_at_return.load(std::memory_order_acquire) == 2);
         EXPECT(queue.idle());
         EXPECT(db[16] == 0x11 && db[32] == 0x22 && db[48] == 0x33 && db[0] == 0x33);
 
@@ -554,8 +555,9 @@ int queue_sync_and_async() {
         EXPECT(done.wait(1, 5'000'000'000ull));
         EXPECT(queue.idle());
 
-        // Every held batch runs its own execute_now() / before_execute_(): 6 batches -> 6 calls.
-        EXPECT(before_calls.load() == 6);
+        // Held consecutive batches coalesce across {steps[0..2]} (1), split at Signal(mid), run {steps[3]} (2),
+        // split at Wait(mid), and coalesce {steps[4..5]} (3): 6 batches -> 3 before_execute_() calls!
+        EXPECT(before_calls.load() == 3);
         for (int i = 0; i < 6; ++i) EXPECT(db[(i + 1) * 16] == std::uint8_t(0xA1 + i));
         EXPECT(db[0] == std::uint8_t(0xA6));  // strict FIFO through all 6 batches
 
@@ -579,11 +581,11 @@ int queue_sync_and_async() {
         EXPECT(copy_q.idle());
         EXPECT(copy_q.take_held_failure() == ReplayResult::unsupported);
         EXPECT(db[16] == 0xA1 && db[32] == 0xA2 && db[0] == 0xA2);
-        std::printf("queue held FIFO drain: 6 batches -> 6 before_execute_ calls, invalid peer isolation ok\n");
+        std::printf("queue held FIFO drain: 6 batches -> 3 merged before_execute_ calls, invalid peer isolation ok\n");
     }
 
-    // 4. LEONIDA_SUBMIT_ASYNC (per-queue async worker depth=4): per-batch before_execute_() (no coalescing),
-    //    Present barrier ordering, held-batch release through worker, and zero-copy CommandList Reset() while queued.
+    // 4. LEONIDA_SUBMIT_ASYNC (per-queue async worker depth=4): same-queue inbox coalescing, Present barrier split &
+    //    ordering, held-batch release coalescing through worker, and zero-copy CommandList Reset() while queued.
     {
         VulkanContext context(d.device_proc, d.device, true);
         EXPECT(context.loaded());
@@ -658,16 +660,17 @@ int queue_sync_and_async() {
         EXPECT(queue.idle());
         EXPECT(barrier_ran.load(std::memory_order_acquire));
 
-        // 4 before_execute_() calls total: {c0}, {c1}, {c2}, {c3}; barrier ran after c2 (count == 3), before c3!
-        EXPECT(before_calls.load() == 4);
-        EXPECT(barrier_seen_before_calls.load() == 3);
+        // 3 before_execute_() calls total: {c0}, coalesced {c1, c2}, {c3}; barrier ran after {c1, c2} (count == 2)!
+        EXPECT(before_calls.load() == 3);
+        EXPECT(barrier_seen_before_calls.load() == 2);
         EXPECT(db[16] == 0xC1 && db[32] == 0xC2 && db[48] == 0xC3 && db[64] == 0xC4);
 
-        // Held batches behind a gate in async mode: release_ready() wakes worker and runs before_execute_() per batch.
+        // Held batches behind a gate in async mode: release_ready() wakes worker and coalesces {s0, s2} into 1 submit.
         before_calls.store(0);
         std::memset(db, 0, kBufBytes);
         VulkanFence gate(context, 0), done2(context, 0);
         EXPECT(gate.semaphore() && done2.semaphore());
+        const std::uint64_t title_replay_before = load(sp::frame_totals().phase_ns[sp::replay]);
         queue.wait(gate.semaphore(), 1);
         EXPECT(queue.execute({&s0, 1}) == ReplayResult::success);
         EXPECT(queue.execute({&s2, 1}) == ReplayResult::success);
@@ -677,9 +680,11 @@ int queue_sync_and_async() {
         EXPECT(gate.signal(1));
         EXPECT(done2.wait(1, 5'000'000'000ull));
         EXPECT(queue.idle());
-        EXPECT(before_calls.load() == 2);
+        EXPECT(before_calls.load() == 1);
         EXPECT(db[16] == 0xC1 && db[48] == 0xC3);
-        std::printf("queue async (depth=4): per-batch before_execute_, Present barrier order, gate release ok\n");
+        // WorkerScope(worker_submit) covers release_held() on async_worker, so title-thread replay_ns stays unchanged!
+        EXPECT(load(sp::frame_totals().phase_ns[sp::replay]) == title_replay_before);
+        std::printf("queue async (depth=4): inbox coalescing, Present barrier split, gate release & WorkerScope ok\n");
     }
 
     // 5. Async queue progress tracking (LEONIDA_SUBMIT_ASYNC=4 + queued Present + busy producer worker + genuine
@@ -817,6 +822,256 @@ int queue_sync_and_async() {
         EXPECT(sync_q.idle());
         EXPECT(!queue_holds::any_progress());
         std::printf("queue async progress: held gate protected during busy worker/executing_, genuine deadlock breaks ok\n");
+    }
+
+    // 6. Explicit async inbox submit merging + vkQueueSubmit count + Signal / Wait / Present splits:
+    //    Consecutive Call::Kind::execute items in async_worker() coalesce into ONE before_execute_() + ONE
+    //    command-buffer vkQueueSubmit, while intervening Signal, Wait, and Present (after_held) each split cleanly.
+    {
+        static PFN_vkQueueSubmit s_real_submit = nullptr;
+        static std::atomic<unsigned> s_cb_submits{0};
+        struct HookSubmit {
+            static VKAPI_ATTR VkResult VKAPI_CALL call(VkQueue q, std::uint32_t count, const VkSubmitInfo* infos,
+                                                       VkFence fence) {
+                for (std::uint32_t i = 0; i < count; ++i)
+                    if (infos[i].commandBufferCount > 0) s_cb_submits.fetch_add(1, std::memory_order_relaxed);
+                return s_real_submit(q, count, infos, fence);
+            }
+        };
+
+        VulkanContext context(d.device_proc, d.device, true);
+        EXPECT(context.loaded());
+        s_real_submit = context.vk.vkQueueSubmit;
+        s_cb_submits.store(0, std::memory_order_relaxed);
+        context.vk.vkQueueSubmit = &HookSubmit::call;
+
+        VulkanQueue queue(context, d.queue, d.family, VulkanQueue::QueueKind::direct);
+        EXPECT(queue.ok());
+        queue.set_async_depth(12);
+
+        void* src_map = nullptr;
+        void* dst_map = nullptr;
+        VkBuffer src = d.buffer(kBufBytes, usage, &src_map);
+        VkBuffer dst = d.buffer(kBufBytes, usage, &dst_map);
+        EXPECT(src && dst);
+        auto* sb = static_cast<std::uint8_t*>(src_map);
+        auto* db = static_cast<std::uint8_t*>(dst_map);
+        std::memset(db, 0, kBufBytes);
+        for (int i = 0; i < 9; ++i) sb[i * 16] = std::uint8_t(0xD0 + i);
+
+        ResourceBinding r_src{}, r_dst{};
+        r_src.buffer = src;
+        r_src.size = kBufBytes;
+        r_dst.buffer = dst;
+        r_dst.size = kBufBytes;
+        r_dst.host_readable = true;
+        context.add_resource(1, r_src);
+        context.add_resource(2, r_dst);
+
+        std::atomic<unsigned> before_calls{0};
+        std::atomic<bool> in_first{false};
+        std::atomic<bool> go_first{false};
+        context.set_before_execute([&] {
+            const unsigned n = before_calls.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (n == 1) {
+                in_first.store(true, std::memory_order_release);
+                while (!go_first.load(std::memory_order_acquire)) std::this_thread::yield();
+            }
+        });
+
+        std::shared_ptr<const CommandList> steps[9];
+        for (int i = 0; i < 9; ++i) {
+            auto l = std::make_shared<CommandList>();
+            EXPECT(l->copy_buffer({2, std::uint64_t((i + 1) * 16), 1, std::uint64_t(i * 16), 1}) &&
+                   l->copy_buffer({2, 0, 1, std::uint64_t(i * 16), 1}) && l->close());
+            steps[i] = std::move(l);
+        }
+
+        VulkanFence mid(context, 0), done(context, 0);
+        EXPECT(mid.semaphore() && done.semaphore());
+
+        // Batch 0 starts on worker and holds in before_execute_() while the remaining 8 batches queue in inbox_.
+        EXPECT(queue.execute({&steps[0], 1}) == ReplayResult::success);
+        while (!in_first.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        // Group A: 3 consecutive execute batches -> coalesces into 1 submit (#2).
+        EXPECT(queue.execute({&steps[1], 1}) == ReplayResult::success);
+        EXPECT(queue.execute({&steps[2], 1}) == ReplayResult::success);
+        EXPECT(queue.execute({&steps[3], 1}) == ReplayResult::success);
+        // Split 1: Signal(mid, 1).
+        EXPECT(queue.signal(mid.semaphore(), 1));
+        // Group B: 2 consecutive execute batches -> coalesces into 1 submit (#3).
+        EXPECT(queue.execute({&steps[4], 1}) == ReplayResult::success);
+        EXPECT(queue.execute({&steps[5], 1}) == ReplayResult::success);
+        // Split 2: Wait(mid, 1).
+        queue.wait(mid.semaphore(), 1);
+        // Group C: 2 consecutive execute batches -> coalesces into 1 submit (#4).
+        EXPECT(queue.execute({&steps[6], 1}) == ReplayResult::success);
+        EXPECT(queue.execute({&steps[7], 1}) == ReplayResult::success);
+        // Split 3: Present barrier (after_held).
+        std::atomic<unsigned> present_saw_submits{0};
+        int present_owner = 0;
+        context.holds().after_held(&present_owner, [&] {
+            present_saw_submits.store(s_cb_submits.load(std::memory_order_acquire), std::memory_order_release);
+        });
+        // Group D: 1 execute batch after Present -> 1 submit (#5).
+        EXPECT(queue.execute({&steps[8], 1}) == ReplayResult::success);
+        EXPECT(queue.signal(done.semaphore(), 1));
+
+        go_first.store(true, std::memory_order_release);
+        EXPECT(done.wait(1, 5'000'000'000ull));
+        EXPECT(queue.idle());
+
+        // 9 execute calls coalesced into exactly 5 before_execute_() calls AND 5 command-buffer vkQueueSubmits!
+        EXPECT(before_calls.load(std::memory_order_acquire) == 5);
+        EXPECT(s_cb_submits.load(std::memory_order_acquire) == 5);
+        EXPECT(present_saw_submits.load(std::memory_order_acquire) == 4);
+        for (int i = 0; i < 9; ++i) EXPECT(db[(i + 1) * 16] == std::uint8_t(0xD0 + i));
+        EXPECT(db[0] == std::uint8_t(0xD8));  // exact FIFO overwrite order preserved across inter-batch barriers
+        std::printf("queue async submit merging: 9 batches -> 5 submits, split cleanly on Signal/Wait/Present ok\n");
+    }
+
+    // 7. ASYNC enqueue-serial retirement epoch contract (set_on_enqueue_execute / set_on_finish_execute):
+    //    A view retired with kAfterExecutes during batch 1's before_execute_() must NOT be stamped or reaped while
+    //    an already-enqueued batch 2 is still waiting in async inbox_, even after batch 1's GPU work completes!
+    {
+        // Mirrors GeometryViews' exact execute_enqueue / retire(kAfterExecutes) / execute_end / reap state machine.
+        struct EpochTracker {
+            enum : std::uint64_t { kAfterExecutes = UINT64_MAX };
+            struct Retired {
+                std::uint64_t id = 0;
+                std::uint64_t ticket = kAfterExecutes;
+                std::uint64_t epoch = 0;
+            };
+            std::mutex mutex, execute_mutex;
+            std::vector<std::uint64_t> executing;
+            std::vector<Retired> retired;
+            std::uint64_t execute_serial = 0;
+            std::atomic<bool> unstamped{false};
+            std::uint64_t reaped = 0;
+
+            std::uint64_t execute_enqueue() {
+                std::lock_guard lock(execute_mutex);
+                executing.push_back(++execute_serial);
+                return execute_serial;
+            }
+            void retire(std::uint64_t id) {
+                std::lock_guard lock(mutex);
+                std::uint64_t epoch = 0;
+                {
+                    std::lock_guard exec(execute_mutex);
+                    epoch = execute_serial;
+                }
+                unstamped.store(true, std::memory_order_release);
+                retired.push_back({id, kAfterExecutes, epoch});
+            }
+            void execute_end(std::uint64_t serial, const std::function<std::uint64_t()>& submitted) {
+                if (!serial) return;
+                {
+                    std::lock_guard exec(execute_mutex);
+                    std::erase(executing, serial);
+                }
+                if (!unstamped.load(std::memory_order_acquire)) return;
+                std::lock_guard lock(mutex);
+                std::uint64_t oldest = kAfterExecutes;
+                {
+                    std::lock_guard exec(execute_mutex);
+                    for (const auto s : executing) oldest = std::min(oldest, s);
+                }
+                const std::uint64_t ticket = submitted();
+                bool left = false;
+                for (auto& r : retired) {
+                    if (r.ticket != kAfterExecutes) continue;
+                    if (r.epoch < oldest) r.ticket = ticket;
+                    else left = true;
+                }
+                unstamped.store(left, std::memory_order_release);
+            }
+            std::size_t reap(std::uint64_t completed) {
+                std::lock_guard lock(mutex);
+                std::size_t freed = 0, keep = 0;
+                for (std::size_t i = 0; i < retired.size(); ++i) {
+                    if (retired[i].ticket != kAfterExecutes && retired[i].ticket <= completed) {
+                        ++reaped;
+                        ++freed;
+                    } else {
+                        if (keep != i) retired[keep] = retired[i];
+                        ++keep;
+                    }
+                }
+                retired.resize(keep);
+                return freed;
+            }
+        } tracker;
+
+        VulkanContext context(d.device_proc, d.device, true);
+        EXPECT(context.loaded());
+        context.set_on_enqueue_execute([&] { return tracker.execute_enqueue(); });
+        context.set_on_finish_execute(
+            [&](std::uint64_t serial) { tracker.execute_end(serial, [&] { return context.submitted_retire_ticket(); }); });
+
+        VulkanQueue queue(context, d.queue, d.family, VulkanQueue::QueueKind::direct);
+        EXPECT(queue.ok());
+        queue.set_async_depth(4);
+
+        auto empty_list = std::make_shared<CommandList>();
+        EXPECT(empty_list->close());
+        std::shared_ptr<const CommandList> snap = empty_list;
+
+        std::atomic<unsigned> before_n{0};
+        std::atomic<bool> b1_entered{false}, b1_go{false}, b2_entered{false}, b2_go{false};
+        std::atomic<std::uint64_t> b1_seen_serial{0}, b2_seen_serial{0};
+        context.set_before_execute([&] {
+            const unsigned n = before_n.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (n == 1) {
+                b1_seen_serial.store(VulkanContext::current_enqueue_serial(), std::memory_order_release);
+                b1_entered.store(true, std::memory_order_release);
+                while (!b1_go.load(std::memory_order_acquire)) std::this_thread::yield();
+                // Batch 1 retires view #1 AFTER batch 2 has already been enqueued in inbox_!
+                tracker.retire(1);
+            } else if (n == 2) {
+                b2_seen_serial.store(VulkanContext::current_enqueue_serial(), std::memory_order_release);
+                b2_entered.store(true, std::memory_order_release);
+                while (!b2_go.load(std::memory_order_acquire)) std::this_thread::yield();
+            }
+        });
+
+        // 1. Enqueue batch 1 (serial 1); wait until worker enters batch 1's before_execute_().
+        EXPECT(queue.execute({&snap, 1}) == ReplayResult::success);
+        while (!b1_entered.load(std::memory_order_acquire)) std::this_thread::yield();
+        EXPECT(b1_seen_serial.load(std::memory_order_acquire) == 1);
+
+        // 2. Title thread enqueues batch 2 (serial 2) + batch 3 (serial 3) into inbox_ while batch 1 is in flight!
+        VulkanFence done(context, 0);
+        EXPECT(done.semaphore() != VK_NULL_HANDLE);
+        EXPECT(queue.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(queue.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(queue.signal(done.semaphore(), 1));
+
+        // 3. Let batch 1 retire view #1, submit to Vulkan, and finish; worker then coalesces {batch 2, batch 3} and
+        //    pauses at n == 2 inside before_execute_().
+        b1_go.store(true, std::memory_order_release);
+        while (!b2_entered.load(std::memory_order_acquire)) std::this_thread::yield();
+        EXPECT(b2_seen_serial.load(std::memory_order_acquire) == 2);
+
+        // Wait until batch 1's GPU submission has completely retired on the GPU!
+        const std::uint64_t b1_ticket = context.submitted_retire_ticket();
+        EXPECT(b1_ticket >= 1);
+        EXPECT(context.wait_retire_ticket(b1_ticket) >= b1_ticket);
+
+        // CRITICAL INVARIANT: Even though batch 1's GPU work is 100% done, view #1 MUST NOT be reaped because
+        // {batch 2, batch 3} (enqueued BEFORE view #1 retired!) have not submitted yet!
+        EXPECT(tracker.reap(context.completed_retire_ticket()) == 0);
+        EXPECT(tracker.reaped == 0);
+
+        // 4. Release {batch 2, batch 3}: both serials 2 and 3 finish after the coalesced vkQueueSubmit, stamping
+        //    view #1 with the coalesced submit ticket; once GPU completes, view #1 reaps cleanly!
+        b2_go.store(true, std::memory_order_release);
+        EXPECT(done.wait(1, 5'000'000'000ull));
+        EXPECT(queue.idle());
+        EXPECT(tracker.reap(context.completed_retire_ticket()) == 1);
+        EXPECT(tracker.reaped == 1);
+        std::printf("queue async retirement epoch: view deferred across queued & coalesced inbox batches ok\n");
     }
 
     return 0;
