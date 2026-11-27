@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <clocale>
 #include <cstring>
 #include <cstdio>
@@ -18,6 +19,7 @@
 #include <sstream>
 #include <initializer_list>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
 #include <vector>
 
@@ -317,6 +319,94 @@ void check_read_file_first_touch(const std::filesystem::path& root) {
     g_first_touch = nullptr;
 }
 
+void check_crt_stat_remove(const std::filesystem::path& root) {
+    using WStat64Fn = int(__cdecl*)(const wchar_t*, struct __stat64*);
+    using Stat64Fn = int(__cdecl*)(const char*, struct __stat64*);
+    using WStat64i32Fn = int(__cdecl*)(const wchar_t*, struct _stat64i32*);
+    using Stat64i32Fn = int(__cdecl*)(const char*, struct _stat64i32*);
+    using RemoveFn = int(__cdecl*)(const char*);
+    using WRemoveFn = int(__cdecl*)(const wchar_t*);
+
+    const auto wstat64 = resolve<WStat64Fn>("api-ms-win-crt-filesystem-l1-1-0.dll", "_wstat64");
+    const auto stat64 = resolve<Stat64Fn>("api-ms-win-crt-filesystem-l1-1-0.dll", "_stat64");
+    const auto wstat64i32 = resolve<WStat64i32Fn>("api-ms-win-crt-filesystem-l1-1-0.dll", "_wstat64i32");
+    const auto stat64i32 = resolve<Stat64i32Fn>("api-ms-win-crt-filesystem-l1-1-0.dll", "_stat64i32");
+    const auto crt_rm = resolve<RemoveFn>("api-ms-win-crt-filesystem-l1-1-0.dll", "remove");
+    const auto crt_wrm = resolve<WRemoveFn>("api-ms-win-crt-filesystem-l1-1-0.dll", "_wremove");
+    const auto crt_unlink = resolve<RemoveFn>("ucrtbase.dll", "_unlink");
+    const auto crt_wunlink = resolve<WRemoveFn>("ucrtbase.dll", "_wunlink");
+    check(wstat64 && stat64 && wstat64i32 && stat64i32 && crt_rm && crt_wrm && crt_unlink && crt_wunlink,
+          "api-ms-win-crt-filesystem-l1-1-0 and ucrtbase serve CRT stat and remove/unlink");
+    if (!wstat64 || !stat64 || !wstat64i32 || !stat64i32 || !crt_rm || !crt_wrm || !crt_unlink || !crt_wunlink) return;
+
+    const auto pack = root / "package";
+    const auto layer = root / "overlay";
+    const auto pkg_file = pack / "crt" / "asset.bin";
+    const auto ro_pkg_file = pack / "crt" / "ro.bin";
+    write_path(pkg_file, "123456");
+    write_path(ro_pkg_file, "readonly");
+    ::SetFileAttributesW(ro_pkg_file.c_str(), FILE_ATTRIBUTE_READONLY);
+    rt::fs::configure(pack, layer);
+
+    struct __stat64 st{};
+    errno = 0;
+    check(wstat64(L"GAME:/crt/asset.bin", &st) == 0 && (st.st_mode & _S_IFREG) != 0 && st.st_size == 6,
+          "_wstat64 reads package file size and regular mode through GAME:");
+    struct _stat64i32 st32{};
+    check(stat64i32("G:/crt/asset.bin", &st32) == 0 && st32.st_size == 6,
+          "_stat64i32 reads package file through G:");
+
+    // Overlay file shadows package file.
+    write_path(layer / "crt" / "asset.bin", "overlay-longer");
+    check(wstat64(L"GAME:\\crt\\asset.bin", &st) == 0 && st.st_size == 14,
+          "_wstat64 sees overlay copy size when shadowed");
+
+    // Directory stat (GAME:, G:, T:) works, while missing/escaped paths fail with ENOENT.
+    struct __stat64 dir_st{};
+    check(wstat64(L"GAME:\\crt", &dir_st) == 0 && (dir_st.st_mode & _S_IFDIR) != 0,
+          "_wstat64 identifies GAME: directory");
+    check(wstat64(L"T:\\", &dir_st) == 0 && (dir_st.st_mode & _S_IFDIR) != 0,
+          "_wstat64 identifies T: scratch root");
+
+    const std::filesystem::path t_dir = own_t_folder(layer);
+    write_path(t_dir / "tmp.txt", "scratch-bytes");
+    check(!t_dir.empty() && stat64("T:/tmp.txt", &st) == 0 && st.st_size == 13 && crt_rm("T:/tmp.txt") == 0,
+          "_stat64 and remove read and delete scratch files on T:");
+    errno = 0;
+    check(wstat64i32(L"T:\\tmp.txt", &st32) == -1 && errno == ENOENT,
+          "_wstat64i32 reports ENOENT after remove on T:");
+
+    // Removing a package file places a delete marker, leaves package intact, and hides it from _wstat64.
+    check(crt_rm("GAME:/crt/asset.bin") == 0 && read_path(pkg_file) == "123456",
+          "remove deletes GAME: file in overlay/marker while leaving package file untouched");
+    errno = 0;
+    check(wstat64(L"GAME:/crt/asset.bin", &st) == -1 && errno == ENOENT,
+          "_wstat64 returns -1 (ENOENT) after CRT remove of GAME: file");
+
+    // Removing a read-only package file or a directory fails with EACCES, matching host CRT behavior.
+    errno = 0;
+    check(crt_wrm(L"GAME:\\crt\\ro.bin") == -1 && errno == EACCES && read_path(ro_pkg_file) == "readonly",
+          "_wremove refuses read-only package file with EACCES");
+    errno = 0;
+    check(crt_wunlink(L"GAME:\\crt") == -1 && errno == EACCES,
+          "_wunlink refuses a GAME: directory with EACCES");
+    ::SetFileAttributesW(ro_pkg_file.c_str(), FILE_ATTRIBUTE_NORMAL);
+
+    // Path traversal escaping GAME: fails cleanly with ENOENT.
+    errno = 0;
+    check(crt_unlink("GAME:/../outside.txt") == -1 && errno == ENOENT,
+          "_unlink refuses paths climbing above GAME: with ENOENT");
+
+    // Host passthrough matches native CRT.
+    const auto host_file = root / "host_crt.txt";
+    write_path(host_file, "host-data");
+    check(wstat64(host_file.c_str(), &st) == 0 && st.st_size == 9 && crt_wunlink(host_file.c_str()) == 0,
+          "host paths pass through CRT _wstat64 and _wunlink");
+    errno = 0;
+    check(wstat64(host_file.c_str(), &st) == -1 && errno == ENOENT,
+          "deleted host file reports ENOENT through _wstat64");
+}
+
 }  // namespace
 
 int main() {
@@ -335,6 +425,7 @@ int main() {
     // failure, the folder is still removed and the summary is still printed.
     try {
         check_read_file_first_touch(root / "first_touch");
+        check_crt_stat_remove(root / "crt_shims");
         run_checks(root);
     } catch (const std::exception& e) {
         check(false, (std::string("the checks run to the end (stopped by: ") + e.what() + ")").c_str());

@@ -27,16 +27,19 @@
 #include <intrin.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
 #include <filesystem>
+#include <io.h>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <sys/stat.h>
 #include <unordered_set>
 #include <vector>
 
@@ -1570,6 +1573,131 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
     return set_file_attributes_w(wide.c_str(), attributes);
 }
 
+namespace {
+
+int set_crt_errno_from_win32(DWORD error) {
+    _set_doserrno(static_cast<int>(error));
+    int mapped = EINVAL;
+    switch (error) {
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+        case ERROR_INVALID_NAME:
+        case ERROR_BAD_NETPATH:
+        case ERROR_BAD_PATHNAME:
+        case ERROR_FILENAME_EXCED_RANGE:
+            mapped = ENOENT;
+            break;
+        case ERROR_ACCESS_DENIED:
+        case ERROR_SHARING_VIOLATION:
+        case ERROR_LOCK_VIOLATION:
+        case ERROR_WRITE_PROTECT:
+        case ERROR_CURRENT_DIRECTORY:
+            mapped = EACCES;
+            break;
+        case ERROR_NOT_ENOUGH_MEMORY:
+        case ERROR_OUTOFMEMORY:
+            mapped = ENOMEM;
+            break;
+        case ERROR_FILE_EXISTS:
+        case ERROR_ALREADY_EXISTS:
+            mapped = EEXIST;
+            break;
+        case ERROR_INVALID_PARAMETER:
+        default:
+            mapped = EINVAL;
+            break;
+    }
+    _set_errno(mapped);
+    return -1;
+}
+
+template <typename StatBuf, typename HostStatW>
+int crt_stat_console_w(const wchar_t* name, StatBuf* buffer, HostStatW host_stat_w) {
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(name, parts);
+    if (parsed == Parsed::Host) return host_stat_w(name, buffer);
+    if (parsed == Parsed::Refused) return set_crt_errno_from_win32(ERROR_INVALID_NAME);
+
+    const Roots r = roots();
+    const bool scratch = !parts.empty() && same_name(parts.front().c_str(), kScratchDir);
+    if (r.overlay.empty() && (scratch || r.game.empty())) return set_crt_errno_from_win32(ERROR_PATH_NOT_FOUND);
+    const View v = view(r, parts);
+    if (v.kind == Kind::None) return set_crt_errno_from_win32(missing_error(r, parts));
+    const std::filesystem::path resolved = v.in_overlay ? disk_path(r.overlay, parts) : disk_path(r.game, parts);
+    return host_stat_w(resolved.c_str(), buffer);
+}
+
+template <typename StatBuf, typename HostStatA, typename HostStatW>
+int crt_stat_a(const char* name, StatBuf* buffer, HostStatA host_stat_a, HostStatW host_stat_w) {
+    if (!name || !buffer) {
+        _set_doserrno(0);
+        _set_errno(EINVAL);
+        return -1;
+    }
+    const std::wstring wide = widen_ansi(name);
+    std::vector<std::wstring> parts;
+    if (parse_console(wide, parts) == Parsed::Host) return host_stat_a(name, buffer);
+    return crt_stat_console_w(wide.c_str(), buffer, host_stat_w);
+}
+
+template <typename StatBuf, typename HostStatW>
+int crt_stat_w(const wchar_t* name, StatBuf* buffer, HostStatW host_stat_w) {
+    if (!name || !buffer) {
+        _set_doserrno(0);
+        _set_errno(EINVAL);
+        return -1;
+    }
+    return crt_stat_console_w(name, buffer, host_stat_w);
+}
+
+int __cdecl crt_wstat64(const wchar_t* name, struct __stat64* buffer) { return crt_stat_w(name, buffer, ::_wstat64); }
+int __cdecl crt_stat64(const char* name, struct __stat64* buffer) {
+    return crt_stat_a(name, buffer, ::_stat64, ::_wstat64);
+}
+int __cdecl crt_wstat64i32(const wchar_t* name, struct _stat64i32* buffer) {
+    return crt_stat_w(name, buffer, ::_wstat64i32);
+}
+int __cdecl crt_stat64i32(const char* name, struct _stat64i32* buffer) {
+    return crt_stat_a(name, buffer, ::_stat64i32, ::_wstat64i32);
+}
+int __cdecl crt_wstat32(const wchar_t* name, struct _stat32* buffer) { return crt_stat_w(name, buffer, ::_wstat32); }
+int __cdecl crt_stat32(const char* name, struct _stat32* buffer) {
+    return crt_stat_a(name, buffer, ::_stat32, ::_wstat32);
+}
+int __cdecl crt_wstat32i64(const wchar_t* name, struct _stat32i64* buffer) {
+    return crt_stat_w(name, buffer, ::_wstat32i64);
+}
+int __cdecl crt_stat32i64(const char* name, struct _stat32i64* buffer) {
+    return crt_stat_a(name, buffer, ::_stat32i64, ::_wstat32i64);
+}
+
+int __cdecl crt_wremove(const wchar_t* name) {
+    if (!name) {
+        _set_doserrno(0);
+        _set_errno(EINVAL);
+        return -1;
+    }
+    std::vector<std::wstring> parts;
+    if (parse_console(name, parts) == Parsed::Host) return ::_wremove(name);
+    if (delete_file_w(name)) return 0;
+    return set_crt_errno_from_win32(::GetLastError());
+}
+
+int __cdecl crt_remove(const char* name) {
+    if (!name) {
+        _set_doserrno(0);
+        _set_errno(EINVAL);
+        return -1;
+    }
+    const std::wstring wide = widen_ansi(name);
+    std::vector<std::wstring> parts;
+    if (parse_console(wide, parts) == Parsed::Host) return ::remove(name);
+    if (delete_file_w(wide.c_str())) return 0;
+    return set_crt_errno_from_win32(::GetLastError());
+}
+
+}  // namespace
+
 }  // namespace rt::fs
 
 namespace {
@@ -1642,6 +1770,20 @@ BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT segments[], DWOR
         {dll, "ReadFile", reinterpret_cast<void*>(&read_file)},                                          \
         {dll, "ReadFileEx", reinterpret_cast<void*>(&read_file_ex)},                                     \
         {dll, "ReadFileScatter", reinterpret_cast<void*>(&read_file_scatter)}
+
+#define CRT_FILE_API(dll)                                                                                \
+    {dll, "remove", reinterpret_cast<void*>(&crt_remove)},                                               \
+        {dll, "_wremove", reinterpret_cast<void*>(&crt_wremove)},                                        \
+        {dll, "_unlink", reinterpret_cast<void*>(&crt_remove)},                                          \
+        {dll, "_wunlink", reinterpret_cast<void*>(&crt_wremove)},                                        \
+        {dll, "_wstat64", reinterpret_cast<void*>(&crt_wstat64)},                                        \
+        {dll, "_stat64", reinterpret_cast<void*>(&crt_stat64)},                                          \
+        {dll, "_wstat64i32", reinterpret_cast<void*>(&crt_wstat64i32)},                                  \
+        {dll, "_stat64i32", reinterpret_cast<void*>(&crt_stat64i32)},                                    \
+        {dll, "_wstat32", reinterpret_cast<void*>(&crt_wstat32)},                                        \
+        {dll, "_stat32", reinterpret_cast<void*>(&crt_stat32)},                                          \
+        {dll, "_wstat32i64", reinterpret_cast<void*>(&crt_wstat32i64)},                                  \
+        {dll, "_stat32i64", reinterpret_cast<void*>(&crt_stat32i64)}
 }  // namespace
 
 SHIM_TABLE(file_system,
@@ -1650,4 +1792,6 @@ SHIM_TABLE(file_system,
     FILE_API("api-ms-win-core-file-l1-1-0.dll"),
     FILE_API("api-ms-win-core-file-l1-2-0.dll"),
     FILE_API("api-ms-win-core-file-l2-1-0.dll"),
+    CRT_FILE_API("api-ms-win-crt-filesystem-l1-1-0.dll"),
+    CRT_FILE_API("ucrtbase.dll"),
 );
