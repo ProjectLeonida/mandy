@@ -2521,8 +2521,9 @@ private:
 // One D3D12 command queue on one VkQueue. D3D12 lets one thread use a queue at a time per call and the COM wrapper
 // serialises its calls; state_mutex_ protects only the queue's pending/held bookkeeping (microsecond hold time),
 // while the executing_ flag serialises actual Vulkan replay, before_execute_(), and submission without holding
-// state_mutex_ across them. Callers arriving while executing_ is true append to held_ in FIFO order without waiting
-// on before_execute_() or replay, and the thread owning executing_ drains all ready held operations before leaving.
+// state_mutex_ across them. Wait, Signal, Marker, and batches blocked on an unmet Wait append under state_mutex_
+// without waiting on before_execute_() or replay; an unblocked synchronous ExecuteCommandLists waits on exec_cv_
+// until executing_ clears so before_execute_() and replay still finish synchronously before returning.
 //
 // A Wait on a fence value no Signal has been submitted for yet holds the next batch (ExecuteCommandLists or Signal)
 // on the CPU, with everything the queue is asked to do after it, instead of replaying it against layouts from before
@@ -2676,7 +2677,6 @@ public:
                       std::span<const TileRange> ranges, GetHeap&& get_heap) {
         flush_async();  // after the calls queued before it (LEONIDA_SUBMIT_ASYNC)
         bool ok = false;
-        bool drained = false;
         QueueHolds<VkSemaphore>::WorkGuard work_guard;
         std::vector<std::shared_ptr<void>> retired;
         {
@@ -2684,6 +2684,8 @@ public:
             exec_cv_.wait(state, [this] { return !executing_; });
             work_guard.arm(context_.holds());
             executing_ = true;
+            active_seq_ = context_.holds().next_seq();
+            update_held_front_seq_locked();
             ExecGuard exec_guard{this, state};
             take_waits_to_exec_locked();
             state.unlock();
@@ -2736,12 +2738,14 @@ public:
             state.lock();
             restore_exec_waits_locked();
             flush_exec_pins_locked(retired);
-            drained = drain_held_while_executing(state, retired);
+            active_seq_ = 0;
+            update_held_front_seq_locked();
+            drain_held_while_executing(state, retired);
             exec_guard.release();
             drain_pins(retired);
         }
         retired.clear();
-        if (drained) context_.holds().pump_ready();
+        context_.holds().pump_ready();
         return ok;
     }
 
@@ -2749,7 +2753,6 @@ public:
                             std::span<const TileRegion> src_regions) {
         flush_async();
         bool ok = false;
-        bool drained = false;
         QueueHolds<VkSemaphore>::WorkGuard work_guard;
         std::vector<std::shared_ptr<void>> retired;
         {
@@ -2757,6 +2760,8 @@ public:
             exec_cv_.wait(state, [this] { return !executing_; });
             work_guard.arm(context_.holds());
             executing_ = true;
+            active_seq_ = context_.holds().next_seq();
+            update_held_front_seq_locked();
             ExecGuard exec_guard{this, state};
             take_waits_to_exec_locked();
             state.unlock();
@@ -2784,21 +2789,24 @@ public:
             state.lock();
             restore_exec_waits_locked();
             flush_exec_pins_locked(retired);
-            drained = drain_held_while_executing(state, retired);
+            active_seq_ = 0;
+            update_held_front_seq_locked();
+            drain_held_while_executing(state, retired);
             exec_guard.release();
             drain_pins(retired);
         }
         retired.clear();
-        if (drained) context_.holds().pump_ready();
+        context_.holds().pump_ready();
         return ok;
     }
 
     // ExecuteCommandLists: every list is checked before any is written, so a failure submits nothing and leaves
     // the layout tracker as it was. Pending Wait()s are attached to this submission. When one of them (or an
-    // earlier held operation, or an active execution on this queue) requires holding, the batch is appended to
-    // held_ under state_mutex_ without blocking on before_execute_() or replay, and the call succeeds: the batch is
-    // replayed in strict FIFO order by the thread draining this queue or submitting the Signal (or the CPU Signal),
-    // which is also where its errors are reported (stderr, and take_held_failure()).
+    // earlier wait-blocked held operation) requires holding, the batch is appended to held_ under state_mutex_
+    // without blocking on before_execute_() or replay, and the call succeeds: the batch is replayed in strict FIFO
+    // order once the wait is satisfied, which is also where its errors are reported (stderr, and take_held_failure()).
+    // Otherwise, if another thread is currently executing or draining ready held ops, this call waits on exec_cv_
+    // (with state_mutex_ unlocked) and runs before_execute_() and execute_now() synchronously before returning.
     //
     // `pin`, called only when the batch is held or queued asynchronously, returns what has to stay alive until the
     // batch has run: the COM layer passes the pipeline states and root signatures the lists named (the application
@@ -2872,7 +2880,6 @@ public:
 
     bool signal_sync(VkSemaphore fence, std::uint64_t value, const PinFn& pin, std::shared_ptr<void> async_pin = {}) {
         bool ok = true;
-        bool drained = false;
         QueueHolds<VkSemaphore>::WorkGuard work_guard;
         std::vector<std::shared_ptr<void>> retired;
         {
@@ -2888,6 +2895,8 @@ public:
             } else {
                 work_guard.arm(context_.holds());
                 executing_ = true;
+                active_seq_ = async_seq_ ? async_seq_ : context_.holds().next_seq();
+                update_held_front_seq_locked();
                 ExecGuard exec_guard{this, state};
                 take_waits_to_exec_locked();
                 state.unlock();
@@ -2906,13 +2915,15 @@ public:
                 state.lock();
                 restore_exec_waits_locked();
                 flush_exec_pins_locked(retired);
-                drained = drain_held_while_executing(state, retired);
+                active_seq_ = 0;
+                update_held_front_seq_locked();
+                drain_held_while_executing(state, retired);
                 exec_guard.release();
             }
             drain_pins(retired);
         }
         retired.clear();
-        context_.holds().pump_ready();  // this Signal, or the hold/drain above, may have made a held batch ready
+        context_.holds().pump_ready();  // this Signal, its active_seq_ completion, or a drain may unblock waiters
         return ok;
     }
 
@@ -2966,7 +2977,7 @@ public:
     }
 
     void marker_sync(DebugMarker::Kind kind, const char* label) {
-        bool drained = false;
+        bool ran = false;
         QueueHolds<VkSemaphore>::WorkGuard work_guard;
         std::vector<std::shared_ptr<void>> retired;
         {
@@ -2980,6 +2991,8 @@ public:
             } else {
                 work_guard.arm(context_.holds());
                 executing_ = true;
+                active_seq_ = async_seq_ ? async_seq_ : context_.holds().next_seq();
+                update_held_front_seq_locked();
                 ExecGuard exec_guard{this, state};
                 state.unlock();
 
@@ -2987,13 +3000,16 @@ public:
 
                 state.lock();
                 flush_exec_pins_locked(retired);
-                drained = drain_held_while_executing(state, retired);
+                active_seq_ = 0;
+                update_held_front_seq_locked();
+                drain_held_while_executing(state, retired);
                 exec_guard.release();
+                ran = true;
             }
             drain_pins(retired);
         }
         retired.clear();
-        if (drained) context_.holds().pump_ready();
+        if (ran) context_.holds().pump_ready();
     }
 
     bool idle() {
@@ -3258,8 +3274,7 @@ private:
         return ReplayResult::success;
     }
 
-    ReplayResult execute_now(std::span<const CommandList* const> lists, std::uint64_t execute_call,
-                             std::span<const std::size_t> batch_breaks = {}) {
+    ReplayResult execute_now(std::span<const CommandList* const> lists, std::uint64_t execute_call) {
         // The "submit frame" line and the floor: this submission from before its first phase to after its last.
         const submit_phases::Submission submission{int(kind_)};
         {
@@ -3613,9 +3628,9 @@ private:
         if (statistics_segments && can_resolve_occlusion) {
             if (!segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, statistics_segments, statistics))
                 return queue_unsupported(__LINE__);
-            for (const auto& list : prepared)
-                statistics->mesh.insert(statistics->mesh.end(), list.statistics_mesh.begin(),
-                                        list.statistics_mesh.end());
+            for (std::size_t i = 0; i < lists.size(); ++i)
+                statistics->mesh.insert(statistics->mesh.end(), prepared[i].statistics_mesh.begin(),
+                                        prepared[i].statistics_mesh.end());
             if (std::find(statistics->mesh.begin(), statistics->mesh.end(), 1) == statistics->mesh.end()) {
                 statistics->mesh.clear();
             } else {
@@ -3842,23 +3857,7 @@ private:
                                      kind_ == QueueKind::compute ? "compute" : "copy";
             diagnostics = fault.begin_submission(execute_call, queue_, queue_kind, lists.size());
         }
-        std::size_t next_break = 0;
         for (std::size_t i = 0; i < lists.size(); ++i) {
-            if (next_break < batch_breaks.size() && batch_breaks[next_break] == i) {
-                ++next_break;
-                // D3D12 boundary between two coalesced ExecuteCommandLists calls: close open list labels and
-                // publish all writes from the preceding batch before the next batch runs.
-                close_labels(command_buffer, replay, open_labels);
-                open_labels = 0;
-                if (context_.vk.vkCmdPipelineBarrier) {
-                    VkMemoryBarrier full{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-                    full.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-                    full.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-                    context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &full, 0, nullptr, 0,
-                                                     nullptr);
-                }
-            }
             const auto& list = prepared[i];
             if (execute_call && i < diagnostics.lists.size()) {
                 const CheckpointRecorder recorder{checkpoint, diagnostics, context_.device_fault()->pipeline_names, i};
@@ -4042,6 +4041,13 @@ private:
     // has no submitted Signal yet. Called with state_mutex_ held.
     bool must_hold() const { return !held_.empty() || waits_pending(waits_, wait_values_); }
 
+    // True when a synchronous caller cannot run even after the active execution finishes draining ready held ops:
+    // either this call carries a Wait on an unsignaled fence, or the front of held_ is blocked on one.
+    // Called with state_mutex_ held.
+    bool blocked_by_wait_locked() const {
+        return waits_pending(waits_, wait_values_) || (!held_.empty() && !ready(held_.front()));
+    }
+
     // Called with state_mutex_ held whenever active_seq_ or held_ changes. Keeps held_front_seq_ covering both any
     // popped op currently executing and the front of held_ so Present barriers never overtake executing work.
     void update_held_front_seq_locked() {
@@ -4140,106 +4146,99 @@ private:
                                    std::uint64_t execute_call, MakeHeldLists&& make_held_lists,
                                    std::shared_ptr<void> async_pin = {}) {
         ReplayResult result = ReplayResult::success;
+        bool ran = false;
         bool held = false;
-        bool drained = false;
+        bool pre_drained = false;
         QueueHolds<VkSemaphore>::WorkGuard work_guard;
         std::vector<std::shared_ptr<void>> retired;  // destroyed after state_mutex_ is released
+        auto hold_batch_locked = [&] {
+            Deferred op;
+            op.kind = Deferred::Kind::batch;
+            op.execute_call = execute_call;
+            op.lists = make_held_lists();
+            if (async_pin) op.pins.push_back(std::move(async_pin));
+            else if (pin) op.pins.push_back(pin());
+            hold(std::move(op));
+            held = true;
+        };
         {
             std::unique_lock state(state_mutex_, std::defer_lock);
             submit_phases::lock_timed(state);
-            if (!executing_ && !must_hold()) {
+            // If another thread is executing or draining ready held ops and this batch is not blocked by an unmet
+            // Wait, wait on exec_cv_ (with state_mutex_ unlocked so Wait/Signal/wait-blocked callers never stall on
+            // before_execute_()) so this batch still runs before_execute_() and execute_now() synchronously.
+            if (executing_ && !blocked_by_wait_locked() && !context_.is_device_lost()) {
+                exec_cv_.wait(state, [this] {
+                    return !executing_ || blocked_by_wait_locked() || context_.is_device_lost();
+                });
+            }
+            if (context_.is_device_lost()) {
+                result = queue_unsupported(__LINE__);
+                if (async_pin) retired.push_back(std::move(async_pin));
+            } else if (!executing_ && !blocked_by_wait_locked()) {
                 work_guard.arm(context_.holds());
                 executing_ = true;
                 ExecGuard exec_guard{this, state};
-                take_waits_to_exec_locked();
-                state.unlock();
+                // Drain any ready held ops ahead of us first (strict FIFO, e.g. a gate just satisfied by
+                // QueueHolds::signaled() before pump_ready() reached this queue).
+                if (!held_.empty()) pre_drained = drain_held_while_executing(state, retired);
+                if (context_.is_device_lost()) {
+                    result = queue_unsupported(__LINE__);
+                    if (async_pin) retired.push_back(std::move(async_pin));
+                } else if (must_hold()) {
+                    hold_batch_locked();
+                } else {
+                    active_seq_ = async_seq_ ? async_seq_ : context_.holds().next_seq();
+                    update_held_front_seq_locked();
+                    take_waits_to_exec_locked();
+                    state.unlock();
 
-                result = execute_now(lists, execute_call);
-                if (async_pin) {
-                    if (result == ReplayResult::success && submitted_)
-                        exec_ticketed_pins_.push_back({submitted_, std::move(async_pin)});
-                    else
-                        exec_retired_pins_.push_back(std::move(async_pin));
+                    result = execute_now(lists, execute_call);
+                    if (async_pin) {
+                        if (result == ReplayResult::success && submitted_)
+                            exec_ticketed_pins_.push_back({submitted_, std::move(async_pin)});
+                        else
+                            exec_retired_pins_.push_back(std::move(async_pin));
+                    }
+
+                    state.lock();
+                    restore_exec_waits_locked();
+                    flush_exec_pins_locked(retired);
+                    active_seq_ = 0;
+                    update_held_front_seq_locked();
+                    drain_held_while_executing(state, retired);
+                    ran = true;
                 }
-
-                state.lock();
-                restore_exec_waits_locked();
-                flush_exec_pins_locked(retired);
-                drained = drain_held_while_executing(state, retired);
                 exec_guard.release();
-            } else if (context_.is_device_lost()) {
-                result = queue_unsupported(__LINE__);
-                if (async_pin) retired.push_back(std::move(async_pin));
             } else {
-                Deferred op;
-                op.kind = Deferred::Kind::batch;
-                op.execute_call = execute_call;
-                op.lists = make_held_lists();
-                if (async_pin) op.pins.push_back(std::move(async_pin));
-                else if (pin) op.pins.push_back(pin());
-                hold(std::move(op));
-                held = true;
+                hold_batch_locked();
             }
             drain_pins(retired);
         }
         retired.clear();
-        if (held || drained) context_.holds().pump_ready();  // a Signal or newly drained op may unblock waiters
+        if (ran || held || pre_drained) context_.holds().pump_ready();
         return result;
     }
 
-    // Runs one held batch op (helper for single-batch execution and coalesced-batch failure fallback).
-    // Called by the thread owning executing_ with state_mutex_ UNLOCKED.
-    void run_single_held_batch(Deferred& op) {
-        std::vector<const CommandList*> lists;
-        lists.reserve(op.lists.size());
-        for (const auto& list : op.lists) lists.push_back(list.get());
-        // The pipeline states and root signatures of the lists are in op.pins (see execute()): they live until
-        // the batch has been recorded and then, with the fences, until its submission has completed (below).
-        const ReplayResult result = execute_now(lists, op.execute_call);
-        if (result != ReplayResult::success) {
-            int none = static_cast<int>(ReplayResult::success);
-            held_failure_.compare_exchange_strong(none, static_cast<int>(result));
-            std::fprintf(stderr, "[rt] d3d12: a held ExecuteCommandLists failed when it was released (result %d); "
-                                 "nothing was submitted for it, and a Signal behind it still signals\n",
-                         static_cast<int>(result));
-        }
-        retire_exec_pins(op.pins, submitted_);
-    }
-
-    // Drains all ready held operations in strict FIFO order while executing_ is owned by the caller.
-    // Releases state_mutex_ around every before_execute_() / execute_now() / submit() / marker_now() so title threads
-    // never block behind an active submission. Coalesces consecutive ready batch ops (with no intervening Signal,
-    // Wait, or Marker) into a single execute_now() call.
+    // Drains all ready held operations in strict FIFO order while executing_ is owned by the caller, running each
+    // batch with its own execute_now() (before_execute_(), bindless_prepare_(), prelude_record_(), fault markers).
+    // Releases state_mutex_ around every execute_now() / submit() / marker_now() so Wait/Signal/wait-blocked callers
+    // never block behind an active submission.
     // Entry & exit: state_mutex_ held, executing_ == true.
     bool drain_held_while_executing(std::unique_lock<std::mutex>& state,
                                     std::vector<std::shared_ptr<void>>& retired) {
         bool released = false;
         while (!held_.empty() && (context_.is_device_lost() || ready(held_.front()))) {
-            std::vector<Deferred> ops;
-            Deferred first = std::move(held_.front());
+            Deferred op = std::move(held_.front());
             held_.pop_front();
             const bool lost = context_.is_device_lost();
-            if (!lost && first.kind == Deferred::Kind::batch) {
-                ops.push_back(std::move(first));
-                // Coalesce consecutive ready batches with no intervening Signal, Wait (non-empty waits), or Marker.
-                while (!held_.empty() && held_.front().kind == Deferred::Kind::batch &&
-                       held_.front().waits.empty() && ready(held_.front())) {
-                    ops.push_back(std::move(held_.front()));
-                    held_.pop_front();
-                }
-            } else {
-                ops.push_back(std::move(first));
-            }
-            active_seq_ = ops.front().seq;
+            active_seq_ = op.seq;
             update_held_front_seq_locked();
 
             if (lost) {
-                const auto dropped_count = static_cast<std::int64_t>(ops.size());
-                for (auto& op : ops) {
-                    for (auto& p : op.pins) retired.push_back(std::move(p));
-                    for (auto& p : op.wait_pins) retired.push_back(std::move(p));
-                }
-                context_.holds().held_changed(-dropped_count);
+                for (auto& p : op.pins) retired.push_back(std::move(p));
+                for (auto& p : op.wait_pins) retired.push_back(std::move(p));
+                context_.holds().held_changed(-1);
                 active_seq_ = 0;
                 update_held_front_seq_locked();
                 released = true;
@@ -4247,90 +4246,67 @@ private:
             }
 
             // Capture latency-log metadata before moving waits out.
-            struct HeldLatencyInfo {
-                int kind = 0;
-                std::chrono::steady_clock::time_point held_at{};
-                std::uint64_t fence = 0;
-                std::uint64_t value = 0;
-            };
-            std::vector<HeldLatencyInfo> latency_info;
-            if (gpu_latency::enabled()) {
-                latency_info.reserve(ops.size());
-                for (const Deferred& op : ops) {
-                    HeldLatencyInfo info{int(op.kind), op.held_at, 0, 0};
-                    for (std::size_t i = 0; i < op.waits.size(); ++i)
-                        if (op.wait_values[i] > info.value) {
-                            info.fence = std::uint64_t(reinterpret_cast<std::uintptr_t>(op.waits[i]));
-                            info.value = op.wait_values[i];
-                        }
-                    latency_info.push_back(info);
-                }
+            const bool log_latency = gpu_latency::enabled();
+            const int latency_kind = int(op.kind);
+            const auto latency_held_at = op.held_at;
+            std::uint64_t latency_fence = 0;
+            std::uint64_t latency_value = 0;
+            if (log_latency) {
+                for (std::size_t i = 0; i < op.waits.size(); ++i)
+                    if (op.wait_values[i] > latency_value) {
+                        latency_fence = std::uint64_t(reinterpret_cast<std::uintptr_t>(op.waits[i]));
+                        latency_value = op.wait_values[i];
+                    }
             }
 
-            // Move leading op's waits into execution-local storage (coalesced followers have empty waits).
-            exec_waits_.insert(exec_waits_.end(), ops.front().waits.begin(), ops.front().waits.end());
-            exec_wait_values_.insert(exec_wait_values_.end(), ops.front().wait_values.begin(),
-                                     ops.front().wait_values.end());
-            for (auto& p : ops.front().wait_pins) exec_wait_pins_.push_back(std::move(p));
-            ops.front().waits.clear();
-            ops.front().wait_values.clear();
-            ops.front().wait_pins.clear();
+            // Move this op's waits into execution-local storage.
+            exec_waits_.insert(exec_waits_.end(), op.waits.begin(), op.waits.end());
+            exec_wait_values_.insert(exec_wait_values_.end(), op.wait_values.begin(), op.wait_values.end());
+            for (auto& p : op.wait_pins) exec_wait_pins_.push_back(std::move(p));
+            op.waits.clear();
+            op.wait_values.clear();
+            op.wait_pins.clear();
 
-            const auto popped_count = static_cast<std::int64_t>(ops.size());
             state.unlock();
 
-            for (const auto& info : latency_info)
-                gpu_latency::held(int(kind_), info.kind, info.held_at, info.fence, info.value);
+            if (log_latency) gpu_latency::held(int(kind_), latency_kind, latency_held_at, latency_fence, latency_value);
 
-            switch (ops.front().kind) {
-            case Deferred::Kind::batch:
-                if (ops.size() == 1) {
-                    run_single_held_batch(ops.front());
-                } else {
-                    std::vector<const CommandList*> lists;
-                    std::vector<std::size_t> batch_breaks;
-                    std::size_t total_lists = 0;
-                    for (const Deferred& op : ops) total_lists += op.lists.size();
-                    lists.reserve(total_lists);
-                    batch_breaks.reserve(ops.size() - 1);
-                    for (const Deferred& op : ops) {
-                        if (!lists.empty() && !op.lists.empty()) batch_breaks.push_back(lists.size());
-                        for (const auto& lp : op.lists) lists.push_back(lp.get());
-                    }
-                    const ReplayResult result = execute_now(lists, ops.front().execute_call, batch_breaks);
-                    if (result == ReplayResult::success) {
-                        for (Deferred& op : ops) retire_exec_pins(op.pins, submitted_);
-                    } else if (!context_.is_device_lost()) {
-                        // One batch in the coalesced group failed validation or replay: fall back to running each
-                        // batch individually so valid batches in the group still execute.
-                        for (Deferred& op : ops) run_single_held_batch(op);
-                    } else {
-                        int none = static_cast<int>(ReplayResult::success);
-                        held_failure_.compare_exchange_strong(none, static_cast<int>(result));
-                        std::fprintf(stderr, "[rt] d3d12: a held ExecuteCommandLists failed when it was released "
-                                             "(result %d); nothing was submitted for it, and a Signal behind it still "
-                                             "signals\n",
-                                     static_cast<int>(result));
-                        for (Deferred& op : ops) retire_exec_pins(op.pins, submitted_);
-                    }
+            switch (op.kind) {
+            case Deferred::Kind::batch: {
+                std::vector<const CommandList*> lists;
+                lists.reserve(op.lists.size());
+                for (const auto& list : op.lists) lists.push_back(list.get());
+                // The pipeline states and root signatures of the lists are in op.pins (see execute()): they live until
+                // the batch has been recorded and then, with the fences, until its submission has completed.
+                const ReplayResult result = execute_now(lists, op.execute_call);
+                if (result != ReplayResult::success) {
+                    int none = static_cast<int>(ReplayResult::success);
+                    held_failure_.compare_exchange_strong(none, static_cast<int>(result));
+                    std::fprintf(stderr, "[rt] d3d12: a held ExecuteCommandLists failed when it was released "
+                                         "(result %d); nothing was submitted for it, and a Signal behind it still "
+                                         "signals\n",
+                                 static_cast<int>(result));
                 }
-                break;
-            case Deferred::Kind::signal:
-                if (!submit(VK_NULL_HANDLE, ops.front().fence, ops.front().value))
-                    std::fprintf(stderr, "[rt] d3d12: a held Signal failed when it was released\n");
-                retire_exec_pins(ops.front().pins, submitted_);
-                break;
-            case Deferred::Kind::marker:
-                marker_now(ops.front().marker_kind, ops.front().label.c_str());
-                retire_exec_pins(ops.front().pins, submitted_);
+                retire_exec_pins(op.pins, result == ReplayResult::success ? submitted_ : 0);
                 break;
             }
-            ops.clear();  // drop CommandList refs before re-acquiring state_mutex_
+            case Deferred::Kind::signal: {
+                const bool ok = submit(VK_NULL_HANDLE, op.fence, op.value);
+                if (!ok) std::fprintf(stderr, "[rt] d3d12: a held Signal failed when it was released\n");
+                retire_exec_pins(op.pins, ok ? submitted_ : 0);
+                break;
+            }
+            case Deferred::Kind::marker:
+                marker_now(op.marker_kind, op.label.c_str());
+                retire_exec_pins(op.pins, 0);
+                break;
+            }
+            op.lists.clear();  // drop CommandList refs before re-acquiring state_mutex_
 
             state.lock();
             restore_exec_waits_locked();
             flush_exec_pins_locked(retired);
-            context_.holds().held_changed(-popped_count);
+            context_.holds().held_changed(-1);
             active_seq_ = 0;
             update_held_front_seq_locked();
             released = true;
@@ -4349,9 +4325,6 @@ private:
             {
                 std::lock_guard lock(inbox_mutex_);
                 if (async_stop_) return false;  // worker is stopping/joined during teardown
-                // A Present barrier (after_held) or cross-queue Signal just ran pump_ready(): do not coalesce a
-                // later inbox batch across what is already queued so a Present runs between them.
-                if (!inbox_.empty()) inbox_.back().barrier_after = true;
                 // Only ask the worker to drain held_ when this queue actually has held work; avoids idle wakeups
                 // and cross-queue ping-pong while another queue holds an unsatisfied wait.
                 if (held_front_seq_.load(std::memory_order_acquire) != 0 && !release_requested_) {
@@ -4404,11 +4377,18 @@ private:
         }
     }
 
-    // Holder: the sequence number of the oldest held operation.
+    // Holder: the sequence number of the oldest active or held operation.
     std::uint64_t oldest_held_seq() override {
-        // held_front_seq_ is updated under state_mutex_ to min_nonzero(active_seq_, held_.front().seq), so an
-        // atomic load never blocks on execution and always covers an op popped and currently executing.
-        std::uint64_t oldest = held_front_seq_.load(std::memory_order_acquire);
+        // Take state_mutex_ briefly (never held across execution) so reading active_seq_/held_ linearizes with
+        // next_seq() called under state_mutex_ before after_held() reads current_seq().
+        std::uint64_t oldest = 0;
+        {
+            std::lock_guard state(state_mutex_);
+            const std::uint64_t queued = held_.empty() ? 0 : held_.front().seq;
+            oldest = (active_seq_ && queued) ? std::min(active_seq_, queued)
+                   : active_seq_             ? active_seq_
+                                             : queued;
+        }
         if (async_started_.load(std::memory_order_acquire)) {
             std::lock_guard lock(inbox_mutex_);
             const std::uint64_t queued = running_seq_ ? running_seq_ : inbox_.empty() ? 0 : inbox_.front().seq;
@@ -4928,7 +4908,6 @@ private:
         DebugMarker::Kind marker_kind = DebugMarker::Kind::set;
         std::string label;
         std::chrono::steady_clock::time_point queued_at{};
-        bool barrier_after = false;  // set when release_ready() ran behind this call (e.g. Present after_held)
     };
 
     struct AsyncStats {  // under inbox_mutex_, since the last line
@@ -4975,7 +4954,8 @@ private:
     void async_worker() {
         t_worker_of_ = this;
         for (;;) {
-            std::vector<Call> calls;
+            Call call;
+            bool have = false;
             bool release = false;
             std::int64_t consumed_work = 0;
             {
@@ -4984,22 +4964,11 @@ private:
                 release = std::exchange(release_requested_, false);
                 if (release) ++consumed_work;
                 if (!inbox_.empty()) {
-                    Call first = std::move(inbox_.front());
+                    call = std::move(inbox_.front());
                     inbox_.pop_front();
-                    running_seq_ = first.seq;
-                    const bool can_merge = first.kind == Call::Kind::execute && !first.barrier_after;
-                    calls.push_back(std::move(first));
-                    if (can_merge) {
-                        // Coalesce consecutive ExecuteCommandLists in the inbox when no Signal/Wait/Marker or
-                        // Present barrier (barrier_after) intervenes.
-                        while (!inbox_.empty() && inbox_.front().kind == Call::Kind::execute) {
-                            const bool stop_after = inbox_.front().barrier_after;
-                            calls.push_back(std::move(inbox_.front()));
-                            inbox_.pop_front();
-                            if (stop_after) break;
-                        }
-                    }
-                    consumed_work += static_cast<std::int64_t>(calls.size());
+                    running_seq_ = call.seq;
+                    have = true;
+                    ++consumed_work;
                 } else if (!release) {
                     return;  // stopping, nothing queued
                 }
@@ -5012,37 +4981,32 @@ private:
                 ~WorkerTurnGuard() { holds.work_changed(-1); }
             } turn_guard{context_.holds()};
             const bool released = release && release_held();
-            const bool have = !calls.empty();
-            std::size_t popped_batches = 0;
+            const bool was_batch = have && call.kind == Call::Kind::execute;
             if (have) {
-                for (const Call& c : calls) popped_batches += (c.kind == Call::Kind::execute);
                 const auto start = std::chrono::steady_clock::now();
                 const submit_phases::WorkerScope busy(submit_phases::worker_submit);  // the "submit frame" line
-                if (calls.size() == 1) run_call(calls.front());
-                else run_coalesced_execute(calls);
+                run_call(call);
                 const auto end = std::chrono::steady_clock::now();
                 const auto ran_ns =
                     std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                const auto lag =
+                    std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(start - call.queued_at).count());
                 std::lock_guard lock(inbox_mutex_);
                 async_stats_.run_ns += ran_ns;
-                for (const Call& c : calls) {
-                    const auto lag = std::uint64_t(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(start - c.queued_at).count());
-                    async_stats_.lag_ns += lag;
-                    async_stats_.lag_max_ns = std::max(async_stats_.lag_max_ns, lag);
-                }
+                async_stats_.lag_ns += lag;
+                async_stats_.lag_max_ns = std::max(async_stats_.lag_max_ns, lag);
             }
             {
                 std::lock_guard lock(inbox_mutex_);
                 running_seq_ = 0;
                 worker_busy_ = false;
-                inbox_batches_ -= popped_batches;
+                if (was_batch) --inbox_batches_;
                 if (have) room_cv_.notify_all();
                 idle_cv_.notify_all();
                 report_async_locked();
             }
-            if (have) context_.holds().held_changed(-static_cast<std::int64_t>(calls.size()));
-            calls.clear();  // the snapshots and pins go before the pump, outside the lock
+            if (have) context_.holds().held_changed(-1);
+            call = Call{};  // the snapshots and pins go before the pump, outside the lock
             if (have || released) context_.holds().pump_ready();
         }
     }
@@ -5061,17 +5025,6 @@ private:
         async_seq_ = 0;
     }
 
-    void run_coalesced_execute(std::vector<Call>& calls) {
-        try {
-            run_coalesced_execute_unguarded(calls);
-        } catch (const std::exception& e) {
-            worker_threw(calls.front(), e.what());
-        } catch (...) {
-            worker_threw(calls.front(), "not a std::exception");
-        }
-        async_seq_ = 0;
-    }
-
     void worker_threw(const Call& call, const char* what) {
         int none = static_cast<int>(ReplayResult::success);
         held_failure_.compare_exchange_strong(none, static_cast<int>(ReplayResult::unsupported));
@@ -5085,96 +5038,6 @@ private:
         context_.mark_device_lost();
     }
 
-    void record_async_execute_failure(ReplayResult result) {
-        int none = static_cast<int>(ReplayResult::success);
-        held_failure_.compare_exchange_strong(none, static_cast<int>(result));
-        std::fprintf(stderr, "[rt] d3d12: a queued ExecuteCommandLists failed on the queue's worker (result "
-                             "%d); nothing was submitted for it\n",
-                     static_cast<int>(result));
-    }
-
-    void run_coalesced_execute_unguarded(std::vector<Call>& calls) {
-        bool held = false;
-        bool drained = false;
-        std::vector<std::shared_ptr<void>> retired;
-        {
-            std::unique_lock state(state_mutex_, std::defer_lock);
-            submit_phases::lock_timed(state);
-            if (!executing_ && !must_hold()) {
-                executing_ = true;
-                ExecGuard exec_guard{this, state};
-                take_waits_to_exec_locked();
-                state.unlock();
-
-                std::vector<const CommandList*> lists;
-                std::vector<std::size_t> batch_breaks;
-                std::size_t total_lists = 0;
-                for (const Call& c : calls) total_lists += c.lists.size();
-                lists.reserve(total_lists);
-                batch_breaks.reserve(calls.size() - 1);
-                for (const Call& c : calls) {
-                    if (!lists.empty() && !c.lists.empty()) batch_breaks.push_back(lists.size());
-                    for (const auto& lp : c.lists) lists.push_back(lp.get());
-                }
-                const ReplayResult result = execute_now(lists, calls.front().execute_call, batch_breaks);
-                if (result == ReplayResult::success) {
-                    for (Call& c : calls) {
-                        if (c.pin) {
-                            if (submitted_) exec_ticketed_pins_.push_back({submitted_, std::move(c.pin)});
-                            else exec_retired_pins_.push_back(std::move(c.pin));
-                        }
-                    }
-                } else if (!context_.is_device_lost()) {
-                    // Fallback: run each queued execute individually so valid batches in the group still succeed.
-                    for (Call& c : calls) {
-                        std::vector<const CommandList*> single_lists;
-                        single_lists.reserve(c.lists.size());
-                        for (const auto& lp : c.lists) single_lists.push_back(lp.get());
-                        const ReplayResult r = execute_now(single_lists, c.execute_call);
-                        if (r != ReplayResult::success) record_async_execute_failure(r);
-                        if (c.pin) {
-                            if (r == ReplayResult::success && submitted_)
-                                exec_ticketed_pins_.push_back({submitted_, std::move(c.pin)});
-                            else
-                                exec_retired_pins_.push_back(std::move(c.pin));
-                        }
-                    }
-                } else {
-                    record_async_execute_failure(result);
-                    for (Call& c : calls)
-                        if (c.pin) exec_retired_pins_.push_back(std::move(c.pin));
-                }
-
-                state.lock();
-                restore_exec_waits_locked();
-                flush_exec_pins_locked(retired);
-                drained = drain_held_while_executing(state, retired);
-                exec_guard.release();
-            } else if (context_.is_device_lost()) {
-                record_async_execute_failure(queue_unsupported(__LINE__));
-                for (Call& c : calls)
-                    if (c.pin) retired.push_back(std::move(c.pin));
-            } else {
-                // Must hold: push each call with its original seq so drain_held_while_executing() coalesces them
-                // cleanly once the unmet wait is satisfied.
-                for (Call& c : calls) {
-                    async_seq_ = c.seq;
-                    Deferred op;
-                    op.kind = Deferred::Kind::batch;
-                    op.execute_call = c.execute_call;
-                    op.lists = std::move(c.lists);
-                    if (c.pin) op.pins.push_back(std::move(c.pin));
-                    hold(std::move(op));
-                }
-                async_seq_ = 0;
-                held = true;
-            }
-            drain_pins(retired);
-        }
-        retired.clear();
-        if (held || drained) context_.holds().pump_ready();
-    }
-
     void run_call_unguarded(Call& call) {
         async_seq_ = call.seq;
         switch (call.kind) {
@@ -5184,7 +5047,13 @@ private:
             for (const auto& list : call.lists) lists.push_back(list.get());
             const ReplayResult result = execute_sync_impl(
                 lists, {}, call.execute_call, [&call] { return std::move(call.lists); }, std::move(call.pin));
-            if (result != ReplayResult::success) record_async_execute_failure(result);
+            if (result != ReplayResult::success) {
+                int none = static_cast<int>(ReplayResult::success);
+                held_failure_.compare_exchange_strong(none, static_cast<int>(result));
+                std::fprintf(stderr, "[rt] d3d12: a queued ExecuteCommandLists failed on the queue's worker (result "
+                                     "%d); nothing was submitted for it\n",
+                             static_cast<int>(result));
+            }
             break;
         }
         case Call::Kind::signal:
@@ -5271,8 +5140,8 @@ private:
 
     // Wait-before-Signal & queue state. state_mutex_ is held ONLY for short bookkeeping (never across
     // before_execute_(), execute_now(), submit(), bind_tiles(), or pin destruction). Execution on this queue is
-    // serialized by executing_ (true while one thread runs/drains work); callers arriving while executing_ is true
-    // append to held_ under state_mutex_ and return without blocking.
+    // serialized by executing_ (true while one thread runs/drains work): Wait/Signal/Marker and wait-blocked
+    // batches append under state_mutex_ without blocking, while unblocked sync execute() waits on exec_cv_.
     std::mutex state_mutex_;
     std::condition_variable exec_cv_;
     bool executing_ = false;
