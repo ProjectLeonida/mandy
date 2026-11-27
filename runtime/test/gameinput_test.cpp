@@ -1272,17 +1272,19 @@ void test_twins(IGameInput* input) {
 
 // ---- force feedback and haptic motors: a fake SDL haptic backend ----
 // SDL's virtual joysticks report no haptics, so the shim's haptic calls go through this table instead. It records what
-// the shim asked SDL to do and reports the capabilities a force-feedback wheel has.
+// the shim asked SDL to do and reports the capabilities a force-feedback wheel has: every effect kind but inertia,
+// so that a kind the motor lacks can be refused.
 struct FakeHaptic {
     uint32_t features = SDL_HAPTIC_CONSTANT | SDL_HAPTIC_SINE | SDL_HAPTIC_SQUARE | SDL_HAPTIC_TRIANGLE |
                         SDL_HAPTIC_SAWTOOTHUP | SDL_HAPTIC_SAWTOOTHDOWN | SDL_HAPTIC_RAMP | SDL_HAPTIC_SPRING |
-                        SDL_HAPTIC_FRICTION | SDL_HAPTIC_DAMPER | SDL_HAPTIC_INERTIA;
+                        SDL_HAPTIC_FRICTION | SDL_HAPTIC_DAMPER;
     int max_effects = 8;
     int create_result = 1;  // what create returns; negative is SDL refusing the effect
     int opens = 0, closes = 0, creates = 0, updates = 0, runs = 0, stops = 0, destroys = 0;
     int gain_calls = 0, last_gain = -1;
     uint32_t last_iterations = 0;
     SDL_HapticEffect last{};
+    uint16_t created_type = 0;  // the type of the effect create made; update refuses another, as SDL does
 };
 FakeHaptic g_fake;
 bool g_fake_open = false;  // pads attached while this is set are opened as haptic devices
@@ -1303,12 +1305,18 @@ int fake_create(void* h, const void* e) {
         return -1;
     }
     f->last = *static_cast<const SDL_HapticEffect*>(e);
+    f->created_type = f->last.type;
     return f->create_result;
 }
 bool fake_update(void* h, int, const void* e) {
     FakeHaptic* f = static_cast<FakeHaptic*>(h);
     ++f->updates;
-    f->last = *static_cast<const SDL_HapticEffect*>(e);
+    const auto* effect = static_cast<const SDL_HapticEffect*>(e);
+    if (effect->type != f->created_type) {  // SDL_UpdateHapticEffect: "Haptic: Updating effect type is illegal"
+        SDL_SetError("fake: updating effect type is illegal");
+        return false;
+    }
+    f->last = *effect;
     return true;
 }
 bool fake_run(void* h, int, uint32_t iterations) {
@@ -1379,6 +1387,10 @@ void test_force_feedback(IGameInput* input) {
     unknown.kind = static_cast<GameInputForceFeedbackEffectKind>(11);
     check(dev->CreateForceFeedbackEffect(0, &unknown, reinterpret_cast<void**>(&effect)) == E_INVALIDARG,
           "force feedback: an effect kind outside the enum is E_INVALIDARG");
+    GameInputForceFeedbackParams inertia{};
+    inertia.kind = GameInputForceFeedbackInertia;
+    check(dev->CreateForceFeedbackEffect(0, &inertia, reinterpret_cast<void**>(&effect)) == E_INVALIDARG && !effect,
+          "force feedback: a kind the motor does not report is E_INVALIDARG");
     check(dev->CreateForceFeedbackEffect(0, &params, reinterpret_cast<void**>(&effect)) == S_OK && effect,
           "force feedback: CreateForceFeedbackEffect");
     if (!effect) {  // leave nothing behind for the next test
@@ -1459,8 +1471,19 @@ void test_force_feedback(IGameInput* input) {
     wave.data.sineWave.magnitude.linearX = 1.0f;
     wave.data.sineWave.frequency = 50.0f;
     wave.data.sineWave.phase = 90.0f;
+    // A kind the motor lacks is refused by SetParams too, and the effect keeps what it had.
+    check(!effect->SetParams(&inertia), "force feedback: SetParams refuses a kind the motor does not report");
+    effect->GetParams(&read);
+    check(read.kind == GameInputForceFeedbackConstant, "force feedback: a refused SetParams changes nothing");
+    // Another kind: SDL cannot update an effect to another type, so the shim makes a new one (the fake refuses a type
+    // change in an update, as SDL_UpdateHapticEffect does).
+    const int creates_before_wave = g_fake.creates, destroys_before_wave = g_fake.destroys;
     check(effect->SetParams(&wave), "force feedback: SetParams for a sine wave");
     rt::gameinput::poll();
+    rt::gameinput::OutputState wave_out{};
+    check(g_fake.creates == creates_before_wave + 1 && g_fake.destroys == destroys_before_wave + 1 &&
+              rt::gameinput::output_state(0, &wave_out) && wave_out.effect_ran && !wave_out.effect_error[0],
+          "force feedback: a new kind replaces the SDL effect instead of updating its type");
     check(g_fake.last.type == SDL_HAPTIC_SINE && g_fake.last.periodic.period == 20 &&
               g_fake.last.periodic.magnitude == 32767 && g_fake.last.periodic.phase == 9000,
           "force feedback: a 50 Hz sine with a 90 degree phase becomes SDL's period and hundredths of a degree");
@@ -1509,9 +1532,10 @@ void test_force_feedback(IGameInput* input) {
     rt::gameinput::poll();
     check(g_fake.runs == runs1 + 1, "force feedback: and it runs again once the mute is lifted");
 
+    const int destroys_before_release = g_fake.destroys;
     check(effect->Release() == 0, "force feedback: the effect is freed once the title releases it");
     rt::gameinput::poll();
-    check(g_fake.destroys == 1, "force feedback: its SDL effect is destroyed on the poll thread");
+    check(g_fake.destroys == destroys_before_release + 1, "force feedback: its SDL effect is destroyed on the poll thread");
 
     // RT-262: the title releases effects while the poll thread applies them. The poll thread used to AddRef an effect
     // whose count had already reached 0 (its destructor waiting for the lock), use it after it was freed, and free it
@@ -1914,6 +1938,8 @@ int main(int argc, char** argv) {
         check(reading->GetControllerButtonState(64, buttons) == SDL_GAMEPAD_BUTTON_COUNT && buttons[SDL_GAMEPAD_BUTTON_SOUTH] &&
                   !buttons[SDL_GAMEPAD_BUTTON_EAST],
               "controller buttons");
+        check(reading->GetControllerAxisState(8, nullptr) == 0 && reading->GetControllerButtonState(64, nullptr) == 0,
+              "controller axes and buttons with no buffer: none written");
         check(!reading->GetMotionState(nullptr) && !reading->GetMouseState(nullptr), "no motion or mouse state");
         IGameInputReading* none = nullptr;
         check(input->GetNextReading(reading, GameInputKindGamepad, nullptr, &none) == GAMEINPUT_E_READING_NOT_FOUND && !none,
