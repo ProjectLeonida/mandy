@@ -340,7 +340,7 @@ def _sgprs(x):
 def _reads_writes(ins):
     """The SGPR numbers `ins` reads and the ones it surely writes (a destination it may leave alone is read too)."""
     op, a = base_op(ins["op"]), ins["args"]
-    if op.startswith(("s_movrels", "s_movreld", "s_swappc", "s_setpc", "s_getpc", "s_call", "s_cbranch_g_fork")):
+    if op.startswith(("s_movrels", "s_movreld", "s_swappc", "s_setpc", "s_call", "s_cbranch_g_fork")):
         return ALL, set()
     if not a:
         return set(), set()
@@ -355,29 +355,63 @@ def _reads_writes(ins):
         if x is not None:
             reads |= _sgprs(x)
     # A SOPK read-modify-write, a 16-bit or SDWA/DPP partial write, or a VOP3b carry-out pair: the first operand is
-    # taken as read too, which only ever keeps a register live.
-    if op in ("s_addk_i32", "s_mulk_i32", "s_cmovk_i32") or op.startswith("s_cmov") or \
-            ins["op"].endswith(("_sdwa", "_dpp", "_dpp8")) or "_co_" in op:
+    # taken as read too, which only ever keeps a register live. (A compare writes its whole mask in any encoding.)
+    if op in ("s_addk_i32", "s_mulk_i32", "s_cmovk_i32") or op.startswith("s_cmov") or "_co_" in op or \
+            (ins["op"].endswith(("_sdwa", "_dpp", "_dpp8")) and not op.startswith("v_cmp")):
         reads |= _sgprs(a[0])
         return reads, set()
     return reads, _sgprs(a[0])
 
 
-def _live_in(blocks, succ):
-    """The SGPR numbers each block may read before writing (ALL for every one)."""
-    use, kill = [], []
-    for blk in blocks:
-        u, k = set(), set()
-        for ins in blk:
-            r, w = _reads_writes(ins)
-            if r is ALL:
-                u = ALL
-                break
-            u |= r - k
-            k |= w
-        use.append(u)
-        kill.append(k)
-    live = [set() if u is not ALL else ALL for u in use]
+def _is_mask_operand(x, masks):
+    if x is None:
+        return False
+    if x.get("k") == "special":
+        return x.get("t", "").startswith(("exec", "vcc"))
+    return x.get("k") == "sgpr" and any(x["r"] + i in masks for i in range(x.get("n", 1)))
+
+
+# The scalar ops that read a register as a whole word of lane bits: the first or last set bit, or how many there are.
+WORD_SCANS = ("s_ff0_i32_b", "s_ff1_i32_b", "s_bcnt0_i32_b", "s_bcnt1_i32_b", "s_flbit_i32")
+
+
+def _numeric_reads(ins, masks):
+    """(reads, through) for insert_data_merges: the SGPR numbers `ins` scans as a whole word of lane bits
+    (WORD_SCANS), which a register taken as data must hold the wave's bits for. `through`: a scalar copy or
+    bitwise op of data, whose sources count only where its result is scanned in turn (`s_xor_b32 s35, s32, s26`
+    then `s_mov_b32 s26, s35`). Other reads are left out. As a mask (EXEC, a bitwise op with a mask, v_cndmask)
+    this lane's 0 / ~0 is exact: the translator takes bit L of a data register there (rdna2spirv's mask_src).
+    `masks`: the registers holding a mask before `ins` (analyse())."""
+    reads, _ = _reads_writes(ins)
+    if reads is ALL:
+        return ALL, False
+    op, a = base_op(ins["op"]), ins["args"]
+    if not a:
+        return set(), False
+    if op.startswith(WORD_SCANS):
+        return reads, False
+    if op.startswith(("s_mov_b", "s_not_b") + BITWISE) and a[0].get("k") == "sgpr" and             not any(_is_mask_operand(x, masks) for x in a[1:]):
+        return reads, True
+    return set(), False
+
+
+def _numeric_live_in(blocks, succ, masks_before):
+    """The SGPR numbers each block may read as a number before writing them (ALL for every one), following scalar
+    copies and bitwise ops of data to where their results are read (_numeric_reads)."""
+    info = [[(_reads_writes(ins)[1], *_numeric_reads(ins, masks_before.get(id(ins), {}))) for ins in blk]
+            for blk in blocks]
+
+    def through(n, live):
+        for w, reads, via in reversed(info[n]):
+            if reads is ALL:
+                return ALL
+            needed = not via or bool(w & live)
+            live = live - w
+            if needed:
+                live = live | reads
+        return live
+
+    live = [set() for _ in blocks]
     changed = True
     while changed:
         changed = False
@@ -390,7 +424,7 @@ def _live_in(blocks, succ):
                     out = ALL
                     break
                 out |= live[s]
-            new = ALL if out is ALL else (use[n] | (out - kill[n]))
+            new = ALL if out is ALL else through(n, out)
             if new != live[n]:
                 live[n] = new
                 changed = True
@@ -410,12 +444,16 @@ def insert_data_merges(blocks, succ, branches, wave64=True):
     (rdna2spirv's lane_mask_word), so the loop sees on every path what the hardware has.
 
     A register is converted only when every successor takes it as data (one that still reads it as a mask keeps
-    this lane's bit) and some successor may read it before writing it: the gather is a cross-lane step, and a
-    register nothing reads again needs none. A later mask use of the converted register stays exact: the
-    translator takes bit L of a data register for lane L (rdna2spirv's mask_src). `branches`: the opcodes that end
-    a block. Returns how many instructions were inserted."""
+    this lane's bit) and some successor may scan its lane bits before writing it (s_ff0 / s_ff1 / s_bcnt0 /
+    s_bcnt1 / s_flbit, also through scalar copies of it: _numeric_reads). The gather is a cross-lane step (a
+    barrier round under --wave64-emulate), and most such merges are only ever read as masks again (written back to
+    EXEC, ANDed with it), where this lane's 0 / ~0 is already exact: the translator takes bit L of a data register
+    for lane L there (rdna2spirv's mask_src). Other number reads of such a merge (an add, a compare) would need the
+    gather too; none is known in a shader, and they are left as they were to keep the change to the lane loops.
+    `branches`: the opcodes that end a block. Returns how many instructions were inserted."""
     inserted = 0
-    live = _live_in(blocks, succ)
+    before, _ = analyse(blocks, succ, wave64=wave64)
+    live = _numeric_live_in(blocks, succ, before)
     for _ in range(len(blocks) + 1):                    # each round only takes masks away, so this ends
         entry = _fixpoint(blocks, succ, wave64)
         added = 0

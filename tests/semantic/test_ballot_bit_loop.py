@@ -121,7 +121,43 @@ def expected(count):
     return {t: (passes[t], visits[t]) for t in range(64)}
 
 
+def mask_use_program(take_mask):
+    """A lane mask (even lanes) on one path and a number (lanes 0-15: 0xffff) on the other meet in s[6:7], which then
+    only goes into EXEC. Taken as data at the merge, each lane's 0 / ~0 on the mask path still gives its own bit
+    (bit L of a data register for lane L), so no gather is needed and none is inserted."""
+    return [
+        f"s_mov_b32 s40, {1 if take_mask else 0}",
+        "s_mov_b64 s[14:15], exec",
+        "v_mov_b32_e32 v2, 0",
+        "v_and_b32_e32 v4, 1, v0",
+        "v_cmp_eq_u32_e32 vcc, 0, v4",
+        "s_mov_b64 s[6:7], vcc",
+        "s_cmp_eq_u32 s40, 1",
+        "s_cbranch_scc1 join",
+        "s_mov_b32 s6, 0xffff",
+        "s_mov_b32 s7, 0",
+        "join:",
+        "s_and_b64 exec, s[6:7], exec",
+        "v_mov_b32_e32 v2, 1",
+        "s_mov_b64 exec, s[14:15]",
+        "v_lshlrev_b32_e32 v6, 2, v0",
+        "buffer_store_dword v2, v6, s[0:3], 0 offen offset:0",
+        "s_endpgm",
+    ]
+
+
 class BallotBitLoop(unittest.TestCase):
+    def test_a_merged_mask_used_as_a_mask_needs_no_gather(self):
+        for take_mask in (True, False):
+            want = {t: int(t % 2 == 0) if take_mask else int(t < 16) for t in range(64)}
+            for label, emulate, sg in (("native64", False, 64), ("emulate_sg32", True, 32)):
+                with self.subTest(take_mask=take_mask, mode=label):
+                    spv, _ = _translate_cs(f"cs_merged_mask_{label}_{int(take_mask)}", mask_use_program(take_mask),
+                                           threads=64, emulate=emulate)
+                    mem = run_compute_workgroup(spv, 64, sg, push_constants=VSHARP)
+                    for t in range(64):
+                        self.assertEqual(mem.get(4 * t, -1), want[t], f"{label} lane {t}")
+
     def test_every_lane_walks_the_wave_ballot(self):
         configs = [
             ("native64", False, 64, True),

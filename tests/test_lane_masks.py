@@ -407,6 +407,31 @@ def test_mask_meets_data_at_a_merge():
     assert all(i["args"][0]["r"] != 27 for blk in blocks for i in blk if i["op"] == L.TO_DATA)
     assert L.insert_data_merges(blocks, succ, branches) == 0
 
+    # A merge that is only read as a mask again (written back to EXEC, ANDed with it, a v_cndmask mask) needs no
+    # gather: this lane's 0 / ~0 already gives bit L there.
+    def diamond(use):
+        # 0 branches to a block that writes a mask to s[6:7] and one that writes data; both go on to `use`.
+        return [[ins("s_cbranch_scc0")],
+                [ins("s_mov_b64", s(6, 2), sp("exec")), ins("s_branch")],
+                [ins("s_mov_b64", s(6, 2), s(20, 2))],
+                [use, ins("s_endpgm")]], [[2, 1], [3], [3], []]
+
+    for use in (ins("s_mov_b64", sp("exec"), s(6, 2)), ins("s_and_b64", s(8, 2), s(6, 2), sp("exec")),
+                ins("v_cndmask_b32_e64", v(1), imm(0), imm(1), s(6, 2))):
+        blocks, succ = diamond(use)
+        assert L.insert_data_merges(blocks, succ, branches) == 0, use["op"]
+    # ... while a scan of its lane bits does, for the register it scans, also through a copy of it.
+    for use in ([ins("s_bcnt1_i32_b32", s(8), s(6))],
+                [ins("s_not_b32", s(9), s(6)), ins("s_ff1_i32_b32", s(8), s(9))]):
+        blocks, succ = diamond(use[0])
+        blocks[3][1:1] = use[1:]
+        assert L.insert_data_merges(blocks, succ, branches) == 1
+        assert [i["args"][0]["r"] for i in blocks[1] if i["op"] == L.TO_DATA] == [6]
+        assert L.base_op(blocks[1][-1]["op"]) == "s_branch"
+    # Other number reads are left as they were (the gather is kept to the bit scans the compiler's lane loops use).
+    blocks, succ = diamond(ins("s_add_u32", s(8), s(6), imm(1)))
+    assert L.insert_data_merges(blocks, succ, branches) == 0
+
     # A successor that still reads the register as a mask keeps this lane's bit: nothing is inserted.
     blocks = [[ins("s_mov_b64", s(6, 2), sp("exec")), ins("s_cbranch_scc0")],
               [ins("s_mov_b64", sp("exec"), s(6, 2)), ins("s_endpgm")]]
