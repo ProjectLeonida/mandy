@@ -3065,8 +3065,6 @@ struct DeviceState {
     std::uint64_t title_write_back_bytes = 0;                 // queued for this submission
     std::uint64_t title_write_back_total = 0;                 // copied back, all submissions
     std::uint64_t title_write_back_calls = 0;                 // log line count
-    std::uint64_t title_write_back_unfenced = 0;
-    static constexpr std::size_t kTitleWriteBackBatches = 64; // pending batches before the oldest goes back unfenced
     static constexpr std::size_t kTitleWriteBackRanges = 8192;         // ranges kept per submission
     static constexpr std::uint64_t kTitleWriteBackBytes = 64ull << 20; // bytes copied back per submission
     // The stream pools' mappings (title_gpu_views): one per readable run of a pool. A window is kept for the device's
@@ -3333,20 +3331,15 @@ struct DeviceState {
                 title_write_back.clear();
                 title_write_back_bytes = 0;
             }
-            bool forced = false;
+            // Backlog is not completion: another queue may finish arbitrarily many submissions while the oldest
+            // ticket waits on a console dependency. Keep their ranges until the completed prefix reaches them.
+            // Do not wait here: shadow_mutex is held, and the queue that releases that dependency may need it.
             while (!title_write_back_pending.empty() &&
-                   (title_write_back_pending.front().first <= done ||
-                    title_write_back_pending.size() > kTitleWriteBackBatches)) {
-                forced = forced || title_write_back_pending.front().first > done;
+                   title_write_back_pending.front().first <= done) {
                 for (const auto& [begin, end] : title_write_back_pending.front().second)
                     finished.push_back({begin, end});
                 title_write_back_pending.pop_front();
             }
-            // A queue held deep (console ordering) can leave batches waiting: the oldest go back anyway, once each.
-            if (forced && !title_write_back_unfenced++)
-                log_once("more than 64 title write-back batches wait on their submissions: the oldest are copied "
-                         "back without their ticket; batches:",
-                         1);
         }
         if (finished.empty()) return;
         std::uint64_t written = 0, ranges = 0;

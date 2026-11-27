@@ -3027,6 +3027,14 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_descriptor COMMAND d3d12_descriptor_test)
     set_tests_properties(d3d12_descriptor PROPERTIES SKIP_RETURN_CODE 77)
 
+    # A held queue must not let >64 pending title-shadow batches bypass retirement (no shader tools needed).
+    add_executable(d3d12_writeback_retirement_test test/d3d12_writeback_retirement_test.cpp)
+    target_link_libraries(d3d12_writeback_retirement_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_writeback_retirement_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_writeback_retirement_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_writeback_retirement COMMAND d3d12_writeback_retirement_test)
+    set_tests_properties(d3d12_writeback_retirement PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
     # Console descriptor heap T# binding rules and per-reason refusal tracking (RT-UNBOUND-TSHARP-REASONS).
     add_executable(d3d12_unbound_tsharp_rules_test test/d3d12_unbound_tsharp_rules_test.cpp)
     target_link_libraries(d3d12_unbound_tsharp_rules_test PRIVATE gta6rt_d3d12_com)

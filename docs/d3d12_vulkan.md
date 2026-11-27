@@ -1729,8 +1729,13 @@ The copies:
   Up to 8,192 ranges and 64 MiB a submission (a V# has no read/write bit, so every view
   reached is compared; past the caps the ranges are left behind, logged once). `LEONIDA_TITLE_WRITEBACK=0` turns it off. A batch is fenced: it is kept with the ticket
   of the submission that will use it and copied back only when the context reports that ticket retired, so a range
-  another submission is still writing is never read half done. A queue held deep (console ordering) can leave batches
-  waiting: past 64 of them the oldest go back without their ticket, logged once.
+  another submission is still writing is never read half done. A queue held deep (console ordering) can leave more
+  than 64 batches waiting even while another queue finishes its own work: those ranges stay pending until their
+  tickets retire. The refresh does not wait for them while holding the shadow lock, which another queue may need
+  to submit the work that releases the dependency. Pending range metadata can grow during a stall; queue length
+  never substitutes for GPU completion. `d3d12_writeback_retirement` holds one of two Vulkan queues at a timeline
+  semaphore, checks that 130 batches on the other queue do not write back early, then releases it and checks that
+  a refresh with no new reached range copies the retained result back. No shaders or game files are needed.
 - A **window that is refused** (the budget is spent, the arena is full, or the pages are not committed yet) is backed
   by a persistent geometry copy of exactly the requested range (`LEONIDA_GEOMETRY_MB`) instead; when no copy can be
   made either, the view is written with **no base and no records** — loads return 0 and stores are dropped. A raw
