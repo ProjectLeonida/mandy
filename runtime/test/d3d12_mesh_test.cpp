@@ -506,6 +506,97 @@ int main(int argc, char** argv) {
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(pixels.data(), mapped, pixels.size());
 
+        // Depth bounds through the stream, drawn: the PSO is created pending and realized on first use, so a flag
+        // dropped on the way into create_graphics would let the fragment through. The depth attachment is cleared to
+        // 0.0, outside the first bounds, so the bounds test is what decides, not the clear. The VS writes z = 0, so
+        // 0.9..1.0 must leave the target blue and 0.0..1.0 must paint it yellow. Its own readback buffer, so the mesh
+        // image rows above stay as they are.
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS2 bounds_support{};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS2, &bounds_support,
+                                                         sizeof bounds_support)));
+            if (bounds_support.DepthBoundsTestSupported) {
+                Ref<ID3D12GraphicsCommandList1> list1;
+                EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list1.p))));
+                D3D12_RESOURCE_DESC depth_desc = rt_desc;
+                depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
+                depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+                Ref<ID3D12Resource> depth_image;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &depth_desc,
+                                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                 IID_PPV_ARGS(&depth_image.p))));
+                const D3D12_DESCRIPTOR_HEAP_DESC dsv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1,
+                                                          D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+                Ref<ID3D12DescriptorHeap> dsv_heap;
+                EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&dsv_desc, IID_PPV_ARGS(&dsv_heap.p))));
+                const D3D12_CPU_DESCRIPTOR_HANDLE dsv{
+                    SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(dsv_heap.p, 9))(dsv_heap.p))};
+                device->CreateDepthStencilView(depth_image.p, nullptr, dsv);
+
+                Ref<ID3D12Resource> bounds_readback;
+                const auto bounds_desc = buffer_desc(size * 256);
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &bounds_desc,
+                                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                 IID_PPV_ARGS(&bounds_readback.p))));
+                D3D12_TEXTURE_COPY_LOCATION bounds_dst{};
+                bounds_dst.pResource = bounds_readback.p;
+                bounds_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                bounds_dst.PlacedFootprint = dst.PlacedFootprint;
+
+                Stream bounds_stream = vs_stream;
+                D3D12_DEPTH_STENCIL_DESC1 bounds_state{};
+                bounds_state.DepthEnable = TRUE;
+                bounds_state.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+                bounds_state.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+                bounds_state.DepthBoundsTestEnable = TRUE;
+                bounds_stream.add(DepthStencil1Subobject{.inner = bounds_state});
+                bounds_stream.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT>{
+                    .inner = DXGI_FORMAT_D32_FLOAT});
+                Ref<ID3D12PipelineState> bounds_pso;
+                EXPECT(SUCCEEDED(create(device.p, bounds_stream, bounds_pso)) && bounds_pso.p);
+
+                const auto draw_bounded = [&](float low, float high) {
+                    EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, bounds_pso.p)));
+                    D3D12_RESOURCE_BARRIER to_rt =
+                        transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    list->ResourceBarrier(1, &to_rt);
+                    list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+                    list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+                    list->SetGraphicsRootSignature(root.p);
+                    list->RSSetViewports(1, &viewport);
+                    list->RSSetScissorRects(1, &scissor);
+                    list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+                    list1->OMSetDepthBounds(low, high);
+                    list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+                    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    list->DrawInstanced(3, 1, 0, 0);
+                    D3D12_RESOURCE_BARRIER to_copy_again =
+                        transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    list->ResourceBarrier(1, &to_copy_again);
+                    list->CopyTextureRegion(&bounds_dst, 0, 0, 0, &src, nullptr);
+                    EXPECT(list->Close() == S_OK);
+                    queue->ExecuteCommandLists(1, lists);
+                    EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                    EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
+                    std::vector<std::uint8_t> shot(size * 256);
+                    void* bounds_mapped = nullptr;
+                    EXPECT(SUCCEEDED(bounds_readback->Map(0, nullptr, &bounds_mapped)));
+                    std::memcpy(shot.data(), bounds_mapped, shot.size());
+                    UINT yellow = 0;
+                    for (UINT i = 0; i + 3 < shot.size(); i += 4)
+                        yellow += shot[i] > 200 && shot[i + 1] > 200 && shot[i + 2] < 60;
+                    return int(yellow);
+                };
+                const int outside = draw_bounded(0.9f, 1.0f);
+                const int inside = draw_bounded(0.0f, 1.0f);
+                std::printf("depth bounds through a pending stream: %d px outside the bounds, %d px inside\n", outside,
+                            inside);
+                EXPECT(outside == 0 && inside > 0);
+                // Leave the target where the next block expects it, and the pixels buffer untouched: it is only
+                // rewritten below, and that row is compared at the end.
+            }
+        }
+
         // ExecuteIndirect with a DISPATCH_MESH signature draws as DispatchMesh (vkCmdDrawMeshTasksIndirectEXT after
         // the clamp pass): one record {2, 1, 1} at upload + 768 fills columns 0 and 1 of row 0, the top half of the
         // top-left quadrant, red; the rest of the cleared target stays blue.
