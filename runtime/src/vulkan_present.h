@@ -391,6 +391,7 @@ public:
 
     VkResult submit(const ResourceBinding* binding, ResourceId source, bool vsync, const PresentRect* source_rect,
                     bool srgb, bool tear = false, const PresentPlanes* planes = nullptr) {
+        const submit_phases::TitleCall call(submit_phases::part_present);  // the "submit frame" line
         wait_for_room();
         std::lock_guard lock(present_mutex_);
         // `binding` null and `planes` null: clear instead of blit; `planes`: compose them (`binding`, `source`,
@@ -679,6 +680,7 @@ private:
             const auto shown = ++presented_;
             submit_phases::totals().presents.fetch_add(1, std::memory_order_relaxed);  // frames a second, phase line
             submit_phases::totals().present_serial.fetch_add(1, std::memory_order_relaxed);
+            submit_phases::frame_presented();  // a frame of the "submit frame" line ends
             if (dump_.due(shown - 1)) {
                 // Presentation is already queued and the queue/tracker locks are released. A sampled frame
                 // may stall here for its transfer fence and a private CPU copy. PNG and disk I/O run on a worker.

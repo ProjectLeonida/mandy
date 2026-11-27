@@ -63,6 +63,7 @@
 #include "../src/list_value_progress.h"  // leonida::list_value_progress: which held gate may go without its value
 #include "../src/title_page_watch.h"  // leonida::kernel_writes::store
 #include "../src/value_write_sink.h"  // leonida::value_sink: the arena and xmem's PAGE_NOACCESS pages
+#include "../src/submit_phases.h"     // the pump's and releaser's time in the "submit frame" line
 #ifdef LEONIDA_VULKAN_DEVICE
 #include "d3d12_com.h"  // rt::d3d12::fence_signal_submitted
 #endif
@@ -647,6 +648,7 @@ private:
                 WaitForSingleObject(wake_, polling ? kPollMs : writes ? 50 : releasing ? 500 : INFINITE);
             }
             if (stop_.load(std::memory_order_relaxed)) break;
+            const leonida::submit_phases::WorkerScope busy(leonida::submit_phases::worker_value_pump);
             pass(false);
             watch_releaser();
             summarize();
@@ -691,6 +693,8 @@ private:
                 releasing_ = true;
             }
             SetEvent(wake_);  // the pump may be in an untimed wait: it watches the Signals from here on
+            // Our thread: its Signals (and the batches they release) are not the title's, in the "submit frame" line.
+            const leonida::submit_phases::WorkerScope busy(leonida::submit_phases::worker_value_pump);
             struct PendingReleaseGuard {
                 std::atomic<std::size_t>* count;
                 std::size_t remaining;

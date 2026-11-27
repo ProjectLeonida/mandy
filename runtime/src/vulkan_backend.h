@@ -899,6 +899,7 @@ private:
             dispatching_.push_back(slot);
         }
         lock.unlock();
+        const submit_phases::WorkerScope busy(submit_phases::worker_fence_thread);  // the "submit frame" line
         for (std::size_t i = 0; i < entries.size(); ++i) {
             Entry& e = entries[i];
             DispatchSlot& slot = *slots[i];
@@ -2719,7 +2720,8 @@ public:
         bool held = false;
         std::vector<std::shared_ptr<void>> retired;  // destroyed after state_mutex_ is released
         {
-            std::lock_guard state(state_mutex_);
+            std::unique_lock state(state_mutex_, std::defer_lock);
+            submit_phases::lock_timed(state);
             if (!must_hold()) {
                 result = execute_now(lists, execute_call);
             } else if (context_.is_device_lost()) {
@@ -3105,6 +3107,8 @@ private:
     }
 
     ReplayResult execute_now(std::span<const CommandList* const> lists, std::uint64_t execute_call) {
+        // The "submit frame" line and the floor: this submission from before its first phase to after its last.
+        const submit_phases::Submission submission{int(kind_)};
         {
             const submit_phases::Scope waited(submit_phases::wait_room);
             if (context_.is_device_lost() || !wait_for_room()) return queue_unsupported(__LINE__);
@@ -3151,7 +3155,8 @@ private:
         // compiles; tracker_mutex_ is acquired lazily during prepare() only if a list uses a shared helper, and
         // otherwise right before bindless_prepare_/emit() through submit() so bindless flushes, layout emits, and
         // submissions stay in order.
-        std::shared_lock pipeline_lock(context_.pipeline_mutex_);
+        std::shared_lock pipeline_lock(context_.pipeline_mutex_, std::defer_lock);
+        submit_phases::lock_timed(pipeline_lock);
         std::shared_lock resource_lock(context_.resource_mutex_, std::defer_lock);
         std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
         // Declared after tracker_lock so any early return after depth24_->prepare() retires uncommitted scratch/pools
@@ -3210,7 +3215,7 @@ private:
         PipelineCompiles prior_compiles;
         bool has_prior_compiles = false;
         for (int pass = 0;; ++pass) {
-            resource_lock.lock();
+            submit_phases::lock_timed(resource_lock);
             bindless_commit = !transfer_only ? context_.bindless_commit_ : std::function<void(bool)>{};
             replay = context_.replay_;
             mesh_draws = 0;
@@ -3387,6 +3392,7 @@ private:
                 has_queries = has_queries || !prepared[i].queries.empty();
             }
             if (pass == 0 && !compiles.empty()) {
+                submit_phases::note_change(submit_phases::change_pipelines);  // not a floor submission
                 if (depth24_guard.active) {
                     context_.depth24_->retire(progress_, 0);
                     depth24_guard.active = false;
@@ -4385,7 +4391,8 @@ private:
         const std::vector<VkPipelineStageFlags> stages(semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         VkResult res = VK_SUCCESS;
         {
-            std::lock_guard lock(context_.submit_mutex());
+            std::unique_lock lock(context_.submit_mutex(), std::defer_lock);
+            submit_phases::lock_timed(lock);  // a wait for another queue's submit is counted (the frame line)
             VkSemaphore signals[2]{progress_, VK_NULL_HANDLE};
             std::uint64_t signal_values[2]{ticket, 0};
             std::uint32_t signal_count = 1;
@@ -4439,8 +4446,10 @@ private:
                 }
                 ring_at = ring->begin_submit(record);
             }
+            const std::int64_t call_start = submit_phases::now_ns();
             res = context_.observe_result(context_.queue_submit(queue_, 1, &submit, context_.gpu_labels_.submit_fence(command_buffer)),
                                           "vkQueueSubmit");
+            submit_phases::add_part(submit_phases::part_submit_call, std::uint64_t(submit_phases::now_ns() - call_start));
             context_.gpu_labels_.submitted(command_buffer, res == VK_SUCCESS);
             if (ring) ring->end_submit(ring_at, diagnostic_ms() - submit_start, res);
             if (res == VK_SUCCESS) {
@@ -4586,6 +4595,7 @@ private:
             std::uint64_t ran_ns = 0;
             if (have) {
                 const auto start = std::chrono::steady_clock::now();
+                const submit_phases::WorkerScope busy(submit_phases::worker_submit);  // the "submit frame" line
                 run_call(call);
                 const auto end = std::chrono::steady_clock::now();
                 ran_ns = std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());

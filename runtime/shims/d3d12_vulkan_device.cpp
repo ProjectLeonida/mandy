@@ -3014,7 +3014,9 @@ struct DeviceState {
         if (copy_aliased) shadow_alias_time = start;
         std::uint64_t copied = 0;
         for (const ShadowPagesPtr& s : shadows) {
-            copied += s->refresh(copy_aliased);
+            const std::uint64_t pages = s->refresh(copy_aliased);
+            if (pages) leonida::submit_phases::note_change(leonida::submit_phases::change_pages);  // not a floor one
+            copied += pages;
             shadow_queries += s->refresh_queries();
             shadow_protects += s->refresh_protects();
             shadow_walks += s->refresh_walked_all();
@@ -5244,7 +5246,11 @@ struct DeviceState {
         }
         for (const auto& heap : console_heaps) {
             const auto start = std::chrono::steady_clock::now();
+            const std::uint64_t copied_before = heap->copied, retried_before = heap->retried;
             refresh_console_heap(*heap, &changes);
+            // A heap slot or page brought up to date: this submission is not one of the "submit floor" line's.
+            if (heap->copied != copied_before || heap->retried != retried_before || !changes.empty())
+                leonida::submit_phases::note_change(leonida::submit_phases::change_slots);
             heap->ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
             ++heap->refreshes;
             // A line at the first and 64th submission, then every 10 s (a crawl logs as often as a fast run).
@@ -5971,6 +5977,7 @@ struct DeviceState {
                     batch.swap(r->requests);
                     tsharps.swap(r->tsharps);
                 }
+                const leonida::submit_phases::WorkerScope busy(leonida::submit_phases::worker_heap_resolver);
                 for (const auto& w : tsharps)
                     if (!r->registered.count(words_hash(w))) bind(w);
                 // Those still waiting for a texture, again every 500 ms, at most 256 a round.
@@ -16793,6 +16800,7 @@ private:
                 }
             }
             if (!fill) continue;
+            const leonida::submit_phases::WorkerScope busy(leonida::submit_phases::worker_texture_fill);
             bool filled = false;
             // A staged texture is filled without the registry lock (the title's threads creating views wait for
             // it: speed-31, 12 % of the main thread): its bytes, layout and resource are taken under the lock, the
@@ -16927,6 +16935,7 @@ private:
                         if (r->stop) return;
                         r->kick = false;
                     }
+                    const leonida::submit_phases::WorkerScope busy(leonida::submit_phases::worker_geometry);
                     state_.geometry.refresh(DeviceState::copy_geometry);
                 }
             });
@@ -17409,7 +17418,10 @@ private:
                     seen = generation_;
                     work = work_;
                 }
-                drain(work);
+                {
+                    const leonida::submit_phases::WorkerScope busy(leonida::submit_phases::worker_texture_reads);
+                    drain(work);
+                }
                 std::lock_guard lock(mutex_);
                 if (!--busy_) done_.notify_all();
             }
