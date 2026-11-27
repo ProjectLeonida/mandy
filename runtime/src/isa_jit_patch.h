@@ -15,13 +15,14 @@
 //   2. Near `jmp rel32` trampolines to native machine-code stubs within +-2 GiB of the module:
 //        - >=5-byte BMI1/BMI2/MOVBE sites -> native x86-64 GPR sequences preserving/setting exact architectural EFLAGS
 //        - >=5-byte AVX2 & FMA3 sites     -> native AVX1 (YMM + 2x128-bit XMM) sequences preserving all GPRs & EFLAGS
-//        - 4-byte 0xC5 AVX2 sites         -> fused with the immediately following instruction when no direct branch,
-//                                            relocation, unwind scope, export or RVA table anywhere in the image
-//                                            targets the interior boundary.
+//        - 4-byte 0xC5 AVX2 sites         -> when LEONIDA_ISA_FUSE_4B=1 is set (off by default), fused with the
+//                                            immediately following instruction when no direct branch, relocation,
+//                                            unwind scope, export, RVA table or Clang table-relative switch entry
+//                                            anywhere in the image targets the interior boundary.
 //
-// Any unpatched site (e.g. F16C, vpmaskmov*, pdep/pext, addr32/FS/GS overrides, or unfusable 4-byte sites) remains
+// Any unpatched site (e.g. F16C, vpmaskmov*, pdep/pext, addr32/FS/GS overrides, or unfused 4-byte sites) remains
 // untouched and continues to execute through bmi_emulation::handler / avx2_emulation::handler on #UD.
-// Set LEONIDA_ISA_PATCH=0 to disable.
+// Set LEONIDA_ISA_PATCH=0 to disable; set LEONIDA_ISA_FUSE_4B=1 to opt in to 4-byte cross-instruction fusion.
 #pragma once
 
 #ifdef _WIN32
@@ -44,6 +45,12 @@ inline bool enabled() {
     char v[8]{};
     std::size_t n = 0;
     return !(getenv_s(&n, v, "LEONIDA_ISA_PATCH") == 0 && n == 2 && v[0] == '0');
+}
+
+inline bool fuse_4b_enabled() {
+    char v[8]{};
+    std::size_t n = 0;
+    return getenv_s(&n, v, "LEONIDA_ISA_FUSE_4B") == 0 && n == 2 && v[0] == '1';
 }
 
 struct Stats {
@@ -1147,69 +1154,73 @@ inline Stats patch_image(uint8_t* base, uint32_t image_size,
     if (exec_secs.empty()) return st;
 
     // Build bitset of every RVA targeted by exports, relocations, .pdata unwind scopes, 32-bit RVA tables in data/gaps,
-    // and direct intra-function branches (used to guarantee 4-byte instruction fusion never crosses a jump target).
-    std::vector<uint8_t> target_bits((std::size_t(image_size) + 7u) >> 3, 0);
+    // Clang table-relative switch tables, and direct intra-function branches (used when LEONIDA_ISA_FUSE_4B=1 to
+    // guarantee 4-byte instruction fusion never crosses a jump target).
+    const bool fuse_4b = fuse_4b_enabled();
+    std::vector<uint8_t> target_bits(fuse_4b ? ((std::size_t(image_size) + 7u) >> 3) : 0u, 0);
     const auto mark_rva = [&](uint64_t rva) {
-        if (rva < image_size) target_bits[std::size_t(rva) >> 3] |= uint8_t(1u << (rva & 7u));
+        if (fuse_4b && rva < image_size) target_bits[std::size_t(rva) >> 3] |= uint8_t(1u << (rva & 7u));
     };
     const auto is_marked_rva = [&](uint32_t rva) -> bool {
-        return rva >= image_size || ((target_bits[rva >> 3] >> (rva & 7u)) & 1u) != 0;
+        return !fuse_4b || rva >= image_size || ((target_bits[rva >> 3] >> (rva & 7u)) & 1u) != 0;
     };
 
-    if (nt->OptionalHeader.AddressOfEntryPoint) mark_rva(nt->OptionalHeader.AddressOfEntryPoint);
+    if (fuse_4b && nt->OptionalHeader.AddressOfEntryPoint) mark_rva(nt->OptionalHeader.AddressOfEntryPoint);
 
     const auto get_dir = [&](unsigned idx) -> IMAGE_DATA_DIRECTORY {
         return idx < nt->OptionalHeader.NumberOfRvaAndSizes ? nt->OptionalHeader.DataDirectory[idx]
                                                             : IMAGE_DATA_DIRECTORY{};
     };
 
-    // 1. Exports
-    const auto exp_dir = get_dir(IMAGE_DIRECTORY_ENTRY_EXPORT);
-    if (exp_dir.VirtualAddress && exp_dir.Size >= sizeof(IMAGE_EXPORT_DIRECTORY) &&
-        uint64_t(exp_dir.VirtualAddress) + sizeof(IMAGE_EXPORT_DIRECTORY) <= image_size) {
-        const auto* ed = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + exp_dir.VirtualAddress);
-        if (uint64_t(ed->AddressOfFunctions) + uint64_t(ed->NumberOfFunctions) * 4u <= image_size) {
-            const auto* fns = reinterpret_cast<const uint32_t*>(base + ed->AddressOfFunctions);
-            for (uint32_t i = 0; i < ed->NumberOfFunctions; ++i) mark_rva(fns[i]);
+    if (fuse_4b) {
+        // 1. Exports
+        const auto exp_dir = get_dir(IMAGE_DIRECTORY_ENTRY_EXPORT);
+        if (exp_dir.VirtualAddress && exp_dir.Size >= sizeof(IMAGE_EXPORT_DIRECTORY) &&
+            uint64_t(exp_dir.VirtualAddress) + sizeof(IMAGE_EXPORT_DIRECTORY) <= image_size) {
+            const auto* ed = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + exp_dir.VirtualAddress);
+            if (uint64_t(ed->AddressOfFunctions) + uint64_t(ed->NumberOfFunctions) * 4u <= image_size) {
+                const auto* fns = reinterpret_cast<const uint32_t*>(base + ed->AddressOfFunctions);
+                for (uint32_t i = 0; i < ed->NumberOfFunctions; ++i) mark_rva(fns[i]);
+            }
         }
-    }
 
-    // 2. Relocations (any absolute 64-bit pointer inside the image)
-    const auto rel_dir = get_dir(IMAGE_DIRECTORY_ENTRY_BASERELOC);
-    if (rel_dir.VirtualAddress && rel_dir.Size &&
-        uint64_t(rel_dir.VirtualAddress) + rel_dir.Size <= image_size) {
-        const uint8_t* p = base + rel_dir.VirtualAddress;
-        const uint8_t* end = p + rel_dir.Size;
-        while (p + sizeof(IMAGE_BASE_RELOCATION) <= end) {
-            const auto* blk = reinterpret_cast<const IMAGE_BASE_RELOCATION*>(p);
-            if (blk->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) || p + blk->SizeOfBlock > end) break;
-            const auto* ents = reinterpret_cast<const uint16_t*>(blk + 1);
-            const std::size_t cnt = (blk->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / 2;
-            for (std::size_t i = 0; i < cnt; ++i) {
-                if ((ents[i] >> 12) == IMAGE_REL_BASED_DIR64) {
-                    const uint64_t rva = uint64_t(blk->VirtualAddress) + (ents[i] & 0xFFFu);
-                    if (rva + 8 <= image_size) {
-                        uint64_t va = 0;
-                        std::memcpy(&va, base + rva, 8);
-                        if (va >= img_base && va - img_base < image_size) mark_rva(va - img_base);
+        // 2. Relocations (any absolute 64-bit pointer inside the image)
+        const auto rel_dir = get_dir(IMAGE_DIRECTORY_ENTRY_BASERELOC);
+        if (rel_dir.VirtualAddress && rel_dir.Size &&
+            uint64_t(rel_dir.VirtualAddress) + rel_dir.Size <= image_size) {
+            const uint8_t* p = base + rel_dir.VirtualAddress;
+            const uint8_t* end = p + rel_dir.Size;
+            while (p + sizeof(IMAGE_BASE_RELOCATION) <= end) {
+                const auto* blk = reinterpret_cast<const IMAGE_BASE_RELOCATION*>(p);
+                if (blk->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) || p + blk->SizeOfBlock > end) break;
+                const auto* ents = reinterpret_cast<const uint16_t*>(blk + 1);
+                const std::size_t cnt = (blk->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / 2;
+                for (std::size_t i = 0; i < cnt; ++i) {
+                    if ((ents[i] >> 12) == IMAGE_REL_BASED_DIR64) {
+                        const uint64_t rva = uint64_t(blk->VirtualAddress) + (ents[i] & 0xFFFu);
+                        if (rva + 8 <= image_size) {
+                            uint64_t va = 0;
+                            std::memcpy(&va, base + rva, 8);
+                            if (va >= img_base && va - img_base < image_size) mark_rva(va - img_base);
+                        }
                     }
                 }
+                p += blk->SizeOfBlock;
             }
-            p += blk->SizeOfBlock;
         }
-    }
 
-    // 3. Non-executable sections: mark every 4-byte uint32_t RVA candidate (1-byte stride) in [0, image_size) and 8-byte aligned VAs
-    for (const auto& [drva, dsz] : data_secs) {
-        const uint8_t* dp = base + drva;
-        for (uint32_t off = 0; off + 4 <= dsz; ++off) {
-            uint32_t w = 0;
-            std::memcpy(&w, dp + off, 4);
-            if (w < image_size) mark_rva(w);
-            if ((off & 7u) == 0 && off + 8 <= dsz) {
-                uint64_t q = 0;
-                std::memcpy(&q, dp + off, 8);
-                if (q >= img_base && q - img_base < image_size) mark_rva(q - img_base);
+        // 3. Non-executable sections: mark every 4-byte uint32_t RVA candidate (1-byte stride) in [0, image_size) and 8-byte aligned VAs
+        for (const auto& [drva, dsz] : data_secs) {
+            const uint8_t* dp = base + drva;
+            for (uint32_t off = 0; off + 4 <= dsz; ++off) {
+                uint32_t w = 0;
+                std::memcpy(&w, dp + off, 4);
+                if (w < image_size) mark_rva(w);
+                if ((off & 7u) == 0 && off + 8 <= dsz) {
+                    uint64_t q = 0;
+                    std::memcpy(&q, dp + off, 8);
+                    if (q >= img_base && q - img_base < image_size) mark_rva(q - img_base);
+                }
             }
         }
     }
@@ -1269,16 +1280,37 @@ inline Stats patch_image(uint8_t* base, uint32_t image_size,
             const std::size_t ilen = bmi_emulation::detail::insn_len64(block + pos, len - pos, nullptr);
             if (!ilen) return false;
             int64_t rel = 0;
-            if (detail::is_control_flow(block + pos, ilen, &rel) && rel != 0) {
-                const int64_t tgt = int64_t(beg_rva) + int64_t(pos + ilen) + rel;
-                if (tgt >= 0 && tgt < int64_t(image_size)) mark_rva(uint64_t(tgt));
-            } else {
+            if (detail::is_control_flow(block + pos, ilen, &rel)) {
+                if (fuse_4b && rel != 0) {
+                    const int64_t tgt = int64_t(beg_rva) + int64_t(pos + ilen) + rel;
+                    if (tgt >= 0 && tgt < int64_t(image_size)) mark_rva(uint64_t(tgt));
+                }
+            } else if (fuse_4b) {
                 const std::size_t rip_off = detail::find_rip_disp32_offset(block + pos, ilen);
                 if (rip_off != 0 && rip_off != SIZE_MAX) {
                     int32_t disp = 0;
                     std::memcpy(&disp, block + pos + rip_off, 4);
                     const int64_t tgt = int64_t(beg_rva) + int64_t(pos + ilen) + disp;
-                    if (tgt >= 0 && tgt < int64_t(image_size)) mark_rva(uint64_t(tgt));
+                    if (tgt >= 0 && tgt < int64_t(image_size)) {
+                        const uint32_t tbl_rva = uint32_t(tgt);
+                        mark_rva(tbl_rva);
+                        // Clang/LLVM x64 Windows switch lowering (`lea reg, [rip + tbl]; movsxd idx, [reg + 4*idx];
+                        // add idx, reg; jmp idx`) stores signed 32-bit offsets relative to `tbl_rva` in `.rdata`.
+                        for (const auto& [drva, dsz] : data_secs) {
+                            if (tbl_rva >= drva && tbl_rva < drva + dsz) {
+                                const uint32_t max_entries = std::min<uint32_t>((drva + dsz - tbl_rva) / 4u, 4096u);
+                                const uint8_t* tp = base + tbl_rva;
+                                for (uint32_t idx = 0; idx < max_entries; ++idx) {
+                                    int32_t rel_entry = 0;
+                                    std::memcpy(&rel_entry, tp + idx * 4u, 4);
+                                    const int64_t case_rva = int64_t(tbl_rva) + int64_t(rel_entry);
+                                    if (case_rva < int64_t(beg_rva) || case_rva >= int64_t(end_rva)) break;
+                                    mark_rva(uint64_t(case_rva));
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             last_pos = pos;
@@ -1330,8 +1362,9 @@ inline Stats patch_image(uint8_t* base, uint32_t image_size,
                                        rva1, ad.length, 0, {}, ad});
                     continue;
                 }
-                // 4-byte 0xC5 AVX2 site: try forward fusion with insns[k + 1] when rva2 is not a jump/table target.
-                if (ad.length == 4 && k + 1 < insns.size()) {
+                // 4-byte 0xC5 AVX2 site: when LEONIDA_ISA_FUSE_4B=1 is set, try forward fusion with insns[k + 1]
+                // when rva2 is not a branch or jump-table target.
+                if (fuse_4b && ad.length == 4 && k + 1 < insns.size()) {
                     const uint32_t rva2 = beg_rva + insns[k + 1].pos;
                     const uint8_t len2 = insns[k + 1].ilen;
                     const uint8_t* p2 = base + rva2;
@@ -1376,13 +1409,15 @@ inline Stats patch_image(uint8_t* base, uint32_t image_size,
         if (cur < sec_end) all_gaps.push_back({cur, sec_end});
     }
 
-    for (const auto& [gb, ge] : all_gaps) {
-        const uint8_t* gp = base + gb;
-        const uint32_t gsz = ge - gb;
-        for (uint32_t off = 0; off + 4 <= gsz; ++off) {
-            uint32_t w = 0;
-            std::memcpy(&w, gp + off, 4);
-            if (w < image_size) mark_rva(w);
+    if (fuse_4b) {
+        for (const auto& [gb, ge] : all_gaps) {
+            const uint8_t* gp = base + gb;
+            const uint32_t gsz = ge - gb;
+            for (uint32_t off = 0; off + 4 <= gsz; ++off) {
+                uint32_t w = 0;
+                std::memcpy(&w, gp + off, 4);
+                if (w < image_size) mark_rva(w);
+            }
         }
     }
 

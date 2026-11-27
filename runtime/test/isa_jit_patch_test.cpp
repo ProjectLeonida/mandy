@@ -3,7 +3,9 @@
 //      randomized GPR/YMM/RFLAGS states, verifying zero #UD traps and architectural parity against reference execution.
 //   2. Forward fusion of 4-byte 0xC5 AVX2 instructions with 6-byte VEX and 8-byte RIP-relative instructions.
 //   3. Full synthetic PE32+ image patching via patch_image(), verifying in-place rewrites, BMI/AVX2/FMA3 trampolines,
-//      4-byte forward fusion when unmarked, fusion refusal across RVA-table / branch targets, and LEONIDA_ISA_PATCH=0.
+//      default non-fusion of 4-byte 0xC5 sites (LEONIDA_ISA_FUSE_4B unset), opt-in 4-byte forward fusion
+//      (LEONIDA_ISA_FUSE_4B=1), fusion refusal across both image-base RVA tables and Clang table-relative int32_t
+//      .rdata switch tables, and LEONIDA_ISA_PATCH=0.
 // Synthetic machine-code buffers and PE headers only; no game files.
 #include <windows.h>
 
@@ -154,15 +156,18 @@ bool test_synthetic_pe_patch() {
     secs[2].Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
 
     // Function at RVA 0x1000 (uint64_t fn(uint64_t rcx, uint64_t rdx)):
-    //   +0x00 (5B): shlx rax, rcx, rdx          (C4 E2 E9 F7 C1)          -> BMI2 stub
-    //   +0x05 (4B): vpxor ymm0, ymm0, ymm0      (C5 FD EF C0)             -> in-place rewrite to vxorps
-    //   +0x09 (4B): vpaddd ymm1, ymm0, ymm0     (C5 FD FE C8)             \  fused 4B + 6B pair
-    //   +0x0D (6B): vpermq ymm1, ymm1, 0xD8     (C4 E3 FD 00 C9 D8)       /  (interior 0x100D is unmarked)
-    //   +0x13 (4B): vpaddd ymm2, ymm0, ymm0     (C5 FD FE D0)             <- NOT fused: 0x1017 is in .rdata RVA table!
-    //   +0x17 (6B): vpermq ymm2, ymm2, 0x1B     (C4 E3 FD 00 D2 1B)       -> standalone >=5B AVX2 stub
-    //   +0x1D (5B): vfmadd213ss xmm0, xmm0, xmm0 (C4 E2 79 A9 C0)         -> FMA3 stub
-    //   +0x22 (3B): vzeroupper                  (C5 F8 77)
-    //   +0x25 (1B): ret                         (C3)
+    //   +0x00 (5B): shlx rax, rcx, rdx            (C4 E2 E9 F7 C1)                 -> BMI2 stub
+    //   +0x05 (4B): vpxor ymm0, ymm0, ymm0        (C5 FD EF C0)                    -> in-place rewrite to vxorps
+    //   +0x09 (4B): vpaddd ymm1, ymm0, ymm0       (C5 FD FE C8)                    \  fused 4B + 6B pair only when
+    //   +0x0D (6B): vpermq ymm1, ymm1, 0xD8       (C4 E3 FD 00 C9 D8)              /  LEONIDA_ISA_FUSE_4B=1 (unmarked)
+    //   +0x13 (4B): vpaddd ymm2, ymm0, ymm0       (C5 FD FE D0)                    <- NOT fused: 0x1017 in RVA table
+    //   +0x17 (6B): vpermq ymm2, ymm2, 0x1B       (C4 E3 FD 00 D2 1B)              -> standalone >=5B AVX2 stub
+    //   +0x1D (7B): lea r8, [rip + 0x101C]        (4C 8D 05 1C 10 00 00)           -> points to .rdata 0x2040 switch tbl
+    //   +0x24 (4B): vpaddd ymm3, ymm0, ymm0       (C5 FD FE D8)                    <- NOT fused: 0x1028 in Clang rel tbl
+    //   +0x28 (6B): vpermq ymm3, ymm3, 0xE4       (C4 E3 FD 00 DB E4)              -> standalone >=5B AVX2 stub
+    //   +0x2E (5B): vfmadd213ss xmm0, xmm0, xmm0  (C4 E2 79 A9 C0)                 -> FMA3 stub
+    //   +0x33 (3B): vzeroupper                    (C5 F8 77)
+    //   +0x36 (1B): ret                           (C3)
     const uint8_t fn_bytes[] = {
         0xC4, 0xE2, 0xE9, 0xF7, 0xC1,
         0xC5, 0xFD, 0xEF, 0xC0,
@@ -170,15 +175,27 @@ bool test_synthetic_pe_patch() {
         0xC4, 0xE3, 0xFD, 0x00, 0xC9, 0xD8,
         0xC5, 0xFD, 0xFE, 0xD0,
         0xC4, 0xE3, 0xFD, 0x00, 0xD2, 0x1B,
+        0x4C, 0x8D, 0x05, 0x1C, 0x10, 0x00, 0x00,
+        0xC5, 0xFD, 0xFE, 0xD8,
+        0xC4, 0xE3, 0xFD, 0x00, 0xDB, 0xE4,
         0xC4, 0xE2, 0x79, 0xA9, 0xC0,
         0xC5, 0xF8, 0x77,
         0xC3,
     };
     std::memcpy(img + 0x1000, fn_bytes, sizeof(fn_bytes));
 
-    // Place interior RVA 0x1017 in .rdata jump table so +0x13 (4B vpaddd) must NOT fuse across 0x1017.
+    // 1) MSVC-style image-base-relative RVA 0x1017 in .rdata at 0x2010: blocks +0x13 from fusing across 0x1017.
     const uint32_t jump_target_rva = 0x1017u;
     std::memcpy(img + 0x2010, &jump_target_rva, sizeof(jump_target_rva));
+
+    // 2) Clang/LLVM-style table-relative signed int32_t jump table in .rdata at 0x2040 (`target_rva - table_rva < 0`,
+    //    so uint32_t(entry) >= kImgSize): entry[1] targets 0x1028, blocking +0x24 from fusing across 0x1028.
+    const int32_t clang_rel_table[3] = {
+        int32_t(0x1000) - int32_t(0x2040),
+        int32_t(0x1028) - int32_t(0x2040),
+        0,  // 0x2040 + 0 lies outside [0x1000, 0x1037), ending the table walk
+    };
+    std::memcpy(img + 0x2040, clang_rel_table, sizeof(clang_rel_table));
 
     // Minimal UNWIND_INFO at 0x2100 + RUNTIME_FUNCTION at 0x3000.
     img[0x2100] = 0x01;  // Version 1, no flags, 0 prolog, 0 unwind codes
@@ -211,23 +228,56 @@ bool test_synthetic_pe_patch() {
         return false;
     }
 
-    // 3. Pre-Haswell host patches 1 in-place, 1 BMI, 2 AVX2 (1 fused 4B + 1 standalone 6B), 1 FMA3, leaving +0x13 untouched.
+    // 3a. Default (LEONIDA_ISA_FUSE_4B unset): 4-byte 0xC5 sites are NEVER fused across instruction boundaries;
+    //     patches 1 in-place, 1 BMI, 3 standalone >=5B AVX2 stubs (+0x0D, +0x17, +0x28), and 1 FMA3 stub.
+    _putenv_s("LEONIDA_ISA_FUSE_4B", "");
+    const auto st_def = rt::isa_jit_patch::patch_image(img, kImgSize, pre_haswell_bmi, pre_haswell_avx);
+    const bool def_ok = st_def.inplace_sites == 1 && st_def.bmi_stubs == 1 && st_def.avx2_stubs == 3 &&
+                        st_def.avx2_fused_4b == 0 && st_def.fma3_stubs == 1 && st_def.stubs != nullptr &&
+                        img[0x1000 + 0x09] == 0xC5 && img[0x1000 + 0x13] == 0xC5 && img[0x1000 + 0x24] == 0xC5;
+    if (!def_ok) {
+        std::fprintf(stderr,
+                     "FAIL: default patch_image stats inplace=%zu bmi=%zu avx2=%zu fused=%zu fma3=%zu\n",
+                     st_def.inplace_sites, st_def.bmi_stubs, st_def.avx2_stubs, st_def.avx2_fused_4b,
+                     st_def.fma3_stubs);
+        if (st_def.stubs) VirtualFree(st_def.stubs, 0, MEM_RELEASE);
+        VirtualFree(img, 0, MEM_RELEASE);
+        return false;
+    }
+    FlushInstructionCache(GetCurrentProcess(), img + 0x1000, sizeof(fn_bytes));
+    auto fn = reinterpret_cast<uint64_t (*)(uint64_t, uint64_t)>(img + 0x1000);
+    const uint64_t out_def = fn(0x123456789ABCDEF0ull, 8);
+    VirtualFree(st_def.stubs, 0, MEM_RELEASE);
+    if (out_def != (0x123456789ABCDEF0ull << 8)) {
+        std::fprintf(stderr, "FAIL: default patched synthetic PE function returned 0x%016llX\n",
+                     static_cast<unsigned long long>(out_def));
+        VirtualFree(img, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // 3b. Opt-in LEONIDA_ISA_FUSE_4B=1: unmarked +0x09 fuses with +0x0D, whereas +0x13 (before RVA-table target 0x1017)
+    //     AND +0x24 (before Clang table-relative int32_t switch target 0x1028) both refuse to fuse across the target!
+    std::memcpy(img + 0x1000, fn_bytes, sizeof(fn_bytes));
+    _putenv_s("LEONIDA_ISA_FUSE_4B", "1");
     const auto st = rt::isa_jit_patch::patch_image(img, kImgSize, pre_haswell_bmi, pre_haswell_avx);
-    const bool counts_ok = st.inplace_sites == 1 && st.bmi_stubs == 1 && st.avx2_stubs == 2 &&
+    _putenv_s("LEONIDA_ISA_FUSE_4B", "");
+    const bool counts_ok = st.inplace_sites == 1 && st.bmi_stubs == 1 && st.avx2_stubs == 3 &&
                            st.avx2_fused_4b == 1 && st.fma3_stubs == 1 && st.stubs != nullptr &&
-                           img[0x1000 + 0x13] == 0xC5;  // unfused 4B site before marked RVA 0x1017 stays intact
+                           img[0x1000 + 0x09] == 0xE9 &&  // unmarked +0x09 fused
+                           img[0x1000 + 0x13] == 0xC5 &&  // RVA-table target 0x1017 respected
+                           img[0x1000 + 0x24] == 0xC5;    // Clang relative jump-table target 0x1028 respected
     if (!counts_ok) {
         std::fprintf(stderr,
-                     "FAIL: unexpected patch_image stats inplace=%zu bmi=%zu avx2=%zu fused=%zu fma3=%zu byte13=0x%02X\n",
+                     "FAIL: LEONIDA_ISA_FUSE_4B=1 stats inplace=%zu bmi=%zu avx2=%zu fused=%zu fma3=%zu "
+                     "b09=0x%02X b13=0x%02X b24=0x%02X\n",
                      st.inplace_sites, st.bmi_stubs, st.avx2_stubs, st.avx2_fused_4b, st.fma3_stubs,
-                     unsigned(img[0x1000 + 0x13]));
+                     unsigned(img[0x1000 + 0x09]), unsigned(img[0x1000 + 0x13]), unsigned(img[0x1000 + 0x24]));
         if (st.stubs) VirtualFree(st.stubs, 0, MEM_RELEASE);
         VirtualFree(img, 0, MEM_RELEASE);
         return false;
     }
 
     FlushInstructionCache(GetCurrentProcess(), img + 0x1000, sizeof(fn_bytes));
-    auto fn = reinterpret_cast<uint64_t (*)(uint64_t, uint64_t)>(img + 0x1000);
     const uint64_t out = fn(0x123456789ABCDEF0ull, 8);
     const bool exec_ok = (out == (0x123456789ABCDEF0ull << 8));
 
