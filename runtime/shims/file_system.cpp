@@ -231,6 +231,17 @@ std::wstring scratch_folder(const std::filesystem::path& overlay) {
     return folder.name;
 }
 
+// Non-creating lookup for this process's already-reserved T: folder below <overlay>\.gta6rt-temp.
+std::wstring existing_scratch_folder(const std::filesystem::path& overlay, bool& failed) {
+    failed = false;
+    if (overlay.empty()) return scratch_run();
+    std::lock_guard lock(g_scratch_mutex);
+    const auto it = g_scratch_folders.find(lower(overlay.native()));
+    if (it == g_scratch_folders.end()) return {};
+    failed = (it->second.error != 0);
+    return it->second.name;
+}
+
 Drive console_drive(const std::wstring& path, size_t& prefix_length) {
     if (path.size() >= kGamePrefixLength && lower(path.substr(0, kGamePrefixLength)) == kGamePrefix) {
         prefix_length = kGamePrefixLength;
@@ -246,22 +257,31 @@ Drive console_drive(const std::wstring& path, size_t& prefix_length) {
     return letter == L'g' ? Drive::Game : Drive::Scratch;
 }
 
-Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts) {
+Parsed parse_console_parts(const std::wstring& path, std::vector<std::wstring>& parts, Drive* out_drive = nullptr,
+                           bool create_scratch = true) {
     size_t prefix_length = 0;
     const Drive drive = console_drive(path, prefix_length);
+    if (out_drive) *out_drive = drive;
     if (drive == Drive::None) return Parsed::Host;
     parts.clear();
     if (drive == Drive::Scratch) {
         const std::filesystem::path overlay = roots().overlay;
-        const std::wstring folder = scratch_folder(overlay);
-        if (folder.empty()) return Parsed::Refused;
         parts.push_back(kScratchDir);
-        parts.push_back(folder);
-        // The folder is this process's from its reservation on; made again if something removed it since.
-        const DWORD last_error = ::GetLastError();
-        std::error_code ec;
-        if (!overlay.empty()) std::filesystem::create_directories(win32_io_path(overlay / kScratchDir / folder), ec);
-        ::SetLastError(last_error);
+        if (create_scratch) {
+            const std::wstring folder = scratch_folder(overlay);
+            if (folder.empty()) return Parsed::Refused;
+            parts.push_back(folder);
+            // The folder is this process's from its reservation on; made again if something removed it since.
+            const DWORD last_error = ::GetLastError();
+            std::error_code ec;
+            if (!overlay.empty()) std::filesystem::create_directories(win32_io_path(overlay / kScratchDir / folder), ec);
+            ::SetLastError(last_error);
+        } else {
+            bool failed = false;
+            const std::wstring folder = existing_scratch_folder(overlay, failed);
+            if (failed) return Parsed::Refused;
+            parts.push_back(folder);
+        }
     }
     const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
     std::wstring part;
@@ -295,6 +315,10 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
     // T: still names the scratch folder: its first two parts are pushed above, not parsed from the title's path.
     if (drive == Drive::Game && !parts.empty() && internal_dir(parts.front().c_str())) return Parsed::Refused;
     return Parsed::Console;
+}
+
+Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts) {
+    return parse_console_parts(path, parts);
 }
 
 std::filesystem::path join(const std::filesystem::path& root, const std::vector<std::wstring>& parts) {
@@ -437,6 +461,96 @@ View view(const Roots& r, const std::vector<std::wstring>& parts) {
         }
     }
     return v;
+}
+
+// Walks up `p` without creating directories to find the nearest existing directory on its volume.
+std::filesystem::path existing_ancestor_dir(std::filesystem::path p, DWORD missing_error, DWORD& error) {
+    std::error_code ec;
+    while (!p.empty()) {
+        const std::filesystem::path io = win32_io_path(p);
+        const auto st = std::filesystem::status(io, ec);
+        if (st.type() == std::filesystem::file_type::directory) return io;
+        if (st.type() != std::filesystem::file_type::not_found && !ec) {
+            error = ERROR_DIRECTORY;
+            return {};
+        }
+        const std::filesystem::path parent = p.parent_path();
+        if (parent == p) break;
+        p = parent;
+    }
+    error = missing_error;
+    return {};
+}
+
+// Resolves a console path for read-only disk-space or drive-type queries without creating `overlay` or `.gta6rt-temp`.
+// Sets `handled` true when `path` is refused or console-owned (`out_dir` valid on success, `error` set on failure).
+bool resolve_console_readonly_dir(const wchar_t* path, DWORD missing_error, bool& handled,
+                                  std::filesystem::path& out_dir, bool& is_root, DWORD& error) {
+    handled = false;
+    is_root = false;
+    error = 0;
+    std::vector<std::wstring> parts;
+    Drive drive = Drive::None;
+    const Parsed parsed = parse_console_parts(path, parts, &drive, /*create_scratch=*/false);
+    if (parsed == Parsed::Host) return false;
+    handled = true;
+    if (parsed == Parsed::Refused) {
+        error = ERROR_INVALID_NAME;
+        return false;
+    }
+    const Roots r = roots();
+    std::error_code ec;
+    if (drive == Drive::Scratch) {
+        if (r.overlay.empty()) {
+            error = ERROR_PATH_NOT_FOUND;
+            return false;
+        }
+        is_root = (parts.size() == 2);
+        if (is_root) {
+            const std::filesystem::path scratch_root =
+                parts[1].empty() ? (r.overlay / kScratchDir) : (r.overlay / kScratchDir / parts[1]);
+            out_dir = existing_ancestor_dir(scratch_root, missing_error, error);
+            return !out_dir.empty();
+        }
+        if (parts[1].empty()) {
+            error = missing_error;
+            return false;
+        }
+        const std::filesystem::path p = disk_path(r.overlay, parts);
+        const auto st = std::filesystem::status(p, ec);
+        if (st.type() == std::filesystem::file_type::directory) {
+            out_dir = p;
+            return true;
+        }
+        error = (st.type() != std::filesystem::file_type::not_found && !ec) ? ERROR_DIRECTORY : missing_error;
+        return false;
+    }
+    if (r.game.empty()) {
+        error = ERROR_PATH_NOT_FOUND;
+        return false;
+    }
+    is_root = parts.empty();
+    if (is_root) {
+        const std::filesystem::path g = win32_io_path(r.game);
+        const auto st = std::filesystem::status(g, ec);
+        if (st.type() == std::filesystem::file_type::directory) {
+            out_dir = g;
+            return true;
+        }
+        error = (st.type() != std::filesystem::file_type::not_found && !ec) ? ERROR_DIRECTORY : missing_error;
+        return false;
+    }
+    const View v = view(r, parts);
+    if (v.kind == Kind::None) {
+        error = missing_error;
+        return false;
+    }
+    if (v.kind == Kind::File) {
+        error = ERROR_DIRECTORY;
+        return false;
+    }
+    out_dir = v.in_overlay ? disk_path(r.overlay, parts) : disk_path(r.game, parts);
+    return true;
 }
 
 bool is_folder(const Roots& r, const std::vector<std::wstring>& parts) { return view(r, parts).kind == Kind::Directory; }
@@ -1570,6 +1684,73 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
     return set_file_attributes_w(wide.c_str(), attributes);
 }
 
+BOOL WINAPI get_disk_free_space_ex_w(LPCWSTR directory, PULARGE_INTEGER available, PULARGE_INTEGER total,
+                                     PULARGE_INTEGER free_bytes) {
+    if (!directory || !*directory) return ::GetDiskFreeSpaceExW(directory, available, total, free_bytes);
+    bool handled = false;
+    bool is_root = false;
+    DWORD error = 0;
+    std::filesystem::path resolved;
+    if (!resolve_console_readonly_dir(directory, ERROR_PATH_NOT_FOUND, handled, resolved, is_root, error)) {
+        if (!handled) return ::GetDiskFreeSpaceExW(directory, available, total, free_bytes);
+        return fail_bool(error);
+    }
+    return ::GetDiskFreeSpaceExW(resolved.c_str(), available, total, free_bytes);
+}
+
+BOOL WINAPI get_disk_free_space_ex_a(LPCSTR directory, PULARGE_INTEGER available, PULARGE_INTEGER total,
+                                     PULARGE_INTEGER free_bytes) {
+    if (!directory) return ::GetDiskFreeSpaceExW(nullptr, available, total, free_bytes);
+    const std::wstring wide = widen_ansi(directory);
+    return get_disk_free_space_ex_w(wide.c_str(), available, total, free_bytes);
+}
+
+BOOL WINAPI get_disk_free_space_w(LPCWSTR root_path, LPDWORD sectors_per_cluster, LPDWORD bytes_per_sector,
+                                  LPDWORD free_clusters, LPDWORD total_clusters) {
+    if (!root_path || !*root_path)
+        return ::GetDiskFreeSpaceW(root_path, sectors_per_cluster, bytes_per_sector, free_clusters, total_clusters);
+    bool handled = false;
+    bool is_root = false;
+    DWORD error = 0;
+    std::filesystem::path resolved;
+    if (!resolve_console_readonly_dir(root_path, ERROR_FILE_NOT_FOUND, handled, resolved, is_root, error)) {
+        if (!handled)
+            return ::GetDiskFreeSpaceW(root_path, sectors_per_cluster, bytes_per_sector, free_clusters, total_clusters);
+        return fail_bool(error);
+    }
+    return ::GetDiskFreeSpaceW(resolved.c_str(), sectors_per_cluster, bytes_per_sector, free_clusters, total_clusters);
+}
+
+BOOL WINAPI get_disk_free_space_a(LPCSTR root_path, LPDWORD sectors_per_cluster, LPDWORD bytes_per_sector,
+                                  LPDWORD free_clusters, LPDWORD total_clusters) {
+    if (!root_path)
+        return ::GetDiskFreeSpaceW(nullptr, sectors_per_cluster, bytes_per_sector, free_clusters, total_clusters);
+    const std::wstring wide = widen_ansi(root_path);
+    return get_disk_free_space_w(wide.c_str(), sectors_per_cluster, bytes_per_sector, free_clusters, total_clusters);
+}
+
+UINT WINAPI get_drive_type_w(LPCWSTR root_path) {
+    if (!root_path || !*root_path) return ::GetDriveTypeW(root_path);
+    bool handled = false;
+    bool is_root = false;
+    DWORD error = 0;
+    std::filesystem::path resolved;
+    if (!resolve_console_readonly_dir(root_path, ERROR_PATH_NOT_FOUND, handled, resolved, is_root, error)) {
+        return handled ? DRIVE_NO_ROOT_DIR : ::GetDriveTypeW(root_path);
+    }
+    if (!is_root) return DRIVE_NO_ROOT_DIR;
+    std::vector<wchar_t> volume_root((std::max<size_t>)(MAX_PATH, resolved.native().size() + 16), L'\0');
+    if (!::GetVolumePathNameW(resolved.c_str(), volume_root.data(), static_cast<DWORD>(volume_root.size())))
+        return DRIVE_NO_ROOT_DIR;
+    return ::GetDriveTypeW(volume_root.data());
+}
+
+UINT WINAPI get_drive_type_a(LPCSTR root_path) {
+    if (!root_path) return ::GetDriveTypeW(nullptr);
+    const std::wstring wide = widen_ansi(root_path);
+    return get_drive_type_w(wide.c_str());
+}
+
 }  // namespace rt::fs
 
 namespace {
@@ -1641,7 +1822,13 @@ BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT segments[], DWOR
         {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)},                    \
         {dll, "ReadFile", reinterpret_cast<void*>(&read_file)},                                          \
         {dll, "ReadFileEx", reinterpret_cast<void*>(&read_file_ex)},                                     \
-        {dll, "ReadFileScatter", reinterpret_cast<void*>(&read_file_scatter)}
+        {dll, "ReadFileScatter", reinterpret_cast<void*>(&read_file_scatter)},                           \
+        {dll, "GetDiskFreeSpaceExA", reinterpret_cast<void*>(&get_disk_free_space_ex_a)},                \
+        {dll, "GetDiskFreeSpaceExW", reinterpret_cast<void*>(&get_disk_free_space_ex_w)},                \
+        {dll, "GetDiskFreeSpaceA", reinterpret_cast<void*>(&get_disk_free_space_a)},                     \
+        {dll, "GetDiskFreeSpaceW", reinterpret_cast<void*>(&get_disk_free_space_w)},                     \
+        {dll, "GetDriveTypeA", reinterpret_cast<void*>(&get_drive_type_a)},                              \
+        {dll, "GetDriveTypeW", reinterpret_cast<void*>(&get_drive_type_w)}
 }  // namespace
 
 SHIM_TABLE(file_system,
