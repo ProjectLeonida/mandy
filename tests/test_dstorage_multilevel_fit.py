@@ -12,6 +12,7 @@ from test_bcpack_history_calib import (  # noqa: E402
     _encode_bc7_mode6_tiled,
     _pack_etpf,
     _write_custom_rds5_pool,
+    encode_lanes,
 )
 import bcpack  # noqa: E402
 import build_dstorage_history as history  # noqa: E402
@@ -146,6 +147,39 @@ class MultilevelMipFitTest(unittest.TestCase):
         self.assertEqual(docs["bc6h"]["endpointClass"][91], 1)
         self.assertEqual(docs["bc7"]["historyEndpointBits"][5][0], 6)
         self.assertEqual(docs["bc7"]["historyEndpoints"][5][0], 192)
+        decoded = bcpack.decode(raw_mip2, 6, 4096, allow_provisional=True, history=docs)
+        self.assertEqual(len(decoded), 4096)
+
+    def test_refused_bc6h_intermediate_sibling_falls_back_to_multilevel_zlib_mip(self):
+        # mip[0] is zlib, mip[1] is a BC6H stream refused by decode (inconsistent anchor index 8), and mip[2] needs
+        # unknown endpoint entry 91. fit_decoded_neighbors cannot decode mip[1] as a reference, whereas fit_distant_mips
+        # pairs mip[2] directly with lossless zlib mip[0] two levels up.
+        w_rgb = (0x3400, 0x2800, 0x1C00)
+        solid = _solid_bc6h_mode14_block(w_rgb)
+        lanes_mip1 = [[0] * 512 for _ in range(16)]
+        lanes_mip1[15] = [13, 0] * 256
+        raw_mip1 = encode_lanes(lanes_mip1, 6)
+        secret_eh = tuple((w_rgb[c], 0x200, 0x20, 0x20) for c in range(3))
+        raw_mip2 = _encode_bc6h_mode14_tiled(solid * 256, secret_entry=91, secret_eh=secret_eh, ref_count=160)
+        zlib_mip0 = zlib.compress(solid * 1024, 9)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = Path(tmp) / "bc6h-refused-mid.ttpf"
+            record = _pack_etpf(128, 128, 3, 2, 95, 4096, mode=4)
+            _write_custom_rds5_pool(
+                pool,
+                [record],
+                [(6, 4096, raw_mip2), (6, 4096, raw_mip1), (8, 16384, zlib_mip0)],
+            )
+            docs = _initial_fit([pool])
+            history.fit_decoded_neighbors([pool], docs)
+            self.assertEqual(docs["bc6h"]["endpointClass"][91], 0)
+            with self.assertRaises(bcpack.BcpackProvisionalError):
+                bcpack.decode(raw_mip2, 6, 4096, allow_provisional=True, history=docs)
+
+            history.extend_missing(docs, history.fit_distant_mips([pool], docs))
+
+        self.assertEqual(docs["bc6h"]["endpointClass"][91], 1)
         decoded = bcpack.decode(raw_mip2, 6, 4096, allow_provisional=True, history=docs)
         self.assertEqual(len(decoded), 4096)
 
