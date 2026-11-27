@@ -5,18 +5,25 @@
 // The test prints which path each instruction took. No game files.
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <latch>
+#include <thread>
 #include <vector>
 
 #include "cpu_emulation.h"
+#include "../shims/shims.h"
 
 namespace ce = rt::cpu_emulation;
 
 namespace {
 int failures = 0;
+
+// clzero; add rax, 64; cmp rax, rdx; jb back to clzero
+constexpr uint8_t loop12[] = {0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4};
 
 void check(bool ok, const char* what) {
     if (!ok) {
@@ -147,7 +154,6 @@ void test_apply() {
           "clzero on an unwritable line reports a write access violation at the line");
 
     // try_clzero_loop EFlags: first-line fault keeps incoming flags, post-prefix fault and >64 MiB batch apply CMP.
-    const uint8_t loop12[] = {0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4};
     if (auto* two_pages = static_cast<uint8_t*>(VirtualAlloc(nullptr, 8192, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
         const uint64_t start = reinterpret_cast<uint64_t>(two_pages);
         DWORD old = 0;
@@ -223,6 +229,173 @@ bool run(const Code& code, const void* in, void* out, DWORD* exception) {
 }
 
 const char* path(bool host_has) { return host_has ? "native" : "emulated"; }
+
+bool state_is(const void* address, DWORD state) {
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(address, &info, sizeof(info)) && info.State == state;
+}
+
+void test_xmem_clzero_batch(uint8_t* next_physical_page, DWORD initial_state) {
+    constexpr SIZE_T host_page_size = 4096;
+    constexpr uint8_t sentinel = 0xA5;
+    auto* const start = next_physical_page - 2 * 64;
+    auto* const boundary = next_physical_page + host_page_size;
+    auto* const end = boundary + 2 * host_page_size;
+
+    // Leave the first two lines untouched in reserve mode. Seed the next writable subpage, the protected
+    // subpage, and a writable subpage beyond it so a skipped fault or an overlong zero is observable.
+    void* const committed = VirtualAlloc(next_physical_page, 3 * host_page_size, MEM_COMMIT, PAGE_READWRITE);
+    MEMORY_BASIC_INFORMATION info{};
+    const bool prepared = committed == next_physical_page && VirtualQuery(start, &info, sizeof(info)) &&
+                          info.Type == MEM_MAPPED &&
+                          info.State == initial_state;
+    check(prepared, "prepare a batch starting in the expected XMem state");
+    if (!prepared) return;
+    auto* const seed_begin = initial_state == MEM_RESERVE ? next_physical_page : start;
+    std::memset(seed_begin, sentinel, static_cast<size_t>(end - seed_begin));
+    DWORD old = 0;
+    const bool protected_page = VirtualProtect(boundary, host_page_size, PAGE_READONLY, &old) != FALSE;
+    check(protected_page, "protect a read-only XMem subpage inside the batch");
+    if (!protected_page) return;
+
+    CONTEXT c{};
+    c.Rax = reinterpret_cast<uint64_t>(start);
+    c.Rdx = reinterpret_cast<uint64_t>(end);
+    c.Rip = reinterpret_cast<uint64_t>(loop12);
+    c.EFlags = 0x246;
+    EXCEPTION_RECORD fault{};
+    const auto result = ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault);
+    check(result == ce::ClzeroLoopResult::faulted && fault.ExceptionCode == STATUS_ACCESS_VIOLATION &&
+              fault.NumberParameters == 2 && fault.ExceptionInformation[0] == 1 &&
+              fault.ExceptionInformation[1] == reinterpret_cast<ULONG_PTR>(boundary),
+          "batched XMem CLZERO reports a write fault at the protected boundary");
+    check(c.Rax == reinterpret_cast<uint64_t>(boundary) && c.Rip == reinterpret_cast<uint64_t>(loop12) &&
+              (c.EFlags & 0xC1u) == 0x81u,
+          "batched XMem CLZERO leaves the loop positioned at the faulting line");
+    check(state_is(start, MEM_COMMIT) && std::all_of(start, boundary, [](uint8_t byte) { return byte == 0; }),
+          "batched XMem CLZERO commits and zeroes the writable prefix");
+    check(VirtualQuery(boundary, &info, sizeof(info)) && info.Protect == PAGE_READONLY,
+          "batched XMem CLZERO preserves the boundary protection");
+    check(std::all_of(boundary, end, [](uint8_t byte) { return byte == sentinel; }),
+          "batched XMem CLZERO preserves every byte at and beyond the boundary");
+}
+
+void test_xmem_clzero(bool wine_default) {
+    // XMem caches the backing mode on first use, so CTest runs the two modes in separate processes.
+    const bool selected = SetEnvironmentVariableA("LEONIDA_XMEM_SEC_COMMIT", wine_default ? nullptr : "0") &&
+                          SetEnvironmentVariableA("LEONIDA_XMEM_BACKING_DIR", nullptr);
+    check(selected, "select anonymous backing for the XMem test");
+    if (!selected) return;
+    const DWORD initial_state = wine_default ? MEM_COMMIT : MEM_RESERVE;
+    std::printf("XMem backing: %s\n", wine_default ? "Wine default (SEC_COMMIT)" : "SEC_RESERVE");
+
+    using Reserve = void* (WINAPI*)(void*, SIZE_T, DWORD, ULONGLONG, DWORD);
+    using Allocate = BOOL (WINAPI*)(uint64_t, uint64_t*, uint64_t*);
+    using Free = BOOL (WINAPI*)(uint64_t, const uint64_t*);
+    using Map = void* (WINAPI*)(void*, uint64_t, const uint64_t*);
+    const auto reserve = reinterpret_cast<Reserve>(rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
+    const auto allocate = reinterpret_cast<Allocate>(rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages"));
+    const auto free = reinterpret_cast<Free>(rt::shims::find("xmem.dll", "XMemFreePhysicalPages"));
+    const auto map = reinterpret_cast<Map>(rt::shims::find("xmem.dll", "XMemMapPhysicalPages"));
+    check(reserve && allocate && free && map, "find XMem physical-page shims");
+    if (!reserve || !allocate || !free || !map) return;
+
+    constexpr SIZE_T page_size = 0x10000;
+    constexpr SIZE_T window_pages = 5;
+    constexpr DWORD xmem_64k_pages = 0x20400000;
+    auto* const window = static_cast<uint8_t*>(
+        reserve(nullptr, (window_pages + 1) * page_size, MEM_RESERVE | xmem_64k_pages, 0, PAGE_READWRITE));
+    void* const readonly = reserve(nullptr, page_size, MEM_RESERVE | xmem_64k_pages, 0, PAGE_READONLY);
+    uint64_t pages[window_pages + 1]{}, count = window_pages + 1;
+    const bool allocated = allocate(0, &count, pages) && count == window_pages + 1;
+    check(window && readonly && allocated, "reserve XMem windows and allocate backing pages");
+
+    // Inject #UD so the real handler is exercised even on hosts that implement CLZERO.
+    const auto emulate = [](void* address) -> DWORD {
+        const uint8_t code[] = {0x0F, 0x01, 0xFC};
+        const auto rip = reinterpret_cast<uint64_t>(code);
+        CONTEXT context{};
+        context.Rip = rip;
+        context.Rax = reinterpret_cast<uint64_t>(address);
+        EXCEPTION_RECORD record{};
+        record.ExceptionCode = STATUS_ILLEGAL_INSTRUCTION;
+        EXCEPTION_POINTERS exception{&record, &context};
+        const LONG disposition = ce::handler(&exception);
+        if (disposition == EXCEPTION_CONTINUE_EXECUTION && context.Rip == rip + sizeof(code)) return 0;
+        if (disposition == EXCEPTION_CONTINUE_SEARCH && context.Rip == rip) return record.ExceptionCode;
+        return STATUS_ILLEGAL_INSTRUCTION;
+    };
+    if (window && readonly && allocated) {
+        const bool mapped = map(window, 3, pages) == window &&
+                            map(window + 3 * page_size, 2, pages + 3) == window + 3 * page_size &&
+                            map(readonly, 1, pages + window_pages) == readonly;
+        check(mapped, "map the XMem test views");
+        if (mapped) {
+            check(state_is(window, initial_state) && state_is(window + page_size, initial_state),
+                  "the XMem views start in the selected backing state");
+            test_xmem_clzero_batch(window + 4 * page_size, initial_state);
+            std::latch start(2);
+            DWORD second = 0;
+            std::thread peer([&] {
+                start.arrive_and_wait();
+                second = emulate(window + 64);
+            });
+            start.arrive_and_wait();
+            const DWORD first = emulate(window);
+            peer.join();
+            check(first == 0 && second == 0 && state_is(window, MEM_COMMIT),
+                  "concurrent CLZERO first touches of one XMem page succeed");
+            check(state_is(window + page_size, initial_state), "the adjacent XMem page keeps its initial state");
+
+            auto* const touched = window + page_size;
+            std::memset(touched, 0x5A, 128);
+            check(emulate(touched + 13) == 0, "CLZERO accepts an XMem page previously written by the CPU");
+            const uint8_t zeros[64]{};
+            check(std::memcmp(touched, zeros, sizeof(zeros)) == 0 && touched[64] == 0x5A,
+                  "CLZERO clears exactly one line");
+            touched[0] = 0xA5;
+            DWORD old = 0;
+            check(VirtualAlloc(touched, 4096, MEM_COMMIT, PAGE_READWRITE) == touched &&
+                      VirtualProtect(touched, 4096, PAGE_READONLY, &old) &&
+                      emulate(touched) == STATUS_ACCESS_VIOLATION && touched[0] == 0xA5,
+                  "CLZERO honors a read-only subpage and leaves its bytes intact");
+            check(VirtualProtect(touched, 4096, PAGE_READWRITE | PAGE_GUARD, &old) &&
+                      emulate(touched + 64) == STATUS_GUARD_PAGE_VIOLATION && touched[64] == 0x5A &&
+                      emulate(touched + 64) == 0 && touched[64] == 0,
+                  "CLZERO honors one-shot guard protection before clearing the line");
+            check(VirtualProtect(touched, 4096, PAGE_NOACCESS, &old) &&
+                      emulate(touched) == STATUS_ACCESS_VIOLATION,
+                  "CLZERO refuses an inaccessible subpage");
+
+            auto* const partial = window + 2 * page_size;
+            check(VirtualAlloc(partial, 4096, MEM_COMMIT, PAGE_READWRITE) == partial &&
+                      VirtualProtect(partial, 4096, PAGE_READONLY, &old) &&
+                      state_is(partial + 4096, initial_state) && emulate(partial + 4096) == 0 &&
+                      state_is(partial + 4096, MEM_COMMIT) && emulate(partial) == STATUS_ACCESS_VIOLATION,
+                  "CLZERO commits the faulting subpage and preserves its neighbor's protection");
+            check(emulate(readonly) == STATUS_ACCESS_VIOLATION && state_is(readonly, initial_state),
+                  "CLZERO leaves an initially read-only XMem view in its initial state");
+            check(emulate(window + window_pages * page_size) == STATUS_ACCESS_VIOLATION,
+                  "CLZERO still faults on an unmapped XMem placeholder");
+
+            const HANDLE section =
+                CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0, page_size, nullptr);
+            void* const foreign = section ? MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, page_size) : nullptr;
+            check(foreign && emulate(foreign) == STATUS_ACCESS_VIOLATION && state_is(foreign, MEM_RESERVE),
+                  "CLZERO leaves an unrelated reserve-only mapped view reserved");
+            if (foreign) UnmapViewOfFile(foreign);
+            if (section) CloseHandle(section);
+        }
+        check(map(window, window_pages, nullptr) == window, "unmap the writable CLZERO fixture views");
+        check(map(readonly, 1, nullptr) == readonly, "unmap the read-only CLZERO fixture view");
+    }
+    if (allocated) check(free(count, pages) != FALSE, "free the CLZERO fixture backing");
+    if (window) {
+        for (SIZE_T offset = 0; offset < (window_pages + 1) * page_size; offset += page_size)
+            VirtualFree(window + offset, 0, MEM_RELEASE);
+    }
+    if (readonly) VirtualFree(readonly, 0, MEM_RELEASE);
+}
 
 void test_live(const ce::Host& host) {
     DWORD ex = 0;
@@ -341,15 +514,27 @@ void test_live(const ce::Host& host) {
 }
 }  // namespace
 
-int main() {
-    test_decode();
-    test_bits();
-    test_apply();
-    const ce::Host host = ce::detect_host();
-    std::printf("host: SSE4a %d, MONITORX %d, CLZERO %d, CLWB %d\n", host.sse4a, host.monitorx, host.clzero,
-                host.clwb);
-    check(ce::install(), "install the handler");
-    test_live(host);
+int main(int argc, char** argv) {
+    const bool wine_default = argc == 2 && std::strcmp(argv[1], "--wine-default-xmem") == 0;
+    if (argc != 1 && !wine_default) {
+        std::fprintf(stderr, "usage: cpu_emulation_test [--wine-default-xmem]\n");
+        return 1;
+    }
+    if (wine_default && !GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version")) {
+        std::printf("SKIP XMem defaults to SEC_COMMIT only on Wine\n");
+        return 77;
+    }
+    if (!wine_default) {
+        test_decode();
+        test_bits();
+        test_apply();
+        const ce::Host host = ce::detect_host();
+        std::printf("host: SSE4a %d, MONITORX %d, CLZERO %d, CLWB %d\n", host.sse4a, host.monitorx, host.clzero,
+                    host.clwb);
+        check(ce::install(), "install the handler");
+        test_live(host);
+    }
+    test_xmem_clzero(wine_default);
     if (failures) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

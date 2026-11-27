@@ -1231,7 +1231,9 @@ bool map_zero_page(uintptr_t address, bool read_only) {
     return true;
 }
 
-PageCommit commit_mapped_page(uintptr_t address, uintptr_t accessed, DWORD& protect) {
+bool access_allowed(DWORD protect, ULONG_PTR access);
+
+PageCommit commit_mapped_page(uintptr_t address, uintptr_t accessed, DWORD& protect, bool for_write = false) {
     auto it = g_views.upper_bound(address);
     if (it == g_views.begin()) return PageCommit::not_ours;
     --it;
@@ -1242,9 +1244,16 @@ PageCommit commit_mapped_page(uintptr_t address, uintptr_t accessed, DWORD& prot
         return PageCommit::not_ours;
     }
     // The fault handler needs the current protection of the accessed host page to decide whether to retry.
-    if (sections_committed() || info.State == MEM_COMMIT) {
+    // The emulated write has to reconcile an actual MEM_RESERVE result even in Wine's SEC_COMMIT mode.
+    if (info.State == MEM_COMMIT || (!for_write && sections_committed())) {
         protect = info.Protect;
         return PageCommit::committed_before;
+    }
+    // Protect is undefined while reserved. AllocationProtect describes the view until the backing is committed.
+    // A guarded view still needs to deliver its guard before testing writability.
+    if (for_write && info.State == MEM_RESERVE && !(info.AllocationProtect & PAGE_GUARD) &&
+        !access_allowed(info.AllocationProtect, 1)) {
+        return PageCommit::failed;
     }
     void* const backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset + within;
     if (!VirtualAlloc(backing, kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE)) return PageCommit::failed;
@@ -2664,6 +2673,15 @@ std::uintptr_t physical_page_scratch(std::uint64_t page) {
     const auto it = g_pages.find(page);
     if (it == g_pages.end() || !it->second.section->scratch) return 0;
     return reinterpret_cast<std::uintptr_t>(it->second.section->scratch) + it->second.offset;
+}
+
+bool commit_physical_page_for_write(const void* address) {
+    const auto accessed = reinterpret_cast<uintptr_t>(address);
+    const auto page = accessed & ~static_cast<uintptr_t>(kPhysicalPageSize - 1);
+    const FaultLockShared lock;
+    DWORD protect = 0;
+    const auto result = commit_mapped_page(page, accessed, protect, true);
+    return result == PageCommit::committed_now || result == PageCommit::committed_before;
 }
 
 bool commit_physical_range(const void* address, size_t size) {
