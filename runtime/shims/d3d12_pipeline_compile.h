@@ -1,6 +1,7 @@
 // Timing and scheduling for Vulkan pipeline creation on the D3D12 device.
 #pragma once
 
+#include "../src/async_pipeline_size.h"
 #include "../src/vulkan_device_fault.h"
 #include "../src/vulkan_replay.h"
 #include <windows.h>
@@ -33,6 +34,32 @@ inline bool async_replay_compile() {
         return GetEnvironmentVariableW(L"LEONIDA_ASYNC_PIPELINES", v, 2) == 1 && v[0] == L'1';
     }();
     return on && !leonida::strict_replay();
+}
+
+// LEONIDA_ASYNC_MIN_BYTES=<n> (with LEONIDA_ASYNC_PIPELINES=1): only pipelines with n bytes of SPIR-V or more are built
+// asynchronously; a smaller one is built where it is needed, as with asynchronous builds off. Unset or 0: every
+// pipeline, as before the variable (src/async_pipeline_size.h).
+inline std::uint64_t async_min_bytes() {
+    static const std::uint64_t bytes = [] {
+        char text[32]{};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_ASYNC_MIN_BYTES", text, sizeof(text));
+        bool valid = n < sizeof(text);
+        const std::uint64_t value = valid ? leonida::async_pipelines::parse_min_bytes(text, &valid) : 0;
+        if (!valid)
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_ASYNC_MIN_BYTES: not a number of bytes, ignored (every "
+                                 "asynchronous pipeline stays asynchronous)\n");
+        else if (value && async_replay_compile())
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_ASYNC_MIN_BYTES: pipelines under %llu bytes of SPIR-V are built "
+                                 "where they are needed; larger ones asynchronously\n", (unsigned long long)value);
+        return value;
+    }();
+    return bytes;
+}
+
+// Whether a pipeline of `spirv_bytes` (compute: its module; graphics: all its stages) is built asynchronously.
+inline bool async_replay_compile(std::uint64_t spirv_bytes) {
+    return async_replay_compile() &&
+           leonida::async_pipelines::asynchronous(true, async_min_bytes(), spirv_bytes);
 }
 
 // LOCAL FIX (post-load stalls): LEONIDA_FAST_PIPELINES=graphics, compute, or all (1 = all) creates those pipelines with
@@ -536,14 +563,14 @@ private:
     // The first job this worker may take, most urgent first (see the class comment). With one worker: any job for the
     // general worker, a graphics job for the graphics one, but not one whose PSO has a build running on the other.
     std::multimap<std::size_t, Job>::iterator next_locked(bool graphics_only) {
-        // Either way a job whose PSO has one running waits: two variants of one graphics PSO, one on each worker, and
-        // its last release (after_running, which waits for the running job only) would delete the PSO under the other.
-        const auto pso_busy = [this](const Job& job) {
-            return std::any_of(running_.begin(), running_.end(), [&](const Running& r) { return r.owner == job.owner; });
-        };
+        // As on main with #2361 (qhukz13, RT-COMPILE-OWNER-RACE): a job whose PSO has an entry running waits, so
+        // after_running never deletes a PSO while another build of it runs on the other worker.
         if (!pool_ || pool_->threads < 2) {
-            return std::find_if(jobs_.begin(), jobs_.end(), [&](const auto& entry) {
-                return (!graphics_only || entry.second.graphics) && !pso_busy(entry.second);
+            return std::find_if(jobs_.begin(), jobs_.end(), [this, graphics_only](const auto& entry) {
+                if (graphics_only && !entry.second.graphics) return false;
+                const void* owner = entry.second.owner;
+                // A finished entry may still be running what comes after its job (the PSO's deletion): it counts too.
+                return std::none_of(running_.begin(), running_.end(), [owner](const Running& r) { return r.owner == owner; });
             });
         }
         unsigned heavy = 0, large = 0, speculative = 0, demanded = 0;
@@ -559,7 +586,8 @@ private:
                 if (running_.empty()) return it;
                 continue;
             }
-            if (pso_busy(job)) continue;
+            if (std::any_of(running_.begin(), running_.end(), [&](const Running& r) { return r.owner == job.owner; }))
+                continue;
             if ((job.large || it->first != 0) && heavy >= pool_->threads - 1) continue;
             if (job.large && large >= pool_->heavy) continue;
             if (it->first != 0 && (speculative || demanded)) continue;

@@ -1722,7 +1722,11 @@ The copies:
   write watch first (the refresh's own asking comes after it, so a hot page's last answer is a submission old), passes
   over pages whose mapping changed, that a kernel write may be filling or that xmem maps at another address too, and
   writes only the 256-byte pieces where the copy differs from the title's bytes: a read-only view writes nothing and
-  its pages stay guarded. Up to 8,192 ranges and 64 MiB a submission (a V# has no read/write bit, so every view
+  its pages stay guarded. The copy runs under the tracker's lock and can still fault on a page another guard keeps
+  read-only (the geometry watch, another view's shadow): the fault handler asks every tracker over the address, this
+  one included, and on the thread whose copy faulted it does not take that lock again (an SRW lock is not
+  recursive; on 621.40 the title's submitting thread hung there for good, the main loop frozen with no device loss).
+  Up to 8,192 ranges and 64 MiB a submission (a V# has no read/write bit, so every view
   reached is compared; past the caps the ranges are left behind, logged once). `LEONIDA_TITLE_WRITEBACK=0` turns it off. A batch is fenced: it is kept with the ticket
   of the submission that will use it and copied back only when the context reports that ticket retired, so a range
   another submission is still writing is never read half done. A queue held deep (console ordering) can leave batches
@@ -2906,6 +2910,19 @@ submitting thread; at the maintainers' decision it was replaced by this one when
   title waits for anyway. `LEONIDA_COMPILE_GATE_WARMUPS=1` makes warm-ups hold the gate again, as before;
   `LEONIDA_COMPILE_GATE=0` still turns the whole gate off. The paragraphs above and below that say a warm-up holds the
   gate for its whole create describe `LEONIDA_COMPILE_GATE_WARMUPS=1`, the behaviour before.
+- **Only the large ones asynchronous** (`LEONIDA_ASYNC_MIN_BYTES=<n>`, with `LEONIDA_ASYNC_PIPELINES=1`). With every
+  pipeline asynchronous, the small lighting and post programs are skipped with the large ones until the worker gets to
+  them, and on an RTX 4070 Laptop (NVIDIA 621.40) the world phase was reached with the screen black; with none, a
+  submission waits for each ray-tracing compute program of 2-26 MB of SPIR-V, 2-3 minutes each there, and 17 were built
+  in 30 minutes (measured by OreoFR on the wave64-emulated pack). With the variable, a pipeline under n bytes of SPIR-V
+  (compute: its module; graphics: all its stages, the size the large-compile rules use) takes the path it takes with
+  asynchronous builds off: no record-time request, prepare's `PipelineCompiles` builds it, and a compile-helper build
+  waits for its file. One of n bytes or more is asynchronous as above. The choice is made once per pipeline at create
+  (`async_build` in `src/vulkan_replay.h`, decided by `src/async_pipeline_size.h`). Unset, `0` or text that is not a
+  decimal number of bytes (which is logged): every pipeline is asynchronous, as before the variable. A large build
+  still goes through the compile gate and `LargeModuleGate` as before, so a smaller one a submission waits for can
+  queue behind it there; `async_pipeline_size_test` covers the decision and `d3d12_m4_compute_async_small_waits` a
+  submission whose two pipelines are under the threshold with the worker held (both dispatches run).
 - **Warm-ups while the title submits.** A compute warm-up holds the compile gate for its whole create, and every
   submission waits behind it: a native boot's submissions waited 140 s in all at the gate behind compute warm-ups, and
   past the story load the worker went through 694 warm-ups of modules over 128 KiB (those over 640 KiB take 4-25 s
