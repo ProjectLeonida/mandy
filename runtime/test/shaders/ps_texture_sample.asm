@@ -2,10 +2,13 @@
 ; using normalized UV coordinates from attr0, outputs sampled color to mrt0.
 ; Run: vk_texture_test (autonomously, or with vs.spv fs.spv out.raw ptr_sgpr s0 s1 s2 s3)
 ;   -> verifies center pixel = gradient color (0.5, 0.5, 0.5, 1.0) sampled via descriptor table
-; s[0:1] = 64-bit pointer to T# in GPU heap
+; s0 = descriptor-table pointer to the T# in the GPU heap, made a 32-bit pointer (s1 = 0) as the title's shaders do:
+;   the shader takes the T#'s bindless index from its dword 6, with no hash-table lookup (docs/design.md, "Bindless
+;   index in the T#"); vk_texture_test writes the index word there.
 ; s[8:15] = 8-dword T# (image descriptor)
 ; s[16:19] = 4-dword S# (sampler descriptor)
 ; v[0:1] = barycentric UV coordinates
+s_mov_b32 s1, 0
 v_interp_p1_f32_e32 v2, v0, attr0.x
 v_interp_p2_f32_e32 v2, v1, attr0.x
 v_interp_p1_f32_e32 v3, v0, attr0.y

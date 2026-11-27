@@ -127,8 +127,12 @@ class Module:
                     return regs[p[1], r]
                 if p[1] == "%vgpr" and self.vgprs is not None:
                     return self.vgprs[r]
-                assert (p[1], r) == ("%sgpr", 1), "only T# word 1 is read"
-                return word1
+                if (p[1], r) == ("%sgpr", 1):
+                    return word1
+                # The T# (s[0:7]) is not from a heap slot, so it is looked up, and its dword 6 wins where it carries
+                # the index tag (dword 3 says it names an image): 0 in both here, so the lookup's index is used.
+                assert (p[1], r) in (("%sgpr", 3), ("%sgpr", 6)), "only T# words 1, 3 and 6 are read"
+                return 0
             var_op, v = self.defs[p[1]]
             assert var_op == "OpVariable" and v[1] == "Private", (var_op, v)
             words = self.defs[v[2]][1][1:]            # OpConstantComposite %fmt_mask_arr <words>
@@ -152,8 +156,12 @@ class Module:
             return (u[0] >> u[1]) & ((1 << u[2]) - 1)
         if op == "OpShiftRightLogical":
             return u[0] >> u[1]
+        if op == "OpShiftLeftLogical":
+            return (u[0] << u[1]) & 0xffffffff
         if op == "OpBitwiseAnd":
             return u[0] & u[1]
+        if op == "OpBitwiseOr":
+            return u[0] | u[1]
         if op == "OpINotEqual":
             return u[0] != u[1]
         if op == "OpIEqual":

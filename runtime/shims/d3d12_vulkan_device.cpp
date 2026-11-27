@@ -3981,6 +3981,22 @@ struct DeviceState {
         --it;
         return addr < it->second && (addr-it->first) % kDescriptorSize == 0;
     }
+    // The T#s of a bound table in one of the layer's heaps get the index word their entry has now (tsharp_index_word):
+    // Create*View wrote it, but a T# whose view came later (a stream published, a texture made at the address) or went
+    // since, and one the title wrote raw or copied from where no index was, would otherwise keep the word of then.
+    void refresh_tsharp_index_words(std::uint8_t* table, VkDeviceSize bytes) {
+        namespace g = leonida::gfx10;
+        std::lock_guard lock(descriptor_mutex);
+        for (VkDeviceSize at = 0; at + kDescriptorSize <= bytes; at += kDescriptorSize) {
+            g::ImageWords words;
+            std::memcpy(words.data(), table + at, sizeof(words));
+            if (!g::is_image(words)) continue;
+            const std::uint32_t word = tsharp_index_word_locked(g::tsharp_key(words));
+            if (word != words[g::kTsharpIndexDword])
+                std::memcpy(table + at + 4 * g::kTsharpIndexDword, &word, sizeof(word));
+        }
+    }
+
     // The buffer V#s of the table at `table_va` whose base is in the title's own memory get the address of a copy,
     // written in place: the title wrote them itself (or copied them), so no Create*View saw them. Images (T#s) and
     // null slots are skipped; so is a V# already in the arena, so a rewritten one is left alone next time.
@@ -4006,6 +4022,7 @@ struct DeviceState {
         // Slots the title wrote in its own backing of this heap, if it gave the heap one.
         aliases.pull_descriptors(table, std::size_t(end - table_va));
         if (sampler) return;  // S# words describe sampling state. They have no buffer address to translate.
+        if (tsharp_index_words) refresh_tsharp_index_words(table, end - table_va);
         for (VkDeviceSize at = table_va; at + 16 <= end; at += kDescriptorSize) {
             auto* words = reinterpret_cast<std::uint32_t*>(table + (at - table_va));
             if (words[3] >> 30) continue;
@@ -4956,6 +4973,11 @@ struct DeviceState {
                     else if (Records::is_waiting(heap.records.state(slot, 0)) &&
                              heap.records.base(slot, 0) == texture_address)
                         ++heap.texture_refills;  // the T# waited for this address and is bound now
+                    // The copy's dword 6 is the index shaders take (gfx10_descriptors.h, tsharp_index_word), or 0 while
+                    // the T# waits: a texture coming, going or being replaced at its address fixes the slot again
+                    // (apply_slot_changes), so the word follows the texture the T# names. The title's bytes and the
+                    // T#'s key keep the title's dword 6.
+                    if (tsharp_index_words) w[leonida::gfx10::kTsharpIndexDword] = unbound ? 0u : tsharp_index_word(words);
                 }
             } else {
                 // Neither a buffer V# (TYPE is not 0) nor a T# the layer can decode: data the title keeps in the slot.
@@ -5558,8 +5580,16 @@ struct DeviceState {
         const bool imported = heap->imported;
         const VkDeviceSize guarded = heap->guard;
         arena_guard_bytes.fetch_add(guarded, std::memory_order_relaxed);
-        if (heap_gpu && console_heap_gpu_enabled() && heap->scratch && resource_heap && !imported)
-            attach_console_heap_gpu(*heap);
+        // The pass copies a T#'s words as the title wrote them; it does not write the index word the library's modules
+        // read (tsharp_index_words), so such a library's heaps are fixed on the CPU, which writes it.
+        if (heap_gpu && console_heap_gpu_enabled() && heap->scratch && resource_heap && !imported) {
+            if (!tsharp_index_words)
+                attach_console_heap_gpu(*heap);
+            else
+                log_once("LEONIDA_CONSOLE_HEAP_GPU: the pass does not write the T# index word the shaders read; console "
+                         "descriptor heaps are fixed on the CPU; slots",
+                         int(std::min<VkDeviceSize>(bytes / kDescriptorSize, INT_MAX)));
+        }
         {
             std::lock_guard lock(console_heap_mutex);
             if (heap->gpu >= 0) gpu_heaps[std::size_t(heap->gpu)] = heap.get();
@@ -7021,7 +7051,7 @@ struct DeviceState {
         char what[96] = "no texture at that address";
         {
             std::lock_guard lock(descriptor_mutex);
-            if (image_entries.count(words)) {
+            if (image_entries.count(words) || image_entries.count(g::tsharp_key(words))) {
                 kind = 3;
                 std::snprintf(what, sizeof(what), "key registered");
             } else if (const auto it = images_by_address.find(image.address); it != images_by_address.end()) {
@@ -7561,6 +7591,10 @@ struct DeviceState {
     // True when the loaded library's modules read the table's kind word (create_bindless, descriptor_table.h): the
     // image inserts then record which arrays each index is bound in.
     bool descriptor_table_tagged = false;
+    // True when the loaded library's modules read a T#'s bindless index from its dword 6 (create_bindless,
+    // gfx10_descriptors.h tsharp_index_word): every T# the layer writes into a heap shaders read then carries it, in
+    // the console heaps' copies (fix_console_slot) and in its own heaps (write_image_descriptor, scan_title_table).
+    bool tsharp_index_words = false;
     std::mutex descriptor_mutex;  // the set and the containers below
     // vkDeviceWaitIdle calls made for the bindless set (none, unless LEONIDA_BINDLESS_IDLE_WAIT restores the old wait).
     std::atomic<std::uint64_t> bindless_idle_waits{0};
@@ -7958,6 +7992,22 @@ struct DeviceState {
                              descriptor_table_tagged ? bindless->image_kind_at(dimension, entry.index) : 0u);
         leonida::fsdraw::note_tsharp(words.data());  // LOCAL DIAGNOSTIC
         return true;
+    }
+
+    // The dword 6 that the T# `words` (its key: the descriptor as the title or Create*View wrote it) gets in a heap
+    // shaders read (gfx10_descriptors.h, tsharp_index_word): its entry's index and the arrays that index is bound in,
+    // which the set derives from what it bound there (image_kind_at); 0, the fallback, while the T# has no entry (no
+    // texture yet, a stream still pending, no room). descriptor_mutex held.
+    std::uint32_t tsharp_index_word_locked(const leonida::gfx10::ImageWords& words) const {
+        if (!bindless) return 0;
+        const auto it = image_entries.find(words);
+        if (it == image_entries.end()) return 0;
+        return leonida::gfx10::tsharp_index_word(it->second.index,
+                                                 bindless->image_kind_at(it->second.dimension, it->second.index));
+    }
+    std::uint32_t tsharp_index_word(const leonida::gfx10::ImageWords& words) {
+        std::lock_guard lock(descriptor_mutex);
+        return tsharp_index_word_locked(words);
     }
 
     // Textures by the address their T#s name them by (Resource::image_address), for the T#s a title writes into a
@@ -15437,6 +15487,21 @@ public:
                          leonida::descriptor_table_layout_name(descriptor_table), table_modules.total());
         }
         state_.descriptor_table_tagged = descriptor_table == leonida::DescriptorTableLayout::tagged;
+        // Whether the loaded modules read a T#'s index from its dword 6 (shader_library.h, TsharpIndexCensus): one such
+        // module needs the word in every heap. Older modules find heap T#s by their words in the hash table, which the
+        // word changes, so a library with both kinds is reported: its older modules read the fallback for those T#s.
+        if (const leonida::ShaderLibrary* library = state_.library()) {
+            const leonida::TsharpIndexCensus& census = library->tsharp_index_census();
+            state_.tsharp_index_words = census.dword6 > 0;
+            if (census.dword6 && census.none)
+                std::fprintf(stderr,
+                             "[rt] d3d12: T# index word: %zu modules read it, %zu older ones look heap T#s up in the "
+                             "hash table and miss them (the heaps carry the word); translate the library again\n",
+                             census.dword6, census.none);
+            else
+                std::fprintf(stderr, "[rt] d3d12: T# index word: %s (all %zu modules)\n",
+                             census.dword6 ? "written into the heaps' T#s" : "not read", census.total());
+        }
         const auto get_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
             state_.info.get_instance_proc(state_.info.instance, "vkGetPhysicalDeviceProperties2"));
         if (get_properties) {
@@ -16249,7 +16314,7 @@ public:
         if (!leonida::gfx10::is_image(result)) return false;
         std::lock_guard descriptors(state_.descriptor_mutex);
         if (!state_.bindless) return true;
-        const auto entry = state_.image_entries.find(result);
+        const auto entry = state_.image_entries.find(leonida::gfx10::tsharp_key(result));
         if (entry != state_.image_entries.end() && entry->second.storage) return true;
         std::memset(reinterpret_cast<void*>(dest.ptr), 0, kDescriptorSize);
         return false;
@@ -21227,8 +21292,11 @@ private:
             log_once("shader access to 1D and 3D UAVs requires robustImageAccess; type", int(view.type));
         } else {
             const bool known_heap = state_.known_view_heap(destination.ptr);
+            // A deferred view has no index to write until a table naming it is bound, and a directly indexed heap
+            // has no such moment: with the index word (tsharp_index_words) the view is made here, as without
+            // LEONIDA_PIPELINE_COMPILE=on-demand.
             if (!storage && resource.deferrable_sample() && state_.info.prepare_on_bind && known_heap &&
-                !g::multisampled(image.type)) {
+                !state_.tsharp_index_words && !g::multisampled(image.type)) {
                 state_.remember_sample(words,{const_cast<Resource*>(&resource),image,view_format,channels_format});
                 std::memcpy(reinterpret_cast<void*>(destination.ptr),words.data(),sizeof(words));
                 return;
@@ -21240,6 +21308,11 @@ private:
                                                        sampled, storage, slices);
             if (registered && (resource.sparse_image() || storage_plane)) state_.context->note_shader_image(resource.id());
             if (!registered && (g::multisampled(image.type) || storage_plane)) return;
+            // In the layer's own heaps the bytes written here are what shaders load: dword 6 carries the index
+            // (gfx10_descriptors.h, tsharp_index_word; 0 while the T# has none). A console heap (the title's memory)
+            // is left as the title's own write would be: its copy gets the word when the slot is fixed.
+            if (state_.tsharp_index_words && known_heap)
+                words[g::kTsharpIndexDword] = state_.tsharp_index_word(words);
         }
         // The CPU UAV used by ClearUnorderedAccessView is independent of set 0.
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
