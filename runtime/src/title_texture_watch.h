@@ -33,6 +33,7 @@
 //   void aliases(std::uintptr_t tile, std::vector<std::uintptr_t>&);  // the tile's other addresses
 //   void take_written(std::vector<std::uintptr_t>& tiles, bool& overflow);  // the queue since the last call
 //   bool enabled();                              // a write-fault handler is installed: arming is allowed
+//   void hot_tiles(std::vector<std::uintptr_t>&); // tiles another owner leaves writable: written at every look
 //
 // Not thread-safe: the caller holds the title texture registry's lock.
 #include <algorithm>
@@ -223,6 +224,14 @@ public:
                         if (const auto it = tiles_.find(owner); it != tiles_.end()) changed(owner, it->second);
             }
         }
+        // Tiles another owner keeps writable (the page mirror's hot pages): written, as far as anyone can tell.
+        watch_.hot_tiles(hot_);
+        for (const std::uintptr_t a : hot_) {
+            if (const auto it = tiles_.find(a); it != tiles_.end()) mark(it->second);
+            if (const auto peer = by_peer_.find(a); peer != by_peer_.end())
+                for (const std::uintptr_t owner : peer->second)
+                    if (const auto it = tiles_.find(owner); it != tiles_.end()) mark(it->second);
+        }
         // Tiles not armed: whatever their version says, a write there need not have faulted.
         for (const std::uintptr_t a : unarmed_)
             if (const auto it = tiles_.find(a); it != tiles_.end()) {
@@ -366,7 +375,7 @@ private:
     std::set<Key> dirty_, over_;
     std::set<std::uintptr_t> pass_written_;  // the tiles written as the last collect() found them
     std::vector<Key> named_;
-    std::vector<std::uintptr_t> written_, aliases_;
+    std::vector<std::uintptr_t> written_, aliases_, hot_;
     Stats stats_;
 };
 
