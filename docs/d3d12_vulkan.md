@@ -2191,29 +2191,37 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    than a change that concerns it. In one world run 70% of the 2,100 rewritten V# halves a submission resolved to
    nothing at about 9 µs each.
    **A console resource heap read in place.** When the page mirror holds every page of the heap (a reservation xmem
-   placed in the mirror's range), there is no copy and no page tracker of the heap's own. 25,865 of 26,503 shaders
-   keep 32 bits of a descriptor-table pointer, so the heap's pages are bound a second time into the arena below
-   4 GiB (`TitleMirror::alias`, in the same bind batches as their mirror binds, so the one wait orders a reader of
-   either address), at a range of whole arena blocks with no arena memory behind it; the null slots after the heap are
-   that range's rest, unbound, which reads zero. Table pointers go there as before (`console_heap_ranges`). The
-   mirror fills the pages' home through a filter (`TitleMirror::filter_range`, `filter_heap_page`): the title's bytes
-   are only read, and the home, the mirror's own GPU memory, gets each slot that changed since it was last filtered,
-   or that a change of the address space touched: a V# whose base lies in the arena, in the mirror (named to it as
-   any reader names title memory) or in a buffer of ours as the title wrote it (`reachable_as_written`), other words
-   null. The filter runs inside the mirror's fills, under its lock, so it takes no other lock of ours: a V# the mirror
-   does not hold (an interim, until every title allocation is in the mirror) reads null until the heap's refresh
-   resolves it as a copied slot was, and a T# is bound there too, its home dword 6 then taking the bindless index word
-   (`tsharp_index_word`, docs/design.md "Bindless index in the T#"; 0, the fallback, from the filter until then and
-   while the T# waits; the title's dword 6 stays in its bytes), each result written into the home unless the title
-   rewrote the slot meanwhile (`finish_in_place`). The upload's sums per 256-byte piece are of the title's bytes for
-   such a page, so the mirror calls the filter only when a piece of the title's page changed, and `write_back` skips
-   it. Lock order:
-   `console_heap_mutex`, then the mirror's, then the change list's. The changes are applied to the homes at the
-   mirror's refresh, before the pages written since are filled. No GPU write is ever copied back from these pages
-   (`TitleMirror::filtered_at`). A heap the mirror does not hold (a device without the mirror, memory outside its
-   range) is copied as before. `d3d12_heap_in_place_test` checks that the GPU reads the filtered slots below 4 GiB while the
-   title's bytes never change, that a rewrite reaches the GPU at the next refresh, and that the null slots read zero;
-   `title_mirror_hooks_test` checks the two hooks without a GPU and `vk_heap_alias_test` the second binding on a device.
+   placed in the mirror's range), there is no copy of the whole heap and no page tracker of its own. Its pages have
+   two homes. At the title's address (the mirror) the home is the title's bytes exactly, as for any page: the title
+   keeps plain data inline in its heap pages and points V#s at it (run 64w3: four words a compute program reads as
+   its sizes, `[512 256 1280 720]`), so a V# or a title pointer into those pages must read what the title wrote, and
+   GPU stores there are written back as for any page. At the table address, below 4 GiB of the arena (25,865 of
+   26,503 shaders keep 32 bits of a descriptor-table pointer), each page has a filtered copy of its own
+   (`TitleMirror::alias`: a second home per page, bound there in the same batches as the mirror's binds, so the one
+   wait orders a reader of either address), in a range of whole arena blocks with no arena memory behind it; the null
+   slots after the heap are that range's rest, unbound, which reads zero. The filter writes only that copy
+   (`filter_heap_page`), refilled when a 256-byte piece of the title's page changed (the upload's sums compare the
+   title's bytes with the title's) or write-back changed it. Each slot that changed since it was last filtered, or
+   that a change of the address space touched, is filtered: a V# half whose base lies in the arena, in the mirror
+   (named to it as any reader names title memory) or in a buffer of ours is kept as the title wrote it
+   (`reachable_as_written`); a half nothing holds is null whole, all four words (a shader reading it as a V# would
+   fault at heap_base + its base: the "resolved to nothing" classes of the heap's log line), never three of four; a
+   T# is kept as written and bound; words that decode as neither are null, as a shader taking them as a V# would
+   fault. The filter runs inside the mirror's fills, under its lock, so it takes no other lock of ours: a V# the mirror
+   does not hold reads null until the heap's refresh resolves it as a copied slot was, and a T# is bound there too,
+   its dword 6 in the copy then taking the bindless index word (`tsharp_index_word`, docs/design.md "Bindless index in
+   the T#"; 0, the fallback, from the filter until then and while the T# waits; the title's dword 6 stays in its
+   bytes), each result written into the copy unless the title rewrote the slot meanwhile (`finish_in_place`). Lock
+   order: `console_heap_mutex`, then the mirror's, then the change list's. Table pointers reach shaders in user SGPRs,
+   which the layer sets to the table address (`console_descriptor_table_va`) for every module; a table pointer a
+   shader loads from memory is the title's address and reads the title's bytes there: V#s as written (the mirror
+   holds what they name, or the read faults as on any unfiltered memory) and T#s without the index word, which a
+   module of the index-word contract reads as the fallback. A heap the mirror does not hold (a device without the
+   mirror, memory outside its range) is copied as before. `d3d12_heap_in_place_test` checks that the GPU reads the
+   filtered slots at the table address while the title's bytes never change, that a rewrite reaches the GPU at the
+   next refresh, that inline data reads exactly through a V# while the table reads it filtered, that a GPU store into
+   the heap goes back, and that the null slots read zero; `title_mirror_hooks_test` checks the alias without a GPU
+   and `vk_heap_alias_test` a second binding on a device.
    Console resource heap copies and shader-visible CBV/SRV/UAV heaps with at least 65,536 slots request
    64 MiB of zeroed padding after their last descriptor. `LEONIDA_HEAP_GUARD_MB` sets the padding in MiB
    (0 disables it). When arena space is tight, allocation can fall back to the heap alone. Only indices
