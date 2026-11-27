@@ -121,7 +121,7 @@ def main(argv=None) -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="leonida-authored-journal-") as tmp:
             return run(exe, Path(tmp), args.device, args.require_hit)
-    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+    except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 

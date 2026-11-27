@@ -141,5 +141,31 @@ class CheckComputeJournalOverlayTests(unittest.TestCase):
                     self.assertNotIn("Traceback", err.getvalue())
 
 
+    def test_executable_launch_oserror_reports_cli_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "d3d12_compute_journal_test.exe"
+            exe.write_bytes(b"")  # real 0-byte exe triggers WinError 193 on Windows
+
+            out, err = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(cjo.subprocess, "run", side_effect=OSError("bad binary")),
+                contextlib.redirect_stdout(out),
+                contextlib.redirect_stderr(err),
+            ):
+                rc = cjo.main([str(exe)])
+            self.assertEqual(rc, 1)
+            self.assertEqual(out.getvalue(), "")
+            self.assertIn("ERROR:", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
+            if os.name == "nt":
+                out_nt, err_nt = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out_nt), contextlib.redirect_stderr(err_nt):
+                    rc_nt = cjo.main([str(exe)])
+                self.assertEqual(rc_nt, 1)
+                self.assertIn("ERROR:", err_nt.getvalue())
+                self.assertNotIn("Traceback", err_nt.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
