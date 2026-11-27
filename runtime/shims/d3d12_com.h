@@ -441,6 +441,11 @@ struct UnboundTsharpStats {
     std::uint64_t total_refusals = 0;
 };
 
+// For tests: the cache key (GetCachedBlob) and the pipeline_order.log key that ID3D12Device2::CreatePipelineState
+// gives a stream's pipeline, without creating it. Fails as parsing the stream does.
+HRESULT pipeline_stream_keys_for_test(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, std::string& cache_key,
+                                      std::string& order_key);
+
 // Returns statistics on unbound T# descriptor refusals across console descriptor heaps.
 UnboundTsharpStats unbound_tsharp_stats();
 // Resets unbound T# refusal statistics (for testing).
