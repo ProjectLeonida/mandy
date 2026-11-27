@@ -312,12 +312,21 @@ def check_carve_index(directory: str) -> list[dict]:
     return sorted(rows, key=lambda r: r["off"])
 
 
-def read_payloads(target: str, *, _checked_index: bool = False) -> list[dict]:
+class _LoadedDirectorySource(gi.DirectorySource):
+    """DirectorySource initialized from an already-validated sorted row list."""
+
+    def __init__(self, directory: str, rows: list[dict]):
+        self.directory = directory
+        self.index = {"files": rows}
+        self.rows = rows
+
+
+def read_payloads(target: str, *, _checked_index: bool = False, _rows: list[dict] | None = None) -> list[dict]:
     """Decode all text and binary payloads from an rpf9_carve.py dir or .rpf archive."""
     if os.path.isdir(target):
-        if not _checked_index:
-            check_carve_index(target)
-        source = gi.DirectorySource(target)
+        if _rows is None and not _checked_index:
+            _rows = check_carve_index(target)
+        source = _LoadedDirectorySource(target, _rows) if _rows is not None else gi.DirectorySource(target)
         return _analyze_from_source(source)
     if not os.path.isfile(target):
         raise ValueError(f"{target}: no such file or folder")
@@ -388,6 +397,11 @@ def check_report_path(out_path: str, target: str, shaders_rpf: str | None = None
         raise ValueError(f"--json would overwrite the input {shaders_rpf}")
     if os.path.isdir(target):
         gm.check_report_path(out_path, target, rows=rows)
+        for row in rows or ():
+            ext = ".bk2" if row.get("type") == "bink2" else ".bin"
+            cand = os.path.join(target, f'{row["off"]:012x}{ext}')
+            if same_report_path(out_path, cand):
+                raise ValueError(f"--json would overwrite the input {cand}")
     elif same_report_path(out_path, target):
         raise ValueError(f"--json would overwrite the input {target}")
 
@@ -439,11 +453,12 @@ def main(argv=None) -> int:
         if a.json:
             check_report_path(a.json, a.target, a.shaders)
         is_dir = os.path.isdir(a.target)
+        rows = None
         if is_dir:
             rows = check_carve_index(a.target)
             if a.json:
                 check_report_path(a.json, a.target, a.shaders, rows=rows)
-        payloads = read_payloads(a.target, _checked_index=is_dir)
+        payloads = read_payloads(a.target, _checked_index=is_dir, _rows=rows)
         xref = cross_reference_sgd5(payloads, a.shaders) if a.shaders else None
     except (OSError, ValueError, KeyError, TypeError, RecursionError, struct.error, RuntimeError) as e:
         print("error:", e, file=sys.stderr)

@@ -427,11 +427,13 @@ class GamedataBlobsSafetyTests(unittest.TestCase):
             out_json = os.path.join(tmp, "out.json")
             with (
                 mock.patch.object(gamedata_blobs, "check_carve_index", wraps=gamedata_blobs.check_carve_index) as spy,
+                mock.patch.object(gamedata_blobs.json, "load", wraps=json.load) as load_spy,
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 rc = gamedata_blobs.main([ok_folder, "--json", out_json])
             self.assertEqual(rc, 0)
             spy.assert_called_once_with(ok_folder)
+            load_spy.assert_called_once()
 
     def test_trailing_separator_json_and_missing_shaders_fail_before_read_payloads(self):
         import contextlib
@@ -501,6 +503,28 @@ class GamedataBlobsSafetyTests(unittest.TestCase):
                     with open(out_json, "rb") as f:
                         self.assertEqual(f.read(), raw)
                     self.assertEqual([n for n in os.listdir(out_dir) if n.startswith(".blobs-")], [])
+
+
+    def test_json_refuses_bink2_carve_input_alias(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            bk2 = os.path.join(carve, "000000001000.bk2")
+            with open(bk2, "wb") as f:
+                f.write(b"KB2nDATA")
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"files": [{"off": 4096, "stored": 8, "type": "bink2"}]}, f)
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = gamedata_blobs.main([carve, "--json", bk2])
+            self.assertEqual(rc, 1)
+            self.assertIn("overwrite", err.getvalue())
+            with open(bk2, "rb") as f:
+                self.assertEqual(f.read(), b"KB2nDATA")
 
 
 if __name__ == "__main__":
