@@ -23,7 +23,10 @@ The count of tests comes from unittest's own result object, not from its output:
 `--timeout SECONDS` limits each module subprocess in parallel mode, or the entire discover subprocess with
 `-j 1`. The value must be positive and at most 86400 seconds (24 hours), keeping it within platform wait limits.
 A timeout fails the run and reports any output already produced; other parallel modules keep running.
-The default has no time limit. This stops the direct test subprocess, not any descendants it may have started.
+The default has no time limit. On POSIX, timed test subprocesses run in their own sessions: timeout and
+cancellation stop their entire process groups, including helpers still holding the output pipes. Untimed
+subprocesses stay in the caller's process group. Descendants that leave a timed worker's group are outside
+the cleanup boundary.
 """
 import argparse
 import concurrent.futures
@@ -33,6 +36,7 @@ import locale
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -56,6 +60,14 @@ def _unregister_process(proc):
         _active_processes.discard(proc)
 
 
+def _start_test_process(cmd, timeout, **kwargs):
+    # Do not detach untimed jobs from the caller's ordinary process-group signals.
+    owns_group = os.name == "posix" and timeout is not None
+    proc = subprocess.Popen(cmd, start_new_session=owns_group, **kwargs)
+    proc._semantic_owns_group = owns_group
+    return proc
+
+
 def _kill_process_tree(proc):
     if proc is None:
         return
@@ -64,6 +76,13 @@ def _kill_process_tree(proc):
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
+            pass
+    elif os.name == "posix" and getattr(proc, "_semantic_owns_group", False):
+        # A launcher can exit while a helper still owns a copy of its output pipe. The session's group ID is
+        # the original worker PID even after the launcher exits.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
             pass
     try:
         proc.kill()
@@ -159,7 +178,7 @@ def run_module(directory, module, verbose, timeout=None):
     with tempfile.TemporaryDirectory() as scratch:
         count_path = os.path.join(scratch, "count.json")
         env = dict(os.environ, LEONIDA_TEST_COUNT=count_path)
-        proc = subprocess.Popen(cmd, cwd=directory, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        proc = _start_test_process(cmd, timeout, cwd=directory, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, errors="replace")
         _register_process(proc)
         try:
@@ -208,7 +227,7 @@ def main(argv=None):
     if a.jobs <= 1:
         cmd = [sys.executable, "-m", "unittest", "discover", "-s", directory,
                "-p", a.pattern, *(["-v"] if a.verbose else [])]
-        proc = subprocess.Popen(cmd)
+        proc = _start_test_process(cmd, a.timeout)
         _register_process(proc)
         start_time = time.monotonic()
         try:
