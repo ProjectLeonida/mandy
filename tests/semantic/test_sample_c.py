@@ -77,18 +77,29 @@ class SampleC(unittest.TestCase):
         (line,) = samples(spv)
         ref, bias = re.search(r"%\w+ %\w+ (%\w+) Bias (%\w+)$", line).groups()
 
+        consts = {k: int(v) for k, v in re.findall(r"^\s*(%\w+) = OpConstant %uint (\d+)", spv, re.M)}
+        vgpr_ptrs = {ptr: consts[idx] for ptr, idx in
+                     re.findall(r"^\s*(%\w+) = OpAccessChain %\S+ %vgpr (%\w+)", spv, re.M)
+                     if idx in consts}
+        stored_to = {val: vgpr_ptrs[ptr] for ptr, val in
+                     re.findall(r"^\s*OpStore (%\w+) (%\w+)", spv, re.M)
+                     if ptr in vgpr_ptrs}
+
         def loaded_from(value):
-            """The VGPR index a value was loaded from: the OpLoad of %vgpr[k] behind it, through bitcasts."""
+            """The VGPR index a value came from: OpLoad of %vgpr[k] or a forwarded OpStore to %vgpr[k], through bitcasts."""
             for _ in range(6):
                 m = re.search(rf"^\s*{re.escape(value)} = (\w+) (?:%\w+ )?(%\w+)", spv, re.M)
-                if not m:
+                if m:
+                    op, src = m.groups()
+                    if op == "OpLoad":
+                        return vgpr_ptrs.get(src)
+                    if value in stored_to:
+                        return stored_to[value]
+                    value = src
+                elif value in stored_to:
+                    return stored_to[value]
+                else:
                     return None
-                op, src = m.groups()
-                if op == "OpLoad":
-                    m2 = re.search(rf"^\s*{re.escape(src)} = OpAccessChain %\S+ %vgpr (%\w+)", spv, re.M)
-                    consts = {k: int(v) for k, v in re.findall(r"^\s*(%\w+) = OpConstant %uint (\d+)", spv, re.M)}
-                    return consts.get(m2.group(1)) if m2 else None
-                value = src
             return None
         self.assertEqual((loaded_from(bias), loaded_from(ref)), (4, 5))
 

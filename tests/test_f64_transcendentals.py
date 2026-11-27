@@ -53,11 +53,14 @@ class F64TranscendentalsTest(unittest.TestCase):
             return match.group(1)
 
         lo, hi = words(value)
-        pair = result(
-            rf"OpCompositeConstruct %v2uint_d {result(f'OpConstant %uint {lo}')} "
-            rf"{result(f'OpConstant %uint {hi}')}"
-        )
-        return result(rf"OpBitcast %double {pair}")
+        lo_id = result(f"OpConstant %uint {lo}")
+        hi_id = result(f"OpConstant %uint {hi}")
+        pairs = re.findall(rf"^ *(%\w+) = OpCompositeConstruct %v2uint_d {re.escape(lo_id)} {re.escape(hi_id)}$", spv, re.M)
+        self.assertTrue(pairs, f"Missing OpCompositeConstruct %v2uint_d {lo_id} {hi_id}")
+        pair_pat = "(?:" + "|".join(re.escape(p) for p in pairs) + ")"
+        casts = re.findall(rf"^ *(%\w+) = OpBitcast %double {pair_pat}$", spv, re.M)
+        self.assertTrue(casts, f"Missing OpBitcast %double for {value}")
+        return "(?:" + "|".join(re.escape(c) for c in casts) + ")"
 
     def test_v_rcp_rsq_sqrt_f64_lowering_and_modifiers(self):
         ops = (

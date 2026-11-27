@@ -34,7 +34,7 @@ OUT_V = 0x31016FAC                          # the output V# in s[0:3]: RAW, base
 W3 = 0x01000FAC                             # RESOURCE_LEVEL, DST_SEL xyzw; FORMAT, INDEX_STRIDE, ADD_TID, mode or-ed in
 NONE = None
 LANE = 5                                    # the lane of the single invocation in the ADD_TID rows
-SWIZZLE_EXTRACT = re.compile(r"OpBitFieldUExtract %uint %t\d+ %c1f %c1\b")    # word1 >> 31 & 1 at run time
+SWIZZLE_EXTRACT = re.compile(r"OpBitFieldUExtract %uint %\w+ %c1f %c1\b")    # word1 >> 31 & 1 at run time
 
 
 class PatternMemory(dict):

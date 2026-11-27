@@ -56,8 +56,12 @@ class RcpIflagModsTest(unittest.TestCase):
             self.assertNotIn("FAbs", spv)
         self.assertRegex(defs[src], r"^OpBitcast %float %\w+$")
         loaded_u = defs[src].split()[-1]
-        self.assertRegex(defs[loaded_u], r"^OpLoad %uint %\w+$")
-        ptr = defs[loaded_u].split()[-1]
+        if defs[loaded_u].startswith("OpLoad %uint "):
+            ptr = defs[loaded_u].split()[-1]
+        else:
+            m_st = re.search(rf"^ *OpStore (%\w+) {re.escape(loaded_u)}$", spv, re.M)
+            self.assertIsNotNone(m_st, f"Missing OpStore for forwarded VGPR value {loaded_u}")
+            ptr = m_st.group(1)
         self.assertRegex(defs[ptr], r"^OpAccessChain %_ptr_Function_uint %vgpr %c1$")
 
         # Verify output modifiers (omod before clamp) feeding v0 store.
@@ -68,8 +72,10 @@ class RcpIflagModsTest(unittest.TestCase):
 
         if scale_bits is not None:
             const = match_result(rf"OpConstant %uint {scale_bits}")
-            scale = match_result(rf"OpBitcast %float {const}")
-            value = match_result(rf"OpFMul %float {value} {scale}")
+            scales = re.findall(rf"^ *(%\w+) = OpBitcast %float {re.escape(const)}$", spv, re.M)
+            self.assertTrue(scales, f"Missing SPIR-V instruction: OpBitcast %float {const}")
+            scale_pat = "(?:" + "|".join(re.escape(s) for s in scales) + ")"
+            value = match_result(rf"OpFMul %float {value} {scale_pat}")
         else:
             self.assertNotRegex(spv, r"\bOpFMul %float\b")
 
