@@ -1837,6 +1837,13 @@ public:
         return it == device_fault_->pipeline_names.end() ? nullptr : it->second[0];
     }
     void set_before_execute(std::function<void()> before) { before_execute_ = std::move(before); }
+    // The page mirror bound pages in a batch that signals `value` on `semaphore`: every queue's next submission of command
+    // lists waits for it (the bind of a remap lands before any submission made after the remap).
+    void note_mirror_bind(VkSemaphore semaphore, std::uint64_t value) {
+        std::lock_guard lock(storage_mutex_);
+        mirror_bind_semaphore_ = semaphore;
+        mirror_bind_value_ = value;
+    }
     // Called at the end of every ExecuteCommandLists replay that called before_execute_, however it returns: by then
     // the submissions it made are recorded, so submitted_retire_ticket() covers them.
     void set_after_execute(std::function<void()> after) { after_execute_ = std::move(after); }
@@ -2360,6 +2367,10 @@ private:
     // a counter that says which one: every other queue's next submission waits for it (storage_mutex_).
     VkSemaphore bindless_upload_semaphore_ = VK_NULL_HANDLE;
     std::uint64_t bindless_upload_value_ = 0;
+    // The page mirror's last bind batch (src/title_mirror.h): every queue's next submission of command lists waits for
+    // it, so none reads a page whose bind has not landed (storage_mutex_).
+    VkSemaphore mirror_bind_semaphore_ = VK_NULL_HANDLE;
+    std::uint64_t mirror_bind_value_ = 0;
     std::uint64_t bindless_upload_version_ = 0;
     std::function<bool(VkCommandBuffer)> prelude_record_;
     std::function<void(bool, std::uint64_t)> prelude_commit_;
@@ -3625,6 +3636,11 @@ private:
                 wait_values_.push_back(context_.bindless_upload_value_);
             }
             bindless_upload_seen_ = context_.bindless_upload_version_;
+            if (context_.mirror_bind_semaphore_ && context_.mirror_bind_value_ > mirror_bind_seen_) {
+                waits_.push_back(context_.mirror_bind_semaphore_);
+                wait_values_.push_back(context_.mirror_bind_value_);
+                mirror_bind_seen_ = context_.mirror_bind_value_;
+            }
             if (kind_ != QueueKind::copy && runs_shaders)
                 storage_images.assign(context_.storage_pending_.begin(), context_.storage_pending_.end());
             if (!storage_images.empty()) context_.storage_pending_.clear();
@@ -4481,6 +4497,7 @@ private:
     std::unique_ptr<OcclusionResolve> occlusion_resolve_;
     std::uint64_t storage_init_seen_ = 0;  // the storage_init_version_ this queue has waited for
     std::uint64_t bindless_upload_seen_ = 0;  // the bindless_upload_version_ this queue has waited for
+    std::uint64_t mirror_bind_seen_ = 0;      // the page mirror's bind value this queue has waited for
     std::uint64_t prelude_seen_ = 0;  // the prelude_version_ this queue has waited for (or recorded)
     std::uint64_t last_sparse_ = 0;
     std::deque<PendingBindings> pending_bindings_;
