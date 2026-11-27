@@ -100,6 +100,29 @@ int scripted() {
     sp::frame_lines(1.0);  // the two lines' format, on stderr; a new window
     EXPECT(load(f.frames) == 0 && load(f.all_count) == 0 && load(f.floor_count) == 0 && load(f.worst_ns) == 0);
     for (const auto& p : f.phase_ns) EXPECT(load(p) == 0);
+    // Mirror refresh/write-back inside a list submission: time inside Scope(shadows) is billed to shadows, not lists,
+    // and contended lock_timed inside it is billed to lock waits.
+    {
+        const sp::TitleCall call(sp::part_lists);
+        const sp::Scope shadows_scope(sp::shadows);
+        std::mutex mirror_m;
+        std::atomic<bool> held_flag{false};
+        std::thread holder([&] {
+            const std::lock_guard held(mirror_m);
+            held_flag.store(true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        });
+        while (!held_flag.load()) std::this_thread::yield();
+        {
+            std::unique_lock lock(mirror_m, std::defer_lock);
+            sp::lock_timed(lock);
+        }
+        holder.join();
+    }
+    EXPECT(load(f.phase_ns[sp::shadows]) >= 2 * ms);
+    EXPECT(load(f.part_ns[sp::part_lock_wait]) >= 2 * ms);
+    EXPECT(load(f.part_ns[sp::part_lists]) < load(f.phase_ns[sp::shadows]));
+    sp::frame_lines(1.0);
     std::printf("scripted: frame sums, title and own threads, worst frame and floor as scripted\n");
     return 0;
 }

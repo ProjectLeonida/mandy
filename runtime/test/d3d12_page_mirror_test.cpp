@@ -236,6 +236,27 @@ int test() {
         EXPECT(ms < 1000.0);
     }
 
+    // 10. Remapping a stream-pool page between submissions with a pending GPU write-back over that VA must deliver
+    //     the old page's GPU write to the old physical frame and never clobber the newly mapped CPU page.
+    {
+        EXPECT(rt::xmem::copy_page_mappings_fn(dst, pool, 1, false));
+        std::thread([&] {
+            words[0] = 0xAA000001u;
+            words[kPage64k / 4] = 0xBB000001u;
+        }).join();
+        EXPECT(gpu_word(device.p, std::uintptr_t(dst)) == 0xAA000001u);
+        const std::uint32_t gpu_old[4] = {0xCC000001u, 0xCC000002u, 0xCC000003u, 0xCC000004u};
+        EXPECT(rt::d3d12::page_mirror_gpu_write(device.p, std::uintptr_t(dst), gpu_old, sizeof(gpu_old)));
+        // Remap `dst` to the second physical page before the mirror drains its feed or runs write-back.
+        EXPECT(rt::xmem::copy_page_mappings_fn(dst, pool + kPage64k, 1, false));
+        EXPECT(rt::d3d12::page_mirror_write_back(device.p, std::uintptr_t(dst), kPage64k) == 256);
+        EXPECT(words[0] == 0xCC000001u);             // old physical frame received its GPU write
+        EXPECT(words[kPage64k / 4] == 0xBB000001u);  // new physical frame was never overwritten
+        EXPECT(gpu_word(device.p, std::uintptr_t(dst)) == 0xBB000001u);
+        EXPECT(rt::d3d12::page_mirror_write_back(device.p, std::uintptr_t(dst), kPage64k) == 0);
+        EXPECT(words[kPage64k / 4] == 0xBB000001u);
+    }
+
     const auto end = rt::d3d12::page_mirror_state(device.p);
     std::printf("page mirror: heap_base 0x%llx, %llu pages in %llu homes over %llu chunk(s); slot-31 copies, a title "
                 "write through its own view and a remap reach heap_base + the GPU-only address; an unmapped page reads "
