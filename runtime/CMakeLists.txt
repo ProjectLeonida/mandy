@@ -2905,6 +2905,10 @@ if(TARGET Vulkan::Headers)
     # its image only once its first upload is submitted (RT-TITLE-TEXTURE-SHOW-AFTER-UPLOAD).
     add_test(NAME d3d12_title_show_after_upload COMMAND d3d12_existing_heap_test --title-show-after-upload)
     set_tests_properties(d3d12_title_show_after_upload PROPERTIES SKIP_RETURN_CODE 77)
+    # The same with LEONIDA_TITLE_IMAGE_STAGING=0 (set by the test itself): a texture filled through WriteToSubresource's
+    # staging copy, neither staged nor host-copied, starts UNDEFINED too.
+    add_test(NAME d3d12_title_show_after_upload_unstaged COMMAND d3d12_existing_heap_test --title-show-after-upload-unstaged)
+    set_tests_properties(d3d12_title_show_after_upload_unstaged PROPERTIES SKIP_RETURN_CODE 77)
     # The same with write watching off: the guarded cases only, the concurrent writers among them.
     add_test(NAME d3d12_existing_heap_no_write_watch COMMAND d3d12_existing_heap_test)
     set_tests_properties(d3d12_existing_heap_no_write_watch PROPERTIES SKIP_RETURN_CODE 77

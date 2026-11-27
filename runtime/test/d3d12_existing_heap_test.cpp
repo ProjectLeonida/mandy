@@ -1526,8 +1526,11 @@ int check_pending_stream_views(ID3D12Device* device) {
 // the fill worker. Its T# must not name the image before then: a shader would sample an image never written, in
 // UNDEFINED layout (the RT-TITLE-TEXTURE-SHOW-AFTER-UPLOAD race; codec-d/cool_fox docs/findings.md, idea only). Once
 // the upload is submitted the T# names it.
-int check_title_show_after_upload(ID3D12Device* device) {
-    const char* who = "slot-70 view shown after its upload";
+// With `unstaged` (LEONIDA_TITLE_IMAGE_STAGING=0 on a device without host copies) the texture is neither staged nor
+// host-copied: the fill worker fills it through WriteToSubresource's waited staging copy, and it starts UNDEFINED all
+// the same (lixonik's review).
+int check_title_show_after_upload(ID3D12Device* device, bool unstaged = false) {
+    const char* who = unstaged ? "unstaged slot-70 view shown after its upload" : "slot-70 view shown after its upload";
     if (!rt::d3d12::bindless_set_layout(device)) return 0;
     constexpr UINT width = 64, height = 8;
     constexpr SIZE_T bytes = 65536;
@@ -2398,10 +2401,13 @@ void print_cases(const std::vector<Case>& cases, const char* who) {
 int main(int argc, char** argv) {
     const bool prefix_only = argc == 2 && std::strcmp(argv[1], "--host-prefix-only") == 0;
     const bool async_plane = argc == 2 && std::strcmp(argv[1], "--mapped-plane-async") == 0;
-    const bool show_after = argc == 2 && std::strcmp(argv[1], "--title-show-after-upload") == 0;
+    const bool show_after_unstaged = argc == 2 && std::strcmp(argv[1], "--title-show-after-upload-unstaged") == 0;
+    const bool show_after =
+        show_after_unstaged || (argc == 2 && std::strcmp(argv[1], "--title-show-after-upload") == 0);
     if (argc != 1 && !prefix_only && !async_plane && !show_after) return 2;
     if (async_plane) _putenv_s("LEONIDA_TEXTURE_REFRESH_ASYNC", "1");  // read once, at the device's first refresh
-    if (show_after) {  // both read once
+    if (show_after) {  // all read once
+        if (show_after_unstaged) _putenv_s("LEONIDA_TITLE_IMAGE_STAGING", "0");
         _putenv_s("LEONIDA_TITLE_FILL_ASYNC", "1");
         _putenv_s("LEONIDA_TITLE_FILL_DELAY_MS", "500");
     }
@@ -2446,7 +2452,7 @@ int main(int argc, char** argv) {
             no_host_copy.host_image_copy = false;
             Ref<ID3D12Device> staged;
             if (FAILED(rt::d3d12::create_vulkan_device(no_host_copy, IID_PPV_ARGS(&staged.p)))) return 1;
-            const int result = check_title_show_after_upload(staged.p);
+            const int result = check_title_show_after_upload(staged.p, show_after_unstaged);
             return result || vk.validation_errors() ? 1 : 0;
         }
         failures += check(ours.p, "vulkan");

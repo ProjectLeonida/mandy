@@ -9274,8 +9274,11 @@ public:
                 std::fprintf(stderr, "[rt] mem-probe: %s no-host-bits=0x%x type=%u\n", key, without.memoryTypeBits, type);
             }
         }
-        // A slot-70 texture of our own that is filled through the staged upload is shown only once its first upload
+        // A slot-70 texture of our own that starts UNDEFINED (filled through the staged upload, or through
+        // WriteToSubresource's waited staging copy: a format without host-image transfer, LEONIDA_TITLE_IMAGE_STAGING=0
+        // on a device without host copies, the retry_host fallback there; lixonik) is shown only once its first upload
         // has been submitted (publish_streamed_texture, after fill_title_texture or the fill worker's fill_unlocked).
+        // A host-transfer image is made GENERAL and filled on the host, so it is shown at once as before.
         // Until then its T#s stay pending and read the fallback at index 0. Before, its T#s named the image from the
         // view on: a draw before the first fill (always with LEONIDA_TITLE_FILL_ASYNC=1, and whenever an inline fill is
         // skipped) sampled an image never written and still UNDEFINED, and one on another queue could run while the
@@ -9287,7 +9290,7 @@ public:
             const char* value = std::getenv("LEONIDA_TITLE_SHOW_AFTER_UPLOAD");
             return !value || std::strcmp(value, "0");
         }();
-        if (show_after_upload && origin == TitleImageOrigin::streamed && staged_title_ && !deferred_stream_) {
+        if (show_after_upload && origin == TitleImageOrigin::streamed && !host_transfer_ && !deferred_stream_) {
             deferred_stream_ = true;
             std::lock_guard lock(device_.descriptor_mutex);
             device_.pending_image_keys.try_emplace(image_);
