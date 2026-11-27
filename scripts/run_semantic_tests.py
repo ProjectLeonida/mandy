@@ -46,9 +46,12 @@ _active_processes = set()
 _processes_lock = threading.Lock()
 
 
-def _register_process(proc):
+def _register_process(proc, cancelled=None):
     with _processes_lock:
+        if cancelled is not None and cancelled.is_set():
+            return False
         _active_processes.add(proc)
+        return True
 
 
 def _unregister_process(proc):
@@ -149,7 +152,7 @@ def read_count(path):
         return 0
 
 
-def run_module(directory, module, verbose, timeout=None):
+def run_module(directory, module, verbose, timeout=None, cancelled=None):
     """(return code, tests run, output) of `python -m unittest <target>` run from `directory`."""
     # `python -m unittest pkg.__init__` imports pkg and then runs the same file again as pkg.__init__, so a
     # registration in the initializer happens twice. Running the package itself imports it once; module_path() is
@@ -159,9 +162,15 @@ def run_module(directory, module, verbose, timeout=None):
     with tempfile.TemporaryDirectory() as scratch:
         count_path = os.path.join(scratch, "count.json")
         env = dict(os.environ, LEONIDA_TEST_COUNT=count_path)
+        if cancelled is not None and cancelled.is_set():
+            return 130, 0, ""
         proc = subprocess.Popen(cmd, cwd=directory, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, errors="replace")
-        _register_process(proc)
+        # Cancellation can take its snapshot while this worker is still inside Popen.
+        if not _register_process(proc, cancelled):
+            with proc:
+                _kill_process_tree(proc)
+            return 130, 0, ""
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -239,10 +248,11 @@ def main(argv=None):
     modules.sort(key=lambda m: -os.path.getsize(module_path(directory, m)))
     start, total, failed = time.monotonic(), 0, []
     pool = concurrent.futures.ThreadPoolExecutor(a.jobs)
+    cancelled = threading.Event()
     jobs = {}
     try:
         for m in modules:
-            jobs[pool.submit(run_module, directory, m, a.verbose, a.timeout)] = m
+            jobs[pool.submit(run_module, directory, m, a.verbose, a.timeout, cancelled)] = m
         pending = set(jobs)
         while pending:
             done, _ = concurrent.futures.wait(pending, timeout=0.2, return_when=concurrent.futures.FIRST_COMPLETED)
@@ -256,6 +266,7 @@ def main(argv=None):
                 elif a.verbose:
                     print(f"==== {jobs[job]}\n{out}", flush=True)
     except KeyboardInterrupt:
+        cancelled.set()
         for job in jobs:
             job.cancel()
         try:
@@ -266,6 +277,7 @@ def main(argv=None):
         print("interrupted", file=sys.stderr)
         return 130
     except BaseException:
+        cancelled.set()
         for job in jobs:
             job.cancel()
         try:

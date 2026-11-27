@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 import _thread
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -323,6 +324,57 @@ class RunnerTest(unittest.TestCase):
             started = os.listdir(marker_dir)
             self.assertEqual(len(started), 2, f"Expected 2 started modules, got {started}")
             self.assertLess(elapsed, 5.0)
+
+    def test_interrupt_during_worker_launch_cleans_up_the_late_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "completed")
+            suite(tmp, {"test_launch.py": (
+                "import time, unittest\n"
+                "from pathlib import Path\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_finish(self):\n"
+                "        time.sleep(2)\n"
+                f"        Path({marker!r}).touch()\n"
+            )})
+            spawned, resume, finished = threading.Event(), threading.Event(), threading.Event()
+            popen = subprocess.Popen
+            terminate_active = r._terminate_active_processes
+            run_module = r.run_module
+
+            def launch_before_registration(argv, **kwargs):
+                proc = popen(argv, **kwargs)
+                if argv[:2] == [sys.executable, "-c"]:
+                    spawned.set()
+                    if not resume.wait(5):
+                        proc.kill()
+                        proc.communicate()
+                        raise RuntimeError("worker launch was never resumed")
+                return proc
+
+            def interrupt(*args, **kwargs):
+                self.assertTrue(spawned.wait(5))
+                raise KeyboardInterrupt
+
+            def resume_after_cancellation():
+                terminate_active()
+                resume.set()
+
+            def observe_worker(*args, **kwargs):
+                try:
+                    return run_module(*args, **kwargs)
+                finally:
+                    finished.set()
+
+            with (
+                patch.object(r.subprocess, "Popen", side_effect=launch_before_registration),
+                patch.object(r.concurrent.futures, "wait", side_effect=interrupt),
+                patch.object(r, "_terminate_active_processes", side_effect=resume_after_cancellation),
+                patch.object(r, "run_module", side_effect=observe_worker),
+            ):
+                code, _ = run(tmp, "-j", "2")
+                self.assertTrue(finished.wait(7))
+            self.assertEqual(code, 130)
+            self.assertFalse(os.path.exists(marker), "untracked child completed after cancellation")
 
     def test_serial_interrupt_returns_130_and_prints_interrupted(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as marker_dir:
