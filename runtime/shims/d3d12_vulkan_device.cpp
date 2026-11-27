@@ -2818,6 +2818,9 @@ struct DeviceState {
     UINT no_output_sample_counts = 0;
     std::uint32_t f16_half_top_location = 29;
     std::uint32_t bary_f16_half_top_location = 29;
+    std::uint32_t max_geometry_input_components = 0;
+    std::uint32_t max_geometry_output_components = 0;
+    std::uint32_t max_geometry_total_output_components = 0;
     float max_sampler_lod_bias = 0;
     D3D12_CONSERVATIVE_RASTERIZATION_TIER conservative_raster_tier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
     bool conservative_post_depth_coverage = false;
@@ -11833,6 +11836,16 @@ public:
             std::string link_error;
             if (!link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
                                  &link_error, bary_fallback)) {
+                if (bary_fallback && device_.bary_f16_half_top_location < device_.f16_half_top_location) {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: %s (%s + %s; --bary-fallback caps f16_halves top location at %u for "
+                                 "maxGeometryInputComponents=%u, maxGeometryOutputComponents=%u)\n",
+                                 link_error.c_str(), vs_stage.entry->name.c_str(), ps_stage.entry->name.c_str(),
+                                 device_.bary_f16_half_top_location, device_.max_geometry_input_components,
+                                 device_.max_geometry_output_components);
+                    return stream_unsupported(
+                        "--bary-fallback + --f16-interp-fallback exceeds geometry stage component limits");
+                }
                 std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
                 return E_FAIL;
             }
@@ -11946,6 +11959,50 @@ public:
                 return stream_unsupported(
                     "--bary-fallback geometry stage forwards CullDistance, which needs shaderCullDistance; count",
                     int(bary_info.cull_count));
+            }
+            const char* vs_name = vs_stage.entry ? vs_stage.entry->name.c_str() : "<vs>";
+            const char* ps_name = ps_stage.entry ? ps_stage.entry->name.c_str() : "<ps>";
+            const std::uint32_t max_gs_in = device_.max_geometry_input_components;
+            if (max_gs_in && (bary_info.max_input_location_components > max_gs_in ||
+                              bary_info.input_components > max_gs_in)) {
+                if (bary_info.max_input_location_components > max_gs_in) {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: --bary-fallback geometry stage for %s + %s reads Location %u "
+                                 "(component end %u > maxGeometryInputComponents %u); refusing pipeline\n",
+                                 vs_name, ps_name, bary_info.max_input_location,
+                                 bary_info.max_input_location_components, max_gs_in);
+                } else {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: --bary-fallback geometry stage for %s + %s uses %u input components "
+                                 "(> maxGeometryInputComponents %u); refusing pipeline\n",
+                                 vs_name, ps_name, bary_info.input_components, max_gs_in);
+                }
+                return stream_unsupported("--bary-fallback geometry stage exceeds maxGeometryInputComponents");
+            }
+            const std::uint32_t max_gs_out = device_.max_geometry_output_components;
+            if (max_gs_out && (bary_info.max_output_location_components > max_gs_out ||
+                               bary_info.output_components > max_gs_out)) {
+                if (bary_info.max_output_location_components > max_gs_out) {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: --bary-fallback geometry stage for %s + %s writes Location %u "
+                                 "(component end %u > maxGeometryOutputComponents %u); refusing pipeline\n",
+                                 vs_name, ps_name, bary_info.max_output_location,
+                                 bary_info.max_output_location_components, max_gs_out);
+                } else {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: --bary-fallback geometry stage for %s + %s uses %u output components "
+                                 "(> maxGeometryOutputComponents %u); refusing pipeline\n",
+                                 vs_name, ps_name, bary_info.output_components, max_gs_out);
+                }
+                return stream_unsupported("--bary-fallback geometry stage exceeds maxGeometryOutputComponents");
+            }
+            const std::uint32_t max_gs_total_out = device_.max_geometry_total_output_components;
+            if (max_gs_total_out && 3u * bary_info.output_components > max_gs_total_out) {
+                std::fprintf(stderr,
+                             "[rt] d3d12: --bary-fallback geometry stage for %s + %s emits %u total output components "
+                             "(> maxGeometryTotalOutputComponents %u); refusing pipeline\n",
+                             vs_name, ps_name, 3u * bary_info.output_components, max_gs_total_out);
+                return stream_unsupported("--bary-fallback geometry stage exceeds maxGeometryTotalOutputComponents");
             }
             if (trace_pipeline_compile()) stage_bytes_ += words.size() * sizeof(std::uint32_t);
             VkShaderModule module = VK_NULL_HANDLE;
@@ -14451,17 +14508,24 @@ public:
                     VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT | VK_SAMPLE_COUNT_16_BIT;
                 state_.no_output_sample_counts =
                     static_cast<UINT>(props.limits.framebufferNoAttachmentsSampleCounts & kD3D12SampleCounts);
+                state_.max_geometry_input_components = info.max_geometry_input_components != 0
+                    ? info.max_geometry_input_components
+                    : props.limits.maxGeometryInputComponents;
+                state_.max_geometry_output_components = info.max_geometry_output_components != 0
+                    ? info.max_geometry_output_components
+                    : props.limits.maxGeometryOutputComponents;
+                state_.max_geometry_total_output_components = props.limits.maxGeometryTotalOutputComponents;
                 state_.f16_half_top_location = info.f16_half_top_location != 0
                     ? info.f16_half_top_location
                     : leonida::f16_half_top_location(
                           props.limits.maxVertexOutputComponents, props.limits.maxFragmentInputComponents);
                 state_.bary_f16_half_top_location = state_.f16_half_top_location;
                 if (info.f16_half_top_location == 0 &&
-                    props.limits.maxGeometryInputComponents && props.limits.maxGeometryOutputComponents) {
+                    state_.max_geometry_input_components && state_.max_geometry_output_components) {
                     state_.bary_f16_half_top_location = std::min(
                         state_.f16_half_top_location,
-                        leonida::f16_half_top_location(props.limits.maxGeometryInputComponents,
-                                                       props.limits.maxGeometryOutputComponents));
+                        leonida::f16_half_top_location(state_.max_geometry_input_components,
+                                                       state_.max_geometry_output_components));
                 }
             }
             if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(

@@ -5,6 +5,9 @@
 //   4. VS ClipDistance[2] and CullDistance[3] forwarding (capabilities, BuiltIn arrays, no duplicate types).
 //   5. Combined link_f16_halves + build_bary_fallback_gs: f16 relocation preserves bary_location and forwards relocated halves.
 //   6. Clean refusals: mixed ClipDistance + CullDistance, ShaderLayer / ShaderViewportIndex, non-vec3 collision at bary_location.
+//   7. Unused PS Input pruning: declared-but-unread PS Inputs are zero-filled on GS->PS without declaring GS Inputs from VS,
+//      keeping component counts within RADV's maxGeometryInputComponents (64), while OpLoad / OpAccessChain / InterpolateAt*
+//      pointer reads are preserved.
 // Optional `--dump-dir <dir>` writes each synthesized GS binary for external `spirv-val` inspection.
 // No GPU or game files required.
 #include "../src/spirv_bary_fallback.h"
@@ -141,15 +144,22 @@ std::vector<std::uint32_t> build_vs(const VsSpec& spec) {
 std::vector<std::uint32_t> build_ps(const std::vector<std::uint32_t>& raw_locs,
                                     const std::set<std::uint32_t>& flat_locs,
                                     std::optional<std::uint32_t> bary_v3_loc,
-                                    const std::map<std::uint32_t, std::array<std::uint32_t, 2>>& f16_halves = {}) {
+                                    const std::map<std::uint32_t, std::array<std::uint32_t, 2>>& f16_halves = {},
+                                    const std::set<std::uint32_t>& unread_locs = {},
+                                    const std::set<std::uint32_t>& access_chain_locs = {},
+                                    const std::set<std::uint32_t>& interp_centroid_locs = {}) {
     std::uint32_t next_id = 1;
     const auto alloc = [&]() { return next_id++; };
 
+    const std::uint32_t id_glsl = interp_centroid_locs.empty() ? 0 : alloc();
     const std::uint32_t id_void = alloc();
     const std::uint32_t id_fn = alloc();
     const std::uint32_t id_float = alloc();
     const std::uint32_t id_v3float = alloc();
     const std::uint32_t id_v4float = alloc();
+    const std::uint32_t id_uint = access_chain_locs.empty() ? 0 : alloc();
+    const std::uint32_t id_u0 = access_chain_locs.empty() ? 0 : alloc();
+    const std::uint32_t id_ptr_in_f = access_chain_locs.empty() ? 0 : alloc();
     const std::uint32_t id_ptr_in_v3 = alloc();
     const std::uint32_t id_ptr_in_v4 = alloc();
     const std::uint32_t id_ptr_out_v4 = alloc();
@@ -166,8 +176,10 @@ std::vector<std::uint32_t> build_ps(const std::vector<std::uint32_t>& raw_locs,
         in_v4_vars.push_back({alloc(), pair[1]});
     }
 
-    std::vector<std::uint32_t> w = {kSpirvMagic, 0x00010500u, 0, next_id, 0};
+    std::vector<std::uint32_t> w = {kSpirvMagic, 0x00010500u, 0, 0, 0};
     append_inst(w, kOpCapability, {1});
+    if (!interp_centroid_locs.empty()) append_inst(w, kOpCapability, {52});  // InterpolationFunction
+    if (id_glsl) append_inst(w, kOpExtInstImport, {id_glsl, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0x00000000u});
     append_inst(w, kOpMemoryModel, {0, 1});
 
     std::vector<std::uint32_t> ep = {kExecModelFragment, id_main, 0x6e69616du, 0x00000000u, id_out0};
@@ -188,6 +200,11 @@ std::vector<std::uint32_t> build_ps(const std::vector<std::uint32_t>& raw_locs,
     append_inst(w, kOpTypeFloat, {id_float, 32});
     append_inst(w, kOpTypeVector, {id_v3float, id_float, 3});
     append_inst(w, kOpTypeVector, {id_v4float, id_float, 4});
+    if (id_uint) {
+        append_inst(w, kOpTypeInt, {id_uint, 32, 0});
+        append_inst(w, 43, {id_uint, id_u0, 0u});
+        append_inst(w, kOpTypePointer, {id_ptr_in_f, kStorageInput, id_float});
+    }
     append_inst(w, kOpTypePointer, {id_ptr_in_v3, kStorageInput, id_v3float});
     append_inst(w, kOpTypePointer, {id_ptr_in_v4, kStorageInput, id_v4float});
     append_inst(w, kOpTypePointer, {id_ptr_out_v4, kStorageOutput, id_v4float});
@@ -199,9 +216,23 @@ std::vector<std::uint32_t> build_ps(const std::vector<std::uint32_t>& raw_locs,
 
     append_inst(w, kOpFunction, {id_void, id_main, 0, id_fn});
     append_inst(w, 248, {id_entry});
+    if (id_bary) append_inst(w, kOpLoad, {id_v3float, alloc(), id_bary});
+    for (const auto& [v, loc] : in_v4_vars) {
+        if (unread_locs.count(loc)) continue;
+        if (access_chain_locs.count(loc)) {
+            const std::uint32_t ptr_id = alloc();
+            append_inst(w, kOpAccessChain, {id_ptr_in_f, ptr_id, v, id_u0});
+            append_inst(w, kOpLoad, {id_float, alloc(), ptr_id});
+        } else if (interp_centroid_locs.count(loc)) {
+            append_inst(w, kOpExtInst, {id_v4float, alloc(), id_glsl, 76u, v});  // InterpolateAtCentroid
+        } else {
+            append_inst(w, kOpLoad, {id_v4float, alloc(), v});
+        }
+    }
     append_inst(w, kOpStore, {id_out0, id_null_v4});
     append_inst(w, kOpReturn, {});
     append_inst(w, kOpFunctionEnd, {});
+    w[3] = next_id;
     return w;
 }
 
@@ -489,6 +520,39 @@ int main(int argc, char** argv) {
         const auto ps_collide = build_ps({0, 1}, {}, std::nullopt);
         err.clear();
         CHECK(!build_bary_fallback_gs(vs_ok, ps_collide, 1, gs, nullptr, &err) && !err.empty() && gs == sentinel);
+    }
+
+    // 7. Unused PS Input pruning + BaryFallbackGsInfo component bounds:
+    //    VS exports 0..29; PS declares Inputs 0..13 and 16..29 (bary at 14), reading only Location 0 (OpLoad),
+    //    Location 5 (OpAccessChain + OpLoad), and Location 7 (GLSL.std.450 InterpolateAtCentroid).
+    //    All 25 unread PS Inputs must be zero-filled in the GS without declaring GS Inputs from the VS, keeping
+    //    both input_components (16) and max_input_location_components (32) within RADV's 64-component limit.
+    {
+        std::vector<std::uint32_t> vs_locs, ps_locs;
+        std::set<std::uint32_t> unread;
+        for (std::uint32_t i = 0; i < 30; ++i) {
+            vs_locs.push_back(i);
+            if (i == 14 || i == 15) continue;
+            ps_locs.push_back(i);
+            if (i != 0 && i != 5 && i != 7) unread.insert(i);
+        }
+        const auto vs = build_vs({.raw_locs = vs_locs});
+        const auto ps = build_ps(ps_locs, {}, 14, {}, unread, {5}, {7});
+        std::vector<std::uint32_t> gs;
+        BaryFallbackGsInfo info{};
+        std::string err;
+        CHECK(build_bary_fallback_gs(vs, ps, 14, gs, &info, &err));
+        CHECK(info.input_components == 16);
+        CHECK(info.max_input_location == 7 && info.max_input_location_components == 32);
+        CHECK(info.output_components == 4 + 28 * 4 + 3);
+        CHECK(info.max_output_location == 29 && info.max_output_location_components == 120);
+        GsInspection ins;
+        CHECK(verify_gs_module(gs, ins));
+        CHECK((ins.in_locs == std::set<std::uint32_t>{0, 5, 7}));
+        CHECK(ins.out_loc_vec_len.size() == 29);
+        CHECK(ins.out_loc_vec_len[14] == 3);
+        CHECK(ins.out_loc_vec_len[29] == 4);
+        maybe_dump(dump_dir, "gs_pruned_unused", gs);
     }
 
     return 0;
