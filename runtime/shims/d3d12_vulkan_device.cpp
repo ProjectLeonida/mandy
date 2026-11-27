@@ -14000,10 +14000,12 @@ void DeviceState::index_texture(const TitleTexture& t) {
         texture_watch.untrack(t.address);
         return;
     }
-    if (filled)
+    if (filled) {
         texture_watch.track(t.address, t.cpu, t.layout.layout.size);
-    else
+        if (!t.hashed || t.stale) texture_watch.touch(t.address);  // never filled, or known changed: read it
+    } else {
         texture_watch.untrack(t.address);
+    }
 }
 
 void DeviceState::title_texture_mapped(const void* resource, std::uint64_t address) {
@@ -16398,7 +16400,17 @@ public:
             job.pieces = t.pieces;
             job.compare = job.previous && t.pieces.valid_for(t.cpu, job.span) && !title_written_.empty() &&
                           title_written_.size() < tiles;
-            if (job.compare) job.written = title_written_;
+            if (job.compare) {
+                job.written = title_written_;
+            } else {
+                // Why it is read whole (counted): never filled, filled without part hashes, one tile only (its part
+                // is all of it), every tile written, or named with no tile written (a noted write, a touch).
+                ++stats.whole_by[!job.previous                               ? 0
+                                 : !t.pieces.valid_for(t.cpu, job.span)    ? 1
+                                 : tiles == 1                              ? 2
+                                 : !title_written_.empty()                 ? 3
+                                                                           : 4];
+            }
             job.write_combined = title_memory_write_combined(t.cpu);
             job.trace = leonida::dstorage::trace_enabled() && leonida::title_gpu_views::other_view(t.cpu);
             batch_bytes += job.span;
@@ -16467,7 +16479,16 @@ public:
             title_watch_logged_ = w;
             if (leonida::fsdraw::enabled()) log_title_census("refresh");
             stats.passes = stats.checked = stats.busy = stats.changed = stats.unchanged = stats.filled_bytes = 0;
+            std::fprintf(stderr,
+                         "[rt] d3d12: title textures read whole, by why: %llu never filled, %llu with no part hashes, "
+                         "%llu of one tile, %llu with every tile written, %llu with no tile written\n",
+                         static_cast<unsigned long long>(stats.whole_by[0]),
+                         static_cast<unsigned long long>(stats.whole_by[1]),
+                         static_cast<unsigned long long>(stats.whole_by[2]),
+                         static_cast<unsigned long long>(stats.whole_by[3]),
+                         static_cast<unsigned long long>(stats.whole_by[4]));
             stats.read_whole = stats.unchanged_parts = stats.first_named = 0;
+            stats.whole_by = {};
             stats.refresh_ns = stats.max_refresh_ns = stats.max_pass_bytes = 0;
         }
         inside.reset();
@@ -16486,6 +16507,7 @@ private:
                       refusals = 0, written_ranges = 0, unmaps = 0, unreadable = 0, pending_views = 0;
         std::uint64_t fills = 0, fill_bytes = 0, fill_failures = 0, unchanged = 0, busy = 0;
         std::uint64_t read_whole = 0, unchanged_parts = 0, first_named = 0;
+        std::array<std::uint64_t, 5> whole_by{};  // why read whole: first, no parts, one tile, all written, none
         std::uint64_t staged_fills = 0, staged_ns = 0;
         // refresh_title_textures, since the last log line
         std::uint64_t passes = 0, checked = 0, hashed = 0, changed = 0, deferred = 0, filled_bytes = 0,
@@ -16656,9 +16678,15 @@ private:
                                          title_memory_write_combined(cpu));
         std::uint64_t hash = 0;
         bool ok = false, nonzero = false;
+        leonida::TilePieces pieces;
         std::uint64_t staged_ns = 0;
         if (copied) {
             hash_guarded(f.tiled.data(), f.tiled.size(), hash, true);
+            pieces.compute(cpu, span, f.tiled.data(), [](const std::uint8_t* p, std::uint64_t bytes) {
+                std::uint64_t h = 0;
+                hash_guarded(p, std::size_t(bytes), h, true);
+                return h;
+            });
             const auto start = std::chrono::steady_clock::now();
             ok = r.upload_staged_title(layout, f.tiled.data(), f.columns, false, nonzero);
             staged_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
@@ -16686,6 +16714,7 @@ private:
         if (t.owned && !t.fills) r.publish_streamed_texture();
         t.hash = hash;
         t.hashed = true;
+        t.pieces = std::move(pieces);
         ++t.fills;
         ++title_stats_.fills;
         title_stats_.fill_bytes += span;
@@ -17054,6 +17083,11 @@ private:
         // uploaded again.
         std::uint64_t hash = 0;
         hash_guarded(title_tiled_.data(), title_tiled_.size(), hash, true);
+        t.pieces.compute(t.cpu, span, title_tiled_.data(), [](const std::uint8_t* p, std::uint64_t bytes) {
+            std::uint64_t h = 0;
+            hash_guarded(p, std::size_t(bytes), h, true);
+            return h;
+        });
         if (t.hashed && t.fills && hash == t.hash) {
             ++title_stats_.unchanged;
             t.stale = false;

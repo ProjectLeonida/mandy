@@ -96,6 +96,11 @@ int main() {
         EXPECT((collect(w) == V{1, 2}));
         for (int pass = 0; pass < 5; ++pass) EXPECT(collect(w).empty());
         EXPECT(f.cells.at(base).armed && f.cells.at(base + 2 * kTile).armed);
+        w.track(1, base, 3 * kTile);  // tracked again over the same tiles (a Map, a view): not named, still armed
+        EXPECT(collect(w).empty());
+        EXPECT(f.cells.at(base).armed);
+        w.track(1, base, 4 * kTile);  // over more tiles: named
+        EXPECT((collect(w) == V{1}));
     }
     {  // a write to one page names exactly the textures over that page's tile
         FakeWatch f;
