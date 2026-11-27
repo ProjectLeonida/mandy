@@ -253,24 +253,6 @@ bool copy_guarded_host(std::uint8_t* to, const std::uint8_t* from, std::size_t b
     }
 }
 
-// Whether two byte ranges differ, one of them title memory that may go away meanwhile: false when a page faults. No
-// C++ objects here: it is a __try frame, and the compare is a loop of its own (a fault inside the CRT's memcmp never
-// reaches the __except under Wine, src/guarded_copy.h).
-__declspec(noinline) LEONIDA_GUARDED_NO_BUILTIN bool bytes_differ(const std::uint8_t* a, const std::uint8_t* b,
-                                                                  std::size_t n) {
-    for (std::size_t i = 0; i < n; ++i)
-        if (a[i] != b[i]) return true;
-    return false;
-}
-bool differ_guarded(const std::uint8_t* a, const std::uint8_t* b, std::size_t n, bool& differs) {
-    __try {
-        differs = bytes_differ(a, b, n);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
 // The same, reading the title's pages that xmem's frame table holds through their frames: a stream pool's GPU-only
 // pages and their CPU twins after queue slot 31's copies have no host view (src/title_frames.h). A frame is a section's
 // scratch view, cached memory, so it is not read streaming.
@@ -4589,6 +4571,7 @@ struct DeviceState {
         bool last_local = true;
         std::uint64_t presents = 0;  // present serial at the last log line
         std::uint64_t faults_seen = 0, hot_seen = 0, cold_seen = 0;  // the tracking's counters at the last log line
+        std::uint64_t uploaded_seen = 0, conflicts_seen = 0;           // the mirror's, likewise
         double ms = 0;
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
     } page_mirror;
@@ -4855,36 +4838,19 @@ struct DeviceState {
         }
         return true;
     }
-    // What the GPU wrote into the homes of mirrored pages of [begin, end) goes back to the title's pages, as
-    // ShadowPages::write_back does for a shadow: after the submissions that could write them have retired
-    // (write_back_titles), only the 256-byte pieces whose home differs from the title's page, and only on a page nothing
-    // wrote since it was last watched (a page written on both sides keeps the title's bytes, which are uploaded over
-    // the home before the next submission). Written through kernel_writes, which opens and pins the page and every
-    // other address of its physical page, so the readers over them take the bytes. Returns the bytes written.
+    // What the GPU wrote into the homes of mirrored pages of [begin, end) goes back to the title's pages
+    // (TitleMirror::write_back: merged at the 256-byte piece, a piece only the GPU changed goes back, one both changed
+    // keeps the title's bytes), once the submissions that could write them have retired (write_back_titles). Written
+    // through kernel_writes, which opens and pins the page and every other address of its physical page, so the
+    // readers over them take the bytes. Returns the bytes written.
     std::uint64_t page_mirror_write_back(std::uint64_t begin, std::uint64_t end) {
         auto& m = page_mirror;
         if (!m.mirror || begin >= end) return 0;
-        constexpr std::uint64_t kPage = leonida::TitleMirror::kPage, kPiece = 256;
         std::lock_guard lock(m.mutex);
-        std::uint64_t written = 0;
-        for (std::uint64_t page = begin & ~(kPage - 1); page < end; page += kPage) {
-            VkDeviceMemory memory = VK_NULL_HANDLE;
-            VkDeviceSize offset = 0;
-            std::uint8_t* home = nullptr;
-            const std::uint8_t* frame = m.mirror->frame_at(page);
-            if (!frame || !m.mirror->home_at(page, memory, offset, &home) || !m.tracking->unwritten(page)) continue;
-            const std::uint64_t from = std::max(begin, page), to = std::min(end, page + kPage);
-            for (std::uint64_t at = from & ~(kPiece - 1); at < to; at += kPiece) {
-                const std::uint64_t a = std::max(at, from), b = std::min(at + kPiece, to);
-                const std::uint8_t* gpu = home + (a - page);
-                const std::uint8_t* title = frame + (a - page);
-                bool differs = false;
-                // A title page gone since (decommitted, unmapped) has nothing to write back into.
-                if (!differ_guarded(gpu, title, std::size_t(b - a), differs) || !differs) continue;
-                if (leonida::kernel_writes::write(reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)), gpu, b - a))
-                    written += b - a;
-            }
-        }
+        const std::uint64_t written = m.mirror->write_back(begin, end, [](std::uint64_t at, const std::uint8_t* bytes,
+                                                                          std::size_t n) {
+            return leonida::kernel_writes::write(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at)), bytes, n);
+        });
         m.written_back += written;
         return written;
     }
@@ -4945,16 +4911,19 @@ struct DeviceState {
         m.taken.clear();
         // Ordinary memory released or decommitted: its mirrored pages leave (named again, they are mirrored again).
         leonida::geometry_writes::take_released(m.released, m.released_ranges);
+        // Only pages the range holds whole: a freed heap block leaves the rest of its page to the blocks around it.
         for (const auto& [from, to] : m.released_ranges) {
-            for (auto page = m.identity.lower_bound(from & ~(leonida::TitleMirror::kPage - 1));
-                 page != m.identity.end() && *page < to;) {
+            constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
+            for (auto page = m.identity.lower_bound((from + kPage - 1) & ~(kPage - 1));
+                 page != m.identity.end() && *page + kPage <= to;) {
                 m.tracking->unwatch(*page);
                 m.mirror->map(*page, nullptr, nullptr, ticket);
                 ++m.identity_released;
                 page = m.identity.erase(page);
             }
-            for (auto run = m.ensured.begin(); run != m.ensured.end();)
-                run = run->first < to && from < run->second ? m.ensured.erase(run) : std::next(run);
+            if (to - from >= kPage)  // a run that lost a page is named again (pages still there map to themselves)
+                for (auto run = m.ensured.begin(); run != m.ensured.end();)
+                    run = run->first < to && from < run->second ? m.ensured.erase(run) : std::next(run);
         }
         m.tracking->collect(m.written);  // re-watched before the copies below
         for (const std::uint64_t page : m.written)
@@ -4979,7 +4948,8 @@ struct DeviceState {
                          "mirrored and %llu released, %llu buffer bindings cut at a chunk's end; %llu slot-133 buffers "
                          "made on it, %llu KiB of GPU writes copied back; homes in device-local memory %llu units, in "
                          "host memory %llu; tracking: %zu pages hot, %zu cold, %llu write faults, %llu hot and %llu "
-                         "cold copies; %.1f KiB uploaded a submission, %.1f KiB a frame\n",
+                         "cold copies; uploaded %.1f KiB a submission and %.1f KiB a frame; written back %.1f KiB a "
+                         "submission and %.1f KiB a frame; %llu pieces written on both sides (the title's kept)\n",
                          static_cast<unsigned long long>(c.pages), static_cast<unsigned long long>(c.homes),
                          static_cast<unsigned long long>(c.units),
                          static_cast<unsigned long long>(c.units * (leonida::TitleMirror::kUnitBytes >> 20)),
@@ -4998,8 +4968,13 @@ struct DeviceState {
                          policy.hot, policy.cold, static_cast<unsigned long long>(policy.faults - m.faults_seen),
                          static_cast<unsigned long long>(policy.hot_copies - m.hot_seen),
                          static_cast<unsigned long long>(policy.cold_copies - m.cold_seen),
-                         m.refreshes ? double(m.uploads) * 64.0 / double(m.refreshes) : 0.0,
-                         frames ? double(m.uploads) * 64.0 / double(frames) : 0.0);
+                         m.refreshes ? double(c.uploaded_bytes - m.uploaded_seen) / 1024.0 / double(m.refreshes) : 0.0,
+                         frames ? double(c.uploaded_bytes - m.uploaded_seen) / 1024.0 / double(frames) : 0.0,
+                         m.refreshes ? double(m.written_back) / 1024.0 / double(m.refreshes) : 0.0,
+                         frames ? double(m.written_back) / 1024.0 / double(frames) : 0.0,
+                         static_cast<unsigned long long>(c.conflicts - m.conflicts_seen));
+            m.uploaded_seen = c.uploaded_bytes;
+            m.conflicts_seen = c.conflicts;
             m.faults_seen = policy.faults;
             m.hot_seen = policy.hot_copies;
             m.cold_seen = policy.cold_copies;
