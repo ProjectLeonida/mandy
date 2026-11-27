@@ -91,8 +91,8 @@ struct Model {
         fix(slot);
     }
     // As the device fixes a slot the title rewrote: the changes noted so far are applied first (sync_slot_changes),
-    // then a half whose range another half waits for takes its answer (waiting_answer) instead of resolving.
-    std::uint64_t answered = 0, stale_answers = 0;
+    // then a half whose range another half has a record for takes its answer (answer()) instead of resolving.
+    std::uint64_t answered = 0, answered_resolved = 0, stale_answers = 0;
     void write_answered(std::size_t slot, Words a, Words b = Words{}) {
         apply();
         slots[slot] = {a, b};
@@ -101,13 +101,15 @@ struct Model {
             const Words& w = slots[slot][half];
             ConsoleHeapSlotRecords::State state{};
             std::uint64_t target = 0;
-            if (w.span && records.waiting_answer(w.base, w.span, false, state, target)) {
+            if (w.span && records.answer(w.base, w.span, false, state, target)) {
                 ++answered;
+                const bool resolved = state == ConsoleHeapSlotRecords::resolved;
+                answered_resolved += resolved;
                 records.set(slot, half, state, w.base, w.span, target);
-                copy[slot][half] = 0;
+                copy[slot][half] = resolved ? target : 0;
                 // The answer must be what resolving now gives, not only after the next submission's changes.
                 std::uint64_t refused = 0;
-                if (resolve(w.base, w.span, refused)) ++stale_answers;
+                if (resolve(w.base, w.span, refused) != copy[slot][half]) ++stale_answers;
                 continue;
             }
             if (!w.span) {
@@ -360,13 +362,15 @@ int differential() {
             return 1;
         }
     }
-    EXPECT(m.records.recorded() > 0 && m.answered > 0 && m.stale_answers == 0);
+    EXPECT(m.records.recorded() > 0 && m.answered_resolved > 0 && m.answered > m.answered_resolved &&
+           m.stale_answers == 0);
     // The model's address space is a few MiB, so most changes touch most of it: this case checks results, not cost.
     std::printf("differential: 400 rounds, copy equal to a full re-resolution after each; %llu entries looked at, "
-                "%llu slots fixed again, %zu halves recorded at the end; %llu rewritten halves answered by a waiting "
-                "one of their range\n",
+                "%llu slots fixed again, %zu halves recorded at the end; %llu rewritten halves answered by a record of "
+                "their range (%llu resolved), each equal to a resolution at that moment\n",
                 static_cast<unsigned long long>(looked), static_cast<unsigned long long>(touched),
-                m.records.recorded(), static_cast<unsigned long long>(m.answered));
+                m.records.recorded(), static_cast<unsigned long long>(m.answered),
+                static_cast<unsigned long long>(m.answered_resolved));
     return 0;
 }
 
