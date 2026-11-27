@@ -426,6 +426,132 @@ int batched_write_back() {
     return 0;
 }
 
+int filter_pieces_mask_and_scratch() {
+    Fixture f;
+    auto h = f.hooks();
+    std::size_t copy_calls = 0;
+    h.copy = [&](std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
+        ++copy_calls;
+        std::memcpy(to, from, bytes);
+        return true;
+    };
+    struct PieceCall {
+        std::uint64_t va;
+        bool fresh;
+        std::array<std::uint64_t, 4> mask;
+        std::uint8_t sample_byte;
+    };
+    std::vector<PieceCall> piece_calls;
+    h.filter_pieces = [&](std::uint64_t va, std::uint8_t* to, const std::uint8_t* scratch, std::size_t bytes,
+                          bool fresh, const std::array<std::uint64_t, 4>& mask) {
+        piece_calls.push_back({va, fresh, mask, scratch[0]});
+        for (std::size_t k = 0; k < bytes / 256; ++k) {
+            if (!fresh && !(mask[k >> 6] & (std::uint64_t(1) << (k & 63)))) continue;
+            for (std::size_t j = 0; j < 256; ++j) {
+                const std::uint8_t b = scratch[k * 256 + j];
+                to[k * 256 + j] = b == 0xA5 ? 0x5A : b;
+            }
+        }
+        return true;
+    };
+
+    TitleMirror mirror(std::move(h));
+    EXPECT(mirror.cover(kBase, kBase + 4 * kPage));
+    std::vector<std::uint8_t> frame(kPage, 0xA5);
+    const VkBuffer arena = fake<VkBuffer>(0x99);
+    mirror.alias(kBase, kBase + kPage, arena, 0);
+
+    // Initial map: fill() runs before make_copy() (1 copy_call), then make_copy() calls hooks_.filter (outside fill).
+    mirror.map(kBase, frame.data(), nullptr, 1);
+    EXPECT(copy_calls == 1 && f.filtered.size() == 1 && f.filtered[0].fresh && piece_calls.empty());
+    EXPECT(mirror.copy_bytes(kBase)[0] == 0x5A);
+
+    // Dirty refill modifying 3 pieces across 64-bit mask word boundaries: pieces 1, 64, and 255.
+    // Must call hooks_.copy ONCE (fill's scratch), ZERO extra copies, and call filter_pieces with exact mask!
+    frame[1 * 256 + 7] = 0x11;
+    frame[64 * 256 + 3] = 0x22;
+    frame[255 * 256 + 200] = 0x33;
+    EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
+    EXPECT(copy_calls == 2);  // exactly 1 copy in fill(), 0 duplicate copies in filter_pieces!
+    EXPECT(f.filtered.size() == 1 && piece_calls.size() == 1);
+    EXPECT(piece_calls[0].va == kBase && !piece_calls[0].fresh);
+    EXPECT(piece_calls[0].mask[0] == (std::uint64_t(1) << 1));
+    EXPECT(piece_calls[0].mask[1] == (std::uint64_t(1) << 0));
+    EXPECT(piece_calls[0].mask[2] == 0);
+    EXPECT(piece_calls[0].mask[3] == (std::uint64_t(1) << 63));
+    EXPECT(mirror.copy_bytes(kBase)[1 * 256 + 7] == 0x11);
+    EXPECT(mirror.copy_bytes(kBase)[64 * 256 + 3] == 0x22);
+    EXPECT(mirror.copy_bytes(kBase)[255 * 256 + 200] == 0x33);
+    EXPECT(mirror.copy_bytes(kBase)[0] == 0x5A);  // untouched piece preserved
+
+    // Unchanged dirty upload: neither filter_pieces nor filter called.
+    EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
+    EXPECT(copy_calls == 3 && piece_calls.size() == 1 && f.filtered.size() == 1);
+
+    // Only filter_pieces installed (no hooks_.filter): make_copy calls filter_pieces with all-1s mask.
+    Fixture f2;
+    auto h2 = f2.hooks();
+    h2.filter = nullptr;
+    std::array<std::uint64_t, 4> init_mask{};
+    bool init_fresh = false;
+    h2.filter_pieces = [&](std::uint64_t, std::uint8_t* to, const std::uint8_t* scratch, std::size_t bytes,
+                           bool fresh, const std::array<std::uint64_t, 4>& mask) {
+        init_mask = mask;
+        init_fresh = fresh;
+        std::memcpy(to, scratch, bytes);
+        return true;
+    };
+    TitleMirror mirror2(std::move(h2));
+    EXPECT(mirror2.cover(kBase, kBase + 2 * kPage));
+    mirror2.alias(kBase, kBase + kPage, arena, 0);
+    mirror2.map(kBase, frame.data(), nullptr, 1);
+    EXPECT(init_fresh && init_mask[0] == ~0ull && init_mask[1] == ~0ull && init_mask[2] == ~0ull &&
+           init_mask[3] == ~0ull);
+    EXPECT(mirror2.copy_bytes(kBase)[64 * 256 + 3] == 0x22);
+
+    std::printf("filter_pieces_mask_and_scratch: zero duplicate copy, exact 256-bit changed-piece mask ok\n");
+    return 0;
+}
+
+int coalesced_fill_and_write_back_soundness() {
+    Fixture f;
+    TitleMirror mirror(f.hooks());
+    EXPECT(mirror.cover(kBase, kBase + 2 * kPage));
+    std::vector<std::uint8_t> frame(kPage, 0x10);
+    mirror.map(kBase, frame.data(), nullptr, 1);
+    EXPECT(mirror.flush(1));
+
+    // Modify contiguous runs spanning 64-bit word boundaries: [0..2], [62..65], [127..129], [254..255].
+    const std::vector<std::size_t> cpu_pieces = {0, 1, 2, 62, 63, 64, 65, 127, 128, 129, 254, 255};
+    for (const std::size_t p : cpu_pieces) std::memset(frame.data() + p * 256, int(0x40 + (p & 0x3f)), 256);
+    EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
+    EXPECT(!std::memcmp(mirror.home_bytes(kBase), frame.data(), kPage));
+
+    // Now test write-back soundness (home.sums must be exact after coalesced fill!):
+    // - Piece 63 (in CPU-updated run): GPU modifies it, CPU does not -> GPU write goes back!
+    // - Piece 64 (in CPU-updated run): BOTH GPU and CPU modify it -> conflict, CPU wins!
+    // - Piece 10 (untouched since initial whole fill): GPU modifies it -> GPU write goes back!
+    mirror.home_bytes(kBase)[63 * 256 + 11] = 0xE1;
+    mirror.home_bytes(kBase)[64 * 256 + 12] = 0xE2;
+    frame[64 * 256 + 13] = 0xF2;
+    mirror.home_bytes(kBase)[10 * 256 + 14] = 0xE3;
+
+    const auto write = [](std::uint64_t dst, const std::uint8_t* bytes, std::size_t n) {
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)), bytes, n);
+        return true;
+    };
+    const std::uint64_t written = mirror.write_back(kBase, kBase + kPage, write);
+    EXPECT(written == 512);  // pieces 10 and 63 only
+    EXPECT(frame[63 * 256 + 11] == 0xE1);
+    EXPECT(frame[10 * 256 + 14] == 0xE3);
+    EXPECT(frame[64 * 256 + 12] == std::uint8_t(0x40 + (64 & 0x3f)));  // conflict: GPU byte rejected
+    EXPECT(frame[64 * 256 + 13] == 0xF2);                               // conflict: CPU byte preserved
+    EXPECT(mirror.counters().conflicts == 1);
+
+    std::printf("coalesced_fill_and_write_back_soundness: word-spanning runs and home.sums conflict detection ok\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -435,6 +561,8 @@ int main() {
     if (refilter_scaling()) return 1;
     if (fill_copy_and_fallback()) return 1;
     if (batched_write_back()) return 1;
+    if (filter_pieces_mask_and_scratch()) return 1;
+    if (coalesced_fill_and_write_back_soundness()) return 1;
     std::printf("title_mirror_hooks_test: ok\n");
     return 0;
 }

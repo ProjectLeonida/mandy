@@ -40,13 +40,28 @@ public:
     };
     struct Stats {
         std::size_t committed = 0, spans = 0, large = 0, live = 0;
+        bool write_watched = false;
     };
 
-    bool init(std::uintptr_t base, std::size_t bytes, Hooks hooks) {
+    // Tries reserving the heap's virtual range with MEM_WRITE_WATCH first (`try_reserve(true)`), falling back silently
+    // to an ordinary reservation (`try_reserve(false)`) when the host/Wine rejects write-watching. Sets
+    // `write_watched` to reflect which reservation succeeded.
+    template <class TryReserve>
+    static std::uintptr_t reserve(TryReserve&& try_reserve, bool& write_watched) {
+        if (const std::uintptr_t at = try_reserve(true)) {
+            write_watched = true;
+            return at;
+        }
+        write_watched = false;
+        return try_reserve(false);
+    }
+
+    bool init(std::uintptr_t base, std::size_t bytes, Hooks hooks, bool write_watched = false) {
         std::lock_guard lock(mutex_);
         if (!base || bytes < kSpan || (base % kPage)) return false;
         base_ = base;
         bytes_ = bytes - bytes % kPage;
+        write_watched_ = write_watched;
         hooks_ = std::move(hooks);
         free_runs_.clear();
         free_runs_[base_] = bytes_;
@@ -55,7 +70,20 @@ public:
         span_class_.assign(bytes_ / kSpan, kNoClass);
         span_live_.assign(bytes_ / kSpan, {});
         stats_ = {};
+        stats_.write_watched = write_watched_;
         return true;
+    }
+    bool write_watched() const {
+        std::lock_guard lock(mutex_);
+        return write_watched_;
+    }
+    std::uintptr_t base() const {
+        std::lock_guard lock(mutex_);
+        return base_;
+    }
+    std::size_t capacity() const {
+        std::lock_guard lock(mutex_);
+        return bytes_;
     }
     bool owns(const void* p) const {
         const auto at = reinterpret_cast<std::uintptr_t>(p);
@@ -228,6 +256,7 @@ private:
     mutable std::mutex mutex_;
     std::uintptr_t base_ = 0;
     std::size_t bytes_ = 0;
+    bool write_watched_ = false;
     Hooks hooks_;
     std::map<std::uintptr_t, std::size_t> free_runs_;  // start -> bytes
     std::map<std::uintptr_t, std::size_t> large_;      // a large block -> its bytes

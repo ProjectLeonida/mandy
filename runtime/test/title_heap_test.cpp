@@ -159,6 +159,40 @@ int main() {
         EXPECT(heap.release(reinterpret_cast<void*>(at)));
     }
     EXPECT(heap.stats().live == 0 && committed > 0);
+    EXPECT(!heap.write_watched() && !heap.stats().write_watched && heap.base() == base && heap.capacity() == kBytes);
+
+    // 5. MEM_WRITE_WATCH reservation helper: prefers write-watched reservation, falls back silently when rejected.
+    {
+        bool ww = false;
+        int tries = 0;
+        const std::uintptr_t got_ww = TitleHeap::reserve(
+            [&](bool want_write_watch) -> std::uintptr_t {
+                ++tries;
+                return want_write_watch ? base : 0;
+            },
+            ww);
+        EXPECT(got_ww == base && ww && tries == 1);
+
+        TitleHeap ww_heap;
+        EXPECT(ww_heap.init(base, kBytes, hooks, ww));
+        EXPECT(ww_heap.write_watched() && ww_heap.stats().write_watched);
+        void* p = ww_heap.allocate(256);
+        EXPECT(p && ww_heap.owns(p) && ww_heap.release(p));
+
+        ww = true;
+        tries = 0;
+        const std::uintptr_t got_fallback = TitleHeap::reserve(
+            [&](bool want_write_watch) -> std::uintptr_t {
+                ++tries;
+                return want_write_watch ? 0 : base;
+            },
+            ww);
+        EXPECT(got_fallback == base && !ww && tries == 2);
+
+        TitleHeap plain_heap;
+        EXPECT(plain_heap.init(base, kBytes, hooks, ww));
+        EXPECT(!plain_heap.write_watched() && !plain_heap.stats().write_watched);
+    }
 
     if (failures) {
         std::fprintf(stderr, "title_heap_test: %d failure(s)\n", failures);

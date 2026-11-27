@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -59,6 +60,15 @@ struct TitleMirrorHooks {
     // zeroed it), so every byte must be written; otherwise `to` still holds this filter's last output for the same page.
     // The title's bytes and the page's own home are never written. False as for `copy` (the copy is zeroed).
     std::function<bool(std::uint64_t va, std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool fresh)> filter;
+    // Optional fast path for `filter`: called from fill() when set and the whole-page copy succeeded (after `home` and
+    // its piece sums are updated), passing the already-copied 64 KiB `scratch` buffer (no duplicate guarded copy) and
+    // the 256-bit `changed_pieces` mask (bit k set when piece [k*256, (k+1)*256) changed; all bits set when `fresh`
+    // or after a write-back refilter). Outside fill() (make_copy, write-back refilter, alias handoff, or partial-read
+    // fallback), `filter` is called if set (or `filter_pieces` with a fresh copy and all bits set when only
+    // `filter_pieces` is installed).
+    std::function<bool(std::uint64_t va, std::uint8_t* to, const std::uint8_t* scratch, std::size_t bytes, bool fresh,
+                       const std::array<std::uint64_t, 4>& changed_pieces)>
+        filter_pieces;
 };
 
 class TitleMirror {
@@ -547,29 +557,102 @@ private:
     // Brings the home up to date with the title's page, piece by piece: `whole` (a new home) copies every piece, and
     // otherwise only a piece the title changed since both sides last agreed, so a piece only the GPU wrote keeps the
     // GPU's bytes (and goes back with write_back). A piece both changed takes the title's bytes. Copies the whole 64 KiB
-    // page in one hooks_.copy call, falling back to per-piece copies only when the whole-page copy fails.
+    // page in one hooks_.copy call, falling back to per-piece copies only when the whole-page copy fails, then updates
+    // home.sums in a tight pass and flushes changed pieces to `to` in coalesced contiguous runs (optimal for write-
+    // combined device-local homes). Never reads from `to`.
     void fill(Home& home, const std::uint8_t* frame, bool whole) {
-        std::uint8_t* to = units_[home.unit].host + std::size_t(home.slot) * kPage;
+        std::uint8_t* const to = units_[home.unit].host + std::size_t(home.slot) * kPage;
+        std::uint8_t* const scratch = fill_scratch_.data();
+        std::uint64_t* const sums = home.sums.get();
         bool failed = false;
-        std::size_t changed = 0;
-        const bool whole_ok = hooks_.copy ? hooks_.copy(fill_scratch_.data(), frame, kPage)
-                                          : (std::memcpy(fill_scratch_.data(), frame, kPage), true);
-        for (std::size_t k = 0; k < kPieces; ++k) {
-            std::uint8_t* title = fill_scratch_.data() + k * kPiece;
-            if (!whole_ok && !hooks_.copy(title, frame + k * kPiece, kPiece)) {
-                std::memset(title, 0, kPiece);
-                failed = true;
+        const bool whole_ok = hooks_.copy ? hooks_.copy(scratch, frame, kPage)
+                                          : (std::memcpy(scratch, frame, kPage), true);
+        if (!whole_ok) {
+            for (std::size_t k = 0; k < kPieces; ++k) {
+                std::uint8_t* piece = scratch + k * kPiece;
+                if (!hooks_.copy(piece, frame + k * kPiece, kPiece)) {
+                    std::memset(piece, 0, kPiece);
+                    failed = true;
+                }
             }
-            const std::uint64_t sum = shadow_keep::sum_of(title, kPiece);
-            if (!whole && sum == home.sums[k]) continue;
-            ++changed;
-            std::memcpy(to + k * kPiece, title, kPiece);
-            home.sums[k] = sum;
-            counters_.uploaded_bytes += kPiece;
         }
-        // The filtered copy follows the title's bytes: refilled when a piece of them changed (the filter itself finds
-        // which slots), and whole when it holds nothing yet.
-        if (home.copy && (changed || home.fresh || home.refilter)) fill_copy(home, frame, false);
+
+        std::array<std::uint64_t, 4> changed_pieces{};
+        std::size_t changed = 0;
+        if (whole) {
+            for (std::size_t k = 0; k < kPieces; ++k) sums[k] = shadow_keep::sum_of(scratch + k * kPiece, kPiece);
+            std::memcpy(to, scratch, kPage);
+            changed = kPieces;
+            changed_pieces = kAllPieces;
+            counters_.uploaded_bytes += kPage;
+        } else {
+            for (std::size_t k = 0; k < kPieces; ++k) {
+                const std::uint64_t sum = shadow_keep::sum_of(scratch + k * kPiece, kPiece);
+                if (sum == sums[k]) continue;
+                sums[k] = sum;
+                changed_pieces[k >> 6] |= std::uint64_t(1) << (k & 63);
+                ++changed;
+            }
+            if (changed == kPieces) {
+                std::memcpy(to, scratch, kPage);
+                counters_.uploaded_bytes += kPage;
+            } else if (changed) {
+                // Coalesce contiguous changed pieces across the 4 x 64-bit mask words into single memcpy bursts.
+                std::size_t run_start = kPieces;
+                for (std::size_t w = 0; w < 4; ++w) {
+                    const std::uint64_t word = changed_pieces[w];
+                    if (!word) {
+                        if (run_start < kPieces) {
+                            const std::size_t run_end = w * 64;
+                            std::memcpy(to + run_start * kPiece, scratch + run_start * kPiece,
+                                        (run_end - run_start) * kPiece);
+                            run_start = kPieces;
+                        }
+                        continue;
+                    }
+                    if (word == ~std::uint64_t(0)) {
+                        if (run_start == kPieces) run_start = w * 64;
+                        continue;
+                    }
+                    std::size_t bit = 0;
+                    while (bit < 64) {
+                        const std::uint64_t rem = word >> bit;
+                        if (!rem) {
+                            if (run_start < kPieces) {
+                                const std::size_t run_end = w * 64 + bit;
+                                std::memcpy(to + run_start * kPiece, scratch + run_start * kPiece,
+                                            (run_end - run_start) * kPiece);
+                                run_start = kPieces;
+                            }
+                            break;
+                        }
+                        const std::size_t zeros = std::size_t(std::countr_zero(rem));
+                        if (zeros > 0) {
+                            if (run_start < kPieces) {
+                                const std::size_t run_end = w * 64 + bit;
+                                std::memcpy(to + run_start * kPiece, scratch + run_start * kPiece,
+                                            (run_end - run_start) * kPiece);
+                                run_start = kPieces;
+                            }
+                            bit += zeros;
+                        }
+                        const std::size_t ones = std::size_t(std::countr_one(word >> bit));
+                        if (run_start == kPieces) run_start = w * 64 + bit;
+                        bit += ones;
+                    }
+                }
+                if (run_start < kPieces) {
+                    std::memcpy(to + run_start * kPiece, scratch + run_start * kPiece,
+                                (kPieces - run_start) * kPiece);
+                }
+                counters_.uploaded_bytes += changed * kPiece;
+            }
+        }
+        // The filtered copy follows the title's bytes: refilled when a piece of them changed (passing the already-
+        // copied scratch buffer and 256-bit changed-piece mask when filter_pieces is installed), and whole when it
+        // holds nothing yet.
+        if (home.copy && (changed || home.fresh || home.refilter))
+            fill_copy(home, frame, false, whole_ok ? scratch : nullptr, &changed_pieces);
         if (failed) ++counters_.upload_failures;
         ++counters_.uploads;
     }
@@ -604,16 +687,32 @@ private:
         home.fresh = true;
         fill_copy(home, frame, true);
     }
-    // Fills the filtered copy from the title's page through hooks.filter (`whole`: every byte).
-    void fill_copy(Home& home, const std::uint8_t* frame, bool whole) {
+    static constexpr std::array<std::uint64_t, 4> kAllPieces = {~std::uint64_t(0), ~std::uint64_t(0),
+                                                                ~std::uint64_t(0), ~std::uint64_t(0)};
+    // Fills the filtered copy from the title's page through hooks.filter_pieces (when called from fill() with an
+    // already-copied `scratch` buffer) or hooks.filter (`whole`: every byte).
+    void fill_copy(Home& home, const std::uint8_t* frame, bool whole, const std::uint8_t* scratch = nullptr,
+                   const std::array<std::uint64_t, 4>* changed_pieces = nullptr) {
+        const bool had_refilter = home.refilter;
         home.refilter = false;
         if (!home.copy) return;
         std::uint8_t* to = units_[home.copy_unit].host + std::size_t(home.copy_slot) * kPage;
         const bool fresh = whole || home.fresh;
         home.fresh = false;
-        const bool ok = hooks_.filter ? hooks_.filter(home.filter_va, to, frame, kPage, fresh)
-                        : hooks_.copy  ? hooks_.copy(to, frame, kPage)
-                                       : (std::memcpy(to, frame, kPage), true);
+        bool ok = false;
+        if (hooks_.filter_pieces && scratch) {
+            const auto& mask = (fresh || had_refilter || !changed_pieces) ? kAllPieces : *changed_pieces;
+            ok = hooks_.filter_pieces(home.filter_va, to, scratch, kPage, fresh, mask);
+        } else if (hooks_.filter) {
+            ok = hooks_.filter(home.filter_va, to, frame, kPage, fresh);
+        } else if (hooks_.filter_pieces) {
+            auto local = std::make_unique<std::uint8_t[]>(kPage);
+            const bool copied = hooks_.copy ? hooks_.copy(local.get(), frame, kPage)
+                                            : (std::memcpy(local.get(), frame, kPage), true);
+            if (copied) ok = hooks_.filter_pieces(home.filter_va, to, local.get(), kPage, fresh, kAllPieces);
+        } else {
+            ok = hooks_.copy ? hooks_.copy(to, frame, kPage) : (std::memcpy(to, frame, kPage), true);
+        }
         if (!ok) {
             std::memset(to, 0, kPage);
             home.fresh = true;  // zeros now: the next fill writes all again
