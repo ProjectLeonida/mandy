@@ -80,4 +80,53 @@ static_assert(offsetof(FeatureDataOptions21, ExtendedCommandInfoSupported) ==
               offsetof(D3D12_FEATURE_DATA_D3D12_OPTIONS21, ExtendedCommandInfoSupported));
 #endif
 
+// Returns true if the feature is one of the compatibility-defined features in this header.
+constexpr bool is_compat_feature(D3D12_FEATURE feature) noexcept {
+    return feature == kFeatureOptions20 ||
+           feature == kFeaturePredication ||
+           feature == kFeatureOptions21 ||
+           feature == kFeatureApplicationSpecificDriverState ||
+           feature == kFeatureBytecodeBypassHashSupported;
+}
+
+// Returns the expected byte size of the payload for a compat feature, or 0 if not a recognized compat feature.
+constexpr std::size_t compat_feature_data_size(D3D12_FEATURE feature) noexcept {
+    switch (feature) {
+        case kFeatureOptions20:
+            return sizeof(FeatureDataOptions20);
+        case kFeatureOptions21:
+            return sizeof(FeatureDataOptions21);
+        case kFeaturePredication:
+        case kFeatureApplicationSpecificDriverState:
+        case kFeatureBytecodeBypassHashSupported:
+            return sizeof(FeatureSupportFlag);
+        default:
+            return 0;
+    }
+}
+
+// Returns true if the size matches the expected size for the compat feature.
+constexpr bool is_valid_compat_feature_size(D3D12_FEATURE feature, std::size_t size) noexcept {
+    const std::size_t expected = compat_feature_data_size(feature);
+    return expected != 0 && expected == size;
+}
+
+// Returns a human-readable identifier for known compat features, or nullptr for unrecognized features.
+constexpr const char* compat_feature_name(D3D12_FEATURE feature) noexcept {
+    switch (feature) {
+        case kFeatureOptions20:
+            return "D3D12_FEATURE_D3D12_OPTIONS20";
+        case kFeaturePredication:
+            return "D3D12_FEATURE_PREDICATION";
+        case kFeatureOptions21:
+            return "D3D12_FEATURE_D3D12_OPTIONS21";
+        case kFeatureApplicationSpecificDriverState:
+            return "D3D12_FEATURE_APPLICATION_SPECIFIC_DRIVER_STATE";
+        case kFeatureBytecodeBypassHashSupported:
+            return "D3D12_FEATURE_BYTECODE_BYPASS_HASH_SUPPORTED";
+        default:
+            return nullptr;
+    }
+}
+
 }  // namespace rt::d3d12::compat
