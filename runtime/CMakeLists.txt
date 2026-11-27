@@ -2116,6 +2116,22 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_queue_query_sync COMMAND vk_queue_query_sync_test)
     set_tests_properties(vk_queue_query_sync PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  # The "submit frame" and "submit floor" lines (src/submit_phases.h): a scripted run on the CPU, then empty
+  # submissions through VulkanQueue whose floor sums must equal the phase totals (that part needs a Vulkan device).
+  add_executable(submit_frame_test test/submit_frame_test.cpp)
+  target_link_libraries(submit_frame_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(submit_frame_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(submit_frame_test PRIVATE Threads::Threads)
+  endif()
+  if(MSVC)
+    target_compile_options(submit_frame_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME submit_frame COMMAND submit_frame_test)
+  endif()
   # Fence and queue teardown with submissions pending: a fence released after an unheld Signal, the bindless upload
   # queue destroyed before another queue submits, the device-fault submit ring forgetting destroyed semaphores.
   add_executable(vk_semaphore_lifetime_test test/vk_semaphore_lifetime_test.cpp)

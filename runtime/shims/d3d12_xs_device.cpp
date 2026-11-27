@@ -29,6 +29,7 @@
 #ifdef LEONIDA_VULKAN_DEVICE
 #include "d3d12_com.h"  // rt::d3d12::create_console_descriptor_heap for slot 14
 #include "../src/vulkan_gpu_labels.h"
+#include "../src/submit_phases.h"
 #endif
 #include "d3d12_xs_placed_depth.h"
 #include "d3d12_trace.h"
@@ -1984,6 +1985,8 @@ bool execute_with_values(ChildProxy* self, UINT count, void* const* lists);
 // list proxy replaced by its real list (a bundle on the list side unwraps the same way at the console's
 // ExecuteBundle); the real queue never sees a proxy.
 std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word) {
+    // The "submit frame" line: the console call as a whole, its list-value waits and writes included (outermost).
+    const leonida::submit_phases::TitleCall frame_call(leonida::submit_phases::part_lists);
     // While the title submits, a held list-value wait is not released for want of progress: this may carry its write.
     const list_values::Pump::TitleCall title_call;
     if (lists_word &&
