@@ -24,12 +24,14 @@ enum Phase : unsigned {
     shadows,    // slot-133 shadow buffers and title windows (ShadowPages::refresh)
     geometry,   // GeometryViews::refresh
     textures,   // Device::refresh_title_textures
+    pipelines,  // no longer timed (the pre-pass that waited for pipelines is gone); kept for the column order
     replay,     // the rest of execute_now: preparing, recording and submitting the lists
     kCount
 };
 
 inline const char* name(unsigned p) {
-    static const char* const names[kCount] = {"wait", "heaps", "shadows", "geometry", "textures", "replay"};
+    static const char* const names[kCount] = {"wait", "heaps", "shadows", "geometry", "textures", "pipes",
+                                                    "replay"};
     return p < kCount ? names[p] : "?";
 }
 
@@ -160,14 +162,15 @@ inline void submitted() {
         all += total;
     }
     std::fprintf(stderr,
-                 "[rt] submit phases t=%.0fs: %llu submissions in %.1f s (%.2f/s, %llu in all), %.2f frames/s; ms per submission "
-                 "(max): %s %.2f (%.0f) %s %.2f (%.0f) %s %.2f (%.0f) %s %.2f (%.0f) %s %.2f (%.0f) %s %.2f (%.0f); "
+                 "[rt] submit phases t=%.0fs: %llu submissions in %.1f s (%.2f/s, %llu in all), %.2f frames/s; ms per "
+                 "submission (max): %s %.2f (%.0f) %s %.2f (%.0f) %s %.2f (%.0f) %s %.2f (%.0f) %s %.2f (%.0f) %s %.2f "
+                 "(%.0f) %s %.2f (%.0f); "
                  "%.0f%% of the wall time\n",
                  process_age(), static_cast<unsigned long long>(n), seconds, double(n) / seconds,
                  static_cast<unsigned long long>(t.all_submissions.load(std::memory_order_relaxed)),
                  double(frames) / seconds, name(0), ms[0],
                  max_ms[0], name(1), ms[1], max_ms[1], name(2), ms[2], max_ms[2], name(3), ms[3], max_ms[3], name(4),
-                 ms[4], max_ms[4], name(5), ms[5], max_ms[5], 100.0 * all * 1e-3 / seconds);
+                 ms[4], max_ms[4], name(5), ms[5], max_ms[5], name(6), ms[6], max_ms[6], 100.0 * all * 1e-3 / seconds);
 }
 
 }  // namespace leonida::submit_phases

@@ -104,10 +104,14 @@ struct VulkanDeviceInfo {
     std::vector<VkQueue> compute_queues;
     std::vector<VkQueue> copy_queues;
     bool pipeline_creation_feedback = false;
+    // Vulkan 1.3 pipelineCreationCacheControl, enabled: FAIL_ON_PIPELINE_COMPILE_REQUIRED asks a cache without a compile.
+    // Implies core VkPipelineCreationFeedback, which then needs no extension.
+    bool pipeline_cache_control = false;
     bool device_fault_diagnostics = false;
     bool device_fault_info = false;
     bool device_checkpoints = false;
     bool device_diagnostics_config = false;
+    bool device_markers = false;  // VK_AMD_buffer_marker enabled for LEONIDA_DEVICE_MARKERS=1
     bool separate_depth_stencil_layouts = true;
     bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted enabled on this device.
     std::uint32_t max_push_constants_size = 0;
@@ -165,6 +169,9 @@ struct VulkanDeviceInfo {
     bool occlusion_query_precise = false;
     bool prepare_on_bind = false;
     bool cold_graphics_compile = false;  // Driver supports a cache-only create and reports when compilation is pending.
+    // pipelineCreationCacheControl is on for the heavy pipeline cache (src/heavy_pipeline_cache.h): a pipeline the
+    // offline cache does not have is created against the cache of pipeline_cache.heavy.bin, written back as it grows.
+    bool heavy_pipeline_cache = false;
     bool pipeline_statistics_query = false;
     bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
     // VK_KHR_swapchain_maintenance1 (or VK_EXT_swapchain_maintenance1) and its swapchainMaintenance1 feature are
@@ -297,6 +304,11 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer);
 HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
                                        D3D12_GPU_VIRTUAL_ADDRESS console_address, std::uint64_t console_size,
                                        REFIID riid, void** out);
+
+// Calls `fn` on the device's fence-wait thread once `fence` (a fence of such a device) reaches `value` (at once on that
+// thread if it has). Released or device lost, `fn` still runs once: it must not use the fence then. False for a fence
+// of another kind. For the console fence's slot-12 mirror (d3d12_xs_device.cpp).
+bool fence_callback_at(ID3D12Fence* fence, std::uint64_t value, std::function<void()> fn);
 
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
@@ -576,6 +588,11 @@ struct RootArgumentLayout {
 const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature);
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
+// Record time, for LEONIDA_ASYNC_PIPELINES=1: starts the pipeline's build on the compile worker before the list is
+// submitted, without waiting (PipelineState::queue_build). `id` is what compute_pipeline_id or graphics_pipeline_id gave (0:
+// nothing). Compute: at SetPipelineState; graphics: at each draw, with the render-target slots it binds (bit per slot)
+// and whether it binds a depth buffer.
+void request_pipeline_build(std::uintptr_t id, std::uint32_t bound_targets, bool depth_bound);
 // What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
 // The linked SPIR-V stage modules for a lazy pipeline (in recipe stages order); false when not a lazy pipeline.
@@ -606,6 +623,8 @@ bool write_placed_texture_view(ID3D12Device* device, bool unordered, const std::
 // The VA shaders read a descriptor table at: for one inside a console descriptor heap (Xbox slot 14) whose arena copy
 // lies elsewhere, the matching VA in that copy; any other VA unchanged.
 D3D12_GPU_VIRTUAL_ADDRESS console_descriptor_table_va(D3D12_GPU_VIRTUAL_ADDRESS va);
+// The console descriptor heap holding `va` (its console VA and bytes); false when none with a copy holds it.
+bool console_descriptor_heap_range(D3D12_GPU_VIRTUAL_ADDRESS va, std::uint64_t& console_va, std::uint64_t& bytes);
 
 // XDXR acceleration-structure commands (docs/d3d12_vulkan.md 4.8) of a list of `device`: every address the command
 // writes or reads, as the title named it, becomes the VA shaders reach that memory by (src/title_va_alias.h: a
