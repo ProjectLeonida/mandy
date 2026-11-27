@@ -142,7 +142,8 @@ inline bool compile_worker_trigger(const char* trigger) {
 //     not holding submissions, when a compile worker runs it for a speculative job (compile_job_speculative).
 //   - the compile worker, which runs below normal priority, runs the call at normal priority, so a preempted worker
 //     does not sit on a driver lock a submit waits for.
-// True on a compile worker while it runs a speculative job (a warm-up, a prewarm, the checkpoint; PipelineCompiler::run):
+// True on a compile worker while it runs a speculative job (any job of a priority other than 0: today the compute warm-up,
+// and the checkpoint, which makes no create; PipelineCompiler::run):
 // its pipeline creates pass the compile gate as warm-ups, which do not hold submissions (SubmitMutex::CompileTurn).
 inline thread_local bool compile_job_speculative = false;
 
@@ -268,7 +269,9 @@ inline CompilePool compile_pool_from_environment() {
 //     large, keeps within the heavy count; when it is speculative, runs alone among speculative ones and only while
 //     no demanded build is queued or running.
 // So a long driver compile holds up only the jobs of its own PSO, and a small build a submission asked for gets a free
-// worker while large ones run. With one worker the order is the old one: the next job, whatever it is.
+// worker while large ones run. With one worker the order is the old one: the next job, whatever it is, except that
+// with the graphics-only worker beside it one build of a PSO at a time holds there too (a PSO's last Release waits only
+// for the build of it that runs: two at once, one on each worker, left the other using the deleted PSO).
 //
 // Lifetime. A job names its owner (the PSO it builds, or the device for a cache checkpoint) and the device whose
 // Vulkan objects it uses, and holds no reference to either: a reference kept the device alive past the title's last
@@ -531,11 +534,17 @@ private:
     }
 
     // The first job this worker may take, most urgent first (see the class comment). With one worker: any job for the
-    // general worker, a graphics job for the graphics one.
+    // general worker, a graphics job for the graphics one, but not one whose PSO has a build running on the other.
     std::multimap<std::size_t, Job>::iterator next_locked(bool graphics_only) {
+        // Either way a job whose PSO has one running waits: two variants of one graphics PSO, one on each worker, and
+        // its last release (after_running, which waits for the running job only) would delete the PSO under the other.
+        const auto pso_busy = [this](const Job& job) {
+            return std::any_of(running_.begin(), running_.end(), [&](const Running& r) { return r.owner == job.owner; });
+        };
         if (!pool_ || pool_->threads < 2) {
-            if (!graphics_only) return jobs_.begin();
-            return std::find_if(jobs_.begin(), jobs_.end(), [](const auto& entry) { return entry.second.graphics; });
+            return std::find_if(jobs_.begin(), jobs_.end(), [&](const auto& entry) {
+                return (!graphics_only || entry.second.graphics) && !pso_busy(entry.second);
+            });
         }
         unsigned heavy = 0, large = 0, speculative = 0, demanded = 0;
         for (const Running& r : running_) {
@@ -550,8 +559,7 @@ private:
                 if (running_.empty()) return it;
                 continue;
             }
-            if (std::any_of(running_.begin(), running_.end(), [&](const Running& r) { return r.owner == job.owner; }))
-                continue;
+            if (pso_busy(job)) continue;
             if ((job.large || it->first != 0) && heavy >= pool_->threads - 1) continue;
             if (job.large && large >= pool_->heavy) continue;
             if (it->first != 0 && (speculative || demanded)) continue;

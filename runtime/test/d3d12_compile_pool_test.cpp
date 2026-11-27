@@ -5,8 +5,9 @@
 //   - large builds keep within the heavy count, and large and speculative ones together leave one worker free;
 //   - demanded jobs go first, in the order they came, then warm-ups by size, and a checkpoint only when nothing runs;
 //   - a checkpoint's second look sees a demanded build that started on another worker meanwhile;
-//   - one job of a PSO at a time;
-//   - a warm-up's and the checkpoint's creates pass the compile gate as speculative, a demanded build's do not;
+//   - one job of a PSO at a time, also with one worker plus the graphics-only one;
+//   - a warm-up's and the checkpoint's creates pass the compile gate as speculative, a demanded build's do not, through
+//     DriverTurn as the runtime makes them;
 //   - the last release with jobs running and queued: the queued ones are dropped, the running ones finish, the
 //     workers are joined; a device's cancel waits for its running jobs; stop_for_exit does not wait past its limit.
 #include "../shims/d3d12_pipeline_compile.h"
@@ -195,6 +196,45 @@ void test_one_worker_keeps_the_old_order() {
     pool.release();
 }
 
+// One general worker plus the graphics-only one (LEONIDA_COMPILE_THREADS=1, the layout of main): two variants of one
+// graphics PSO must not build at once, one on each worker. A PSO's last release attaches its deletion to the job of
+// that PSO that is running (after_running); a second one still in build() on the other worker would use the deleted
+// PSO (qhukz13, #2233). Another PSO's graphics build still runs beside it on the graphics worker.
+void test_one_worker_and_the_graphics_worker_build_one_job_of_a_pso() {
+    auto& pool = make_pool(1, 1);
+    Log log;
+    Gate first;
+    Owners owner;
+    const auto graphics = [&](const void* who, const std::string& name, Gate* gate) {
+        EXPECT(pool.submit(who, device, 0, [&log, gate, name] {
+            log.start(name, false);
+            if (gate) gate->wait();
+            log.finish(name, false);
+        }, true));
+    };
+    graphics(owner[0], "variant 1", &first);
+    EXPECT(log.wait_started(1));
+    graphics(owner[0], "variant 2", nullptr);
+    std::this_thread::sleep_for(100ms);
+    EXPECT(!log.has_started("variant 2"));  // the other worker is free, but this PSO has a build running
+    graphics(owner[1], "other pso", nullptr);
+    EXPECT(log.wait_finished(1));            // the free worker takes another PSO's build meanwhile
+    EXPECT(log.has_started("other pso") && !log.has_started("variant 2"));
+    // The PSO's last release while "variant 1" runs: "variant 2" is dropped, and the deletion runs after "variant 1".
+    std::atomic<bool> deleted{false}, variant_running_at_delete{false};
+    EXPECT(pool.after_running(owner[0], [&] {
+        std::lock_guard lock(log.mutex);
+        variant_running_at_delete = log.running != 0;
+        deleted = true;
+    }));
+    first.release();
+    EXPECT(log.wait_finished(2));
+    pool.wait_idle();
+    EXPECT(deleted.load() && !variant_running_at_delete.load());
+    EXPECT(!log.has_started("variant 2"));
+    pool.release();
+}
+
 void test_heavy_count_and_the_free_worker() {
     auto& pool = make_pool(4, 2);
     Log log;
@@ -348,7 +388,7 @@ void test_a_checkpoint_sees_a_demand_that_started_during_it() {
     EXPECT(log.wait_finished(1));
     EXPECT(second_look == 1);
     build.release();
-    EXPECT(log.wait_finished(2));
+    pool.wait_idle();  // the job leaves the running list after its function returns
     EXPECT(!pool.has_compile_waiter());
     pool.release();
 }
@@ -384,6 +424,39 @@ void test_jobs_tell_the_gate_whether_they_are_speculative() {
             {"warm", true}, {"demand", false}, {"checkpoint", true}, {"demand again", false}};
         EXPECT(seen == want);
         pool.release();
+    }
+}
+
+// The one line that turns the warm-up-free gate on in the runtime: a pipeline create's DriverTurn on a thread whose job is
+// speculative passes the gate as speculative, so a submission does not wait for it; on any other thread it holds
+// submissions as before (qhukz13, #2275).
+void test_a_driver_turn_passes_the_speculative_flag_to_the_gate() {
+    if (!leonida::SubmitMutex::compile_gate_enabled()) return;  // LEONIDA_COMPILE_GATE=0: no gate to check
+    leonida::SubmitMutex gate;
+    gate.set_warmup_policy({true, 1});
+    for (const bool speculative : {true, false}) {
+        std::atomic<bool> inside{false}, release{false}, submitted{false};
+        std::thread create([&] {
+            rt::d3d12::compile_job_speculative = speculative;
+            {
+                const rt::d3d12::DriverTurn turn(gate, "warmup", "vkCreateComputePipelines", true, nullptr);
+                inside = true;
+                while (!release) std::this_thread::sleep_for(1ms);
+            }
+            rt::d3d12::compile_job_speculative = false;
+        });
+        for (int i = 0; i < 2000 && !inside; ++i) std::this_thread::sleep_for(1ms);
+        EXPECT(inside.load());
+        std::thread submit([&] {
+            const leonida::SubmitMutex::SubmitTurn turn(gate);
+            submitted = true;
+        });
+        std::this_thread::sleep_for(150ms);
+        EXPECT(submitted.load() == speculative);  // past a warm-up at once; behind a demanded create
+        release = true;
+        create.join();
+        submit.join();
+        EXPECT(submitted.load());
     }
 }
 
@@ -515,6 +588,7 @@ int main() {
     test_pool_settings();
     test_long_build_does_not_hold_up_a_small_demanded_one();
     test_one_worker_keeps_the_old_order();
+    test_one_worker_and_the_graphics_worker_build_one_job_of_a_pso();
     test_heavy_count_and_the_free_worker();
     test_one_warm_up_at_a_time();
     test_demanded_builds_go_before_warm_ups();
@@ -523,6 +597,7 @@ int main() {
     test_a_checkpoint_sees_a_demand_that_started_during_it();
     test_one_job_of_a_pso_at_a_time();
     test_jobs_tell_the_gate_whether_they_are_speculative();
+    test_a_driver_turn_passes_the_speculative_flag_to_the_gate();
     test_a_finished_job_wakes_the_idle_workers();
     test_release_with_jobs_running_and_queued();
     test_cancel_waits_for_a_devices_running_jobs();
