@@ -482,6 +482,33 @@ int paired_views(ID3D12Device* real) {
     return failures;
 }
 
+// The title's own VirtualProtect (xmem's TitleVirtualProtect) never sees one of our read-only guards as the protection
+// it had: a title that saves `old` and sets it back later would leave the page read-only with no guard to answer for it,
+// and its next write faults (run 62's "stray read-only title page"). A cell of the geometry watch, armed as the title
+// texture watch arms them, stands for the guards.
+int title_protect_round_trip() {
+    const char* who = "title VirtualProtect over a guard";
+    using VirtualProtectFn = BOOL(WINAPI*)(LPVOID, SIZE_T, DWORD, PDWORD);
+    const auto protect = reinterpret_cast<VirtualProtectFn>(rt::shims::find("kernel32.dll", "VirtualProtect"));
+    EXPECT(protect);
+    auto* pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(pages);
+    const auto va = reinterpret_cast<std::uintptr_t>(pages);
+    auto* cell = leonida::geometry_writes::acquire(va);
+    EXPECT(leonida::geometry_writes::arm(va, *cell));
+    EXPECT((protection_of(pages + 0x1000) & 0xff) == PAGE_READONLY);  // guarded
+    DWORD old = 0, again = 0;
+    EXPECT(protect(pages + 0x1000, 0x1000, PAGE_READWRITE, &old));
+    EXPECT((old & 0xff) == PAGE_READWRITE);  // what the title set, not our guard
+    EXPECT(protect(pages + 0x1000, 0x1000, old, &again));  // set back as the title saw it
+    EXPECT((protection_of(pages + 0x1000) & 0xff) == PAGE_READWRITE);
+    pages[0x1964] = 1;  // and written: no fault left to the title
+    leonida::geometry_writes::release(va);
+    EXPECT(VirtualFree(pages, 0, MEM_RELEASE));
+    std::printf("%s: the title saw and restored its own protection\n", who);
+    return 0;
+}
+
 int exposure_map_ranges(void* device) {
     auto* pages = static_cast<char*>(VirtualAlloc(nullptr, 2 * kPage64k, MEM_RESERVE, PAGE_READWRITE));
     EXPECT(pages && VirtualAlloc(pages, kPage64k, MEM_COMMIT, PAGE_READWRITE));
@@ -697,6 +724,7 @@ int main(int argc, char** argv) {
             failures += queue_remap(real.p, device.p);
             failures += queue_remap_default_route(real.p, device.p);
             failures += paired_views(real.p);
+            failures += title_protect_round_trip();
         }
     }
     if (vk.validation_errors()) {
