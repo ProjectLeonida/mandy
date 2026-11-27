@@ -59,11 +59,13 @@ int scripted() {
     EXPECT(fences > 1 * ms && double(fences) <= call_ns - 1e6);
     // A lock another thread holds for 4 ms: counted as a lock wait, inside the other parts (not in the frame's sum).
     std::mutex m;
-    std::unique_lock held(m);
-    std::thread holder([&] {
+    std::atomic<bool> taken{false};
+    std::thread holder([&] {  // takes the lock and lets it go on its own thread, as a mutex must be
+        const std::lock_guard held(m);
+        taken.store(true);
         std::this_thread::sleep_for(std::chrono::milliseconds(4));
-        held.unlock();
     });
+    while (!taken.load()) std::this_thread::yield();
     {
         std::unique_lock lock(m, std::defer_lock);
         sp::lock_timed(lock);
