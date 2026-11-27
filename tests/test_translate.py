@@ -111,10 +111,17 @@ def test_dpp_controls_translate_and_validate(case, make_shader):
     shader = make_shader(program("v_mov_b32 v0, v0\n" + DPP_CASES[case]))
     spvasm = shader.translate()
     shader.validate(spvasm)
-    assert "OpGroupNonUniformShuffle" in spvasm
+    # make_shader builds a pixel shader: quad_perm reads its quad through quad operations, which helper
+    # invocations take part in (SHADER-PS-DPP-QUAD-OPS); the identity selector reads no other lane.
+    if "quad_perm:[0,1,2,3]" in DPP_CASES[case]:
+        assert "OpGroupNonUniformShuffle" not in spvasm and "OpGroupNonUniformQuad" not in spvasm
+    elif "quad_perm" in DPP_CASES[case]:
+        assert "OpGroupNonUniformQuadSwap" in spvasm and "OpGroupNonUniformShuffle" not in spvasm
+    else:
+        assert "OpGroupNonUniformShuffle" in spvasm
 
 
-@pytest.mark.parametrize("mods", [[], ["row_share:20"], ["row_shl:0"], ["row_shl:1", "row_shr:2"]])
+@pytest.mark.parametrize("mods",[[], ["row_share:20"], ["row_shl:0"], ["row_shl:1", "row_shr:2"]])
 def test_dpp_bad_control_is_rejected(mods):
     """A missing, out-of-range or duplicate DPP control must fail instead of guessing."""
     gen = rdna2spirv.Gen("ps")

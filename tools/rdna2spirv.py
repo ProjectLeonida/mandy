@@ -7757,6 +7757,20 @@ class Gen:
                     self.emit(f"{both} = OpLogicalAnd %bool {in_bounds} {active}")
                     active = both
                 src_ok = active
+        elif quad is not None and self.stage == "ps":
+            # A pixel shader reads its quad neighbours through quad operations (SHADER-PS-DPP-QUAD-OPS). Without
+            # MaximallyReconvergesKHR, Vulkan lets helper invocations count as inactive for every group operation
+            # other than the quad and derivative ones, so a shuffle could miss the helper next to a triangle edge.
+            # A quad is four consecutive subgroup lanes from a multiple of 4: the lane & ~3 of quad_perm.
+            shuffled = self.quad_perm_read(src_val, quad, perm) if src.get("k") == "vgpr" else src_val
+            if fi:
+                src_ok = "%true"
+            else:
+                bit = self.tmp()
+                self.emit(f"{bit} = OpSelect %uint {self.active_b()} {self.cu(1)} {self.cu(0)}")
+                read = self.tmp()
+                self.emit(f"{read} = OpINotEqual %bool {self.quad_perm_read(bit, quad, perm)} {self.cu(0)}")
+                src_ok = read
         else:
             sgl = self.subgroup_lane()
             sg_group = self.tmp()
@@ -7842,6 +7856,34 @@ class Gen:
             return self._insn({**ins, "args": args})
         finally:
             self.dpp_guard = previous
+
+    QUAD_SWAPS = {(1, 0, 3, 2): 0, (2, 3, 0, 1): 1, (3, 2, 1, 0): 2}   # OpGroupNonUniformQuadSwap Direction
+
+    def quad_perm_read(self, value, quad, perm):
+        """value (a %uint) of the lane quad_perm selects in this lane's quad, through quad operations: a swap for
+        the three swaps, else one QuadBroadcast per lane read (the Index must be a constant) and a select on this
+        lane's `perm`. Each result is stored eagerly, so every lane runs it (SHADER-529)."""
+        quad = tuple(quad)
+        if quad == (0, 1, 2, 3):
+            return value
+        self.uses_subgroup = self.uses_quad = True
+        if quad in self.QUAD_SWAPS:
+            r = self.tmp()
+            self.emit(f"{r} = OpGroupNonUniformQuadSwap %uint {self.cu(3)} {value} {self.cu(self.QUAD_SWAPS[quad])}")
+            return self.eager("%uint", r)
+        reads = {}
+        for k in sorted(set(quad)):
+            r = self.tmp()
+            self.emit(f"{r} = OpGroupNonUniformQuadBroadcast %uint {self.cu(3)} {value} {self.cu(k)}")
+            reads[k] = self.eager("%uint", r)
+        *rest, last = reads
+        out = reads[last]
+        for k in rest:
+            is_k, sel = self.tmp(), self.tmp()
+            self.emit(f"{is_k} = OpIEqual %bool {perm} {self.cu(k)}")
+            self.emit(f"{sel} = OpSelect %uint {is_k} {reads[k]} {out}")
+            out = sel
+        return out
 
     def permute_known_selector(self, src0, src1, selector):
         """Emit only the selected bytes of V_PERM_B32 when S2 is known."""

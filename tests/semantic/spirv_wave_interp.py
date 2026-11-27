@@ -25,8 +25,13 @@ wave size; BaseVertex and BaseInstance read 0; other Input variables read zero, 
 lane number giving that lane's integer value, e.g. {"VertexIndex": lambda lane: first + lane}). PushConstant words
 can be seeded (default zero).
 
-    run_wave(text, wave=32, push_constants=None, max_steps=2_000_000, builtins=None) ->
-        {"outputs": [ {output_name: tuple_of_words} or None (lane killed) for each lane ],
+`helpers` names lanes that run as a fragment shader's helper invocations. They take part in quad operations, but
+every other group operation leaves them out, the strict reading of Vulkan's "Helper Invocations" without
+MaximallyReconvergesKHR: a shuffle or broadcast from one is undefined, a ballot does not see it, and any other
+group operation they reach raises UnsupportedConstruct. Their outputs are discarded (None).
+
+    run_wave(text, wave=32, push_constants=None, max_steps=2_000_000, builtins=None, helpers=()) ->
+        {"outputs": [ {output_name: tuple_of_words} or None (lane killed or a helper) for each lane ],
          "steps": instructions executed (summed over invocations)}
 """
 import math
@@ -321,9 +326,10 @@ def _copy(v):
 
 
 class _Wave:
-    def __init__(self, mod, wave, push_constants, max_steps, builtins=None, inputs=None, memory=None):
+    def __init__(self, mod, wave, push_constants, max_steps, builtins=None, inputs=None, memory=None, helpers=()):
         self.m = mod
         self.wave = wave
+        self.helpers = frozenset(helpers)
         self.pcw = list(push_constants or [])
         self.max_steps = max_steps
         self.steps = 0
@@ -397,8 +403,8 @@ class _Wave:
             raise UnsupportedConstruct(f"invocations left the function through {sorted(rest)}")
         out = []
         for lane in self.lanes:
-            if lane.index in self.killed:
-                out.append(None)
+            if lane.index in self.killed or lane.index in self.helpers:
+                out.append(None)        # a helper invocation's outputs are discarded
                 continue
             words = {}
             for vid, box in lane.outputs.items():
@@ -576,6 +582,16 @@ class _Wave:
             raise UnsupportedConstruct(f"{op} with a scope other than Subgroup")
         L = self.lanes
         width = self.wave
+        if not op.startswith("OpGroupNonUniformQuad") and self.helpers.intersection(members):
+            # Without MaximallyReconvergesKHR, helper invocations may be treated as inactive for group operations
+            # other than quad and derivative ones (Vulkan, "Helper Invocations"): the strict reading leaves them out.
+            if op not in ("OpGroupNonUniformShuffle", "OpGroupNonUniformBroadcast", "OpGroupNonUniformBallot"):
+                raise UnsupportedConstruct(f"{op} with helper invocations")
+            for i in self.helpers.intersection(members):
+                L[i].values[res] = _Poison(f"{op[17:]} in a helper invocation")
+            members = [i for i in members if i not in self.helpers]
+            if not members:
+                return
 
         def ballot_bits(v):
             if not (isinstance(v, tuple) and len(v) == 4):
@@ -1011,9 +1027,11 @@ class _BuiltinNotModelled:
         self.name = name
 
 
-def run_wave(text, wave=32, push_constants=None, max_steps=2_000_000, builtins=None, inputs=None, memory=None):
+def run_wave(text, wave=32, push_constants=None, max_steps=2_000_000, builtins=None, inputs=None, memory=None,
+             helpers=()):
     if wave not in (32, 64):
         raise ValueError("wave must be 32 or 64")
-    w = _Wave(_Module(text), wave, push_constants, max_steps, builtins, inputs=inputs, memory=memory)
+    w = _Wave(_Module(text), wave, push_constants, max_steps, builtins, inputs=inputs, memory=memory,
+              helpers=helpers)
     outputs = w.run()
     return {"outputs": outputs, "steps": w.steps, "memory": w.memory}
