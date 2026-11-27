@@ -885,6 +885,12 @@ if(BUILD_TESTING)
   add_executable(heavy_pipeline_cache_test test/heavy_pipeline_cache_test.cpp)
   add_test(NAME heavy_pipeline_cache COMMAND heavy_pipeline_cache_test)
 
+  # RT-PIPELINE-PREWARM-ORDER phase 1: the file format and the recorder of src/pipeline_order.h (pure stdlib, no GPU).
+  add_executable(pipeline_order_test test/pipeline_order_test.cpp)
+  target_link_libraries(pipeline_order_test PRIVATE Threads::Threads)
+  add_test(NAME pipeline_order COMMAND pipeline_order_test)
+  set_tests_properties(pipeline_order PROPERTIES TIMEOUT 120)
+
   # The per-pipeline journal files compute pipelines are kept in: naming, header check, atomic replacement.
   add_executable(pipeline_cache_journal_test test/pipeline_cache_journal_test.cpp)
   add_test(NAME pipeline_cache_journal COMMAND pipeline_cache_journal_test)
@@ -914,6 +920,10 @@ if(BUILD_TESTING)
   target_link_libraries(big_compile_gate_test PRIVATE Threads::Threads)
   add_test(NAME big_compile_gate COMMAND big_compile_gate_test)
   set_tests_properties(big_compile_gate PROPERTIES TIMEOUT 120)
+  # LEONIDA_COMPILE_GATE=auto (src/compile_gate_policy.h): the setting, the calibration verdict, its cache file and the
+  # slow pipeline's SPIR-V: pure stdlib, no Vulkan device.
+  add_executable(compile_gate_policy_test test/compile_gate_policy_test.cpp)
+  add_test(NAME compile_gate_policy COMMAND compile_gate_policy_test)
   # vk_pipeline_check's memory budget for large modules: pure stdlib, no Vulkan device.
   add_executable(large_module_gate_test test/large_module_gate_test.cpp)
   find_package(Threads REQUIRED)
@@ -2006,6 +2016,23 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(${tool} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
   endforeach()
+  # The LEONIDA_COMPILE_GATE=auto calibration (src/compile_gate_calibration.h) on this machine's GPU: a verdict within
+  # 20 s, adaptive on NVIDIA 621.40. 77 without a Vulkan device.
+  add_executable(vk_compile_gate_calibration_test test/vk_compile_gate_calibration_test.cpp)
+  target_link_libraries(vk_compile_gate_calibration_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_compile_gate_calibration_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(vk_compile_gate_calibration_test PRIVATE Threads::Threads)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_compile_gate_calibration_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_compile_gate_calibration COMMAND vk_compile_gate_calibration_test)
+    set_tests_properties(vk_compile_gate_calibration PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  endif()
   # The ExecuteIndirect argument clamp's compute pass (runtime/src/vulkan_indirect_clamp.h): every argument kind and
   # the counted variants, with garbage records bounded and the batch budget saturating, read back from the scratch
   # the replay would use. 77 without a Vulkan device.
@@ -2598,6 +2625,14 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_compile_pool_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_compile_pool COMMAND d3d12_compile_pool_test)
     set_tests_properties(d3d12_compile_pool PROPERTIES TIMEOUT 120)
+    # RT-PIPELINE-PREWARM-ORDER phase 2: the plan read from an order log (src/pipeline_prewarm.h) and its warm-ups on the
+    # compile workers, with jobs that wait at gates; no device.
+    add_executable(pipeline_prewarm_test test/pipeline_prewarm_test.cpp)
+    target_link_libraries(pipeline_prewarm_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(pipeline_prewarm_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(pipeline_prewarm_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME pipeline_prewarm COMMAND pipeline_prewarm_test)
+    set_tests_properties(pipeline_prewarm PROPERTIES TIMEOUT 120)
     add_executable(d3d12_pipeline_workers_test test/d3d12_pipeline_workers_test.cpp)
     target_link_libraries(d3d12_pipeline_workers_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_pipeline_workers_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -4598,6 +4633,13 @@ if(TARGET Vulkan::Headers)
     add_test(NAME replay_pipeline_compiles COMMAND replay_pipeline_compiles_test)
     add_test(NAME replay_pipeline_compiles_strict COMMAND replay_pipeline_compiles_test)
     set_tests_properties(replay_pipeline_compiles_strict PROPERTIES ENVIRONMENT "LEONIDA_STRICT_REPLAY=1")
+    # The request hook of ComputePipeline / GraphicsPipeline that pipeline_order.h's recorder hangs on (no GPU).
+    add_executable(replay_pipeline_order_hook_test test/replay_pipeline_order_hook_test.cpp)
+    target_link_libraries(replay_pipeline_order_hook_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_pipeline_order_hook_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_pipeline_order_hook COMMAND replay_pipeline_order_hook_test)
     # Compiling unbuilt pipelines releases resource_mutex_ and tracker_mutex_ while keeping pipeline_mutex_ (no GPU).
     add_executable(replay_pipeline_compile_unlock_test test/replay_pipeline_compile_unlock_test.cpp)
     target_link_libraries(replay_pipeline_compile_unlock_test PRIVATE Vulkan::Headers Threads::Threads)
