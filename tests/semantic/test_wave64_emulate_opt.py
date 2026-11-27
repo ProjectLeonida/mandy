@@ -706,8 +706,7 @@ class DeadSccLivenessTests(unittest.TestCase):
                     self.assertEqual(actual, [1] * threads,
                                      f"{actual.count(1)}/{threads} lanes observed the live SCC")
 
-    def test_non_emulated_unchanged_keeps_wqm_scc_vote(self):
-        # Verify WAVE64_EMULATE=False keeps dead-SCC votes (required by test_translate.py WQM_MASK).
+    def test_dead_wqm_scc_skips_vote_in_native_and_emulated_waves(self):
         insns = [
             ("s_mov_b64 exec, -1", 4),
             ("v_cmp_gt_u32_e32 vcc, 16, v0", 4),
@@ -715,8 +714,8 @@ class DeadSccLivenessTests(unittest.TestCase):
             ("s_bcnt1_i32_b64 s8, s[6:7]", 4),
             ("s_endpgm", 4),
         ]
-        spv_native, _ = _translate_encoded("cs_wqm_native_keep", insns, (64, 1, 1), emulate=False)
-        self.assertIn("OpGroupNonUniformAny", spv_native)
+        spv_native, _ = _translate_encoded("cs_wqm_native_dead_scc", insns, (64, 1, 1), emulate=False)
+        self.assertNotIn("OpGroupNonUniformAny", spv_native)
         spv_emu, _ = _translate_encoded("cs_wqm_emu_dead_scc", insns, (64, 1, 1), emulate=True)
         self.assertNotIn("OpGroupNonUniform", spv_emu)
         # Only s_bcnt1's wave_mask uses OpAtomicOr (2 words); s_wqm's dead SCC vote is elided.

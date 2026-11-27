@@ -117,6 +117,28 @@ def bits_list(mask: int, width: int) -> list[int]:
 
 
 class Wave32B32LaneMaskTests(unittest.TestCase):
+    def test_native_scc_vote_at_a_join(self):
+        asm = [
+            "v_cmp_ne_u32_e64 vcc_lo, 0, s4 ; encoding: [0x6a,0x00,0xc5,0xd4,0x80,0x08,0x00,0x02]",
+            "s_not_b32 s10, vcc_lo ; encoding: [0x6a,0x07,0x8a,0xbe]",
+            "s_cbranch_vccz 1 ; encoding: [0x01,0x00,0x86,0xbf]",
+            "s_and_b32 s11, 0, 0 ; encoding: [0x80,0x80,0x0b,0x87]",
+            "s_cselect_b32 s11, 1, 0 ; encoding: [0x81,0x80,0x0b,0x85]",
+            "v_mov_b32_e32 v5, s11 ; encoding: [0x0b,0x02,0x0a,0x7e]",
+            "v_lshlrev_b32_e32 v6, 2, v0 ; encoding: [0x82,0x00,0x0c,0x34]",
+            "buffer_store_dword v5, v6, s[0:3], 0 offen ; encoding: [0x00,0x10,0x70,0xe0,0x06,0x05,0x00,0x80]",
+            "s_endpgm ; encoding: [0x00,0x00,0x81,0xbf]",
+        ]
+        # One predecessor carries the vote's SCC to the select; the other overwrites it.
+        joined = translate_cs("scc_vote_join", asm, 32)
+        for value, want in ((0, 1), (1, 0)):
+            self.assertEqual(run_cs(joined, 32, s4=value), {4 * i: want for i in range(32)})
+
+        # Without the branch the overwrite is unconditional, so the mask needs no subgroup vote.
+        straight = translate_cs("scc_vote_overwritten", asm[:2] + asm[3:], 32)
+        self.assertNotIn("OpGroupNonUniformAny ", straight)
+        self.assertEqual(run_cs(straight, 32), {4 * i: 0 for i in range(32)})
+
     def test_s_not_b32_on_vcc_into_sgpr_and_scc(self):
         asm = W32_BUILD_VCC + [
             "s_not_b32 s10, vcc_lo",

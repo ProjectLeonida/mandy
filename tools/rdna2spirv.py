@@ -550,8 +550,8 @@ class Gen:
         self.lane_either = {}      # id(instruction) -> SGPRs holding constant 0/-1 (EITHER) there
         self.cur_either = ()
         self.x_lanes = 64          # emulate: workgroup invocations rounded up to whole waves
-        self.scc_live = None       # emulate: set of id(ins) whose SCC write is live-out (wave64_emulate_opt)
-        self.cur_scc_live = True   # emulate: whether the current instruction's SCC result is live-out
+        self.scc_live = None       # instructions whose SCC result can reach a reader
+        self.cur_scc_live = True   # keep the SCC result when emitting without a whole-shader analysis
         self.bar_rounds = False    # native wave32 cs with an s_barrier outside uniform control flow (bar_scheduler)
         self.uses_storage3d = False
         self.uses_heap = False
@@ -7551,7 +7551,7 @@ class Gen:
         self.cur_masks = self.lane_masks.get(id(ins), {})
         self.write_all_lanes = id(ins) in self.mask_writes
         self.cur_uniform_readlane = bool(self.w64g) and id(ins) in self.w64g["uniform_readlane"]
-        self.cur_scc_live = (not self.emulate) or (self.scc_live is None) or (id(ins) in self.scc_live)
+        self.cur_scc_live = self.scc_live is None or id(ins) in self.scc_live
         if self.emulate:
             self.x_memory_order(base_op(ins["op"]))
         self.cur_either = self.lane_either.get(id(ins), ())
@@ -18869,6 +18869,7 @@ def _translate(path):
     if not branchy and not g.emulate:
         g.vm_latch = stage == "ps" and exec_changes_after_vm([insns], [[]])
         g.park_masks(([insns], [[]]))
+        g.scc_live = wave64_emulate_opt.scc_live_outs([insns], [[]])
         halves_analysis(g, [insns], [[]])
         g.build_meta = _shader_meta.collect(path, info["name"], [insns], [[]],
                                             user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
@@ -18945,8 +18946,8 @@ def _translate(path):
 
     g.bar_rounds = needs_barrier_rounds(g, blocks, succ)
     folds, fold_chain, absorbed = {}, {}, set()
+    g.scc_live = wave64_emulate_opt.scc_live_outs(blocks, succ)
     if g.emulate:
-        g.scc_live = wave64_emulate_opt.scc_live_outs(blocks, succ)
         folds, fold_chain, absorbed = wave64_emulate_opt.find_local_exec_folds(
             blocks, raw_edges, succ, g.lane_masks, g.scc_live, g.mask_writes)
         if STRUCTURED and WAVE64_PLAN:

@@ -223,6 +223,7 @@ class WrexecB32Tests(unittest.TestCase):
                         "v_mbcnt_lo_u32_b32 v1, -1, 0",
                         "v_cmp_eq_u32_e32 vcc_lo, 0, v1",
                         f"{op} s6, vcc_lo",
+                        "s_cselect_b32 s8, 1, 0",
                         "s_endpgm",
                     ],
                     fssm=fssm(32),

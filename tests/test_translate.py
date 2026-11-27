@@ -843,7 +843,7 @@ def test_wave32_bpermute_zeroes_inactive_and_missing_source_lanes(make_shader):
         "source mask must read the active lane predicate"
     assert f"OpBitwiseAnd %uint {shuffle['result']} " in asm, "the destination write must also mask the shuffle"
 
-WQM_MASK = "s_mov_b64 exec, -1\nv_cmp_gt_u32_e32 vcc_lo, 16, v0\ns_wqm_b64 s[6:7], vcc\ns_bcnt1_i32_b64 s8, s[6:7]\ns_endpgm\n"
+WQM_MASK = "s_mov_b64 exec, -1\nv_cmp_gt_u32_e32 vcc_lo, 16, v0\ns_wqm_b64 s[6:7], vcc\ns_cselect_b32 s9, 1, 0\ns_bcnt1_i32_b64 s8, s[6:7]\ns_endpgm\n"
 WQM_DATA = "s_mov_b32 s20, 0x00800010\ns_mov_b32 s21, 1\ns_wqm_b64 s[22:23], s[20:21]\ns_add_u32 s24, s22, s23\ns_endpgm\n"
 
 
