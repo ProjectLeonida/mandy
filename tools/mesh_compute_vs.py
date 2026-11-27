@@ -32,6 +32,7 @@ SUFFIX = ".mesh_vs"   # <ms name>.mesh_vs.spvasm / .spv next to the mesh shader
 USER_SGPRS = 32       # push constants: s0..s31, heap base, code base, then the output address (rdna2spirv.py)
 PC_TAIL_SET = 1       # set/binding of rdna2spirv.py --pc-tail-ubo's uniform block (6 dwords with --mesh-compute)
 PC_TAIL_BINDING = 0
+PC_TAIL_MAX_DWORDS = 64   # upper bound on %PcTail members (256 bytes; avoids an unbounded OpTypeStruct)
 
 
 def _pc_tail_dwords(lay):
@@ -40,9 +41,13 @@ def _pc_tail_dwords(lay):
     if dwords is None:
         return None
     if (not isinstance(dwords, (list, tuple)) or len(dwords) != 2
-            or any(isinstance(x, bool) or not isinstance(x, int) or x < 0 for x in dwords)):
-        raise ValueError(f"pc_tail_address_dwords must be two non-negative ints, got {dwords!r}")
+            or any(isinstance(x, bool) or not isinstance(x, int)
+                   or not 0 <= x < PC_TAIL_MAX_DWORDS for x in dwords)):
+        raise ValueError(
+            f"pc_tail_address_dwords must be two ints in 0..{PC_TAIL_MAX_DWORDS - 1}, got {dwords!r}")
     lo, hi = dwords
+    if lo == hi:
+        raise ValueError(f"pc_tail_address_dwords must be two distinct ints, got {dwords!r}")
     return lo, hi, max(6, lo + 1, hi + 1)
 
 

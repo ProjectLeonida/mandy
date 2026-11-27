@@ -91,11 +91,23 @@ class Interface(unittest.TestCase):
         self.assertIn("%ahi_p = OpAccessChain %_ptr_Uniform_uint_tail %pc_tail %c5", asm)
 
     def test_pc_tail_address_dwords_rejects_malformed_values(self):
-        for bad in ([], [4], [4, 5, 6], [-1, 5], [True, 5], ["4", "5"], "45", 4):
+        # Duplicates and out-of-range indices would emit an OpAccessChain outside %pc_tail instead of failing here.
+        for bad in ([], [4], [4, 5, 6], [-1, 5], [True, 5], ["4", "5"], "45", 4,
+                    [4, 4], [64, 65], [70000, 70001],
+                    (4, 4), (4, 5, 6), [4.0, 5], [4, None], {}, [4, 5, 6, 7]):
             with self.subTest(bad=bad):
                 lay = dict(layout(), pc_tail_address_dwords=bad)
                 with self.assertRaises(ValueError):
                     vs.vs_spvasm(lay)
+
+    def test_pc_tail_dwords_accept_only_distinct_indices_in_range(self):
+        self.assertIsNone(vs._pc_tail_dwords({}))
+        self.assertEqual(vs._pc_tail_dwords({"pc_tail_address_dwords": [4, 5]}), (4, 5, 6))
+        self.assertEqual(vs._pc_tail_dwords({"pc_tail_address_dwords": [0, 63]}), (0, 63, 64))
+        for bad in ([4, 4], [63, 63], [63, 64], [0, 64]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    vs._pc_tail_dwords({"pc_tail_address_dwords": bad})
 
     def test_the_index_drives_write_for_index(self):
         with tempfile.TemporaryDirectory() as tmp:
