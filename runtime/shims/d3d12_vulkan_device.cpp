@@ -11469,7 +11469,9 @@ public:
                 const auto* record=rt::d3d12_xs::find_pso_record(this);
                 PipelineStream stream{};
                 HRESULT hr=record?parse_pipeline_stream(record->desc(),stream):E_INVALIDARG;
-                if(SUCCEEDED(hr))hr=stream.has_cs?create_compute(stream.compute):create_graphics(stream.graphics,&stream.ms,&stream.as);
+                if(SUCCEEDED(hr))hr=stream.has_cs?create_compute(stream.compute):create_graphics(stream.graphics,&stream.ms,&stream.as,
+                                                                                               stream.back_masks?&stream.back_stencil:nullptr,
+                                                                                               stream.depth_bounds);
             });
         }
         return registered_ && (is_graphics_==graphics);
