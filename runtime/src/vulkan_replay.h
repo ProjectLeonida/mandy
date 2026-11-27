@@ -4699,6 +4699,29 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 profile.other(command_buffer);
             }
         }
+        // LEONIDA_DEVICE_MARKERS=1 (vulkan_device_markers.h): a draw's started marker, before its helper passes (index
+        // expansion, indirect clamp) and its rendering scope, so a hang in them is the draw's too; its finished marker
+        // follows the scope (drawn below). Nothing without the markers.
+        if constexpr (Checkpoints) {
+            if (raster.state && !prepared.draws[p.draw].skipped && checkpoints->submission.markers) {
+                const Draw& s = *raster.state;
+                const detail::PreparedDraw& pd = prepared.draws[p.draw];
+                unsigned flags = (s.indexed ? marked_draw::indexed : 0u) | (s.mesh ? marked_draw::mesh : 0u) |
+                                 (!s.mesh && s.topology == topology_quad_list ? marked_draw::quads : 0u);
+                std::array<std::uint32_t, 3> counts{s.count, s.instances, s.first};
+                if (raster.arguments) {
+                    flags |= marked_draw::indirect | (raster.arguments->count_buffer ? marked_draw::counted : 0u);
+                    counts = {raster.arguments->max_count, raster.arguments->stride, 0};
+                }
+                std::array<VkImageView, detail::max_render_targets> views{};
+                const std::size_t slots = std::min(pd.colors.size(), views.size());
+                for (std::size_t slot = 0; slot < slots; ++slot)
+                    views[slot] = pd.colors[slot].id ? pd.colors[slot].view : VK_NULL_HANDLE;
+                checkpoints->draw(command_buffer, i, s.pipeline, static_cast<std::uint8_t>(flags), counts,
+                                  MarkedTargets::of(std::span<const VkImageView>(views.data(), slots),
+                                                    pd.depth.id ? pd.depth.view : VK_NULL_HANDLE, pd.area));
+            }
+        }
         if (next_query < prepared.queries.size() && prepared.queries[next_query].command == i) {
             if constexpr (Checkpoints)
                 if (std::holds_alternative<ResolveQueries>(command))
@@ -5359,7 +5382,16 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             // A legacy graphics indirect draw opens no rendering scope of its own: the caller has one open around the
             // replay (the tests do), and the recorded, stateful graphics indirects are Draw commands instead.
             if (ind->kind != IndirectKind::dispatch) {
-                if constexpr (Checkpoints) checkpoints->record(command_buffer, i, CheckpointKind::draw);
+                if constexpr (Checkpoints) {
+                    checkpoints->record(command_buffer, i, CheckpointKind::draw);
+                    // Inside the caller's rendering scope, which VK_AMD_buffer_marker allows.
+                    checkpoints->draw(command_buffer, i, 0,
+                                      static_cast<std::uint8_t>(
+                                          marked_draw::indirect |
+                                          (ind->kind == IndirectKind::draw_indexed ? marked_draw::indexed : 0u) |
+                                          (ind->count_buffer ? marked_draw::counted : 0u)),
+                                      {records, stride, 0});
+                }
                 if (ind->count_buffer) {
                     if (ind->kind == IndirectKind::draw)
                         vk.draw_indirect_count(command_buffer, indirect_buffer, arguments, count_buffer, count_offset,
@@ -5372,6 +5404,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 } else {
                     vk.draw_indexed_indirect(command_buffer, indirect_buffer, arguments, records, stride);
                 }
+                if constexpr (Checkpoints) checkpoints->drawn(command_buffer);
                 continue;
             }
             if (ind->pipeline && !p.pipeline.pipeline && (p.pipeline.async_build || p.pipeline.skipped)) continue;
@@ -5727,6 +5760,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
             }
             vk.end_rendering(command_buffer);
+            if constexpr (Checkpoints) checkpoints->drawn(command_buffer);
         }
     }
     // Predication does not carry over to the next command list.

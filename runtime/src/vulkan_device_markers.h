@@ -1,14 +1,24 @@
 #pragma once
 
 // LEONIDA_DEVICE_MARKERS=1 (diagnostic, with LEONIDA_DEVICE_FAULT=1 or 2): AMD breadcrumbs for the device-fault report
-// (vulkan_device_fault.h). On a device with VK_AMD_buffer_marker every dispatch the report numbers writes its `seq`
-// into its queue's slot of one small host-visible buffer twice: at top of pipe before the dispatch (started) and at
-// bottom of pipe after it (finished). A bottom-of-pipe write waits for all earlier work of the queue, so the finished
-// word is the last dispatch before which everything had completed; the dispatches after it up to the started word
-// are the ones the GPU had begun and not finished. On a loss or a stall report the slots are read back and the oldest
-// started, unfinished dispatch of a queue is reported as the likely hang. NVIDIA checkpoints do this on NVIDIA; RADV
-// has none. The buffer lives in system memory, so the last values usually survive a ring reset, but they are only
-// what the GPU wrote before it stopped: best-effort after a loss.
+// (vulkan_device_fault.h). On a device with VK_AMD_buffer_marker every dispatch and every draw the report numbers
+// writes its `seq` into its queue's slot of one small host-visible buffer twice: at top of pipe before the work
+// (started) and at bottom of pipe after it (finished). A bottom-of-pipe write waits for all earlier work of the queue,
+// so the finished word is the last item before which everything had completed; the items after it up to the started
+// word are the ones the GPU had begun and not finished. On a loss or a stall report the slots are read back and the
+// oldest started, unfinished item of a queue is reported as the likely hang. NVIDIA checkpoints do this on NVIDIA;
+// RADV has none. The buffer lives in system memory, so the last values usually survive a ring reset, but they are
+// only what the GPU wrote before it stopped: best-effort after a loss.
+//
+// Granularity: a marker pair per draw, as per dispatch. The replay opens a dynamic-rendering scope per draw, so the
+// started write goes before the draw's helper passes (quad index expansion, indirect clamp) and its scope, and the
+// finished one after the scope ends: both outside any render pass instance. The extension allows them inside one too
+// (vk.xml: renderpass="both", conditionalrendering="false"), which only the legacy graphics ExecuteIndirect path uses,
+// drawing in the caller's scope. In RADV (radv_CmdWriteMarkerToMemoryAMD) a top-of-pipe write is one COPY_DATA packet
+// with write confirm (the command processor waits for that one write, not for earlier work) and any other stage one
+// bottom-of-pipe EOP event (no wait); both first emit the cache flushes already pending, which the next draw would
+// have emitted anyway. That is at most 12 dwords per write, 24 per draw or dispatch next to the hundreds the draw's
+// own scope and state take, plus one history entry each on the CPU.
 
 #include <vulkan/vulkan.h>
 
@@ -19,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace leonida {
@@ -31,8 +42,8 @@ inline bool device_markers_requested() {
     return on;
 }
 
-// One queue's slot as the GPU writes it: the low 32 bits of the seq of the last dispatch whose top-of-pipe write ran
-// (started) and of the last whose bottom-of-pipe write ran (finished). 0 is no dispatch yet; seqs start at 1.
+// One queue's slot as the GPU writes it: the low 32 bits of the seq of the last dispatch or draw whose top-of-pipe
+// write ran (started) and of the last whose bottom-of-pipe write ran (finished). 0 is nothing yet; seqs start at 1.
 struct MarkerSlot {
     std::uint32_t started = 0;
     std::uint32_t finished = 0;
@@ -44,25 +55,143 @@ constexpr bool marker_after(std::uint64_t seq, std::uint32_t marker) {
     return static_cast<std::int32_t>(static_cast<std::uint32_t>(seq) - marker) > 0;
 }
 
-// What the marker history keeps of each recorded dispatch: enough to name one that left the report's 64-entry list.
-struct MarkedDispatch {
+enum class MarkedKind : std::uint8_t { dispatch, draw };
+
+// What a marked draw was (MarkedWork::draw_flags).
+namespace marked_draw {
+inline constexpr std::uint8_t indexed = 1;
+inline constexpr std::uint8_t indirect = 2;  // arguments from a buffer
+inline constexpr std::uint8_t counted = 4;   // indirect, with a count buffer
+inline constexpr std::uint8_t mesh = 8;      // a mesh-shader dispatch (vkCmdDrawMeshTasks*)
+inline constexpr std::uint8_t quads = 16;    // a quad list, drawn as triangles
+}  // namespace marked_draw
+
+// The render targets a draw writes, for its place in the list: the draws of a list to the same targets, one after the
+// other (other commands between them allowed), are one pass. `key` 0: not known (the legacy indirect path draws in
+// the caller's scope).
+struct MarkedTargets {
+    std::uint64_t key = 0;
+    VkExtent2D area{};
+    std::uint8_t colors = 0;
+    bool depth = false;
+
+    // From the attachment views (null for an unbound slot).
+    template<typename Views>
+    static MarkedTargets of(const Views& colors, VkImageView depth, VkExtent2D area) {
+        MarkedTargets t;
+        t.area = area;
+        std::uint64_t h = 0xcbf29ce484222325ull;
+        const auto mix = [&](VkImageView view) {
+            std::uint64_t v = 0;
+            std::memcpy(&v, &view, sizeof(view) < sizeof(v) ? sizeof(view) : sizeof(v));
+            h = (h ^ v) * 0x100000001b3ull;
+        };
+        for (VkImageView view : colors) {
+            mix(view);
+            if (view) ++t.colors;
+        }
+        mix(depth);
+        t.depth = depth != VK_NULL_HANDLE;
+        t.key = h ? h : 1;
+        return t;
+    }
+};
+
+// What the marker history keeps of each recorded dispatch or draw: enough to name a dispatch that left the report's
+// 64-entry dispatch list, or a draw, which that list does not hold.
+struct MarkedWork {
     std::uint64_t seq = 0;
     std::uint64_t execute_call = 0;
     VkQueue queue = VK_NULL_HANDLE;
     const char* queue_kind = nullptr;
     std::uint32_t list = 0;
     std::uint32_t command = 0;
-    const char* shader = nullptr;  // ShaderLibrary name, valid until device teardown
+    const char* shader = nullptr;  // a dispatch's ShaderLibrary name, valid until device teardown
+    MarkedKind kind = MarkedKind::dispatch;
+    // Draws only.
+    std::uint8_t draw_flags = 0;  // marked_draw
+    std::uint8_t colors = 0;      // bound colour targets
+    bool depth = false;           // a depth/stencil target
+    std::array<const char*, 3> stages{};    // ShaderLibrary names: vertex or mesh, geometry, pixel (CheckpointShaders)
+    std::uintptr_t pipeline = 0;            // the PSO id, named when it has no stage names
+    std::array<std::uint32_t, 3> counts{};  // see describe_marked
+    VkExtent2D area{};
+    std::uint32_t pass_command = 0;  // the list's command where the run of draws to these targets began
+    std::uint32_t pass_draw = 0;     // this draw's place in that run, from 1; 0: not known
+
+    bool is_draw() const { return kind == MarkedKind::draw; }
 };
 
-// The recent dispatches of every queue, oldest first once read. Allocated once, when the markers are on.
+// A graphics pipeline as the GPU profile's lines name it (gpu_profile::label, which the marker test compares): each
+// stage's tag and entry name without its folder, or "pso 0x..." when it has no names.
+inline std::string marked_pipeline_label(const std::array<const char*, 3>& stages, bool mesh, std::uintptr_t id) {
+    static const char* const tags[3] = {"vs", "gs", "ps"};
+    std::string text;
+    for (std::size_t i = 0; i < stages.size(); ++i) {
+        const char* name = stages[i];
+        if (!name) continue;
+        if (const char* slash = std::strrchr(name, '/')) name = slash + 1;
+        if (!text.empty()) text += ' ';
+        text += i == 0 && mesh ? "ms" : tags[i];
+        text += ' ';
+        text += name;
+    }
+    if (text.empty()) {
+        char buffer[48];
+        std::snprintf(buffer, sizeof buffer, "pso 0x%llx", static_cast<unsigned long long>(id));
+        text = buffer;
+    }
+    return text;
+}
+
+// One marked item as the report prints it. A dispatch keeps the fields its likely-hang line always had; a draw says
+// what kind it is with its counts (vertex or index count and instances; a mesh dispatch's group counts; an indirect
+// draw's record count and stride), its pipeline, and its place among the draws to the same targets.
+inline std::string describe_marked(const MarkedWork& w) {
+    char head[192];
+    std::snprintf(head, sizeof head, "seq=%llu execute=%llu queue=%p (%s) list=%u command=%u",
+                  static_cast<unsigned long long>(w.seq), static_cast<unsigned long long>(w.execute_call),
+                  static_cast<void*>(w.queue), w.queue_kind ? w.queue_kind : "?", w.list, w.command);
+    std::string text = head;
+    if (!w.is_draw()) {
+        text += " shader=";
+        text += w.shader ? w.shader : "-";
+        return text;
+    }
+    const std::uint8_t f = w.draw_flags;
+    const bool mesh = (f & marked_draw::mesh) != 0;
+    text += " draw=";
+    text += mesh ? "mesh" : (f & marked_draw::indexed) ? "indexed" : "vertices";
+    if (f & marked_draw::quads) text += "-quads";
+    if (f & marked_draw::indirect) text += (f & marked_draw::counted) ? "-indirect-count" : "-indirect";
+    char counts[96];
+    if (f & marked_draw::indirect)
+        std::snprintf(counts, sizeof counts, " max=%u stride=%u", w.counts[0], w.counts[1]);
+    else if (mesh)
+        std::snprintf(counts, sizeof counts, " groups=%u,%u,%u", w.counts[0], w.counts[1], w.counts[2]);
+    else
+        std::snprintf(counts, sizeof counts, " count=%u instances=%u", w.counts[0], w.counts[1]);
+    text += counts;
+    text += " pipeline=" + marked_pipeline_label(w.stages, mesh, w.pipeline);
+    if (w.pass_draw) {
+        char pass[128];
+        std::snprintf(pass, sizeof pass, " pass=draw %u since command %u (%u colour%s%s, %ux%u)", w.pass_draw,
+                      w.pass_command, unsigned(w.colors), w.colors == 1 ? "" : "s", w.depth ? " + depth" : "",
+                      w.area.width, w.area.height);
+        text += pass;
+    }
+    return text;
+}
+
+// The recent dispatches and draws of every queue, oldest first once read. Allocated once, when the markers are on:
+// 65,536 entries of about 100 bytes (6 MiB), several frames of draws.
 class MarkerHistory {
 public:
-    static constexpr std::size_t capacity = 16384;
+    static constexpr std::size_t capacity = 65536;
 
     MarkerHistory() : entries_(capacity) {}
 
-    void push(const MarkedDispatch& d) { entries_[count_++ % capacity] = d; }
+    void push(const MarkedWork& d) { entries_[count_++ % capacity] = d; }
 
     std::size_t size() const { return count_ < capacity ? count_ : capacity; }
 
@@ -72,7 +201,7 @@ public:
     }
 
 private:
-    std::vector<MarkedDispatch> entries_;
+    std::vector<MarkedWork> entries_;
     std::size_t count_ = 0;
 };
 
@@ -82,7 +211,10 @@ struct MarkerQueueReport {
     const char* queue_kind = nullptr;   // from the history, null when it holds no dispatch of the queue
     std::vector<std::uint64_t> unfinished;  // seqs of this queue in (finished, started], oldest first
     std::uint64_t likely_hang = 0;      // the oldest of them; 0 when none was started and not finished
-    std::uint64_t next_queued = 0;      // idle queue: the oldest submitted dispatch after `finished`, not started yet
+    std::uint64_t next_queued = 0;      // idle queue: the oldest submitted item after `finished`, not started yet
+    std::uint64_t last_finished = 0;    // the history's item whose seq is `finished`; 0 when it holds none
+    std::uint64_t last_started = 0;     // the history's newest item of the queue at or before `started`; 0: none
+    std::uint64_t last_draw = 0;        // the newest draw among them (the last draw the queue started); 0: none
     bool missing = false;               // started > finished but the history no longer holds any of them
 
     bool idle() const { return slot.started == slot.finished; }
@@ -95,9 +227,14 @@ MarkerQueueReport judge_markers(VkQueue queue, MarkerSlot slot, const History& h
     // never behind; a value that says otherwise (memory lost in a reset) is read as an idle queue.
     if (slot.started != slot.finished && !marker_after(slot.started, slot.finished)) slot.started = slot.finished;
     report.slot = slot;
-    history.for_each([&](const MarkedDispatch& d) {
+    history.for_each([&](const MarkedWork& d) {
         if (d.queue != queue) return;
         if (!report.queue_kind) report.queue_kind = d.queue_kind;
+        if (slot.started && !marker_after(d.seq, slot.started)) {
+            report.last_started = d.seq;
+            if (d.is_draw()) report.last_draw = d.seq;
+        }
+        if (slot.finished && std::uint32_t(d.seq) == slot.finished) report.last_finished = d.seq;
         if (!marker_after(d.seq, slot.finished)) return;
         if (!marker_after(d.seq, slot.started)) report.unfinished.push_back(d.seq);
         else if (!report.next_queued) report.next_queued = d.seq;
