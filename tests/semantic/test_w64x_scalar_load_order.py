@@ -83,6 +83,10 @@ def segments(spv):
             cur.append("r")
         elif len(t) >= 2 and t[0] == "OpStore" and t[1] in psb:
             cur.append("w")
+        elif len(t) >= 1 and t[0] == "OpImageWrite":
+            cur.append("w")
+        elif len(t) >= 3 and t[1] == "=" and t[2].startswith(("OpImageSample", "OpImageGather", "OpImageDrefGather")):
+            cur.append("r")
     return out
 
 
@@ -127,6 +131,77 @@ class ScalarLoadOrderTests(unittest.TestCase):
         spv = translate(HEAD + STORE + SLOAD + TAIL, emulate=False)
         self.assertNotIn("%pcv", spv)
         self.assertNotIn("OpControlBarrier", spv)
+
+    def test_image_store_then_image_sample_lz(self):
+        # RAW across image_store -> image_sample_lz must start a new round
+        img_head = ["s_mov_b64 exec, -1", "v_mov_b32_e32 v4, v0", "v_mov_b32_e32 v5, 0",
+                    "v_mov_b32_e32 v2, 1.0", "v_mov_b32_e32 v3, 0"]
+        img_store = ["image_store v2, v[4:5], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm", "s_waitcnt vmcnt(0)"]
+        img_sample = ["image_sample_lz v[6:9], v[4:5], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+                      "s_waitcnt vmcnt(0)"]
+        segs = segments(translate(img_head + img_store + img_sample + ["s_endpgm"]))
+        kinds = [set(a) for a in segs.values() if a]
+        self.assertEqual(kinds, [{"w"}, {"r"}], segs)
+
+    def test_image_sample_lz_then_image_store(self):
+        # WAR across image_sample_lz -> image_store must start a new round
+        img_head = ["s_mov_b64 exec, -1", "v_mov_b32_e32 v4, v0", "v_mov_b32_e32 v5, 0",
+                    "v_mov_b32_e32 v2, 1.0", "v_mov_b32_e32 v3, 0"]
+        img_sample = ["image_sample_lz v[6:9], v[4:5], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+                      "s_waitcnt vmcnt(0)"]
+        img_store = ["image_store v2, v[4:5], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm", "s_waitcnt vmcnt(0)"]
+        segs = segments(translate(img_head + img_sample + img_store + ["s_endpgm"]))
+        kinds = [set(a) for a in segs.values() if a]
+        self.assertEqual(kinds, [{"r"}, {"w"}], segs)
+
+    def test_x_memory_order_mirror_parity_and_ds_nop(self):
+        # Gen.x_memory_order and wave64_emulate_opt._x_memory_order_access must agree on every op class,
+        # including image_sample*, image_gather4*, image_bvh*, and ds_nop.
+        import wave64_emulate_opt
+
+        class _Probe:
+            def __init__(self):
+                self.x_dirty = set()
+                self.barriers = 0
+
+            def x_order_barrier(self):
+                self.barriers += 1
+                self.x_dirty.clear()
+
+        cases = [
+            ("image_sample", ("mem", True, False)),
+            ("image_sample_lz", ("mem", True, False)),
+            ("image_sample_c_lz", ("mem", True, False)),
+            ("image_gather4", ("mem", True, False)),
+            ("image_gather4_c_lz", ("mem", True, False)),
+            ("image_bvh_intersect_ray", ("mem", True, False)),
+            ("image_bvh64_intersect_ray", ("mem", True, False)),
+            ("image_load", ("mem", True, False)),
+            ("image_store", ("mem", False, True)),
+            ("image_atomic_add", ("mem", True, True)),
+            ("buffer_store_dword", ("mem", False, True)),
+            ("s_load_dword", ("mem", True, False)),
+            ("s_buffer_load_dword", ("mem", True, False)),
+            ("ds_nop", None),
+            ("ds_swizzle_b32", None),
+            ("ds_read_b32", ("lds", True, False)),
+            ("ds_write_b32", ("lds", False, True)),
+        ]
+        for op, expected in cases:
+            self.assertEqual(wave64_emulate_opt._x_memory_order_access(op), expected, op)
+            probe = _Probe()
+            rdna2spirv.Gen.x_memory_order(probe, op)
+            if expected is None:
+                self.assertEqual(probe.x_dirty, set(), op)
+            else:
+                kind, reads, writes = expected
+                want = set()
+                if reads:
+                    want.add((kind, "r"))
+                if writes:
+                    want.add((kind, "w"))
+                self.assertEqual(probe.x_dirty, want, op)
+                self.assertEqual(probe.barriers, 0, op)
 
 
 if __name__ == "__main__":
