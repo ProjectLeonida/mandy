@@ -258,6 +258,159 @@ ComPtr<ID3D12Device> native_device(LUID layer_luid) {
     return {};
 }
 
+// A second reserved buffer whose memory type mask is a superset of the first one's (dedicated type | arena type)
+// reuses the first one's dedicated allocation instead of being refused, and an image is refused on the same
+// buffer-only heap. The bits come from the device, never from a constant: a device without both a dedicated and an
+// arena type cannot express the case and skips. Returns 0 when the case holds, 1 on a mismatch, 77 when skipped.
+int mixed_mask(ID3D12Device& device) {
+    const std::uint32_t mask = rt::d3d12::device_sparse_buffer_memory_types(&device);
+    if (!mask || rt::d3d12::device_arena_size(&device) == 0) {
+        std::puts("Mixed mask: device has no sparse buffer residency or no GPU address arena; skipped");
+        return 77;
+    }
+    const auto bit_index = [](std::uint32_t bit) {
+        for (unsigned i = 0; i < 32; ++i) if (bit & (std::uint32_t{1} << i)) return i;
+        return 32u;
+    };
+    const std::uint32_t arena_type = rt::d3d12::device_arena_memory_type(&device);
+    if (arena_type >= 32) {
+        std::puts("Mixed mask: device reports an arena memory type outside a 32-bit mask; skipped");
+        return 77;
+    }
+    const std::uint32_t arena_bit = std::uint32_t{1} << arena_type;
+    std::uint32_t ded_bit = 0;
+    for (unsigned bit = 0; bit < 32; ++bit) {
+        const std::uint32_t candidate = std::uint32_t{1} << bit;
+        if ((mask & candidate) && candidate != arena_bit) { ded_bit = candidate; break; }
+    }
+    if (!ded_bit) {
+        std::puts("Mixed mask: no dedicated sparse buffer memory type besides the arena's; skipped");
+        return 77;
+    }
+    std::printf("Mixed mask: dedicated type %u, arena type %u, device mask %#x, mixed mask %#x\n",
+                unsigned(bit_index(ded_bit)), unsigned(arena_type), unsigned(mask), unsigned(ded_bit | arena_bit));
+
+    ComPtr<ID3D12Resource> a, b, image, upload, readback;
+    const auto reserved = buffer_desc(buffer_bytes);
+    EXPECT(SUCCEEDED(device.CreateReservedResource(&reserved, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&a))));
+    EXPECT(SUCCEEDED(device.CreateReservedResource(&reserved, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&b))));
+    D3D12_HEAP_DESC heap_desc{};
+    heap_desc.SizeInBytes = 2 * tile_bytes;
+    heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap_desc.Properties.CreationNodeMask = heap_desc.Properties.VisibleNodeMask = 1;
+    heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    ComPtr<ID3D12Heap> heap;
+    EXPECT(SUCCEEDED(device.CreateHeap(&heap_desc, IID_PPV_ARGS(&heap))));
+    D3D12_HEAP_PROPERTIES upload_heap = heap_desc.Properties, readback_heap = heap_desc.Properties;
+    upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
+    const auto source_desc = buffer_desc(tile_bytes);
+    const auto target_desc = buffer_desc(2 * tile_bytes);
+    EXPECT(SUCCEEDED(device.CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &source_desc,
+                                                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload))));
+    EXPECT(SUCCEEDED(device.CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &target_desc,
+                                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback))));
+    constexpr auto words_per_tile = std::size_t(tile_bytes / sizeof(std::uint32_t));
+    const D3D12_RANGE empty{0, 0};
+    void* mapped = nullptr;
+    EXPECT(SUCCEEDED(upload->Map(0, &empty, &mapped)));
+    std::fill_n(static_cast<std::uint32_t*>(mapped), words_per_tile, patterns[0]);
+    upload->Unmap(0, nullptr);
+
+    ComPtr<ID3D12Fence> gate, done;
+    EXPECT(SUCCEEDED(device.CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate))));
+    EXPECT(SUCCEEDED(device.CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done))));
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    EXPECT(SUCCEEDED(device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))));
+    EXPECT(SUCCEEDED(device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                              IID_PPV_ARGS(&list))));
+    ComPtr<ID3D12CommandQueue> queue;
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    EXPECT(SUCCEEDED(device.CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue))));
+    Event event;
+    EXPECT(event.handle);
+    Gate open_on_exit{gate.Get()};
+    EXPECT(SUCCEEDED(queue->Wait(gate.Get(), 1)));
+
+    const D3D12_TILED_RESOURCE_COORDINATE origin{};
+    const D3D12_TILE_REGION_SIZE one{1, FALSE, 0, 0, 0};
+    const UINT offsets[] = {0, 1}, counts[] = {1, 1};
+    // A takes the dedicated allocation. B's mask is the mixed one (dedicated | arena), a superset of A's, so the
+    // reuse rule must hand B the same allocation rather than refuse it.
+    queue->UpdateTileMappings(a.Get(), 1, &origin, &one, heap.Get(), 1, nullptr, offsets, counts,
+                              D3D12_TILE_MAPPING_FLAG_NONE);
+    EXPECT(SUCCEEDED(device.GetDeviceRemovedReason()));
+    queue->UpdateTileMappings(b.Get(), 1, &origin, &one, heap.Get(), 1, nullptr, offsets + 1, counts + 1,
+                              D3D12_TILE_MAPPING_FLAG_NONE);
+    EXPECT(SUCCEEDED(device.GetDeviceRemovedReason()));
+
+    const auto submit = [&](UINT value) {
+        if (FAILED(list->Close())) return false;
+        ID3D12CommandList* batch[] = {list.Get()};
+        queue->ExecuteCommandLists(1, batch);
+        if (FAILED(queue->Signal(done.Get(), value))) return false;
+        // The list is single-use: reopen it for the next round.
+        return SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.Get(), nullptr));
+    };
+    const auto wait = [&](UINT value) {
+        return SUCCEEDED(done->SetEventOnCompletion(value, event.handle)) &&
+               WaitForSingleObject(event.handle, 15000) == WAIT_OBJECT_0;
+    };
+
+    // B's tile must read A's pattern: the reuse happened, the update was not refused.
+    list->CopyTiles(b.Get(), &origin, &one, readback.Get(), 0,
+                    D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+    EXPECT(submit(1));
+    EXPECT(wait(1));
+    std::uint32_t first = 0;
+    EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+    first = *static_cast<const std::uint32_t*>(mapped);
+    readback->Unmap(0, &empty);
+    if (first != patterns[0]) {
+        std::fprintf(stderr, "Mixed mask: buffer B tile reads %#010x, want the reused allocation's %#010x\n",
+                     unsigned(first), unsigned(patterns[0]));
+        return 1;
+    }
+
+    // A texture on the same buffer-only heap is refused (its backing is separate), and the refusal must leave B's
+    // tile untouched. A disjoint buffer mask is not constructible through the public API: the driver reports one
+    // memory type mask per buffer desc, so the image is the reachable incompatible case.
+    D3D12_RESOURCE_DESC texture_desc{};
+    texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture_desc.Width = texture_desc.Height = 1;
+    texture_desc.DepthOrArraySize = texture_desc.MipLevels = 1;
+    texture_desc.SampleDesc.Count = 1;
+    texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (SUCCEEDED(device.CreateReservedResource(&texture_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                IID_PPV_ARGS(&image)))) {
+        queue->UpdateTileMappings(image.Get(), 1, &origin, &one, heap.Get(), 1, nullptr, offsets + 1, counts + 1,
+                                  D3D12_TILE_MAPPING_FLAG_NONE);
+        EXPECT(SUCCEEDED(device.GetDeviceRemovedReason()));
+        list->CopyTiles(b.Get(), &origin, &one, readback.Get(), tile_bytes,
+                        D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+        EXPECT(submit(2));
+        EXPECT(wait(2));
+        std::uint32_t second = 0;
+        EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+        second = static_cast<const std::uint32_t*>(mapped)[tile_bytes / sizeof(std::uint32_t)];
+        readback->Unmap(0, &empty);
+        if (second != patterns[0]) {
+            std::fprintf(stderr, "Mixed mask: an image changed buffer B's tile to %#010x, want %#010x\n",
+                         unsigned(second), unsigned(patterns[0]));
+            return 1;
+        }
+        std::puts("Mixed mask: an image on the buffer-only heap was refused and B's tile is unchanged");
+    } else {
+        std::puts("Mixed mask: device cannot create a reserved texture; image separation skipped");
+    }
+    EXPECT(SUCCEEDED(gate->Signal(1)));
+    open_on_exit.fence = nullptr;
+    std::puts("Mixed mask: a mixed dedicated|arena mask reused the dedicated allocation");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -271,7 +424,9 @@ int main() {
         std::puts("Vulkan device lacks sparse buffer residency with aliasing and strict unbound reads");
         return 77;
     }
-    Results observed{}, native{};
+    const int mixed = mixed_mask(*vulkan.Get());
+    if (mixed == 1) return 1;
+    Results observed{};
     if (!run(*vulkan.Get(), observed, true)) return 1;
     std::puts("Vulkan replay: 12 full tiles matched across aliased, skipped, unmapped, reused and remapped ranges");
     std::puts("A rejected update left all tile mappings intact");

@@ -21571,6 +21571,21 @@ bool device_sparse_buffer_tiles(ID3D12Device* device) {
     return d && d->state().sparse_buffer_memory_types != 0;
 }
 
+std::uint32_t device_sparse_buffer_memory_types(ID3D12Device* device) {
+    const Device* d = Device::from<Device>(device);
+    return d ? d->state().sparse_buffer_memory_types : 0;
+}
+
+std::uint32_t device_arena_memory_type(ID3D12Device* device) {
+    if (!device) return 0;
+    // The same proxy step device_arena_size() takes: a caller that reached the device through a proxy passes the
+    // proxy, and the state lives on the real device behind it.
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    const Device* d = Device::from<Device>(real);
+    return d && d->state().arena.size ? d->state().arena.memory_type : 0;
+}
+
 std::uint64_t device_arena_size(ID3D12Device* device) {
     if (!device) return 0;
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
