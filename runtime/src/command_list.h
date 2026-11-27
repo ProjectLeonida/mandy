@@ -462,6 +462,7 @@ struct Draw {
     std::uint32_t first_instance = 0;
     bool mesh = false;
     std::shared_ptr<const DrawViewports> viewports;  // non-null when >1 viewport or >1 scissor was bound
+    std::array<float, 2> depth_bounds{0, 1};  // OMSetDepthBounds (min, max); used by depth-bounds pipelines only
 };
 
 // Only indirect draws allocate this extra payload. Copies of the IR share both its
@@ -545,8 +546,8 @@ struct UavView {
     std::uint64_t size;          // buffer: bytes in the view
     std::uint32_t element_size;  // buffer: bytes an element (rects count elements), 4 for a raw view
     std::uint32_t mip;           // texture
-    std::uint32_t first_layer;
-    std::uint32_t layer_count;
+    std::uint32_t first_layer;   // 1D/2D array: first slice; 3D volume: FirstWSlice
+    std::uint32_t layer_count;   // 1D/2D array: slice count; 3D volume: WSize
     bool exact_clear_format = false; // newly exposed 1D/3D UAVs: do not clear via a different backing format
 };
 
