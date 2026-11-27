@@ -85,7 +85,8 @@ void main() {
         const uint bytes_per_record = mode < 2u ? max(stride, 1u) : 1u;
         const uint byte_off = (indexed ? 0u : pc.s[4]) + i * 4u;
         if (byte_off <= 0xfffffffcu && (byte_off + 3u) / bytes_per_record < num_records) {
-            Words cbv = at(uvec2(table.w[word], table.w[word + 1u] & 0xFFFFu));
+            // V# bases are signed 48-bit offsets from heap_base, as the translator reads them.
+            Words cbv = at(uvec2(table.w[word], uint(int(table.w[word + 1u] << 16u) >> 16)));
             result.w[i] = cbv.w[byte_off >> 2u];
         } else {
             result.w[i] = 0u;
@@ -97,7 +98,7 @@ void main() {
         const uint stride = (table.w[1] >> 16u) & 0x3FFFu;
         const uint num_records = table.w[2];
         const uint oob_select = (table.w[3] >> 28u) & 3u;
-        const uvec2 base = uvec2(table.w[0], table.w[1] & 0xFFFFu);
+        const uvec2 base = uvec2(table.w[0], uint(int(table.w[1] << 16u) >> 16));  // signed 48-bit offset
         if (oob_select == 3u) {
             const uint byte_off = pc.s[4] + i * 4u;
             result.w[i] = (byte_off + 4u <= num_records) ? at(base).w[byte_off >> 2u] : 0u;

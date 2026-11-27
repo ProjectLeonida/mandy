@@ -13,6 +13,7 @@
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../src/title_page_watch.h"
+#include "../src/title_geometry_watch.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/deferred_image_binding.h"
 #include <dxgi1_4.h>
@@ -922,6 +923,167 @@ int check_aliased_write(ID3D12Device* device) {
     return 0;
 }
 
+// The same page, guarded at both addresses instead of copied at every submission. With the other address known (what
+// xmem answers through leonida::geometry_writes::aliases), the shadow at A arms the geometry watch's cells of the
+// aliased 64 KiB at A and at B: both read-only between submissions, and a submission that follows no write copies
+// nothing of it. The control: a write through a third view nobody reported doesn't fault, so it stays stale until a
+// write through B (which faults) marks the block; then both arrive. Each view commits its pages itself: Wine shows a
+// page of a SEC_RESERVE view as committed only in the view that committed it.
+std::uintptr_t g_alias_a, g_alias_b;
+void aliases_of_test_views(std::uintptr_t va, std::vector<std::uintptr_t>& others) {
+    if (va >= g_alias_a && va < g_alias_a + 4 * 0x10000) others.push_back(va - g_alias_a + g_alias_b);
+    if (va >= g_alias_b && va < g_alias_b + 4 * 0x10000) others.push_back(va - g_alias_b + g_alias_a);
+}
+
+int check_aliased_guard(ID3D12Device* device) {
+    const char* who = "vulkan slot-133 aliased page, guarded";
+    constexpr SIZE_T size = 4 * 0x10000;
+    constexpr UINT64 committed = size / 2, block = 0x10000, at = 0x11000;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0, DWORD(size),
+                                        nullptr);
+    EXPECT(section != nullptr);
+    std::uint8_t* views[3]{};
+    for (auto& view : views) {
+        view = static_cast<std::uint8_t*>(MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size));
+        EXPECT(view != nullptr && VirtualAlloc(view, committed, MEM_COMMIT, PAGE_READWRITE) == view);
+    }
+    std::uint8_t *a = views[0], *b = views[1], *c = views[2];
+    g_alias_a = reinterpret_cast<std::uintptr_t>(a);
+    g_alias_b = reinterpret_cast<std::uintptr_t>(b);
+    leonida::geometry_writes::aliases.store(&aliases_of_test_views, std::memory_order_release);
+    leonida::title_page_aliases::set(g_alias_a + block, true);
+    leonida::title_page_aliases::set(g_alias_b + block, true);
+    long long unreported = -1, faulted = -1;
+    DWORD at_a = 0, at_b = 0, b_written = 0;
+    {
+        Ref<ID3D12Resource> buffer;
+        buffer.p = place_shadow(device, a, size);
+        EXPECT(buffer.p != nullptr);
+        GpuReader reader;
+        if (reader.init(device, size)) return 1;
+        std::vector<std::uint8_t> want(size, 0), got;
+        for (UINT64 i = 0; i < committed; ++i) want[i] = a[i] = pattern_byte(i, 23);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(first_difference(got, want) == -1);
+        at_a = protection_of(a + at);
+        at_b = protection_of(b + at);
+        EXPECT((at_a & 0xff) == PAGE_READONLY);
+        EXPECT((at_b & 0xff) == PAGE_READONLY);
+        // Nothing written: the block is not copied, so a write the cells can't see is not either.
+        for (UINT64 i = at; i < at + 64; ++i) want[i] = c[i] = 0x5a;
+        EXPECT(reader.read(buffer.p, got) == 0);
+        unreported = first_difference(got, want);
+        // Through B: faults, and the block is copied again (the write through C with it).
+        for (UINT64 i = at + 0x800; i < at + 0x1000; ++i) want[i] = b[i] = pattern_byte(i, 151);
+        b_written = protection_of(b + at);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        faulted = first_difference(got, want);
+        EXPECT((protection_of(b + at) & 0xff) == PAGE_READONLY);
+        // Through A, the shadow's own address.
+        for (UINT64 i = at; i < at + 16; ++i) want[i] = a[i] = 0xc3;
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(first_difference(got, want) == -1);
+    }
+    // Released: both addresses are writable again.
+    EXPECT((protection_of(a + at) & 0xff) == PAGE_READWRITE);
+    EXPECT((protection_of(b + at) & 0xff) == PAGE_READWRITE);
+    leonida::title_page_aliases::set(g_alias_a + block, false);
+    leonida::title_page_aliases::set(g_alias_b + block, false);
+    leonida::geometry_writes::aliases.store(nullptr, std::memory_order_release);
+    for (auto* view : views) UnmapViewOfFile(view);
+    CloseHandle(section);
+    std::printf("%s: protection between submissions 0x%lx at A, 0x%lx at B (0x%lx after the write through B); an "
+                "unreported view's write: first stale byte at %lld (expected 69632); after a write through B: %s\n",
+                who, at_a, at_b, b_written, unreported, faulted == -1 ? "arrives" : "STILL STALE");
+    EXPECT(unreported == static_cast<long long>(at));
+    EXPECT((b_written & 0xff) == PAGE_READWRITE);
+    EXPECT(faulted == -1);
+    return 0;
+}
+
+// An alias that appears after the cells were armed. The page is mapped at A and B and guarded at both; then xmem maps
+// it at C too and, as note_mapping does once the peers are updated, moves the mapping of the cells at every address.
+// The next submission asks for the other addresses again and guards C as well, so a write through C faults and is
+// copied at the submission after it.
+std::uintptr_t g_alias_c;
+void aliases_of_late_views(std::uintptr_t va, std::vector<std::uintptr_t>& others) {
+    const std::uintptr_t views[3] = {g_alias_a, g_alias_b, g_alias_c};
+    for (const std::uintptr_t from : views) {
+        if (!from || va < from || va >= from + 4 * 0x10000) continue;
+        for (const std::uintptr_t to : views)
+            if (to && to != from) others.push_back(va - from + to);
+    }
+}
+
+int check_aliased_guard_late_peer(ID3D12Device* device) {
+    const char* who = "vulkan slot-133 aliased page, guarded, alias added later";
+    constexpr SIZE_T size = 4 * 0x10000;
+    constexpr UINT64 committed = size / 2, block = 0x10000, at = 0x11000;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0, DWORD(size),
+                                        nullptr);
+    EXPECT(section != nullptr);
+    std::uint8_t* views[3]{};
+    for (auto& view : views) {
+        view = static_cast<std::uint8_t*>(MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size));
+        EXPECT(view != nullptr && VirtualAlloc(view, committed, MEM_COMMIT, PAGE_READWRITE) == view);
+    }
+    std::uint8_t *a = views[0], *b = views[1], *c = views[2];
+    g_alias_a = reinterpret_cast<std::uintptr_t>(a);
+    g_alias_b = reinterpret_cast<std::uintptr_t>(b);
+    g_alias_c = 0;  // not mapped there yet, as far as xmem knows
+    leonida::geometry_writes::aliases.store(&aliases_of_late_views, std::memory_order_release);
+    leonida::title_page_aliases::set(g_alias_a + block, true);
+    leonida::title_page_aliases::set(g_alias_b + block, true);
+    DWORD c_before = 0, c_armed = 0, c_written = 0;
+    long long late = -1;
+    {
+        Ref<ID3D12Resource> buffer;
+        buffer.p = place_shadow(device, a, size);
+        EXPECT(buffer.p != nullptr);
+        GpuReader reader;
+        if (reader.init(device, size)) return 1;
+        std::vector<std::uint8_t> want(size, 0), got;
+        for (UINT64 i = 0; i < committed; ++i) want[i] = a[i] = pattern_byte(i, 41);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(first_difference(got, want) == -1);
+        EXPECT((protection_of(a + at) & 0xff) == PAGE_READONLY);
+        EXPECT((protection_of(b + at) & 0xff) == PAGE_READONLY);
+        c_before = protection_of(c + at);
+        // Mapped at C now: the peers first, then the cells' mapping at every address (xmem's note_mapping).
+        g_alias_c = reinterpret_cast<std::uintptr_t>(c);
+        leonida::title_page_aliases::set(g_alias_c + block, true);
+        namespace watch = leonida::geometry_writes;
+        for (const std::uintptr_t view : {g_alias_a, g_alias_b, g_alias_c})
+            watch::notify(view + block, view + 2 * block, watch::Event::mapping);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(first_difference(got, want) == -1);
+        c_armed = protection_of(c + at);
+        // Through C: faults, and the block is copied at the next submission.
+        for (UINT64 i = at + 0x400; i < at + 0xc00; ++i) want[i] = c[i] = pattern_byte(i, 97);
+        c_written = protection_of(c + at);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        late = first_difference(got, want);
+    }
+    EXPECT((protection_of(a + at) & 0xff) == PAGE_READWRITE);
+    EXPECT((protection_of(b + at) & 0xff) == PAGE_READWRITE);
+    EXPECT((protection_of(c + at) & 0xff) == PAGE_READWRITE);
+    leonida::title_page_aliases::set(g_alias_a + block, false);
+    leonida::title_page_aliases::set(g_alias_b + block, false);
+    leonida::title_page_aliases::set(g_alias_c + block, false);
+    leonida::geometry_writes::aliases.store(nullptr, std::memory_order_release);
+    g_alias_c = 0;
+    for (auto* view : views) UnmapViewOfFile(view);
+    CloseHandle(section);
+    std::printf("%s: protection at C 0x%lx before it was reported, 0x%lx after (0x%lx after the write through C); "
+                "the write through C: %s\n",
+                who, c_before, c_armed, c_written, late == -1 ? "arrives" : "STILL STALE");
+    EXPECT((c_before & 0xff) == PAGE_READWRITE);
+    EXPECT((c_armed & 0xff) == PAGE_READONLY);
+    EXPECT((c_written & 0xff) == PAGE_READWRITE);
+    EXPECT(late == -1);
+    return 0;
+}
+
 // Kernel writes into a watched page. ReadFile writes from kernel mode, so a page a shadow made read-only fails it
 // with ERROR_NOACCESS instead of faulting into the layer: the plain call fails (the control). Through the file shims'
 // path (leonida::kernel_writes::read_file, what the title's ReadFile import resolves to), the destination is pinned
@@ -1494,6 +1656,130 @@ int check_placed_view_map_changes(ID3D12Device* device) {
     return 0;
 }
 
+// A shader view of `texture`, as a draw would name it: a title texture is filled from its memory only once a
+// descriptor names it (the refresh's upload at first use). `heap` holds the descriptor; the caller keeps it.
+int name_texture(ID3D12Device* device, ID3D12Resource* texture, Ref<ID3D12DescriptorHeap>& heap) {
+    const char* who = "naming a title texture";
+    D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    EXPECT_HR(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap.p)), S_OK);
+    device->CreateShaderResourceView(texture, nullptr, heap->GetCPUDescriptorHandleForHeapStart());
+    return 0;
+}
+
+// A texture over the memory of a GPU-written texture (a render target placed at the same title pages) is not filled
+// from those pages: they hold what the CPU last wrote there, not what the GPU rendered, and an upload of them (in
+// 64 KiB pieces, as write-backs and neighbours' writes marked tiles written) showed blocks of older frames.
+int check_texture_over_render_target(ID3D12Device* device) {
+    const char* who = "texture over a render target's memory";
+    constexpr SIZE_T bytes = 4 * 65536;
+    void* pages = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    EXPECT(pages);
+    std::memset(pages, 0x11, bytes);
+    GpuReader gpu;
+    EXPECT(!gpu.init(device, 256));
+    D3D12_RESOURCE_DESC target{};
+    target.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    target.Width = 256;
+    target.Height = 256;
+    target.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    target.SampleDesc.Count = target.DepthOrArraySize = target.MipLevels = 1;
+    target.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    Ref<ID3D12Resource> rendered;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, target, 6, IID_PPV_ARGS(&rendered.p)), S_OK);
+    // A plain texture over the target's second 64 KiB, laid out linearly (the title's XG computer for its shape).
+    constexpr UINT width = 256, height = 256;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.Format = DXGI_FORMAT_R8_UNORM;
+    desc.SampleDesc.Count = desc.DepthOrArraySize = desc.MipLevels = 1;
+    leonida::title_xg_layouts::note({UINT(desc.Dimension), UINT(desc.Format), height, 1, 1, width}, 1);
+    auto* over = static_cast<std::uint8_t*>(pages) + 65536;
+    Ref<ID3D12Resource> texture;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, over, desc, 6, IID_PPV_ARGS(&texture.p)), S_OK);
+    void* mapped = nullptr;
+    EXPECT_HR(texture->Map(0, nullptr, &mapped), S_OK);
+    Ref<ID3D12DescriptorHeap> named;
+    EXPECT(!name_texture(device, texture.p, named));
+    ID3D12CommandList* lists[]{gpu.list.p};
+    std::array<std::uint8_t, width * height> pixels{};
+    for (unsigned pass = 1; pass <= 2; ++pass) {
+        std::memset(over, 0x40 + pass, 65536);  // a CPU write (a write-back of a GPU copy, say) of one 64 KiB piece
+        gpu.queue->ExecuteCommandLists(1, lists);
+        EXPECT_HR(gpu.queue->Signal(gpu.fence.p, pass), S_OK);
+        EXPECT_HR(gpu.fence->SetEventOnCompletion(pass, gpu.done), S_OK);
+        EXPECT(WaitForSingleObject(gpu.done, 30000) == WAIT_OBJECT_0);
+        EXPECT_HR(texture->ReadFromSubresource(pixels.data(), width, UINT(pixels.size()), 0, nullptr), S_OK);
+        EXPECT(std::none_of(pixels.begin(), pixels.end(), [&](auto value) { return value == 0x40 + pass; }));
+    }
+    texture->Unmap(0, nullptr);
+    texture.p->Release();
+    texture.p = nullptr;
+    rendered.p->Release();
+    rendered.p = nullptr;
+    VirtualFree(pages, 0, MEM_RELEASE);
+    return 0;
+}
+
+// A plain texture and a render target at one address, in either order: a slot-70 view of the plain texture's
+// description is a view of the render target's image (what the GPU renders there), and once the target is gone, of
+// the plain texture's own image again.
+int check_view_over_render_target(ID3D12Device* device) {
+    const char* who = "view over a render target";
+    if (!rt::d3d12::bindless_set_layout(device)) return 0;
+    constexpr SIZE_T bytes = 4 * 65536;
+    D3D12_RESOURCE_DESC plain{};
+    plain.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    plain.Width = 256;
+    plain.Height = 256;
+    plain.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    plain.SampleDesc.Count = plain.DepthOrArraySize = plain.MipLevels = 1;
+    D3D12_RESOURCE_DESC target = plain;
+    target.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const auto view = [&](void* pages, const D3D12_RESOURCE_DESC& desc, std::uint64_t& image) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = desc.Format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        std::array<UINT, 14> resource{};
+        std::array<UINT, 16> words{};
+        std::memcpy(resource.data(), &desc, sizeof(desc));
+        std::memcpy(words.data(), &srv, sizeof(srv));
+        leonida::gfx10::ImageWords slot{};
+        if (!rt::d3d12::write_placed_texture_view(device, false, resource.data(), words.data(),
+                                                  reinterpret_cast<UINT64>(pages), {reinterpret_cast<SIZE_T>(slot.data())}))
+            return false;
+        leonida::gfx10::Image decoded{};
+        if (!leonida::gfx10::decode(slot, decoded)) return false;
+        image = decoded.address;
+        return true;
+    };
+    for (const bool target_first : {false, true}) {
+        void* pages = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        EXPECT(pages);
+        Ref<ID3D12Resource> texture, rendered;
+        if (target_first)
+            EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, target, 6, IID_PPV_ARGS(&rendered.p)), S_OK);
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, plain, 6, IID_PPV_ARGS(&texture.p)), S_OK);
+        if (!target_first)
+            EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, target, 6, IID_PPV_ARGS(&rendered.p)), S_OK);
+        std::uint64_t of_plain = 0, of_target = 0;
+        EXPECT(view(pages, target, of_target));
+        EXPECT(view(pages, plain, of_plain));
+        EXPECT(of_plain == of_target);  // the plain texture's view shows the target's image
+        rendered.p->Release();
+        rendered.p = nullptr;
+        EXPECT(view(pages, plain, of_plain));
+        EXPECT(of_plain != of_target);  // the target is gone: the plain texture's own image again
+        texture.p->Release();
+        texture.p = nullptr;
+        VirtualFree(pages, 0, MEM_RELEASE);
+    }
+    return 0;
+}
+
 // A persistent Map can become readable without notifying xmem or calling Map a second time.
 int check_mapped_plane(ID3D12Device* device) {
     const char* who = "persistent slot-133 plane";
@@ -1513,6 +1799,8 @@ int check_mapped_plane(ID3D12Device* device) {
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 6, IID_PPV_ARGS(&texture.p)), S_OK);
     void* mapped = nullptr;
     EXPECT_HR(texture->Map(0, nullptr, &mapped), S_OK);
+    Ref<ID3D12DescriptorHeap> named;  // filled from memory once a descriptor names it
+    EXPECT(!name_texture(device, texture.p, named));
     EXPECT(mapped == pages);
     ID3D12CommandList* lists[]{gpu.list.p};
     std::array<std::uint8_t, size> pixels{};
@@ -1537,9 +1825,8 @@ int check_mapped_plane(ID3D12Device* device) {
     return 0;
 }
 
-// LEONIDA_TEXTURE_REFRESH_ASYNC=1 (the d3d12_mapped_plane_async test): a texture the title maps and writes, and then
-// reads on the GPU in its very first submission, has its bytes there, though the refresh pass runs on a worker: the
-// submission fills a mapped texture that was never filled before it records anything (fill_first_mapped_textures).
+// The d3d12_mapped_plane_async test (named for the refresh mode it was written for, removed since): a texture the title
+// maps and writes, and then reads on the GPU in its very first submission, has its bytes there.
 int check_mapped_plane_first_use(ID3D12Device* device) {
     const char* who = "persistent slot-133 plane, first use";
     constexpr UINT width = 256, height = 8, size = width * height;
@@ -1560,6 +1847,8 @@ int check_mapped_plane_first_use(ID3D12Device* device) {
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 6, IID_PPV_ARGS(&texture.p)), S_OK);
     void* mapped = nullptr;
     EXPECT_HR(texture->Map(0, nullptr, &mapped), S_OK);
+    Ref<ID3D12DescriptorHeap> named;  // filled from memory once a descriptor names it
+    EXPECT(!name_texture(device, texture.p, named));
     EXPECT(mapped == pages);
     EXPECT_HR(gpu.allocator->Reset(), S_OK);
     EXPECT_HR(gpu.list->Reset(gpu.allocator.p, nullptr), S_OK);
@@ -2095,6 +2384,8 @@ int check_written_pages_all(ID3D12Device* device) {
     failures += check_concurrent_writes(device, false);
     if (leonida::title_write_watch::enabled()) failures += check_concurrent_writes(device, true);
     failures += check_aliased_write(device);
+    failures += check_aliased_guard(device);
+    failures += check_aliased_guard_late_peer(device);
     failures += check_kernel_write(device);
     failures += check_shared_pages(device);
     return failures;
@@ -2132,6 +2423,8 @@ int check_mapped_bc_array(ID3D12Device* device) {
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 6, IID_PPV_ARGS(&texture.p)), S_OK);
     void* mapped = nullptr;
     EXPECT_HR(texture->Map(0, nullptr, &mapped), S_OK);
+    Ref<ID3D12DescriptorHeap> named;  // filled from memory once a descriptor names it
+    EXPECT(!name_texture(device, texture.p, named));
     EXPECT(mapped == pages);
     std::vector<std::uint64_t> columns;
     std::vector<std::vector<std::uint8_t>> patterns(x.mips * x.depth_or_array);
@@ -2179,9 +2472,6 @@ int main(int argc, char** argv) {
     const bool prefix_only = argc == 2 && std::strcmp(argv[1], "--host-prefix-only") == 0;
     const bool async_plane = argc == 2 && std::strcmp(argv[1], "--mapped-plane-async") == 0;
     if (argc != 1 && !prefix_only && !async_plane) return 2;
-    if (async_plane) _putenv_s("LEONIDA_TEXTURE_REFRESH_ASYNC", "1");  // read once, at the device's first refresh
-    _putenv_s("LEONIDA_TITLE_TEXTURE_PERIOD_MS", "0");
-    _putenv_s("LEONIDA_TITLE_TEXTURE_CHECK_KB", "0");
     vktest::Device vk;
     const auto status = vk.initialize();
     if (status == vktest::DeviceStatus::unavailable) return 77;
@@ -2227,6 +2517,8 @@ int main(int argc, char** argv) {
             failures += check_placed_view_map_changes(ours.p);
             failures += check_shared_bc_placements(ours.p);
             failures += check_mapped_plane(ours.p);
+            failures += check_texture_over_render_target(ours.p);
+            failures += check_view_over_render_target(ours.p);
             failures += check_mapped_bc_array(ours.p);
         }
         {

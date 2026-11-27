@@ -886,7 +886,42 @@ The compute path, end to end:
   D3D-448); the compute bind point uses it.
 - **GPU address arena** (section 3.3, when the device has `bufferDeviceAddress`): one host-visible,
   device-addressable buffer, 256 MiB by default (`LEONIDA_ARENA_MB`, at most 4095 MiB, so every VA fits 32-bit
-  table pointers).
+  table pointers). `LEONIDA_ARENA_MB` bounds the address range; with sparse binding it is not memory.
+  - **Backing blocks** (`runtime/src/arena_backing.h`). Where the device has `sparseBinding`,
+    `sparseResidencyBuffer`, `residencyNonResidentStrict`, a sparse address space at least as large as the arena and
+    a queue with the sparse binding bit to spare (`pick_arena_bind_queue`: RADV's sparse-only family), the arena is a
+    sparse buffer and its memory comes in units bound in 2 MiB blocks: a block is bound when the first allocation
+    needs it, before the allocation is handed out, and unbound once its last allocation is released and the GPU has
+    passed the retire ticket of the release (`submitted_retire_ticket() + 1`, checked at the start of every
+    `ExecuteCommandLists` against `completed_retire_ticket()`), then its memory is freed. Binds go to that queue alone
+    and are waited for there, so a bind never sits behind a submission that waits for a fence the CPU signals later.
+  - **Only with signed V# offsets.** A driver can place a sparse buffer anywhere relative to ordinary ones: RADV
+    (Mesa 26.3.1, natively and under Wine) gives sparse buffers a range of their own 64 TiB above them
+    (0xffffc00100200000 against 0xffff800100010000), so with a sparse arena every buffer outside it (geometry copies,
+    title windows and shadows outside it, upload buffers) lies below heap_base, at a negative offset. A shader that
+    sign-extends a V#'s 48-bit base (docs/design.md, "Heap-relative buffer device addresses") reaches it, since RADV
+    hands out addresses from one 2^47 half of the 48-bit space, so any two lie within 2^47 of each other. One that
+    zero-extends does not. The device counts each loaded module's `vsharp_base_sign_extended` marker
+    (`VsharpBaseCensus`, `runtime/src/shader_library.h`) and logs
+    `V# bases: signed offsets from heap_base (N of N modules sign-extend)`. The arena is sparse only when every module
+    sign-extends (or `LEONIDA_IMPORT_BELOW_ARENA=1` says to read bases signed). With older modules it stays one
+    allocation and one line says why. `TitleBufferWindows::shader_reachable` checks every block made outside the
+    arena against the same range when it is made, and a block it refuses is logged with both addresses.
+    `d3d12_title_va_game_device` and `d3d12_geometry_views_game_device` run the title-memory tests on the device the
+    game makes (with the bind queue), so on RADV their windows and geometry copies are read through negative offsets.
+  - No allocation crosses a unit: one no larger than a block stays inside one block, a larger one takes whole blocks
+    of its own. So each allocation is one run of one mapping, and the CPU reaches an arena offset through
+    `DeviceState::arena_host()` (one table read; null, with a line, for a range without memory), or
+    `ArenaBacking::with_host()` for an offset the caller does not hold (value writes, `read_arena`). A D3D12 heap in the
+    arena lends its unit's memory to reserved resources' tiles at the heap's place in that unit.
+  - The block size is measured, not tuned: a world run had about 5,000 live arena allocations averaging 160 KiB
+    (790 MiB live, 990 MiB peak end, 4,095 MiB asked). 2 MiB is a multiple of the 64 KiB sparse page, keeps a 4 GiB
+    arena within the 4,096 memory objects some Windows drivers allow (2,048 at most, about 500 at that peak), and is
+    amdgpu's large page.
+  - Without those capabilities (llvmpipe: a 2 GiB sparse address space and one queue) one allocation backs the whole
+    arena, as before, through the same accessors. `arena_backing_test` (CPU) and `arena_sparse_gpu_test` (a real
+    device; skipped without sparse binding) check both. The arena's line at device release (and with a console
+    heap's log) reads `GPU address arena: bound N MiB now (peak P, U units of 2 MiB blocks, sparse)`.
   - It is also no larger than the device's `maxBufferSize` (Vulkan 1.3) and, counting the buffer's memory
     requirement, `maxMemoryAllocationSize` (Vulkan 1.1), whichever is smaller (`runtime/src/arena_size.h`). When a
     limit cuts the request, one log line names the limit and the size used. `arena_size_test` (CPU) checks the
@@ -1710,7 +1745,9 @@ The copies:
   (so dirty-page tracking for that refresh applies to both). Windows stay until the device goes, up to
   `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default). A window that
   cannot fit between the title's address reservations can use a separate mapped buffer. The buffer's device address
-  must fit as a positive 47-bit offset from the arena base. The same window cap and dirty-page refresh apply.
+  must lie within reach of a V# base from the arena base: a positive offset below 2^47, or, when every loaded shader
+  sign-extends the base, anywhere within 2^47 on either side (`TitleBufferWindows::shader_reachable`). The same
+  window cap and dirty-page refresh apply.
   `LEONIDA_STREAM_BUFFER_WINDOWS=0` requires the window to fit in the arena.
 - **What the GPU wrote goes back.** The same return copy serves slot-133 shadows (a buffer the driver would not
   import, a compute result the title reads again): the ranges are recorded through the alias of the buffer's pages and
@@ -1718,9 +1755,12 @@ The copies:
   the copy and the title would never see it ([#1537](https://github.com/ubiquitarianism/leonida/issues/1537), the
   `WRITE_INVALID` stop at the world start). Every title range a submission's bindings reach is kept, and the next
   refresh copies those ranges from the copy to the title's pages *before* it copies the pages forward, so a page the
-  title itself wrote in between keeps the title's newer bytes and its GPU result is dropped. Up to 8,192 ranges and
-  64 MiB a submission (a V# has no read/write bit, so a read-only view costs a copy too; past the caps the ranges are
-  left behind, logged once). `LEONIDA_TITLE_WRITEBACK=0` turns it off. A batch is fenced: it is kept with the ticket
+  title itself wrote in between keeps the title's newer bytes and its GPU result is dropped. The copy back asks the
+  write watch first (the refresh's own asking comes after it, so a hot page's last answer is a submission old), passes
+  over pages whose mapping changed, that a kernel write may be filling or that xmem maps at another address too, and
+  writes only the 256-byte pieces where the copy differs from the title's bytes: a read-only view writes nothing and
+  its pages stay guarded. Up to 8,192 ranges and 64 MiB a submission (a V# has no read/write bit, so every view
+  reached is compared; past the caps the ranges are left behind, logged once). `LEONIDA_TITLE_WRITEBACK=0` turns it off. A batch is fenced: it is kept with the ticket
   of the submission that will use it and copied back only when the context reports that ticket retired, so a range
   another submission is still writing is never read half done. A queue held deep (console ordering) can leave batches
   waiting: past 64 of them the oldest go back without their ticket, logged once.
@@ -4659,29 +4699,53 @@ order the submissions were recorded. The list keeps the last 64, so its numbers 
 recorded more than that.
 
 **AMD breadcrumbs.** NVIDIA's checkpoints say where a queue stopped; RADV has none. With `LEONIDA_DEVICE_MARKERS=1`
-as well, on a device with `VK_AMD_buffer_marker`, every numbered dispatch writes its `seq` into its queue's slot of
-one persistent buffer twice (`src/vulkan_device_markers.h`): at top of pipe before the dispatch (started) and at
-bottom of pipe after it (finished), with `vkCmdWriteBufferMarker2AMD` (or `vkCmdWriteBufferMarkerAMD` without
-synchronization2). A bottom-of-pipe write waits for all earlier work on the queue, so the finished value is the last
-dispatch before which everything had completed, and the queue's dispatches after it up to the started value are the
-ones the GPU began and did not finish. The oldest of them is the likely hang. The buffer is host-visible and
-coherent, in system memory where the device has such a type, so it can still be read after a device loss. The loss
-and stall reports then add lines like these (the shader names are made up):
+as well, on a device with `VK_AMD_buffer_marker`, every numbered dispatch and every draw writes its `seq` into its
+queue's slot of one persistent buffer twice (`src/vulkan_device_markers.h`): at top of pipe before the work
+(started) and at bottom of pipe after it (finished), with `vkCmdWriteBufferMarker2AMD` (or
+`vkCmdWriteBufferMarkerAMD` without synchronization2). Draws and dispatches share the numbering, so the 64-entry
+dispatch list has gaps where draws ran. A bottom-of-pipe write waits for all earlier work on the queue, so the
+finished value is the last item before which everything had completed, and the queue's items after it up to the
+started value are the ones the GPU began and did not finish. The oldest of them is the likely hang. The buffer is
+host-visible and coherent, in system memory where the device has such a type, so it can still be read after a device
+loss. The loss and stall reports then add lines like these (the shader names are made up):
 
 ```
 [rt] device-markers: AMD buffer markers, read after the device loss; best-effort: only what the GPU wrote before it stopped, and a reset may have lost the last writes
 [rt] device-markers: queue 0000000012345678 (compute) finished seq=1203 started seq=1205; started, not finished: 1204 1205
+[rt] device-markers:   finished: seq=1203 execute=88 queue=0000000012345678 (compute) list=0 command=16 shader=cs_example_b
 [rt] device-markers: likely hang: seq=1204 execute=88 queue=0000000012345678 (compute) list=0 command=17 shader=cs_example_a
-[rt] device-markers: queue 00000000123456a0 (direct) idle: finished seq=1199, nothing started after it; next submitted seq=1206 not started (waiting, or behind other work of the queue)
+[rt] device-markers:   in flight: seq=1205 execute=88 queue=0000000012345678 (compute) list=0 command=18 shader=cs_example_a
+[rt] device-markers: queue 00000000123456a0 (direct) finished seq=1199 started seq=1200; started, not finished: 1200
+[rt] device-markers:   finished: seq=1199 execute=89 queue=00000000123456a0 (direct) list=1 command=1 shader=cs_example_c
+[rt] device-markers: likely hang: seq=1200 execute=89 queue=00000000123456a0 (direct) list=1 command=7 draw=indexed count=3480 instances=1 pipeline=vs vs_example ps ps_example pass=draw 4 since command 2 (3 colours + depth, 1920x1080)
 [rt] device-fault: submitted dispatch seq=1204 execute=88 queue=0000000012345678 (compute) list=0 command=17 shader=cs_example_a groups=64,1,1 <- likely hang (device-markers)
 ```
 
-A separate history of the last 16,384 dispatches names the likely hang when it has already left the 64-entry list.
-An idle queue (finished equals started) is not called hung: if it still has dispatches submitted, it was waiting
-on a semaphore or stuck in work that is not a dispatch (a draw, a copy). The values are what the GPU wrote before
-it stopped; after a loss and a ring reset they may be stale, so read them as a pointer, not a proof. The cost with
-the switch on is two marker writes per dispatch (a command-processor write and an end-of-pipe event, no wait) plus
-one entry in the history; with it off nothing is recorded. Without the extension, or without
+A draw line gives its kind (`indexed`, `vertices`, `mesh`, with `-quads` for a quad list and `-indirect` or
+`-indirect-count` for arguments from a buffer) and counts (vertex or index count and instances, a mesh dispatch's
+`groups`, an indirect draw's `max` records and `stride`), its pipeline named as the `LEONIDA_GPU_PROFILE` lines name
+it (`gpu_profile::label`: each stage's tag and entry name, or `pso 0x...`), and its place among the draws of the list
+to the same targets: `pass=draw 4 since command 2` is the fourth draw to these targets since command 2. An idle queue
+gets a `not started:` line for its next submitted item. When `VK_EXT_device_fault` reports an address, a
+`device-fault: last started draw (device-markers):` line per queue follows the address lines, with `(not finished)`
+or `(finished)` and `<- likely hang` when it is the queue's likely hang.
+
+Granularity: a pair per draw, as per dispatch. The replay opens a rendering scope per draw, so the started write goes
+before the draw's helper passes (quad index expansion, indirect clamp; a hang there is named as the draw's) and the
+finished one after the scope ends, both outside a render pass instance. The extension allows them inside one too
+(`vk.xml`: `renderpass="both"`, and conditional rendering does not apply), which the legacy graphics ExecuteIndirect
+path, drawing in the caller's scope, uses; `vk_device_markers_test` writes a pair inside an open scope under
+validation. RADV (`radv_CmdWriteMarkerToMemoryAMD`) emits the cache flushes already pending, then a top-of-pipe write
+as one write-confirmed COPY_DATA (the command processor waits for that write only) and any other stage as one
+bottom-of-pipe EOP event (no wait): at most 24 dwords per draw, against the hundreds the draw's own scope and state
+take. A pair per run of one pipeline would be cheaper but could not name the draw, so it was not chosen.
+
+A separate history of the last 65,536 dispatches and draws (about 6 MiB) names the likely hang when it has already
+left the 64-entry list, and names every draw. An idle queue (finished equals started) is not called hung: if it
+still has work submitted, it was waiting on a semaphore or stuck in work that is neither (a copy, a barrier). The
+values are what the GPU wrote before it stopped; after a loss and a ring reset they may be stale, so read them as a
+pointer, not a proof. The cost with the switch on is two marker writes per dispatch and per draw plus one entry in
+the history; with it off nothing is recorded. Without the extension, or without
 `LEONIDA_DEVICE_FAULT`, the runtime logs one `device-markers: unavailable` line and runs as before.
 
 For a local pre-submit inspection, also set `LEONIDA_COMPUTE_INPUTS` to comma-separated shader name fragments and

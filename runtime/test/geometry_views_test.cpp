@@ -141,6 +141,27 @@ void title_write(std::uintptr_t at, std::uint8_t value) {
 }  // namespace
 
 int main() {
+    // Which blocks outside the arena a V# base reaches (TitleBufferWindows::shader_reachable), with the addresses RADV
+    // gives (Mesa 26.3.1): a sparse arena at 0xffffc00100200000, ordinary buffers at 0xffff8001..., 64 TiB below it.
+    {
+        using Windows = rt::d3d12::TitleBufferWindows;
+        constexpr std::uint64_t sparse_arena = 0xffffc00100200000ull, ordinary = 0xffff800100010000ull;
+        constexpr std::uint64_t k4m = 4ull << 20, k47 = 1ull << 47;
+        // Below heap_base: only with sign-extending shaders.
+        if (!Windows::shader_reachable(ordinary, k4m, sparse_arena, true)) return 1;
+        if (Windows::shader_reachable(ordinary, k4m, sparse_arena, false)) return 1;
+        // Above it (an ordinary arena with blocks made after it): both readings.
+        if (!Windows::shader_reachable(ordinary + (1ull << 30), k4m, ordinary, false)) return 1;
+        if (!Windows::shader_reachable(ordinary + (1ull << 30), k4m, ordinary, true)) return 1;
+        // The edges of the signed range: [-2^47, 2^47).
+        if (!Windows::shader_reachable(sparse_arena - k47, k4m, sparse_arena, true)) return 1;
+        if (Windows::shader_reachable(sparse_arena - k47 - 65536, k4m, sparse_arena, true)) return 1;
+        if (!Windows::shader_reachable(sparse_arena + k47 - k4m, k4m, sparse_arena, true)) return 1;
+        if (Windows::shader_reachable(sparse_arena + k47 - k4m + 65536, k4m, sparse_arena, true)) return 1;
+        // A block that ends exactly at heap_base, and no block at all.
+        if (!Windows::shader_reachable(sparse_arena - k4m, k4m, sparse_arena, true)) return 1;
+        if (Windows::shader_reachable(0, k4m, sparse_arena, true)) return 1;
+    }
     _putenv_s("LEONIDA_GEOMETRY_MB", "64");
     constexpr std::size_t kTile = 65536, kView = 16 * kTile;
     auto* title = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 2 * kView, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));

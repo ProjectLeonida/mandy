@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <cstdlib>
 #include <mutex>
 #include <set>
@@ -25,8 +26,9 @@ struct State {
     std::mutex mutex;
     std::unordered_map<std::uintptr_t, std::string> pipelines;  // graphics PSO id -> description
     std::set<std::array<std::uint32_t, 8>> tsharps;             // T#s that have a bindless entry
-    const std::uint8_t* arena = nullptr;                        // the GPU address arena's host mapping
+    const void* arena = nullptr;  // the device whose GPU address arena `read_arena` reads
     std::uint64_t arena_size = 0;
+    std::function<bool(std::uint64_t va, void* out, std::size_t bytes)> read_arena;  // false: no memory there
     std::vector<std::uint64_t> readback;  // render targets of fullscreen draws (besides the presented source)
     std::uint64_t presented_source = 0;
     std::unordered_map<std::uint64_t, std::uint64_t> table_origin;  // translated table VA -> title VA
@@ -89,19 +91,22 @@ inline bool has_tsharp(const std::uint32_t* words) {
     return state().tsharps.count(key) != 0;
 }
 
-inline void note_arena(const std::uint8_t* mapped, std::uint64_t size) {
+inline void note_arena(const void* device, std::uint64_t size,
+                       std::function<bool(std::uint64_t va, void* out, std::size_t bytes)> read) {
     std::lock_guard lock(state().mutex);
-    state().arena = mapped;
+    state().arena = device;
     state().arena_size = size;
+    state().read_arena = std::move(read);
 }
 
 // A test or application may create multiple devices. Never inspect a released
 // mapping; destroying an older device must leave the current mapping alone.
-inline void forget_arena(const std::uint8_t* mapped) {
+inline void forget_arena(const void* device) {
     std::lock_guard lock(state().mutex);
-    if (state().arena == mapped) {
+    if (state().arena == device) {
         state().arena = nullptr;
         state().arena_size = 0;
+        state().read_arena = nullptr;
     }
 }
 
@@ -168,9 +173,8 @@ inline std::string hex_words(const std::uint32_t* w, std::size_t n) {
 inline bool arena_words(std::uint64_t va, std::uint32_t* out, std::size_t n) {
     std::lock_guard lock(state().mutex);
     const State& s = state();
-    if (!s.arena || va + n * 4 > s.arena_size || va + n * 4 < va) return false;
-    std::memcpy(out, s.arena + va, n * 4);
-    return true;
+    if (!s.arena || !s.read_arena || va + n * 4 > s.arena_size || va + n * 4 < va) return false;
+    return s.read_arena(va, out, n * 4);
 }
 
 inline std::uint64_t arena_size() {

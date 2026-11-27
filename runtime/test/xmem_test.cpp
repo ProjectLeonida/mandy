@@ -693,10 +693,32 @@ bool access_faults(volatile uint32_t* address, bool write);
 
 // The same hook on a GPU-only destination: the title reserves a CPU-mappable range and a GPU-only one of the same size
 // right after it (title_gpu_views), and the D3D12 layer reads the GPU-only range's memory at the CPU range's address.
-// A batch copy onto the GPU-only range maps the same pages at the CPU range too, so that memory becomes readable there.
+// A batch copy onto the GPU-only range gives both its pages and the paired CPU pages their physical pages in xmem's
+// table alone: no host view at either, as on the console, where the call edits GPU page tables only. The host reads
+// and writes them through their frames (src/title_frames.h), and guards them at their physical pages' host views. No
+// host map at all for a paired range (rt::xmem::slot31_mapping_counts).
 void test_copy_page_mappings_cpu_view(const PhysicalApi& api) {
     const auto copy = rt::xmem::copy_page_mappings_fn;
     if (!copy) return;  // test_copy_page_mappings reports it
+    rt::xmem::Slot31Counts base{};
+    rt::xmem::slot31_mapping_counts(base);
+    const auto counted = [&](uint64_t gpu_pages, uint64_t twin_pages, uint64_t kept, uint64_t unpaired,
+                             uint64_t replaced) {
+        rt::xmem::Slot31Counts c{};
+        rt::xmem::slot31_mapping_counts(c);
+        const bool ok = c.gpu_pages - base.gpu_pages == gpu_pages && c.twin_pages - base.twin_pages == twin_pages &&
+                        c.twins_kept - base.twins_kept == kept && c.unpaired_pages - base.unpaired_pages == unpaired &&
+                        c.views_replaced - base.views_replaced == replaced;
+        if (!ok)
+            std::fprintf(stderr, "  slot-31 pages so far: %llu GPU-only and %llu twins by table, %llu twins kept, %llu "
+                                 "unpaired and %llu views replaced by host\n",
+                         static_cast<unsigned long long>(c.gpu_pages - base.gpu_pages),
+                         static_cast<unsigned long long>(c.twin_pages - base.twin_pages),
+                         static_cast<unsigned long long>(c.twins_kept - base.twins_kept),
+                         static_cast<unsigned long long>(c.unpaired_pages - base.unpaired_pages),
+                         static_cast<unsigned long long>(c.views_replaced - base.views_replaced));
+        return ok;
+    };
     constexpr uint64_t kPool = 2, kPair = 3;
     auto* const pool = static_cast<uint8_t*>(api.virtual_alloc(
         nullptr, kPool * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
@@ -717,50 +739,146 @@ void test_copy_page_mappings_cpu_view(const PhysicalApi& api) {
     check(api.map(pool, kPool, pages) == pool, "the pool maps its pages");
     for (uint64_t i = 0; i < kPool; ++i) fill_page(pool + i * kPage64k, 0x7300u + static_cast<uint32_t>(i));
 
-    // A run onto the GPU-only range: its CPU range shows the same bytes. Each page is read under a guard first, so a
-    // page left reserved fails its check instead of faulting the test (Wine's VirtualQuery does not report a view
-    // mapped into a placeholder as committed, so the state is not asked for).
+    // Each page is read under a guard first, so a page left reserved fails its check instead of faulting the test
+    // (Wine's VirtualQuery does not report a view mapped into a placeholder as committed, so the state is not asked
+    // for). A table page is read through its frame.
     const auto readable = [](const uint8_t* page) {
         return !access_faults(reinterpret_cast<volatile uint32_t*>(const_cast<uint8_t*>(page)), false);
     };
-    check(copy(gpu, pool, kPool, false), "a run of pool pages maps onto the GPU-only range");
-    check(readable(gpu) && page_holds(gpu, 0x7300u), "the GPU-only range shows the pool pages");
-    check(readable(cpu) && readable(cpu + kPage64k), "the paired CPU range is readable after the copy");
-    check(readable(cpu) && readable(cpu + kPage64k) && page_holds(cpu, 0x7300u) && page_holds(cpu + kPage64k, 0x7301u),
-          "the paired CPU range shows the same bytes as the pool");
-    check(!readable(cpu + 2 * kPage64k), "a CPU page past the copied run stays unmapped");
-    if (readable(cpu + kPage64k)) {
-        static_cast<volatile uint32_t*>(static_cast<void*>(cpu + kPage64k))[1] = 0xc0ffee32;
-        check(read_u32(pool + kPage64k, 4) == 0xc0ffee32 && read_u32(gpu + kPage64k, 4) == 0xc0ffee32,
-              "a write at the CPU range is seen in the pool and the GPU-only range: one memory");
-    }
+    const auto frame_holds = [](const uint8_t* page, uint32_t tag) {
+        leonida::title_frames::Frame frame;
+        return leonida::title_frames::find(reinterpret_cast<uintptr_t>(page), frame) && page_holds(frame.bytes, tag);
+    };
+    const auto backed = [](const uint8_t* page) { return leonida::title_frames::backed(reinterpret_cast<uintptr_t>(page)); };
+    const auto frame_word = [](const uint8_t* at) {
+        leonida::title_frames::Frame frame;
+        return leonida::title_frames::find(reinterpret_cast<uintptr_t>(at), frame) ? read_u32(frame.bytes, 0) : 0u;
+    };
 
-    // A GPU-only source whose page is mapped only at its CPU range is found there.
+    // A run onto the GPU-only range: no host call at all. Both ranges are table pages, holding the pool's pages.
+    check(copy(gpu, pool, kPool, false), "a run of pool pages maps onto the GPU-only range");
+    check(!readable(gpu) && !readable(gpu + kPage64k), "the GPU-only range has no host view: a table entry only");
+    check(!readable(cpu) && !readable(cpu + kPage64k), "the paired CPU range has no host view either");
+    check(counted(kPool, kPool, 0, 0, 0), "no host remap: the GPU-only pages and their CPU twins by table");
+    check(frame_holds(cpu, 0x7300u) && frame_holds(cpu + kPage64k, 0x7301u) && frame_holds(gpu, 0x7300u),
+          "the paired CPU range reads the pool's bytes through the frame table");
+    check(!backed(cpu + 2 * kPage64k) && !readable(cpu + 2 * kPage64k), "a CPU page past the copied run stays unmapped");
+    // The title's CPU still writes the page through its own mapping (the pool): the table page shows it, and names
+    // that mapping as its other address, where the D3D12 layer's shadows and watches guard it.
+    static_cast<volatile uint32_t*>(static_cast<void*>(pool + kPage64k))[1] = 0xc0ffee32;
+    check(frame_word(cpu + kPage64k + 4) == 0xc0ffee32, "a write through the title's own mapping is seen at the twin");
+    std::vector<std::uintptr_t> peers;
+    rt::xmem::geometry_aliases(reinterpret_cast<uintptr_t>(cpu + kPage64k), peers);
+    check(peers.size() == 1 && peers[0] == reinterpret_cast<uintptr_t>(pool + kPage64k),
+          "the twin's other address is the title's own mapping of its page");
+    bool aliased = false;
+    leonida::title_page_aliases::for_each_in(reinterpret_cast<uintptr_t>(cpu), reinterpret_cast<uintptr_t>(cpu) + 1,
+                                             [&](uintptr_t) { aliased = true; });
+    check(aliased, "a table page is aliased: written only through other addresses");
+    // A host writer (DirectStorage's copy into a request's destination) writes the frame, seen at the pool.
+    const uint32_t value = 0x5eed0031;
+    check(leonida::kernel_writes::write(cpu + 8, &value, sizeof(value)) && read_u32(pool, 8) == value,
+          "a host write into a table page lands in its physical page");
+    check(leonida::kernel_writes::store(cpu + kPage64k + 16, 0x5eed0032, 4) && read_u32(pool + kPage64k, 16) == 0x5eed0032,
+          "a value store into a table page lands in its physical page");
+
+    // A remap of a table page is a table update too: the next read through it sees the new page, and no host call.
+    check(copy(gpu, pool + kPage64k, 1, false), "a remap of a GPU-only page");
+    check(counted(kPool + 1, kPool + 1, 0, 0, 0), "the remap took no host call");
+    check(frame_word(cpu + 4) == 0xc0ffee32 && frame_word(gpu + 4) == 0xc0ffee32,
+          "a read after the remap sees the new page at the GPU-only page and its twin");
+    check(copy(gpu, pool, 1, false) && frame_word(cpu + 8) == value, "and the page before it after a remap back");
+
+    // A GPU-only source page is found in the table; one mapped only at its CPU range is found there.
     check(api.map(cpu + 2 * kPage64k, 1, &pages[0]) == cpu + 2 * kPage64k, "a page maps at the CPU range alone");
     check(copy(other, gpu + 2 * kPage64k, 1, false), "a copy from the GPU-only range maps");
-    check(readable(other) && page_holds(other, 0x7300u),
+    check(counted(kPool + 2, kPool + 2, 0, 1, 0), "a destination with no CPU pair is mapped on the host");
+    check(readable(other) && read_u32(other, 8) == value,
           "a GPU-only source page unmapped there is looked up at its CPU range");
 
     // A CPU page the title mapped itself is the title's: a copy onto its GPU-only page, or an unmap of it, changes the
     // GPU-only page alone (the console's CopyPageMappingsBatchX edits only that range's page table).
     check(copy(gpu + 2 * kPage64k, pool + kPage64k, 1, false), "a copy onto a GPU-only page whose CPU page is the title's");
-    check(readable(gpu + 2 * kPage64k) && page_holds(gpu + 2 * kPage64k, 0x7301u),
-          "the GPU-only page shows the copied pool page");
-    check(readable(cpu + 2 * kPage64k) && page_holds(cpu + 2 * kPage64k, 0x7300u),
+    check(counted(kPool + 3, kPool + 2, 1, 1, 0), "the GPU-only page took the pool page by table, the twin was kept");
+    // The table is what later copies read: a copy from that GPU-only page brings the pool page it was given.
+    check(copy(other, gpu + 2 * kPage64k, 1, false) && readable(other) && read_u32(other, 4) == 0xc0ffee32,
+          "a copy from the GPU-only page finds the page its table entry holds");
+    check(readable(cpu + 2 * kPage64k) && !backed(cpu + 2 * kPage64k) && read_u32(cpu + 2 * kPage64k, 8) == value,
           "the title's own mapping at the paired CPU page is kept, not replaced by the copy");
     check(copy(gpu + 2 * kPage64k, nullptr, 1, false), "a null source unmaps a GPU-only page whose CPU page is the title's");
-    check(!readable(gpu + 2 * kPage64k), "the GPU-only page is unmapped");
-    check(readable(cpu + 2 * kPage64k) && page_holds(cpu + 2 * kPage64k, 0x7300u),
+    check(!readable(gpu + 2 * kPage64k) && !backed(gpu + 2 * kPage64k), "the GPU-only page is unmapped");
+    check(readable(cpu + 2 * kPage64k) && read_u32(cpu + 2 * kPage64k, 8) == value,
           "the title's own mapping at the paired CPU page survives the unmap");
 
-    // A null source unmaps both ranges where the CPU pages are the copy's own.
+    // A null source empties both ranges' table entries where the CPU pages are the copy's own.
     check(copy(gpu, nullptr, kPool, false), "a null source unmaps the GPU-only range");
-    check(!readable(gpu) && !readable(cpu) && !readable(cpu + kPage64k), "the paired CPU range is unmapped with it");
+    check(!backed(gpu) && !backed(cpu) && !backed(cpu + kPage64k) && !readable(cpu),
+          "the paired CPU range leaves the table with it");
+    check(copy(other, gpu, 1, false) && !readable(other), "the GPU-only page's table entry is gone: a copy of it is a hole");
+
+    // A page the title mapped itself into the GPU-only range (XMemMapPhysicalPages) is a host view: a copy onto it
+    // unmaps that view once and keeps the page in the table; the title's own unmap of the range clears the table too.
+    check(api.map(gpu, 1, &pages[1]) == gpu && readable(gpu) && read_u32(gpu, 4) == 0xc0ffee32,
+          "the title maps a page into the GPU-only range itself");
+    rt::xmem::Slot31Counts before{};
+    rt::xmem::slot31_mapping_counts(before);
+    check(copy(gpu, pool, 1, false) && !readable(gpu) && backed(gpu), "a copy onto it replaces the host view by a table entry");
+    rt::xmem::Slot31Counts after{};
+    rt::xmem::slot31_mapping_counts(after);
+    check(after.views_replaced - before.views_replaced == 1, "the title's view there was unmapped once");
+    check(copy(other, gpu, 1, false) && readable(other) && read_u32(other, 8) == value, "the table entry holds the copied page");
+    // The title maps a page of its own at the twin the copy gave a table entry: the host view replaces the entry.
+    check(backed(cpu) && api.map(cpu, 1, &pages[1]) == cpu && !backed(cpu) && readable(cpu) &&
+              read_u32(cpu, 4) == 0xc0ffee32,
+          "the title's own mapping at a table twin replaces the table entry");
+    check(api.map(gpu, 1, nullptr) == gpu && api.map(cpu, 1, nullptr) == cpu, "the title unmaps both pages");
+    check(!backed(gpu) && copy(other, gpu, 1, false) && !readable(other), "after the title's unmap the table entry is gone");
 
     api.map(other, 1, nullptr);
     api.map(cpu, kPair, nullptr);
     api.map(pool, kPool, nullptr);
     check(api.free_pages(kPool, pages) == TRUE, "the pool's pages are freed");
+}
+
+// A physical page number the title frees comes back with its next allocation (the free slots are reused last in, first
+// out), now naming another page of memory. A slot-31 copy of that number onto a table page that still holds the freed
+// page's number must give it the new page: the table's frame is the memory behind the number now, not the one it was
+// given before (the readers of a stream pool's pages read through it: a stale frame showed them the freed page's
+// bytes).
+void test_copy_page_mappings_reused_number(const PhysicalApi& api) {
+    const auto copy = rt::xmem::copy_page_mappings_fn;
+    if (!copy) return;  // test_copy_page_mappings reports it
+    auto* const pool = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    auto* const cpu = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    auto* const gpu = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x3, 0x801));
+    check(pool && cpu && gpu, "XMemVirtualAlloc reserves a pool and a CPU + GPU-only pair");
+    if (!pool || !cpu || !gpu) return;
+    const auto frame_word = [](const uint8_t* at) {
+        leonida::title_frames::Frame frame;
+        return leonida::title_frames::find(reinterpret_cast<uintptr_t>(at), frame) ? read_u32(frame.bytes, 0) : 0u;
+    };
+    uint64_t first = 0, count = 1;
+    check(api.allocate(0x280, &count, &first) == TRUE && count == 1 && api.map(pool, 1, &first) == pool,
+          "a page for the pool");
+    fill_page(pool, 0x7500u);
+    check(copy(gpu, pool, 1, false) && frame_word(gpu) == 0x7500u && frame_word(cpu) == 0x7500u,
+          "the GPU-only page and its twin take the pool's page");
+    // The title lets the page go and allocates again: the same number, another page of memory.
+    check(api.map(pool, 1, nullptr) == pool && api.free_pages(1, &first) == TRUE, "the title frees the page");
+    uint64_t second = 0;
+    count = 1;
+    check(api.allocate(0x280, &count, &second) == TRUE && count == 1 && second == first,
+          "the next allocation reuses the freed page's number");
+    check(api.map(pool, 1, &second) == pool, "the pool maps the new page");
+    fill_page(pool, 0x7600u);
+    check(copy(gpu, pool, 1, false), "a copy of the reused number onto the table pages");
+    check(frame_word(gpu) == 0x7600u && frame_word(cpu) == 0x7600u,
+          "the table pages read the new page behind the number, not the freed one");
+    check(copy(gpu, nullptr, 1, false) && api.map(pool, 1, nullptr) == pool && api.free_pages(1, &second) == TRUE,
+          "the pages are unmapped and freed");
 }
 
 bool access_faults(volatile uint32_t* address, bool write) {
@@ -2706,6 +2824,7 @@ int main(int argc, char** argv) {
         }
         test_copy_page_mappings(physical);
         test_copy_page_mappings_cpu_view(physical);
+        test_copy_page_mappings_reused_number(physical);
         test_stream_cpu_twin(physical);
         test_unowned_guards(physical);
         test_physical_pages_commit_on_touch(physical);

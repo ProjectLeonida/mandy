@@ -9,7 +9,8 @@
 //
 // 1. Aliases (title_page_aliases). xmem maps one physical page at as many VAs as the title asks
 //    (XMemMapPhysicalPages): a write through one VA changes what the others read without touching them. xmem
-//    reports each 64 KiB page mapped at more than one address; a shadow copies those at every submission.
+//    reports each 64 KiB page mapped at more than one address; a shadow guards those at every address with the
+//    geometry watch's cells (title_geometry_watch.h), or copies them at every submission while it can't.
 //
 // 2. Kernel writes (kernel_writes). A read-only page makes ReadFile fail with ERROR_NOACCESS instead of faulting
 //    into a user-mode handler. The file shims (read_file and the rest, below) pin the destination before the kernel
@@ -48,6 +49,7 @@
 #include <windows.h>
 
 #include "guarded_copy.h"
+#include "title_frames.h"
 
 #include <algorithm>
 #include <atomic>
@@ -365,7 +367,9 @@ inline std::uintptr_t to_host_view(std::uintptr_t va, std::uintptr_t bytes = 1) 
     if (!view_at(va, bytes, range)) return va;
     const auto offset = va >= range.gpu && va - range.gpu < range.size ? va - range.gpu : va - range.cpu;
     const auto cpu = range.cpu + offset, gpu = range.gpu + offset;
+    // A page xmem's frame table holds (slot 31's copies onto the pair, src/title_frames.h) is readable through it.
     const auto readable = [](std::uintptr_t address) {
+        if (title_frames::backed(address)) return true;
         MEMORY_BASIC_INFORMATION region{};
         return VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) &&
                region.State == MEM_COMMIT && region.Protect && !(region.Protect & (PAGE_NOACCESS | PAGE_GUARD));
@@ -889,15 +893,48 @@ inline bool store_guarded(void* destination, std::uint64_t value, std::size_t by
 }
 }  // namespace detail
 
+namespace detail {
+// Pins [to, to + bytes) as a kernel write, and the same bytes at the other addresses of each table page in it (the
+// host views of its physical page, src/title_frames.h): a write through the frame faults no guard anywhere, so the
+// guards over every address it shows at are lifted first and the copies there take the bytes. The pins go to `pins`.
+inline void pin_frames(std::uintptr_t to, std::size_t bytes, std::vector<std::uint64_t>& pins) {
+    pins.push_back(begin_write(reinterpret_cast<const void*>(to), bytes, nullptr));
+    std::vector<std::uintptr_t> peers;
+    title_frames::for_each_part(to, bytes, [&](std::uintptr_t at, std::size_t n, std::uint8_t* frame) {
+        if (!frame) return true;
+        peers.clear();
+        title_frames::peers(at, peers);
+        for (const std::uintptr_t peer : peers)
+            pins.push_back(begin_write(reinterpret_cast<const void*>(peer + (at & (title_frames::kPage - 1))), n, nullptr));
+        return true;
+    });
+}
+}  // namespace detail
+
 // A host thread's copy of `bytes` from `source` into the title's memory at `destination`: pinned and opened as a
 // kernel write is, so the guards over it are lifted first, the copies take the bytes at the next submission and no
 // refresh guards it again mid-copy; retried once after reopen() if it faults anyway (not when the two ranges overlap:
 // the part copied before the fault changed the source). False when it still faults (the destination, or the source,
 // is not memory it can copy).
+//
+// Pages xmem's frame table holds (a stream pool's GPU-only pages and their CPU twins after queue slot 31's copies:
+// they have no host view, src/title_frames.h) are written through their frames, with their other addresses pinned too.
 inline bool write(void* destination, const void* source, std::size_t bytes) {
     if (!bytes) return true;
     const auto to = reinterpret_cast<std::uintptr_t>(destination), from = reinterpret_cast<std::uintptr_t>(source);
     const bool overlap = to < from + bytes && from < to + bytes;
+    if (title_frames::may_hold(to, to + bytes)) {
+        std::vector<std::uint64_t> pins;
+        detail::pin_frames(to, bytes, pins);
+        const auto* in = static_cast<const std::uint8_t*>(source);
+        const bool ok = title_frames::for_each_part(to, bytes, [&](std::uintptr_t at, std::size_t n, std::uint8_t* frame) {
+            void* const out = frame ? static_cast<void*>(frame) : reinterpret_cast<void*>(at);
+            if (detail::move_guarded(out, in + (at - to), n)) return true;
+            return !frame && !overlap && reopen(out, n) && detail::move_guarded(out, in + (at - to), n);
+        });
+        for (const std::uint64_t pin : pins) end_write(pin, false);
+        return ok;
+    }
     const std::uint64_t pin = begin_write(destination, bytes, nullptr);
     bool ok = detail::move_guarded(destination, source, bytes);
     if (!ok && !overlap && reopen(destination, bytes)) ok = detail::move_guarded(destination, source, bytes);
@@ -906,10 +943,19 @@ inline bool write(void* destination, const void* source, std::size_t bytes) {
 }
 
 // write() of a 4- or 8-byte value (the low `bytes` of `value`). Aligned, it is stored in one locked access, so a
-// title thread polling it never reads a mix of the old and the new value; pinned and retried the same way.
+// title thread polling it never reads a mix of the old and the new value; pinned and retried the same way. A table
+// page's value goes into its frame, the same way.
 inline bool store(void* destination, std::uint64_t value, std::size_t bytes) {
     const auto to = reinterpret_cast<std::uintptr_t>(destination);
     if ((bytes != 4 && bytes != 8) || to % bytes) return write(destination, &value, bytes);
+    title_frames::Frame frame;
+    if (title_frames::find(to, frame)) {
+        std::vector<std::uint64_t> pins;
+        detail::pin_frames(to, bytes, pins);
+        const bool ok = detail::store_guarded(frame.bytes, value, bytes);
+        for (const std::uint64_t pin : pins) end_write(pin, false);
+        return ok;
+    }
     const std::uint64_t pin = begin_write(destination, bytes, nullptr);
     bool ok = detail::store_guarded(destination, value, bytes);
     if (!ok && reopen(destination, bytes)) ok = detail::store_guarded(destination, value, bytes);
@@ -917,10 +963,39 @@ inline bool store(void* destination, std::uint64_t value, std::size_t bytes) {
     return ok;
 }
 
+// Whether [buffer, buffer + bytes) holds a page of xmem's frame table (the kernel cannot write such a page: it has no
+// host view).
+inline bool holds_table_page(const void* buffer, std::size_t bytes) {
+    const auto at = reinterpret_cast<std::uintptr_t>(buffer);
+    if (!bytes || !title_frames::may_hold(at, at + bytes)) return false;
+    bool found = false;
+    title_frames::for_each_part(at, bytes, [&](std::uintptr_t, std::size_t, std::uint8_t* frame) {
+        found = frame != nullptr;
+        return !found;
+    });
+    return found;
+}
+
 // The file shims' reads into title memory (file_system.cpp): ReadFile, ReadFileEx and ReadFileScatter with their
 // destination pinned and opened first, and retried once if it fails with ERROR_NOACCESS anyway (after committing
 // first-touch pages: the title retries such a read forever, `0x314200`, so the retry has to change something).
+//
+// A destination with pages of xmem's frame table (DirectStorage reading a request straight into a stream pool's
+// GPU-only destination, src/title_frames.h) is read into memory of the runtime's first, completed (waited for when it
+// is overlapped and pending), and then written through write(): the kernel cannot write a page with no host view.
 inline BOOL read_file(HANDLE file, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVERLAPPED overlapped) {
+    if (holds_table_page(buffer, bytes)) {
+        std::vector<std::uint8_t> bounce(bytes);
+        DWORD got = 0;
+        BOOL ok = ::ReadFile(file, bounce.data(), bytes, &got, overlapped);
+        if (!ok && GetLastError() == ERROR_IO_PENDING && overlapped) ok = GetOverlappedResult(file, overlapped, &got, TRUE);
+        if (ok && !write(buffer, bounce.data(), got)) {
+            ok = FALSE;
+            SetLastError(ERROR_NOACCESS);
+        }
+        if (read) *read = ok ? got : 0;
+        return ok;
+    }
     const std::uint64_t pin = begin_write(buffer, bytes, overlapped);
     BOOL ok = ::ReadFile(file, buffer, bytes, read, overlapped);
     if (!ok && GetLastError() == ERROR_NOACCESS && reopen(buffer, bytes))

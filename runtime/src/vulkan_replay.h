@@ -37,6 +37,7 @@
 #include "indirect_draw_stats.h"
 #include "deferred_image_binding.h"
 #include "vulkan_device_fault.h"
+#include "vulkan_gpu_profile.h"
 #include "depth24.h"
 #include "quad_index_expand.h"
 #include "rect_list_geometry.h"
@@ -1153,6 +1154,9 @@ struct ReplayFunctions {
     // Set: prepare() leaves pipelines that are not built to it instead of building each on the spot.
     PipelineCompiles* compiles = nullptr;
     std::function<void(VkCommandBuffer, const label::Write&)> gpu_label;
+    // LEONIDA_GPU_PROFILE=1 (vulkan_gpu_profile.h): this submission's timestamps around each run of draws or
+    // dispatches of one pipeline. Null: no profile, and the replay records nothing for it.
+    gpu_profile::Recording* gpu_profile = nullptr;
     // Set 0 for the pipelines that declare one (their own `bindless_set` is only the marker): the device's current
     // generation of it, which a flush may have replaced since the pipeline was made. Null: the pipeline's.
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;
@@ -4672,6 +4676,52 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
         const auto raster = draw_command(command);
+        // LEONIDA_GPU_PROFILE=1: before anything of the command is recorded, so that the helper passes of a draw or
+        // dispatch (index expansion, indirect clamp, counted dispatch) count for it. A command that records no draw
+        // or dispatch here (dropped, skipped, still compiling) neither starts nor ends a run.
+        if (vk.gpu_profile) {
+            auto& profile = *vk.gpu_profile;
+            if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
+                if (p.pipeline.pipeline) profile.work(command_buffer, gpu_profile::Kind::compute, dispatch->pipeline);
+            } else if (const auto* indirect = std::get_if<ExecuteIndirect>(&command)) {
+                if (indirect->kind == IndirectKind::dispatch) {
+                    if (!indirect->pipeline || p.pipeline.pipeline || !(p.pipeline.async_build || p.pipeline.skipped))
+                        profile.work(command_buffer, gpu_profile::Kind::compute, indirect->pipeline);
+                } else if (vk.external_graphics_scope) {
+                    profile.work(command_buffer, gpu_profile::Kind::graphics, 0);  // the caller's pipeline
+                }
+            } else if (raster.state) {
+                if (!prepared.draws[p.draw].skipped)
+                    profile.work(command_buffer,
+                                 raster.state->mesh ? gpu_profile::Kind::mesh : gpu_profile::Kind::graphics,
+                                 raster.state->pipeline);
+            } else {
+                profile.other(command_buffer);
+            }
+        }
+        // LEONIDA_DEVICE_MARKERS=1 (vulkan_device_markers.h): a draw's started marker, before its helper passes (index
+        // expansion, indirect clamp) and its rendering scope, so a hang in them is the draw's too; its finished marker
+        // follows the scope (drawn below). Nothing without the markers.
+        if constexpr (Checkpoints) {
+            if (raster.state && !prepared.draws[p.draw].skipped && checkpoints->submission.markers) {
+                const Draw& s = *raster.state;
+                const detail::PreparedDraw& pd = prepared.draws[p.draw];
+                unsigned flags = (s.indexed ? marked_draw::indexed : 0u) | (s.mesh ? marked_draw::mesh : 0u) |
+                                 (!s.mesh && s.topology == topology_quad_list ? marked_draw::quads : 0u);
+                std::array<std::uint32_t, 3> counts{s.count, s.instances, s.first};
+                if (raster.arguments) {
+                    flags |= marked_draw::indirect | (raster.arguments->count_buffer ? marked_draw::counted : 0u);
+                    counts = {raster.arguments->max_count, raster.arguments->stride, 0};
+                }
+                std::array<VkImageView, detail::max_render_targets> views{};
+                const std::size_t slots = std::min(pd.colors.size(), views.size());
+                for (std::size_t slot = 0; slot < slots; ++slot)
+                    views[slot] = pd.colors[slot].id ? pd.colors[slot].view : VK_NULL_HANDLE;
+                checkpoints->draw(command_buffer, i, s.pipeline, static_cast<std::uint8_t>(flags), counts,
+                                  MarkedTargets::of(std::span<const VkImageView>(views.data(), slots),
+                                                    pd.depth.id ? pd.depth.view : VK_NULL_HANDLE, pd.area));
+            }
+        }
         if (next_query < prepared.queries.size() && prepared.queries[next_query].command == i) {
             if constexpr (Checkpoints)
                 if (std::holds_alternative<ResolveQueries>(command))
@@ -5332,7 +5382,16 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             // A legacy graphics indirect draw opens no rendering scope of its own: the caller has one open around the
             // replay (the tests do), and the recorded, stateful graphics indirects are Draw commands instead.
             if (ind->kind != IndirectKind::dispatch) {
-                if constexpr (Checkpoints) checkpoints->record(command_buffer, i, CheckpointKind::draw);
+                if constexpr (Checkpoints) {
+                    checkpoints->record(command_buffer, i, CheckpointKind::draw);
+                    // Inside the caller's rendering scope, which VK_AMD_buffer_marker allows.
+                    checkpoints->draw(command_buffer, i, 0,
+                                      static_cast<std::uint8_t>(
+                                          marked_draw::indirect |
+                                          (ind->kind == IndirectKind::draw_indexed ? marked_draw::indexed : 0u) |
+                                          (ind->count_buffer ? marked_draw::counted : 0u)),
+                                      {records, stride, 0});
+                }
                 if (ind->count_buffer) {
                     if (ind->kind == IndirectKind::draw)
                         vk.draw_indirect_count(command_buffer, indirect_buffer, arguments, count_buffer, count_offset,
@@ -5345,6 +5404,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 } else {
                     vk.draw_indexed_indirect(command_buffer, indirect_buffer, arguments, records, stride);
                 }
+                if constexpr (Checkpoints) checkpoints->drawn(command_buffer);
                 continue;
             }
             if (ind->pipeline && !p.pipeline.pipeline && (p.pipeline.async_build || p.pipeline.skipped)) continue;
@@ -5700,6 +5760,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
             }
             vk.end_rendering(command_buffer);
+            if constexpr (Checkpoints) checkpoints->drawn(command_buffer);
         }
     }
     // Predication does not carry over to the next command list.

@@ -1,25 +1,30 @@
 #pragma once
 
 #include "xg_xs_layout.h"
+#include <memory>
+#include <vector>
 #include "../src/vulkan_backend.h"
 
 namespace rt::d3d12 {
 
-// A ring of upload buffers and command buffers per device, used under the title-texture registry lock.
-// A whole image (including arrays and compressed mip tails) is detiled into the mapped buffer of the next slot.
-// The transfer never re-enters the D3D12 queue's pre-submit callbacks.
+// Upload buffers and command buffers per device, used under the title-texture registry lock. A whole image
+// (including arrays and compressed mip tails) is detiled into the mapped buffer of a free slot. The transfer never
+// re-enters the D3D12 queue's pre-submit callbacks.
 //
-// A write no longer waits for its own transfer: the caller (a title thread creating a slot-70 view) waited for the
-// GPU at every texture fill, behind all earlier work on the queue, with tracker_mutex_ and submit_mutex_ held, so
-// every other submission waited too (speed-26: a title thread 68-88 % inside slot 70). A slot's buffer is reused,
-// resized or freed only after its last transfer completed (the slot's timeline value). The image needs no CPU wait:
-// later submissions on the queue are ordered after the transfer, other queues wait for it on the GPU, and a retired
-// image is destroyed through the deferred queue, after later submissions retire.
+// Nothing here waits for the GPU on the CPU. The transfer waits on the GPU for every queue's submitted work
+// (VulkanContext::write_staged_title_image hands over those values), later submissions on the queue are ordered after
+// it, and the other queues wait for it on the GPU before their next submission: a texture the refresh before a
+// submission uploads is seen by that submission's draws, on whichever queue (the planes of a video frame together,
+// as VIctory-Belobug's prelude uploads do, crates/victory-gpu/src/texture.rs, GPL-3.0-or-later). A slot is reused
+// once its last transfer has completed, which is looked up without waiting; while every slot is still in flight a new
+// one is made (up to kMaxSlots, past which the oldest is waited for: the only wait, for a transfer of ours that waits
+// only for work already submitted). A retired image is destroyed through the deferred queue, after later submissions
+// retire.
 class TitleImageUpload {
 public:
     VkDeviceSize capacity() const {
         VkDeviceSize total = 0;
-        for (const auto& slot : slots_) total += slot.capacity;
+        for (const auto& slot : slots_) total += slot->capacity;
         return total;
     }
 
@@ -27,24 +32,28 @@ public:
     void release(Device& d) {
         auto& vk = d.context->vk;
         wait_all(d);
-        for (auto& slot : slots_) release_buffer(d, slot);
+        for (auto& slot : slots_) release_buffer(d, *slot);
         if (pool_) vk.vkDestroyCommandPool(d.info.device, pool_, nullptr);
         if (ready_) vk.vkDestroySemaphore(d.info.device, ready_, nullptr);
         pool_ = VK_NULL_HANDLE;
-        for (auto& slot : slots_) slot.command = VK_NULL_HANDLE;
+        for (auto& slot : slots_) slot->command = VK_NULL_HANDLE;
         ready_ = VK_NULL_HANDLE;
     }
 
+    struct Slot;
+
+    // One upload in three steps, so the detile of several textures can run on several threads while the transfers
+    // are still recorded and submitted one by one, in order (Device::refresh_title_textures):
+    //   reserve (serial): the copy regions, a free slot and its buffer;
+    //   fill (any thread, one slot each): the detile into the slot's mapped buffer;
+    //   commit (serial): the transfer recorded and submitted; or unreserve when the bytes turned out unchanged.
     template<class Device>
-    bool write(Device& d, leonida::ResourceId id, const leonida::ResourceBinding& image,
-               const xg_xs::Texture& layout, const std::uint8_t* tiled, std::vector<std::uint64_t>& columns,
-               bool inspect, bool& nonzero) {
+    Slot* reserve(Device& d, const leonida::ResourceBinding& image, const xg_xs::Texture& layout) {
         const auto block = leonida::copy_block_format(image, VK_IMAGE_ASPECT_COLOR_BIT);
         const auto mips = layout.layout.mips;
         const auto layers = layout.array;
         if (!block.bytes || block.bytes != layout.format.bytes || !mips || mips > image.mip_levels ||
-            !layers || layers > image.array_layers) return false;
-
+            !layers || layers > image.array_layers) return nullptr;
         regions_.clear();
         VkDeviceSize bytes = 0;
         for (unsigned layer = 0; layer < layers; ++layer) {
@@ -56,21 +65,30 @@ public:
                                     image.volume ? std::max(1u, image.depth >> level) : 1u};
                 if (mip.width_elements != (copy.imageExtent.width + block.block - 1) / block.block ||
                     mip.height_elements != (copy.imageExtent.height + block.block - 1) / block.block ||
-                    (image.volume && mip.depth != copy.imageExtent.depth)) return false;
+                    (image.volume && mip.depth != copy.imageExtent.depth)) return nullptr;
                 // Vulkan requires offsets aligned to four bytes and to the texel block size.
                 const auto align = 4u * block.bytes;
                 copy.bufferOffset = bytes + (align - bytes % align) % align;
                 const VkDeviceSize row = VkDeviceSize(mip.width_elements) * block.bytes;
                 const VkDeviceSize slice = row * mip.height_elements;
-                if (slice > UINT32_MAX || (UINT64_MAX - copy.bufferOffset) / copy.imageExtent.depth < slice) return false;
+                if (slice > UINT32_MAX || (UINT64_MAX - copy.bufferOffset) / copy.imageExtent.depth < slice)
+                    return nullptr;
                 bytes = copy.bufferOffset + slice * copy.imageExtent.depth;
                 regions_.push_back(copy);
             }
         }
-        Slot& slot = slots_[next_];
-        if (!prepare(d, slot, bytes)) return false;
-        next_ = (next_ + 1) % kSlots;
-        for (const auto& copy : regions_) {
+        Slot* slot = take_slot(d);
+        if (!slot || !prepare(d, *slot, bytes)) return nullptr;
+        slot->regions = regions_;
+        slot->reserved = true;
+        return slot;
+    }
+
+    // Thread-safe for distinct slots: reads only `tiled` and writes only the slot's buffer and `columns`.
+    static void fill(Slot& slot, const leonida::ResourceBinding& image, const xg_xs::Texture& layout,
+                     const std::uint8_t* tiled, std::vector<std::uint64_t>& columns, bool inspect, bool& nonzero) {
+        const auto block = leonida::copy_block_format(image, VK_IMAGE_ASPECT_COLOR_BIT);
+        for (const auto& copy : slot.regions) {
             const auto level = copy.imageSubresource.mipLevel;
             const auto& mip = layout.layout.plane[0].mips[level];
             const auto row = mip.width_elements * block.bytes, slice = row * mip.height_elements;
@@ -80,37 +98,54 @@ public:
                 nonzero = std::any_of(dst, dst + VkDeviceSize(slice) * copy.imageExtent.depth,
                                       [](std::uint8_t c) { return c != 0; });
         }
+    }
 
-        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers};
+    static void unreserve(Slot& slot) { slot.reserved = false; }
+
+    template<class Device>
+    bool commit(Device& d, leonida::ResourceId id, const leonida::ResourceBinding& image,
+                const xg_xs::Texture& layout, Slot& slot) {
+        slot.reserved = false;
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, layout.layout.mips, 0, layout.array};
         const auto result = d.context->write_staged_title_image(id, range, [&](const leonida::ReplayFunctions& replay,
-                                                                               const leonida::LayoutPieces& pieces) {
+                                                                               const leonida::LayoutPieces& pieces,
+                                                                               const auto& waits) {
             auto& vk = d.context->vk;
             VkResult r = vk.vkResetCommandBuffer(slot.command, 0);
             if (r != VK_SUCCESS) return r;
             VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             if ((r = vk.vkBeginCommandBuffer(slot.command, &begin)) != VK_SUCCESS) return r;
-            // All texels of every mip/layer named in range are overwritten. The CPU no longer waits for a transfer,
-            // so the barrier orders this one after all earlier work on the queue: earlier reads of the image and an
-            // earlier transfer into it, still running.
+            // All texels of every mip/layer named in range are overwritten. Nothing waits on the CPU, so the barrier
+            // orders this one after all earlier work on the queue (earlier reads of the image and an earlier transfer
+            // into it, still running); the submission's waits do the same for the other queues.
             leonida::detail::image_barrier(replay, slot.command, image, range, VK_IMAGE_LAYOUT_UNDEFINED,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
             vk.vkCmdCopyBufferToImage(slot.command, slot.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                      static_cast<std::uint32_t>(regions_.size()), regions_.data());
+                                      static_cast<std::uint32_t>(slot.regions.size()), slot.regions.data());
             for (const auto& piece : pieces)
                 leonida::detail::image_barrier(replay, slot.command, image, piece.range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     piece.layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_IMAGE_LAYOUT_GENERAL : piece.layout,
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             if ((r = vk.vkEndCommandBuffer(slot.command)) != VK_SUCCESS) return r;
-            return submit(d, slot);
+            return submit(d, slot, waits);
         });
         return result == VK_SUCCESS;
     }
 
-private:
-    static constexpr unsigned kSlots = 4;
+    template<class Device>
+    bool write(Device& d, leonida::ResourceId id, const leonida::ResourceBinding& image,
+               const xg_xs::Texture& layout, const std::uint8_t* tiled, std::vector<std::uint64_t>& columns,
+               bool inspect, bool& nonzero) {
+        Slot* slot = reserve(d, image, layout);
+        if (!slot) return false;
+        fill(*slot, image, layout, tiled, columns, inspect, nonzero);
+        return commit(d, id, image, layout, *slot);
+    }
+
+    static constexpr std::size_t kMaxSlots = 64;
     struct Slot {
         VkBuffer buffer{};
         VkDeviceMemory memory{};
@@ -118,7 +153,11 @@ private:
         VkDeviceSize capacity = 0;
         VkCommandBuffer command{};
         std::uint64_t value = 0;  // the ready_ value its last transfer signals; 0: none submitted
+        bool reserved = false;    // between reserve() and commit()/unreserve()
+        std::vector<VkBufferImageCopy> regions;
     };
+
+private:
 
     // Waits (outside every lock but the registry's) until the slot's last transfer has completed.
     template<class Device>
@@ -142,7 +181,29 @@ private:
 
     template<class Device>
     void wait_all(Device& d) {
-        for (auto& slot : slots_) wait_slot(d, slot);
+        for (auto& slot : slots_) wait_slot(d, *slot);
+    }
+
+    // A slot whose last transfer is done (looked up, not waited for); a new one while all are in flight, or the oldest
+    // one's transfer waited for once there are kMaxSlots.
+    template<class Device>
+    Slot* take_slot(Device& d) {
+        auto& vk = d.context->vk;
+        std::uint64_t reached = 0;
+        if (ready_ && vk.vkGetSemaphoreCounterValue &&
+            vk.vkGetSemaphoreCounterValue(d.info.device, ready_, &reached) != VK_SUCCESS)
+            reached = 0;
+        Slot* oldest = nullptr;
+        for (auto& slot : slots_) {
+            if (slot->reserved) continue;
+            if (!slot->value || slot->value <= reached) {
+                slot->value = 0;
+                return slot.get();
+            }
+            if (!oldest || slot->value < oldest->value) oldest = slot.get();
+        }
+        if (slots_.size() < kMaxSlots) return slots_.emplace_back(std::make_unique<Slot>()).get();
+        return oldest && wait_slot(d, *oldest) ? oldest : nullptr;
     }
 
     template<class Device>
@@ -205,16 +266,28 @@ private:
         return true;
     }
 
-    // Under tracker_mutex_ and submit_mutex_ (write_staged_title_image): submits the transfer and the other queues'
-    // GPU-side waits for it, and returns without waiting for it on the CPU.
-    template<class Device>
-    VkResult submit(Device& d, Slot& slot) {
-        auto& vk = d.context->vk;
+    // Under tracker_mutex_ and submit_mutex_ (write_staged_title_image): submits the transfer, waiting on the GPU for
+    // `waits` (every queue's submitted work), and the other queues' GPU-side waits for it, and returns without waiting
+    // for anything on the CPU.
+    template<class Device, class Waits>
+    VkResult submit(Device& d, Slot& slot, const Waits& waits) {
         ++value_;
+        wait_semaphores_.clear();
+        wait_values_.clear();
+        for (const auto& [semaphore, value] : waits) {
+            wait_semaphores_.push_back(semaphore);
+            wait_values_.push_back(value);
+        }
+        wait_stages_.assign(wait_semaphores_.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
         timeline.signalSemaphoreValueCount = 1;
         timeline.pSignalSemaphoreValues = &value_;
+        timeline.waitSemaphoreValueCount = static_cast<std::uint32_t>(wait_values_.size());
+        timeline.pWaitSemaphoreValues = wait_values_.data();
         VkSubmitInfo transfer{VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline};
+        transfer.waitSemaphoreCount = static_cast<std::uint32_t>(wait_semaphores_.size());
+        transfer.pWaitSemaphores = wait_semaphores_.data();
+        transfer.pWaitDstStageMask = wait_stages_.data();
         transfer.commandBufferCount = 1;
         transfer.pCommandBuffers = &slot.command;
         transfer.signalSemaphoreCount = 1;
@@ -243,8 +316,10 @@ private:
         return VK_SUCCESS;
     }
 
-    Slot slots_[kSlots];
-    unsigned next_ = 0;
+    std::vector<std::unique_ptr<Slot>> slots_;
+    std::vector<VkSemaphore> wait_semaphores_;
+    std::vector<std::uint64_t> wait_values_;
+    std::vector<VkPipelineStageFlags> wait_stages_;
     VkCommandPool pool_{};
     VkSemaphore ready_{};
     std::uint64_t value_ = 0;

@@ -55,11 +55,22 @@ private:
 
 using TexturePageCommitter = bool (*)(const void*, std::size_t);
 
-// Check the whole footprint. A committed first page says nothing about a streamed mip farther on.
+// Check the whole footprint. A committed first page says nothing about a streamed mip farther on. A page xmem's frame
+// table holds (a stream pool page queue slot 31 gave a physical page: no host view, src/title_frames.h) is readable
+// through its frame.
 inline bool texture_memory_readable(std::uintptr_t base, std::uint64_t size, TexturePageCommitter commit = nullptr) {
     if (!base || !size || size > (std::numeric_limits<std::uintptr_t>::max)() - base) return false;
     const auto end = base + size;
     for (auto at = base; at < end;) {
+        auto stop = end;  // the host's part: up to the next table page
+        if (title_frames::may_hold(at, end)) {
+            bool backed = false;
+            stop = title_frames::run_end(at, end, backed);
+            if (backed) {
+                at = stop;
+                continue;
+            }
+        }
         MEMORY_BASIC_INFORMATION region{};
         const auto* address = reinterpret_cast<const void*>(at);
         if (!VirtualQuery(address, &region, sizeof(region))) return false;
@@ -77,7 +88,10 @@ inline bool texture_memory_readable(std::uintptr_t base, std::uint64_t size, Tex
         const auto start = reinterpret_cast<std::uintptr_t>(region.BaseAddress);
         if (at < start || at - start >= region.RegionSize) return false;
         const auto available = region.RegionSize - (at - start);
-        if (available >= end - at) return true;
+        if (available >= stop - at) {
+            at = stop;
+            continue;
+        }
         at += available;
     }
     return true;

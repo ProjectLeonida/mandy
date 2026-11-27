@@ -1132,6 +1132,7 @@ public:
         if (loaded_ && gpu_labels_.initialize(device, get)) {
             replay_.gpu_label = [this](VkCommandBuffer cb, const label::Write& write) { gpu_labels_.record(cb, write); };
         }
+        if (loaded_ && gpu_profile::enabled()) gpu_profile_.configure(device, get);  // LEONIDA_GPU_PROFILE=1
         replay_.pipeline_barrier = vk.vkCmdPipelineBarrier;
         replay_.clear_color_image = vk.vkCmdClearColorImage;
         replay_.clear_depth_stencil_image = vk.vkCmdClearDepthStencilImage;
@@ -1313,6 +1314,7 @@ public:
         progress_watch_ = {};  // stop before queues, timelines or diagnostic state go away
         gpu_labels_.stop(device_);
         fence_dispatcher_.reset();
+        gpu_profile_.stop();  // after the fence callbacks that hold its recordings
         deletion_queue_.drain(UINT64_MAX, device_, vk);
         for (const auto& [key, framebuffer] : resolve_framebuffers_)
             vk.vkDestroyFramebuffer(device_, framebuffer, nullptr);
@@ -1536,6 +1538,14 @@ public:
     // (timestampValidBits 0). Set by the device before any queue uses it.
     double timestamp_period() const { return timestamp_period_; }
     void set_timestamp_period(double period) { timestamp_period_ = period; }
+    // timestampValidBits by queue family, 0 for one that cannot reset or resolve queries. Set by the device before any
+    // queue uses it; LEONIDA_GPU_PROFILE profiles the queues of the families with bits.
+    void set_timestamp_bits(std::vector<std::uint32_t> bits) { timestamp_bits_ = std::move(bits); }
+    std::uint32_t timestamp_bits(std::uint32_t family) const {
+        return family < timestamp_bits_.size() ? timestamp_bits_[family] : 0;
+    }
+    // LEONIDA_GPU_PROFILE=1: the GPU time per pipeline (vulkan_gpu_profile.h). Tests read its sums.
+    gpu_profile::Profiler& gpu_profile() { return gpu_profile_; }
     // True where a timestamp resolve must be ordered explicitly after the timestamps it copies (MoltenVK on Apple
     // GPUs, docs/d3d12_vulkan.md section 4.6). Set by the device before any queue uses it.
     bool order_timestamp_copies() const { return order_timestamp_copies_; }
@@ -1607,18 +1617,21 @@ public:
         std::unique_lock lock(pipeline_mutex_);
         pipelines_[id] = pipeline;
         if (shader && device_fault_) device_fault_->pipeline_names[id] = {shader};
+        if (shader && gpu_profile::enabled()) profile_names_[id] = {shader};
     }
     void remove_pipeline(std::uintptr_t id) {
         std::unique_lock lock(pipeline_mutex_);
         pipelines_.erase(id);
         graphics_pipelines_.erase(id);
         if (device_fault_) device_fault_->pipeline_names.erase(id);
+        if (gpu_profile::enabled()) profile_names_.erase(id);
     }
     void add_graphics_pipeline(std::uintptr_t id, const GraphicsPipeline& pipeline,
                                const CheckpointShaders* shaders = nullptr) {
         std::unique_lock lock(pipeline_mutex_);
         graphics_pipelines_[id] = pipeline;
         if (shaders && device_fault_) device_fault_->pipeline_names[id] = *shaders;
+        if (shaders && gpu_profile::enabled()) profile_names_[id] = *shaders;
     }
     // Workers for the pipelines a submission needs and that are not built yet. Null (the default): compiled serially on
     // the submitting thread once resource_mutex_ is released. Replacing it waits for submissions that are compiling, and
@@ -1644,99 +1657,32 @@ public:
         occlusion_resolve_memory_ = memory;
     }
 
-    struct HostTextureStats { std::uint64_t copies = 0, waits = 0; };
-    HostTextureStats host_texture_stats() {
-        std::lock_guard lock(submit_mutex_);
-        return host_texture_stats_;
-    }
-
-    // LOCAL FIX (deadlock on the first-run pages): the texture writes below used vkDeviceWaitIdle with the submit
-    // lock held. The device is idle only once every queue has run all it was given, and a queue whose submitted
-    // work waits on a value a later submission signals never gets there while this thread keeps the lock: a native
-    // boot sat 270 s in vkDeviceWaitIdle (title staging), then lost the device. Instead: wait for the queue
-    // timelines to pass what was submitted so far, at most `timeout`; on VK_TIMEOUT the caller skips this write (the
-    // title-texture pass tries it again) rather than freeze the title. Not covered, unlike the device wait: present
-    // and probe submissions, which have their own fences outside the retirement timelines (a present reading the
-    // image). The staged write is ordered behind them anyway (same queue, an ALL_COMMANDS barrier); the host copy
-    // is not, so a presented title texture can be written while a present still reads it (a torn frame, no fault).
-    // With submit_mutex_ held.
-    VkResult wait_submitted_locked(std::uint64_t timeout_ns, const char* what) {
-        if (is_device_lost()) return VK_ERROR_DEVICE_LOST;  // a queue's timeline may be gone already
-        const auto pending = retire_tickets_.pending_through(submitted_ticket_.load(std::memory_order_acquire));
-        if (pending.empty()) return VK_SUCCESS;
-        std::vector<VkSemaphore> semaphores;
-        std::vector<std::uint64_t> values;
-        for (const auto& [semaphore, value] : pending) {
-            semaphores.push_back(semaphore);
-            values.push_back(value);
-        }
-        VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-        wait.semaphoreCount = std::uint32_t(semaphores.size());
-        wait.pSemaphores = semaphores.data();
-        wait.pValues = values.data();
-        const VkResult r = observe_result(vk.vkWaitSemaphores(device_, &wait, timeout_ns), what);
-        if (r == VK_TIMEOUT) {
-            static std::atomic<std::uint64_t> timeouts{0};
-            const std::uint64_t n = timeouts.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (!(n & (n - 1)))
-                std::fprintf(stderr, "[rt] vulkan: %s: submitted work not done within %llu ms (%llu time(s)); the "
-                                     "write is skipped this time\n", what,
-                             static_cast<unsigned long long>(timeout_ns / 1000000), static_cast<unsigned long long>(n));
-        }
-        return r;
-    }
-    // Short: a timeout is certain when the awaited work needs this thread's lock, and the write is only skipped.
-    static constexpr std::uint64_t kTitleWriteWaitNs = 250'000'000;  // 250 ms
-
-    // CPU writes to a title texture have no application fence. Prevent another queue from
-    // claiming a new layout or submitting work between the completion check and the host copy.
-    // An unsatisfied console Wait lives in QueueHolds, outside the Vulkan queues.
-    template<class Copy>
-    VkResult write_host_texture(ResourceId id, std::uint32_t subresource, Copy&& copy) {
-        std::lock_guard layout_lock(tracker_mutex_);
-        std::lock_guard queue_lock(submit_mutex_);
-        if (tracker_.layout(id, subresource) != VK_IMAGE_LAYOUT_GENERAL) return VK_NOT_READY;
-        if (image_work_pending_) {
-            ++host_texture_stats_.waits;
-            // A device wait is a queue operation: it passes the compile gate, so it never waits in the driver behind a
-            // long pipeline create (the starved wait that loses the device after 10 s).
-            const SubmitMutex::SubmitTurn turn(submit_mutex_);
-            const auto result = wait_submitted_locked(kTitleWriteWaitNs, "vkWaitSemaphores (title texture upload)");
-            // Not done in time: VK_NOT_READY, so the caller takes its staged path (ordered on the queue) or tries
-            // again later, and the skip is not counted as a failed fill.
-            if (result == VK_TIMEOUT) return VK_NOT_READY;
-            if (result != VK_SUCCESS) return result;
-            image_work_pending_ = false;
-        }
-        if (!copy()) return VK_ERROR_UNKNOWN;
-        ++host_texture_stats_.copies;
-        return VK_SUCCESS;
-    }
-
-    // A complete CPU-side replacement of these color subresources. Serialize with replay and
-    // present while recording the old layouts, finishing prior reads and publishing the copy.
+    // A complete replacement of these color subresources from a staging buffer (TitleImageUpload): the title's CPU
+    // writes into its own texture memory, brought to the image. Serialized with replay and present while the old
+    // layouts are read and the transfer is submitted. It never waits for the GPU on the CPU: `copy(replay, pieces,
+    // waits)` records the transfer and submits it with a GPU wait on `waits`, every queue timeline value submitted so
+    // far, so it runs after all earlier work that may still read the image, on any queue, and before every submission
+    // made after it (the ones that sample the new texels). Until 2026-11 this waited on the CPU for that work for at
+    // most 250 ms and skipped the write when it was not done: a world frame takes longer, so changed textures (the
+    // planes of a video frame among them) arrived late or out of step, and the submitting thread stalled. A GPU wait
+    // cannot deadlock: every value in `waits` was submitted already, and a console Wait whose signal is not submitted
+    // yet is held in QueueHolds, outside the Vulkan queues, so the work behind these values completes without
+    // anything submitted later.
     template<class Copy>
     VkResult write_staged_title_image(ResourceId id, const VkImageSubresourceRange& range, Copy&& copy) {
         std::lock_guard layout_lock(tracker_mutex_);
         std::lock_guard queue_lock(submit_mutex_);
+        if (is_device_lost()) return VK_ERROR_DEVICE_LOST;
         LayoutPieces pieces;
         if (!tracker_.pieces(id, range, pieces) || pieces.empty()) return VK_ERROR_UNKNOWN;
-        if (image_work_pending_) {
-            const SubmitMutex::SubmitTurn turn(submit_mutex_);  // a queue operation: the compile gate (as above)
-            const auto r = wait_submitted_locked(kTitleWriteWaitNs, "vkWaitSemaphores (title staging)");
-            if (r != VK_SUCCESS) return r;
-            image_work_pending_ = false;
-        }
-        const auto r = observe_result(copy(replay_, pieces), "title staging upload");
+        const auto waits = retire_tickets_.pending_through(submitted_ticket_.load(std::memory_order_acquire));
+        const auto r = observe_result(copy(replay_, pieces, waits), "title staging upload");
         if (r == VK_SUCCESS) {
             for (const auto& p : pieces)
                 if (p.layout == VK_IMAGE_LAYOUT_UNDEFINED) tracker_.set(id, p.range, VK_IMAGE_LAYOUT_GENERAL);
         }
         return r;
     }
-
-    // Present and probe submissions have their own fences, outside the queue retirement timelines.
-    void note_image_work_locked() { image_work_pending_ = true; }
 
     // For tests and traces.
     VkImageLayout layout(ResourceId id, std::uint32_t subresource) {
@@ -2054,7 +2000,6 @@ public:
     void record_submit_locked(VkSemaphore progress, std::uint64_t value) {
         const auto ticket = submitted_ticket_.fetch_add(1, std::memory_order_acq_rel) + 1;
         retire_tickets_.record(ticket, progress, value);
-        note_image_work_locked();
     }
     void retire_queue_idle_locked(VkSemaphore progress) {
         retire_tickets_.queue_idle(progress);
@@ -2366,8 +2311,6 @@ private:
     // gate's own mutex is a leaf; a submission waits at the gate with submit_mutex_ held, for creates already in the
     // driver only (SubmitMutex::CompileTurn).
     alignas(64) SubmitMutex submit_mutex_;
-    bool image_work_pending_ = false;  // under submit_mutex_
-    HostTextureStats host_texture_stats_;  // under submit_mutex_
     RetireTickets<VkSemaphore> retire_tickets_;
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;
@@ -2428,6 +2371,9 @@ private:
     std::function<void(bool)> bindless_commit_;
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
+    std::vector<std::uint32_t> timestamp_bits_;  // by queue family (set_timestamp_bits)
+    gpu_profile::Profiler gpu_profile_;          // LEONIDA_GPU_PROFILE=1
+    gpu_profile::NameMap profile_names_;         // its pipeline names, guarded by pipeline_mutex_
     bool order_timestamp_copies_ = false;
     VkPhysicalDeviceMemoryProperties occlusion_resolve_memory_{};
     label::Completions gpu_labels_;
@@ -3632,6 +3578,16 @@ private:
             return queue_unsupported(__LINE__);
         }
         replay.bindless_set = context_.bindless_current_ ? context_.bindless_current_() : VK_NULL_HANDLE;
+        // LEONIDA_GPU_PROFILE=1: the submission's query pool is reset and its first timestamp written here, after the
+        // failure path above (which submits the buffer without a recording); dropped unless the buffer is submitted.
+        std::unique_ptr<gpu_profile::Recording> profile;
+        if (gpu_profile::enabled()) {
+            std::size_t commands = 0;
+            for (const CommandList* list : lists) commands += list->commands().size();
+            profile = context_.gpu_profile_.begin(command_buffer, int(kind_), context_.timestamp_period(),
+                                                  context_.timestamp_bits(family_), commands, &context_.profile_names_);
+            replay.gpu_profile = profile.get();
+        }
         const bool bindless_uploaded = std::exchange(context_.bindless_upload_pending_, false);
         // Layout changes go into the tracker itself, journalled, and are undone unless the submission reaches the
         // queue (tracker_mutex_ is held from here to the commit, so nothing else sees them meanwhile).
@@ -3733,6 +3689,7 @@ private:
             readback_stages |= list.readback_src_stages;
         }
         close_labels(command_buffer, replay, open_labels);
+        if (profile) profile->finish(command_buffer);
         // Only flush GPU writes to the host domain when this batch actually wrote to a readback buffer.
         if (wrote_readback) {
             const VkPipelineStageFlags2 allowed = queue_supported_stages(kind_);
@@ -3774,6 +3731,14 @@ private:
         }
         const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0,
                                                execute_call ? &diagnostics : nullptr);
+        if (profile && submitted) {
+            // Read once this submission (ticket submitted_ on progress_) is done; the pool is reused after that.
+            profile->mark_submitted();
+            std::shared_ptr<gpu_profile::Recording> recording(std::move(profile));
+            context_.enqueue_fence_callback(progress_, submitted_, [profiler = &context_.gpu_profile_, recording] {
+                profiler->resolve(*recording);
+            });
+        }
         if (mesh_draws)
             std::fprintf(stderr, "[rt] pso-mesh unix_ms=%lld draws=%u submitted=%d\n",
                          pipeline_profile::unix_ms(), mesh_draws, int(submitted));

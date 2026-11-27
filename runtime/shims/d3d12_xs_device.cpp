@@ -1984,6 +1984,8 @@ bool execute_with_values(ChildProxy* self, UINT count, void* const* lists);
 // list proxy replaced by its real list (a bundle on the list side unwraps the same way at the console's
 // ExecuteBundle); the real queue never sees a proxy.
 std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word) {
+    // While the title submits, a held list-value wait is not released for want of progress: this may carry its write.
+    const list_values::Pump::TitleCall title_call;
     if (lists_word &&
         execute_with_values(self, static_cast<UINT>(count_word), reinterpret_cast<void* const*>(lists_word)))
         return 0;
@@ -2431,11 +2433,24 @@ HRESULT queue_copy_page_mappings(ChildProxy* self, UINT count, const xmem::PageB
         stats.max = (std::max)(stats.max, t2 - t0);
         if (t2 - stats.since >= std::chrono::seconds(10)) {
             const auto ms = [](clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
+            // Pages changed by a table update alone (GPU-only pages with a CPU pair, and those pairs' CPU pages) and
+            // by a host map or unmap (a wineserver round trip each under Wine), since the last line, by path
+            // (rt::xmem::Slot31Counts).
+            static rt::xmem::Slot31Counts before{};
+            rt::xmem::Slot31Counts now{};
+            if (rt::xmem::slot31_mapping_counts_fn) rt::xmem::slot31_mapping_counts_fn(now);
+            const auto since = [](std::uint64_t a, std::uint64_t b) { return static_cast<unsigned long long>(a - b); };
             std::fprintf(stderr, "[rt] d3d12_xs: queue slot 31: %llu calls (%llu batches) in %.0f s: %.1f ms waiting "
-                                 "for the queue, %.1f ms mapping, %.1f ms the longest call\n",
+                                 "for the queue, %.1f ms mapping, %.1f ms the longest call; pages %llu by table, %llu "
+                                 "by host remap (table: %llu GPU-only, %llu CPU twins; %llu twins the title mapped "
+                                 "kept; host: %llu with no CPU pair, %llu views replaced)\n",
                          static_cast<unsigned long long>(stats.calls), static_cast<unsigned long long>(stats.ranges),
                          std::chrono::duration<double>(t2 - stats.since).count(), ms(stats.wait), ms(stats.map),
-                         ms(stats.max));
+                         ms(stats.max), since(now.table(), before.table()), since(now.host(), before.host()),
+                         since(now.gpu_pages, before.gpu_pages), since(now.twin_pages, before.twin_pages),
+                         since(now.twins_kept, before.twins_kept), since(now.unpaired_pages, before.unpaired_pages),
+                         since(now.views_replaced, before.views_replaced));
+            before = now;
             stats = {};
             stats.since = t2;
         }
@@ -2618,6 +2633,9 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             const unsigned present_x_slot =
                 newer && !qroutes.present_x_set ? qroutes.present_x + 2 : qroutes.present_x;
             if (Slot >= self->slot_count) {
+                // A present stands behind the work held so far, which may then go without its values once nothing
+                // else can run (d3d12_xs_list_values.h). Noted before it, whichever presentation takes it.
+                if (Slot == present_x_slot) list_values::Pump::get().note_present();
                 HRESULT hr = S_OK;
                 bool external_queue = false;
                 if (call_presentation(self->device, [&](const PresentationHandler& p) {
@@ -7001,8 +7019,9 @@ const char* list_tail_slot_name(unsigned slot, unsigned char console_layout) {
 // Every counter of list_values::Counters, by name: the stats and their reset stay in step.
 #define LEONIDA_LIST_VALUE_COUNTERS(X)                                                                         \
     X(writes_recorded) X(writes_landed) X(writes_failed) X(waits_recorded) X(waits_met_at_submit)            \
-    X(waits_relayed) X(gates_held) X(gates_met) X(gates_timed_out) X(cuts) X(cuts_deferred) X(cut_failures)  \
-    X(gates_short) X(demotions) X(late_met) X(bundle_ops) X(releases) X(release_us) X(release_us_max)        \
+    X(waits_relayed) X(gates_held) X(gates_met) X(gates_released) X(released_present) X(released_cycle)      \
+    X(released_stalled) X(released_lost) X(met_after_release) X(cuts) X(cuts_deferred) X(cut_failures)        \
+    X(bundle_ops) X(releases) X(release_us) X(release_us_max)                                                 \
     X(pass_us_max) X(release_stalls) X(remaps_now) X(remaps_deferred) X(remaps_failed) X(remap_wait_us_max)    \
     X(stamps_gpu) X(stamps_cpu) X(labels_handed) X(writes_arena) X(writes_title_pages)
 
@@ -7023,7 +7042,11 @@ void reset_list_value_stats() {
 }
 #undef LEONIDA_LIST_VALUE_COUNTERS
 
-void set_list_value_wait_timeout_ms(unsigned ms) { list_values::Pump::get().set_timeout_ms(ms); }
+void set_list_value_signal_submitted_hook(bool (*hook)(ID3D12Fence*, std::uint64_t)) {
+    list_values::signal_submitted_hook() = hook;
+}
+
+void note_list_value_present() { list_values::Pump::get().note_present(); }
 
 void set_list_values_enabled(bool on) { list_values::set_enabled(on); }
 

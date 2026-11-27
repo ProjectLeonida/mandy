@@ -2255,6 +2255,8 @@ public:
     UINT64 STDMETHODCALLTYPE GetCompletedValue() override {
         return context_.is_device_lost() ? UINT64_MAX : fence_.completed();
     }
+    // A Signal of at least `value` went to the GPU (or the CPU set it), not held (fence_signal_submitted).
+    bool signal_submitted(UINT64 value) { return !context_.holds().pending(fence_.semaphore(), value); }
     D3D12_FENCE_FLAGS STDMETHODCALLTYPE GetCreationFlags() override { return flags_; }
 
     // vkSignalSemaphore must stay below every signal still pending on the GPU
@@ -2975,6 +2977,11 @@ bool fence_callback_at(ID3D12Fence* fence, std::uint64_t value, std::function<vo
     if (!f) return false;
     f->callback_at(value, std::move(fn));
     return true;
+}
+
+bool fence_signal_submitted(ID3D12Fence* fence, std::uint64_t value) {
+    Fence* f = Fence::from(fence);
+    return !f || f->signal_submitted(value);
 }
 
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue) {

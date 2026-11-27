@@ -5,14 +5,18 @@
 //     then one draw over that scratch. The dispatch runs before the draw's rendering scope and outside a
 //     pipeline-statistics query, reads no index past the view, and a draw with more quads than one dispatch may
 //     cover is split into several.
+//   - With LEONIDA_DEVICE_MARKERS' breadcrumbs, the draw's marker pair encloses the expansion and the draw.
 // No GPU: the Vulkan calls are recorded.
 #include "../src/vulkan_replay.h"
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -401,6 +405,46 @@ int main() {
             "begin_query 4", "end_query 4", "barrier", "bind_compute", "dispatch", "barrier", "begin_query 5",
             "begin_rendering", "bind_graphics", "draw_indexed", "end_rendering", "end_query 5"};
         ok &= check(events == want, "the dispatch runs between the query's two segments, the draw in the second");
+    }
+
+    // LEONIDA_DEVICE_MARKERS=1 (vulkan_device_markers.h): the draw's started marker comes before its index expansion
+    // and rendering scope, its finished marker after the scope, and the history entry says what the draw was.
+    {
+        reset();
+        CommandList list;
+        ok &= check(list.draw(draw) && list.close(), "record a quad draw for the markers");
+        PreparedList prepared;
+        ok &= check(prepare(list, resolve, vk, prepared) == ReplayResult::success, "prepare the marked draw");
+        std::atomic<std::uint64_t> seq{41};
+        CheckpointSubmission submission;
+        submission.execute_call = 3;
+        submission.queue_kind = "direct";
+        submission.lists.resize(1);
+        submission.dispatch_seq = &seq;
+        submission.markers = {nullptr,
+                              +[](VkCommandBuffer, VkPipelineStageFlags2 stage, VkBuffer, VkDeviceSize, std::uint32_t m) {
+                                  events.push_back(
+                                      (stage == VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT ? "started " : "finished ") +
+                                      std::to_string(m));
+                              },
+                              handle<VkBuffer>(30), 0};
+        const std::unordered_map<std::uintptr_t, CheckpointShaders> names{
+            {1, {"library/vs_quad", nullptr, "library/ps_quad"}}};
+        const CheckpointRecorder recorder{nullptr, submission, names, 0};
+        emit_commands<true>(prepared, VK_NULL_HANDLE, vk, nullptr, nullptr, &recorder);
+        std::vector<std::string> want{"started 42"};
+        want.insert(want.end(), one_dispatch_one_draw.begin(), one_dispatch_one_draw.end());
+        want.push_back("finished 42");
+        ok &= check(events == want, "a draw's markers enclose its index expansion and its rendering scope");
+        ok &= check(submission.marked.size() == 1 && submission.marked[0].is_draw() &&
+                        submission.marked[0].draw_flags == (marked_draw::indexed | marked_draw::quads) &&
+                        submission.marked[0].counts == std::array<std::uint32_t, 3>{8, 2, 0} &&
+                        submission.marked[0].pass_draw == 1 && submission.marked[0].seq == 42,
+                    "the marked draw is an indexed quad list of 8 indices and 2 instances");
+        ok &= check(describe_marked(submission.marked[0]).find(
+                        "draw=indexed-quads count=8 instances=2 pipeline=vs vs_quad ps ps_quad pass=draw 1 since "
+                        "command 0 (0 colours, 0x0)") != std::string::npos,
+                    "the report line names the draw and its pipeline");
     }
     return ok ? 0 : 1;
 }

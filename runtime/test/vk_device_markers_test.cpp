@@ -1,8 +1,9 @@
 // The AMD breadcrumbs of the device-fault report (src/vulkan_device_markers.h, LEONIDA_DEVICE_MARKERS=1) on a real
 // device: dispatches recorded through CheckpointRecorder with the markers on, submitted and waited for, leave their
 // queue's started and finished markers at the last dispatch's seq, and the report calls none of them hung. Two
-// submissions, so the second continues the first one's numbering. The shader is an empty hand-written compute
-// program; nothing is meant to fault or hang. SKIP (77) without a Vulkan device or without VK_AMD_buffer_marker.
+// submissions, so the second continues the first one's numbering; a third adds draw markers outside and inside a
+// dynamic-rendering scope and the report names the last draw. The shader is an empty hand-written compute program;
+// nothing is meant to fault or hang. SKIP (77) without a Vulkan device or without VK_AMD_buffer_marker.
 // LEONIDA_VK_VALIDATION=1 runs it under VK_LAYER_KHRONOS_validation (any validation error fails the test).
 #include "vk_test_device.h"
 #include "../src/vulkan_device_fault.h"
@@ -10,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -116,6 +118,48 @@ int run(vktest::Device& d) {
         EXPECT(slot.started == last_seq && slot.finished == last_seq);
         EXPECT(diagnostics.report_markers(false).empty());
     }
+
+    // Draw markers, as the replay writes them: one pair outside a rendering scope (the replay's own draws) and one
+    // inside an open dynamic-rendering scope (the legacy indirect path draws in the caller's), which
+    // VK_AMD_buffer_marker allows. No draw call is needed for the markers; the scope has no attachments.
+    const auto begin_rendering = d.fn<PFN_vkCmdBeginRendering>("vkCmdBeginRendering");
+    const auto end_rendering = d.fn<PFN_vkCmdEndRendering>("vkCmdEndRendering");
+    EXPECT(begin_rendering && end_rendering);
+    auto submission = diagnostics.begin_submission(diagnostics.next_execute_call(), d.queue, "direct", 1);
+    const CheckpointRecorder recorder{nullptr, submission, diagnostics.pipeline_names, 0};
+    const std::uintptr_t graphics_id = pipeline_id + 1;
+    diagnostics.pipeline_names[graphics_id] = {"vs_marker_test", nullptr, "ps_marker_test"};
+    const bool ran = d.run([&](VkCommandBuffer cb) {
+        recorder.dispatch(cb, 0, pipeline.pipeline, pipeline_id, roots, {1, 1, 1});  // seq 9
+        bind(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+        dispatch(cb, 1, 1, 1);
+        recorder.dispatched(cb);
+        recorder.draw(cb, 1, graphics_id, marked_draw::indexed, {6, 1, 0});  // seq 10, outside a scope
+        recorder.drawn(cb);
+        VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        rendering.renderArea = {{0, 0}, {16, 16}};
+        rendering.layerCount = 1;
+        begin_rendering(cb, &rendering);
+        recorder.draw(cb, 2, graphics_id, marked_draw::indirect, {4, 16, 0});  // seq 11, inside the scope
+        recorder.drawn(cb);
+        end_rendering(cb);
+        return true;
+    });
+    EXPECT(ran);
+    EXPECT(submission.marked.size() == 3 && submission.marked.back().seq == last_seq + 3);
+    diagnostics.publish(std::move(submission));
+    const MarkerSlot slot = diagnostics.marker_slot(d.queue);
+    std::printf("draws: started=%u finished=%u, last seq %llu\n", slot.started, slot.finished,
+                static_cast<unsigned long long>(last_seq + 3));
+    EXPECT(slot.started == last_seq + 3 && slot.finished == last_seq + 3);
+    std::string text;
+    EXPECT(diagnostics.report_markers(false, &text).empty());
+    EXPECT(text.find("  finished: seq=" + std::to_string(last_seq + 3) + " ") != std::string::npos);
+    EXPECT(text.find("command=2 draw=vertices-indirect max=4 stride=16 pipeline=vs vs_marker_test ps ps_marker_test") !=
+           std::string::npos);
+    const std::string fault = diagnostics.marker_fault_draws();
+    EXPECT(fault.find("last started draw (device-markers): seq=" + std::to_string(last_seq + 3)) != std::string::npos &&
+           fault.find("(finished)") != std::string::npos);
     return 0;
 }
 
