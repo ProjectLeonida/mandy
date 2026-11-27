@@ -71,14 +71,38 @@ vec3 nits_to_pq(vec3 nits) {
     return pow((c1 + c2 * y) / (1.0 + c3 * y), vec3(m2));
 }
 
-// One texel as linear premultiplied colour (plane space) and its alpha. Premultiplied data is divided by alpha for the
-// decode (the curve applies to the colour, not to colour times alpha) and multiplied again after.
+// One texel as linear premultiplied colour (plane space) and its alpha.
+// - A premultiplied *_UNORM_SRGB plane was blended in linear light by the RTV and sRGB-encoded on write, so texelFetch
+//   already returns linear premultiplied RGB; re-encoding and dividing by alpha would divide sRGB-encoded values by
+//   linear alpha and clip translucent UI toward white. Under gamma 2.2, the [0, a] component is reinterpreted via the
+//   unassociated sRGB curve (keeping stored-byte identity for opaque pixels and avoiding 8-bit quantization jumps at
+//   lin ~= a), and any additive excess max(lin - a, 0) is reinterpreted directly.
+// - A UNORM premultiplied plane holds encoded-space premultiplied colour: divide by alpha for the decode when a > 0
+//   and multiply by alpha after; when a == 0, decode e directly so additive premultiplied pixels (rgb > 0, a == 0)
+//   keep their light instead of vanishing.
 vec4 fetch_texel(texture2D t, ivec2 i, uint flags) {
     vec4 c = texelFetch(t, i, 0);
     bool opaque = (flags & flag_opaque) != 0u;
     float a = opaque ? 1.0 : clamp(c.a, 0.0, 1.0);
-    vec3 e = (flags & flag_srgb_source) != 0u ? srgb_encode(c.rgb) : c.rgb;
-    if (!opaque && (flags & flag_straight_alpha) == 0u) e = a > 0.0 ? e / a : vec3(0.0);
+    bool srgb_src = (flags & flag_srgb_source) != 0u;
+    bool premul = !opaque && (flags & flag_straight_alpha) == 0u;
+    if (srgb_src && premul && (flags & flag_hdr10) == 0u) {
+        vec3 lin = max(c.rgb, 0.0);
+        if (pc.sdr_eotf == 1u) {
+            vec3 excess = sdr_decode(srgb_encode(max(lin - a, 0.0)));
+            lin = (a > 0.0 ? sdr_decode(srgb_encode(min(lin, vec3(a)) / a)) * a : vec3(0.0)) + excess;
+        }
+        return vec4(lin, a);
+    }
+    vec3 e = srgb_src ? srgb_encode(c.rgb) : c.rgb;
+    if (premul) {
+        if (a > 0.0) {
+            vec3 lin = (flags & flag_hdr10) != 0u ? pq_to_nits(e / a) : sdr_decode(e / a);
+            return vec4(lin * a, a);
+        }
+        vec3 lin = (flags & flag_hdr10) != 0u ? pq_to_nits(e) : sdr_decode(e);
+        return vec4(lin, 0.0);
+    }
     vec3 lin = (flags & flag_hdr10) != 0u ? pq_to_nits(e) : sdr_decode(e);
     return vec4(lin * a, a);
 }
@@ -126,7 +150,7 @@ vec3 to_working(vec3 lin, float a, bool plane_hdr) {
     bool out_hdr = pc.out_hdr != 0u;
     if (plane_hdr == out_hdr) return lin;
     if (!plane_hdr) return bt709_to_bt2020(lin) * pc.sdr_white;
-    if (a <= 0.0) return vec3(0.0);
+    if (a <= 0.0) return tone_map(max(bt2020_to_bt709(lin) / pc.sdr_white, 0.0));
     return tone_map(max(bt2020_to_bt709(lin / a) / pc.sdr_white, 0.0)) * a;
 }
 

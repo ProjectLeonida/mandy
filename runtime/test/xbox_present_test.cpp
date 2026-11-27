@@ -1069,6 +1069,74 @@ int main() {
                 xbox.set_sdr_eotf(leonida::PresentPlanes::SdrEotf::srgb);
                 xbox_present_ref::gamma22 = false;
                 std::printf("compose: SDR EOTF sRGB and gamma 2.2: linear blend matches the model, single planes unchanged: ok\n");
+
+                // C2b: premultiplied *_UNORM_SRGB plane 1 and additive premultiplied (a == 0) pixels.
+                // An *_UNORM_SRGB RTV blends in linear light and sRGB-encodes the premultiplied colour; texelFetch
+                // returns linear premultiplied RGB directly, so re-encoding and dividing by alpha blows out to 255.
+                Source srgb_ui;
+                EXPECT(make_source(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, srgb_ui, 8, 8));
+                const FLOAT half_premul[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+                EXPECT(fill(srgb_ui, half_premul));
+                pair[0] = parameters(black.source, nullptr, xbox_scale_filter_point);
+                pair[1] = parameters(srgb_ui, nullptr, xbox_scale_filter_point, 0, rt::d3d12::xbox_plane_flag_overlay);
+                for (const bool g22 : {false, true}) {
+                    xbox.set_sdr_eotf(g22 ? leonida::PresentPlanes::SdrEotf::gamma22 : leonida::PresentPlanes::SdrEotf::srgb);
+                    EXPECT(present_planes(pair, 2) && composed_ok());
+                    EXPECT(region_is(frame, 0, 0, width, height, g22 ? Px{186, 186, 186} : Px{188, 188, 188}, 1));
+                }
+                xbox.set_sdr_eotf(leonida::PresentPlanes::SdrEotf::srgb);
+                const FLOAT quarter_premul[4] = {0.25f, 0.25f, 0.25f, 0.25f};
+                EXPECT(fill(srgb_ui, quarter_premul));
+                EXPECT(present_planes(pair, 2) && composed_ok());
+                EXPECT(region_is(frame, 0, 0, width, height, {137, 137, 137}, 1));
+                // Opaque pixel on an *_UNORM_SRGB plane 1 keeps stored-byte identity under gamma 2.2 (as plane 0 does).
+                const FLOAT dark_opaque[4] = {0.007f, 0.007f, 0.007f, 1.0f};  // sRGB byte 20
+                EXPECT(fill(srgb_ui, dark_opaque));
+                xbox.set_sdr_eotf(leonida::PresentPlanes::SdrEotf::gamma22);
+                EXPECT(present_planes(pair, 2) && composed_ok());
+                EXPECT(region_is(frame, 0, 0, width, height, {20, 20, 20}, 1));
+                // Straight-alpha *_UNORM_SRGB plane 1 still premultiplies after decode under both EOTFs.
+                const FLOAT half_straight[4] = {1.0f, 1.0f, 1.0f, 0.5f};
+                EXPECT(fill(srgb_ui, half_straight));
+                pair[1] = parameters(srgb_ui, nullptr, xbox_scale_filter_point, 0,
+                                     rt::d3d12::xbox_plane_flag_overlay | rt::d3d12::xbox_plane_flag_straight_alpha);
+                for (const bool g22 : {false, true}) {
+                    xbox.set_sdr_eotf(g22 ? leonida::PresentPlanes::SdrEotf::gamma22 : leonida::PresentPlanes::SdrEotf::srgb);
+                    EXPECT(present_planes(pair, 2) && composed_ok());
+                    EXPECT(region_is(frame, 0, 0, width, height, g22 ? Px{186, 186, 186} : Px{188, 188, 188}, 1));
+                }
+                xbox.set_sdr_eotf(leonida::PresentPlanes::SdrEotf::srgb);
+                std::printf("compose: premultiplied and straight *_UNORM_SRGB plane 1 overlays: ok\n");
+
+                // Additive premultiplied pixels (rgb > 0, a == 0) add light over the base; transparent black (0,0,0,0)
+                // and straight-alpha a == 0 leave the base untouched.
+                EXPECT(paint(black, {0, 0, LONG(width), LONG(height)}, 64, 64, 64, 255));
+                const FLOAT add_srgb[4] = {0.5f, 0.0f, 0.0f, 0.0f};
+                EXPECT(fill(srgb_ui, add_srgb));
+                pair[1] = parameters(srgb_ui, nullptr, xbox_scale_filter_point, 0, rt::d3d12::xbox_plane_flag_overlay);
+                EXPECT(present_planes(pair, 2) && composed_ok());
+                EXPECT(region_is(frame, 0, 0, width, height, {196, 64, 64}, 1));
+
+                const FLOAT add_unorm[4] = {188.0f / 255.0f, 0.0f, 0.0f, 0.0f};
+                EXPECT(fill(half_white.source, add_unorm));
+                pair[1] = parameters(half_white.source, nullptr, xbox_scale_filter_point, 0, rt::d3d12::xbox_plane_flag_overlay);
+                EXPECT(present_planes(pair, 2) && composed_ok());
+                EXPECT(region_is(frame, 0, 0, width, height, {197, 64, 64}, 1));
+
+                const FLOAT clear_zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                const FLOAT straight_zero_alpha[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+                for (Source* src : {&srgb_ui, &half_white.source}) {
+                    EXPECT(fill(*src, clear_zero));
+                    pair[1] = parameters(*src, nullptr, xbox_scale_filter_point, 0, rt::d3d12::xbox_plane_flag_overlay);
+                    EXPECT(present_planes(pair, 2) && composed_ok());
+                    EXPECT(region_is(frame, 0, 0, width, height, {64, 64, 64}, 1));
+                    EXPECT(fill(*src, straight_zero_alpha));
+                    pair[1] = parameters(*src, nullptr, xbox_scale_filter_point, 0,
+                                         rt::d3d12::xbox_plane_flag_overlay | rt::d3d12::xbox_plane_flag_straight_alpha);
+                    EXPECT(present_planes(pair, 2) && composed_ok());
+                    EXPECT(region_is(frame, 0, 0, width, height, {64, 64, 64}, 1));
+                }
+                std::printf("compose: additive premultiplied (a == 0) sRGB and UNORM plane 1 overlays: ok\n");
             }
 
             // C3: HDR10 -> SDR output is tone mapped, not clipped: identity on luminance up to 0.8 of SDR white (162 nits), then
@@ -1153,6 +1221,16 @@ int main() {
                 EXPECT(region_is(frame, 0, 0, width, height, {211, 211, 211}, 3));
                 std::printf("compose: HDR10 plane 1 (premultiplied, alpha 2/3) over SDR plane 0: HDR10 output byte %d (hand 155), SDR output byte %d (hand 211): ok\n",
                             hdr_byte, int(frame.at(5, 5).r));
+                // Additive premultiplied HDR10 plane 1 (100 nits grey, alpha 0) over black: PQ output ~130, SDR output ~186.
+                const int add100 = code(100);
+                EXPECT(paint10a(hdr_ui, {0, 0, 16, 16}, add100, add100, add100, 0));
+                xbox.presenter().force_hdr_encoding(true);
+                EXPECT(present_planes(pair, 2) && composed_ok());
+                EXPECT(region_is(frame, 0, 0, width, height, {130, 130, 130}, 3));
+                xbox.presenter().force_hdr_encoding(false);
+                EXPECT(present_planes(pair, 2) && composed_ok());
+                EXPECT(region_is(frame, 0, 0, width, height, {186, 186, 186}, 3));
+                std::printf("compose: HDR10 plane 1 additive premultiplied (a == 0) over SDR plane 0: ok\n");
             }
 
             // D: an SDR plane 1 next to an HDR10 plane 0 that is not flagged an overlay is the GameDVR copy: not shown.
