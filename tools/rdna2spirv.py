@@ -13077,9 +13077,47 @@ class Gen:
         self.emit(f"{sh} = OpShiftLeftLogical %ulong {h64} %c64_32")
         self.emit(f"{addr} = OpBitwiseOr %ulong {sh} {l64}")
         self.emit(f"{full} = OpIAdd %ulong {addr} {o64}")
-        ptr = self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full, 'load', 4 * n)}")
+        ptr, host = self.tmp(), self.host_addr(full, 'load', 4 * n)
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
         self.uses_psb = True
+
+        def wide(count):
+            """Dwords 0..count-1 at the load's address as the fewest loads SPIR-V types allow: uvec4, then uvec2,
+            then one uint. Each is Aligned 4, the alignment SMEM has. One instruction's dwords are consecutive in
+            memory, so a driver can fetch them as one scalar or vector load instead of one per dword (RADV gave 6,048
+            global_load_b32, 5,935 v_readfirstlane and 5,448 64-bit compares for the 365 s_buffer_load_dwordx16
+            of an FSPX program loaded per dword).
+
+            The vectors are read through a Block whose member is NonWritable (%sl_blk2 / %sl_blk4): with it RADV
+            makes the 365 one s_load_b512 each; without it, one global_load_b128 and four v_readfirstlane per uvec4.
+            It says what SMEM is: the scalar cache is not coherent with the vector stores of the same wave, so the
+            title's code cannot rely on an SMEM load seeing its own earlier store to the same address (it would need
+            s_dcache_inv, which the translator does not model), and letting the driver order this load freely
+            against the module's stores keeps that rule rather than weakening it."""
+            got, k = [], 0
+            while k < count:
+                w = 4 if count - k >= 4 else 2 if count - k >= 2 else 1
+                if w == 1:
+                    q, v = self.tmp(), self.tmp()
+                    self.emit(f"{q} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(k)}")
+                    self.emit(f"{v} = OpLoad %uint {q} Aligned 4")
+                    got.append(v)
+                else:
+                    self.uses_psb_vec = True
+                    at = host
+                    if k:
+                        at = self.tmp()
+                        self.emit(f"{at} = OpIAdd %ulong {host} {self.cl(4 * k)}")
+                    b, q, v = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{b} = OpConvertUToPtr %_ptr_PSB_sl_blk{w} {at}")
+                    self.emit(f"{q} = OpAccessChain %_ptr_PSB_v{w}uint_sl {b} {self.cu(0)}")
+                    self.emit(f"{v} = OpLoad %v{w}uint_sl {q} Aligned 4")
+                    for j in range(w):
+                        e = self.tmp()
+                        self.emit(f"{e} = OpCompositeExtract %uint {v} {j}")
+                        got.append(e)
+                k += w
+            return got
         lim = None
         lim_val = None
         if sbuf:
@@ -13100,6 +13138,25 @@ class Gen:
                 self.emit(f"{raw} = OpIEqual %bool {stride} {self.cu(0)}")
                 self.emit(f"{lim} = OpSelect %ulong {raw} {nr64} {prod}")
         guarded = {}
+        slow_entry = None
+        if lim is not None and not (lim_val is not None and reg is None) and n > 1:
+            # Every dword in range (the last one is, so all are): one wide load, the common case. Otherwise the
+            # per-dword path below, which gives the out-of-range dwords 0 without reading them, as before.
+            last_end, all_ok = self.tmp(), self.tmp()
+            if reg is not None:
+                self.emit(f"{last_end} = OpIAdd %ulong {o64} {self.cl(4 * n)}")
+            else:
+                last_end = self.cl(imm + 4 * n)
+            self.emit(f"{all_ok} = OpUGreaterThanEqual %bool {lim} {last_end}")
+            lbl_fast, lbl_slow, lbl_join = self.tmp() + "_all", self.tmp() + "_part", self.tmp() + "_join"
+            self.emit(f"OpSelectionMerge {lbl_join} None")
+            self.emit(f"OpBranchConditional {all_ok} {lbl_fast} {lbl_slow}")
+            self.emit(f"{lbl_fast} = OpLabel")
+            fast = wide(n)
+            fast_exit = self.current_label_placeholder()
+            self.emit(f"OpBranch {lbl_join}")
+            self.emit(f"{lbl_slow} = OpLabel")
+            slow_entry = (fast, fast_exit, lbl_join)
         if lim is not None and not (lim_val is not None and reg is None):
             # A run-time bound: dword i is in range when off + 4*i + 4 <= limit, and out of range it is 0 with memory
             # not read. The ends grow with i, so "dword i in range" implies every dword before it is: one selection
@@ -13141,20 +13198,25 @@ class Gen:
                 v = self.tmp()
                 self.emit(f"{v} = OpPhi %uint {got_in[i]} {lbl_do} {self.cu(0)} {pre}")
                 guarded[i] = v
+            if slow_entry is not None:
+                fast, fast_exit, lbl_join = slow_entry
+                self.emit(f"OpBranch {lbl_join}")
+                self.emit(f"{lbl_join} = OpLabel")
+                for i in range(n):
+                    v = self.tmp()
+                    self.emit(f"{v} = OpPhi %uint {fast[i]} {fast_exit} {guarded[i]} {lbl_end}")
+                    guarded[i] = v
+        if guarded:
+            vals = [guarded[i] for i in range(n)]
+        elif lim is None:
+            vals = wide(n)
+        else:
+            # A bound known at translate time (lim_val, constant offset). The dwords in range are a prefix (their
+            # ends grow with i): one wide load for them, 0 for the rest.
+            count = sum(lim_val >= imm + 4 * i + 4 for i in range(n))
+            vals = wide(count) + [self.cu(0)] * (n - count)
         for i in range(n):
-            p, v = self.tmp(), self.tmp()
-            if i in guarded:
-                v = guarded[i]
-            elif lim is None:
-                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
-                self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
-            else:                   # a bound known at translate time (lim_val, constant offset): fold each dword
-                end_val = imm + 4 * i + 4
-                if lim_val >= end_val:
-                    self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
-                    self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
-                else:
-                    v = self.cu(0)
+            v = vals[i]
             if single_special:
                 if n == 2:          # vcc pair: low dword -> vcc_lo, high dword -> vcc_hi (data, not a lane mask)
                     self.emit(f"OpStore {'%vcc' if i == 0 else '%vcc_hi'} {v}")
@@ -16457,6 +16519,16 @@ def assemble(gen):
                   "%rt_uint = OpTypeRuntimeArray %uint", "%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint",
                   "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint"]
         dec.append("OpDecorate %rt_uint ArrayStride 4")
+        if gen.uses_psb_vec:            # dedupe_types merges these with any other uvec2 / uvec4
+            types += ["%v2uint_sl = OpTypeVector %uint 2", "%v4uint_sl = OpTypeVector %uint 4",
+                      "%_ptr_PSB_v2uint_sl = OpTypePointer PhysicalStorageBuffer %v2uint_sl",
+                      "%_ptr_PSB_v4uint_sl = OpTypePointer PhysicalStorageBuffer %v4uint_sl",
+                      "%sl_blk2 = OpTypeStruct %v2uint_sl", "%sl_blk4 = OpTypeStruct %v4uint_sl",
+                      "%_ptr_PSB_sl_blk2 = OpTypePointer PhysicalStorageBuffer %sl_blk2",
+                      "%_ptr_PSB_sl_blk4 = OpTypePointer PhysicalStorageBuffer %sl_blk4"]
+            for blk in ("%sl_blk2", "%sl_blk4"):
+                dec += [f"OpDecorate {blk} Block", f"OpMemberDecorate {blk} 0 Offset 0",
+                        f"OpMemberDecorate {blk} 0 NonWritable"]
         types += [f"{name} = OpConstant %ulong {v}" for v, name in sorted(gen.lconsts.items())]
     if tex:
         # Bindless set 0: images (binding 0), samplers (binding 1), descriptor hash table (binding 2).
@@ -17249,9 +17321,40 @@ def assemble(gen):
     else:
         tail = end_lock + "         OpReturn\n         OpFunctionEnd\n"
     insert_late_constants(gen, out, written)
-    return split_big_switch(no_contraction(dedupe_types(
+    return split_big_switch(no_contraction(scalar_loads_read_only(dedupe_types(
         "\n".join("         " + l if not l.startswith("%") or " = " not in l else l for l in out) +
-        "\n" + "\n".join(gen.body) + "\n" + tail)))
+        "\n" + "\n".join(gen.body) + "\n" + tail))))
+
+
+_PSB_POINTER_TYPE = re.compile(r"(?m)^\s*(%[\w.]+) = OpTypePointer PhysicalStorageBuffer ")
+_RESULT_OF_TYPE = re.compile(r"(?m)^\s*(%[\w.]+) = Op\w+ (%[\w.]+)")
+_MEMORY_WRITE = re.compile(r"(?m)^\s*(?:(?:%[\w.]+ = )?(OpStore|OpAtomic\w+|OpCopyMemory\w*)\b(.*)|.*\b(OpImageWrite|"
+                           r"OpImageTexelPointer)\b.*)$")
+
+
+def scalar_loads_read_only(text):
+    """Keep scalar_load's NonWritable wide loads (%sl_blk2 / %sl_blk4) only in a module that writes no memory.
+
+    NonWritable lets the driver read them as SMEM (RADV: one s_load_b512 for an s_buffer_load_dwordx16), but also
+    lets it order them freely against the module's own stores, and an s_load / s_buffer_load sees what the same
+    program stored before it (docs/design.md, Scalar/buffer memory; tools/valu_fuzz.py --family mem stores and then
+    loads it back, and RADV read the old words in 18 of 600 programs with the decoration). A module with no store,
+    atomic or image write to any memory can't reach that: nothing this dispatch runs writes what it reads."""
+    if "OpMemberDecorate %sl_blk" not in text:
+        return text
+    ptr_types = set(_PSB_POINTER_TYPE.findall(text))
+    pointers = {r for r, t in _RESULT_OF_TYPE.findall(text) if t in ptr_types}
+    for m in _MEMORY_WRITE.finditer(text):
+        if m.group(3):
+            break                                   # an image write or texel pointer: treat as a write
+        op, rest = m.group(1), m.group(2).split()
+        target = rest[0] if op in ("OpStore", "OpAtomicStore") or op.startswith("OpCopyMemory") else (
+            rest[1] if len(rest) > 1 else None)       # OpAtomicX %type %pointer ...
+        if target in pointers or op.startswith("OpCopyMemory"):
+            break
+    else:
+        return text
+    return re.sub(r"(?m)^\s*OpMemberDecorate %sl_blk[24] 0 NonWritable\n", "", text)
 
 
 # SPIR-V caps an instruction at 65,535 words. The dispatch loop's OpSwitch has one (literal, label) pair per block,

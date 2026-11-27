@@ -849,9 +849,15 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                 w = p[1] // 4
                 values[res] = push_constants[w] if 0 <= w < len(push_constants) else 0
             elif p[0] == "psb":
-                if types.t[a[0]][:2] != ("int", 32):
-                    raise UnsupportedConstruct("PhysicalStorageBuffer load of a type that is not a 32-bit integer")
-                values[res] = memory.get(psb_word(p[1]), 0)
+                kind = types.t[a[0]]
+                if kind[0] == "vec" and types.t[kind[1]][:2] == ("int", 32):
+                    # A uvecN: N consecutive words (the wide scalar loads of rdna2spirv.scalar_load).
+                    values[res] = [memory.get(psb_word(p[1] + 4 * i), 0) for i in range(kind[2])]
+                elif kind[:2] != ("int", 32):
+                    raise UnsupportedConstruct("PhysicalStorageBuffer load of a type that is not a 32-bit integer "
+                                               "or a vector of them")
+                else:
+                    values[res] = memory.get(psb_word(p[1]), 0)
             else:
                 values[res] = types.copy_value(a[0], deref(p))
         elif op == "OpImageFetch":
