@@ -2190,6 +2190,22 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    (`sync_slot_changes`), and the submission's own changes before the rewritten slots, so an answer is never older
    than a change that concerns it. In one world run 70% of the 2,100 rewritten V# halves a submission resolved to
    nothing at about 9 µs each.
+   **A console resource heap read in place.** When the page mirror holds every page of the heap (a reservation xmem
+   placed in the mirror's range), there is no copy and no page tracker of the heap's own. 25,865 of 26,503 shaders
+   keep 32 bits of a descriptor-table pointer, so the heap's pages are bound a second time into the arena below
+   4 GiB (`TitleMirror::alias`, in the same bind batches as their mirror binds, so the one wait orders a reader of
+   either address), at a range of whole arena blocks with no arena memory behind it; the null slots after the heap are
+   that range's rest, unbound, which reads zero. Table pointers go there as before (`console_heap_ranges`). The
+   mirror fills the pages' home through a filter (`TitleMirror::filter_range`, `filter_heap_page`): the title's bytes
+   are only read, and the home, the mirror's own GPU memory, gets each slot that changed since it was last filtered,
+   or that a change of the address space touched: a V# whose base lies in the arena, in the mirror or in a buffer of
+   ours as the title wrote it (`reachable_as_written`), another V# resolved as before (an interim, until every title
+   allocation is in the mirror) or with no base and no records, a T# bound as before (its bindless index in the entry
+   comes later), other words null. The changes are applied to the homes at the mirror's refresh, before the pages
+   written since are filled. A heap the mirror does not hold (a device without the mirror, memory outside its range)
+   is copied as before. `d3d12_heap_in_place_test` checks that the GPU reads the filtered slots below 4 GiB while the
+   title's bytes never change, that a rewrite reaches the GPU at the next refresh, and that the null slots read zero;
+   `title_mirror_hooks_test` checks the two hooks without a GPU and `vk_heap_alias_test` the second binding on a device.
    Console resource heap copies and shader-visible CBV/SRV/UAV heaps with at least 65,536 slots request
    64 MiB of zeroed padding after their last descriptor. `LEONIDA_HEAP_GUARD_MB` sets the padding in MiB
    (0 disables it). When arena space is tight, allocation can fall back to the heap alone. Only indices

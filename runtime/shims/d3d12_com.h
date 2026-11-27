@@ -425,6 +425,9 @@ PageMirrorState page_mirror_state(ID3D12Device* device);
 // reads at a title-written address there) into `out` with the GPU, after the mirror's last bind. False when the mirror is
 // off or the address is not in one of its chunks. For tests.
 bool page_mirror_gpu_read(ID3D12Device* device, std::uint64_t title_va, void* out, std::size_t bytes);
+// The same at arena VA `va` (heap_base + va): what a shader reads there, a console heap read in place among it. False
+// when the mirror is off. For tests.
+bool arena_gpu_read(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes);
 
 // The blocks of device memory that textures share (src/image_memory.h): how many, their bytes, and the textures in
 // them. For tests.
