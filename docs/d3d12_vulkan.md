@@ -1727,11 +1727,13 @@ The copies:
   one included, and on the thread whose copy faulted it does not take that lock again (an SRW lock is not
   recursive; on 621.40 the title's submitting thread hung there for good, the main loop frozen with no device loss).
   Up to 8,192 ranges and 64 MiB a submission (a V# has no read/write bit, so every view
-  reached is compared; past the caps the ranges are left behind, logged once). `LEONIDA_TITLE_WRITEBACK=0` turns it off. A batch is fenced: it is kept with the ticket
-  of the submission that will use it and copied back only when the context reports that ticket retired, so a range
-  another submission is still writing is never read half done. A queue held deep (console ordering) can leave more
+  reached is compared; past the caps the ranges are left behind, logged once). `LEONIDA_TITLE_WRITEBACK=0` turns it off.
+  Each batch records the predicted next submission ticket (`submitted_retire_ticket() + 1`) before its writer
+  submits. Copy-back waits until the context's completed retirement prefix reaches that recorded ticket. This
+  removes the backlog-based bypass; it does not establish per-writer isolation across concurrent queues or snapshot
+  the shadow bytes, which later overlapping writers may change. A queue held deep (console ordering) can leave more
   than 64 batches waiting even while another queue finishes its own work: those ranges stay pending until their
-  tickets retire. The refresh does not wait for them while holding the shadow lock, which another queue may need
+  recorded tickets retire. The refresh does not wait for them while holding the shadow lock, which another queue may need
   to submit the work that releases the dependency. Pending range metadata can grow during a stall; queue length
   never substitutes for GPU completion. `d3d12_writeback_retirement` holds one of two Vulkan queues at a timeline
   semaphore, checks that 130 batches on the other queue do not write back early, then releases it and checks that
