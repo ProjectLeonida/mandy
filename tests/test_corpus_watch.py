@@ -160,5 +160,42 @@ class CorpusCounts(unittest.TestCase):
             self.assertEqual(kwargs.get("errors"), "replace")
 
 
+    def test_outputs_collide_rejects_work_corpus_indexes(self):
+        import contextlib
+        import io
+
+        game = os.path.join(self.tmp.name, "game")
+        os.makedirs(game, exist_ok=True)
+        out_dir = os.path.join(self.tmp.name, "port_out")
+        report = os.path.join(self.tmp.name, "report")
+        dxbc_idx = os.path.join(self.work, "shaders", "dxbc", "index.json")
+        raw_dxbc = '[{"stage": "vs"}]\n'
+        with open(dxbc_idx, "w", encoding="utf-8", newline="\n") as f:
+            f.write(raw_dxbc)
+
+        candidates = (
+            dxbc_idx,
+            os.path.join(self.work, "shaders", "spirv", "index.json"),
+            os.path.join(self.work, "dxbc", "index.json"),
+            os.path.join(self.work, "spirv", "index.json"),
+        )
+        for cand in candidates:
+            with self.subTest(index_path=cand):
+                self.assertTrue(corpus_watch.outputs_collide(self.work, report, cand, None, game=game, out=out_dir))
+                self.assertTrue(corpus_watch.outputs_collide(
+                    self.work, report, os.path.join(self.tmp.name, "counts.jsonl"), cand, game=game, out=out_dir,
+                ))
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            corpus_watch.main([
+                "--game", game, "--work", self.work, "--out", out_dir,
+                "--report", report, "--results", dxbc_idx, "--once",
+            ])
+        self.assertEqual(cm.exception.code, 2)
+        with open(dxbc_idx, encoding="utf-8") as f:
+            self.assertEqual(f.read(), raw_dxbc)
+
+
 if __name__ == "__main__":
     unittest.main()

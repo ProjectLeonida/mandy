@@ -84,6 +84,13 @@ def outputs_collide(work, report, results, log, game=None, out=None):
             if same_report_path(first, second):
                 return True
     inputs = [p for p in (work, game) if p]
+    if work:
+        inputs.extend([
+            os.path.join(work, "shaders", "dxbc", "index.json"),
+            os.path.join(work, "shaders", "spirv", "index.json"),
+            os.path.join(work, "dxbc", "index.json"),
+            os.path.join(work, "spirv", "index.json"),
+        ])
     for target_out in outputs:
         for inp in inputs:
             if same_report_path(target_out, inp):
