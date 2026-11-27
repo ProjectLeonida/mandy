@@ -434,9 +434,9 @@ public:
             hi = std::max(hi, (to + kPage - 1) & ~(kPage - 1));
         }
         if (lo >= hi) return 0;
-        // Allocated before lock_ is taken: a thread that faults on a guarded page waits on lock_ in reopen(), and may
-        // hold the heap's lock while it does.
-        std::vector<std::uint8_t> held_pages((hi - lo) / kPage);
+        // Sized before lock_ is taken: a thread that faults on a guarded page waits on lock_ in reopen(), and may hold
+        // the heap's lock while it does. Only write_back uses it, and one write_back runs at a time (shadow_mutex).
+        held_pages_.resize((hi - lo) / kPage);
         AcquireSRWLockExclusive(&lock_);
         // The copies below can fault on a page another guard (the geometry watch, another view's shadow) keeps
         // read-only. The fault handler asks this tracker too (reopen), and must not take lock_ again on this thread:
@@ -471,17 +471,23 @@ public:
         // A page the title wrote since it was last copied holds the newer bytes already: its GPU result is dropped and
         // the refresh's own copy carries the title's. So is a page whose mapping changed, one a kernel write may be
         // filling, and one xmem maps at another address too (a write there is seen by no guard and no watch here).
+        // Decided for every page of every range before the first copy (#2468, RT-WRITEBACK-TILE-REOPEN, and this
+        // call's other ranges): a copy below can fault on another guard, and the handler then reopens the whole 64 KiB
+        // tile here on this thread (reopen_range), which clears kClean and kProtected there; and a range that differs
+        // reopens its pages itself. Read live, either made the later runs on those pages count as written by the
+        // title, and their GPU results were dropped from a batch already taken off the queue. A page the title wrote
+        // before this point is held still.
         const std::size_t p0 = (lo - first_) / kPage;
         for (std::size_t r = 0; r < count; ++r) {
             const std::uintptr_t from = std::max(ranges[r].first, first_), to = std::min(ranges[r].second, last_);
             if (from >= to) continue;
             for (std::size_t i = (from - first_) / kPage, i1 = (to - first_ + kPage - 1) / kPage; i < i1; ++i) {
                 const std::uint8_t s = state_[i];
-                held_pages[i - p0] =
+                held_pages_[i - p0] =
                     (s & (kZero | kRequery | kPinned | kAliased)) || (!(s & kProtected) && !(s & kClean));
             }
         }
-        const auto held = [&](std::size_t i) { return held_pages[i - p0] != 0; };
+        const auto held = [&](std::size_t i) { return held_pages_[i - p0] != 0; };
         constexpr std::uintptr_t kPiece = 256;  // compared and copied in pieces this size
         std::size_t written = 0;
         for (std::size_t r = 0; r < count; ++r) {
@@ -505,7 +511,11 @@ public:
                             const std::uint8_t* copy = t.shadow + (c - t.begin);
                             if (std::memcmp(reinterpret_cast<const void*>(c), copy, e - c) != 0) {
                                 if (!opened) {
-                                    reopen_locked(at, at + pages * kPage);
+                                    // An earlier range on these pages may have reopened them already.
+                                    const std::size_t i0 = (at - first_) / kPage;
+                                    if (std::any_of(state_.begin() + i0, state_.begin() + i0 + pages,
+                                                    [](std::uint8_t page) { return page & kProtected; }))
+                                        reopen_locked(at, at + pages * kPage);
                                     opened = true;
                                 }
                                 std::memcpy(reinterpret_cast<void*>(c), copy, e - c);
@@ -1454,6 +1464,7 @@ private:
     std::uintptr_t first_ = 0, last_ = 0;  // the pages covered
     SRWLOCK lock_ = SRWLOCK_INIT;          // state_, cover_, the targets, and the protection of the pages
     std::atomic<DWORD> writer_{0};         // the thread in write_back, which holds lock_ while it copies into the title
+    Vector<std::uint8_t> held_pages_;      // write_back's per-page decision, taken before its copies
     Vector<std::uint8_t> state_;           // per 4 KiB page
     Vector<std::uint32_t> cover_;          // per 4 KiB page: the targets that read it
     Vector<Target> targets_;               // by start
