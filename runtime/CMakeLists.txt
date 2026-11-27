@@ -4363,6 +4363,11 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_mesh_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_mesh COMMAND d3d12_mesh_test)
       set_tests_properties(d3d12_mesh PROPERTIES SKIP_RETURN_CODE 77)
+      # Every console-numbered stream is realized on first use: the deferred path must read it with the console's
+      # numbering and keep the console-numbered record, or every type 24/26 subobject is refused (CONSOLE-STREAM-ON-DEMAND-REREAD).
+      add_test(NAME d3d12_mesh_on_demand COMMAND d3d12_mesh_test)
+      set_tests_properties(d3d12_mesh_on_demand PROPERTIES SKIP_RETURN_CODE 77
+                           ENVIRONMENT "LEONIDA_PIPELINE_COMPILE=on-demand")
       # The same draws through the heavy pipeline cache (src/heavy_pipeline_cache.h): every build first asks the
       # offline cache without compiling, and a miss is built against the heavy cache in a folder of its own.
       add_test(NAME d3d12_mesh_heavy_cache COMMAND d3d12_mesh_test)

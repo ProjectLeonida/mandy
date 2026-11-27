@@ -15663,13 +15663,52 @@ public:
             return shared_native_graphics(pc, mesh, containers, iid, out);
         });
     }
+    // parse_pipeline_stream, plus the console re-read: a stream the PC reading refuses, or leaves with an AS and no MS
+    // (no valid PC stream), is read again with the console's numbering, and that reading is taken when it holds a mesh
+    // shader (its 24) and no AS. A stream the PC reading accepts as valid is never read differently.
+    // LEONIDA_XS_STREAM_ENUM=pc keeps the PC reading alone (such PSOs are then refused, as before). The eager path and
+    // the deferred one below both read through here: the deferred path is handed console-numbered streams, and used to
+    // parse them as PC ones alone, which refused every console PSO while a device prepared PSOs on bind.
+    HRESULT parse_console_or_pc_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& source, PipelineStream& stream,
+                                       bool console_first = false) {
+        // The console entry points (Xbox CreatePipelineState, slot 86) are handed console-numbered streams: read those
+        // with the console's numbering first, and only fall back to the PC reading when that does not hold a mesh.
+        if (console_first && console_stream_enum_enabled()) {
+            PipelineStream console;
+            if (SUCCEEDED(parse_pipeline_stream(source, console, true)) && !console.as.pShaderBytecode &&
+                is_mesh_container(console.ms)) {
+                log_once("console pipeline stream: type 24 contains a mesh shader; DXIL kind", 13);
+                d3d12_xs::used_console_stream = true;
+                d3d12_trace::stream_refusal = nullptr;
+                stream = console;
+                return S_OK;
+            }
+        }
+        const HRESULT parsed = parse_pipeline_stream(source, stream);
+        if (!(FAILED(parsed) || (stream.as.pShaderBytecode && !stream.ms.pShaderBytecode)) ||
+            !console_stream_enum_enabled())
+            return parsed;
+        const char* pc_reason = d3d12_trace::stream_refusal;
+        PipelineStream console;
+        if (SUCCEEDED(parse_pipeline_stream(source, console, true)) && !console.as.pShaderBytecode &&
+            is_mesh_container(console.ms)) {
+            log_once("console pipeline stream: type 24 contains a mesh shader; DXIL kind", 13);
+            d3d12_xs::used_console_stream = true;
+            d3d12_trace::stream_refusal = nullptr;
+            stream = console;
+            return S_OK;
+        }
+        d3d12_trace::stream_refusal = pc_reason;
+        return parsed;
+    }
+
     // A fresh public PSO has its own COM identity, private data and name. Equal native descriptions can
     // hold one compiled backend PSO while either public object lives. The device only holds weak references.
     HRESULT prepare_console_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& source, REFIID iid, void** out,
                                    std::unique_ptr<rt::d3d12_xs::PsoStreamRecord> record) {
         if (!out)return E_POINTER;*out=nullptr;
         PipelineStream stream{};
-        if(const auto hr=parse_pipeline_stream(source,stream);FAILED(hr))return hr;
+        if(const auto hr=parse_console_or_pc_stream(source,stream,true);FAILED(hr))return hr;
         const auto* library=state_.library();if(!library)return E_FAIL;
         const auto verify=[&](const char* name,const D3D12_SHADER_BYTECODE& code) {
             if(!code.BytecodeLength)return true;
@@ -15691,9 +15730,10 @@ public:
             const auto& g=stream.graphics;
             if(stream.as.BytecodeLength || g.HS.BytecodeLength || g.DS.BytecodeLength)return E_NOTIMPL;
             if((bool(g.VS.BytecodeLength)==bool(stream.ms.BytecodeLength)) || g.NumRenderTargets>8 ||
-               !verify("vs",g.VS)||!verify("gs",g.GS)||!verify("ms",stream.ms)||!verify("ps",g.PS))return E_INVALIDARG;
+               !verify("vs",g.VS)||!verify("gs",g.GS)||!verify("ms",stream.ms)||!verify("ps",g.PS))
+                return E_INVALIDARG;
         }
-        if(!record) record=rt::d3d12_xs::PsoStreamRecord::capture(source);
+        if(!record) record=rt::d3d12_xs::PsoStreamRecord::capture(source, d3d12_xs::used_console_stream);
         if(!record)return E_INVALIDARG;
         auto* pipeline=new PipelineState(state_);
         pipeline->attach_device(identity());
@@ -17914,26 +17954,7 @@ public:
         *out = nullptr;
         if (!desc) return finish(E_INVALIDARG);
         PipelineStream stream;
-        HRESULT parsed = parse_pipeline_stream(*desc, stream);
-        // A stream the PC reading refuses, or leaves with an AS and no MS (no valid PC stream), is read again with the
-        // console's numbering (parse_pipeline_stream), and that reading is taken when it holds a mesh shader (its 24)
-        // and no AS. A stream the PC reading accepts as valid is never read differently. LEONIDA_XS_STREAM_ENUM=pc
-        // keeps the PC reading alone (such PSOs are then refused, as before).
-        if ((FAILED(parsed) || (stream.as.pShaderBytecode && !stream.ms.pShaderBytecode)) &&
-            console_stream_enum_enabled()) {
-            const char* pc_reason = d3d12_trace::stream_refusal;
-            PipelineStream console;
-            if (SUCCEEDED(parse_pipeline_stream(*desc, console, true)) && !console.as.pShaderBytecode &&
-                is_mesh_container(console.ms)) {
-                log_once("console pipeline stream: type 24 contains a mesh shader; DXIL kind", 13);
-                d3d12_xs::used_console_stream = true;
-                d3d12_trace::stream_refusal = nullptr;
-                stream = console;
-                parsed = S_OK;
-            } else {
-                d3d12_trace::stream_refusal = pc_reason;
-            }
-        }
+        const HRESULT parsed = parse_console_or_pc_stream(*desc, stream);
         if (FAILED(parsed)) return finish(parsed);
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
