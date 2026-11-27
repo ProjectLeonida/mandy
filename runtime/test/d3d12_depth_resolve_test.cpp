@@ -326,8 +326,9 @@ bool same_planes(const Planes& a, const Planes& b, bool only_resolved, const Cas
     if (c.plane) return only_resolved ? a.stencil == b.stencil : a.depth == b.depth && a.stencil == b.stencil;
     if (!only_resolved && a.stencil != b.stencil) return false;
     if (a.depth == b.depth) return true;
-    // Mixed-sample D16 AVERAGE can round by 1 LSB (1/65535) between Vulkan and D3D12 hardware resolves.
-    if (!c.edge || c.mode != D3D12_RESOLVE_MODE_AVERAGE || !unorm16(c) || a.depth.size() != b.depth.size())
+    // D16_UNORM clears and mixed-sample AVERAGE resolves can differ by 1 LSB (1/65535) across GPUs
+    // (e.g. Apple GPUs under MoltenVK/KosmicKrisp round a 0.25 clear down to 16383 instead of 16384).
+    if (!unorm16(c) || a.depth.size() != b.depth.size())
         return false;
     for (std::size_t i = 0; i + 1 < a.depth.size(); i += 2) {
         const auto u = int(std::uint16_t(a.depth[i] | (a.depth[i + 1] << 8)));
