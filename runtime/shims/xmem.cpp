@@ -2155,7 +2155,18 @@ bool map_table_page(uintptr_t address, uint64_t page) {
     uint64_t was = 0;
     if (const auto table = g_table_pages.find(address); table != g_table_pages.end()) {
         const auto mapped = g_mapped.find(address);
-        if (mapped != g_mapped.end() && mapped->second == page) return true;
+        // Unchanged only when the frame it holds is the memory behind the number now: a number the title freed comes
+        // back with its next allocation (g_free_slots, last in first out) naming another page, while the table entry
+        // still holds the freed one's frame. (g_table_frames is written with g_phys_mutex held, so it is read here
+        // without g_frame_lock.)
+        if (mapped != g_mapped.end() && mapped->second == page) {
+            const auto frame = g_table_frames.find(address);
+            const auto backing = page ? g_pages.find(page) : g_pages.end();
+            if (!page || (frame != g_table_frames.end() && backing != g_pages.end() &&
+                          frame->second.section == backing->second.section &&
+                          frame->second.offset == backing->second.offset))
+                return true;
+        }
         if (mapped != g_mapped.end()) {
             was = mapped->second;
             g_mapped.erase(mapped);
