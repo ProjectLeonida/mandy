@@ -422,13 +422,17 @@ public:
     // No deadlock: a create holds the gate only across its vkCreate*Pipelines and a submission only across its
     // vkQueueSubmit, and neither driver call waits for anything of ours.
     //
-    // A speculative create (a warm-up: nobody waits for its pipeline yet) does not hold submissions: they wait only for
-    // the demanded creates in the driver. It still never enters while a submission is in the driver or waits there, and
-    // at most warmup_max of them are in the driver at once, so the creates beside a submission stay bounded (HasiKe and
-    // MoonEyes, #2233 / #1608: a cold boot crawled at about one submission a second behind 290 s of warm-ups). One of a
-    // kind with the driver_holds verdict (adaptive gate) holds submissions as a demanded create does: a submission beside
-    // it would wait in the driver instead. LEONIDA_COMPILE_GATE_WARMUPS=1: warm-ups hold the gate as demanded creates do
-    // (the behaviour before).
+    // A speculative create (a warm-up or a prewarm: nobody waits for its pipeline yet) of a compute pipeline, with the
+    // adaptive gate, does not hold submissions: they wait only for the demanded creates in the driver. It still never
+    // enters while a submission is in the driver or waits there, and at most warmup_max of them are in the driver at
+    // once, so the creates beside a submission stay bounded (HasiKe and MoonEyes, #2233 / #1608: a cold boot crawled at
+    // about one submission a second behind 290 s of warm-ups). Every other speculative create holds submissions as a
+    // demanded create does (warmup_passes): with the classic gate or LEONIDA_COMPILE_GATE=1, which are in use where the
+    // driver holds a submission behind a create or that is not known (auto's calibration, 630.20), and no probe ever
+    // tells otherwise; a graphics or mesh one, since the calibration measures only a compute create and a submission
+    // was held 54 s beside a mesh create on 621.40; and one of a kind the adaptive gate found to hold submissions
+    // (is_blocking). LEONIDA_COMPILE_GATE_WARMUPS=1: speculative creates always hold the gate (the behaviour before);
+    // =0: a compute one passes with every gate, the classic one and =1 too.
     //
     // By default (classic) only compute creates pass the gate and a submission waits for them however long they take,
     // as before the adaptive gate; LEONIDA_COMPILE_GATE_WAIT_MS bounds that too. With the adaptive gate
@@ -510,9 +514,9 @@ public:
     using GateAhead = CompileGateAhead;
     class CompileTurn {  // around vkCreate*Pipelines
     public:
+        // `speculative`: asked for; speculative() says whether the gate let it pass as one (warmup_passes).
         explicit CompileTurn(SubmitMutex& gate, const CreateInfo& info = {}, bool speculative = false)
-            : gate_(gate), speculative_(speculative && gate.warmups_free()),
-              waited_(gate.enter_compile(seq_, info, speculative_)) {}
+            : gate_(gate), waited_(gate.enter_compile(seq_, info, speculative, &speculative_)) {}
         ~CompileTurn() { gate_.leave_compile(seq_); }
         CompileTurn(const CompileTurn&) = delete;
         CompileTurn& operator=(const CompileTurn&) = delete;
@@ -523,7 +527,7 @@ public:
     private:
         SubmitMutex& gate_;
         std::uint64_t seq_ = 0;  // declared before waited_: enter_compile sets it
-        bool speculative_;       // declared before waited_: enter_compile reads it
+        bool speculative_ = false;  // declared before waited_: enter_compile sets it
         std::int64_t waited_;
     };
     class SubmitTurn {  // around vkQueueSubmit, with the submit lock held
@@ -710,31 +714,34 @@ public:
         return logged_held_waits_;
     }
 
-    // Whether warm-ups pass the gate without holding submissions, and how many may be in the driver at once.
-    // LEONIDA_COMPILE_GATE_WARMUPS=1: they hold it as demanded creates do. LEONIDA_COMPILE_GATE_WARMUP_MAX=<n>: n at
-    // once (default 1). Read once; a test sets them per gate (set_warmup_policy).
+    // Whether speculative creates may pass the gate without holding submissions (see CompileTurn), and how many may be
+    // in the driver at once. LEONIDA_COMPILE_GATE_WARMUPS: unset, compute ones with the adaptive gate; 1, none (they
+    // hold it as demanded creates do); 0, compute ones with every gate (`everywhere`). LEONIDA_COMPILE_GATE_WARMUP_MAX
+    // =<n>: n at once (1-64, default 1). Read once; a test sets them per gate (set_warmup_policy).
+    static constexpr unsigned kMaxWarmups = 64;
     struct WarmupPolicy {
         bool free = true;
         unsigned max = 1;
+        bool everywhere = false;  // with the classic gate and LEONIDA_COMPILE_GATE=1 too
     };
     static WarmupPolicy warmup_policy_from_environment() {
         WarmupPolicy policy;
-        const char* hold = std::getenv("LEONIDA_COMPILE_GATE_WARMUPS");
-        policy.free = !(hold && !std::strcmp(hold, "1"));
+        if (const char* warmups = std::getenv("LEONIDA_COMPILE_GATE_WARMUPS")) {
+            policy.free = std::strcmp(warmups, "1") != 0;
+            policy.everywhere = !std::strcmp(warmups, "0");
+        }
         if (const char* max = std::getenv("LEONIDA_COMPILE_GATE_WARMUP_MAX")) {
             char* end = nullptr;
             const unsigned long n = std::strtoul(max, &end, 10);
-            if (end != max && !*end && n >= 1 && n <= 64) policy.max = unsigned(n);
+            if (end != max && !*end && n >= 1 && n <= kMaxWarmups) policy.max = unsigned(n);
         }
         return policy;
     }
+    // max is clamped to 1-64: 0 would keep every speculative create waiting for a place.
     void set_warmup_policy(WarmupPolicy policy) {
+        policy.max = (std::clamp)(policy.max, 1u, kMaxWarmups);
         std::lock_guard lock(gate_mutex_);
         policy_ = policy;
-    }
-    bool warmups_free() {
-        std::lock_guard lock(gate_mutex_);
-        return policy_.free;
     }
     // Speculative creates in the driver now (they are not counted in what a submission waits for).
     unsigned speculative_compiles() {
@@ -757,9 +764,12 @@ public:
         return stats_;
     }
 
-    // `seq` receives the create's number, which leave_compile takes back. `speculative`: a warm-up that does not hold
-    // submissions (CompileTurn); it also waits for a free place among the warmup_max speculative ones.
-    std::int64_t enter_compile(std::uint64_t& seq, const CreateInfo& info = {}, bool speculative = false) {
+    // `seq` receives the create's number, which leave_compile takes back. `speculative`: a warm-up or prewarm, which
+    // passes without holding submissions where warmup_passes says so (CompileTurn) and then also waits for a free
+    // place among the warmup_max speculative ones; `passed` (optional) is told whether it did.
+    std::int64_t enter_compile(std::uint64_t& seq, const CreateInfo& info = {}, bool speculative = false,
+                               bool* passed = nullptr) {
+        if (passed) *passed = false;
         if (!compile_gate_enabled()) return 0;
         std::unique_lock lock(gate_mutex_);
         std::int64_t waited = 0;
@@ -767,6 +777,8 @@ public:
             seq = 0;
             return 0;
         }
+        speculative = speculative && warmup_passes(info.kind);
+        if (passed) *passed = speculative;
         // Not behind this thread's own submission (it holds the submit lock: none of its submissions is in the
         // driver now, and waiting for them would never end).
         const bool own = owner_.load(std::memory_order_relaxed) == diagnostic_thread_id();
@@ -957,6 +969,10 @@ private:
     };
 
     // With gate_mutex_ held.
+    // Whether a speculative create of this kind passes without holding submissions (see CompileTurn).
+    bool warmup_passes(CreateKind kind) const {
+        return policy_.free && kind == CreateKind::compute && (adaptive_ || policy_.everywhere);
+    }
     bool kind_off(CreateKind kind) const {
         return verdict_[std::size_t(kind)] == GateVerdict::driver_does_not_hold;
     }

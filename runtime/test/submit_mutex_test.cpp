@@ -208,53 +208,117 @@ int compile_gate() {
     return 0;
 }
 
-// Warm-up creates (CompileTurn speculative) do not hold submissions; demanded ones still do; at most warmup_max warm-ups
-// are in the driver at once; none enters while a submission waits or is in the driver; with warm-ups held
-// (LEONIDA_COMPILE_GATE_WARMUPS=1) a submission waits for them as before.
+// Speculative creates (CompileTurn speculative: warm-ups and prewarms). With the adaptive gate a compute one does not
+// hold submissions; demanded ones still do; at most warmup_max are in the driver at once; none enters while a
+// submission waits or is in the driver. They hold submissions as demanded creates do with the classic gate and with
+// LEONIDA_COMPILE_GATE=1 (unless LEONIDA_COMPILE_GATE_WARMUPS=0), as graphics or mesh ones, and with
+// LEONIDA_COMPILE_GATE_WARMUPS=1. Each case on a gate of its own, so no probe of one case gives a verdict to the next.
 int warmups_do_not_hold_the_gate() {
     if (!SubmitMutex::compile_gate_enabled()) {
         std::printf("warm-up gate: compile gate off (LEONIDA_COMPILE_GATE=0): not checked\n");
         return 0;
     }
-    SubmitMutex m;
-    m.set_warmup_policy({true, 1});
-    // A submission is not held by a warm-up in the driver.
-    {
-        std::atomic<bool> in{false}, release{false};
+    // A gate as each mode makes it: the adaptive one without early probes or a wait limit (a verdict could turn the
+    // compute gate off under a later case), the classic one, and LEONIDA_COMPILE_GATE=1 (graphics creates pass it).
+    enum class Mode { adaptive, classic, always };
+    const auto make = [](Mode mode, SubmitMutex::WarmupPolicy policy = {true, 1}) {
+        auto m = std::make_unique<SubmitMutex>();
+        m->set_gate_adaptive(mode == Mode::adaptive);
+        m->set_gate_graphics(mode != Mode::classic);
+        m->set_gate_wait_limit_ms(0);
+        m->set_gate_probe_budget_ms(0);
+        m->set_warmup_policy(policy);
+        return m;
+    };
+    // Whether a submission waits for a speculative create of `kind` on gate `m`: the create stays 150 ms.
+    const auto submission_waits = [](SubmitMutex& m, SubmitMutex::CreateKind kind, bool* passed) {
+        std::atomic<bool> in{false};
+        std::atomic<std::int64_t> left{0};
         std::thread warm([&] {
-            const SubmitMutex::CompileTurn turn(m, {}, true);
+            const SubmitMutex::CompileTurn turn(m, SubmitMutex::CreateInfo{kind, "warm", "test", 0}, true);
+            *passed = turn.speculative();
             in = true;
-            while (!release) std::this_thread::sleep_for(1ms);
+            std::this_thread::sleep_for(150ms);
+            left = now_ms();
         });
-        EXPECT(eventually([&] { return in.load(); }));
-        EXPECT(m.speculative_compiles() == 1);
-        const std::int64_t start = now_ms();
+        bool entered = false;
+        for (int i = 0; i < 2000 && !in; ++i) std::this_thread::sleep_for(1ms);
+        entered = in.load();
+        std::int64_t submitted = 0;
         {
             const SubmitMutex::SubmitTurn turn(m);
+            submitted = now_ms();
         }
-        EXPECT(now_ms() - start < 50);
-        release = true;
         warm.join();
-        EXPECT(m.speculative_compiles() == 0);
+        return entered && submitted >= left.load();
+    };
+    using Kind = SubmitMutex::CreateKind;
+    // Adaptive gate: a submission is not held by a compute warm-up in the driver.
+    {
+        auto m = make(Mode::adaptive);
+        bool passed = false;
+        EXPECT(!submission_waits(*m, Kind::compute, &passed));
+        EXPECT(passed && m->speculative_compiles() == 0);
+    }
+    // ... but by a graphics or mesh prewarm (the calibration measures compute creates only).
+    {
+        auto m = make(Mode::adaptive);
+        bool passed = true;
+        EXPECT(submission_waits(*m, Kind::graphics, &passed));
+        EXPECT(!passed);
+    }
+    // Classic gate (also auto's choice where the driver holds submissions) and LEONIDA_COMPILE_GATE=1: a compute
+    // warm-up holds submissions; with =1 a graphics prewarm does too.
+    for (const Mode mode : {Mode::classic, Mode::always}) {
+        auto m = make(mode);
+        bool passed = true;
+        EXPECT(submission_waits(*m, Kind::compute, &passed));
+        EXPECT(!passed);
+        if (mode == Mode::always) {
+            passed = true;
+            EXPECT(submission_waits(*m, Kind::graphics, &passed));
+            EXPECT(!passed);
+        }
+    }
+    // LEONIDA_COMPILE_GATE_WARMUPS=0: a compute warm-up passes with the classic gate and =1 too; graphics ones never.
+    for (const Mode mode : {Mode::classic, Mode::always}) {
+        auto m = make(mode, {true, 1, true});
+        bool passed = false;
+        EXPECT(!submission_waits(*m, Kind::compute, &passed));
+        EXPECT(passed);
+        if (mode == Mode::always) {
+            passed = true;
+            EXPECT(submission_waits(*m, Kind::graphics, &passed));
+            EXPECT(!passed);
+        }
+    }
+    // LEONIDA_COMPILE_GATE_WARMUPS=1: a warm-up holds submissions with the adaptive gate too.
+    {
+        auto m = make(Mode::adaptive, {false, 1});
+        bool passed = true;
+        EXPECT(submission_waits(*m, Kind::compute, &passed));
+        EXPECT(!passed && m->speculative_compiles() == 0);
     }
     // A demanded create is still waited for, also beside a warm-up: the submission waits for the demanded one only.
     {
+        auto m = make(Mode::adaptive);
         std::atomic<bool> warm_in{false}, demand_in{false}, release_warm{false};
         std::atomic<std::int64_t> demand_left{0}, submitted{0};
         std::thread warm([&] {
-            const SubmitMutex::CompileTurn turn(m, {}, true);
+            const SubmitMutex::CompileTurn turn(*m, {}, true);
             warm_in = true;
             while (!release_warm) std::this_thread::sleep_for(1ms);
         });
         std::thread demand([&] {
-            const SubmitMutex::CompileTurn turn(m);
+            const SubmitMutex::CompileTurn turn(*m);
             demand_in = true;
             std::this_thread::sleep_for(200ms);
             demand_left = now_ms();
         });
         EXPECT(eventually([&] { return warm_in.load() && demand_in.load(); }));
+        EXPECT(m->speculative_compiles() == 1);
         std::thread submit([&] {
-            const SubmitMutex::SubmitTurn turn(m);
+            const SubmitMutex::SubmitTurn turn(*m);
             submitted = now_ms();
         });
         submit.join();
@@ -263,16 +327,19 @@ int warmups_do_not_hold_the_gate() {
         EXPECT(warm_in.load() && !release_warm.load());  // and not for the warm-up, still in the driver
         release_warm = true;
         warm.join();
+        EXPECT(m->speculative_compiles() == 0);
     }
-    // At most warmup_max warm-ups in the driver; a demanded create does not wait for them.
-    for (const unsigned max : {1u, 2u}) {
-        m.set_warmup_policy({true, max});
+    // At most warmup_max warm-ups in the driver; a demanded create does not wait for them. A max of 0 is taken as 1:
+    // it would keep every warm-up waiting for a place.
+    for (const unsigned max : {0u, 1u, 2u}) {
+        auto m = make(Mode::adaptive, {true, max});
+        const int places = int((std::max)(max, 1u));
         std::atomic<int> inside{0}, most{0};
         std::atomic<bool> release{false};
         std::vector<std::thread> warms;
         for (int i = 0; i < 4; ++i)
             warms.emplace_back([&] {
-                const SubmitMutex::CompileTurn turn(m, {}, true);
+                const SubmitMutex::CompileTurn turn(*m, {}, true);
                 const int now = ++inside;
                 int seen = most.load();
                 while (now > seen && !most.compare_exchange_weak(seen, now)) {
@@ -280,35 +347,35 @@ int warmups_do_not_hold_the_gate() {
                 while (!release) std::this_thread::sleep_for(1ms);
                 --inside;
             });
-        EXPECT(eventually([&] { return inside.load() == int(max); }));
+        EXPECT(eventually([&] { return inside.load() == places; }));
         std::this_thread::sleep_for(100ms);
-        EXPECT(inside.load() == int(max));  // the others wait for a place
+        EXPECT(inside.load() == places);  // the others wait for a place
         std::atomic<std::int64_t> demand_waited{-1};
         std::thread demand([&] {
-            const SubmitMutex::CompileTurn turn(m);
+            const SubmitMutex::CompileTurn turn(*m);
             demand_waited = turn.waited_ms();
         });
         demand.join();
         EXPECT(demand_waited.load() == 0);
         release = true;
         for (auto& t : warms) t.join();
-        EXPECT(most.load() == int(max));
-        EXPECT(m.speculative_compiles() == 0);
+        EXPECT(most.load() == places);
+        EXPECT(m->speculative_compiles() == 0);
     }
-    m.set_warmup_policy({true, 1});
     // A warm-up never enters while a submission is in the driver.
     {
+        auto m = make(Mode::adaptive);
         std::atomic<bool> submitting{false}, release{false};
         std::atomic<std::int64_t> submit_left{0}, warm_entered{0};
         std::thread submit([&] {
-            const SubmitMutex::SubmitTurn turn(m);
+            const SubmitMutex::SubmitTurn turn(*m);
             submitting = true;
             while (!release) std::this_thread::sleep_for(1ms);
             submit_left = now_ms();
         });
         EXPECT(eventually([&] { return submitting.load(); }));
         std::thread warm([&] {
-            const SubmitMutex::CompileTurn turn(m, {}, true);
+            const SubmitMutex::CompileTurn turn(*m, {}, true);
             warm_entered = now_ms();
         });
         std::this_thread::sleep_for(100ms);
@@ -318,44 +385,24 @@ int warmups_do_not_hold_the_gate() {
         warm.join();
         EXPECT(warm_entered.load() >= submit_left.load());
     }
-    // LEONIDA_COMPILE_GATE_WARMUPS=1: a warm-up holds submissions as a demanded create does.
-    {
-        m.set_warmup_policy({false, 1});
-        std::atomic<bool> in{false};
-        std::atomic<std::int64_t> warm_left{0}, submitted{0};
-        std::thread warm([&] {
-            const SubmitMutex::CompileTurn turn(m, {}, true);
-            EXPECT_VOID(!turn.speculative());
-            in = true;
-            std::this_thread::sleep_for(150ms);
-            warm_left = now_ms();
-        });
-        EXPECT(eventually([&] { return in.load(); }));
-        EXPECT(m.speculative_compiles() == 0);
-        {
-            const SubmitMutex::SubmitTurn turn(m);
-            submitted = now_ms();
-        }
-        warm.join();
-        EXPECT(submitted.load() >= warm_left.load());
-    }
     // The settings.
     _putenv_s("LEONIDA_COMPILE_GATE_WARMUPS", "1");
     _putenv_s("LEONIDA_COMPILE_GATE_WARMUP_MAX", "3");
     auto policy = SubmitMutex::warmup_policy_from_environment();
-    EXPECT(!policy.free && policy.max == 3);
+    EXPECT(!policy.free && !policy.everywhere && policy.max == 3);
     _putenv_s("LEONIDA_COMPILE_GATE_WARMUPS", "0");
     _putenv_s("LEONIDA_COMPILE_GATE_WARMUP_MAX", "0");
     policy = SubmitMutex::warmup_policy_from_environment();
-    EXPECT(policy.free && policy.max == 1);
+    EXPECT(policy.free && policy.everywhere && policy.max == 1);
     _putenv_s("LEONIDA_COMPILE_GATE_WARMUP_MAX", "x");
     EXPECT(SubmitMutex::warmup_policy_from_environment().max == 1);
     _putenv_s("LEONIDA_COMPILE_GATE_WARMUPS", "");
     _putenv_s("LEONIDA_COMPILE_GATE_WARMUP_MAX", "");
     policy = SubmitMutex::warmup_policy_from_environment();
-    EXPECT(policy.free && policy.max == 1);
-    if (failed_void) return 1;
-    std::printf("warm-up gate: submissions pass a warm-up, wait for demanded creates; warm-ups capped\n");
+    EXPECT(policy.free && !policy.everywhere && policy.max == 1);
+    std::printf("warm-up gate: adaptive gate: compute warm-ups pass, graphics prewarms and demanded creates hold, "
+                "warm-ups capped (max 0 taken as 1); classic and =1: warm-ups hold unless "
+                "LEONIDA_COMPILE_GATE_WARMUPS=0\n");
     return 0;
 }
 

@@ -433,13 +433,27 @@ void test_jobs_tell_the_gate_whether_they_are_speculative() {
 void test_a_driver_turn_passes_the_speculative_flag_to_the_gate() {
     if (!leonida::SubmitMutex::compile_gate_enabled()) return;  // LEONIDA_COMPILE_GATE=0: no gate to check
     leonida::SubmitMutex gate;
+    gate.set_gate_adaptive(true);  // warm-ups pass only the adaptive gate (submit_mutex_test has the other modes)
+    gate.set_gate_wait_limit_ms(0);
+    gate.set_gate_probe_budget_ms(0);
+    gate.set_gate_graphics(true);  // graphics creates pass the gate, as with the adaptive gate
     gate.set_warmup_policy({true, 1});
-    for (const bool speculative : {true, false}) {
+    // A speculative compute create (a warm-up), a demanded one, and a speculative graphics one (a prewarm of
+    // LEONIDA_PIPELINE_PREWARM_ORDER, which holds submissions: the calibration measures only compute creates).
+    struct Case {
+        bool speculative;
+        leonida::SubmitMutex::CreateKind kind;
+        bool passes;
+    };
+    for (const Case c : {Case{true, leonida::SubmitMutex::CreateKind::compute, true},
+                         Case{false, leonida::SubmitMutex::CreateKind::compute, false},
+                         Case{true, leonida::SubmitMutex::CreateKind::graphics, false}}) {
+        const bool speculative = c.speculative;
         std::atomic<bool> inside{false}, release{false}, submitted{false};
         std::thread create([&] {
             rt::d3d12::compile_job_speculative = speculative;
             {
-                const rt::d3d12::DriverTurn turn(gate, "warmup", "vkCreateComputePipelines", true, nullptr);
+                const rt::d3d12::DriverTurn turn(gate, "warmup", "vkCreateComputePipelines", true, nullptr, c.kind);
                 inside = true;
                 while (!release) std::this_thread::sleep_for(1ms);
             }
@@ -452,7 +466,7 @@ void test_a_driver_turn_passes_the_speculative_flag_to_the_gate() {
             submitted = true;
         });
         std::this_thread::sleep_for(150ms);
-        EXPECT(submitted.load() == speculative);  // past a warm-up at once; behind a demanded create
+        EXPECT(submitted.load() == c.passes);  // past a warm-up at once; behind a demanded create or a prewarm
         release = true;
         create.join();
         submit.join();
