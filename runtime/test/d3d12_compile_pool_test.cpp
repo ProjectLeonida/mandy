@@ -44,6 +44,11 @@ struct Gate {
         std::unique_lock lock(mutex);
         changed.wait(lock, [this] { return open; });
     }
+    // Waits up to `limit`; false when the gate is still shut.
+    bool wait_for(std::chrono::milliseconds limit) {
+        std::unique_lock lock(mutex);
+        return changed.wait_for(lock, limit, [this] { return open; });
+    }
     void release() {
         {
             std::lock_guard lock(mutex);
@@ -367,17 +372,21 @@ void test_order() {
 void test_a_checkpoint_sees_a_demand_that_started_during_it() {
     auto& pool = make_pool(2, 1);
     Log log;
-    Gate query;
+    Gate looked, query;
     Owners owner;
-    std::atomic<int> second_look{-1};
+    std::atomic<int> first_look{-1}, second_look{-1};
     EXPECT(pool.submit(device, device, SIZE_MAX, [&] {
         log.start("checkpoint", false);
-        EXPECT(!pool.has_compile_waiter());  // the first look: nothing else queued or running
-        query.wait();                         // the size query
+        first_look = pool.has_compile_waiter();
+        looked.release();
+        query.wait();  // the size query
         second_look = pool.has_compile_waiter();
         log.finish("checkpoint", false);
     }));
-    EXPECT(log.wait_started(1));
+    // The demanded build is submitted only after the first look: submitted once the checkpoint has started, a loaded
+    // machine could run it before the checkpoint's thread gets to its first look.
+    EXPECT(looked.wait_for(10s));
+    EXPECT(first_look == 0);  // the first look: nothing else queued or running
     Gate build;
     submit(pool, log, &build, owner[0], "demand");
     EXPECT(log.wait_started(2));  // on the second worker, while the checkpoint runs
