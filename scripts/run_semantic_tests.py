@@ -210,14 +210,19 @@ def main(argv=None):
                "-p", a.pattern, *(["-v"] if a.verbose else [])]
         proc = subprocess.Popen(cmd)
         _register_process(proc)
-        start_time = time.monotonic()
         try:
+            deadline = None if a.timeout is None else time.monotonic() + a.timeout
             while True:
+                wait_seconds = 0.2
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(cmd, a.timeout)
+                    wait_seconds = min(wait_seconds, remaining)
                 try:
-                    return proc.wait(timeout=0.2)
+                    return proc.wait(timeout=wait_seconds)
                 except subprocess.TimeoutExpired:
-                    if a.timeout is not None and time.monotonic() - start_time >= a.timeout:
-                        raise
+                    continue
         except subprocess.TimeoutExpired:
             _kill_process_tree(proc)
             print(f"TIMED OUT after {a.timeout:g} s: unittest discover in {directory}", file=sys.stderr)
