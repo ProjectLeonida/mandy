@@ -2147,6 +2147,31 @@ if(TARGET Vulkan::Headers)
     add_test(NAME arena_sparse_gpu COMMAND arena_sparse_gpu_test)
     set_tests_properties(arena_sparse_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   endif()
+  # The page mirror on a real device (src/title_mirror.h): a title-written V# read through a buffer reaches its page at
+  # heap_base + its title address; remaps, writes and unmaps reach the next dispatch that waits for the bind.
+  add_executable(vk_title_mirror_test test/vk_title_mirror_test.cpp)
+  target_link_libraries(vk_title_mirror_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_title_mirror_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_title_mirror_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+  if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    set(_title_mirror_spv ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_title_mirror_read.spv)
+    add_custom_command(OUTPUT ${_title_mirror_spv}
+      COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${_title_mirror_spv}
+              ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_title_mirror_read.comp
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_title_mirror_read.comp
+      COMMENT "Compiling the page mirror test shader" VERBATIM)
+    target_sources(vk_title_mirror_test PRIVATE ${_title_mirror_spv})
+    target_compile_definitions(vk_title_mirror_test PRIVATE LEONIDA_TEST_TITLE_MIRROR_SPV="${_title_mirror_spv}")
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_title_mirror COMMAND vk_title_mirror_test)
+    set_tests_properties(vk_title_mirror PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  endif()
   # A measurement, not a test: what page-sized sparse binds cost on the device (the page mirror's layout).
   add_executable(vk_sparse_bind_bench test/vk_sparse_bind_bench.cpp)
   target_link_libraries(vk_sparse_bind_bench PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
@@ -2928,6 +2953,16 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(d3d12_r9g9b9e5_uav_test PRIVATE
         LEONIDA_TEST_CS_R9G9B9E5_UAV_SPV="${LEONIDA_TEST_CS_R9G9B9E5_UAV}")
     endif()
+
+    # The page mirror in the game's device over xmem's pages (src/title_mirror.h): a stream pool's GPU-only pages,
+    # their twins and the title's own view at heap_base + their address, after slot-31 copies, title writes and remaps.
+    add_executable(d3d12_page_mirror_test test/d3d12_page_mirror_test.cpp shims/xmem.cpp shims/registry.cpp)
+    target_link_libraries(d3d12_page_mirror_test PRIVATE gta6rt_d3d12_com d3d12 dxgi psapi)
+    target_compile_definitions(d3d12_page_mirror_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_page_mirror_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(d3d12_page_mirror_test PRIVATE /OPT:NOREF)
+    add_test(NAME d3d12_page_mirror COMMAND d3d12_page_mirror_test)
+    set_tests_properties(d3d12_page_mirror PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
     # Debug markers as VK_EXT_debug_utils labels, and private data on every object (D3D-24).
     add_executable(d3d12_debug_markers_test test/d3d12_debug_markers_test.cpp)
