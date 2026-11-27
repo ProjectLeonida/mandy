@@ -638,7 +638,11 @@ inline constexpr VkSamplerReductionMode vulkan_reduction_mode(FilterMode mode) {
 // in [0, 0.25] (the Vulkan specification's note on samplers without mipmapping). An unnormalised sampler gets
 // what Vulkan requires of one: no mips, no anisotropy, no comparison.
 // A decoded GFX10 bias has absolute value at most 32. When creating a device sampler, pass its smaller limit.
-inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_bias = 32.0f) {
+// Anisotropy is what the hardware does with it: only an ANISO_POINT or ANISO_BILINEAR filter uses MAX_ANISO_RATIO, so
+// a point or bilinear S# with a ratio set samples without anisotropy. The ratio is held to `max_anisotropy`, the
+// device's maxSamplerAnisotropy when creating a device sampler (VUID-VkSamplerCreateInfo-anisotropyEnable-01071).
+inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_bias = 32.0f,
+                                          float max_anisotropy = 16.0f) {
     static_assert(int(CompareFunction::never) == int(VK_COMPARE_OP_NEVER) &&
                   int(CompareFunction::less) == int(VK_COMPARE_OP_LESS) &&
                   int(CompareFunction::equal) == int(VK_COMPARE_OP_EQUAL) &&
@@ -659,8 +663,12 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_
     info.addressModeV = vulkan_address_mode(sampler.address_v);
     info.addressModeW = vulkan_address_mode(sampler.address_w);
     info.mipLodBias = std::clamp(sampler.lod_bias, -max_lod_bias, max_lod_bias);
-    info.anisotropyEnable = sampler.max_anisotropy > 1 ? VK_TRUE : VK_FALSE;
-    info.maxAnisotropy = float(std::max(sampler.max_anisotropy, 1u));
+    const auto aniso = [](Filter f) { return f == Filter::aniso_point || f == Filter::aniso_bilinear; };
+    info.anisotropyEnable =
+        sampler.max_anisotropy > 1 && (aniso(sampler.mag_filter) || aniso(sampler.min_filter)) ? VK_TRUE : VK_FALSE;
+    info.maxAnisotropy = info.anisotropyEnable
+                             ? std::clamp(float(sampler.max_anisotropy), 1.0f, std::max(max_anisotropy, 1.0f))
+                             : 1.0f;
     info.compareEnable = (sampler.compare_never || sampler.compare != CompareFunction::never) ? VK_TRUE : VK_FALSE;
     info.compareOp = VkCompareOp(sampler.compare);
     info.minLod = sampler.min_lod;

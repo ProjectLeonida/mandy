@@ -392,6 +392,26 @@ int main() {
     CHECK(vulkan_sampler({.lod_bias = -32.0f}, 15.0f).mipLodBias == -15.0f);
     CHECK(vulkan_sampler({.lod_bias = 31.0f}, 15.0f).mipLodBias == 15.0f);
     CHECK(vulkan_sampler({.lod_bias = 2.25f}, 15.0f).mipLodBias == 2.25f);
+    // Anisotropy only with an aniso filter (a bilinear S# with MAX_ANISO_RATIO set samples without it), and the ratio
+    // held to the device's maxSamplerAnisotropy (RT-STATE-SAMPLER-ANISO, kevincommits in #1608).
+    info = vulkan_sampler({.mag_filter = Filter::bilinear, .min_filter = Filter::bilinear, .max_anisotropy = 16});
+    CHECK(info.anisotropyEnable == VK_FALSE && info.maxAnisotropy == 1.0f);
+    info = vulkan_sampler({.mag_filter = Filter::point, .min_filter = Filter::point, .max_anisotropy = 4});
+    CHECK(info.anisotropyEnable == VK_FALSE && info.maxAnisotropy == 1.0f);
+    info = vulkan_sampler({.mag_filter = Filter::bilinear, .min_filter = Filter::aniso_bilinear, .max_anisotropy = 8});
+    CHECK(info.anisotropyEnable == VK_TRUE && info.maxAnisotropy == 8.0f);
+    info = vulkan_sampler({.mag_filter = Filter::aniso_bilinear, .min_filter = Filter::aniso_bilinear,
+                           .max_anisotropy = 16}, 15.0f, 4.0f);
+    CHECK(info.anisotropyEnable == VK_TRUE && info.maxAnisotropy == 4.0f);
+    info = vulkan_sampler({.mag_filter = Filter::aniso_point, .min_filter = Filter::aniso_point, .max_anisotropy = 2},
+                          15.0f, 16.0f);
+    CHECK(info.anisotropyEnable == VK_TRUE && info.maxAnisotropy == 2.0f);
+    // Decoded from words, as bind_sampler does: XY_MAG_FILTER and XY_MIN_FILTER bilinear, MAX_ANISO_RATIO 4 (16x).
+    {
+        const Sampler raw = decode(SamplerWords{4u << 9, 0, (1u << 20) | (1u << 22), 0});
+        CHECK(raw.mag_filter == Filter::bilinear && raw.min_filter == Filter::bilinear && raw.max_anisotropy == 16);
+        CHECK(vulkan_sampler(raw).anisotropyEnable == VK_FALSE);
+    }
     info = vulkan_sampler(point);
     CHECK(info.magFilter == VK_FILTER_NEAREST && info.mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST);
     CHECK(info.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && info.mipLodBias == -0.75f);
