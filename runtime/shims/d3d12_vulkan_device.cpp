@@ -448,10 +448,17 @@ public:
         // A page the title wrote since it was last copied holds the newer bytes already: its GPU result is dropped and
         // the refresh's own copy carries the title's. So is a page whose mapping changed, one a kernel write may be
         // filling, and one xmem maps at another address too (a write there is seen by no guard and no watch here).
-        const auto held = [&](std::size_t i) {
+        // Decided for every page before the first copy: a copy below can fault on another guard, and the handler then
+        // reopens the whole 64 KiB tile here on this thread (reopen_range), which clears kClean and kProtected there.
+        // Read live, that made the later runs in the tile count as written by the title, and their GPU results were
+        // dropped from a batch already taken off the queue. A page the title wrote before this point is held still.
+        const std::size_t p0 = (from - first_) / kPage, p1 = (to - first_ + kPage - 1) / kPage;
+        held_pages_.resize(p1 - p0);
+        for (std::size_t i = p0; i < p1; ++i) {
             const std::uint8_t s = state_[i];
-            return (s & (kZero | kRequery | kPinned | kAliased)) || (!(s & kProtected) && !(s & kClean));
-        };
+            held_pages_[i - p0] = (s & (kZero | kRequery | kPinned | kAliased)) || (!(s & kProtected) && !(s & kClean));
+        }
+        const auto held = [&](std::size_t i) { return held_pages_[i - p0] != 0; };
         constexpr std::uintptr_t kPiece = 256;  // compared and copied in pieces this size
         std::size_t written = 0;
         for (std::uintptr_t at = from & ~(kPage - 1); at < ((to + kPage - 1) & ~(kPage - 1));) {
@@ -1417,6 +1424,7 @@ private:
     std::uintptr_t first_ = 0, last_ = 0;  // the pages covered
     SRWLOCK lock_ = SRWLOCK_INIT;          // state_, cover_, the targets, and the protection of the pages
     std::atomic<DWORD> writer_{0};         // the thread in write_back, which holds lock_ while it copies into the title
+    Vector<std::uint8_t> held_pages_;      // write_back's per-page decision, taken before its copies (under lock_)
     Vector<std::uint8_t> state_;           // per 4 KiB page
     Vector<std::uint32_t> cover_;          // per 4 KiB page: the targets that read it
     Vector<Target> targets_;               // by start
