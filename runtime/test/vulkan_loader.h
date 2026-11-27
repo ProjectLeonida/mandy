@@ -29,6 +29,8 @@ inline PFN_vkGetInstanceProcAddr& real_gipa() {
     static PFN_vkGetInstanceProcAddr gipa = nullptr;
     return gipa;
 }
+// The instance the device wrapper queries through. Each test tool makes one instance, so the last one created is
+// the one its device comes from; a tool that made two would still get the loader's same device entry points.
 inline VkInstance& last_instance() {
     static VkInstance instance = VK_NULL_HANDLE;
     return instance;
@@ -50,8 +52,9 @@ inline VKAPI_ATTR VkResult VKAPI_CALL create_instance(const VkInstanceCreateInfo
         real_gipa()(nullptr, "vkEnumerateInstanceExtensionProperties"));
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
     VkInstanceCreateInfo copy = *info;
-    std::vector<const char*> names(info->ppEnabledExtensionNames,
-                                   info->ppEnabledExtensionNames + info->enabledExtensionCount);
+    std::vector<const char*> names;
+    if (info->enabledExtensionCount)  // ppEnabledExtensionNames may be null when the count is 0
+        names.assign(info->ppEnabledExtensionNames, info->ppEnabledExtensionNames + info->enabledExtensionCount);
     uint32_t count = 0;
     std::vector<VkExtensionProperties> extensions;
     if (enumerate && enumerate(nullptr, &count, nullptr) == VK_SUCCESS) {
@@ -78,8 +81,9 @@ inline VKAPI_ATTR VkResult VKAPI_CALL create_device(VkPhysicalDevice physical, c
         real_gipa()(instance, "vkEnumerateDeviceExtensionProperties"));
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
     VkDeviceCreateInfo copy = *info;
-    std::vector<const char*> names(info->ppEnabledExtensionNames,
-                                   info->ppEnabledExtensionNames + info->enabledExtensionCount);
+    std::vector<const char*> names;
+    if (info->enabledExtensionCount)  // ppEnabledExtensionNames may be null when the count is 0
+        names.assign(info->ppEnabledExtensionNames, info->ppEnabledExtensionNames + info->enabledExtensionCount);
     uint32_t count = 0;
     std::vector<VkExtensionProperties> extensions;
     if (enumerate && enumerate(physical, nullptr, &count, nullptr) == VK_SUCCESS) {
