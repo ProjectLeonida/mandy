@@ -110,6 +110,13 @@ def _scene_report(gltf: dict, index: int, scene: dict) -> dict:
     roots = []
     issues = []
     seen = set()
+    child_nodes = {
+        child
+        for parent in _array(gltf.get("nodes"))
+        if isinstance(parent, dict)
+        for child in _array(parent.get("children"))
+        if _entry(gltf, "nodes", child) is not None
+    }
     if "nodes" in scene and not _array(scene["nodes"]):
         issues.append("nodes must be a non-empty array when present")
     for slot, ref in enumerate(_array(scene.get("nodes"))):
@@ -121,6 +128,8 @@ def _scene_report(gltf: dict, index: int, scene: dict) -> dict:
             issues.append(f"nodes[{slot}] repeats root node {ref}")
         else:
             seen.add(ref)
+            if ref in child_nodes:
+                issues.append(f"nodes[{slot}] references child node {ref} as a scene root")
     return {"index": index, "name": _text(scene.get("name")), "roots": roots, "issues": issues}
 
 

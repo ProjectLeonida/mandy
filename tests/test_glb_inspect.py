@@ -953,5 +953,12 @@ class GlbInspectTests(unittest.TestCase):
                                 for issue in issues))
 
 
+    def test_scene_root_rejects_child_node(self):
+        doc = {"nodes": [{"children": [1]}, {"name": "child"}], "scenes": [{"nodes": [1]}]}
+        data = glb(doc)
+        report = glb_inspect.build_report(glb_inspect.parse_glb(data), len(data))
+        self.assertEqual(report["scenes"][0]["issues"], ["nodes[0] references child node 1 as a scene root"])
+
+
 if __name__ == "__main__":
     unittest.main()
