@@ -99,6 +99,21 @@ class IndexTest(unittest.TestCase):
         self.assertNotIn("cannot use", r.stderr)
         self.assertIn("0 shaders in index", r.stderr)
 
+    def test_invalid_bary_fallback_input_is_an_error(self):
+        for bad in ('"bad"', "123", "{}", '{"other":1}', '{"location":32}', '{"location":-1}', '{"location":1.5}'):
+            with self.subTest(bad=bad):
+                self.assert_index_error(
+                    self.run_tool(f'{{"ps0":{{"stage":"ps","bary_fallback_input":{bad}}}}}'),
+                    "malformed JSON",
+                )
+
+    def test_valid_bary_fallback_input_is_accepted(self):
+        for ok in ("null", '{"location":0}', '{"extra":true,"location":31}'):
+            with self.subTest(ok=ok):
+                r = self.run_tool(f'{{"ps0":{{"stage":"ps","bary_fallback_input":{ok}}}}}')
+                self.assertNotIn("malformed JSON", r.stderr)
+                self.assertIn("1 shaders in index", r.stderr)
+
 
 def main():
     """unittest.main(), except that a file whose tests all skipped succeeds: unittest exits 5 for an empty run, and

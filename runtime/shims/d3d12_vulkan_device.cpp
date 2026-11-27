@@ -70,6 +70,7 @@
 #include "../src/title_texture_refresh.h"
 #include "title_gpu_placements.h"
 #include "../src/spirv_f16_halves.h"
+#include "../src/spirv_bary_fallback.h"
 #include "../src/spirv_stores.h"
 #include "../src/title_va_alias.h"
 #include "../src/console_heap_slot_records.h"
@@ -3077,6 +3078,7 @@ struct DeviceState {
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
     std::uint32_t f16_half_top_location = 29;
+    std::uint32_t bary_f16_half_top_location = 29;
     float max_sampler_lod_bias = 0;
     D3D12_CONSERVATIVE_RASTERIZATION_TIER conservative_raster_tier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
     bool conservative_post_depth_coverage = false;
@@ -12483,6 +12485,32 @@ public:
         Stage& vs_stage = stages[0];
         Stage& gs_stage = stages[1];
         Stage& ps_stage = stages[2];
+        const bool bary_fallback = ps_stage.entry && ps_stage.entry->bary_fallback_location.has_value();
+        if (bary_fallback) {
+            const int bary_loc = int(*ps_stage.entry->bary_fallback_location);
+            if (mesh) {
+                return stream_unsupported(
+                    "--bary-fallback pixel shader needs a geometry stage, which a mesh PSO cannot include; location",
+                    bary_loc);
+            }
+            if (gs_stage.entry) {
+                return stream_unsupported(
+                    "--bary-fallback pixel shader cannot pair with an explicit geometry shader; location", bary_loc);
+            }
+            if (rect_list) {
+                return stream_unsupported(
+                    "--bary-fallback pixel shader cannot pair with a rectangle-list geometry stage; location",
+                    bary_loc);
+            }
+            if (!device_.info.features.geometryShader) {
+                return stream_unsupported(
+                    "--bary-fallback pixel shaders need the Vulkan geometryShader feature; location", bary_loc);
+            }
+            if (desc.PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
+                log_once("a --bary-fallback geometry stage takes triangles; topology type", desc.PrimitiveTopologyType);
+                return E_INVALIDARG;
+            }
+        }
         if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && gs_stage.entry) {
             log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
         }
@@ -12490,12 +12518,13 @@ public:
             (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty())) {
             std::string link_error;
             if (!link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
-                                 &link_error)) {
+                                 &link_error, bary_fallback)) {
                 std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
                 return E_FAIL;
             }
             f16_linked_ = true;
         }
+        bary_fallback_ = bary_fallback;
         // A lazy pipeline keeps where each stage's words come from, not the words or a module: build() makes them
         // again, the same way, and drops them once the pipeline exists.
         lazy_ = lazy_graphics_pipelines();
@@ -12550,8 +12579,8 @@ public:
                 module = shader_module(stage.words);
                 if (!module) return E_FAIL;
             }
-            if (stage.bit == VK_SHADER_STAGE_VERTEX_BIT && !geometry && device_.info.features.geometryShader &&
-                topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
+            if (stage.bit == VK_SHADER_STAGE_VERTEX_BIT && !geometry && !bary_fallback &&
+                device_.info.features.geometryShader && topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
                 rectangle_capable_ = true;
                 if (!lazy_) rectangle_vertex_ = modules_.back();
             }
@@ -12574,6 +12603,40 @@ public:
             VkShaderModule module = VK_NULL_HANDLE;
             if (lazy_) {
                 sources_.push_back({StageSource::rect_list});
+            } else {
+                module = shader_module(words);
+                if (!module) return E_FAIL;
+            }
+            VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            info.stage = VK_SHADER_STAGE_GEOMETRY_BIT;
+            info.module = module;
+            info.pName = "main";
+            stage_infos.push_back(info);
+        }
+        if (bary_fallback) {  // the stage that supplies (1,0,0)/(0,1,0)/(0,0,1) at bary_fallback_input.location
+            std::vector<std::uint32_t> words;
+            leonida::BaryFallbackGsInfo bary_info{};
+            std::string bary_error;
+            if (!leonida::build_bary_fallback_gs(vs_stage.words, ps_stage.words,
+                                                 *ps_stage.entry->bary_fallback_location, words, &bary_info,
+                                                 &bary_error)) {
+                std::fprintf(stderr, "[rt] d3d12: %s\n", bary_error.c_str());
+                return E_FAIL;
+            }
+            if (bary_info.clip_count && !device_.info.features.shaderClipDistance) {
+                return stream_unsupported(
+                    "--bary-fallback geometry stage forwards ClipDistance, which needs shaderClipDistance; count",
+                    int(bary_info.clip_count));
+            }
+            if (bary_info.cull_count && !device_.info.features.shaderCullDistance) {
+                return stream_unsupported(
+                    "--bary-fallback geometry stage forwards CullDistance, which needs shaderCullDistance; count",
+                    int(bary_info.cull_count));
+            }
+            if (trace_pipeline_compile()) stage_bytes_ += words.size() * sizeof(std::uint32_t);
+            VkShaderModule module = VK_NULL_HANDLE;
+            if (lazy_) {
+                sources_.push_back({StageSource::bary_fallback});
             } else {
                 module = shader_module(words);
                 if (!module) return E_FAIL;
@@ -13677,9 +13740,10 @@ private:
 
     bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const leonida::ShaderEntry& vs_entry,
                          std::vector<std::uint32_t>& ps_words, const leonida::ShaderEntry& ps_entry,
-                         std::string* error) const {
-        return leonida::link_f16_halves(vs_words, vs_entry, ps_words, ps_entry, error,
-                                        device_.f16_half_top_location);
+                         std::string* error, bool bary_fallback = false) const {
+        const std::uint32_t top_loc =
+            bary_fallback ? device_.bary_f16_half_top_location : device_.f16_half_top_location;
+        return leonida::link_f16_halves(vs_words, vs_entry, ps_words, ps_entry, error, top_loc);
     }
 
 public:
@@ -13712,7 +13776,8 @@ public:
         }
         if (f16_linked_) {
             if (vs == SIZE_MAX || ps == SIZE_MAX ||
-                !link_f16_halves(words[vs], *sources_[vs].entry, words[ps], *sources_[ps].entry, &why))
+                !link_f16_halves(words[vs], *sources_[vs].entry, words[ps], *sources_[ps].entry, &why,
+                                 bary_fallback_))
                 return false;
         }
         for (std::size_t i = 0; i < sources_.size(); ++i) {
@@ -13725,6 +13790,12 @@ public:
             if (sources_[i].kind == StageSource::rect_list) {
                 if (vs == SIZE_MAX) return false;
                 words[i] = leonida::rect_list_geometry(words[vs], why);
+            } else if (sources_[i].kind == StageSource::bary_fallback) {
+                if (vs == SIZE_MAX || ps == SIZE_MAX || !sources_[ps].entry->bary_fallback_location ||
+                    !leonida::build_bary_fallback_gs(words[vs], words[ps],
+                                                     *sources_[ps].entry->bary_fallback_location, words[i], nullptr,
+                                                     &why))
+                    return false;
             } else if (sources_[i].kind == StageSource::depth_only) {
                 words[i] = leonida::depth24_depth_only_fragment(depth24_bias_);
             } else {
@@ -13758,7 +13829,7 @@ private:
 
     // Where a lazy graphics pipeline's stage modules come from, in recipe_.stages order (stage_words).
     struct StageSource {
-        enum Kind : std::uint8_t { library, rect_list, depth_only } kind = library;
+        enum Kind : std::uint8_t { library, rect_list, bary_fallback, depth_only } kind = library;
         std::uint8_t slot = 0;       // library: the create_graphics stage table entry (0 VS or MS, 1 GS, 2 PS)
         bool depth24 = false;        // library: the D24 fragment patch applies
         const leonida::ShaderEntry* entry = nullptr;  // library: the translated shader
@@ -13771,8 +13842,9 @@ private:
     const leonida::ShaderEntry* compute_entry_ = nullptr;  // compute: the translated shader build_compute reads
     bool compute_failed_ = false;                          // compute: could not be built; not retried
     std::atomic<bool> skip_logged_{false};                 // compute: the skipped program's first dispatch was logged
-    bool lazy_ = false;       // graphics: built at the first draw (lazy_graphics_pipelines)
-    bool f16_linked_ = false; // graphics: the VS and PS words had their f16 halves linked
+    bool lazy_ = false;          // graphics: built at the first draw (lazy_graphics_pipelines)
+    bool f16_linked_ = false;    // graphics: the VS and PS words had their f16 halves linked
+    bool bary_fallback_ = false; // graphics: synthesized --bary-fallback geometry stage
     leonida::Depth24Bias depth24_bias_{};
     unsigned rgba4_mask_ = 0;  // graphics: the B4G4R4A4 targets stored as RGBA8 that the pixel shader is quantised for
     bool dual_source_ = false; // graphics: a SRC1 blend factor; the pixel shader's SV_Target1 is Location 0, Index 1
@@ -15153,6 +15225,14 @@ public:
                     ? info.f16_half_top_location
                     : leonida::f16_half_top_location(
                           props.limits.maxVertexOutputComponents, props.limits.maxFragmentInputComponents);
+                state_.bary_f16_half_top_location = state_.f16_half_top_location;
+                if (info.f16_half_top_location == 0 &&
+                    props.limits.maxGeometryInputComponents && props.limits.maxGeometryOutputComponents) {
+                    state_.bary_f16_half_top_location = std::min(
+                        state_.f16_half_top_location,
+                        leonida::f16_half_top_location(props.limits.maxGeometryInputComponents,
+                                                       props.limits.maxGeometryOutputComponents));
+                }
             }
             if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"))) {
