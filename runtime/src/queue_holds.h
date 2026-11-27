@@ -5,10 +5,59 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
 namespace leonida {
+
+namespace queue_holds {
+
+// Process-wide registry of live QueueHolds instances and their active CPU/async queue work count.
+// Queried by the console list-value progress pump (shims/d3d12_xs_list_values.h) so held waits are never
+// released unmet while any queue has queued async inbox calls, an active worker/executing submission, a pending
+// held-release request, an active pump_ready() pass, or unretired GPU work.
+struct Registry {
+    struct Entry {
+        const void* owner = nullptr;
+        bool (*has_progress)(const void* owner) = nullptr;
+    };
+
+    std::atomic<std::int64_t> active_work{0};
+    mutable std::mutex mutex;
+    std::vector<Entry> entries;
+
+    static Registry& get() {
+        static Registry* r = new Registry;  // immortal: may be queried during teardown
+        return *r;
+    }
+
+    void add(const void* owner, bool (*fn)(const void*)) {
+        std::lock_guard lock(mutex);
+        entries.push_back({owner, fn});
+    }
+
+    void remove(const void* owner) {
+        std::lock_guard lock(mutex);
+        for (auto it = entries.begin(); it != entries.end(); ++it)
+            if (it->owner == owner) {
+                entries.erase(it);
+                return;
+            }
+    }
+
+    bool any_progress() const {
+        if (active_work.load(std::memory_order_acquire) > 0) return true;
+        std::lock_guard lock(mutex);
+        for (const Entry& e : entries)
+            if (e.has_progress && e.has_progress(e.owner)) return true;
+        return false;
+    }
+};
+
+inline bool any_progress() { return Registry::get().any_progress(); }
+
+}  // namespace queue_holds
 
 // Cross-queue Wait-before-Signal (docs section 4.4, "Wait before Signal across queues").
 //
@@ -44,10 +93,61 @@ public:
         virtual void discard_waiting_on(Semaphore semaphore) = 0;
         // Sequence number (next_seq()) of the oldest held operation, 0 when nothing is held.
         virtual std::uint64_t oldest_held_seq() = 0;
+        // True when this queue has submitted GPU work that has not retired yet. Must not take any QueueHolds or
+        // queue lock (called under holders_use_mutex_ shared lock from any_progress()).
+        virtual bool has_pending_gpu_work() const { return false; }
 
     protected:
         ~Holder() = default;
     };
+
+    QueueHolds() { queue_holds::Registry::get().add(this, &has_progress_thunk); }
+    ~QueueHolds() { queue_holds::Registry::get().remove(this); }
+    QueueHolds(const QueueHolds&) = delete;
+    QueueHolds& operator=(const QueueHolds&) = delete;
+
+    // Tracks active CPU-side queue progress (async inbox items, busy worker turns, pending async release requests,
+    // actively executing submissions, and active pump_ready() passes). Balanced in pairs / via WorkGuard.
+    void work_changed(std::int64_t delta) {
+        active_work_.fetch_add(delta, std::memory_order_acq_rel);
+        queue_holds::Registry::get().active_work.fetch_add(delta, std::memory_order_acq_rel);
+    }
+
+    class WorkGuard {
+    public:
+        WorkGuard() = default;
+        explicit WorkGuard(QueueHolds& holds) { arm(holds); }
+        ~WorkGuard() { release(); }
+        void arm(QueueHolds& holds) {
+            if (holds_) return;
+            holds_ = &holds;
+            holds_->work_changed(1);
+        }
+        void release() {
+            if (!holds_) return;
+            QueueHolds* h = holds_;
+            holds_ = nullptr;
+            h->work_changed(-1);
+        }
+        WorkGuard(const WorkGuard&) = delete;
+        WorkGuard& operator=(const WorkGuard&) = delete;
+
+    private:
+        QueueHolds* holds_ = nullptr;
+    };
+
+    // True when this device has active CPU/async queue work, an unpumped signal for held work, or unretired GPU
+    // work on any attached queue. Lock order: Registry::mutex (optional) -> holders_use_mutex_ (shared) -> mutex_
+    // (leaf, released before querying each holder's lock-free GPU progress).
+    bool has_progress() const {
+        if (active_work_.load(std::memory_order_acquire) > 0) return true;
+        if (any_held() && signaled_unpumped_.load(std::memory_order_acquire)) return true;
+        std::shared_lock use(holders_use_mutex_);
+        const auto list = snapshot();
+        for (const Holder* holder : list)
+            if (holder->has_pending_gpu_work()) return true;
+        return false;
+    }
 
     void add_fence(Semaphore semaphore, std::uint64_t initial) {
         std::lock_guard lock(mutex_);
@@ -76,9 +176,16 @@ public:
     // A Signal of `value` was submitted to the GPU (or the CPU set the fence). Call after the submission, with no
     // queue lock held; then pump_ready() to release what it satisfied.
     void signaled(Semaphore semaphore, std::uint64_t value) {
-        std::lock_guard lock(mutex_);
-        const auto it = fences_.find(semaphore);
-        if (it != fences_.end() && it->second < value) it->second = value;
+        bool advanced = false;
+        {
+            std::lock_guard lock(mutex_);
+            const auto it = fences_.find(semaphore);
+            if (it != fences_.end() && it->second < value) {
+                it->second = value;
+                advanced = true;
+            }
+        }
+        if (advanced && any_held()) signaled_unpumped_.store(true, std::memory_order_release);
     }
 
     // A queue is about to submit a Signal of `value`; call inside the device submit lock, and record the value with
@@ -116,12 +223,16 @@ public:
     void detach(Holder* holder) {
         {
             std::lock_guard pump(pump_mutex_);
-            std::lock_guard lock(mutex_);
-            for (auto it = holders_.begin(); it != holders_.end(); ++it)
-                if (*it == holder) {
-                    holders_.erase(it);
-                    break;
-                }
+            {
+                std::lock_guard lock(mutex_);
+                for (auto it = holders_.begin(); it != holders_.end(); ++it)
+                    if (*it == holder) {
+                        holders_.erase(it);
+                        break;
+                    }
+            }
+            // Wait for any concurrent has_progress() reader holding a snapshot that still names `holder`.
+            std::unique_lock use(holders_use_mutex_);
         }
         pump_ready();
     }
@@ -166,7 +277,11 @@ public:
     // that makes another queue's front ready, so passes repeat until one finds nothing new. Then the callbacks
     // whose held work is all gone.
     void pump_ready() {
-        if (!any_held() && barrier_count_.load(std::memory_order_acquire) == 0) return;
+        if (!any_held() && barrier_count_.load(std::memory_order_acquire) == 0) {
+            signaled_unpumped_.store(false, std::memory_order_release);
+            return;
+        }
+        WorkGuard pumping(*this);
         dirty_.store(true, std::memory_order_release);
         if (in_pump()) return;  // a release on this thread submitted a Signal: the running pass will go again
         for (;;) {
@@ -174,6 +289,7 @@ public:
             if (!pump) return;  // another thread is releasing and will see dirty_
             in_pump() = true;
             while (dirty_.exchange(false, std::memory_order_acq_rel)) {
+                signaled_unpumped_.store(false, std::memory_order_release);
                 bool progress = true;
                 while (progress) {
                     progress = false;
@@ -228,8 +344,13 @@ private:
         }
     }
 
+    static bool has_progress_thunk(const void* owner) {
+        return static_cast<const QueueHolds*>(owner)->has_progress();
+    }
+
     mutable std::mutex mutex_;  // leaf: fences_, holders_ and barriers_
     std::mutex pump_mutex_;     // one releasing thread; held across release_ready(), so detach() waits for it
+    mutable std::shared_mutex holders_use_mutex_;  // shared by has_progress(), unique in detach() after erasing holder
     std::unordered_map<Semaphore, std::uint64_t> fences_;
     std::vector<Holder*> holders_;
     std::deque<Barrier> barriers_;
@@ -237,6 +358,8 @@ private:
     std::atomic<std::int64_t> barrier_count_{0};
     std::atomic<std::uint64_t> seq_{0};
     std::atomic<bool> dirty_{false};
+    std::atomic<std::int64_t> active_work_{0};
+    std::atomic<bool> signaled_unpumped_{false};
 };
 
 }  // namespace leonida

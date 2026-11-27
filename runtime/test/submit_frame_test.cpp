@@ -7,6 +7,7 @@
 //      the test still passes): the floor's phase sums must equal what the phase totals grew by, submission for
 //      submission, and every one of them is a floor submission.
 #include "vk_test_device.h"
+#include "../src/list_value_progress.h"
 #include "../src/vulkan_backend.h"
 
 #include <atomic>
@@ -471,6 +472,143 @@ int queue_async_and_coalescing() {
         EXPECT(before_calls.load() == 1);
         EXPECT(db[16] == 0xC1 && db[48] == 0xC3);
         std::printf("queue async (depth=4): inbox coalescing, Present barrier split, gate release ok\n");
+    }
+
+    // 4. Async queue progress tracking (LEONIDA_SUBMIT_ASYNC=4 + queued Present + busy producer worker + genuine
+    //    deadlock):
+    //    (a) While the direct producer async worker is busy inside before_execute_() with a WriteGroup Signal
+    //        still queued in its inbox_, a consumer compute gate with a Present queued behind it must NOT be
+    //        released unmet (queue_holds::any_progress() == true -> list_value_progress::Reason::hold).
+    //    (b) Once all async workers finish draining into held_ and the GPU is idle, two async queues holding
+    //        unsatisfied waits must NOT ping-pong release_ready(), queue_holds::any_progress() settles to false,
+    //        and a genuine Present deadlock breaks cleanly.
+    //    (c) In synchronous mode, executing_ == true (unlocked before_execute_()) also keeps any_progress() true.
+    {
+        namespace lvp = leonida::list_value_progress;
+        const auto met_ge = [](std::uint32_t, std::uint64_t v, std::uint64_t ref, bool) { return v >= ref; };
+
+        VulkanContext context(d.device_proc, d.device, true);
+        EXPECT(context.loaded());
+        VulkanQueue direct(context, d.queue, d.family, VulkanQueue::QueueKind::direct);
+        VulkanQueue compute(context, d.queue, d.family, VulkanQueue::QueueKind::compute);
+        EXPECT(direct.ok() && compute.ok());
+        direct.set_async_depth(4);
+        compute.set_async_depth(4);
+
+        auto empty_list = std::make_shared<CommandList>();
+        EXPECT(empty_list->close());
+        std::shared_ptr<const CommandList> snap = empty_list;
+
+        std::atomic<bool> hold_before{true};
+        std::atomic<bool> in_before{false};
+        context.set_before_execute([&] {
+            if (hold_before.load(std::memory_order_acquire)) {
+                in_before.store(true, std::memory_order_release);
+                while (hold_before.load(std::memory_order_acquire)) std::this_thread::yield();
+            }
+        });
+
+        VulkanFence producer_written(context, 0), consumer_gate(context, 0), consumer_done(context, 0);
+        EXPECT(producer_written.semaphore() && consumer_gate.semaphore() && consumer_done.semaphore());
+
+        // (a) Direct worker starts batch 0 and blocks inside before_execute_().
+        EXPECT(direct.execute({&snap, 1}) == ReplayResult::success);
+        while (!in_before.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        // Compute queue holds a batch behind consumer_gate (simulating wait64 on title memory).
+        compute.wait(consumer_gate.semaphore(), 1);
+        EXPECT(compute.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(compute.signal(consumer_done.semaphore(), 1));
+
+        // Direct queue queues the producer batch + Signal(producer_written, 1) behind the blocked batch in inbox_.
+        EXPECT(direct.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(direct.signal(producer_written.semaphore(), 1));
+
+        // Title queues Present (after_held) and returns to idle (title_calls == 0).
+        std::atomic<bool> present_ran{false};
+        int present_owner = 0;
+        context.holds().after_held(&present_owner, [&] { present_ran.store(true, std::memory_order_release); });
+
+        // Wait briefly for compute's worker to move its batch into held_, while direct's worker stays busy.
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        // Producer's Signal has NOT reached Vulkan yet (still in direct.inbox_!), so pending() is true — the exact
+        // condition where Pump::choose_release() sees wg.running == false and would falsely break at Present
+        // without QueueHolds progress tracking.
+        EXPECT(context.holds().pending(producer_written.semaphore(), 1));
+        EXPECT(queue_holds::any_progress());
+
+        const lvp::WaitPredicate wait_val[] = {{0x1000, 1, 7, true}};
+        const lvp::PendingWrite write_val[] = {{0x1000, 1, 8, false}};
+        const lvp::PendingGate gates[] = {
+            {&compute, 1, false, false, wait_val, /*presents_at_hold=*/0, /*held_ms=*/0}};
+        const lvp::PendingWriteGroup writes[] = {{&direct, 0, /*running=*/false, write_val}};
+        lvp::Activity at_present;
+        at_present.presents = 1;
+        at_present.now_ms = 250;
+        at_present.title_call_ms = 10;
+        at_present.title_submitting = queue_holds::any_progress();
+        EXPECT(lvp::decide(writes, gates, at_present, met_ge).reason == lvp::Reason::hold);
+        EXPECT(!present_ran.load(std::memory_order_acquire));
+
+        // Unblock direct's worker: producer executes and submits Signal(producer_written, 1) cleanly.
+        hold_before.store(false, std::memory_order_release);
+        EXPECT(producer_written.wait(1, 5'000'000'000ull));
+        EXPECT(direct.idle());
+        EXPECT(!context.holds().pending(producer_written.semaphore(), 1));
+
+        // Now consumer_gate is met: signaling it wakes compute's worker, which drains consumer_batch and Present.
+        EXPECT(consumer_gate.signal(1));
+        EXPECT(consumer_done.wait(1, 5'000'000'000ull));
+        EXPECT(compute.idle());
+        EXPECT(present_ran.load(std::memory_order_acquire));
+
+        // (b) Genuine deadlock across BOTH async queues (no producer can ever signal): any_progress() must settle
+        //     to false (zero cross-queue release_ready() ping-pong) so Present breaks the deadlock cleanly.
+        VulkanFence dead_gate_a(context, 0), dead_gate_b(context, 0), dead_done_a(context, 0), dead_done_b(context, 0);
+        EXPECT(dead_gate_a.semaphore() && dead_gate_b.semaphore() && dead_done_a.semaphore() &&
+               dead_done_b.semaphore());
+        direct.wait(dead_gate_a.semaphore(), 1);
+        EXPECT(direct.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(direct.signal(dead_done_a.semaphore(), 1));
+        compute.wait(dead_gate_b.semaphore(), 1);
+        EXPECT(compute.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(compute.signal(dead_done_b.semaphore(), 1));
+
+        EXPECT(direct.idle());
+        EXPECT(compute.idle());
+        // Wait up to 500 ms for any trailing pump_ready() to finish; must settle to false and stay false.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (queue_holds::any_progress() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        EXPECT(!queue_holds::any_progress());
+        at_present.title_submitting = queue_holds::any_progress();
+        const lvp::Decision broken = lvp::decide({}, gates, at_present, met_ge);
+        EXPECT(broken.reason == lvp::Reason::present && broken.gate == 0);
+
+        // Clean teardown of held deadlock ops.
+        EXPECT(dead_gate_a.signal(1));
+        EXPECT(dead_gate_b.signal(1));
+        EXPECT(dead_done_a.wait(1, 5'000'000'000ull));
+        EXPECT(dead_done_b.wait(1, 5'000'000'000ull));
+        EXPECT(direct.idle() && compute.idle());
+
+        // (c) Synchronous executing_ == true (unlocked before_execute_()) also keeps any_progress() true.
+        VulkanQueue sync_q(context, d.queue, d.family, VulkanQueue::QueueKind::direct);
+        EXPECT(sync_q.ok());
+        sync_q.set_async_depth(0);
+        hold_before.store(true, std::memory_order_release);
+        in_before.store(false, std::memory_order_release);
+        ReplayResult sync_res = ReplayResult::unsupported;
+        std::thread sync_t([&] { sync_res = sync_q.execute({&snap, 1}); });
+        while (!in_before.load(std::memory_order_acquire)) std::this_thread::yield();
+        EXPECT(queue_holds::any_progress());
+        hold_before.store(false, std::memory_order_release);
+        sync_t.join();
+        EXPECT(sync_res == ReplayResult::success);
+        EXPECT(sync_q.idle());
+        EXPECT(!queue_holds::any_progress());
+        std::printf("queue async progress: held gate protected during busy worker/executing_, genuine deadlock breaks ok\n");
     }
 
     return 0;

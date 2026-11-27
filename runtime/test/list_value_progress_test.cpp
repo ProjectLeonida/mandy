@@ -3,7 +3,9 @@
 // present queued after it or when the title has stopped calling, and a gate whose writer is held behind another
 // queue's root waits for that root. No time alone ever releases a gate. No Windows, D3D12 or Vulkan headers.
 #include "../src/list_value_progress.h"
+#include "../src/queue_holds.h"
 
+#include <atomic>
 #include <cstdio>
 #include <vector>
 
@@ -230,6 +232,89 @@ int main() {
         a.presents = 9;
         a.now_ms = 100'000;
         CHECK(run({}, gates, a).reason == Reason::hold);
+    }
+
+    // 11. QueueHolds progress integration (LEONIDA_SUBMIT_ASYNC + busy worker + unretired GPU work):
+    //     a held gate with a queued Present must NOT be released unmet while any queue has active CPU/async work,
+    //     an unpumped signal for held work, or unretired GPU work; once all queues and the GPU are truly idle,
+    //     genuine Present and cycle deadlocks still break cleanly.
+    {
+        struct MockHolder final : leonida::QueueHolds<std::uint64_t>::Holder {
+            std::atomic<bool> gpu_busy{false};
+            bool release_ready() override { return false; }
+            void discard_waiting_on(std::uint64_t) override {}
+            std::uint64_t oldest_held_seq() override { return 0; }
+            bool has_pending_gpu_work() const override { return gpu_busy.load(std::memory_order_acquire); }
+        };
+
+        leonida::QueueHolds<std::uint64_t> holds;
+        MockHolder holder;
+        holds.attach(&holder);
+        holds.add_fence(1, 0);
+        CHECK(!leonida::queue_holds::any_progress());
+
+        const PendingGate gates[] = {gate(qa, 1, wait_x, 0, 0)};
+        // Producer's write group has running == false because its Signal is still sitting in an async queue inbox.
+        const PendingWriteGroup queued_write[] = {group(qb, 0, write_x, false)};
+        Activity at_present;
+        at_present.presents = 1;
+        at_present.now_ms = 250;
+        at_present.title_call_ms = 10;
+
+        // 11a. Active async inbox / busy worker keeps any_progress() true -> gate stays held at Present.
+        {
+            leonida::QueueHolds<std::uint64_t>::WorkGuard busy(holds);
+            CHECK(leonida::queue_holds::any_progress());
+            Activity a = at_present;
+            a.title_submitting = leonida::queue_holds::any_progress();
+            CHECK(run(queued_write, gates, a).reason == Reason::hold);
+        }
+        CHECK(!leonida::queue_holds::any_progress());
+
+        // 11b. Unpumped Signal while held work exists keeps any_progress() true until pump_ready() runs.
+        holds.held_changed(1);
+        holds.signaled(1, 1);
+        CHECK(leonida::queue_holds::any_progress());
+        {
+            Activity a = at_present;
+            a.title_submitting = leonida::queue_holds::any_progress();
+            CHECK(run(queued_write, gates, a).reason == Reason::hold);
+        }
+        holds.pump_ready();
+        holds.held_changed(-1);
+        CHECK(!leonida::queue_holds::any_progress());
+
+        // 11c. Unretired GPU submission on any queue keeps any_progress() true -> gate stays held at Present.
+        holder.gpu_busy.store(true, std::memory_order_release);
+        CHECK(leonida::queue_holds::any_progress());
+        {
+            Activity a = at_present;
+            a.title_submitting = leonida::queue_holds::any_progress();
+            CHECK(run({}, gates, a).reason == Reason::hold);
+        }
+        // Once the GPU retires and all queues are idle, a genuine Present deadlock breaks cleanly.
+        holder.gpu_busy.store(false, std::memory_order_release);
+        CHECK(!leonida::queue_holds::any_progress());
+        {
+            Activity a = at_present;
+            a.title_submitting = leonida::queue_holds::any_progress();
+            const Decision d = run({}, gates, a);
+            CHECK(d.reason == Reason::present && d.gate == 0);
+        }
+
+        // 11d. Genuine cycle deadlock also breaks cleanly once queues and GPU are idle.
+        {
+            const PendingGate cycle_gates[] = {gate(qa, 1, wait_x), gate(qb, 1, wait_y)};
+            const PendingWriteGroup cycle_writes[] = {group(qb, 1, write_x), group(qa, 1, write_y)};
+            Activity a;
+            a.now_ms = 5;
+            a.title_call_ms = 5;
+            a.title_submitting = leonida::queue_holds::any_progress();
+            const Decision d = run(cycle_writes, cycle_gates, a);
+            CHECK(d.reason == Reason::cycle && d.gate == 0);
+        }
+
+        holds.detach(&holder);
     }
 
     std::printf("list_value_progress_test: all checks passed\n");

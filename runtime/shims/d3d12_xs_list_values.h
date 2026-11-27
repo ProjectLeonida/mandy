@@ -61,6 +61,7 @@
 
 #include "d3d12_xs_device.h"          // console_value_met, ListValueStats
 #include "../src/list_value_progress.h"  // leonida::list_value_progress: which held gate may go without its value
+#include "../src/queue_holds.h"       // leonida::queue_holds::any_progress: async/active/GPU queue work
 #include "../src/title_page_watch.h"  // leonida::kernel_writes::store
 #include "../src/value_write_sink.h"  // leonida::value_sink: the arena and xmem's PAGE_NOACCESS pages
 #include "../src/submit_phases.h"     // the pump's and releaser's time in the "submit frame" line
@@ -843,13 +844,18 @@ private:
     // and logged, or gates_.size(). Called with mutex_ held, after a pass that opened nothing.
     std::size_t choose_release(bool landed_any) {
         namespace lvp = leonida::list_value_progress;
+        const std::uint64_t now_ms = GetTickCount64();
         lvp::Activity activity;
         activity.releasing = landed_any || pending_releases_.load(std::memory_order_acquire) != 0;
-        activity.title_submitting = title_calls_.load(std::memory_order_relaxed) != 0;
-        if (activity.releasing || activity.title_submitting) return gates_.size();  // the cheap answer first
+        activity.title_submitting =
+            title_calls_.load(std::memory_order_relaxed) != 0 || leonida::queue_holds::any_progress();
+        if (activity.releasing || activity.title_submitting) {
+            last_progress_ms_ = now_ms;
+            return gates_.size();  // the cheap answer first
+        }
         activity.presents = presents_.load(std::memory_order_relaxed);
-        activity.now_ms = GetTickCount64();
-        activity.title_call_ms = title_call_ms_.load(std::memory_order_relaxed);
+        activity.now_ms = now_ms;
+        activity.title_call_ms = (std::max)(title_call_ms_.load(std::memory_order_relaxed), last_progress_ms_);
 
         std::size_t total_writes = 0;
         for (const WriteGroup& wg : writes_) total_writes += wg.writes.size();
@@ -865,7 +871,10 @@ private:
             // relayed wait or a title fence), it is not running.
             const bool running = wg.queue->written->GetCompletedValue() < wg.value &&
                                  signal_submitted(wg.queue->written, wg.value);
-            if (running) return gates_.size();
+            if (running) {
+                last_progress_ms_ = now_ms;
+                return gates_.size();
+            }
             groups.push_back({wg.queue.get(), wg.after_gate, running,
                               std::span<const lvp::PendingWrite>(flat_writes).subspan(start, wg.writes.size())});
         }
@@ -888,6 +897,7 @@ private:
             const bool action = static_cast<bool>(g.action);
             const bool action_running = action && g.queue->written->GetCompletedValue() < g.after &&
                                         signal_submitted(g.queue->written, g.after);
+            if (action_running) last_progress_ms_ = now_ms;
             view.push_back({g.queue.get(), g.value, action, action_running,
                             std::span<const lvp::WaitPredicate>(flat_waits).subspan(ranges[i].first, ranges[i].second),
                             g.presents_at_hold, g.held_ms});
@@ -1165,6 +1175,7 @@ private:
     bool busy_ = false;               // a pass is landing or handing over what it took off the lists
     unsigned logged_met_ = 0;
     std::uint64_t logged_released_ = 0;
+    std::uint64_t last_progress_ms_ = 0;             // pump thread only (mutex_): latest tick progress was observed
     std::atomic<std::uint64_t> presents_{0};       // the title's PresentX calls so far
     std::atomic<std::uint64_t> title_call_ms_{0};  // GetTickCount64 at the start or end of its latest queue call
     std::atomic<unsigned> title_calls_{0};         // title ExecuteCommandLists calls in progress

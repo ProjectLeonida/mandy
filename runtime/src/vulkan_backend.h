@@ -2493,8 +2493,11 @@ public:
                                                         "vkSignalSemaphore");
         if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
         if (result != VK_SUCCESS) return false;
-        context_.holds().signaled(semaphore_, value);  // queues that held a batch for this value run it now
-        context_.holds().pump_ready();
+        {
+            QueueHolds<VkSemaphore>::WorkGuard active(context_.holds());
+            context_.holds().signaled(semaphore_, value);  // queues that held a batch for this value run it now
+            context_.holds().pump_ready();
+        }
         return true;
     }
 
@@ -2674,10 +2677,12 @@ public:
         flush_async();  // after the calls queued before it (LEONIDA_SUBMIT_ASYNC)
         bool ok = false;
         bool drained = false;
+        QueueHolds<VkSemaphore>::WorkGuard work_guard;
         std::vector<std::shared_ptr<void>> retired;
         {
             std::unique_lock state(state_mutex_);
             exec_cv_.wait(state, [this] { return !executing_; });
+            work_guard.arm(context_.holds());
             executing_ = true;
             ExecGuard exec_guard{this, state};
             take_waits_to_exec_locked();
@@ -2745,10 +2750,12 @@ public:
         flush_async();
         bool ok = false;
         bool drained = false;
+        QueueHolds<VkSemaphore>::WorkGuard work_guard;
         std::vector<std::shared_ptr<void>> retired;
         {
             std::unique_lock state(state_mutex_);
             exec_cv_.wait(state, [this] { return !executing_; });
+            work_guard.arm(context_.holds());
             executing_ = true;
             ExecGuard exec_guard{this, state};
             take_waits_to_exec_locked();
@@ -2866,6 +2873,7 @@ public:
     bool signal_sync(VkSemaphore fence, std::uint64_t value, const PinFn& pin, std::shared_ptr<void> async_pin = {}) {
         bool ok = true;
         bool drained = false;
+        QueueHolds<VkSemaphore>::WorkGuard work_guard;
         std::vector<std::shared_ptr<void>> retired;
         {
             std::unique_lock state(state_mutex_);
@@ -2878,6 +2886,7 @@ public:
                 else if (pin) op.pins.push_back(pin());
                 hold(std::move(op));
             } else {
+                work_guard.arm(context_.holds());
                 executing_ = true;
                 ExecGuard exec_guard{this, state};
                 take_waits_to_exec_locked();
@@ -2958,6 +2967,7 @@ public:
 
     void marker_sync(DebugMarker::Kind kind, const char* label) {
         bool drained = false;
+        QueueHolds<VkSemaphore>::WorkGuard work_guard;
         std::vector<std::shared_ptr<void>> retired;
         {
             std::unique_lock state(state_mutex_);
@@ -2968,6 +2978,7 @@ public:
                 op.label = label ? label : "";
                 hold(std::move(op));
             } else {
+                work_guard.arm(context_.holds());
                 executing_ = true;
                 ExecGuard exec_guard{this, state};
                 state.unlock();
@@ -4131,11 +4142,13 @@ private:
         ReplayResult result = ReplayResult::success;
         bool held = false;
         bool drained = false;
+        QueueHolds<VkSemaphore>::WorkGuard work_guard;
         std::vector<std::shared_ptr<void>> retired;  // destroyed after state_mutex_ is released
         {
             std::unique_lock state(state_mutex_, std::defer_lock);
             submit_phases::lock_timed(state);
             if (!executing_ && !must_hold()) {
+                work_guard.arm(context_.holds());
                 executing_ = true;
                 ExecGuard exec_guard{this, state};
                 take_waits_to_exec_locked();
@@ -4332,14 +4345,22 @@ private:
     // which releases it and then pumps the holds itself (so a Present behind it still runs after it).
     bool release_ready() override {
         if (async_started_.load(std::memory_order_acquire) && t_worker_of_ != this) {
+            bool wake = false;
             {
                 std::lock_guard lock(inbox_mutex_);
-                release_requested_ = true;
+                if (async_stop_) return false;  // worker is stopping/joined during teardown
                 // A Present barrier (after_held) or cross-queue Signal just ran pump_ready(): do not coalesce a
                 // later inbox batch across what is already queued so a Present runs between them.
                 if (!inbox_.empty()) inbox_.back().barrier_after = true;
+                // Only ask the worker to drain held_ when this queue actually has held work; avoids idle wakeups
+                // and cross-queue ping-pong while another queue holds an unsatisfied wait.
+                if (held_front_seq_.load(std::memory_order_acquire) != 0 && !release_requested_) {
+                    release_requested_ = true;
+                    context_.holds().work_changed(1);
+                    wake = true;
+                }
             }
-            inbox_cv_.notify_one();
+            if (wake) inbox_cv_.notify_one();
             return false;
         }
         return release_held();
@@ -4394,6 +4415,17 @@ private:
             if (queued && (!oldest || queued < oldest)) oldest = queued;
         }
         return oldest;
+    }
+
+    // Holder: true while this queue has submitted GPU work that has not retired yet. Lock-free so
+    // QueueHolds::has_progress() can query it safely without taking queue or submit locks.
+    bool has_pending_gpu_work() const override {
+        if (context_.is_device_lost()) return false;
+        const std::uint64_t sub = submitted_gpu_.load(std::memory_order_acquire);
+        if (!sub) return false;
+        std::uint64_t done = 0;
+        const VkResult result = context_.vk.vkGetSemaphoreCounterValue(context_.device(), progress_, &done);
+        return result == VK_SUCCESS && done < sub;
     }
 
     // A queue destroyed with held work. Reported, not waited for: nothing was submitted for it, so the VkQueue is
@@ -4569,6 +4601,7 @@ private:
             context_.record_submit_locked(progress_, ticket);
         }
         submitted_ = last_sparse_ = ticket;
+        submitted_gpu_.store(ticket, std::memory_order_release);
         clear_exec_waits(ticket);
         for (auto it = changes.begin(); it != changes.end();) {
             resource->mapped.erase(it->first);
@@ -4832,6 +4865,7 @@ private:
         }
         if (ok) {
             submitted_ = ticket;
+            submitted_gpu_.store(ticket, std::memory_order_release);
             clear_exec_waits(ticket);
             for (auto& slot : buffers_)
                 if (slot.buffer == command_buffer) slot.ticket = ticket;
@@ -4846,6 +4880,7 @@ private:
     VkCommandPool pool_ = VK_NULL_HANDLE;
     VkSemaphore progress_ = VK_NULL_HANDLE;  // our own timeline: which command buffers are done
     std::uint64_t submitted_ = 0;
+    std::atomic<std::uint64_t> submitted_gpu_{0};  // mirror of submitted_, read lock-free by has_pending_gpu_work()
     std::vector<CommandSlot> buffers_;
     std::vector<VkEvent> free_events_;  // unsignaled, for order_timestamp_copy
     std::unique_ptr<OcclusionResolve> occlusion_resolve_;
@@ -4930,6 +4965,7 @@ private:
         call.seq = context_.holds().next_seq();
         call.queued_at = std::chrono::steady_clock::now();
         context_.holds().held_changed(1);
+        context_.holds().work_changed(1);
         inbox_.push_back(std::move(call));
         async_stats_.depth_max = std::max(async_stats_.depth_max, inbox_.size());
         lock.unlock();
@@ -4941,10 +4977,12 @@ private:
         for (;;) {
             std::vector<Call> calls;
             bool release = false;
+            std::int64_t consumed_work = 0;
             {
                 std::unique_lock lock(inbox_mutex_);
                 inbox_cv_.wait(lock, [this] { return !inbox_.empty() || release_requested_ || async_stop_; });
                 release = std::exchange(release_requested_, false);
+                if (release) ++consumed_work;
                 if (!inbox_.empty()) {
                     Call first = std::move(inbox_.front());
                     inbox_.pop_front();
@@ -4961,12 +4999,19 @@ private:
                             if (stop_after) break;
                         }
                     }
+                    consumed_work += static_cast<std::int64_t>(calls.size());
                 } else if (!release) {
                     return;  // stopping, nothing queued
                 }
                 worker_busy_ = true;
+                // Transfer consumed inbox/release work into this worker turn: keep +1 active until pump_ready() ends.
+                if (consumed_work != 1) context_.holds().work_changed(1 - consumed_work);
             }
-            if (release) release_held();
+            struct WorkerTurnGuard {
+                QueueHolds<VkSemaphore>& holds;
+                ~WorkerTurnGuard() { holds.work_changed(-1); }
+            } turn_guard{context_.holds()};
+            const bool released = release && release_held();
             const bool have = !calls.empty();
             std::size_t popped_batches = 0;
             if (have) {
@@ -4998,7 +5043,7 @@ private:
             }
             if (have) context_.holds().held_changed(-static_cast<std::int64_t>(calls.size()));
             calls.clear();  // the snapshots and pins go before the pump, outside the lock
-            context_.holds().pump_ready();
+            if (have || released) context_.holds().pump_ready();
         }
     }
 
