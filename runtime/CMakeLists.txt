@@ -2147,6 +2147,20 @@ if(TARGET Vulkan::Headers)
     add_test(NAME arena_sparse_gpu COMMAND arena_sparse_gpu_test)
     set_tests_properties(arena_sparse_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   endif()
+  # A console heap read in place: one home bound into a mirror chunk and into the arena shows the same bytes through
+  # both, CPU and GPU writes alike, and the unbound guard after the heap reads zero.
+  add_executable(vk_heap_alias_test test/vk_heap_alias_test.cpp)
+  target_link_libraries(vk_heap_alias_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_heap_alias_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_heap_alias_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_heap_alias COMMAND vk_heap_alias_test)
+    set_tests_properties(vk_heap_alias PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  endif()
   # The page mirror on a real device (src/title_mirror.h): a title-written V# read through a buffer reaches its page at
   # heap_base + its title address; remaps, writes and unmaps reach the next dispatch that waits for the bind.
   add_executable(vk_title_mirror_test test/vk_title_mirror_test.cpp)
