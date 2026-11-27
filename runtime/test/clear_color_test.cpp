@@ -22,7 +22,7 @@ VKAPI_ATTR void VKAPI_CALL end(VkCommandBuffer) {}
 VKAPI_ATTR void VKAPI_CALL attachments(VkCommandBuffer, std::uint32_t n, const VkClearAttachment* a,
     std::uint32_t, const VkClearRect*) { if (n == 1) { captured = a[0].clearValue.color; ++calls; } }
 
-bool replay_color(VkFormat format, const leonida::ClearColor& color, bool rectangle) {
+bool replay_color(VkFormat format, const leonida::ClearColor& color, bool rectangle, bool rgba4_fallback = false) {
     leonida::CommandList list;
     const leonida::Rect rect{1, 1, 3, 3};
     if (!list.clear_render_target({1, 0, 0, 1}, color,
@@ -31,6 +31,7 @@ bool replay_color(VkFormat format, const leonida::ClearColor& color, bool rectan
     binding.image = reinterpret_cast<VkImage>(std::uintptr_t{1});
     binding.format = format;
     binding.width = binding.height = 4;
+    binding.rgba4_render_fallback = rgba4_fallback;
     leonida::ReplayFunctions vk{};
     vk.pipeline_barrier = barrier;
     vk.clear_color_image = clear;
@@ -141,6 +142,11 @@ int main() {
         {VK_FORMAT_B8G8R8A8_UNORM, {-1, 2, nan, 0.5f}, {0, 255, 0, 128}, {255, 255, 255, 255}},
         {VK_FORMAT_R8G8_UNORM, {0.5f, 1.5f, 0, 0}, {128, 255, 0, 0}, {255, 255, 255, 255}},
         {VK_FORMAT_A2B10G10R10_UNORM_PACK32, {0.5f, 0.5f, 0.5f, 0.5f}, {512, 512, 512, 2}, {1023, 1023, 1023, 3}},
+        {VK_FORMAT_A1R5G5B5_UNORM_PACK16, {0.5f, 0.25f, -1.0f, 0.5f}, {16, 8, 0, 0}, {31, 31, 31, 1}},
+        {VK_FORMAT_A1R5G5B5_UNORM_PACK16, {nan, 2.0f, 0.75f, 0.51f}, {0, 31, 23, 1}, {31, 31, 31, 1}},
+        {VK_FORMAT_A4R4G4B4_UNORM_PACK16, {0.5f, -1.0f, 2.0f, nan}, {8, 0, 15, 0}, {15, 15, 15, 15}},
+        {VK_FORMAT_R4G4B4A4_UNORM_PACK16, {0.5f, 0.25f, 0.75f, 1.5f}, {8, 4, 11, 15}, {15, 15, 15, 15}},
+        {VK_FORMAT_A4B4G4R4_UNORM_PACK16, {0.5f, 0.125f, -0.5f, nan}, {8, 2, 0, 0}, {15, 15, 15, 15}},
         {VK_FORMAT_R16G16B16A16_UNORM, {0.5f, 0.25f, 0.75f, 1.0f}, {32768, 16384, 49151, 65535},
          {65535, 65535, 65535, 65535}},
         {VK_FORMAT_R8G8B8A8_SRGB, {0.2f, 0.7f, 0.5f, 0.5f}, {0, 0, 0, 128}, {0, 0, 0, 255}},  // colour: the GPU's sRGB curve
@@ -206,14 +212,26 @@ int main() {
     // 127 when rounding down). Converted under each mode, checked after the default mode is back.
     {
         const int mode = std::fegetround();
-        VkClearColorValue unorm[3]{}, snorm[3]{};
+        VkClearColorValue unorm[3]{}, snorm[3]{}, fallback[3][2]{}, fallback_undef[3]{};
+        bool fallback_ok = true;
         const int modes[3] = {FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO};
+        const leonida::ClearColor fallback_input{0.5f, -1.0f, 2.0f, nan};
         for (int m = 0; m < 3; ++m) {
             std::fesetround(modes[m]);
             unorm[m] = leonida::detail::render_target_clear_color(VK_FORMAT_R8G8B8A8_UNORM, {0.5f, 0.5f, 0.5f, 0.5f});
             snorm[m] = leonida::detail::render_target_clear_color(VK_FORMAT_R8G8B8A8_SNORM, {-0.5f, 0.5f, -0.5f, 0.5f});
+            for (int r = 0; r < 2; ++r) {
+                if (!replay_color(VK_FORMAT_R8G8B8A8_UNORM, fallback_input, r != 0, true)) fallback_ok = false;
+                fallback[m][r] = captured;
+            }
+            if (!replay_color(VK_FORMAT_UNDEFINED, fallback_input, false, true)) fallback_ok = false;
+            fallback_undef[m] = captured;
         }
         std::fesetround(mode);
+        if (!fallback_ok) {
+            std::fprintf(stderr, "rgba4_render_fallback replay failed\n");
+            return 1;
+        }
         for (int m = 0; m < 3; ++m) {
             const long u = std::lround(double(unorm[m].float32[0]) * 255.0);
             const long s0 = std::lround(double(snorm[m].float32[0]) * 127.0);
@@ -221,6 +239,24 @@ int main() {
             if (u != 128 || s0 != -64 || s1 != 64) {
                 std::fprintf(stderr, "tie rounding under FP mode %d: UNORM %ld (128), SNORM %ld %ld (-64 64)\n",
                              modes[m], u, s0, s1);
+                return 1;
+            }
+            for (int r = 0; r < 2; ++r) {
+                const long f0 = std::lround(double(fallback[m][r].float32[0]) * 255.0);
+                if (f0 != 136 || fallback[m][r].float32[1] != 0.0f || fallback[m][r].float32[2] != 1.0f ||
+                    fallback[m][r].float32[3] != 0.0f) {
+                    std::fprintf(stderr, "rgba4_render_fallback under FP mode %d rect %d: got %.9g %.9g %.9g %.9g\n",
+                                 modes[m], r, double(fallback[m][r].float32[0]), double(fallback[m][r].float32[1]),
+                                 double(fallback[m][r].float32[2]), double(fallback[m][r].float32[3]));
+                    return 1;
+                }
+            }
+            const long fu0 = std::lround(double(fallback_undef[m].float32[0]) * 15.0);
+            if (fu0 != 8 || fallback_undef[m].float32[1] != 0.0f || fallback_undef[m].float32[2] != 1.0f ||
+                fallback_undef[m].float32[3] != 0.0f) {
+                std::fprintf(stderr, "rgba4_render_fallback (undef format) under FP mode %d: got %.9g %.9g %.9g %.9g\n",
+                             modes[m], double(fallback_undef[m].float32[0]), double(fallback_undef[m].float32[1]),
+                             double(fallback_undef[m].float32[2]), double(fallback_undef[m].float32[3]));
                 return 1;
             }
             ++checks;

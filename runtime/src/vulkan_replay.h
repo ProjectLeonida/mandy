@@ -1635,6 +1635,10 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
         unorm = {0, 0, 0, 255};
         break;
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32: is_integer = false; unorm = {1023, 1023, 1023, 3}; break;
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16: is_integer = false; unorm = {31, 31, 31, 1}; break;
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
+    case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
+    case VK_FORMAT_A4B4G4R4_UNORM_PACK16: is_integer = false; unorm = {15, 15, 15, 15}; break;
     case VK_FORMAT_R16_UNORM:
     case VK_FORMAT_R16G16_UNORM:
     case VK_FORMAT_R16G16B16A16_UNORM: is_integer = false; unorm = {65535, 65535, 65535, 65535}; break;
@@ -4859,10 +4863,10 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);
             auto pieces = detail::current(tracker, id, p.range, image_layout(p.binding, state.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
-            auto clear_value=color_clear->color;
-            if(p.binding.rgba4_render_fallback)for(auto& channel:clear_value)
-                channel=std::nearbyint(std::clamp(channel,0.0f,1.0f)*15.0f)/15.0f;
-            const VkClearColorValue color=detail::render_target_clear_color(p.clear_format,clear_value);
+            auto clear_value = color_clear->color;
+            if (p.binding.rgba4_render_fallback)
+                for (auto& channel : clear_value) channel = detail::quantize_unorm(channel, 15.0);
+            const VkClearColorValue color = detail::render_target_clear_color(p.clear_format, clear_value);
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, image_layout(p.binding, transfer_dst.layout),
                                    state, transfer_dst.access, transfer_dst.stages, [&] {
