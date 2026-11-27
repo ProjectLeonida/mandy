@@ -412,6 +412,14 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(cpu_emulation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(cpu_emulation_test PRIVATE /W4 /permissive- /utf-8)
 
+  # The geometry watch's cells (src/title_geometry_watch.h): a cell dropped while it guarded pages that a slot-133
+  # shadow also guards opens them with no write fault, so release() tells the reopener the layer installs. No GPU, no
+  # game data: pages of a private allocation.
+  add_executable(geometry_writes_test test/geometry_writes_test.cpp)
+  target_include_directories(geometry_writes_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(geometry_writes_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(geometry_writes_test PRIVATE /W4 /permissive- /utf-8)
+
   # Xbox DirectStorage (DStorageGetFactory under dstorage_xs.dll, xcrdapi.dll and dstorage.dll) over synthetic files:
   # GAME: paths through the file shims, queues, status arrays, fences and errors. No GPU, no game data.
   set(dstorage_vectors "${CMAKE_CURRENT_BINARY_DIR}/dstorage_vectors.inc")
@@ -1664,6 +1672,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET cpu_emulation_test)
     add_test(NAME cpu_emulation COMMAND cpu_emulation_test)
+  endif()
+  if(WIN32 AND TARGET geometry_writes_test)
+    add_test(NAME geometry_writes COMMAND geometry_writes_test)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)

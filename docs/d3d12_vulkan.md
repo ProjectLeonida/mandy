@@ -1726,6 +1726,9 @@ The copies:
   read-only (the geometry watch, another view's shadow): the fault handler asks every tracker over the address, this
   one included, and on the thread whose copy faulted it does not take that lock again (an SRW lock is not
   recursive; on 621.40 the title's submitting thread hung there for good, the main loop frozen with no device loss).
+  A page the geometry watch makes writable with no fault to answer (the last cell over the tile is dropped) reopens
+  every shadow over that tile before the next copy-back, so a page both guarded is not taken for unchanged and
+  overwritten with the copy's older bytes.
   Up to 8,192 ranges and 64 MiB a submission (a V# has no read/write bit, so every view
   reached is compared; past the caps the ranges are left behind, logged once). `LEONIDA_TITLE_WRITEBACK=0` turns it off. A batch is fenced: it is kept with the ticket
   of the submission that will use it and copied back only when the context reports that ticket retired, so a range

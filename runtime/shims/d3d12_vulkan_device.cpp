@@ -1543,6 +1543,14 @@ LONG CALLBACK shadow_write_fault(EXCEPTION_POINTERS* info) {
     return retry ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
+// The shadow half of a reopen: every tracker covering [from, to) makes its pages writable and forgets that it guarded
+// them, so the title's write is not copied over from an older copy at the next write-back.
+void reopen_shadow_ranges(std::uintptr_t from, std::uintptr_t to) {
+    AcquireSRWLockShared(&g_shadow_pages_lock);
+    for (ShadowPages* pages : shadow_pages_list()) pages->reopen_range(from, to);
+    ReleaseSRWLockShared(&g_shadow_pages_lock);
+}
+
 // leonida::kernel_writes' opener: a file shim is about to let the kernel write [from, to).
 void open_shadow_pages(std::uintptr_t from, std::uintptr_t to) {
     bool tiles_reopened = false;
@@ -1552,9 +1560,7 @@ void open_shadow_pages(std::uintptr_t from, std::uintptr_t to) {
         from &= ~(kTile - 1);
         to = (to + kTile - 1) & ~(kTile - 1);
     }
-    AcquireSRWLockShared(&g_shadow_pages_lock);
-    for (ShadowPages* pages : shadow_pages_list()) pages->reopen_range(from, to);
-    ReleaseSRWLockShared(&g_shadow_pages_lock);
+    reopen_shadow_ranges(from, to);
 }
 
 // fsdraw's backing hook: whether a slot-133 shadow keeps the GPU copy of a title VA (LEONIDA_FSDRAW_PROBE only).
@@ -1571,6 +1577,9 @@ bool watch_shadow_writes() {
     static const bool installed = [] {
         if (!AddVectoredExceptionHandler(1, &shadow_write_fault)) return false;
         leonida::kernel_writes::set_opener(&open_shadow_pages);
+        // A geometry cell dropped while it guarded a page a shadow also guards: the shadows reopen that tile now,
+        // before a write-back can take their pages for unchanged (title_geometry_watch.h, release).
+        leonida::geometry_writes::set_reopener(&reopen_shadow_ranges);
         return true;
     }();
     return installed;
