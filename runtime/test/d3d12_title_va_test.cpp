@@ -525,13 +525,13 @@ struct WriteBack {
 };
 
 // One submission that dispatches through a root UAV at `va` and waits for it. False on a failed call.
-int submit_write(WriteBack& s, std::uint64_t va) {
+int submit_write(WriteBack& s, std::uint64_t va, std::uint32_t base = 0) {
     EXPECT(s.allocator->Reset() == S_OK);
     EXPECT(s.list->Reset(s.allocator, s.c->pso) == S_OK);
     ID3D12DescriptorHeap* heaps[] = {s.heap};
     s.list->SetDescriptorHeaps(1, heaps);
     s.list->SetComputeRootSignature(s.c->root);
-    s.list->SetComputeRoot32BitConstant(0, 0, 0);
+    s.list->SetComputeRoot32BitConstant(0, base, 0);
     s.list->SetComputeRoot32BitConstant(0, 1, 1);  // the step: a word the shader writes
     s.list->SetComputeRootUnorderedAccessView(1, va);
     s.list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{s.gpu});
@@ -694,6 +694,94 @@ int check_window_write_back(Context& c, bool geometry) {
     for (UINT i = 0; i < kElements; ++i) kept += ring[i] == 0xB16B00B5u;
     std::printf("write back: the title's own words survived the next submission %u/%u\n", kept, kElements);
     EXPECT(kept == kElements);
+
+    aliases.remove_title_memory(ring_va);
+    VirtualFree(ring, 0, MEM_RELEASE);
+    return 0;
+}
+
+// Several disjoint write-back ranges on one guarded page (RT-TITLE-WRITEBACK-SAME-PAGE-RANGES, found by 73N1X in
+// #1608). The ranges of a submission go back one by one; the first that differs used to reopen the page, and every
+// later range on it then found the page neither guarded nor clean and was dropped as written by the title, though
+// nothing but the write-back itself had written there.
+//   1. a submission makes the ring's window, and a second one copies its words back and guards the pages;
+//   2. a submission writes new words into the window through its arena address (nothing noted for it), while 16
+//      four-byte ranges 16 bytes apart on the first page are noted as reached;
+//   3. the next submission's refresh copies those ranges back: every one of them must reach the page, and the words
+//      between them must keep the title's.
+int check_window_write_back_ranges(Context& c, bool geometry) {
+    if (geometry) {
+        std::fprintf(stderr, "SKIP: the geometry copy backs the ring, not a window\n");
+        return 77;
+    }
+    constexpr UINT64 ring_bytes = 64 * 1024;
+    constexpr UINT kRanges = 16, kSpacing = 4;  // in words: ranges at words 0, 4, 8, ..., 60
+    auto* ring = static_cast<std::uint32_t*>(
+        VirtualAlloc(nullptr, ring_bytes, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(ring);
+    const auto ring_va = reinterpret_cast<std::uint64_t>(ring);
+    for (UINT i = 0; i < ring_bytes / 4; ++i) ring[i] = 0;
+    auto& aliases = leonida::title_va_aliases();
+    aliases.add_title_memory(ring_va, ring_bytes);
+
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    const auto uav = buffer_desc(kBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    Ref<ID3D12Resource> out, scratch;
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
+                                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                       IID_PPV_ARGS(&out.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
+                                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                       IID_PPV_ARGS(&scratch.p))));
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    Ref<ID3D12DescriptorHeap> heap;
+    EXPECT(SUCCEEDED(c.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    EXPECT(SUCCEEDED(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, c.pso,
+                                                 IID_PPV_ARGS(&list.p))));
+    EXPECT(list->Close() == S_OK);
+    WriteBack s{&c, allocator.p, list.p, out.p, heap.p,
+                reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 10))(heap.p)};
+
+    // 1. The window, and its words back in the pages; then a submission that does not reach the ring guards them.
+    EXPECT(submit_write(s, ring_va) == 0);
+    const std::uint64_t window = aliases.shader_va(ring_va);
+    EXPECT(window != ring_va && window != 0);
+    EXPECT(submit_write(s, scratch->GetGPUVirtualAddress()) == 0);
+    EXPECT(submit_write(s, scratch->GetGPUVirtualAddress()) == 0);
+    const std::vector<std::uint32_t> before(ring, ring + kElements);
+    UINT nonzero = 0;
+    for (std::uint32_t w : before) nonzero += w != 0;
+    EXPECT(nonzero > 0);  // the first submission's words came back
+    MEMORY_BASIC_INFORMATION region{};
+    EXPECT(VirtualQuery(ring, &region, sizeof(region)) && (region.Protect & 0xff) == PAGE_READONLY);
+
+    // 2. New words in the window, written through its arena address (not a title address: nothing is noted), and the
+    // ranges the copy back should cover, noted for the same submission.
+    constexpr std::uint32_t kBase = 0x5A000000u;
+    for (UINT k = 0; k < kRanges; ++k) aliases.note_reached(ring_va + k * kSpacing * 4, 4);
+    EXPECT(submit_write(s, window, kBase) == 0);
+    for (UINT i = 0; i < kElements; ++i) EXPECT(ring[i] == before[i]);  // not back before the next submission
+
+    // 3. The next refresh copies the ranges back.
+    EXPECT(submit_write(s, scratch->GetGPUVirtualAddress()) == 0);
+    UINT reached = 0, kept = 0, wrong = 0;
+    for (UINT i = 0; i < kElements; ++i) {
+        if (i % kSpacing == 0)
+            reached += ring[i] != before[i];
+        else
+            kept += ring[i] == before[i];
+        wrong += ring[i] != before[i] && ring[i] != before[i] + kBase;
+    }
+    std::printf("write back ranges: %u/%u four-byte ranges on one guarded page reached it, %u/%u words between them "
+                "kept the title's, %u words neither\n",
+                reached, kRanges, kept, kElements - kRanges, wrong);
+    EXPECT(reached == kRanges);
+    EXPECT(kept == kElements - kRanges);
+    EXPECT(wrong == 0);
 
     aliases.remove_title_memory(ring_va);
     VirtualFree(ring, 0, MEM_RELEASE);
@@ -1346,6 +1434,7 @@ int main(int argc, char** argv) {
     const bool window_write_back = argc == 2 && std::strcmp(argv[1], "--window-writeback") == 0;
     const bool window_write_back_fault = argc == 2 && std::strcmp(argv[1], "--window-writeback-fault") == 0;
     const bool placed_write_back = argc == 2 && std::strcmp(argv[1], "--placed-writeback") == 0;
+    const bool window_write_back_ranges = argc == 2 && std::strcmp(argv[1], "--window-writeback-ranges") == 0;
     const bool keep_refill = argc == 2 && std::strcmp(argv[1], "--shadow-keep-refill") == 0;
     if (window_cap) {
         const char* cap = std::getenv("LEONIDA_TITLE_WINDOWS_MB");
@@ -1486,6 +1575,15 @@ int main(int argc, char** argv) {
             }
             std::printf("title window write back fault: a write-back copy that faulted on a page another guard keeps "
                         "read-only returned, and the GPU's words reached the title's pages\n");
+            return 0;
+        }
+        if (window_write_back_ranges) {
+            if (const int result = check_window_write_back_ranges(c, geometry)) return result;
+            if (d.validation_errors()) {
+                std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+                return 1;
+            }
+            std::printf("title window write back ranges: every range on one guarded page reached it\n");
             return 0;
         }
         if (window_write_back) {

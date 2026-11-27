@@ -404,9 +404,10 @@ public:
     ShadowPages(const ShadowPages&) = delete;
     ShadowPages& operator=(const ShadowPages&) = delete;
 
-    // What the GPU writes into the copies of [from, to) goes back to the title's pages. Returns the bytes written.
-    // Called before the next refresh, so a page the title writes again is copied forward over the result, as on a GPU
-    // that shares the memory.
+    // What the GPU writes into the copies of the ranges [first, second) goes back to the title's pages: `count` of
+    // them, sorted by start. Returns the bytes written, and in `reached` (when given) how many of the ranges wrote
+    // any. Called before the next refresh, so a page the title writes again is copied forward over the result, as on
+    // a GPU that shares the memory.
     //
     // Only the bytes a copy holds differently from the title's page go back, and only on a page known unchanged since
     // it was copied: guarded (read-only since that copy), or write-watched and found unwritten by an asking made here.
@@ -415,9 +416,27 @@ public:
     // read-only binding's pages alone (guarded, so a write the title makes meanwhile faults and waits on the lock),
     // where opening them for a whole copy lost a write made between the opening and the copy; and of two copies of
     // the same bytes only the one that differs is written, where the last one won.
-    std::size_t write_back(std::uintptr_t from, std::uintptr_t to) {
-        from = std::max(from, first_), to = std::min(to, last_);
-        if (from >= to) return 0;
+    //
+    // All the finished ranges over this tracker come in one call, and which pages are held is decided once for all of
+    // them, before the first copy. One call per range made the first range that differed reopen its page (kProtected
+    // gone), and every later range on that page then read as written by the title and was dropped, though only this
+    // write-back had written there (73N1X, #1608: of 130 four-byte ranges 256 bytes apart, 9 went back). A page
+    // opened here is open to the title until the next refresh guards it again, as it was for the pieces of one range
+    // after the first.
+    std::size_t write_back(const std::pair<std::uintptr_t, std::uintptr_t>* ranges, std::size_t count,
+                           std::size_t* reached = nullptr) {
+        if (reached) *reached = 0;
+        std::uintptr_t lo = last_, hi = first_;  // the pages the ranges cover
+        for (std::size_t r = 0; r < count; ++r) {
+            const std::uintptr_t from = std::max(ranges[r].first, first_), to = std::min(ranges[r].second, last_);
+            if (from >= to) continue;
+            lo = std::min(lo, from & ~(kPage - 1));
+            hi = std::max(hi, (to + kPage - 1) & ~(kPage - 1));
+        }
+        if (lo >= hi) return 0;
+        // Allocated before lock_ is taken: a thread that faults on a guarded page waits on lock_ in reopen(), and may
+        // hold the heap's lock while it does.
+        std::vector<std::uint8_t> held_pages((hi - lo) / kPage);
         AcquireSRWLockExclusive(&lock_);
         // The copies below can fault on a page another guard (the geometry watch, another view's shadow) keeps
         // read-only. The fault handler asks this tracker too (reopen), and must not take lock_ again on this thread:
@@ -439,48 +458,66 @@ public:
             ReleaseSRWLockExclusive(&lock_);
             return 0;
         }
-        leonida::kernel_writes::for_each_pin(from, to, [&](std::uintptr_t a, std::uintptr_t b) {
-            for (std::uintptr_t p = std::max(a, from) & ~(kPage - 1); p < std::min(b, to); p += kPage)
-                state_[(p - first_) / kPage] |= kPinned;
-            pinned_ = true;
-        });
+        for (std::size_t r = 0; r < count; ++r) {
+            const std::uintptr_t from = std::max(ranges[r].first, first_), to = std::min(ranges[r].second, last_);
+            if (from >= to) continue;
+            leonida::kernel_writes::for_each_pin(from, to, [&](std::uintptr_t a, std::uintptr_t b) {
+                for (std::uintptr_t p = std::max(a, from) & ~(kPage - 1); p < std::min(b, to); p += kPage)
+                    state_[(p - first_) / kPage] |= kPinned;
+                pinned_ = true;
+            });
+        }
         ask_written_locked();
         // A page the title wrote since it was last copied holds the newer bytes already: its GPU result is dropped and
         // the refresh's own copy carries the title's. So is a page whose mapping changed, one a kernel write may be
         // filling, and one xmem maps at another address too (a write there is seen by no guard and no watch here).
-        const auto held = [&](std::size_t i) {
-            const std::uint8_t s = state_[i];
-            return (s & (kZero | kRequery | kPinned | kAliased)) || (!(s & kProtected) && !(s & kClean));
-        };
+        const std::size_t p0 = (lo - first_) / kPage;
+        for (std::size_t r = 0; r < count; ++r) {
+            const std::uintptr_t from = std::max(ranges[r].first, first_), to = std::min(ranges[r].second, last_);
+            if (from >= to) continue;
+            for (std::size_t i = (from - first_) / kPage, i1 = (to - first_ + kPage - 1) / kPage; i < i1; ++i) {
+                const std::uint8_t s = state_[i];
+                held_pages[i - p0] =
+                    (s & (kZero | kRequery | kPinned | kAliased)) || (!(s & kProtected) && !(s & kClean));
+            }
+        }
+        const auto held = [&](std::size_t i) { return held_pages[i - p0] != 0; };
         constexpr std::uintptr_t kPiece = 256;  // compared and copied in pieces this size
         std::size_t written = 0;
-        for (std::uintptr_t at = from & ~(kPage - 1); at < ((to + kPage - 1) & ~(kPage - 1));) {
-            std::size_t pages = 0;
-            while (at + (pages + 1) * kPage <= ((to + kPage - 1) & ~(kPage - 1)) &&
-                   held((at - first_) / kPage + pages) == held((at - first_) / kPage))
-                ++pages;
-            if (!held((at - first_) / kPage)) {
-                const std::uintptr_t a = std::max(at, from), b = std::min(at + pages * kPage, to);
-                bool opened = false;
-                for (const Target& t : targets_) {
-                    const std::uintptr_t x = std::max(a, t.begin), y = std::min(b, t.end);
-                    if (x >= y || !t.shadow) continue;
-                    for (std::uintptr_t c = x; c < y;) {
-                        const std::uintptr_t e = std::min(y, (c + kPiece) & ~(kPiece - 1));
-                        const std::uint8_t* copy = t.shadow + (c - t.begin);
-                        if (std::memcmp(reinterpret_cast<const void*>(c), copy, e - c) != 0) {
-                            if (!opened) {
-                                reopen_locked(at, at + pages * kPage);
-                                opened = true;
+        for (std::size_t r = 0; r < count; ++r) {
+            const std::uintptr_t from = std::max(ranges[r].first, first_), to = std::min(ranges[r].second, last_);
+            if (from >= to) continue;
+            const std::size_t range_written = written;
+            const std::uintptr_t end = (to + kPage - 1) & ~(kPage - 1);
+            for (std::uintptr_t at = from & ~(kPage - 1); at < end;) {
+                std::size_t pages = 0;
+                while (at + (pages + 1) * kPage <= end &&
+                       held((at - first_) / kPage + pages) == held((at - first_) / kPage))
+                    ++pages;
+                if (!held((at - first_) / kPage)) {
+                    const std::uintptr_t a = std::max(at, from), b = std::min(at + pages * kPage, to);
+                    bool opened = false;
+                    for (const Target& t : targets_) {
+                        const std::uintptr_t x = std::max(a, t.begin), y = std::min(b, t.end);
+                        if (x >= y || !t.shadow) continue;
+                        for (std::uintptr_t c = x; c < y;) {
+                            const std::uintptr_t e = std::min(y, (c + kPiece) & ~(kPiece - 1));
+                            const std::uint8_t* copy = t.shadow + (c - t.begin);
+                            if (std::memcmp(reinterpret_cast<const void*>(c), copy, e - c) != 0) {
+                                if (!opened) {
+                                    reopen_locked(at, at + pages * kPage);
+                                    opened = true;
+                                }
+                                std::memcpy(reinterpret_cast<void*>(c), copy, e - c);
+                                written += e - c;
                             }
-                            std::memcpy(reinterpret_cast<void*>(c), copy, e - c);
-                            written += e - c;
+                            c = e;
                         }
-                        c = e;
                     }
                 }
+                at += pages * kPage;
             }
-            at += pages * kPage;
+            if (reached && written != range_written) ++*reached;
         }
         writer_.store(0, std::memory_order_relaxed);
         ReleaseSRWLockExclusive(&lock_);
@@ -3524,14 +3561,21 @@ struct DeviceState {
                          1);
         }
         if (finished.empty()) return;
+        // Each shadow takes all the ranges over it in one call, in address order (batches can overlap), and decides
+        // which of its pages are held once for all of them (ShadowPages::write_back).
+        std::sort(finished.begin(), finished.end());
         std::uint64_t written = 0, ranges = 0;
-        for (const auto& [begin, end] : finished)
-            for (const ShadowPagesPtr& s : shadows)
-                if (end > s->first() && begin < s->last()) {
-                    const std::uint64_t bytes = s->write_back(begin, end);
-                    written += bytes;
-                    ranges += bytes != 0;
-                }
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> over;
+        for (const ShadowPagesPtr& s : shadows) {
+            over.clear();
+            for (const auto& [begin, end] : finished)
+                if (end > s->first() && begin < s->last())
+                    over.push_back({static_cast<std::uintptr_t>(begin), static_cast<std::uintptr_t>(end)});
+            if (over.empty()) continue;
+            std::size_t reached = 0;
+            written += s->write_back(over.data(), over.size(), &reached);
+            ranges += reached;
+        }
         title_write_back_total += written;
         if (!written) return;
         if (++title_write_back_calls <= 4 || !(title_write_back_calls & (title_write_back_calls - 1)))
