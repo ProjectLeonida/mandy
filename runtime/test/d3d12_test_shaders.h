@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../shims/d3d12_xs_rootsig.h"
@@ -173,12 +174,11 @@ struct Ref {
     // One owner: a copy would Release twice, and `ref = {}` must Release what it held.
     Ref(const Ref&) = delete;
     Ref& operator=(const Ref&) = delete;
-    Ref(Ref&& other) noexcept : p(other.p) { other.p = nullptr; }
+    Ref(Ref&& other) noexcept : p(std::exchange(other.p, nullptr)) {}
     Ref& operator=(Ref&& other) noexcept {
         if (this != &other) {
             reset();
-            p = other.p;
-            other.p = nullptr;
+            p = std::exchange(other.p, nullptr);
         }
         return *this;
     }
