@@ -83,6 +83,7 @@ _MASK_WORD_READERS = frozenset({
     "s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
     "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64",
     "s_flbit_i32_b32", "s_flbit_i32_b64", "s_flbit_i32",
+    "s_mask_to_data_b32",       # lane_masks.TO_DATA: the mask's bits where a merge takes the register as data
 })
 
 # Mask ops that emit a cross-lane vote in --wave64-emulate when SCC is live.

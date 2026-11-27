@@ -288,6 +288,165 @@ def parked(blocks, masks):
     return sorted(found)
 
 
+TO_DATA = "s_mask_to_data_b32"   # the translator's own: sD = the real bits of the lane-mask word in sD
+
+
+def _fixpoint(blocks, succ, wave64):
+    """Each block's state on entry (None where it is not reached), as analyse() works it out."""
+    entry = [None] * len(blocks)
+    if blocks:
+        entry[0] = {}
+    work = [0] if blocks else []
+    while work:
+        n = work.pop()
+        state = dict(entry[n])
+        for ins in blocks[n]:
+            step(state, ins, wave64)
+        for s in succ[n]:
+            merged = dict(state) if entry[s] is None else _merge(entry[s], state)
+            if merged != entry[s]:
+                entry[s] = merged
+                work.append(s)
+    return entry
+
+
+def _merge(a, b):
+    """A mask on both paths, or a mask on one and 0 / -1 on the other; anything else is data (left out)."""
+    merged = {}
+    for r in a.keys() & b.keys():
+        a_k, b_k = a[r], b[r]
+        if a_k == b_k:
+            merged[r] = a_k
+        elif a_k == EITHER:
+            merged[r] = b_k
+        elif b_k == EITHER:
+            merged[r] = a_k
+        else:
+            merged[r] = MASK
+    return merged
+
+
+ALL = "all"     # an instruction that may read any SGPR (s_movrels / s_movrelsd: the register comes from M0)
+
+
+def _sgprs(x):
+    if x.get("k") == "sgpr":
+        return set(range(x["r"], x["r"] + x.get("n", 1)))
+    if x.get("k") == "slist":
+        return {r for r in x["r"] if isinstance(r, int)}
+    return set()
+
+
+def _reads_writes(ins):
+    """The SGPR numbers `ins` reads and the ones it surely writes (a destination it may leave alone is read too)."""
+    op, a = base_op(ins["op"]), ins["args"]
+    if op.startswith(("s_movrels", "s_movreld", "s_swappc", "s_setpc", "s_getpc", "s_call", "s_cbranch_g_fork")):
+        return ALL, set()
+    if not a:
+        return set(), set()
+    if op.startswith(NO_DESTINATION):
+        reads = set()
+        for x in a:
+            if x is not None:
+                reads |= _sgprs(x)
+        return reads, set()
+    reads = set()
+    for x in a[1:]:
+        if x is not None:
+            reads |= _sgprs(x)
+    # A SOPK read-modify-write, a 16-bit or SDWA/DPP partial write, or a VOP3b carry-out pair: the first operand is
+    # taken as read too, which only ever keeps a register live.
+    if op in ("s_addk_i32", "s_mulk_i32", "s_cmovk_i32") or op.startswith("s_cmov") or \
+            ins["op"].endswith(("_sdwa", "_dpp", "_dpp8")) or "_co_" in op:
+        reads |= _sgprs(a[0])
+        return reads, set()
+    return reads, _sgprs(a[0])
+
+
+def _live_in(blocks, succ):
+    """The SGPR numbers each block may read before writing (ALL for every one)."""
+    use, kill = [], []
+    for blk in blocks:
+        u, k = set(), set()
+        for ins in blk:
+            r, w = _reads_writes(ins)
+            if r is ALL:
+                u = ALL
+                break
+            u |= r - k
+            k |= w
+        use.append(u)
+        kill.append(k)
+    live = [set() if u is not ALL else ALL for u in use]
+    changed = True
+    while changed:
+        changed = False
+        for n in range(len(blocks) - 1, -1, -1):
+            if live[n] is ALL:
+                continue
+            out = set()
+            for s in succ[n]:
+                if live[s] is ALL:
+                    out = ALL
+                    break
+                out |= live[s]
+            new = ALL if out is ALL else (use[n] | (out - kill[n]))
+            if new != live[n]:
+                live[n] = new
+                changed = True
+    return live
+
+
+def insert_data_merges(blocks, succ, branches, wave64=True):
+    """In place: where an SGPR holds a lane mask at the end of a block but is data where a successor begins (a
+    mask on one path to it, a number on another), insert a TO_DATA instruction for it before the block's branch.
+
+    The two kinds of value are kept differently: a mask as this lane's bit (all ones or zero), data as the same
+    number in every lane. Where they meet the register is taken as data, which the path that wrote the mask does
+    not hold. The compiler makes such a merge when it walks the lanes of a ballot with a scalar loop:
+    `s_and_b64 s[26:27], vcc, exec`, then s_ff1_i32_b32 / s_xor_b32 of s26 and `s_mov_b32 s26, sN` on the back
+    edge. The loop's s26 was this lane's 0 / ~0 on the first pass, so each lane found its own first bit and took
+    its own number of passes, where the wave takes one. TO_DATA gathers the wave's real bits into the register
+    (rdna2spirv's lane_mask_word), so the loop sees on every path what the hardware has.
+
+    A register is converted only when every successor takes it as data (one that still reads it as a mask keeps
+    this lane's bit) and some successor may read it before writing it: the gather is a cross-lane step, and a
+    register nothing reads again needs none. A later mask use of the converted register stays exact: the
+    translator takes bit L of a data register for lane L (rdna2spirv's mask_src). `branches`: the opcodes that end
+    a block. Returns how many instructions were inserted."""
+    inserted = 0
+    live = _live_in(blocks, succ)
+    for _ in range(len(blocks) + 1):                    # each round only takes masks away, so this ends
+        entry = _fixpoint(blocks, succ, wave64)
+        added = 0
+        for n, blk in enumerate(blocks):
+            if entry[n] is None or not succ[n]:
+                continue
+            state = dict(entry[n])
+            for ins in blk:
+                step(state, ins, wave64)
+            regs = []
+            for r, k in sorted((r, k) for r, k in state.items() if isinstance(r, int) and k in MASK_KINDS):
+                if all(entry[s] is not None and r not in entry[s] for s in succ[n]) and \
+                        any(live[s] is ALL or r in live[s] for s in succ[n]):
+                    regs.append(r)
+            if not regs:
+                continue
+            last = blk[-1] if blk else None
+            at = len(blk) - 1 if last is not None and (base_op(last["op"]) in branches) else len(blk)
+            pc = last.get("pc", 0) if last is not None else 0
+            for r in regs:
+                reg = {"k": "sgpr", "r": r, "n": 1}
+                blk.insert(at, {"op": TO_DATA, "args": [dict(reg), dict(reg)], "mods": [], "pc": pc, "enc": "",
+                                "synthetic": True})
+                at += 1
+                added += 1
+        inserted += added
+        if not added:
+            break
+    return inserted
+
+
 def analyse(blocks, succ, *, include_either=False, wave64=True):
     entry = [None] * len(blocks)                        # None: not reached yet
     if blocks:
