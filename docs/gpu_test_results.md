@@ -17,6 +17,7 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 | NVIDIA GeForce RTX 5070 Ti (Blackwell), subgroup 32..32 | NVIDIA 617.42, Vulkan 1.4.351, Windows 11 Pro 26300 | `21625bc` | 257/257 translated and valid (run_gpu_tests.py) | run via run_gpu_tests.py | 197/248 passed, 49 skipped, 2 failed (native); 229/248 passed, 17 skipped, 2 failed (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31) | [local note](../gpu-test-results/RTX5070Ti.txt) |
 | Apple M5 Pro (16-core GPU, Metal 4), subgroup 4..32 | MoltenVK 1.4.2 (Homebrew), Vulkan 1.4.357, macOS 26.7.3 (25G342) | `d42773d07` | 280/280 translated and valid | 175/219 pass, 39 skipped, 5 failed | 183/248 passed, 61 skipped, 4 failed (native); 214/248 passed, 30 skipped, 4 failed (`LEONIDA_W64_EMULATE=1`) | `cs_fma_fused` (known row), `cs_imgload_tfe`, `cs_imgload_d16_tfe` (pass with #291), `ps_imgatomic` flake (#543) | [local note](../gpu-test-results/AppleM5Pro.txt) |
 | NVIDIA GeForce RTX 3080 (Ampere, GA102, 10 GB GDDR6X), subgroup 32..32 | NVIDIA 580.178.04, Vulkan 1.4.312, Ubuntu 26.04 LTS | `d2cd6c0` | not run | not run | 197/248 passed, 49 skipped, 2 failed (native); 229/248 passed, 17 skipped, 2 failed (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31; see #280) | [local note](../gpu-test-results/RTX3080.txt) |
+| NVIDIA GeForce GTX 1650 SUPER (Turing, TU116), subgroup 32..32 | NVIDIA 610.88, Vulkan 1.4.341, Windows 11 26300 (26H2) | `db6115940` (PR #4426 on `dde82f2`) | 247/247 translated and valid | run via run_gpu_tests.py | 192/241 passed, 48 skipped (native); 223/241 passed, 17 skipped (`LEONIDA_W64_EMULATE=1`) | `ms_wave_info_s3` (native and emulated) | [#166](https://github.com/ProjectLeonida/Leonida/issues/166#issuecomment-7115144655) |
 
 ## AMD Radeon RX 9070 GRE — 2026-11-23
 
@@ -125,3 +126,36 @@ distribution's build. The full record, with every skip by name, is in
 
 AI-assisted (Claude Code): built `main` at `84347bb`, ran `build.py`, `check.py` and `run_gpu_tests.py` native and
 emulated on this GPU, and reran the tfe pair with #98 applied.
+
+## NVIDIA GeForce GTX 1650 SUPER — 2026-11-23
+
+```
+GPU:        NVIDIA GeForce GTX 1650 SUPER (Turing / TU116, PCI 10DE:2187), subgroup 32..32
+Driver:     NVIDIA 610.88, Vulkan 1.4.341
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32; default 32, subgroupSizeControl, computeFullSubgroups)
+OS:         Windows 11 x64, build 10.0.26300 (26H2)
+Commit:     db6115940 (PR #4426 on top of dde82f2, 2026-11-23); ctest and fuzzers on main a2c2ba878
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools), Vulkan SDK 1.4.363 / SPIRV-Tools,
+            CMake + Ninja, llvm-mingw 23.1.6 (UCRT), Python 3.15.0
+build.py:   247 shaders: 247 translated, 247 pass spirv-val
+            wave64 VS/PS/GS on 32-wide subgroups: tier A: 1, tier C: 1
+check.py:   not run separately (run_gpu_tests.py below)
+run_gpu_tests.py:
+            native:                 192/241 passed, 48 skipped, 1 failed
+            LEONIDA_W64_EMULATE=1:  223/241 passed, 17 skipped, 1 failed
+Failed:     ms_wave_info_s3: at (0,0) got (-1,-1,-1,-1), want (0.0078,0.0078,0.5,1.0),
+            both native and emulated. Same signature as the RTX 5070 Laptop noted in docs/design.md.
+Skipped:    48 native skips (16 runner-delegated + 32 wave64 tests requiring 64-wide subgroups);
+            17 emulated skips (16 runner-delegated + ps_w64x_readlane requiring a 64-wide fragment subgroup).
+Runtime ctest (standalone Vulkan subset, -DLEONIDA_BUILD_WINDOWS_RUNTIME=OFF):
+            67/67 passed (including vk_xdxr_build_test in 1.94 s and xdxr_build_check in 134.46 s,
+            0/1000 rays differing across all 30 BLAS/TLAS cases).
+Fuzzers (wave64 emulated, --seed 1 --programs 30):
+            valu_fuzz.py --family f16: 30/30 matched, 0 mismatched
+            valu_fuzz.py --family mem: 30/30 matched, 0 mismatched
+            lds_fuzz.py:               30/30 matched, 0 mismatched
+```
+
+Setup: standalone Vulkan tools built with `cmake -S runtime -B runtime/build/vulkan -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release -DLEONIDA_BUILD_WINDOWS_RUNTIME=OFF` using llvm-mingw 23.1.6 (UCRT) and Vulkan SDK 1.4.363 headers. Under Python 3.15 (UTF-8 mode by default) with a non-ASCII Windows user profile folder, `main` at `dde82f2` crashed in `run_cmd` with `UnicodeDecodeError` → `TypeError`; running on PR #4426 (`db6115940`) resolved the crash cleanly. This is the first NVIDIA / Turing entry on this page.
+
+AI-assisted: helped set up the toolchain, run the tests and format this entry; all builds, shader suites, runtime `ctest` checks and fuzzers were executed locally on this GPU.
