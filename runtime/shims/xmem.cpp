@@ -46,6 +46,7 @@
 #include "../src/dstorage_trace.h"
 #include "../src/gpu_label_memory.h"
 #include "../src/title_frames.h"
+#include "../src/title_heap.h"
 #include "../src/title_mirror_space.h"
 #include "../src/title_page_watch.h"
 #include "../src/title_geometry_watch.h"
@@ -83,12 +84,57 @@ void note_attributes(const char* api, uint64_t attributes, size_t size, const vo
 // The title's XMemAlloc blocks come from a heap of their own instead of the CRT heap (LEONIDA_TITLE_HEAP=0: not). Slot-133
 // imports pin title memory page by page for the GPU, and on the CRT heap a pinned page also holds the runtime's own
 // objects (g_pages' nodes among them): a GPU store past a buffer's end, or into a block freed while its import still
-// lived, then corrupted the runtime (speed-30/41/49-52: g_pages found corrupt under g_phys_mutex). Each block keeps its
-// size and the heap allocation it sits in just below it.
+// lived, then corrupted the runtime (speed-30/41/49-52: g_pages found corrupt under g_phys_mutex).
+//
+// The heap is the runtime's own (src/title_heap.h) over a reservation in the page mirror's range
+// (src/title_mirror_space.h), so a V# or pointer the title writes into a block reaches the mirror at heap_base + the
+// block's address, and its committed pages are fed to the mirror as they are committed (they read the title's bytes
+// there, not zeros). RtlCreateHeap over a given base faults under Wine. Where the range cannot take the reservation, a
+// heap the host places, as before (each block keeps its size and the heap allocation it sits in just below it).
 struct TitleHeapHeader {
     void* raw;
     size_t size;
 };
+constexpr size_t kTitleHeapBytes = size_t(32) << 30;  // address range only: pages are committed as blocks need them
+
+// Tells the page mirror that the pages of [at, at + bytes) of the heap are committed (each shows itself) or not any
+// more (defined with the feed, below).
+void feed_heap_pages(uintptr_t at, size_t bytes, bool committed);
+
+leonida::TitleHeap& mirror_heap() {
+    static leonida::TitleHeap heap;
+    return heap;
+}
+bool mirror_heap_ready() {
+    static const bool ready = [] {
+        const char* v = std::getenv("LEONIDA_TITLE_HEAP");
+        if (v && std::strcmp(v, "0") == 0) return false;
+        uintptr_t base = 0;
+        // Not "plain": every committed page is fed to the mirror as it is committed, so a pointer the title wrote reads
+        // its bytes without anything naming the range first.
+        leonida::title_mirror_space::take(kTitleHeapBytes, 0x10000, false, [&](std::uint64_t at) {
+            void* const made = VirtualAlloc(reinterpret_cast<void*>(static_cast<uintptr_t>(at)), kTitleHeapBytes,
+                                            MEM_RESERVE, PAGE_READWRITE);
+            base = reinterpret_cast<uintptr_t>(made);
+            return made != nullptr;
+        });
+        leonida::TitleHeap::Hooks hooks;
+        hooks.commit = [](uintptr_t at, size_t bytes) {
+            if (!VirtualAlloc(reinterpret_cast<void*>(at), bytes, MEM_COMMIT, PAGE_READWRITE)) return false;
+            feed_heap_pages(at, bytes, true);
+            return true;
+        };
+        hooks.decommit = [](uintptr_t at, size_t bytes) {
+            feed_heap_pages(at, bytes, false);
+            VirtualFree(reinterpret_cast<void*>(at), bytes, MEM_DECOMMIT);
+        };
+        const bool ok = base && mirror_heap().init(base, kTitleHeapBytes, std::move(hooks));
+        std::fprintf(stderr, "[rt] xmem: XMemAlloc blocks come from %s\n",
+                     ok ? "the runtime's heap in the page mirror's range" : "a heap the host places");
+        return ok;
+    }();
+    return ready;
+}
 HANDLE title_heap() {
     static const HANDLE heap = [] {
         // Set LEONIDA_TITLE_HEAP=0 to use the CRT heap.
@@ -102,8 +148,10 @@ HANDLE title_heap() {
 }
 void* allocate_block(size_t size) {
     size = size ? size : 1;
+    if (mirror_heap_ready())
+        if (void* p = mirror_heap().allocate(size)) return p;  // full: the host's heap, as before
     const HANDLE heap = title_heap();
-    if (!heap) return _aligned_malloc(size, kAlign);
+    if (!heap) return _aligned_malloc(size, kAlign);  // LEONIDA_TITLE_HEAP=0
     const size_t extra = kAlign + sizeof(TitleHeapHeader);
     if (size > SIZE_MAX - extra) return nullptr;
     void* raw = HeapAlloc(heap, 0, size + extra);
@@ -116,11 +164,16 @@ void* allocate_block(size_t size) {
 }
 size_t block_size(void* p) {
     if (!p) return 0;
+    if (mirror_heap_ready() && mirror_heap().owns(p)) return mirror_heap().size_of(p);
     if (!title_heap()) return _aligned_msize(p, kAlign, 0);
     return (reinterpret_cast<TitleHeapHeader*>(p) - 1)->size;
 }
 void free_block(void* p) {
     if (!p) return;
+    if (mirror_heap_ready() && mirror_heap().owns(p)) {
+        mirror_heap().release(p);
+        return;
+    }
     const HANDLE heap = title_heap();
     if (!heap) return _aligned_free(p);
     HeapFree(heap, 0, (reinterpret_cast<TitleHeapHeader*>(p) - 1)->raw);
@@ -580,6 +633,16 @@ HostUnorderedMap<uintptr_t, TableFrame> g_table_frames;
 // The page mirror's feed (src/title_frames.h, Feed), under g_phys_mutex.
 leonida::title_frames::Feed g_mirror_feed = nullptr;
 void* g_mirror_context = nullptr;
+
+// The heap's committed pages show themselves (title_heap): fed to the page mirror as they are committed and
+// decommitted, under g_phys_mutex like every other change of the feed. Called with the heap's lock held (heap, then
+// g_phys_mutex; attach_mirror takes the heap's lock only after releasing g_phys_mutex).
+void feed_heap_pages(uintptr_t at, size_t bytes, bool committed) {
+    const std::lock_guard lock(g_phys_mutex);
+    if (!g_mirror_feed) return;
+    for (uintptr_t page = at & ~uintptr_t(kPhysicalPageSize - 1); page < at + bytes; page += kPhysicalPageSize)
+        g_mirror_feed(g_mirror_context, page, committed ? reinterpret_cast<uint8_t*>(page) : nullptr, {});
+}
 
 // With g_phys_mutex held: the page at `address` shows physical page `page` now (0: nothing), for the page mirror.
 void feed_mirror(uintptr_t address, uint64_t page) {
@@ -2922,7 +2985,17 @@ void slot31_mapping_counts(Slot31Counts& out) {
 // their physical pages' host addresses.
 // title_frames' Attach (src/title_frames.h): the page mirror's feed from now on, after every page of the mirror's range
 // mapped now (the views, then the table pages), all under g_phys_mutex.
+void attach_mirror_locked(void* context, leonida::title_frames::Feed feed);
 void attach_mirror(void* context, leonida::title_frames::Feed feed) {
+    attach_mirror_locked(context, feed);
+    if (!feed || !mirror_heap_ready()) return;
+    // The heap's committed pages, after g_phys_mutex (the heap takes it under its own lock). A page committed or
+    // decommitted meanwhile was fed by the heap itself; one fed twice is mapped twice to the same bytes.
+    std::vector<std::pair<uintptr_t, size_t>> committed;
+    mirror_heap().for_each_committed([&](uintptr_t at, size_t bytes) { committed.emplace_back(at, bytes); });
+    for (const auto& [at, bytes] : committed) feed_heap_pages(at, bytes, true);
+}
+void attach_mirror_locked(void* context, leonida::title_frames::Feed feed) {
     const std::lock_guard lock(g_phys_mutex);
     g_mirror_feed = feed;
     g_mirror_context = context;

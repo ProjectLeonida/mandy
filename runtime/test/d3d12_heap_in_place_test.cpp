@@ -8,7 +8,10 @@
 //   2. a slot the title rewrites (through its own view: a guard fault) reaches the GPU at the next refresh, filtered;
 //      the title's bytes are again as written;
 //   3. the null slots after the heap read zero, and the heap's address is below 4 GiB;
-//   4. no copy: the device names it "read in place".
+//   4. no copy: the device names it "read in place";
+//   5. a T# in the heap (the words CreateShaderResourceView wrote for a texture of ours) reads with the bindless index
+//      in its dword 6 (gfx10_descriptors.h, tsharp_index_word: the tag and the texture's index) once the filter and its
+//      finishing have run, while the title's bytes keep the dword 6 the title wrote.
 // Exit 77 when the device makes no page mirror (llvmpipe). No shaders, no game data.
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
@@ -102,11 +105,40 @@ int test() {
     const auto put = [&](unsigned slot, const leonida::gfx10::BufferWords& w) {
         std::memcpy(title + slot * kDescriptor, w.data(), sizeof(w));
     };
+    // A texture of ours and its T#, as CreateShaderResourceView writes it into a CPU heap (before the index word is on:
+    // dword 6 as encode() writes it). The index word is then on, as a library of modules that read it turns it on.
+    D3D12_RESOURCE_DESC tex_desc{};
+    tex_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    tex_desc.Width = 64;
+    tex_desc.Height = 64;
+    tex_desc.DepthOrArraySize = 1;
+    tex_desc.MipLevels = 1;
+    tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    tex_desc.SampleDesc.Count = 1;
+    Ref<ID3D12Resource> texture;
+    EXPECT(SUCCEEDED(device.p->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &tex_desc,
+                                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                                                       IID_PPV_ARGS(&texture.p))));
+    const D3D12_DESCRIPTOR_HEAP_DESC cpu_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                                              0};
+    Ref<ID3D12DescriptorHeap> cpu_heap;
+    EXPECT(SUCCEEDED(device.p->CreateDescriptorHeap(&cpu_desc, IID_PPV_ARGS(&cpu_heap.p))));
+    const D3D12_CPU_DESCRIPTOR_HANDLE cpu = cpu_heap.p->GetCPUDescriptorHandleForHeapStart();
+    device.p->CreateShaderResourceView(texture.p, nullptr, cpu);
+    std::uint32_t tsharp[8];
+    std::memcpy(tsharp, reinterpret_cast<const void*>(cpu.ptr), sizeof(tsharp));
+    leonida::gfx10::ImageWords tsharp_words{};
+    std::memcpy(tsharp_words.data(), tsharp, sizeof(tsharp_words));
+    EXPECT(leonida::gfx10::is_image(tsharp_words) && !leonida::gfx10::has_tsharp_index(tsharp_words));
+    tsharp[leonida::gfx10::kTsharpIndexDword] = 0x00C0FFEEu;  // the title's own dword 6 (compression metadata)
+    rt::d3d12::set_tsharp_index_words_for_test(device.p, true);
+
     put(0, raw_vsharp(arena_va, 256));
     put(1, raw_vsharp(nobody, 256));
     put(2, raw_vsharp(mirrored, 256));
     const std::uint32_t data[8] = {0x12345000u, 0x00007777u, 0x00000400u, 0x40000000u, 1, 2, 3, 4};
     std::memcpy(title + 3 * kDescriptor, data, sizeof(data));
+    std::memcpy(title + 6 * kDescriptor, tsharp, sizeof(tsharp));
     std::uint8_t written[5 * kDescriptor];
     std::memcpy(written, title, sizeof(written));
 
@@ -155,6 +187,18 @@ int test() {
     EXPECT(rt::d3d12::page_mirror_write_back(device.p, std::uintptr_t(title), kPages * kPage64k) == 0);
     for (unsigned i = 0; i < kDescriptor; ++i) EXPECT(title[5 * kDescriptor + i] == 0);
 
+    // 5. The T#: dword 6 carries the tag and the texture's index, the other words as written; the title's dword 6 is
+    // its own.
+    std::uint32_t gpu_tsharp[8]{};
+    EXPECT(rt::d3d12::arena_gpu_read(device.p, shader_va + 6 * kDescriptor, gpu_tsharp, sizeof(gpu_tsharp)));
+    const std::uint32_t word = gpu_tsharp[leonida::gfx10::kTsharpIndexDword];
+    EXPECT((word >> 28) == leonida::gfx10::kTsharpIndexTag && (word & 0xFFFFu) != 0);
+    for (unsigned i = 0; i < 8; ++i)
+        if (i != leonida::gfx10::kTsharpIndexDword) EXPECT(gpu_tsharp[i] == tsharp[i]);
+    EXPECT(!std::memcmp(title + 6 * kDescriptor, tsharp, sizeof(tsharp)));
+    EXPECT(reinterpret_cast<const std::uint32_t*>(title + 6 * kDescriptor)[leonida::gfx10::kTsharpIndexDword] ==
+           0x00C0FFEEu);
+
     // 3. The null slots after the heap.
     std::uint32_t tail[64]{};
     std::memset(tail, 0xff, sizeof(tail));
@@ -162,8 +206,8 @@ int test() {
     for (const std::uint32_t word : tail) EXPECT(word == 0);
 
     std::printf("heap in place: at heap_base + 0x%llx; the GPU reads a nobody's V# and a data word null and the others "
-                "as written, a rewrite at the next refresh, zeros after the heap; the title's bytes never change\n",
-                static_cast<unsigned long long>(shader_va));
+                "as written, a rewrite at the next refresh, zeros after the heap, a T# with its index word (0x%08x); the title's bytes never change\n",
+                static_cast<unsigned long long>(shader_va), word);
     heap.reset();
     EXPECT(map(title, kPages, nullptr) == title && free_pages(kPages, pages));
     return 0;

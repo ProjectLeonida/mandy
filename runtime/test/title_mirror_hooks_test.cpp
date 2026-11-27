@@ -139,10 +139,26 @@ int filters() {
     EXPECT(f.filtered.size() == 1 && f.filtered[0].va == kBase && f.filtered[0].fresh);
     EXPECT(mirror.home_bytes(kBase)[100] == 0x5A && mirror.home_bytes(kBase + 2 * kPage)[100] == 0xA5);
     EXPECT(mirror.counters().filtered == 1 && mirror.counters().uploads == 2);
+    // Write-back: a filtered home differs from the title's page by the filter's bytes and is never written back; a
+    // copied home the GPU wrote is.
+    std::size_t written = 0;
+    const auto count_writes = [&](std::uint64_t va, const std::uint8_t* bytes, std::uint64_t n) {
+        if (va < kBase + 2 * kPage) return false;  // the copied page only (a write elsewhere fails the counts)
+        std::memcpy(&frames[std::size_t(va - kBase)], bytes, std::size_t(n));
+        written += std::size_t(n);
+        return true;
+    };
+    EXPECT(mirror.write_back(kBase, kBase + kPage, count_writes) == 0 && written == 0);
+    mirror.home_bytes(kBase + 2 * kPage)[300] = 0x77;  // a GPU store into the copied page
+    EXPECT(mirror.write_back(kBase + 2 * kPage, kBase + 3 * kPage, count_writes) == 256 && written == 256);
+    mirror.home_bytes(kBase + 2 * kPage)[300] = 0xA5;  // as it was, for the cases below
+    EXPECT(mirror.write_back(kBase + 2 * kPage, kBase + 3 * kPage, count_writes) == 256);
     // A write and its refill: through the filter, not fresh.
     frames[200] = 0x11;
     EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
     EXPECT(f.filtered.size() == 2 && !f.filtered[1].fresh && mirror.home_bytes(kBase)[200] == 0x11);
+    // The upload compares the title's bytes with the title's: the same title bytes again fill nothing.
+    EXPECT(mirror.dirty(kBase) && mirror.upload() == 1 && f.filtered.size() == 2);
     // The same physical page shown at a second, unfiltered address: one home, still filtered.
     mirror.map(kBase + 5 * kPage, &frames[0], nullptr, 2);
     EXPECT(mirror.home_bytes(kBase + 5 * kPage) == mirror.home_bytes(kBase) && mirror.home_bytes(kBase + 5 * kPage)[0] == 0x5A);

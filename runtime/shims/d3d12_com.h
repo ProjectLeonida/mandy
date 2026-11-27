@@ -428,6 +428,9 @@ bool page_mirror_gpu_read(ID3D12Device* device, std::uint64_t title_va, void* ou
 // The same at arena VA `va` (heap_base + va): what a shader reads there, a console heap read in place among it. False
 // when the mirror is off. For tests.
 bool arena_gpu_read(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes);
+// Whether the layer writes the T# index word (gfx10_descriptors.h, tsharp_index_word) into the heaps shaders read, as a
+// loaded library of modules that read it turns on. Returns what it was. For tests, which load no library.
+bool set_tsharp_index_words_for_test(ID3D12Device* device, bool on);
 // Whether a draw's or copy's binding of title memory [va, va + size) would be served by the page mirror (VulkanContext's
 // mirror lookup): it must have been named before. `size` comes back cut at the chunk's end. For tests.
 bool page_mirror_buffer_at(ID3D12Device* device, std::uint64_t va, std::uint64_t& size);
@@ -464,7 +467,8 @@ struct BindlessStats {
 BindlessStats bindless_stats(ID3D12Device* device);
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
 // The bindless index the descriptor hash table holds for the 8 key dwords of a T# (or the 4 of an S# followed by
-// 0xFFFFFFFF x4), 0 (the fallback) when it has none or `device` has no such set. For tests.
+// 0xFFFFFFFF x4), 0 (the fallback) when it has none or `device` has no such set. A T# read from one of the layer's
+// heaps is looked up without its index word (dword 6), and gives 0 unless that word names the same index. For tests.
 std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]);
 // The free indices of that set's 2D image and sampler arrays: how many more distinct 2D T#s and S#s
 // CreateShaderResourceView and CreateSampler can register before they log that the array is full. Zeros when

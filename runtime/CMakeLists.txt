@@ -4918,6 +4918,12 @@ if(TARGET Vulkan::Headers)
       target_compile_options(title_mirror_hooks_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME title_mirror_hooks COMMAND title_mirror_hooks_test)
+    # The XMemAlloc heap in the page mirror's range (src/title_heap.h).
+    add_executable(title_heap_test test/title_heap_test.cpp)
+    if(WIN32 AND MSVC)
+      target_compile_options(title_heap_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME title_heap COMMAND title_heap_test)
     # Queue construction cleans its Vulkan handles if holder registration runs out of host memory.
     # Which title textures the refresh looks at: only those something says changed (src/title_texture_watch.h).
     add_executable(title_texture_watch_test test/title_texture_watch_test.cpp)

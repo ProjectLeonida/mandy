@@ -35,6 +35,7 @@ from shader_ir import HDR, parse_file  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
 from file_mode import published_mode  # noqa: E402
 import cfg_structure  # noqa: E402
+import descriptor_sources  # noqa: E402
 import fssm_header  # noqa: E402
 import fssm_unpack  # noqa: E402
 import lane_masks  # noqa: E402
@@ -65,6 +66,14 @@ DESCRIPTOR_TABLE = "tagged"
 # The kind word's bit positions, shared with runtime/src/descriptor_table.h.
 DESC_SAMPLED_BIT = 0     # bit i: the index is bound in dimension i's sampled array
 DESC_STORAGE_BIT = 8     # bit 8 + i: ... in its storage arrays (dimensions 0..4 have them)
+# The bindless index in the T# (docs/design.md, "Bindless index in the T#"): the layer writes dword 6 of every T# in
+# the heaps it keeps (runtime/src/gfx10_descriptors.h, tsharp_index_word) as TAG << 28 | storage kind << 23 |
+# sampled kind << 16 | index, the kind being the table's kind bits 8..12 and 0..6. A module reads it, without the
+# hash table, where tools/descriptor_sources.py shows the T#'s dword 6 was loaded from such a heap, and records
+# TSHARP_INDEX in its meta, which tells the runtime to write the word.
+TSHARP_INDEX = "dword6"
+TSHARP_INDEX_DWORD = 6
+TSHARP_INDEX_TAG = 0xA
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
 # --wave64-emulate: use wave64_emulate_opt's inline structured form when it does not put an exchange barrier
 # under control flow only some invocations take (translate() re-runs this module without it when it does).
@@ -586,6 +595,10 @@ class Gen:
         self.x_round_fn_types: dict[int, str] = {}        # emulate_inline: arity -> OpTypeFunction id for x_round_fns
         self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
         self.desc_cache = {}  # (first SGPR, dwords) -> id of the %desc_lookup_fn result in the current basic block
+        # id(instruction) -> True when its T#'s dword 6 comes from a heap slot the layer writes (descriptor_sources)
+        self.tsharp_from_heap = {}
+        self.tsharp_index_reads = 0     # image instructions that take the T#'s index from dword 6 alone
+        self.tsharp_lookups = 0         # ... that also look the T# up in the hash table (its source is not known)
         self._scan = (None, 0, [])   # (body list, lines already seen, open merge labels): see desc_cache_ok
         self.block_label = "%entry"   # label of the SPIR-V block the current instruction starts in
         self.build_meta = {}          # runtime build metadata from tools/shader_meta.py
@@ -13234,7 +13247,7 @@ class Gen:
     # The last word is the pad word a plain module never reads; --descriptor-table tagged fills it with the kind.
     PROBES = 8
 
-    def desc_lookup(self, words):
+    def desc_lookup(self, words, uniform=True):
         """words: 8 uint ids. Returns (bindless index, kind), kind being None with --descriptor-table plain.
 
         The probe is about 400 instructions, so it is one function in the module (%desc_lookup_fn) that every
@@ -13259,6 +13272,32 @@ class Gen:
             self.emit(f"{kind} = OpCompositeExtract %uint {r} 1")
         else:
             idx, kind = r, None
+        return self.desc_uniform(idx, kind) if uniform else (idx, kind)
+
+    def tsharp_index_word(self, words):
+        """(index, kind, tagged) from the T#'s dword 6 as the layer writes it (TSHARP_INDEX): the bool `tagged` is
+        whether the word carries the tag and dword 3 names an image (TYPE >= 8, bit 31); index and kind are 0 when it
+        does not, index 0's fallback, which is what a T# that names no image reads. The words are SGPRs, so this is a
+        handful of scalar operations and no memory access beyond the T# the shader loaded anyway."""
+        w3, w6 = words[3], words[TSHARP_INDEX_DWORD]
+        tag, tag_ok, img, img_ok, ok = (self.tmp() for _ in range(5))
+        self.emit(f"{tag} = OpShiftRightLogical %uint {w6} {self.cu(28)}")
+        self.emit(f"{tag_ok} = OpIEqual %bool {tag} {self.cu(TSHARP_INDEX_TAG)}")
+        self.emit(f"{img} = OpShiftRightLogical %uint {w3} {self.cu(31)}")
+        self.emit(f"{img_ok} = OpINotEqual %bool {img} {self.cu(0)}")
+        self.emit(f"{ok} = OpLogicalAnd %bool {tag_ok} {img_ok}")
+        raw, idx, sampled, storage, storage_hi, both, kind = (self.tmp() for _ in range(7))
+        self.emit(f"{raw} = OpBitwiseAnd %uint {w6} {self.cu(0xFFFF)}")
+        self.emit(f"{idx} = OpSelect %uint {ok} {raw} {self.cu(0)}")
+        self.emit(f"{sampled} = OpBitFieldUExtract %uint {w6} {self.cu(16)} {self.cu(7)}")
+        self.emit(f"{storage} = OpBitFieldUExtract %uint {w6} {self.cu(23)} {self.cu(5)}")
+        self.emit(f"{storage_hi} = OpShiftLeftLogical %uint {storage} {self.cu(DESC_STORAGE_BIT)}")
+        self.emit(f"{both} = OpBitwiseOr %uint {sampled} {storage_hi}")
+        self.emit(f"{kind} = OpSelect %uint {ok} {both} {self.cu(0)}")
+        return idx, kind, ok
+
+    def desc_uniform(self, idx, kind):
+        """The index (and the kind, or None) made explicitly uniform, as the hash lookup's result always was."""
         if self.emulate:
             return idx, kind
         if self.wave32_fragment:
@@ -13850,6 +13889,20 @@ class Gen:
         self.image_read_typed(dim, self.sgpr_word(a[2], 1), img, img_idx,
                               0xf, vdata, d16, gather_mip)
 
+    def tsharp_index_sgpr(self, a):
+        """(index, kind) of the current instruction's T# operand `a` when the dataflow showed its dword 6 is a heap
+        slot's (Gen.tsharp_from_heap, tools/descriptor_sources.py), else None."""
+        ins = self.cur_ins
+        if ins is None or not self.tsharp_from_heap.get(id(ins)):
+            return None
+        regs = descriptor_sources.tsharp_operand(ins)
+        if regs is None or tuple(regs) != self.tsharp_regs(a):
+            return None
+        self.uses_tex = True      # set 0's image arrays, which the index reads, as desc_lookup declares them
+        idx, kind, _ = self.tsharp_index_word(self.sgpr_words(a, 8))
+        self.tsharp_index_reads += 1
+        return self.desc_uniform(idx, kind)
+
     def desc_lookup_sgpr(self, a, n):
         """desc_lookup for an SGPR descriptor range (n=8: T#, n=4: S#), cached for the rest of the basic block.
 
@@ -13858,12 +13911,21 @@ class Gen:
         array go through store_reg, including the 64-bit ones, which are two calls, s_load results,
         v_readlane/v_readfirstlane results and the spare slots lane masks are parked in) and cleared when a basic
         block starts. Only lookups made at the block's top level are remembered, see desc_cache_ok. Returns
-        (bindless index, kind), kind being None with --descriptor-table plain."""
+        (bindless index, kind), kind being None with --descriptor-table plain.
+
+        A T# (n=8) whose dword 6 the dataflow traced to a heap slot takes its index from that word alone
+        (tsharp_index_sgpr). Any other T# is looked up, and the dword-6 index wins where the word carries it: such a
+        T# may still come from a heap the layer writes, along a path the dataflow did not follow, and there its words
+        are not the key the table holds (the key is the descriptor as the title wrote it)."""
+        if n == 8:
+            direct = self.tsharp_index_sgpr(a)
+            if direct is not None:
+                return direct
         if a["k"] == "slist" and len(a["r"]) >= n:
             words = self.sgpr_words(a, n)
             if n < 8:
                 words = words + [self.cu(0xFFFFFFFF)] * (8 - n)
-            return self.desc_lookup(words)
+            return self.desc_lookup(words) if n < 8 else self.tsharp_lookup(words)
         if a["k"] != "sgpr" or a.get("n", 1) < n:
             raise Unsupported("descriptor operand")
         key = (a["r"], n)
@@ -13874,10 +13936,32 @@ class Gen:
         words = self.sgpr_words(a, n)
         if n < 8:
             words = words + [self.cu(0xFFFFFFFF)] * (8 - n)
-        idx = self.desc_lookup(words)
+        idx = self.desc_lookup(words) if n < 8 else self.tsharp_lookup(words)
         if top:
             self.desc_cache[key] = idx
         return idx
+
+    def tsharp_lookup(self, words):
+        """A T# of unknown source: its dword-6 index where the word carries one, else the hash table's answer for its
+        words. The lookup sits in the branch taken only without the word: `ok` comes from SGPRs, so the branch is
+        uniform, and a T# from a heap the layer writes, along a path the dataflow did not follow, costs no probe."""
+        self.tsharp_lookups += 1
+        direct, direct_kind, ok = self.tsharp_index_word(words)
+        pre = self.current_label_placeholder()
+        probe, end = self.tmp() + "_probe", self.tmp() + "_tsharp"
+        self.emit(f"OpSelectionMerge {end} None")
+        self.emit(f"OpBranchConditional {ok} {end} {probe}")
+        self.emit(f"{probe} = OpLabel")
+        idx, kind = self.desc_lookup(words, uniform=False)
+        self.emit(f"OpBranch {end}")
+        self.emit(f"{end} = OpLabel")
+        out = self.tmp()
+        self.emit(f"{out} = OpPhi %uint {direct} {pre} {idx} {probe}")
+        out_kind = None
+        if kind is not None:
+            out_kind = self.tmp()
+            self.emit(f"{out_kind} = OpPhi %uint {direct_kind} {pre} {kind} {probe}")
+        return self.desc_uniform(out, out_kind)
 
     # The dimension of an instruction's image array, indexed by STORE_DIMS' index (0 2D, 1 2D array, 2 3D, 3 1D).
     # A cube instruction reads the 2D-array binding: a cube is six layers of a 2D array.
@@ -18965,6 +19049,7 @@ def _translate(path):
                                             user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
         g.fit_shared_memory()
         end = next((k for k, ins in enumerate(insns) if base_op(ins["op"]) == "s_endpgm"), len(insns))
+        g.tsharp_from_heap = descriptor_sources.analyse([insns[:end]], [[]], user_limit, sys_sgprs)
         g.exec_changes = any(g.may_write_exec(ins) for ins in insns[:end])
         g.insns(insns[:end])
         _translate.last_gen = g
@@ -19035,6 +19120,7 @@ def _translate(path):
                                         user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
 
     g.bar_rounds = needs_barrier_rounds(g, blocks, succ)
+    g.tsharp_from_heap = descriptor_sources.analyse(blocks, succ, user_limit, sys_sgprs)
     folds, fold_chain, absorbed = {}, {}, set()
     if g.emulate:
         g.scc_live = wave64_emulate_opt.scc_live_outs(blocks, succ)
@@ -19854,6 +19940,13 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         # The module reads the kind word from every table entry it hits: the runtime must fill it
         # (runtime/src/descriptor_table.h, docs/design.md "Images and samplers (T# dimension)").
         m["descriptor_table"] = g.descriptor_table
+    # Every module of this translator reads a T#'s bindless index from its dword 6 where the word carries one, so the
+    # runtime must write that word into the heaps it keeps (docs/design.md, "Bindless index in the T#"). The counts
+    # say how many image instructions take it alone and how many still look the T# up in the hash table too.
+    m["tsharp_index"] = TSHARP_INDEX
+    if g.tsharp_index_reads or g.tsharp_lookups:
+        m["tsharp_index_reads"] = g.tsharp_index_reads
+        m["tsharp_lookups"] = g.tsharp_lookups
     if g.w64g:
         # SHADER-10: partition invariance on 32-wide subgroups. A and B are exact there (B: aggregated atomics up to
         # the order of the slots), C is not; the reasons name the construct (docs/design.md, Wave64 graphics).

@@ -25,6 +25,26 @@ int main() {
     // and TYPE (SQ_RSRC_IMG_2D = 9 at bits 31:28).
     const ImageWords plain = encode(Image{});
     CHECK((plain == ImageWords{0, 0, 0, 0x90000FAC, 0, 0, 0, 0}));
+
+    // The bindless index in dword 6 (tsharp_index_word): TAG 0xA [31:28], the storage kind bits 8..12 at [27:23], the
+    // sampled kind bits 0..6 at [22:16], the index at [15:0]; decoded back as the translator does, and stripped from the
+    // key. Index 0 and an index past 16 bits get no word, which every shader reads as the fallback.
+    {
+        const std::uint32_t kind = 0x1Fu << 8 | 0x7Fu;  // every array
+        CHECK(tsharp_index_word(0x1234, kind) == 0xAFFF1234u);
+        CHECK(tsharp_index_word(7, 1u | 1u << 8) == 0xA0810007u);
+        CHECK(tsharp_index_word(0, kind) == 0 && tsharp_index_word(0x10000, kind) == 0);
+        ImageWords words = plain;
+        words[kTsharpIndexDword] = tsharp_index_word(9, 1u << 2 | 1u << 10);
+        CHECK(has_tsharp_index(words) && tsharp_index_of(words) == 9 && tsharp_kind_of(words) == (1u << 2 | 1u << 10));
+        CHECK(tsharp_key(words) == plain);
+        ImageWords no_image = words;
+        no_image[3] = 0x30000FAC;  // TYPE 3: not an image, whatever dword 6 holds
+        CHECK(tsharp_index_of(no_image) == 0 && tsharp_kind_of(no_image) == 0);
+        ImageWords title = plain;
+        title[kTsharpIndexDword] = 0x1234;  // a title's own dword 6 (no tag) stays in its key
+        CHECK(!has_tsharp_index(title) && tsharp_key(title) == title && tsharp_index_of(title) == 0);
+    }
     // One field at a time: the bits that change, word by word.
     const auto changed = [&](const Image& image) {
         ImageWords words = encode(image);

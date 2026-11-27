@@ -253,24 +253,6 @@ bool copy_guarded_host(std::uint8_t* to, const std::uint8_t* from, std::size_t b
     }
 }
 
-// Whether two byte ranges differ, one of them title memory that may go away meanwhile: false when a page faults. No
-// C++ objects here: it is a __try frame, and the compare is a loop of its own (a fault inside the CRT's memcmp never
-// reaches the __except under Wine, src/guarded_copy.h).
-__declspec(noinline) LEONIDA_GUARDED_NO_BUILTIN bool bytes_differ(const std::uint8_t* a, const std::uint8_t* b,
-                                                                  std::size_t n) {
-    for (std::size_t i = 0; i < n; ++i)
-        if (a[i] != b[i]) return true;
-    return false;
-}
-bool differ_guarded(const std::uint8_t* a, const std::uint8_t* b, std::size_t n, bool& differs) {
-    __try {
-        differs = bytes_differ(a, b, n);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
 // The same, reading the title's pages that xmem's frame table holds through their frames: a stream pool's GPU-only
 // pages and their CPU twins after queue slot 31's copies have no host view (src/title_frames.h). A frame is a section's
 // scratch view, cached memory, so it is not read streaming.
@@ -4033,6 +4015,22 @@ struct DeviceState {
         --it;
         return addr < it->second && (addr-it->first) % kDescriptorSize == 0;
     }
+    // The T#s of a bound table in one of the layer's heaps get the index word their entry has now (tsharp_index_word):
+    // Create*View wrote it, but a T# whose view came later (a stream published, a texture made at the address) or went
+    // since, and one the title wrote raw or copied from where no index was, would otherwise keep the word of then.
+    void refresh_tsharp_index_words(std::uint8_t* table, VkDeviceSize bytes) {
+        namespace g = leonida::gfx10;
+        std::lock_guard lock(descriptor_mutex);
+        for (VkDeviceSize at = 0; at + kDescriptorSize <= bytes; at += kDescriptorSize) {
+            g::ImageWords words;
+            std::memcpy(words.data(), table + at, sizeof(words));
+            if (!g::is_image(words)) continue;
+            const std::uint32_t word = tsharp_index_word_locked(g::tsharp_key(words));
+            if (word != words[g::kTsharpIndexDword])
+                std::memcpy(table + at + 4 * g::kTsharpIndexDword, &word, sizeof(word));
+        }
+    }
+
     // The buffer V#s of the table at `table_va` whose base is in the title's own memory get the address of a copy,
     // written in place: the title wrote them itself (or copied them), so no Create*View saw them. Images (T#s) and
     // null slots are skipped; so is a V# already in the arena, so a rewritten one is left alone next time.
@@ -4058,6 +4056,7 @@ struct DeviceState {
         // Slots the title wrote in its own backing of this heap, if it gave the heap one.
         aliases.pull_descriptors(table, std::size_t(end - table_va));
         if (sampler) return;  // S# words describe sampling state. They have no buffer address to translate.
+        if (tsharp_index_words) refresh_tsharp_index_words(table, end - table_va);
         for (VkDeviceSize at = table_va; at + 16 <= end; at += kDescriptorSize) {
             auto* words = reinterpret_cast<std::uint32_t*>(table + (at - table_va));
             if (words[3] >> 30) continue;
@@ -4589,6 +4588,7 @@ struct DeviceState {
         bool last_local = true;
         std::uint64_t presents = 0;  // present serial at the last log line
         std::uint64_t faults_seen = 0, hot_seen = 0, cold_seen = 0;  // the tracking's counters at the last log line
+        std::uint64_t uploaded_seen = 0, conflicts_seen = 0;           // the mirror's, likewise
         double ms = 0;
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
         // The console heaps read in place (add_heap_in_place): their filter state is under this mutex too.
@@ -4879,38 +4879,20 @@ struct DeviceState {
         }
         return true;
     }
-    // What the GPU wrote into the homes of mirrored pages of [begin, end) goes back to the title's pages, as
-    // ShadowPages::write_back does for a shadow: after the submissions that could write them have retired
-    // (write_back_titles), only the 256-byte pieces whose home differs from the title's page, and only on a page nothing
-    // wrote since it was last watched (a page written on both sides keeps the title's bytes, which are uploaded over
-    // the home before the next submission). Written through kernel_writes, which opens and pins the page and every
-    // other address of its physical page, so the readers over them take the bytes. Returns the bytes written.
+    // What the GPU wrote into the homes of mirrored pages of [begin, end) goes back to the title's pages
+    // (TitleMirror::write_back: merged at the 256-byte piece, a piece only the GPU changed goes back, one both changed
+    // keeps the title's bytes), once the submissions that could write them have retired (write_back_titles). Written
+    // through kernel_writes, which opens and pins the page and every other address of its physical page, so the
+    // readers over them take the bytes. Returns the bytes written.
     std::uint64_t page_mirror_write_back(std::uint64_t begin, std::uint64_t end) {
         auto& m = page_mirror;
         if (!m.mirror || begin >= end) return 0;
-        constexpr std::uint64_t kPage = leonida::TitleMirror::kPage, kPiece = 256;
         std::lock_guard lock(m.mutex);
-        std::uint64_t written = 0;
-        for (std::uint64_t page = begin & ~(kPage - 1); page < end; page += kPage) {
-            VkDeviceMemory memory = VK_NULL_HANDLE;
-            VkDeviceSize offset = 0;
-            std::uint8_t* home = nullptr;
-            const std::uint8_t* frame = m.mirror->frame_at(page);
-            if (!frame || !m.mirror->home_at(page, memory, offset, &home) || !m.tracking->unwritten(page)) continue;
-            // A console heap read in place: its home holds the filtered slots, never to be copied over the title's.
-            if (m.mirror->filtered_at(page)) continue;
-            const std::uint64_t from = std::max(begin, page), to = std::min(end, page + kPage);
-            for (std::uint64_t at = from & ~(kPiece - 1); at < to; at += kPiece) {
-                const std::uint64_t a = std::max(at, from), b = std::min(at + kPiece, to);
-                const std::uint8_t* gpu = home + (a - page);
-                const std::uint8_t* title = frame + (a - page);
-                bool differs = false;
-                // A title page gone since (decommitted, unmapped) has nothing to write back into.
-                if (!differ_guarded(gpu, title, std::size_t(b - a), differs) || !differs) continue;
-                if (leonida::kernel_writes::write(reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)), gpu, b - a))
-                    written += b - a;
-            }
-        }
+        // A console heap read in place is skipped there: its home holds the filtered slots.
+        const std::uint64_t written = m.mirror->write_back(begin, end, [](std::uint64_t at, const std::uint8_t* bytes,
+                                                                          std::size_t n) {
+            return leonida::kernel_writes::write(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at)), bytes, n);
+        });
         m.written_back += written;
         return written;
     }
@@ -4971,16 +4953,19 @@ struct DeviceState {
         m.taken.clear();
         // Ordinary memory released or decommitted: its mirrored pages leave (named again, they are mirrored again).
         leonida::geometry_writes::take_released(m.released, m.released_ranges);
+        // Only pages the range holds whole: a freed heap block leaves the rest of its page to the blocks around it.
         for (const auto& [from, to] : m.released_ranges) {
-            for (auto page = m.identity.lower_bound(from & ~(leonida::TitleMirror::kPage - 1));
-                 page != m.identity.end() && *page < to;) {
+            constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
+            for (auto page = m.identity.lower_bound((from + kPage - 1) & ~(kPage - 1));
+                 page != m.identity.end() && *page + kPage <= to;) {
                 m.tracking->unwatch(*page);
                 m.mirror->map(*page, nullptr, nullptr, ticket);
                 ++m.identity_released;
                 page = m.identity.erase(page);
             }
-            for (auto run = m.ensured.begin(); run != m.ensured.end();)
-                run = run->first < to && from < run->second ? m.ensured.erase(run) : std::next(run);
+            if (to - from >= kPage)  // a run that lost a page is named again (pages still there map to themselves)
+                for (auto run = m.ensured.begin(); run != m.ensured.end();)
+                    run = run->first < to && from < run->second ? m.ensured.erase(run) : std::next(run);
         }
         m.tracking->collect(m.written);  // re-watched before the copies below
         for (const std::uint64_t page : m.written)
@@ -5008,7 +4993,8 @@ struct DeviceState {
                          "mirrored and %llu released, %llu buffer bindings cut at a chunk's end; %llu slot-133 buffers "
                          "made on it, %llu KiB of GPU writes copied back; homes in device-local memory %llu units, in "
                          "host memory %llu; tracking: %zu pages hot, %zu cold, %llu write faults, %llu hot and %llu "
-                         "cold copies; %.1f KiB uploaded a submission, %.1f KiB a frame\n",
+                         "cold copies; uploaded %.1f KiB a submission and %.1f KiB a frame; written back %.1f KiB a "
+                         "submission and %.1f KiB a frame; %llu pieces written on both sides (the title's kept)\n",
                          static_cast<unsigned long long>(c.pages), static_cast<unsigned long long>(c.homes),
                          static_cast<unsigned long long>(c.units),
                          static_cast<unsigned long long>(c.units * (leonida::TitleMirror::kUnitBytes >> 20)),
@@ -5027,8 +5013,13 @@ struct DeviceState {
                          policy.hot, policy.cold, static_cast<unsigned long long>(policy.faults - m.faults_seen),
                          static_cast<unsigned long long>(policy.hot_copies - m.hot_seen),
                          static_cast<unsigned long long>(policy.cold_copies - m.cold_seen),
-                         m.refreshes ? double(m.uploads) * 64.0 / double(m.refreshes) : 0.0,
-                         frames ? double(m.uploads) * 64.0 / double(frames) : 0.0);
+                         m.refreshes ? double(c.uploaded_bytes - m.uploaded_seen) / 1024.0 / double(m.refreshes) : 0.0,
+                         frames ? double(c.uploaded_bytes - m.uploaded_seen) / 1024.0 / double(frames) : 0.0,
+                         m.refreshes ? double(m.written_back) / 1024.0 / double(m.refreshes) : 0.0,
+                         frames ? double(m.written_back) / 1024.0 / double(frames) : 0.0,
+                         static_cast<unsigned long long>(c.conflicts - m.conflicts_seen));
+            m.uploaded_seen = c.uploaded_bytes;
+            m.conflicts_seen = c.conflicts;
             m.faults_seen = policy.faults;
             m.hot_seen = policy.hot_copies;
             m.cold_seen = policy.cold_copies;
@@ -5529,6 +5520,11 @@ struct DeviceState {
                     else if (Records::is_waiting(heap.records.state(slot, 0)) &&
                              heap.records.base(slot, 0) == texture_address)
                         ++heap.texture_refills;  // the T# waited for this address and is bound now
+                    // The copy's dword 6 is the index shaders take (gfx10_descriptors.h, tsharp_index_word), or 0 while
+                    // the T# waits: a texture coming, going or being replaced at its address fixes the slot again
+                    // (apply_slot_changes), so the word follows the texture the T# names. The title's bytes and the
+                    // T#'s key keep the title's dword 6.
+                    if (tsharp_index_words) w[leonida::gfx10::kTsharpIndexDword] = unbound ? 0u : tsharp_index_word(words);
                 }
             } else {
                 // Neither a buffer V# (TYPE is not 0) nor a T# the layer can decode: data the title keeps in the slot.
@@ -5719,7 +5715,11 @@ struct DeviceState {
             std::memcpy(words.data(), w, sizeof(words));
             leonida::gfx10::Image image{};
             if (leonida::gfx10::is_image(words) && leonida::gfx10::decode(words, image)) {
-                // As the title wrote it; bound by finish_in_place [TSHARP-INDEX: where its bindless index goes in].
+                // As the title wrote it, bound by finish_in_place, which writes its bindless index into dword 6
+                // (gfx10_descriptors.h, tsharp_index_word; the entry's index needs descriptor_mutex, not taken under
+                // the mirror's lock). Until then dword 6 is 0, the fallback: the title's own dword 6 (compression
+                // metadata) is never read as an index. The title's bytes keep it.
+                if (tsharp_index_words) w[leonida::gfx10::kTsharpIndexDword] = 0;
                 defer = true;
             } else {
                 heap.records.clear(slot);
@@ -5869,6 +5869,11 @@ struct DeviceState {
                 done[i].texture = !unbound ? Records::texture_bound
                                   : why == kTsharpArrayFull || why == kTsharpStorageFull ? Records::texture_waiting_room
                                                                                          : Records::texture_waiting;
+                // The home's dword 6 is the index shaders take (tsharp_index_word), 0 while the T# waits; a texture
+                // coming, going or replaced at its address touches the slot (apply_in_place_changes), which is filtered
+                // and finished again, so the word follows the texture the T# names. The heap copy's write
+                // (fix_console_slot) is for heaps not read in place.
+                if (tsharp_index_words) w[leonida::gfx10::kTsharpIndexDword] = unbound ? 0u : tsharp_index_word(words);
             }
         }
         std::lock_guard lock(page_mirror.mutex);
@@ -6487,8 +6492,16 @@ struct DeviceState {
         const bool imported = heap->imported;
         const VkDeviceSize guarded = heap->guard;
         arena_guard_bytes.fetch_add(guarded, std::memory_order_relaxed);
-        if (heap_gpu && console_heap_gpu_enabled() && heap->scratch && resource_heap && !imported)
-            attach_console_heap_gpu(*heap);
+        // The pass copies a T#'s words as the title wrote them; it does not write the index word the library's modules
+        // read (tsharp_index_words), so such a library's heaps are fixed on the CPU, which writes it.
+        if (heap_gpu && console_heap_gpu_enabled() && heap->scratch && resource_heap && !imported) {
+            if (!tsharp_index_words)
+                attach_console_heap_gpu(*heap);
+            else
+                log_once("LEONIDA_CONSOLE_HEAP_GPU: the pass does not write the T# index word the shaders read; console "
+                         "descriptor heaps are fixed on the CPU; slots",
+                         int(std::min<VkDeviceSize>(bytes / kDescriptorSize, INT_MAX)));
+        }
         {
             std::lock_guard lock(console_heap_mutex);
             if (heap->gpu >= 0) gpu_heaps[std::size_t(heap->gpu)] = heap.get();
@@ -7970,7 +7983,7 @@ struct DeviceState {
         char what[96] = "no texture at that address";
         {
             std::lock_guard lock(descriptor_mutex);
-            if (image_entries.count(words)) {
+            if (image_entries.count(words) || image_entries.count(g::tsharp_key(words))) {
                 kind = 3;
                 std::snprintf(what, sizeof(what), "key registered");
             } else if (const auto it = images_by_address.find(image.address); it != images_by_address.end()) {
@@ -8510,6 +8523,10 @@ struct DeviceState {
     // True when the loaded library's modules read the table's kind word (create_bindless, descriptor_table.h): the
     // image inserts then record which arrays each index is bound in.
     bool descriptor_table_tagged = false;
+    // True when the loaded library's modules read a T#'s bindless index from its dword 6 (create_bindless,
+    // gfx10_descriptors.h tsharp_index_word): every T# the layer writes into a heap shaders read then carries it, in
+    // the console heaps' copies (fix_console_slot) and in its own heaps (write_image_descriptor, scan_title_table).
+    bool tsharp_index_words = false;
     std::mutex descriptor_mutex;  // the set and the containers below
     // vkDeviceWaitIdle calls made for the bindless set (none, unless LEONIDA_BINDLESS_IDLE_WAIT restores the old wait).
     std::atomic<std::uint64_t> bindless_idle_waits{0};
@@ -8612,6 +8629,7 @@ struct DeviceState {
     std::atomic<unsigned> pending_sample_count{};
     bool materialize_sample(const leonida::DescriptorKey& key);
     bool materialize_table(std::uint64_t address,std::uint32_t slots);
+    void write_tsharp_index_words(const std::vector<leonida::DescriptorKey>& keys);
     void remember_sample(const leonida::DescriptorKey& key, const PendingSample& sample) {
         std::lock_guard lock(pending_view_mutex);
         if (pending_samples.try_emplace(key,sample).second) {
@@ -8897,6 +8915,11 @@ struct DeviceState {
         if (existing != image_entries.end()) {
             replaced_images.push_back(existing->second);  // the read-only entry of the same bytes
             existing->second = entry;
+            // The console heap slots holding these words carry the read-only entry's index in their dword 6
+            // (tsharp_index_words): fixed again at the next submission (a texture_gone change re-fixes bound T#s,
+            // under the address their records keep, tsharp_texture_key), they take this one, with its storage views.
+            if (tsharp_index_words)
+                note_texture_change(leonida::SlotChange::texture_gone, tsharp_texture_key(image.address));
         } else {
             image_entries.emplace(words, entry);
             image_keys.emplace(image.address, words);
@@ -8907,6 +8930,22 @@ struct DeviceState {
                              descriptor_table_tagged ? bindless->image_kind_at(dimension, entry.index) : 0u);
         leonida::fsdraw::note_tsharp(words.data());  // LOCAL DIAGNOSTIC
         return true;
+    }
+
+    // The dword 6 that the T# `words` (its key: the descriptor as the title or Create*View wrote it) gets in a heap
+    // shaders read (gfx10_descriptors.h, tsharp_index_word): its entry's index and the arrays that index is bound in,
+    // which the set derives from what it bound there (image_kind_at); 0, the fallback, while the T# has no entry (no
+    // texture yet, a stream still pending, no room). descriptor_mutex held.
+    std::uint32_t tsharp_index_word_locked(const leonida::gfx10::ImageWords& words) const {
+        if (!bindless) return 0;
+        const auto it = image_entries.find(words);
+        if (it == image_entries.end()) return 0;
+        return leonida::gfx10::tsharp_index_word(it->second.index,
+                                                 bindless->image_kind_at(it->second.dimension, it->second.index));
+    }
+    std::uint32_t tsharp_index_word(const leonida::gfx10::ImageWords& words) {
+        std::lock_guard lock(descriptor_mutex);
+        return tsharp_index_word_locked(words);
     }
 
     // Textures by the address their T#s name them by (Resource::image_address), for the T#s a title writes into a
@@ -11780,6 +11819,7 @@ bool DeviceState::materialize_table(std::uint64_t address, std::uint32_t slots) 
           for (const auto& [key,view]:pending_samples)
               if (view.owner->id() == address) keys.push_back(key); }
         for (const auto& key:keys) if (!materialize_sample(key)) return false;
+        write_tsharp_index_words(keys);
         return true;
     }
     std::uint64_t end = 0;
@@ -11799,6 +11839,7 @@ bool DeviceState::materialize_table(std::uint64_t address, std::uint32_t slots) 
         std::vector<leonida::DescriptorKey> all;
         {std::lock_guard lock(pending_view_mutex);for(const auto& [key,v]:pending_samples) all.push_back(key);}
         for(const auto& key:all) if(!materialize_sample(key)) return false;
+        write_tsharp_index_words(all);
         return true;
     }
     const auto refreshed = std::min<std::uint64_t>(end-address, std::uint64_t(kViewScanLimit)*kDescriptorSize);
@@ -11809,9 +11850,47 @@ bool DeviceState::materialize_table(std::uint64_t address, std::uint32_t slots) 
     for (auto at=address; at<end; at+=kDescriptorSize) {
         leonida::DescriptorKey key{};
         std::memcpy(key.data(),table+(at-address),sizeof(key));
-        if (leonida::gfx10::is_image(key) && !materialize_sample(key)) return false;
+        if (!leonida::gfx10::is_image(key)) continue;
+        // A deferred view's slot was written without its index word (it had no index): its key is the slot without
+        // the word, and once made the slot gets it.
+        key = leonida::gfx10::tsharp_key(key);
+        if (!materialize_sample(key)) return false;
+        if (tsharp_index_words) {
+            const std::uint32_t word = tsharp_index_word(key);
+            std::memcpy(table + (at - address) + 4 * leonida::gfx10::kTsharpIndexDword, &word, sizeof(word));
+        }
     }
     return true;
+}
+
+// The views of `keys` made at last (materialize_sample, LEONIDA_PIPELINE_COMPILE=on-demand) without a table extent to
+// name their slots: every T# of them in the layer's heaps (shader-visible, and the CPU-only ones a later
+// CopyDescriptors copies from) gets its index word (tsharp_index_word). Only while views are pending, once per batch.
+void DeviceState::write_tsharp_index_words(const std::vector<leonida::DescriptorKey>& keys) {
+    if (!tsharp_index_words || keys.empty()) return;
+    namespace g = leonida::gfx10;
+    const std::set<leonida::DescriptorKey> wanted(keys.begin(), keys.end());
+    std::vector<std::pair<std::uint8_t*, std::size_t>> ranges;
+    {
+        std::lock_guard lock(visible_heap_mutex);
+        for (const auto& [offset, heap] : visible_heaps)
+            if (heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                if (std::uint8_t* host = arena_host(offset, heap.end - offset))
+                    ranges.emplace_back(host, std::size_t(heap.end - offset));
+        for (const auto& [begin, end] : cpu_view_heaps)
+            ranges.emplace_back(reinterpret_cast<std::uint8_t*>(begin), std::size_t(end - begin));
+    }
+    std::lock_guard lock(descriptor_mutex);
+    for (const auto& [base, bytes] : ranges)
+        for (std::size_t at = 0; at + kDescriptorSize <= bytes; at += kDescriptorSize) {
+            g::ImageWords words;
+            std::memcpy(words.data(), base + at, sizeof(words));
+            if (!g::is_image(words)) continue;
+            const g::ImageWords key = g::tsharp_key(words);
+            if (!wanted.count(key)) continue;
+            const std::uint32_t word = tsharp_index_word_locked(key);
+            std::memcpy(base + at + 4 * g::kTsharpIndexDword, &word, sizeof(word));
+        }
 }
 
 class Heap final
@@ -16426,6 +16505,21 @@ public:
                          leonida::descriptor_table_layout_name(descriptor_table), table_modules.total());
         }
         state_.descriptor_table_tagged = descriptor_table == leonida::DescriptorTableLayout::tagged;
+        // Whether the loaded modules read a T#'s index from its dword 6 (shader_library.h, TsharpIndexCensus): one such
+        // module needs the word in every heap. Older modules find heap T#s by their words in the hash table, which the
+        // word changes, so a library with both kinds is reported: its older modules read the fallback for those T#s.
+        if (const leonida::ShaderLibrary* library = state_.library()) {
+            const leonida::TsharpIndexCensus& census = library->tsharp_index_census();
+            state_.tsharp_index_words = census.dword6 > 0;
+            if (census.dword6 && census.none)
+                std::fprintf(stderr,
+                             "[rt] d3d12: T# index word: %zu modules read it, %zu older ones look heap T#s up in the "
+                             "hash table and miss them (the heaps carry the word); translate the library again\n",
+                             census.dword6, census.none);
+            else
+                std::fprintf(stderr, "[rt] d3d12: T# index word: %s (all %zu modules)\n",
+                             census.dword6 ? "written into the heaps' T#s" : "not read", census.total());
+        }
         const auto get_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
             state_.info.get_instance_proc(state_.info.instance, "vkGetPhysicalDeviceProperties2"));
         if (get_properties) {
@@ -17239,7 +17333,7 @@ public:
         if (!leonida::gfx10::is_image(result)) return false;
         std::lock_guard descriptors(state_.descriptor_mutex);
         if (!state_.bindless) return true;
-        const auto entry = state_.image_entries.find(result);
+        const auto entry = state_.image_entries.find(leonida::gfx10::tsharp_key(result));
         if (entry != state_.image_entries.end() && entry->second.storage) return true;
         std::memset(reinterpret_cast<void*>(dest.ptr), 0, kDescriptorSize);
         return false;
@@ -22226,6 +22320,8 @@ private:
             log_once("shader access to 1D and 3D UAVs requires robustImageAccess; type", int(view.type));
         } else {
             const bool known_heap = state_.known_view_heap(destination.ptr);
+            // A deferred view has no index yet: its slot gets the index word when the view is made
+            // (materialize_table, write_tsharp_index_words).
             if (!storage && resource.deferrable_sample() && state_.info.prepare_on_bind && known_heap &&
                 !g::multisampled(image.type)) {
                 state_.remember_sample(words,{const_cast<Resource*>(&resource),image,view_format,channels_format});
@@ -22239,6 +22335,11 @@ private:
                                                        sampled, storage, slices);
             if (registered && (resource.sparse_image() || storage_plane)) state_.context->note_shader_image(resource.id());
             if (!registered && (g::multisampled(image.type) || storage_plane)) return;
+            // In the layer's own heaps the bytes written here are what shaders load: dword 6 carries the index
+            // (gfx10_descriptors.h, tsharp_index_word; 0 while the T# has none). A console heap (the title's memory)
+            // is left as the title's own write would be: its copy gets the word when the slot is fixed.
+            if (state_.tsharp_index_words && known_heap)
+                words[g::kTsharpIndexDword] = state_.tsharp_index_word(words);
         }
         // The CPU UAV used by ClearUnorderedAccessView is independent of set 0.
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
@@ -23243,6 +23344,14 @@ bool arena_gpu_read(ID3D12Device* device, std::uint64_t va, void* out, std::size
     return gpu_buffer_read(*state, state->arena.buffer, va, wait, out, bytes);
 }
 
+bool set_tsharp_index_words_for_test(ID3D12Device* device, bool on) {
+    DeviceState* state = mirror_state(device);
+    if (!state) return false;
+    const bool was = state->tsharp_index_words;
+    state->tsharp_index_words = on;
+    return was;
+}
+
 bool page_mirror_buffer_at(ID3D12Device* device, std::uint64_t va, std::uint64_t& size) {
     ID3D12Device* real = device ? rt::d3d12_xs::device_proxy_real_device(device) : nullptr;
     if (!real) real = device;
@@ -23389,7 +23498,16 @@ VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device) {
 
 std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]) {
     const leonida::BindlessSet* set = bindless_of(device);
-    return set ? set->table().lookup(key) : 0;
+    if (!set) return 0;
+    // A T# read back from one of the layer's heaps carries its index in dword 6 (tsharp_index_word): its key is the
+    // descriptor without it, and the word must name the index the table holds, which is what a shader reads.
+    namespace g = leonida::gfx10;
+    g::ImageWords words;
+    std::memcpy(words.data(), key, sizeof(words));
+    if (!g::is_image(words) || !g::has_tsharp_index(words)) return set->table().lookup(key);
+    const g::ImageWords stripped = g::tsharp_key(words);
+    const std::uint32_t index = set->table().lookup(stripped.data());
+    return index == g::tsharp_index_of(words) ? index : 0;
 }
 
 BindlessRoom bindless_room(ID3D12Device* device) {

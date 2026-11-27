@@ -179,6 +179,45 @@ inline constexpr bool partial_volume_uav(const ImageWords& words, const Image& i
     return range.first_w != 0 || range.w_size != (mip_depth ? mip_depth : 1u);
 }
 
+// The bindless index in the T# (docs/design.md, "Bindless index in the T#"). In the heaps shaders read (the copies of
+// the console resource heaps and the layer's own shader-visible heaps) the layer writes dword 6 of every T# as
+//   TAG [31:28] | storage kind [27:23] | sampled kind [22:16] | index [15:0]
+// where the kinds are descriptor_table.h's kind bits 8..12 and 0..6 for that index. A translated shader that loaded
+// the T# from such a heap takes the index from this word and no hash-table lookup (tools/rdna2spirv.py,
+// tsharp_index_word), and reads index 0 (the fallback) unless the word has the tag and dword 3 names an image (TYPE
+// 8..15, bit 31). Dword 6 is the hardware's compression metadata (META_DATA_ADDRESS, COMPRESSION_EN and friends),
+// which no Vulkan view uses; over the 1.0.2.1 corpus no shader reads dword 6 or 7 of a heap T# with a scalar
+// instruction (tools/descriptor_source_census.py). The title's own bytes keep their dword 6, and a T#'s table key
+// stays the descriptor as the title or Create*View wrote it (tsharp_key strips the word from the layer's heaps).
+inline constexpr unsigned kTsharpIndexDword = 6;
+inline constexpr std::uint32_t kTsharpIndexTag = 0xA;
+inline constexpr std::uint32_t kTsharpIndexLimit = 0x10000;  // an index past 16 bits gets no word (the fallback)
+
+// The word for `index` bound in the arrays `kind` names (descriptor_table.h's kind bits); 0 for index 0 or one that
+// does not fit, which every shader reads as the fallback.
+inline constexpr std::uint32_t tsharp_index_word(std::uint32_t index, std::uint32_t kind) {
+    if (!index || index >= kTsharpIndexLimit) return 0;
+    return (kTsharpIndexTag << 28) | (((kind >> 8) & 0x1Fu) << 23) | ((kind & 0x7Fu) << 16) | index;
+}
+inline constexpr bool has_tsharp_index(const ImageWords& words) {
+    return (words[kTsharpIndexDword] >> 28) == kTsharpIndexTag;
+}
+// The index and kind a shader reads from `words` (0 and 0 without the tag or when dword 3 names no image).
+inline constexpr std::uint32_t tsharp_index_of(const ImageWords& words) {
+    return has_tsharp_index(words) && (words[3] >> 31) ? words[kTsharpIndexDword] & 0xFFFFu : 0u;
+}
+inline constexpr std::uint32_t tsharp_kind_of(const ImageWords& words) {
+    if (!has_tsharp_index(words) || !(words[3] >> 31)) return 0;
+    const std::uint32_t w = words[kTsharpIndexDword];
+    return ((w >> 16) & 0x7Fu) | (((w >> 23) & 0x1Fu) << 8);
+}
+// The key of a T# the layer wrote into one of its own heaps: dword 6 as encode() writes it (0) when it carries the
+// index. Only for words read back from the layer's heaps; a title's T# keeps whatever its dword 6 holds.
+inline constexpr ImageWords tsharp_key(ImageWords words) {
+    if (has_tsharp_index(words)) words[kTsharpIndexDword] = 0;
+    return words;
+}
+
 inline constexpr float image_min_lod(const ImageWords& words) {
     return float(detail::get(words[1], 8, 12)) / 256.0f;
 }

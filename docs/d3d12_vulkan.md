@@ -2202,8 +2202,12 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    any reader names title memory) or in a buffer of ours as the title wrote it (`reachable_as_written`), other words
    null. The filter runs inside the mirror's fills, under its lock, so it takes no other lock of ours: a V# the mirror
    does not hold (an interim, until every title allocation is in the mirror) reads null until the heap's refresh
-   resolves it as a copied slot was, and a T# is bound there too (its bindless index in the entry comes later), each
-   result written into the home unless the title rewrote the slot meanwhile (`finish_in_place`). Lock order:
+   resolves it as a copied slot was, and a T# is bound there too, its home dword 6 then taking the bindless index word
+   (`tsharp_index_word`, docs/design.md "Bindless index in the T#"; 0, the fallback, from the filter until then and
+   while the T# waits; the title's dword 6 stays in its bytes), each result written into the home unless the title
+   rewrote the slot meanwhile (`finish_in_place`). The upload's sums per 256-byte piece are of the title's bytes for
+   such a page, so the mirror calls the filter only when a piece of the title's page changed, and `write_back` skips
+   it. Lock order:
    `console_heap_mutex`, then the mirror's, then the change list's. The changes are applied to the homes at the
    mirror's refresh, before the pages written since are filled. No GPU write is ever copied back from these pages
    (`TitleMirror::filtered_at`). A heap the mirror does not hold (a device without the mirror, memory outside its
@@ -2235,7 +2239,9 @@ The layer's descriptor model:
   which is the assumption to verify. If it uses an opaque format, the layer must translate at bind time.
 - At execution, for each bound table (or the whole bound heap when direct indexing is enabled), the layer walks
   the declared descriptor range with the heap's stride, parses each T#/S#, and ensures a bindless entry exists:
-  - image T# → `VkImageView` (format, view type, mip range, array layers) → bindless image index;
+  - image T# → `VkImageView` (format, view type, mip range, array layers) → bindless image index, which the layer
+    writes into dword 6 of the T# where shaders read it (the console heap copy's slot, or the layer's own heap), with
+    the arrays it is bound in (`docs/design.md`, "Bindless index in the T#"); the hash table keeps the key as written;
   - sampler S# → `VkSampler` (filter, address modes, LOD, compare, anisotropy) → bindless sampler index;
   - buffer V# / CBV → no Vulkan view; the descriptor already contains a console VA the shader dereferences.
 - **Buffer UAVs.** `CreateUnorderedAccessView` on a buffer writes a V# in the first 16 bytes of the slot (the rest of
@@ -4800,6 +4806,12 @@ store, load, mesh, geometry and BVH tests; this layer is the other half.
 | Code-embedded data | The whole FSSM blob is in the arena; `s_getpc_b64` becomes `code_base + next-instruction offset`. |
 
 ### 5.1 Descriptor hash table details
+
+Since the T# index word (`docs/design.md`, "Bindless index in the T#") the table serves only what the word does not
+reach: every S#, and the T#s a translated module cannot trace to a heap slot (1,062 of the 439,415 T# operands of
+the 1.0.2.1 corpus, in 108 modules). A T# loaded from a heap the layer writes carries its index and kind in dword 6
+and is never looked up. Every T# key is still inserted, as the title wrote it: a T# outside the heaps is found by
+those words.
 
 The exact layout the shader reads (from `tools/rdna2spirv.py`, `desc_lookup`):
 

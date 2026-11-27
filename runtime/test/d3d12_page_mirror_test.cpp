@@ -12,7 +12,11 @@
 //      keeps the title's address as its base, the GPU reads the bytes and a later title write there, and a binding of
 //      it is served by the mirror's chunk;
 //   6. a slot-133 buffer over mirrored memory is the mirror's chunk (no shadow); the GPU's writes into it go back to
-//      the title's page, and a page written on both sides keeps the title's bytes.
+//      the title's page, and a 256-byte piece written on both sides keeps the title's bytes;
+//   7. one page, the GPU writes piece A and the title piece B in the same submission window (the title's write is
+//      uploaded before the GPU's goes back): both survive, on both sides;
+//   8. XMemAlloc blocks lie in the mirror's range and are mirrored as the heap commits them: the GPU reads a small and
+//      a large block's bytes through a pointer into them that nothing named.
 // Exit 77 when the device makes no page mirror (no sparse aliased strict buffers or capture-replay addresses: llvmpipe).
 // No shaders, no game data.
 #include "../shims/d3d12_com.h"
@@ -34,6 +38,8 @@
 namespace {
 
 using XMemVirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, ULONGLONG, DWORD);
+using XMemAllocFn = void*(__stdcall*)(size_t, std::uint64_t);
+using XMemFreeFn = void(__stdcall*)(void*, std::uint64_t);
 using XMemAllocatePhysicalPagesFn = BOOL(WINAPI*)(std::uint64_t, std::uint64_t*, std::uint64_t*);
 using XMemFreePhysicalPagesFn = BOOL(WINAPI*)(std::uint64_t, const std::uint64_t*);
 using XMemMapPhysicalPagesFn = void*(WINAPI*)(void*, std::uint64_t, const std::uint64_t*);
@@ -178,6 +184,38 @@ int test() {
     EXPECT(rt::d3d12::page_mirror_write_back(device.p, std::uintptr_t(placed), kPage64k) == 0);
     EXPECT(placed_words[0x100] == 0x7171u);
     EXPECT(gpu_word(device.p, std::uintptr_t(placed) + 0x400) == 0x7171u);
+
+    // 7. Pieces A (0x800) and B (0xc00) of one page: the GPU writes A, the title B; a GPU read refreshes the mirror
+    //    first (B is uploaded, A's home bytes stay), then A goes back to the title's page.
+    const std::uint32_t gpu_a[4] = {0xA0A00001u, 0xA0A00002u, 0xA0A00003u, 0xA0A00004u};
+    EXPECT(rt::d3d12::page_mirror_gpu_write(device.p, std::uintptr_t(placed) + 0x800, gpu_a, sizeof(gpu_a)));
+    std::thread([&] { placed_words[0x300] = 0xB0B00001u; }).join();
+    EXPECT(gpu_word(device.p, std::uintptr_t(placed) + 0xc00) == 0xB0B00001u);
+    EXPECT(gpu_word(device.p, std::uintptr_t(placed) + 0x800) == 0xA0A00001u);
+    EXPECT(rt::d3d12::page_mirror_write_back(device.p, std::uintptr_t(placed), kPage64k) == 256);
+    EXPECT(placed_words[0x200] == 0xA0A00001u && placed_words[0x203] == 0xA0A00004u);
+    EXPECT(placed_words[0x300] == 0xB0B00001u);
+    EXPECT(gpu_word(device.p, std::uintptr_t(placed) + 0x800) == 0xA0A00001u);
+    EXPECT(gpu_word(device.p, std::uintptr_t(placed) + 0xc00) == 0xB0B00001u);
+
+    // 8. XMemAlloc blocks.
+    auto xmem_alloc = reinterpret_cast<XMemAllocFn>(rt::shims::find("xmem.dll", "XMemAlloc"));
+    auto xmem_free = reinterpret_cast<XMemFreeFn>(rt::shims::find("xmem.dll", "XMemFree"));
+    EXPECT(xmem_alloc && xmem_free);
+    auto* heap_small = static_cast<volatile std::uint32_t*>(xmem_alloc(3000, 0x5e50000));
+    auto* heap_large = static_cast<volatile std::uint32_t*>(xmem_alloc(200000, 0));
+    EXPECT(heap_small && heap_large && std::uintptr_t(heap_small) % 64 == 0);
+    EXPECT(leonida::title_mirror_space::contains(std::uintptr_t(heap_small)) &&
+           leonida::title_mirror_space::contains(std::uintptr_t(heap_large)));
+    heap_small[700] = 0x81000700u;
+    heap_large[40000] = 0x82040000u;
+    EXPECT(gpu_word(device.p, std::uintptr_t(heap_small) + 2800) == 0x81000700u);
+    EXPECT(gpu_word(device.p, std::uintptr_t(heap_large) + 160000) == 0x82040000u);
+    std::thread([&] { heap_small[700] = 0x81000701u; }).join();
+    EXPECT(gpu_word(device.p, std::uintptr_t(heap_small) + 2800) == 0x81000701u);
+    xmem_free(const_cast<std::uint32_t*>(heap_small), 0);
+    xmem_free(const_cast<std::uint32_t*>(heap_large), 0);
+    EXPECT(gpu_word(device.p, std::uintptr_t(heap_large) + 160000) == 0);  // decommitted: unmapped, reads zero
 
     const auto end = rt::d3d12::page_mirror_state(device.p);
     std::printf("page mirror: heap_base 0x%llx, %llu pages in %llu homes over %llu chunk(s); slot-31 copies, a title "
