@@ -940,6 +940,25 @@ class _Wave:
                 return _Poison("bit-field insert beyond the width")
             mk = ((1 << cnt) - 1) << off
             return ((base & ~mk) | ((ins << off) & mk)) & w
+        if op in ("OpSDotKHR", "OpUDotKHR", "OpSDotAccSatKHR", "OpUDotAccSatKHR",
+                  "OpSDot", "OpUDot", "OpSDotAccSat", "OpUDotAccSat"):
+            # SPV_KHR_integer_dot_product on PackedVectorFormat4x8Bit (as spirv_mini_interp): the exact sum of the four
+            # byte products, its low bits, or with AccSat the accumulator added exactly and saturated.
+            if a[-1] not in ("PackedVectorFormat4x8BitKHR", "PackedVectorFormat4x8Bit") or bits != 32:
+                raise UnsupportedConstruct(f"{op} other than 32-bit PackedVectorFormat4x8Bit")
+            is_signed = op.startswith("OpS")
+            x, y = self.int_of(lane, a[1]) & MASK, self.int_of(lane, a[2]) & MASK
+
+            def byte(word, i):
+                b = (word >> (8 * i)) & 0xFF
+                return b - 256 if is_signed and b & 0x80 else b
+            total = sum(byte(x, i) * byte(y, i) for i in range(4))
+            if "AccSat" in op:
+                acc = self.int_of(lane, a[3]) & MASK
+                total += _signed(acc, 32) if is_signed else acc
+                lo, hi = (-(1 << 31), (1 << 31) - 1) if is_signed else (0, MASK)
+                total = min(max(total, lo), hi)
+            return total & MASK
         if op in ("OpIAddCarry", "OpISubBorrow"):
             x, y = self.int_of(lane, a[1]) & MASK, self.int_of(lane, a[2]) & MASK
             if op == "OpIAddCarry":
