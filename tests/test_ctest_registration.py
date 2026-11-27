@@ -65,6 +65,16 @@ class CTestRegistrationTest(unittest.TestCase):
         self.assertEqual(len(skips), 3, f"expected three whole-test SKIP paths, got {len(skips)}")
         self.assertEqual(skips, [77, 77, 77], "SKIP paths must return 77 for SKIP_RETURN_CODE 77")
 
+    def test_translated_draw_variants_skip_without_vulkan(self):
+        tests = ("d3d12_translated_draw", "xbox_native_base_draw", "xbox_derived_mask_zero",
+                 "xbox_derived_mask_restore")
+        for test in tests:
+            self.assertRegex(
+                self.cmake,
+                r"set_tests_properties\([^)]*\b" + re.escape(test) + r"\b[^)]*\bSKIP_RETURN_CODE\s+77",
+                f"{test} returns 77 without a usable Vulkan device and must be a CTest skip",
+            )
+
     def test_whole_test_skips_return_the_skip_code(self):
         # A test registered with SKIP_RETURN_CODE 77 that prints SKIP and returns 0 is counted as passed although it
         # checked nothing: bink_audio_test did that for a movie without audio tracks after #1580.

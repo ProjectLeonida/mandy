@@ -3569,7 +3569,8 @@ if(TARGET Vulkan::Headers)
       add_test(NAME xbox_derived_mask_zero COMMAND d3d12_translated_draw_test --derived-zero)
       add_test(NAME xbox_derived_mask_restore COMMAND d3d12_translated_draw_test --derived-restore)
 
-      set_tests_properties(d3d12_translated_draw PROPERTIES SKIP_RETURN_CODE 77)
+      set_tests_properties(d3d12_translated_draw xbox_native_base_draw xbox_derived_mask_zero xbox_derived_mask_restore
+                           PROPERTIES SKIP_RETURN_CODE 77)
       # Dual-source blending (RT-DUAL-SOURCE-BLEND): with lazy pipelines (the default) and built at creation.
       add_test(NAME d3d12_dual_source_draw COMMAND d3d12_translated_draw_test --dual-source)
       add_test(NAME d3d12_dual_source_draw_eager COMMAND d3d12_translated_draw_test --dual-source)
