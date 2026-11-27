@@ -69,7 +69,7 @@ reasons behind each step: [linux_proton.md](linux_proton.md#amd-on-linux-what-go
   | `LEONIDA_TITLE_WATCHDOG=0`, `LEONIDA_TITLE_WATCHDOG_KICK=<trap RVA>,<kick RVA>` | the title's hang watchdog ([above](#settings-every-platform-needs)) |
   | `LEONIDA_DEVICE_TYPE=6`, `LEONIDA_MAP_READBACK=1`, `LEONIDA_FRAME_PACING=1`, `LEONIDA_PRESENT_NO_TEAR=1` | taken over from the NVIDIA report below; their effect on AMD was not measured one by one |
   | `LEONIDA_ARENA_MB=4095`, `LEONIDA_TITLE_WINDOWS_MB=4096`, `LEONIDA_GEOMETRY_MB=6144` | room for the title's buffers in the world |
-  | `LEONIDA_CONSOLE_RELEASE_FILTER=1`, `LEONIDA_SHADOW_ALIAS_MS=5000`, `LEONIDA_CONSOLE_FIX_US=0` | carried from earlier boot runs; their effect here was not measured one by one |
+  | `LEONIDA_SHADOW_ALIAS_MS=5000`, `LEONIDA_CONSOLE_FIX_US=0` | carried from earlier boot runs; their effect here was not measured one by one |
   | `LEONIDA_DEVICE_FAULT=1` | a device-loss report if the GPU hangs |
   | `LEONIDA_KEYBOARD_PAD=always` | the keyboard as the pad |
 
@@ -113,6 +113,10 @@ Reported by others: [#1608, comment 7184700506](https://github.com/ubiquitariani
   are the report's pack; a native wave64 pack builds them in seconds each ([above](#settings-every-platform-needs)).
   Where they still take minutes, `gta6rt --precompile-pipelines --big-threads N` bounds how many build at once (each
   held about 3.5 GB of host memory on an RTX 4070 Ti) and `--skip-listed` leaves the listed ones out.
+  Between the two: `LEONIDA_ASYNC_PIPELINES=1` with `LEONIDA_ASYNC_MIN_BYTES=2097152` builds only the pipelines of
+  2 MiB of SPIR-V or more asynchronously (the ray-tracing programs above), and the smaller lighting and post programs
+  where they are needed, as with `=0` ([d3d12_vulkan.md](d3d12_vulkan.md), "Only the large ones asynchronous"). Whether
+  that draws the world without the skip list: TBD.
 - **Command:** TBD.
 - **What to expect:** the opening night street from about 650 s, at 0.1-0.2 frames/s, no device loss through 934 s.
   The black stretch before it is graphics pipelines of 1-2.6 MB SPIR-V compiling one at a time, 5-10 s each.
