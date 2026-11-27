@@ -20,9 +20,9 @@
 // cosines, without squared-length tie-break loss on thin axis-aligned strips or pre-divide overflow/distortion when w
 // differs or is large; a degenerate or w == 0 triangle takes v1), makes the fourth corner v4 = other_a + other_b -
 // corner with bit-exact selection whenever a component matches the corner (zero ULP drift on axis-aligned grid
-// coordinates and constant/flat attributes, and perspective-consistent 1/w extrapolation when w differs), and emits
-// the rectangle as two triangles with the winding of (v1, v2, v3) that both start at v1, so a flat input (taken from
-// a triangle's first vertex) is v1's over the whole rectangle:
+// coordinates and constant/flat attributes, keeping the clip-space v2 + v3 - v1 rule for both position and
+// interpolants), and emits the rectangle as two triangles with the winding of (v1, v2, v3) that both start at v1, so a
+// flat input (taken from a triangle's first vertex) is v1's over the whole rectangle:
 //   corner v1: (v1, v2, v4) (v1, v4, v3);  corner v2: (v1, v2, v3) (v1, v3, v4);  corner v3: (v1, v2, v3) (v1, v4, v2).
 // Every Location output of the vertex stage is a vec4 float in the translator's output (rdna2spirv.py),
 // and so is the stage's Position; the generated stage reads and writes exactly those.
@@ -55,9 +55,9 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
         op_entry_point = 15, op_type_void = 19, op_type_int = 21, op_type_float = 22,
         op_type_vector = 23, op_type_array = 28, op_type_pointer = 32, op_type_function = 33, op_constant = 43,
         op_type_bool = 20, op_composite_construct = 80, op_composite_extract = 81, op_bitcast = 124,
-        op_fadd = 129, op_fsub = 131, op_fmul = 133, op_fdiv = 136, op_vector_times_scalar = 142,
+        op_fadd = 129, op_fsub = 131, op_fmul = 133, op_fdiv = 136,
         op_logical_and = 167, op_logical_not = 168, op_select = 169, op_iequal = 170,
-        op_ford_greater_than = 186, op_funord_greater_than_equal = 191,
+        op_funord_greater_than_equal = 191,
         op_function = 54, op_function_end = 56, op_variable = 59, op_load = 61, op_store = 62, op_access_chain = 65,
         op_decorate = 71, op_emit_vertex = 218, op_end_primitive = 219, op_label = 248, op_return = 253,
         op_capability = 17, op_memory_model = 14, op_execution_mode = 16,
@@ -135,7 +135,7 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
     const std::uint32_t t_void = id(), t_fn = id(), t_uint = id(), t_float = id(), t_v4 = id(),
                         t_uv4 = id(), t_bool = id(), t_bv4 = id(),
                         c3 = id(), t_arr = id(), t_pin_arr = id(), t_pin_v4 = id(),
-                        t_pout_v4 = id(), c0 = id(), c1 = id(), c2 = id(), cf0 = id(), cf1 = id();
+                        t_pout_v4 = id(), c0 = id(), c1 = id(), c2 = id();
     emit(globals, op_type_void, {t_void});
     emit(globals, op_type_function, {t_fn, t_void});
     emit(globals, op_type_int, {t_uint, 32, 0});
@@ -148,8 +148,6 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
     emit(globals, op_constant, {t_uint, c0, 0});
     emit(globals, op_constant, {t_uint, c1, 1});
     emit(globals, op_constant, {t_uint, c2, 2});
-    emit(globals, op_constant, {t_float, cf0, 0x00000000u});  // 0.0f
-    emit(globals, op_constant, {t_float, cf1, 0x3f800000u});  // 1.0f
     emit(globals, op_type_array, {t_arr, t_v4, c3});
     emit(globals, op_type_pointer, {t_pin_arr, storage_input, t_arr});
     emit(globals, op_type_pointer, {t_pin_v4, storage_input, t_v4});
@@ -221,15 +219,11 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
         return r;
     };
     const std::uint32_t* p = corners[0].v;  // vars[0] is the Position
-    std::uint32_t pw[3], nx[3], ny[3], nz[3], inv_w[3], ndc[3];
+    std::uint32_t nx[3], ny[3];
     for (int k = 0; k < 3; ++k) {
-        pw[k] = extract(p[k], 3);
-        nx[k] = bin(op_fdiv, t_float, extract(p[k], 0), pw[k]);
-        ny[k] = bin(op_fdiv, t_float, extract(p[k], 1), pw[k]);
-        nz[k] = bin(op_fdiv, t_float, extract(p[k], 2), pw[k]);
-        inv_w[k] = bin(op_fdiv, t_float, cf1, pw[k]);
-        ndc[k] = id();
-        emit(body, op_composite_construct, {t_v4, ndc[k], nx[k], ny[k], nz[k], inv_w[k]});
+        const std::uint32_t w = extract(p[k], 3);
+        nx[k] = bin(op_fdiv, t_float, extract(p[k], 0), w);
+        ny[k] = bin(op_fdiv, t_float, extract(p[k], 1), w);
     }
     const std::uint32_t e01x = bin(op_fsub, t_float, nx[1], nx[0]), e01y = bin(op_fsub, t_float, ny[1], ny[0]);
     const std::uint32_t e12x = bin(op_fsub, t_float, nx[2], nx[1]), e12y = bin(op_fsub, t_float, ny[2], ny[1]);
@@ -248,69 +242,27 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
     const std::uint32_t at_v3 = both(not_v1, not_v2);
     const std::uint32_t c_v1 = splat(at_v1), c_v2 = splat(at_v2), c_v3 = splat(at_v3);
 
-    // Exact per-component fourth corner: when either non-corner vertex shares bits with the corner (axis-aligned grid
-    // coordinates, constant/flat attributes, packed bits), return the other vertex bit-exact; otherwise (oa + ob) - c.
-    const auto exact_fourth = [&](std::uint32_t oa, std::uint32_t ob, std::uint32_t c,
-                                  std::uint32_t* all_eq_out = nullptr) {
+    // Exact per-component fourth corner (other_a + other_b - corner): when either non-corner vertex shares bits with
+    // the corner (axis-aligned grid coordinates, constant/flat attributes, packed bits), return the other vertex
+    // bit-exact; otherwise compute (other_a + other_b) - corner.
+    const auto exact_fourth = [&](std::uint32_t oa, std::uint32_t ob, std::uint32_t c) {
         const std::uint32_t ua = id(), ub = id(), uc = id();
         emit(body, op_bitcast, {t_uv4, ua, oa});
         emit(body, op_bitcast, {t_uv4, ub, ob});
         emit(body, op_bitcast, {t_uv4, uc, c});
         const std::uint32_t a_eq_c = bin(op_iequal, t_bv4, ua, uc);
         const std::uint32_t b_eq_c = bin(op_iequal, t_bv4, ub, uc);
-        if (all_eq_out) *all_eq_out = bin(op_logical_and, t_bv4, a_eq_c, b_eq_c);
         const std::uint32_t lin = bin(op_fsub, t_v4, bin(op_fadd, t_v4, oa, ob), c);
         return pick(a_eq_c, ob, pick(b_eq_c, oa, lin));
     };
 
-    // Detect uniform w by bit equality: common rects (w == 1, w == 2, large constant w) stay in clip space with zero
-    // divide/remultiply rounding; differing w extrapolates the 4th corner in NDC and 1/w for single-plane perspective.
-    std::uint32_t uw[3];
-    for (int k = 0; k < 3; ++k) {
-        uw[k] = id();
-        emit(body, op_bitcast, {t_uint, uw[k], pw[k]});
-    }
-    const std::uint32_t same_w = both(bin(op_iequal, t_bool, uw[0], uw[1]), bin(op_iequal, t_bool, uw[0], uw[2]));
-    const std::uint32_t same_w_v4 = splat(same_w);
-    const std::uint32_t ndc_c = pick(c_v1, ndc[0], pick(c_v2, ndc[1], ndc[2]));
-    const std::uint32_t ndc_a = pick(c_v1, ndc[1], ndc[0]);
-    const std::uint32_t ndc_b = pick(c_v3, ndc[1], ndc[2]);
-    const std::uint32_t ndc4 = exact_fourth(ndc_a, ndc_b, ndc_c);
-    const std::uint32_t inv_w4 = extract(ndc4, 3);
-    const std::uint32_t valid_inv_w4 = bin(op_ford_greater_than, t_bool, inv_w4, cf0);
-    const std::uint32_t safe_inv_w4 = id();
-    emit(body, op_select, {t_float, safe_inv_w4, valid_inv_w4, inv_w4, cf1});
-    const std::uint32_t w4 = bin(op_fdiv, t_float, cf1, safe_inv_w4);
-    const std::uint32_t inv_wc = extract(ndc_c, 3), inv_wa = extract(ndc_a, 3), inv_wb = extract(ndc_b, 3);
-    const std::uint32_t not_same_w = id();
-    emit(body, op_logical_not, {t_bool, not_same_w, same_w});
-    const std::uint32_t use_persp_v4 = splat(both(not_same_w, valid_inv_w4));
-
-    // Per variable: the fourth corner and the six vertices of the two triangles.
+    // Per variable: the fourth corner, other_a + other_b - corner, and the six vertices of the two triangles.
     std::vector<std::array<std::uint32_t, 6>> emitted;
-    for (std::size_t vi = 0; vi < corners.size(); ++vi) {
-        const Corners& c = corners[vi];
+    for (const Corners& c : corners) {
         const std::uint32_t corner = pick(c_v1, c.v[0], pick(c_v2, c.v[1], c.v[2]));
         const std::uint32_t other_a = pick(c_v1, c.v[1], c.v[0]);
         const std::uint32_t other_b = pick(c_v3, c.v[1], c.v[2]);
-        std::uint32_t fourth = 0;
-        if (vi == 0) {
-            const std::uint32_t p4_same = exact_fourth(other_a, other_b, corner);
-            const std::uint32_t n4_unit = id();
-            emit(body, op_composite_construct, {t_v4, n4_unit, extract(ndc4, 0), extract(ndc4, 1), extract(ndc4, 2), cf1});
-            const std::uint32_t p4_diff = bin(op_vector_times_scalar, t_v4, n4_unit, w4);
-            fourth = pick(same_w_v4, p4_same, p4_diff);
-        } else {
-            std::uint32_t all_eq = 0;
-            const std::uint32_t v4_lin = exact_fourth(other_a, other_b, corner, &all_eq);
-            const std::uint32_t va_w = bin(op_vector_times_scalar, t_v4, other_a, inv_wa);
-            const std::uint32_t vb_w = bin(op_vector_times_scalar, t_v4, other_b, inv_wb);
-            const std::uint32_t vc_w = bin(op_vector_times_scalar, t_v4, corner, inv_wc);
-            const std::uint32_t v4_persp_raw =
-                bin(op_vector_times_scalar, t_v4, bin(op_fsub, t_v4, bin(op_fadd, t_v4, va_w, vb_w), vc_w), w4);
-            const std::uint32_t v4_persp = pick(all_eq, corner, v4_persp_raw);
-            fourth = pick(use_persp_v4, v4_persp, v4_lin);
-        }
+        const std::uint32_t fourth = exact_fourth(other_a, other_b, corner);
         emitted.push_back({c.v[0], c.v[1], pick(c_v1, fourth, c.v[2]),
                            c.v[0], pick(c_v2, c.v[2], fourth), pick(c_v1, c.v[2], pick(c_v2, fourth, c.v[1]))});
     }

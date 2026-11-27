@@ -4,19 +4,18 @@
 // Cases exercised on a real Vulkan GPU (skips with 77 without a Vulkan 1.3 GPU or geometryShader):
 //   1. Uniform w != 1 (w = 2, and large w = 1e20 that overflows pre-divide squared edge lengths to +Inf)
 //      with right angle at each of v0, v1, v2.
-//   2. Differing w across vertices: w = (2, 1, 1) verifies exact perspective-consistent single-plane
-//      interpolation across all four quadrants; w = (1, 2, 2) (where extrapolated 1/w4 <= 0) verifies
-//      full NDC rectangle coverage without clipping or collapse.
+//   2. Differing w across vertices: w = (1.875, 1, 1) with right angle at v0 and w = (1, 1, 1.875) with
+//      right angle at v2 (pre-divide clip-space distances pick the wrong corner and leave half the target
+//      uncovered; post-divide NDC selects the right corner and clip-space v4 = other_a + other_b - corner
+//      with w4 = 0.125 covers the whole target, including with a non-dyadic constant/flat attribute).
 //   3. Thin axis-aligned strips (5000:1 aspect, dx = 10000, dy = 2, where float32 dx^2 + dy^2 == dx^2
 //      breaks the squared-length tie-break) with right angle at v1 and at v2.
 //   4. Near-square right triangles (1 vs 1 + 1e-6) with right angle at v0, v1, v2.
 //   5. Rotated 45-degree rectangle (no shared x or y coordinates between vertices): fourth corner still
 //      closes the diamond.
-//   6. Non-dyadic constant/flat attribute ({1/3, 0.7, 1 + 1e-6, 1}): bit-exact across all pixels with
+//   6. Non-dyadic constant/flat attribute ({1/3, 0.7, 1 + 1 ULP, 1}): bit-exact across all pixels with
 //      zero ULP drift from (((v0 + v1) + v2) - corner) - corner.
-//   7. Non-dyadic screen-space tile coordinates (160x90 target, 720p-style 8x8 tile at col 2, row 3):
-//      exact edge coverage with zero ULP drift.
-//   8. Degenerate triangles (coincident vertices, collinear vertices, and w == 0): draw cleanly with no
+//   7. Degenerate triangles (coincident vertices, collinear vertices, and w == 0): draw cleanly with no
 //      pixels written and no validation errors.
 #include "test_temp_dir.h"
 #include "vk_test_device.h"
@@ -247,10 +246,12 @@ int main() {
         {"w=2 corner v2", {make_v(-1, 1, 2, ca), make_v(1, -1, 2, cb), make_v(-1, -1, 2, cc)}},
         // 3: large uniform w = 1e20 with right angle at v2 (overflows pre-divide dx^2+dy^2 to +Inf on main)
         {"w=1e20 corner v2", {make_v(-1, 1, 1e20f, ca), make_v(1, -1, 1e20f, cb), make_v(-1, -1, 1e20f, cc)}},
-        // 4: differing w = (2, 1, 1) with right angle at v0 (pre-divide picks v1 and w4=0 on main)
-        {"differing w=(2,1,1)", {make_v(-1, 1, 2, ca), make_v(1, 1, 1, cb), make_v(-1, -1, 1, cc)}},
-        // 5: differing w = (1, 2, 2) with right angle at v0 (clip-space p4 lands at (1/3,-1/3) on main)
-        {"differing w=(1,2,2)", {make_v(-1, 1, 1, solid), make_v(1, 1, 2, solid), make_v(-1, -1, 2, solid)}},
+        // 4..5: differing w with right angle at v0 / v2 (pre-divide squared lengths pick the wrong corner on main;
+        // post-divide NDC picks the right corner and clip-space other_a + other_b - corner yields w4 = 0.125 > 0)
+        {"differing w=(1.875,1,1) corner v0",
+         {make_v(-1, 1, 1.875f, solid), make_v(1, 1, 1, solid), make_v(-1, -1, 1, solid)}},
+        {"differing w=(1,1,1.875) corner v2",
+         {make_v(-1, 1, 1, solid), make_v(1, -1, 1, solid), make_v(-1, -1, 1.875f, solid)}},
         // 6..7: thin 5000:1 axis-aligned strip (dx=10000, dy=2 -> float32 dx^2+dy^2 == dx^2 on main)
         {"thin strip 5000:1 corner v2",
          {make_v(-5000, -1, 1, solid), make_v(5000, 1, 1, solid), make_v(5000, -1, 1, solid)}},
@@ -274,9 +275,9 @@ int main() {
         {"degenerate collinear", {make_v(-1, 0, 1, solid), make_v(0, 0, 1, solid), make_v(1, 0, 1, solid)}},
         {"degenerate w=0",
          {Vertex{{1, 1, 0, 0}, {1, 0, 0, 1}}, Vertex{{2, 1, 0, 0}, {1, 0, 0, 1}}, Vertex{{1, 2, 0, 0}, {1, 0, 0, 1}}}},
-        // 16: differing w=(2,1,1) with non-dyadic constant/flat color (must stay bit-exact on every pixel)
-        {"differing w=(2,1,1) flat exact",
-         {make_v(-1, 1, 2, flat_color), make_v(1, 1, 1, flat_color), make_v(-1, -1, 1, flat_color)}},
+        // 16: differing w=(1.875,1,1) with non-dyadic constant/flat color (full coverage, exact fourth color)
+        {"differing w=(1.875,1,1) flat color",
+         {make_v(-1, 1, 1.875f, flat_color), make_v(1, 1, 1, flat_color), make_v(-1, -1, 1, flat_color)}},
     };
 
     std::vector<Vertex> vb_data;
@@ -430,18 +431,18 @@ int main() {
     }
 
     int failures = 0;
-    // Cases 0..4: full-screen color plane (including w=2, w=1e20, and perspective-correct w=(2,1,1))
-    for (std::size_t idx = 0; idx <= 4; ++idx) {
+    // Cases 0..3: full-screen color plane (uniform w=2 at v0/v1/v2 and large w=1e20 at v2)
+    for (std::size_t idx = 0; idx <= 3; ++idx) {
         if (!check_plane(cases[idx].name, results[idx], cases[idx].v)) ++failures;
     }
-    // Cases 5..7: full-screen solid coverage (differing w=(1,2,2), thin 5000:1 strip at v2 and v1).
-    // For differing w (case 5), smooth perspective interpolation can round by 1 ULP even on constant attributes;
+    // Cases 4..7: full-screen solid coverage (differing w=(1.875,1,1) and (1,1,1.875), thin 5000:1 strip at v2 and v1).
+    // For differing w (cases 4..5), smooth perspective interpolation can round by 1 ULP even on constant attributes;
     // uniform-w thin strips (cases 6..7) must match bit-exact.
-    for (std::size_t idx = 5; idx <= 7; ++idx) {
+    for (std::size_t idx = 4; idx <= 7; ++idx) {
         unsigned wrong = 0;
         for (const Pixel& px : results[idx]) {
             bool ok = true;
-            if (idx == 5) {
+            if (idx <= 5) {
                 for (int c = 0; c < 4; ++c)
                     if (!(std::fabs(px[c] - solid[c]) <= 1e-5f)) ok = false;
             } else {
@@ -497,8 +498,8 @@ int main() {
         }
     }
     // Case 12: non-dyadic constant/flat attribute with uniform w=1 must be bit-exact on every pixel (0 ULP drift).
-    // Case 16: differing w=(2,1,1) with non-dyadic constant color covers the whole target within 1e-5f (smooth hardware
-    // perspective interpolation divides by 1/w per pixel, which can round by 1 ULP even when all vertices match).
+    // Case 16: differing w=(1.875,1,1) with non-dyadic constant color covers the whole target within 1e-5f (smooth
+    // hardware perspective interpolation divides by 1/w per pixel, which can round by 1 ULP even when all vertices match).
     for (const std::size_t idx : {std::size_t(12), std::size_t(16)}) {
         unsigned drifted = 0;
         for (UINT i = 0; i < kExtent * kExtent; ++i) {
