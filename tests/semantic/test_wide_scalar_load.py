@@ -72,6 +72,30 @@ class WideScalarLoad(unittest.TestCase):
         self.assertEqual(text.count("OpLoad %v2uint_sl"), 1)
         self.assertEqual(sum("OpLoad %uint" in ln and "Aligned 4" in ln for ln in text.splitlines()), 16 + 8 + 4 + 2)
 
+    def test_a_destination_that_is_its_own_vsharp(self):
+        # cs_wide_scalar_load_overlap.asm: s_buffer_load_dwordx4 s[20:23], s[20:23] with its V# from memory, under
+        # every NUM_RECORDS from nothing to all of both buffers; the dwords out of range are 0 and not read.
+        text = support.translate_listing("cs_wide_scalar_load_overlap",
+                                         (Path(HERE) / "fixtures" / "cs_wide_scalar_load_overlap.asm").read_bytes(),
+                                         fssm=tv._fssm(10 << 1, (64, 1, 1)))
+        cb0, cb1, table = 0x4000, 0x5000, 0x6000
+
+        def cb(base, nr, off):
+            return word(base + off) if off + 4 <= nr else 0
+        for nr0 in (0, 4, 8, 12, 16, 20, 24, 0x100):
+            for nr1 in (0, 4, 8, 12, 16, 0x100):
+                with self.subTest(nr0=nr0, nr1=nr1):
+                    mem = tv.ReadLog({a: word(a) for base in (cb0, cb1) for a in range(base, base + 0x40, 4)})
+                    mem.update({table: cb1, table + 4: 0, table + 8: nr1, table + 12: 0})
+                    support.run_fragment(text, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+                                         push_constants=[OUT, 0, 0x100, OUT_V, cb0, 0, nr0, 0, table, 0] + [0] * 22,
+                                         memory=mem)
+                    self.assertEqual([dict.get(mem, OUT + 4 * i) for i in range(8)],
+                                     [cb(cb0, nr0, 0), cb(cb0, nr0, 4), cb(cb1, nr1, 0), cb(cb1, nr1, 4),
+                                      cb(cb1, nr1, 8), cb(cb1, nr1, 12), cb(cb0, nr0, 8), cb(cb0, nr0, 20)])
+                    self.assertFalse([a for a in mem.reads if (cb0 <= a < cb0 + 0x40 and a - cb0 + 4 > nr0) or
+                                      (cb1 <= a < cb1 + 0x40 and a - cb1 + 4 > nr1)])
+
 
 if __name__ == "__main__":
     unittest.main()
