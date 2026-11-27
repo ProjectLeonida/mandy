@@ -36,6 +36,8 @@ $hash = (Get-FileHash -LiteralPath $Exe -Algorithm SHA256).Hash.ToLower()
 "sha256 $hash  size $size" | Tee-Object -LiteralPath (Join-Path $out "hash.txt")
 
 Write-Host "`n== PE inspection"
+$reportPath = Join-Path $out "$([IO.Path]::GetFileName($Exe)).json"
+if (Test-Path -LiteralPath $reportPath -PathType Leaf) { Remove-Item -LiteralPath $reportPath -Force }
 python -I (Join-Path $root "tools\pe_inspect.py") $Exe --game-dir $GameDir --out $out
 if ($LASTEXITCODE -ne 0) { throw "pe_inspect failed" }
 
@@ -116,7 +118,6 @@ Write-Host "`n== Loader dry run (map, relocate, bind imports; nothing executes)"
 $dryRunExitCode = $LASTEXITCODE
 
 # Shim to-do list, grouped by DLL, most functions first.
-$reportPath = Join-Path $out "$([IO.Path]::GetFileName($Exe)).json"
 if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) { throw "pe_inspect did not write $reportPath" }
 $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
 $todo = $report.imports | Where-Object { $_.where -eq "shim" } | Sort-Object { -$_.functions.Count }

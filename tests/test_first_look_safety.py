@@ -44,6 +44,7 @@ class FirstLookSafetyTests(unittest.TestCase):
         self.assertIn("$read -ne 2", text)
         self.assertIn("$global:LASTEXITCODE = 0", text)
         self.assertIn("build_runtime.ps1 failed ($LASTEXITCODE)", text)
+        self.assertIn("Remove-Item -LiteralPath $reportPath -Force", text)
         self.assertIn("Test-Path -LiteralPath $reportPath -PathType Leaf", text)
         self.assertIn("pe_inspect did not write $reportPath", text)
 
@@ -144,11 +145,16 @@ class FirstLookSafetyTests(unittest.TestCase):
             now = time.time() + 10
             os.utime(loader, (now, now))
 
-            # 7. Missing pe_inspect JSON report fails before ConvertFrom-Json.
-            (out_dir / "game.exe.json").unlink()
+            # 7. Stale report from a prior run is cleared before pe_inspect runs, so skipping output fails.
+            (out_dir / "game.exe.json").write_text(
+                '{"imports":[{"where":"shim","dll":"stale_old.dll","functions":["Foo"]}],"sections":[]}',
+                encoding="utf-8",
+                newline="\n",
+            )
             res = run_ps("-Exe", str(exe), extra_env={"LEONIDA_SKIP_PE_REPORT": "1"})
             self.assertNotEqual(res.returncode, 0, res.stdout + res.stderr)
             self.assertIn("pe_inspect did not write", res.stdout + res.stderr)
+            self.assertNotIn("stale_old.dll", res.stdout + res.stderr)
 
 
 if __name__ == "__main__":
