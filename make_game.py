@@ -2712,10 +2712,19 @@ def runtime_exe(out: str | None = None, runtime_build: str | None = None) -> str
     return next((p for d in dirs if os.path.isfile(p := os.path.join(d, "gta6rt.exe"))), None)
 
 
-def precompile_command(exe: str, jobs: int) -> list[str]:
-    """Command line to run gta6rt --precompile-pipelines directly on Windows or under Wine elsewhere."""
-    base = [exe, "--precompile-pipelines", "--threads", str(jobs)]
-    return base if os.name == "nt" else [wine_exe(), *base]
+def precompile_command(exe: str, jobs: int, *, skip_listed: bool = False) -> list[str]:
+    """Command line to run gta6rt --precompile-pipelines directly on Windows or under Wine elsewhere.
+
+    The smallest modules go first, so a stage stopped part way has built the most entries it could (the default
+    order, the largest first, can spend hours on a few modules of several MiB). `skip_listed` leaves out what
+    LEONIDA_SKIP_COMPUTE names. On Windows the runtime watches this process (--parent) and stops with it, so a
+    stage that is closed leaves no gta6rt holding the journal; a Wine process cannot watch a host process."""
+    base = [exe, "--precompile-pipelines", "--threads", str(jobs), "--smallest-first"]
+    if skip_listed:
+        base.append("--skip-listed")
+    if os.name == "nt":
+        return [*base, "--parent", str(os.getpid())]
+    return [wine_exe(), *base]
 
 
 def precompile_env(spirv: str, out: str) -> dict[str, str]:
@@ -2752,9 +2761,10 @@ def require_translated_shaders(work: str) -> str:
 PRECOMPILE_PROGRESS_RE = re.compile(r"^\[precompile\]\s+(\d+)/(\d+)\s+")
 
 
-def read_crashed_names(cache_root: str) -> "list[str]":
-    """Entry names the runtime recorded in <cache>/pipeline_cache.d/requests/crashed.txt."""
-    path = os.path.join(cache_root, "pipeline_cache.d", "requests", "crashed.txt")
+def read_crashed_names(cache_root: str, record: str = "crashed.txt") -> "list[str]":
+    """Entry names in one of the runtime's records in <cache>/pipeline_cache.d/requests: crashed.txt (two runs died
+    building it), suspect.txt (one did) or inflight.txt (what a run that just died was building)."""
+    path = os.path.join(cache_root, "pipeline_cache.d", "requests", record)
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             # "<name> <key>" per line (runtime/src/precompile_inflight.h); the key says which build crashed.
@@ -2829,7 +2839,10 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         fail(f"gta6rt.exe was not found: {hint}")
     spirv = require_translated_shaders(work)
     threads = jobs if jobs else max(1, (os.cpu_count() or 2) // 2)
-    cmd = precompile_command(exe, threads)
+    skip_listed = bool(os.environ.get("LEONIDA_SKIP_COMPUTE", "").strip())
+    cmd = precompile_command(exe, threads, skip_listed=skip_listed)
+    if skip_listed:
+        log("pipelines: leaving out the entries LEONIDA_SKIP_COMPUTE names (--skip-listed)")
     if os.name != "nt" and cmd[0] == wine_exe() and not wine_available():
         fail(f"'{wine_exe()}' was not found: install Wine or set WINE to run gta6rt.exe in the pipelines stage.")
     os.makedirs(out, exist_ok=True)
@@ -2850,30 +2863,46 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             record_crashes(out, spirv, names)
         return names
 
+    def record_names(record: str) -> "list[str]":
+        names = read_crashed_names(cache_root, record)
+        return names or (read_crashed_names(out, record) if cache_root != out else [])
+
     progress_box: list = [None]
     code = 0
-    for attempt in range(PIPELINE_CRASH_RETRIES + 1):
+    restarts = idle_crashes = 0
+    while True:
         code = _run_precompile(cmd, env, progress_box)
-        if code == 0:
+        if _board_stopped():
+            fail("pipelines: stopped; what gta6rt was building is built again when the stage runs next")
+        kind = precompile_exit_kind(code)
+        if kind in ("ok", "failed"):
             break
-        if code == 2:
-            break
-        if code == 1:
+        if kind == "device":
             fail("pipelines: gta6rt could not open the Vulkan device or shader library (exit 1); "
                  "see the output above")
-        if code == 3:
+        if kind == "locked":
             fail("pipelines: another gta6rt --precompile-pipelines is using this pipeline journal (exit 3); "
                  "let it finish or stop it, then run the stage again")
-        if interrupted(code):
-            fail(f"pipelines: gta6rt interrupted ({exit_label(code)})")
-        if attempt < PIPELINE_CRASH_RETRIES:
-            log(f"pipelines: gta6rt crashed ({exit_label(code)}); retrying "
-                f"({attempt + 1}/{PIPELINE_CRASH_RETRIES}) so the runtime skips the in-flight entry")
-    else:
-        crashed = collect_crashes()
-        why = f"; crashed entries: {', '.join(crashed)}" if crashed else ""
-        fail(f"pipelines: gta6rt still crashed after {PIPELINE_CRASH_RETRIES} retries "
-             f"(last exit {exit_label(code)}){why}")
+        if kind == "stopped":
+            fail(f"pipelines: gta6rt was stopped ({exit_label(code)}), not a crash; nothing it was building is "
+                 "held against it, and the stage carries on from the journal when it runs again")
+        # A crash. The entries it left in flight are built once more by the next run, and held as crashed (skipped)
+        # only if that run dies on them too (runtime/src/precompile_inflight.h), so each restart moves one on.
+        building = record_names("inflight.txt")
+        idle_crashes = 0 if building else idle_crashes + 1
+        restarts += 1
+        if idle_crashes > PIPELINE_CRASH_RETRIES or restarts > PIPELINE_MAX_RESTARTS:
+            crashed = collect_crashes()
+            suspects = record_names("suspect.txt")
+            why = (f"; crashed entries: {', '.join(crashed)}" if crashed else "") + \
+                  (f"; died once building: {', '.join(building or suspects)}" if building or suspects else "")
+            fail(f"pipelines: gta6rt kept crashing (last exit {exit_label(code)}, {restarts} restarts){why}")
+        if building:
+            log(f"pipelines: gta6rt crashed ({exit_label(code)}) while the driver built {', '.join(building)}; "
+                "restarting, and an entry that takes it down a second time is skipped from then on")
+        else:
+            log(f"pipelines: gta6rt crashed ({exit_label(code)}) outside a pipeline build; restarting "
+                f"({idle_crashes}/{PIPELINE_CRASH_RETRIES})")
 
     if not collect_crashes() and code == 2:
         log("pipelines: WARNING: some compute pipelines failed to build (exit 2); see the summary above")
@@ -2905,14 +2934,37 @@ def record_crashes(out: str, spirv: str, crashed: "list[str]") -> None:
         log(f"pipelines: cannot write pipeline_crashes.json: {error.strerror or error}")
 
 
-# How many times the pipelines stage restarts gta6rt after a module takes it down; the next start moves any stale
-# in-flight entry to requests/crashed.txt and skips it.
-PIPELINE_CRASH_RETRIES = 5
+# The pipelines stage restarts gta6rt after a crash. A crash inside a pipeline build always moves on (that entry is a
+# suspect, then crashed and skipped), so only crashes outside one count against PIPELINE_CRASH_RETRIES (in a row);
+# PIPELINE_MAX_RESTARTS bounds the whole stage.
+PIPELINE_CRASH_RETRIES = 2
+PIPELINE_MAX_RESTARTS = 64
+
+# Signals that stop a process from outside (SIGHUP, SIGINT, SIGKILL, SIGTERM) rather than crash it.
+_STOP_SIGNALS = (1, 2, 9, 15)
 
 
-def interrupted(code: int) -> bool:
-    """Ctrl+C or a kill, not a crash: SIGINT/SIGTERM off Windows, STATUS_CONTROL_C_EXIT on it."""
-    return code in (-2, -15) or (code & 0xFFFFFFFF) == 0xC000013A
+def precompile_exit_kind(code: int) -> str:
+    """What a gta6rt --precompile-pipelines exit means: "ok" (0), "device" (1, no Vulkan device or library), "failed"
+    (2, some entries failed or were skipped), "locked" (3, another precompile holds the journal), "crash" or
+    "stopped". On Windows a crash is an NTSTATUS error or warning (0xC0000005, 0xC0000409, 0x80000003) other than
+    STATUS_CONTROL_C_EXIT; any other code is a TerminateProcess from outside. Off Windows, Wine passes on the low
+    byte of the NTSTATUS, so any other positive code is a crash; a stop signal is not, any other signal is."""
+    if code in (0, 1, 2, 3):
+        return {0: "ok", 1: "device", 2: "failed", 3: "locked"}[code]
+    if os.name == "nt":
+        status = code & 0xFFFFFFFF
+        return "crash" if status >= 0x80000000 and status != 0xC000013A else "stopped"
+    if code < 0:
+        return "stopped" if -code in _STOP_SIGNALS else "crash"
+    return "crash"
+
+
+def _board_stopped() -> bool:
+    """The TUI was told to stop (its board kills the live processes): the exit code that follows is not gta6rt's."""
+    board = leonida_tui.current_board()
+    stop = getattr(board, "_stop", None) if board is not None else None
+    return bool(stop is not None and stop.is_set())
 
 
 def exit_label(code: int) -> str:

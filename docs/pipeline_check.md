@@ -348,14 +348,30 @@ that size. Which threads the game creates pipelines on is not known without its 
 
 `make_game.py`'s `pipelines` stage no longer drives `vk_pipeline_check`: it runs `gta6rt.exe --precompile-pipelines`
 (directly on Windows, or under `WINE` / `wine` elsewhere) so the stage populates the runtime's own compute pipeline
-journal in `<out>/pipeline_cache.d` with matching device features and driver keys. If a driver crash kills `gta6rt`
-mid-build, `make_game.py` retries up to `PIPELINE_CRASH_RETRIES` times so the runtime can move stale entries from
-`pipeline_cache.d/requests/inflight.txt` to `requests/crashed.txt` and skip them, then writes `<out>/pipeline_crashes.json`.
-A crash is held against that module file on that device and driver: once the module is translated again or the
-driver changes, the next run builds it again, and a build that returns clears it from the list.
-`gta6rt --precompile-pipelines --all` tries every recorded entry again now. Exit 3 means another precompile holds
-the journal folder (`requests/precompile.lock`). For tests, `LEONIDA_PRECOMPILE_CRASH_TEST=<entry name>` ends the
-precompile just before that entry's pipeline create, as a driver crash there would.
+journal in `<out>/pipeline_cache.d` with matching device features and driver keys. The stage passes
+`--smallest-first`, so a stage stopped part way has built as many entries as it could (the runtime's own default, the
+largest first, can spend hours on a few modules of several MiB), and `--skip-listed` when `LEONIDA_SKIP_COMPUTE` is
+set. On Windows it also passes `--parent <its pid>`: the runtime stops when `make_game.py` ends, so a closed stage
+leaves no `gta6rt` holding the journal (a Wine process cannot watch a host process).
+
+The runtime keeps the entries inside the driver in `pipeline_cache.d/requests/inflight.txt` (`<name> <key>`, the key
+made from the module file and the driver; `runtime/src/precompile_inflight.h`). A stop the runtime is told about
+(Ctrl+C, the console closing, the parent gone) removes the file. A run killed from outside leaves it as a crash would,
+so one death proves nothing: the next run makes each entry left in flight a suspect (`requests/suspect.txt`) and builds
+it again, and only an entry left in flight a second time with the same key is held as crashed (`requests/crashed.txt`)
+and skipped. A crash is held against that module file on that device and driver: once the module is translated again
+or the driver changes, the next run builds it again, and a build that returns clears it from both lists.
+`gta6rt --precompile-pipelines --all` tries every recorded entry again now.
+
+`make_game.py` reads the exit code (`precompile_exit_kind`): 0 done, 2 some entries failed (a warning), 1 no Vulkan
+device or shader library and 3 another precompile holds `requests/precompile.lock` (both end the stage). A crash is an
+NTSTATUS error or warning on Windows other than `STATUS_CONTROL_C_EXIT`, or under Wine any other positive code (its low
+byte) or a signal other than SIGHUP/SIGINT/SIGKILL/SIGTERM; anything else is a stop, which ends the stage without a
+restart. After a crash the stage restarts `gta6rt`: a crash inside a pipeline build always moves on (suspect, then
+crashed and skipped), so only crashes outside one count against `PIPELINE_CRASH_RETRIES` in a row, and
+`PIPELINE_MAX_RESTARTS` bounds the stage. Crashed entries go to `<out>/pipeline_crashes.json` with their SPIR-V's
+SHA-256. For tests, `LEONIDA_PRECOMPILE_CRASH_TEST=<entry name>` ends the precompile just before that entry's pipeline
+create, as a driver crash there would.
 
 `vk_pipeline_check` remains a standalone diagnostic tool (and CI test binary) for corpus-wide module/pipeline checks,
 Mesa DRM-shim profiling, `--stats`, `--cache-feedback`, and `--isolate` crash bisection.

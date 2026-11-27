@@ -1,5 +1,6 @@
-// precompile_inflight.h: an entry left in flight by a run that died is known to the next run and skipped there while
-// it is the same module on the same driver; a new key (a new translation, a new driver) or --all tries it again.
+// precompile_inflight.h: an entry a dead run left inside the driver is a suspect, built again; only a second death
+// on the same module and driver holds it as crashed (a kill from outside lands on whatever was building, a driver crash
+// recurs). A stop the run is told about (abandon) leaves nothing; a new key, a returning build or --all clears it.
 // Standard library only, no GPU.
 #include "../src/precompile_inflight.h"
 
@@ -29,57 +30,78 @@ std::set<std::string> lines(const fs::path& path) {
     return out;
 }
 
-int run(const fs::path& dir) {
-    const fs::path inflight = dir / "inflight.txt", crashed = dir / "crashed.txt";
+// A run that dies with `name` (as `key`) inside the driver: its record is left as it was.
+void die_building(const fs::path& dir, const std::string& name, const std::string& key) {
+    Record r(dir, false);
+    r.begin(name, key);
+}
 
-    {   // A clean run: nothing crashed, the file lists what is being built and goes when nothing is.
+int run(const fs::path& dir) {
+    const fs::path inflight = dir / "inflight.txt", suspect = dir / "suspect.txt", crashed = dir / "crashed.txt";
+
+    {   // A clean run: the file lists what is being built and goes when nothing is.
         Record r(dir, false);
-        EXPECT(r.crashed().empty() && r.left_in_flight().empty());
+        EXPECT(r.crashed().empty() && r.suspects().empty() && r.left_in_flight().empty());
         r.begin("lib_cs_a", "k1");
         r.begin("lib_cs_b", "k2");
         EXPECT((lines(inflight) == std::set<std::string>{"lib_cs_a k1", "lib_cs_b k2"}));
         r.end("lib_cs_a");
-        EXPECT((lines(inflight) == std::set<std::string>{"lib_cs_b k2"}));
         r.end("lib_cs_b");
-        EXPECT(!fs::exists(inflight));
-        EXPECT(!fs::exists(crashed));
+        EXPECT(!fs::exists(inflight) && !fs::exists(suspect) && !fs::exists(crashed));
     }
-    {   // A run that dies inside the driver: its record is left as it was (no end()).
-        Record r(dir, false);
-        r.begin("lib_cs_big", "k7");
-        r.begin("lib_cs_other", "k8");
-        r.end("lib_cs_other");
-    }
-    {   // The next run learns which entry and key it was, moves it to crashed.txt and starts with no in-flight list.
+    // One death: a suspect, not skipped (a kill from outside looks the same).
+    die_building(dir, "lib_cs_big", "k7");
+    {
         Record r(dir, false);
         EXPECT(r.left_in_flight().size() == 1 && r.left_in_flight().at("lib_cs_big") == "k7");
-        EXPECT(r.is_crashed("lib_cs_big", "k7") && !r.is_crashed("lib_cs_other", "k8"));
-        EXPECT(!fs::exists(inflight));
-        EXPECT((lines(crashed) == std::set<std::string>{"lib_cs_big k7"}));
+        EXPECT(!r.is_crashed("lib_cs_big", "k7"));
+        EXPECT((lines(suspect) == std::set<std::string>{"lib_cs_big k7"}));
+        EXPECT(!fs::exists(crashed) && !fs::exists(inflight));
+        // The retry dies on it again: that run is what makes it a crash.
+        r.begin("lib_cs_big", "k7");
     }
-    {   // A later run still skips it while it is the same module on the same driver...
+    {   // Second death on the same module and driver: crashed, skipped from now on.
         Record r(dir, false);
-        EXPECT(r.left_in_flight().empty());
         EXPECT(r.is_crashed("lib_cs_big", "k7"));
-        // ...and tries it again once the key changes (a new translation of it, or a new driver).
-        EXPECT(!r.is_crashed("lib_cs_big", "k9"));
+        EXPECT(r.suspects().empty() && !fs::exists(suspect));
+        EXPECT((lines(crashed) == std::set<std::string>{"lib_cs_big k7"}));
+        EXPECT(!r.is_crashed("lib_cs_big", "k9"));  // a new translation or driver: tried again
     }
-    {   // A new build of it that dies again records the new key.
-        { Record r(dir, false); r.begin("lib_cs_big", "k9"); }
+    {   // A build of a new key that returns clears it.
         Record r(dir, false);
-        EXPECT(r.is_crashed("lib_cs_big", "k9") && !r.is_crashed("lib_cs_big", "k7"));
-    }
-    {   // A build of a new key that returns clears the entry from crashed.txt.
-        Record r(dir, false);
-        r.begin("lib_cs_big", "k10");
+        r.begin("lib_cs_big", "k9");
         r.end("lib_cs_big");
         EXPECT(r.crashed().empty() && !fs::exists(crashed));
-        { Record dead(dir, false); dead.begin("lib_cs_big", "k11"); }  // and dies once more for the --all case
     }
-    {   // --all: every entry is tried again, the list is cleared.
-        Record r(dir, true);
+    // Kills that land on different entries never make a crash.
+    die_building(dir, "lib_cs_one", "k1");
+    die_building(dir, "lib_cs_two", "k2");
+    {
+        Record r(dir, false);
         EXPECT(r.crashed().empty());
-        EXPECT(!fs::exists(crashed));
+        EXPECT((lines(suspect) == std::set<std::string>{"lib_cs_one k1", "lib_cs_two k2"}));
+        r.begin("lib_cs_one", "k1");
+        r.end("lib_cs_one");  // built this time: no longer a suspect
+        EXPECT((lines(suspect) == std::set<std::string>{"lib_cs_two k2"}));
+    }
+    // A suspect that dies again with a different key (it was translated again in between) is a suspect again.
+    die_building(dir, "lib_cs_two", "k3");
+    {
+        Record r(dir, false);
+        EXPECT(!r.is_crashed("lib_cs_two", "k3") && r.suspects().at("lib_cs_two") == "k3");
+    }
+    {   // abandon (Ctrl+C, the parent gone): nothing in flight is held against anything, and nothing more is written.
+        Record r(dir, true);  // --all: start with no record
+        EXPECT(r.crashed().empty() && r.suspects().empty() && !fs::exists(suspect));
+        r.begin("lib_cs_long", "k5");
+        r.abandon();
+        EXPECT(!fs::exists(inflight));
+        r.begin("lib_cs_after", "k6");  // a worker still finishing: ignored
+        EXPECT(!fs::exists(inflight));
+    }
+    {
+        Record r(dir, false);
+        EXPECT(r.left_in_flight().empty() && r.suspects().empty() && r.crashed().empty());
     }
     {   // Many threads at once: the file always holds whole lines, and nothing is left when all are done.
         Record r(dir, false);
@@ -94,7 +116,6 @@ int run(const fs::path& dir) {
             });
         for (std::thread& t : pool) t.join();
         EXPECT(!fs::exists(inflight));
-        EXPECT(r.crashed().empty());
     }
     {   // A Windows line ending in a hand-edited list is not part of the key; a line with no key matches no build.
         { std::ofstream(crashed, std::ios::binary) << "lib_cs_crlf k3\r\nlib_cs_nokey\n"; }

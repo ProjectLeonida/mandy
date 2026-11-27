@@ -33,6 +33,8 @@ struct PrecompileOptions {
     bool skip_listed = false;          // --skip-listed: leave out the entries LEONIDA_SKIP_COMPUTE names
     bool dry_run = false;              // --list: print the plan, build nothing
     bool via_helper = false;           // --via-helper: as a title does with LEONIDA_COMPILE_HELPER=1 (a test)
+    unsigned long parent_pid = 0;      // --parent: stop, without holding anything against the entries in flight,
+                                       // when that process ends (make_game's stage passes its own)
 };
 
 // gta6rt --compile-server (d3d12_compile_helper.h).

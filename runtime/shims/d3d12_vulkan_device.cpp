@@ -23529,7 +23529,30 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
     const DWORD crash_length = GetEnvironmentVariableA("LEONIDA_PRECOMPILE_CRASH_TEST", crash_buffer, sizeof crash_buffer);
     const char* crash_test = crash_length && crash_length < sizeof crash_buffer ? crash_buffer : nullptr;
     for (const auto& [name, key] : inflight.left_in_flight())
-        std::fprintf(stderr, "[precompile] %s: the last run died while the driver built it\n", name.c_str());
+        std::fprintf(stderr, "[precompile] %s: the last run ended while the driver built it; %s\n", name.c_str(),
+                     inflight.is_crashed(name, key) ? "the second time in a row, so it is held as a crash"
+                                                    : "built again (one death may be a kill from outside)");
+    // A stop that is not a crash leaves nothing held against the entries in flight: Ctrl+C or the console closing
+    // (a handler, then the default one ends the process), and the process that started this run ending (--parent).
+    // A kill from outside cannot be told apart from a crash here; precompile_inflight.h's second strike handles it.
+    static leonida::precompile_inflight::Record* stopping = nullptr;
+    stopping = &inflight;
+    SetConsoleCtrlHandler([](DWORD) -> BOOL {
+        if (stopping) stopping->abandon();
+        return FALSE;
+    }, TRUE);
+    if (options.parent_pid) {
+        const HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, options.parent_pid);
+        if (!parent) {
+            std::fprintf(stderr, "[precompile] process %lu is gone\n", options.parent_pid);
+            return 1;
+        }
+        std::thread([parent] {
+            WaitForSingleObject(parent, INFINITE);
+            if (stopping) stopping->abandon();
+            TerminateProcess(GetCurrentProcess(), 1);
+        }).detach();
+    }
     std::vector<std::string> keys;
     keys.reserve(jobs.size());
     std::size_t crashed = 0;
@@ -23542,8 +23565,8 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
             if (inflight.is_crashed(job.entry->name, key)) {
                 ++crashed;
                 crashed_bytes += job.bytes;
-                std::fprintf(stderr, "[precompile] %s: not built (a run died building this module on this driver; "
-                                     "listed in %ls, a new translation or driver or --all tries it again)\n",
+                std::fprintf(stderr, "[precompile] %s: not built (two runs in a row died building this module on this "
+                                     "driver; listed in %ls, a new translation or driver or --all tries it again)\n",
                              job.entry->name.c_str(), inflight.crashed_path().c_str());
                 continue;
             }
@@ -23628,6 +23651,7 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
                  options.skip_listed ? " (--skip-listed)" : "", not_buildable, filtered,
                  crashed ? (", " + std::to_string(crashed) + " crashed a run").c_str() : "",
                  std::chrono::duration<double>(Clock::now() - began).count());
+    stopping = nullptr;
     CloseHandle(run_lock);
     return failed || crashed ? 2 : 0;
 }
