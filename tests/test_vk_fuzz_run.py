@@ -137,7 +137,7 @@ class ProgramText(unittest.TestCase):
         self.assertFalse(R.all_skipped({"match": 1, "skip: x": 2}))
         self.assertFalse(R.all_skipped({"denormal": 1, "skip: x": 2}))
 
-    def _run_with_fake_gpu(self, tmp, outcomes, calls, run, retries=0):
+    def _run_with_fake_gpu(self, tmp, outcomes, calls, run, retries=0, translate_cmds=None, envs=None):
         """Run the real assembly/translation/GPU orchestration with synthetic child procedures."""
         if R.SHADERS not in sys.path:
             sys.path.insert(0, R.SHADERS)
@@ -148,6 +148,8 @@ class ProgramText(unittest.TestCase):
 
         def child(cmd, *, env=None, **_kwargs):
             if "--out" in cmd:
+                if translate_cmds is not None:
+                    translate_cmds.append(cmd)
                 out = Path(cmd[cmd.index("--out") + 1])
                 out.mkdir()
                 (out / "index.json").write_text(json.dumps({f"cs_vkfuzz_{i}": {} for i in range(len(outcomes))}),
@@ -157,6 +159,8 @@ class ProgramText(unittest.TestCase):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             i = int(Path(cmd[1]).stem.rsplit("_", 1)[1])
             calls.append(i)
+            if envs is not None:
+                envs.append(dict(env))
             Path(env["VKC_DUMP"]).write_bytes(bytes(128))  # fresh, complete 32-lane, one-word dump
             rc, stdout, stderr = outcomes[i]
             return subprocess.CompletedProcess(cmd, rc, stdout, stderr)
@@ -196,6 +200,72 @@ class ProgramText(unittest.TestCase):
         self.assertEqual(calls, [0, 1, 2])
         self.assertEqual(got, ["the device can't run 32-lane subgroups (8 lanes)",
                                "vk_compute_test: unsupported: no matching device", [0]])
+
+    def test_pc_tail_ubo_env_passes_the_flag_and_propagates_to_vk_compute_test(self):
+        outcomes = [(0, "compute subgroup size: 32\n", "")]
+        with tempfile.TemporaryDirectory() as tmp:
+            translate_cmds, envs = [], []
+            with mock.patch.dict(os.environ, {"LEONIDA_PC_TAIL_UBO": "yes"}):
+                got = self._run_with_fake_gpu(
+                    tmp, outcomes, [], translate_cmds=translate_cmds, envs=envs,
+                    run=lambda folder, retries: R.run_programs([["v_mov_b32 v8, 0"]], words=1, wave=32,
+                                                               build=folder, work_parent=folder, retries=retries))
+            self.assertEqual(got, [[0]])
+            self.assertEqual(len(translate_cmds), 1)
+            self.assertIn("--pc-tail-ubo", translate_cmds[0])
+            # vk_compute_test reads the same variable for its own push-constant range.
+            self.assertEqual(envs[0].get("LEONIDA_PC_TAIL_UBO"), "yes")
+            # The unset case passes no flag.
+            with tempfile.TemporaryDirectory() as tmp2:
+                translate_cmds2 = []
+                with mock.patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("LEONIDA_PC_TAIL_UBO", None)
+                    got2 = self._run_with_fake_gpu(
+                        tmp2, outcomes, [], translate_cmds=translate_cmds2,
+                        run=lambda folder, retries: R.run_programs([["v_mov_b32 v8, 0"]], words=1, wave=32,
+                                                                   build=folder, work_parent=folder,
+                                                                   retries=retries))
+                self.assertEqual(got2, [[0]])
+                self.assertNotIn("--pc-tail-ubo", translate_cmds2[0])
+
+    def test_skip_crash_records_a_crash_as_a_skip_but_keeps_harness_errors_fatal(self):
+        crash = (3221225477, "", "")          # 0xC0000005-style driver crash exit
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"VK_FUZZ_SKIP_CRASH": "1"}):
+                calls = []
+                got = self._run_with_fake_gpu(
+                    tmp, [crash], calls,
+                    lambda folder, retries: R.run_programs([["v_mov_b32 v8, 0"]], words=1, wave=32,
+                                                           build=folder, work_parent=folder, retries=retries))
+            self.assertEqual(got, ["vk_compute_test: crashed (exit 3221225477)"])
+            self.assertEqual(calls, [0])     # the retries are spent first, then it is skipped
+        # A signal death is a negative subprocess returncode on POSIX; it is a crash skip too.
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"VK_FUZZ_SKIP_CRASH": "1"}):
+                got = self._run_with_fake_gpu(
+                    tmp, [(-11, "", "")], [],
+                    lambda folder, retries: R.run_programs([["v_mov_b32 v8, 0"]], words=1, wave=32,
+                                                           build=folder, work_parent=folder, retries=retries))
+            self.assertEqual(got, ["vk_compute_test: crashed (exit -11)"])
+        # Both harness errors stay fatal under VK_FUZZ_SKIP_CRASH: 1 is a CHECK failure, 2 a usage error.
+        for fatal in ((1, "", "FAILED vkCreateShaderModule"), (2, "", "usage: ...")):
+            with self.subTest(exit=fatal[0]), tempfile.TemporaryDirectory() as tmp:
+                with mock.patch.dict(os.environ, {"VK_FUZZ_SKIP_CRASH": "1"}):
+                    with self.assertRaisesRegex(RuntimeError, rf"vk_compute_test exit {fatal[0]}"):
+                        self._run_with_fake_gpu(
+                            tmp, [fatal], [],
+                            lambda folder, retries: R.run_programs([["v_mov_b32 v8, 0"]], words=1, wave=32,
+                                                                   build=folder, work_parent=folder,
+                                                                   retries=retries))
+        # And without the variable a crash is still fatal.
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ):
+                os.environ.pop("VK_FUZZ_SKIP_CRASH", None)
+                with self.assertRaisesRegex(RuntimeError, r"vk_compute_test exit 3221225477"):
+                    self._run_with_fake_gpu(
+                        tmp, [crash], [],
+                        lambda folder, retries: R.run_programs([["v_mov_b32 v8, 0"]], words=1, wave=32,
+                                                               build=folder, work_parent=folder, retries=retries))
 
 
 class Guard(unittest.TestCase):

@@ -15,6 +15,11 @@ words * 4 through the V# in s[0:3]. The result list has, per program, a list of 
 there is no result (llvm-mc rejected it, the translator refused it, the device cannot run it, the lanes disagree).
 wave64_text() rewrites the wave32 spellings of lane masks (vcc_lo, s20, s21) as the 64-bit ones.
 
+LEONIDA_PC_TAIL_UBO=1 translates with rdna2spirv.py --pc-tail-ubo and passes the same variable to vk_compute_test
+for 128-byte push-constant devices. VK_FUZZ_SKIP_CRASH=1 records any vk_compute_test exit other than 0, 1, 2 or 77
+as a skip, including signal deaths (which Python reports as negative return codes); exits 1 and 2 stay fatal because
+they are harness/check failures, not driver crashes.
+
 opaque=True (the default of run_programs) keeps the driver from folding the program: a `v_mov_b32 vN, K` seed becomes
 `v_xor_b32 vN, K ^ FILL, vF`, where vF is read from the output buffer, which vk_compute_test fills with 0xEEEEEEEE.
 The program computes the same values at run time, but a compiler that sees literal operands folds them itself, and
@@ -136,7 +141,12 @@ def run_programs(texts, words=4, wave=32, build=None, work_parent=None, retries=
                 f.write(compute_header(path))
             names.append(name)
             results.append(None)
-        subprocess.run([sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), disasm, "--out", spirv],
+        # LEONIDA_PC_TAIL_UBO=1 (the convention the other fuzzers' --pc-tail-ubo flag sets): translate with
+        # rdna2spirv.py --pc-tail-ubo so the modules fit a device's 128-byte push-constant range; vk_compute_test
+        # reads the same variable for its own range.
+        pc_tail = ["--pc-tail-ubo"] if (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in (
+            "1", "true", "yes", "on") else []
+        subprocess.run([sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), disasm, "--out", spirv] + pc_tail,
                        capture_output=True, text=True)
         index = {}
         index_path = os.path.join(spirv, "index.json")
@@ -164,6 +174,13 @@ def run_programs(texts, words=4, wave=32, build=None, work_parent=None, retries=
                 if r.returncode in (0, 77):
                     break
             msg = (r.stdout + r.stderr).strip()
+            # VK_FUZZ_SKIP_CRASH=1: a vk_compute_test that dies (the AMD Windows shader compiler's access
+            # violation, exit 3221225477, or any other crash code) is recorded as a skip instead of aborting the
+            # whole batch — the crash is a driver/harness finding, not a result for this program.
+            skip_crash = (os.environ.get("VK_FUZZ_SKIP_CRASH") or "").strip().lower() in ("1", "true", "yes", "on")
+            if r.returncode not in (0, 77) and skip_crash and r.returncode not in (1, 2):
+                results[i] = f"vk_compute_test: crashed (exit {r.returncode})"
+                continue
             if r.returncode not in (0, 77):
                 detail = f": {msg[-400:]}" if msg else ""
                 raise RuntimeError(f"{name}: vk_compute_test exit {r.returncode}{detail}")
