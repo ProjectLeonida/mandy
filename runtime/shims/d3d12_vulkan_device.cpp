@@ -1633,6 +1633,18 @@ struct TitleTextureCells {
         leonida::geometry_writes::take_written(queue, out, overflow);
     }
     void hot_tiles(std::vector<std::uintptr_t>& out) { leonida::geometry_writes::hot_tiles(out); }
+    bool has_written() const { return queue.pending.load(std::memory_order_acquire); }
+    std::size_t hot_count() const {
+        return leonida::geometry_writes::state().hot_count.load(std::memory_order_acquire);
+    }
+    std::uint64_t hot_generation() const {
+        auto& s = leonida::geometry_writes::state();
+        if constexpr (requires { s.hot_generation; }) {
+            return s.hot_generation.load(std::memory_order_acquire);
+        } else {
+            return static_cast<std::uint64_t>(s.hot_count.load(std::memory_order_acquire));
+        }
+    }
     bool enabled() const { return watch_shadow_writes(); }
 };
 
@@ -3102,6 +3114,9 @@ struct DeviceState {
     TitleTextureCells texture_cells;
     leonida::TitleTextureWatch<TitleTextureCells> texture_watch{texture_cells};
     void index_texture(const TitleTexture& t);
+    bool page_mirror_texture_chunk(std::uint64_t cpu, std::uint64_t gpu, std::uint64_t bytes, VkBuffer& buffer,
+                                   VkDeviceSize& offset, VkDeviceSize& chunk_size, VkSemaphore& timeline,
+                                   std::uint64_t& value);
     // The CPU-view ranges of the registered GPU-written textures (render targets, depth, unordered access), by their
     // registry address. A texture over such memory is not filled from it (index_texture): the title's pages there
     // hold what the CPU last put there, never what our GPU renders into the image, and a fill uploaded those old
@@ -15738,7 +15753,21 @@ struct TitleTexture {
     std::uint64_t hash = 0;                 // hash_guarded (every byte) of the bytes the image was last filled from
     leonida::TilePieces pieces;             // and of its part in each 64 KiB tile (the refresh's reads)
     bool hashed = false;
+    bool write_combined = false;            // cached PAGE_WRITECOMBINE from VirtualQuery; invalidated on remap
+    bool write_combined_known = false;
+    bool gpu_uploaded = false;              // last upload came directly from TitleMirror (Stage 3b GPU detile/copy)
     std::uint64_t fills = 0;
+
+    bool is_write_combined() {
+        if (!write_combined_known) {
+            MEMORY_BASIC_INFORMATION region{};
+            write_combined = VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cpu)), &region,
+                                          sizeof(region)) &&
+                             (region.Protect & PAGE_WRITECOMBINE) != 0;
+            write_combined_known = true;
+        }
+        return write_combined;
+    }
 };
 
 // The layout of a slot-133 texture as the title's own XG computer for its shape says (title_xg_layouts): how the title
@@ -15813,12 +15842,70 @@ void DeviceState::index_texture(const TitleTexture& t) {
     }
 }
 
+bool DeviceState::page_mirror_texture_chunk(std::uint64_t cpu, std::uint64_t gpu, std::uint64_t bytes,
+                                            VkBuffer& buffer, VkDeviceSize& offset, VkDeviceSize& chunk_size,
+                                            VkSemaphore& timeline, std::uint64_t& value) {
+    if (!page_mirror.mirror || !bytes) return false;
+    // Lock order: title_texture_mutex -> page_mirror.mutex (acyclic: nothing under page_mirror.mutex ever takes
+    // title_texture_mutex). Called AFTER watch.examine() has re-armed the texture's tiles:
+    //   - If xmem fed any physical-page remap between refresh_page_mirror() (T0) and now (T2), drain and flush the
+    //     mirror first so sparse chunk bindings and `page_mirror.value` include the remap.
+    //   - For any page of the texture where !tracking->unwritten(p) (a T1 CPU write, hot page, or write-watched page),
+    //     sync that page into its TitleMirror home now so GPU detile/copy never sees stale pre-T1 bytes.
+    bool feed_pending = false;
+    {
+        AcquireSRWLockShared(&page_mirror.feed_lock);
+        feed_pending = !page_mirror.feed.empty();
+        ReleaseSRWLockShared(&page_mirror.feed_lock);
+    }
+    if (feed_pending) {
+        refresh_page_mirror();
+        flush_page_mirror();
+    }
+    std::lock_guard lock(page_mirror.mutex);
+    constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
+    const auto check_va = [&](std::uint64_t va) -> bool {
+        if (!va || va + bytes < va) return false;
+        VkBuffer buf = VK_NULL_HANDLE;
+        VkDeviceSize off = 0;
+        if (!page_mirror.mirror->chunk_at(va, buf, off)) return false;
+        if (bytes > leonida::TitleMirror::kChunk - off) return false;
+        const std::uint64_t end = va + bytes;
+        for (std::uint64_t p = va & ~(kPage - 1); p < end; p += kPage) {
+            if (!page_mirror.mirror->mirrored(p) || page_mirror.mirror->has_pending(p)) return false;
+            if (p > UINT64_MAX - kPage) break;
+        }
+        bool need_upload = false;
+        for (std::uint64_t p = va & ~(kPage - 1); p < end; p += kPage) {
+            if (!page_mirror.tracking || !page_mirror.tracking->unwritten(p)) {
+                if (page_mirror.mirror->dirty(p)) {
+                    need_upload = true;
+                    if (page_mirror.readback_in_flight)
+                        if (std::uint8_t* f = page_mirror.mirror->frame_at(p)) page_mirror.readback_invalidated.insert(f);
+                }
+            }
+            if (p > UINT64_MAX - kPage) break;
+        }
+        if (need_upload) page_mirror.uploads += page_mirror.mirror->upload();
+        buffer = buf;
+        offset = off;
+        chunk_size = leonida::TitleMirror::kChunk;
+        timeline = page_mirror.timeline;
+        value = page_mirror.value;
+        return true;
+    };
+    if (check_va(cpu)) return true;
+    if (gpu && gpu != cpu && check_va(gpu)) return true;
+    return false;
+}
+
 void DeviceState::title_texture_mapped(const void* resource, std::uint64_t address) {
     std::lock_guard lock(title_texture_mutex);
     const auto it = title_textures.find(address);
     if (it == title_textures.end() || it->second->resource != resource) return;
     TitleTexture& t = *it->second;
     t.mapped = true;
+    t.write_combined_known = false;
     t.memory.retry();
     index_texture(t);  // watched from now on, and looked at by the next refresh
     // The title computes the layout of what it writes right before it maps: take it when no view gave one.
@@ -15855,6 +15942,7 @@ void DeviceState::title_texture_unmapped(const void* resource, std::uint64_t add
     const auto it = title_textures.find(address);
     if (it != title_textures.end() && it->second->resource == resource) {
         it->second->stale = true;
+        it->second->write_combined_known = false;
         it->second->memory.retry();
         index_texture(*it->second);
         texture_watch.touch(address);
@@ -18075,14 +18163,34 @@ public:
         if (t_in_title_textures) return;
         using clock = std::chrono::steady_clock;
         const auto now = clock::now();
+        const std::int64_t now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+        // O(1) lock-free dirty fast-path: return immediately without locking title_texture_mutex or scanning when
+        // nothing changed since the last pass, no retired textures are due, and the 10-second log is not due.
+        {
+            const std::int64_t due_retire = retired_earliest_ns_.load(std::memory_order_acquire);
+            const std::int64_t last_log = title_last_log_ns_.load(std::memory_order_acquire);
+            const bool log_due = (now_ns - last_log) >= 10'000'000'000ll;
+            if (!log_due && (due_retire == 0 || now_ns < due_retire) && !state_.texture_watch.may_have_work() &&
+                !leonida::title_texel_writes::state().pending.load(std::memory_order_acquire) &&
+                leonida::title_memory_map::generation() ==
+                    title_map_generation_atomic_.load(std::memory_order_acquire) &&
+                !state_.titles_named_pending.load(std::memory_order_acquire) &&
+                !state_.titles_gone_pending.load(std::memory_order_acquire)) {
+                title_fast_passes_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
         // Waits for a slot-70 view that is filling a texture: skipping would leave this submission a write behind.
         // No deadlock: before_execute holds no lock, and the registry's holders never wait for this thread.
         std::unique_lock lock(state_.title_texture_mutex);
         std::optional<InTitleTextures> inside(std::in_place);
         TitleTextureStats& stats = title_stats_;
         auto& watch = state_.texture_watch;
-        ++stats.passes;
-        ++title_split_passes_;
+        const std::uint64_t fast_skips = title_fast_passes_.exchange(0, std::memory_order_relaxed);
+        stats.fast_passes += fast_skips;
+        stats.passes += fast_skips + 1;
+        title_split_passes_ += fast_skips + 1;
         title_pass_ = true;
         // A fill this pass makes can retire an image (title_texture_gone while this thread holds the registry): the
         // entry stops naming the resource and is erased by drain_titles_gone after the pass. Entries are looked up by
@@ -18096,12 +18204,17 @@ public:
             title_map_generation_, map_now, 0, UINTPTR_MAX,
             [&](std::uintptr_t from, std::uintptr_t to) { title_map_changes_.emplace_back(from, to); });
         title_map_generation_ = map_now;
+        title_map_generation_atomic_.store(map_now, std::memory_order_release);
         stats.map_ranges += title_map_changes_.size();
         stats.map_all += map_all;
-        // A mapping change: the textures over it probe their memory again (TextureReadability) and are looked at.
+        // A mapping change: the textures over it probe their memory again (TextureReadability) and invalidate cached
+        // write_combined status.
         const auto remapped = [&](std::uint64_t key) {
             const auto it = state_.title_textures.find(key);
-            if (it != state_.title_textures.end()) it->second->memory.retry();
+            if (it != state_.title_textures.end()) {
+                it->second->memory.retry();
+                it->second->write_combined_known = false;
+            }
         };
         if (map_all || overflow) {
             watch.for_each_over(0, UINTPTR_MAX, remapped);
@@ -18120,7 +18233,7 @@ public:
         if (state_.titles_named_pending.load(std::memory_order_acquire)) {
             std::vector<std::uint64_t> named;
             {
-                std::lock_guard lock(state_.titles_named_mutex);
+                std::lock_guard named_lock(state_.titles_named_mutex);
                 named.swap(state_.titles_named);
                 state_.titles_named_pending.store(false, std::memory_order_relaxed);
             }
@@ -18144,10 +18257,12 @@ public:
             if ((t.stale || !t.hashed) && t.resource && (!t.memory.pending() || t.mapped))
                 watch.note_changed(t.cpu, t.cpu + t.layout.layout.size);
         };
-        // The textures named are read and detiled by several threads (TitleReadPool) in batches, and their transfers
-        // recorded and submitted here, one by one in key order, before this submission: the reads of different
-        // textures are independent, the submissions are what the ordering needs. Everything under the registry lock,
-        // which the pass holds throughout.
+        // Stage 3a + Stage 3b batch execution:
+        //   1. Hash-before-reserve for ALL CPU-checked textures (including tiles == 1) on TitleReadPool.
+        //   2. Only reserve staging slots & detile on CPU for CPU jobs whose bytes actually changed.
+        //   3. Mirrored textures eligible for Stage 3b (linear direct copy or GPU compute detile from TitleMirror)
+        //      bypass CPU whole-reads, CPU detiling, and host staging completely.
+        //   4. Record and submit all uploads of the batch in ONE batched command buffer + ONE vkQueueSubmit.
         std::uint64_t filled = 0;
         title_jobs_.clear();
         std::uint64_t batch_bytes = 0;
@@ -18157,12 +18272,26 @@ public:
             if (title_jobs_.empty()) return;
             const auto read_start = clock::now();
             TitleReadPool& pool = title_read_pool();
-            pool.run(title_jobs_.size(), [this](std::size_t i) { read_title_job(title_jobs_[i]); });
-            // Whole reads in pieces of up to kTitleChunkTiles tiles, spread over the threads.
+            bool any_cpu_check = false;
+            for (const TitleJob& job : title_jobs_) {
+                if (!job.gpu_mirror || job.compare) {
+                    any_cpu_check = true;
+                    break;
+                }
+            }
+            if (any_cpu_check) {
+                pool.run(title_jobs_.size(), [this](std::size_t i) { read_title_job(title_jobs_[i]); });
+            }
+            // Whole CPU reads in pieces of up to kTitleChunkTiles tiles, spread over the threads (never for GPU-mirror
+            // jobs or jobs already copied/found unchanged in read_title_job).
             title_chunks_.clear();
             for (std::size_t i = 0; i < title_jobs_.size(); ++i) {
                 TitleJob& job = title_jobs_[i];
-                if (!job.whole) continue;
+                if (!job.whole || job.gpu_mirror) continue;
+                if (job.precopied) {
+                    stats.read_bytes += job.span;
+                    continue;
+                }
                 job.tiled.resize(std::size_t(job.span));
                 job.pieces.reset(job.entry->cpu, job.span);
                 job.failed.store(false, std::memory_order_relaxed);
@@ -18171,18 +18300,64 @@ public:
                     title_chunks_.push_back({i, first, std::min(tiles, first + kTitleChunkTiles)});
                 stats.read_bytes += job.span;
             }
-            pool.run(title_chunks_.size(), [this](std::size_t c) {
-                const TitleChunk& chunk = title_chunks_[c];
-                read_title_chunk(title_jobs_[chunk.job], chunk.first, chunk.end);
-            });
-            pool.run(title_jobs_.size(), [this](std::size_t i) { finish_title_job(title_jobs_[i]); });
+            if (!title_chunks_.empty()) {
+                pool.run(title_chunks_.size(), [this](std::size_t c) {
+                    const TitleChunk& chunk = title_chunks_[c];
+                    read_title_chunk(title_jobs_[chunk.job], chunk.first, chunk.end);
+                });
+            }
+            // Finalize hashes on CPU jobs BEFORE reserving any upload slots.
+            if (any_cpu_check) {
+                pool.run(title_jobs_.size(), [this](std::size_t i) { hash_title_job(title_jobs_[i]); });
+            }
+            // Reserve staging slots ONLY for CPU jobs whose bytes actually changed (eliminating >87% wasted reserves).
+            title_detile_indices_.clear();
+            {
+                std::lock_guard upload(state_.title_upload_mutex);
+                for (std::size_t i = 0; i < title_jobs_.size(); ++i) {
+                    TitleJob& job = title_jobs_[i];
+                    if (job.gpu_mirror || !job.copied || job.unchanged) continue;
+                    job.slot = state_.title_upload.reserve(state_, job.resource->title_binding(), job.entry->layout);
+                    if (job.slot) title_detile_indices_.push_back(i);
+                }
+            }
+            if (!title_detile_indices_.empty()) {
+                pool.run(title_detile_indices_.size(),
+                         [this](std::size_t k) { detile_title_job(title_jobs_[title_detile_indices_[k]]); });
+            }
             stats.read_ns += std::uint64_t(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - read_start).count());
             for (const TitleJob& job : title_jobs_) stats.detile_ns += job.detile_ns;
-            for (TitleJob& job : title_jobs_) {
+
+            // Build one batch of all changed CPU slots + GPU-mirror direct/detile uploads and commit in one submit.
+            title_batch_items_.clear();
+            title_batch_job_indices_.clear();
+            for (std::size_t i = 0; i < title_jobs_.size(); ++i) {
+                TitleJob& job = title_jobs_[i];
                 TitleTexture& t = *job.entry;
+                if (job.gpu_mirror) {
+                    if (job.unchanged) {
+                        ++stats.unchanged_parts;
+                        t.stale = false;
+                        continue;
+                    }
+                    rt::d3d12::TitleImageUpload::BatchItem item{};
+                    item.kind = job.gpu_kind;
+                    item.id = job.resource->id();
+                    item.image = job.resource->title_binding();
+                    item.layout = &t.layout;
+                    item.unsafe_undefined = !t.owned && !t.fills;
+                    item.mirror_buffer = job.mirror_buffer;
+                    item.mirror_offset = job.mirror_offset;
+                    item.mirror_chunk_size = job.mirror_chunk_size;
+                    item.mirror_timeline = job.mirror_timeline;
+                    item.mirror_value = job.mirror_value;
+                    title_batch_items_.push_back(item);
+                    title_batch_job_indices_.push_back(i);
+                    continue;
+                }
                 if (!job.copied) {  // the section changed after VirtualQuery: keep the last upload and retry
-                    rt::d3d12::TitleImageUpload::unreserve(*job.slot);
+                    if (job.slot) rt::d3d12::TitleImageUpload::unreserve(*job.slot);
                     t.memory.defer();
                     t.stale = true;
                     not_filled(t);
@@ -18193,45 +18368,87 @@ public:
                     t.pieces = std::move(job.pieces);
                 }
                 if (job.unchanged) {
-                    rt::d3d12::TitleImageUpload::unreserve(*job.slot);
+                    if (job.slot) rt::d3d12::TitleImageUpload::unreserve(*job.slot);
                     ++(job.whole ? stats.unchanged : stats.unchanged_parts);
                     t.stale = false;
                     continue;
                 }
-                bool ok = false;
-                {
-                    const auto start = clock::now();
-                    std::lock_guard upload(state_.title_upload_mutex);
-                    ok = state_.title_upload.commit(state_, job.resource->id(), job.resource->title_binding(),
-                                                    t.layout, *job.slot);
-                    stats.staged_ns +=
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
-                }
-                if (!ok) {
+                if (!job.slot) {
                     log_once("staged title texture upload failed, format", int(job.resource->format()));
                     ++stats.fill_failures;
                     t.stale = true;
                     not_filled(t);
                     continue;
                 }
-                ++stats.staged_fills;
-                if (job.trace)
-                    std::fprintf(stderr, "[rt] ds-pool-fill cpu=%llx size=%llu staged=1 nonzero=%d\n",
-                                 static_cast<unsigned long long>(t.cpu), static_cast<unsigned long long>(job.span),
-                                 int(job.nonzero));
-                if (t.owned && !t.fills) job.resource->publish_streamed_texture();
-                t.hash = job.hash;
-                t.hashed = true;
-                t.stale = false;
-                ++t.fills;
-                ++stats.fills;
-                ++stats.changed;
-                stats.fill_bytes += job.span;
-                filled += job.span;
+                rt::d3d12::TitleImageUpload::BatchItem item{};
+                item.kind = rt::d3d12::TitleImageUpload::UploadKind::cpu_slot;
+                item.id = job.resource->id();
+                item.image = job.resource->title_binding();
+                item.layout = &t.layout;
+                item.unsafe_undefined = !t.owned && !t.fills;
+                item.slot = job.slot;
+                title_batch_items_.push_back(item);
+                title_batch_job_indices_.push_back(i);
+            }
+
+            if (!title_batch_items_.empty()) {
+                const auto start = clock::now();
+                {
+                    std::lock_guard upload(state_.title_upload_mutex);
+                    state_.title_upload.commit_batch(state_, title_batch_items_);
+                }
+                stats.staged_ns +=
+                    std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count());
+
+                for (std::size_t b = 0; b < title_batch_items_.size(); ++b) {
+                    const auto& item = title_batch_items_[b];
+                    TitleJob& job = title_jobs_[title_batch_job_indices_[b]];
+                    TitleTexture& t = *job.entry;
+                    if (!item.ok) {
+                        log_once("staged title texture upload failed, format", int(job.resource->format()));
+                        ++stats.fill_failures;
+                        t.stale = true;
+                        not_filled(t);
+                        continue;
+                    }
+                    if (job.gpu_mirror) {
+                        if (job.gpu_kind == rt::d3d12::TitleImageUpload::UploadKind::mirror_linear)
+                            ++stats.gpu_linear_fills;
+                        else
+                            ++stats.gpu_detile_fills;
+                        if (t.owned && !t.fills) job.resource->publish_streamed_texture();
+                        t.gpu_uploaded = true;
+                        t.hashed = true;
+                        t.pieces.hashes.clear();
+                        t.stale = false;
+                        ++t.fills;
+                        ++stats.fills;
+                        ++stats.changed;
+                        stats.fill_bytes += job.span;
+                        filled += job.span;
+                    } else {
+                        ++stats.staged_fills;
+                        if (job.trace)
+                            std::fprintf(stderr, "[rt] ds-pool-fill cpu=%llx size=%llu staged=1 nonzero=%d\n",
+                                         static_cast<unsigned long long>(t.cpu),
+                                         static_cast<unsigned long long>(job.span), int(job.nonzero));
+                        if (t.owned && !t.fills) job.resource->publish_streamed_texture();
+                        t.gpu_uploaded = false;
+                        t.hash = job.hash;
+                        t.hashed = true;
+                        t.stale = false;
+                        ++t.fills;
+                        ++stats.fills;
+                        ++stats.changed;
+                        stats.fill_bytes += job.span;
+                        filled += job.span;
+                    }
+                }
             }
             title_jobs_.clear();
             batch_bytes = 0;
         };
+        const bool gpu_detile_on = leonida::title_gpu_detile_enabled();
         for (const std::uint64_t key : title_named_) {
             const auto it = state_.title_textures.find(key);
             if (it == state_.title_textures.end() || !it->second->resource) continue;
@@ -18249,47 +18466,70 @@ public:
                 not_filled(t);
                 continue;
             }
-            rt::d3d12::TitleImageUpload::Slot* slot = nullptr;
-            {
-                std::lock_guard upload(state_.title_upload_mutex);
-                slot = state_.title_upload.reserve(state_, t.resource->title_binding(), t.layout);
-            }
-            if (!slot) {
-                log_once("staged title texture upload failed, format", int(t.resource->format()));
-                ++stats.fill_failures;
-                t.stale = true;
-                not_filled(t);
-                continue;
-            }
             TitleJob& job = title_jobs_.emplace_back();
             job.entry = entry;
             job.resource = t.resource;
-            job.slot = slot;
             job.span = t.layout.layout.size;
-            job.previous = t.hashed && t.fills ? std::optional<std::uint64_t>(t.hash) : std::nullopt;
-            // Only some of its tiles written: those parts are compared first, in place (read_title_job).
+            job.previous = (t.hashed && t.fills && !t.gpu_uploaded) ? std::optional<std::uint64_t>(t.hash) : std::nullopt;
             const std::size_t tiles = std::size_t(((t.cpu + job.span + 0xffff) & ~std::uint64_t(0xffff)) -
-                                                  (t.cpu & ~std::uint64_t(0xffff))) >> 16;
+                                                  (t.cpu & ~std::uint64_t(0xffff))) >>
+                                      16;
+            // Stage 3b: check if all pages of this texture are already mirrored and flushed in a single TitleMirror
+            // chunk and supported by GPU linear direct copy or GPU compute detile.
+            if (gpu_detile_on) {
+                VkBuffer m_buf = VK_NULL_HANDLE;
+                VkDeviceSize m_off = 0, m_chunk = 0;
+                VkSemaphore m_tl = VK_NULL_HANDLE;
+                std::uint64_t m_val = 0;
+                if (state_.page_mirror_texture_chunk(t.cpu, t.address, job.span, m_buf, m_off, m_chunk, m_tl, m_val)) {
+                    rt::d3d12::TitleImageUpload::UploadKind kind{};
+                    bool gpu_ok = false;
+                    {
+                        std::lock_guard upload(state_.title_upload_mutex);
+                        gpu_ok = state_.title_upload.can_gpu_upload(state_, t.resource->title_binding(), t.layout,
+                                                                    m_off, m_chunk, kind);
+                    }
+                    if (gpu_ok) {
+                        job.gpu_mirror = true;
+                        job.gpu_kind = kind;
+                        job.mirror_buffer = m_buf;
+                        job.mirror_offset = m_off;
+                        job.mirror_chunk_size = m_chunk;
+                        job.mirror_timeline = m_tl;
+                        job.mirror_value = m_val;
+                        // If a multi-tile texture already has CPU piece hashes and only a subset of tiles were
+                        // written, check those tiles first to skip unchanged neighbor-faulted uploads.
+                        if (tiles > 1 && job.previous && t.pieces.valid_for(t.cpu, job.span) &&
+                            !title_written_.empty() && title_written_.size() < tiles) {
+                            job.pieces = t.pieces;
+                            job.compare = true;
+                            job.written = title_written_;
+                        }
+                        if (title_jobs_.size() >= kTitleBatch) run_batch();
+                        continue;
+                    }
+                }
+            }
+            // Stage 3a CPU path: hash-before-reserve for ALL textures including tiles == 1 (`<= tiles`).
             job.pieces = t.pieces;
             job.compare = job.previous && t.pieces.valid_for(t.cpu, job.span) && !title_written_.empty() &&
-                          title_written_.size() < tiles;
+                          title_written_.size() <= tiles;
             if (job.compare) {
                 job.written = title_written_;
             } else {
-                // Why it is read whole (counted): never filled, filled without part hashes, one tile only (its part
-                // is all of it), every tile written, or named with no tile written (a noted write, a touch).
-                ++stats.whole_by[!job.previous                               ? 0
-                                 : !t.pieces.valid_for(t.cpu, job.span)    ? 1
-                                 : tiles == 1                              ? 2
-                                 : !title_written_.empty()                 ? 3
-                                                                           : 4];
+                ++stats.whole_by[!job.previous                            ? 0
+                                 : !t.pieces.valid_for(t.cpu, job.span) ? 1
+                                 : tiles == 1                           ? 2
+                                 : !title_written_.empty()              ? 3
+                                                                        : 4];
             }
-            job.write_combined = title_memory_write_combined(t.cpu);
+            job.write_combined = t.is_write_combined();
             job.trace = leonida::dstorage::trace_enabled() && leonida::title_gpu_views::other_view(t.cpu);
             batch_bytes += job.span;
             if (title_jobs_.size() >= kTitleBatch || batch_bytes >= kTitleBatchBytes) run_batch();
         }
         run_batch();
+        watch.update_idle_hint();
         {
             const auto pass_fill = std::uint64_t(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - fill_start).count());
@@ -18301,39 +18541,54 @@ public:
         stats.filled_bytes += filled;
         stats.max_pass_bytes = std::max(stats.max_pass_bytes, filled);
         std::vector<Resource*> release;
-        std::erase_if(retired_title_textures_, [&](const auto& r) {
-            if (now - r.first < std::chrono::seconds(3)) return false;  // descriptors may still be in flight
-            retired_backing_ -= r.second->image_backing_bytes();
-            release.push_back(r.second);
-            return true;
-        });
+        if (!retired_title_textures_.empty()) {
+            std::int64_t next_due = 0;
+            std::erase_if(retired_title_textures_, [&](const auto& r) {
+                if (now - r.first < std::chrono::seconds(3)) {
+                    const std::int64_t due = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 (r.first + std::chrono::seconds(3)).time_since_epoch())
+                                                 .count();
+                    if (next_due == 0 || due < next_due) next_due = due;
+                    return false;
+                }
+                retired_backing_ -= r.second->image_backing_bytes();
+                release.push_back(r.second);
+                return true;
+            });
+            retired_earliest_ns_.store(next_due, std::memory_order_release);
+        }
         title_pass_ = false;
         const std::uint64_t pass_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - now).count();
         stats.refresh_ns += pass_ns;
         stats.max_refresh_ns = std::max(stats.max_refresh_ns, pass_ns);
         if (now - stats.last_log >= std::chrono::seconds(10)) {
             stats.last_log = now;
+            title_last_log_ns_.store(now_ns, std::memory_order_release);
             const auto& w = watch.stats();
             const auto& l = title_watch_logged_;
-            // Registered textures that would be filled from memory but no descriptor names yet: not read, not
-            // watched (index_texture), whatever the title writes into them.
             std::size_t unnamed = 0;
             for (const auto& [address, entry] : state_.title_textures)
                 unnamed += entry->resource && !entry->gpu_written && entry->layout_known && !entry->owned &&
                            !entry->resource->shader_views();
             std::fprintf(stderr,
-                         "[rt] d3d12: title texture refresh: %llu passes; %llu textures written or new, %llu read whole, "
-                         "%llu found unchanged by their written parts alone, %llu left for a kernel write in progress, "
-                         "%llu named over tiles not armed; %llu uploaded (%.1f MiB), %llu read whole and unchanged; %llu "
-                         "named for the first time, %zu not named by any descriptor (not read); %llu written tiles, "
-                         "%llu arms (%llu busy, %llu refused), %llu queue overflows; %zu textures over %zu tiles "
-                         "watched, %zu tiles not armed; %.3f ms a pass, %.3f at most\n",
-                         static_cast<unsigned long long>(stats.passes), static_cast<unsigned long long>(stats.checked),
+                         "[rt] d3d12: title texture refresh: %llu passes (%llu fast-path skipped); %llu textures "
+                         "written or new, %llu read whole, %llu found unchanged by their written parts alone, %llu "
+                         "left for a kernel write in progress, %llu named over tiles not armed; %llu uploaded "
+                         "(%.1f MiB; %llu CPU staged, %llu GPU linear, %llu GPU detiled), %llu read whole and "
+                         "unchanged; %llu named for the first time, %zu not named by any descriptor (not read); %llu "
+                         "written tiles, %llu arms (%llu busy, %llu refused), %llu queue overflows; %zu textures over "
+                         "%zu tiles watched, %zu tiles not armed; %.3f ms a pass, %.3f at most\n",
+                         static_cast<unsigned long long>(stats.passes),
+                         static_cast<unsigned long long>(stats.fast_passes),
+                         static_cast<unsigned long long>(stats.checked),
                          static_cast<unsigned long long>(stats.read_whole),
                          static_cast<unsigned long long>(stats.unchanged_parts),
                          static_cast<unsigned long long>(stats.busy),
                          static_cast<unsigned long long>(w.unarmed_named - l.unarmed_named),
                          static_cast<unsigned long long>(stats.changed), double(stats.filled_bytes) / 1048576.0,
+                         static_cast<unsigned long long>(stats.staged_fills),
+                         static_cast<unsigned long long>(stats.gpu_linear_fills),
+                         static_cast<unsigned long long>(stats.gpu_detile_fills),
                          static_cast<unsigned long long>(stats.unchanged),
                          static_cast<unsigned long long>(stats.first_named), unnamed,
                          static_cast<unsigned long long>(w.written_tiles - l.written_tiles),
@@ -18341,11 +18596,8 @@ public:
                          static_cast<unsigned long long>(w.arm_busy - l.arm_busy),
                          static_cast<unsigned long long>(w.arm_failures - l.arm_failures),
                          static_cast<unsigned long long>(w.overflows - l.overflows), watch.textures(), watch.tiles(),
-                         watch.unarmed(), double(stats.refresh_ns) * 1e-6 / double(stats.passes),
+                         watch.unarmed(), double(stats.refresh_ns) * 1e-6 / double(std::max<std::uint64_t>(1, stats.passes)),
                          double(stats.max_refresh_ns) * 1e-6);
-            // Views and T#s at an address a render target (depth, UAV) texture covers, since the start: resolved to
-            // its image, or left on the other texture because its image takes no view in that format, or because the
-            // extent or samples, or the mips or layers, differ (a reinterpretation of the tiled bytes, no image view).
             const auto& o = state_.over_gpu_target;
             std::fprintf(stderr,
                          "[rt] d3d12: textures over GPU-written memory: %llu views resolved to the GPU-written image; "
@@ -18358,7 +18610,9 @@ public:
                          static_cast<unsigned long long>(state_.gpu_owned_refusals));
             title_watch_logged_ = w;
             if (leonida::fsdraw::enabled()) log_title_census("refresh");
-            stats.passes = stats.checked = stats.busy = stats.changed = stats.unchanged = stats.filled_bytes = 0;
+            stats.passes = stats.fast_passes = stats.checked = stats.busy = stats.changed = stats.unchanged =
+                stats.filled_bytes = 0;
+            stats.gpu_linear_fills = stats.gpu_detile_fills = 0;
             std::fprintf(stderr,
                          "[rt] d3d12: title textures read whole, by why: %llu never filled, %llu with no part hashes, "
                          "%llu of one tile, %llu with every tile written, %llu with no tile written\n",
@@ -18406,6 +18660,7 @@ private:
         // threads), and the transfers' recording and submission (staged_ns); bytes read whole.
         std::uint64_t collect_ns = 0, examine_ns = 0, read_ns = 0, detile_ns = 0, read_bytes = 0;
         std::uint64_t staged_fills = 0, staged_ns = 0;
+        std::uint64_t gpu_linear_fills = 0, gpu_detile_fills = 0, fast_passes = 0;
         // refresh_title_textures, since the last log line
         std::uint64_t passes = 0, checked = 0, hashed = 0, changed = 0, deferred = 0, filled_bytes = 0,
                       max_pass_bytes = 0, hash_ns = 0, refresh_ns = 0, max_refresh_ns = 0;
@@ -18434,16 +18689,30 @@ private:
         std::optional<std::uint64_t> previous;
         leonida::TilePieces pieces;                // the texture's, then (read whole) the new ones
         std::vector<std::uintptr_t> written;       // its tiles written since its last read (compare)
-        bool compare = false, whole = false;
+        bool compare = false, whole = false, precopied = false;
         std::atomic<bool> failed{false};  // a piece of a whole read could not be copied
         std::uint64_t detile_ns = 0;
         bool write_combined = false, trace = false, copied = false, unchanged = false, nonzero = false;
+        // Stage 3b GPU mirror upload fields:
+        bool gpu_mirror = false;
+        rt::d3d12::TitleImageUpload::UploadKind gpu_kind = rt::d3d12::TitleImageUpload::UploadKind::cpu_slot;
+        VkBuffer mirror_buffer = VK_NULL_HANDLE;
+        VkDeviceSize mirror_offset = 0, mirror_chunk_size = 0;
+        VkSemaphore mirror_timeline = VK_NULL_HANDLE;
+        std::uint64_t mirror_value = 0;
         std::vector<std::uint8_t> tiled;
         std::vector<std::uint64_t> columns;
     };
-    static constexpr std::size_t kTitleBatch = 16;                 // jobs read at once (and upload slots reserved)
-    static constexpr std::uint64_t kTitleBatchBytes = 64ull << 20; // or this many bytes of them
+    static constexpr std::size_t kTitleBatch = 64;                 // jobs processed together before reserving/submitting
+    static constexpr std::uint64_t kTitleBatchBytes = 64ull << 20; // or this many CPU-read bytes of them
     std::deque<TitleJob> title_jobs_;                              // refresh scratch, under title_texture_mutex
+    std::vector<std::size_t> title_detile_indices_;                // indices of changed CPU jobs to detile
+    std::vector<rt::d3d12::TitleImageUpload::BatchItem> title_batch_items_;
+    std::vector<std::size_t> title_batch_job_indices_;
+    std::atomic<std::uint64_t> title_map_generation_atomic_{0};
+    std::atomic<std::int64_t> retired_earliest_ns_{0};
+    std::atomic<std::int64_t> title_last_log_ns_{0};
+    std::atomic<std::uint64_t> title_fast_passes_{0};
     struct TitleChunk {
         std::size_t job, first, end;  // tiles [first, end) of title_jobs_[job]
     };
@@ -18618,6 +18887,7 @@ private:
         ++title_stats_.staged_fills;
         if (t.fills != fills) return true;  // another fill recorded itself in between: its hash is as good
         if (t.owned && !t.fills) r.publish_streamed_texture();
+        t.gpu_uploaded = false;
         t.hash = hash;
         t.hashed = true;
         t.pieces = std::move(pieces);
@@ -18763,6 +19033,8 @@ private:
                                      static_cast<unsigned long long>(address), d.layout, layout.mode,
                                      t->layout_guessed ? "guessed" : "unknown");
                     t->memory.retry();
+                    t->write_combined_known = false;
+                    t->gpu_uploaded = false;
                     t->layout = layout;
                     t->desc = words;
                     t->layout_known = true;
@@ -18899,7 +19171,13 @@ private:
         // took the address over) keeps it, or every T# naming the address would find no texture.
         if (t.resource->image_address()) state_.forget_image_of(t.resource->image_address(), t.resource);
         retired_backing_ += t.resource->image_backing_bytes();
-        retired_title_textures_.emplace_back(std::chrono::steady_clock::now(), t.resource);
+        const auto retired_at = std::chrono::steady_clock::now();
+        retired_title_textures_.emplace_back(retired_at, t.resource);
+        const std::int64_t due = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     (retired_at + std::chrono::seconds(3)).time_since_epoch())
+                                     .count();
+        const std::int64_t prev = retired_earliest_ns_.load(std::memory_order_acquire);
+        if (prev == 0 || due < prev) retired_earliest_ns_.store(due, std::memory_order_release);
         t.resource = nullptr;
         ++title_stats_.retired;
     }
@@ -18980,7 +19258,7 @@ private:
         if (!title_texture_readable(t)) return 0;
         title_tiled_.resize(std::size_t(span));
         if (!copy_guarded(title_tiled_.data(), reinterpret_cast<const std::uint8_t*>(t.cpu), std::size_t(span),
-                          title_memory_write_combined(t.cpu))) {
+                          t.is_write_combined())) {
             // The section changed after VirtualQuery. Preserve the last complete upload and retry.
             t.memory.defer();
             t.stale = true;
@@ -18997,7 +19275,7 @@ private:
             return h;
         });
         hash = t.pieces.combined();
-        if (t.hashed && t.fills && hash == t.hash) {
+        if (t.hashed && t.fills && !t.gpu_uploaded && hash == t.hash) {
             ++title_stats_.unchanged;
             t.stale = false;
             return 0;
@@ -19019,6 +19297,7 @@ private:
             std::fprintf(stderr, "[rt] ds-pool-fill cpu=%llx size=%llu staged=1 nonzero=%d\n",
                          static_cast<unsigned long long>(t.cpu), static_cast<unsigned long long>(span), int(nonzero));
         if (t.owned && !t.fills) t.resource->publish_streamed_texture();
+        t.gpu_uploaded = false;
         t.hash = hash;
         t.hashed = true;
         t.stale = false;
@@ -19039,21 +19318,47 @@ private:
         return true;
     }
 
-    // A pass's read of one texture, on a TitleReadPool thread: the bytes, their hash, and, when they differ from the
-    // last fill's, the detile into the reserved upload slot. Touches only the job's own buffers and slot.
+    // A pass's first-stage hash check of one texture, on a TitleReadPool thread (before any staging slot is reserved):
+    // hashes only the written tiles (including 1-tile textures!). If unchanged, no job.tiled copy or staging reserve
+    // happens. For 1-tile write-combined textures, copies once via streaming MOVNTDQA so a changed tile is never read
+    // twice from WC memory.
     void read_title_job(TitleJob& job) {
         const TitleTexture& t = *job.entry;
         job.whole = false;
-        // Its parts in the tiles written since its last read, hashed where they are: equal, and it is unchanged.
-        if (job.compare && job.pieces.unchanged(job.written, [](std::uintptr_t from, std::uint64_t bytes) {
+        job.precopied = false;
+        if (job.gpu_mirror && !job.compare) return;
+        if (job.compare) {
+            if (!job.gpu_mirror && job.write_combined && job.written.size() == 1 && job.pieces.hashes.size() == 1 &&
+                job.span <= leonida::TilePieces::kTile) {
+                job.tiled.resize(std::size_t(job.span));
+                if (!copy_guarded(job.tiled.data(), reinterpret_cast<const std::uint8_t*>(t.cpu), std::size_t(job.span),
+                                  true)) {
+                    job.copied = false;
+                    return;
+                }
                 std::uint64_t h = 0;
-                return hash_guarded(reinterpret_cast<const std::uint8_t*>(from), std::size_t(bytes), h, true)
-                           ? std::optional<std::uint64_t>(h) : std::nullopt;
-            })) {
-            job.copied = job.unchanged = true;
-            return;
+                hash_guarded(job.tiled.data(), std::size_t(job.span), h, true);
+                if (h == job.pieces.hashes[0]) {
+                    job.copied = job.unchanged = true;
+                    return;
+                }
+                job.pieces.hashes[0] = h;
+                job.copied = true;
+                job.precopied = true;
+                job.whole = true;
+                return;
+            }
+            if (job.pieces.unchanged(job.written, [](std::uintptr_t from, std::uint64_t bytes) {
+                    std::uint64_t h = 0;
+                    return hash_guarded(reinterpret_cast<const std::uint8_t*>(from), std::size_t(bytes), h, true)
+                               ? std::optional<std::uint64_t>(h)
+                               : std::nullopt;
+                })) {
+                job.copied = job.unchanged = true;
+                return;
+            }
         }
-        job.whole = true;
+        if (!job.gpu_mirror) job.whole = true;
     }
 
     // The bytes of tiles [first, end) of a texture read whole (its parts), and their hashes: a texture of many tiles
@@ -19077,20 +19382,27 @@ private:
         }
     }
 
-    // After its parts: the texture's hash, and the detile of changed bytes into its upload slot.
-    void finish_title_job(TitleJob& job) {
-        if (!job.whole) return;
-        job.copied = !job.failed.load(std::memory_order_relaxed);
-        if (!job.copied) return;
+    // After whole-read chunks finish: combine the piece hashes and determine if bytes changed (BEFORE reserving any
+    // staging slot).
+    void hash_title_job(TitleJob& job) {
+        if (!job.whole || job.gpu_mirror) return;
+        if (!job.precopied) {
+            job.copied = !job.failed.load(std::memory_order_relaxed);
+            if (!job.copied) return;
+        }
         job.hash = job.pieces.combined();
         job.unchanged = job.previous && *job.previous == job.hash;
-        if (job.unchanged) return;
+    }
+
+    // Parallel CPU detile into the staging slot reserved ONLY for changed CPU jobs.
+    void detile_title_job(TitleJob& job) {
         const auto detile_start = std::chrono::steady_clock::now();
         job.nonzero = false;
         rt::d3d12::TitleImageUpload::fill(*job.slot, job.resource->title_binding(), job.entry->layout, job.tiled.data(),
                                           job.columns, job.trace, job.nonzero);
         job.detile_ns = std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                          std::chrono::steady_clock::now() - detile_start).count());
+                                          std::chrono::steady_clock::now() - detile_start)
+                                          .count());
     }
 
     // A few threads of ours for the refresh's reads: run(n, f) calls f(0..n-1) on them and on the calling thread,

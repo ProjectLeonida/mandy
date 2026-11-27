@@ -268,8 +268,170 @@ int main() {
         EXPECT(f.cells.empty());
         EXPECT(w.tiles() == 0 && w.textures() == 0);
     }
+    {  // O(1) lock-free clean fast-path (may_have_work) and buffer-hot decoupling (hot_count / hot_tiles)
+        struct FastFakeWatch : FakeWatch {
+            std::uint64_t hot_tile_calls = 0;
+            bool has_written() const { return !queue.empty() || overflow; }
+            std::size_t hot_count() const { return hot.size(); }
+            void hot_tiles(std::vector<std::uintptr_t>& out) {
+                ++hot_tile_calls;
+                out = hot;
+            }
+        };
+        using FastWatch = leonida::TitleTextureWatch<FastFakeWatch>;
+        FastFakeWatch f;
+        FastWatch w(f);
+        for (std::uint64_t i = 0; i < 1000; ++i) w.track(i + 1, base + i * kTile, kTile);
+        EXPECT(w.may_have_work());
+        std::vector<std::uint64_t> seen;
+        w.collect([&](std::uint64_t k) {
+            seen.push_back(k);
+            w.examine(k);
+        });
+        EXPECT(seen.size() == 1000);
+        // Clean steady state: O(1) lock-free fast-path reports no work.
+        EXPECT(!w.may_have_work());
+
+        // 500 buffer-only hot pages in TitleMirror (disjoint from watched textures):
+        const std::uintptr_t buf_base = base + 0x10000000;
+        for (std::size_t i = 0; i < 500; ++i) f.hot.push_back(buf_base + i * kTile);
+        // hot_count changed -> one sync pass detects zero texture overlap and decouples them.
+        EXPECT(w.may_have_work());
+        seen.clear();
+        w.collect([&](std::uint64_t k) {
+            seen.push_back(k);
+            w.examine(k);
+        });
+        EXPECT(seen.empty());
+        EXPECT(w.hot_overlap() == 0);
+        EXPECT(!w.may_have_work());  // buffer-only hot pages no longer wake refresh!
+        const std::uint64_t calls_before = f.hot_tile_calls;
+        for (int pass = 0; pass < 5; ++pass) {
+            w.collect([&](std::uint64_t k) { seen.push_back(k); });
+        }
+        EXPECT(seen.empty());
+        EXPECT(f.hot_tile_calls == calls_before);  // hot_tiles() was completely skipped on quiet passes!
+        EXPECT(w.stats().hot_skips >= 5);
+
+        // One hot page that DOES overlap texture #42: only texture #42 is named, and arm() is not redundantly called.
+        f.hot.push_back(base + 41 * kTile);
+        EXPECT(w.may_have_work());
+        const std::uint64_t arms_before = w.stats().arms;
+        seen.clear();
+        w.collect([&](std::uint64_t k) {
+            seen.push_back(k);
+            w.examine(k);
+        });
+        EXPECT((seen == V{42}));
+        EXPECT(w.hot_overlap() == 1);
+        EXPECT(w.may_have_work());  // overlapping hot tile stays active
+        EXPECT(w.stats().arms == arms_before);  // skipped redundant arm() on hot tile
+
+        // Tile cools down (TitleMirror::set_hot(false) removes from hot and queues write):
+        f.hot.pop_back();
+        f.write(base + 41 * kTile, true);  // simulate set_hot(false) bumping version + queuing tile
+        seen.clear();
+        w.collect([&](std::uint64_t k) {
+            seen.push_back(k);
+            w.examine(k);
+        });
+        EXPECT((seen == V{42}));
+        EXPECT(w.hot_overlap() == 0);
+        EXPECT(!w.may_have_work());
+
+        // Equal-swap edge case with hot_generation(): one buffer page cools while one texture page heats in the
+        // same pass (hot.size() stays numerically equal, but hot_generation() increments).
+        struct GenFakeWatch : FastFakeWatch {
+            std::uint64_t hot_gen = 0;
+            std::uint64_t hot_generation() const { return hot_gen; }
+        };
+        using GenWatch = leonida::TitleTextureWatch<GenFakeWatch>;
+        GenFakeWatch gf;
+        GenWatch gw(gf);
+        gw.track(1, base, kTile);
+        gw.track(2, base + kTile, kTile);
+        gw.collect([&](std::uint64_t k) { gw.examine(k); });
+        gf.hot = {buf_base};
+        ++gf.hot_gen;
+        gw.collect([&](std::uint64_t k) { gw.examine(k); });
+        EXPECT(gw.hot_overlap() == 0 && !gw.may_have_work());
+        // Swap buffer page out and texture-2 page in: hot.size() == 1 before and after, hot_gen bumped!
+        gf.hot = {base + kTile};
+        ++gf.hot_gen;
+        EXPECT(gw.may_have_work());
+        seen.clear();
+        gw.collect([&](std::uint64_t k) {
+            seen.push_back(k);
+            gw.examine(k);
+        });
+        EXPECT((seen == V{2}));
+        EXPECT(gw.hot_overlap() == 1);
+
+        // Single-tile write on a multi-tile texture names ONLY that texture and examine() returns ONLY that 1 tile.
+        const std::uintptr_t big_base = base + 0x20000000;
+        w.track(9999, big_base, 16 * kTile);
+        w.collect([&](std::uint64_t k) { w.examine(k); });
+        EXPECT(!w.may_have_work());
+        f.write(big_base + 7 * kTile + 123);
+        EXPECT(w.may_have_work());
+        std::vector<std::uintptr_t> written_tiles;
+        seen.clear();
+        w.collect([&](std::uint64_t k) {
+            seen.push_back(k);
+            w.examine(k, &written_tiles);
+        });
+        EXPECT((seen == V{9999}));
+        EXPECT(written_tiles.size() == 1 && written_tiles[0] == big_base + 7 * kTile);
+        EXPECT(!w.may_have_work());
+    }
+    {  // Stage 3a: 1-tile hash-before-reserve skips staging reserve & whole read when bytes are unchanged
+        FakeWatch f;
+        Watch w(f);
+        static std::uint8_t mem[kTile];
+        for (std::size_t i = 0; i < sizeof mem; ++i) mem[i] = std::uint8_t(i * 13 + 5);
+        const auto at = [&](std::uintptr_t a) { return mem + (a - base); };
+        const auto hash = [](const std::uint8_t* p, std::uint64_t n) {
+            std::uint64_t h = 1469598103934665603ull;
+            for (std::uint64_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
+            return h;
+        };
+        // Two 1-tile textures sharing tile 0.
+        const std::map<std::uint64_t, std::pair<std::uintptr_t, std::uint64_t>> range{
+            {1, {base + 0x0000, 0x4000}}, {2, {base + 0x8000, 0x4000}}};
+        std::map<std::uint64_t, leonida::TilePieces> pieces;
+        for (const auto& [k, r] : range) w.track(k, r.first, r.second);
+        unsigned reserves = 0;
+        std::vector<std::uintptr_t> written;
+        const auto pass = [&] {
+            std::vector<std::uint64_t> uploaded;
+            w.collect([&](std::uint64_t k) {
+                w.examine(k, &written);
+                const auto [cpu, span] = range.at(k);
+                const std::size_t tiles = leonida::TilePieces::tiles(cpu, span);
+                auto& p = pieces[k];
+                // Stage 3a rule: `written.size() <= tiles` (including tiles == 1) hashes BEFORE reserving!
+                if (p.valid_for(cpu, span) && !written.empty() && written.size() <= tiles &&
+                    p.unchanged(written, [&](std::uintptr_t from, std::uint64_t n) -> std::optional<std::uint64_t> {
+                        return hash(at(from), n);
+                    }))
+                    return;
+                ++reserves;
+                uploaded.push_back(k);
+                p.compute(cpu, span, at(cpu), hash);
+            });
+            return uploaded;
+        };
+        EXPECT((pass() == V{1, 2}));
+        EXPECT(reserves == 2);
+        reserves = 0;
+        // Mutate only texture 2 in shared tile 0: texture 1 (1-tile!) must NOT reserve or upload.
+        mem[0x8010] ^= 0xff;
+        f.write(base + 0x8010);
+        EXPECT((pass() == V{2}));
+        EXPECT(reserves == 1);
+    }
     if (failures) return 1;
     std::puts("title texture watch: new, untouched, one page, two addresses, remap, every frame, unarmable, kernel "
-              "write in progress, lost queue");
+              "write in progress, lost queue, O(1) fast-path, buffer-hot decoupling, 1-tile hash-before-reserve");
     return 0;
 }
