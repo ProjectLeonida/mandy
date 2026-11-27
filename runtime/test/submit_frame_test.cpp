@@ -172,11 +172,12 @@ int submissions() {
     return 0;
 }
 
-// Round 1D queue concurrency, batch coalescing, zero-copy CommandList snapshot, and async worker tests.
-int queue_async_and_coalescing() {
+// Queue sync contract, unlocked state_mutex_, per-batch FIFO drain, active_seq_ / after_held(),
+// zero-copy CommandList snapshot, async worker, and QueueHolds progress tracking tests.
+int queue_sync_and_async() {
     vktest::Device d;
     if (!d.create()) {
-        std::printf("no usable Vulkan device: the queue_async_and_coalescing part is skipped\n");
+        std::printf("no usable Vulkan device: the queue_sync_and_async part is skipped\n");
         return 0;
     }
 
@@ -190,13 +191,19 @@ int queue_async_and_coalescing() {
         return list;
     };
 
-    // 1. Concurrent submission while before_execute_() is running must not block on state_mutex_, must preserve
-    //    strict FIFO execution order, and must coalesce consecutive queued batches on drain.
+    // 1. Synchronous execute() arriving while executing_ == true:
+    //    (a) With !must_hold(), waits on exec_cv_ and runs before_execute_() synchronously before returning.
+    //    (b) With must_hold() (unmet Wait) or Signal, enqueues immediately under state_mutex_ without blocking on
+    //        before_execute_(), preserves zero-copy CommandList snapshots across Reset(), and runs before_execute_()
+    //        once per batch on drain.
+    //    (c) Arriving while a releaser thread is draining multiple ready held batches waits until the ready held
+    //        batches finish and then runs before_execute_() synchronously before returning (strict FIFO).
     {
         VulkanContext context(d.device_proc, d.device, true);
         EXPECT(context.loaded());
         VulkanQueue queue(context, d.queue, d.family, VulkanQueue::QueueKind::direct);
         EXPECT(queue.ok());
+        queue.set_async_depth(0);
 
         void* src_map = nullptr;
         void* dst_map = nullptr;
@@ -239,19 +246,53 @@ int queue_async_and_coalescing() {
         auto b3 = std::make_shared<CommandList>();
         EXPECT(b3->copy_buffer({2, 48, 1, 32, 1}) && b3->copy_buffer({2, 0, 1, 32, 1}) && b3->close());
 
-        VulkanFence done(context, 0);
-        EXPECT(done.semaphore() != VK_NULL_HANDLE);
-
-        ReplayResult t_res = ReplayResult::unsupported;
-        std::thread worker([&] {
+        // (a) Unheld sync execute() while executing_ == true must wait on exec_cv_ and run before_execute_().
+        ReplayResult t1_res = ReplayResult::unsupported, t2_res = ReplayResult::unsupported;
+        std::atomic<bool> t2_done{false};
+        std::atomic<unsigned> t2_before_at_return{0};
+        std::thread worker1([&] {
             std::shared_ptr<const CommandList> s1 = b1;
-            t_res = queue.execute({&s1, 1});
+            t1_res = queue.execute({&s1, 1});
         });
-
         while (!in_first_before.load(std::memory_order_acquire)) std::this_thread::yield();
 
-        // While worker is blocked inside before_execute_(), this thread submits b2, b3, and Signal(done, 1).
-        // If state_mutex_ were held across before_execute_(), this would deadlock before release_first_before is set!
+        std::thread worker2([&] {
+            std::shared_ptr<const CommandList> s2 = b2;
+            t2_res = queue.execute({&s2, 1});
+            t2_before_at_return.store(before_calls.load(std::memory_order_acquire), std::memory_order_release);
+            t2_done.store(true, std::memory_order_release);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        EXPECT(!t2_done.load(std::memory_order_acquire));
+        EXPECT(before_calls.load(std::memory_order_acquire) == 1);
+
+        release_first_before.store(true, std::memory_order_release);
+        worker1.join();
+        worker2.join();
+        EXPECT(t1_res == ReplayResult::success && t2_res == ReplayResult::success);
+        EXPECT(t2_before_at_return.load(std::memory_order_acquire) == 2);
+        EXPECT(queue.idle());
+        EXPECT(db[16] == 0x11 && db[32] == 0x22 && db[0] == 0x22);
+
+        // (b) must_hold() ops (behind an unmet Wait) and Signal enqueue immediately without blocking on executing_.
+        std::memset(db, 0, kBufBytes);
+        before_calls.store(0, std::memory_order_release);
+        in_first_before.store(false, std::memory_order_release);
+        release_first_before.store(false, std::memory_order_release);
+        VulkanFence gate(context, 0), done(context, 0);
+        EXPECT(gate.semaphore() != VK_NULL_HANDLE && done.semaphore() != VK_NULL_HANDLE);
+
+        t1_res = ReplayResult::unsupported;
+        std::thread worker_b([&] {
+            std::shared_ptr<const CommandList> s1 = b1;
+            t1_res = queue.execute({&s1, 1});
+        });
+        while (!in_first_before.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        // While worker_b is blocked inside before_execute_(), this thread queues wait(gate), b2, b3, and Signal(done).
+        // If state_mutex_ were held across before_execute_() or wait-blocked ops waited on exec_cv_, this would
+        // deadlock before release_first_before is set!
+        queue.wait(gate.semaphore(), 1);
         std::shared_ptr<const CommandList> s2 = b2;
         std::shared_ptr<const CommandList> s3 = b3;
         EXPECT(queue.execute({&s2, 1}) == ReplayResult::success);
@@ -265,32 +306,199 @@ int queue_async_and_coalescing() {
         EXPECT(b2->copy_buffer({2, 0, 1, 0, 1}) && b2->close());  // distinct content (0x11), must not affect in-flight
 
         release_first_before.store(true, std::memory_order_release);
-        worker.join();
-        EXPECT(t_res == ReplayResult::success);
+        worker_b.join();
+        EXPECT(t1_res == ReplayResult::success);
+        EXPECT(before_calls.load(std::memory_order_acquire) == 1);  // b2 & b3 stay held behind gate
+
+        EXPECT(gate.signal(1));
         EXPECT(done.wait(1, 5'000'000'000ull));
         EXPECT(queue.idle());
-
-        // b1 ran first (before_calls #1), then b2+b3 coalesced into ONE execute_now() (before_calls #2).
-        EXPECT(before_calls.load(std::memory_order_acquire) == 2);
-        EXPECT(db[16] == 0x11 && db[32] == 0x22 && db[48] == 0x33);
-        EXPECT(db[0] == 0x33);  // strict FIFO: b1 -> b2 -> b3
-        // After completion, s2/s3 snapshots are released (only local s3 holds b3's old CommandList).
+        EXPECT(before_calls.load(std::memory_order_acquire) == 3);  // one before_execute_() per batch
+        EXPECT(db[16] == 0x11 && db[32] == 0x22 && db[48] == 0x33 && db[0] == 0x33);
         s2.reset();
         s3.reset();
         EXPECT(b1.use_count() == 1 && b3.use_count() == 1);
         EXPECT(b3->reset());  // steady-state reuse with zero allocation
-        std::printf("queue sync: unlocked before_execute_, strict FIFO, coalesced drain, zero-copy Reset ok\n");
+
+        // (c) Sync execute() arriving while a releaser drains [b1 (running), b2 (ready in held_)] must wait for both
+        //     ready held batches to drain and run before_execute_() for b3 synchronously before returning.
+        auto b2_fresh = std::make_shared<CommandList>();
+        EXPECT(b2_fresh->copy_buffer({2, 32, 1, 16, 1}) && b2_fresh->copy_buffer({2, 0, 1, 16, 1}) &&
+               b2_fresh->close());
+        EXPECT(b3->copy_buffer({2, 48, 1, 32, 1}) && b3->copy_buffer({2, 0, 1, 32, 1}) && b3->close());
+        std::memset(db, 0, kBufBytes);
+        before_calls.store(0, std::memory_order_release);
+        in_first_before.store(false, std::memory_order_release);
+        release_first_before.store(false, std::memory_order_release);
+        VulkanFence gate_c(context, 0);
+        EXPECT(gate_c.semaphore() != VK_NULL_HANDLE);
+
+        queue.wait(gate_c.semaphore(), 1);
+        std::shared_ptr<const CommandList> c1 = b1, c2 = b2_fresh, c3 = b3;
+        EXPECT(queue.execute({&c1, 1}) == ReplayResult::success);
+        EXPECT(queue.execute({&c2, 1}) == ReplayResult::success);
+        EXPECT(before_calls.load(std::memory_order_acquire) == 0);
+
+        std::thread releaser([&] { (void)gate_c.signal(1); });
+        while (!in_first_before.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        ReplayResult title_res = ReplayResult::unsupported;
+        std::atomic<bool> title_done{false};
+        std::atomic<unsigned> title_before_at_return{0};
+        std::thread title([&] {
+            title_res = queue.execute({&c3, 1});
+            title_before_at_return.store(before_calls.load(std::memory_order_acquire), std::memory_order_release);
+            title_done.store(true, std::memory_order_release);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        EXPECT(!title_done.load(std::memory_order_acquire));
+        EXPECT(before_calls.load(std::memory_order_acquire) == 1);
+
+        release_first_before.store(true, std::memory_order_release);
+        releaser.join();
+        title.join();
+        EXPECT(title_res == ReplayResult::success);
+        EXPECT(title_before_at_return.load(std::memory_order_acquire) == 3);
+        EXPECT(queue.idle());
+        EXPECT(db[16] == 0x11 && db[32] == 0x22 && db[48] == 0x33 && db[0] == 0x33);
+
+        // (d) Gate front held on `queue`, signaled while another thread holds pump_mutex_ (so pump_ready() has not
+        //     reached `queue` yet and executing_ == false with !held_.empty() && ready(held_.front())):
+        //     sync execute() must drain the ready front and run before_execute_() for itself before returning!
+        VulkanQueue other_q(context, d.queue, d.family, VulkanQueue::QueueKind::compute);
+        EXPECT(other_q.ok());
+        other_q.set_async_depth(0);
+        VulkanFence gate_other(context, 0), gate_d(context, 0);
+        EXPECT(gate_other.semaphore() && gate_d.semaphore());
+        auto empty_other = std::make_shared<CommandList>();
+        EXPECT(empty_other->close());
+        std::shared_ptr<const CommandList> s_other = empty_other;
+
+        std::memset(db, 0, kBufBytes);
+        std::atomic<bool> in_pumper_before{false};
+        std::atomic<bool> release_pumper{false};
+        std::atomic<unsigned> main_before_calls{0};
+        const std::thread::id main_tid = std::this_thread::get_id();
+        context.set_before_execute([&] {
+            if (std::this_thread::get_id() == main_tid) {
+                main_before_calls.fetch_add(1, std::memory_order_acq_rel);
+            } else {
+                in_pumper_before.store(true, std::memory_order_release);
+                while (!release_pumper.load(std::memory_order_acquire)) std::this_thread::yield();
+            }
+        });
+
+        other_q.wait(gate_other.semaphore(), 1);
+        EXPECT(other_q.execute({&s_other, 1}) == ReplayResult::success);
+        queue.wait(gate_d.semaphore(), 1);
+        EXPECT(queue.execute({&c1, 1}) == ReplayResult::success);
+
+        // Pumper thread holds QueueHolds::pump_mutex_ while blocked inside other_q's before_execute_().
+        std::thread pumper([&] { (void)gate_other.signal(1); });
+        while (!in_pumper_before.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        // Signal gate_d: QueueHolds::signaled() marks c1 ready, while pump_ready() returns immediately because
+        // pumper holds pump_mutex_. Thus queue has executing_ == false, !held_.empty(), and ready(held_.front()).
+        EXPECT(gate_d.signal(1));
+        EXPECT(main_before_calls.load(std::memory_order_acquire) == 0);
+
+        // Sync execute(c2) must drain c1 and execute c2 synchronously before returning (while pumper still holds pump).
+        EXPECT(queue.execute({&c2, 1}) == ReplayResult::success);
+        EXPECT(main_before_calls.load(std::memory_order_acquire) == 2);
+        EXPECT(queue.idle());
+        EXPECT(db[16] == 0x11 && db[32] == 0x22 && db[0] == 0x22);
+
+        release_pumper.store(true, std::memory_order_release);
+        pumper.join();
+        EXPECT(other_q.idle());
+        std::printf("queue sync: exec_cv_ sync wait, unlocked must_hold, releaser-drain sync, ready-front drain, zero-copy Reset ok\n");
     }
 
-    // 2. Held batches behind a fence gate coalesce consecutive ready batches into ONE before_execute_() call,
-    //    while an intervening Signal or Wait stops coalescing. Also verify invalid-batch fallback inside a
-    //    coalesced group does not drop valid peers.
+    // 2. after_held() must wait behind an active unheld synchronous execute() and an active unheld synchronous
+    //    signal() (active_seq_ tracking via oldest_held_seq()).
+    {
+        VulkanContext context(d.device_proc, d.device, true);
+        EXPECT(context.loaded());
+        VulkanQueue queue(context, d.queue, d.family, VulkanQueue::QueueKind::direct);
+        EXPECT(queue.ok());
+        queue.set_async_depth(0);
+
+        auto empty = std::make_shared<CommandList>();
+        EXPECT(empty->close());
+        std::shared_ptr<const CommandList> snap = empty;
+
+        // (a) Active unheld sync execute().
+        std::atomic<bool> in_before{false}, release_before{false};
+        std::atomic<unsigned> after_calls{0};
+        context.set_before_execute([&] {
+            in_before.store(true, std::memory_order_release);
+            while (!release_before.load(std::memory_order_acquire)) std::this_thread::yield();
+        });
+        context.set_after_execute([&] { after_calls.fetch_add(1, std::memory_order_acq_rel); });
+
+        ReplayResult res = ReplayResult::unsupported;
+        std::thread exec_t([&] { res = queue.execute({&snap, 1}); });
+        while (!in_before.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        std::atomic<bool> barrier_ran{false};
+        std::atomic<unsigned> barrier_saw_after{0};
+        int owner_a = 0;
+        context.holds().after_held(&owner_a, [&] {
+            barrier_saw_after.store(after_calls.load(std::memory_order_acquire), std::memory_order_release);
+            barrier_ran.store(true, std::memory_order_release);
+        });
+        EXPECT(!barrier_ran.load(std::memory_order_acquire));
+
+        release_before.store(true, std::memory_order_release);
+        exec_t.join();
+        EXPECT(res == ReplayResult::success);
+        EXPECT(barrier_ran.load(std::memory_order_acquire));
+        EXPECT(barrier_saw_after.load(std::memory_order_acquire) == 1);
+
+        // (b) Active unheld sync signal().
+        context.set_before_execute({});
+        context.set_after_execute({});
+        VulkanFence sig_fence(context, 0);
+        EXPECT(sig_fence.semaphore() != VK_NULL_HANDLE);
+
+        std::atomic<bool> sig_ok{false};
+        std::atomic<bool> sig_barrier_ran{false};
+        std::atomic<bool> sig_barrier_saw_signaled{false};
+        int owner_b = 0;
+        const std::uint64_t seq_before = context.holds().current_seq();
+        std::thread sig_t;
+        {
+            std::lock_guard hold_submit(context.submit_mutex());
+            sig_t = std::thread([&] { sig_ok.store(queue.signal(sig_fence.semaphore(), 1), std::memory_order_release); });
+            // Wait until signal_sync() has acquired active_seq_ under state_mutex_ and is blocked in submit().
+            while (context.holds().current_seq() == seq_before) std::this_thread::yield();
+
+            context.holds().after_held(&owner_b, [&] {
+                sig_barrier_saw_signaled.store(!context.holds().pending(sig_fence.semaphore(), 1),
+                                               std::memory_order_release);
+                sig_barrier_ran.store(true, std::memory_order_release);
+            });
+            EXPECT(!sig_barrier_ran.load(std::memory_order_acquire));
+        }
+        sig_t.join();
+        EXPECT(sig_ok.load(std::memory_order_acquire));
+        EXPECT(sig_barrier_ran.load(std::memory_order_acquire));
+        EXPECT(sig_barrier_saw_signaled.load(std::memory_order_acquire));
+        EXPECT(sig_fence.wait(1, 5'000'000'000ull));
+        EXPECT(queue.idle());
+        std::printf("queue active_seq_: after_held waits behind active unheld execute() and signal() ok\n");
+    }
+
+    // 3. Held batches drain in strict FIFO order with before_execute_() called once per batch (no cross-batch
+    //    coalescing), and an invalid held batch reports its failure without dropping valid peers.
     {
         VulkanContext context(d.device_proc, d.device, true);
         EXPECT(context.loaded());
         VulkanQueue queue(context, d.queue, d.family, VulkanQueue::QueueKind::direct);
         VulkanQueue copy_q(context, d.queue, d.family, VulkanQueue::QueueKind::copy);
         EXPECT(queue.ok() && copy_q.ok());
+        queue.set_async_depth(0);
+        copy_q.set_async_depth(0);
 
         void* src_map = nullptr;
         void* dst_map = nullptr;
@@ -331,13 +539,13 @@ int queue_async_and_coalescing() {
         }
 
         queue.wait(gate.semaphore(), 1);
-        EXPECT(queue.execute({&steps[0], 1}) == ReplayResult::success);  // group 1: steps 0, 1, 2
+        EXPECT(queue.execute({&steps[0], 1}) == ReplayResult::success);
         EXPECT(queue.execute({&steps[1], 1}) == ReplayResult::success);
         EXPECT(queue.execute({&steps[2], 1}) == ReplayResult::success);
-        EXPECT(queue.signal(mid.semaphore(), 1));                        // Signal stops coalescing
-        EXPECT(queue.execute({&steps[3], 1}) == ReplayResult::success);  // group 2: step 3 alone
-        queue.wait(mid.semaphore(), 1);                                  // Wait stops coalescing
-        EXPECT(queue.execute({&steps[4], 1}) == ReplayResult::success);  // group 3: steps 4, 5
+        EXPECT(queue.signal(mid.semaphore(), 1));
+        EXPECT(queue.execute({&steps[3], 1}) == ReplayResult::success);
+        queue.wait(mid.semaphore(), 1);
+        EXPECT(queue.execute({&steps[4], 1}) == ReplayResult::success);
         EXPECT(queue.execute({&steps[5], 1}) == ReplayResult::success);
         EXPECT(queue.signal(done.semaphore(), 1));
 
@@ -346,12 +554,12 @@ int queue_async_and_coalescing() {
         EXPECT(done.wait(1, 5'000'000'000ull));
         EXPECT(queue.idle());
 
-        // Exactly 3 before_execute_() calls: {0,1,2}, {3}, {4,5}.
-        EXPECT(before_calls.load() == 3);
+        // Every held batch runs its own execute_now() / before_execute_(): 6 batches -> 6 calls.
+        EXPECT(before_calls.load() == 6);
         for (int i = 0; i < 6; ++i) EXPECT(db[(i + 1) * 16] == std::uint8_t(0xA1 + i));
         EXPECT(db[0] == std::uint8_t(0xA6));  // strict FIFO through all 6 batches
 
-        // Coalesced fallback: [valid, invalid ClearRenderTarget on copy queue, valid] held behind gate2.
+        // Invalid held batch [valid, invalid ClearRenderTarget on copy queue, valid] must not drop valid peers.
         VulkanFence gate2(context, 0), done2(context, 0);
         EXPECT(gate2.semaphore() && done2.semaphore());
         std::memset(db, 0, kBufBytes);
@@ -371,11 +579,11 @@ int queue_async_and_coalescing() {
         EXPECT(copy_q.idle());
         EXPECT(copy_q.take_held_failure() == ReplayResult::unsupported);
         EXPECT(db[16] == 0xA1 && db[32] == 0xA2 && db[0] == 0xA2);
-        std::printf("queue held coalescing: 6 batches -> 3 submits, Signal/Wait split, invalid fallback ok\n");
+        std::printf("queue held FIFO drain: 6 batches -> 6 before_execute_ calls, invalid peer isolation ok\n");
     }
 
-    // 3. LEONIDA_SUBMIT_ASYNC (per-queue async worker depth=4): inbox coalescing, Present barrier split,
-    //    held-batch release through worker, and zero-copy CommandList Reset() while queued.
+    // 4. LEONIDA_SUBMIT_ASYNC (per-queue async worker depth=4): per-batch before_execute_() (no coalescing),
+    //    Present barrier ordering, held-batch release through worker, and zero-copy CommandList Reset() while queued.
     {
         VulkanContext context(d.device_proc, d.device, true);
         EXPECT(context.loaded());
@@ -423,7 +631,7 @@ int queue_async_and_coalescing() {
         EXPECT(queue.execute({&s0, 1}) == ReplayResult::success);
         while (!in_first.load(std::memory_order_acquire)) std::this_thread::yield();
 
-        // Enqueue c1, c2 (will coalesce), then a Present after_held barrier, then c3 (must NOT coalesce past barrier).
+        // Enqueue c1, c2, then a Present after_held barrier, then c3.
         EXPECT(queue.execute({&s1, 1}) == ReplayResult::success);
         EXPECT(queue.execute({&s2, 1}) == ReplayResult::success);
         EXPECT(c1.use_count() > 1 && c2.use_count() > 1);  // queued zero-copy
@@ -450,12 +658,12 @@ int queue_async_and_coalescing() {
         EXPECT(queue.idle());
         EXPECT(barrier_ran.load(std::memory_order_acquire));
 
-        // 3 before_execute_() calls total: {c0}, {c1, c2}, {c3}; barrier ran after {c1, c2} (count == 2), before {c3}!
-        EXPECT(before_calls.load() == 3);
-        EXPECT(barrier_seen_before_calls.load() == 2);
+        // 4 before_execute_() calls total: {c0}, {c1}, {c2}, {c3}; barrier ran after c2 (count == 3), before c3!
+        EXPECT(before_calls.load() == 4);
+        EXPECT(barrier_seen_before_calls.load() == 3);
         EXPECT(db[16] == 0xC1 && db[32] == 0xC2 && db[48] == 0xC3 && db[64] == 0xC4);
 
-        // Held batches behind a gate in async mode: release_ready() wakes worker and coalesces them.
+        // Held batches behind a gate in async mode: release_ready() wakes worker and runs before_execute_() per batch.
         before_calls.store(0);
         std::memset(db, 0, kBufBytes);
         VulkanFence gate(context, 0), done2(context, 0);
@@ -469,12 +677,12 @@ int queue_async_and_coalescing() {
         EXPECT(gate.signal(1));
         EXPECT(done2.wait(1, 5'000'000'000ull));
         EXPECT(queue.idle());
-        EXPECT(before_calls.load() == 1);
+        EXPECT(before_calls.load() == 2);
         EXPECT(db[16] == 0xC1 && db[48] == 0xC3);
-        std::printf("queue async (depth=4): inbox coalescing, Present barrier split, gate release ok\n");
+        std::printf("queue async (depth=4): per-batch before_execute_, Present barrier order, gate release ok\n");
     }
 
-    // 4. Async queue progress tracking (LEONIDA_SUBMIT_ASYNC=4 + queued Present + busy producer worker + genuine
+    // 5. Async queue progress tracking (LEONIDA_SUBMIT_ASYNC=4 + queued Present + busy producer worker + genuine
     //    deadlock):
     //    (a) While the direct producer async worker is busy inside before_execute_() with a WriteGroup Signal
     //        still queued in its inbox_, a consumer compute gate with a Present queued behind it must NOT be
@@ -617,7 +825,7 @@ int queue_async_and_coalescing() {
 }  // namespace
 
 int main() {
-    if (scripted() || submissions() || queue_async_and_coalescing()) return 1;
+    if (scripted() || submissions() || queue_sync_and_async()) return 1;
     std::printf("submit_frame_test: OK\n");
     return 0;
 }
