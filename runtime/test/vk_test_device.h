@@ -123,6 +123,7 @@ public:
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
     bool prepare_on_bind=false;
     bool cold_graphics_compile = false;
+    bool heavy_pipeline_cache = false;  // LEONIDA_HEAVY_PIPELINE_CACHE_MS set and pipelineCreationCacheControl on
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
     bool request_multi_draw_indirect = false, request_draw_indirect_count = false;
     bool draw_indirect_count_enabled = false;
@@ -143,6 +144,8 @@ public:
     bool custom_border_color = false;  // VK_EXT_custom_border_color and customBorderColors enabled
     bool custom_border_color_without_format = false;
     bool shader_output_viewport_index = false;  // Vulkan 1.2 shaderOutputViewportIndex enabled
+    bool request_buffer_marker = false;  // set before initialize(): enable VK_AMD_buffer_marker where available
+    bool buffer_marker = false;          // VK_AMD_buffer_marker is enabled
     bool request_null_descriptor = false;  // set before initialize(): enable VK_EXT_robustness2 nullDescriptor
     bool null_descriptor = false;          // VK_EXT_robustness2 and nullDescriptor are enabled
     // VK_EXT_external_memory_host is enabled when non-zero: its minImportedHostPointerAlignment.
@@ -410,8 +413,13 @@ private:
         // (zero-based VS ids) is in; harmless before.
         const char* compile_mode = std::getenv("LEONIDA_PIPELINE_COMPILE");
         const bool cache_only = compile_mode && std::strcmp(compile_mode, "cache-only") == 0;
-        v13_.enable_pipeline_cache_control = cache_only && v13_.core && v13_.pipeline_cache_control;
-        cold_graphics_compile = v13_.enable_pipeline_cache_control;
+        // LEONIDA_HEAVY_PIPELINE_CACHE_MS other than 0: the heavy pipeline cache path, as the runtime takes it by default
+        // (src/heavy_pipeline_cache.h). Tests leave it off unless asked.
+        const char* heavy_ms = std::getenv("LEONIDA_HEAVY_PIPELINE_CACHE_MS");
+        const bool heavy = heavy_ms && *heavy_ms && std::strcmp(heavy_ms, "0") != 0;
+        v13_.enable_pipeline_cache_control = (cache_only || heavy) && v13_.core && v13_.pipeline_cache_control;
+        cold_graphics_compile = cache_only && v13_.enable_pipeline_cache_control;
+        heavy_pipeline_cache = heavy && v13_.enable_pipeline_cache_control;
         prepare_on_bind = compile_mode && std::strcmp(compile_mode, "on-demand") == 0;
         VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                                                   v13_.enable(conditional_rendering ? &enable_conditional : nullptr)};
@@ -770,6 +778,10 @@ private:
         if (custom_border_color) device_extensions.push_back(custom_border_color_name);
         if (null_descriptor || robust_index_view) device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
         if (mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+        buffer_marker = request_buffer_marker && std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_AMD_BUFFER_MARKER_EXTENSION_NAME) == 0;
+        });
+        if (buffer_marker) device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);

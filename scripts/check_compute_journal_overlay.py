@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -95,6 +96,10 @@ def run(exe, root, device, strict):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("executable", type=Path, help="built d3d12_compute_journal_test.exe")
     parser.add_argument("--device", help="optional LEONIDA_VK_DEVICE selector")

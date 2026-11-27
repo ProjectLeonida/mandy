@@ -175,7 +175,7 @@ inline UINT64 console_depth_stencil_size(const D3D12_RESOURCE_DESC& desc) {
 //
 // Why exact: the title keeps this size in its streaming tables and reads exactly that many bytes of the texture
 // from its archives through DirectStorage; a compressed chunk must be read whole, and the title stops on an int3
-// (game+0x4ffd879) when the size it was given is smaller than the chunk. Measured with a debugger at that int3: a
+// when the size it was given is smaller than the chunk. Measured with a debugger at that int3: a
 // request of 0x2000 bytes for a chunk that spans 0x4000, the PC answer for the texture being half the console's.
 inline bool console_texture_layout(const D3D12_RESOURCE_DESC& desc, UINT64& size, UINT64& alignment) {
     constexpr UINT gpu_written = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |

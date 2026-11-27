@@ -107,4 +107,38 @@ void poll_title_textures(const std::vector<Entry>& entries, std::uint64_t& curso
     }
 }
 
+// Visit the marked textures of a snapshot (mapped by the title, or known stale) under a time limit
+// (LEONIDA_TITLE_EVERY_BUDGET_US). Those `urgent` answers true for (a mapped texture never filled yet) are all
+// visited first, in placement order, whatever the limit. The others are visited
+// from `cursor`, as poll_title_textures does for the unmarked ones, until `exhausted()` answers true after a visit;
+// the next pass resumes at the entry after the last one visited, so every marked texture gets its turn however many
+// there are. An entry skipped as unmarked costs no check.
+template<class Entry, class Visit, class Urgent, class Exhausted>
+void visit_marked_title_textures(const std::vector<Entry>& entries, std::uint64_t& cursor, Visit visit, Urgent urgent,
+                                 Exhausted exhausted) {
+    if (entries.empty()) return;
+    // Which entries are urgent is decided before any visit: a visit fills the texture, and it must not come round
+    // again in the rotation of the same pass.
+    std::vector<char> was_urgent(entries.size());
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        const auto& texture = entries[i].second;
+        was_urgent[i] = (texture->mapped || texture->stale) && urgent(*texture);
+    }
+    for (std::size_t i = 0; i < entries.size(); ++i)
+        if (was_urgent[i]) visit(*entries[i].second);
+    const auto first = std::lower_bound(entries.begin(), entries.end(), cursor,
+                                        [](const Entry& entry, std::uint64_t at) { return entry.first < at; });
+    auto index = std::size_t(first - entries.begin());
+    if (index == entries.size()) index = 0;
+    for (auto left = entries.size(); left; --left) {
+        const auto& [address, texture] = entries[index];
+        cursor = address + 1;
+        if ((texture->mapped || texture->stale) && !was_urgent[index]) {
+            visit(*texture);
+            if (exhausted()) break;
+        }
+        index = index + 1 == entries.size() ? 0 : index + 1;
+    }
+}
+
 }  // namespace leonida
