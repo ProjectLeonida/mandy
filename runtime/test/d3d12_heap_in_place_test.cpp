@@ -375,6 +375,53 @@ int test() {
         EXPECT(VirtualFree(big_plain, 0, MEM_RELEASE));
     }
 
+    // 9. Round 12 regressions:
+    //    (a) A slot queued in heap.deferred by apply_in_place_changes (texture_gone) and overwritten in the same
+    //        refresh's upload() with non-T# words (w[3] >> 30 != 0, !is_image) must zero w[0..3] in finish_in_place
+    //        instead of writing raw unfiltered words into home[slot];
+    //    (b) A V# naming base >= arena.size not yet in title_memory or aliases is nulled and recorded as waiting, so
+    //        adding an alias for that base later wakes and rebases the slot automatically.
+    {
+        // (a) Trigger apply_in_place_changes (texture_gone -> queues slot 17 in heap.deferred) + concurrent page write
+        //     of raw non-T# words into slot 17 before refresh, forcing finish_in_place() to see not_tsharp.
+        Ref<ID3D12Resource> tmp_tex;
+        EXPECT(SUCCEEDED(device.p->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &tex_desc,
+                                                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                                                           IID_PPV_ARGS(&tmp_tex.p))));
+        device.p->CreateShaderResourceView(tmp_tex.p, nullptr, cpu);
+        std::uint32_t tmp_tsharp[8];
+        std::memcpy(tmp_tsharp, reinterpret_cast<const void*>(cpu.ptr), sizeof(tmp_tsharp));
+        tmp_tsharp[leonida::gfx10::kTsharpIndexDword] = 0x00C0FFEEu;
+        std::thread([&] { std::memcpy(title + 17 * kDescriptor, tmp_tsharp, sizeof(tmp_tsharp)); }).join();
+        std::uint32_t bound_tsharp[8]{};
+        EXPECT(rt::d3d12::arena_gpu_read(device.p, shader_va + 17 * kDescriptor, bound_tsharp, sizeof(bound_tsharp)));
+        EXPECT((bound_tsharp[leonida::gfx10::kTsharpIndexDword] >> 28) == leonida::gfx10::kTsharpIndexTag);
+
+        const std::uint32_t bad_non_tsharp[8] = {0xdead0000u, 0x0000ffffu, 0x00000400u, 0x40000000u, 1, 2, 3, 4};
+        tmp_tex.reset();  // notes texture_gone -> next refresh's apply_in_place_changes defers slot 17
+        std::thread([&] { std::memcpy(title + 17 * kDescriptor, bad_non_tsharp, sizeof(bad_non_tsharp)); }).join();
+        std::uint32_t cleared[8]{};
+        EXPECT(rt::d3d12::arena_gpu_read(device.p, shader_va + 17 * kDescriptor, cleared, sizeof(cleared)));
+        EXPECT(!(cleared[0] | cleared[1] | cleared[2] | cleared[3]));
+        EXPECT(!std::memcmp(title + 17 * kDescriptor, bad_non_tsharp, sizeof(bad_non_tsharp)));
+
+        // (b) V# at unbacked base >= arena.size: nulled initially, then woken and rebased when an alias arrives.
+        constexpr std::uint64_t kLateVa = 0x510000000000ull;
+        const auto late_vsharp = raw_vsharp(kLateVa, 256);
+        std::thread([&] { put(18, late_vsharp); }).join();
+        std::uint32_t late_out[8]{};
+        EXPECT(rt::d3d12::arena_gpu_read(device.p, shader_va + 18 * kDescriptor, late_out, sizeof(late_out)));
+        EXPECT(!(late_out[0] | late_out[1] | late_out[2] | late_out[3]));
+
+        EXPECT(leonida::title_va_aliases().add(kLateVa, 4096, arena_va));
+        EXPECT(rt::d3d12::arena_gpu_read(device.p, shader_va + 18 * kDescriptor, late_out, sizeof(late_out)));
+        EXPECT(base_of(late_out) == arena_va && late_out[2] == 256);
+
+        leonida::title_va_aliases().remove(kLateVa, arena_va);
+        EXPECT(rt::d3d12::arena_gpu_read(device.p, shader_va + 18 * kDescriptor, late_out, sizeof(late_out)));
+        EXPECT(!(late_out[0] | late_out[1] | late_out[2] | late_out[3]));
+    }
+
     // 3. The null slots after the heap.
     std::uint32_t tail[64]{};
     std::memset(tail, 0xff, sizeof(tail));

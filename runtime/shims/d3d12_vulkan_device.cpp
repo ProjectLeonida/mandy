@@ -4493,7 +4493,10 @@ struct DeviceState {
         if (heap && answers && record && answered_by_record(*heap, base, span, copy_geometry, *record)) {
             if (record->state == leonida::ConsoleHeapSlotRecords::resolved) {
                 const uint64_t to = record->target - arena.address;  // mod 2^64, as it was recorded
-                if ((to & ((1ull << 48) - 1)) == base) return VsharpResult::unchanged;
+                if ((to & ((1ull << 48) - 1)) == base) {
+                    if (page_mirror.mirror && to == base && base >= arena.size) note_title_write(base, span);
+                    return VsharpResult::unchanged;
+                }
                 w[0] = uint32_t(to);
                 w[1] = (w[1] & 0xffff0000u) | uint32_t((to >> 32) & 0xffff);
                 return VsharpResult::rebased;
@@ -4842,18 +4845,45 @@ struct DeviceState {
     // Whether a V# naming [base, base + span) can be read as the title wrote it, by a heap read in place: heap_base +
     // its base lies in the sparse arena (where nothing is bound reads zero), in title memory the mirror holds (named
     // to it as vsharp_address's mirror path does, page_mirror_resolve_locked: ordinary memory is mirrored then;
-    // `mirrored` says so, for the write-back of what shaders store there), or in a buffer of ours (one below the
-    // arena). page_mirror.mutex held: only the in-place filter asks.
-    bool reachable_as_written(std::uint64_t base, std::uint64_t span, bool& mirrored) {
+    // `mirrored` says so, for the write-back of what shaders store there), or in a non-sparse buffer or geometry copy
+    // of ours (including below-arena bit-47 V#s regardless of signed_vsharp_offsets(), matching vsharp_address; when
+    // `tracked_target` is given, it receives the backing's device address so the slot records a resolved target and
+    // is re-filtered on target_gone). page_mirror.mutex held: only the in-place filter asks.
+    bool reachable_as_written(std::uint64_t base, std::uint64_t span, bool& mirrored,
+                              std::uint64_t* tracked_target = nullptr) {
         constexpr std::uint64_t mask = (1ull << 48) - 1;
         mirrored = false;
+        if (tracked_target) *tracked_target = 0;
+        if (!base) return false;
         if (!span) span = 1;
+        const auto encodable = [&](std::uint64_t offset) {
+            const std::uint64_t limit = signed_vsharp_offsets() ? mask / 2 : mask;
+            if (offset <= limit) return span - 1 <= limit - offset;
+            return offset >= UINT64_MAX - mask / 2 && span - 1 <= mask / 2 - offset;
+        };
+        const auto backed_direct = [&](std::uint64_t offset) {
+            if (!encodable(offset)) return false;
+            const VkDeviceAddress bda = arena.address + offset;
+            bool ok = false;
+            {
+                std::lock_guard lock(backing_mutex);
+                ok = gpu_backings.covers(bda, span);
+            }
+            if (!ok && geometry.cap()) {
+                std::uint64_t host{}, room{};
+                ok = geometry.lookup(bda, host, room) && room >= span;
+            }
+            if (ok && tracked_target) *tracked_target = bda;
+            return ok;
+        };
         std::uint64_t offset = base;
         if (signed_vsharp_offsets() && base <= mask && (base & (1ull << 47))) offset |= ~mask;
         if (offset < arena.size && span <= arena.size - offset) return true;
         if (page_mirror.mirror && offset == base && page_mirror_resolve_locked(base, span, true)) return mirrored = true;
-        std::lock_guard lock(backing_mutex);
-        return gpu_backings.covers(arena.address + offset, span);
+        if (backed_direct(offset)) return true;
+        // Read the other way: bit 47 as a sign, for a below-arena buffer's V# the layer wrote itself (vsharp_address).
+        if (offset == base && base <= mask && (base & (1ull << 47)) && backed_direct(base | ~mask)) return true;
+        return false;
     }
 
     // Title memory [va, va + bytes) as a reader names it (a V#, a root view, a vertex or index view, a stream-pool
@@ -6029,27 +6059,48 @@ struct DeviceState {
                 const std::uint32_t stride = (h[1] >> 16) & 0x3fffu;
                 const std::uint64_t span = std::uint64_t(h[2]) * (stride ? stride : 1);
                 bool mirrored = false;
-                if (reachable_as_written(base, span, mirrored)) {
-                    heap.records.set(slot, half, Records::none, 0, 0, 0);
+                std::uint64_t target = 0;
+                if (reachable_as_written(base, span, mirrored, &target)) {
+                    if (target) heap.records.set(slot, half, Records::resolved, base, span, target, false);
+                    else heap.records.set(slot, half, Records::none, 0, 0, 0);
                     if (mirrored) heap.mirror_ranges.emplace_back(base, span);
                     ++heap.vsharps_as_written;
                     continue;
                 }
-                // Reject V# halves that are guaranteed unresolvable (inline constants, bit-47 sign bit not backed by
-                // any device buffer, arena offsets extending past arena.size, or non-title addresses without an alias)
-                // in O(1) without inserting into heap.records or deferring to finish_in_place.
+                // Classify V# halves that reachable_as_written did not accept, maintaining exact semantic parity with
+                // finish_in_place -> vsharp_address (VsharpPath::scratch):
+                //   - permanently impossible (null base, unbacked bit-47, or arena offset whose span exceeds arena.size
+                //     and is neither in title_memory, aliased, nor a stream-pool GPU view): null with Records::none;
+                //   - unresolvable right now (base >= arena.size, not in title_memory within span, no alias, and no
+                //     stream-pool GPU view): null and record Records::waiting directly without deferring, so a later
+                //     SlotChange::source_added (backing, alias, or title_memory) still wakes and re-filters it;
+                //   - otherwise: clear any stale record, null temporarily, and defer to finish_in_place.
                 auto& aliases = leonida::title_va_aliases();
-                bool impossible = !base || (base & (1ull << 47)) != 0;
-                if (!impossible) {
+                bool permanent_impossible = !base || (base & (1ull << 47)) != 0;
+                bool in_title = false, has_alias = false, is_gpu_view = false;
+                if (!permanent_impossible) {
                     std::uint64_t lo = 0, hi = 0;
-                    const bool in_title = aliases.title_memory(base, lo, hi) && span <= hi - base;
+                    in_title = aliases.title_memory(base, lo, hi) && span <= hi - base;
                     if (!in_title) {
                         std::uint64_t alias_to = 0, alias_room = 0;
-                        impossible = !aliases.range_of(base, alias_to, alias_room);
+                        has_alias = aliases.range_of(base, alias_to, alias_room);
+                        if (!has_alias) {
+                            is_gpu_view = geometry.cap() && leonida::title_gpu_views::to_cpu(base, span) != base;
+                            if (!is_gpu_view && base < arena.size) permanent_impossible = true;
+                        }
                     }
                 }
-                if (impossible) {
+                if (permanent_impossible) {
                     heap.records.set(slot, half, Records::none, 0, 0, 0);
+                    h[0] = h[1] = h[2] = h[3] = 0;  // null whole: no three words of four
+                    ++heap.vsharps_rejected;
+                    continue;
+                }
+                if (!in_title && !has_alias && !is_gpu_view) {
+                    // `!in_title && !has_alias && !is_gpu_view` proves geometry_va cannot succeed either, so
+                    // `geometry = true` is exact and lets answer() serve both geometry=true/false queries until a
+                    // SlotChange::source_added refilters this slot.
+                    heap.records.set(slot, half, Records::waiting, base, span, 0, true);
                     h[0] = h[1] = h[2] = h[3] = 0;  // null whole: no three words of four
                     ++heap.vsharps_rejected;
                     continue;
@@ -6233,6 +6284,7 @@ struct DeviceState {
             std::uint32_t slot;
             std::uint32_t words[kDescriptorSize / 4];
             bool reachable[2] = {false, false};
+            std::uint64_t reachable_target[2] = {0, 0};
             bool answered[2] = {false, false};
             VsharpRecord answer[2]{};
         };
@@ -6268,8 +6320,10 @@ struct DeviceState {
                         const std::uint32_t stride = (h[1] >> 16) & 0x3fffu;
                         const std::uint64_t span = std::uint64_t(h[2]) * (stride ? stride : 1);
                         bool mirrored = false;
-                        if (reachable_as_written(base, span, mirrored)) {
+                        std::uint64_t reach_target = 0;
+                        if (reachable_as_written(base, span, mirrored, &reach_target)) {
                             job.reachable[half] = true;
+                            job.reachable_target[half] = reach_target;
                             if (mirrored) heap.mirror_ranges.emplace_back(base, span);
                             continue;
                         }
@@ -6318,6 +6372,8 @@ struct DeviceState {
                     h[0] = std::uint32_t(to);
                     h[1] = (h[1] & 0xffff0000u) | std::uint32_t((to >> 32) & 0xffff);
                     ++heap.vsharps;
+                } else if (page_mirror.mirror && to == rec.base && rec.base >= arena.size) {
+                    note_title_write(rec.base, rec.span);
                 }
             } else {
                 const std::uint32_t stride = (h[1] >> 16) & 0x3fffu;
@@ -6359,26 +6415,37 @@ struct DeviceState {
             } else {
                 leonida::gfx10::ImageWords words;
                 std::memcpy(words.data(), w, sizeof(words));
-                const char* why = nullptr;
-                const TitleImage result = bind_title_image(*this, words, &why);
-                const bool unbound = result == TitleImage::unknown || result == TitleImage::refused;
-                if (unbound) {
-                    note_refused_tsharp(heap, std::size_t(jobs[i].slot) * kDescriptorSize, words, why);
-                    ++heap.refused_reasons[why ? why : "?"];
-                    ++heap.texture_waits;
+                if (leonida::gfx10::is_image(words)) {
+                    const char* why = nullptr;
+                    const TitleImage result = bind_title_image(*this, words, &why);
+                    const bool unbound = result == TitleImage::unknown || result == TitleImage::refused;
+                    if (unbound) {
+                        note_refused_tsharp(heap, std::size_t(jobs[i].slot) * kDescriptorSize, words, why);
+                        ++heap.refused_reasons[why ? why : "?"];
+                        ++heap.texture_waits;
+                    }
+                    ++heap.images[unsigned(result)];
+                    if (result == TitleImage::not_tsharp) {
+                        std::memset(w, 0, 16);
+                    } else {
+                        leonida::gfx10::Image image{};
+                        leonida::gfx10::decode(words, image);
+                        done[i].texture_address = tsharp_texture_key(image.address);
+                        done[i].texture = !unbound ? Records::texture_bound
+                                          : why == kTsharpArrayFull || why == kTsharpStorageFull
+                                              ? Records::texture_waiting_room
+                                              : Records::texture_waiting;
+                        // The home's dword 6 is the index shaders take (tsharp_index_word), 0 while the T# waits; a
+                        // texture coming, going or replaced at its address touches the slot (apply_in_place_changes),
+                        // which is filtered and finished again, so the word follows the texture the T# names. The heap
+                        // copy's write (fix_console_slot) is for heaps not read in place.
+                        if (tsharp_index_words)
+                            w[leonida::gfx10::kTsharpIndexDword] = unbound ? 0u : tsharp_index_word(words);
+                    }
+                } else {
+                    ++heap.images[unsigned(TitleImage::not_tsharp)];
+                    std::memset(w, 0, 16);
                 }
-                ++heap.images[unsigned(result)];
-                leonida::gfx10::Image image{};
-                leonida::gfx10::decode(words, image);
-                done[i].texture_address = tsharp_texture_key(image.address);
-                done[i].texture = !unbound ? Records::texture_bound
-                                  : why == kTsharpArrayFull || why == kTsharpStorageFull ? Records::texture_waiting_room
-                                                                                         : Records::texture_waiting;
-                // The home's dword 6 is the index shaders take (tsharp_index_word), 0 while the T# waits; a texture
-                // coming, going or replaced at its address touches the slot (apply_in_place_changes), which is filtered
-                // and finished again, so the word follows the texture the T# names. The heap copy's write
-                // (fix_console_slot) is for heaps not read in place.
-                if (tsharp_index_words) w[leonida::gfx10::kTsharpIndexDword] = unbound ? 0u : tsharp_index_word(words);
             }
         }
         std::unique_lock lock(page_mirror.mutex, std::defer_lock);
@@ -6396,13 +6463,27 @@ struct DeviceState {
                     d.texture == Records::texture_bound)
                     ++heap.texture_refills;
                 heap.records.set_texture(slot, d.texture, d.texture_address);
+            } else if (jobs[i].words[3] >> 30) {
+                heap.records.clear(slot);
             } else {
                 for (unsigned half = 0; half < 2; ++half) {
-                    if (jobs[i].reachable[half])
-                        heap.records.set(slot, half, Records::none, 0, 0, 0);
-                    else if (d.halves[half].state != Records::none)
+                    const std::uint32_t* h = jobs[i].words + 4 * half;
+                    if (jobs[i].reachable[half]) {
+                        if (jobs[i].reachable_target[half]) {
+                            const std::uint64_t base = std::uint64_t(h[0]) | (std::uint64_t(h[1] & 0xffff) << 32);
+                            const std::uint32_t stride = (h[1] >> 16) & 0x3fffu;
+                            const std::uint64_t span = std::uint64_t(h[2]) * (stride ? stride : 1);
+                            heap.records.set(slot, half, Records::resolved, base, span, jobs[i].reachable_target[half],
+                                             false);
+                        } else {
+                            heap.records.set(slot, half, Records::none, 0, 0, 0);
+                        }
+                    } else if (d.halves[half].state != Records::none) {
                         heap.records.set(slot, half, d.halves[half].state, d.halves[half].base, d.halves[half].span,
                                          d.halves[half].target, d.halves[half].geometry);
+                    } else if ((h[3] >> 30) || !h[2]) {
+                        heap.records.set(slot, half, Records::none, 0, 0, 0);
+                    }
                 }
             }
             std::memcpy(home + (va & (leonida::TitleMirror::kPage - 1)), d.out, kDescriptorSize);
