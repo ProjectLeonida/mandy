@@ -12,6 +12,7 @@
 #include <atomic>
 #include <array>
 #include <charconv>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -309,6 +310,22 @@ template<class State>
 Backing descriptor(State& state, std::uint64_t seq, std::size_t list, std::size_t cmd,
                 const std::array<std::uint32_t, 32>& roots, unsigned reg, unsigned slot,
                 std::array<std::uint32_t, 8>* words = nullptr) {
+    // The whole record goes out in one write when the function returns: other threads' probe lines (fsdraw) write to
+    // stderr too, and a record made of many writes came out cut by theirs.
+    struct Line {
+        std::string s;
+        void f(const char* format, ...) {
+            char text[1024];
+            va_list args;
+            va_start(args, format);
+            const int n = std::vsnprintf(text, sizeof(text), format, args);
+            va_end(args);
+            if (n > 0) s.append(text, std::min<std::size_t>(std::size_t(n), sizeof(text) - 1));
+        }
+        ~Line() {
+            if (!s.empty()) std::fwrite(s.data(), 1, s.size(), stderr);
+        }
+    } line;
     const auto at = std::uint64_t(roots[reg]) + std::uint32_t(slot * 32u);
     std::array<std::uint32_t, 8> raw{}, gpu{};
     const char* origin = "no-heap";
@@ -354,19 +371,20 @@ Backing descriptor(State& state, std::uint64_t seq, std::size_t list, std::size_
     if (!have_gpu) have_gpu = leonida::fsdraw::arena_words(at, gpu.data(), gpu.size());
     if (have_gpu) remember(at, seq, cmd, reg, slot, gpu);
     const auto prefix = "[rt] compute-input: execute=%llu list=%zu cmd=%zu s%u/%u ";
-    std::fprintf(stderr, prefix, (unsigned long long)seq, list, cmd, reg, slot);
+    line.f(prefix, (unsigned long long)seq, list, cmd, reg, slot);
     if (!have_gpu) {
-        std::fprintf(stderr, "table=0x%llx no GPU-visible bytes\n", (unsigned long long)at);
+        line.f("table=0x%llx no GPU-visible bytes\n", (unsigned long long)at);
         return {"missing-table"};
     }
     if (words) *words = gpu;
-    std::fprintf(stderr, "heap-slot=%llu table-title=0x%llx writer=%s words=[%s] ",
+    line.f("heap-slot=%llu table-title=0x%llx writer=%s words=[%s] ",
         (unsigned long long)index, (unsigned long long)title_at, origin,
         leonida::fsdraw::hex_words(gpu.data(), gpu.size()).c_str());
     if (table && raw != gpu)
-        std::fprintf(stderr, "title-words=[%s] ", leonida::fsdraw::hex_words(raw.data(), raw.size()).c_str());
+        line.f("title-words=[%s] ", leonida::fsdraw::hex_words(raw.data(), raw.size()).c_str());
     if (gpu[3] >> 30) {
-        std::fprintf(stderr, "texture key=%s\n", leonida::fsdraw::has_tsharp(gpu.data()) ? "registered" : "absent");
+        line.f("texture key=%s\n", leonida::fsdraw::has_tsharp(gpu.data()) ||
+                                          (table && leonida::fsdraw::has_tsharp(raw.data())) ? "registered" : "absent");
         return {"texture"};
     }
     if (!(gpu[0] | gpu[1] | gpu[2] | gpu[3])) {
@@ -379,15 +397,15 @@ Backing descriptor(State& state, std::uint64_t seq, std::size_t list, std::size_
             const auto t = std::min<std::uint64_t>(std::uint64_t(raw[2]) * (title_stride ? title_stride : 1), sizeof(title)) / 4;
             const bool high = title_base & (1ull << 47);
             const auto tb = backing(state, title_base);
-            std::fprintf(stderr, "null (resolved to nothing) title-V#=0x%llx stride=%u records=%u storage=%s host=%s",
+            line.f("null (resolved to nothing) title-V#=0x%llx stride=%u records=%u storage=%s host=%s",
                          (unsigned long long)title_base, title_stride, raw[2], tb.kind,
                          high ? "bit47" : host_kind(title_base));
             if (!high && title_base >= state.arena.size && t && read_cpu(title_base, title.data(), 4 * t))
-                std::fprintf(stderr, " title-sample=[%s]", leonida::fsdraw::hex_words(title.data(), t).c_str());
-            std::fputc('\n', stderr);
+                line.f(" title-sample=[%s]", leonida::fsdraw::hex_words(title.data(), t).c_str());
+            line.s += '\n';
             return {"null"};
         }
-        std::fputs("null\n", stderr);
+        line.s += "null\n";
         return {"null"};
     }
     const auto base = std::uint64_t(gpu[0]) | (std::uint64_t(gpu[1] & 0xffff) << 32);
@@ -395,23 +413,23 @@ Backing descriptor(State& state, std::uint64_t seq, std::size_t list, std::size_
     const auto span = std::uint64_t(gpu[2]) * (stride ? stride : 1);
     auto b = backing(state, base);
     const auto signed_base = (base ^ (1ull << 47)) - (1ull << 47);
-    std::fprintf(stderr, "V#=0x%llx bda=0x%llx stride=%u records=%u storage=%s title=0x%llx",
+    line.f("V#=0x%llx bda=0x%llx stride=%u records=%u storage=%s title=0x%llx",
         (unsigned long long)base, (unsigned long long)(state.arena.address + signed_base), stride, gpu[2],
         b.kind, (unsigned long long)b.title);
     std::array<std::uint32_t, 16> data{};
     const auto n = std::min<std::uint64_t>({span, b.available, sizeof(data)}) / 4;
     if (n && read_backing(b, 0, data.data(), 4 * n))
-        std::fprintf(stderr, " cpu-sample=[%s]", leonida::fsdraw::hex_words(data.data(), n).c_str());
+        line.f(" cpu-sample=[%s]", leonida::fsdraw::hex_words(data.data(), n).c_str());
     // The title's own bytes at the base (as the title wrote them), when the host has the address: against what the
     // GPU reads there, the first 16 dwords.
     {
         std::array<std::uint32_t, 16> title{};
         const auto t = std::min<std::uint64_t>(span ? span : 4, sizeof(title)) / 4;
         const bool read = base >= state.arena.size && !(base & (1ull << 47)) && t && read_cpu(base, title.data(), 4 * t);
-        std::fprintf(stderr, " host=%s", base & (1ull << 47) ? "bit47" : host_kind(base));
+        line.f(" host=%s", base & (1ull << 47) ? "bit47" : host_kind(base));
         if (read) {
-            std::fprintf(stderr, " title-sample=[%s]", leonida::fsdraw::hex_words(title.data(), t).c_str());
-            if (n) std::fprintf(stderr, " gpu-vs-title=%s", std::memcmp(title.data(), data.data(), 4 * std::min<std::uint64_t>(n, t)) ? "DIFFER" : "same");
+            line.f(" title-sample=[%s]", leonida::fsdraw::hex_words(title.data(), t).c_str());
+            if (n) line.f(" gpu-vs-title=%s", std::memcmp(title.data(), data.data(), 4 * std::min<std::uint64_t>(n, t)) ? "DIFFER" : "same");
         }
     }
     if (std::string_view(b.kind) == "untranslated-title") {
@@ -421,15 +439,15 @@ Backing descriptor(State& state, std::uint64_t seq, std::size_t list, std::size_
         const auto aliased = leonida::title_va_aliases().shader_va(source);
         MEMORY_BASIC_INFORMATION region{};
         VirtualQuery(reinterpret_cast<const void*>(source), &region, sizeof(region));
-        std::fprintf(stderr, " source=0x%llx source-alias=0x%llx state=0x%lx protect=0x%lx",
+        line.f(" source=0x%llx source-alias=0x%llx state=0x%lx protect=0x%lx",
                      (unsigned long long)source, (unsigned long long)aliased, region.State, region.Protect);
-        if (from_cbv) std::fprintf(stderr, " recorded-CBV-location=0x%llx", (unsigned long long)created_at);
+        if (from_cbv) line.f(" recorded-CBV-location=0x%llx", (unsigned long long)created_at);
         const auto size = std::min<std::uint64_t>(span, sizeof(data)) / 4;
         if (size && region.State == MEM_COMMIT && !(region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
             read_cpu(source, data.data(), size * 4))
-            std::fprintf(stderr, " source-only=[%s]", leonida::fsdraw::hex_words(data.data(), size).c_str());
+            line.f(" source-only=[%s]", leonida::fsdraw::hex_words(data.data(), size).c_str());
     }
-    std::fputc('\n', stderr);
+    line.s += '\n';
     b.available = std::min(b.available, span);
     return b;
 }
