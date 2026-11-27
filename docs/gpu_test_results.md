@@ -4,6 +4,12 @@ This page keeps a local record of GPU test runs. The project's public tracker is
 [#166](https://github.com/ItsNotRexed/Leonida/issues/166) (one comment per GPU and driver);
 post counts and pass/fail lines there, never game shaders, logs or private paths.
 
+Name the Vulkan headers a run was built against: configure with `-DLEONIDA_VULKAN_HEADERS_FETCH=ON`, which uses the
+repository's pinned Khronos Vulkan-Headers whatever else is installed, and quote the configure's `-- Vulkan headers:`
+line in the entry. Other headers can change the counts ([testing.md](testing.md#build-the-test-programs)). Until
+`CMAKE-VULKAN-HEADERS-PIN` the flag lost to any Vulkan headers already on the machine, so an older entry whose setup
+names it may have been built against those instead.
+
 | GPU | Driver, OS | Commit | build.py | check.py | run_gpu_tests.py | Failed | Entry |
 |---|---|---|---|---|---|---|---|
 | NVIDIA GeForce RTX 5070 Ti (Blackwell), subgroup 32 | NVIDIA 621.01, Windows 11 26300.9457 | `e0b08c7` | not run; pre-disassembled subset | run via run_gpu_tests.py | **Subset:** 82/98 passed, 16 skipped (native); 98/98 passed (`LEONIDA_W64_EMULATE=1`); Python assembler, no spirv-val. ctest 280/280 (MSVC) | none in the subset | [local note](../gpu-test-results/RTX5070Ti-62101.txt) |
