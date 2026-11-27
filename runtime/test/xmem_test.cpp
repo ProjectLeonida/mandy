@@ -840,6 +840,47 @@ void test_copy_page_mappings_cpu_view(const PhysicalApi& api) {
     check(api.free_pages(kPool, pages) == TRUE, "the pool's pages are freed");
 }
 
+// A physical page number the title frees comes back with its next allocation (the free slots are reused last in, first
+// out), now naming another page of memory. A slot-31 copy of that number onto a table page that still holds the freed
+// page's number must give it the new page: the table's frame is the memory behind the number now, not the one it was
+// given before (the readers of a stream pool's pages read through it: a stale frame showed them the freed page's
+// bytes).
+void test_copy_page_mappings_reused_number(const PhysicalApi& api) {
+    const auto copy = rt::xmem::copy_page_mappings_fn;
+    if (!copy) return;  // test_copy_page_mappings reports it
+    auto* const pool = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    auto* const cpu = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    auto* const gpu = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x3, 0x801));
+    check(pool && cpu && gpu, "XMemVirtualAlloc reserves a pool and a CPU + GPU-only pair");
+    if (!pool || !cpu || !gpu) return;
+    const auto frame_word = [](const uint8_t* at) {
+        leonida::title_frames::Frame frame;
+        return leonida::title_frames::find(reinterpret_cast<uintptr_t>(at), frame) ? read_u32(frame.bytes, 0) : 0u;
+    };
+    uint64_t first = 0, count = 1;
+    check(api.allocate(0x280, &count, &first) == TRUE && count == 1 && api.map(pool, 1, &first) == pool,
+          "a page for the pool");
+    fill_page(pool, 0x7500u);
+    check(copy(gpu, pool, 1, false) && frame_word(gpu) == 0x7500u && frame_word(cpu) == 0x7500u,
+          "the GPU-only page and its twin take the pool's page");
+    // The title lets the page go and allocates again: the same number, another page of memory.
+    check(api.map(pool, 1, nullptr) == pool && api.free_pages(1, &first) == TRUE, "the title frees the page");
+    uint64_t second = 0;
+    count = 1;
+    check(api.allocate(0x280, &count, &second) == TRUE && count == 1 && second == first,
+          "the next allocation reuses the freed page's number");
+    check(api.map(pool, 1, &second) == pool, "the pool maps the new page");
+    fill_page(pool, 0x7600u);
+    check(copy(gpu, pool, 1, false), "a copy of the reused number onto the table pages");
+    check(frame_word(gpu) == 0x7600u && frame_word(cpu) == 0x7600u,
+          "the table pages read the new page behind the number, not the freed one");
+    check(copy(gpu, nullptr, 1, false) && api.map(pool, 1, nullptr) == pool && api.free_pages(1, &second) == TRUE,
+          "the pages are unmapped and freed");
+}
+
 bool access_faults(volatile uint32_t* address, bool write) {
     __try {
         if (write) {
@@ -2783,6 +2824,7 @@ int main(int argc, char** argv) {
         }
         test_copy_page_mappings(physical);
         test_copy_page_mappings_cpu_view(physical);
+        test_copy_page_mappings_reused_number(physical);
         test_stream_cpu_twin(physical);
         test_unowned_guards(physical);
         test_physical_pages_commit_on_touch(physical);
