@@ -115,9 +115,15 @@ public:
     std::size_t tiles() const { return tiles_.size(); }
     std::size_t unarmed() const { return unarmed_.size(); }
 
-    // The texture `key` reads [cpu, cpu + bytes) from now on (a new texture, or one whose layout changed): it is named
-    // by the next collect() whatever its tiles say. Tracking it again replaces its range.
+    // The texture `key` reads [cpu, cpu + bytes) from now on (a new texture, or one whose range changed): it is named
+    // by the next collect() whatever its tiles say. Tracking it again over the same tiles changes nothing (its tiles stay
+    // armed and it is not named: the title's Map, a view, a layout found for the same bytes are not writes; touch()
+    // names it when its bytes must be read again); over other tiles it replaces its range.
     void track(Key key, std::uintptr_t cpu, std::uint64_t bytes) {
+        if (const auto it = textures_.find(key); it != textures_.end() && bytes &&
+                                                 it->second.first == (cpu & ~(kTile - 1)) &&
+                                                 it->second.last == ((cpu + bytes + kTile - 1) & ~(kTile - 1)))
+            return;
         untrack(key);
         if (!bytes) return;
         Texture& t = textures_[key];
