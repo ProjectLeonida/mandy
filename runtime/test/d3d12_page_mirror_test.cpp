@@ -16,7 +16,8 @@
 //   7. one page, the GPU writes piece A and the title piece B in the same submission window (the title's write is
 //      uploaded before the GPU's goes back): both survive, on both sides;
 //   8. XMemAlloc blocks lie in the mirror's range and are mirrored as the heap commits them: the GPU reads a small and
-//      a large block's bytes through a pointer into them that nothing named.
+//      a large block's bytes through a pointer into them that nothing named;
+//   9. the write-back over 64 MiB (one submission's most) returns the one piece the GPU wrote, in well under a second.
 // Exit 77 when the device makes no page mirror (no sparse aliased strict buffers or capture-replay addresses: llvmpipe).
 // No shaders, no game data.
 #include "../shims/d3d12_com.h"
@@ -30,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <chrono>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "page mirror line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -216,6 +218,23 @@ int test() {
     xmem_free(const_cast<std::uint32_t*>(heap_small), 0);
     xmem_free(const_cast<std::uint32_t*>(heap_large), 0);
     EXPECT(gpu_word(device.p, std::uintptr_t(heap_large) + 160000) == 0);  // decommitted: unmapped, reads zero
+
+    // 9. The write-back over 64 MiB of mirrored memory (the most one submission's write-back covers), the GPU having
+    //    written one piece of it: that piece goes back, and the call takes well under a second. The homes are copied
+    //    out by the GPU; read by the CPU from device-local memory it took 1.6 s for 16 MiB here, 14.5 s in run 64w.
+    {
+        constexpr SIZE_T kBig = 64u << 20;
+        auto* big = static_cast<std::uint8_t*>(reserve(nullptr, kBig, MEM_RESERVE | MEM_COMMIT, 0, PAGE_READWRITE));
+        EXPECT(big && rt::d3d12::page_mirror_name(device.p, std::uintptr_t(big), kBig));
+        const std::uint32_t mark[4] = {0x9A9A0001u, 0x9A9A0002u, 0x9A9A0003u, 0x9A9A0004u};
+        EXPECT(rt::d3d12::page_mirror_gpu_write(device.p, std::uintptr_t(big) + kBig - 0x1000, mark, sizeof(mark)));
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto back = rt::d3d12::page_mirror_write_back(device.p, std::uintptr_t(big), kBig);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("page mirror: write-back over 64 MiB in %.1f ms\n", ms);
+        EXPECT(back == 256 && reinterpret_cast<volatile std::uint32_t*>(big + kBig - 0x1000)[3] == 0x9A9A0004u);
+        EXPECT(ms < 1000.0);
+    }
 
     const auto end = rt::d3d12::page_mirror_state(device.p);
     std::printf("page mirror: heap_base 0x%llx, %llu pages in %llu homes over %llu chunk(s); slot-31 copies, a title "

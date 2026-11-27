@@ -4589,6 +4589,20 @@ struct DeviceState {
         std::uint64_t presents = 0;  // present serial at the last log line
         std::uint64_t faults_seen = 0, hot_seen = 0, cold_seen = 0;  // the tracking's counters at the last log line
         std::uint64_t uploaded_seen = 0, conflicts_seen = 0;           // the mirror's, likewise
+        // The write-back's GPU copy of the homes it looks at (page_mirror_write_back): a host-cached buffer of
+        // kReadbackPages pages, its command buffer and fence, made at the first write-back. And its cost since the
+        // last line: calls, milliseconds (the copies' waits among them), the most one took, the bytes copied.
+        VkBuffer readback = VK_NULL_HANDLE;
+        VkDeviceMemory readback_memory = VK_NULL_HANDLE;
+        const std::uint8_t* readback_host = nullptr;
+        VkCommandPool readback_pool = VK_NULL_HANDLE;
+        VkCommandBuffer readback_commands = VK_NULL_HANDLE;
+        VkSemaphore readback_done = VK_NULL_HANDLE;  // a timeline: value readback_value once the last copy is done
+        std::uint64_t readback_value = 0;
+        bool readback_failed = false;
+        std::vector<std::uint64_t> readback_pages;
+        std::uint64_t write_back_calls = 0, read_back_bytes = 0;
+        double write_back_ms = 0, write_back_wait_ms = 0, write_back_max_ms = 0;
         double ms = 0;
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
         // The console heaps read in place (add_heap_in_place): their filter state is under this mutex too.
@@ -4881,18 +4895,180 @@ struct DeviceState {
     }
     // What the GPU wrote into the homes of mirrored pages of [begin, end) goes back to the title's pages
     // (TitleMirror::write_back: merged at the 256-byte piece, a piece only the GPU changed goes back, one both changed
-    // keeps the title's bytes), once the submissions that could write them have retired (write_back_titles). Written
-    // through kernel_writes, which opens and pins the page and every other address of its physical page, so the
-    // readers over them take the bytes. Returns the bytes written.
+    // keeps the title's bytes), once the submissions that could write them have retired (write_back_titles). The homes
+    // are copied out by the GPU into host-cached memory first, kReadbackPages at a time: the CPU never reads a home,
+    // which in device-local memory is an uncached read over the bus (run 64w: 14.5 s for one submission's 64 MiB).
+    // Written through kernel_writes, which opens and pins the page and every other address of its physical page, so
+    // the readers over them take the bytes. Returns the bytes written.
+    static constexpr std::size_t kReadbackPages = 256;  // 16 MiB a copy
+    bool make_readback_locked() {
+        auto& m = page_mirror;
+        if (m.readback) return true;
+        if (m.readback_failed) return false;
+        auto& vk = context->vk;
+        const VkDevice dev = info.device;
+        m.readback_failed = true;
+        VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        buffer.size = kReadbackPages * leonida::TitleMirror::kPage;
+        buffer.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (vk.vkCreateBuffer(dev, &buffer, nullptr, &m.readback) != VK_SUCCESS) return false;
+        VkMemoryRequirements requirements{};
+        vk.vkGetBufferMemoryRequirements(dev, m.readback, &requirements);
+        m.readback_memory = allocate(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                     VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        void* mapped = nullptr;
+        VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pool.queueFamilyIndex = info.queue_family;
+        VkCommandBufferAllocateInfo commands{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        commands.commandBufferCount = 1;
+        VkSemaphoreTypeCreateInfo timeline{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        timeline.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &timeline};
+        const bool ok = m.readback_memory && vk.vkBindBufferMemory(dev, m.readback, m.readback_memory, 0) == VK_SUCCESS &&
+                        vk.vkMapMemory(dev, m.readback_memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS &&
+                        vk.vkCreateCommandPool(dev, &pool, nullptr, &m.readback_pool) == VK_SUCCESS &&
+                        (commands.commandPool = m.readback_pool,
+                         vk.vkAllocateCommandBuffers(dev, &commands, &m.readback_commands) == VK_SUCCESS) &&
+                        vk.vkCreateSemaphore(dev, &semaphore, nullptr, &m.readback_done) == VK_SUCCESS;
+        if (!ok) {
+            destroy_readback_locked();
+            std::fprintf(stderr, "[rt] d3d12: page mirror: no buffer to copy homes out for the write-back: the GPU's "
+                                 "writes into mirrored pages do not go back to the title\n");
+            return false;
+        }
+        m.readback_host = static_cast<const std::uint8_t*>(mapped);
+        m.readback_failed = false;
+        return true;
+    }
+    void destroy_readback_locked() {
+        auto& m = page_mirror;
+        auto& vk = context->vk;
+        const VkDevice dev = info.device;
+        if (m.readback_done) vk.vkDestroySemaphore(dev, m.readback_done, nullptr);
+        if (m.readback_pool) vk.vkDestroyCommandPool(dev, m.readback_pool, nullptr);
+        if (m.readback) vk.vkDestroyBuffer(dev, m.readback, nullptr);
+        if (m.readback_memory) vk.vkFreeMemory(dev, m.readback_memory, nullptr);
+        m.readback_done = VK_NULL_HANDLE;
+        m.readback_value = 0;
+        m.readback_pool = VK_NULL_HANDLE;
+        m.readback_commands = VK_NULL_HANDLE;
+        m.readback = VK_NULL_HANDLE;
+        m.readback_memory = VK_NULL_HANDLE;
+        m.readback_host = nullptr;
+    }
+    // The homes of `pages` (at most kReadbackPages, page_mirror.mutex held: nothing is filled meanwhile) into the
+    // readback buffer, in order, after the mirror's last bind batch. Waits for the copy alone (a timeline semaphore of
+    // its own), on the device's staging queue.
+    bool copy_homes_out_locked(const std::uint64_t* pages, std::size_t count) {
+        auto& m = page_mirror;
+        auto& vk = context->vk;
+        constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vk.vkResetCommandBuffer(m.readback_commands, 0) != VK_SUCCESS ||
+            vk.vkBeginCommandBuffer(m.readback_commands, &begin) != VK_SUCCESS)
+            return false;
+        // One copy command per run of pages in one chunk; regions that follow each other in both are joined.
+        std::vector<VkBufferCopy> regions;
+        VkBuffer source = VK_NULL_HANDLE;
+        const auto emit = [&] {
+            if (source && !regions.empty())
+                vk.vkCmdCopyBuffer(m.readback_commands, source, m.readback, std::uint32_t(regions.size()), regions.data());
+            regions.clear();
+        };
+        for (std::size_t i = 0; i < count; ++i) {
+            VkBuffer chunk = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            if (!m.mirror->chunk_at(pages[i], chunk, offset)) {
+                vk.vkEndCommandBuffer(m.readback_commands);
+                return false;
+            }
+            if (chunk != source) {
+                emit();
+                source = chunk;
+            }
+            if (!regions.empty() && regions.back().srcOffset + regions.back().size == offset &&
+                regions.back().dstOffset + regions.back().size == i * kPage)
+                regions.back().size += kPage;
+            else
+                regions.push_back({offset, i * kPage, kPage});
+        }
+        emit();
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vk.vkCmdPipelineBarrier(m.readback_commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
+                                &barrier, 0, nullptr, 0, nullptr);
+        if (vk.vkEndCommandBuffer(m.readback_commands) != VK_SUCCESS) return false;
+        const std::uint64_t wait = m.value, done = m.readback_value + 1;
+        VkTimelineSemaphoreSubmitInfo values{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        values.waitSemaphoreValueCount = wait ? 1u : 0u;
+        values.pWaitSemaphoreValues = &wait;
+        values.signalSemaphoreValueCount = 1;
+        values.pSignalSemaphoreValues = &done;
+        const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, &values};
+        submit.waitSemaphoreCount = wait ? 1u : 0u;
+        submit.pWaitSemaphores = &m.timeline;
+        submit.pWaitDstStageMask = &stage;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &m.readback_commands;
+        submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores = &m.readback_done;
+        VkResult result;
+        {
+            std::lock_guard lock(context->submit_mutex());
+            result = context->observe_result(vk.vkQueueSubmit(info.queue, 1, &submit, VK_NULL_HANDLE),
+                                             "vkQueueSubmit (page mirror write-back copy)");
+        }
+        if (result == VK_SUCCESS) {
+            m.readback_value = done;
+            VkSemaphoreWaitInfo until{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+            until.semaphoreCount = 1;
+            until.pSemaphores = &m.readback_done;
+            until.pValues = &done;
+            result = context->observe_result(vk.vkWaitSemaphores(info.device, &until, UINT64_MAX),
+                                             "vkWaitSemaphores (page mirror write-back copy)");
+        }
+        if (result == VK_ERROR_DEVICE_LOST) context->mark_device_lost();
+        return result == VK_SUCCESS;
+    }
     std::uint64_t page_mirror_write_back(std::uint64_t begin, std::uint64_t end) {
         auto& m = page_mirror;
         if (!m.mirror || begin >= end) return 0;
+        using clock = std::chrono::steady_clock;
         std::lock_guard lock(m.mutex);
-        // A console heap read in place is skipped there: its home holds the filtered slots.
-        const std::uint64_t written = m.mirror->write_back(begin, end, [](std::uint64_t at, const std::uint8_t* bytes,
-                                                                          std::size_t n) {
+        m.readback_pages.clear();
+        m.mirror->homes_in(begin, end, m.readback_pages);
+        if (m.readback_pages.empty() || !make_readback_locked()) return 0;
+        const auto start = clock::now();
+        double waited = 0;
+        std::uint64_t written = 0;
+        constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
+        const auto write = [](std::uint64_t at, const std::uint8_t* bytes, std::size_t n) {
             return leonida::kernel_writes::write(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at)), bytes, n);
-        });
+        };
+        for (std::size_t first = 0; first < m.readback_pages.size(); first += kReadbackPages) {
+            const std::size_t count = std::min(kReadbackPages, m.readback_pages.size() - first);
+            const std::uint64_t* pages = m.readback_pages.data() + first;
+            const auto copy_start = clock::now();
+            const bool copied = copy_homes_out_locked(pages, count);
+            waited += std::chrono::duration<double, std::milli>(clock::now() - copy_start).count();
+            if (!copied) break;
+            m.read_back_bytes += count * kPage;
+            const auto staged = [&](std::uint64_t page) -> const std::uint8_t* {
+                const auto at = std::lower_bound(pages, pages + count, page);
+                return at != pages + count && *at == page ? m.readback_host + (at - pages) * kPage : nullptr;
+            };
+            written += m.mirror->write_back(std::max(begin, pages[0]), std::min(end, pages[count - 1] + kPage), staged,
+                                            write);
+        }
+        const double ms = std::chrono::duration<double, std::milli>(clock::now() - start).count();
+        ++m.write_back_calls;
+        m.write_back_ms += ms;
+        m.write_back_wait_ms += waited;
+        m.write_back_max_ms = std::max(m.write_back_max_ms, ms);
         m.written_back += written;
         return written;
     }
@@ -4919,6 +5095,7 @@ struct DeviceState {
         std::lock_guard lock(page_mirror.mutex);
         page_mirror.tracking.reset();
         page_mirror.mirror.reset();
+        destroy_readback_locked();
         for (VkBuffer chunk : page_mirror.chunks) context->vk.vkDestroyBuffer(info.device, chunk, nullptr);
         page_mirror.chunks.clear();
         if (page_mirror.timeline) context->vk.vkDestroySemaphore(info.device, page_mirror.timeline, nullptr);
@@ -4994,7 +5171,9 @@ struct DeviceState {
                          "made on it, %llu KiB of GPU writes copied back; homes in device-local memory %llu units, in "
                          "host memory %llu; tracking: %zu pages hot, %zu cold, %llu write faults, %llu hot and %llu "
                          "cold copies; uploaded %.1f KiB a submission and %.1f KiB a frame; written back %.1f KiB a "
-                         "submission and %.1f KiB a frame; %llu pieces written on both sides (the title's kept)\n",
+                         "submission and %.1f KiB a frame; %llu pieces written on both sides (the title's kept); "
+                         "write-back: %llu calls, %.3f ms each (%.3f of it the GPU's copy of the homes and its wait), "
+                         "%.3f ms the longest, %.1f MiB of homes copied out\n",
                          static_cast<unsigned long long>(c.pages), static_cast<unsigned long long>(c.homes),
                          static_cast<unsigned long long>(c.units),
                          static_cast<unsigned long long>(c.units * (leonida::TitleMirror::kUnitBytes >> 20)),
@@ -5017,7 +5196,13 @@ struct DeviceState {
                          frames ? double(c.uploaded_bytes - m.uploaded_seen) / 1024.0 / double(frames) : 0.0,
                          m.refreshes ? double(m.written_back) / 1024.0 / double(m.refreshes) : 0.0,
                          frames ? double(m.written_back) / 1024.0 / double(frames) : 0.0,
-                         static_cast<unsigned long long>(c.conflicts - m.conflicts_seen));
+                         static_cast<unsigned long long>(c.conflicts - m.conflicts_seen),
+                         static_cast<unsigned long long>(m.write_back_calls),
+                         m.write_back_calls ? m.write_back_ms / double(m.write_back_calls) : 0.0,
+                         m.write_back_calls ? m.write_back_wait_ms / double(m.write_back_calls) : 0.0,
+                         m.write_back_max_ms, double(m.read_back_bytes) / double(1 << 20));
+            m.write_back_calls = m.read_back_bytes = 0;
+            m.write_back_ms = m.write_back_wait_ms = m.write_back_max_ms = 0;
             m.uploaded_seen = c.uploaded_bytes;
             m.conflicts_seen = c.conflicts;
             m.faults_seen = policy.faults;
