@@ -19,6 +19,7 @@ method, scope and caveats. No game data is included.
 | [modding.md](modding.md) | The mod format: `mods/<folder>/mod.json`, checked and loaded in name order by `gta6rt`; a swap takes effect once the game's archetype lookup is hooked (needs the executable, RT-5). A mod names game models and holds no game data. |
 | [progress_dashboard.md](progress_dashboard.md) | A local page of what works, what changed since it last passed and what blocks next: unit and runtime tests, the translator contract by confirmation method, measured imports, corpus counts and, with `--github`, CI and the D3D- items (`tools/progress_dashboard.py`). |
 | [dev-tools.md](dev-tools.md) | The development CLI `scripts/dev.py`: `discover` (text or `--json`, schema version 1) lists the boot-trace analyzer and the guest-scene runner with their help commands and prerequisites, without running them; live attach, pause, step and screenshots are not available through it. |
+| [selective_re.md](selective_re.md) | The REA + Ghidra setup for isolated, question-driven reverse engineering of the local package: measured cold-import costs, the cheapest-evidence ladder (docs, static PE tools, shipped DLLs, the executable last), seven playability-ordered targets, and the evidence-hygiene rules. |
 
 ## Archives and assets
 

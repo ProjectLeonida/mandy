@@ -166,4 +166,62 @@ static reference, reached through a table (#7516), so 2 of them are calls of ano
 - The names of the stream record types and of their values.
 - The offline statistics layout (§4). It is not in the package: the one DLL that knows the type only rejects or
   skips it (RT-155). A runtime doesn't need it, because the shipped builder refuses the request.
-- Whether the game passes a non-empty stream desc at all. That needs the executable's call sites (RT-5).
+- The stream desc: answered in §6. It is never non-empty. Every element's stream is zeroed before its fields are
+  written, and all three prebuild calls pass a null pointer, so ignoring it cannot change a build.
+
+## 6. What the executable passes (measured)
+
+Measured statically on 1.0.2.1 (SHA-256 `e95020b2…d5a08993`) on 2026-11-25: every reference to the seven import
+slots at `0x6793f78`…`0x6793fa8` was located in `.text`, then the instructions that set the argument registers before
+each `call qword [rip+disp32]` were read with `llvm-objdump -d`. No game code is quoted here, only the arguments.
+
+`tools/import_call_sites.py` reports **0** call sites for this DLL: the title reaches these imports with
+`call qword [rip+disp32]` directly, not through a `jmp qword [rip+disp32]` thunk, and the tool counts `E8`/`E9`
+branches to a thunk. The slot references (`FF 15` at the site) are the ones below.
+
+| Export | Sites | Measured arguments |
+|---|---:|---|
+| `XboxBvhBuilder(ID3D12Device11*, bool)` | 1 | `this` is a fresh **0x18-byte** allocation, zeroed; device from a global; **bool `false`**; the object is then stored in a global |
+| `~XboxBvhBuilder()` | 1 | calls the destructor on that global, then frees the same pointer with size `0x18` |
+| `Set64BitMortonCodes(bool)` | 8 | **4 × true and 4 × false**, in enable/disable pairs around builds |
+| `GetRaytracingAccelerationStructurePrebuildInfo(INPUTS*, XDXR_STREAM_DESC*, PREBUILD_INFO*)` | 3 | the stream argument is **null at all three**; the output struct is zeroed (`0x18` bytes) before the call |
+| `BuildRaytracingAccelerationStructureBatched2X(GCL6*, UINT, BATCHED_DESC2*)` | 8 | 4 in each of two sibling functions; the element fill zeroes all `0x50` bytes, writes `Dest`, `Inputs`, the postbuild count/pointer, and **never writes `+0x40`**, so every element carries an all-zero stream desc |
+| `CopyRaytracingAccelerationStructure(GCL4*, dest, source, mode)` | 2 | `mode` is the stack argument **1** (`COMPACT`) at both |
+| `RehydrateRaytracingAccelerationStructureBatched2X(GCL8*, UINT, BUILD_DESC*, UINT64*)` | 4 | batched from a 16-entry stack pair: descs at `rsp+0xe0`, source array at `rsp+0x60`; a batch is flushed when the accepted count reaches 16, and the remainder at the end |
+
+The rehydrate descs are built in the title from a source record, with a fixed shape: `DestAccelerationStructureData`
+= the destination array element, the 24-byte `Inputs` copied from the record, `SourceAccelerationStructureData` =
+the record's translated pointer, and **`ScratchAccelerationStructureData` = 0**. The source array (`rsp+0x60`) holds
+the same translated pointers, one per desc. The return value is not checked before the caller continues.
+
+The constructor's `bool`: `false` (what the title passes) allocates the internal `0x1f8`-byte device builder at
+`this+0` and builds its pipelines; `true` leaves that pointer null. The constructor writes `this+0`, `this+8` and
+`this+0x10` and nothing else, so the class is exactly `0x18` bytes — the size the title allocates.
+
+## 7. Rehydrate as the DLL defines it
+
+Decompiled on the same file with Ghidra 12.2 through REA 6.10.1:
+
+- `ValidateRehydrateAccelerationStructureBuildDesc` (`0x21a00`) hashes the build inputs — `Inputs.NumDescs` at
+  `+0x10`; `Inputs.DescsLayout` at `+0x14`: 0 walks geometry descriptors at stride `0x38`, 1 walks an array of
+  instance pointers — and compares the hash with the 32-bit word at **`SourceAccelerationStructureData + 8`**.
+  A mismatch returns `E_INVALIDARG` after logging "Detected a mismatch between the dehydrated BVH and the build
+  desc supplied to rehydrate it." So a desc with no geometry cannot pass, and the dehydrated stream carries a header
+  whose second word binds it to one build description.
+- `RehydrateRaytracingAccelerationStructureBatched2X` (`0x219d0`) forwards to an internal routine (`0x14700`).
+  Per element it takes `source[i]` when the source array is non-null and `desc.SourceAccelerationStructureData`
+  otherwise, reads `*(u32*)source` on the **CPU**, and returns `E_INVALIDARG` when `source` is null, `Dest` is
+  null, or bit `0x01000000` of that first word is clear. The array therefore **overrides** the desc's own source,
+  rather than merely filling a null one.
+
+For the shim (`runtime/shims/xbox_bvh_builder.cpp`, and the open #1759 for the rebuild): the title's descs carry
+real geometry, the title passes **`ScratchAccelerationStructureData = 0`**, and the source array is authoritative.
+A rebuild path has to supply its own scratch and must not expect one from the desc; a `source`-only element that
+skips the geometry would also fail the DLL's own validation.
+
+Measured on the retail boot: the #1759 rebuild forwards the title's desc unchanged, so
+`GraphicsCommandList::BuildRaytracingAccelerationStructure` takes the `!cmd.scratch_va` branch
+(`runtime/shims/d3d12_com.cpp`, the alignment check) and rejects the call, which makes that list's `Close` return
+`E_INVALIDARG` and its `ExecuteCommandLists` refuse it. The diagnostic appears once per boot in each run of a
+#1759 tree (three runs measured) and not on `main`. The synthetic test does not see it because it sets
+`ScratchAccelerationStructureData` to a real buffer, unlike the title.
