@@ -9200,6 +9200,16 @@ struct DeviceState {
         images_by_address.erase(address);
         forget_image_views_locked(address);
     }
+    // The same for a texture that is going, only while `owner` is the texture registered at `address`: one that took
+    // the address over since (a slot-133 texture placed where a slot-70 view had made one, place_at_title_address)
+    // keeps it, and the views of the one going left with that takeover.
+    void forget_image_of(std::uint64_t address, const void* owner) {
+        std::lock_guard lock(descriptor_mutex);
+        const auto it = images_by_address.find(address);
+        if (it == images_by_address.end() || it->second != owner) return;
+        images_by_address.erase(it);
+        forget_image_views_locked(address);
+    }
     // Its T#s stop naming it at once (a shader's lookup of their words misses from the next table flush on); the
     // console heap slots that held them wait for the next texture at the address (note_texture_change), and the
     // indices freed let T#s that found their array full bind.
@@ -9975,7 +9985,7 @@ public:
             std::lock_guard lock(device_.descriptor_mutex);
             device_.pending_image_keys.erase(image_);
         }
-        if (image_address_ && device_.image_owner(image_address_) == this) device_.forget_image(image_address_);
+        if (image_address_) device_.forget_image_of(image_address_, this);
         device_.context->remove_resource(id());
         // Before the memory goes to the deferred queue: no submission copies into it after this.
         if (shadow_) device_.remove_shadow(shadow_);
@@ -18435,8 +18445,10 @@ private:
     void retire_title_texture(TitleTexture& t) {
         if (!t.owned || !t.resource) return;
         // Its T#s leave the hash table now (a later texture at the address takes them over); the image itself goes
-        // a few seconds later, when no submission can still read it.
-        if (t.resource->image_address()) state_.forget_image(t.resource->image_address());
+        // a few seconds later, when no submission can still read it. Only while it still holds the address: a
+        // slot-133 texture placed there since (register_title_texture retires this entry right after the placement
+        // took the address over) keeps it, or every T# naming the address would find no texture.
+        if (t.resource->image_address()) state_.forget_image_of(t.resource->image_address(), t.resource);
         retired_backing_ += t.resource->image_backing_bytes();
         retired_title_textures_.emplace_back(std::chrono::steady_clock::now(), t.resource);
         t.resource = nullptr;

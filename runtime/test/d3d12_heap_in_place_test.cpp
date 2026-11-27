@@ -11,7 +11,12 @@
 //   4. no copy: the device names it "read in place";
 //   5. a T# in the heap (the words CreateShaderResourceView wrote for a texture of ours) reads with the bindless index
 //      in its dword 6 (gfx10_descriptors.h, tsharp_index_word: the tag and the texture's index) once the filter and its
-//      finishing have run, while the title's bytes keep the dword 6 the title wrote.
+//      finishing have run, while the title's bytes keep the dword 6 the title wrote;
+//   6. a texture the title places in its own memory (device slot 133, in a reservation at 16 TiB and up) where a slot-70
+//      view had made a texture of the layer's first, named by a T# the title writes itself (its dword 6 the title's, so
+//      the T# is found by its address), binds: tag and index (the slot-70 texture's retirement used to take the
+//      address from the placed one, and the T# found no texture); when the texture goes the slot reads the fallback
+//      (0: vulkan_bindless.h's 1x1 zeros), and a texture placed again at the address binds it again.
 // Exit 77 when the device makes no page mirror (llvmpipe). No shaders, no game data.
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
@@ -20,6 +25,7 @@
 #include "../src/gfx10_descriptors.h"
 #include "../src/title_mirror_space.h"
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -58,6 +64,18 @@ leonida::gfx10::BufferWords raw_vsharp(std::uint64_t address, std::uint32_t byte
     b.oob_select = leonida::gfx10::OobSelect::raw;
     return leonida::gfx10::encode(b);
 }
+// Device slot 133 (CreatePlacedResourceX) as the title calls it: (va, desc, layout, clear, riid, out).
+using SlotFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                      std::uint64_t, std::uint64_t);
+HRESULT place(void* xbox, void* va, const D3D12_RESOURCE_DESC& desc, ID3D12Resource** out) {
+    void* const* vtable = *static_cast<void* const* const*>(xbox);
+    const GUID iid = __uuidof(ID3D12Resource);
+    const std::uint64_t r = reinterpret_cast<SlotFn>(vtable[133])(
+        xbox, reinterpret_cast<std::uint64_t>(va), reinterpret_cast<std::uint64_t>(&desc), 0xFFFFFFFFull, 0,
+        reinterpret_cast<std::uint64_t>(&iid), reinterpret_cast<std::uint64_t>(out));
+    return static_cast<HRESULT>(static_cast<std::uint32_t>(r));
+}
+
 std::uint64_t base_of(const std::uint32_t* w) { return std::uint64_t(w[0]) | (std::uint64_t(w[1] & 0xFFFFu) << 32); }
 
 int test() {
@@ -198,6 +216,73 @@ int test() {
     EXPECT(!std::memcmp(title + 6 * kDescriptor, tsharp, sizeof(tsharp)));
     EXPECT(reinterpret_cast<const std::uint32_t*>(title + 6 * kDescriptor)[leonida::gfx10::kTsharpIndexDword] ==
            0x00C0FFEEu);
+
+    // 6. A texture the title places in its own memory and names by a T# it writes.
+    {
+        auto* pixels = static_cast<std::uint8_t*>(reserve(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0,
+                                                          PAGE_READWRITE));
+        std::uint64_t pixel_page = 0, one = 1;
+        EXPECT(pixels && leonida::title_mirror_space::contains(std::uintptr_t(pixels)));
+        EXPECT(allocate(0x280, &one, &pixel_page) && one == 1 && map(pixels, 1, &pixel_page) == pixels);
+        std::memset(pixels, 0x40, kPage64k);
+        device.p->AddRef();  // the proxy takes one reference
+        Ref<ID3D12Device> xbox;
+        EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(device.p, __uuidof(ID3D12Device),
+                                                           reinterpret_cast<void**>(&xbox.p))));
+        rt::d3d12::set_device_outer(device.p, xbox.p);
+        D3D12_RESOURCE_DESC placed_desc = tex_desc;
+        placed_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x100);
+        // First a slot-70 view of the memory, before any texture is placed there: the layer makes a texture of its
+        // own for it (the title's order for memory it streams into and then places a texture on).
+        std::array<std::uint32_t, 14> resource_words{};
+        std::memcpy(resource_words.data(), &placed_desc, sizeof(placed_desc));
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = placed_desc.Format;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1;
+        std::array<std::uint32_t, 16> view_words{};
+        std::memcpy(view_words.data(), &view, sizeof(view));
+        leonida::gfx10::ImageWords streamed{};
+        EXPECT(rt::d3d12::write_placed_texture_view(device.p, false, resource_words.data(), view_words.data(),
+                                                    std::uintptr_t(pixels),
+                                                    {reinterpret_cast<SIZE_T>(streamed.data())}));
+        // Then the texture placed there (slot 133): it takes the address over.
+        Ref<ID3D12Resource> placed;
+        EXPECT(place(xbox.p, pixels, placed_desc, &placed.p) == S_OK && placed.p);
+        EXPECT(placed.p->GetGPUVirtualAddress() == std::uintptr_t(pixels));
+        // The T# the title writes: the words a view of the texture has, with the title's own dword 6.
+        device.p->CreateShaderResourceView(placed.p, nullptr, cpu);
+        std::uint32_t named[8];
+        std::memcpy(named, reinterpret_cast<const void*>(cpu.ptr), sizeof(named));
+        leonida::gfx10::ImageWords named_words{};
+        std::memcpy(named_words.data(), named, sizeof(named_words));
+        leonida::gfx10::Image named_image{};
+        EXPECT(leonida::gfx10::decode(named_words, named_image) && named_image.address == std::uintptr_t(pixels));
+        named[leonida::gfx10::kTsharpIndexDword] = 0x00BEEF00u;
+        std::thread([&] { std::memcpy(title + 7 * kDescriptor, named, sizeof(named)); }).join();
+        std::uint32_t got[8]{};
+        EXPECT(rt::d3d12::arena_gpu_read(device.p, shader_va + 7 * kDescriptor, got, sizeof(got)));
+        const std::uint32_t placed_word = got[leonida::gfx10::kTsharpIndexDword];
+        std::printf("placed texture at 0x%llx: the T# reads index word 0x%08x\n",
+                    static_cast<unsigned long long>(std::uintptr_t(pixels)), placed_word);
+        EXPECT((placed_word >> 28) == leonida::gfx10::kTsharpIndexTag && (placed_word & 0xFFFFu) != 0);
+        EXPECT(reinterpret_cast<const std::uint32_t*>(title + 7 * kDescriptor)[leonida::gfx10::kTsharpIndexDword] ==
+               0x00BEEF00u);
+        // The texture goes: the slot waits and reads the fallback. Another placed at the address: bound again.
+        placed.reset();
+        EXPECT(rt::d3d12::arena_gpu_read(device.p, shader_va + 7 * kDescriptor, got, sizeof(got)));
+        EXPECT(got[leonida::gfx10::kTsharpIndexDword] == 0);
+        Ref<ID3D12Resource> again;
+        EXPECT(place(xbox.p, pixels, placed_desc, &again.p) == S_OK && again.p);
+        EXPECT(rt::d3d12::arena_gpu_read(device.p, shader_va + 7 * kDescriptor, got, sizeof(got)));
+        const std::uint32_t again_word = got[leonida::gfx10::kTsharpIndexDword];
+        EXPECT((again_word >> 28) == leonida::gfx10::kTsharpIndexTag && (again_word & 0xFFFFu) != 0);
+        again.reset();
+        rt::d3d12::set_device_outer(device.p, nullptr);
+        xbox.reset();
+        EXPECT(map(pixels, 1, nullptr) == pixels && free_pages(1, &pixel_page));
+    }
 
     // 3. The null slots after the heap.
     std::uint32_t tail[64]{};
