@@ -4699,29 +4699,53 @@ order the submissions were recorded. The list keeps the last 64, so its numbers 
 recorded more than that.
 
 **AMD breadcrumbs.** NVIDIA's checkpoints say where a queue stopped; RADV has none. With `LEONIDA_DEVICE_MARKERS=1`
-as well, on a device with `VK_AMD_buffer_marker`, every numbered dispatch writes its `seq` into its queue's slot of
-one persistent buffer twice (`src/vulkan_device_markers.h`): at top of pipe before the dispatch (started) and at
-bottom of pipe after it (finished), with `vkCmdWriteBufferMarker2AMD` (or `vkCmdWriteBufferMarkerAMD` without
-synchronization2). A bottom-of-pipe write waits for all earlier work on the queue, so the finished value is the last
-dispatch before which everything had completed, and the queue's dispatches after it up to the started value are the
-ones the GPU began and did not finish. The oldest of them is the likely hang. The buffer is host-visible and
-coherent, in system memory where the device has such a type, so it can still be read after a device loss. The loss
-and stall reports then add lines like these (the shader names are made up):
+as well, on a device with `VK_AMD_buffer_marker`, every numbered dispatch and every draw writes its `seq` into its
+queue's slot of one persistent buffer twice (`src/vulkan_device_markers.h`): at top of pipe before the work
+(started) and at bottom of pipe after it (finished), with `vkCmdWriteBufferMarker2AMD` (or
+`vkCmdWriteBufferMarkerAMD` without synchronization2). Draws and dispatches share the numbering, so the 64-entry
+dispatch list has gaps where draws ran. A bottom-of-pipe write waits for all earlier work on the queue, so the
+finished value is the last item before which everything had completed, and the queue's items after it up to the
+started value are the ones the GPU began and did not finish. The oldest of them is the likely hang. The buffer is
+host-visible and coherent, in system memory where the device has such a type, so it can still be read after a device
+loss. The loss and stall reports then add lines like these (the shader names are made up):
 
 ```
 [rt] device-markers: AMD buffer markers, read after the device loss; best-effort: only what the GPU wrote before it stopped, and a reset may have lost the last writes
 [rt] device-markers: queue 0000000012345678 (compute) finished seq=1203 started seq=1205; started, not finished: 1204 1205
+[rt] device-markers:   finished: seq=1203 execute=88 queue=0000000012345678 (compute) list=0 command=16 shader=cs_example_b
 [rt] device-markers: likely hang: seq=1204 execute=88 queue=0000000012345678 (compute) list=0 command=17 shader=cs_example_a
-[rt] device-markers: queue 00000000123456a0 (direct) idle: finished seq=1199, nothing started after it; next submitted seq=1206 not started (waiting, or behind other work of the queue)
+[rt] device-markers:   in flight: seq=1205 execute=88 queue=0000000012345678 (compute) list=0 command=18 shader=cs_example_a
+[rt] device-markers: queue 00000000123456a0 (direct) finished seq=1199 started seq=1200; started, not finished: 1200
+[rt] device-markers:   finished: seq=1199 execute=89 queue=00000000123456a0 (direct) list=1 command=1 shader=cs_example_c
+[rt] device-markers: likely hang: seq=1200 execute=89 queue=00000000123456a0 (direct) list=1 command=7 draw=indexed count=3480 instances=1 pipeline=vs vs_example ps ps_example pass=draw 4 since command 2 (3 colours + depth, 1920x1080)
 [rt] device-fault: submitted dispatch seq=1204 execute=88 queue=0000000012345678 (compute) list=0 command=17 shader=cs_example_a groups=64,1,1 <- likely hang (device-markers)
 ```
 
-A separate history of the last 16,384 dispatches names the likely hang when it has already left the 64-entry list.
-An idle queue (finished equals started) is not called hung: if it still has dispatches submitted, it was waiting
-on a semaphore or stuck in work that is not a dispatch (a draw, a copy). The values are what the GPU wrote before
-it stopped; after a loss and a ring reset they may be stale, so read them as a pointer, not a proof. The cost with
-the switch on is two marker writes per dispatch (a command-processor write and an end-of-pipe event, no wait) plus
-one entry in the history; with it off nothing is recorded. Without the extension, or without
+A draw line gives its kind (`indexed`, `vertices`, `mesh`, with `-quads` for a quad list and `-indirect` or
+`-indirect-count` for arguments from a buffer) and counts (vertex or index count and instances, a mesh dispatch's
+`groups`, an indirect draw's `max` records and `stride`), its pipeline named as the `LEONIDA_GPU_PROFILE` lines name
+it (`gpu_profile::label`: each stage's tag and entry name, or `pso 0x...`), and its place among the draws of the list
+to the same targets: `pass=draw 4 since command 2` is the fourth draw to these targets since command 2. An idle queue
+gets a `not started:` line for its next submitted item. When `VK_EXT_device_fault` reports an address, a
+`device-fault: last started draw (device-markers):` line per queue follows the address lines, with `(not finished)`
+or `(finished)` and `<- likely hang` when it is the queue's likely hang.
+
+Granularity: a pair per draw, as per dispatch. The replay opens a rendering scope per draw, so the started write goes
+before the draw's helper passes (quad index expansion, indirect clamp; a hang there is named as the draw's) and the
+finished one after the scope ends, both outside a render pass instance. The extension allows them inside one too
+(`vk.xml`: `renderpass="both"`, and conditional rendering does not apply), which the legacy graphics ExecuteIndirect
+path, drawing in the caller's scope, uses; `vk_device_markers_test` writes a pair inside an open scope under
+validation. RADV (`radv_CmdWriteMarkerToMemoryAMD`) emits the cache flushes already pending, then a top-of-pipe write
+as one write-confirmed COPY_DATA (the command processor waits for that write only) and any other stage as one
+bottom-of-pipe EOP event (no wait): at most 24 dwords per draw, against the hundreds the draw's own scope and state
+take. A pair per run of one pipeline would be cheaper but could not name the draw, so it was not chosen.
+
+A separate history of the last 65,536 dispatches and draws (about 6 MiB) names the likely hang when it has already
+left the 64-entry list, and names every draw. An idle queue (finished equals started) is not called hung: if it
+still has work submitted, it was waiting on a semaphore or stuck in work that is neither (a copy, a barrier). The
+values are what the GPU wrote before it stopped; after a loss and a ring reset they may be stale, so read them as a
+pointer, not a proof. The cost with the switch on is two marker writes per dispatch and per draw plus one entry in
+the history; with it off nothing is recorded. Without the extension, or without
 `LEONIDA_DEVICE_FAULT`, the runtime logs one `device-markers: unavailable` line and runs as before.
 
 For a local pre-submit inspection, also set `LEONIDA_COMPUTE_INPUTS` to comma-separated shader name fragments and
