@@ -88,7 +88,7 @@ public:
     template<class Copy>
     void collect(Copy&& copy) {
         for (auto& [address, p] : pages_) {
-            if (p.hot && !p.probing) {
+            if (p.hot && !p.probe) {
                 ++stats_.hot_copies;
                 copy(address);
                 continue;
@@ -96,6 +96,7 @@ public:
             if (!p.written && p.armed) continue;  // guarded all along and not written: the copy is current
             // Written, or not guarded since the last copy (a write then faulted nowhere): armed, then copied.
             if (!p.armed) arm(address, p);
+            if (p.probe == 1 && p.armed) p.probe = 2;  // guarded from here: the next interval is the probe's
             p.written = false;
             ++(p.hot ? stats_.hot_copies : stats_.cold_copies);
             copy(address);
@@ -108,9 +109,11 @@ public:
         const bool probe = frame_ % kProbe == 0;
         for (auto& [address, p] : pages_) {
             if (p.hot) {
-                if (p.probing) {
-                    // A probe frame with no write: the page is cold from now on (it stays armed).
-                    p.probing = false;
+                if (p.probe == 2) {
+                    p.probe = 3;  // armed at the collect just before: the interval from here is observed
+                } else if (p.probe == 3) {
+                    // The interval after the arming saw no write: the page is cold from now on (it stays armed).
+                    p.probe = 0;
                     if (!(p.history & 1) && p.armed) {
                         p.hot = false;
                         ++stats_.demotions;
@@ -120,8 +123,8 @@ public:
                         guard_.disarm(address);
                         p.armed = false;
                     }
-                } else if (probe) {
-                    p.probing = true;  // guarded for the next frame (collect() arms it)
+                } else if (probe && !p.probe) {
+                    p.probe = 1;       // guarded at the next collect()
                     p.written = true;  // and copied once more after the arming
                 }
             } else if (unsigned(std::popcount(unsigned(p.history & ((1u << kHistory) - 1)))) >= kPromote) {
@@ -147,7 +150,8 @@ public:
 private:
     struct Page {
         std::uint16_t history = 0;  // bit 0: this frame
-        bool hot = false, probing = false, armed = false, written = false;
+        std::uint8_t probe = 0;  // a hot page's probe: 1 asked, 2 armed at the last collect, 3 observed
+        bool hot = false, armed = false, written = false;
     };
 
     void arm(std::uintptr_t address, Page& p) {

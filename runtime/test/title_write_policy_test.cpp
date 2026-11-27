@@ -73,7 +73,9 @@ int main() {
             for (unsigned submission = 0; submission < 4; ++submission) {
                 const std::uint64_t before = f.faults_by_page[kBase];
                 f.write(kBase + 100 + submission, std::uint8_t(frame + submission));
-                if (frame > 20 && frame % Policy::kProbe != 1) hot_faults_late += f.faults_by_page[kBase] - before;
+                // (a probe: armed at the collect after the probe's frame() and observed for the next interval)
+                const unsigned phase = frame % Policy::kProbe;
+                if (frame > 20 && phase != 1 && phase != 2) hot_faults_late += f.faults_by_page[kBase] - before;
                 if (frame % 10 == 0 && submission == 0) {
                     const std::uint64_t b = f.faults_by_page[kBase + kPage];
                     f.write(kBase + kPage + frame, std::uint8_t(frame));
