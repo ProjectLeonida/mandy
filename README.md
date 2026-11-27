@@ -36,7 +36,7 @@ happens **on your PC, from your own copy of the game**.
 > from your game and stays on your PC. Never share those files.
 
 > [!NOTE]
-> **This is a continuation of [NotRexed's Leonida project](https://github.com/ItsNotRexed/Leonida).** The original
+> **This is a continuation of [NotRexed's Leonida project](https://github.com/ProjectLeonida/Leonida).** The original
 > author has left the project, and development continues here with its full commit history. Credit for the work up to
 > that point belongs to NotRexed and the contributors listed in the history.
 
@@ -44,7 +44,6 @@ Discord: https://discord.gg/ETf4qj5acN
 
 Telegram: https://t.me/mandyport
 
-Original author's Git Mirror: https://git.notrexed.dev/notrexed/Leonida
 <br>
 
 ## Project status

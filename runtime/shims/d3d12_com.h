@@ -331,6 +331,12 @@ bool title_shadow_buffer(ID3D12Resource* resource);
 std::uint64_t title_host_imports(ID3D12Device* device);
 // VirtualQuery calls made by the title-buffer shadows in their latest refresh. For tests.
 std::uint64_t title_shadow_refresh_queries(ID3D12Device* device);
+// The device's title windows now: how many and their bytes, how many were retired with their pages, and how many of
+// those still wait for the GPU before their memory is freed. For tests.
+struct TitleWindows {
+    std::uint64_t count = 0, bytes = 0, retired = 0, waiting = 0;
+};
+TitleWindows title_windows(ID3D12Device* device);
 // The trackers behind the title-buffer shadows and title windows (copies whose pages overlap or touch share one).
 // For tests.
 std::uint64_t title_shadow_trackers(ID3D12Device* device);
@@ -390,10 +396,6 @@ std::uint64_t device_arena_size(ID3D12Device* device);
 // Copies `bytes` of the device's GPU address arena at console VA `va` (what shaders read there: a heap's GPU copy,
 // the null slots after it) into `out`. False without an arena or when the range is not inside it. For tests.
 bool read_arena(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes);
-// The slots whose host-RAM mirror differs from the GPU copy of the console descriptor heap at `console_va`
-// (src/console_heap_copy.h), compared now: 0 when they agree, -1 when there is no such heap or it has no mirror.
-// For tests.
-long long console_heap_mirror_mismatches(ID3D12Device* device, std::uint64_t console_va);
 
 // The blocks of device memory that textures share (src/image_memory.h): how many, their bytes, and the textures in
 // them. For tests.
