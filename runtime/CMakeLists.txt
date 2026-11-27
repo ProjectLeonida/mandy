@@ -2993,6 +2993,15 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_existing_heap_write_watch COMMAND d3d12_existing_heap_test)
     set_tests_properties(d3d12_existing_heap_write_watch PROPERTIES SKIP_RETURN_CODE 77
                          ENVIRONMENT "LEONIDA_WRITE_WATCH=1")
+    # What a guard costs on this host (fault, VirtualProtect, re-arming, write watch, soft-dirty): prints a table for
+    # the tracking policy (src/title_write_policy.h).
+    add_executable(guard_fault_bench test/guard_fault_bench.cpp)
+    target_compile_definitions(guard_fault_bench PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_test(NAME guard_fault_bench COMMAND guard_fault_bench)
+    # The page mirror's hot/cold tracking (src/title_mirror_hot_cold.h) on real guards.
+    add_executable(title_mirror_hot_cold_test test/title_mirror_hot_cold_test.cpp)
+    target_compile_definitions(title_mirror_hot_cold_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_test(NAME title_mirror_hot_cold COMMAND title_mirror_hot_cold_test)
     # Slot 133 on untouched xmem physical pages: committed through the pages hook, then imported. xmem.cpp and
     # registry.cpp are compiled in, as xmem_test does, to reach the registered XMem* exports.
     add_executable(d3d12_xmem_placed_test test/d3d12_xmem_placed_test.cpp shims/xmem.cpp shims/registry.cpp)
@@ -4866,6 +4875,9 @@ if(TARGET Vulkan::Headers)
     # Which title textures the refresh looks at: only those something says changed (src/title_texture_watch.h).
     add_executable(title_texture_watch_test test/title_texture_watch_test.cpp)
     add_test(NAME title_texture_watch COMMAND title_texture_watch_test)
+    # Hot pages copied every submission, cold ones guarded (src/title_write_policy.h): nothing missed.
+    add_executable(title_write_policy_test test/title_write_policy_test.cpp)
+    add_test(NAME title_write_policy COMMAND title_write_policy_test)
     add_executable(vk_host_texture_order_test test/vk_host_texture_order_test.cpp)
     target_link_libraries(vk_host_texture_order_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     if(WIN32)
