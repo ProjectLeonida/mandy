@@ -27,6 +27,8 @@ Run the ordinary build or `python -I make_game.py --game <package> --work <work>
 
 For the strict decoder, place a local combined history from `bcpack_history_calib.py` at `<work>/bcpack-history.json` (use that filename as the tool's `--out`). The assets stage uses this same history for all strict reconstructions, including fallbacks for formats outside a calibration profile. Adding, changing or removing the history invalidates the saved pool pass. Run the assets stage again with the same work folder. Strict decoding still refuses unconfirmed history, and a refusal keeps any previous DDS in the catalog.
 
+Pool-only calibration produces provisional entries. A provisional-only history starts a new pass without supplying confirmed entries for strict decoding. Use exact references with `--ref-dds` or `--ref-pairs` to produce confirmed entries.
+
 The DDS files and their manifest are under `<work>/assets/ttpf/<pool>/` or `<work>/assets/ttpf_pack/<pack>/<pool>/`. The manifest keeps the asset key for model lookup and records the new filename, mip count and decoder. A failed reconstruction keeps the previous file reference and records the reason in `BCPackLimitation`. The stage publishes each DDS before replacing the pool manifest. A completed pass skips decoding on the next build. Adding or changing the profile triggers another pass.
 
 ## Version 1 profile

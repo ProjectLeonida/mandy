@@ -263,6 +263,7 @@ class TextureAssets(unittest.TestCase):
         updated = self.folder / self.row_after_export()["File"]
         self.assertNotEqual(updated, original)
         self.assertEqual(updated.read_bytes()[148:], b"".join(linear.values()))
+        self.assertFalse(original.exists())
 
         history.unlink()
         self.build()
@@ -464,6 +465,42 @@ class CompletePoolEarlyReturn(unittest.TestCase):
                              (0, 0))
         pool.assert_not_called()
 
+
+    def test_calibrated_and_strict_rows_use_separate_stamps_with_history(self):
+        pool = mock.Mock(chunks=[(0,)], virtual_size=64)
+        pool.descriptor.side_effect = [
+            {"base": 0, "dimension": 1, "format": 77, "mips": 1},
+            {"base": 8, "dimension": 1, "format": 71, "mips": 1},
+        ]
+        pool.span.return_value = 8
+        pool.codecs.return_value = ttpf_assets.bcpack.SUPPORTED_REBUILD_CODECS
+        calibrated = mock.Mock()
+        calibrated.LocalDecoder.return_value.formats = {77}
+        calibrated.LocalDecoder.return_value.dds.return_value = b"calibrated"
+        history = {"bc1": {"confirmed": {"6": [0, 0, 0, 0, 0, 0]}}}
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+            work = Path(tmp)
+            (work / "bcpack-calibration.json").write_text('{"version": 1}', encoding="utf-8", newline="\n")
+            stack.enter_context(mock.patch.dict(sys.modules, calibrated_texture=calibrated))
+            calibrated_stamp, _ = ttpf_assets.load_profile(work)
+
+            history_path = work / "bcpack-history.json"
+            history_path.write_text(json.dumps(history), encoding="utf-8", newline="\n")
+            strict_stamp = ttpf_assets.strict_stamp(history_path.read_bytes())
+            settings = ttpf_assets.load_profile(work)
+            stack.enter_context(mock.patch.object(ttpf_assets.ttpf, "Pool", return_value=pool))
+            stack.enter_context(mock.patch.object(ttpf_assets.ttpf, "analyze", return_value=mock.sentinel.analysis))
+            texture_dds = stack.enter_context(mock.patch.object(ttpf_assets.ttpf, "texture_dds", return_value=b"strict"))
+            calibrated_row = synthetic_row(Index=0, DxgiFormat=77)
+            strict_row = synthetic_row(Index=1, DxgiFormat=71)
+            manifest = {"Textures": [calibrated_row, strict_row]}
+
+            self.assertEqual(ttpf_assets.complete_pool("synthetic", work, manifest, settings), (2, 0))
+            calibrated.LocalDecoder.return_value.dds.assert_called_once_with(0)
+            texture_dds.assert_called_once_with(pool, mock.sentinel.analysis, history=history)
+            self.assertEqual(manifest["BCPackPass"], f"{calibrated_stamp}+{strict_stamp}")
+            self.assertEqual(calibrated_row["BCPackDecoder"], calibrated_stamp)
+            self.assertEqual(strict_row["BCPackDecoder"], strict_stamp)
 
     def test_a_pool_hashes_the_decoder_sources_once_for_all_its_strict_fallback_rows(self):
         # With a profile, each row the calibrated decoder can't take falls back to strict decoding; hashing the

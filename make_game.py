@@ -23,7 +23,8 @@ Stages (each skips work that is already done, so a stopped build continues where
     shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V; then the same for the
               programs inside amd_fidelityfx_upscaler_xbox.dll, XboxBvhBuilder.dll and game_scarlett_master.exe
     assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC; --wav adds PCM WAV)
-              BCPack uses strict decoding by default. For local calibration use <work>/bcpack-calibration.json.
+              BCPack uses strict decoding by default and reads confirmed history from <work>/bcpack-history.json.
+              For local calibration use <work>/bcpack-calibration.json.
     runtime   build the loader (needs the game's executable to run, not to build). On Linux it is cross-built with
               clang-cl and an xwin SDK (docs/testing.md) and gta6rt.sh starts it with Wine; --runtime-build DIR
               takes a Windows build of runtime/ instead (the runtime-windows artifact of the Runtime workflow)
@@ -3116,7 +3117,8 @@ def main() -> int:
     ap.add_argument("--out", type=nonempty_path, help="folder for the finished port (default Documents/Leonida; ~/Leonida on a Mac "
                                   "whose Documents iCloud syncs)")
     ap.add_argument("--work", type=nonempty_path, help="folder for intermediate files (hundreds of GB; default <out>/work)")
-    ap.add_argument("--stages", help="comma list from: " + ",".join(STAGES))
+    ap.add_argument("--stages", help=f"comma list from: {','.join(STAGES)}. The assets stage reads "
+                    "<work>/bcpack-history.json for strict BCPack and <work>/bcpack-calibration.json for calibration")
     ap.add_argument("--check", action="store_true", help="only check the game files")
     ap.add_argument("--full-check", action="store_true",
                     help="also verify each manifest file's SHA-256 using --jobs workers (slow)")
