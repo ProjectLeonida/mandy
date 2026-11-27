@@ -26,7 +26,7 @@ from test_dpp_eager_subgroup import conditional_subgroup_ops  # noqa: E402
 SWAPS = {(1, 0, 3, 2): 0, (2, 3, 0, 1): 1, (3, 2, 1, 0): 2}
 SELECTORS = [(1, 0, 3, 2), (2, 3, 0, 1), (3, 2, 1, 0),            # the three swaps
              (0, 0, 0, 0), (1, 1, 1, 1), (2, 2, 2, 2), (3, 3, 3, 3),  # broadcasts
-             (1, 1, 3, 3), (2, 3, 2, 3), (0, 0, 2, 2), (0, 1, 0, 1),  # the other selectors seen in pixel shaders
+             (1, 1, 3, 3), (2, 3, 2, 3), (0, 0, 2, 2), (0, 1, 0, 1),  # pair and half broadcasts
              (3, 1, 2, 0)]                                             # all four lanes, no pattern
 
 
