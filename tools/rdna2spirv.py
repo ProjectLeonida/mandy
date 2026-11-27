@@ -7634,22 +7634,23 @@ class Gen:
             raise Unsupported("DPP operands")
         # A VOPC compare in DPP form (docs/design.md, "DPP on a VOPC compare"): src0 comes through the same lane
         # selection and the result is a mask bit, not a VGPR. Only the forms where every lane writes its bit are
-        # taken: what a lane that DPP leaves unwritten does to its VCC bit is not measured.
+        # taken: what a lane that DPP leaves unwritten does to its VCC bit is measured on RDNA3 only (it gets 0), not
+        # on RDNA2. v_cmpx writes EXEC instead and prints no destination, so its src0 is the first operand
+        # (SHADER-VOPCX-DPP).
         compare = base_op(ins["op"]).startswith("v_cmp")
+        first = 0 if base_op(ins["op"]).startswith("v_cmpx") else 1
         if compare:
-            if base_op(ins["op"]).startswith("v_cmpx"):
-                raise Unsupported("DPP on v_cmpx")
-            if len(args) != 3:
+            if len(args) != first + 2:
                 raise Unsupported("DPP compare operands")
             if row_mask != 0xF or bank_mask != 0xF or not (dpp8 is not None or bound):
-                raise Unsupported("DPP compare with lanes that keep their mask bit")
+                raise Unsupported("DPP compare with lanes DPP leaves unwritten")
         elif args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
             raise Unsupported("DPP destination")
-        if args[1].get("n", 1) != 1:
+        if args[first].get("n", 1) != 1:
             raise Unsupported("DPP 64-bit source")
-        if args[1].get("sext"):
+        if args[first].get("sext"):
             raise Unsupported("DPP sext")
-        src = args[1]
+        src = args[first]
         raw_src = dict(src)
         raw_src.pop("neg", None)
         raw_src.pop("abs", None)
@@ -7830,10 +7831,10 @@ class Gen:
         else:
             write = self.tmp()
             self.emit(f"{write} = OpLogicalAnd %bool {enabled} {src_ok}")
-        args[1] = {"k": "ssa", "v": src0}
+        args[first] = {"k": "ssa", "v": src0}
         if compare:
             # Every lane is enabled and an invalid source reads 0 (checked above), so the compare's own EXEC guard
-            # is the only one: the mask write is the plain compare's.
+            # is the only one: the mask write is the plain compare's (for v_cmpx, EXEC's).
             return self._insn({**ins, "args": args})
         previous = self.dpp_guard
         self.dpp_guard = write
@@ -17975,12 +17976,12 @@ def restore_mix_inline_literal(ins, raw, literal):
 
 def skipped_form(ins, blob, at):
     """Whether rdna2_decode's instruction at blob offset ``at`` is one of the forms llvm-mc skips that
-    restore_vcc_tuples takes from the blob: a tuple that reaches vcc (SGPRs 106 and 107), a VOPC f32 compare in DPP
-    form (docs/design.md, "DPP on a VOPC compare"), or the measured v_dot4_i32_i8 with op_sel 2 / op_sel_hi 5 and no
+    restore_vcc_tuples takes from the blob: a tuple that reaches vcc (SGPRs 106 and 107), a VOPC f32 compare (v_cmp or
+    v_cmpx) in DPP form (docs/design.md, "DPP on a VOPC compare"), or the measured v_dot4_i32_i8 with op_sel 2 / op_sel_hi 5 and no
     clamp or neg, all reserved bits clear (tedin7, upstream PR #281; docs/fspx.md). shader_disasm.py prints the last
     two itself; this covers a listing made without that pass (#984)."""
     op = ins["op"]
-    if op.startswith("v_cmp_") and op.endswith("_f32_dpp"):
+    if op.startswith(("v_cmp_", "v_cmpx_")) and op.endswith("_f32_dpp"):
         return True
     if op == "v_dot4_i32_i8" and int.from_bytes(blob[at:at + 4], "little") >> 8 == 0xCC1650 and blob[at + 7] >> 3 == 1:
         return True

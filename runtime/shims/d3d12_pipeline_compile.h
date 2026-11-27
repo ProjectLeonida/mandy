@@ -1,6 +1,7 @@
 // Timing and scheduling for Vulkan pipeline creation on the D3D12 device.
 #pragma once
 
+#include "../src/async_pipeline_size.h"
 #include "../src/vulkan_device_fault.h"
 #include "../src/vulkan_replay.h"
 #include <windows.h>
@@ -33,6 +34,32 @@ inline bool async_replay_compile() {
         return GetEnvironmentVariableW(L"LEONIDA_ASYNC_PIPELINES", v, 2) == 1 && v[0] == L'1';
     }();
     return on && !leonida::strict_replay();
+}
+
+// LEONIDA_ASYNC_MIN_BYTES=<n> (with LEONIDA_ASYNC_PIPELINES=1): only pipelines with n bytes of SPIR-V or more are built
+// asynchronously; a smaller one is built where it is needed, as with asynchronous builds off. Unset or 0: every
+// pipeline, as before the variable (src/async_pipeline_size.h).
+inline std::uint64_t async_min_bytes() {
+    static const std::uint64_t bytes = [] {
+        char text[32]{};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_ASYNC_MIN_BYTES", text, sizeof(text));
+        bool valid = n < sizeof(text);
+        const std::uint64_t value = valid ? leonida::async_pipelines::parse_min_bytes(text, &valid) : 0;
+        if (!valid)
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_ASYNC_MIN_BYTES: not a number of bytes, ignored (every "
+                                 "asynchronous pipeline stays asynchronous)\n");
+        else if (value && async_replay_compile())
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_ASYNC_MIN_BYTES: pipelines under %llu bytes of SPIR-V are built "
+                                 "where they are needed; larger ones asynchronously\n", (unsigned long long)value);
+        return value;
+    }();
+    return bytes;
+}
+
+// Whether a pipeline of `spirv_bytes` (compute: its module; graphics: all its stages) is built asynchronously.
+inline bool async_replay_compile(std::uint64_t spirv_bytes) {
+    return async_replay_compile() &&
+           leonida::async_pipelines::asynchronous(true, async_min_bytes(), spirv_bytes);
 }
 
 // LOCAL FIX (post-load stalls): LEONIDA_FAST_PIPELINES=graphics, compute, or all (1 = all) creates those pipelines with

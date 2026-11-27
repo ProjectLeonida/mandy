@@ -1,6 +1,7 @@
 #pragma once
 
 #include "d3d12_title_buffer_windows.h"
+#include "../src/memory_breakdown.h"
 #include "../src/title_geometry_watch.h"
 #include <atomic>
 #include <chrono>
@@ -318,6 +319,7 @@ public:
         VkDeviceSize va{};
         bool at_cap = false;
         const bool over_bytes = bytes_ >= limit || bytes > limit - bytes_;
+        leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::geometry);
         if (over_bytes || !pool_.allocate(device, bytes, va, mapped, true, limit, &at_cap)) {
             if (at_cap || over_bytes) {
                 refused_[key] = gen;

@@ -896,8 +896,17 @@ if(BUILD_TESTING)
     add_test(NAME compile_helper COMMAND compile_helper_test)
   endif()
 
+  # D24/D16 fragment depth quantisation and bias SPIR-V patcher (runtime/src/depth24_fragment.h): pure stdlib.
+  add_executable(depth24_fragment_test test/depth24_fragment_test.cpp)
+  add_test(NAME depth24_fragment COMMAND depth24_fragment_test)
+
   add_executable(xdxr_build_output_test test/xdxr_build_output_test.cpp)
   add_test(NAME xdxr_build_output COMMAND xdxr_build_output_test)
+
+  # Which pipelines LEONIDA_ASYNC_PIPELINES=1 builds asynchronously by size (LEONIDA_ASYNC_MIN_BYTES,
+  # src/async_pipeline_size.h): pure stdlib.
+  add_executable(async_pipeline_size_test test/async_pipeline_size_test.cpp)
+  add_test(NAME async_pipeline_size COMMAND async_pipeline_size_test)
 
   # The gate of large_module_gate.h as the runtime uses it for large pipelines (LEONIDA_BIG_COMPILE_BUDGET_MB): pure
   # stdlib.
@@ -2279,6 +2288,34 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vk_null_descriptor COMMAND vk_null_descriptor_test)
     set_tests_properties(vk_null_descriptor PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # More than 4096 live 1D, 2D-array and 3D images, each read through its bindless index, in a set sized from the
+  # device's limits; a full array's refusal reason and indices coming back. The shader is GLSL; without
+  # glslangValidator the test skips.
+  add_executable(vk_bindless_dimensions_test test/vk_bindless_dimensions_test.cpp)
+  target_link_libraries(vk_bindless_dimensions_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_bindless_dimensions_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_bindless_dimensions_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    set(_bindless_dimensions_spv ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_bindless_dimensions.spv)
+    add_custom_command(OUTPUT ${_bindless_dimensions_spv}
+      COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${_bindless_dimensions_spv}
+              ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_bindless_dimensions.comp
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_bindless_dimensions.comp
+      COMMENT "Compiling the bindless dimensions test shader" VERBATIM)
+    target_sources(vk_bindless_dimensions_test PRIVATE ${_bindless_dimensions_spv})
+    target_compile_definitions(vk_bindless_dimensions_test PRIVATE
+                               LEONIDA_TEST_BINDLESS_DIMENSIONS_SPV="${_bindless_dimensions_spv}")
+  else()
+    message(STATUS "glslangValidator not found: vk_bindless_dimensions_test skips")
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_bindless_dimensions COMMAND vk_bindless_dimensions_test)
+    set_tests_properties(vk_bindless_dimensions PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   # CPU-only: the bindless set's array sizes from synthetic device limits.
   add_executable(bindless_sizing_test test/bindless_sizing_test.cpp)
@@ -3675,6 +3712,10 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_m4_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_m4_compute COMMAND d3d12_m4_compute_test)
       set_tests_properties(d3d12_m4_compute PROPERTIES SKIP_RETURN_CODE 77)
+      # LEONIDA_ASYNC_PIPELINES=1 with LEONIDA_ASYNC_MIN_BYTES over both modules and the compile worker held: the
+      # dispatches build their pipelines in place, as with asynchronous builds off (src/async_pipeline_size.h).
+      add_test(NAME d3d12_m4_compute_async_small_waits COMMAND d3d12_m4_compute_test --async-small-waits)
+      set_tests_properties(d3d12_m4_compute_async_small_waits PROPERTIES SKIP_RETURN_CODE 77)
 
       # Typed buffer UAVs and UAV counters: cs_buf_typed.asm writes typed views through V#s with a FORMAT, and
       # cs_buf_counter.asm appends to and consumes from a structured view whose counter is the second V# of its slot;
@@ -3904,9 +3945,19 @@ if(TARGET Vulkan::Headers)
       # the title's pages at the next refresh, and the title's own newer words still win (#1537, WRITE_INVALID).
       add_test(NAME d3d12_title_window_write_back COMMAND d3d12_title_va_test --window-writeback)
       set_tests_properties(d3d12_title_window_write_back PROPERTIES SKIP_RETURN_CODE 77)
+      # A write-back copy that faults on a page another guard (a geometry watch cell) keeps read-only: the fault
+      # handler asks the tracker whose copy faulted too, which must not take its lock again on that thread (#2418).
+      add_test(NAME d3d12_title_window_write_back_fault COMMAND d3d12_title_va_test --window-writeback-fault)
+      set_tests_properties(d3d12_title_window_write_back_fault PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
       # The same return copy for a slot-133 buffer's shadow (the write-back of a compute result the title reads again).
       add_test(NAME d3d12_placed_write_back COMMAND d3d12_title_va_test --placed-writeback)
       set_tests_properties(d3d12_placed_write_back PROPERTIES SKIP_RETURN_CODE 77)
+      # Two shadows over one page share their sums: a newly filled one must still follow the title's bytes, with
+      # LEONIDA_SHADOW_KEEP on and off (review by lixonik).
+      add_test(NAME d3d12_shadow_keep_refill COMMAND d3d12_title_va_test --shadow-keep-refill)
+      set_tests_properties(d3d12_shadow_keep_refill PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_SHADOW_KEEP=1")
+      add_test(NAME d3d12_shadow_keep_refill_off COMMAND d3d12_title_va_test --shadow-keep-refill)
+      set_tests_properties(d3d12_shadow_keep_refill_off PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_SHADOW_KEEP=0")
       add_test(NAME d3d12_api_descriptor_copy COMMAND d3d12_title_va_test --api-descriptor-copy)
       set_tests_properties(d3d12_api_descriptor_copy PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_DESC_MIRROR=1")
       add_test(NAME d3d12_api_descriptor_copy_off COMMAND d3d12_title_va_test --api-descriptor-copy-off)
@@ -4357,6 +4408,18 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com user32)  # user32: the PresentX window
       target_compile_definitions(gta6rt PRIVATE LEONIDA_VULKAN_DEVICE)
 
+      # gta6rt --precompile-pipelines builds the programs LEONIDA_SKIP_COMPUTE names unless --skip-listed is given,
+      # and its last line counts both (shims/d3d12_precompile.h). Two synthetic compute modules, three runs.
+      if(TARGET gta6rt_compute_journal_shader)
+        add_dependencies(gta6rt gta6rt_indirect_count_shader gta6rt_compute_journal_shader)
+        add_test(NAME precompile_skip_list COMMAND ${CMAKE_COMMAND}
+          "-DGTA6RT=$<TARGET_FILE:gta6rt>" "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+          "-DSPV_A=${_indirect_count_spv}" "-DSPV_B=${_journal_second_spv}"
+          "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/precompile_skip_list"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_precompile_skip_list.cmake")
+        set_tests_properties(precompile_skip_list PROPERTIES TIMEOUT 240 SKIP_REGULAR_EXPRESSION "SKIP: ")
+      endif()
+
       # A stand-in title that imports d3d12_xs.dll!D3D12XboxCreateDevice and runs a clear and a readback on the
       # device it gets, mapped and run by `gta6rt --run` with LEONIDA_D3D12=vulkan: the loader, the game thread, the
       # proxies and the Vulkan device in one process. check_tiny_frame.py reads the verdict, the binding and the
@@ -4667,6 +4730,12 @@ if(TARGET Vulkan::Headers)
       target_compile_options(arena_blocks_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME arena_blocks COMMAND arena_blocks_test)
+    # The mem probe's breakdown line: the tally by consumer, the owner scopes and the text (src/memory_breakdown.h).
+    add_executable(memory_breakdown_test test/memory_breakdown_test.cpp)
+    if(WIN32 AND MSVC)
+      target_compile_options(memory_breakdown_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME memory_breakdown COMMAND memory_breakdown_test)
     # The address guard's page table (src/address_guard.h; docs/d3d12_vulkan.md, "Address guard").
     add_executable(address_guard_test test/address_guard_test.cpp)
     if(WIN32 AND MSVC)
@@ -4678,12 +4747,18 @@ if(TARGET Vulkan::Headers)
       target_compile_options(title_window_plan_bounds_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME title_window_plan_bounds COMMAND title_window_plan_bounds_test)
-    # Host-RAM bitset of live console resource-heap V# slots (src/console_heap_vsharp_slots.h).
-    add_executable(console_heap_vsharp_slots_test test/console_heap_vsharp_slots_test.cpp)
+    # What each console resource-heap V# resolved to, and the slots a change touches (src/console_heap_slot_records.h).
+    add_executable(console_heap_slot_records_test test/console_heap_slot_records_test.cpp)
     if(WIN32 AND MSVC)
-      target_compile_options(console_heap_vsharp_slots_test PRIVATE /W4 /permissive- /utf-8)
+      target_compile_options(console_heap_slot_records_test PRIVATE /W4 /permissive- /utf-8)
     endif()
-    add_test(NAME console_heap_vsharp_slots COMMAND console_heap_vsharp_slots_test)
+    add_test(NAME console_heap_slot_records COMMAND console_heap_slot_records_test)
+    # A slot-133 shadow keeps a GPU write until the title's bytes under it change (src/shadow_keep.h).
+    add_executable(shadow_keep_test test/shadow_keep_test.cpp)
+    if(WIN32 AND MSVC)
+      target_compile_options(shadow_keep_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME shadow_keep COMMAND shadow_keep_test)
     # Queue construction cleans its Vulkan handles if holder registration runs out of host memory.
     add_executable(vk_host_texture_order_test test/vk_host_texture_order_test.cpp)
     target_link_libraries(vk_host_texture_order_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
