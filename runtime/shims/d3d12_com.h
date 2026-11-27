@@ -118,6 +118,9 @@ struct VulkanDeviceInfo {
     bool push_constants_need_fallback = false;
     // Top location for relocated f16 halves (0: read from device limits; non-zero: override for testing low-limit devices).
     std::uint32_t f16_half_top_location = 0;
+    // Geometry shader per-vertex interface component limits (0: read from physical device; non-zero: test override).
+    std::uint32_t max_geometry_input_components = 0;
+    std::uint32_t max_geometry_output_components = 0;
     // maxBufferSize and maxMemoryAllocationSize, which cap the GPU address arena (src/arena_size.h). 0: read from
     // the physical device when the D3D12 device is created; a test sets smaller ones to simulate a device.
     VkDeviceSize max_buffer_size = 0;
@@ -169,6 +172,9 @@ struct VulkanDeviceInfo {
     bool occlusion_query_precise = false;
     bool prepare_on_bind = false;
     bool cold_graphics_compile = false;  // Driver supports a cache-only create and reports when compilation is pending.
+    // pipelineCreationCacheControl is on for the heavy pipeline cache (src/heavy_pipeline_cache.h): a pipeline the
+    // offline cache does not have is created against the cache of pipeline_cache.heavy.bin, written back as it grows.
+    bool heavy_pipeline_cache = false;
     bool pipeline_statistics_query = false;
     bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
     // VK_KHR_swapchain_maintenance1 (or VK_EXT_swapchain_maintenance1) and its swapchainMaintenance1 feature are

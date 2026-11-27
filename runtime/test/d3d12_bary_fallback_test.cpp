@@ -8,11 +8,18 @@
 //      plus pass-through `Location 0` alpha (`0.75`), separating perspective interpolation from affine by >40 LSB.
 //   2. VS `ClipDistance[1]` forwarding (when `shaderClipDistance` is enabled): clips `ndc_x < 0` to the clear color
 //      while keeping `ndc_x > 0` with intact barycentrics.
-//   3. Combined `--f16-interp-fallback` + `--bary-fallback`: a 16-param VS (with packed f16 pairs in `param7` and
-//      colliding static halves) paired with a PS reading raw `0..13`, `bary_fallback_input` at `Location 14`, and
-//      `f16_halves` for `param7` at `[15, 16]` (relocated to `[28, 29]` before GS synthesis).
-//   4. Refusals: non-triangle topology (`E_INVALIDARG`), explicit GS (`E_NOTIMPL`), and disabled `geometryShader`
-//      feature (`E_NOTIMPL`).
+//   3. Unused PS Input pruning + `--f16-interp-fallback` combinations:
+//      a) 16-param VS (`0..29`) + PS declaring 26 `Input`s (`0..13`, `16..27`) while only reading `Location 7` +
+//         `bary_fallback_input` at `Location 14`: unread inputs are zero-filled in the GS so `VS -> GS` stays within
+//         64 input components (`maxGeometryInputComponents = 64`, e.g. RADV).
+//      b) 10-param VS (`0..9`) + PS with `bary_fallback_input` at `Location 12` and colliding `f16_halves` at `[9, 10]`
+//         relocated into `[13, 14]`: exercises combined `--f16-interp-fallback` + `--bary-fallback` within 64 geometry
+//         input components.
+//      c) 16-param VS (`0..15`) + PS with `f16_halves` relocated to `[28, 29]`: draws and verifies all 256 pixels when
+//         `maxGeometryInputComponents >= 120 && maxGeometryOutputComponents >= 120`, or verifies clean logged refusal +
+//         skips the draw on devices with tighter geometry stage limits.
+//   4. Refusals: non-triangle topology (`E_INVALIDARG`), explicit GS (`E_NOTIMPL`), disabled `geometryShader` feature
+//      (`E_NOTIMPL`), and `maxGeometryInputComponents` / `VUID-RuntimeSpirv-Location-06272` limit refusals (`E_NOTIMPL`).
 //   5. Computed I/J pairs (RT-BARY-FALLBACK-PER-VERTEX): a PS that reads an attribute as a `Flat vec4[3]` named by
 //      `bary_fallback_input.per_vertex` and weights the three vertices' values with its own I/J. The VS gives each
 //      vertex a different value, and the weights are chosen so that every other order of the three vertices lands
@@ -63,8 +70,8 @@ void write_spv(const std::filesystem::path& path, const std::vector<std::uint32_
 //   - If `non_uniform_w` is true: V0 = (-1, -1, 0, 1), V1 = (6, -2, 0, 2), V2 = (-4, 12, 0, 4)
 //     (same NDC (-1,-1), (3,-1), (-1,3), with w = 1, 2, 4).
 //   - Else: V0 = (-1, -1, 0, 1), V1 = (3, -1, 0, 1), V2 = (-1, 3, 0, 1).
-// Exports Location 0 = vec4(0.5, 0.25, 0.75, 1.0), and optionally BuiltIn ClipDistance float[1] = {ndc_x}.
-std::vector<std::uint32_t> make_bary_vs(bool non_uniform_w, bool with_clip_x) {
+// Exports Location `attr_loc` = vec4(0.5, 0.25, 0.75, 1.0), and optionally BuiltIn ClipDistance float[1] = {ndc_x}.
+std::vector<std::uint32_t> make_bary_vs(bool non_uniform_w, bool with_clip_x, std::uint32_t attr_loc = 0) {
     std::uint32_t next_id = 1;
     const auto alloc = [&]() { return next_id++; };
 
@@ -132,7 +139,7 @@ std::vector<std::uint32_t> make_bary_vs(bool non_uniform_w, bool with_clip_x) {
 
     put_inst(w, kOpDecorate, {id_vid_var, 11, 42});  // BuiltIn VertexIndex
     put_inst(w, kOpDecorate, {id_pos_var, 11, 0});   // BuiltIn Position
-    put_inst(w, kOpDecorate, {id_out0_var, kDecorationLocation, 0});
+    put_inst(w, kOpDecorate, {id_out0_var, kDecorationLocation, attr_loc});
     if (with_clip_x) put_inst(w, kOpDecorate, {id_clip_var, 11, 3});  // BuiltIn ClipDistance
 
     put_inst(w, 19, {id_void});
@@ -203,8 +210,8 @@ std::vector<std::uint32_t> make_bary_vs(bool non_uniform_w, bool with_clip_x) {
     return w;
 }
 
-// PS reading Location 0 (vec4 attr0) and Location 1 (vec3 bary), writing vec4(bary.x, bary.y, bary.z, attr0.z).
-std::vector<std::uint32_t> make_bary_ps(std::uint32_t bary_loc) {
+// PS reading Location `attr_loc` (vec4 attr0) and Location `bary_loc` (vec3 bary), writing vec4(bary.x, bary.y, bary.z, attr0.z).
+std::vector<std::uint32_t> make_bary_ps(std::uint32_t bary_loc, std::uint32_t attr_loc = 0) {
     // 1=void, 2=fn, 3=float, 4=v3float, 5=v4float, 6=ptr_in_v3, 7=ptr_in_v4, 8=ptr_out_v4,
     // 9=out0, 10=in_attr0, 11=in_bary, 12=main, 13=entry,
     // 14=attr0, 15=bary, 16=bx, 17=by, 18=bz, 19=az, 20=rgba
@@ -216,7 +223,7 @@ std::vector<std::uint32_t> make_bary_ps(std::uint32_t bary_loc) {
     put_inst(w, kOpExecutionMode, {12, 7});  // OriginUpperLeft
 
     put_inst(w, kOpDecorate, {9, kDecorationLocation, 0});
-    put_inst(w, kOpDecorate, {10, kDecorationLocation, 0});
+    put_inst(w, kOpDecorate, {10, kDecorationLocation, attr_loc});
     put_inst(w, kOpDecorate, {11, kDecorationLocation, bary_loc});
 
     put_inst(w, 19, {1});
@@ -247,22 +254,28 @@ std::vector<std::uint32_t> make_bary_ps(std::uint32_t bary_loc) {
     return w;
 }
 
-// 16-param VS (param0..param15, static f16_halves for 0..6, param7.x = packHalf2x16(0.25, 0.75) = 0x3a003400).
-std::vector<std::uint32_t> make_16param_vs() {
-    constexpr std::uint32_t kBound = 61;
-    std::vector<std::uint32_t> w = {kSpirvMagic, 0x00010500u, 0, kBound, 0};
+// Multi-param VS (param0..param(num_raw-1), optional static f16_halves for 0..6,
+// param7.x = packHalf2x16(0.25, 0.75) = 0x3a003400, param7.w = 1.0).
+std::vector<std::uint32_t> make_nparam_vs(std::uint32_t num_raw, bool with_static_halves) {
+    const std::uint32_t num_halves = with_static_halves ? 14u : 0u;
+    const std::uint32_t last_out_id = 30u + num_raw + num_halves;
+    const std::uint32_t bound = last_out_id + 1u;
+    std::vector<std::uint32_t> w = {kSpirvMagic, 0x00010500u, 0, bound, 0};
     put_inst(w, kOpCapability, {1});
     put_inst(w, kOpMemoryModel, {0, 1});
     std::vector<std::uint32_t> ep = {kExecModelVertex, 24, 0x6e69616du, 0x00000000u, 8, 9};
-    for (std::uint32_t id = 31; id <= 60; ++id) ep.push_back(id);
+    for (std::uint32_t id = 31; id <= last_out_id; ++id) ep.push_back(id);
     put_inst_vec(w, kOpEntryPoint, ep);
 
     put_inst(w, kOpDecorate, {8, 11, 42});  // BuiltIn VertexIndex
     put_inst(w, kOpDecorate, {9, 11, 0});   // BuiltIn Position
-    for (std::uint32_t p = 0; p < 16; ++p) put_inst(w, kOpDecorate, {31 + p, kDecorationLocation, p});
-    for (std::uint32_t n = 0; n <= 6; ++n) {
-        put_inst(w, kOpDecorate, {47 + 2 * n, kDecorationLocation, 28 - 2 * n});
-        put_inst(w, kOpDecorate, {48 + 2 * n, kDecorationLocation, 29 - 2 * n});
+    for (std::uint32_t p = 0; p < num_raw; ++p) put_inst(w, kOpDecorate, {31 + p, kDecorationLocation, p});
+    if (with_static_halves) {
+        const std::uint32_t half_base = 31u + num_raw;
+        for (std::uint32_t n = 0; n <= 6; ++n) {
+            put_inst(w, kOpDecorate, {half_base + 2 * n, kDecorationLocation, 28 - 2 * n});
+            put_inst(w, kOpDecorate, {half_base + 2 * n + 1, kDecorationLocation, 29 - 2 * n});
+        }
     }
 
     put_inst(w, 19, {1});
@@ -290,7 +303,7 @@ std::vector<std::uint32_t> make_16param_vs() {
 
     put_inst(w, kOpVariable, {6, 8, kStorageInput});
     put_inst(w, kOpVariable, {7, 9, kStorageOutput});
-    for (std::uint32_t id = 31; id <= 60; ++id) put_inst(w, kOpVariable, {7, id, kStorageOutput});
+    for (std::uint32_t id = 31; id <= last_out_id; ++id) put_inst(w, kOpVariable, {7, id, kStorageOutput});
 
     put_inst(w, kOpFunction, {1, 24, 0, 2});
     put_inst(w, 248, {25});
@@ -300,8 +313,86 @@ std::vector<std::uint32_t> make_16param_vs() {
     put_inst(w, 169, {4, 29, 28, 16, 17});
     put_inst(w, 169, {4, 30, 27, 15, 29});
     put_inst(w, kOpStore, {9, 30});
-    for (std::uint32_t p = 0; p < 16; ++p) put_inst(w, kOpStore, {31 + p, p == 7 ? 23u : 10u});
-    for (std::uint32_t id = 47; id <= 60; ++id) put_inst(w, kOpStore, {id, 10});
+    for (std::uint32_t p = 0; p < num_raw; ++p) put_inst(w, kOpStore, {31 + p, p == 7 ? 23u : 10u});
+    if (with_static_halves) {
+        for (std::uint32_t id = 31u + num_raw; id <= last_out_id; ++id) put_inst(w, kOpStore, {id, 10});
+    }
+    put_inst(w, kOpReturn, {});
+    put_inst(w, kOpFunctionEnd, {});
+    return w;
+}
+
+// PS declaring 26 vec4 Inputs (0..13 and 16..27) + vec3 bary at 14, loading ONLY Location 7 + bary 14,
+// writing vec4(bary.x, bary.y, bary.z, param7.w) to MRT 0.
+std::vector<std::uint32_t> make_bary_pruned_ps() {
+    std::uint32_t next_id = 1;
+    const auto alloc = [&]() { return next_id++; };
+
+    const std::uint32_t id_void = alloc();
+    const std::uint32_t id_fn = alloc();
+    const std::uint32_t id_float = alloc();
+    const std::uint32_t id_v3float = alloc();
+    const std::uint32_t id_v4float = alloc();
+    const std::uint32_t id_ptr_in_v3 = alloc();
+    const std::uint32_t id_ptr_in_v4 = alloc();
+    const std::uint32_t id_ptr_out_v4 = alloc();
+    const std::uint32_t id_out0 = alloc();
+    const std::uint32_t id_in_bary = alloc();
+    const std::uint32_t id_main = alloc();
+    const std::uint32_t id_entry = alloc();
+
+    std::uint32_t id_in7 = 0;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> in_vars;
+    for (std::uint32_t loc = 0; loc < 28; ++loc) {
+        if (loc == 14 || loc == 15) continue;
+        const std::uint32_t vid = alloc();
+        in_vars.push_back({vid, loc});
+        if (loc == 7) id_in7 = vid;
+    }
+
+    const std::uint32_t id_bary_val = alloc();
+    const std::uint32_t id_v7 = alloc();
+    const std::uint32_t id_bx = alloc();
+    const std::uint32_t id_by = alloc();
+    const std::uint32_t id_bz = alloc();
+    const std::uint32_t id_w7 = alloc();
+    const std::uint32_t id_rgba = alloc();
+
+    std::vector<std::uint32_t> w = {kSpirvMagic, 0x00010500u, 0, next_id, 0};
+    put_inst(w, kOpCapability, {1});
+    put_inst(w, kOpMemoryModel, {0, 1});
+    std::vector<std::uint32_t> ep = {kExecModelFragment, id_main, 0x6e69616du, 0x00000000u, id_out0, id_in_bary};
+    for (const auto& [vid, loc] : in_vars) ep.push_back(vid);
+    put_inst_vec(w, kOpEntryPoint, ep);
+    put_inst(w, kOpExecutionMode, {id_main, 7});
+
+    put_inst(w, kOpDecorate, {id_out0, kDecorationLocation, 0});
+    put_inst(w, kOpDecorate, {id_in_bary, kDecorationLocation, 14});
+    for (const auto& [vid, loc] : in_vars) put_inst(w, kOpDecorate, {vid, kDecorationLocation, loc});
+
+    put_inst(w, 19, {id_void});
+    put_inst(w, 33, {id_fn, id_void});
+    put_inst(w, kOpTypeFloat, {id_float, 32});
+    put_inst(w, kOpTypeVector, {id_v3float, id_float, 3});
+    put_inst(w, kOpTypeVector, {id_v4float, id_float, 4});
+    put_inst(w, kOpTypePointer, {id_ptr_in_v3, kStorageInput, id_v3float});
+    put_inst(w, kOpTypePointer, {id_ptr_in_v4, kStorageInput, id_v4float});
+    put_inst(w, kOpTypePointer, {id_ptr_out_v4, kStorageOutput, id_v4float});
+
+    put_inst(w, kOpVariable, {id_ptr_out_v4, id_out0, kStorageOutput});
+    put_inst(w, kOpVariable, {id_ptr_in_v3, id_in_bary, kStorageInput});
+    for (const auto& [vid, loc] : in_vars) put_inst(w, kOpVariable, {id_ptr_in_v4, vid, kStorageInput});
+
+    put_inst(w, kOpFunction, {id_void, id_main, 0, id_fn});
+    put_inst(w, 248, {id_entry});
+    put_inst(w, kOpLoad, {id_v3float, id_bary_val, id_in_bary});
+    put_inst(w, kOpLoad, {id_v4float, id_v7, id_in7});
+    put_inst(w, kOpCompositeExtract, {id_float, id_bx, id_bary_val, 0});
+    put_inst(w, kOpCompositeExtract, {id_float, id_by, id_bary_val, 1});
+    put_inst(w, kOpCompositeExtract, {id_float, id_bz, id_bary_val, 2});
+    put_inst(w, kOpCompositeExtract, {id_float, id_w7, id_v7, 3});
+    put_inst(w, kOpCompositeConstruct, {id_v4float, id_rgba, id_bx, id_by, id_bz, id_w7});
+    put_inst(w, kOpStore, {id_out0, id_rgba});
     put_inst(w, kOpReturn, {});
     put_inst(w, kOpFunctionEnd, {});
     return w;
@@ -581,23 +672,39 @@ int main() {
         return 77;
     }
 
+    VkPhysicalDeviceProperties props{};
+    d.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(d.physical, &props);
+    const std::uint32_t max_gs_in = props.limits.maxGeometryInputComponents;
+    const std::uint32_t max_gs_out = props.limits.maxGeometryOutputComponents;
+    std::printf("GPU limits: maxGeometryInputComponents=%u, maxGeometryOutputComponents=%u\n", max_gs_in, max_gs_out);
+
     const auto vs_persp_prog = fssm_program({0x5653ba01, 0xbf810000});
     const auto vs_clip_prog = fssm_program({0x5653ba02, 0xbf810000});
     const auto vs_16p_prog = fssm_program({0x5653ba03, 0xbf810000});
+    const auto vs_10p_prog = fssm_program({0x5653ba04, 0xbf810000});
+    const auto vs_loc16_prog = fssm_program({0x5653ba05, 0xbf810000});
     const auto gs_dummy_prog = fssm_program({0x4753ba01, 0xbf810000});
     const auto ps_bary_prog = fssm_program({0x5053ba01, 0xbf810000});
     const auto ps_f16_prog = fssm_program({0x5053ba02, 0xbf810000});
-    const auto vs_ij_prog = fssm_program({0x5653ba04, 0xbf810000});
-    const auto ps_ij_prog = fssm_program({0x5053ba03, 0xbf810000});
-    const auto ps_ij_reloc_prog = fssm_program({0x5053ba04, 0xbf810000});
-    const auto ps_ij_nomap_prog = fssm_program({0x5053ba05, 0xbf810000});
+    const auto ps_f16_low_prog = fssm_program({0x5053ba03, 0xbf810000});
+    const auto ps_pruned_prog = fssm_program({0x5053ba04, 0xbf810000});
+    const auto ps_loc16_prog = fssm_program({0x5053ba05, 0xbf810000});
+    const auto vs_ij_prog = fssm_program({0x5653ba06, 0xbf810000});
+    const auto ps_ij_prog = fssm_program({0x5053ba06, 0xbf810000});
+    const auto ps_ij_reloc_prog = fssm_program({0x5053ba07, 0xbf810000});
+    const auto ps_ij_nomap_prog = fssm_program({0x5053ba08, 0xbf810000});
 
     const auto vs_persp_c = shader_container(vs_persp_prog);
     const auto vs_clip_c = shader_container(vs_clip_prog);
     const auto vs_16p_c = shader_container(vs_16p_prog);
+    const auto vs_10p_c = shader_container(vs_10p_prog);
+    const auto vs_loc16_c = shader_container(vs_loc16_prog);
     const auto gs_dummy_c = shader_container(gs_dummy_prog);
     const auto ps_bary_c = shader_container(ps_bary_prog);
     const auto ps_f16_c = shader_container(ps_f16_prog);
+    const auto ps_f16_low_c = shader_container(ps_f16_low_prog);
+    const auto ps_pruned_c = shader_container(ps_pruned_prog);
+    const auto ps_loc16_c = shader_container(ps_loc16_prog);
     const auto vs_ij_c = shader_container(vs_ij_prog);
     const auto ps_ij_c = shader_container(ps_ij_prog);
     const auto ps_ij_reloc_c = shader_container(ps_ij_reloc_prog);
@@ -612,10 +719,15 @@ int main() {
     std::filesystem::create_directories(lib_dir);
     write_spv(lib_dir / "vs_persp.spv", vs_persp_spv);
     write_spv(lib_dir / "vs_clip.spv", make_bary_vs(false, true));
-    write_spv(lib_dir / "vs_16p.spv", make_16param_vs());
+    write_spv(lib_dir / "vs_16p.spv", make_nparam_vs(16, true));
+    write_spv(lib_dir / "vs_10p.spv", make_nparam_vs(10, false));
+    write_spv(lib_dir / "vs_loc16.spv", make_bary_vs(false, false, 16));
     write_spv(lib_dir / "gs_dummy.spv", gs_dummy_spv);
     write_spv(lib_dir / "ps_bary.spv", ps_bary_spv);
     write_spv(lib_dir / "ps_bary_f16.spv", make_bary_f16_ps(14, 14, 15, 16));
+    write_spv(lib_dir / "ps_bary_f16_low.spv", make_bary_f16_ps(8, 12, 9, 10));
+    write_spv(lib_dir / "ps_bary_pruned.spv", make_bary_pruned_ps());
+    write_spv(lib_dir / "ps_loc16.spv", make_bary_ps(1, 16));
     write_spv(lib_dir / "vs_ij.spv", make_ij_vs());
     write_spv(lib_dir / "ps_ij.spv", make_ij_ps(0, 3, false));
     write_spv(lib_dir / "ps_ij_reloc.spv", make_ij_ps(4, 1, true));
@@ -630,6 +742,10 @@ int main() {
             << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": [], "
                "\"f16_halves\": {\"0\": [28, 29], \"1\": [26, 27], \"2\": [24, 25], \"3\": [22, 23], "
                "\"4\": [20, 21], \"5\": [18, 19], \"6\": [16, 17]}},\n"
+               " \"vs_10p\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_10p_prog)
+            << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": [], \"f16_halves\": {}},\n"
+               " \"vs_loc16\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_loc16_prog)
+            << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": []},\n"
                " \"gs_dummy\": {\"stage\": \"gs\", \"fssm_sha256\": \"" << leonida::sha256_hex(gs_dummy_prog)
             << "\", \"bindings\": [], \"push_constant_bytes\": 144},\n"
                " \"ps_bary\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_bary_prog)
@@ -654,7 +770,16 @@ int main() {
                " \"ps_ij_nomap\": {\"stage\": \"ps\", \"fssm_sha256\": \""
             << leonida::sha256_hex(ps_ij_nomap_prog)
             << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], \"inputs\": [1], "
-               "\"bary_fallback_input\": {\"location\": 3}}}";
+               "\"bary_fallback_input\": {\"location\": 3}}},\n"
+               " \"ps_bary_f16_low\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_f16_low_prog)
+            << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], "
+               "\"bary_fallback_input\": {\"location\": 12}, \"f16_halves\": {\"7\": [9, 10]}},\n"
+               " \"ps_bary_pruned\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_pruned_prog)
+            << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], "
+               "\"bary_fallback_input\": {\"location\": 14}},\n"
+               " \"ps_loc16\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_loc16_prog)
+            << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], "
+               "\"bary_fallback_input\": {\"location\": 1}}}";
     }
 
     constexpr UINT kSize = 16;
@@ -851,9 +976,35 @@ int main() {
             std::printf("ps_bary + ClipDistance[1]: left half clipped, right half interpolated OK\n");
         }
 
-        // 3. Combined --f16-interp-fallback + --bary-fallback (relocated f16 halves + synthesized GS).
+        // 3a. Pruned unused PS Inputs (vs_16p exports 0..29, ps_bary_pruned declares 0..13 & 16..27, loads only 7 + bary 14):
+        //     must succeed and draw accurately even on GPUs with maxGeometryInputComponents = 64 (e.g. RADV).
         {
-            auto pd = make_pso_desc(vs_16p_c, ps_f16_c);
+            auto pd = make_pso_desc(vs_16p_c, ps_pruned_c);
+            Ref<ID3D12PipelineState> pso;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso.p))) && pso.p);
+            std::vector<std::uint8_t> pixels;
+            EXPECT(draw_and_readback(pso.p, pixels));
+            for (UINT row = 0; row < kSize; ++row) {
+                for (UINT col = 0; col < kSize; ++col) {
+                    const float ndc_x = -1.0f + 2.0f * (float(col) + 0.5f) / float(kSize);
+                    const float ndc_y = +1.0f - 2.0f * (float(row) + 0.5f) / float(kSize);
+                    const float l1 = 0.25f * (ndc_x + 1.0f);
+                    const float l2 = 0.25f * (ndc_y + 1.0f);
+                    const float l0 = 1.0f - l1 - l2;
+                    const auto* px = pixels.data() + row * 256 + col * 4;
+                    EXPECT(std::abs(int(px[0]) - to_unorm8(l0)) <= 2);
+                    EXPECT(std::abs(int(px[1]) - to_unorm8(l1)) <= 2);
+                    EXPECT(std::abs(int(px[2]) - to_unorm8(l2)) <= 2);
+                    EXPECT(px[3] == 255);  // param7.w = 1.0 (unread params in vs_16p are 0.0)
+                }
+            }
+            std::printf("ps_bary_pruned (25 unread PS inputs pruned; live Location 7 + bary 14): all 256 pixels OK\n");
+        }
+
+        // 3b. Combined --f16-interp-fallback + --bary-fallback within 64 geometry input components (10-param VS):
+        //     runs on all GPUs including RADV (maxGeometryInputComponents = 64).
+        {
+            auto pd = make_pso_desc(vs_10p_c, ps_f16_low_c);
             Ref<ID3D12PipelineState> pso;
             EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso.p))) && pso.p);
             std::vector<std::uint8_t> pixels;
@@ -871,7 +1022,40 @@ int main() {
                     EXPECT(std::abs(int(px[3]) - want_j) <= 2);
                 }
             }
-            std::printf("ps_bary_f16 (combined f16_halves relocation + bary GS): all 256 pixels OK\n");
+            std::printf("ps_bary_f16_low (10-param VS + f16 relocation <=14 + bary GS): all 256 pixels OK\n");
+        }
+
+        // 3c. Combined --f16-interp-fallback + --bary-fallback on 16-param VS (relocated f16 halves at [28, 29],
+        //     requiring maxGeometryInputComponents >= 120 and maxGeometryOutputComponents >= 120).
+        {
+            auto pd = make_pso_desc(vs_16p_c, ps_f16_c);
+            Ref<ID3D12PipelineState> pso;
+            const HRESULT hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso.p));
+            if (max_gs_in < 120 || max_gs_out < 120) {
+                EXPECT(FAILED(hr) && !pso.p);
+                std::printf(
+                    "SKIP ps_bary_f16 16-param draw: maxGeometryInputComponents=%u, maxGeometryOutputComponents=%u "
+                    "(< 120); refused cleanly\n",
+                    max_gs_in, max_gs_out);
+            } else {
+                EXPECT(SUCCEEDED(hr) && pso.p);
+                std::vector<std::uint8_t> pixels;
+                EXPECT(draw_and_readback(pso.p, pixels));
+                for (UINT row = 0; row < kSize; ++row) {
+                    for (UINT col = 0; col < kSize; ++col) {
+                        const float ndc_x = -1.0f + 2.0f * (float(col) + 0.5f) / float(kSize);
+                        const float ndc_y = +1.0f - 2.0f * (float(row) + 0.5f) / float(kSize);
+                        const int want_i = to_unorm8(0.25f * (ndc_x + 1.0f));
+                        const int want_j = to_unorm8(0.25f * (ndc_y + 1.0f));
+                        const auto* px = pixels.data() + row * 256 + col * 4;
+                        EXPECT(std::abs(int(px[0]) - 64) <= 1);
+                        EXPECT(std::abs(int(px[1]) - 191) <= 1);
+                        EXPECT(std::abs(int(px[2]) - want_i) <= 2);
+                        EXPECT(std::abs(int(px[3]) - want_j) <= 2);
+                    }
+                }
+                std::printf("ps_bary_f16 (16-param f16_halves relocation [28,29] + bary GS): all 256 pixels OK\n");
+            }
         }
 
         // 5. Computed I/J pairs: the GS hands the PS the triangle's three values of VS output 1 (element k = vertex
@@ -990,6 +1174,44 @@ int main() {
             pd.pRootSignature = root2.p;
             Ref<ID3D12PipelineState> bad;
             EXPECT(dev_no_gs->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&bad.p)) == E_NOTIMPL && !bad.p);
+        }
+
+        // 4d. Simulated RADV-like max_geometry_input_components = 64 on any GPU:
+        //     - pruned high-location PS inputs (ps_bary_pruned) and 10-param f16 relocation (ps_bary_f16_low) succeed;
+        //     - 16-param f16 relocation (ps_bary_f16) and live Location 16 (VUID-06272: 4*16+4 = 68 > 64) refuse cleanly.
+        {
+            rt::d3d12::VulkanDeviceInfo info_gs64 = info;
+            info_gs64.max_geometry_input_components = 64;
+            ID3D12Device* inner_gs64 = nullptr;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info_gs64, IID_PPV_ARGS(&inner_gs64))));
+            Ref<ID3D12Device> dev_gs64;
+            EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner_gs64, __uuidof(ID3D12Device),
+                                                               reinterpret_cast<void**>(&dev_gs64.p))));
+            rt::d3d12::set_device_outer(inner_gs64, dev_gs64.p);
+            Ref<ID3D12RootSignature> root64;
+            EXPECT(SUCCEEDED(dev_gs64->CreateRootSignature(0, root_blob.data(), root_blob.size(),
+                                                           IID_PPV_ARGS(&root64.p))));
+
+            auto pd_pruned = make_pso_desc(vs_16p_c, ps_pruned_c);
+            pd_pruned.pRootSignature = root64.p;
+            Ref<ID3D12PipelineState> pso_pruned;
+            EXPECT(SUCCEEDED(dev_gs64->CreateGraphicsPipelineState(&pd_pruned, IID_PPV_ARGS(&pso_pruned.p))) &&
+                   pso_pruned.p);
+
+            auto pd_low = make_pso_desc(vs_10p_c, ps_f16_low_c);
+            pd_low.pRootSignature = root64.p;
+            Ref<ID3D12PipelineState> pso_low;
+            EXPECT(SUCCEEDED(dev_gs64->CreateGraphicsPipelineState(&pd_low, IID_PPV_ARGS(&pso_low.p))) && pso_low.p);
+
+            auto pd_16p = make_pso_desc(vs_16p_c, ps_f16_c);
+            pd_16p.pRootSignature = root64.p;
+            Ref<ID3D12PipelineState> bad;
+            EXPECT(dev_gs64->CreateGraphicsPipelineState(&pd_16p, IID_PPV_ARGS(&bad.p)) == E_NOTIMPL && !bad.p);
+
+            auto pd_loc16 = make_pso_desc(vs_loc16_c, ps_loc16_c);
+            pd_loc16.pRootSignature = root64.p;
+            EXPECT(dev_gs64->CreateGraphicsPipelineState(&pd_loc16, IID_PPV_ARGS(&bad.p)) == E_NOTIMPL && !bad.p);
+            std::printf("max_geometry_input_components=64 checks (pruned OK, 10p f16 OK, 16p & loc16 refused) OK\n");
         }
     }
 

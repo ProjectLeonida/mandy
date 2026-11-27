@@ -9,9 +9,9 @@
 // triangle pass-through Geometry SPIR-V module (`tools/bary_fallback_gs.py` equivalent) in memory for the exact
 // `(VS, PS)` pair:
 //   - copies `BuiltIn Position` across the triangle's 3 vertices (`Triangles` -> `OutputTriangleStrip`, 3 vertices);
-//   - copies every `vec4<f32>` `Location` input the PS reads (other than `bary_location`) that the VS exports, and
-//     zero-fills any declared PS `Location` input the VS omits without declaring a dangling GS `Input` (preserving
-//     `VUID-RuntimeSpirv-OpEntryPoint-08743` on both `VS -> GS` and `GS -> PS` interfaces);
+//   - copies every `vec4<f32>` `Location` input the PS statically reads (other than `bary_location`) that the VS
+//     exports, and zero-fills any unexported or unread PS `Location` input without declaring a GS `Input` (preserving
+//     `VUID-RuntimeSpirv-OpEntryPoint-08743` and avoiding `VUID-RuntimeSpirv-Location-06272` on unused FSSM inputs);
 //   - forwards a VS `BuiltIn ClipDistance` or `BuiltIn CullDistance` `float[1..8]` array when present (rejecting
 //     mixed clip+cull and `ShaderLayer` / `ShaderViewportIndex`, which a pass-through helper cannot forward);
 //   - writes `(1, 0, 0)`, `(0, 1, 0)`, `(0, 0, 1)` at `bary_location` so perspective interpolation yields
@@ -40,6 +40,18 @@ namespace leonida {
 struct BaryFallbackGsInfo {
     std::uint32_t clip_count = 0;
     std::uint32_t cull_count = 0;
+    // Per-vertex scalar input components declared by the GS (4 for Position + dist_count + 4 * forwarded_locs).
+    std::uint32_t input_components = 0;
+    // Highest `4 * Location + 4` across GS Input locations (0 when no user locations are forwarded);
+    // Vulkan VUID-RuntimeSpirv-Location-06272 requires this <= limits.maxGeometryInputComponents.
+    std::uint32_t max_input_location = 0;
+    std::uint32_t max_input_location_components = 0;
+    // Per-vertex scalar output components declared by the GS (4 for Position + dist_count + 4 * pass_locs + 3).
+    std::uint32_t output_components = 0;
+    // Highest `4 * Location + components` across GS Output locations (`pass_locs` vec4 and `bary_location` vec3);
+    // Vulkan VUID-RuntimeSpirv-Location-06272 requires this <= limits.maxGeometryOutputComponents.
+    std::uint32_t max_output_location = 0;
+    std::uint32_t max_output_location_components = 0;
 };
 
 // `per_vertex` is the index entry's `bary_fallback_input.per_vertex` (`ShaderEntry::bary_fallback_per_vertex`):
@@ -68,8 +80,16 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
     constexpr std::uint16_t kOpTypeFunction = 33;
     constexpr std::uint16_t kOpConstant = 43;
     constexpr std::uint16_t kOpConstantComposite = 44;
+    constexpr std::uint16_t kOpFunctionCall = 57;
+    constexpr std::uint16_t kOpCopyMemory = 63;
+    constexpr std::uint16_t kOpCopyMemorySized = 64;
+    constexpr std::uint16_t kOpPtrAccessChain = 67;
+    constexpr std::uint16_t kOpInBoundsPtrAccessChain = 70;
+    constexpr std::uint16_t kOpCopyObject = 83;
+    constexpr std::uint16_t kOpSelect = 169;
     constexpr std::uint16_t kOpEmitVertex = 218;
     constexpr std::uint16_t kOpEndPrimitive = 219;
+    constexpr std::uint16_t kOpPhi = 245;
     constexpr std::uint16_t kOpLabel = 248;
 
     constexpr std::uint32_t kExecModelGeometry = 3;
@@ -240,6 +260,7 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
     if (!has_ps_ep) return fail("bary_fallback: PS has no Fragment entry point");
 
     std::map<std::uint32_t, std::uint32_t> ps_in_loc_pointee;
+    std::map<std::uint32_t, std::uint32_t> ps_in_var_by_loc;
     for (const auto& [target, loc] : ps_loc_decs) {
         const auto it = ps_in_var_pointee.find(target);
         if (it == ps_in_var_pointee.end()) continue;
@@ -247,6 +268,66 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
             return fail("bary_fallback: Component-decorated PS Input at Location " + std::to_string(loc));
         if (!ps_in_loc_pointee.emplace(loc, it->second).second)
             return fail("bary_fallback: duplicate PS Input Location " + std::to_string(loc));
+        ps_in_var_by_loc.emplace(loc, target);
+    }
+
+    // The translator declares every interpolant in the FSSM table as a PS Input variable, even when the PS never
+    // reads it. The GS must still write matching outputs for the PS interface, but reading unused locations from the
+    // VS would bloat the VS->GS interface and exceed maxGeometryInputComponents (64 on RADV). Propagate pointer
+    // aliases from PS Input variables and forward only inputs statically read (via OpLoad, GLSL.std.450 InterpolateAt*
+    // OpExtInst, OpFunctionCall, or OpCopyMemory*); unread PS inputs are zero-filled in the GS.
+    std::map<std::uint32_t, std::set<std::uint32_t>> input_pointer_roots;
+    for (const auto& [var, _] : ps_in_var_pointee) input_pointer_roots[var].insert(var);
+    const auto add_roots = [&](std::uint32_t dst_ptr, std::uint32_t src_ptr) -> bool {
+        const auto it = input_pointer_roots.find(src_ptr);
+        if (it == input_pointer_roots.end()) return false;
+        auto& dst = input_pointer_roots[dst_ptr];
+        const std::size_t before = dst.size();
+        dst.insert(it->second.begin(), it->second.end());
+        return dst.size() != before;
+    };
+    bool roots_changed = true;
+    while (roots_changed) {
+        roots_changed = false;
+        bool in_ps_function = false;
+        for (const Inst& inst : ps_mod.insts) {
+            if (inst.opcode == kOpFunction) in_ps_function = true;
+            if (!in_ps_function) continue;
+            if ((inst.opcode == kOpAccessChain || inst.opcode == kOpInBoundsAccessChain ||
+                 inst.opcode == kOpPtrAccessChain || inst.opcode == kOpInBoundsPtrAccessChain ||
+                 inst.opcode == kOpCopyObject) &&
+                inst.words.size() >= 4) {
+                roots_changed |= add_roots(inst.words[2], inst.words[3]);
+            } else if (inst.opcode == kOpSelect && inst.words.size() >= 6) {
+                roots_changed |= add_roots(inst.words[2], inst.words[4]);
+                roots_changed |= add_roots(inst.words[2], inst.words[5]);
+            } else if (inst.opcode == kOpPhi && inst.words.size() >= 5) {
+                for (std::size_t k = 3; k + 1 < inst.words.size(); k += 2)
+                    roots_changed |= add_roots(inst.words[2], inst.words[k]);
+            }
+        }
+    }
+    std::set<std::uint32_t> statically_read_ps_inputs;
+    const auto mark_read = [&](std::uint32_t ptr_id) {
+        if (const auto it = input_pointer_roots.find(ptr_id); it != input_pointer_roots.end())
+            statically_read_ps_inputs.insert(it->second.begin(), it->second.end());
+    };
+    {
+        bool in_ps_function = false;
+        for (const Inst& inst : ps_mod.insts) {
+            if (inst.opcode == kOpFunction) in_ps_function = true;
+            if (!in_ps_function) continue;
+            if (inst.opcode == kOpLoad && inst.words.size() >= 4) {
+                mark_read(inst.words[3]);
+            } else if (inst.opcode == kOpExtInst && inst.words.size() >= 6) {
+                for (std::size_t k = 5; k < inst.words.size(); ++k) mark_read(inst.words[k]);
+            } else if (inst.opcode == kOpFunctionCall && inst.words.size() >= 5) {
+                for (std::size_t k = 4; k < inst.words.size(); ++k) mark_read(inst.words[k]);
+            } else if ((inst.opcode == kOpCopyMemory && inst.words.size() >= 3) ||
+                       (inst.opcode == kOpCopyMemorySized && inst.words.size() >= 4)) {
+                mark_read(inst.words[2]);
+            }
+        }
     }
 
     if (const auto bary_it = ps_in_loc_pointee.find(bary_location);
@@ -310,6 +391,10 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
         if (!ps_v4float_tys.count(pt_ty))
             return fail("bary_fallback: PS pass-through Input at Location " + std::to_string(loc) + " is not vec4<f32>");
         pass_locs.push_back(loc);
+        if (!statically_read_ps_inputs.count(ps_in_var_by_loc.at(loc))) {
+            zero_loc_set.insert(loc);
+            continue;
+        }
         const auto vs_it = vs_out_loc_pointee.find(loc);
         if (vs_it != vs_out_loc_pointee.end()) {
             if (!vs_v4float_tys.count(vs_it->second))
@@ -533,7 +618,28 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
 
     gs.header = {kSpirvMagic, kSpirvVersion15, 0u, next_id, 0u};
     gs_words = gs.serialize();
-    if (out_info) *out_info = {clip_count, cull_count};
+    if (out_info) {
+        BaryFallbackGsInfo info{};
+        info.clip_count = clip_count;
+        info.cull_count = cull_count;
+        info.input_components = 4u + dist_count + 4u * std::uint32_t(forwarded_locs.size());
+        if (!forwarded_locs.empty()) {
+            info.max_input_location = forwarded_locs.back();
+            info.max_input_location_components = 4u * info.max_input_location + 4u;
+        }
+        info.output_components = 4u + dist_count + 4u * std::uint32_t(pass_locs.size()) + 3u;
+        info.max_output_location = bary_location;
+        info.max_output_location_components = 4u * bary_location + 3u;
+        if (!pass_locs.empty()) {
+            const std::uint32_t hi_pass = pass_locs.back();
+            const std::uint32_t hi_comp = 4u * hi_pass + 4u;
+            if (hi_comp > info.max_output_location_components) {
+                info.max_output_location = hi_pass;
+                info.max_output_location_components = hi_comp;
+            }
+        }
+        *out_info = info;
+    }
     return true;
 }
 
