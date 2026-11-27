@@ -29,6 +29,7 @@
 #include "../shims/xmem.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/title_mirror_space.h"
+#include "../src/title_va_alias.h"
 
 #include <array>
 #include <cstdio>
@@ -324,6 +325,54 @@ int test() {
         EXPECT(!std::memcmp(rewritten_entry, other.data(), sizeof(other)));           // filtered: an arena V#
         EXPECT(!std::memcmp(title + 10 * kDescriptor, sizes, sizeof(sizes)));         // the title's bytes unchanged
         EXPECT(!std::memcmp(title + 11 * kDescriptor, pointer.data(), sizeof(pointer)));
+    }
+
+    // 8. Round 1A/1C regression: an in-place heap V# naming > 256 MiB (past kMirrorNameMax) of a committed plain
+    //    region inside title_mirror_space must NEVER create an orphan TitleWindow, must null the filtered copy while
+    //    keeping the title's bytes intact, and repeated V# halves must answer identically without creating windows.
+    //    Also verify O(1)-rejected bit-47 and out-of-arena-span V# halves null cleanly.
+    {
+        constexpr SIZE_T kBigReserve = 300ull << 20;
+        constexpr std::uint32_t kOverMirrorMax = 260u << 20;  // > kMirrorNameMax (256 MiB)
+        auto* big_plain = static_cast<std::uint8_t*>(reserve(nullptr, kBigReserve, MEM_RESERVE, 0, PAGE_READWRITE));
+        EXPECT(big_plain && leonida::title_mirror_space::contains(std::uintptr_t(big_plain)));
+        EXPECT(VirtualAlloc(big_plain, kPage64k, MEM_COMMIT, PAGE_READWRITE) == big_plain);
+        std::memset(big_plain, 0x5A, kPage64k);
+        const std::size_t aliases_before = leonida::title_va_aliases().size();
+
+        const auto wide_vsharp = raw_vsharp(std::uintptr_t(big_plain), kOverMirrorMax);
+        const auto bit47_vsharp = raw_vsharp((1ull << 47) | 0x200000ull, 256);
+        const std::uint64_t arena_sz = rt::d3d12::device_arena_size(device.p);
+        // base < arena_sz with span > arena_sz - base (fails reachable_as_written; O(1)-rejected in filter).
+        leonida::gfx10::Buffer over_arena{};
+        over_arena.address = arena_sz > 0x10000 ? arena_sz - 0x10000 : 0x10000;
+        over_arena.stride = 16;
+        over_arena.num_records = 0x4000;  // 256 KiB > 64 KiB remaining in arena
+        over_arena.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+        const auto over_arena_vsharp = leonida::gfx10::encode(over_arena);
+
+        std::thread([&] {
+            put(12, wide_vsharp);
+            put(13, wide_vsharp);  // repeated V# half in same batch
+            put(14, bit47_vsharp);
+            put(15, over_arena_vsharp);
+        }).join();
+        std::uint32_t out[4][8]{};
+        EXPECT(rt::d3d12::arena_gpu_read(device.p, shader_va + 12 * kDescriptor, out, sizeof(out)));
+        for (int i = 0; i < 4; ++i) EXPECT(!(out[i][0] | out[i][1] | out[i][2] | out[i][3]));
+        // Write another repeated wide V# on a subsequent submission (hits heap.records.answer()).
+        std::thread([&] { put(16, wide_vsharp); }).join();
+        std::uint32_t repeat_out[8]{};
+        EXPECT(rt::d3d12::arena_gpu_read(device.p, shader_va + 16 * kDescriptor, repeat_out, sizeof(repeat_out)));
+        EXPECT(!(repeat_out[0] | repeat_out[1] | repeat_out[2] | repeat_out[3]));
+
+        // Zero orphan TitleWindows created in title_va_aliases.
+        EXPECT(leonida::title_va_aliases().size() == aliases_before);
+        EXPECT(leonida::title_va_aliases().shader_va(std::uintptr_t(big_plain)) == std::uintptr_t(big_plain));
+        // Title's own bytes remain untouched.
+        EXPECT(!std::memcmp(title + 12 * kDescriptor, wide_vsharp.data(), sizeof(wide_vsharp)));
+        EXPECT(!std::memcmp(title + 14 * kDescriptor, bit47_vsharp.data(), sizeof(bit47_vsharp)));
+        EXPECT(VirtualFree(big_plain, 0, MEM_RELEASE));
     }
 
     // 3. The null slots after the heap.

@@ -3405,7 +3405,7 @@ struct DeviceState {
         }
         VkDeviceSize offset = 0;
         std::uint8_t* mapped{};
-        if (arena_allocate(size, kTitleWindowAlign, offset, arena_buffer)) {
+        if (arena_allocate(size, kTitleWindowAlign, offset, arena_window)) {
             mapped = arena_host(offset, size);
         } else if (leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::windows);
                    stream_windows() && external_windows.allocate(*this, size, offset, mapped)) {
@@ -3731,6 +3731,12 @@ struct DeviceState {
         // TitleVaAliases::resolve calls note_reached(va, bytes) after we return true iff writable && out != 0.
         if (page_mirror_resolve(va, want)) {
             out = va;
+            return true;
+        }
+        // Never fall through to make_title_window / ShadowPages over memory covered by the page mirror (e.g. a span
+        // exceeding kMirrorNameMax): a shadow tracker over mirrored pages fights HotColdTracking's guards.
+        if (page_mirror.mirror && page_mirror_covers(va, 1)) {
+            out = 0;
             return true;
         }
         // A stream pool's address: one mapping for its readable run, shared by both of its views.
@@ -4389,7 +4395,7 @@ struct DeviceState {
             if (to && encodable(to)) return path(3), to;
         }
         uint64_t lo{}, hi{};
-        if (make_window && aliases.title_memory(base, lo, hi) && bytes <= hi - base) {
+        if (make_window && bytes <= kTitleWindowMax && aliases.title_memory(base, lo, hi) && bytes <= hi - base) {
             to = aliases.resolve(base, bytes, kind, writable);
             uint64_t mapped{};
             if (to && aliases.range_of(base, mapped, room) && mapped == to && room >= bytes && backed(to))
@@ -4569,7 +4575,7 @@ struct DeviceState {
         // most bytes live at once, which differs from it by fragmentation.
         bool log = false;  // LEONIDA_ARENA_LOG=1: one line per VA handed out
         VkDeviceSize in_use = 0, peak_in_use = 0, peak_end = 0;
-        VkDeviceSize use_in_use[4] = {}, use_peak[4] = {};
+        VkDeviceSize use_in_use[5] = {}, use_peak[5] = {};
         std::uint64_t allocations = 0, failures = 0;
     } arena;
 
@@ -4636,6 +4642,7 @@ struct DeviceState {
         std::uint64_t units_local = 0, units_host = 0;  // home units by memory, all so far
         bool last_local = true;
         std::uint64_t presents = 0;  // present serial at the last log line
+        std::uint64_t last_present_serial = 0;  // present serial last forwarded to HotColdTracking
         std::uint64_t faults_seen = 0, hot_seen = 0, cold_seen = 0;  // the tracking's counters at the last log line
         std::uint64_t uploaded_seen = 0, conflicts_seen = 0;           // the mirror's, likewise
         // The write-back's GPU copy of the homes it looks at (page_mirror_write_back_ranges): a host-cached buffer of
@@ -5347,8 +5354,10 @@ struct DeviceState {
     }
 
     // What an arena range holds, for the high-water report (D3D-55).
-    enum ArenaUse { arena_buffer, arena_descriptor_heap, arena_shader, arena_heap };
-    static constexpr const char* kArenaUseNames[4] = {"buffer", "descriptor heap", "shader", "heap"};
+    enum ArenaUse { arena_buffer, arena_descriptor_heap, arena_shader, arena_heap, arena_window, arena_use_count };
+    static_assert(arena_use_count == 5);
+    static constexpr const char* kArenaUseNames[arena_use_count] = {
+        "buffer", "descriptor heap", "shader", "heap", "title window/shadow"};
     // A fault line about the arena is rate-limited to this interval: the walk behind it costs a pass over every
     // free block, and a persistent fault would otherwise print on every allocation of a streaming frame.
     static constexpr ULONGLONG kArenaReportMs = 5000;
@@ -5522,13 +5531,14 @@ struct DeviceState {
                      static_cast<unsigned long long>(bound.bind_failures));
         std::fprintf(stderr,
                      "[rt] d3d12: GPU address arena: peak end %.1f of %.1f MiB (%.1f%%), peak live %.1f MiB "
-                     "(buffers %.1f, descriptor heaps %.1f of which null guards %.1f now, shaders %.1f, heaps %.1f), %llu "
-                     "allocations, %llu refused; %zu free blocks (largest %.1f MiB, %.1f MiB free)\n",
+                     "(buffers %.1f, descriptor heaps %.1f of which null guards %.1f now, shaders %.1f, heaps %.1f, "
+                     "windows/shadows %.1f), %llu allocations, %llu refused; %zu free blocks (largest %.1f MiB, %.1f "
+                     "MiB free)\n",
                      arena.peak_end * mib, arena.size * mib, 100.0 * double(arena.peak_end) / double(arena.size),
                      arena.peak_in_use * mib, arena.use_peak[arena_buffer] * mib,
                      arena.use_peak[arena_descriptor_heap] * mib,
                      double(arena_guard_bytes.load(std::memory_order_relaxed)) * mib, arena.use_peak[arena_shader] * mib,
-                     arena.use_peak[arena_heap] * mib,
+                     arena.use_peak[arena_heap] * mib, arena.use_peak[arena_window] * mib,
                      (unsigned long long)arena.allocations, (unsigned long long)arena.failures, arena.blocks.count(),
                      arena.blocks.largest().size * mib, arena.blocks.free_bytes() * mib);
     }
@@ -5673,7 +5683,7 @@ struct DeviceState {
         std::vector<leonida::SlotChange> pending_changes;
         std::vector<std::uint32_t> touched_scratch;
         std::uint64_t pages_filtered = 0, slots_filtered = 0, present_mark = 0;
-        std::uint64_t vsharps_as_written = 0, vsharps_deferred = 0;
+        std::uint64_t vsharps_as_written = 0, vsharps_deferred = 0, vsharps_rejected = 0;
         double filter_ms = 0, deferred_ms = 0;
         // fix_console_slots' budget, for the current refresh, and the slots it nulled since the last log line
         std::chrono::steady_clock::time_point fix_start{};
@@ -5794,7 +5804,7 @@ struct DeviceState {
         Records::State texture = Records::none;
         std::uint64_t texture_address = 0;
         VsharpRecord halves[2];
-        const VsharpPath path = heap.scratch ? VsharpPath::scratch : VsharpPath::shadow;
+        const VsharpPath path = (heap.scratch || heap.in_place) ? VsharpPath::scratch : VsharpPath::shadow;
         if (!heap.resource_heap || !(w[0] | w[1] | w[2] | w[3])) {
             // A sampler heap holds S#s (copied as written); an all-zero slot stays null.
         } else if (!(w[3] >> 30)) {
@@ -6022,7 +6032,28 @@ struct DeviceState {
                     ++heap.vsharps_as_written;
                     continue;
                 }
-                heap.records.set(slot, half, Records::waiting, base, span, 0);
+                // Reject V# halves that are guaranteed unresolvable (inline constants, bit-47 sign bit not backed by
+                // any device buffer, arena offsets extending past arena.size, or non-title addresses without an alias)
+                // in O(1) without inserting into heap.records or deferring to finish_in_place.
+                auto& aliases = leonida::title_va_aliases();
+                bool impossible = !base || (base & (1ull << 47)) != 0;
+                if (!impossible) {
+                    std::uint64_t lo = 0, hi = 0;
+                    const bool in_title = aliases.title_memory(base, lo, hi) && span <= hi - base;
+                    if (!in_title) {
+                        std::uint64_t alias_to = 0, alias_room = 0;
+                        impossible = !aliases.range_of(base, alias_to, alias_room);
+                    }
+                }
+                if (impossible) {
+                    heap.records.set(slot, half, Records::none, 0, 0, 0);
+                    h[0] = h[1] = h[2] = h[3] = 0;  // null whole: no three words of four
+                    ++heap.vsharps_rejected;
+                    continue;
+                }
+                // Clear any stale record before deferring so finish_in_place's record-answer lookup never mistakes a
+                // placeholder for a resolved or settled waiting record.
+                heap.records.set(slot, half, Records::none, 0, 0, 0);
                 h[0] = h[1] = h[2] = h[3] = 0;  // null whole: no three words of four (a stride or format left over)
                 ++heap.vsharps_deferred;
                 defer = true;
@@ -6129,22 +6160,96 @@ struct DeviceState {
         return true;
     }
 
+    // Fast path for TitleMirrorHooks::filter_pieces: `scratch` already holds the title's 64 KiB page copied by
+    // TitleMirror::fill(), and `changed_pieces` (256 bits, one per 256-byte piece = 8 descriptor slots) marks the
+    // pieces that changed. Pass 1 reads `scratch` and snapshots changed slots into `heap->previous` BEFORE Pass 2
+    // calls filter_slot_locked(), so a re-entrant TitleMirror::fill() triggered by page_mirror_resolve_locked()
+    // cannot overwrite `scratch` while we are still reading it. page_mirror.mutex held.
+    bool filter_heap_page_pieces(std::uint64_t va, std::uint8_t* to, const std::uint8_t* scratch, std::size_t bytes,
+                                 bool fresh, const std::array<std::uint64_t, 4>& changed_pieces) {
+        if (bytes > leonida::TitleMirror::kPage) return filter_heap_page(va, to, scratch, bytes, fresh);
+        ConsoleHeap* heap = nullptr;
+        for (ConsoleHeap* h : page_mirror.in_place)
+            if (va - h->console_va < h->bytes) heap = h;
+        if (!heap) {
+            std::memcpy(to, scratch, bytes);
+            return true;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        constexpr std::size_t kPiece = 256;
+        std::array<std::uint16_t, leonida::TitleMirror::kPage / kDescriptorSize> to_filter;
+        std::size_t to_filter_count = 0;
+        std::size_t changed = 0;
+        for (std::size_t word = 0; word < 4; ++word) {
+            std::uint64_t mask = fresh ? ~std::uint64_t(0) : changed_pieces[word];
+            while (mask) {
+                const unsigned bit = static_cast<unsigned>(std::countr_zero(mask));
+                mask &= mask - 1;
+                const std::size_t piece_begin = (word * 64 + bit) * kPiece;
+                if (piece_begin >= bytes) break;
+                const std::size_t piece_end = std::min(piece_begin + kPiece, bytes);
+                for (std::size_t at = piece_begin; at + kDescriptorSize <= piece_end; at += kDescriptorSize) {
+                    const std::uint64_t slot_va = va + at;
+                    if (slot_va - heap->console_va >= heap->bytes) {  // past the heap's end on its last page: as it is
+                        std::memcpy(to + at, scratch + at, kDescriptorSize);
+                        continue;
+                    }
+                    const std::size_t slot = std::size_t((slot_va - heap->console_va) / kDescriptorSize);
+                    std::uint8_t* previous = heap->previous + slot * kDescriptorSize;
+                    const bool same = !std::memcmp(previous, scratch + at, kDescriptorSize);
+                    if (same && !fresh) continue;
+                    if (!same) {
+                        std::memcpy(previous, scratch + at, kDescriptorSize);
+                        note_changed_slot(*heap, previous);
+                        ++changed;
+                    }
+                    to_filter[to_filter_count++] = static_cast<std::uint16_t>(at);
+                }
+            }
+        }
+        for (std::size_t i = 0; i < to_filter_count; ++i) {
+            const std::size_t at = to_filter[i];
+            const std::size_t slot = std::size_t((va + at - heap->console_va) / kDescriptorSize);
+            filter_slot_locked(*heap, slot, to + at);
+        }
+        heap->slots_filtered += changed;
+        ++heap->pages_filtered;
+        heap->copied += changed * kDescriptorSize;
+        heap->filter_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        return true;
+    }
+
     // What the filter left to do, done outside the mirror's lock: the V#s the mirror does not hold resolved as a
     // copied slot's were (an interim, until every title allocation is in the mirror; they read null meanwhile), the
     // T#s bound, and the write-back noted for the mirror ranges the heap's V#s name. Each result goes into the home
     // under the lock, unless the title rewrote the slot since (then the filter has it again). console_heap_mutex held,
     // page_mirror.mutex not.
     void finish_in_place(ConsoleHeap& heap) {
+        using Records = leonida::ConsoleHeapSlotRecords;
         struct Job {
             std::uint32_t slot;
             std::uint32_t words[kDescriptorSize / 4];
             bool reachable[2] = {false, false};
+            bool answered[2] = {false, false};
+            VsharpRecord answer[2]{};
+        };
+        const VsharpPath path = (heap.scratch || heap.in_place) ? VsharpPath::scratch : VsharpPath::shadow;
+        const auto wants_geometry = [path](const std::uint32_t* h, std::uint64_t span) {
+            const leonida::gfx10::BufferWords words{h[0], h[1], h[2], h[3]};
+            leonida::gfx10::Buffer desc{};
+            return leonida::gfx10::decode(words, desc) &&
+                   (path != VsharpPath::scratch || span <= kTitleWindowMax ||
+                    (desc.format && leonida::gfx10::encode(desc) == words));
         };
         std::vector<Job> jobs;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
         {
             std::unique_lock lock(page_mirror.mutex, std::defer_lock);
             leonida::submit_phases::lock_timed(lock);
+            // Apply any pending slot changes first under page_mirror.mutex so heap.records is current before
+            // consulting heap.records.answer() for repeated V# halves.
+            apply_in_place_changes(heap);
+            const std::uint64_t room_gen = geometry.free_generation();
             jobs.reserve(heap.deferred.size());
             for (const std::uint32_t slot : heap.deferred) {
                 heap.deferred_mark[slot] = 0;
@@ -6152,7 +6257,7 @@ struct DeviceState {
                 job.slot = slot;
                 std::memcpy(job.words, heap.previous + std::size_t(slot) * kDescriptorSize, kDescriptorSize);
                 if (!(job.words[3] >> 30)) {
-                    // Batch-check reachability under the single mirror lock acquisition instead of re-locking per half.
+                    // Batch-check reachability and existing slot records under the single mirror lock acquisition.
                     for (unsigned half = 0; half < 2; ++half) {
                         const std::uint32_t* h = job.words + 4 * half;
                         if ((h[3] >> 30) || !h[2]) continue;
@@ -6163,6 +6268,16 @@ struct DeviceState {
                         if (reachable_as_written(base, span, mirrored)) {
                             job.reachable[half] = true;
                             if (mirrored) heap.mirror_ranges.emplace_back(base, span);
+                            continue;
+                        }
+                        const bool copy_geometry = wants_geometry(h, span);
+                        Records::State state{};
+                        std::uint64_t target = 0;
+                        if (heap.records.answer(base, span, copy_geometry, state, target) &&
+                            !(state == Records::waiting_room && room_gen != geometry_room_seen)) {
+                            job.answered[half] = true;
+                            job.answer[half] = {state, base, span, target, copy_geometry};
+                            ++(state == Records::resolved ? heap.vsharps_answered_resolved : heap.vsharps_answered);
                         }
                     }
                 }
@@ -6173,13 +6288,40 @@ struct DeviceState {
         for (const auto& [base, span] : ranges) note_title_write(base, span);  // as vsharp_address's mirror path does
         if (jobs.empty()) return;
         const auto start = std::chrono::steady_clock::now();
-        using Records = leonida::ConsoleHeapSlotRecords;
-        const VsharpPath path = heap.scratch ? VsharpPath::scratch : VsharpPath::shadow;
         struct Done {
             std::uint32_t out[kDescriptorSize / 4];
             VsharpRecord halves[2];
             Records::State texture = Records::none;
             std::uint64_t texture_address = 0;
+        };
+        struct BatchKey {
+            std::uint64_t base, span;
+            bool geometry;
+            bool operator==(const BatchKey&) const = default;
+        };
+        struct BatchKeyHash {
+            std::size_t operator()(const BatchKey& k) const noexcept {
+                std::size_t h = std::hash<std::uint64_t>{}(k.base);
+                h ^= std::hash<std::uint64_t>{}(k.span) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+                return h ^ std::size_t(k.geometry);
+            }
+        };
+        std::unordered_map<BatchKey, VsharpRecord, BatchKeyHash> batch_answers;
+        const auto apply_answer = [&](std::uint32_t* h, const VsharpRecord& rec, VsharpRecord& out_rec) {
+            out_rec = rec;
+            if (rec.state == Records::resolved) {
+                const std::uint64_t to = rec.target - arena.address;  // mod 2^64, as recorded
+                if ((to & ((1ull << 48) - 1)) != rec.base) {
+                    h[0] = std::uint32_t(to);
+                    h[1] = (h[1] & 0xffff0000u) | std::uint32_t((to >> 32) & 0xffff);
+                    ++heap.vsharps;
+                }
+            } else {
+                const std::uint32_t stride = (h[1] >> 16) & 0x3fffu;
+                note_unbacked_vsharp(rec.base, rec.span, stride, h);
+                h[0] = h[1] = h[2] = h[3] = 0;
+                ++heap.unbacked;
+            }
         };
         std::vector<Done> done(jobs.size());
         for (std::size_t i = 0; i < jobs.size(); ++i) {
@@ -6189,7 +6331,22 @@ struct DeviceState {
                 for (unsigned half = 0; half < 2; ++half) {
                     std::uint32_t* h = w + 4 * half;
                     if ((h[3] >> 30) || !h[2] || jobs[i].reachable[half]) continue;
+                    if (jobs[i].answered[half]) {
+                        apply_answer(h, jobs[i].answer[half], done[i].halves[half]);
+                        continue;
+                    }
+                    const std::uint64_t base = std::uint64_t(h[0]) | (std::uint64_t(h[1] & 0xffff) << 32);
+                    const std::uint32_t stride = (h[1] >> 16) & 0x3fffu;
+                    const std::uint64_t span = std::uint64_t(h[2]) * (stride ? stride : 1);
+                    const BatchKey key{base, span, wants_geometry(h, span)};
+                    if (const auto it = batch_answers.find(key); it != batch_answers.end()) {
+                        ++(it->second.state == Records::resolved ? heap.vsharps_answered_resolved
+                                                                 : heap.vsharps_answered);
+                        apply_answer(h, it->second, done[i].halves[half]);
+                        continue;
+                    }
                     const VsharpResult result = fix_vsharp(h, path, &done[i].halves[half], &heap, false);
+                    if (done[i].halves[half].state != Records::none) batch_answers.emplace(key, done[i].halves[half]);
                     if (result == VsharpResult::rebased) ++heap.vsharps;
                     if (result == VsharpResult::empty) {
                         ++heap.unbacked;
@@ -6267,6 +6424,7 @@ struct DeviceState {
     // fix_vsharp's answer from a record of the same range in `heap`, current with every change noted so far.
     bool answered_by_record(ConsoleHeap& heap, std::uint64_t base, std::uint64_t span, bool copy_geometry,
                             VsharpRecord& record) {
+        if (heap.in_place) return false;  // in-place heaps answer under page_mirror.mutex in finish_in_place
         sync_slot_changes(heap);
         using Records = leonida::ConsoleHeapSlotRecords;
         Records::State state{};
@@ -6558,14 +6716,16 @@ struct DeviceState {
                              "[rt] d3d12: console descriptor heap 0x%llx read in place: per submission %.1f pages "
                              "filtered, %.1f slots changed, %.3f ms, and %.3f ms finishing what the filter left; per "
                              "frame %.1f pages, %.3f ms (%llu frames); V# halves a submission: %.1f read as the title "
-                             "wrote them, %.1f resolved outside the mirror\n",
+                             "wrote them, %.1f rejected in filter, %.1f resolved outside the mirror\n",
                              static_cast<unsigned long long>(heap->console_va), double(heap->pages_filtered) / count,
                              double(heap->slots_filtered) / count, heap->filter_ms / count, heap->deferred_ms / count,
                              double(heap->pages_filtered) / frames, (heap->filter_ms + heap->deferred_ms) / frames,
                              static_cast<unsigned long long>(presents - heap->present_mark),
-                             double(heap->vsharps_as_written) / count, double(heap->vsharps_deferred) / count);
+                             double(heap->vsharps_as_written) / count, double(heap->vsharps_rejected) / count,
+                             double(heap->vsharps_deferred) / count);
                 heap->present_mark = presents;
-                heap->pages_filtered = heap->slots_filtered = heap->vsharps_as_written = heap->vsharps_deferred = 0;
+                heap->pages_filtered = heap->slots_filtered = heap->vsharps_as_written = heap->vsharps_deferred =
+                    heap->vsharps_rejected = 0;
                 heap->filter_ms = heap->deferred_ms = 0;
             }
             std::string refused_breakdown;
@@ -10197,7 +10357,9 @@ public:
             buffer_ = VK_NULL_HANDLE;
             memory_ = VK_NULL_HANDLE;
         }
-        if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
+        if (in_arena_)
+            device_.arena_release(arena_offset_, desc_.Width,
+                                  shadow_ ? DeviceState::arena_window : DeviceState::arena_buffer);
         if (pooled_image_)
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::pooled_title_image, pooled_image_.release());
         else if (image_ && !sparse_image_)
@@ -10681,7 +10843,7 @@ public:
         // instead (src/title_va_alias.h), a VA below 4 GiB that a root view and a V#'s 48 bits both hold. The arena
         // is host-visible, so the per-submission copy writes it in place.
         if (device_.arena_ready() && device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
-                                                           arena_offset_, DeviceState::arena_buffer)) {
+                                                           arena_offset_, DeviceState::arena_window)) {
             in_arena_ = true;
             shadow_ = device_.arena_host(arena_offset_, desc_.Width);
             device_.add_shadow(pages, shadow_, std::size_t(desc_.Width));
@@ -16631,22 +16793,24 @@ public:
                     std::lock_guard lock(d.shadow_mutex);
                     shadows = d.shadows.size();
                 }
-                VkDeviceSize in_use = 0, peak = 0, use[4] = {};
+                VkDeviceSize in_use = 0, peak = 0, use[DeviceState::arena_use_count] = {};
                 {
                     std::lock_guard lock(d.arena.mutex);
                     in_use = d.arena.in_use;
                     peak = d.arena.peak_end;
-                    for (int i = 0; i < 4; ++i) use[i] = d.arena.use_in_use[i];
+                    for (int i = 0; i < DeviceState::arena_use_count; ++i) use[i] = d.arena.use_in_use[i];
                 }
                 char text[512];
                 std::snprintf(text, sizeof text,
                               "pipeline cache %.0f MiB; arena %.0f MiB (type %u), in use %.0f MiB (buffer %.0f, "
-                              "descriptor heap %.0f, shader %.0f, heap %.0f), peak end %.0f MiB; title memory %llu "
-                              "ranges %.0f MiB reserved/committed VA; shadows %llu; fsdraw pipeline notes %zu",
+                              "descriptor heap %.0f, shader %.0f, heap %.0f, windows/shadows %.0f), peak end %.0f MiB; "
+                              "title memory %llu ranges %.0f MiB reserved/committed VA; shadows %llu; fsdraw pipeline "
+                              "notes %zu",
                               leonida::mem_probe::mib(cache), leonida::mem_probe::mib(d.arena.size),
                               d.arena.memory_type, leonida::mem_probe::mib(in_use), leonida::mem_probe::mib(use[0]),
                               leonida::mem_probe::mib(use[1]), leonida::mem_probe::mib(use[2]),
-                              leonida::mem_probe::mib(use[3]), leonida::mem_probe::mib(peak),
+                              leonida::mem_probe::mib(use[3]),
+                              leonida::mem_probe::mib(use[DeviceState::arena_window]), leonida::mem_probe::mib(peak),
                               (unsigned long long)title_ranges, leonida::mem_probe::mib(title),
                               (unsigned long long)shadows, leonida::fsdraw::pipeline_count());
                 return std::string(text);
@@ -16661,6 +16825,7 @@ public:
                     share.arena_bound = d.arena.backing.stats().bound;
                     share.arena_in_use = d.arena.in_use;
                     for (std::size_t i = 0; i < share.arena_use.size(); ++i) share.arena_use[i] = d.arena.use_in_use[i];
+                    share.arena_windows = d.arena.use_in_use[DeviceState::arena_window];
                 }
                 if (d.page_mirror.mirror) {
                     std::lock_guard held(d.page_mirror.mutex);

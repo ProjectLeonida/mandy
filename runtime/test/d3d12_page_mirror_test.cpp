@@ -26,6 +26,7 @@
 #include "../shims/xmem.h"
 #include "../src/title_mirror_space.h"
 #include "../src/title_page_watch.h"
+#include "../src/title_va_alias.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -255,6 +256,40 @@ int test() {
         EXPECT(gpu_word(device.p, std::uintptr_t(dst)) == 0xBB000001u);
         EXPECT(rt::d3d12::page_mirror_write_back(device.p, std::uintptr_t(dst), kPage64k) == 0);
         EXPECT(words[kPage64k / 4] == 0xBB000001u);
+    }
+
+    // 11. Reservations <= 2 GiB (TitleMirror::kChunk) are aligned so they never straddle a 2 GiB chunk boundary,
+    //     allowing any placed buffer inside them to bind directly to a single mirror chunk without falling back to a
+    //     slot-133 shadow.
+    {
+        constexpr SIZE_T kBig = 1200ull << 20;  // 1.2 GiB: two of these cannot share one 2 GiB chunk
+        constexpr std::uint64_t kChunk = leonida::title_mirror_space::kChunk;
+        auto* r1 = static_cast<std::uint8_t*>(reserve(nullptr, kBig, MEM_RESERVE, 0, PAGE_READWRITE));
+        auto* r2 = static_cast<std::uint8_t*>(reserve(nullptr, kBig, MEM_RESERVE, 0, PAGE_READWRITE));
+        EXPECT(r1 && r2);
+        const std::uint64_t a1 = std::uintptr_t(r1), a2 = std::uintptr_t(r2);
+        EXPECT(leonida::title_mirror_space::contains(a1) && leonida::title_mirror_space::contains(a2));
+        EXPECT(a1 / kChunk == (a1 + kBig - 1) / kChunk);
+        EXPECT(a2 / kChunk == (a2 + kBig - 1) / kChunk);
+        EXPECT(VirtualFree(r1, 0, MEM_RELEASE) && VirtualFree(r2, 0, MEM_RELEASE));
+    }
+
+    // 12. resolve_title_memory must never create a TitleWindow over memory already covered by the page mirror, even
+    //     when a request exceeds kMirrorNameMax (256 MiB) and page_mirror_resolve refuses it.
+    {
+        constexpr SIZE_T kBigReserve = 300ull << 20;
+        constexpr std::uint64_t kOverMirrorMax = 260ull << 20;
+        auto* big_plain = static_cast<std::uint8_t*>(reserve(nullptr, kBigReserve, MEM_RESERVE, 0, PAGE_READWRITE));
+        EXPECT(big_plain && leonida::title_mirror_space::contains(std::uintptr_t(big_plain)));
+        EXPECT(VirtualAlloc(big_plain, kPage64k, MEM_COMMIT, PAGE_READWRITE) == big_plain);
+        std::memset(big_plain, 0x3C, kPage64k);
+        const std::size_t aliases_before = leonida::title_va_aliases().size();
+        const std::uint64_t resolved = leonida::title_va_aliases().resolve(
+            std::uintptr_t(big_plain), kOverMirrorMax, leonida::TitleVaAliases::table_view, true);
+        EXPECT(resolved == 0);
+        EXPECT(leonida::title_va_aliases().size() == aliases_before);
+        EXPECT(leonida::title_va_aliases().shader_va(std::uintptr_t(big_plain)) == std::uintptr_t(big_plain));
+        EXPECT(VirtualFree(big_plain, 0, MEM_RELEASE));
     }
 
     const auto end = rt::d3d12::page_mirror_state(device.p);

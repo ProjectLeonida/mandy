@@ -8,6 +8,8 @@
 // compared with a full re-resolution of every slot: a slot left naming a range that went (a GPU page fault in the
 // runtime) or a waiting slot left null after its buffer came fails the comparison.
 #include "../src/console_heap_slot_records.h"
+#include "../src/memory_breakdown.h"
+#include "../src/title_mirror_space.h"
 
 #include <array>
 #include <cstdint>
@@ -584,6 +586,96 @@ int changes_look_at_each_record_once() {
     return 0;
 }
 
+// Reservations <= TitleMirror::kChunk (2 GiB) that would cross a 2 GiB chunk boundary advance to the next chunk so
+// placed buffers inside them stay in one chunk; > 2 GiB reservations are not skipped past chunk boundaries.
+int title_mirror_space_chunk_alignment() {
+    namespace tms = leonida::title_mirror_space;
+    constexpr std::uint64_t kChunk = tms::kChunk;
+    constexpr std::uint64_t kMiB = 1ull << 20;
+    const auto accept = [](std::uint64_t) { return true; };
+
+    // Small reservation starts in the first chunk; a second small one packs into the same chunk.
+    const std::uint64_t a = tms::take(64 * kMiB, 0x10000, true, accept);
+    const std::uint64_t b = tms::take(64 * kMiB, 0x10000, true, accept);
+    EXPECT(a >= tms::kLow && b == a + 64 * kMiB);
+    EXPECT(a / kChunk == (b + 64 * kMiB - 1) / kChunk);
+
+    // A 1950 MiB reservation cannot fit in the remaining 1920 MiB of this chunk: advances to the next 2 GiB boundary.
+    const std::uint64_t big_size = 1950 * kMiB;
+    const std::uint64_t c = tms::take(big_size, 0x10000, false, accept);
+    EXPECT((c & (kChunk - 1)) == 0);
+    EXPECT(c > b);
+    EXPECT(c / kChunk == (c + big_size - 1) / kChunk);
+
+    // An exact 2 GiB reservation while mid-chunk also lands chunk-aligned inside a single chunk.
+    const std::uint64_t exact = tms::take(kChunk, 0x10000, false, accept);
+    EXPECT((exact & (kChunk - 1)) == 0);
+    EXPECT(exact / kChunk == (exact + kChunk - 1) / kChunk);
+
+    // A reservation > 2 GiB does not artificially align to a new chunk when already mid-chunk.
+    const std::uint64_t tiny = tms::take(0x10000, 0x10000, true, accept);
+    const std::uint64_t huge = tms::take(kChunk + 64 * kMiB, 0x10000, true, accept);
+    EXPECT(huge == tiny + 0x10000);
+
+    std::printf("title_mirror_space: <= 2 GiB reservations stay inside one 2 GiB chunk\n");
+    return 0;
+}
+
+// Arena-backed title windows and shadows are split out of general arena buffers in mem-probe breakdown.
+int memory_breakdown_arena_windows() {
+    namespace mb = leonida::memory_breakdown;
+    constexpr std::uint64_t kMiB = 1ull << 20;
+    mb::Tally t;
+    t.add(mb::Consumer::arena, 4095 * kMiB, false);
+    mb::DeviceShare share;
+    share.arena = true;
+    share.arena_reserved = share.arena_bound = 4095 * kMiB;
+    share.arena_in_use = 522 * kMiB;
+    share.arena_use = {58 * kMiB, 0, 0, 0};
+    share.arena_windows = 464 * kMiB;
+    const std::string line = mb::format(t, share, 0);
+    EXPECT(line.find("buffers 58, descriptor heaps 0, shader code 0, heaps 0, windows/shadows 464]") !=
+           std::string::npos);
+    EXPECT(line.find("title windows and shadows 0 (0) [in arena 464 MiB]") != std::string::npos);
+
+    // With 0 arena windows, the compact format stays unchanged.
+    share.arena_windows = 0;
+    const std::string clean = mb::format(t, share, 0);
+    EXPECT(clean.find("windows/shadows") == std::string::npos);
+    EXPECT(clean.find("[in arena") == std::string::npos);
+    std::printf("memory_breakdown: arena windows/shadows split from buffers\n");
+    return 0;
+}
+
+// Clearing a deferred slot before finish_in_place resolves it prevents a placeholder waiting record from poisoning
+// ConsoleHeapSlotRecords::answer(), while repeated V# halves still hit settled resolved/waiting records.
+int deferred_clear_and_repeated_answers() {
+    using R = ConsoleHeapSlotRecords;
+    R records;
+    records.reset(16);
+    constexpr std::uint64_t kBase = 0x100800000000ull;
+    constexpr std::uint64_t kSpan = 0x1000;
+    // Deferred slot 0 is cleared (none), not inserted as a placeholder waiting record -> answer() returns false.
+    records.set(0, 0, R::none, 0, 0, 0);
+    R::State state = R::none;
+    std::uint64_t target = 0;
+    EXPECT(!records.answer(kBase, kSpan, false, state, target));
+    EXPECT(!records.answer(kBase, kSpan, true, state, target));
+
+    // Once slot 0 settles as resolved, repeated slot 1 gets the exact resolved target from answer().
+    records.set(0, 0, R::resolved, kBase, kSpan, kArena + 0x20000, false);
+    EXPECT(records.answer(kBase, kSpan, false, state, target));
+    EXPECT(state == R::resolved && target == kArena + 0x20000);
+
+    // Once slot 2 settles as waiting (asked for geometry), repeated slot 3 gets waiting whether geometry is true/false.
+    constexpr std::uint64_t kUnbacked = 0x100900000000ull;
+    records.set(2, 0, R::waiting, kUnbacked, kSpan, 0, true);
+    EXPECT(records.answer(kUnbacked, kSpan, true, state, target) && state == R::waiting && target == 0);
+    EXPECT(records.answer(kUnbacked, kSpan, false, state, target) && state == R::waiting && target == 0);
+    std::printf("deferred_clear_and_repeated_answers: ok\n");
+    return 0;
+}
+
 int main() {
     if (release_looks_at_its_slots_only()) return 1;
     if (cases()) return 1;
@@ -592,6 +684,9 @@ int main() {
     if (differential()) return 1;
     if (textures()) return 1;
     if (room()) return 1;
+    if (title_mirror_space_chunk_alignment()) return 1;
+    if (memory_breakdown_arena_windows()) return 1;
+    if (deferred_clear_and_repeated_answers()) return 1;
     std::printf("console_heap_slot_records_test: ok\n");
     return 0;
 }

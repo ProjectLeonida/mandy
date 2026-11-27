@@ -52,7 +52,9 @@ inline bool enabled() {
 inline bool contains(std::uint64_t va) { return va >= kLow && va < kHigh; }
 
 // The next free address for `size` bytes aligned to `alignment` (a power of two), or 0 when the range is spent. `reserve`
-// tries the host's reservation there: false (the host has something there) moves on by one chunk. Under the state's lock:
+// tries the host's reservation there: false (the host has something there) moves on by one chunk. A reservation of at
+// most one sparse chunk (kChunk, 2 GiB) that would cross a chunk boundary advances to the next chunk boundary so placed
+// buffers inside it never straddle two chunks. Under the state's lock:
 // `reserve` must not take a lock a reserving thread holds (xmem calls this before taking any of its own).
 // `plain`: ordinary memory the title's CPU and GPU read at this address (an XMemVirtualAlloc region of committed or
 // reserved pages), mirrored page by page as readers name it; otherwise physical-page windows or placeholders, whose
@@ -64,7 +66,12 @@ std::uint64_t take(std::uint64_t size, std::uint64_t alignment, bool plain, Rese
     if (alignment < 0x10000) alignment = 0x10000;
     std::lock_guard lock(s.mutex);
     for (int tries = 0; tries < 64; ++tries) {
-        const std::uint64_t at = (s.next + alignment - 1) & ~(alignment - 1);
+        std::uint64_t at = (s.next + alignment - 1) & ~(alignment - 1);
+        if (at >= kHigh) break;
+        if (size <= kChunk) {
+            const std::uint64_t chunk_end = (at & ~(kChunk - 1)) + kChunk;
+            if (size > chunk_end - at) at = (chunk_end + alignment - 1) & ~(alignment - 1);
+        }
         if (at >= kHigh || size > kHigh - at) break;
         if (reserve(at)) {
             s.next = at + ((size + 0xffff) & ~std::uint64_t(0xffff));
