@@ -104,7 +104,12 @@ class Completions {
         VkFence fence{};
         std::vector<VkQueryPool> pools;
         std::vector<Write> labels;
+        // The timestamp query of each label: a GPU timestamp (clock 1) has one, a supplied value or a system timestamp
+        // has none (kNoQuery), and nothing is recorded into the command buffer for it.
+        std::vector<unsigned> queries;
+        unsigned timestamps = 0;
     };
+    static constexpr unsigned kNoQuery = ~0u;
     std::mutex mutex_;
     std::condition_variable changed_;
     bool closing_ = false;
@@ -154,51 +159,73 @@ class Completions {
         if (b.fence) idle_fences_.push_back(b.fence);
     }
     static bool store(const Target &target, std::uint64_t value) { return store_value(target, value); }
-    void publish(const Batch &batch) {
+    // Called by the worker without mutex_ held: storing a label takes other locks (xmem's, the layer's shadow openers),
+    // and threads that hold those take mutex_ to record and submit. The batch is off pending_ and its pools and fence
+    // are not recycled until this returns. Counts into errors and expired, which the caller adds under mutex_.
+    void publish(VkDevice device, const Batch &batch, std::uint64_t &errors, std::uint64_t &expired) const {
         for (std::size_t i = 0; i < batch.labels.size(); ++i) {
             const Write &op = batch.labels[i];
             std::uint64_t value = op.value;
             if (op.clock == 1) {
-                if (results_(device_, batch.pools[i / per_pool], static_cast<unsigned>(i % per_pool), 1, sizeof(value),
-                             &value, sizeof(value), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
-                    ++errors_;
+                // The fence has signaled, but a query's result need not be available yet without WAIT_BIT; waiting
+                // here is short, and without it a VK_NOT_READY would drop the label for good.
+                const unsigned q = batch.queries[i];
+                if (q == kNoQuery ||
+                    results_(device, batch.pools[q / per_pool], q % per_pool, 1, sizeof(value), &value, sizeof(value),
+                             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS) {
+                    ++errors;
                     continue;
                 }
             } else if (op.clock == 2) {
 #ifdef _WIN32
                 LARGE_INTEGER qpc{};
                 if (!QueryPerformanceCounter(&qpc)) {
-                    ++errors_;
+                    ++errors;
                     continue;
                 }
                 value = static_cast<std::uint64_t>(qpc.QuadPart);
 #else
-                ++errors_;
+                ++errors;
                 continue;
 #endif
             }
-            if (!store(op.target, value)) ++expired_;
+            if (!store(op.target, value)) ++expired;
         }
     }
     void run() {
         std::unique_lock lock(mutex_);
+        std::vector<std::unique_ptr<Batch>> done;
         for (;;) {
             if (pending_.empty() && !closing_) changed_.wait(lock, [&] { return closing_ || !pending_.empty(); });
+            const bool closing = closing_;
+            const VkDevice device = device_;
+            std::uint64_t errors = 0, expired = 0;
             for (auto i = pending_.begin(); i != pending_.end();) {
-                auto &b = **i;
-                const auto status = fence_status_(device_, b.fence);
-                if (status == VK_NOT_READY && !closing_) {
+                const auto status = fence_status_(device, (*i)->fence);
+                if (status == VK_NOT_READY && !closing) {
                     ++i;
                     continue;
                 }
-                if (status == VK_SUCCESS)
-                    publish(b);
-                else
-                    ++errors_;
-                recycle(b);
+                if (status == VK_SUCCESS) {
+                    done.push_back(std::move(*i));
+                } else {
+                    ++errors;
+                    recycle(**i);
+                }
                 i = pending_.erase(i);
             }
-            if (closing_) return;
+            if (!done.empty()) {
+                lock.unlock();
+                for (const auto &b : done)
+                    publish(device, *b, errors, expired);
+                lock.lock();
+                for (auto &b : done)
+                    recycle(*b);
+                done.clear();
+            }
+            errors_ += errors;
+            expired_ += expired;
+            if (closing) return;
             if (!pending_.empty()) changed_.wait_for(lock, std::chrono::milliseconds(1));
         }
     }
@@ -255,20 +282,27 @@ class Completions {
             ++errors_;
             return;
         }
-        const auto i = slot->labels.size();
-        const auto j = static_cast<unsigned>(i % per_pool);
-        if (!j) {
-            auto p = pool();
-            if (!p) {
-                ++errors_;
-                return;
+        // Only a GPU timestamp takes a query: a supplied value and a system timestamp are stored when the fence
+        // signals, and a queue without timestamp bits (a copy queue may have none) must not record one.
+        unsigned query = kNoQuery;
+        if (op.clock == 1) {
+            query = slot->timestamps;
+            const auto j = query % per_pool;
+            if (!j) {
+                auto p = pool();
+                if (!p) {
+                    ++errors_;
+                    return;
+                }
+                slot->pools.push_back(p);
             }
-            slot->pools.push_back(p);
+            auto p = slot->pools[query / per_pool];
+            reset_query_(cb, p, j, 1);
+            timestamp_(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, p, j);
+            ++slot->timestamps;
         }
-        auto p = slot->pools[i / per_pool];
-        reset_query_(cb, p, j, 1);
-        timestamp_(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, p, j);
         slot->labels.push_back(op);
+        slot->queries.push_back(query);
     }
     VkFence submit_fence(VkCommandBuffer cb) {
         if (!enabled() || !cb) return VK_NULL_HANDLE;

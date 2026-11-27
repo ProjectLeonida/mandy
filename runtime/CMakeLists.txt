@@ -2410,6 +2410,17 @@ if(TARGET Vulkan::Headers)
     if(BUILD_TESTING)
       add_test(NAME gpu_label_store COMMAND gpu_label_store_test)
     endif()
+    # CPU-only, a mock VkDevice: a GPU label records a timestamp query only for a GPU timestamp, reads it with
+    # WAIT_BIT, and is stored without the completions' lock held (runtime/src/vulkan_gpu_labels.h).
+    add_executable(gpu_label_completions_test test/gpu_label_completions_test.cpp)
+    target_link_libraries(gpu_label_completions_test PRIVATE Vulkan::Headers)
+    target_compile_definitions(gpu_label_completions_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    if(MSVC)
+      target_compile_options(gpu_label_completions_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    if(BUILD_TESTING)
+      add_test(NAME gpu_label_completions COMMAND gpu_label_completions_test)
+    endif()
   endif()
   if(WIN32 AND BUILD_TESTING)
     # Whole title-region import capability: one host allocation bound as a BDA buffer. The default case uses the
