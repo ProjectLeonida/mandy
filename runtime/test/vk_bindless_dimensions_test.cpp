@@ -380,13 +380,20 @@ int main() {
     std::printf("device: %s\n", properties.properties.deviceName);
 
     // Sized as the D3D12 device sizes it (d3d12_vulkan_device.cpp): from the update-after-bind limits, past
-    // maxPerSetDescriptors where vkGetDescriptorSetLayoutSupport accepts the layout.
+    // maxPerSetDescriptors where vkGetDescriptorSetLayoutSupport accepts the layout. MoltenVK's answer is not asked
+    // for, as there: it refuses every layout of maxPerSetDescriptors (1212) or more and runs the full set, so with
+    // it the set would stay at the default 256 indices of each dimension and the test would fail on every Mac.
     BindlessFeatures features;
     features.update_after_bind = true;
     features.partially_bound = d.partially_bound;
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 driver_properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+    d.instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(d.physical, &driver_properties);
+    const bool moltenvk = driver.driverID == VK_DRIVER_ID_MOLTENVK;
     const auto layout_support =
         d.fn<PFN_vkGetDescriptorSetLayoutSupport>("vkGetDescriptorSetLayoutSupport");
     const auto layout_supported = [&](const BindlessFeatures& candidate) {
+        if (moltenvk) return true;
         if (!layout_support) return false;
         const bindless::SetLayout layout(candidate);
         VkDescriptorSetLayoutSupport support{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT};
