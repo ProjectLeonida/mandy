@@ -4807,6 +4807,10 @@ struct DeviceState {
         hooks.filter = [this](std::uint64_t va, std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool fresh) {
             return filter_heap_page(va, to, from, bytes, fresh);
         };
+        hooks.filter_pieces = [this](std::uint64_t va, std::uint8_t* to, const std::uint8_t* scratch, std::size_t bytes,
+                                     bool fresh, const std::array<std::uint64_t, 4>& changed_pieces) {
+            return filter_heap_page_pieces(va, to, scratch, bytes, fresh, changed_pieces);
+        };
         page_mirror.mirror = std::make_unique<leonida::TitleMirror>(std::move(hooks));
         page_mirror.tracking = std::make_unique<leonida::HotColdTracking>();
         leonida::geometry_writes::subscribe(page_mirror.released);
@@ -5275,6 +5279,13 @@ struct DeviceState {
             if (to - from >= kPage)  // a run that lost a page is named again (pages still there map to themselves)
                 for (auto run = m.ensured.begin(); run != m.ensured.end();)
                     run = run->first < to && from < run->second ? m.ensured.erase(run) : std::next(run);
+        }
+        const std::uint64_t present_now =
+            leonida::submit_phases::totals().present_serial.load(std::memory_order_relaxed);
+        if (present_now != m.last_present_serial) {
+            const std::uint64_t delta = present_now - m.last_present_serial;
+            m.last_present_serial = present_now;
+            for (std::uint64_t i = 0; i < std::min<std::uint64_t>(delta, 4); ++i) m.tracking->on_present();
         }
         m.tracking->collect(m.written);  // re-watched before the copies below
         for (const std::uint64_t page : m.written)
