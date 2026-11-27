@@ -1210,7 +1210,10 @@ public:
         // buffer as out of bounds, which is no reason to drop the submission.
         replay_.buffer_at = [this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
             BufferVaIndex<ResourceId>::Hit hit{};
-            if (!buffer_vas_.find(va, hit, size)) return false;  // prefers an aliasing buffer that holds all of it
+            if (!buffer_vas_.find(va, hit, size)) {  // prefers an aliasing buffer that holds all of it
+                // Title memory the page mirror holds (set_mirror_buffer): its chunk at heap_base + va.
+                return mirror_buffer_ && mirror_buffer_(va, size, buffer, offset);
+            }
             const ResourceBinding* b = resolve(hit.id);
             if (!b) return false;
             buffer = b->buffer;
@@ -1838,6 +1841,10 @@ public:
         return it == device_fault_->pipeline_names.end() ? nullptr : it->second[0];
     }
     void set_before_execute(std::function<void()> before) { before_execute_ = std::move(before); }
+    // The page mirror's lookup for buffer_at (src/title_mirror.h): the buffer and offset that hold a title address no
+    // buffer of ours holds. Set while no replay runs (device creation and destruction).
+    using MirrorBuffer = std::function<bool(std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset)>;
+    void set_mirror_buffer(MirrorBuffer lookup) { mirror_buffer_ = std::move(lookup); }
     // The page mirror bound pages in a batch that signals `value` on `semaphore`: every queue's next submission of command
     // lists waits for it (the bind of a remap lands before any submission made after the remap).
     void note_mirror_bind(VkSemaphore semaphore, std::uint64_t value) {
@@ -2370,6 +2377,7 @@ private:
     std::uint64_t bindless_upload_value_ = 0;
     // The page mirror's last bind batch (src/title_mirror.h): every queue's next submission of command lists waits for
     // it, so none reads a page whose bind has not landed (storage_mutex_).
+    MirrorBuffer mirror_buffer_;
     VkSemaphore mirror_bind_semaphore_ = VK_NULL_HANDLE;
     std::uint64_t mirror_bind_value_ = 0;
     std::uint64_t bindless_upload_version_ = 0;
