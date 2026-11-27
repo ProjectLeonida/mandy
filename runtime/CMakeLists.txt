@@ -219,12 +219,18 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_library(gta6rt_bcpack STATIC src/bcpack.cpp "${bcpack_tables}")
   target_include_directories(gta6rt_bcpack PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
+  # Each consumer gets its own registry state. Compile the equivalent source object once per configuration.
+  add_library(gta6rt_shim_registry OBJECT shims/registry.cpp)
+  target_compile_definitions(gta6rt_shim_registry PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(gta6rt_shim_registry PRIVATE /W4 /permissive- /utf-8 /EHsc)
+  set(_shim_registry_objects $<TARGET_OBJECTS:gta6rt_shim_registry>)
+
   add_executable(gta6rt
     src/main.cpp
     src/host_cpu.cpp
     src/pe_loader.cpp
     src/thread_stacks.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
     shims/console_registry.cpp
     shims/file_system.cpp
     shims/winhttp_offline.cpp
@@ -289,7 +295,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   if(D3D12_LIBRARY)
     add_executable(root_sig_test
       test/root_sig_test.cpp
-      shims/registry.cpp
+      ${_shim_registry_objects}
       shims/d3d12_xs.cpp
       shims/d3d12_xs_device.cpp
       shims/d3d12_xs_pso_stream.cpp
@@ -328,7 +334,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     if(DXGI_LIBRARY)
       add_executable(device_proxy_test
         test/device_proxy_test.cpp
-        shims/registry.cpp
+        ${_shim_registry_objects}
         shims/d3d12_xs.cpp
         shims/d3d12_xs_device.cpp
         shims/d3d12_xs_pso_stream.cpp
@@ -379,7 +385,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(xg_xs_test
     test/xg_xs_test.cpp
     shims/xg_xs.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
   )
   target_include_directories(xg_xs_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(xg_xs_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -390,7 +396,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(acphal_test
     test/acphal_test.cpp
     shims/acphal.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
   )
   target_include_directories(acphal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(acphal_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -426,7 +432,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xmem.cpp
     shims/dstorage.cpp
     shims/file_system.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
   )
   target_include_directories(dstorage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims "${CMAKE_CURRENT_BINARY_DIR}")
   target_compile_definitions(dstorage_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -440,7 +446,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     test/xapu_chad_test.cpp
     shims/xapu_queue.cpp
     shims/xapu_chad.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
   )
   target_include_directories(xapu_chad_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(xapu_chad_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -489,7 +495,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(process_cmdline_test
     test/process_cmdline_test.cpp
     shims/process.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
   )
   target_include_directories(process_cmdline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(process_cmdline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -513,7 +519,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(file_system_test
     test/file_system_test.cpp
     shims/file_system.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
   )
   target_include_directories(file_system_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(file_system_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -524,7 +530,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # LEONIDA_SKIP_INT3 (shims/startup_trace.h): each case runs in a child process with its own environment.
   add_executable(int3_skip_test
     test/int3_skip_test.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
   )
   target_include_directories(int3_skip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(int3_skip_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -535,7 +541,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(winhttp_offline_test
     test/winhttp_offline_test.cpp
     shims/winhttp_offline.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
   )
   target_include_directories(winhttp_offline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(winhttp_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -546,7 +552,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(ws2_offline_test
     test/ws2_offline_test.cpp
     shims/ws2_offline.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
   )
   target_include_directories(ws2_offline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(ws2_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -559,7 +565,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     test/com_shim_test.cpp
     shims/com_shim.cpp
     shims/silent_audio.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
   )
   target_include_directories(com_shim_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(com_shim_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -583,7 +589,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(bcrypt_rng_test
     test/bcrypt_rng_test.cpp
     shims/bcrypt_rng.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
   )
   target_include_directories(bcrypt_rng_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(bcrypt_rng_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -649,7 +655,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_libraries(api_global_refs_test PRIVATE
     gta6rt_xtaskqueue)
   # Offline GDK runtime shim (XGameRuntime, XSystem, XTaskQueue, XAsync), driven through the shim registry the way
-  # a title calls it at boot. Like xmem_test it compiles its own registry.cpp.
+  # a title calls it at boot. This test consumes the shared registry object.
   add_executable(xgameruntime_test
     test/xgameruntime_test.cpp
     shims/xgameruntime.cpp
@@ -658,7 +664,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xgameruntime_store.cpp
     shims/xgameruntime_offline.cpp
     shims/library_loader.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
     shims/file_system.cpp
   )
   target_include_directories(xgameruntime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
@@ -676,7 +682,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xgameruntime_store.cpp
     shims/xgameruntime_offline.cpp
     shims/library_loader.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
     shims/file_system.cpp
   )
   target_include_directories(xgameruntime_user_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
@@ -694,7 +700,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xgameruntime_store.cpp
     shims/xgameruntime_offline.cpp
     shims/library_loader.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
     shims/file_system.cpp
   )
   target_include_directories(xgameruntime_gamesave_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
@@ -712,7 +718,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xgameruntime_store.cpp
     shims/xgameruntime_offline.cpp
     shims/library_loader.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
     shims/file_system.cpp
   )
   target_include_directories(xgameruntime_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
@@ -730,7 +736,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xgameruntime_store.cpp
     shims/xgameruntime_offline.cpp
     shims/library_loader.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
     shims/file_system.cpp
   )
   target_include_directories(xgameruntime_offline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
@@ -790,9 +796,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     target_link_libraries(gta6rt PRIVATE SDL3::SDL3-static)
 
     # GameInput through the shim registry on SDL virtual joysticks: no controller, no game data.
-    add_executable(gameinput_test test/gameinput_test.cpp shims/gameinput.cpp shims/registry.cpp)
+    add_executable(gameinput_test test/gameinput_test.cpp shims/gameinput.cpp ${_shim_registry_objects})
     # gameinput_probe: the same shim on a real controller, run by hand (not a CTest).
-    add_executable(gameinput_probe test/gameinput_probe.cpp shims/gameinput.cpp shims/registry.cpp)
+    add_executable(gameinput_probe test/gameinput_probe.cpp shims/gameinput.cpp ${_shim_registry_objects})
     foreach(_gi gameinput_test gameinput_probe)
       target_include_directories(${_gi} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
       target_compile_definitions(${_gi} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -958,7 +964,7 @@ if(BUILD_TESTING)
     add_executable(loader_test
       test/loader_test.cpp
       src/pe_loader.cpp
-      shims/registry.cpp
+      ${_shim_registry_objects}
     )
     target_compile_definitions(loader_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
     target_compile_options(loader_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
@@ -1010,7 +1016,7 @@ if(BUILD_TESTING)
       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
     )
 
-    add_executable(module_names_test test/module_names_test.cpp src/pe_loader.cpp shims/registry.cpp)
+    add_executable(module_names_test test/module_names_test.cpp src/pe_loader.cpp ${_shim_registry_objects})
     target_include_directories(module_names_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(module_names_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(module_names_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
@@ -1043,7 +1049,7 @@ if(BUILD_TESTING)
     add_executable(pe_loader_test
       test/pe_loader_test.cpp
       src/pe_loader.cpp
-      shims/registry.cpp
+      ${_shim_registry_objects}
       shims/xmem.cpp
       shims/d3d12_xs.cpp
       shims/d3d12_xs_device.cpp
@@ -1196,7 +1202,7 @@ if(BUILD_TESTING)
     add_executable(test_pe_loader_bounds
       test/test_pe_loader_bounds.cpp
       src/pe_loader.cpp
-      shims/registry.cpp
+      ${_shim_registry_objects}
       shims/xmem.cpp
       shims/d3d12_xs.cpp
       shims/d3d12_xs_device.cpp
@@ -1299,7 +1305,7 @@ if(BUILD_TESTING)
     add_executable(loader_tls_test
       test/loader_tls_test.cpp
       src/pe_loader.cpp
-      shims/registry.cpp
+      ${_shim_registry_objects}
     )
     target_include_directories(loader_tls_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -1382,7 +1388,7 @@ if(BUILD_TESTING)
       test/dll_thread_calls_test.cpp
       src/pe_loader.cpp
       shims/library_loader.cpp
-      shims/registry.cpp
+      ${_shim_registry_objects}
       shims/xmem.cpp
     )
     target_include_directories(dll_thread_calls_test PRIVATE
@@ -1416,7 +1422,7 @@ if(BUILD_TESTING)
       add_executable(gameinput_host_test
         test/gameinput_host_test.cpp
         src/pe_loader.cpp
-        shims/registry.cpp
+        ${_shim_registry_objects}
       )
       target_include_directories(gameinput_host_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
       target_compile_definitions(gameinput_host_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -1431,7 +1437,7 @@ if(BUILD_TESTING)
     add_executable(unimplemented_policy_test
       test/unimplemented_policy_test.cpp
       src/pe_loader.cpp
-      shims/registry.cpp
+      ${_shim_registry_objects}
     )
     # The register-preservation check needs a caller that sets rbx/rbp/rdi/rsi/r12-r15 and xmm6-15, which MSVC x64
     # cannot do inline: test/fixtures/abi_probe.asm (MASM). Without ml64 the rest of the test still runs.
@@ -1459,7 +1465,7 @@ if(BUILD_TESTING)
     add_executable(startup_trace_test
       test/startup_trace_test.cpp
       src/pe_loader.cpp
-      shims/registry.cpp
+      ${_shim_registry_objects}
     )
     target_include_directories(startup_trace_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(startup_trace_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
@@ -1559,7 +1565,7 @@ if(BUILD_TESTING)
     add_executable(bink_decode_test
       test/bink_decode_test.cpp
       src/pe_loader.cpp
-      shims/registry.cpp
+      ${_shim_registry_objects}
       shims/xmem.cpp
     )
     target_compile_definitions(bink_decode_test PRIVATE
@@ -1576,7 +1582,7 @@ if(BUILD_TESTING)
     add_executable(bink_abi_test
       test/bink_abi_test.cpp
       src/pe_loader.cpp
-      shims/registry.cpp
+      ${_shim_registry_objects}
       shims/xmem.cpp
     )
     target_compile_definitions(bink_abi_test PRIVATE
@@ -1593,7 +1599,7 @@ if(BUILD_TESTING)
     add_executable(bink_play
       test/bink_play.cpp
       src/pe_loader.cpp
-      shims/registry.cpp
+      ${_shim_registry_objects}
       shims/xmem.cpp
     )
     target_compile_definitions(bink_play PRIVATE
@@ -1610,7 +1616,7 @@ if(BUILD_TESTING)
       add_executable(fsr_dispatch_test
         test/fsr_dispatch_test.cpp
         src/pe_loader.cpp
-        shims/registry.cpp
+        ${_shim_registry_objects}
         shims/xmem.cpp
         shims/d3d12_xs.cpp
         shims/d3d12_xs_device.cpp
@@ -1628,7 +1634,7 @@ if(BUILD_TESTING)
       add_executable(bvh_builder_test
         test/bvh_builder_test.cpp
         src/pe_loader.cpp
-        shims/registry.cpp
+        ${_shim_registry_objects}
         shims/xmem.cpp
         shims/d3d12_xs.cpp
         shims/d3d12_xs_device.cpp
@@ -1647,7 +1653,7 @@ if(BUILD_TESTING)
     add_executable(bink_audio_test
       test/bink_audio_test.cpp
       src/pe_loader.cpp
-      shims/registry.cpp
+      ${_shim_registry_objects}
       shims/xmem.cpp
     )
     target_compile_definitions(bink_audio_test PRIVATE
@@ -1936,7 +1942,7 @@ if(LEONIDA_D3D12_SHIM_TESTS)
   add_executable(d3d12_xs_root_signature_test
     test/d3d12_xs_root_signature_test.cpp
     shims/d3d12_xs.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
     shims/d3d12_xs_device.cpp
     shims/d3d12_xs_pso_stream.cpp
   )
