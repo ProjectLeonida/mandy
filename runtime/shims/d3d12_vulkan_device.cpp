@@ -417,6 +417,10 @@ public:
         from = std::max(from, first_), to = std::min(to, last_);
         if (from >= to) return 0;
         AcquireSRWLockExclusive(&lock_);
+        // The copies below can fault on a page another guard (the geometry watch, another view's shadow) keeps
+        // read-only. The fault handler asks this tracker too (reopen), and must not take lock_ again on this thread:
+        // SRW locks are not recursive, and a title thread hung there for good (621.40, a submission's write-back).
+        writer_.store(GetCurrentThreadId(), std::memory_order_relaxed);
         // What changed since the last refresh, as refresh() learns it: mappings (the journal), kernel-write pins, and
         // the write watch. A journal that no longer reaches back makes nothing known: nothing goes back.
         std::uint64_t map_generation = leonida::title_memory_map::generation();
@@ -429,6 +433,7 @@ public:
                         state_[i] |= kRequery;
                 });
         if (!known) {
+            writer_.store(0, std::memory_order_relaxed);
             ReleaseSRWLockExclusive(&lock_);
             return 0;
         }
@@ -475,6 +480,7 @@ public:
             }
             at += pages * kPage;
         }
+        writer_.store(0, std::memory_order_relaxed);
         ReleaseSRWLockExclusive(&lock_);
         return written;
     }
@@ -871,14 +877,15 @@ public:
         from = std::max(from & ~(kPage - 1), first_);
         to = std::min((to + kPage - 1) & ~(kPage - 1), last_);
         if (from >= to) return;
-        AcquireSRWLockExclusive(&lock_);
+        const bool held = writer_.load(std::memory_order_relaxed) == GetCurrentThreadId();  // see write_back
+        if (!held) AcquireSRWLockExclusive(&lock_);
         bool guarded = false;
         for (std::size_t i = (from - first_) / kPage, i1 = (to - first_) / kPage; i < i1; ++i) {
             state_[i] &= ~kClean;
             guarded |= (state_[i] & kProtected) != 0;
         }
         if (guarded) reopen_locked(from, to);
-        ReleaseSRWLockExclusive(&lock_);
+        if (!held) ReleaseSRWLockExclusive(&lock_);
     }
 
     // From the fault handler: a write to `address`, inside this range, faulted. True when the write can be retried:
@@ -889,7 +896,9 @@ public:
     // write it should have retried, which ended the process (seen natively on Windows 11: threads writing one page
     // across a submission).
     bool reopen(std::uintptr_t address) {
-        AcquireSRWLockExclusive(&lock_);
+        // On the thread whose write_back faulted, lock_ is held already (see write_back).
+        const bool held = writer_.load(std::memory_order_relaxed) == GetCurrentThreadId();
+        if (!held) AcquireSRWLockExclusive(&lock_);
         const std::size_t index = (address - first_) / kPage;
         bool retry = (state_[index] & kProtected) != 0;
         if (retry) {
@@ -915,7 +924,7 @@ public:
             retry = VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) &&
                     classify(region) == Kind::writable;
         }
-        ReleaseSRWLockExclusive(&lock_);
+        if (!held) ReleaseSRWLockExclusive(&lock_);
         return retry;
     }
 
@@ -1405,6 +1414,7 @@ private:
     std::uintptr_t begin_ = 0, end_ = 0;   // the targets' bytes: the first start and the furthest end
     std::uintptr_t first_ = 0, last_ = 0;  // the pages covered
     SRWLOCK lock_ = SRWLOCK_INIT;          // state_, cover_, the targets, and the protection of the pages
+    std::atomic<DWORD> writer_{0};         // the thread in write_back, which holds lock_ while it copies into the title
     Vector<std::uint8_t> state_;           // per 4 KiB page
     Vector<std::uint32_t> cover_;          // per 4 KiB page: the targets that read it
     Vector<Target> targets_;               // by start
@@ -11261,7 +11271,8 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
         // gate: from the journal a build takes milliseconds and the warm-up worker makes them back to back, and
         // three warm boots lost the device in a vkQueueSubmit (no GPU fault, no TDR) while only the create was
         // gated. No file I/O in here.
-        const DriverTurn turn(submits, trigger, "vkCreateComputePipelines", true, entry->name.c_str());
+        const DriverTurn turn(submits, trigger, "vkCreateComputePipelines", true, entry->name.c_str(),
+                              leonida::SubmitMutex::CreateKind::compute, bytes);
         {
             const leonida::aftermath::ShaderName named(entry->name);
             if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return out;
@@ -12368,7 +12379,8 @@ public:
             // A cache-only create that the driver would have to compile stays null: the first draw builds it.
             if (!graphics_.pipeline && !(cache_only && compile_status == VK_PIPELINE_COMPILE_REQUIRED)) return E_FAIL;
         }  // lazy: graphics_.pipeline stays null and the first draw builds it as variant 0
-        graphics_.async_build = async_replay_compile();
+        // LEONIDA_ASYNC_MIN_BYTES: a pipeline smaller than that (all its stages) is built where a draw needs it.
+        graphics_.async_build = async_replay_compile(spirv_bytes);
         graphics_.variant = [this](std::uint32_t unbound) {
             return replay_pipeline("draw", [&] {
                 return graphics_.async_build ? queue_build(false, unbound) : variant(unbound, "draw");
@@ -12534,7 +12546,8 @@ public:
             };
             pipeline_.build_context = this;
         } else if (lazy_compute) {
-            pipeline_.async_build = async_replay_compile();
+            // LEONIDA_ASYNC_MIN_BYTES: a module smaller than that is built where a dispatch needs it.
+            pipeline_.async_build = async_replay_compile(spirv_bytes);
             pipeline_.build = [](void* self) {
                 auto* pso = static_cast<PipelineState*>(self);
                 return replay_pipeline("dispatch", [&] {
@@ -12609,7 +12622,8 @@ private:
         // (LOCAL FIX, review: with LEONIDA_ASYNC_PIPELINES=1 it was deferred and returned E_FAIL).
         const bool warmup = !std::strcmp(trigger, "warmup");
         const bool replay_trigger = !std::strcmp(trigger, "dispatch") || !std::strcmp(trigger, "dispatch-worker");
-        const bool helper_nowait = warmup || (replay_trigger && async_replay_compile());
+        // An asynchronous pipeline only (one under LEONIDA_ASYNC_MIN_BYTES waits for the file, as without them).
+        const bool helper_nowait = warmup || (replay_trigger && pipeline_.async_build);
         if (!helper_file_.empty()) {
             auto& helper = compile_helper::Client::instance();
             std::string why;
@@ -12715,7 +12729,7 @@ private:
                     // The compile helper is still making the journal file (build_compute): not built, so nothing is
                     // published and the next use asks again.
                     const bool deferred = compute && helper_deferred_.exchange(false);
-                    if (async_replay_compile()) {
+                    if (compute ? pipeline_.async_build : graphics_.async_build) {
                         unsigned long long skipped = 0;
                         {
                             std::lock_guard publish(publication);
@@ -12750,6 +12764,8 @@ public:
     // Never waits; nothing to do when the variant is the last one asked for here.
     void request_early(std::uint32_t bound_targets, bool depth_bound) {
         if (!async_replay_compile() || !registered_) return;
+        // A pipeline under LEONIDA_ASYNC_MIN_BYTES is built where it is needed, as without asynchronous builds.
+        if (!(is_graphics_ ? graphics_.async_build : pipeline_.async_build)) return;
         std::uint32_t unbound = 0;
         if (is_graphics_) {
             for (std::size_t slot = 0; slot < graphics_.color_formats.size() && slot < 8; ++slot)
@@ -13009,11 +13025,26 @@ private:
         const leonida::dev_status::Build dev_build(r.mesh ? "mesh pipeline" : "graphics pipeline");
         const leonida::pipeline_profile::DriverCall profile(r.mesh ? "ms" : "vs", lazy_ ? "lazy" : "eager",
                                                          program, fragment, unbound);
-        const auto result = device_.create_pipeline(flags, [&](VkPipelineCache with, VkPipelineCreateFlags f) {
-            info.flags = f;
-            pipeline = VK_NULL_HANDLE;
-            return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, with, 1, &info, nullptr, &pipeline);
-        });
+        // Through the compile gate as a graphics create (a mesh pipeline is one): on NVIDIA 621.40 a vkQueueSubmit
+        // sat in the driver for as long as a mesh create was in it (54 s) and lost the device. Not with the classic
+        // gate (the default), which keeps graphics creates out of it as before.
+        const char* gate_name = nullptr;
+        for (const auto& source : sources_)
+            if (source.entry && source.slot == 0) gate_name = source.entry->name.c_str();
+        VkResult result = VK_ERROR_UNKNOWN;
+        {
+            std::optional<DriverTurn> turn;
+            if (leonida::SubmitMutex::compile_gate_graphics())
+                turn.emplace(device_.context->submit_mutex(), trigger,
+                             r.mesh ? "vkCreateGraphicsPipelines (mesh)" : "vkCreateGraphicsPipelines", true, gate_name,
+                             leonida::SubmitMutex::CreateKind::graphics, bytes);
+            result = device_.create_pipeline(flags, [&](VkPipelineCache with, VkPipelineCreateFlags f) {
+                info.flags = f;
+                pipeline = VK_NULL_HANDLE;
+                return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, with, 1, &info, nullptr,
+                                                                     &pipeline);
+            });
+        }
         if (status) *status = result;
         profile.finish(int(result));
         trace.end(trigger, profile_shaders_.c_str(), unbound, bytes, result);
@@ -15090,7 +15121,7 @@ public:
                 // after it, so the generations flush() retires are free at once.
                 {
                     std::lock_guard submit(context.submit_mutex());
-                    const leonida::SubmitMutex::SubmitTurn turn(context.submit_mutex());  // the compile gate
+                    const leonida::SubmitMutex::SubmitTurn turn(context.submit_mutex(), false);  // the compile gate
                     context.observe_result(context.vk.vkDeviceWaitIdle(state_.info.device), "vkDeviceWaitIdle");
                 }
                 state_.bindless_idle_waits.fetch_add(1, std::memory_order_relaxed);
@@ -15409,7 +15440,7 @@ public:
         if (state_.context) {
             {
                 std::lock_guard lock(state_.context->submit_mutex());
-                const leonida::SubmitMutex::SubmitTurn turn(state_.context->submit_mutex());  // the compile gate
+                const leonida::SubmitMutex::SubmitTurn turn(state_.context->submit_mutex(), false);  // the compile gate
                 state_.context->observe_result(state_.context->vk.vkDeviceWaitIdle(state_.info.device),
                                               "vkDeviceWaitIdle");
             }

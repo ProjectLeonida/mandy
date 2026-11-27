@@ -1,6 +1,7 @@
 // Timing and scheduling for Vulkan pipeline creation on the D3D12 device.
 #pragma once
 
+#include "../src/async_pipeline_size.h"
 #include "../src/vulkan_device_fault.h"
 #include "../src/vulkan_replay.h"
 #include <windows.h>
@@ -33,6 +34,32 @@ inline bool async_replay_compile() {
         return GetEnvironmentVariableW(L"LEONIDA_ASYNC_PIPELINES", v, 2) == 1 && v[0] == L'1';
     }();
     return on && !leonida::strict_replay();
+}
+
+// LEONIDA_ASYNC_MIN_BYTES=<n> (with LEONIDA_ASYNC_PIPELINES=1): only pipelines with n bytes of SPIR-V or more are built
+// asynchronously; a smaller one is built where it is needed, as with asynchronous builds off. Unset or 0: every
+// pipeline, as before the variable (src/async_pipeline_size.h).
+inline std::uint64_t async_min_bytes() {
+    static const std::uint64_t bytes = [] {
+        char text[32]{};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_ASYNC_MIN_BYTES", text, sizeof(text));
+        bool valid = n < sizeof(text);
+        const std::uint64_t value = valid ? leonida::async_pipelines::parse_min_bytes(text, &valid) : 0;
+        if (!valid)
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_ASYNC_MIN_BYTES: not a number of bytes, ignored (every "
+                                 "asynchronous pipeline stays asynchronous)\n");
+        else if (value && async_replay_compile())
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_ASYNC_MIN_BYTES: pipelines under %llu bytes of SPIR-V are built "
+                                 "where they are needed; larger ones asynchronously\n", (unsigned long long)value);
+        return value;
+    }();
+    return bytes;
+}
+
+// Whether a pipeline of `spirv_bytes` (compute: its module; graphics: all its stages) is built asynchronously.
+inline bool async_replay_compile(std::uint64_t spirv_bytes) {
+    return async_replay_compile() &&
+           leonida::async_pipelines::asynchronous(true, async_min_bytes(), spirv_bytes);
 }
 
 // LOCAL FIX (post-load stalls): LEONIDA_FAST_PIPELINES=graphics, compute, or all (1 = all) creates those pipelines with
@@ -138,13 +165,15 @@ inline bool compile_worker_trigger(const char* trigger) {
 //     behind it go first, and does so before its vkCreateShaderModule and vkDestroyShaderModule too; a title thread
 //     waits only for the holder, and only before a pipeline create (it may wait out a vkDeviceWaitIdle or a present:
 //     waits of 50 ms or more are logged).
-//   - a pipeline create passes the compile gate (SubmitMutex::CompileTurn) for the length of the call.
+//   - a pipeline create passes the compile gate (SubmitMutex::CompileTurn) for the length of the call, as its kind
+//     (compute, or graphics with mesh): the adaptive gate keeps a verdict per kind.
 //   - the compile worker, which runs below normal priority, runs the call at normal priority, so a preempted worker
 //     does not sit on a driver lock a submit waits for.
 class DriverTurn {
 public:
     DriverTurn(leonida::SubmitMutex& submits, const char* trigger, const char* call, bool pipeline,
-               const char* name = nullptr)
+               const char* name = nullptr,
+               leonida::SubmitMutex::CreateKind kind = leonida::SubmitMutex::CreateKind::compute, std::size_t bytes = 0)
         : worker_(compile_worker_trigger(trigger)) {
         // Normal priority first: a below-normal worker that waits its turn at normal priority cannot keep losing the
         // race to the next submit, and holds the gate (below) only at normal priority.
@@ -160,7 +189,7 @@ public:
             if (waited >= 50) note("waited for the submit lock", trigger, call, name, waited);
         }
         if (pipeline) {
-            gate_.emplace(submits);
+            gate_.emplace(submits, leonida::SubmitMutex::CreateInfo{kind, name, trigger, bytes});
             if (gate_->waited_ms() >= 50) note("waited at the compile gate", trigger, call, name, gate_->waited_ms());
         }
     }
