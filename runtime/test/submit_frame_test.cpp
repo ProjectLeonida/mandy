@@ -9,11 +9,15 @@
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -167,10 +171,315 @@ int submissions() {
     return 0;
 }
 
+// Round 1D queue concurrency, batch coalescing, zero-copy CommandList snapshot, and async worker tests.
+int queue_async_and_coalescing() {
+    vktest::Device d;
+    if (!d.create()) {
+        std::printf("no usable Vulkan device: the queue_async_and_coalescing part is skipped\n");
+        return 0;
+    }
+
+    constexpr VkDeviceSize kBufBytes = 256;
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+    auto make_copy_list = [](ResourceId dst, std::uint64_t dst_off, ResourceId src, std::uint64_t src_off,
+                             std::uint64_t bytes) -> std::shared_ptr<CommandList> {
+        auto list = std::make_shared<CommandList>();
+        if (!list->copy_buffer({dst, dst_off, src, src_off, bytes}) || !list->close()) return {};
+        return list;
+    };
+
+    // 1. Concurrent submission while before_execute_() is running must not block on state_mutex_, must preserve
+    //    strict FIFO execution order, and must coalesce consecutive queued batches on drain.
+    {
+        VulkanContext context(d.device_proc, d.device, true);
+        EXPECT(context.loaded());
+        VulkanQueue queue(context, d.queue, d.family, VulkanQueue::QueueKind::direct);
+        EXPECT(queue.ok());
+
+        void* src_map = nullptr;
+        void* dst_map = nullptr;
+        VkBuffer src = d.buffer(kBufBytes, usage, &src_map);
+        VkBuffer dst = d.buffer(kBufBytes, usage, &dst_map);
+        EXPECT(src && dst);
+        auto* sb = static_cast<std::uint8_t*>(src_map);
+        auto* db = static_cast<std::uint8_t*>(dst_map);
+        std::memset(sb, 0, kBufBytes);
+        std::memset(db, 0, kBufBytes);
+        sb[0] = 0x11;
+        sb[16] = 0x22;
+        sb[32] = 0x33;
+
+        ResourceBinding r_src{}, r_dst{};
+        r_src.buffer = src;
+        r_src.size = kBufBytes;
+        r_dst.buffer = dst;
+        r_dst.size = kBufBytes;
+        r_dst.host_readable = true;
+        context.add_resource(1, r_src);
+        context.add_resource(2, r_dst);
+
+        std::atomic<unsigned> before_calls{0};
+        std::atomic<bool> in_first_before{false};
+        std::atomic<bool> release_first_before{false};
+        context.set_before_execute([&] {
+            const unsigned n = before_calls.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (n == 1) {
+                in_first_before.store(true, std::memory_order_release);
+                while (!release_first_before.load(std::memory_order_acquire)) std::this_thread::yield();
+            }
+        });
+
+        // Each batch writes its marker to its own slot AND overwrites slot 0 (final value proves strict FIFO order).
+        auto b1 = std::make_shared<CommandList>();
+        EXPECT(b1->copy_buffer({2, 16, 1, 0, 1}) && b1->copy_buffer({2, 0, 1, 0, 1}) && b1->close());
+        auto b2 = std::make_shared<CommandList>();
+        EXPECT(b2->copy_buffer({2, 32, 1, 16, 1}) && b2->copy_buffer({2, 0, 1, 16, 1}) && b2->close());
+        auto b3 = std::make_shared<CommandList>();
+        EXPECT(b3->copy_buffer({2, 48, 1, 32, 1}) && b3->copy_buffer({2, 0, 1, 32, 1}) && b3->close());
+
+        VulkanFence done(context, 0);
+        EXPECT(done.semaphore() != VK_NULL_HANDLE);
+
+        ReplayResult t_res = ReplayResult::unsupported;
+        std::thread worker([&] {
+            std::shared_ptr<const CommandList> s1 = b1;
+            t_res = queue.execute({&s1, 1});
+        });
+
+        while (!in_first_before.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        // While worker is blocked inside before_execute_(), this thread submits b2, b3, and Signal(done, 1).
+        // If state_mutex_ were held across before_execute_(), this would deadlock before release_first_before is set!
+        std::shared_ptr<const CommandList> s2 = b2;
+        std::shared_ptr<const CommandList> s3 = b3;
+        EXPECT(queue.execute({&s2, 1}) == ReplayResult::success);
+        EXPECT(queue.execute({&s3, 1}) == ReplayResult::success);
+        EXPECT(queue.signal(done.semaphore(), 1));
+
+        // Zero-copy proof: queue holds references to b2 and b3 without copying; simulating Reset() when use_count > 1
+        // allocates fresh storage and never mutates the in-flight snapshot.
+        EXPECT(b2.use_count() > 1 && b3.use_count() > 1);
+        b2 = std::make_shared<CommandList>();
+        EXPECT(b2->copy_buffer({2, 0, 1, 0, 1}) && b2->close());  // distinct content (0x11), must not affect in-flight
+
+        release_first_before.store(true, std::memory_order_release);
+        worker.join();
+        EXPECT(t_res == ReplayResult::success);
+        EXPECT(done.wait(1, 5'000'000'000ull));
+        EXPECT(queue.idle());
+
+        // b1 ran first (before_calls #1), then b2+b3 coalesced into ONE execute_now() (before_calls #2).
+        EXPECT(before_calls.load(std::memory_order_acquire) == 2);
+        EXPECT(db[16] == 0x11 && db[32] == 0x22 && db[48] == 0x33);
+        EXPECT(db[0] == 0x33);  // strict FIFO: b1 -> b2 -> b3
+        // After completion, s2/s3 snapshots are released (only local s3 holds b3's old CommandList).
+        s2.reset();
+        s3.reset();
+        EXPECT(b1.use_count() == 1 && b3.use_count() == 1);
+        EXPECT(b3->reset());  // steady-state reuse with zero allocation
+        std::printf("queue sync: unlocked before_execute_, strict FIFO, coalesced drain, zero-copy Reset ok\n");
+    }
+
+    // 2. Held batches behind a fence gate coalesce consecutive ready batches into ONE before_execute_() call,
+    //    while an intervening Signal or Wait stops coalescing. Also verify invalid-batch fallback inside a
+    //    coalesced group does not drop valid peers.
+    {
+        VulkanContext context(d.device_proc, d.device, true);
+        EXPECT(context.loaded());
+        VulkanQueue queue(context, d.queue, d.family, VulkanQueue::QueueKind::direct);
+        VulkanQueue copy_q(context, d.queue, d.family, VulkanQueue::QueueKind::copy);
+        EXPECT(queue.ok() && copy_q.ok());
+
+        void* src_map = nullptr;
+        void* dst_map = nullptr;
+        VkBuffer src = d.buffer(kBufBytes, usage, &src_map);
+        VkBuffer dst = d.buffer(kBufBytes, usage, &dst_map);
+        EXPECT(src && dst);
+        auto* sb = static_cast<std::uint8_t*>(src_map);
+        auto* db = static_cast<std::uint8_t*>(dst_map);
+        std::memset(db, 0, kBufBytes);
+        for (int i = 0; i < 6; ++i) sb[i * 16] = std::uint8_t(0xA1 + i);
+
+        ResourceBinding r_src{}, r_dst{};
+        r_src.buffer = src;
+        r_src.size = kBufBytes;
+        r_dst.buffer = dst;
+        r_dst.size = kBufBytes;
+        r_dst.host_readable = true;
+        context.add_resource(1, r_src);
+        context.add_resource(2, r_dst);
+
+        std::atomic<unsigned> before_calls{0};
+        context.set_before_execute([&] { before_calls.fetch_add(1, std::memory_order_relaxed); });
+
+        VulkanFence gate(context, 0), mid(context, 0), done(context, 0);
+        EXPECT(gate.semaphore() && mid.semaphore() && done.semaphore());
+
+        auto make_step = [&](int idx) {
+            auto l = std::make_shared<CommandList>();
+            if (!l->copy_buffer({2, std::uint64_t((idx + 1) * 16), 1, std::uint64_t(idx * 16), 1}) ||
+                !l->copy_buffer({2, 0, 1, std::uint64_t(idx * 16), 1}) || !l->close())
+                return std::shared_ptr<const CommandList>{};
+            return std::shared_ptr<const CommandList>(std::move(l));
+        };
+        std::shared_ptr<const CommandList> steps[6];
+        for (int i = 0; i < 6; ++i) {
+            steps[i] = make_step(i);
+            EXPECT(steps[i] != nullptr);
+        }
+
+        queue.wait(gate.semaphore(), 1);
+        EXPECT(queue.execute({&steps[0], 1}) == ReplayResult::success);  // group 1: steps 0, 1, 2
+        EXPECT(queue.execute({&steps[1], 1}) == ReplayResult::success);
+        EXPECT(queue.execute({&steps[2], 1}) == ReplayResult::success);
+        EXPECT(queue.signal(mid.semaphore(), 1));                        // Signal stops coalescing
+        EXPECT(queue.execute({&steps[3], 1}) == ReplayResult::success);  // group 2: step 3 alone
+        queue.wait(mid.semaphore(), 1);                                  // Wait stops coalescing
+        EXPECT(queue.execute({&steps[4], 1}) == ReplayResult::success);  // group 3: steps 4, 5
+        EXPECT(queue.execute({&steps[5], 1}) == ReplayResult::success);
+        EXPECT(queue.signal(done.semaphore(), 1));
+
+        EXPECT(before_calls.load() == 0);
+        EXPECT(gate.signal(1));
+        EXPECT(done.wait(1, 5'000'000'000ull));
+        EXPECT(queue.idle());
+
+        // Exactly 3 before_execute_() calls: {0,1,2}, {3}, {4,5}.
+        EXPECT(before_calls.load() == 3);
+        for (int i = 0; i < 6; ++i) EXPECT(db[(i + 1) * 16] == std::uint8_t(0xA1 + i));
+        EXPECT(db[0] == std::uint8_t(0xA6));  // strict FIFO through all 6 batches
+
+        // Coalesced fallback: [valid, invalid ClearRenderTarget on copy queue, valid] held behind gate2.
+        VulkanFence gate2(context, 0), done2(context, 0);
+        EXPECT(gate2.semaphore() && done2.semaphore());
+        std::memset(db, 0, kBufBytes);
+        auto bad_clear = std::make_shared<CommandList>();
+        TargetView tv{};
+        tv.resource = 2;
+        tv.layer_count = 1;
+        EXPECT(bad_clear->clear_render_target(tv, ClearColor{}) && bad_clear->close());
+        std::shared_ptr<const CommandList> bad_snap = bad_clear;
+        copy_q.wait(gate2.semaphore(), 1);
+        EXPECT(copy_q.execute({&steps[0], 1}) == ReplayResult::success);
+        EXPECT(copy_q.execute({&bad_snap, 1}) == ReplayResult::success);
+        EXPECT(copy_q.execute({&steps[1], 1}) == ReplayResult::success);
+        EXPECT(copy_q.signal(done2.semaphore(), 1));
+        EXPECT(gate2.signal(1));
+        EXPECT(done2.wait(1, 5'000'000'000ull));
+        EXPECT(copy_q.idle());
+        EXPECT(copy_q.take_held_failure() == ReplayResult::unsupported);
+        EXPECT(db[16] == 0xA1 && db[32] == 0xA2 && db[0] == 0xA2);
+        std::printf("queue held coalescing: 6 batches -> 3 submits, Signal/Wait split, invalid fallback ok\n");
+    }
+
+    // 3. LEONIDA_SUBMIT_ASYNC (per-queue async worker depth=4): inbox coalescing, Present barrier split,
+    //    held-batch release through worker, and zero-copy CommandList Reset() while queued.
+    {
+        VulkanContext context(d.device_proc, d.device, true);
+        EXPECT(context.loaded());
+        VulkanQueue queue(context, d.queue, d.family, VulkanQueue::QueueKind::direct);
+        EXPECT(queue.ok());
+        queue.set_async_depth(4);
+
+        void* src_map = nullptr;
+        void* dst_map = nullptr;
+        VkBuffer src = d.buffer(kBufBytes, usage, &src_map);
+        VkBuffer dst = d.buffer(kBufBytes, usage, &dst_map);
+        EXPECT(src && dst);
+        auto* sb = static_cast<std::uint8_t*>(src_map);
+        auto* db = static_cast<std::uint8_t*>(dst_map);
+        std::memset(db, 0, kBufBytes);
+        for (int i = 0; i < 4; ++i) sb[i * 16] = std::uint8_t(0xC1 + i);
+
+        ResourceBinding r_src{}, r_dst{};
+        r_src.buffer = src;
+        r_src.size = kBufBytes;
+        r_dst.buffer = dst;
+        r_dst.size = kBufBytes;
+        r_dst.host_readable = true;
+        context.add_resource(1, r_src);
+        context.add_resource(2, r_dst);
+
+        std::atomic<unsigned> before_calls{0};
+        std::atomic<bool> in_first{false};
+        std::atomic<bool> go_first{false};
+        context.set_before_execute([&] {
+            const unsigned n = before_calls.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (n == 1) {
+                in_first.store(true, std::memory_order_release);
+                while (!go_first.load(std::memory_order_acquire)) std::this_thread::yield();
+            }
+        });
+
+        auto c0 = make_copy_list(2, 16, 1, 0, 1);
+        auto c1 = make_copy_list(2, 32, 1, 16, 1);
+        auto c2 = make_copy_list(2, 48, 1, 32, 1);
+        auto c3 = make_copy_list(2, 64, 1, 48, 1);
+        EXPECT(c0 && c1 && c2 && c3);
+
+        std::shared_ptr<const CommandList> s0 = c0, s1 = c1, s2 = c2, s3 = c3;
+        EXPECT(queue.execute({&s0, 1}) == ReplayResult::success);
+        while (!in_first.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        // Enqueue c1, c2 (will coalesce), then a Present after_held barrier, then c3 (must NOT coalesce past barrier).
+        EXPECT(queue.execute({&s1, 1}) == ReplayResult::success);
+        EXPECT(queue.execute({&s2, 1}) == ReplayResult::success);
+        EXPECT(c1.use_count() > 1 && c2.use_count() > 1);  // queued zero-copy
+
+        std::atomic<unsigned> barrier_seen_before_calls{0};
+        std::atomic<bool> barrier_ran{false};
+        int barrier_owner = 0;
+        context.holds().after_held(&barrier_owner, [&] {
+            barrier_seen_before_calls.store(before_calls.load(std::memory_order_acquire), std::memory_order_release);
+            barrier_ran.store(true, std::memory_order_release);
+        });
+
+        EXPECT(queue.execute({&s3, 1}) == ReplayResult::success);
+        VulkanFence done(context, 0);
+        EXPECT(done.semaphore() != VK_NULL_HANDLE);
+        EXPECT(queue.signal(done.semaphore(), 1));
+
+        // Simulate Reset() of c1 while still in inbox: allocating new storage leaves in-flight snapshot intact.
+        c1 = make_copy_list(2, 32, 1, 0, 1);
+        EXPECT(c1 != nullptr);
+
+        go_first.store(true, std::memory_order_release);
+        EXPECT(done.wait(1, 5'000'000'000ull));
+        EXPECT(queue.idle());
+        EXPECT(barrier_ran.load(std::memory_order_acquire));
+
+        // 3 before_execute_() calls total: {c0}, {c1, c2}, {c3}; barrier ran after {c1, c2} (count == 2), before {c3}!
+        EXPECT(before_calls.load() == 3);
+        EXPECT(barrier_seen_before_calls.load() == 2);
+        EXPECT(db[16] == 0xC1 && db[32] == 0xC2 && db[48] == 0xC3 && db[64] == 0xC4);
+
+        // Held batches behind a gate in async mode: release_ready() wakes worker and coalesces them.
+        before_calls.store(0);
+        std::memset(db, 0, kBufBytes);
+        VulkanFence gate(context, 0), done2(context, 0);
+        EXPECT(gate.semaphore() && done2.semaphore());
+        queue.wait(gate.semaphore(), 1);
+        EXPECT(queue.execute({&s0, 1}) == ReplayResult::success);
+        EXPECT(queue.execute({&s2, 1}) == ReplayResult::success);
+        EXPECT(queue.signal(done2.semaphore(), 1));
+        EXPECT(queue.idle());  // flushes inbox into held_ while gate is still closed
+        EXPECT(before_calls.load() == 0);
+        EXPECT(gate.signal(1));
+        EXPECT(done2.wait(1, 5'000'000'000ull));
+        EXPECT(queue.idle());
+        EXPECT(before_calls.load() == 1);
+        EXPECT(db[16] == 0xC1 && db[48] == 0xC3);
+        std::printf("queue async (depth=4): inbox coalescing, Present barrier split, gate release ok\n");
+    }
+
+    return 0;
+}
+
 }  // namespace
 
 int main() {
-    if (scripted() || submissions()) return 1;
+    if (scripted() || submissions() || queue_async_and_coalescing()) return 1;
     std::printf("submit_frame_test: OK\n");
     return 0;
 }
