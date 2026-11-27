@@ -65,6 +65,16 @@ class CTestRegistrationTest(unittest.TestCase):
         self.assertEqual(len(skips), 3, f"expected three whole-test SKIP paths, got {len(skips)}")
         self.assertEqual(skips, [77, 77, 77], "SKIP paths must return 77 for SKIP_RETURN_CODE 77")
 
+    def test_sparse_tile_tests_have_ctest_timeouts(self):
+        properties = re.search(
+            r"set_tests_properties\(\s*d3d12_buffer_tiles\s+d3d12_texture_tiles\s+PROPERTIES([^)]*)\)",
+            self.cmake,
+            re.S,
+        )
+        self.assertIsNotNone(properties, "both sparse tile tests must have explicit CTest properties")
+        self.assertRegex(properties.group(1), r"\bSKIP_RETURN_CODE\s+77\b")
+        self.assertRegex(properties.group(1), r"\bTIMEOUT\s+[1-9]\d*\b")
+
     def test_whole_test_skips_return_the_skip_code(self):
         # A test registered with SKIP_RETURN_CODE 77 that prints SKIP and returns 0 is counted as passed although it
         # checked nothing: bink_audio_test did that for a movie without audio tracks after #1580.
