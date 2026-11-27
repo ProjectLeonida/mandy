@@ -375,20 +375,33 @@ public:
     }
 
     // retire_range's ticket for a view that work already in flight may name: the ticket is taken by execute_end()
-    // once every ExecuteCommandLists replay begun by then has recorded its submissions.
+    // once every ExecuteCommandLists replay enqueued or begun by then has recorded its submissions.
     static constexpr std::uint64_t kAfterExecutes = UINT64_MAX;
 
-    // An ExecuteCommandLists replay starts (before its before_execute_ work): its serial, for execute_end().
-    std::uint64_t execute_begin() {
+    // Registers an ExecuteCommandLists batch at enqueue time (before it enters VulkanQueue::inbox_ or held_), so any
+    // view retired with kAfterExecutes while this already-recorded batch waits in an async inbox or behind a fence
+    // gate cannot be stamped and reaped until this batch has recorded its GPU submission. Paired with execute_end().
+    std::uint64_t execute_enqueue() {
         std::lock_guard lock(execute_mutex_);
         executing_.push_back(++execute_serial_);
         return execute_serial_;
     }
-    // The replay that began with `serial` has recorded its submissions. Views retired while only replays now finished
-    // were in progress get submitted() (the context's submitted_retire_ticket(), read here, after those replays
-    // recorded theirs) as their retire ticket. Lock order: mutex_ -> execute_mutex_, as in retire_range.
+
+    // An ExecuteCommandLists replay starts (before its before_execute_ work): its serial, for execute_end().
+    // When `enqueued_serial` != 0, execute_enqueue() already registered it in executing_ at enqueue time.
+    std::uint64_t execute_begin(std::uint64_t enqueued_serial = 0) {
+        if (enqueued_serial) return enqueued_serial;
+        std::lock_guard lock(execute_mutex_);
+        executing_.push_back(++execute_serial_);
+        return execute_serial_;
+    }
+    // The replay that began (or was enqueued) with `serial` has recorded its submissions (or was dropped). Views
+    // retired while only replays now finished were in progress get submitted() (the context's
+    // submitted_retire_ticket(), read here, after those replays recorded theirs) as their retire ticket.
+    // Lock order: mutex_ -> execute_mutex_, as in retire_range.
     template<class Submitted>
     void execute_end(std::uint64_t serial, Submitted&& submitted) {
+        if (!serial) return;
         {
             std::lock_guard lock(execute_mutex_);
             std::erase(executing_, serial);

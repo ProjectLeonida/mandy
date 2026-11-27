@@ -702,6 +702,47 @@ int reentrant_rehash_in_alias_and_handoff() {
     return 0;
 }
 
+int lock_free_pending_fast_paths() {
+    Fixture f;
+    TitleMirror mirror(f.hooks());
+    EXPECT(mirror.cover(kBase, kBase + 4 * kPage));
+    EXPECT(!mirror.has_pending_work() && !mirror.has_pending_binds() && !mirror.has_dirty() &&
+           !mirror.has_retired_homes());
+
+    std::vector<std::uint8_t> frame(kPage, 0x21);
+    mirror.map(kBase, frame.data(), nullptr, 1);
+    EXPECT(mirror.has_pending_binds() && mirror.has_pending_work() && !mirror.has_dirty());
+    EXPECT(mirror.flush(1));
+    EXPECT(!mirror.has_pending_binds() && !mirror.has_pending_work());
+
+    // Dirty with unchanged bytes: has_dirty() transitions true -> false, and last_upload_bytes() reports 0!
+    EXPECT(mirror.dirty(kBase));
+    EXPECT(mirror.has_dirty() && mirror.has_pending_work());
+    EXPECT(mirror.upload() == 1);
+    EXPECT(!mirror.has_dirty() && !mirror.has_pending_work());
+    EXPECT(mirror.last_upload_bytes() == 0);
+
+    // Dirty with 1 modified 256-byte piece: last_upload_bytes() reports 256.
+    frame[10] = 0x99;
+    EXPECT(mirror.dirty(kBase));
+    EXPECT(mirror.upload() == 1);
+    EXPECT(mirror.last_upload_bytes() == 256);
+
+    // Unmap retires home at ticket 10: has_retired_homes(completed) checks oldest ticket in O(1) without locking.
+    mirror.map(kBase, nullptr, nullptr, 10);
+    EXPECT(mirror.flush(2));
+    EXPECT(mirror.has_retired_homes());
+    EXPECT(!mirror.has_retired_homes(9));
+    EXPECT(mirror.has_retired_homes(10));
+    mirror.retire(9);
+    EXPECT(mirror.has_retired_homes());
+    mirror.retire(10);
+    EXPECT(!mirror.has_retired_homes() && !mirror.has_pending_work());
+
+    std::printf("lock_free_pending_fast_paths: O(1) bind/dirty/retire/upload_bytes queries ok\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -715,6 +756,7 @@ int main() {
     if (coalesced_fill_and_write_back_soundness()) return 1;
     if (make_copy_aba_staleness()) return 1;
     if (reentrant_rehash_in_alias_and_handoff()) return 1;
+    if (lock_free_pending_fast_paths()) return 1;
     std::printf("title_mirror_hooks_test: ok\n");
     return 0;
 }

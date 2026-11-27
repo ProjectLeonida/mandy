@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdint>
 #include <cstring>
@@ -216,6 +217,7 @@ public:
             if (va >= lo && va < alias.hi) {
                 alias_pending_[alias.buffer][alias.offset + (va - lo)] =
                     {alias.offset + (va - lo), kPage, VK_NULL_HANDLE, 0, 0};
+                has_pending_binds_.store(true, std::memory_order_release);
                 const auto home = homes_.find(frame);
                 if (home != homes_.end() && home->second.copy && home->second.filter_va == va)
                     drop_copy(home->second, ticket);
@@ -242,11 +244,13 @@ public:
         if (!home->second.dirty) {
             home->second.dirty = true;
             dirty_.push_back(page->second);
+            dirty_count_.store(dirty_.size(), std::memory_order_release);
         }
         return true;
     }
     // Fills the homes dirty() named. Returns how many.
     std::size_t upload() {
+        const std::uint64_t uploaded_before = counters_.uploaded_bytes;
         std::size_t n = 0;
         for (std::uint8_t* frame : dirty_) {
             const auto home = homes_.find(frame);
@@ -256,6 +260,8 @@ public:
             ++n;
         }
         dirty_.clear();
+        dirty_count_.store(0, std::memory_order_release);
+        last_upload_bytes_ = counters_.uploaded_bytes - uploaded_before;
         return n;
     }
 
@@ -439,18 +445,35 @@ public:
         ++counters_.batches;
         pending_.clear();
         alias_pending_.clear();
+        has_pending_binds_.store(false, std::memory_order_release);
         return ok;
     }
 
     // Frees the homes no page binds any more whose last reader has retired (`completed` ticket).
     void retire(std::uint64_t completed) {
+        if (freed_.empty()) return;
+        bool popped = false;
         while (!freed_.empty() && freed_.front().ticket <= completed) {
             const auto [unit, slot, ticket] = freed_.front();
             freed_.pop_front();
             units_[unit].free.push_back(slot);
             ++counters_.homes_freed;
+            popped = true;
         }
+        if (popped) sync_freed_atomics();
     }
+
+    // Lock-free O(1) clean fast-path queries so before_execute_() / flush_page_mirror() skip taking page_mirror.mutex
+    // and completed_retire_ticket() when nothing is pending.
+    bool has_pending_binds() const noexcept { return has_pending_binds_.load(std::memory_order_acquire); }
+    bool has_dirty() const noexcept { return dirty_count_.load(std::memory_order_acquire) != 0; }
+    bool has_pending_work() const noexcept { return has_pending_binds() || has_dirty(); }
+    bool has_retired_homes() const noexcept { return freed_count_.load(std::memory_order_acquire) != 0; }
+    bool has_retired_homes(std::uint64_t completed) const noexcept {
+        return freed_count_.load(std::memory_order_acquire) != 0 &&
+               oldest_freed_ticket_.load(std::memory_order_acquire) <= completed;
+    }
+    std::uint64_t last_upload_bytes() const noexcept { return last_upload_bytes_; }
 
     // The home's memory and offset of the mirrored page at `va` (tests and diagnostics).
     bool home_at(std::uint64_t va, VkDeviceMemory& memory, VkDeviceSize& offset, std::uint8_t** host = nullptr) const {
@@ -760,7 +783,7 @@ private:
     // The filtered copy goes, after `ticket` (the submissions that could read it at the alias).
     void drop_copy(Home& home, std::uint64_t ticket) {
         if (!home.copy) return;
-        freed_.push_back({home.copy_unit, home.copy_slot, ticket});
+        push_freed(home.copy_unit, home.copy_slot, ticket);
         home.copy = false;
         home.filter_va = 0;
         home.fresh = true;
@@ -775,6 +798,7 @@ private:
         if (va >= it->second.hi) return;
         const VkDeviceSize at = it->second.offset + (va - it->first);
         alias_pending_[it->second.buffer][at] = {at, kPage, memory, offset, 0};
+        has_pending_binds_.store(true, std::memory_order_release);
     }
     bool take_slot(std::uint32_t& unit, std::uint32_t& slot) {
         for (std::uint32_t u = 0; u < units_.size(); ++u)
@@ -799,13 +823,32 @@ private:
         const auto it = homes_.find(frame);
         if (it == homes_.end() || --it->second.refs) return;
         drop_copy(it->second, ticket);
-        freed_.push_back({it->second.unit, it->second.slot, ticket});
+        push_freed(it->second.unit, it->second.slot, ticket);
         homes_.erase(it);
     }
     // One bind (memory null: unbind) of the page at `va`, in every chunk it lies in, into the next batch.
     void note_bind(std::uint64_t va, VkDeviceMemory memory, VkDeviceSize offset) {
         const std::uint64_t chunk = va / kChunk;
         pending_[chunk][va - chunk * kChunk] = {va - chunk * kChunk, kPage, memory, offset, 0};
+        has_pending_binds_.store(true, std::memory_order_release);
+    }
+    void push_freed(std::uint32_t unit, std::uint32_t slot, std::uint64_t ticket) {
+        freed_.push_back({unit, slot, ticket});
+        if (ticket < oldest_freed_ticket_.load(std::memory_order_relaxed))
+            oldest_freed_ticket_.store(ticket, std::memory_order_release);
+        freed_count_.store(freed_.size(), std::memory_order_release);
+    }
+    void sync_freed_atomics() noexcept {
+        if (freed_.empty()) {
+            oldest_freed_ticket_.store(UINT64_MAX, std::memory_order_release);
+            freed_count_.store(0, std::memory_order_release);
+            return;
+        }
+        std::uint64_t oldest = freed_.front().ticket;
+        for (const Freed& f : freed_)
+            if (f.ticket < oldest) oldest = f.ticket;
+        oldest_freed_ticket_.store(oldest, std::memory_order_release);
+        freed_count_.store(freed_.size(), std::memory_order_release);
     }
 
     TitleMirrorHooks hooks_;
@@ -820,6 +863,11 @@ private:
     std::map<VkBuffer, std::map<VkDeviceSize, VkSparseMemoryBind>> alias_pending_;  // buffer -> offset -> next bind
     Counters counters_;
     std::size_t last_batch_ = 0;
+    std::uint64_t last_upload_bytes_ = 0;
+    std::atomic<bool> has_pending_binds_{false};
+    std::atomic<std::size_t> dirty_count_{0};
+    std::atomic<std::size_t> freed_count_{0};
+    std::atomic<std::uint64_t> oldest_freed_ticket_{UINT64_MAX};
     alignas(64) std::array<std::uint8_t, kPage> fill_scratch_{};
 
 public:

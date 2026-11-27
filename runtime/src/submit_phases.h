@@ -42,6 +42,7 @@ struct Totals {
     std::atomic<std::int64_t> last_log{0};
     std::atomic<std::uint64_t> presents{0};  // frames the presenter showed (VulkanPresenter), since the last line
     std::atomic<std::uint64_t> present_serial{0};  // the same, never reset (LEONIDA_REFRESH_PER_FRAME)
+    std::atomic<std::uint64_t> present_calls{0};   // TitleCall(part_present) entries: splits async submit merging at Present
     // Threads whose innermost Scope is this phase now, and when the first of them entered it (steady_clock). Counted
     // per phase, since queues submit from several threads: one value would go stale when their scopes overlap.
     std::atomic<unsigned> active[kCount]{};
@@ -181,6 +182,7 @@ struct TitleCall {
     std::int64_t start = 0;
     std::uint64_t phases_at = 0;
     explicit TitleCall(Part p) : part(p) {
+        if (p == part_present) totals().present_calls.fetch_add(1, std::memory_order_release);
         ThreadState& s = thread_state();
         if (s.calls++ || s.worker >= 0) return;
         start = now_ns();
