@@ -7,7 +7,8 @@
 //   6. Clean refusals: mixed ClipDistance + CullDistance, ShaderLayer / ShaderViewportIndex, non-vec3 collision at bary_location.
 //   7. Computed I/J pairs (RT-BARY-FALLBACK-PER-VERTEX): a PS `Flat vec4[3]` Input named by `per_vertex` gets the
 //      triangle's three values of the VS output it maps, with shared GS Inputs, zero-fill and clean refusals; after
-//      f16 linking, only from the VS's raw outputs, and with the block's three Locations kept free of halves.
+//      f16 linking, only from the VS's raw outputs, and with the block's three Locations kept free of halves; the
+//      blocks count in BaryFallbackGsInfo's component bounds.
 //   8. Unused PS Input pruning: declared-but-unread PS Inputs are zero-filled on GS->PS without declaring GS Inputs from VS,
 //      keeping component counts within RADV's maxGeometryInputComponents (64), while OpLoad / OpAccessChain / InterpolateAt*
 //      pointer reads are preserved.
@@ -23,6 +24,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #define CHECK(cond) do { \
@@ -161,7 +163,8 @@ std::vector<std::uint32_t> build_ps(const std::vector<std::uint32_t>& raw_locs,
     const std::uint32_t id_float = alloc();
     const std::uint32_t id_v3float = alloc();
     const std::uint32_t id_v4float = alloc();
-    const std::uint32_t id_uint = access_chain_locs.empty() ? 0 : alloc();
+    // One uint type for the access-chain index and the computed-I/J array length.
+    const std::uint32_t id_uint = access_chain_locs.empty() && pv_bases.empty() ? 0 : alloc();
     const std::uint32_t id_u0 = access_chain_locs.empty() ? 0 : alloc();
     const std::uint32_t id_ptr_in_f = access_chain_locs.empty() ? 0 : alloc();
     const std::uint32_t id_ptr_in_v3 = alloc();
@@ -180,10 +183,9 @@ std::vector<std::uint32_t> build_ps(const std::vector<std::uint32_t>& raw_locs,
         in_v4_vars.push_back({alloc(), pair[1]});
     }
     // --bary-fallback computed I/J pairs: a Flat vec4[3] Input at each first location (rdna2spirv's pv_fallback).
-    std::uint32_t id_uint = 0, id_uint_3 = 0, id_arr_v4_3 = 0, id_ptr_in_arr = 0;
+    std::uint32_t id_uint_3 = 0, id_arr_v4_3 = 0, id_ptr_in_arr = 0;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> in_pv_vars;
     if (!pv_bases.empty()) {
-        id_uint = alloc();
         id_uint_3 = alloc();
         id_arr_v4_3 = alloc();
         id_ptr_in_arr = alloc();
@@ -219,8 +221,8 @@ std::vector<std::uint32_t> build_ps(const std::vector<std::uint32_t>& raw_locs,
     append_inst(w, kOpTypeFloat, {id_float, 32});
     append_inst(w, kOpTypeVector, {id_v3float, id_float, 3});
     append_inst(w, kOpTypeVector, {id_v4float, id_float, 4});
-    if (id_uint) {
-        append_inst(w, kOpTypeInt, {id_uint, 32, 0});
+    if (id_uint) append_inst(w, kOpTypeInt, {id_uint, 32, 0});
+    if (!access_chain_locs.empty()) {
         append_inst(w, 43, {id_uint, id_u0, 0u});
         append_inst(w, kOpTypePointer, {id_ptr_in_f, kStorageInput, id_float});
     }
@@ -229,7 +231,6 @@ std::vector<std::uint32_t> build_ps(const std::vector<std::uint32_t>& raw_locs,
     append_inst(w, kOpTypePointer, {id_ptr_out_v4, kStorageOutput, id_v4float});
     append_inst(w, kOpConstantNull, {id_v4float, id_null_v4});
     if (!pv_bases.empty()) {
-        append_inst(w, kOpTypeInt, {id_uint, 32, 0});
         append_inst(w, 43, {id_uint, id_uint_3, 3});
         append_inst(w, 28, {id_arr_v4_3, id_v4float, id_uint_3});
         append_inst(w, kOpTypePointer, {id_ptr_in_arr, kStorageInput, id_arr_v4_3});
@@ -705,6 +706,45 @@ int main(int argc, char** argv) {
         CHECK((ins.out_pv_locs == std::set<std::uint32_t>{25}) && ins.out_pv_stores == 9);
         CHECK(!ins.in_locs.count(26) && !ins.in_locs.count(27));
         maybe_dump(dump_dir, "gs_per_vertex_f16_block_reserved", gs);
+    }
+
+    // 7i. BaryFallbackGsInfo counts computed-I/J blocks (#1497's geometry-limit precheck): the GS Input of an
+    //     attribute only a block reads, and the block's three output Locations (12 components), forwarded or
+    //     zero-filled. Attribute 16 with its block at 14..16 needs 68/68, above a 64-component device; attribute 15
+    //     with its block at 13..15 is the 64/64 edge. (Found by @ecox982745, confirmed on a Vega 20 by @zmasi.)
+    {
+        // ok is false when the builder refused or its module did not parse.
+        const auto footprint = [&](std::uint32_t attr, std::uint32_t base, bool exported) {
+            const auto vs = build_vs({.raw_locs = exported ? std::vector<std::uint32_t>{attr}
+                                                           : std::vector<std::uint32_t>{}});
+            const auto ps = build_ps({}, {}, 3, {}, {base});
+            std::vector<std::uint32_t> gs;
+            BaryFallbackGsInfo info{};
+            GsInspection ins;
+            std::string err;
+            const bool ok = build_bary_fallback_gs(vs, ps, 3, PerVertexMap{{attr, base}}, gs, &info, &err) &&
+                            verify_gs_module(gs, ins);
+            return std::tuple{ok, info, ins};
+        };
+        {
+            const auto [ok, info, ins] = footprint(16, 14, true);
+            CHECK(ok);
+            CHECK((ins.in_locs == std::set<std::uint32_t>{16}));
+            CHECK(info.input_components == 8 && info.max_input_location == 16 &&
+                  info.max_input_location_components == 68);
+            CHECK(info.output_components == 4 + 3 + 12);
+            CHECK(info.max_output_location == 16 && info.max_output_location_components == 68);
+        }
+        {
+            const auto [ok, info, ins] = footprint(15, 13, true);
+            CHECK(ok && info.max_input_location_components == 64 && info.max_output_location_components == 64);
+        }
+        {
+            // Zero-filled: no GS Input, but the block's Locations still count on the output side.
+            const auto [ok, info, ins] = footprint(16, 14, false);
+            CHECK(ok && ins.in_locs.empty() && info.input_components == 4 && info.max_input_location_components == 0);
+            CHECK(info.output_components == 4 + 3 + 12 && info.max_output_location_components == 68);
+        }
     }
 
     // 7d. A mapping the PS does not declare is ignored: the module is the one built without it.

@@ -770,7 +770,7 @@ int main() {
                " \"ps_ij_nomap\": {\"stage\": \"ps\", \"fssm_sha256\": \""
             << leonida::sha256_hex(ps_ij_nomap_prog)
             << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], \"inputs\": [1], "
-               "\"bary_fallback_input\": {\"location\": 3}}},\n"
+               "\"bary_fallback_input\": {\"location\": 3}},\n"
                " \"ps_bary_f16_low\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_f16_low_prog)
             << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], "
                "\"bary_fallback_input\": {\"location\": 12}, \"f16_halves\": {\"7\": [9, 10]}},\n"

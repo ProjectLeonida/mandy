@@ -40,15 +40,18 @@ namespace leonida {
 struct BaryFallbackGsInfo {
     std::uint32_t clip_count = 0;
     std::uint32_t cull_count = 0;
-    // Per-vertex scalar input components declared by the GS (4 for Position + dist_count + 4 * forwarded_locs).
+    // Per-vertex scalar input components declared by the GS (4 for Position + dist_count + 4 per user Input
+    // Location, including a VS attribute read only by a computed-I/J block).
     std::uint32_t input_components = 0;
     // Highest `4 * Location + 4` across GS Input locations (0 when no user locations are forwarded);
     // Vulkan VUID-RuntimeSpirv-Location-06272 requires this <= limits.maxGeometryInputComponents.
     std::uint32_t max_input_location = 0;
     std::uint32_t max_input_location_components = 0;
-    // Per-vertex scalar output components declared by the GS (4 for Position + dist_count + 4 * pass_locs + 3).
+    // Per-vertex scalar output components declared by the GS (4 for Position + dist_count + 4 * pass_locs + 3,
+    // and 12 for each computed-I/J vec4[3]).
     std::uint32_t output_components = 0;
-    // Highest `4 * Location + components` across GS Output locations (`pass_locs` vec4 and `bary_location` vec3);
+    // Highest `4 * Location + components` across GS Output locations (`pass_locs` vec4, `bary_location` vec3 and
+    // the last Location of each computed-I/J block);
     // Vulkan VUID-RuntimeSpirv-Location-06272 requires this <= limits.maxGeometryOutputComponents.
     std::uint32_t max_output_location = 0;
     std::uint32_t max_output_location_components = 0;
@@ -622,22 +625,26 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
         BaryFallbackGsInfo info{};
         info.clip_count = clip_count;
         info.cull_count = cull_count;
-        info.input_components = 4u + dist_count + 4u * std::uint32_t(forwarded_locs.size());
-        if (!forwarded_locs.empty()) {
-            info.max_input_location = forwarded_locs.back();
+        // Inputs: every GS Input the module declares (id_in_loc), which includes a VS attribute only a computed-I/J
+        // block reads and counts an input both an ordinary output and a block read once.
+        info.input_components = 4u + dist_count + 4u * std::uint32_t(id_in_loc.size());
+        if (!id_in_loc.empty()) {
+            info.max_input_location = id_in_loc.rbegin()->first;
             info.max_input_location_components = 4u * info.max_input_location + 4u;
         }
-        info.output_components = 4u + dist_count + 4u * std::uint32_t(pass_locs.size()) + 3u;
+        // Outputs: each computed-I/J vec4[3] takes 12 components at Locations base..base+2, zero-filled or not.
+        info.output_components = 4u + dist_count + 4u * std::uint32_t(pass_locs.size()) + 3u +
+                                 12u * std::uint32_t(id_out_pv.size());
         info.max_output_location = bary_location;
         info.max_output_location_components = 4u * bary_location + 3u;
-        if (!pass_locs.empty()) {
-            const std::uint32_t hi_pass = pass_locs.back();
-            const std::uint32_t hi_comp = 4u * hi_pass + 4u;
-            if (hi_comp > info.max_output_location_components) {
-                info.max_output_location = hi_pass;
-                info.max_output_location_components = hi_comp;
+        const auto note_output = [&](std::uint32_t loc) {
+            if (4u * loc + 4u > info.max_output_location_components) {
+                info.max_output_location = loc;
+                info.max_output_location_components = 4u * loc + 4u;
             }
-        }
+        };
+        if (!pass_locs.empty()) note_output(pass_locs.back());
+        for (const auto& [base, id] : id_out_pv) note_output(base + 2u);
         *out_info = info;
     }
     return true;
