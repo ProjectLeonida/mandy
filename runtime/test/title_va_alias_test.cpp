@@ -138,6 +138,84 @@ int main() {
     EXPECT(!a.shader_side(arena) && a.shader_side(0xA0000ff) && !a.shader_side(0xA000100));
     a.remove(title + 0x100, 0xA000000);
     EXPECT(a.size() == 0 && !a.shader_side(0xA000000));
+    // Read-only vs writable resolution: writable=false translates without invoking Noter, while writable=true invokes
+    // Noter and forwards the writable flag to AccessResolver.
+    struct HookState {
+        std::uint64_t noted = 0, last_noted_va = 0, last_noted_bytes = 0;
+        std::uint64_t resolved = 0, last_writable_calls = 0, last_readonly_calls = 0;
+        std::uint64_t mirror_va = 0, remap_from = 0, remap_to = 0;
+    } hs;
+    hs.mirror_va = title + 0x800000;
+    hs.remap_from = title + 0x900000;
+    hs.remap_to = 0xB000000;
+    a.set_hooks(
+        &hs,
+        [](void* ctx, std::uint64_t va, std::uint64_t bytes, bool writable, std::uint64_t& out) -> bool {
+            (void)bytes;
+            auto* s = static_cast<HookState*>(ctx);
+            ++s->resolved;
+            if (writable) ++s->last_writable_calls;
+            else ++s->last_readonly_calls;
+            if (va == s->mirror_va) {
+                out = va;
+                return true;
+            }
+            if (va == s->remap_from) {
+                out = s->remap_to;
+                return true;
+            }
+            return false;
+        },
+        nullptr);
+    a.set_noter([](void* ctx, std::uint64_t va, std::uint64_t bytes) {
+        auto* s = static_cast<HookState*>(ctx);
+        ++s->noted;
+        s->last_noted_va = va;
+        s->last_noted_bytes = bytes;
+    });
+    // Existing alias hit: writable=false translates without noting; writable=true (and default) notes.
+    EXPECT(a.add(title, size, arena));
+    EXPECT(a.resolve(title + 0x20, 64, leonida::TitleVaAliases::root_view, false) == arena + 0x20);
+    EXPECT(hs.noted == 0);
+    EXPECT(a.resolve(title + 0x20, 64, leonida::TitleVaAliases::root_view, true) == arena + 0x20);
+    EXPECT(hs.noted == 1 && hs.last_noted_va == title + 0x20 && hs.last_noted_bytes == 64);
+    EXPECT(a.resolve(title + 0x40, 32, leonida::TitleVaAliases::root_view) == arena + 0x40);
+    EXPECT(hs.noted == 2 && hs.last_noted_va == title + 0x40 && hs.last_noted_bytes == 32);
+    a.remove(title, arena);
+    // AccessResolver path: writable flag is passed through; Noter fires iff writable && to != 0 (including mirror to == va).
+    EXPECT(a.resolve(hs.mirror_va, 128, leonida::TitleVaAliases::root_view, false) == hs.mirror_va);
+    EXPECT(hs.last_readonly_calls == 1 && hs.last_writable_calls == 0 && hs.noted == 2);
+    EXPECT(a.resolve(hs.mirror_va, 128, leonida::TitleVaAliases::root_view, true) == hs.mirror_va);
+    EXPECT(hs.last_readonly_calls == 1 && hs.last_writable_calls == 1 && hs.noted == 3 &&
+           hs.last_noted_va == hs.mirror_va && hs.last_noted_bytes == 128);
+    EXPECT(a.resolve(hs.remap_from, 256, leonida::TitleVaAliases::root_view, false) == hs.remap_to);
+    EXPECT(hs.last_readonly_calls == 2 && hs.noted == 3);
+    EXPECT(a.resolve(hs.remap_from, 256, leonida::TitleVaAliases::root_view, true) == hs.remap_to);
+    EXPECT(hs.last_writable_calls == 2 && hs.noted == 4 && hs.last_noted_va == hs.remap_from &&
+           hs.last_noted_bytes == 256);
+    a.clear_hooks(&hs);
+    // 4-arg Resolver path (unchanged hook signature): mirrored (to == va) notes iff writable=true.
+    hs.noted = 0;
+    a.set_hooks(
+        &hs,
+        [](void* ctx, std::uint64_t va, std::uint64_t, std::uint64_t& out) -> bool {
+            auto* s = static_cast<HookState*>(ctx);
+            if (va != s->mirror_va) return false;
+            out = va;
+            return true;
+        },
+        nullptr);
+    a.set_noter([](void* ctx, std::uint64_t va, std::uint64_t bytes) {
+        auto* s = static_cast<HookState*>(ctx);
+        ++s->noted;
+        s->last_noted_va = va;
+        s->last_noted_bytes = bytes;
+    });
+    EXPECT(a.resolve(hs.mirror_va, 64, leonida::TitleVaAliases::root_view, false) == hs.mirror_va);
+    EXPECT(hs.noted == 0);
+    EXPECT(a.resolve(hs.mirror_va, 64, leonida::TitleVaAliases::root_view, true) == hs.mirror_va);
+    EXPECT(hs.noted == 1 && hs.last_noted_va == hs.mirror_va && hs.last_noted_bytes == 64);
+    a.clear_hooks(&hs);
     std::printf("title_va_alias: translation inside a title-placed range, identity outside it and after release\n");
     return 0;
 }

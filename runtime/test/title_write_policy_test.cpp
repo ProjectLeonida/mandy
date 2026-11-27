@@ -5,6 +5,7 @@
 // written during that collect's own copy, which the next one brings over.
 #include "../src/title_write_policy.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -143,6 +144,70 @@ int main() {
                     static_cast<unsigned long long>(s.hot_copies), static_cast<unsigned long long>(s.cold_copies),
                     static_cast<unsigned long long>(s.promotions), static_cast<unsigned long long>(s.demotions),
                     static_cast<unsigned long long>(s.arm_failures));
+    }
+    {  // scale + correctness: 200,000 cold pages + 100 hot pages stays O(dirty + hot), sub-millisecond per collect+frame
+        struct LightGuard {
+            std::uint64_t arms = 0, disarms = 0;
+            bool arm(std::uintptr_t) {
+                ++arms;
+                return true;
+            }
+            void disarm(std::uintptr_t) { ++disarms; }
+        } lg;
+        constexpr std::size_t kCold = 200000, kHot = 100, kTotal = kCold + kHot;
+        leonida::TitleWritePolicy<LightGuard> policy(lg);
+        policy.add(kBase, kBase + kTotal * kPage);
+        // Initial collect arms all 200,100 pages once.
+        std::size_t initial = 0;
+        policy.collect([&](std::uintptr_t) { ++initial; });
+        EXPECT(initial == kTotal);
+        EXPECT(policy.stats().cold == kTotal && policy.stats().hot == 0);
+        // Promote the first kHot pages by writing them every frame for kPromote frames.
+        for (unsigned f = 0; f < Policy::kPromote; ++f) {
+            for (std::size_t h = 0; h < kHot; ++h) policy.written(kBase + h * kPage);
+            std::size_t copied = 0;
+            std::uintptr_t prev = 0;
+            policy.collect([&](std::uintptr_t p) {
+                EXPECT(p > prev);  // delivered in address order
+                prev = p;
+                ++copied;
+            });
+            EXPECT(copied == kHot);
+            policy.frame();
+        }
+        EXPECT(policy.stats().hot == kHot && policy.stats().cold == kCold);
+        for (std::size_t h = 0; h < kHot; ++h) EXPECT(policy.hot(kBase + h * kPage));
+        EXPECT(!policy.hot(kBase + kHot * kPage));
+        // Steady-state benchmark: 50 submissions (collect + frame) with 100 hot + 10 cold writes each.
+        constexpr unsigned kIters = 50;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (unsigned it = 0; it < kIters; ++it) {
+            for (unsigned c = 0; c < 10; ++c)
+                policy.written(kBase + (kHot + ((it * 13 + c * 97) % kCold)) * kPage);
+            std::size_t copied = 0;
+            std::uintptr_t prev = 0;
+            policy.collect([&](std::uintptr_t p) {
+                EXPECT(p > prev);
+                prev = p;
+                ++copied;
+            });
+            EXPECT(copied >= 10);  // at least the 10 cold pages (hot pages may skip during probe wait)
+            policy.frame();
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const double per_iter_ms = ms / double(kIters);
+        std::printf("scale (%zu cold + %zu hot): %.3f ms per collect+frame (%.2f ms for %u iters)\n",
+                    kCold, kHot, per_iter_ms, ms, kIters);
+        EXPECT(per_iter_ms < 1.0);
+        // Stop writing the hot pages: they demote after a probe cycle, and removing pages updates stats cleanly.
+        for (unsigned f = 0; f < 2 * Policy::kProbe; ++f) {
+            policy.collect([&](std::uintptr_t) {});
+            policy.frame();
+        }
+        EXPECT(policy.stats().hot == 0 && policy.stats().cold == kTotal);
+        EXPECT(policy.stats().demotions >= kHot);
+        policy.remove(kBase, kBase + 50 * kPage);
+        EXPECT(policy.stats().cold == kTotal - 50);
     }
     if (failures) return 1;
     std::puts("title write policy: hot pages stop faulting, cold pages fault once an interval, nothing missed");
