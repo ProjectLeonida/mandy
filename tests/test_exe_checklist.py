@@ -150,6 +150,50 @@ class ExeChecklist(unittest.TestCase):
         self.assertEqual(notes[2]["text"], "parent note + nested plus continuation 1. nested ordered continuation")
         self.assertEqual(notes[3]["text"], "prose note 2024. the year it occurred + 5 cases passed.")
 
+    def test_tilde_fenced_fake_notes_are_skipped(self):
+        sample = """# Tilde Fences
+
+~~~python
+**VERIFY:** a fake note inside a tilde fence
+- **ASSUMPTION:** a second fake note inside the fence
+~~~
+
+- **VERIFY:** a real note after the fence.
+"""
+        path = os.path.join(self.root, "docs", "tilde.md")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(sample)
+        notes = ec.doc_notes(path, "docs/tilde.md")
+        self.assertEqual([(n["line"], n["kind"], n["text"]) for n in notes],
+                         [(8, "VERIFY", "a real note after the fence.")])
+
+    def test_an_unclosed_fence_does_not_hide_later_notes(self):
+        sample = """# Unclosed Fence
+
+```
+- **VERIFY:** text after an unterminated fence is still a note.
+"""
+        path = os.path.join(self.root, "docs", "unclosed.md")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(sample)
+        notes = ec.doc_notes(path, "docs/unclosed.md")
+        self.assertEqual([(n["line"], n["text"]) for n in notes],
+                         [(4, "text after an unterminated fence is still a note.")])
+
+    def test_a_marked_nested_sub_item_is_a_note_of_its_own(self):
+        sample = """# Nested Items
+
+- **VERIFY:** parent note
+  - **ASSUMPTION:** a marked nested sub-item
+"""
+        path = os.path.join(self.root, "docs", "nested.md")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(sample)
+        notes = ec.doc_notes(path, "docs/nested.md")
+        self.assertEqual([(n["line"], n["kind"]) for n in notes], [(3, "VERIFY"), (4, "ASSUMPTION")])
+        self.assertEqual(notes[0]["text"], "parent note")   # the child's text is not glued into the parent
+        self.assertEqual(notes[1]["text"], "a marked nested sub-item")
+
     def test_a_marker_inside_a_sentence_or_a_table_row_is_prose(self):
         with open(os.path.join(self.root, "docs", "demo.md"), "a", encoding="utf-8", newline="\n") as f:
             f.write("| `v_demo` | written without the console (**Assumption**: not a note) |\n"

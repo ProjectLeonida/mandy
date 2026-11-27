@@ -83,20 +83,46 @@ def code_notes(path: str, rel: str) -> list[dict]:
     return notes
 
 
+def closed_code_fences(lines: list[str]) -> set[int]:
+    """Line indices inside a *closed* fenced code block (``` or ~~~). An unclosed fence is not a region: an unfinished
+    block must not hide every note that follows it in the file."""
+    fenced: set[int] = set()
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].lstrip()
+        if len(lines[i]) - len(stripped) <= 3:
+            m = re.match(r"^(`{3,}|~{3,})", stripped)
+            if m:
+                marker, length = m.group(1)[0], len(m.group(1))
+                close = None
+                for j in range(i + 1, len(lines)):
+                    closer = lines[j].lstrip()
+                    if (len(lines[j]) - len(closer) <= 3
+                            and re.fullmatch(rf"{marker}{{{length},}}\s*", closer)):
+                        close = j
+                        break
+                if close is not None:
+                    fenced.update(range(i, close + 1))
+                    i = close + 1
+                    continue
+        i += 1
+    return fenced
+
+
 def doc_notes(path: str, rel: str) -> list[dict]:
     """Each note whose bold marker starts its line (after the indentation and an optional list marker), from the line
     it starts on to the next blank line or item. A marker further into a sentence (`... work (**Assumption**);`) or a
-    table row (`| ... |`) is prose: the note does not start there, so it is not a note."""
+    table row (`| ... |`) is prose: the note does not start there, so it is not a note. Closed ``` and ~~~ fences are
+    skipped; a marked nested sub-item starts its own note instead of being glued into its parent's text."""
     with open(path, encoding="utf-8", errors="replace") as f:
         lines = f.read().split("\n")
     notes = []
-    in_fence = False
+    fenced = closed_code_fences(lines)
     for i, line in enumerate(lines):
-        stripped = line.lstrip()
-        if stripped.startswith("```"):
-            in_fence = not in_fence
+        if i in fenced:
             continue
-        if in_fence or stripped.startswith("|"):
+        stripped = line.lstrip()
+        if stripped.startswith("|"):
             continue
         body = LIST_ITEM.sub("", stripped)
         m = DOC_MARK.match(body)
@@ -107,34 +133,29 @@ def doc_notes(path: str, rel: str) -> list[dict]:
         base_indent = len(line) - len(stripped)
         is_list = bool(LIST_ITEM.match(stripped))
         end = i + 1
-        fence = False
         while end < len(lines):
+            if end in fenced:
+                end += 1
+                continue
             curr = lines[end]
             curr_stripped = curr.lstrip()
-            if curr_stripped.startswith("```"):
-                fence = not fence
-                end += 1
-                continue
-            if fence:
-                end += 1
-                continue
             if not curr.strip():
                 break
             if curr_stripped.startswith(("#", "|")):
                 break
             curr_indent = len(curr) - len(curr_stripped)
-            if LIST_ITEM.match(curr_stripped) and (not is_list or curr_indent <= base_indent):
-                break
+            if LIST_ITEM.match(curr_stripped):
+                curr_body = LIST_ITEM.sub("", curr_stripped)
+                if not is_list or curr_indent <= base_indent or DOC_MARK.match(curr_body):
+                    break
             end += 1
         parts = [LIST_ITEM.sub("", lines[i].strip())]
-        fence = False
-        for l in lines[i + 1:end]:
-            l_str = l.strip()
-            if l_str.startswith("```"):
-                fence = not fence
+        for j in range(i + 1, end):
+            if j in fenced:
                 continue
-            if not fence and l_str:
-                parts.append(l_str)
+            item = lines[j].strip()
+            if item:
+                parts.append(item)
         text = " ".join(p for p in parts if p)
         notes.append({"file": rel, "line": i + 1, "kind": m.group(1).upper(), "text": without_marker(text)})
     return notes
