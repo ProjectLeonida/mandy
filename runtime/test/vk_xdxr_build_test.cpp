@@ -5,8 +5,9 @@
 // against brute force (ctest runs both; see CMakeLists.txt).
 //
 // Cases: one triangle; five (two levels); 1000 random triangles; an indexed R16 grid with a 16-byte vertex stride;
-// R16 indices of an odd triangle count at an address 2 mod 4 (D3D12 asks only 2-byte alignment of them), which
-// end exactly at the end of their buffer;
+// R16 indices of an odd triangle count at an address 2 mod 4 (D3D12 asks only 2-byte alignment of them) and at
+// 0 mod 4, each in a buffer that ends at the first word boundary after the last index (the most XdxrTriangles asks
+// to be readable);
 // R32 indices with R32G32 vertices; a geometry transform; two geometries with an inactive (NaN) triangle; no
 // triangles; 5000 triangles (many radix-sort tiles); updates (refits) in place and into another buffer; clones and a
 // compaction (CopyRaytracingAccelerationStructure) with the postbuild size; a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS);
@@ -164,7 +165,8 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
         vertex_buffers.push_back(v);
         if (!geo.indices.empty()) {
             const std::size_t index_bytes = geo.indices.size() * (geo.u16 ? 2 : 4);
-            Buffer ib = make(gpu, geo.index_lead + index_bytes);
+            // Exactly the indices' range rounded out to whole words: what XdxrTriangles::indices asks to be readable.
+            Buffer ib = make(gpu, (geo.index_lead + index_bytes + 3) & ~std::size_t(3));
             EXPECT(ib.buffer);
             auto* at = static_cast<char*>(ib.map) + geo.index_lead;
             if (geo.u16) {
@@ -374,6 +376,8 @@ int main(int argc, char** argv) {
         odd.triangle_count -= 1;
         Built built;
         if (build_blas(gpu, builder, dir, "blas_grid_u16_odd_offset2", {odd}, built)) return 1;
+        odd.index_lead = 0;                     // the last index in the low half of the buffer's last word
+        if (build_blas(gpu, builder, dir, "blas_grid_u16_odd_offset0", {odd}, built)) return 1;
     }
     if (build_blas(gpu, builder, dir, "blas_grid_u32_xy", {grid(9, 2, true)}, xy32)) return 1;
     Geometry gt = grid(6, 3, false);

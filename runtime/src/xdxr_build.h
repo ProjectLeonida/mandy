@@ -99,7 +99,11 @@ struct XdxrTriangles {
     std::uint64_t vertices = 0;       // device address
     std::uint32_t vertex_stride = 12;
     bool xy_only = false;             // DXGI_FORMAT_R32G32_FLOAT (z = 0); otherwise R32G32B32_FLOAT
-    std::uint64_t indices = 0;        // device address, 0 = none
+    // Device address, 0 = none. R16_UINT indices need only 2-byte alignment, but the builder reads them as the
+    // aligned 4-byte words that hold them (xdxr_build.comp index_of: no 16-bit storage access is assumed), so the
+    // index range rounded out to whole words must be readable: up to 2 bytes before the first index and after the
+    // last. The layer checks that range (d3d12_vulkan_device.cpp resolve_xdxr_build) and refuses a build without it.
+    std::uint64_t indices = 0;
     std::uint32_t index_type = 0;     // 0 none, 1 R16_UINT, 2 R32_UINT
     std::uint32_t triangle_count = 0;
     std::uint64_t transform = 0;      // device address of a 3x4 row-major float matrix, 0 = none
