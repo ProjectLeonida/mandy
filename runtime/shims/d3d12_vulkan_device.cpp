@@ -16236,6 +16236,7 @@ public:
         TitleTextureStats& stats = title_stats_;
         auto& watch = state_.texture_watch;
         ++stats.passes;
+        ++title_split_passes_;
         title_pass_ = true;
         // A fill this pass makes can retire an image (title_texture_gone while this thread holds the registry): the
         // entry stops naming the resource and is erased by drain_titles_gone after the pass. Entries are looked up by
@@ -16287,6 +16288,8 @@ public:
         }
         title_named_.clear();
         watch.collect([&](std::uint64_t key) { title_named_.push_back(key); });
+        const auto collected = clock::now();
+        stats.collect_ns += std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(collected - now).count());
         // Not filled: with no backing yet or after a failed upload it is looked at again next pass. Memory not
         // readable yet waits for its mapping (xmem's change names it), except a texture the title mapped, whose
         // pages may be committed under the pointer Map gave without xmem (the probe answers each pass). Its tiles
@@ -16303,9 +16306,33 @@ public:
         title_jobs_.clear();
         std::uint64_t batch_bytes = 0;
         const auto fill_start = clock::now();
+        const std::uint64_t read_before = stats.read_ns, staged_before = stats.staged_ns;
         const auto run_batch = [&] {
             if (title_jobs_.empty()) return;
-            title_read_pool().run(title_jobs_.size(), [this](std::size_t i) { read_title_job(title_jobs_[i]); });
+            const auto read_start = clock::now();
+            TitleReadPool& pool = title_read_pool();
+            pool.run(title_jobs_.size(), [this](std::size_t i) { read_title_job(title_jobs_[i]); });
+            // Whole reads in pieces of up to kTitleChunkTiles tiles, spread over the threads.
+            title_chunks_.clear();
+            for (std::size_t i = 0; i < title_jobs_.size(); ++i) {
+                TitleJob& job = title_jobs_[i];
+                if (!job.whole) continue;
+                job.tiled.resize(std::size_t(job.span));
+                job.pieces.reset(job.entry->cpu, job.span);
+                job.failed.store(false, std::memory_order_relaxed);
+                const std::size_t tiles = job.pieces.hashes.size();
+                for (std::size_t first = 0; first < tiles; first += kTitleChunkTiles)
+                    title_chunks_.push_back({i, first, std::min(tiles, first + kTitleChunkTiles)});
+                stats.read_bytes += job.span;
+            }
+            pool.run(title_chunks_.size(), [this](std::size_t c) {
+                const TitleChunk& chunk = title_chunks_[c];
+                read_title_chunk(title_jobs_[chunk.job], chunk.first, chunk.end);
+            });
+            pool.run(title_jobs_.size(), [this](std::size_t i) { finish_title_job(title_jobs_[i]); });
+            stats.read_ns += std::uint64_t(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - read_start).count());
+            for (const TitleJob& job : title_jobs_) stats.detile_ns += job.detile_ns;
             for (TitleJob& job : title_jobs_) {
                 TitleTexture& t = *job.entry;
                 if (!job.copied) {  // the section changed after VirtualQuery: keep the last upload and retry
@@ -16417,7 +16444,14 @@ public:
             if (title_jobs_.size() >= kTitleBatch || batch_bytes >= kTitleBatchBytes) run_batch();
         }
         run_batch();
-        stats.fill_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - fill_start).count();
+        {
+            const auto pass_fill = std::uint64_t(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - fill_start).count());
+            stats.fill_ns += pass_fill;
+            // What is not reading or submitting: naming, arming, readability, slot reservation.
+            const std::uint64_t other = (stats.read_ns - read_before) + (stats.staged_ns - staged_before);
+            stats.examine_ns += pass_fill > other ? pass_fill - other : 0;
+        }
         stats.filled_bytes += filled;
         stats.max_pass_bytes = std::max(stats.max_pass_bytes, filled);
         std::vector<Resource*> release;
@@ -16489,6 +16523,19 @@ public:
                          static_cast<unsigned long long>(stats.whole_by[4]));
             stats.read_whole = stats.unchanged_parts = stats.first_named = 0;
             stats.whole_by = {};
+            const double per_pass = 1e-6 / double(std::max<std::uint64_t>(1, title_split_passes_));
+            std::fprintf(stderr,
+                         "[rt] d3d12: title texture pass split, ms a pass: %.3f finding what to look at, %.3f naming, "
+                         "arming and reserving, %.3f reading on %u threads (%.3f of it detiling, summed over them; "
+                         "%.1f MiB read whole a pass), %.3f recording and submitting the transfers\n",
+                         double(stats.collect_ns) * per_pass, double(stats.examine_ns) * per_pass,
+                         double(stats.read_ns) * per_pass, title_read_pool_ ? title_read_pool_->threads() + 1 : 1,
+                         double(stats.detile_ns) * per_pass,
+                         double(stats.read_bytes) / 1048576.0 / double(std::max<std::uint64_t>(1, title_split_passes_)),
+                         double(stats.staged_ns) * per_pass);
+            stats.collect_ns = stats.examine_ns = stats.read_ns = stats.detile_ns = stats.read_bytes = 0;
+            stats.staged_ns = 0;
+            title_split_passes_ = 0;
             stats.refresh_ns = stats.max_refresh_ns = stats.max_pass_bytes = 0;
         }
         inside.reset();
@@ -16508,6 +16555,10 @@ private:
         std::uint64_t fills = 0, fill_bytes = 0, fill_failures = 0, unchanged = 0, busy = 0;
         std::uint64_t read_whole = 0, unchanged_parts = 0, first_named = 0;
         std::array<std::uint64_t, 5> whole_by{};  // why read whole: first, no parts, one tile, all written, none
+        // Split of refresh_ns: up to the textures to look at (map changes, notes, the watch's queue), naming and arming
+        // them (examine, readability, slot reservation), the read threads' work (and of it the detile, summed over the
+        // threads), and the transfers' recording and submission (staged_ns); bytes read whole.
+        std::uint64_t collect_ns = 0, examine_ns = 0, read_ns = 0, detile_ns = 0, read_bytes = 0;
         std::uint64_t staged_fills = 0, staged_ns = 0;
         // refresh_title_textures, since the last log line
         std::uint64_t passes = 0, checked = 0, hashed = 0, changed = 0, deferred = 0, filled_bytes = 0,
@@ -16526,6 +16577,7 @@ private:
     bool title_pass_ = false;                                      // in refresh_title_textures, likewise
     std::vector<std::uint64_t> title_named_;                       // refresh scratch, under title_texture_mutex
     std::vector<std::uintptr_t> title_written_;                    // likewise
+    std::uint64_t title_split_passes_ = 0;                         // passes since the split's last log line
     // One texture of a refresh batch: what the serial part found (the slot reserved for it, the last fill's hash) and
     // what a TitleReadPool thread read (read_title_job).
     struct TitleJob {
@@ -16537,6 +16589,8 @@ private:
         leonida::TilePieces pieces;                // the texture's, then (read whole) the new ones
         std::vector<std::uintptr_t> written;       // its tiles written since its last read (compare)
         bool compare = false, whole = false;
+        std::atomic<bool> failed{false};  // a piece of a whole read could not be copied
+        std::uint64_t detile_ns = 0;
         bool write_combined = false, trace = false, copied = false, unchanged = false, nonzero = false;
         std::vector<std::uint8_t> tiled;
         std::vector<std::uint64_t> columns;
@@ -16544,6 +16598,11 @@ private:
     static constexpr std::size_t kTitleBatch = 16;                 // jobs read at once (and upload slots reserved)
     static constexpr std::uint64_t kTitleBatchBytes = 64ull << 20; // or this many bytes of them
     std::deque<TitleJob> title_jobs_;                              // refresh scratch, under title_texture_mutex
+    struct TitleChunk {
+        std::size_t job, first, end;  // tiles [first, end) of title_jobs_[job]
+    };
+    static constexpr std::size_t kTitleChunkTiles = 16;            // 1 MiB of a texture a read thread copies at a time
+    std::vector<TitleChunk> title_chunks_;                         // likewise
     class TitleReadPool;
     std::unique_ptr<TitleReadPool> title_read_pool_;
     std::once_flag title_read_pool_once_;
@@ -16681,12 +16740,12 @@ private:
         leonida::TilePieces pieces;
         std::uint64_t staged_ns = 0;
         if (copied) {
-            hash_guarded(f.tiled.data(), f.tiled.size(), hash, true);
             pieces.compute(cpu, span, f.tiled.data(), [](const std::uint8_t* p, std::uint64_t bytes) {
                 std::uint64_t h = 0;
                 hash_guarded(p, std::size_t(bytes), h, true);
                 return h;
             });
+            hash = pieces.combined();
             const auto start = std::chrono::steady_clock::now();
             ok = r.upload_staged_title(layout, f.tiled.data(), f.columns, false, nonzero);
             staged_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
@@ -17082,12 +17141,12 @@ private:
         // the last fill's (a write to another texture in the same 64 KiB tile, or the same texels again) are not
         // uploaded again.
         std::uint64_t hash = 0;
-        hash_guarded(title_tiled_.data(), title_tiled_.size(), hash, true);
         t.pieces.compute(t.cpu, span, title_tiled_.data(), [](const std::uint8_t* p, std::uint64_t bytes) {
             std::uint64_t h = 0;
             hash_guarded(p, std::size_t(bytes), h, true);
             return h;
         });
+        hash = t.pieces.combined();
         if (t.hashed && t.fills && hash == t.hash) {
             ++title_stats_.unchanged;
             t.stale = false;
@@ -17145,21 +17204,43 @@ private:
             return;
         }
         job.whole = true;
-        job.tiled.resize(std::size_t(job.span));
-        job.copied = copy_guarded(job.tiled.data(), reinterpret_cast<const std::uint8_t*>(t.cpu), std::size_t(job.span),
-                                  job.write_combined);
-        if (!job.copied) return;
-        hash_guarded(job.tiled.data(), job.tiled.size(), job.hash, true);
-        job.pieces.compute(t.cpu, job.span, job.tiled.data(), [](const std::uint8_t* p, std::uint64_t bytes) {
+    }
+
+    // The bytes of tiles [first, end) of a texture read whole (its parts), and their hashes: a texture of many tiles
+    // is read by several threads at once (a 4K video plane, a streamed texture), not by one.
+    void read_title_chunk(TitleJob& job, std::size_t first, std::size_t end) {
+        const TitleTexture& t = *job.entry;
+        const std::uintptr_t base = t.cpu & ~std::uintptr_t(0xffff);
+        const auto [from, unused] = leonida::TilePieces::part(t.cpu, job.span, base + first * 0x10000);
+        const auto [last_offset, last_length] = leonida::TilePieces::part(t.cpu, job.span, base + (end - 1) * 0x10000);
+        const std::uint64_t to = last_offset + last_length;
+        if (!copy_guarded(job.tiled.data() + from, reinterpret_cast<const std::uint8_t*>(t.cpu + from),
+                          std::size_t(to - from), job.write_combined)) {
+            job.failed.store(true, std::memory_order_relaxed);
+            return;
+        }
+        for (std::size_t i = first; i < end; ++i) {
+            const auto [offset, length] = leonida::TilePieces::part(t.cpu, job.span, base + i * 0x10000);
             std::uint64_t h = 0;
-            hash_guarded(p, std::size_t(bytes), h, true);
-            return h;
-        });
+            hash_guarded(job.tiled.data() + offset, std::size_t(length), h, true);
+            job.pieces.hashes[i] = h;
+        }
+    }
+
+    // After its parts: the texture's hash, and the detile of changed bytes into its upload slot.
+    void finish_title_job(TitleJob& job) {
+        if (!job.whole) return;
+        job.copied = !job.failed.load(std::memory_order_relaxed);
+        if (!job.copied) return;
+        job.hash = job.pieces.combined();
         job.unchanged = job.previous && *job.previous == job.hash;
         if (job.unchanged) return;
+        const auto detile_start = std::chrono::steady_clock::now();
         job.nonzero = false;
-        rt::d3d12::TitleImageUpload::fill(*job.slot, job.resource->title_binding(), t.layout, job.tiled.data(),
+        rt::d3d12::TitleImageUpload::fill(*job.slot, job.resource->title_binding(), job.entry->layout, job.tiled.data(),
                                           job.columns, job.trace, job.nonzero);
+        job.detile_ns = std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - detile_start).count());
     }
 
     // A few threads of ours for the refresh's reads: run(n, f) calls f(0..n-1) on them and on the calling thread,
@@ -17223,6 +17304,9 @@ private:
         std::uint64_t generation_ = 0;
         bool stop_ = false;
         std::vector<std::thread> threads_;
+
+    public:
+        unsigned threads() const { return unsigned(threads_.size()); }
     };
     TitleReadPool& title_read_pool() {
         std::call_once(title_read_pool_once_, [this] {
