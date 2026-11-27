@@ -19,6 +19,7 @@ public:
     HotColdTracking() : policy_(guard_) { geometry_writes::subscribe_writes(queue_); }
     ~HotColdTracking() override {
         geometry_writes::unsubscribe_writes(queue_);
+        for (const auto& [page, held] : guard_.hot) geometry_writes::set_hot(std::uintptr_t(page), false);
         for (const auto& [page, cell] : guard_.cells) geometry_writes::release(std::uintptr_t(page));
     }
     HotColdTracking(const HotColdTracking&) = delete;
@@ -34,6 +35,7 @@ public:
         if (it == guard_.cells.end()) return;
         policy_.remove(std::uintptr_t(page), std::uintptr_t(page) + Policy::kPage);
         guard_.armed.erase(page);
+        if (guard_.hot.erase(page)) geometry_writes::set_hot(std::uintptr_t(page), false);
         geometry_writes::release(std::uintptr_t(page));
         guard_.cells.erase(it);
     }
@@ -44,8 +46,17 @@ public:
         if (overflow)
             for (const auto& [page, cell] : guard_.cells) policy_.written(std::uintptr_t(page));
         else
-            for (const std::uintptr_t tile : tiles_)
-                if (guard_.cells.count(tile)) policy_.written(tile);
+            for (const std::uintptr_t tile : tiles_) {
+                const auto cell = guard_.cells.find(tile);
+                if (cell == guard_.cells.end()) continue;
+                // A guarded page whose cell has not moved since it was armed was not written since: the entry is
+                // older than the arming, or this tracking's own turn of the page from hot to cold.
+                const auto armed = guard_.armed.find(tile);
+                if (armed != guard_.armed.end() &&
+                    armed->second == cell->second->version.load(std::memory_order_acquire))
+                    continue;
+                policy_.written(tile);
+            }
         policy_.collect([&](std::uintptr_t page) { out.push_back(page); });
         policy_.frame();  // one interval a collect
     }
@@ -68,9 +79,12 @@ private:
     struct CellGuard {
         std::unordered_map<std::uint64_t, geometry_writes::Cell*> cells;
         std::unordered_map<std::uint64_t, std::uint64_t> armed;  // page -> its cell's version when last armed
+        std::unordered_map<std::uint64_t, bool> hot;  // pages this tracking holds hot in their cells
+        // Guarded (cold, or a hot page's probe): no longer hot for this owner, then armed.
         bool arm(std::uintptr_t page) {
             const auto it = cells.find(page);
             if (it == cells.end()) return false;
+            if (hot.erase(page)) geometry_writes::set_hot(page, false);
             const std::uint64_t version = it->second->version.load(std::memory_order_acquire);
             if (!geometry_writes::arm(page, *it->second)) {
                 armed.erase(page);
@@ -79,9 +93,11 @@ private:
             armed[page] = version;
             return true;
         }
-        // Writable again (a page turning hot): the cell reopens what it guarded.
+        // Hot: the cell is held hot (writable, and written at every look for every other copy of the page), not
+        // just reopened behind the other copies' backs (which left them blind: run 64's frozen video).
         void disarm(std::uintptr_t page) {
-            geometry_writes::notify(page, page + 1, geometry_writes::Event::open);
+            armed.erase(page);
+            if (cells.count(page) && hot.emplace(page, true).second) geometry_writes::set_hot(page, true);
         }
     };
     using Policy = TitleWritePolicy<CellGuard>;

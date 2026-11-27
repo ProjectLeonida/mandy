@@ -16,6 +16,13 @@ struct Cell {
     std::atomic<std::uint64_t> version{1}, mapping{1};
     std::array<DWORD, tile_size / page_size> restore{};
     unsigned refs = 0;
+    // Owners that leave the tile writable and copy it at every submission instead (the page mirror's hot pages,
+    // src/title_write_policy.h). While it is nonzero the cell guards nothing (arm() does not protect it) and its tile
+    // counts as written at every look: a subscriber asks for the hot tiles (hot_tiles()) as it takes its queue. One
+    // guard per page, owned here, whatever the number of copies that read it: an owner that stopped guarding a page
+    // without saying so left every other copy of it blind (run 64: video planes uploaded until the mirror found their
+    // pages hot, then never again).
+    unsigned hot = 0;
 };
 struct ReleaseQueue {
     std::mutex mutex;
@@ -34,6 +41,8 @@ struct WriteQueue {
 struct State {
     std::mutex mutex;
     host_heap::map<std::uintptr_t, Cell> cells;
+    host_heap::vector<std::uintptr_t> hot;  // the tiles of the cells with hot > 0, under mutex
+    std::atomic<std::size_t> hot_count{0};
     host_heap::vector<WriteQueue*> writers;  // under mutex
     std::atomic<std::uint64_t> serial{1};
     std::atomic<std::size_t> count{0};
@@ -214,6 +223,10 @@ inline void release(std::uintptr_t va) {
     std::lock_guard lock(s.mutex);
     auto it = s.cells.find(va);
     if (it != s.cells.end() && !--it->second.refs) {
+        if (it->second.hot) {
+            std::erase(s.hot, va);
+            s.hot_count.store(s.hot.size(), std::memory_order_release);
+        }
         // A page reopened here may also be one a slot-133 shadow keeps read-only (both guard the title's geometry):
         // it is writable now with no fault to tell that shadow, which then walks its pages again.
         if (reopen(va, it->second)) title_memory_map::changed(va, va + tile_size);
@@ -265,7 +278,51 @@ inline bool notify(std::uintptr_t begin, std::uintptr_t end, Event event, bool* 
     return opened;
 }
 
+// The tile at `va` is hot for one more owner (`hot`) or one fewer: while any owner holds it hot, its guard is off and
+// it is not armed again, and hot_tiles() lists it for every subscriber. The cell must be acquired.
+inline void set_hot(std::uintptr_t va, bool hot) {
+    auto& s = state();
+    std::lock_guard lock(s.mutex);
+    const auto it = s.cells.find(va);
+    if (it == s.cells.end()) return;
+    Cell& c = it->second;
+    if (hot) {
+        if (c.hot++) return;
+        reopen(va, c);
+        s.hot.push_back(va);
+    } else {
+        if (!c.hot || --c.hot) return;
+        std::erase(s.hot, va);
+        // Writes made while it was hot faulted nowhere and the subscribers that looked before this saw it in
+        // hot_tiles(): it counts as written once more, for all of them, as a write does.
+        const auto version = s.serial.load(std::memory_order_relaxed) + 1;
+        c.version.store(version, std::memory_order_release);
+        for (WriteQueue* q : s.writers) {
+            std::lock_guard queue_lock(q->mutex);
+            if (q->overflow) continue;
+            if (q->tiles.size() < WriteQueue::kMaxTiles)
+                q->tiles.push_back(va);
+            else
+                q->overflow = true, q->tiles.clear();
+            q->pending.store(true, std::memory_order_release);
+        }
+        s.serial.store(version, std::memory_order_release);
+    }
+    s.hot_count.store(s.hot.size(), std::memory_order_release);
+}
+
+// The tiles some owner holds hot: written, for every subscriber, at every look.
+template<class Out>
+inline void hot_tiles(Out& out) {
+    out.clear();
+    auto& s = state();
+    if (!s.hot_count.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(s.mutex);
+    out.assign(s.hot.begin(), s.hot.end());
+}
+
 // Arm under the same lock as the write-fault path. A kernel destination may only be guarded again after its pin ends.
+// A hot cell is not protected (true: its writes reach every subscriber through hot_tiles()).
 inline bool arm(std::uintptr_t va, Cell& c) {
     auto& s = state();
     // Querying an OVERLAPPED can fault into xmem. Never do it with the watch lock held.
@@ -273,6 +330,7 @@ inline bool arm(std::uintptr_t va, Cell& c) {
     bool pinned = false;
     kernel_writes::for_each_pin(va, va + tile_size, [&](auto, auto) { pinned = true; });
     std::lock_guard lock(s.mutex);
+    if (c.hot) return true;
     if (pinned || version != c.version.load(std::memory_order_relaxed)) return false;
     for (std::size_t i = 0; i < c.restore.size();) {
         auto p = va + i * page_size;

@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include "../src/title_mirror_hot_cold.h"
+#include "../src/title_texture_watch.h"
 
 #include <atomic>
 #include <cstdio>
@@ -39,6 +40,24 @@ int failures = 0;
         }                                                                 \
     } while (0)
 
+// The title texture refresh's view of the same cells (as the D3D12 layer's TitleTextureCells): a second copy of a page
+// the mirror tracks, which must hear of every write the mirror's tracking lets through unguarded.
+struct TextureCells {
+    using Cell = leonida::geometry_writes::Cell;
+    leonida::geometry_writes::WriteQueue queue;
+    TextureCells() { leonida::geometry_writes::subscribe_writes(queue); }
+    ~TextureCells() { leonida::geometry_writes::unsubscribe_writes(queue); }
+    Cell* acquire(std::uintptr_t tile) { return leonida::geometry_writes::acquire(tile); }
+    void release(std::uintptr_t tile) { leonida::geometry_writes::release(tile); }
+    int arm(std::uintptr_t tile, Cell& cell) { return leonida::geometry_writes::arm(tile, cell) ? 1 : -1; }
+    void aliases(std::uintptr_t, std::vector<std::uintptr_t>&) {}
+    void take_written(std::vector<std::uintptr_t>& out, bool& overflow) {
+        leonida::geometry_writes::take_written(queue, out, overflow);
+    }
+    void hot_tiles(std::vector<std::uintptr_t>& out) { leonida::geometry_writes::hot_tiles(out); }
+    bool enabled() const { return true; }
+};
+
 }  // namespace
 
 int main() {
@@ -54,6 +73,13 @@ int main() {
     {
         leonida::HotColdTracking tracking;
         for (std::size_t p = 0; p < kPages; ++p) tracking.watch(base + p * kPage);
+        // A texture over page 0 (a video plane the title writes every interval) and one over page 2, watched by the
+        // texture refresh's watch over the same cells.
+        TextureCells cells;
+        leonida::TitleTextureWatch<TextureCells> textures(cells);
+        textures.track(1, base, kPage);
+        textures.track(2, base + 2 * kPage, kPage);
+        unsigned plane_missed = 0;
         std::vector<std::uint64_t> out;
         std::uint64_t hot_faults_late = 0;
         for (unsigned interval = 0; interval < 200; ++interval) {
@@ -66,7 +92,20 @@ int main() {
             for (const std::uint64_t page : out)
                 std::memcpy(copy.data() + (page - base), reinterpret_cast<const void*>(page), kPage);
             EXPECT(!std::memcmp(copy.data(), memory, copy.size()));
+            // The texture refresh's pass after the mirror's: the plane, written this interval, must be named.
+            bool plane = false;
+            textures.collect([&](std::uint64_t key) {
+                plane |= key == 1;
+                textures.examine(key);
+            });
+            if (interval > 0 && !plane) {
+                ++plane_missed;
+                if (plane_missed <= 8)
+                    std::printf("plane not named at interval %u (hot %d)\n", interval, int(tracking.stats().hot));
+            }
         }
+        EXPECT(tracking.stats().hot >= 1);  // the plane's page turned hot in the mirror's tracking
+        EXPECT(plane_missed == 0);          // and the texture watch still heard of every write to it
         EXPECT(hot_faults_late == 0);
         EXPECT(g_faults[1].load() <= 21);
         const auto& s = tracking.stats();

@@ -1632,6 +1632,7 @@ struct TitleTextureCells {
     void take_written(std::vector<std::uintptr_t>& out, bool& overflow) {
         leonida::geometry_writes::take_written(queue, out, overflow);
     }
+    void hot_tiles(std::vector<std::uintptr_t>& out) { leonida::geometry_writes::hot_tiles(out); }
     bool enabled() const { return watch_shadow_writes(); }
 };
 
@@ -18888,7 +18889,9 @@ private:
                          static_cast<unsigned long long>(s.probes[1]), double(s.probe_ns[1]) * 1e-6,
                          static_cast<unsigned long long>(s.rechecks[1]),
                          static_cast<unsigned long long>(s.readable_now[1]));
-            s.passes = s.checked = s.hashed = s.changed = s.deferred = s.filled_bytes = s.max_pass_bytes = 0;
+            // passes, checked, changed and filled_bytes belong to the refresh's own 10 s line, which resets them: reset
+            // here too (LEONIDA_FSDRAW_PROBE prints this census far more often) they read 0 uploads there (run 64).
+            s.hashed = s.deferred = 0;
             std::fprintf(stderr,
                          "[rt] title texture pass split: written ranges and map changes %.3f ms/pass (%.1f map ranges a "
                          "pass, %llu passes probed all), mapped and stale textures %.3f ms/pass (%.1f visited a pass), "

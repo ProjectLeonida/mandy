@@ -42,6 +42,8 @@ struct FakeWatch {
     void aliases(std::uintptr_t tile, std::vector<std::uintptr_t>& out) {
         if (const auto it = alias.find(tile); it != alias.end()) out = it->second;
     }
+    std::vector<std::uintptr_t> hot;
+    void hot_tiles(std::vector<std::uintptr_t>& out) { out = hot; }
     void take_written(std::vector<std::uintptr_t>& out, bool& lost) {
         out = std::move(queue);
         queue.clear();
