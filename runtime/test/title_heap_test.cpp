@@ -68,7 +68,48 @@ int main() {
     int outside = 0;
     EXPECT(!heap.release(&outside) && !heap.owns(&outside));
     EXPECT(!heap.release(static_cast<std::uint8_t*>(zero) + 8));  // not a block's start
+    EXPECT(heap.size_of(static_cast<std::uint8_t*>(zero) + 8) == 0);
     EXPECT(heap.release(zero));
+    EXPECT(heap.size_of(zero) == 0);
+    EXPECT(!heap.release(zero));  // double-free of small block rejected
+
+    // 4. Small-block double-free must not duplicate the freelist; interior / unallocated / tail pointers rejected.
+    {
+        const std::size_t live_before = heap.stats().live;
+        void* a = heap.allocate(128);
+        void* b = heap.allocate(128);
+        EXPECT(a && b && a != b && heap.size_of(a) == 128 && heap.size_of(b) == 128);
+        EXPECT(heap.size_of(static_cast<std::uint8_t*>(a) + 64) == 0);
+        EXPECT(!heap.release(static_cast<std::uint8_t*>(a) + 64));
+        EXPECT(heap.release(a));
+        EXPECT(heap.size_of(a) == 0);
+        EXPECT(!heap.release(a));  // second free rejected
+        EXPECT(heap.stats().live == live_before + 1);
+        void* c = heap.allocate(128);
+        void* d = heap.allocate(128);
+        EXPECT(c && d && c != d && c != b && d != b);  // freelist not duplicated
+        EXPECT(heap.release(b) && heap.release(c) && heap.release(d));
+        EXPECT(heap.stats().live == live_before);
+
+        // Large-block interior pointer & double-free rejected, size_of is 0 after release.
+        void* big = heap.allocate(100000);
+        EXPECT(big && heap.size_of(big) == 2 * TitleHeap::kPage);
+        EXPECT(heap.size_of(static_cast<std::uint8_t*>(big) + 64) == 0);
+        EXPECT(!heap.release(static_cast<std::uint8_t*>(big) + 64));
+        EXPECT(heap.release(big));
+        EXPECT(heap.size_of(big) == 0 && !heap.release(big));
+
+        // Non-power-of-two class (192 B): unused span tail & never-allocated slot rejected.
+        void* p192 = heap.allocate(192);
+        EXPECT(p192 && heap.size_of(p192) == 192);
+        auto* const span_start = reinterpret_cast<std::uint8_t*>(
+            base + ((reinterpret_cast<std::uintptr_t>(p192) - base) / TitleHeap::kSpan) * TitleHeap::kSpan);
+        EXPECT(heap.size_of(span_start + 192) == 0 && !heap.release(span_start + 192));  // never allocated
+        const std::size_t tail_off = (TitleHeap::kSpan / 192) * 192;
+        EXPECT(tail_off < TitleHeap::kSpan);
+        EXPECT(heap.size_of(span_start + tail_off) == 0 && !heap.release(span_start + tail_off));  // unused tail
+        EXPECT(heap.release(p192));
+    }
 
     // 2.
     std::mt19937 random(2026);

@@ -29,6 +29,8 @@
 
 #include "shadow_keep.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -227,17 +229,58 @@ public:
         return n;
     }
 
-    // The mirrored pages of [begin, end) that have a home, in address order: what write_back reads. The caller copies
-    // their homes out with the GPU: a home in device-local memory is not read by the CPU (an uncached read over the bus
-    // costs about 1.7 us per 8 bytes: 14.5 s for the 64 MiB one submission's write-back may cover).
-    // Every home holds the title's bytes (an alias's filtered copy is a second home, never read back).
+    // A mirrored page snapshotted for GPU write-back readback: carries its chunk location and the physical frame it
+    // showed at snapshot time, so the caller can release the mirror mutex during the GPU copy and write_back_batch()
+    // can skip any page remapped or given a pending bind meanwhile.
+    struct HomeRef {
+        std::uint64_t page = 0;
+        VkBuffer chunk = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        std::uint8_t* frame = nullptr;
+    };
+
+    // True when the 64 KiB page at `va` has an unflushed bind/unbind in pending_: the sparse chunk on the GPU does not
+    // yet reflect pages_[va], so reading back from chunk_at(va) would read the previous binding (or zeros).
+    bool has_pending(std::uint64_t va) const {
+        const std::uint64_t page = va & ~(kPage - 1);
+        const std::uint64_t chunk = page / kChunk;
+        const auto it = pending_.find(chunk);
+        return it != pending_.end() && it->second.count(page - chunk * kChunk) != 0;
+    }
+
+    // The mirrored pages of [begin, end) that have a flushed home, in address order: what write_back reads. Pages with
+    // an unflushed bind in pending_ are skipped so the caller never copies a stale chunk binding.
     void homes_in(std::uint64_t begin, std::uint64_t end, std::vector<std::uint64_t>& out) const {
+        if (begin >= end) return;
         for (std::uint64_t page = begin & ~(kPage - 1); page < end; page += kPage) {
-            const auto mapped = pages_.find(page);
-            if (mapped == pages_.end()) continue;
-            if (homes_.count(mapped->second)) out.push_back(page);
+            if (!has_pending(page)) {
+                const auto mapped = pages_.find(page);
+                if (mapped != pages_.end() && homes_.count(mapped->second)) out.push_back(page);
+            }
+            if (page > UINT64_MAX - kPage) break;
         }
     }
+
+    // Deduplicated, page-sorted HomeRefs for every flushed mirrored page overlapping any [begin, end) in `ranges`.
+    std::vector<HomeRef> homes_in_ranges(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const {
+        std::vector<HomeRef> out;
+        if (ranges.empty()) return out;
+        const auto merged = merge_ranges(ranges);
+        for (const auto& [begin, end] : merged) {
+            for (std::uint64_t page = begin & ~(kPage - 1); page < end; page += kPage) {
+                if ((out.empty() || page > out.back().page) && !has_pending(page)) {
+                    const auto mapped = pages_.find(page);
+                    VkBuffer chunk = VK_NULL_HANDLE;
+                    VkDeviceSize offset = 0;
+                    if (mapped != pages_.end() && homes_.count(mapped->second) && chunk_at(page, chunk, offset))
+                        out.push_back({page, chunk, offset, mapped->second});
+                }
+                if (page > UINT64_MAX - kPage) break;
+            }
+        }
+        return out;
+    }
+
     // The home of the page at `va`, mapped (its host bytes): the title's bytes as the GPU reads them at the title's
     // address. Null when the page is not mapped.
     std::uint8_t* home_bytes(std::uint64_t va) {
@@ -248,12 +291,14 @@ public:
         return units_[home->second.unit].host + std::size_t(home->second.slot) * kPage;
     }
 
-    // What the GPU wrote into the homes of the mirrored pages of [begin, end) goes to the title's pages, merged at the
-    // 256-byte piece against the sums both sides last agreed on: a piece only the GPU changed is written back with
-    // `write(va, bytes, n)` (and agreed on again); a piece only the title changed waits for the upload; a piece both
-    // changed keeps the title's bytes and is counted. staged(page) gives the page's home as the GPU left it (a copy the
-    // caller made once the submissions that could write it completed, with nothing filled since), or nullptr to skip
-    // the page. Returns the bytes written back.
+    // What the GPU wrote into the homes of the mirrored pages of [begin, end) goes back to each page's physical frame,
+    // merged at the 256-byte piece against the sums both sides last agreed on: a piece only the GPU changed is written
+    // back with `write(frame_dst, bytes, n)` (and agreed on again); a piece only the title changed waits for the
+    // upload; a piece both changed keeps the title's bytes and is counted. `write` receives the physical frame address
+    // (`mapped->second + k * kPiece`, identical to the title VA for ordinary memory and the writable scratch view for
+    // xmem physical pages), so a concurrent CPU remap of `va` never receives the previous mapping's bytes. Pages with
+    // an unflushed bind in pending_ are skipped. `staged(page)` gives the page's home as the GPU left it, or nullptr to
+    // skip the page. Returns the bytes written back.
     // The same, reading each home where it lies (host memory: the tests' homes; the device copies its homes out first).
     template <class Write>
     std::uint64_t write_back(std::uint64_t begin, std::uint64_t end, Write&& write) {
@@ -262,39 +307,76 @@ public:
     }
     template <class Staged, class Write>
     std::uint64_t write_back(std::uint64_t begin, std::uint64_t end, Staged&& staged, Write&& write) {
+        if (begin >= end) return 0;
         std::uint64_t written = 0;
-        alignas(64) std::uint8_t title[kPiece];
+        std::vector<std::uint8_t*> refilter_frames;
         for (std::uint64_t page = begin & ~(kPage - 1); page < end; page += kPage) {
-            const auto mapped = pages_.find(page);
-            if (mapped == pages_.end()) continue;
+            if (!has_pending(page)) {
+                const auto mapped = pages_.find(page);
+                if (mapped != pages_.end()) {
+                    const auto found = homes_.find(mapped->second);
+                    if (found != homes_.end()) {
+                        if (const std::uint8_t* gpu = staged(page)) {
+                            const std::size_t k0 = std::size_t((std::max(begin, page) - page) / kPiece);
+                            const std::size_t k1 = std::size_t((std::min(end, page + kPage) - page + kPiece - 1) / kPiece);
+                            written += write_back_pieces(found->second, mapped->second, gpu, k0, k1, write,
+                                                         refilter_frames);
+                        }
+                    }
+                }
+            }
+            if (page > UINT64_MAX - kPage) break;
+        }
+        finish_write_back(written, refilter_frames);
+        return written;
+    }
+
+    // Batched multi-range write-back over `count` snapshotted HomeRefs whose GPU copies lie contiguously at
+    // `staged + i * kPage`. Skips any page that now has a pending bind or was remapped to a different physical frame
+    // since `homes_in_ranges()` snapshotted it.
+    template <class Write>
+    std::uint64_t write_back_batch(const HomeRef* batch, std::size_t count,
+                                   const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges,
+                                   const std::uint8_t* staged, Write&& write) {
+        if (!batch || !count || !staged || ranges.empty()) return 0;
+        const auto merged = merge_ranges(ranges);
+        if (merged.empty()) return 0;
+        std::uint64_t written = 0;
+        std::vector<std::uint8_t*> refilter_frames;
+        std::size_t cursor = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            const HomeRef& ref = batch[i];
+            if (i > 0 && ref.page < batch[i - 1].page) cursor = 0;
+            while (cursor < merged.size() && merged[cursor].second <= ref.page) ++cursor;
+            if (cursor >= merged.size()) break;
+            if (merged[cursor].first >= ref.page + kPage) continue;
+            if (has_pending(ref.page)) continue;
+            const auto mapped = pages_.find(ref.page);
+            if (mapped == pages_.end() || mapped->second != ref.frame) continue;
             const auto found = homes_.find(mapped->second);
             if (found == homes_.end()) continue;
-            Home& home = found->second;
-            const std::uint8_t* gpu = staged(page);
-            if (!gpu) continue;
-            const std::size_t k0 = std::size_t((std::max(begin, page) - page) / kPiece);
-            const std::size_t k1 = std::size_t((std::min(end, page + kPage) - page + kPiece - 1) / kPiece);
-            for (std::size_t k = k0; k < k1; ++k) {
-                const std::uint64_t agreed = home.sums[k];
-                const std::uint64_t now = shadow_keep::sum_of(gpu + k * kPiece, kPiece);
-                if (now == agreed) continue;  // the GPU did not change it
-                const std::uint8_t* from = mapped->second + k * kPiece;
-                if (!(hooks_.copy ? hooks_.copy(title, from, kPiece) : (std::memcpy(title, from, kPiece), true)))
-                    continue;  // the title's page went away
-                if (shadow_keep::sum_of(title, kPiece) != agreed) {
-                    ++counters_.conflicts;  // both changed it: the title's bytes win at the next upload
-                    continue;
+            const std::uint8_t* gpu = staged + i * kPage;
+            std::size_t next_k = 0;
+            for (std::size_t r = cursor; r < merged.size() && merged[r].first < ref.page + kPage; ++r) {
+                const std::uint64_t lo = std::max(merged[r].first, ref.page);
+                const std::uint64_t hi = std::min(merged[r].second, ref.page + kPage);
+                if (lo >= hi) continue;
+                const std::size_t k0 = std::max(next_k, std::size_t((lo - ref.page) / kPiece));
+                const std::size_t k1 = std::size_t((hi - ref.page + kPiece - 1) / kPiece);
+                if (k0 < k1) {
+                    written += write_back_pieces(found->second, mapped->second, gpu, k0, k1, write, refilter_frames);
+                    next_k = k1;
                 }
-                if (!write(page + k * kPiece, gpu + k * kPiece, kPiece)) continue;
-                home.sums[k] = now;
-                written += kPiece;
-                if (home.copy) home.refilter = true;  // the title's bytes changed: its filtered copy follows
             }
         }
-        counters_.written_back_bytes += written;
-        for (auto& [frame, home] : homes_)
-            if (home.refilter) fill_copy(home, frame, false);
+        finish_write_back(written, refilter_frames);
         return written;
+    }
+    template <class Write>
+    std::uint64_t write_back_batch(const std::vector<HomeRef>& batch,
+                                   const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges,
+                                   const std::uint8_t* staged, Write&& write) {
+        return write_back_batch(batch.data(), batch.size(), ranges, staged, std::forward<Write>(write));
     }
 
     // The binds noted since the last flush, as one batch signalling `value`. False when there were none (nothing to
@@ -406,17 +488,75 @@ private:
         std::uint64_t ticket;
     };
 
+    static std::vector<std::pair<std::uint64_t, std::uint64_t>> merge_ranges(
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> sorted;
+        sorted.reserve(ranges.size());
+        for (const auto& [b, e] : ranges)
+            if (b < e) sorted.emplace_back(b, e);
+        if (sorted.size() <= 1) return sorted;
+        std::sort(sorted.begin(), sorted.end());
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+        merged.reserve(sorted.size());
+        for (const auto& [b, e] : sorted) {
+            if (!merged.empty() && b <= merged.back().second) {
+                if (e > merged.back().second) merged.back().second = e;
+            } else {
+                merged.emplace_back(b, e);
+            }
+        }
+        return merged;
+    }
+
+    template <class Write>
+    std::uint64_t write_back_pieces(Home& home, std::uint8_t* frame, const std::uint8_t* gpu, std::size_t k0,
+                                    std::size_t k1, Write&& write, std::vector<std::uint8_t*>& refilter_frames) {
+        std::uint64_t written = 0;
+        alignas(64) std::uint8_t title[kPiece];
+        const auto frame_base = reinterpret_cast<std::uintptr_t>(frame);
+        for (std::size_t k = k0; k < k1; ++k) {
+            const std::uint64_t agreed = home.sums[k];
+            const std::uint64_t now = shadow_keep::sum_of(gpu + k * kPiece, kPiece);
+            if (now == agreed) continue;  // the GPU did not change it
+            const std::uint8_t* from = frame + k * kPiece;
+            if (!(hooks_.copy ? hooks_.copy(title, from, kPiece) : (std::memcpy(title, from, kPiece), true)))
+                continue;  // the title's page went away
+            if (shadow_keep::sum_of(title, kPiece) != agreed) {
+                ++counters_.conflicts;  // both changed it: the title's bytes win at the next upload
+                continue;
+            }
+            if (!write(static_cast<std::uint64_t>(frame_base + k * kPiece), gpu + k * kPiece, kPiece)) continue;
+            home.sums[k] = now;
+            written += kPiece;
+            if (home.copy && !home.refilter) {
+                home.refilter = true;  // the title's bytes changed: its filtered copy follows
+                refilter_frames.push_back(frame);
+            }
+        }
+        return written;
+    }
+
+    void finish_write_back(std::uint64_t written, const std::vector<std::uint8_t*>& refilter_frames) {
+        counters_.written_back_bytes += written;
+        for (std::uint8_t* frame : refilter_frames) {
+            const auto it = homes_.find(frame);
+            if (it != homes_.end() && it->second.refilter) fill_copy(it->second, frame, false);
+        }
+    }
+
     // Brings the home up to date with the title's page, piece by piece: `whole` (a new home) copies every piece, and
     // otherwise only a piece the title changed since both sides last agreed, so a piece only the GPU wrote keeps the
-    // GPU's bytes (and goes back with write_back). A piece both changed takes the title's bytes.
+    // GPU's bytes (and goes back with write_back). A piece both changed takes the title's bytes. Copies the whole 64 KiB
+    // page in one hooks_.copy call, falling back to per-piece copies only when the whole-page copy fails.
     void fill(Home& home, const std::uint8_t* frame, bool whole) {
         std::uint8_t* to = units_[home.unit].host + std::size_t(home.slot) * kPage;
-        alignas(64) std::uint8_t title[kPiece];
         bool failed = false;
         std::size_t changed = 0;
+        const bool whole_ok = hooks_.copy ? hooks_.copy(fill_scratch_.data(), frame, kPage)
+                                          : (std::memcpy(fill_scratch_.data(), frame, kPage), true);
         for (std::size_t k = 0; k < kPieces; ++k) {
-            const std::uint8_t* from = frame + k * kPiece;
-            if (!(hooks_.copy ? hooks_.copy(title, from, kPiece) : (std::memcpy(title, from, kPiece), true))) {
+            std::uint8_t* title = fill_scratch_.data() + k * kPiece;
+            if (!whole_ok && !hooks_.copy(title, frame + k * kPiece, kPiece)) {
                 std::memset(title, 0, kPiece);
                 failed = true;
             }
@@ -544,6 +684,7 @@ private:
     std::map<VkBuffer, std::map<VkDeviceSize, VkSparseMemoryBind>> alias_pending_;  // buffer -> offset -> next bind
     Counters counters_;
     std::size_t last_batch_ = 0;
+    alignas(64) std::array<std::uint8_t, kPage> fill_scratch_{};
 
 public:
     std::size_t last_batch() const { return last_batch_; }  // binds in the last flush()

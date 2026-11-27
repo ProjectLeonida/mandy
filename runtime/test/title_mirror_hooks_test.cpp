@@ -6,6 +6,7 @@
 //     home at the title's address keeps the title's bytes exactly and is written back as any page; unalias() unbinds
 //     the alias and frees the copies. Without an alias the batches are as before. The title's bytes are only written
 //     by write-back.
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -148,16 +149,19 @@ int filters() {
     EXPECT(mirror.home_bytes(kBase + 2 * kPage)[100] == 0xA5 && !mirror.copy_bytes(kBase + 2 * kPage));
     EXPECT(mirror.flush(1) && *f.read(arena, kAt + 100) == 0x5A);
     EXPECT(mirror.counters().filtered == 1 && mirror.counters().uploads == 2);
-    // Write-back: the aliased page's own home is the title's bytes, written back as any page; the title's bytes
-    // changed, so its copy is filtered again (not fresh).
+    // Write-back: the aliased page's own home is the title's bytes, written back to its physical frame as any page;
+    // the title's bytes changed, so its copy is filtered again (not fresh).
     std::size_t written = 0;
-    const auto write = [&](std::uint64_t va, const std::uint8_t* bytes, std::uint64_t n) {
-        std::memcpy(&frames[std::size_t(va - kBase)], bytes, std::size_t(n));
+    std::uint64_t last_dst = 0;
+    const auto write = [&](std::uint64_t dst, const std::uint8_t* bytes, std::uint64_t n) {
+        last_dst = dst;
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)), bytes, std::size_t(n));
         written += std::size_t(n);
         return true;
     };
     mirror.home_bytes(kBase)[300] = 0x77;  // a GPU store through a V# into the heap's page
     EXPECT(mirror.write_back(kBase, kBase + kPage, write) == 256 && written == 256 && frames[300] == 0x77);
+    EXPECT(last_dst == reinterpret_cast<std::uintptr_t>(&frames[0]) + 256);
     EXPECT(f.filtered.size() == 2 && !f.filtered[1].fresh && mirror.copy_bytes(kBase)[300] == 0x77);
     // A write and its refill: the home takes the title's bytes, the copy is filtered, not fresh.
     frames[200] = 0x11;
@@ -189,11 +193,248 @@ int filters() {
     return 0;
 }
 
+int pending_guard_and_frame_dest() {
+    Fixture f;
+    TitleMirror mirror(f.hooks());
+    EXPECT(mirror.cover(kBase, kBase + 4 * kPage));
+    std::vector<std::uint8_t> f_old(kPage, 0x11);
+    std::vector<std::uint8_t> f_new(kPage, 0x22);
+
+    // Map va -> F_old, flush: now flushed, visible to homes_in and write_back.
+    mirror.map(kBase, f_old.data(), nullptr, 1);
+    EXPECT(mirror.has_pending(kBase));
+    EXPECT(mirror.flush(1));
+    EXPECT(!mirror.has_pending(kBase));
+
+    // GPU writes to F_old's home: write_back must target F_old's physical frame address, NOT kBase (va).
+    mirror.home_bytes(kBase)[512] = 0x99;
+    std::uint64_t got_dst = 0;
+    const auto write_direct = [&](std::uint64_t dst, const std::uint8_t* bytes, std::size_t n) {
+        got_dst = dst;
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)), bytes, n);
+        return true;
+    };
+    EXPECT(mirror.write_back(kBase, kBase + kPage, write_direct) == 256);
+    EXPECT(got_dst == reinterpret_cast<std::uintptr_t>(f_old.data()) + 512);
+    EXPECT(got_dst != kBase + 512 && f_old[512] == 0x99);
+
+    // Remap va -> F_new WITHOUT flushing: chunk on GPU still holds F_old's bytes.
+    // Both homes_in() and write_back() MUST skip va so F_new is never overwritten with stale F_old bytes.
+    mirror.map(kBase, f_new.data(), nullptr, 2);
+    EXPECT(mirror.has_pending(kBase));
+    std::vector<std::uint64_t> pages;
+    mirror.homes_in(kBase, kBase + kPage, pages);
+    EXPECT(pages.empty());
+    EXPECT(mirror.homes_in_ranges({{kBase, kBase + kPage}}).empty());
+
+    std::size_t stale_writes = 0;
+    const auto staged_stale = [&](std::uint64_t) -> const std::uint8_t* { return f_old.data(); };
+    const auto count_writes = [&](std::uint64_t, const std::uint8_t*, std::size_t n) {
+        stale_writes += n;
+        return true;
+    };
+    EXPECT(mirror.write_back(kBase, kBase + kPage, staged_stale, count_writes) == 0);
+    EXPECT(stale_writes == 0 && f_new[0] == 0x22 && f_new[512] == 0x22);
+
+    // Once flushed, homes_in() and write_back() include va again and target F_new.
+    EXPECT(mirror.flush(2) && !mirror.has_pending(kBase));
+    mirror.homes_in(kBase, kBase + kPage, pages);
+    EXPECT(pages.size() == 1 && pages[0] == kBase);
+    mirror.home_bytes(kBase)[256] = 0x77;
+    got_dst = 0;
+    EXPECT(mirror.write_back(kBase, kBase + kPage, write_direct) == 256);
+    EXPECT(got_dst == reinterpret_cast<std::uintptr_t>(f_new.data()) + 256 && f_new[256] == 0x77);
+    std::printf("pending_guard_and_frame_dest: unflushed remaps skipped, write-back targets physical frame\n");
+    return 0;
+}
+
+int refilter_scaling() {
+    // 10,240 distinct homes + 1 aliased home, sharing a single 32 MiB dummy unit for the untouched homes so the test
+    // stays light in RAM while exercising O(changed) refiltering over >10,000 entries in homes_.
+    constexpr std::size_t kDummyHomes = 10240;
+    std::vector<std::uint8_t> shared_unit(TitleMirror::kUnitBytes, 0);
+    std::vector<std::uint8_t> aliased_unit(TitleMirror::kUnitBytes, 0);
+    std::uintptr_t next_handle = 0x2000;
+    std::size_t filter_calls = 0;
+    std::size_t units_made = 0;
+
+    leonida::TitleMirrorHooks h;
+    h.make_chunk = [&](std::uint64_t, std::uint64_t, VkBuffer& out) {
+        out = fake<VkBuffer>(next_handle++);
+        return true;
+    };
+    h.make_unit = [&](VkDeviceMemory& out, std::uint8_t*& host) {
+        out = fake<VkDeviceMemory>(next_handle++);
+        host = (units_made++ == 0) ? aliased_unit.data() : shared_unit.data();
+        return true;
+    };
+    h.free_unit = [](VkDeviceMemory) {};
+    h.bind = [](const std::vector<VkSparseBufferMemoryBindInfo>&, std::uint64_t) { return true; };
+    h.filter = [&](std::uint64_t, std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool) {
+        ++filter_calls;
+        std::memcpy(to, from, bytes);
+        return true;
+    };
+
+    TitleMirror mirror(std::move(h));
+    EXPECT(mirror.cover(kBase, kBase + (kDummyHomes + 4) * kPage));
+
+    std::vector<std::uint8_t> aliased_frame(kPage, 0x33);
+    const VkBuffer arena = fake<VkBuffer>(0x88);
+    mirror.alias(kBase, kBase + kPage, arena, 0);
+    mirror.map(kBase, aliased_frame.data(), nullptr, 1);
+    EXPECT(filter_calls == 1);
+
+    // Distinct frame pointers shifted by 1 byte each over a single (kPage + kDummyHomes) zero buffer.
+    std::vector<std::uint8_t> dummy_buf(kPage + kDummyHomes, 0);
+    for (std::size_t i = 0; i < kDummyHomes; ++i)
+        mirror.map(kBase + (i + 1) * kPage, dummy_buf.data() + i, nullptr, 1);
+    EXPECT(mirror.flush(1));
+    EXPECT(mirror.counters().homes == kDummyHomes + 1);
+
+    const auto noop_write = [](std::uint64_t dst, const std::uint8_t* bytes, std::size_t n) {
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)), bytes, n);
+        return true;
+    };
+    // 500 unchanged write-backs on 1 page must be O(1), not O(homes_.size()).
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 500; ++i) EXPECT(mirror.write_back(kBase, kBase + kPage, noop_write) == 0);
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    EXPECT(filter_calls == 1);
+
+    // One real GPU write to the aliased page triggers exactly one refilter.
+    mirror.home_bytes(kBase)[64] = 0x55;
+    EXPECT(mirror.write_back(kBase, kBase + kPage, noop_write) == 256);
+    EXPECT(aliased_frame[64] == 0x55 && filter_calls == 2 && mirror.copy_bytes(kBase)[64] == 0x55);
+    std::printf("refilter_scaling: 500 write_back calls over %zu homes in %lld ms, O(changed) refilter\n",
+                std::size_t(mirror.counters().homes), static_cast<long long>(elapsed_ms));
+    return 0;
+}
+
+int fill_copy_and_fallback() {
+    Fixture f;
+    auto h = f.hooks();
+    std::size_t whole_calls = 0, piece_calls = 0;
+    bool fail_whole = false;
+    std::size_t fail_piece_offset = ~std::size_t(0);
+    const std::uint8_t* tracked_frame = nullptr;
+    h.copy = [&](std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
+        if (bytes == kPage) {
+            ++whole_calls;
+            if (fail_whole) return false;
+            std::memcpy(to, from, bytes);
+            return true;
+        }
+        ++piece_calls;
+        if (tracked_frame && std::size_t(from - tracked_frame) == fail_piece_offset) return false;
+        std::memcpy(to, from, bytes);
+        return true;
+    };
+
+    TitleMirror mirror(std::move(h));
+    EXPECT(mirror.cover(kBase, kBase + 4 * kPage));
+    std::vector<std::uint8_t> frame(kPage, 0x42);
+    tracked_frame = frame.data();
+
+    // Fast path: 1 whole-page hooks_.copy call, 0 per-piece calls.
+    mirror.map(kBase, frame.data(), nullptr, 1);
+    EXPECT(whole_calls == 1 && piece_calls == 0 && mirror.counters().upload_failures == 0);
+    EXPECT(mirror.home_bytes(kBase)[0] == 0x42 && mirror.home_bytes(kBase)[kPage - 1] == 0x42);
+
+    // Dirty refill also uses 1 whole-page hooks_.copy call.
+    frame[1024] = 0x99;
+    EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
+    EXPECT(whole_calls == 2 && piece_calls == 0 && mirror.home_bytes(kBase)[1024] == 0x99);
+
+    // Fallback path: whole-page copy fails -> falls back to 256 per-piece copies; unreadable piece 5 is zeroed.
+    fail_whole = true;
+    fail_piece_offset = 5 * 256;
+    frame[0] = 0x77;
+    frame[5 * 256 + 10] = 0xAA;
+    frame[6 * 256 + 10] = 0xBB;
+    EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
+    EXPECT(whole_calls == 3 && piece_calls == kPage / 256 && mirror.counters().upload_failures == 1);
+    EXPECT(mirror.home_bytes(kBase)[0] == 0x77);
+    EXPECT(mirror.home_bytes(kBase)[5 * 256 + 10] == 0);
+    EXPECT(mirror.home_bytes(kBase)[6 * 256 + 10] == 0xBB);
+    std::printf("fill_copy_and_fallback: 1-shot 64 KiB copy on fast path, per-piece fallback on failure\n");
+    return 0;
+}
+
+int batched_write_back() {
+    Fixture f;
+    TitleMirror mirror(f.hooks());
+    EXPECT(mirror.cover(kBase, kBase + 6 * kPage));
+    std::vector<std::uint8_t> f0(kPage, 0x10), f1(kPage, 0x20), f2(kPage, 0x30), f3(kPage, 0x40), f4(kPage, 0x50);
+    mirror.map(kBase + 0 * kPage, f0.data(), nullptr, 1);
+    mirror.map(kBase + 1 * kPage, f1.data(), nullptr, 1);
+    mirror.map(kBase + 2 * kPage, f2.data(), nullptr, 1);
+    mirror.map(kBase + 3 * kPage, f3.data(), nullptr, 1);
+    EXPECT(mirror.flush(1));
+
+    // Make page 2 pending (unflushed remap): homes_in_ranges must skip it.
+    mirror.map(kBase + 2 * kPage, f4.data(), nullptr, 2);
+    EXPECT(mirror.has_pending(kBase + 2 * kPage));
+
+    // Unsorted, overlapping, and same-piece sub-ranges across pages 0, 1, 2, 3.
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges = {
+        {kBase + 3 * kPage + 256, kBase + 3 * kPage + 512},
+        {kBase + 0 * kPage + 128, kBase + 0 * kPage + 192},  // same piece 0 as below
+        {kBase + 0 * kPage + 0, kBase + 0 * kPage + 64},
+        {kBase + 0 * kPage + kPage - 64, kBase + 2 * kPage + 512},  // crosses page 0 -> 1 -> pending page 2
+    };
+    const auto refs = mirror.homes_in_ranges(ranges);
+    EXPECT(refs.size() == 3);
+    EXPECT(refs[0].page == kBase + 0 * kPage && refs[0].frame == f0.data() && refs[0].chunk != VK_NULL_HANDLE);
+    EXPECT(refs[1].page == kBase + 1 * kPage && refs[1].frame == f1.data());
+    EXPECT(refs[2].page == kBase + 3 * kPage && refs[2].frame == f3.data());
+
+    // Build contiguous staged buffer for the 3 snapshotted pages.
+    std::vector<std::uint8_t> staged(refs.size() * kPage);
+    std::memcpy(&staged[0 * kPage], f0.data(), kPage);
+    std::memcpy(&staged[1 * kPage], f1.data(), kPage);
+    std::memcpy(&staged[2 * kPage], f3.data(), kPage);
+
+    // GPU modified: page 0 piece 0 (covered by two sub-ranges -> must write ONCE), page 1 piece 2 (GPU-only),
+    // page 1 piece 3 (BOTH GPU and CPU modified -> conflict, CPU wins), page 3 piece 1 (GPU modified, but page 3 is
+    // remapped while mutex was released -> must be skipped!).
+    staged[0 * kPage + 10] = 0xA1;
+    staged[1 * kPage + 2 * 256 + 5] = 0xB2;
+    staged[1 * kPage + 3 * 256 + 5] = 0xB3;
+    f1[3 * 256 + 5] = 0xC3;  // CPU also modified piece 3 -> conflict
+    staged[2 * kPage + 1 * 256 + 5] = 0xD4;
+
+    // Simulate page 3 remapping & flushing while page_mirror.mutex was released during GPU readback wait.
+    std::vector<std::uint8_t> f3_new(kPage, 0x60);
+    mirror.map(kBase + 3 * kPage, f3_new.data(), nullptr, 3);
+    EXPECT(mirror.flush(3));
+
+    std::size_t write_calls = 0;
+    const auto write = [&](std::uint64_t dst, const std::uint8_t* bytes, std::size_t n) {
+        ++write_calls;
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)), bytes, n);
+        return true;
+    };
+    const std::uint64_t written = mirror.write_back_batch(refs, ranges, staged.data(), write);
+    EXPECT(written == 512 && write_calls == 2);
+    EXPECT(f0[10] == 0xA1);
+    EXPECT(f1[2 * 256 + 5] == 0xB2);
+    EXPECT(f1[3 * 256 + 5] == 0xC3);  // conflict kept CPU bytes
+    EXPECT(mirror.counters().conflicts == 1);
+    EXPECT(f3[1 * 256 + 5] == 0x40 && f3_new[1 * 256 + 5] == 0x60);  // remapped page 3 skipped
+    std::printf("batched_write_back: coalescing, dedup, conflict counting, and concurrent-remap skip ok\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     if (aliases()) return 1;
     if (filters()) return 1;
+    if (pending_guard_and_frame_dest()) return 1;
+    if (refilter_scaling()) return 1;
+    if (fill_copy_and_fallback()) return 1;
+    if (batched_write_back()) return 1;
     std::printf("title_mirror_hooks_test: ok\n");
     return 0;
 }
