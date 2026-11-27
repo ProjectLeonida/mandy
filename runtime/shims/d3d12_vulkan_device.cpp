@@ -10628,6 +10628,13 @@ public:
         if (device_.context.get() != &context || desc_.Properties.Type != D3D12_HEAP_TYPE_DEFAULT ||
             (desc_.Flags & denied) || host_address_) return {};
         std::lock_guard lock(backing_mutex_);
+        // A dedicated buffer tile allocation already live on this heap is reused when the new mask is compatible
+        // with its memory type; an incompatible mask is rejected. This precedes the arena check so a mixed mask
+        // (dedicated type + arena type) reuses the dedicated backing instead of failing on the arena branch.
+        if (!image && !arena_tiles_ && tile_allocation_ && !image_tiles_) {
+            if ((memory_types & (1u << tile_allocation_->memory_type)) != 0) return tile_allocation_;
+            return {};
+        }
         if (!image && device_.tiles_share_arena() && (memory_types & (1u << device_.arena.memory_type))) {
             if (tile_allocation_) return {};
             arena_tiles_ = true;
