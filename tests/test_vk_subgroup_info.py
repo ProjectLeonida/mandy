@@ -70,6 +70,9 @@ class FakeDevice:
         vk_info.VK_SHADER_STAGE_COMPUTE_BIT | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT
     )
     fragment_shader_barycentric: bool = True
+    geometry_shader: bool = True
+    task_shader: bool = False
+    mesh_shader: bool = False
     max_push_constants_size: int = 256
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
     vendor_id: int = 0
@@ -227,7 +230,11 @@ class FakeVulkan:
         seen_types = set()
         for stype, node_addr in self._iter_chain(addr):
             seen_types.add(stype)
-            if stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
+            if stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
+                ctypes.c_uint32.from_address(
+                    node_addr + vk_info.F2_GEOMETRY_SHADER
+                ).value = int(dev.geometry_shader)
+            elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
                 ctypes.c_uint32.from_address(
                     node_addr + vk_info.F12_SEPARATE_DEPTH_STENCIL_LAYOUTS
                 ).value = int(dev.separate_depth_stencil_layouts)
@@ -255,10 +262,17 @@ class FakeVulkan:
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.subgroup_size_control)
             elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR:
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.fragment_shader_barycentric)
+            elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT:
+                ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.task_shader)
+                ctypes.c_uint32.from_address(node_addr + 20).value = int(dev.mesh_shader)
+                ctypes.c_uint32.from_address(node_addr + 24).value = 0
+                ctypes.c_uint32.from_address(node_addr + 28).value = 0
+                ctypes.c_uint32.from_address(node_addr + 32).value = 0
         expected = {
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR,
+            vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,
         }
         if dev.api_version >= vk_info.VK_API_VERSION_1_3:
             expected.add(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
@@ -336,6 +350,7 @@ class ConstantsAndLayoutTest(unittest.TestCase):
         self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES, 1000225000)
         self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES, 1000196000)
         self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR, 1000203000)
+        self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT, 1000328000)
 
     def test_shader_stage_bits(self):
         self.assertEqual(vk_info.VK_SHADER_STAGE_COMPUTE_BIT, 0x20)
@@ -363,15 +378,18 @@ class ConstantsAndLayoutTest(unittest.TestCase):
         self.assertEqual(vk_info.F12_SIZE, 208)
         self.assertEqual(vk_info.F13_SIZE, 80)
         self.assertEqual(vk_info.BARY_FEATURES_SIZE, 24)
+        self.assertEqual(vk_info.MESH_FEATURES_SIZE, 40)
         self.assertEqual(vk_info.DRIVER_PROPS_SIZE, 536)
         self.assertEqual(vk_info.QUEUE_FAMILY_SIZE, 24)
 
     def test_feature_and_property_offsets(self):
+        self.assertEqual(vk_info.F2_GEOMETRY_SHADER, 16 + 4 * 4)
         self.assertEqual(vk_info.F12_SEPARATE_DEPTH_STENCIL_LAYOUTS, 16 + 4 * 35)
         self.assertEqual(vk_info.F12_TIMELINE_SEMAPHORE, 16 + 4 * 37)
         self.assertEqual(vk_info.F13_SUBGROUP_SIZE_CONTROL, 16 + 4 * 7)
         self.assertEqual(vk_info.F13_SYNCHRONIZATION2, 16 + 4 * 9)
         self.assertEqual(vk_info.F13_DYNAMIC_RENDERING, 16 + 4 * 12)
+        self.assertEqual(vk_info.MESH_FEATURES_MESH_SHADER, 20)
         self.assertEqual(vk_info.PROPS_API_VERSION, 0)
         self.assertEqual(vk_info.PROPS_VENDOR_ID, 8)
         self.assertEqual(vk_info.PROPS_DEVICE_ID, 12)
@@ -816,6 +834,9 @@ class QueryTest(unittest.TestCase):
                     "mesh_in_supported_stages": True,
                     "native64_compute": want_native64 or label == "missing_mesh_stage_bit",
                     "native64": want_native64,
+                    "mesh_shader": False,
+                    "fragment_shader_barycentric": True,
+                    "geometry_shader": True,
                     "per_vertex_inputs": True,
                     "barycentric_fallback": False,
                     "max_push_constants_size": 256,
@@ -825,6 +846,30 @@ class QueryTest(unittest.TestCase):
                     "rdna1_amd_windows": False,
                     "rdna2_amd_windows": False,
                 })
+
+    def test_mesh_shader_feature_query(self):
+        """mesh_shader requires VK_EXT_mesh_shader in device extensions and meshShader (offset 20, after taskShader)."""
+        v12_base = (b"VK_KHR_dynamic_rendering", b"VK_KHR_synchronization2")
+        cases = (
+            ("v13_without_extension", FakeDevice(mesh_shader=True), False),
+            ("v13_with_extension_and_feature", FakeDevice(extension_names=(b"VK_EXT_mesh_shader",),
+                                                          mesh_shader=True), True),
+            ("v13_task_only_mesh_zero", FakeDevice(extension_names=(b"VK_EXT_mesh_shader",),
+                                                   task_shader=True, mesh_shader=False), False),
+            ("v12_with_extension_and_feature", FakeDevice(api_version=vk_info.VK_API_VERSION_1_2,
+                                                          extension_names=v12_base + (b"VK_EXT_mesh_shader",),
+                                                          mesh_shader=True), True),
+            ("v12_without_extension", FakeDevice(api_version=vk_info.VK_API_VERSION_1_2,
+                                                 extension_names=v12_base,
+                                                 mesh_shader=True), False),
+            ("v12_task_only_mesh_zero", FakeDevice(api_version=vk_info.VK_API_VERSION_1_2,
+                                                   extension_names=v12_base + (b"VK_EXT_mesh_shader",),
+                                                   task_shader=True, mesh_shader=False), False),
+        )
+        for label, dev, want in cases:
+            with self.subTest(case=label):
+                res, _vk = self._run_query(dev)
+                self.assertIs(res["mesh_shader"], want)
 
     def test_max_push_constants_size(self):
         """limits.maxPushConstantsSize is read from VkPhysicalDeviceProperties (offset 328 on 64-bit)."""
@@ -879,6 +924,27 @@ class QueryTest(unittest.TestCase):
                 res, _vk = self._run_query(FakeDevice(driver_id=driver))
                 self.assertIs(res["barycentric_fallback"], want)
         self.assertEqual(vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, 6)
+
+    def test_barycentric_fallback_when_extension_missing_and_geometry_shader_supported(self):
+        """Devices without VK_KHR_fragment_shader_barycentric take --bary-fallback iff geometryShader is supported
+        (NVIDIA Pascal, Intel Gen9.5, older GCN; MoltenVK lacks geometryShader and stays False)."""
+        ext = (vk_info.FRAGMENT_SHADER_BARYCENTRIC_EXTENSION,)
+        cases = (
+            ("pascal_no_ext_with_gs", False, (), True, 4, False, False, True),
+            ("feature_bit_without_ext_with_gs", True, (), True, 3, False, False, True),
+            ("ext_listed_feature_zero_with_gs", False, ext, True, 4, False, False, True),
+            ("moltenvk_with_bary_no_gs", True, ext, False, vk_info.VK_DRIVER_ID_MOLTENVK, True, False, False),
+            ("moltenvk_without_bary_no_gs", False, (), False, vk_info.VK_DRIVER_ID_MOLTENVK, False, False, False),
+            ("turing_with_bary_and_gs", True, ext, True, 4, True, True, False),
+        )
+        for label, bary_bit, names, gs, drv, want_bary, want_pv, want_fb in cases:
+            with self.subTest(case=label):
+                res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary_bit, extension_names=names,
+                                                      geometry_shader=gs, driver_id=drv))
+                self.assertIs(res["fragment_shader_barycentric"], want_bary)
+                self.assertIs(res["geometry_shader"], gs)
+                self.assertIs(res["per_vertex_inputs"], want_pv)
+                self.assertIs(res["barycentric_fallback"], want_fb)
 
     def test_barycentric_fallback_rejects_an_intel_windows_fake(self):
         """Intel Windows uses its Windows driver ID, not ANV; the fake must carry Intel's vendor ID."""
