@@ -12,8 +12,10 @@
 //
 // Pure standard library, so the rule is tested without a GPU (title_upload_trim_test).
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 
 namespace leonida::title_upload_trim {
 
@@ -45,6 +47,34 @@ inline Settings settings_from(const char* idle_ms, const char* keep_mb) {
     s.keep_bytes = mb > (UINT64_MAX >> 20) ? UINT64_MAX : mb << 20;
     return s;
 }
+
+// A variable's value as an owned copy ("" when unset): getenv's result may be overwritten by the next getenv, and
+// the Windows CRT deprecates getenv for _dupenv_s.
+inline std::string env_copy(const char* name) {
+#if defined(_WIN32)
+    char* value = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&value, &length, name) != 0 || !value) return {};
+    std::string copy(value);
+    std::free(value);
+    return copy;
+#else
+    const char* value = std::getenv(name);
+    return value ? std::string(value) : std::string();
+#endif
+}
+
+// The settings from the environment; an unset variable is "", which gives its default.
+inline Settings settings_from_env() {
+    const std::string idle = env_copy("LEONIDA_TITLE_UPLOAD_IDLE_MS");
+    const std::string keep = env_copy("LEONIDA_TITLE_UPLOAD_KEEP_MB");
+    return settings_from(idle.c_str(), keep.c_str());
+}
+
+// Whether an upload of `bytes` counts as a use of its slot's large buffer. Only an upload over the size kept does:
+// small ones the slot also carries would otherwise keep a buffer left over from a burst of large textures for ever
+// (they go round the four slots, so every slot gets one now and then).
+inline bool counts_as_use(std::uint64_t bytes, const Settings& s) { return bytes > s.keep_bytes; }
 
 // Whether a slot's buffer is released now. `capacity`: its bytes (0: nothing to release); `last_used_ns`: when a
 // write last used it; `transfer_done`: its last transfer has completed (known without waiting).

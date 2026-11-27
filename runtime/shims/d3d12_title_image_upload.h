@@ -34,8 +34,7 @@ public:
     // Called from the periodic title-texture pass, so a burst of large uploads does not hold its buffers after it.
     template<class Device>
     void trim(Device& d) {
-        static const leonida::title_upload_trim::Settings settings = leonida::title_upload_trim::settings_from(
-            std::getenv("LEONIDA_TITLE_UPLOAD_IDLE_MS"), std::getenv("LEONIDA_TITLE_UPLOAD_KEEP_MB"));
+        const auto& settings = trim_settings();
         if (!settings.enabled()) return;
         const std::uint64_t now = now_ns();
         for (auto& slot : slots_) {
@@ -94,7 +93,8 @@ public:
         }
         Slot& slot = slots_[next_];
         if (!prepare(d, slot, bytes)) return false;
-        slot.last_used_ns = now_ns();
+        // Only a large upload keeps the slot's buffer: a small one fits the buffer trim() would leave behind.
+        if (leonida::title_upload_trim::counts_as_use(bytes, trim_settings())) slot.last_used_ns = now_ns();
         next_ = (next_ + 1) % kSlots;
         for (const auto& copy : regions_) {
             const auto level = copy.imageSubresource.mipLevel;
@@ -144,8 +144,13 @@ private:
         VkDeviceSize capacity = 0;
         VkCommandBuffer command{};
         std::uint64_t value = 0;  // the ready_ value its last transfer signals; 0: none submitted
-        std::uint64_t last_used_ns = 0;  // when write() last used it (steady clock)
+        std::uint64_t last_used_ns = 0;  // when write() last carried an upload over the size kept (steady clock)
     };
+
+    static const leonida::title_upload_trim::Settings& trim_settings() {
+        static const leonida::title_upload_trim::Settings settings = leonida::title_upload_trim::settings_from_env();
+        return settings;
+    }
 
     static std::uint64_t now_ns() {
         return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(

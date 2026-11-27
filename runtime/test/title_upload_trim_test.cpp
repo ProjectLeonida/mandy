@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 
 #define EXPECT(condition) do { \
@@ -69,10 +70,43 @@ int settings() {
     return 0;
 }
 
+// Only an upload over the size kept stamps the slot: small uploads going round the ring must not keep a large
+// buffer alive (lixonik's review of #2463).
+int uses() {
+    const tt::Settings s = tt::settings_from(nullptr, nullptr);
+    EXPECT(!tt::counts_as_use(1, s));
+    EXPECT(!tt::counts_as_use(4 * kMiB, s));
+    EXPECT(tt::counts_as_use(4 * kMiB + 1, s));
+    EXPECT(tt::counts_as_use(64 * kMiB, s));
+    // A 64 MiB slot last stamped by a large upload, then carrying 1 MiB uploads every 0.5 s: they do not stamp it,
+    // so 2 s after the large one it is released.
+    const std::uint64_t large_at = 1000 * kMs;
+    std::uint64_t last = large_at;
+    for (std::uint64_t t = large_at + 500 * kMs; t <= large_at + 2000 * kMs; t += 500 * kMs)
+        if (tt::counts_as_use(1 * kMiB, s)) last = t;
+    EXPECT(tt::release(64 * kMiB, last, large_at + 2000 * kMs, true, s));
+    return 0;
+}
+
+// Both variables are read, each copied before the next getenv.
+int environment() {
+#if defined(_WIN32)
+    _putenv_s("LEONIDA_TITLE_UPLOAD_IDLE_MS", "750");
+    _putenv_s("LEONIDA_TITLE_UPLOAD_KEEP_MB", "16");
+#else
+    setenv("LEONIDA_TITLE_UPLOAD_IDLE_MS", "750", 1);
+    setenv("LEONIDA_TITLE_UPLOAD_KEEP_MB", "16", 1);
+#endif
+    const tt::Settings s = tt::settings_from_env();
+    EXPECT(s.idle_ns == 750 * kMs);
+    EXPECT(s.keep_bytes == 16 * kMiB);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
-    if (defaults() || rule() || settings()) return 1;
+    if (defaults() || rule() || settings() || uses() || environment()) return 1;
     std::puts("title_upload_trim_test: ok");
     return 0;
 }
