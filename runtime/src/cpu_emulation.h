@@ -217,6 +217,48 @@ inline std::size_t readable(uint64_t addr, std::size_t want) {
     return got;
 }
 
+#if defined(_MSC_VER) && !defined(__clang__)
+inline LONG capture_exception_record(EXCEPTION_POINTERS* ep, EXCEPTION_RECORD* out) noexcept {
+    if (out && ep && ep->ExceptionRecord) *out = *ep->ExceptionRecord;
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+__declspec(noinline) inline void zero_64_volatile(volatile uint64_t* p) noexcept {
+    p[0] = 0;
+    p[1] = 0;
+    p[2] = 0;
+    p[3] = 0;
+    p[4] = 0;
+    p[5] = 0;
+    p[6] = 0;
+    p[7] = 0;
+}
+
+inline bool zero_line_seh(uint64_t addr, EXCEPTION_RECORD* fault) noexcept {
+    __try {
+        zero_64_volatile(reinterpret_cast<volatile uint64_t*>(addr));
+        return true;
+    } __except (capture_exception_record(GetExceptionInformation(), fault)) {
+        return false;
+    }
+}
+
+__declspec(noinline) inline uint8_t read_u8_volatile(const volatile uint8_t* p) noexcept { return *p; }
+
+inline std::size_t read_code_seh(uint64_t rip, uint8_t* out, std::size_t max_len) noexcept {
+    const auto* vp = reinterpret_cast<const volatile uint8_t*>(rip);
+    volatile std::size_t got = 0;
+    __try {
+        for (std::size_t i = 0; i < max_len; ++i) {
+            out[i] = read_u8_volatile(vp + i);
+            got = i + 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return got;
+}
+#endif
+
 inline uint64_t& lo(CONTEXT* c, int r) { return c->FltSave.XmmRegisters[r].Low; }
 inline uint64_t hi(const CONTEXT* c, int r) { return uint64_t(c->FltSave.XmmRegisters[r].High); }
 
@@ -247,6 +289,9 @@ inline bool apply(const Decoded& d, CONTEXT* c, EXCEPTION_RECORD* fault = nullpt
     }
     case Op::clzero: {
         const uint64_t addr = (d.addr32 ? (c->Rax & 0xFFFFFFFFu) : c->Rax) & ~uint64_t(63);
+#if defined(_MSC_VER) && !defined(__clang__)
+        if (!zero_line_seh(addr, fault)) return false;
+#else
         // The line's page is checked first instead of catching a fault from the write: a compiler may turn the
         // write into inline stores that a local __try does not cover (clang-cl without /EHa). A 64-byte aligned
         // line never spans two pages, so one query answers for all of it.
@@ -262,6 +307,7 @@ inline bool apply(const Decoded& d, CONTEXT* c, EXCEPTION_RECORD* fault = nullpt
             return false;
         }
         std::memset(reinterpret_cast<void*>(addr), 0, 64);
+#endif
         break;
     }
     case Op::mwaitx: YieldProcessor(); break;
@@ -354,8 +400,12 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     if (info->ExceptionRecord->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
     CONTEXT* c = info->ContextRecord;
     uint8_t code[15] = {};
+#if defined(_MSC_VER) && !defined(__clang__)
+    const std::size_t avail = read_code_seh(c->Rip, code, sizeof code);
+#else
     const std::size_t avail = readable(c->Rip, sizeof code);  // the instruction may end at a page boundary
     std::memcpy(code, reinterpret_cast<const void*>(c->Rip), avail);
+#endif
     const Decoded d = decode(code, avail);
     if (d.op == Op::none) return EXCEPTION_CONTINUE_SEARCH;
     EXCEPTION_RECORD fault;
