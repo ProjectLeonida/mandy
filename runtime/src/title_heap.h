@@ -50,7 +50,11 @@ public:
         hooks_ = std::move(hooks);
         free_runs_.clear();
         free_runs_[base_] = bytes_;
+        large_.clear();
+        for (auto& cls : classes_) cls.free.clear();
         span_class_.assign(bytes_ / kSpan, kNoClass);
+        span_live_.assign(bytes_ / kSpan, {});
+        stats_ = {};
         return true;
     }
     bool owns(const void* p) const {
@@ -68,6 +72,10 @@ public:
             if (cls.free.empty() && !grow(c)) return nullptr;
             const std::uintptr_t at = cls.free.back();
             cls.free.pop_back();
+            const std::size_t rel = at - base_;
+            const std::size_t s = rel / kSpan;
+            const std::size_t slot = (rel % kSpan) / class_size(c);
+            span_live_[s][slot / 64] |= std::uint64_t(1) << (slot % 64);
             ++stats_.live;
             return reinterpret_cast<void*>(at);
         }
@@ -92,11 +100,20 @@ public:
         std::lock_guard lock(mutex_);
         if (!owns(p)) return 0;
         if (const auto it = large_.find(at); it != large_.end()) return it->second;
-        const unsigned c = span_class_[(at - base_) / kSpan];
-        return c == kNoClass ? 0 : class_size(c);
+        const std::size_t rel = at - base_;
+        const std::size_t s = rel / kSpan;
+        if (s >= span_class_.size()) return 0;
+        const unsigned c = span_class_[s];
+        if (c == kNoClass) return 0;
+        const std::size_t size = class_size(c);
+        const std::size_t in_span = rel % kSpan;
+        if (in_span % size != 0) return 0;
+        const std::size_t slot = in_span / size;
+        if (slot >= kSpan / size) return 0;
+        return (span_live_[s][slot / 64] & (std::uint64_t(1) << (slot % 64))) ? size : 0;
     }
 
-    // Frees a block allocate() returned. False (nothing done) for any other pointer.
+    // Frees a block allocate() returned. False (nothing done) for any other pointer or an already-freed block.
     bool release(void* p) {
         const auto at = reinterpret_cast<std::uintptr_t>(p);
         std::lock_guard lock(mutex_);
@@ -111,8 +128,20 @@ public:
             give_run(at, bytes);
             return true;
         }
-        const unsigned c = span_class_[(at - base_) / kSpan];
-        if (c == kNoClass || (at - base_) % kSpan % class_size(c)) return false;
+        const std::size_t rel = at - base_;
+        const std::size_t s = rel / kSpan;
+        if (s >= span_class_.size()) return false;
+        const unsigned c = span_class_[s];
+        if (c == kNoClass) return false;
+        const std::size_t size = class_size(c);
+        const std::size_t in_span = rel % kSpan;
+        if (in_span % size != 0) return false;
+        const std::size_t slot = in_span / size;
+        if (slot >= kSpan / size) return false;
+        std::uint64_t& word = span_live_[s][slot / 64];
+        const std::uint64_t bit = std::uint64_t(1) << (slot % 64);
+        if ((word & bit) == 0) return false;
+        word &= ~bit;
         classes_[c].free.push_back(at);
         --stats_.live;
         return true;
@@ -155,11 +184,14 @@ private:
             give_run(at, kSpan);
             return false;
         }
-        span_class_[(at - base_) / kSpan] = std::uint8_t(c);
+        const std::size_t s = (at - base_) / kSpan;
+        span_class_[s] = std::uint8_t(c);
+        const std::size_t size = class_size(c);
+        const std::size_t slots = kSpan / size;
+        span_live_[s].assign((slots + 63) / 64, 0);
         stats_.committed += kSpan;
         ++stats_.spans;
-        const std::size_t size = class_size(c);
-        for (std::size_t off = kSpan / size * size; off >= size; off -= size) classes_[c].free.push_back(at + off - size);
+        for (std::size_t off = slots * size; off >= size; off -= size) classes_[c].free.push_back(at + off - size);
         return true;
     }
     // The first free run that holds `bytes` at an offset from the base aligned to `align` (spans are numbered from the
@@ -200,6 +232,7 @@ private:
     std::map<std::uintptr_t, std::size_t> free_runs_;  // start -> bytes
     std::map<std::uintptr_t, std::size_t> large_;      // a large block -> its bytes
     std::vector<std::uint8_t> span_class_;             // per span: its class, or kNoClass
+    std::vector<std::vector<std::uint64_t>> span_live_; // per active span: 1 bit per slot (1 = live, 0 = free)
     Class classes_[kClasses];
     Stats stats_;
 };
