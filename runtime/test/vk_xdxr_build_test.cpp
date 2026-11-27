@@ -5,6 +5,8 @@
 // against brute force (ctest runs both; see CMakeLists.txt).
 //
 // Cases: one triangle; five (two levels); 1000 random triangles; an indexed R16 grid with a 16-byte vertex stride;
+// R16 indices of an odd triangle count at an address 2 mod 4 (D3D12 asks only 2-byte alignment of them), which
+// end exactly at the end of their buffer;
 // R32 indices with R32G32 vertices; a geometry transform; two geometries with an inactive (NaN) triangle; no
 // triangles; 5000 triangles (many radix-sort tiles); updates (refits) in place and into another buffer; clones and a
 // compaction (CopyRaytracingAccelerationStructure) with the postbuild size; a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS);
@@ -102,6 +104,7 @@ struct Geometry {
     bool xy = false;
     std::vector<std::uint32_t> indices;       // empty = none
     bool u16 = false;
+    std::uint32_t index_lead = 0;             // bytes before the first index in its buffer (2: an R16 buffer at 2 mod 4)
     bool transform = false;
     float m[12] = {};
     std::uint32_t triangle_count = 0;
@@ -160,15 +163,19 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
         keep.push_back(v);
         vertex_buffers.push_back(v);
         if (!geo.indices.empty()) {
-            Buffer ib = make(gpu, geo.indices.size() * 4);
+            const std::size_t index_bytes = geo.indices.size() * (geo.u16 ? 2 : 4);
+            Buffer ib = make(gpu, geo.index_lead + index_bytes);
             EXPECT(ib.buffer);
+            auto* at = static_cast<char*>(ib.map) + geo.index_lead;
             if (geo.u16) {
-                auto* p = static_cast<std::uint16_t*>(ib.map);
-                for (std::size_t i = 0; i < geo.indices.size(); ++i) p[i] = std::uint16_t(geo.indices[i]);
+                for (std::size_t i = 0; i < geo.indices.size(); ++i) {
+                    const auto v = std::uint16_t(geo.indices[i]);
+                    std::memcpy(at + 2 * i, &v, 2);
+                }
             } else {
-                std::memcpy(ib.map, geo.indices.data(), geo.indices.size() * 4);
+                std::memcpy(at, geo.indices.data(), index_bytes);
             }
-            d.indices = ib.address;
+            d.indices = ib.address + geo.index_lead;
             d.index_type = geo.u16 ? 1 : 2;
             keep.push_back(ib);
         }
@@ -359,6 +366,15 @@ int main(int argc, char** argv) {
     Geometry g16 = grid(12, 4, false);
     g16.u16 = true;
     if (build_blas(gpu, builder, dir, "blas_grid_u16_stride16", {g16}, grid16)) return 1;
+    {
+        Geometry odd = grid(7, 3, false);       // 98 triangles, less the last: 97, so 291 indices, 582 bytes
+        odd.u16 = true;
+        odd.index_lead = 2;
+        odd.indices.resize(odd.indices.size() - 3);
+        odd.triangle_count -= 1;
+        Built built;
+        if (build_blas(gpu, builder, dir, "blas_grid_u16_odd_offset2", {odd}, built)) return 1;
+    }
     if (build_blas(gpu, builder, dir, "blas_grid_u32_xy", {grid(9, 2, true)}, xy32)) return 1;
     Geometry gt = grid(6, 3, false);
     gt.transform = true;

@@ -264,8 +264,13 @@ vec3 vertex(uint v) {
 uint index_of(uint i) {
     if (pc.arg2 == 0u) return i;
     if (pc.arg2 == 2u) return load(pc.src1, 4u * i);
-    uint word = load(pc.src1, 4u * (i >> 1));      // u16 indices: D3D12 requires 2-byte alignment; the word is aligned
-    return (i & 1u) != 0u ? word >> 16 : word & 0xffffu;
+    // u16 indices: D3D12 requires only 2-byte alignment, so index i is in the low or high half of the aligned word
+    // that holds it, by its own address (Words is 4-byte aligned; aligning down never borrows from the high word).
+    // That word may reach 2 bytes past the last index: the layer checks the index range rounded out to whole words
+    // (d3d12_vulkan_device.cpp, resolve_xdxr_build).
+    uvec2 a = add(pc.src1, 2u * i);
+    uint word = Words(uvec2(a.x & ~3u, a.y)).w[0];
+    return (a.x & 2u) != 0u ? word >> 16 : word & 0xffffu;
 }
 vec3 transformed(vec3 p) {
     if (is_null(pc.src2)) return p;

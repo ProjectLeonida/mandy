@@ -3917,10 +3917,16 @@ struct DeviceState {
                     return bvh_refuse(bvh_vertices, t.vertex_va, vertex_bytes), false;
                 t.vertex_va = out;
                 if (t.index_type && t.index_va) {
+                    // The builder reads R16 indices as the aligned 4-byte words that hold them (xdxr_build.comp
+                    // index_of), so their range is checked rounded out to whole words: an index buffer at 2 mod 4,
+                    // or an odd index count, reaches 2 bytes further on either side.
                     const std::uint64_t index_bytes = 3 * triangles * (t.index_type == 1 ? 2 : 4);
-                    if (!bvh_va(t.index_va, index_bytes, false, out))
+                    const std::uint64_t lead = t.index_type == 1 ? t.index_va & 3 : 0;
+                    const std::uint64_t words = t.index_type == 1 ? (lead + index_bytes + 3) & ~std::uint64_t(3)
+                                                                  : index_bytes;
+                    if (!bvh_va(t.index_va - lead, words, false, out))
                         return bvh_refuse(bvh_indices, t.index_va, index_bytes), false;
-                    t.index_va = out;
+                    t.index_va = out + lead;
                 }
                 if (t.transform_va) {
                     if (!bvh_va(t.transform_va, 48, false, out))

@@ -397,11 +397,27 @@ private:
         dispatch(cb, h, 1, false);
     }
 
+public:
+    // Vulkan guarantees 65535 workgroups along X (maxComputeWorkGroupCount[0]), and some devices (MoltenVK) allow
+    // no more. A step with more threads (a copy or refit moves one word a thread, so any structure over 16 MiB; a
+    // build of over 4M elements) is split into dispatches of at most this many groups.
+    static constexpr std::uint32_t max_groups = 65535;
+
+private:
     // One dispatch, then a compute-to-compute dependency so the next step sees its writes. The last step leaves the
-    // dependency on its results to the caller's barrier (the application's UAV or AS barrier).
+    // dependency on its results to the caller's barrier (the application's UAV or AS barrier). Past max_groups the
+    // dispatch is split with vkCmdDispatchBase, whose base offsets gl_WorkGroupID and gl_GlobalInvocationID, so every
+    // mode sees the ids one dispatch would give it.
     void dispatch(VkCommandBuffer cb, const Push& p, std::uint32_t threads, bool barrier = true) {
         vk_.vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push), &p);
-        vk_.vkCmdDispatch(cb, std::uint32_t((std::uint64_t(threads) + 63u) / 64u), 1, 1);
+        const std::uint64_t groups = (std::uint64_t(threads) + 63u) / 64u;
+        if (groups <= max_groups) {
+            vk_.vkCmdDispatch(cb, std::uint32_t(groups), 1, 1);
+        } else {
+            for (std::uint64_t first = 0; first < groups; first += max_groups)
+                vk_.vkCmdDispatchBase(cb, std::uint32_t(first), 0, 0,
+                                      std::uint32_t(std::min<std::uint64_t>(max_groups, groups - first)), 1, 1);
+        }
         if (!barrier) return;
         VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -414,7 +430,7 @@ private:
 #define LEONIDA_XDXR_FUNCTIONS(X)                                                                              \
     X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout)      \
     X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCmdBindPipeline) X(vkCmdPushConstants)                \
-    X(vkCmdDispatch) X(vkCmdPipelineBarrier)
+    X(vkCmdDispatch) X(vkCmdDispatchBase) X(vkCmdPipelineBarrier)
 #define LEONIDA_XDXR_MEMBER(name) PFN_##name name = nullptr;
         LEONIDA_XDXR_FUNCTIONS(LEONIDA_XDXR_MEMBER)
 #undef LEONIDA_XDXR_MEMBER
@@ -445,6 +461,7 @@ private:
         const aftermath::ShaderName aftermath_name("(runtime) xdxr_build.comp");
         if (vk_.vkCreateShaderModule(device_, &module_info, nullptr, &module) != VK_SUCCESS) return false;
         VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        info.flags = VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;   // dispatch() splits large steps with vkCmdDispatchBase
         info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
                       module, "main", nullptr};
         info.layout = layout_;
