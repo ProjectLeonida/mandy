@@ -178,7 +178,7 @@ int main() {
         EXPECT(policy.stats().hot == kHot && policy.stats().cold == kCold);
         for (std::size_t h = 0; h < kHot; ++h) EXPECT(policy.hot(kBase + h * kPage));
         EXPECT(!policy.hot(kBase + kHot * kPage));
-        // Steady-state benchmark: 50 submissions (collect + frame) with 100 hot + 10 cold writes each.
+        // Steady-state benchmark: 50 submissions (collect + frame) + periodic present_frame with 100 hot + 10 cold writes each.
         constexpr unsigned kIters = 50;
         const auto t0 = std::chrono::steady_clock::now();
         for (unsigned it = 0; it < kIters; ++it) {
@@ -193,6 +193,7 @@ int main() {
             });
             EXPECT(copied >= 10);  // at least the 10 cold pages (hot pages may skip during probe wait)
             policy.frame();
+            if ((it + 1) % 10 == 0) policy.present_frame();
         }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         const double per_iter_ms = ms / double(kIters);
@@ -208,6 +209,153 @@ int main() {
         EXPECT(policy.stats().demotions >= kHot);
         policy.remove(kBase, kBase + 50 * kPage);
         EXPECT(policy.stats().cold == kTotal - 50);
+    }
+    {  // submission-hot threshold: kPromote == 3 of 8 promotes, 2 of 8 stays cold
+        Fake f;
+        Policy policy(f);
+        f.policy = &policy;
+        policy.add(kBase, kBase + 2 * kPage);
+        policy.collect([&](std::uintptr_t p) { f.take(p); });
+        // Page 0 written on 3 of 8 submissions; page 1 written on 2 of 8 submissions.
+        for (unsigned sub = 0; sub < 8; ++sub) {
+            if (sub == 0 || sub == 3 || sub == 6) f.write(kBase + sub, std::uint8_t(sub + 1));
+            if (sub == 0 || sub == 4) f.write(kBase + kPage + sub, std::uint8_t(sub + 1));
+            policy.collect([&](std::uintptr_t p) { f.take(p); });
+            EXPECT(f.same(kBase) && f.same(kBase + kPage));
+            policy.frame();
+        }
+        EXPECT(Policy::kPromote == 3);
+        EXPECT(policy.sub_hot(kBase) && policy.hot(kBase));
+        EXPECT(!policy.sub_hot(kBase + kPage) && !policy.hot(kBase + kPage));
+    }
+    {  // two-tier frame-hot policy: low-sub frames keep frame-hot pages unguarded; high-sub frames keep them guarded
+       // (no 30x/frame copy storm, zero missed mid-frame CPU writes), while sub-hot intra-frame rings stay unguarded.
+        Fake f;
+        Policy policy(f);
+        f.policy = &policy;
+        policy.add(kBase, kBase + 3 * kPage);
+        policy.collect([&](std::uintptr_t p) { f.take(p); });
+        // Phase 1: low-sub frames (4 subs/frame == kFrameHotMaxSubs). Page 0 written once per frame (sub 2 mid-frame):
+        // that is 2 writes per 8 submissions (< kPromote == 3, so NOT sub_hot), yet 4 of 4 frames (>= kFramePromote == 3,
+        // so frame_hot and unguarded on low-sub frames!).
+        for (unsigned frame = 1; frame <= 10; ++frame) {
+            for (unsigned sub = 0; sub < 4; ++sub) {
+                if (sub == 2) f.write(kBase + frame, std::uint8_t(frame));  // mid-frame write before sub 2
+                policy.collect([&](std::uintptr_t p) { f.take(p); });
+                EXPECT(f.same(kBase));
+                policy.frame();
+            }
+            policy.present_frame();
+        }
+        EXPECT(policy.frame_hot(kBase));
+        EXPECT(!policy.sub_hot(kBase));
+        EXPECT(policy.hot(kBase));  // unguarded on low-sub frames
+        const std::uint64_t faults_before_low = f.faults_by_page[kBase];
+        for (unsigned frame = 11; frame <= 15; ++frame) {
+            for (unsigned sub = 0; sub < 4; ++sub) {
+                if (sub == 2) f.write(kBase + frame, std::uint8_t(frame));
+                policy.collect([&](std::uintptr_t p) { f.take(p); });
+                EXPECT(f.same(kBase));
+                policy.frame();
+            }
+            policy.present_frame();
+        }
+        EXPECT(f.faults_by_page[kBase] == faults_before_low);  // zero faults while frame-hot on low-sub frames
+
+        // Phase 2: transition to high-sub gameplay (10 subs/frame > kFrameHotMaxSubs).
+        // Page 0 written once mid-frame (sub 5); page 1 written every other sub (sub-hot ring).
+        for (unsigned frame = 16; frame <= 20; ++frame) {
+            for (unsigned sub = 0; sub < 10; ++sub) {
+                if (sub == 5) f.write(kBase + frame * 16 + sub, std::uint8_t(frame ^ sub));
+                if (sub % 2 == 0) f.write(kBase + kPage + sub, std::uint8_t(frame + sub));
+                policy.collect([&](std::uintptr_t p) { f.take(p); });
+                EXPECT(f.same(kBase));
+                EXPECT(f.same(kBase + kPage));
+                policy.frame();
+            }
+            policy.present_frame();
+        }
+        EXPECT(policy.frame_hot(kBase));
+        EXPECT(!policy.hot(kBase));      // guarded on high-sub frames (no 10x redundant copies!)
+        EXPECT(policy.sub_hot(kBase + kPage) && policy.hot(kBase + kPage));  // sub-hot ring stays unguarded
+
+        // Verify page 0 is copied only once (not 10x) during a 10-sub frame with 1 mid-frame write.
+        std::uint64_t p0_copies = 0;
+        for (unsigned sub = 0; sub < 10; ++sub) {
+            if (sub == 7) f.write(kBase + 500, 0xCC);
+            policy.collect([&](std::uintptr_t p) {
+                if (p == kBase) ++p0_copies;
+                f.take(p);
+            });
+            EXPECT(f.same(kBase));
+            policy.frame();
+        }
+        policy.present_frame();
+        EXPECT(p0_copies == 1);
+
+        // Phase 3: return to low-sub frames and stop writing page 0 -> returns to unguarded then demotes after probe.
+        policy.collect([&](std::uintptr_t p) { f.take(p); });
+        policy.frame();
+        policy.present_frame();
+        EXPECT(policy.frame_hot(kBase) && policy.hot(kBase));
+        for (unsigned frame = 0; frame < 2 * Policy::kFrameProbe; ++frame) {
+            policy.collect([&](std::uintptr_t p) { f.take(p); });
+            policy.frame();
+            policy.present_frame();
+        }
+        EXPECT(!policy.frame_hot(kBase));
+        EXPECT(!policy.hot(kBase));
+        EXPECT(policy.stats().frame_demotions >= 1);
+    }
+    {  // batched arming: Guard with arm_batch() receives sorted pages in one call per collect(), handles partial refusal
+        struct BatchGuard {
+            std::set<std::uintptr_t> armed;
+            std::uintptr_t refuse_page = 0;
+            std::uint64_t single_arms = 0, batch_calls = 0, batch_pages = 0;
+            bool sorted_ok = true;
+
+            bool arm(std::uintptr_t page) {
+                ++single_arms;
+                if (page == refuse_page) return false;
+                armed.insert(page);
+                return true;
+            }
+            void arm_batch(const std::uintptr_t* pages, std::uint8_t* results, std::size_t count) {
+                ++batch_calls;
+                batch_pages += count;
+                for (std::size_t i = 0; i < count; ++i) {
+                    if (i > 0 && pages[i] <= pages[i - 1]) sorted_ok = false;
+                    if (pages[i] == refuse_page) {
+                        results[i] = 0;
+                    } else {
+                        armed.insert(pages[i]);
+                        results[i] = 1;
+                    }
+                }
+            }
+            void disarm(std::uintptr_t page) { armed.erase(page); }
+        } bg;
+
+        leonida::TitleWritePolicy<BatchGuard> policy(bg);
+        policy.add(kBase, kBase + 16 * kPage);
+        bg.refuse_page = kBase + 5 * kPage;
+        std::vector<std::uintptr_t> copied;
+        policy.collect([&](std::uintptr_t p) { copied.push_back(p); });
+        EXPECT(copied.size() == 16);
+        EXPECT(bg.single_arms == 0 && bg.batch_calls == 1 && bg.batch_pages == 16 && bg.sorted_ok);
+        EXPECT(policy.stats().batched_arm_calls == 1 && policy.stats().arm_failures == 1);
+        EXPECT(bg.armed.size() == 15 && !bg.armed.count(kBase + 5 * kPage));
+
+        // Next collect retries only the refused page (5) plus newly written pages (10, 2) in sorted order.
+        bg.refuse_page = 0;
+        policy.written(kBase + 10 * kPage);
+        policy.written(kBase + 2 * kPage);
+        copied.clear();
+        policy.collect([&](std::uintptr_t p) { copied.push_back(p); });
+        EXPECT(copied.size() == 3 && copied[0] == kBase + 2 * kPage && copied[1] == kBase + 5 * kPage &&
+               copied[2] == kBase + 10 * kPage);
+        EXPECT(bg.batch_calls == 2 && bg.batch_pages == 19 && bg.sorted_ok);
+        EXPECT(bg.armed.size() == 16);
     }
     if (failures) return 1;
     std::puts("title write policy: hot pages stop faulting, cold pages fault once an interval, nothing missed");
