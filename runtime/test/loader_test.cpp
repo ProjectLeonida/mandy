@@ -23,6 +23,7 @@
 #include "../shims/shims.h"
 #include "../src/pe_loader.h"
 #include "free_image_base.h"
+#include "test_temp_dir.h"
 
 namespace {
 
@@ -1353,7 +1354,12 @@ std::filesystem::path work_dir() {
     std::filesystem::path base;
     if (_wdupenv_s(&env, &size, L"LEONIDA_TEST_DIR") == 0 && env && *env) base = env;
     std::free(env);
-    if (base.empty()) base = std::filesystem::temp_directory_path();
+    if (base.empty()) {
+        // writable_temp_dir() first: with TMP/TEMP/USERPROFILE unset, temp_directory_path() names C:\Windows,
+        // where the image folder cannot be created; the current directory is the last resort.
+        base = testfiles::writable_temp_dir();
+        if (base.empty()) base = L".";
+    }
     return base / "leonida_loader_test" / std::to_string(GetCurrentProcessId());
 }
 

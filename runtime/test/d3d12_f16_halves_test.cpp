@@ -13,6 +13,7 @@
 // Skips (77) when no usable Vulkan 1.3 device is present. No game data.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
+#include "test_temp_dir.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
@@ -247,8 +248,12 @@ int main() {
     const auto vs_low_c = shader_container(vs_low_prog);
     const auto ps_low_c = shader_container(ps_low_prog);
 
-    const auto lib_dir = std::filesystem::temp_directory_path() / "leonida_f16_halves_gpu_test";
-    std::filesystem::create_directories(lib_dir);
+    const testfiles::ScratchDir lib_scratch("leonida_f16_halves_gpu_test");  // removed on every way out of main
+    const auto& lib_dir = lib_scratch.path();
+    if (!std::filesystem::is_directory(lib_dir)) {
+        std::fprintf(stderr, "SKIP: no writable directory for the shader library\n");
+        return 77;
+    }
     write_spv(lib_dir / "vs_16p.spv", make_16param_vs());
     write_spv(lib_dir / "vs_10p.spv", make_10param_vs());
     write_spv(lib_dir / "ps_packed.spv", make_f16_ps(15, 20, 21));

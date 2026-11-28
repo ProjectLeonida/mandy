@@ -1890,7 +1890,7 @@ if(BUILD_TESTING)
     # game's exact exit code comes back through the relaunch.
     add_test(NAME run_tiny_first_run_ui COMMAND gta6rt --first-run-ui $<TARGET_FILE:tiny_game> -- hello 42 first-run-ui)
     set_tests_properties(run_tiny_first_run_ui PROPERTIES
-      ENVIRONMENT "LEONIDA_ARENA_MB=768;LEONIDA_D3D12=;LEONIDA_PIPELINE_COMPILE=;LEONIDA_KEYBOARD_PAD="
+      ENVIRONMENT "LEONIDA_ARENA_MB=768;LEONIDA_D3D12=;LEONIDA_PIPELINE_COMPILE=;LEONIDA_KEYBOARD_PAD=;TMP=${CMAKE_CURRENT_BINARY_DIR};TEMP=${CMAKE_CURRENT_BINARY_DIR}"
       PASS_REGULAR_EXPRESSION "tiny_game: PASS first-run UI caller override"
       FAIL_REGULAR_EXPRESSION "tiny_game: FAIL")
     add_test(NAME run_tiny_game_fixed COMMAND gta6rt --run $<TARGET_FILE:tiny_game_fixed> -- hello 42)
@@ -1931,6 +1931,17 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_game_dir COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_game_dir.cmake")
+    # These run gta6rt, which the test exes' test_temp_dir.h cannot reach: with TMP/TEMP/USERPROFILE unset,
+    # GetTempPathW names C:\Windows, where neither the guest's file round trip nor the loader's TLS clone directory
+    # can write. Point TMP/TEMP at the build folder, which is always writable (run_tiny_first_run_ui keeps its own
+    # variables, merged into its ENVIRONMENT above).
+    foreach(test_name run_tiny_game run_tiny_game_console_paths run_tiny_game_exit_code
+            run_tiny_game_abort_exit_codes run_tiny_game_fixed run_tiny_game_fixed_exit_code run_tiny_game_tls
+            run_tiny_game_eh run_tiny_game_ga_tls run_tiny_game_stack run_tiny_tls_ga
+            run_tiny_tls_clone_cleanup run_tiny_game_dir run_startup_cmdline)
+      set_tests_properties(${test_name} PROPERTIES
+        ENVIRONMENT "TMP=${CMAKE_CURRENT_BINARY_DIR};TEMP=${CMAKE_CURRENT_BINARY_DIR}")
+    endforeach()
   endif()
   if(TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)

@@ -14,6 +14,7 @@
 #include "vk_test_device.h"
 #include "host_wine.h"
 #include "d3d12_test_shaders.h"
+#include "test_temp_dir.h"
 #include "../shims/d3d12_com.h"
 #include "../src/shader_library.h"
 
@@ -547,8 +548,12 @@ int main() {
 
     const auto vs_program = d3d12test::fssm_program({0x56530501, 0xbf810000});
     const auto ps_program = d3d12test::fssm_program({0x50530501, 0xbf810000});
-    const auto library = std::filesystem::temp_directory_path() / "leonida_state_sweep_test";
-    std::filesystem::create_directories(library);
+    const testfiles::ScratchDir library_scratch("leonida_state_sweep_test");  // removed on every way out of main
+    const auto& library = library_scratch.path();
+    if (!std::filesystem::is_directory(library)) {
+        std::fprintf(stderr, "SKIP: no writable directory for the shader library\n");
+        return 77;
+    }
     const auto overwrite = std::filesystem::copy_options::overwrite_existing;
     std::filesystem::copy_file(LEONIDA_SWEEP_VS_SPV, library / "vs.spv", overwrite);
     std::filesystem::copy_file(LEONIDA_SWEEP_PS_SPV, library / "ps.spv", overwrite);

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "pe_loader.h"
+#include "test_temp_dir.h"
 
 // The CRT's record of the module TLS index Windows gave this EXE.
 extern "C" unsigned long _tls_index;
@@ -60,7 +61,10 @@ void write_file(const fs::path& path, const void* data, size_t size) {
 struct TempDir {
     fs::path path;
     TempDir() {
-        path = fs::temp_directory_path() / ("leonida_loader_tls_test_" + std::to_string(GetCurrentProcessId()));
+        // writable_temp_dir(), not temp_directory_path(): with TMP/TEMP/USERPROFILE unset the latter names
+        // C:\Windows, where the folder cannot be created.
+        path = testfiles::writable_temp_dir() /
+               ("leonida_loader_tls_test_" + std::to_string(GetCurrentProcessId()));
         std::error_code ec;
         fs::remove_all(path, ec);
         fs::create_directories(path);
@@ -706,12 +710,15 @@ struct ChildProcess {
 std::vector<fs::path> own_clone_files() {
     const std::wstring own = L"leonida_tls_host_" + std::to_wstring(GetCurrentProcessId()) + L"_";
     std::vector<fs::path> found;
+    std::error_code ec;
+    const auto temp = fs::temp_directory_path(ec);  // the loader's clone root; empty when GetTempPathW fails
+    if (ec || temp.empty()) return found;
     WIN32_FIND_DATAW fd{};
-    HANDLE h = FindFirstFileW((fs::temp_directory_path() / (own + L"*.dll")).c_str(), &fd);
+    HANDLE h = FindFirstFileW((temp / (own + L"*.dll")).c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return found;
     do {
         if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
-            found.push_back(fs::temp_directory_path() / fd.cFileName);
+            found.push_back(temp / fd.cFileName);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
     return found;
@@ -726,7 +733,9 @@ void test_purge_ownership_scoping(const fs::path& dll, const fs::path& temp) {
     dead.end();
     ChildProcess live;
 
-    const fs::path clone_root = fs::temp_directory_path();
+    std::error_code temp_ec;
+    const fs::path clone_root = fs::temp_directory_path(temp_ec);
+    if (temp_ec || clone_root.empty()) throw std::runtime_error("no temp directory for the clone files");
     // An own-PID name stands in for a leftover of a dead run whose PID this process reused: the sweep runs before
     // this process has created any clone, so such a file is always ownerless here.
     const fs::path stale_file = clone_root / (L"leonida_tls_host_" + std::to_wstring(GetCurrentProcessId()) + L"_31.dll");

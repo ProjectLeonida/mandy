@@ -24,6 +24,7 @@
 #include "file_system.h"
 #include "shims.h"
 #include "startup_trace.h"
+#include "test_temp_dir.h"
 
 namespace {
 
@@ -326,9 +327,12 @@ int main() {
     // the process id alone can be one an earlier run left behind.
     LARGE_INTEGER now{};
     QueryPerformanceCounter(&now);
+    // writable_temp_dir() first: with TMP/TEMP/USERPROFILE unset, temp_directory_path() names C:\Windows, where
+    // the folder cannot be created (and where temp_directory_path() itself can throw before the try below).
     const std::filesystem::path root =
-        std::filesystem::temp_directory_path() / ("leonida_file_system_" + std::to_string(GetCurrentProcessId()) +
-                                                  "_" + std::to_string(now.QuadPart));
+        testfiles::writable_temp_dir() /
+        ("leonida_file_system_" + std::to_string(GetCurrentProcessId()) +
+         "_" + std::to_string(now.QuadPart));
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
     // An exception from one check (std::filesystem throws on a host error) ends the checks, not the run: it is a

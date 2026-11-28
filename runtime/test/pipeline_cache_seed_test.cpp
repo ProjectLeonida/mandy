@@ -12,6 +12,7 @@
 // a cache this device wrote itself a moment before.
 #include "../shims/d3d12_com.h"
 #include "../src/shader_library.h"
+#include "test_temp_dir.h"
 
 #include <wrl/client.h>
 

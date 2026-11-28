@@ -1,13 +1,25 @@
 #include "shader_fixture_path.h"
+#include "test_temp_dir.h"
 #include <cstdio>
 #include <chrono>
 #include <fstream>
 
 int main() {
     namespace fs = std::filesystem;
-    const auto root = fs::temp_directory_path() / ("leonida_fixture_path_" +
+    // scratch_dir, not temp_directory_path()/create_directories: with TMP/TEMP/USERPROFILE unset the temp path is
+    // C:\Windows and the throwing create_directories below ended the run as 0xc0000409 before the try starts.
+    const auto root = testfiles::scratch_dir("leonida_fixture_path_" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    fs::create_directories(root / "generated");
+    if (root.empty()) {
+        std::puts("shader fixture lookup failed: no writable directory");
+        return 1;
+    }
+    std::error_code ec;
+    fs::create_directories(root / "generated", ec);
+    if (ec) {
+        std::puts("shader fixture lookup failed: cannot create the fixture folder");
+        return 1;
+    }
     const auto previous = fs::current_path();
     int result = 0;
     try {

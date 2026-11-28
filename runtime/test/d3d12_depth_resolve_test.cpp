@@ -22,6 +22,7 @@
 #include "../shims/d3d12_com.h"
 #if defined(LEONIDA_DEPTH_EDGE_VS_SPV)
 #include "d3d12_test_shaders.h"
+#include "test_temp_dir.h"
 #include "../src/shader_library.h"
 
 #include <d3dcompiler.h>
@@ -385,11 +386,15 @@ int main() {
     std::vector<std::uint8_t> root_blob, edge_container, edge_host_vs;
     rt::d3d12::VulkanDeviceInfo info{};
 #if defined(LEONIDA_DEPTH_EDGE_VS_SPV)
+    const testfiles::ScratchDir edge_library("leonida_depth_resolve_test");  // removed on every way out of main
     {
         const auto program = d3d12test::fssm_program({0x56530848, 0xbf810000});
         edge_container = d3d12test::shader_container(program);
-        const auto library = std::filesystem::temp_directory_path() / "leonida_depth_resolve_test";
-        std::filesystem::create_directories(library);
+        const auto& library = edge_library.path();
+        if (!std::filesystem::is_directory(library)) {
+            std::fprintf(stderr, "SKIP: no writable directory for the shader library\n");
+            return 77;
+        }
         std::filesystem::copy_file(LEONIDA_DEPTH_EDGE_VS_SPV, library / "vs.spv",
                                    std::filesystem::copy_options::overwrite_existing);
         std::ofstream index(library / "index.json", std::ios::binary);

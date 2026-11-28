@@ -14208,8 +14208,18 @@ struct ShaderCacheStore {
 std::filesystem::path default_shader_cache_dir() {
     std::error_code ec;
     const auto tmp = std::filesystem::temp_directory_path(ec);
-    if (ec || tmp.empty()) return {};
-    return tmp / L"leonida_shader_cache";
+    if (!ec && !tmp.empty()) {
+        // temp_directory_path() names C:\Windows when TMP/TEMP/USERPROFILE are all unset; probe the folder it
+        // would make instead of finding out at the first StoreValue.
+        const auto dir = tmp / L"leonida_shader_cache";
+        ec.clear();
+        std::filesystem::create_directories(dir, ec);
+        if (!ec) return dir;
+    }
+    // No usable temp directory: the working directory, where USE_WORKING_DIR sessions already write.
+    const auto cwd = std::filesystem::current_path(ec);
+    if (!ec && !cwd.empty()) return cwd / L"leonida_shader_cache";
+    return {};
 }
 
 struct ShaderCacheRegistry {

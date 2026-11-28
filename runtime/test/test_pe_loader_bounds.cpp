@@ -28,6 +28,8 @@
 #include "shims.h"
 #endif
 
+#include "test_temp_dir.h"
+
 namespace {
 
 int g_checks = 0;
@@ -984,10 +986,21 @@ int main() {
     std::printf("test_pe_loader_bounds: PE Loader boundary checks, virtual address range wrapping, and import table null termination\n");
 
     const char* env_dir = std::getenv("LEONIDA_TEST_DIR");
-    g_temp_dir = env_dir ? std::filesystem::path(env_dir)
-                         : std::filesystem::temp_directory_path() /
-                               ("leonida_pe_bounds_test_" + std::to_string(GetCurrentProcessId()));
-    std::filesystem::create_directories(g_temp_dir);
+    if (env_dir && *env_dir) {
+        g_temp_dir = std::filesystem::path(env_dir);
+    } else {
+        // writable_temp_dir() first: with TMP/TEMP/USERPROFILE unset, temp_directory_path() names C:\Windows,
+        // where create_directories throws before the try below and the run ends as 0xc0000409.
+        const auto base = testfiles::writable_temp_dir();
+        g_temp_dir = (base.empty() ? std::filesystem::path(".") : base) /
+                     ("leonida_pe_bounds_test_" + std::to_string(GetCurrentProcessId()));
+    }
+    std::error_code dir_ec;
+    std::filesystem::create_directories(g_temp_dir, dir_ec);
+    if (dir_ec) {
+        std::printf("cannot create %s: %s\n", g_temp_dir.string().c_str(), dir_ec.message().c_str());
+        return 1;
+    }
 
     try {
         test_range_wrapping_arithmetic();

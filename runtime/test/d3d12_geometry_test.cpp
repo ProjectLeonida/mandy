@@ -11,6 +11,7 @@
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
+#include "test_temp_dir.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
@@ -53,8 +54,11 @@ int main() {
     const auto ps_program = fssm_program({0x50530001, 0xbf810000});
     const auto vs_container = shader_container(vs_program), gs_container = shader_container(gs_program),
                ps_container = shader_container(ps_program);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_geometry_test";
-    std::filesystem::create_directories(library);
+    const auto library = testfiles::scratch_dir("leonida_geometry_test_" + std::to_string(GetCurrentProcessId()));
+    if (library.empty()) {
+        std::fprintf(stderr, "SKIP: no writable directory for the shader library\n");
+        return 77;
+    }
     std::filesystem::copy_file(LEONIDA_TEST_VS_SPV, library / "vs_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_GS_SPV, library / "gs_double.spv",
                                std::filesystem::copy_options::overwrite_existing);

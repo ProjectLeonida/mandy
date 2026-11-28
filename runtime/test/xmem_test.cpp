@@ -31,6 +31,7 @@
 #include "startup_trace.h"
 #include "xmem.h"
 #include "../src/title_page_watch.h"
+#include "test_temp_dir.h"
 
 // The process heap as test_heap_lock_faults needs it (the same gate as d3d12_existing_heap_test's): an allocation that
 // waits while a thread holds the heap's lock. The NT heap's low-fragmentation front end serves most small sizes

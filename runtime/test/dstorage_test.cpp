@@ -23,6 +23,7 @@
 #include "../src/title_page_watch.h"
 #include "xmem.h"
 #include "dstorage_xs_abi.h"
+#include "test_temp_dir.h"
 #include "dstorage_staging.h"
 #include "file_system.h"
 #include "shims.h"

@@ -23,6 +23,7 @@
 
 #include "file_system.h"
 #include "shims.h"
+#include "test_temp_dir.h"
 
 namespace {
 
@@ -554,7 +555,7 @@ void check_run_time_load() {
     const GUID pls_class = {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}};
     const GUID pls3 = {0x41a4e10c, 0x5a7e, 0x41d9, {0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6}};
     const std::filesystem::path scratch =
-        std::filesystem::temp_directory_path() / (L"gta6rt_pls_test_" + std::to_wstring(GetCurrentProcessId()));
+        testfiles::writable_temp_dir() / (L"gta6rt_pls_test_" + std::to_wstring(GetCurrentProcessId()));
     std::error_code scratch_ec;
     std::filesystem::remove_all(scratch, scratch_ec);
     rt::fs::configure(scratch / L"game", scratch / L"overlay");
@@ -1259,7 +1260,7 @@ int main() {
     }
     {
         namespace fs = std::filesystem;
-        const auto folder = fs::temp_directory_path() /
+        const auto folder = testfiles::writable_temp_dir() /
             (L"leonida_content_\u16a0_\U0001F680_" + std::to_wstring(GetCurrentProcessId()));
         std::error_code ec;
         const bool created = fs::create_directory(folder, ec);

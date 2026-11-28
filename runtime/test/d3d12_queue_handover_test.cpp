@@ -18,6 +18,7 @@
 // producer ran reads a zero-filled texture and fails here (and with LEONIDA_VK_VALIDATION=1 under sync validation).
 // No game data.
 #include "vk_test_device.h"
+#include "test_temp_dir.h"
 #include "../shims/d3d12_com.h"
 
 #include <dxgi1_4.h>
@@ -385,15 +386,27 @@ bool cpu_gate(Rig& rig, Type producer, Type consumer, bool signal_first, int see
     return c.wait_fence(2, 1) && c.verify();
 }
 
-// Runs `body` with stderr redirected to a file and returns what it wrote.
+// Runs `body` with stderr redirected to a file and returns what it wrote. A string starting with '<' reports that
+// the capture itself failed: the callers look for the layer's report in the result, so it fails the case loudly
+// instead of reading an empty capture as "the layer said nothing". The file goes to writable_temp_dir() because
+// GetTempPathA/GetTempFileNameA name C:\Windows when TMP/TEMP/USERPROFILE are unset and _sopen_s then fails.
 std::string capture_stderr(const std::function<void()>& body) {
-    char dir[MAX_PATH], path[MAX_PATH];
-    GetTempPathA(MAX_PATH, dir);
-    GetTempFileNameA(dir, "qho", 0, path);
+    static std::atomic<int> capture_id{0};
+    const auto dir = testfiles::writable_temp_dir();
+    if (dir.empty()) return "<stderr capture unavailable: no writable directory>";
+    const auto path = dir / ("leonida_queue_handover_" + std::to_string(GetCurrentProcessId()) + "_" +
+                             std::to_string(capture_id.fetch_add(1)) + ".log");
+    const std::string path_text = path.string();
     std::fflush(stderr);
     const int saved = _dup(2);
     int file = -1;
-    _sopen_s(&file, path, _O_RDWR | _O_CREAT | _O_TRUNC | _O_BINARY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
+    if (saved < 0 || _sopen_s(&file, path_text.c_str(), _O_RDWR | _O_CREAT | _O_TRUNC | _O_BINARY, _SH_DENYNO,
+                              _S_IREAD | _S_IWRITE) != 0 ||
+        file < 0) {
+        if (file >= 0) _close(file);
+        if (saved >= 0) _close(saved);
+        return "<stderr capture unavailable: cannot open " + path_text + ">";
+    }
     _dup2(file, 2);
     body();
     std::fflush(stderr);
@@ -402,13 +415,13 @@ std::string capture_stderr(const std::function<void()>& body) {
     _close(file);
     std::string text;
     FILE* f = nullptr;
-    if (fopen_s(&f, path, "rb") == 0 && f) {
+    if (fopen_s(&f, path_text.c_str(), "rb") == 0 && f) {
         char buffer[512];
         std::size_t n;
         while ((n = std::fread(buffer, 1, sizeof(buffer), f)) > 0) text.append(buffer, n);
         std::fclose(f);
     }
-    std::remove(path);
+    std::remove(path_text.c_str());
     return text;
 }
 

@@ -33,6 +33,7 @@
 #include <thread>
 
 #include "pe_loader.h"
+#include "test_temp_dir.h"  // sets TMP/TEMP to a writable folder before main when the env gives none
 
 extern "C" unsigned long _tls_index;  // this EXE's module TLS index, read through its TLS directory's AddressOfIndex
 

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "../src/title_page_watch.h"
+#include "test_temp_dir.h"
 
 namespace {
 

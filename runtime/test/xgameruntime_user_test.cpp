@@ -18,6 +18,7 @@
 #include <XTaskQueue.h>
 
 #include "shims.h"
+#include "test_temp_dir.h"
 
 namespace rt::shims {
 long xgameruntime_user_open_handles();
