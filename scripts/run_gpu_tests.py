@@ -1230,7 +1230,7 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
                       "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w64x_partial_swizzle", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_barrier_early_end",
 "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_w64x_cmp_sdst", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_wrxchg2_ext", "cs_w32_wrxchg2st64", "cs_w32_andn2_exec",
-                      "cs_mask_vgpr_exec", "cs_w32_exec_computed", "cs_w64_exec_computed"):
+                      "cs_mask_vgpr_exec", "cs_w32_exec_computed", "cs_w64_exec_computed", "cs_buf_lds"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
@@ -1349,6 +1349,10 @@ def run_suite(a, work: str) -> int:
                 # inactive lanes keep the old VGPR (cs_mask_vgpr_exec.asm)
                 "cs_mask_vgpr_exec": [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
                                       0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF],
+                # MUBUF loads with `lds` (RDNA2 ISA 8.1.9, cs_buf_lds.asm): only lanes 0-1 store, four words
+                # each; the last word of a lane's four is lane t^1's dword slot
+                "cs_buf_lds": [0x5EED0000, 0x00000080, 0xFFFFFF80, 0x5EED0001,
+                               0x5EED0001, 0x00000081, 0xFFFFFF81, 0x5EED0000],
             }
             want = cs_dump_wants[name]
             # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 / cs_w32_permute /
@@ -1371,7 +1375,7 @@ def run_suite(a, work: str) -> int:
                                   "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_wrxchg2_ext", "cs_w32_wrxchg2st64", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
                                   "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_dpp_cmp", "cs_dpp_cmpx", "cs_w32_andn2_exec",
-                                  "cs_w32_exec_computed") and not emulated and not partial
+                                  "cs_w32_exec_computed", "cs_buf_lds") and not emulated and not partial
             if partial:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="32" if emulated else "64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)
