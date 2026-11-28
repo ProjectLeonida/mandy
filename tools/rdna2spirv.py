@@ -3220,9 +3220,10 @@ class Gen:
         dwords, low first) as one 32-bit atomic per dword, with no Int64 atomics. That leaves the same memory for a
         bitwise op, whose bits are independent, but not always for an exchange: two lanes swapping into one element at
         once can leave one's low dword with the other's high dword (A.lo, B.lo, B.hi, A.hi). The returned pair is two
-        reads, so another lane's 64-bit op on the same element between them could be seen half done. The other _x2
-        forms (add/sub/min/max carry or compare across the dwords, cmpswap_x2 compares all 64 bits) and inc/dec stay
-        Unsupported. fcmpswap compares as binary32 (float_cmpswap_loop)."""
+        reads, so another lane's 64-bit op on the same element between them could be seen half done. inc/dec wrap
+        against DATA through a CAS loop (atomic_inc_dec_cas), fmin/fmax through global_atomic_float. The other _x2
+        forms (add/sub/min/max/inc/dec carry or compare across the dwords, cmpswap_x2 compares all 64 bits)
+        stay Unsupported. fcmpswap compares as binary32 (float_cmpswap_loop)."""
         kind = op[len("global_atomic_"):]
         if kind in ("and_x2", "or_x2", "xor_x2", "swap_x2"):
             return self.global_atomic_x2(op, kind[:-3], a, mods)
