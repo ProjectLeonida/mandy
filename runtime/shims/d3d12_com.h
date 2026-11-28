@@ -356,6 +356,20 @@ struct ConsoleHeapGpuPending {
     std::uint64_t released = 0, removed = 0;
 };
 ConsoleHeapGpuPending console_heap_gpu_pending(ID3D12Device* device);
+// The device's registry of textures in the title's own memory now (write_placed_texture_view): the images it made for
+// slot-70 texture views and their image memory, the slot-133 textures in it, the made images retired since the device
+// was created (of them, those a newer texture over their bytes retired and those whose pages went), and how many
+// retired images still wait for the GPU before their memory is freed. Then the made images that may be retired now,
+// and, since the device was created, the looks at their pages and the images a view named again after a newer texture
+// covered them. For tests.
+struct OwnedTitleImages {
+    std::uint64_t owned = 0, owned_bytes = 0, slot133 = 0, retired = 0, superseded = 0, gone = 0, waiting = 0;
+    std::uint64_t candidates = 0, looks = 0, named_again = 0;
+};
+OwnedTitleImages owned_title_images(ID3D12Device* device);
+// The image made for slot-70 texture views at `address`, with a reference added for the caller; null when the
+// registry holds none there. For tests.
+ID3D12Resource* owned_title_image(ID3D12Device* device, std::uint64_t address);
 // True when `device` has VK_KHR_acceleration_structure + VK_KHR_ray_query enabled.
 bool device_supports_ray_tracing(ID3D12Device* device);
 
