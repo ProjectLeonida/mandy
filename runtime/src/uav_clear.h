@@ -105,10 +105,61 @@ inline constexpr Layout layouts[] = {
 };
 
 inline constexpr const Layout* layout(VkFormat format) {
-    for (const Layout& l : layouts)
-        if (l.format == format) return &l;
-    return nullptr;
+    switch (format) {
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return &layouts[0];
+    case VK_FORMAT_R32G32B32A32_UINT: return &layouts[1];
+    case VK_FORMAT_R32G32B32A32_SINT: return &layouts[2];
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return &layouts[3];
+    case VK_FORMAT_R16G16B16A16_UNORM: return &layouts[4];
+    case VK_FORMAT_R16G16B16A16_SNORM: return &layouts[5];
+    case VK_FORMAT_R16G16B16A16_UINT: return &layouts[6];
+    case VK_FORMAT_R16G16B16A16_SINT: return &layouts[7];
+    case VK_FORMAT_R32G32_SFLOAT: return &layouts[8];
+    case VK_FORMAT_R32G32_UINT: return &layouts[9];
+    case VK_FORMAT_R32G32_SINT: return &layouts[10];
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return &layouts[11];
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: return &layouts[12];
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return &layouts[13];
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: return &layouts[14];
+    case VK_FORMAT_R8G8B8A8_UNORM: return &layouts[15];
+    case VK_FORMAT_R8G8B8A8_SNORM: return &layouts[16];
+    case VK_FORMAT_R8G8B8A8_UINT: return &layouts[17];
+    case VK_FORMAT_R8G8B8A8_SINT: return &layouts[18];
+    case VK_FORMAT_B8G8R8A8_UNORM: return &layouts[19];
+    case VK_FORMAT_R16G16_SFLOAT: return &layouts[20];
+    case VK_FORMAT_R16G16_UNORM: return &layouts[21];
+    case VK_FORMAT_R16G16_SNORM: return &layouts[22];
+    case VK_FORMAT_R16G16_UINT: return &layouts[23];
+    case VK_FORMAT_R16G16_SINT: return &layouts[24];
+    case VK_FORMAT_R32_SFLOAT: return &layouts[25];
+    case VK_FORMAT_R32_UINT: return &layouts[26];
+    case VK_FORMAT_R32_SINT: return &layouts[27];
+    case VK_FORMAT_R8G8_UNORM: return &layouts[28];
+    case VK_FORMAT_R8G8_SNORM: return &layouts[29];
+    case VK_FORMAT_R8G8_UINT: return &layouts[30];
+    case VK_FORMAT_R8G8_SINT: return &layouts[31];
+    case VK_FORMAT_R16_SFLOAT: return &layouts[32];
+    case VK_FORMAT_R16_UNORM: return &layouts[33];
+    case VK_FORMAT_R4G4B4A4_UNORM_PACK16: return &layouts[34];
+    case VK_FORMAT_R5G6B5_UNORM_PACK16: return &layouts[35];
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16: return &layouts[36];
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16: return &layouts[37];
+    case VK_FORMAT_R16_SNORM: return &layouts[38];
+    case VK_FORMAT_R16_UINT: return &layouts[39];
+    case VK_FORMAT_R16_SINT: return &layouts[40];
+    case VK_FORMAT_R8_UNORM: return &layouts[41];
+    case VK_FORMAT_R8_SNORM: return &layouts[42];
+    case VK_FORMAT_R8_UINT: return &layouts[43];
+    case VK_FORMAT_R8_SINT: return &layouts[44];
+    default: return nullptr;
+    }
 }
+
+static_assert([] {
+    for (const Layout& l : layouts)
+        if (layout(l.format) != &l) return false;
+    return true;
+}(), "layout() switch must match layouts[] table");
 
 // Up to one element of the largest format.
 struct Element {
@@ -118,19 +169,63 @@ struct Element {
 
 namespace detail {
 
+static_assert(std::endian::native == std::endian::little, "uav_clear assumes little-endian byte order");
+
 inline constexpr std::uint32_t mask(unsigned bits) { return bits >= 32 ? 0xffffffffu : (1u << bits) - 1; }
 
 inline void put(Element& e, Channel c, std::uint32_t value) {
+    if (!c.bits || c.bits > 32u || c.offset > 128u - c.bits) return;
     value &= mask(c.bits);
-    for (unsigned i = 0; i < c.bits; ++i)
-        if (value >> i & 1) e.bytes[(c.offset + i) / 8] |= std::uint8_t(1u << ((c.offset + i) % 8));
+    const unsigned byte = c.offset >> 3;
+    const unsigned bit = c.offset & 7u;
+    if (bit == 0u) {
+        if (c.bits == 8u) {
+            e.bytes[byte] |= static_cast<std::uint8_t>(value);
+            return;
+        }
+        if (c.bits == 16u) {
+            std::uint16_t cur = 0;
+            std::memcpy(&cur, e.bytes.data() + byte, 2);
+            cur = static_cast<std::uint16_t>(cur | static_cast<std::uint16_t>(value));
+            std::memcpy(e.bytes.data() + byte, &cur, 2);
+            return;
+        }
+        if (c.bits == 32u) {
+            std::uint32_t cur = 0;
+            std::memcpy(&cur, e.bytes.data() + byte, 4);
+            cur |= value;
+            std::memcpy(e.bytes.data() + byte, &cur, 4);
+            return;
+        }
+    }
+    const unsigned span = (bit + c.bits + 7u) >> 3;
+    std::uint64_t word = 0;
+    std::memcpy(&word, e.bytes.data() + byte, span);
+    word |= std::uint64_t{value} << bit;
+    std::memcpy(e.bytes.data() + byte, &word, span);
 }
 
 inline std::uint32_t get(const Element& e, Channel c) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < c.bits; ++i)
-        value |= std::uint32_t(e.bytes[(c.offset + i) / 8] >> ((c.offset + i) % 8) & 1) << i;
-    return value;
+    if (!c.bits || c.bits > 32u || c.offset > 128u - c.bits) return 0u;
+    const unsigned byte = c.offset >> 3;
+    const unsigned bit = c.offset & 7u;
+    if (bit == 0u) {
+        if (c.bits == 8u) return e.bytes[byte];
+        if (c.bits == 16u) {
+            std::uint16_t v = 0;
+            std::memcpy(&v, e.bytes.data() + byte, 2);
+            return v;
+        }
+        if (c.bits == 32u) {
+            std::uint32_t v = 0;
+            std::memcpy(&v, e.bytes.data() + byte, 4);
+            return v;
+        }
+    }
+    const unsigned span = (bit + c.bits + 7u) >> 3;
+    std::uint64_t word = 0;
+    std::memcpy(&word, e.bytes.data() + byte, span);
+    return static_cast<std::uint32_t>(word >> bit) & mask(c.bits);
 }
 
 // A float32 as a float with `mantissa` fraction bits, `exponent` exponent bits and an optional sign bit (IEEE
@@ -246,11 +341,12 @@ inline bool encode(VkFormat format, bool is_float, const std::array<std::uint32_
             continue;
         }
         const float v = std::bit_cast<float>(values[i]);
-        const double scale = double(detail::mask(c.bits));
         switch (l->kind) {
-        case Kind::unorm:
+        case Kind::unorm: {
+            const double scale = double(detail::mask(c.bits));
             detail::put(out, c, std::isnan(v) ? 0 : std::uint32_t(std::lround(std::clamp(double(v), 0.0, 1.0) * scale)));
             break;
+        }
         case Kind::snorm: {
             const double max = double(detail::mask(c.bits - 1));
             detail::put(out, c, std::isnan(v) ? 0 : std::uint32_t(std::lround(std::clamp(double(v), -1.0, 1.0) * max)));

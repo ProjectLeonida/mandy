@@ -2075,6 +2075,11 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME xdxr_builder_validation COMMAND xdxr_builder_validation_test)
   endif()
+  add_executable(uav_clear_unit_test test/uav_clear_unit_test.cpp)
+  target_link_libraries(uav_clear_unit_test PRIVATE Vulkan::Headers)
+  if(BUILD_TESTING)
+    add_test(NAME uav_clear_unit COMMAND uav_clear_unit_test)
+  endif()
   # LEONIDA_VK_DEVICE names the GPU in every harness (docs/testing.md, "Choosing the GPU"): a filter that matches no
   # device fails the run in vk_descriptor_bench and vk_sandbox too, instead of testing another GPU (TEST-1141).
   find_package(Python3 COMPONENTS Interpreter QUIET)
