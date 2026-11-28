@@ -155,18 +155,43 @@ class SpecialValuesAndDomainsTests(unittest.TestCase):
                 got, _ = run_ps("ps_trans_nan", [f"v_mov_b32 v1, {QNAN:#x}", f"{op} v0, v1"])
                 self.assertTrue(math.isnan(bits_to_f32(got)), f"{op} did not propagate NaN: {got:#x}")
 
-    def test_undefined_domains_raise_in_interpreter(self):
+    def test_spirv_undefined_domains_give_hardware_results(self):
+        """The inputs GLSL.std.450 leaves undefined get RDNA2's measured results (docs/design.md, "Denormal flush and
+        special results"): 0xffc00000 for the root, reciprocal root or log of a negative value, -inf for log(+-0) and
+        rsq(-0), -0 for sqrt(-0), +inf for rsq(+0)."""
         cases = [
-            ("v_log_f32", POS_ZERO),
-            ("v_log_f32", f32_to_bits(-1.0)),
-            ("v_sqrt_f32", f32_to_bits(-1.0)),
-            ("v_rsq_f32", POS_ZERO),
-            ("v_rsq_f32", f32_to_bits(-1.0)),
+            ("v_log_f32", POS_ZERO, NEG_INF),
+            ("v_log_f32", NEG_ZERO, NEG_INF),
+            ("v_log_f32", f32_to_bits(-1.0), 0xFFC00000),
+            ("v_log_f32", NEG_INF, 0xFFC00000),
+            ("v_sqrt_f32", NEG_ZERO, NEG_ZERO),
+            ("v_sqrt_f32", f32_to_bits(-1.0), 0xFFC00000),
+            ("v_sqrt_f32", NEG_INF, 0xFFC00000),
+            ("v_rsq_f32", POS_ZERO, POS_INF),
+            ("v_rsq_f32", NEG_ZERO, NEG_INF),
+            ("v_rsq_f32", f32_to_bits(-1.0), 0xFFC00000),
+            ("v_rcp_f32", POS_ZERO, POS_INF),
+            ("v_rcp_f32", NEG_ZERO, NEG_INF),
         ]
-        for op, src_bits in cases:
+        for op, src_bits, want in cases:
             with self.subTest(op=op, src=hex(src_bits)):
-                with self.assertRaises(si.UnsupportedConstruct):
-                    run_ps("ps_trans_undef", [f"v_mov_b32 v1, {src_bits:#x}", f"{op} v0, v1"])
+                got, _ = run_ps("ps_trans_special", [f"v_mov_b32 v1, {src_bits:#x}", f"{op} v0, v1"])
+                self.assertEqual(got, want, f"{op}({src_bits:#x}) = {got:#x}, want {want:#x}")
+
+    def test_regular_inputs_unchanged_by_special_cases(self):
+        """+0 and positive values keep the op's own result: sqrt(+0) = +0, sqrt(4) = 2, log(1) = 0, rsq(4) = 0.5."""
+        cases = [
+            ("v_sqrt_f32", POS_ZERO, POS_ZERO),
+            ("v_sqrt_f32", f32_to_bits(4.0), f32_to_bits(2.0)),
+            ("v_log_f32", f32_to_bits(1.0), POS_ZERO),
+            ("v_rsq_f32", f32_to_bits(4.0), f32_to_bits(0.5)),
+            ("v_rcp_f32", f32_to_bits(4.0), f32_to_bits(0.25)),
+            ("v_rsq_f32", POS_INF, POS_ZERO),
+        ]
+        for op, src_bits, want in cases:
+            with self.subTest(op=op, src=hex(src_bits)):
+                got, _ = run_ps("ps_trans_regular", [f"v_mov_b32 v1, {src_bits:#x}", f"{op} v0, v1"])
+                self.assertEqual(got, want, f"{op}({src_bits:#x}) = {got:#x}, want {want:#x}")
 
 
 class ModifiersAndOperandFormsTests(unittest.TestCase):

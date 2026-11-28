@@ -662,9 +662,9 @@ class TestSpecialFloatBoundaries(unittest.TestCase):
 class TestNegativeControlsAndFaults(unittest.TestCase):
     """Test suite validating negative controls, fault handling, and unsupported constructs."""
 
-    def test_spirv_unsupported_rcp_zero(self):
-        # In SPIR-V / spirv_mini_interp, OpFDiv by zero raises UnsupportedConstruct
-        for zero_word in (POS_ZERO, NEG_ZERO):
+    def test_rcp_zero_is_signed_inf(self):
+        # v_rcp_f32(+-0) = +-inf (RDNA2 special result); the translation no longer emits OpFDiv by zero
+        for zero_word, want in ((POS_ZERO, 0x7F800000), (NEG_ZERO, 0xFF800000)):
             lines = [
                 f"v_mov_b32 v0, 0x{zero_word:08x}",
                 "v_rcp_f32 v1, v0",
@@ -672,12 +672,11 @@ class TestNegativeControlsAndFaults(unittest.TestCase):
                 "s_endpgm",
             ]
             spv = support.translate_lines(f"ps_rcp_zero_{zero_word:08x}", lines)
-            with self.assertRaises(si.UnsupportedConstruct):
-                support.mrt0_words(spv)
+            self.assertEqual(support.mrt0_words(spv)[0], want)
 
-    def test_spirv_unsupported_rsq_zero_or_negative(self):
-        # In GLSL.std.450 / spirv_mini_interp, InverseSqrt of <= 0 raises UnsupportedConstruct
-        for bad_val in (POS_ZERO, NEG_ZERO, NEG_ONE):
+    def test_rsq_zero_or_negative_gives_hardware_result(self):
+        # GLSL.std.450 leaves InverseSqrt of x <= 0 undefined; RDNA2: rsq(+0) = +inf, rsq(-0) = -inf, rsq(-1) = 0xffc00000
+        for bad_val, want in ((POS_ZERO, 0x7F800000), (NEG_ZERO, 0xFF800000), (NEG_ONE, 0xFFC00000)):
             lines = [
                 f"v_mov_b32 v0, 0x{bad_val:08x}",
                 "v_rsq_f32 v1, v0",
@@ -685,8 +684,7 @@ class TestNegativeControlsAndFaults(unittest.TestCase):
                 "s_endpgm",
             ]
             spv = support.translate_lines(f"ps_rsq_bad_{bad_val:08x}", lines)
-            with self.assertRaises(si.UnsupportedConstruct):
-                support.mrt0_words(spv)
+            self.assertEqual(support.mrt0_words(spv)[0], want)
 
     def test_simd_interpreter_fault_rejection(self):
         # Disallow unsupported wave sizes

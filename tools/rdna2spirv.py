@@ -7291,6 +7291,50 @@ class Gen:
             self.fconst_of[name] = bits
         return self.fconsts[bits]
 
+    def f32_special_results(self, kind, x):
+        """v_rcp_f32 / v_rcp_iflag_f32 ("rcp"), v_rsq_f32 ("InverseSqrt"), v_sqrt_f32 ("Sqrt") and v_log_f32 ("Log2") of
+        the operand x (source modifiers applied; src_f has already read a denormal as a zero of its sign) with the
+        special results RDNA2 gives, measured natively on an RX 6800 (docs/design.md, "Denormal flush and special
+        results"): rcp(+-0) = +-inf, rsq(-0) = -inf, sqrt(-0) = -0, log(+-0) = -inf, and sqrt, rsq and log of a negative
+        value (-inf included) give the negative quiet NaN 0xffc00000. rsq(+0) = +inf, the IEEE reciprocal square root.
+        SPIR-V leaves every one of these undefined (OpFDiv by zero; GLSL.std.450 Sqrt of x < 0, InverseSqrt and Log2 of
+        x <= 0), so such an operand reaches the op as 1.0 and the result is chosen afterwards. Every other operand, NaNs
+        included, reaches the op unchanged, so its result is what it was before."""
+        bits, sign, mag, zero, neg = (self.tmp() for _ in range(5))
+        self.emit(f"{bits} = OpBitcast %uint {x}")
+        self.emit(f"{sign} = OpBitwiseAnd %uint {bits} {self.cu(0x80000000)}")
+        self.emit(f"{mag} = OpBitwiseAnd %uint {bits} {self.cu(0x7FFFFFFF)}")
+        self.emit(f"{zero} = OpIEqual %bool {mag} {self.cu(0)}")
+        self.emit(f"{neg} = OpFOrdLessThan %bool {x} %f0")           # negative and not -0; false for a NaN
+        signed_inf = self.tmp()
+        self.emit(f"{signed_inf} = OpBitwiseOr %uint {sign} {self.cu(0x7F800000)}")
+        special, value = self.tmp(), self.tmp()
+        if kind == "rcp":
+            special, value = zero, signed_inf
+        elif kind == "InverseSqrt":
+            self.emit(f"{special} = OpLogicalOr %bool {zero} {neg}")
+            self.emit(f"{value} = OpSelect %uint {neg} {self.cu(0xFFC00000)} {signed_inf}")
+        elif kind == "Sqrt":
+            negzero = self.tmp()
+            self.emit(f"{negzero} = OpIEqual %bool {bits} {self.cu(0x80000000)}")
+            self.emit(f"{special} = OpLogicalOr %bool {negzero} {neg}")
+            self.emit(f"{value} = OpSelect %uint {neg} {self.cu(0xFFC00000)} {self.cu(0x80000000)}")
+        elif kind == "Log2":
+            self.emit(f"{special} = OpLogicalOr %bool {zero} {neg}")
+            self.emit(f"{value} = OpSelect %uint {neg} {self.cu(0xFFC00000)} {self.cu(0xFF800000)}")
+        else:
+            raise ValueError(f"f32_special_results: {kind}")
+        safe, r = self.tmp(), self.tmp()
+        self.emit(f"{safe} = OpSelect %float {special} %f1 {x}")
+        if kind == "rcp":
+            self.emit(f"{r} = OpFDiv %float %f1 {safe}")
+        else:
+            self.emit(f"{r} = OpExtInst %float %glsl {kind} {safe}")
+        rb, out = self.tmp(), self.tmp()
+        self.emit(f"{rb} = OpBitcast %uint {r}")
+        self.emit(f"{out} = OpSelect %uint {special} {value} {rb}")
+        return self.tof(out)
+
     def dconst(self, x):
         """A %double value (needs uses_f64): the two words of x, bitcast."""
         bits = struct.unpack("<Q", struct.pack("<d", x))[0]
@@ -12078,9 +12122,9 @@ class Gen:
             self.emit(f"{r} = OpFMul %float {fi} {self.fconst(0.0625)}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op == "v_rcp_iflag_f32":
+            # Bit-identical to v_rcp_f32 on the values measured (docs/design.md), +-0 -> +-inf included.
             x = self.src_f(a[1])
-            r = self.tmp()
-            self.emit(f"{r} = OpFDiv %float %f1 {x}")
+            r = self.f32_special_results("rcp", x)
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in F2:
             read_source = self.src_f_sign_mods if F2[op] in ("max", "min") else self.src_f
@@ -12114,8 +12158,8 @@ class Gen:
         elif op in F1:
             x = self.src_f(a[1])
             r = self.tmp()
-            if F1[op] == "rcp":
-                self.emit(f"{r} = OpFDiv %float %f1 {x}")
+            if F1[op] in ("rcp", "InverseSqrt", "Sqrt", "Log2"):
+                r = self.f32_special_results(F1[op], x)
             elif F1[op] in ("Floor", "Ceil", "Fract"):
                 r = self.round_f32_flushed(F1[op], x)
             else:

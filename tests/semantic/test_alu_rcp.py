@@ -249,15 +249,15 @@ class AluRcpF32Tests(unittest.TestCase):
                 self.assertTrue(is_f32_nan(res))
                 self.assertTrue(math.isnan(u2f(res)))
 
-    def test_rcp_division_by_zero_raises(self) -> None:
-        """OpFDiv by +-0.0 is undefined in SPIR-V and raises si.UnsupportedConstruct."""
-        with self.assertRaises(si.UnsupportedConstruct) as ctx:
-            run_op("v_rcp_f32_e32 v0, v1", POS_ZERO_BITS)
-        self.assertIn("OpFDiv by zero", str(ctx.exception))
-
-        with self.assertRaises(si.UnsupportedConstruct) as ctx_neg:
-            run_op("v_rcp_f32_e32 v0, v1", NEG_ZERO_BITS)
-        self.assertIn("OpFDiv by zero", str(ctx_neg.exception))
+    def test_rcp_of_zero_is_signed_inf(self) -> None:
+        """v_rcp_f32(+-0) = +-inf, measured on RDNA2 (docs/design.md, special results). The translation no longer
+        divides by zero, which SPIR-V leaves undefined: the interpreter would raise on that."""
+        self.assertEqual(run_op("v_rcp_f32_e32 v0, v1", POS_ZERO_BITS), POS_INF_BITS)
+        self.assertEqual(run_op("v_rcp_f32_e32 v0, v1", NEG_ZERO_BITS), NEG_INF_BITS)
+        self.assertEqual(run_op("v_rcp_iflag_f32 v0, v1", POS_ZERO_BITS), POS_INF_BITS)
+        self.assertEqual(run_op("v_rcp_iflag_f32 v0, v1", NEG_ZERO_BITS), NEG_INF_BITS)
+        # -v1 of +0 is -0: the modifier is applied before the special case.
+        self.assertEqual(run_op("v_rcp_f32_e64 v0, -v1", POS_ZERO_BITS), NEG_INF_BITS)
 
     def test_rcp_e64_input_modifiers(self) -> None:
         """VOP3 input modifiers: negation (-v1), absolute value (|v1|), negative abs (-|v1|)."""
@@ -359,20 +359,19 @@ class AluRsqF32Tests(unittest.TestCase):
                 self.assertTrue(is_f32_nan(res))
                 self.assertTrue(math.isnan(u2f(res)))
 
-    def test_rsq_non_positive_inputs_raise(self) -> None:
-        """InverseSqrt of x <= 0 is undefined in GLSL.std.450 and raises si.UnsupportedConstruct."""
-        non_positive_cases = [
-            ("pos_zero", POS_ZERO_BITS),
-            ("neg_zero", NEG_ZERO_BITS),
-            ("neg_one", f2u(-1.0)),
-            ("neg_four", f2u(-4.0)),
-            ("neg_inf", NEG_INF_BITS),
+    def test_rsq_non_positive_inputs_give_hardware_results(self) -> None:
+        """GLSL.std.450 leaves InverseSqrt of x <= 0 undefined; RDNA2 gives rsq(-0) = -inf and 0xffc00000 for a
+        negative value (docs/design.md, special results), and rsq(+0) = +inf."""
+        cases = [
+            ("pos_zero", POS_ZERO_BITS, POS_INF_BITS),
+            ("neg_zero", NEG_ZERO_BITS, NEG_INF_BITS),
+            ("neg_one", f2u(-1.0), 0xFFC00000),
+            ("neg_four", f2u(-4.0), 0xFFC00000),
+            ("neg_inf", NEG_INF_BITS, 0xFFC00000),
         ]
-        for name, bits in non_positive_cases:
+        for name, bits, want in cases:
             with self.subTest(name=name):
-                with self.assertRaises(si.UnsupportedConstruct) as ctx:
-                    run_op("v_rsq_f32_e32 v0, v1", bits)
-                self.assertIn("InverseSqrt", str(ctx.exception))
+                self.assertEqual(run_op("v_rsq_f32_e32 v0, v1", bits), want)
 
     def test_rsq_e64_input_modifiers(self) -> None:
         """VOP3 input modifiers: absolute value (|v1|) and negation (-v1) rescue negative inputs."""
