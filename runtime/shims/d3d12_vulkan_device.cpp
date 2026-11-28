@@ -5482,10 +5482,11 @@ struct DeviceState {
                 // entries looked at to find their slots, and the slots fixed again (apply_slot_changes).
                 std::fprintf(stderr,
                              "[rt] d3d12: console descriptor heap 0x%llx slot records per submission: %.1f changes, "
-                             "%.1f slots looked at, %.1f fixed again, %.3f ms; %zu V# halves recorded\n",
+                             "%.1f slots looked at, %.1f fixed again, %.3f ms; %zu V# halves recorded, %zu index "
+                             "buckets\n",
                              static_cast<unsigned long long>(heap->console_va), double(heap->record_changes) / count,
                              double(heap->record_looked) / count, double(heap->record_refixed) / count,
-                             heap->record_ms / count, heap->records.recorded());
+                             heap->record_ms / count, heap->records.recorded(), heap->records.buckets());
                 for (auto& n : heap->changed) n = 0;
                 heap->vsharp_halves = heap->vsharp_repeats = 0;
                 heap->record_changes = heap->record_looked = heap->record_refixed = 0;
