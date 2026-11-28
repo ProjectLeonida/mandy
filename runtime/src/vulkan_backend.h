@@ -3533,9 +3533,8 @@ private:
         if (statistics_segments && can_resolve_occlusion) {
             if (!segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, statistics_segments, statistics))
                 return queue_unsupported(__LINE__);
-            for (const auto& list : prepared)
-                statistics->mesh.insert(statistics->mesh.end(), list.statistics_mesh.begin(),
-                                        list.statistics_mesh.end());
+            // This batch's lists only: `prepared` keeps the entries of a larger batch past lists.size().
+            statistics->mesh = batch_statistics_mesh(std::span<const PreparedList>(prepared).first(lists.size()));
             if (std::find(statistics->mesh.begin(), statistics->mesh.end(), 1) == statistics->mesh.end()) {
                 statistics->mesh.clear();
             } else {
