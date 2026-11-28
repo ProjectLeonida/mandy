@@ -391,6 +391,14 @@ bool device_upload_in_vram(ID3D12Device* device);
 // True when the device can map reserved buffers onto its D3D12 heaps.
 bool device_sparse_buffer_tiles(ID3D12Device* device);
 
+// The device's sparse buffer memory type mask (the bits a reserved buffer may land in), or 0 when it has no sparse
+// buffer residency. For tests.
+std::uint32_t device_sparse_buffer_memory_types(ID3D12Device* device);
+
+// The memory type index of the device's GPU address arena. Only meaningful when device_arena_size() is non-zero:
+// type 0 is a valid index, so the size is what says whether an arena exists. For tests.
+std::uint32_t device_arena_memory_type(ID3D12Device* device);
+
 // The size in bytes of the device's GPU address arena, or 0 without one. For tests.
 std::uint64_t device_arena_size(ID3D12Device* device);
 // Copies `bytes` of the device's GPU address arena at console VA `va` (what shaders read there: a heap's GPU copy,

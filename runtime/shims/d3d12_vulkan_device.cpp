@@ -11064,7 +11064,14 @@ public:
         if (device_.context.get() != &context || desc_.Properties.Type != D3D12_HEAP_TYPE_DEFAULT ||
             (desc_.Flags & denied) || host_address_) return {};
         std::lock_guard lock(backing_mutex_);
-        if (!image && device_.tiles_share_arena()) {
+        // A dedicated buffer tile allocation already live on this heap is reused when the new mask is compatible
+        // with its memory type; an incompatible mask is rejected. This precedes the arena check so a mixed mask
+        // (dedicated type + arena type) reuses the dedicated backing instead of failing on the arena branch.
+        if (!image && !arena_tiles_ && tile_allocation_ && !image_tiles_) {
+            if ((memory_types & (1u << tile_allocation_->memory_type)) != 0) return tile_allocation_;
+            return {};
+        }
+        if (!image && device_.tiles_share_arena() && (memory_types & (1u << device_.arena.memory_type))) {
             if (tile_allocation_) return {};
             arena_tiles_ = true;
             return allocation_;
@@ -11075,7 +11082,7 @@ public:
         if (placed_buffer_ || (image && placed_image_)) return {};
         if (!tile_allocation_) {
             std::uint32_t memory_type = 0;
-            if (!image) memory_types = device_.sparse_buffer_memory_types;
+            if (!image && (memory_types & device_.sparse_buffer_memory_types)) memory_types &= device_.sparse_buffer_memory_types;
             const VkMemoryRequirements requirements{desc_.SizeInBytes, leonida::tile_size_in_bytes,
                                                     memory_types};
             const auto memory = device_.allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
@@ -22232,6 +22239,21 @@ bool device_upload_in_vram(ID3D12Device* device) {
 bool device_sparse_buffer_tiles(ID3D12Device* device) {
     const Device* d = Device::from<Device>(device);
     return d && d->state().sparse_buffer_memory_types != 0;
+}
+
+std::uint32_t device_sparse_buffer_memory_types(ID3D12Device* device) {
+    const Device* d = Device::from<Device>(device);
+    return d ? d->state().sparse_buffer_memory_types : 0;
+}
+
+std::uint32_t device_arena_memory_type(ID3D12Device* device) {
+    if (!device) return 0;
+    // The same proxy step device_arena_size() takes: a caller that reached the device through a proxy passes the
+    // proxy, and the state lives on the real device behind it.
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    const Device* d = Device::from<Device>(real);
+    return d && d->state().arena.size ? d->state().arena.memory_type : 0;
 }
 
 std::uint64_t device_arena_size(ID3D12Device* device) {
