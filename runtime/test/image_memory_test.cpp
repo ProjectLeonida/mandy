@@ -78,6 +78,8 @@ void shared_blocks() {
         check(driver.allocations == 1 && pool.stats().blocks == 1 && pool.stats().ranges == 64 &&
                   pool.stats().block_bytes == 64 * kMiB,
               "64 one-MiB textures fill one block");
+        check(pool.stats().used_bytes == 64 * kMiB && pool.stats().empty_blocks == 0 && pool.stats().largest_free == 0,
+              "a full block: every byte in use, no free piece");
         auto extra = pool.allocate(2, kMiB, 65536, 64 * kMiB);
         check(driver.allocations == 2, "the 65th makes a second block");
         check(extra && !extra->reused(), "a range of a new block is fresh");
@@ -85,6 +87,9 @@ void shared_blocks() {
         check(driver.allocations == 3 && other->memory() != extra->memory(), "memory types do not share blocks");
         extra.reset();
         check(driver.frees == 0 && pool.stats().blocks == 3, "an emptied block is kept for the next textures");
+        check(pool.stats().used_bytes == 65 * kMiB && pool.stats().block_bytes == 192 * kMiB &&
+                  pool.stats().empty_blocks == 1 && pool.stats().largest_free == 64 * kMiB,
+              "the stats count used bytes, empty blocks and the largest free piece");
         ranges.clear();
         check(driver.frees == 1 && pool.stats().blocks == 2, "only one empty block is kept per memory type");
         const auto again = pool.allocate(2, kMiB, 65536, 64 * kMiB);
@@ -175,6 +180,60 @@ void threads() {
     check(driver.live.empty(), "nor a block");
 }
 
+// The stats the mem-probe breakdown prints: what the blocks hold apart from what they reserve. Textures of mixed sizes
+// stream in and out (a seeded churn); at every step the used bytes are the live ranges' sum, the free bytes the rest
+// of the blocks, and the largest free piece fits in a block. Then two pools with the same live bytes, one packed and
+// one with every other texture released, show the same used bytes but different largest free pieces: block bytes
+// alone would not tell them apart.
+void churn_stats() {
+    Driver driver;
+    {
+        Pool pool = driver.pool();
+        std::mt19937 random(20261128);
+        const std::uint64_t sizes[] = {64 * 1024, 256 * 1024, kMiB, 3 * kMiB, 8 * kMiB};
+        std::vector<std::unique_ptr<Pool::Range>> live;
+        std::vector<std::uint64_t> live_size;
+        bool consistent = true;
+        for (int step = 0; step < 4000 && consistent; ++step) {
+            if (!live.empty() && random() % 3 == 0) {
+                const std::size_t i = random() % live.size();
+                live.erase(live.begin() + std::ptrdiff_t(i));
+                live_size.erase(live_size.begin() + std::ptrdiff_t(i));
+            } else {
+                const std::uint64_t size = sizes[random() % std::size(sizes)];
+                if (auto range = pool.allocate(1, size, 65536, 64 * kMiB)) {
+                    live.push_back(std::move(range));
+                    live_size.push_back(size);
+                }
+            }
+            std::uint64_t sum = 0;
+            for (const auto s : live_size) sum += s;
+            const auto stats = pool.stats();
+            consistent = stats.used_bytes == sum && stats.ranges == live.size() && stats.used_bytes <= stats.block_bytes &&
+                         stats.largest_free <= 64 * kMiB && stats.empty_blocks <= 1;
+        }
+        check(consistent, "under mixed-size churn the used bytes are the live ranges' sum, at most one block is empty");
+        live.clear();
+        const auto drained = pool.stats();
+        check(drained.used_bytes == 0 && drained.ranges == 0 && drained.blocks == 1 && drained.empty_blocks == 1 &&
+                  drained.largest_free == 64 * kMiB,
+              "drained, one empty block is kept, all of it one free piece");
+    }
+    {
+        Pool packed = driver.pool(), holes = driver.pool();
+        std::vector<std::unique_ptr<Pool::Range>> a, b;
+        for (int i = 0; i < 32; ++i) a.push_back(packed.allocate(1, kMiB, 65536, 64 * kMiB));
+        for (int i = 0; i < 64; ++i) b.push_back(holes.allocate(1, kMiB, 65536, 64 * kMiB));
+        for (int i = 0; i < 64; i += 2) b[std::size_t(i)].reset();  // every other one released: 1 MiB holes
+        const auto p = packed.stats(), h = holes.stats();
+        check(p.used_bytes == 32 * kMiB && h.used_bytes == 32 * kMiB && p.block_bytes == h.block_bytes,
+              "the same live bytes in the same block bytes");
+        check(p.largest_free == 32 * kMiB && h.largest_free == kMiB,
+              "but a packed block keeps one 32 MiB free piece and a holed one only 1 MiB pieces");
+    }
+    check(driver.live.empty(), "the churn pools free their blocks");
+}
+
 }  // namespace
 
 int main() {
@@ -183,6 +242,7 @@ int main() {
     a_full_heap();
     random_requests();
     threads();
+    churn_stats();
     if (!failures) std::printf("image memory: textures share blocks, and released ranges are used again\n");
     return failures ? 1 : 0;
 }

@@ -15519,6 +15519,15 @@ public:
                     share.arena_in_use = d.arena.in_use;
                     for (std::size_t i = 0; i < share.arena_use.size(); ++i) share.arena_use[i] = d.arena.use_in_use[i];
                 }
+                if (d.image_memory) {
+                    const auto blocks = d.image_memory->stats();  // the pool's own lock
+                    share.texture_blocks = true;
+                    share.block_bytes = blocks.block_bytes;
+                    share.block_ranges = blocks.ranges;
+                    share.block_used = blocks.used_bytes;
+                    share.empty_blocks = blocks.empty_blocks;
+                    share.largest_free = blocks.largest_free;
+                }
                 std::lock_guard lock(d.descriptor_mutex);  // the bindless set's lock (ExecuteCommandLists' flush)
                 if (const auto* bindless = d.bindless.get()) share.bindless_table_bytes = bindless->table_buffer_bytes();
                 return share;

@@ -129,9 +129,12 @@ public:
     };
 
     struct Stats {
-        std::uint64_t blocks = 0;       // live driver allocations
-        std::uint64_t block_bytes = 0;  // their size
-        std::uint64_t ranges = 0;       // live ranges in them
+        std::uint64_t blocks = 0;        // live driver allocations
+        std::uint64_t block_bytes = 0;   // their size
+        std::uint64_t ranges = 0;        // live ranges in them
+        std::uint64_t used_bytes = 0;    // bytes those ranges hold; block_bytes - used_bytes is free inside the blocks
+        std::uint64_t empty_blocks = 0;  // blocks with no range (one kept per memory type)
+        std::uint64_t largest_free = 0;  // the largest free piece of any block
     };
 
     ImageMemoryPool(AllocateFn allocate, FreeFn free) : allocate_(std::move(allocate)), free_(std::move(free)) {}
@@ -181,6 +184,9 @@ public:
             for (const auto& block : pool.blocks) {
                 ++result.blocks;
                 result.block_bytes += block->ranges.size();
+                result.used_bytes += block->ranges.in_use();
+                if (block->ranges.empty()) ++result.empty_blocks;
+                result.largest_free = std::max(result.largest_free, block->ranges.largest());
             }
         return result;
     }

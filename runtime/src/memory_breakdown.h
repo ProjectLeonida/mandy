@@ -112,6 +112,14 @@ struct DeviceShare {
     // arena_in_use by kind, as DeviceState::ArenaUse: buffers, descriptor heaps, shader code, heaps
     std::array<std::uint64_t, 4> arena_use{};
     std::uint64_t bindless_table_bytes = 0;  // allocated by BindlessSet through its own function table
+    // What the texture blocks (Consumer::image_blocks, src/image_memory.h) hold: their bytes, the ranges in them
+    // (one a texture), the bytes those ranges take, empty blocks and the largest free piece of any block.
+    bool texture_blocks = false;
+    std::uint64_t block_bytes = 0;
+    std::uint64_t block_ranges = 0;
+    std::uint64_t block_used = 0;
+    std::uint64_t empty_blocks = 0;
+    std::uint64_t largest_free = 0;
 };
 
 inline double mib(std::uint64_t bytes) { return double(bytes) / 1048576.0; }
@@ -137,6 +145,15 @@ inline std::string format(const Tally& tally, const DeviceShare& device, std::ui
                           mib(device.arena_reserved), mib(device.arena_bound), mib(device.arena_in_use),
                           mib(device.arena_use[0]), mib(device.arena_use[1]), mib(device.arena_use[2]),
                           mib(device.arena_use[3]));
+            out += item;
+        }
+        if (Consumer(c) == Consumer::image_blocks && device.texture_blocks) {
+            const std::uint64_t free = device.block_bytes > device.block_used ? device.block_bytes - device.block_used : 0;
+            std::snprintf(item, sizeof item,
+                          " [%llu textures in %.0f MiB, %.0f MiB free inside the blocks (%llu empty blocks, largest "
+                          "free piece %.0f)]",
+                          (unsigned long long)device.block_ranges, mib(device.block_used), mib(free),
+                          (unsigned long long)device.empty_blocks, mib(device.largest_free));
             out += item;
         }
     }
