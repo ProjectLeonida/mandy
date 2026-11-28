@@ -3672,9 +3672,12 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    // Asked once for the whole sweep: each ask is a GlobalMemoryStatusEx
+    // call and a look at the residency headroom.
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     // The spare buffers of copies of views' own bytes that no copy took for
-    // the PC memory's idle time go too, whether or not there are windows.
-    let_go_idle_spares(crate::host::ram_idle_ms(crate::host::available_physical_ram()));
+    // that long go too, whether or not there are windows.
+    let_go_idle_spares(idle_ms);
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -3682,7 +3685,6 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
