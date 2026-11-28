@@ -1805,8 +1805,10 @@ The copies:
   (`XMemVirtualAlloc`'s ordinary regions and the title's `VirtualAlloc` reservations, not placeholders or
   physical-page windows), the kernel says (`GetWriteWatch` with reset, its answers kept for every copy over the page:
   `leonida::title_write_watch` in `runtime/src/title_page_watch.h`); elsewhere a copied page is made read-only and the
-  title's first write faults (`ShadowPages`). `LEONIDA_WRITE_WATCH=0` guards everything; under Wine that is the
-  default and `=1` turns write watching on. A reservation the title releases and reserves again (at the same address
+  title's first write faults (`ShadowPages`). `LEONIDA_WRITE_WATCH=0` guards everything. Write watching is on by
+  default under Wine too: on Proton Experimental (Wine 11), RTX 5070 Ti, NVIDIA 620.73, it took the story load from
+  about 0.2 to 30 frames a second, with the shadow refresh down from about 109 ms to 2-7 ms a submission (the
+  "submit phases" line); before, Wine defaulted to the guards because its write watching had not been measured. A reservation the title releases and reserves again (at the same address
   too) is new to every copy, all of it taken as written once. The title's own `XMemGetWriteWatch` and
   `XMemResetWriteWatch` refuse a reservation write-watched for the copies, as the host refuses one that isn't. The
   write-fault handler waits for the trackers' locks while the faulting thread may hold the process heap's lock (the

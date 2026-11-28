@@ -479,8 +479,8 @@ inline bool find(const Shape& shape, std::uint32_t& layout) {
 //    is then new to the shadows, though its pages are write-watched both before and after and the new one's kernel
 //    bits are clear (what the old one's pages held is gone: they read as zeros now).
 //
-//    LEONIDA_WRITE_WATCH=0 reserves without MEM_WRITE_WATCH: every shadow keeps the read-only guard, as before. Under
-//    Wine that is the default (=1 turns write watching on).
+//    LEONIDA_WRITE_WATCH=0 reserves without MEM_WRITE_WATCH: every shadow keeps the read-only guard, as before. That
+//    was the default under Wine until write watching was measured there (see enabled()).
 namespace leonida::title_write_watch {
 
 constexpr std::uintptr_t kPage = 0x1000;  // the kernel's unit
@@ -489,16 +489,16 @@ constexpr std::uintptr_t kPage = 0x1000;  // the kernel's unit
 constexpr std::size_t kMaxPages = std::size_t(1) << 18;
 constexpr std::uint64_t kKeep = std::uint64_t(1) << 16;
 
-// On by default on Windows; off under Wine, whose write watching was not measured here (LEONIDA_WRITE_WATCH=1 turns it
-// on there). Off with LEONIDA_WRITE_WATCH=0.
+// On by default, on Windows and under Wine alike; off with LEONIDA_WRITE_WATCH=0. Under Wine it used to be off because
+// Wine's write watching had not been measured: on Proton Experimental (Wine 11) with an RTX 5070 Ti it took the story
+// load from about 0.2 to 30 frames a second, the shadow refresh from about 109 ms to 2-7 ms a submission.
 inline bool enabled() {
     static const bool on = [] {
         char value[8] = {};
         std::size_t length = 0;
         if (host_heap::handle() == GetProcessHeap()) return false;  // no private heap: see host_heap
         if (getenv_s(&length, value, sizeof(value), "LEONIDA_WRITE_WATCH") == 0 && length > 1) return value[0] != '0';
-        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-        return !(ntdll && GetProcAddress(ntdll, "wine_get_version"));
+        return true;
     }();
     return on;
 }
