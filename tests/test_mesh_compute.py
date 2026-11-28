@@ -79,9 +79,13 @@ def test_module_is_compute(make_shader, name, emulate):
     assert lay["max_vertices"] == meta["max_vertices"] and lay["max_primitives"] == meta["max_primitives"]
     assert sorted(int(k) for k in lay["params"]) == meta["params"]
     # Header (2 words), position (4), each param (4), each clip/cull distance (1) and the primitive (4).
-    stores = spvasm.count("OpConvertUToPtr %_ptr_PSB_uint %ma")
+    # (OpConvertUToPtr of the 64-bit address with --int64-addresses; OpBitcast of its (low, high) pair, lowered
+    # by lower_addr64, without)
+    stores = spvasm.count("OpConvertUToPtr %_ptr_PSB_uint %ma") + spvasm.count("OpBitcast %_ptr_PSB_uint %a64_")
     assert stores == 2 + 4 + 4 * len(lay["params"]) + lay["clip_count"] + lay["cull_count"] + 4
-    assert "%mso = OpIMul %ulong %mwl64" in spvasm          # 64-bit slot offset
+    # 64-bit slot offset: one OpIMul %ulong with --int64-addresses, else lower_addr64's pair form, whose low word
+    # starts as the 32-bit product of the workgroup's linear index and the slot stride
+    assert "%mso = OpIMul %ulong %mwl64" in spvasm or re.search(r"^\s*%a64_\w+ = OpIMul %uint %mwl %a64c_\w+$", spvasm, re.M)
     assert "mesh_compute" not in meta["features"]
 
 

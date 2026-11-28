@@ -73,8 +73,9 @@ class ChainedScalarConstPropTests(unittest.TestCase):
             "v_mov_b32 v0, s8",
         ]
         spv = self.translate_lines(lines)
-        # s_lshl_b32 folded completely without runtime shift on uint
-        self.assertNotIn("OpShiftLeftLogical %uint", spv)
+        # s_lshl_b32 folded completely without runtime shift on uint (lower_addr64's own shifts, %a64_..., are
+        # the buffer address's 48-bit sign extension, not this instruction)
+        self.assertNotRegex(spv, r"^\s*%(?!a64_)\w+ = OpShiftLeftLogical %uint")
         # s_buffer_load evaluated offset 1056 <= 2048 statically: no branch diamond
         self.assertNotIn("OpSelectionMerge", spv)
         self.assertNotIn("OpBranchConditional", spv)
