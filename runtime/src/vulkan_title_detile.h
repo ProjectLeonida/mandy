@@ -649,7 +649,7 @@ public:
     // returns nullptr so caller can wait on oldest_in_flight_scratch_value() or fall back), ensures its device-local
     // scratch buffer holds `min_bytes` and its descriptor pool holds `sets_needed` sets (resetting the pool for fresh
     // allocation).
-    static constexpr std::size_t kMaxScratchSlots = 32;
+    static constexpr std::size_t kMaxScratchSlots = 64;
     ScratchSlot* acquire_scratch(std::uint64_t reached, VkDeviceSize min_bytes, std::uint32_t sets_needed) {
         if (!ensure_pipeline()) return nullptr;
         ScratchSlot* chosen = nullptr;
@@ -714,14 +714,34 @@ public:
                                    nullptr);
     }
 
+    // Allocates `count` descriptor sets from `slot.pool` in a single vkAllocateDescriptorSets call.
+    bool allocate_descriptor_sets(ScratchSlot& slot, std::uint32_t count, std::vector<VkDescriptorSet>& out) {
+        out.clear();
+        if (!count) return true;
+        if (!ensure_pipeline() || !slot.pool || count > slot.pool_sets) return false;
+        batch_set_layouts_.assign(count, set_layout_);
+        out.resize(count, VK_NULL_HANDLE);
+        VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        alloc.descriptorPool = slot.pool;
+        alloc.descriptorSetCount = count;
+        alloc.pSetLayouts = batch_set_layouts_.data();
+        if (vk_.allocate_descriptor_sets(device_, &alloc, out.data()) != VK_SUCCESS) {
+            out.clear();
+            return false;
+        }
+        return true;
+    }
+
     // Prepares descriptor set and per-(layer, mip) compute dispatches for one swizzled texture into `slot`.
     // `regions` must have been built by build_scratch_regions() with `dst_base` inside `slot.buffer`.
     // When `pending_updates` is non-null, descriptor writes are appended for one batched flush_descriptor_updates()
     // call across the sub-batch; otherwise vkUpdateDescriptorSets runs immediately.
+    // When `preallocated_set` is non-null (from allocate_descriptor_sets()), skips per-texture vkAllocateDescriptorSets.
     bool prepare_texture(ScratchSlot& slot, VkBuffer src_buffer, VkDeviceSize src_offset, const TitleDetileDesc& desc,
                          VkDeviceSize dst_base, VkDeviceSize dst_end, const std::vector<VkBufferImageCopy>& regions,
                          std::vector<TitleDetileDispatch>& dispatches,
-                         std::vector<PendingDescriptorUpdate>* pending_updates = nullptr) {
+                         std::vector<PendingDescriptorUpdate>* pending_updates = nullptr,
+                         VkDescriptorSet preallocated_set = VK_NULL_HANDLE) {
         if (!ensure_pipeline() || !slot.buffer || !slot.pool || dst_end > slot.capacity || dst_end < dst_base)
             return false;
         const VkDeviceSize min_ssbo = (std::max)(VkDeviceSize(4), limits_.minStorageBufferOffsetAlignment);
@@ -734,12 +754,14 @@ public:
             dst_range > UINT32_MAX || aligned_dst + dst_range > slot.capacity)
             return false;
 
-        VkDescriptorSet set = VK_NULL_HANDLE;
-        VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        alloc.descriptorPool = slot.pool;
-        alloc.descriptorSetCount = 1;
-        alloc.pSetLayouts = &set_layout_;
-        if (vk_.allocate_descriptor_sets(device_, &alloc, &set) != VK_SUCCESS) return false;
+        VkDescriptorSet set = preallocated_set;
+        if (set == VK_NULL_HANDLE) {
+            VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            alloc.descriptorPool = slot.pool;
+            alloc.descriptorSetCount = 1;
+            alloc.pSetLayouts = &set_layout_;
+            if (vk_.allocate_descriptor_sets(device_, &alloc, &set) != VK_SUCCESS) return false;
+        }
 
         const VkDescriptorBufferInfo src_info{src_buffer, aligned_src, src_range};
         const VkDescriptorBufferInfo dst_info{slot.buffer, aligned_dst, dst_range};
@@ -1012,6 +1034,7 @@ private:
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     bool failed_ = false;
     std::vector<std::unique_ptr<ScratchSlot>> scratch_slots_;
+    std::vector<VkDescriptorSetLayout> batch_set_layouts_;
     std::vector<VkWriteDescriptorSet> batch_writes_;
 };
 

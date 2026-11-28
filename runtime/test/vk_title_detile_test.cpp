@@ -441,15 +441,25 @@ int main() {
     EXPECT(d.validation_errors() == 0);
 
     // Verify cached PFN_vk* (zero vkGetDeviceProcAddr calls during prepare/flush/emit), batched
-    // vkUpdateDescriptorSets (1 driver call for 4 textures), oldest_in_flight_scratch_value(), and kMaxScratchSlots==32.
+    // vkAllocateDescriptorSets (1 driver call for 4 textures), batched vkUpdateDescriptorSets (1 driver call for 4
+    // textures), oldest_in_flight_scratch_value(), and kMaxScratchSlots==64.
     {
-        static_assert(leonida::TitleDetilePipeline::kMaxScratchSlots == 32);
+        static_assert(leonida::TitleDetilePipeline::kMaxScratchSlots == 64);
         static PFN_vkGetDeviceProcAddr s_real_gdpa = nullptr;
+        static PFN_vkAllocateDescriptorSets s_real_alloc = nullptr;
         static PFN_vkUpdateDescriptorSets s_real_update = nullptr;
         static std::atomic<std::uint64_t> s_gdpa_calls{0};
+        static std::atomic<std::uint64_t> s_alloc_calls{0};
+        static std::atomic<std::uint32_t> s_alloc_sets{0};
         static std::atomic<std::uint64_t> s_update_calls{0};
         static std::atomic<std::uint32_t> s_update_writes{0};
         struct CountingProc {
+            static VKAPI_ATTR VkResult VKAPI_CALL alloc_ds(VkDevice dev, const VkDescriptorSetAllocateInfo* info,
+                                                           VkDescriptorSet* out) {
+                s_alloc_calls.fetch_add(1, std::memory_order_relaxed);
+                if (info) s_alloc_sets.fetch_add(info->descriptorSetCount, std::memory_order_relaxed);
+                return s_real_alloc(dev, info, out);
+            }
             static VKAPI_ATTR void VKAPI_CALL update_ds(VkDevice dev, std::uint32_t write_count,
                                                         const VkWriteDescriptorSet* writes, std::uint32_t copy_count,
                                                         const VkCopyDescriptorSet* copies) {
@@ -459,6 +469,10 @@ int main() {
             }
             static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get(VkDevice dev, const char* name) {
                 s_gdpa_calls.fetch_add(1, std::memory_order_relaxed);
+                if (name && std::strcmp(name, "vkAllocateDescriptorSets") == 0) {
+                    s_real_alloc = reinterpret_cast<PFN_vkAllocateDescriptorSets>(s_real_gdpa(dev, name));
+                    return reinterpret_cast<PFN_vkVoidFunction>(&alloc_ds);
+                }
                 if (name && std::strcmp(name, "vkUpdateDescriptorSets") == 0) {
                     s_real_update = reinterpret_cast<PFN_vkUpdateDescriptorSets>(s_real_gdpa(dev, name));
                     return reinterpret_cast<PFN_vkVoidFunction>(&update_ds);
@@ -468,6 +482,8 @@ int main() {
         };
         s_real_gdpa = d.device_proc;
         s_gdpa_calls.store(0, std::memory_order_relaxed);
+        s_alloc_calls.store(0, std::memory_order_relaxed);
+        s_alloc_sets.store(0, std::memory_order_relaxed);
         s_update_calls.store(0, std::memory_order_relaxed);
         s_update_writes.store(0, std::memory_order_relaxed);
 
@@ -521,12 +537,18 @@ int main() {
 
         auto* slot = batch_pipe.acquire_scratch(0, total_scratch, kBatchTex);
         EXPECT(slot != nullptr);
+        std::vector<VkDescriptorSet> pre_sets;
+        EXPECT(batch_pipe.allocate_descriptor_sets(*slot, kBatchTex, pre_sets));
+        EXPECT(pre_sets.size() == kBatchTex);
+        EXPECT(s_alloc_calls.load(std::memory_order_acquire) == 1);  // ONE batched vkAllocateDescriptorSets call!
+        EXPECT(s_alloc_sets.load(std::memory_order_acquire) == kBatchTex);
         std::vector<leonida::TitleDetileDispatch> dispatches;
         std::vector<leonida::TitleDetilePipeline::PendingDescriptorUpdate> pending;
         for (std::size_t i = 0; i < kBatchTex; ++i) {
             EXPECT(batch_pipe.prepare_texture(*slot, srcs[i].handle, 0, descs[i], bases[i], ends[i], regions[i],
-                                              dispatches, &pending));
+                                              dispatches, &pending, pre_sets[i]));
         }
+        EXPECT(s_alloc_calls.load(std::memory_order_acquire) == 1);   // ZERO per-texture vkAllocateDescriptorSets!
         EXPECT(s_update_calls.load(std::memory_order_acquire) == 0);  // deferred until flush!
         batch_pipe.flush_descriptor_updates(pending);
         EXPECT(s_update_calls.load(std::memory_order_acquire) == 1);  // ONE batched vkUpdateDescriptorSets call!
@@ -585,15 +607,26 @@ int main() {
             EXPECT(std::memcmp(rbs[i].mapped, expected[i].data(), expected[i].size()) == 0);
         }
 
-        // Verify oldest_in_flight_scratch_value() picks the smallest non-zero in-flight slot value.
+        // Verify kMaxScratchSlots == 64 allows > 32 concurrent in-flight slots and oldest_in_flight_scratch_value()
+        // picks the smallest non-zero in-flight slot value.
         slot->value = 42;
         auto* slot2 = batch_pipe.acquire_scratch(0, 64, 1);
         EXPECT(slot2 != nullptr && slot2 != slot);
         slot2->value = 17;
         EXPECT(batch_pipe.oldest_in_flight_scratch_value() == 17);
+        std::vector<leonida::TitleDetilePipeline::ScratchSlot*> extra_slots;
+        for (std::size_t k = 0; k < 34; ++k) {
+            auto* s = batch_pipe.acquire_scratch(0, 64, 1);
+            EXPECT(s != nullptr);
+            s->value = 100 + k;
+            extra_slots.push_back(s);
+        }
+        EXPECT(batch_pipe.oldest_in_flight_scratch_value() == 17);
         slot2->value = 0;
         EXPECT(batch_pipe.oldest_in_flight_scratch_value() == 42);
         slot->value = 0;
+        EXPECT(batch_pipe.oldest_in_flight_scratch_value() == 100);
+        for (auto* s : extra_slots) s->value = 0;
         EXPECT(batch_pipe.oldest_in_flight_scratch_value() == 0);
         EXPECT(d.validation_errors() == 0);
     }

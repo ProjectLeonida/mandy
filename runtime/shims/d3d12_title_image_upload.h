@@ -455,6 +455,8 @@ private:
         }
 
         leonida::TitleDetilePipeline::ScratchSlot* scratch_slot = nullptr;
+        batch_detile_sets_.clear();
+        std::size_t next_detile_set = 0;
         if (detile_sets > 0 && pipe) {
             scratch_slot = pipe->acquire_scratch(reached, total_scratch, detile_sets);
             if (!scratch_slot) {
@@ -465,6 +467,9 @@ private:
                     reached = (std::max)(reached, oldest_scratch);
                     scratch_slot = pipe->acquire_scratch(reached, total_scratch, detile_sets);
                 }
+            }
+            if (scratch_slot && !pipe->allocate_descriptor_sets(*scratch_slot, detile_sets, batch_detile_sets_)) {
+                scratch_slot = nullptr;
             }
         }
 
@@ -506,11 +511,14 @@ private:
                     mirror_val = item.mirror_value;
                 }
             } else {  // mirror_detile
-                if (!scratch_slot || !pipe || batch_detile_regions_[i].empty()) continue;
+                if (!scratch_slot || !pipe || batch_detile_regions_[i].empty() ||
+                    next_detile_set >= batch_detile_sets_.size())
+                    continue;
+                const VkDescriptorSet pre_set = batch_detile_sets_[next_detile_set++];
                 const std::size_t disp_start = batch_dispatches_.size();
                 if (!pipe->prepare_texture(*scratch_slot, item.mirror_buffer, item.mirror_offset, batch_descs_[i],
                                            batch_dst_bases_[i], batch_dst_ends_[i], batch_detile_regions_[i],
-                                           batch_dispatches_, &batch_descriptor_updates_)) {
+                                           batch_dispatches_, &batch_descriptor_updates_, pre_set)) {
                     batch_dispatches_.resize(disp_start);
                     continue;
                 }
@@ -790,6 +798,7 @@ private:
     std::vector<PreparedItem> batch_prepared_;
     std::vector<leonida::VulkanContext::StagedImageTarget> batch_targets_;
     std::vector<leonida::TitleDetileDispatch> batch_dispatches_;
+    std::vector<VkDescriptorSet> batch_detile_sets_;
     std::vector<leonida::TitleDetilePipeline::PendingDescriptorUpdate> batch_descriptor_updates_;
     std::vector<leonida::TitleDetileDesc> batch_descs_;
     std::vector<VkDeviceSize> batch_dst_bases_;
