@@ -34,6 +34,7 @@ from report_paths import same_report_path  # noqa: E402
 CHUNK = 8 * 1024 * 1024
 DEFAULT_MANIFEST = os.path.join(os.path.dirname(__file__), "..", "reports", "manifest.json")
 CACHE_VERSION = 1
+SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
 # don't cache files written this recently, a write in the same timestamp tick wouldn't change the stamp
 # (FAT and some network shares only keep 2s times)
 RACY_WINDOW_NS = 3_000_000_000
@@ -194,6 +195,8 @@ def load_manifest(path: str) -> dict[str, dict]:
       {<rel_path>: {"size": <int>, "sha256": <str>}, ...}
     In a flat manifest, `created`, `title`, `version` and `note` are metadata unless
     their value is an explicit file object with a `sha256` field.
+    A flat entry named `files` needs a digest string or an object with an integer
+    `size` and a `sha256` string to distinguish it from the wrapper.
 
     Rejects repeated JSON keys and normalizes relative paths to forward
     slashes and hashes to lowercase hex.
@@ -226,9 +229,18 @@ def load_manifest(path: str) -> dict[str, dict]:
     if not isinstance(doc, dict):
         raise ManifestError(f"{path}: root must be a JSON object")
 
-    nested = "files" in doc
+    files_value = doc.get("files")
+    # A wrapped manifest can itself list files named `sha256` or `size`.
+    flat_files_entry = (
+        isinstance(files_value, str) and SHA256_HEX.fullmatch(files_value) is not None
+    ) or (
+        isinstance(files_value, dict)
+        and type(files_value.get("size")) is int
+        and isinstance(files_value.get("sha256"), str)
+    )
+    nested = "files" in doc and not flat_files_entry
     if nested:
-        raw_files = doc["files"]
+        raw_files = files_value
         if not isinstance(raw_files, dict):
             raise ManifestError(f"{path}: 'files' must be a JSON object")
     else:
@@ -253,7 +265,7 @@ def load_manifest(path: str) -> dict[str, dict]:
             size, digest = None, info
         else:
             raise ManifestError(f"{path}: entry {rel!r} must be an object or digest string")
-        if re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None:
+        if SHA256_HEX.fullmatch(digest) is None:
             raise ManifestError(f"{path}: entry {rel!r} needs a SHA-256 digest of 64 hexadecimal characters")
         entries[rel] = {"size": size, "sha256": digest.lower()}
     return entries
