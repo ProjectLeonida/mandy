@@ -271,9 +271,12 @@ class AluAddSubI16Tests(unittest.TestCase):
         )
         self.assertIsNotNone(const_match)
         c65535 = const_match.group(1)
+        # The low-16 mask is an OpBitFieldUExtract (base 0, count 16), not an OpBitwiseAnd:
+        # NVIDIA's shader compiler miscompiles And & 0xFFFF on values that passed through %int
+        # ops when the result merges with a preserved high half (RTX 4070 SUPER, wave32).
         mask_matches = list(
             re.finditer(
-                rf"= OpBitwiseAnd %uint (%\S+) {re.escape(c65535)}\b", spv_mask
+                r"= OpBitFieldUExtract %uint (%\S+) %\S+ %\S+\b", spv_mask
             )
         )
         # one 16-bit mask at least: SHADER-315's constant folding removed the ones on the literal operands

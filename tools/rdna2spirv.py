@@ -9679,7 +9679,12 @@ class Gen:
                     self.emit(f"{sat} = OpSelect %uint {ov} {self.cu(0 if 'sub' in op else 0xFFFF)} {r}")
                     r = sat
             lo = self.tmp()
-            self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
+            # BitFieldUExtract, not OpBitwiseAnd & 0xFFFF: on NVIDIA's shader compiler an And of a value that
+            # passed through %int ops (the signed i16 add/sub/min/max and ashr paths below) feeding the
+            # preserve-high-half merge miscompiles the KEPT high half (measured on an RTX 4070 SUPER, wave32:
+            # v_add_nc_i16 ... op_sel:[1,1,0] clamp wrote 0x1113AAA8 for 0x0002AAA8). Extract reads the same
+            # low 16 bits and dodges that peephole; AMD and the interpreter are unaffected.
+            self.emit(f"{lo} = OpBitFieldUExtract %uint {r} {self.cu(0)} {self.cu(16)}")
             if e64 and sb[2]:
                 # op_sel destination bit: the result goes to the high half, the low half is kept.
                 if a[0]["k"] != "vgpr":
@@ -9721,7 +9726,7 @@ class Gen:
                     self.emit(f"{sat} = OpBitcast %uint {hi_c}")
                 r = sat
             lo = self.tmp()
-            self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
+            self.emit(f"{lo} = OpBitFieldUExtract %uint {r} {self.cu(0)} {self.cu(16)}")   # see the nc_i16 note above: And & 0xFFFF miscompiles on NVIDIA
             if dhi:
                 old, keep, sh16, v = (self.tmp() for _ in range(4))
                 self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', a[0]['r'])}")
@@ -9761,7 +9766,7 @@ class Gen:
             else:
                 r = m
             lo = self.tmp()
-            self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
+            self.emit(f"{lo} = OpBitFieldUExtract %uint {r} {self.cu(0)} {self.cu(16)}")   # same NVIDIA And-&-0xFFFF workaround as above
             self.write_half16(a[0], lo, dhi)
         elif op == "v_bcnt_u32_b32":
             self._check_int32_valu(op, ins["op"], a, mods)
@@ -11237,7 +11242,10 @@ class Gen:
                     self.emit(f"{conv} = OpBitcast %uint {ci}")
                 else:
                     self.emit(f"{conv} = OpConvertFToU %uint {cl}")
-                self.emit(f"{lo} = OpBitwiseAnd %uint {conv} {self.cu(0xFFFF)}")
+                # BitFieldUExtract, not And & 0xFFFF: the signed form's conv is a Bitcast of an %int
+                # ConvertFToS, and NVIDIA's shader compiler miscompiles that And feeding the
+                # preserve-high-half merge (same workaround as the VOP3 16-bit integer ops).
+                self.emit(f"{lo} = OpBitFieldUExtract %uint {conv} {self.cu(0)} {self.cu(16)}")
                 if not dhi:
                     self.write_lo16(a[0], lo)
                 else:
@@ -11297,7 +11305,8 @@ class Gen:
                 self.emit(f"{conv} = OpBitcast %uint {ci}")
             else:
                 self.emit(f"{conv} = OpConvertFToU %uint {rn}")
-            self.emit(f"{lo} = OpBitwiseAnd %uint {conv} {self.cu(0xFFFF)}")
+            # Same NVIDIA And-&-0xFFFF workaround as v_cvt_i16_f16 above.
+            self.emit(f"{lo} = OpBitFieldUExtract %uint {conv} {self.cu(0)} {self.cu(16)}")
             if not dhi:
                 self.write_lo16(a[0], lo)
             else:
@@ -14449,7 +14458,9 @@ class Gen:
             self.emit(f"{clamped} = OpExtInst %int %glsl SClamp {value} {self.as_int(self.cu(0xFFFF8000))} "
                       f"{self.as_int(self.cu(0x7FFF))}")
             self.emit(f"{raw} = OpBitcast %uint {clamped}")
-            self.emit(f"{half} = OpBitwiseAnd %uint {raw} {self.cu(0xFFFF)}")
+            # BitFieldUExtract, not And & 0xFFFF: raw is a Bitcast of an %int SClamp and the result
+            # reaches preserve-high-half merges (d16 image/buffer stores); NVIDIA miscompiles the And.
+            self.emit(f"{half} = OpBitFieldUExtract %uint {raw} {self.cu(0)} {self.cu(16)}")
         else:
             self.emit(f"{half} = OpExtInst %uint %glsl UMin {bits} {self.cu(0xFFFF)}")
         return half
