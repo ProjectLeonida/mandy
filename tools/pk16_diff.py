@@ -33,11 +33,11 @@ Not generated: neg_lo/neg_hi on the integer packed ops (the translator rejects t
 unmeasured), clamp on min/max/mul_lo/shifts, DPP and SDWA forms (tools/sdwa_diff.py), v_mad_u32_u16 and the other
 16x16->32 ops (tools/vint_diff.py), v_dot* (#2229), f16 ops (tools/valu_fuzz.py --family f16).
 
-Known divergences (KNOWN_DIVERGENCES): by default the generator leaves out the forms where the translator is known to
-differ from the hardware, so that a run shows new problems only; --known puts them back (a hardware-only run always
-has them):
-  * pk-const-hi: a constant (inline or literal) in a packed add/sub/mul_lo/min/max/mad source whose high half
-    op_sel or op_sel_hi reads. The translator raises Unsupported (counted as a skip); #2224 removes that.
+Known divergences (KNOWN_DIVERGENCES): none at present. By default the generator leaves out the forms where the
+translator is known to differ from the hardware, so that a run shows new problems only; --known puts them back (a
+hardware-only run always has them). The last one, `pk-const-hi` (a constant in a packed add/sub/mul_lo/min/max/mad
+source whose high half `op_sel` or `op_sel_hi` reads, which raised Unsupported until 2026-11-22), is measured and
+handled (docs/design.md), so the generator produces it by default.
 
 With --oracle hw the same programs also run natively on an AMD GPU (tools/hw_oracle/), one lane of a wave32 compute
 dispatch, and the four words are compared with the reference: that validates the reference itself. Without the
@@ -130,7 +130,6 @@ OPS_PK = {
     "v_pk_mad_u16": (3, lambda a, b, c: a * b + c, satu),
     "v_pk_mad_i16": (3, lambda a, b, c: sx16(a) * sx16(b) + sx16(c), sati),
 }
-PK_SHIFTS = ("v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16")
 OPS_16 = {
     "v_add_nc_u16": (2, lambda a, b: a + b, satu),
     "v_sub_nc_u16": (2, lambda a, b: a - b, satu),
@@ -161,10 +160,7 @@ ALL_OPS = sorted(OPS_PK) + sorted(OPS_16)
 
 KNOWN = False   # also generate the forms in KNOWN_DIVERGENCES (--known; always on for a hardware-only run)
 LITERALS = True
-KNOWN_DIVERGENCES = {
-    "pk-const-hi": "a constant in a packed add/sub/mul_lo/min/max/mad source whose high half op_sel or op_sel_hi "
-                   "reads: the translator raises Unsupported, #2224 reads the constant's 32-bit value",
-}
+KNOWN_DIVERGENCES = {}   # forms left out by default and put back by --known; none at present
 
 
 # ---- program generation -------------------------------------------------------------------------------------
@@ -233,8 +229,9 @@ class Gen:
             n, _, cl = OPS_PK[name]
             sel = [int(r.random() < 0.3) for _ in range(n)]
             hi = [int(r.random() < 0.7) for _ in range(n)]
-            free = KNOWN or name in PK_SHIFTS
-            srcs = self.srcs(n, False, [free or not (sel[i] or hi[i]) for i in range(n)])
+            # a constant source is its 32-bit dword and op_sel / op_sel_hi index that dword, high half included
+            # (measured on gfx1036, docs/design.md), so a constant may go in any source
+            srcs = self.srcs(n, False, [True] * n)
             line = f"{name} v{d}, {', '.join(srcs)}"
             if any(sel):
                 line += f" op_sel:[{','.join(map(str, sel))}]"
