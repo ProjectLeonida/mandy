@@ -596,6 +596,22 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                                                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
                                                    "-property", "installationPath"])
 
+    def test_visual_cpp_tools_accepts_a_prerelease_installation(self):
+        # vswhere lists a Preview or Insiders install only with -prerelease. A stable install is asked for first, so a
+        # machine with both keeps the stable one.
+        def vswhere(stable):
+            def run(argv, **kwargs):
+                return mock.Mock(returncode=0, stdout=b"C:\\VS Preview\r\n" if "-prerelease" in argv else stable)
+            return run
+        with mock.patch("os.path.isfile", return_value=True), \
+             mock.patch("subprocess.run", side_effect=vswhere(b"\r\n")) as run:
+            self.assertTrue(make_game.visual_cpp_tools_ok())
+        self.assertEqual(["-prerelease" in c.args[0] for c in run.call_args_list], [False, True])
+        with mock.patch("os.path.isfile", return_value=True), \
+             mock.patch("subprocess.run", side_effect=vswhere(b"C:\\VS\r\n")) as run:
+            self.assertTrue(make_game.visual_cpp_tools_ok())
+        self.assertEqual(run.call_count, 1)                    # no prerelease lookup after a hit
+
     def test_preflight_python_version_check(self):
         with tempfile.TemporaryDirectory() as tmp_work:
             with mock.patch("sys.version_info", (3, 11, 9)), \

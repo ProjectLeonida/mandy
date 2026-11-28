@@ -1011,13 +1011,17 @@ def visual_cpp_tools_ok() -> bool:
                            "Microsoft Visual Studio", "Installer", "vswhere.exe")
     if not os.path.isfile(vswhere):
         return False
-    try:
-        result = subprocess.run([vswhere, "-latest", "-products", "*", "-requires",
-                                 "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-                                 "-property", "installationPath"], capture_output=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0 and bool(result.stdout.strip())
+    # vswhere lists a Preview or Insiders install only with -prerelease; asked second, so a stable one still wins.
+    for prerelease in ([], ["-prerelease"]):
+        try:
+            result = subprocess.run([vswhere, "-latest", *prerelease, "-products", "*", "-requires",
+                                     "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                                     "-property", "installationPath"], capture_output=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if result.returncode == 0 and result.stdout.strip():
+            return True
+    return False
 
 
 def windows_powershell() -> str:

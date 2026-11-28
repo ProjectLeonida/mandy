@@ -113,9 +113,13 @@ def find_vcvars():
     if not os.path.isfile(vswhere):
         return None
     try:
-        out = subprocess.run([vswhere, "-latest", "-products", "*", "-requires",
-                              "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"],
-                             capture_output=True, text=True, timeout=60).stdout.strip().splitlines()
+        # vswhere lists a Preview or Insiders install only with -prerelease; asked second, so a stable one still wins.
+        for prerelease in ([], ["-prerelease"]):
+            out = subprocess.run([vswhere, "-latest", *prerelease, "-products", "*", "-requires",
+                                  "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"],
+                                 capture_output=True, text=True, timeout=60).stdout.strip().splitlines()
+            if out:
+                break
     except (OSError, subprocess.SubprocessError):
         return None
     bat = os.path.join(out[0].strip(), "VC", "Auxiliary", "Build", "vcvars64.bat") if out else ""
