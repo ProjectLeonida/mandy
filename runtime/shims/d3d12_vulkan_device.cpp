@@ -11608,17 +11608,20 @@ public:
 
     bool enabled() const { return enabled_; }
     bool has_file_data() const { return !file_.data.empty(); }
+    bool from_seed() const { return file_.from_seed; }  // the data came from the read-only seed overlay
     bool found() const { return enabled_ && built_ && !write_; }  // the pipeline came out of the journal file
     bool written() const { return written_; }                     // publish() wrote the file
 
-    void load(std::filesystem::path path) {
+    // `use_seed` false: the seed overlay's file is read as absent (one the driver already refused in this build).
+    void load(std::filesystem::path path, bool use_seed = true) {
         const auto& vk = device_.context->vk;
         if (!vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache || !vk.vkGetPipelineCacheData) return;
         enabled_ = true;
         path_ = std::move(path);
         namespace journal = leonida::pipeline_journal;
         const auto role = compile_helper::build_host.load() ? journal::ReadRole::materialize_local : journal::ReadRole::runtime;
-        file_ = journal::read_with_seed(path_, pipeline_journal_roots().seed, device_.pso_identity, role);
+        file_ = journal::read_with_seed(path_, use_seed ? pipeline_journal_roots().seed : std::filesystem::path{},
+                                        device_.pso_identity, role);
     }
 
     // In the build's driver turn.
@@ -11636,6 +11639,25 @@ public:
             if (vk.vkCreatePipelineCache(device_.info.device, &info, nullptr, &cache) != VK_SUCCESS) cache = VK_NULL_HANDLE;
         }
         std::vector<char>().swap(file_.data);  // the driver has its own copy
+    }
+
+    // In the build's driver turn, after a create against a seeded cache that missed. Measured on NVIDIA (RTX 3080,
+    // 610.88): such a cache can keep its data exactly as loaded, without the pipeline just compiled, so the rewrite
+    // gave the same file and the same miss on every boot. When the cache's data is still the loaded size, it is
+    // swapped for an empty one for one more create (the driver still has the pipeline: tens of milliseconds).
+    bool restart_empty() {
+        if (!cache || !seeded) return false;
+        const auto& vk = device_.context->vk;
+        std::size_t size = 0;
+        if (vk.vkGetPipelineCacheData(device_.info.device, cache, &size, nullptr) != VK_SUCCESS || size != file_.bytes)
+            return false;  // it took the pipeline (or cannot say): rewritten from it as before
+        vk.vkDestroyPipelineCache(device_.info.device, cache, nullptr);
+        cache = VK_NULL_HANDLE;
+        seeded = false;
+        const VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        if (vk.vkCreatePipelineCache(device_.info.device, &info, nullptr, &cache) == VK_SUCCESS) return true;
+        cache = VK_NULL_HANDLE;
+        return false;
     }
 
     // In the build's driver turn, after the create against `cache`. `built`: that create made the pipeline; `hit`:
@@ -11751,6 +11773,8 @@ struct ComputeBuildOptions {
     std::uint64_t helper_priority = 0;       // the request's urgency: 0 a dispatch, else the warm-up's module size
     bool mark_building = false;              // precompile, helper: claim the entry, skip it when another process has it
     bool key_only = false;                   // only name the journal file (journal_path), build nothing
+    bool probe_journal = true;               // a helper-sized module's file is asked without a compile (see below)
+    bool skip_seed = false;                  // the seed overlay's file was refused: read as absent, left untouched
 };
 
 // A compute pipeline from a library entry: what a PSO's first dispatch, the warm-up worker and gta6rt
@@ -11831,7 +11855,7 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
             out.skipped = true;
             return out;
         }
-        journal.load(path);
+        journal.load(path, !options.skip_seed);
         // LOCAL FIX (compile helper, d3d12_compile_helper.h): no file, so this would be a compile in this process,
         // where the driver's lock it holds stops the title's submissions. The helper process compiles it into the file
         // instead, and the create below is a hit. Asked without waiting, the build answers deferred and is asked
@@ -11849,7 +11873,7 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
             } else {
                 const ULONGLONG asked = GetTickCount64();
                 if (helper.build(path, entry->name, device.pso_identity, &why)) {
-                    journal.load(path);
+                    journal.load(path, !options.skip_seed);
                     std::fprintf(stderr, "[rt] d3d12: compile helper built %s in %.1f s (%zu B SPIR-V, %s)\n",
                                  entry->name.c_str(), double(GetTickCount64() - asked) / 1000.0, bytes, trigger);
                 } else {
@@ -11872,6 +11896,14 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
         big_lock.lock();
     const bool ask_shared = journal.enabled() && !journal.has_file_data() && shared && device.pipeline_cache_seeded &&
                             device.info.pipeline_cache_control && device.journal_ask_shared.load();
+    // A module the helper would build, with a journal file: the create from the file is asked not to compile. A file
+    // the driver does not take (written by another driver build, or before a rewrite fix) would otherwise be a compile
+    // here, minutes for the largest modules with every submission of the title waiting at the compile gate. On
+    // VK_PIPELINE_COMPILE_REQUIRED the file is removed and the build goes the no-file way: to the helper.
+    const bool probe_file = options.probe_journal && journal.has_file_data() && options.use_helper &&
+                            compile_helper::wanted(bytes) && device.info.pipeline_cache_control;
+    bool stale_file = false;
+    bool stale_seed = false;  // the refused file is the seed overlay's: it stays, and the retry reads it as absent
 
     VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     module_info.codeSize = bytes;
@@ -11891,6 +11923,7 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
     auto& compiling = leonida::driver_compile;
     VkResult created = VK_ERROR_UNKNOWN;
     bool from_shared = false, probe_compiled = false;
+    bool journal_retry_failed = false;  // the create against the empty cache failed: nothing to write
     ULONGLONG probe_ms = 0, driver_ms = 0;
     {
         // Every driver call of the build (shader module, journal cache, pipeline) in one turn through the compile
@@ -11931,18 +11964,60 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
             if (!from_shared) built = VK_NULL_HANDLE;
         }
         if (!from_shared) {
+            const bool probing = probe_file && journal.seeded;
+            if (probing) pipeline_info.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
             const ULONGLONG at = GetTickCount64();
             created = vk.vkCreateComputePipelines(dev, cache, 1, &pipeline_info, nullptr, &built);
             driver_ms = GetTickCount64() - at;
+            if (probing) {
+                pipeline_info.flags &= ~VkPipelineCreateFlags(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT);
+                stale_file = created == VK_PIPELINE_COMPILE_REQUIRED;
+                stale_seed = stale_file && journal.from_seed();
+                if (stale_file) built = VK_NULL_HANDLE;
+            }
+            // A seeded miss the cache did not take: built once more against an empty cache, so the file is rewritten
+            // with this pipeline instead of as it was read.
+            if (created == VK_SUCCESS && built && journal.seeded &&
+                leonida::pipeline_journal::should_write(true, trace.hit(), driver_ms) && journal.restart_empty()) {
+                VkPipeline again = VK_NULL_HANDLE;
+                const ULONGLONG at_again = GetTickCount64();
+                const VkResult again_result = vk.vkCreateComputePipelines(dev, journal.cache, 1, &pipeline_info, nullptr, &again);
+                const ULONGLONG again_ms = GetTickCount64() - at_again;
+                journal_retry_failed = again_result != VK_SUCCESS || !again;
+                if (!journal_retry_failed) {
+                    vk.vkDestroyPipeline(dev, built, nullptr);
+                    built = again;
+                }
+                std::fprintf(stderr, "[rt] d3d12: pipeline journal: %s missed its journal file (%llu ms); built again "
+                                     "against an empty cache in %llu ms (VkResult %d) to rewrite it\n",
+                             entry->name.c_str(), static_cast<unsigned long long>(driver_ms),
+                             static_cast<unsigned long long>(again_ms), int(again_result));
+            }
         }
         compiling.name.store(nullptr, std::memory_order_release);
         vk.vkDestroyShaderModule(dev, module, nullptr);  // Vulkan lets a module go once the pipeline exists
-        journal.finish(!from_shared && created == VK_SUCCESS && built, trace.hit(), driver_ms);
+        journal.finish(!from_shared && !journal_retry_failed && created == VK_SUCCESS && built, trace.hit(), driver_ms);
     }
     std::vector<std::uint32_t>().swap(words);
     profile.finish(int(created));
     trace.end(trigger, entry->name.c_str(), 0, bytes, created);
     if (big_lock.owns_lock()) big_lock.unlock();
+    if (stale_file) {
+        // A local file is removed. The seed overlay is read-only and stays as it is; the retry reads it as absent,
+        // so the build goes the no-file way too and the helper's file is written locally.
+        std::error_code removed;
+        if (!stale_seed) std::filesystem::remove(out.journal_path, removed);
+        std::fprintf(stderr, "[rt] d3d12: pipeline journal: %s: its journal file would have been a compile here "
+                             "(%llu ms to say so); %s, and the build goes to the compile helper\n",
+                     entry->name.c_str(), static_cast<unsigned long long>(driver_ms),
+                     stale_seed ? "the seed's file is left and read as absent"
+                     : removed  ? "the file could not be removed (built here as before)"
+                                : "the file is removed");
+        ComputeBuildOptions again = options;  // once: a file left in place is then seeded and compiled as before
+        again.probe_journal = false;
+        again.skip_seed = stale_seed;
+        return build_compute_pipeline(device, compute_entry, layout, subgroup, again);
+    }
     if (probe_compiled && device.journal_ask_shared.exchange(false))
         std::fprintf(stderr, "[rt] d3d12: pipeline journal: the driver compiled %s for "
                              "FAIL_ON_PIPELINE_COMPILE_REQUIRED (%llu ms, no cache hit); built again for its journal "
