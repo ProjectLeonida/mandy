@@ -30,7 +30,11 @@ bounds, not a proof that every site is reached.
 | `XMemIsToolsMemAvailable` | 1 | yes (returns `FALSE`) |
 | `XMemAllocDefault`, `XMemFreeDefault` | 1 tail jump each, no call | yes |
 
-The executable also exports one symbol, `__XMemAllocationHooks__`.
+The executable also exports one symbol, `__XMemAllocationHooks__`. The loader registers that `{alloc, free}` pair
+when the image is mapped (`pe_loader.cpp`, `rt::shims::add_xmem_allocation_hooks`) and clears it in
+`Loader::~Loader`; while a complete pair is registered `XMemAlloc`/`XMemFree` forward to the title's hooks
+(`XMemAllocDefault`/`XMemFreeDefault` bypass them, and a half-null pair stays on the shim heap so the allocators
+never mix; checked in `xmem_test`, runtime title hook behaviour still **unmeasured**).
 
 ## `XMemVirtualAlloc`: every site passes an attribute word
 
