@@ -13,6 +13,7 @@
 #include <propsys.h>
 #include <spatialaudioclient.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -415,10 +416,27 @@ public:
         Lock l(lock_);
         if (i < kMaxChannels) channel_volume_[i] = v;
     }
-    float master_ = 1.0f;
-    BOOL mute_ = FALSE;
+    // ISimpleAudioVolume's state, under the same lock as the channel volumes: the title may set it from any thread.
+    float master() {
+        Lock l(lock_);
+        return master_;
+    }
+    void set_master(float level) {
+        Lock l(lock_);
+        master_ = level;
+    }
+    BOOL mute() {
+        Lock l(lock_);
+        return mute_;
+    }
+    void set_mute(BOOL mute) {
+        Lock l(lock_);
+        mute_ = mute;
+    }
 
 private:
+    float master_ = 1.0f;
+    BOOL mute_ = FALSE;
     struct Lock {
         explicit Lock(SRWLOCK& s) : s_(s) { AcquireSRWLockExclusive(&s_); }
         ~Lock() { ReleaseSRWLockExclusive(&s_); }
@@ -551,26 +569,30 @@ public:
     }
 };
 
+// A volume level is 0.0 to 1.0. Written so that NaN, which compares false either way, is out of range too (as
+// SpatialObject::SetVolume checks it).
+bool volume_level(float level) { return level >= 0.0f && level <= 1.0f; }
+
 class SimpleVolume final : public Service<ISimpleAudioVolume> {
 public:
     using Service::Service;
     HRESULT STDMETHODCALLTYPE SetMasterVolume(float level, LPCGUID) override {
-        if (level < 0.0f || level > 1.0f) return E_INVALIDARG;
-        client_->master_ = level;
+        if (!volume_level(level)) return E_INVALIDARG;
+        client_->set_master(level);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetMasterVolume(float* level) override {
         if (!level) return E_POINTER;
-        *level = client_->master_;
+        *level = client_->master();
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetMute(BOOL mute, LPCGUID) override {
-        client_->mute_ = mute;
+        client_->set_mute(mute);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetMute(BOOL* mute) override {
         if (!mute) return E_POINTER;
-        *mute = client_->mute_;
+        *mute = client_->mute();
         return S_OK;
     }
 };
@@ -584,7 +606,7 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetChannelVolume(UINT32 index, const float level) override {
-        if (index >= client_->channels() || level < 0.0f || level > 1.0f) return E_INVALIDARG;
+        if (index >= client_->channels() || !volume_level(level)) return E_INVALIDARG;
         client_->set_volume(index, level);
         return S_OK;
     }
@@ -598,7 +620,7 @@ public:
         if (!levels) return E_POINTER;
         if (count != client_->channels()) return E_INVALIDARG;
         for (UINT32 i = 0; i < count; ++i) {
-            if (levels[i] < 0.0f || levels[i] > 1.0f) return E_INVALIDARG;
+            if (!volume_level(levels[i])) return E_INVALIDARG;
         }
         for (UINT32 i = 0; i < count; ++i) client_->set_volume(i, levels[i]);
         return S_OK;
@@ -744,9 +766,23 @@ public:
         running_ = false;
         return S_OK;
     }
+    // A stopped stream's reset revokes every active object (Microsoft's reference for
+    // ISpatialAudioObjectRenderStreamBase::Reset): each is inactive from now on and its type can be activated again;
+    // the ends a pass had queued go too.
     HRESULT STDMETHODCALLTYPE Reset() override {
-        Lock l(lock_);
-        return running_ ? SPTLAUDCLNT_E_STREAM_NOT_STOPPED : S_OK;
+        std::vector<SpatialObject*> ended;
+        {
+            Lock l(lock_);
+            if (running_) return SPTLAUDCLNT_E_STREAM_NOT_STOPPED;
+            for (SpatialObject* o : objects_) {
+                o->make_inactive();
+                o->take_type();
+            }
+            active_types_ = 0;
+            ended.swap(ending_);
+        }
+        for (SpatialObject* o : ended) o->Release();
+        return S_OK;
     }
     HRESULT STDMETHODCALLTYPE BeginUpdatingAudioObjects(UINT32* available, UINT32* frames) override {
         if (!available || !frames) return E_POINTER;
@@ -789,6 +825,10 @@ public:
             release_type(t);
             return E_OUTOFMEMORY;
         }
+        {
+            Lock l(lock_);
+            objects_.push_back(o);
+        }
         *object = o;
         return S_OK;
     }
@@ -811,6 +851,12 @@ public:
     void release_type(uint32_t t) {
         Lock l(lock_);
         active_types_ &= ~t;
+    }
+    // An object going away: Reset no longer reaches it. First in its destructor, so a Reset that holds the lock
+    // meanwhile still sees the whole object.
+    void forget(SpatialObject* o) {
+        Lock l(lock_);
+        objects_.erase(std::remove(objects_.begin(), objects_.end(), o), objects_.end());
     }
 
 private:
@@ -838,6 +884,7 @@ private:
     bool updating_ = false;
     std::vector<BYTE> scratch_;
     std::vector<SpatialObject*> ending_;
+    std::vector<SpatialObject*> objects_;  // the live objects (not owned): each holds the stream
     PeriodicThread clock_;
 };
 
@@ -845,6 +892,7 @@ SpatialObject::SpatialObject(SpatialStream* stream, uint32_t type) : stream_(str
     stream_->AddRef();
 }
 SpatialObject::~SpatialObject() {
+    stream_->forget(this);
     if (take_type()) stream_->release_type(type_);
     stream_->Release();
 }

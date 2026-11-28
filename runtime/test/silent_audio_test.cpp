@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <limits>
 
 #include "shims.h"
 #include "silent_audio.h"
@@ -429,6 +430,19 @@ void test_render_stream() {
           "IAudioStreamVolume keeps a channel volume");
     check(simple->SetMasterVolume(0.25f, nullptr) == S_OK && simple->GetMasterVolume(&level) == S_OK && level == 0.25f,
           "ISimpleAudioVolume keeps the master volume");
+    {
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        float levels[8] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, nan};
+        check(simple->SetMasterVolume(nan, nullptr) == E_INVALIDARG && simple->GetMasterVolume(&level) == S_OK &&
+                  level == 0.25f,
+              "SetMasterVolume(NaN) is refused and the volume stays");
+        check(stream->SetChannelVolume(7, nan) == E_INVALIDARG && stream->GetChannelVolume(7, &level) == S_OK &&
+                  level == 0.5f,
+              "SetChannelVolume(NaN) is refused and the volume stays");
+        check(stream->SetAllVolumes(8, levels) == E_INVALIDARG && stream->GetChannelVolume(0, &level) == S_OK &&
+                  level == 1.0f,
+              "SetAllVolumes with a NaN level is refused and changes nothing");
+    }
     UINT64 freq = 0;
     check(clock->GetFrequency(&freq) == S_OK && freq == 48000, "IAudioClock counts frames at 48 kHz");
 
@@ -668,6 +682,17 @@ void test_spatial_stream() {
     }
     check(WaitForSingleObject(event, 60) == WAIT_TIMEOUT, "no spatial event after Stop");
     check(stream->Reset() == S_OK, "Reset");
+    check(fl->IsActive(&active) == S_OK && !active, "Reset revokes the objects that were active");
+    buffer = nullptr;
+    check(fl->GetBuffer(&buffer, &length) == SPTLAUDCLNT_E_RESOURCES_INVALIDATED && !buffer,
+          "a revoked object gets no buffer");
+    if (SUCCEEDED(stream->BeginUpdatingAudioObjects(&available, &frames))) {
+        check(stream->ActivateSpatialAudioObject(AudioObjectType_FrontLeft, &other) == S_OK && other,
+              "after Reset, a type that was active can be activated again");
+        if (other) other->Release();
+        other = nullptr;
+        stream->EndUpdatingAudioObjects();
+    }
     fr->Release();
     if (SUCCEEDED(stream->BeginUpdatingAudioObjects(&available, &frames))) {
         check(stream->ActivateSpatialAudioObject(AudioObjectType_FrontRight, &other) == S_OK && other,
