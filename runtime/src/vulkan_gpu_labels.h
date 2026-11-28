@@ -8,6 +8,8 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -100,13 +102,24 @@ inline bool store_value(const Target &target, std::uint64_t value) {
 // The CPU destination is a generation-checked title data allocation. No guest pointer is a GPU command destination.
 class Completions {
     static constexpr unsigned per_pool = 64;
+    static constexpr std::uint32_t no_query = (std::numeric_limits<std::uint32_t>::max)();
+    struct Entry {
+        Write op;
+        std::uint32_t query = no_query;
+    };
     struct Batch {
         VkFence fence{};
         std::vector<VkQueryPool> pools;
-        std::vector<Write> labels;
+        std::vector<Entry> labels;
+        std::uint32_t query_count = 0;
+    };
+    struct PublishCounts {
+        std::uint64_t errors = 0;
+        std::uint64_t expired = 0;
     };
     std::mutex mutex_;
     std::condition_variable changed_;
+    bool stopping_ = false;
     bool closing_ = false;
     std::thread worker_;
     VkDevice device_{};
@@ -151,83 +164,152 @@ class Completions {
     void recycle(Batch &b) {
         for (auto p : b.pools)
             idle_pools_.push_back(p);
-        if (b.fence) idle_fences_.push_back(b.fence);
+        b.pools.clear();
+        if (b.fence) {
+            idle_fences_.push_back(b.fence);
+            b.fence = VK_NULL_HANDLE;
+        }
     }
     static bool store(const Target &target, std::uint64_t value) { return store_value(target, value); }
-    void publish(const Batch &batch) {
-        for (std::size_t i = 0; i < batch.labels.size(); ++i) {
-            const Write &op = batch.labels[i];
+    static PublishCounts publish(const Batch &batch, VkDevice dev, PFN_vkGetQueryPoolResults results) {
+        PublishCounts counts{};
+        for (const Entry &entry : batch.labels) {
+            const Write &op = entry.op;
             std::uint64_t value = op.value;
             if (op.clock == 1) {
-                if (results_(device_, batch.pools[i / per_pool], static_cast<unsigned>(i % per_pool), 1, sizeof(value),
-                             &value, sizeof(value), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
-                    ++errors_;
+                const auto pool_index = entry.query / per_pool;
+                // The batch's fence has already signaled VK_SUCCESS; pass WAIT_BIT so drivers that defer timestamp
+                // writeback cannot drop a completed label with VK_NOT_READY.
+                if (entry.query == no_query || pool_index >= batch.pools.size() ||
+                    results(dev, batch.pools[pool_index], static_cast<unsigned>(entry.query % per_pool), 1,
+                            sizeof(value), &value, sizeof(value),
+                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS) {
+                    ++counts.errors;
                     continue;
                 }
             } else if (op.clock == 2) {
 #ifdef _WIN32
                 LARGE_INTEGER qpc{};
                 if (!QueryPerformanceCounter(&qpc)) {
-                    ++errors_;
+                    ++counts.errors;
                     continue;
                 }
                 value = static_cast<std::uint64_t>(qpc.QuadPart);
 #else
-                ++errors_;
+                ++counts.errors;
                 continue;
 #endif
             }
-            if (!store(op.target, value)) ++expired_;
+            if (!store(op.target, value)) ++counts.expired;
         }
+        return counts;
     }
     void run() {
         std::unique_lock lock(mutex_);
+        const VkDevice dev = device_;
+        const auto fence_status = fence_status_;
+        const auto results = results_;
         for (;;) {
             if (pending_.empty() && !closing_) changed_.wait(lock, [&] { return closing_ || !pending_.empty(); });
-            for (auto i = pending_.begin(); i != pending_.end();) {
-                auto &b = **i;
-                const auto status = fence_status_(device_, b.fence);
-                if (status == VK_NOT_READY && !closing_) {
-                    ++i;
+            if (pending_.empty()) return;
+            const bool closing_now = closing_;
+            std::vector<std::unique_ptr<Batch>> checking;
+            checking.swap(pending_);
+            // Release mutex_ before polling fences or publishing labels: store_value() invokes value_sink::arena()
+            // (which takes VulkanContext::resource_mutex_) and kernel_writes::begin_write(), while threads holding
+            // resource_mutex_ call begin_record()/record() and acquire mutex_.
+            lock.unlock();
+
+            std::vector<std::unique_ptr<Batch>> still_pending;
+            std::vector<std::unique_ptr<Batch>> done;
+            PublishCounts totals{};
+            for (auto &batch : checking) {
+                const auto status = fence_status(dev, batch->fence);
+                if (status == VK_NOT_READY && !closing_now) {
+                    still_pending.push_back(std::move(batch));
                     continue;
                 }
-                if (status == VK_SUCCESS)
-                    publish(b);
-                else
-                    ++errors_;
-                recycle(b);
-                i = pending_.erase(i);
+                if (status == VK_SUCCESS) {
+                    const PublishCounts c = publish(*batch, dev, results);
+                    totals.errors += c.errors;
+                    totals.expired += c.expired;
+                } else {
+                    ++totals.errors;
+                }
+                done.push_back(std::move(batch));
             }
-            if (closing_) return;
-            if (!pending_.empty()) changed_.wait_for(lock, std::chrono::milliseconds(1));
+
+            lock.lock();
+            errors_ += totals.errors;
+            expired_ += totals.expired;
+            for (auto &b : done)
+                recycle(*b);
+            const bool arrived = !pending_.empty();
+            if (!still_pending.empty()) {
+                if (pending_.empty()) {
+                    pending_.swap(still_pending);
+                } else {
+                    still_pending.insert(still_pending.end(), std::make_move_iterator(pending_.begin()),
+                                         std::make_move_iterator(pending_.end()));
+                    pending_.swap(still_pending);
+                }
+            }
+            if (closing_) {
+                if (pending_.empty()) return;
+                continue;
+            }
+            if (!pending_.empty() && !arrived) changed_.wait_for(lock, std::chrono::milliseconds(1));
         }
     }
 
   public:
-    ~Completions() { stop(device_); }
+    ~Completions() {
+        VkDevice dev = VK_NULL_HANDLE;
+        {
+            std::lock_guard lock(mutex_);
+            dev = device_;
+        }
+        if (dev) stop(dev);
+    }
 
     bool initialize(VkDevice dev, PFN_vkGetDeviceProcAddr get) {
         if (!enabled() || !dev || !get) return false;
         std::lock_guard lock(mutex_);
-        if (device_) return device_ == dev;
+        if (device_) return device_ == dev && !stopping_;
 #define LABEL_FN(name) reinterpret_cast<PFN_##name>(get(dev, #name))
-        create_pool_ = LABEL_FN(vkCreateQueryPool);
-        destroy_pool_ = LABEL_FN(vkDestroyQueryPool);
-        reset_query_ = LABEL_FN(vkCmdResetQueryPool);
-        timestamp_ = LABEL_FN(vkCmdWriteTimestamp);
-        results_ = LABEL_FN(vkGetQueryPoolResults);
-        create_fence_ = LABEL_FN(vkCreateFence);
-        destroy_fence_ = LABEL_FN(vkDestroyFence);
-        fence_status_ = LABEL_FN(vkGetFenceStatus);
-        reset_fences_ = LABEL_FN(vkResetFences);
-        device_idle_ = LABEL_FN(vkDeviceWaitIdle);
+        const auto create_pool = LABEL_FN(vkCreateQueryPool);
+        const auto destroy_pool = LABEL_FN(vkDestroyQueryPool);
+        const auto reset_query = LABEL_FN(vkCmdResetQueryPool);
+        const auto timestamp = LABEL_FN(vkCmdWriteTimestamp);
+        const auto results = LABEL_FN(vkGetQueryPoolResults);
+        const auto create_fence = LABEL_FN(vkCreateFence);
+        const auto destroy_fence = LABEL_FN(vkDestroyFence);
+        const auto fence_status = LABEL_FN(vkGetFenceStatus);
+        const auto reset_fences = LABEL_FN(vkResetFences);
+        const auto device_idle = LABEL_FN(vkDeviceWaitIdle);
 #undef LABEL_FN
-        if (!create_pool_ || !destroy_pool_ || !reset_query_ || !timestamp_ || !results_ || !create_fence_ ||
-            !destroy_fence_ || !fence_status_ || !reset_fences_ || !device_idle_)
+        if (!create_pool || !destroy_pool || !reset_query || !timestamp || !results || !create_fence ||
+            !destroy_fence || !fence_status || !reset_fences || !device_idle)
             return false;
+        create_pool_ = create_pool;
+        destroy_pool_ = destroy_pool;
+        reset_query_ = reset_query;
+        timestamp_ = timestamp;
+        results_ = results;
+        create_fence_ = create_fence;
+        destroy_fence_ = destroy_fence;
+        fence_status_ = fence_status;
+        reset_fences_ = reset_fences;
+        device_idle_ = device_idle;
         device_ = dev;
+        stopping_ = false;
         closing_ = false;
-        worker_ = std::thread([this] { run(); });
+        try {
+            worker_ = std::thread([this] { run(); });
+        } catch (...) {
+            device_ = VK_NULL_HANDLE;
+            throw;
+        }
         return true;
     }
     void begin_record(VkCommandBuffer cb) {
@@ -242,7 +324,7 @@ class Completions {
     void record(VkCommandBuffer cb, const Write &op) {
         if (!enabled()) return;
         std::lock_guard lock(mutex_);
-        if (!device_ || closing_) {
+        if (!device_ || stopping_ || closing_) {
             ++errors_;
             return;
         }
@@ -255,24 +337,36 @@ class Completions {
             ++errors_;
             return;
         }
-        const auto i = slot->labels.size();
-        const auto j = static_cast<unsigned>(i % per_pool);
-        if (!j) {
-            auto p = pool();
-            if (!p) {
-                ++errors_;
-                return;
+        if (op.clock == 1) {
+            const auto q = slot->query_count;
+            const auto pool_index = q / per_pool;
+            const auto j = static_cast<unsigned>(q % per_pool);
+            if (pool_index >= slot->pools.size()) {
+                auto p = pool();
+                if (!p) {
+                    ++errors_;
+                    return;
+                }
+                try {
+                    slot->pools.push_back(p);
+                } catch (...) {
+                    idle_pools_.push_back(p);
+                    throw;
+                }
             }
-            slot->pools.push_back(p);
+            auto p = slot->pools[pool_index];
+            slot->labels.push_back(Entry{op, q});
+            ++slot->query_count;
+            reset_query_(cb, p, j, 1);
+            timestamp_(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, p, j);
+        } else {
+            slot->labels.push_back(Entry{op, no_query});
         }
-        auto p = slot->pools[i / per_pool];
-        reset_query_(cb, p, j, 1);
-        timestamp_(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, p, j);
-        slot->labels.push_back(op);
     }
     VkFence submit_fence(VkCommandBuffer cb) {
         if (!enabled() || !cb) return VK_NULL_HANDLE;
         std::lock_guard lock(mutex_);
+        if (stopping_ || closing_) return VK_NULL_HANDLE;
         auto i = recording_.find(cb);
         return i == recording_.end() ? VK_NULL_HANDLE : i->second->fence;
     }
@@ -281,29 +375,44 @@ class Completions {
         std::lock_guard lock(mutex_);
         auto i = recording_.find(cb);
         if (i == recording_.end()) return;
-        if (ok && i->second->fence) {
+        if (ok && i->second->fence && !closing_) {
             pending_.push_back(std::move(i->second));
             changed_.notify_one();
-        } else
+        } else {
+            if (ok && i->second->fence) ++errors_;
             recycle(*i->second);
+        }
         recording_.erase(i);
     }
     void stop(VkDevice dev) {
+        PFN_vkDeviceWaitIdle device_idle = nullptr;
         {
-            std::lock_guard lock(mutex_);
-            if (!dev || device_ != dev) return;
+            std::unique_lock lock(mutex_);
+            if (!dev) return;
+            if (stopping_) {
+                if (device_ == dev) changed_.wait(lock, [&] { return !stopping_; });
+                return;
+            }
+            if (device_ != dev) return;
+            stopping_ = true;
+            device_idle = device_idle_;
         }
-        device_idle_(dev);
+        if (device_idle) device_idle(dev);
+        std::thread worker;
         {
             std::lock_guard lock(mutex_);
             closing_ = true;
             changed_.notify_all();
+            worker = std::move(worker_);
         }
-        if (worker_.joinable()) worker_.join();
+        if (worker.joinable()) worker.join();
         std::lock_guard lock(mutex_);
         for (auto &pair : recording_)
             recycle(*pair.second);
         recording_.clear();
+        for (auto &b : pending_)
+            recycle(*b);
+        pending_.clear();
         for (auto f : idle_fences_)
             destroy_fence_(dev, f, nullptr);
         idle_fences_.clear();
@@ -316,6 +425,9 @@ class Completions {
         }
         expired_ = errors_ = 0;
         device_ = VK_NULL_HANDLE;
+        stopping_ = false;
+        closing_ = false;
+        changed_.notify_all();
     }
 };
 } // namespace leonida::label
