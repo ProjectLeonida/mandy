@@ -386,7 +386,7 @@ int main() {
         EXPECT(written_tiles.size() == 1 && written_tiles[0] == big_base + 7 * kTile);
         EXPECT(!w.may_have_work());
     }
-    {  // Stage 3a: 1-tile hash-before-reserve skips staging reserve & whole read when bytes are unchanged
+    {  // 1-tile hash-before-reserve skips staging reserve & whole read when bytes are unchanged
         FakeWatch f;
         Watch w(f);
         static std::uint8_t mem[kTile];
@@ -411,7 +411,7 @@ int main() {
                 const auto [cpu, span] = range.at(k);
                 const std::size_t tiles = leonida::TilePieces::tiles(cpu, span);
                 auto& p = pieces[k];
-                // Stage 3a rule: `written.size() <= tiles` (including tiles == 1) hashes BEFORE reserving!
+                // Hash-before-reserve: `written.size() <= tiles` (including tiles == 1) hashes before reserving.
                 if (p.valid_for(cpu, span) && !written.empty() && written.size() <= tiles &&
                     p.unchanged(written, [&](std::uintptr_t from, std::uint64_t n) -> std::optional<std::uint64_t> {
                         return hash(at(from), n);
@@ -432,8 +432,8 @@ int main() {
         EXPECT((pass() == V{2}));
         EXPECT(reserves == 1);
     }
-    {  // Round 2.1: note_changed() / note_changed_and_for_each() on already-armed unchanged tiles skips redundant
-       // watch_.arm(), while remapped, faulted, hot, pinned, and rearm=true tiles STILL call watch_.arm().
+    {  // note_changed() / note_changed_and_for_each() on already-armed unchanged tiles skips redundant
+       // watch_.arm(), while remapped, faulted, hot, pinned, and rearm=true tiles still call watch_.arm().
         FakeWatch f;
         Watch w(f);
         w.track(1, base, 2 * kTile);
@@ -539,7 +539,7 @@ int main() {
         f.write(base + 8 * kTile, true);
         EXPECT((collect(w) == V{10, 11}));
     }
-    {  // Round 2.1: 86k-tile scale test verifying O(overlapping) chunked region index (no O(86k) std::sort).
+    {  // 86k-tile scale test verifying O(overlapping) chunked region index (no O(86k) std::sort).
         struct FastScaleWatch {
             struct Cell {
                 std::atomic<std::uint64_t> version{1}, mapping{1};

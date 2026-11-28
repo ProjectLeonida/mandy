@@ -327,7 +327,7 @@ int test() {
         EXPECT(!std::memcmp(title + 11 * kDescriptor, pointer.data(), sizeof(pointer)));
     }
 
-    // 8. Round 1A/1C regression: an in-place heap V# naming > 256 MiB (past kMirrorNameMax) of a committed plain
+    // 8. Oversized & out-of-range V# regression: an in-place heap V# naming > 256 MiB (past kMirrorNameMax) of a committed plain
     //    region inside title_mirror_space must NEVER create an orphan TitleWindow, must null the filtered copy while
     //    keeping the title's bytes intact, and repeated V# halves must answer identically without creating windows.
     //    Also verify O(1)-rejected bit-47 and out-of-arena-span V# halves null cleanly.
@@ -375,7 +375,7 @@ int test() {
         EXPECT(VirtualFree(big_plain, 0, MEM_RELEASE));
     }
 
-    // 9. Round 12 regressions:
+    // 9. Deferred-slot and pending-alias regressions:
     //    (a) A slot queued in heap.deferred by apply_in_place_changes (texture_gone) and overwritten in the same
     //        refresh's upload() with non-T# words (w[3] >> 30 != 0, !is_image) must zero w[0..3] in finish_in_place
     //        instead of writing raw unfiltered words into home[slot];

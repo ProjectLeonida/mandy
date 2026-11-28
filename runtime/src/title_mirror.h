@@ -77,6 +77,9 @@ public:
     static constexpr std::uint64_t kChunk = std::uint64_t(2) << 30;
     static constexpr std::uint64_t kUnitBytes = std::uint64_t(32) << 20;
     static constexpr std::uint32_t kUnitPages = std::uint32_t(kUnitBytes / kPage);
+    // Sentinel ticket for freed homes waiting for flush() + note_mirror_bind() to publish the sparse unbind before
+    // stamping their retire ticket via stamp_freed().
+    static constexpr std::uint64_t kUnstamped = UINT64_MAX;
 
     struct Counters {
         std::uint64_t chunks = 0, chunk_failures = 0, homes = 0, units = 0, pages = 0;  // now
@@ -121,7 +124,9 @@ public:
 
     // The feed: the 64 KiB page at `va` shows the physical page whose 64 KiB are at `frame` (its section's scratch view,
     // kept alive by `keep`), or nothing (`frame` null). The bind is noted for the next flush(); a new home is filled.
-    void map(std::uint64_t va, std::uint8_t* frame, std::shared_ptr<void> keep, std::uint64_t ticket) {
+    // Freed homes default to kUnstamped and wait for stamp_freed() after flush() publishes the sparse unbind.
+    void map(std::uint64_t va, std::uint8_t* frame, std::shared_ptr<void> keep,
+             std::uint64_t ticket = kUnstamped) {
         va &= ~(kPage - 1);
         if (!covers(va)) {
             ++counters_.unmirrored_changes;
@@ -208,8 +213,9 @@ public:
             if (h.copy) note_alias_bind(va, units_[h.copy_unit].memory, VkDeviceSize(h.copy_slot) * kPage);
         }
     }
-    // The alias at `lo` goes: its pages are unbound there, and their filtered copies are freed after `ticket`.
-    void unalias(std::uint64_t lo, std::uint64_t ticket) {
+    // The alias at `lo` goes: its pages are unbound there, and their filtered copies are freed after `ticket`
+    // (kUnstamped: wait for stamp_freed() after flush() publishes the sparse unbind).
+    void unalias(std::uint64_t lo, std::uint64_t ticket = kUnstamped) {
         const auto it = aliases_.find(lo);
         if (it == aliases_.end()) return;
         const Alias alias = it->second;
@@ -448,6 +454,16 @@ public:
         has_pending_binds_.store(false, std::memory_order_release);
         return ok;
     }
+
+    // Stamps every unstamped freed home (queued by map()/unalias() with kUnstamped) with `ticket`, taken after
+    // flush() published the sparse unbind via note_mirror_bind(). Unstamped homes are never retired until stamped.
+    void stamp_freed(std::uint64_t ticket) {
+        if (unstamped_freed_.empty()) return;
+        for (const auto& [unit, slot] : unstamped_freed_) freed_.push_back({unit, slot, ticket});
+        unstamped_freed_.clear();
+        sync_freed_atomics();
+    }
+    std::size_t unstamped_freed_count() const noexcept { return unstamped_freed_.size(); }
 
     // Frees the homes no page binds any more whose last reader has retired (`completed` ticket).
     void retire(std::uint64_t completed) {
@@ -860,6 +876,10 @@ private:
         has_pending_binds_.store(true, std::memory_order_release);
     }
     void push_freed(std::uint32_t unit, std::uint32_t slot, std::uint64_t ticket) {
+        if (ticket == kUnstamped) {
+            unstamped_freed_.push_back({unit, slot});
+            return;
+        }
         freed_.push_back({unit, slot, ticket});
         if (ticket < oldest_freed_ticket_.load(std::memory_order_relaxed))
             oldest_freed_ticket_.store(ticket, std::memory_order_release);
@@ -884,6 +904,7 @@ private:
     std::unordered_map<std::uint8_t*, Home> homes_;            // physical page (its scratch bytes) -> home
     std::vector<Unit> units_;
     std::vector<std::uint8_t*> dirty_;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> unstamped_freed_;
     std::deque<Freed> freed_;
     std::map<std::uint64_t, std::map<VkDeviceSize, VkSparseMemoryBind>> pending_;  // chunk -> offset -> next bind
     std::map<std::uint64_t, Alias> aliases_;                    // title address -> [it, hi) also bound there, filtered

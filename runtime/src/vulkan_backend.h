@@ -1892,12 +1892,20 @@ public:
     // buffer of ours holds. Set while no replay runs (device creation and destruction).
     using MirrorBuffer = std::function<bool(std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset)>;
     void set_mirror_buffer(MirrorBuffer lookup) { mirror_buffer_ = std::move(lookup); }
-    // The page mirror bound pages in a batch that signals `value` on `semaphore`: every queue's next submission of command
-    // lists waits for it (the bind of a remap lands before any submission made after the remap).
-    void note_mirror_bind(VkSemaphore semaphore, std::uint64_t value) {
-        std::lock_guard lock(storage_mutex_);
+    // The page mirror bound pages in a batch that signals `value` on `semaphore`: every queue's next command-buffer
+    // submission waits for it (checked under submit_mutex_ before vkQueueSubmit and record_submit_locked()). Returns
+    // the retire ticket of the latest submission accepted before this bind was published, so freed homes stamped with
+    // it cannot be reused while any submission that did not wait for this bind is still in flight.
+    std::uint64_t note_mirror_bind(VkSemaphore semaphore, std::uint64_t value) {
+        std::lock_guard lock(submit_mutex_);
         mirror_bind_semaphore_ = semaphore;
         mirror_bind_value_ = value;
+        return submitted_retire_ticket();
+    }
+    // Reads the latest published page-mirror bind timeline semaphore and value (caller must hold submit_mutex_).
+    void mirror_bind_locked(VkSemaphore& semaphore, std::uint64_t& value) const noexcept {
+        semaphore = mirror_bind_semaphore_;
+        value = mirror_bind_value_;
     }
     // Called at the end of every ExecuteCommandLists replay that called before_execute_, however it returns: by then
     // the submissions it made are recorded, so submitted_retire_ticket() covers them.
@@ -1912,7 +1920,6 @@ public:
     void set_on_finish_execute(std::function<void(std::uint64_t)> on_finish) {
         on_finish_execute_ = std::move(on_finish);
     }
-    static std::uint64_t current_enqueue_serial() noexcept { return current_enqueue_serial_slot(); }
     // GPU work the lists of a submission depend on, recorded at the start of its command buffer by a queue that can
     // run compute (the console heap translation pass, src/console_heap_gpu.h): `record` returns true when it recorded
     // something, and `commit` follows that submit (true: it reached the queue; the ticket is a retire ticket at or
@@ -2420,10 +2427,6 @@ private:
     std::map<std::tuple<VkFormat, std::uint32_t, VkImageLayout, VkImageLayout, VkResolveModeFlagBits>, VkRenderPass>
         resolve_passes_;
     std::map<std::tuple<VkImage, VkImage, VkImageView, VkImageView, VkRenderPass>, VkFramebuffer> resolve_framebuffers_;
-    static std::uint64_t& current_enqueue_serial_slot() noexcept {
-        thread_local std::uint64_t serial = 0;  // trivially destructible (no TLS callback in gta6rt.exe)
-        return serial;
-    }
 
     std::function<void()> before_execute_;
     std::function<void()> after_execute_;
@@ -2441,8 +2444,8 @@ private:
     // a counter that says which one: every other queue's next submission waits for it (storage_mutex_).
     VkSemaphore bindless_upload_semaphore_ = VK_NULL_HANDLE;
     std::uint64_t bindless_upload_value_ = 0;
-    // The page mirror's last bind batch (src/title_mirror.h): every queue's next submission of command lists waits for
-    // it, so none reads a page whose bind has not landed (storage_mutex_).
+    // The page mirror's last bind batch (src/title_mirror.h): every queue's next command-buffer submission waits for
+    // it under submit_mutex_, so none reads a page whose bind has not landed (submit_mutex_).
     MirrorBuffer mirror_buffer_;
     VkSemaphore mirror_bind_semaphore_ = VK_NULL_HANDLE;
     std::uint64_t mirror_bind_value_ = 0;
@@ -3153,11 +3156,7 @@ public:
     // submit lock, so other queues keep submitting, and without waiting for anything submitted after (review D9;
     // idle() waits for the whole VkQueue, which D3D12 queues may share, and blocks every submission meanwhile).
     bool wait_submitted() {
-        std::uint64_t value = 0;
-        {
-            std::lock_guard state(state_mutex_);
-            value = submitted_;
-        }
+        const std::uint64_t value = submitted_gpu_.load(std::memory_order_acquire);
         if (!value) return true;
         VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
         wait.semaphoreCount = 1;
@@ -3426,7 +3425,7 @@ private:
     }
 
     ReplayResult execute_now(std::span<const CommandList* const> lists, std::uint64_t execute_call,
-                             std::span<const std::size_t> batch_breaks = {}, std::uint64_t enqueue_serial = 0) {
+                             std::span<const std::size_t> batch_breaks = {}) {
         const bool skip_before = skip_before_execute_.load(std::memory_order_acquire);
         // The "submit frame" line and the floor: this submission from before its first phase to after its last.
         std::optional<submit_phases::Submission> submission;
@@ -3436,12 +3435,6 @@ private:
             if (!skip_before) waited.emplace(submit_phases::wait_room);
             if (context_.is_device_lost() || !wait_for_room()) return queue_unsupported(__LINE__);
         }
-        struct EnqueueSerialScope {
-            std::uint64_t outer;
-            explicit EnqueueSerialScope(std::uint64_t current) noexcept
-                : outer(std::exchange(VulkanContext::current_enqueue_serial_slot(), current)) {}
-            ~EnqueueSerialScope() { VulkanContext::current_enqueue_serial_slot() = outer; }
-        } serial_scope{enqueue_serial};
         if (!skip_before && context_.before_execute_) context_.before_execute_();
         struct AfterExecute {
             VulkanContext& context;
@@ -3545,11 +3538,6 @@ private:
                         exec_wait_values_.push_back(context_.bindless_upload_value_);
                     }
                     bindless_upload_seen_ = context_.bindless_upload_version_;
-                }
-                if (context_.mirror_bind_semaphore_ && context_.mirror_bind_value_ > mirror_bind_seen_) {
-                    exec_waits_.push_back(context_.mirror_bind_semaphore_);
-                    exec_wait_values_.push_back(context_.mirror_bind_value_);
-                    mirror_bind_seen_ = context_.mirror_bind_value_;
                 }
                 zero_buffers.swap(context_.zero_pending_);
             }
@@ -4112,11 +4100,6 @@ private:
                 }
                 bindless_upload_seen_ = context_.bindless_upload_version_;
             }
-            if (context_.mirror_bind_semaphore_ && context_.mirror_bind_value_ > mirror_bind_seen_) {
-                exec_waits_.push_back(context_.mirror_bind_semaphore_);
-                exec_wait_values_.push_back(context_.mirror_bind_value_);
-                mirror_bind_seen_ = context_.mirror_bind_value_;
-            }
             if (kind_ != QueueKind::copy && runs_shaders)
                 storage_images.assign(context_.storage_pending_.begin(), context_.storage_pending_.end());
             if (!storage_images.empty()) context_.storage_pending_.clear();
@@ -4377,9 +4360,20 @@ private:
         std::uint64_t last_epoch = kUnsetEpoch;
     };
 
-    void set_active_seq_locked(std::uint64_t first, std::uint64_t last = 0) {
+    struct HeldCountGuard {
+        QueueHolds<VkSemaphore>& holds;
+        std::int64_t delta;
+        void release() noexcept {
+            if (delta) {
+                holds.held_changed(delta);
+                delta = 0;
+            }
+        }
+        ~HeldCountGuard() { release(); }
+    };
+
+    void set_active_seq_locked(std::uint64_t first) {
         active_seq_ = first;
-        active_end_seq_ = last ? last : first;
         update_held_front_seq_locked();
     }
 
@@ -4567,7 +4561,7 @@ private:
                     take_waits_to_exec_locked();
                     state.unlock();
 
-                    result = execute_now(lists, execute_call, {}, enqueue_serial.value);
+                    result = execute_now(lists, execute_call);
                     note_coalesced_submit(1);
                     enqueue_serial.finish();
                     if (async_pin) {
@@ -4638,6 +4632,8 @@ private:
                     held_.pop_front();
                 }
 
+                HeldCountGuard held_guard{context_.holds(), -static_cast<std::int64_t>(batch_ops.size())};
+
                 const std::uint64_t last_seq = batch_ops.back().seq;
                 const std::uint64_t last_epoch = batch_ops.back().present_epoch;
                 bool stop_for_barrier =
@@ -4646,7 +4642,7 @@ private:
                      crosses_barrier(last_seq, held_.front().seq, last_epoch, held_.front().present_epoch, bseq));
 
                 Deferred& first = batch_ops.front();
-                set_active_seq_locked(first.seq, last_seq);
+                set_active_seq_locked(first.seq);
 
                 const bool log_latency = gpu_latency::enabled();
                 std::uint64_t latency_fence = 0;
@@ -4682,7 +4678,7 @@ private:
                 }
 
                 const ReplayResult result =
-                    execute_now(exec_list_ptrs_, first.execute_call, exec_batch_breaks_, first.enqueue_serial.value);
+                    execute_now(exec_list_ptrs_, first.execute_call, exec_batch_breaks_);
                 if (result == ReplayResult::success) {
                     note_coalesced_submit(batch_ops.size());
                     for (Deferred& op : batch_ops) {
@@ -4695,8 +4691,7 @@ private:
                     for (Deferred& op : batch_ops) {
                         exec_list_ptrs_.clear();
                         for (const auto& list : op.lists) exec_list_ptrs_.push_back(list.get());
-                        const ReplayResult sub =
-                            execute_now(exec_list_ptrs_, op.execute_call, {}, op.enqueue_serial.value);
+                        const ReplayResult sub = execute_now(exec_list_ptrs_, op.execute_call);
                         note_coalesced_submit(1);
                         if (sub != ReplayResult::success) {
                             int none = static_cast<int>(ReplayResult::success);
@@ -4729,7 +4724,7 @@ private:
                 state.lock();
                 restore_exec_waits_locked();
                 flush_exec_pins_locked(retired);
-                context_.holds().held_changed(-static_cast<std::int64_t>(batch_ops.size()));
+                held_guard.release();
                 set_active_seq_locked(0);
                 released = true;
                 const std::uint64_t bseq_after = barrier_seq_.load(std::memory_order_acquire);
@@ -4752,6 +4747,7 @@ private:
 
             Deferred op = std::move(held_.front());
             held_.pop_front();
+            HeldCountGuard held_guard{context_.holds(), -1};
             const std::uint64_t op_seq = op.seq;
             const std::uint64_t op_epoch = op.present_epoch;
             const bool op_barrier = op.barrier_after;
@@ -4803,7 +4799,7 @@ private:
             state.lock();
             restore_exec_waits_locked();
             flush_exec_pins_locked(retired);
-            context_.holds().held_changed(-1);
+            held_guard.release();
             set_active_seq_locked(0);
             released = true;
             const std::uint64_t bseq_after = barrier_seq_.load(std::memory_order_acquire);
@@ -4921,22 +4917,22 @@ private:
         }
     }
 
-    // Holder: the sequence number of the oldest active or held operation (read-only query).
+    // Holder: the sequence number of the oldest active, held, or queued operation (read-only query).
     std::uint64_t oldest_held_seq() override {
-        // Take state_mutex_ briefly (never held across execution) so reading active_seq_/held_ linearizes with
-        // next_seq() called under state_mutex_ before after_held() reads current_seq().
+        // Read inbox_mutex_ (running_seq_ / inbox_) before state_mutex_ (active_seq_ / held_): items only move
+        // inbox -> running -> held/active -> done, so reading upstream first cannot miss an item in transit.
         std::uint64_t oldest = 0;
+        if (async_started_.load(std::memory_order_acquire)) {
+            std::lock_guard lock(inbox_mutex_);
+            oldest = running_seq_ ? running_seq_ : inbox_.empty() ? 0 : inbox_.front().seq;
+        }
         {
             std::lock_guard state(state_mutex_);
             const std::uint64_t queued = held_.empty() ? 0 : held_.front().seq;
-            oldest = (active_seq_ && queued) ? std::min(active_seq_, queued)
-                   : active_seq_             ? active_seq_
-                                             : queued;
-        }
-        if (async_started_.load(std::memory_order_acquire)) {
-            std::lock_guard lock(inbox_mutex_);
-            const std::uint64_t queued = running_seq_ ? running_seq_ : inbox_.empty() ? 0 : inbox_.front().seq;
-            if (queued && (!oldest || queued < oldest)) oldest = queued;
+            const std::uint64_t active = (active_seq_ && queued) ? std::min(active_seq_, queued)
+                                       : active_seq_             ? active_seq_
+                                                                 : queued;
+            if (active && (!oldest || active < oldest)) oldest = active;
         }
         return oldest;
     }
@@ -5296,6 +5292,7 @@ private:
         }
         std::span<const VkSemaphore> semaphores = exec_waits_;
         std::span<const std::uint64_t> values = exec_wait_values_;
+        bool using_sparse = false;
         if (last_sparse_) {
             sparse_waits_ = exec_waits_;
             sparse_values_ = exec_wait_values_;
@@ -5303,6 +5300,7 @@ private:
             sparse_values_.push_back(last_sparse_);
             semaphores = sparse_waits_;
             values = sparse_values_;
+            using_sparse = true;
         }
         constexpr VkPipelineStageFlags kAllCmds = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
         VkPipelineStageFlags stack_stages[16] = {
@@ -5314,10 +5312,30 @@ private:
             submit_stages_.assign(semaphores.size(), kAllCmds);
             stages_ptr = submit_stages_.data();
         }
+        std::uint64_t mirror_bind_waited = 0;
         VkResult res = VK_SUCCESS;
         {
             std::unique_lock lock(context_.submit_mutex(), std::defer_lock);
             submit_phases::lock_timed(lock);  // a wait for another queue's submit is counted (the frame line)
+            // Check the page mirror's latest bind under submit_mutex_ (serialized with note_mirror_bind() and
+            // record_submit_locked()), so every command-buffer submission stamped after note_mirror_bind() waits on
+            // the sparse bind before reading any mirrored page.
+            if (command_buffer && context_.mirror_bind_semaphore_ && context_.mirror_bind_value_ > mirror_bind_seen_) {
+                if (!using_sparse) {
+                    sparse_waits_ = exec_waits_;
+                    sparse_values_ = exec_wait_values_;
+                    using_sparse = true;
+                }
+                sparse_waits_.push_back(context_.mirror_bind_semaphore_);
+                sparse_values_.push_back(context_.mirror_bind_value_);
+                semaphores = sparse_waits_;
+                values = sparse_values_;
+                mirror_bind_waited = context_.mirror_bind_value_;
+                if (semaphores.size() > 16) {
+                    submit_stages_.assign(semaphores.size(), kAllCmds);
+                    stages_ptr = submit_stages_.data();
+                }
+            }
             VkSemaphore signals[2]{progress_, VK_NULL_HANDLE};
             std::uint64_t signal_values[2]{ticket, 0};
             std::uint32_t signal_count = 1;
@@ -5395,6 +5413,7 @@ private:
             context_.enqueue_fence_callback(progress_, ticket, [kind, at] { gpu_latency::done(kind, at); });
         }
         if (ok) {
+            if (mirror_bind_waited > mirror_bind_seen_) mirror_bind_seen_ = mirror_bind_waited;
             submitted_ = ticket;
             submitted_gpu_.store(ticket, std::memory_order_release);
             clear_exec_waits(ticket);
@@ -5535,7 +5554,6 @@ private:
                             ++consumed_work;
                         }
                         running_seq_ = batch_calls.front().seq;
-                        running_end_seq_ = batch_calls.back().seq;
                         // A coalesced group executes as ONE in-flight submission; release the (K - 1) merged batch
                         // slots immediately so enqueue() can accumulate the next coalescing window without stalling.
                         if (batch_calls.size() > 1) {
@@ -5546,7 +5564,6 @@ private:
                         single_call = std::move(inbox_.front());
                         inbox_.pop_front();
                         running_seq_ = single_call.seq;
-                        running_end_seq_ = single_call.seq;
                         have_single = true;
                         ++consumed_work;
                     }
@@ -5561,13 +5578,15 @@ private:
                 QueueHolds<VkSemaphore>& holds;
                 ~WorkerTurnGuard() { holds.work_changed(-1); }
             } turn_guard{context_.holds()};
+            const std::size_t batch_count = batch_calls.size();
+            const bool have = have_single || batch_count != 0;
+            HeldCountGuard inbox_held_guard{
+                context_.holds(), have ? -static_cast<std::int64_t>(batch_count ? batch_count : 1) : 0};
             // Wrap the entire worker turn (release_held, call execution, and pump_ready) so gate-released batches and
             // deferred presents running on async_worker are attributed to worker_submit, never to title threads.
             const submit_phases::WorkerScope busy(submit_phases::worker_submit);
             DrainInfo rel_info{};
             const bool released = release && release_held(/*from_pump=*/false, &rel_info);
-            const std::size_t batch_count = batch_calls.size();
-            const bool have = have_single || batch_count != 0;
             if (released && have) {
                 const std::uint64_t next_seq = batch_count ? batch_calls.front().seq : single_call.seq;
                 const std::uint64_t next_epoch =
@@ -5611,15 +5630,13 @@ private:
             {
                 std::lock_guard lock(inbox_mutex_);
                 running_seq_ = 0;
-                running_end_seq_ = 0;
                 worker_busy_ = false;
                 if (batch_count != 0) --inbox_batches_;
                 if (have) room_cv_.notify_all();
                 idle_cv_.notify_all();
                 report_async_locked();
             }
-            if (have)
-                context_.holds().held_changed(-static_cast<std::int64_t>(batch_count ? batch_count : 1));
+            inbox_held_guard.release();
             single_call = Call{};
             batch_calls.clear();  // the snapshots, pins, and serials go before the pump, outside the lock
             if (have || released) context_.holds().pump_ready();
@@ -5693,7 +5710,7 @@ private:
                     hold_all_locked();
                     if (barrier_before_me) pause_release_for_barrier_.store(true, std::memory_order_release);
                 } else {
-                    set_active_seq_locked(calls.front().seq, calls.back().seq);
+                    set_active_seq_locked(calls.front().seq);
                     take_waits_to_exec_locked();
                     state.unlock();
 
@@ -5705,9 +5722,8 @@ private:
                         for (const auto& list : call.lists) exec_list_ptrs_.push_back(list.get());
                     }
 
-                    const ReplayResult result = execute_now(
-                        exec_list_ptrs_, calls.front().execute_call, exec_batch_breaks_,
-                        calls.front().enqueue_serial.value);
+                    const ReplayResult result =
+                        execute_now(exec_list_ptrs_, calls.front().execute_call, exec_batch_breaks_);
                     if (result == ReplayResult::success) {
                         note_coalesced_submit(calls.size());
                         for (Call& call : calls) {
@@ -5721,8 +5737,7 @@ private:
                         for (Call& call : calls) {
                             exec_list_ptrs_.clear();
                             for (const auto& list : call.lists) exec_list_ptrs_.push_back(list.get());
-                            const ReplayResult sub =
-                                execute_now(exec_list_ptrs_, call.execute_call, {}, call.enqueue_serial.value);
+                            const ReplayResult sub = execute_now(exec_list_ptrs_, call.execute_call);
                             note_coalesced_submit(1);
                             if (sub != ReplayResult::success) {
                                 int none = static_cast<int>(ReplayResult::success);
@@ -5902,7 +5917,6 @@ private:
     std::deque<Call> inbox_;
     std::size_t inbox_batches_ = 0;
     std::uint64_t running_seq_ = 0;      // oldest seq of the call(s) the worker runs now
-    std::uint64_t running_end_seq_ = 0;  // newest seq of the call(s) the worker runs now
     bool worker_busy_ = false, release_requested_ = false, async_stop_ = false;
     AsyncStats async_stats_;
     unsigned async_depth_ = async_depth();
@@ -5927,7 +5941,6 @@ private:
     std::condition_variable exec_cv_;
     bool executing_ = false;
     std::uint64_t active_seq_ = 0;
-    std::uint64_t active_end_seq_ = 0;
     std::deque<Deferred> held_;
     std::vector<std::shared_ptr<void>> wait_pins_;     // keep the fences of waits_ alive
     std::vector<std::shared_ptr<void>> retired_pins_;  // released by the caller once state_mutex_ is dropped

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "d3d12_title_buffer_windows.h"
+#include "../src/command_list_epochs.h"
 #include "../src/memory_breakdown.h"
 #include "../src/title_geometry_watch.h"
 #include "../src/submit_phases.h"
@@ -56,8 +57,9 @@ class GeometryViews {
     struct Retired {
         VkDeviceSize va{};
         std::size_t size{};
-        std::uint64_t ticket{};  // kAfterExecutes until execute_end() stamps it
-        std::uint64_t epoch{};   // the last execute begun when it was retired (kAfterExecutes only)
+        std::uint64_t ticket{};  // kAfterExecutes until execute_end() / stamp_retired() stamps it
+        std::uint64_t epoch{};   // the last execute enqueued when it was retired (kAfterExecutes only)
+        std::uint64_t lists{};   // the command-list epoch of the retirement (kAfterExecutes only)
     };
     std::uint64_t cap_override_{};
     mutable std::mutex mutex_;
@@ -113,10 +115,11 @@ class GeometryViews {
     std::map<Address, Tile> tiles_;
     std::vector<Retired> retired_;
     std::atomic<std::size_t> retired_count_{0};
-    // The ExecuteCommandLists replays in progress (execute_begin/execute_end), by the serial each began with. A view
-    // retired at kAfterExecutes may be named by any of them: by a list recorded before the retirement, or by a console
-    // heap slot their before_execute_ translated. It gets its retire ticket only once all of them have recorded their
-    // submissions, so a ticket read then covers them, however many tickets a replay records and on whichever queue.
+    // The ExecuteCommandLists replays in progress (execute_enqueue/execute_end), by the serial each enqueued with.
+    // A view retired at kAfterExecutes may be named by any of them (console heap slots their before_execute_
+    // translated) or by any live command list recorded before the retirement (src/command_list_epochs.h). It gets
+    // its retire ticket only once all such replays have recorded their submissions and all such command lists are gone,
+    // so a ticket read then covers them, however many tickets a replay records and on whichever queue.
     std::mutex execute_mutex_;  // a leaf lock
     std::uint64_t execute_serial_{};
     std::vector<std::uint64_t> executing_;
@@ -386,15 +389,7 @@ public:
         executing_.push_back(++execute_serial_);
         return execute_serial_;
     }
-    // An ExecuteCommandLists replay starts (before its before_execute_ work): its serial, for execute_end().
-    // When `enqueued_serial` != 0, execute_enqueue() already registered it in executing_ at enqueue time.
-    std::uint64_t execute_begin(std::uint64_t enqueued_serial = 0) {
-        if (enqueued_serial) return enqueued_serial;
-        std::lock_guard lock(execute_mutex_);
-        executing_.push_back(++execute_serial_);
-        return execute_serial_;
-    }
-    // The last replay begun (or enqueued), and the oldest still in progress (kAfterExecutes when none): what
+    // The last replay enqueued, and the oldest still in progress (kAfterExecutes when none): what
     // execute_end stamps by, for a copy the device retires the same way outside these views (a title window,
     // DeviceState::retire_orphan_windows).
     std::uint64_t execute_epoch() {
@@ -407,17 +402,12 @@ public:
         for (const auto s : executing_) oldest = (std::min)(oldest, s);
         return oldest;
     }
-    // The replay that began (or was enqueued) with `serial` has recorded its submissions (or was dropped). Views
-    // retired while only replays now finished were in progress get submitted() (the context's
-    // submitted_retire_ticket(), read here, after those replays recorded theirs) as their retire ticket.
+    // Stamps every unstamped retired view whose pre-retirement replays have finished and whose pre-retirement
+    // command lists are gone (src/command_list_epochs.h) with submitted() (the context's submitted_retire_ticket(),
+    // read after oldest_list so any list released before that read has had its submissions counted).
     // Lock order: mutex_ -> execute_mutex_, as in retire_range.
     template<class Submitted>
-    void execute_end(std::uint64_t serial, Submitted&& submitted) {
-        if (!serial) return;
-        {
-            std::lock_guard lock(execute_mutex_);
-            std::erase(executing_, serial);
-        }
+    void stamp_retired(Submitted&& submitted) {
         if (!unstamped_.load(std::memory_order_acquire)) return;
         std::lock_guard lock(mutex_);
         std::uint64_t oldest = kAfterExecutes;
@@ -425,14 +415,27 @@ public:
             std::lock_guard execute(execute_mutex_);
             for (const auto s : executing_) oldest = (std::min)(oldest, s);
         }
+        // Before the ticket: a list released after this read has had its submissions counted in it.
+        const std::uint64_t oldest_list = leonida::command_list_epochs::oldest();
         const std::uint64_t ticket = submitted();
         bool left = false;
         for (auto& r : retired_) {
             if (r.ticket != kAfterExecutes) continue;
-            if (r.epoch < oldest) r.ticket = ticket;
+            if (r.epoch < oldest && r.lists <= oldest_list) r.ticket = ticket;
             else left = true;
         }
         unstamped_.store(left, std::memory_order_release);
+    }
+    // The replay that was enqueued with `serial` has recorded its submissions (or was dropped). Views retired while
+    // only replays now finished and command lists now gone were live get submitted() as their retire ticket.
+    template<class Submitted>
+    void execute_end(std::uint64_t serial, Submitted&& submitted) {
+        if (!serial) return;
+        {
+            std::lock_guard lock(execute_mutex_);
+            std::erase(executing_, serial);
+        }
+        stamp_retired(submitted);
     }
 
     // Retires every live view overlapping [begin, end), unlinking it from lookup/refresh/watch immediately and
@@ -488,7 +491,7 @@ public:
                     v.ready = false;
                 }
                 callbacks.push_back({v.source, v.size, v.va});
-                retired_.push_back({v.va, v.size, retire_ticket, 0});
+                retired_.push_back({v.va, v.size, retire_ticket, 0, 0});
             }
             if (!ids.empty()) {
                 std::unique_lock structure(structure_mutex_);
@@ -504,15 +507,19 @@ public:
                 for (const auto id : ids) fast_.erase({views_[id].source, views_[id].size});
                 for (const auto& k : stale_refused) fast_.erase(k);
             }
-            // No resolve() or find() answers these views from here on, so a replay that begins now cannot name them:
-            // they wait only for the replays begun so far.
+            // No resolve() or find() answers these views from here on, so a replay or command list whose recording
+            // begins now cannot name them: they wait only for replays enqueued so far and command lists already alive.
             if (retire_ticket == kAfterExecutes && !ids.empty()) {
                 std::uint64_t epoch = 0;
                 {
                     std::lock_guard execute(execute_mutex_);
                     epoch = execute_serial_;
                 }
-                for (std::size_t i = first_retired; i < retired_.size(); ++i) retired_[i].epoch = epoch;
+                const std::uint64_t lists = leonida::command_list_epochs::advance();
+                for (std::size_t i = first_retired; i < retired_.size(); ++i) {
+                    retired_[i].epoch = epoch;
+                    retired_[i].lists = lists;
+                }
             }
             for (const auto& k : stale_refused) refused_.erase(k);
             for (const auto id : ids) {

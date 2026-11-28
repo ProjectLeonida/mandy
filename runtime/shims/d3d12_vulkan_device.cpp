@@ -3556,6 +3556,7 @@ struct DeviceState {
     // A stream-pool extent it backed leaves pool_spans: the next request for those pages makes a new mapping.
     void drain_geometry_releases() {
         if (!context || !geometry.has_pending_reclaim()) return;
+        geometry.stamp_retired([this] { return context->submitted_retire_ticket(); });
         const std::uint64_t completed_ticket = geometry.has_retired() ? context->completed_retire_ticket() : 0;
         geometry.drain_released(
             *this, rt::d3d12::GeometryViews::kAfterExecutes, completed_ticket,
@@ -3575,17 +3576,25 @@ struct DeviceState {
         pool_span_count.store(pool_spans.size(), std::memory_order_relaxed);
         ++pool_spans_retired;
     }
+    // Before refresh_shadows (next to drain_geometry_releases): stamps retired windows whose pre-retirement replays
+    // and command lists have finished, and frees those whose GPU ticket has completed so any target_gone slot changes
+    // from destroyed external blocks apply during this submission's heap refresh.
+    void reclaim_retired_windows() {
+        if (!context || !retired_window_count.load(std::memory_order_acquire)) return;
+        stamp_retired_windows();  // lists reset or released since the last replay
+        const std::uint64_t completed = context->completed_retire_ticket();
+        std::lock_guard windows(title_window_mutex);
+        free_retired_windows(completed);
+    }
     // After this submission's refresh (the windows' last copy is the one it made): a title window no address range
     // answers from any more leaves the refresh. Its ranges went because a newer range was entered over them (a
     // slot-133 buffer placed over the pages, a BVH input's exact copy, src/title_va_alias.h add), and a window nothing
     // reaches is only cost: its tracker walks its pages at every refresh and its bytes count against
     // LEONIDA_TITLE_WINDOWS_MB. Its stream-pool extent and its budget go at once; its copy leaves its tracker and its
-    // memory is freed later (retired_windows), and the retired windows due are freed here. Only windows whose copy a
+    // memory is freed later (retired_windows, reclaimed in reclaim_retired_windows). Only windows whose copy a
     // removed range answered from are looked at (alias_changed records those).
     void retire_orphan_windows() {
-        if (!context || (!window_alias_removals_pending.load(std::memory_order_acquire) &&
-                         !retired_window_count.load(std::memory_order_acquire)))
-            return;
+        if (!context || !window_alias_removals_pending.load(std::memory_order_acquire)) return;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> removed;  // (shader VA, bytes)
         bool every = false;
         {
@@ -3595,11 +3604,8 @@ struct DeviceState {
             window_alias_removals_overflow = false;
             window_alias_removals_pending.store(false, std::memory_order_release);
         }
-        stamp_retired_windows();  // lists reset or released since the last replay
-        const std::uint64_t completed = context->completed_retire_ticket();
-        std::lock_guard windows(title_window_mutex);
-        free_retired_windows(completed);
         if (removed.empty() && !every) return;
+        std::lock_guard windows(title_window_mutex);
         std::sort(removed.begin(), removed.end());
         std::uint64_t longest = 0;
         for (const auto& r : removed) longest = std::max(longest, r.second);
@@ -3686,8 +3692,8 @@ struct DeviceState {
         }
     }
     // A replay has recorded its submissions, or a refresh runs: retired windows that only replays now finished and
-    // only lists now gone may name get the submissions recorded so far as their ticket (GeometryViews::execute_end
-    // does the same for its views, by replays alone).
+    // only lists now gone may name get the submissions recorded so far as their ticket (GeometryViews::stamp_retired
+    // does the same for its views).
     void stamp_retired_windows() {
         if (!retired_windows_unstamped.load(std::memory_order_acquire)) return;
         // Under the lock: a window retired by a replay begun after `oldest` was read must not be stamped here.
@@ -5190,6 +5196,7 @@ struct DeviceState {
         std::uint64_t presents = 0;  // present serial at the last log line
         std::uint64_t faults_seen = 0, hot_seen = 0, cold_seen = 0;  // the tracking's counters at the last log line
         std::uint64_t uploaded_seen = 0, conflicts_seen = 0;           // the mirror's, likewise
+        std::uint64_t unbinds_seen = 0, homes_freed_seen = 0;
         // The write-back's GPU copy of the homes it looks at (page_mirror_write_back_ranges): a host-cached buffer of
         // kReadbackPages pages, its command buffer and fence, made at the first write-back. Protected by
         // `readback_mutex` (lock order: `readback_mutex` -> `mutex`, never the reverse) so `mutex` is released across
@@ -5534,13 +5541,12 @@ struct DeviceState {
                 ++m.resolve_refused;
                 return false;
             }
-            const std::uint64_t ticket = context->submitted_retire_ticket() + 1;
             for (std::uint64_t page = from; page < to; page += kPage) {
                 if (m.mirror->mirrored(page)) continue;
                 auto* const frame = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(page));
                 if (m.readback_in_flight) m.readback_invalidated.insert(frame);
                 m.tracking->watch(page);  // before the fill: a write after it is in the next collect
-                m.mirror->map(page, frame, nullptr, ticket);
+                m.mirror->map(page, frame, nullptr);
                 m.identity.insert(page);
                 ++m.identity_mapped;
             }
@@ -5854,7 +5860,8 @@ struct DeviceState {
             ++m.value;
             ++m.batches;
             m.binds += m.mirror->last_batch();
-            context->note_mirror_bind(m.timeline, m.value);
+            const std::uint64_t retire_ticket = context->note_mirror_bind(m.timeline, m.value);
+            m.mirror->stamp_freed(retire_ticket);
         }
     }
 
@@ -5924,7 +5931,6 @@ struct DeviceState {
         m.feed.clear();
         m.feed_pending.store(false, std::memory_order_release);
         ReleaseSRWLockExclusive(&m.feed_lock);
-        const std::uint64_t ticket = context->submitted_retire_ticket() + 1;
         m.fed_now.clear();
         for (auto& change : m.taken) {
             ++m.fed;
@@ -5936,7 +5942,7 @@ struct DeviceState {
             // Watched before the home is filled: a write after the fill is in the next collect.
             if (!change.frame) m.tracking->unwatch(change.page);
             else if (m.mirror->covers(change.page)) m.tracking->watch(change.page);
-            m.mirror->map(change.page, change.frame, std::move(change.keep), ticket);
+            m.mirror->map(change.page, change.frame, std::move(change.keep));
         }
         m.taken.clear();
         // Ordinary memory released or decommitted: its mirrored pages leave (named again, they are mirrored again).
@@ -5950,7 +5956,7 @@ struct DeviceState {
                 if (m.readback_in_flight)
                     if (std::uint8_t* old_frame = m.mirror->frame_at(*page)) m.readback_invalidated.insert(old_frame);
                 m.tracking->unwatch(*page);
-                m.mirror->map(*page, nullptr, nullptr, ticket);
+                m.mirror->map(*page, nullptr, nullptr);
                 ++m.identity_released;
                 page = m.identity.erase(page);
             }
@@ -5998,15 +6004,16 @@ struct DeviceState {
             std::fprintf(stderr,
                          "[rt] d3d12: page mirror: %llu pages mirrored, %llu homes in %llu units (%llu MiB), %llu chunks "
                          "(%llu not placed); in %.0f s: %llu refreshes, %llu changes fed, %llu pages written, %llu "
-                         "uploads, %llu binds in %llu batches, %llu arms refused, %.3f ms a refresh; changes outside "
-                         "the chunks %llu; readers: %llu ranges resolved into it, %llu refused, %llu ordinary pages "
-                         "mirrored and %llu released, %llu buffer bindings cut at a chunk's end; %llu slot-133 buffers "
-                         "made on it, %llu KiB of GPU writes copied back; homes in device-local memory %llu units, in "
-                         "host memory %llu; tracking: %zu pages hot, %zu cold, %llu write faults, %llu hot and %llu "
-                         "cold copies; uploaded %.1f KiB a submission and %.1f KiB a frame; written back %.1f KiB a "
-                         "submission and %.1f KiB a frame; %llu pieces written on both sides (the title's kept); "
-                         "write-back: %llu calls, %.3f ms each (%.3f of it the GPU's copy of the homes and its wait), "
-                         "%.3f ms the longest, %.1f MiB of homes copied out\n",
+                         "uploads, %llu binds (%llu unbinds, %llu homes freed) in %llu batches, %llu arms refused, "
+                         "%.3f ms a refresh; changes outside the chunks %llu; readers: %llu ranges resolved into it, "
+                         "%llu refused, %llu ordinary pages mirrored and %llu released, %llu buffer bindings cut at a "
+                         "chunk's end; %llu slot-133 buffers made on it, %llu KiB of GPU writes copied back (%llu KiB "
+                         "total); homes in device-local memory %llu units, in host memory %llu; tracking: %zu pages "
+                         "hot, %zu cold, %llu write faults, %llu hot and %llu cold copies; uploaded %.1f KiB a "
+                         "submission and %.1f KiB a frame; written back %.1f KiB a submission and %.1f KiB a frame; "
+                         "%llu pieces written on both sides (the title's kept); write-back: %llu calls, %.3f ms each "
+                         "(%.3f of it the GPU's copy of the homes and its wait), %.3f ms the longest, %.1f MiB of "
+                         "homes copied out\n",
                          static_cast<unsigned long long>(c.pages), static_cast<unsigned long long>(c.homes),
                          static_cast<unsigned long long>(c.units),
                          static_cast<unsigned long long>(c.units * (leonida::TitleMirror::kUnitBytes >> 20)),
@@ -6014,6 +6021,8 @@ struct DeviceState {
                          std::chrono::duration<double>(now - m.since).count(), static_cast<unsigned long long>(m.refreshes),
                          static_cast<unsigned long long>(m.fed), static_cast<unsigned long long>(m.dirty),
                          static_cast<unsigned long long>(m.uploads), static_cast<unsigned long long>(m.binds),
+                         static_cast<unsigned long long>(c.unbinds - m.unbinds_seen),
+                         static_cast<unsigned long long>(c.homes_freed - m.homes_freed_seen),
                          static_cast<unsigned long long>(m.batches), static_cast<unsigned long long>(m.arm_failures),
                          m.refreshes ? m.ms / double(m.refreshes) : 0.0,
                          static_cast<unsigned long long>(c.unmirrored_changes),
@@ -6021,6 +6030,7 @@ struct DeviceState {
                          static_cast<unsigned long long>(m.identity_mapped),
                          static_cast<unsigned long long>(m.identity_released), static_cast<unsigned long long>(m.clipped),
                          static_cast<unsigned long long>(m.buffers), static_cast<unsigned long long>(m.written_back >> 10),
+                         static_cast<unsigned long long>(c.written_back_bytes >> 10),
                          static_cast<unsigned long long>(m.units_local), static_cast<unsigned long long>(m.units_host),
                          policy.hot, policy.cold, static_cast<unsigned long long>(policy.faults - m.faults_seen),
                          static_cast<unsigned long long>(policy.hot_copies - m.hot_seen),
@@ -6038,6 +6048,8 @@ struct DeviceState {
             m.write_back_ms = m.write_back_wait_ms = m.write_back_max_ms = 0;
             m.uploaded_seen = c.uploaded_bytes;
             m.conflicts_seen = c.conflicts;
+            m.unbinds_seen = c.unbinds;
+            m.homes_freed_seen = c.homes_freed;
             m.faults_seen = policy.faults;
             m.hot_seen = policy.hot_copies;
             m.cold_seen = policy.cold_copies;
@@ -7866,7 +7878,7 @@ struct DeviceState {
                 std::lock_guard lock(page_mirror.mutex);
                 std::erase(page_mirror.in_place, heap.get());
                 if (page_mirror.mirror)
-                    page_mirror.mirror->unalias(console_va, context->submitted_retire_ticket() + 1);
+                    page_mirror.mirror->unalias(console_va);
             }
             refresh_page_mirror();
             flush_page_mirror();
@@ -16600,8 +16612,8 @@ struct TitleTexture {
     bool hashed = false;
     bool write_combined = false;            // cached PAGE_WRITECOMBINE from VirtualQuery; invalidated on remap
     bool write_combined_known = false;
-    bool gpu_uploaded = false;              // last upload came directly from TitleMirror (Stage 3b GPU detile/copy)
-    std::uint64_t mirror_hash = 0;          // TitleMirror::range_sum() as of the last Stage 3b GPU upload
+    bool gpu_uploaded = false;              // last upload came directly from TitleMirror (GPU detile/copy)
+    std::uint64_t mirror_hash = 0;          // TitleMirror::range_sum() as of the last GPU mirror upload
     bool mirror_hash_valid = false;
     std::uint64_t fills = 0;
     unsigned view_mip = 0;                  // first mip of the last slot-70 view
@@ -17691,6 +17703,7 @@ public:
                 full = refreshed_present_.exchange(serial, std::memory_order_relaxed) != serial;
             }
             state_.drain_geometry_releases();
+            state_.reclaim_retired_windows();
             state_.reclaim_arena();
             state_.refresh_shadows(full || per_frame < 2, full);
             state_.retire_orphan_windows();
@@ -18569,7 +18582,7 @@ public:
         state_.context->set_heap_base(arena.address, arena.size);
         leonida::fsdraw::note_arena(&state_, arena.size, [st = &state_](std::uint64_t va, void* out, std::size_t n) {
             return st->arena.backing.with_host(va, n, [&](const std::uint8_t* host) { std::memcpy(out, host, n); });
-        });  // LOCAL DIAGNOSTIC
+        });
         leonida::fsdraw::backing_hook().store(&fsdraw_backing, std::memory_order_release);
         state_.context->set_zero_page(arena.buffer, null_bytes, kZeroPage);
         state_.context->set_quad_indices(arena.buffer, null_bytes + kZeroPage, kQuadIndexCount);
@@ -19155,11 +19168,11 @@ public:
                     watch.touch(t.address);
             }
         };
-        // Stage 3a + Stage 3b batch execution:
+        // Batched texture refresh:
         //   1. Hash-before-reserve for ALL CPU-checked textures (including tiles == 1) on TitleReadPool.
         //   2. Only reserve staging slots & detile on CPU for CPU jobs whose bytes actually changed.
-        //   3. Mirrored textures eligible for Stage 3b (linear direct copy or GPU compute detile from TitleMirror)
-        //      bypass CPU whole-reads, CPU detiling, and host staging completely.
+        //   3. Mirrored textures eligible for GPU mirror upload (linear direct copy or GPU compute detile from
+        //      TitleMirror) bypass CPU whole-reads, CPU detiling, and host staging completely.
         //   4. Record and submit all uploads of the batch in ONE batched command buffer + ONE vkQueueSubmit.
         std::uint64_t filled = 0;
         title_jobs_.clear();
@@ -19394,8 +19407,8 @@ public:
             const std::size_t tiles = std::size_t(((t.cpu + span + 0xffff) & ~std::uint64_t(0xffff)) -
                                                   (t.cpu & ~std::uint64_t(0xffff))) >>
                                       16;
-            // Stage 3b: check if all pages of this texture are already mirrored and flushed in a single TitleMirror
-            // chunk and supported by GPU linear direct copy or GPU compute detile.
+            // GPU mirror path: check if all pages of this texture are already mirrored and flushed in a single
+            // TitleMirror chunk and supported by GPU linear direct copy or GPU compute detile.
             if (gpu_detile_on && from == 0) {
                 VkBuffer m_buf = VK_NULL_HANDLE;
                 VkDeviceSize m_off = 0, m_chunk = 0;
@@ -19404,7 +19417,7 @@ public:
                 if (state_.page_mirror_texture_chunk(t.cpu, t.address, span, m_buf, m_off, m_chunk, m_tl, m_val, m_hash,
                                                      allow_record_synced ? &title_synced_frames_ : nullptr,
                                                      reuse_synced_frames)) {
-                    // 256-byte piece-hash filter: skip unchanged Stage 3b GPU textures in ~15 ns (zero CPU read of
+                    // 256-byte piece-hash filter: skip unchanged GPU-uploaded textures in ~15 ns (zero CPU read of
                     // title memory, zero title_upload_mutex lock, zero GPU command recording).
                     if (t.gpu_uploaded && t.fills && t.mirror_hash_valid && m_hash == t.mirror_hash) {
                         ++stats.unchanged_parts;
@@ -19449,7 +19462,7 @@ public:
                     }
                 }
             }
-            // Stage 3a CPU path: hash-before-reserve for ALL textures including tiles == 1 (`<= tiles`).
+            // CPU upload path: hash-before-reserve for ALL textures including tiles == 1 (`<= tiles`).
             TitleJob& job = title_jobs_.emplace_back();
             job.entry = entry;
             job.resource = t.resource;
@@ -19648,7 +19661,7 @@ private:
         std::atomic<bool> failed{false};  // a piece of a whole read could not be copied
         std::uint64_t detile_ns = 0;
         bool write_combined = false, trace = false, copied = false, unchanged = false, nonzero = false;
-        // Stage 3b GPU mirror upload fields:
+        // GPU mirror upload fields:
         bool gpu_mirror = false;
         rt::d3d12::TitleImageUpload::UploadKind gpu_kind = rt::d3d12::TitleImageUpload::UploadKind::cpu_slot;
         VkBuffer mirror_buffer = VK_NULL_HANDLE;

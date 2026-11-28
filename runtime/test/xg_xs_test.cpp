@@ -473,7 +473,7 @@ int main() {
         for (unsigned pass = 0; pass < 3; ++pass) poll([] { return true; });
         check(polled == std::vector<int>{4}, "an expired wall budget advances past priority entries to the next texture");
 
-        // LEONIDA_TITLE_EVERY_BUDGET_US: the marked textures (mapped or stale) are visited from a cursor of their own
+        // visit_marked_title_textures: the marked textures (mapped or stale) are visited from a cursor of their own
         // until the budget runs out; the unmarked ones are the round robin's and are skipped here.
         {
             Entry m1{true, false, 11}, u1{false, false, 12}, s1{false, true, 13}, m2{true, false, 14};

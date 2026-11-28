@@ -843,6 +843,44 @@ int range_sum_piece_hashing() {
     return 0;
 }
 
+int unstamped_freed_homes_wait_for_flush() {
+    Fixture f;
+    TitleMirror mirror(f.hooks());
+    EXPECT(mirror.cover(kBase, kBase + 4 * kPage));
+    const VkBuffer arena = fake<VkBuffer>(0x99);
+    constexpr VkDeviceSize kAt = 0xc000000;
+    mirror.alias(kBase, kBase + 2 * kPage, arena, kAt);
+
+    std::vector<std::uint8_t> f0(kPage, 0x31);
+    std::vector<std::uint8_t> f1(kPage, 0x42);
+    mirror.map(kBase, f0.data(), nullptr);
+    mirror.map(kBase + kPage, f1.data(), nullptr);
+    EXPECT(mirror.flush(1));
+    EXPECT(mirror.unstamped_freed_count() == 0 && !mirror.has_retired_homes() && mirror.counters().homes_freed == 0);
+
+    // Unmap page 0 (frees both its home and its aliased filtered copy as unstamped) and unalias page 1 (frees its
+    // filtered copy as unstamped): NONE of the 3 freed slots may be retired until flush() + stamp_freed() run.
+    mirror.map(kBase, nullptr, nullptr);
+    mirror.unalias(kBase);
+    EXPECT(mirror.unstamped_freed_count() == 3);
+    EXPECT(!mirror.has_retired_homes());
+    mirror.retire(UINT64_MAX);
+    EXPECT(mirror.counters().homes_freed == 0 && mirror.unstamped_freed_count() == 3);
+
+    // Flush publishes the sparse unbinds; stamp_freed(42) stamps the 3 slots with the post-note_mirror_bind ticket.
+    EXPECT(mirror.flush(2));
+    mirror.stamp_freed(42);
+    EXPECT(mirror.unstamped_freed_count() == 0);
+    EXPECT(mirror.has_retired_homes() && !mirror.has_retired_homes(41) && mirror.has_retired_homes(42));
+    mirror.retire(41);
+    EXPECT(mirror.counters().homes_freed == 0 && mirror.has_retired_homes());
+    mirror.retire(42);
+    EXPECT(mirror.counters().homes_freed == 3 && !mirror.has_retired_homes());
+
+    std::printf("unstamped_freed_homes_wait_for_flush: unstamped home and alias copies stay held until flush + stamp ok\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -858,6 +896,7 @@ int main() {
     if (reentrant_rehash_in_alias_and_handoff()) return 1;
     if (lock_free_pending_fast_paths()) return 1;
     if (range_sum_piece_hashing()) return 1;
+    if (unstamped_freed_homes_wait_for_flush()) return 1;
     std::printf("title_mirror_hooks_test: ok\n");
     return 0;
 }

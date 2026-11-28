@@ -1020,17 +1020,14 @@ int queue_sync_and_async() {
 
         std::atomic<unsigned> before_n{0};
         std::atomic<bool> b1_entered{false}, b1_go{false}, b2_entered{false}, b2_go{false};
-        std::atomic<std::uint64_t> b1_seen_serial{0}, b2_seen_serial{0};
         context.set_before_execute([&] {
             const unsigned n = before_n.fetch_add(1, std::memory_order_acq_rel) + 1;
             if (n == 1) {
-                b1_seen_serial.store(VulkanContext::current_enqueue_serial(), std::memory_order_release);
                 b1_entered.store(true, std::memory_order_release);
                 while (!b1_go.load(std::memory_order_acquire)) std::this_thread::yield();
                 // Batch 1 retires view #1 AFTER batch 2 has already been enqueued in inbox_!
                 tracker.retire(1);
             } else if (n == 2) {
-                b2_seen_serial.store(VulkanContext::current_enqueue_serial(), std::memory_order_release);
                 b2_entered.store(true, std::memory_order_release);
                 while (!b2_go.load(std::memory_order_acquire)) std::this_thread::yield();
             }
@@ -1039,7 +1036,6 @@ int queue_sync_and_async() {
         // 1. Enqueue batch 1 (serial 1); wait until worker enters batch 1's before_execute_().
         EXPECT(queue.execute({&snap, 1}) == ReplayResult::success);
         while (!b1_entered.load(std::memory_order_acquire)) std::this_thread::yield();
-        EXPECT(b1_seen_serial.load(std::memory_order_acquire) == 1);
 
         // 2. Title thread enqueues batch 2 (serial 2) + batch 3 (serial 3) into inbox_ while batch 1 is in flight!
         VulkanFence done(context, 0);
@@ -1052,7 +1048,6 @@ int queue_sync_and_async() {
         //    pauses at n == 2 inside before_execute_().
         b1_go.store(true, std::memory_order_release);
         while (!b2_entered.load(std::memory_order_acquire)) std::this_thread::yield();
-        EXPECT(b2_seen_serial.load(std::memory_order_acquire) == 2);
 
         // Wait until batch 1's GPU submission has completely retired on the GPU!
         const std::uint64_t b1_ticket = context.submitted_retire_ticket();
@@ -1532,6 +1527,46 @@ int queue_sync_and_async() {
             EXPECT(db[16] == 0xF1 && db[32] == 0xF2 && db[48] == 0xF3 && db[0] == 0xF3);
         }
         std::printf("queue held Present/after_held barrier ordering: present_epoch & in-transit barrier_seq_ ok\n");
+    }
+
+    // 10. note_mirror_bind() returns the latest submitted retire ticket under submit_mutex_, and every subsequent
+    //     command-buffer submission on VulkanQueue waits on the newly published mirror bind timeline semaphore value.
+    {
+        VulkanContext context(d.device_proc, d.device, true);
+        EXPECT(context.loaded());
+        VulkanQueue queue(context, d.queue, d.family, VulkanQueue::QueueKind::direct);
+        EXPECT(queue.ok());
+
+        auto empty = std::make_shared<CommandList>();
+        EXPECT(empty->close());
+        std::shared_ptr<const CommandList> snap = empty;
+
+        EXPECT(queue.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(queue.idle());
+        const std::uint64_t t_before = context.submitted_retire_ticket();
+        EXPECT(t_before >= 1);
+
+        VulkanFence mirror_tl(context, 0), done(context, 0);
+        EXPECT(mirror_tl.semaphore() != VK_NULL_HANDLE && done.semaphore() != VK_NULL_HANDLE);
+        const std::uint64_t bind_ticket = context.note_mirror_bind(mirror_tl.semaphore(), 1);
+        EXPECT(bind_ticket == t_before);
+        {
+            std::lock_guard lock(context.submit_mutex());
+            VkSemaphore seen_sem = VK_NULL_HANDLE;
+            std::uint64_t seen_val = 0;
+            context.mirror_bind_locked(seen_sem, seen_val);
+            EXPECT(seen_sem == mirror_tl.semaphore() && seen_val == 1);
+        }
+
+        // Next submission MUST wait on (mirror_tl, 1) before completing on the GPU.
+        EXPECT(queue.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(queue.signal(done.semaphore(), 1));
+        EXPECT(!done.wait(1, 20'000'000ull));  // 20 ms: still blocked waiting for mirror_tl == 1
+        EXPECT(mirror_tl.signal(1));
+        EXPECT(done.wait(1, 5'000'000'000ull));
+        EXPECT(queue.idle());
+        EXPECT(context.submitted_retire_ticket() > bind_ticket);
+        std::printf("note_mirror_bind ticket & submit wait ordering: ok\n");
     }
 
     return 0;

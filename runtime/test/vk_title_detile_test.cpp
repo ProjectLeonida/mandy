@@ -1,4 +1,4 @@
-// GPU detile & linear mirror direct-copy bit-for-bit parity test (Stage 3b, src/vulkan_title_detile.h).
+// GPU detile & linear mirror direct-copy bit-for-bit parity test (src/vulkan_title_detile.h).
 //
 // Verifies bit-for-bit parity between leonida::TitleDetilePipeline (GPU compute detile & direct linear copy into a
 // real optimal-tiling VkImage, read back via vkCmdCopyImageToBuffer) and the CPU console texture detiler
@@ -253,7 +253,7 @@ int run_case(vktest::Device& d, leonida::TitleDetilePipeline& pipe, const Format
     EXPECT(make_host_buffer(d, std::max<VkDeviceSize>(readback_bytes, 64), VK_BUFFER_USAGE_TRANSFER_DST_BIT, readback));
     std::memset(readback.mapped, 0x5A, std::size_t(readback.size));
 
-    // 4. Execute Stage 3b GPU path (direct linear copy OR compute detile -> scratch -> image) + readback.
+    // 4. Execute GPU mirror path (direct linear copy OR compute detile -> scratch -> image) + readback.
     const bool is_linear = ec.swizzle == ct::kLinear;
     std::vector<VkBufferImageCopy> copy_regions;
     std::vector<leonida::TitleDetileDispatch> dispatches;

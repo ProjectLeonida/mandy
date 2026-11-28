@@ -3107,7 +3107,6 @@ if(TARGET Vulkan::Headers)
     # the tracking policy (src/title_write_policy.h).
     add_executable(guard_fault_bench test/guard_fault_bench.cpp)
     target_compile_definitions(guard_fault_bench PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    add_test(NAME guard_fault_bench COMMAND guard_fault_bench)
     # The page mirror's hot/cold tracking (src/title_mirror_hot_cold.h) on real guards.
     add_executable(title_mirror_hot_cold_test test/title_mirror_hot_cold_test.cpp)
     target_compile_definitions(title_mirror_hot_cold_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

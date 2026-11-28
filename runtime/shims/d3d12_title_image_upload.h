@@ -44,7 +44,13 @@ public:
         for (auto& slot : slots_) release_buffer(d, *slot);
         batch_cmds_.clear();
         if (pool_) vk.vkDestroyCommandPool(d.info.device, pool_, nullptr);
-        if (ready_) vk.vkDestroySemaphore(d.info.device, ready_, nullptr);
+        if (ready_) {
+            {
+                std::lock_guard lock(d.context->submit_mutex());
+                d.context->retire_queue_idle_locked(ready_);
+            }
+            vk.vkDestroySemaphore(d.info.device, ready_, nullptr);
+        }
         pool_ = VK_NULL_HANDLE;
         for (auto& slot : slots_) slot->command = VK_NULL_HANDLE;
         ready_ = VK_NULL_HANDLE;
@@ -102,7 +108,7 @@ public:
 
     enum class UploadKind : std::uint8_t { cpu_slot, mirror_linear, mirror_detile };
 
-    // Determines whether a mirrored texture in a single TitleMirror chunk can take Stage 3b GPU direct copy or GPU
+    // Determines whether a mirrored texture in a single TitleMirror chunk can take GPU direct copy or GPU
     // compute detile. Returns true and sets `out_kind` when supported; false means use CPU fallback.
     template<class Device>
     bool can_gpu_upload(Device& d, const leonida::ResourceBinding& image, const xg_xs::Texture& layout,
@@ -622,6 +628,7 @@ private:
         for (auto& b : batch_cmds_) {
             if (b.value && wait_value(d, b.value)) b.value = 0;
         }
+        if (value_ && ready_) wait_value(d, value_);
     }
 
     // A slot whose last transfer is done (looked up, not waited for); a new one while all are in flight, or the oldest
@@ -703,11 +710,19 @@ private:
             wait_semaphores_.push_back(semaphore);
             wait_values_.push_back(value);
         }
+        if (mirror_sem) {
+            // Re-check under submit_mutex_ so any mirror bind published after commit_batch() snapshotted mirror_val
+            // is waited on before this upload reads from TitleMirror chunks.
+            VkSemaphore latest_sem = VK_NULL_HANDLE;
+            std::uint64_t latest_val = 0;
+            d.context->mirror_bind_locked(latest_sem, latest_val);
+            if (latest_sem == mirror_sem && latest_val > mirror_val) mirror_val = latest_val;
+        }
         if (mirror_sem && mirror_val) {
             bool merged = false;
             for (std::size_t i = 0; i < wait_semaphores_.size(); ++i) {
                 if (wait_semaphores_[i] == mirror_sem) {
-                    wait_values_[i] = std::max(wait_values_[i], mirror_val);
+                    if (mirror_val > wait_values_[i]) wait_values_[i] = mirror_val;
                     merged = true;
                     break;
                 }
@@ -736,6 +751,9 @@ private:
             --value_;
             return r;
         }
+        // Record this upload in retire_tickets_ under submit_mutex_ so note_mirror_bind() covers in-flight GPU mirror
+        // reads and freed TitleMirror homes cannot be reused while this upload is executing.
+        d.context->record_submit_locked(ready_, value_);
         VkTimelineSemaphoreSubmitInfo acquire{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
         acquire.waitSemaphoreValueCount = 1;
         acquire.pWaitSemaphoreValues = &value_;

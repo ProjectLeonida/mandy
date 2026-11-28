@@ -115,8 +115,8 @@ void poll_title_textures(const std::vector<Entry>& entries, std::uint64_t& curso
     }
 }
 
-// Visit the marked textures of a snapshot (mapped by the title, or known stale) under a time limit
-// (LEONIDA_TITLE_EVERY_BUDGET_US). Those `urgent` answers true for (a mapped texture never filled yet) are all
+// Visit the marked textures of a snapshot (mapped by the title, or known stale) under a time limit.
+// Those `urgent` answers true for (a mapped texture never filled yet) are all
 // visited first, in placement order, whatever the limit. The others are visited
 // from `cursor`, as poll_title_textures does for the unmarked ones, until `exhausted()` answers true after a visit;
 // the next pass resumes at the entry after the last one visited, so every marked texture gets its turn however many

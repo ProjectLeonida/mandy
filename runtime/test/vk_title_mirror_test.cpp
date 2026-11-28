@@ -401,15 +401,22 @@ int test() {
     EXPECT(dispatch(3, r));
     EXPECT(r[0] == b[0x10] && r[1] == 0xA11A5E00u && r[2] == 0 && r[3] == 0);
 
-    // 3. A unbound at page 3 too: its home waits for the ticket of that unmap before its slot is free again.
+    // 3. A unbound at page 3 too: its home stays unstamped (never freed even by retire(UINT64_MAX)) until flush()
+    //    publishes the sparse unbind and stamp_freed() assigns the ticket; then it waits for that ticket to retire.
     const std::uint64_t freed = mirror->counters().homes_freed;
-    mirror->map(t0 + 3 * kPage, nullptr, nullptr, ++ticket);
-    EXPECT(mirror->counters().homes == 1);
-    mirror->retire(ticket - 1);
+    mirror->map(t0 + 3 * kPage, nullptr, nullptr);
+    EXPECT(mirror->counters().homes == 1 && mirror->unstamped_freed_count() == 1);
+    mirror->retire(UINT64_MAX);
+    EXPECT(mirror->counters().homes_freed == freed && mirror->unstamped_freed_count() == 1);
+    EXPECT(mirror->flush(4));
+    const std::uint64_t stamp = ++ticket;
+    mirror->stamp_freed(stamp);
+    EXPECT(mirror->unstamped_freed_count() == 0);
+    mirror->retire(stamp - 1);
     EXPECT(mirror->counters().homes_freed == freed);
-    mirror->retire(ticket);
+    mirror->retire(stamp);
     EXPECT(mirror->counters().homes_freed == freed + 1);
-    EXPECT(mirror->flush(4) && dispatch(4, r) && r[0] == b[0x10] && r[1] == 0);
+    EXPECT(dispatch(4, r) && r[0] == b[0x10] && r[1] == 0);
 
     std::printf("title mirror: a title-written V# read through a buffer reaches its page at heap_base + its address, "
                 "its alias the same home, an unbound page zero; a remap, a write and an unmap reach the next dispatch "

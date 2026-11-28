@@ -1,5 +1,5 @@
 #pragma once
-// GPU detiling and direct linear copy of mirrored title textures (Stage 3b).
+// GPU detiling and direct linear copy of mirrored title textures.
 //
 // Textures whose 64 KiB pages are already backed and flushed in TitleMirror (src/title_mirror.h) can be brought
 // directly into their Vulkan VkImage on the GPU without reading title memory on the CPU or staging through host RAM:
