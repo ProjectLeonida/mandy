@@ -118,6 +118,88 @@ int main() {
         for (std::size_t p = 0; p < kPages; ++p) tracking.unwatch(base + p * kPage);
     }
     memory[5] = 1;  // every guard is gone: no fault left
+
+    // Verify HotColdTracking::unwatch() single-lock behavior:
+    //  1. Cold armed page with sole owner (refs==1): unwatch() reopens once without toggling set_hot(true/false)
+    //     (hot_generation unchanged) and without pushing a bogus tile entry to WriteQueue subscribers.
+    //  2. Hot page with sole owner (refs==1): unwatch() clears hot state without pushing a bogus WriteQueue entry.
+    //  3. Hot page with a second owner (refs==2): unwatch() drops our hot count and notifies WriteQueue so the
+    //     remaining owner observes writes made while hot.
+    {
+        leonida::geometry_writes::WriteQueue observer;
+        leonida::geometry_writes::subscribe_writes(observer);
+        std::vector<std::uintptr_t> written_tiles;
+        bool overflow = false;
+        std::vector<std::uint64_t> out;
+
+        leonida::HotColdTracking tracking;
+        const std::uintptr_t p_cold = base + 0 * kPage;
+        const std::uintptr_t p_hot_sole = base + 1 * kPage;
+        const std::uintptr_t p_hot_shared = base + 2 * kPage;
+        tracking.watch(p_cold);
+        tracking.watch(p_hot_sole);
+        tracking.watch(p_hot_shared);
+
+        // Acquire a second owner on p_hot_shared.
+        TextureCells extra_owner;
+        extra_owner.acquire(p_hot_shared);
+
+        // Arm p_cold (never written after initial collect) and promote p_hot_sole + p_hot_shared to hot.
+        for (unsigned i = 0; i < 12; ++i) {
+            memory[1 * kPage + i] = std::uint8_t(i + 1);
+            memory[2 * kPage + i] = std::uint8_t(i + 2);
+            tracking.collect(out);
+        }
+        EXPECT(!tracking.hot(p_cold) && tracking.unwritten(p_cold));
+        EXPECT(tracking.hot(p_hot_sole) && tracking.hot(p_hot_shared));
+
+        // Drain observer queue before testing unwatch().
+        leonida::geometry_writes::take_written(observer, written_tiles, overflow);
+        const std::uint64_t hot_gen_before =
+            leonida::geometry_writes::state().hot_generation.load(std::memory_order_acquire);
+
+        // 1. Cold armed unwatch (sole owner): zero hot_generation bump, zero bogus WriteQueue push, page writable!
+        tracking.unwatch(p_cold);
+        const std::uint64_t hot_gen_after_cold =
+            leonida::geometry_writes::state().hot_generation.load(std::memory_order_acquire);
+        leonida::geometry_writes::take_written(observer, written_tiles, overflow);
+        EXPECT(hot_gen_after_cold == hot_gen_before);
+        EXPECT(!overflow && written_tiles.empty());
+        const std::uint64_t faults_before_write = g_faults[0].load();
+        memory[0 * kPage + 7] = 0x5A;  // must NOT fault: guard was reopened on release
+        EXPECT(g_faults[0].load() == faults_before_write);
+
+        // 2. Hot unwatch (sole owner): hot_generation bumps once (erased from s.hot), zero bogus WriteQueue push!
+        tracking.unwatch(p_hot_sole);
+        leonida::geometry_writes::take_written(observer, written_tiles, overflow);
+        EXPECT(!overflow && written_tiles.empty());
+        EXPECT(!tracking.hot(p_hot_sole));
+
+        // 3. Hot unwatch (shared owner): remaining owner still holds ref, so WriteQueue DOES receive notification!
+        tracking.unwatch(p_hot_shared);
+        leonida::geometry_writes::take_written(observer, written_tiles, overflow);
+        EXPECT(!overflow && written_tiles.size() == 1 && written_tiles[0] == p_hot_shared);
+        extra_owner.release(p_hot_shared);
+
+        // 4. Verify notify(Event::fault) returns opened=true both when reopen() restores begin's page (fast path,
+        //    skipping 2nd VirtualQuery) and when the page is already writable (concurrent fault fallback VirtualQuery).
+        tracking.watch(p_cold);
+        tracking.collect(out);  // arms p_cold
+        EXPECT(tracking.unwritten(p_cold));
+        bool restored = false;
+        EXPECT(leonida::geometry_writes::notify(p_cold + 123, p_cold + 124,
+                                                leonida::geometry_writes::Event::fault, &restored));
+        EXPECT(restored);
+        restored = false;
+        EXPECT(leonida::geometry_writes::notify(p_cold + 123, p_cold + 124,
+                                                leonida::geometry_writes::Event::fault, &restored));
+        EXPECT(!restored);
+        tracking.unwatch(p_cold);
+
+        leonida::geometry_writes::unsubscribe_writes(observer);
+        std::printf("unwatch single-lock & fault reopen fast path: ok\n");
+    }
+
     VirtualFree(memory, 0, MEM_RELEASE);
     return failures ? 1 : 0;
 }

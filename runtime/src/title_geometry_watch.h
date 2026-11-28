@@ -185,7 +185,10 @@ inline DWORD read_only(DWORD protection) {
 // Pages that are to get the same protection back are reopened together, a VirtualQuery and a VirtualProtect for each
 // region the query reports, not for each page: under Wine each call goes to the server, and a fault on a whole guarded
 // tile cost 16 us page by page against 2.6 us for one call (runtime/test/guard_fault_bench.cpp).
-inline bool reopen(std::uintptr_t va, Cell& c) {
+// When `fault_page_opened` is non-null, sets it to true if VirtualProtect restored a writable, non-guard protection on
+// the 4 KiB page `fault_page`, allowing notify(Event::fault) to skip a redundant second VirtualQuery.
+inline bool reopen(std::uintptr_t va, Cell& c, std::uintptr_t fault_page = UINTPTR_MAX,
+                   bool* fault_page_opened = nullptr) {
     bool opened = false;
     for (std::size_t i = 0; i < c.restore.size();) {
         if (!c.restore[i]) {
@@ -195,6 +198,7 @@ inline bool reopen(std::uintptr_t va, Cell& c) {
         std::size_t j = i + 1;
         while (j < c.restore.size() && c.restore[j] == c.restore[i]) ++j;
         const DWORD restore = c.restore[i];
+        const bool writable_restore = !(restore & PAGE_GUARD) && read_only(restore) != 0;
         for (std::uintptr_t at = va + i * page_size, end = va + j * page_size; at < end;) {
             MEMORY_BASIC_INFORMATION m{};
             if (!VirtualQuery(reinterpret_cast<void*>(at), &m, sizeof m)) {
@@ -206,10 +210,13 @@ inline bool reopen(std::uintptr_t va, Cell& c) {
             bool done = true;
             if (m.State == MEM_COMMIT && m.Protect == read_only(restore)) {
                 DWORD old{};
-                if (VirtualProtect(reinterpret_cast<void*>(at), until - at, restore, &old))
+                if (VirtualProtect(reinterpret_cast<void*>(at), until - at, restore, &old)) {
                     opened = true;
-                else
+                    if (fault_page_opened && writable_restore && fault_page >= at && fault_page < until)
+                        *fault_page_opened = true;
+                } else {
                     done = false;  // kept: tried again by the next reopen
+                }
             }
             if (done)
                 for (std::uintptr_t p = at; p < until; p += page_size) c.restore[(p - va) / page_size] = 0;
@@ -219,21 +226,45 @@ inline bool reopen(std::uintptr_t va, Cell& c) {
     }
     return opened;
 }
-inline void release(std::uintptr_t va) {
+// Releases one owner's reference to `va`. When `was_hot` is true, drops that owner's hot count in the same lock hold
+// (avoiding a separate set_hot(false) lock and avoiding a bogus WriteQueue push when the cell's last ref goes).
+inline void release(std::uintptr_t va, bool was_hot = false) {
     auto& s = state();
     std::lock_guard lock(s.mutex);
     auto it = s.cells.find(va);
-    if (it != s.cells.end() && !--it->second.refs) {
-        if (it->second.hot) {
+    if (it == s.cells.end()) return;
+    Cell& c = it->second;
+    if (!--c.refs) {
+        if (c.hot) {
             std::erase(s.hot, va);
             s.hot_count.store(s.hot.size(), std::memory_order_release);
             s.hot_generation.fetch_add(1, std::memory_order_release);
         }
         // A page reopened here may also be one a slot-133 shadow keeps read-only (both guard the title's geometry):
         // it is writable now with no fault to tell that shadow, which then walks its pages again.
-        if (reopen(va, it->second)) title_memory_map::changed(va, va + tile_size);
+        if (reopen(va, c)) title_memory_map::changed(va, va + tile_size);
         s.cells.erase(it);
         s.count.store(s.cells.size(), std::memory_order_release);
+        return;
+    }
+    if (was_hot && c.hot && !--c.hot) {
+        std::erase(s.hot, va);
+        // Other owners still hold this cell: writes made while it was hot faulted nowhere, so notify subscribers once
+        // as set_hot(false) does.
+        const auto version = s.serial.load(std::memory_order_relaxed) + 1;
+        c.version.store(version, std::memory_order_release);
+        for (WriteQueue* q : s.writers) {
+            std::lock_guard queue_lock(q->mutex);
+            if (q->overflow) continue;
+            if (q->tiles.size() < WriteQueue::kMaxTiles)
+                q->tiles.push_back(va);
+            else
+                q->overflow = true, q->tiles.clear();
+            q->pending.store(true, std::memory_order_release);
+        }
+        s.serial.store(version, std::memory_order_release);
+        s.hot_count.store(s.hot.size(), std::memory_order_release);
+        s.hot_generation.fetch_add(1, std::memory_order_release);
     }
 }
 enum class Event { write, open, fault, mapping, replaced };
@@ -247,15 +278,23 @@ inline bool notify(std::uintptr_t begin, std::uintptr_t end, Event event, bool* 
     auto it = s.cells.lower_bound(begin & ~(tile_size - 1));
     if (it == s.cells.end() || it->first >= end) return false;
     const auto version = s.serial.load(std::memory_order_relaxed) + 1;
+    const std::uintptr_t fault_page = begin & ~(page_size - 1);
     bool opened = false;
     for (; it != s.cells.end() && it->first < end; ++it) {
         auto& cell = it->second;
         if (event == Event::open || event == Event::fault) {
-            if (reopen(it->first, cell) && restored) *restored = true;
+            bool fault_opened = false;
+            const bool any = reopen(it->first, cell, event == Event::fault ? fault_page : UINTPTR_MAX,
+                                    event == Event::fault ? &fault_opened : nullptr);
+            if (any && restored) *restored = true;
             if (event == Event::fault) {
-                MEMORY_BASIC_INFORMATION m{};
-                opened = VirtualQuery(reinterpret_cast<void*>(begin), &m, sizeof m) &&
-                         m.State == MEM_COMMIT && !(m.Protect & PAGE_GUARD) && read_only(m.Protect);
+                if (fault_opened) {
+                    opened = true;
+                } else if (!opened) {
+                    MEMORY_BASIC_INFORMATION m{};
+                    opened = VirtualQuery(reinterpret_cast<void*>(begin), &m, sizeof m) &&
+                             m.State == MEM_COMMIT && !(m.Protect & PAGE_GUARD) && read_only(m.Protect);
+                }
             }
         }
         if (event == Event::replaced) {
