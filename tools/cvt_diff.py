@@ -819,7 +819,7 @@ def self_test():
     return ok
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--programs", type=int, default=300, help="random programs after the sweep")
@@ -830,7 +830,11 @@ def main():
     ap.add_argument("--exhaustive-f16", action="store_true", help="also run every f16 input through the f16 ops")
     ap.add_argument("--list-ops", action="store_true")
     ap.add_argument("--self-test", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    if args.max_ops < 1:
+        ap.error("--max-ops must be at least 1")
+    if args.programs < 1:
+        ap.error("--programs must be at least 1")
 
     if args.list_ops:
         for op, form in OP_FORMS.items():
