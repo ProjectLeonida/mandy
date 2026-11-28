@@ -2351,7 +2351,8 @@ int queue_sync_and_async() {
         std::shared_ptr<const CommandList> b0 = make_step(0), b1 = make_step(1), b2 = make_step(2);
         EXPECT(b0 && b1 && b2);
 
-        // (a) Empty-batch skip + pending_wait_vis_seq_ preservation across empty execute.
+        // (a) Empty-command ExecuteCommandLists MUST still run before_execute_() / after_execute_() (titles and
+        //     d3d12_existing_heap rely on empty submissions to flush pending streamed views & title textures).
         std::atomic<unsigned> before_calls{0}, after_calls{0};
         std::atomic<std::uint64_t> last_req_seq{0};
         context.set_before_execute([&] {
@@ -2363,30 +2364,23 @@ int queue_sync_and_async() {
         const std::uint64_t vis0 = context.current_visibility_seq();
         EXPECT(direct.execute({&empty_snap, 1}) == ReplayResult::success);
         EXPECT(direct.idle());
-        EXPECT(context.current_visibility_seq() == vis0);
-        EXPECT(before_calls.load(std::memory_order_acquire) == 0);
-        EXPECT(after_calls.load(std::memory_order_acquire) == 0);
+        EXPECT(context.current_visibility_seq() > vis0);
+        EXPECT(before_calls.load(std::memory_order_acquire) == 1);
+        EXPECT(after_calls.load(std::memory_order_acquire) == 1);
 
-        // Wait on a CPU-signaled fence (vis_seq V), consume it with an EMPTY list (skips before_execute_()), then run
-        // a non-empty list: the non-empty list's before_execute_() MUST still observe req_seq >= V!
-        VulkanFence cpu_f(context, 0), done_a(context, 0);
-        EXPECT(cpu_f.semaphore() && done_a.semaphore());
-        EXPECT(cpu_f.signal(1));
-        const std::uint64_t cpu_vis = context.holds().signaled_vis_seq(cpu_f.semaphore(), 1);
-        EXPECT(cpu_vis > vis0);
-
-        // Also advance visibility_seq_ on a dummy batch so empty_list has vis_seq == 0 while b0 gets a later vis_seq;
-        // verify specifically when b0 is enqueued BEFORE cpu_f.signal(2) (held behind cpu_f2)!
-        VulkanFence cpu_f2(context, 0);
-        EXPECT(cpu_f2.semaphore());
+        // Wait on a CPU-signaled fence (vis_seq V), consume it with an empty list + non-empty list: before_execute_()
+        // MUST observe req_seq >= V!
+        before_calls.store(0, std::memory_order_release);
+        after_calls.store(0, std::memory_order_release);
+        VulkanFence cpu_f2(context, 0), done_a(context, 0);
+        EXPECT(cpu_f2.semaphore() && done_a.semaphore());
         direct.wait(cpu_f2.semaphore(), 1);
-        EXPECT(direct.execute({&empty_snap, 1}) == ReplayResult::success);  // held behind cpu_f2; vis_seq == 0
-        EXPECT(direct.execute({&b0, 1}) == ReplayResult::success);          // held behind empty; enqueued BEFORE signal
+        EXPECT(direct.execute({&empty_snap, 1}) == ReplayResult::success);
+        EXPECT(direct.execute({&b0, 1}) == ReplayResult::success);
         EXPECT(direct.signal(done_a.semaphore(), 1));
         EXPECT(direct.idle());
         EXPECT(before_calls.load(std::memory_order_acquire) == 0);
 
-        // Signal cpu_f2 AFTER b0 was enqueued: cpu_f2's vis_seq is strictly higher than b0's enqueue vis_seq!
         EXPECT(cpu_f2.signal(1));
         const std::uint64_t cpu_vis2 = context.holds().signaled_vis_seq(cpu_f2.semaphore(), 1);
         EXPECT(done_a.wait(1, 5'000'000'000ull));
@@ -2501,7 +2495,8 @@ int queue_sync_and_async() {
         EXPECT(direct.signal(f_done_c.semaphore(), 1));
         EXPECT(direct.idle());
 
-        // Hold independent work on compute_c behind comp_gate_c.
+        // Hold independent work on compute_c behind comp_gate_c (skip before_execute so before_calls tracks direct).
+        compute_c.set_skip_before_execute(true);
         compute_c.wait(comp_gate_c.semaphore(), 1);
         EXPECT(compute_c.execute({&empty_snap, 1}) == ReplayResult::success);
         EXPECT(compute_c.signal(comp_done_c.semaphore(), 1));

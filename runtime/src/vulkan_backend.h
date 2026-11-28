@@ -3192,16 +3192,9 @@ private:
 
 public:
     ReplayResult execute(std::span<const CommandList* const> lists, const PinFn& pin = {}) {
-        bool all_empty = true;
-        for (const CommandList* list : lists) {
-            if (list && !list->commands().empty()) {
-                all_empty = false;
-                break;
-            }
-        }
         const bool skip_before = skip_before_execute_.load(std::memory_order_acquire);
         if (!skip_before) pipeline_wait::note_submission();  // big compute warm-ups are left to their first use while the title submits
-        const std::uint64_t vis_seq = (skip_before || all_empty) ? 0 : context_.next_visibility_seq();
+        const std::uint64_t vis_seq = skip_before ? 0 : context_.next_visibility_seq();
         auto* diagnostics = context_.device_fault();
         const auto execute_call = diagnostics ? diagnostics->next_execute_call() : 0;
         EnqueueSerial enqueue_serial = make_enqueue_serial();
@@ -3223,16 +3216,9 @@ public:
     // Zero-copy ExecuteCommandLists for immutable closed CommandList snapshots (used by the COM layer so Reset()
     // allocates fresh storage only while a submitted snapshot is still in flight, avoiding deep copies on submission).
     ReplayResult execute(std::span<const std::shared_ptr<const CommandList>> lists, const PinFn& pin = {}) {
-        bool all_empty = true;
-        for (const auto& list : lists) {
-            if (list && !list->commands().empty()) {
-                all_empty = false;
-                break;
-            }
-        }
         const bool skip_before = skip_before_execute_.load(std::memory_order_acquire);
         if (!skip_before) pipeline_wait::note_submission();
-        const std::uint64_t vis_seq = (skip_before || all_empty) ? 0 : context_.next_visibility_seq();
+        const std::uint64_t vis_seq = skip_before ? 0 : context_.next_visibility_seq();
         auto* diagnostics = context_.device_fault();
         const auto execute_call = diagnostics ? diagnostics->next_execute_call() : 0;
         EnqueueSerial enqueue_serial = make_enqueue_serial();
@@ -3957,8 +3943,7 @@ private:
                 }
             }
         }
-        const bool run_before_after = !skip_before && total_commands != 0;
-        if (run_before_after && context_.before_execute_) {
+        if (!skip_before && context_.before_execute_) {
             std::uint64_t req_seq = visibility_seq ? visibility_seq : context_.current_visibility_seq();
             const std::uint64_t wait_vis = (std::max)(pending_wait_vis_seq_, exec_waits_vis_seq());
             if (wait_vis > req_seq) req_seq = wait_vis;
@@ -3971,11 +3956,6 @@ private:
             } before_seq_guard{req_seq};
             context_.before_execute_();
             pending_wait_vis_seq_ = 0;
-        } else if (!skip_before) {
-            // Empty-command batch skipped before_execute_(): NEVER clear pending_wait_vis_seq_, and carry forward any
-            // CPU Fence::Signal visibility edges from this batch's waits (including coalesced completed waits).
-            const std::uint64_t wait_vis = (std::max)(visibility_seq, exec_waits_vis_seq());
-            pending_wait_vis_seq_ = (std::max)(pending_wait_vis_seq_, wait_vis);
         }
         struct AfterExecute {
             VulkanContext& context;
@@ -3983,7 +3963,7 @@ private:
             ~AfterExecute() {
                 if (active && context.after_execute_) context.after_execute_();
             }
-        } after_execute{context_, run_before_after};
+        } after_execute{context_, !skip_before};
         // The rest of this call is the replay phase; the submission is counted when it returns, however it returns.
         struct Replayed {
             bool active;
