@@ -1,5 +1,6 @@
 #include "d3d12_xs_rootsig.h"
 
+#include <atomic>
 #include <cstring>
 #include <new>
 
@@ -245,9 +246,9 @@ public:
         *out = nullptr;
         return E_NOINTERFACE;
     }
-    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE AddRef() override { return refs_.fetch_add(1, std::memory_order_relaxed) + 1; }
     ULONG STDMETHODCALLTYPE Release() override {
-        const ULONG left = --refs_;
+        const ULONG left = refs_.fetch_sub(1, std::memory_order_acq_rel) - 1;
         if (!left) delete this;
         return left;
     }
@@ -256,7 +257,7 @@ public:
 
 private:
     std::vector<uint8_t> bytes_;
-    ULONG refs_ = 1;
+    std::atomic<ULONG> refs_{1};
 };
 
 HRESULT make_blob(std::vector<uint8_t> bytes, ID3DBlob** out) {

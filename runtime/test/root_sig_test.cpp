@@ -6,8 +6,10 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #include "d3d12_xs_rootsig.h"
@@ -639,6 +641,83 @@ void test_deserializer() {
     }
 }
 
+void test_rewritten_blob_concurrent_refcount() {
+    struct PlainBlob final : public ID3DBlob {
+        std::vector<uint8_t> bytes;
+        std::atomic<ULONG> refs{1};
+        explicit PlainBlob(std::vector<uint8_t> b) : bytes(std::move(b)) {}
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+            if (!out) return E_POINTER;
+            if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D10Blob)) {
+                AddRef();
+                *out = static_cast<ID3DBlob*>(this);
+                return S_OK;
+            }
+            *out = nullptr;
+            return E_NOINTERFACE;
+        }
+        ULONG STDMETHODCALLTYPE AddRef() override { return refs.fetch_add(1, std::memory_order_relaxed) + 1; }
+        ULONG STDMETHODCALLTYPE Release() override {
+            const ULONG left = refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
+            if (!left) delete this;
+            return left;
+        }
+        LPVOID STDMETHODCALLTYPE GetBufferPointer() override { return bytes.data(); }
+        SIZE_T STDMETHODCALLTYPE GetBufferSize() override { return bytes.size(); }
+    };
+    struct FakeHost {
+        static HRESULT WINAPI serialize(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* d, ID3DBlob** out,
+                                        ID3DBlob**) {
+            if (!d || !out) return E_INVALIDARG;
+            if ((static_cast<uint32_t>(d->Desc_1_1.Flags) & rt::d3d12_xs::kDirectlyIndexedFlags) != 0)
+                return E_INVALIDARG;
+            // Minimal valid DXBC container with one 24-byte RTS0 chunk (flags = 0, zero checksum).
+            std::vector<uint8_t> buf(36 + 8 + 24, 0);
+            std::memcpy(buf.data(), "DXBC", 4);
+            const uint32_t total = static_cast<uint32_t>(buf.size());
+            const uint32_t one = 1, chunk_off = 36, chunk_sz = 24, rts_ver = 2;
+            std::memcpy(buf.data() + 20, &one, 4);
+            std::memcpy(buf.data() + 24, &total, 4);
+            std::memcpy(buf.data() + 28, &one, 4);
+            std::memcpy(buf.data() + 32, &chunk_off, 4);
+            std::memcpy(buf.data() + 36, "RTS0", 4);
+            std::memcpy(buf.data() + 40, &chunk_sz, 4);
+            std::memcpy(buf.data() + 44, &rts_ver, 4);
+            *out = new PlainBlob(std::move(buf));
+            return S_OK;
+        }
+    };
+
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc{};
+    desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    desc.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(rt::d3d12_xs::kDirectlyIndexedFlags);
+    ID3DBlob* rewritten = nullptr;
+    const HRESULT hr =
+        rt::d3d12_xs::serialize_versioned_keeping_heap_flags(&FakeHost::serialize, desc, &rewritten, nullptr);
+    check(SUCCEEDED(hr) && rewritten != nullptr, "retry path returns a RewrittenBlob");
+    if (!rewritten) return;
+
+    uint32_t restored_flags = 0;
+    if (rewritten->GetBufferSize() >= 36 + 8 + 24) {
+        std::memcpy(&restored_flags, static_cast<const uint8_t*>(rewritten->GetBufferPointer()) + 36 + 8 + 20, 4);
+    }
+    check(restored_flags == rt::d3d12_xs::kDirectlyIndexedFlags,
+          "RewrittenBlob restores directly-indexed flags into the RTS0 chunk");
+
+    std::vector<std::thread> workers;
+    for (int t = 0; t < 4; ++t) {
+        workers.emplace_back([rewritten] {
+            for (int i = 0; i < 20000; ++i) {
+                rewritten->AddRef();
+                rewritten->Release();
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    const ULONG left = rewritten->Release();
+    check(left == 0, "RewrittenBlob concurrent AddRef/Release leaves exact refcount 0");
+}
+
 }  // namespace
 
 int main() {
@@ -652,6 +731,7 @@ int main() {
     test_preserves_low_bits_and_unknown_versions();
     test_registered_shim(supports_1_2);
     test_deserializer();
+    test_rewritten_blob_concurrent_refcount();
     std::printf("root_sig_test: %s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures,
                 g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
