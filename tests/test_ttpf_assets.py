@@ -285,6 +285,31 @@ class TextureAssets(unittest.TestCase):
         self.assertEqual(self.catalog.read_bytes(), manifest)
         self.assertEqual(previous.read_bytes(), b"previous mip chain")
 
+    def test_out_of_range_bc6h_and_bc7_history_reports_error_without_updating_the_pool(self):
+        # Tables bcpack_history_calib.py --verify rejects: strict decoding would take them as confirmed.
+        previous = self.upgrade()
+        manifest = self.catalog.read_bytes()
+        bc7_depth = {"historyEndpointBits": {"0": [8] * 24}, "historyEndpointConfirmedBits": {"0": [8] * 24}}
+        bc6h_class = {"endpointClass": {"0": 3}}
+        cases = {
+            "BC7 confirmed above known": {"bc7": bc7_depth | {"historyEndpoints": {"0": [0] * 24},
+                                                              "historyEndpointConfirmedBits": {"0": [9] * 24}}},
+            "BC7 confirmed row without values": {"bc7": bc7_depth},
+            "BC6H endpoint value out of range": {"bc6h": bc6h_class | {
+                "endpointHistory": {"0": [[0, 1024, 0, 0]] * 3}}},
+            "BC6H confirmed row without values": {"bc6h": bc6h_class},
+        }
+        for case, data in cases.items():
+            with self.subTest(case):
+                (self.work / "bcpack-history.json").write_text(json.dumps(data), encoding="utf-8", newline="\n")
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+                    self.build()
+                self.assertEqual(caught.exception.code, 1)
+                self.assertIn("bcpack-history.json", stderr.getvalue())
+                self.assertEqual(self.catalog.read_bytes(), manifest)
+                self.assertEqual(previous.read_bytes(), b"previous mip chain")
+
     @unittest.skipUnless(os.environ.get("RPF9DUMP_DLL"), "requires the built rpf9dump")
     def test_new_base_and_pack_pools(self):
         dll = Path(os.environ["RPF9DUMP_DLL"]).resolve()

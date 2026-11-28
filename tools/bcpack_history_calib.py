@@ -2428,11 +2428,26 @@ def validate_history_schema(history_path, codecs):
     """Validate history JSON schema for `codecs` and return aggregate coverage counts."""
     if not os.path.exists(history_path):
         raise CliError(f"history path not found: {history_path}")
+    return check_history_tables(history_path, codecs)
+
+
+def _value_rows(history, codec_key, marker_key, table):
+    """The entry indices that `table` of the `codec_key` section lists (a sparse table can leave entries out)."""
+    sec = _bptc._read_history_section(history, codec_key, marker_key)
+    return {i for i, _ in _bptc._iter_entries((sec or {}).get(table))}
+
+
+def check_history_tables(history, codecs):
+    """Check the `codecs` tables of `history` (a combined history dict, a JSON file or a directory) and return
+    aggregate coverage counts; raise ValueError on a table out of range. An entry with confirmed bits must also
+    list its values: the decoder would otherwise take the zeros it fills in as confirmed values."""
     summary = {}
     for cid in codecs:
         ckey = CODEC_KEYS[cid]
         if cid == 6:
-            eh, ih, ec, ic = _bptc.load_bc6h(history_path)
+            eh, ih, ec, ic, ep_cb, ix_cb = _bptc.load_bc6h(history, with_confirmed_bits=True)
+            ep_rows = _value_rows(history, "bc6h", "endpointHistory", "endpointHistory")
+            ix_rows = _value_rows(history, "bc6h", "endpointHistory", "indexHistory")
             for i in range(256):
                 if not 0 <= ec[i] <= 3:
                     raise ValueError(f"BC6H endpointClass[{i}]={ec[i]} outside 0..3")
@@ -2444,6 +2459,10 @@ def validate_history_schema(history_path, codecs):
                         raise ValueError(f"BC6H endpointHistory[{i}][{c}] out of bounds")
                 if any(not 0 <= p <= 15 for p in ih[i]):
                     raise ValueError(f"BC6H indexHistory[{i}] pixel out of 0..15")
+                if i not in ep_rows and any(v for ch in ep_cb[i] for v in ch):
+                    raise ValueError(f"BC6H endpointHistory[{i}] missing for confirmed bits")
+                if i not in ix_rows and any(ix_cb[i]):
+                    raise ValueError(f"BC6H indexHistory[{i}] missing for confirmed bits")
             summary[ckey] = {
                 "endpoint_confirmed": sum(1 for v in ec if v == 3),
                 "endpoint_provisional": sum(1 for v in ec if v == 1),
@@ -2455,7 +2474,9 @@ def validate_history_schema(history_path, codecs):
                 "index_unknown": sum(1 for v in ic if v == 0),
             }
         elif cid == 7:
-            tab = _bptc.load_bc7(history_path)
+            tab = _bptc.load_bc7(history)
+            ep_rows = _value_rows(history, "bc7", "historyEndpoints", "historyEndpoints")
+            ix_rows = _value_rows(history, "bc7", "historyEndpoints", "historyIndices")
             ep = tab["history_endpoints"]
             ep_b = tab["history_endpoint_bits"]
             ep_cb = tab["history_endpoint_confirmed_bits"]
@@ -2473,6 +2494,10 @@ def validate_history_schema(history_path, codecs):
                         raise ValueError(f"BC7 historyIndices[{i}][{j}] out of 0..15")
                     if not 0 <= ix_cb[i][j] <= ix_b[i][j] <= 4:
                         raise ValueError(f"BC7 index bit depth invalid at [{i}][{j}]")
+                if i not in ep_rows and any(ep_cb[i]):
+                    raise ValueError(f"BC7 historyEndpoints[{i}] missing for confirmed bits")
+                if i not in ix_rows and any(ix_cb[i]):
+                    raise ValueError(f"BC7 historyIndices[{i}] missing for confirmed bits")
             summary[ckey] = {
                 "endpoint_confirmed_slots": sum(1 for row in ep_cb for v in row if v > 0),
                 "endpoint_known_slots": sum(1 for row in ep_b for v in row if v > 0),
@@ -2481,7 +2506,7 @@ def validate_history_schema(history_path, codecs):
                 "index_known_slots": sum(1 for row in ix_b for v in row if v > 0),
             }
         else:
-            loaded = _bptc.load_bc_history(cid, history_path)
+            loaded = _bptc.load_bc_history(cid, history)
             if loaded is None:
                 summary[ckey] = {"present": False}
             else:

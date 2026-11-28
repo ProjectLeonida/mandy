@@ -13,7 +13,6 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import bcpack
-import bcpack_tables_bptc
 from file_mode import published_mode
 import ttpf_mips as ttpf
 
@@ -64,13 +63,11 @@ def load_history(work):
         for key, section in history.items():
             if not isinstance(section, dict):
                 raise ValueError(f"{key} history section must be a JSON object")
-            codec = keys[key]
-            if codec == 6:
-                bcpack_tables_bptc.load_bc6h(history)
-            elif codec == 7:
-                bcpack_tables_bptc.load_bc7(history)
-            else:
-                bcpack_tables_bptc.load_bc_history(codec, history)
+        # The checks of bcpack_history_calib.py --verify: the table loaders check shapes only, so a confirmed depth
+        # above the known one, or without values, would publish a provisional decode as a strict DDS. Imported here,
+        # with a history only: the module reconfigures stdout and stderr when it loads.
+        import bcpack_history_calib
+        bcpack_history_calib.check_history_tables(history, [keys[key] for key in history])
     except (ValueError, TypeError, OverflowError, RecursionError) as exc:
         raise ValueError(f"{path}: invalid BCPack history: {exc}") from None
     return history, strict_stamp(raw)
