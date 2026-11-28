@@ -9652,8 +9652,8 @@ public:
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
         // (A D24 texture stored as D32 goes through the staged copy: the host copy would not convert. Nor would it
         // repack a 96-bit texture's 12-byte texels.)
-        host_transfer_ = cpu_visible() && samples == 1 && !format.d24_as_float && !format.rgb96 &&
-                         device_.host_transfer_format(format.format);
+        const bool cpu_copyable = cpu_visible() && samples == 1 && !format.d24_as_float && !format.rgb96;
+        host_transfer_ = cpu_copyable && device_.host_transfer_format(format.format);
         rgb96_ = format.rgb96;
         if (host_transfer_) info.usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
         HRESULT support = device_.check_image_support(info);
@@ -9680,6 +9680,17 @@ public:
             const char* value = std::getenv("LEONIDA_TITLE_IMAGE_STAGING");
             return !value || std::strcmp(value, "0");
         }();
+        const bool can_stage_title = stage_title && allow_staged_title && cpu_copyable &&
+                                     origin != TitleImageOrigin::ordinary && format.aspects == VK_IMAGE_ASPECT_COLOR_BIT;
+        VkMemoryRequirements with_host{};
+        const bool have_host_requirements = can_stage_title && host_transfer_ && device_.memory_requirements(info, with_host);
+        // A driver can accept HOST_TRANSFER for the image yet give it no bindable memory type.
+        if (have_host_requirements && !with_host.memoryTypeBits) {
+            info.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+            host_transfer_ = false;
+            if (HRESULT hr = device_.check_image_support(info); FAILED(hr)) return hr;
+            log_once("title image has no host-transfer memory type, using staging for Vulkan format", int(info.format));
+        }
         // Keep placed movie planes with a known linear CPU layout on the host-copy path, where there is one.
         // Map on a staged placement still returns the title's pages and participates in the refresh.
         std::uint32_t xg_layout = 0;
@@ -9693,8 +9704,7 @@ public:
         }();
         // A device without host copies has no other way to fill a title image: a refresh before a submission may not
         // use a staged copy through the queue (host_copy_now). Its linear movie planes are staged too.
-        const bool no_host_copy = !device_.copy_memory_to_image && cpu_visible() && samples == 1 &&
-                                  !format.d24_as_float && !format.rgb96;
+        const bool no_host_copy = !device_.copy_memory_to_image && cpu_copyable;
         // Private BC copies start with the exact same zero blocks as the shared image. The host
         // transition and clear complete before a private view is published, including during command prepare.
         // Without host copies the staged upload fills the private image, and the first shader submission clears what
@@ -9705,31 +9715,33 @@ public:
             desc_.Flags == D3D12_RESOURCE_FLAG_NONE && desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
             desc_.SampleDesc.Count == 1 && asked_castable.empty() && !format.typeless &&
             leonida::block_format(format.format, format.aspects).block > 1) {
-            VkMemoryRequirements footprint{};
-            if (device_.memory_requirements(info, footprint))
-                shared_zero_ = device_.zero_sampled_image(desc_, format, footprint.size);
+            if (have_host_requirements || device_.memory_requirements(info, with_host))
+                shared_zero_ = device_.zero_sampled_image(desc_, format, with_host.size);
         }
         std::uint32_t plain_bits = 0;
-        if (stage_title && (!shared_zero_ || no_host_copy) && allow_staged_title && origin != TitleImageOrigin::ordinary &&
-            (no_host_copy || (!linear_placement && host_transfer_)) && format.aspects == VK_IMAGE_ASPECT_COLOR_BIT &&
-            device_.image_requirements) {
+        const bool can_stage = can_stage_title && (!shared_zero_ || no_host_copy);
+        // A refresh must queue an upload when this image cannot take host copies, including linear movie planes.
+        const bool needs_staging = can_stage && !host_transfer_;
+        if (needs_staging) {
+            staged_title_ = true;
+            plain_bits = UINT32_MAX;  // the image already lacks HOST_TRANSFER; any compatible memory type will do
+        } else if (can_stage && !linear_placement && device_.image_requirements) {
             for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount; ++i) {
                 const auto flags = device_.memory.memoryTypes[i].propertyFlags;
                 if ((flags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) ==
                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) plain_bits |= 1u << i;
             }
-            if (no_host_copy) plain_bits = UINT32_MAX;  // nothing to compare with: any memory type will do
-            VkMemoryRequirements with{}, without{};
+            VkMemoryRequirements without{};
             auto staged = info;
             staged.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
-            if (plain_bits && (no_host_copy || (device_.memory_requirements(info, with) &&
-                                                !(with.memoryTypeBits & plain_bits))) &&
+            if (plain_bits && have_host_requirements && !(with_host.memoryTypeBits & plain_bits) &&
                 device_.memory_requirements(staged, without) && (without.memoryTypeBits & plain_bits)) {
                 staged_title_ = true;
                 host_transfer_ = false;
                 info.usage = staged.usage;
             }
         }
+        const bool can_retry_host = staged_title_ && !needs_staging;
         auto retry_host = [&] {
             if (image_) vk.vkDestroyImage(device_.info.device, image_, nullptr);
             if (memory_) vk.vkFreeMemory(device_.info.device, memory_, nullptr);
@@ -9755,7 +9767,7 @@ public:
             }
             return E_OUTOFMEMORY;
         };
-        if (HRESULT hr = create_image(); FAILED(hr)) return staged_title_ ? retry_host() : hr;
+        if (HRESULT hr = create_image(); FAILED(hr)) return can_retry_host ? retry_host() : hr;
         VkMemoryRequirements requirements{};
         std::uint32_t type = UINT32_MAX;
         const bool stream = origin == TitleImageOrigin::streamed || origin == TitleImageOrigin::pending_stream;
@@ -9792,7 +9804,7 @@ public:
             // A title image (placed or streamed) takes the title image pool or an allocation of its own, of the memory
             // types its placement allows; the shared texture blocks below are for the layer's ordinary textures.
             if (!bind_texture_memory(stream, allowed, requirements, type)) {
-                if (staged_title_) return retry_host();
+                if (can_retry_host) return retry_host();
                 std::fprintf(stderr,
                              "[rt] d3d12: texture memory unavailable: %llu bytes, alignment %llu, type bits 0x%x (vk "
                              "format %d %ux%u)\n",
