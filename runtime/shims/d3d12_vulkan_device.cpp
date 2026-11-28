@@ -3291,15 +3291,16 @@ struct DeviceState {
 
     // The slots on [offset, offset + bytes) of a heap copy's mirror, just brought up to date: each that differs from
     // what its arena slot was made from is written there and fixed up.
-    // Past LEONIDA_CONSOLE_FIX_US of fixing in one submission (4000 by default, 0: no limit), a changed slot is written
-    // as a null descriptor and left to retry_console_slots: after the story load the title rewrote up to 3.7 MiB of
-    // its heap at once and one submission spent 28 s fixing it (speed-8). A shader reads such a slot as empty until
-    // its turn comes.
+    // LEONIDA_CONSOLE_FIX_US limits the fixing in one submission (0, the default: no limit). Past it a changed slot is
+    // written as a null descriptor and left to retry_console_slots: after the story load the title rewrote up to
+    // 3.7 MiB of its heap at once and one submission spent 28 s fixing it (speed-8). A shader reads such a slot as
+    // empty until its turn comes, so a limit changes results: at the first world frame lib_cs_01144 read the size it
+    // divides by from a nulled buffer slot and its loops never ended, which lost the device.
     void fix_console_slots(ConsoleHeap& heap, std::size_t offset, std::size_t bytes) {
         static const std::uint64_t budget_us = [] {
             char text[16] = {};
             const DWORD n = GetEnvironmentVariableA("LEONIDA_CONSOLE_FIX_US", text, sizeof(text));
-            return n > 0 && n < sizeof(text) ? std::strtoull(text, nullptr, 10) : 4000ull;
+            return n > 0 && n < sizeof(text) ? std::strtoull(text, nullptr, 10) : 0ull;
         }();
         const std::size_t end = std::min<std::size_t>(offset + bytes, std::size_t(heap.bytes));
         if (!heap.resource_heap) {
@@ -5750,14 +5751,13 @@ public:
         const VkDeviceSize alignment = device_.info.host_pointer_alignment;
         if (!device_.get_host_pointer_properties || !alignment) return E_NOTIMPL;
         const auto start = reinterpret_cast<std::uintptr_t>(address);
-        if (!address || !desc_.Width || desc_.Width > UINT64_MAX - 2 * alignment) return E_INVALIDARG;
+        if (start & 3) return E_NOTIMPL;  // byte-unaligned copies keep the ordinary-buffer fallback
+        if (!address || !desc_.Width || alignment > UINT64_MAX / 2 ||
+            (alignment & (alignment - 1)) || desc_.Width > UINT64_MAX - 2 * alignment) return E_INVALIDARG;
         const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
-        // Apply the same backing size rule to imports. The committed-range check and Vulkan bind requirements
-        // below cover the padding as well. The import never initializes or writes the caller's padding.
+        // Keep the device-address word padding, and include the host page prefix in the backing buffer.
         const VkDeviceSize backing_size = need_bda ? align_up(desc_.Width, sizeof(std::uint32_t)) : desc_.Width;
-        // The import starts at the page that holds `address`, and the buffer is bound at the offset inside it: the
-        // title places small buffers inside a page too (a 16-byte UAV at a 64-byte-aligned address on an RTX 5090,
-        // found in review), which an import of `address` itself would refuse.
+        // Bind at zero; replay and device addresses carry the logical buffer's prefix instead.
         const std::uintptr_t base = start & ~static_cast<std::uintptr_t>(alignment - 1);
         void* const base_address = reinterpret_cast<void*>(base);
         const VkDeviceSize offset = start - base;
@@ -5801,7 +5801,7 @@ public:
         VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
-        info.size = backing_size;
+        info.size = offset + backing_size;
         info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -5835,9 +5835,8 @@ public:
                                                 &host) != VK_SUCCESS)
             return decline(E_NOTIMPL);
         const std::uint32_t types = host.memoryTypeBits & requirements.memoryTypeBits;
-        // An offset off the buffer's own alignment cannot be bound: the fallback answers.
-        if (!types || (offset % requirements.alignment) || requirements.size > bytes - offset)
-            return decline(E_NOTIMPL);
+        // The binding is at zero; requirements cover the prefix as part of the buffer.
+        if (!types || requirements.size > bytes) return decline(E_NOTIMPL);
         VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
         import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         import.pHostPointer = base_address;
@@ -5869,12 +5868,12 @@ public:
             if (memory_) break;
         }
         if (!memory_) return decline(E_OUTOFMEMORY);
-        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, offset) != VK_SUCCESS)
-            return decline(E_OUTOFMEMORY);
+        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS) return decline(E_OUTOFMEMORY);
         if (need_bda && vk.vkGetBufferDeviceAddress) {
             VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             bda.buffer = buffer_;
             buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
+            if (buffer_va_) buffer_va_ += offset;
             gpu_va_ = buffer_va_;
         }
         // An import the driver put below the arena cannot be named by a V#: the V# keeps 48 bits of (device address
@@ -5913,6 +5912,7 @@ public:
         leonida::ResourceBinding binding{};
         binding.buffer = buffer_;
         binding.indirect_arguments = (info.usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0;
+        binding.buffer_offset = offset;
         binding.size = desc_.Width;
         binding.host = static_cast<const std::uint8_t*>(address);
         binding.host_readable = true;
@@ -6240,9 +6240,16 @@ public:
             const char* value = std::getenv("LEONIDA_PLACED_IMAGE_DEFER");
             return !value || std::strcmp(value, "0");
         }();
+        // A device without host copies has no other way to fill a title image: a refresh before a submission may not
+        // use a staged copy through the queue (host_copy_now). Its linear movie planes are staged too.
+        const bool no_host_copy = !device_.copy_memory_to_image && cpu_copyable;
         // Private BC copies start with the exact same zero blocks as the shared image. The host
         // transition and clear complete before a private view is published, including during command prepare.
-        if (defer_placed && origin == TitleImageOrigin::placed && host_transfer_ && device_.bindless &&
+        // Without host copies the staged upload fills the private image, and the first shader submission clears what
+        // it has not filled.
+        const bool can_fill = host_transfer_ || (no_host_copy && stage_title && allow_staged_title &&
+                                                 device_.image_requirements);
+        if (defer_placed && origin == TitleImageOrigin::placed && can_fill && device_.bindless &&
             desc_.Flags == D3D12_RESOURCE_FLAG_NONE && desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
             desc_.SampleDesc.Count == 1 && asked_castable.empty() && !format.typeless &&
             leonida::block_format(format.format, format.aspects).block > 1) {
@@ -6250,7 +6257,7 @@ public:
                 shared_zero_ = device_.zero_sampled_image(desc_, format, with_host.size);
         }
         std::uint32_t plain_bits = 0;
-        const bool can_stage = can_stage_title && !shared_zero_;
+        const bool can_stage = can_stage_title && (!shared_zero_ || no_host_copy);
         // A refresh must queue an upload when this image cannot take host copies, including linear movie planes.
         const bool needs_staging = can_stage && !host_transfer_;
         if (needs_staging) {
@@ -6279,6 +6286,7 @@ public:
             image_ = VK_NULL_HANDLE;
             memory_ = VK_NULL_HANDLE;
             staged_title_ = false;
+            shared_zero_ = VK_NULL_HANDLE;
             log_once("no room for a staged title image; retrying host-copyable backing, format", int(info.format));
             return create_texture(format, asked_castable, origin, false);
         };
@@ -6504,6 +6512,7 @@ private:
         }
         if (shared_zero_) {
             if (host_transfer_ && !host_initialize()) return false;
+            if (!host_transfer_) device_.context->note_shader_image(id());  // zeros until something fills it
             publish_streamed_texture();
         }
         return true;
@@ -7223,10 +7232,11 @@ private:
     std::shared_ptr<const leonida::TileHeapAllocation> heap_range_;
 };
 
-// One immutable, host-zeroed BC image per exact view shape. It has the right sampled format, extent,
+// One immutable, zeroed BC image per exact view shape (zeroed on the host, or by the first shader submission). It has
+// the right sampled format, extent,
 // mip count and zero-block decoding even before the title first supplies data or copies into the placement.
 VkImage DeviceState::zero_sampled_image(const D3D12_RESOURCE_DESC& d, const Format& format, VkDeviceSize bytes) {
-    if (!host_transfer_format(format.format)) return VK_NULL_HANDLE;
+    if (copy_memory_to_image && !host_transfer_format(format.format)) return VK_NULL_HANDLE;
     const ZeroShape key{d.Format, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels};
     std::lock_guard lock(zero_image_mutex);
     if (auto it = zero_images.find(key); it != zero_images.end()) return it->second ? it->second->image() : VK_NULL_HANDLE;
@@ -7235,12 +7245,13 @@ VkImage DeviceState::zero_sampled_image(const D3D12_RESOURCE_DESC& d, const Form
     if (used >= limit || bytes > limit - used) return VK_NULL_HANDLE;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0, 1, 1};
     auto* zero = new Resource(*this, d, heap, D3D12_HEAP_FLAG_NONE);
-    if (FAILED(zero->create_texture(format)) || !zero->host_initialized_image() ||
+    if (FAILED(zero->create_texture(format)) || (copy_memory_to_image && !zero->host_initialized_image()) ||
         zero->image_backing_bytes() > limit - used) {
         zero->Release();
         zero_images.emplace(key, nullptr);
         return VK_NULL_HANDLE;
     }
+    if (!zero->host_initialized_image()) context->note_shader_image(zero->id());  // cleared before a shader reads it
     zero_images.emplace(key, zero);
     zero_image_bytes.fetch_add(zero->image_backing_bytes(), std::memory_order_relaxed);
     return zero->image();

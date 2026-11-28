@@ -484,6 +484,13 @@ What is implemented (all of it testable without the game):
     `E_INVALIDARG` for such a render target, since no other format can view its image. Without that format,
     render targets are refused as before; depth-stencil and UAV creation are
     unsupported for this format.
+  - A `CopyTextureRegion` of the depth plane between two depth formats with the same depth encoding but not the
+    same `VkFormat` (`D32_SFLOAT_S8_UINT` and `D32_SFLOAT`, `D16_UNORM_S8_UINT` and `D16_UNORM`,
+    `D24_UNORM_S8_UINT` and `X8_D24_UNORM_PACK32`) goes image → transfer scratch → image too, depth aspect on both
+    sides (`vulkan_replay.h`, `depth_format_pair`; `replay_copy_offset_test`). `vkCmdCopyImage` requires
+    depth/stencil formats to match exactly (`VUID-vkCmdCopyImage-srcImage-01548`), and an NVIDIA driver (RTX 4070
+    Laptop, 621.40) handed the `D32_SFLOAT_S8_UINT` → `D32_SFLOAT` pair wrote past the end of the `D32_SFLOAT`
+    image: the world-start `WRITE_INVALID` device loss, with the fault at the first byte after the image.
   - reserved resources and `GetResourceTiling` (section 4.2);
   - query heaps for occlusion, timestamps and pipeline statistics, and `GetTimestampFrequency` on the queue
     (section 4.6);
@@ -2878,7 +2885,8 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   the driver's), as on D3D12.
 - GPU-writable slot-133 images on a default heap bind memory when replay, presentation or creation of a shader
   view first needs their Vulkan image. D3D12 placement and logical attachment views can precede that bind.
-  A CPU-fillable, typed BC texture can initially sample an immutable zero image of the same format, extent,
+  A CPU-fillable, typed BC texture (filled by host copies or the staged upload) can initially sample
+  an immutable zero image of the same format, extent,
   layer count and mip count. A CPU upload or explicit GPU command gives the placement private backing and
   republishes its existing descriptor keys. The cache holds at most 256 MiB. `LEONIDA_PLACED_IMAGE_DEFER=0`
   restores eager binding.

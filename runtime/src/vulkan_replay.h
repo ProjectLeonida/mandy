@@ -548,6 +548,27 @@ inline bool a8_mixed_backing(VkFormat a, VkFormat b) {
 #endif
 }
 
+// Two depth formats whose depth aspect has the same encoding but which are not the same VkFormat: D32_SFLOAT and
+// D32_SFLOAT_S8_UINT, D16_UNORM and D16_UNORM_S8_UINT, X8_D24_UNORM_PACK32 and D24_UNORM_S8_UINT. D3D12 copies the
+// depth plane between them; Vulkan's vkCmdCopyImage requires depth/stencil formats to match exactly
+// (VUID-vkCmdCopyImage-srcImage-01548), and an NVIDIA driver handed D32_SFLOAT_S8_UINT -> D32_SFLOAT writes past the
+// end of the D32 image (the world-start WRITE_INVALID). The replay stages these through a buffer, where the depth
+// aspect has the same texel layout on both sides.
+inline bool depth_format_pair(VkFormat a, VkFormat b) {
+    const auto encoding = [](VkFormat format) -> int {
+        switch (format) {
+        case VK_FORMAT_D32_SFLOAT:
+        case VK_FORMAT_D32_SFLOAT_S8_UINT: return 32;
+        case VK_FORMAT_X8_D24_UNORM_PACK32:
+        case VK_FORMAT_D24_UNORM_S8_UINT: return 24;
+        case VK_FORMAT_D16_UNORM:
+        case VK_FORMAT_D16_UNORM_S8_UINT: return 16;
+        default: return 0;
+        }
+    };
+    return a != b && encoding(a) && encoding(a) == encoding(b);
+}
+
 inline bool depth_colour_pair(const ResourceBinding& a, const ResourceBinding& b) {
     const auto family = [](VkFormat format) -> int {
         switch (format) {
@@ -2192,7 +2213,9 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         return ReplayResult::invalid_copy;
     if (buffer.size > UINT64_MAX - buffer.buffer_offset) return ReplayResult::invalid_copy;
     const VkDeviceSize backing_offset = buffer.buffer_offset + offset;
-    if (backing_offset % alignment && !copy.tile_footprint) return unsupported_at(__LINE__);
+    // A host-import prefix may be word aligned without being texel aligned (e.g. +4 for RGBA16).
+    // The replay stages those copies through aligned scratch; VkBufferCopy still needs word alignment.
+    if (backing_offset % alignment && backing_offset % 4 && !copy.tile_footprint) return unsupported_at(__LINE__);
     VkBufferImageCopy region{};
     region.bufferOffset = backing_offset;
     region.bufferRowLength = placed.row_pitch / format.bytes * format.block;
@@ -2212,13 +2235,13 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     return ReplayResult::success;
 }
 
-// CopyTiles accepts arbitrary byte offsets into its linear buffer, while VkBufferImageCopy requires texel/block
+// CopyTiles byte offsets and word-aligned imported host prefixes may violate VkBufferImageCopy texel/block
 // alignment (VUID-vkCmdCopyBufferToImage-dstImage-07975). Stage only the occupied texels/blocks through aligned
 // transfer scratch; leave partial-tile padding alone.
 inline bool stage_unaligned_tile(const ReplayFunctions& vk, Prepared& p, const ResourceBinding& image,
                                  const BlockFormat& fmt, bool upload) {
     auto& region = p.buffer_image_copies.front();
-    if (!fmt.bytes || !fmt.block || image.rgb96 ||
+    if (!vk.copy_buffer || !fmt.bytes || !fmt.block || image.rgb96 ||
         (image.depth24_as_float && region.imageSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT))
         return false;
     const VkDeviceSize blocks_w = (VkDeviceSize(region.imageExtent.width) + fmt.block - 1) / fmt.block;
@@ -3067,8 +3090,8 @@ inline void plan_statistics_segments(PreparedList& out) {
 }
 
 // Overlapping pipeline-statistics queries (D3D-252): the same physical-segment layout the occlusion planner
-// builds, in the statistics pool. Each Begin and End of a statistics query â€” and every non-timestamp resolve
-// while one runs, because its helper dispatch would be counted â€” closes the one open physical query and opens
+// builds, in the statistics pool. Each Begin and End of a statistics query — and every non-timestamp resolve
+// while one runs, because its helper dispatch would be counted — closes the one open physical query and opens
 // a new one, so each logical query keeps a contiguous slot range and its result is the sum of that range
 // (statistics_sum.comp). A Begin or End of another query kind leaves the segments alone.
 inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
@@ -3562,7 +3585,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                      static_cast<unsigned long long>(n));
                 }
                 const ResourceBinding& image = upload ? p.binding : p.source;
-                if (result == ReplayResult::success && texture_copy->tile_footprint && !p.buffer_image_copies.empty()) {
+                if (result == ReplayResult::success && !p.buffer_image_copies.empty()) {
                     const auto& region = p.buffer_image_copies.front();
                     const BlockFormat fmt = copy_block_format(image, region.imageSubresource.aspectMask);
                     const std::uint32_t alignment =
@@ -3627,7 +3650,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             if (result == ReplayResult::success && !p.image_copies.empty() &&
                 (p.image_copies[0].srcSubresource.aspectMask != p.image_copies[0].dstSubresource.aspectMask ||
-                 a8_mixed_backing(p.source.format, p.binding.format))) {
+                 a8_mixed_backing(p.source.format, p.binding.format) ||
+                 depth_format_pair(p.source.format, p.binding.format))) {
                 // Depth <-> colour: vkCmdCopyImage cannot mix aspects, so each region goes image -> scratch -> image,
                 // tightly packed. Depth aspects want 4-byte buffer offsets; 16 covers every texel size here. The two
                 // backings of A8_UNORM take the same route: one byte per texel on both sides, but Vulkan does not

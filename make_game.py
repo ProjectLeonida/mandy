@@ -61,6 +61,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an older Python can't run
@@ -2912,6 +2913,20 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
         "pipelines": fn_pipelines,
     }
 
+    reported: set[str] = set()
+
+    def report_unexpected(name: str, exc: BaseException) -> None:
+        """A stage that fails through fail() already printed a diagnostic; one that raises outright did
+        not. Report the stage and the exception once per stage, so a failure is never silent."""
+        if isinstance(exc, RuntimeError) and str(exc).startswith("stage exited with "):
+            return  # fail() called sys.exit; its diagnostic already went out
+        key = f"{name}: {exc!r}"
+        if key in reported:
+            return
+        reported.add(key)
+        print(f"\nERROR: stage '{name}' failed with an unexpected exception: {exc!r}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+
     if not overlap:
         order = [s for s in ("shaders", "assets", "runtime", "pipelines") if s in stages]
         if not order:
@@ -2921,7 +2936,8 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
             try:
                 _invoke_stage(name, builders[name])
                 progress.complete(name)
-            except Exception:
+            except Exception as exc:
+                report_unexpected(name, exc)
                 sys.exit(1)
         return
 
@@ -2950,7 +2966,8 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
                 futures[name].result()
                 progress.complete(name)
                 return True
-            except Exception:
+            except Exception as exc:
+                report_unexpected(name, exc)
                 failed = True
                 return False
 
@@ -2968,7 +2985,8 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
             try:
                 fut.result()
                 progress.complete(name)
-            except Exception:
+            except Exception as exc:
+                report_unexpected(name, exc)
                 failed = True
         ex.shutdown(wait=True)
     except KeyboardInterrupt:
