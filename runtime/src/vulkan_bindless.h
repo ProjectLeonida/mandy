@@ -440,12 +440,22 @@ public:
     std::uint32_t sampler_capacity() const { return features_.counts[bindless::sampler_binding]; }
     // How many more images of a dimension, or samplers, add_image and add_sampler can take before they return 0.
     std::uint32_t free_images(ImageDimension dimension) const {
-        const auto& used = image_used_[std::uint32_t(dimension)];
-        return std::uint32_t(std::count(used.begin(), used.end(), std::uint8_t(0)));
+        const std::uint32_t d = std::uint32_t(dimension);
+        return free_low_count_[d] + free_high_count_[d];
     }
-    std::uint32_t free_samplers() const {
-        return std::uint32_t(std::count(sampler_used_.begin(), sampler_used_.end(), std::uint8_t(0)));
+    std::uint32_t free_storage_images(ImageDimension dimension) const {
+        return free_low_count_[std::uint32_t(dimension)];
     }
+    std::uint32_t total_free_images() const noexcept {
+        return total_free_images_.load(std::memory_order_acquire);
+    }
+    bool has_free_image(ImageDimension dimension, bool stores, std::uint32_t sampled_class = 0) const {
+        if (!stores && bindless::sampled_binding(dimension) == bindless::no_binding) return false;
+        if (bindless::multisampled(dimension) && (stores || !supports_ms_class(sampled_class))) return false;
+        const std::uint32_t d = std::uint32_t(dimension);
+        return stores ? (free_low_count_[d] > 0) : (free_low_count_[d] + free_high_count_[d] > 0);
+    }
+    std::uint32_t free_samplers() const { return free_sampler_count_; }
     // Set 0 of every pipeline layout made for translated shaders.
     VkDescriptorSetLayout layout() const { return layout_; }
     // Bound at set 0. flush() updates it in place until flush_replaces_table() is true: then the flush makes a new
@@ -520,58 +530,57 @@ public:
         const bool stores = storage.as_float || storage.as_uint || storage.as_sint || storage.r32ui;
         if (!stores && bindless::sampled_binding(dimension) == bindless::no_binding) return 0;
         if (bindless::multisampled(dimension) && (stores || !supports_ms_class(sampled_class))) return 0;
-        auto& used = image_used_[std::uint32_t(dimension)];
-        const std::uint32_t low_end = std::min(std::uint32_t(used.size()), storage_capacity(dimension));
-        std::vector<std::uint8_t>* used_2d = nullptr;   // the mirror's index space, when there is one
-        if (mirror && dimension != ImageDimension::dim_2d && mirror->sampled) {
-            used_2d = &image_used_[std::uint32_t(ImageDimension::dim_2d)];
-            if (mirror->sampled_layout == VK_IMAGE_LAYOUT_UNDEFINED) used_2d = nullptr;
+        const std::uint32_t d = std::uint32_t(dimension);
+        const auto& used = image_used_[d];
+        const std::uint32_t low_end = low_end_[d];
+        bool want_mirror = false;
+        if (mirror && dimension != ImageDimension::dim_2d && mirror->sampled &&
+            mirror->sampled_layout != VK_IMAGE_LAYOUT_UNDEFINED) {
+            want_mirror = true;
         }
         // A store through the array T# and one through its 2D slice both have to land on a view, so an index with
         // storage views must be inside this dimension's storage arrays and, when the mirror has storage views too,
         // inside the 2D arrays' (their range can be the shorter of the two).
         const bool any_stores = stores || mirror_storage(mirror);
-        const std::uint32_t mirrored_storage_end = std::min(stores ? low_end : std::uint32_t(used.size()),
-                                                            storage_capacity(ImageDimension::dim_2d));
+        const std::uint32_t mirrored_storage_end =
+            (std::min)(stores ? low_end : std::uint32_t(used.size()), storage_capacity(ImageDimension::dim_2d));
         std::uint32_t index = 0;
-        if (used_2d) {
-            index = any_stores ? allocate_pair(used, *used_2d, 1, mirrored_storage_end)
-                               : allocate_pair(used, *used_2d, low_end, std::uint32_t(used.size()));
-            if (!index && !any_stores) index = allocate_pair(used, *used_2d, 1, low_end);
+        if (want_mirror) {
+            index = any_stores ? allocate_pair(dimension, 1, mirrored_storage_end)
+                               : allocate_pair(dimension, low_end, std::uint32_t(used.size()));
+            if (!index && !any_stores) index = allocate_pair(dimension, 1, low_end);
             if (!index) {
                 // No shared slot: the image still gets its own dimension's slot, unmirrored (a 2D read then finds
                 // the fallback). A full array is what returns 0.
-                used_2d = nullptr;
+                want_mirror = false;
             }
         }
-        if (!used_2d) {
-            index = stores ? allocate(used, 1, low_end) : allocate(used, low_end, std::uint32_t(used.size()));
-            if (!index) index = allocate(used, 1, low_end);
+        if (!want_mirror) {
+            index = stores ? pop_free_image(d, true) : pop_free_image(d, false);
+            if (!index && !stores) index = pop_free_image(d, true);
         }
         if (!index) return 0;
-        assert(!used_2d || !any_stores || index < storage_capacity(ImageDimension::dim_2d));
+        assert(!want_mirror || !any_stores || index < storage_capacity(ImageDimension::dim_2d));
         write_image(dimension, index, sampled, sampled_layout, storage, sampled_class);
-        if (index < storage_used_[std::uint32_t(dimension)].size())
-            storage_used_[std::uint32_t(dimension)][index] = stores ? 1 : 0;
-        if (used_2d) {
+        if (index < storage_used_[d].size()) storage_used_[d][index] = stores ? 1 : 0;
+        if (want_mirror) {
+            assert(image_used_[std::uint32_t(ImageDimension::dim_2d)][index] == in_use);
             write_image(ImageDimension::dim_2d, index, mirror->sampled, mirror->sampled_layout, mirror->storage, 0);
-            used_2d->at(index) = in_use;
             // The 2D slot is this image's mirror, and this image is its owner: the slot number alone does not say
             // so, because every dimension's index space is dense and independent.
             if (index < mirror_owner_.size()) {
-                mirror_owner_[index] = std::uint8_t(std::uint32_t(dimension) + 1);
+                mirror_owner_[index] = std::uint8_t(d + 1);
                 mirror_storage_used_[index] = mirror_storage(mirror) ? 1 : 0;
             }
             auto& storage_2d = storage_used_[std::uint32_t(ImageDimension::dim_2d)];
             if (index < storage_2d.size()) storage_2d[index] = mirror_storage(mirror) ? 1 : 0;
         }
         if (kind_out) {
-            *kind_out = kind_sampled_bit(std::uint32_t(dimension)) |
-                        (stores ? kind_storage_bit(std::uint32_t(dimension)) : 0) |
-                        (used_2d ? (kind_sampled_bit(std::uint32_t(ImageDimension::dim_2d)) |
-                                    (mirror_storage(mirror) ? kind_storage_bit(std::uint32_t(ImageDimension::dim_2d))
-                                                            : 0))
-                                 : 0);
+            *kind_out = kind_sampled_bit(d) | (stores ? kind_storage_bit(d) : 0) |
+                        (want_mirror ? (kind_sampled_bit(std::uint32_t(ImageDimension::dim_2d)) |
+                                        (mirror_storage(mirror) ? kind_storage_bit(std::uint32_t(ImageDimension::dim_2d))
+                                                                : 0))
+                                     : 0);
         }
         return index;
     }
@@ -585,12 +594,9 @@ public:
         if (!stores && bindless::sampled_binding(dimension) == bindless::no_binding) return ImageRefusal::no_array;
         if (bindless::multisampled(dimension) && (stores || !supports_ms_class(sampled_class)))
             return ImageRefusal::no_array;
-        const auto& used = image_used_[std::uint32_t(dimension)];
-        const std::size_t low_end = std::min<std::size_t>(used.size(), storage_capacity(dimension));
-        const auto storage_end = used.begin() + std::ptrdiff_t(low_end);
-        const bool storage_free = low_end > 1 && std::find(used.begin() + 1, storage_end, std::uint8_t(0)) != storage_end;
-        return stores && !storage_free && free_images(dimension) ? ImageRefusal::storage_full
-                                                                 : ImageRefusal::array_full;
+        const std::uint32_t d = std::uint32_t(dimension);
+        return stores && free_low_count_[d] == 0 && free_high_count_[d] > 0 ? ImageRefusal::storage_full
+                                                                            : ImageRefusal::array_full;
     }
 
     // New views or a new layout for an index add_image returned (a texture's state changed, say). `mirror` is
@@ -622,31 +628,34 @@ public:
     // held until a flush has brought the table up to date (one that did not degrade), so that no new image answers
     // that key; otherwise it is free at once.
     void remove_image(ImageDimension dimension, std::uint32_t index) {
-        auto& used = image_used_[std::uint32_t(dimension)];
+        const std::uint32_t d = std::uint32_t(dimension);
+        auto& used = image_used_[d];
         if (!index || index >= used.size() || used[index] != in_use) return;
         write_image(dimension, index, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, {}, 0);
-        used[index] = table_dirty_ ? held : 0;
-        if (index < storage_used_[std::uint32_t(dimension)].size())
-            storage_used_[std::uint32_t(dimension)][index] = 0;
-        if (table_dirty_) held_images_.push_back({dimension, index});
+        if (index < storage_used_[d].size()) storage_used_[d][index] = 0;
+        if (table_dirty_)
+            hold_image_slot(dimension, index);
+        else
+            free_image_slot(d, index);
         // Its 2D copy goes back to the fallback as well (add_image's mirror), when this image is the one that owns
         // that slot: another dimension's image at the same slot number has its own index space and keeps its 2D
         // descriptor (and, if it is a 2D-array image, its own mirror there).
         if (mirror_of(dimension, index)) {
-            auto& used_2d = image_used_[std::uint32_t(ImageDimension::dim_2d)];
             write_image(ImageDimension::dim_2d, index, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, {}, 0);
-            used_2d[index] = table_dirty_ ? held : 0;
             mirror_owner_[index] = 0;
             mirror_storage_used_[index] = 0;
             auto& storage_2d = storage_used_[std::uint32_t(ImageDimension::dim_2d)];
             if (index < storage_2d.size()) storage_2d[index] = 0;
-            if (table_dirty_) held_images_.push_back({ImageDimension::dim_2d, index});
+            if (table_dirty_)
+                hold_image_slot(ImageDimension::dim_2d, index);
+            else
+                free_image_slot(std::uint32_t(ImageDimension::dim_2d), index);
         }
     }
 
     // 0 when the sampler array is full.
     std::uint32_t add_sampler(VkSampler sampler) {
-        const std::uint32_t index = allocate(sampler_used_, 1, std::uint32_t(sampler_used_.size()));
+        const std::uint32_t index = pop_free_sampler();
         if (index) write_sampler(index, sampler);
         return index;
     }
@@ -654,8 +663,12 @@ public:
     void remove_sampler(std::uint32_t index) {
         if (!index || index >= sampler_used_.size() || sampler_used_[index] != in_use) return;
         write_sampler(index, fallback_sampler_);
-        sampler_used_[index] = table_dirty_ ? held : 0;
-        if (table_dirty_) held_samplers_.push_back(index);
+        if (table_dirty_) {
+            sampler_used_[index] = held;
+            held_samplers_.push_back(index);
+        } else {
+            free_sampler_slot(index);
+        }
     }
 
     // What an index of `dimension` is bound in, from what add_image wrote: that dimension's sampled bit, its storage
@@ -800,8 +813,9 @@ public:
         pending_slots_.clear();
         if (!last_flush_degraded_) {
             // The table this flush leaves on the GPU names no removed index any more: they can be given out again.
-            for (const auto& [dimension, index] : held_images_) image_used_[std::uint32_t(dimension)][index] = 0;
-            for (const std::uint32_t index : held_samplers_) sampler_used_[index] = 0;
+            for (const auto& [dimension, index] : held_images_)
+                free_image_slot(std::uint32_t(dimension), index);
+            for (const std::uint32_t index : held_samplers_) free_sampler_slot(index);
             held_images_.clear();
             held_samplers_.clear();
         }
@@ -921,25 +935,128 @@ private:
     // flush that does not degrade).
     static constexpr std::uint8_t in_use = 1, held = 2;
 
-    // The first free index in [begin, end), marked used; 0 when there is none.
-    static std::uint32_t allocate(std::vector<std::uint8_t>& used, std::uint32_t begin, std::uint32_t end) {
-        for (std::uint32_t i = begin; i < end; ++i) {
-            if (used[i]) continue;
-            used[i] = 1;
-            return i;
+    // O(1) slot bookkeeping helpers. Every state transition of image_used_ / sampler_used_ goes through here so the
+    // free counts and free-lists can never drift out of sync with the occupancy arrays.
+    void claim_image_slot(std::uint32_t d, std::uint32_t index) {
+        assert(index > 0 && index < image_used_[d].size() && image_used_[d][index] == 0);
+        image_used_[d][index] = in_use;
+        if (index < low_end_[d])
+            --free_low_count_[d];
+        else
+            --free_high_count_[d];
+        total_free_images_.fetch_sub(1, std::memory_order_release);
+    }
+
+    void free_image_slot(std::uint32_t d, std::uint32_t index) {
+        if (!index || index >= image_used_[d].size() || image_used_[d][index] == 0) return;
+        image_used_[d][index] = 0;
+        if (index < low_end_[d]) {
+            ++free_low_count_[d];
+            free_low_[d].push_back(index);
+        } else {
+            ++free_high_count_[d];
+            free_high_[d].push_back(index);
+        }
+        total_free_images_.fetch_add(1, std::memory_order_release);
+    }
+
+    void hold_image_slot(ImageDimension dimension, std::uint32_t index) {
+        const std::uint32_t d = std::uint32_t(dimension);
+        assert(index > 0 && index < image_used_[d].size() && image_used_[d][index] == in_use);
+        image_used_[d][index] = held;
+        held_images_.push_back({dimension, index});
+    }
+
+    std::uint32_t pop_free_image(std::uint32_t d, bool low) {
+        const std::uint32_t count = low ? free_low_count_[d] : free_high_count_[d];
+        if (!count) return 0;
+        auto& list = low ? free_low_[d] : free_high_[d];
+        auto& used = image_used_[d];
+        while (!list.empty()) {
+            const std::uint32_t idx = list.back();
+            list.pop_back();
+            if (used[idx] == 0) {
+                claim_image_slot(d, idx);
+                return idx;
+            }
         }
         return 0;
     }
 
-    // The first index in [begin, end) free in both arrays, marked used in the first; 0 when there is none. The
-    // second array's size bounds the range: a mirrored index must exist in it (its 2D slot).
-    static std::uint32_t allocate_pair(std::vector<std::uint8_t>& used, std::vector<std::uint8_t>& other,
-                                       std::uint32_t begin, std::uint32_t end) {
-        end = std::min(end, std::uint32_t(other.size()));
-        for (std::uint32_t i = begin; i < end; ++i) {
-            if (used[i] || other[i]) continue;
-            used[i] = 1;
-            return i;
+    std::uint32_t pop_free_sampler() {
+        if (!free_sampler_count_) return 0;
+        while (!free_samplers_.empty()) {
+            const std::uint32_t idx = free_samplers_.back();
+            free_samplers_.pop_back();
+            if (sampler_used_[idx] == 0) {
+                sampler_used_[idx] = in_use;
+                --free_sampler_count_;
+                return idx;
+            }
+        }
+        return 0;
+    }
+
+    void free_sampler_slot(std::uint32_t index) {
+        if (!index || index >= sampler_used_.size() || sampler_used_[index] == 0) return;
+        sampler_used_[index] = 0;
+        ++free_sampler_count_;
+        free_samplers_.push_back(index);
+    }
+
+    // Finds a slot in [begin, limit) free in both `dim` and `dim_2d`, claiming it in BOTH spaces; 0 when none exists.
+    std::uint32_t allocate_pair(ImageDimension dim, std::uint32_t begin, std::uint32_t end) {
+        const std::uint32_t d = std::uint32_t(dim);
+        constexpr std::uint32_t d2 = std::uint32_t(ImageDimension::dim_2d);
+        const std::uint32_t limit = (std::min)(end, std::uint32_t(image_used_[d2].size()));
+        if (begin >= limit) return 0;
+        if (free_low_count_[d] + free_high_count_[d] == 0 || free_low_count_[d2] + free_high_count_[d2] == 0) return 0;
+        if (limit <= low_end_[d] && free_low_count_[d] == 0) return 0;
+        if (begin >= low_end_[d] && free_high_count_[d] == 0) return 0;
+        if (limit <= low_end_[d2] && free_low_count_[d2] == 0) return 0;
+        if (begin >= low_end_[d2] && free_high_count_[d2] == 0) return 0;
+
+        const auto search_list = [&](std::vector<std::uint32_t>& list, std::uint32_t owner_d,
+                                     std::uint32_t other_d) -> std::uint32_t {
+            const auto& used_a = image_used_[owner_d];
+            const auto& used_b = image_used_[other_d];
+            for (std::size_t k = list.size(); k > 0; --k) {
+                const std::uint32_t idx = list[k - 1];
+                if (used_a[idx] != 0) {
+                    list[k - 1] = list.back();
+                    list.pop_back();
+                    continue;
+                }
+                if (idx >= begin && idx < limit && used_b[idx] == 0) {
+                    list[k - 1] = list.back();
+                    list.pop_back();
+                    claim_image_slot(d, idx);
+                    claim_image_slot(d2, idx);
+                    return idx;
+                }
+            }
+            return 0;
+        };
+
+        const bool d_uses_low = begin < low_end_[d];
+        const bool d_uses_high = limit > low_end_[d];
+        const bool d2_uses_low = begin < low_end_[d2];
+        const bool d2_uses_high = limit > low_end_[d2];
+        const std::uint32_t d_avail = (d_uses_low ? free_low_count_[d] : 0) + (d_uses_high ? free_high_count_[d] : 0);
+        const std::uint32_t d2_avail =
+            (d2_uses_low ? free_low_count_[d2] : 0) + (d2_uses_high ? free_high_count_[d2] : 0);
+        if (!d_avail || !d2_avail) return 0;
+
+        if (d_avail <= d2_avail) {
+            if (d_uses_low)
+                if (const std::uint32_t idx = search_list(free_low_[d], d, d2)) return idx;
+            if (d_uses_high)
+                if (const std::uint32_t idx = search_list(free_high_[d], d, d2)) return idx;
+        } else {
+            if (d2_uses_low)
+                if (const std::uint32_t idx = search_list(free_low_[d2], d2, d)) return idx;
+            if (d2_uses_high)
+                if (const std::uint32_t idx = search_list(free_high_[d2], d2, d)) return idx;
         }
         return 0;
     }
@@ -979,16 +1096,38 @@ private:
             shadow_written_[b].assign(features_.counts[b], 0);
         }
 
+        std::uint32_t total_free = 0;
         for (std::uint32_t d = 0; d < dimensions; ++d) {
-            image_used_[d].assign(image_capacity(ImageDimension(d)), 0);
+            const std::uint32_t cap = image_capacity(ImageDimension(d));
+            const std::uint32_t low = (std::min)(cap, storage_capacity(ImageDimension(d)));
+            low_end_[d] = low;
+            image_used_[d].assign(cap, 0);
             image_used_[d][0] = 1;
+            const std::uint32_t low_count = low > 1 ? low - 1 : 0;
+            const std::uint32_t high_begin = (std::max)(low, std::uint32_t(1));
+            const std::uint32_t high_count = cap > high_begin ? cap - high_begin : 0;
+            free_low_count_[d] = low_count;
+            free_high_count_[d] = high_count;
+            total_free += low_count + high_count;
+            free_low_[d].clear();
+            free_low_[d].reserve(low_count);
+            for (std::uint32_t i = low; i > 1; --i) free_low_[d].push_back(i - 1);
+            free_high_[d].clear();
+            free_high_[d].reserve(high_count);
+            for (std::uint32_t i = cap; i > high_begin; --i) free_high_[d].push_back(i - 1);
         }
+        total_free_images_.store(total_free, std::memory_order_release);
         for (std::uint32_t d = 0; d < dimensions; ++d)
             storage_used_[d].assign(image_capacity(ImageDimension(d)), 0);
         mirror_owner_.assign(image_capacity(ImageDimension::dim_2d), 0);
         mirror_storage_used_.assign(image_capacity(ImageDimension::dim_2d), 0);
-        sampler_used_.assign(sampler_capacity(), 0);
+        const std::uint32_t scap = sampler_capacity();
+        sampler_used_.assign(scap, 0);
         sampler_used_[0] = 1;
+        free_sampler_count_ = scap > 1 ? scap - 1 : 0;
+        free_samplers_.clear();
+        free_samplers_.reserve(free_sampler_count_);
+        for (std::uint32_t i = scap; i > 1; --i) free_samplers_.push_back(i - 1);
         return true;
     }
 
@@ -1444,8 +1583,8 @@ private:
     }
 
     void sync_fast_state() noexcept {
-        const bool prep =
-            !fallbacks_ready_ || table_dirty_ || !table_uploaded_ || !pending_.empty() || !retired_.empty();
+        const bool prep = !fallbacks_ready_ || table_dirty_ || !table_uploaded_ || !pending_.empty() ||
+                          !retired_.empty() || !held_images_.empty() || !held_samplers_.empty();
         current_set_.store(set_, std::memory_order_release);
         needs_commit_.store(upload_in_flight_, std::memory_order_release);
         needs_prepare_.store(prep, std::memory_order_release);
@@ -1500,6 +1639,12 @@ private:
     VkSampler fallback_sampler_ = VK_NULL_HANDLE;
     bool fallbacks_ready_ = false;
     std::array<std::vector<std::uint8_t>, dimensions> image_used_;
+    std::array<std::uint32_t, dimensions> low_end_{};
+    std::array<std::vector<std::uint32_t>, dimensions> free_low_;
+    std::array<std::vector<std::uint32_t>, dimensions> free_high_;
+    std::array<std::uint32_t, dimensions> free_low_count_{};
+    std::array<std::uint32_t, dimensions> free_high_count_{};
+    std::atomic<std::uint32_t> total_free_images_{0};
     // Which of those slots also hold storage views (add_image's `storage`), and which 2D slots hold the mirror of an
     // image in another dimension (add_image's MirrorViews): removing that image frees the 2D slot too. insert_key
     // reads both to say which arrays an index is bound in. mirror_owner_ says whose mirror each of those 2D slots is
@@ -1509,6 +1654,8 @@ private:
     std::vector<std::uint8_t> mirror_owner_;
     std::vector<std::uint8_t> mirror_storage_used_;
     std::vector<std::uint8_t> sampler_used_;
+    std::vector<std::uint32_t> free_samplers_;
+    std::uint32_t free_sampler_count_ = 0;
     std::vector<std::pair<ImageDimension, std::uint32_t>> held_images_;  // removed, not yet free (remove_image)
     std::vector<std::uint32_t> held_samplers_;
     std::vector<Pending> pending_;

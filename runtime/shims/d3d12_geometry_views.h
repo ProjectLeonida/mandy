@@ -125,6 +125,13 @@ class GeometryViews {
     std::vector<std::uint64_t> executing_;
     std::atomic<bool> unstamped_{false};
     leonida::geometry_writes::ReleaseQueue releases_;
+    leonida::geometry_writes::WriteQueue writes_;
+    std::unordered_map<Address, std::vector<Address>> peer_to_tiles_;
+    std::vector<Address> written_queue_scratch_;
+    std::vector<Address> hot_tiles_scratch_;
+    std::vector<Address> hot_overlap_tiles_;
+    std::vector<Address> candidate_vas_;
+    std::uint64_t hot_gen_seen_ = ~std::uint64_t(0);
     std::atomic<std::uint64_t> free_generation_{0};
     std::uint64_t serial_{}, bytes_{}, cap_refusals_{}, allocation_failures_{}, ready_{}, uploads_{}, uploaded_{};
     std::uint64_t submissions_{}, dirty_refreshes_{}, refilled_{}, tile_fills_{};
@@ -145,15 +152,26 @@ class GeometryViews {
     std::uint64_t cleared_{};
     bool retry_{};
 
+    void unregister_peers_locked(Address va, const std::vector<std::pair<Address, Cell*>>& peers) {  // mutex_ held
+        for (const auto& item : peers) {
+            const auto pit = peer_to_tiles_.find(item.first);
+            if (pit == peer_to_tiles_.end()) continue;
+            std::erase(pit->second, va);
+            if (pit->second.empty()) peer_to_tiles_.erase(pit);
+        }
+    }
+
     void detach_tiles_locked(std::size_t id, Address source, std::size_t size) {  // mutex_ held
         for (auto p = source & ~(tile_size - 1); p < source + size; p += tile_size) {
             const auto it = tiles_.find(p);
             if (it == tiles_.end()) continue;
             std::erase(it->second.views, id);
             if (it->second.views.empty()) {
+                unregister_peers_locked(p, it->second.peers);
                 for (auto [peer, cell] : it->second.peers) leonida::geometry_writes::release(peer);
                 if (it->second.primary) leonida::geometry_writes::release(p);
                 tiles_.erase(it);
+                hot_gen_seen_ = ~std::uint64_t(0);
             }
         }
     }
@@ -167,9 +185,14 @@ class GeometryViews {
             std::vector<Address> others;
             if (auto aliases = watch::aliases.load(std::memory_order_acquire)) aliases(va, others);
             auto old = std::move(t.peers);
-            for (auto peer : others) t.peers.emplace_back(peer, watch::acquire(peer));
+            unregister_peers_locked(va, old);
+            for (auto peer : others) {
+                t.peers.emplace_back(peer, watch::acquire(peer));
+                peer_to_tiles_[peer].push_back(va);
+            }
             for (auto [peer, cell] : old) watch::release(peer);
             t.mapping = mapping;
+            hot_gen_seen_ = ~std::uint64_t(0);
         }
         for (auto [addr, peer] : t.peers)
             version = (std::max)(version, peer->version.load(std::memory_order_acquire));
@@ -180,6 +203,37 @@ class GeometryViews {
         t.version = version;
         retry_ |= t.retry;
         return !t.retry;
+    }
+
+    // Rebuilds `hot_overlap_tiles_` (sorted, unique primary tile VAs in `tiles_` whose primary or any peer is
+    // currently hot in geometry_writes) whenever `hot_generation` or `tiles_`/`peer_to_tiles_` changed. mutex_ held.
+    void sync_hot_overlap_locked() {
+        auto& s = leonida::geometry_writes::state();
+        if (s.hot_count.load(std::memory_order_acquire) == 0) {
+            hot_overlap_tiles_.clear();
+            hot_gen_seen_ = ~std::uint64_t(0);
+            return;
+        }
+        const std::uint64_t gen = s.hot_generation.load(std::memory_order_acquire);
+        if (gen == hot_gen_seen_) return;
+        hot_overlap_tiles_.clear();
+        if (!tiles_.empty()) {
+            leonida::geometry_writes::hot_tiles(hot_tiles_scratch_);
+            for (const Address h : hot_tiles_scratch_) {
+                if (tiles_.find(h) != tiles_.end()) hot_overlap_tiles_.push_back(h);
+                if (!peer_to_tiles_.empty()) {
+                    if (const auto pit = peer_to_tiles_.find(h); pit != peer_to_tiles_.end()) {
+                        for (const Address primary : pit->second) hot_overlap_tiles_.push_back(primary);
+                    }
+                }
+            }
+            if (hot_overlap_tiles_.size() > 1) {
+                std::sort(hot_overlap_tiles_.begin(), hot_overlap_tiles_.end());
+                hot_overlap_tiles_.erase(std::unique(hot_overlap_tiles_.begin(), hot_overlap_tiles_.end()),
+                                         hot_overlap_tiles_.end());
+            }
+        }
+        hot_gen_seen_ = gen;
     }
     // The tile's 64 KiB as this refresh read it, or null when it could not be read whole. Read at most once a refresh.
     template<class Copy>
@@ -222,8 +276,12 @@ public:
     explicit GeometryViews(std::uint64_t cap_override = 0) : cap_override_(cap_override) {
         pool_.set_system_memory(system_memory_setting());
         leonida::geometry_writes::subscribe(releases_);
+        leonida::geometry_writes::subscribe_writes(writes_);
     }
-    ~GeometryViews() { leonida::geometry_writes::unsubscribe(releases_); }
+    ~GeometryViews() {
+        leonida::geometry_writes::unsubscribe_writes(writes_);
+        leonida::geometry_writes::unsubscribe(releases_);
+    }
     GeometryViews(const GeometryViews&) = delete;
     GeometryViews& operator=(const GeometryViews&) = delete;
     GeometryViews(GeometryViews&&) = delete;
@@ -361,7 +419,9 @@ public:
         bytes_ += bytes;
         bool ready = true;
         for (auto p = cpu & ~(tile_size - 1); p < cpu + bytes; p += tile_size) {
-            auto& tile = tiles_[p];
+            auto [tile_it, inserted] = tiles_.try_emplace(p);
+            auto& tile = tile_it->second;
+            if (inserted) hot_gen_seen_ = ~std::uint64_t(0);
             // Previously watched tiles may have other dirty views waiting for refresh().
             if (!tile.primary) update(p, tile);
             tile.views.push_back(id);
@@ -586,11 +646,33 @@ public:
         std::lock_guard serial(refresh_mutex_);
         std::unique_lock lock(mutex_);
         ++submissions_;
-        auto now = leonida::geometry_writes::state().serial.load(std::memory_order_acquire);
-        if (serial_ == now && !retry_) return;
+        sync_hot_overlap_locked();
+        const bool has_writes = writes_.pending.load(std::memory_order_acquire);
+        if (!retry_ && !has_writes && hot_overlap_tiles_.empty()) return;
+        bool overflow = false;
+        written_queue_scratch_.clear();
+        if (has_writes) leonida::geometry_writes::take_written(writes_, written_queue_scratch_, overflow);
+        candidate_vas_.clear();
+        const bool full_walk = retry_ || overflow;
+        if (!full_walk) {
+            for (const Address w : written_queue_scratch_) {
+                if (tiles_.find(w) != tiles_.end()) candidate_vas_.push_back(w);
+                if (!peer_to_tiles_.empty()) {
+                    if (const auto pit = peer_to_tiles_.find(w); pit != peer_to_tiles_.end()) {
+                        for (const Address primary : pit->second) candidate_vas_.push_back(primary);
+                    }
+                }
+            }
+            for (const Address h : hot_overlap_tiles_) candidate_vas_.push_back(h);
+            if (candidate_vas_.empty()) return;
+            if (candidate_vas_.size() > 1) {
+                std::sort(candidate_vas_.begin(), candidate_vas_.end());
+                candidate_vas_.erase(std::unique(candidate_vas_.begin(), candidate_vas_.end()), candidate_vas_.end());
+            }
+        }
         const auto start = std::chrono::steady_clock::now();
         const auto before = uploaded_;
-        serial_ = now;
+        serial_ = leonida::geometry_writes::state().serial.load(std::memory_order_acquire);
         retry_ = false;
         refreshing_ = true;
         struct RefreshGuard {
@@ -614,24 +696,46 @@ public:
         // submission fixes its console heap slots then waited for the whole pass (speed-35: 116 ms of fixing a
         // submission with indirect draws on). So the lock is let go every 64 tiles. Walking by key (lower_bound)
         // survives both inserts from resolve() and erasures from retire_range() while unlocked.
-        Address cursor = 0;
-        bool have_cursor = true;
-        std::size_t walked = 0;
-        while (have_cursor) {
-            auto it = tiles_.lower_bound(cursor);
-            if (it == tiles_.end()) break;
-            const Address va = it->first;
-            Tile& tile = it->second;
-            const bool written = update(va, tile);
-            if (tile.retry)
-                for (auto id : tile.views)
-                    if (id < marks_.size() && views_[id].alive) marks_[id] |= kPinned;
-            if (written) written_vas_.push_back(va);
-            if (va > UINTPTR_MAX - tile_size) have_cursor = false;
-            else cursor = va + tile_size;
-            if (!(++walked & 63)) {
-                lock.unlock();
-                lock.lock();
+        const auto is_hot_overlap = [&](Address va) {
+            return !hot_overlap_tiles_.empty() &&
+                   std::binary_search(hot_overlap_tiles_.begin(), hot_overlap_tiles_.end(), va);
+        };
+        if (full_walk) {
+            Address cursor = 0;
+            bool have_cursor = true;
+            std::size_t walked = 0;
+            while (have_cursor) {
+                auto it = tiles_.lower_bound(cursor);
+                if (it == tiles_.end()) break;
+                const Address va = it->first;
+                Tile& tile = it->second;
+                const bool written = update(va, tile);
+                if (tile.retry)
+                    for (auto id : tile.views)
+                        if (id < marks_.size() && views_[id].alive) marks_[id] |= kPinned;
+                if (written || (!tile.retry && is_hot_overlap(va))) written_vas_.push_back(va);
+                if (va > UINTPTR_MAX - tile_size) have_cursor = false;
+                else cursor = va + tile_size;
+                if (!(++walked & 63)) {
+                    lock.unlock();
+                    lock.lock();
+                }
+            }
+        } else {
+            std::size_t walked = 0;
+            for (const Address va : candidate_vas_) {
+                auto it = tiles_.find(va);
+                if (it == tiles_.end()) continue;
+                Tile& tile = it->second;
+                const bool written = update(va, tile);
+                if (tile.retry)
+                    for (auto id : tile.views)
+                        if (id < marks_.size() && views_[id].alive) marks_[id] |= kPinned;
+                if (written || (!tile.retry && is_hot_overlap(va))) written_vas_.push_back(va);
+                if (!(++walked & 63)) {
+                    lock.unlock();
+                    lock.lock();
+                }
             }
         }
         const std::size_t changed_tiles = written_vas_.size();
@@ -758,6 +862,9 @@ public:
             if (tile.primary) leonida::geometry_writes::release(va);
         }
         tiles_.clear();
+        peer_to_tiles_.clear();
+        hot_overlap_tiles_.clear();
+        hot_gen_seen_ = ~std::uint64_t(0);
         {
             std::unique_lock structure(structure_mutex_);
             keys_.clear();

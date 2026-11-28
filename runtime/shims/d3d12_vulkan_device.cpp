@@ -3068,34 +3068,73 @@ constexpr const char* kTsharpNoTextureLow32Other = "no texture at the T# address
 constexpr const char* kTsharpNoTextureLow32Gone = "no texture at the T# address: its low 32 bits name a texture of ours that is gone";
 constexpr const char* kTsharpNoTextureNothing = "no texture at the T# address: no title memory and no texture of ours";
 struct TitleTexture;  // a texture the title keeps in its own memory (TitleTexture, after Resource)
+// Overload returning the bindless index word under the same descriptor_mutex hold (null to skip).
+TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWords& words, const char** why,
+                            std::uint32_t* out_index_word);
 
 // The first refused T#s of each reason, with where they sit in the heap and their words, and counts of the
 // distinct slots refused overall and per reason (a slot is scanned again every pass over the heap).
+// Zero-allocation on the hot path: reasons are matched by pointer identity first (all runtime reasons are static
+// literals), with an owned string fallback for synthetic test strings.
 struct UnboundTsharpTracker {
+    struct ReasonBucket {
+        const char* literal = nullptr;
+        std::string owned;
+        std::unordered_set<std::size_t> slots;
+        std::uint64_t count = 0;
+        unsigned logged = 0;
+    };
+
     std::mutex mutex;
-    std::set<std::size_t> total_slots;
-    std::map<std::string, std::set<std::size_t>> slots_by_reason;
-    std::map<std::string, std::uint64_t> counts_by_reason;
-    std::map<std::string, unsigned> logged;
+    std::unordered_set<std::size_t> total_slots;
+    std::vector<ReasonBucket> buckets;
     std::uint64_t total_refusals = 0;
+    std::atomic<bool> capped{false};
+
+    bool is_capped() const noexcept { return capped.load(std::memory_order_acquire); }
+
+    ReasonBucket& bucket_locked(const char* why) {
+        const char* r = why ? why : "?";
+        for (ReasonBucket& b : buckets) {
+            if (b.literal == r) return b;
+        }
+        for (ReasonBucket& b : buckets) {
+            if (b.owned == r) return b;
+        }
+        ReasonBucket& b = buckets.emplace_back();
+        b.literal = r;
+        b.owned = r;
+        return b;
+    }
 
     void note(std::uint64_t heap_va, std::size_t offset, const leonida::gfx10::ImageWords& words, const char* why) {
         std::lock_guard lock(mutex);
-        const std::string reason = why ? why : "?";
+        ReasonBucket& b = bucket_locked(why);
         ++total_refusals;
-        ++counts_by_reason[reason];
-        if (total_slots.size() >= 262144) return;  // enough to say how many
+        ++b.count;
+        if (total_slots.size() >= 262144) {
+            capped.store(true, std::memory_order_release);
+            return;  // enough to say how many
+        }
         const bool fresh_overall = total_slots.insert(offset).second;
-        const bool fresh_reason = slots_by_reason[reason].insert(offset).second;
-        unsigned& n = logged[reason];
-        if ((!fresh_overall && !fresh_reason) || n >= 6) return;
-        ++n;
+        if (total_slots.size() >= 262144) capped.store(true, std::memory_order_release);
+        const bool fresh_reason = b.slots.insert(offset).second;
+        if ((!fresh_overall && !fresh_reason) || b.logged >= 6) return;
+        ++b.logged;
         std::fprintf(stderr,
                      "[rt] d3d12: unbound T# in console heap 0x%llx at +0x%zx (%zu distinct slots so far, %zu for '%s'): %s: "
                      "%08x %08x %08x %08x %08x %08x %08x %08x\n",
                      static_cast<unsigned long long>(heap_va), offset, total_slots.size(),
-                     slots_by_reason[reason].size(), reason.c_str(), reason.c_str(), words[0],
+                     b.slots.size(), b.owned.c_str(), b.owned.c_str(), words[0],
                      words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    }
+
+    void note_capped(const char* why, std::uint64_t count) {
+        if (!count) return;
+        std::lock_guard lock(mutex);
+        ReasonBucket& b = bucket_locked(why);
+        total_refusals += count;
+        b.count += count;
     }
 
     UnboundTsharpStats stats() {
@@ -3103,9 +3142,9 @@ struct UnboundTsharpTracker {
         UnboundTsharpStats s;
         s.total_distinct_slots = total_slots.size();
         s.total_refusals = total_refusals;
-        for (const auto& [reason, slots] : slots_by_reason) {
-            s.by_reason[reason].distinct_slots = slots.size();
-            s.by_reason[reason].total_refusals = counts_by_reason[reason];
+        for (const ReasonBucket& b : buckets) {
+            s.by_reason[b.owned].distinct_slots = b.slots.size();
+            s.by_reason[b.owned].total_refusals = b.count;
         }
         return s;
     }
@@ -3113,10 +3152,9 @@ struct UnboundTsharpTracker {
     void reset() {
         std::lock_guard lock(mutex);
         total_slots.clear();
-        slots_by_reason.clear();
-        counts_by_reason.clear();
-        logged.clear();
+        buckets.clear();
         total_refusals = 0;
+        capped.store(false, std::memory_order_release);
     }
 };
 
@@ -7302,7 +7340,12 @@ struct DeviceState {
         // Since the last log line.
         std::uint64_t copied = 0, vsharps = 0, unbacked = 0, retried = 0;
         std::uint64_t images[5] = {};  // by TitleImage
-        std::map<std::string, std::uint64_t> refused_reasons;
+        struct ReasonLess {
+            bool operator()(const char* a, const char* b) const noexcept {
+                return a != b && std::strcmp(a, b) < 0;
+            }
+        };
+        std::map<const char*, std::uint64_t, ReasonLess> refused_reasons;
         double ms = 0, pages_ms = 0, fix_ms = 0, retry_ms = 0;  // ms: all; the others its parts
         // Changed slots by class (before the fix budget), since the last log line: all-zero, V# pair, T#, other
         // words; V# halves whose 16 bytes were seen before (a direct-mapped memo of 65536 keys, so a lower bound of
@@ -7324,6 +7367,17 @@ struct DeviceState {
     };
     std::mutex console_heap_mutex;  // taken before title_window_mutex, shadow_mutex and descriptor_mutex
     std::vector<std::unique_ptr<ConsoleHeap>> console_heaps;
+    std::atomic<std::uint64_t> console_heap_signature{0xcbf29ce484222325ull};
+    void update_console_heap_signature_locked() {  // console_heap_mutex held
+        std::uint64_t sig = 0xcbf29ce484222325ull;
+        for (const auto& h : console_heaps) {
+            if (!h || !h->bytes) continue;
+            const std::uint64_t begin = h->shader_va, end = h->shader_va + h->bytes + h->guard;
+            sig = (sig ^ begin) * 0x100000001b3ull;
+            sig = (sig ^ end) * 0x100000001b3ull;
+        }
+        console_heap_signature.store(sig, std::memory_order_release);
+    }
 
     // Null slots after a shader-visible resource heap's GPU copy. A directly indexed heap is read at
     // heap VA + index * 32 with the index from data (docs/d3d12_vulkan.md section 3.4), and nothing bounds it: an
@@ -7433,7 +7487,9 @@ struct DeviceState {
             std::memcpy(words.data(), w, sizeof(words));
             if (leonida::gfx10::is_image(words)) {
                 const char* why = nullptr;
-                const TitleImage result = bind_title_image(*this, words, &why);
+                std::uint32_t index_word = 0;
+                const TitleImage result =
+                    bind_title_image(*this, words, &why, tsharp_index_words ? &index_word : nullptr);
                 const bool unbound = result == TitleImage::unknown || result == TitleImage::refused;
                 if (unbound) {
                     note_refused_tsharp(heap, slot * kDescriptorSize, words, why);
@@ -7458,7 +7514,7 @@ struct DeviceState {
                     // the T# waits: a texture coming, going or being replaced at its address fixes the slot again
                     // (apply_slot_changes), so the word follows the texture the T# names. The title's bytes and the
                     // T#'s key keep the title's dword 6.
-                    if (tsharp_index_words) w[leonida::gfx10::kTsharpIndexDword] = unbound ? 0u : tsharp_index_word(words);
+                    if (tsharp_index_words) w[leonida::gfx10::kTsharpIndexDword] = unbound ? 0u : index_word;
                 }
             } else {
                 // Neither a buffer V# (TYPE is not 0) nor a T# the layer can decode: data the title keeps in the slot.
@@ -7997,6 +8053,13 @@ struct DeviceState {
             heap.changes_seen = slot_changes.size();
         }
         if (heap.pending_changes.empty()) return;
+        if (bindless && bindless->total_free_images() == 0) {
+            // No free bindless slot in any dimension: waking room_[1] (texture_waiting_room) cannot succeed and would
+            // only re-refuse every waiting slot on this submission.
+            std::erase_if(heap.pending_changes,
+                          [](const leonida::SlotChange& c) { return c.kind == leonida::SlotChange::texture_room; });
+            if (heap.pending_changes.empty()) return;
+        }
         const auto start = std::chrono::steady_clock::now();
         const std::uint64_t looked = heap.records.looked_at();
         heap.records.touched(heap.pending_changes.data(), heap.pending_changes.size(), heap.touched_scratch);
@@ -8654,6 +8717,7 @@ struct DeviceState {
         const char* why = nullptr;
         std::uint64_t texture_address = 0;
         std::uint32_t index_word = 0;
+        std::uint64_t capped_hits = 0;
     };
     std::vector<InPlaceJob> in_place_jobs_scratch;
     std::vector<InPlaceDone> in_place_done_scratch;
@@ -8818,6 +8882,8 @@ struct DeviceState {
         };
         auto& done = in_place_done_scratch;
         done.assign(jobs.size(), InPlaceDone{});
+        auto& refusal_tracker = unbound_tsharp_tracker();
+        bool any_capped_hits = false;
         for (std::size_t i = 0; i < jobs.size(); ++i) {
             std::uint32_t* w = done[i].out;
             std::memcpy(w, jobs[i].words, kDescriptorSize);
@@ -8851,10 +8917,15 @@ struct DeviceState {
                 leonida::gfx10::ImageWords words;
                 std::memcpy(words.data(), w, sizeof(words));
                 if (const auto cached = tsharp_cache.find(words); cached != tsharp_cache.end()) {
-                    const InPlaceTsharpCached& entry = cached->second;
+                    InPlaceTsharpCached& entry = cached->second;
                     const bool unbound = entry.result == TitleImage::unknown || entry.result == TitleImage::refused;
                     if (unbound) {
-                        note_refused_tsharp(heap, std::size_t(jobs[i].slot) * kDescriptorSize, words, entry.why);
+                        if (refusal_tracker.is_capped()) {
+                            ++entry.capped_hits;
+                            any_capped_hits = true;
+                        } else {
+                            note_refused_tsharp(heap, std::size_t(jobs[i].slot) * kDescriptorSize, words, entry.why);
+                        }
                         ++heap.refused_reasons[entry.why ? entry.why : "?"];
                         ++heap.texture_waits;
                     }
@@ -8873,15 +8944,23 @@ struct DeviceState {
                 }
                 if (leonida::gfx10::is_image(words)) {
                     const char* why = nullptr;
-                    const TitleImage result = bind_title_image(*this, words, &why);
+                    std::uint32_t index_word = 0;
+                    const TitleImage result =
+                        bind_title_image(*this, words, &why, tsharp_index_words ? &index_word : nullptr);
                     const bool unbound = result == TitleImage::unknown || result == TitleImage::refused;
+                    bool counted_capped = false;
                     if (unbound) {
-                        note_refused_tsharp(heap, std::size_t(jobs[i].slot) * kDescriptorSize, words, why);
+                        if (refusal_tracker.is_capped()) {
+                            counted_capped = true;
+                            any_capped_hits = true;
+                        } else {
+                            note_refused_tsharp(heap, std::size_t(jobs[i].slot) * kDescriptorSize, words, why);
+                        }
                         ++heap.refused_reasons[why ? why : "?"];
                         ++heap.texture_waits;
                     }
                     ++heap.images[unsigned(result)];
-                    InPlaceTsharpCached entry{result, why, 0, 0};
+                    InPlaceTsharpCached entry{result, why, 0, 0, counted_capped ? 1ull : 0ull};
                     if (result == TitleImage::not_tsharp) {
                         std::memset(w, 0, 16);
                     } else {
@@ -8898,7 +8977,7 @@ struct DeviceState {
                         // which is filtered and finished again, so the word follows the texture the T# names. The heap
                         // copy's write (fix_console_slot) is for heaps not read in place.
                         if (tsharp_index_words) {
-                            entry.index_word = unbound ? 0u : tsharp_index_word(words);
+                            entry.index_word = unbound ? 0u : index_word;
                             w[leonida::gfx10::kTsharpIndexDword] = entry.index_word;
                         }
                     }
@@ -8906,8 +8985,13 @@ struct DeviceState {
                 } else {
                     ++heap.images[unsigned(TitleImage::not_tsharp)];
                     std::memset(w, 0, 16);
-                    tsharp_cache.emplace(words, InPlaceTsharpCached{TitleImage::not_tsharp, nullptr, 0, 0});
+                    tsharp_cache.emplace(words, InPlaceTsharpCached{TitleImage::not_tsharp, nullptr, 0, 0, 0});
                 }
+            }
+        }
+        if (any_capped_hits) {
+            for (const auto& kv : tsharp_cache) {
+                if (kv.second.capped_hits) refusal_tracker.note_capped(kv.second.why, kv.second.capped_hits);
             }
         }
         std::unique_lock lock(page_mirror.mutex, std::defer_lock);
@@ -8974,6 +9058,12 @@ struct DeviceState {
                     }
                 }
             }
+            // filter_slot_locked / Phase A already wrote every deferred T# slot to the home with dword 6 = 0 (when
+            // tsharp_index_words) or raw words (otherwise). Skip the WC BAR write when d.out matches those bytes
+            // (e.g. repeated zero-index refusal or !tsharp_index_words).
+            if (d.texture != Records::none &&
+                (!tsharp_index_words || d.out[leonida::gfx10::kTsharpIndexDword] == 0))
+                continue;
             const std::size_t at = std::size_t(va & kOffMask);
             const std::size_t page_slot = at >> 5;
             std::memcpy(out_guard.ptr + at, d.out, kDescriptorSize);
@@ -9325,7 +9415,7 @@ struct DeviceState {
             }
             std::string refused_breakdown;
             for (const auto& [reason, count] : heap->refused_reasons)
-                refused_breakdown += (refused_breakdown.empty() ? "" : "; ") + reason + " " + std::to_string(count);
+                refused_breakdown += (refused_breakdown.empty() ? "" : "; ") + std::string(reason) + " " + std::to_string(count);
             if (!refused_breakdown.empty())
                 std::fprintf(stderr, "[rt] d3d12: console descriptor heap 0x%llx unbound T#s by reason: %s\n",
                              static_cast<unsigned long long>(heap->console_va), refused_breakdown.c_str());
@@ -9472,6 +9562,7 @@ struct DeviceState {
             page_mirror.mirror->alias(console_va, console_va + bytes, arena.buffer, offset);
             page_mirror_resolve_locked(console_va, bytes, true);
             console_heaps.push_back(std::move(owned));
+            update_console_heap_signature_locked();
         }
         std::fprintf(stderr,
                      "[rt] d3d12: console CBV/SRV/UAV descriptor heap 0x%llx (%llu KiB): read in place, its pages the "
@@ -9644,6 +9735,7 @@ struct DeviceState {
                 console_copy_ranges.emplace_back(heap->console_va, heap->bytes);
             }
             console_heaps.push_back(std::move(heap));
+            update_console_heap_signature_locked();
         }
         std::fprintf(stderr,
                      "[rt] d3d12: console %s descriptor heap 0x%llx (%llu KiB): shaders read it at heap_base + 0x%llx, "
@@ -9678,6 +9770,7 @@ struct DeviceState {
             if (it == console_heaps.end()) return;
             heap = std::move(*it);
             console_heaps.erase(it);
+            update_console_heap_signature_locked();
             std::unique_lock ranges(console_copy_ranges_mutex);
             std::erase_if(console_copy_ranges, [console_va](const auto& r) { return r.first == console_va; });
             if (heap->gpu >= 0) {
@@ -10561,14 +10654,30 @@ struct DeviceState {
     void update_address_guard() {
         namespace ag = leonida::address_guard;
         if (!guard.words) return;
+        const std::uint64_t generation = backing_generation.load(std::memory_order_acquire);
+        const std::uint64_t blocks = geometry.pool().layout_generation() + external_windows.layout_generation();
+        std::uint64_t heap_signature = console_heap_signature.load(std::memory_order_acquire);
+        // Lock-free clean fast path: skip console_heap_mutex, heap_spans allocation, and guard.mutex when backings,
+        // blocks, console heaps, and refusal counter are unchanged.
+        if (generation == std::atomic_ref(guard.generation).load(std::memory_order_acquire) &&
+            blocks == std::atomic_ref(guard.blocks).load(std::memory_order_acquire) &&
+            heap_signature == std::atomic_ref(guard.heaps).load(std::memory_order_acquire)) {
+            auto* header =
+                reinterpret_cast<ag::AddressGuardHeader*>(arena_host(ag::kGuardHeader, sizeof(ag::AddressGuardHeader)));
+            if (!header || std::atomic_ref(header->refused).load(std::memory_order_relaxed) == 0) return;
+        }
         // A console descriptor heap whose GPU copy lies outside the arena (an import of the title's pages, which
         // shaders read at shader_va = its device address minus heap_base) is read through heap_base + VA like a
         // buffer, but no gpu_backing names it: its bytes and the null guard after them are entered here. Without
         // this the guard refused every descriptor-table load from such a heap (run 28: a 38 MB imported heap at
         // shader VA 0x87e00000, past a 2 GiB arena). Collected before guard.mutex, in console_heap_mutex's order.
         std::vector<std::pair<std::uint64_t, std::uint64_t>> heap_spans;
-        std::uint64_t heap_signature = 0xcbf29ce484222325ull;
-        {
+        const bool need_table_update =
+            generation != std::atomic_ref(guard.generation).load(std::memory_order_acquire) ||
+            blocks != std::atomic_ref(guard.blocks).load(std::memory_order_acquire) ||
+            heap_signature != std::atomic_ref(guard.heaps).load(std::memory_order_acquire);
+        if (need_table_update) {
+            heap_signature = 0xcbf29ce484222325ull;
             std::lock_guard heaps(console_heap_mutex);
             for (const auto& h : console_heaps) {
                 if (!h || !h->bytes) continue;
@@ -10578,21 +10687,11 @@ struct DeviceState {
                 if (!(begin < arena.size && end <= arena.size)) heap_spans.emplace_back(begin, end);
             }
         }
-        const std::uint64_t generation = backing_generation.load(std::memory_order_acquire);
-        const std::uint64_t blocks = geometry.pool().layout_generation() + external_windows.layout_generation();
-        // Lock-free clean fast path: skip guard.mutex when backings, blocks, console heaps, and refusal counter are
-        // unchanged.
-        if (generation == std::atomic_ref(guard.generation).load(std::memory_order_acquire) &&
-            blocks == std::atomic_ref(guard.blocks).load(std::memory_order_acquire) &&
-            heap_signature == std::atomic_ref(guard.heaps).load(std::memory_order_acquire)) {
-            auto* header =
-                reinterpret_cast<ag::AddressGuardHeader*>(arena_host(ag::kGuardHeader, sizeof(ag::AddressGuardHeader)));
-            if (!header || std::atomic_ref(header->refused).load(std::memory_order_relaxed) == 0) return;
-        }
         std::lock_guard lock(guard.mutex);
-        if (generation != std::atomic_ref(guard.generation).load(std::memory_order_relaxed) ||
-            blocks != std::atomic_ref(guard.blocks).load(std::memory_order_relaxed) ||
-            heap_signature != std::atomic_ref(guard.heaps).load(std::memory_order_relaxed)) {
+        if (need_table_update &&
+            (generation != std::atomic_ref(guard.generation).load(std::memory_order_relaxed) ||
+             blocks != std::atomic_ref(guard.blocks).load(std::memory_order_relaxed) ||
+             heap_signature != std::atomic_ref(guard.heaps).load(std::memory_order_relaxed))) {
             std::vector<std::pair<std::uint64_t, std::uint64_t>> spans = heap_spans;
             {
                 std::lock_guard backing_lock(backing_mutex);
@@ -11680,7 +11779,87 @@ struct DeviceState {
     std::atomic<bool> bindless_cap_logged{false};
     std::size_t bindless_logged_table_bytes = 0;  // descriptor_mutex: the table size last logged
     bool bindless_host_logged = false;            // descriptor_mutex
-    std::map<leonida::DescriptorKey, ImageEntry> image_entries;
+    struct DescriptorKeyHash {
+        std::size_t operator()(const leonida::DescriptorKey& k) const noexcept {
+            std::uint64_t h = 14695981039346656037ull;
+            for (const std::uint32_t x : k) h = (h ^ x) * 1099511628211ull;
+            return static_cast<std::size_t>(h);
+        }
+    };
+    // Deduplication key for Vulkan image views + bindless slots across distinct T# keys whose post-pending_image_keys
+    // Vulkan view state is identical (differing only in non-semantic T# metadata, CPU/GPU alias addresses, or shared
+    // zero_sampled_image for pending streams).
+    struct ViewKey {
+        VkImage vk_image = VK_NULL_HANDLE;
+        leonida::ImageDimension dimension = leonida::ImageDimension::dim_2d;
+        VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D;
+        VkFormat view_format = VK_FORMAT_UNDEFINED;
+        VkFormat storage_format = VK_FORMAT_UNDEFINED;
+        std::uint32_t sampled_class = 0;
+        VkComponentSwizzle swizzle_r = VK_COMPONENT_SWIZZLE_IDENTITY;
+        VkComponentSwizzle swizzle_g = VK_COMPONENT_SWIZZLE_IDENTITY;
+        VkComponentSwizzle swizzle_b = VK_COMPONENT_SWIZZLE_IDENTITY;
+        VkComponentSwizzle swizzle_a = VK_COMPONENT_SWIZZLE_IDENTITY;
+        VkImageAspectFlags aspect_mask = 0;
+        std::uint32_t base_mip = 0;
+        std::uint32_t mip_count = 0;
+        std::uint32_t base_layer = 0;
+        std::uint32_t layer_count = 0;
+        std::uint32_t min_lod_bits = 0;
+        std::uint32_t slice_first = 0;
+        std::uint32_t slice_count = 0;
+        std::uint32_t mirror_layer = 0;
+        bool sampled_only = false;
+        bool sampled = false;
+        bool storage = false;
+        bool has_min_lod = false;
+        bool operator==(const ViewKey&) const = default;
+    };
+    struct ViewKeyHash {
+        std::size_t operator()(const ViewKey& k) const noexcept {
+            auto mix = [](std::uint64_t h, std::uint64_t v) noexcept {
+                h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+                return h;
+            };
+            std::uint64_t h = static_cast<std::uint64_t>(std::hash<VkImage>{}(k.vk_image));
+            h = mix(h, (std::uint64_t(k.dimension) << 32) | std::uint64_t(k.view_type));
+            h = mix(h, (std::uint64_t(k.view_format) << 32) | std::uint64_t(k.storage_format));
+            h = mix(h, (std::uint64_t(k.sampled_class) << 32) | std::uint64_t(k.aspect_mask));
+            h = mix(h, (std::uint64_t(k.swizzle_r) << 48) | (std::uint64_t(k.swizzle_g) << 32) |
+                           (std::uint64_t(k.swizzle_b) << 16) | std::uint64_t(k.swizzle_a));
+            h = mix(h, (std::uint64_t(k.base_mip) << 32) | std::uint64_t(k.mip_count));
+            h = mix(h, (std::uint64_t(k.base_layer) << 32) | std::uint64_t(k.layer_count));
+            h = mix(h, (std::uint64_t(k.min_lod_bits) << 32) | std::uint64_t(k.mirror_layer));
+            h = mix(h, (std::uint64_t(k.slice_first) << 32) | std::uint64_t(k.slice_count));
+            const std::uint64_t flags = (k.sampled_only ? 1ull : 0ull) | (k.sampled ? 2ull : 0ull) |
+                                        (k.storage ? 4ull : 0ull) | (k.has_min_lod ? 8ull : 0ull);
+            h = mix(h, flags);
+            return static_cast<std::size_t>(h);
+        }
+    };
+    struct SharedViewEntry {
+        ImageEntry entry{};
+        std::uint32_t refcount = 0;
+        std::uint32_t api_refcount = 0;  // keys created/upgraded via D3D12 API Create*View (never GC-evicted)
+        std::uint64_t last_seen_gen = 0;
+        bool pinned_by_upgrade = false;  // kept in replaced_images when refcount hits 0 until texture goes
+        std::uint64_t pinned_address = 0;
+        bool is_zero_view = false;       // shared pending_image_keys->zero fallback view
+        std::vector<leonida::DescriptorKey> keys;
+    };
+    struct ImageKeyEntry : ImageEntry {
+        ViewKey view_key{};
+        std::size_t sv_key_pos = 0;
+        bool from_title_heap = false;
+        std::uint64_t last_seen_gen = 0;
+    };
+    std::unordered_map<leonida::DescriptorKey, ImageKeyEntry, DescriptorKeyHash> image_entries;
+    std::unordered_map<ViewKey, SharedViewEntry, ViewKeyHash> shared_views;
+    bool binding_from_title_heap = false;  // descriptor_mutex: true while inside bind_title_image()
+    std::uint64_t tsharp_use_gen = 0;      // descriptor_mutex: monotonic LRU touch counter
+    std::size_t title_heap_image_keys = 0; // descriptor_mutex: count of image_entries with from_title_heap == true
+    std::array<std::uint64_t, 7> gc_last_submit_ticket{};  // descriptor_mutex
+    std::uint64_t gc_runs = 0, gc_evicted_slots = 0, gc_evicted_keys = 0;  // descriptor_mutex
     // A pending stream has a console descriptor immediately. Keep its keys (including aliases)
     // until the first complete upload. A shader hash miss selects the existing fallback image.
     // Once the smaller mips are filled (publish_streamed_texture), only the views that start above first_mip wait.
@@ -11769,6 +11948,145 @@ struct DeviceState {
             context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.mirror_sampled);
         if (entry.mirror_storage)
             context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.mirror_storage);
+    }
+
+    // Detaches one T# key from its refcounted SharedViewEntry (descriptor_mutex held). Releases the VkImageViews and
+    // bindless slot ONLY when refcount drops to 0; if the SharedViewEntry was replaced by a storage upgrade, moves it
+    // to replaced_images instead so already-recorded command lists keep valid descriptors until the texture goes.
+    void detach_view_key_locked(const ViewKey& vk_key, std::size_t key_pos, bool was_from_title_heap, bool upgrading,
+                                std::uint64_t upgrade_address) {
+        const auto sv_it = shared_views.find(vk_key);
+        if (sv_it == shared_views.end()) return;
+        SharedViewEntry& sv = sv_it->second;
+        if (key_pos < sv.keys.size()) {
+            const leonida::DescriptorKey back_key = sv.keys.back();
+            sv.keys[key_pos] = back_key;
+            sv.keys.pop_back();
+            if (key_pos < sv.keys.size()) {
+                if (const auto moved = image_entries.find(back_key); moved != image_entries.end())
+                    moved->second.sv_key_pos = key_pos;
+            }
+        }
+        if (upgrading && !sv.pinned_by_upgrade) {
+            sv.pinned_by_upgrade = true;
+            sv.pinned_address = upgrade_address;
+        }
+        if (!was_from_title_heap && sv.api_refcount > 0) --sv.api_refcount;
+        if (sv.refcount > 0) --sv.refcount;
+        if (sv.refcount == 0) {
+            if (sv.pinned_by_upgrade && images_by_address.count(sv.pinned_address)) {
+                ImageEntry kept = sv.entry;
+                kept.address = sv.pinned_address;
+                replaced_images.push_back(kept);
+            } else {
+                release(sv.entry);
+            }
+            shared_views.erase(sv_it);
+        }
+    }
+
+    // Diagnostic breakdown of dim-2D live slots, shared ViewKeys, and title_heap vs api keys (descriptor_mutex held).
+    std::string bindless_diag_summary_locked() const {
+        if (!bindless) return {};
+        const std::uint32_t cap_2d = bindless->image_capacity(leonida::ImageDimension::dim_2d);
+        const std::uint32_t free_2d = bindless->free_images(leonida::ImageDimension::dim_2d);
+        const std::uint32_t live_2d = cap_2d > 1 + free_2d ? cap_2d - 1 - free_2d : 0;
+        const std::size_t api_keys =
+            image_entries.size() >= title_heap_image_keys ? image_entries.size() - title_heap_image_keys : 0;
+        return std::to_string(live_2d) + "/" + std::to_string(cap_2d > 0 ? cap_2d - 1 : 0) + " dim2D live, " +
+               std::to_string(shared_views.size()) + " ViewKeys (" + std::to_string(title_heap_image_keys) +
+               " title_heap, " + std::to_string(api_keys) + " api keys)";
+    }
+
+    // Safe pressure-triggered GC (descriptor_mutex held): evicts ONLY stale from_title_heap T# entries (never D3D12
+    // API Create*View entries, never live TitleTextures from images_by_address), oldest last_seen_gen first, emitting
+    // texture_gone so any still-live console heap slot automatically re-binds on demand.
+    void gc_bindless_title_views_locked(leonida::ImageDimension dimension, bool need_storage,
+                                        std::uint32_t sampled_class, const ViewKey* skip_view_key = nullptr) {
+        if (!bindless || title_heap_image_keys == 0) return;
+        const std::uint32_t d = std::uint32_t(dimension);
+        const std::uint64_t submitted = context ? context->submitted_retire_ticket() : 0;
+        const std::uint64_t completed = context ? context->completed_retire_ticket() : 0;
+        const bool hard_full = !bindless->has_free_image(dimension, need_storage, sampled_class);
+        const std::uint64_t wait_ticket = gc_last_submit_ticket[d];
+        if (wait_ticket != 0 && completed < wait_ticket) {
+            if (!hard_full || submitted < wait_ticket) return;
+        }
+        const std::uint32_t storage_cap = bindless->storage_capacity(dimension);
+        struct Candidate {
+            ViewKey key;
+            std::uint64_t last_seen = 0;
+        };
+        std::vector<Candidate> candidates;
+        candidates.reserve(shared_views.size() / 4 + 16);
+        for (const auto& [vk_key, sv] : shared_views) {
+            if (sv.entry.dimension != dimension) continue;
+            if (sv.api_refcount != 0 || sv.pinned_by_upgrade || sv.is_zero_view) continue;
+            if (skip_view_key && vk_key == *skip_view_key) continue;
+            if (need_storage && sv.entry.index >= storage_cap) continue;
+            candidates.push_back({vk_key, sv.last_seen_gen});
+        }
+        if (candidates.empty()) return;
+        const std::uint32_t dim_cap = bindless->image_capacity(dimension);
+        const std::size_t batch_cap =
+            std::size_t((std::max)(std::uint32_t(64), (std::min)(std::uint32_t(1024), dim_cap / 8)));
+        const std::size_t target = (std::min)(candidates.size(), batch_cap);
+        if (target < candidates.size()) {
+            std::nth_element(candidates.begin(), candidates.begin() + std::ptrdiff_t(target), candidates.end(),
+                             [](const Candidate& a, const Candidate& b) { return a.last_seen < b.last_seen; });
+        }
+        std::vector<std::uint64_t> touched_addresses;
+        touched_addresses.reserve(target);
+        std::size_t evicted_slots = 0, evicted_keys = 0;
+        for (std::size_t i = 0; i < target; ++i) {
+            const auto sv_it = shared_views.find(candidates[i].key);
+            if (sv_it == shared_views.end()) continue;
+            if (sv_it->second.api_refcount != 0 || sv_it->second.pinned_by_upgrade) continue;
+            const ImageEntry entry = sv_it->second.entry;
+            const std::vector<leonida::DescriptorKey> keys = std::move(sv_it->second.keys);
+            shared_views.erase(sv_it);
+            for (const auto& k : keys) {
+                if (const auto e_it = image_entries.find(k); e_it != image_entries.end()) {
+                    const std::uint64_t addr = e_it->second.address;
+                    touched_addresses.push_back(addr);
+                    const auto [first, last] = image_keys.equal_range(addr);
+                    for (auto kit = first; kit != last; ++kit) {
+                        if (kit->second == k) {
+                            image_keys.erase(kit);
+                            break;
+                        }
+                    }
+                    if (e_it->second.from_title_heap && title_heap_image_keys > 0) --title_heap_image_keys;
+                    image_entries.erase(e_it);
+                }
+                bindless->erase_key(k);
+                ++evicted_keys;
+            }
+            release(entry);
+            ++evicted_slots;
+        }
+        if (!evicted_slots) return;
+        gc_last_submit_ticket[d] = submitted + 1;
+        ++gc_runs;
+        gc_evicted_slots += evicted_slots;
+        gc_evicted_keys += evicted_keys;
+        std::sort(touched_addresses.begin(), touched_addresses.end());
+        touched_addresses.erase(std::unique(touched_addresses.begin(), touched_addresses.end()),
+                                touched_addresses.end());
+        for (const std::uint64_t addr : touched_addresses) {
+            note_texture_change(leonida::SlotChange::texture_gone, addr);
+            if (const std::uint64_t key = tsharp_texture_key(addr); key != addr)
+                note_texture_change(leonida::SlotChange::texture_gone, key);
+        }
+        if ((gc_runs & (gc_runs - 1)) == 0) {
+            constexpr const char* names[] = {"2D", "2D array", "3D", "1D", "1D array", "2D MS", "2D MS array"};
+            std::fprintf(stderr,
+                         "[rt] d3d12: bindless GC #%llu dim %d (%s%s): evicted %zu slots (%zu title_heap keys, %zu "
+                         "textures notified); %s, %u free in dim\n",
+                         static_cast<unsigned long long>(gc_runs), int(dimension), names[int(dimension)],
+                         need_storage ? " storage" : "", evicted_slots, evicted_keys, touched_addresses.size(),
+                         bindless_diag_summary_locked().c_str(), bindless->free_images(dimension));
+        }
     }
 
     struct PendingSample {
@@ -11879,14 +12197,27 @@ struct DeviceState {
             if (storage) log_once("unordered-access view needs the Vulkan bindless set; type", int(image.type));
             return false;
         }
+        bool is_zero_view = false;
         if (const auto pending = pending_image_keys.find(vk_image);
             pending != pending_image_keys.end() && image.first_mip < pending->second.first_mip) {
             pending->second.keys.try_emplace(words, image);
             if (!pending->second.zero) return true;
             vk_image = pending->second.zero;
+            is_zero_view = true;
         }
         const auto existing = image_entries.find(words);
-        if (existing != image_entries.end() && (existing->second.storage || !storage)) return true;
+        if (existing != image_entries.end() && (existing->second.storage || !storage)) {
+            const std::uint64_t gen = ++tsharp_use_gen;
+            existing->second.last_seen_gen = gen;
+            const auto sv_it = shared_views.find(existing->second.view_key);
+            if (!binding_from_title_heap && existing->second.from_title_heap) {
+                existing->second.from_title_heap = false;
+                if (title_heap_image_keys > 0) --title_heap_image_keys;
+                if (sv_it != shared_views.end()) ++sv_it->second.api_refcount;
+            }
+            if (sv_it != shared_views.end()) sv_it->second.last_seen_gen = gen;
+            return true;
+        }
 
         leonida::ImageDimension dimension;
         switch (image.type) {
@@ -11931,6 +12262,8 @@ struct DeviceState {
         view_info.format = view_format;
         auto swizzle = image.swizzle;
         VkImageViewMinLodCreateInfoEXT clamp{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
+        bool has_min_lod = false;
+        std::uint32_t min_lod_bits = 0;
         const bool supports_lod_clamp = image.type == g::ImageType::image_1d || image.type == g::ImageType::image_2d ||
                                         image.type == g::ImageType::image_2d_array || image.type == g::ImageType::cube ||
                                         image.type == g::ImageType::image_3d;
@@ -11948,6 +12281,8 @@ struct DeviceState {
                 }
                 clamp.pNext = view_info.pNext;
                 view_info.pNext = &clamp;
+                has_min_lod = true;
+                min_lod_bits = std::bit_cast<std::uint32_t>(clamp.minLod);
             }
         }
         view_info.components = g::vulkan_swizzle(swizzle, channels_format);
@@ -11955,6 +12290,137 @@ struct DeviceState {
             image, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT
                             : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
                                                                    : VK_IMAGE_ASPECT_COLOR_BIT);
+
+        // Deduplicate identical Vulkan views across distinct T# keys via refcounted ViewKey sharing.
+        ViewKey vk_key{};
+        vk_key.vk_image = vk_image;
+        vk_key.dimension = dimension;
+        vk_key.view_type = view_info.viewType;
+        vk_key.view_format = view_info.format;
+        vk_key.storage_format = storage ? storage_format : VK_FORMAT_UNDEFINED;
+        vk_key.sampled_class = sampled_class;
+        vk_key.swizzle_r = view_info.components.r;
+        vk_key.swizzle_g = view_info.components.g;
+        vk_key.swizzle_b = view_info.components.b;
+        vk_key.swizzle_a = view_info.components.a;
+        vk_key.aspect_mask = view_info.subresourceRange.aspectMask;
+        vk_key.base_mip = view_info.subresourceRange.baseMipLevel;
+        vk_key.mip_count = view_info.subresourceRange.levelCount;
+        vk_key.base_layer = view_info.subresourceRange.baseArrayLayer;
+        vk_key.layer_count = view_info.subresourceRange.layerCount;
+        vk_key.min_lod_bits = min_lod_bits;
+        vk_key.slice_first = storage ? slices.first : 0u;
+        vk_key.slice_count = storage ? slices.count : 0u;
+        vk_key.mirror_layer = dimension == leonida::ImageDimension::dim_2d_array ? image.first_layer : 0u;
+        vk_key.sampled_only = sampled_only;
+        vk_key.sampled = sampled;
+        vk_key.storage = storage;
+        vk_key.has_min_lod = has_min_lod;
+
+        const auto commit_key_to_shared = [&](SharedViewEntry& sv) {
+            const std::uint64_t gen = ++tsharp_use_gen;
+            sv.last_seen_gen = gen;
+            if (existing != image_entries.end()) {
+                const bool old_from_title = existing->second.from_title_heap;
+                const bool new_from_title = binding_from_title_heap ? old_from_title : false;
+                const ViewKey old_vk_key = existing->second.view_key;
+                const std::size_t old_pos = existing->second.sv_key_pos;
+                const std::uint64_t old_addr = existing->second.address;
+                if (old_from_title && !new_from_title && title_heap_image_keys > 0) --title_heap_image_keys;
+                ++sv.refcount;
+                if (!new_from_title) ++sv.api_refcount;
+                const std::size_t new_pos = sv.keys.size();
+                sv.keys.push_back(words);
+                static_cast<ImageEntry&>(existing->second) = sv.entry;
+                existing->second.address = old_addr;
+                existing->second.view_key = vk_key;
+                existing->second.sv_key_pos = new_pos;
+                existing->second.from_title_heap = new_from_title;
+                existing->second.last_seen_gen = gen;
+                detach_view_key_locked(old_vk_key, old_pos, old_from_title, /*upgrading=*/true, old_addr);
+                // The console heap slots holding these words carry the read-only entry's index in their dword 6
+                // (tsharp_index_words): fixed again at the next submission (a texture_gone change re-fixes bound T#s,
+                // under the address their records keep, tsharp_texture_key), they take this one, with its storage views.
+                if (tsharp_index_words)
+                    note_texture_change(leonida::SlotChange::texture_gone, tsharp_texture_key(image.address));
+            } else {
+                const bool from_title = binding_from_title_heap;
+                if (from_title) ++title_heap_image_keys;
+                ++sv.refcount;
+                if (!from_title) ++sv.api_refcount;
+                const std::size_t new_pos = sv.keys.size();
+                sv.keys.push_back(words);
+                ImageKeyEntry key_entry{};
+                static_cast<ImageEntry&>(key_entry) = sv.entry;
+                key_entry.address = image.address;
+                key_entry.view_key = vk_key;
+                key_entry.sv_key_pos = new_pos;
+                key_entry.from_title_heap = from_title;
+                key_entry.last_seen_gen = gen;
+                image_entries.emplace(words, std::move(key_entry));
+                image_keys.emplace(image.address, words);
+            }
+            // The set derives the entry's kind from what it bound at this index (BindlessSet::image_kind_at); a plain
+            // library's modules do not read it, so they get 0 as before.
+            bindless->insert_key(words, sv.entry.index,
+                                 descriptor_table_tagged ? bindless->image_kind_at(dimension, sv.entry.index) : 0u);
+            leonida::fsdraw::note_tsharp(words.data());  // LOCAL DIAGNOSTIC
+        };
+
+        if (const auto sv_it = shared_views.find(vk_key); sv_it != shared_views.end()) {
+            commit_key_to_shared(sv_it->second);
+            return true;
+        }
+
+        // Need a new bindless slot. Trigger safe pressure GC of stale title_heap entries before checking room.
+        const std::uint32_t dim_cap = bindless->image_capacity(dimension);
+        const std::uint32_t gc_threshold = (std::min)(std::uint32_t(2048), dim_cap / 4);
+        if (!bindless->has_free_image(dimension, storage, sampled_class) ||
+            bindless->free_images(dimension) < gc_threshold) {
+            const ViewKey* skip_vk = existing != image_entries.end() ? &existing->second.view_key : nullptr;
+            gc_bindless_title_views_locked(dimension, storage, sampled_class, skip_vk);
+        }
+
+        const auto report_bindless_refusal = [&](bool needed_storage) {
+            using Refusal = leonida::BindlessSet::ImageRefusal;
+            const Refusal refusal = bindless->image_refusal(dimension, needed_storage, sampled_class);
+            if (why)
+                *why = refusal == Refusal::no_array       ? "set 0 has no array for the T#'s dimension"
+                       : refusal == Refusal::storage_full ? kTsharpStorageFull
+                                                          : kTsharpArrayFull;
+            if (refusal != Refusal::no_array &&
+                first_diagnostic("a bindless image array is full; dimension", int(dimension))) {
+                std::size_t entries = 0, replaced = 0, most = 0, registered = 0, dim_view_keys = 0;
+                std::map<std::uint64_t, std::size_t> per_texture;
+                for (const auto& kv : image_entries)
+                    if (kv.second.dimension == dimension) {
+                        ++entries;
+                        most = (std::max)(most, ++per_texture[kv.second.address]);
+                    }
+                for (const auto& kv : shared_views)
+                    if (kv.second.entry.dimension == dimension) ++dim_view_keys;
+                for (const auto& texture : per_texture) registered += images_by_address.count(texture.first);
+                for (const auto& held : replaced_images) replaced += held.dimension == dimension;
+                constexpr const char* names[] = {"2D", "2D array", "3D", "1D", "1D array", "2D MS", "2D MS array"};
+                std::fprintf(stderr,
+                             "[rt] d3d12: a bindless image array is full; dimension %d (%s)%s: %u indices, %u in the "
+                             "storage arrays, %zu T#s (%zu shared ViewKeys) of %zu textures (%zu registered at their "
+                             "address, at most %zu T#s of one), %zu replaced views kept [%s]; further T#s of this "
+                             "dimension read the fallback\n",
+                             int(dimension), names[int(dimension)],
+                             refusal == Refusal::storage_full ? ", its storage range" : "",
+                             bindless->image_capacity(dimension), bindless->storage_capacity(dimension), entries,
+                             dim_view_keys, per_texture.size(), registered, most, replaced,
+                             bindless_diag_summary_locked().c_str());
+            }
+        };
+
+        // Pre-check bindless room BEFORE vkCreateImageView so zero driver views are created/destroyed when full.
+        if (!bindless->has_free_image(dimension, storage, sampled_class)) {
+            report_bindless_refusal(storage);
+            return false;
+        }
+
         ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
         if (sampled) {
             const VkResult result = vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled);
@@ -12023,65 +12489,23 @@ struct DeviceState {
         entry.index = bindless->add_image(dimension, entry.sampled, VK_IMAGE_LAYOUT_GENERAL, views, sampled_class,
                                           mirror.sampled ? &mirror : nullptr);
         if (!entry.index) {
-            vk.vkDestroyImageView(info.device, entry.mirror_sampled, nullptr);
-            entry.mirror_sampled = VK_NULL_HANDLE;
+            if (entry.mirror_sampled) {
+                vk.vkDestroyImageView(info.device, entry.mirror_sampled, nullptr);
+                entry.mirror_sampled = VK_NULL_HANDLE;
+            }
             if (entry.mirror_storage) {
                 vk.vkDestroyImageView(info.device, entry.mirror_storage, nullptr);
                 entry.mirror_storage = VK_NULL_HANDLE;
             }
-            using Refusal = leonida::BindlessSet::ImageRefusal;
-            const Refusal refusal = bindless->image_refusal(dimension, entry.storage != VK_NULL_HANDLE, sampled_class);
-            if (why)
-                *why = refusal == Refusal::no_array       ? "set 0 has no array for the T#'s dimension"
-                       : refusal == Refusal::storage_full ? kTsharpStorageFull
-                                                          : kTsharpArrayFull;
-            if (refusal != Refusal::no_array &&
-                first_diagnostic("a bindless image array is full; dimension", int(dimension))) {
-                // Whether the array holds live textures or stale views: the T#s it holds, the textures they name,
-                // the most T#s of one texture (a texture whose T#s keep changing, a streamed mip clamp say, keeps an
-                // index for each until it goes), and how many of those textures are still the one registered at
-                // their address (a texture leaves the set when the one registered there goes: forget_image).
-                std::size_t entries = 0, replaced = 0, most = 0, registered = 0;
-                std::map<std::uint64_t, std::size_t> per_texture;
-                for (const auto& [key, held] : image_entries)
-                    if (held.dimension == dimension) {
-                        ++entries;
-                        most = std::max(most, ++per_texture[held.address]);
-                    }
-                for (const auto& texture : per_texture) registered += images_by_address.count(texture.first);
-                for (const auto& held : replaced_images) replaced += held.dimension == dimension;
-                constexpr const char* names[] = {"2D", "2D array", "3D", "1D", "1D array", "2D MS", "2D MS array"};
-                std::fprintf(stderr,
-                             "[rt] d3d12: a bindless image array is full; dimension %d (%s)%s: %u indices, %u in the "
-                             "storage arrays, %zu T#s of %zu textures (%zu registered at their address, at most %zu "
-                             "T#s of one), %zu replaced views kept; further T#s of this dimension read the "
-                             "fallback\n",
-                             int(dimension), names[int(dimension)],
-                             refusal == Refusal::storage_full ? ", its storage range" : "",
-                             bindless->image_capacity(dimension), bindless->storage_capacity(dimension), entries,
-                             per_texture.size(), registered, most, replaced);
-            }
+            report_bindless_refusal(entry.storage != VK_NULL_HANDLE);
             if (entry.sampled) vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
             if (entry.storage) vk.vkDestroyImageView(info.device, entry.storage, nullptr);
             return false;
         }
-        if (existing != image_entries.end()) {
-            replaced_images.push_back(existing->second);  // the read-only entry of the same bytes
-            existing->second = entry;
-            // The console heap slots holding these words carry the read-only entry's index in their dword 6
-            // (tsharp_index_words): fixed again at the next submission (a texture_gone change re-fixes bound T#s,
-            // under the address their records keep, tsharp_texture_key), they take this one, with its storage views.
-            if (tsharp_index_words)
-                note_texture_change(leonida::SlotChange::texture_gone, tsharp_texture_key(image.address));
-        } else {
-            image_entries.emplace(words, entry);
-            image_keys.emplace(image.address, words);
-        }
-        // The set derives the entry's kind from what it bound at this index (BindlessSet::image_kind_at); a plain
-        // library's modules do not read it, so they get 0 as before.
-        bindless->insert_key(words, entry.index,
-                             descriptor_table_tagged ? bindless->image_kind_at(dimension, entry.index) : 0u);
-        leonida::fsdraw::note_tsharp(words.data());  // LOCAL DIAGNOSTIC
+        SharedViewEntry& sv = shared_views[vk_key];
+        sv.entry = entry;
+        sv.is_zero_view = is_zero_view;
+        commit_key_to_shared(sv);
         return true;
     }
 
@@ -12179,28 +12603,30 @@ struct DeviceState {
         forget_image_views_locked(address);
     }
     // Its T#s stop naming it at once (a shader's lookup of their words misses from the next table flush on); the
-    // console heap slots that held them wait for the next texture at the address (note_texture_change), and the
-    // indices freed let T#s that found their array full bind.
+    // console heap slots that held them wait for the next texture at the address (note_texture_change). Actual
+    // SlotChange::texture_room is emitted only once the deferred slots actually return to free in set_bindless_release
+    // or set_bindless_prepare (flush), avoiding premature wake storms while slots are still in flight.
     void forget_image_views_locked(std::uint64_t address) {
         note_texture_change(leonida::SlotChange::texture_gone, address);
         if (!bindless) return;
-        bool freed = false;
         const auto [first, last] = image_keys.equal_range(address);
         for (auto it = first; it != last; ++it) {
             const auto entry = image_entries.find(it->second);
+            if (entry == image_entries.end()) continue;
             bindless->erase_key(it->second);
-            release(entry->second);
+            const ViewKey vk_key = entry->second.view_key;
+            const std::size_t key_pos = entry->second.sv_key_pos;
+            const bool from_title = entry->second.from_title_heap;
+            if (from_title && title_heap_image_keys > 0) --title_heap_image_keys;
             image_entries.erase(entry);
-            freed = true;
+            detach_view_key_locked(vk_key, key_pos, from_title, /*upgrading=*/false, 0);
         }
         image_keys.erase(first, last);
         std::erase_if(replaced_images, [&](const ImageEntry& entry) {
             if (entry.address != address) return false;
             release(entry);
-            freed = true;
             return true;
         });
-        if (freed) note_slot_change(leonida::SlotChange::texture_room, 0, 1);
     }
 
     // Gives the S# `words` a sampler in set 0 and an entry in the hash table, unless it has them.
@@ -19115,8 +19541,10 @@ bool bind_title_image_to(DeviceState& device, const leonida::gfx10::ImageWords& 
     return true;
 }
 
-TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWords& words, const char** why) {
+TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWords& words, const char** why,
+                            std::uint32_t* out_index_word) {
     namespace g = leonida::gfx10;
+    if (out_index_word) *out_index_word = 0;
     const auto refuse = [why](const char* reason) {
         if (why) *why = reason;
         return TitleImage::refused;
@@ -19130,7 +19558,16 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
     {
         std::lock_guard lock(device.descriptor_mutex);
         if (!device.bindless) return refuse("no bindless set");
-        if (device.image_entries.count(words)) return TitleImage::known;
+        if (const auto it = device.image_entries.find(words); it != device.image_entries.end()) {
+            const std::uint64_t gen = ++device.tsharp_use_gen;
+            it->second.last_seen_gen = gen;
+            if (const auto sv_it = device.shared_views.find(it->second.view_key); sv_it != device.shared_views.end())
+                sv_it->second.last_seen_gen = gen;
+            if (out_index_word)
+                *out_index_word = g::tsharp_index_word(
+                    it->second.index, device.bindless->image_kind_at(it->second.dimension, it->second.index));
+            return TitleImage::known;
+        }
         if (g::has_hardware_volume_uav_slice_offset(words, image))
             return refuse("a title-written 3D UAV with a slice offset is not supported");
         auto found = device.images_by_address.find(image.address);
@@ -19175,6 +19612,12 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
             note_unknown_tsharp(words, image);
             return TitleImage::unknown;
         }
+        struct TitleHeapBindGuard {
+            bool& flag;
+            bool prev;
+            explicit TitleHeapBindGuard(bool& f) : flag(f), prev(f) { flag = true; }
+            ~TitleHeapBindGuard() { flag = prev; }
+        } title_guard(device.binding_from_title_heap);
         const char* reason = nullptr;
         if (bind_title_image_to(device, words, image, *owner, reason, sparse)) {
             if (owner == gpu && plain) ++device.over_gpu_target[DeviceState::kOverTargetResolved];
@@ -19184,9 +19627,14 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
         } else {
             return refuse(reason);
         }
+        if (out_index_word) *out_index_word = device.tsharp_index_word_locked(words);
     }
     if (sparse) device.context->note_shader_image(sparse);
     return TitleImage::bound;
+}
+
+TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWords& words, const char** why) {
+    return bind_title_image(device, words, why, nullptr);
 }
 
 bool image_descriptor(const Resource& resource, const TextureView& asked, bool storage, leonida::gfx10::Image& out,
@@ -20572,8 +21020,16 @@ public:
         state_.context->set_bindless_release(
             [](void* user, std::uint32_t dim, std::uint32_t idx) {
                 auto* st = static_cast<DeviceState*>(user);
-                std::lock_guard lock(st->descriptor_mutex);
-                if (st->bindless) st->bindless->remove_image(static_cast<leonida::ImageDimension>(dim), idx);
+                bool freed_now = false;
+                {
+                    std::lock_guard lock(st->descriptor_mutex);
+                    if (st->bindless) {
+                        const std::uint32_t before = st->bindless->total_free_images();
+                        st->bindless->remove_image(static_cast<leonida::ImageDimension>(dim), idx);
+                        freed_now = st->bindless->total_free_images() > before;
+                    }
+                }
+                if (freed_now) st->note_slot_change(leonida::SlotChange::texture_room, 0, 1);
             },
             &state_);
         state_.context->set_bindless_prepare([this](VkCommandBuffer command_buffer) {
@@ -20620,8 +21076,10 @@ public:
             // and retries, rewrites the table in place when nothing runs, or keeps the previous table (vulkan_bindless.h).
             auto& set = *state_.bindless;
             const std::uint64_t host_fallbacks = set.table_host_fallbacks();
+            const std::uint32_t free_before_flush = set.total_free_images();
             const bool flushed = set.flush(command_buffer, context.submitted_retire_ticket(),
                                            [&context] { return context.completed_retire_ticket(); });
+            const bool freed_by_flush = flushed && set.total_free_images() > free_before_flush;
             if (flushed && set.last_flush_replaced()) context.note_bindless_upload();
             const auto table_state = [&] {
                 return std::to_string(set.table().size()) + " of " + std::to_string(set.table().capacity()) +
@@ -20629,7 +21087,8 @@ public:
                        (set.table_in_device_local_memory() ? "device-local" : "host") + " memory; " +
                        std::to_string(set.generations_made()) + " generations made, " +
                        std::to_string(set.retired_count()) + " retired, " + std::to_string(set.spare_count()) +
-                       " spare, " + std::to_string(set.spares_reused()) + " reused";
+                       " spare, " + std::to_string(set.spares_reused()) + " reused; " +
+                       state_.bindless_diag_summary_locked();
             };
             if (set.table_buffer_bytes() != state_.bindless_logged_table_bytes) {
                 state_.bindless_logged_table_bytes = set.table_buffer_bytes();
@@ -20650,6 +21109,8 @@ public:
                                  set.last_failure() ? set.last_failure() : "?", int(set.last_failure_result()),
                                  static_cast<unsigned long long>(n), table_state().c_str());
             }
+            lock.unlock();
+            if (freed_by_flush) state_.note_slot_change(leonida::SlotChange::texture_room, 0, 1);
             return flushed;
         });
         state_.context->set_bindless_current([this]() {
