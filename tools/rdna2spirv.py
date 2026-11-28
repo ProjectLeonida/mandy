@@ -7452,17 +7452,19 @@ class Gen:
             else:
                 raise Unsupported(f"{op} modifier")
 
-    def flush_f32(self, f):
+    def flush_f32(self, f, *, force=False):
         """v_mad_f32, v_mac_f32, v_mad_legacy_f32 and default-mode v_mul_legacy_f32 flush f32 denormals:
         a subnormal operand or result
         reads as signed zero, whatever the MODE register says. LLVM's SITargetLowering::isFMADLegal forms
         v_mad_f32/v_mac_f32 only when f32 denormals are flushed (SIISelLowering.cpp, llvm-project 1922c0c);
         v_mad_legacy_f32 is the same VALU. When hardware DenormFlushToZero 32 is active (self.ftz32), the f32
-        arithmetic op itself flushes inputs and output; otherwise emulate as |x| < FLT_MIN -> copysign(0, x):
+        arithmetic op itself flushes inputs and output; otherwise (or when force=True for GLSL.std.450 ops
+        like Exp2 where DenormFlushToZero 32 is not guaranteed to flush on all drivers) emulate as
+        |x| < FLT_MIN -> copysign(0, x):
         inf and NaN compare false and pass through, and 0 keeps its sign. Counted over the corpus before
         writing this (SHADER-118): 9,297 of the 26,503 shaders use at least one of the three, 440,858
         occurrences (0.99% of the corpus)."""
-        if self.ftz32:
+        if self.ftz32 and not force:
             return f
         a, small, sign, z, r = (self.tmp() for _ in range(5))
         self.emit(f"{a} = OpExtInst %float %glsl FAbs {f}")
@@ -12601,7 +12603,7 @@ class Gen:
             else:
                 self.emit(f"{r} = OpExtInst %float %glsl {F1[op]} {x}")
                 if op == "v_exp_f32":
-                    r = self.flush_f32(r)
+                    r = self.flush_f32(r, force=True)
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in ("v_frexp_mant_f32", "v_frexp_exp_i32_f32", "v_ldexp_f32"):
             # Bit-exact on the binary32 word (no float arithmetic). A normal input has biased exponent 1..254;
@@ -18816,7 +18818,8 @@ def _vgpr_reads_of(ins):
         elif x["k"] == "vlist":
             regs.update(x["r"])
     if (bop in DST_ALSO_READ or _permlane_preserves_dst(bop, mods) or
-            (op.startswith(("global_load_", "buffer_load_")) and "_d16" in op and "format" not in op)) and \
+            (op.startswith(("global_load_", "buffer_load_")) and "_d16" in op and "format" not in op) or
+            op == "buffer_load_format_d16_hi_x") and \
             a[0]["k"] == "vgpr":
         regs.add(a[0]["r"])
     return regs
