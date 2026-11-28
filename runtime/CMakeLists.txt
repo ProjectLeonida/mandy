@@ -824,6 +824,10 @@ elseif(NOT WIN32)
 endif()
 
 include(CTest)
+# Every rule that writes a generated/<name> file (the GLSL test shaders, d3d12_stubs.h, ...) expects the folder to
+# exist, and only some of them make it: with -j a fresh build could run one of the others first ("Failed to open
+# file"). Make it once here, before any rule runs.
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated)
 # LEONIDA_TRANSLATOR_DEPS: what the rules that run test/shaders/build.py depend on besides their .asm files.
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/translator_deps.cmake")
 if(BUILD_TESTING)
@@ -2337,6 +2341,7 @@ if(TARGET Vulkan::Headers)
   if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     set(_null_descriptors_spv ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_null_descriptors.spv)
     add_custom_command(OUTPUT ${_null_descriptors_spv}
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/generated
       COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${_null_descriptors_spv}
               ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_null_descriptors.comp
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_null_descriptors.comp
