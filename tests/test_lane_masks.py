@@ -428,6 +428,14 @@ def test_mask_meets_data_at_a_merge():
         assert L.insert_data_merges(blocks, succ, branches) == 1
         assert [i["args"][0]["r"] for i in blocks[1] if i["op"] == L.TO_DATA] == [6]
         assert L.base_op(blocks[1][-1]["op"]) == "s_branch"
+        assert L.insert_data_merges(blocks, succ, branches) == 0      # idempotent: the marker leaves data
+    # A 64-bit scan of the whole ballot (s_bcnt1_i32_b64 / s_ff1_i32_b64 of s[6:7]) gathers both halves, so lanes
+    # 32-63 come from s7.
+    for scan in ("s_bcnt1_i32_b64", "s_ff1_i32_b64"):
+        blocks, succ = diamond(ins(scan, s(8), s(6, 2)))
+        assert L.insert_data_merges(blocks, succ, branches) == 2, scan
+        assert [i["args"][0]["r"] for i in blocks[1] if i["op"] == L.TO_DATA] == [6, 7], scan
+        assert L.insert_data_merges(blocks, succ, branches) == 0, scan
     # Other number reads are left as they were (the gather is kept to the bit scans the compiler's lane loops use).
     blocks, succ = diamond(ins("s_add_u32", s(8), s(6), imm(1)))
     assert L.insert_data_merges(blocks, succ, branches) == 0

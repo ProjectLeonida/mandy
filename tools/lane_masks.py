@@ -159,6 +159,9 @@ def step(state, ins, wave64=True):
     op, a = base_op(ins["op"]), ins["args"]
     if not a or op.startswith(NO_DESTINATION):
         return
+    if op == TO_DATA:                                   # the wave's bits of a mask: data, the same in every lane
+        put(state, a[0], None, wave64)
+        return
     if ins.get("vcc_data_pair"):
         # Gen materializes both scalar words (including a source mask's lane bits).
         put(state, a[0], None, wave64)
@@ -450,6 +453,11 @@ def insert_data_merges(blocks, succ, branches, wave64=True):
     EXEC, ANDed with it), where this lane's 0 / ~0 is already exact: the translator takes bit L of a data register
     for lane L there (rdna2spirv's mask_src). Other number reads of such a merge (an add, a compare) would need the
     gather too; none is known in a shader, and they are left as they were to keep the change to the lane loops.
+    TO_DATA itself writes data (step), so a second run finds nothing left to insert.
+
+    Under --wave64-emulate the gather is an exchange round that both halves of the wave must join, so it relies on
+    its block being reached by the whole wave, through scalar (wave-uniform) branches, as the compiler's lane loops
+    are; wave64_emulate_opt keeps it out of lane-local regions (_MASK_WORD_READERS).
     `branches`: the opcodes that end a block. Returns how many instructions were inserted."""
     inserted = 0
     before, _ = analyse(blocks, succ, wave64=wave64)
