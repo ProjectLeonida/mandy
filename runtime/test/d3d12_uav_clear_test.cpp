@@ -164,6 +164,7 @@ struct Clear {
     bool tagged_volume = false;  // encode volume_uav_flag + volume_uav_word(first_layer, layer_count)
     bool packed_uav = false;     // also set packed_uav_flag (emulated RGB9E5)
     std::uint32_t descriptor_depth = 0;  // override the raw 3D T# depth independently of the resource
+    enum class Predicate { none, skip, execute } predicate = Predicate::none;
 };
 
 struct BufferCase {
@@ -296,6 +297,20 @@ int run_buffer(Harness& h, const BufferCase& test) {
     readback_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
     Ref<ID3D12Resource> readback = h.committed(readback_desc, D3D12_HEAP_TYPE_READBACK);
     EXPECT(buffer.p && readback.p);
+    Ref<ID3D12Resource> predicate;
+    if (std::any_of(test.clears.begin(), test.clears.end(),
+                    [](const Clear& clear) { return clear.predicate != Clear::Predicate::none; })) {
+        const D3D12_HEAP_PROPERTIES upload{D3D12_HEAP_TYPE_UPLOAD};
+        auto desc = buffer_desc(16);
+        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        EXPECT(SUCCEEDED(h.device->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&predicate.p))));
+        void* data = nullptr;
+        EXPECT(SUCCEEDED(predicate->Map(0, nullptr, &data)));
+        const UINT64 values[]{0, UINT64_C(1) << 32};
+        std::memcpy(data, values, sizeof(values));
+        predicate->Unmap(0, nullptr);
+    }
     const UINT64 va = buffer->GetGPUVirtualAddress();
     std::vector<std::uint8_t> model(std::size_t(test.size), 0);
     HRESULT close = E_FAIL;
@@ -303,6 +318,11 @@ int run_buffer(Harness& h, const BufferCase& test) {
         for (UINT i = 0; i < test.clears.size(); ++i) {
             const Clear& c = test.clears[i];
             const auto view = h.write(i, buffer_view(va, c));  // each clear has its own slot
+            if (predicate.p) {
+                list->SetPredication(c.predicate == Clear::Predicate::none ? nullptr : predicate.p,
+                                     c.predicate == Clear::Predicate::execute ? 8 : 0,
+                                     D3D12_PREDICATION_OP_EQUAL_ZERO);
+            }
             const auto* rects = c.rects.empty() ? nullptr : c.rects.data();
             if (c.is_float) {
                 const float v[4] = {std::bit_cast<float>(c.values[0]), std::bit_cast<float>(c.values[1]),
@@ -315,8 +335,9 @@ int run_buffer(Harness& h, const BufferCase& test) {
             uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
             uav.UAV.pResource = buffer.p;
             list->ResourceBarrier(1, &uav);
-            apply(model, c);
+            if (c.predicate != Clear::Predicate::skip) apply(model, c);
         }
+        if (predicate.p) list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
         const auto to_copy = transition(buffer.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         list->ResourceBarrier(1, &to_copy);
         list->CopyBufferRegion(readback.p, 0, buffer.p, 0, test.size);
@@ -572,6 +593,7 @@ int main() {
         info.compute_queues = {d.compute_queue};
         info.compute_family = d.compute_family;
         info.conditional_rendering = d.conditional_rendering;
+        info.storage_buffer_8bit = d.storage_buffer_8bit;
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
         Ref<ID3D12CommandQueue> queue;
@@ -610,6 +632,23 @@ int main() {
         };
 
         std::vector<BufferCase> buffers;
+        if (d.conditional_rendering && d.storage_buffer_8bit) {
+            BufferCase gated{"predicated buffer UAV clears", 256, {whole(64)}};
+            auto wide = typed(VK_FORMAT_R32G32B32A32_UINT, false, {1, 2, 3, 4}, 16, 10,
+                              {{1, 0, 4, 1}, {3, 0, 6, 1}});
+            wide.predicate = Clear::Predicate::execute;
+            gated.clears.push_back(wide);
+            wide.values = {21, 22, 23, 24};
+            wide.predicate = Clear::Predicate::skip;
+            gated.clears.push_back(wide);
+            auto narrow = typed(VK_FORMAT_R8_UNORM, true, floats(0.5f, 0, 0, 0), 3, 5);
+            narrow.predicate = Clear::Predicate::execute;
+            gated.clears.push_back(narrow);
+            narrow.values = floats(1.0f, 0, 0, 0);
+            narrow.predicate = Clear::Predicate::skip;
+            gated.clears.push_back(narrow);
+            buffers.push_back(std::move(gated));
+        }
         {
             BufferCase raw{"raw buffer", 1024, {whole(256)}};
             Clear part;  // a raw view in the middle: value 0 in every word

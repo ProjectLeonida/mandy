@@ -1333,6 +1333,8 @@ struct ReplayFunctions {
     std::function<void(VkCommandBuffer, const PredicateCapture&)> capture_predicate;
     std::function<bool(VkBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, VkDeviceSize,
                        std::vector<PredicatedCopyDispatch>&)> prepare_predicated_copy;
+    std::function<bool(VkBuffer, VkDeviceSize, VkDeviceSize, const uav_clear::Element&,
+                       std::vector<PredicatedCopyDispatch>&)> prepare_predicated_fill;
     std::function<void(VkCommandBuffer, const std::vector<PredicatedCopyDispatch>&)> emit_predicated_copy;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
@@ -3661,9 +3663,26 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const UavView& view = uav->view;
             if (!bind(view.resource)) return unresolved_at(__LINE__);
             if (view.buffer) {
-                if (!vk.fill_buffer || !vk.update_buffer || !vk.copy_buffer) return unsupported_at(__LINE__);
-                if (predicated) ++out.unpredicated_copies;  // fills and copies are transfer commands
                 if (const auto r = detail::prepare_buffer_uav_clear(*uav, p); r != ReplayResult::success) return r;
+                if (p.fills.empty()) {
+                    p.skip = true;
+                    continue;
+                }
+                if (predicated) {
+                    if ((statistics_active && !statistics_helpers) ||
+                        !vk.prepare_predicated_fill || !vk.emit_predicated_copy)
+                        return unsupported_at(__LINE__);
+                    for (const auto& range : p.fills)
+                        if (!vk.prepare_predicated_fill(p.binding.buffer, range[0], range[1], p.element,
+                                                        p.predicated_copy))
+                            return unsupported_at(__LINE__);
+                    if (p.binding.host_readable) {
+                        out.wrote_readback = true;
+                        out.readback_src_stages |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    }
+                    continue;
+                }
+                if (!vk.fill_buffer || !vk.update_buffer || !vk.copy_buffer) return unsupported_at(__LINE__);
                 const bool short_fill = std::any_of(p.fills.begin(), p.fills.end(), [&](const auto& fill) {
                     return detail::buffer_fill_needs_scratch(p.element, fill[0], fill[1]);
                 });
@@ -4943,6 +4962,12 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             state.access |= VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
             state.stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
             if (uav->view.buffer) {
+                if (!p.predicated_copy.empty()) {
+                    end_statistics();
+                    vk.emit_predicated_copy(command_buffer, p.predicated_copy);
+                    begin_statistics();
+                    continue;
+                }
                 constexpr VkAccessFlags transfer = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
                 detail::memory_barrier(vk, command_buffer, state.access, state.stages, transfer,
                                        VK_PIPELINE_STAGE_TRANSFER_BIT);

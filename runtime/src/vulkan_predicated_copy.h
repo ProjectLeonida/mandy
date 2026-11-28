@@ -1,20 +1,24 @@
-// Byte-granular conditional CopyBufferRegion. Requires enabled storageBuffer8BitAccess, not shaderInt8.
+// Byte-granular conditional buffer copies and UAV clears. Requires storageBuffer8BitAccess.
 #pragma once
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
 #include <vulkan/vulkan.h>
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <initializer_list>
 #include <vector>
 #include "predicated_copy_spv.h"
 #include "vulkan_aftermath.h"
+#include "uav_clear.h"
 namespace leonida {
 struct PredicatedCopyDispatch {
     VkDescriptorSet set = VK_NULL_HANDLE;
     std::uint32_t source = 0, destination = 0, bytes = 0;
+    std::uint32_t element_size = 0, phase = 0;
+    std::array<std::uint32_t, 4> pattern{};
 };
 class PredicatedBufferCopier {
 public:
@@ -35,13 +39,27 @@ public:
         bool prepare(VkBuffer source,VkBuffer destination,VkDeviceSize src,VkDeviceSize dst,VkDeviceSize bytes,
                      std::vector<PredicatedCopyDispatch>& out) {
             out.clear();
+            return prepare_windows(source, destination, src, dst, bytes, nullptr, out);
+        }
+
+        bool prepare_fill(VkBuffer destination, VkDeviceSize dst, VkDeviceSize bytes,
+                          const uav_clear::Element& element, std::vector<PredicatedCopyDispatch>& out) {
+            if (!element.size || element.size > element.bytes.size()) return false;
+            // Fill does not read binding 0. Use the destination window there too so both descriptors are valid.
+            return prepare_windows(destination, destination, dst, dst, bytes, &element, out);
+        }
+
+    private:
+        bool prepare_windows(VkBuffer source, VkBuffer destination, VkDeviceSize src, VkDeviceSize dst,
+                             VkDeviceSize bytes, const uav_clear::Element* element,
+                             std::vector<PredicatedCopyDispatch>& out) {
             if(!bytes)return true;
             if(!source||!destination||bytes>UINT64_MAX-src||bytes>UINT64_MAX-dst)return false;
-            if(source==destination && src<dst+bytes && dst<src+bytes)return false;
+            if(!element && source==destination && src<dst+bytes && dst<src+bytes)return false;
             if(!owner.make_pipeline())return false;
             // Align each descriptor base down, keeping byte prefixes in push constants. Split at the smaller
             // remaining descriptor range or dispatch limit, so no uint32 shader index can wrap or overread.
-            struct Window{VkDescriptorBufferInfo source,destination;std::uint32_t src,dst,bytes;};
+            struct Window{VkDescriptorBufferInfo source,destination;std::uint32_t src,dst,bytes,phase;};
             std::vector<Window> windows;
             const auto alignment=std::max<VkDeviceSize>(1,owner.limits_.minStorageBufferOffsetAlignment);
             const VkDeviceSize maximum=owner.limits_.maxStorageBufferRange;
@@ -52,7 +70,8 @@ public:
                 const auto n=std::min({bytes-done,maximum-sp,maximum-dp,threads});
                 if(!n||n>UINT32_MAX)return false;
                 windows.push_back({{source,s-sp,sp+n},{destination,d-dp,dp+n},
-                                   static_cast<std::uint32_t>(sp),static_cast<std::uint32_t>(dp),static_cast<std::uint32_t>(n)});
+                                   static_cast<std::uint32_t>(sp),static_cast<std::uint32_t>(dp),static_cast<std::uint32_t>(n),
+                                   element ? static_cast<std::uint32_t>(done % element->size) : 0});
                 if(windows.size()>UINT32_MAX/2)return false;
                 done+=n;
             }
@@ -69,6 +88,11 @@ public:
             VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
             allocate.descriptorPool=pool;allocate.descriptorSetCount=count;allocate.pSetLayouts=layouts.data();
             if(owner.fn<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(owner.device_,&allocate,sets.data())!=VK_SUCCESS)return false;
+            std::array<std::uint32_t, 4> pattern{};
+            if (element) {
+                for (unsigned i = 0; i < element->size; ++i)
+                    pattern[i / 4] |= std::uint32_t(element->bytes[i]) << (8 * (i % 4));
+            }
             for(std::uint32_t i=0;i<count;++i){
                 VkWriteDescriptorSet writes[2]{};
                 const VkDescriptorBufferInfo* infos[]={&windows[i].source,&windows[i].destination};
@@ -77,7 +101,8 @@ public:
                     w.dstBinding=binding;w.descriptorCount=1;w.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;w.pBufferInfo=infos[binding];
                 }
                 owner.fn<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(owner.device_,2,writes,0,nullptr);
-                out.push_back({sets[i],windows[i].src,windows[i].dst,windows[i].bytes});
+                out.push_back({sets[i], windows[i].src, windows[i].dst, windows[i].bytes,
+                               element ? element->size : 0, windows[i].phase, pattern});
             }
             return true;
         }
@@ -94,7 +119,8 @@ public:
             barrier(cb,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&before,0,nullptr,0,nullptr);
             fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(cb,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline_);
             fn<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets")(cb,VK_PIPELINE_BIND_POINT_COMPUTE,layout_,0,1,&job.set,0,nullptr);
-            const std::uint32_t push[]={job.source,job.destination,job.bytes};
+            const std::uint32_t push[] = {job.source, job.destination, job.bytes, job.element_size, job.phase,
+                                          job.pattern[0], job.pattern[1], job.pattern[2], job.pattern[3]};
             fn<PFN_vkCmdPushConstants>("vkCmdPushConstants")(cb,layout_,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(push),push);
             fn<PFN_vkCmdDispatch>("vkCmdDispatch")(cb,(job.bytes-1u)/64u+1u,1,1);
             VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -122,7 +148,7 @@ private:
         VkDescriptorSetLayoutCreateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         set_info.bindingCount = 2; set_info.pBindings = bindings;
         bool ok = fn<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(device_, &set_info, nullptr, &set) == VK_SUCCESS;
-        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 12};
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 9 * sizeof(std::uint32_t)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.setLayoutCount = 1; layout_info.pSetLayouts = &set;
         layout_info.pushConstantRangeCount = 1; layout_info.pPushConstantRanges = &push;

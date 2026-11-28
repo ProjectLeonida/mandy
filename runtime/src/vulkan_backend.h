@@ -3348,6 +3348,11 @@ private:
                                                          std::vector<PredicatedCopyDispatch>& out) {
                         return copy_batch->prepare(source, destination, src, dst, size, out);
                     };
+                    replay.prepare_predicated_fill = [&](VkBuffer dst, VkDeviceSize offset, VkDeviceSize size,
+                                                          const uav_clear::Element& element,
+                                                          std::vector<PredicatedCopyDispatch>& out) {
+                        return copy_batch->prepare_fill(dst, offset, size, element, out);
+                    };
                     replay.emit_predicated_copy = [&](VkCommandBuffer cb, const std::vector<PredicatedCopyDispatch>& jobs) {
                         context_.predicated_copier_->emit(cb, jobs);
                     };
