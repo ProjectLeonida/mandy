@@ -835,6 +835,42 @@ there. The Linux libdrm backend of #1265 (`tools/hw_oracle/drm.py`) now runs the
 therefore 16,384 words, with no rejections (Linux 7.3.5-zen1-1-zen, libdrm 2.4.134, AMD clang 23.1.5). It copies
 only `.text`, which is where the texture lives, and the loaded code is 256-byte aligned.
 
+#### `image_load_pck` / `image_load_pck_sgn` (`--op`)
+
+`--op image_load_pck` and `--op image_load_pck_sgn` run the same kernels with the fetch opcode replaced (the
+`unorm` modifier does not apply: the pck forms return raw bits) and add the sub-4-byte texel formats
+`R8_UINT`, `R8_SINT`, `R16_UINT`, `R16_SINT`, `R8G8_UINT`, `R8G8_SINT` and `R16G16_SINT` to the default
+`--formats` for those ops (`--formats` still selects explicitly). The CPU model is `pck_oracle` in
+`tools/image_fuzz.py`: the texel's S bytes (S = bytes per texel from the T# FORMAT) form ceil(S/4)
+little-endian dwords — a texel under 4 bytes is one dword, zero-extended for `image_load_pck` and
+sign-extended from bit 8·S−1 for `image_load_pck_sgn` (the sign of the whole texel, not per component);
+`dmask` bit i selects dword i (0 past the last) and the selected dwords pack into consecutive VGPRs. The
+format's numeric type (UINT/SINT/UNORM/FLOAT) does not matter. `--oracle translator` does not translate the
+pck ops and is skipped for them (exit 77 when it is the only oracle).
+
+Measured natively on an RDNA2 iGPU (gfx1036, Ryzen 9 9950X, Linux amdgpu DRM through `tools/hw_oracle/drm.py`,
+AMD clang), texel 0 bytes to registers for `dmask:0xf`:
+
+- `R8G8B8A8_{UNORM,UINT,SINT}` `81 7f ff 02` → `02ff7f81 0 0 0`, both ops.
+- `R16G16B16A16_SFLOAT` `01 80 ff fb 34 12 00 80` → `fbff8001 80001234 0 0`, both ops.
+- `R32G32B32A32_SFLOAT` `f0..ff` → `f3f2f1f0 f7f6f5f4 fbfaf9f8 fffefdfc` (as `image_load`), both ops.
+- `R32_SFLOAT` `81 7f ff 02` → `02ff7f81 0 0 0` (`image_load` gives the (r, 0, 0, 1) fill instead).
+- `dmask` selects raw texel dwords: `R8G8B8A8` 1/2/3/5/8/c/e → `02ff7f81` / `0` / `02ff7f81 0` /
+  `02ff7f81 0` / `0` / `0 0` / `0 0 0`; `R16G16B16A16` 2/5/e → `80001234` / `fbff8001 0` / `80001234 0 0`.
+- Sub-4-byte texels: `R8_{UINT,SINT}` `81` → pck `00000081`, sgn `ffffff81`; `R16_{UINT,SINT}` `01 80` →
+  `00008001` / `ffff8001`; `R8G8_{UINT,SINT}` `81 f2` → `0000f281` / `fffff281`; `R16G16_SINT` `01 80 fe 7f` →
+  `7ffe8001` under both ops.
+
+```
+python -I tools/image_fuzz.py --oracle hw --op image_load_pck_sgn --programs 60 --seed 1
+python -I tools/image_fuzz.py --oracle hw --op image_load_pck --negative-control --programs 180 --seed 1
+python -m pytest tests/test_image_fuzz_hw.py
+```
+
+The `pck_oracle` fixtures are the measured words above (`test_pck_oracle_measured_values`); the negative
+control adds `pck_sgn_zero_extend` (a `_sgn` model that zero-extends), caught only by the sub-4-byte
+formats. Its wrong-T# FORMAT check builds each pck kernel with the next format of another texel size: a format of the same size but another numeric type gives the same words (the measurement above), so it could not be caught. With 60 cases on gfx1036 every perturbation and every wrong FORMAT is caught. On gfx1150 (RDNA3.5) a match supports the model, as for `image_load`.
+
 ### 32-bit integer VALU in every encoding (`tools/vint_diff.py`)
 
 `tools/shader_diff.py` checks the common integer opcodes with VGPR sources in their e32 form. `tools/vint_diff.py`

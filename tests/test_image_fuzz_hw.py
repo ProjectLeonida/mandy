@@ -6,6 +6,7 @@ import json
 import os
 import random
 import struct
+import subprocess
 import sys
 
 import pytest
@@ -61,12 +62,15 @@ def test_format_tables_agree_with_the_translator_table_and_each_other():
         by_name = {name: int(code) for code, name in json.load(f).items()}
     names = {"R8G8B8A8_UNORM": "8_8_8_8_UNORM", "R16G16B16A16_SFLOAT": "16_16_16_16_FLOAT",
              "R32G32B32A32_SFLOAT": "32_32_32_32_FLOAT", "R32_SFLOAT": "32_FLOAT",
-             "R8G8B8A8_UINT": "8_8_8_8_UINT", "R8G8B8A8_SINT": "8_8_8_8_SINT"}
-    assert set(tsharp.IMG_FORMATS["gfx10"]) == set(tsharp.IMG_FORMATS["gfx11"]) == set(imf.FORMATS) == set(names)
+             "R8G8B8A8_UINT": "8_8_8_8_UINT", "R8G8B8A8_SINT": "8_8_8_8_SINT",
+             "R8_UINT": "8_UINT", "R8_SINT": "8_SINT", "R16_UINT": "16_UINT", "R16_SINT": "16_SINT",
+             "R8G8_UINT": "8_8_UINT", "R8G8_SINT": "8_8_SINT", "R16G16_SINT": "16_16_SINT"}
+    assert set(tsharp.IMG_FORMATS["gfx10"]) == set(tsharp.IMG_FORMATS["gfx11"]) == set(imf.HW_FORMATS) == set(names)
+    assert set(imf.PCK_FORMATS) == set(names) - set(imf.FORMATS)
     for fmt, short in names.items():
-        assert tsharp.IMG_FORMATS["gfx10"][fmt] == by_name["GFX10_FORMAT_" + short] == imf.FORMATS[fmt][1]
+        assert tsharp.IMG_FORMATS["gfx10"][fmt] == by_name["GFX10_FORMAT_" + short] == imf.HW_FORMATS[fmt][1]
     # GFX11 numbers the formats in LLVM's UfmtGFX11 order: no 10_10_10_2-style gaps filled differently from GFX10
-    assert len(set(tsharp.IMG_FORMATS["gfx11"].values())) == len(imf.FORMATS)
+    assert len(set(tsharp.IMG_FORMATS["gfx11"].values())) == len(imf.HW_FORMATS)
 
 
 def test_pitch_and_layout():
@@ -151,17 +155,20 @@ def test_integer_words_do_not_get_nan_leniency():
 def test_perturbations_change_the_model():
     for name in imf.PERTURBATIONS:
         changed = False
-        for fmt in imf.FORMATS:
-            for dmask in (0xf, 0x5):
-                c = case(fmt=fmt, width=16, height=8, dmask=dmask)
-                base = imf.expected_words(fmt, c.data[0], 16, 8, dmask)
-                imf.PERTURB.add(name)
-                try:
-                    changed = changed or imf.expected_words(fmt, c.data[0], 16, 8, dmask) != base
-                finally:
-                    imf.PERTURB.discard(name)
+        for op in imf.PERTURB_OPS[name]:
+            formats = imf.FORMATS if op == "image_load" else imf.HW_FORMATS
+            for fmt in formats:
+                for dmask in (0xf, 0x5):
+                    c = case(fmt=fmt, width=16, height=8, dmask=dmask)
+                    base = imf.expected_words(fmt, c.data[0], 16, 8, dmask, op)
+                    imf.PERTURB.add(name)
+                    try:
+                        changed = changed or imf.expected_words(fmt, c.data[0], 16, 8, dmask, op) != base
+                    finally:
+                        imf.PERTURB.discard(name)
         assert changed, name
     assert not imf.PERTURB
+    assert set(imf.PERTURB_OPS) == set(imf.PERTURBATIONS)
 
 
 class ModelOracle:
@@ -170,14 +177,14 @@ class ModelOracle:
     device = "model"
     chunk = 0
 
-    def __init__(self, cases, damage=None):
-        self.cases, self.damage = cases, damage
+    def __init__(self, cases, damage=None, op="image_load"):
+        self.cases, self.damage, self.op = cases, damage, op
 
     def run(self, kernels, words=4):
         out = []
         for c, k in zip(self.cases, kernels):
-            w = imf.expected_words(c.fmt, c.data[0], c.width, c.height, c.dmask)
-            right = tsharp.image_words(self.arch, c.fmt, c.width, c.height, imf.FORMATS[c.fmt][2])[1]
+            w = imf.expected_words(c.fmt, c.data[0], c.width, c.height, c.dmask, self.op)
+            right = tsharp.image_words(self.arch, c.fmt, c.width, c.height, imf.HW_FORMATS[c.fmt][2])[1]
             if f"0x{right:08x}" not in "\n".join(k.lines):      # a kernel built with another FORMAT reads other bits
                 w = [x ^ 0x00400000 for x in w]
             if self.damage:
@@ -279,6 +286,107 @@ def test_on_the_hardware_when_present(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["image_fuzz.py", "--oracle", "hw", "--programs", "36", "--seed", "1"])
     assert imf.main() == 0
     assert "mismatch 0" in capsys.readouterr().out
+
+
+def test_pck_oracle_measured_values():
+    """The texel-fetch rule measured on gfx1036 (docs/shader_validation.md): the texel's bytes as raw dwords."""
+    s = list(tsharp.SENTINEL_BITS)
+    # R8G8B8A8_*: one dword, the four bytes little-endian; every dmask bit past the first selects 0.
+    texel = bytes([0x81, 0x7f, 0xff, 0x02])
+    for fmt in ("R8G8B8A8_UNORM", "R8G8B8A8_UINT", "R8G8B8A8_SINT"):
+        assert imf.pck_oracle(fmt, texel, 0xf, False) == [0x02ff7f81, 0, 0, 0]
+        assert imf.pck_oracle(fmt, texel, 0xf, True) == [0x02ff7f81, 0, 0, 0]
+    assert imf.pck_oracle("R8G8B8A8_UNORM", texel, 0x1, False) == [0x02ff7f81] + s[1:]
+    assert imf.pck_oracle("R8G8B8A8_UNORM", texel, 0x2, False) == [0] + s[1:]
+    assert imf.pck_oracle("R8G8B8A8_UNORM", texel, 0x3, False) == [0x02ff7f81, 0] + s[2:]
+    assert imf.pck_oracle("R8G8B8A8_UNORM", texel, 0x5, False) == [0x02ff7f81, 0] + s[2:]
+    assert imf.pck_oracle("R8G8B8A8_UNORM", texel, 0x8, False) == [0] + s[1:]
+    assert imf.pck_oracle("R8G8B8A8_UNORM", texel, 0xc, False) == [0, 0] + s[2:]
+    assert imf.pck_oracle("R8G8B8A8_UNORM", texel, 0xe, False) == [0, 0, 0] + s[3:]
+    # R16G16B16A16_SFLOAT: two dwords.
+    texel = bytes([0x01, 0x80, 0xff, 0xfb, 0x34, 0x12, 0x00, 0x80])
+    for sgn in (False, True):
+        assert imf.pck_oracle("R16G16B16A16_SFLOAT", texel, 0xf, sgn) == [0xfbff8001, 0x80001234, 0, 0]
+    assert imf.pck_oracle("R16G16B16A16_SFLOAT", texel, 0x2, False) == [0x80001234] + s[1:]
+    assert imf.pck_oracle("R16G16B16A16_SFLOAT", texel, 0x5, False) == [0xfbff8001, 0] + s[2:]
+    assert imf.pck_oracle("R16G16B16A16_SFLOAT", texel, 0xe, False) == [0x80001234, 0, 0] + s[3:]
+    # R32G32B32A32_SFLOAT: the four texel dwords as-is; R32_SFLOAT's missing components are 0 (not the
+    # (r, 0, 0, 1) fill image_load gives).
+    texel = bytes(range(0xf0, 0x100))
+    assert imf.pck_oracle("R32G32B32A32_SFLOAT", texel, 0xf, False) == [0xf3f2f1f0, 0xf7f6f5f4, 0xfbfaf9f8, 0xfffefdfc]
+    assert imf.pck_oracle("R32_SFLOAT", bytes([0x81, 0x7f, 0xff, 0x02]), 0xf, False) == [0x02ff7f81, 0, 0, 0]
+    # Texels under 4 bytes: one dword, zero-extended for pck, sign-extended from the texel's top bit for
+    # _sgn (the sign of the whole texel, not per component).
+    assert imf.pck_oracle("R8_UINT", bytes([0x81]), 0x1, False) == [0x81] + s[1:]
+    assert imf.pck_oracle("R8_UINT", bytes([0x81]), 0x1, True) == [0xFFFFFF81] + s[1:]
+    assert imf.pck_oracle("R16_UINT", bytes([0x01, 0x80]), 0x1, False) == [0x8001] + s[1:]
+    assert imf.pck_oracle("R16_UINT", bytes([0x01, 0x80]), 0x1, True) == [0xFFFF8001] + s[1:]
+    assert imf.pck_oracle("R8G8_UINT", bytes([0x81, 0xf2]), 0x1, False) == [0xF281] + s[1:]
+    assert imf.pck_oracle("R8G8_UINT", bytes([0x81, 0xf2]), 0x1, True) == [0xFFFFF281] + s[1:]
+    assert imf.pck_oracle("R16G16_SINT", bytes([0x01, 0x80, 0xfe, 0x7f]), 0x1, False) == [0x7FFE8001] + s[1:]
+    assert imf.pck_oracle("R16G16_SINT", bytes([0x01, 0x80, 0xfe, 0x7f]), 0x1, True) == [0x7FFE8001] + s[1:]
+    # dmask 0 selects nothing: every register keeps its sentinel.
+    assert imf.pck_oracle("R8_UINT", bytes([0x81]), 0x0, True) == s
+
+
+def test_pck_oracle_words_for_every_texel():
+    """Four words per texel, in texel order, for the raw formats too."""
+    texels, _ = imf.make_texels("R8G8_UINT", 4, 2, random.Random(9))
+    words = imf.pck_oracle("R8G8_UINT", texels, 0xf, False)
+    assert len(words) == 4 * 2 * 4
+    for i in range(8):
+        chunk = texels[i * 2:i * 2 + 2]
+        assert words[i * 4] == int.from_bytes(chunk, "little")
+        assert words[i * 4 + 1:i * 4 + 4] == [0, 0, 0]
+
+
+def test_kernel_pck_ops_replace_the_opcode_and_drop_unorm():
+    c = case(fmt="R8_UINT", width=8, height=8, dmask=0x5)
+    for op in ("image_load_pck", "image_load_pck_sgn"):
+        for arch in (GFX11, GFX10):
+            text = "\n".join(imf.hw_kernel(arch, c, op=op).lines)
+            assert f"{op} v[8:9], v[2:3], s[8:15] dmask:0x5 dim:SQ_RSRC_IMG_2D\n" in text + "\n"
+            assert " unorm" not in text and "image_load " not in text
+    text = "\n".join(imf.hw_kernel(GFX11, c).lines)
+    assert "image_load v[8:9], v[2:3], s[8:15] dmask:0x5 dim:SQ_RSRC_IMG_2D unorm" in text
+
+
+def test_expected_words_pck_ops_and_strict_compare():
+    c = case(fmt="R8_UINT", width=8, height=8, dmask=0x1)
+    want = imf.expected_words(c.fmt, c.data[0], 8, 8, 0x1, "image_load_pck_sgn")
+    got = list(want)
+    got[0] ^= 1
+    assert imf.compare_hw(c, got, "image_load_pck_sgn")
+    # Bit-exact even where the bits look like a NaN: the pck model has no NaN leniency.
+    texels = bytes([0x00, 0x00, 0xc0, 0x7f]) * 64
+    want = imf.expected_words("R32_SFLOAT", texels, 8, 8, 0xf, "image_load_pck")
+    got = [w ^ 0x00000001 if i % 4 == 0 else w for i, w in enumerate(want)]
+    c = imf.Case(0, "R32_SFLOAT", 8, 8, 0xf, (texels, None), 32)
+    assert imf.compare_hw(c, got, "image_load_pck")
+
+
+def test_negative_control_catches_a_wrong_pck_model(capsys):
+    cases = imf.make_cases(60, 1, list(imf.HW_FORMATS))
+    a = Args()
+    a.op = "image_load_pck_sgn"
+    assert imf.negative_control(ModelOracle(cases, op=a.op), cases, a) == 0
+    out = capsys.readouterr().out
+    assert "unperturbed model: 0 of 60 cases mismatch" in out
+    assert "perturbation pck_sgn_zero_extend" in out and "NOT CAUGHT" not in out
+    assert "perturbation unorm_256" in out and "not applicable" in out
+
+
+def test_main_skips_the_translator_oracle_for_pck_ops(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["image_fuzz.py", "--oracle", "translator", "--op", "image_load_pck"])
+    assert imf.main() == 77
+    assert "not translated" in capsys.readouterr().out
+
+
+def test_main_rejects_pck_only_formats_for_image_load():
+    result = subprocess.run([sys.executable, "-I", imf.__file__, "--formats", "R8_UINT", "--programs", "1"],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2, result.stderr
+    assert "only the pck ops model these formats" in result.stderr
 
 
 @pytest.mark.parametrize("arch,wave", [("gfx1030", 32), ("gfx1030", 64), ("gfx1150", 32), ("gfx1150", 64)])
