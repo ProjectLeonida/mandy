@@ -50,7 +50,8 @@
 
 .PARAMETER InputScript
     LEONIDA_INPUT_SCRIPT: timed pad presses, seconds since the pad's first poll (button@seconds, comma-separated;
-    buttons a b x y start back lb rb up down left right). Sets LEONIDA_KEYBOARD_PAD=always. Builds older than
+    buttons a b x y start back lb rb up down left right). Each press is held 300 ms; button@seconds:hold holds it
+    longer, e.g. b@1100:3 for a title that reads its pad only every few seconds. Sets LEONIDA_KEYBOARD_PAD=always. Builds older than
     main @ 8146ef690 ignore a script longer than 63 characters. Default 'a@45,a@60,a@75,a@90'.
 
 .PARAMETER NoInput
@@ -74,6 +75,9 @@
 
 .PARAMETER ExtraArgs
     More gta6rt arguments, appended after the standard ones.
+
+.PARAMETER FirstRunUi
+    Launch with the offline first-run UI profile instead of the generic runtime profile.
 
 .PARAMETER Python
     Python 3.12+ used for tools/boot_trace.py. Default: python, else py -3.
@@ -118,6 +122,7 @@ param(
     [switch]$NoCapture,
     [switch]$NoInput,
     [string[]]$ExtraArgs = @(),
+    [switch]$FirstRunUi,
     [string]$Python = "",
     [int]$SummaryLines = 40,
     [int]$LockWaitSeconds = 3600,
@@ -276,8 +281,78 @@ foreach ($pair in $EnvPairs) {
     $bootEnv[$Matches[1]] = $Matches[2]
 }
 if ($bootEnv["LEONIDA_CAPTURE"]) { $Capture = $bootEnv["LEONIDA_CAPTURE"] }
+# The journal `gta6rt --precompile-pipelines` fills beside gta6rt.exe (when it runs without LEONIDA_PIPELINE_CACHE_DIR)
+# is read here as the runtime's read-only seed (LEONIDA_PIPELINE_JOURNAL_SEED_DIR, docs/d3d12_vulkan.md), so the pipelines
+# it holds are not compiled again in the boot's own cache folder. Only when this shell or -SetEnv/KEY= did not decide, and
+# when the two journals are distinct: the runtime turns its journal off for a seed that is, holds or sits in its writable
+# journal (pipeline_cache_journal.h, resolve_roots). A relative cache folder is resolved by the runtime against its own
+# working folder, so it gets no seed here; a name that cannot be resolved gets none either, rather than a stop.
+if (-not $bootEnv.Contains("LEONIDA_PIPELINE_JOURNAL_SEED_DIR")) {
+    # Windows' final path of a folder (GetFinalPathNameByHandle) sees through junctions, symbolic links, substituted
+    # and mapped drives, short 8.3 names and the \\?\ and \\.\ prefixes, as the runtime's std::filesystem checks do.
+    # A folder that does not exist yet is named from its deepest existing parent. Without the helper (a compile error,
+    # a restricted session), the comparison falls back to the spelled paths.
+    function Get-FinalFolderPath([string]$path) {
+        $plain = ($path -replace '^\\\\[?.]\\UNC\\', '\\' -replace '^\\\\[?.]\\', '').TrimEnd('\', '/')
+        try {
+            if (-not ('LeonidaFinalPath' -as [type])) {
+                Add-Type -ErrorAction Stop -TypeDefinition @'
+using System; using System.Runtime.InteropServices; using System.Text; using Microsoft.Win32.SafeHandles;
+public static class LeonidaFinalPath {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder buffer, uint length, uint flags);
+    public static string Of(string path) {
+        // No access asked, all sharing, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (needed to open a folder).
+        using (SafeFileHandle h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+            if (h.IsInvalid) return null;
+            StringBuilder b = new StringBuilder(32768);
+            uint n = GetFinalPathNameByHandleW(h, b, (uint)b.Capacity, 0);
+            return (n == 0 || n >= b.Capacity) ? null : b.ToString();
+        }
+    }
+}
+'@
+            }
+            $existing = $path.TrimEnd('\', '/'); $tail = @()
+            while ($existing -and -not [System.IO.Directory]::Exists($existing)) {
+                $tail = @([System.IO.Path]::GetFileName($existing)) + $tail
+                $existing = [System.IO.Path]::GetDirectoryName($existing)
+            }
+            if (-not $existing) { return $plain }
+            $final = [LeonidaFinalPath]::Of($existing)
+            if (-not $final) { return $plain }
+            $final = $final -replace '^\\\\\?\\UNC\\', '\\' -replace '^\\\\\?\\', ''
+            foreach ($part in $tail) { $final = [System.IO.Path]::Combine($final, $part) }
+            return $final.TrimEnd('\', '/')
+        } catch { return $plain }
+    }
+    $seed = $null
+    try {
+        $runtimeFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RuntimeDir)
+        $precompiled = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($runtimeFull, "pipeline_cache.d")).TrimEnd('\', '/')
+        if (Test-Path -LiteralPath $precompiled -PathType Container) {
+            $cacheDir = $bootEnv["LEONIDA_PIPELINE_CACHE_DIR"]
+            $ownJournal = $null
+            if (-not $cacheDir) { $ownJournal = $precompiled }   # the runtime then keeps its journal beside gta6rt.exe
+            elseif ($cacheDir -match '^([A-Za-z]:[\\/]|[\\/]{2})') {
+                $ownJournal = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($cacheDir, "pipeline_cache.d")).TrimEnd('\', '/')
+            }
+            if ($ownJournal) {
+                $a = Get-FinalFolderPath $ownJournal
+                $b = Get-FinalFolderPath $precompiled
+                $c = [System.StringComparison]::OrdinalIgnoreCase
+                $overlap = $a.Equals($b, $c) -or $a.StartsWith($b + '\', $c) -or $b.StartsWith($a + '\', $c)
+                if (-not $overlap) { $seed = $precompiled }
+            }
+        }
+    } catch { $seed = $null }
+    if ($seed) { $bootEnv["LEONIDA_PIPELINE_JOURNAL_SEED_DIR"] = $seed }
+}
 
-$gameArgs = @("--run", $Exe, "--game-dir", $GameDir, "--overlay", $Overlay, "--trace", $TraceFile, "--trace-d3d12") + $ExtraArgs
+$launchMode = if ($FirstRunUi) { "--first-run-ui" } else { "--run" }
+$gameArgs = @($launchMode, $Exe, "--game-dir", $GameDir, "--overlay", $Overlay, "--trace", $TraceFile, "--trace-d3d12") + $ExtraArgs
 $argLine = ($gameArgs | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) }) -join " "
 
 if (-not $DigestOnly) {
