@@ -29,6 +29,11 @@ Every transform is strictly sound:
     OpConstantTrue / OpConstantFalse already matches the result type and value.
   - Pure DCE uses an explicit allowlist of side-effect-free opcodes and drops any
     OpDecorate / OpName lines that reference deleted SSA IDs.
+  - Scalar Replacement of Aggregates (SROA) splits surviving non-escaped, statically
+    indexed 1D Function-scope array variables (such as `%vgpr[256]` and `%sgpr[128]`
+    when no `v_movrel*`/`s_movrel*` dynamic access exists) into per-slot scalar
+    Function `OpVariable`s for only the surviving slots, eliminating the monolithic
+    array allocas and their `OpAccessChain` instructions.
 
 As a module:
     from spirv_opt import optimize
@@ -380,13 +385,164 @@ def _fold_int_op(op: str, res_ty: str, args: list[str],
     return None
 
 
+def _sroa_function_arrays(insts: list[list], const_int_val: dict[str, tuple[str, int, int, int]],
+                          const_null_elem_zero: dict[str, str], array_elem_type: dict[str, str],
+                          array_len: dict[str, int], func_ptr_pointee: dict[str, str],
+                          func_ptr_of_type: dict[str, str], decorated_ids: set[str],
+                          all_module_ids: set[str]) -> tuple[list[list], set[str]]:
+    """Scalar Replacement of Aggregates (SROA) for non-escaped, statically indexed 1D Function arrays.
+
+    Splits surviving Function-scope arrays (such as `%vgpr[256]` and `%sgpr[128]` when no dynamic
+    `v_movrel*`/`s_movrel*` indexing exists) into individual scalar `OpVariable`s for only the slots
+    actually referenced after forwarding/DCE, removing the aggregate allocas and their `OpAccessChain`s.
+    """
+    # Collect Function-scope array OpVariable candidates.
+    candidates: dict[str, tuple[str, str | None, int, int]] = {}  # var -> (elem_ptr_ty, elem_init, arr_len, def_idx)
+    for idx, (res, op, args, _raw) in enumerate(insts):
+        if op != "OpVariable" or not res or len(args) < 2 or args[1] != "Function":
+            continue
+        if res in decorated_ids:
+            continue
+        arr_ty = func_ptr_pointee.get(args[0])
+        if arr_ty is None:
+            continue
+        elem_ty = array_elem_type.get(arr_ty)
+        alen = array_len.get(arr_ty)
+        if elem_ty is None or alen is None or alen <= 0:
+            continue
+        elem_ptr_ty = func_ptr_of_type.get(elem_ty)
+        if elem_ptr_ty is None:
+            continue
+        init = args[2] if len(args) >= 3 else None
+        if init is None:
+            elem_init = None
+        elif init in const_null_elem_zero:
+            elem_init = const_null_elem_zero[init]
+        else:
+            continue
+        candidates[res] = (elem_ptr_ty, elem_init, alen, idx)
+
+    if not candidates:
+        return insts, set()
+
+    # Verify every use of each candidate is a valid static-index OpAccessChain (no escapes, no dynamic
+    # indices, no whole-array loads/stores, no decorated 1-index OpAccessChain results).
+    rejected: set[str] = set()
+    used_indices: dict[str, set[int]] = {v: set() for v in candidates}
+    one_idx_chains: dict[int, tuple[str, str, int]] = {}   # inst_idx -> (res_id, var_id, uval)
+    multi_idx_chains: dict[int, tuple[str, int]] = {}      # inst_idx -> (var_id, uval)
+
+    for idx, (res, op, args, _raw) in enumerate(insts):
+        if op is None or not args:
+            continue
+        if op == "OpVariable" and res in candidates:
+            continue
+        if op == "OpAccessChain" and res and len(args) >= 3 and args[1] in candidates:
+            v = args[1]
+            if v in rejected:
+                continue
+            # Ensure no candidate variable is also used as an index operand.
+            bad_idx = False
+            for tok in args[2:]:
+                if tok in candidates:
+                    rejected.add(tok)
+                    bad_idx = True
+            if bad_idx:
+                rejected.add(v)
+                continue
+            cinfo = const_int_val.get(args[2])
+            elem_ptr_ty, _elem_init, alen, _def_idx = candidates[v]
+            if cinfo is None:
+                rejected.add(v)
+                continue
+            _cty, uval, width, signedness = cinfo
+            if (signedness == 1 and uval >= (1 << (width - 1))) or not (0 <= uval < alen):
+                rejected.add(v)
+                continue
+            if len(args) == 3:
+                if args[0] != elem_ptr_ty or res in decorated_ids:
+                    rejected.add(v)
+                    continue
+                one_idx_chains[idx] = (res, v, uval)
+            else:
+                multi_idx_chains[idx] = (v, uval)
+            used_indices[v].add(uval)
+        else:
+            for tok in args:
+                if tok in candidates:
+                    rejected.add(tok)
+
+    active = {v: info for v, info in candidates.items() if v not in rejected and used_indices[v]}
+    if not active:
+        return insts, set()
+
+    # Mint collision-free scalar OpVariable IDs per (var, uval) in sorted index order.
+    slot_var: dict[tuple[str, int], str] = {}
+    var_replacements: dict[int, list[list]] = {}
+    deleted_ids: set[str] = set()
+    for v, (elem_ptr_ty, elem_init, _alen, def_idx) in active.items():
+        deleted_ids.add(v)
+        stem = v[1:]
+        decls: list[list] = []
+        for uval in sorted(used_indices[v]):
+            if stem == "vgpr":
+                base_name = f"%rv_{uval}"
+            elif stem == "sgpr":
+                base_name = f"%rs_{uval}"
+            else:
+                base_name = f"%sr_{stem}_{uval}"
+            name = base_name
+            suffix = 1
+            while name in all_module_ids:
+                name = f"{base_name}_{suffix}"
+                suffix += 1
+            all_module_ids.add(name)
+            slot_var[(v, uval)] = name
+            vargs = [elem_ptr_ty, "Function"] + ([elem_init] if elem_init is not None else [])
+            raw_decl = _format_inst(name, "OpVariable", vargs)
+            decls.append([name, "OpVariable", vargs, raw_decl])
+        var_replacements[def_idx] = decls
+
+    alias: dict[str, str] = {}
+    drop_idx: set[int] = set()
+    for idx, (res, v, uval) in one_idx_chains.items():
+        if v in active:
+            alias[res] = slot_var[(v, uval)]
+            drop_idx.add(idx)
+            deleted_ids.add(res)
+
+    new_insts: list[list] = []
+    for idx, entry in enumerate(insts):
+        if idx in var_replacements:
+            new_insts.extend(var_replacements[idx])
+            continue
+        if idx in drop_idx:
+            continue
+        res, op, args, raw = entry
+        if idx in multi_idx_chains and multi_idx_chains[idx][0] in active:
+            v, uval = multi_idx_chains[idx]
+            args = [args[0], slot_var[(v, uval)], *args[3:]]
+            raw = _format_inst(res, op, args)
+            entry = [res, op, args, raw]
+        if op is not None and args and alias:
+            new_args = [alias.get(tok, tok) if tok.startswith("%") else tok for tok in args]
+            if new_args != args:
+                entry = [res, op, new_args, _format_inst(res, op, new_args)]
+        new_insts.append(entry)
+
+    return new_insts, deleted_ids
+
+
 def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: set[str],
                        const_false: set[str], const_null_elem_zero: dict[str, str],
                        const_type: dict[str, str], const_int_val: dict[str, tuple[str, int, int, int]],
                        int_const_by_val: dict[tuple[str, int], str],
                        int_type_info: dict[str, tuple[int, int]],
                        readonly_global_vars: set[str], glsl_sets: set[str],
-                       decorated_ids: set[str], max_passes: int = 4) -> tuple[list[str], set[str]]:
+                       decorated_ids: set[str], array_elem_type: dict[str, str],
+                       array_len: dict[str, int], func_ptr_pointee: dict[str, str],
+                       func_ptr_of_type: dict[str, str], all_module_ids: set[str],
+                       max_passes: int = 4) -> tuple[list[str], set[str]]:
     """Optimize one OpFunction ... OpFunctionEnd slice. Returns (new_lines, deleted_ids)."""
     insts: list[list] = []
     for raw in body_lines:
@@ -807,10 +963,13 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                         if slot is not None:
                             cached = slot_val.get(slot)
                             if cached is None and len(slot) == 2:
+                                cand_z = None
                                 if root in entry_null_zero:
-                                    cached = entry_null_zero[root]
+                                    cand_z = entry_null_zero[root]
                                 elif root in static_null_zero and slot not in stored_slots:
-                                    cached = static_null_zero[root]
+                                    cand_z = static_null_zero[root]
+                                if cand_z is not None and const_type.get(cand_z) == args[0]:
+                                    cached = cand_z
                             if cached is not None and res not in decorated_ids:
                                 alias[res] = cached
                                 dead_idx.add(idx)
@@ -1008,6 +1167,12 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
         if not changed:
             break
 
+    insts, sroa_deleted = _sroa_function_arrays(
+        insts, const_int_val, const_null_elem_zero, array_elem_type,
+        array_len, func_ptr_pointee, func_ptr_of_type, decorated_ids, all_module_ids,
+    )
+    deleted_ids.update(sroa_deleted)
+
     out_lines = []
     for res, op, args, raw in insts:
         if op is None or op in ("OpFunction", "OpFunctionEnd", "OpLabel", "OpVariable"):
@@ -1030,11 +1195,15 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
     const_int_val: dict[str, tuple[str, int, int, int]] = {}  # const_id -> (type_id, uval, width, signedness)
     int_const_by_val: dict[tuple[str, int], str] = {}       # (type_id, uval) -> const_id
     array_elem_type: dict[str, str] = {}                    # arr_type_id -> elem_type_id
+    array_len_id: dict[str, str] = {}                       # arr_type_id -> len_const_id
+    func_ptr_pointee: dict[str, str] = {}                   # ptr_type_id -> pointee_type_id (Function only)
+    func_ptr_of_type: dict[str, str] = {}                   # pointee_type_id -> ptr_type_id (Function only)
     zero_const_of_type: dict[str, str] = {}                 # scalar_type_id -> zero_const_id
     const_null_type: dict[str, str] = {}                    # null_const_id -> array_type_id
     readonly_global_vars: set[str] = set()                  # PushConstant and Input OpVariables
     glsl_sets: set[str] = set()
     decorated_ids: set[str] = set()
+    all_module_ids: set[str] = set()
 
     func_ranges: list[tuple[int, int]] = []
     fn_start = None
@@ -1044,6 +1213,7 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
                 lhs = raw.split("=", 1)[0].strip()
                 if lhs.startswith("%"):
                     glsl_sets.add(lhs)
+                    all_module_ids.add(lhs)
                 continue
             stripped = raw.lstrip()
             op_tok = stripped.split(None, 1)[0] if stripped else ""
@@ -1056,6 +1226,8 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
             if parsed is None:
                 continue
             res, op, args = parsed
+            if res is not None:
+                all_module_ids.add(res)
             if op == "OpFunction":
                 fn_start = i
                 continue
@@ -1077,6 +1249,9 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
                         int_type_info[res] = (w, s)
                 except ValueError:
                     pass
+            elif op == "OpTypePointer" and res and len(args) >= 2 and args[0] == "Function":
+                func_ptr_pointee[res] = args[1]
+                func_ptr_of_type.setdefault(args[1], res)
             elif op == "OpConstant" and res and len(args) >= 2:
                 const_ids.add(res)
                 const_type[res] = args[0]
@@ -1101,6 +1276,7 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
                 const_ids.add(res)
                 const_false.add(res)
                 const_type[res] = args[0]
+                zero_const_of_type.setdefault(args[0], res)
             elif op == "OpConstantComposite" and res and args:
                 const_ids.add(res)
                 const_type[res] = args[0]
@@ -1108,15 +1284,20 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
                 const_ids.add(res)
                 const_type[res] = args[0]
                 const_null_type[res] = args[0]
-            elif op == "OpTypeArray" and res and args:
+                zero_const_of_type.setdefault(args[0], res)
+            elif op == "OpTypeArray" and res and len(args) >= 2:
                 array_elem_type[res] = args[0]
+                array_len_id[res] = args[1]
             elif op == "OpVariable" and res and len(args) >= 2 and args[1] in ("PushConstant", "Input"):
                 readonly_global_vars.add(res)
         else:
             parsed = _parse_line(raw)
-            if parsed is not None and parsed[1] == "OpFunctionEnd":
-                func_ranges.append((fn_start, i + 1))
-                fn_start = None
+            if parsed is not None:
+                if parsed[0] is not None:
+                    all_module_ids.add(parsed[0])
+                if parsed[1] == "OpFunctionEnd":
+                    func_ranges.append((fn_start, i + 1))
+                    fn_start = None
 
     if not func_ranges:
         return spvasm
@@ -1127,6 +1308,14 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
         if elem_ty and elem_ty in zero_const_of_type:
             const_null_elem_zero[null_id] = zero_const_of_type[elem_ty]
 
+    array_len: dict[str, int] = {}
+    for arr_ty, len_id in array_len_id.items():
+        cinfo = const_int_val.get(len_id)
+        if cinfo is not None:
+            _ty, uval, width, signedness = cinfo
+            if not (signedness == 1 and uval >= (1 << (width - 1))) and uval > 0:
+                array_len[arr_ty] = uval
+
     all_deleted: set[str] = set()
     opt_funcs: dict[int, list[str]] = {}
     for start, end in func_ranges:
@@ -1134,7 +1323,8 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
             lines[start:end], const_ids, const_true, const_false,
             const_null_elem_zero, const_type, const_int_val, int_const_by_val,
             int_type_info, readonly_global_vars, glsl_sets, decorated_ids,
-            max_passes=max_passes,
+            array_elem_type, array_len, func_ptr_pointee, func_ptr_of_type,
+            all_module_ids, max_passes=max_passes,
         )
         opt_funcs[start] = new_body
         all_deleted.update(deleted)
