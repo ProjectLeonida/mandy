@@ -2001,6 +2001,13 @@ if(NOT TARGET Vulkan::Headers)
     FetchContent_MakeAvailable(VulkanHeaders)
   endif()
 endif()
+# LEONIDA_D3D12=vulkan asked of a runtime with no Vulkan-backed device (shims/d3d12_backend.h). Outside the block
+# below on purpose: a configure without the Vulkan headers is the case it is about.
+add_executable(d3d12_backend_test test/d3d12_backend_test.cpp)
+if(WIN32 AND MSVC)
+  target_compile_options(d3d12_backend_test PRIVATE /W4 /permissive- /utf-8)
+endif()
+add_test(NAME d3d12_backend COMMAND d3d12_backend_test)
 if(TARGET Vulkan::Headers)
   # The standalone Khronos releases use glslang; older SDKs also provide glslangValidator.
   find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE NAMES glslangValidator glslang

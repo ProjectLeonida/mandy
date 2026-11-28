@@ -20,6 +20,7 @@
 #ifdef LEONIDA_VULKAN_DEVICE
 #include "d3d12_com.h"
 #endif
+#include "d3d12_backend.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "d3d12_xs_rootsig.h"
@@ -198,12 +199,24 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     const bool pc_lists = getenv_s(&lists_length, lists_mode, "LEONIDA_D3D12_LISTS") == 0 &&
                           std::strcmp(lists_mode, "pc") == 0;
 
-#ifdef LEONIDA_VULKAN_DEVICE
     // Opt-in until the Vulkan device covers the first frame: LEONIDA_D3D12=vulkan puts the Vulkan-backed device
     // behind the same proxy instead of the host's D3D12 device.
     char backend[16] = {};
     size_t backend_length = 0;
-    if (getenv_s(&backend_length, backend, "LEONIDA_D3D12") == 0 && std::strcmp(backend, "vulkan") == 0) {
+    const bool backend_read = getenv_s(&backend_length, backend, "LEONIDA_D3D12") == 0;
+#ifdef LEONIDA_VULKAN_DEVICE
+    constexpr bool vulkan_built = true;
+#else
+    constexpr bool vulkan_built = false;
+#endif
+    // A runtime configured without the Vulkan headers has no such device: say so once instead of running the title on
+    // the host's device as if nothing had been asked.
+    if (const char* note = rt::d3d12_xs::backend::vulkan_not_built_note(backend_read ? backend : nullptr, vulkan_built)) {
+        static std::atomic<bool> noted{false};
+        if (!noted.exchange(true, std::memory_order_relaxed)) std::fprintf(stderr, "[rt] d3d12_xs: %s\n", note);
+    }
+#ifdef LEONIDA_VULKAN_DEVICE
+    if (backend_read && rt::d3d12_xs::backend::vulkan_requested(backend)) {
         ID3D12Device* vulkan = nullptr;
         HRESULT vhr = rt::d3d12::create_vulkan_device_standalone(
             __uuidof(ID3D12Device), reinterpret_cast<void**>(&vulkan), rt::d3d12::QueueTestSettings::ignore);
