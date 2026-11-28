@@ -4775,6 +4775,13 @@ if(TARGET Vulkan::Headers)
     add_executable(replay_uav_clear_offset_test test/replay_uav_clear_offset_test.cpp)
     target_link_libraries(replay_uav_clear_offset_test PRIVATE Vulkan::Headers)
     add_test(NAME replay_uav_clear_offset COMMAND replay_uav_clear_offset_test)
+    # GPU replay helpers: cached device proc lookups, BAR-aware memory fallback, and failure cleanup (no GPU).
+    add_executable(vk_helper_proc_cache_test test/vk_helper_proc_cache_test.cpp)
+    target_link_libraries(vk_helper_proc_cache_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(vk_helper_proc_cache_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME vk_helper_proc_cache COMMAND vk_helper_proc_cache_test)
     # ResolveQueryData suspends conditional rendering around un-ended vkCmdFillBuffer runs as well as dispatches (D3D-148).
     add_executable(replay_query_predication_test test/replay_query_predication_test.cpp)
     target_link_libraries(replay_query_predication_test PRIVATE Vulkan::Headers)

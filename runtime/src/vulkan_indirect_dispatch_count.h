@@ -51,8 +51,8 @@ public:
                             const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceLimits& limits)
         : get_(get), device_(device), memory_(memory), limits_(limits) {}
     ~IndirectDispatchCounter() {
-        if (pipeline_) fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(device_, pipeline_, nullptr);
-        if (layout_) fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(device_, layout_, nullptr);
+        if (pipeline_) vk_.destroy_pipeline(device_, pipeline_, nullptr);
+        if (layout_) vk_.destroy_layout(device_, layout_, nullptr);
     }
     IndirectDispatchCounter(const IndirectDispatchCounter&) = delete;
     IndirectDispatchCounter& operator=(const IndirectDispatchCounter&) = delete;
@@ -68,8 +68,8 @@ public:
         explicit Batch(IndirectDispatchCounter& value) : owner(value) {}
         ~Batch() {
             for (auto& a : allocations) {
-                if (a.buffer) owner.fn<PFN_vkDestroyBuffer>("vkDestroyBuffer")(owner.device_, a.buffer, nullptr);
-                if (a.memory) owner.fn<PFN_vkFreeMemory>("vkFreeMemory")(owner.device_, a.memory, nullptr);
+                if (a.buffer) owner.vk_.destroy_buffer(owner.device_, a.buffer, nullptr);
+                if (a.memory) owner.vk_.free_memory(owner.device_, a.memory, nullptr);
             }
         }
         Batch(const Batch&) = delete;
@@ -80,8 +80,8 @@ public:
                      CountedDispatch& out) {
             out = {};
             constexpr VkDeviceSize record_bytes = 3 * sizeof(std::uint32_t);
-            if (!arguments || (!count && !indirect_group_budget()) || stride < record_bytes || stride % 4 ||
-                (argument_offset % 4) != 0 || (count_offset % 4) != 0 || !max_count ||
+            if (!arguments || (!count && (count_offset || !indirect_group_budget())) || stride < record_bytes ||
+                stride % 4 || (argument_offset % 4) != 0 || (count_offset % 4) != 0 || !max_count ||
                 !owner.limits_.maxComputeWorkGroupCount[0] || !owner.make_pipeline()) return false;
             if (VkDeviceSize(max_count) > std::numeric_limits<VkDeviceSize>::max() / record_bytes)
                 return false;
@@ -90,42 +90,50 @@ public:
             info.size = bytes;
             info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                          VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-            Allocation scratch{};
-            if (owner.fn<PFN_vkCreateBuffer>("vkCreateBuffer")(owner.device_, &info, nullptr, &scratch.buffer) != VK_SUCCESS)
+            Allocation a{};
+            const auto cleanup = [&] {
+                if (a.buffer) owner.vk_.destroy_buffer(owner.device_, a.buffer, nullptr);
+                if (a.memory) owner.vk_.free_memory(owner.device_, a.memory, nullptr);
                 return false;
-            allocations.push_back(scratch);  // all failure paths free it with the batch
-            auto& a = allocations.back();
+            };
+            if (owner.vk_.create_buffer(owner.device_, &info, nullptr, &a.buffer) != VK_SUCCESS) {
+                a.buffer = VK_NULL_HANDLE;
+                return false;
+            }
             VkMemoryRequirements requirements{};
-            owner.fn<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(
-                owner.device_, a.buffer, &requirements);
-            const auto order = memory_type_order(owner.memory_, requirements.memoryTypeBits, 0,
-                                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, requirements.size);
-            if (order.empty()) return false;
+            owner.vk_.get_reqs(owner.device_, a.buffer, &requirements);
+            auto order = memory_type_order(owner.memory_, requirements.memoryTypeBits, 0,
+                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, requirements.size);
+            if (!resizable_bar(owner.memory_)) {
+                std::stable_partition(order.begin(), order.end(), [&](std::uint32_t t) {
+                    const auto f = owner.memory_.memoryTypes[t].propertyFlags;
+                    return (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+                });
+            }
+            if (order.empty()) return cleanup();
             VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
             flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
             VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
             allocation.allocationSize = requirements.size;
-            const auto alloc_memory = owner.fn<PFN_vkAllocateMemory>("vkAllocateMemory");
             for (const std::uint32_t memory_type : order) {
                 allocation.memoryTypeIndex = memory_type;
-                if (alloc_memory(owner.device_, &allocation, nullptr, &a.memory) == VK_SUCCESS) break;
+                if (owner.vk_.allocate_memory(owner.device_, &allocation, nullptr, &a.memory) == VK_SUCCESS) break;
                 a.memory = VK_NULL_HANDLE;
             }
-            if (!a.memory ||
-                owner.fn<PFN_vkBindBufferMemory>("vkBindBufferMemory")(owner.device_, a.buffer, a.memory, 0) != VK_SUCCESS)
-                return false;
-            const auto address = owner.fn<PFN_vkGetBufferDeviceAddress>("vkGetBufferDeviceAddress");
+            if (!a.memory || owner.vk_.bind_buffer(owner.device_, a.buffer, a.memory, 0) != VK_SUCCESS)
+                return cleanup();
             VkBufferDeviceAddressInfo addr{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             addr.buffer = arguments;
-            const VkDeviceAddress args_va = address(owner.device_, &addr);
+            const VkDeviceAddress args_va = owner.vk_.get_address(owner.device_, &addr);
             addr.buffer = count;
-            const VkDeviceAddress count_va = count ? address(owner.device_, &addr) : 0;
+            const VkDeviceAddress count_va = count ? owner.vk_.get_address(owner.device_, &addr) : 0;
             addr.buffer = a.buffer;
-            const VkDeviceAddress output_va = address(owner.device_, &addr);
+            const VkDeviceAddress output_va = owner.vk_.get_address(owner.device_, &addr);
             if (!args_va || (count && !count_va) || !output_va ||
-                argument_offset > UINT64_MAX - args_va || count_offset > UINT64_MAX - count_va)
-                return false;
-            out = {a.buffer, 0, args_va + argument_offset, count_va + count_offset,
+                argument_offset > UINT64_MAX - args_va || (count && count_offset > UINT64_MAX - count_va))
+                return cleanup();
+            allocations.push_back(a);
+            out = {a.buffer, 0, args_va + argument_offset, count ? count_va + count_offset : 0,
                    output_va, stride, max_count};
             return true;
         }
@@ -134,13 +142,12 @@ public:
     std::unique_ptr<Batch> batch() { return std::make_unique<Batch>(*this); }
 
     void emit(VkCommandBuffer cb, const CountedDispatch& job) const {
-        const auto barrier = fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
         VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         before.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        barrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0, 1, &before, 0, nullptr, 0, nullptr);
-        fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        vk_.cmd_barrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        0, 1, &before, 0, nullptr, 0, nullptr);
+        vk_.cmd_bind_pipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         struct Push {
             VkDeviceAddress arguments, count, output;
             std::uint32_t stride_words, first_record, records, budget, has_count;
@@ -156,29 +163,62 @@ public:
             const std::uint32_t count = std::uint32_t(std::min<VkDeviceSize>(chunk_limit, job.max_count - first));
             const Push push{job.arguments + first * job.stride, job.count, job.output + first * 12,
                             job.stride / 4, std::uint32_t(first), count, indirect_group_budget(), job.count != 0};
-            fn<PFN_vkCmdPushConstants>("vkCmdPushConstants")(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT,
-                                                             0, sizeof(push), &push);
-            fn<PFN_vkCmdDispatch>("vkCmdDispatch")(cb, (count - 1u) / 64u + 1u, 1, 1);
+            vk_.cmd_push_constants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            vk_.cmd_dispatch(cb, (count - 1u) / 64u + 1u, 1, 1);
             first += count;
         }
         VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         after.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
         after.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_MEMORY_READ_BIT |
                               VK_ACCESS_MEMORY_WRITE_BIT;
-        barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                0, 1, &after, 0, nullptr, 0, nullptr);
+        vk_.cmd_barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        0, 1, &after, 0, nullptr, 0, nullptr);
     }
 
 private:
-    template<typename T> T fn(const char* name) const { return reinterpret_cast<T>(get_(device_, name)); }
+    struct Functions {
+        PFN_vkCreateBuffer create_buffer = nullptr;
+        PFN_vkDestroyBuffer destroy_buffer = nullptr;
+        PFN_vkGetBufferMemoryRequirements get_reqs = nullptr;
+        PFN_vkAllocateMemory allocate_memory = nullptr;
+        PFN_vkFreeMemory free_memory = nullptr;
+        PFN_vkBindBufferMemory bind_buffer = nullptr;
+        PFN_vkGetBufferDeviceAddress get_address = nullptr;
+        PFN_vkCreateShaderModule create_shader = nullptr;
+        PFN_vkDestroyShaderModule destroy_shader = nullptr;
+        PFN_vkCreatePipelineLayout create_layout = nullptr;
+        PFN_vkDestroyPipelineLayout destroy_layout = nullptr;
+        PFN_vkCreateComputePipelines create_pipelines = nullptr;
+        PFN_vkDestroyPipeline destroy_pipeline = nullptr;
+        PFN_vkCmdPipelineBarrier cmd_barrier = nullptr;
+        PFN_vkCmdBindPipeline cmd_bind_pipeline = nullptr;
+        PFN_vkCmdPushConstants cmd_push_constants = nullptr;
+        PFN_vkCmdDispatch cmd_dispatch = nullptr;
+    };
+
+    template<typename T> bool load_fn(T& out, const char* name) const {
+        out = reinterpret_cast<T>(get_(device_, name));
+        return out != nullptr;
+    }
+
     bool make_pipeline() {
         if (pipeline_) return true;
-        for (const char* name : {"vkCreateBuffer", "vkDestroyBuffer", "vkGetBufferMemoryRequirements",
-             "vkAllocateMemory", "vkFreeMemory", "vkBindBufferMemory", "vkGetBufferDeviceAddress",
-             "vkCreateShaderModule", "vkDestroyShaderModule", "vkCreatePipelineLayout",
-             "vkDestroyPipelineLayout", "vkCreateComputePipelines", "vkDestroyPipeline",
-             "vkCmdPipelineBarrier", "vkCmdBindPipeline", "vkCmdPushConstants", "vkCmdDispatch"})
-            if (!get_(device_, name)) return false;
+        Functions f{};
+        if (!load_fn(f.create_buffer, "vkCreateBuffer") || !load_fn(f.destroy_buffer, "vkDestroyBuffer") ||
+            !load_fn(f.get_reqs, "vkGetBufferMemoryRequirements") ||
+            !load_fn(f.allocate_memory, "vkAllocateMemory") || !load_fn(f.free_memory, "vkFreeMemory") ||
+            !load_fn(f.bind_buffer, "vkBindBufferMemory") ||
+            !load_fn(f.get_address, "vkGetBufferDeviceAddress") ||
+            !load_fn(f.create_shader, "vkCreateShaderModule") ||
+            !load_fn(f.destroy_shader, "vkDestroyShaderModule") ||
+            !load_fn(f.create_layout, "vkCreatePipelineLayout") ||
+            !load_fn(f.destroy_layout, "vkDestroyPipelineLayout") ||
+            !load_fn(f.create_pipelines, "vkCreateComputePipelines") ||
+            !load_fn(f.destroy_pipeline, "vkDestroyPipeline") ||
+            !load_fn(f.cmd_barrier, "vkCmdPipelineBarrier") ||
+            !load_fn(f.cmd_bind_pipeline, "vkCmdBindPipeline") ||
+            !load_fn(f.cmd_push_constants, "vkCmdPushConstants") || !load_fn(f.cmd_dispatch, "vkCmdDispatch"))
+            return false;
         VkShaderModule module = VK_NULL_HANDLE;
         VkPipelineLayout layout = VK_NULL_HANDLE;
         VkPipeline pipeline = VK_NULL_HANDLE;
@@ -186,26 +226,26 @@ private:
         shader.codeSize = sizeof(indirect_dispatch_count_spirv);
         shader.pCode = indirect_dispatch_count_spirv;
         const aftermath::ShaderName aftermath_name("(runtime) indirect_dispatch_count");
-        bool ok = fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(device_, &shader, nullptr, &module) == VK_SUCCESS;
+        bool ok = f.create_shader(device_, &shader, nullptr, &module) == VK_SUCCESS;
         const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 48};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &range;
-        ok = ok && fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(device_, &layout_info, nullptr, &layout) == VK_SUCCESS;
+        ok = ok && f.create_layout(device_, &layout_info, nullptr, &layout) == VK_SUCCESS;
         VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         info.stage.module = module;
         info.stage.pName = "main";
         info.layout = layout;
-        ok = ok && fn<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(
-            device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) == VK_SUCCESS;
-        if (module) fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(device_, module, nullptr);
+        ok = ok && f.create_pipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) == VK_SUCCESS;
+        if (module) f.destroy_shader(device_, module, nullptr);
         if (!ok) {
-            if (pipeline) fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(device_, pipeline, nullptr);
-            if (layout) fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(device_, layout, nullptr);
+            if (pipeline) f.destroy_pipeline(device_, pipeline, nullptr);
+            if (layout) f.destroy_layout(device_, layout, nullptr);
             return false;
         }
+        vk_ = f;
         layout_ = layout;
         pipeline_ = pipeline;
         return true;
@@ -214,6 +254,7 @@ private:
     VkDevice device_;
     VkPhysicalDeviceMemoryProperties memory_;
     VkPhysicalDeviceLimits limits_;
+    Functions vk_{};
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
 };

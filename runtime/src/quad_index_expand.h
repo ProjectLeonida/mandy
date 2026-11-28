@@ -56,8 +56,8 @@ public:
     QuadIndexExpander(PFN_vkGetDeviceProcAddr get, VkDevice device, const VkPhysicalDeviceLimits& limits)
         : get_(get), device_(device), limits_(limits) {}
     ~QuadIndexExpander() {
-        if (pipeline_) fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(device_, pipeline_, nullptr);
-        if (layout_) fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(device_, layout_, nullptr);
+        if (pipeline_) vk_.destroy_pipeline(device_, pipeline_, nullptr);
+        if (layout_) vk_.destroy_layout(device_, layout_, nullptr);
     }
     QuadIndexExpander(const QuadIndexExpander&) = delete;
     QuadIndexExpander& operator=(const QuadIndexExpander&) = delete;
@@ -72,12 +72,11 @@ public:
         if (!indices || !scratch || !index_bytes || !quads || quads > max_quads || index_offset % index_bytes ||
             scratch_offset % sizeof(std::uint32_t) || !limits_.maxComputeWorkGroupCount[0] || !make_pipeline())
             return false;
-        const auto address = fn<PFN_vkGetBufferDeviceAddress>("vkGetBufferDeviceAddress");
         VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         info.buffer = indices;
-        const VkDeviceAddress source = address(device_, &info);
+        const VkDeviceAddress source = vk_.get_address(device_, &info);
         info.buffer = scratch;
-        const VkDeviceAddress target = address(device_, &info);
+        const VkDeviceAddress target = vk_.get_address(device_, &info);
         if (!source || !target || index_offset > UINT64_MAX - source || scratch_offset > UINT64_MAX - target ||
             (source % sizeof(std::uint32_t)) || (target % sizeof(std::uint32_t)))
             return false;
@@ -95,14 +94,13 @@ public:
 
     // Records the pass: outside a render pass, before the draw that binds job.buffer as its index buffer.
     void emit(VkCommandBuffer cb, const QuadIndexExpansion& job) const {
-        const auto barrier = fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
         // Whatever wrote the application's indices earlier in the command buffer (a copy, a shader) is visible.
         VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         before.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        barrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0, 1, &before, 0, nullptr, 0, nullptr);
-        fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        vk_.cmd_barrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        0, 1, &before, 0, nullptr, 0, nullptr);
+        vk_.cmd_bind_pipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         struct Push {
             VkDeviceAddress source, triangles;
             std::uint32_t first_half, index_bits, limit, quads;
@@ -121,54 +119,77 @@ public:
             const Push push{job.source + source_bytes, job.triangles + first * indices_per_quad * 4,
                             job.first_half, job.index_bits, std::uint32_t(std::min<std::uint64_t>(left, UINT32_MAX)),
                             quads};
-            fn<PFN_vkCmdPushConstants>("vkCmdPushConstants")(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                                             sizeof(push), &push);
-            fn<PFN_vkCmdDispatch>("vkCmdDispatch")(cb, (quads - 1u) / group_size + 1u, 1, 1);
+            vk_.cmd_push_constants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            vk_.cmd_dispatch(cb, (quads - 1u) / group_size + 1u, 1, 1);
             first += quads;
         }
         VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         after.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         after.dstAccessMask = VK_ACCESS_INDEX_READ_BIT;
-        barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
-                0, 1, &after, 0, nullptr, 0, nullptr);
+        vk_.cmd_barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+                        0, 1, &after, 0, nullptr, 0, nullptr);
     }
 
 private:
     static constexpr std::uint32_t group_size = 64;  // local_size_x of quad_index_expand.comp
     static constexpr std::uint32_t push_bytes = 32;
-    template<typename T> T fn(const char* name) const { return reinterpret_cast<T>(get_(device_, name)); }
+    struct Functions {
+        PFN_vkGetBufferDeviceAddress get_address = nullptr;
+        PFN_vkCreateShaderModule create_shader = nullptr;
+        PFN_vkDestroyShaderModule destroy_shader = nullptr;
+        PFN_vkCreatePipelineLayout create_layout = nullptr;
+        PFN_vkDestroyPipelineLayout destroy_layout = nullptr;
+        PFN_vkCreateComputePipelines create_pipelines = nullptr;
+        PFN_vkDestroyPipeline destroy_pipeline = nullptr;
+        PFN_vkCmdPipelineBarrier cmd_barrier = nullptr;
+        PFN_vkCmdBindPipeline cmd_bind_pipeline = nullptr;
+        PFN_vkCmdPushConstants cmd_push_constants = nullptr;
+        PFN_vkCmdDispatch cmd_dispatch = nullptr;
+    };
+    template<typename T> bool load_fn(T& out, const char* name) const {
+        out = reinterpret_cast<T>(get_(device_, name));
+        return out != nullptr;
+    }
     bool make_pipeline() {
         if (pipeline_) return true;
-        for (const char* name : {"vkGetBufferDeviceAddress", "vkCreateShaderModule", "vkDestroyShaderModule",
-             "vkCreatePipelineLayout", "vkDestroyPipelineLayout", "vkCreateComputePipelines", "vkDestroyPipeline",
-             "vkCmdPipelineBarrier", "vkCmdBindPipeline", "vkCmdPushConstants", "vkCmdDispatch"})
-            if (!get_(device_, name)) return false;
+        Functions f{};
+        if (!load_fn(f.get_address, "vkGetBufferDeviceAddress") ||
+            !load_fn(f.create_shader, "vkCreateShaderModule") ||
+            !load_fn(f.destroy_shader, "vkDestroyShaderModule") ||
+            !load_fn(f.create_layout, "vkCreatePipelineLayout") ||
+            !load_fn(f.destroy_layout, "vkDestroyPipelineLayout") ||
+            !load_fn(f.create_pipelines, "vkCreateComputePipelines") ||
+            !load_fn(f.destroy_pipeline, "vkDestroyPipeline") ||
+            !load_fn(f.cmd_barrier, "vkCmdPipelineBarrier") ||
+            !load_fn(f.cmd_bind_pipeline, "vkCmdBindPipeline") ||
+            !load_fn(f.cmd_push_constants, "vkCmdPushConstants") || !load_fn(f.cmd_dispatch, "vkCmdDispatch"))
+            return false;
         VkShaderModule module = VK_NULL_HANDLE;
         VkPipelineLayout layout = VK_NULL_HANDLE;
         VkPipeline pipeline = VK_NULL_HANDLE;
         VkShaderModuleCreateInfo shader{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         shader.codeSize = sizeof(quad_index_expand_spirv);
         shader.pCode = quad_index_expand_spirv;
-        bool ok = fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(device_, &shader, nullptr, &module) == VK_SUCCESS;
+        bool ok = f.create_shader(device_, &shader, nullptr, &module) == VK_SUCCESS;
         const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &range;
-        ok = ok && fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(device_, &layout_info, nullptr, &layout) == VK_SUCCESS;
+        ok = ok && f.create_layout(device_, &layout_info, nullptr, &layout) == VK_SUCCESS;
         VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         info.stage.module = module;
         info.stage.pName = "main";
         info.layout = layout;
-        ok = ok && fn<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(
-            device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) == VK_SUCCESS;
-        if (module) fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(device_, module, nullptr);
+        ok = ok && f.create_pipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) == VK_SUCCESS;
+        if (module) f.destroy_shader(device_, module, nullptr);
         if (!ok) {
-            if (pipeline) fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(device_, pipeline, nullptr);
-            if (layout) fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(device_, layout, nullptr);
+            if (pipeline) f.destroy_pipeline(device_, pipeline, nullptr);
+            if (layout) f.destroy_layout(device_, layout, nullptr);
             return false;
         }
+        vk_ = f;
         layout_ = layout;
         pipeline_ = pipeline;
         return true;
@@ -176,6 +197,7 @@ private:
     PFN_vkGetDeviceProcAddr get_;
     VkDevice device_;
     VkPhysicalDeviceLimits limits_;
+    Functions vk_{};
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
 };
