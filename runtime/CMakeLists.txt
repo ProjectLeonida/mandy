@@ -1563,6 +1563,23 @@ if(BUILD_TESTING)
   add_test(NAME spirv_f16_halves COMMAND spirv_f16_halves_test)
   add_executable(dual_source_fragment_test test/dual_source_fragment_test.cpp)
   add_test(NAME dual_source_fragment COMMAND dual_source_fragment_test)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    set(bcpack_stream_test_dir "${CMAKE_CURRENT_BINARY_DIR}/bcpack_stream_test_gen")
+    set(bcpack_stream_test_tables "${bcpack_stream_test_dir}/bcpack_tables.inc")
+    add_custom_command(OUTPUT "${bcpack_stream_test_tables}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory "${bcpack_stream_test_dir}"
+      COMMAND "${Python3_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_bcpack_runtime_tables.py"
+              "${bcpack_stream_test_tables}"
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_bcpack_runtime_tables.py"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../tools/bcpack.py"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../tools/bcpack_tables.py"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../tools/bcpack_tables_bptc.py"
+      VERBATIM)
+    add_executable(bcpack_stream_test test/bcpack_stream_test.cpp src/bcpack.cpp "${bcpack_stream_test_tables}")
+    target_include_directories(bcpack_stream_test PRIVATE "${bcpack_stream_test_dir}")
+    add_test(NAME bcpack_stream COMMAND bcpack_stream_test)
+  endif()
   # Optional: skips unless LEONIDA_SHADERS names a translated work folder (<work>/shaders/spirv).
   add_executable(shader_library_corpus_test test/shader_library_corpus_test.cpp)
   add_test(NAME shader_library_corpus COMMAND shader_library_corpus_test)

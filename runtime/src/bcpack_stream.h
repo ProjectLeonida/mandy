@@ -21,11 +21,16 @@ using Symbols = array<uint16_t, 16>;
 constexpr uint32_t home = 1u << 24;
 
 struct Model {
+  struct Step {
+    uint16_t freq;
+    uint16_t cdf;
+  };
   uint32_t base[11]{};
   const uint32_t *frequency{};
   int width{};
   array<uint8_t, 256> first{};
   uint64_t reciprocal[9]{};
+  array<Step, 256> steps{};
   void init(int w, int q) {
     width = w;
     frequency = freq[w][q];
@@ -33,17 +38,29 @@ struct Model {
       base[p] = base[p - 1] + (frequency[p - 1] << max(0, p - 2));
       reciprocal[p] = ((uint64_t{1} << 32) + frequency[p] - 1) / frequency[p];
     }
+    base[w + 1] = 65536u;
     unsigned p = 0;
     for (unsigned window = 0; window < first.size(); ++window) {
       while (p < unsigned(width) && base[p + 1] <= (window << 8)) ++p;
       first[window] = uint8_t(p);
+    }
+    const unsigned limit = 1u << w;
+    for (unsigned sym = 0; sym < limit; ++sym) {
+      const int bp = bit_width(sym);
+      uint32_t f = frequency[bp];
+      uint32_t c = base[bp] + f * (sym - (bp ? 1u << (bp - 1) : 0u));
+      if (!c) {
+        --f;
+        ++c;
+      }
+      steps[sym] = {uint16_t(f), uint16_t(c)};
     }
   }
   int symbol(uint32_t state, bool fast) const {
     const uint32_t cf = state & 65535;
     if (fast) {
       unsigned p = first[cf >> 8];
-      while (p < unsigned(width) && cf >= base[p + 1]) ++p;
+      while (cf >= base[p + 1]) ++p;
       if (!p) return 0;
       const auto quotient = uint32_t(((cf - base[p]) * reciprocal[p]) >> 32);
       return int((1u << (p - 1)) + quotient);
@@ -53,14 +70,8 @@ struct Model {
     return p ? (1 << (p - 1)) + (cf - base[p]) / frequency[p] : 0;
   }
   uint32_t advance(uint32_t state, unsigned sym) const {
-    const int p = bit_width(sym);
-    uint32_t f = frequency[p],
-             c = base[p] + f * (sym - (p ? 1u << (p - 1) : 0u));
-    if (!c) {
-      --f;
-      ++c;
-    }
-    return f * (state >> 16) + (state & 65535) - c;
+    const Step s = steps[sym & 255u];
+    return uint32_t(s.freq) * (state >> 16) + (state & 65535u) - s.cdf;
   }
 };
 
@@ -100,28 +111,12 @@ struct Lane {
       buffered = true;
     }
     if (held) {
-      state = model->advance(state, symbol);
+      state = model->advance(state, unsigned(symbol));
       slot = symbol;
       full = true;
       held = false;
     }
-    if (phase == Phase::header) {
-      model = &model_for(width - (byte >> 6), byte & 15);
-      flush = (byte & 16) != 0;
-      extended = (byte & 32) != 0;
-      zeros = 0;
-      buffered = false;
-      phase = Phase::length;
-    } else if (phase == Phase::length || phase == Phase::long_length) {
-      if (phase == Phase::long_length) {
-        bytes += (byte << 8) + 257;
-        phase = Phase::symbols;
-      } else {
-        bytes = byte + !extended;
-        phase = extended ? Phase::long_length : Phase::symbols;
-      }
-      buffered = false;
-    } else {
+    if (phase == Phase::symbols) [[likely]] {
       if (state < home) {
         if (bytes) {
           state = (state << 8) | byte;
@@ -143,8 +138,10 @@ struct Lane {
       }
       held = state > home && remaining;
       if (held) {
+        if (!model)
+          return false;
         symbol = model->symbol(state, fast);
-        if (symbol >= (1 << model->width))
+        if (symbol < 0 || symbol >= (1 << model->width))
           return false;
         --remaining;
       }
@@ -157,6 +154,25 @@ struct Lane {
       } else if (state == home || (state > home && !held)) {
         return false;
       }
+    } else if (phase == Phase::header) {
+      const int model_width = width - (byte >> 6);
+      if (model_width < 1 || model_width > 8)
+        return false;
+      model = &model_for(model_width, byte & 15);
+      flush = (byte & 16) != 0;
+      extended = (byte & 32) != 0;
+      zeros = 0;
+      buffered = false;
+      phase = Phase::length;
+    } else {
+      if (phase == Phase::long_length) {
+        bytes += (byte << 8) + 257;
+        phase = Phase::symbols;
+      } else {
+        bytes = byte + !extended;
+        phase = extended ? Phase::long_length : Phase::symbols;
+      }
+      buffered = false;
     }
     return true;
   }
@@ -181,7 +197,11 @@ constexpr BC7Format bc7_formats[] = {{3, 4, 0, 1, 3, 4}, {2, 6, 0, 2, 3, 6},
 
 template<class Block>
 bool visit_blocks(unsigned codec, span<const uint8_t> source, size_t size, Block block, bool fast = true) {
+  if (!codec || codec == 2 || codec >= 8)
+    return false;
   const bool single = codec == 1 || codec == 4;
+  if (size % (single ? 8 : 16))
+    return false;
   const unsigned count = codec >= 6 ? 16 : 12;
   const size_t elements = size / 8;
   array<Lane, 16> lanes{};
