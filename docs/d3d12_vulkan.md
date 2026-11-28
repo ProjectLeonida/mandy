@@ -4348,12 +4348,16 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   working space, plane 1 is blended over plane 0 there, and the sum is encoded once:
 
   1. Decode. SDR planes: the SDR EOTF (below) gives linear Rec.709 with 1.0 = SDR white. HDR10 planes: PQ inverse to linear
-     nits (Rec.2020). Premultiplied data is divided by alpha for the decode and multiplied again after, so what is filtered
-     and blended is linear premultiplied colour; straight-alpha colour is premultiplied after the decode, so a transparent
-     texel adds no colour of its own (found in review by @Flyander).
+     nits (Rec.2020). For premultiplied UNORM, encoded RGB up to alpha is divided by alpha before decoding and multiplied
+     again afterwards. Encoded RGB above alpha is decoded as additive light, including all RGB when alpha is zero. Both
+     contributions are filtered separately so coverage cannot attenuate the additive light. Premultiplied
+     `*_UNORM_SRGB` planes are already hardware-decoded to linear premultiplied light by `texelFetch` (no encoded-space
+     division by alpha). Straight-alpha colour is premultiplied after the decode, so a transparent texel adds no colour of
+     its own (found in review by @Flyander).
   2. Convert, still linear. HDR10 output: SDR to Rec.2020 (the Rec.709 to Rec.2020 matrix from the primaries; rows sum to 1)
      times the SDR white level in nits. SDR output: HDR10 to Rec.709 (the inverse matrix), divided by the SDR white level, then
-     tone mapped (below). A plane already in the output's space is not converted.
+     tone mapped (below). Tone mapping unpremultiplies only the covered light and maps the filtered additive light
+     independently. A plane already in the output's space is not converted.
   3. Blend `over + (1 - alpha) * base` (premultiplied; straight alpha was premultiplied in step 1); black outside plane 0.
   4. Encode once: PQ of the nits for an HDR10 output (argument clamped to 0..10000 nits), the inverse SDR EOTF (clipped to
      0..1) for an SDR one.
