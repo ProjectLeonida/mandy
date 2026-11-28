@@ -1610,17 +1610,15 @@ def encode_png(width: int, height: int, rgba: bytes) -> bytes:
 
     ihdr = _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
 
-    raw = bytearray(height * (stride + 1))
-    mv = memoryview(rgba)
-    dst = 1
-    src = 0
-    dst_step = stride + 1
-    for _ in range(height):
-        raw[dst : dst + stride] = mv[src : src + stride]
-        dst += dst_step
-        src += stride
+    compressor = zlib.compressobj()
+    compressed = bytearray()
+    pixels = memoryview(rgba)
+    for start in range(0, expected, stride):
+        compressed.extend(compressor.compress(b"\x00"))  # PNG filter type 0
+        compressed.extend(compressor.compress(pixels[start:start + stride]))
+    compressed.extend(compressor.flush())
 
-    idat = _png_chunk(b"IDAT", zlib.compress(raw))
+    idat = _png_chunk(b"IDAT", compressed)
     iend = _png_chunk(b"IEND", b"")
     return PNG_SIGNATURE + ihdr + idat + iend
 
