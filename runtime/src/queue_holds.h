@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <algorithm>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -62,6 +63,7 @@ public:
         {
             std::lock_guard lock(mutex_);
             fences_.erase(semaphore);
+            asked_.erase(semaphore);
         }
         if (held_.load(std::memory_order_acquire) == 0 || in_pump()) return;
         {
@@ -98,6 +100,25 @@ public:
         std::lock_guard lock(mutex_);
         const auto it = fences_.find(semaphore);
         return it == fences_.end() ? 0 : it->second;
+    }
+
+    // A Signal of `value` is about to reach Vulkan (vkSignalSemaphore or a vkQueueSubmit that signals the fence).
+    // Called before the Vulkan call, so a counter read on another thread that already sees the value also finds it
+    // here, which signaled() records only afterwards. Kept even when the call then fails: asked_value() only answers
+    // whether a counter value can have come from a Signal.
+    void asking(Semaphore semaphore, std::uint64_t value) {
+        std::lock_guard lock(mutex_);
+        std::uint64_t& asked = asked_[semaphore];
+        if (asked < value) asked = value;
+    }
+
+    // The highest value anyone asked of the fence: its initial value, a Signal recorded by signaled(), or one
+    // announced by asking() whose Vulkan call may still be in flight. 0 for an unknown semaphore.
+    std::uint64_t asked_value(Semaphore semaphore) const {
+        std::lock_guard lock(mutex_);
+        const auto it = fences_.find(semaphore);
+        const auto at = asked_.find(semaphore);
+        return std::max(it == fences_.end() ? 0 : it->second, at == asked_.end() ? 0 : at->second);
     }
 
     // true when no submitted Signal reaches `value` yet. Unknown semaphores are satisfied.
@@ -228,9 +249,10 @@ private:
         }
     }
 
-    mutable std::mutex mutex_;  // leaf: fences_, holders_ and barriers_
+    mutable std::mutex mutex_;  // leaf: fences_, asked_, holders_ and barriers_
     std::mutex pump_mutex_;     // one releasing thread; held across release_ready(), so detach() waits for it
     std::unordered_map<Semaphore, std::uint64_t> fences_;
+    std::unordered_map<Semaphore, std::uint64_t> asked_;  // asking(): Signals announced before their Vulkan call
     std::vector<Holder*> holders_;
     std::deque<Barrier> barriers_;
     std::atomic<std::int64_t> held_{0};

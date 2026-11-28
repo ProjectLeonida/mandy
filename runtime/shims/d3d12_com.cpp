@@ -2286,6 +2286,7 @@ public:
                 VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
                 info.semaphore = semaphore;
                 info.value = value;
+                context->holds().asking(semaphore, value);  // before the call, as VulkanFence::signal
                 signaled = context->observe_result(context->vk.vkSignalSemaphore(context->device(), &info),
                                                    "vkSignalSemaphore (fence callback)") == VK_SUCCESS;
             }
