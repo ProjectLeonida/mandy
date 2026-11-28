@@ -61,6 +61,12 @@ int main() {
         CHECK(unsorted.size() == 2);
         CHECK(unsorted[0] == std::make_pair(std::uintptr_t{0x1000}, std::uintptr_t{0x5000}));
         CHECK(unsorted[1] == std::make_pair(std::uintptr_t{0x8000}, std::uintptr_t{0x9000}));
+
+        // Repeated full-space map changes ({0, UINTPTR_MAX}) plus sub-ranges collapse to a single {0, UINTPTR_MAX}.
+        TitleWriteRanges full_space{{0x2000, 0x4000}, {0, UINTPTR_MAX}, {0x8000, 0x9000}, {0, UINTPTR_MAX}};
+        merge_title_writes(full_space);
+        CHECK(full_space.size() == 1);
+        CHECK(full_space[0] == std::make_pair(std::uintptr_t{0}, UINTPTR_MAX));
     }
 
     // 2. title_write_overlaps: empty, degenerate query, single-range fast path, envelope reject, multi-range boundaries.

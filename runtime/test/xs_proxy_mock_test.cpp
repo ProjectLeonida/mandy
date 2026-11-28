@@ -4057,7 +4057,6 @@ int check_list_values() {
     EXPECT(device);
     mock->zero_fences = true;  // the gate and write fences start at 0: nothing is reached before the test says so
     xs::reset_list_value_stats();
-    xs::set_list_value_wait_timeout_ms(5000);
     void* qa = make_queue(device);
     void* qb = make_queue(device);
     EXPECT(qa && qb);
@@ -4121,7 +4120,7 @@ int check_list_values() {
     fence_signal(a_written, 2);
     EXPECT(xs::list_values_idle(2000) && cell(3) == 5 && fence_completed(b_gate) == 1);
     stats = xs::list_value_stats();
-    EXPECT(stats.waits_recorded == 1 && stats.gates_held == 1 && stats.gates_met == 1 && stats.gates_timed_out == 0);
+    EXPECT(stats.waits_recorded == 1 && stats.gates_held == 1 && stats.gates_met == 1 && stats.gates_released == 0);
 
     // 3. A wait a write in flight will meet is relayed: the waiter's queue waits on the writer's fence value.
     EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
@@ -4143,22 +4142,26 @@ int check_list_values() {
     EXPECT(xs::list_values_idle(2000) && cell(4) == 9);
 
     // 4. A met wait costs nothing (a 32-bit one ignores the high half of memory); an unmet one that nothing meets
-    // is bounded: the gate opens after the timeout.
+    // is held, past the old 200 ms timeout, until the title presents: a present queued behind it with nothing else
+    // able to run releases it, counted and logged with the reason.
     g_cells[5] = 0xffffffff00000077ull;
-    xs::set_list_value_wait_timeout_ms(30);
     EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
     raw(lv, 73, word(&g_cells[5]), 3, 0x77, 1);  // wait32(address, ==, 0x77): met now
     raw(lv, 73, word(&g_cells[6]), 3, 0x77, 1);  // never written
     raw(lv, 14, 1, 1, 1);
     EXPECT(hr_of(raw(lv, 9)) == S_OK);
     g_queue_call_count = 0;
-    const ULONGLONG started = GetTickCount64();
     EXPECT(submit(qb, lv) == 0);
     EXPECT(g_queue_call_count == 2 && queue_call_is(0, qb_mock, 15, word(b_gate), 2));
-    EXPECT(xs::list_values_idle(3000) && fence_completed(b_gate) == 2 && GetTickCount64() - started >= 20);
+    EXPECT(!xs::list_values_idle(400) && fence_completed(b_gate) == 1);  // held: no timeout
     stats = xs::list_value_stats();
-    EXPECT(stats.gates_timed_out == 1 && stats.waits_met_at_submit >= 1);
-    xs::set_list_value_wait_timeout_ms(5000);
+    EXPECT(stats.gates_released == 0 && stats.waits_met_at_submit >= 1);
+    const ULONGLONG presented = GetTickCount64();
+    xs::note_list_value_present();
+    EXPECT(xs::list_values_idle(3000) && fence_completed(b_gate) == 2 && GetTickCount64() - presented < 1000);
+    stats = xs::list_value_stats();
+    EXPECT(stats.gates_released == 1 && stats.released_present == 1 && stats.released_cycle == 0 &&
+           stats.released_stalled == 0 && stats.met_after_release == 0);
 
     // 5. Memory the title's CPU writes opens a gate too (the pump looks at it while a gate is held).
     EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
@@ -4229,7 +4232,7 @@ int check_list_values() {
 
     // 8. Writes before a part's first wait (no work yet) land before the queue stands at it, without a cut: the
     // title's direct lists write job tags as their first calls and then wait for compute results whose lists wait
-    // for those tags; a gate ahead of the writes would hold both queues until the timeout.
+    // for those tags; a gate ahead of the writes would hold both queues until nothing else could run.
     EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
     raw(lw, 72, word(&g_cells[3]), 0x55, 0, 0);  // write64 first
     raw(lw, 74, word(&g_cells[7]), 7, 2, 1);     // then a wait (memory holds 1)
@@ -4272,13 +4275,14 @@ int check_list_values() {
     EXPECT(a_gate->refs == 0 && a_written->refs == 0 && b_gate->refs == 0 && b_written->refs == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: list memory writes land after their part, waits hold their part behind a gate (relayed onto a "
-                "write in flight, bounded by a timeout), and a wait after work cuts the list with its state replayed\n",
+                "write in flight, released unmet only when nothing else can run), and a wait after work cuts the list "
+                "with its state replayed\n",
                 g_label);
     return 0;
 }
 
 // ---- 15. List values, the rest: LEONIDA_LIST_VALUES=0, bundles, ClearState, root constants, landing order across
-// queues, the short timeout for every wait, CopyPageMappingsBatchX behind held work, value stores, the exit ----
+// queues, holding and releasing waits, CopyPageMappingsBatchX behind held work, value stores, the exit ----
 
 alignas(64) std::uint64_t g_cells2[32];
 
@@ -4304,6 +4308,12 @@ std::uint64_t logged_signal(const Mock* queue, const Mock* fence) {
         if (g_queue_calls[i].queue == queue && g_queue_calls[i].slot == 14 && g_queue_calls[i].a1 == word(fence))
             return g_queue_calls[i].a2;
     return 0;
+}
+
+// The write fence whose Signals the test says the layer holds (section 5c, 11c): not running work.
+Mock* g_held_fence = nullptr;
+bool held_fence_hook(ID3D12Fence* fence, std::uint64_t) {
+    return reinterpret_cast<Mock*>(fence) != g_held_fence;
 }
 
 DWORD WINAPI tear_reader(LPVOID) {
@@ -4350,7 +4360,6 @@ int check_list_values_more() {
     EXPECT(device);
     mock->zero_fences = true;
     xs::reset_list_value_stats();
-    xs::set_list_value_wait_timeout_ms(5000);
     void* qa = make_queue(device);
     void* qb = make_queue(device);
     void* qc = make_queue(device);
@@ -4472,11 +4481,9 @@ int check_list_values_more() {
     EXPECT(xs::list_values_idle(2000) && fence_completed(a_written) == 1);
     EXPECT(cell2(2) == 2 && cell2(3) == 0xA);
 
-    // 5. Four gates in a row that time out give the short timeout to every wait whose address was never met (a new
-    // address each time here, so none times out three times on its own). A wait cut short and met in the rest of the
-    // full timeout keeps the full timeout for its address only; a gate cut short and met within its short timeout
-    // gives every wait the full timeout again.
-    xs::set_list_value_wait_timeout_ms(100);
+    // 5. A wait is held until its value is in memory, with no timeout (before: let go after 200 ms), while work that
+    // does not depend on it goes on; it goes without its value only when nothing else can make progress: in a cycle
+    // at once, and, with nothing writing it, when the title stops calling (here: no present).
     xs::reset_list_value_stats();
     const auto hold_on = [&](void* queue, int index, std::uint64_t reference) -> bool {
         if (FAILED(hr_of(raw(lb, 139, word(allocator), 0)))) return false;
@@ -4492,45 +4499,72 @@ int check_list_values_more() {
     const auto set_cell = [](int index, std::uint64_t value) {
         InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cells2[index]), static_cast<LONG64>(value));
     };
-    for (int i = 0; i < 4; ++i) EXPECT(hold(4 + i) && xs::list_values_idle(3000));
-    stats = xs::list_value_stats();
-    EXPECT(stats.gates_held == 4 && stats.gates_timed_out == 4 && stats.demotions == 1 && stats.gates_short == 0);
+    // One list on queue A writing `value` to a cell; the value of A's write fence it lands at.
+    const auto write_on_a = [&](int index, std::uint64_t value, std::uint64_t& signal_value) -> bool {
+        if (FAILED(hr_of(raw(direct, 139, word(allocator), 0)))) return false;
+        raw(direct, 14, 1, 1, 1);  // Dispatch
+        raw(direct, 72, word(&g_cells2[index]), value, 0, 0);  // write64
+        if (FAILED(hr_of(raw(direct, 9)))) return false;
+        g_queue_call_count = 0;
+        if (submit(qa, direct) != 0) return false;
+        signal_value = logged_signal(qa_mock, a_written);
+        return signal_value != 0;
+    };
+    // 5a. The writer comes 300 ms after the wait, later than the old timeout: the gate opens only once the write has
+    //     landed (the waiting list runs after the write), and is counted met.
+    // 5b. Meanwhile queue A's work that the wait does not concern lands at once.
     Clock::time_point started = Clock::now();
-    EXPECT(hold(8) && xs::list_values_idle(3000) && ms_since(started) < 60);  // a new address: cut short
+    const std::uint64_t b_gate_before = fence_completed(b_gate);
+    EXPECT(hold_on(qb, 4, 1));
+    Sleep(300);
+    EXPECT(fence_completed(b_gate) == b_gate_before && cell2(4) == 0);
+    std::uint64_t unrelated = 0;
+    EXPECT(write_on_a(5, 7, unrelated));
+    fence_signal(a_written, unrelated);
+    for (int i = 0; i < 2000 && cell2(5) != 7; ++i) Sleep(1);
+    EXPECT(cell2(5) == 7 && fence_completed(b_gate) == b_gate_before);  // A's write landed, B still held
+    std::uint64_t producer = 0;
+    EXPECT(write_on_a(4, 1, producer));
+    Sleep(50);
+    EXPECT(fence_completed(b_gate) == b_gate_before && cell2(4) == 0);  // written on the GPU only once A ran
+    fence_signal(a_written, producer);
+    EXPECT(xs::list_values_idle(3000) && cell2(4) == 1 && fence_completed(b_gate) == b_gate_before + 1);
     stats = xs::list_value_stats();
-    EXPECT(stats.gates_short == 1 && stats.gates_timed_out == 5 && stats.late_met == 0);
-    set_cell(8, 1);  // late, within the full timeout
-    for (int i = 0; i < 2000 && xs::list_value_stats().late_met == 0; ++i) Sleep(1);
-    EXPECT(xs::list_value_stats().late_met == 1);
+    EXPECT(stats.gates_held == 1 && stats.gates_met == 1 && stats.gates_released == 0 && ms_since(started) >= 300);
+    // 5c. A queue stands at a wait that its own later list writes, a list the layer holds behind that wait (the hook
+    //     says its Signal never reached the GPU): a cycle, released at once, without a present.
+    g_held_fence = b_written;
+    xs::set_list_value_signal_submitted_hook(&held_fence_hook);
+    EXPECT(hold_on(qb, 6, 1));
+    EXPECT(hr_of(raw(lb, 139, word(allocator), 0)) == S_OK);
+    raw(lb, 14, 1, 1, 1);
+    raw(lb, 72, word(&g_cells2[6]), 1, 0, 0);
+    EXPECT(hr_of(raw(lb, 9)) == S_OK);
+    g_queue_call_count = 0;
     started = Clock::now();
-    EXPECT(hold(9) && xs::list_values_idle(3000) && ms_since(started) < 60);  // still demoted for a new address
+    EXPECT(submit(qb, lb) == 0);
+    const std::uint64_t own_write = logged_signal(qb_mock, b_written);
+    EXPECT(own_write != 0);
+    for (int i = 0; i < 2000 && xs::list_value_stats().released_cycle == 0; ++i) Sleep(1);
+    EXPECT(xs::list_value_stats().released_cycle == 1 && ms_since(started) < 1000);
+    EXPECT(fence_completed(b_gate) == b_gate_before + 2 && cell2(6) == 0);
+    xs::set_list_value_signal_submitted_hook(nullptr);
+    g_held_fence = nullptr;
+    fence_signal(b_written, own_write);  // the held list ran: its write lands, and the release is seen met later
+    EXPECT(xs::list_values_idle(3000) && cell2(6) == 1);
+    for (int i = 0; i < 2000 && xs::list_value_stats().met_after_release == 0; ++i) Sleep(1);
+    EXPECT(xs::list_value_stats().met_after_release == 1);
+    // 5d. Nothing writes the value, nothing else runs, and the title presents nothing: held while the title calls; it
+    //     goes once the title has made no queue call for the stall period (its threads wait for the held work).
+    started = Clock::now();
+    EXPECT(hold(7));
+    Sleep(300);
+    EXPECT(fence_completed(b_gate) == b_gate_before + 2 && xs::list_value_stats().released_stalled == 0);
+    for (int i = 0; i < 5000 && xs::list_value_stats().released_stalled == 0; ++i) Sleep(1);
     stats = xs::list_value_stats();
-    EXPECT(stats.gates_short == 2 && stats.gates_timed_out == 6 && stats.demotions == 1);
-    // Cell 8 was met before: it keeps the full timeout (met here after 30 ms, within it), and the demotion stays.
-    EXPECT(hold_on(qb, 8, 2) && !xs::list_values_idle(30));
-    set_cell(8, 2);
-    EXPECT(xs::list_values_idle(3000));
-    stats = xs::list_value_stats();
-    EXPECT(stats.gates_short == 2 && stats.gates_met == 1 && stats.gates_timed_out == 6);
-    started = Clock::now();
-    EXPECT(hold(10) && xs::list_values_idle(3000) && ms_since(started) < 60);
-    EXPECT(xs::list_value_stats().gates_short == 3);
-    // A gate cut short and met within its short timeout lifts the demotion (the write follows the submission at
-    // once; a slow machine may need another try).
-    bool lifted = false;
-    for (int i = 0; i < 3 && !lifted; ++i) {
-        const std::uint64_t met_before = xs::list_value_stats().gates_met;
-        EXPECT(hold(11 + i));
-        set_cell(11 + i, 1);
-        EXPECT(xs::list_values_idle(3000));
-        lifted = xs::list_value_stats().gates_met == met_before + 1;
-    }
-    EXPECT(lifted);
-    const std::uint64_t short_before = xs::list_value_stats().gates_short;
-    started = Clock::now();
-    EXPECT(hold(14) && !xs::list_values_idle(40));  // a new address, the full timeout again
-    EXPECT(xs::list_values_idle(3000) && ms_since(started) >= 90);
-    EXPECT(xs::list_value_stats().gates_short == short_before && xs::list_value_stats().demotions == 1);
+    EXPECT(stats.released_stalled == 1 && stats.released_present == 0 && stats.gates_released == 2 &&
+           ms_since(started) >= 1900);
+    EXPECT(xs::list_values_idle(3000) && fence_completed(b_gate) == b_gate_before + 3);
 
     // 6. CopyPageMappingsBatchX behind work the queue has not done: the call returns, and the remap (of a copy of
     // the batches) runs once the queue gets there, before the gate its later work waits on opens. With the earlier
@@ -4550,16 +4584,16 @@ int check_list_values_more() {
     EXPECT(g_queue_call_count == 2 && queue_call_is(0, qc_mock, 14, word(c_written), 1) &&
            queue_call_is(1, qc_mock, 15, word(c_gate), 1));
     EXPECT(!xs::list_values_idle(30) && fence_completed(c_gate) == 0 && g_page_mapping.count == 0);
-    // A memory wait behind the remap on the same queue: its time starts when the remap's gate opens, not at its
-    // submission (held 150 ms behind the remap, it does not open at once then).
-    const std::uint64_t timed_out_before = xs::list_value_stats().gates_timed_out;
+    // A memory wait behind the remap on the same queue: held behind it, and after it until memory meets it.
+    const std::uint64_t released_before = xs::list_value_stats().gates_released;
     EXPECT(hold_on(qc, 15, 1));
     Sleep(150);
-    EXPECT(fence_completed(c_gate) == 0 && xs::list_value_stats().gates_timed_out == timed_out_before);
+    EXPECT(fence_completed(c_gate) == 0 && xs::list_value_stats().gates_released == released_before);
     fence_signal(c_written, 1);
     EXPECT(!xs::list_values_idle(40) && fence_completed(c_gate) == 1);
+    set_cell(15, 1);
     EXPECT(xs::list_values_idle(3000) && fence_completed(c_gate) == 2);
-    EXPECT(xs::list_value_stats().gates_timed_out == timed_out_before + 1);
+    EXPECT(xs::list_value_stats().gates_released == released_before);
     EXPECT(g_page_mapping.count == 1 && g_page_mapping.batches != remap && g_page_mapping.pool == 0x7000000000 &&
            g_page_mapping.pages == 16 && g_page_mapping.first_destination == 0x9000000000 &&
            g_page_mapping.first_count == 2 && g_page_mapping.first_ranges[0].start == 4 &&
@@ -4575,7 +4609,6 @@ int check_list_values_more() {
     EXPECT(stats.remaps_deferred == 1 && stats.remaps_now == 1);
     qc_mock->signals_complete = false;
     xs::set_copy_page_mappings_hook(nullptr);
-    xs::set_list_value_wait_timeout_ms(5000);
 
     // 7. Value stores: an aligned 4- or 8-byte value in one locked access (a reader polling it never sees half of
     // each), an unaligned one byte by byte, memory that cannot be written reported, not raised.
@@ -4603,7 +4636,6 @@ int check_list_values_more() {
     // begin/end pair is the GPU work's, not one landing time), flag 2 as the QPC value the queue's clock calibration
     // gives. A pre-write that lands before its part ran (the gate is held) takes the CPU's clock instead.
     xs::reset_list_value_stats();
-    xs::set_list_value_wait_timeout_ms(5000);
     EXPECT(hr_of(raw(direct, 139, word(allocator), 0)) == S_OK);
     const unsigned end_queries = direct_real->calls[53], resolves = direct_real->calls[54];
     raw(direct, 72, word(&g_cells2[20]), 0, 0, 1);  // begin
@@ -4654,7 +4686,7 @@ int check_list_values_more() {
     EXPECT(xs::list_values_idle(3000));
 
     // 10. A GPU wait for a label a CPU job of the title's writes later never blocks the submitting thread: the
-    // submission returns at once with the gate held (with a 5 s timeout), a submission behind it on the same queue
+    // submission returns at once with the gate held, a submission behind it on the same queue
     // returns at once too, and the CPU job's write (on another thread, 100 ms later) opens the gate.
     const std::uint64_t met_before = xs::list_value_stats().gates_met;
     started = Clock::now();
@@ -4668,37 +4700,26 @@ int check_list_values_more() {
     WaitForSingleObject(job, INFINITE);
     CloseHandle(job);
 
-    // 11. Work-aware timeout in Pump (src/list_value_wait_budget.h):
-    //   a) a matching in-flight producer pauses a held memory gate past the idle timeout until the producer lands;
-    //   b) a busy releaser executing an action gate pauses a concurrent memory gate past the idle timeout;
-    //   c) a demoted gate (4 ms budget) scales its pause caps with its short budget so unrelated active work does not
-    //      hold it for the full timeout's cap;
-    //   d) a matching producer stuck behind an unsignalled fence still hits a finite pause cap instead of hanging.
-    const auto write_on_a = [&](int index, std::uint64_t value, std::uint64_t& signal_value) -> bool {
-        if (FAILED(hr_of(raw(direct, 139, word(allocator), 0)))) return false;
-        raw(direct, 14, 1, 1, 1);  // Dispatch
-        raw(direct, 72, word(&g_cells2[index]), value, 0, 0);  // write64
-        if (FAILED(hr_of(raw(direct, 9)))) return false;
-        g_queue_call_count = 0;
-        if (submit(qa, direct) != 0) return false;
-        signal_value = logged_signal(qa_mock, a_written);
-        return signal_value != 0;
-    };
-    xs::set_list_value_wait_timeout_ms(40);
+    // 11. What counts as progress (src/list_value_progress.h):
+    //   a) a matching write in flight on the GPU keeps a held gate shut, even past a present, until it lands;
+    //   b) a releaser running held work (an action gate's remap) keeps a concurrent memory gate shut;
+    //   c) a writer the layer holds (its Signal never reached the GPU, behind a relayed wait or a title fence) is not
+    //      progress: at a present the gate goes, and the write still lands later.
     xs::reset_list_value_stats();
-    // 11a. Wait on qb before qa submits its matching write (so relay() misses it and Pump holds a gate).
+    // 11a. Wait on qb before qa submits its matching write (so relay() misses it and the pump holds a gate).
     EXPECT(hold_on(qb, 27, 1));
     std::uint64_t producer_sig = 0;
     EXPECT(write_on_a(27, 1, producer_sig));
-    EXPECT(!xs::list_values_idle(150));  // >3x the 40 ms idle timeout: pauses while producer is in flight
+    xs::note_list_value_present();
+    EXPECT(!xs::list_values_idle(300));  // the producer runs: neither the present nor the time releases the gate
     stats = xs::list_value_stats();
-    EXPECT(stats.gates_timed_out == 0 && stats.gates_met == 0 && cell2(27) == 0);
+    EXPECT(stats.gates_released == 0 && stats.gates_met == 0 && cell2(27) == 0);
     fence_signal(a_written, producer_sig);
     EXPECT(xs::list_values_idle(3000) && cell2(27) == 1);
     stats = xs::list_value_stats();
-    EXPECT(stats.gates_met == 1 && stats.gates_timed_out == 0);
+    EXPECT(stats.gates_met == 1 && stats.gates_released == 0);
 
-    // 11b. Releaser inside a 150 ms action gate pauses a concurrent memory gate past the 40 ms idle timeout.
+    // 11b. Releaser inside a 150 ms action gate: a concurrent memory gate stays shut, met once the action wrote.
     xs::set_copy_page_mappings_hook([](std::uint32_t, const rt::xmem::PageBatch*, std::uintptr_t, std::uint32_t,
                                        std::uint32_t) -> bool {
         Sleep(150);
@@ -4710,47 +4731,41 @@ int check_list_values_more() {
     const std::uint64_t action_sig = logged_signal(qc_mock, c_written);
     EXPECT(action_sig != 0);
     const std::uint64_t met_before_rel = xs::list_value_stats().gates_met;
-    const std::uint64_t to_before_rel = xs::list_value_stats().gates_timed_out;
     EXPECT(hold_on(qb, 28, 1));
+    xs::note_list_value_present();
     fence_signal(c_written, action_sig);
     EXPECT(xs::list_values_idle(3000) && cell2(28) == 1);
     xs::set_copy_page_mappings_hook(nullptr);
     stats = xs::list_value_stats();
-    EXPECT(stats.gates_met == met_before_rel + 1 && stats.gates_timed_out == to_before_rel);
+    EXPECT(stats.gates_met == met_before_rel + 1 && stats.gates_released == 0);
 
-    // 11c. Demoted gate (3 timeouts -> 4 ms budget) with unrelated in-flight work on qa times out in a few ms, not
-    // the 12 s active-work cap of the 40 ms full timeout.
-    for (int i = 0; i < 3; ++i) EXPECT(hold_on(qb, 29, 1) && xs::list_values_idle(3000));
-    std::uint64_t unrelated_sig = 0;
-    EXPECT(write_on_a(30, 1, unrelated_sig));
-    const std::uint64_t short_before_dem = xs::list_value_stats().gates_short;
-    const std::uint64_t to_before_dem = xs::list_value_stats().gates_timed_out;
-    started = Clock::now();
-    EXPECT(hold_on(qb, 29, 1));
-    for (int i = 0; i < 1000 && xs::list_value_stats().gates_timed_out == to_before_dem; ++i) Sleep(1);
-    const auto demoted_active_ms = ms_since(started);
-    EXPECT(xs::list_value_stats().gates_timed_out == to_before_dem + 1 &&
-           xs::list_value_stats().gates_short == short_before_dem + 1 && demoted_active_ms < 500);
-    fence_signal(a_written, unrelated_sig);
-    EXPECT(xs::list_values_idle(3000));
-
-    // 11d. Stuck matching producer (fence never signals) still hits the finite max pause cap instead of hanging.
-    const std::uint64_t to_before_stuck = xs::list_value_stats().gates_timed_out;
-    started = Clock::now();
+    // 11c. The writer is held in the layer: a present releases the gate (a root: nothing that runs can meet it).
     EXPECT(hold_on(qb, 29, 1));
     std::uint64_t stuck_sig = 0;
+    g_held_fence = a_written;
+    xs::set_list_value_signal_submitted_hook(&held_fence_hook);
     EXPECT(write_on_a(29, 1, stuck_sig));
-    for (int i = 0; i < 1000 && xs::list_value_stats().gates_timed_out == to_before_stuck; ++i) Sleep(1);
-    const auto stuck_producer_ms = ms_since(started);
-    EXPECT(xs::list_value_stats().gates_timed_out == to_before_stuck + 1 && stuck_producer_ms < 500);
+    EXPECT(!xs::list_values_idle(100) && xs::list_value_stats().gates_released == 0);  // no present yet
+    started = Clock::now();
+    xs::note_list_value_present();
+    for (int i = 0; i < 2000 && xs::list_value_stats().released_present == 0; ++i) Sleep(1);
+    EXPECT(xs::list_value_stats().released_present == 1 && ms_since(started) < 1000);
+    xs::set_list_value_signal_submitted_hook(nullptr);
+    g_held_fence = nullptr;
     fence_signal(a_written, stuck_sig);
-    EXPECT(xs::list_values_idle(3000));
-    xs::set_list_value_wait_timeout_ms(5000);
+    EXPECT(xs::list_values_idle(3000) && cell2(29) == 1);
 
     // 8. stop() ends both threads. Afterwards nothing new is landed or opened (the process is ending: a gate
     // signalled from another thread could open one whose remap was skipped, or go below one still to come), and
-    // CopyPageMappingsBatchX remaps at the call rather than wait for a queue whose gates stay shut.
+    // CopyPageMappingsBatchX remaps at the call rather than wait for a queue whose gates stay shut. A gate held at the
+    // time (nothing writes it) does not keep stop() waiting, and stays shut.
+    const std::uint64_t held_at_stop = fence_completed(b_gate);
+    EXPECT(hold(17) && !xs::list_values_idle(50));
+    started = Clock::now();
     xs::stop_list_values(2000);
+    EXPECT(ms_since(started) < 1000);
+    Sleep(20);
+    EXPECT(fence_completed(b_gate) == held_at_stop);
     const std::uint64_t gates_before = fence_completed(b_gate);
     EXPECT(hold(16));
     Sleep(20);
@@ -4773,11 +4788,12 @@ int check_list_values_more() {
            c_gate->refs == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: with LEONIDA_LIST_VALUES=0 and on bundles writes and waits are no-ops, a bundle's and "
-                "ClearState's state carry over a cut, writes land in submission order across queues, timeouts in a "
-                "row shorten the waits for addresses never met until one cut short is met, a gate's time starts at "
-                "its queue's head, a page remap behind held work is deferred, value stores do not tear, and nothing "
-                "is opened after stop(); timestamp writes land the GPU's timestamps, and a wait for a label a CPU job "
-                "writes later never blocks the submitting thread\n",
+                "ClearState's state carry over a cut, writes land in submission order across queues, a wait is held "
+                "until its write lands however late while other queues' writes land, a cycle and a wait nothing "
+                "writes are released only when nothing else can run (at once, at a present, when the title stops "
+                "calling), a page remap behind held work is deferred, value stores do not tear, and nothing "
+                "is opened after stop(), which a held gate does not delay; timestamp writes land the GPU's "
+                "timestamps, and a wait for a label a CPU job writes later never blocks the submitting thread\n",
                 g_label);
     return 0;
 }

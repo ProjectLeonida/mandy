@@ -1,0 +1,832 @@
+// GPU detile & linear mirror direct-copy bit-for-bit parity test (src/vulkan_title_detile.h).
+//
+// Verifies bit-for-bit parity between leonida::TitleDetilePipeline (GPU compute detile & direct linear copy into a
+// real optimal-tiling VkImage, read back via vkCmdCopyImageToBuffer) and the CPU console texture detiler
+// (leonida::console_texture::Layout, matching rt::xg_xs::copy_elements<false> bit-for-bit) across:
+//   - BC1, BC3, BC4, BC5, BC7, R8, RG8, RGBA8, R16F, RG16F, RGBA16F, R32F, RGBA32F
+//   - Swizzle modes: 4KB_S, 64KB_S, 64KB_D, and Linear direct copy
+//   - Full mip chains (exercising both macro-tiled mips and mip-tail mips), array slices, odd/NPOT extents, and
+//     non-zero TitleMirror chunk offsets.
+// Skips with exit code 77 when no Vulkan 1.2/1.3 device with textureCompressionBC is available. No game data.
+
+#include "vk_test_device.h"
+#include "../src/console_texture_layout.h"
+#include "../src/vulkan_title_detile.h"
+#include "../src/vulkan_title_image_pool.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+#define EXPECT(cond)                                                                         \
+    do {                                                                                     \
+        if (!(cond)) {                                                                       \
+            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);             \
+            return 1;                                                                        \
+        }                                                                                    \
+    } while (0)
+
+namespace {
+
+struct Buffer {
+    VkDevice device = VK_NULL_HANDLE;
+    PFN_vkDestroyBuffer destroy = nullptr;
+    PFN_vkFreeMemory free_mem = nullptr;
+    VkBuffer handle = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    std::uint8_t* mapped = nullptr;
+    VkDeviceSize size = 0;
+
+    ~Buffer() {
+        if (handle && destroy) destroy(device, handle, nullptr);
+        if (memory && free_mem) free_mem(device, memory, nullptr);
+    }
+    Buffer() = default;
+    Buffer(const Buffer&) = delete;
+    Buffer& operator=(const Buffer&) = delete;
+};
+
+struct Image {
+    VkDevice device = VK_NULL_HANDLE;
+    PFN_vkDestroyImage destroy = nullptr;
+    PFN_vkFreeMemory free_mem = nullptr;
+    VkImage handle = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+
+    ~Image() {
+        if (handle && destroy) destroy(device, handle, nullptr);
+        if (memory && free_mem) free_mem(device, memory, nullptr);
+    }
+    Image() = default;
+    Image(const Image&) = delete;
+    Image& operator=(const Image&) = delete;
+};
+
+VkDeviceMemory alloc_memory(const vktest::Device& d, const VkMemoryRequirements& req,
+                            VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred) {
+    VkPhysicalDeviceMemoryProperties mp{};
+    d.instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(d.physical, &mp);
+    std::uint32_t chosen = UINT32_MAX;
+    for (std::uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        if (!(req.memoryTypeBits & (1u << i))) continue;
+        const auto flags = mp.memoryTypes[i].propertyFlags;
+        if ((flags & required) != required) continue;
+        if (chosen == UINT32_MAX) chosen = i;
+        if ((flags & preferred) == preferred) {
+            chosen = i;
+            break;
+        }
+    }
+    if (chosen == UINT32_MAX) return VK_NULL_HANDLE;
+    VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    info.allocationSize = req.size;
+    info.memoryTypeIndex = chosen;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (d.fn<PFN_vkAllocateMemory>("vkAllocateMemory")(d.device, &info, nullptr, &mem) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    return mem;
+}
+
+bool make_host_buffer(const vktest::Device& d, VkDeviceSize size, VkBufferUsageFlags usage, Buffer& out) {
+    out.device = d.device;
+    out.destroy = d.fn<PFN_vkDestroyBuffer>("vkDestroyBuffer");
+    out.free_mem = d.fn<PFN_vkFreeMemory>("vkFreeMemory");
+    out.size = size;
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = size;
+    info.usage = usage;
+    if (d.fn<PFN_vkCreateBuffer>("vkCreateBuffer")(d.device, &info, nullptr, &out.handle) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{};
+    d.fn<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(d.device, out.handle, &req);
+    out.memory = alloc_memory(d, req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                              VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (!out.memory) return false;
+    if (d.fn<PFN_vkBindBufferMemory>("vkBindBufferMemory")(d.device, out.handle, out.memory, 0) != VK_SUCCESS)
+        return false;
+    void* ptr = nullptr;
+    if (d.fn<PFN_vkMapMemory>("vkMapMemory")(d.device, out.memory, 0, VK_WHOLE_SIZE, 0, &ptr) != VK_SUCCESS)
+        return false;
+    out.mapped = static_cast<std::uint8_t*>(ptr);
+    return true;
+}
+
+bool make_image(const vktest::Device& d, VkFormat format, std::uint32_t width, std::uint32_t height,
+                std::uint32_t mips, std::uint32_t layers, Image& out) {
+    out.device = d.device;
+    out.destroy = d.fn<PFN_vkDestroyImage>("vkDestroyImage");
+    out.free_mem = d.fn<PFN_vkFreeMemory>("vkFreeMemory");
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = format;
+    info.extent = {width, height, 1};
+    info.mipLevels = mips;
+    info.arrayLayers = layers;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (d.fn<PFN_vkCreateImage>("vkCreateImage")(d.device, &info, nullptr, &out.handle) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{};
+    d.fn<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(d.device, out.handle, &req);
+    out.memory = alloc_memory(d, req, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (!out.memory) return false;
+    return d.fn<PFN_vkBindImageMemory>("vkBindImageMemory")(d.device, out.handle, out.memory, 0) == VK_SUCCESS;
+}
+
+leonida::TitleDetileDesc to_detile_desc(const leonida::console_texture::Layout& layout) {
+    leonida::TitleDetileDesc out{};
+    switch (layout.desc.swizzle) {
+    case leonida::console_texture::kLinear: out.mode = leonida::TitleDetileMode::linear; break;
+    case leonida::console_texture::kSw4kbS: out.mode = leonida::TitleDetileMode::sw_4kb_s; break;
+    case leonida::console_texture::kSw64kbS: out.mode = leonida::TitleDetileMode::sw_64kb_s; break;
+    case leonida::console_texture::kSw64kbD: out.mode = leonida::TitleDetileMode::sw_64kb_d; break;
+    default: break;
+    }
+    out.dimension = 3;  // 2D
+    out.element_bytes = layout.desc.element_bytes;
+    out.block_side = layout.desc.block;
+    out.tile_width = layout.block[0];
+    out.tile_height = layout.block[1];
+    out.array_layers = layout.slices;
+    out.total_size = layout.size;
+    out.slice_bytes = layout.slice_size;
+    out.mips.resize(layout.mips.size());
+    for (std::size_t i = 0; i < layout.mips.size(); ++i) {
+        const auto& m = layout.mips[i];
+        auto& dst = out.mips[i];
+        dst.offset = m.offset;
+        dst.width_elements = m.width;
+        dst.height_elements = m.height;
+        dst.width_texels = std::max(1u, layout.desc.width >> i);
+        dst.height_texels = std::max(1u, layout.desc.height >> i);
+        dst.depth = m.depth;
+        dst.padded_width = m.pitch;
+        dst.padded_height = m.rows;
+        dst.pitch_bytes = m.pitch * layout.desc.element_bytes;
+        dst.pitch_texels = m.pitch * layout.desc.block;
+        dst.in_tail = m.tail.has_value();
+        if (m.tail) {
+            dst.tail_x = m.tail->x;
+            dst.tail_y = m.tail->y;
+        }
+    }
+    return out;
+}
+
+struct FormatCase {
+    const char* name;
+    VkFormat vk_format;
+    std::uint32_t element_bytes;
+    std::uint32_t block_side;
+};
+
+struct ExtentCase {
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t mips;
+    std::uint32_t layers;
+    std::uint32_t swizzle;
+    VkDeviceSize src_offset;
+};
+
+int run_case(vktest::Device& d, leonida::TitleDetilePipeline& pipe, const FormatCase& fmt, const ExtentCase& ec,
+             std::uint64_t& serial) {
+    namespace ct = leonida::console_texture;
+    ct::Desc cd{};
+    cd.dimension = ct::Dimension::tex2d;
+    cd.width = ec.width;
+    cd.height = ec.height;
+    cd.depth = ec.layers;
+    cd.mips = ec.mips;
+    cd.element_bytes = fmt.element_bytes;
+    cd.block = fmt.block_side;
+    cd.samples = 1;
+    cd.swizzle = ec.swizzle;
+    const auto layout_opt = ct::Layout::make(cd);
+    EXPECT(layout_opt.has_value());
+    const ct::Layout& layout = *layout_opt;
+    const auto desc = to_detile_desc(layout);
+
+    // 1. Fill simulated TitleMirror chunk buffer with deterministic non-repeating bytes at ec.src_offset.
+    const VkDeviceSize chunk_size = ec.src_offset + layout.size + 4096;
+    Buffer mirror_chunk;
+    EXPECT(make_host_buffer(d, chunk_size,
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, mirror_chunk));
+    std::memset(mirror_chunk.mapped, 0xCC, std::size_t(chunk_size));
+    std::uint8_t* const tiled_ptr = mirror_chunk.mapped + ec.src_offset;
+    std::uint64_t seed = 0x9e3779b97f4a7c15ull ^ (serial * 0xbf58476d1ce4e5b9ull) ^ (std::uint64_t(ec.width) << 16) ^
+                         ec.height ^ (std::uint64_t(ec.swizzle) << 32) ^ (std::uint64_t(fmt.element_bytes) << 40);
+    for (std::size_t i = 0; i < layout.size; ++i) {
+        seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+        tiled_ptr[i] = static_cast<std::uint8_t>(seed >> 56);
+    }
+
+    // 2. Compute CPU ground truth for every (layer, mip) via console_texture::Layout::detile().
+    std::vector<std::vector<std::uint8_t>> cpu_truth;
+    cpu_truth.reserve(std::size_t(ec.layers) * ec.mips);
+    std::vector<VkBufferImageCopy> readback_regions;
+    VkDeviceSize readback_bytes = 0;
+    const VkDeviceSize rb_align = std::max<VkDeviceSize>(4u, fmt.element_bytes) * 4u;
+    for (std::uint32_t layer = 0; layer < ec.layers; ++layer) {
+        for (std::uint32_t mip = 0; mip < ec.mips; ++mip) {
+            const auto& m = layout.mips[mip];
+            const std::size_t row_bytes = std::size_t(m.width) * fmt.element_bytes;
+            const std::size_t slice_bytes = row_bytes * m.height;
+            std::vector<std::uint8_t> linear(slice_bytes, 0xA5);
+            EXPECT(layout.detile(tiled_ptr, std::size_t(layout.size), mip, layer, linear.data(), linear.size(),
+                                 row_bytes, slice_bytes) == ct::Error::ok);
+            cpu_truth.push_back(std::move(linear));
+
+            VkBufferImageCopy rb{};
+            rb.bufferOffset = leonida::detail::align_up_size(readback_bytes, rb_align);
+            rb.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1};
+            rb.imageExtent = {std::max(1u, ec.width >> mip), std::max(1u, ec.height >> mip), 1u};
+            readback_regions.push_back(rb);
+            readback_bytes = rb.bufferOffset + slice_bytes;
+        }
+    }
+
+    // 3. Create target optimal-tiling VkImage and host-visible readback buffer.
+    Image image;
+    EXPECT(make_image(d, fmt.vk_format, ec.width, ec.height, ec.mips, ec.layers, image));
+    Buffer readback;
+    EXPECT(make_host_buffer(d, std::max<VkDeviceSize>(readback_bytes, 64), VK_BUFFER_USAGE_TRANSFER_DST_BIT, readback));
+    std::memset(readback.mapped, 0x5A, std::size_t(readback.size));
+
+    // 4. Execute GPU mirror path (direct linear copy OR compute detile -> scratch -> image) + readback.
+    const bool is_linear = ec.swizzle == ct::kLinear;
+    std::vector<VkBufferImageCopy> copy_regions;
+    std::vector<leonida::TitleDetileDispatch> dispatches;
+    leonida::TitleDetilePipeline::ScratchSlot* scratch = nullptr;
+    VkBuffer copy_src = VK_NULL_HANDLE;
+
+    if (is_linear) {
+        EXPECT(leonida::TitleDetilePipeline::can_direct_linear(desc, ec.src_offset, chunk_size, ec.width, ec.height, 1,
+                                                               ec.mips, ec.layers, false));
+        EXPECT(leonida::TitleDetilePipeline::build_linear_regions(desc, ec.src_offset, ec.width, ec.height, 1, false,
+                                                                  copy_regions));
+        copy_src = mirror_chunk.handle;
+    } else {
+        EXPECT(pipe.can_gpu_detile(desc, ec.src_offset, chunk_size, ec.width, ec.height, ec.mips, ec.layers, false));
+        VkDeviceSize scratch_end = 0;
+        EXPECT(leonida::TitleDetilePipeline::build_scratch_regions(desc, 0, ec.width, ec.height, copy_regions,
+                                                                   scratch_end));
+        // Pass serial as `reached` because vktest::Device::run() waits for queue idle after each test case.
+        scratch = pipe.acquire_scratch(serial, scratch_end, 1);
+        EXPECT(scratch != nullptr);
+        EXPECT(pipe.prepare_texture(*scratch, mirror_chunk.handle, ec.src_offset, desc, 0, scratch_end, copy_regions,
+                                    dispatches));
+        copy_src = scratch->buffer;
+    }
+
+    const bool ran = d.run([&](VkCommandBuffer cb) {
+        const auto barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+        const auto copy_b2i = d.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
+        const auto copy_i2b = d.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+
+        // Mirror visibility barrier (HOST_WRITE | TRANSFER_WRITE -> SHADER_READ | TRANSFER_READ).
+        VkMemoryBarrier mem{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mem.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        mem.dstAccessMask =
+            VkAccessFlags(is_linear ? 0u : VK_ACCESS_SHADER_READ_BIT) | VK_ACCESS_TRANSFER_READ_BIT;
+        const VkPipelineStageFlags dst_stage =
+            VkPipelineStageFlags(is_linear ? 0u : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) |
+            VK_PIPELINE_STAGE_TRANSFER_BIT;
+        barrier(cb, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, dst_stage, 0, 1, &mem, 0, nullptr, 0,
+                nullptr);
+
+        VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        to_dst.srcQueueFamilyIndex = to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_dst.image = image.handle;
+        to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, ec.mips, 0, ec.layers};
+        barrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                &to_dst);
+
+        if (!is_linear) {
+            pipe.emit_dispatches(cb, dispatches);
+            VkMemoryBarrier cs_to_xfer{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            cs_to_xfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            cs_to_xfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &cs_to_xfer, 0,
+                    nullptr, 0, nullptr);
+        }
+
+        copy_b2i(cb, copy_src, image.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                 static_cast<std::uint32_t>(copy_regions.size()), copy_regions.data());
+
+        VkImageMemoryBarrier to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        to_src.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        to_src.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        to_src.srcQueueFamilyIndex = to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_src.image = image.handle;
+        to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, ec.mips, 0, ec.layers};
+        barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                &to_src);
+
+        copy_i2b(cb, image.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.handle,
+                 static_cast<std::uint32_t>(readback_regions.size()), readback_regions.data());
+
+        VkMemoryBarrier host_vis{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        host_vis.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        host_vis.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_vis, 0, nullptr, 0,
+                nullptr);
+        return true;
+    });
+    EXPECT(ran);
+    if (scratch) scratch->value = serial;
+    ++serial;
+
+    // 5. Bit-for-bit comparison of every single byte across every layer and mip!
+    for (std::size_t idx = 0; idx < cpu_truth.size(); ++idx) {
+        const auto& expected = cpu_truth[idx];
+        const std::uint8_t* actual = readback.mapped + readback_regions[idx].bufferOffset;
+        if (std::memcmp(actual, expected.data(), expected.size()) != 0) {
+            for (std::size_t b = 0; b < expected.size(); ++b) {
+                if (actual[b] != expected[b]) {
+                    std::fprintf(stderr,
+                                 "MISMATCH fmt=%s swizzle=%u %ux%u mips=%u layers=%u region=%zu byte=%zu: "
+                                 "gpu=0x%02x cpu=0x%02x (in_tail=%d)\n",
+                                 fmt.name, ec.swizzle, ec.width, ec.height, ec.mips, ec.layers, idx, b,
+                                 unsigned(actual[b]), unsigned(expected[b]),
+                                 int(layout.mips[readback_regions[idx].imageSubresource.mipLevel].tail.has_value()));
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+}  // namespace
+
+int main() {
+    vktest::Device d;
+    const auto status = d.initialize();
+    if (status == vktest::DeviceStatus::unavailable) {
+        std::puts("vk_title_detile_test: no Vulkan 1.2/1.3 device available (skipping)");
+        return 77;
+    }
+    EXPECT(status == vktest::DeviceStatus::ready);
+    if (!d.bc) {
+        std::puts("vk_title_detile_test: textureCompressionBC unavailable (skipping)");
+        return 77;
+    }
+
+    VkPhysicalDeviceProperties props{};
+    d.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(d.physical, &props);
+
+    leonida::TitleDetilePipeline pipe(
+        d.device_proc, d.device, props.limits,
+        [&d](const VkMemoryRequirements& req, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred) {
+            return alloc_memory(d, req, required, preferred);
+        });
+
+    const FormatCase formats[] = {
+        {"BC1", VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8, 4},
+        {"BC3", VK_FORMAT_BC3_UNORM_BLOCK, 16, 4},
+        {"BC4", VK_FORMAT_BC4_UNORM_BLOCK, 8, 4},
+        {"BC5", VK_FORMAT_BC5_UNORM_BLOCK, 16, 4},
+        {"BC7", VK_FORMAT_BC7_UNORM_BLOCK, 16, 4},
+        {"R8", VK_FORMAT_R8_UNORM, 1, 1},
+        {"RG8", VK_FORMAT_R8G8_UNORM, 2, 1},
+        {"RGBA8", VK_FORMAT_R8G8B8A8_UNORM, 4, 1},
+        {"R16F", VK_FORMAT_R16_SFLOAT, 2, 1},
+        {"RG16F", VK_FORMAT_R16G16_SFLOAT, 4, 1},
+        {"RGBA16F", VK_FORMAT_R16G16B16A16_SFLOAT, 8, 1},
+        {"R32F", VK_FORMAT_R32_SFLOAT, 4, 1},
+        {"RGBA32F", VK_FORMAT_R32G32B32A32_SFLOAT, 16, 1},
+    };
+
+    namespace ct = leonida::console_texture;
+    const ExtentCase extents[] = {
+        // Multi-mip chains with both macro-tiled mips and mip tails across all 3 swizzle modes:
+        {256, 256, 9, 1, ct::kSw64kbS, 65536},
+        {256, 256, 9, 1, ct::kSw64kbD, 65536},
+        {256, 128, 9, 1, ct::kSw4kbS, 4096},
+        // Odd / non-power-of-two extents with multi-mip chains & mip tails:
+        {127, 95, 7, 1, ct::kSw64kbS, 65536},
+        {73, 51, 6, 1, ct::kSw64kbD, 65536},
+        {37, 29, 5, 1, ct::kSw4kbS, 4096},
+        // Tiny odd extents (tests 1B/2B word packing boundary & partial tail bytes):
+        {13, 7, 1, 1, ct::kSw4kbS, 4096},
+        {3, 5, 1, 1, ct::kSw64kbD, 65536},
+        {1, 1, 1, 1, ct::kSw64kbS, 65536},
+        // Array textures (multiple slices + mips + mip tails):
+        {64, 64, 6, 3, ct::kSw64kbD, 65536},
+        {33, 27, 4, 2, ct::kSw4kbS, 4096},
+        // Linear direct copy (multi-mip, array slices, odd extents, non-zero offset):
+        {128, 64, 5, 2, ct::kLinear, 4096},
+        {37, 29, 4, 1, ct::kLinear, 256},
+        {13, 7, 1, 1, ct::kLinear, 256},
+    };
+
+    std::uint64_t serial = 1;
+    std::uint32_t passed = 0;
+    for (const auto& fmt : formats) {
+        for (const auto& ec : extents) {
+            // Skip odd extents smaller than a 4x4 block for BC formats when mip count would be valid,
+            // Note: console_texture::Layout handles odd BC extents (rounds up to blocks); test all of them!
+            if (run_case(d, pipe, fmt, ec, serial) != 0) return 1;
+            ++passed;
+        }
+    }
+
+    EXPECT(d.validation_errors() == 0);
+
+    // Verify cached PFN_vk* (zero vkGetDeviceProcAddr calls during prepare/flush/emit), batched
+    // vkAllocateDescriptorSets (1 driver call for 4 textures), batched vkUpdateDescriptorSets (1 driver call for 4
+    // textures), oldest_in_flight_scratch_value(), and kMaxScratchSlots==64.
+    {
+        static_assert(leonida::TitleDetilePipeline::kMaxScratchSlots == 64);
+        static PFN_vkGetDeviceProcAddr s_real_gdpa = nullptr;
+        static PFN_vkAllocateDescriptorSets s_real_alloc = nullptr;
+        static PFN_vkUpdateDescriptorSets s_real_update = nullptr;
+        static std::atomic<std::uint64_t> s_gdpa_calls{0};
+        static std::atomic<std::uint64_t> s_alloc_calls{0};
+        static std::atomic<std::uint32_t> s_alloc_sets{0};
+        static std::atomic<std::uint64_t> s_update_calls{0};
+        static std::atomic<std::uint32_t> s_update_writes{0};
+        struct CountingProc {
+            static VKAPI_ATTR VkResult VKAPI_CALL alloc_ds(VkDevice dev, const VkDescriptorSetAllocateInfo* info,
+                                                           VkDescriptorSet* out) {
+                s_alloc_calls.fetch_add(1, std::memory_order_relaxed);
+                if (info) s_alloc_sets.fetch_add(info->descriptorSetCount, std::memory_order_relaxed);
+                return s_real_alloc(dev, info, out);
+            }
+            static VKAPI_ATTR void VKAPI_CALL update_ds(VkDevice dev, std::uint32_t write_count,
+                                                        const VkWriteDescriptorSet* writes, std::uint32_t copy_count,
+                                                        const VkCopyDescriptorSet* copies) {
+                s_update_calls.fetch_add(1, std::memory_order_relaxed);
+                s_update_writes.fetch_add(write_count, std::memory_order_relaxed);
+                s_real_update(dev, write_count, writes, copy_count, copies);
+            }
+            static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get(VkDevice dev, const char* name) {
+                s_gdpa_calls.fetch_add(1, std::memory_order_relaxed);
+                if (name && std::strcmp(name, "vkAllocateDescriptorSets") == 0) {
+                    s_real_alloc = reinterpret_cast<PFN_vkAllocateDescriptorSets>(s_real_gdpa(dev, name));
+                    return reinterpret_cast<PFN_vkVoidFunction>(&alloc_ds);
+                }
+                if (name && std::strcmp(name, "vkUpdateDescriptorSets") == 0) {
+                    s_real_update = reinterpret_cast<PFN_vkUpdateDescriptorSets>(s_real_gdpa(dev, name));
+                    return reinterpret_cast<PFN_vkVoidFunction>(&update_ds);
+                }
+                return s_real_gdpa(dev, name);
+            }
+        };
+        s_real_gdpa = d.device_proc;
+        s_gdpa_calls.store(0, std::memory_order_relaxed);
+        s_alloc_calls.store(0, std::memory_order_relaxed);
+        s_alloc_sets.store(0, std::memory_order_relaxed);
+        s_update_calls.store(0, std::memory_order_relaxed);
+        s_update_writes.store(0, std::memory_order_relaxed);
+
+        leonida::TitleDetilePipeline batch_pipe(
+            &CountingProc::get, d.device, props.limits,
+            [&d](const VkMemoryRequirements& req, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred) {
+                return alloc_memory(d, req, required, preferred);
+            });
+        const std::uint64_t gdpa_after_ctor = s_gdpa_calls.load(std::memory_order_acquire);
+        EXPECT(gdpa_after_ctor > 0);
+
+        namespace ct = leonida::console_texture;
+        constexpr std::size_t kBatchTex = 4;
+        std::vector<Buffer> srcs(kBatchTex);
+        std::vector<Image> imgs(kBatchTex);
+        std::vector<Buffer> rbs(kBatchTex);
+        std::vector<leonida::TitleDetileDesc> descs(kBatchTex);
+        std::vector<std::vector<std::uint8_t>> expected(kBatchTex);
+        std::vector<std::vector<VkBufferImageCopy>> regions(kBatchTex);
+        VkDeviceSize bases[kBatchTex]{}, ends[kBatchTex]{};
+        VkDeviceSize total_scratch = 0;
+
+        for (std::size_t i = 0; i < kBatchTex; ++i) {
+            ct::Desc cd{};
+            cd.dimension = ct::Dimension::tex2d;
+            cd.width = 64;
+            cd.height = 64;
+            cd.depth = 1;
+            cd.mips = 1;
+            cd.element_bytes = 4;
+            cd.block = 1;
+            cd.samples = 1;
+            cd.swizzle = (i % 2 == 0) ? ct::kSw64kbD : ct::kSw4kbS;
+            const auto lay = ct::Layout::make(cd);
+            EXPECT(lay.has_value());
+            descs[i] = to_detile_desc(*lay);
+            EXPECT(make_host_buffer(d, lay->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                    srcs[i]));
+            for (std::size_t b = 0; b < lay->size; ++b)
+                srcs[i].mapped[b] = static_cast<std::uint8_t>((b * (17 + i * 7) + i * 31) & 0xffu);
+            expected[i].resize(64u * 64u * 4u);
+            EXPECT(lay->detile(srcs[i].mapped, std::size_t(lay->size), 0, 0, expected[i].data(), expected[i].size(),
+                               64u * 4u, expected[i].size()) == ct::Error::ok);
+            EXPECT(make_image(d, VK_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, imgs[i]));
+            EXPECT(make_host_buffer(d, expected[i].size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT, rbs[i]));
+            const VkDeviceSize align = (std::max)(batch_pipe.min_storage_alignment(), VkDeviceSize(16));
+            bases[i] = leonida::detail::align_up_size(total_scratch, align);
+            EXPECT(leonida::TitleDetilePipeline::build_scratch_regions(descs[i], bases[i], 64, 64, regions[i], ends[i]));
+            total_scratch = ends[i];
+        }
+
+        auto* slot = batch_pipe.acquire_scratch(0, total_scratch, kBatchTex);
+        EXPECT(slot != nullptr);
+        std::vector<VkDescriptorSet> pre_sets;
+        EXPECT(batch_pipe.allocate_descriptor_sets(*slot, kBatchTex, pre_sets));
+        EXPECT(pre_sets.size() == kBatchTex);
+        EXPECT(s_alloc_calls.load(std::memory_order_acquire) == 1);  // ONE batched vkAllocateDescriptorSets call!
+        EXPECT(s_alloc_sets.load(std::memory_order_acquire) == kBatchTex);
+        std::vector<leonida::TitleDetileDispatch> dispatches;
+        std::vector<leonida::TitleDetilePipeline::PendingDescriptorUpdate> pending;
+        for (std::size_t i = 0; i < kBatchTex; ++i) {
+            EXPECT(batch_pipe.prepare_texture(*slot, srcs[i].handle, 0, descs[i], bases[i], ends[i], regions[i],
+                                              dispatches, &pending, pre_sets[i]));
+        }
+        EXPECT(s_alloc_calls.load(std::memory_order_acquire) == 1);   // ZERO per-texture vkAllocateDescriptorSets!
+        EXPECT(s_update_calls.load(std::memory_order_acquire) == 0);  // deferred until flush!
+        batch_pipe.flush_descriptor_updates(pending);
+        EXPECT(s_update_calls.load(std::memory_order_acquire) == 1);  // ONE batched vkUpdateDescriptorSets call!
+        EXPECT(s_update_writes.load(std::memory_order_acquire) == kBatchTex * 2u);
+
+        const bool ok = d.run([&](VkCommandBuffer cb) {
+            const auto barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+            const auto copy_b2i = d.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
+            const auto copy_i2b = d.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+            VkMemoryBarrier mem{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mem.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+            mem.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            barrier(cb, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem, 0, nullptr, 0,
+                    nullptr);
+            batch_pipe.emit_dispatches(cb, dispatches);
+            VkMemoryBarrier cs_to_x{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            cs_to_x.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            cs_to_x.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &cs_to_x, 0,
+                    nullptr, 0, nullptr);
+            for (std::size_t i = 0; i < kBatchTex; ++i) {
+                VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                to_dst.srcQueueFamilyIndex = to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                to_dst.image = imgs[i].handle;
+                to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                barrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                        nullptr, 1, &to_dst);
+                copy_b2i(cb, slot->buffer, imgs[i].handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         static_cast<std::uint32_t>(regions[i].size()), regions[i].data());
+                VkImageMemoryBarrier to_src = to_dst;
+                to_src.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                to_src.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                        1, &to_src);
+                VkBufferImageCopy rb{};
+                rb.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                rb.imageExtent = {64, 64, 1};
+                copy_i2b(cb, imgs[i].handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rbs[i].handle, 1, &rb);
+            }
+            VkMemoryBarrier host_vis{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            host_vis.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            host_vis.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_vis, 0, nullptr, 0,
+                    nullptr);
+            return true;
+        });
+        EXPECT(ok);
+        // Zero vkGetDeviceProcAddr calls after constructor (all PFN_vk* cached once!).
+        EXPECT(s_gdpa_calls.load(std::memory_order_acquire) == gdpa_after_ctor);
+        for (std::size_t i = 0; i < kBatchTex; ++i) {
+            EXPECT(std::memcmp(rbs[i].mapped, expected[i].data(), expected[i].size()) == 0);
+        }
+
+        // Verify kMaxScratchSlots == 64 allows > 32 concurrent in-flight slots and oldest_in_flight_scratch_value()
+        // picks the smallest non-zero in-flight slot value.
+        slot->value = 42;
+        auto* slot2 = batch_pipe.acquire_scratch(0, 64, 1);
+        EXPECT(slot2 != nullptr && slot2 != slot);
+        slot2->value = 17;
+        EXPECT(batch_pipe.oldest_in_flight_scratch_value() == 17);
+        std::vector<leonida::TitleDetilePipeline::ScratchSlot*> extra_slots;
+        for (std::size_t k = 0; k < 34; ++k) {
+            auto* s = batch_pipe.acquire_scratch(0, 64, 1);
+            EXPECT(s != nullptr);
+            s->value = 100 + k;
+            extra_slots.push_back(s);
+        }
+        EXPECT(batch_pipe.oldest_in_flight_scratch_value() == 17);
+        slot2->value = 0;
+        EXPECT(batch_pipe.oldest_in_flight_scratch_value() == 42);
+        slot->value = 0;
+        EXPECT(batch_pipe.oldest_in_flight_scratch_value() == 100);
+        for (auto* s : extra_slots) s->value = 0;
+        EXPECT(batch_pipe.oldest_in_flight_scratch_value() == 0);
+        EXPECT(d.validation_errors() == 0);
+    }
+
+    // Verify linear 3D direct copy with mips > 1 (array_layers == 1) bit-for-bit against console_texture::Layout,
+    // plus rejection of invalid array_layers != 1 for volume textures.
+    {
+        namespace ct = leonida::console_texture;
+        struct VolumeCase {
+            const char* name;
+            VkFormat vk_format;
+            std::uint32_t element_bytes;
+            std::uint32_t block_side;
+            std::uint32_t width;
+            std::uint32_t height;
+            std::uint32_t depth;
+            std::uint32_t mips;
+            VkDeviceSize src_offset;
+        };
+        const VolumeCase vcases[] = {
+            {"RGBA8 32x24x8 mips=4", VK_FORMAT_R8G8B8A8_UNORM, 4, 1, 32, 24, 8, 4, 4096},
+            {"R8 17x13x5 mips=3", VK_FORMAT_R8_UNORM, 1, 1, 17, 13, 5, 3, 256},
+            {"RGBA16F 16x12x6 mips=4", VK_FORMAT_R16G16B16A16_SFLOAT, 8, 1, 16, 12, 6, 4, 512},
+            {"BC1 32x32x4 mips=3", VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8, 4, 32, 32, 4, 3, 4096},
+            {"RGBA8 16x16x4 mips=1", VK_FORMAT_R8G8B8A8_UNORM, 4, 1, 16, 16, 4, 1, 256},
+        };
+        for (const auto& vc : vcases) {
+            ct::Desc cd{};
+            cd.dimension = ct::Dimension::tex3d;
+            cd.width = vc.width;
+            cd.height = vc.height;
+            cd.depth = vc.depth;
+            cd.mips = vc.mips;
+            cd.element_bytes = vc.element_bytes;
+            cd.block = vc.block_side;
+            cd.samples = 1;
+            cd.swizzle = ct::kLinear;
+            const auto layout_opt = ct::Layout::make(cd);
+            EXPECT(layout_opt.has_value());
+            const ct::Layout& layout = *layout_opt;
+            leonida::TitleDetileDesc desc = to_detile_desc(layout);
+            desc.dimension = 4;
+            desc.array_layers = 1;
+
+            const VkDeviceSize chunk_size = vc.src_offset + layout.size + 4096;
+            Buffer mirror_chunk;
+            EXPECT(make_host_buffer(d, chunk_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, mirror_chunk));
+            std::memset(mirror_chunk.mapped, 0xCC, std::size_t(chunk_size));
+            std::uint8_t* const tiled_ptr = mirror_chunk.mapped + vc.src_offset;
+            std::uint64_t seed = 0x517cc1b727220a95ull ^ (serial * 0x94d049bb133111ebull);
+            for (std::size_t i = 0; i < layout.size; ++i) {
+                seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+                tiled_ptr[i] = static_cast<std::uint8_t>(seed >> 56);
+            }
+
+            // Invalid array_layers > 1 on a 3D volume must be rejected.
+            auto bad_desc = desc;
+            bad_desc.array_layers = 2;
+            EXPECT(!leonida::TitleDetilePipeline::can_direct_linear(bad_desc, vc.src_offset, chunk_size, vc.width,
+                                                                    vc.height, vc.depth, vc.mips, 2, true));
+
+            EXPECT(leonida::TitleDetilePipeline::can_direct_linear(desc, vc.src_offset, chunk_size, vc.width,
+                                                                   vc.height, vc.depth, vc.mips, 1, true));
+            std::vector<VkBufferImageCopy> copy_regions;
+            EXPECT(leonida::TitleDetilePipeline::build_linear_regions(desc, vc.src_offset, vc.width, vc.height,
+                                                                      vc.depth, true, copy_regions));
+
+            std::vector<std::vector<std::uint8_t>> cpu_truth;
+            std::vector<VkBufferImageCopy> rb_regions;
+            VkDeviceSize rb_bytes = 0;
+            const VkDeviceSize rb_align = (std::max)(VkDeviceSize(4u), VkDeviceSize(vc.element_bytes)) * 4u;
+            for (std::uint32_t mip = 0; mip < vc.mips; ++mip) {
+                const auto& m = layout.mips[mip];
+                const std::size_t row_bytes = std::size_t(m.width) * vc.element_bytes;
+                const std::size_t slice_bytes = row_bytes * m.height;
+                const std::size_t vol_bytes = slice_bytes * m.depth;
+                std::vector<std::uint8_t> linear(vol_bytes, 0xA5);
+                EXPECT(layout.detile(tiled_ptr, std::size_t(layout.size), mip, 0, linear.data(), linear.size(),
+                                     row_bytes, slice_bytes) == ct::Error::ok);
+                cpu_truth.push_back(std::move(linear));
+
+                VkBufferImageCopy rb{};
+                rb.bufferOffset = leonida::detail::align_up_size(rb_bytes, rb_align);
+                rb.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
+                rb.imageExtent = {(std::max)(1u, vc.width >> mip), (std::max)(1u, vc.height >> mip),
+                                  (std::max)(1u, vc.depth >> mip)};
+                rb_regions.push_back(rb);
+                rb_bytes = rb.bufferOffset + vol_bytes;
+            }
+
+            Image img;
+            img.device = d.device;
+            img.destroy = d.fn<PFN_vkDestroyImage>("vkDestroyImage");
+            img.free_mem = d.fn<PFN_vkFreeMemory>("vkFreeMemory");
+            VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ii.imageType = VK_IMAGE_TYPE_3D;
+            ii.format = vc.vk_format;
+            ii.extent = {vc.width, vc.height, vc.depth};
+            ii.mipLevels = vc.mips;
+            ii.arrayLayers = 1;
+            ii.samples = VK_SAMPLE_COUNT_1_BIT;
+            ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            EXPECT(d.fn<PFN_vkCreateImage>("vkCreateImage")(d.device, &ii, nullptr, &img.handle) == VK_SUCCESS);
+            VkMemoryRequirements req{};
+            d.fn<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(d.device, img.handle, &req);
+            img.memory = alloc_memory(d, req, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            EXPECT(img.memory != VK_NULL_HANDLE);
+            EXPECT(d.fn<PFN_vkBindImageMemory>("vkBindImageMemory")(d.device, img.handle, img.memory, 0) == VK_SUCCESS);
+
+            Buffer readback;
+            EXPECT(make_host_buffer(d, (std::max)(rb_bytes, VkDeviceSize(64)), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                    readback));
+            std::memset(readback.mapped, 0x5A, std::size_t(readback.size));
+
+            const bool ran = d.run([&](VkCommandBuffer cb) {
+                const auto barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+                const auto copy_b2i = d.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
+                const auto copy_i2b = d.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+                VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                to_dst.srcQueueFamilyIndex = to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                to_dst.image = img.handle;
+                to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, vc.mips, 0, 1};
+                barrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                        nullptr, 1, &to_dst);
+                copy_b2i(cb, mirror_chunk.handle, img.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         static_cast<std::uint32_t>(copy_regions.size()), copy_regions.data());
+                VkImageMemoryBarrier to_src = to_dst;
+                to_src.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                to_src.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                        1, &to_src);
+                copy_i2b(cb, img.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.handle,
+                         static_cast<std::uint32_t>(rb_regions.size()), rb_regions.data());
+                VkMemoryBarrier host_vis{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                host_vis.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                host_vis.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_vis, 0, nullptr, 0,
+                        nullptr);
+                return true;
+            });
+            EXPECT(ran);
+            for (std::uint32_t mip = 0; mip < vc.mips; ++mip) {
+                const auto& expected = cpu_truth[mip];
+                const std::uint8_t* actual = readback.mapped + rb_regions[mip].bufferOffset;
+                if (std::memcmp(actual, expected.data(), expected.size()) != 0) {
+                    std::fprintf(stderr, "3D LINEAR MISMATCH case=%s mip=%u\n", vc.name, mip);
+                    return 1;
+                }
+            }
+            ++serial;
+            ++passed;
+        }
+        EXPECT(d.validation_errors() == 0);
+    }
+
+    // Verify TitleImagePool raises largest_slot to 8 MiB and caps >2 MiB page allocations at <= 16 MiB.
+    {
+        leonida::TitleImagePool pool;
+        std::vector<VkDeviceSize> alloc_sizes;
+        std::uint64_t next_mem = 1;
+        auto fake_bind = [](VkDevice, VkImage, VkDeviceMemory, VkDeviceSize) -> VkResult { return VK_SUCCESS; };
+        auto fake_destroy_img = [](VkDevice, VkImage, const VkAllocationCallbacks*) {};
+        auto fake_free_mem = [](VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {};
+        auto fake_alloc = [&](VkDeviceSize size, std::uint32_t& type) -> VkDeviceMemory {
+            alloc_sizes.push_back(size);
+            type = 0;
+            return reinterpret_cast<VkDeviceMemory>(next_mem++);
+        };
+        const VkDevice fake_dev = reinterpret_cast<VkDevice>(std::uintptr_t(1));
+        const VkImage fake_img = reinterpret_cast<VkImage>(std::uintptr_t(1));
+
+        // 5.5 MiB texture -> pooled in 11 MiB page (capacity 2, <= 16 MiB cap), second reuses same page!
+        VkMemoryRequirements req_55{5632ull << 10, 65536, 1u};
+        auto a1 = pool.bind(fake_dev, fake_img, req_55, fake_bind, fake_destroy_img, fake_free_mem, fake_alloc);
+        auto a2 = pool.bind(fake_dev, fake_img, req_55, fake_bind, fake_destroy_img, fake_free_mem, fake_alloc);
+        EXPECT(a1 && a2 && a1->page == a2->page);
+        EXPECT(alloc_sizes.size() == 1 && alloc_sizes[0] <= (16ull << 20));
+
+        // 8 MiB texture -> pooled in 16 MiB page (capacity 2).
+        VkMemoryRequirements req_8m{8ull << 20, 65536, 1u};
+        auto b1 = pool.bind(fake_dev, fake_img, req_8m, fake_bind, fake_destroy_img, fake_free_mem, fake_alloc);
+        auto b2 = pool.bind(fake_dev, fake_img, req_8m, fake_bind, fake_destroy_img, fake_free_mem, fake_alloc);
+        EXPECT(b1 && b2 && b1->page == b2->page);
+        EXPECT(alloc_sizes.size() == 2 && alloc_sizes[1] == (16ull << 20));
+
+        // > 8 MiB texture -> refused by pool (returns nullptr).
+        VkMemoryRequirements req_9m{9ull << 20, 65536, 1u};
+        auto c1 = pool.bind(fake_dev, fake_img, req_9m, fake_bind, fake_destroy_img, fake_free_mem, fake_alloc);
+        EXPECT(!c1 && alloc_sizes.size() == 2);
+    }
+
+    std::printf("vk_title_detile_test: %u cases + batched descriptor/cached PFN + linear 3D multi-mip + pool 8MiB "
+                "checks passed bit-for-bit (0 validation errors)\n",
+                passed);
+    return 0;
+}

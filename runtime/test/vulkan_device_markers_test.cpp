@@ -1,13 +1,16 @@
 // The AMD breadcrumbs of the device-fault report (src/vulkan_device_markers.h, LEONIDA_DEVICE_MARKERS=1), on the
-// CPU: seq numbering, the marker writes a recorded dispatch makes, the history ring, and which dispatch the report
-// calls the likely hang for given marker values. The driver is faked: its marker writes are logged, and a "GPU"
-// applies a prefix of them to the mapped words, as a queue that stopped at that point would have. No GPU, no game
-// data.
+// CPU: seq numbering, the marker writes a recorded dispatch or draw makes, the history ring, and which dispatch or draw
+// the report calls the likely hang for given marker values, with the lines that name it. The driver is faked: its
+// marker writes are logged, and a "GPU" applies a prefix of them to the mapped words, as a queue that stopped at that
+// point would have. No GPU, no game data.
 #include "../src/vulkan_device_fault.h"
+#include "../src/vulkan_gpu_profile.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -104,7 +107,7 @@ void execute(std::size_t count) {
 }
 
 struct History {  // a plain list in MarkerHistory::for_each order, for judge_markers
-    std::vector<MarkedDispatch> entries;
+    std::vector<MarkedWork> entries;
     template<typename Visit>
     void for_each(Visit&& visit) const {
         for (const auto& d : entries) visit(d);
@@ -124,7 +127,7 @@ int pure_logic() {
     EXPECT(ring.size() == MarkerHistory::capacity);
     std::uint64_t expect = 6, visited = 0;
     bool ordered = true;
-    ring.for_each([&](const MarkedDispatch& d) { ordered &= d.seq == expect++; ++visited; });
+    ring.for_each([&](const MarkedWork& d) { ordered &= d.seq == expect++; ++visited; });
     EXPECT(ordered && visited == MarkerHistory::capacity);
 
     // Two queues interleaved: compute has 1 3 5 6 8, direct has 2 4 7.
@@ -256,6 +259,143 @@ int recorded(bool synchronization2) {
     return 0;
 }
 
+bool contains(const std::string& text, const char* part) {
+    if (text.find(part) != std::string::npos) return true;
+    std::fprintf(stderr, "missing \"%s\" in:\n%s", part, text.c_str());
+    return false;
+}
+
+// Draws get marker pairs too, numbered with the dispatches, and the report names the draw the "GPU" stopped in: its
+// kind and counts, its pipeline as the GPU profile names it, its list and command, and its place among the draws to the
+// same targets. Also the device-fault address note, the draws in flight and an idle queue's next draw.
+int draws() {
+    writes.clear();
+    const auto memory = memory_types();
+    DeviceFaultExtensions enabled;
+    enabled.markers = true;
+    const VkQueue direct = fake_handle<VkQueue>(0x20);
+    const VkCommandBuffer cb = fake_handle<VkCommandBuffer>(0x30);
+    DeviceFaultDiagnostics diagnostics(get_proc, VK_NULL_HANDLE, enabled, &memory, true);
+    diagnostics.add_queue(direct);
+    diagnostics.pipeline_names[4] = {"library/cs_example_a"};
+    diagnostics.pipeline_names[7] = {"library/vs_example", nullptr, "library/ps_example"};
+    diagnostics.pipeline_names[8] = {"library/ms_example", nullptr, "library/ps_mesh_example"};
+    const std::array<std::uint32_t, 32> roots{};
+    const VkImageView rt0 = fake_handle<VkImageView>(0x41), rt1 = fake_handle<VkImageView>(0x42);
+    const VkImageView depth = fake_handle<VkImageView>(0x43), other = fake_handle<VkImageView>(0x44);
+    const std::array<VkImageView, 3> gbuffer{rt0, VK_NULL_HANDLE, rt1};  // slot 1 unbound
+    const std::array<VkImageView, 1> single{other};
+    const MarkedTargets pass_a = MarkedTargets::of(gbuffer, depth, {640, 480});
+    const MarkedTargets pass_b = MarkedTargets::of(single, VK_NULL_HANDLE, {320, 240});
+    EXPECT(pass_a.key && pass_a.colors == 2 && pass_a.depth && pass_a.key != pass_b.key && !pass_b.depth);
+
+    auto s = diagnostics.begin_submission(diagnostics.next_execute_call(), direct, "direct", 2);
+    {
+        const CheckpointRecorder list0{nullptr, s, diagnostics.pipeline_names, 0};
+        list0.dispatch(cb, 0, VK_NULL_HANDLE, 4, roots, {8, 1, 1});     // seq 1
+        list0.dispatched(cb);
+        list0.draw(cb, 3, 7, marked_draw::indexed, {36, 2, 0}, pass_a);  // seq 2
+        list0.drawn(cb);
+        list0.draw(cb, 5, 7, marked_draw::indexed, {12, 1, 6}, pass_a);  // seq 3
+        list0.drawn(cb);
+        list0.draw(cb, 6, 8, marked_draw::mesh, {4, 2, 1}, pass_a);      // seq 4
+        list0.drawn(cb);
+        list0.draw(cb, 9, 7, 0, {3, 1, 0}, pass_b);                      // seq 5
+        list0.drawn(cb);
+    }
+    {
+        const CheckpointRecorder list1{nullptr, s, diagnostics.pipeline_names, 1};
+        list1.draw(cb, 0, 7, marked_draw::indexed | marked_draw::indirect | marked_draw::counted, {64, 20, 0},
+                   pass_b);                                              // seq 6
+        list1.drawn(cb);
+        list1.dispatch(cb, 1, VK_NULL_HANDLE, 4, roots, {1, 1, 1});     // seq 7
+        list1.dispatched(cb);
+    }
+    EXPECT(writes.size() == 14);
+    for (std::size_t i = 0; i < writes.size(); ++i)  // started, finished, ... with seqs 1..7, all in slot 0
+        EXPECT(writes[i].marker == i / 2 + 1 && writes[i].offset == (i % 2 ? 4u : 0u) &&
+               writes[i].stage ==
+                   std::uint64_t(i % 2 ? VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT));
+    // The dispatch list keeps dispatches only, with their seqs; draws are in the marker history.
+    EXPECT(s.dispatches.size() == 2 && s.dispatches[0].seq == 1 && s.dispatches[1].seq == 7);
+    EXPECT(s.marked.size() == 7 && s.marked[1].is_draw() && !s.marked[0].is_draw());
+    EXPECT(s.marked[2].pass_command == 3 && s.marked[2].pass_draw == 2);  // the second draw to pass_a
+    EXPECT(s.marked[3].pass_command == 3 && s.marked[3].pass_draw == 3);
+    EXPECT(s.marked[4].pass_command == 9 && s.marked[4].pass_draw == 1);  // other targets: a new pass
+    EXPECT(s.marked[5].list == 1 && s.marked[5].pass_command == 0 && s.marked[5].pass_draw == 1);  // a new list
+    diagnostics.publish(std::move(s));
+
+    // The pipeline as the GPU profile's lines call it.
+    const gpu_profile::Key graphics{gpu_profile::Kind::graphics, {"library/vs_example", nullptr, "library/ps_example"}};
+    EXPECT(marked_pipeline_label(graphics.names, false, 7) == gpu_profile::label(graphics));
+    const gpu_profile::Key mesh{gpu_profile::Kind::mesh, {"library/ms_example", nullptr, "library/ps_mesh_example"}};
+    EXPECT(marked_pipeline_label(mesh.names, true, 8) == gpu_profile::label(mesh));
+    gpu_profile::Key unnamed{gpu_profile::Kind::graphics};
+    unnamed.id = 0x99;
+    EXPECT(marked_pipeline_label({}, false, 0x99) == gpu_profile::label(unnamed));
+
+    // The "GPU" ran seq 1 and 2, started 3 and stopped in it: 3 is the likely hang, 2 the last finished.
+    execute(5);
+    std::string text;
+    EXPECT(diagnostics.report_markers(true, &text) == std::vector<std::uint64_t>({3}));
+    EXPECT(contains(text, " (direct) finished seq=2 started seq=3; started, not finished: 3\n"));
+    EXPECT(contains(text, "[rt] device-markers:   finished: seq=2 execute=1 queue="));
+    EXPECT(contains(text, " (direct) list=0 command=3 draw=indexed count=36 instances=2 pipeline=vs vs_example ps "
+                          "ps_example pass=draw 1 since command 3 (2 colours + depth, 640x480)\n"));
+    EXPECT(contains(text, "[rt] device-markers: likely hang: seq=3 execute=1 queue="));
+    EXPECT(contains(text, " (direct) list=0 command=5 draw=indexed count=12 instances=1 pipeline=vs vs_example ps "
+                          "ps_example pass=draw 2 since command 3 (2 colours + depth, 640x480)\n"));
+    // With a fault address: the last draw the queue started.
+    std::string fault = diagnostics.marker_fault_draws();
+    EXPECT(contains(fault, "[rt] device-fault: last started draw (device-markers): seq=3 execute=1"));
+    EXPECT(contains(fault, "list=0 command=5 draw=indexed count=12 instances=1 pipeline=vs vs_example ps ps_example"));
+    EXPECT(contains(fault, " (not finished) <- likely hang\n"));
+
+    // Stopped inside the mesh dispatch, with the vertex draw after it started too: both in flight.
+    execute(7);     // through seq 4 started, 3 finished
+    words[0] = 5;   // seq 5 started
+    text.clear();
+    EXPECT(diagnostics.report_markers(true, &text) == std::vector<std::uint64_t>({4}));
+    EXPECT(contains(text, "likely hang: seq=4 execute=1 queue="));
+    EXPECT(contains(text, " list=0 command=6 draw=mesh groups=4,2,1 pipeline=ms ms_example ps ps_mesh_example "
+                          "pass=draw 3 since command 3 (2 colours + depth, 640x480)\n"));
+    EXPECT(contains(text, "[rt] device-markers:   in flight: seq=5 execute=1 queue="));
+    EXPECT(contains(text, " list=0 command=9 draw=vertices count=3 instances=1 pipeline=vs vs_example ps ps_example "
+                          "pass=draw 1 since command 9 (1 colour, 320x240)\n"));
+    fault = diagnostics.marker_fault_draws();
+    EXPECT(contains(fault, "seq=5 execute=1") && contains(fault, "(not finished)\n"));
+
+    // Idle after seq 5: the next one, an indirect draw, was not started.
+    execute(10);
+    text.clear();
+    EXPECT(diagnostics.report_markers(false, &text).empty());
+    EXPECT(contains(text, "idle: finished seq=5, nothing started after it; next submitted seq=6 not started"));
+    EXPECT(contains(text, "[rt] device-markers:   not started: seq=6 execute=1 queue="));
+    EXPECT(contains(text, " list=1 command=0 draw=indexed-indirect-count max=64 stride=20 pipeline=vs vs_example ps "
+                          "ps_example pass=draw 1 since command 0 (1 colour, 320x240)\n"));
+    fault = diagnostics.marker_fault_draws();
+    EXPECT(contains(fault, "seq=5 execute=1") && contains(fault, "(finished)\n"));
+    // Everything ran: the last item is the dispatch, the last started draw seq 6, finished.
+    execute(writes.size());
+    text.clear();
+    EXPECT(diagnostics.report_markers(false, &text).empty());
+    EXPECT(contains(text, "idle: finished seq=7, nothing started after it\n"));
+    EXPECT(contains(text, " list=1 command=1 shader=library/cs_example_a\n"));
+    EXPECT(contains(diagnostics.marker_fault_draws(), "seq=6 execute=1"));
+
+    // Without the markers a draw writes nothing and takes no seq.
+    DeviceFaultDiagnostics plain(get_proc, VK_NULL_HANDLE, DeviceFaultExtensions{});
+    auto off = plain.begin_submission(plain.next_execute_call(), direct, "direct", 1);
+    writes.clear();
+    const CheckpointRecorder recorder{nullptr, off, plain.pipeline_names, 0};
+    recorder.draw(cb, 0, 7, 0, {3, 1, 0}, pass_b);
+    recorder.drawn(cb);
+    recorder.dispatch(cb, 1, VK_NULL_HANDLE, 4, roots, {1, 1, 1});
+    EXPECT(writes.empty() && off.marked.empty() && off.dispatches[0].seq == 1);
+    EXPECT(plain.marker_fault_draws().empty());
+    return 0;
+}
+
 // Without LEONIDA_DEVICE_MARKERS the extension is not asked for, and with it only where the device has it.
 int extension_request() {
     const VkExtensionProperties with[] = {{VK_AMD_BUFFER_MARKER_EXTENSION_NAME, 1}};
@@ -294,6 +434,7 @@ int main() {
     if (int failed = pure_logic()) return failed;
     if (int failed = recorded(true)) return failed;
     if (int failed = recorded(false)) return failed;
+    if (int failed = draws()) return failed;
     if (int failed = extension_request()) return failed;
     std::puts("vulkan_device_markers: ok");
     return 0;

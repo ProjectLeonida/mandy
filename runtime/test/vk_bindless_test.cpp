@@ -255,6 +255,9 @@ int main(int argc, char** argv) {
     enable12.descriptorBindingStorageImageUpdateAfterBind = device_flags.update_after_bind;
     enable12.descriptorBindingStorageBufferUpdateAfterBind = device_flags.update_after_bind;
     enable12.descriptorBindingPartiallyBound = device_flags.partially_bound;
+    enable12.vulkanMemoryModel = have12.vulkanMemoryModel;
+    enable12.vulkanMemoryModelDeviceScope =
+        have12.vulkanMemoryModel && have12.vulkanMemoryModelDeviceScope ? VK_TRUE : VK_FALSE;
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &enable12};
     enable.features.shaderInt64 = int64 ? VK_TRUE : VK_FALSE;
     enable.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
@@ -1376,6 +1379,135 @@ int main(int argc, char** argv) {
             compare("12 live neighbour", orange_colour);
         } else {
             std::printf("%s: no room past 5000 2D images and 2100 samplers on this device; step 9 skipped\n", name);
+        }
+
+        // 13. O(1) free-list: storage vs high ranges, has_free_image, free_storage_images, total_free_images,
+        // image_refusal, held_images_ fast state, and shared-slot refcount + storage-upgrade semantics.
+        {
+            const std::uint32_t cap_1d = set.image_capacity(ImageDimension::dim_1d);
+            const std::uint32_t stor_1d = set.storage_capacity(ImageDimension::dim_1d);
+            const std::uint32_t total_before = set.total_free_images();
+            EXPECT(set.free_images(ImageDimension::dim_1d) == cap_1d - 1);
+            EXPECT(set.free_storage_images(ImageDimension::dim_1d) == stor_1d - 1);
+            EXPECT(set.has_free_image(ImageDimension::dim_1d, true));
+            EXPECT(set.has_free_image(ImageDimension::dim_1d, false));
+            EXPECT(!set.has_free_image(ImageDimension::dim_1d_array, false));
+            EXPECT(set.has_free_image(ImageDimension::dim_1d_array, true));
+
+            // Fill the entire 1D storage range [1, stor_1d) with storage views.
+            StorageViews dummy_storage{};
+            dummy_storage.as_float = stored_view;
+            std::vector<std::uint32_t> stor_indices;
+            stor_indices.reserve(stor_1d - 1);
+            for (std::uint32_t i = 1; i < stor_1d; ++i) {
+                const std::uint32_t idx =
+                    set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, dummy_storage);
+                EXPECT(idx >= 1 && idx < stor_1d);
+                stor_indices.push_back(idx);
+            }
+            EXPECT(set.free_storage_images(ImageDimension::dim_1d) == 0);
+            EXPECT(!set.has_free_image(ImageDimension::dim_1d, true));
+            EXPECT(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, dummy_storage) == 0);
+            if (cap_1d > stor_1d) {
+                EXPECT(set.image_refusal(ImageDimension::dim_1d, true) == BindlessSet::ImageRefusal::storage_full);
+                EXPECT(set.has_free_image(ImageDimension::dim_1d, false));
+                const std::uint32_t high_idx =
+                    set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL);
+                EXPECT(high_idx >= stor_1d && high_idx < cap_1d);
+                set.remove_image(ImageDimension::dim_1d, high_idx);
+            } else {
+                EXPECT(set.image_refusal(ImageDimension::dim_1d, true) == BindlessSet::ImageRefusal::array_full);
+            }
+            // Freeing one storage slot restores storage room and hands back that exact storage index.
+            const std::uint32_t freed_stor = stor_indices[stor_indices.size() / 2];
+            set.remove_image(ImageDimension::dim_1d, freed_stor);
+            EXPECT(set.free_storage_images(ImageDimension::dim_1d) == 1);
+            EXPECT(set.has_free_image(ImageDimension::dim_1d, true));
+            const std::uint32_t reused_stor =
+                set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, dummy_storage);
+            EXPECT(reused_stor == freed_stor);
+            EXPECT(set.free_storage_images(ImageDimension::dim_1d) == 0);
+            for (const std::uint32_t idx : stor_indices) set.remove_image(ImageDimension::dim_1d, idx);
+            EXPECT(set.free_storage_images(ImageDimension::dim_1d) == stor_1d - 1);
+            EXPECT(set.free_images(ImageDimension::dim_1d) == cap_1d - 1);
+            EXPECT(set.total_free_images() == total_before);
+
+            // held_images_ fast state: removing while table_dirty_ holds the slot until flush() and keeps
+            // needs_prepare() true.
+            const std::uint32_t free_3d_before = set.free_images(ImageDimension::dim_3d);
+            const std::uint32_t held_idx =
+                set.add_image(ImageDimension::dim_3d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL);
+            EXPECT(held_idx != 0 && set.free_images(ImageDimension::dim_3d) == free_3d_before - 1);
+            DescriptorKey held_key = tsharp;
+            held_key[7] ^= 0x55AA1234u;
+            EXPECT(set.insert_key(held_key, held_idx, ImageDimension::dim_3d));
+            set.remove_image(ImageDimension::dim_3d, held_idx);
+            EXPECT(set.free_images(ImageDimension::dim_3d) == free_3d_before - 1);  // held while table_dirty_
+            EXPECT(set.needs_prepare());
+            EXPECT(set.erase_key(held_key));
+            EXPECT(flush());
+            set.table_upload_result(true);
+            set.release_retired();
+            EXPECT(set.free_images(ImageDimension::dim_3d) == free_3d_before);
+            EXPECT(set.total_free_images() == total_before);
+            EXPECT(!set.needs_prepare());
+
+            // Shared ViewKey refcount + storage upgrade: two distinct T# keys share ONE sampled-only bindless index;
+            // upgrading key 1 to a storage slot keeps the old sampled-only slot alive for key 2 until key 2 leaves.
+            const std::uint32_t free_2d_before = set.free_images(ImageDimension::dim_2d);
+            const std::uint32_t shared_idx =
+                set.add_image(ImageDimension::dim_2d, gradient_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            EXPECT(shared_idx >= set.storage_capacity(ImageDimension::dim_2d));
+            DescriptorKey shared_k1 = tsharp, shared_k2 = tsharp;
+            shared_k1[7] ^= 0x1010101u;
+            shared_k2[7] ^= 0x2020202u;
+            std::uint32_t shared_refcount = 0;
+            EXPECT(set.insert_key(shared_k1, shared_idx, ImageDimension::dim_2d));
+            ++shared_refcount;
+            EXPECT(set.insert_key(shared_k2, shared_idx, ImageDimension::dim_2d));
+            ++shared_refcount;
+            EXPECT(set.free_images(ImageDimension::dim_2d) == free_2d_before - 1);
+            EXPECT(flush());
+            const auto draw_key = [&](const DescriptorKey& key) {
+                std::memcpy(static_cast<char*>(heap_map) + table_va, key.data(), 32);
+                return draw();
+            };
+            CHECK(draw_key(shared_k1));
+            compare("13a shared ViewKey k1", nullptr);
+            CHECK(draw_key(shared_k2));
+            compare("13b shared ViewKey k2", nullptr);
+
+            // Upgrade shared_k1 to a storage-capable index: shared_idx stays alive for shared_k2 (refcount 2 -> 1).
+            StorageViews upgrade_storage{};
+            upgrade_storage.as_float = stored_view;
+            const std::uint32_t upgrade_idx =
+                set.add_image(ImageDimension::dim_2d, stored_view, VK_IMAGE_LAYOUT_GENERAL, upgrade_storage);
+            EXPECT(upgrade_idx >= 1 && upgrade_idx < set.storage_capacity(ImageDimension::dim_2d));
+            EXPECT(set.insert_key(shared_k1, upgrade_idx, ImageDimension::dim_2d));
+            --shared_refcount;
+            EXPECT(shared_refcount == 1);
+            EXPECT(flush());
+            const float blue_pixel[4] = {0, 0, 128.0f / 255.0f, 1};
+            CHECK(draw_key(shared_k1));
+            compare("13c upgraded k1 reads storage slot", blue_pixel);
+            CHECK(draw_key(shared_k2));
+            compare("13d peer k2 keeps shared sampled slot", nullptr);
+
+            // Release shared_k2: refcount hits 0, releasing shared_idx while upgraded shared_k1 stays live.
+            EXPECT(set.erase_key(shared_k2));
+            if (--shared_refcount == 0) set.remove_image(ImageDimension::dim_2d, shared_idx);
+            EXPECT(flush());
+            EXPECT(set.free_images(ImageDimension::dim_2d) == free_2d_before - 1);  // only upgrade_idx remains
+            CHECK(draw_key(shared_k2));
+            compare("13e removed k2 reads fallback", zeros);
+            CHECK(draw_key(shared_k1));
+            compare("13f upgraded k1 still live", blue_pixel);
+
+            EXPECT(set.erase_key(shared_k1));
+            set.remove_image(ImageDimension::dim_2d, upgrade_idx);
+            EXPECT(flush());
+            EXPECT(set.free_images(ImageDimension::dim_2d) == free_2d_before);
+            std::memcpy(static_cast<char*>(heap_map) + table_va, tsharp.data(), 32);
         }
 
         std::printf("%s: descriptor table in %s memory\n", name,

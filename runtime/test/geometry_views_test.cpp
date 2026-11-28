@@ -19,7 +19,9 @@
 //      (forget_copy); its destroyed block leaves the lock-free block list and is reported to the device;
 //  14. LEONIDA_GEOMETRY_HOST picks a system-memory type (write-back for 1, write-combined for 2), never the BAR;
 //  15. a retired view is copied once more from its pages when they are readable, not when they are not;
-//  16. a full release queue joins touching ranges before it collapses to one covering range.
+//  16. a full release queue joins touching ranges before it collapses to one covering range;
+//  17. a retired view stays live while a pre-retirement command_list_epochs::Stamp is alive, and gets stamped and
+//      reaped once that stamp drops (a post-retirement stamp does not hold it).
 #include <windows.h>
 
 #include <cstdint>
@@ -141,6 +143,27 @@ void title_write(std::uintptr_t at, std::uint8_t value) {
 }  // namespace
 
 int main() {
+    // Which blocks outside the arena a V# base reaches (TitleBufferWindows::shader_reachable), with the addresses RADV
+    // gives (Mesa 26.3.1): a sparse arena at 0xffffc00100200000, ordinary buffers at 0xffff8001..., 64 TiB below it.
+    {
+        using Windows = rt::d3d12::TitleBufferWindows;
+        constexpr std::uint64_t sparse_arena = 0xffffc00100200000ull, ordinary = 0xffff800100010000ull;
+        constexpr std::uint64_t k4m = 4ull << 20, k47 = 1ull << 47;
+        // Below heap_base: only with sign-extending shaders.
+        if (!Windows::shader_reachable(ordinary, k4m, sparse_arena, true)) return 1;
+        if (Windows::shader_reachable(ordinary, k4m, sparse_arena, false)) return 1;
+        // Above it (an ordinary arena with blocks made after it): both readings.
+        if (!Windows::shader_reachable(ordinary + (1ull << 30), k4m, ordinary, false)) return 1;
+        if (!Windows::shader_reachable(ordinary + (1ull << 30), k4m, ordinary, true)) return 1;
+        // The edges of the signed range: [-2^47, 2^47).
+        if (!Windows::shader_reachable(sparse_arena - k47, k4m, sparse_arena, true)) return 1;
+        if (Windows::shader_reachable(sparse_arena - k47 - 65536, k4m, sparse_arena, true)) return 1;
+        if (!Windows::shader_reachable(sparse_arena + k47 - k4m, k4m, sparse_arena, true)) return 1;
+        if (Windows::shader_reachable(sparse_arena + k47 - k4m + 65536, k4m, sparse_arena, true)) return 1;
+        // A block that ends exactly at heap_base, and no block at all.
+        if (!Windows::shader_reachable(sparse_arena - k4m, k4m, sparse_arena, true)) return 1;
+        if (Windows::shader_reachable(0, k4m, sparse_arena, true)) return 1;
+    }
     _putenv_s("LEONIDA_GEOMETRY_MB", "64");
     constexpr std::size_t kTile = 65536, kView = 16 * kTile;
     auto* title = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 2 * kView, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -443,7 +466,7 @@ int main() {
     check(g_live_buffers == 0 && g_live_allocs == 0, "multi-instance teardown frees all blocks");
     VirtualFree(shared_title, 0, MEM_RELEASE);
 
-    // 13. DeviceState's order for one submission: execute_begin, drain_geometry_releases (kAfterExecutes) and the
+    // 13. DeviceState's order for one submission: execute_enqueue, drain_geometry_releases (kAfterExecutes) and the
     // console heaps in before_execute_, the replay records its submission, execute_end. Another queue's replay began
     // before the release (its heap slots may already name the view); one more begins after the retirement.
     auto* fly_title = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, kView, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -464,8 +487,8 @@ int main() {
         const int gone = g_gone_blocks;
 
         std::uint64_t submitted = 7;  // completed == submitted below: the GPU is idle
-        const std::uint64_t other = fly.execute_begin();
-        const std::uint64_t own = fly.execute_begin();
+        const std::uint64_t other = fly.execute_enqueue();
+        const std::uint64_t own = fly.execute_enqueue();
         leonida::TitleVaAliases aliases;
         aliases.record_removals(true);
         // What the console heaps' slot records are told (TitleVaAliases::add_listener).
@@ -501,7 +524,7 @@ int main() {
         check(fly.reap(device, 8) == 0 && fly.retired_count() == 1 && fly.bytes() == kView,
               "not freed while a replay begun before the retirement is still in progress");
 
-        const std::uint64_t later = fly.execute_begin();
+        const std::uint64_t later = fly.execute_enqueue();
         submitted = 9;  // the other queue's submission
         fly.execute_end(other, [&] { return submitted; });
         check(fly.reap(device, 8) == 0 && fly.retired_count() == 1,
@@ -617,6 +640,43 @@ int main() {
                   joined[1] == std::make_pair(hbase + kView - 4096, hbase + kView),
               "65536 touching ranges become one, and a range apart from them stays apart");
         coalesce.release(device);
+
+        // 17. Command-list-epoch guard: a view retired with kAfterExecutes stays unstamped (not reaped even when
+        // every replay has ended and completed == submitted) while a command list recorded before the retirement is
+        // still alive, and gets stamped and reaped once that list's Stamp drops (a list recorded after does not hold it).
+        {
+            rt::d3d12::GeometryViews guarded(2 * kView);
+            const std::uint64_t va_g = guarded.resolve(device, hbase, kView, copy);
+            check(va_g != 0 && guarded.live_views() == 1 && g_live_buffers == 1,
+                  "epoch guard: view created in its own block");
+            std::uint64_t submitted = 20;
+            auto pre_list = std::make_unique<leonida::command_list_epochs::Stamp>();
+            const std::uint64_t replay = guarded.execute_enqueue();
+            check(guarded.retire_range(hbase, hbase + kView, rt::d3d12::GeometryViews::kAfterExecutes) == 1 &&
+                      guarded.retired_count() == 1,
+                  "epoch guard: view retired with kAfterExecutes while pre-retirement list is alive");
+            auto post_list = std::make_unique<leonida::command_list_epochs::Stamp>();
+
+            submitted = 21;
+            guarded.execute_end(replay, [&] { return submitted; });
+            guarded.stamp_retired([&] { return submitted; });
+            check(guarded.reap(device, 100) == 0 && guarded.retired_count() == 1 && g_live_buffers == 1,
+                  "epoch guard: retired view stays live while pre-retirement command list stamp is alive");
+
+            // Drop the pre-retirement list (simulating Reset or Release after its final submission at ticket 25);
+            // the post-retirement list stays alive and must NOT block stamping.
+            submitted = 25;
+            pre_list.reset();
+            guarded.stamp_retired([&] { return submitted; });
+            check(guarded.reap(device, 24) == 0 && guarded.retired_count() == 1 && g_live_buffers == 1,
+                  "epoch guard: stamped view waits for ticket 25 after pre-retirement list drops");
+            check(guarded.reap(device, 25) == 1 && guarded.retired_count() == 0 && guarded.bytes() == 0 &&
+                      g_live_buffers == 0,
+                  "epoch guard: stamped view is reaped at ticket 25 while post-retirement list is still alive");
+            post_list.reset();
+            guarded.release(device);
+        }
+
         VirtualFree(host_title, 0, MEM_RELEASE);
     }
 

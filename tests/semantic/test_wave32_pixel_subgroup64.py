@@ -156,6 +156,47 @@ class Wave32PixelSubgroupTests(unittest.TestCase):
             with self.subTest(subgroup_size=subgroup_size):
                 self.assertEqual(run_ps(spv, subgroup_size, inputs, lanes), expected)
 
+    def test_scalar_spill_vgpr_survives_absent_lanes(self):
+        # Pure scalar-spill VGPRs (v_writelane_b32 / v_readlane_b32 with immediate lanes and non-VGPR
+        # sources, never used as vector operands) must be parked in %sgpr rather than shuffled from
+        # physical subgroup lanes: in fragment waves for small triangles or after discards, target
+        # lanes (e.g. 0..3 or 16..19) may not be running at all, making OpGroupNonUniformShuffle UB.
+        spv = support.translate_lines("ps_wave32_scalar_spill_absent_lanes", [
+            "s_mov_b32 s20, 0x11112222",
+            "s_mov_b32 s21, 0x33334444",
+            "s_mov_b32 s22, 0x55556666",
+            "s_mov_b32 s23, 0x77778888",
+            "v_writelane_b32 v48, s20, 0",
+            "v_writelane_b32 v48, s21, 1",
+            "v_writelane_b32 v48, s22, 16",
+            "v_writelane_b32 v48, s23, 19",
+            "s_mov_b32 s20, 0",
+            "s_mov_b32 s21, 0",
+            "s_mov_b32 s22, 0",
+            "s_mov_b32 s23, 0",
+            "v_readlane_b32 s4, v48, 0",
+            "v_readlane_b32 s5, v48, 1",
+            "v_readlane_b32 s6, v48, 16",
+            "v_readlane_b32 s7, v48, 19",
+            "v_mov_b32_e32 v6, s4",
+            "v_mov_b32_e32 v7, s5",
+            "v_mov_b32_e32 v8, s6",
+            "v_mov_b32_e32 v9, s7",
+            "exp mrt0 v6, v7, v8, v9 done vm",
+            "s_endpgm",
+        ])
+        self.assertNotIn("OpGroupNonUniformShuffle", spv)
+        want = (0x11112222, 0x33334444, 0x55556666, 0x77778888)
+        for name, lanes in (
+            ("lanes_0_3_absent", [lane for lane in range(64) if lane % 32 >= 4]),
+            ("single_quad_only", [lane for lane in range(64) if lane % 32 < 4]),
+        ):
+            inputs = [0.0] * len(lanes)
+            expected = [want] * len(lanes)
+            for subgroup_size in (32, 64):
+                with self.subTest(case=name, subgroup_size=subgroup_size):
+                    self.assertEqual(run_ps(spv, subgroup_size, inputs, lanes), expected)
+
 
 if __name__ == "__main__":
     unittest.main()

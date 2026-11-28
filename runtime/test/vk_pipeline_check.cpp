@@ -1324,7 +1324,7 @@ int main(int argc, char** argv) {
 #endif
         }
         // Execution modes the translator declares (SignedZeroInfNanPreserve 32, and 64 with Float64;
-        // DenormPreserve 16) need a device property, not a feature.
+        // DenormPreserve 16; DenormFlushToZero 32) need a device property, not a feature.
         for (const auto& fc : meta.float_controls) {
             if (fc == "shaderSignedZeroInfNanPreserveFloat32") {
                 if (!indexed.shaderSignedZeroInfNanPreserveFloat32) return "no " + fc;
@@ -1332,6 +1332,8 @@ int main(int argc, char** argv) {
                 if (!indexed.shaderSignedZeroInfNanPreserveFloat64) return "no " + fc;
             } else if (fc == "shaderDenormPreserveFloat16") {
                 if (!indexed.shaderDenormPreserveFloat16) return "no " + fc;
+            } else if (fc == "shaderDenormFlushToZeroFloat32") {
+                if (!indexed.shaderDenormFlushToZeroFloat32) return "no " + fc;
             } else {
                 return "unknown float control " + fc;
             }
@@ -1349,8 +1351,15 @@ int main(int argc, char** argv) {
             if (feat == "shaderDrawParameters" && !f11.shaderDrawParameters) return "no shaderDrawParameters";
             if (feat == "bufferDeviceAddress" && !f12.bufferDeviceAddress) return "no bufferDeviceAddress";
             if (feat == "runtimeDescriptorArray" && !f12.runtimeDescriptorArray) return "no runtimeDescriptorArray";
+            if (feat == "vulkanMemoryModel" && !f12.vulkanMemoryModel) return "no vulkanMemoryModel";
+            if (feat == "vulkanMemoryModelDeviceScope" &&
+                !(f12.vulkanMemoryModel && f12.vulkanMemoryModelDeviceScope))
+                return "no vulkanMemoryModelDeviceScope";
             if (feat == "shaderImageGatherExtended" && !f2.features.shaderImageGatherExtended) return "no shaderImageGatherExtended";
             if (feat == "shaderResourceMinLod" && !f2.features.shaderResourceMinLod) return "no shaderResourceMinLod";
+            if (feat == "shaderIntegerDotProduct" &&
+                !(props.apiVersion >= VK_API_VERSION_1_3 && f13.shaderIntegerDotProduct))
+                return "no shaderIntegerDotProduct";
             if (props.apiVersion < VK_API_VERSION_1_3) {
                 if (feat == "shaderStorageImageWriteWithoutFormat" && !f2.features.shaderStorageImageWriteWithoutFormat)
                     return "no shaderStorageImageWriteWithoutFormat";

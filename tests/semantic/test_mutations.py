@@ -68,11 +68,11 @@ MUTATIONS = [
      'self.emit(f"{arg} = OpFMul %float {t} {self.fconst(1.0)}")',
      "test_ps_ops4"),
     ("v_mul_legacy_f32 drops zero-times-anything guard", TRANSLATOR,
-     # since SHADER-340 v_mul_legacy_f32 flushes its inputs and product; the guard is the OpSelect on either zero
-     '            self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")\n'
-     '            self.emit(f"{r} = OpSelect %float {either} %f0 {self.flush_f32(m)}")',
-     '            self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")\n'
-     '            self.emit(f"{r} = OpCopyObject %float {self.flush_f32(m)}")',
+     # Under default FTZ32 v_mul_legacy_f32 uses the canonical fmulz select; dropping it fails test_ps_legacy_mul.
+     '                self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")\n'
+     '                self.emit(f"{r} = OpSelect %float {either} %f0 {m}")',
+     '                self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")\n'
+     '                self.emit(f"{r} = OpCopyObject %float {m}")',
      "test_ps_legacy_mul"),
 ]
 

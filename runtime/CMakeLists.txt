@@ -16,6 +16,17 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "gta6rt must be built for x64 (run from an x64 Native Tools prompt or vcvars64.bat)")
 endif()
 
+# Target x86-64-v3 (AVX2, BMI1/2, FMA, F16C, LZCNT, POPCNT, MOVBE) on x86-64 hosts so SIMD hot paths
+# (shadow_keep::sum_of, descriptor-slot scans, texture hashing) and auto-vectorization emit 256-bit code.
+# Kept C/C++-only so ml64 does not receive an unknown switch, and skipped on non-x86-64 portable builds.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+  if(MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX2>)
+  elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-march=x86-64-v3>)
+  endif()
+endif()
+
 # Portable root-signature model + packer to user SGPRs (no d3d12.h, no windows.h), and the host CPU preflight of
 # --init/--run (src/host_cpu.h). Built on every OS, so their tests run in the Linux and macOS jobs as well as with the
 # Windows runtime.
@@ -1553,8 +1564,9 @@ if(BUILD_TESTING)
   # Which SPIR-V modules declare a storage image or buffer they may write (src/spirv_stores.h), on hand-built words.
   add_executable(spirv_stores_test test/spirv_stores_test.cpp)
   add_test(NAME spirv_stores COMMAND spirv_stores_test)
-  add_executable(list_value_wait_budget_test test/list_value_wait_budget_test.cpp)
-  add_test(NAME list_value_wait_budget COMMAND list_value_wait_budget_test)
+  # When a held console memory wait may go without its value (src/list_value_progress.h), on hand-built states.
+  add_executable(list_value_progress_test test/list_value_progress_test.cpp)
+  add_test(NAME list_value_progress COMMAND list_value_progress_test)
   add_executable(shader_fixture_path_test test/shader_fixture_path_test.cpp)
   add_test(NAME shader_fixture_path COMMAND shader_fixture_path_test)
   add_executable(resource_tiling_test test/resource_tiling_test.cpp)
@@ -2186,6 +2198,22 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_queue_query_sync COMMAND vk_queue_query_sync_test)
     set_tests_properties(vk_queue_query_sync PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  # The "submit frame" and "submit floor" lines (src/submit_phases.h): a scripted run on the CPU, then empty
+  # submissions through VulkanQueue whose floor sums must equal the phase totals (that part needs a Vulkan device).
+  add_executable(submit_frame_test test/submit_frame_test.cpp)
+  target_link_libraries(submit_frame_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(submit_frame_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(submit_frame_test PRIVATE Threads::Threads)
+  endif()
+  if(MSVC)
+    target_compile_options(submit_frame_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME submit_frame COMMAND submit_frame_test)
+  endif()
   # Fence and queue teardown with submissions pending: a fence released after an unheld Signal, the bindless upload
   # queue destroyed before another queue submits, the device-fault submit ring forgetting destroyed semaphores.
   add_executable(vk_semaphore_lifetime_test test/vk_semaphore_lifetime_test.cpp)
@@ -2202,6 +2230,65 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vk_semaphore_lifetime COMMAND vk_semaphore_lifetime_test)
     set_tests_properties(vk_semaphore_lifetime PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  endif()
+  # The sparse GPU address arena on a real device: bound bytes follow the allocations, a released block stays bound
+  # until the submission that read it has retired, and binds go to a queue of their own (src/arena_backing.h).
+  add_executable(arena_sparse_gpu_test test/arena_sparse_gpu_test.cpp)
+  target_link_libraries(arena_sparse_gpu_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(arena_sparse_gpu_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  if(MSVC)
+    target_compile_options(arena_sparse_gpu_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME arena_sparse_gpu COMMAND arena_sparse_gpu_test)
+    set_tests_properties(arena_sparse_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  endif()
+  # A console heap read in place: one home bound into a mirror chunk and into the arena shows the same bytes through
+  # both, CPU and GPU writes alike, and the unbound guard after the heap reads zero.
+  add_executable(vk_heap_alias_test test/vk_heap_alias_test.cpp)
+  target_link_libraries(vk_heap_alias_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_heap_alias_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_heap_alias_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_heap_alias COMMAND vk_heap_alias_test)
+    set_tests_properties(vk_heap_alias PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  endif()
+  # The page mirror on a real device (src/title_mirror.h): a title-written V# read through a buffer reaches its page at
+  # heap_base + its title address; remaps, writes and unmaps reach the next dispatch that waits for the bind.
+  add_executable(vk_title_mirror_test test/vk_title_mirror_test.cpp)
+  target_link_libraries(vk_title_mirror_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_title_mirror_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_title_mirror_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+  if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    set(_title_mirror_spv ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_title_mirror_read.spv)
+    add_custom_command(OUTPUT ${_title_mirror_spv}
+      COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${_title_mirror_spv}
+              ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_title_mirror_read.comp
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_title_mirror_read.comp
+      COMMENT "Compiling the page mirror test shader" VERBATIM)
+    target_sources(vk_title_mirror_test PRIVATE ${_title_mirror_spv})
+    target_compile_definitions(vk_title_mirror_test PRIVATE LEONIDA_TEST_TITLE_MIRROR_SPV="${_title_mirror_spv}")
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_title_mirror COMMAND vk_title_mirror_test)
+    set_tests_properties(vk_title_mirror PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  endif()
+  # A measurement, not a test: what page-sized sparse binds cost on the device (the page mirror's layout).
+  add_executable(vk_sparse_bind_bench test/vk_sparse_bind_bench.cpp)
+  target_link_libraries(vk_sparse_bind_bench PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_sparse_bind_bench PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   endif()
   # The AMD breadcrumbs (LEONIDA_DEVICE_MARKERS) on a real device: after a few dispatches and a wait, the queue's
   # started and finished markers hold the last dispatch's seq. SKIP without VK_AMD_buffer_marker.
@@ -2257,6 +2344,34 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(vk_overlapping_occlusion vk_overlapping_occlusion_no_statistics
                            PROPERTIES SKIP_RETURN_CODE 77)
     endif()
+    # LEONIDA_GPU_PROFILE (src/vulkan_gpu_profile.h): known dispatches and a draw through VulkanQueue, each pipeline
+    # reported under its name with its calls, runs and a GPU time that grows with its work; prints the cost when on.
+    add_executable(vk_gpu_profile_test test/vk_gpu_profile_test.cpp)
+    target_link_libraries(vk_gpu_profile_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    if(WIN32)
+      target_compile_definitions(vk_gpu_profile_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    else()
+      find_package(Threads REQUIRED)
+      target_link_libraries(vk_gpu_profile_test PRIVATE Threads::Threads)
+    endif()
+    if(MSVC)
+      target_compile_options(vk_gpu_profile_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    foreach(stage comp vert)
+      set(source "${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/gpu_profile_spin.${stage}")
+      set(output "${CMAKE_CURRENT_BINARY_DIR}/gpu_profile_spin.${stage}.spv")
+      add_custom_command(OUTPUT "${output}"
+                         COMMAND "${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.0
+                                 -o "${output}" "${source}"
+                         DEPENDS "${source}" VERBATIM)
+      target_sources(vk_gpu_profile_test PRIVATE "${output}")
+    endforeach()
+    if(BUILD_TESTING)
+      add_test(NAME vk_gpu_profile COMMAND vk_gpu_profile_test
+               "${CMAKE_CURRENT_BINARY_DIR}/gpu_profile_spin.comp.spv"
+               "${CMAKE_CURRENT_BINARY_DIR}/gpu_profile_spin.vert.spv")
+      set_tests_properties(vk_gpu_profile PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
   endif()
   # CPU-only: the ranking that makes these harnesses prefer a native ICD over Mesa's Dozen (#915). No GPU needed.
   add_executable(vk_device_pick_test test/vk_device_pick_test.cpp)
@@ -2276,6 +2391,19 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vk_bc_zero_init COMMAND vk_bc_zero_init_test)
     set_tests_properties(vk_bc_zero_init PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # GPU detile compute shader & linear direct copy parity against CPU console texture detiler (src/vulkan_title_detile.h).
+  add_executable(vk_title_detile_test test/vk_title_detile_test.cpp)
+  target_link_libraries(vk_title_detile_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_title_detile_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_title_detile_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_title_detile COMMAND vk_title_detile_test)
+    set_tests_properties(vk_title_detile PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   # FenceWaitDispatcher concurrency and device-lost regressions (re-entrant callbacks, wakeup on device lost, counter error drain).
   add_executable(vk_fence_dispatcher_sync_test test/vk_fence_dispatcher_sync_test.cpp)
@@ -2967,6 +3095,25 @@ if(TARGET Vulkan::Headers)
         LEONIDA_TEST_CS_R9G9B9E5_UAV_SPV="${LEONIDA_TEST_CS_R9G9B9E5_UAV}")
     endif()
 
+    # The page mirror in the game's device over xmem's pages (src/title_mirror.h): a stream pool's GPU-only pages,
+    # their twins and the title's own view at heap_base + their address, after slot-31 copies, title writes and remaps.
+    add_executable(d3d12_page_mirror_test test/d3d12_page_mirror_test.cpp shims/xmem.cpp shims/registry.cpp)
+    target_link_libraries(d3d12_page_mirror_test PRIVATE gta6rt_d3d12_com d3d12 dxgi psapi)
+    target_compile_definitions(d3d12_page_mirror_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_page_mirror_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(d3d12_page_mirror_test PRIVATE /OPT:NOREF)
+    add_test(NAME d3d12_page_mirror COMMAND d3d12_page_mirror_test)
+    set_tests_properties(d3d12_page_mirror PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # A console heap read in place through the page mirror: the GPU reads the filtered slots below 4 GiB of the arena,
+    # the title's bytes never change, a rewrite reaches the GPU at the next refresh, zeros after the heap.
+    add_executable(d3d12_heap_in_place_test test/d3d12_heap_in_place_test.cpp shims/xmem.cpp shims/registry.cpp)
+    target_link_libraries(d3d12_heap_in_place_test PRIVATE gta6rt_d3d12_com d3d12 dxgi psapi)
+    target_compile_definitions(d3d12_heap_in_place_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_heap_in_place_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(d3d12_heap_in_place_test PRIVATE /OPT:NOREF)
+    add_test(NAME d3d12_heap_in_place COMMAND d3d12_heap_in_place_test)
+    set_tests_properties(d3d12_heap_in_place PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
     # Debug markers as VK_EXT_debug_utils labels, and private data on every object (D3D-24).
     add_executable(d3d12_debug_markers_test test/d3d12_debug_markers_test.cpp)
     target_link_libraries(d3d12_debug_markers_test PRIVATE gta6rt_d3d12_com)
@@ -2985,7 +3132,7 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_host_prefix COMMAND d3d12_existing_heap_test --host-prefix-only)
     set_tests_properties(d3d12_host_prefix PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(d3d12_existing_heap PROPERTIES SKIP_RETURN_CODE 77)
-    # LEONIDA_TEXTURE_REFRESH_ASYNC=1 (set by the test itself): a mapped plane's first submission reads its bytes.
+    # A mapped plane's first submission reads its bytes.
     add_test(NAME d3d12_mapped_plane_async COMMAND d3d12_existing_heap_test --mapped-plane-async)
     set_tests_properties(d3d12_mapped_plane_async PROPERTIES SKIP_RETURN_CODE 77)
     # The same with write watching off: the guarded cases only, the concurrent writers among them.
@@ -2996,6 +3143,14 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_existing_heap_write_watch COMMAND d3d12_existing_heap_test)
     set_tests_properties(d3d12_existing_heap_write_watch PROPERTIES SKIP_RETURN_CODE 77
                          ENVIRONMENT "LEONIDA_WRITE_WATCH=1")
+    # What a guard costs on this host (fault, VirtualProtect, re-arming, write watch, soft-dirty): prints a table for
+    # the tracking policy (src/title_write_policy.h).
+    add_executable(guard_fault_bench test/guard_fault_bench.cpp)
+    target_compile_definitions(guard_fault_bench PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    # The page mirror's hot/cold tracking (src/title_mirror_hot_cold.h) on real guards.
+    add_executable(title_mirror_hot_cold_test test/title_mirror_hot_cold_test.cpp)
+    target_compile_definitions(title_mirror_hot_cold_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_test(NAME title_mirror_hot_cold COMMAND title_mirror_hot_cold_test)
     # Slot 133 on untouched xmem physical pages: committed through the pages hook, then imported. xmem.cpp and
     # registry.cpp are compiled in, as xmem_test does, to reach the registered XMem* exports.
     add_executable(d3d12_xmem_placed_test test/d3d12_xmem_placed_test.cpp shims/xmem.cpp shims/registry.cpp)
@@ -4032,6 +4187,14 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_title_va_shadow PROPERTIES ENVIRONMENT "LEONIDA_TEST_CONSOLE_SHADOW=1;LEONIDA_GEOMETRY_MB=0" SKIP_RETURN_CODE 77)
       add_test(NAME d3d12_geometry_views COMMAND d3d12_title_va_test)
       set_tests_properties(d3d12_geometry_views PROPERTIES ENVIRONMENT "LEONIDA_GEOMETRY_MB=16" SKIP_RETURN_CODE 77)
+      # The same two on the device the game makes (create_vulkan_device_standalone, with the arena's bind queue): where
+      # the GPU can, the arena is sparse, and on RADV every buffer outside it then lies 64 TiB below heap_base, so
+      # title windows, shadows and geometry copies are reached through negative (sign-extended) V# offsets.
+      add_test(NAME d3d12_title_va_game_device COMMAND d3d12_title_va_test --game-device)
+      set_tests_properties(d3d12_title_va_game_device PROPERTIES ENVIRONMENT "LEONIDA_ARENA_MB=1024" SKIP_RETURN_CODE 77)
+      add_test(NAME d3d12_geometry_views_game_device COMMAND d3d12_title_va_test --game-device)
+      set_tests_properties(d3d12_geometry_views_game_device PROPERTIES
+                           ENVIRONMENT "LEONIDA_GEOMETRY_MB=16;LEONIDA_ARENA_MB=1024" SKIP_RETURN_CODE 77)
       set_tests_properties(d3d12_title_va PROPERTIES SKIP_RETURN_CODE 77)
       # Past LEONIDA_TITLE_WINDOWS_MB a view of the title's memory is never its raw VA (#1537): with no other backing it
       # is written zero-size, and a dispatch through it reads zeros.
@@ -4324,6 +4487,16 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_set0_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_set0_compute COMMAND d3d12_set0_compute_test)
       set_tests_properties(d3d12_set0_compute PROPERTIES SKIP_RETURN_CODE 77)
+      # A T# written into a console heap before its texture exists samples the texture at the first submission after
+      # it appears (the heap's slot records), and leaves the hash table when it goes.
+      add_executable(d3d12_tsharp_refill_test test/d3d12_tsharp_refill_test.cpp shims/d3d12_xs_device.cpp
+                     shims/d3d12_xs_pso_stream.cpp ${LEONIDA_TEST_CS_SET0_SAMPLE})
+      target_link_libraries(d3d12_tsharp_refill_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_tsharp_refill_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_CS_SET0_SAMPLE_SPV="${LEONIDA_TEST_CS_SET0_SAMPLE}")
+      target_compile_options(d3d12_tsharp_refill_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_tsharp_refill COMMAND d3d12_tsharp_refill_test)
+      set_tests_properties(d3d12_tsharp_refill PROPERTIES SKIP_RETURN_CODE 77)
       set(depth_uav_shader ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_depth_stencil_uav.comp)
       foreach(variant IN ITEMS DEPTH_STENCIL_2D DEPTH_STENCIL_ARRAY DEPTH16_2D DEPTH16_ARRAY)
         set(spv ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_depth_uav_${variant}.spv)
@@ -4858,6 +5031,14 @@ if(TARGET Vulkan::Headers)
       target_compile_options(arena_blocks_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME arena_blocks COMMAND arena_blocks_test)
+    # The GPU address arena's backing blocks with fake hooks: placement, binding, unbinding after the release ticket,
+    # the constant-time accessor and the bind queue choice (src/arena_backing.h).
+    add_executable(arena_backing_test test/arena_backing_test.cpp)
+    target_link_libraries(arena_backing_test PRIVATE Vulkan::Headers)
+    if(WIN32 AND MSVC)
+      target_compile_options(arena_backing_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME arena_backing COMMAND arena_backing_test)
     # The mem probe's breakdown line: the tally by consumer, the owner scopes and the text (src/memory_breakdown.h).
     add_executable(memory_breakdown_test test/memory_breakdown_test.cpp)
     if(WIN32 AND MSVC)
@@ -4887,7 +5068,33 @@ if(TARGET Vulkan::Headers)
       target_compile_options(shadow_keep_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME shadow_keep COMMAND shadow_keep_test)
+    # The host's reads of title pages only xmem's frame table holds (src/title_frames.h).
+    add_executable(title_frames_test test/title_frames_test.cpp)
+    if(WIN32 AND MSVC)
+      target_compile_options(title_frames_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME title_frames COMMAND title_frames_test)
+    # The page mirror's hooks for descriptor heaps read in place: a second binding of a range's pages, and a filter on
+    # the fill path (src/title_mirror.h). No GPU.
+    add_executable(title_mirror_hooks_test test/title_mirror_hooks_test.cpp)
+    target_link_libraries(title_mirror_hooks_test PRIVATE Vulkan::Headers)
+    if(WIN32 AND MSVC)
+      target_compile_options(title_mirror_hooks_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME title_mirror_hooks COMMAND title_mirror_hooks_test)
+    # The XMemAlloc heap in the page mirror's range (src/title_heap.h).
+    add_executable(title_heap_test test/title_heap_test.cpp)
+    if(WIN32 AND MSVC)
+      target_compile_options(title_heap_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME title_heap COMMAND title_heap_test)
     # Queue construction cleans its Vulkan handles if holder registration runs out of host memory.
+    # Which title textures the refresh looks at: only those something says changed (src/title_texture_watch.h).
+    add_executable(title_texture_watch_test test/title_texture_watch_test.cpp)
+    add_test(NAME title_texture_watch COMMAND title_texture_watch_test)
+    # Hot pages copied every submission, cold ones guarded (src/title_write_policy.h): nothing missed.
+    add_executable(title_write_policy_test test/title_write_policy_test.cpp)
+    add_test(NAME title_write_policy COMMAND title_write_policy_test)
     add_executable(vk_host_texture_order_test test/vk_host_texture_order_test.cpp)
     target_link_libraries(vk_host_texture_order_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     if(WIN32)
@@ -4914,6 +5121,26 @@ if(TARGET Vulkan::Headers)
     endif()
     add_test(NAME vk_xdxr_postbuild_readback COMMAND vk_xdxr_postbuild_readback_test)
     set_tests_properties(vk_xdxr_postbuild_readback PROPERTIES SKIP_RETURN_CODE 77)
+    # Round 3B runtime hooks: LiteralSamplerSpec, reads_glc_buffer barrier, writes_buffer hook, VulkanMemoryModel.
+    add_executable(r3b_runtime_hooks_test test/r3b_runtime_hooks_test.cpp)
+    target_link_libraries(r3b_runtime_hooks_test PRIVATE Vulkan::Headers Threads::Threads ${CMAKE_DL_LIBS})
+    if(WIN32)
+      target_compile_definitions(r3b_runtime_hooks_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      if(MSVC)
+        target_compile_options(r3b_runtime_hooks_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+      endif()
+    endif()
+    add_test(NAME r3b_runtime_hooks COMMAND r3b_runtime_hooks_test)
+    # Stage 5b replay state caching: redundant bind/push/dynamic-state elision, helper invalidation, throughput & GPU validation.
+    add_executable(replay_state_cache_test test/replay_state_cache_test.cpp)
+    target_link_libraries(replay_state_cache_test PRIVATE Vulkan::Headers Threads::Threads ${CMAKE_DL_LIBS})
+    if(WIN32)
+      target_compile_definitions(replay_state_cache_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      if(MSVC)
+        target_compile_options(replay_state_cache_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+      endif()
+    endif()
+    add_test(NAME replay_state_cache COMMAND replay_state_cache_test)
 
     # Title-placed buffer VAs (device slot 133) and the console VA shaders reach them by (src/title_va_alias.h).
     add_executable(title_va_alias_test test/title_va_alias_test.cpp)

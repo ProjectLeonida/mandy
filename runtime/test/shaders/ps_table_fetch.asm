@@ -1,6 +1,9 @@
 ; vk_texture_test fetch-sint / fetch-uint / fetch-miss. Texel (0,0) holds bytes
 ; 82 22 f8 4d: expect (-126,34,-8,77) or (130,34,248,77). A key mismatch
 ; fetches magenta UNORM at index zero. Convert raw integer words for RGBA32F output.
+; s0 is a descriptor-table pointer (s1 = 0): the index comes from the T#'s dword 6 (docs/design.md, "Bindless index in
+; the T#"), and fetch-miss writes a dword 6 without the index tag, which must read index zero.
+s_mov_b32 s1, 0
 s_load_dwordx8 s[8:15], s[0:1], 0
 s_waitcnt lgkmcnt(0)
 v_mov_b32_e32 v0, 0

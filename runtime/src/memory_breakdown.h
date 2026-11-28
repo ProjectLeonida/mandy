@@ -32,6 +32,7 @@ enum class Consumer : std::uint8_t {
     image_blocks,   // blocks that hold many textures (ImageMemory, TitleImagePool)
     sampled,        // dedicated memory of a texture that is not an attachment
     render_target,  // dedicated memory of a colour or depth/stencil attachment
+    mirror,         // the page mirror's homes: one per physical page the GPU reads (src/title_mirror.h)
     count
 };
 
@@ -48,6 +49,7 @@ inline const char* consumer_name(Consumer c) {
         case Consumer::image_blocks: return "texture blocks";
         case Consumer::sampled: return "sampled textures";
         case Consumer::render_target: return "render targets and depth";
+        case Consumer::mirror: return "page mirror";
         default: return "?";
     }
 }
@@ -111,7 +113,11 @@ struct DeviceShare {
     std::uint64_t arena_in_use = 0;    // bytes allocations hold
     // arena_in_use by kind, as DeviceState::ArenaUse: buffers, descriptor heaps, shader code, heaps
     std::array<std::uint64_t, 4> arena_use{};
+    std::uint64_t arena_windows = 0;  // arena_in_use held by title windows and slot-133 shadows
     std::uint64_t bindless_table_bytes = 0;  // allocated by BindlessSet through its own function table
+    bool mirror = false;  // the page mirror is on: its homes, the pages bound to them, its chunks
+    std::uint64_t mirror_homes = 0, mirror_pages = 0, mirror_chunks = 0;
+    std::uint64_t mirror_units_local = 0, mirror_units_host = 0;  // its units of homes by memory
 };
 
 inline double mib(std::uint64_t bytes) { return double(bytes) / 1048576.0; }
@@ -131,12 +137,34 @@ inline std::string format(const Tally& tally, const DeviceShare& device, std::ui
         out += item;
         first = false;
         if (Consumer(c) == Consumer::arena && device.arena) {
+            if (device.arena_windows) {
+                std::snprintf(item, sizeof item,
+                              " [reserved %.0f, bound %.0f, in use %.0f: buffers %.0f, descriptor heaps %.0f, shader "
+                              "code %.0f, heaps %.0f, windows/shadows %.0f]",
+                              mib(device.arena_reserved), mib(device.arena_bound), mib(device.arena_in_use),
+                              mib(device.arena_use[0]), mib(device.arena_use[1]), mib(device.arena_use[2]),
+                              mib(device.arena_use[3]), mib(device.arena_windows));
+            } else {
+                std::snprintf(item, sizeof item,
+                              " [reserved %.0f, bound %.0f, in use %.0f: buffers %.0f, descriptor heaps %.0f, shader "
+                              "code %.0f, heaps %.0f]",
+                              mib(device.arena_reserved), mib(device.arena_bound), mib(device.arena_in_use),
+                              mib(device.arena_use[0]), mib(device.arena_use[1]), mib(device.arena_use[2]),
+                              mib(device.arena_use[3]));
+            }
+            out += item;
+        }
+        if (Consumer(c) == Consumer::windows && device.arena_windows) {
+            std::snprintf(item, sizeof item, " [in arena %.0f MiB]", mib(device.arena_windows));
+            out += item;
+        }
+        if (Consumer(c) == Consumer::mirror && device.mirror) {
             std::snprintf(item, sizeof item,
-                          " [reserved %.0f, bound %.0f, in use %.0f: buffers %.0f, descriptor heaps %.0f, shader code "
-                          "%.0f, heaps %.0f]",
-                          mib(device.arena_reserved), mib(device.arena_bound), mib(device.arena_in_use),
-                          mib(device.arena_use[0]), mib(device.arena_use[1]), mib(device.arena_use[2]),
-                          mib(device.arena_use[3]));
+                          " [homes bound %.0f MiB (%llu), pages mirrored %llu, chunks %llu, units %llu device-local %llu "
+                          "host]",
+                          mib(device.mirror_homes * 0x10000), (unsigned long long)device.mirror_homes,
+                          (unsigned long long)device.mirror_pages, (unsigned long long)device.mirror_chunks,
+                          (unsigned long long)device.mirror_units_local, (unsigned long long)device.mirror_units_host);
             out += item;
         }
     }

@@ -1745,6 +1745,10 @@ int main(int argc, char** argv) {
         window_write_back_tile || (argc == 2 && std::strcmp(argv[1], "--window-writeback-fault") == 0);
     const bool placed_write_back = argc == 2 && std::strcmp(argv[1], "--placed-writeback") == 0;
     const bool keep_refill = argc == 2 && std::strcmp(argv[1], "--shadow-keep-refill") == 0;
+    // The device the game makes (create_vulkan_device_standalone: the arena's bind queue, so a sparse arena where the
+    // GPU can), not one built on the test's own Vulkan device: a sparse arena puts every other buffer below heap_base
+    // on RADV, which the test's own device never showed.
+    const bool game_device = argc == 2 && std::strcmp(argv[1], "--game-device") == 0;
     if (window_cap) {
         const char* cap = std::getenv("LEONIDA_TITLE_WINDOWS_MB");
         if (!cap || std::strcmp(cap, "0")) {
@@ -1773,7 +1777,7 @@ int main(int argc, char** argv) {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"cs_user_data\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(fssm)
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
-                 "\"uses_code_base\": true, \"wave64\": false}}";
+                 "\"uses_code_base\": true, \"wave64\": false, \"vsharp_base_sign_extended\": true}}";
     }
 
     int checks = 0;
@@ -1793,7 +1797,34 @@ int main(int argc, char** argv) {
         Ref<ID3D12Device> first;
         if (second_device) EXPECT(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&first.p)) == S_OK);
         ID3D12Device* inner = nullptr;  // owned by the proxy, as in d3d12_compute_test
-        EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
+        if (game_device) {
+            // The standalone device reads its shaders from LEONIDA_SHADERS, as the game's does.
+            const std::string dir = library.string();
+            SetEnvironmentVariableA("LEONIDA_SHADERS", dir.c_str());
+            _putenv_s("LEONIDA_SHADERS", dir.c_str());
+            if (FAILED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&inner)))) {
+                std::fprintf(stderr, "SKIP: no standalone Vulkan device\n");
+                return 77;
+            }
+        } else {
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
+        }
+        if (game_device) {
+            // The module above sign-extends a V# base, so buffers outside the arena may lie below heap_base, and the
+            // arena binds its memory as it is used wherever the device can (sparse binding and residency, strict
+            // non-resident reads, a queue for the binds): not its whole range at once.
+            const auto arena = rt::d3d12::device_arena_memory(inner);
+            std::fprintf(stderr, "game device: arena %llu MiB at 0x%llx, %llu KiB bound, %s (capable: %s), %s V# "
+                                 "offsets\n",
+                         static_cast<unsigned long long>(arena.size >> 20),
+                         static_cast<unsigned long long>(arena.address),
+                         static_cast<unsigned long long>(arena.bound >> 10), arena.sparse ? "sparse" : "one allocation",
+                         arena.sparse_capable ? "yes" : "no", arena.signed_offsets ? "signed" : "unsigned");
+            EXPECT(arena.size != 0);
+            EXPECT(arena.signed_offsets);
+            EXPECT(arena.sparse == arena.sparse_capable);
+            if (arena.sparse) EXPECT(arena.bound < arena.size);
+        }
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
                                                            reinterpret_cast<void**>(&device.p))));

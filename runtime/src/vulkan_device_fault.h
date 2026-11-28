@@ -179,11 +179,15 @@ struct CheckpointSubmission {
     static constexpr std::size_t dispatch_limit = 64;
     // Numbers every recorded dispatch, across queues and submissions (the report's seq). Null: no numbers.
     std::atomic<std::uint64_t>* dispatch_seq = nullptr;
-    // LEONIDA_DEVICE_MARKERS=1: this queue's marker slot, every dispatch recorded for the marker history and the seq
-    // whose finished marker is still to be written after its dispatch (CheckpointRecorder::dispatched).
+    // LEONIDA_DEVICE_MARKERS=1: this queue's marker slot, every dispatch and draw recorded for the marker history and
+    // the seq whose finished marker is still to be written after its work (CheckpointRecorder::dispatched, drawn).
     MarkerTarget markers;
-    std::vector<MarkedDispatch> marked;
+    std::vector<MarkedWork> marked;
     std::uint64_t open_marker = 0;
+    // The run of draws to one set of targets the last marked draw belongs to (CheckpointRecorder::draw).
+    std::size_t pass_list = SIZE_MAX;
+    std::uint64_t pass_targets = 0;
+    std::uint32_t pass_command = 0, pass_draws = 0;
 
     void append_dispatch(CheckpointDispatch d) {
         if (dispatches.size() < dispatch_limit) dispatches.push_back(d);
@@ -240,6 +244,42 @@ struct CheckpointRecorder {
         submission.markers.finished(buffer, submission.open_marker);
         submission.open_marker = 0;
     }
+
+    // LEONIDA_DEVICE_MARKERS=1: a draw of pipeline `id` comes next, before its helper passes and its rendering scope.
+    // It takes the next seq, goes into the marker history and writes its started marker; drawn() writes the finished
+    // one. `flags` are marked_draw bits, `counts` as MarkedWork::counts (describe_marked). Without the markers it does
+    // nothing, so the dispatch numbering stays as it was.
+    void draw(VkCommandBuffer buffer, std::size_t command, std::uintptr_t id, std::uint8_t flags,
+              std::array<std::uint32_t, 3> counts, const MarkedTargets& targets = {}) const {
+        if (!submission.markers || !submission.dispatch_seq) return;
+        const std::uint64_t seq = submission.dispatch_seq->fetch_add(1, std::memory_order_relaxed) + 1;
+        MarkedWork w{seq, submission.execute_call, submission.queue, submission.queue_kind,
+                     static_cast<std::uint32_t>(list), static_cast<std::uint32_t>(command)};
+        w.kind = MarkedKind::draw;
+        w.draw_flags = flags;
+        w.pipeline = id;
+        if (const auto names = pipeline_names.find(id); names != pipeline_names.end()) w.stages = names->second;
+        w.counts = counts;
+        if (targets.key) {
+            if (submission.pass_list != list || submission.pass_targets != targets.key) {
+                submission.pass_list = list;
+                submission.pass_targets = targets.key;
+                submission.pass_command = static_cast<std::uint32_t>(command);
+                submission.pass_draws = 0;
+            }
+            w.pass_command = submission.pass_command;
+            w.pass_draw = ++submission.pass_draws;
+            w.area = targets.area;
+            w.colors = targets.colors;
+            w.depth = targets.depth;
+        }
+        submission.marked.push_back(w);
+        submission.markers.started(buffer, seq);
+        submission.open_marker = seq;
+    }
+
+    // After the draw that draw() announced, once its rendering scope has ended: its finished marker.
+    void drawn(VkCommandBuffer buffer) const { dispatched(buffer); }
 };
 
 // A D3D fence may stay unsignalled by design. Only queue retirement tickets represent
@@ -1402,52 +1442,93 @@ public:
     }
 
     // LEONIDA_DEVICE_MARKERS=1: each queue's marker slot judged against the marker history, printed; returns the
-    // likely hangs (the oldest started, unfinished dispatch of each queue) for dump_dispatches to mark.
-    std::vector<std::uint64_t> report_markers(bool lost) noexcept {
+    // likely hangs (the oldest started, unfinished dispatch or draw of each queue) for dump_dispatches to mark. Each
+    // queue's verdict line is followed by the items it names, dispatches and draws alike (describe_marked): the last
+    // finished one, the likely hang and the rest in flight (up to 8), or for an idle queue the next not started.
+    // `text`, when given, also gets the lines (the tests read them).
+    std::vector<std::uint64_t> report_markers(bool lost, std::string* text = nullptr) noexcept {
         std::vector<std::uint64_t> hangs;
         if (!markers_) return hangs;
         try {
+            std::string out = std::string("[rt] device-markers: AMD buffer markers, read ") +
+                              (lost ? "after the device loss" : "while the device is still up") + "; best-effort: " +
+                              (lost ? "only what the GPU wrote before it stopped, and a reset may have lost the last "
+                                      "writes"
+                                    : "the GPU may still be writing them") +
+                              "\n";
             std::lock_guard lock(mutex_);
-            std::fprintf(stderr, "[rt] device-markers: AMD buffer markers, read %s; best-effort: %s\n",
-                         lost ? "after the device loss" : "while the device is still up",
-                         lost ? "only what the GPU wrote before it stopped, and a reset may have lost the last writes"
-                              : "the GPU may still be writing them");
             for (VkQueue queue : markers_->queues()) {
                 const MarkerQueueReport r = judge_markers(queue, markers_->read(queue), *history_);
-                if (!r.slot.started && !r.slot.finished && !r.next_queued) continue;  // never marked a dispatch
+                if (!r.slot.started && !r.slot.finished && !r.next_queued) continue;  // never marked anything
                 const char* kind = r.queue_kind ? r.queue_kind : "?";
+                constexpr std::size_t in_flight_lines = 8;
+                std::vector<std::uint64_t> named;  // the items the detail lines describe, in print order
                 if (r.idle()) {
-                    std::fprintf(stderr, "[rt] device-markers: queue %p (%s) idle: finished seq=%u, nothing started "
-                                         "after it", static_cast<void*>(queue), kind, unsigned(r.slot.finished));
+                    out += "[rt] device-markers: queue " + hex(queue) + " (" + kind + ") idle: finished seq=" +
+                           std::to_string(r.slot.finished) + ", nothing started after it";
                     if (r.next_queued)
-                        std::fprintf(stderr, "; next submitted seq=%" PRIu64 " not started (waiting, or behind other "
-                                             "work of the queue)", r.next_queued);
-                    std::fputc('\n', stderr);
-                    continue;
+                        out += "; next submitted seq=" + std::to_string(r.next_queued) +
+                               " not started (waiting, or behind other work of the queue)";
+                    out += '\n';
+                } else {
+                    out += "[rt] device-markers: queue " + hex(queue) + " (" + kind + ") finished seq=" +
+                           std::to_string(r.slot.finished) + " started seq=" + std::to_string(r.slot.started) +
+                           "; started, not finished:";
+                    for (std::size_t i = 0; i < r.unfinished.size() && i < 16; ++i)
+                        out += " " + std::to_string(r.unfinished[i]);
+                    if (r.unfinished.size() > 16) out += " (+" + std::to_string(r.unfinished.size() - 16) + ")";
+                    if (r.missing) out += " (no longer in the marker history)";
+                    out += '\n';
+                    if (r.likely_hang) hangs.push_back(r.likely_hang);
                 }
-                std::string line = "[rt] device-markers: queue " + hex(queue) + " (" + kind + ") finished seq=" +
-                                   std::to_string(r.slot.finished) + " started seq=" + std::to_string(r.slot.started) +
-                                   "; started, not finished:";
-                for (std::size_t i = 0; i < r.unfinished.size() && i < 16; ++i)
-                    line += " " + std::to_string(r.unfinished[i]);
-                if (r.unfinished.size() > 16) line += " (+" + std::to_string(r.unfinished.size() - 16) + ")";
-                if (r.missing) line += " (no longer in the marker history)";
-                line += '\n';
-                std::fputs(line.c_str(), stderr);
-                if (!r.likely_hang) continue;
-                hangs.push_back(r.likely_hang);
-                history_->for_each([&](const MarkedDispatch& d) {
-                    if (d.seq != r.likely_hang) return;
-                    std::fprintf(stderr, "[rt] device-markers: likely hang: seq=%" PRIu64 " execute=%" PRIu64
-                                         " queue=%p (%s) list=%u command=%u shader=%s\n",
-                                 d.seq, d.execute_call, static_cast<void*>(d.queue), kind, d.list, d.command,
-                                 d.shader ? d.shader : "-");
+                if (r.last_finished) named.push_back(r.last_finished);
+                for (std::size_t i = 0; i < r.unfinished.size() && i < in_flight_lines; ++i)
+                    named.push_back(r.unfinished[i]);
+                if (r.next_queued) named.push_back(r.next_queued);
+                std::vector<const MarkedWork*> found(named.size(), nullptr);
+                history_->for_each([&](const MarkedWork& d) {
+                    if (d.queue != queue) return;
+                    for (std::size_t i = 0; i < named.size(); ++i)
+                        if (named[i] == d.seq) found[i] = &d;
                 });
+                for (std::size_t i = 0; i < named.size(); ++i) {
+                    if (!found[i]) continue;
+                    const std::uint64_t seq = named[i];
+                    const char* what = seq == r.likely_hang          ? "likely hang: "
+                                       : seq == r.last_finished       ? "  finished: "
+                                       : seq == r.next_queued         ? "  not started: "
+                                                                      : "  in flight: ";
+                    out += std::string("[rt] device-markers: ") + what + describe_marked(*found[i]) + '\n';
+                }
+                if (r.unfinished.size() > in_flight_lines)
+                    out += "[rt] device-markers:   in flight: (+" +
+                           std::to_string(r.unfinished.size() - in_flight_lines) + " more)\n";
             }
+            std::fputs(out.c_str(), stderr);
+            if (text) *text += out;
         } catch (...) {
             std::fprintf(stderr, "[rt] device-markers: marker collection failed\n");
         }
         return hangs;
+    }
+
+    // LEONIDA_DEVICE_MARKERS=1, for a device-fault address: the last draw each queue started (the GPU's top-of-pipe
+    // marker reached it), and whether its finished marker ran. Empty without markers or without such a draw.
+    std::string marker_fault_draws() {
+        std::string out;
+        if (!markers_) return out;
+        std::lock_guard lock(mutex_);
+        for (VkQueue queue : markers_->queues()) {
+            const MarkerQueueReport r = judge_markers(queue, markers_->read(queue), *history_);
+            if (!r.last_draw) continue;
+            history_->for_each([&](const MarkedWork& d) {
+                if (d.queue != queue || d.seq != r.last_draw) return;
+                out += std::string("[rt] device-fault: last started draw (device-markers): ") + describe_marked(d) +
+                       (marker_after(d.seq, r.slot.finished) ? " (not finished)" : " (finished)") +
+                       (d.seq == r.likely_hang ? " <- likely hang" : "") + '\n';
+            });
+        }
+        return out;
     }
 
 private:
@@ -1461,8 +1542,8 @@ private:
                          int(result));
             return;
         }
-        std::fprintf(stderr, "[rt] device-markers: on (VK_AMD_buffer_marker, %s): each dispatch writes its seq at top "
-                             "and bottom of pipe\n",
+        std::fprintf(stderr, "[rt] device-markers: on (VK_AMD_buffer_marker, %s): each dispatch and draw writes its "
+                             "seq at top and bottom of pipe\n",
                      markers->synchronization2() ? "vkCmdWriteBufferMarker2AMD" : "vkCmdWriteBufferMarkerAMD");
         history_ = std::make_unique<MarkerHistory>();
         markers_ = std::move(markers);
@@ -1544,7 +1625,7 @@ private:
         }
     }
 
-    void report_fault() const {
+    void report_fault() {
         VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
         VkResult result = vkGetDeviceFaultInfoEXT(device_, &counts, nullptr);
         if (result != VK_SUCCESS) {
@@ -1579,6 +1660,8 @@ private:
                                  " precision=%" PRIu64 "\n",
                          i, int(address.addressType), address.reportedAddress, address.addressPrecision);
         }
+        // The draw that was running when the address faulted, as far as the AMD markers say.
+        if (counts.addressInfoCount) std::fputs(marker_fault_draws().c_str(), stderr);
         for (std::size_t i = 0; i < counts.vendorInfoCount; ++i) {
             const auto& vendor = vendors[i];
             std::fprintf(stderr, "[rt] device-fault: vendor[%zu] %.*s code=0x%" PRIx64 " data=0x%" PRIx64 "\n",

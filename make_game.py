@@ -1863,10 +1863,11 @@ def exe_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
 WAVE64_MODES = ("auto", "on", "off")
 
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
-FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
+FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--no-ftz32", "no_ftz32"),
+                  ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
                   ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
-                  ("--compact-spirv", "compact_spirv"))
+                  ("--compact-spirv", "compact_spirv"), ("--integer-dot-fallback", "integer_dot_fallback"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -2028,6 +2029,13 @@ def runtime_gpu_per_vertex():
         return None
 
 
+def runtime_gpu_integer_dot_product():
+    """shaderIntegerDotProduct as tools/vk_subgroup_info.py answers for the GPU the runtime would use (required by
+    Vulkan 1.3, so False only on a Vulkan 1.2 device such as MoltenVK's), or None when it can't be told."""
+    v = runtime_gpu_info().get("integer_dot_product")
+    return v if isinstance(v, bool) else None
+
+
 def runtime_gpu_barycentric_fallback():
     """Whether the selected Vulkan GPU's driver has a known BaryCoordKHR bug (Mesa ANV, AMD Windows on gfx90c), or None
     when it can't be told."""
@@ -2072,7 +2080,7 @@ def runtime_gpu_max_push_constants():
 
 
 # Source and data files that produce the translated modules, metadata, partner stubs and native PSO catalog.
-TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "file_mode.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
+TRANSLATION_SOURCES = ("rdna2spirv.py", "descriptor_sources.py", "heap_index_census.py", "shader_ir.py", "cfg_structure.py", "file_mode.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
                        "wave64_emulate_opt.py", "spirv_loop_guard.py", "shader_meta.py", "spirv_stubs.py", "spirv_asm.py", "spirv_asm_tables.py",
                        "spirv_opt.py", "report_paths.py", "replace_retry.py", "fssm_unpack.py", "shader_stage_manifest.py",
                        "rdna2_decode.py", "rdna2_isa_tables.py", "gfx10_formats.json",
@@ -3191,9 +3199,10 @@ def main() -> int:
     ap.add_argument("--compact-spirv", action="store_true",
                     help="run the translator's compact binary pass on all shader libraries (requires spirv-opt)")
     ap.add_argument("--no-float-controls", action="store_true",
-                    help="translate without SignedZeroInfNanPreserve and DenormPreserve (Depends on: #664), for "
-                         "devices whose vk_pipeline_check skips a shader without "
-                         "shaderSignedZeroInfNanPreserveFloat32 or shaderDenormPreserveFloat16")
+                    help="translate without SignedZeroInfNanPreserve, DenormPreserve and DenormFlushToZero (Depends on: "
+                         "#664), for devices whose vk_pipeline_check skips a shader without float-control properties")
+    ap.add_argument("--no-ftz32", action="store_true",
+                    help="translate without DenormFlushToZero 32 (keep software f32 denormal flushes, e.g. llvmpipe)")
     ap.add_argument("--bary-fallback", action="store_true",
                     help="translate raw barycentric reads from an interpolated vec3 input (with a pass-through "
                          "geometry shader the runtime draws), for devices without "
@@ -3211,6 +3220,10 @@ def main() -> int:
     ap.add_argument("--native-mesh", action="store_true",
                     help="keep native mesh shaders on Intel's Windows Vulkan driver instead of turning on "
                          "--mesh-compute (for a driver that fixes BUILD-2202's crash)")
+    ap.add_argument("--integer-dot-fallback", action="store_true",
+                    help="translate the 4x8-bit dot products (v_dot4_*) as extracts, multiplies and adds instead of "
+                         "SPV_KHR_integer_dot_product; on by itself when the runtime's GPU has no "
+                         "shaderIntegerDotProduct (a Vulkan 1.2 device)")
     ap.add_argument("--pc-tail-ubo", action="store_true",
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
@@ -3328,6 +3341,14 @@ def main() -> int:
             log(f"shaders: the GPU the runtime would use reports maxPushConstantsSize = {max_pc} (< {need_pc}): "
                 "translating with --pc-tail-ubo")
             a.pc_tail_ubo = True
+    if "shaders" in stages and not a.integer_dot_fallback:
+        integer_dot = runtime_gpu_integer_dot_product()
+        if integer_dot is False:
+            log("shaders: the GPU the runtime would use has no shaderIntegerDotProduct (a Vulkan 1.2 device): "
+                "translating with --integer-dot-fallback")
+            a.integer_dot_fallback = True
+        elif integer_dot is None:
+            a.integer_dot_fallback = keep_recorded_fallback("--integer-dot-fallback", work)
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     overlap = True
     use_tui = leonida_tui.tui_eligible(a.no_tui)

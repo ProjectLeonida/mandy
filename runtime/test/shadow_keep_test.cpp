@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <utility>
 #include <vector>
 
@@ -124,6 +125,85 @@ void sums_tell_bytes_apart() {
     EXPECT(leonida::shadow_keep::sum_of(a, 16) != leonida::shadow_keep::sum_of(a, 17));  // the length counts
 }
 
+void sum_of_batch_256_matches_sum_of() {
+    constexpr std::size_t kMaxPieces = 256;
+    constexpr std::size_t kPad = 64;
+    std::vector<std::uint8_t> buf(kMaxPieces * kPiece + kPad);
+    std::vector<std::uint64_t> batch_out(kMaxPieces, 0);
+
+    const std::size_t counts[] = {0, 1, 2, 15, 16, 17, 64, 256};
+    const std::size_t offsets[] = {0, 1, 3, 7, 15, 31};
+    std::mt19937_64 rng(0x5eed123456789abcull);
+
+    for (int pattern = 0; pattern < 4; ++pattern) {
+        if (pattern == 0) {
+            std::fill(buf.begin(), buf.end(), std::uint8_t(0));
+        } else if (pattern == 1) {
+            std::fill(buf.begin(), buf.end(), std::uint8_t(0xff));
+        } else if (pattern == 2) {
+            for (std::size_t i = 0; i < buf.size(); ++i) buf[i] = std::uint8_t((i * 131 + 17) & 0xff);
+        } else {
+            for (std::size_t i = 0; i < buf.size(); ++i) buf[i] = std::uint8_t(rng() & 0xff);
+        }
+        for (const std::size_t off : offsets) {
+            const std::uint8_t* const ptr = buf.data() + off;
+            for (const std::size_t n : counts) {
+                std::fill(batch_out.begin(), batch_out.end(), std::uint64_t(0xdeadbeefull));
+                leonida::shadow_keep::sum_of_batch_256(ptr, n, batch_out.data());
+                for (std::size_t i = 0; i < n; ++i) {
+                    const std::uint64_t expected = leonida::shadow_keep::sum_of(ptr + i * kPiece, kPiece);
+                    EXPECT(batch_out[i] == expected);
+                    EXPECT(batch_out[i] != 0);
+                }
+                if (n < kMaxPieces) EXPECT(batch_out[n] == 0xdeadbeefull);
+            }
+        }
+    }
+}
+
+void copy_and_sum_256_matches_sum_of() {
+    constexpr std::size_t kMaxPieces = 256;
+    constexpr std::size_t kPad = 64;
+    std::vector<std::uint8_t> src(kMaxPieces * kPiece + kPad);
+    std::vector<std::uint8_t> dst(kMaxPieces * kPiece + kPad);
+    std::vector<std::uint64_t> fused_out(kMaxPieces, 0);
+
+    const std::size_t counts[] = {0, 1, 2, 15, 16, 17, 64, 256};
+    const std::size_t offsets[] = {0, 1, 3, 7, 15, 31};
+    std::mt19937_64 rng(0xf05ed123456789abull);
+
+    for (int pattern = 0; pattern < 4; ++pattern) {
+        if (pattern == 0) {
+            std::fill(src.begin(), src.end(), std::uint8_t(0));
+        } else if (pattern == 1) {
+            std::fill(src.begin(), src.end(), std::uint8_t(0xff));
+        } else if (pattern == 2) {
+            for (std::size_t i = 0; i < src.size(); ++i) src[i] = std::uint8_t((i * 131 + 17) & 0xff);
+        } else {
+            for (std::size_t i = 0; i < src.size(); ++i) src[i] = std::uint8_t(rng() & 0xff);
+        }
+        for (const std::size_t src_off : offsets) {
+            const std::size_t dst_off = (src_off * 3) % 32;
+            const std::uint8_t* const sptr = src.data() + src_off;
+            std::uint8_t* const dptr = dst.data() + dst_off;
+            for (const std::size_t n : counts) {
+                std::fill(dst.begin(), dst.end(), std::uint8_t(0xCC));
+                std::fill(fused_out.begin(), fused_out.end(), std::uint64_t(0xdeadbeefull));
+                leonida::shadow_keep::copy_and_sum_256(dptr, sptr, n, fused_out.data());
+                if (dst_off > 0) EXPECT(dst[dst_off - 1] == 0xCC);
+                if (n > 0) EXPECT(std::memcmp(dptr, sptr, n * kPiece) == 0);
+                EXPECT(dst[dst_off + n * kPiece] == 0xCC);
+                for (std::size_t i = 0; i < n; ++i) {
+                    const std::uint64_t expected = leonida::shadow_keep::sum_of(sptr + i * kPiece, kPiece);
+                    EXPECT(fused_out[i] == expected);
+                    EXPECT(fused_out[i] != 0);
+                }
+                if (n < kMaxPieces) EXPECT(fused_out[n] == 0xdeadbeefull);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -132,6 +212,8 @@ int main() {
     partial_first_and_last_pieces();
     forgotten_sums_copy_once();
     sums_tell_bytes_apart();
+    sum_of_batch_256_matches_sum_of();
+    copy_and_sum_256_matches_sum_of();
     if (failures) {
         std::fprintf(stderr, "shadow_keep: %d check(s) failed\n", failures);
         return 1;

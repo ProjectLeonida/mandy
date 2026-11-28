@@ -886,7 +886,42 @@ The compute path, end to end:
   D3D-448); the compute bind point uses it.
 - **GPU address arena** (section 3.3, when the device has `bufferDeviceAddress`): one host-visible,
   device-addressable buffer, 256 MiB by default (`LEONIDA_ARENA_MB`, at most 4095 MiB, so every VA fits 32-bit
-  table pointers).
+  table pointers). `LEONIDA_ARENA_MB` bounds the address range; with sparse binding it is not memory.
+  - **Backing blocks** (`runtime/src/arena_backing.h`). Where the device has `sparseBinding`,
+    `sparseResidencyBuffer`, `residencyNonResidentStrict`, a sparse address space at least as large as the arena and
+    a queue with the sparse binding bit to spare (`pick_arena_bind_queue`: RADV's sparse-only family), the arena is a
+    sparse buffer and its memory comes in units bound in 2 MiB blocks: a block is bound when the first allocation
+    needs it, before the allocation is handed out, and unbound once its last allocation is released and the GPU has
+    passed the retire ticket of the release (`submitted_retire_ticket() + 1`, checked at the start of every
+    `ExecuteCommandLists` against `completed_retire_ticket()`), then its memory is freed. Binds go to that queue alone
+    and are waited for there, so a bind never sits behind a submission that waits for a fence the CPU signals later.
+  - **Only with signed V# offsets.** A driver can place a sparse buffer anywhere relative to ordinary ones: RADV
+    (Mesa 26.3.1, natively and under Wine) gives sparse buffers a range of their own 64 TiB above them
+    (0xffffc00100200000 against 0xffff800100010000), so with a sparse arena every buffer outside it (geometry copies,
+    title windows and shadows outside it, upload buffers) lies below heap_base, at a negative offset. A shader that
+    sign-extends a V#'s 48-bit base (docs/design.md, "Heap-relative buffer device addresses") reaches it, since RADV
+    hands out addresses from one 2^47 half of the 48-bit space, so any two lie within 2^47 of each other. One that
+    zero-extends does not. The device counts each loaded module's `vsharp_base_sign_extended` marker
+    (`VsharpBaseCensus`, `runtime/src/shader_library.h`) and logs
+    `V# bases: signed offsets from heap_base (N of N modules sign-extend)`. The arena is sparse only when every module
+    sign-extends (or `LEONIDA_IMPORT_BELOW_ARENA=1` says to read bases signed). With older modules it stays one
+    allocation and one line says why. `TitleBufferWindows::shader_reachable` checks every block made outside the
+    arena against the same range when it is made, and a block it refuses is logged with both addresses.
+    `d3d12_title_va_game_device` and `d3d12_geometry_views_game_device` run the title-memory tests on the device the
+    game makes (with the bind queue), so on RADV their windows and geometry copies are read through negative offsets.
+  - No allocation crosses a unit: one no larger than a block stays inside one block, a larger one takes whole blocks
+    of its own. So each allocation is one run of one mapping, and the CPU reaches an arena offset through
+    `DeviceState::arena_host()` (one table read; null, with a line, for a range without memory), or
+    `ArenaBacking::with_host()` for an offset the caller does not hold (value writes, `read_arena`). A D3D12 heap in the
+    arena lends its unit's memory to reserved resources' tiles at the heap's place in that unit.
+  - The block size is measured, not tuned: a world run had about 5,000 live arena allocations averaging 160 KiB
+    (790 MiB live, 990 MiB peak end, 4,095 MiB asked). 2 MiB is a multiple of the 64 KiB sparse page, keeps a 4 GiB
+    arena within the 4,096 memory objects some Windows drivers allow (2,048 at most, about 500 at that peak), and is
+    amdgpu's large page.
+  - Without those capabilities (llvmpipe: a 2 GiB sparse address space and one queue) one allocation backs the whole
+    arena, as before, through the same accessors. `arena_backing_test` (CPU) and `arena_sparse_gpu_test` (a real
+    device; skipped without sparse binding) check both. The arena's line at device release (and with a console
+    heap's log) reads `GPU address arena: bound N MiB now (peak P, U units of 2 MiB blocks, sparse)`.
   - It is also no larger than the device's `maxBufferSize` (Vulkan 1.3) and, counting the buffer's memory
     requirement, `maxMemoryAllocationSize` (Vulkan 1.1), whichever is smaller (`runtime/src/arena_size.h`). When a
     limit cuts the request, one log line names the limit and the size used. `arena_size_test` (CPU) checks the
@@ -1732,7 +1767,9 @@ The copies:
   cover (the title remaps its pool frames instead), and the tracker follows the pages.
   A tracker the window shared with a copy still live keeps its extent (a retirement never splits one). A window that
   cannot fit between the title's address reservations can use a separate mapped buffer. The buffer's device address
-  must fit as a positive 47-bit offset from the arena base. The same window cap and dirty-page refresh apply.
+  must lie within reach of a V# base from the arena base: a positive offset below 2^47, or, when every loaded shader
+  sign-extends the base, anywhere within 2^47 on either side (`TitleBufferWindows::shader_reachable`). The same
+  window cap and dirty-page refresh apply.
   `LEONIDA_STREAM_BUFFER_WINDOWS=0` requires the window to fit in the arena.
 - **What the GPU wrote goes back.** The same return copy serves slot-133 shadows (a buffer the driver would not
   import, a compute result the title reads again): the ranges are recorded through the alias of the buffer's pages and
@@ -2140,15 +2177,90 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    Missing console V# backing leaves a zero descriptor in the copy. Each V# half of a console resource heap's copy
    (the buffer V# and the UAV counter) has a record in host RAM of what it resolved to: the title's base and span,
    the device address its copy names, and whether it resolved or waits (`src/console_heap_slot_records.h`, written
-   only by `fix_console_slot`). Two indexes find the halves near a range, by base and by target, per power-of-two
-   span class and 64 KiB-or-larger granule. Releases (a backing, a title-window or geometry block), alias ranges
+   only by `fix_console_slot`). Two indexes, by base and by target, hold the halves by their exact range: halves
+   naming the same range share one group (with a resolved and a waiting list, each half's place in it kept, so a
+   half moves or goes in O(1)), and the groups are ordered by start per power-of-two class of their length. A change
+   visits exactly the halves whose range overlaps it; an addition visits the waiting halves whose range starts inside
+   it, since a V# resolves only through a backing, alias range, copy or title memory that holds its base (title memory
+   is told as the merged range that holds it); each half once per index in a submission, however many changes name
+   it. The groups compared to find them are those plus, for a removal, per class, the ones that start less than one
+   class length before it and end before it.
+   Releases (a backing, a title-window or geometry block), alias ranges
    removed or replaced (`TitleVaAliases` tells its listeners as it happens, `forget_copy` included) and additions
    (a backing, an alias range, title memory) go on an unbounded per-device list; at the next submission each heap
    fixes again exactly the slots whose records a change touches: a release or removal every half naming it, an
-   addition the waiting halves over it. Nothing walks the heap or reads the copy for this. A zeroed range, a slot
+   addition the waiting halves whose base it holds. Nothing walks the heap or reads the copy for this. A zeroed range, a slot
    the title rewrote and a heap destroyed drop their records. `console_heap_slot_records_test` checks that a release
-   of a buffer 10 of 60,010 slots name looks at those 10, and compares the copy with a full re-resolution through
-   random writes, releases, additions and alias changes.
+   of a buffer 10 of 60,010 slots name looks at those 10, that a 40-byte release among 300,000 slots packed into 74
+   blocks of 64 KiB looks at the 3 it overlaps, and compares the copy with a full re-resolution through random
+   writes, releases, additions and alias changes.
+   A title-written T# has a record too, under the exact base address it names (`bind_title_image` looks textures up
+   by that address, or by the other view of texture-pool memory): bound, or waiting for a texture there (no texture,
+   or one whose type, samples, mips, layers, image or views do not fit the T#), or waiting for room in its bindless
+   array. A texture registered, replaced or published at an address (`note_image_address`, a title texture's
+   placement, a streamed texture's image), or gone from it (`forget_image`, a placement removed), goes on the same
+   list, and the next submission fixes again exactly the T#s naming that address; freed bindless entries fix the
+   T#s waiting for room. Nothing looks at a waiting T# otherwise: before, a round robin tried the waiting slots again
+   for 500 µs a submission (`LEONIDA_CONSOLE_RETRY_US`), which in world runs took tens of submissions to come round
+   and counted every look as a T# "naming no texture" again. A texture that goes takes its T#s out of the descriptor
+   hash table at once (`forget_image_views_locked`), so a shader reading the slot gets the fallback; the slot then
+   waits for the next texture at the address, which a texture streamed out and back in needs. A V# half whose
+   geometry copy was refused for lack of room waits for room the same way: the slots are fixed again when geometry
+   copies are freed (`GeometryViews::free_generation`), not only when something is added over their base.
+   A T# with no texture at its address is counted by what the address is (`unbound T#s by reason` in the heap's log
+   line): title memory, a texture of the layer's own that is gone, an address whose low 32 bits are one of the
+   layer's texture addresses with other high bits (the texture there with the T#'s shape, with another, or gone),
+   or none of these. The heap's `slot records` line gives the T#s recorded, those waiting, the T# fixes that left
+   one waiting and the refills since the last line. `d3d12_tsharp_refill_test` samples, through the last of 60,001
+   waiting slots, a texture made after the T# was written, at the first submission after it appears. T#s are a third
+   index of the same kind, keyed by their address: a texture change visits exactly the T#s recorded for that address,
+   and the records waiting for room are kept in a list per kind, which a change saying room was made visits whole.
+   The title rebuilds T#s of the layer's textures from 32 bits: the unbound T#s of one world run named 0x7f0000021400
+   for the layer's 0x100021400, and 0x2ef600 for 0x1002ef600 (bits 32-39 clear, 0x7f or 0 in bits 40-47). Such an
+   address outside the title's memory names the layer's texture with the same low 32 bits (`tsharp_texture_key`,
+   while fewer than 2^24 texture addresses were handed out): `bind_title_image` looks it up there, and the T# waits
+   under that address, where the texture's creation is announced. Before, such T#s waited under the title's form,
+   which no arrival names, and the run showed no refill at all; `d3d12_tsharp_refill_test` writes both forms before
+   the texture exists and expects them bound at the first submission after it appears.
+   A V# the title rewrote whose range another half of the heap waits for is answered as that half was
+   (`ConsoleHeapSlotRecords::waiting_answer`), without walking the alias table, backings, geometry copies and title
+   memory again: a waiting record is fixed again by every change that could let it resolve, so while it waits its
+   answer stands. The changes noted since the submission's list was taken are applied to the heap first
+   (`sync_slot_changes`), and the submission's own changes before the rewritten slots, so an answer is never older
+   than a change that concerns it. In one world run 70% of the 2,100 rewritten V# halves a submission resolved to
+   nothing at about 9 µs each.
+   **A console resource heap read in place.** When the page mirror holds every page of the heap (a reservation xmem
+   placed in the mirror's range), there is no copy of the whole heap and no page tracker of its own. Its pages have
+   two homes. At the title's address (the mirror) the home is the title's bytes exactly, as for any page: the title
+   keeps plain data inline in its heap pages and points V#s at it (run 64w3: four words a compute program reads as
+   its sizes, `[512 256 1280 720]`), so a V# or a title pointer into those pages must read what the title wrote, and
+   GPU stores there are written back as for any page. At the table address, below 4 GiB of the arena (25,865 of
+   26,503 shaders keep 32 bits of a descriptor-table pointer), each page has a filtered copy of its own
+   (`TitleMirror::alias`: a second home per page, bound there in the same batches as the mirror's binds, so the one
+   wait orders a reader of either address), in a range of whole arena blocks with no arena memory behind it; the null
+   slots after the heap are that range's rest, unbound, which reads zero. The filter writes only that copy
+   (`filter_heap_page`), refilled when a 256-byte piece of the title's page changed (the upload's sums compare the
+   title's bytes with the title's) or write-back changed it. Each slot that changed since it was last filtered, or
+   that a change of the address space touched, is filtered: a V# half whose base lies in the arena, in the mirror
+   (named to it as any reader names title memory) or in a buffer of ours is kept as the title wrote it
+   (`reachable_as_written`); a half nothing holds is null whole, all four words (a shader reading it as a V# would
+   fault at heap_base + its base: the "resolved to nothing" classes of the heap's log line), never three of four; a
+   T# is kept as written and bound; words that decode as neither are null, as a shader taking them as a V# would
+   fault. The filter runs inside the mirror's fills, under its lock, so it takes no other lock of ours: a V# the mirror
+   does not hold reads null until the heap's refresh resolves it as a copied slot was, and a T# is bound there too,
+   its dword 6 in the copy then taking the bindless index word (`tsharp_index_word`, docs/design.md "Bindless index in
+   the T#"; 0, the fallback, from the filter until then and while the T# waits; the title's dword 6 stays in its
+   bytes), each result written into the copy unless the title rewrote the slot meanwhile (`finish_in_place`). Lock
+   order: `console_heap_mutex`, then the mirror's, then the change list's. Table pointers reach shaders in user SGPRs,
+   which the layer sets to the table address (`console_descriptor_table_va`) for every module; a table pointer a
+   shader loads from memory is the title's address and reads the title's bytes there: V#s as written (the mirror
+   holds what they name, or the read faults as on any unfiltered memory) and T#s without the index word, which a
+   module of the index-word contract reads as the fallback. A heap the mirror does not hold (a device without the
+   mirror, memory outside its range) is copied as before. `d3d12_heap_in_place_test` checks that the GPU reads the
+   filtered slots at the table address while the title's bytes never change, that a rewrite reaches the GPU at the
+   next refresh, that inline data reads exactly through a V# while the table reads it filtered, that a GPU store into
+   the heap goes back, and that the null slots read zero; `title_mirror_hooks_test` checks the alias without a GPU
+   and `vk_heap_alias_test` a second binding on a device.
    Console resource heap copies and shader-visible CBV/SRV/UAV heaps with at least 65,536 slots request
    64 MiB of zeroed padding after their last descriptor. `LEONIDA_HEAP_GUARD_MB` sets the padding in MiB
    (0 disables it). When arena space is tight, allocation can fall back to the heap alone. Only indices
@@ -2174,7 +2286,9 @@ The layer's descriptor model:
   which is the assumption to verify. If it uses an opaque format, the layer must translate at bind time.
 - At execution, for each bound table (or the whole bound heap when direct indexing is enabled), the layer walks
   the declared descriptor range with the heap's stride, parses each T#/S#, and ensures a bindless entry exists:
-  - image T# → `VkImageView` (format, view type, mip range, array layers) → bindless image index;
+  - image T# → `VkImageView` (format, view type, mip range, array layers) → bindless image index, which the layer
+    writes into dword 6 of the T# where shaders read it (the console heap copy's slot, or the layer's own heap), with
+    the arrays it is bound in (`docs/design.md`, "Bindless index in the T#"); the hash table keeps the key as written;
   - sampler S# → `VkSampler` (filter, address modes, LOD, compare, anisotropy) → bindless sampler index;
   - buffer V# / CBV → no Vulkan view; the descriptor already contains a console VA the shader dereferences.
 - **Buffer UAVs.** `CreateUnorderedAccessView` on a buffer writes a V# in the first 16 bytes of the slot (the rest of
@@ -4931,29 +5045,53 @@ order the submissions were recorded. The list keeps the last 64, so its numbers 
 recorded more than that.
 
 **AMD breadcrumbs.** NVIDIA's checkpoints say where a queue stopped; RADV has none. With `LEONIDA_DEVICE_MARKERS=1`
-as well, on a device with `VK_AMD_buffer_marker`, every numbered dispatch writes its `seq` into its queue's slot of
-one persistent buffer twice (`src/vulkan_device_markers.h`): at top of pipe before the dispatch (started) and at
-bottom of pipe after it (finished), with `vkCmdWriteBufferMarker2AMD` (or `vkCmdWriteBufferMarkerAMD` without
-synchronization2). A bottom-of-pipe write waits for all earlier work on the queue, so the finished value is the last
-dispatch before which everything had completed, and the queue's dispatches after it up to the started value are the
-ones the GPU began and did not finish. The oldest of them is the likely hang. The buffer is host-visible and
-coherent, in system memory where the device has such a type, so it can still be read after a device loss. The loss
-and stall reports then add lines like these (the shader names are made up):
+as well, on a device with `VK_AMD_buffer_marker`, every numbered dispatch and every draw writes its `seq` into its
+queue's slot of one persistent buffer twice (`src/vulkan_device_markers.h`): at top of pipe before the work
+(started) and at bottom of pipe after it (finished), with `vkCmdWriteBufferMarker2AMD` (or
+`vkCmdWriteBufferMarkerAMD` without synchronization2). Draws and dispatches share the numbering, so the 64-entry
+dispatch list has gaps where draws ran. A bottom-of-pipe write waits for all earlier work on the queue, so the
+finished value is the last item before which everything had completed, and the queue's items after it up to the
+started value are the ones the GPU began and did not finish. The oldest of them is the likely hang. The buffer is
+host-visible and coherent, in system memory where the device has such a type, so it can still be read after a device
+loss. The loss and stall reports then add lines like these (the shader names are made up):
 
 ```
 [rt] device-markers: AMD buffer markers, read after the device loss; best-effort: only what the GPU wrote before it stopped, and a reset may have lost the last writes
 [rt] device-markers: queue 0000000012345678 (compute) finished seq=1203 started seq=1205; started, not finished: 1204 1205
+[rt] device-markers:   finished: seq=1203 execute=88 queue=0000000012345678 (compute) list=0 command=16 shader=cs_example_b
 [rt] device-markers: likely hang: seq=1204 execute=88 queue=0000000012345678 (compute) list=0 command=17 shader=cs_example_a
-[rt] device-markers: queue 00000000123456a0 (direct) idle: finished seq=1199, nothing started after it; next submitted seq=1206 not started (waiting, or behind other work of the queue)
+[rt] device-markers:   in flight: seq=1205 execute=88 queue=0000000012345678 (compute) list=0 command=18 shader=cs_example_a
+[rt] device-markers: queue 00000000123456a0 (direct) finished seq=1199 started seq=1200; started, not finished: 1200
+[rt] device-markers:   finished: seq=1199 execute=89 queue=00000000123456a0 (direct) list=1 command=1 shader=cs_example_c
+[rt] device-markers: likely hang: seq=1200 execute=89 queue=00000000123456a0 (direct) list=1 command=7 draw=indexed count=3480 instances=1 pipeline=vs vs_example ps ps_example pass=draw 4 since command 2 (3 colours + depth, 1920x1080)
 [rt] device-fault: submitted dispatch seq=1204 execute=88 queue=0000000012345678 (compute) list=0 command=17 shader=cs_example_a groups=64,1,1 <- likely hang (device-markers)
 ```
 
-A separate history of the last 16,384 dispatches names the likely hang when it has already left the 64-entry list.
-An idle queue (finished equals started) is not called hung: if it still has dispatches submitted, it was waiting
-on a semaphore or stuck in work that is not a dispatch (a draw, a copy). The values are what the GPU wrote before
-it stopped; after a loss and a ring reset they may be stale, so read them as a pointer, not a proof. The cost with
-the switch on is two marker writes per dispatch (a command-processor write and an end-of-pipe event, no wait) plus
-one entry in the history; with it off nothing is recorded. Without the extension, or without
+A draw line gives its kind (`indexed`, `vertices`, `mesh`, with `-quads` for a quad list and `-indirect` or
+`-indirect-count` for arguments from a buffer) and counts (vertex or index count and instances, a mesh dispatch's
+`groups`, an indirect draw's `max` records and `stride`), its pipeline named as the `LEONIDA_GPU_PROFILE` lines name
+it (`gpu_profile::label`: each stage's tag and entry name, or `pso 0x...`), and its place among the draws of the list
+to the same targets: `pass=draw 4 since command 2` is the fourth draw to these targets since command 2. An idle queue
+gets a `not started:` line for its next submitted item. When `VK_EXT_device_fault` reports an address, a
+`device-fault: last started draw (device-markers):` line per queue follows the address lines, with `(not finished)`
+or `(finished)` and `<- likely hang` when it is the queue's likely hang.
+
+Granularity: a pair per draw, as per dispatch. The replay opens a rendering scope per draw, so the started write goes
+before the draw's helper passes (quad index expansion, indirect clamp; a hang there is named as the draw's) and the
+finished one after the scope ends, both outside a render pass instance. The extension allows them inside one too
+(`vk.xml`: `renderpass="both"`, and conditional rendering does not apply), which the legacy graphics ExecuteIndirect
+path, drawing in the caller's scope, uses; `vk_device_markers_test` writes a pair inside an open scope under
+validation. RADV (`radv_CmdWriteMarkerToMemoryAMD`) emits the cache flushes already pending, then a top-of-pipe write
+as one write-confirmed COPY_DATA (the command processor waits for that write only) and any other stage as one
+bottom-of-pipe EOP event (no wait): at most 24 dwords per draw, against the hundreds the draw's own scope and state
+take. A pair per run of one pipeline would be cheaper but could not name the draw, so it was not chosen.
+
+A separate history of the last 65,536 dispatches and draws (about 6 MiB) names the likely hang when it has already
+left the 64-entry list, and names every draw. An idle queue (finished equals started) is not called hung: if it
+still has work submitted, it was waiting on a semaphore or stuck in work that is neither (a copy, a barrier). The
+values are what the GPU wrote before it stopped; after a loss and a ring reset they may be stale, so read them as a
+pointer, not a proof. The cost with the switch on is two marker writes per dispatch and per draw plus one entry in
+the history; with it off nothing is recorded. Without the extension, or without
 `LEONIDA_DEVICE_FAULT`, the runtime logs one `device-markers: unavailable` line and runs as before.
 
 For a local pre-submit inspection, also set `LEONIDA_COMPUTE_INPUTS` to comma-separated shader name fragments and
@@ -4988,6 +5126,12 @@ store, load, mesh, geometry and BVH tests; this layer is the other half.
 | Code-embedded data | The whole FSSM blob is in the arena; `s_getpc_b64` becomes `code_base + next-instruction offset`. |
 
 ### 5.1 Descriptor hash table details
+
+Since the T# index word (`docs/design.md`, "Bindless index in the T#") the table serves only what the word does not
+reach: every S#, and the T#s a translated module cannot trace to a heap slot (1,062 of the 439,415 T# operands of
+the 1.0.2.1 corpus, in 108 modules). A T# loaded from a heap the layer writes carries its index and kind in dword 6
+and is never looked up. Every T# key is still inserted, as the title wrote it: a T# outside the heaps is found by
+those words.
 
 The exact layout the shader reads (from `tools/rdna2spirv.py`, `desc_lookup`):
 

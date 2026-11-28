@@ -399,7 +399,11 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                     vals[res] = push_constants[w] if 0 <= w < len(push_constants) else 0
                 elif p[0] == "psb":
                     assert p[1] % 4 == 0, f"unaligned PSB load {p[1]:#x}"
-                    vals[res] = memory.get(p[1], 0)
+                    kind = types.get(a[0], ("",))
+                    if kind[0] == "vec":      # a uvecN: scalar_load's wide loads read N consecutive words
+                        vals[res] = [memory.get(p[1] + 4 * i, 0) for i in range(kind[2])]
+                    else:
+                        vals[res] = memory.get(p[1], 0)
                 else:
                     v = p[0][p[1]]
                     vals[res] = list(v) if isinstance(v, list) else v

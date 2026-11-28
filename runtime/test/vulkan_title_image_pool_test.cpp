@@ -7,7 +7,7 @@
 namespace {
 unsigned allocated, freed, destroyed, next_type;
 bool fail_alloc, fail_bind;
-VkDeviceSize last_offset;
+VkDeviceSize last_offset, last_alloc_size;
 VKAPI_ATTR VkResult VKAPI_CALL bind_image(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize offset) {
     last_offset = offset;
     return fail_bind ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_SUCCESS;
@@ -24,7 +24,8 @@ int main() {
     const auto make = [&] {
         const auto image = (VkImage)(std::uintptr_t(++next_image));
         return pool.bind(VK_NULL_HANDLE, image, req, bind_image, destroy_image, free_memory,
-                         [](VkDeviceSize, std::uint32_t& type) {
+                         [](VkDeviceSize size, std::uint32_t& type) {
+                             last_alloc_size = size;
                              type = next_type;
                              return fail_alloc ? VkDeviceMemory{} : (VkDeviceMemory)(std::uintptr_t(++allocated));
                          });
@@ -61,11 +62,28 @@ int main() {
     fail_alloc = true;
     CHECK(!make() && allocated == 4 && freed == 4);
     fail_alloc = false;
-    req.size++;
-    CHECK(!make() && allocated == 4);
+
+    // > 2 MiB .. 8 MiB classes cap page_size at 16 MiB (no VRAM bloat) and pack stride * capacity tightly.
+    req = {5632u << 10, 65536, 2};
+    for (int i = 0; i < 3; ++i) live.push_back(make());
+    CHECK(live[0] && live[1] && live[2] && live[0]->page == live[1]->page && live[2]->page != live[1]->page);
+    CHECK(last_alloc_size <= (16u << 20) && allocated == 6);
+    live.clear();
+    CHECK(freed == 6);
+
+    req = {8u << 20, 65536, 2};
+    for (int i = 0; i < 3; ++i) live.push_back(make());
+    CHECK(live[0] && live[1] && live[2] && live[0]->page == live[1]->page && live[2]->page != live[1]->page);
+    CHECK(last_alloc_size == (16u << 20) && allocated == 8);
+    live.clear();
+    CHECK(freed == 8);
+
+    // > 8 MiB exceeds largest_slot and falls back to dedicated allocation.
+    req.size = (8u << 20) + 1;
+    CHECK(!make() && allocated == 8);
     req = {701440, 512, 2};
     a = make(); b = make();
     CHECK(a && b && a->page == b->page && last_offset % req.alignment == 0);
     CHECK(last_offset >= req.size && last_offset <= req.size + req.size / 8);
-    std::puts("title image pool alignment, type separation, retirement, reuse and fallback OK");
+    std::puts("title image pool alignment, type separation, retirement, reuse, 8MiB/16MiB cap and fallback OK");
 }

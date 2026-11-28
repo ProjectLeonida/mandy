@@ -26,6 +26,7 @@ struct FakeDevice {
     VkBool32 synchronization2 = VK_FALSE;
     VkBool32 subgroup_size_control = VK_FALSE;
     VkBool32 compute_full_subgroups = VK_FALSE;
+    VkBool32 integer_dot_product = VK_FALSE;
     VkBool32 eds = VK_FALSE;
     VkBool32 eds2 = VK_FALSE;
     int features2_calls = 0;
@@ -65,6 +66,7 @@ VKAPI_ATTR void VKAPI_CALL fake_get_features2(VkPhysicalDevice, VkPhysicalDevice
                 f->synchronization2 = g_device->synchronization2;
                 f->subgroupSizeControl = g_device->subgroup_size_control;
                 f->computeFullSubgroups = g_device->compute_full_subgroups;
+                f->shaderIntegerDotProduct = g_device->integer_dot_product;
                 break;
             }
             case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR:
@@ -127,6 +129,28 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fake_get_device_proc(VkDevice, const ch
 }  // namespace
 
 int main() {
+    // shaderIntegerDotProduct (the translator's OpSDot / OpUDot) is enabled where a 1.3 device has it.
+    {
+        FakeDevice dev;
+        dev.dynamic_rendering = VK_TRUE;
+        dev.synchronization2 = VK_TRUE;
+        dev.integer_dot_product = VK_TRUE;
+        g_device = &dev;
+        Vulkan13Features v13;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_3, fake_get_features2, nullptr);
+        EXPECT(v13.integer_dot_product);
+        Vulkan13Features chosen;
+        chosen.choose(v13);
+        EXPECT(chosen.integer_dot_product);
+        VkBaseOutStructure tail{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, nullptr};
+        const auto* enable13 = static_cast<const VkPhysicalDeviceVulkan13Features*>(chosen.enable(&tail));
+        EXPECT(enable13->shaderIntegerDotProduct == VK_TRUE);
+        // A 1.2 device goes without (make_game.py translates for it with --integer-dot-fallback).
+        Vulkan13Features v12;
+        v12.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, nullptr);
+        EXPECT(!v12.integer_dot_product);
+    }
+
     // Vulkan 1.3 core device: queries VkPhysicalDeviceVulkan13Features without enumerating extensions.
     {
         FakeDevice dev;
@@ -152,6 +176,7 @@ int main() {
         EXPECT(enable13->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES);
         EXPECT(enable13->dynamicRendering == VK_TRUE && enable13->synchronization2 == VK_TRUE);
         EXPECT(enable13->subgroupSizeControl == VK_TRUE && enable13->computeFullSubgroups == VK_FALSE);
+        EXPECT(!v13.integer_dot_product && enable13->shaderIntegerDotProduct == VK_FALSE);
         EXPECT(enable13->pNext == &tail);
 
         // Inserting a later feature struct through next() places it between enable13 and tail.

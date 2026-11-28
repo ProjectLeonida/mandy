@@ -103,6 +103,13 @@ struct VulkanDeviceInfo {
     std::uint32_t copy_family = UINT32_MAX;
     std::vector<VkQueue> compute_queues;
     std::vector<VkQueue> copy_queues;
+    // A queue of its own on which the GPU address arena binds and unbinds its memory blocks (src/arena_backing.h),
+    // so a bind never waits behind the title's work. Null: the arena is one allocation, as without sparse binding.
+    VkQueue arena_bind_queue = VK_NULL_HANDLE;
+    // VkPhysicalDeviceLimits::sparseAddressSpaceSize and VkPhysicalDeviceSparseProperties::residencyNonResidentStrict:
+    // a sparse arena must fit the first, and needs the second (an unbound block reads as zero).
+    VkDeviceSize sparse_address_space = 0;
+    bool residency_non_resident_strict = false;
     bool pipeline_creation_feedback = false;
     // Vulkan 1.3 pipelineCreationCacheControl, enabled: FAIL_ON_PIPELINE_COMPILE_REQUIRED asks a cache without a compile.
     // Implies core VkPipelineCreationFeedback, which then needs no extension.
@@ -208,6 +215,9 @@ struct VulkanDeviceInfo {
     // arena and have console VAs (docs section 3.3), and GetGPUVirtualAddress returns those addresses; ray tracing
     // needs it too. Without it, GetGPUVirtualAddress returns 0 and pipelines cannot be created.
     bool buffer_device_address = false;
+    // bufferDeviceAddressCaptureReplay is enabled: a buffer can be made at a device address of the runtime's choosing
+    // (the page mirror's chunks at heap_base + a title address, src/title_mirror.h).
+    bool buffer_device_address_capture_replay = false;
     // Optional VK_KHR_acceleration_structure + VK_KHR_deferred_host_operations + VK_KHR_ray_query are enabled:
     // GetRaytracingAccelerationStructurePrebuildInfo and BuildRaytracingAccelerationStructure (BLAS + TLAS) work.
     bool ray_tracing = false;
@@ -248,6 +258,10 @@ struct VulkanDeviceInfo {
     // writes the layer or viewport declares ShaderLayer / ShaderViewportIndex (the index's `features`).
     bool shader_output_layer = false;
     bool shader_output_viewport_index = false;
+    // Vulkan 1.2 vulkanMemoryModel / vulkanMemoryModelDeviceScope enabled on `device`: coherent (glc/dlc) translated
+    // shaders declare OpCapability VulkanMemoryModel and VulkanMemoryModelDeviceScope.
+    bool vulkan_memory_model = false;
+    bool vulkan_memory_model_device_scope = false;
     // The translator's output folder for pipeline creation. An empty value uses LEONIDA_SHADERS or the packaged path.
     std::string shader_dir;
     // VK_EXT_custom_border_color (with customBorderColors and customBorderColorWithoutFormat) is enabled on
@@ -309,6 +323,27 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
 // thread if it has). Released or device lost, `fn` still runs once: it must not use the fence then. False for a fence
 // of another kind. For the console fence's slot-12 mirror (d3d12_xs_device.cpp).
 bool fence_callback_at(ID3D12Fence* fence, std::uint64_t value, std::function<void()> fn);
+
+// Whether a Signal of at least `value` has reached the GPU for `fence` (or the CPU set it): false while the layer
+// holds that Signal behind a wait it has not seen satisfied (src/queue_holds.h). True for a fence of another kind. For
+// the console list values' pump (d3d12_xs_list_values.h): work held that way is not running.
+bool fence_signal_submitted(ID3D12Fence* fence, std::uint64_t value);
+
+// Signals `fence` to `value` from the CPU without bumping the device visibility epoch (vis_seq = 0): for GPU-to-GPU
+// relays (e.g. list_values::Pump gates met strictly by GPU writes landed via Pump::land()). Falls back to
+// fence->Signal(value) for fences of another kind.
+HRESULT fence_signal_gpu_relay(ID3D12Fence* fence, std::uint64_t value);
+
+// Retroactively redirects any queued, pending, or held wait on `(gate_fence, gate_value)` to GPU waits on
+// `replacements` in QueueHolds (never GPU-signaling `gate_fence`), releasing newly-unblocked held operations
+// immediately. False when `gate_fence` or any replacement is not a Vulkan fence on the same context, or when
+// `gate_fence` has already been signaled to at least `gate_value`.
+struct FenceRelayTarget {
+    ID3D12Fence* fence = nullptr;
+    std::uint64_t value = 0;
+};
+bool fence_relay_wait(ID3D12Fence* gate_fence, std::uint64_t gate_value,
+                      std::span<const FenceRelayTarget> replacements);
 
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
@@ -393,9 +428,46 @@ bool device_sparse_buffer_tiles(ID3D12Device* device);
 
 // The size in bytes of the device's GPU address arena, or 0 without one. For tests.
 std::uint64_t device_arena_size(ID3D12Device* device);
+// The GPU address arena's memory: its size (address range), device address (heap_base), the bytes of memory bound
+// behind it now (all of it for one allocation), whether it binds memory as allocations need it (sparse), whether the
+// device could (sparse_capable), and whether V# bases are read as signed offsets (a buffer below heap_base is
+// reachable). All zero without an arena. For tests.
+struct ArenaMemoryState {
+    std::uint64_t size = 0, address = 0, bound = 0;
+    bool sparse = false, sparse_capable = false, signed_offsets = false;
+};
+ArenaMemoryState device_arena_memory(ID3D12Device* device);
 // Copies `bytes` of the device's GPU address arena at console VA `va` (what shaders read there: a heap's GPU copy,
 // the null slots after it) into `out`. False without an arena or when the range is not inside it. For tests.
 bool read_arena(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes);
+
+// The page mirror (src/title_mirror.h): whether the device made it (and why not), and what it holds. For tests.
+struct PageMirrorState {
+    bool on = false;
+    std::uint64_t heap_base = 0, pages = 0, homes = 0, chunks = 0, uploads = 0, binds = 0;
+};
+PageMirrorState page_mirror_state(ID3D12Device* device);
+// Brings the page mirror up to date as a submission does, then copies `bytes` at heap_base + `title_va` (what a shader
+// reads at a title-written address there) into `out` with the GPU, after the mirror's last bind. False when the mirror is
+// off or the address is not in one of its chunks. For tests.
+bool page_mirror_gpu_read(ID3D12Device* device, std::uint64_t title_va, void* out, std::size_t bytes);
+// The same at arena VA `va` (heap_base + va): what a shader reads there, a console heap read in place among it. False
+// when the mirror is off. For tests.
+bool arena_gpu_read(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes);
+// Whether the layer writes the T# index word (gfx10_descriptors.h, tsharp_index_word) into the heaps shaders read, as a
+// loaded library of modules that read it turns on. Returns what it was. For tests, which load no library.
+bool set_tsharp_index_words_for_test(ID3D12Device* device, bool on);
+// Whether a draw's or copy's binding of title memory [va, va + size) would be served by the page mirror (VulkanContext's
+// mirror lookup): it must have been named before. `size` comes back cut at the chunk's end. For tests.
+bool page_mirror_buffer_at(ID3D12Device* device, std::uint64_t va, std::uint64_t& size);
+// Names [va, va + bytes) to the page mirror as a reader would (page_mirror_resolve). For tests.
+bool page_mirror_name(ID3D12Device* device, std::uint64_t va, std::uint64_t bytes);
+// Writes `bytes` (at most 64 KiB) at heap_base + `title_va` with the GPU, as a shader's store into the mirror would,
+// and waits for it. For tests.
+bool page_mirror_gpu_write(ID3D12Device* device, std::uint64_t title_va, const void* data, std::size_t bytes);
+// The copy back of what the GPU wrote into the mirror's homes over [va, va + bytes) to the title's pages, as
+// write_back_titles makes it once a submission has retired. Returns the bytes written. For tests.
+std::uint64_t page_mirror_write_back(ID3D12Device* device, std::uint64_t va, std::uint64_t bytes);
 
 // The blocks of device memory that textures share (src/image_memory.h): how many, their bytes, and the textures in
 // them. For tests.
@@ -421,7 +493,8 @@ struct BindlessStats {
 BindlessStats bindless_stats(ID3D12Device* device);
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
 // The bindless index the descriptor hash table holds for the 8 key dwords of a T# (or the 4 of an S# followed by
-// 0xFFFFFFFF x4), 0 (the fallback) when it has none or `device` has no such set. For tests.
+// 0xFFFFFFFF x4), 0 (the fallback) when it has none or `device` has no such set. A T# read from one of the layer's
+// heaps is looked up without its index word (dword 6), and gives 0 unless that word names the same index. For tests.
 std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]);
 // The free indices of that set's 2D image and sampler arrays: how many more distinct 2D T#s and S#s
 // CreateShaderResourceView and CreateSampler can register before they log that the array is full. Zeros when

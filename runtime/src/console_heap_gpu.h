@@ -352,7 +352,9 @@ public:
 
     ConsoleHeapGpu(PFN_vkGetDeviceProcAddr get, VkDevice device, const VkPhysicalDeviceMemoryProperties& memory,
                    std::uint32_t log2_keys = 20)
-        : get_(get), device_(device), memory_(memory), keys_(log2_keys) {}
+        : get_(get), device_(device), memory_(memory), keys_(log2_keys) {
+        load_procs();
+    }
     ~ConsoleHeapGpu() {
         std::lock_guard lock(mutex_);
         for (auto& pass : in_flight_) free_buffer(pass.buffer);
@@ -365,8 +367,8 @@ public:
             if (t.current) free_buffer(*t.current);
         }
         free_buffer(key_table_);
-        if (pipeline_) fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(device_, pipeline_, nullptr);
-        if (layout_) fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(device_, layout_, nullptr);
+        if (pipeline_ && vk_.destroy_pipeline) vk_.destroy_pipeline(device_, pipeline_, nullptr);
+        if (layout_ && vk_.destroy_pipeline_layout) vk_.destroy_pipeline_layout(device_, layout_, nullptr);
     }
     ConsoleHeapGpu(const ConsoleHeapGpu&) = delete;
     ConsoleHeapGpu& operator=(const ConsoleHeapGpu&) = delete;
@@ -551,16 +553,16 @@ public:
         const VkDeviceAddress update_address = base + at * 4;
         if (!updates.empty()) std::memcpy(words + at, updates.data(), updates.size() * 4);
         at += updates.size();
-        const auto barrier = fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
-        const auto dispatch = fn<PFN_vkCmdDispatch>("vkCmdDispatch");
-        const auto push = fn<PFN_vkCmdPushConstants>("vkCmdPushConstants");
+        const auto barrier = vk_.cmd_pipeline_barrier;
+        const auto dispatch = vk_.cmd_dispatch;
+        const auto push = vk_.cmd_push_constants;
         // The copies first (another kind of work in the same prelude), then what reads their destinations may run.
         if (!copies_.empty()) {
             std::sort(copies_.begin(), copies_.end(), [](const Copy& a, const Copy& b) {
                 return a.src != b.src ? a.src < b.src : a.dst < b.dst;
             });
             std::vector<VkBufferCopy> regions;
-            const auto copy = fn<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+            const auto copy = vk_.cmd_copy_buffer;
             for (std::size_t i = 0; i < copies_.size();) {
                 std::size_t j = i;
                 regions.clear();
@@ -587,7 +589,7 @@ public:
         // before it to finish.
         // The pass may then rewrite a slot an earlier submission still reads, as the CPU path's memcpy into the copy
         // always could.
-        fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        vk_.cmd_bind_pipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         Push p{};
         const auto address = [&](TableKind kind) { return tables_[kind].current ? tables_[kind].current->address : 0; };
         p.ranges = address(range_table);
@@ -601,7 +603,7 @@ public:
         p.flags = (signed_offsets_ ? 1u : 0u) | (use_ask_ ? 2u : 0u);
         p.key_mask = keys_.mask();
         if (clear_keys_) {
-            fn<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(cb, key_table_.buffer, 0, VK_WHOLE_SIZE, 0);
+            vk_.cmd_fill_buffer(cb, key_table_.buffer, 0, VK_WHOLE_SIZE, 0);
             VkMemoryBarrier filled{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
             filled.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             filled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -612,7 +614,7 @@ public:
         bool meta_filled = false;
         for (Heap& h : heaps_)
             if (h.meta_clear && h.meta.buffer) {
-                fn<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(cb, h.meta.buffer, 0, VK_WHOLE_SIZE, 0);
+                vk_.cmd_fill_buffer(cb, h.meta.buffer, 0, VK_WHOLE_SIZE, 0);
                 h.meta_clear = false;
                 meta_filled = true;
                 pass.filled.push_back(int(&h - heaps_.data()));
@@ -869,9 +871,62 @@ private:
         std::vector<Buffer> pool;
     };
 
-    template <typename T>
-    T fn(const char* name) const {
-        return reinterpret_cast<T>(get_(device_, name));
+    struct VkFns {
+        PFN_vkCreateBuffer create_buffer = nullptr;
+        PFN_vkDestroyBuffer destroy_buffer = nullptr;
+        PFN_vkGetBufferMemoryRequirements get_buffer_memory_requirements = nullptr;
+        PFN_vkAllocateMemory allocate_memory = nullptr;
+        PFN_vkFreeMemory free_memory = nullptr;
+        PFN_vkBindBufferMemory bind_buffer_memory = nullptr;
+        PFN_vkMapMemory map_memory = nullptr;
+        PFN_vkGetBufferDeviceAddress get_buffer_device_address = nullptr;
+        PFN_vkCreateShaderModule create_shader_module = nullptr;
+        PFN_vkDestroyShaderModule destroy_shader_module = nullptr;
+        PFN_vkCreatePipelineLayout create_pipeline_layout = nullptr;
+        PFN_vkDestroyPipelineLayout destroy_pipeline_layout = nullptr;
+        PFN_vkCreateComputePipelines create_compute_pipelines = nullptr;
+        PFN_vkDestroyPipeline destroy_pipeline = nullptr;
+        PFN_vkCmdPipelineBarrier cmd_pipeline_barrier = nullptr;
+        PFN_vkCmdBindPipeline cmd_bind_pipeline = nullptr;
+        PFN_vkCmdPushConstants cmd_push_constants = nullptr;
+        PFN_vkCmdDispatch cmd_dispatch = nullptr;
+        PFN_vkCmdFillBuffer cmd_fill_buffer = nullptr;
+        PFN_vkCmdCopyBuffer cmd_copy_buffer = nullptr;
+
+        bool complete() const {
+            return create_buffer && destroy_buffer && get_buffer_memory_requirements && allocate_memory &&
+                   free_memory && bind_buffer_memory && map_memory && get_buffer_device_address &&
+                   create_shader_module && destroy_shader_module && create_pipeline_layout &&
+                   destroy_pipeline_layout && create_compute_pipelines && destroy_pipeline && cmd_pipeline_barrier &&
+                   cmd_bind_pipeline && cmd_push_constants && cmd_dispatch && cmd_fill_buffer && cmd_copy_buffer;
+        }
+    };
+
+    void load_procs() {
+        if (!get_ || !device_) return;
+        const auto load = [this]<typename T>(T& out, const char* name) {
+            out = reinterpret_cast<T>(get_(device_, name));
+        };
+        load(vk_.create_buffer, "vkCreateBuffer");
+        load(vk_.destroy_buffer, "vkDestroyBuffer");
+        load(vk_.get_buffer_memory_requirements, "vkGetBufferMemoryRequirements");
+        load(vk_.allocate_memory, "vkAllocateMemory");
+        load(vk_.free_memory, "vkFreeMemory");
+        load(vk_.bind_buffer_memory, "vkBindBufferMemory");
+        load(vk_.map_memory, "vkMapMemory");
+        load(vk_.get_buffer_device_address, "vkGetBufferDeviceAddress");
+        load(vk_.create_shader_module, "vkCreateShaderModule");
+        load(vk_.destroy_shader_module, "vkDestroyShaderModule");
+        load(vk_.create_pipeline_layout, "vkCreatePipelineLayout");
+        load(vk_.destroy_pipeline_layout, "vkDestroyPipelineLayout");
+        load(vk_.create_compute_pipelines, "vkCreateComputePipelines");
+        load(vk_.destroy_pipeline, "vkDestroyPipeline");
+        load(vk_.cmd_pipeline_barrier, "vkCmdPipelineBarrier");
+        load(vk_.cmd_bind_pipeline, "vkCmdBindPipeline");
+        load(vk_.cmd_push_constants, "vkCmdPushConstants");
+        load(vk_.cmd_dispatch, "vkCmdDispatch");
+        load(vk_.cmd_fill_buffer, "vkCmdFillBuffer");
+        load(vk_.cmd_copy_buffer, "vkCmdCopyBuffer");
     }
 
     void queue_locked(int heap, std::uint32_t item) {
@@ -932,13 +987,16 @@ private:
 
     bool make_buffer(VkDeviceSize bytes, bool host, Buffer& out, bool host_device_local = false) {
         out = {};
+        if (!vk_.create_buffer || !vk_.get_buffer_memory_requirements || !vk_.allocate_memory ||
+            !vk_.bind_buffer_memory || (host && !vk_.map_memory) || !vk_.get_buffer_device_address)
+            return false;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = bytes;
         info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                      VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        if (fn<PFN_vkCreateBuffer>("vkCreateBuffer")(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) return false;
+        if (vk_.create_buffer(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
-        fn<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(device_, out.buffer, &requirements);
+        vk_.get_buffer_memory_requirements(device_, out.buffer, &requirements);
         const VkMemoryPropertyFlags required =
             host ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT : 0;
         const VkMemoryPropertyFlags preferred = host ? 0 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -963,22 +1021,21 @@ private:
         } else {
             order = memory_type_order(memory_, requirements.memoryTypeBits, required, preferred, requirements.size);
         }
-        const auto allocate_memory = fn<PFN_vkAllocateMemory>("vkAllocateMemory");
         for (const std::uint32_t type : order) {
             allocate.memoryTypeIndex = type;
-            if (allocate_memory(device_, &allocate, nullptr, &out.memory) == VK_SUCCESS) break;
+            if (vk_.allocate_memory(device_, &allocate, nullptr, &out.memory) == VK_SUCCESS) break;
             out.memory = VK_NULL_HANDLE;
         }
         if (!out.memory ||
-            fn<PFN_vkBindBufferMemory>("vkBindBufferMemory")(device_, out.buffer, out.memory, 0) != VK_SUCCESS ||
-            (host && fn<PFN_vkMapMemory>("vkMapMemory")(device_, out.memory, 0, VK_WHOLE_SIZE, 0, &out.mapped) !=
+            vk_.bind_buffer_memory(device_, out.buffer, out.memory, 0) != VK_SUCCESS ||
+            (host && vk_.map_memory(device_, out.memory, 0, VK_WHOLE_SIZE, 0, &out.mapped) !=
                          VK_SUCCESS)) {
             free_buffer(out);
             return false;
         }
         VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         address.buffer = out.buffer;
-        out.address = fn<PFN_vkGetBufferDeviceAddress>("vkGetBufferDeviceAddress")(device_, &address);
+        out.address = vk_.get_buffer_device_address(device_, &address);
         out.size = bytes;
         if (!out.address) {
             free_buffer(out);
@@ -987,46 +1044,37 @@ private:
         return true;
     }
     void free_buffer(Buffer& b) {
-        if (b.buffer) fn<PFN_vkDestroyBuffer>("vkDestroyBuffer")(device_, b.buffer, nullptr);
-        if (b.memory) fn<PFN_vkFreeMemory>("vkFreeMemory")(device_, b.memory, nullptr);  // unmaps
+        if (b.buffer && vk_.destroy_buffer) vk_.destroy_buffer(device_, b.buffer, nullptr);
+        if (b.memory && vk_.free_memory) vk_.free_memory(device_, b.memory, nullptr);  // unmaps
         b = {};
     }
 
     bool make_pipeline() {
-        for (const char* name :
-             {"vkCreateBuffer", "vkDestroyBuffer", "vkGetBufferMemoryRequirements", "vkAllocateMemory", "vkFreeMemory",
-              "vkBindBufferMemory", "vkMapMemory", "vkGetBufferDeviceAddress", "vkCreateShaderModule",
-              "vkDestroyShaderModule", "vkCreatePipelineLayout", "vkDestroyPipelineLayout", "vkCreateComputePipelines",
-              "vkDestroyPipeline", "vkCmdPipelineBarrier", "vkCmdBindPipeline", "vkCmdPushConstants", "vkCmdDispatch",
-              "vkCmdFillBuffer", "vkCmdCopyBuffer"})
-            if (!get_(device_, name)) return false;
+        if (!vk_.complete()) return false;
         VkShaderModule module = VK_NULL_HANDLE;
         VkShaderModuleCreateInfo shader{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         shader.codeSize = sizeof(console_heap_fix_spirv);
         shader.pCode = console_heap_fix_spirv;
         const aftermath::ShaderName aftermath_name("(runtime) console_heap_fix");
-        bool ok =
-            fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(device_, &shader, nullptr, &module) == VK_SUCCESS;
+        bool ok = vk_.create_shader_module(device_, &shader, nullptr, &module) == VK_SUCCESS;
         const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &range;
         VkPipelineLayout layout = VK_NULL_HANDLE;
         VkPipeline pipeline = VK_NULL_HANDLE;
-        ok = ok && fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(device_, &layout_info, nullptr, &layout) ==
-                       VK_SUCCESS;
+        ok = ok && vk_.create_pipeline_layout(device_, &layout_info, nullptr, &layout) == VK_SUCCESS;
         VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         info.stage.module = module;
         info.stage.pName = "main";
         info.layout = layout;
-        ok = ok && fn<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(device_, VK_NULL_HANDLE, 1, &info,
-                                                                                nullptr, &pipeline) == VK_SUCCESS;
-        if (module) fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(device_, module, nullptr);
+        ok = ok && vk_.create_compute_pipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) == VK_SUCCESS;
+        if (module) vk_.destroy_shader_module(device_, module, nullptr);
         if (!ok) {
-            if (pipeline) fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(device_, pipeline, nullptr);
-            if (layout) fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(device_, layout, nullptr);
+            if (pipeline) vk_.destroy_pipeline(device_, pipeline, nullptr);
+            if (layout) vk_.destroy_pipeline_layout(device_, layout, nullptr);
             return false;
         }
         layout_ = layout;
@@ -1036,6 +1084,7 @@ private:
 
     PFN_vkGetDeviceProcAddr get_;
     VkDevice device_;
+    VkFns vk_{};
     VkPhysicalDeviceMemoryProperties memory_;
     std::mutex mutex_;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;

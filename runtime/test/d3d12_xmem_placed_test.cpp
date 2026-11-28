@@ -14,6 +14,7 @@
 #include "../shims/shims.h"
 #include "../shims/xmem.h"
 
+#include "../src/title_geometry_watch.h"
 #include "../src/title_page_watch.h"
 #include <array>
 #include <chrono>
@@ -174,6 +175,11 @@ int queue_remap(ID3D12Device* real, ID3D12Device* proxy) {
     return 0;
 }
 
+int read_back(ID3D12Device* real, ID3D12Resource* buffer, UINT64 size, std::vector<std::uint8_t>& out);
+template <class F>
+bool on_thread(F f);
+DWORD protection_of(const void* address);
+
 // Queue slot 31 as a retail run takes it: no batch hook, so the queue's default adapter sends each range to xmem's
 // range callback (copy_page_mappings_fn), which mirrors a legacy-paired GPU-only destination at its CPU view. The
 // source is a GPU-only pool backed only through its CPU alias, and the title maps a page of its own at one CPU twin
@@ -227,26 +233,92 @@ int queue_remap_default_route(ID3D12Device* real, ID3D12Device* proxy) {
     const auto completion = WaitForSingleObject(remapped, 10000);
     CloseHandle(remapped);
     EXPECT(completion == WAIT_OBJECT_0);
-    EXPECT(dst[0] == 40 && dst[kPage64k] == 41);  // the GPU-only pages, found through the pool's CPU alias
-    EXPECT(cpu[0] == 40);                         // a CPU twin with no mapping of the title's follows the copy
-    EXPECT(cpu[kPage64k] == 77);                  // the title's own page is kept
+    // The GPU-only pages took the pool's pages (found through its CPU alias) in xmem's table alone: no host view there,
+    // as on the console. A copy from them shows what the table holds.
+    EXPECT(state_is(dst, MEM_RESERVE) && state_is(dst + kPage64k, MEM_RESERVE));
+    auto* probe = window(PAGE_READWRITE);
+    EXPECT(probe && rt::xmem::copy_page_mappings_fn &&
+           rt::xmem::copy_page_mappings_fn(probe, dst, n, false) && probe[0] == 40 && probe[kPage64k] == 41);
+    EXPECT(rt::xmem::copy_page_mappings_fn(probe, nullptr, n, false));
+    // A CPU twin with no mapping of the title's follows the copy, in the table too: no host view, its bytes through
+    // its frame (src/title_frames.h). The title's own page is kept.
+    leonida::title_frames::Frame frame;
+    EXPECT(state_is(cpu, MEM_RESERVE) && leonida::title_frames::find(uintptr_t(cpu), frame) && frame.bytes[0] == 40);
+    EXPECT(cpu[kPage64k] == 77 && !leonida::title_frames::backed(uintptr_t(cpu + kPage64k)));
+
+    // The layer's readers go through the table. A slot-133 buffer over the GPU-only pages (a shadow: they have no host
+    // view to import) and one over the CPU twin read the pages the copy gave them; a write through the title's own
+    // mapping of a page (the pool's CPU alias) reaches both, guarded there by the geometry watch's cells (xmem names
+    // that mapping as the table pages' other address); a remap reaches them with no host map or unmap at all.
+    leonida::geometry_writes::aliases.store(&rt::xmem::geometry_aliases, std::memory_order_release);
+    {
+        rt::xmem::Slot31Counts before{};
+        rt::xmem::slot31_mapping_counts(before);
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = n * kPage64k;
+        desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        Ref<ID3D12Resource> over_gpu, over_twin;
+        EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(real, dst, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&over_gpu.p))));
+        desc.Width = kPage64k;
+        EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(real, cpu, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&over_twin.p))));
+        std::vector<std::uint8_t> got;
+        EXPECT(read_back(real, over_gpu.p, n * kPage64k, got) == 0 && got[0] == 40 && got[kPage64k] == 41);
+        EXPECT(read_back(real, over_twin.p, kPage64k, got) == 0 && got[0] == 40);
+        EXPECT((protection_of(pool_cpu) & 0xff) == PAGE_READONLY);  // guarded at the other address
+        on_thread([&] { pool_cpu[16] = 55; });  // the title's CPU, through its own mapping of the page
+        EXPECT(read_back(real, over_gpu.p, n * kPage64k, got) == 0 && got[16] == 55 && got[kPage64k] == 41);
+        EXPECT(read_back(real, over_twin.p, kPage64k, got) == 0 && got[16] == 55);
+        on_thread([&] { pool_cpu[17] = 56; });  // and again, after the pages were read (and guarded) once more
+        EXPECT(read_back(real, over_gpu.p, n * kPage64k, got) == 0 && got[17] == 56);
+        // The remap: the first GPU-only page (and its twin) takes the pool's second page.
+        const PageRange swap[] = {{0, 1, 1}};
+        const PageBatch swap_batch{uintptr_t(dst), 1, swap};
+        EXPECT(SUCCEEDED(call(queue.p, 1, &swap_batch, uintptr_t(pool), n, 0)));
+        EXPECT(SUCCEEDED(real_queue->Signal(gate.p, 3)));
+        remapped = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        EXPECT(remapped && SUCCEEDED(gate->SetEventOnCompletion(3, remapped)));
+        EXPECT(WaitForSingleObject(remapped, 10000) == WAIT_OBJECT_0);
+        CloseHandle(remapped);
+        EXPECT(read_back(real, over_gpu.p, n * kPage64k, got) == 0 && got[0] == 41 && got[16] == 0 &&
+               got[kPage64k] == 41);
+        EXPECT(read_back(real, over_twin.p, kPage64k, got) == 0 && got[0] == 41);
+        rt::xmem::Slot31Counts after{};
+        rt::xmem::slot31_mapping_counts(after);
+        EXPECT(after.host() == before.host() && after.table() == before.table() + 2);
+        // Back as it was, for the unmap below.
+        const PageRange back[] = {{0, 0, 1}};
+        const PageBatch back_batch{uintptr_t(dst), 1, back};
+        EXPECT(SUCCEEDED(call(queue.p, 1, &back_batch, uintptr_t(pool), n, 0)));
+        EXPECT(SUCCEEDED(real_queue->Signal(gate.p, 4)));
+        remapped = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        EXPECT(remapped && SUCCEEDED(gate->SetEventOnCompletion(4, remapped)));
+        EXPECT(WaitForSingleObject(remapped, 10000) == WAIT_OBJECT_0);
+        CloseHandle(remapped);
+        EXPECT(read_back(real, over_gpu.p, n * kPage64k, got) == 0 && got[0] == 40 && got[16] == 55);
+    }
+    leonida::geometry_writes::aliases.store(nullptr, std::memory_order_release);
 
     // The unmap: the GPU-only pages and the mirrored twin are unmapped, the title's page stays.
     const PageRange hole[] = {{2, 0, n}};
     const PageBatch unmap_batch{uintptr_t(dst), 1, hole};
     EXPECT(SUCCEEDED(call(queue.p, 1, &unmap_batch, uintptr_t(pool), n, 0)));
-    EXPECT(SUCCEEDED(real_queue->Signal(gate.p, 3)));
+    EXPECT(SUCCEEDED(real_queue->Signal(gate.p, 5)));
     remapped = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    EXPECT(remapped && SUCCEEDED(gate->SetEventOnCompletion(3, remapped)));
+    EXPECT(remapped && SUCCEEDED(gate->SetEventOnCompletion(5, remapped)));
     EXPECT(WaitForSingleObject(remapped, 10000) == WAIT_OBJECT_0);
     CloseHandle(remapped);
     EXPECT(state_is(dst, MEM_RESERVE) && state_is(dst + kPage64k, MEM_RESERVE) && state_is(cpu, MEM_RESERVE));
+    EXPECT(!leonida::title_frames::backed(uintptr_t(dst)) && !leonida::title_frames::backed(uintptr_t(cpu)));
     EXPECT(cpu[kPage64k] == 77);
 
     EXPECT(map(cpu + kPage64k, 1, nullptr) && map(pool_cpu, n, nullptr));
     EXPECT(free_pages(n + 1, pages));
     std::puts("queue slot 31 default route: a source through its CPU alias, a deferred copy and an unmap keep the "
-              "title's own CPU twin page");
+              "title's own CPU twin page; slot-133 buffers over the GPU-only pages and their twin read them through "
+              "the frame table, with the title's CPU writes and a remap, and no host remap");
     return 0;
 }
 
@@ -408,6 +480,33 @@ int paired_views(ID3D12Device* real) {
     kw::set_unguarder(nullptr);
     EXPECT(map(cpu, n, nullptr) && map(gpu, n, nullptr) && free_pages(n, pages));
     return failures;
+}
+
+// The title's own VirtualProtect (xmem's TitleVirtualProtect) never sees one of our read-only guards as the protection
+// it had: a title that saves `old` and sets it back later would leave the page read-only with no guard to answer for it,
+// and its next write faults (run 62's "stray read-only title page"). A cell of the geometry watch, armed as the title
+// texture watch arms them, stands for the guards.
+int title_protect_round_trip() {
+    const char* who = "title VirtualProtect over a guard";
+    using VirtualProtectFn = BOOL(WINAPI*)(LPVOID, SIZE_T, DWORD, PDWORD);
+    const auto protect = reinterpret_cast<VirtualProtectFn>(rt::shims::find("kernel32.dll", "VirtualProtect"));
+    EXPECT(protect);
+    auto* pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(pages);
+    const auto va = reinterpret_cast<std::uintptr_t>(pages);
+    auto* cell = leonida::geometry_writes::acquire(va);
+    EXPECT(leonida::geometry_writes::arm(va, *cell));
+    EXPECT((protection_of(pages + 0x1000) & 0xff) == PAGE_READONLY);  // guarded
+    DWORD old = 0, again = 0;
+    EXPECT(protect(pages + 0x1000, 0x1000, PAGE_READWRITE, &old));
+    EXPECT((old & 0xff) == PAGE_READWRITE);  // what the title set, not our guard
+    EXPECT(protect(pages + 0x1000, 0x1000, old, &again));  // set back as the title saw it
+    EXPECT((protection_of(pages + 0x1000) & 0xff) == PAGE_READWRITE);
+    pages[0x1964] = 1;  // and written: no fault left to the title
+    leonida::geometry_writes::release(va);
+    EXPECT(VirtualFree(pages, 0, MEM_RELEASE));
+    std::printf("%s: the title saw and restored its own protection\n", who);
+    return 0;
 }
 
 int exposure_map_ranges(void* device) {
@@ -625,6 +724,7 @@ int main(int argc, char** argv) {
             failures += queue_remap(real.p, device.p);
             failures += queue_remap_default_route(real.p, device.p);
             failures += paired_views(real.p);
+            failures += title_protect_round_trip();
         }
     }
     if (vk.validation_errors()) {

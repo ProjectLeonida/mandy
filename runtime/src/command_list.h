@@ -976,6 +976,18 @@ public:
     bool close() {
         if (closed_) return false;
         closed_ = true;
+        predication_captures_ = 0;
+        runs_shaders_ = false;
+        has_rt_ds_clear_ = false;
+        for (const Command& command : commands_) {
+            if (std::holds_alternative<ClearRenderTarget>(command) ||
+                std::holds_alternative<ClearDepthStencil>(command))
+                has_rt_ds_clear_ = true;
+            if (const auto* p = std::get_if<Predication>(&command); p && p->buffer) ++predication_captures_;
+            if (std::holds_alternative<Dispatch>(command) || draw_command(command).state ||
+                std::holds_alternative<ExecuteIndirect>(command))
+                runs_shaders_ = true;
+        }
         return true;
     }
 
@@ -984,12 +996,18 @@ public:
         commands_.clear();
         active_.clear();
         closed_ = false;
+        predication_captures_ = 0;
+        runs_shaders_ = false;
+        has_rt_ds_clear_ = false;
         stamp_.restamp();
         return true;
     }
 
     bool closed() const { return closed_; }
     std::span<const Command> commands() const { return commands_; }
+    std::uint64_t predication_captures() const noexcept { return predication_captures_; }
+    bool runs_shaders() const noexcept { return runs_shaders_; }
+    bool has_rt_ds_clear() const noexcept { return has_rt_ds_clear_; }
 
 private:
     static bool valid(const TargetView& target) { return target.resource && target.layer_count; }
@@ -1028,6 +1046,9 @@ private:
     std::vector<Command> commands_;
     std::vector<BeginQuery> active_;  // queries begun and not yet ended
     bool closed_ = false;
+    std::uint64_t predication_captures_ = 0;
+    bool runs_shaders_ = false;
+    bool has_rt_ds_clear_ = false;
     command_list_epochs::Stamp stamp_;  // when this recording began: a copy the layer retires waits for it
 };
 

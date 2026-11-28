@@ -58,6 +58,7 @@ class FakeDevice:
     separate_depth_stencil_layouts: bool = True
     buffer_device_address: bool = True
     subgroup_size_control: bool = True
+    integer_dot_product: bool = True    # shaderIntegerDotProduct, required by Vulkan 1.3
     queue_flags: tuple[int, ...] = (vk_info.VK_QUEUE_GRAPHICS_BIT,)
     subgroup_size: int = 32
     subgroup_supported_stages: int = (
@@ -249,6 +250,9 @@ class FakeVulkan:
                 ctypes.c_uint32.from_address(
                     node_addr + vk_info.F13_DYNAMIC_RENDERING
                 ).value = int(dev.dynamic_rendering)
+                ctypes.c_uint32.from_address(
+                    node_addr + vk_info.F13_SHADER_INTEGER_DOT_PRODUCT
+                ).value = int(dev.integer_dot_product)
             elif stype == 1000044003:  # VkPhysicalDeviceDynamicRenderingFeaturesKHR
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.dynamic_rendering)
             elif stype == 1000314007:  # VkPhysicalDeviceSynchronization2FeaturesKHR
@@ -374,6 +378,7 @@ class ConstantsAndLayoutTest(unittest.TestCase):
         self.assertEqual(vk_info.F13_SUBGROUP_SIZE_CONTROL, 16 + 4 * 7)
         self.assertEqual(vk_info.F13_SYNCHRONIZATION2, 16 + 4 * 9)
         self.assertEqual(vk_info.F13_DYNAMIC_RENDERING, 16 + 4 * 12)
+        self.assertEqual(vk_info.F13_SHADER_INTEGER_DOT_PRODUCT, 16 + 4 * 13)
         self.assertEqual(vk_info.PROPS_API_VERSION, 0)
         self.assertEqual(vk_info.PROPS_DRIVER_VERSION, 4)
         self.assertEqual(vk_info.PROPS_VENDOR_ID, 8)
@@ -822,12 +827,20 @@ class QueryTest(unittest.TestCase):
                     "per_vertex_inputs": True,
                     "barycentric_fallback": False,
                     "max_push_constants_size": 256,
+                    "integer_dot_product": True,
                     "vendor_id": 0,
                     "device_id": 0,
                     "driver_id": 1,
                     "rdna1_amd_windows": False,
                     "rdna2_amd_windows": False,
                 })
+
+    def test_integer_dot_product(self):
+        """shaderIntegerDotProduct of a Vulkan 1.3 device (offset 68); a Vulkan 1.2 device never has it."""
+        for have in (True, False):
+            with self.subTest(have=have):
+                res, _vk = self._run_query(FakeDevice(integer_dot_product=have))
+                self.assertIs(res["integer_dot_product"], have)
 
     def test_max_push_constants_size(self):
         """limits.maxPushConstantsSize is read from VkPhysicalDeviceProperties (offset 328 on 64-bit)."""

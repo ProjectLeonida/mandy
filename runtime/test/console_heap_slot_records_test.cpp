@@ -8,6 +8,8 @@
 // compared with a full re-resolution of every slot: a slot left naming a range that went (a GPU page fault in the
 // runtime) or a waiting slot left null after its buffer came fails the comparison.
 #include "../src/console_heap_slot_records.h"
+#include "../src/memory_breakdown.h"
+#include "../src/title_mirror_space.h"
 
 #include <array>
 #include <cstdint>
@@ -89,6 +91,40 @@ struct Model {
     void write(std::size_t slot, Words a, Words b = Words{}) {
         slots[slot] = {a, b};
         fix(slot);
+    }
+    // As the device fixes a slot the title rewrote: the changes noted so far are applied first (sync_slot_changes),
+    // then a half whose range another half has a record for takes its answer (answer()) instead of resolving.
+    std::uint64_t answered = 0, answered_resolved = 0, stale_answers = 0;
+    void write_answered(std::size_t slot, Words a, Words b = Words{}) {
+        apply();
+        slots[slot] = {a, b};
+        ++fixes;
+        for (unsigned half = 0; half < 2; ++half) {
+            const Words& w = slots[slot][half];
+            ConsoleHeapSlotRecords::State state{};
+            std::uint64_t target = 0;
+            if (w.span && records.answer(w.base, w.span, false, state, target)) {
+                ++answered;
+                const bool resolved = state == ConsoleHeapSlotRecords::resolved;
+                answered_resolved += resolved;
+                records.set(slot, half, state, w.base, w.span, target);
+                copy[slot][half] = resolved ? target : 0;
+                // The answer must be what resolving now gives, not only after the next submission's changes.
+                std::uint64_t refused = 0;
+                if (resolve(w.base, w.span, refused) != copy[slot][half]) ++stale_answers;
+                continue;
+            }
+            if (!w.span) {
+                records.set(slot, half, ConsoleHeapSlotRecords::none, 0, 0, 0);
+                copy[slot][half] = 0;
+                continue;
+            }
+            std::uint64_t refused = 0;
+            const std::uint64_t to = resolve(w.base, w.span, refused);
+            records.set(slot, half, to ? ConsoleHeapSlotRecords::resolved : ConsoleHeapSlotRecords::waiting, w.base,
+                        w.span, to ? to : refused);
+            copy[slot][half] = to;
+        }
     }
     void zero(std::size_t slot) {
         slots[slot] = {};
@@ -286,7 +322,8 @@ int differential() {
                 Model::Words a{pick(2) ? pick(64) * kGranule / 2 + pick(0x800) : titles[pick(6)] + pick(0x80000), span};
                 Model::Words b{};
                 if (!pick(4)) b = {pick(64) * kGranule / 2, 4};
-                m.write(slot, a, b);
+                if (pick(2)) m.write_answered(slot, a, b);
+                else m.write(slot, a, b);
                 break;
             }
             case 3: m.zero(slot); break;
@@ -327,21 +364,532 @@ int differential() {
             return 1;
         }
     }
-    EXPECT(m.records.recorded() > 0);
+    EXPECT(m.records.recorded() > 0 && m.answered_resolved > 0 && m.answered > m.answered_resolved &&
+           m.stale_answers == 0);
     // The model's address space is a few MiB, so most changes touch most of it: this case checks results, not cost.
     std::printf("differential: 400 rounds, copy equal to a full re-resolution after each; %llu entries looked at, "
-                "%llu slots fixed again, %zu halves recorded at the end\n",
+                "%llu slots fixed again, %zu halves recorded at the end; %llu rewritten halves answered by a record of "
+                "their range (%llu resolved), each equal to a resolution at that moment\n",
                 static_cast<unsigned long long>(looked), static_cast<unsigned long long>(touched),
-                m.records.recorded());
+                m.records.recorded(), static_cast<unsigned long long>(m.answered),
+                static_cast<unsigned long long>(m.answered_resolved));
+    return 0;
+}
+
+// T# records (set_texture): a T# waits on the exact address it names; a texture registered there touches the slots
+// waiting on it and only those; a texture gone touches the bound ones; a slot rewritten while waiting leaves no
+// stale entry; many slots on one texture; V# and T# changes never touch each other's records.
+int textures() {
+    using R = ConsoleHeapSlotRecords;
+    R records;
+    records.reset(70000);
+    constexpr std::uint64_t kTex = 0x100000100ull, kOther = 0x100000200ull, kNear = 0x100000300ull,
+                            kRebound = 0x100000400ull;
+    std::vector<std::uint32_t> out;
+    const auto touched = [&](SlotChange::Kind kind, std::uint64_t address) {
+        const SlotChange change{kind, address, address + 1};
+        records.touched(&change, 1, out);
+        return out;
+    };
+    // 60,000 T#s wait on kTex, 10 on kOther, 5 are bound to kNear (each address another texture).
+    for (std::uint32_t slot = 0; slot < 60000; ++slot) records.set_texture(slot, R::texture_waiting, kTex);
+    for (std::uint32_t slot = 60000; slot < 60010; ++slot) records.set_texture(slot, R::texture_waiting, kOther);
+    for (std::uint32_t slot = 60010; slot < 60015; ++slot) records.set_texture(slot, R::texture_bound, kNear);
+    EXPECT(records.textures() == 60015 && records.textures_waiting() == 60010 && records.recorded() == 0);
+    // A texture at kOther: its 10 slots, looking at 10 entries.
+    std::uint64_t looked = records.looked_at();
+    EXPECT(touched(SlotChange::texture_added, kOther).size() == 10 && out.front() == 60000 && out.back() == 60009);
+    EXPECT(records.looked_at() - looked == 10);
+    // A texture added where no T# waits, or where only bound ones are: nothing.
+    EXPECT(touched(SlotChange::texture_added, kOther + 0x1000).empty());
+    EXPECT(touched(SlotChange::texture_added, kNear).empty());
+    // V# changes over those addresses never touch T# records.
+    for (const auto kind : {SlotChange::target_gone, SlotChange::source_gone, SlotChange::target_added,
+                            SlotChange::source_added}) {
+        const SlotChange change{kind, kTex - 0x10000, kTex + 0x10000};
+        records.touched(&change, 1, out);
+        EXPECT(out.empty());
+    }
+    // The texture at kNear goes: its bound slots, which the fix makes waiting.
+    EXPECT(touched(SlotChange::texture_gone, kNear).size() == 5);
+    for (std::uint32_t slot = 60010; slot < 60015; ++slot) records.set_texture(slot, R::texture_waiting, kNear);
+    EXPECT(records.textures_waiting() == 60015);
+    // Slot 7 is rewritten while waiting: now a T# of kOther, then a V#, then zeroed. Each time kTex no longer names it.
+    records.set_texture(7, R::texture_waiting, kOther);
+    EXPECT(touched(SlotChange::texture_added, kTex).size() == 59999);
+    EXPECT(touched(SlotChange::texture_added, kOther).size() == 11);
+    records.set(7, 0, R::resolved, 0x5000, 256, kArena + 0x5000);
+    EXPECT(touched(SlotChange::texture_added, kOther).size() == 10);
+    EXPECT(records.textures() == 60014 && records.recorded() == 1);
+    records.clear(7);
+    EXPECT(touched(SlotChange::texture_gone, kOther).size() == 10 && records.recorded() == 0);
+    // The texture comes: the fix binds all 59,999; a later texture added there touches none (they wait no more), a
+    // texture gone touches them all again.
+    for (std::uint32_t slot = 0; slot < 60000; ++slot)
+        if (slot != 7) records.set_texture(slot, R::texture_bound, kTex);
+    EXPECT(touched(SlotChange::texture_added, kTex).empty());
+    EXPECT(touched(SlotChange::texture_gone, kTex).size() == 59999);
+    // Rebinding the same address many times leaves one entry per slot (the bucket is cleaned as it grows).
+    for (int round = 0; round < 8; ++round)
+        for (std::uint32_t slot = 0; slot < 100; ++slot)
+            records.set_texture(slot, round & 1 ? R::texture_bound : R::texture_waiting, kRebound);
+    looked = records.looked_at();
+    EXPECT(touched(SlotChange::texture_gone, kRebound).size() == 100);
+    EXPECT(records.looked_at() - looked <= 200);
+    std::printf("textures: a texture registered touches only the T#s waiting on its address (10 of 60,015, 10 looked "
+                "at); one gone touches the bound ones; rewritten slots leave no stale entry; V# changes touch none\n");
+    return 0;
+}
+
+// Waiting for room: a V# half refused a geometry copy for lack of room is fixed again when copies are freed
+// (geometry_room) whatever its address; a T# refused for a full bindless array when entries are freed (texture_room).
+// The A1 gap: such a half has no target, so no target change ever found it.
+int room() {
+    using R = ConsoleHeapSlotRecords;
+    R records;
+    records.reset(64);
+    records.set(1, 0, R::waiting_room, 0x7000000000ull, 4096, 0);  // geometry refused for room
+    records.set(2, 0, R::waiting, 0x7000100000ull, 4096, 0);       // nothing at its base
+    records.set(3, 1, R::waiting_room, 0x7000200000ull, 64, 0);    // the counter half
+    records.set_texture(4, R::texture_waiting_room, 0x100000400ull);
+    records.set_texture(5, R::texture_waiting, 0x100000500ull);
+    std::vector<std::uint32_t> out;
+    const SlotChange geometry{SlotChange::geometry_room, 0, 1}, textures{SlotChange::texture_room, 0, 1};
+    records.touched(&geometry, 1, out);
+    EXPECT(out == std::vector<std::uint32_t>({1, 3}));
+    records.touched(&textures, 1, out);
+    EXPECT(out == std::vector<std::uint32_t>({4}));
+    // Both at once, each list once; duplicates of one change count once.
+    const SlotChange both[] = {geometry, textures, geometry};
+    records.touched(both, 3, out);
+    EXPECT(out == std::vector<std::uint32_t>({1, 3, 4}));
+    // Resolved since (a copy was made): out of the list; waiting for an address alone: still found by the address.
+    records.set(1, 0, R::resolved, 0x7000000000ull, 4096, kArena + 0x10000);
+    records.set_texture(4, R::texture_waiting, 0x100000400ull);
+    records.touched(both, 3, out);
+    EXPECT(out == std::vector<std::uint32_t>({3}));
+    const SlotChange added{SlotChange::texture_added, 0x100000400ull, 0x100000401ull};
+    records.touched(&added, 1, out);
+    EXPECT(out == std::vector<std::uint32_t>({4}));
+    // A room waiter is also found by its base, as any waiting half.
+    const SlotChange source{SlotChange::source_added, 0x7000200000ull, 0x7000200040ull};
+    records.touched(&source, 1, out);
+    EXPECT(out == std::vector<std::uint32_t>({3}));
+    EXPECT(records.waiting_count() == 2 && records.textures_waiting() == 2);
+    std::printf("room: geometry room touches only the halves refused a copy (2 of 3 waiting), texture room only the "
+                "T#s refused for a full array; resolved ones leave the lists\n");
     return 0;
 }
 
 }  // namespace
 
+// Many slots in a few 64 KiB blocks, as the world's heaps have them (82,000-472,000 entries looked at for 2-15
+// changes in one run when the index grouped spans by 64 KiB block): a change looks at the halves whose range overlaps
+// it, however many others share its block. 300,000 slots name 16 bytes each, in 74 blocks; a release of 48 bytes
+// overlaps three of them. An addition over a range of resolved halves looks at the waiting ones only.
+int dense_blocks_look_at_overlaps_only() {
+    constexpr std::size_t kSlots = 300000;
+    constexpr std::uint64_t kBase = 0x10000000;
+    ConsoleHeapSlotRecords records;
+    records.reset(kSlots);
+    for (std::size_t slot = 0; slot < kSlots; ++slot) {
+        const std::uint64_t base = kBase + slot * 16;
+        records.set(slot, 0, ConsoleHeapSlotRecords::resolved, base, 16, kArena + base);
+    }
+    // A slot whose 1 MiB range starts two blocks before the change, and its counter half waiting on a refused copy.
+    records.set(5, 1, ConsoleHeapSlotRecords::resolved, kBase + 0x80000 - 0x20000, 0x100000, kArena + 0x7000000);
+    std::vector<std::uint32_t> touched;
+    const SlotChange release{SlotChange::target_gone, kArena + kBase + 0x80000 + 8, kArena + kBase + 0x80000 + 48};
+    std::uint64_t before = records.looked_at();
+    records.touched(&release, 1, touched);
+    const std::uint64_t looked = records.looked_at() - before;
+    // [base + 0x80008, base + 0x80030) overlaps slots 0x8000 (from byte 8), 0x8001 and 0x8002 (to byte 0x30).
+    EXPECT(looked == 3);
+    EXPECT(touched.size() == 3 && touched[0] == 0x8000 && touched[2] == 0x8002);
+    // The same bytes by source: the 1 MiB half of slot 5 overlaps them too.
+    const SlotChange removal{SlotChange::source_gone, kBase + 0x80000 + 8, kBase + 0x80000 + 48};
+    before = records.looked_at();
+    records.touched(&removal, 1, touched);
+    EXPECT(records.looked_at() - before == 4 && touched.size() == 4 && touched[0] == 5);
+    // A half that moves leaves nothing behind: slot 0x8001 now names other bytes, so the release looks at two.
+    records.set(0x8001, 0, ConsoleHeapSlotRecords::resolved, kBase - 0x1000, 16, kArena + kBase - 0x1000);
+    before = records.looked_at();
+    records.touched(&release, 1, touched);
+    EXPECT(records.looked_at() - before == 2 && touched.size() == 2 && touched[1] == 0x8002);
+
+    // Additions: 1,000 slots wait among the 300,000 resolved ones; a backing added over the whole range looks at the
+    // 1,000 only.
+    for (std::size_t slot = 100000; slot < 101000; ++slot) {
+        const std::uint64_t base = kBase + slot * 16;
+        records.set(slot, 0, ConsoleHeapSlotRecords::waiting, base, 16, 0);
+    }
+    EXPECT(records.waiting_count() == 1000);
+    const SlotChange added{SlotChange::source_added, kBase, kBase + kSlots * 16};
+    before = records.looked_at();
+    records.touched(&added, 1, touched);
+    EXPECT(records.looked_at() - before == 1000 && touched.size() == 1000 && touched[0] == 100000);
+    // Zeroed or reset, they are gone from every index.
+    records.clear_range(0, kSlots);
+    EXPECT(records.recorded() == 0 && records.ranges() == 0);
+    before = records.looked_at();
+    records.touched(&removal, 1, touched);
+    EXPECT(records.looked_at() == before && touched.empty());
+    std::printf("dense blocks: 300,000 slots in 74 blocks of 64 KiB; a 40-byte release looks at the 3 it overlaps, "
+                "an addition over all of them at the 1,000 waiting\n");
+    return 0;
+}
+
+// What one world run showed (130-210 changes a submission, 60,000-135,000 records looked at for 1,300-2,600 slots
+// fixed): waiting V#s with large spans were looked at by every addition inside their span, though only a range that
+// holds a V#'s base can back it, and a record named by many changes of one submission was looked at once per change.
+// 5,000 waiting halves of 4 GiB each over one title range; 200 additions inside it, none holding their bases, look at
+// none; one that holds 10 of the bases looks at those 10. 200 removals of one submission that all overlap the same
+// 5,000 resolved halves look at each once.
+int changes_look_at_each_record_once() {
+    constexpr std::size_t kSlots = 20000;
+    constexpr std::uint64_t kTitle = 0x200000000000ull, kSpan = 1ull << 32;
+    ConsoleHeapSlotRecords records;
+    records.reset(kSlots);
+    for (std::size_t slot = 0; slot < 5000; ++slot)
+        records.set(slot, 0, ConsoleHeapSlotRecords::waiting, kTitle + slot * 0x100, kSpan, 0);
+    std::vector<SlotChange> added;
+    for (std::uint64_t i = 0; i < 200; ++i) {
+        const std::uint64_t lo = kTitle + 0x10000000 + i * 0x100000;  // past every base, inside every span
+        added.push_back({SlotChange::source_added, lo, lo + 0x10000});
+    }
+    std::vector<std::uint32_t> touched;
+    std::uint64_t before = records.looked_at();
+    records.touched(added.data(), added.size(), touched);
+    EXPECT(records.looked_at() - before == 0 && touched.empty());
+    const SlotChange holds{SlotChange::source_added, kTitle + 0x100 * 20, kTitle + 0x100 * 30};
+    before = records.looked_at();
+    records.touched(&holds, 1, touched);
+    EXPECT(records.looked_at() - before == 10 && touched.size() == 10 && touched[0] == 20);
+
+    for (std::size_t slot = 5000; slot < 10000; ++slot)
+        records.set(slot, 0, ConsoleHeapSlotRecords::resolved, kTitle, kSpan, kArena + 0x100000);
+    std::vector<SlotChange> gone;
+    for (std::uint64_t i = 0; i < 200; ++i)
+        gone.push_back({SlotChange::target_gone, kArena + 0x100000 + i * 0x10000, kArena + 0x100000 + i * 0x10000 + 64});
+    before = records.looked_at();
+    records.touched(gone.data(), gone.size(), touched);
+    EXPECT(records.looked_at() - before == 5000 && touched.size() == 5000);
+    // A removal and an addition in one call over the same waiting half: looked at once in the source index. The 5,000
+    // resolved halves the removal names by source are looked at there once more (once per index, at most twice).
+    gone.push_back({SlotChange::source_gone, kTitle, kTitle + 0x100});
+    gone.push_back({SlotChange::source_added, kTitle, kTitle + 0x100});
+    before = records.looked_at();
+    records.touched(gone.data(), gone.size(), touched);
+    EXPECT(records.looked_at() - before == 10001 && touched.size() == 5001);
+    std::printf("once a call: 200 additions inside 5,000 waiting 4 GiB spans look at none, one holding 10 bases at 10; "
+                "200 removals over 5,000 resolved halves look at each once\n");
+    return 0;
+}
+
+// Reservations <= TitleMirror::kChunk (2 GiB) that would cross a 2 GiB chunk boundary advance to the next chunk so
+// placed buffers inside them stay in one chunk; > 2 GiB reservations are not skipped past chunk boundaries.
+int title_mirror_space_chunk_alignment() {
+    namespace tms = leonida::title_mirror_space;
+    constexpr std::uint64_t kChunk = tms::kChunk;
+    constexpr std::uint64_t kMiB = 1ull << 20;
+    const auto accept = [](std::uint64_t) { return true; };
+
+    // Small reservation starts in the first chunk; a second small one packs into the same chunk.
+    const std::uint64_t a = tms::take(64 * kMiB, 0x10000, true, accept);
+    const std::uint64_t b = tms::take(64 * kMiB, 0x10000, true, accept);
+    EXPECT(a >= tms::kLow && b == a + 64 * kMiB);
+    EXPECT(a / kChunk == (b + 64 * kMiB - 1) / kChunk);
+
+    // A 1950 MiB reservation cannot fit in the remaining 1920 MiB of this chunk: advances to the next 2 GiB boundary.
+    const std::uint64_t big_size = 1950 * kMiB;
+    const std::uint64_t c = tms::take(big_size, 0x10000, false, accept);
+    EXPECT((c & (kChunk - 1)) == 0);
+    EXPECT(c > b);
+    EXPECT(c / kChunk == (c + big_size - 1) / kChunk);
+
+    // An exact 2 GiB reservation while mid-chunk also lands chunk-aligned inside a single chunk.
+    const std::uint64_t exact = tms::take(kChunk, 0x10000, false, accept);
+    EXPECT((exact & (kChunk - 1)) == 0);
+    EXPECT(exact / kChunk == (exact + kChunk - 1) / kChunk);
+
+    // A reservation > 2 GiB does not artificially align to a new chunk when already mid-chunk.
+    const std::uint64_t tiny = tms::take(0x10000, 0x10000, true, accept);
+    const std::uint64_t huge = tms::take(kChunk + 64 * kMiB, 0x10000, true, accept);
+    EXPECT(huge == tiny + 0x10000);
+
+    std::printf("title_mirror_space: <= 2 GiB reservations stay inside one 2 GiB chunk\n");
+    return 0;
+}
+
+// Arena-backed title windows and shadows are split out of general arena buffers in mem-probe breakdown.
+int memory_breakdown_arena_windows() {
+    namespace mb = leonida::memory_breakdown;
+    constexpr std::uint64_t kMiB = 1ull << 20;
+    mb::Tally t;
+    t.add(mb::Consumer::arena, 4095 * kMiB, false);
+    mb::DeviceShare share;
+    share.arena = true;
+    share.arena_reserved = share.arena_bound = 4095 * kMiB;
+    share.arena_in_use = 522 * kMiB;
+    share.arena_use = {58 * kMiB, 0, 0, 0};
+    share.arena_windows = 464 * kMiB;
+    const std::string line = mb::format(t, share, 0);
+    EXPECT(line.find("buffers 58, descriptor heaps 0, shader code 0, heaps 0, windows/shadows 464]") !=
+           std::string::npos);
+    EXPECT(line.find("title windows and shadows 0 (0) [in arena 464 MiB]") != std::string::npos);
+
+    // With 0 arena windows, the compact format stays unchanged.
+    share.arena_windows = 0;
+    const std::string clean = mb::format(t, share, 0);
+    EXPECT(clean.find("windows/shadows") == std::string::npos);
+    EXPECT(clean.find("[in arena") == std::string::npos);
+    std::printf("memory_breakdown: arena windows/shadows split from buffers\n");
+    return 0;
+}
+
+// Clearing a deferred slot before finish_in_place resolves it prevents a placeholder waiting record from poisoning
+// ConsoleHeapSlotRecords::answer(), while repeated V# halves still hit settled resolved/waiting records.
+int deferred_clear_and_repeated_answers() {
+    using R = ConsoleHeapSlotRecords;
+    R records;
+    records.reset(16);
+    constexpr std::uint64_t kBase = 0x100800000000ull;
+    constexpr std::uint64_t kSpan = 0x1000;
+    // Deferred slot 0 is cleared (none), not inserted as a placeholder waiting record -> answer() returns false.
+    records.set(0, 0, R::none, 0, 0, 0);
+    R::State state = R::none;
+    std::uint64_t target = 0;
+    EXPECT(!records.answer(kBase, kSpan, false, state, target));
+    EXPECT(!records.answer(kBase, kSpan, true, state, target));
+
+    // Once slot 0 settles as resolved, repeated slot 1 gets the exact resolved target from answer().
+    records.set(0, 0, R::resolved, kBase, kSpan, kArena + 0x20000, false);
+    EXPECT(records.answer(kBase, kSpan, false, state, target));
+    EXPECT(state == R::resolved && target == kArena + 0x20000);
+
+    // Once slot 2 settles as waiting (asked for geometry), repeated slot 3 gets waiting whether geometry is true/false.
+    constexpr std::uint64_t kUnbacked = 0x100900000000ull;
+    records.set(2, 0, R::waiting, kUnbacked, kSpan, 0, true);
+    EXPECT(records.answer(kUnbacked, kSpan, true, state, target) && state == R::waiting && target == 0);
+    EXPECT(records.answer(kUnbacked, kSpan, false, state, target) && state == R::waiting && target == 0);
+    std::printf("deferred_clear_and_repeated_answers: ok\n");
+    return 0;
+}
+
+// Regression:
+//   1. An unresolvable base >= arena.size V# recorded directly as waiting (geometry=true) wakes on source_added
+//      (late alias, backing, or extended title_memory) and answers repeated halves consistently until woken;
+//   2. A tracked non-sparse direct backing (resolved with target) wakes on target_gone when freed;
+//   3. Clearing a slot whose T# was overwritten with non-T# data removes its texture record so later texture changes
+//      never touch the slot.
+int waiting_source_added_and_tsharp_clear() {
+    using R = ConsoleHeapSlotRecords;
+    R records;
+    records.reset(32);
+    std::vector<std::uint32_t> out;
+
+    // 1. Waiting record (geometry=true) for base >= arena.size wakes on source_added.
+    constexpr std::uint64_t kLateBase = 0x100800004000ull;
+    constexpr std::uint64_t kSpan = 0x1000;
+    records.set(4, 0, R::waiting, kLateBase, kSpan, 0, true);
+    R::State state = R::none;
+    std::uint64_t target = 0;
+    EXPECT(records.answer(kLateBase, kSpan, false, state, target) && state == R::waiting && target == 0);
+    EXPECT(records.answer(kLateBase, kSpan, true, state, target) && state == R::waiting && target == 0);
+    const SlotChange late_alias{SlotChange::source_added, kLateBase - 0x4000, kLateBase + 0x10000};
+    records.touched(&late_alias, 1, out);
+    EXPECT(out == std::vector<std::uint32_t>({4}));
+
+    // 2. Non-sparse direct backing (e.g. below-arena gpu_backings or geometry copy) tracked as resolved wakes on
+    //    target_gone when that backing is freed.
+    constexpr std::uint64_t kBelowOffset = (1ull << 47) | 0x200000ull;
+    constexpr std::uint64_t kBelowBda = kArena + (kBelowOffset | ~kMask);
+    records.set(7, 0, R::resolved, kBelowOffset, 0x400, kBelowBda, false);
+    const SlotChange freed{SlotChange::target_gone, kBelowBda, kBelowBda + 0x1000};
+    records.touched(&freed, 1, out);
+    EXPECT(out == std::vector<std::uint32_t>({7}));
+
+    // 3. Prior texture record cleared when slot is overwritten with not_tsharp data.
+    constexpr std::uint64_t kTexAddr = 0x100801000000ull;
+    records.set_texture(9, R::texture_bound, kTexAddr);
+    EXPECT(records.textures() == 1);
+    records.clear(9);
+    EXPECT(records.textures() == 0 && records.state(9, 0) == R::none);
+    const SlotChange tex_gone{SlotChange::texture_gone, kTexAddr, kTexAddr + 1};
+    records.touched(&tex_gone, 1, out);
+    EXPECT(out.empty());
+
+    std::printf("waiting_source_added_and_tsharp_clear: ok\n");
+    return 0;
+}
+
+// Fast-path regression: repeated none->none set()/clear() calls and repeated identical place() calls leave all
+// counts, groups, and touched() results exact without corrupting state.
+int none_to_none_and_idempotent_fast_path() {
+    using R = ConsoleHeapSlotRecords;
+    R records;
+    records.reset(1024);
+
+    // Repeated none->none on untouched slots.
+    for (std::size_t s = 0; s < 1024; ++s) {
+        records.set(s, 0, R::none, 0, 0, 0);
+        records.set(s, 1, R::none, 0, 0, 0);
+        records.clear(s);
+    }
+    EXPECT(records.recorded() == 0 && records.waiting_count() == 0 && records.textures() == 0 && records.ranges() == 0);
+
+    // Identical repeated set() and set_texture() hit place() fast path cleanly.
+    constexpr std::uint64_t kBase = 0x40000000ull, kTarget = kArena + 0x40000000ull, kTex = 0x50000000ull;
+    records.set(10, 0, R::resolved, kBase, 256, kTarget, false);
+    records.set(10, 0, R::resolved, kBase, 256, kTarget, false);
+    records.set(10, 1, R::none, 0, 0, 0);
+    records.set_texture(11, R::texture_bound, kTex);
+    records.set_texture(11, R::texture_bound, kTex);
+    EXPECT(records.recorded() == 1 && records.textures() == 1 && records.ranges() == 3);
+
+    // Changing state or clearing still drops cleanly and returns to none->none.
+    records.set(10, 0, R::waiting, kBase, 256, 0, true);
+    EXPECT(records.recorded() == 1 && records.waiting_count() == 1 && records.ranges() == 2);
+    records.set(10, 0, R::waiting, kBase, 256, 0, true);
+    EXPECT(records.recorded() == 1 && records.waiting_count() == 1 && records.ranges() == 2);
+
+    std::vector<std::uint32_t> out;
+    const SlotChange src{SlotChange::source_added, kBase, kBase + 64};
+    records.touched(&src, 1, out);
+    EXPECT(out == std::vector<std::uint32_t>({10}));
+
+    records.clear(10);
+    records.clear(10);  // second clear hits none->none fast path
+    records.clear(11);
+    records.clear(11);
+    EXPECT(records.recorded() == 0 && records.waiting_count() == 0 && records.textures() == 0 && records.ranges() == 0);
+
+    std::printf("none_to_none_and_idempotent_fast_path: ok\n");
+    return 0;
+}
+
+// Live texture callback: fires ONLY on kTexture kSettled 0 <-> 1 transitions per address per heap across attach,
+// detach, clear/clear_range, overwrite, reset(), move, and destructor (never on waiting states or V# records).
+int texture_live_callback() {
+    using R = ConsoleHeapSlotRecords;
+    struct Tracker {
+        std::map<std::uint64_t, int> live_heaps;
+        std::vector<std::pair<std::uint64_t, bool>> events;
+        static void on_live(void* user, std::uint64_t addr, bool bound) {
+            auto* self = static_cast<Tracker*>(user);
+            self->events.emplace_back(addr, bound);
+            if (bound) {
+                ++self->live_heaps[addr];
+            } else {
+                const auto it = self->live_heaps.find(addr);
+                if (it != self->live_heaps.end()) {
+                    if (--it->second == 0) self->live_heaps.erase(it);
+                } else {
+                    self->live_heaps[addr] = -1;  // underflow sentinel
+                }
+            }
+        }
+    } tracker;
+
+    constexpr std::uint64_t kTexA = 0x100001000ull;
+    constexpr std::uint64_t kTexB = 0x100002000ull;
+    constexpr std::uint64_t kTexC = 0x100003000ull;
+    constexpr std::uint64_t kTexWait = 0x100004000ull;
+
+    {
+        R heap1, heap2;
+        heap1.set_texture_live_callback(&Tracker::on_live, &tracker);
+        heap2.set_texture_live_callback(&Tracker::on_live, &tracker);
+        heap1.reset(64);
+        heap2.reset(64);
+
+        // Waiting T# and V# records at the same address never trigger callbacks.
+        heap1.set_texture(0, R::texture_waiting, kTexWait);
+        heap1.set_texture(1, R::texture_waiting_room, kTexWait);
+        heap1.set(2, 0, R::resolved, kTexA, 256, kArena + 0x1000);
+        EXPECT(tracker.events.empty() && tracker.live_heaps.empty());
+
+        // 0 -> 1 on kTexA fires (kTexA, true); 1 -> 2 and idempotent rewrite do not fire.
+        heap1.set_texture(3, R::texture_bound, kTexA);
+        EXPECT(tracker.events.size() == 1 && tracker.events.back() == std::make_pair(kTexA, true));
+        EXPECT(tracker.live_heaps.at(kTexA) == 1);
+        heap1.set_texture(4, R::texture_bound, kTexA);
+        heap1.set_texture(3, R::texture_bound, kTexA);
+        EXPECT(tracker.events.size() == 1);
+
+        // Second heap binding kTexA increments live_heaps[kTexA] to 2.
+        heap2.set_texture(10, R::texture_bound, kTexA);
+        EXPECT(tracker.events.size() == 2 && tracker.live_heaps.at(kTexA) == 2);
+
+        // One slot in heap1 transitions bound -> waiting: slot 4 still holds kTexA, so no false event yet.
+        heap1.set_texture(3, R::texture_waiting, kTexA);
+        EXPECT(tracker.events.size() == 2 && tracker.live_heaps.at(kTexA) == 2);
+
+        // Last slot in heap1 switches kTexA -> kTexB: fires (kTexA, false) then (kTexB, true).
+        heap1.set_texture(4, R::texture_bound, kTexB);
+        EXPECT(tracker.events.size() == 4);
+        EXPECT(tracker.events[2] == std::make_pair(kTexA, false));
+        EXPECT(tracker.events[3] == std::make_pair(kTexB, true));
+        EXPECT(tracker.live_heaps.at(kTexA) == 1 && tracker.live_heaps.at(kTexB) == 1);
+
+        // Overwriting kTexB with a V# fires (kTexB, false).
+        heap1.set(4, 0, R::resolved, 0x8000, 64, kArena + 0x8000);
+        EXPECT(tracker.events.size() == 5 && tracker.events.back() == std::make_pair(kTexB, false));
+        EXPECT(tracker.live_heaps.count(kTexB) == 0);
+
+        // Re-bind kTexB and kTexC in heap1, then clear_range drops kTexB only.
+        heap1.set_texture(5, R::texture_bound, kTexB);
+        heap1.set_texture(8, R::texture_bound, kTexC);
+        EXPECT(tracker.live_heaps.at(kTexB) == 1 && tracker.live_heaps.at(kTexC) == 1);
+        heap1.clear_range(5, 7);
+        EXPECT(tracker.live_heaps.count(kTexB) == 0 && tracker.live_heaps.at(kTexC) == 1);
+
+        // reset() notifies kTexC unbound (and NOT kTexWait), and keeps callback active afterward.
+        const std::size_t before_reset = tracker.events.size();
+        heap1.reset(32);
+        EXPECT(tracker.events.size() == before_reset + 1 && tracker.events.back() == std::make_pair(kTexC, false));
+        EXPECT(tracker.live_heaps.count(kTexC) == 0);
+
+        // Post-reset binding works, and move leaves moved-from silent.
+        heap1.set_texture(1, R::texture_bound, kTexC);
+        EXPECT(tracker.live_heaps.at(kTexC) == 1);
+        R moved_heap(std::move(heap1));
+        EXPECT(tracker.live_heaps.at(kTexC) == 1);
+
+        // Destructors of moved_heap (kTexC) and heap2 (kTexA) unbind both cleanly.
+    }
+    EXPECT(tracker.live_heaps.empty());
+
+    // Detaching callback with nullptr before destruction suppresses teardown callbacks.
+    {
+        R silent;
+        silent.set_texture_live_callback(&Tracker::on_live, &tracker);
+        silent.reset(16);
+        silent.set_texture(0, R::texture_bound, kTexA);
+        EXPECT(tracker.live_heaps.at(kTexA) == 1);
+        const std::size_t before_detach = tracker.events.size();
+        silent.set_texture_live_callback(nullptr, nullptr);
+        silent.reset(0);
+        EXPECT(tracker.events.size() == before_detach);
+    }
+    std::printf("texture_live_callback: ok\n");
+    return 0;
+}
+
 int main() {
     if (release_looks_at_its_slots_only()) return 1;
     if (cases()) return 1;
+    if (dense_blocks_look_at_overlaps_only()) return 1;
+    if (changes_look_at_each_record_once()) return 1;
     if (differential()) return 1;
+    if (textures()) return 1;
+    if (room()) return 1;
+    if (title_mirror_space_chunk_alignment()) return 1;
+    if (memory_breakdown_arena_windows()) return 1;
+    if (deferred_clear_and_repeated_answers()) return 1;
+    if (waiting_source_added_and_tsharp_clear()) return 1;
+    if (none_to_none_and_idempotent_fast_path()) return 1;
+    if (texture_live_callback()) return 1;
     std::printf("console_heap_slot_records_test: ok\n");
     return 0;
 }

@@ -475,9 +475,11 @@ inline constexpr bool console_value_met(std::uint32_t comparison, std::uint64_t 
 struct ListValueStats {
     std::uint64_t writes_recorded, writes_landed, writes_failed;
     std::uint64_t waits_recorded, waits_met_at_submit, waits_relayed;  // relayed: a GPU wait on a write in flight
-    std::uint64_t gates_held, gates_met, gates_timed_out;               // gate: opened from the CPU
+    std::uint64_t gates_held, gates_met, gates_released;                // gate: opened from the CPU; released unmet
+    // Released unmet because nothing else could run with a present queued, in a cycle, with the title stalled, at
+    // device loss (part of gates_released); released waits that memory met afterwards.
+    std::uint64_t released_present, released_cycle, released_stalled, released_lost, met_after_release;
     std::uint64_t cuts, cuts_deferred, cut_failures;                    // a list split at a wait after work
-    std::uint64_t gates_short, demotions, late_met;  // short timeouts, every wait demoted, short waits met later
     std::uint64_t bundle_ops;                         // writes and waits on bundles, not modelled
     std::uint64_t releases, release_us, release_us_max, pass_us_max;  // the releaser's signals, the pump's passes
     std::uint64_t release_stalls;                     // gate Signals still running after a second
@@ -488,8 +490,11 @@ struct ListValueStats {
 };
 ListValueStats list_value_stats();
 void reset_list_value_stats();
-// How long a queue stands at an unmet wait before it runs on (LEONIDA_VALUE_WAIT_TIMEOUT_MS, default 200 ms).
-void set_list_value_wait_timeout_ms(unsigned ms);
+// Test helper: whether a Signal of the value reached the GPU (null: the layer answers; without it, always). A test
+// says "held" for a fence whose Signal the real layer would hold behind a wait.
+void set_list_value_signal_submitted_hook(bool (*hook)(ID3D12Fence*, std::uint64_t));
+// The title called PresentX (the queue proxy calls it; a test may too): a present stands behind the held work.
+void note_list_value_present();
 // Test helper: LEONIDA_LIST_VALUES as if set to 0 (false) or unset (true), for lists made afterwards.
 void set_list_values_enabled(bool on);
 // Before the process exits: the threads that land list writes and open gates finish and end (up to `ms`).

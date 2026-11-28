@@ -36,6 +36,7 @@ from shader_ir import HDR, parse_file  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
 from file_mode import published_mode  # noqa: E402
 import cfg_structure  # noqa: E402
+import descriptor_sources  # noqa: E402
 import fssm_header  # noqa: E402
 import fssm_unpack  # noqa: E402
 import lane_masks  # noqa: E402
@@ -66,6 +67,14 @@ DESCRIPTOR_TABLE = "tagged"
 # The kind word's bit positions, shared with runtime/src/descriptor_table.h.
 DESC_SAMPLED_BIT = 0     # bit i: the index is bound in dimension i's sampled array
 DESC_STORAGE_BIT = 8     # bit 8 + i: ... in its storage arrays (dimensions 0..4 have them)
+# The bindless index in the T# (docs/design.md, "Bindless index in the T#"): the layer writes dword 6 of every T# in
+# the heaps it keeps (runtime/src/gfx10_descriptors.h, tsharp_index_word) as TAG << 28 | storage kind << 23 |
+# sampled kind << 16 | index, the kind being the table's kind bits 8..12 and 0..6. A module reads it, without the
+# hash table, where tools/descriptor_sources.py shows the T#'s dword 6 was loaded from such a heap, and records
+# TSHARP_INDEX in its meta, which tells the runtime to write the word.
+TSHARP_INDEX = "dword6"
+TSHARP_INDEX_DWORD = 6
+TSHARP_INDEX_TAG = 0xA
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
 # --wave64-emulate: use wave64_emulate_opt's inline structured form when it does not put an exchange barrier
 # under control flow only some invocations take (translate() re-runs this module without it when it does).
@@ -84,6 +93,12 @@ W64G_COUNTS = Counter()   # tiers of the wave64 VS/PS/GS translated so far, for 
 # (1,0,0), (0,1,0), (0,0,1) at the triangle's three vertices; interpolating those gives the perspective-correct
 # barycentrics, so .y/.z are AMD's i/j as with BaryCoordKHR.
 BARY_FALLBACK = False
+# --integer-dot-fallback: the 4x8-bit dot products (v_dot4_i32_i8, v_dot4c_i32_i8, v_dot4_u32_u8, v_dot4c_u32_u8) are
+# four extracts, multiplies and adds, as before, instead of SPV_KHR_integer_dot_product's OpSDot / OpUDot and their
+# saturating-accumulate forms (Gen.packed_dot4). For devices without shaderIntegerDotProduct (a Vulkan 1.2 device
+# without VK_KHR_shader_integer_dot_product); Vulkan 1.3 requires the feature. docs/design.md, "Signed-byte dot
+# products".
+INTEGER_DOT_FALLBACK = False
 SHADER_CLOCK = False
 FMA_KHR = False          # --fma khr: fused multiply-adds are OpFmaKHR (SPV_KHR_fma, VK_KHR_shader_fma), not GLSL Fma
 FMA_EXACT = False        # --fma exact: fused multiply-adds are emulated from single-rounded f32 ops (Gen.fma_exact)
@@ -93,6 +108,7 @@ FMA_EXACT = False        # --fma exact: fused multiply-adds are emulated from si
 # coordinate, so a per-pixel offset doesn't change the LOD. Gathers keep their Offset (shaderImageGatherExtended).
 TEXEL_OFFSET_FALLBACK = False
 FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPreserve, for drivers without the property
+FTZ32 = True             # False (--no-ftz32): keep software flush_f32() instead of DenormFlushToZero 32
 # --mesh-compute: mesh shaders become compute shaders (same workgroup size and code) for devices without
 # VK_EXT_mesh_shader. Instead of SetMeshOutputs and the mesh outputs, the epilogue writes the vertex and primitive
 # counts, each lane's vertex and each lane's primitive into this workgroup's slot of a buffer whose device address is
@@ -479,6 +495,8 @@ class Gen:
         self.atomic_volume_tsharps = set()  # SGPR descriptor groups also used for 3D atomics
         self.reads_store_views = False  # reserved for compatibility with main
         self.coherent_images = False    # a glc image_load/image_store: the storage views are decorated Coherent
+        self.uses_vmm = False           # glc/dlc buffer/global/scalar access: VulkanMemoryModel + DeviceScope
+        self.reads_glc_buffer = False   # glc/dlc buffer/global/scalar load: runtime pre-dispatch barrier hint
         self.writes_depth = False
         self.uses_smul = False
         self.uses_minlod = False
@@ -487,6 +505,13 @@ class Gen:
         self.round_mode = False     # the program writes MODE.FP_ROUND[3:2] (f16/f64 rounding): kept in %mode_r16
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
+        self.uses_psb_vec = False      # scalar_load's read-only wide loads: uvec2/uvec4 NonWritable Block pointers
+        self.uses_psb_vec_rw = False   # scalar_load's mutable wide loads: uvec2/uvec4 Block pointers without NonWritable
+        self.uses_psb_scalar_ro = False  # scalar_load's read-only single-dword loads: uint NonWritable Block pointers
+        self.ftz32 = bool(FLOAT_CONTROLS and FTZ32)  # DenormFlushToZero 32 active for this module
+        self.scalar_load_ro = None     # None (unanalysed), True (all RO), or frozenset of id(ins) safe for NonWritable
+        self.sbuf_slow_fns: dict[tuple[int, bool], list[str]] = {}  # (width, ro) -> %sbuf_slow_{ro|rw}_x{n} helper lines
+        self.uses_int_dot = False      # packed_dot4 emitted OpSDot/OpUDot(AccSat): SPV_KHR_integer_dot_product
         self.uses_fma_khr = False      # an OpFmaKHR was emitted: capability FMAKHR + extension SPV_KHR_fma
         self.uses_fma_khr32 = False    # ... on f32 (feature shaderFmaFloat32)
         self.uses_fma_khr64 = False    # ... on f64 (feature shaderFmaFloat64)
@@ -535,7 +560,8 @@ class Gen:
         self.wave64 = False        # compiled for 64-lane waves (64-bit EXEC writes, exec_hi, v_mbcnt_hi, ...)
         self.cur_uniform_readlane = False
         self.w64g = None           # wave64 VS/PS/GS: wave64_halves.analyse() result (tier, reasons, rewrite sites)
-        self.w64_scalar_spills = set()  # (vgpr, lane) pure scalar spill slots lowered to self.parked (SHADER-10)
+        self.scalar_spills = set() # (vgpr, lane) pure scalar spill slots lowered to self.parked (all waves/stages)
+        self.spill_readlanes = set()  # id(ins) of mixed-VGPR v_readlane_b32 proven to reload a parked spill slot
         self.emulate = False       # --wave64-emulate: exact wave64 on any subgroup size (cs/ms; see x_round)
         self.emulate_inline = False  # emulate: current block emits direct inline barriers (no x_split)
         self.emulate_plan = None   # emulate: structured plan from wave64_emulate_opt.plan_structured_emulation
@@ -584,13 +610,23 @@ class Gen:
         self.guard_fn = None      # --address-guard: lines of %guard_fn, once an access needs it
         self.guard_last = None    # --address-guard: (guarded address, unguarded address) of the last host_addr
         self.uses_fmt_tables = False    # %fmt_desc_tab / %fmt_norm_rep_tab: a format's kind and channel widths
+        self.uses_fmt_enc_table = False  # %fmt_enc_desc_tab: table-driven dynamic-format buffer store encoder
+        self.float_only_images = set()  # id(ins) of image_load/image_sample ops provably float-only
         self.x_round_fns: dict[str, list[str]] = {}       # emulate_inline: helper functions for x_round pre-barrier setup
         self.x_round_fn_types: dict[int, str] = {}        # emulate_inline: arity -> OpTypeFunction id for x_round_fns
         self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
         self.desc_cache = {}  # (first SGPR, dwords) -> id of the %desc_lookup_fn result in the current basic block
+        # id(instruction) -> True when its T#'s dword 6 comes from a heap slot the layer writes (descriptor_sources)
+        self.tsharp_from_heap = {}
+        self.tsharp_index_reads = 0     # image instructions that take the T#'s index from dword 6 alone
+        self.tsharp_lookups = 0         # ... that also look the T# up in the hash table (its source is not known)
         self._scan = (None, 0, [])   # (body list, lines already seen, open merge labels): see desc_cache_ok
         self.block_label = "%entry"   # label of the SPIR-V block the current instruction starts in
         self.build_meta = {}          # runtime build metadata from tools/shader_meta.py
+        self.literal_samplers = []    # ordered 4-dword literal S# tuples (matches meta["literal_samplers"])
+        self.literal_sampler_index = {}  # 4-dword tuple -> SpecId index (0..N-1)
+        self.literal_sampler_sites = {}  # id(ins) -> 4-dword literal S# tuple
+        self.uses_lit_sampler_spec = False  # emitted OpSpecConstant literal sampler bypass
 
     def tmp(self):
         self.n += 1
@@ -2527,6 +2563,23 @@ class Gen:
         "buffer_store_byte": (1, True, False, None), "buffer_store_byte_d16_hi": (1, True, False, 1),
         "buffer_store_short": (2, True, False, None), "buffer_store_short_d16_hi": (2, True, False, 1)}
 
+    @staticmethod
+    def _is_coherent_mem(mods):
+        return "glc" in mods or "dlc" in mods
+
+    def _psb_load_op(self, mods):
+        if self._is_coherent_mem(mods):
+            self.uses_vmm = True
+            self.reads_glc_buffer = True
+            return f"Aligned|MakePointerVisible|NonPrivatePointer 4 {self.cu(1)}"
+        return "Aligned 4"
+
+    def _psb_store_op(self, mods):
+        if self._is_coherent_mem(mods):
+            self.uses_vmm = True
+            return f"Aligned|MakePointerAvailable|NonPrivatePointer 4 {self.cu(1)}"
+        return "Aligned 4"
+
     def buffer_sub(self, op, a, mods):
         """The d16 8/16-bit MUBUF loads and the 8/16-bit stores (RDNA2 ISA); the plain buffer_load_{u,s}byte /
         {u,s}short are buffer_load_sub's. The _d16 loads write one 16-bit half of vdata (ubyte / sbyte extended to 16 bits) and
@@ -2551,6 +2604,9 @@ class Gen:
         self.emit(f"OpSelectionMerge {lbl_end} None")
         self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
+        if store and self._is_coherent_mem(mods):
+            self.uses_vmm = True
+        load_mem = None if store else self._psb_load_op(mods)
         value = None
         for k in range(nbytes):
             va = addr
@@ -2580,7 +2636,7 @@ class Gen:
                 self.emit(f"{t2} = OpAtomicOr %uint {p} {self.cu(1)} {self.cu(0)} {vs}")
             else:
                 w, b = self.tmp(), self.tmp()
-                self.emit(f"{w} = OpLoad %uint {p} Aligned 4")
+                self.emit(f"{w} = OpLoad %uint {p} {load_mem}")
                 self.emit(f"{b} = OpBitFieldUExtract %uint {w} {sh} {self.cu(8)}")
                 if value is None:
                     value = b
@@ -2622,6 +2678,8 @@ class Gen:
         ptr, host = self.tmp(), self.host_addr(addr, "load", lambda: self.guard_delta(n, step))
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
 
+        load_mem = self._psb_load_op(mods)
+
         def guarded(cond, dwords):
             """One selection construct that loads these dwords when cond holds; the phis give 0 otherwise."""
             lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
@@ -2632,7 +2690,7 @@ class Gen:
             loaded = []
             for i in dwords:
                 p, v_do = self.buf_dword_ptr(ptr, host, step, i), self.tmp()
-                self.emit(f"{v_do} = OpLoad %uint {p} Aligned 4")
+                self.emit(f"{v_do} = OpLoad %uint {p} {load_mem}")
                 loaded.append(v_do)
             self.emit(f"OpBranch {lbl_end}")
             self.emit(f"{lbl_end} = OpLabel")
@@ -2688,8 +2746,9 @@ class Gen:
         self.emit(f"{sh} = OpShiftLeftLogical %uint {b3} {self.cu(3)}")
         ptr, host = self.tmp(), self.host_addr(aligned, "load", lambda: self.guard_delta(self.sub_dwords(nbytes, b3), step))
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
+        load_mem = self._psb_load_op(mods)
         p0, w0 = self.buf_dword_ptr(ptr, host, step, 0), self.tmp()
-        self.emit(f"{w0} = OpLoad %uint {p0} Aligned 4")
+        self.emit(f"{w0} = OpLoad %uint {p0} {load_mem}")
         ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
         val = self.tmp()
         if nbytes == 1:
@@ -2699,7 +2758,7 @@ class Gen:
             self.emit(f"{cross} = OpIEqual %bool {b3} {self.cu(3)}")
             self.emit(f"{idx1} = OpSelect %uint {cross} {self.cu(1)} {self.cu(0)}")
             p1 = self.buf_dword_ptr(ptr, host, step, idx1, same_base=True)   # idx1 0: the dword p0 reads
-            self.emit(f"{w1} = OpLoad %uint {p1} Aligned 4")
+            self.emit(f"{w1} = OpLoad %uint {p1} {load_mem}")
             self.emit(f"{lo_part} = OpShiftRightLogical %uint {w0} {sh}")
             self.emit(f"{hi_byte} = OpBitFieldUExtract %uint {w1} {self.cu(0)} {self.cu(8)}")
             self.emit(f"{hi_sh} = OpShiftLeftLogical %uint {hi_byte} {self.cu(8)}")
@@ -2775,6 +2834,29 @@ class Gen:
             word = kind | (len(widths) << 4)
             for i in range(4):
                 word |= (widths[i] if i < len(widths) else 0) << (7 + 6 * i)
+            table.append(word)
+        return table
+
+    # The run-time FORMAT encode (3B.6): packed into one 32-bit word per format code:
+    #   bits [3:0] enc_kind (0..9), [6:4] ncomp (0..4), [12:7]..[30:25] widths[0..3], bit 31 = BGRA swap (50, 56).
+    ENC_NONE, ENC_F32, ENC_U32, ENC_I32, ENC_UINT, ENC_SINT, ENC_UNORM, ENC_SNORM, ENC_F16, ENC_UFLOAT = range(10)
+    ENC_KINDS = {"f32": ENC_F32, "u32": ENC_U32, "i32": ENC_I32, "uint": ENC_UINT,
+                 "sint": ENC_SINT, "unorm": ENC_UNORM, "uscaled": ENC_UNORM,
+                 "snorm": ENC_SNORM, "sscaled": ENC_SNORM, "f16": ENC_F16, "ufloat": ENC_UFLOAT}
+
+    @classmethod
+    def fmt_enc_desc_table(cls):
+        """One uint per format code for table-driven buffer_store_format encoding."""
+        table = []
+        for code in range(128):
+            entry = cls.FORMATS.get(code)
+            kind = cls.ENC_KINDS.get(entry[1], cls.ENC_NONE) if entry else cls.ENC_NONE
+            widths = entry[2] if entry else ()
+            word = kind | (len(widths) << 4)
+            for i in range(4):
+                word |= (widths[i] if i < len(widths) else 0) << (7 + 6 * i)
+            if code in (50, 56):
+                word |= 1 << 31
             table.append(word)
         return table
 
@@ -3877,13 +3959,14 @@ class Gen:
         self.emit(f"{lbl_do} = OpLabel")
         ptr, host = self.tmp(), self.host_addr(aligned, "load", lambda: self.guard_delta(need, step))
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
+        load_mem = self._psb_load_op(mods)
         loaded = []
         for i in range(5):
             ok, idx, v = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{ok} = OpULessThan %bool {self.cu(i)} {need}")
             self.emit(f"{idx} = OpSelect %uint {ok} {self.cu(i)} {self.cu(0)}")
             p = self.buf_dword_ptr(ptr, host, step, idx)
-            self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
+            self.emit(f"{v} = OpLoad %uint {p} {load_mem}")
             loaded.append(v)
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
@@ -4143,6 +4226,9 @@ class Gen:
         self.emit(f"OpSelectionMerge {lbl_end} None")
         self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
+        if store and self._is_coherent_mem(mods):
+            self.uses_vmm = True
+        load_mem = None if store else self._psb_load_op(mods)
         value = None
         for k in range(nbytes):
             va = full
@@ -4160,7 +4246,7 @@ class Gen:
                 self.emit(f"{t2} = OpAtomicOr %uint {p} {self.cu(1)} {self.cu(0)} {vs}")
             else:
                 w, b = self.tmp(), self.tmp()
-                self.emit(f"{w} = OpLoad %uint {p} Aligned 4")
+                self.emit(f"{w} = OpLoad %uint {p} {load_mem}")
                 self.emit(f"{b} = OpBitFieldUExtract %uint {w} {sh} {self.cu(8)}")
                 if value is None:
                     value = b
@@ -4202,6 +4288,7 @@ class Gen:
         act = self.active_b()
         lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
         if load:
+            load_mem = self._psb_load_op(mods)
             # Inactive lanes don't load (and keep their registers): guard the access, merge with OpPhi per dword.
             olds = [self.load_reg("vgpr", data["r"] + i) for i in range(n)]
             pre = self.current_label_placeholder()
@@ -4221,7 +4308,7 @@ class Gen:
                 self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr "
                           f"{self.host_addr(al, 'load', lambda: self.guard_delta(self.sub_dwords(bits // 8, b3), None))}")
                 self.emit(f"{p0} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(0)}")
-                self.emit(f"{w} = OpLoad %uint {p0} Aligned 4")
+                self.emit(f"{w} = OpLoad %uint {p0} {load_mem}")
                 self.emit(f"{shb} = OpShiftLeftLogical %uint {b3} {self.cu(3)}")
                 ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
                 if bits == 8:
@@ -4235,7 +4322,7 @@ class Gen:
                     self.emit(f"OpBranchConditional {cross} {lbl_cross} {lbl_cend}")
                     self.emit(f"{lbl_cross} = OpLabel")
                     self.emit(f"{p1} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(1)}")
-                    self.emit(f"{w1} = OpLoad %uint {p1} Aligned 4")
+                    self.emit(f"{w1} = OpLoad %uint {p1} {load_mem}")
                     self.emit(f"{hi_byte} = OpBitFieldUExtract %uint {w1} {self.cu(0)} {self.cu(8)}")
                     self.emit(f"{hi_sh} = OpShiftLeftLogical %uint {hi_byte} {self.cu(8)}")
                     self.emit(f"{crossed} = OpBitwiseOr %uint {lo_part} {hi_sh}")
@@ -4250,7 +4337,7 @@ class Gen:
                 for i in range(n):
                     p, v = self.tmp(), self.tmp()
                     self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
-                    self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
+                    self.emit(f"{v} = OpLoad %uint {p} {load_mem}")
                     vals.append(v)
             done_lbl = self.current_label_placeholder()
             self.emit(f"OpBranch {lbl_end}")
@@ -4263,6 +4350,7 @@ class Gen:
             for i, ph in enumerate(phis):
                 self.store_reg("vgpr", data["r"] + i, ph)
         else:
+            store_mem = self._psb_store_op(mods)
             vals = [self.load_reg("vgpr", data["r"] + i) for i in range(n)]
             self.emit(f"OpSelectionMerge {lbl_end} None")
             self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
@@ -4272,7 +4360,7 @@ class Gen:
             for i in range(n):
                 p = self.tmp()
                 self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
-                self.emit(f"OpStore {p} {vals[i]} Aligned 4")
+                self.emit(f"OpStore {p} {vals[i]} {store_mem}")
             self.emit(f"OpBranch {lbl_end}")
             self.emit(f"{lbl_end} = OpLabel")
 
@@ -4702,45 +4790,219 @@ class Gen:
             return addr, d3, in_b, (part if mode in (None, 0, 3) else None), step
         return addr, d3, in_b, step
 
+    def _fmt_enc_chan_body(self, mode, val, w, is_signed):
+        """Encode one channel of a dynamic-format buffer store (branch-free, shared across all 77 FORMATS)."""
+        # Clamp width 0 (unused channel) to 1 so shifts and (w - 1) stay well-defined.
+        w_is0, w_nz, w_lo, wm1, wm1_lo = (self.tmp() for _ in range(5))
+        self.emit(f"{w_is0} = OpIEqual %bool {w} {self.cu(0)}")
+        self.emit(f"{w_nz} = OpSelect %uint {w_is0} {self.cu(1)} {w}")
+        self.emit(f"{w_lo} = OpBitwiseAnd %uint {w_nz} {self.cu(31)}")
+        self.emit(f"{wm1} = OpISub %uint {w_nz} {self.cu(1)}")
+        self.emit(f"{wm1_lo} = OpBitwiseAnd %uint {wm1} {self.cu(31)}")
+
+        # Narrow UINT: saturate to (1 << w) - 1.
+        u_one, u_max, c_uint = (self.tmp() for _ in range(3))
+        self.emit(f"{u_one} = OpShiftLeftLogical %uint {self.cu(1)} {w_lo}")
+        self.emit(f"{u_max} = OpISub %uint {u_one} {self.cu(1)}")
+        self.emit(f"{c_uint} = OpExtInst %uint %glsl UMin {val} {u_max}")
+
+        # Narrow SINT: clamp signed 32-bit int to [-2^(w-1), 2^(w-1) - 1].
+        s_half, s_hi_u, s_lo_u, s_clamped, c_sint = (self.tmp() for _ in range(5))
+        self.emit(f"{s_half} = OpShiftLeftLogical %uint {self.cu(1)} {wm1_lo}")
+        self.emit(f"{s_hi_u} = OpISub %uint {s_half} {self.cu(1)}")
+        self.emit(f"{s_lo_u} = OpISub %uint {self.cu(0)} {s_half}")
+        self.emit(f"{s_clamped} = OpExtInst %int %glsl SClamp {self.as_int(val)} "
+                  f"{self.as_int(s_lo_u)} {self.as_int(s_hi_u)}")
+        self.emit(f"{c_sint} = OpBitcast %uint {s_clamped}")
+
+        # Exact single-rounded UNORM/SNORM (same 64-bit arithmetic as encode_norm_bits, with run-time scale).
+        nw, n_one, scale, scale64 = (self.tmp() for _ in range(4))
+        self.emit(f"{nw} = OpSelect %uint {is_signed} {wm1_lo} {w_lo}")
+        self.emit(f"{n_one} = OpShiftLeftLogical %uint {self.cu(1)} {nw}")
+        self.emit(f"{scale} = OpISub %uint {n_one} {self.cu(1)}")
+        self.emit(f"{scale64} = OpUConvert %ulong {scale}")
+        sign, neg, a = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{sign} = OpShiftRightLogical %uint {val} {self.cu(31)}")
+        self.emit(f"{neg} = OpINotEqual %bool {sign} {self.cu(0)}")
+        self.emit(f"{a} = OpBitwiseAnd %uint {val} {self.cu(0x7FFFFFFF)}")
+        small, ge1, exp_, ec, ec2, shift, sh64, sh1, sh1_64 = (self.tmp() for _ in range(9))
+        self.emit(f"{small} = OpULessThan %bool {a} {self.cu(0x37000000)}")
+        self.emit(f"{ge1} = OpUGreaterThanEqual %bool {a} {self.cu(0x3F800000)}")
+        self.emit(f"{exp_} = OpShiftRightLogical %uint {a} {self.cu(23)}")
+        self.emit(f"{ec} = OpExtInst %uint %glsl UMax {exp_} {self.cu(110)}")
+        self.emit(f"{ec2} = OpExtInst %uint %glsl UMin {ec} {self.cu(126)}")
+        self.emit(f"{shift} = OpISub %uint {self.cu(150)} {ec2}")
+        self.emit(f"{sh64} = OpUConvert %ulong {shift}")
+        self.emit(f"{sh1} = OpISub %uint {shift} {self.cu(1)}")
+        self.emit(f"{sh1_64} = OpUConvert %ulong {sh1}")
+        mant, m, m64, p, half, ps, q64, q, mag1, mag, nmag, neg_val, c_norm = (self.tmp() for _ in range(13))
+        self.emit(f"{mant} = OpBitwiseAnd %uint {a} {self.cu(0x7FFFFF)}")
+        self.emit(f"{m} = OpBitwiseOr %uint {mant} {self.cu(0x800000)}")
+        self.emit(f"{m64} = OpUConvert %ulong {m}")
+        self.emit(f"{p} = OpIMul %ulong {m64} {scale64}")
+        self.emit(f"{half} = OpShiftLeftLogical %ulong {self.cl(1)} {sh1_64}")
+        self.emit(f"{ps} = OpIAdd %ulong {p} {half}")
+        self.emit(f"{q64} = OpShiftRightLogical %ulong {ps} {sh64}")
+        self.emit(f"{q} = OpUConvert %uint {q64}")
+        self.emit(f"{mag1} = OpSelect %uint {small} {self.cu(0)} {q}")
+        self.emit(f"{mag} = OpSelect %uint {ge1} {scale} {mag1}")
+        self.emit(f"{nmag} = OpISub %uint {self.cu(0)} {mag}")
+        self.emit(f"{neg_val} = OpSelect %uint {is_signed} {nmag} {self.cu(0)}")
+        self.emit(f"{c_norm} = OpSelect %uint {neg} {neg_val} {mag}")
+
+        # F16: round toward zero with finite overflow clamping to +-65504.
+        c_f16 = self.mem_f16(self.tof(val))
+
+        # UFLOAT (10- or 11-bit unsigned float, mb = 5 or 6): same integer ops as ufloat_encode_bits.
+        is11, sh_base, sh_m, mmask, max_fin, inf_b = (self.tmp() for _ in range(6))
+        self.emit(f"{is11} = OpIEqual %bool {w_nz} {self.cu(11)}")
+        self.emit(f"{sh_base} = OpSelect %uint {is11} {self.cu(130)} {self.cu(131)}")
+        self.emit(f"{sh_m} = OpSelect %uint {is11} {self.cu(17)} {self.cu(18)}")
+        self.emit(f"{mmask} = OpSelect %uint {is11} {self.cu(0x3F)} {self.cu(0x1F)}")
+        self.emit(f"{max_fin} = OpSelect %uint {is11} {self.cu((30 << 6) | 0x3F)} {self.cu((30 << 5) | 0x1F)}")
+        self.emit(f"{inf_b} = OpSelect %uint {is11} {self.cu(31 << 6)} {self.cu(31 << 5)}")
+        (sh0, shc, dn, nr0, nr, nm, nm1, nz, nmant, nanb, isnan, isinf, big, norm,
+         r0, r1, r2, snan, ng, r3, c_ufloat) = (self.tmp() for _ in range(21))
+        self.emit(f"{sh0} = OpISub %uint {sh_base} {exp_}")
+        self.emit(f"{shc} = OpExtInst %uint %glsl UMin {sh0} {self.cu(31)}")
+        self.emit(f"{dn} = OpShiftRightLogical %uint {m} {shc}")
+        self.emit(f"{nr0} = OpISub %uint {a} {self.cu(112 << 23)}")
+        self.emit(f"{nr} = OpShiftRightLogical %uint {nr0} {sh_m}")
+        self.emit(f"{nm} = OpShiftRightLogical %uint {a} {sh_m}")
+        self.emit(f"{nm1} = OpBitwiseAnd %uint {nm} {mmask}")
+        self.emit(f"{nz} = OpIEqual %bool {nm1} {self.cu(0)}")
+        self.emit(f"{nmant} = OpSelect %uint {nz} {self.cu(1)} {nm1}")
+        self.emit(f"{nanb} = OpBitwiseOr %uint {nmant} {inf_b}")
+        self.emit(f"{isnan} = OpUGreaterThan %bool {a} {self.cu(0x7F800000)}")
+        self.emit(f"{isinf} = OpIEqual %bool {a} {self.cu(0x7F800000)}")
+        self.emit(f"{big} = OpUGreaterThanEqual %bool {a} {self.cu(0x47800000)}")
+        self.emit(f"{norm} = OpUGreaterThanEqual %bool {a} {self.cu(0x38800000)}")
+        self.emit(f"{r0} = OpSelect %uint {norm} {nr} {dn}")
+        self.emit(f"{r1} = OpSelect %uint {big} {max_fin} {r0}")
+        self.emit(f"{r2} = OpSelect %uint {isinf} {inf_b} {r1}")
+        self.emit(f"{r3} = OpSelect %uint {isnan} {nanb} {r2}")
+        self.emit(f"{snan} = OpLogicalNot %bool {isnan}")
+        self.emit(f"{ng} = OpLogicalAnd %bool {neg} {snan}")
+        self.emit(f"{c_ufloat} = OpSelect %uint {ng} {self.cu(0)} {r3}")
+
+        # Pick conversion by mode (ENC_F32/ENC_U32/ENC_I32 pass val through unchanged).
+        res = val
+        for kind, cand in ((self.ENC_UINT, c_uint), (self.ENC_SINT, c_sint),
+                           (self.ENC_UNORM, c_norm), (self.ENC_SNORM, c_norm),
+                           (self.ENC_F16, c_f16), (self.ENC_UFLOAT, c_ufloat)):
+            eq, sel = self.tmp(), self.tmp()
+            self.emit(f"{eq} = OpIEqual %bool {mode} {self.cu(kind)}")
+            self.emit(f"{sel} = OpSelect %uint {eq} {cand} {res}")
+            res = sel
+        return res
+
     def format_encode_call(self, fmt, fc, normalized, unorm_view, ic, signed_ic, two):
         """The 4 words of the element a typed store writes, per the run-time FORMAT, and its size in bytes (0 for a code
-        outside FORMATS: nothing is stored). One function per module like the decode (format_decode_call): inlined, every
-        store site carried every format's encode, three times the module of the older table (cs_store 169 KB -> 503 KB).
+        outside FORMATS: nothing is stored). Table-driven and branch-free (like format_decode_call / SHADER-849),
+        replacing the old 77-way OpSwitch with a single %fmt_enc_desc_tab lookup and shared %fmt_enc_chan helper.
         The five lists are 4 uint ids each: the raw float bits, the same with NaN -> 0 (NORM stores), the B/R-swapped
         view for 50 and 56, the integers and the sign-extended d16 integers; a component the instruction does not give is 0."""
         if self.fmt_enc_fn is None:
-            names = ["%fe_fmt"] + [f"%fe_{g}{i}" for g in "fnvis" for i in range(4)] + [f"%fe_t{i}" for i in range(8)]
+            self.uses_fmt_enc_table = True
+            for v in Gen.fmt_enc_desc_table():
+                self.cu(v)
+            self.cu(128)
             saved, self.body = self.body, []
+            chan_res = self._fmt_enc_chan_body("%fec_mode", "%fec_val", "%fec_w", "%fec_signed")
+            chan_lines = self.body
+            self.body = []
+            chan_fn = (["%fmt_enc_chan = OpFunction %uint None %fn_fmt_enc_chan",
+                        "%fec_mode = OpFunctionParameter %uint", "%fec_val = OpFunctionParameter %uint",
+                        "%fec_w = OpFunctionParameter %uint", "%fec_signed = OpFunctionParameter %bool",
+                        "%fec_entry = OpLabel"] + chan_lines + [f"OpReturnValue {chan_res}", "OpFunctionEnd"])
+
+            names = ["%fe_fmt"] + [f"%fe_{g}{i}" for g in "fnvis" for i in range(4)] + [f"%fe_t{i}" for i in range(8)]
             params = names[1:21]
             tw = names[21:29]       # the channels a two-component V# store takes: norm, float, int, signed int (2 each)
             lists = [params[4 * g:4 * g + 4] for g in range(5)]
-            # FORMAT is a 7-bit integer. One case per supported code, all other codes return zero.
-            cases = " ".join(f"{code} %fe_case_{code}" for code in self.FORMATS)
-            self.emit("OpSelectionMerge %fe_unknown None")
-            self.emit(f"OpSwitch %fe_fmt %fe_unknown {cases}")
-            for code, (_, kind, widths) in self.FORMATS.items():
-                self.emit(f"%fe_case_{code} = OpLabel")
-                source = lists[1] if kind in ("unorm", "snorm", "uscaled", "sscaled") else lists[0]
-                if code in (50, 56):
-                    source = lists[2]
-                integer_source = lists[4] if kind in ("i32", "sint") else lists[3]
-                if len(widths) == 2:
-                    # through a V# a two-component format takes the channels DST_SEL picks (x, y; x, w; y, x; ...), swizzled
-                    # at the store site like gfx1036 does it; tbuffer stores are encoded in line, with (x, y)
-                    source = tw[0:2] if kind in ("unorm", "snorm", "uscaled", "sscaled") else tw[2:4]
-                    integer_source = tw[6:8] if kind in ("i32", "sint") else tw[4:6]
-                words = self.encode_format(source[:len(widths)] + [self.cu(0)] * 4,
-                                           integer_source[:len(widths)] + [self.cu(0)] * 4, code)
-                words = (words + [self.cu(0)] * 4)[:4]
-                res = self.tmp()
-                self.emit(f"{res} = OpCompositeConstruct %v4uint_fmt " + " ".join(words))
-                self.emit(f"OpReturnValue {res}")
-            self.emit("%fe_unknown = OpLabel")
-            zero = self.tmp()
-            self.emit(f"{zero} = OpCompositeConstruct %v4uint_fmt " + " ".join([self.cu(0)] * 4))
-            self.emit(f"OpReturnValue {zero}")
+
+            desc = self.fmt_table_get("%_ptr_Private_fmt_enc_elem", "%fmt_enc_desc_tab", "%fe_fmt")
+            mode, ncomp_r, ncomp, bgra_b, is_bgra, is_two = (self.tmp() for _ in range(6))
+            self.emit(f"{mode} = OpBitwiseAnd %uint {desc} {self.cu(15)}")
+            self.emit(f"{ncomp_r} = OpShiftRightLogical %uint {desc} {self.cu(4)}")
+            self.emit(f"{ncomp} = OpBitwiseAnd %uint {ncomp_r} {self.cu(7)}")
+            self.emit(f"{bgra_b} = OpShiftRightLogical %uint {desc} {self.cu(31)}")
+            self.emit(f"{is_bgra} = OpINotEqual %bool {bgra_b} {self.cu(0)}")
+            self.emit(f"{is_two} = OpIEqual %bool {ncomp} {self.cu(2)}")
+            widths = []
+            for i in range(4):
+                wr, wi = self.tmp(), self.tmp()
+                self.emit(f"{wr} = OpShiftRightLogical %uint {desc} {self.cu(7 + 6 * i)}")
+                self.emit(f"{wi} = OpBitwiseAnd %uint {wr} {self.cu(63)}")
+                widths.append(wi)
+            offsets = [self.cu(0)]
+            for i in range(1, 4):
+                o = self.tmp()
+                self.emit(f"{o} = OpIAdd %uint {offsets[-1]} {widths[i - 1]}")
+                offsets.append(o)
+
+            is_unorm, is_snorm, is_norm = (self.tmp() for _ in range(3))
+            self.emit(f"{is_unorm} = OpIEqual %bool {mode} {self.cu(self.ENC_UNORM)}")
+            self.emit(f"{is_snorm} = OpIEqual %bool {mode} {self.cu(self.ENC_SNORM)}")
+            self.emit(f"{is_norm} = OpLogicalOr %bool {is_unorm} {is_snorm}")
+            is_u32, is_uint, is_int_u = (self.tmp() for _ in range(3))
+            self.emit(f"{is_u32} = OpIEqual %bool {mode} {self.cu(self.ENC_U32)}")
+            self.emit(f"{is_uint} = OpIEqual %bool {mode} {self.cu(self.ENC_UINT)}")
+            self.emit(f"{is_int_u} = OpLogicalOr %bool {is_u32} {is_uint}")
+            is_i32, is_sint, is_int_s = (self.tmp() for _ in range(3))
+            self.emit(f"{is_i32} = OpIEqual %bool {mode} {self.cu(self.ENC_I32)}")
+            self.emit(f"{is_sint} = OpIEqual %bool {mode} {self.cu(self.ENC_SINT)}")
+            self.emit(f"{is_int_s} = OpLogicalOr %bool {is_i32} {is_sint}")
+
+            words = [self.cu(0)] * 4
+            # Channels 0..3 can only land in dwords: 0 -> (0,), 1 -> (0,1), 2 -> (0,1,2), 3 -> (0,1,3).
+            chan_dwords = ((0,), (0, 1), (0, 1, 2), (0, 1, 3))
+            for c in range(4):
+                ns0 = self.tmp()
+                self.emit(f"{ns0} = OpSelect %uint {is_bgra} {lists[2][c]} {lists[1][c]}")
+                if c < 2:
+                    ns, fs, us, ss = (self.tmp() for _ in range(4))
+                    self.emit(f"{ns} = OpSelect %uint {is_two} {tw[c]} {ns0}")
+                    self.emit(f"{fs} = OpSelect %uint {is_two} {tw[2 + c]} {lists[0][c]}")
+                    self.emit(f"{us} = OpSelect %uint {is_two} {tw[4 + c]} {lists[3][c]}")
+                    self.emit(f"{ss} = OpSelect %uint {is_two} {tw[6 + c]} {lists[4][c]}")
+                else:
+                    ns, fs, us, ss = ns0, lists[0][c], lists[3][c], lists[4][c]
+                s0, s1, src = (self.tmp() for _ in range(3))
+                self.emit(f"{s0} = OpSelect %uint {is_norm} {ns} {fs}")
+                self.emit(f"{s1} = OpSelect %uint {is_int_u} {us} {s0}")
+                self.emit(f"{src} = OpSelect %uint {is_int_s} {ss} {s1}")
+
+                field = self.tmp()
+                self.emit(f"{field} = OpFunctionCall %uint %fmt_enc_chan {mode} {src} {widths[c]} {is_snorm}")
+                active, w32, wlo, one, m1, mask, masked, bo, shifted, contrib = (self.tmp() for _ in range(10))
+                self.emit(f"{active} = OpULessThan %bool {self.cu(c)} {ncomp}")
+                self.emit(f"{w32} = OpIEqual %bool {widths[c]} {self.cu(32)}")
+                self.emit(f"{wlo} = OpBitwiseAnd %uint {widths[c]} {self.cu(31)}")
+                self.emit(f"{one} = OpShiftLeftLogical %uint {self.cu(1)} {wlo}")
+                self.emit(f"{m1} = OpISub %uint {one} {self.cu(1)}")
+                self.emit(f"{mask} = OpSelect %uint {w32} {self.cu(0xFFFFFFFF)} {m1}")
+                self.emit(f"{masked} = OpBitwiseAnd %uint {field} {mask}")
+                self.emit(f"{bo} = OpBitwiseAnd %uint {offsets[c]} {self.cu(31)}")
+                self.emit(f"{shifted} = OpShiftLeftLogical %uint {masked} {bo}")
+                self.emit(f"{contrib} = OpSelect %uint {active} {shifted} {self.cu(0)}")
+                if c == 0:
+                    words[0] = contrib
+                else:
+                    wi = self.tmp()
+                    self.emit(f"{wi} = OpShiftRightLogical %uint {offsets[c]} {self.cu(5)}")
+                    for j in chan_dwords[c]:
+                        hit, part, merged = (self.tmp() for _ in range(3))
+                        self.emit(f"{hit} = OpIEqual %bool {wi} {self.cu(j)}")
+                        self.emit(f"{part} = OpSelect %uint {hit} {contrib} {self.cu(0)}")
+                        self.emit(f"{merged} = OpBitwiseOr %uint {words[j]} {part}")
+                        words[j] = merged
+
+            res = self.tmp()
+            self.emit(f"{res} = OpCompositeConstruct %v4uint_fmt " + " ".join(words))
+            self.emit(f"OpReturnValue {res}")
             lines, self.body = self.body, saved
-            self.fmt_enc_fn = (["%fmt_encode_fn = OpFunction %v4uint_fmt None %fn_fmt_encode"] +
+            self.fmt_enc_fn = (chan_fn + ["%fmt_encode_fn = OpFunction %v4uint_fmt None %fn_fmt_encode"] +
                                [f"{q} = OpFunctionParameter %uint" for q in names] + ["%fe_entry = OpLabel"] +
                                lines + ["OpFunctionEnd"])
         r = self.tmp()
@@ -4771,6 +5033,7 @@ class Gen:
         bounds check uses its element size, whatever the V# says. Only active lanes store, inside a structured if."""
         if any(m in mods for m in ("lds", "tfe", "d16")):
             raise Unsupported(op + " form")
+        store_mem = self._psb_store_op(mods)
         d16 = "_d16_" in op
         vd = a[0]
         dword_store = op.startswith("buffer_store_dword")
@@ -4824,7 +5087,7 @@ class Gen:
                 self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
                 self.emit(f"{lbl_do} = OpLabel")
                 p = self.buf_dword_ptr(ptr, host, step, i)
-                self.emit(f"OpStore {p} {w} Aligned 4")
+                self.emit(f"OpStore {p} {w} {store_mem}")
                 self.emit(f"OpBranch {lbl_end}")
                 self.emit(f"{lbl_end} = OpLabel")
             return
@@ -4848,7 +5111,7 @@ class Gen:
         if words is not None:
             for i, w in enumerate(words):
                 p = self.buf_dword_ptr(ptr, host, step, i)
-                self.emit(f"OpStore {p} {w} Aligned 4")
+                self.emit(f"OpStore {p} {w} {store_mem}")
         else:
             fmt, comps, f32, fl, icomps = plans
             # Every format in FORMATS (the same table the loads decode); unknown formats store nothing.
@@ -4920,7 +5183,7 @@ class Gen:
                     if size >= 4:
                         for k, w in enumerate(words[:size // 4]):
                             pp = self.buf_dword_ptr(ptr, host, step, k)
-                            self.emit(f"OpStore {pp} {w} Aligned 4")
+                            self.emit(f"OpStore {pp} {w} {store_mem}")
                     else:
                         # 1- or 2-byte element: merge into its dword with atomics so neighbours are kept.
                         al, sh, sh8, ap, mk, mks, inv, val, vs, t1, t2 = (self.tmp() for _ in range(11))
@@ -4955,7 +5218,7 @@ class Gen:
                     self.emit(f"OpBranchConditional {big} {lk} {le}")
                     self.emit(f"{lk} = OpLabel")
                     pp = self.buf_dword_ptr(ptr, host, step, k)
-                    self.emit(f"OpStore {pp} {words[k]} Aligned 4")
+                    self.emit(f"OpStore {pp} {words[k]} {store_mem}")
                     self.emit(f"OpBranch {le}")
                     self.emit(f"{le} = OpLabel")
                 # 1- or 2-byte element: merge into its dword with atomics so neighbours are kept.
@@ -5378,9 +5641,14 @@ class Gen:
             val = read(fi)
         else:
             self.uses_subgroup = self.uses_ballot = True
-            fi, val = self.tmp(), self.tmp()
-            self.emit(f"{fi} = OpBitwiseAnd %uint {first} {self.cu(63 if self.wave64 else 31)}")
-            self.emit(f"{val} = OpGroupNonUniformShuffle %uint {self.cu(3)} {old} {fi}")
+            any_act, fi, bal, present, safe_fi, val = (self.tmp() for _ in range(6))
+            sgl = self.subgroup_lane()
+            self.emit(f"{any_act} = OpLogicalOr %bool {lz} {hz}")
+            self.emit(f"{fi} = OpSelect %uint {any_act} {first} {sgl}")
+            self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+            self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool {self.cu(3)} {bal} {fi}")
+            self.emit(f"{safe_fi} = OpSelect %uint {present} {fi} {sgl}")
+            self.emit(f"{val} = OpGroupNonUniformShuffle %uint {self.cu(3)} {old} {safe_fi}")
         self.dst(a[0], val)
 
     LDS_WORDS = {"b32": 1, "b64": 2, "b96": 3, "b128": 4}
@@ -5824,28 +6092,48 @@ class Gen:
         self.emit(f"{word} = OpSelect %uint {upper} {hi} {lo}")
         return word
 
-    def wave32_first_running_lane(self):
+    def wave32_first_running_lane(self, ballot=None):
         """The lowest running lane of this wave32 fragment's 32-lane half (0-31): the lane a uniform value is read
         from. A fixed lane (0 of the half) need not be running: a quad with no covered sample, or helpers a driver
-        leaves out of subgroup operations, read as undefined (SHADER-1016)."""
-        ballot, any_, lsb, first = (self.tmp() for _ in range(4))
-        self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+        leaves out of subgroup operations, read as undefined (SHADER-1016). When the half's ballot word is empty,
+        fall back to this invocation's own logical lane (never lane 0, which may not be launched)."""
+        if ballot is None:
+            ballot = self.tmp()
+            self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+        any_, lsb, first = (self.tmp() for _ in range(3))
         word = self.wave32_ballot_word(ballot)
-        # An empty word (a helper a driver leaves out of its own ballot) reads lane 0, as v_readfirstlane does,
-        # never FindILsb's 0xFFFFFFFF.
         self.emit(f"{any_} = OpINotEqual %bool {word} {self.cu(0)}")
         self.emit(f"{lsb} = OpExtInst %uint %glsl FindILsb {word}")
-        self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
+        self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.wave_lane()}")
         self.uses_subgroup = self.uses_ballot = True
         return first
 
-    def ballot_lsb_by_words(self, bal):
+    def subgroup_first_running_lane(self, ballot=None):
+        """The lowest running physical lane in the subgroup (0..SubgroupSize-1), or this invocation's own subgroup
+        lane when the ballot is empty. Never falls back to lane 0, which may not be launched in a partial wave."""
+        if ballot is None:
+            ballot = self.tmp()
+            self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+        if self.stage == "vs":
+            lsb, any_ = self.ballot_lsb_by_words(ballot, with_any=True)
+        else:
+            self.uses_vote = True
+            lsb, any_ = self.tmp(), self.tmp()
+            self.emit(f"{lsb} = OpGroupNonUniformBallotFindLSB %uint {self.cu(3)} {ballot}")
+            self.emit(f"{any_} = OpGroupNonUniformAny %bool {self.cu(3)} %true")
+        first = self.tmp()
+        self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.subgroup_lane()}")
+        self.uses_subgroup = self.uses_ballot = True
+        return first
+
+    def ballot_lsb_by_words(self, bal, with_any=False):
         """The lowest set bit of a subgroup ballot, from its four words with FindILsb: the lane
         OpGroupNonUniformBallotFindLSB gives (a ballot has no bit at or above the subgroup size), without asking for
         the subgroup size. MoltenVK lowers BallotFindLSB, like the SubgroupSize built-in, to Metal's
         threads_per_simdgroup input, which a vertex function can't declare (Apple M4, MoltenVK 1.4.2), so vertex
-        shaders use this form. Like the op, the result means nothing for an empty ballot; callers select 0 then."""
+        shaders use this form. When `with_any` is True, also returns a %bool that is true iff any word is non-zero."""
         r = None
+        any_ = None
         for k in (3, 2, 1, 0):            # the lowest non-zero word wins, so it is selected last
             w, lsb = self.tmp(), self.tmp()
             self.emit(f"{w} = OpCompositeExtract %uint {bal} {k}")
@@ -5854,14 +6142,21 @@ class Gen:
                 at = self.tmp()
                 self.emit(f"{at} = OpIAdd %uint {lsb} {self.cu(32 * k)}")
                 lsb = at
+            nz = self.tmp() if (r is not None or with_any) else None
+            if nz is not None:
+                self.emit(f"{nz} = OpINotEqual %bool {w} {self.cu(0)}")
             if r is None:
                 r = lsb
+                any_ = nz
             else:
-                nz, pick = self.tmp(), self.tmp()
-                self.emit(f"{nz} = OpINotEqual %bool {w} {self.cu(0)}")
+                pick = self.tmp()
                 self.emit(f"{pick} = OpSelect %uint {nz} {lsb} {r}")
                 r = pick
-        return r
+                if with_any:
+                    both = self.tmp()
+                    self.emit(f"{both} = OpLogicalOr %bool {any_} {nz}")
+                    any_ = both
+        return (r, any_) if with_any else r
 
     # ---- wave64 emulation (--wave64-emulate) ----
     # A wave64 compute or mesh shader runs exact on any subgroup size. Each lane is one invocation as usual, but no
@@ -6265,12 +6560,13 @@ class Gen:
             self.g_shuffle(result, value, src)
         else:
             # Redirect absent source lanes before the shuffle: even a masked undefined result is undefined.
-            ballot, present, safe_src, shuffled, mask = (self.tmp() for _ in range(5))
+            ballot, present, safe_phys, shuffled, mask = (self.tmp() for _ in range(5))
             physical_src = self.wave_source_lane(src)
+            physical_self = self.subgroup_lane()
             self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
             self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool %c3 {ballot} {physical_src}")
-            self.emit(f"{safe_src} = OpSelect %uint {present} {src} {lane}")
-            self.emit(f"{shuffled} = OpGroupNonUniformShuffle %uint %c3 {value} {self.wave_source_lane(safe_src)}")
+            self.emit(f"{safe_phys} = OpSelect %uint {present} {physical_src} {physical_self}")
+            self.emit(f"{shuffled} = OpGroupNonUniformShuffle %uint %c3 {value} {safe_phys}")
             self.emit(f"{mask} = OpSelect %uint {present} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
             self.emit(f"{result} = OpBitwiseAnd %uint {shuffled} {mask}")
             self.uses_subgroup = self.uses_ballot = True
@@ -6332,13 +6628,10 @@ class Gen:
         self.emit(f"{lane} = OpCopyObject %uint {self.wave_lane()}")
         self.emit(f"{rl} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
         self.emit(f"{mine} = OpIAdd %uint {rl} {self.cu(1)}")
+        sgl = self.subgroup_lane()
         if self.wave64 or self.wave32_fragment:
-            sgl = self.tmp()
-            self.emit(f"{sgl} = OpLoad %uint %sg_lane")
             self.emit(f"{half} = OpBitwiseAnd %uint {sgl} {self.cu(32)}")
-            self_lane = sgl
-        else:
-            self_lane = lane
+        self_lane = sgl
         bal = self.tmp()
         self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
         acc = self.cu(0)
@@ -6550,8 +6843,13 @@ class Gen:
         # lane_masks merges a mask on one path with plain data on another by dropping the register,
         # so "not in cur_masks" does not prove it is data on every path. Keep a conservative set.
         self.ever_mask = {r for m in self.lane_masks.values() for r in m if isinstance(r, int)}
-        slots = lane_masks.parked(blocks[0], self.lane_masks)
-        self.parked = {slot: self.SGPRS + i for i, slot in enumerate(slots)}
+        slots = lane_masks.parked(blocks[0], self.lane_masks, wave64=self.wave64)
+        self.scalar_spills = set(lane_masks.scalar_spills(blocks[0], blocks[1], wave64=self.wave64))
+        self.spill_readlanes, spill_read_slots = lane_masks.definite_spill_reads(
+            blocks[0], blocks[1], wave64=self.wave64
+        )
+        all_slots = sorted(set(slots) | self.scalar_spills | set(spill_read_slots))
+        self.parked = {slot: self.SGPRS + i for i, slot in enumerate(all_slots)}
 
     def mask_half(self, a):
         """For a 32-bit lane-mask operand in wave64, return 'lo' (lanes 0-31), 'hi' (lanes 32-63), or None."""
@@ -6707,7 +7005,9 @@ class Gen:
                     o = self.tmp()
                     self.emit(f"{o} = OpBitwiseOr %uint {acc} {w}")
                     acc = o
-        elif self.stage in ("ps", "cs"):
+        elif self.stage == "ps":
+            # Fragment shaders always launch complete 2x2 pixel quads (including helper invocations), and Vulkan
+            # guarantees OpGroupNonUniformQuadSwap includes helpers in the quad.
             self.uses_subgroup = self.uses_quad = True
             acc = b
             for d in (0, 1):                      # horizontal, then vertical neighbour
@@ -6716,19 +7016,26 @@ class Gen:
                 self.emit(f"{o} = OpBitwiseOr %uint {acc} {sw}")
                 acc = o
         else:
-            # Quad operations are only guaranteed in fragment and compute shaders (quadOperationsInAllStages):
-            # vertex, geometry and mesh shaders shuffle from the four lanes of the quad instead.
-            self.uses_subgroup = True
-            lane, base = self.tmp(), self.tmp()
-            self.sub_lane(lane)
-            self.emit(f"{base} = OpBitwiseAnd %uint {lane} {self.cu(0xFFFFFFFC)}")
-            acc = b
-            for k in range(4):
-                i, w, o = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{i} = OpIAdd %uint {base} {self.cu(k)}")
-                self.g_shuffle(w, b, i)
-                self.emit(f"{o} = OpBitwiseOr %uint {acc} {w}")
-                acc = o
+            # Non-fragment stages (CS/VS/GS/MS) can have partial quads (subgroup size or thread count not a multiple
+            # of 4), where QuadSwap or unguarded shuffles from absent lanes are undefined in SPIR-V. Ballot sets bit l
+            # iff lane l is running with `v != 0`, so extracting this lane's 4-bit quad nibble is exact on any partial
+            # subgroup up to 128 lanes without needing GroupNonUniformQuad or any shuffle.
+            self.uses_subgroup = self.uses_ballot = True
+            nz = self.tmp_bool_nz(v)
+            bal, widx, word, qoff, shifted, acc = (self.tmp() for _ in range(6))
+            self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {nz}")
+            sgl = self.subgroup_lane()
+            self.emit(f"{widx} = OpShiftRightLogical %uint {sgl} {self.cu(5)}")
+            self.emit(f"{word} = OpCompositeExtract %uint {bal} 0")
+            for k in (1, 2, 3):
+                wk, eq, pick = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{wk} = OpCompositeExtract %uint {bal} {k}")
+                self.emit(f"{eq} = OpIEqual %bool {widx} {self.cu(k)}")
+                self.emit(f"{pick} = OpSelect %uint {eq} {wk} {word}")
+                word = pick
+            self.emit(f"{qoff} = OpBitwiseAnd %uint {sgl} {self.cu(28)}")
+            self.emit(f"{shifted} = OpShiftRightLogical %uint {word} {qoff}")
+            self.emit(f"{acc} = OpBitwiseAnd %uint {shifted} {self.cu(0xF)}")
         r = self.tmp()
         self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(acc)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
         return r
@@ -7145,14 +7452,20 @@ class Gen:
             else:
                 raise Unsupported(f"{op} modifier")
 
-    def flush_f32(self, f):
+    def flush_f32(self, f, *, force=False):
         """v_mad_f32, v_mac_f32, v_mad_legacy_f32 and default-mode v_mul_legacy_f32 flush f32 denormals:
         a subnormal operand or result
         reads as signed zero, whatever the MODE register says. LLVM's SITargetLowering::isFMADLegal forms
         v_mad_f32/v_mac_f32 only when f32 denormals are flushed (SIISelLowering.cpp, llvm-project 1922c0c);
-        v_mad_legacy_f32 is the same VALU. Emulated as |x| < FLT_MIN -> copysign(0, x): inf and NaN compare
-        false and pass through, and 0 keeps its sign. Counted over the corpus before writing this (SHADER-118):
-        9,297 of the 26,503 shaders use at least one of the three, 440,858 occurrences (0.99% of the corpus)."""
+        v_mad_legacy_f32 is the same VALU. When hardware DenormFlushToZero 32 is active (self.ftz32), the f32
+        arithmetic op itself flushes inputs and output; otherwise (or when force=True for GLSL.std.450 ops
+        like Exp2 where DenormFlushToZero 32 is not guaranteed to flush on all drivers) emulate as
+        |x| < FLT_MIN -> copysign(0, x):
+        inf and NaN compare false and pass through, and 0 keeps its sign. Counted over the corpus before
+        writing this (SHADER-118): 9,297 of the 26,503 shaders use at least one of the three, 440,858
+        occurrences (0.99% of the corpus)."""
+        if self.ftz32 and not force:
+            return f
         a, small, sign, z, r = (self.tmp() for _ in range(5))
         self.emit(f"{a} = OpExtInst %float %glsl FAbs {f}")
         self.emit(f"{small} = OpFOrdLessThan %bool {a} {self.fconst(2.0 ** -126)}")
@@ -7873,17 +8186,32 @@ class Gen:
             src_sg = self.tmp()
             self.emit(f"{src_sg} = OpBitwiseOr %uint {sg_group} {src_local}")
             if in_bounds is not None:
-                # Clamp an invalid source lane before the shuffle: its value is discarded below, but the lane index
-                # passed to OpGroupNonUniformShuffle must still be in range.
+                # Clamp an invalid source lane to own subgroup lane (always running, never lane 0 which may be absent).
                 safe_sg = self.tmp()
-                self.emit(f"{safe_sg} = OpSelect %uint {in_bounds} {src_sg} {self.cu(0)}")
+                self.emit(f"{safe_sg} = OpSelect %uint {in_bounds} {src_sg} {sgl}")
             else:
                 safe_sg = src_sg
 
             shuffle_src = safe_sg
             if fi:
-                # fi:1 fetches the inactive source as well; only an out-of-row lane is still invalid.
-                src_ok = in_bounds if in_bounds is not None else "%true"
+                # fi:1 fetches an EXEC-off source lane, but an unlaunched/absent lane in a partial subgroup must
+                # still be redirected to sgl before OpGroupNonUniformShuffle and treated as invalid.
+                if src.get("k") == "vgpr":
+                    pbal, present = self.tmp(), self.tmp()
+                    self.emit(f"{pbal} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+                    self.uses_ballot = True
+                    self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool {self.cu(3)} {pbal} {safe_sg}")
+                    present_e = self.eager("%bool", present)
+                    if in_bounds is not None:
+                        both = self.tmp()
+                        self.emit(f"{both} = OpLogicalAnd %bool {in_bounds} {present_e}")
+                        src_ok = both
+                    else:
+                        src_ok = present_e
+                    shuffle_src = self.tmp()
+                    self.emit(f"{shuffle_src} = OpSelect %uint {present} {safe_sg} {sgl}")
+                else:
+                    src_ok = in_bounds if in_bounds is not None else "%true"
             else:
                 ballot = self.tmp()
                 self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {self.active_b()}")
@@ -8241,16 +8569,19 @@ class Gen:
                 self.emit(f"{first} = OpSelect %uint {lz} {l} {fh}")
                 self.dst(a[0], read(first))
                 return
-            self.uses_subgroup = self.uses_ballot = self.uses_vote = True
+            self.uses_subgroup = self.uses_ballot = True
             v, act = self.src_u(a[1]), self.active_b()
-            bal, lsb, any_, first, r = (self.tmp() for _ in range(5))
+            bal, first, r = (self.tmp() for _ in range(3))
             self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {act}")
             if self.stage == "vs":
-                lsb = self.ballot_lsb_by_words(bal)
+                lsb, any_ = self.ballot_lsb_by_words(bal, with_any=True)
             else:
+                self.uses_vote = True
+                lsb, any_ = self.tmp(), self.tmp()
                 self.emit(f"{lsb} = OpGroupNonUniformBallotFindLSB %uint {self.cu(3)} {bal}")
-            self.emit(f"{any_} = OpGroupNonUniformAny %bool {self.cu(3)} {act}")
-            self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
+                self.emit(f"{any_} = OpGroupNonUniformAny %bool {self.cu(3)} {act}")
+            fallback = self.subgroup_first_running_lane()
+            self.emit(f"{first} = OpSelect %uint {any_} {lsb} {fallback}")
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {first}")
             self.dst(a[0], r)
         elif op in ("image_gather4_c_lz", "image_gather4_c_lz_o"):
@@ -8368,6 +8699,11 @@ class Gen:
             width = 16 if ("_dot2_" in op or "_dot2c_" in op) else (8 if "_dot4" in op else 4)
             signed = op.endswith(("i16", "i4"))
             clamp = "clamp" in mods
+            if width == 8:
+                packed = self.packed_dot4(x, y, acc, signed=False, clamp=clamp)
+                if packed is not None:
+                    self.dst(a[0], packed)
+                    return
             ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
             prods = []
             for off in range(0, 32, width):
@@ -9238,17 +9574,18 @@ class Gen:
                 # shuffle would index a lane the 32-lane subgroup of a VS/PS/GS may not have (lane >= 32).
                 self.dst(a[0], self.src_u(a[1]))
                 return
-            slot = lane_masks.lane_slot(a[1], a[2])
+            slot = lane_masks.lane_slot(a[1], a[2], self.wave64)
+            if slot and (slot[1:] in self.scalar_spills
+                         or (id(self.cur_ins) in self.spill_readlanes and slot[1:] in self.parked)):
+                # Pure scalar-spill VGPR or definite mixed-VGPR spill reload: load from the parked scalar slot
+                # instead of shuffling from a lane that may be inactive (small fragment waves, discards, or
+                # wave64 lanes >= 32 on 32-wide subgroups).
+                self.dst(a[0], self.load_reg("sgpr", self.parked[slot[1:]]))
+                return
             if slot in self.cur_masks:
                 # A lane mask parked there by v_writelane (a saved EXEC, when the shader ran out of SGPRs): this
                 # lane's bit comes back, from the slot the write kept it in. The shuffle would hand every lane
                 # the bit of the one lane the mask was parked in.
-                self.dst(a[0], self.load_reg("sgpr", self.parked[slot[1:]]))
-                return
-            if slot and slot[1:] in self.w64_scalar_spills:
-                # SHADER-10: wave64_halves proved this VGPR is pure scalar-spill storage (never read as a vector
-                # operand), so spills across all 64 lanes (including 32..63) reload from the parked scalar slot
-                # instead of shuffling from an out-of-range lane on a 32-wide subgroup.
                 self.dst(a[0], self.load_reg("sgpr", self.parked[slot[1:]]))
                 return
             self.uses_subgroup = True
@@ -9257,12 +9594,27 @@ class Gen:
             # RDNA2: wave64 uses S1[5:0] (mod 64); wave32 uses S1[4:0] (mod 32). Masking wave32 with 63 left
             # lane selects 32..63 pointing past a 32-wide subgroup (SHADER-52 / FUZZ-7).
             self.emit(f"{m} = OpBitwiseAnd %uint {ln} {self.cu(63 if self.wave64 else 31)}")
-            self.g_shuffle(r, v, m)
+            if self.emulate:
+                self.g_shuffle(r, v, m)
+            else:
+                # Guard against shuffling from an unlaunched/absent lane in a partial subgroup: redirect absent
+                # targets to the wave's first running lane so the result stays wave-uniform and never triggers UB.
+                self.uses_ballot = True
+                phys = self.wave_source_lane(m)
+                bal, present, safe_phys = (self.tmp() for _ in range(3))
+                self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+                self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool {self.cu(3)} {bal} {phys}")
+                if self.wave32_fragment:
+                    fallback = self.wave_source_lane(self.wave32_first_running_lane(bal))
+                else:
+                    fallback = self.subgroup_first_running_lane(bal)
+                self.emit(f"{safe_phys} = OpSelect %uint {present} {phys} {fallback}")
+                self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {safe_phys}")
             self.dst(a[0], r)
         elif op == "v_writelane_b32":
             # vD[lane] = sS: only the named lane changes (independent of EXEC, as on hardware).
-            slot = lane_masks.lane_slot(a[0], a[2])
-            if slot and slot[1:] in self.w64_scalar_spills:
+            slot = lane_masks.lane_slot(a[0], a[2], self.wave64)
+            if slot and slot[1:] in self.scalar_spills:
                 self.store_reg("sgpr", self.parked[slot[1:]], self.src_u(a[1]))
                 return
             self.uses_subgroup = True
@@ -9317,10 +9669,24 @@ class Gen:
             # way. Measured on RDNA2 (issue #374).
             (fi, bc), _ = self.opsel_bits(mods, 2)
             if fi:
-                # FI=1 fetches the value of a source lane that is off in EXEC.
-                r = self.tmp()
-                self.g_shuffle(r, v, src)
-                self.dst(a[0], r)
+                # FI=1 fetches the value of a source lane that is off in EXEC. On a native subgroup, redirect
+                # unlaunched/absent lanes first so OpGroupNonUniformShuffle never targets a non-running lane.
+                if self.emulate:
+                    r = self.tmp()
+                    self.g_shuffle(r, v, src)
+                    self.dst(a[0], r)
+                else:
+                    ballot, present, safe_phys, shuf, mask, r = (self.tmp() for _ in range(6))
+                    physical_src = self.wave_source_lane(src)
+                    physical_self = self.subgroup_lane()
+                    self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
+                    self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool %c3 {ballot} {physical_src}")
+                    self.emit(f"{safe_phys} = OpSelect %uint {present} {physical_src} {physical_self}")
+                    self.emit(f"{shuf} = OpGroupNonUniformShuffle %uint %c3 {v} {safe_phys}")
+                    self.uses_subgroup = self.uses_ballot = True
+                    self.emit(f"{mask} = OpSelect %uint {present} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                    self.emit(f"{r} = OpBitwiseAnd %uint {shuf} {mask}")
+                    self.dst(a[0], r, eager=True)
             elif self.emulate:
                 r = self.tmp()
                 self.g_shuffle(r, v, src)
@@ -9345,14 +9711,15 @@ class Gen:
                 # aa217aeb the FI=0 lanes then read the source lane's value instead of keeping the old one (#5895).
                 # Combine with bitwise masks instead, as #932 does for ds_bpermute: the ballot and the shuffles run
                 # before lane predication.
-                sa, ballot, present, safe_src, r, act, got, ok, mask = (self.tmp() for _ in range(9))
+                sa, ballot, present, safe_phys, r, act, got, ok, mask = (self.tmp() for _ in range(9))
                 self.emit(f"{sa} = OpSelect %uint {self.active_b()} {self.cu(1)} {self.cu(0)}")
                 physical_src = self.wave_source_lane(src)
+                physical_self = self.subgroup_lane()
                 self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
                 self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool %c3 {ballot} {physical_src}")
-                self.emit(f"{safe_src} = OpSelect %uint {present} {src} {lane}")
-                self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {self.wave_source_lane(safe_src)}")
-                self.emit(f"{act} = OpGroupNonUniformShuffle %uint %c3 {sa} {self.wave_source_lane(safe_src)}")
+                self.emit(f"{safe_phys} = OpSelect %uint {present} {physical_src} {physical_self}")
+                self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {safe_phys}")
+                self.emit(f"{act} = OpGroupNonUniformShuffle %uint %c3 {sa} {safe_phys}")
                 self.emit(f"{got} = OpINotEqual %bool {act} {self.cu(0)}")
                 self.emit(f"{ok} = OpLogicalAnd %bool {present} {got}")
                 self.uses_subgroup = self.uses_ballot = True
@@ -10546,14 +10913,25 @@ class Gen:
             # zero override gives +0 even when a negative subnormal operand becomes -0 after input flushing.
             # Flush the product before omod: otherwise FLT_MIN * 0.5 mul:2 becomes FLT_MIN, not zero.
             x, y = (self.src_f(t) for t in a[1:3])
-            m, ax, ay, zx, zy, either, r = (self.tmp() for _ in range(7))
-            self.emit(f"{m} = OpFMul %float {x} {y}")
-            self.emit(f"{ax} = OpExtInst %float %glsl FAbs {x}")
-            self.emit(f"{ay} = OpExtInst %float %glsl FAbs {y}")
-            self.emit(f"{zx} = OpFOrdLessThan %bool {ax} {self.fconst(2.0 ** -126)}")
-            self.emit(f"{zy} = OpFOrdLessThan %bool {ay} {self.fconst(2.0 ** -126)}")
-            self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")
-            self.emit(f"{r} = OpSelect %float {either} %f0 {self.flush_f32(m)}")
+            if self.ftz32:
+                # Under DenormFlushToZero 32, OpFOrdEqual flushes subnormal inputs to 0 and OpFMul flushes
+                # subnormal products to signed zero. Emit the canonical Mesa NIR fmulz pattern so RADV/ACO
+                # lowers it to a single native v_mul_legacy_f32.
+                m, zx, zy, either, r = (self.tmp() for _ in range(5))
+                self.emit(f"{m} = OpFMul %float {x} {y}")
+                self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")
+                self.emit(f"{zy} = OpFOrdEqual %bool {y} %f0")
+                self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")
+                self.emit(f"{r} = OpSelect %float {either} %f0 {m}")
+            else:
+                m, ax, ay, zx, zy, either, r = (self.tmp() for _ in range(7))
+                self.emit(f"{m} = OpFMul %float {x} {y}")
+                self.emit(f"{ax} = OpExtInst %float %glsl FAbs {x}")
+                self.emit(f"{ay} = OpExtInst %float %glsl FAbs {y}")
+                self.emit(f"{zx} = OpFOrdLessThan %bool {ax} {self.fconst(2.0 ** -126)}")
+                self.emit(f"{zy} = OpFOrdLessThan %bool {ay} {self.fconst(2.0 ** -126)}")
+                self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")
+                self.emit(f"{r} = OpSelect %float {either} %f0 {self.flush_f32(m)}")
             r = self.clamp_mods(r, mods)
             if any(mod in ("mul:2", "mul:4", "div:2") for mod in mods):
                 r = self.flush_f32(r)
@@ -12225,7 +12603,7 @@ class Gen:
             else:
                 self.emit(f"{r} = OpExtInst %float %glsl {F1[op]} {x}")
                 if op == "v_exp_f32":
-                    r = self.flush_f32(r)
+                    r = self.flush_f32(r, force=True)
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in ("v_frexp_mant_f32", "v_frexp_exp_i32_f32", "v_ldexp_f32"):
             # Bit-exact on the binary32 word (no float arithmetic). A normal input has biased exponent 1..254;
@@ -13004,6 +13382,11 @@ class Gen:
                 raise Unsupported(op + " op_sel")
             x, y = self.src_u(a[1]), self.src_u(a[2])
             acc = self.src_u(a[3]) if is_vop3p else self.src_u(a[0])
+            packed = self.packed_dot4(self.dot4_halves(x, sel[0], selhi[0]), self.dot4_halves(y, sel[1], selhi[1]),
+                                      acc, signed=True, clamp=has_clamp)
+            if packed is not None:
+                self.dst(a[0], packed)
+                return
             x_offs = (16 * sel[0], 16 * sel[0] + 8, 16 * selhi[0], 16 * selhi[0] + 8)
             y_offs = (16 * sel[1], 16 * sel[1] + 8, 16 * selhi[1], 16 * selhi[1] + 8)
             dot = None
@@ -13056,6 +13439,137 @@ class Gen:
             self.export(ins)
         else:
             raise Unsupported(op)
+
+    def dot4_halves(self, x, lo_half, hi_half):
+        """The dword a 4x8-bit dot product reads under op_sel: bytes 0..1 from 16-bit half `lo_half` of `x` and bytes
+        2..3 from half `hi_half` (0 low, 1 high; the default is 0 and 1, `x` itself)."""
+        if (lo_half, hi_half) == (0, 1):
+            return x
+        lo, hi, r = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{lo} = OpBitFieldUExtract %uint {x} {self.cu(16 * lo_half)} {self.cu(16)}")
+        self.emit(f"{hi} = OpBitFieldUExtract %uint {x} {self.cu(16 * hi_half)} {self.cu(16)}")
+        self.emit(f"{r} = OpBitFieldInsert %uint {lo} {hi} {self.cu(16)} {self.cu(16)}")
+        return r
+
+    def packed_dot4(self, x, y, acc, *, signed, clamp):
+        """acc + the dot product of the four bytes of x and y as one SPV_KHR_integer_dot_product instruction, or None
+        under --integer-dot-fallback (the caller expands it).
+
+        OpSDot / OpUDot give the low 32 bits of the exact sum of the four products of the sign- (zero-) extended
+        bytes (PackedVectorFormat4x8Bit), the sum v_dot4_i32_i8 / v_dot4_u32_u8 form; adding acc wraps at 32 bits as
+        the instructions do without clamp. With clamp the hardware saturates acc + the exact sum (signed 32-bit for
+        i8, unsigned for u8; docs/design.md, "Signed-byte dot products" and "Packed integer dot products"), which is
+        OpSDotAccSat / OpUDotAccSat: "the correct result ... computed with enough precision to avoid overflow",
+        saturated to the result type. The signed forms use %int operands, so the signedness is the type's too."""
+        if INTEGER_DOT_FALLBACK:
+            return None
+        self.uses_int_dot = True
+        fmt = "PackedVectorFormat4x8BitKHR"
+        if not signed:
+            r = self.tmp()
+            if clamp:
+                self.emit(f"{r} = OpUDotAccSatKHR %uint {x} {y} {acc} {fmt}")
+            else:
+                d = self.tmp()
+                self.emit(f"{d} = OpUDotKHR %uint {x} {y} {fmt}")
+                self.emit(f"{r} = OpIAdd %uint {acc} {d}")
+            return r
+        xi, yi = self.tmp(), self.tmp()
+        self.emit(f"{xi} = OpBitcast %int {x}")
+        self.emit(f"{yi} = OpBitcast %int {y}")
+        if clamp:
+            ai, s, r = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{ai} = OpBitcast %int {acc}")
+            self.emit(f"{s} = OpSDotAccSatKHR %int {xi} {yi} {ai} {fmt}")
+            self.emit(f"{r} = OpBitcast %uint {s}")
+            return r
+        d, du, r = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{d} = OpSDotKHR %int {xi} {yi} {fmt}")
+        self.emit(f"{du} = OpBitcast %uint {d}")
+        self.emit(f"{r} = OpIAdd %uint {acc} {du}")
+        return r
+
+    def sbuf_slow_function(self, n, ro=False):
+        """Build (once per (width, ro) with n in {2, 4, 8, 16}) the partial-OOB helper %sbuf_slow_{ro|rw}_x{n}.
+
+        Called from the cold lbl_slow branch of wide s_buffer_load_dwordxN when the last dword is past limit.
+        Uses a compact counted loop (DontUnroll) with ONE OpLoad in the loop body, storing into a zero-initialized
+        Function-scope %arr_sbuf_x{n} and returning OpLoad %arr_sbuf_x{n}: each dword i with off + 4*i + 4 <= lim
+        is loaded at host + 4*i (Aligned 4); out-of-range dwords stay 0 without reading past limit.
+        When ro=True, loads through NonWritable %_ptr_PSB_sl_blk1 so RADV/ACO keeps SMEM s_load_dword even inside
+        the slow path; when ro=False, loads through mutable %_ptr_PSB_arr."""
+        ro = bool(ro)
+        key = (n, ro)
+        tag = "ro" if ro else "rw"
+        fn = f"%sbuf_slow_{tag}_x{n}"
+        if key not in self.sbuf_slow_fns:
+            p = f"%sbs_{tag}{n}_"
+            arr = f"%arr_sbuf_x{n}"
+            ptr_arr = f"%_ptr_Function_arr_sbuf_x{n}"
+            null_arr = f"%null_sbuf_x{n}"
+            c0 = self.cu(0)
+            c1 = self.cu(1)
+            self.cu(n)
+            cl2 = self.cl(2)
+            cln = self.cl(n)
+            if ro:
+                self.uses_psb_scalar_ro = True
+            lines = [
+                f"{fn} = OpFunction {arr} None %fn_sbuf_slow_x{n}",
+                f"{p}host = OpFunctionParameter %ulong",
+                f"{p}off = OpFunctionParameter %ulong",
+                f"{p}lim = OpFunctionParameter %ulong",
+                f"{p}entry = OpLabel",
+                f"{p}out = OpVariable {ptr_arr} Function {null_arr}",
+                # Overflow-safe exact in-range dword count:
+                # off + 4*i + 4 <= lim  <=>  lim >= off and i < min((lim - off) >> 2, n).
+                f"{p}ge = OpUGreaterThanEqual %bool {p}lim {p}off",
+                f"{p}diff = OpISub %ulong {p}lim {p}off",
+                f"{p}avail = OpShiftRightLogical %ulong {p}diff {cl2}",
+                f"{p}lt_n = OpULessThan %bool {p}avail {cln}",
+                f"{p}cnt64 = OpSelect %ulong {p}lt_n {p}avail {cln}",
+                f"{p}cnt_u = OpUConvert %uint {p}cnt64",
+                f"{p}cnt = OpSelect %uint {p}ge {p}cnt_u {c0}",
+            ]
+            if not ro:
+                lines.append(f"{p}ptr = OpConvertUToPtr %_ptr_PSB_arr {p}host")
+            lines += [
+                f"OpBranch {p}head",
+                f"{p}head = OpLabel",
+                f"{p}i = OpPhi %uint {c0} {p}entry {p}next {p}cont",
+                f"{p}cond = OpULessThan %bool {p}i {p}cnt",
+                f"OpLoopMerge {p}exit {p}cont DontUnroll",
+                f"OpBranchConditional {p}cond {p}body {p}exit",
+                f"{p}body = OpLabel",
+            ]
+            if ro:
+                lines += [
+                    f"{p}i64 = OpUConvert %ulong {p}i",
+                    f"{p}boff = OpShiftLeftLogical %ulong {p}i64 {cl2}",
+                    f"{p}addr = OpIAdd %ulong {p}host {p}boff",
+                    f"{p}bptr = OpConvertUToPtr %_ptr_PSB_sl_blk1 {p}addr",
+                    f"{p}qptr = OpAccessChain %_ptr_PSB_uint {p}bptr {c0}",
+                    f"{p}val = OpLoad %uint {p}qptr Aligned 4",
+                ]
+            else:
+                lines += [
+                    f"{p}qptr = OpAccessChain %_ptr_PSB_uint {p}ptr {p}i",
+                    f"{p}val = OpLoad %uint {p}qptr Aligned 4",
+                ]
+            lines += [
+                f"{p}slot = OpAccessChain %_ptr_Function_uint {p}out {p}i",
+                f"OpStore {p}slot {p}val",
+                f"OpBranch {p}cont",
+                f"{p}cont = OpLabel",
+                f"{p}next = OpIAdd %uint {p}i {c1}",
+                f"OpBranch {p}head",
+                f"{p}exit = OpLabel",
+                f"{p}res = OpLoad {arr} {p}out",
+                f"OpReturnValue {p}res",
+                "OpFunctionEnd",
+            ]
+            self.sbuf_slow_fns[key] = lines
+        return fn
 
     def scalar_load(self, op, a, mods):
         """s_load_dwordxN sD, s[p:p+1], off   -> N dwords from a 64-bit pointer, no bound
@@ -13170,9 +13684,73 @@ class Gen:
         self.emit(f"{sh} = OpShiftLeftLogical %ulong {h64} %c64_32")
         self.emit(f"{addr} = OpBitwiseOr %ulong {sh} {l64}")
         self.emit(f"{full} = OpIAdd %ulong {addr} {o64}")
-        ptr = self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full, 'load', 4 * n)}")
+        host = self.host_addr(full, 'load', 4 * n)
         self.uses_psb = True
+        coherent = self._is_coherent_mem(mods)
+        load_mem = self._psb_load_op(mods)
+        ro = (not coherent) and (self.scalar_load_ro is None or self.scalar_load_ro is True or
+                                 (self.cur_ins is not None and id(self.cur_ins) in self.scalar_load_ro))
+        scalar_ro = ro and self.scalar_load_ro is not None
+        ptr_cache = [None]
+
+        def get_ptr():
+            if ptr_cache[0] is None:
+                p = self.tmp()
+                self.emit(f"{p} = OpConvertUToPtr %_ptr_PSB_arr {host}")
+                ptr_cache[0] = p
+            return ptr_cache[0]
+
+        def wide(count):
+            """Dwords 0..count-1 at the load's address as the fewest loads SPIR-V types allow: uvec4, then uvec2,
+            then one uint. Each is Aligned 4, the alignment SMEM has. One instruction's dwords are consecutive in
+            memory, so a driver can fetch them as one scalar or vector load instead of one per dword (RADV gave 6,048
+            global_load_b32, 5,935 v_readfirstlane and 5,448 64-bit compares for the 365 s_buffer_load_dwordx16
+            of an FSPX program loaded per dword).
+
+            Provably non-aliasing scalar loads read through a NonWritable Block (%sl_blk1 / %sl_blk2 / %sl_blk4)
+            so RADV emits SMEM (s_load_b32..b512); loads that may alias a store/atomic in the same module read
+            through a mutable Block (%sl_rw_blk2 / %sl_rw_blk4) or %_ptr_PSB_arr so stores remain visible. Coherent
+            (glc/dlc) loads always use scalar mutable loads carrying MakePointerVisible|NonPrivatePointer."""
+            got, k = [], 0
+            while k < count:
+                w = 1 if coherent else (4 if count - k >= 4 else 2 if count - k >= 2 else 1)
+                if w == 1:
+                    if scalar_ro:
+                        self.uses_psb_scalar_ro = True
+                        at = host
+                        if k:
+                            at = self.tmp()
+                            self.emit(f"{at} = OpIAdd %ulong {host} {self.cl(4 * k)}")
+                        b, q, v = self.tmp(), self.tmp(), self.tmp()
+                        self.emit(f"{b} = OpConvertUToPtr %_ptr_PSB_sl_blk1 {at}")
+                        self.emit(f"{q} = OpAccessChain %_ptr_PSB_uint {b} {self.cu(0)}")
+                        self.emit(f"{v} = OpLoad %uint {q} Aligned 4")
+                    else:
+                        q, v = self.tmp(), self.tmp()
+                        self.emit(f"{q} = OpAccessChain %_ptr_PSB_uint {get_ptr()} {self.cu(k)}")
+                        self.emit(f"{v} = OpLoad %uint {q} {load_mem}")
+                    got.append(v)
+                else:
+                    if ro:
+                        self.uses_psb_vec = True
+                        blk_ptr = f"%_ptr_PSB_sl_blk{w}"
+                    else:
+                        self.uses_psb_vec_rw = True
+                        blk_ptr = f"%_ptr_PSB_sl_rw_blk{w}"
+                    at = host
+                    if k:
+                        at = self.tmp()
+                        self.emit(f"{at} = OpIAdd %ulong {host} {self.cl(4 * k)}")
+                    b, q, v = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{b} = OpConvertUToPtr {blk_ptr} {at}")
+                    self.emit(f"{q} = OpAccessChain %_ptr_PSB_v{w}uint_sl {b} {self.cu(0)}")
+                    self.emit(f"{v} = OpLoad %v{w}uint_sl {q} Aligned 4")
+                    for j in range(w):
+                        e = self.tmp()
+                        self.emit(f"{e} = OpCompositeExtract %uint {v} {j}")
+                        got.append(e)
+                k += w
+            return got
         lim = None
         lim_val = None
         if sbuf:
@@ -13193,61 +13771,107 @@ class Gen:
                 self.emit(f"{raw} = OpIEqual %bool {stride} {self.cu(0)}")
                 self.emit(f"{lim} = OpSelect %ulong {raw} {nr64} {prod}")
         guarded = {}
-        if lim is not None and not (lim_val is not None and reg is None):
-            # A run-time bound: dword i is in range when off + 4*i + 4 <= limit, and out of range it is 0 with memory
-            # not read. The ends grow with i, so "dword i in range" implies every dword before it is: one selection
-            # on dword 0 covers the load. Inside it each dword reads at index i when in range, else at index 0 (in
-            # range there, so nothing outside the buffer is touched), and the out-of-range ones are then 0. Before,
-            # each dword had its own selection: 2N blocks per s_buffer_load_dwordxN, 11,000 of the 17,000 blocks of
-            # the cascade-shadow CS whose pipeline NVIDIA's compiler could not build in 16 GB.
-            oks = []
+        if lim is not None and not (lim_val is not None and reg is None) and n > 1:
+            # Every dword in range (the last one is, so all are): one wide load, the common case. Otherwise call
+            # the shared per-width partial-OOB loop helper %sbuf_slow_{ro|rw}_x{n}.
+            last_end, all_ok = self.tmp(), self.tmp()
+            if reg is not None:
+                self.emit(f"{last_end} = OpIAdd %ulong {o64} {self.cl(4 * n)}")
+            else:
+                last_end = self.cl(imm + 4 * n)
+            self.emit(f"{all_ok} = OpUGreaterThanEqual %bool {lim} {last_end}")
+            if coherent:
+                get_ptr()
+            lbl_fast, lbl_slow, lbl_join = self.tmp() + "_all", self.tmp() + "_part", self.tmp() + "_join"
+            self.emit(f"OpSelectionMerge {lbl_join} None")
+            self.emit(f"OpBranchConditional {all_ok} {lbl_fast} {lbl_slow}")
+            self.emit(f"{lbl_fast} = OpLabel")
+            fast = wide(n)
+            fast_exit = self.current_label_placeholder()
+            self.emit(f"OpBranch {lbl_join}")
+            self.emit(f"{lbl_slow} = OpLabel")
+            if not coherent:
+                slow_fn = self.sbuf_slow_function(n, ro=ro)
+                slow_arr = self.tmp()
+                self.emit(f"{slow_arr} = OpFunctionCall %arr_sbuf_x{n} {slow_fn} {host} {o64} {lim}")
+                slow_vals = []
+                for i in range(n):
+                    e = self.tmp()
+                    self.emit(f"{e} = OpCompositeExtract %uint {slow_arr} {i}")
+                    slow_vals.append(e)
+            else:
+                oks = []
+                for i in range(n):
+                    end, ok = self.tmp(), self.tmp()
+                    if reg is not None:
+                        self.emit(f"{end} = OpIAdd %ulong {o64} {self.cl(4 * i + 4)}")
+                    else:
+                        end = self.cl(imm + 4 * i + 4)
+                    self.emit(f"{ok} = OpUGreaterThanEqual %bool {lim} {end}")
+                    oks.append(ok)
+                lbl_cdo, lbl_cend = self.tmp() + "_cdo", self.tmp() + "_cend"
+                cpre = self.current_label_placeholder()
+                self.emit(f"OpSelectionMerge {lbl_cend} None")
+                self.emit(f"OpBranchConditional {oks[0]} {lbl_cdo} {lbl_cend}")
+                self.emit(f"{lbl_cdo} = OpLabel")
+                got_in = []
+                for i in range(n):
+                    idx, p, got, val = (self.tmp() for _ in range(4))
+                    if i == 0:
+                        idx = self.cu(0)
+                    else:
+                        self.emit(f"{idx} = OpSelect %uint {oks[i]} {self.cu(i)} {self.cu(0)}")
+                    self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {get_ptr()} {idx}")
+                    self.emit(f"{got} = OpLoad %uint {p} {load_mem}")
+                    if i == 0:
+                        val = got
+                    else:
+                        self.emit(f"{val} = OpSelect %uint {oks[i]} {got} {self.cu(0)}")
+                    got_in.append(val)
+                self.emit(f"OpBranch {lbl_cend}")
+                self.emit(f"{lbl_cend} = OpLabel")
+                slow_vals = []
+                for i in range(n):
+                    sv = self.tmp()
+                    self.emit(f"{sv} = OpPhi %uint {got_in[i]} {lbl_cdo} {self.cu(0)} {cpre}")
+                    slow_vals.append(sv)
+            slow_exit = self.current_label_placeholder()
+            self.emit(f"OpBranch {lbl_join}")
+            self.emit(f"{lbl_join} = OpLabel")
             for i in range(n):
-                end, ok = self.tmp(), self.tmp()
-                if reg is not None:
-                    self.emit(f"{end} = OpIAdd %ulong {o64} {self.cl(4 * i + 4)}")
-                else:
-                    end = self.cl(imm + 4 * i + 4)
-                self.emit(f"{ok} = OpUGreaterThanEqual %bool {lim} {end}")
-                oks.append(ok)
+                v = self.tmp()
+                self.emit(f"{v} = OpPhi %uint {fast[i]} {fast_exit} {slow_vals[i]} {slow_exit}")
+                guarded[i] = v
+        elif lim is not None and not (lim_val is not None and reg is None):
+            # Single-dword run-time bound: 0 without reading memory when off + 4 > limit.
+            end, ok = self.tmp(), self.tmp()
+            if reg is not None:
+                self.emit(f"{end} = OpIAdd %ulong {o64} {self.cl(4)}")
+            else:
+                end = self.cl(imm + 4)
+            self.emit(f"{ok} = OpUGreaterThanEqual %bool {lim} {end}")
             lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
             pre = self.current_label_placeholder()
             self.emit(f"OpSelectionMerge {lbl_end} None")
-            self.emit(f"OpBranchConditional {oks[0]} {lbl_do} {lbl_end}")
+            self.emit(f"OpBranchConditional {ok} {lbl_do} {lbl_end}")
             self.emit(f"{lbl_do} = OpLabel")
-            got_in = []
-            for i in range(n):
-                idx, p, got, val = (self.tmp() for _ in range(4))
-                if i == 0:
-                    idx = self.cu(0)
-                else:
-                    self.emit(f"{idx} = OpSelect %uint {oks[i]} {self.cu(i)} {self.cu(0)}")
-                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {idx}")
-                self.emit(f"{got} = OpLoad %uint {p} Aligned 4")
-                if i == 0:
-                    val = got
-                else:
-                    self.emit(f"{val} = OpSelect %uint {oks[i]} {got} {self.cu(0)}")
-                got_in.append(val)
+            got = wide(1)[0]
             self.emit(f"OpBranch {lbl_end}")
             self.emit(f"{lbl_end} = OpLabel")
-            for i in range(n):
-                v = self.tmp()
-                self.emit(f"{v} = OpPhi %uint {got_in[i]} {lbl_do} {self.cu(0)} {pre}")
-                guarded[i] = v
+            v = self.tmp()
+            self.emit(f"{v} = OpPhi %uint {got} {lbl_do} {self.cu(0)} {pre}")
+            guarded[0] = v
+        if guarded:
+            vals = [guarded[i] for i in range(n)]
+        elif lim is None:
+            vals = wide(n)
+        else:
+            # A bound known at translate time (lim_val, constant offset). The dwords in range are a prefix (their
+            # ends grow with i): one wide load for them, 0 for the rest.
+            count = sum(lim_val >= imm + 4 * i + 4 for i in range(n))
+            vals = wide(count) + [self.cu(0)] * (n - count)
         for i in range(n):
-            p, v = self.tmp(), self.tmp()
-            if i in guarded:
-                v = guarded[i]
-            elif lim is None:
-                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
-                self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
-            else:                   # a bound known at translate time (lim_val, constant offset): fold each dword
-                end_val = imm + 4 * i + 4
-                if lim_val >= end_val:
-                    self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
-                    self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
-                else:
-                    v = self.cu(0)
+            v = vals[i]
             if single_special:
                 if n == 2:          # vcc pair: low dword -> vcc_lo, high dword -> vcc_hi (data, not a lane mask)
                     self.emit(f"OpStore {'%vcc' if i == 0 else '%vcc_hi'} {v}")
@@ -13265,7 +13889,7 @@ class Gen:
     # The last word is the pad word a plain module never reads; --descriptor-table tagged fills it with the kind.
     PROBES = 8
 
-    def desc_lookup(self, words):
+    def desc_lookup(self, words, uniform=True):
         """words: 8 uint ids. Returns (bindless index, kind), kind being None with --descriptor-table plain.
 
         The probe is about 400 instructions, so it is one function in the module (%desc_lookup_fn) that every
@@ -13290,16 +13914,43 @@ class Gen:
             self.emit(f"{kind} = OpCompositeExtract %uint {r} 1")
         else:
             idx, kind = r, None
+        return self.desc_uniform(idx, kind) if uniform else (idx, kind)
+
+    def tsharp_index_word(self, words):
+        """(index, kind, tagged) from the T#'s dword 6 as the layer writes it (TSHARP_INDEX): the bool `tagged` is
+        whether the word carries the tag and dword 3 names an image (TYPE >= 8, bit 31); index and kind are 0 when it
+        does not, index 0's fallback, which is what a T# that names no image reads. The words are SGPRs, so this is a
+        handful of scalar operations and no memory access beyond the T# the shader loaded anyway."""
+        w3, w6 = words[3], words[TSHARP_INDEX_DWORD]
+        tag, tag_ok, img, img_ok, ok = (self.tmp() for _ in range(5))
+        self.emit(f"{tag} = OpShiftRightLogical %uint {w6} {self.cu(28)}")
+        self.emit(f"{tag_ok} = OpIEqual %bool {tag} {self.cu(TSHARP_INDEX_TAG)}")
+        self.emit(f"{img} = OpShiftRightLogical %uint {w3} {self.cu(31)}")
+        self.emit(f"{img_ok} = OpINotEqual %bool {img} {self.cu(0)}")
+        self.emit(f"{ok} = OpLogicalAnd %bool {tag_ok} {img_ok}")
+        raw, idx, sampled, storage, storage_hi, both, kind = (self.tmp() for _ in range(7))
+        self.emit(f"{raw} = OpBitwiseAnd %uint {w6} {self.cu(0xFFFF)}")
+        self.emit(f"{idx} = OpSelect %uint {ok} {raw} {self.cu(0)}")
+        self.emit(f"{sampled} = OpBitFieldUExtract %uint {w6} {self.cu(16)} {self.cu(7)}")
+        self.emit(f"{storage} = OpBitFieldUExtract %uint {w6} {self.cu(23)} {self.cu(5)}")
+        self.emit(f"{storage_hi} = OpShiftLeftLogical %uint {storage} {self.cu(DESC_STORAGE_BIT)}")
+        self.emit(f"{both} = OpBitwiseOr %uint {sampled} {storage_hi}")
+        self.emit(f"{kind} = OpSelect %uint {ok} {both} {self.cu(0)}")
+        return idx, kind, ok
+
+    def desc_uniform(self, idx, kind):
+        """The index (and the kind, or None) made explicitly uniform, as the hash lookup's result always was."""
         if self.emulate:
             return idx, kind
         if self.wave32_fragment:
             # Each 32-lane half of a wider subgroup is its own wave with its own SGPRs: broadcast from the half's
             # first running lane, as OpGroupNonUniformBroadcastFirst does for the whole subgroup below.
+            first = self.wave32_first_running_lane()
             b = self.tmp()
-            self.g_shuffle(b, idx, self.wave32_first_running_lane())
+            self.g_shuffle(b, idx, first)
             if kind is not None:
                 k = self.tmp()
-                self.g_shuffle(k, kind, self.wave32_first_running_lane())
+                self.g_shuffle(k, kind, first)
                 kind = k
             return b, kind
         # The descriptor words are SGPRs, so the index is the same in every invocation of the subgroup; the
@@ -13929,6 +14580,52 @@ class Gen:
         self.image_read_typed(dim, self.sgpr_word(a[2], 1), img, img_idx,
                               0xf, vdata, d16, gather_mip)
 
+    def tsharp_index_sgpr(self, a):
+        """(index, kind) of the current instruction's T# operand `a` when the dataflow showed its dword 6 is a heap
+        slot's (Gen.tsharp_from_heap, tools/descriptor_sources.py), else None."""
+        ins = self.cur_ins
+        if ins is None or not self.tsharp_from_heap.get(id(ins)):
+            return None
+        regs = descriptor_sources.tsharp_operand(ins)
+        if regs is None or tuple(regs) != self.tsharp_regs(a):
+            return None
+        self.uses_tex = True      # set 0's image arrays, which the index reads, as desc_lookup declares them
+        idx, kind, _ = self.tsharp_index_word(self.sgpr_words(a, 8))
+        self.tsharp_index_reads += 1
+        return self.desc_uniform(idx, kind)
+
+    def literal_sampler_lookup(self, a, slot):
+        """Sampler bindless index for compile-time literal S# `slot`: when OpSpecConstant %lit_smp_<slot> is
+        specialized (!= 0xFFFFFFFF), use it directly without probing %desc_map; when unspecialized (0xFFFFFFFF),
+        fall back to the existing bindless hash-table probe."""
+        self.uses_tex = True
+        self.uses_lit_sampler_spec = True
+        spec_id = f"%lit_smp_{slot}"
+        use_spec = self.tmp()
+        self.emit(f"{use_spec} = OpINotEqual %bool {spec_id} {self.cu(0xFFFFFFFF)}")
+        pre = self.current_label_placeholder()
+        lbl_probe, lbl_end = self.tmp() + "_sprobe", self.tmp() + "_send"
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {use_spec} {lbl_end} {lbl_probe}")
+        self.emit(f"{lbl_probe} = OpLabel")
+        words = self.sgpr_words(a, 4) + [self.cu(0xFFFFFFFF)] * 4
+        probe_idx, _ = self.desc_lookup(words, uniform=False)
+        probe_exit = self.current_label_placeholder()
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        out = self.tmp()
+        self.emit(f"{out} = OpPhi %uint {spec_id} {pre} {probe_idx} {probe_exit}")
+        return self.desc_uniform(out, None)
+
+    def _literal_sampler_slot(self, a):
+        if not self.literal_sampler_index:
+            return None
+        words = self.literal_sampler_sites.get(id(self.cur_ins)) if self.cur_ins is not None else None
+        if words is None and a["k"] == "sgpr" and a.get("n", 1) >= 4:
+            if all((a["r"] + i) in self.sgpr_imm for i in range(4)):
+                words = tuple(self.sgpr_imm[a["r"] + i] & 0xFFFFFFFF for i in range(4))
+        return self.literal_sampler_index.get(words) if words is not None else None
+
     def desc_lookup_sgpr(self, a, n):
         """desc_lookup for an SGPR descriptor range (n=8: T#, n=4: S#), cached for the rest of the basic block.
 
@@ -13937,12 +14634,25 @@ class Gen:
         array go through store_reg, including the 64-bit ones, which are two calls, s_load results,
         v_readlane/v_readfirstlane results and the spare slots lane masks are parked in) and cleared when a basic
         block starts. Only lookups made at the block's top level are remembered, see desc_cache_ok. Returns
-        (bindless index, kind), kind being None with --descriptor-table plain."""
+        (bindless index, kind), kind being None with --descriptor-table plain.
+
+        A T# (n=8) whose dword 6 the dataflow traced to a heap slot takes its index from that word alone
+        (tsharp_index_sgpr). Any other T# is looked up, and the dword-6 index wins where the word carries it: such a
+        T# may still come from a heap the layer writes, along a path the dataflow did not follow, and there its words
+        are not the key the table holds (the key is the descriptor as the title wrote it)."""
+        if n == 8:
+            direct = self.tsharp_index_sgpr(a)
+            if direct is not None:
+                return direct
         if a["k"] == "slist" and len(a["r"]) >= n:
+            if n == 4:
+                slot = self._literal_sampler_slot(a)
+                if slot is not None:
+                    return self.literal_sampler_lookup(a, slot)
             words = self.sgpr_words(a, n)
             if n < 8:
                 words = words + [self.cu(0xFFFFFFFF)] * (8 - n)
-            return self.desc_lookup(words)
+            return self.desc_lookup(words) if n < 8 else self.tsharp_lookup(words)
         if a["k"] != "sgpr" or a.get("n", 1) < n:
             raise Unsupported("descriptor operand")
         key = (a["r"], n)
@@ -13950,13 +14660,42 @@ class Gen:
         if hit is not None:
             return hit
         top = self.desc_cache_ok()
+        if n == 4:
+            slot = self._literal_sampler_slot(a)
+            if slot is not None:
+                idx = self.literal_sampler_lookup(a, slot)
+                if top:
+                    self.desc_cache[key] = idx
+                return idx
         words = self.sgpr_words(a, n)
         if n < 8:
             words = words + [self.cu(0xFFFFFFFF)] * (8 - n)
-        idx = self.desc_lookup(words)
+        idx = self.desc_lookup(words) if n < 8 else self.tsharp_lookup(words)
         if top:
             self.desc_cache[key] = idx
         return idx
+
+    def tsharp_lookup(self, words):
+        """A T# of unknown source: its dword-6 index where the word carries one, else the hash table's answer for its
+        words. The lookup sits in the branch taken only without the word: `ok` comes from SGPRs, so the branch is
+        uniform, and a T# from a heap the layer writes, along a path the dataflow did not follow, costs no probe."""
+        self.tsharp_lookups += 1
+        direct, direct_kind, ok = self.tsharp_index_word(words)
+        pre = self.current_label_placeholder()
+        probe, end = self.tmp() + "_probe", self.tmp() + "_tsharp"
+        self.emit(f"OpSelectionMerge {end} None")
+        self.emit(f"OpBranchConditional {ok} {end} {probe}")
+        self.emit(f"{probe} = OpLabel")
+        idx, kind = self.desc_lookup(words, uniform=False)
+        self.emit(f"OpBranch {end}")
+        self.emit(f"{end} = OpLabel")
+        out = self.tmp()
+        self.emit(f"{out} = OpPhi %uint {direct} {pre} {idx} {probe}")
+        out_kind = None
+        if kind is not None:
+            out_kind = self.tmp()
+            self.emit(f"{out_kind} = OpPhi %uint {direct_kind} {pre} {kind} {probe}")
+        return self.desc_uniform(out, out_kind)
 
     # The dimension of an instruction's image array, indexed by STORE_DIMS' index (0 2D, 1 2D array, 2 3D, 3 1D).
     # A cube instruction reads the 2D-array binding: a cube is six layers of a 2D array.
@@ -14434,26 +15173,36 @@ class Gen:
                 self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
             lod = f[ncoord] if kind == "_l" and len(f) > ncoord else "%f0"
             if typed_sample:
+                float_only = self._is_float_only_image_op(op, a, mods)
                 # The aliases image_read_typed declares are indexed by the dimension it reads: a cube samples its
                 # 6-layer 2D-array view, which is what `img` was loaded from above.
                 di = self.STORE_DIMS[view_dim][0]
-                operands = f"Lod {lod}"
-                if typed_implicit:
-                    # Compute the quad gradients before the per-image format branch.
-                    dx, dy = self.tmp(), self.tmp()
-                    self.emit(f"{dx} = OpDPdx %v2float {uv}")
-                    self.emit(f"{dy} = OpDPdy %v2float {uv}")
-                    operands = f"Grad {dx} {dy}"
+                if typed_implicit and float_only:
+                    def sample(image, cls, ty):
+                        sampled = sampled_image(image, cls, di)
+                        result = self.tmp()
+                        self.emit(f"{result} = OpImageSampleImplicitLod {ty} {sampled} {uv}")
+                        return result
+                else:
+                    operands = f"Lod {lod}"
+                    if typed_implicit:
+                        # Compute the quad gradients before the per-image format branch.
+                        dx, dy = self.tmp(), self.tmp()
+                        self.emit(f"{dx} = OpDPdx %v2float {uv}")
+                        self.emit(f"{dy} = OpDPdy %v2float {uv}")
+                        operands = f"Grad {dx} {dy}"
 
-                def sample(image, cls, ty):
-                    sampled = sampled_image(image, cls, di)
-                    result = self.tmp()
-                    self.emit(f"{result} = OpImageSampleExplicitLod {ty} {sampled} {uv} {operands}")
-                    return result
+                    def sample(image, cls, ty):
+                        sampled = sampled_image(image, cls, di)
+                        result = self.tmp()
+                        self.emit(f"{result} = OpImageSampleExplicitLod {ty} {sampled} {uv} {operands}")
+                        return result
 
-                self.uses_int_sampler = True
-                self.image_read_typed(view_dim, self.sgpr_word(a[2], 1), img, img_idx,
-                                      dmask, vdata, d16, sample)
+                if not float_only:
+                    self.uses_int_sampler = True
+                t1 = self.sgpr_word(a[2], 1) if (d16 or not float_only) else None
+                self.image_read_typed(view_dim, t1, img, img_idx,
+                                      dmask, vdata, d16, sample, float_only=float_only)
                 return
             res = self.tmp()
             if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz", "_c", "_c_b"):
@@ -14709,15 +15458,40 @@ class Gen:
         self.emit(f"{result} = OpPhi {ty} {texel} {body} {zero} {miss}")
         return result
 
+    def _is_float_only_image_op(self, op, a=None, mods=()):
+        """Whether the current image op is provably float-only so uint/sint runtime branches can be elided.
+
+        True when either:
+        1. CFG consumer analysis (float_only_image_ops) proved every reachable consumer of its destination VGPRs
+           interprets them strictly as floating-point (f32, or f16 under d16), with at least one float consumer.
+        2. It is a filtered image_sample* whose compile-time literal S# word 2 enables bilinear/aniso XY filtering
+           or linear mip filtering (undefined on integer formats in Vulkan and RDNA2)."""
+        if self.cur_ins is not None and id(self.cur_ins) in self.float_only_images:
+            return True
+        if op in ("image_sample", "image_sample_l", "image_sample_lz") and a is not None and len(a) >= 4:
+            w2 = None
+            if self.cur_ins is not None and id(self.cur_ins) in self.literal_sampler_sites:
+                w2 = self.literal_sampler_sites[id(self.cur_ins)][2]
+            elif a[3]["k"] == "sgpr" and a[3].get("n", 1) >= 4:
+                w2 = self.sgpr_imm.get(a[3]["r"] + 2)
+            if w2 is not None:
+                mag = (w2 >> 20) & 3
+                min_f = (w2 >> 22) & 3
+                mip = (w2 >> 26) & 3
+                if mag in (1, 3) or min_f in (1, 3) or mip == 2:
+                    return True
+        return False
+
     def image_load_typed(self, dim, tsharp, iv, img, idx, dmask, vdata, *, lod, d16=False):
         """Supply the fetch to the shared typed-image dispatch used by both loads and gathers."""
-        t1 = self.sgpr_word(tsharp, 1)
+        float_only = self._is_float_only_image_op("image_load")
         di = self.STORE_DIMS[dim][0]
         volume = self.synthetic_uav(tsharp) if di == 2 else None
         atomic_read = (volume is not None and self.tsharp_regs(tsharp) in self.atomic_volume_tsharps and
                        lod == self.cu(0))
         if img is None:
             return self.image_load_storage(dim, tsharp, iv, idx, dmask, vdata, d16)
+        t1 = self.sgpr_word(tsharp, 1) if (d16 or atomic_read or not float_only) else None
 
         def fetch(image, cls, ty):
             if cls != 1 or not atomic_read:
@@ -14748,7 +15522,8 @@ class Gen:
             self.emit(f"{result} = OpPhi {ty} {raw} {storage} {texel} {fetch_done}")
             return result
 
-        self.image_read_typed(dim, t1, img, idx, dmask, vdata, d16, fetch)
+        self.image_read_typed(dim, t1, img, idx, dmask, vdata, d16, fetch,
+                              float_only=float_only)
 
     def image_load_coherent(self, dim, tsharp, iv, idx, dmask, vdata, d16):
         """image_load with glc: a coherent read. On GFX10 a device-scope load is glc + dlc and a device-scope store
@@ -14788,16 +15563,46 @@ class Gen:
             res = self.tmp()
             self.emit(f"{res} = OpImageRead {ty} {image} {iv}")
             return res
-        self.image_read_typed(dim, self.sgpr_word(tsharp, 1), None, idx, dmask, vdata, d16, read, view)
+        float_only = self._is_float_only_image_op("image_load")
+        t1 = self.sgpr_word(tsharp, 1) if (d16 or not float_only) else None
+        self.image_read_typed(dim, t1, None, idx, dmask, vdata, d16, read, view,
+                              float_only=float_only)
 
-    def image_read_typed(self, dim, t1, img, idx, dmask, vdata, d16, read, view=None):
+    def image_read_typed(self, dim, t1, img, idx, dmask, vdata, d16, read, view=None, float_only=False):
         """Read an image using the component type selected by FORMAT in T# word 1.
         read(image, cls, ty) emits the fetch or gather and returns its four components. The float view also
         handles a lookup miss: index zero holds the RGBA8_UNORM fallback. view(cls) loads the image of class cls
         (0 float, 1 uint, 2 sint); by default the sampled image img for float and, for UINT and SINT, typed aliases
         of the dimension's sampled binding (SHADER-151), so no storage image feature is needed.
+        When `float_only` is True, the dead uint/sint branches, format-mask lookups and typed alias arrays are elided.
         dmask selects the output components; d16 packs two per VGPR."""
         di = self.STORE_DIMS[dim][0]
+        if float_only:
+            if d16:
+                self.uses_d16_image = True
+            is_norm_fmt, is_f32_fmt = self.fmt_float_flags(t1) if d16 else (None, None)
+            texel = read(view(0) if view is not None else img, 0, "%v4float")
+            xs = []
+            for c in range(4):
+                if dmask >> c & 1:
+                    comp = self.tmp()
+                    self.emit(f"{comp} = OpCompositeExtract %float {texel} {c}")
+                    xs.append(self.tou(comp))
+            if not d16:
+                for k, x in enumerate(xs):
+                    self.dst({"k": "vgpr", "r": vdata["r"] + k, "n": 1}, x)
+                return
+            for i in range(0, len(xs), 2):
+                dest = {"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}
+                if i + 1 == len(xs):
+                    self.write_lo16(dest, self.d16_norm_f16(xs[i], is_norm_fmt, is_f32_fmt))
+                    continue
+                hi_s, w = self.tmp(), self.tmp()
+                self.emit(f"{hi_s} = OpShiftLeftLogical %uint "
+                          f"{self.d16_norm_f16(xs[i + 1], is_norm_fmt, is_f32_fmt)} {self.cu(16)}")
+                self.emit(f"{w} = OpBitwiseOr %uint {self.d16_norm_f16(xs[i], is_norm_fmt, is_f32_fmt)} {hi_s}")
+                self.dst(dest, w)
+            return
         if view is None:
             self.uses_int_fetch.add(di)
 
@@ -16515,6 +17320,7 @@ def assemble(gen):
         ["%fmt_norm_mask", "%fmt_f32_mask"] if gen.uses_d16_image else []) + \
         (["%fmt_size_tab"] if gen.uses_fmt_size else []) + \
         (["%fmt_desc_tab", "%fmt_norm_rep_tab"] if gen.uses_fmt_tables else []) + \
+        (["%fmt_enc_desc_tab"] if gen.uses_fmt_enc_table else []) + \
         [f"%stv{c}_{d}" for d in sorted(store_dims) for c in range(3)] + \
         [f"%itx{c}_{d}" for d in sorted(gen.uses_int_fetch) for c in (1, 2)]
     psb = gen.uses_psb
@@ -16578,6 +17384,8 @@ def assemble(gen):
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformArithmetic") if c not in caps]
     if gen.uses_quad:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformQuad") if c not in caps]
+    if gen.uses_int_dot:
+        caps += ["DotProductKHR", "DotProductInput4x8BitPackedKHR"]   # shaderIntegerDotProduct
     if gen.uses_f64:
         caps.append("Float64")
     if gen.uses_fma_khr:
@@ -16617,8 +17425,12 @@ def assemble(gen):
         # Core in SPIR-V 1.4, so no extension at vulkan1.2; the runtime checks the properties in "float_controls"
         # (shaderSignedZeroInfNanPreserveFloat64 too for a module that uses Float64, SHADER-597).
         caps += ["SignedZeroInfNanPreserve", "DenormPreserve"]
+        if gen.ftz32:
+            caps.append("DenormFlushToZero")
     pops = gen.uses_pops and gen.stage == "ps"
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
+    if gen.uses_int_dot:
+        exts.append("SPV_KHR_integer_dot_product")
     if gen.uses_fma_khr:
         exts.append("SPV_KHR_fma")
     if gen.uses_clock:
@@ -16630,9 +17442,13 @@ def assemble(gen):
     if pops:
         caps.append("FragmentShaderPixelInterlockEXT")
         exts.append("SPV_EXT_fragment_shader_interlock")
+    if gen.uses_vmm:
+        caps += ["VulkanMemoryModel", "VulkanMemoryModelDeviceScope"]
+        exts.append("SPV_KHR_vulkan_memory_model")
+        gen.cu(1)
     hdr = [f"OpCapability {c}" for c in caps] + [f'OpExtension "{e}"' for e in exts] + \
           ['%glsl = OpExtInstImport "GLSL.std.450"',
-           f"OpMemoryModel {'PhysicalStorageBuffer64' if psb else 'Logical'} GLSL450",
+           f"OpMemoryModel {'PhysicalStorageBuffer64' if psb else 'Logical'} {'Vulkan' if gen.uses_vmm else 'GLSL450'}",
            f"OpEntryPoint {model} %main \"main\" {' '.join(iface)}"]
     if cs:
         hdr.append("OpExecutionMode %main LocalSize {} {} {}".format(*gen.cs["size"]))
@@ -16659,6 +17475,8 @@ def assemble(gen):
             # in modules that declare Float64; --no-float-controls leaves it out with the other modes.
             hdr.append("OpExecutionMode %main SignedZeroInfNanPreserve 64")
         hdr.append("OpExecutionMode %main DenormPreserve 16")
+        if gen.ftz32:
+            hdr.append("OpExecutionMode %main DenormFlushToZero 32")
     dec = []
     if vs:
         dec.append("OpDecorate %vertex_index BuiltIn VertexIndex")
@@ -16747,6 +17565,28 @@ def assemble(gen):
                   "%rt_uint = OpTypeRuntimeArray %uint", "%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint",
                   "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint"]
         dec.append("OpDecorate %rt_uint ArrayStride 4")
+        if gen.uses_psb_scalar_ro:
+            types += ["%sl_blk1 = OpTypeStruct %uint",
+                      "%_ptr_PSB_sl_blk1 = OpTypePointer PhysicalStorageBuffer %sl_blk1"]
+            dec += ["OpDecorate %sl_blk1 Block", "OpMemberDecorate %sl_blk1 0 Offset 0",
+                    "OpMemberDecorate %sl_blk1 0 NonWritable"]
+        if gen.uses_psb_vec or gen.uses_psb_vec_rw:  # dedupe_types merges these with any other uvec2 / uvec4
+            types += ["%v2uint_sl = OpTypeVector %uint 2", "%v4uint_sl = OpTypeVector %uint 4",
+                      "%_ptr_PSB_v2uint_sl = OpTypePointer PhysicalStorageBuffer %v2uint_sl",
+                      "%_ptr_PSB_v4uint_sl = OpTypePointer PhysicalStorageBuffer %v4uint_sl"]
+        if gen.uses_psb_vec:
+            types += ["%sl_blk2 = OpTypeStruct %v2uint_sl", "%sl_blk4 = OpTypeStruct %v4uint_sl",
+                      "%_ptr_PSB_sl_blk2 = OpTypePointer PhysicalStorageBuffer %sl_blk2",
+                      "%_ptr_PSB_sl_blk4 = OpTypePointer PhysicalStorageBuffer %sl_blk4"]
+            for blk in ("%sl_blk2", "%sl_blk4"):
+                dec += [f"OpDecorate {blk} Block", f"OpMemberDecorate {blk} 0 Offset 0",
+                        f"OpMemberDecorate {blk} 0 NonWritable"]
+        if gen.uses_psb_vec_rw:
+            types += ["%sl_rw_blk2 = OpTypeStruct %v2uint_sl", "%sl_rw_blk4 = OpTypeStruct %v4uint_sl",
+                      "%_ptr_PSB_sl_rw_blk2 = OpTypePointer PhysicalStorageBuffer %sl_rw_blk2",
+                      "%_ptr_PSB_sl_rw_blk4 = OpTypePointer PhysicalStorageBuffer %sl_rw_blk4"]
+            for blk in ("%sl_rw_blk2", "%sl_rw_blk4"):
+                dec += [f"OpDecorate {blk} Block", f"OpMemberDecorate {blk} 0 Offset 0"]
         types += [f"{name} = OpConstant %ulong {v}" for v, name in sorted(gen.lconsts.items())]
     if tex:
         # Bindless set 0: images (binding 0), samplers (binding 1), descriptor hash table (binding 2).
@@ -16824,14 +17664,27 @@ def assemble(gen):
     if gen.uses_fmt_tables:
         gen.cu(128)
         gen.cu(17)
-    if gen.uses_store_views or gen.uses_int_fetch:
+    if gen.uses_fmt_enc_table:
+        gen.cu(128)
+        for v in Gen.fmt_enc_desc_table():
+            gen.cu(v)
+    if store_dims or gen.uses_int_fetch or gen.uses_d16_image:
         gen.cu(16)
+    if store_dims or gen.uses_int_fetch:
         for words in Gen.int_format_masks():
+            for w in words:
+                gen.cu(w)
+    if gen.uses_d16_image:
+        for words in Gen.float_format_masks():
             for w in words:
                 gen.cu(w)
     gen.consts.setdefault(0, "%c0")
     for v, name in sorted(gen.consts.items()):
         types.append(f"{name} = OpConstant %uint {v}")
+    if gen.uses_lit_sampler_spec and gen.literal_samplers:
+        for i in range(len(gen.literal_samplers)):
+            dec.append(f"OpDecorate %lit_smp_{i} SpecId {i}")
+            types.append(f"%lit_smp_{i} = OpSpecConstant %uint 4294967295")
     # fconst's floats (%f0 and %f1 are declared with the types above).
     types += [f"{name} = OpConstant %float {float_literal(v)}" for v, name in sorted(gen.fconsts.items())
               if v not in (0, 0x3F800000)]
@@ -16851,6 +17704,11 @@ def assemble(gen):
         # --address-guard: (heap_base, on, limit, table, offset, delta, sink) -> host address; no other function
         # type of the module has this signature.
         types.append("%fn_guard = OpTypeFunction %ulong %ulong %bool %ulong %ulong %ulong %ulong %ulong")
+    for n in sorted({k[0] for k in gen.sbuf_slow_fns}):
+        types += [f"%arr_sbuf_x{n} = OpTypeArray %uint {gen.cu(n)}",
+                  f"%_ptr_Function_arr_sbuf_x{n} = OpTypePointer Function %arr_sbuf_x{n}",
+                  f"%null_sbuf_x{n} = OpConstantNull %arr_sbuf_x{n}",
+                  f"%fn_sbuf_slow_x{n} = OpTypeFunction %arr_sbuf_x{n} %ulong %ulong %ulong"]
     if gen.fmt_fn or gen.fmt_enc_fn:
         types.append("%v4uint_fmt = OpTypeVector %uint 4")      # dedupe_types merges it with any other uvec4
     if gen.fmt_fn:
@@ -16859,6 +17717,7 @@ def assemble(gen):
         types.append("%fn_fmt_dec = OpTypeFunction %uint %uint %v4uint_fmt %uint")
         types.append("%fn_fmt_norm = OpTypeFunction %uint %uint %uint")
     if gen.fmt_enc_fn:
+        types.append("%fn_fmt_enc_chan = OpTypeFunction %uint %uint %uint %uint %bool")
         types.append("%fn_fmt_encode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 29))
     for arity, fn_type in sorted(gen.x_round_fn_types.items()):
         types.append(f"{fn_type} = OpTypeFunction %uint " + " ".join(["%uint"] * arity))
@@ -16921,6 +17780,13 @@ def assemble(gen):
                      " ".join(gen.lconsts[v] for v in Gen.fmt_norm_reps()))
         gvars += ["%fmt_desc_tab = OpVariable %_ptr_Private_fmt_desc Private %fmt_desc_init",
                   "%fmt_norm_rep_tab = OpVariable %_ptr_Private_fmt_rep Private %fmt_norm_rep_init"]
+    if gen.uses_fmt_enc_table:
+        types += [f"%fmt_enc_desc_arr = OpTypeArray %uint {gen.cu(128)}",
+                  "%_ptr_Private_fmt_enc_desc = OpTypePointer Private %fmt_enc_desc_arr",
+                  "%_ptr_Private_fmt_enc_elem = OpTypePointer Private %uint"]
+        types.append("%fmt_enc_desc_init = OpConstantComposite %fmt_enc_desc_arr " +
+                     " ".join(gen.consts[v] for v in Gen.fmt_enc_desc_table()))
+        gvars += ["%fmt_enc_desc_tab = OpVariable %_ptr_Private_fmt_enc_desc Private %fmt_enc_desc_init"]
     if store_dims or gen.uses_int_fetch or gen.uses_d16_image:
         u, si = Gen.int_format_masks()
         types += ["%v4uint_st = OpTypeVector %uint 4", "%v4int_st = OpTypeVector %int 4",
@@ -16928,9 +17794,12 @@ def assemble(gen):
                   f"%fmt_mask_arr = OpTypeArray %uint {gen.cu(16)}",
                   "%_ptr_Private_fmt = OpTypePointer Private %fmt_mask_arr",
                   "%_ptr_Private_uint = OpTypePointer Private %uint"]
-        for nm, words in (("uint", u), ("sint", si)) + (
-                (("norm", Gen.float_format_masks()[0]), ("f32", Gen.float_format_masks()[1]))
-                if gen.uses_d16_image else ()):
+        mask_tables = ()
+        if store_dims or gen.uses_int_fetch:
+            mask_tables += (("uint", u), ("sint", si))
+        if gen.uses_d16_image:
+            mask_tables += (("norm", Gen.float_format_masks()[0]), ("f32", Gen.float_format_masks()[1]))
+        for nm, words in mask_tables:
             ids = " ".join(gen.cu(w) for w in words)
             types += [f"%fmt_{nm}_init = OpConstantComposite %fmt_mask_arr {ids}"]
             gvars += [f"%fmt_{nm}_mask = OpVariable %_ptr_Private_fmt Private %fmt_{nm}_init"]
@@ -16959,7 +17828,7 @@ def assemble(gen):
                           f"%_ptr_UC_rt_stv{cls}_{di} = OpTypePointer UniformConstant %rt_stv{cls}_{di}",
                           f"%_ptr_UC_stv{cls}_{di} = OpTypePointer UniformConstant %stimg{cls}_{di}"]
                 dec += [f"OpDecorate %stv{cls}_{di} DescriptorSet 0", f"OpDecorate %stv{cls}_{di} Binding {base + cls}"]
-                if gen.coherent_images:
+                if gen.coherent_images and not gen.uses_vmm:
                     dec.append(f"OpDecorate %stv{cls}_{di} Coherent")
                 gvars += [f"%stv{cls}_{di} = OpVariable %_ptr_UC_rt_stv{cls}_{di} UniformConstant"]
     if gsx:
@@ -17286,6 +18155,8 @@ def assemble(gen):
         helpers.extend(function)
     for function in gen.x_round_fns.values():
         helpers.extend(function)
+    for key in sorted(gen.sbuf_slow_fns):
+        helpers.extend(gen.sbuf_slow_fns[key])
     tree, nesting = (capped_tree(gen.succ, gen.out_pcs) if gen.blocks and not gen.emulate and not gen.bar_rounds
                      else (None, None))
     if nesting is not None:
@@ -17545,10 +18416,56 @@ def assemble(gen):
         tail = end_lock + "         OpReturn\n         OpFunctionEnd\n"
     if serial_close:
         gen.body = list(gen.body) + [("         " + l if " = OpLabel" not in l else l) for l in serial_close]
+    if gen.uses_vmm and gen.coherent_images:
+        # VulkanMemoryModel bans the Coherent decoration; use per-op MakeTexelVisible/Available|NonPrivateTexel.
+        c1 = gen.cu(1)
+        def _vmm_texel(line):
+            s = line.strip()
+            if " = OpImageRead " in s and len(s.split()) == 6:
+                return line + f" MakeTexelVisible|NonPrivateTexel {c1}"
+            if s.startswith("OpImageWrite ") and len(s.split()) == 4:
+                return line + f" MakeTexelAvailable|NonPrivateTexel {c1}"
+            return line
+        out = [_vmm_texel(l) for l in out]
+        gen.body = [_vmm_texel(l) for l in gen.body]
     insert_late_constants(gen, out, written)
-    return split_big_switch(no_contraction(dedupe_types(
+    assembled = dedupe_types(
         "\n".join("         " + l if not l.startswith("%") or " = " not in l else l for l in out) +
-        "\n" + "\n".join(gen.body) + "\n" + tail)))
+        "\n" + "\n".join(gen.body) + "\n" + tail)
+    if gen.scalar_load_ro is None:
+        assembled = scalar_loads_read_only(assembled)
+    return split_big_switch(no_contraction(assembled))
+
+
+_PSB_POINTER_TYPE = re.compile(r"(?m)^\s*(%[\w.]+) = OpTypePointer PhysicalStorageBuffer ")
+_RESULT_OF_TYPE = re.compile(r"(?m)^\s*(%[\w.]+) = Op\w+ (%[\w.]+)")
+_MEMORY_WRITE = re.compile(r"(?m)^\s*(?:(?:%[\w.]+ = )?(OpStore|OpAtomic\w+|OpCopyMemory\w*)\b(.*)|.*\b(OpImageWrite|"
+                           r"OpImageTexelPointer)\b.*)$")
+
+
+def scalar_loads_read_only(text):
+    """Keep scalar_load's NonWritable loads (%sl_blk1 / %sl_blk2 / %sl_blk4) only in a module that writes no memory.
+
+    NonWritable lets the driver read them as SMEM (RADV: one s_load_b512 for an s_buffer_load_dwordx16), but also
+    lets it order them freely against the module's own stores, and an s_load / s_buffer_load sees what the same
+    program stored before it (docs/design.md, Scalar/buffer memory; tools/valu_fuzz.py --family mem stores and then
+    loads it back, and RADV read the old words in 18 of 600 programs with the decoration). A module with no store,
+    atomic or image write to any memory can't reach that: nothing this dispatch runs writes what it reads."""
+    if "OpMemberDecorate %sl_blk" not in text:
+        return text
+    ptr_types = set(_PSB_POINTER_TYPE.findall(text))
+    pointers = {r for r, t in _RESULT_OF_TYPE.findall(text) if t in ptr_types}
+    for m in _MEMORY_WRITE.finditer(text):
+        if m.group(3):
+            break                                   # an image write or texel pointer: treat as a write
+        op, rest = m.group(1), m.group(2).split()
+        target = rest[0] if op in ("OpStore", "OpAtomicStore") or op.startswith("OpCopyMemory") else (
+            rest[1] if len(rest) > 1 else None)       # OpAtomicX %type %pointer ...
+        if target in pointers or op.startswith("OpCopyMemory"):
+            break
+    else:
+        return text
+    return re.sub(r"(?m)^\s*OpMemberDecorate %sl_blk[124] 0 NonWritable\n", "", text)
 
 
 # SPIR-V caps an instruction at 65,535 words. The dispatch loop's OpSwitch has one (literal, label) pair per block,
@@ -17664,7 +18581,7 @@ def halves_analysis(g, blocks, succ):
     for slot in g.w64g.get("scalar_spills", ()):
         if slot not in g.parked:
             g.parked[slot] = g.SGPRS + len(g.parked)
-        g.w64_scalar_spills.add(slot)
+        g.scalar_spills.add(slot)
     W64G_COUNTS[g.w64g["tier"]] += 1
     if g.w64g["tier"] == "C" and WAVE64_GRAPHICS == "error":
         raise Unsupported("wave64 graphics tier C: " + ", ".join(g.w64g["reasons"]))
@@ -17817,6 +18734,338 @@ DST_ALSO_READ = ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v
 # All VGPR operands of these instructions are sources, including store address and data ranges.
 VGPR_READ_ONLY_PREFIXES = ("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "ds_write",
                            "global_store", "flat_store", "scratch_store")
+
+
+_FLOAT_ONLY_IMAGE_OPS = frozenset({"image_load", "image_load_mip", "image_sample", "image_sample_l", "image_sample_lz"})
+
+# VALU ops whose VGPR source operands are strictly IEEE binary32 float (never raw integer/bitfield ops).
+_F32_ONLY_CONSUMERS = frozenset({
+    "v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_mul_legacy_f32",
+    "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f32", "v_fma_f32", "v_fma_legacy_f32",
+    "v_fmaak_f32", "v_fmamk_f32", "v_mad_f32", "v_mad_legacy_f32", "v_madak_f32", "v_madmk_f32",
+    "v_min_f32", "v_max_f32", "v_min3_f32", "v_max3_f32", "v_med3_f32",
+    "v_rcp_f32", "v_rcp_iflag_f32", "v_rsq_f32", "v_sqrt_f32",
+    "v_log_f32", "v_exp_f32", "v_sin_f32", "v_cos_f32", "v_floor_f32", "v_ceil_f32", "v_trunc_f32",
+    "v_rndne_f32", "v_fract_f32", "v_cvt_f16_f32", "v_cvt_pkrtz_f16_f32", "v_cvt_pknorm_i16_f32",
+    "v_cvt_pknorm_u16_f32", "v_cvt_u32_f32", "v_cvt_i32_f32", "v_cvt_f64_f32",
+    "v_cvt_rpi_i32_f32", "v_cvt_flr_i32_f32", "v_frexp_mant_f32", "v_frexp_exp_i32_f32",
+    "v_cubema_f32", "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32",
+    "v_div_fixup_f32", "v_div_fmas_f32", "v_div_scale_f32",
+})
+
+# VALU ops whose VGPR source operands are strictly IEEE binary16 float (packed or scalar f16).
+_F16_ONLY_CONSUMERS = frozenset({
+    "v_add_f16", "v_sub_f16", "v_subrev_f16", "v_mul_f16",
+    "v_fma_f16", "v_fmac_f16", "v_fmaak_f16", "v_fmamk_f16",
+    "v_min_f16", "v_max_f16", "v_min3_f16", "v_max3_f16", "v_med3_f16",
+    "v_rcp_f16", "v_rsq_f16", "v_sqrt_f16",
+    "v_log_f16", "v_exp_f16", "v_sin_f16", "v_cos_f16", "v_floor_f16", "v_ceil_f16",
+    "v_trunc_f16", "v_rndne_f16", "v_fract_f16",
+    "v_pk_add_f16", "v_pk_mul_f16", "v_pk_fma_f16", "v_pk_fmac_f16", "v_pk_min_f16", "v_pk_max_f16",
+    "v_cvt_f32_f16", "v_cvt_u16_f16", "v_cvt_i16_f16",
+    "v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16", "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16",
+    "v_div_fixup_f16", "v_frexp_mant_f16", "v_frexp_exp_i16_f16",
+})
+
+
+def _arg_vgprs(arg):
+    """Set of VGPR indices named by a single parsed operand."""
+    if arg["k"] == "vgpr":
+        return set(range(arg["r"], arg["r"] + arg.get("n", 1)))
+    if arg["k"] == "vlist":
+        return set(arg["r"])
+    return set()
+
+
+def _is_ds_dst_only(bop):
+    """Whether a DS op has a pure VGPR destination in a[0] (does not read a[0] as an address/data source)."""
+    return (bop.startswith(("ds_read", "ds_swizzle", "ds_permute", "ds_bpermute", "ds_append", "ds_consume"))
+            or "_rtn" in bop)
+
+
+def _permlane_preserves_dst(bop, mods):
+    """Whether v_permlane16_b32 / v_permlanex16_b32 may preserve vdst (FI=0 and BOUND_CTRL=0)."""
+    if bop not in ("v_permlane16_b32", "v_permlanex16_b32"):
+        return False
+    if "fi:1" in mods or "bound_ctrl:1" in mods:
+        return False
+    sel = next((m for m in mods if m.startswith("op_sel:")), None)
+    if sel is not None:
+        try:
+            bits = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")]
+        except (IndexError, ValueError):
+            return True
+        if (len(bits) >= 1 and bits[0]) or (len(bits) >= 2 and bits[1]):
+            return False
+    return True
+
+
+def _vgpr_reads_of(ins):
+    """Set of VGPR indices read by instruction `ins` (matches read_before_write_vgprs + atomics/DS)."""
+    a, op = ins["args"], ins["op"]
+    if not a:
+        return set()
+    bop = base_op(op)
+    mods = ins.get("mods", ())
+    reads_all = (op.startswith(VGPR_READ_ONLY_PREFIXES)
+                 or bop.startswith(("buffer_atomic_", "image_atomic_", "flat_atomic_", "global_atomic_"))
+                 or (bop.startswith(("buffer_load", "tbuffer_load")) and "lds" in mods)
+                 or (bop.startswith("ds_") and not _is_ds_dst_only(bop)))
+    regs = set()
+    for x in (a if reads_all or sdwa_reads_dst(op, mods) else a[1:]):
+        if x["k"] == "vgpr":
+            regs.update(range(x["r"], x["r"] + x.get("n", 1)))
+        elif x["k"] == "vlist":
+            regs.update(x["r"])
+    if (bop in DST_ALSO_READ or _permlane_preserves_dst(bop, mods) or
+            (op.startswith(("global_load_", "buffer_load_")) and "_d16" in op and "format" not in op) or
+            op == "buffer_load_format_d16_hi_x") and \
+            a[0]["k"] == "vgpr":
+        regs.add(a[0]["r"])
+    return regs
+
+
+def _vgpr_full_writes_of(ins):
+    """Set of VGPR indices unconditionally and completely overwritten by `ins` (conservative)."""
+    a, op = ins["args"], ins["op"]
+    if not a or op.endswith(("_sdwa", "_dpp")):
+        return set()
+    bop = base_op(op)
+    mods = ins.get("mods", ())
+    if bop == "v_writelane_b32" or _permlane_preserves_dst(bop, mods):
+        return set()
+    if bop.startswith(("buffer_atomic_", "image_atomic_", "flat_atomic_", "global_atomic_")):
+        return set()
+    if bop.startswith(("buffer_load", "tbuffer_load")) and "lds" in mods:
+        return set()
+    if bop.startswith("ds_") and not _is_ds_dst_only(bop):
+        return set()
+    reads_all = op.startswith(VGPR_READ_ONLY_PREFIXES)
+    if reads_all or a[0]["k"] != "vgpr":
+        return set()
+    if "_d16" in op or "d16" in mods:
+        return set()
+    if bop.startswith("image_"):
+        dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
+        try:
+            ncomp = bin(int(dm.split(":")[1], 0)).count("1")
+        except ValueError:
+            return set()
+        if ncomp <= 0:
+            return set()
+        return set(range(a[0]["r"], a[0]["r"] + min(ncomp, a[0].get("n", 1))))
+    # Scalar 16-bit VALU ops preserve the unwritten 16-bit half of a[0], so never kill the full 32-bit VGPR.
+    if (any(s in bop for s in ("_f16", "_u16", "_i16", "_b16"))
+            and not bop.startswith(("v_pk_", "v_cvt_pk", "v_cvt_f32_", "v_cvt_u32_", "v_cvt_i32_",
+                                    "v_pack_b32_", "v_dot2", "v_dot4", "v_dot8"))):
+        return set()
+    return set(vgpr_dest_registers(ins))
+
+
+def _exec_monotone_widen(ins):
+    """Whether a writes_exec instruction only turns ON lanes (EXEC_new >= EXEC_old)."""
+    bop = base_op(ins["op"])
+    a = ins["args"]
+    if bop in ("s_or_saveexec_b32", "s_or_saveexec_b64"):
+        return True
+    if bop in ("s_or_b32", "s_or_b64") and len(a) >= 3 and a[0]["k"] == "special":
+        dst_t = a[0].get("t", "")
+        if dst_t in ("exec", "exec_lo", "exec_hi"):
+            return any(x["k"] == "special" and x.get("t") == dst_t for x in a[1:3])
+    if bop in ("s_wqm_b32", "s_wqm_b64") and len(a) >= 2 and a[0]["k"] == "special" and a[1]["k"] == "special":
+        dst_t = a[0].get("t", "")
+        if dst_t in ("exec", "exec_lo", "exec_hi") and a[1].get("t") == dst_t:
+            return True
+    return False
+
+
+def _is_float_consumer_of(ins, regs, d16):
+    """Whether `ins` strictly interprets every VGPR in `regs` it reads as floating-point (f16 if d16, else f32)."""
+    raw_op = ins["op"]
+    if raw_op.endswith("_sdwa"):
+        return False
+    bop = base_op(raw_op)
+    a = ins["args"]
+    mods = ins.get("mods", ())
+    if bop in ("v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16"):
+        selhi = next((m for m in mods if m.startswith("op_sel_hi:")), "op_sel_hi:[0,0,0]")
+        try:
+            hb = ([int(x) for x in selhi.split("[")[1].rstrip("]").split(",")] + [0, 0, 0])[:3]
+        except (IndexError, ValueError):
+            return False
+        f16_srcs, f32_srcs = set(), set()
+        for i in range(3):
+            if 1 + i < len(a):
+                (f16_srcs if hb[i] else f32_srcs).update(_arg_vgprs(a[1 + i]))
+        want, other = (f16_srcs, f32_srcs) if d16 else (f32_srcs, f16_srcs)
+        return bool(regs) and regs <= want and not (regs & other)
+    if d16:
+        if bop in _F16_ONLY_CONSUMERS:
+            return True
+        if bop.startswith(("v_cmp_", "v_cmpx_")) and bop.endswith("_f16"):
+            if "_class_" not in bop:
+                return True
+            src0_idx = 0 if (bop.startswith("v_cmpx_") or len(a) == 2) else 1
+            s0 = _arg_vgprs(a[src0_idx]) if src0_idx < len(a) else set()
+            s1 = _arg_vgprs(a[src0_idx + 1]) if src0_idx + 1 < len(a) else set()
+            return bool(regs) and regs <= s0 and not (regs & s1)
+        if bop == "v_ldexp_f16":
+            s0 = _arg_vgprs(a[1]) if len(a) > 1 else set()
+            s1 = _arg_vgprs(a[2]) if len(a) > 2 else set()
+            return bool(regs) and regs <= s0 and not (regs & s1)
+        if bop in ("v_dot2_f32_f16", "v_dot2c_f32_f16"):
+            # src0 (a[1]) and src1 (a[2]) are f16x2; accumulator (a[3] / a[0]) is f32.
+            f16_srcs = (_arg_vgprs(a[1]) if len(a) > 1 else set()) | (_arg_vgprs(a[2]) if len(a) > 2 else set())
+            acc_idx = 3 if bop == "v_dot2_f32_f16" else 0
+            acc_regs = _arg_vgprs(a[acc_idx]) if acc_idx < len(a) else set()
+            return bool(regs) and regs <= f16_srcs and not (regs & acc_regs)
+        if bop == "v_pack_b32_f16" and not raw_op.endswith("_dpp") and len(a) >= 3:
+            # Plain v_pack_b32_f16 without sign/abs modifiers is also used to pack integer 16-bit halves
+            # (handled by transitive copy propagation below); with neg/abs it is strictly IEEE f16 sign/abs.
+            hit = [src for src in a[1:3] if _arg_vgprs(src) & regs]
+            return bool(hit) and all(src.get("neg") or src.get("abs") for src in hit)
+        return False
+    if bop in _F32_ONLY_CONSUMERS:
+        return True
+    if bop.startswith(("v_cmp_", "v_cmpx_")) and bop.endswith("_f32"):
+        if "_class_" not in bop:
+            return True
+        src0_idx = 0 if (bop.startswith("v_cmpx_") or len(a) == 2) else 1
+        s0 = _arg_vgprs(a[src0_idx]) if src0_idx < len(a) else set()
+        s1 = _arg_vgprs(a[src0_idx + 1]) if src0_idx + 1 < len(a) else set()
+        return bool(regs) and regs <= s0 and not (regs & s1)
+    if bop == "v_ldexp_f32":
+        s0 = _arg_vgprs(a[1]) if len(a) > 1 else set()
+        s1 = _arg_vgprs(a[2]) if len(a) > 2 else set()
+        return bool(regs) and regs <= s0 and not (regs & s1)
+    if bop == "v_cvt_pk_u8_f32":
+        # src0 (a[1]) is f32; src1 (a[2], byte index) and src2 (a[3], packed u32) are integer.
+        s0 = _arg_vgprs(a[1]) if len(a) > 1 else set()
+        other = (_arg_vgprs(a[2]) if len(a) > 2 else set()) | (_arg_vgprs(a[3]) if len(a) > 3 else set())
+        return bool(regs) and regs <= s0 and not (regs & other)
+    if bop in ("v_dot2_f32_f16", "v_dot2c_f32_f16"):
+        acc_idx = 3 if bop == "v_dot2_f32_f16" else 0
+        acc_regs = _arg_vgprs(a[acc_idx]) if acc_idx < len(a) else set()
+        f16_srcs = (_arg_vgprs(a[1]) if len(a) > 1 else set()) | (_arg_vgprs(a[2]) if len(a) > 2 else set())
+        return bool(regs) and regs <= acc_regs and not (regs & f16_srcs)
+    if not raw_op.endswith("_dpp") and not mods:
+        # VOP3 float sign/abs modifiers (-v / |v|) on v_mov_b32 / v_cndmask_b32 interpret f32 sign bit.
+        if bop == "v_mov_b32" and len(a) >= 2 and (_arg_vgprs(a[1]) & regs):
+            return bool(a[1].get("neg") or a[1].get("abs"))
+        if bop == "v_cndmask_b32" and len(a) >= 3:
+            hit = [src for src in a[1:3] if _arg_vgprs(src) & regs]
+            return bool(hit) and all(src.get("neg") or src.get("abs") for src in hit)
+    return False
+
+
+def _copy_prop_dst(ins, regs, d16):
+    """If `ins` is a pure register copy/select/pack forwarding `regs` into a single VGPR, return that dst VGPR."""
+    raw_op = ins["op"]
+    if raw_op.endswith(("_sdwa", "_dpp")):
+        return None
+    bop = base_op(raw_op)
+    a = ins["args"]
+    mods = ins.get("mods", ())
+    if not a or a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
+        return None
+    if bop == "v_mov_b32" and not mods and len(a) >= 2 and a[1]["k"] == "vgpr" and a[1].get("n", 1) == 1:
+        if not a[1].get("neg") and not a[1].get("abs"):
+            return a[0]["r"]
+        return None
+    if bop == "v_cndmask_b32" and not mods and len(a) >= 3:
+        if d16 and any((src.get("neg") or src.get("abs")) for src in a[1:3] if _arg_vgprs(src) & regs):
+            return None
+        return a[0]["r"]
+    if d16 and bop == "v_pack_b32_f16" and len(a) >= 3:
+        return a[0]["r"]
+    return None
+
+
+def float_only_image_ops(blocks, succ):
+    """Set of id(ins) for image_load/image_sample ops whose dest VGPRs are consumed solely by float ops."""
+    nb = len(blocks)
+    out = set()
+    for b_idx, blk in enumerate(blocks):
+        for i_idx, ins in enumerate(blk):
+            bop = base_op(ins["op"])
+            if bop not in _FLOAT_ONLY_IMAGE_OPS:
+                continue
+            a = ins["args"]
+            if not a or a[0]["k"] != "vgpr":
+                continue
+            mods = ins.get("mods", ())
+            d16 = "d16" in mods
+            dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
+            try:
+                dmask = int(dm.split(":")[1], 0)
+            except ValueError:
+                continue
+            ncomp = bin(dmask).count("1")
+            nregs = (ncomp + 1) // 2 if d16 else ncomp
+            if nregs <= 0:
+                continue
+            dst_regs = set(range(a[0]["r"], a[0]["r"] + nregs))
+            # Monotone forward dataflow from (b_idx, i_idx + 1):
+            #   in_live[b]: union of tracked VGPRs (including transitive copies) reaching block b
+            #   in_exec_sup[b]: True iff EVERY reaching path preserved EXEC >= EXEC_at_image_load
+            in_live = [None] * nb
+            in_exec_sup = [None] * nb
+            saw_float = False
+            ok = True
+
+            def _scan(cb, start_i, live, exec_sup):
+                nonlocal saw_float, ok
+                ended = False
+                for u in blocks[cb][start_i:]:
+                    ubop = base_op(u["op"])
+                    if ubop == "s_endpgm":
+                        ended = True
+                        break
+                    if (ubop.startswith(("v_movrels", "v_movreld", "v_movrelsd", "v_swaprel"))
+                            or ubop in ("s_swappc_b64", "s_setpc_b64", "s_call_b64")):
+                        ok = False
+                        return
+                    r_used = live & _vgpr_reads_of(u)
+                    copied_dst = None
+                    if r_used:
+                        if _is_float_consumer_of(u, r_used, d16):
+                            saw_float = True
+                        else:
+                            copied_dst = _copy_prop_dst(u, r_used, d16)
+                            if copied_dst is None:
+                                ok = False
+                                return
+                    if writes_exec(u) and not _exec_monotone_widen(u):
+                        exec_sup = False
+                    if copied_dst is not None:
+                        live.add(copied_dst)
+                    elif exec_sup:
+                        live -= _vgpr_full_writes_of(u)
+                        if not live:
+                            ended = True
+                            break
+                if ok and not ended and live:
+                    for nxt in succ[cb]:
+                        if in_live[nxt] is None:
+                            in_live[nxt] = set(live)
+                            in_exec_sup[nxt] = exec_sup
+                            work.append(nxt)
+                        else:
+                            new_live = in_live[nxt] | live
+                            new_sup = in_exec_sup[nxt] and exec_sup
+                            if len(new_live) != len(in_live[nxt]) or new_sup != in_exec_sup[nxt]:
+                                in_live[nxt] = new_live
+                                in_exec_sup[nxt] = new_sup
+                                work.append(nxt)
+
+            work = []
+            _scan(b_idx, i_idx + 1, set(dst_regs), True)
+            while work and ok:
+                cb = work.pop()
+                _scan(cb, 0, set(in_live[cb]), in_exec_sup[cb])
+            if ok and saw_float:
+                out.add(id(ins))
+    return out
 
 
 def read_before_write_vgprs(insns):
@@ -18814,6 +20063,878 @@ def barriers_under_control_flow(text):
     return False
 
 
+_FTZ32_DISABLE_OPS = frozenset({"v_div_scale_f32", "v_div_fmas_f32", "s_denorm_mode"})
+_HWREG_MODE_RE = re.compile(
+    r"^hwreg\(\s*(\w+)(?:\s*,\s*(0x[0-9a-fA-F]+|\d+)(?:\s*,\s*(0x[0-9a-fA-F]+|\d+))?)?\s*\)$"
+)
+
+
+def _disables_ftz32(insns):
+    """Whether any instruction in `insns` requires disabling hardware DenormFlushToZero 32.
+
+    v_div_scale_f32 and v_div_fmas_f32 preserve subnormal f32 inputs/intermediates on RDNA2 even under denorm32=0,
+    and s_denorm_mode / s_setreg* writing HW_REG_MODE bits [5:4] (FP_DENORM.fp32) to a non-zero or non-constant
+    value may disable f32 denormal flushing. Writes to disjoint MODE bit ranges (such as FP_ROUND.fp64_fp16 in
+    bits [3:2]) or immediate writes that set the overlapped [5:4] bits to 0 keep FTZ32 enabled."""
+    for ins in insns:
+        op = base_op(ins["op"])
+        if op in _FTZ32_DISABLE_OPS:
+            return True
+        if not op.startswith("s_setreg"):
+            continue
+        if not ins["args"]:
+            return True
+        a0 = ins["args"][0]
+        if a0.get("k") == "imm":
+            simm16 = a0["v"] & 0xFFFF
+            if (simm16 & 0x3F) != 1:
+                continue
+            offset = (simm16 >> 6) & 0x1F
+            size = ((simm16 >> 11) & 0x1F) + 1
+        else:
+            t = a0.get("t", "")
+            m = _HWREG_MODE_RE.match(t)
+            if not m:
+                return True
+            reg_id = m.group(1)
+            if reg_id != "HW_REG_MODE":
+                try:
+                    if int(reg_id, 0) != 1:
+                        continue
+                except ValueError:
+                    continue
+            offset = int(m.group(2), 0) if m.group(2) is not None else 0
+            size = int(m.group(3), 0) if m.group(3) is not None else 32
+            if offset < 0 or offset >= 32 or size <= 0 or size > 32:
+                return True
+        lo = max(offset, 4)
+        hi = min(offset + size, 6)
+        if lo >= hi:
+            continue
+        if op == "s_setreg_imm32_b32" and len(ins["args"]) >= 2 and ins["args"][1].get("k") == "imm" \
+                and not ins["args"][1].get("abs"):
+            val = ins["args"][1]["v"] & 0xFFFFFFFF
+            mask = (1 << (hi - lo)) - 1
+            if ((val >> (lo - offset)) & mask) != 0:
+                return True
+            continue
+        return True
+    return False
+
+
+_PSB_WRITE_PREFIXES = (
+    "buffer_store", "tbuffer_store", "buffer_atomic",
+    "global_store", "global_atomic",
+    "flat_store", "flat_atomic",
+    "scratch_store",
+    "s_store", "s_buffer_store", "s_atomic", "s_buffer_atomic",
+)
+
+
+def _scalar_operand_slots(arg):
+    """Return list of scalar slots (int SGPR index or 'vcc_lo'/'vcc_hi') for an operand, or None."""
+    k = arg.get("k")
+    if k == "sgpr":
+        return list(range(arg["r"], arg["r"] + arg.get("n", 1)))
+    if k == "slist":
+        return list(arg["r"])
+    if k == "special" and arg.get("t") in ("vcc", "vcc_lo", "vcc_hi"):
+        return ["vcc_lo", "vcc_hi"] if arg["t"] == "vcc" else [arg["t"]]
+    return None
+
+
+def _symbolic_origin(tag):
+    """Return a non-constant symbolic descriptor/pointer origin tag, or None if unknown/constant."""
+    if tag is None or tag[0] == "const":
+        return None
+    return tag
+
+
+def _root_origin(tag):
+    """Unwrap an arithmetic-offset wrapper ('off', root) to its underlying symbolic root origin."""
+    if tag is not None and tag[0] == "off":
+        return tag[1]
+    return tag
+
+
+def _as_offset_origin(tag):
+    """Mark a symbolic pointer tag as having an untracked arithmetic offset (preserving code/rodata)."""
+    if tag is None or tag[0] in ("const", "code", "off"):
+        return tag
+    return ("off", tag)
+
+
+def _origin_depth(tag):
+    """Nesting depth of a symbolic ('load'/'load_dyn', base, ...) origin tag."""
+    d = 0
+    cur = _root_origin(tag)
+    while cur is not None and cur[0] in ("load", "load_dyn"):
+        d += 1
+        cur = _root_origin(cur[1])
+    return d
+
+
+def _merge_sym_tag(v1, v2):
+    """Join two symbolic provenance tags at a CFG merge or conditional select."""
+    if v1 == v2:
+        return v1
+    if v1 is None or v2 is None:
+        return None
+    r1, r2 = _root_origin(v1), _root_origin(v2)
+    if r1 is not None and r1 == r2 and r1[0] != "const":
+        return _as_offset_origin(r1)
+    if r1 is not None and r2 is not None and r1[0] in ("load", "load_dyn") and r2[0] in ("load", "load_dyn") and r1[1] == r2[1]:
+        return ("load_dyn", r1[1])
+    return None
+
+
+def _origins_may_alias(o1, o2):
+    """Conservative alias check between two symbolic descriptor/pointer origins."""
+    if o1 is None or o2 is None:
+        return True
+    r1, r2 = _root_origin(o1), _root_origin(o2)
+    if r1 is None or r2 is None:
+        return True
+    if r1 == r2:
+        return True
+    if r1[0] == "code" or r2[0] == "code":
+        return False
+    if r1[0] == "load" and r2[0] == "load":
+        return r1[2] == r2[2] and _origins_may_alias(r1[1], r2[1])
+    # Dynamic offset load from an aliasing base table may hit any static/dynamic slot in that table.
+    if r1[0] in ("load", "load_dyn") and r2[0] in ("load", "load_dyn"):
+        return _origins_may_alias(r1[1], r2[1])
+    return False
+
+
+def _origin_chain_aliases_known(origin, known_writes):
+    """Whether `origin` or any ancestor table pointer in its load chain aliases a write origin in `known_writes`."""
+    cur = _root_origin(origin)
+    while cur is not None:
+        if any(_origins_may_alias(cur, wo) for wo in known_writes):
+            return True
+        cur = _root_origin(cur[1]) if cur[0] in ("load", "load_dyn") else None
+    return False
+
+
+def _psb_write_origin(ins, sym):
+    """Extract the symbolic base-address origin of a PSB memory write instruction, or None if unknown."""
+    op = base_op(ins["op"])
+    a = ins["args"]
+    if op.startswith(("buffer_store", "tbuffer_store", "buffer_atomic")):
+        if len(a) >= 3:
+            slots = _scalar_operand_slots(a[2])
+            if slots and len(slots) == 4:
+                return _symbolic_origin(sym.get(slots[0]))
+        return None
+    if op.startswith("global_store"):
+        if len(a) >= 3:
+            slots = _scalar_operand_slots(a[2])
+            if slots and len(slots) == 2:
+                return _symbolic_origin(sym.get(slots[0]))
+        return None
+    if op.startswith("global_atomic"):
+        idx = 3 if "glc" in ins["mods"] else 2
+        if len(a) > idx:
+            slots = _scalar_operand_slots(a[idx])
+            if slots and len(slots) == 2:
+                return _symbolic_origin(sym.get(slots[0]))
+        return None
+    if op.startswith(("s_store", "s_buffer_store", "s_atomic", "s_buffer_atomic")):
+        if len(a) >= 2:
+            slots = _scalar_operand_slots(a[1])
+            if slots:
+                return _symbolic_origin(sym.get(slots[0]))
+        return None
+    return None
+
+
+def _sload_static_offset(ins, sym, is_sbuf):
+    """Return the normalized static byte offset of an s_load / s_buffer_load, or None if dynamic."""
+    a = ins["args"]
+    off = a[2] if len(a) > 2 else {"k": "imm", "v": 0}
+    inst = [m.split(":", 1)[1] for m in ins["mods"] if m.startswith("offset:")]
+    if len(inst) > 1 or (inst and off["k"] == "imm"):
+        return None
+    imm = 0
+    if inst:
+        try:
+            imm = int(inst[0], 0)
+        except ValueError:
+            return None
+    reg_const = None
+    if off["k"] == "imm":
+        imm = off["v"]
+    elif off["k"] == "special" and off.get("t") == "null":
+        reg_const = 0
+    else:
+        slots = _scalar_operand_slots(off)
+        if not slots or len(slots) != 1:
+            return None
+        tag = sym.get(slots[0])
+        if tag is None or tag[0] != "const":
+            return None
+        reg_const = tag[1] & 0xFFFFFFFC
+    if is_sbuf:
+        imm &= 0xFFFFFFFF
+    else:
+        imm = ((imm & 0x1FFFFF) ^ 0x100000) - 0x100000
+    imm &= ~3
+    return (reg_const + imm) if reg_const is not None else imm
+
+
+def _read_scalar_tag(sym, arg):
+    """Read a 32-bit constant or symbolic provenance tag for a single scalar operand."""
+    if arg["k"] == "imm":
+        return ("const", arg["v"] & 0xFFFFFFFF)
+    if arg["k"] == "special" and arg.get("t") == "null":
+        return ("const", 0)
+    slots = _scalar_operand_slots(arg)
+    if slots and len(slots) == 1:
+        return sym.get(slots[0])
+    return None
+
+
+def _const_lane(sym, arg):
+    """Constant lane index (0..63) for v_writelane_b32 / v_readlane_b32, or None if dynamic."""
+    t = _read_scalar_tag(sym, arg)
+    return t[1] & 63 if t is not None and t[0] == "const" else None
+
+
+def _step_scalar_provenance(sym, ins, desc_src=None):
+    """Advance forward SGPR/VCC/spill-VGPR provenance state across one instruction.
+
+    When `desc_src` is given (slot -> frozenset of s_load instruction ids), also propagates which s_load
+    instructions originated each slot's value (through copies, selects, and VGPR spill lanes) so descriptor-only
+    loads can be verified."""
+    op = base_op(ins["op"])
+    a = ins["args"]
+    if op in ("s_swappc_b64", "s_setpc_b64", "s_call_b64") or op.startswith("s_movreld"):
+        sym.clear()
+        if desc_src is not None:
+            desc_src.clear()
+        return
+    if not a:
+        return
+
+    def read_tag(arg):
+        return _read_scalar_tag(sym, arg)
+
+    def clear_slots(slots):
+        if slots:
+            for s in slots:
+                sym.pop(s, None)
+                if desc_src is not None:
+                    desc_src.pop(s, None)
+
+    def clear_vgpr_lanes(vregs):
+        if not vregs:
+            return
+        for k in [k for k in sym if isinstance(k, tuple) and k[1] in vregs]:
+            del sym[k]
+        if desc_src is not None:
+            for k in [k for k in desc_src if isinstance(k, tuple) and k[1] in vregs]:
+                del desc_src[k]
+
+    if op.startswith(("v_movreld", "v_movrelsd", "v_swaprel")):
+        for k in [k for k in sym if isinstance(k, tuple)]:
+            del sym[k]
+        if desc_src is not None:
+            for k in [k for k in desc_src if isinstance(k, tuple)]:
+                del desc_src[k]
+        return
+
+    if op == "v_writelane_b32" and len(a) >= 3 and a[0]["k"] == "vgpr":
+        vr = a[0]["r"]
+        lane = _const_lane(sym, a[2])
+        if lane is None:
+            clear_vgpr_lanes({vr})
+            return
+        key = ("v", vr, lane)
+        t = read_tag(a[1])
+        if t is not None:
+            sym[key] = t
+        else:
+            sym.pop(key, None)
+        if desc_src is not None:
+            src = _scalar_operand_slots(a[1])
+            if src and len(src) == 1 and src[0] in desc_src:
+                desc_src[key] = desc_src[src[0]]
+            else:
+                desc_src.pop(key, None)
+        return
+
+    if op == "v_readlane_b32":
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 1 and len(a) >= 3 and a[1]["k"] == "vgpr":
+            lane = _const_lane(sym, a[2])
+            if lane is not None:
+                key = ("v", a[1]["r"], lane)
+                t = sym.get(key)
+                if t is not None:
+                    sym[dst[0]] = t
+                else:
+                    sym.pop(dst[0], None)
+                if desc_src is not None:
+                    if key in desc_src:
+                        desc_src[dst[0]] = desc_src[key]
+                    else:
+                        desc_src.pop(dst[0], None)
+                return
+        clear_slots(dst)
+        return
+
+    if op == "s_mov_b32" and len(a) >= 2:
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 1:
+            t = read_tag(a[1])
+            if t is not None:
+                sym[dst[0]] = t
+            else:
+                sym.pop(dst[0], None)
+            if desc_src is not None:
+                src = _scalar_operand_slots(a[1])
+                if src and len(src) == 1 and src[0] in desc_src:
+                    desc_src[dst[0]] = desc_src[src[0]]
+                else:
+                    desc_src.pop(dst[0], None)
+        return
+    if op == "s_movk_i32" and len(a) >= 2 and a[1]["k"] == "imm":
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 1:
+            v = a[1]["v"] & 0xFFFF
+            if v & 0x8000:
+                v |= 0xFFFF0000
+            sym[dst[0]] = ("const", v & 0xFFFFFFFF)
+            if desc_src is not None:
+                desc_src.pop(dst[0], None)
+        return
+    if op in ("s_addk_i32", "s_mulk_i32") and len(a) >= 2 and a[1]["k"] == "imm":
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 1:
+            v = a[1]["v"] & 0xFFFF
+            if v & 0x8000:
+                v -= 0x10000
+            cur = sym.get(dst[0])
+            if cur is not None and cur[0] == "const":
+                sym[dst[0]] = ("const", ((cur[1] + v) if op == "s_addk_i32" else (cur[1] * v)) & 0xFFFFFFFF)
+            elif op == "s_addk_i32" and _symbolic_origin(cur) is not None:
+                sym[dst[0]] = cur if v == 0 else _as_offset_origin(cur)
+            else:
+                sym.pop(dst[0], None)
+            if desc_src is not None:
+                desc_src.pop(dst[0], None)
+        return
+    if op == "s_mov_b64" and len(a) >= 2:
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 2:
+            if a[1]["k"] == "imm":
+                v = a[1]["v"]
+                sym[dst[0]] = ("const", v & 0xFFFFFFFF)
+                sym[dst[1]] = ("const", (v >> 32) & 0xFFFFFFFF)
+                if desc_src is not None:
+                    desc_src.pop(dst[0], None)
+                    desc_src.pop(dst[1], None)
+            else:
+                src = _scalar_operand_slots(a[1])
+                if src and len(src) == 2:
+                    vals = [sym.get(src[0]), sym.get(src[1])]
+                    dvals = [desc_src.get(src[0]), desc_src.get(src[1])] if desc_src is not None else None
+                    for i, (d, v) in enumerate(zip(dst, vals)):
+                        if v is not None:
+                            sym[d] = v
+                        else:
+                            sym.pop(d, None)
+                        if desc_src is not None:
+                            if dvals[i] is not None:
+                                desc_src[d] = dvals[i]
+                            else:
+                                desc_src.pop(d, None)
+                else:
+                    clear_slots(dst)
+        return
+    if op in ("s_cselect_b32", "s_cmov_b32") and len(a) >= (3 if op == "s_cselect_b32" else 2):
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 1:
+            x_arg, y_arg = (a[1], a[2]) if op == "s_cselect_b32" else (a[1], a[0])
+            merged = _merge_sym_tag(read_tag(x_arg), read_tag(y_arg))
+            if merged is not None:
+                sym[dst[0]] = merged
+            else:
+                sym.pop(dst[0], None)
+            if desc_src is not None:
+                sx = _scalar_operand_slots(x_arg)
+                sy = _scalar_operand_slots(y_arg)
+                dx = desc_src.get(sx[0]) if sx and len(sx) == 1 else None
+                dy = desc_src.get(sy[0]) if sy and len(sy) == 1 else None
+                union = (dx or frozenset()) | (dy or frozenset())
+                if union:
+                    desc_src[dst[0]] = union
+                else:
+                    desc_src.pop(dst[0], None)
+        return
+    if op in ("s_cselect_b64", "s_cmov_b64") and len(a) >= (3 if op == "s_cselect_b64" else 2):
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 2:
+            x_arg, y_arg = (a[1], a[2]) if op == "s_cselect_b64" else (a[1], a[0])
+
+            def _pair_tags(arg):
+                if arg["k"] == "imm":
+                    v = arg["v"]
+                    return [("const", v & 0xFFFFFFFF), ("const", (v >> 32) & 0xFFFFFFFF)], [None, None]
+                s = _scalar_operand_slots(arg)
+                if s and len(s) == 2:
+                    return ([sym.get(s[0]), sym.get(s[1])],
+                            [desc_src.get(s[0]), desc_src.get(s[1])] if desc_src is not None else [None, None])
+                return [None, None], [None, None]
+
+            xt, xd = _pair_tags(x_arg)
+            yt, yd = _pair_tags(y_arg)
+            for i, d in enumerate(dst):
+                merged = _merge_sym_tag(xt[i], yt[i])
+                if merged is not None:
+                    sym[d] = merged
+                else:
+                    sym.pop(d, None)
+                if desc_src is not None:
+                    union = (xd[i] or frozenset()) | (yd[i] or frozenset())
+                    if union:
+                        desc_src[d] = union
+                    else:
+                        desc_src.pop(d, None)
+        return
+    if op == "s_getpc_b64":
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 2:
+            sym[dst[0]] = ("code",)
+            sym[dst[1]] = ("code",)
+            if desc_src is not None:
+                desc_src.pop(dst[0], None)
+                desc_src.pop(dst[1], None)
+        return
+    if op in ("s_add_u32", "s_add_i32", "s_addc_u32", "s_sub_u32", "s_sub_i32", "s_subb_u32",
+              "s_and_b32", "s_or_b32", "s_xor_b32", "s_lshl_b32", "s_lshr_b32", "s_mul_i32",
+              "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32") and len(a) >= 3:
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 1:
+            t0, t1 = read_tag(a[1]), read_tag(a[2])
+            c0_flag = t0 is not None and t0[0] == "const"
+            c1_flag = t1 is not None and t1[0] == "const"
+            s0_slots = _scalar_operand_slots(a[1])
+            s1_slots = _scalar_operand_slots(a[2])
+            out = None
+            if op == "s_and_b32" and (t0 == ("const", 0) or t1 == ("const", 0)):
+                out = ("const", 0)
+            elif op in ("s_xor_b32", "s_sub_u32", "s_sub_i32") and s0_slots and s0_slots == s1_slots:
+                out = ("const", 0)
+            elif c0_flag and c1_flag:
+                c0, c1 = t0[1], t1[1]
+                if op in ("s_add_u32", "s_add_i32"):
+                    out = ("const", (c0 + c1) & 0xFFFFFFFF)
+                elif op in ("s_sub_u32", "s_sub_i32"):
+                    out = ("const", (c0 - c1) & 0xFFFFFFFF)
+                elif op == "s_and_b32":
+                    out = ("const", c0 & c1)
+                elif op == "s_or_b32":
+                    out = ("const", c0 | c1)
+                elif op == "s_xor_b32":
+                    out = ("const", c0 ^ c1)
+                elif op == "s_lshl_b32":
+                    out = ("const", (c0 << (c1 & 31)) & 0xFFFFFFFF)
+                elif op == "s_lshr_b32":
+                    out = ("const", (c0 >> (c1 & 31)) & 0xFFFFFFFF)
+                elif op == "s_mul_i32":
+                    out = ("const", (c0 * c1) & 0xFFFFFFFF)
+                elif op.startswith("s_lshl"):
+                    sh = int(op[6])
+                    out = ("const", ((c0 << sh) + c1) & 0xFFFFFFFF)
+            elif op not in ("s_xor_b32", "s_lshl_b32", "s_lshr_b32", "s_mul_i32"):
+                s0, s1 = _symbolic_origin(t0), _symbolic_origin(t1)
+                if op.startswith("s_lshl"):
+                    # (S0 << sh) + S1: shifting a base pointer left does not preserve its origin;
+                    # only propagate S1 when the shifted index S0 is a known constant (marking as offset if non-zero).
+                    if c0_flag and s1 is not None:
+                        out = s1 if t0[1] == 0 else _as_offset_origin(s1)
+                elif s0 is not None and c1_flag:
+                    noop = (op in ("s_add_u32", "s_add_i32", "s_sub_u32", "s_sub_i32", "s_or_b32") and t1[1] == 0) \
+                        or (op == "s_and_b32" and t1[1] == 0xFFFFFFFF)
+                    out = s0 if noop else _as_offset_origin(s0)
+                elif s1 is not None and c0_flag and op not in ("s_sub_u32", "s_sub_i32", "s_subb_u32"):
+                    noop = (op in ("s_add_u32", "s_add_i32", "s_or_b32") and t0[1] == 0) \
+                        or (op == "s_and_b32" and t0[1] == 0xFFFFFFFF)
+                    out = s1 if noop else _as_offset_origin(s1)
+                elif op in ("s_and_b32", "s_or_b32") and s0 is not None and _root_origin(s0) == _root_origin(s1):
+                    out = s0 if s0 == s1 else _as_offset_origin(s0)
+            if out is not None:
+                sym[dst[0]] = out
+            else:
+                sym.pop(dst[0], None)
+            if desc_src is not None:
+                desc_src.pop(dst[0], None)
+        return
+    if op.startswith(("s_load_dword", "s_buffer_load_dword")) and len(a) >= 2:
+        dst = _scalar_operand_slots(a[0])
+        base = _scalar_operand_slots(a[1])
+        if dst:
+            base_tag = _symbolic_origin(sym.get(base[0])) if base else None
+            base_root = _root_origin(base_tag)
+            if base_root is not None and _origin_depth(base_root) < 4:
+                off = None if base_tag[0] == "off" else _sload_static_offset(ins, sym, op.startswith("s_buffer"))
+                for i, slot in enumerate(dst):
+                    sym[slot] = ("load", base_root, off + 4 * i) if off is not None else ("load_dyn", base_root)
+            else:
+                clear_slots(dst)
+            if desc_src is not None:
+                tag = frozenset((id(ins),)) if op.startswith("s_load_dword") else None
+                for slot in dst:
+                    if tag is not None:
+                        desc_src[slot] = tag
+                    else:
+                        desc_src.pop(slot, None)
+        return
+    # Any non-writelane instruction that writes a VGPR clears any spilled scalar lanes parked in that VGPR.
+    if (not op.startswith(VGPR_READ_ONLY_PREFIXES)
+            and not (op.startswith(("buffer_load", "tbuffer_load")) and "lds" in ins.get("mods", ()))
+            and not (op.startswith("ds_") and not _is_ds_dst_only(op))):
+        written_v = _arg_vgprs(a[0])
+        if op == "v_swap_b32" and len(a) >= 2:
+            written_v |= _arg_vgprs(a[1])
+        if written_v:
+            clear_vgpr_lanes(written_v)
+    # Any other instruction that writes scalar destination slots clears their provenance.
+    if op.startswith(("s_cmp", "s_bitcmp", "s_cbranch", "s_branch", "s_waitcnt", "s_nop", "s_endpgm",
+                      "s_barrier", "s_sendmsg", "s_setreg", "s_round_mode", "s_store", "s_buffer_store",
+                      "buffer_", "tbuffer_", "global_", "flat_", "scratch_", "image_", "ds_", "exp")):
+        return
+    if op.startswith("v_cmp"):
+        if not op.startswith("v_cmpx"):
+            dst = _scalar_operand_slots(a[0])
+            clear_slots(dst if dst else ["vcc_lo", "vcc_hi"])
+    elif op.startswith("s_") or op in ("v_readfirstlane_b32", "v_readlane_b32"):
+        clear_slots(_scalar_operand_slots(a[0]))
+    if len(a) >= 2 and op in ("v_add_co_u32", "v_add_co_ci_u32", "v_sub_co_u32", "v_sub_co_ci_u32",
+                              "v_subrev_co_u32", "v_subrev_co_ci_u32", "v_mad_u64_u32", "v_mad_i64_i32",
+                              "v_div_scale_f32", "v_div_scale_f64"):
+        clear_slots(_scalar_operand_slots(a[1]))
+
+
+def _classify_scalar_uses(ins, sym, desc_src, used_as_desc, used_as_data, used_as_sload_base):
+    """Record whether scalar operands read by `ins` are used solely as descriptors (T#/S#/V#), as base pointers
+    of another s_load, or as general data."""
+    if not desc_src:
+        return
+    op = base_op(ins["op"])
+    a = ins["args"]
+    if not a:
+        return
+    if op in ("s_mov_b32", "s_mov_b64", "s_cselect_b32", "s_cselect_b64", "s_cmov_b32", "s_cmov_b64"):
+        dst = _scalar_operand_slots(a[0])
+        want = 2 if op.endswith("_b64") else 1
+        if dst and len(dst) == want:
+            # Pure copies/selects into tracked scalar slots propagate desc_src without classifying the value yet.
+            return
+    if op in ("s_swappc_b64", "s_setpc_b64", "s_call_b64") or op.startswith("s_movrel"):
+        for tags in desc_src.values():
+            used_as_data.update(tags)
+        return
+    if op == "v_writelane_b32":
+        if len(a) >= 3 and a[0]["k"] == "vgpr":
+            lane = _const_lane(sym, a[2])
+            # Lane index operand (if scalar reg) is data; source sS propagates into ("v", vr, lane) when lane is const.
+            for idx in ((2,) if lane is not None else (1, 2)):
+                slots = _scalar_operand_slots(a[idx])
+                if slots:
+                    for s in slots:
+                        tags = desc_src.get(s)
+                        if tags:
+                            used_as_data.update(tags)
+        else:
+            for arg in a:
+                slots = _scalar_operand_slots(arg)
+                if slots:
+                    for s in slots:
+                        tags = desc_src.get(s)
+                        if tags:
+                            used_as_data.update(tags)
+        return
+    if op == "v_readlane_b32":
+        if len(a) >= 3 and a[1]["k"] == "vgpr":
+            lane = _const_lane(sym, a[2])
+            slots = _scalar_operand_slots(a[2])
+            if slots:
+                for s in slots:
+                    tags = desc_src.get(s)
+                    if tags:
+                        used_as_data.update(tags)
+            if lane is None:
+                vr = a[1]["r"]
+                for k, tags in desc_src.items():
+                    if isinstance(k, tuple) and k[1] == vr:
+                        used_as_data.update(tags)
+        return
+    if op.startswith(("v_movrels", "v_movreld", "v_movrelsd", "v_swaprel")):
+        for k, tags in desc_src.items():
+            if isinstance(k, tuple):
+                used_as_data.update(tags)
+    else:
+        # Any non-readlane read of a spill VGPR consumes all descriptor tags parked in its lanes as general data.
+        vreads = _vgpr_reads_of(ins)
+        if vreads:
+            for k, tags in desc_src.items():
+                if isinstance(k, tuple) and k[1] in vreads:
+                    used_as_data.update(tags)
+
+    # Identify operand indices that are pure descriptor reads (T#, S#, V#), s_load base ptrs, or write-only.
+    desc_idxs = set()
+    sload_base_idxs = set()
+    write_only_idxs = set()
+    if op.startswith("image_"):
+        if len(a) >= 3:
+            desc_idxs.add(2)    # T#
+        if len(a) >= 4:
+            desc_idxs.add(3)    # S#
+        if not op.startswith(("image_store", "image_atomic")):
+            write_only_idxs.add(0)
+    elif op.startswith(("buffer_", "tbuffer_")):
+        if "lds" in ins.get("mods", ()) and op.startswith(("buffer_load", "tbuffer_load")):
+            if len(a) >= 2:
+                desc_idxs.add(1)    # V# (no vdata operand when lds is set)
+        else:
+            if len(a) >= 3:
+                desc_idxs.add(2)    # V#
+            if op.startswith(("buffer_load", "tbuffer_load")):
+                write_only_idxs.add(0)
+    elif op.startswith("s_buffer_"):
+        if len(a) >= 2:
+            desc_idxs.add(1)    # V#
+        if op.startswith("s_buffer_load"):
+            write_only_idxs.add(0)
+    elif op.startswith("s_load_dword"):
+        write_only_idxs.add(0)
+        if len(a) >= 2:
+            sload_base_idxs.add(1)
+    elif op.startswith("s_") and not op.startswith(("s_cmp", "s_bitcmp", "s_cbranch", "s_branch", "s_store",
+                                                    "s_atomic", "s_setreg", "s_sendmsg", "s_waitcnt", "s_nop",
+                                                    "s_endpgm", "s_barrier", "s_round_mode", "s_cmov", "s_bitset")):
+        write_only_idxs.add(0)
+    elif op.startswith("v_") and not op.startswith(("v_cmp", "v_cmpx")) and op not in DST_ALSO_READ:
+        write_only_idxs.add(0)
+        if op in ("v_add_co_u32", "v_add_co_ci_u32", "v_sub_co_u32", "v_sub_co_ci_u32",
+                  "v_subrev_co_u32", "v_subrev_co_ci_u32", "v_mad_u64_u32", "v_mad_i64_i32",
+                  "v_div_scale_f32", "v_div_scale_f64"):
+            write_only_idxs.add(1)
+
+    child_id = id(ins)
+    for idx, arg in enumerate(a):
+        if idx in write_only_idxs:
+            continue
+        slots = _scalar_operand_slots(arg)
+        if not slots:
+            continue
+        if idx in sload_base_idxs:
+            for s in slots:
+                tags = desc_src.get(s)
+                if tags:
+                    for parent_id in tags:
+                        used_as_sload_base.setdefault(parent_id, set()).add(child_id)
+            continue
+        target = used_as_desc if idx in desc_idxs else used_as_data
+        for s in slots:
+            tags = desc_src.get(s)
+            if tags:
+                target.update(tags)
+
+
+def analyse_scalar_load_ro(blocks, succ, user_limit=USER_SGPRS, sys_sgprs=()):
+    """Decide which s_load* / s_buffer_load* instructions may safely carry NonWritable (allowing RADV/ACO SMEM).
+
+    Returns True when the shader performs no PhysicalStorageBuffer memory writes at all (all scalar loads are safe),
+    or a frozenset of id(ins) for scalar loads proven not to alias any PSB write in the module:
+      - If any s_dcache_* instruction is present alongside a PSB write, falls back conservatively to frozenset().
+      - Descriptor-only s_load* (from a 32-bit or 64-bit user SGPR table pointer or multi-level table load,
+        including descriptors carried through scalar-spill VGPRs via v_writelane_b32/v_readlane_b32, whose origin
+        chain is not explicitly written and whose loaded dwords are consumed solely as T#/S#/V# descriptors or as
+        the base pointer of another descriptor-only s_load) and s_getpc_b64 code/rodata loads are read-only.
+      - Any scalar load with no PSB write reachable before it on any CFG path (`not store_reached`, including loop
+        back-edges) is read-only unless its known origin explicitly aliases a known PSB write reachable after it.
+      - Any scalar load whose symbolic descriptor/pointer origin (user SGPR root or static descriptor-table slot) is
+        strictly disjoint from every PSB write's origin in the module is read-only."""
+    if not blocks:
+        return True
+    nb = len(blocks)
+    has_dcache = False
+    has_any_write = False
+    for b, blk in enumerate(blocks):
+        for ins in blk:
+            op = base_op(ins["op"])
+            if op == "s_endpgm":
+                break
+            if op.startswith("s_dcache_"):
+                has_dcache = True
+            if op.startswith(_PSB_WRITE_PREFIXES):
+                has_any_write = True
+    if not has_any_write:
+        return True
+    if has_dcache:
+        return frozenset()
+
+    # Forward SGPR/VCC/spill-VGPR descriptor provenance and s_load-origin dataflow (also discovers reachable blocks).
+    system = set(sys_sgprs)
+    entry_sym = [None] * nb
+    entry_dsrc = [None] * nb
+    entry_sym[0] = {r: ("in", r) for r in range(user_limit) if r not in system}
+    entry_dsrc[0] = {}
+    work = [0]
+    while work:
+        b = work.pop()
+        sym = dict(entry_sym[b])
+        dsrc = dict(entry_dsrc[b])
+        for ins in blocks[b]:
+            if base_op(ins["op"]) == "s_endpgm":
+                break
+            _step_scalar_provenance(sym, ins, dsrc)
+        for s in succ[b]:
+            if entry_sym[s] is None:
+                entry_sym[s] = dict(sym)
+                entry_dsrc[s] = dict(dsrc)
+                work.append(s)
+            else:
+                merged_sym = {}
+                for k, v in entry_sym[s].items():
+                    m = _merge_sym_tag(v, sym.get(k))
+                    if m is not None:
+                        merged_sym[k] = m
+                # Join desc_src by union so any path on which a slot comes from an s_load sees all its uses.
+                merged_dsrc = dict(entry_dsrc[s])
+                for k, v in dsrc.items():
+                    merged_dsrc[k] = merged_dsrc[k] | v if k in merged_dsrc else v
+                if merged_sym != entry_sym[s] or merged_dsrc != entry_dsrc[s]:
+                    entry_sym[s] = merged_sym
+                    entry_dsrc[s] = merged_dsrc
+                    work.append(s)
+
+    # Collect per-block PSB writes/origins, classify s_load uses, and record every scalar load at its exact point.
+    write_origins = set()
+    block_writes_list = [[] for _ in range(nb)]  # per block: [(idx, origin_or_None), ...]
+    used_as_desc, used_as_data = set(), set()
+    used_as_sload_base = {}  # parent s_load id -> set of child s_load ids
+    scalar_loads = []  # (ins, b, idx, is_desc_ptr, origin)
+    for b in range(nb):
+        if entry_sym[b] is None:
+            continue
+        sym = dict(entry_sym[b])
+        dsrc = dict(entry_dsrc[b])
+        for idx, ins in enumerate(blocks[b]):
+            op = base_op(ins["op"])
+            if op == "s_endpgm":
+                break
+            _classify_scalar_uses(ins, sym, dsrc, used_as_desc, used_as_data, used_as_sload_base)
+            if op.startswith(_PSB_WRITE_PREFIXES):
+                wo = _psb_write_origin(ins, sym)
+                write_origins.add(wo)
+                block_writes_list[b].append((idx, wo))
+            elif op.startswith(("s_load_dword", "s_buffer_load_dword")) and len(ins["args"]) >= 2:
+                base = _scalar_operand_slots(ins["args"][1])
+                origin = _symbolic_origin(sym.get(base[0])) if base else None
+                hi_tag = sym.get(base[1]) if (base and len(base) == 2) else None
+                origin_root = _root_origin(origin)
+                hi_root = _root_origin(hi_tag)
+                is_desc_ptr = (
+                    op.startswith("s_load_dword") and base is not None and len(base) == 2
+                    and origin_root is not None and origin_root[0] in ("in", "load", "load_dyn")
+                    and hi_root is not None and hi_root[0] in ("const", "in", "load", "load_dyn")
+                )
+                scalar_loads.append((ins, b, idx, is_desc_ptr, origin))
+            _step_scalar_provenance(sym, ins, dsrc)
+
+    # Forward CFG store-reachability: whether any PSB write can precede entry to block b (including loop back-edges).
+    block_writes = [bool(block_writes_list[b]) for b in range(nb)]
+    write_in = [False] * nb
+    write_out = list(block_writes)
+    changed = True
+    while changed:
+        changed = False
+        for b in range(nb):
+            if write_out[b]:
+                for s in succ[b]:
+                    if not write_in[s]:
+                        write_in[s] = True
+                        if not write_out[s]:
+                            write_out[s] = True
+                        changed = True
+
+    # Backward CFG reachability: whether any PSB write (and which write origins, including None) can follow block b.
+    write_after_out = [False] * nb
+    write_after_in = list(block_writes)
+    write_after_out_origins = [set() for _ in range(nb)]
+    write_after_in_origins = [{wo for _, wo in block_writes_list[b]} for b in range(nb)]
+    changed = True
+    while changed:
+        changed = False
+        for b in range(nb):
+            if any(write_after_in[s] for s in succ[b]):
+                if not write_after_out[b]:
+                    write_after_out[b] = True
+                    if not write_after_in[b]:
+                        write_after_in[b] = True
+                    changed = True
+            for s in succ[b]:
+                if write_after_in_origins[s]:
+                    before_o = len(write_after_out_origins[b])
+                    write_after_out_origins[b].update(write_after_in_origins[s])
+                    if len(write_after_out_origins[b]) != before_o:
+                        write_after_in_origins[b].update(write_after_out_origins[b])
+                        changed = True
+
+    # Least fixed point for multi-level descriptor-only s_load_dword* instructions.
+    known_write_origins = {wo for wo in write_origins if wo is not None}
+    desc_cand = set()
+    for ins, b, idx, is_desc_ptr, origin in scalar_loads:
+        lid = id(ins)
+        if (is_desc_ptr
+                and not _origin_chain_aliases_known(origin, known_write_origins)
+                and lid not in used_as_data
+                and (lid in used_as_desc or lid in used_as_sload_base)):
+            desc_cand.add(lid)
+    desc_only_ro = set()
+    changed = True
+    while changed:
+        changed = False
+        for lid in desc_cand:
+            if lid in desc_only_ro:
+                continue
+            children = used_as_sload_base.get(lid)
+            if children is None:
+                if lid in used_as_desc:
+                    desc_only_ro.add(lid)
+                    changed = True
+            elif children <= desc_only_ro:
+                desc_only_ro.add(lid)
+                changed = True
+
+    ro = set()
+    for ins, b, idx, is_desc_ptr, origin in scalar_loads:
+        if origin == ("code",):
+            ro.add(id(ins))
+            continue
+        if id(ins) in desc_only_ro:
+            ro.add(id(ins))
+            continue
+        w_before = write_in[b] or any(w_idx < idx for w_idx, _ in block_writes_list[b])
+        w_after = write_after_out[b] or any(w_idx > idx for w_idx, _ in block_writes_list[b])
+        if not w_before and not w_after:
+            ro.add(id(ins))
+            continue
+        if not w_before:
+            after_origins = write_after_out_origins[b] | {wo for w_idx, wo in block_writes_list[b] if w_idx > idx}
+            if origin is not None and None not in after_origins and not _origin_chain_aliases_known(origin, after_origins):
+                ro.add(id(ins))
+                continue
+        if origin is not None and not _origin_chain_aliases_known(origin, write_origins):
+            ro.add(id(ins))
+    return frozenset(ro)
+
+
 def _translate(path):
     global GUARD_MODULE_ID
     GUARD_MODULE_ID = fnv1a32(os.path.splitext(os.path.basename(path))[0])
@@ -18924,6 +21045,7 @@ def _translate(path):
     g.round_mode = any(i["op"] == "s_round_mode" or
                        (i["op"].startswith("s_setreg") and "HW_REG_MODE" in i["args"][0].get("t", ""))
                        for i in insns)
+    g.ftz32 = bool(FLOAT_CONTROLS and FTZ32 and not _disables_ftz32(insns))
     w64_marks, code_w64, code_w32 = wave_markers(insns)
     # Authoritative wave size from the FSSM header flags at 0xD4 bit 5 (0x20 = wave32, 0 = wave64;
     # verified with 0 contradictions across all 26,503 corpus blobs). Falls back to the code-marker
@@ -19207,10 +21329,18 @@ def _translate(path):
         g.vm_latch = stage == "ps" and exec_changes_after_vm([insns], [[]])
         g.park_masks(([insns], [[]]))
         halves_analysis(g, [insns], [[]])
+        meta_extra = {}
         g.build_meta = _shader_meta.collect(path, info["name"], [insns], [[]],
-                                            user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
+                                            user_sgpr_limit=user_limit, system_sgprs=sys_sgprs, extra=meta_extra)
+        if g.build_meta.get("literal_samplers"):
+            g.literal_samplers = [tuple(w) for w in g.build_meta["literal_samplers"]]
+            g.literal_sampler_index = {w: i for i, w in enumerate(g.literal_samplers)}
+            g.literal_sampler_sites = meta_extra.get("literal_sampler_sites", {})
         g.fit_shared_memory()
         end = next((k for k, ins in enumerate(insns) if base_op(ins["op"]) == "s_endpgm"), len(insns))
+        g.tsharp_from_heap = descriptor_sources.analyse([insns[:end]], [[]], user_limit, sys_sgprs)
+        g.scalar_load_ro = analyse_scalar_load_ro([insns[:end]], [[]], user_limit, sys_sgprs)
+        g.float_only_images = float_only_image_ops([insns[:end]], [[]])
         g.exec_changes = any(g.may_write_exec(ins) for ins in insns[:end])
         g.insns(insns[:end])
         _translate.last_gen = g
@@ -19277,10 +21407,18 @@ def _translate(path):
     g.vm_latch = stage == "ps" and exec_changes_after_vm(blocks, succ)
     g.park_masks((blocks, succ))
     halves_analysis(g, blocks, succ)
+    meta_extra = {}
     g.build_meta = _shader_meta.collect(path, info["name"], blocks, succ,
-                                        user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
+                                        user_sgpr_limit=user_limit, system_sgprs=sys_sgprs, extra=meta_extra)
+    if g.build_meta.get("literal_samplers"):
+        g.literal_samplers = [tuple(w) for w in g.build_meta["literal_samplers"]]
+        g.literal_sampler_index = {w: i for i, w in enumerate(g.literal_samplers)}
+        g.literal_sampler_sites = meta_extra.get("literal_sampler_sites", {})
 
     g.bar_rounds = needs_barrier_rounds(g, blocks, succ)
+    g.tsharp_from_heap = descriptor_sources.analyse(blocks, succ, user_limit, sys_sgprs)
+    g.scalar_load_ro = analyse_scalar_load_ro(blocks, succ, user_limit, sys_sgprs)
+    g.float_only_images = float_only_image_ops(blocks, succ)
     folds, fold_chain, absorbed = {}, {}, set()
     if g.emulate:
         g.scc_live = wave64_emulate_opt.scc_live_outs(blocks, succ)
@@ -20080,7 +22218,9 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "MinLod": "shaderResourceMinLod", "Image1D": "shaderImage1D? (core)", "Sampled1D": "core",
              "ClipDistance": "shaderClipDistance", "CullDistance": "shaderCullDistance",
              "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex",
-             "DrawParameters": "shaderDrawParameters",
+             "DrawParameters": "shaderDrawParameters", "DotProductKHR": "shaderIntegerDotProduct",
+             "VulkanMemoryModel": "vulkanMemoryModel",
+             "VulkanMemoryModelDeviceScope": "vulkanMemoryModelDeviceScope",
              }     # FMAKHR: shaderFmaFloat32 / shaderFmaFloat64 (VK_KHR_shader_fma) by the width used, below
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          # How fused multiply-adds were emitted. --fma khr is already implied by the FMAKHR capability,
@@ -20108,6 +22248,13 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         # The module reads the kind word from every table entry it hits: the runtime must fill it
         # (runtime/src/descriptor_table.h, docs/design.md "Images and samplers (T# dimension)").
         m["descriptor_table"] = g.descriptor_table
+    # Every module of this translator reads a T#'s bindless index from its dword 6 where the word carries one, so the
+    # runtime must write that word into the heaps it keeps (docs/design.md, "Bindless index in the T#"). The counts
+    # say how many image instructions take it alone and how many still look the T# up in the hash table too.
+    m["tsharp_index"] = TSHARP_INDEX
+    if g.tsharp_index_reads or g.tsharp_lookups:
+        m["tsharp_index_reads"] = g.tsharp_index_reads
+        m["tsharp_lookups"] = g.tsharp_lookups
     if g.w64g:
         # SHADER-10: partition invariance on 32-wide subgroups. A and B are exact there (B: aggregated atomics up to
         # the order of the slots), C is not; the reasons name the construct (docs/design.md, Wave64 graphics).
@@ -20133,6 +22280,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["float_controls"] = [f"shaderSignedZeroInfNanPreserveFloat{w}" for w in widths]
         if "DenormPreserve" in caps:
             m["float_controls"].append("shaderDenormPreserveFloat16")
+        if "DenormFlushToZero" in caps:
+            m["float_controls"].append("shaderDenormFlushToZeroFloat32")
     if g.uses_codebase:
         m["uses_code_base"] = True
     if g.cs:
@@ -20224,8 +22373,14 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
             m["f16_halves"] = {str(n): [lo, hi] for n, (lo, hi) in sorted(pairs.items())}
             if "mesh_compute" in m:     # tools/mesh_compute_vs.py exports them from the slot's raw params
                 m["mesh_compute"] = dict(m["mesh_compute"], f16_halves=m["f16_halves"])
+    if getattr(g, "reads_glc_buffer", False):
+        m["reads_glc_buffer"] = True
     if g.build_meta:
         m.update(g.build_meta)
+    m.setdefault("writes_buffer", False)
+    m.setdefault("buffer_write_slots", [])
+    if getattr(g, "uses_lit_sampler_spec", False) and m.get("literal_samplers"):
+        m["literal_sampler_spec_base"] = 0
     return m
 
 
@@ -20526,9 +22681,12 @@ def main():
     ap.add_argument("--dispatch-loop", action="store_true",
                     help="emit control flow the old way, as one loop around a switch (to compare with the default)")
     ap.add_argument("--no-float-controls", action="store_true",
-                    help="don't declare SignedZeroInfNanPreserve or DenormPreserve (for a driver whose "
-                         "shaderSignedZeroInfNanPreserveFloat32 or shaderDenormPreserveFloat16 is false); NaN, inf, "
-                         "-0 and f16 denormals are then not guaranteed")
+                    help="don't declare SignedZeroInfNanPreserve, DenormPreserve or DenormFlushToZero (for a driver "
+                         "whose float-control properties are false); NaN, inf, -0 and f16/f32 denormals are then not "
+                         "guaranteed")
+    ap.add_argument("--no-ftz32", action="store_true",
+                    help="don't declare DenormFlushToZero 32; keep software f32 denormal flushes instead (for a driver "
+                         "whose shaderDenormFlushToZeroFloat32 is false, e.g. llvmpipe)")
     ap.add_argument("--wave64-emulate", action="store_true",
                     help="wave64 compute and mesh shaders exact on any subgroup size (32-wide NVIDIA, Intel): "
                          "cross-lane operations go through workgroup memory instead of subgroup operations")
@@ -20536,6 +22694,9 @@ def main():
                     help="wave64 vertex, pixel and geometry shaders that are not exact on 32-wide subgroups (tier C of "
                          "tools/wave64_halves.py): warn = count them in the summary and mark them in the index, "
                          "error = refuse them (Unsupported), off = skip the analysis")
+    ap.add_argument("--integer-dot-fallback", action="store_true",
+                    help="4x8-bit dot products (v_dot4_*) as extracts, multiplies and adds instead of "
+                         "SPV_KHR_integer_dot_product, for devices without shaderIntegerDotProduct")
     ap.add_argument("--bary-fallback", action="store_true",
                     help="pixel shaders that read raw barycentrics take them from an ordinary interpolated input "
                          "(metadata: bary_fallback_input) instead of BaryCoordKHR, for devices without "
@@ -20616,6 +22777,7 @@ def main():
     DESCRIPTOR_TABLE = a.descriptor_table
     LOOP_LIMIT = a.loop_limit
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
+    global INTEGER_DOT_FALLBACK
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
     global MESH_SERIAL_WAVES
     global PC_TAIL_UBO, ADDRESS_GUARD
@@ -20626,11 +22788,13 @@ def main():
     SHADER_CLOCK = a.shader_clock == "khr"
     FMA_EXACT = a.fma == "exact"
     STRUCTURED = not a.dispatch_loop
-    global FLOAT_CONTROLS
+    global FLOAT_CONTROLS, FTZ32
     FLOAT_CONTROLS = not a.no_float_controls
+    FTZ32 = not a.no_ftz32
     WAVE64_EMULATE = a.wave64_emulate
     WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback
+    INTEGER_DOT_FALLBACK = a.integer_dot_fallback
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
     MESH_SERIAL_WAVES = a.mesh_serial_waves

@@ -338,6 +338,8 @@ static int run(int argc, char** argv) {
     f12.bufferDeviceAddress = VK_TRUE;
     f12.shaderBufferInt64Atomics = int64_atomics ? VK_TRUE : VK_FALSE;
     f12.shaderSharedInt64Atomics = int64_atomics && f12q.shaderSharedInt64Atomics ? VK_TRUE : VK_FALSE;
+    f12.vulkanMemoryModel = f12q.vulkanMemoryModel;
+    f12.vulkanMemoryModelDeviceScope = f12q.vulkanMemoryModel && f12q.vulkanMemoryModelDeviceScope ? VK_TRUE : VK_FALSE;
     if (f13q.subgroupSizeControl || require_wave64) {
         f13.subgroupSizeControl = f13q.subgroupSizeControl;
         f13.computeFullSubgroups = require_wave64 || observed_full ? VK_TRUE : VK_FALSE;

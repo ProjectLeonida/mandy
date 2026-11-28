@@ -45,6 +45,9 @@
 #include "placed_image_map_note.h"
 #include "../src/dstorage_trace.h"
 #include "../src/gpu_label_memory.h"
+#include "../src/title_frames.h"
+#include "../src/title_heap.h"
+#include "../src/title_mirror_space.h"
 #include "../src/title_page_watch.h"
 #include "../src/title_geometry_watch.h"
 #include "../src/title_va_alias.h"
@@ -81,12 +84,77 @@ void note_attributes(const char* api, uint64_t attributes, size_t size, const vo
 // The title's XMemAlloc blocks come from a heap of their own instead of the CRT heap (LEONIDA_TITLE_HEAP=0: not). Slot-133
 // imports pin title memory page by page for the GPU, and on the CRT heap a pinned page also holds the runtime's own
 // objects (g_pages' nodes among them): a GPU store past a buffer's end, or into a block freed while its import still
-// lived, then corrupted the runtime (speed-30/41/49-52: g_pages found corrupt under g_phys_mutex). Each block keeps its
-// size and the heap allocation it sits in just below it.
+// lived, then corrupted the runtime (speed-30/41/49-52: g_pages found corrupt under g_phys_mutex).
+//
+// The heap is the runtime's own (src/title_heap.h) over a reservation in the page mirror's range
+// (src/title_mirror_space.h), so a V# or pointer the title writes into a block reaches the mirror at heap_base + the
+// block's address, and its committed pages are fed to the mirror as they are committed (they read the title's bytes
+// there, not zeros). RtlCreateHeap over a given base faults under Wine. Where the range cannot take the reservation, a
+// heap the host places, as before (each block keeps its size and the heap allocation it sits in just below it).
 struct TitleHeapHeader {
     void* raw;
     size_t size;
 };
+constexpr size_t kTitleHeapBytes = size_t(32) << 30;  // address range only: pages are committed as blocks need them
+
+// Tells the page mirror that the pages of [at, at + bytes) of the heap are committed (each shows itself) or not any
+// more (defined with the feed, below).
+void feed_heap_pages(uintptr_t at, size_t bytes, bool committed);
+
+leonida::TitleHeap& mirror_heap() {
+    static leonida::TitleHeap heap;
+    return heap;
+}
+bool mirror_heap_ready() {
+    static const bool ready = [] {
+        const char* v = std::getenv("LEONIDA_TITLE_HEAP");
+        if (v && std::strcmp(v, "0") == 0) return false;
+        uintptr_t base = 0;
+        bool write_watched = false;
+        const bool want_watch = leonida::title_write_watch::enabled();
+        // Not "plain": every committed page is fed to the mirror as it is committed, so a pointer the title wrote reads
+        // its bytes without anything naming the range first. Try MEM_WRITE_WATCH on this private reservation (never
+        // combined with MEM_LARGE_PAGES, MEM_PHYSICAL, or section views), falling back silently to MEM_RESERVE.
+        leonida::title_mirror_space::take(kTitleHeapBytes, 0x10000, false, [&](std::uint64_t at) {
+            base = leonida::TitleHeap::reserve(
+                [&](bool try_ww) -> uintptr_t {
+                    if (try_ww && !want_watch) return 0;
+                    void* const made =
+                        VirtualAlloc(reinterpret_cast<void*>(static_cast<uintptr_t>(at)), kTitleHeapBytes,
+                                     MEM_RESERVE | (try_ww ? MEM_WRITE_WATCH : 0), PAGE_READWRITE);
+                    return reinterpret_cast<uintptr_t>(made);
+                },
+                write_watched);
+            return base != 0;
+        });
+        if (base && write_watched) leonida::title_write_watch::add(base, kTitleHeapBytes);
+        leonida::TitleHeap::Hooks hooks;
+        hooks.commit = [write_watched](uintptr_t at, size_t bytes) {
+            if (!VirtualAlloc(reinterpret_cast<void*>(at), bytes, MEM_COMMIT, PAGE_READWRITE)) return false;
+            leonida::title_memory_map::changed(at, at + bytes);
+            if (write_watched) leonida::title_write_watch::mark(at, at + bytes);
+            feed_heap_pages(at, bytes, true);
+            return true;
+        };
+        hooks.decommit = [write_watched](uintptr_t at, size_t bytes) {
+            VirtualFree(reinterpret_cast<void*>(at), bytes, MEM_DECOMMIT);
+            leonida::title_memory_map::changed(at, at + bytes);
+            leonida::geometry_writes::notify(at, at + bytes, leonida::geometry_writes::Event::replaced);
+            feed_heap_pages(at, bytes, false);
+            if (write_watched) leonida::title_write_watch::mark(at, at + bytes);
+        };
+        const bool ok = base && mirror_heap().init(base, kTitleHeapBytes, std::move(hooks), write_watched);
+        if (!ok && base) {
+            if (write_watched) leonida::title_write_watch::remove(base);
+            VirtualFree(reinterpret_cast<void*>(base), 0, MEM_RELEASE);
+        }
+        std::fprintf(stderr, "[rt] xmem: XMemAlloc blocks come from %s%s\n",
+                     ok ? "the runtime's heap in the page mirror's range" : "a heap the host places",
+                     ok && write_watched ? " (MEM_WRITE_WATCH)" : "");
+        return ok;
+    }();
+    return ready;
+}
 HANDLE title_heap() {
     static const HANDLE heap = [] {
         // Set LEONIDA_TITLE_HEAP=0 to use the CRT heap.
@@ -100,8 +168,10 @@ HANDLE title_heap() {
 }
 void* allocate_block(size_t size) {
     size = size ? size : 1;
+    if (mirror_heap_ready())
+        if (void* p = mirror_heap().allocate(size)) return p;  // full: the host's heap, as before
     const HANDLE heap = title_heap();
-    if (!heap) return _aligned_malloc(size, kAlign);
+    if (!heap) return _aligned_malloc(size, kAlign);  // LEONIDA_TITLE_HEAP=0
     const size_t extra = kAlign + sizeof(TitleHeapHeader);
     if (size > SIZE_MAX - extra) return nullptr;
     void* raw = HeapAlloc(heap, 0, size + extra);
@@ -114,14 +184,23 @@ void* allocate_block(size_t size) {
 }
 size_t block_size(void* p) {
     if (!p) return 0;
+    if (mirror_heap_ready() && mirror_heap().owns(p)) return mirror_heap().size_of(p);
     if (!title_heap()) return _aligned_msize(p, kAlign, 0);
     return (reinterpret_cast<TitleHeapHeader*>(p) - 1)->size;
 }
-void free_block(void* p) {
-    if (!p) return;
+bool free_block(void* p) {
+    if (!p) return false;
+    if (mirror_heap_ready() && mirror_heap().owns(p)) {
+        mirror_heap().release(p);
+        return true;
+    }
     const HANDLE heap = title_heap();
-    if (!heap) return _aligned_free(p);
+    if (!heap) {
+        _aligned_free(p);
+        return false;
+    }
     HeapFree(heap, 0, (reinterpret_cast<TitleHeapHeader*>(p) - 1)->raw);
+    return false;
 }
 
 // Every block and range the title gets here is recorded as the title's memory (src/title_va_alias.h): a shader
@@ -145,11 +224,13 @@ void free_title_block(void* p) {
     if(p)leonida::label::memory().release_heap(reinterpret_cast<std::uintptr_t>(p));
     if (p) leonida::title_va_aliases().remove_title_memory(reinterpret_cast<uintptr_t>(p));
     const size_t size = block_size(p);
-    free_block(p);
+    const bool from_mirror_heap = free_block(p);
     if (p) {
         const auto from = reinterpret_cast<uintptr_t>(p);
         const size_t bytes = size ? size : 1;
-        leonida::title_memory_map::changed(p, bytes);
+        // mirror_heap() reports actual OS commit/decommit via TitleHeap::Hooks; releasing a sub-block does not alter
+        // OS page mappings or protections.
+        if (!from_mirror_heap) leonida::title_memory_map::changed(p, bytes);
         leonida::geometry_writes::note_released(from, from + bytes);
     }
 }
@@ -533,6 +614,37 @@ using HostUnorderedMap =
 using AddressSet = std::set<uintptr_t, std::less<uintptr_t>, leonida::host_heap::Allocator<uintptr_t>>;
 HostUnorderedMap<uintptr_t, uint64_t> g_mapped;            // mapped 64 KiB address -> page number
 HostUnorderedMap<uint64_t, AddressSet> g_page_addresses;  // page number -> the addresses it is mapped at
+// Pages of a GPU-only range that the console queue's CopyPageMappingsBatchX gave a physical page: in g_mapped, with no
+// host view. The title's CPU never touches such a page (the range is PAGE_NOACCESS on the console), and the host reads
+// and writes it through its frame (g_table_frames, src/title_frames.h), as the runtime reads a page by its number
+// through the section's scratch view (host_page). So the copy there is a table update, as it is on the console, where
+// it edits GPU page tables only. With g_phys_mutex held.
+// A table page is not one of its physical page's host addresses (note_mapping, g_page_addresses): no host write can
+// come through it and no host guard can be set on it, so it never makes those addresses aliased. It is aliased itself
+// (note_table_page), with those addresses as its peers: a write through any of them changes its bytes, and the
+// slot-133 shadows, geometry copies and title texture watch guard it there.
+AddressSet g_table_pages;
+// The paired CPU page of a GPU-only destination (title_gpu_views) is a table page too, when the title has not mapped
+// a page there itself (title_mapped_twin): the D3D12 layer and DirectStorage read and write the GPU-only range there,
+// and they reach it through the frame table (src/title_frames.h), not through a host view. So a slot-31 copy onto a
+// paired range makes no host call at all.
+//
+// Each table page's frame, for readers that must not wait behind g_phys_mutex (title_frames' lookup, table_frame):
+// written with g_phys_mutex held under g_frame_lock exclusive, read under it shared. Nothing under it allocates on the
+// process heap, faults or logs. The entry keeps its section, so the scratch view a reader was given stays mapped.
+SRWLOCK g_frame_lock = SRWLOCK_INIT;
+struct TableFrame {
+    std::shared_ptr<Section> section;
+    uint64_t offset = 0;
+};
+// The physical page each table page holds is in g_mapped; and per physical page, its table pages (g_phys_mutex held),
+// whose alias peers follow the page's host addresses (note_mapping).
+HostUnorderedMap<uint64_t, AddressSet> g_page_tables;
+// Queue slot 31's page changes by path (rt::xmem::Slot31Counts): GPU-only pages and paired CPU pages by table,
+// paired CPU pages the title mapped itself and left as they are, and host maps or unmaps: a destination with no CPU
+// pair, and a view found at a page the table takes over (unmapped once).
+std::atomic<uint64_t> g_slot31_table_pages{0}, g_slot31_twin_pages{0}, g_slot31_twins_kept{0},
+    g_slot31_host_pages{0}, g_slot31_views_replaced{0};
 // The same aliases, for readers that must not wait behind g_phys_mutex (geometry_aliases, from the D3D12 layer's
 // submission thread: speed-16 and re-1 had it waiting there behind the streaming workers' scatter batches and the
 // render thread's queue slot 31, which hold g_phys_mutex through every MapViewOfFile3). Only addresses whose page is
@@ -541,6 +653,49 @@ HostUnorderedMap<uint64_t, AddressSet> g_page_addresses;  // page number -> the 
 std::shared_mutex g_alias_lock;
 using AddressList = std::vector<uintptr_t, leonida::host_heap::Allocator<uintptr_t>>;
 HostUnorderedMap<uintptr_t, AddressList> g_alias_peers;
+// The frames of g_table_frames, under g_frame_lock (declared with it).
+HostUnorderedMap<uintptr_t, TableFrame> g_table_frames;
+
+// The page mirror's feed (src/title_frames.h, Feed), under g_phys_mutex.
+leonida::title_frames::Feed g_mirror_feed = nullptr;
+void* g_mirror_context = nullptr;
+
+// The heap's committed pages show themselves (title_heap): fed to the page mirror as they are committed and
+// decommitted, under g_phys_mutex like every other change of the feed. Called with the heap's lock held (heap, then
+// g_phys_mutex; attach_mirror takes the heap's lock only after releasing g_phys_mutex).
+void feed_heap_pages(uintptr_t at, size_t bytes, bool committed) {
+    const std::lock_guard lock(g_phys_mutex);
+    if (!g_mirror_feed) return;
+    for (uintptr_t page = at & ~uintptr_t(kPhysicalPageSize - 1); page < at + bytes; page += kPhysicalPageSize)
+        g_mirror_feed(g_mirror_context, page, committed ? reinterpret_cast<uint8_t*>(page) : nullptr, {});
+}
+
+// With g_phys_mutex held: the page at `address` shows physical page `page` now (0: nothing), for the page mirror.
+void feed_mirror(uintptr_t address, uint64_t page) {
+    if (!g_mirror_feed || !leonida::title_mirror_space::contains(address)) return;
+    if (page) {
+        if (const auto backing = g_pages.find(page); backing != g_pages.end() && backing->second.section &&
+                                                     backing->second.section->scratch) {
+            g_mirror_feed(g_mirror_context, address,
+                          static_cast<uint8_t*>(backing->second.section->scratch) + backing->second.offset,
+                          backing->second.section);
+            return;
+        }
+    }
+    g_mirror_feed(g_mirror_context, address, nullptr, {});
+}
+
+// With g_phys_mutex held, and g_alias_lock exclusive: the table page `table`'s alias peers are the host addresses of
+// its physical page (`addresses`). A table page is not one of those addresses itself (no write can come through it),
+// but a write through any of them changes its bytes: the shadows and the watches guard it there.
+void set_table_peers_locked(uintptr_t table, const AddressSet* addresses) {
+    if (!addresses || addresses->empty()) {
+        g_alias_peers.erase(table);
+        return;
+    }
+    AddressList& peers = g_alias_peers[table];
+    peers.assign(addresses->begin(), addresses->end());
+}
 
 // With g_phys_mutex held. Keeps leonida::title_page_aliases in step: a page mapped at two or more addresses is
 // aliased at each of them (the D3D12 layer's slot-133 shadows guard those pages at every address, since a write
@@ -567,14 +722,115 @@ void note_mapping(uint64_t page, uintptr_t address, bool mapped) {
         for (const uintptr_t other : addresses)
             if (other != at) peers.push_back(other);
     }
+    // The page's table pages are written through every one of its host addresses.
+    const auto tables = g_page_tables.find(page);
+    if (tables != g_page_tables.end())
+        for (const uintptr_t table : tables->second) set_table_peers_locked(table, &addresses);
     // After the peers: a cell's watcher that sees the new mapping asks geometry_aliases for the addresses again.
     using namespace leonida::geometry_writes;
     if (state().count.load(std::memory_order_acquire)) {
         notify(address, address + kPhysicalPageSize, Event::mapping);
         for (auto other : addresses)
             if (other != address) notify(other, other + kPhysicalPageSize, Event::mapping);
+        if (tables != g_page_tables.end())
+            for (const uintptr_t table : tables->second) notify(table, table + kPhysicalPageSize, Event::mapping);
     }
+    feed_mirror(address, mapped ? page : 0);
     if (addresses.empty()) g_page_addresses.erase(page);
+}
+
+// With g_phys_mutex held. The table page at `table` held physical page `was` (0: none) and holds `page` now (0: it
+// leaves the table): its frame for the readers (g_table_frames), its physical page's list of table pages, and its alias
+// mark and peers. A table page is always aliased: its bytes change through other addresses (its physical page's host
+// views) or through the table, never through a write at its own address, so a reader guards it with the geometry
+// watch's cells there and at the peers. The caller raises the remap itself (title_memory_map, geometry_writes).
+void note_table_page(uintptr_t table, uint64_t was, uint64_t page) {
+    if (was && was != page) {
+        if (const auto it = g_page_tables.find(was); it != g_page_tables.end()) {
+            it->second.erase(table);
+            if (it->second.empty()) g_page_tables.erase(it);
+        }
+    }
+    TableFrame frame;
+    if (page) {
+        if (const auto backing = g_pages.find(page); backing != g_pages.end())
+            frame = TableFrame{backing->second.section, backing->second.offset};
+        g_page_tables[page].insert(table);
+        leonida::title_frames::note_page(table);
+    }
+    {
+        AcquireSRWLockExclusive(&g_frame_lock);
+        if (frame.section)
+            std::swap(g_table_frames[table], frame);  // the old frame is released after the lock
+        else if (const auto it = g_table_frames.find(table); it != g_table_frames.end()) {
+            frame = std::move(it->second);
+            g_table_frames.erase(it);
+        }
+        ReleaseSRWLockExclusive(&g_frame_lock);
+    }
+    leonida::title_page_aliases::set(table, page != 0);
+    feed_mirror(table, page);
+    const std::unique_lock aliases(g_alias_lock);
+    const auto addresses = page ? g_page_addresses.find(page) : g_page_addresses.end();
+    set_table_peers_locked(table, addresses != g_page_addresses.end() ? &addresses->second : nullptr);
+}
+
+// title_frames' lookup (src/title_frames.h): the frame of the table page at `page`. From any thread, with any lock of
+// the D3D12 layer's held: only g_frame_lock is taken.
+bool table_frame(std::uintptr_t page, leonida::title_frames::Frame& out) {
+    std::shared_ptr<Section> section;
+    uint64_t offset = 0;
+    AcquireSRWLockShared(&g_frame_lock);
+    if (const auto it = g_table_frames.find(page); it != g_table_frames.end()) {
+        section = it->second.section;
+        offset = it->second.offset;
+    }
+    ReleaseSRWLockShared(&g_frame_lock);
+    if (!section || !section->scratch) return false;
+    out.bytes = static_cast<uint8_t*>(section->scratch) + offset;
+    out.keep = std::move(section);
+    return true;
+}
+
+// Single-lock, zero-shared_ptr run_end over g_table_frames (src/title_frames.h).
+std::uintptr_t table_frame_run_end(std::uintptr_t from, std::uintptr_t to, bool& is_backed) {
+    constexpr std::uintptr_t kPage = leonida::title_frames::kPage;
+    if (from >= to) {
+        is_backed = false;
+        return to;
+    }
+    AcquireSRWLockShared(&g_frame_lock);
+    const auto has = [](std::uintptr_t p) -> bool {
+        const auto it = g_table_frames.find(p);
+        return it != g_table_frames.end() && it->second.section && it->second.section->scratch;
+    };
+    const std::uintptr_t first_page = from & ~(kPage - 1);
+    is_backed = has(first_page);
+    if (!is_backed && g_table_frames.empty()) {
+        ReleaseSRWLockShared(&g_frame_lock);
+        return to;
+    }
+    std::uintptr_t at = first_page + kPage;
+    while (at < to && at > from && has(at) == is_backed) at += kPage;
+    ReleaseSRWLockShared(&g_frame_lock);
+    return at < to && at > from ? at : to;
+}
+
+// Single-lock, zero-shared_ptr batch existence check over g_table_frames (src/title_frames.h).
+void table_frame_backed_batch(const std::uintptr_t* pages, std::uint8_t* out_backed, std::size_t count) {
+    constexpr std::uintptr_t kPage = leonida::title_frames::kPage;
+    if (!count) return;
+    AcquireSRWLockShared(&g_frame_lock);
+    if (g_table_frames.empty()) {
+        ReleaseSRWLockShared(&g_frame_lock);
+        for (std::size_t k = 0; k < count; ++k) out_backed[k] = 0;
+        return;
+    }
+    for (std::size_t k = 0; k < count; ++k) {
+        const auto it = g_table_frames.find(pages[k] & ~(kPage - 1));
+        out_backed[k] = (it != g_table_frames.end() && it->second.section && it->second.section->scratch) ? 1u : 0u;
+    }
+    ReleaseSRWLockShared(&g_frame_lock);
 }
 
 // Appends `value` in hex (with 0x) or decimal at `at`, which has room for it: no CRT, so no lock and no allocation.
@@ -917,8 +1173,21 @@ void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULON
         record_window(address, size, host_prot, caller, true);
         return address;
     }
+    // A reservation the title lets the host place goes into the page mirror's range (src/title_mirror_space.h), so a V#
+    // or pointer the title writes with its address reaches the mirror at heap_base + the address. `reserve(at)` makes
+    // the reservation at `at`; null when the range is spent or the host refused every address tried (then the host
+    // places it, as before).
+    const auto in_mirror_space = [&](auto&& reserve) -> void* {
+        void* made = nullptr;
+        leonida::title_mirror_space::take(size, base_granularity, !(new_placeholder || window), [&](std::uint64_t at) {
+            made = reserve(reinterpret_cast<void*>(static_cast<uintptr_t>(at)));
+            return made != nullptr;
+        });
+        return made;
+    };
     if (new_placeholder || window) {
-        void* const result = reserve_placeholder(address, size, base_granularity);
+        void* placed = address ? nullptr : in_mirror_space([&](void* at) { return reserve_placeholder(at, size, base_granularity); });
+        void* const result = placed ? placed : reserve_placeholder(address, size, base_granularity);
         if (result && window) {
             const std::lock_guard lock(g_phys_mutex);
             record_window(result, size, host_prot, caller, false);
@@ -943,6 +1212,12 @@ void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULON
         return result;
     }
     if (page_mode == kXmemLargePages && address == nullptr) {
+        if (void* placed = in_mirror_space([&](void* at) {
+                return reserve_watched(host_type | MEM_RESERVE, at, size, [&](DWORD type) {
+                    return placeholder_api().virtual_alloc2(GetCurrentProcess(), at, size, type, host_prot, nullptr, 0);
+                });
+            }))
+            return placed;
         MEM_ADDRESS_REQUIREMENTS requirements{};
         requirements.Alignment = kXmemPageSize2m;
         MEM_EXTENDED_PARAMETER parameter{};
@@ -952,6 +1227,13 @@ void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULON
             return placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size, type, host_prot, &parameter, 1);
         });
     }
+    // A reservation (or a commit at no given address, which reserves too) the host would place.
+    if (!address && (host_type & (MEM_RESERVE | MEM_COMMIT)))
+        if (void* placed = in_mirror_space([&](void* at) {
+                return reserve_watched(host_type | MEM_RESERVE, at, size,
+                                       [&](DWORD type) { return VirtualAlloc(at, size, type, host_prot); });
+            }))
+            return placed;
     return reserve_watched(host_type, address, size,
                            [&](DWORD type) { return VirtualAlloc(address, size, type, host_prot); });
 }
@@ -1047,6 +1329,19 @@ struct UnmapCause {
 // sees the failure.
 bool unmap_range_locked(uintptr_t start, uintptr_t end) {
     g_unmaps[g_unmap_count++ % kUnmapRecords] = {start, end, GetTickCount64(), t_unmap_cause};
+    // Table pages (g_table_pages) have no view: they leave the table here, and their readers are told as of an unmap.
+    for (auto table = g_table_pages.lower_bound(start); table != g_table_pages.end() && *table < end;) {
+        const uintptr_t at = *table;
+        uint64_t was = 0;
+        if (const auto mapped = g_mapped.find(at); mapped != g_mapped.end()) {
+            was = mapped->second;
+            g_mapped.erase(mapped);
+        }
+        table = g_table_pages.erase(table);
+        note_table_page(at, was, 0);
+        leonida::title_memory_map::changed(at, at + kPhysicalPageSize);
+        leonida::geometry_writes::notify(at, at + kPhysicalPageSize, leonida::geometry_writes::Event::replaced);
+    }
     auto it = g_views.upper_bound(start);
     if (it != g_views.begin()) {
         const auto prev = std::prev(it);
@@ -2024,6 +2319,135 @@ bool title_mapped_twin(uintptr_t address, uintptr_t gpu, bool unmap) {
     return true;
 }
 
+// Batched table-page update used by copy_page_mappings() so slot-31 ranges take g_frame_lock, title_page_aliases,
+// g_alias_lock, title_memory_map::changed(), and geometry_writes::notify() once per contiguous range instead of once
+// per 64 KiB page. Called with g_phys_mutex held.
+struct TablePageUpdate {
+    uintptr_t address = 0;
+    uint64_t page = 0;
+    TableFrame frame;
+};
+
+bool prepare_table_page(uintptr_t address, uint64_t page, std::vector<TablePageUpdate>& batch) {
+    if (page && !g_pages.contains(page)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    uint64_t was = 0;
+    if (const auto table = g_table_pages.find(address); table != g_table_pages.end()) {
+        const auto mapped = g_mapped.find(address);
+        // Unchanged only when the frame it holds is the memory behind the number now: a number the title freed comes
+        // back with its next allocation (g_free_slots, last in first out) naming another page, while the table entry
+        // still holds the freed one's frame. (g_table_frames is written with g_phys_mutex held, so it is read here
+        // without g_frame_lock.)
+        if (mapped != g_mapped.end() && mapped->second == page) {
+            const auto frame = g_table_frames.find(address);
+            const auto backing = page ? g_pages.find(page) : g_pages.end();
+            if (!page || (frame != g_table_frames.end() && backing != g_pages.end() &&
+                          frame->second.section == backing->second.section &&
+                          frame->second.offset == backing->second.offset))
+                return true;
+        }
+        if (mapped != g_mapped.end()) {
+            was = mapped->second;
+            g_mapped.erase(mapped);
+        }
+        g_table_pages.erase(table);
+    } else {
+        bool viewed;
+        {
+            const FaultLockShared faults;
+            viewed = view_covers(address);
+        }
+        if (viewed) {
+            if (!unmap_page(address)) return false;  // also drops its g_mapped entry
+            g_slot31_views_replaced.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (page) {
+        g_mapped[address] = page;
+        g_table_pages.insert(address);
+    }
+    if (was && was != page) {
+        if (const auto it = g_page_tables.find(was); it != g_page_tables.end()) {
+            it->second.erase(address);
+            if (it->second.empty()) g_page_tables.erase(it);
+        }
+    }
+    TableFrame frame;
+    if (page) {
+        if (const auto backing = g_pages.find(page); backing != g_pages.end())
+            frame = TableFrame{backing->second.section, backing->second.offset};
+        g_page_tables[page].insert(address);
+        leonida::title_frames::note_page(address);
+    }
+    batch.push_back({address, page, std::move(frame)});
+    return true;
+}
+
+// With g_phys_mutex held. Publishes a batch of prepared table-page updates across g_frame_lock (releasing old
+// TableFrame shared_ptrs outside the lock), title_page_aliases, feed_mirror, g_alias_lock, and per-contiguous-range
+// title_memory_map::changed() + geometry_writes::notify(Event::replaced).
+void commit_table_page_batch(std::vector<TablePageUpdate>& batch) {
+    if (batch.empty()) return;
+    std::vector<TableFrame> old_frames;
+    old_frames.reserve(batch.size());
+    {
+        AcquireSRWLockExclusive(&g_frame_lock);
+        for (TablePageUpdate& u : batch) {
+            if (u.frame.section) {
+                TableFrame prev = std::move(u.frame);
+                std::swap(g_table_frames[u.address], prev);
+                if (prev.section) old_frames.push_back(std::move(prev));
+            } else if (const auto it = g_table_frames.find(u.address); it != g_table_frames.end()) {
+                old_frames.push_back(std::move(it->second));
+                g_table_frames.erase(it);
+            }
+        }
+        ReleaseSRWLockExclusive(&g_frame_lock);
+    }
+    old_frames.clear();  // release old TableFrame shared_ptrs outside g_frame_lock
+    {
+        auto& alias_state = leonida::title_page_aliases::state();
+        std::unique_lock alias_lock(alias_state.mutex);
+        bool any_changed = false;
+        for (const TablePageUpdate& u : batch) {
+            const uintptr_t va = u.address & ~(leonida::title_page_aliases::kPageSize - 1);
+            const bool ch = u.page != 0 ? alias_state.aliased.insert(va).second
+                                        : (alias_state.aliased.erase(va) != 0);
+            any_changed = any_changed || ch;
+        }
+        if (any_changed) alias_state.generation.fetch_add(1, std::memory_order_release);
+    }
+    if (g_mirror_feed) {
+        for (const TablePageUpdate& u : batch) feed_mirror(u.address, u.page);
+    }
+    {
+        const std::unique_lock aliases(g_alias_lock);
+        for (const TablePageUpdate& u : batch) {
+            const auto addresses = u.page ? g_page_addresses.find(u.page) : g_page_addresses.end();
+            set_table_peers_locked(u.address, addresses != g_page_addresses.end() ? &addresses->second : nullptr);
+        }
+    }
+    std::vector<uintptr_t> addrs;
+    addrs.reserve(batch.size());
+    for (const TablePageUpdate& u : batch) addrs.push_back(u.address);
+    std::sort(addrs.begin(), addrs.end());
+    addrs.erase(std::unique(addrs.begin(), addrs.end()), addrs.end());
+    for (std::size_t i = 0; i < addrs.size();) {
+        const uintptr_t run_lo = addrs[i];
+        uintptr_t run_hi = run_lo + kPhysicalPageSize;
+        ++i;
+        while (i < addrs.size() && addrs[i] == run_hi) {
+            run_hi += kPhysicalPageSize;
+            ++i;
+        }
+        leonida::title_memory_map::changed(run_lo, run_hi);
+        leonida::geometry_writes::notify(run_lo, run_hi, leonida::geometry_writes::Event::replaced);
+    }
+    batch.clear();
+}
+
 bool copy_page_mappings(void* destination, const void* source, uint64_t pages, bool repeat_first) {
     const uintptr_t to = reinterpret_cast<uintptr_t>(destination);
     const uintptr_t from = reinterpret_cast<uintptr_t>(source);
@@ -2039,19 +2463,39 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
     }
     const std::lock_guard lock(g_phys_mutex);
     // The destination is usually a GPU-only reservation, which the D3D12 layer reads at its paired CPU view
-    // (title_gpu_views::to_cpu); that view gets the same pages, or it would stay reserved and never readable.
+    // (title_gpu_views::to_cpu); that view gets the same pages in the table (prepare_table_page), or it would never be
+    // readable. Both are table updates: the host reads them through their frames (src/title_frames.h).
     const uintptr_t cpu_to = leonida::title_gpu_views::to_cpu(to, pages * kPhysicalPageSize);
     const Window* const cpu_window = cpu_to != to ? find_window(cpu_to, pages * kPhysicalPageSize) : nullptr;
+    std::vector<TablePageUpdate> table_batch;
+    if (cpu_window && pages) table_batch.reserve(static_cast<std::size_t>(pages) * 2);
+    struct TableBatchCommit {
+        std::vector<TablePageUpdate>& batch;
+        ~TableBatchCommit() { commit_table_page_batch(batch); }
+    } commit_guard{table_batch};
+    // The paired CPU page follows the GPU-only one unless the title mapped a page there itself.
+    const auto twin = [&](uintptr_t cpu, uintptr_t gpu, uint64_t page, bool unmap) {
+        if (title_mapped_twin(cpu, gpu, unmap)) {
+            g_slot31_twins_kept.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        if (!prepare_table_page(cpu, page, table_batch)) return false;
+        g_slot31_twin_pages.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    };
     if (!source) {
         for (uint64_t i = 0; i < pages; ++i) {
             const uintptr_t gpu = to + i * kPhysicalPageSize, cpu = cpu_to + i * kPhysicalPageSize;
-            {
-                const UnmapCause cause("CopyPageMappingsBatchX (unmap)");
+            const UnmapCause cause("CopyPageMappingsBatchX (unmap)");
+            // A page of a paired range leaves the table; any other destination is unmapped on the host.
+            if (!cpu_window) {
                 if (!unmap_page(gpu)) return false;
+                g_slot31_host_pages.fetch_add(1, std::memory_order_relaxed);
+                continue;
             }
-            if (!cpu_window || title_mapped_twin(cpu, gpu, true)) continue;
-            const UnmapCause cause("CopyPageMappingsBatchX (unmap paired CPU page)");
-            if (!unmap_page(cpu)) return false;
+            if (!prepare_table_page(gpu, 0, table_batch)) return false;
+            g_slot31_table_pages.fetch_add(1, std::memory_order_relaxed);
+            if (!twin(cpu, gpu, 0, true)) return false;
         }
         return true;
     }
@@ -2071,18 +2515,26 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
         if (it != g_mapped.end()) found[static_cast<size_t>(i)] = it->second;
     }
     const DWORD protect = view_protect(*window);
-    const DWORD cpu_protect = cpu_window ? view_protect(*cpu_window) : 0;
     for (uint64_t i = 0; i < pages; ++i) {
         const uint64_t page = found[static_cast<size_t>(i)];
         const uintptr_t gpu = to + i * kPhysicalPageSize, cpu = cpu_to + i * kPhysicalPageSize;
         const UnmapCause cause(page ? "CopyPageMappingsBatchX (remap)" : "CopyPageMappingsBatchX (hole)");
-        if (!map_page(gpu, page, protect, MapOwner::slot31)) return false;
-        if (cpu_window && !title_mapped_twin(cpu, gpu, false) && !map_page(cpu, page, cpu_protect, MapOwner::mirror))
-            return false;
+        // Both pages of a paired range are table entries (prepare_table_page); a destination without a CPU pair (an
+        // independent-pages range, LEONIDA_SLOT31_RUNS) is read where it is, so it is mapped on the host as before.
+        if (!cpu_window) {
+            if (!map_page(gpu, page, protect, MapOwner::slot31)) return false;
+            g_slot31_host_pages.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        if (!prepare_table_page(gpu, page, table_batch)) return false;
+        g_slot31_table_pages.fetch_add(1, std::memory_order_relaxed);
+        if (!twin(cpu, gpu, page, false)) return false;
     }
     return true;
 }
 [[maybe_unused]] const bool g_copy_page_mappings_set =(rt::xmem::copy_page_mappings_fn = &copy_page_mappings, true);
+[[maybe_unused]] const bool g_slot31_mapping_counts_set =
+    (rt::xmem::slot31_mapping_counts_fn = &rt::xmem::slot31_mapping_counts, true);
 
 // The title's write watching, on reservations it made with MEM_WRITE_WATCH. One xmem write-watched for the shadows
 // (reserve_watched) is refused as the host refuses a region that is not write-watched ((UINT)-1,
@@ -2165,8 +2617,21 @@ constexpr DWORD kMemTitle = 0x40000000;
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
     const DWORD type = allocation_type & ~(kMemGraphics | kMemTitle);
     const DWORD host_prot = host_protect(protect);
-    LPVOID result =
-        reserve_watched(type, address, size, [&](DWORD t) { return VirtualAlloc(address, size, t, host_prot); });
+    LPVOID result = nullptr;
+    // A reservation the host would place goes into the page mirror's range too (src/title_mirror_space.h), as an
+    // XMemVirtualAlloc one does: a V# or pointer the title writes with its address reaches the mirror.
+    if (!address && size && (type & (MEM_RESERVE | MEM_COMMIT)) && !(type & (MEM_PHYSICAL | MEM_LARGE_PAGES))) {
+        SIZE_T rounded = 0;
+        if (round_up_size(size, kXmemPageSize64k, rounded))
+            leonida::title_mirror_space::take(rounded, kXmemPageSize64k, true, [&](std::uint64_t at) {
+                void* const there = reinterpret_cast<void*>(static_cast<uintptr_t>(at));
+                result = reserve_watched(type | MEM_RESERVE, there, size,
+                                         [&](DWORD t) { return VirtualAlloc(there, size, t, host_prot); });
+                return result != nullptr;
+            });
+    }
+    if (!result)
+        result = reserve_watched(type, address, size, [&](DWORD t) { return VirtualAlloc(address, size, t, host_prot); });
     if (result) {
         leonida::title_memory_map::changed(result, size);
         leonida::title_va_aliases().add_title_memory(reinterpret_cast<uintptr_t>(result), size);
@@ -2276,9 +2741,15 @@ BOOL title_free_impl(LPVOID address, SIZE_T size, DWORD free_type) {
     } else {
         result = VirtualFree(address, size, free_type);
     }
-    // A release of size 0 frees the whole reservation, whose extent is not known here: a change anywhere.
-    if (result && size) leonida::title_memory_map::changed(address, size);
-    else if (result) leonida::title_memory_map::changed();
+    // Report the exact released/decommitted extent whenever known so CellGuard::sync_known_protect() only invalidates
+    // overlapping tiles instead of wiping all cached page protections across the entire address space.
+    if (result) {
+        if (size) leonida::title_memory_map::changed(address, size);
+        else if (releases && release_end > start) leonida::title_memory_map::changed(start, release_end);
+        else if ((free_type & MEM_DECOMMIT) && decommit_end > start)
+            leonida::title_memory_map::changed(start, decommit_end);
+        else leonida::title_memory_map::changed();
+    }
     if (result && (free_type & MEM_DECOMMIT)) note_unwatched_change(address, size, 0, true);
     if (result && (free_type & MEM_RELEASE) && !(free_type & MEM_PRESERVE_PLACEHOLDER))
         leonida::title_write_watch::remove(reinterpret_cast<uintptr_t>(address));
@@ -2335,7 +2806,13 @@ BOOL WINAPI TitleVirtualProtect(LPVOID address, SIZE_T size, DWORD protect, PDWO
     const auto start = reinterpret_cast<uintptr_t>(address);
     // Before the call: a fault on another thread in between must not take the title's protection for a lost guard.
     note_title_protect(start, size, protect);
+    // Our guards over the range (the slot-133 shadows', the geometry and title texture watches' cells) come off first
+    // and stay off while the call runs, as for a kernel write (a pin: no refresh guards a pinned page): the protection
+    // the call returns in `old` is the title's own, never one of our read-only guards. A title that saved such an `old`
+    // and set it back later left the page read-only with no guard to answer for it, and its next write faulted.
+    const std::uint64_t pin = leonida::kernel_writes::begin_write(address, size, nullptr);
     const BOOL result = VirtualProtect(address, size, protect, old);
+    leonida::kernel_writes::end_write(pin, false);
     if (result) {
         leonida::title_memory_map::changed(start, start + size);
         leonida::geometry_writes::notify(start, start + size, leonida::geometry_writes::Event::replaced);
@@ -2652,6 +3129,56 @@ void geometry_aliases(std::uintptr_t va, std::vector<std::uintptr_t>& addresses)
 
 std::uint64_t zero_pages_taken() { return g_zero_pages.next; }
 
+void slot31_mapping_counts(Slot31Counts& out) {
+    out.gpu_pages = g_slot31_table_pages.load(std::memory_order_relaxed);
+    out.twin_pages = g_slot31_twin_pages.load(std::memory_order_relaxed);
+    out.twins_kept = g_slot31_twins_kept.load(std::memory_order_relaxed);
+    out.unpaired_pages = g_slot31_host_pages.load(std::memory_order_relaxed);
+    out.views_replaced = g_slot31_views_replaced.load(std::memory_order_relaxed);
+}
+
+// The D3D12 layer and DirectStorage reach table pages through their frames (src/title_frames.h), and guard them at
+// their physical pages' host addresses.
+// title_frames' Attach (src/title_frames.h): the page mirror's feed from now on, after every page of the mirror's range
+// mapped now (the views, then the table pages), all under g_phys_mutex.
+void attach_mirror_locked(void* context, leonida::title_frames::Feed feed);
+void attach_mirror(void* context, leonida::title_frames::Feed feed) {
+    attach_mirror_locked(context, feed);
+    if (!feed || !mirror_heap_ready()) return;
+    // The heap's committed pages, after g_phys_mutex (the heap takes it under its own lock). A page committed or
+    // decommitted meanwhile was fed by the heap itself; one fed twice is mapped twice to the same bytes.
+    std::vector<std::pair<uintptr_t, size_t>> committed;
+    mirror_heap().for_each_committed([&](uintptr_t at, size_t bytes) { committed.emplace_back(at, bytes); });
+    for (const auto& [at, bytes] : committed) feed_heap_pages(at, bytes, true);
+}
+void attach_mirror_locked(void* context, leonida::title_frames::Feed feed) {
+    const std::lock_guard lock(g_phys_mutex);
+    g_mirror_feed = feed;
+    g_mirror_context = context;
+    if (!feed) return;
+    {
+        const FaultLockShared faults;
+        for (const auto& [base, view] : g_views) {
+            if (view.zero || !view.section || !view.section->scratch) continue;
+            for (uint64_t i = 0; i < view.count; ++i) {
+                const uintptr_t at = base + i * kPhysicalPageSize;
+                if (!leonida::title_mirror_space::contains(at)) continue;
+                feed(context, at, static_cast<uint8_t*>(view.section->scratch) + view.offset + i * kPhysicalPageSize,
+                     view.section);
+            }
+        }
+    }
+    for (const auto& [at, frame] : g_table_frames)
+        if (leonida::title_mirror_space::contains(at) && frame.section && frame.section->scratch)
+            feed(context, at, static_cast<uint8_t*>(frame.section->scratch) + frame.offset, frame.section);
+}
+[[maybe_unused]] const bool g_mirror_attach_set = (leonida::title_frames::attach_fn = &attach_mirror, true);
+
+[[maybe_unused]] const bool g_title_frames_set =
+    (leonida::title_frames::set_lookup(&table_frame, &geometry_aliases, &table_frame_run_end,
+                                       &table_frame_backed_batch),
+     true);
+
 void set_fault_race_hook(FaultRaceHook hook) { g_fault_race_hook.store(hook, std::memory_order_release); }
 
 std::uint64_t fault_exits(FaultExit exit) {
@@ -2864,6 +3391,10 @@ bool transfer_physical(std::span<const uint64_t> pages, uint16_t offset, std::sp
                 const size_t bytes = (std::min)(left, size_t(kPhysicalPageSize - at));
                 if (auto mapped = g_page_addresses.find(page); mapped != g_page_addresses.end())
                     for (uintptr_t address : mapped->second) ranges.emplace_back(address + at, bytes);
+                // Its table pages too: the shadows and watches over them guard them at the host addresses above, but a
+                // pin on the table page itself makes them copy it until the write is done.
+                if (auto tables = g_page_tables.find(page); tables != g_page_tables.end())
+                    for (uintptr_t address : tables->second) ranges.emplace_back(address + at, bytes);
                 left -= bytes;
                 at = 0;
             }
@@ -2889,16 +3420,18 @@ bool transfer_physical(std::span<const uint64_t> pages, uint16_t offset, std::sp
         const size_t bytes = (std::min)(staging.size(), size_t(kPhysicalPageSize - offset));
         if (write) {
             std::memcpy(ptr, staging.data(), bytes);
-            if (auto mapped = g_page_addresses.find(page); mapped != g_page_addresses.end()) {
-                for (uintptr_t address : mapped->second) {
-                    leonida::geometry_writes::notify(address + offset, address + offset + bytes, leonida::geometry_writes::Event::write);
-                    leonida::title_texel_writes::note(reinterpret_cast<void*>(address + offset), bytes);
-                    if (leonida::dstorage::trace_enabled())
-                        std::fprintf(stderr, "[rt] ds-scatter cpu=%llx bytes=%zu page=%llu\n",
-                                     static_cast<unsigned long long>(address + offset), bytes,
-                                     static_cast<unsigned long long>(page));
-                }
-            }
+            const auto told = [&](uintptr_t address) {
+                leonida::geometry_writes::notify(address + offset, address + offset + bytes, leonida::geometry_writes::Event::write);
+                leonida::title_texel_writes::note(reinterpret_cast<void*>(address + offset), bytes);
+                if (leonida::dstorage::trace_enabled())
+                    std::fprintf(stderr, "[rt] ds-scatter cpu=%llx bytes=%zu page=%llu\n",
+                                 static_cast<unsigned long long>(address + offset), bytes,
+                                 static_cast<unsigned long long>(page));
+            };
+            if (auto mapped = g_page_addresses.find(page); mapped != g_page_addresses.end())
+                for (uintptr_t address : mapped->second) told(address);
+            if (auto tables = g_page_tables.find(page); tables != g_page_tables.end())
+                for (uintptr_t address : tables->second) told(address);
         } else {
             std::memcpy(staging.data(), ptr, bytes);
         }

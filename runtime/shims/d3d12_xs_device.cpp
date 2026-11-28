@@ -29,6 +29,7 @@
 #ifdef LEONIDA_VULKAN_DEVICE
 #include "d3d12_com.h"  // rt::d3d12::create_console_descriptor_heap for slot 14
 #include "../src/vulkan_gpu_labels.h"
+#include "../src/submit_phases.h"
 #endif
 #include "d3d12_xs_placed_depth.h"
 #include "d3d12_trace.h"
@@ -1480,7 +1481,14 @@ void arm_mirror_callback(const std::shared_ptr<MirrorLink>& link, ID3D12Fence* f
 }
 
 void wait_for_fence_progress(FenceMirror* mirror) {
+#ifdef LEONIDA_VULKAN_DEVICE
+    // Vulkan timeline semaphores are monotonic (cannot rewind); when SetEventOnCompletion succeeded, use a 1000 ms
+    // safety-net timeout instead of a 10 ms rewind poll to avoid thousands of idle Wine threadpool wakeups/s.
+    const LONGLONG poll_ms = mirror->arm_failed.load(std::memory_order_relaxed) ? 10 : 1000;
+    const LONGLONG kRewindPollInterval = -poll_ms * 10'000;  // relative 100 ns units
+#else
     constexpr LONGLONG kRewindPollInterval = -10 * 10'000;  // 10 ms in relative 100 ns units
+#endif
     ULARGE_INTEGER due{};
     due.QuadPart = static_cast<ULONGLONG>(kRewindPollInterval);
     FILETIME timeout{due.LowPart, due.HighPart};
@@ -2056,6 +2064,10 @@ bool execute_with_values(ChildProxy* self, UINT count, void* const* lists);
 // list proxy replaced by its real list (a bundle on the list side unwraps the same way at the console's
 // ExecuteBundle); the real queue never sees a proxy.
 std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word) {
+    // The "submit frame" line: the console call as a whole, its list-value waits and writes included (outermost).
+    const leonida::submit_phases::TitleCall frame_call(leonida::submit_phases::part_lists);
+    // While the title submits, a held list-value wait is not released for want of progress: this may carry its write.
+    const list_values::Pump::TitleCall title_call;
     if (lists_word &&
         execute_with_values(self, static_cast<UINT>(count_word), reinterpret_cast<void* const*>(lists_word)))
         return 0;
@@ -2274,16 +2286,29 @@ AsyncMapper& async_mapper() {
 // CopyPageMappingsBatchX's batches, copied: the remap of a deferred call runs after the caller freed its arrays.
 struct PageMappingCopy {
     std::vector<xmem::PageBatch> batches;
-    std::vector<std::vector<xmem::PageRange>> ranges;
+    std::vector<xmem::PageRange> range_storage;
     std::uintptr_t pool = 0;
     UINT pages = 0, flags = 0;
 
+    PageMappingCopy(const PageMappingCopy&) = delete;
+    PageMappingCopy& operator=(const PageMappingCopy&) = delete;
+    PageMappingCopy(PageMappingCopy&&) = delete;
+    PageMappingCopy& operator=(PageMappingCopy&&) = delete;
+
     PageMappingCopy(UINT count, const xmem::PageBatch* in, std::uintptr_t pool_, UINT pages_, UINT flags_)
-        : batches(in, in + count), ranges(count), pool(pool_), pages(pages_), flags(flags_) {
+        : batches(in, in + count), pool(pool_), pages(pages_), flags(flags_) {
+        std::size_t total_ranges = 0;
+        for (UINT b = 0; b < count; ++b)
+            if (in[b].ranges) total_ranges += in[b].count;
+        range_storage.reserve(total_ranges);
         for (UINT b = 0; b < count; ++b) {
-            if (!in[b].ranges) continue;  // xmem refuses a batch with ranges but no array; it still sees none
-            ranges[b].assign(in[b].ranges, in[b].ranges + in[b].count);
-            batches[b].ranges = ranges[b].data();
+            if (!in[b].ranges || !in[b].count) {
+                batches[b].ranges = nullptr;
+                continue;  // xmem refuses a batch with ranges but no array; zero-count batches need no dangling ptr
+            }
+            const std::size_t offset = range_storage.size();
+            range_storage.insert(range_storage.end(), in[b].ranges, in[b].ranges + in[b].count);
+            batches[b].ranges = range_storage.data() + offset;
         }
     }
 };
@@ -2503,11 +2528,24 @@ HRESULT queue_copy_page_mappings(ChildProxy* self, UINT count, const xmem::PageB
         stats.max = (std::max)(stats.max, t2 - t0);
         if (t2 - stats.since >= std::chrono::seconds(10)) {
             const auto ms = [](clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
+            // Pages changed by a table update alone (GPU-only pages with a CPU pair, and those pairs' CPU pages) and
+            // by a host map or unmap (a wineserver round trip each under Wine), since the last line, by path
+            // (rt::xmem::Slot31Counts).
+            static rt::xmem::Slot31Counts before{};
+            rt::xmem::Slot31Counts now{};
+            if (rt::xmem::slot31_mapping_counts_fn) rt::xmem::slot31_mapping_counts_fn(now);
+            const auto since = [](std::uint64_t a, std::uint64_t b) { return static_cast<unsigned long long>(a - b); };
             std::fprintf(stderr, "[rt] d3d12_xs: queue slot 31: %llu calls (%llu batches) in %.0f s: %.1f ms waiting "
-                                 "for the queue, %.1f ms mapping, %.1f ms the longest call\n",
+                                 "for the queue, %.1f ms mapping, %.1f ms the longest call; pages %llu by table, %llu "
+                                 "by host remap (table: %llu GPU-only, %llu CPU twins; %llu twins the title mapped "
+                                 "kept; host: %llu with no CPU pair, %llu views replaced)\n",
                          static_cast<unsigned long long>(stats.calls), static_cast<unsigned long long>(stats.ranges),
                          std::chrono::duration<double>(t2 - stats.since).count(), ms(stats.wait), ms(stats.map),
-                         ms(stats.max));
+                         ms(stats.max), since(now.table(), before.table()), since(now.host(), before.host()),
+                         since(now.gpu_pages, before.gpu_pages), since(now.twin_pages, before.twin_pages),
+                         since(now.twins_kept, before.twins_kept), since(now.unpaired_pages, before.unpaired_pages),
+                         since(now.views_replaced, before.views_replaced));
+            before = now;
             stats = {};
             stats.since = t2;
         }
@@ -2704,6 +2742,9 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             const unsigned present_x_slot =
                 newer && !qroutes.present_x_set ? qroutes.present_x + 2 : qroutes.present_x;
             if (Slot >= self->slot_count) {
+                // A present stands behind the work held so far, which may then go without its values once nothing
+                // else can run (d3d12_xs_list_values.h). Noted before it, whichever presentation takes it.
+                if (Slot == present_x_slot) list_values::Pump::get().note_present();
                 HRESULT hr = S_OK;
                 bool external_queue = false;
                 if (call_presentation(self->device, [&](const PresentationHandler& p) {
@@ -4002,7 +4043,9 @@ IUnknown* list_real_or_null(const void* object) {
 // lock, so the fence values rise in submission order.
 class ValueSubmission {
 public:
-    explicit ValueSubmission(ChildProxy* queue) : queue_(queue) {}
+    explicit ValueSubmission(ChildProxy* queue, UINT reserve_lists = 0) : queue_(queue) {
+        if (reserve_lists) group_.reserve(reserve_lists);
+    }
 
     void add(ID3D12CommandList* list) { group_.push_back(list); }
 
@@ -4010,9 +4053,18 @@ public:
               const std::vector<list_values::Wait>& gate, const std::vector<list_values::Write>& writes) {
         // Pre-writes land with the group before the gate: behind the work submitted so far, before the queue stands
         // at the gate (stand_at submits the group first when a wait is unmet). A met gate is no gate: they then land
-        // behind the part, with its writes. The memory is read once here, for both.
+        // behind the part, with its writes. Evaluate each wait once into unmet_scratch_ so stand_at avoids repeating
+        // ReadProcessMemory loops when flush() has no prior group or writes to submit.
         bool met = true;
-        for (const list_values::Wait& w : gate) met = met && list_values::met_now(w);
+        if (!gate.empty()) {
+            unmet_scratch_.clear();
+            for (const list_values::Wait& w : gate) {
+                if (!list_values::met_now(w)) {
+                    unmet_scratch_.push_back(w);
+                    met = false;
+                }
+            }
+        }
         for (const list_values::Write& write : pre_writes) {
             writes_.push_back(write);
             // Landing before the part has run, a GPU timestamp of the part's would not be written yet: the CPU's
@@ -4025,7 +4077,8 @@ public:
     }
 
     void flush() {
-        if (!group_.empty()) {
+        const bool bare = group_.empty();
+        if (!bare) {
             using ExecuteFn = void(WINAPI*)(void*, std::uint64_t, ID3D12CommandList* const*);
             reinterpret_cast<ExecuteFn>(queue_->real_vtable[kQueueExecuteCommandLists])(
                 queue_->real, static_cast<std::uint64_t>(group_.size()), group_.data());
@@ -4037,7 +4090,7 @@ public:
             const std::uint64_t value = ++values->written_value;
             if (SUCCEEDED(signal(values->written, value))) {
                 values->written->SetEventOnCompletion(value, list_values::Pump::get().wake());
-                list_values::Pump::get().add_writes(queue_->values, value, std::move(writes_));
+                list_values::Pump::get().add_writes(queue_->values, value, std::move(writes_), bare);
             } else {
                 // Nothing would ever say when they may land: dropped, as without fences.
                 list_values::bump(list_values::counters().writes_failed, writes_.size());
@@ -4065,13 +4118,18 @@ private:
             list_values::bump(counters.waits_met_at_submit, waits.size());
             return;
         }
+        // Count the subset of waits in `waits` that already compared true in part().
+        if (waits.size() > unmet_scratch_.size())
+            list_values::bump(counters.waits_met_at_submit, waits.size() - unmet_scratch_.size());
         // The work before the wait goes first; its writes are in flight from here on, so a relay can find them.
-        flush();
+        const bool had_work = !group_.empty() || !writes_.empty();
+        if (had_work) flush();
         list_values::QueueValues* values = queue_->values.get();
         if (!values) return;  // no fences: the wait runs on, as before
         std::vector<list_values::Wait> unmet;
-        for (const list_values::Wait& w : waits) {
-            if (list_values::met_now(w)) {
+        unmet.reserve(unmet_scratch_.size());
+        for (const list_values::Wait& w : unmet_scratch_) {
+            if (had_work && list_values::met_now(w)) {
                 list_values::bump(counters.waits_met_at_submit);
                 continue;
             }
@@ -4090,13 +4148,14 @@ private:
         if (unmet.empty()) return;
         const std::uint64_t value = ++values->gate_value;
         list_values::bump(counters.gates_held);
-        list_values::Pump::get().add_gate(queue_->values, value, std::move(unmet));
         wait(values->gate, value);
+        list_values::Pump::get().add_gate(queue_->values, value, std::move(unmet));
     }
 
     ChildProxy* queue_;
     std::vector<ID3D12CommandList*> group_;
     std::vector<list_values::Write> writes_;
+    std::vector<list_values::Wait> unmet_scratch_;
 };
 
 bool execute_with_values(ChildProxy* self, UINT count, void* const* lists) {
@@ -4112,7 +4171,7 @@ bool execute_with_values(ChildProxy* self, UINT count, void* const* lists) {
             std::fprintf(stderr, "[rt] d3d12_xs: no fences for list memory writes and waits: their parts run "
                                  "without them\n");
     }
-    ValueSubmission submission(self);
+    ValueSubmission submission(self, count);
     for (UINT i = 0; i < count; ++i) {
         if (!is_list_proxy_impl(lists[i])) {
             const std::uint64_t entry = unwrap_object(reinterpret_cast<std::uint64_t>(lists[i]));
@@ -7090,8 +7149,9 @@ const char* list_tail_slot_name(unsigned slot, unsigned char console_layout) {
 // Every counter of list_values::Counters, by name: the stats and their reset stay in step.
 #define LEONIDA_LIST_VALUE_COUNTERS(X)                                                                         \
     X(writes_recorded) X(writes_landed) X(writes_failed) X(waits_recorded) X(waits_met_at_submit)            \
-    X(waits_relayed) X(gates_held) X(gates_met) X(gates_timed_out) X(cuts) X(cuts_deferred) X(cut_failures)  \
-    X(gates_short) X(demotions) X(late_met) X(bundle_ops) X(releases) X(release_us) X(release_us_max)        \
+    X(waits_relayed) X(gates_held) X(gates_met) X(gates_released) X(released_present) X(released_cycle)      \
+    X(released_stalled) X(released_lost) X(met_after_release) X(cuts) X(cuts_deferred) X(cut_failures)        \
+    X(bundle_ops) X(releases) X(release_us) X(release_us_max)                                                 \
     X(pass_us_max) X(release_stalls) X(remaps_now) X(remaps_deferred) X(remaps_failed) X(remap_wait_us_max)    \
     X(stamps_gpu) X(stamps_cpu) X(labels_handed) X(writes_arena) X(writes_title_pages)
 
@@ -7109,10 +7169,16 @@ void reset_list_value_stats() {
 #define LEONIDA_RESET(name) c.name.store(0, std::memory_order_relaxed);
     LEONIDA_LIST_VALUE_COUNTERS(LEONIDA_RESET)
 #undef LEONIDA_RESET
+    c.gpu_relay_downgraded_bare.store(0, std::memory_order_relaxed);
+    c.gpu_relay_downgraded_val.store(0, std::memory_order_relaxed);
 }
 #undef LEONIDA_LIST_VALUE_COUNTERS
 
-void set_list_value_wait_timeout_ms(unsigned ms) { list_values::Pump::get().set_timeout_ms(ms); }
+void set_list_value_signal_submitted_hook(bool (*hook)(ID3D12Fence*, std::uint64_t)) {
+    list_values::signal_submitted_hook() = hook;
+}
+
+void note_list_value_present() { list_values::Pump::get().note_present(); }
 
 void set_list_values_enabled(bool on) { list_values::set_enabled(on); }
 

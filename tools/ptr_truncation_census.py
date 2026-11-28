@@ -68,7 +68,7 @@ class _Reached(Exception):
         self.args_ = (blocks, succ, user_sgpr_limit, system_sgprs)
 
 
-def _capture(_path, _name, blocks, succ, user_sgpr_limit=32, system_sgprs=()):
+def _capture(_path, _name, blocks, succ, user_sgpr_limit=32, system_sgprs=(), extra=None):
     raise _Reached(blocks, succ, user_sgpr_limit, system_sgprs)
 
 

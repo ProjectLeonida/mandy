@@ -62,6 +62,11 @@ class SampledDynamicIndex(unittest.TestCase):
             more |= {res for res, true_value, false_value in re.findall(
                 r"(%\w+) = OpSelect %uint %\w+ (%\w+) (%\w+)", asm)
                 if true_value in lookup_indices and false_value == "%c0"}
+            # These T#s come from user SGPRs, not a heap slot, so they are looked up, and the index word of their
+            # dword 6 wins where it carries the tag (docs/design.md, "Bindless index in the T#"): an OpPhi of the
+            # word and the lookup's index, which runs only without the word.
+            more |= {res for res, probed in re.findall(
+                r"(%\w+) = OpPhi %uint %\w+ %\w+ (%\w+) %\w+", asm) if probed in lookup_indices}
             if more <= lookup_indices:
                 break
             lookup_indices |= more
@@ -91,12 +96,20 @@ class SampledDynamicIndex(unittest.TestCase):
 
     def test_sample_with_literal_sampler_still_indexes_both_arrays_dynamically(self):
         fixture = Path(__file__).with_name("fixtures") / "sampled_dynamic_index.asm"
-        asm = support.translate_lines("ps_dynamic_index", fixture.read_text(encoding="utf-8").splitlines())
+        lines = fixture.read_text(encoding="utf-8").splitlines()
+        asm = support.translate_lines("ps_dynamic_index", lines)
         self.check_accesses(asm, (0, 1))
         self.assertIn("OpSampledImage", asm)
         self.assertIn("OpImageSampleExplicitLod", asm)
+        # Bilinear literal S# (word2 = 0x14500000) is float-only (Item 3B.6), so dead uint/sint aliases are elided.
+        for signedness in (1, 2):
+            self.assertNotIn(f"%itx{signedness}_0", asm)
+        # Point-filtered literal S# (word2 = 0) retains UINT/SINT aliases of binding 0, still dynamically indexed.
+        point_lines = [ln.replace("0x14500000", "0x0") for ln in lines]
+        asm_point = support.translate_lines("ps_dynamic_index_pt", point_lines)
+        self.check_accesses(asm_point, (0, 1))
         for signedness in (1, 2):  # UINT/SINT alias the same sampled binding as the float view.
-            self.assertRegex(asm, rf"OpAccessChain %_ptr_UC_itx{signedness}_0 %itx{signedness}_0 ")
+            self.assertRegex(asm_point, rf"OpAccessChain %_ptr_UC_itx{signedness}_0 %itx{signedness}_0 ")
 
     def test_fetch_and_query_paths(self):
         for op, dim, coords, sampler, expected_op, bindings in (

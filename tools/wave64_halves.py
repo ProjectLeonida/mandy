@@ -359,7 +359,8 @@ class Analysis:
                         if x.get("k") == "vgpr":
                             movrel_min = x["r"] if movrel_min is None else min(movrel_min, x["r"])
                 if op == "v_writelane_b32" and len(a) == 3 and a[0].get("k") == "vgpr" and a[0].get("n", 1) == 1 \
-                        and a[2].get("k") == "imm" and a[1].get("k") != "vgpr":
+                        and a[2].get("k") == "imm" and not (a[2].get("neg") or a[2].get("abs")) \
+                        and a[1].get("k") != "vgpr":
                     vr = a[0]["r"]
                     slot = lane_masks.lane_slot(a[0], a[2])
                     if slot and (slot in self.masks.get(id(ins), {}) or self.is_mask(ins, a[1])):
@@ -367,14 +368,13 @@ class Analysis:
                     else:
                         candidates.add(vr)
                     continue
-                if op == "v_readlane_b32" and len(a) == 3 and a[1].get("k") == "vgpr" and a[1].get("n", 1) == 1 \
-                        and a[2].get("k") == "imm":
+                if op == "v_readlane_b32" and len(a) == 3 and a[0].get("k") != "vgpr" \
+                        and a[1].get("k") == "vgpr" and a[1].get("n", 1) == 1 \
+                        and a[2].get("k") == "imm" and not (a[2].get("neg") or a[2].get("abs")):
                     vr = a[1]["r"]
                     slot = lane_masks.lane_slot(a[1], a[2])
                     if slot and slot in self.masks.get(id(ins), {}):
                         disqualified.add(vr)
-                    else:
-                        candidates.add(vr)
                     continue
                 for x in a:
                     for r in _regs(x):

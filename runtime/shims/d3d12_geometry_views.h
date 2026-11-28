@@ -1,8 +1,10 @@
 #pragma once
 
 #include "d3d12_title_buffer_windows.h"
+#include "../src/command_list_epochs.h"
 #include "../src/memory_breakdown.h"
 #include "../src/title_geometry_watch.h"
+#include "../src/submit_phases.h"
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -55,8 +57,9 @@ class GeometryViews {
     struct Retired {
         VkDeviceSize va{};
         std::size_t size{};
-        std::uint64_t ticket{};  // kAfterExecutes until execute_end() stamps it
-        std::uint64_t epoch{};   // the last execute begun when it was retired (kAfterExecutes only)
+        std::uint64_t ticket{};  // kAfterExecutes until execute_end() / stamp_retired() stamps it
+        std::uint64_t epoch{};   // the last execute enqueued when it was retired (kAfterExecutes only)
+        std::uint64_t lists{};   // the command-list epoch of the retirement (kAfterExecutes only)
     };
     std::uint64_t cap_override_{};
     mutable std::mutex mutex_;
@@ -112,15 +115,23 @@ class GeometryViews {
     std::map<Address, Tile> tiles_;
     std::vector<Retired> retired_;
     std::atomic<std::size_t> retired_count_{0};
-    // The ExecuteCommandLists replays in progress (execute_begin/execute_end), by the serial each began with. A view
-    // retired at kAfterExecutes may be named by any of them: by a list recorded before the retirement, or by a console
-    // heap slot their before_execute_ translated. It gets its retire ticket only once all of them have recorded their
-    // submissions, so a ticket read then covers them, however many tickets a replay records and on whichever queue.
+    // The ExecuteCommandLists replays in progress (execute_enqueue/execute_end), by the serial each enqueued with.
+    // A view retired at kAfterExecutes may be named by any of them (console heap slots their before_execute_
+    // translated) or by any live command list recorded before the retirement (src/command_list_epochs.h). It gets
+    // its retire ticket only once all such replays have recorded their submissions and all such command lists are gone,
+    // so a ticket read then covers them, however many tickets a replay records and on whichever queue.
     std::mutex execute_mutex_;  // a leaf lock
     std::uint64_t execute_serial_{};
     std::vector<std::uint64_t> executing_;
     std::atomic<bool> unstamped_{false};
     leonida::geometry_writes::ReleaseQueue releases_;
+    leonida::geometry_writes::WriteQueue writes_;
+    std::unordered_map<Address, std::vector<Address>> peer_to_tiles_;
+    std::vector<Address> written_queue_scratch_;
+    std::vector<Address> hot_tiles_scratch_;
+    std::vector<Address> hot_overlap_tiles_;
+    std::vector<Address> candidate_vas_;
+    std::uint64_t hot_gen_seen_ = ~std::uint64_t(0);
     std::atomic<std::uint64_t> free_generation_{0};
     std::uint64_t serial_{}, bytes_{}, cap_refusals_{}, allocation_failures_{}, ready_{}, uploads_{}, uploaded_{};
     std::uint64_t submissions_{}, dirty_refreshes_{}, refilled_{}, tile_fills_{};
@@ -141,15 +152,26 @@ class GeometryViews {
     std::uint64_t cleared_{};
     bool retry_{};
 
+    void unregister_peers_locked(Address va, const std::vector<std::pair<Address, Cell*>>& peers) {  // mutex_ held
+        for (const auto& item : peers) {
+            const auto pit = peer_to_tiles_.find(item.first);
+            if (pit == peer_to_tiles_.end()) continue;
+            std::erase(pit->second, va);
+            if (pit->second.empty()) peer_to_tiles_.erase(pit);
+        }
+    }
+
     void detach_tiles_locked(std::size_t id, Address source, std::size_t size) {  // mutex_ held
         for (auto p = source & ~(tile_size - 1); p < source + size; p += tile_size) {
             const auto it = tiles_.find(p);
             if (it == tiles_.end()) continue;
             std::erase(it->second.views, id);
             if (it->second.views.empty()) {
+                unregister_peers_locked(p, it->second.peers);
                 for (auto [peer, cell] : it->second.peers) leonida::geometry_writes::release(peer);
                 if (it->second.primary) leonida::geometry_writes::release(p);
                 tiles_.erase(it);
+                hot_gen_seen_ = ~std::uint64_t(0);
             }
         }
     }
@@ -163,9 +185,14 @@ class GeometryViews {
             std::vector<Address> others;
             if (auto aliases = watch::aliases.load(std::memory_order_acquire)) aliases(va, others);
             auto old = std::move(t.peers);
-            for (auto peer : others) t.peers.emplace_back(peer, watch::acquire(peer));
+            unregister_peers_locked(va, old);
+            for (auto peer : others) {
+                t.peers.emplace_back(peer, watch::acquire(peer));
+                peer_to_tiles_[peer].push_back(va);
+            }
             for (auto [peer, cell] : old) watch::release(peer);
             t.mapping = mapping;
+            hot_gen_seen_ = ~std::uint64_t(0);
         }
         for (auto [addr, peer] : t.peers)
             version = (std::max)(version, peer->version.load(std::memory_order_acquire));
@@ -176,6 +203,37 @@ class GeometryViews {
         t.version = version;
         retry_ |= t.retry;
         return !t.retry;
+    }
+
+    // Rebuilds `hot_overlap_tiles_` (sorted, unique primary tile VAs in `tiles_` whose primary or any peer is
+    // currently hot in geometry_writes) whenever `hot_generation` or `tiles_`/`peer_to_tiles_` changed. mutex_ held.
+    void sync_hot_overlap_locked() {
+        auto& s = leonida::geometry_writes::state();
+        if (s.hot_count.load(std::memory_order_acquire) == 0) {
+            hot_overlap_tiles_.clear();
+            hot_gen_seen_ = ~std::uint64_t(0);
+            return;
+        }
+        const std::uint64_t gen = s.hot_generation.load(std::memory_order_acquire);
+        if (gen == hot_gen_seen_) return;
+        hot_overlap_tiles_.clear();
+        if (!tiles_.empty()) {
+            leonida::geometry_writes::hot_tiles(hot_tiles_scratch_);
+            for (const Address h : hot_tiles_scratch_) {
+                if (tiles_.find(h) != tiles_.end()) hot_overlap_tiles_.push_back(h);
+                if (!peer_to_tiles_.empty()) {
+                    if (const auto pit = peer_to_tiles_.find(h); pit != peer_to_tiles_.end()) {
+                        for (const Address primary : pit->second) hot_overlap_tiles_.push_back(primary);
+                    }
+                }
+            }
+            if (hot_overlap_tiles_.size() > 1) {
+                std::sort(hot_overlap_tiles_.begin(), hot_overlap_tiles_.end());
+                hot_overlap_tiles_.erase(std::unique(hot_overlap_tiles_.begin(), hot_overlap_tiles_.end()),
+                                         hot_overlap_tiles_.end());
+            }
+        }
+        hot_gen_seen_ = gen;
     }
     // The tile's 64 KiB as this refresh read it, or null when it could not be read whole. Read at most once a refresh.
     template<class Copy>
@@ -218,8 +276,12 @@ public:
     explicit GeometryViews(std::uint64_t cap_override = 0) : cap_override_(cap_override) {
         pool_.set_system_memory(system_memory_setting());
         leonida::geometry_writes::subscribe(releases_);
+        leonida::geometry_writes::subscribe_writes(writes_);
     }
-    ~GeometryViews() { leonida::geometry_writes::unsubscribe(releases_); }
+    ~GeometryViews() {
+        leonida::geometry_writes::unsubscribe_writes(writes_);
+        leonida::geometry_writes::unsubscribe(releases_);
+    }
     GeometryViews(const GeometryViews&) = delete;
     GeometryViews& operator=(const GeometryViews&) = delete;
     GeometryViews(GeometryViews&&) = delete;
@@ -357,7 +419,9 @@ public:
         bytes_ += bytes;
         bool ready = true;
         for (auto p = cpu & ~(tile_size - 1); p < cpu + bytes; p += tile_size) {
-            auto& tile = tiles_[p];
+            auto [tile_it, inserted] = tiles_.try_emplace(p);
+            auto& tile = tile_it->second;
+            if (inserted) hot_gen_seen_ = ~std::uint64_t(0);
             // Previously watched tiles may have other dirty views waiting for refresh().
             if (!tile.primary) update(p, tile);
             tile.views.push_back(id);
@@ -374,17 +438,20 @@ public:
     }
 
     // retire_range's ticket for a view that work already in flight may name: the ticket is taken by execute_end()
-    // once every ExecuteCommandLists replay begun by then has recorded its submissions.
+    // once every ExecuteCommandLists replay enqueued or begun by then has recorded its submissions.
     static constexpr std::uint64_t kAfterExecutes = UINT64_MAX;
 
-    // An ExecuteCommandLists replay starts (before its before_execute_ work): its serial, for execute_end().
-    std::uint64_t execute_begin() {
+    // Registers an ExecuteCommandLists batch at enqueue time (before it enters VulkanQueue::inbox_ or held_), so any
+    // view retired with kAfterExecutes while this already-recorded batch waits in an async inbox or behind a fence
+    // gate cannot be stamped and reaped until this batch has recorded its GPU submission. Paired with execute_end().
+    std::uint64_t execute_enqueue() {
         std::lock_guard lock(execute_mutex_);
         executing_.push_back(++execute_serial_);
         return execute_serial_;
     }
-    // The last replay begun, and the oldest still in progress (kAfterExecutes when none): what execute_end stamps by,
-    // for a copy the device retires the same way outside these views (a title window, DeviceState::retire_windows).
+    // The last replay enqueued, and the oldest still in progress (kAfterExecutes when none): what
+    // execute_end stamps by, for a copy the device retires the same way outside these views (a title window,
+    // DeviceState::retire_orphan_windows).
     std::uint64_t execute_epoch() {
         std::lock_guard lock(execute_mutex_);
         return execute_serial_;
@@ -395,15 +462,12 @@ public:
         for (const auto s : executing_) oldest = (std::min)(oldest, s);
         return oldest;
     }
-    // The replay that began with `serial` has recorded its submissions. Views retired while only replays now finished
-    // were in progress get submitted() (the context's submitted_retire_ticket(), read here, after those replays
-    // recorded theirs) as their retire ticket. Lock order: mutex_ -> execute_mutex_, as in retire_range.
+    // Stamps every unstamped retired view whose pre-retirement replays have finished and whose pre-retirement
+    // command lists are gone (src/command_list_epochs.h) with submitted() (the context's submitted_retire_ticket(),
+    // read after oldest_list so any list released before that read has had its submissions counted).
+    // Lock order: mutex_ -> execute_mutex_, as in retire_range.
     template<class Submitted>
-    void execute_end(std::uint64_t serial, Submitted&& submitted) {
-        {
-            std::lock_guard lock(execute_mutex_);
-            std::erase(executing_, serial);
-        }
+    void stamp_retired(Submitted&& submitted) {
         if (!unstamped_.load(std::memory_order_acquire)) return;
         std::lock_guard lock(mutex_);
         std::uint64_t oldest = kAfterExecutes;
@@ -411,14 +475,27 @@ public:
             std::lock_guard execute(execute_mutex_);
             for (const auto s : executing_) oldest = (std::min)(oldest, s);
         }
+        // Before the ticket: a list released after this read has had its submissions counted in it.
+        const std::uint64_t oldest_list = leonida::command_list_epochs::oldest();
         const std::uint64_t ticket = submitted();
         bool left = false;
         for (auto& r : retired_) {
             if (r.ticket != kAfterExecutes) continue;
-            if (r.epoch < oldest) r.ticket = ticket;
+            if (r.epoch < oldest && r.lists <= oldest_list) r.ticket = ticket;
             else left = true;
         }
         unstamped_.store(left, std::memory_order_release);
+    }
+    // The replay that was enqueued with `serial` has recorded its submissions (or was dropped). Views retired while
+    // only replays now finished and command lists now gone were live get submitted() as their retire ticket.
+    template<class Submitted>
+    void execute_end(std::uint64_t serial, Submitted&& submitted) {
+        if (!serial) return;
+        {
+            std::lock_guard lock(execute_mutex_);
+            std::erase(executing_, serial);
+        }
+        stamp_retired(submitted);
     }
 
     // Retires every live view overlapping [begin, end), unlinking it from lookup/refresh/watch immediately and
@@ -474,7 +551,7 @@ public:
                     v.ready = false;
                 }
                 callbacks.push_back({v.source, v.size, v.va});
-                retired_.push_back({v.va, v.size, retire_ticket, 0});
+                retired_.push_back({v.va, v.size, retire_ticket, 0, 0});
             }
             if (!ids.empty()) {
                 std::unique_lock structure(structure_mutex_);
@@ -490,15 +567,19 @@ public:
                 for (const auto id : ids) fast_.erase({views_[id].source, views_[id].size});
                 for (const auto& k : stale_refused) fast_.erase(k);
             }
-            // No resolve() or find() answers these views from here on, so a replay that begins now cannot name them:
-            // they wait only for the replays begun so far.
+            // No resolve() or find() answers these views from here on, so a replay or command list whose recording
+            // begins now cannot name them: they wait only for replays enqueued so far and command lists already alive.
             if (retire_ticket == kAfterExecutes && !ids.empty()) {
                 std::uint64_t epoch = 0;
                 {
                     std::lock_guard execute(execute_mutex_);
                     epoch = execute_serial_;
                 }
-                for (std::size_t i = first_retired; i < retired_.size(); ++i) retired_[i].epoch = epoch;
+                const std::uint64_t lists = leonida::command_list_epochs::advance();
+                for (std::size_t i = first_retired; i < retired_.size(); ++i) {
+                    retired_[i].epoch = epoch;
+                    retired_[i].lists = lists;
+                }
             }
             for (const auto& k : stale_refused) refused_.erase(k);
             for (const auto id : ids) {
@@ -565,11 +646,33 @@ public:
         std::lock_guard serial(refresh_mutex_);
         std::unique_lock lock(mutex_);
         ++submissions_;
-        auto now = leonida::geometry_writes::state().serial.load(std::memory_order_acquire);
-        if (serial_ == now && !retry_) return;
+        sync_hot_overlap_locked();
+        const bool has_writes = writes_.pending.load(std::memory_order_acquire);
+        if (!retry_ && !has_writes && hot_overlap_tiles_.empty()) return;
+        bool overflow = false;
+        written_queue_scratch_.clear();
+        if (has_writes) leonida::geometry_writes::take_written(writes_, written_queue_scratch_, overflow);
+        candidate_vas_.clear();
+        const bool full_walk = retry_ || overflow;
+        if (!full_walk) {
+            for (const Address w : written_queue_scratch_) {
+                if (tiles_.find(w) != tiles_.end()) candidate_vas_.push_back(w);
+                if (!peer_to_tiles_.empty()) {
+                    if (const auto pit = peer_to_tiles_.find(w); pit != peer_to_tiles_.end()) {
+                        for (const Address primary : pit->second) candidate_vas_.push_back(primary);
+                    }
+                }
+            }
+            for (const Address h : hot_overlap_tiles_) candidate_vas_.push_back(h);
+            if (candidate_vas_.empty()) return;
+            if (candidate_vas_.size() > 1) {
+                std::sort(candidate_vas_.begin(), candidate_vas_.end());
+                candidate_vas_.erase(std::unique(candidate_vas_.begin(), candidate_vas_.end()), candidate_vas_.end());
+            }
+        }
         const auto start = std::chrono::steady_clock::now();
         const auto before = uploaded_;
-        serial_ = now;
+        serial_ = leonida::geometry_writes::state().serial.load(std::memory_order_acquire);
         retry_ = false;
         refreshing_ = true;
         struct RefreshGuard {
@@ -593,24 +696,46 @@ public:
         // submission fixes its console heap slots then waited for the whole pass (speed-35: 116 ms of fixing a
         // submission with indirect draws on). So the lock is let go every 64 tiles. Walking by key (lower_bound)
         // survives both inserts from resolve() and erasures from retire_range() while unlocked.
-        Address cursor = 0;
-        bool have_cursor = true;
-        std::size_t walked = 0;
-        while (have_cursor) {
-            auto it = tiles_.lower_bound(cursor);
-            if (it == tiles_.end()) break;
-            const Address va = it->first;
-            Tile& tile = it->second;
-            const bool written = update(va, tile);
-            if (tile.retry)
-                for (auto id : tile.views)
-                    if (id < marks_.size() && views_[id].alive) marks_[id] |= kPinned;
-            if (written) written_vas_.push_back(va);
-            if (va > UINTPTR_MAX - tile_size) have_cursor = false;
-            else cursor = va + tile_size;
-            if (!(++walked & 63)) {
-                lock.unlock();
-                lock.lock();
+        const auto is_hot_overlap = [&](Address va) {
+            return !hot_overlap_tiles_.empty() &&
+                   std::binary_search(hot_overlap_tiles_.begin(), hot_overlap_tiles_.end(), va);
+        };
+        if (full_walk) {
+            Address cursor = 0;
+            bool have_cursor = true;
+            std::size_t walked = 0;
+            while (have_cursor) {
+                auto it = tiles_.lower_bound(cursor);
+                if (it == tiles_.end()) break;
+                const Address va = it->first;
+                Tile& tile = it->second;
+                const bool written = update(va, tile);
+                if (tile.retry)
+                    for (auto id : tile.views)
+                        if (id < marks_.size() && views_[id].alive) marks_[id] |= kPinned;
+                if (written || (!tile.retry && is_hot_overlap(va))) written_vas_.push_back(va);
+                if (va > UINTPTR_MAX - tile_size) have_cursor = false;
+                else cursor = va + tile_size;
+                if (!(++walked & 63)) {
+                    lock.unlock();
+                    lock.lock();
+                }
+            }
+        } else {
+            std::size_t walked = 0;
+            for (const Address va : candidate_vas_) {
+                auto it = tiles_.find(va);
+                if (it == tiles_.end()) continue;
+                Tile& tile = it->second;
+                const bool written = update(va, tile);
+                if (tile.retry)
+                    for (auto id : tile.views)
+                        if (id < marks_.size() && views_[id].alive) marks_[id] |= kPinned;
+                if (written || (!tile.retry && is_hot_overlap(va))) written_vas_.push_back(va);
+                if (!(++walked & 63)) {
+                    lock.unlock();
+                    lock.lock();
+                }
             }
         }
         const std::size_t changed_tiles = written_vas_.size();
@@ -661,7 +786,10 @@ public:
         for (std::size_t id = 0; id < marks_.size(); ++id)
             if ((marks_[id] & (kWhole | kPinned)) == kWhole && views_[id].alive) fill(views_[id], copy);
         written_vas_.clear();
-        if (uploaded_ != before) ++dirty_refreshes_;
+        if (uploaded_ != before) {
+            ++dirty_refreshes_;
+            leonida::submit_phases::note_change(leonida::submit_phases::change_geometry);  // not a "submit floor" one
+        }
         refilled_ += uploaded_ - before;
         const auto end = std::chrono::steady_clock::now();
         refresh_time_ += end - start;
@@ -734,6 +862,9 @@ public:
             if (tile.primary) leonida::geometry_writes::release(va);
         }
         tiles_.clear();
+        peer_to_tiles_.clear();
+        hot_overlap_tiles_.clear();
+        hot_gen_seen_ = ~std::uint64_t(0);
         {
             std::unique_lock structure(structure_mutex_);
             keys_.clear();

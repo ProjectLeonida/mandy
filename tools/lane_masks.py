@@ -134,11 +134,11 @@ def _maskable_b32(x):
     )
 
 
-def lane_slot(vgpr, lane):
+def lane_slot(vgpr, lane, wave64=True):
     """State key for a mask parked in one lane of a VGPR, or None unless both operands are plain."""
     if vgpr["k"] != "vgpr" or lane["k"] != "imm":
         return None
-    return ("lane", vgpr["r"], lane["v"] & 63)
+    return ("lane", vgpr["r"], lane["v"] & (63 if wave64 else 31))
 
 
 def wave32_vcc_pair_op(op, args):
@@ -176,16 +176,17 @@ def step(state, ins, wave64=True):
     if op == "v_readfirstlane_b32" and len(a) == 2:                             # sD = vS, the same in every lane
         put(state, a[0], kind(state, a[1], wave64), wave64)
         return
-    if op == "v_writelane_b32" and len(a) == 3 and lane_slot(a[0], a[2]):       # vD[lane] = sS
+    if op == "v_writelane_b32" and len(a) == 3 and lane_slot(a[0], a[2], wave64):  # vD[lane] = sS
         state.pop(("v", a[0]["r"]), None)
         k = kind(state, a[1], wave64)
+        slot = lane_slot(a[0], a[2], wave64)
         if k is None:
-            state.pop(lane_slot(a[0], a[2]), None)
+            state.pop(slot, None)
         else:
-            state[lane_slot(a[0], a[2])] = k
+            state[slot] = k
         return
     if op == "v_readlane_b32" and len(a) == 3:                                  # sD = vS[lane]
-        put(state, a[0], state.get(lane_slot(a[1], a[2])), wave64)
+        put(state, a[0], state.get(lane_slot(a[1], a[2], wave64)), wave64)
         return
     if op.startswith("v_cmp"):
         # Handle v_cmp before VGPR clobber (defensive for 2-operand forms with implicit vcc).
@@ -275,17 +276,199 @@ def step(state, ins, wave64=True):
             put(state, a[1], MASK, wave64)                      # carry/sign/scale lane mask of VOP3b ops
 
 
-def parked(blocks, masks):
+def parked(blocks, masks, wave64=True):
     """The (vgpr, lane) slots some v_readlane_b32 fetches a mask from, given analyse()'s result."""
     found = set()
     for blk in blocks:
         for ins in blk:
             a = ins["args"]
             if base_op(ins["op"]) == "v_readlane_b32" and len(a) == 3:
-                slot = lane_slot(a[1], a[2])
+                slot = lane_slot(a[1], a[2], wave64)
                 if slot in masks.get(id(ins), ()):
                     found.add(slot[1:])
     return sorted(found)
+
+
+VGPR_MOVREL = ("v_movrels_b32", "v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32", "v_swaprel_b32")
+
+
+def scalar_spills(blocks, succ=None, wave64=True):
+    """The (vgpr, lane) slots of pure scalar-spill VGPRs: VGPRs touched only by constant-lane v_writelane_b32
+    (non-VGPR source) and constant-lane v_readlane_b32, never read or written as a vector operand, never aliased by
+    v_movrel*/v_swaprel_b32, and with every v_readlane_b32 lane definitely written on all paths before it is read.
+
+    On RDNA2 hardware v_writelane_b32 / v_readlane_b32 ignore EXEC and access physical lane K even when lane K is
+    inactive (e.g. a small triangle launching fewer than 32 fragment lanes or after a dither/alpha discard). In
+    Vulkan SPIR-V, OpGroupNonUniformShuffle from an inactive invocation is undefined and reads stale VGPR bits.
+    Parking these slots in the %sgpr array makes every wave32/wave64 stage exact regardless of active lanes."""
+    mask = 63 if wave64 else 31
+    written = {}
+    disqualified = set()
+    movrel_min = None
+    for blk in blocks:
+        for ins in blk:
+            op = base_op(ins["op"])
+            a = ins["args"]
+            if op in VGPR_MOVREL:
+                for x in a:
+                    if x.get("k") == "vgpr":
+                        movrel_min = x["r"] if movrel_min is None else min(movrel_min, x["r"])
+            if (op == "v_writelane_b32" and len(a) == 3
+                    and a[0].get("k") == "vgpr" and a[0].get("n", 1) == 1
+                    and a[2].get("k") == "imm" and not (a[2].get("neg") or a[2].get("abs"))
+                    and a[1].get("k") != "vgpr"):
+                written.setdefault(a[0]["r"], set()).add(a[2]["v"] & mask)
+                continue
+            if (op == "v_readlane_b32" and len(a) == 3
+                    and a[0].get("k") != "vgpr"
+                    and a[1].get("k") == "vgpr" and a[1].get("n", 1) == 1
+                    and a[2].get("k") == "imm" and not (a[2].get("neg") or a[2].get("abs"))):
+                continue
+            for x in a:
+                k = x.get("k")
+                if k == "vgpr":
+                    disqualified.update(range(x["r"], x["r"] + x.get("n", 1)))
+                elif k == "vlist":
+                    disqualified.update(x["r"])
+    candidates = {vr for vr in written if vr not in disqualified and (movrel_min is None or vr < movrel_min)}
+    if not candidates:
+        return []
+    # Must-def check over CFG: every v_readlane_b32 of (vr, lane) must be dominated by v_writelane_b32 of (vr, lane)
+    # on every path from entry, so entry-populated input VGPRs read before write are never misclassified.
+    if succ is None:
+        succ = [[i + 1] if i + 1 < len(blocks) else [] for i in range(len(blocks))]
+    entry = [None] * len(blocks)
+    if blocks:
+        entry[0] = set()
+    work = [0] if blocks else []
+    while work:
+        n = work.pop()
+        st = set(entry[n])
+        for ins in blocks[n]:
+            op, a = base_op(ins["op"]), ins["args"]
+            if op == "v_writelane_b32" and len(a) == 3 and a[0].get("k") == "vgpr" and a[0]["r"] in candidates:
+                st.add((a[0]["r"], a[2]["v"] & mask))
+        for s in succ[n]:
+            merged = set(st) if entry[s] is None else (entry[s] & st)
+            if entry[s] is None or merged != entry[s]:
+                entry[s] = merged
+                work.append(s)
+    for n, blk in enumerate(blocks):
+        if entry[n] is None:
+            continue
+        st = set(entry[n])
+        for ins in blk:
+            op, a = base_op(ins["op"]), ins["args"]
+            if op == "v_writelane_b32" and len(a) == 3 and a[0].get("k") == "vgpr" and a[0]["r"] in candidates:
+                st.add((a[0]["r"], a[2]["v"] & mask))
+            elif op == "v_readlane_b32" and len(a) == 3 and a[1].get("k") == "vgpr" and a[1]["r"] in candidates:
+                if (a[1]["r"], a[2]["v"] & mask) not in st:
+                    candidates.discard(a[1]["r"])
+    return sorted((vr, lane) for vr in candidates for lane in written[vr])
+
+
+def definite_spill_reads(blocks, succ=None, wave64=True):
+    """Per-instruction definite constant-lane scalar spill reloads (works on mixed VGPRs too).
+
+    Returns (read_ins_ids, slots) where `read_ins_ids` is the set of `id(ins)` for every constant-lane
+    `v_readlane_b32 sD, vR, K` where `(vR, K)` was definitely written by a constant-lane `v_writelane_b32 vR, sS, K`
+    (non-VGPR source) on every path from entry with no intervening write to `vR` (other than constant-lane
+    `v_writelane_b32` to a different lane). `slots` is the sorted list of `(vR, K)` slots needed by those reads.
+
+    Parking those slots in `%sgpr` avoids `OpGroupNonUniformShuffle` on lanes that may be absent (partial fragment
+    waves, discards, or wave64 lanes >= 32 on 32-wide subgroups) even when the VGPR is reused as a vector register
+    elsewhere in the shader.
+    """
+    mask = 63 if wave64 else 31
+
+    def _const_lane(a):
+        return a.get("k") == "imm" and not (a.get("neg") or a.get("abs"))
+
+    def _kill_vgprs(st, regs):
+        if not regs or not st:
+            return
+        for key in [k for k in st if k[0] in regs]:
+            st.discard(key)
+
+    def _step_spills(st, ins):
+        op, a = base_op(ins["op"]), ins["args"]
+        if op in ("s_swappc_b64", "s_setpc_b64", "s_call_b64"):
+            st.clear()
+            return
+        if not a or op.startswith(NO_DESTINATION):
+            return
+        mods = ins.get("mods", ())
+        if op.startswith(("buffer_load", "tbuffer_load")) and "lds" in mods:
+            return
+        if op.startswith(("buffer_atomic", "global_atomic", "flat_atomic", "image_atomic",
+                          "s_atomic", "s_buffer_atomic")) and "glc" not in mods:
+            return
+        if op.startswith("ds_") and not op.startswith(DS_HAS_DST) and "_rtn" not in op:
+            return
+        if op.startswith("v_cmp") or op == "v_readlane_b32":
+            return
+        if op == "v_writelane_b32" and len(a) == 3 and a[0].get("k") == "vgpr":
+            vr = a[0]["r"]
+            if a[0].get("n", 1) == 1 and _const_lane(a[2]) and a[1].get("k") != "vgpr":
+                st.add((vr, a[2]["v"] & mask))
+            else:
+                _kill_vgprs(st, range(vr, vr + a[0].get("n", 1)))
+            return
+        if op == "v_swap_b32":
+            written = set()
+            for x in a[:2]:
+                if x.get("k") == "vgpr":
+                    written.update(range(x["r"], x["r"] + x.get("n", 1)))
+            _kill_vgprs(st, written)
+            return
+        if op in VGPR_REL_DST:
+            bases = [x["r"] for x in (a[:2] if op == "v_swaprel_b32" else a[:1]) if x.get("k") == "vgpr"]
+            if bases:
+                lo = min(bases)
+                for key in [k for k in st if k[0] >= lo]:
+                    st.discard(key)
+            return
+        k0 = a[0].get("k")
+        if k0 == "vgpr":
+            _kill_vgprs(st, range(a[0]["r"], a[0]["r"] + a[0].get("n", 1)))
+        elif k0 == "vlist":
+            _kill_vgprs(st, set(a[0]["r"]))
+
+    if not blocks:
+        return set(), []
+    if succ is None:
+        succ = [[i + 1] if i + 1 < len(blocks) else [] for i in range(len(blocks))]
+    entry = [None] * len(blocks)
+    entry[0] = set()
+    work = [0]
+    while work:
+        n = work.pop()
+        st = set(entry[n])
+        for ins in blocks[n]:
+            _step_spills(st, ins)
+        for s in succ[n]:
+            merged = set(st) if entry[s] is None else (entry[s] & st)
+            if entry[s] is None or merged != entry[s]:
+                entry[s] = merged
+                work.append(s)
+    read_ids = set()
+    slots = set()
+    for n, blk in enumerate(blocks):
+        if entry[n] is None:
+            continue
+        st = set(entry[n])
+        for ins in blk:
+            op, a = base_op(ins["op"]), ins["args"]
+            if (op == "v_readlane_b32" and len(a) == 3
+                    and a[0].get("k") != "vgpr"
+                    and a[1].get("k") == "vgpr" and a[1].get("n", 1) == 1
+                    and _const_lane(a[2])):
+                slot = (a[1]["r"], a[2]["v"] & mask)
+                if slot in st:
+                    read_ids.add(id(ins))
+                    slots.add(slot)
+            _step_spills(st, ins)
+    return read_ids, sorted(slots)
 
 
 def analyse(blocks, succ, *, include_either=False, wave64=True):

@@ -13,12 +13,10 @@ by spirv_mini_interp.run_workgroup as one 64-thread workgroup, in two layouts:
   on 32-wide subgroups). The tests pin which results stay exact there and which do not:
     - ds_bpermute_b32 never crosses halves, so all eight words stay exact;
     - v_writelane_b32 writes the right lane in both halves (the wave lane comes from LocalInvocationIndex);
-    - a v_readlane_b32 from the other half shuffles from lane >= 32 of a 32-wide subgroup, which SPIR-V leaves
-      undefined. Strictly that is UndefinedResult. Under the wrap model (lane Id mod 32, the symptom in issue
-      #94, an observation and not the specification) the expected words below are what a 32-wide GPU without
-      --wave64-emulate shows. Measured: NVIDIA GeForce RTX 4070 SUPER (subgroup 32), driver 610.88, Vulkan SDK
-      1.4.363.0, `vk_compute_test <name>.spv 1 dump` on the non-emulated build of run_gpu_tests.py: all 24
-      words equal WRAP32_EXPECTED. That is one driver's behaviour, not a requirement.
+    - a v_readlane_b32 from the other half asks for lane >= 32 of a 32-wide subgroup; the translator's present-lane
+      ballot guard detects that lane as absent and redirects the shuffle to the subgroup's first running lane instead
+      of issuing an out-of-range shuffle (no SPIR-V UB, still different from the 64-wide result without
+      --wave64-emulate). SUBGROUP32_EXPECTED pins those exact per-half words.
 
 Limits: --wave64-emulate output uses Workgroup memory and a round loop, which the interpreter rejects, so the
 emulated path is covered only by the GPU tests. The subgroup layout (invocation i in subgroup i // 32) is the
@@ -45,16 +43,15 @@ GPU_EXPECTED = {
     "cs_w64x_bpermute": [36, 316, 253, 218, 435, 225, 0, 442],
 }
 
-# Two 32-wide subgroups, wrap model. readlane: v2 = 3 * lane + 1 and each subgroup reads lane (S1 % 64) % 32 of
-# its own half. The low half reads lane 8 for lane 40 (25), lane 0 for 32 (1) and lane 1 for 33 (4); the upper
-# half reads lane 32 + 5 = 37 for lane 5 (112). Words stored by lanes of the half the source lane is in stay right:
-#   out[0] lane 0: s6 = v2[8] = 25        out[1] lane 33: s6 = v2[40] = 121   out[2] lane 63: s7 = v2[37] = 112
-#   out[3] lane 0: s8 = v2[0] = 1         out[4] lane 45: s7 = v2[37] = 112   out[5] lane 7: s9 = v2[1] = 4
-#   out[6] lane 60: s9 = v2[33] = 100     out[7] lane 63: v2[40] = 121
-# writelane: the writes are exact, the two readlanes from lanes 0 and 8 read lanes 8 and 31 of the low half,
-# which nobody wrote (0).
-WRAP32_EXPECTED = {
-    "cs_w64x_readlane": [25, 121, 112, 1, 112, 4, 100, 121],
+# Two 32-wide subgroups with present-lane guarded v_readlane_b32: lane >= 32 is absent in both 32-wide subgroups, so
+# it redirects to each subgroup's first running lane (lane 0 -> 1 in subgroup 0, lane 32 -> 97 in subgroup 1), while
+# lane 5 is present in both (lane 5 -> 16 in subgroup 0, lane 32+5=37 -> 112 in subgroup 1):
+#   out[0] lane 0: s6 = v2[0] = 1          out[1] lane 33: s6 = v2[32] = 97   out[2] lane 63: s7 = v2[37] = 112
+#   out[3] lane 0: s8 = v2[0] = 1          out[4] lane 45: s7 = v2[37] = 112  out[5] lane 7: s9 = v2[0] = 1
+#   out[6] lane 60: s9 = v2[32] = 97       out[7] lane 63: s11 = v2[32] = 97
+# writelane: the writes are exact, the two readlanes from lanes 40 and 63 redirect to lane 0 of subgroup 0 (0).
+SUBGROUP32_EXPECTED = {
+    "cs_w64x_readlane": [1, 97, 112, 1, 112, 1, 97, 97],
     "cs_w64x_writelane": [4660, 77, 99, 2748, 0, 0, 0, 0],
     "cs_w64x_bpermute": GPU_EXPECTED["cs_w64x_bpermute"],
 }
@@ -92,23 +89,19 @@ class Wave64OnTwoSubgroups32(unittest.TestCase):
         spv = translate("cs_w64x_bpermute")
         self.assertEqual(run(spv, 32), GPU_EXPECTED["cs_w64x_bpermute"])
 
-    def test_cross_half_readlane_is_undefined(self):
-        for name in ("cs_w64x_readlane", "cs_w64x_writelane"):
+    def test_cross_half_readlane_redirects_without_ub(self):
+        # Present-lane ballot guard prevents UndefinedResult on a 32-wide subgroup, redirecting absent lanes
+        # >= 32 to the subgroup's first running lane (still not exact for cross-half reads without emulation).
+        for name, want in SUBGROUP32_EXPECTED.items():
             with self.subTest(shader=name):
-                with self.assertRaisesRegex(si.UndefinedResult, r"lane 40 of a 32-wide subgroup"):
-                    run(translate(name), 32)
-
-    def test_wrap_model_prediction(self):
-        for name, want in WRAP32_EXPECTED.items():
-            with self.subTest(shader=name):
-                got = run(translate(name), 32, out_of_range="wrap")
+                got = run(translate(name), 32)
                 self.assertEqual(got, want)
                 wrong = [k for k in range(8) if got[k] != GPU_EXPECTED[name][k]]
                 self.assertEqual(bool(wrong), name != "cs_w64x_bpermute", f"{name}: words {wrong} differ")
 
     def test_writelane_writes_are_exact(self):
         # out[0..5] are the written lanes and their untouched neighbours; only the readlanes (out[6..7]) cross.
-        got = run(translate("cs_w64x_writelane"), 32, out_of_range="wrap")
+        got = run(translate("cs_w64x_writelane"), 32)
         self.assertEqual(got[:6], GPU_EXPECTED["cs_w64x_writelane"][:6])
 
 
@@ -126,7 +119,7 @@ class NegativeControls(unittest.TestCase):
     def test_readlane_lane_select_mod_32(self):
         # v_readlane lane = S1 & 31 instead of & 63 (the issue #94 symptom, moved into the translator).
         got = self.sabotage("cs_w64x_readlane",
-                            r"(OpBitwiseAnd %uint \S+ )%c3f(\n\s*%\w+ = OpGroupNonUniformShuffle)", r"\1%c1f\2", 5)
+                            r"(OpBitwiseAnd %uint \S+ )%c3f(\n\s*%\w+ = OpGroupNonUniformBallot )", r"\1%c1f\2", 5)
         self.assertEqual(got[0], 25)          # lane 40 -> lane 8
 
     def test_bpermute_upper_half_reads_low_half(self):

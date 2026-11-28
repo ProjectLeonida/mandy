@@ -392,20 +392,20 @@ class _Types:
         return k[1]
 
 
-def run_fragment(text, inputs=None, push_constants=None, memory=None):
+def run_fragment(text, inputs=None, push_constants=None, memory=None, spec_constants=None, resources=None):
     """Execute the entry point of `text` once and return the words written to every Output variable.
 
     `inputs` maps an Input variable name (for example "%in_attr1") to its value (a tuple for vectors).
     `push_constants` is a list of 32-bit words at byte offsets 0, 4, 8, ... of the PushConstant block
     (missing words read as zero). `memory` is a mutable {byte_address: word} mapping used for
-    PhysicalStorageBuffer loads and stores.
+    PhysicalStorageBuffer loads and stores. `spec_constants` maps SpecId integers to override values.
 
     Returns {output_variable_name: tuple_of_32bit_words}. Float outputs are returned as their bit patterns, a
     bool as 0 or 1, and an aggregate (a mesh shader's arrayed outputs) as its scalars in order. A mesh shader's
     result also has "OpSetMeshOutputsEXT": (vertex count, primitive count) once that instruction has run.
     A module with a subgroup operation is rejected here; see run_workgroup.
     """
-    gen = _invocation(text, inputs, push_constants, memory)
+    gen = _invocation(text, inputs, push_constants, memory, resources=resources, spec_constants=spec_constants)
     try:
         req = next(gen)
     except StopIteration as done:
@@ -555,7 +555,7 @@ def _parsed_lines(text):
     return parsed
 
 
-def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None, resources=None):
+def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None, resources=None, spec_constants=None):
     """One invocation as a generator. It yields (opcode, instruction index, value, id) at each subgroup operation
     and at each OpControlBarrier, and expects that operation's result back; with `step` it also yields _TICK before
     each instruction. `workgroup` (run_workgroup's) maps a Workgroup variable id to the box all invocations
@@ -567,6 +567,8 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
     left out stays declared but cannot be accessed (OpAccessChain into it raises)."""
     inputs = inputs or {}
     resources = resources or {}
+    spec_constants = spec_constants or {}
+    spec_ids = {}
     push_constants = list(push_constants or [])
     memory = {} if memory is None else memory
     types = _Types()
@@ -605,6 +607,7 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                 raise UnsupportedConstruct(f"OpAccessChain into {k[0]}")
         return off, cur
 
+    ftz32 = False
     for res, op, a, line in _parsed_lines(text):
         if op is None:
             raise UnsupportedConstruct(f"cannot parse line: {line!r}")
@@ -614,6 +617,13 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
         if op == "OpFunction":
             in_body = True
             first_fn = res
+            continue
+        if op == "OpExecutionMode":
+            if len(a) >= 3 and a[1] == "DenormFlushToZero" and a[2] == "32":
+                ftz32 = True
+            continue
+        if op == "OpDecorate" and len(a) >= 3 and a[1] == "SpecId":
+            spec_ids[a[0]] = int(a[2])
             continue
         if op in _IGNORED:
             continue
@@ -641,15 +651,18 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             ptr_types[res] = (a[0], a[1])
         elif op in ("OpTypeImage", "OpTypeSampler", "OpTypeSampledImage"):
             types.t[res] = ("image",)                  # opaque: only OpImageFetch on a bound resource reads it
-        elif op == "OpConstant":
+        elif op in ("OpConstant", "OpSpecConstant"):
             k = types.t[a[0]]
             if k[0] == "float":
                 constants[res] = values[res] = f32_literal(a[1]) if k[1] == 32 else float(a[1])
+                id_type[res] = a[0]
             elif k[0] == "int":
-                constants[res] = values[res] = int(a[1]) & ((1 << k[1]) - 1)
+                sid = spec_ids.get(res) if op == "OpSpecConstant" else None
+                raw_v = spec_constants[sid] if (sid is not None and sid in spec_constants) else int(a[1])
+                constants[res] = values[res] = raw_v & ((1 << k[1]) - 1)
                 id_type[res] = a[0]
             else:
-                raise UnsupportedConstruct(f"OpConstant of type {k[0]}")
+                raise UnsupportedConstruct(f"{op} of type {k[0]}")
         elif op == "OpConstantTrue":
             constants[res] = values[res] = True
         elif op == "OpConstantFalse":
@@ -708,6 +721,18 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
 
     def wmask(type_id):
         return (1 << types.bits(type_id)) - 1
+
+    def ftz(v):
+        """Flush binary32 subnormals to signed zero when DenormFlushToZero 32 is active."""
+        if ftz32 and isinstance(v, float) and v != 0.0 and abs(v) < 2.0 ** -126:
+            return math.copysign(0.0, v)
+        return v
+
+    def is_f32_type(type_id):
+        t = types.t.get(type_id)
+        if t == ("float", 32):
+            return True
+        return bool(t and t[0] == "vec" and types.t.get(t[1]) == ("float", 32))
 
     def signed(v, bits):
         v &= (1 << bits) - 1
@@ -869,9 +894,15 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                 w = p[1] // 4
                 values[res] = push_constants[w] if 0 <= w < len(push_constants) else 0
             elif p[0] == "psb":
-                if types.t[a[0]][:2] != ("int", 32):
-                    raise UnsupportedConstruct("PhysicalStorageBuffer load of a type that is not a 32-bit integer")
-                values[res] = memory.get(psb_word(p[1]), 0)
+                kind = types.t[a[0]]
+                if kind[0] == "vec" and types.t[kind[1]][:2] == ("int", 32):
+                    # A uvecN: N consecutive words (the wide scalar loads of rdna2spirv.scalar_load).
+                    values[res] = [memory.get(psb_word(p[1] + 4 * i), 0) for i in range(kind[2])]
+                elif kind[:2] != ("int", 32):
+                    raise UnsupportedConstruct("PhysicalStorageBuffer load of a type that is not a 32-bit integer "
+                                               "or a vector of them")
+                else:
+                    values[res] = memory.get(psb_word(p[1]), 0)
             else:
                 values[res] = types.copy_value(a[0], deref(p))
         elif op == "OpImageFetch":
@@ -1148,16 +1179,18 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                 continue
 
             def _fdiv(p, q):
-                # SPIR-V leaves OpFDiv by zero undefined: refuse it, as the interpreter does for every undefined case
+                # SPIR-V leaves OpFDiv by zero undefined: refuse an actual zero divisor (a subnormal divisor
+                # under DenormFlushToZero 32 gives +-inf for non-zero p, matching RDNA2 v_rcp_f32).
                 if q == 0.0:
                     raise UnsupportedConstruct("OpFDiv by zero (undefined in SPIR-V)")
-                if math.isinf(p) and math.isinf(q):
+                p_f = ftz(p)
+                if math.isinf(p_f) and math.isinf(q):
                     return math.nan
-                return f32(p / q)       # x/inf is a signed zero, as in Python
+                return ftz(f32(p_f / q))       # x/inf is a signed zero, as in Python
 
-            fn = {"OpFAdd": (lambda p, q: f32(ieee_nan(p + q, p, q))),
-                  "OpFSub": (lambda p, q: f32(ieee_nan(p - q, p, q))),
-                  "OpFMul": (lambda p, q: f32(ieee_nan(p * q, p, q))), "OpFDiv": _fdiv}[op]
+            fn = {"OpFAdd": (lambda p, q: ftz(f32(ieee_nan(ftz(p) + ftz(q), ftz(p), ftz(q))))),
+                  "OpFSub": (lambda p, q: ftz(f32(ieee_nan(ftz(p) - ftz(q), ftz(p), ftz(q))))),
+                  "OpFMul": (lambda p, q: ftz(f32(ieee_nan(ftz(p) * ftz(q), ftz(p), ftz(q))))), "OpFDiv": _fdiv}[op]
             if isinstance(x, tuple) and isinstance(y, tuple) and len(x) == len(y) and all(
                     isinstance(p, float) and isinstance(q, float) for p, q in zip(x, y)):
                 values[res] = tuple(fn(p, q) for p, q in zip(x, y))
@@ -1169,9 +1202,9 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             # SPV_KHR_fma: x * y + z correctly rounded, the same exact single rounding as GLSL Fma above (fma_f32)
             x, y, z = (val(t) for t in a[1:4])
             if isinstance(x, tuple):
-                values[res] = tuple(fma_f32(p, q, s) for p, q, s in zip(x, y, z))
+                values[res] = tuple(ftz(fma_f32(ftz(p), ftz(q), ftz(s))) for p, q, s in zip(x, y, z))
             else:
-                values[res] = fma_f32(x, y, z)
+                values[res] = ftz(fma_f32(ftz(x), ftz(y), ftz(z)))
         elif op == "OpFNegate":
             # IEEE 754 negate only flips the sign bit: it keeps a NaN's payload and does not quiet a signalling NaN.
             # A binary32 operand is negated on its bits, because the float round trip in f32() sets the quiet bit
@@ -1209,6 +1242,8 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             x, y = val(a[1]), val(a[2])
             if not (isinstance(x, float) and isinstance(y, float)):
                 raise UnsupportedConstruct(f"{op} on non-float")
+            if is_f32_type(id_type.get(a[1])) or is_f32_type(id_type.get(a[2])):
+                x, y = ftz(x), ftz(y)
             # Ordered: false if either operand is NaN. Unordered: true if either is NaN. Python's own comparisons
             # are already ordered (NaN compares false), and -0.0 == 0.0 as in SPIR-V.
             unordered = math.isnan(x) or math.isnan(y)
@@ -1234,6 +1269,27 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                 raise UnsupportedConstruct("bit-field insert beyond 32 bits (undefined in SPIR-V)")
             mk = ((1 << cnt) - 1) << off
             values[res] = ((base & ~mk) | ((ins << off) & mk)) & MASK
+        elif op in ("OpSDotKHR", "OpUDotKHR", "OpSDotAccSatKHR", "OpUDotAccSatKHR",
+                    "OpSDot", "OpUDot", "OpSDotAccSat", "OpUDotAccSat"):
+            # SPV_KHR_integer_dot_product, PackedVectorFormat4x8Bit only: the exact sum of the four products of the
+            # sign- (OpS*) or zero- (OpU*) extended bytes; plain forms keep its low bits, AccSat forms add the
+            # accumulator exactly and saturate to the result type's range (signed for OpS*, unsigned for OpU*).
+            acc_sat = "AccSat" in op
+            if a[-1] not in ("PackedVectorFormat4x8BitKHR", "PackedVectorFormat4x8Bit") or types.bits(a[0]) != 32:
+                raise UnsupportedConstruct(f"{op} other than 32-bit PackedVectorFormat4x8Bit")
+            is_signed = op.startswith("OpS")
+            x, y = val(a[1]), val(a[2])
+
+            def byte(w, i):
+                b = (w >> (8 * i)) & 0xFF
+                return b - 256 if is_signed and b & 0x80 else b
+            total = sum(byte(x, i) * byte(y, i) for i in range(4))
+            if acc_sat:
+                acc = val(a[3]) & MASK
+                total += (acc - (1 << 32) if acc >> 31 else acc) if is_signed else acc
+                lo, hi = (-(1 << 31), (1 << 31) - 1) if is_signed else (0, MASK)
+                total = min(max(total, lo), hi)
+            values[res] = total & MASK
         elif op == "OpConvertUToPtr":
             values[res] = ("psb", val(a[1]))
             pointers[res] = values[res]
@@ -1257,9 +1313,9 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                 # Exact product and sum, one rounding to binary32 (fma_f32).
                 x, y, z = args
                 if isinstance(x, tuple):
-                    values[res] = tuple(fma_f32(p, q, s) for p, q, s in zip(x, y, z))
+                    values[res] = tuple(ftz(fma_f32(ftz(p), ftz(q), ftz(s))) for p, q, s in zip(x, y, z))
                 else:
-                    values[res] = fma_f32(x, y, z)
+                    values[res] = ftz(fma_f32(ftz(x), ftz(y), ftz(z)))
             elif name in ("Sin", "Cos"):
                 values[res] = f32(math.sin(args[0]) if name == "Sin" else math.cos(args[0]))
             elif name == "FAbs":
@@ -1276,13 +1332,15 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                 values[res] = abs(signed(args[0], bits)) & wmask(a[0])
             elif name in ("FMax", "FClamp"):
                 def fmax_clamp(*xs):
+                    if is_f32_type(a[0]):
+                        xs = tuple(ftz(v) for v in xs)
                     if any(math.isnan(v) for v in xs) or (name == "FClamp" and xs[1] > xs[2]):
                         raise UnsupportedConstruct(f"GLSL.std.450 {name} with these operands (undefined)")
                     # Equal zeros: -0 is ordered below +0, as in NMin/NMax above (the order RDNA2 hardware uses,
                     # so a med3 built from these ops is the hardware's median for signed zeros too).
                     v = _nmin_nmax("NMax", xs[0], xs[1])
                     result = v if name == "FMax" else _nmin_nmax("NMin", v, xs[2])
-                    return result if types.t[a[0]] == ("float", 64) else f32(result)
+                    return result if types.t[a[0]] == ("float", 64) else ftz(f32(result))
                 # Vector operands (v_pk_* clamp) are component-wise.
                 values[res] = (tuple(fmax_clamp(*c) for c in zip(*args)) if isinstance(args[0], tuple)
                                else fmax_clamp(*args))

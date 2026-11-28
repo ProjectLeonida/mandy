@@ -10,6 +10,7 @@
 // - clang-cl, without /EHa, catches only what a call inside the __try raises, not an inline load or store.
 // So the bytes move here: never inlined, and no_builtin keeps the compiler from turning a loop back into a call to
 // memcpy or memmove.
+#include "shadow_keep.h"
 #include <cstddef>
 #include <cstdint>
 #include <intrin.h>
@@ -54,6 +55,14 @@ __declspec(noinline) inline void store64(void* to, std::uint64_t value) {
 // freed).
 __declspec(noinline) inline std::uintptr_t read_word(const void* at) {
     return *static_cast<const volatile std::uintptr_t*>(at);
+}
+
+// Fused copy + 256-byte piece hashing for a __try frame: never inlined and no_builtin so clang-cl (/EHsc) and Wine
+// unwind any access violation on `from` into the caller's __except instead of a CRT memcpy.
+// Intentionally NOT noexcept (SEH under /EHsc).
+__declspec(noinline) LEONIDA_GUARDED_NO_BUILTIN inline void copy_and_sum_256(
+    std::uint8_t* to, const std::uint8_t* from, std::size_t pieces, std::uint64_t* out) {
+    leonida::shadow_keep::copy_and_sum_256(to, from, pieces, out);
 }
 
 }  // namespace leonida::guarded

@@ -68,7 +68,7 @@ reasons behind each step: [linux_proton.md](linux_proton.md#amd-on-linux-what-go
   | `LEONIDA_RT_AS=off`, `LEONIDA_SKIP_COMPUTE=<list>` | the large ray-tracing programs, left out at play as in our longest runs ([above](#settings-every-platform-needs)) |
   | `LEONIDA_TITLE_WATCHDOG=0`, `LEONIDA_TITLE_WATCHDOG_KICK=<trap RVA>,<kick RVA>` | the title's hang watchdog ([above](#settings-every-platform-needs)) |
   | `LEONIDA_DEVICE_TYPE=6`, `LEONIDA_MAP_READBACK=1`, `LEONIDA_FRAME_PACING=1`, `LEONIDA_PRESENT_NO_TEAR=1` | taken over from the NVIDIA report below; their effect on AMD was not measured one by one |
-  | `LEONIDA_ARENA_MB=4095`, `LEONIDA_TITLE_WINDOWS_MB=4096`, `LEONIDA_GEOMETRY_MB=6144` | room for the title's buffers in the world |
+  | `LEONIDA_ARENA_MB=4095`, `LEONIDA_TITLE_WINDOWS_MB=4096`, `LEONIDA_GEOMETRY_MB=6144` | room for the title's buffers in the world (with sparse binding the arena's size is address range; memory is bound as it is used) |
   | `LEONIDA_SHADOW_ALIAS_MS=5000`, `LEONIDA_CONSOLE_FIX_US=0` | carried from earlier boot runs; their effect here was not measured one by one |
   | `LEONIDA_DEVICE_FAULT=1` | a device-loss report if the GPU hangs |
   | `LEONIDA_KEYBOARD_PAD=always` | the keyboard as the pad |

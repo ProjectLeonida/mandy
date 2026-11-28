@@ -244,13 +244,18 @@ def run_one(name, lines, writers):
         _write_listing(spv_path, lines, with_export=True)
         with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
             f.write(STUB_DXBC)
+        prev_ftz32 = rdna2spirv.FTZ32
         try:
+            # cpu_ref models IEEE binary32 with denormals preserved (tools/cpu_ref.py).
+            rdna2spirv.FTZ32 = False
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", ResourceWarning)
                 spvasm = rdna2spirv.translate(spv_path)
                 gc.collect()
         except rdna2spirv.Unsupported as e:
             return ("skip", f"translator unsupported: {e}")
+        finally:
+            rdna2spirv.FTZ32 = prev_ftz32
         try:
             out = run_fragment(spvasm)
         except UnsupportedConstruct as e:

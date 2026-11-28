@@ -436,6 +436,12 @@ int main(int argc, char** argv) {
         chain = &f13;
     }
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    bool enable_f12 = false;
+    if (f12q.vulkanMemoryModel) {
+        f12.vulkanMemoryModel = VK_TRUE;
+        f12.vulkanMemoryModelDeviceScope = f12q.vulkanMemoryModelDeviceScope;
+        enable_f12 = true;
+    }
     if (need_heap || mesh_compute) {
         // 77 is the "this device cannot run the test" code that check.py and run_gpu_tests.py report as SKIP.
         if (!f12q.bufferDeviceAddress) {
@@ -452,6 +458,9 @@ int main(int argc, char** argv) {
             f12.runtimeDescriptorArray = VK_TRUE;
             f12.descriptorIndexing = VK_TRUE;
         }
+        enable_f12 = true;
+    }
+    if (enable_f12) {
         f12.pNext = chain;
         chain = &f12;
     }
