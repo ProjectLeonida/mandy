@@ -1,6 +1,7 @@
 // Headless Vulkan compute test for translated compute shaders.
 // Usage: vk_compute_test cs.spv groups expect [--require-wave64]
 //   expect = "mirror64": out[g*64 + t] == g*64 + (63 - t)   (runtime/test/shaders/cs_lds.asm)
+//            "bench_mix": compare the stock wave64 benchmark with its CPU result, outside the timed dispatches
 //            "workgroup_yz": pass 2x3x4 for groups; check the Y/Z histogram (cs_workgroup_yz.asm)
 //            "exec64", "wavemask", "bvh": see cs_exec64.asm, cs_wavemask.asm, cs_bvh.asm; anything else prints out[0..7]
 //   VKC_BENCH=N (env): dispatch N more times after the checked one and print the median / min / max wall time of one
@@ -53,6 +54,36 @@ static PFN_vkGetInstanceProcAddr gipa;
             return 1;                                                                    \
         }                                                                                \
     } while (0)
+
+// Reference for cs_bench_mix.asm, using one 64-lane prefix count across both halves of the wave.
+static uint32_t check_bench_mix(const uint32_t* out, uint32_t groups, uint32_t& first_bad) {
+    uint32_t bad = 0;
+    for (uint32_t group = 0; group < groups; ++group) {
+        uint32_t hash[64], prefix[64], pair_sum[64], count = 0;
+        for (uint32_t lane = 0; lane < 64; ++lane) {
+            const uint32_t index = 64 * group + lane;
+            hash[lane] = (index * 0x9e3779b1u) ^ index;
+            prefix[lane] = count;
+            if (((hash[lane] >> 8) & 3u) == 1) ++count;
+        }
+        const auto shared_word = [&](uint32_t lane) { return prefix[lane] + hash[lane] + hash[37] + count; };
+        const bool add_three = std::any_of(std::begin(hash), std::end(hash), [](uint32_t h) { return h < 0x80000000u; });
+        for (uint32_t lane = 0; lane < 64; ++lane)
+            pair_sum[lane] = shared_word(lane) + shared_word(lane ^ 1u) + (add_three ? 3u : 0u);
+        const bool xor_five = std::none_of(std::begin(pair_sum), std::end(pair_sum),
+                                           [](uint32_t sum) { return sum < 0x7fffffffu; });
+        for (uint32_t lane = 0; lane < 64; ++lane) {
+            const uint32_t index = 64 * group + lane;
+            uint32_t want = pair_sum[lane] ^ (xor_five ? 5u : 0u);
+            if (hash[lane] > 0x40000000u) want = (want + 7) ^ index;
+            if (out[index] != want) {
+                if (!bad) first_bad = index;
+                ++bad;
+            }
+        }
+    }
+    return bad;
+}
 
 // The same word list parser as vk_harness: decimal or 0x hex, no sign or space, and "1,2," is rejected.
 static bool parse_u32(const char*& s, uint32_t& v) {
@@ -664,6 +695,10 @@ static int run(int argc, char** argv) {
         }
         std::printf("single-group origins: %u/%u matched\n", origins - wrong_origins, origins);
         return bad || wrong_origins ? 1 : 0;
+    }
+    if (!std::strcmp(argv[3], "bench_mix")) {
+        bad = check_bench_mix(out, groups, first_bad);
+        std::printf("bench_mix checked %u words\n", groups * 64);
     }
     if (!std::strcmp(argv[3], "mirror64")) {
         for (uint32_t g = 0; g < groups; g++)
