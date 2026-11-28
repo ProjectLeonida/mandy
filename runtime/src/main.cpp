@@ -16,6 +16,9 @@
 //       does not stall it. Resumable: entries already journaled are skipped (--all: built anyway). Programs named by
 //       LEONIDA_SKIP_COMPUTE are built too unless --skip-listed is given. See shims/d3d12_precompile.h.
 //
+//   gta6rt --check-shader-pack [DIR]
+//       Checks mesh and barycentric index metadata against the Vulkan GPU selected by --run. No game or pipelines.
+//
 //   gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [--trace FILE] [-- game arguments...]
 //       The same, then the EXE's own TLS callbacks and its entry point, on a game thread. The game's argv and
 //       command line are <exe name> plus the arguments after "--"; exit/ExitProcess from the game end the run
@@ -33,6 +36,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -195,6 +199,7 @@ void start_title_peek(std::uint8_t* base) {
 #include "vulkan_device_fault.h"
 #include "../shims/d3d12_compile_exit.h"
 #include "../shims/d3d12_precompile.h"
+#include "../shims/d3d12_shader_pack_check.h"
 #include "../shims/package_splash.h"
 #endif
 #include "../shims/process_shim.h"
@@ -264,6 +269,7 @@ int usage() {
                  "       gta6rt --first-run-ui <exe> [--game-dir DIR] [--overlay DIR] [--trace FILE]\n"
                  "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n"
                  "       gta6rt --precompile-pipelines [--threads N] [--big-threads N] [--big-bytes N] [--all] [--smallest-first] [--limit N] [--min-bytes N] [--max-bytes N] [--filter PART]... [--skip-listed] [--list] [--via-helper]\n"
+                 "       gta6rt --check-shader-pack [DIR]\n"
                  "       gta6rt --compile-server [--parent PID] [--threads N] [--idle-threads N] [--idle-exit SECONDS]\n");
     return 2;
 }
@@ -388,6 +394,11 @@ static BOOL WINAPI show_package_window(HWND window, int command) {
 
 int wmain(int argc, wchar_t** argv) {
 #ifdef LEONIDA_VULKAN_DEVICE
+    if (argc > 1 && std::wstring_view(argv[1]) == L"--check-shader-pack") {
+        if (argc == 2) return rt::d3d12::check_shader_pack({});
+        if (argc != 3 || !*argv[2] || std::wstring_view(argv[2]).starts_with(L"--")) return usage();
+        return rt::d3d12::check_shader_pack(argv[2]);
+    }
     if (argc > 1 && std::wstring(argv[1]) == L"--precompile-pipelines") return precompile_main(argc, argv);
     if (argc > 1 && std::wstring(argv[1]) == L"--compile-server") return compile_server_main(argc, argv);
 #endif

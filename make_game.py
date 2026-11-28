@@ -75,6 +75,7 @@ import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
 from stale_build import newer_sources  # noqa: E402
+from vk_subgroup_info import native_shader_driver_issue  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
@@ -2029,10 +2030,6 @@ def barycentric_fallback_override():
     return None
 
 
-# VkDriverId of Intel's Windows Vulkan driver (igvk64.dll).
-VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS = 5
-
-
 def runtime_gpu_mesh_draws_crash():
     """True where the GPU the runtime would use is on Intel's Windows Vulkan driver with VK_EXT_mesh_shader: there
     vkCmdDrawMeshTasksEXT crashes (0xC0000409 in igvk64.dll) for a mesh shader with a live push-constant load at
@@ -2042,8 +2039,8 @@ def runtime_gpu_mesh_draws_crash():
     info = runtime_gpu_info()
     if not info or "driver_id" not in info:
         return None
-    return info.get("driver_id") == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS and \
-        info.get("mesh_in_supported_stages") is True
+    return info.get("mesh_in_supported_stages") is True and native_shader_driver_issue(
+        "mesh", info["driver_id"], info.get("vendor_id"), info.get("device_id"))
 
 
 def runtime_gpu_max_push_constants():

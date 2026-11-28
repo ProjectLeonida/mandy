@@ -11,6 +11,23 @@ Paths are placeholders: `<checkout>` is the repository, `<build>` the folder wit
 `gta6rt_tls_host.dll`, `<work>` the work folder `make_game.py` writes, `<cache>` a folder for pipeline caches,
 `<package>` the game's package folder and `<exe>` its executable. Under Wine, a Linux path is passed as `Z:<path>`.
 
+## Check a translated shader pack
+
+Before precompiling or starting the game, `gta6rt.exe --check-shader-pack [DIR]` checks the pack's mesh and
+barycentric requirements against the GPU that `--run` would select with `LEONIDA_D3D12=vulkan` and the
+same `LEONIDA_VK_DEVICE` setting. Omit `DIR` to use `LEONIDA_SHADERS` or the runtime's `shader_path.txt`.
+
+```sh
+wine <build>/gta6rt.exe --check-shader-pack 'Z:\path\to\work\shaders\spirv'
+```
+
+It reports missing GPU features, known native mesh/barycentric driver issues that `make_game.py` selects
+fallbacks for, and translated fallbacks this runtime cannot use. It reads indexes only: no game files,
+logical Vulkan device, pipeline compilation, or cache writes. Exit `0` means no mismatch was found, `1`
+means blockers were found (even if some optional indexes could not be read), and `2` means the check
+could not be completed and found no blockers. This does not verify SPIR-V files, shader interfaces,
+other GPU requirements, or that the game will boot.
+
 ## Settings every platform needs
 
 - **The title's hang watchdog.** The title exits on purpose (a write to address 0) when its main loop has not reported

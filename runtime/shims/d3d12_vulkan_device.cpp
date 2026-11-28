@@ -13,6 +13,7 @@
 #include "d3d12_compile_exit.h"
 #include "d3d12_pipeline_compile.h"
 #include "d3d12_precompile.h"
+#include "d3d12_shader_pack_check.h"
 #include "d3d12_compile_helper.h"
 #include "d3d12_pipeline_checkpoint.h"
 #include "d3d12_feature_compat.h"
@@ -62,6 +63,7 @@
 #include "../src/resource_detile.h"
 #include "../src/console_texture_layout.h"
 #include "../src/shader_library.h"
+#include "../src/shader_pack_check.h"
 #include "../src/shadow_keep.h"
 #include "../src/dstorage_trace.h"
 #include "../src/title_page_watch.h"
@@ -22507,13 +22509,19 @@ HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
                                     i.queue_family, riid, out);
 }
 
-// Creates its own Vulkan instance and a Vulkan 1.3 device, or a 1.2 device with VK_KHR_dynamic_rendering and
-// VK_KHR_synchronization2 (vulkan13_features.h). LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
-HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettings queue_test_settings) {
-    if (!out) return E_POINTER;
-    *out = nullptr;
+struct ShaderPackProbe {
+    leonida::ShaderPackDevice device;
+    char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE]{};
+};
+
+// Creates its own Vulkan instance and device (or probes the same selected GPU and stops before the logical device).
+// LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
+static HRESULT open_vulkan_standalone(REFIID riid, void** out, QueueTestSettings queue_test_settings,
+                                      ShaderPackProbe* probe) {
+    if (!probe && !out) return E_POINTER;
+    if (out) *out = nullptr;
     // LEONIDA_AFTERMATH=1: GPU crash dumps on before the Vulkan instance and device exist (src/vulkan_aftermath.h).
-    leonida::aftermath::enable();
+    if (!probe) leonida::aftermath::enable();
     static const HMODULE library = LoadLibraryA("vulkan-1.dll");
     const auto get = library ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(
                                    reinterpret_cast<void*>(GetProcAddress(library, "vkGetInstanceProcAddr")))
@@ -22620,7 +22628,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     instance_info.enabledExtensionCount = static_cast<std::uint32_t>(inst_exts.size());
     instance_info.ppEnabledExtensionNames = inst_exts.empty() ? nullptr : inst_exts.data();
     OwnedRuntime owned{};
-    if (create_instance(&instance_info, nullptr, &owned.instance) != VK_SUCCESS) {
+    if (!create_instance || create_instance(&instance_info, nullptr, &owned.instance) != VK_SUCCESS) {
         std::fprintf(stderr, "[rt] d3d12: vkCreateInstance (Vulkan 1.3) failed\n");
         return E_FAIL;
     }
@@ -23061,6 +23069,19 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
             *v13.next() = &barycentric;
         }
     }
+    if (probe) {
+        VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, &driver};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup};
+        vkGetPhysicalDeviceProperties2(info.physical, &properties);
+        // make_game's mesh policy also requires mesh in the supported subgroup stages.
+        probe->device = leonida::shader_pack_device(info.mesh_shader, info.fragment_shader_barycentric,
+                                                   (subgroup.supportedStages & VK_SHADER_STAGE_MESH_BIT_EXT) != 0,
+                                                   driver.driverID, chosen.vendorID, chosen.deviceID);
+        std::memcpy(probe->name, chosen.deviceName, sizeof(probe->name));
+        owned.destroy_instance(owned.instance, nullptr);
+        return S_OK;
+    }
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT interlock{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
     if (has_device_extension(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME)) {
@@ -23426,6 +23447,57 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         return E_FAIL;
     }
     return hand_out(device, riid, out);
+}
+
+HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettings queue_test_settings) {
+    return open_vulkan_standalone(riid, out, queue_test_settings, nullptr);
+}
+
+int check_shader_pack(const std::filesystem::path& directory) {
+    std::string error;
+    const auto root = directory.empty() ? configured_shader_directory(&error) : directory;
+    if (root.empty()) {
+        std::fprintf(stderr, "[shader-pack] no shader directory: %s\n", error.c_str());
+        return 2;
+    }
+    ShaderPackProbe probe;
+    if (FAILED(open_vulkan_standalone(__uuidof(ID3D12Device), nullptr, QueueTestSettings::ignore, &probe))) {
+        std::fprintf(stderr, "[shader-pack] could not probe the Vulkan device\n");
+        return 2;
+    }
+    std::printf("[shader-pack] Vulkan device: %s (native mesh: %s, native barycentrics: %s)\n", probe.name,
+                probe.device.native_mesh ? "yes" : "no", probe.device.native_barycentric ? "yes" : "no");
+    leonida::ShaderPackCheck report;
+    if (!leonida::check_shader_pack(root, probe.device, report, error)) {
+        std::fprintf(stderr, "[shader-pack] %s\n", error.c_str());
+        return 2;
+    }
+    for (const auto& issue : report.optional_index_errors)
+        std::fprintf(stderr, "[shader-pack] incomplete scan: %s\n", issue.c_str());
+    if (report.native_mesh_missing)
+        std::printf("[shader-pack] %zu mesh modules need VK_EXT_mesh_shader / meshShader, unavailable on this GPU\n",
+                    report.native_mesh_missing);
+    if (report.native_mesh_driver_blocked)
+        std::printf("[shader-pack] %zu native mesh modules match a known driver issue (mesh draws can crash)\n",
+                    report.native_mesh_driver_blocked);
+    if (report.mesh_compute_unimplemented)
+        std::printf("[shader-pack] %zu mesh modules were translated to compute, but this runtime cannot replay them\n",
+                    report.mesh_compute_unimplemented);
+    if (report.native_barycentric_missing)
+        std::printf("[shader-pack] %zu pixel modules need fragmentShaderBarycentric, unavailable on this GPU\n",
+                    report.native_barycentric_missing);
+    if (report.native_barycentric_driver_blocked)
+        std::printf("[shader-pack] %zu native barycentric modules match a known driver issue (barycentrics can be incorrect)\n",
+                    report.native_barycentric_driver_blocked);
+    if (report.barycentric_fallback_unimplemented)
+        std::printf("[shader-pack] %zu pixel modules need the barycentric fallback, not implemented in this runtime\n",
+                    report.barycentric_fallback_unimplemented);
+    if (report.unknown)
+        std::printf("[shader-pack] %zu entries have missing or malformed stage or mesh/barycentric metadata\n", report.unknown);
+    std::printf("[shader-pack] %zu indexed modules: %s. Metadata only; no pipelines tested.\n", report.indexed,
+                report.blocked() ? "mesh/barycentric blockers found"
+                : report.exit_code() ? "incomplete check" : "no known mesh/barycentric mismatch");
+    return report.exit_code();
 }
 
 // A Vulkan device made as `gta6rt --run` makes it, for building the library's compute pipelines with no title

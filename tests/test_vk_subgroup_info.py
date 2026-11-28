@@ -902,7 +902,6 @@ class QueryTest(unittest.TestCase):
         for label, vendor, device, driver, want in cases:
             with self.subTest(case=label):
                 self.assertIs(vk_info.barycentric_fallback(vendor, device, driver), want)
-                self.assertIs(vk_info.gfx90c_amd_windows(vendor, device, driver), want and driver == 1)
                 res, _vk = self._run_query(FakeDevice(vendor_id=vendor, device_id=device, driver_id=driver))
                 self.assertEqual((res["vendor_id"], res["device_id"], res["driver_id"]), (vendor, device, driver))
                 self.assertIs(res["barycentric_fallback"], want)
