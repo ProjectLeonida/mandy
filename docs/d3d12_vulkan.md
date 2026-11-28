@@ -3582,8 +3582,11 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   so a pass visits at most `LEONIDA_TITLE_IMAGE_CHECKS` (128) of the images that may go, from where the last one
   stopped. The title textures census line counts the retirements under a newer texture and with their pages gone,
   and the images a view named again after a newer texture covered them (overlapping textures both in use).
-  `LEONIDA_TITLE_IMAGE_RETIRE=0` keeps the images as before. `d3d12_title_image_retire` and `d3d12_title_image_idle`
-  cover it without game files.
+  It is off by default (`LEONIDA_TITLE_IMAGE_RETIRE=1` turns it on) until a game session has measured it: a title
+  that samples an image through a descriptor it wrote once (a heap it copies from, a table it keeps), with no later
+  slot-70 view of the address, would sample the fallback once the image goes, and the census cannot see that. The
+  range a whole release records is there for every reader of the map, whatever the switch.
+  `d3d12_title_image_retire` and `d3d12_title_image_idle` cover it without game files, with the switch on.
 - With `LEONIDA_TITLE_PARTIAL_MIPS=1`, such a texture can be filled before all its pages are readable. The XG
   layout of a 2D texture of one slice stores its mips from the smallest to the largest, so the mips from `m` on are
   the first `mip_chain_bytes(layout, m)` bytes from its base (`xg_xs_layout.h`; checked in `xg_xs_test` for tiled,
