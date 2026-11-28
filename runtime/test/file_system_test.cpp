@@ -1042,6 +1042,31 @@ void run_checks(const std::filesystem::path& root) {
         check(move_w(L"GAME:\\misc\\keep.txt", L"GAME:\\nowhere\\keep.txt") == FALSE &&
                   GetLastError() == ERROR_PATH_NOT_FOUND,
               "moving into a missing folder reports ERROR_PATH_NOT_FOUND");
+        // Onto a folder (the package's data\sub, the overlay's cache\renamed), as MoveFileEx answers on the host: the
+        // name is already there without MOVEFILE_REPLACE_EXISTING, and a folder is not replaced with it. Nothing moves.
+        const struct {
+            const wchar_t* folder;
+            std::string name;
+        } folders[] = {{L"GAME:\\data\\sub", "GAME:\\data\\sub"}, {L"GAME:\\cache\\renamed", "GAME:\\cache\\renamed"}};
+        for (const auto& [folder, name] : folders) {
+            SetLastError(0);
+            check(move_ex_w(L"GAME:\\misc\\keep.txt", folder, 0) == FALSE && GetLastError() == ERROR_ALREADY_EXISTS,
+                  ("MoveFileExW of a file onto " + name + " reports ERROR_ALREADY_EXISTS").c_str());
+            SetLastError(0);
+            check(move_w(L"GAME:\\misc\\keep.txt", folder) == FALSE && GetLastError() == ERROR_ALREADY_EXISTS,
+                  ("MoveFileW of a file onto " + name + " reports ERROR_ALREADY_EXISTS").c_str());
+            SetLastError(0);
+            check(move_ex_w(L"GAME:\\misc\\keep.txt", folder, MOVEFILE_REPLACE_EXISTING) == FALSE &&
+                      GetLastError() == ERROR_ACCESS_DENIED,
+                  ("with MOVEFILE_REPLACE_EXISTING a file is not moved onto " + name + " (ERROR_ACCESS_DENIED)").c_str());
+        }
+        check(attributes_w(L"GAME:\\misc\\keep.txt") != INVALID_FILE_ATTRIBUTES &&
+                  read_path(package / "misc" / "keep.txt") == "keep",
+              "the file refused at a folder stays where it was");
+        SetLastError(0);
+        check(move_w(L"GAME:\\cache\\renamed", L"GAME:\\data\\sub") == FALSE && GetLastError() == ERROR_ALREADY_EXISTS &&
+                  std::filesystem::is_directory(overlay / "cache" / "renamed"),
+              "an overlay folder moved onto a folder reports ERROR_ALREADY_EXISTS and stays");
     }
 
     // MOVEFILE_WRITE_THROUGH on a package file: the copy and the marker are flushed before the call returns.
