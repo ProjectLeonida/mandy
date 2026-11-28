@@ -6589,7 +6589,9 @@ void apply_console_placement(const D3D12_RESOURCE_DESC* descs, UINT count, D3D12
     bool depth = false;
     for (UINT i = 0; descs && i < count && !depth; ++i) {
         UINT64 xg_size = 0, xg_alignment = 0;
-        depth = console_depth_stencil_size(descs[i]) != 0 || console_texture_layout(descs[i], xg_size, xg_alignment);
+        const UINT layout = static_cast<UINT>((title_descs ? title_descs : descs)[i].Layout);
+        depth = console_depth_stencil_size(descs[i]) != 0 ||
+                console_texture_layout(descs[i], layout, xg_size, xg_alignment);
     }
     if (depth || console.SizeInBytes >= info.SizeInBytes) info = console;
 }
