@@ -5531,19 +5531,33 @@ struct DeviceState {
         std::atomic<std::uint32_t> flush_in_flight{0};
         std::atomic<std::uint64_t> fast_refreshes{0};
         std::atomic<std::uint64_t> resolved_fast{0};
+        std::atomic<std::uint64_t> clipped_fast{0};
         std::atomic<std::int64_t> since_ns_atomic{
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
                 .count()};
-        // Read-mostly snapshot of chunk coverage + plain/ensured intervals so title recording threads calling
-        // page_mirror_resolve() take a shared lock and never contend on page_mirror.mutex against async workers.
+        // Read-mostly snapshot of chunk coverage (base -> VkBuffer) + plain/ensured intervals so title recording
+        // threads calling page_mirror_resolve() / page_mirror_buffer() take a shared lock and never contend on
+        // page_mirror.mutex against async workers.
         // Lock order: page_mirror.mutex -> resolve_cache.mutex (never reversed).
         struct ResolveCache {
             std::shared_mutex mutex;
             std::uint64_t space_generation = 0;
-            std::vector<std::uint64_t> chunks;
+            std::vector<std::pair<std::uint64_t, VkBuffer>> chunks;
             std::map<std::uint64_t, std::uint64_t> plain, ensured;
         } resolve_cache;
         std::vector<Change> taken;
+        struct FeedOrder {
+            std::uintptr_t page = 0;
+            std::uint32_t seq = 0;
+        };
+        struct FeedCollapsed {
+            std::uint32_t seq = 0;
+            bool had_prior = false;
+        };
+        std::vector<FeedOrder> feed_order;
+        std::vector<FeedCollapsed> feed_collapsed;
+        std::vector<std::uint64_t> feed_unwatch;
+        std::vector<std::uint64_t> feed_watch;
         // Which mirrored pages the host wrote (src/title_mirror_tracking.h): a policy behind a small interface, the
         // plainest correct one (a guard on every page) until a measured one replaces it.
         std::unique_ptr<leonida::HotColdTracking> tracking;
@@ -5604,6 +5618,7 @@ struct DeviceState {
             double cpu_ms = 0;
             double waited_ms = 0;
             std::uint64_t read_bytes = 0;
+            std::uint64_t slice_copied_bytes = 0;
             std::uint64_t written = 0;
         } readback_async;  // under `readback_mutex`
         std::vector<std::pair<std::uint64_t, std::uint64_t>> readback_queued_ranges;  // under `readback_mutex`
@@ -5861,7 +5876,10 @@ struct DeviceState {
                 const std::uint64_t end = va + bytes;
                 bool covered = true;
                 for (std::uint64_t c = va & ~(kChunk - 1); c < end; c += kChunk) {
-                    if (!std::binary_search(rc.chunks.begin(), rc.chunks.end(), c)) {
+                    const auto it = std::lower_bound(
+                        rc.chunks.begin(), rc.chunks.end(), c,
+                        [](const auto& entry, std::uint64_t key) { return entry.first < key; });
+                    if (it == rc.chunks.end() || it->first != c) {
                         covered = false;
                         break;
                     }
@@ -5872,8 +5890,8 @@ struct DeviceState {
                     auto it = rc.plain.upper_bound(va);
                     if (it != rc.plain.begin() && std::prev(it)->second > va) --it;
                     for (; it != rc.plain.end() && it->first < end; ++it) {
-                        const std::uint64_t from = std::max(it->first, va) & ~(kPage - 1);
-                        const std::uint64_t to = (std::min(it->second, end) + kPage - 1) & ~(kPage - 1);
+                        const std::uint64_t from = (std::max)(it->first, va) & ~(kPage - 1);
+                        const std::uint64_t to = ((std::min)(it->second, end) + kPage - 1) & ~(kPage - 1);
                         auto eit = rc.ensured.upper_bound(from);
                         if (eit == rc.ensured.begin() || std::prev(eit)->first > from || std::prev(eit)->second < to) {
                             all_ensured = false;
@@ -5900,26 +5918,35 @@ struct DeviceState {
         if (g == m.space_generation) return;
         m.space_generation = g;
         m.plain.clear();
-        std::vector<std::uint64_t> covered_chunks;
+        std::vector<std::pair<std::uint64_t, VkBuffer>> covered_chunks;
         leonida::title_mirror_space::for_each_taken([&](std::uint64_t base, std::uint64_t end, bool plain) {
             m.mirror->cover(base, end);
             if (plain) m.plain[base] = end;
             constexpr std::uint64_t kChunk = leonida::TitleMirror::kChunk;
             for (std::uint64_t c = base & ~(kChunk - 1); c < end; c += kChunk) {
-                if (m.mirror->covers(c)) covered_chunks.push_back(c);
+                VkBuffer buf = VK_NULL_HANDLE;
+                VkDeviceSize off = 0;
+                if (m.mirror->chunk_at(c, buf, off)) covered_chunks.emplace_back(c, buf);
                 if (c > UINT64_MAX - kChunk) break;
             }
         });
-        std::sort(covered_chunks.begin(), covered_chunks.end());
-        covered_chunks.erase(std::unique(covered_chunks.begin(), covered_chunks.end()), covered_chunks.end());
+        std::sort(covered_chunks.begin(), covered_chunks.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        covered_chunks.erase(
+            std::unique(covered_chunks.begin(), covered_chunks.end(),
+                        [](const auto& a, const auto& b) { return a.first == b.first; }),
+            covered_chunks.end());
         {
             std::unique_lock rc_lock(m.resolve_cache.mutex);
             // TitleMirror never removes covered chunks until destroy_page_mirror(), so union monotonically to keep
-            // resolve_cache.chunks 100% identical to m.mirror->covers() even if a reservation is later released.
+            // resolve_cache.chunks 100% identical to m.mirror->covers()/chunk_at() even if a reservation is released.
             m.resolve_cache.chunks.insert(m.resolve_cache.chunks.end(), covered_chunks.begin(), covered_chunks.end());
-            std::sort(m.resolve_cache.chunks.begin(), m.resolve_cache.chunks.end());
-            m.resolve_cache.chunks.erase(std::unique(m.resolve_cache.chunks.begin(), m.resolve_cache.chunks.end()),
-                                         m.resolve_cache.chunks.end());
+            std::sort(m.resolve_cache.chunks.begin(), m.resolve_cache.chunks.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+            m.resolve_cache.chunks.erase(
+                std::unique(m.resolve_cache.chunks.begin(), m.resolve_cache.chunks.end(),
+                            [](const auto& a, const auto& b) { return a.first == b.first; }),
+                m.resolve_cache.chunks.end());
             m.resolve_cache.plain = m.plain;
             m.resolve_cache.ensured = m.ensured;
             m.resolve_cache.space_generation = g;
@@ -5997,7 +6024,45 @@ struct DeviceState {
     // holds all of it already (named before: nothing is mirrored during a replay, whose binds would land after it). A
     // range that runs past its chunk is cut at the chunk's end (counted): a buffer binding cannot span two chunks.
     bool page_mirror_buffer(std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
-        if (!page_mirror.mirror || !size) return false;
+        if (!page_mirror.mirror || !size || va + size < va) return false;
+        // Shared-lock fast path via resolve_cache so concurrent queue replays never stall behind
+        // refresh_page_mirror()'s page_mirror.mutex hold.
+        {
+            auto& rc = page_mirror.resolve_cache;
+            std::shared_lock shared(rc.mutex);
+            if (rc.space_generation == leonida::title_mirror_space::generation() && !rc.chunks.empty()) {
+                constexpr std::uint64_t kChunk = leonida::TitleMirror::kChunk;
+                constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
+                const std::uint64_t end = va + size;
+                VkBuffer first_chunk = VK_NULL_HANDLE;
+                for (std::uint64_t c = va & ~(kChunk - 1); c < end; c += kChunk) {
+                    const auto it = std::lower_bound(
+                        rc.chunks.begin(), rc.chunks.end(), c,
+                        [](const auto& entry, std::uint64_t key) { return entry.first < key; });
+                    if (it == rc.chunks.end() || it->first != c || !it->second) return false;
+                    if (!first_chunk) first_chunk = it->second;
+                    if (c > UINT64_MAX - kChunk) break;
+                }
+                auto it = rc.plain.upper_bound(va);
+                if (it != rc.plain.begin() && std::prev(it)->second > va) --it;
+                for (; it != rc.plain.end() && it->first < end; ++it) {
+                    const std::uint64_t from = (std::max)(it->first, va) & ~(kPage - 1);
+                    const std::uint64_t to = ((std::min)(it->second, end) + kPage - 1) & ~(kPage - 1);
+                    auto eit = rc.ensured.upper_bound(from);
+                    if (eit == rc.ensured.begin() || std::prev(eit)->first > from || std::prev(eit)->second < to)
+                        return false;
+                }
+                buffer = first_chunk;
+                offset = va & (kChunk - 1);
+                const std::uint64_t room = kChunk - offset;
+                if (size > room) {
+                    size = room;
+                    page_mirror.clipped_fast.fetch_add(1, std::memory_order_relaxed);
+                }
+                page_mirror.resolved_fast.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+        }
         std::lock_guard lock(page_mirror.mutex);
         if (!page_mirror_resolve_locked(va, size, false) || !page_mirror.mirror->chunk_at(va, buffer, offset)) return false;
         const std::uint64_t room = leonida::TitleMirror::kChunk - offset;
@@ -6082,18 +6147,22 @@ struct DeviceState {
     }
     // Submits the GPU copy of `refs` (at most kReadbackPages, page_mirror.readback_mutex held, page_mirror.mutex NOT
     // held) into the host-cached readback buffer after mirror bind batch `wait`, signalling `m.readback_done` at `done`
-    // without blocking on the CPU.
-    bool submit_homes_copy_locked(const leonida::TitleMirror::HomeRef* refs, std::size_t count, std::uint64_t wait,
-                                  std::uint64_t done) {
+    // without blocking on the CPU. Emits 256-byte-aligned sub-page VkBufferCopy regions matching sorted disjoint
+    // `ranges` while preserving exact `dstOffset = i * kPage + sub_off` staging layout.
+    bool submit_homes_copy_locked(const leonida::TitleMirror::HomeRef* refs, std::size_t count,
+                                  const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges,
+                                  std::uint64_t wait, std::uint64_t done, std::uint64_t& copied_bytes_out) {
         auto& m = page_mirror;
         auto& vk = context->vk;
         constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
+        constexpr std::uint64_t kPiece = leonida::shadow_keep::kPiece;
+        copied_bytes_out = 0;
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (vk.vkResetCommandBuffer(m.readback_commands, 0) != VK_SUCCESS ||
             vk.vkBeginCommandBuffer(m.readback_commands, &begin) != VK_SUCCESS)
             return false;
-        // One copy command per run of pages in one chunk; regions that follow each other in both are joined.
+        // One copy command per run of pages/sub-pages in one chunk; adjacent regions in both src and dst are joined.
         std::vector<VkBufferCopy> regions;
         VkBuffer source = VK_NULL_HANDLE;
         const auto emit = [&] {
@@ -6101,7 +6170,18 @@ struct DeviceState {
                 vk.vkCmdCopyBuffer(m.readback_commands, source, m.readback, std::uint32_t(regions.size()), regions.data());
             regions.clear();
         };
+        const auto push_region = [&](VkDeviceSize src_off, VkDeviceSize dst_off, VkDeviceSize len) {
+            if (!len) return;
+            copied_bytes_out += len;
+            if (!regions.empty() && regions.back().srcOffset + regions.back().size == src_off &&
+                regions.back().dstOffset + regions.back().size == dst_off)
+                regions.back().size += len;
+            else
+                regions.push_back({src_off, dst_off, len});
+        };
+        std::size_t cursor = 0;
         for (std::size_t i = 0; i < count; ++i) {
+            const std::uint64_t page = refs[i].page;
             const VkBuffer chunk = refs[i].chunk;
             const VkDeviceSize offset = refs[i].offset;
             if (!chunk) {
@@ -6112,11 +6192,33 @@ struct DeviceState {
                 emit();
                 source = chunk;
             }
-            if (!regions.empty() && regions.back().srcOffset + regions.back().size == offset &&
-                regions.back().dstOffset + regions.back().size == i * kPage)
-                regions.back().size += kPage;
-            else
-                regions.push_back({offset, i * kPage, kPage});
+            if (ranges.empty()) {
+                push_region(offset, i * kPage, kPage);
+                continue;
+            }
+            if (i > 0 && page < refs[i - 1].page) cursor = 0;
+            while (cursor < ranges.size() && ranges[cursor].second <= page) ++cursor;
+            if (cursor >= ranges.size() || ranges[cursor].first >= page + kPage) continue;
+            // Coalesce 256-byte-aligned sub-ranges on this page so no two VkBufferCopy regions overlap.
+            std::uint64_t run_lo = kPage, run_hi = kPage;
+            for (std::size_t r = cursor; r < ranges.size() && ranges[r].first < page + kPage; ++r) {
+                const std::uint64_t lo = (std::max)(ranges[r].first, page);
+                const std::uint64_t hi = (std::min)(ranges[r].second, page + kPage);
+                if (lo >= hi) continue;
+                const std::uint64_t sub_lo = (lo - page) & ~(kPiece - 1);
+                const std::uint64_t sub_hi = ((hi - page) + kPiece - 1) & ~(kPiece - 1);
+                if (run_lo == kPage) {
+                    run_lo = sub_lo;
+                    run_hi = sub_hi;
+                } else if (sub_lo <= run_hi) {
+                    if (sub_hi > run_hi) run_hi = sub_hi;
+                } else {
+                    push_region(offset + run_lo, i * kPage + run_lo, run_hi - run_lo);
+                    run_lo = sub_lo;
+                    run_hi = sub_hi;
+                }
+            }
+            if (run_lo < run_hi) push_region(offset + run_lo, i * kPage + run_lo, run_hi - run_lo);
         }
         emit();
         VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -6249,7 +6351,9 @@ struct DeviceState {
                 m.readback_slice_skip_masks.assign(m.readback_slice_frames.size(), {});
                 submit_lock.lock();
             }
-            const bool submitted = submit_homes_copy_locked(slice.data(), slice.size(), wait, done);
+            std::uint64_t slice_copied_bytes = 0;
+            const bool submitted =
+                submit_homes_copy_locked(slice.data(), slice.size(), ranges, wait, done, slice_copied_bytes);
             if (submitted) m.readback_active_value.store(done, std::memory_order_release);
             submit_lock.unlock();
             if (!submitted) {
@@ -6268,6 +6372,7 @@ struct DeviceState {
                 cpu_ms + std::chrono::duration<double, std::milli>(clock::now() - kick_start).count();
             m.readback_async.waited_ms = waited_ms;
             m.readback_async.read_bytes = read_bytes;
+            m.readback_async.slice_copied_bytes = slice_copied_bytes;
             m.readback_async.written = batch_written;
             return true;
         }
@@ -6431,7 +6536,7 @@ struct DeviceState {
             auto ranges = std::move(m.readback_async.ranges);
             const double cpu_ms = m.readback_async.cpu_ms + slice_cpu_ms;
             const double waited_ms = m.readback_async.waited_ms;
-            const std::uint64_t read_bytes = m.readback_async.read_bytes + slice_pages * kPage;
+            const std::uint64_t read_bytes = m.readback_async.read_bytes + m.readback_async.slice_copied_bytes;
             const std::uint64_t batch_written = m.readback_async.written + slice_written;
             m.readback_async = {};
             const bool launched_next = kick_async_readback_locked(std::move(refs), cursor, std::move(ranges), cpu_ms,
@@ -6626,24 +6731,62 @@ struct DeviceState {
         ReleaseSRWLockExclusive(&m.feed_lock);
         m.fed_now.clear();
         if (!m.taken.empty()) {
-            m.fed_now.reserve(m.taken.size());
-            for (auto& change : m.taken) {
-                ++m.fed;
-                m.fed_now.push_back(change.page);
-                if (m.readback_in_flight) {
+            m.fed += m.taken.size();
+            // 1. Invalidate readback_in_flight frames across ALL raw m.taken entries BEFORE collapsing.
+            if (m.readback_in_flight) {
+                for (const auto& change : m.taken) {
                     note_readback_frame_invalidated_locked(m.mirror->frame_at(change.page));
                     note_readback_frame_invalidated_locked(change.frame);
                 }
-                // Watched before the home is filled: a write after the fill is in the next collect.
+            }
+            if (m.taken.size() == 1) {
+                auto& change = m.taken[0];
+                m.fed_now.push_back(change.page);
                 if (!change.frame) m.tracking->unwatch(change.page);
                 else if (m.mirror->covers(change.page)) m.tracking->watch(change.page);
-                // Defer non-aliased new-home fills so upload() executes them in parallel across WorkerPool after
-                // collect() has armed the pages.
                 m.mirror->map(change.page, change.frame, std::move(change.keep), leonida::TitleMirror::kUnstamped,
                               true);
+            } else {
+                // 2. Collapse m.taken by change.page keeping only the final entry per page (avoiding redundant
+                //    unwatch+watch churn on xmem unmap+remap pairs), then batch unwatch/watch under single lock holds
+                //    and execute map() in final chronological order.
+                m.feed_order.resize(m.taken.size());
+                for (std::size_t idx = 0; idx < m.taken.size(); ++idx)
+                    m.feed_order[idx] = {m.taken[idx].page, static_cast<std::uint32_t>(idx)};
+                std::sort(m.feed_order.begin(), m.feed_order.end(), [](const auto& a, const auto& b) {
+                    return a.page != b.page ? (a.page < b.page) : (a.seq < b.seq);
+                });
+                m.feed_collapsed.clear();
+                m.feed_unwatch.clear();
+                m.feed_watch.clear();
+                m.fed_now.reserve(m.taken.size());
+                for (std::size_t r = 0; r < m.feed_order.size();) {
+                    std::size_t r_end = r + 1;
+                    while (r_end < m.feed_order.size() && m.feed_order[r_end].page == m.feed_order[r].page) ++r_end;
+                    const std::uint32_t last_seq = m.feed_order[r_end - 1].seq;
+                    const bool had_prior = (r_end - r) > 1;
+                    const auto& final_change = m.taken[last_seq];
+                    m.fed_now.push_back(final_change.page);
+                    m.feed_collapsed.push_back({last_seq, had_prior});
+                    if (!final_change.frame) m.feed_unwatch.push_back(final_change.page);
+                    else if (m.mirror->covers(final_change.page)) m.feed_watch.push_back(final_change.page);
+                    r = r_end;
+                }
+                if (!m.feed_unwatch.empty()) m.tracking->unwatch_batch(m.feed_unwatch.data(), m.feed_unwatch.size());
+                if (!m.feed_watch.empty()) m.tracking->watch_batch(m.feed_watch.data(), m.feed_watch.size());
+                std::sort(m.feed_collapsed.begin(), m.feed_collapsed.end(),
+                          [](const auto& a, const auto& b) { return a.seq < b.seq; });
+                for (const auto& entry : m.feed_collapsed) {
+                    auto& change = m.taken[entry.seq];
+                    // Guardrail: if {p, nullptr} was followed by {p, same_old_frame}, map() would see
+                    // old_frame == change.frame and return early; still mark dirty(p) so changed bytes upload.
+                    const bool same_frame_after_churn =
+                        entry.had_prior && change.frame && m.mirror->frame_at(change.page) == change.frame;
+                    m.mirror->map(change.page, change.frame, std::move(change.keep), leonida::TitleMirror::kUnstamped,
+                                  true);
+                    if (same_frame_after_churn && m.mirror->dirty(change.page)) ++m.dirty;
+                }
             }
-            std::sort(m.fed_now.begin(), m.fed_now.end());
-            m.fed_now.erase(std::unique(m.fed_now.begin(), m.fed_now.end()), m.fed_now.end());
         }
         m.taken.clear();
         // Ordinary memory released or decommitted: its mirrored pages leave (named again, they are mirrored again).
@@ -6708,6 +6851,7 @@ struct DeviceState {
         if (now - m.since >= std::chrono::seconds(10)) {
             m.refreshes += m.fast_refreshes.exchange(0, std::memory_order_relaxed);
             m.resolved += m.resolved_fast.exchange(0, std::memory_order_relaxed);
+            m.clipped += m.clipped_fast.exchange(0, std::memory_order_relaxed);
             const auto c = m.mirror->counters();
             const auto policy = m.tracking->stats();
             const std::uint64_t presents =
@@ -6861,8 +7005,10 @@ struct DeviceState {
     void reclaim_arena() {
         if (!context || !arena.backing.sparse()) return;
         {
-            std::lock_guard lock(arena.mutex);
-            if (!arena.backing.has_pending()) return;
+            // Non-blocking fast path: skip reclaiming on this submission if arena.mutex is currently held by another
+            // thread's allocation or sparse bind, and return immediately when no backing units are pending.
+            std::unique_lock lock(arena.mutex, std::try_to_lock);
+            if (!lock.owns_lock() || !arena.backing.has_pending()) return;
         }
         const std::uint64_t completed = context->completed_retire_ticket();
         std::lock_guard lock(arena.mutex);
@@ -7826,24 +7972,45 @@ struct DeviceState {
         heap.pending_changes.clear();
         if (!heap.touched_scratch.empty()) {
             FilterCacheScope cache_scope(*this);
+            OutScratchGuard out_guard;
+            std::array<std::uint64_t, 32> written_slots{};
+            std::size_t written_count = 0;
             constexpr std::uint64_t kPageMask = ~(leonida::TitleMirror::kPage - 1);
             constexpr std::uint64_t kOffMask = leonida::TitleMirror::kPage - 1;
             std::uint64_t last_page = UINT64_MAX;
             std::uint8_t* last_copy = nullptr;
             std::uint8_t* last_frame = nullptr;
             const bool readback = page_mirror.readback_in_flight;
+            const auto flush_page = [&] {
+                if (last_copy && written_count) {
+                    flush_written_slot_runs(last_copy, out_guard.ptr, written_slots, written_count);
+                    written_slots = {};
+                    written_count = 0;
+                }
+            };
             for (const std::uint32_t slot : heap.touched_scratch) {
                 const std::uint64_t va = heap.console_va + std::uint64_t(slot) * kDescriptorSize;
                 const std::uint64_t page_va = va & kPageMask;
                 if (page_va != last_page) {
+                    flush_page();
                     last_page = page_va;
                     last_copy = page_mirror.mirror->copy_bytes(page_va);
                     last_frame = (last_copy && readback) ? page_mirror.mirror->frame_at(page_va) : nullptr;
                     if (last_frame) note_readback_frame_invalidated_locked(last_frame);
                 }
-                if (last_copy) filter_slot_locked(heap, slot, last_copy + (va & kOffMask), cache_scope.cache, false);
+                if (last_copy) {
+                    const std::size_t at = std::size_t(va & kOffMask);
+                    const std::size_t page_slot = at >> 5;
+                    filter_slot_locked(heap, slot, out_guard.ptr + at, cache_scope.cache, false);
+                    const std::uint64_t bit = std::uint64_t(1) << (page_slot & 63);
+                    if (!(written_slots[page_slot >> 6] & bit)) {
+                        written_slots[page_slot >> 6] |= bit;
+                        ++written_count;
+                    }
+                }
                 // A page not mapped is filtered whole when it is.
             }
+            flush_page();
         }
         heap.record_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
@@ -8044,10 +8211,46 @@ struct DeviceState {
             std::vector<std::uint32_t> defer_slots;
             std::vector<std::pair<std::uint64_t, std::uint64_t>> mirror_ranges;
             std::vector<std::uint16_t> phase_b_full;
+            void reset() noexcept {
+                heap = nullptr;
+                out_buf = nullptr;
+                persistent_buf = false;
+                flushed = false;
+                written_slots = {};
+                written_count = 0;
+                changed = 0;
+                changed_class[0] = changed_class[1] = changed_class[2] = changed_class[3] = 0;
+                vsharp_halves = 0;
+                vsharps_as_written = 0;
+                resolved = 0;
+                clear_ops.clear();
+                defer_slots.clear();
+                mirror_ranges.clear();
+                phase_b_full.clear();
+            }
         };
 
-        // Pre-Phase A (sequential under page_mirror.mutex): resolve heaps and confirm disjoint page VAs.
-        std::vector<PageWork> work(count);
+        // Pre-Phase A (sequential under page_mirror.mutex): reuse thread-local PageWork storage (keeping inner vector
+        // capacities warm across batches; falls back to stack vector on re-entry), resolve heaps and confirm disjoint
+        // page VAs.
+        thread_local std::vector<PageWork> tls_page_work;
+        thread_local bool tls_page_work_in_use = false;
+        std::vector<PageWork> fallback_page_work;
+        struct PageWorkGuard {
+            bool* in_use = nullptr;
+            ~PageWorkGuard() {
+                if (in_use) *in_use = false;
+            }
+        } work_guard;
+        std::vector<PageWork>* work_ptr = &fallback_page_work;
+        if (!tls_page_work_in_use) {
+            tls_page_work_in_use = true;
+            work_guard.in_use = &tls_page_work_in_use;
+            work_ptr = &tls_page_work;
+        }
+        std::vector<PageWork>& work = *work_ptr;
+        if (work.size() < count) work.resize(count);
+        for (std::size_t p = 0; p < count; ++p) work[p].reset();
         bool duplicate_va = false;
         for (std::size_t p = 0; p < count; ++p) {
             ConsoleHeap* heap = nullptr;
@@ -8090,7 +8293,7 @@ struct DeviceState {
                 std::uint64_t span = 0;
                 std::uint32_t gen = 0;
             };
-            std::array<LocalMirrorEntry, 64> local_mirror{};
+            std::array<LocalMirrorEntry, 256> local_mirror{};
             std::uint32_t local_gen = 0;
 
             std::uint8_t* const worker_fallback_buf = pool ? pool->scratch(tid) : nullptr;
@@ -8193,7 +8396,7 @@ struct DeviceState {
                                         if (has_mirror) {
                                             const std::size_t lb =
                                                 static_cast<std::size_t>(((base >> 4) ^ (span * 0x9e3779b97f4a7c15ull)) &
-                                                                         63u);
+                                                                         255u);
                                             LocalMirrorEntry& le = local_mirror[lb];
                                             if (le.gen == local_gen && le.base == base && le.span == span) {
                                                 half_ok[half] = true;
@@ -8369,9 +8572,9 @@ struct DeviceState {
         const double total_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - batch_start).count();
         ConsoleHeap* first_heap = nullptr;
-        for (const PageWork& pw : work) {
-            if (pw.heap) {
-                first_heap = pw.heap;
+        for (std::size_t p = 0; p < count; ++p) {
+            if (work[p].heap) {
+                first_heap = work[p].heap;
                 break;
             }
         }
@@ -8533,7 +8736,28 @@ struct DeviceState {
             }
             ranges.resize(write);
         }
-        for (const auto& [base, span] : ranges) note_passive_title_write(base, span);  // gated when writes_buffer meta is complete
+        if (!ranges.empty()) {
+            if (!writes_buffer_meta_complete.load(std::memory_order_acquire)) {
+                for (const auto& [base, span] : ranges) note_title_write(base, span);
+            } else if (title_write_back_enabled()) {
+                // Clamp each range against title_memory outside title_write_back_mutex, then batch all notes under one
+                // lock hold.
+                auto& aliases = leonida::title_va_aliases();
+                std::size_t valid = 0;
+                for (const auto& [base, span] : ranges) {
+                    if (!base || !span) continue;
+                    std::uint64_t lo = 0, hi = 0;
+                    if (!aliases.title_memory(base, lo, hi) || base >= hi) continue;
+                    ranges[valid++] = {base, base + (std::min)(span, hi - base)};
+                }
+                if (valid) {
+                    std::lock_guard wb_lock(title_write_back_mutex);
+                    for (std::size_t i = 0; i < valid; ++i)
+                        passive_write_back.note(ranges[i].first, ranges[i].second);
+                    has_passive_title_write_back.store(!passive_write_back.empty(), std::memory_order_release);
+                }
+            }
+        }
         if (jobs.empty()) return;
         const auto start = std::chrono::steady_clock::now();
         auto& batch_answers = in_place_vsharp_cache;
@@ -8654,12 +8878,22 @@ struct DeviceState {
         }
         std::unique_lock lock(page_mirror.mutex, std::defer_lock);
         leonida::submit_phases::lock_timed(lock);
+        OutScratchGuard out_guard;
+        std::array<std::uint64_t, 32> written_slots{};
+        std::size_t written_count = 0;
         constexpr std::uint64_t kPageMask = ~(leonida::TitleMirror::kPage - 1);
         constexpr std::uint64_t kOffMask = leonida::TitleMirror::kPage - 1;
         std::uint64_t last_page = UINT64_MAX;
         std::uint8_t* last_home = nullptr;
         const bool has_mirror = page_mirror.mirror != nullptr;
         const bool readback = page_mirror.readback_in_flight;
+        const auto flush_page = [&] {
+            if (last_home && written_count) {
+                flush_written_slot_runs(last_home, out_guard.ptr, written_slots, written_count);
+                written_slots = {};
+                written_count = 0;
+            }
+        };
         for (std::size_t i = 0; i < jobs.size(); ++i) {
             const std::uint32_t slot = jobs[i].slot;
             if (!slots_equal_32(heap.previous + std::size_t(slot) * kDescriptorSize,
@@ -8668,6 +8902,7 @@ struct DeviceState {
             const std::uint64_t va = heap.console_va + std::uint64_t(slot) * kDescriptorSize;
             const std::uint64_t page_va = va & kPageMask;
             if (page_va != last_page) {
+                flush_page();
                 last_page = page_va;
                 last_home = has_mirror ? page_mirror.mirror->copy_bytes(page_va) : nullptr;
                 if (last_home && readback) {
@@ -8705,8 +8940,16 @@ struct DeviceState {
                     }
                 }
             }
-            std::memcpy(last_home + (va & kOffMask), d.out, kDescriptorSize);
+            const std::size_t at = std::size_t(va & kOffMask);
+            const std::size_t page_slot = at >> 5;
+            std::memcpy(out_guard.ptr + at, d.out, kDescriptorSize);
+            const std::uint64_t bit = std::uint64_t(1) << (page_slot & 63);
+            if (!(written_slots[page_slot >> 6] & bit)) {
+                written_slots[page_slot >> 6] |= bit;
+                ++written_count;
+            }
         }
+        flush_page();
         heap.deferred_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
 
@@ -10301,13 +10544,21 @@ struct DeviceState {
                 if (!(begin < arena.size && end <= arena.size)) heap_spans.emplace_back(begin, end);
             }
         }
-        std::lock_guard lock(guard.mutex);
-        const std::uint64_t generation = backing_generation.load(std::memory_order_relaxed);
+        const std::uint64_t generation = backing_generation.load(std::memory_order_acquire);
         const std::uint64_t blocks = geometry.pool().layout_generation() + external_windows.layout_generation();
-        if (generation != guard.generation || blocks != guard.blocks || heap_signature != guard.heaps) {
-            guard.generation = generation;
-            guard.blocks = blocks;
-            guard.heaps = heap_signature;
+        // Lock-free clean fast path: skip guard.mutex when backings, blocks, console heaps, and refusal counter are
+        // unchanged.
+        if (generation == std::atomic_ref(guard.generation).load(std::memory_order_acquire) &&
+            blocks == std::atomic_ref(guard.blocks).load(std::memory_order_acquire) &&
+            heap_signature == std::atomic_ref(guard.heaps).load(std::memory_order_acquire)) {
+            auto* header =
+                reinterpret_cast<ag::AddressGuardHeader*>(arena_host(ag::kGuardHeader, sizeof(ag::AddressGuardHeader)));
+            if (!header || std::atomic_ref(header->refused).load(std::memory_order_relaxed) == 0) return;
+        }
+        std::lock_guard lock(guard.mutex);
+        if (generation != std::atomic_ref(guard.generation).load(std::memory_order_relaxed) ||
+            blocks != std::atomic_ref(guard.blocks).load(std::memory_order_relaxed) ||
+            heap_signature != std::atomic_ref(guard.heaps).load(std::memory_order_relaxed)) {
             std::vector<std::pair<std::uint64_t, std::uint64_t>> spans = heap_spans;
             {
                 std::lock_guard backing_lock(backing_mutex);
@@ -10328,6 +10579,11 @@ struct DeviceState {
                 std::atomic_ref(guard.words[i]).store(v, std::memory_order_relaxed);
             });
             ++guard.updates;
+            // Publish updated generation/blocks/heaps with release semantics AFTER guard.words is updated so
+            // concurrent threads taking the lock-free fast path never observe stale page-table words.
+            std::atomic_ref(guard.generation).store(generation, std::memory_order_release);
+            std::atomic_ref(guard.blocks).store(blocks, std::memory_order_release);
+            std::atomic_ref(guard.heaps).store(heap_signature, std::memory_order_release);
             if (guard.table->overflowed() != guard.overflow_logged) {
                 guard.overflow_logged = guard.table->overflowed();
                 std::fprintf(stderr, "[rt] d3d12: address guard: %u 4 GiB chunk(s) of backings past the page table's "

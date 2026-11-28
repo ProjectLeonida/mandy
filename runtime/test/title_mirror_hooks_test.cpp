@@ -314,14 +314,16 @@ int refilter_scaling() {
 int fill_copy_and_fallback() {
     Fixture f;
     auto h = f.hooks();
-    std::size_t whole_calls = 0, piece_calls = 0;
-    bool fail_whole = false;
+    constexpr std::size_t kStrip = TitleMirror::kStripBytes;
+    constexpr std::size_t kStripsPerPage = kPage / kStrip;
+    std::size_t strip_calls = 0, piece_calls = 0;
+    std::size_t fail_strip_offset = ~std::size_t(0);
     std::size_t fail_piece_offset = ~std::size_t(0);
     const std::uint8_t* tracked_frame = nullptr;
     h.copy = [&](std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
-        if (bytes == kPage) {
-            ++whole_calls;
-            if (fail_whole) return false;
+        if (bytes == kStrip) {
+            ++strip_calls;
+            if (tracked_frame && std::size_t(from - tracked_frame) == fail_strip_offset) return false;
             std::memcpy(to, from, bytes);
             return true;
         }
@@ -336,28 +338,28 @@ int fill_copy_and_fallback() {
     std::vector<std::uint8_t> frame(kPage, 0x42);
     tracked_frame = frame.data();
 
-    // Fast path: 1 whole-page hooks_.copy call, 0 per-piece calls.
+    // Fast path: 16 x 4 KiB L1-hot strip hooks_.copy calls, 0 per-piece calls.
     mirror.map(kBase, frame.data(), nullptr, 1);
-    EXPECT(whole_calls == 1 && piece_calls == 0 && mirror.counters().upload_failures == 0);
+    EXPECT(strip_calls == kStripsPerPage && piece_calls == 0 && mirror.counters().upload_failures == 0);
     EXPECT(mirror.home_bytes(kBase)[0] == 0x42 && mirror.home_bytes(kBase)[kPage - 1] == 0x42);
 
-    // Dirty refill also uses 1 whole-page hooks_.copy call.
+    // Dirty refill also uses 16 x 4 KiB strip hooks_.copy calls.
     frame[1024] = 0x99;
     EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
-    EXPECT(whole_calls == 2 && piece_calls == 0 && mirror.home_bytes(kBase)[1024] == 0x99);
+    EXPECT(strip_calls == 2 * kStripsPerPage && piece_calls == 0 && mirror.home_bytes(kBase)[1024] == 0x99);
 
-    // Fallback path: whole-page copy fails -> falls back to 256 per-piece copies; unreadable piece 5 is zeroed.
-    fail_whole = true;
+    // Fallback path: strip 0 fails -> falls back to ONLY 16 per-piece copies in strip 0; unreadable piece 5 is zeroed.
+    fail_strip_offset = 0;
     fail_piece_offset = 5 * 256;
     frame[0] = 0x77;
     frame[5 * 256 + 10] = 0xAA;
     frame[6 * 256 + 10] = 0xBB;
     EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
-    EXPECT(whole_calls == 3 && piece_calls == kPage / 256 && mirror.counters().upload_failures == 1);
+    EXPECT(strip_calls == 3 * kStripsPerPage && piece_calls == kStrip / 256 && mirror.counters().upload_failures == 1);
     EXPECT(mirror.home_bytes(kBase)[0] == 0x77);
     EXPECT(mirror.home_bytes(kBase)[5 * 256 + 10] == 0);
     EXPECT(mirror.home_bytes(kBase)[6 * 256 + 10] == 0xBB);
-    std::printf("fill_copy_and_fallback: 1-shot 64 KiB copy on fast path, per-piece fallback on failure\n");
+    std::printf("fill_copy_and_fallback: 4 KiB L1-hot strips on fast path, per-strip 16-piece fallback on failure\n");
     return 0;
 }
 
@@ -429,9 +431,9 @@ int batched_write_back() {
 int filter_pieces_mask_and_scratch() {
     Fixture f;
     auto h = f.hooks();
-    std::size_t copy_calls = 0;
+    std::size_t copy_bytes_total = 0;
     h.copy = [&](std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
-        ++copy_calls;
+        copy_bytes_total += bytes;
         std::memcpy(to, from, bytes);
         return true;
     };
@@ -461,21 +463,21 @@ int filter_pieces_mask_and_scratch() {
     const VkBuffer arena = fake<VkBuffer>(0x99);
     mirror.alias(kBase, kBase + kPage, arena, 0);
 
-    // Initial map on an aliased page: fill() copies once into fill_scratch_ and calls filter_pieces fresh with all-1s
-    // mask from that exact same snapshot (zero duplicate copy, zero TOCTOU between home.sums[] and filtered copy).
+    // Initial map on an aliased page: fill() copies once (kPage bytes in 4 KiB strips) into fill_scratch_ and calls
+    // filter_pieces fresh with all-1s mask from that exact same snapshot (zero duplicate copy, zero TOCTOU).
     mirror.map(kBase, frame.data(), nullptr, 1);
-    EXPECT(copy_calls == 1 && f.filtered.empty() && piece_calls.size() == 1 && piece_calls[0].va == kBase &&
+    EXPECT(copy_bytes_total == kPage && f.filtered.empty() && piece_calls.size() == 1 && piece_calls[0].va == kBase &&
            piece_calls[0].fresh && piece_calls[0].mask[0] == ~0ull && piece_calls[0].mask[1] == ~0ull &&
            piece_calls[0].mask[2] == ~0ull && piece_calls[0].mask[3] == ~0ull);
     EXPECT(mirror.copy_bytes(kBase)[0] == 0x5A);
 
     // Dirty refill modifying 3 pieces across 64-bit mask word boundaries: pieces 1, 64, and 255.
-    // Must call hooks_.copy ONCE (fill's scratch), ZERO extra copies, and call filter_pieces with exact mask!
+    // Must copy kPage bytes ONCE (fill's scratch), ZERO extra copies, and call filter_pieces with exact mask!
     frame[1 * 256 + 7] = 0x11;
     frame[64 * 256 + 3] = 0x22;
     frame[255 * 256 + 200] = 0x33;
     EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
-    EXPECT(copy_calls == 2);  // exactly 1 copy in fill(), 0 duplicate copies in filter_pieces!
+    EXPECT(copy_bytes_total == 2 * kPage);  // exactly 1 page copied in fill(), 0 duplicate copies in filter_pieces!
     EXPECT(f.filtered.empty() && piece_calls.size() == 2);
     EXPECT(piece_calls[1].va == kBase && !piece_calls[1].fresh);
     EXPECT(piece_calls[1].mask[0] == (std::uint64_t(1) << 1));
@@ -489,7 +491,7 @@ int filter_pieces_mask_and_scratch() {
 
     // Unchanged dirty upload: neither filter_pieces nor filter called.
     EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
-    EXPECT(copy_calls == 3 && piece_calls.size() == 2 && f.filtered.empty());
+    EXPECT(copy_bytes_total == 3 * kPage && piece_calls.size() == 2 && f.filtered.empty());
 
     // Only filter_pieces installed (no hooks_.filter): make_copy calls filter_pieces with all-1s mask.
     Fixture f2;
@@ -915,7 +917,9 @@ int parallel_upload_matches_serial() {
         const std::uint8_t* const fail_frame = frames.data() + kFailPage * kPage;
         bool enable_copy_fail = false;
         h.copy = [fail_frame, &enable_copy_fail](std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
-            if (enable_copy_fail && from == fail_frame && bytes == kPage) return false;
+            constexpr std::size_t kFailStripOff = (kFailPiece * 256) & ~(TitleMirror::kStripBytes - 1);
+            if (enable_copy_fail && from == fail_frame + kFailStripOff && bytes == TitleMirror::kStripBytes)
+                return false;
             if (enable_copy_fail && bytes == 256 && from == fail_frame + kFailPiece * 256) return false;
             std::memcpy(to, from, bytes);
             return true;
@@ -1703,6 +1707,54 @@ int batched_filter_and_page_aware_write_back() {
     return 0;
 }
 
+int multi_chunk_direct_table_boundaries() {
+    Fixture f;
+    TitleMirror mirror(f.hooks());
+    constexpr std::uint64_t kChunk = TitleMirror::kChunk;
+    // Cover chunk 0 at kBase, skip chunk 1 (uncovered gap), cover chunk 2 at kBase + 2 * kChunk.
+    EXPECT(mirror.cover(kBase, kBase + kChunk));
+    EXPECT(mirror.cover(kBase + 2 * kChunk, kBase + 3 * kChunk));
+
+    std::vector<std::uint8_t> f0(kPage, 0x11), f1(kPage, 0x22), f2(kPage, 0x33), f3(kPage, 0x44);
+    const std::uint64_t va_c0_first = kBase;
+    const std::uint64_t va_c0_last = kBase + kChunk - kPage;  // page slot 32767
+    const std::uint64_t va_c2_first = kBase + 2 * kChunk;
+    const std::uint64_t va_c2_last = kBase + 3 * kChunk - kPage;
+
+    mirror.map(va_c0_first, f0.data(), nullptr, 1);
+    mirror.map(va_c0_last, f1.data(), nullptr, 1);
+    mirror.map(va_c2_first, f2.data(), nullptr, 1);
+    mirror.map(va_c2_last, f3.data(), nullptr, 1);
+    EXPECT(mirror.counters().pages == 4);
+    EXPECT(mirror.has_pending(va_c0_last) && !mirror.has_pending(va_c0_first + kPage));
+    EXPECT(mirror.flush(1));
+    EXPECT(!mirror.has_pending_binds() && !mirror.has_pending(va_c0_last));
+
+    EXPECT(mirror.frame_at(va_c0_first) == f0.data() && mirror.frame_at(va_c0_last) == f1.data());
+    EXPECT(mirror.frame_at(va_c2_first) == f2.data() && mirror.frame_at(va_c2_last) == f3.data());
+    EXPECT(!mirror.mirrored(kBase + kChunk) && mirror.frame_at(kBase + kChunk) == nullptr);
+
+    // homes_in_ranges across the uncovered chunk gap must return all 4 boundary pages in sorted order.
+    const auto refs = mirror.homes_in_ranges({{va_c0_first, va_c2_last + kPage}});
+    EXPECT(refs.size() == 4);
+    EXPECT(refs[0].page == va_c0_first && refs[1].page == va_c0_last && refs[2].page == va_c2_first &&
+           refs[3].page == va_c2_last);
+
+    // range_sum across chunk boundary (va_c0_last -> va_c0_last + kPage, then uncovered fails).
+    std::uint64_t h = 0;
+    EXPECT(mirror.range_sum(va_c0_last, kPage, h));
+    EXPECT(!mirror.range_sum(va_c0_last, 2 * kPage, h));
+
+    // Unmap and verify pages_count_ returns to 0.
+    mirror.map(va_c0_first, nullptr, nullptr, 2);
+    mirror.map(va_c0_last, nullptr, nullptr, 2);
+    mirror.map(va_c2_first, nullptr, nullptr, 2);
+    mirror.map(va_c2_last, nullptr, nullptr, 2);
+    EXPECT(mirror.counters().pages == 0 && !mirror.mirrored(va_c0_last) && !mirror.mirrored(va_c2_last));
+    std::printf("multi_chunk_direct_table_boundaries: 32768-slot per-chunk direct page table ok\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -1726,6 +1778,7 @@ int main() {
     if (prehashed_readback_and_skip_masks()) return 1;
     if (deferred_map_fill_and_on_changed()) return 1;
     if (batched_filter_and_page_aware_write_back()) return 1;
+    if (multi_chunk_direct_table_boundaries()) return 1;
     std::printf("title_mirror_hooks_test: ok\n");
     return 0;
 }

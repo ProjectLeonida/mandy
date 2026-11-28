@@ -13,8 +13,13 @@ using Aliases = void (*)(std::uintptr_t, std::vector<std::uintptr_t>&);
 inline std::atomic<Aliases> aliases{};
 
 struct Cell {
+    static constexpr std::uint64_t kNoMapGen = ~std::uint64_t(0);
     std::atomic<std::uint64_t> version{1}, mapping{1};
     std::array<DWORD, tile_size / page_size> restore{};
+    // title_memory_map::generation() observed when `restore` was uniformly armed across all 16 sub-pages (under
+    // State::mutex). When title_memory_map::generation() still equals armed_map_gen and `restore` is uniform, reopen()
+    // skips VirtualQuery and calls VirtualProtect directly (falling back on unexpected `old`).
+    std::uint64_t armed_map_gen = kNoMapGen;
     unsigned refs = 0;
     // Owners that leave the tile writable and copy it at every submission instead (the page mirror's hot pages,
     // src/title_write_policy.h). While it is nonzero the cell guards nothing (arm() does not protect it) and its tile
@@ -173,6 +178,34 @@ inline Cell* acquire(std::uintptr_t va) {
     return &c;
 }
 
+// Acquires one reference per tile in `vas[0..count)` under a single State::mutex hold.
+inline void acquire_batch(const std::uintptr_t* vas, Cell** out_cells, std::size_t count) {
+    if (!count) return;
+    auto& s = state();
+    std::lock_guard lock(s.mutex);
+    std::uintptr_t lo = s.watched_lo.load(std::memory_order_relaxed);
+    std::uintptr_t hi = s.watched_hi.load(std::memory_order_relaxed);
+    bool lo_changed = false, hi_changed = false;
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::uintptr_t va = vas[i];
+        auto& c = s.cells[va];
+        ++c.refs;
+        out_cells[i] = &c;
+        const std::uintptr_t tile_end = va <= UINTPTR_MAX - tile_size ? va + tile_size : UINTPTR_MAX;
+        if (va < lo) {
+            lo = va;
+            lo_changed = true;
+        }
+        if (tile_end > hi) {
+            hi = tile_end;
+            hi_changed = true;
+        }
+    }
+    if (lo_changed) s.watched_lo.store(lo, std::memory_order_release);
+    if (hi_changed) s.watched_hi.store(hi, std::memory_order_release);
+    s.count.store(s.cells.size(), std::memory_order_release);
+}
+
 // Restore only protections this watch installed. A guest remap or explicit new protection supersedes them.
 inline DWORD read_only(DWORD protection) {
     switch (protection & 255u) {
@@ -185,10 +218,44 @@ inline DWORD read_only(DWORD protection) {
 // Pages that are to get the same protection back are reopened together, a VirtualQuery and a VirtualProtect for each
 // region the query reports, not for each page: under Wine each call goes to the server, and a fault on a whole guarded
 // tile cost 16 us page by page against 2.6 us for one call (runtime/test/guard_fault_bench.cpp).
+// Fast path: when `c.restore` is uniform across all 16 sub-pages and `title_memory_map::generation() == c.armed_map_gen`,
+// skip VirtualQuery and call VirtualProtect directly (verifying `old == read_only(restore) || old == restore`, else
+// restoring `old` and falling back to the slow path).
 // When `fault_page_opened` is non-null, sets it to true if VirtualProtect restored a writable, non-guard protection on
 // the 4 KiB page `fault_page`, allowing notify(Event::fault) to skip a redundant second VirtualQuery.
 inline bool reopen(std::uintptr_t va, Cell& c, std::uintptr_t fault_page = UINTPTR_MAX,
                    bool* fault_page_opened = nullptr) {
+    const DWORD r0 = c.restore[0];
+    if (r0 && c.armed_map_gen != Cell::kNoMapGen && title_memory_map::generation() == c.armed_map_gen) {
+        bool uniform = true;
+        for (std::size_t i = 1; i < c.restore.size(); ++i) {
+            if (c.restore[i] != r0) {
+                uniform = false;
+                break;
+            }
+        }
+        if (uniform) {
+            const DWORD ro = read_only(r0);
+            const bool writable_restore = !(r0 & PAGE_GUARD) && ro != 0;
+            if (ro) {
+                DWORD old{};
+                if (VirtualProtect(reinterpret_cast<void*>(va), tile_size, r0, &old)) {
+                    if (old == ro || old == r0) {
+                        c.restore.fill(0);
+                        c.armed_map_gen = Cell::kNoMapGen;
+                        if (fault_page_opened && writable_restore && fault_page >= va && fault_page < va + tile_size)
+                            *fault_page_opened = true;
+                        return true;
+                    }
+                    // Unexpected prior protection (caller bypassed title_memory_map::changed): restore `old` and fall
+                    // back to the VirtualQuery slow path.
+                    DWORD dummy{};
+                    VirtualProtect(reinterpret_cast<void*>(va), tile_size, old, &dummy);
+                }
+            }
+        }
+    }
+    c.armed_map_gen = Cell::kNoMapGen;
     bool opened = false;
     for (std::size_t i = 0; i < c.restore.size();) {
         if (!c.restore[i]) {
@@ -267,6 +334,79 @@ inline void release(std::uintptr_t va, bool was_hot = false) {
         s.hot_generation.fetch_add(1, std::memory_order_release);
     }
 }
+
+// Releases one reference per {va, was_hot} item under a single State::mutex hold.
+inline void release_batch(const std::pair<std::uintptr_t, bool>* items, std::size_t count) {
+    if (!count) return;
+    auto& s = state();
+    std::lock_guard lock(s.mutex);
+    bool hot_changed = false;
+    bool cells_erased = false;
+    host_heap::vector<std::uintptr_t> cooled_shared;
+    std::uintptr_t reopened_lo = 0, reopened_hi = 0;
+    const auto flush_reopened = [&] {
+        if (reopened_lo < reopened_hi) {
+            title_memory_map::changed(reopened_lo, reopened_hi);
+            reopened_lo = reopened_hi = 0;
+        }
+    };
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::uintptr_t va = items[i].first;
+        const bool was_hot = items[i].second;
+        auto it = s.cells.find(va);
+        if (it == s.cells.end()) continue;
+        Cell& c = it->second;
+        if (!--c.refs) {
+            if (c.hot) {
+                std::erase(s.hot, va);
+                hot_changed = true;
+            }
+            if (reopen(va, c)) {
+                const std::uintptr_t tile_end = va <= UINTPTR_MAX - tile_size ? va + tile_size : UINTPTR_MAX;
+                if (reopened_lo < reopened_hi && va == reopened_hi) {
+                    reopened_hi = tile_end;
+                } else {
+                    flush_reopened();
+                    reopened_lo = va;
+                    reopened_hi = tile_end;
+                }
+            }
+            s.cells.erase(it);
+            cells_erased = true;
+            continue;
+        }
+        if (was_hot && c.hot && !--c.hot) {
+            std::erase(s.hot, va);
+            hot_changed = true;
+            cooled_shared.push_back(va);
+        }
+    }
+    flush_reopened();
+    if (!cooled_shared.empty()) {
+        const auto version = s.serial.load(std::memory_order_relaxed) + 1;
+        for (const std::uintptr_t va : cooled_shared) {
+            auto it = s.cells.find(va);
+            if (it != s.cells.end()) it->second.version.store(version, std::memory_order_release);
+        }
+        for (WriteQueue* q : s.writers) {
+            std::lock_guard queue_lock(q->mutex);
+            if (q->overflow) continue;
+            if (q->tiles.size() + cooled_shared.size() <= WriteQueue::kMaxTiles) {
+                q->tiles.insert(q->tiles.end(), cooled_shared.begin(), cooled_shared.end());
+            } else {
+                q->overflow = true;
+                q->tiles.clear();
+            }
+            q->pending.store(true, std::memory_order_release);
+        }
+        s.serial.store(version, std::memory_order_release);
+    }
+    if (cells_erased) s.count.store(s.cells.size(), std::memory_order_release);
+    if (hot_changed) {
+        s.hot_count.store(s.hot.size(), std::memory_order_release);
+        s.hot_generation.fetch_add(1, std::memory_order_release);
+    }
+}
 enum class Event { write, open, fault, mapping, replaced };
 // `restored` (open and fault): set when a tile's pages were made writable again. A tile reopens all of its pages, and
 // a page of it a slot-133 shadow also keeps read-only (both can guard one page: each queries, then protects, under its
@@ -298,6 +438,7 @@ inline bool notify(std::uintptr_t begin, std::uintptr_t end, Event event, bool* 
             }
         }
         if (event == Event::replaced) {
+            cell.armed_map_gen = Cell::kNoMapGen;
             for (unsigned i = 0; i < cell.restore.size(); ++i) {
                 auto p = it->first + i * page_size;
                 if (p < end && p + page_size > begin) cell.restore[i] = 0;
@@ -374,8 +515,10 @@ inline bool arm(std::uintptr_t va, Cell& c) {
     std::lock_guard lock(s.mutex);
     if (c.hot) return true;
     if (pinned || version != c.version.load(std::memory_order_relaxed)) return false;
+    c.armed_map_gen = Cell::kNoMapGen;
     for (std::size_t i = 0; i < c.restore.size();) {
         auto p = va + i * page_size;
+        const std::uint64_t query_gen = title_memory_map::generation();
         MEMORY_BASIC_INFORMATION m{};
         if (!VirtualQuery(reinterpret_cast<void*>(p), &m, sizeof m)) return false;
         const auto end = (std::min)(va + tile_size, reinterpret_cast<std::uintptr_t>(m.BaseAddress) + m.RegionSize);
@@ -391,6 +534,8 @@ inline bool arm(std::uintptr_t va, Cell& c) {
             // and they stayed read-only with no guard to answer for them: title writes and kernel writes into them
             // failed for good. Such a page has two guards now; reopening it tells the shadows (notify's `restored`).
             for (auto j = i; j < next; ++j) c.restore[j] = m.Protect;
+            if (i == 0 && next == c.restore.size() && title_memory_map::generation() == query_gen)
+                c.armed_map_gen = query_gen;
         }
         i = next;
     }
