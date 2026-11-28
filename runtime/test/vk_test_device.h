@@ -144,6 +144,8 @@ public:
     bool custom_border_color = false;  // VK_EXT_custom_border_color and customBorderColors enabled
     bool custom_border_color_without_format = false;
     bool shader_output_viewport_index = false;  // Vulkan 1.2 shaderOutputViewportIndex enabled
+    bool vulkan_memory_model = false;           // Vulkan 1.2 vulkanMemoryModel enabled
+    bool vulkan_memory_model_device_scope = false;  // Vulkan 1.2 vulkanMemoryModelDeviceScope enabled
     bool request_buffer_marker = false;  // set before initialize(): enable VK_AMD_buffer_marker where available
     bool buffer_marker = false;          // VK_AMD_buffer_marker is enabled
     bool request_null_descriptor = false;  // set before initialize(): enable VK_EXT_robustness2 nullDescriptor
@@ -456,6 +458,10 @@ private:
         enable12.samplerFilterMinmax = sampler_filter_minmax;
         shader_output_viewport_index = features12.shaderOutputViewportIndex == VK_TRUE;
         enable12.shaderOutputViewportIndex = shader_output_viewport_index;
+        vulkan_memory_model = features12.vulkanMemoryModel == VK_TRUE;
+        vulkan_memory_model_device_scope = vulkan_memory_model && features12.vulkanMemoryModelDeviceScope == VK_TRUE;
+        enable12.vulkanMemoryModel = vulkan_memory_model ? VK_TRUE : VK_FALSE;
+        enable12.vulkanMemoryModelDeviceScope = vulkan_memory_model_device_scope ? VK_TRUE : VK_FALSE;
         enable12.bufferDeviceAddress = VK_TRUE;
 
         const std::uint32_t graphics_count = std::max(1u, std::min(queue_count_wanted, family_queue_count));

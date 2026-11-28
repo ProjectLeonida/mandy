@@ -1912,6 +1912,11 @@ public:
     void set_on_finish_execute(std::function<void(std::uint64_t)> on_finish) {
         on_finish_execute_ = std::move(on_finish);
     }
+    // Called after a submission containing at least one emitted draw or dispatch with `writes_buffer == true` (or
+    // legacy untyped indirect) succeeds on vkQueueSubmit, with the device's current submitted retire ticket.
+    void set_on_buffer_write_submitted(std::function<void(std::uint64_t)> on_buffer_write) {
+        on_buffer_write_submitted_ = std::move(on_buffer_write);
+    }
     static std::uint64_t current_enqueue_serial() noexcept { return current_enqueue_serial_slot(); }
     // GPU work the lists of a submission depend on, recorded at the start of its command buffer by a queue that can
     // run compute (the console heap translation pass, src/console_heap_gpu.h): `record` returns true when it recorded
@@ -2429,6 +2434,7 @@ private:
     std::function<void()> after_execute_;
     std::function<std::uint64_t()> on_enqueue_execute_;
     std::function<void(std::uint64_t)> on_finish_execute_;
+    std::function<void(std::uint64_t)> on_buffer_write_submitted_;
     InputProbe input_probe_;
     TableScanner table_scanner_;
     GeometryProvider geometry_provider_;
@@ -4159,6 +4165,18 @@ private:
         }
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
+        bool wrote_buffer = false;
+        struct BufferWriteChain {
+            bool* flag;
+            void (*next)(void*);
+            void* next_ctx;
+        } buffer_write_chain{&wrote_buffer, replay.on_buffer_write, replay.on_buffer_write_context};
+        replay.on_buffer_write = +[](void* ctx) {
+            auto* c = static_cast<BufferWriteChain*>(ctx);
+            *c->flag = true;
+            if (c->next) c->next(c->next_ctx);
+        };
+        replay.on_buffer_write_context = &buffer_write_chain;
         std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
         std::size_t break_cursor = 0;
         CheckpointSubmission diagnostics;
@@ -4239,6 +4257,8 @@ private:
         }
         const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0,
                                                execute_call ? &diagnostics : nullptr);
+        if (submitted && wrote_buffer && context_.on_buffer_write_submitted_)
+            context_.on_buffer_write_submitted_(context_.submitted_retire_ticket());
         if (profile && submitted) {
             // Read once this submission (ticket submitted_ on progress_) is done; the pool is reused after that.
             profile->mark_submitted();
