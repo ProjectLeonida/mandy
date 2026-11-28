@@ -23,13 +23,16 @@ import json
 import os
 import re
 import sys
+import tempfile
 from collections import Counter, defaultdict
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
+from file_mode import published_mode  # noqa: E402
 import fssm_unpack  # noqa: E402
 import pal_stages  # noqa: E402
+import replace_retry  # noqa: E402
 import shader_disasm  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 import shader_ir  # noqa: E402
@@ -90,8 +93,11 @@ def payloads_of(dxbc_path):
 
 def load_index(dxbc_dir):
     """(stage by stem, stems in index order) from <dxbc>/index.json."""
-    with open(os.path.join(dxbc_dir, "index.json"), encoding="utf-8") as f:
-        index = json.load(f)
+    try:
+        with open(os.path.join(dxbc_dir, "index.json"), encoding="utf-8-sig") as f:
+            index = json.load(f)
+    except RecursionError:
+        raise ValueError("invalid JSON: recursion limit exceeded") from None
     if not isinstance(index, list) or not all(isinstance(e, dict) for e in index):
         raise ValueError("index.json is not a list of shader entries")
     stages = {}
@@ -111,7 +117,7 @@ def input_paths(dxbc_dir):
     paths = [os.path.join(dxbc_dir, "index.json")]
     try:
         _stages, names = load_index(dxbc_dir)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return paths
     for name in names:
         paths.append(os.path.join(dxbc_dir, name + ".dxbc"))
@@ -121,6 +127,8 @@ def input_paths(dxbc_dir):
 
 def survey(dxbc_dir, disasm_fn=None, limit=None):
     """The census over <dxbc>: counts by stage, hardware id, markers and VS entry VGPRs."""
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be at least 1")
     stages, names = load_index(dxbc_dir)
     if limit is not None:
         names = names[:limit]
@@ -199,16 +207,45 @@ def survey(dxbc_dir, disasm_fn=None, limit=None):
     }
 
 
+def _write_json_atomic(out_path, payload):
+    dest = os.path.realpath(out_path)
+    dest_dir = os.path.dirname(dest) or "."
+    os.makedirs(dest_dir, exist_ok=True)
+    fd, temp = tempfile.mkstemp(dir=dest_dir, prefix=".vs-layout-", suffix=".tmp")
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(payload, f, indent=1)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp, published_mode(dest))
+        replace_retry.replace(temp, dest)
+    except BaseException:
+        try:
+            os.chmod(temp, 0o600)
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("dxbc", help="<work>/shaders/dxbc from make_game.py")
     ap.add_argument("--json", help="also write the counts as JSON")
     ap.add_argument("--limit", type=int, help="stop after this many containers (index order)")
     a = ap.parse_args(argv)
+    if a.limit is not None and a.limit < 1:
+        ap.error("--limit must be at least 1")
     index_path = os.path.join(a.dxbc, "index.json")
     if a.json:
         # Refuse before survey(): it reads the whole corpus and runs llvm-mc for every unlisted payload.
-        if os.path.isdir(a.json):
+        if os.path.isdir(a.json) or a.json.endswith(("/", "\\")):
             print(f"vs_layout_census: error: --json {a.json} is a directory, not a JSON file", file=sys.stderr)
             return 2
         for path in input_paths(a.dxbc):
@@ -217,7 +254,7 @@ def main(argv=None):
                 return 2
     try:
         r = survey(a.dxbc, disasm_fn=default_disasm, limit=a.limit)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         print(f"vs_layout_census: error: cannot read {index_path}: {e}", file=sys.stderr)
         return 2
     print(f"{r['containers']} containers, {r['payloads']} payloads "
@@ -231,8 +268,7 @@ def main(argv=None):
           f"unlisted payloads disassembled {r['disassembled_unlisted']}")
     if a.json:
         try:
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(r, f, indent=1)
+            _write_json_atomic(a.json, r)
         except OSError as e:
             print(f"vs_layout_census: error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 2
