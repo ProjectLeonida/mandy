@@ -20,6 +20,10 @@ struct Builds {
     }
     void name(const char* text) {
         std::lock_guard lock(mutex_);
+        if (!text) {
+            name_[0] = 0;
+            return;
+        }
         const std::size_t n = std::min(std::strlen(text), sizeof name_ - 1);
         std::memcpy(name_, text, n);
         name_[n] = 0;
