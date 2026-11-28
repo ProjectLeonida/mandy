@@ -532,8 +532,17 @@ public:
         for (const Item& item : to_destroy) destroy(item, device, vk, release_fn, release_user);
     }
 
-    // After a device loss: destroys every item now, whatever its ticket, except the bindless slots, which stay queued
-    // in their order. Releasing a slot takes the device's descriptor lock, which a caller of this may hold.
+    // What still waits for a drain after a device loss, in its order, instead of being destroyed at once. Releasing a
+    // bindless slot takes the device's descriptor lock, which the caller that defers it holds (DeviceState::release in
+    // d3d12_vulkan_device.cpp). An image view is deferred right after its slot, and until the slot is released the
+    // set's pending writes and shadow copy may still name the view; a flush hands those to vkUpdateDescriptorSets,
+    // which must not see a destroyed view. So views go at teardown too, after their slot. Both stay bounded: the set
+    // never hands out more slots than it has (a slot comes back only through its release), a slot has at most four
+    // views, and the context's own view cache grows only while batches replay, which stops at the loss.
+    static bool kept_after_loss(Kind kind) { return kind == Kind::bindless_slot || kind == Kind::image_view; }
+
+    // After a device loss: destroys every item now, whatever its ticket, except those kept_after_loss(), which stay
+    // queued in their order.
     void drain_lost(VkDevice device, const VulkanDeviceFunctions& vk) {
         std::vector<Item> to_destroy;
         {
@@ -542,7 +551,7 @@ public:
             std::size_t kept = 0;
             for (std::size_t i = 0; i < count_; ++i) {
                 const Item& item = pending_[(head_ + i) & mask];
-                if (item.kind == Kind::bindless_slot) {
+                if (kept_after_loss(item.kind)) {
                     // Kept items move towards the front only, so this never overwrites one not yet read.
                     pending_[(head_ + kept) & mask] = item;
                     ++kept;
@@ -576,7 +585,8 @@ public:
             delete reinterpret_cast<PooledTitleImage*>(item.handle);
             break;
         case Kind::sparse_resource:
-            // Releases the resource and its page backing together after outstanding submissions.
+            // Releases the resource and its page backing together: after outstanding submissions, or at once after a
+            // device loss.
             delete reinterpret_cast<std::shared_ptr<SparseResource>*>(item.handle);
             break;
         case Kind::buffer:
@@ -2007,10 +2017,9 @@ public:
         // Once the device is lost no retire ticket completes again (completed_retire_ticket() answers 0 and acquire()
         // returns before its drain), so a queued object would stay until the context goes and the queue would grow
         // with everything the title releases. The lost device runs nothing more, and vkDestroy* and vkFreeMemory are
-        // valid on it: the object goes now, and the first time also everything queued before the loss. A bindless
-        // slot still waits: its release takes the device's descriptor lock, which the caller may hold (release() in
-        // d3d12_vulkan_device.cpp), and the set never hands out more slots than it has, so those entries stay bounded.
-        if (is_device_lost() && kind != DeferredDeletionQueue::Kind::bindless_slot) {
+        // valid on it: the object goes now, and the first time also everything queued before the loss. Bindless slots
+        // and image views still wait, in their order (DeferredDeletionQueue::kept_after_loss says why).
+        if (is_device_lost() && !DeferredDeletionQueue::kept_after_loss(kind)) {
             if (!lost_queue_drained_.exchange(true, std::memory_order_acq_rel)) deletion_queue_.drain_lost(device_, vk);
             DeferredDeletionQueue::destroy({0, raw_handle, kind}, device_, vk, nullptr, nullptr);
             return;

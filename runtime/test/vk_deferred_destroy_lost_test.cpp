@@ -5,18 +5,24 @@
 //   1. Buffers deferred before the loss wait for a submission that never comes.
 //   2. After the loss, the next deferred destruction frees them and every later one is freed at once: all 1000 buffers
 //      are gone while the context lives, and the context's own teardown destroys none of them twice.
-//   3. A bindless slot, queued before the loss or after it, still waits in the queue (its release takes the device's
-//      descriptor lock, which the caller holds) and is released once, at teardown.
-// vkDestroyBuffer is interposed on a real device's table to count the destructions. Skips with exit code 77 when no
-// Vulkan 1.3 device is available; LEONIDA_VK_VALIDATION=1 runs it under the validation layer. No game data.
+//   3. A bindless slot and the image view released with it (DeviceState::release in d3d12_vulkan_device.cpp defers
+//      the slot, then its views), queued before the loss or after it, both wait in the queue. Releasing the slot
+//      takes the device's descriptor lock, which the caller holds; and until the slot is released the set's pending
+//      writes and shadow copy may still name the view, which a flush hands to vkUpdateDescriptorSets. At teardown the
+//      slot is released first, then its view is destroyed.
+// vkDestroyBuffer and vkDestroyImageView are interposed on a real device's table; only the buffers and views the test
+// made are counted. Skips with exit code 77 when no Vulkan 1.3 device is available;
+// LEONIDA_VK_VALIDATION=1 runs it under the validation layer. No game data.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
 
-#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <set>
 #include <string_view>
+#include <vector>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); std::_Exit(1); } \
@@ -24,25 +30,67 @@
 
 namespace {
 
+template<typename Handle>
+std::uint64_t key(Handle handle) {
+    return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(handle));
+}
+
 namespace driver {
 PFN_vkGetDeviceProcAddr real_get_device = nullptr;
 PFN_vkDestroyBuffer real_destroy_buffer = nullptr;
+PFN_vkDestroyImageView real_destroy_view = nullptr;
 
-std::atomic<unsigned> destroyed_buffers{0};
+std::mutex mutex;
+std::set<std::uint64_t> ours;        // the buffers and views the test made
+unsigned destroyed_buffers = 0;      // of ours
+unsigned destroyed_views = 0;        // of ours
+std::vector<std::uint64_t> events;   // bindless slot releases and destructions of our views, in order
+
+void adopt(std::uint64_t handle) {
+    std::lock_guard lock(mutex);
+    ours.insert(handle);
+}
+
+unsigned buffers() {
+    std::lock_guard lock(mutex);
+    return destroyed_buffers;
+}
+
+unsigned views() {
+    std::lock_guard lock(mutex);
+    return destroyed_views;
+}
 
 VKAPI_ATTR void VKAPI_CALL destroy_buffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* allocator) {
-    if (buffer) destroyed_buffers.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(mutex);
+        if (ours.erase(key(buffer))) ++destroyed_buffers;
+    }
     real_destroy_buffer(device, buffer, allocator);
 }
 
+VKAPI_ATTR void VKAPI_CALL destroy_view(VkDevice device, VkImageView view, const VkAllocationCallbacks* allocator) {
+    {
+        std::lock_guard lock(mutex);
+        if (ours.erase(key(view))) {
+            ++destroyed_views;
+            events.push_back(key(view));
+        }
+    }
+    real_destroy_view(device, view, allocator);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char* name) {
-    if (std::string_view(name) == "vkDestroyBuffer") return reinterpret_cast<PFN_vkVoidFunction>(destroy_buffer);
+    const std::string_view n(name);
+    if (n == "vkDestroyBuffer") return reinterpret_cast<PFN_vkVoidFunction>(destroy_buffer);
+    if (n == "vkDestroyImageView") return reinterpret_cast<PFN_vkVoidFunction>(destroy_view);
     return real_get_device(device, name);
 }
 
 void install(PFN_vkGetDeviceProcAddr device_proc, VkDevice device) {
     real_get_device = device_proc;
     real_destroy_buffer = reinterpret_cast<PFN_vkDestroyBuffer>(device_proc(device, "vkDestroyBuffer"));
+    real_destroy_view = reinterpret_cast<PFN_vkDestroyImageView>(device_proc(device, "vkDestroyImageView"));
 }
 }  // namespace driver
 
@@ -58,7 +106,8 @@ int main() {
     }
     driver::install(d.device_proc, d.device);
     const auto create_buffer = d.fn<PFN_vkCreateBuffer>("vkCreateBuffer");
-    EXPECT(create_buffer);
+    const auto create_view = d.fn<PFN_vkCreateImageView>("vkCreateImageView");
+    EXPECT(create_buffer && create_view);
     const auto make_buffer = [&] {
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = 256;
@@ -66,38 +115,74 @@ int main() {
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         VkBuffer buffer = VK_NULL_HANDLE;
         EXPECT(create_buffer(d.device, &info, nullptr, &buffer) == VK_SUCCESS && buffer);
+        driver::adopt(key(buffer));
         return buffer;
+    };
+    const VkImage image = d.image(VK_FORMAT_R8G8B8A8_UNORM, 4, 4, 1, VK_IMAGE_USAGE_SAMPLED_BIT);  // d destroys it
+    EXPECT(image);
+    const auto make_view = [&] {
+        VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        info.image = image;
+        info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageView view = VK_NULL_HANDLE;
+        EXPECT(create_view(d.device, &info, nullptr, &view) == VK_SUCCESS && view);
+        driver::adopt(key(view));
+        return view;
     };
 
     constexpr unsigned before_loss = 500;
     constexpr unsigned total = 1000;
-    unsigned released_slots = 0;
+    constexpr std::uint64_t slot_before = (std::uint64_t(1) << 32) | 3u;
+    constexpr std::uint64_t slot_after = (std::uint64_t(1) << 32) | 7u;
+    const VkImageView view_before = make_view(), view_after = make_view();
     {
         VulkanContext context(driver::get_device, d.device, true);
         EXPECT(context.loaded());
         context.set_bindless_release(
-            [](void* user, std::uint32_t, std::uint32_t) { ++*static_cast<unsigned*>(user); }, &released_slots);
+            [](void*, std::uint32_t dimension, std::uint32_t index) {
+                std::lock_guard lock(driver::mutex);
+                driver::events.push_back((std::uint64_t(dimension) << 32) | index);
+            },
+            nullptr);
 
-        // 1, with a bindless slot among the buffers
+        // 1, with a bindless slot and its view among the buffers
         for (unsigned i = 0; i < before_loss; ++i) {
             context.defer_destroy(DeferredDeletionQueue::Kind::buffer, make_buffer());
-            if (i == before_loss / 2)
-                context.defer_destroy(DeferredDeletionQueue::Kind::bindless_slot, (std::uint64_t(1) << 32) | 3u);
+            if (i == before_loss / 2) {
+                context.defer_destroy(DeferredDeletionQueue::Kind::bindless_slot, slot_before);
+                context.defer_destroy(DeferredDeletionQueue::Kind::image_view, view_before);
+            }
         }
-        EXPECT(driver::destroyed_buffers.load() == 0);
+        EXPECT(driver::buffers() == 0);
+        EXPECT(driver::views() == 0);
 
         // 2
         context.mark_device_lost("the test marks the device lost");
         for (unsigned i = before_loss; i < total; ++i)
             context.defer_destroy(DeferredDeletionQueue::Kind::buffer, make_buffer());
-        EXPECT(driver::destroyed_buffers.load() == total);
+        EXPECT(driver::buffers() == total);
+        EXPECT(driver::views() == 0);  // the view queued before the loss still waits behind its slot
 
         // 3
-        context.defer_destroy(DeferredDeletionQueue::Kind::bindless_slot, (std::uint64_t(1) << 32) | 7u);
-        EXPECT(released_slots == 0);
+        context.defer_destroy(DeferredDeletionQueue::Kind::bindless_slot, slot_after);
+        context.defer_destroy(DeferredDeletionQueue::Kind::image_view, view_after);
+        context.defer_destroy(DeferredDeletionQueue::Kind::buffer, make_buffer());  // still freed at once
+        EXPECT(driver::buffers() == total + 1);
+        EXPECT(driver::views() == 0);
+        std::lock_guard lock(driver::mutex);
+        EXPECT(driver::events.empty());
     }
-    EXPECT(driver::destroyed_buffers.load() == total);
-    EXPECT(released_slots == 2);
+    EXPECT(driver::buffers() == total + 1);
+    EXPECT(driver::views() == 2);
+    {
+        std::lock_guard lock(driver::mutex);
+        const std::vector<std::uint64_t> expected{slot_before, key(view_before), slot_after, key(view_after)};
+        EXPECT(driver::events == expected);
+    }
+    std::puts("deferred deletion after a loss: buffers freed at once; bindless slots and their views kept, in order");
+
     EXPECT(d.validation_errors() == 0);
     std::puts("vk_deferred_destroy_lost: ok");
     return 0;
