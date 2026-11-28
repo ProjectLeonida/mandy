@@ -2781,7 +2781,9 @@ public:
             std::lock_guard state(state_mutex_);
             if (!must_hold()) {
                 result = execute_now(lists, execute_call);
-                if (std::shared_ptr<void> kept = keep ? keep() : nullptr) {
+                // A failed call submitted nothing of the lists, so there is nothing to keep them for.
+                std::shared_ptr<void> kept = result == ReplayResult::success && keep ? keep() : nullptr;
+                if (kept) {
                     std::vector<std::shared_ptr<void>> pins{std::move(kept)};
                     retire_pins(pins, submitted_);  // released by drain_pins once this submission has completed
                 }

@@ -2363,16 +2363,7 @@ public:
     // are not held (a D3D12 application keeps them until the fence it signals; the docs, section 4.4, list this),
     // except a shim's own the recording uses (hold_until_reset), which are pinned with them.
     static std::shared_ptr<void> pin_lists(const std::vector<const GraphicsCommandList*>& lists) {
-        auto objects = std::shared_ptr<std::vector<IUnknown*>>(new std::vector<IUnknown*>, [](auto* held) {
-            for (IUnknown* object : *held) object->Release();
-            delete held;
-        });
-        for (const GraphicsCommandList* list : lists)
-            for (IUnknown* object : list->pinned()) {
-                object->AddRef();
-                objects->push_back(object);
-            }
-        return objects;
+        return reference_lists(lists, &GraphicsCommandList::pinned);
     }
 
     // What a batch submitted at once keeps alive until its submission has completed on the GPU: the shim's own
@@ -2380,20 +2371,26 @@ public:
     // as soon as ExecuteCommandLists returns, and a default-heap buffer's arena range is free again the moment the
     // buffer is destroyed. Null when no list has any, which is every list without a shim's scratch.
     static std::shared_ptr<void> keep_lists(const std::vector<const GraphicsCommandList*>& lists) {
-        std::size_t count = 0;
-        for (const GraphicsCommandList* list : lists) count += list->kept().size();
-        if (!count) return nullptr;
-        auto objects = std::shared_ptr<std::vector<IUnknown*>>(new std::vector<IUnknown*>, [](auto* kept) {
-            for (IUnknown* object : *kept) object->Release();
-            delete kept;
-        });
-        objects->reserve(count);
         for (const GraphicsCommandList* list : lists)
-            for (IUnknown* object : list->kept()) {
+            if (!list->kept().empty()) return reference_lists(lists, &GraphicsCommandList::kept);
+        return nullptr;
+    }
+
+    // Takes a reference to each object that `objects` returns for each list. They are released when the last copy of
+    // the result goes.
+    static std::shared_ptr<void> reference_lists(
+        const std::vector<const GraphicsCommandList*>& lists,
+        const std::vector<IUnknown*>& (GraphicsCommandList::*objects)() const) {
+        auto references = std::shared_ptr<std::vector<IUnknown*>>(new std::vector<IUnknown*>, [](auto* held) {
+            for (IUnknown* object : *held) object->Release();
+            delete held;
+        });
+        for (const GraphicsCommandList* list : lists)
+            for (IUnknown* object : (list->*objects)()) {
                 object->AddRef();
-                objects->push_back(object);
+                references->push_back(object);
             }
-        return objects;
+        return references;
     }
 
     // A D3D12 queue holds the fences it waits on and signals until the work has been submitted.

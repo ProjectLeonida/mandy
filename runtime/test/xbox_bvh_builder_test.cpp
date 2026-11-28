@@ -575,7 +575,9 @@ int main(int argc, char** argv) {
                 if (const auto* build = std::get_if<leonida::BuildAccelerationStructure>(&command))
                     scratch_va = build->scratch_va;
         const UINT64 scratch_bytes = (blas_info.ScratchDataSizeInBytes + 255) / 256 * 256;
-        Sentinel reset_sentinel, release_sentinel;
+        // Static, so a release that comes after this block (the queue's worker, or the teardown after a failed step
+        // returns early) still finds the object.
+        static Sentinel reset_sentinel, release_sentinel;
         check(scratch_va && rt::d3d12::hold_until_reset(list.p, &reset_sentinel) &&
                   rt::d3d12::hold_until_reset(other_list.p, &release_sentinel),
               "the build has the shim's scratch, and both lists hold a sentinel");
@@ -600,24 +602,26 @@ int main(int argc, char** argv) {
               "a DEFAULT buffer made right after the Reset does not get the range of the scratch the submission uses");
         check(reset_sentinel.refs.load() > 1, "an object a list holds outlives the list's Reset after the call");
         check(release_sentinel.refs.load() > 1, "and the list's release after the call");
-        // The queue lets go of what a submission kept on its next call after that submission has completed: a
-        // Signal once the build's fence is reached, and one more, waited for, so that its release has run also
-        // when the queue's calls run on a worker (LEONIDA_SUBMIT_ASYNC).
-        const bool settled = SUCCEEDED(list->Close()) && [&] {
-            for (int i = 0; i < 2; ++i) {
-                if (FAILED(queue->Signal(fence.p, ++fence_value))) return false;
-                HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-                const bool done = event && SUCCEEDED(fence->SetEventOnCompletion(fence_value, event)) &&
-                                  WaitForSingleObject(event, 10000) == WAIT_OBJECT_0;
-                if (event) CloseHandle(event);
-                if (!done) return false;
-            }
-            return SUCCEEDED(device->GetDeviceRemovedReason());
-        }();
-        if (!settled) return fail("the kept-scratch submission did not complete");
+        // The queue lets go of what a submission kept in the first of its calls that finds the submission completed,
+        // after that call's own submission. On the queue's worker (LEONIDA_SUBMIT_ASYNC) the release can therefore
+        // still be running when the fence of that call's Signal is reached. The worker runs the calls in order, so it
+        // has finished by the time the fence of the next Signal is reached. After the Signal the build needs, the
+        // loop signals and waits until both objects are released, a few Signals at most.
+        const auto signal_and_wait = [&] {
+            if (FAILED(queue->Signal(fence.p, ++fence_value))) return false;
+            HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            const bool done = event && SUCCEEDED(fence->SetEventOnCompletion(fence_value, event)) &&
+                              WaitForSingleObject(event, 10000) == WAIT_OBJECT_0;
+            if (event) CloseHandle(event);
+            return done;
+        };
+        const auto released = [] { return reset_sentinel.refs.load() == 1 && release_sentinel.refs.load() == 1; };
+        bool settled = SUCCEEDED(list->Close()) && signal_and_wait();
+        for (int i = 0; settled && !released() && i < 8; ++i) settled = signal_and_wait();
+        if (!settled || FAILED(device->GetDeviceRemovedReason()))
+            return fail("the kept-scratch submission did not complete");
         check(header_units(kept_rb.p) > 0, "the structure rehydrated with the kept scratch was built");
-        check(reset_sentinel.refs.load() == 1 && release_sentinel.refs.load() == 1,
-              "both objects are released once the submission has completed");
+        check(released(), "both objects are released once the submission has completed");
     }
 
     // ---- the destructor releases the builder ----
