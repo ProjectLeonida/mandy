@@ -254,8 +254,8 @@ every core. Progress lines include percent and a rough ETA for translation shard
 completion.
 
 On an interactive terminal, a LEONIDA setup screen lets you set jobs and whether stages overlap, then a key-switchable
-per-stage log view (`1`–`4` / `Tab`) keeps parallel output demuxed; full stage logs go under `work/logs/`. Use
-`--no-tui` (or redirect stdout) for the plain console.
+per-stage log view (`1`–`4` / `Tab`) keeps parallel output demuxed. Use `--no-tui` (or redirect stdout) for the plain
+console. Either way each build stage's full log goes to `work/logs/<stage>.log`.
 
 `--wav` is off by default because 16-bit PCM WAV is several times larger than Ogg Opus. It decodes the repackaged Ogg
 Opus streams to `work\assets\audio\wav` after the audio bank step; existing WAV files are skipped when a build resumes.

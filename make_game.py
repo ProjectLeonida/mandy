@@ -41,14 +41,15 @@ Long steps log percent and a rough ETA (shader translation shards, asset exports
 weighted stage completion while they overlap).
 
 On an interactive terminal, a LEONIDA setup screen asks for --jobs and whether to overlap stages, then a
-key-switchable per-stage log view (1-4 / Tab) keeps parallel output demuxed; full logs land in <work>/logs/.
-Pass --no-tui (or redirect stdout) for the plain interleaved console.
+key-switchable per-stage log view (1-4 / Tab) keeps parallel output demuxed. Pass --no-tui (or redirect stdout)
+for the plain interleaved console. Either way each build stage's full log lands in <work>/logs/<stage>.log.
 """
 import argparse
 import functools
 import glob
 import hashlib
 import json
+import locale
 import ntpath
 import os
 import re
@@ -93,6 +94,103 @@ MODEL_ARCHIVES = [
 ]
 
 
+class PlainStageLogs:
+    """The stage logs of a build without the LEONIDA board (--no-tui, or stdout redirected). The console keeps the
+    plain interleaved output, and each stage's lines also go to <work>/logs/<stage>.log, the files the board writes:
+    log() and fail() lines, and the output of the commands run() starts, one line per \\r- or \\n-ended piece as the
+    board splits it. Active (module-level _plain_logs) while run_build_stages runs. A stage's file is opened with its
+    first line; when the folder can't be written, one note goes to stderr and the build goes on without the logs."""
+
+    def __init__(self, stages: list, log_dir: str):
+        self.log_dir = log_dir
+        self.stages = tuple(stages)
+        self.consoles: dict = {}
+        self._lock = threading.Lock()
+        self._unwritable = False
+        # What a text-mode pipe decodes with, so a line reads the same as in the board's log.
+        self.encoding = locale.getpreferredencoding(False)
+
+    def _console(self, stage: "str | None"):
+        if stage not in self.stages:
+            return None
+        with self._lock:
+            console = self.consoles.get(stage)
+            if console is None and not self._unwritable:
+                try:
+                    console = self.consoles[stage] = leonida_tui.StageConsole(
+                        stage, os.path.join(self.log_dir, f"{stage}.log"))
+                except OSError as e:
+                    self._unwritable = True
+                    print(f"cannot write the stage logs in {self.log_dir} ({e.strerror or e}); the build goes on "
+                          "without them", file=sys.stderr, flush=True)
+            return console
+
+    def __enter__(self) -> "PlainStageLogs":
+        global _plain_logs
+        _plain_logs = self
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        global _plain_logs
+        if _plain_logs is self:
+            _plain_logs = None
+        for console in self.consoles.values():
+            console.close()
+        if self.consoles:
+            print(f"stage logs in {self.log_dir}", flush=True)
+        return False
+
+    def write(self, stage: "str | None", line: str) -> None:
+        console = self._console(stage)
+        if console is not None:
+            console.write_line(line)
+
+    def _write_pieces(self, stage: str, data: bytes) -> bytes:
+        """Log each \\r- or \\n-ended piece of data (stripped, empty ones dropped); return the unended rest."""
+        *ended, rest = re.split(rb"[\r\n]", data)
+        for piece in ended:
+            text = piece.decode(self.encoding, errors="replace").strip()
+            if text:
+                self.write(stage, text)
+        return rest
+
+    def run(self, cmd: list, stage: str, **kw) -> int:
+        """Run cmd with its stdout and stderr through one pipe: every byte goes on to the console as it comes (so a
+        \\r progress line still redraws in place) and every piece to the stage's log. The child keeps the console,
+        so Ctrl+C reaches it as before. Returns the exit code."""
+        console = getattr(sys.stdout, "buffer", None)
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kw) as proc:
+            try:
+                rest = b""
+                while True:
+                    chunk = proc.stdout.read1(65536)   # what has arrived, not a full buffer: progress shows at once
+                    if not chunk:
+                        break
+                    sys.stdout.flush()   # a log() line printed by another stage's thread goes out first
+                    if console is not None:
+                        console.write(chunk)
+                        console.flush()
+                    else:
+                        sys.stdout.write(chunk.decode(self.encoding, errors="replace"))
+                        sys.stdout.flush()
+                    rest = self._write_pieces(stage, rest + chunk)
+                self._write_pieces(stage, rest + b"\n")
+            except KeyboardInterrupt:   # the child got the Ctrl+C too: a moment to stop on its own, as subprocess.run
+                try:
+                    proc.wait(timeout=0.25)
+                except subprocess.TimeoutExpired:
+                    pass
+                proc.kill()
+                raise
+            except BaseException:   # a failed write: do not leave the child running
+                proc.kill()
+                raise
+            return proc.wait()
+
+
+_plain_logs: "PlainStageLogs | None" = None
+
+
 def log(msg: str) -> None:
     line = f"{time.strftime('%H:%M:%S')}  {msg}"
     board = leonida_tui.current_board()
@@ -100,6 +198,8 @@ def log(msg: str) -> None:
         board.write(leonida_tui.current_stage(), line)
         return
     print(line, flush=True)
+    if _plain_logs is not None:
+        _plain_logs.write(leonida_tui.current_stage(), line)
 
 
 def fail(msg: str) -> "None":
@@ -111,6 +211,8 @@ def fail(msg: str) -> "None":
             board.set_status(stage, "failed")
         # Do not print through the board's stderr proxy (would duplicate into the pane).
         sys.exit(1)
+    if _plain_logs is not None:
+        _plain_logs.write(leonida_tui.current_stage(), f"ERROR: {msg}")
     print(f"\nERROR: {msg}", file=sys.stderr)
     sys.exit(1)
 
@@ -259,6 +361,17 @@ def run(args: list, hint: str = "", check: bool = True, **kw) -> int:
             capture["creationflags"] = capture.get("creationflags", 0) | int(kw["creationflags"])
         proc = subprocess.Popen(cmd, **capture, **extra)
         code = leonida_tui.pump_process(proc, leonida_tui.current_stage(), board)
+        if check and code != 0:
+            fail(f"{os.path.basename(str(args[0]))} exited with {code}" + (f". {hint}" if hint else ""))
+        return code
+    # Without the board, a build stage's commands also go to its log (PlainStageLogs), with the same rule for pipes.
+    stage = leonida_tui.current_stage()
+    if (_plain_logs is not None and stage in _plain_logs.stages and kw.get("stdout") is None
+            and kw.get("stderr") is None and not kw.get("capture_output")):
+        extra = {k: v for k, v in kw.items()
+                 if k not in ("stdout", "stderr", "capture_output", "text", "universal_newlines", "encoding",
+                              "errors")}
+        code = _plain_logs.run([str(a) for a in args], stage, **extra)
         if check and code != 0:
             fail(f"{os.path.basename(str(args[0]))} exited with {code}" + (f". {hint}" if hint else ""))
         return code
@@ -3171,7 +3284,7 @@ def main() -> int:
                          "the shaders need (144, or 152 with --mesh-compute)")
     ap.add_argument("--no-tui", action="store_true",
                     help="plain console logs (default when stdout is not a TTY); skip the LEONIDA setup screen "
-                         "and per-stage log view")
+                         "and per-stage log view (the stage logs still go to <work>/logs)")
     a = ap.parse_args()
     if a.loop_limit is not None and not 0 <= a.loop_limit <= 0xffffffff:
         ap.error("--loop-limit must be in 0..4294967295")
@@ -3306,9 +3419,10 @@ def main() -> int:
                              fallbacks=fallbacks, overlap=overlap)
             tui_board.set_summary(f"finished in {(time.time() - t0) / 60:.0f} min")
     else:
-        run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
-                         runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                         fallbacks=fallbacks, overlap=overlap)
+        with PlainStageLogs(build_stages, os.path.join(work, "logs")):
+            run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
+                             runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
+                             fallbacks=fallbacks, overlap=overlap)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 
