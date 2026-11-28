@@ -225,8 +225,14 @@ public:
     // The pipeline states and root signatures the recording names (it holds a reference to each until Reset), and
     // the objects a shim handed it with hold_until_reset.
     const std::vector<IUnknown*>& pinned() const { return held_; }
+    // The objects a shim handed it with hold_until_reset (also in pinned()), which ExecuteCommandLists keeps until
+    // the submission has completed: the application may Reset or release the list as soon as the call returns.
+    const std::vector<IUnknown*>& kept() const { return kept_; }
     // rt::d3d12::hold_until_reset: an object the recording uses that its caller does not keep (a shim's own scratch).
-    void hold_for_recording(IUnknown* object) { hold(object); }
+    void hold_for_recording(IUnknown* object) {
+        if (std::find(kept_.begin(), kept_.end(), object) == kept_.end()) kept_.push_back(object);
+        hold(object);
+    }
     bool needs_all_sampled_views() const {
         if (directly_indexed_) return true;
         for (const auto& command : list_.commands()) {
@@ -1621,6 +1627,9 @@ private:
     // layout it reads and the pipeline ExecuteCommandLists looks up still exist. (Keeping them alive while the GPU
     // runs the submission stays the application's job, as in D3D12.)
     std::vector<IUnknown*> held_;
+    // The part of held_ a shim handed the list (hold_until_reset). Nothing else keeps those alive while the GPU runs
+    // the submission (CommandQueue::keep_lists). No references of its own: held_ has them.
+    std::vector<IUnknown*> kept_;
 
     // A bundle keeps its state calls and draws instead of applying them: it has no render targets, viewport or root
     // signature of its own to resolve them against, and what it sets belongs to the list that executes it.
@@ -1656,6 +1665,7 @@ private:
     void release_held() {
         for (IUnknown* object : held_) object->Release();
         held_.clear();
+        kept_.clear();
     }
 
     void set_pipeline(ID3D12PipelineState* state) {
@@ -2365,6 +2375,27 @@ public:
         return objects;
     }
 
+    // What a batch submitted at once keeps alive until its submission has completed on the GPU: the shim's own
+    // objects its lists use (hold_until_reset). The lists release them at their Reset or release, which D3D12 allows
+    // as soon as ExecuteCommandLists returns, and a default-heap buffer's arena range is free again the moment the
+    // buffer is destroyed. Null when no list has any, which is every list without a shim's scratch.
+    static std::shared_ptr<void> keep_lists(const std::vector<const GraphicsCommandList*>& lists) {
+        std::size_t count = 0;
+        for (const GraphicsCommandList* list : lists) count += list->kept().size();
+        if (!count) return nullptr;
+        auto objects = std::shared_ptr<std::vector<IUnknown*>>(new std::vector<IUnknown*>, [](auto* kept) {
+            for (IUnknown* object : *kept) object->Release();
+            delete kept;
+        });
+        objects->reserve(count);
+        for (const GraphicsCommandList* list : lists)
+            for (IUnknown* object : list->kept()) {
+                object->AddRef();
+                objects->push_back(object);
+            }
+        return objects;
+    }
+
     // A D3D12 queue holds the fences it waits on and signals until the work has been submitted.
     static leonida::VulkanQueue::PinFn fence_pin(ID3D12Fence* fence) {
         return [fence]() -> std::shared_ptr<void> {
@@ -2535,7 +2566,8 @@ public:
                 return;
             }
         }
-        last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
+        last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); },
+                                      [&graphics] { return keep_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success)
             std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
