@@ -51,6 +51,7 @@
 #include "guarded_copy.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -217,13 +218,23 @@ inline std::size_t sample(std::vector<std::uintptr_t>& out, std::size_t n) {
     return s.aliased.size();
 }
 
-// Calls `f(va)` for each aliased 64 KiB page overlapping [begin, end).
+// Calls `f(va)` for each aliased 64 KiB page overlapping [begin, end), in no set order. The pages are counted, not
+// walked to `end`, so a range ending at the top of the address space (title_memory_map::changed()'s whole range)
+// ends; a range with more pages than there are aliased pages looks through the aliased pages instead.
 template<class F>
 void for_each_in(std::uintptr_t begin, std::uintptr_t end, F&& f) {
     State& s = state();
     std::shared_lock lock(s.mutex);
-    if (s.aliased.empty()) return;
-    for (std::uintptr_t va = begin & ~(kPageSize - 1); va < end; va += kPageSize)
+    const std::uintptr_t first = begin & ~(kPageSize - 1);
+    if (s.aliased.empty() || end <= first) return;
+    const std::uintptr_t pages = (end - first - 1) / kPageSize + 1;
+    if (pages > s.aliased.size()) {
+        for (const std::uintptr_t va : s.aliased)
+            if (va >= first && va < end) f(va);
+        return;
+    }
+    std::uintptr_t va = first;
+    for (std::uintptr_t i = 0; i < pages; ++i, va += kPageSize)
         if (s.aliased.count(va)) f(va);
 }
 
@@ -400,7 +411,8 @@ inline void note(const void* begin, std::size_t bytes) {
     State& s = state();
     std::lock_guard lock(s.mutex);
     const auto at = reinterpret_cast<std::uintptr_t>(begin);
-    if (s.ranges.size() < 4096) s.ranges.emplace_back(at, at + bytes);
+    const std::uintptr_t end = bytes > UINTPTR_MAX - at ? UINTPTR_MAX : at + bytes;  // no wrap past the top
+    if (s.ranges.size() < 4096) s.ranges.emplace_back(at, end);
     else s.overflow = true;
     s.pending.store(true, std::memory_order_release);
 }
@@ -541,7 +553,9 @@ inline State& state() {
 inline void add(std::uintptr_t base, std::uintptr_t size) {
     if (!size) return;
     State& s = state();
-    const std::uintptr_t end = base + ((size + kPage - 1) & ~(kPage - 1));
+    // Whole pages, and no wrap past the top of the address space (the reservation then ends at UINTPTR_MAX).
+    const std::uintptr_t room = UINTPTR_MAX - base;
+    const std::uintptr_t end = size > room - (room % kPage) ? UINTPTR_MAX : base + ((size + kPage - 1) & ~(kPage - 1));
     std::unique_lock lock(s.mutex);
     // A reservation released without remove() overlapping the new one is gone.
     auto it = s.regions.lower_bound(base);
@@ -602,18 +616,35 @@ void for_each_in(std::uintptr_t begin, std::uintptr_t end, F&& f) {
 // xmem: [from, to) of a write-watched reservation changed with no write the kernel sees (decommitted, committed again,
 // reset): every reader takes its pages as written at its next asking. Past kKeep pages, every reader takes all of its
 // write-watched pages as written instead.
+// Every write-watched part of [from, to) counts, also when the range starts before a reservation or covers several.
 inline void mark(std::uintptr_t from, std::uintptr_t to) {
     from &= ~(kPage - 1);
-    to = (to + kPage - 1) & ~(kPage - 1);
-    if (from >= to || !contains(from)) return;
+    to = to > UINTPTR_MAX - (kPage - 1) ? UINTPTR_MAX : (to + kPage - 1) & ~(kPage - 1);  // saturates, as changed() does
+    if (from >= to) return;
+    // The parts, gathered before the journal's lock (for_each_in takes the record's); past the room here, or past
+    // kKeep pages in all, every reader takes all of its pages as written.
+    std::array<std::pair<std::uintptr_t, std::uintptr_t>, 16> parts{};
+    std::size_t found = 0;
+    std::uint64_t pages = 0;
+    bool all = false;
+    for_each_in(from, to, [&](std::uintptr_t lo, std::uintptr_t hi) {
+        pages += (hi - lo + kPage - 1) / kPage;
+        if (found < parts.size()) parts[found++] = {lo, hi};
+        else all = true;
+    });
+    if (!found) return;
     State& s = state();
     std::lock_guard lock(s.journal);
     const std::uint64_t now = s.asked.fetch_add(1, std::memory_order_acq_rel) + 1;
-    if ((to - from) / kPage > kKeep) {
+    if (all || pages > kKeep) {
         s.floor = now;
         return;
     }
-    for (std::uintptr_t p = from; p < to; p += kPage) s.written[p] = now;
+    for (std::size_t i = 0; i < found; ++i) {
+        std::uintptr_t p = parts[i].first;
+        for (std::uint64_t n = (parts[i].second - parts[i].first + kPage - 1) / kPage; n; --n, p += kPage)
+            s.written[p] = now;
+    }
 }
 
 // A new reader, which has seen everything asked so far (its pages are not known yet: it copies them all first).
@@ -792,15 +823,16 @@ inline std::uint64_t begin_write(const void* buffer, std::size_t bytes, const OV
     const Opener opener = s.opener.load(std::memory_order_acquire);
     if (!opener || !buffer || !bytes) return 0;
     const auto begin = reinterpret_cast<std::uintptr_t>(buffer);
+    const std::uintptr_t end = bytes > UINTPTR_MAX - begin ? UINTPTR_MAX : begin + bytes;  // no wrap past the top
     std::uint64_t id = 0;
     {
         std::lock_guard lock(s.mutex);
         id = s.next_id++;
-        s.pins.push_back({begin, begin + bytes, overlapped, id, false});
+        s.pins.push_back({begin, end, overlapped, id, false});
         s.count.store(s.pins.size(), std::memory_order_release);
     }
     // After the pin: a refresh that runs from here on leaves the range writable.
-    opener(begin, begin + bytes);
+    opener(begin, end);
     return id;
 }
 
@@ -830,15 +862,16 @@ inline std::uint64_t hold(const void* buffer, std::size_t bytes) {
     if (!buffer || !bytes) return 0;
     State& s = state();
     const auto begin = reinterpret_cast<std::uintptr_t>(buffer);
+    const std::uintptr_t end = bytes > UINTPTR_MAX - begin ? UINTPTR_MAX : begin + bytes;  // no wrap past the top
     std::uint64_t id = 0;
     {
         std::lock_guard lock(s.mutex);
         id = s.next_id++;
-        s.pins.push_back({begin, begin + bytes, nullptr, id});
+        s.pins.push_back({begin, end, nullptr, id});
         s.count.store(s.pins.size(), std::memory_order_release);
     }
     // After the pin: a guard a refresh made before it is lifted, and no refresh from here on makes one.
-    if (const Opener opener = s.opener.load(std::memory_order_acquire)) opener(begin, begin + bytes);
+    if (const Opener opener = s.opener.load(std::memory_order_acquire)) opener(begin, end);
     return id;
 }
 
@@ -950,7 +983,10 @@ inline BOOL read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT segments[], DWOR
     SYSTEM_INFO info{};
     GetSystemInfo(&info);
     std::vector<std::uint64_t> pins;
-    const DWORD count = segments ? (bytes + info.dwPageSize - 1) / info.dwPageSize : 0;
+    // Counted in 64 bits: `bytes` near 4 GiB would wrap the rounding in a DWORD and pin nothing.
+    const DWORD count = segments && info.dwPageSize
+                            ? DWORD((std::uint64_t(bytes) + info.dwPageSize - 1) / info.dwPageSize)
+                            : 0;
     for (DWORD i = 0; i < count; ++i)
         pins.push_back(begin_write(segments[i].Buffer, info.dwPageSize, overlapped));
     BOOL ok = ::ReadFileScatter(file, segments, bytes, reserved, overlapped);

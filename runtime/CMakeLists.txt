@@ -616,6 +616,11 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(title_write_watch_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(title_write_watch_test PRIVATE /W4 /permissive- /utf-8)
 
+  # src/title_page_watch.h at the top of the address space and across reservation edges: no wrap, no endless walk.
+  add_executable(title_page_watch_bounds_test test/title_page_watch_bounds_test.cpp)
+  target_compile_definitions(title_page_watch_bounds_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+  target_compile_options(title_page_watch_bounds_test PRIVATE /W4 /permissive- /utf-8)
+
   # title_memory_map (src/title_page_watch.h): map changes by range, and the texture pass that probes only what they hit.
   add_executable(title_memory_map_test test/title_memory_map_test.cpp)
   target_compile_definitions(title_memory_map_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
@@ -1743,6 +1748,7 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET title_write_watch_test)
     add_test(NAME title_write_watch COMMAND title_write_watch_test)
+    add_test(NAME title_page_watch_bounds COMMAND title_page_watch_bounds_test)
     add_test(NAME title_write_watch_on COMMAND title_write_watch_test)
     set_tests_properties(title_write_watch_on PROPERTIES ENVIRONMENT "LEONIDA_WRITE_WATCH=1")
   endif()
