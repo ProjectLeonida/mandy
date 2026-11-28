@@ -38,7 +38,7 @@ Rien n'est jouable, sur aucune plateforme. Ce qui tourne aujourd'hui :
   exécutent les shaders wave64 nativement.
 
 Les résultats GPU de toutes les plateformes sont regroupés dans
-l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
+le dossier [gpu-test-results/](../../../gpu-test-results/).
 
 ## Prérequis
 
@@ -80,7 +80,7 @@ l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
 1. Installez les prérequis ci-dessus.
 2. Clonez le dépôt **avec son sous-module** :
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/ubiquitarianism/leonida
    ```
    Un « Download ZIP » depuis GitHub n'inclut pas `third_party/rpf9-explorer` : la compilation le récupère si `git`
    est installé, et sinon vous dit quoi faire.
@@ -176,8 +176,8 @@ encore ce cache.
    avez lancé des tests GPU. Précisez si vous avez été assisté par une IA. Les règles sont dans
    [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
 
-Le [guide des tests GPU](../../testing.md) explique comment lancer les tests sans aucun fichier du jeu. Publiez vos
-résultats dans l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166), un commentaire par GPU et par
-pilote.
+Le [guide des tests GPU](../../testing.md) explique comment lancer les tests sans aucun fichier du jeu. Proposez vos
+résultats dans une pull request qui ajoute un fichier à [gpu-test-results/](../../../gpu-test-results/), en suivant
+le format des rapports existants.
 
-[coord]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+[coord]: https://github.com/ubiquitarianism/leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
