@@ -4128,8 +4128,9 @@ struct DeviceState {
     // or a build reaches the whole range by one address. A GPU-written structure (a BVH destination or its scratch)
     // keeps the GPU's writes in the copy: that is the only place the structure is read from afterwards, so the copy
     // is the structure. It is made even when a shorter range already maps the start: spreading a window's address over
-    // bytes it does not cover would be a lie. 0 when geometry copies are off (LEONIDA_GEOMETRY_MB), their cap refuses
-    // it, or the range is not the title's memory.
+    // bytes it does not cover would be a lie. It is not answered from inside a larger copy either (resolve's
+    // `contain`): a release elsewhere in that copy would retire the structure with it. 0 when geometry copies are off
+    // (LEONIDA_GEOMETRY_MB), their cap refuses it, or the range is not the title's memory.
     std::uint64_t copy_title_range(std::uint64_t va, std::uint64_t bytes) {
         const std::uint64_t span = std::max<std::uint64_t>(bytes, 1);
         auto& aliases = leonida::title_va_aliases();
@@ -4138,7 +4139,7 @@ struct DeviceState {
         const auto cpu = leonida::title_gpu_views::to_host_view(static_cast<std::uintptr_t>(va),
                                                                 static_cast<std::uintptr_t>(span));
         if (context->knows_buffer_va(cpu, span)) return 0;
-        const std::uint64_t copy = geometry.resolve(*this, cpu, span, copy_geometry);
+        const std::uint64_t copy = geometry.resolve(*this, cpu, span, copy_geometry, false);
         if (!copy) return 0;
         std::lock_guard lock(title_window_mutex);
         aliases.add(va, span, copy);
