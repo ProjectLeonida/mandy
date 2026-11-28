@@ -14,6 +14,7 @@ sys.path.insert(0, str(TOOL.parent))
 import pk16_diff as d  # noqa: E402
 
 M = d.M32
+PK_SHIFT_OPS = ("v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16")
 
 
 def prefix(v=None, s=None):
@@ -24,6 +25,21 @@ def prefix(v=None, s=None):
 def run(*body, v=None, s=None, regs=(1, 2, 3, 4)):
     """The reference's four exported words; v / s map register -> seed value (others are 0)."""
     return d.reference(prefix(v, s) + list(body) + d.observe(list(regs)))
+
+
+def const_hi_line(line, skip=()):
+    """True when the line reads the high half of a constant source. A constant is its 32-bit dword and
+    op_sel / op_sel_hi index that dword, so the default op_sel_hi [1,..] already reads bits [31:16]. This is the
+    form that raised Unsupported until 2026-11-22 (`pk-const-hi`, docs/design.md); `skip` drops ops that took
+    constants before that (the packed shifts)."""
+    op, _, rest = line.partition(" ")
+    if op not in d.OPS_PK or op in skip:
+        return False
+    args, mods = d.parse(rest)
+    srcs = args[1:]
+    n = len(srcs)
+    sel, hi = mods.get("op_sel", [0] * n), mods.get("op_sel_hi", [1] * n)
+    return any(d.is_const(x) and (sel[i] or hi[i]) for i, x in enumerate(srcs))
 
 
 class Reference(unittest.TestCase):
@@ -115,19 +131,20 @@ class Generator(unittest.TestCase):
                 self.assertTrue(all(int(x, 16) <= 0xFFFF for x in lits), line)
         self.assertFalse(any("0x" in line for line in self.lines(literals=False)))
 
-    def test_known_divergences_are_left_out_by_default(self):
-        def const_hi(lines):
-            for line in lines:
-                op, srcs, mods = self.split(line)
-                if op not in d.OPS_PK or op in d.PK_SHIFTS:
-                    continue
-                n = len(srcs)
-                sel, hi = mods.get("op_sel", [0] * n), mods.get("op_sel_hi", [1] * n)
-                if any(d.is_const(x) and (sel[i] or hi[i]) for i, x in enumerate(srcs)):
-                    return True
-            return False
-        self.assertFalse(const_hi(self.lines()))
-        self.assertTrue(const_hi(self.lines(known=True)))
+    def test_the_high_half_constant_read_is_not_left_out(self):
+        # the packed high-half constant read is handled (docs/design.md), so it is not a known divergence any more:
+        # every packed op may take a constant, not only the three shifts that did while it raised Unsupported
+        self.assertEqual(d.KNOWN_DIVERGENCES, {})
+        self.assertTrue(any(const_hi_line(line, PK_SHIFT_OPS) for line in self.lines()))
+
+    def test_generated_high_half_constant_reads_match_the_translator(self):
+        rng = d.random.Random(7)
+        programs = [d.generate(rng, 5, d.ALL_OPS) for _ in range(200)]
+        hits = [prog for prog in programs if any(const_hi_line(line, PK_SHIFT_OPS) for line in prog)]
+        self.assertGreaterEqual(len(hits), 5)
+        for prog in hits[:20]:
+            with self.subTest(program=prog[0]):
+                self.assertIsNone(d.check(prog))
 
 
 class Translated(unittest.TestCase):
