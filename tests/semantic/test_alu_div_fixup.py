@@ -2,9 +2,9 @@
 
 v_div_fixup_{f16,f64} D, S0 (quot), S1 (denom), S2 (num) resolves IEEE-754 division special cases:
   - sign_out = sign(S1) ^ sign(S2)
-  - NaN(S2) -> quiet(S2); NaN(S1) -> quiet(S1)
+  - NaN(S2) -> S2 unchanged; NaN(S1) -> S1 unchanged (S2 wins; sNaN is not quieted under IEEE=0)
   - (0/0) or (inf/inf) -> canonical negative qNaN (0xFE00 / 0xFFF80000_00000000)
-  - (x/inf) or (0/y) -> copysign(0, sign_out)
+  - (x/inf) or (0/y), or on f64 exp(S2) - exp(S1) <= -1076 -> copysign(0, sign_out)
   - (x/0) or (inf/y) or NaN(S0) -> copysign(inf, sign_out)
   - otherwise copysign(S0, sign_out)
 """
