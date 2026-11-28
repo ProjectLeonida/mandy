@@ -140,6 +140,8 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         def run_probe(vs_dir: Path, path_dirs: list[Path]) -> tuple[str, str]:
             ps = (
                 "$ErrorActionPreference = 'Stop'\n"
+                # A redirected powershell.exe writes the OEM code page, and the probe prints paths.
+                "[Console]::OutputEncoding = New-Object Text.UTF8Encoding $false\n"
                 "$vs = $env:LEONIDA_VS_DIR\n"
                 + snippet
                 + "\nWrite-Output \"CMAKE=$cmake\"\nWrite-Output \"NINJA=$ninja\"\n"
@@ -147,7 +149,7 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
             env = dict(os.environ, PATH=";".join(str(p) for p in path_dirs), LEONIDA_VS_DIR=str(vs_dir))
             res = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
-                env=env, capture_output=True, text=True, check=True, timeout=30,
+                env=env, capture_output=True, text=True, encoding="utf-8", check=True, timeout=30,
             )
             found = {}
             for line in res.stdout.splitlines():
@@ -157,7 +159,8 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
             return found.get("CMAKE", ""), found.get("NINJA", "")
 
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp) / "tools-\u00f8"
+            root.mkdir()
             vs_empty = root / "vs_empty"
             msys_dir = root / "msys_bin"
             native_cmake_dir = root / "native_cmake_bin"
