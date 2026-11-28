@@ -4803,6 +4803,15 @@ Games and middleware call these every frame (PIX events), so they must be cheap 
 - **Labels, only with `VK_EXT_debug_utils`.** It is an instance extension, so `VulkanDeviceInfo::debug_utils` says
   whether the instance enabled it; `create_vulkan_device_standalone` enables it when the loader lists it. Without
   it every marker call is a no-op (nothing logged, nothing recorded on the queue).
+- **Compute shader modules.** With `VK_EXT_debug_utils`, each module is named with its shader-library entry name
+  before pipeline creation. This lets GPU-assisted validation select an individual compute shader using
+  `VK_LAYER_GPUAV_ENABLE=1`, `VK_LAYER_GPUAV_SELECT_INSTRUMENTED_SHADERS=1` and
+  `VK_LAYER_GPUAV_SHADERS_TO_INSTRUMENT=<entry name>` alongside `LEONIDA_VK_VALIDATION=1`.
+  Shader code and execution are unchanged; without the extension or naming entry point no naming call is made.
+  The layer's selection setting must be enabled to avoid instrumenting the entire library.
+  With a recent Khronos validation layer installed, `python -I scripts/check_compute_gpuav_selection.py
+  <build>/d3d12_compute_test.exe` checks selected and unmatched names using synthetic compute readbacks and
+  the layer's instrumented-module dumps. It is an opt-in GPU-AV check, not a default CTest requirement.
 - **Command lists.** `SetMarker`/`BeginEvent`/`EndEvent` are recorded in the IR (`DebugMarker`) in order with the
   other commands and replayed as `vkCmdInsertDebugUtilsLabelEXT`/`vkCmdBeginDebugUtilsLabelEXT`/
   `vkCmdEndDebugUtilsLabelEXT` into the submission's command buffer.

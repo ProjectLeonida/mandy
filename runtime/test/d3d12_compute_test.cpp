@@ -299,6 +299,7 @@ int main() {
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.prepare_on_bind=d.prepare_on_bind;
+        info.debug_utils = d.debug_utils;
         info.get_instance_proc = d.instance_proc;
         info.instance = d.instance;
         info.physical = d.physical;
