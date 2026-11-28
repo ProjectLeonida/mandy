@@ -20,20 +20,34 @@ SOURCE = Path(os.environ.get("LEONIDA_RUNTIME_TEST_SOURCE",
 NOT_IN_CTEST = {"d3d12_clear_test"}
 
 
+def strip_cmake_comments(text):
+    """Replace CMake line and bracket comments with whitespace, leaving arguments intact."""
+    # Match escaped characters, quoted arguments and bracket arguments before line comments so a
+    # literal # in those arguments is not mistaken for the start of a comment. Bracket comments
+    # and arguments can contain closing brackets with a different number of '=' characters.
+    tokens = re.compile(r'\\.|"(?:\\.|[^"\\])*"|#?\[(?P<eq>=*)\[.*?\](?P=eq)\]|#[^\r\n]*', re.S)
+
+    def replace(match):
+        token = match.group()
+        return re.sub(r"[^\r\n]", " ", token) if token.startswith("#") else token
+
+    return tokens.sub(replace, text)
+
+
 def built_test_executables(text):
-    return {name for name in re.findall(r"add_executable\(\s*([A-Za-z0-9_]+)", text)
+    return {name for name in re.findall(r"add_executable\(\s*([A-Za-z0-9_]+)", strip_cmake_comments(text))
             if name.endswith("_test")}
 
 
 def registered_commands(text):
     # add_test may span lines, e.g. add_test(NAME x\n  COMMAND foo_test ...).
-    return set(re.findall(r"add_test\([^)]*?\bCOMMAND\s+\"?([A-Za-z0-9_]+)", text, re.S))
+    return set(re.findall(r"add_test\([^)]*?\bCOMMAND\s+\"?([A-Za-z0-9_]+)", strip_cmake_comments(text), re.S))
 
 
 class CTestRegistrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.cmake = CMAKE.read_text(encoding="utf-8")
+        cls.cmake = strip_cmake_comments(CMAKE.read_text(encoding="utf-8"))
 
     def test_all_test_executables_have_an_add_test(self):
         missing = built_test_executables(self.cmake) - registered_commands(self.cmake) - NOT_IN_CTEST
@@ -42,6 +56,49 @@ class CTestRegistrationTest(unittest.TestCase):
     def test_the_exception_is_still_the_only_one(self):
         # An allowlist that grows unnoticed is how this bug happens again.
         self.assertEqual(NOT_IN_CTEST & built_test_executables(self.cmake), {"d3d12_clear_test"})
+
+    def test_comments_do_not_build_or_register_tests(self):
+        text = (
+            "add_executable(registered_test test/registered_test.cpp)\n"
+            "add_test(NAME registered COMMAND registered_test)\n"
+            "add_executable(orphan_test test/orphan_test.cpp)\n"
+            "# add_test(NAME orphan COMMAND orphan_test)\n"
+            "# add_executable(disabled_test test/disabled_test.cpp)\n"
+            "#[=[ Block comment containing ]]\n"
+            "add_test(NAME orphan COMMAND orphan_test)\n"
+            "add_executable(blocked_test test/blocked_test.cpp)\n"
+            "]=]\n"
+        )
+        self.assertEqual(built_test_executables(text), {"registered_test", "orphan_test"})
+        self.assertEqual(registered_commands(text), {"registered_test"})
+
+    def test_comments_inside_multiline_commands_are_ignored(self):
+        text = (
+            "add_executable(\n"
+            "  # formerly old_test\n"
+            "  real_test test/real_test.cpp)\n"
+            "add_test(NAME real\n"
+            "  # COMMAND old_test\n"
+            "  #[[ COMMAND old_test ]]\n"
+            "  COMMAND real_test)\n"
+        )
+        self.assertEqual(built_test_executables(text), {"real_test"})
+        self.assertEqual(registered_commands(text), {"real_test"})
+
+    def test_hashes_inside_arguments_are_not_comments(self):
+        text = ('message("literal # with an escaped \\"quote\\"")\n'
+                'message([=[literal # and ]] inside a bracket argument]=])\n'
+                'message(escaped\\#hash)\n')
+        self.assertEqual(strip_cmake_comments(text), text)
+
+    def test_commented_skip_code_does_not_enable_the_skip_check(self):
+        text = ("add_executable(a_test test/a_test.cpp)\nadd_test(NAME a COMMAND a_test)\n"
+                "# set_tests_properties(a PROPERTIES SKIP_RETURN_CODE 77)\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "test" / "a_test.cpp"
+            src.parent.mkdir()
+            src.write_text('std::printf("SKIP: none\\n");\nreturn 0;\n', encoding="utf-8", newline="\n")
+            self.assertEqual(whole_test_skips_not_77(text, Path(tmp)), [])
 
     def test_indirect_rt_skips_with_the_ctest_skip_code(self):
         self.assertTrue(
@@ -120,6 +177,7 @@ def whole_test_skips_not_77(cmake_text, runtime_dir):
     """[(source:line, code)] for a SKIP print directly followed by `return N;` (N != 77) in the sources of a test
     registered with SKIP_RETURN_CODE 77. A SKIP print with no return right after it skips one section, not the test.
     A named code (`return kSkip;`) counts by the value of its `constexpr int` in the same source."""
+    cmake_text = strip_cmake_comments(cmake_text)
     skip_tests = set(re.findall(r"set_tests_properties\(\s*([A-Za-z0-9_]+)\s+PROPERTIES[^)]*SKIP_RETURN_CODE\s+77",
                                 cmake_text))
     commands = dict(re.findall(r"add_test\(\s*NAME\s+([A-Za-z0-9_]+)\s+COMMAND\s+\"?([A-Za-z0-9_]+)", cmake_text))
