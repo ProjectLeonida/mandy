@@ -679,6 +679,7 @@ constants, so those tests skip.
 shaders with `--mesh-serial-waves` (`docs/design.md`, "Mesh shaders with their waves in series"): the ones that
 qualify run one pass per wave in 64 invocations. The `ms_*` tests must pass with and without it;
 `ms_w64x_wave_votes` is the one whose two waves take different branches and both give the triangle a vertex. `ms_w64x_wave_loops` is the one whose two waves run a loop of different length (5 and 9 iterations), each iteration reading a wave-wide count, so under emulation the waves reach different numbers of barriers.
+With `LEONIDA_MESH_COMPUTE=1` as well (below), the same tests run the passes in the `--mesh-compute` form.
 
 ## GPUs without mesh shaders (NVIDIA Pascal and older)
 

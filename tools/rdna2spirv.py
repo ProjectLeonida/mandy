@@ -16058,7 +16058,8 @@ def ms_prim_count(c, maxp):
 
 
 def mesh_compute_epilogue(gen):
-    """--mesh-compute: the mesh epilogue as buffer stores. Same barrier and counts as the mesh path; then lane 0
+    """--mesh-compute: the mesh epilogue as buffer stores, as lines (assemble indents them; ms_serial_epilogue
+    repeats the writes per pass). Same barrier and counts as the mesh path; then lane 0
     writes the header, lane i < vertex count its vertex and lane i < primitive count its primitive, at the offsets
     of gen.msc_layout in this workgroup's slot (linear workgroup index x + y*nx + z*nx*ny)."""
     c, lay = gen.cu, gen.msc_layout
@@ -16152,7 +16153,7 @@ def mesh_compute_epilogue(gen):
     for i, w in enumerate(("%mi0", "%mi1", "%mi2", "%mnb")):
         store(at("%mpb", 4 * i), w)
     L += ["OpBranch %msc_pend", "%msc_pend = OpLabel"]
-    return "".join(("         " + l if " = OpLabel" not in l else l) + "\n" for l in L)
+    return L
 
 
 def float_literal(bits):
@@ -16234,8 +16235,8 @@ def ms_serial_passes(gen, fn, lists):
 
 def ms_serial_epilogue(gen, lines, exports):
     """--mesh-serial-waves: the mesh epilogue for passes. `lines` is the epilogue of one invocation: the barrier,
-    the counts and OpSetMeshOutputsEXT, then (from the load of `%local_index` on) the writes of what the invocation
-    exported. The first part stays as it is, once; the writes are repeated per pass w with the pass's twins of the
+    the counts and OpSetMeshOutputsEXT (or, with --mesh-compute, mesh_compute_epilogue's barrier and counts), then
+    (from the load of `%local_index` on) the writes of what the invocation exported. The first part stays as it is, once; the writes are repeated per pass w with the pass's twins of the
     export variables and the output index real index + 64 * w, every id of the block renamed per pass."""
     cut = lines.index("%mli = OpLoad %uint %local_index")
     once, writes = lines[:cut], lines[cut + 1:]
@@ -16268,6 +16269,7 @@ def assemble(gen):
         gen.msc_layout = mesh_compute_layout(gen.ms["maxv"], gen.ms["maxp"], gen.clip_count if gen.uses_clip else 0,
                                              gen.cull_count if gen.uses_cull else 0, gen.ms_params)
         # Built here, before any constant is emitted, so every constant it asks for gets declared.
+        # --mesh-serial-waves: the constants of each pass's output index too (_translate asked for them).
         gen.msc_epilogue = mesh_compute_epilogue(gen)
     # --pc-tail-ubo: the uniform block exists only when the shader reads the tail (after the epilogue, which reads it).
     gen.uses_pc_tail = PC_TAIL_UBO and (gen.uses_heap or gen.uses_codebase or msc)
@@ -16441,7 +16443,7 @@ def assemble(gen):
         hdr += ["OpExecutionMode %main Triangles", "OpExecutionMode %main Invocations 1",
                 "OpExecutionMode %main OutputTriangleStrip", f"OpExecutionMode %main OutputVertices {gen.gs['maxv']}"]
     if msc:
-        hdr.append("OpExecutionMode %main LocalSize {} {} {}".format(*gen.ms["size"]))
+        hdr.append("OpExecutionMode %main LocalSize {} {} {}".format(*((64, 1, 1) if gen.ms_serial else gen.ms["size"])))
     elif ms:
         hdr += ["OpExecutionMode %main LocalSize {} {} {}".format(*((64, 1, 1) if gen.ms_serial else gen.ms["size"])),
                 f"OpExecutionMode %main OutputVertices {gen.ms['maxv']}",
@@ -17232,12 +17234,15 @@ def assemble(gen):
     if pops:
         fn.append("OpBeginInvocationInterlockEXT")   # end of the entry block: uniform, executed once
     serial_close, serial_exports = [], []
-    if ms and not msc and gen.ms_serial:
+    if ms and gen.ms_serial:
         fn, serial_close, serial_exports = ms_serial_passes(gen, fn, (hdr, dec, gvars))
     out = hdr + dec + types + gvars + helpers + fn
     end_lock = "         OpEndInvocationInterlockEXT\n" if pops else ""
     if msc:
-        end_lock = gen.msc_epilogue + end_lock
+        # The slot writes of one invocation; with passes, once per pass from its twins (ms_serial_epilogue). Lane 0
+        # of pass 0 is then the only one that writes the header: a later pass's index starts at 64.
+        L = ms_serial_epilogue(gen, gen.msc_epilogue, serial_exports) if gen.ms_serial else gen.msc_epilogue
+        end_lock = "".join(("         " + l if " = OpLabel" not in l else l) + "\n" for l in L) + end_lock
     elif ms:
         # All invocations reach the end: wait for the ALLOC_REQ write, declare the counts once (uniform), then each
         # thread writes the vertex and primitive it exported (index = LocalInvocationIndex).
@@ -18939,7 +18944,7 @@ def _translate(path):
         size = (g.cs or g.ms)["size"]
         g.x_lanes = -(-size[0] * size[1] * size[2] // 64) * 64
         threads = size[0] * size[1] * size[2]
-        if (MESH_SERIAL_WAVES and stage == "ms" and not MESH_COMPUTE and threads > 64 and threads % 64 == 0
+        if (MESH_SERIAL_WAVES and stage == "ms" and threads > 64 and threads % 64 == 0
                 and not any(i["op"].startswith("ds_") or "store" in i["op"] or "atomic" in i["op"] for i in insns)):
             # The waves of such a program cannot pass each other anything: no LDS, and no store or atomic to
             # memory another wave could read (ms_wave_info_s3 counts lanes in LDS across an s_barrier and keeps
