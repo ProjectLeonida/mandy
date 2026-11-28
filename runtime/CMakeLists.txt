@@ -397,6 +397,15 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(acphal_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(acphal_test PRIVATE /OPT:NOREF)
 
+  # Console command list IID mapping and classification for CreateCommandListX.
+  add_executable(d3d12_xs_command_list_iid_test
+    test/d3d12_xs_command_list_iid_test.cpp
+  )
+  target_include_directories(d3d12_xs_command_list_iid_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(d3d12_xs_command_list_iid_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(d3d12_xs_command_list_iid_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(d3d12_xs_command_list_iid_test PRIVATE /OPT:NOREF)
+
   if(TARGET leonida_xma2_decoder)
     target_link_libraries(gta6rt PRIVATE leonida_xma2_decoder)
     target_link_libraries(acphal_test PRIVATE leonida_xma2_decoder)
@@ -1698,6 +1707,9 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET acphal_test)
     add_test(NAME acphal COMMAND acphal_test)
     add_test(NAME acphal_noncached_only COMMAND acphal_test --noncached-only)
+  endif()
+  if(WIN32 AND TARGET d3d12_xs_command_list_iid_test)
+    add_test(NAME d3d12_xs_command_list_iid COMMAND d3d12_xs_command_list_iid_test)
   endif()
   if(WIN32 AND TARGET xapu_chad_test)
     add_test(NAME xapu_chad COMMAND xapu_chad_test)
