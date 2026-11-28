@@ -846,6 +846,8 @@ struct ShaderEntry {
     std::string fspx_code_sha256;   // an FSPX program (docs/fspx.md): the SHA-256 of its kind-6 bytes
     std::string fspx_state_sha256;  // and of its kind-0 entry (dispatch state)
     std::size_t binding_count = 0;  // set-0 bindings the module declares
+    std::uint64_t binding_mask = 0;  // bitmask of numeric set-0 bindings < 64
+    bool binding_mask_known = true;  // false if "bindings" had a non-numeric or >= 64 entry
     std::uint32_t push_constant_bytes = 0;
     std::array<std::uint32_t, 3> local_size{1, 1, 1};
     // Workgroup memory the module declares: its LDS array plus what --wave64-emulate adds (SHADER-309). A compute
@@ -1104,8 +1106,9 @@ public:
         if (all.size() > 1) {
             const auto first = spirv(*all.front());
             const auto runtime_metadata = [](const ShaderEntry& e) {
-                return std::tie(e.binding_count, e.push_constant_bytes, e.local_size, e.lds_bytes, e.uses_code_base,
-                                e.wave64, e.subgroup_size, e.wave64_exchange, e.literal_samplers);
+                return std::tie(e.binding_count, e.binding_mask, e.binding_mask_known, e.push_constant_bytes,
+                                e.local_size, e.lds_bytes, e.uses_code_base, e.wave64, e.subgroup_size,
+                                e.wave64_exchange, e.literal_samplers);
             };
             for (std::size_t i = 1; i < all.size(); ++i) {
                 if (first.empty() || runtime_metadata(*all[i]) != runtime_metadata(*all.front()) ||
@@ -1240,7 +1243,17 @@ private:
             if (by_fspx) e.fspx_code_sha256 = code_hash->string;
             if (const Json* s = meta.find("fspx_state_sha256"); s && s->kind == Json::Kind::string)
                 e.fspx_state_sha256 = s->string;
-            if (const Json* b = meta.find("bindings"); b && b->kind == Json::Kind::array) e.binding_count = b->array.size();
+            if (const Json* b = meta.find("bindings"); b && b->kind == Json::Kind::array) {
+                e.binding_count = b->array.size();
+                for (const Json& item : b->array) {
+                    if (item.kind == Json::Kind::number && item.number >= 0 && item.number < 64 &&
+                        static_cast<double>(static_cast<std::uint64_t>(item.number)) == item.number) {
+                        e.binding_mask |= std::uint64_t{1} << static_cast<std::uint64_t>(item.number);
+                    } else {
+                        e.binding_mask_known = false;
+                    }
+                }
+            }
             e.push_constant_bytes = u32(meta.find("push_constant_bytes"));
             e.lds_bytes = u32(meta.find("lds_bytes"));
             if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)

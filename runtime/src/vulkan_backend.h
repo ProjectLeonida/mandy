@@ -1306,11 +1306,13 @@ public:
         replay_.separate_depth_stencil_layouts = separate_depth_stencil_layouts;
         if (loaded_) {
             fence_dispatcher_ = std::make_unique<FenceWaitDispatcher>(device_, vk, device_lost_);
+            target_dump_.initialize(get, device_, conditional_rendering);
         }
     }
 
     ~VulkanContext() {
         progress_watch_ = {};  // stop before queues, timelines or diagnostic state go away
+        flush_target_dump();
         gpu_labels_.stop(device_);
         fence_dispatcher_.reset();
         deletion_queue_.drain(UINT64_MAX, device_, vk);
@@ -1510,6 +1512,7 @@ public:
                           new std::shared_ptr<SparseResource>(std::move(sparse_resource)));
         std::lock_guard tlock(tracker_mutex_);
         tracker_.forget(id);
+        target_dump_.forget_resource(id);
     }
 
     // A query heap, by its stable ID (the COM query heap pointer). The pool stays the caller's to destroy, after
@@ -1642,6 +1645,34 @@ public:
     // Configure before queue creation, when the selected queue family supports compute.
     void set_occlusion_resolve_memory(const VkPhysicalDeviceMemoryProperties& memory) {
         occlusion_resolve_memory_ = memory;
+        target_dump_.set_memory_properties(memory);
+    }
+    void set_target_dump_memory(const VkPhysicalDeviceMemoryProperties& memory,
+                                std::uint32_t max_memory_allocations = 0) {
+        target_dump_.set_memory_properties(memory, max_memory_allocations);
+    }
+    void set_target_dump_limits(VkDeviceSize max_bytes, std::uint32_t max_allocations) {
+        target_dump_.set_staging_limits(max_bytes, max_allocations);
+    }
+    VkDeviceSize target_dump_outstanding_bytes() const noexcept {
+        return target_dump_.outstanding_staging_bytes();
+    }
+    std::uint32_t target_dump_outstanding_allocations() const noexcept {
+        return target_dump_.outstanding_staging_allocations();
+    }
+    bool target_dump_enabled() const noexcept { return target_dump_.enabled(); }
+    void flush_target_dump() {
+        if (!target_dump_.enabled() && !target_dump_.has_pending()) return;
+        const std::uint64_t pending_ticket = target_dump_.max_pending_ticket();
+        if (pending_ticket && !is_device_lost()) {
+            const std::uint64_t completed = wait_retire_ticket(pending_ticket);
+            if (!is_device_lost()) target_dump_.drain(completed >= pending_ticket ? completed : pending_ticket);
+        }
+        if (is_device_lost()) {
+            target_dump_.discard_pending();
+        } else {
+            target_dump_.finalize_for_teardown();
+        }
     }
 
     struct HostTextureStats { std::uint64_t copies = 0, waits = 0; };
@@ -2037,6 +2068,9 @@ public:
 
     void drain_deleted_resources(std::uint64_t current_ticket) {
         deletion_queue_.drain(current_ticket, device_, vk);
+        if (target_dump_.has_pending() || target_dump_.enabled()) {
+            target_dump_.drain(current_ticket, submit_phases::totals().present_serial.load(std::memory_order_relaxed) + 1);
+        }
     }
 
     // True when the VA names a sparse resource: the sparse pass binds its memory, not the arena's mapping, so the
@@ -2442,6 +2476,7 @@ private:
     std::uint32_t transfer_only_family_ = UINT32_MAX;
     std::uint32_t graphics_family_ = UINT32_MAX;
     DebugLabelFunctions labels_;
+    TargetDump target_dump_;
 };
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -2627,6 +2662,10 @@ public:
                                          "treated as lost\n", int(idle_result));
                 context_.mark_device_lost();
             }
+        }
+        if (context_.target_dump_.has_pending() && !context_.is_device_lost()) {
+            context_.target_dump_.drain(context_.completed_retire_ticket(),
+                                        submit_phases::totals().present_serial.load(std::memory_order_relaxed) + 1);
         }
         if (progress_) {
             std::lock_guard lock(context_.tracker_mutex_);
@@ -3738,6 +3777,23 @@ private:
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
         std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
+        bool target_dump_active = false;
+        struct TargetDumpGuard {
+            TargetDump* dump = nullptr;
+            bool committed = false;
+            ~TargetDumpGuard() {
+                if (dump && !committed) dump->commit_submission(false, 0);
+            }
+        } target_dump_guard;
+        if (context_.target_dump_.enabled()) {
+            const std::uint64_t frame = submit_phases::totals().present_serial.load(std::memory_order_relaxed) + 1;
+            if (context_.target_dump_.active_for_frame(frame)) {
+                context_.target_dump_.begin_submission(frame, queue_);
+                replay.target_dump = &context_.target_dump_;
+                target_dump_guard.dump = &context_.target_dump_;
+                target_dump_active = true;
+            }
+        }
         CheckpointSubmission diagnostics;
         PFN_vkCmdSetCheckpointNV checkpoint = nullptr;
         if (execute_call) {
@@ -3832,6 +3888,10 @@ private:
                 prelude_seen_ = context_.prelude_version_;
             }
             if (context_.prelude_commit_) context_.prelude_commit_(submitted, context_.submitted_retire_ticket());
+        }
+        if (target_dump_active) {
+            context_.target_dump_.commit_submission(submitted, submitted ? context_.submitted_retire_ticket() : 0);
+            target_dump_guard.committed = true;
         }
         if (wait_previous && !submitted && !waits_.empty()) {  // a failed submit keeps the waits for the next one
             waits_.pop_back();
