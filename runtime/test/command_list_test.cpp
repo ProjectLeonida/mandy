@@ -372,5 +372,43 @@ int main() {
     CHECK(!list.acceleration_structure_postbuild({0x4000, 0, {0x1080}}));
     CHECK(list.close());
     CHECK(list.commands().size() == 7);
+
+    // Direct draw / DispatchMesh: both copy and move overloads must drop zero-sized draws and zero-Z mesh dispatches.
+    CHECK(list.reset());
+    Draw direct{};
+    direct.pipeline = 0x5000;
+    direct.count = 3;
+    direct.instances = 1;
+    CHECK(list.draw(direct));
+    CHECK(list.draw(Draw{direct}));
+    CHECK(!list.draw(Draw{}));  // null pipeline
+    Draw zero_v = direct;
+    zero_v.count = 0;
+    CHECK(list.draw(zero_v));
+    CHECK(list.draw(std::move(zero_v)));
+    Draw zero_i = direct;
+    zero_i.instances = 0;
+    CHECK(list.draw(zero_i));
+    CHECK(list.draw(std::move(zero_i)));
+    Draw mesh{};
+    mesh.pipeline = 0x6000;
+    mesh.mesh = true;
+    mesh.count = 4;      // groupCountX
+    mesh.instances = 2;  // groupCountY
+    mesh.first = 0;      // groupCountZ == 0: must not be recorded by either copy or move overload
+    CHECK(list.draw(mesh));
+    CHECK(list.draw(Draw{mesh}));
+    mesh.first = 3;      // non-zero groupCountZ: recorded
+    CHECK(list.draw(mesh));
+    CHECK(list.draw(Draw{mesh}));
+    CHECK(list.commands().size() == 4);
+    CHECK(std::get<Draw>(list.commands()[2]).mesh && std::get<Draw>(list.commands()[2]).first == 3);
+    CHECK(std::get<Draw>(list.commands()[3]).mesh && std::get<Draw>(list.commands()[3]).first == 3);
+    CHECK(list.close());
+    // Closed list rejects no-op draws (both copy and move overloads) too.
+    Draw closed_mesh = mesh;
+    closed_mesh.first = 0;
+    CHECK(!list.draw(closed_mesh));
+    CHECK(!list.draw(std::move(closed_mesh)));
     return 0;
 }
