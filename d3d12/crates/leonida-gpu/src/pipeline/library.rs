@@ -12,7 +12,8 @@
 //! 2. The title pipelines a run drew or dispatched with are listed by a key
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
-//!    creation, during loading.
+//!    creation, during loading. A pipeline stays listed for two runs after
+//!    the last one that drew with it ([`early_runs`]).
 //!
 //! Library calls overlap: the host documents the library as safe to use
 //! from several threads ("The pipeline library is thread-safe to use, and
@@ -49,7 +50,7 @@
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
 //! open (the test below). `LEONIDA_LIBRARY_HANDLE=0`: closed, as before.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
@@ -680,7 +681,7 @@ pub(crate) fn save(now: bool) {
     };
     // Through `used`: a process that asked for none yet (`leonida shaders`)
     // must not write the earlier runs' list over with nothing.
-    let used: Vec<String> = used().iter().flatten().cloned().collect();
+    let used: Vec<String> = used().as_ref().map(|e| e.lines(early_runs())).unwrap_or_default();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -803,25 +804,97 @@ pub(crate) fn note_time(key: &str, ms: u64) {
     }
 }
 
-/// Title pipeline keys requested by draws or dispatches (this run and the last).
-static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Title pipeline keys requested by draws or dispatches (this run and the
+/// last, [`early_runs`]).
+static USED: Mutex<Option<Early>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
+/// How many runs' title pipelines the early list keeps: 2, those this run
+/// requested and those the run before did, so a pipeline is started early
+/// by the two runs after the last one that drew with it. The list held
+/// every run's: each pipeline drawn with in any earlier run was started at
+/// the title's creation of it, at every load, and kept as a host pipeline
+/// for the whole session whether this run drew with it or not. It grew
+/// with every place visited, and at `EARLY_MAX` it stopped taking new ones.
+/// `LEONIDA_EARLY_RUNS=<n>`: n runs; 0: every run's, as before.
+fn early_runs() -> u64 {
+    static RUNS: OnceLock<u64> = OnceLock::new();
+    *RUNS.get_or_init(|| {
+        std::env::var("LEONIDA_EARLY_RUNS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2)
+    })
+}
+
+/// The early list ([`EARLY_FILE`]): a key and the run that last requested
+/// it on each line. Runs are counted by the list itself: this one is one
+/// past the newest written down. A line with a key alone (a list written
+/// before runs were counted) is one of run 0.
+struct Early {
+    /// This run's number.
+    run: u64,
+    keys: HashMap<String, u64>,
+}
+
+impl Early {
+    fn read(text: &str) -> Early {
+        let mut keys: HashMap<String, u64> = HashMap::new();
+        for line in text.lines() {
+            let mut words = line.split_ascii_whitespace();
+            let Some(key) = words.next() else { continue };
+            let run = words.next().and_then(|r| r.parse().ok()).unwrap_or(0);
+            let last = keys.entry(key.to_owned()).or_insert(run);
+            *last = run.max(*last);
+        }
+        let run = keys.values().copied().max().unwrap_or(0).saturating_add(1);
+        Early { run, keys }
+    }
+
+    /// Whether a run on the list requested `key`.
+    fn has(&self, key: &str) -> bool {
+        self.keys.contains_key(key)
+    }
+
+    /// This run requested `key`; whether the list changed: a key new to it,
+    /// or one an earlier run requested last (its run is written again).
+    fn note(&mut self, key: &str) -> bool {
+        if let Some(last) = self.keys.get_mut(key) {
+            return std::mem::replace(last, self.run) != self.run;
+        }
+        self.keys.len() < EARLY_MAX && self.keys.insert(key.to_owned(), self.run).is_none()
+    }
+
+    /// The lines to write, by key: the keys requested in the last `runs`
+    /// runs (0: in any). They are counted back from the newest run on the
+    /// list, which is this one once it has requested a pipeline: a process
+    /// that requests none (one that only translates shaders) writes the
+    /// list back as it found it, and is not a run that ages the others out.
+    fn lines(&self, runs: u64) -> Vec<String> {
+        let newest = self.keys.values().copied().max().unwrap_or(0);
+        let mut kept: Vec<(&String, &u64)> = self
+            .keys
+            .iter()
+            .filter(|&(_, &last)| runs == 0 || last.saturating_add(runs) > newest)
+            .collect();
+        kept.sort_unstable();
+        kept.into_iter().map(|(key, last)| format!("{key} {last}")).collect()
+    }
+}
+
+fn used() -> std::sync::MutexGuard<'static, Option<Early>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
         let listed = DIR
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
-        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        tracing::info!(pipelines = set.len(), "title pipelines to start early");
-        *used = Some(set);
+        let early = Early::read(&listed);
+        tracing::info!(pipelines = early.keys.len(), "title pipelines to start early");
+        *used = Some(early);
     }
     used
 }
 
-/// Whether the title pipeline with `key` was requested in this or an earlier run.
+/// Whether the title pipeline with `key` was requested in this run or one
+/// of the earlier runs the early list keeps ([`early_runs`]).
 ///
 /// `LEONIDA_EARLY_ALL=1`: every title pipeline is started at creation,
 /// requested before or not, so that the driver's own cache holds it for
@@ -831,14 +904,12 @@ pub(crate) fn wanted_early(key: &str) -> bool {
     if *ALL.get_or_init(|| std::env::var_os("LEONIDA_EARLY_ALL").is_some_and(|v| v == "1")) {
         return true;
     }
-    used().as_ref().is_some_and(|s| s.contains(key))
+    used().as_ref().is_some_and(|early| early.has(key))
 }
 
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
-    let mut used = used();
-    let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+    if used().get_or_insert_with(|| Early::read("")).note(key) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -985,6 +1056,93 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
+    }
+
+    /// The keys an early list's text holds, sorted.
+    fn listed(text: &str) -> Vec<&str> {
+        let mut keys: Vec<&str> = text.lines().filter_map(|l| l.split(' ').next()).collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Five runs, each drawing with pipelines of its own: the list the last
+    /// one writes holds those of that run and the one before, and the next
+    /// run starts only those early. It held every run's, so each pipeline
+    /// drawn with in any run ever became a host pipeline at every load.
+    #[test]
+    fn the_early_list_keeps_the_last_two_runs() {
+        let mut text = String::new();
+        for run in 1..=5 {
+            let mut early = Early::read(&text);
+            for n in 0..2 {
+                assert!(early.note(&format!("run{run}-{n}")));
+            }
+            text = early.lines(2).join("\n");
+        }
+        assert_eq!(listed(&text), ["run4-0", "run4-1", "run5-0", "run5-1"]);
+        let next = Early::read(&text);
+        assert!(next.has("run4-0") && next.has("run5-1"));
+        assert!(!next.has("run3-0") && !next.has("run1-0"));
+    }
+
+    /// A pipeline drawn with again in a later run stays listed from then on.
+    #[test]
+    fn a_pipeline_drawn_with_again_stays_listed() {
+        let mut text = String::new();
+        for run in 1..=5 {
+            let mut early = Early::read(&text);
+            early.note(&format!("run{run}"));
+            if run % 2 == 1 {
+                // The list changes (its run is written down), once a run.
+                assert!(early.note("odd-runs"));
+                assert!(!early.note("odd-runs"));
+            }
+            text = early.lines(2).join("\n");
+        }
+        assert_eq!(listed(&text), ["odd-runs", "run4", "run5"]);
+    }
+
+    /// A list written before runs were counted (a key alone on each line)
+    /// still loads: its keys are started early, kept for one more run and
+    /// then age as the others do.
+    #[test]
+    fn an_early_list_without_runs_still_loads() {
+        let mut early = Early::read("old-a\nold-b\n\n");
+        assert!(early.has("old-a") && early.has("old-b"));
+        early.note("new");
+        let text = early.lines(2).join("\n");
+        assert_eq!(listed(&text), ["new", "old-a", "old-b"]);
+        let mut next = Early::read(&text);
+        next.note("new");
+        next.note("old-b");
+        assert_eq!(listed(&next.lines(2).join("\n")), ["new", "old-b"]);
+    }
+
+    /// A process that requests no pipeline (one that only translates
+    /// shaders) writes the list back as it found it: it is not a run that
+    /// ages the others out.
+    #[test]
+    fn a_process_that_requests_nothing_writes_the_list_back() {
+        let mut text = String::new();
+        for run in 1..=3 {
+            let mut early = Early::read(&text);
+            early.note(&format!("run{run}"));
+            text = early.lines(2).join("\n");
+        }
+        assert_eq!(Early::read(&text).lines(2).join("\n"), text);
+        assert_eq!(listed(&text), ["run2", "run3"]);
+    }
+
+    /// `LEONIDA_EARLY_RUNS=0`: every run's pipelines stay listed, as before.
+    #[test]
+    fn no_count_of_runs_keeps_every_run() {
+        let mut text = String::new();
+        for run in 1..=4 {
+            let mut early = Early::read(&text);
+            early.note(&format!("run{run}"));
+            text = early.lines(0).join("\n");
+        }
+        assert_eq!(listed(&text), ["run1", "run2", "run3", "run4"]);
     }
 
     #[test]
