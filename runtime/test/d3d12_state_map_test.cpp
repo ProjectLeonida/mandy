@@ -6,7 +6,7 @@
 #include "../src/vulkan_replay.h"
 #include "../src/vulkan_index_view.h"
 #include <cstring>
-#include "../src/vulkan_memory.h"  // resizable_bar, memory_type_order
+#include "../src/vulkan_memory.h"  // resizable_bar, bar_window_type, memory_type_order
 
 // Argument-buffer bounds only, no Vulkan calls. A 64-byte compound record has padding to an
 // 80-byte stride between records, but needs none after the last. A terminal DRAW_INDEXED alone is only 20 bytes.
@@ -893,14 +893,28 @@ static int memory_tests() {
         CHECK(memory_type_order(memory, 0xF, host, local, 128 * mib) == (order{3, 1, 2}));  // fits the BAR heap
         CHECK(memory_type_order(memory, 0xF, host, local, 224395264) == (order{3, 1, 2}));  // exactly fits
         CHECK(memory_type_order(memory, 0x7, host, local, 128 * mib) == (order{1, 2}));     // type 3 not allowed
-        CHECK(memory_type_order(memory, 0xF, 0, local, 1 * mib) == (order{0, 3, 1, 2}));
+        // A texture that wants no host access tries the BAR window last, after system memory: there it would take
+        // the window from the arena, and with VRAM full the window is full too.
+        CHECK(memory_type_order(memory, 0xF, 0, local, 1 * mib) == (order{0, 1, 2, 3}));
+        CHECK(memory_type_order(memory, 0x8, 0, local, 1 * mib) == (order{3}));            // the only type allowed
+        // A staging buffer (host access, no VRAM preference) also leaves the window to the arena.
+        memory.memoryTypes[1] = {local | host, 2};
+        memory.memoryTypes[3] = {host, 1};
+        CHECK(memory_type_order(memory, 0xF, host, 0, 1 * mib) == (order{2, 3, 1}));
+        CHECK(memory_type_order(memory, 0xF, host, local, 1 * mib) == (order{1, 2, 3}));  // the arena keeps it first
+        memory.memoryTypes[1] = {host, 1};
+        memory.memoryTypes[3] = {local | host, 2};
+        CHECK(bar_window_type(memory, 3));
+        CHECK(!bar_window_type(memory, 0) && !bar_window_type(memory, 1) && !bar_window_type(memory, 4));
         // D3D-299: types 1 and 2 lack DEVICE_LOCAL; when preferred local fails, allocations fall back to them (host spill).
         const order spill_order = memory_type_order(memory, 0xF, 0, local, 1 * mib);
+        CHECK((memory.memoryTypes[spill_order[1]].propertyFlags & local) == 0);
         CHECK((memory.memoryTypes[spill_order[2]].propertyFlags & local) == 0);
-        CHECK((memory.memoryTypes[spill_order[3]].propertyFlags & local) == 0);
         CHECK(memory_type_order(memory, 0xF, host, local, 64ull << 30).empty());           // nothing that large
         memory.memoryHeaps[2].size = 24ull << 30;                                         // Resizable BAR on
         CHECK(memory_type_order(memory, 0xF, host, local, 256 * mib) == (order{3, 1, 2}));
+        CHECK(!bar_window_type(memory, 3));
+        CHECK(memory_type_order(memory, 0xF, 0, local, 1 * mib) == (order{0, 3, 1, 2}));
     }
 
     // block_format: bytes per texel, or per 4x4 block for block-compressed formats, of one aspect as a copy lays a

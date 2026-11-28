@@ -11078,7 +11078,9 @@ public:
             if (!image) memory_types = device_.sparse_buffer_memory_types;
             const VkMemoryRequirements requirements{desc_.SizeInBytes, leonida::tile_size_in_bytes,
                                                     memory_types};
-            const auto memory = device_.allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+            // VRAM preferred, not required: with VRAM full a tile heap the title asked for has to come from system
+            // memory rather than not at all. memory_types is the sparse resource's own memoryTypeBits.
+            const auto memory = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                                                   nullptr, !image, &memory_type);
             if (!memory) return {};
             image_tiles_ = image;
