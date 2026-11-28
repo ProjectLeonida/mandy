@@ -4,7 +4,7 @@
 // The window is then resized, which recreates the swapchain and scales the blit. The presented images are copied
 // back (the presenter's capture) and must hold the clear colour at the swapchain's size. Last, the colour on screen
 // is read back with GDI on native Windows when the window is in front with no other window over its centre, the
-// display is in SDR and GDI can read the screen. Under Wine, rootless XWayland can return black for desktop reads,
+// desktop has an active display path in SDR and GDI can read the screen. Under Wine, rootless XWayland can return black for desktop reads,
 // so the swapchain checks confirm the colour there. No shaders or game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
@@ -48,6 +48,14 @@ struct Ref {
     }
     T* operator->() const { return p; }
 };
+
+// GDI can return a valid black pixel on a headless Windows desktop even when the swapchain is correct.
+// Keep the screen check if Windows cannot report the display configuration.
+bool has_no_active_display_paths() {
+    UINT32 paths = 0;
+    UINT32 modes = 0;
+    return GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &paths, &modes) == ERROR_SUCCESS && paths == 0;
+}
 
 // Returns true when the monitor containing the window is running with Windows HDR enabled
 // (DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020). On an HDR desktop, DWM scales SDR GDI reads
@@ -586,6 +594,8 @@ int main() {
         }
         if (wine) {
             std::printf("Wine: on-screen colour check skipped after swapchain readback\n");
+        } else if (has_no_active_display_paths()) {
+            std::printf("Windows has no active display paths: on-screen colour check skipped after swapchain readback\n");
         } else if (GetForegroundWindow() == window && !IsIconic(window)) {
             if (is_hdr_monitor(window)) {
                 std::printf("the monitor is in HDR mode: on-screen colour check skipped\n");
