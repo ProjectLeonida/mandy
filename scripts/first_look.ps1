@@ -9,13 +9,25 @@ $root = Split-Path $PSScriptRoot -Parent
 $Exe = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Exe)
 if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "$Exe not found" }
 $image = Get-Item -LiteralPath $Exe
-if (-not $GameDir) { $GameDir = $image.DirectoryName }
+if ($GameDir) {
+    $GameDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($GameDir)
+    if (-not (Test-Path -LiteralPath $GameDir -PathType Container)) { throw "$GameDir not found or not a directory" }
+} else {
+    $GameDir = $image.DirectoryName
+}
 $name = [IO.Path]::GetFileNameWithoutExtension($Exe)
 $out = Join-Path $root "reports\exe\$name"
-New-Item -ItemType Directory -Force $out | Out-Null
+if (Test-Path -LiteralPath $out -PathType Leaf) { throw "$out is a file, not a directory" }
+[void][IO.Directory]::CreateDirectory($out)
 
-$fs = [IO.File]::OpenRead($Exe); $mz = New-Object byte[] 2; [void]$fs.Read($mz, 0, 2); $fs.Close()
-if ([Text.Encoding]::ASCII.GetString($mz) -ne "MZ") {
+$fs = [IO.File]::OpenRead($Exe)
+try {
+    $mz = New-Object byte[] 2
+    $read = $fs.Read($mz, 0, 2)
+} finally {
+    $fs.Dispose()
+}
+if ($read -ne 2 -or [Text.Encoding]::ASCII.GetString($mz) -ne "MZ") {
     throw "$Exe doesn't start with an MZ header. It's still packaged or encrypted, so there's nothing to inspect."
 }
 
@@ -24,6 +36,8 @@ $hash = (Get-FileHash -LiteralPath $Exe -Algorithm SHA256).Hash.ToLower()
 "sha256 $hash  size $size" | Tee-Object -LiteralPath (Join-Path $out "hash.txt")
 
 Write-Host "`n== PE inspection"
+$reportPath = Join-Path $out "$([IO.Path]::GetFileName($Exe)).json"
+if (Test-Path -LiteralPath $reportPath -PathType Leaf) { Remove-Item -LiteralPath $reportPath -Force }
 python -I (Join-Path $root "tools\pe_inspect.py") $Exe --game-dir $GameDir --out $out
 if ($LASTEXITCODE -ne 0) { throw "pe_inspect failed" }
 
@@ -85,7 +99,9 @@ if (-not $hasTls -or $stale) {
         & $cmake --build $build --target gta6rt @configArgs
         if ($LASTEXITCODE -ne 0) { throw "Building gta6rt in $build failed ($LASTEXITCODE)" }
     } else {
+        $global:LASTEXITCODE = 0
         & (Join-Path $PSScriptRoot "build_runtime.ps1")
+        if ($LASTEXITCODE -ne 0) { throw "build_runtime.ps1 failed ($LASTEXITCODE)" }
     }
     $rt = Find-RuntimeLoader $build $folders
     if (-not $rt) { throw "runtime build did not produce gta6rt.exe in $build" }
@@ -102,7 +118,8 @@ Write-Host "`n== Loader dry run (map, relocate, bind imports; nothing executes)"
 $dryRunExitCode = $LASTEXITCODE
 
 # Shim to-do list, grouped by DLL, most functions first.
-$report = Get-Content -LiteralPath (Join-Path $out "$([IO.Path]::GetFileName($Exe)).json") -Raw | ConvertFrom-Json
+if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) { throw "pe_inspect did not write $reportPath" }
+$report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
 $todo = $report.imports | Where-Object { $_.where -eq "shim" } | Sort-Object { -$_.functions.Count }
 $lines = foreach ($t in $todo) { "{0,-40} {1,5}" -f $t.dll, $t.functions.Count }
 # "unverified" only comes from a host that isn't Windows and has no Wine prefix (pe_inspect.py, classify_dll): most
