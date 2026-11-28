@@ -518,6 +518,16 @@ void set_reference_settler(ReferenceSettler settle);
 // counts. Calls made before that are not counted (the counter stays 0); they set only the first-call flags.
 std::uint64_t device_slot_hits(unsigned slot);
 bool device_slot_first_call_seen(unsigned slot);
+// For a slot that enters the proxy's generic branch (no compile-time handler of its own; Xbox slots routed at run
+// time and slots refused past the PC table included): the caller of its first call since the last
+// reset_device_proxy_stats, named by the formatter below, the same text the first-call log line shows; "" before
+// one. Diagnostic only: the first-call flag is set before the caller is stored, so a concurrent reader can see
+// device_slot_first_call_seen true with this still "".
+std::string device_slot_first_caller(unsigned slot);
+// Names a caller address in the first-call log line and device_slot_first_caller. gta6rt sets
+// rt::shims::module_offset (module+offset); with none set (the default, and in tests) the address is shown in hex.
+using CallerFormatter = std::string (*)(std::uint64_t address);
+void set_device_slot_caller_formatter(CallerFormatter formatter);
 std::uint64_t heap_slot_hits(unsigned slot);
 bool heap_slot_first_call_seen(unsigned slot);
 void reset_device_proxy_stats();

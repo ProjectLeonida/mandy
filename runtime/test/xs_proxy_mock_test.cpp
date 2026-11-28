@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <string>
 #include <new>
 #include <utility>
 
@@ -1877,6 +1878,13 @@ int check_xbox_slots() {
     // 78 SetFrameIntervalX(output, interval_us, latency, flags): S_OK, not forwarded to PC slot 78.
     EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK);
     EXPECT(mock->calls[78] == 0 && xs::device_slot_hits(78) == 1);
+    // RT-526: the first call of a slot in the generic branch keeps its caller (no formatter here: hex), a reset
+    // forgets it with the first-call flag, and the next call records it again.
+    EXPECT(xs::device_slot_first_call_seen(78) && xs::device_slot_first_caller(78).rfind("0x", 0) == 0);
+    xs::reset_device_proxy_stats();
+    EXPECT(!xs::device_slot_first_call_seen(78) && xs::device_slot_first_caller(78).empty());
+    EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK);
+    EXPECT(xs::device_slot_first_call_seen(78) && xs::device_slot_first_caller(78).rfind("0x", 0) == 0);
     // 79 ScheduleFrameEventX(event, offset_us, pEvent, flags): S_OK, not forwarded to PC slot 79.
     EXPECT(hr_of(raw(device, 79, 0, 0, 0x1234, 0)) == S_OK);
     EXPECT(mock->calls[79] == 0 && xs::device_slot_hits(79) == 1);

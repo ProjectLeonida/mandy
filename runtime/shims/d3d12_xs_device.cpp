@@ -476,6 +476,18 @@ void drop_null_rtv_marks(DeviceProxy* device, SIZE_T start, SIZE_T bytes) {
 
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
 std::atomic<bool> g_first[kMaxSlots];
+// The return address of the first call of each slot that reached the generic forwarding branch (0: none yet).
+std::atomic<std::uint64_t> g_first_caller[kMaxSlots];
+// Names a caller address (set_device_slot_caller_formatter); null: the bare address in hex. gta6rt sets
+// rt::shims::module_offset, so this file does not depend on the module table and test targets link it alone.
+std::atomic<CallerFormatter> g_caller_formatter{nullptr};
+
+std::string format_caller(std::uint64_t address) {
+    if (const CallerFormatter formatter = g_caller_formatter.load(std::memory_order_relaxed)) return formatter(address);
+    char text[32];
+    std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(address));
+    return text;
+}
 std::atomic<bool> g_beyond_warned[kMaxSlots];
 std::atomic<std::uint64_t> g_heap_hits[kHeapSlots];
 std::atomic<bool> g_heap_first[kHeapSlots];
@@ -568,11 +580,18 @@ const char* slot_name(unsigned slot) {
     }
 }
 
-void note_slot(unsigned slot) {
+// caller: the title code that called the slot, for the slots the proxy forwards by number (RT-526). The first call
+// then also names it as module+offset, so a new Xbox-only slot can be found in the executable without a debugger.
+void note_slot(unsigned slot, const void* caller = nullptr) {
     if (slot >= kMaxSlots) return;
     count_hit(g_hits[slot]);
     const bool first = first_call(g_first[slot]);
-    if (first) {
+    if (first && caller) {
+        const auto address = reinterpret_cast<std::uint64_t>(caller);
+        g_first_caller[slot].store(address, std::memory_order_relaxed);
+        std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) first call from %s\n", slot, slot_name(slot),
+                     format_caller(address).c_str());
+    } else if (first) {
         std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) first call\n", slot, slot_name(slot));
     } else if (slot >= 3 && trace_enabled()) {
         std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) call\n", slot, slot_name(slot));
@@ -6476,7 +6495,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                     reinterpret_cast<D3D12_HEAP_PROPERTIES*>(self), reinterpret_cast<DeviceProxy*>(a1),
                     static_cast<UINT>(a2), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(a3))));
         }
-        note_slot(Slot);
+        note_slot(Slot, _ReturnAddress());
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
         // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
         // methods. The check is before the slot-count refusal because slot 80 is outside a PC ID3D12Device11 table.
@@ -7161,6 +7180,15 @@ bool device_slot_first_call_seen(unsigned slot) {
     return slot < kMaxSlots && g_first[slot].load(std::memory_order_relaxed);
 }
 
+std::string device_slot_first_caller(unsigned slot) {
+    const std::uint64_t address = slot < kMaxSlots ? g_first_caller[slot].load(std::memory_order_relaxed) : 0;
+    return address ? format_caller(address) : std::string();
+}
+
+void set_device_slot_caller_formatter(CallerFormatter formatter) {
+    g_caller_formatter.store(formatter, std::memory_order_relaxed);
+}
+
 unsigned long device_proxy_ref_count(const void* device) {
     if (!is_device_proxy(device)) return 0;
     if (const ReferenceSettler settle = g_reference_settler.load(std::memory_order_acquire)) settle();
@@ -7201,6 +7229,7 @@ void reset_device_proxy_stats() {
     for (unsigned slot = 0; slot < kMaxSlots; ++slot) {
         g_hits[slot].store(0, std::memory_order_relaxed);
         g_first[slot].store(false, std::memory_order_relaxed);
+        g_first_caller[slot].store(0, std::memory_order_relaxed);
         g_beyond_warned[slot].store(false, std::memory_order_relaxed);
     }
     for (unsigned slot = 0; slot < kHeapSlots; ++slot) {

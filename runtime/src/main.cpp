@@ -545,6 +545,8 @@ int wmain(int argc, wchar_t** argv) {
     leonida::kernel_writes::set_committer(&rt::xmem::commit_physical_range);
     rt::d3d12_xs::set_texture_page_provider(&rt::xmem::pin_mapped_data);
     leonida::kernel_writes::set_unguarder(&rt::xmem::reopen_unowned);
+    // The first call of a forwarded device slot names its caller as module+offset (RT-526).
+    rt::d3d12_xs::set_device_slot_caller_formatter(&rt::shims::module_offset);
     if (int trace_error = 0; !trace_file.empty() && !rt::startup_trace::open(trace_file.c_str(), &trace_error)) {
         std::fprintf(stderr, trace_error == EEXIST ? "error: the trace file already exists; --trace only creates a new file\n"
                                                    : "error: cannot create the trace file\n");
