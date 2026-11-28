@@ -33,6 +33,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -46,6 +47,9 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 
 namespace leonida {
 
@@ -83,7 +87,7 @@ public:
     static constexpr std::size_t kChunkPages = std::size_t(kChunk / kPage);
     static constexpr std::uint64_t kUnitBytes = std::uint64_t(32) << 20;
     static constexpr std::uint32_t kUnitPages = std::uint32_t(kUnitBytes / kPage);
-    static constexpr std::size_t kStripBytes = 4096;
+    static constexpr std::size_t kStripBytes = 16384;
     static constexpr std::size_t kStripPieces = kStripBytes / shadow_keep::kPiece;
     static constexpr std::size_t kParallelThreshold = 16;
     static constexpr std::size_t kMaxWorkers = 6;
@@ -144,7 +148,7 @@ public:
                 task_chunk_ = chunk_size;
                 next_index_.store(0, std::memory_order_relaxed);
                 remaining_workers_.store(threads_.size(), std::memory_order_release);
-                ++generation_;
+                generation_.fetch_add(1, std::memory_order_release);
             }
             work_cv_.notify_all();
             struct JoinGuard {
@@ -169,11 +173,19 @@ public:
         };
         using Thunk = void (*)(void*, std::size_t, std::size_t, std::size_t);
 
+        static void cpu_pause() noexcept {
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+            _mm_pause();
+#elif defined(__aarch64__)
+            asm volatile("yield");
+#endif
+        }
+
         void shutdown() noexcept {
             {
                 std::lock_guard lock(mutex_);
                 stop_ = true;
-                ++generation_;
+                generation_.fetch_add(1, std::memory_order_release);
             }
             work_cv_.notify_all();
             for (std::thread& t : threads_)
@@ -193,20 +205,31 @@ public:
         void worker_loop(std::size_t tid) {
             std::uint64_t seen = 0;
             for (;;) {
-                Thunk fn = nullptr;
-                void* ctx = nullptr;
-                std::size_t count = 0;
-                std::size_t chunk = 0;
-                {
-                    std::unique_lock lock(mutex_);
-                    work_cv_.wait(lock, [this, seen] { return generation_ != seen; });
-                    seen = generation_;
-                    if (stop_) return;
-                    fn = task_fn_;
-                    ctx = task_ctx_;
-                    count = task_count_;
-                    chunk = task_chunk_;
+                std::uint64_t gen = generation_.load(std::memory_order_acquire);
+                if (gen == seen && seen != 0) {
+                    // Brief ~50 us spin before sleeping to avoid Wine/OS condvar wakeup latency between back-to-back
+                    // WorkerPool::run() dispatches (e.g. upload() -> filter_heap_pages_batch_locked()).
+                    const auto spin_deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(50);
+                    for (;;) {
+                        for (int p = 0; p < 64; ++p) {
+                            gen = generation_.load(std::memory_order_acquire);
+                            if (gen != seen) break;
+                            cpu_pause();
+                        }
+                        if (gen != seen || std::chrono::steady_clock::now() >= spin_deadline) break;
+                    }
                 }
+                if (gen == seen) {
+                    std::unique_lock lock(mutex_);
+                    work_cv_.wait(lock, [this, seen] { return generation_.load(std::memory_order_acquire) != seen; });
+                    gen = generation_.load(std::memory_order_acquire);
+                }
+                seen = gen;
+                if (stop_) return;
+                const Thunk fn = task_fn_;
+                void* const ctx = task_ctx_;
+                const std::size_t count = task_count_;
+                const std::size_t chunk = task_chunk_;
                 struct DoneGuard {
                     WorkerPool& pool;
                     ~DoneGuard() {
@@ -229,8 +252,8 @@ public:
         void* task_ctx_ = nullptr;
         std::size_t task_count_ = 0;
         std::size_t task_chunk_ = 1;
-        std::uint64_t generation_ = 0;
         bool stop_ = false;
+        alignas(64) std::atomic<std::uint64_t> generation_{0};
         alignas(64) std::atomic<std::size_t> remaining_workers_{0};
         alignas(64) std::atomic<std::size_t> next_index_{0};
     };
@@ -692,7 +715,7 @@ public:
             if (!slot || slot->frame != ref.frame || !slot->home) continue;
 
             const std::uint64_t* const gpu_sums = prehashed.sums.data() + i * kPieces;
-            const std::uint64_t* const agreed = slot->home->sums.get();
+            const std::uint64_t* const agreed = home_sums(*slot->home);
             const std::array<std::uint64_t, 4>* const sm = skip_masks ? &skip_masks[i] : nullptr;
 
             std::array<std::uint64_t, 4> diff_mask{};
@@ -836,7 +859,7 @@ public:
             job.page = ref.page;
             job.frame = slot->frame;
             job.gpu = staged + i * kPage;
-            job.sums = slot->home->sums.get();
+            job.sums = home_sums(*slot->home);
             if (slot->home->refs > 1) any_shared_home = true;
 
             std::size_t next_k = 0;
@@ -1005,6 +1028,9 @@ public:
                oldest_freed_ticket_.load(std::memory_order_acquire) <= completed;
     }
     std::uint64_t last_upload_bytes() const noexcept { return last_upload_bytes_; }
+    std::size_t last_whole_pages() const noexcept { return last_whole_pages_; }
+    std::size_t last_inc_pages() const noexcept { return last_inc_pages_; }
+    std::size_t last_aliased_pages() const noexcept { return last_aliased_pages_; }
 
     // The home's memory and offset of the mirrored page at `va` (tests and diagnostics).
     bool home_at(std::uint64_t va, VkDeviceMemory& memory, VkDeviceSize& offset, std::uint8_t** host = nullptr) const {
@@ -1042,7 +1068,7 @@ public:
                 const std::uint64_t hi = (std::min)(end, page_end);
                 const std::size_t k0 = std::size_t((lo - page) / kPiece);
                 const std::size_t k1 = std::size_t((hi - page + kPiece - 1) / kPiece);
-                const std::uint64_t* const sums = s.home->sums.get();
+                const std::uint64_t* const sums = home_sums(*s.home);
                 for (std::size_t k = k0; k < k1; ++k) {
                     h = (h ^ sums[k]) * 1099511628211ull;
                     h ^= h >> 29;
@@ -1087,7 +1113,6 @@ private:
         std::shared_ptr<void> keep;
         bool dirty = false;
         bool whole_fill = false;  // deferred initial fill from map(..., defer_fill=true)
-        std::unique_ptr<std::uint64_t[]> sums = std::make_unique<std::uint64_t[]>(kPieces);
         // The filtered copy (alias): its own slot, bound at the alias of `filter_va`, the aliased page it was made for.
         bool copy = false;
         std::uint32_t copy_unit = 0, copy_slot = 0;
@@ -1103,8 +1128,16 @@ private:
     struct Unit {
         VkDeviceMemory memory = VK_NULL_HANDLE;
         std::uint8_t* host = nullptr;
+        std::unique_ptr<std::uint64_t[]> sums;  // contiguous slab: kUnitPages * kPieces (0 heap allocs per Home)
         std::vector<std::uint32_t> free;
     };
+
+    std::uint64_t* home_sums(const Home& h) noexcept {
+        return units_[h.unit].sums.get() + std::size_t(h.slot) * kPieces;
+    }
+    const std::uint64_t* home_sums(const Home& h) const noexcept {
+        return units_[h.unit].sums.get() + std::size_t(h.slot) * kPieces;
+    }
     struct Freed {
         std::uint32_t unit, slot;
         std::uint64_t ticket;
@@ -1166,6 +1199,7 @@ private:
                                             const std::array<std::uint64_t, 4>& diff_mask, std::size_t diff_count,
                                             Write&& write, std::vector<std::uint8_t*>& refilter_frames) {
         if (!diff_count) return 0;
+        std::uint64_t* const sums = home_sums(home);
         bool whole_title_ok = false;
         if (diff_count >= 2) {
             whole_title_ok = hooks_.copy ? hooks_.copy(fill_scratch_.data(), frame, kPage)
@@ -1180,7 +1214,7 @@ private:
                 const unsigned bit = static_cast<unsigned>(std::countr_zero(m));
                 m &= m - 1;
                 const std::size_t k = w * 64 + bit;
-                const std::uint64_t agreed = home.sums[k];
+                const std::uint64_t agreed = sums[k];
                 if (pre_sums[k] == agreed) continue;
                 const std::uint8_t* title_ptr = nullptr;
                 if (whole_title_ok) {
@@ -1209,14 +1243,14 @@ private:
                 const std::size_t run_pieces = run_end - run_start;
                 if (do_write(static_cast<std::uint64_t>(frame_base + run_start * kPiece), gpu + run_start * kPiece,
                              run_pieces * kPiece)) {
-                    for (std::size_t k = run_start; k < run_end; ++k) home.sums[k] = pre_sums[k];
+                    for (std::size_t k = run_start; k < run_end; ++k) sums[k] = pre_sums[k];
                     written += std::uint64_t(run_pieces) * kPiece;
                     return;
                 }
                 if (run_pieces == 1) return;
                 for (std::size_t k = run_start; k < run_end; ++k) {
                     if (do_write(static_cast<std::uint64_t>(frame_base + k * kPiece), gpu + k * kPiece, kPiece)) {
-                        home.sums[k] = pre_sums[k];
+                        sums[k] = pre_sums[k];
                         written += kPiece;
                     }
                 }
@@ -1300,7 +1334,7 @@ private:
         std::array<std::uint64_t, 4> diff_mask{};
         std::uint64_t gpu_sums[kPieces];
         std::size_t diff_count = 0;
-        const std::uint64_t* const agreed = home.sums.get();
+        const std::uint64_t* const agreed = home_sums(home);
         if (k0 < k1) shadow_keep::sum_of_batch_256(gpu + k0 * kPiece, k1 - k0, gpu_sums + k0);
         for (std::size_t k = k0; k < k1; ++k) {
             if (gpu_sums[k] != agreed[k]) {
@@ -1321,7 +1355,7 @@ private:
         std::array<std::uint64_t, 4> diff_mask{};
         std::uint64_t gpu_sums[kPieces];
         std::size_t diff_count = 0;
-        const std::uint64_t* const agreed = home.sums.get();
+        const std::uint64_t* const agreed = home_sums(home);
         for (std::size_t w = 0; w < 4; ++w) {
             std::uint64_t m = mask[w];
             while (m) {
@@ -1350,14 +1384,14 @@ private:
     }
 
     // Stateless per-page copy + 256-byte piece hash + coalesced WC home flush (safe to run across worker threads on
-    // disjoint homes and scratch buffers). Processes each 64 KiB page in 4 KiB (16 x 256 B) L1-hot strips through
+    // disjoint homes and scratch buffers). Processes each 64 KiB page in 16 KiB (64 x 256 B) L1-hot strips through
     // `hooks_.copy` + hoisted `shadow_keep::sum_of_batch_256()` + immediate L1-to-WC flush so non-aliased pages
-    // (`scratch == nullptr`) never evict L1d through a 64 KiB bounce buffer, while aliased pages (`scratch != nullptr`)
-    // populate the full 64 KiB snapshot in `scratch` at the same time.
+    // (`scratch == nullptr`) stay L1d-resident while cutting `hooks_.copy` calls 4x and mapping 1 uint64_t mask word
+    // per strip; aliased pages (`scratch != nullptr`) populate the full 64 KiB snapshot in `scratch` at the same time.
     bool sync_page_into_scratch(std::uint8_t* to, std::uint8_t* scratch, std::uint64_t* sums,
                                 const std::uint8_t* frame, bool whole,
                                 std::array<std::uint64_t, 4>& changed_pieces, std::size_t& changed) const {
-        static_assert(kPage % kStripBytes == 0 && kStripPieces == 16);
+        static_assert(kPage % kStripBytes == 0 && kStripPieces == 64 && kPage / kStripBytes == 4);
         constexpr std::size_t kStrips = kPage / kStripBytes;
         alignas(64) std::uint8_t local_strip[kStripBytes];
         std::uint64_t strip_sums[kStripPieces];
@@ -1388,26 +1422,28 @@ private:
                 std::memcpy(to + strip_off, strip_buf, kStripBytes);
             } else {
                 shadow_keep::sum_of_batch_256(strip_buf, kStripPieces, strip_sums);
-                std::uint32_t strip_mask = 0;
+                std::uint64_t strip_mask = 0;
                 for (std::size_t p = 0; p < kStripPieces; ++p) {
                     if (strip_sums[p] != sums[base_k + p]) {
                         sums[base_k + p] = strip_sums[p];
-                        strip_mask |= std::uint32_t(1u) << p;
+                        strip_mask |= std::uint64_t(1) << p;
                         ++changed;
                     }
                 }
                 if (strip_mask) {
-                    changed_pieces[base_k >> 6] |= std::uint64_t(strip_mask) << (base_k & 63);
-                    if (strip_mask == 0xffffu) {
+                    changed_pieces[strip] = strip_mask;
+                    if (strip_mask == ~std::uint64_t(0)) {
                         std::memcpy(to + strip_off, strip_buf, kStripBytes);
                     } else {
-                        std::uint32_t m = strip_mask;
+                        std::uint64_t m = strip_mask;
                         while (m) {
                             const unsigned r0 = static_cast<unsigned>(std::countr_zero(m));
                             const unsigned ones = static_cast<unsigned>(std::countr_one(m >> r0));
                             std::memcpy(to + strip_off + std::size_t(r0) * kPiece,
                                         strip_buf + std::size_t(r0) * kPiece, std::size_t(ones) * kPiece);
-                            m &= ~(((std::uint32_t(1u) << ones) - 1u) << r0);
+                            const std::uint64_t run_mask =
+                                (ones >= 64) ? ~std::uint64_t(0) : (((std::uint64_t(1) << ones) - 1) << r0);
+                            m &= ~run_mask;
                         }
                     }
                 }
@@ -1422,7 +1458,7 @@ private:
 
     // Brings the home up to date with the title's page, piece by piece: `whole` (a new home) copies every piece, and
     // otherwise only a piece the title changed since both sides last agreed, so a piece only the GPU wrote keeps the
-    // GPU's bytes (and goes back with write_back). A piece both changed takes the title's bytes. Uses 4 KiB L1-hot
+    // GPU's bytes (and goes back with write_back). A piece both changed takes the title's bytes. Uses 16 KiB L1-hot
     // strips (populating `fill_scratch_` only when the home has a filtered copy). Never reads from `to`. Returns
     // whether any piece copy failed.
     bool sync_home_from_frame(Home& home, const std::uint8_t* frame, bool whole,
@@ -1430,7 +1466,7 @@ private:
         std::uint8_t* const to = units_[home.unit].host + std::size_t(home.slot) * kPage;
         std::uint8_t* const scratch = home.copy ? fill_scratch_.data() : nullptr;
         const bool failed =
-            sync_page_into_scratch(to, scratch, home.sums.get(), frame, whole, changed_pieces, changed);
+            sync_page_into_scratch(to, scratch, home_sums(home), frame, whole, changed_pieces, changed);
         counters_.uploaded_bytes += std::uint64_t(changed) * kPiece;
         return failed;
     }
@@ -1476,6 +1512,7 @@ private:
         home.unit = unit;
         home.slot = slot;
         home.keep = std::move(keep);
+        std::memset(home_sums(home), 0, kPieces * sizeof(std::uint64_t));
         created = true;
         return &home;
     }
@@ -1557,6 +1594,7 @@ private:
             }
         Unit made;
         if (!hooks_.make_unit || !hooks_.make_unit(made.memory, made.host)) return false;
+        made.sums = std::make_unique<std::uint64_t[]>(std::size_t(kUnitPages) * kPieces);
         for (std::uint32_t s = kUnitPages; s-- > 0;) made.free.push_back(s);
         units_.push_back(std::move(made));
         unit = std::uint32_t(units_.size() - 1);
@@ -1617,6 +1655,9 @@ private:
     std::size_t upload_impl(OnChanged&& on_changed, FilterBatchPtr filter_batch) {
         constexpr bool kHasFilterBatch = !std::is_same_v<std::decay_t<FilterBatchPtr>, std::nullptr_t>;
         const std::uint64_t uploaded_before = counters_.uploaded_bytes;
+        last_whole_pages_ = 0;
+        last_inc_pages_ = 0;
+        last_aliased_pages_ = 0;
         if (dirty_.empty()) {
             last_upload_bytes_ = 0;
             return 0;
@@ -1635,11 +1676,14 @@ private:
             UploadJob job;
             job.frame = frame;
             job.to = units_[home->second.unit].host + std::size_t(home->second.slot) * kPage;
-            job.sums = home->second.sums.get();
+            job.sums = home_sums(home->second);
             job.whole = std::exchange(home->second.whole_fill, false);
+            if (job.whole) ++last_whole_pages_;
+            else ++last_inc_pages_;
             if (home->second.copy) job.aliased_slot = aliased_count++;
             upload_jobs_.push_back(job);
         }
+        last_aliased_pages_ = aliased_count;
         const std::size_t n = upload_jobs_.size();
         const bool run_parallel_sync = parallel_enabled_ && n >= kParallelThreshold && ensure_pool();
 
@@ -1851,6 +1895,9 @@ private:
     Counters counters_;
     std::size_t last_batch_ = 0;
     std::uint64_t last_upload_bytes_ = 0;
+    std::size_t last_whole_pages_ = 0;
+    std::size_t last_inc_pages_ = 0;
+    std::size_t last_aliased_pages_ = 0;
     std::atomic<bool> has_pending_binds_{false};
     std::atomic<std::size_t> dirty_count_{0};
     std::atomic<std::size_t> freed_count_{0};

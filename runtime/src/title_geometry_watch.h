@@ -218,15 +218,15 @@ inline DWORD read_only(DWORD protection) {
 // Pages that are to get the same protection back are reopened together, a VirtualQuery and a VirtualProtect for each
 // region the query reports, not for each page: under Wine each call goes to the server, and a fault on a whole guarded
 // tile cost 16 us page by page against 2.6 us for one call (runtime/test/guard_fault_bench.cpp).
-// Fast path: when `c.restore` is uniform across all 16 sub-pages and `title_memory_map::generation() == c.armed_map_gen`,
-// skip VirtualQuery and call VirtualProtect directly (verifying `old == read_only(restore) || old == restore`, else
-// restoring `old` and falling back to the slow path).
+// Fast path: when `c.restore` is uniform across all 16 sub-pages and no title_memory_map change after
+// `c.armed_map_gen` overlapped [va, va + tile_size), skip VirtualQuery and call VirtualProtect directly (verifying
+// `old == read_only(restore) || old == restore`, else restoring `old` and falling back to the slow path).
 // When `fault_page_opened` is non-null, sets it to true if VirtualProtect restored a writable, non-guard protection on
 // the 4 KiB page `fault_page`, allowing notify(Event::fault) to skip a redundant second VirtualQuery.
 inline bool reopen(std::uintptr_t va, Cell& c, std::uintptr_t fault_page = UINTPTR_MAX,
                    bool* fault_page_opened = nullptr) {
     const DWORD r0 = c.restore[0];
-    if (r0 && c.armed_map_gen != Cell::kNoMapGen && title_memory_map::generation() == c.armed_map_gen) {
+    if (r0 && c.armed_map_gen != Cell::kNoMapGen) {
         bool uniform = true;
         for (std::size_t i = 1; i < c.restore.size(); ++i) {
             if (c.restore[i] != r0) {
@@ -235,22 +235,36 @@ inline bool reopen(std::uintptr_t va, Cell& c, std::uintptr_t fault_page = UINTP
             }
         }
         if (uniform) {
-            const DWORD ro = read_only(r0);
-            const bool writable_restore = !(r0 & PAGE_GUARD) && ro != 0;
-            if (ro) {
-                DWORD old{};
-                if (VirtualProtect(reinterpret_cast<void*>(va), tile_size, r0, &old)) {
-                    if (old == ro || old == r0) {
-                        c.restore.fill(0);
-                        c.armed_map_gen = Cell::kNoMapGen;
-                        if (fault_page_opened && writable_restore && fault_page >= va && fault_page < va + tile_size)
-                            *fault_page_opened = true;
-                        return true;
+            const std::uintptr_t tile_end = va <= UINTPTR_MAX - tile_size ? va + tile_size : UINTPTR_MAX;
+            bool range_clean = (title_memory_map::generation() == c.armed_map_gen);
+            if (!range_clean) {
+                std::uint64_t now = 0;
+                bool overlapped = false;
+                if (title_memory_map::changes_since(c.armed_map_gen, now, va, tile_end,
+                                                    [&](std::uintptr_t c_from, std::uintptr_t c_to) {
+                                                        if (c_from < c_to) overlapped = true;
+                                                    })) {
+                    range_clean = !overlapped;
+                }
+            }
+            if (range_clean) {
+                const DWORD ro = read_only(r0);
+                const bool writable_restore = !(r0 & PAGE_GUARD) && ro != 0;
+                if (ro) {
+                    DWORD old{};
+                    if (VirtualProtect(reinterpret_cast<void*>(va), tile_size, r0, &old)) {
+                        if (old == ro || old == r0) {
+                            c.restore.fill(0);
+                            c.armed_map_gen = Cell::kNoMapGen;
+                            if (fault_page_opened && writable_restore && fault_page >= va && fault_page < tile_end)
+                                *fault_page_opened = true;
+                            return true;
+                        }
+                        // Unexpected prior protection (caller bypassed title_memory_map::changed): restore `old` and
+                        // fall back to the VirtualQuery slow path.
+                        DWORD dummy{};
+                        VirtualProtect(reinterpret_cast<void*>(va), tile_size, old, &dummy);
                     }
-                    // Unexpected prior protection (caller bypassed title_memory_map::changed): restore `old` and fall
-                    // back to the VirtualQuery slow path.
-                    DWORD dummy{};
-                    VirtualProtect(reinterpret_cast<void*>(va), tile_size, old, &dummy);
                 }
             }
         }
@@ -492,6 +506,71 @@ inline void set_hot(std::uintptr_t va, bool hot) {
     }
     s.hot_count.store(s.hot.size(), std::memory_order_release);
     s.hot_generation.fetch_add(1, std::memory_order_release);
+}
+
+// Batched set_hot: updates `vas[0..count)` under a single State::mutex hold (eliminating per-tile mutex + WriteQueue
+// churn on TitleWritePolicy::kProbe cycles and hot-page promotion batches).
+inline void set_hot_batch(const std::uintptr_t* vas, std::size_t count, bool hot) {
+    if (!count) return;
+    if (count == 1) {
+        set_hot(vas[0], hot);
+        return;
+    }
+    auto& s = state();
+    std::lock_guard lock(s.mutex);
+    bool hot_changed = false;
+    if (hot) {
+        for (std::size_t i = 0; i < count; ++i) {
+            const std::uintptr_t va = vas[i];
+            const auto it = s.cells.find(va);
+            if (it == s.cells.end()) continue;
+            Cell& c = it->second;
+            if (c.hot++) continue;
+            reopen(va, c);
+            s.hot.push_back(va);
+            hot_changed = true;
+        }
+    } else {
+        host_heap::vector<std::uintptr_t> cooled;
+        cooled.reserve(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            const std::uintptr_t va = vas[i];
+            const auto it = s.cells.find(va);
+            if (it == s.cells.end()) continue;
+            Cell& c = it->second;
+            if (!c.hot || --c.hot) continue;
+            cooled.push_back(va);
+            hot_changed = true;
+        }
+        if (!cooled.empty()) {
+            std::sort(cooled.begin(), cooled.end());
+            cooled.erase(std::unique(cooled.begin(), cooled.end()), cooled.end());
+            std::erase_if(s.hot, [&](std::uintptr_t x) {
+                return std::binary_search(cooled.begin(), cooled.end(), x);
+            });
+            const auto version = s.serial.load(std::memory_order_relaxed) + 1;
+            for (const std::uintptr_t va : cooled) {
+                const auto it = s.cells.find(va);
+                if (it != s.cells.end()) it->second.version.store(version, std::memory_order_release);
+            }
+            for (WriteQueue* q : s.writers) {
+                std::lock_guard queue_lock(q->mutex);
+                if (q->overflow) continue;
+                if (q->tiles.size() + cooled.size() <= WriteQueue::kMaxTiles) {
+                    q->tiles.insert(q->tiles.end(), cooled.begin(), cooled.end());
+                } else {
+                    q->overflow = true;
+                    q->tiles.clear();
+                }
+                q->pending.store(true, std::memory_order_release);
+            }
+            s.serial.store(version, std::memory_order_release);
+        }
+    }
+    if (hot_changed) {
+        s.hot_count.store(s.hot.size(), std::memory_order_release);
+        s.hot_generation.fetch_add(1, std::memory_order_release);
+    }
 }
 
 // The tiles some owner holds hot: written, for every subscriber, at every look.

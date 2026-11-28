@@ -248,6 +248,140 @@ int main() {
         std::printf("watch_batch/unwatch_batch, gap-bridging pin guardrail, reopen fast path: ok\n");
     }
 
+    // Verify WS1 Round 9 fast paths:
+    //  1. Zero-syscall all_armed skip when another owner already armed all 16 sub-pages.
+    //  2. VirtualQuery region cache for MEM_RESERVE and PAGE_READONLY (explicit cached_state).
+    //  3. Range-scoped reopen() fast path across unrelated map changes + unexpected-protection rollback.
+    //  4. kMaxBridgeGap = 32 bridging (>8 tile gap bridged in 1 VirtualProtect) + set_hot_batch/disarm_batch.
+    //  5. WC tile detection (wc_tiles + is_wc_page) when host preserves PAGE_WRITECOMBINE.
+    {
+        std::vector<std::uint64_t> out;
+
+        // 1. Zero-syscall all_armed skip.
+        {
+            TextureCells other;
+            leonida::geometry_writes::Cell* cell = other.acquire(base);
+            EXPECT(other.arm(base, *cell) == 1);  // arms all 16 sub-pages
+            leonida::HotColdTracking tracking;
+            tracking.watch(base);
+            tracking.collect(out);
+            const auto arm_s = tracking.last_arm_stats();
+            EXPECT(arm_s.already_armed_skips == 1 && arm_s.vp_calls == 0 && arm_s.vq_calls == 0);
+            EXPECT(tracking.unwritten(base));
+            tracking.unwatch(base);
+            other.release(base);
+        }
+
+        // 2. MEM_RESERVE and PAGE_READONLY VQ region caching (explicit cached_state).
+        {
+            auto* reserved = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 4 * kPage, MEM_RESERVE, PAGE_NOACCESS));
+            auto* ro_mem = static_cast<std::uint8_t*>(
+                VirtualAlloc(nullptr, 4 * kPage, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY));
+            EXPECT(reserved && ro_mem);
+            if (reserved && ro_mem) {
+                const auto res_base = reinterpret_cast<std::uintptr_t>(reserved);
+                const auto ro_base = reinterpret_cast<std::uintptr_t>(ro_mem);
+                leonida::HotColdTracking tracking;
+                std::vector<std::uint64_t> mix = {res_base, res_base + 2 * kPage, res_base + 3 * kPage,
+                                                  ro_base,  ro_base + 2 * kPage,  ro_base + 3 * kPage};
+                tracking.watch_batch(mix.data(), mix.size());
+                tracking.collect(out);
+                const auto arm_s = tracking.last_arm_stats();
+                EXPECT(arm_s.vp_calls == 0);
+                EXPECT(arm_s.vq_calls <= 2);  // cached across non-contiguous sub-runs in each region!
+                EXPECT(tracking.take_refused() == 0);
+                tracking.unwatch_batch(mix.data(), mix.size());
+            }
+            if (reserved) VirtualFree(reserved, 0, MEM_RELEASE);
+            if (ro_mem) VirtualFree(ro_mem, 0, MEM_RELEASE);
+        }
+
+        // 3. Range-scoped reopen() fast path + unexpected-protection rollback.
+        {
+            leonida::HotColdTracking tracking;
+            tracking.watch(base);
+            tracking.collect(out);
+            EXPECT(tracking.unwritten(base));
+            // Unrelated map change must NOT disable range-scoped reopen() fast path.
+            leonida::title_memory_map::changed(base + 0x20000000, base + 0x20010000);
+            bool restored = false;
+            EXPECT(leonida::geometry_writes::notify(base + 64, base + 65, leonida::geometry_writes::Event::fault,
+                                                    &restored));
+            EXPECT(restored);
+            // Re-arm, then bypass title_memory_map::changed and change protection to PAGE_NOACCESS: reopen() MUST
+            // detect old != ro && old != r0, restore PAGE_NOACCESS, and NOT make it PAGE_READWRITE!
+            tracking.collect(out);
+            EXPECT(tracking.unwritten(base));
+            DWORD prev_prot = 0;
+            EXPECT(VirtualProtect(memory, kPage, PAGE_NOACCESS, &prev_prot) != 0);
+            restored = false;
+            leonida::geometry_writes::notify(base, base + 1, leonida::geometry_writes::Event::open, &restored);
+            EXPECT(!restored);
+            MEMORY_BASIC_INFORMATION mbi{};
+            EXPECT(VirtualQuery(memory, &mbi, sizeof mbi) && mbi.Protect == PAGE_NOACCESS);
+            EXPECT(VirtualProtect(memory, kPage, PAGE_READWRITE, &prev_prot) != 0);
+            leonida::title_memory_map::changed(base, base + kPage);
+            tracking.unwatch(base);
+        }
+
+        // 4. kMaxBridgeGap = 32 bridging (gap of 16 cold armed tiles bridged in 1 VirtualProtect) + disarm_batch.
+        {
+            constexpr std::size_t kBridgePages = 24;
+            auto* bmem = static_cast<std::uint8_t*>(
+                VirtualAlloc(nullptr, kBridgePages * kPage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            EXPECT(bmem != nullptr);
+            if (bmem) {
+                const auto bbase = reinterpret_cast<std::uintptr_t>(bmem);
+                leonida::HotColdTracking tracking;
+                std::vector<std::uint64_t> bpages(kBridgePages);
+                for (std::size_t p = 0; p < kBridgePages; ++p) bpages[p] = bbase + p * kPage;
+                tracking.watch_batch(bpages.data(), bpages.size());
+                tracking.collect(out);  // initial arm populates known_protect
+                // Open tiles 0 and 18 via notify(open) -> gap of 17 already-armed tiles (>8, <=32).
+                leonida::geometry_writes::notify(bbase, bbase + 1, leonida::geometry_writes::Event::open);
+                leonida::geometry_writes::notify(bbase + 18 * kPage, bbase + 18 * kPage + 1,
+                                                 leonida::geometry_writes::Event::open);
+                tracking.collect(out);
+                const auto arm_s = tracking.last_arm_stats();
+                EXPECT(arm_s.bridged_runs == 1 && arm_s.vp_calls == 1 && arm_s.vq_calls == 0);
+                // Promote 4 tiles simultaneously and run through a kProbe=32 cycle to exercise disarm_batch/set_hot_batch.
+                for (unsigned step = 0; step < 40; ++step) {
+                    for (std::size_t p = 0; p < 4; ++p)
+                        leonida::geometry_writes::notify(bbase + p * kPage, bbase + p * kPage + 1,
+                                                         leonida::geometry_writes::Event::open);
+                    tracking.collect(out);
+                }
+                for (std::size_t p = 0; p < 4; ++p) EXPECT(tracking.hot(bpages[p]));
+                tracking.unwatch_batch(bpages.data(), bpages.size());
+                VirtualFree(bmem, 0, MEM_RELEASE);
+            }
+        }
+
+        // 5. PAGE_WRITECOMBINE detection (when OS/Wine preserves PAGE_WRITECOMBINE on VirtualAlloc).
+        {
+            auto* wc_mem = static_cast<std::uint8_t*>(
+                VirtualAlloc(nullptr, 2 * kPage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_WRITECOMBINE));
+            if (wc_mem) {
+                MEMORY_BASIC_INFORMATION mbi{};
+                const bool host_has_wc =
+                    VirtualQuery(wc_mem, &mbi, sizeof mbi) && (mbi.Protect & PAGE_WRITECOMBINE) != 0;
+                const auto wc_base = reinterpret_cast<std::uintptr_t>(wc_mem);
+                leonida::HotColdTracking tracking;
+                std::vector<std::uint64_t> wpages = {wc_base, wc_base + kPage};
+                tracking.watch_batch(wpages.data(), wpages.size());
+                tracking.collect(out);
+                if (host_has_wc) {
+                    EXPECT(tracking.last_arm_stats().wc_tiles == 2);
+                    EXPECT(tracking.is_wc_page(wc_base) && tracking.is_wc_page(wc_base + kPage + 123));
+                }
+                tracking.unwatch_batch(wpages.data(), wpages.size());
+                EXPECT(!tracking.is_wc_page(wc_base));
+                VirtualFree(wc_mem, 0, MEM_RELEASE);
+            }
+        }
+        std::printf("WS1 fast paths (all_armed, reserve/ro cache, range-scoped reopen, 32-gap bridge, disarm_batch, WC): ok\n");
+    }
+
     VirtualFree(memory, 0, MEM_RELEASE);
     return failures ? 1 : 0;
 }

@@ -2273,6 +2273,10 @@ public:
     // queue's next submission wait for this one, which binds the new set.
     void note_bindless_upload() { bindless_upload_pending_ = true; }
 
+    std::uint64_t cached_completed_retire_ticket() const noexcept {
+        return completed_retire_ticket_.load(std::memory_order_acquire);
+    }
+
     std::uint64_t completed_retire_ticket() {
         bool lost = false;
         std::uint64_t ticket = 0;
@@ -2291,6 +2295,7 @@ public:
         // A DEVICE_LOST seen here is the first Vulkan operation to discover it; it must not be mistaken for
         // "this ticket has not completed".
         if (lost) mark_device_lost();
+        else note_completed_retire_ticket(ticket);
         return lost ? 0 : ticket;
     }
 
@@ -2485,13 +2490,23 @@ private:
         return framebuffer;
     }
 
+    void note_completed_retire_ticket(std::uint64_t ticket) noexcept {
+        std::uint64_t prev = completed_retire_ticket_.load(std::memory_order_relaxed);
+        while (ticket > prev &&
+               !completed_retire_ticket_.compare_exchange_weak(prev, ticket, std::memory_order_release,
+                                                               std::memory_order_relaxed)) {
+        }
+    }
+
     std::uint64_t poll_retirement_locked(VkResult& result) {
-        return retire_tickets_.completed([&](VkSemaphore semaphore, std::uint64_t value) {
+        const std::uint64_t ticket = retire_tickets_.completed([&](VkSemaphore semaphore, std::uint64_t value) {
             std::uint64_t done = 0;
             result = observe_result(vk.vkGetSemaphoreCounterValue(device_, semaphore, &done),
                                     "vkGetSemaphoreCounterValue (retirement)");
             return result == VK_SUCCESS && done >= value;
         });
+        if (result == VK_SUCCESS) note_completed_retire_ticket(ticket);
+        return ticket;
     }
 
     void watch_queue_progress(std::stop_token stop) {
@@ -2627,6 +2642,7 @@ private:
     alignas(64) SubmitMutex submit_mutex_;
     RetireTickets<VkSemaphore> retire_tickets_;
     std::atomic<std::uint64_t> submitted_ticket_{0};
+    std::atomic<std::uint64_t> completed_retire_ticket_{0};
     DeferredDeletionQueue deletion_queue_;
     std::unique_ptr<DeviceFaultDiagnostics> device_fault_;
     std::jthread progress_watch_;
