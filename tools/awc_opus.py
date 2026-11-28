@@ -388,10 +388,11 @@ def write_cue_sheet(sheet, rows):
     write_file(sheet, (json.dumps(payload, indent=2) + "\n").encode("utf-8"))
 
 
-def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP, cue_sheet: bool = False):
+def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP, cue_sheet: bool = False,
+                skip_existing: bool = False):
     od = bank_output_dir(path, out_dir)
-    if cue_sheet:
-        sheet = os.path.join(od, "cue_regions.json")
+    sheet = os.path.join(od, "cue_regions.json")
+    if cue_sheet and not skip_existing:
         if os.path.exists(sheet):
             # A skipped bank or interrupted channel write must not leave last run's regions current.
             write_cue_sheet(sheet, [])
@@ -407,8 +408,12 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP, cue_shee
             if cue_sheet:
                 channel_counts[cid] += 1
             if pk:
+                target = os.path.join(od, f"{cid:08X}.ogg")
+                if skip_existing and os.path.exists(target):
+                    counts["music"] += 1
+                    continue
                 n48 = samples * 48000 // rate if rate else 0
-                granule = write_ogg_opus(os.path.join(od, f"{cid:08X}.ogg"), pk, packet_channels, cid, n48,
+                granule = write_ogg_opus(target, pk, packet_channels, cid, n48,
                                          pre_skip=pre_skip)
                 if cue_sheet and rate == 48000 and samples > 0:
                     frame_limits[cid] = min(samples, max(0, granule - pre_skip))
@@ -416,6 +421,10 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP, cue_shee
     for s, stem in zip(streams, export_stems([s["id"] for s in streams])):
         at, size = s["data"]
         if s["codec"] == 0x0B and size % 2048 == 0 and s["channels"] in (1, 2):
+            ogg = os.path.join(od, stem + ".ogg")
+            if skip_existing and os.path.exists(ogg):
+                counts["opus"] += 1
+                continue
             pk = opus_packets(d, at, size)
             if pk:
                 # +0x0C is the per-channel Opus frame count: equal to the +0 count for mono and
@@ -425,17 +434,25 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP, cue_shee
                 frames = s["frames"]
                 if not frames or frames * s["channels"] != s["samples"]:
                     frames = s["samples"] // max(1, s["channels"])
-                write_ogg_opus(os.path.join(od, stem + ".ogg"), pk, s["channels"], s["id"], frames,
+                write_ogg_opus(ogg, pk, s["channels"], s["id"], frames,
                                pre_skip=pre_skip)
                 counts["opus"] += 1
                 continue
         if s["codec"] == 2 and s["channels"] in (1, 2) and size == s["samples"] * s["channels"] * 4:
             # codec 2: 32-bit float PCM (4 bytes per sample; values can exceed +-1, e.g. impulse responses)
-            write_wav(os.path.join(od, stem + ".wav"), memoryview(d)[at:at + size], s["rate"], s["channels"], True)
+            wav = os.path.join(od, stem + ".wav")
+            if skip_existing and os.path.exists(wav):
+                counts["pcm"] += 1
+                continue
+            write_wav(wav, memoryview(d)[at:at + size], s["rate"], s["channels"], True)
             counts["pcm"] += 1
             continue
         if s["codec"] == 0 and s["channels"] in (1, 2) and size == s["samples"] * s["channels"] * 2:
-            write_wav(os.path.join(od, stem + ".wav"), memoryview(d)[at:at + size], s["rate"], s["channels"])
+            wav = os.path.join(od, stem + ".wav")
+            if skip_existing and os.path.exists(wav):
+                counts["pcm"] += 1
+                continue
+            write_wav(wav, memoryview(d)[at:at + size], s["rate"], s["channels"])
             counts["pcm"] += 1
             continue
         counts["other"] += 1
@@ -454,6 +471,9 @@ def main(argv=None) -> int:
     ap.add_argument("src")
     ap.add_argument("out")
     ap.add_argument("--cue-sheet", action="store_true", help="write paired music cues beside their Ogg files")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="leave outputs that already exist alone, so a stopped export resumes instead of "
+                         "rewriting every file")
     ap.add_argument("--limit", type=int, help="maximum number of banks to export (default: all)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
                     help="banks to export at once (default: half the CPU count)")
@@ -517,7 +537,7 @@ def main(argv=None) -> int:
     if jobs == 1:
         for i, (b, output_parent) in enumerate(banks):
             try:
-                add(export_bank(b, output_parent, a.pre_skip, a.cue_sheet))
+                add(export_bank(b, output_parent, a.pre_skip, a.cue_sheet, a.skip_existing))
             except (ValueError, struct.error, IndexError, OSError) as e:
                 skipped(b, e)
                 continue

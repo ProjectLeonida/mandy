@@ -2467,7 +2467,9 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
     if need_ogg:
         # Lossless: the banks' Opus packets repackaged as standard Ogg Opus files (PCM streams as .wav)
         log("assets: audio streams -> Ogg Opus")
-        py("awc_opus.py", os.path.join(out, "audio", "awc"), ogg, "--jobs", str(jobs))
+        # A stopped run leaves most of the Ogg files written but no marker, so a restarted stage would repack every
+        # bank from the beginning; --skip-existing makes that restart pick up where it stopped.
+        py("awc_opus.py", os.path.join(out, "audio", "awc"), ogg, "--jobs", str(jobs), "--skip-existing")
         mark(ogg_done, "awc_opus.py")
         progress.tick(force=True)
     if need_wav:
