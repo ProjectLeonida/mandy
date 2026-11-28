@@ -3170,6 +3170,18 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_compute_journal_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_compute_journal COMMAND d3d12_compute_journal_test)
       set_tests_properties(d3d12_compute_journal PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+      # LEONIDA_SKIP_COMPUTE (diagnostic): a named compute program is not built and its direct and indirect dispatches
+      # are dropped, on the GPU, with the same counting module. The variable is read once, so each case is one run.
+      add_executable(d3d12_skip_compute_test test/d3d12_skip_compute_test.cpp ${_indirect_count_spv})
+      target_link_libraries(d3d12_skip_compute_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_skip_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+        LEONIDA_TEST_SKIP_COMPUTE_SPV="${_indirect_count_spv}")
+      target_compile_options(d3d12_skip_compute_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_skip_compute_unset COMMAND d3d12_skip_compute_test)
+      add_test(NAME d3d12_skip_compute_one COMMAND d3d12_skip_compute_test --skip-one)
+      add_test(NAME d3d12_skip_compute_all COMMAND d3d12_skip_compute_test --skip-all)
+      set_tests_properties(d3d12_skip_compute_unset d3d12_skip_compute_one d3d12_skip_compute_all
+                           PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
     # The cache vk_pipeline_check saves has to hit on the runtime's device (docs/pipeline_check.md): the test
