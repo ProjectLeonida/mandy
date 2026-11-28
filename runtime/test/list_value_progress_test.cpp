@@ -458,6 +458,95 @@ int main() {
         }  // ~QueueHolds() cleanly stops and joins barrier_thread_
     }
 
+    // 14. Round 10 WS3 QueueHolds::relay_wait redirect table, pruning, multi-wait substitution, and in-transit lookup:
+    {
+        struct RelayHolder final : leonida::QueueHolds<std::uint64_t>::Holder {
+            using Wait = leonida::QueueHolds<std::uint64_t>::Wait;
+            struct Op {
+                std::vector<std::uint64_t> sems;
+                std::vector<std::uint64_t> vals;
+            };
+            std::vector<Op> held;
+            std::atomic<unsigned> release_calls{0};
+            bool release_ready() override {
+                release_calls.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            void discard_waiting_on(std::uint64_t) override {}
+            std::uint64_t oldest_held_seq() override { return 0; }
+            bool apply_wait_relay(std::uint64_t gate_sem, std::uint64_t gate_val, std::span<const Wait> replacements,
+                                  bool& any_substituted) override {
+                bool updated = false;
+                for (Op& op : held) {
+                    const std::size_t n = op.sems.size();
+                    for (std::size_t i = 0; i < n; ++i) {
+                        if (op.sems[i] != gate_sem || op.vals[i] != gate_val) continue;
+                        any_substituted = true;
+                        updated = true;
+                        op.sems[i] = replacements[0].semaphore;
+                        op.vals[i] = replacements[0].value;
+                        for (std::size_t k = 1; k < replacements.size(); ++k) {
+                            op.sems.push_back(replacements[k].semaphore);
+                            op.vals.push_back(replacements[k].value);
+                        }
+                    }
+                }
+                return updated;
+            }
+        };
+
+        leonida::QueueHolds<std::uint64_t> holds;
+        RelayHolder holder;
+        holds.attach(&holder);
+        holds.add_fence(10, 0);  // gate fence (never signaled!)
+        holds.add_fence(20, 0);  // writer A
+        holds.add_fence(30, 0);  // writer B
+        holds.add_fence(40, 0);  // already-signaled gate
+        holds.signaled(40, 5, 0);
+
+        using Wait = leonida::QueueHolds<std::uint64_t>::Wait;
+        // Reject invalid relays (self-relay, empty, already-passed gate).
+        const Wait self_rep[] = {{10, 1, {}}};
+        CHECK(!holds.relay_wait(10, 1, self_rep));
+        CHECK(!holds.relay_wait(10, 1, {}));
+        const Wait ok_rep[] = {{20, 2, {}}};
+        CHECK(!holds.relay_wait(40, 5, ok_rep));  // gate 40 already at 5
+        CHECK(holds.active_relay_count() == 0);
+
+        // Multi-wait substitution in held op + consume_on_substitute immediate pruning + pump_ready() trigger.
+        holder.held.push_back({{10}, {1}});
+        holds.held_changed(1);
+        const Wait multi_rep[] = {{20, 2, {}}, {30, 3, {}}};
+        CHECK(holds.relay_wait(10, 1, multi_rep, /*consume_on_substitute=*/true));
+        CHECK(holds.active_relay_count() == 0);  // pruned immediately on substitute!
+        CHECK(holder.release_calls.load() >= 1);
+        CHECK((holder.held[0].sems == std::vector<std::uint64_t>{20, 30}));
+        CHECK((holder.held[0].vals == std::vector<std::uint64_t>{2, 3}));
+        CHECK(holds.pending(10, 1));  // gate 10 was NEVER signaled!
+        holds.held_changed(-1);
+
+        // In-transit lookup_relay() when apply_wait_relay finds nothing yet (race ordering), plus consume pruning.
+        const Wait single_rep[] = {{20, 4, {}}};
+        CHECK(holds.relay_wait(10, 2, single_rep, /*consume_on_substitute=*/true));
+        CHECK(holds.active_relay_count() == 1);  // retained for in-transit waiter
+        std::vector<Wait> found;
+        CHECK(holds.lookup_relay(10, 2, found));
+        CHECK(found.size() == 1 && found[0].semaphore == 20 && found[0].value == 4);
+        CHECK(holds.active_relay_count() == 0);  // consumed and pruned!
+        CHECK(!holds.lookup_relay(10, 2, found));
+
+        // Non-consuming relays prune cleanly when gate is later signaled past gate_val or fence is removed.
+        CHECK(holds.relay_wait(10, 3, single_rep, /*consume_on_substitute=*/false));
+        CHECK(holds.relay_wait(10, 7, single_rep, /*consume_on_substitute=*/false));
+        CHECK(holds.active_relay_count() == 2);
+        holds.signaled(10, 5, 0);
+        CHECK(holds.active_relay_count() == 1);  // val 3 pruned, val 7 kept
+        holds.remove_fence(20);
+        CHECK(holds.active_relay_count() == 0);  // replacement fence removed -> pruned
+
+        holds.detach(&holder);
+    }
+
     std::printf("list_value_progress_test: all checks passed\n");
     return 0;
 }

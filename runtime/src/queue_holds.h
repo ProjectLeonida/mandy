@@ -5,8 +5,10 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <span>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -87,6 +89,14 @@ inline bool any_progress() { return Registry::get().any_progress(); }
 template<class Semaphore>
 class QueueHolds {
 public:
+    // Replacement wait target for retroactive GPU-to-GPU wait relays. `pin` keeps the underlying fence object alive
+    // until the substituted submission retires on the GPU.
+    struct Wait {
+        Semaphore semaphore{};
+        std::uint64_t value = 0;
+        std::shared_ptr<void> pin;
+    };
+
     // A queue that can hold batches. The calls take the queue's own lock; none is made with it held.
     struct Holder {
         // Releases the held operations at the front of the queue whose waits are satisfied. True if any was.
@@ -98,6 +108,13 @@ public:
         // Notifies the holder that a real after_held() barrier was registered at `seq` so batches at or before `seq`
         // will not coalesce with batches enqueued after `seq`. Called with no queue lock held.
         virtual void note_barrier(std::uint64_t /*seq*/) {}
+        // Substitutes any queued/pending/held waits matching `(gate_sem, gate_val)` with `replacements`.
+        // Sets `any_substituted = true` when at least one matching wait was replaced; returns true when at least one
+        // held operation was updated (and may now be ready to release). Called with no QueueHolds lock held.
+        virtual bool apply_wait_relay(Semaphore /*gate_sem*/, std::uint64_t /*gate_val*/,
+                                      std::span<const Wait> /*replacements*/, bool& /*any_substituted*/) {
+            return false;
+        }
         // True when this queue has submitted GPU work that has not retired yet. Must not take any QueueHolds or
         // queue lock (called under holders_use_mutex_ shared lock from any_progress()).
         virtual bool has_pending_gpu_work() const { return false; }
@@ -172,10 +189,33 @@ public:
     // from inside a release: the releasing thread already holds the lock, and what it is releasing cannot
     // reference a fence whose last reference it is dropping, since that reference is the one it holds.
     void remove_fence(Semaphore semaphore) {
+        std::vector<std::shared_ptr<void>> dropped_pins;
         {
             std::lock_guard lock(mutex_);
             fences_.erase(semaphore);
+            if (!relays_.empty()) {
+                for (auto it = relays_.begin(); it != relays_.end();) {
+                    bool match = (it->gate_sem == semaphore);
+                    if (!match) {
+                        for (const Wait& w : it->replacements) {
+                            if (w.semaphore == semaphore) {
+                                match = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (match) {
+                        for (Wait& w : it->replacements)
+                            if (w.pin) dropped_pins.push_back(std::move(w.pin));
+                        it = relays_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                relay_count_.store(relays_.size(), std::memory_order_release);
+            }
         }
+        dropped_pins.clear();
         if (held_.load(std::memory_order_acquire) == 0 || in_pump()) return;
         {
             std::lock_guard pump(pump_mutex_);
@@ -193,6 +233,7 @@ public:
     // unrelated fences or GPU-only signals never force redundant global visibility refreshes.
     void signaled(Semaphore semaphore, std::uint64_t value, std::uint64_t vis_seq = 0) {
         bool advanced = false;
+        std::vector<std::shared_ptr<void>> dropped_pins;
         {
             std::lock_guard lock(mutex_);
             const auto it = fences_.find(semaphore);
@@ -212,9 +253,107 @@ public:
                     }
                 }
             }
+            if (!relays_.empty()) {
+                for (auto rit = relays_.begin(); rit != relays_.end();) {
+                    if (rit->gate_sem == semaphore && rit->gate_val <= value) {
+                        for (Wait& w : rit->replacements)
+                            if (w.pin) dropped_pins.push_back(std::move(w.pin));
+                        rit = relays_.erase(rit);
+                    } else {
+                        ++rit;
+                    }
+                }
+                relay_count_.store(relays_.size(), std::memory_order_release);
+            }
         }
+        dropped_pins.clear();
         if (advanced && any_held()) signaled_unpumped_.store(true, std::memory_order_release);
     }
+
+    // Retroactively redirects any queued, pending, or held wait on `(gate_sem, gate_val)` to `replacements`
+    // (GPU-to-GPU timeline waits, never GPU-signaling `gate_sem`), then calls pump_ready() so newly-unblocked held
+    // ops release immediately. When `consume_on_substitute` is true (single-owner gate fences), the redirect entry is
+    // pruned immediately once substituted (or once consumed by an in-transit lookup_relay).
+    bool relay_wait(Semaphore gate_sem, std::uint64_t gate_val, std::span<const Wait> replacements,
+                    bool consume_on_substitute = false) {
+        if (!gate_sem || !gate_val || replacements.empty()) return false;
+        for (const Wait& w : replacements) {
+            if (!w.semaphore || w.semaphore == gate_sem) return false;
+        }
+        std::vector<std::shared_ptr<void>> dropped_pins;
+        {
+            std::lock_guard lock(mutex_);
+            const auto fit = fences_.find(gate_sem);
+            if (fit != fences_.end() && fit->second.value >= gate_val) return false;
+            for (const WaitRelay& existing : relays_) {
+                if (existing.gate_sem == gate_sem && existing.gate_val == gate_val) return false;
+            }
+            while (relays_.size() >= kMaxRelays) {
+                for (Wait& w : relays_.front().replacements)
+                    if (w.pin) dropped_pins.push_back(std::move(w.pin));
+                relays_.pop_front();
+            }
+            relays_.push_back(WaitRelay{gate_sem, gate_val,
+                                        std::vector<Wait>(replacements.begin(), replacements.end()),
+                                        consume_on_substitute});
+            relay_count_.store(relays_.size(), std::memory_order_release);
+        }
+        dropped_pins.clear();
+
+        WorkGuard relaying(*this);
+        bool any_held_updated = false;
+        bool any_substituted = false;
+        {
+            std::shared_lock use(holders_use_mutex_);
+            for (Holder* holder : snapshot()) {
+                bool sub = false;
+                if (holder->apply_wait_relay(gate_sem, gate_val, replacements, sub)) any_held_updated = true;
+                if (sub) any_substituted = true;
+            }
+        }
+        if (consume_on_substitute && any_substituted) {
+            {
+                std::lock_guard lock(mutex_);
+                for (auto it = relays_.begin(); it != relays_.end(); ++it) {
+                    if (it->gate_sem == gate_sem && it->gate_val == gate_val) {
+                        for (Wait& w : it->replacements)
+                            if (w.pin) dropped_pins.push_back(std::move(w.pin));
+                        relays_.erase(it);
+                        relay_count_.store(relays_.size(), std::memory_order_release);
+                        break;
+                    }
+                }
+            }
+            dropped_pins.clear();
+        }
+        if (any_held_updated || (any_substituted && any_held())) {
+            if (any_held()) signaled_unpumped_.store(true, std::memory_order_release);
+            pump_ready();
+        }
+        return true;
+    }
+
+    // Checks whether `(gate_sem, gate_val)` has an active wait redirect (catching waits in transit between an async
+    // inbox pop and state_mutex_). Lock-free fast path when no redirects are active.
+    bool lookup_relay(Semaphore gate_sem, std::uint64_t gate_val, std::vector<Wait>& out) {
+        if (!gate_sem || !gate_val || relay_count_.load(std::memory_order_acquire) == 0) return false;
+        std::lock_guard lock(mutex_);
+        for (auto it = relays_.begin(); it != relays_.end(); ++it) {
+            if (it->gate_sem == gate_sem && it->gate_val == gate_val) {
+                if (it->consume_on_substitute) {
+                    out = std::move(it->replacements);
+                    relays_.erase(it);
+                    relay_count_.store(relays_.size(), std::memory_order_release);
+                } else {
+                    out = it->replacements;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::size_t active_relay_count() const noexcept { return relay_count_.load(std::memory_order_acquire); }
 
     // Minimum CPU visibility epoch established by a CPU Fence::Signal that reached `wait_value` on `semaphore`
     // (0 when `semaphore` has never received a CPU signal).
@@ -396,6 +535,14 @@ public:
 
 private:
     static constexpr std::size_t kMaxFenceVisHistory = 32;
+    static constexpr std::size_t kMaxRelays = 256;
+
+    struct WaitRelay {
+        Semaphore gate_sem{};
+        std::uint64_t gate_val = 0;
+        std::vector<Wait> replacements;
+        bool consume_on_substitute = false;
+    };
 
     struct FenceState {
         std::uint64_t value = 0;
@@ -542,6 +689,8 @@ private:
     std::atomic<std::uint64_t> active_barrier_min_seq_{0};  // 0 if none, else min(seq)+1 of running/ready barriers
     mutable std::shared_mutex holders_use_mutex_;  // shared by has_progress(), unique in detach() after erasing holder
     std::unordered_map<Semaphore, FenceState> fences_;
+    std::deque<WaitRelay> relays_;
+    std::atomic<std::size_t> relay_count_{0};
     std::vector<Holder*> holders_;
     std::deque<Barrier> barriers_;
     std::deque<Barrier> ready_barriers_;

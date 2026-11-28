@@ -21052,6 +21052,19 @@ public:
                 state_.refresh_page_mirror();  // what this submission's title-written addresses read
                 t2 = phases::now_ns();
             }
+            // Flush sparse binds and run title texture refresh immediately after refresh_page_mirror() so concurrent
+            // xmem remaps during refresh_shadows()/geometry.refresh() do not force in_feed CPU fallbacks, and so
+            // newly-published streamed textures bind on the same submission in refresh_shadows() below.
+            {
+                const phases::Scope timed(phases::shadows);
+                state_.flush_page_mirror();
+            }
+            const std::int64_t t_flush1 = phases::now_ns();
+            {
+                const phases::Scope timed(phases::textures);
+                refresh_title_textures(/*mirror_just_synced=*/true, mirror_serial);
+            }
+            const std::int64_t t_tex1 = phases::now_ns();
             bool full = true;
             if (per_frame) {
                 const std::uint64_t serial = phases::totals().present_serial.load(std::memory_order_relaxed);
@@ -21078,22 +21091,28 @@ public:
             }
             // Last, once the heap refresh, the windows and the geometry copies have made what this submission reads.
             state_.update_address_guard();
-            const std::int64_t t3 = phases::now_ns();
+            const std::int64_t t_shadows = phases::now_ns();
+            // Mandatory 2nd O(1) flush for any plain-page sparse binds added by finish_in_place() -> fix_vsharp().
             {
                 const phases::Scope timed(phases::shadows);
                 state_.flush_page_mirror();
             }
-            const std::int64_t t4 = phases::now_ns();
-            {
-                const phases::Scope timed(phases::textures);
-                refresh_title_textures(/*mirror_just_synced=*/true, mirror_serial);
+            const std::int64_t t_flush2 = phases::now_ns();
+            std::uint64_t tex2_ns = 0;
+            // Mandatory trailing texture refresh only if refresh_shadows() newly named a first-time slot-133 texture.
+            if (state_.titles_named_pending.load(std::memory_order_acquire)) {
+                const std::int64_t t_tex2_start = phases::now_ns();
+                {
+                    const phases::Scope timed(phases::textures);
+                    refresh_title_textures(/*mirror_just_synced=*/true, mirror_serial);
+                }
+                tex2_ns = std::uint64_t(phases::now_ns() - t_tex2_start);
             }
-            const std::int64_t t5 = phases::now_ns();
             leader_guard.wb_ns = std::uint64_t(t1 - t0);
             leader_guard.mirror_ns = std::uint64_t(t2 - t1);
-            leader_guard.shadows_ns = std::uint64_t(t3 - t2);
-            leader_guard.flush_ns = std::uint64_t(t4 - t3);
-            leader_guard.tex_ns = std::uint64_t(t5 - t4);
+            leader_guard.shadows_ns = std::uint64_t(t_shadows - t_tex1);
+            leader_guard.flush_ns = std::uint64_t(t_flush1 - t2) + std::uint64_t(t_flush2 - t_shadows);
+            leader_guard.tex_ns = std::uint64_t(t_tex1 - t_flush1) + tex2_ns;
             leader_guard.completed = true;
         });
         {
@@ -22959,6 +22978,59 @@ public:
             const std::uint64_t probes_before = stats.probes[0];
             std::uint64_t pass_back_ns = 0;
 
+            // Skip VirtualQuery in Stage 2b ONLY when `!t.mapped` AND every 64 KiB tile of `[t.cpu, t.cpu + size)`
+            // has all 16 `Cell::restore[0..15] != 0` under `geometry_writes::state().mutex` (proving MEM_COMMIT +
+            // readable; Look::armed alone also covers MEM_RESERVE/PAGE_NOACCESS and is never sufficient).
+            std::vector<std::uint8_t> tile_proven_readable;
+            if (check_pages_before_read()) {
+                bool any_need_probe = false;
+                for (std::size_t idx = 0; idx < title_candidates_.size(); ++idx) {
+                    if (title_examine_results_[idx].look == leonida::TitleTextureWatch<TitleTextureCells>::Look::busy)
+                        continue;
+                    const TitleTexture& t = *title_candidates_[idx].entry;
+                    if (!t.mapped && t.memory.needs_probe(0, true, true)) {
+                        any_need_probe = true;
+                        break;
+                    }
+                }
+                if (any_need_probe) {
+                    tile_proven_readable.assign(title_candidates_.size(), 0);
+                    auto& gs = leonida::geometry_writes::state();
+                    std::lock_guard gs_lock(gs.mutex);
+                    constexpr std::uintptr_t kTile = leonida::geometry_writes::tile_size;
+                    for (std::size_t idx = 0; idx < title_candidates_.size(); ++idx) {
+                        if (title_examine_results_[idx].look ==
+                            leonida::TitleTextureWatch<TitleTextureCells>::Look::busy)
+                            continue;
+                        const TitleTexture& t = *title_candidates_[idx].entry;
+                        if (t.mapped || !t.memory.needs_probe(0, true, true)) continue;
+                        const std::uintptr_t cpu = static_cast<std::uintptr_t>(t.cpu);
+                        const std::uint64_t size = t.layout.layout.size;
+                        if (!cpu || !size || size > (std::numeric_limits<std::uintptr_t>::max)() - cpu) continue;
+                        const std::uintptr_t first_tile = cpu & ~(kTile - 1);
+                        const std::uintptr_t last_tile = (cpu + static_cast<std::uintptr_t>(size) - 1) & ~(kTile - 1);
+                        const std::size_t n_tiles = std::size_t((last_tile - first_tile) / kTile) + 1;
+                        auto it = gs.cells.lower_bound(first_tile);
+                        std::uintptr_t tile = first_tile;
+                        bool all_restored = true;
+                        for (std::size_t ti = 0; ti < n_tiles; ++ti, tile += kTile, ++it) {
+                            if (it == gs.cells.end() || it->first != tile) {
+                                all_restored = false;
+                                break;
+                            }
+                            for (const DWORD r : it->second.restore) {
+                                if (!r) {
+                                    all_restored = false;
+                                    break;
+                                }
+                            }
+                            if (!all_restored) break;
+                        }
+                        if (all_restored) tile_proven_readable[idx] = 1;
+                    }
+                }
+            }
+
             for (std::size_t idx = 0; idx < title_candidates_.size(); ++idx) {
                 TitleCandidate& cand = title_candidates_[idx];
                 TitleTexture& t = *cand.entry;
@@ -22969,7 +23041,14 @@ public:
                     continue;
                 }
                 ++stats.checked;
-                if (!title_texture_readable(t, &stage2_vq_cache)) {
+                bool readable = false;
+                if (!tile_proven_readable.empty() && tile_proven_readable[idx]) {
+                    t.readable_from = 0;
+                    readable = t.memory.check(0, true, [&] { return true; }, true);
+                } else {
+                    readable = title_texture_readable(t, &stage2_vq_cache);
+                }
+                if (!readable) {
                     not_filled(t);
                     if (have_mirror) title_mirror_checks_[idx].active = false;
                     continue;

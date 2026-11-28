@@ -1354,7 +1354,8 @@ public:
         progress_watch_ = {};  // stop before queues, timelines or diagnostic state go away
         gpu_labels_.stop(device_);
         fence_dispatcher_.reset();
-        gpu_profile_.stop();  // after the fence callbacks that hold its recordings
+        stop_profile_resolver();  // drain/join profile resolver before destroying idle query pools
+        gpu_profile_.stop();      // after the fence callbacks and profile resolver that hold its recordings
         deletion_queue_.drain(UINT64_MAX, device_, vk);
         for (const auto& [key, framebuffer] : resolve_framebuffers_)
             vk.vkDestroyFramebuffer(device_, framebuffer, nullptr);
@@ -1595,6 +1596,21 @@ public:
     }
     // LEONIDA_GPU_PROFILE=1: the GPU time per pipeline (vulkan_gpu_profile.h). Tests read its sums.
     gpu_profile::Profiler& gpu_profile() { return gpu_profile_; }
+
+    // Hands a completed GPU profile recording off the FenceWaitDispatcher thread onto a dedicated lazy resolver
+    // thread so vkGetQueryPoolResults / Profiler::mutex_ / periodic stderr reports never delay SetEventOnCompletion.
+    void enqueue_profile_resolve(std::shared_ptr<gpu_profile::Recording> recording) {
+        if (!recording) return;
+        {
+            std::lock_guard lock(profile_resolve_mutex_);
+            if (profile_resolve_stop_) return;
+            if (!profile_resolve_thread_.joinable()) {
+                profile_resolve_thread_ = std::thread([this] { profile_resolve_loop(); });
+            }
+            profile_resolve_queue_.push_back(std::move(recording));
+        }
+        profile_resolve_cv_.notify_one();
+    }
     // True where a timestamp resolve must be ordered explicitly after the timestamps it copies (MoltenVK on Apple
     // GPUs, docs/d3d12_vulkan.md section 4.6). Set by the device before any queue uses it.
     bool order_timestamp_copies() const { return order_timestamp_copies_; }
@@ -2728,6 +2744,42 @@ private:
     std::vector<std::uint32_t> timestamp_bits_;  // by queue family (set_timestamp_bits)
     gpu_profile::Profiler gpu_profile_;          // LEONIDA_GPU_PROFILE=1
     gpu_profile::NameMap profile_names_;         // its pipeline names, guarded by pipeline_mutex_
+    std::mutex profile_resolve_mutex_;
+    std::condition_variable profile_resolve_cv_;
+    std::deque<std::shared_ptr<gpu_profile::Recording>> profile_resolve_queue_;
+    std::thread profile_resolve_thread_;
+    bool profile_resolve_stop_ = false;
+
+    void profile_resolve_loop() {
+        for (;;) {
+            std::deque<std::shared_ptr<gpu_profile::Recording>> batch;
+            {
+                std::unique_lock lock(profile_resolve_mutex_);
+                profile_resolve_cv_.wait(lock, [this] {
+                    return profile_resolve_stop_ || !profile_resolve_queue_.empty();
+                });
+                if (profile_resolve_queue_.empty()) {
+                    if (profile_resolve_stop_) return;
+                    continue;
+                }
+                batch.swap(profile_resolve_queue_);
+            }
+            for (auto& rec : batch) {
+                gpu_profile_.resolve(*rec);
+                rec.reset();
+            }
+        }
+    }
+
+    void stop_profile_resolver() {
+        {
+            std::lock_guard lock(profile_resolve_mutex_);
+            profile_resolve_stop_ = true;
+        }
+        profile_resolve_cv_.notify_all();
+        if (profile_resolve_thread_.joinable()) profile_resolve_thread_.join();
+        profile_resolve_queue_.clear();
+    }
     bool order_timestamp_copies_ = false;
     VkPhysicalDeviceMemoryProperties occlusion_resolve_memory_{};
     label::Completions gpu_labels_;
@@ -2811,7 +2863,26 @@ public:
 
     // ID3D12Fence::Signal from the CPU. Vulkan timelines only increase: a value at or below the current one is
     // ignored (D3D12 would set it), and the caller is told.
-    bool signal(std::uint64_t value) {
+    bool signal(std::uint64_t value) { return signal_impl(value, true); }
+
+    // GPU-to-GPU relay signal (vis_seq = 0): signals the timeline semaphore from the CPU without bumping
+    // visibility_seq_, for list_values gates whose waits were met strictly by GPU writes landed via Pump::land().
+    bool signal_gpu_relay(std::uint64_t value) { return signal_impl(value, false); }
+
+    // true when the value was reached within the timeout.
+    bool wait(std::uint64_t value, std::uint64_t timeout_ns) const {
+        VkSemaphoreWaitInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        info.semaphoreCount = 1;
+        info.pSemaphores = &semaphore_;
+        info.pValues = &value;
+        const VkResult result = context_.observe_result(
+            context_.vk.vkWaitSemaphores(context_.device(), &info, timeout_ns), "vkWaitSemaphores");
+        if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+        return result == VK_SUCCESS;
+    }
+
+private:
+    bool signal_impl(std::uint64_t value, bool bump_vis_seq) {
         // The dispatcher may be testing a failed counter query. Do not call completed() here:
         // it marks the context lost on a query error and prevents the dispatcher from waking.
         if (context_.is_device_lost()) return false;
@@ -2829,25 +2900,13 @@ public:
         if (result != VK_SUCCESS) return false;
         {
             QueueHolds<VkSemaphore>::WorkGuard active(context_.holds());
-            context_.holds().signaled(semaphore_, value, context_.next_visibility_seq());  // queues held on this fence run with this CPU visibility epoch
+            const std::uint64_t vis_seq = bump_vis_seq ? context_.next_visibility_seq() : 0;
+            context_.holds().signaled(semaphore_, value, vis_seq);
             context_.holds().pump_ready();
         }
         return true;
     }
 
-    // true when the value was reached within the timeout.
-    bool wait(std::uint64_t value, std::uint64_t timeout_ns) const {
-        VkSemaphoreWaitInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-        info.semaphoreCount = 1;
-        info.pSemaphores = &semaphore_;
-        info.pValues = &value;
-        const VkResult result = context_.observe_result(
-            context_.vk.vkWaitSemaphores(context_.device(), &info, timeout_ns), "vkWaitSemaphores");
-        if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
-        return result == VK_SUCCESS;
-    }
-
-private:
     VulkanContext& context_;
     VkSemaphore semaphore_ = VK_NULL_HANDLE;
 };
@@ -3367,14 +3426,26 @@ public:
 
     void wait_sync(VkSemaphore fence, std::uint64_t value, const PinFn& pin, std::shared_ptr<void> async_pin = {},
                    bool already_tracked = false) {
-        if (!already_tracked) context_.note_wait_added(fence, value);
+        std::vector<QueueHolds<VkSemaphore>::Wait> replacements;
         std::vector<std::shared_ptr<void>> retired;  // fences whose submission has completed: released unlocked
         {
             std::lock_guard state(state_mutex_);
-            waits_.push_back(fence);
-            wait_values_.push_back(value);
-            if (async_pin) wait_pins_.push_back(std::move(async_pin));
-            else if (pin) wait_pins_.push_back(pin());
+            if (context_.holds().lookup_relay(fence, value, replacements)) {
+                if (already_tracked) context_.note_wait_removed(fence, value);
+                if (async_pin) retired.push_back(std::move(async_pin));
+                for (auto& rep : replacements) {
+                    context_.note_wait_added(rep.semaphore, rep.value);
+                    waits_.push_back(rep.semaphore);
+                    wait_values_.push_back(rep.value);
+                    if (rep.pin) wait_pins_.push_back(std::move(rep.pin));
+                }
+            } else {
+                if (!already_tracked) context_.note_wait_added(fence, value);
+                waits_.push_back(fence);
+                wait_values_.push_back(value);
+                if (async_pin) wait_pins_.push_back(std::move(async_pin));
+                else if (pin) wait_pins_.push_back(pin());
+            }
             drain_pins(retired);
         }
     }
@@ -4631,11 +4702,12 @@ private:
         if (submitted && wrote_buffer && context_.on_buffer_write_submitted_)
             context_.on_buffer_write_submitted_(context_.submitted_retire_ticket());
         if (profile && submitted) {
-            // Read once this submission (ticket submitted_ on progress_) is done; the pool is reused after that.
+            // Read once this submission (ticket submitted_ on progress_) is done; resolve off the FenceWaitDispatcher
+            // thread so timestamp readback and reporting never delay SetEventOnCompletion wakeups.
             profile->mark_submitted();
             std::shared_ptr<gpu_profile::Recording> recording(std::move(profile));
-            context_.enqueue_fence_callback(progress_, submitted_, [profiler = &context_.gpu_profile_, recording] {
-                profiler->resolve(*recording);
+            context_.enqueue_fence_callback(progress_, submitted_, [ctx = &context_, recording] {
+                ctx->enqueue_profile_resolve(recording);
             });
         }
         if (mesh_draws)
@@ -5437,6 +5509,98 @@ private:
             }
             update_held_front_seq_locked();
         }
+    }
+
+    // Holder: substitutes matching waits across inbox_, waits_, and held_ for a retroactive GPU-to-GPU relay.
+    // Keeps context_.note_wait_added / note_wait_removed and QueueHolds held/work counts balanced.
+    bool apply_wait_relay(VkSemaphore gate_sem, std::uint64_t gate_val,
+                          std::span<const QueueHolds<VkSemaphore>::Wait> replacements,
+                          bool& any_substituted) override {
+        if (!gate_sem || !gate_val || replacements.empty()) return false;
+        std::vector<std::shared_ptr<void>> retired_pins;
+        if (async_started_.load(std::memory_order_acquire)) {
+            std::lock_guard lock(inbox_mutex_);
+            for (std::size_t i = 0; i < inbox_.size(); ++i) {
+                Call& c = inbox_[i];
+                if (c.kind != Call::Kind::wait || c.fence != gate_sem || c.value != gate_val) continue;
+                any_substituted = true;
+                context_.note_wait_removed(gate_sem, gate_val);
+                if (c.pin) retired_pins.push_back(std::move(c.pin));
+                c.fence = replacements[0].semaphore;
+                c.value = replacements[0].value;
+                c.pin = replacements[0].pin;
+                context_.note_wait_added(c.fence, c.value);
+                if (replacements.size() > 1) {
+                    const bool orig_barrier = c.barrier_after;
+                    const std::uint64_t seq = c.seq;
+                    const std::uint64_t epoch = c.present_epoch;
+                    const auto queued_at = c.queued_at;
+                    c.barrier_after = false;
+                    std::vector<Call> extras;
+                    extras.reserve(replacements.size() - 1);
+                    for (std::size_t k = 1; k < replacements.size(); ++k) {
+                        Call extra;
+                        extra.kind = Call::Kind::wait;
+                        extra.seq = seq;
+                        extra.present_epoch = epoch;
+                        extra.queued_at = queued_at;
+                        extra.barrier_after = (k + 1 == replacements.size()) ? orig_barrier : false;
+                        extra.fence = replacements[k].semaphore;
+                        extra.value = replacements[k].value;
+                        extra.pin = replacements[k].pin;
+                        context_.note_wait_added(extra.fence, extra.value);
+                        extras.push_back(std::move(extra));
+                    }
+                    const std::int64_t added = static_cast<std::int64_t>(extras.size());
+                    context_.holds().held_changed(added);
+                    context_.holds().work_changed(added);
+                    inbox_.insert(inbox_.begin() + static_cast<std::ptrdiff_t>(i + 1),
+                                  std::make_move_iterator(extras.begin()), std::make_move_iterator(extras.end()));
+                    i += extras.size();
+                }
+            }
+        }
+        bool any_held_updated = false;
+        {
+            std::lock_guard state(state_mutex_);
+            const std::size_t orig_waits = waits_.size();
+            for (std::size_t i = 0; i < orig_waits; ++i) {
+                if (waits_[i] != gate_sem || wait_values_[i] != gate_val) continue;
+                any_substituted = true;
+                context_.note_wait_removed(gate_sem, gate_val);
+                waits_[i] = replacements[0].semaphore;
+                wait_values_[i] = replacements[0].value;
+                context_.note_wait_added(replacements[0].semaphore, replacements[0].value);
+                if (replacements[0].pin) wait_pins_.push_back(replacements[0].pin);
+                for (std::size_t k = 1; k < replacements.size(); ++k) {
+                    waits_.push_back(replacements[k].semaphore);
+                    wait_values_.push_back(replacements[k].value);
+                    context_.note_wait_added(replacements[k].semaphore, replacements[k].value);
+                    if (replacements[k].pin) wait_pins_.push_back(replacements[k].pin);
+                }
+            }
+            for (Deferred& op : held_) {
+                const std::size_t orig_op_waits = op.waits.size();
+                for (std::size_t i = 0; i < orig_op_waits; ++i) {
+                    if (op.waits[i] != gate_sem || op.wait_values[i] != gate_val) continue;
+                    any_substituted = true;
+                    any_held_updated = true;
+                    context_.note_wait_removed(gate_sem, gate_val);
+                    op.waits[i] = replacements[0].semaphore;
+                    op.wait_values[i] = replacements[0].value;
+                    context_.note_wait_added(replacements[0].semaphore, replacements[0].value);
+                    if (replacements[0].pin) op.wait_pins.push_back(replacements[0].pin);
+                    for (std::size_t k = 1; k < replacements.size(); ++k) {
+                        op.waits.push_back(replacements[k].semaphore);
+                        op.wait_values.push_back(replacements[k].value);
+                        context_.note_wait_added(replacements[k].semaphore, replacements[k].value);
+                        if (replacements[k].pin) op.wait_pins.push_back(replacements[k].pin);
+                    }
+                }
+            }
+        }
+        retired_pins.clear();
+        return any_held_updated;
     }
 
     // Holder: records a real after_held() barrier at `seq` so batches at or before `seq` never coalesce with batches
@@ -6402,11 +6566,24 @@ private:
         std::vector<std::shared_ptr<void>> retired;
         std::vector<EnqueueSerial> dropped_serials;
         auto hold_all_locked = [&] {
+            std::vector<QueueHolds<VkSemaphore>::Wait> replacements;
             for (Call& call : calls) {
                 if (call.kind == Call::Kind::wait) {
-                    waits_.push_back(call.fence);
-                    wait_values_.push_back(call.value);
-                    if (call.pin) wait_pins_.push_back(std::move(call.pin));
+                    replacements.clear();
+                    if (context_.holds().lookup_relay(call.fence, call.value, replacements)) {
+                        context_.note_wait_removed(call.fence, call.value);
+                        if (call.pin) retired.push_back(std::move(call.pin));
+                        for (auto& rep : replacements) {
+                            context_.note_wait_added(rep.semaphore, rep.value);
+                            waits_.push_back(rep.semaphore);
+                            wait_values_.push_back(rep.value);
+                            if (rep.pin) wait_pins_.push_back(std::move(rep.pin));
+                        }
+                    } else {
+                        waits_.push_back(call.fence);
+                        wait_values_.push_back(call.value);
+                        if (call.pin) wait_pins_.push_back(std::move(call.pin));
+                    }
                     continue;
                 }
                 async_seq_ = call.seq;

@@ -2528,6 +2528,231 @@ int queue_sync_and_async() {
         std::printf("queue r8 ws3: empty-batch skip+vis carry, completed-wait coalescing, dedicated barrier thread ok\n");
     }
 
+    // 9. Round 10 WS3: VulkanFence::signal_gpu_relay() (vis_seq = 0 vs CPU Signal vis_seq > 0) and retroactive
+    //    QueueHolds::relay_wait() (single-wait in held_, multi-wait in held_ & inbox_, in-transit race ordering,
+    //    never signaling gate_sem, balanced note_wait_added/removed & active_work_).
+    {
+        VulkanContext context(d.device_proc, d.device, true);
+        EXPECT(context.loaded());
+        VulkanQueue direct(context, d.queue, d.family, VulkanQueue::QueueKind::direct);
+        VulkanQueue compute_a(context, d.queue, d.family, VulkanQueue::QueueKind::compute);
+        VulkanQueue compute_b(context, d.queue, d.family, VulkanQueue::QueueKind::compute);
+        EXPECT(direct.ok() && compute_a.ok() && compute_b.ok());
+        direct.set_async_depth(4);
+        compute_a.set_async_depth(4);
+        compute_b.set_async_depth(4);
+        compute_a.set_skip_before_execute(true);
+        compute_b.set_skip_before_execute(true);
+
+        void* src_map = nullptr;
+        void* mid_map = nullptr;
+        void* dst_map = nullptr;
+        VkBuffer src = d.buffer(kBufBytes, usage, &src_map);
+        VkBuffer mid = d.buffer(kBufBytes, usage, &mid_map);
+        VkBuffer dst = d.buffer(kBufBytes, usage, &dst_map);
+        EXPECT(src && mid && dst);
+        auto* sb = static_cast<std::uint8_t*>(src_map);
+        auto* mb = static_cast<std::uint8_t*>(mid_map);
+        auto* db = static_cast<std::uint8_t*>(dst_map);
+        std::memset(sb, 0, kBufBytes);
+        std::memset(mb, 0, kBufBytes);
+        std::memset(db, 0, kBufBytes);
+        sb[0] = 0x5A;
+        sb[16] = 0x6B;
+        sb[32] = 0x7C;
+
+        ResourceBinding r_src{}, r_mid{}, r_dst{};
+        r_src.buffer = src;
+        r_src.size = kBufBytes;
+        r_mid.buffer = mid;
+        r_mid.size = kBufBytes;
+        r_dst.buffer = dst;
+        r_dst.size = kBufBytes;
+        r_dst.host_readable = true;
+        context.add_resource(1, r_src);
+        context.add_resource(2, r_mid);
+        context.add_resource(3, r_dst);
+
+        std::atomic<unsigned> before_calls{0};
+        std::atomic<std::uint64_t> last_req_seq{0};
+        context.set_before_execute([&] {
+            before_calls.fetch_add(1, std::memory_order_acq_rel);
+            last_req_seq.store(VulkanContext::current_before_execute_seq(), std::memory_order_release);
+        });
+
+        auto empty_list = std::make_shared<CommandList>();
+        EXPECT(empty_list->close());
+        std::shared_ptr<const CommandList> empty_snap = empty_list;
+
+        // (a) GPU-met signal_gpu_relay (vis_seq = 0) vs CPU-met signal (vis_seq > 0).
+        {
+            VulkanFence gate_gpu(context, 0), gate_cpu(context, 0), done_a(context, 0), done_b(context, 0);
+            EXPECT(gate_gpu.semaphore() && gate_cpu.semaphore() && done_a.semaphore() && done_b.semaphore());
+
+            direct.wait(gate_gpu.semaphore(), 1);
+            EXPECT(direct.execute({&empty_snap, 1}) == ReplayResult::success);
+            const std::uint64_t seq_after_enqueue = context.current_visibility_seq();
+            EXPECT(direct.signal(done_a.semaphore(), 1));
+            EXPECT(direct.idle());
+            EXPECT(before_calls.load(std::memory_order_acquire) == 0);
+
+            EXPECT(gate_gpu.signal_gpu_relay(1));
+            EXPECT(context.current_visibility_seq() == seq_after_enqueue);  // vis_seq NOT bumped!
+            EXPECT(context.holds().signaled_vis_seq(gate_gpu.semaphore(), 1) == 0);
+            EXPECT(done_a.wait(1, 5'000'000'000ull));
+            EXPECT(direct.idle());
+            EXPECT(before_calls.load(std::memory_order_acquire) == 1);
+            EXPECT(last_req_seq.load(std::memory_order_acquire) == seq_after_enqueue);
+
+            // CPU-met signal MUST bump visibility_seq and propagate into before_execute_().
+            direct.wait(gate_cpu.semaphore(), 1);
+            EXPECT(direct.execute({&empty_snap, 1}) == ReplayResult::success);
+            const std::uint64_t seq_before_cpu = context.current_visibility_seq();
+            EXPECT(direct.signal(done_b.semaphore(), 1));
+            EXPECT(direct.idle());
+
+            EXPECT(gate_cpu.signal(1));
+            const std::uint64_t cpu_vis = context.holds().signaled_vis_seq(gate_cpu.semaphore(), 1);
+            EXPECT(cpu_vis > seq_before_cpu);
+            EXPECT(done_b.wait(1, 5'000'000'000ull));
+            EXPECT(direct.idle());
+            EXPECT(last_req_seq.load(std::memory_order_acquire) >= cpu_vis);
+        }
+
+        // (b) Retroactive single-wait relay in held_: direct waits on gate_single, compute_a writes mid[0],
+        //     relay_wait redirects (gate_single, 1) -> (written_a, 1) WITHOUT signaling gate_single!
+        {
+            std::memset(mb, 0, kBufBytes);
+            std::memset(db, 0, kBufBytes);
+            before_calls.store(0, std::memory_order_release);
+            last_req_seq.store(0, std::memory_order_release);
+
+            auto write_mid0 = make_copy_list(2, 0, 1, 0, 1);  // mid[0] = 0x5A
+            auto read_mid0 = make_copy_list(3, 0, 2, 0, 1);   // dst[0] = mid[0]
+            EXPECT(write_mid0 && read_mid0);
+            std::shared_ptr<const CommandList> sw = write_mid0, sr = read_mid0;
+
+            VulkanFence gate_single(context, 0), written_a(context, 0), done_s(context, 0);
+            EXPECT(gate_single.semaphore() && written_a.semaphore() && done_s.semaphore());
+
+            direct.wait(gate_single.semaphore(), 1);
+            EXPECT(direct.execute({&sr, 1}) == ReplayResult::success);
+            const std::uint64_t seq_after_direct = context.current_visibility_seq();
+            EXPECT(direct.signal(done_s.semaphore(), 1));
+            EXPECT(direct.idle());  // sr is held behind gate_single
+            EXPECT(before_calls.load(std::memory_order_acquire) == 0);
+
+            EXPECT(compute_a.execute({&sw, 1}) == ReplayResult::success);
+            EXPECT(compute_a.signal(written_a.semaphore(), 1));
+
+            const QueueHolds<VkSemaphore>::Wait rep[] = {{written_a.semaphore(), 1, {}}};
+            EXPECT(context.holds().relay_wait(gate_single.semaphore(), 1, rep, /*consume_on_substitute=*/true));
+            EXPECT(done_s.wait(1, 5'000'000'000ull));
+            EXPECT(direct.idle() && compute_a.idle());
+            EXPECT(gate_single.completed() == 0);  // gate_single was NEVER signaled!
+            EXPECT(db[0] == 0x5A);                 // GPU ordering preserved!
+            EXPECT(context.current_visibility_seq() == seq_after_direct);
+            EXPECT(last_req_seq.load(std::memory_order_acquire) == seq_after_direct);
+            EXPECT(context.holds().active_relay_count() == 0);
+            EXPECT(!context.has_unsatisfied_waiter(gate_single.semaphore(), 1));
+        }
+
+        // (c) Retroactive multi-wait relay in held_ (two distinct writers, one initially blocked) AND in inbox_
+        //     (expanding 1 Call::Kind::wait into 2 Calls while async_worker is busy inside before_execute_()).
+        {
+            std::memset(mb, 0, kBufBytes);
+            std::memset(db, 0, kBufBytes);
+            auto write_m1 = make_copy_list(2, 16, 1, 16, 1);  // mid[16] = 0x6B
+            auto write_m2 = make_copy_list(2, 32, 1, 32, 1);  // mid[32] = 0x7C
+            auto read_both = std::make_shared<CommandList>();
+            EXPECT(read_both->copy_buffer({3, 16, 2, 16, 1}) && read_both->copy_buffer({3, 32, 2, 32, 1}) &&
+                   read_both->close());
+            EXPECT(write_m1 && write_m2);
+            std::shared_ptr<const CommandList> sm1 = write_m1, sm2 = write_m2, srb = read_both;
+
+            VulkanFence gate_multi(context, 0), gate_b_hold(context, 0), written_a(context, 0), written_b(context, 0),
+                done_m(context, 0);
+            EXPECT(gate_multi.semaphore() && gate_b_hold.semaphore() && written_a.semaphore() &&
+                   written_b.semaphore() && done_m.semaphore());
+
+            // Hold direct in held_ behind gate_multi; compute_a submits immediately; compute_b is still held behind
+            // gate_b_hold so written_b is pending when relay_wait runs!
+            direct.wait(gate_multi.semaphore(), 1);
+            EXPECT(direct.execute({&srb, 1}) == ReplayResult::success);
+            EXPECT(direct.signal(done_m.semaphore(), 1));
+            EXPECT(direct.idle());
+
+            EXPECT(compute_a.execute({&sm1, 1}) == ReplayResult::success);
+            EXPECT(compute_a.signal(written_a.semaphore(), 1));
+            compute_b.wait(gate_b_hold.semaphore(), 1);
+            EXPECT(compute_b.execute({&sm2, 1}) == ReplayResult::success);
+            EXPECT(compute_b.signal(written_b.semaphore(), 1));
+            EXPECT(compute_b.idle());
+
+            const QueueHolds<VkSemaphore>::Wait reps[] = {{written_a.semaphore(), 1, {}},
+                                                          {written_b.semaphore(), 1, {}}};
+            EXPECT(context.holds().relay_wait(gate_multi.semaphore(), 1, reps, /*consume_on_substitute=*/true));
+            EXPECT(context.holds().active_relay_count() == 0);
+            // Release compute_b -> written_b signals -> direct unblocks and reads both mid[16] and mid[32].
+            EXPECT(gate_b_hold.signal_gpu_relay(1));
+            EXPECT(done_m.wait(1, 5'000'000'000ull));
+            EXPECT(direct.idle() && compute_a.idle() && compute_b.idle());
+            EXPECT(gate_multi.completed() == 0);
+            EXPECT(db[16] == 0x6B && db[32] == 0x7C);
+
+            // Multi-wait substitution inside inbox_ while direct's worker is blocked inside before_execute_().
+            std::memset(db, 0, kBufBytes);
+            std::atomic<bool> in_lead{false}, go_lead{false};
+            before_calls.store(0, std::memory_order_release);
+            context.set_before_execute([&] {
+                if (before_calls.fetch_add(1, std::memory_order_acq_rel) == 0) {
+                    in_lead.store(true, std::memory_order_release);
+                    while (!go_lead.load(std::memory_order_acquire)) std::this_thread::yield();
+                }
+            });
+            VulkanFence gate_inbox(context, 0), done_in(context, 0);
+            EXPECT(gate_inbox.semaphore() && done_in.semaphore());
+            EXPECT(direct.execute({&empty_snap, 1}) == ReplayResult::success);
+            while (!in_lead.load(std::memory_order_acquire)) std::this_thread::yield();
+
+            direct.wait(gate_inbox.semaphore(), 1);
+            EXPECT(direct.execute({&srb, 1}) == ReplayResult::success);
+            EXPECT(direct.signal(done_in.semaphore(), 1));
+            EXPECT(context.holds().relay_wait(gate_inbox.semaphore(), 1, reps, /*consume_on_substitute=*/true));
+            EXPECT(context.holds().active_relay_count() == 0);
+
+            go_lead.store(true, std::memory_order_release);
+            EXPECT(done_in.wait(1, 5'000'000'000ull));
+            EXPECT(direct.idle());
+            EXPECT(gate_inbox.completed() == 0);
+            EXPECT(db[16] == 0x6B && db[32] == 0x7C);
+            EXPECT(!context.holds().has_progress());  // held/work counts stayed balanced across inbox expansion!
+        }
+
+        // (d) Race ordering (in-transit lookup_relay): relay_wait registered BEFORE wait_sync sees (gate_race, 1).
+        {
+            context.set_before_execute({});
+            VulkanFence gate_race(context, 0), written_r(context, 0), done_r(context, 0);
+            EXPECT(gate_race.semaphore() && written_r.semaphore() && done_r.semaphore());
+            EXPECT(compute_a.signal(written_r.semaphore(), 1));
+            const QueueHolds<VkSemaphore>::Wait rep[] = {{written_r.semaphore(), 1, {}}};
+            EXPECT(context.holds().relay_wait(gate_race.semaphore(), 1, rep, /*consume_on_substitute=*/true));
+            EXPECT(context.holds().active_relay_count() == 1);  // retained until in-transit wait consumes it
+
+            direct.wait(gate_race.semaphore(), 1);
+            EXPECT(direct.execute({&empty_snap, 1}) == ReplayResult::success);
+            EXPECT(direct.signal(done_r.semaphore(), 1));
+            EXPECT(done_r.wait(1, 5'000'000'000ull));
+            EXPECT(direct.idle() && compute_a.idle());
+            EXPECT(gate_race.completed() == 0);
+            EXPECT(context.holds().active_relay_count() == 0);
+            EXPECT(!context.has_unsatisfied_waiter(gate_race.semaphore(), 1));
+            EXPECT(!context.holds().has_progress());
+        }
+
+        std::printf("queue r10 ws3: signal_gpu_relay vis_seq=0, retroactive relay_wait (single/multi/inbox/race) ok\n");
+    }
+
     return 0;
 }
 

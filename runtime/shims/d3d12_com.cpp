@@ -2398,6 +2398,7 @@ public:
     bool ok() const { return fence_.semaphore() != VK_NULL_HANDLE; }
     VkSemaphore semaphore() const { return fence_.semaphore(); }
     const leonida::VulkanContext* context() const { return &context_; }
+    leonida::VulkanContext* mutable_context() { return &context_; }
 
     // A Vulkan timeline only increases; D3D12 allows setting a fence lower. Such a signal is reported and dropped.
     // A queue's claim also records the value as one the GPU will signal, which a later CPU signal must not overtake.
@@ -2420,16 +2421,23 @@ public:
     // would already read `value`.
     HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override {
         const leonida::submit_phases::TitleCall call(leonida::submit_phases::part_fences);  // "submit frame" line
+        return signal_impl(value, true);
+    }
+
+    HRESULT signal_gpu_relay(UINT64 value) { return signal_impl(value, false); }
+
+    HRESULT signal_impl(UINT64 value, bool bump_vis_seq) {
         std::lock_guard lock(claim_mutex_);
         if (!claim_locked(value, false)) return S_OK;
         const UINT64 queued = queued_;
-        if (held_->load() == 0 && fence_.completed() >= queued) return fence_.signal(value) ? S_OK : E_FAIL;
+        if (held_->load() == 0 && fence_.completed() >= queued)
+            return (bump_vis_seq ? fence_.signal(value) : fence_.signal_gpu_relay(value)) ? S_OK : E_FAIL;
         held_->fetch_add(1);
         // The callback must not touch the fence, which may be released first. Released (cancel) or device lost,
         // the queue value may not be reached, and signalling then would break the same rule: the signal is dropped.
         leonida::VulkanContext* context = &context_;
         const VkSemaphore semaphore = fence_.semaphore();
-        context_.enqueue_fence_callback(semaphore, queued, [context, semaphore, queued, value, held = held_] {
+        context_.enqueue_fence_callback(semaphore, queued, [context, semaphore, queued, value, bump_vis_seq, held = held_] {
             std::uint64_t now = 0;
             bool signaled = false;
             if (context->observe_result(context->vk.vkGetSemaphoreCounterValue(context->device(), semaphore, &now),
@@ -2443,7 +2451,8 @@ public:
             }
             held->fetch_sub(1);
             if (signaled) {
-                context->holds().signaled(semaphore, value, context->next_visibility_seq());
+                const std::uint64_t vis_seq = bump_vis_seq ? context->next_visibility_seq() : 0;
+                context->holds().signaled(semaphore, value, vis_seq);
                 context->holds().pump_ready();
             }
         });
@@ -3190,6 +3199,27 @@ bool fence_callback_at(ID3D12Fence* fence, std::uint64_t value, std::function<vo
 bool fence_signal_submitted(ID3D12Fence* fence, std::uint64_t value) {
     Fence* f = Fence::from(fence);
     return !f || f->signal_submitted(value);
+}
+
+HRESULT fence_signal_gpu_relay(ID3D12Fence* fence, std::uint64_t value) {
+    if (!fence) return E_INVALIDARG;
+    if (Fence* f = Fence::from(fence)) return f->signal_gpu_relay(value);
+    return fence->Signal(value);
+}
+
+bool fence_relay_wait(ID3D12Fence* gate_fence, std::uint64_t gate_value,
+                      std::span<const FenceRelayTarget> replacements) {
+    Fence* gf = Fence::from(gate_fence);
+    if (!gf || !gate_value || replacements.empty()) return false;
+    std::vector<leonida::QueueHolds<VkSemaphore>::Wait> waits;
+    waits.reserve(replacements.size());
+    for (const FenceRelayTarget& target : replacements) {
+        Fence* rf = Fence::from(target.fence);
+        if (!rf || rf->context() != gf->context() || rf->semaphore() == gf->semaphore()) return false;
+        waits.push_back({rf->semaphore(), target.value, CommandQueue::fence_pin(target.fence)()});
+    }
+    return gf->mutable_context()->holds().relay_wait(gf->semaphore(), gate_value, waits,
+                                                     /*consume_on_substitute=*/true);
 }
 
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue) {

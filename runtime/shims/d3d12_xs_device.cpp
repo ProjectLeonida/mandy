@@ -4058,8 +4058,8 @@ private:
         if (unmet.empty()) return;
         const std::uint64_t value = ++values->gate_value;
         list_values::bump(counters.gates_held);
-        list_values::Pump::get().add_gate(queue_->values, value, std::move(unmet));
         wait(values->gate, value);
+        list_values::Pump::get().add_gate(queue_->values, value, std::move(unmet));
     }
 
     ChildProxy* queue_;

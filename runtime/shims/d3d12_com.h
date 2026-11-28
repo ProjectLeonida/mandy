@@ -329,6 +329,22 @@ bool fence_callback_at(ID3D12Fence* fence, std::uint64_t value, std::function<vo
 // the console list values' pump (d3d12_xs_list_values.h): work held that way is not running.
 bool fence_signal_submitted(ID3D12Fence* fence, std::uint64_t value);
 
+// Signals `fence` to `value` from the CPU without bumping the device visibility epoch (vis_seq = 0): for GPU-to-GPU
+// relays (e.g. list_values::Pump gates met strictly by GPU writes landed via Pump::land()). Falls back to
+// fence->Signal(value) for fences of another kind.
+HRESULT fence_signal_gpu_relay(ID3D12Fence* fence, std::uint64_t value);
+
+// Retroactively redirects any queued, pending, or held wait on `(gate_fence, gate_value)` to GPU waits on
+// `replacements` in QueueHolds (never GPU-signaling `gate_fence`), releasing newly-unblocked held operations
+// immediately. False when `gate_fence` or any replacement is not a Vulkan fence on the same context, or when
+// `gate_fence` has already been signaled to at least `gate_value`.
+struct FenceRelayTarget {
+    ID3D12Fence* fence = nullptr;
+    std::uint64_t value = 0;
+};
+bool fence_relay_wait(ID3D12Fence* gate_fence, std::uint64_t gate_value,
+                      std::span<const FenceRelayTarget> replacements);
+
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
 // Resolves the resource that a UAV clear writes. Xbox depth/stencil UAVs name one of two color images by T#.
