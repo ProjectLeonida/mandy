@@ -4,6 +4,7 @@ import ast
 import json
 from pathlib import Path
 import re
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -30,6 +31,8 @@ def rust_bc2(data):
             + ''.join('    (' + ', '.join(value(v) for v in row) + '),\n' for row in dictionary) + '];\n')
 
 if __name__ == '__main__':
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()

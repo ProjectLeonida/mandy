@@ -6,7 +6,10 @@ incorrect BC7 indices in the Rust table reader, valid BC1/BC4 streams rejected b
 its lane scheduler, and missing or fitted initial dictionaries in the older
 C++/Python production paths. BC2 is now implemented in all three paths.
 
-Submission base: `4938673668d807bf365b61284bf22b1ff8d02cc4` (`main`).
+Initial submission base: `4938673668d807bf365b61284bf22b1ff8d02cc4` (`main`).
+Updated by merging `main` at `4a54aedcb6b66525e0c9f72a6ea10263337c9141`,
+preserving the published decoder commit and upstream DirectStorage vector
+generator CLI validation and atomic output handling.
 The original decoder audit used `6dfca642807631bbe41d6925f152529f99c71ce2`;
 the decoder files were unchanged when rebasing onto the submission base.
 Branch: `bcpack/standalone-correctness`.
@@ -139,6 +142,32 @@ compilation verifies the modified DirectStorage shim despite that full-build
 constraint. No game launch, GPU image comparison or frame-rate benchmark was
 performed for this decoder change. These finite synthetic tests do not prove
 correctness for every possible bit sequence.
+
+## Branch refresh validation
+
+After merging `main` at `4a54aedcb`, the C++ BCPack CTest passed again, Rust
+reported 42 passed and five ignored, and the directly compiled DirectStorage
+test reported 546 checks and zero failures. The combined Python suite reported
+308 tests, four skips and no failures. The upstream DirectStorage generator
+CLI/atomic-write tests, documentation links and CTest registration tests passed
+(two, 17 and seven tests respectively). Shared-table generation and formatting
+checks on the changed Rust files also passed.
+The full translator regression passed: 507 files, 6,410 tests and zero failed
+files, using 12 workers.
+
+The new table generator now guards stdout encoding like the other CLI tools.
+The remaining eight failing tool/documentation test files were rerun on a
+separate, unmodified checkout of the same `main` commit: both checkouts reported
+the same ten failing tests, including the same ten unrelated tools missing
+stdout guards. These baseline failures were not skipped or disabled.
+
+The module overview in `make_game.py` now describes standalone decoding rather
+than recommending a calibration profile, as requested in the independent
+[Linux verification](https://github.com/ProjectLeonida/mandy/pull/2567#issuecomment-7237546991).
+Independent Windows build and DirectStorage results are recorded in the
+[Windows verification](https://github.com/ProjectLeonida/mandy/pull/2567#issuecomment-7236979028).
+Those are other contributors' results; the local refresh did not perform a GPU
+or game run.
 
 ## Existing pull request overlap
 
