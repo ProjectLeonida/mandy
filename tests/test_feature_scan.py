@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import unittest
 from unittest import mock
 
 TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
@@ -560,6 +561,73 @@ def run_tests(tests, report=print):
         finally:
             failures += before
     return raised
+
+
+class FeatureScanAtomicOutputTests(unittest.TestCase):
+    """Subprocess tests for --out failure handling and successful JSON output."""
+
+    @staticmethod
+    def make_shaders(root):
+        shaders = os.path.join(root, "shaders")
+        dxbc = os.path.join(shaders, "dxbc")
+        os.makedirs(dxbc)
+        with open(os.path.join(dxbc, "index.json"), "w", encoding="utf-8") as stream:
+            json.dump([], stream)
+        return shaders
+
+    @staticmethod
+    def fail_file_writes():
+        import resource
+        import signal
+
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+
+    def run_scan(self, shaders, report, *, fail_writes=False):
+        return subprocess.run(
+            [sys.executable, "-I", "-B", os.path.join(TOOLS, "feature_scan.py"), shaders, "--out", report],
+            cwd=os.path.dirname(TOOLS), capture_output=True, text=True,
+            preexec_fn=self.fail_file_writes if fail_writes else None,
+        )
+
+    def test_failed_write_keeps_existing_report(self):
+        with tempfile.TemporaryDirectory() as root:
+            shaders = self.make_shaders(root)
+            report = os.path.join(root, "report.json")
+            original = b'{"previous": "report"}\n'
+            with open(report, "wb") as stream:
+                stream.write(original)
+
+            result = self.run_scan(shaders, report, fail_writes=True)
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            with open(report, "rb") as stream:
+                self.assertEqual(stream.read(), original)
+
+    def test_failed_write_leaves_no_temporary_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            shaders = self.make_shaders(root)
+            report = os.path.join(root, "report.json")
+            with open(report, "w", encoding="utf-8") as stream:
+                stream.write('{"previous": true}\n')
+
+            result = self.run_scan(shaders, report, fail_writes=True)
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(set(os.listdir(root)), {"shaders", "report.json"})
+
+    def test_success_writes_valid_json(self):
+        with tempfile.TemporaryDirectory() as root:
+            shaders = self.make_shaders(root)
+            report = os.path.join(root, "report.json")
+
+            result = self.run_scan(shaders, report)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(report, encoding="utf-8") as stream:
+                parsed = json.load(stream)
+            self.assertEqual(parsed["shaders"], 0)
+            self.assertEqual(set(os.listdir(root)), {"shaders", "report.json"})
 
 
 if __name__ == "__main__":
