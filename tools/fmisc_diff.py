@@ -33,9 +33,12 @@ Every rule was checked against an RDNA2 GPU (AMD Radeon iGPU, gfx1036, Windows d
 
 Not judged (the program is skipped with the reason, counted): a denormal operand or result (whether f32 denormals
 are flushed is the MODE question, SHADER-35), a NaN whose payload is later read as an integer (payloads are not
-modelled), the clamp of a NaN and an output modifier whose result is a zero (tools/f32_fuzz.py measures both), and
-an output modifier on a signalling-NaN result (the translator's multiply quiets it, which a later v_cmp_class sees;
-whether the hardware does is not measured).
+modelled), the clamp of a NaN and an output modifier whose result is a zero (tools/f32_fuzz.py measures both), an
+output modifier on a signalling-NaN result (the translator's multiply quiets it, which a later v_cmp_class sees;
+whether the hardware does is not measured), and the class bits of a NaN that a float op computed (v_fmamk_f32 & co.:
+whether the hardware quiets a signalling NaN operand is payload-level and only partly measured - on gfx1036 under
+the game's MODE it mostly passes the NaN source through unchanged but sometimes quiets or flips its sign, so a
+v_cmp_class_f32 on the result cannot be judged).
 
 Known divergences (KNOWN_DIVERGENCES): by default the generator leaves out the forms where the translator is known to
 differ from the hardware, so that a run shows new problems only; --known puts them back (a hardware-only run always
@@ -450,10 +453,37 @@ def raw(tok, st):
     return int(tok, 0) & M32
 
 
+def _vreg(tok):
+    """The VGPR a source token reads, ignoring neg/abs modifiers; None for anything else."""
+    if tok.startswith("-") and not tok[1:2].isdigit():
+        tok = tok[1:]
+    tok = tok.strip("|")
+    m = re.fullmatch(r"v(\d+)", tok)
+    return int(m.group(1)) if m else None
+
+
 def ivalue(tok, st):
     if re.fullmatch(r"v\d+", tok) and int(tok[1:]) in st["nan"]:
         raise Uncertain("a computed NaN read as an integer")
     return raw(tok, st)
+
+
+# Ops whose NaN output is the NaN input's word, unchanged (a pass-through or a bit move): the quiet bit a
+# v_cmp_class_f32 later reads is the input's, modelled exactly when the input's is (st["nanf"] does not propagate
+# through them, it only survives). v_fmamk_f32 is the one op here that makes a NaN from its operands: on gfx1036
+# under the game's MODE (IEEE off) the hardware mostly returns the NaN source's word but sometimes quiets a
+# signalling one, so a signalling-NaN operand - or an operand whose NaN quiet bit is already unmodelled - makes
+# the result's class bits unmodelled too.
+NAN_PASSTHROUGH = {"v_fract_f32", "v_frexp_mant_f32", "v_frexp_exp_i32_f32", "v_ldexp_f32"}
+
+
+def _nan_fuzzy(tok, w, st):
+    """Whether a NaN input to v_fmamk_f32 leaves the result's quiet bit unmodelled: the input is signalling, or
+    it is a register whose NaN quiet bit already is."""
+    if not is_nan(w):
+        return False
+    r = _vreg(tok)
+    return (r is not None and r in st["nanf"]) or not w & 0x400000
 
 
 def fvalue(tok, st):
@@ -489,7 +519,9 @@ def out_mods(w, mods):
 
 def reference(lines):
     """Run the program; returns the four exported words. Raises Uncertain for what it does not judge."""
-    st = {"v": {}, "s": {}, "nan": set()}   # nan: VGPRs holding a computed NaN (payload not modelled)
+    st = {"v": {}, "s": {}, "nan": set(), "nanf": set()}   # nan: VGPRs holding a computed NaN (payload not
+    # modelled); nanf: of those, the ones whose quiet bit is not modelled either (a v_fmamk_f32 NaN, or a
+    # pass-through of one): a later v_cmp_class_f32 on them is Uncertain, everything else still judges them.
     for line in lines:
         op, _, rest = line.partition(" ")
         args, mods = parse(rest)
@@ -499,6 +531,9 @@ def reference(lines):
         if op.startswith("v_cmp_"):
             a = fvalue(args[1], st)
             if op.startswith("v_cmp_class_f32"):
+                r = _vreg(args[1])
+                if r is not None and r in st["nanf"]:
+                    raise Uncertain("the class bits of a NaN whose quiet bit is not modelled")
                 bit = class_bits(a) & ivalue(args[2], st)
             else:
                 bit = fcmp(op[len("v_cmp_"):].split("_f32")[0], a, fvalue(args[2], st))
@@ -508,8 +543,11 @@ def reference(lines):
         if op in ("v_mov_b32_e32", "v_cndmask_b32_e64"):
             src = args[1] if op == "v_mov_b32_e32" else args[2 if raw(args[3], st) & 1 else 1]
             st["v"][d] = raw(src, st)
-            nan = re.fullmatch(r"v\d+", src) and int(src[1:]) in st["nan"]
+            r = _vreg(src)
+            nan = r is not None and r in st["nan"]
             (st["nan"].add if nan else st["nan"].discard)(d)
+            fuzzy = r is not None and r in st["nanf"]
+            (st["nanf"].add if fuzzy else st["nanf"].discard)(d)
             continue
         base = op[:-4] if op.endswith(("_e32", "_e64")) else op
         if base not in OPS:
@@ -524,7 +562,18 @@ def reference(lines):
             if is_denorm(w):
                 raise Uncertain("denormal result")
             w = out_mods(w, mods)
-        (st["nan"].add if fout and is_nan(w) else st["nan"].discard)(d)
+        nan_out = fout and is_nan(w)
+        # Read the sources' nanf before d's own entry is replaced (d may alias a source).
+        if not nan_out:
+            fuzzy = False
+        elif base == "v_fmamk_f32":
+            fuzzy = any(_nan_fuzzy(t, v, st) for t, v in zip(args[1:4], vals))
+        elif base in NAN_PASSTHROUGH:
+            fuzzy = any(_vreg(t) in st["nanf"] for t, f in zip(args[1:], fin) if f)
+        else:
+            fuzzy = False
+        (st["nan"].add if nan_out else st["nan"].discard)(d)
+        (st["nanf"].add if fuzzy else st["nanf"].discard)(d)
         st["v"][d] = w
     return [st["v"].get(8 + i, 0) for i in range(4)]
 

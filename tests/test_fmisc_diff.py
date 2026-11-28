@@ -123,6 +123,31 @@ class Reference(unittest.TestCase):
         self.assertIsNone(d._diff(["", "", "", "v_mov_b32_e32 v8, v1"] * 1, [QNAN] + [0] * 3,
                                   [0xFFC00001] + [0] * 3, "x"))
 
+    def test_class_of_a_computed_nan(self):
+        # v_fmamk_f32 with a signalling-NaN operand: on gfx1036 (IEEE off) the hardware mostly passes the NaN
+        # source through unchanged but sometimes quiets it, so the result's class bits are not judged. A quiet
+        # NaN input gives a quiet result either way, and a pass-through op keeps an exact NaN's bits.
+        with self.assertRaises(d.Uncertain):
+            run("v_fmamk_f32 v1, v3, 0x3f800000, v2",
+                "v_cmp_class_f32_e64 s20, v1, 0x2",
+                "v_cndmask_b32_e64 v4, 0, 1.0, s20",
+                v={2: 0, 3: SNAN})
+        with self.assertRaises(d.Uncertain):                       # the fuzziness survives a pass-through
+            run("v_fmamk_f32 v1, v3, 0x3f800000, v2", "v_fract_f32_e64 v5, v1",
+                "v_cmp_class_f32_e64 s20, v5, 0x2",
+                "v_cndmask_b32_e64 v4, 0, 1.0, s20",
+                v={2: 0, 3: SNAN})
+        # a quiet NaN operand gives a quiet NaN result: class bit 1 (quiet NaN) still judged
+        self.assertEqual(run("v_fmamk_f32 v1, v3, 0x3f800000, v2",
+                             "v_cmp_class_f32_e64 s20, v1, 0x2",
+                             "v_cndmask_b32_e64 v4, 0, 1.0, s20",
+                             v={2: 0, 3: QNAN})[3], 0x3F800000)
+        # a pass-through NaN keeps its bits: fract of a signalling NaN stays signalling, class bit 0
+        self.assertEqual(run("v_fract_f32_e64 v1, v2",
+                             "v_cmp_class_f32_e64 s20, v1, 0x1",
+                             "v_cndmask_b32_e64 v4, 0, 1.0, s20",
+                             v={2: SNAN})[3], 0x3F800000)
+
 
 class Generator(unittest.TestCase):
     def lines(self, known=False, literals=True, n=3000, seed=1):
