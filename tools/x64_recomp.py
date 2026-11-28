@@ -1889,19 +1889,20 @@ class FunctionTranslator:
         a = self.asm
         m = ins.mnem
         if m == "cbtw":
-            if ins.opsize:
+            if ins.rexw:
+                a.sxtw(GMAP[0], GMAP[0])
+            elif ins.opsize:
                 a.sxtb(T0, GMAP[0], sf=0)
                 a.bfi(GMAP[0], T0, 0, 16)
-            elif ins.rexw:
-                a.sxtw(GMAP[0], GMAP[0])
             else:
                 a.sxth(GMAP[0], GMAP[0], sf=0)
         elif m == "cwtd":
-            if ins.opsize:
-                a.sxth(T0, GMAP[0], sf=0)
-                a.bfi(GMAP[2], T0, 0, 16)
-            elif ins.rexw:
+            if ins.rexw:
                 a.asr(GMAP[2], GMAP[0], 63)
+            elif ins.opsize:
+                a.sxth(T0, GMAP[0], sf=0)
+                a.asr(T0, T0, 16, sf=0)
+                a.bfi(GMAP[2], T0, 0, 16)
             else:
                 a.asr(GMAP[2], GMAP[0], 31, sf=0)
         else:
@@ -2179,37 +2180,50 @@ class FunctionTranslator:
                 a.b("rt_dispatch")
             return
         if ins.cc == "jcxz":
-            a.cbz(GMAP[1], self._target_lbl(ins.ops[0][1]), sf=0)
+            a.cbz(GMAP[1], self._target_lbl(ins.ops[0][1]), sf=0 if ins.addrsize else 1)
             return
         if ins.cc in ("loop", "loope", "loopne"):
-            a.sub(GMAP[1], GMAP[1], 1)
+            sf = 0 if ins.addrsize else 1
+            lbl = self._target_lbl(ins.ops[0][1])
+            a.sub(GMAP[1], GMAP[1], 1, sf)
             if ins.cc == "loop":
-                a.cbnz(GMAP[1], self._target_lbl(ins.ops[0][1]))
+                a.cbnz(GMAP[1], lbl, sf)
             else:
                 skip = self._skip_lbl()
-                a.cbz(GMAP[1], skip)
-                a.bcond("eq" if ins.cc == "loope" else "ne",
-                        self._target_lbl(ins.ops[0][1]))
+                a.cbz(GMAP[1], skip, sf)
+                prod = self.arm_path.get(ins.addr)
+                if prod is not None and "Z" in FLAG_WRITERS.get(prod.mnem, ""):
+                    a.bcond("eq" if ins.cc == "loope" else "ne", lbl)
+                else:
+                    self._ctx_jcc("e" if ins.cc == "loope" else "ne", lbl)
                 a.label(skip)
             return
         self._emit_jcc(ins)
 
     def _emit_call(self, ins):
         a = self.asm
-        a.li(T0, ins.addr + ins.size)
-        a.str_pre(T0, GMAP[4], -8)
         op = ins.ops[0]
         if op[0] == "a" and op[1] in self.by_addr:
+            a.li(T0, ins.addr + ins.size)
+            a.str_pre(T0, GMAP[4], -8)
             a.b(self._lbl(op[1]))
         else:
-            self._load(ins, op, ADDR_T)
+            self._load(ins, op, ADDR_T, as_size=8)
+            a.li(T0, ins.addr + ins.size)
+            a.str_pre(T0, GMAP[4], -8)
             a.b("rt_dispatch")
 
     def _emit_ret(self, ins):
         a = self.asm
         a.ldr_post(ADDR_T, GMAP[4], 8)
         if ins.ops and ins.ops[0][0] == "i":
-            a.add(GMAP[4], GMAP[4], ins.ops[1] & 0xFFFF)
+            imm = ins.ops[0][1] & 0xFFFF
+            if imm:
+                if imm < 4096:
+                    a.add(GMAP[4], GMAP[4], imm)
+                else:
+                    a.li(T0, imm)
+                    a.add_r(GMAP[4], GMAP[4], T0)
         a.b("rt_dispatch")
 
     def _emit_leave(self, ins):
