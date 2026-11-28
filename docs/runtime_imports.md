@@ -840,6 +840,14 @@ works for loopback traffic:
   `MCAST_JOIN_GROUP`, `MCAST_JOIN_SOURCE_GROUP`, and `wsock32.dll`'s Winsock 1.1 `IP_ADD_MEMBERSHIP` = 5) fail with
   `WSAEADDRNOTAVAIL`; other options pass through. `WSAJoinLeaf` gets the same loopback check as `connect`, so a group
   address is refused with `WSAENETUNREACH`.
+- An empty name (`""`), and a null one for `gethostbyname` and `WSAAsyncGetHostByName`, names the local computer,
+  whose answer is every address it has (its LAN and external adapters): it is refused with `WSAHOST_NOT_FOUND`. A
+  null `getaddrinfo` node (a service-only lookup) is still answered. Forward lookups of `localhost` hand the host a
+  loopback literal (`::1` for an `AF_INET6` lookup, else `127.0.0.1`; not under `AI_NUMERICHOST`, which refuses the
+  name), so its hosts file cannot map the name off loopback. `WSAIoctl`'s extension-pointer lookup for `ConnectEx` and
+  `WSASendMsg` is answered by the host with the caller's overlapped and completion routine (so a completion port,
+  event or routine is told as Winsock tells it, and a socket without `WSA_FLAG_OVERLAPPED` ignores them), but the host
+  writes its own pointer into the shim's storage; the caller's buffer holds the wrapper before the call.
 - Forward lookups refuse external names with `WSAHOST_NOT_FOUND` without sending DNS traffic. A dotted octet with a
   leading zero (`0127.0.0.1`) is refused too: Windows reads it as octal, so it is not the loopback address it looks
   like. `getnameinfo` / `GetNameInfoW` force `NI_NUMERICHOST` (or return `WSAHOST_NOT_FOUND` under `NI_NAMEREQD`) for
