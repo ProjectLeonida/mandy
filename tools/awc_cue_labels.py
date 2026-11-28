@@ -7,9 +7,39 @@ import re
 import sys
 from tempfile import TemporaryDirectory
 
+MAX_JSON_DEPTH = 64
+
+
+def _check_json_depth(text: str, max_depth: int = MAX_JSON_DEPTH) -> None:
+    """Fail fast before json.loads; CPython's C stack limit varies across OSes."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "{[":
+            depth += 1
+            if depth > max_depth:
+                raise ValueError("cue sheet JSON nesting is too deep")
+        elif ch in "}]" and depth > 0:
+            depth -= 1
+
 
 def convert(sheet, output):
-    data = json.loads(sheet.read_text(encoding="utf-8"))
+    text = sheet.read_text(encoding="utf-8")
+    _check_json_depth(text)
+    try:
+        data = json.loads(text)
+    except RecursionError:
+        raise ValueError("cue sheet JSON nesting is too deep") from None
     if (not isinstance(data, dict) or data.get("sample_rate") != 48000
             or not isinstance(data.get("regions"), list)):
         raise ValueError("expected a 48 kHz cue sheet with a regions list")
