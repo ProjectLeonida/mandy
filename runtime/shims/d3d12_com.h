@@ -347,6 +347,15 @@ struct TitleShadowWatch {
     std::uint64_t asks = 0, written = 0, faults = 0, watched_bytes = 0, hot_bytes = 0;
 };
 TitleShadowWatch title_shadow_watch(ID3D12Device* device);
+// What waits for the console heaps' GPU pass (LEONIDA_CONSOLE_HEAP_GPU, src/console_heap_gpu.h) to drop from its key
+// table at the next submission that runs it: the arena ranges `device` released since the last one, and the alias
+// ranges removed since (the alias table's list, one for the process). `made`: the device made the pass's object at
+// all (LEONIDA_CONSOLE_HEAP_GPU=1 or LEONIDA_SHADOW_GPU=1). For tests.
+struct ConsoleHeapGpuPending {
+    bool made = false;
+    std::uint64_t released = 0, removed = 0;
+};
+ConsoleHeapGpuPending console_heap_gpu_pending(ID3D12Device* device);
 // True when `device` has VK_KHR_acceleration_structure + VK_KHR_ray_query enabled.
 bool device_supports_ray_tracing(ID3D12Device* device);
 

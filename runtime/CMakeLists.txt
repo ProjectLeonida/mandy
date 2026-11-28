@@ -2874,6 +2874,18 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(d3d12_placed_heap_lifetime PROPERTIES SKIP_RETURN_CODE 77
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
+    # LEONIDA_SHADOW_GPU=1 alone keeps no released arena range or removed alias range for the console heap pass,
+    # which never runs then; with LEONIDA_CONSOLE_HEAP_GPU=1 an arena release is one range, taken by the next
+    # submission (RT-SHADOW-GPU-RELEASED-RANGES). The test sets both variables itself.
+    add_executable(d3d12_shadow_gpu_releases_test test/d3d12_shadow_gpu_releases_test.cpp)
+    target_link_libraries(d3d12_shadow_gpu_releases_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_shadow_gpu_releases_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_shadow_gpu_releases_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_shadow_gpu_releases COMMAND d3d12_shadow_gpu_releases_test)
+    add_test(NAME d3d12_console_heap_gpu_releases COMMAND d3d12_shadow_gpu_releases_test --console-heap-gpu)
+    set_tests_properties(d3d12_shadow_gpu_releases d3d12_console_heap_gpu_releases PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
     # ClearUnorderedAccessViewUint/Float on buffers and textures, read back through D3D12.
     add_executable(d3d12_uav_clear_test test/d3d12_uav_clear_test.cpp)
     target_link_libraries(d3d12_uav_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
