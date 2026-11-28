@@ -373,8 +373,8 @@ class HeaderTests(unittest.TestCase):
         self.assertIn("DX10", str(ctx.exception))
 
     def test_rejects_unknown_dxgi_format(self):
-        # 94-96 are BC6H typeless/UF16/SF16, which this decoder deliberately does not claim.
-        for dxgi in (94, 95, 96):
+        # Typeless BC6H does not tell the reader whether the endpoints are signed.
+        for dxgi in (94, 0xFFFFFFFF):
             with self.subTest(dxgi=dxgi):
                 with self.assertRaises(dds.DdsError) as ctx:
                     dds.parse_dds_header(dds_buffer(4, 4, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=dxgi))

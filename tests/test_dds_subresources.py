@@ -61,6 +61,18 @@ class SubresourceTests(unittest.TestCase):
         with self.assertRaises(dds.DdsError):
             dds.decode_dds(data, face="px")
 
+    def test_bc6h_hdr_blocks_preview_signed_unsigned_and_clipped_edges(self):
+        for fmt, signed in ((95, False), (96, True)):
+            with self.subTest(fmt=fmt):
+                base = pool_fixtures.solid_bc6h(-0.5 if signed else 0, 0.5, 2, signed=signed)
+                right = pool_fixtures.solid_bc6h(1, 0, 0, signed=signed)
+                data = dx10(5, 2, base + right, fmt=fmt)
+                expected = (bytes((0, 128, 255, 255)) * 4 + bytes((255, 0, 0, 255))) * 2
+                self.assertEqual(dds.decode_dds(data), (5, 2, expected))
+                self.assertEqual(dds.dds_to_png_bytes(data), dds.encode_png(5, 2, expected))
+                with self.assertRaises(dds.DdsError):
+                    dds.decode_dds(data[:-1])
+
     def test_project_writer_array_and_cube(self):
         for cube, count, selection in ((False, 3, {"layer": 2}), (True, 6, {"face": "nz"})):
             with self.subTest(cube=cube):
