@@ -13,6 +13,7 @@
 #include <propsys.h>
 #include <spatialaudioclient.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -197,25 +198,37 @@ public:
     }
 
 private:
+    // A wait timeout ends on the system timer's tick: 15.625 ms on Windows for a process that has not raised the timer
+    // resolution, and nothing in the runtime does. A 10 ms period then woke once per tick, about 64 passes a second
+    // instead of 100, and a spatial stream, which hands out 480 frames a pass, ran its title's audio at 64% of real
+    // time. A high-resolution waitable timer (Windows 10 1803 and later) wakes within a fraction of a millisecond of
+    // its due time; where it cannot be created, the timeout wait remains.
     static DWORD WINAPI run(void* self) {
         auto* t = static_cast<PeriodicThread*>(self);
         const DWORD period_ms = static_cast<DWORD>((t->period_hns_ + 9999) / 10000);
         const int64_t f = qpc_frequency();
         const int64_t step = t->period_hns_ * f / 10000000;
+        const HANDLE timer =
+            CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         int64_t next = qpc_now() + step;
         for (;;) {
             const int64_t now = qpc_now();
-            DWORD wait = 0;
-            if (next > now) {
-                wait = static_cast<DWORD>((next - now) * 1000 / f);
-                if (wait > period_ms) wait = period_ms;
+            const int64_t left = next > now ? next - now : 0;
+            LARGE_INTEGER due;
+            due.QuadPart = -std::max<int64_t>(1, left * 10000000 / f);  // relative, in 100 ns units
+            if (left && timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+                const HANDLE handles[2] = {t->stop_, timer};
+                if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
+            } else {
+                const DWORD wait = static_cast<DWORD>(std::min<int64_t>(left * 1000 / f, period_ms));
+                if (WaitForSingleObject(t->stop_, wait) != WAIT_TIMEOUT) break;
             }
-            if (WaitForSingleObject(t->stop_, wait) != WAIT_TIMEOUT) break;
             if (qpc_now() < next) continue;
             next += step;
             if (next < qpc_now()) next = qpc_now() + step;
             t->tick_(t->context_);
         }
+        if (timer) CloseHandle(timer);
         return 0;
     }
 
