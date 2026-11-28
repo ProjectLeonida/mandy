@@ -25,6 +25,7 @@
 // (--overlay, default <game-dir>/overlay) so the package is never modified (shims/file_system.cpp).
 #include <windows.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +38,8 @@
 #include <vector>
 
 #include <cstring>
+
+#include "fatal_report.h"
 
 namespace {
 
@@ -356,15 +359,21 @@ static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI title_set_unhandled_exception_filter(
         InterlockedExchangePointer(&title_fatal_filter, reinterpret_cast<void*>(filter)));
 }
 
+// The title's image, for rt::fatal_report (set once the title is loaded).
+static std::atomic<std::uintptr_t> title_image_base{0}, title_image_size{0};
+
 static LONG WINAPI save_caches_on_fatal_exception(EXCEPTION_POINTERS* info) {
     const DWORD code = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionCode : 0;
     if (code != EXCEPTION_STACK_OVERFLOW) {
         // Several title threads can fault at once (measured: eight within a second). The first writes; the others
         // wait here for it, so none of them reaches the title's filter, which may end the process, mid-write.
         static std::once_flag once;
-        std::call_once(once, [code] {
+        std::call_once(once, [code, info] {
             std::fprintf(stderr, "[rt] unhandled exception 0x%08lx: writing the session pipeline cache before the "
                                  "process ends\n", static_cast<unsigned long>(code));
+            const std::string where = rt::fatal_report::describe(
+                info, title_image_base.load(std::memory_order_relaxed), title_image_size.load(std::memory_order_relaxed));
+            std::fputs(where.c_str(), stderr);
             rt::d3d12::stop_pipeline_compiles(kExitCompileWaitMs);
             rt::d3d12::save_pipeline_caches_at_exit(kExitCacheWaitMs);
             std::fflush(stderr);
@@ -668,6 +677,8 @@ int wmain(int argc, wchar_t** argv) {
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
         keep_title_watchdog_kicked(main_module.base);
+        title_image_base.store(reinterpret_cast<std::uintptr_t>(main_module.base), std::memory_order_relaxed);
+        title_image_size.store(main_module.size, std::memory_order_relaxed);
         start_title_peek(main_module.base);
         leonida::dev_overlay::start();  // LEONIDA_DEV_OVERLAY=1
         leonida::thread_sampler::start(main_module.base, main_module.size);  // LEONIDA_SAMPLE_MS (diagnostic)
