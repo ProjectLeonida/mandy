@@ -832,7 +832,6 @@ private:
     // Poll thread only.
     uint64_t applied_ = 0;   // the version SDL has
     int sdl_effect_ = -1;
-    uint16_t sdl_type_ = 0;  // the SDL_HAPTIC_* type sdl_effect_ was created with
     bool sdl_running_ = false;
     bool endless_ = true;    // GameInput gave no duration: re-run before the SDL length runs out
     uint64_t run_at_ = 0, run_for_ = 0;
@@ -2276,9 +2275,10 @@ void STDMETHODCALLTYPE ForceFeedbackEffect::GetParams(GameInputForceFeedbackPara
 bool STDMETHODCALLTYPE ForceFeedbackEffect::SetParams(const GameInputForceFeedbackParams* params) {
     if (!params || !valid_kind(params->kind)) return false;
     std::lock_guard lock(g().mu);
-    // A kind the motor does not report is refused here as CreateForceFeedbackEffect refuses it. While the pad is away
-    // (ff_features 0) the effect keeps its parameters, as it was created with a kind the motor had.
-    if (device_->ff_features && !(device_->ff_features & kind_feature(params->kind))) return false;
+    // The kind is the effect's for life: SetParams changes the parameters of that kind only, and another kind is
+    // refused with the effect left as it was (a title makes a second effect for it). The motor reported this kind
+    // when the effect was created, so SDL's effect keeps its type and is only ever updated.
+    if (params->kind != params_.kind) return false;
     params_ = *params;
     ++version_;
     return true;
@@ -2357,17 +2357,8 @@ void ForceFeedbackEffect::sync(Device* d, uint64_t now, bool muted) {
         sdl_running_ = false;
         return;
     }
-    if (sdl_effect_ >= 0 && fx.type != sdl_type_) {
-        // SetParams changed the kind. SDL_UpdateHapticEffect refuses a new type ("Updating effect type is
-        // illegal"), so the old effect goes and one of the new type is made below.
-        if (sdl_running_) haptics().stop_effect(d->haptic, sdl_effect_);
-        sdl_running_ = false;
-        haptics().destroy_effect(d->haptic, sdl_effect_);
-        sdl_effect_ = -1;
-    }
     if (sdl_effect_ < 0) {
         sdl_effect_ = haptics().create_effect(d->haptic, &fx);  // SDL refused: nothing to drive this effect
-        sdl_type_ = fx.type;
         if (sdl_effect_ < 0) {
             note_effect(d, -1, false);
             return;
