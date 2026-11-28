@@ -24,6 +24,9 @@ import re
 import sys
 from collections import Counter, defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 FAMILIES = [("s_buffer_", "smem"), ("s_load", "smem"), ("s_", "scalar"), ("v_", "vector"), ("ds_", "lds"),
             ("buffer_", "buffer"), ("tbuffer_", "buffer"), ("image_", "image"), ("global_", "global"),
             ("flat_", "flat"), ("scratch_", "scratch"), ("exp", "export")]
@@ -289,13 +292,10 @@ def stage_map(disasm_dir) -> dict:
 
 
 def same_output_path(first, second):
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
+    """True when writing ``second`` would truncate ``first``: one name (case-folded on a folding volume) or one
+    file through a hard link. `tools/report_paths.same_report_path` owns that answer; this keeps the name the rest
+    of the tool calls."""
+    return same_report_path(first, second)
 
 
 def main():
