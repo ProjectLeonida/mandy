@@ -243,7 +243,8 @@ class ShadersStageTest(unittest.TestCase):
             elif tool == "fssm_unpack.py":
                 write(os.path.join(self.dxbc, "fssm_index.json"), json.dumps([{"name": "shader"}]))
             elif tool == "shader_disasm.py":
-                write(os.path.join(self.dxbc, "disasm", "shader.s"), "synthetic listing\n")
+                write(os.path.join(self.dxbc, "disasm", "shader.s"),
+                      "; synthetic listing\n\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n")
 
         def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
             ran.append("translate")

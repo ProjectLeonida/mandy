@@ -72,7 +72,7 @@ TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
 from mc_command import install_hint as mc_install_hint, mc_command, split_command  # noqa: E402
 import leonida_tui  # noqa: E402
-from shader_stage_manifest import shader_stems  # noqa: E402
+from shader_stage_manifest import listing_file_is_complete, shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
 from stale_build import newer_sources  # noqa: E402
 
@@ -1233,7 +1233,7 @@ def disassembly_listings(dxbc: str) -> set[str] | None:
                     continue
                 if entry.is_symlink():
                     return None
-                if entry.is_file() and entry.stat().st_size > 0:
+                if entry.is_file() and listing_file_is_complete(entry.path):
                     listings.add(entry.name[:-2])
             return listings
     except OSError:
