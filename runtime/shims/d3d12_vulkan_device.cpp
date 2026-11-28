@@ -16215,33 +16215,101 @@ public:
     // hold one compiled backend PSO while either public object lives. The device only holds weak references.
     HRESULT prepare_console_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& source, REFIID iid, void** out,
                                    std::unique_ptr<rt::d3d12_xs::PsoStreamRecord> record) {
-        if (!out)return E_POINTER;*out=nullptr;
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        d3d12_trace::stream_refusal = nullptr;
+        d3d12_xs::used_console_stream = false;
         PipelineStream stream{};
-        if(const auto hr=parse_pipeline_stream(source,stream);FAILED(hr))return hr;
-        const auto* library=state_.library();if(!library)return E_FAIL;
-        const auto verify=[&](const char* name,const D3D12_SHADER_BYTECODE& code) {
-            if(!code.BytecodeLength)return true;
-            if(!code.pShaderBytecode)return false;
-            const std::span<const std::uint8_t> bytes{static_cast<const std::uint8_t*>(code.pShaderBytecode),code.BytecodeLength};
-            const std::string identity=std::string(name)+leonida::sha256_hex(bytes);
-            {std::lock_guard lock(verified_program_mutex_);if(verified_programs_.count(identity))return true;}
-            auto program=leonida::compute_program(bytes);
-            if(program.bytes.empty())return false;
-            bool ambiguous=false;
-            const auto candidates=library->program_candidates(name,program,&ambiguous);
-            if(candidates.empty() || ambiguous)return false;
-            {std::lock_guard lock(verified_program_mutex_);verified_programs_.insert(identity);}
-            return true;
-        };
-        if(stream.has_cs) {
-            if(!stream.compute.CS.BytecodeLength || !verify("cs",stream.compute.CS))return E_INVALIDARG;
-        } else {
-            const auto& g=stream.graphics;
-            if(stream.as.BytecodeLength || g.HS.BytecodeLength || g.DS.BytecodeLength)return E_NOTIMPL;
-            if((bool(g.VS.BytecodeLength)==bool(stream.ms.BytecodeLength)) || g.NumRenderTargets>8 ||
-               !verify("vs",g.VS)||!verify("gs",g.GS)||!verify("ms",stream.ms)||!verify("ps",g.PS))return E_INVALIDARG;
+        bool used_console = false;
+        HRESULT parsed = parse_pipeline_stream(source, stream);
+        // As in ID3D12Device2::CreatePipelineState: a raw slot-86 stream the PC reading refuses, or leaves with an AS
+        // and no MS, is retried with the console's subobject numbering when it carries a DXIL mesh shader (kind 13).
+        if (!record && (FAILED(parsed) || (stream.as.pShaderBytecode && !stream.ms.pShaderBytecode)) &&
+            console_stream_enum_enabled()) {
+            const char* pc_reason = d3d12_trace::stream_refusal;
+            PipelineStream console{};
+            if (SUCCEEDED(parse_pipeline_stream(source, console, true)) && !console.as.pShaderBytecode &&
+                is_mesh_container(console.ms)) {
+                log_once("console pipeline stream: type 24 contains a mesh shader; DXIL kind", 13);
+                d3d12_xs::used_console_stream = true;
+                d3d12_trace::stream_refusal = nullptr;
+                stream = console;
+                used_console = true;
+                parsed = S_OK;
+            } else {
+                d3d12_trace::stream_refusal = pc_reason;
+            }
         }
-        if(!record) record=rt::d3d12_xs::PsoStreamRecord::capture(source);
+        if (FAILED(parsed)) return parsed;
+        if (!stream.has_cs) {
+            const auto& g = stream.graphics;
+            if (stream.as.BytecodeLength)
+                return stream_unsupported("amplification shaders are not supported; stream subobject",
+                                          D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS);
+            if (stream.ms.BytecodeLength && !stream.ms.pShaderBytecode) return E_INVALIDARG;
+            const bool mesh = stream.ms.pShaderBytecode && stream.ms.BytecodeLength;
+            if (mesh && (g.VS.BytecodeLength || g.HS.BytecodeLength || g.DS.BytecodeLength || g.GS.BytecodeLength ||
+                         g.StreamOutput.NumEntries))
+                return E_INVALIDARG;
+            if (!mesh && (!g.VS.pShaderBytecode || !g.VS.BytecodeLength)) return E_INVALIDARG;
+            if (mesh && (!state_.info.mesh_shader || !state_.context || !state_.context->vk.vkCmdDrawMeshTasksEXT))
+                return stream_unsupported(
+                    "mesh-shader PSOs need VK_EXT_mesh_shader, which the device has not enabled; stage", 1);
+            if (g.HS.BytecodeLength || g.DS.BytecodeLength || g.StreamOutput.NumEntries)
+                return stream_unsupported("graphics pipeline stage not supported yet (hull/domain/stream output):", 0);
+            if (g.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return E_INVALIDARG;
+        }
+        const auto* library = state_.library();
+        if (!library) return E_FAIL;
+        const auto verify = [&](const char* name, const D3D12_SHADER_BYTECODE& code) -> HRESULT {
+            if (!code.BytecodeLength) return S_OK;
+            if (!code.pShaderBytecode) return E_INVALIDARG;
+            const std::span<const std::uint8_t> bytes{static_cast<const std::uint8_t*>(code.pShaderBytecode),
+                                                      code.BytecodeLength};
+            const std::string identity = std::string(name) + leonida::sha256_hex(bytes);
+            {
+                std::lock_guard lock(verified_program_mutex_);
+                if (verified_programs_.count(identity)) return S_OK;
+            }
+            auto program = leonida::compute_program(bytes);
+            if (program.bytes.empty()) return E_INVALIDARG;
+            bool ambiguous = false;
+            const auto candidates = library->program_candidates(name, program, &ambiguous);
+            if (candidates.empty() || ambiguous) return E_INVALIDARG;
+            if (std::strcmp(name, "ms") == 0) {
+                const leonida::ShaderEntry* entry =
+                    pick_entry(candidates, [](const leonida::ShaderEntry&) { return true; });
+                if (!entry) return E_INVALIDARG;
+                if (const std::string refusal = leonida::mesh_limit_refusal(*entry, state_.mesh_limits());
+                    !refusal.empty()) {
+                    std::fprintf(stderr, "[rt] d3d12: %s\n", refusal.c_str());
+                    return stream_unsupported("mesh shader exceeds a device mesh limit");
+                }
+                if (!entry->graphics_root_window) {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: mesh shader %s was translated before the graphics root window; translate "
+                                 "the shaders again (make_game.py --stages shaders)\n",
+                                 entry->name.c_str());
+                    return E_INVALIDARG;
+                }
+            }
+            {
+                std::lock_guard lock(verified_program_mutex_);
+                verified_programs_.insert(identity);
+            }
+            return S_OK;
+        };
+        if (stream.has_cs) {
+            if (!stream.compute.CS.BytecodeLength) return E_INVALIDARG;
+            if (const HRESULT hr = verify("cs", stream.compute.CS); FAILED(hr)) return hr;
+        } else {
+            const auto& g = stream.graphics;
+            for (const auto& [name, code] : {std::pair{"vs", g.VS}, std::pair{"gs", g.GS},
+                                             std::pair{"ms", stream.ms}, std::pair{"ps", g.PS}}) {
+                if (const HRESULT hr = verify(name, code); FAILED(hr)) return hr;
+            }
+        }
+        if (!record) record = rt::d3d12_xs::PsoStreamRecord::capture(source, used_console);
         if(!record)return E_INVALIDARG;
         auto* pipeline=new PipelineState(state_);
         pipeline->attach_device(identity());

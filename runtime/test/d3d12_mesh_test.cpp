@@ -19,6 +19,7 @@
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
+#include "shader_fixture_path.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/d3d12_xs_pso_stream.h"
@@ -127,10 +128,14 @@ int main(int argc, char** argv) {
     const auto vs_container = shader_container(vs_program);
     const auto library = std::filesystem::temp_directory_path() / "leonida_mesh_test";
     std::filesystem::create_directories(library);
-    std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_draw.spv", std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_old.spv", std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(LEONIDA_TEST_VS_FULLSCREEN_SPV, library / "vs_fullscreen.spv",
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_MS_SPV), library / "ms_draw.spv",
+                               std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_MS_SPV), library / "ms_old.spv",
+                               std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_SPV), library / "ps_draw.spv",
+                               std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_FULLSCREEN_SPV),
+                               library / "vs_fullscreen.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);
@@ -220,6 +225,18 @@ int main(int argc, char** argv) {
         stream.add(TargetsSubobject{.inner = one_target()});
         Ref<ID3D12PipelineState> pso;
         EXPECT(create(device.p, stream, pso) == E_NOTIMPL && !pso.p);
+        using CreateSlot86 = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+        const auto slot86_fn = reinterpret_cast<CreateSlot86>(slot(device.p, 86));
+        const auto pc_mesh_desc = stream.desc();
+        EXPECT(slot86_fn(device.p, &pc_mesh_desc, IID_PPV_ARGS(&pso.p)) == E_NOTIMPL && !pso.p);
+        if (!pc_only) {
+            Stream console_no_ext;
+            console_no_ext.add(RootSubobject{.inner = root.p});
+            console_no_ext.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(24), D3D12_SHADER_BYTECODE>{.inner = ms});
+            console_no_ext.add(PsSubobject{.inner = ps}).add(TargetsSubobject{.inner = one_target()});
+            const auto console_no_ext_desc = console_no_ext.desc();
+            EXPECT(slot86_fn(device.p, &console_no_ext_desc, IID_PPV_ARGS(&pso.p)) == E_NOTIMPL && !pso.p);
+        }
         // A DISPATCH_MESH command signature is refused the same way.
         const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
         const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
@@ -290,6 +307,11 @@ int main(int argc, char** argv) {
             old_stream.add(RootSubobject{.inner = root.p}).add(MsSubobject{.inner = ms_old}).add(PsSubobject{.inner = ps});
             old_stream.add(TargetsSubobject{.inner = one_target()});
             EXPECT(create(device.p, old_stream, refused) == E_INVALIDARG && !refused.p);
+            using CreateSlot86 = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+            const auto old_desc = old_stream.desc();
+            EXPECT(reinterpret_cast<CreateSlot86>(slot(device.p, 86))(device.p, &old_desc, IID_PPV_ARGS(&refused.p)) ==
+                       E_INVALIDARG &&
+                   !refused.p);
         }
 
         // Streams the PC runtime refuses.

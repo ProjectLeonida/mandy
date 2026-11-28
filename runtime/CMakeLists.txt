@@ -4428,6 +4428,9 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_mesh_heavy_cache COMMAND d3d12_mesh_test)
       set_tests_properties(d3d12_mesh_heavy_cache PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT
           "LEONIDA_HEAVY_PIPELINE_CACHE_MS=1;LEONIDA_PIPELINE_CACHE_DIR=${CMAKE_CURRENT_BINARY_DIR}/heavy_cache_test")
+      add_test(NAME d3d12_mesh_on_demand COMMAND d3d12_mesh_test)
+      set_tests_properties(d3d12_mesh_on_demand PROPERTIES ENVIRONMENT "LEONIDA_PIPELINE_COMPILE=on-demand"
+                           SKIP_RETURN_CODE 77)
     else()
       message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test, d3d12_set0_compute_test and d3d12_mesh_test are not built")
     endif()
