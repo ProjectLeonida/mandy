@@ -312,6 +312,11 @@ Current limits, by design:
   `LEONIDA_INPUT_SCRIPT` set one scripted pad driven by the script alone, so a headless or CI build can get past the
   title's first prompt ([docs/gameinput.md](../docs/gameinput.md#scripted-input-without-sdl3)).
 
+- `bcrypt.dll` — `BCryptGenRandom` (`shims/bcrypt_rng.cpp`): delegates to host
+  `BCryptGenRandom` or `SystemFunction036` (RtlGenRandom). For reproducible diagnostics and testing, setting
+  `LEONIDA_RNG_SEED` to a 64-bit integer seed (decimal or `0x` hex) switches the RNG to a deterministic splitmix64
+  generator.
+
 ### What `xgameruntime.dll` reports: environment overrides
 
 The `xgameruntime` shim (`shims/xgameruntime.cpp`) answers the title's questions about the console and its package
