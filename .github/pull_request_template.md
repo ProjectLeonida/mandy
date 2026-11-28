@@ -1,8 +1,8 @@
-Claimed in the coordination issue as: <!-- the item ID from the open "Coordinating who works on what" issue,
-     for example TEST-17, or a link to your claim -->
+Claimed on the coordination board as: <!-- the item ID you posted with `python -I tools/coord.py claiming <ID>`
+     (https://leonida-coord.ytsodacan.workers.dev), for example TEST-17; older claims in the coordination issue still count -->
 
 Depends on: <!-- #N for every pull request this one builds on or conflicts with (see AGENTS.md; the
-     coordination issue lists the open pull requests); delete the line if it builds on none and conflicts with none -->
+     `python -I tools/coord.py check` lists overlapping claims); delete the line if it builds on none and conflicts with none -->
 
 Fixes: <!-- #N for each issue this closes (GitHub closes it on merge); delete the line if it closes none -->
 

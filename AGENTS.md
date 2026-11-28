@@ -36,23 +36,32 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
 
 ## Claim before you start
 
-- Work is claimed in the coordination issue before a pull request is opened: the open issue titled "Coordinating
-  who works on what". It moves to a new issue when the thread gets long, so look it up instead of using an old
-  number:
+- Work is claimed on the coordination board before a pull request is opened:
+  https://leonida-coord.ytsodacan.workers.dev. It continues the "Coordinating who works on what" thread, whose
+  issue hit GitHub's comment cap, with the same comments (`claiming:`, `finding:`, `done:`, `note:`). Claims made in
+  the issue still stand. `tools/coord.py` reads and posts it ([docs/coordination.md](docs/coordination.md)); reading
+  needs nothing, and posting signs in with `gh auth token`, `GITHUB_TOKEN` or `GH_TOKEN`.
+
+  Check first, and look at the open pull requests too:
 
   ```sh
-  gh issue list -R ubiquitarianism/leonida --state open --search "Coordinating who works on what in:title"
+  python -I tools/coord.py check <files> --id <ID>
   ```
 
-  With no `gh` auth, the search link in [CONTRIBUTING.md](CONTRIBUTING.md) works in a browser; say so when you cannot
-  read the claims at all rather than guessing that a thing is unclaimed.
+  It exits 1 when someone else's open claim shares those files or that ID. If someone has claimed the item or has a
+  pull request for it, stop and tell the user instead of writing it a second time. When you cannot reach the board,
+  say so rather than guessing that a thing is unclaimed. Otherwise claim it, with the files you mean to touch:
 
-  Check its tables and the open pull requests first. If someone has claimed the item or has a pull request for it,
-  stop and tell the user instead of writing it a second time.
-- Put the item ID from that issue in the pull request, and `Depends on: #N` for every pull request yours builds on.
+  ```sh
+  python -I tools/coord.py claiming <ID> "what you will do" --files <paths>
+  ```
+
+  Do not pass `--force` on your own; it is for overlap the user has agreed on.
+- Put the item ID in the pull request, and `Depends on: #N` for every pull request yours builds on. When the pull
+  request is open, post `python -I tools/coord.py done <ID> --pr <N>`.
 - Found work you won't do yourself (a bug, a missing method, a stale doc, a follow-up of your own pull request)?
-  Post it in the coordination issue as `finding: <one line>`, followed by where it is (file and line), why it matters,
-  and whether it needs game files or particular hardware. The coordinator checks it and lists it for others.
+  Post it with `python -I tools/coord.py finding "<one line>" --body "..."`: where it is (file and line), why it
+  matters, and whether it needs game files or particular hardware. It goes on the list for others.
 - For the D3D12 → Vulkan layer (`runtime/shims/d3d12_*`, `runtime/src/vulkan_*`), also read
   [docs/d3d12_vulkan.md](docs/d3d12_vulkan.md) and the open pull requests: most of that work builds on a few of
   them. The page that tracked it, #313, was in the original repository and is gone.

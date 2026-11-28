@@ -12,13 +12,23 @@ Thanks for helping. A few rules keep the project safe to host:
 
 ## Before you start
 
-Claim the work in [the coordination issue][claims] first: the open issue titled "Coordinating who works on what" (it
-moves to a new issue when the thread gets long, so the link searches for it). Check its tables and the open pull
-requests, post `claiming: <ID>` there (or a one-line description for something not listed yet), and put the ID in
-your pull request. When the pull request is open, post `done: <ID> -> #<PR>` there. Found something that needs doing
-but won't do it yourself? Post `finding: <one line>` there, with where it is and why it matters, and it goes on the
-list for others. When two pull requests overlap anyway, the one that lands first is merged and the other is asked to
-rebase or close. Pull requests target `main`.
+Claim the work on [the coordination board][board] first. It continues the "Coordinating who works on what" thread
+([the coordination issue][claims], which hit GitHub's comment cap) with the same comments in the same words, signed in
+with your GitHub account. Existing claims in the issue still stand. `python -I tools/coord.py` posts and reads it;
+[docs/coordination.md](docs/coordination.md) has the details.
+
+1. Check: `python -I tools/coord.py check <files> --id <ID>` lists the open claims that share those files (a path
+   ending in `/` covers a folder) or that ID, and exits 1 when there are any. Look at the open pull requests too.
+2. Claim: `python -I tools/coord.py claiming <ID> "what you will do" --files <paths>` posts
+   `claiming: <ID> - ...`, or use a one-line description for something not listed yet. Put the ID in your pull
+   request. The board refuses a claim that overlaps someone else's unless you pass `--force` for overlap you have
+   agreed on.
+3. Done: when the pull request is open, `python -I tools/coord.py done <ID> --pr <N>` posts `done: <ID> -> #<PR>`.
+
+Found something that needs doing but won't do it yourself? `python -I tools/coord.py finding "<one line>" --body
+"<file and line, why it matters, how to reproduce>"` puts it on the list for others. `board` lists the open claims and
+`read --id <ID>` shows everything said about an item. When two pull requests overlap anyway, the one that lands first
+is merged and the other is asked to rebase or close. Pull requests target `main`.
 
 The original repository (`ItsNotRexed/Leonida`) went private on 23 November 2026, and its issues and pull requests
 went with it. A `#N` in the docs, in a code comment or in a commit message from before that date is an **old**
@@ -35,6 +45,7 @@ number and links nowhere now, including the two this page used to send you to: #
   the files there; [docs/testing.md](docs/testing.md) has how to run the tests.
 - The plan and status of the D3D12 → Vulkan layer are in [docs/d3d12_vulkan.md](docs/d3d12_vulkan.md).
 
+[board]: https://leonida-coord.ytsodacan.workers.dev
 [claims]: https://github.com/ubiquitarianism/leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
 
 ## Working on the code
@@ -94,7 +105,8 @@ How maintainers review and merge pull requests.
 
 **Is it mergeable?**
 
-- It is claimed in [the coordination issue][claims] by the pull request's author.
+- It is claimed on [the coordination board][board] (or, for older work, in [the coordination issue][claims]) by the
+  pull request's author.
 - One topic, not a duplicate of another open pull request. If two fix the same thing, the better one wins.
 - A new test that fails on `main` and passes with the pull request.
 - No game data: `python -I scripts/check_no_game_data.py <files>`.
