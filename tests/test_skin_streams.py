@@ -530,6 +530,22 @@ class TestCli(unittest.TestCase):
             with open(path, "rb") as fh:
                 self.assertEqual(fh.read(), data)
 
+    def test_case_only_spelling_of_a_missing_report_is_one_path(self):
+        # normcase keeps case on macOS, and samefile cannot see a file that has not been created.
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "Reports")
+            os.mkdir(folder)
+            probe = os.path.join(folder, "Probe.tmp")
+            with open(probe, "wb"):
+                pass
+            insensitive = os.path.exists(os.path.join(folder, "probe.tmp"))
+            os.remove(probe)
+            if not insensitive:
+                self.skipTest("volume keeps case")
+            first = os.path.join(tmp, "Reports", "out.json")
+            second = os.path.join(tmp, "reports", "out.json")
+            self.assertTrue(ss.same_output_path(first, second))
+
     def test_json_that_is_a_directory_is_refused_before_the_scan(self):
         with tempfile.TemporaryDirectory() as tmp:
             path, _ = self._archive(tmp)
