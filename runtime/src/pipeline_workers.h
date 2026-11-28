@@ -60,7 +60,14 @@ public:
         while (batch.next < batch.count) step(batch, lock);
         batch.done.wait(lock, [&] { return !batch.running; });
         lock.unlock();
-        if (batch.error) std::rethrow_exception(batch.error);
+        if (batch.error) {
+            // Wine 11.0's rethrow_exception throws the stored object itself, not a copy, so the exception_ptr in
+            // `batch` (a local of this frame) would free it while the throw unwinds, and the caller's handler would
+            // see no runtime_error. A thread_local reference keeps it alive until this thread's next error.
+            thread_local std::exception_ptr in_flight;
+            in_flight = std::move(batch.error);
+            std::rethrow_exception(in_flight);
+        }
     }
 
     // Ends the workers once each has finished the job it is in. A run() in progress on another thread finishes its
