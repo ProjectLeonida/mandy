@@ -292,7 +292,13 @@ int mixed_mask(ID3D12Device& device) {
         std::puts("Mixed mask: no dedicated sparse buffer memory type besides the arena's; skipped");
         return 77;
     }
-    std::printf("Mixed mask: dedicated type %u, arena type %u, device mask %#x, mixed mask %#x\n",
+    // CreateReservedResource assigns the device mask, not the mixed one: 0x2 on a device whose mask excludes the
+    // arena bit (NVIDIA), 0x12 on one whose mask includes it (Intel Arc). Either way Heap::tiles() reuses the
+    // heap's existing allocation across a, b and c.
+    std::printf("Mixed mask: dedicated type %u, arena type %u, device mask %#x, mixed mask %#x; "
+                "CreateReservedResource assigns the device mask rather than the mixed one (0x2 where the device "
+                "mask excludes the arena bit, like NVIDIA, 0x12 where it includes it, like Intel Arc), and "
+                "Heap::tiles() reuses the heap's existing allocation across a, b and c either way\n",
                 unsigned(bit_index(ded_bit)), unsigned(arena_type), unsigned(mask), unsigned(ded_bit | arena_bit));
 
     ComPtr<ID3D12Resource> a, b, image, upload, readback;
@@ -339,11 +345,14 @@ int mixed_mask(ID3D12Device& device) {
     const D3D12_TILE_REGION_SIZE one{1, FALSE, 0, 0, 0};
     const UINT offsets[] = {0, 1}, counts[] = {1, 1};
     // A takes the dedicated allocation. B's mask is the mixed one (dedicated | arena), a superset of A's, so the
-    // reuse rule must hand B the same allocation rather than refuse it.
+    // reuse rule must hand B the same allocation rather than refuse it. A, B and C all map to heap tile 0 of that
+    // reused allocation, so B and C read A's patterns[0] when Heap::tiles() reuses it and read 0 when the update
+    // is refused. Tile 1 is a distinct 64 KiB page of the reused 128 KiB allocation on drivers that do not alias
+    // the two pages (NVIDIA), so a tile-1 mapping would read 0 there even though the reuse worked.
     queue->UpdateTileMappings(a.Get(), 1, &origin, &one, heap.Get(), 1, nullptr, offsets, counts,
                               D3D12_TILE_MAPPING_FLAG_NONE);
     EXPECT_MISMATCH(SUCCEEDED(device.GetDeviceRemovedReason()));
-    queue->UpdateTileMappings(b.Get(), 1, &origin, &one, heap.Get(), 1, nullptr, offsets + 1, counts + 1,
+    queue->UpdateTileMappings(b.Get(), 1, &origin, &one, heap.Get(), 1, nullptr, offsets, counts,
                               D3D12_TILE_MAPPING_FLAG_NONE);
     EXPECT_MISMATCH(SUCCEEDED(device.GetDeviceRemovedReason()));
 
@@ -411,6 +420,37 @@ int mixed_mask(ID3D12Device& device) {
         return 1;
     }
 
+    // A third reserved buffer with the same mixed mask aliases the same dedicated tile as A and B, and the shared
+    // tile must still hold the reused pattern. The C readback doubles as the earlier buffers' readback because A, B
+    // and C all back onto one allocation. A genuinely disjoint buffer mask is not constructible through the public
+    // API (the driver reports one memory type mask per buffer desc from vkGetBufferMemoryRequirements), so the image
+    // check below is the reachable incompatible case rather than a third buffer's refusal.
+    {
+        ComPtr<ID3D12Resource> c;
+        EXPECT_MISMATCH(SUCCEEDED(device.CreateReservedResource(&reserved, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&c))));
+        // Heap tile 0, as for A and B: page 0 of the reused allocation is the one that holds patterns[0].
+        queue->UpdateTileMappings(c.Get(), 1, &origin, &one, heap.Get(), 1, nullptr, offsets, counts,
+                                  D3D12_TILE_MAPPING_FLAG_NONE);
+        EXPECT_MISMATCH(SUCCEEDED(device.GetDeviceRemovedReason()));
+        EXPECT_MISMATCH(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+        std::fill_n(static_cast<std::uint32_t*>(mapped), words_per_tile, std::uint32_t{0});
+        readback->Unmap(0, nullptr);
+        list->CopyTiles(c.Get(), &origin, &one, readback.Get(), 0,
+                        D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+        EXPECT_MISMATCH(submit(5));
+        EXPECT_MISMATCH(wait(5));
+        std::uint32_t fifth = 0;
+        EXPECT_MISMATCH(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+        fifth = *static_cast<const std::uint32_t*>(mapped);
+        readback->Unmap(0, &empty);
+        if (fifth != patterns[0]) {
+            std::fprintf(stderr, "Mixed mask: buffer C tile reads %#010x, want the reused allocation's %#010x\n",
+                         unsigned(fifth), unsigned(patterns[0]));
+            return 1;
+        }
+        std::puts("Mixed mask: a third same-mask buffer aliased the reused tile");
+    }
+
     // A texture on the same buffer-only heap is refused (its backing is separate), and the refusal must leave B's
     // tile untouched. A disjoint buffer mask is not constructible through the public API: the driver reports one
     // memory type mask per buffer desc, so the image is the reachable incompatible case.
@@ -432,8 +472,8 @@ int mixed_mask(ID3D12Device& device) {
         readback->Unmap(0, nullptr);
         list->CopyTiles(b.Get(), &origin, &one, readback.Get(), tile_bytes,
                         D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
-        EXPECT_MISMATCH(submit(5));
-        EXPECT_MISMATCH(wait(5));
+        EXPECT_MISMATCH(submit(6));
+        EXPECT_MISMATCH(wait(6));
         std::uint32_t fourth = 0;
         EXPECT_MISMATCH(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         fourth = static_cast<const std::uint32_t*>(mapped)[tile_bytes / sizeof(std::uint32_t)];
