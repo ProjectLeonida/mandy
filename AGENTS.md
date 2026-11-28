@@ -61,6 +61,10 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
   repository. The old open issues are indexed by title in
   [#18](https://github.com/ubiquitarianism/leonida/issues/18) and the old open pull requests are kept as
   `old-pr/<old number>` branches ([#17](https://github.com/ubiquitarianism/leonida/issues/17)).
+- Searching GitHub for pull requests by path (`gh search prs 'path:...'`) returns nothing here, so ask git which
+  open pull requests change a file: `python -I scripts/pr_overlap.py <file or folder>...`, before you start on it.
+  With no argument it takes what your branch changes and says which open pull requests conflict with it; those
+  belong on the `Depends on:` line as well.
 
 ## Before you guess, look
 
