@@ -25,6 +25,9 @@ Set `LEONIDA_GAME_DIR`, `LEONIDA_SHADERS` (and `GTA6RT`, `LEONIDA_RUNS` if you u
 profile and the parameters can be left out. Defaults: `gta6rt` from `runtime\build\RelWithDebInfo\` of this
 checkout, the executable from the game folder (`-Exe` or `LEONIDA_EXE` when it lives elsewhere), outputs in `$HOME\leonida-runs`.
 The script refuses an output folder inside the repository.
+The runtime starts in `<out>\work_<name>`, where driver artifacts such as `ucode.elf` can land. Relative path
+parameters are resolved from the caller's PowerShell location. Use absolute paths for additional runtime switches
+supplied through `-ExtraArgs` or custom environment variables.
 
 ## What it sets
 

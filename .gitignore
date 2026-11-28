@@ -26,6 +26,7 @@ RpfPreview/
 *.wav
 
 # ---- build output and caches ----
+/ucode.elf
 build/
 build-*/
 bin/
