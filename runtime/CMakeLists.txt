@@ -4643,6 +4643,13 @@ if(TARGET Vulkan::Headers)
       target_compile_options(replay_khr_as_copy_postbuild_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME replay_khr_as_copy_postbuild COMMAND replay_khr_as_copy_postbuild_test)
+    # A KHR TLAS build of instance pointers does not end the list's preparation (no GPU).
+    add_executable(replay_khr_tlas_pointers_test test/replay_khr_tlas_pointers_test.cpp)
+    target_link_libraries(replay_khr_tlas_pointers_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_khr_tlas_pointers_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_khr_tlas_pointers COMMAND replay_khr_tlas_pointers_test)
     # PreparedList::wrote_readback and readback_src_stages match the actual producer stage (depth24, rgb96, UAV clear; no GPU).
     add_executable(replay_readback_stages_test test/replay_readback_stages_test.cpp)
     target_link_libraries(replay_readback_stages_test PRIVATE Vulkan::Headers)

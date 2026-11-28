@@ -4197,7 +4197,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 }
                 if (build->is_tlas && build->instance_pointers && build->instance_count) {
                     if (!vk.prepare_khr_instances || !vk.host_at || !vk.buffer_at) return unsupported_at(__LINE__);
-                    return vk.prepare_khr_instances(*build, p.khr_instances);
+                    // Only a failure ends the list here, as on the XDXR path above: the commands after this one still
+                    // have to be prepared, and the end-of-list checks and segment plans still have to run.
+                    const ReplayResult staged = vk.prepare_khr_instances(*build, p.khr_instances);
+                    if (staged != ReplayResult::success) return staged;
                 }
             }
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
