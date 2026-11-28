@@ -1662,7 +1662,11 @@ public:
     // With submit_mutex_ held.
     VkResult wait_submitted_locked(std::uint64_t timeout_ns, const char* what) {
         if (is_device_lost()) return VK_ERROR_DEVICE_LOST;  // a queue's timeline may be gone already
-        const auto pending = retire_tickets_.pending_through(submitted_ticket_.load(std::memory_order_acquire));
+        std::vector<std::pair<VkSemaphore, std::uint64_t>> pending;
+        {
+            std::lock_guard lock(retire_mutex_);
+            pending = retire_tickets_.pending_through(submitted_ticket_.load(std::memory_order_acquire));
+        }
         if (pending.empty()) return VK_SUCCESS;
         std::vector<VkSemaphore> semaphores;
         std::vector<std::uint64_t> values;
@@ -1988,7 +1992,7 @@ public:
     std::uint64_t wait_retire_ticket(std::uint64_t ticket) {
         std::vector<std::pair<VkSemaphore, std::uint64_t>> pending;
         {
-            std::lock_guard lock(submit_mutex_);
+            std::lock_guard lock(retire_mutex_);
             if (is_device_lost()) return 0;
             pending = retire_tickets_.pending_through(ticket);
         }
@@ -2018,7 +2022,7 @@ public:
         bool lost = false;
         std::uint64_t ticket = 0;
         {
-            std::lock_guard lock(submit_mutex_);
+            std::lock_guard lock(retire_mutex_);
             if (is_device_lost()) return 0;
             ticket = retire_tickets_.completed([this, &lost](VkSemaphore semaphore, std::uint64_t value) {
                 std::uint64_t done = 0;
@@ -2028,9 +2032,9 @@ public:
                 return result == VK_SUCCESS && done >= value;
             });
         }
-        // Outside submit_mutex_, as in submit(): notifying the fence dispatcher can run callbacks that submit.
-        // A DEVICE_LOST seen here is the first Vulkan operation to discover it; it must not be mistaken for
-        // "this ticket has not completed".
+        // Outside retire_mutex_, and without submit_mutex_ (notifying the fence dispatcher can run callbacks that
+        // submit). A DEVICE_LOST seen here is the first Vulkan operation to discover it; it must not be mistaken
+        // for "this ticket has not completed".
         if (lost) mark_device_lost();
         return lost ? 0 : ticket;
     }
@@ -2053,10 +2057,14 @@ public:
     // monotonic even when another queue completes first; global tickets are retired in order.
     void record_submit_locked(VkSemaphore progress, std::uint64_t value) {
         const auto ticket = submitted_ticket_.fetch_add(1, std::memory_order_acq_rel) + 1;
-        retire_tickets_.record(ticket, progress, value);
+        {
+            std::lock_guard lock(retire_mutex_);
+            retire_tickets_.record(ticket, progress, value);
+        }
         note_image_work_locked();
     }
     void retire_queue_idle_locked(VkSemaphore progress) {
+        std::lock_guard lock(retire_mutex_);
         retire_tickets_.queue_idle(progress);
     }
 
@@ -2227,7 +2235,11 @@ private:
         return framebuffer;
     }
 
+    // Called with submit_mutex_ held. Never waits for retire_mutex_: a query already in progress watches the same
+    // timelines, and waiting for it here would keep the submit lock, and every submission, behind a stuck query.
     std::uint64_t poll_retirement_locked(VkResult& result) {
+        std::unique_lock lock(retire_mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) return 0;      // report no progress this tick; the next one reads it
         return retire_tickets_.completed([&](VkSemaphore semaphore, std::uint64_t value) {
             std::uint64_t done = 0;
             result = observe_result(vk.vkGetSemaphoreCounterValue(device_, semaphore, &done),
@@ -2360,15 +2372,19 @@ private:
     alignas(64) std::shared_mutex resource_mutex_;  // shared for prepare lookups, unique for add/remove
     alignas(64) std::mutex tracker_mutex_;
     alignas(64) std::mutex views_mutex_;
-    // Lock hierarchy (see VulkanQueue::execute): resource_mutex_ -> tracker_mutex_ -> submit_mutex_. A PSO build
-    // (shims/d3d12_vulkan_device.cpp, PipelineState::build_compute / build) holds its variants_mutex_ and the
-    // static big_compile mutex while it waits for the submit lock (SubmitMutex::let_submit_finish) or at the compile
-    // gate: variants_mutex_ -> big_compile -> submit_mutex_, and nothing holding submit_mutex_ takes either. The
-    // gate's own mutex is a leaf; a submission waits at the gate with submit_mutex_ held, for creates already in the
-    // driver only (SubmitMutex::CompileTurn).
+    // Lock hierarchy (see VulkanQueue::execute): resource_mutex_ -> tracker_mutex_ -> submit_mutex_ -> retire_mutex_.
+    // A PSO build (shims/d3d12_vulkan_device.cpp, PipelineState::build_compute / build) holds its variants_mutex_
+    // and the static big_compile mutex while it waits for the submit lock (SubmitMutex::let_submit_finish) or at the
+    // compile gate: variants_mutex_ -> big_compile -> submit_mutex_, and nothing holding submit_mutex_ takes either.
+    // The gate's own mutex is a leaf; a submission waits at the gate with submit_mutex_ held, for creates already in
+    // the driver only (SubmitMutex::CompileTurn).
     alignas(64) SubmitMutex submit_mutex_;
     bool image_work_pending_ = false;  // under submit_mutex_
     HostTextureStats host_texture_stats_;  // under submit_mutex_
+    // The retirement records have their own innermost lock: a caller that only asks what retired
+    // (completed_retire_ticket, the progress watch) must not wait for a submission, or a vkDeviceWaitIdle, that
+    // holds submit_mutex_. Nothing takes retire_mutex_ before submit_mutex_.
+    alignas(64) std::mutex retire_mutex_;
     RetireTickets<VkSemaphore> retire_tickets_;
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;
@@ -3224,7 +3240,8 @@ private:
             }
         } khr_guard{this};
         std::function<void(bool)> bindless_commit;
-        // Lock hierarchy: state_mutex_ -> pipeline_mutex_ -> resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
+        // Lock hierarchy: state_mutex_ -> pipeline_mutex_ -> resource_mutex_ -> tracker_mutex_ -> submit_mutex_
+        // -> retire_mutex_.
         // Shared pipeline_lock keeps registered pipelines, pipeline_names, and pipeline_workers_ alive across
         // preparation, compilation, and emit. Shared resource_lock allows concurrent prepare() across queues and is
         // released while unbuilt pipelines compile so add_resource()/remove_resource() never stall behind shader

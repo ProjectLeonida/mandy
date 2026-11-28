@@ -15826,8 +15826,9 @@ public:
                 state_.bindless->release_retired();
             } else if (state_.bindless->has_retired()) {
                 // Generations of the table that an earlier flush replaced: free those whose submissions are done.
-                // Nothing waits; the rest stay for a later submit. completed_retire_ticket() takes submit_mutex_,
-                // which comes after the resource, tracker and descriptor locks held here.
+                // Nothing waits; the rest stay for a later submit. completed_retire_ticket() takes only
+                // retire_mutex_, a leaf below submit_mutex_, so it comes after the resource, tracker and descriptor
+                // locks held here and cannot wait for a submission on the submit lock.
                 state_.bindless->release_retired(context.completed_retire_ticket());
                 // A queue whose work is stalled (a fence only the CPU signals, long async work) keeps its ticket from
                 // completing, and each replacing flush adds a generation. Past the cap wait, once the oldest is in the
