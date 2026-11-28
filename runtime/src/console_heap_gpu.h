@@ -175,7 +175,8 @@ public:
         std::vector<std::uint32_t> gone;
         for (auto it = by_to_.lower_bound(from); it != by_to_.end() && it->first < end; ++it) {
             const Entry& e = entries_[it->second];
-            if (e.to + std::max<std::uint64_t>(e.span, 1) > start) gone.push_back(it->second);
+            const std::uint64_t span = std::max<std::uint64_t>(e.span, 1);
+            if (e.to >= start || span > start - e.to) gone.push_back(it->second);
         }
         for (const std::uint32_t at : gone) erase_at(at);
         return gone.size();
@@ -556,7 +557,7 @@ public:
         const auto push = fn<PFN_vkCmdPushConstants>("vkCmdPushConstants");
         // The copies first (another kind of work in the same prelude), then what reads their destinations may run.
         if (!copies_.empty()) {
-            std::sort(copies_.begin(), copies_.end(), [](const Copy& a, const Copy& b) {
+            std::stable_sort(copies_.begin(), copies_.end(), [](const Copy& a, const Copy& b) {
                 return a.src != b.src ? a.src < b.src : a.dst < b.dst;
             });
             std::vector<VkBufferCopy> regions;
@@ -730,7 +731,11 @@ public:
             ++stats_.failed;
             for (const auto& [heap, list] : it->work)
                 if (heaps_[heap].slots)
-                    for (const std::uint32_t item : list) queue_locked(heap, item);
+                    for (const std::uint32_t item : list) {
+                        const std::uint32_t slot = item & ~kZeroFirst;
+                        if (slot < heaps_[heap].slots && !heaps_[heap].queued[slot])
+                            queue_locked(heap, item);
+                    }
             for (const auto& r : it->rescans) {
                 if (!heaps_[r.heap].slots) continue;
                 auto& to = r.filtered ? heaps_[r.heap].rescan_filtered : heaps_[r.heap].rescan;
@@ -740,8 +745,8 @@ public:
             change_title_.insert(change_title_.end(), it->change_title.begin(), it->change_title.end());
             for (const int heap : it->filled)
                 if (heaps_[heap].slots) heaps_[heap].meta_clear = true;
-            copies_.insert(copies_.end(), it->copies.begin(), it->copies.end());
-            keeps_.insert(keeps_.end(), it->keeps.begin(), it->keeps.end());
+            copies_.insert(copies_.begin(), it->copies.begin(), it->copies.end());
+            keeps_.insert(keeps_.begin(), it->keeps.begin(), it->keeps.end());
             for (std::size_t i = 0; i < it->updates.size(); i += ConsoleHeapKeys::kUpdateWords)
                 keys_.touch(it->updates[i]);
             if (it->cleared) clear_keys_ = true;
