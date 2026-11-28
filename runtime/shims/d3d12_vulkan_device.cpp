@@ -44,6 +44,7 @@
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
+#include "../src/host_import_policy.h"
 #include "../src/vulkan_mesh_limits.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
@@ -88,6 +89,7 @@
 #include "../src/console_heap_gpu.h"
 
 #include <vulkan/vulkan_win32.h>
+#include <psapi.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "advapi32.lib")
 #endif
@@ -126,6 +128,55 @@
 
 namespace rt::d3d12 {
 namespace {
+
+bool running_under_wine() {
+    static const bool wine = [] {
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        return ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+    }();
+    return wine;
+}
+
+bool host_range_importable(const void* base_address, VkDeviceSize bytes, bool require_writable) {
+    if (!base_address || !bytes) return false;
+    const bool wine = running_under_wine();
+    const auto base = reinterpret_cast<std::uintptr_t>(base_address);
+    leonida::HostImportRangeCheck check{wine, require_writable};
+    for (VkDeviceSize at = 0; at < bytes;) {
+        const auto* current = static_cast<const char*>(base_address) + at;
+        MEMORY_BASIC_INFORMATION region{};
+        if (!VirtualQuery(current, &region, sizeof(region))) return false;
+        const auto region_end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+        if (region_end <= base + at) return false;
+        bool mapped_file = false;
+        if (wine && region.Type == MEM_MAPPED) {
+            wchar_t mapped_name[8]{};
+            mapped_file =
+                K32GetMappedFileNameW(GetCurrentProcess(), const_cast<char*>(current), mapped_name, 8) != 0;
+        }
+        const leonida::HostRegion info{
+            reinterpret_cast<std::uintptr_t>(region.AllocationBase),
+            region.State == MEM_COMMIT,
+            (region.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0,
+            (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE | PAGE_GUARD)) != 0,
+            mapped_file,
+        };
+        if (!check.accept(info)) return false;
+        at = region_end - base;
+    }
+    return true;
+}
+
+std::vector<std::uint32_t> host_import_types_for(const VkPhysicalDeviceMemoryProperties& memory,
+                                                 std::uint32_t allowed_mask) {
+    std::array<std::uint32_t, VK_MAX_MEMORY_TYPES> flags{};
+    const std::uint32_t count =
+        memory.memoryTypeCount < VK_MAX_MEMORY_TYPES ? memory.memoryTypeCount : VK_MAX_MEMORY_TYPES;
+    for (std::uint32_t i = 0; i < count; ++i) flags[i] = memory.memoryTypes[i].propertyFlags;
+    return leonida::host_import_memory_types(
+        allowed_mask, flags.data(), count,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+}
 
 // Every descriptor slot is this many bytes; an RTV or DSV slot holds a leonida::TargetView. The console's own
 // increments are open question 4 in docs/d3d12_vulkan.md; the application reads them from the device, as it must.
@@ -5523,13 +5574,7 @@ struct DeviceState {
             (span % alignment))
             return false;
         const auto* pages = reinterpret_cast<const char*>(static_cast<std::uintptr_t>(host_va));
-        for (VkDeviceSize at = 0; at < span;) {
-            MEMORY_BASIC_INFORMATION region{};
-            if (!VirtualQuery(pages + at, &region, sizeof(region)) || region.State != MEM_COMMIT ||
-                (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE | PAGE_GUARD)))
-                return false;
-            at = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize - host_va;
-        }
+        if (!host_range_importable(pages, span, true)) return false;
         VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         VkBufferCreateInfo create{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
@@ -5560,19 +5605,20 @@ struct DeviceState {
         import.pHostPointer = const_cast<char*>(pages);
         VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
         flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-        heap.pin = leonida::kernel_writes::hold(pages, std::size_t(heap.bytes));  // as create_host_buffer's
-        for (const VkMemoryPropertyFlags want :
-             {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
-              VkMemoryPropertyFlags(0)}) {
-            for (std::uint32_t i = 0; i < memory.memoryTypeCount && !heap.memory; ++i) {
-                if (!(types & (1u << i)) || (memory.memoryTypes[i].propertyFlags & want) != want) continue;
-                VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
-                allocate.allocationSize = span;
-                allocate.memoryTypeIndex = i;
-                if (vk.vkAllocateMemory(info.device, &allocate, nullptr, &heap.memory) != VK_SUCCESS)
-                    heap.memory = VK_NULL_HANDLE;
+        heap.pin = leonida::kernel_writes::hold(pages, std::size_t(span));  // as create_host_buffer's
+        if (!host_range_importable(pages, span, true)) return fail();
+        for (const std::uint32_t i : host_import_types_for(memory, types)) {
+            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+            allocate.allocationSize = span;
+            allocate.memoryTypeIndex = i;
+            VkResult result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            {
+                std::lock_guard serial(memory_mutex());
+                result = vk.vkAllocateMemory(info.device, &allocate, nullptr, &heap.memory);
             }
-            if (heap.memory) break;
+            if (result == VK_SUCCESS) break;
+            heap.memory = VK_NULL_HANDLE;
+            if (result == VK_ERROR_INVALID_EXTERNAL_HANDLE) break;
         }
         if (!heap.memory || vk.vkBindBufferMemory(info.device, heap.buffer, heap.memory, 0) != VK_SUCCESS)
             return fail();
@@ -9241,22 +9287,9 @@ public:
         // The whole imported range must be committed, possibly across several allocations (the retail buffer spans
         // three mapped windows); a page not committed yet (xmem commits on first touch) or a write-combined one (on
         // an RTX 5090 such an import succeeded but GPU reads returned wrong bytes, found in review) is not imported,
-        // and the ordinary-buffer fallback answers instead.
-        bool importable = true;
-        for (VkDeviceSize at = 0; at < bytes;) {
-            MEMORY_BASIC_INFORMATION region{};
-            // A page that is not writable right now (a shadow buffer's write watch on the same page, say) cannot be
-            // pinned for the GPU: the kernel module refuses it, loudly, and the shadow answers anyway.
-            if (!VirtualQuery(static_cast<const char*>(base_address) + at, &region, sizeof(region)) ||
-                region.State != MEM_COMMIT || (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE | PAGE_GUARD)) ||
-                !(region.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
-                importable = false;
-                break;
-            }
-            const auto region_end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
-            at = region_end - base;
-        }
-        if (!importable) return E_NOTIMPL;
+        // and the ordinary-buffer fallback answers instead. Under Wine, file-backed mapped views and multi-VMA ranges
+        // are also declined before calling the driver (host_import_policy.h).
+        if (!host_range_importable(base_address, bytes, true)) return E_NOTIMPL;
         VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
@@ -9302,29 +9335,29 @@ public:
         VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
         flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         // The imported pages are pinned before the import and until its memory is freed, so the shadow trackers
-        // and the geometry watch never make them read-only meanwhile (leonida::kernel_writes::hold). Taken first,
-        // so no guard lands between the writability check above and the import.
+        // and the geometry watch never make them read-only meanwhile (leonida::kernel_writes::hold). Re-check after
+        // pinning so no guard or remap that landed between the initial check and the hold reaches vkAllocateMemory.
         host_pin_ = leonida::kernel_writes::hold(base_address, std::size_t(bytes));
-        // Host-visible and coherent first, as the caller's pages are; then any type both the import and the
-        // buffer take.
-        for (const VkMemoryPropertyFlags want :
-             {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
-              VkMemoryPropertyFlags(0)}) {
-            for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount && !memory_; ++i) {
-                if (!(types & (1u << i)) || (device_.memory.memoryTypes[i].propertyFlags & want) != want) continue;
-                VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                                              need_bda ? static_cast<const void*>(&flags) : &import};
-                allocate.allocationSize = bytes;
-                allocate.memoryTypeIndex = i;
+        if (!host_range_importable(base_address, bytes, true)) return decline(E_NOTIMPL);
+        // Host-visible and coherent first, as the caller's pages are; then any other type both the import and the
+        // buffer take (each type tried at most once).
+        for (const std::uint32_t i : host_import_types_for(device_.memory, types)) {
+            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                          need_bda ? static_cast<const void*>(&flags) : &import};
+            allocate.allocationSize = bytes;
+            allocate.memoryTypeIndex = i;
+            VkResult result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            {
                 std::lock_guard serial(DeviceState::memory_mutex());
-                if (vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &memory_) == VK_SUCCESS) {
-                    memory_flags_ = device_.memory.memoryTypes[i].propertyFlags;
-                    device_.host_imports.fetch_add(1, std::memory_order_relaxed);
-                } else {
-                    memory_ = VK_NULL_HANDLE;
-                }
+                result = vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &memory_);
             }
-            if (memory_) break;
+            if (result == VK_SUCCESS) {
+                memory_flags_ = device_.memory.memoryTypes[i].propertyFlags;
+                device_.host_imports.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            memory_ = VK_NULL_HANDLE;
+            if (result == VK_ERROR_INVALID_EXTERNAL_HANDLE) break;
         }
         if (!memory_) return decline(E_OUTOFMEMORY);
         if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS) return decline(E_OUTOFMEMORY);
@@ -15405,6 +15438,7 @@ public:
                 block.memoryTypeIndex = type;
                 VkDeviceMemory out = VK_NULL_HANDLE;
                 leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::image_blocks);
+                std::lock_guard serial(DeviceState::memory_mutex());
                 return make(device, &block, nullptr, &out) == VK_SUCCESS ? out : VkDeviceMemory(VK_NULL_HANDLE);
             },
             [device = info.device, free = state_.context->vk.vkFreeMemory](VkDeviceMemory block) {
@@ -19635,24 +19669,22 @@ public:
         flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         std::uint32_t memory_type = 0;
-        // Host-visible and coherent first, as the caller's pages are; then any type the driver offers.
-        for (const VkMemoryPropertyFlags want :
-             {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
-              VkMemoryPropertyFlags(0)}) {
-            for (std::uint32_t i = 0; i < state_.memory.memoryTypeCount && !memory; ++i) {
-                if (!(host.memoryTypeBits & (1u << i)) ||
-                    (state_.memory.memoryTypes[i].propertyFlags & want) != want)
-                    continue;
-                VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
-                allocate.allocationSize = size;
-                allocate.memoryTypeIndex = i;
-                if (state_.context->vk.vkAllocateMemory(state_.info.device, &allocate, nullptr, &memory) ==
-                    VK_SUCCESS)
-                    memory_type = i;
-                else
-                    memory = VK_NULL_HANDLE;
+        // Host-visible and coherent first, as the caller's pages are; then any other type the driver offers.
+        for (const std::uint32_t i : host_import_types_for(state_.memory, host.memoryTypeBits)) {
+            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+            allocate.allocationSize = size;
+            allocate.memoryTypeIndex = i;
+            VkResult result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            {
+                std::lock_guard serial(DeviceState::memory_mutex());
+                result = state_.context->vk.vkAllocateMemory(state_.info.device, &allocate, nullptr, &memory);
             }
-            if (memory) break;
+            if (result == VK_SUCCESS) {
+                memory_type = i;
+                break;
+            }
+            memory = VK_NULL_HANDLE;
+            if (result == VK_ERROR_INVALID_EXTERNAL_HANDLE) break;
         }
         if (!memory) {
             log_once("OpenExistingHeapFromAddress: importing the host range failed; size in KiB", int(size / 1024));
