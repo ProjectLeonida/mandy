@@ -1330,10 +1330,6 @@ class PixelShaders(unittest.TestCase):
                     for c in range(4):
                         if exp[c] is not None:
                             self.assertEqual(w64[lane][c], exp[c], f"{name} wave64 lane {lane} c{c}")
-                if name == "ps_w64_c_readlane":
-                    with self.assertRaises(wi.UnsupportedConstruct):
-                        _run_ps_cut(asm, 32, push=push)
-                    continue
                 w32 = _run_ps_cut(asm, 32, push=push, memory=mem32)
                 if tier in ("A", "B"):
                     self.assertEqual(w32, w64)

@@ -553,6 +553,7 @@ class Gen:
         self.cur_uniform_readlane = False
         self.w64g = None           # wave64 VS/PS/GS: wave64_halves.analyse() result (tier, reasons, rewrite sites)
         self.scalar_spills = set() # (vgpr, lane) pure scalar spill slots lowered to self.parked (all waves/stages)
+        self.spill_readlanes = set()  # id(ins) of mixed-VGPR v_readlane_b32 proven to reload a parked spill slot
         self.emulate = False       # --wave64-emulate: exact wave64 on any subgroup size (cs/ms; see x_round)
         self.emulate_inline = False  # emulate: current block emits direct inline barriers (no x_split)
         self.emulate_plan = None   # emulate: structured plan from wave64_emulate_opt.plan_structured_emulation
@@ -5385,9 +5386,14 @@ class Gen:
             val = read(fi)
         else:
             self.uses_subgroup = self.uses_ballot = True
-            fi, val = self.tmp(), self.tmp()
-            self.emit(f"{fi} = OpBitwiseAnd %uint {first} {self.cu(63 if self.wave64 else 31)}")
-            self.emit(f"{val} = OpGroupNonUniformShuffle %uint {self.cu(3)} {old} {fi}")
+            any_act, fi, bal, present, safe_fi, val = (self.tmp() for _ in range(6))
+            sgl = self.subgroup_lane()
+            self.emit(f"{any_act} = OpLogicalOr %bool {lz} {hz}")
+            self.emit(f"{fi} = OpSelect %uint {any_act} {first} {sgl}")
+            self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+            self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool {self.cu(3)} {bal} {fi}")
+            self.emit(f"{safe_fi} = OpSelect %uint {present} {fi} {sgl}")
+            self.emit(f"{val} = OpGroupNonUniformShuffle %uint {self.cu(3)} {old} {safe_fi}")
         self.dst(a[0], val)
 
     def lds_op(self, op, a, mods):
@@ -5813,28 +5819,48 @@ class Gen:
         self.emit(f"{word} = OpSelect %uint {upper} {hi} {lo}")
         return word
 
-    def wave32_first_running_lane(self):
+    def wave32_first_running_lane(self, ballot=None):
         """The lowest running lane of this wave32 fragment's 32-lane half (0-31): the lane a uniform value is read
         from. A fixed lane (0 of the half) need not be running: a quad with no covered sample, or helpers a driver
-        leaves out of subgroup operations, read as undefined (SHADER-1016)."""
-        ballot, any_, lsb, first = (self.tmp() for _ in range(4))
-        self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+        leaves out of subgroup operations, read as undefined (SHADER-1016). When the half's ballot word is empty,
+        fall back to this invocation's own logical lane (never lane 0, which may not be launched)."""
+        if ballot is None:
+            ballot = self.tmp()
+            self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+        any_, lsb, first = (self.tmp() for _ in range(3))
         word = self.wave32_ballot_word(ballot)
-        # An empty word (a helper a driver leaves out of its own ballot) reads lane 0, as v_readfirstlane does,
-        # never FindILsb's 0xFFFFFFFF.
         self.emit(f"{any_} = OpINotEqual %bool {word} {self.cu(0)}")
         self.emit(f"{lsb} = OpExtInst %uint %glsl FindILsb {word}")
-        self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
+        self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.wave_lane()}")
         self.uses_subgroup = self.uses_ballot = True
         return first
 
-    def ballot_lsb_by_words(self, bal):
+    def subgroup_first_running_lane(self, ballot=None):
+        """The lowest running physical lane in the subgroup (0..SubgroupSize-1), or this invocation's own subgroup
+        lane when the ballot is empty. Never falls back to lane 0, which may not be launched in a partial wave."""
+        if ballot is None:
+            ballot = self.tmp()
+            self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+        if self.stage == "vs":
+            lsb, any_ = self.ballot_lsb_by_words(ballot, with_any=True)
+        else:
+            self.uses_vote = True
+            lsb, any_ = self.tmp(), self.tmp()
+            self.emit(f"{lsb} = OpGroupNonUniformBallotFindLSB %uint {self.cu(3)} {ballot}")
+            self.emit(f"{any_} = OpGroupNonUniformAny %bool {self.cu(3)} %true")
+        first = self.tmp()
+        self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.subgroup_lane()}")
+        self.uses_subgroup = self.uses_ballot = True
+        return first
+
+    def ballot_lsb_by_words(self, bal, with_any=False):
         """The lowest set bit of a subgroup ballot, from its four words with FindILsb: the lane
         OpGroupNonUniformBallotFindLSB gives (a ballot has no bit at or above the subgroup size), without asking for
         the subgroup size. MoltenVK lowers BallotFindLSB, like the SubgroupSize built-in, to Metal's
         threads_per_simdgroup input, which a vertex function can't declare (Apple M4, MoltenVK 1.4.2), so vertex
-        shaders use this form. Like the op, the result means nothing for an empty ballot; callers select 0 then."""
+        shaders use this form. When `with_any` is True, also returns a %bool that is true iff any word is non-zero."""
         r = None
+        any_ = None
         for k in (3, 2, 1, 0):            # the lowest non-zero word wins, so it is selected last
             w, lsb = self.tmp(), self.tmp()
             self.emit(f"{w} = OpCompositeExtract %uint {bal} {k}")
@@ -5843,14 +5869,21 @@ class Gen:
                 at = self.tmp()
                 self.emit(f"{at} = OpIAdd %uint {lsb} {self.cu(32 * k)}")
                 lsb = at
+            nz = self.tmp() if (r is not None or with_any) else None
+            if nz is not None:
+                self.emit(f"{nz} = OpINotEqual %bool {w} {self.cu(0)}")
             if r is None:
                 r = lsb
+                any_ = nz
             else:
-                nz, pick = self.tmp(), self.tmp()
-                self.emit(f"{nz} = OpINotEqual %bool {w} {self.cu(0)}")
+                pick = self.tmp()
                 self.emit(f"{pick} = OpSelect %uint {nz} {lsb} {r}")
                 r = pick
-        return r
+                if with_any:
+                    both = self.tmp()
+                    self.emit(f"{both} = OpLogicalOr %bool {any_} {nz}")
+                    any_ = both
+        return (r, any_) if with_any else r
 
     # ---- wave64 emulation (--wave64-emulate) ----
     # A wave64 compute or mesh shader runs exact on any subgroup size. Each lane is one invocation as usual, but no
@@ -6254,12 +6287,13 @@ class Gen:
             self.g_shuffle(result, value, src)
         else:
             # Redirect absent source lanes before the shuffle: even a masked undefined result is undefined.
-            ballot, present, safe_src, shuffled, mask = (self.tmp() for _ in range(5))
+            ballot, present, safe_phys, shuffled, mask = (self.tmp() for _ in range(5))
             physical_src = self.wave_source_lane(src)
+            physical_self = self.subgroup_lane()
             self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
             self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool %c3 {ballot} {physical_src}")
-            self.emit(f"{safe_src} = OpSelect %uint {present} {src} {lane}")
-            self.emit(f"{shuffled} = OpGroupNonUniformShuffle %uint %c3 {value} {self.wave_source_lane(safe_src)}")
+            self.emit(f"{safe_phys} = OpSelect %uint {present} {physical_src} {physical_self}")
+            self.emit(f"{shuffled} = OpGroupNonUniformShuffle %uint %c3 {value} {safe_phys}")
             self.emit(f"{mask} = OpSelect %uint {present} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
             self.emit(f"{result} = OpBitwiseAnd %uint {shuffled} {mask}")
             self.uses_subgroup = self.uses_ballot = True
@@ -6321,13 +6355,10 @@ class Gen:
         self.emit(f"{lane} = OpCopyObject %uint {self.wave_lane()}")
         self.emit(f"{rl} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
         self.emit(f"{mine} = OpIAdd %uint {rl} {self.cu(1)}")
+        sgl = self.subgroup_lane()
         if self.wave64 or self.wave32_fragment:
-            sgl = self.tmp()
-            self.emit(f"{sgl} = OpLoad %uint %sg_lane")
             self.emit(f"{half} = OpBitwiseAnd %uint {sgl} {self.cu(32)}")
-            self_lane = sgl
-        else:
-            self_lane = lane
+        self_lane = sgl
         bal = self.tmp()
         self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
         acc = self.cu(0)
@@ -6535,7 +6566,10 @@ class Gen:
         self.ever_mask = {r for m in self.lane_masks.values() for r in m if isinstance(r, int)}
         slots = lane_masks.parked(blocks[0], self.lane_masks, wave64=self.wave64)
         self.scalar_spills = set(lane_masks.scalar_spills(blocks[0], blocks[1], wave64=self.wave64))
-        all_slots = sorted(set(slots) | self.scalar_spills)
+        self.spill_readlanes, spill_read_slots = lane_masks.definite_spill_reads(
+            blocks[0], blocks[1], wave64=self.wave64
+        )
+        all_slots = sorted(set(slots) | self.scalar_spills | set(spill_read_slots))
         self.parked = {slot: self.SGPRS + i for i, slot in enumerate(all_slots)}
 
     def mask_half(self, a):
@@ -6692,7 +6726,9 @@ class Gen:
                     o = self.tmp()
                     self.emit(f"{o} = OpBitwiseOr %uint {acc} {w}")
                     acc = o
-        elif self.stage in ("ps", "cs"):
+        elif self.stage == "ps":
+            # Fragment shaders always launch complete 2x2 pixel quads (including helper invocations), and Vulkan
+            # guarantees OpGroupNonUniformQuadSwap includes helpers in the quad.
             self.uses_subgroup = self.uses_quad = True
             acc = b
             for d in (0, 1):                      # horizontal, then vertical neighbour
@@ -6701,19 +6737,26 @@ class Gen:
                 self.emit(f"{o} = OpBitwiseOr %uint {acc} {sw}")
                 acc = o
         else:
-            # Quad operations are only guaranteed in fragment and compute shaders (quadOperationsInAllStages):
-            # vertex, geometry and mesh shaders shuffle from the four lanes of the quad instead.
-            self.uses_subgroup = True
-            lane, base = self.tmp(), self.tmp()
-            self.sub_lane(lane)
-            self.emit(f"{base} = OpBitwiseAnd %uint {lane} {self.cu(0xFFFFFFFC)}")
-            acc = b
-            for k in range(4):
-                i, w, o = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{i} = OpIAdd %uint {base} {self.cu(k)}")
-                self.g_shuffle(w, b, i)
-                self.emit(f"{o} = OpBitwiseOr %uint {acc} {w}")
-                acc = o
+            # Non-fragment stages (CS/VS/GS/MS) can have partial quads (subgroup size or thread count not a multiple
+            # of 4), where QuadSwap or unguarded shuffles from absent lanes are undefined in SPIR-V. Ballot sets bit l
+            # iff lane l is running with `v != 0`, so extracting this lane's 4-bit quad nibble is exact on any partial
+            # subgroup up to 128 lanes without needing GroupNonUniformQuad or any shuffle.
+            self.uses_subgroup = self.uses_ballot = True
+            nz = self.tmp_bool_nz(v)
+            bal, widx, word, qoff, shifted, acc = (self.tmp() for _ in range(6))
+            self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {nz}")
+            sgl = self.subgroup_lane()
+            self.emit(f"{widx} = OpShiftRightLogical %uint {sgl} {self.cu(5)}")
+            self.emit(f"{word} = OpCompositeExtract %uint {bal} 0")
+            for k in (1, 2, 3):
+                wk, eq, pick = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{wk} = OpCompositeExtract %uint {bal} {k}")
+                self.emit(f"{eq} = OpIEqual %bool {widx} {self.cu(k)}")
+                self.emit(f"{pick} = OpSelect %uint {eq} {wk} {word}")
+                word = pick
+            self.emit(f"{qoff} = OpBitwiseAnd %uint {sgl} {self.cu(28)}")
+            self.emit(f"{shifted} = OpShiftRightLogical %uint {word} {qoff}")
+            self.emit(f"{acc} = OpBitwiseAnd %uint {shifted} {self.cu(0xF)}")
         r = self.tmp()
         self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(acc)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
         return r
@@ -7844,17 +7887,32 @@ class Gen:
             src_sg = self.tmp()
             self.emit(f"{src_sg} = OpBitwiseOr %uint {sg_group} {src_local}")
             if in_bounds is not None:
-                # Clamp an invalid source lane before the shuffle: its value is discarded below, but the lane index
-                # passed to OpGroupNonUniformShuffle must still be in range.
+                # Clamp an invalid source lane to own subgroup lane (always running, never lane 0 which may be absent).
                 safe_sg = self.tmp()
-                self.emit(f"{safe_sg} = OpSelect %uint {in_bounds} {src_sg} {self.cu(0)}")
+                self.emit(f"{safe_sg} = OpSelect %uint {in_bounds} {src_sg} {sgl}")
             else:
                 safe_sg = src_sg
 
             shuffle_src = safe_sg
             if fi:
-                # fi:1 fetches the inactive source as well; only an out-of-row lane is still invalid.
-                src_ok = in_bounds if in_bounds is not None else "%true"
+                # fi:1 fetches an EXEC-off source lane, but an unlaunched/absent lane in a partial subgroup must
+                # still be redirected to sgl before OpGroupNonUniformShuffle and treated as invalid.
+                if src.get("k") == "vgpr":
+                    pbal, present = self.tmp(), self.tmp()
+                    self.emit(f"{pbal} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+                    self.uses_ballot = True
+                    self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool {self.cu(3)} {pbal} {safe_sg}")
+                    present_e = self.eager("%bool", present)
+                    if in_bounds is not None:
+                        both = self.tmp()
+                        self.emit(f"{both} = OpLogicalAnd %bool {in_bounds} {present_e}")
+                        src_ok = both
+                    else:
+                        src_ok = present_e
+                    shuffle_src = self.tmp()
+                    self.emit(f"{shuffle_src} = OpSelect %uint {present} {safe_sg} {sgl}")
+                else:
+                    src_ok = in_bounds if in_bounds is not None else "%true"
             else:
                 ballot = self.tmp()
                 self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {self.active_b()}")
@@ -8212,16 +8270,19 @@ class Gen:
                 self.emit(f"{first} = OpSelect %uint {lz} {l} {fh}")
                 self.dst(a[0], read(first))
                 return
-            self.uses_subgroup = self.uses_ballot = self.uses_vote = True
+            self.uses_subgroup = self.uses_ballot = True
             v, act = self.src_u(a[1]), self.active_b()
-            bal, lsb, any_, first, r = (self.tmp() for _ in range(5))
+            bal, first, r = (self.tmp() for _ in range(3))
             self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {act}")
             if self.stage == "vs":
-                lsb = self.ballot_lsb_by_words(bal)
+                lsb, any_ = self.ballot_lsb_by_words(bal, with_any=True)
             else:
+                self.uses_vote = True
+                lsb, any_ = self.tmp(), self.tmp()
                 self.emit(f"{lsb} = OpGroupNonUniformBallotFindLSB %uint {self.cu(3)} {bal}")
-            self.emit(f"{any_} = OpGroupNonUniformAny %bool {self.cu(3)} {act}")
-            self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
+                self.emit(f"{any_} = OpGroupNonUniformAny %bool {self.cu(3)} {act}")
+            fallback = self.subgroup_first_running_lane()
+            self.emit(f"{first} = OpSelect %uint {any_} {lsb} {fallback}")
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {first}")
             self.dst(a[0], r)
         elif op in ("image_sample_o", "image_sample_lz_o", "image_sample_l_o", "image_sample_b_o",
@@ -9203,8 +9264,9 @@ class Gen:
                 self.dst(a[0], self.src_u(a[1]))
                 return
             slot = lane_masks.lane_slot(a[1], a[2], self.wave64)
-            if slot and slot[1:] in self.scalar_spills:
-                # Pure scalar-spill VGPR (never used as a vector operand): reload from the parked scalar slot
+            if slot and (slot[1:] in self.scalar_spills
+                         or (id(self.cur_ins) in self.spill_readlanes and slot[1:] in self.parked)):
+                # Pure scalar-spill VGPR or definite mixed-VGPR spill reload: load from the parked scalar slot
                 # instead of shuffling from a lane that may be inactive (small fragment waves, discards, or
                 # wave64 lanes >= 32 on 32-wide subgroups).
                 self.dst(a[0], self.load_reg("sgpr", self.parked[slot[1:]]))
@@ -9221,7 +9283,22 @@ class Gen:
             # RDNA2: wave64 uses S1[5:0] (mod 64); wave32 uses S1[4:0] (mod 32). Masking wave32 with 63 left
             # lane selects 32..63 pointing past a 32-wide subgroup (SHADER-52 / FUZZ-7).
             self.emit(f"{m} = OpBitwiseAnd %uint {ln} {self.cu(63 if self.wave64 else 31)}")
-            self.g_shuffle(r, v, m)
+            if self.emulate:
+                self.g_shuffle(r, v, m)
+            else:
+                # Guard against shuffling from an unlaunched/absent lane in a partial subgroup: redirect absent
+                # targets to the wave's first running lane so the result stays wave-uniform and never triggers UB.
+                self.uses_ballot = True
+                phys = self.wave_source_lane(m)
+                bal, present, safe_phys = (self.tmp() for _ in range(3))
+                self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+                self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool {self.cu(3)} {bal} {phys}")
+                if self.wave32_fragment:
+                    fallback = self.wave_source_lane(self.wave32_first_running_lane(bal))
+                else:
+                    fallback = self.subgroup_first_running_lane(bal)
+                self.emit(f"{safe_phys} = OpSelect %uint {present} {phys} {fallback}")
+                self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {safe_phys}")
             self.dst(a[0], r)
         elif op == "v_writelane_b32":
             # vD[lane] = sS: only the named lane changes (independent of EXEC, as on hardware).
@@ -9280,10 +9357,24 @@ class Gen:
             # way. Measured on RDNA2 (issue #374).
             (fi, bc), _ = self.opsel_bits(mods, 2)
             if fi:
-                # FI=1 fetches the value of a source lane that is off in EXEC.
-                r = self.tmp()
-                self.g_shuffle(r, v, src)
-                self.dst(a[0], r)
+                # FI=1 fetches the value of a source lane that is off in EXEC. On a native subgroup, redirect
+                # unlaunched/absent lanes first so OpGroupNonUniformShuffle never targets a non-running lane.
+                if self.emulate:
+                    r = self.tmp()
+                    self.g_shuffle(r, v, src)
+                    self.dst(a[0], r)
+                else:
+                    ballot, present, safe_phys, shuf, mask, r = (self.tmp() for _ in range(6))
+                    physical_src = self.wave_source_lane(src)
+                    physical_self = self.subgroup_lane()
+                    self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
+                    self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool %c3 {ballot} {physical_src}")
+                    self.emit(f"{safe_phys} = OpSelect %uint {present} {physical_src} {physical_self}")
+                    self.emit(f"{shuf} = OpGroupNonUniformShuffle %uint %c3 {v} {safe_phys}")
+                    self.uses_subgroup = self.uses_ballot = True
+                    self.emit(f"{mask} = OpSelect %uint {present} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                    self.emit(f"{r} = OpBitwiseAnd %uint {shuf} {mask}")
+                    self.dst(a[0], r, eager=True)
             elif self.emulate:
                 r = self.tmp()
                 self.g_shuffle(r, v, src)
@@ -9308,14 +9399,15 @@ class Gen:
                 # aa217aeb the FI=0 lanes then read the source lane's value instead of keeping the old one (#5895).
                 # Combine with bitwise masks instead, as #932 does for ds_bpermute: the ballot and the shuffles run
                 # before lane predication.
-                sa, ballot, present, safe_src, r, act, got, ok, mask = (self.tmp() for _ in range(9))
+                sa, ballot, present, safe_phys, r, act, got, ok, mask = (self.tmp() for _ in range(9))
                 self.emit(f"{sa} = OpSelect %uint {self.active_b()} {self.cu(1)} {self.cu(0)}")
                 physical_src = self.wave_source_lane(src)
+                physical_self = self.subgroup_lane()
                 self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
                 self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool %c3 {ballot} {physical_src}")
-                self.emit(f"{safe_src} = OpSelect %uint {present} {src} {lane}")
-                self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {self.wave_source_lane(safe_src)}")
-                self.emit(f"{act} = OpGroupNonUniformShuffle %uint %c3 {sa} {self.wave_source_lane(safe_src)}")
+                self.emit(f"{safe_phys} = OpSelect %uint {present} {physical_src} {physical_self}")
+                self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {safe_phys}")
+                self.emit(f"{act} = OpGroupNonUniformShuffle %uint %c3 {sa} {safe_phys}")
                 self.emit(f"{got} = OpINotEqual %bool {act} {self.cu(0)}")
                 self.emit(f"{ok} = OpLogicalAnd %bool {present} {got}")
                 self.uses_subgroup = self.uses_ballot = True
@@ -13362,11 +13454,12 @@ class Gen:
         if self.wave32_fragment:
             # Each 32-lane half of a wider subgroup is its own wave with its own SGPRs: broadcast from the half's
             # first running lane, as OpGroupNonUniformBroadcastFirst does for the whole subgroup below.
+            first = self.wave32_first_running_lane()
             b = self.tmp()
-            self.g_shuffle(b, idx, self.wave32_first_running_lane())
+            self.g_shuffle(b, idx, first)
             if kind is not None:
                 k = self.tmp()
-                self.g_shuffle(k, kind, self.wave32_first_running_lane())
+                self.g_shuffle(k, kind, first)
                 kind = k
             return b, kind
         # The descriptor words are SGPRs, so the index is the same in every invocation of the subgroup; the

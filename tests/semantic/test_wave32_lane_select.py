@@ -47,23 +47,24 @@ class Wave32LaneSelect(unittest.TestCase):
     def test_lane_select_uses_bits_4_0(self):
         self.assertEqual(run(translate()), EXPECTED)
 
-    def test_mask_63_is_undefined(self):
-        # Negative control: put the wave64 mask back on the lane selects; the read of lane 40 must then be
-        # out of range for the subgroup.
+    def test_mask_63_breaks_lane_40_wrap(self):
+        # Negative control: put the wave64 mask back on the lane selects; lane 40 no longer wraps to lane 8
+        # (writelane(40) misses lane 8 and present-lane guarded readlane(40) redirects to lane 0 instead of lane 8).
         spv = translate()
         c31 = re.search(r"^(%\S+) = OpConstant %uint 31$", spv, re.M).group(1)
         lines = spv.splitlines()
         sels = [i for i, ln in enumerate(lines)
                 if re.search(r"= OpBitwiseAnd %uint \S+ " + re.escape(c31) + "$", ln)]
-        # Four reads and one write select a lane, plus the wave lane (LocalInvocationIndex & 31), which a wider
-        # mask leaves unchanged in a 32-thread group.
-        self.assertGreaterEqual(len(sels), 5)
+        # Two non-spill reads on v2 and the write on v10 select a lane (plus wave_lane & 31).
+        self.assertGreaterEqual(len(sels), 3)
         for i in sels:
             lines[i] = lines[i][:-len(c31)] + "%neg_c63"
         k = next(i for i, ln in enumerate(lines) if ln.startswith(c31 + " = OpConstant"))
         lines.insert(k + 1, "%neg_c63 = OpConstant %uint 63")
-        with self.assertRaises(si.UndefinedResult):
-            run("\n".join(lines) + "\n")
+        got = run("\n".join(lines) + "\n")
+        self.assertNotEqual(got, EXPECTED)
+        # v2 readlane(40) sees lane 40 as absent and redirects to lane 0 (= 1) instead of wrapping to lane 8 (= 25).
+        self.assertEqual(got[0], 1)
 
 
 if __name__ == "__main__":
