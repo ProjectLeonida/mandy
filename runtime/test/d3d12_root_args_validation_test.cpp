@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -495,9 +496,33 @@ int main() {
                 if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
                 Ref<ID3D12Device> hw_dev;
                 if (SUCCEEDED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&hw_dev.p)))) {
-                    Env env;
-                    REQUIRE(env.init(hw_dev.p));
-                    for (std::size_t j = 0; j < table.size(); ++j) REQUIRE(run_case(env, table[j], true, hw_hr[j]));
+                    // A hardware UMD can remove its device on a call that WARP and the layer accept. Intel's (Iris Xe,
+                    // 32.0.101.7092) does on SetGraphicsRoot32BitConstants(0, 0, nullptr, 0), in a direct list and in
+                    // a bundle: Close() returns DXGI_ERROR_DEVICE_REMOVED and the reason is
+                    // DXGI_ERROR_DRIVER_INTERNAL_ERROR. Such a case is not compared on hardware, like the
+                    // run_on_hw = false ones, and the cases after it run on a new device: D3D12 hands one out once
+                    // every reference to the removed device is released.
+                    std::optional<Env> env;
+                    env.emplace();
+                    REQUIRE(env->init(hw_dev.p));
+                    for (std::size_t j = 0; j < table.size(); ++j) {
+                        const bool ran = run_case(*env, table[j], true, hw_hr[j]);
+                        const HRESULT removed = hw_dev->GetDeviceRemovedReason();
+                        if (removed == S_OK) {
+                            REQUIRE(ran);
+                            continue;
+                        }
+                        std::printf("%s: the hardware driver removed its device (0x%08lx); not compared on hardware\n",
+                                    table[j].name, static_cast<unsigned long>(removed));
+                        hw_hr[j] = kNotRun;
+                        env.reset();
+                        hw_dev.reset();
+                        REQUIRE(SUCCEEDED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0,
+                                                            IID_PPV_ARGS(&hw_dev.p))));
+                        REQUIRE(hw_dev->GetDeviceRemovedReason() == S_OK);
+                        env.emplace();
+                        REQUIRE(env->init(hw_dev.p));
+                    }
                     REQUIRE(hw_dev->GetDeviceRemovedReason() == S_OK);
                     char name_buf[256]{};
                     std::snprintf(name_buf, sizeof(name_buf), "%ls", desc.Description);
