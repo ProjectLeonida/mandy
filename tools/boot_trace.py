@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 
@@ -118,6 +119,13 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 continue
             trace["events"] += 1
             kind = str(event.get("kind"))
+            seq, elapsed = event.get("seq"), event.get("t")
+            trace["last_event"] = {
+                "kind": kind,
+                "seq": seq if type(seq) is int and seq >= 0 else None,
+                "t": elapsed if (type(elapsed) is int and elapsed >= 0 or
+                                 type(elapsed) is float and math.isfinite(elapsed) and elapsed >= 0) else None,
+            }
             trace["kinds"][kind] = trace["kinds"].get(kind, 0) + 1
             if kind == "trace_open":
                 trace["pid"] = event.get("pid")
@@ -385,6 +393,11 @@ def format_text(summary: dict, limit: int) -> str:
             )
             kinds = ", ".join(f"{k} {v}" for k, v in sorted(startup["kinds"].items()))
             out.append(f"  kinds: {kinds}")
+            if startup["exit"] is None:
+                last = startup["last_event"]
+                seq = f" #{last['seq']}" if last["seq"] is not None else ""
+                elapsed = f" at {last['t']} s" if last["t"] is not None else ""
+                out.append(f"  last startup event: {last['kind']}{seq}{elapsed}")
         if startup["modules"]:
             # A relocated module is marked: triage step 1 asks whether the executable sits at its preferred base.
             names = [m["module"] + (" (relocated)" if m.get("relocated") else "") for m in startup["modules"]]

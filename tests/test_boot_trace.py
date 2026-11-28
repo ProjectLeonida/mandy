@@ -186,6 +186,18 @@ class BootTraceTests(unittest.TestCase):
         self.assertIn("debug strings: 1", text)
         self.assertNotIn("secret game text", text)
 
+    def test_last_startup_record_survives_a_torn_tail(self):
+        self.write(self.startup, [{"kind": "map", "module": "a"},
+                                  {"kind": "debug_string", "text": "private text", "seq": 8, "t": 1.25}])
+        with open(self.startup, "ab") as tail:
+            tail.write(b'{"kind":')
+        report = bt.summarize(bt.parse_startup(self.startup, limit=0), None)
+        self.assertEqual(report["startup"]["last_event"], {"kind": "debug_string", "seq": 8, "t": 1.25})
+        text = bt.format_text(report, 0)
+        self.assertIn("last startup event: debug_string #8 at 1.25 s", text)
+        self.assertNotIn("private text", text)
+        self.assertNotIn("last_event", bt.counts_only(report)["startup"])
+
     def test_truncated_line_is_counted_not_fatal(self):
         self.write(self.startup, STARTUP)
         with open(self.startup, "a", encoding="utf-8", newline="\n") as f:
