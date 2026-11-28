@@ -5,6 +5,7 @@ work/
 /assets/*
 !/assets/logo.png
 !/assets/logo.svg
+!/assets/logo.ico
 carve/
 # rpf9-explorer's index cache (archive paths and entry names); see "Full-scan indexes" in docs/design.md
 RpfPreview/

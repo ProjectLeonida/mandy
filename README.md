@@ -128,6 +128,8 @@ The port isn't downloaded ready-made. It's built on your PC from your own copy.
    and otherwise tells you what to do.
 3. Double-click **`Build.bat`**. On Linux or macOS, run **`./Build.sh`** from a terminal instead (see
    [docs/linux.md](docs/linux.md) for Linux).
+   Prefer a window? [`builder/`](builder) is a desktop launcher (Rust, `cargo build --release`) that
+   builds the port, manages its mods and starts it.
 
 It finds your copy of the game by itself: it looks in Downloads, Desktop, Documents (also where Windows keeps them,
 such as in OneDrive), Games, your home folder and the top of every drive, two folders deep. It recognises the
