@@ -37,6 +37,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from file_mode import published_mode  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 from zero_span import gap_split  # noqa: E402
 
 MAGIC = b"RBF0"
@@ -539,16 +540,6 @@ def byte_count(text):
     return value
 
 
-def same_output_path(first, second):
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved streams")
@@ -559,7 +550,7 @@ def main():
     ap.add_argument("--all-strings", action="store_true", help="write every readable string to JSON (game data)")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
-    if same_output_path(a.source, a.out):
+    if same_report_path(a.source, a.out):
         ap.error("output must not overwrite the source")
     if a.strings < 0:
         ap.exit(2, f"{ap.prog}: error: argument --strings: must be 0 or more\n")
@@ -574,8 +565,8 @@ def main():
     try:
         if os.path.isdir(a.source):
             manifest = os.path.join(a.source, "index.json")
-            if same_output_path(manifest, a.out) or (os.path.isfile(a.out) and any(
-                    same_output_path(path, a.out) for _, path in carved_streams(a.source))):
+            if same_report_path(manifest, a.out) or (os.path.isfile(a.out) and any(
+                    same_report_path(path, a.out) for _, path in carved_streams(a.source))):
                 ap.error(f"output would overwrite a carve input: {a.out}")
             rows, records, summary = scan_dir(a.source, string_limit=limit)
         else:

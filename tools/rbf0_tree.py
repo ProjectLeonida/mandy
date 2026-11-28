@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import rbf0_index  # noqa: E402
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 MAGIC = rbf0_index.MAGIC
 PROLOGUE = rbf0_index.PROLOGUE
@@ -677,15 +678,6 @@ def write_json(path, docs, summary):
         raise
 
 
-def same_output_path(first, second):
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="a carve directory, a complete resource, or a single RBF0 stream")
@@ -699,11 +691,11 @@ def main(argv=None):
     args = ap.parse_args(argv)
     # The reports are written after the decode: an out or --csv naming the source used to replace it, and the
     # same file for both left only the CSV.
-    if args.csv and same_output_path(args.out, args.csv):
+    if args.csv and same_report_path(args.out, args.csv):
         ap.error("out and --csv must be different files")
     if os.path.isfile(args.source):
         for flag, path in (("out", args.out), ("--csv", args.csv)):
-            if path and same_output_path(path, args.source):
+            if path and same_report_path(path, args.source):
                 ap.error(f"{flag} would overwrite the source {args.source}")
     elif os.path.isdir(args.source):
         # A carve folder: out or --csv naming one of its streams used to replace that stream, and --xml on the
@@ -714,9 +706,9 @@ def main(argv=None):
         except OSError:
             streams = []   # decode_source reports the unreadable folder
         for flag, path in (("out", args.out), ("--csv", args.csv)):
-            if path and os.path.exists(path) and any(same_output_path(path, s) for s in streams):
+            if path and os.path.exists(path) and any(same_report_path(path, s) for s in streams):
                 ap.error(f"{flag} would overwrite the stream {path} in the source folder")
-        if args.xml and same_output_path(args.xml, args.source):
+        if args.xml and same_report_path(args.xml, args.source):
             ap.error("--xml must not be the source folder: its XML files would be read as streams")
 
     def progress(n, total):
