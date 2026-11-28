@@ -51,16 +51,18 @@ class Wave32LaneSelect(unittest.TestCase):
         # Negative control: put the wave64 mask back on the lane selects; the read of lane 40 must then be
         # out of range for the subgroup.
         spv = translate()
-        c31 = re.search(r"^(%\S+) = OpConstant %uint 31$", spv, re.M).group(1)
+        # every constant 31 (lower_addr64 declares its own for its shift masks, which stay as they are)
+        c31s = re.findall(r"^(%\S+) = OpConstant %uint 31$", spv, re.M)
         lines = spv.splitlines()
         sels = [i for i, ln in enumerate(lines)
-                if re.search(r"= OpBitwiseAnd %uint \S+ " + re.escape(c31) + "$", ln)]
+                if any(re.search(r"= OpBitwiseAnd %uint \S+ " + re.escape(c31) + "$", ln) for c31 in c31s)
+                and not ln.lstrip().startswith("%a64_")]
         # Four reads and one write select a lane, plus the wave lane (LocalInvocationIndex & 31), which a wider
         # mask leaves unchanged in a 32-thread group.
         self.assertGreaterEqual(len(sels), 5)
         for i in sels:
-            lines[i] = lines[i][:-len(c31)] + "%neg_c63"
-        k = next(i for i, ln in enumerate(lines) if ln.startswith(c31 + " = OpConstant"))
+            lines[i] = re.sub(r"%\S+$", "%neg_c63", lines[i])
+        k = next(i for i, ln in enumerate(lines) if ln.startswith(c31s[0] + " = OpConstant"))
         lines.insert(k + 1, "%neg_c63 = OpConstant %uint 63")
         with self.assertRaises(si.UndefinedResult):
             run("\n".join(lines) + "\n")

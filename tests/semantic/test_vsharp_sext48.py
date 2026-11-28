@@ -12,15 +12,22 @@ class VSharpSignExtensionTest(unittest.TestCase):
         fixture = Path(support.HERE) / "fixtures" / f"{name}.asm"
         spv = support.translate_listing(name, fixture.read_bytes())
 
-        # Both effective VAs must be sign-extended by shifting 16 bits in each direction before rebasing.
-        shift = re.search(r"^(%\w+) = OpConstant %uint 16$", spv, re.M)
-        self.assertIsNotNone(shift)
-        extended = re.findall(
-            rf"(%\w+) = OpShiftLeftLogical %ulong %\w+ {shift[1]}\s+"
-            rf"(%\w+) = OpShiftRightArithmetic %ulong \1 {shift[1]}\s+"
-            r"%\w+ = OpIAdd %ulong %heap_base \2\b",
-            spv,
-        )
+        # Both effective VAs must be sign-extended by shifting 16 bits in each direction before rebasing: two
+        # 64-bit shifts with --int64-addresses, or, lowered to (low, high) pairs by lower_addr64, the high
+        # word's arithmetic shift right by 16 (the left shift by 16 spreads over both words).
+        shifts = re.findall(r"^(%\w+) = OpConstant %uint 16$", spv, re.M)
+        self.assertTrue(shifts)
+        extended = []
+        for shift in shifts:
+            extended += re.findall(
+                rf"(%\w+) = OpShiftLeftLogical %ulong %\w+ {shift}\s+"
+                rf"(%\w+) = OpShiftRightArithmetic %ulong \1 {shift}\s+"
+                r"%\w+ = OpIAdd %ulong %heap_base \2\b",
+                spv,
+            )
+        if "%ulong" not in spv:
+            extended = [m for shift in shifts
+                        for m in re.findall(rf"^\s*%\w+ = OpShiftRightArithmetic %int %\w+ {shift}$", spv, re.M)]
         self.assertEqual(len(extended), 2)
 
         # The second base+offset sum carries out of the low 48 bits and lands on the heap base itself.

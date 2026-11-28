@@ -278,13 +278,14 @@ class LdsSubwordD16Tests(unittest.TestCase):
             "s_waitcnt lgkmcnt(0)",
         ] + emit_stores(["v10"]), "cs_neg_u16")
         self.assertEqual(run_cs(spv_u16), [0x00008000])
-        m_c16_u = re.search(r"^\s*(%\w+) = OpConstant %uint 16$", spv_u16, re.MULTILINE)
-        self.assertIsNotNone(m_c16_u)
-        m_uext = re.search(
-            rf"^(\s*%\w+ = )OpBitFieldUExtract( %uint %\w+ %\w+ {re.escape(m_c16_u.group(1))})$",
+        # (any of the module's constants 16: lower_addr64 declares one of its own next to the translator's)
+        c16s = re.findall(r"^\s*(%\w+) = OpConstant %uint 16$", spv_u16, re.MULTILINE)
+        self.assertTrue(c16s)
+        m_uext = next((m for c16 in c16s for m in [re.search(
+            rf"^(\s*%\w+ = )OpBitFieldUExtract( %uint %\w+ %\w+ {re.escape(c16)})$",
             spv_u16,
             re.MULTILINE,
-        )
+        )] if m), None)
         self.assertIsNotNone(m_uext)
         bad_u16 = spv_u16.replace(m_uext.group(0), f"{m_uext.group(1)}OpBitFieldSExtract{m_uext.group(2)}")
         self.assertEqual(run_cs(bad_u16), [0xFFFF8000])
@@ -335,14 +336,15 @@ class LdsSubwordD16Tests(unittest.TestCase):
         ] + emit_stores(["v10"]), "cs_neg_w_hi")
         self.assertEqual(run_cs(spv_w_hi), [0x1234CAFE])
         m_c0_w = re.search(r"^\s*(%\w+) = OpConstant %uint 0$", spv_w_hi, re.MULTILINE)
-        m_c16_w = re.search(r"^\s*(%\w+) = OpConstant %uint 16$", spv_w_hi, re.MULTILINE)
+        # the d16_hi shift by 16, by whichever constant 16 it uses; not lower_addr64's own shifts (%a64_...)
+        c16s_w = re.findall(r"^\s*(%\w+) = OpConstant %uint 16$", spv_w_hi, re.MULTILINE)
         self.assertIsNotNone(m_c0_w)
-        self.assertIsNotNone(m_c16_w)
-        m_shr = re.search(
-            rf"^(\s*%\w+ = OpShiftRightLogical %uint %\w+) {re.escape(m_c16_w.group(1))}$",
+        self.assertTrue(c16s_w)
+        m_shr = next((m for c16 in c16s_w for m in re.finditer(
+            rf"^(\s*%(?!a64_)\w+ = OpShiftRightLogical %uint %\w+) {re.escape(c16)}$",
             spv_w_hi,
             re.MULTILINE,
-        )
+        )), None)
         self.assertIsNotNone(m_shr)
         bad_w_hi = spv_w_hi.replace(m_shr.group(0), f"{m_shr.group(1)} {m_c0_w.group(1)}")
         self.assertEqual(run_cs(bad_w_hi), [0x1234BEEF])

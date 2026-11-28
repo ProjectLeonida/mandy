@@ -808,7 +808,9 @@ class TestSpirvEmission(unittest.TestCase):
             ],
             fssm=CS_FSSM,
         )
-        self.assertIn("OpConvertUToPtr", spv)
+        # The store's buffer address: a (low, high) uint pair bitcast to the pointer (lower_addr64), or
+        # OpConvertUToPtr of the 64-bit value with --int64-addresses.
+        self.assertTrue("OpBitcast %_ptr_PSB" in spv or "OpConvertUToPtr" in spv)
         self.assertIn("OpStore", spv)
         self.assertIn("OpBranchConditional", spv)
         self.assertIn("OpSelectionMerge", spv)
