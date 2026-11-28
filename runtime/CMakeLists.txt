@@ -512,11 +512,13 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(lifecycle_test PRIVATE /OPT:NOREF)
   target_link_libraries(lifecycle_test PRIVATE user32)
 
-  # LEONIDA_IO_TRACE (shims/io_trace.h): read lines written through and readable while the trace is open.
+  # LEONIDA_IO_TRACE (shims/io_trace.h): read lines written through and readable while the trace is open. The test
+  # hands safe_name an unreadable pointer, and copy_name's load faults inline in its __try: clang-cl catches that only
+  # with asynchronous exceptions, as for dstorage.cpp above.
   add_executable(io_trace_test test/io_trace_test.cpp)
   target_include_directories(io_trace_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(io_trace_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_compile_options(io_trace_test PRIVATE /W4 /permissive- /utf-8)
+  target_compile_options(io_trace_test PRIVATE /W4 /permissive- /utf-8 $<$<CXX_COMPILER_ID:Clang>:/EHa>)
   add_test(NAME io_trace COMMAND io_trace_test)
 
   # Console paths (GAME:) and the write overlay: the file shims resolved through the registry, over temporary folders.

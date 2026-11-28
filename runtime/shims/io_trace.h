@@ -64,6 +64,8 @@ inline std::string path_of(HANDLE file) {
 }
 
 // A request name the title passed, copied defensively (the pointer is the title's). No C++ objects: __try.
+// The load is inline in the __try, so under clang-cl a source that calls this needs /EHa (dstorage.cpp and
+// io_trace_test have it, runtime/CMakeLists.txt); MSVC catches it either way.
 inline int copy_name(const char* name, char* copy, int capacity) {
     int n = 0;
     __try {
