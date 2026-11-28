@@ -408,6 +408,22 @@ private:
     uint32_t axis_offset[3][256]{};
 };
 
+// One row of a tiled mip: element x lives `columns[x]` bytes after `tiled` in the console layout and `x * bytes` after
+// `linear` in the row. `Width` is the element size as a compile-time constant (1/2/4/8/16), so each std::memcpy has a
+// fixed size and the compiler emits one load and one store instead of a call. Width 0 keeps the runtime size, which is
+// what every other element size (and the reference the tests compare against) uses. Both give the same bytes: only the
+// way the size reaches memcpy differs, never the addresses.
+template<bool Into, uint32_t Width, class Byte>
+inline void copy_tiled_row(const Byte* source, Byte* destination, uint64_t tiled, uint64_t linear,
+                           const uint64_t* columns, uint32_t count, uint32_t runtime_bytes) {
+    const uint32_t bytes = Width ? Width : runtime_bytes;
+    for (uint32_t x = 0; x < count; ++x) {
+        const uint64_t at = tiled + columns[x];
+        const uint64_t to = linear + uint64_t(x) * bytes;
+        std::memcpy(destination + (Into ? at : to), source + (Into ? to : at), bytes);
+    }
+}
+
 // The element copy behind XG's CopyIntoSubresource / CopyFromSubresource (xg_xs.cpp) and the D3D12 layer's fill of
 // textures the title keeps in its own memory (d3d12_vulkan_device.cpp, TitleTextures): one mip of one array slice
 // between the console layout (`tiled`, from the texture's base) and linear rows of elements `row_pitch` bytes apart,
@@ -432,10 +448,16 @@ inline void copy_elements(const Texture& t, uint32_t level, uint32_t slice, cons
                 std::memcpy(destination + (Into ? tiled : linear), source + (Into ? linear : tiled), row_bytes);
                 continue;
             }
-            for (uint32_t x = 0; x < mip.width_elements; ++x) {
-                const uint64_t at = tiled + columns[x];
-                const uint64_t to = linear + uint64_t(x) * bytes;
-                std::memcpy(destination + (Into ? at : to), source + (Into ? to : at), bytes);
+            // Dispatch on the element size once per row; sizes other than 1/2/4/8/16 take the runtime-size loop.
+            const uint64_t* const column = columns.data();
+            const uint32_t count = mip.width_elements;
+            switch (bytes) {
+            case 1: copy_tiled_row<Into, 1>(source, destination, tiled, linear, column, count, bytes); break;
+            case 2: copy_tiled_row<Into, 2>(source, destination, tiled, linear, column, count, bytes); break;
+            case 4: copy_tiled_row<Into, 4>(source, destination, tiled, linear, column, count, bytes); break;
+            case 8: copy_tiled_row<Into, 8>(source, destination, tiled, linear, column, count, bytes); break;
+            case 16: copy_tiled_row<Into, 16>(source, destination, tiled, linear, column, count, bytes); break;
+            default: copy_tiled_row<Into, 0>(source, destination, tiled, linear, column, count, bytes); break;
             }
         }
     }
