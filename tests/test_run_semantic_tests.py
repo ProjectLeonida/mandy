@@ -515,6 +515,11 @@ class RunnerTest(unittest.TestCase):
             self.assertNotIn("5 files,", stdout)
             self.assertEqual(len(os.listdir(marker_dir)), 2)
 
+    def test_cli_reconfigures_streams_cleanly(self):
+        result = cli("unused-suite", "-h")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Run the translator regression suite", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
