@@ -337,6 +337,38 @@ int main(int argc, char** argv) {
             const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER write{0x1000, 1};
             b->WriteBufferImmediate(1, &write, nullptr); }));
 
+        // A barrier call with a count and no array fails a direct list's Close instead of reading through null, as
+        // WriteBufferImmediate does; a count of 0 needs no array.
+        auto invalid_direct_call = [&](auto record) {
+            Ref<ID3D12CommandAllocator> test_allocator;
+            Ref<ID3D12GraphicsCommandList8> test_list;
+            if (FAILED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                           IID_PPV_ARGS(&test_allocator.p))))
+                return false;
+            if (FAILED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_DIRECT, test_allocator.p,
+                                                      IID_PPV_ARGS(&test_list.p))))
+                return false;
+            record(test_list.p);
+            return test_list->Close() == E_INVALIDARG;
+        };
+        EXPECT(invalid_direct_call([&](auto* l) { l->ResourceBarrier(1, nullptr); }));
+        EXPECT(invalid_direct_call([&](auto* l) { l->Barrier(1, nullptr); }));
+        for (const auto type : {D3D12_BARRIER_TYPE_GLOBAL, D3D12_BARRIER_TYPE_TEXTURE, D3D12_BARRIER_TYPE_BUFFER}) {
+            D3D12_BARRIER_GROUP no_array{};
+            no_array.Type = type;
+            no_array.NumBarriers = 1;
+            EXPECT(invalid_direct_call([&](auto* l) { l->Barrier(1, &no_array); }));
+            // The same group after a valid one: the valid one is recorded, the list still fails.
+            const D3D12_BARRIER_GROUP both[] = {group, no_array};
+            EXPECT(invalid_direct_call([&](auto* l) { l->Barrier(2, both); }));
+        }
+        EXPECT(!invalid_direct_call([&](auto* l) { l->ResourceBarrier(0, nullptr); }));
+        EXPECT(!invalid_direct_call([&](auto* l) { l->Barrier(0, nullptr); }));
+        D3D12_BARRIER_GROUP empty_group{};
+        empty_group.Type = D3D12_BARRIER_TYPE_TEXTURE;  // no barriers, no array
+        EXPECT(!invalid_direct_call([&](auto* l) { l->Barrier(1, &empty_group); }));
+        EXPECT(!invalid_direct_call([&](auto* l) { l->ResourceBarrier(1, &transition); }));  // the control
+
         list->Barrier(1, &group);
         // Not implemented: reported once by its generated stub, recording continues.
         list->SetProtectedResourceSession(nullptr);

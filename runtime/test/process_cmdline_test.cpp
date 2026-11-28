@@ -218,6 +218,59 @@ void check_getmainargs_environment() {
         ++failures;
     }
 }
+
+// __getmainargs/__wgetmainargs's `expand` (the CRT's _dowildcard): nonzero expands wildcards in the arguments, as
+// _configure_*_argv's mode 2 does; zero leaves them as typed. A null argc or argv fails instead of being written
+// through. Synthetic files in a temporary folder.
+void check_getmainargs_expand() {
+    using Narrow = int(__cdecl*)(int*, char***, char***, int, void*);
+    using Wide = int(__cdecl*)(int*, wchar_t***, wchar_t***, int, void*);
+    const auto narrow_fn = reinterpret_cast<Narrow>(rt::shims::find("msvcrt.dll", "__getmainargs"));
+    const auto wide_fn = reinterpret_cast<Wide>(rt::shims::find("msvcrt.dll", "__wgetmainargs"));
+    if (!narrow_fn || !wide_fn) return;  // check_getmainargs_environment reports it
+    wchar_t temp[MAX_PATH]{};
+    if (!GetTempPathW(MAX_PATH, temp)) {
+        std::fprintf(stderr, "FAIL GetTempPathW\n");
+        ++failures;
+        return;
+    }
+    const std::wstring dir = std::wstring(temp) + L"leonida_getmainargs_" + std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring files[] = {dir + L"\\a1.lx", dir + L"\\a2.lx"};
+    for (const auto& f : files) {
+        const HANDLE h = CreateFileW(f.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    }
+    const std::wstring pattern = dir + L"\\*.lx";
+    rt::process::set_command_line(L"game.exe", {pattern});
+    for (const int expand : {0, 1}) {
+        const int want = expand ? 3 : 2;  // game.exe and the two files, or game.exe and the pattern
+        int argc = 0;
+        char** argv = nullptr;
+        if (narrow_fn(&argc, &argv, nullptr, expand, nullptr) != 0 || argc != want || !argv ||
+            (!expand && std::strchr(argv[1], '*') == nullptr) || (expand && std::strchr(argv[1], '*') != nullptr)) {
+            std::fprintf(stderr, "FAIL __getmainargs(expand=%d): argc %d, want %d\n", expand, argc, want);
+            ++failures;
+        }
+        int wargc = 0;
+        wchar_t** wargv = nullptr;
+        if (wide_fn(&wargc, &wargv, nullptr, expand, nullptr) != 0 || wargc != want || !wargv ||
+            (!expand && std::wcschr(wargv[1], L'*') == nullptr) || (expand && std::wcschr(wargv[1], L'*') != nullptr)) {
+            std::fprintf(stderr, "FAIL __wgetmainargs(expand=%d): argc %d, want %d\n", expand, wargc, want);
+            ++failures;
+        }
+    }
+    int argc = 0;
+    char** argv = nullptr;
+    wchar_t** wargv = nullptr;
+    if (narrow_fn(nullptr, &argv, nullptr, 0, nullptr) == 0 || narrow_fn(&argc, nullptr, nullptr, 0, nullptr) == 0 ||
+        wide_fn(nullptr, &wargv, nullptr, 0, nullptr) == 0 || wide_fn(&argc, nullptr, nullptr, 0, nullptr) == 0) {
+        std::fprintf(stderr, "FAIL __getmainargs/__wgetmainargs accepted a null argc or argv\n");
+        ++failures;
+    }
+    for (const auto& f : files) DeleteFileW(f.c_str());
+    RemoveDirectoryW(dir.c_str());
+}
 }  // namespace
 
 int main() {
@@ -234,6 +287,7 @@ int main() {
     check_import_names();
     check_argv_reset();
     check_getmainargs_environment();
+    check_getmainargs_expand();
     check_winmain(L"game.exe", {L"-foo", L"with space"}, L"-foo \"with space\"", "arguments after a plain name");
     check_winmain(L"C:\\My Games\\game.exe", {L"-x"}, L"-x", "a quoted program name with a space");
     check_winmain(L"game.exe", {}, L"", "no arguments");

@@ -590,6 +590,7 @@ public:
     void STDMETHODCALLTYPE ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ResourceBarrier");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (count && !barriers) return check(false);  // as WriteBufferImmediate: the list fails, nothing is read
         for (UINT i = 0; i < count; ++i) {
             const auto& b = barriers[i];
             switch (b.Type) {
@@ -626,7 +627,14 @@ public:
     void STDMETHODCALLTYPE Barrier(UINT32 groups, const D3D12_BARRIER_GROUP* group) override {
         d3d12_trace::record("ID3D12GraphicsCommandList7::Barrier");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (groups && !group) return check(false);
         for (UINT32 g = 0; g < groups; ++g) {
+            // A group with barriers and no array fails the list; nothing is read. The three array pointers are one
+            // union, so any of them says whether there is an array.
+            if (group[g].NumBarriers && !group[g].pGlobalBarriers) {
+                check(false);
+                continue;
+            }
             for (UINT32 i = 0; i < group[g].NumBarriers; ++i) {
                 switch (group[g].Type) {
                 case D3D12_BARRIER_TYPE_GLOBAL: {
@@ -702,6 +710,7 @@ public:
                                      const D3D12_TILE_REGION_SIZE* size, ID3D12Resource* linear,
                                      UINT64 linear_offset, D3D12_TILE_COPY_FLAGS flags) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyTiles");
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);  // no copy is allowed in a bundle
         const auto direction = flags & ~D3D12_TILE_COPY_FLAG_NO_HAZARD;
         const bool to_linear = direction == D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER;
         const auto grid = tile_grid(tiled);
@@ -715,7 +724,7 @@ public:
             const auto buffer = linear->GetDesc();
             const auto desc = tiled->GetDesc();
             const auto count = size->UseBox ? std::uint64_t(size->Width) * size->Height : size->NumTiles;
-            if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || buffer.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+            if (buffer.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
                 linear_offset > buffer.Width || count > (buffer.Width - linear_offset) / leonida::tile_size_in_bytes)
                 return check(false);
             constexpr auto shape = leonida::element_tile_shape(false, 4);
@@ -2705,7 +2714,7 @@ private:
         std::uint64_t stamp = 0;
         if (context_.observe_result(stamp_.get_query_pool_results(context_.device(), stamp_.queries, 0, 1,
                                                                 sizeof(stamp), &stamp, sizeof(stamp),
-                                                                VK_QUERY_RESULT_64_BIT),
+                                                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
                                     "vkGetQueryPoolResults (calibration)") != VK_SUCCESS)
             return E_FAIL;
         if (clock_.timestamp_valid_bits < 64) stamp &= (std::uint64_t(1) << clock_.timestamp_valid_bits) - 1;

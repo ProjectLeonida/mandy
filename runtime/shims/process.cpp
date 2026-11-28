@@ -489,30 +489,30 @@ wchar_t** current_wide_environment() {
     return _wenviron;
 }
 
-// msvcrt.dll: int __getmainargs(int* argc, char*** argv, char*** env, int expand, void* startinfo)
-int __cdecl game_getmainargs(int* argc, char*** argv, char*** env, int, void*) {
-    if (const int error = game_configure_narrow_argv(1)) return error;
+// msvcrt.dll: int __getmainargs(int* argc, char*** argv, char*** env, int expand, void* startinfo). A nonzero
+// `expand` (the CRT's _dowildcard) expands wildcards in the arguments, as _configure_narrow_argv's mode 2 does.
+int __cdecl game_getmainargs(int* argc, char*** argv, char*** env, int expand, void*) {
+    if (!argc || !argv) return -1;
+    if (const int error = game_configure_narrow_argv(expand ? 2 : 1)) return error;
     *argc = g_argc;
     *argv = g_argv_ptr;
     if (env) *env = current_environment();
     return 0;
 }
-int __cdecl game_wgetmainargs(int* argc, wchar_t*** argv, wchar_t*** env, int, void*) {
-    if (const int error = game_configure_wide_argv(1)) return error;
+int __cdecl game_wgetmainargs(int* argc, wchar_t*** argv, wchar_t*** env, int expand, void*) {
+    if (!argc || !argv) return -1;
+    if (const int error = game_configure_wide_argv(expand ? 2 : 1)) return error;
     *argc = g_argc;
     *argv = g_wargv_ptr;
     if (env) *env = current_wide_environment();
     return 0;
 }
 
-struct EntryCall {
-    void* entry;
-};
-
+// `p` is the entry point itself: run_entry can return (another thread ended the run) before this thread first runs,
+// so nothing of run_entry's frame may be read here.
 DWORD WINAPI game_thread(void* p) {
-    auto* call = static_cast<EntryCall*>(p);
     // An EXE entry point (mainCRTStartup and friends) takes the PEB pointer and returns the process exit code.
-    auto entry = reinterpret_cast<DWORD(WINAPI*)(void*)>(call->entry);
+    auto entry = reinterpret_cast<DWORD(WINAPI*)(void*)>(p);
     const DWORD code = entry(nullptr);
     end_run(static_cast<int>(code));  // returning from the entry point is an exit too
 }
@@ -554,8 +554,7 @@ int run_entry(void* entry, size_t stack_bytes) {
     g_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_done) return -1;
     g_running = true;
-    EntryCall call{entry};
-    HANDLE thread = CreateThread(nullptr, stack_bytes, game_thread, &call, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    HANDLE thread = CreateThread(nullptr, stack_bytes, game_thread, entry, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
     if (!thread) {
         g_running = false;
         CloseHandle(g_done);
