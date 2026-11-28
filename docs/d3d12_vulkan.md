@@ -2905,7 +2905,10 @@ Pipeline creation:
   appended to `pipeline_order.log` beside `pipeline_cache.session.bin` (so `LEONIDA_PIPELINE_CACHE_DIR` moves it):
   `P <c|g|m> <key> <variant hex> <created ms> <first use ms> <build ms or -> <ready 0|1> *<checksum>`, with the
   times in milliseconds since the process started. The key is the SHA-256 of the title's own description of the PSO
-  (`GetCachedBlob`'s key; a mesh pipeline's MS is folded in), not of the SPIR-V, so a translator change keeps it. A
+  (`GetCachedBlob`'s key; a mesh pipeline's MS is folded in, and so are a stream's depth-bounds flag and back-face
+  stencil masks unlike the front's, which the plain description does not hold: RT-STATE-PIPELINE-KEY-DS2; a log
+  written before that names such a pipeline by the plain key, which then finds nothing, while every other key is
+  unchanged), not of the SPIR-V, so a translator change keeps it. A
   build that ends after its line was written adds `B <key> <variant hex> <build ms> *<checksum>`; a session starts
   with `S 1 <vendor hex> <device hex>`. A compute pipeline's `P` line is followed by
   `E <key> <variant hex> <name hash hex> *<checksum>`: the name hash is 16 hex digits of FNV-1a 64 over the name of

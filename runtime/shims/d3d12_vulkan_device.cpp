@@ -11341,11 +11341,29 @@ struct PipelineStream {
     bool depth_bounds = false;        // DEPTH_STENCIL1/2 DepthBoundsTestEnable (not in the plain graphics desc)
 };
 
+// A stream's graphics key: pipeline_key of its graphics description, with what the stream adds beyond that
+// description folded in, since create_graphics builds from it too: DEPTH_STENCIL1/2's depth-bounds flag, and
+// DEPTH_STENCIL2's back-face stencil masks where they differ from the front face's (without them the back face takes
+// the front's, so equal ones build the same pipeline). Two streams that differ only there would otherwise share the
+// key (kevincommits, RT-STATE-AUDIT-PIPELINE item 5). A stream without either keeps the key it had before, the one
+// CreateGraphicsPipelineState gives the same description.
+leonida::cached_pso::Key stream_graphics_key(const PipelineStream& stream) {
+    auto key = pipeline_key(stream.graphics);
+    const D3D12_DEPTH_STENCIL_DESC& d = stream.graphics.DepthStencilState;
+    const bool back = stream.back_masks && (stream.back_stencil.read != d.StencilReadMask ||
+                                            stream.back_stencil.write != d.StencilWriteMask);
+    if (!stream.depth_bounds && !back) return key;
+    leonida::cached_pso::KeyBuilder extra;
+    extra.tag("graphics stream").text(key.c_str()).u32(stream.depth_bounds).u32(back);
+    if (back) extra.u32(stream.back_stencil.read).u32(stream.back_stencil.write);
+    return leonida::sha256_hex(extra.data());
+}
+
 // What pipeline_order.log names a stream's pipeline by: the cache key, with the mesh shader's hash folded in (the
 // graphics key does not cover the MS, so two mesh pipelines that differ only there would share it).
 leonida::cached_pso::Key order_key(const PipelineStream& stream) {
     if (stream.has_cs) return pipeline_key(stream.compute);
-    auto key = pipeline_key(stream.graphics);
+    auto key = stream_graphics_key(stream);
     if (stream.ms.BytecodeLength) {
         key += leonida::sha256_hex({static_cast<const std::uint8_t*>(stream.ms.pShaderBytecode), stream.ms.BytecodeLength});
         key = leonida::sha256_hex({reinterpret_cast<const std::uint8_t*>(key.data()), key.size()});
@@ -16245,7 +16263,7 @@ public:
         if(!record)return E_INVALIDARG;
         auto* pipeline=new PipelineState(state_);
         pipeline->attach_device(identity());
-        pipeline->set_cache_key(stream.has_cs?pipeline_key(stream.compute):pipeline_key(stream.graphics));
+        pipeline->set_cache_key(stream.has_cs?pipeline_key(stream.compute):stream_graphics_key(stream));
         if(state_.order_log||state_.prewarm_plan) pipeline->set_order_key(order_key(stream));
         if(!rt::d3d12_xs::attach_pso_record(pipeline,std::move(record))){pipeline->Release();return E_OUTOFMEMORY;}
         pipeline->set_pending_stream(stream.has_cs);
@@ -18589,6 +18607,9 @@ public:
         if (FAILED(parsed)) return finish(parsed);
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
+        // The same cache key the description paths and a console stream (prepare_console_stream) give: GetCachedBlob
+        // and a later CachedPSO check name this stream's state, its depth bounds and back-face stencil masks with it.
+        pipeline->set_cache_key(stream.has_cs ? pipeline_key(stream.compute) : stream_graphics_key(stream));
         if (state_.order_log || state_.prewarm_plan) pipeline->set_order_key(order_key(stream));
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
                                          : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as,
@@ -24023,6 +24044,16 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;
     return d->create_console_descriptor_heap(desc, console_address, console_size, riid, out);
+}
+
+HRESULT pipeline_stream_keys_for_test(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, std::string& cache_key,
+                                      std::string& order) {
+    PipelineStream stream;
+    const HRESULT hr = parse_pipeline_stream(desc, stream);
+    if (FAILED(hr)) return hr;
+    cache_key = stream.has_cs ? pipeline_key(stream.compute) : stream_graphics_key(stream);
+    order = order_key(stream);
+    return S_OK;
 }
 
 UnboundTsharpStats unbound_tsharp_stats() {
