@@ -121,6 +121,44 @@ class InlineScanTests(unittest.TestCase):
         self.assertTrue(site["checked"])
         self.assertEqual(site["limit"], 0x30)
 
+    def test_list_copied_before_the_cursor_load_is_still_unchecked(self):
+        # The UNGUARDED write with `this` copied to rbx first and the cursor loaded through rcx. The walk back from
+        # the store-back meets the load before the copy, so it took the load for another structure's +18h and
+        # called the write unrelated: "UNCHECKED 0" for a write that never checks. The copy after the load was
+        # already followed.
+        write = (
+            "mov rax,qword ptr [rcx+18h]",
+            "mov dword ptr [rax],4002C400h",
+            "mov dword ptr [rax+4],edx",
+            "add rax,10h",
+            "mov qword ptr [rbx+18h],rax",
+            "mov byte ptr [rbx+0000000000000140h],0",
+        )
+        for name, rows in (("copy before the load", ("mov rbx,rcx",) + write),
+                           ("copy after the load", write[:1] + ("mov rbx,rcx",) + write[1:])):
+            with self.subTest(name):
+                (site,) = sites(rows)
+                self.assertFalse(site["checked"])
+                self.assertTrue(site["list"])
+                self.assertTrue(site["load_traced"])
+                self.assertEqual(site["size"], 0x10)
+                self.assertIn("UNCHECKED 1", inline_scan.summarize([site]))
+
+    def test_cursor_loaded_from_another_structure_is_not_a_list(self):
+        # rsi is never a copy of the list, so its +18h is not the list's cursor, wherever the copy into rbx is.
+        rows = (
+            "mov rbx,rcx",
+            "mov rax,qword ptr [rsi+18h]",
+            "mov dword ptr [rax],4002C400h",
+            "add rax,10h",
+            "mov qword ptr [rbx+18h],rax",
+            "mov byte ptr [rbx+0000000000000140h],0",
+        )
+        (site,) = sites(rows)
+        self.assertFalse(site["list"])
+        self.assertFalse(site["load_traced"])
+        self.assertIsNone(site["load"])
+
     def test_stack_frame_slot_is_not_a_list(self):
         rows = (
             "mov qword ptr [rbp+0000000000000140h],rcx",
