@@ -159,14 +159,20 @@ class LibraryStage(unittest.TestCase):
         for path in stale_files:
             self.assertFalse(os.path.exists(path), f"stale unpacked artifact survived rebuild: {path}")
 
-    def test_missing_cached_module_is_rebuilt(self):
+    def test_missing_or_empty_cached_module_is_rebuilt(self):
         self.run_step()
         self.assertEqual(self.run_step(), [])
         module = os.path.join(self.spirv, "lib_cs_00007.spv")
-        os.remove(module)
-        self.assertEqual(self.run_step(), ["shader_library.py", "translate"])
-        self.assertTrue(os.path.isfile(module))
-        self.assertEqual(self.run_step(), [])
+        for damage in ("missing", "empty"):
+            with self.subTest(damage=damage):
+                if damage == "missing":
+                    os.remove(module)
+                else:
+                    open(module, "wb").close()
+                self.assertEqual(self.run_step(), ["shader_library.py", "translate"])
+                with open(module, "rb") as f:
+                    self.assertEqual(f.read(), b"synthetic module")
+                self.assertEqual(self.run_step(), [])
 
     def test_key_clash_fails_and_leaves_no_index(self):
         self.translations = {"lib_cs_00001": ("c" * 64, "s" * 64, b"module one"),
