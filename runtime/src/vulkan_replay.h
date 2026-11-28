@@ -1583,17 +1583,55 @@ inline float quantize_snorm(float value, double maximum) {
     return static_cast<float>(round_half_even(double(value) * maximum) / maximum);
 }
 
+// An sRGB format takes a linear value and stores its encoding. D3D lets an implementation place the 255 steps of
+// that encoding within 0.6 of a step of the ideal curve, and each one measured places them elsewhere: of 60 000
+// random values, an Intel Iris Xe (driver 32.0.101.7092) stores another byte than WARP for 6 649 and an NVIDIA RTX
+// 4060 (616.92) for 3 648, in vkCmdClearColorImage and vkCmdClearAttachments alike (0.5 is 187 on the Intel GPU and
+// 188 on the other two). So the value is encoded here, the way WARP does it, and Vulkan gets the linear value in the
+// middle of that code's range (srgb8_linear), which both drivers store as that code for all 256. A GPU's own D3D12
+// driver encodes as its Vulkan driver does, so where that differs from WARP the layer now differs from that driver:
+// WARP is the reference here, as it is for the ties of quantize_unorm and for D24.
+//
+// WARP (10.0.26100.5074) takes the value to 12 bits first - x * 4095 in single precision, rounded half up - and
+// encodes that with the curve of IEC 61966-2-1, rounded to nearest. Bisecting where its result changes gives 255
+// floats, and this function changes at the same 255; it also agrees on 84 582 other values (docs/d3d12_vulkan.md).
+// NaN and values below 0 are 0, values above 1 are 255.
+inline unsigned srgb8_from_linear(float value) {
+    if (!(value > 0.0f)) return 0;
+    if (value >= 1.0f) return 255;
+    // The single-precision product, rounded to nearest even whatever the thread's rounding mode (see
+    // round_half_even): a double holds the product exactly (24 bits times 12), and a float keeps 24 bits of it.
+    const double product = double(value) * 4095.0;
+    if (product < 0.25) return 0;  // rounds to the 12-bit value 0, and keeps denormals away from frexp
+    int exponent = 0;
+    std::frexp(product, &exponent);
+    const double ulp = std::ldexp(1.0, exponent - 24);
+    const double single = round_half_even(product / ulp) * ulp;
+    const double linear = std::floor(single + 0.5) / 4095.0;
+    const double encoded = linear < 0.0031308 ? 12.92 * linear : 1.055 * std::pow(linear, 1.0 / 2.4) - 0.055;
+    return static_cast<unsigned>(std::floor(encoded * 255.0 + 0.5));
+}
+
+// The linear value an 8-bit sRGB code stands for, which is the one farthest from the values a GPU may encode as a
+// neighbouring code.
+inline float srgb8_linear(unsigned code) {
+    if (code >= 255) return 1.0f;
+    const double encoded = code / 255.0;
+    return static_cast<float>(encoded <= 0.04045 ? encoded / 12.92 : std::pow((encoded + 0.055) / 1.055, 2.4));
+}
+
 // ClearRenderTargetView takes FLOATs even for integer RTVs. Windows D3D12 (WARP and AMD) clamps to the
 // component range and truncates fractions. Vulkan instead interprets the matching union member as an integer
 // already; copying float bits changes the value without a validation error. The normalised formats are rounded like
-// D3D (quantize_unorm, quantize_snorm).
+// D3D (quantize_unorm, quantize_snorm), and the colour channels of the sRGB formats are encoded like WARP
+// (srgb8_from_linear).
 inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearColor& input) {
     // Integer formats convert the float numerically: NaN maps to zero, values below the range clamp to the low
     // end, positive overflow (and +infinity) to the high end, and fractions truncate toward zero. Unsigned uses
     // uint32, signed int32. A2B10G10R10 clamps RGB to 10 bits and alpha (channel 3) to 2 bits.
     constexpr double u32_max = 4294967295.0, s32_min = -2147483648.0, s32_max = 2147483647.0;
     double low = 0, high = 0, alpha_high = 0;
-    bool is_integer = true, is_signed = false;
+    bool is_integer = true, is_signed = false, srgb = false;
     std::array<double, 4> unorm{};  // the largest value of each normalised channel; 0 leaves the channel to the GPU
     double snorm = 0;               // the largest value of a signed normalised format
     switch (format) {
@@ -1630,8 +1668,9 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     case VK_FORMAT_A8_UNORM_KHR: is_integer = false; unorm = {0, 0, 0, 255}; break;  // alpha only
 #endif
     case VK_FORMAT_R8G8B8A8_SRGB:
-    case VK_FORMAT_B8G8R8A8_SRGB:  // the colour channels go through the sRGB curve on the GPU
+    case VK_FORMAT_B8G8R8A8_SRGB:  // the colour channels are encoded below; alpha is linear
         is_integer = false;
+        srgb = true;
         unorm = {0, 0, 0, 255};
         break;
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32: is_integer = false; unorm = {1023, 1023, 1023, 3}; break;
@@ -1645,6 +1684,7 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     for (std::size_t i = 0; i < input.size(); ++i) {
         if (!is_integer) {
             if (snorm != 0) value.float32[i] = quantize_snorm(input[i], snorm);
+            else if (srgb && i < 3) value.float32[i] = srgb8_linear(srgb8_from_linear(input[i]));
             else value.float32[i] = unorm[i] != 0.0 ? quantize_unorm(input[i], unorm[i]) : input[i];
             continue;
         }

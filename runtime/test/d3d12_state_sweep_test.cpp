@@ -20,6 +20,7 @@
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -409,6 +410,19 @@ std::vector<Case> build_cases() {
         c.name = tag + "no blend";
         c.format = f;
         cases.push_back(std::move(c));
+        // An sRGB target starts from the linear values of three codes (124, 170 and 203, near the 0.2, 0.4 and 0.6 of
+        // the other targets), which every implementation measured stores as those codes. Another value lands on the
+        // code above or below it depending on who encodes: the layer does as WARP does, a GPU's D3D12 driver as its
+        // hardware does (0.2 is 124 on WARP and 123 on an Intel Iris Xe), and this sweep is about the blending.
+        if (f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+            for (std::size_t i = cases.size() - 4; i < cases.size(); ++i) {
+                const unsigned codes[3] = {124, 170, 203};
+                for (int channel = 0; channel < 3; ++channel) {
+                    const double encoded = codes[channel] / 255.0;
+                    cases[i].clear_color[channel] = static_cast<float>(std::pow((encoded + 0.055) / 1.055, 2.4));
+                }
+            }
+        }
     }
     // Depth: the draw's depth is 0; the clear is 0 (EQUAL-ish) or 0.5.
     for (int func = 1; func <= 8; ++func)

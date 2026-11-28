@@ -8,7 +8,9 @@
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -232,6 +234,31 @@ const std::vector<Color> kUint = {{1, 2, 3, 4}, {1.5f, 2.5f, 3.5f, 4.5f}, {-1, -
 const std::vector<Color> kSint = {{-1, -2, -128, 127}, {-1.5f, -2.5f, 2.5f, 3.5f}, {-129, 128, -32769, 32768},
                                   {2147483648.0f, -2147483904.0f, kNaN, kInf}, {-kInf, 0.5f, -0.5f, 100000.0f}};
 
+// The linear value of an sRGB encoding given on the scale of the 8-bit codes (IEC 61966-2-1).
+float srgb_linear(double code) {
+    const double encoded = code / 255.0;
+    return static_cast<float>(encoded <= 0.04045 ? encoded / 12.92 : std::pow((encoded + 0.055) / 1.055, 2.4));
+}
+
+// The sRGB formats take the UNORM colours and then, three to a colour, the linear value of each of the 256 codes and
+// of each of the 255 places halfway between two codes. A GPU stores a code's own value as that code, but each one
+// (and WARP) puts the step between two codes somewhere else near the halfway value, so a clear that leaves the
+// encoding to the GPU differs from WARP on many of the second kind and on a few of the UNORM colours (0.5 is 187 on
+// an Intel Iris Xe and 188 on WARP).
+std::vector<Color> srgb_colors() {
+    std::vector<float> values;
+    for (int code = 0; code < 256; ++code) values.push_back(srgb_linear(code));
+    for (int code = 0; code < 255; ++code) values.push_back(srgb_linear(code + 0.5));
+    std::vector<Color> colors = kUnorm;
+    for (std::size_t i = 0; i < values.size(); i += 3) {
+        const std::size_t last = values.size() - 1;
+        colors.push_back({values[i], values[std::min(i + 1, last)], values[std::min(i + 2, last)],
+                          i % 2 ? 0.25f : 1.0f});
+    }
+    return colors;
+}
+const std::vector<Color> kSrgb = srgb_colors();
+
 const ColorCase kColorCases[] = {
     {"UNORM", "R8_UNORM", DXGI_FORMAT_R8_UNORM, 1, &kUnorm},
     {"UNORM", "A8_UNORM", DXGI_FORMAT_A8_UNORM, 1, &kUnorm},  // the alpha component only
@@ -248,8 +275,8 @@ const ColorCase kColorCases[] = {
     {"SNORM", "R16_SNORM", DXGI_FORMAT_R16_SNORM, 2, &kSnorm},
     {"SNORM", "R16G16_SNORM", DXGI_FORMAT_R16G16_SNORM, 4, &kSnorm},
     {"SNORM", "R16G16B16A16_SNORM", DXGI_FORMAT_R16G16B16A16_SNORM, 8, &kSnorm},
-    {"SRGB", "R8G8B8A8_UNORM_SRGB", DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 4, &kUnorm},
-    {"SRGB", "B8G8R8A8_UNORM_SRGB", DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, 4, &kUnorm},
+    {"SRGB", "R8G8B8A8_UNORM_SRGB", DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 4, &kSrgb},
+    {"SRGB", "B8G8R8A8_UNORM_SRGB", DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, 4, &kSrgb},
     {"FLOAT", "R16_FLOAT", DXGI_FORMAT_R16_FLOAT, 2, &kFloat},
     {"FLOAT", "R16G16_FLOAT", DXGI_FORMAT_R16G16_FLOAT, 4, &kFloat},
     {"FLOAT", "R16G16B16A16_FLOAT", DXGI_FORMAT_R16G16B16A16_FLOAT, 8, &kFloat},

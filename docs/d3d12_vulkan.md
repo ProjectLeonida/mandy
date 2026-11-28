@@ -3879,13 +3879,52 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   and 2^32 in alpha match WARP). `d3d12_clear_test` compares full and rectangular D3D12 readbacks with WARP across
   UNORM, SNORM, FLOAT, all 15 exposed UINT/SINT render targets (11 value vectors, including 8-/16-/10-/2-bit range
   boundaries) and depth/stencil; `clear_color_test` checks both replay paths for 19 integer formats without a GPU,
-  including unchanged float values. SRGB clears are omitted from the comparison: the
-  linear→sRGB encoding rounds differently at the `.5` boundary on WARP vs Vulkan (a 1-ulp driver difference).
+  including unchanged float values. SRGB clears are omitted from that comparison; `d3d12_clear_formats_test`
+  compares them (next item).
   **Open:** on NVIDIA RTX 5080 (driver 616.56) clears that land exactly on a `.5` UNORM/SNORM step round down where
   WARP rounds up: `R8G8B8A8_UNORM`/`SNORM` 0.5 store `7f`/`3f` vs WARP `80`/`40`, and a `D16_UNORM` 0.5 depth clear
   stores `0x7fff` vs WARP `0x8000` (all on `main` before this change; same 1-ulp class as SRGB, not addressed here).
   `D32_FLOAT` and `D32_FLOAT_S8X24_UINT` match WARP.
   This does not add typed-view reinterpretation of typeless resources.
+- **sRGB RTV clears (D3D-CLEAR-SRGB-ENCODE):** `ClearRenderTargetView` through an `R8G8B8A8_UNORM_SRGB` or
+  `B8G8R8A8_UNORM_SRGB` view encodes the colour channels in the layer and hands Vulkan the linear value of the
+  resulting code (`srgb8_from_linear` and `srgb8_linear` in `vulkan_replay.h`); alpha is linear and rounds like
+  UNORM. Before, the linear float went to `vkCmdClearColorImage` or `vkCmdClearAttachments` as it was and the GPU
+  encoded it, so the stored byte depended on the GPU: 0.5 was `bb` on an Intel Iris Xe and `bc` on WARP and an
+  NVIDIA RTX 4060. **Measured** (Windows 11 build 26100, WARP 10.0.26100.5074, Iris Xe with Intel 32.0.101.7092, RTX
+  4060 Laptop with NVIDIA 616.92; a scratch program cleared 256-slice sRGB targets through the layer and through
+  WARP, a whole view and a rectangle each, and bisected over float bit patterns):
+  - No driver is wrong. D3D permits FLOAT → SRGB a tolerance of 0.6 of a step (Direct3D 11.3 functional
+    specification, 3.2.3.8), and each implementation puts the 255 steps between two codes somewhere else: measured
+    against the halfway point of the ideal curve, the Iris Xe's sit between 0.18 of a code below and 0.33 above, the
+    RTX 4060's within 0.10 and WARP's between 0.29 below and 0.34 above. On each GPU both Vulkan commands have the
+    same 255 steps. Of 60 000 random values (half uniform in 0..1, half log-uniform from 1e-6) the Iris Xe stored
+    another byte than WARP for 6 649 and the RTX 4060 for 3 648, never more than one code away.
+  - WARP takes the value to 12 bits first and encodes that: `j = floor(x * 4095 + 0.5)` with the product rounded to
+    single precision, then the nearest code of the IEC 61966-2-1 curve at `j / 4095`. The 255 floats at which WARP's
+    byte changes are the 255 this rule gives (with the product in exact arithmetic only 188 are: `0x3f018018` times
+    4095 is 2071.4999986, which a float rounds to 2071.5), and WARP agrees with it on 84 582 further values: every
+    12-bit value, five floats around each of the 4 095 places between two of them, the 60 000 random ones, 0, 1,
+    values outside 0..1, NaN and both infinities. It is not the nearest code of the ideal curve for 2 852 of the
+    60 000 (0.0004 is 2, the curve gives 1.32).
+  - WARP and both GPUs store the linear value of a code as that code, for all 256 codes and with both commands. That
+    value is the one farthest from any implementation's steps, so it is what the layer hands over; a GPU whose
+    encoding is more than half a code off at one of these values would still differ.
+  - Each GPU's own D3D12 driver stores what its Vulkan driver stores (the same byte for 84 582 of 84 582 values, on
+    both GPUs): the encoding is the hardware's. So the layer used to store the bytes of the D3D12 driver of the GPU it
+    ran on, and now stores WARP's on every GPU, which differ from the Intel driver's for those 6 649 of 60 000 values
+    and from the NVIDIA driver's for 3 648. That is the choice made before for the ties of UNORM clears and for D24:
+    the layer converts, WARP is the reference, and a host driver that does otherwise is a host quirk.
+
+  `clear_color_test` (no GPU) pins 38 values to the bytes WARP stored, checks that every code encodes to itself and
+  that the result is the same under each floating-point rounding mode. `d3d12_clear_formats_test` clears both formats
+  to the UNORM colours, the value of every code and the value halfway between every two codes (176 colours each, as
+  a whole view and as a rectangle): against WARP, 178 of the 352 cases differed on the Iris Xe and 170 on the RTX
+  4060 before, none after (the five UNORM colours alone differed in 10 of 10 cases on the Iris Xe and in none on the
+  RTX 4060). `d3d12_state_sweep_test` compares with the D3D12 driver of the same adapter and cleared its sRGB targets
+  to 0.2, 0.4 and 0.6, of which the first two are codes 124 and 170 on WARP and 123 and 169 on the Iris Xe; it now
+  clears them to the values of codes 124, 170 and 203, so its eight sRGB cases compare the blending whichever way
+  the host encodes. A draw into an sRGB target is still encoded by the GPU.
 - **Depth clears.** Microsoft documents a `[0, 1]` clamp. On Windows 11 build 26100, both WARP and native D3D12 on
   an RTX 5070 Ti (610.74) preserved finite out-of-range `D32_FLOAT` values and quiet NaN in full and rectangle
   clears. Replay preserves those values when the Vulkan device has enabled `VK_EXT_depth_range_unrestricted`.

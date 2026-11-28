@@ -1,5 +1,6 @@
 // Value-level replay regression: full and rectangular integer clears must carry integer values, not float bits,
-// and normalised clears are rounded to nearest even like D3D (0.5 on 8 bits is 128).
+// normalised clears are rounded to nearest even like D3D (0.5 on 8 bits is 128), and the colour channels of an sRGB
+// clear are encoded like WARP (0.5 is code 188) and handed over as that code's linear value.
 // No Vulkan loader, GPU, shaders or game data. Expected conversions also match the WARP differential GPU tests.
 #include "../src/vulkan_replay.h"
 #include <array>
@@ -8,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 namespace {
 VkClearColorValue captured{};
@@ -44,6 +46,17 @@ bool replay_color(VkFormat format, const leonida::ClearColor& color, bool rectan
 
 // Integer RTV format with its component range; A2B10G10R10 has a 2-bit alpha.
 struct IntegerFormat { VkFormat format; const char* name; double low, high, alpha_high; bool is_signed; };
+
+float from_bits(std::uint32_t word) {
+    float value;
+    std::memcpy(&value, &word, sizeof value);
+    return value;
+}
+
+// The ideal sRGB encoding of a linear value in 0..1 (IEC 61966-2-1), on a scale of 1.
+double srgb_encode(double linear) {
+    return linear < 0.0031308 ? 12.92 * linear : 1.055 * std::pow(linear, 1.0 / 2.4) - 0.055;
+}
 
 // Reference conversion measured against WARP: NaN -> 0, clamp to the range, truncate fractions toward zero.
 std::uint32_t expected_bits(float input, double low, double high, bool is_signed) {
@@ -143,8 +156,6 @@ int main() {
         {VK_FORMAT_A2B10G10R10_UNORM_PACK32, {0.5f, 0.5f, 0.5f, 0.5f}, {512, 512, 512, 2}, {1023, 1023, 1023, 3}},
         {VK_FORMAT_R16G16B16A16_UNORM, {0.5f, 0.25f, 0.75f, 1.0f}, {32768, 16384, 49151, 65535},
          {65535, 65535, 65535, 65535}},
-        {VK_FORMAT_R8G8B8A8_SRGB, {0.2f, 0.7f, 0.5f, 0.5f}, {0, 0, 0, 128}, {0, 0, 0, 255}},  // colour: the GPU's sRGB curve
-        {VK_FORMAT_B8G8R8A8_SRGB, {0.5f, 0.25f, 0.75f, 0.499f}, {0, 0, 0, 127}, {0, 0, 0, 255}},
         {VK_FORMAT_R16_UNORM, {0.5f, 0, 0, 0}, {32768, 0, 0, 0}, {65535, 65535, 65535, 65535}},
         // Signed normalised: -1.0 is -127 (-32767), the scale is 127 (32767) and ties go to the even neighbour.
         {VK_FORMAT_R8G8B8A8_SNORM, {-1, -0.5f, 0.5f, 1}, {-127, -64, 64, 127}, {127, 127, 127, 127}},
@@ -166,6 +177,67 @@ int main() {
             ++checks;
         }
     }
+    // sRGB: the colour channels are encoded here the way WARP encodes them and handed over as the linear value of that
+    // code, so the byte does not depend on where a GPU puts the steps of its own curve; alpha is linear and rounds like
+    // UNORM. The codes are the bytes WARP 10.0.26100.5074 stored for these clears of an R8G8B8A8_UNORM_SRGB target.
+    // WARP takes the value to 12 bits first (x * 4095 in single precision, rounded half up), so some are not the
+    // nearest code of the ideal curve.
+    struct Srgb {
+        float linear;
+        unsigned code;
+    };
+    const Srgb srgb[] = {
+        {0.5f, 188}, {0.25f, 137}, {0.75f, 225}, {0.125f, 99}, {0.0039f, 13}, {0.5019f, 188}, {0.9961f, 255},
+        {0.2f, 124}, {0.7f, 218}, {0.0001f, 0}, {0.001f, 3}, {0.003f, 10}, {0.0031308f, 10}, {0.004f, 13},
+        {0.01f, 25}, {0.05f, 63}, {0.1f, 89}, {0.3f, 149}, {0.6f, 203}, {0.9f, 243}, {0.99f, 254}, {0.999f, 255},
+        {0.9999f, 255}, {0, 0}, {1, 255}, {-1, 0}, {2, 255}, {nan, 0}, {inf, 255}, {-inf, 0},
+        // The ideal curve gives 1.32, 2.64, 5.27 and 6.59 for these.
+        {0.0004f, 2}, {0.0008f, 2}, {0.0016f, 6}, {0.002f, 6},
+        // Neighbouring floats on the two sides of a step: x * 4095 is just below 0.5 and 0.5 after rounding to
+        // single precision (0.50000003 exactly); 2071.49976 and 2071.5 after rounding (2071.4999986 exactly).
+        {from_bits(0x39000800), 0}, {from_bits(0x39000801), 1}, {from_bits(0x3f018017), 188},
+        {from_bits(0x3f018018), 189},
+    };
+    for (const VkFormat format : {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB}) {
+        for (std::size_t first = 0; first < std::size(srgb); first += 3) {
+            leonida::ClearColor color{0, 0, 0, first % 2 ? 0.499f : 0.5f};
+            unsigned codes[3] = {0, 0, 0};
+            for (std::size_t i = 0; i < 3 && first + i < std::size(srgb); ++i) {
+                color[i] = srgb[first + i].linear;
+                codes[i] = srgb[first + i].code;
+            }
+            for (const bool rect : {false, true}) {
+                if (!replay_color(format, color, rect)) return 1;
+                for (unsigned i = 0; i < 3; ++i) {
+                    // The value is the middle of the code's range: its ideal encoding is the code itself.
+                    const double encoded = srgb_encode(captured.float32[i]) * 255.0;
+                    if (captured.float32[i] != leonida::detail::srgb8_linear(codes[i]) ||
+                        std::fabs(encoded - codes[i]) > 0.001) {
+                        std::fprintf(stderr, "sRGB clear: format %d rect %d value %.9g: got %.9g, which encodes to "
+                                     "%.4f, expected code %u\n", int(format), int(rect), double(color[i]),
+                                     double(captured.float32[i]), encoded, codes[i]);
+                        return 1;
+                    }
+                }
+                const float alpha = static_cast<float>((first % 2 ? 127.0 : 128.0) / 255.0);
+                if (captured.float32[3] != alpha) {
+                    std::fprintf(stderr, "sRGB clear: format %d rect %d: alpha %.9g, expected %.9g\n", int(format),
+                                 int(rect), double(captured.float32[3]), double(alpha));
+                    return 1;
+                }
+                ++checks;
+            }
+        }
+    }
+    // Every code is the code of its own linear value, so a clear to a colour read back from an sRGB target stores
+    // that colour again.
+    for (unsigned code = 0; code < 256; ++code) {
+        if (leonida::detail::srgb8_from_linear(leonida::detail::srgb8_linear(code)) != code) {
+            std::fprintf(stderr, "sRGB code %u does not encode to itself\n", code);
+            return 1;
+        }
+    }
+    ++checks;
     // The other integer formats clamp to the component range and truncate toward zero (what WARP writes).
     struct Integer {
         VkFormat format;
@@ -225,11 +297,33 @@ int main() {
             }
             ++checks;
         }
+        // The sRGB encoding too: every 12-bit value and the floats around each step between two of them give the
+        // same code under each mode as under the default one (a float multiply or std::nearbyint would follow it).
+        std::vector<float> values;
+        for (unsigned j = 0; j < 4096; ++j) {
+            values.push_back(static_cast<float>(j / 4095.0));
+            const float step = static_cast<float>((j + 0.5) / 4095.0);
+            values.insert(values.end(), {std::nextafter(step, 0.0f), step, std::nextafter(step, 2.0f)});
+        }
+        std::vector<unsigned> codes[4];
+        for (int m = 0; m < 4; ++m) {
+            if (m < 3) std::fesetround(modes[m]);
+            for (const float v : values) codes[m].push_back(leonida::detail::srgb8_from_linear(v));
+            std::fesetround(mode);
+        }
+        for (int m = 0; m < 3; ++m) {
+            if (codes[m] != codes[3]) {
+                std::fprintf(stderr, "sRGB encoding under FP mode %d differs from the default mode\n", modes[m]);
+                return 1;
+            }
+            ++checks;
+        }
     }
     if (failed_formats) {
         std::fprintf(stderr, "clear_color_test: %u integer format(s) failed\n", failed_formats);
         return 1;
     }
-    std::printf("clear_color_test: %u full/rectangle integer, normalised and float replay checks passed\n", checks);
+    std::printf("clear_color_test: %u full/rectangle integer, normalised, sRGB and float replay checks passed\n",
+                checks);
     return 0;
 }

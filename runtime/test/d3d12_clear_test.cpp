@@ -495,8 +495,8 @@ int main(int argc, char** argv) {
             {65535.5f, 65536, 1023.5f, 1024}, {3.5f, 4, 2147483520.0f, -2147483648.0f}
         };
         // Float-valued formats (UNORM/SNORM/FLOAT); out-of-range values exercise clamping. NaN/inf and SRGB are
-        // omitted: NaN/inf conversion is driver-defined, and the linear->sRGB encoding rounds differently at the .5
-        // boundary on WARP vs Vulkan (a 1-ulp driver difference the shim cannot control).
+        // omitted: NaN/inf conversion is driver-defined, and d3d12_clear_formats_test compares the SRGB clears (the
+        // layer encodes them itself, as WARP does).
         const std::array<float, 4> float_values[] = {
             {0, 0.25f, 0.5f, 1}, {1, 1, 1, 1}, {0.5f, 0.5f, 0.5f, 0.5f}, {-0.5f, 0, 1.5f, 2}
         };
@@ -556,9 +556,10 @@ int main(int argc, char** argv) {
         // RTVs through a castable-format list in another channel order or family, or a typed BGRA8 texture's sRGB
         // view: the clear is stored in the view's channel order and encoding, as WARP and AMD's D3D12 driver store
         // it. An X8 view leaves its X byte undefined (WARP and AMD's driver differ), so it isn't compared. The bytes
-        // are compared within 1: drivers round the 0.5 tie differently (WARP 128, NVIDIA 127), and Intel's encodes
-        // sRGB 1 off WARP in places (its own D3D12 driver stores the same bytes as the layer there); a wrong channel
-        // order or a missing sRGB encoding is many steps off.
+        // are compared within 1, from when the GPU converted the value: drivers round the 0.5 tie differently (WARP
+        // 128, NVIDIA 127) and Intel's encodes sRGB 1 off WARP in places (in its own D3D12 driver too). The layer now
+        // does both itself (render_target_clear_color); a wrong channel order or a missing sRGB encoding is many
+        // steps off.
         // A host that can't take a castable-format list (Windows 10's d3d12.dll has no ID3D12Device10; the in-box WARP
         // 10.0.22621.5415 on Windows 11 23H2 reports RelaxedFormatCastingSupported = 0 and CreateCommittedResource3
         // fails) clears a texture in the view's own format instead: the bytes are stored in the view's channel order
