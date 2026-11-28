@@ -142,6 +142,132 @@ class Tests(unittest.TestCase):
         )
         self.assertEqual(pd.parse_lasttest(log), [("outer", "fail", 0.23), ("next", "pass", 0.02)])
 
+    def test_lasttest_recovers_when_nested_log_omits_end_testing(self) -> None:
+        # Mirrors the real CTest 3.31.10 fixture where outer `wrapper` (1/2, fails) prints an inner
+        # log containing `wrapper` (1/2, passes) and `child_2` (2/2, passes) with identical ordinal
+        # and timestamps, but without the inner `End testing:` trailer, followed by outer `later` (2/2).
+        sep = "-" * 58
+        ts = "Nov 24 20:47 UTC"
+        inner_no_end = (
+            f"Start testing: {ts}\n{sep}\n"
+            f"1/2 Testing: wrapper\n1/2 Test: wrapper\nOutput:\n{sep}\ninner ok\n<end of output>\n"
+            f'Test time =   0.01 sec\n{sep}\nTest Passed.\n"wrapper" end time: {ts}\n'
+            f'"wrapper" time elapsed: 00:00:00\n{sep}\n\n'
+            f"2/2 Testing: child_2\n2/2 Test: child_2\nOutput:\n{sep}\nchild ok\n<end of output>\n"
+            f'Test time =   0.01 sec\n{sep}\nTest Passed.\n"child_2" end time: {ts}\n'
+            f'"child_2" time elapsed: 00:00:00\n{sep}'
+        )
+        log = (
+            f"Start testing: {ts}\n{sep}\n"
+            f"1/2 Testing: wrapper\n1/2 Test: wrapper\nOutput:\n{sep}\n{inner_no_end}\n<end of output>\n"
+            f'Test time =   0.25 sec\n{sep}\nTest Failed.\n"wrapper" end time: {ts}\n'
+            f'"wrapper" time elapsed: 00:00:00\n{sep}\n\n'
+            f"2/2 Testing: later\n2/2 Test: later\nOutput:\n{sep}\nok\n<end of output>\n"
+            f'Test time =   0.02 sec\n{sep}\nTest Passed.\n"later" end time: {ts}\n'
+            f'"later" time elapsed: 00:00:00\n{sep}\n\nEnd testing: {ts}\n'
+        )
+        self.assertEqual(pd.parse_lasttest(log), [("wrapper", "fail", 0.25), ("later", "pass", 0.02)])
+
+    def test_lasttest_recovers_from_empty_incomplete_nested_log(self) -> None:
+        sep = "-" * 58
+        log = (
+            f"Start testing: Nov 24 20:47 UTC\n{sep}\n"
+            f"1/1 Testing: wrapper\n1/1 Test: wrapper\nOutput:\n{sep}\n"
+            f"Start testing: Nov 24 20:47 UTC\n{sep}\n"
+            f"<end of output>\nTest time =  10.00 sec\n{sep}\nTest Failed.\n"
+        )
+        self.assertEqual(pd.parse_lasttest(log), [("wrapper", "fail", 10.0)])
+
+    def test_lasttest_handles_three_level_nested_log_missing_innermost_end_testing(self) -> None:
+        sep = "-" * 58
+        ts = "Nov 24 20:47 UTC"
+        leaf = (
+            f"Start testing: {ts}\n{sep}\n1/1 Test: leaf\nOutput:\n{sep}\nleaf\n<end of output>\n"
+            f'Test time =   0.01 sec\n{sep}\nTest Passed.\n"leaf" end time: {ts}\n{sep}'
+        )
+        mid = (
+            f"Start testing: {ts}\n{sep}\n1/1 Test: mid\nOutput:\n{sep}\n{leaf}\n<end of output>\n"
+            f'Test time =   0.05 sec\n{sep}\nTest Passed.\n"mid" end time: {ts}\n{sep}\n\nEnd testing: {ts}'
+        )
+        log = (
+            f"Start testing: {ts}\n{sep}\n1/2 Test: wrapper\nOutput:\n{sep}\n{mid}\n<end of output>\n"
+            f'Test time =   0.30 sec\n{sep}\nTest Failed.\n"wrapper" end time: {ts}\n{sep}\n\n'
+            f"2/2 Test: later\nOutput:\n{sep}\nok\n<end of output>\n"
+            f'Test time =   0.02 sec\n{sep}\nTest Passed.\n"later" end time: {ts}\n{sep}\n\nEnd testing: {ts}\n'
+        )
+        self.assertEqual(pd.parse_lasttest(log), [("wrapper", "fail", 0.3), ("later", "pass", 0.02)])
+
+    def test_lasttest_recovers_when_inner_test_output_is_truncated_mid_stream(self) -> None:
+        sep = "-" * 58
+        ts = "Nov 24 20:47 UTC"
+        inner_truncated = (
+            f"Start testing: {ts}\n{sep}\n"
+            f"1/2 Test: wrapper\nOutput:\n{sep}\nok\n<end of output>\n"
+            f'Test time =   0.01 sec\n{sep}\nTest Passed.\n"wrapper" end time: {ts}\n{sep}\n'
+            f"2/2 Test: child_2\nOutput:\n{sep}\npartial output before kill"
+        )
+        log = (
+            f"Start testing: {ts}\n{sep}\n"
+            f"1/2 Test: wrapper\nOutput:\n{sep}\n{inner_truncated}\n<end of output>\n"
+            f'Test time =   0.40 sec\n{sep}\nTest Failed.\n"wrapper" end time: {ts}\n{sep}\n\n'
+            f"2/2 Test: later\nOutput:\n{sep}\nok\n<end of output>\n"
+            f'Test time =   0.03 sec\n{sep}\nTest Passed.\n"later" end time: {ts}\n{sep}\n\nEnd testing: {ts}\n'
+        )
+        self.assertEqual(pd.parse_lasttest(log), [("wrapper", "fail", 0.4), ("later", "pass", 0.03)])
+
+    def test_lasttest_recovers_when_multi_level_nested_output_is_truncated_mid_leaf(self) -> None:
+        sep = "-" * 58
+        ts = "Nov 24 21:40 UTC"
+        middle_truncated_in_leaf = (
+            f"Start testing: {ts}\n{sep}\n"
+            f"1/1 Test: middle\nOutput:\n{sep}\n"
+            f"Start testing: {ts}\n{sep}\n"
+            f"1/1 Test: leaf\nOutput:\n{sep}\n"
+            f"leaf payload"
+        )
+        log = (
+            f"Start testing: {ts}\n{sep}\n"
+            f"1/2 Test: wrapper\nOutput:\n{sep}\n{middle_truncated_in_leaf}\n<end of output>\n"
+            f'Test time =   0.25 sec\n{sep}\nTest Failed.\n"wrapper" end time: {ts}\n{sep}\n\n'
+            f"2/2 Test: later\nOutput:\n{sep}\nok\n<end of output>\n"
+            f'Test time =   0.04 sec\n{sep}\nTest Passed.\n"later" end time: {ts}\n{sep}\n\nEnd testing: {ts}\n'
+        )
+        self.assertEqual(pd.parse_lasttest(log), [("wrapper", "fail", 0.25), ("later", "pass", 0.04)])
+
+    def test_lasttest_recovers_when_middle_finishes_after_truncated_leaf(self) -> None:
+        sep = "-" * 58
+        ts = "Nov 24 21:40 UTC"
+        middle_with_truncated_leaf = (
+            f"Start testing: {ts}\n{sep}\n"
+            f"1/1 Test: middle\nOutput:\n{sep}\n"
+            f"Start testing: {ts}\n{sep}\n"
+            f"1/1 Test: leaf\nOutput:\n{sep}\n"
+            f"leaf payload\n<end of output>\n"
+            f'Test time =   0.10 sec\n{sep}\nTest Failed.\n"middle" end time: {ts}\n{sep}\nEnd testing: {ts}'
+        )
+        log = (
+            f"Start testing: {ts}\n{sep}\n"
+            f"1/2 Test: wrapper\nOutput:\n{sep}\n{middle_with_truncated_leaf}\n<end of output>\n"
+            f'Test time =   0.35 sec\n{sep}\nTest Passed.\n"wrapper" end time: {ts}\n{sep}\n\n'
+            f"2/2 Test: later\nOutput:\n{sep}\nok\n<end of output>\n"
+            f'Test time =   0.05 sec\n{sep}\nTest Passed.\n"later" end time: {ts}\n{sep}\n\nEnd testing: {ts}\n'
+        )
+        self.assertEqual(pd.parse_lasttest(log), [("wrapper", "pass", 0.35), ("later", "pass", 0.05)])
+
+    def test_lasttest_ignores_spurious_end_testing_inside_nested_test_output(self) -> None:
+        sep = "-" * 58
+        ts = "Nov 24 20:47 UTC"
+        inner = (
+            f"Start testing: {ts}\n{sep}\n1/1 Test: inner\nOutput:\n{sep}\n"
+            f"End testing: spurious line in child output\n<end of output>\n"
+            f'Test time =   0.01 sec\n{sep}\nTest Passed.\n"inner" end time: {ts}\n{sep}\nEnd testing: {ts}'
+        )
+        log = (
+            f"Start testing: {ts}\n{sep}\n1/1 Test: wrapper\nOutput:\n{sep}\n{inner}\n<end of output>\n"
+            f'Test time =   0.15 sec\n{sep}\nTest Failed.\n"wrapper" end time: {ts}\n{sep}\nEnd testing: {ts}\n'
+        )
+        self.assertEqual(pd.parse_lasttest(log), [("wrapper", "fail", 0.15)])
+
     def test_ci_selection_matches_the_workflow_rule(self):
         files = pd.ci_test_files()
         self.assertIn("tests/test_progress_dashboard.py", files)
