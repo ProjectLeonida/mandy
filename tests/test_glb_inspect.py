@@ -682,6 +682,30 @@ class GlbInspectTests(unittest.TestCase):
                                                 "images": 0, "skins": 0, "animations": 0})
             self.assertIsNone(report["position_bbox"])
 
+    def test_invalid_bounds_do_not_distort_the_aggregate(self):
+        for lower, upper in (([0, 4, 0], [1, 3, 1]), ([0, 0, 0, 0], [9, 9, 9]),
+                             ([0, 0, 0], [9, 9, 9, 9]), ([0, False, 0], [9, 9, 9])):
+            with self.subTest(lower=lower, upper=upper):
+                doc = triangle_gltf()
+                doc["accessors"].append({"type": "VEC3", "count": 3, "min": lower, "max": upper})
+                doc["meshes"][0]["primitives"].append({"attributes": {"POSITION": 2}})
+                data = glb(doc)
+                report = glb_inspect.build_report(glb_inspect.parse_glb(data), len(data))
+                self.assertIsNone(report["meshes"][0]["primitives"][1]["bbox"])
+                self.assertEqual(report["position_bbox"], {"min": [0, 0, 0], "max": [1, 1, 0]})
+                self.assertFalse(report["position_bbox_complete"])
+                self.assertIn("(partial:", glb_inspect.format_report(report))
+
+    def test_overflowed_json_exponent_still_allows_strict_json_report(self):
+        doc = bbox_gltf(with_bounds=True)
+        doc["accessors"][0]["max"][0] = "huge"
+        payload = json_bytes(doc).rstrip(b" ").replace(b'"huge"', b"1e999")
+        data = container(payload + b" " * (-len(payload) % 4))
+        report = glb_inspect.build_report(glb_inspect.parse_glb(data), len(data))
+        self.assertIsNone(report["position_bbox"])
+        self.assertFalse(report["position_bbox_complete"])
+        json.dumps(report, allow_nan=False)
+
     def test_position_bbox_from_accessor_bounds(self):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "bounds.glb")

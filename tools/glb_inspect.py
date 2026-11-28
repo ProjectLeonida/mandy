@@ -18,6 +18,7 @@ import argparse
 from contextlib import suppress
 import errno
 import json
+import math
 import os
 import struct
 import sys
@@ -369,11 +370,14 @@ def _bbox(accessor: dict | None) -> dict | None:
         return None
     lower = accessor.get("min")
     upper = accessor.get("max")
-    if not (isinstance(lower, list) and isinstance(upper, list) and len(lower) >= 3 and len(upper) >= 3):
+    if not (isinstance(lower, list) and isinstance(upper, list) and len(lower) == len(upper) == 3):
         return None
-    if not all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in lower[:3] + upper[:3]):
+    for value in lower + upper:
+        if not (_is_int(value) or (isinstance(value, float) and math.isfinite(value))):
+            return None
+    if any(lo > hi for lo, hi in zip(lower, upper)):
         return None
-    return {"min": lower[:3], "max": upper[:3]}
+    return {"min": lower, "max": upper}
 
 
 def _merge_bbox(boxes: list[dict]) -> dict | None:
@@ -598,7 +602,7 @@ def format_report(report: dict) -> str:
         f"{chunk['type']} {chunk['byte_length']} bytes (padding {_padding_text(chunk.get('padding'))})"
         for chunk in report["chunks"]))
     bbox = report["position_bbox"]
-    suffix = (" (partial: some POSITION accessors have no min/max)"
+    suffix = (" (partial: some POSITION accessors have missing or invalid bounds)"
               if bbox is not None and not report["position_bbox_complete"] else "")
     lines.append(f"POSITION bbox: {_bbox_text(bbox)}{suffix}")
 
