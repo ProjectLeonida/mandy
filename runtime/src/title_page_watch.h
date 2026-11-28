@@ -387,9 +387,11 @@ inline std::uintptr_t to_host_view(std::uintptr_t va, std::uintptr_t bytes = 1) 
 namespace leonida::title_texel_writes {
 
 struct State {
+    static constexpr std::size_t kMaxMerged = 16384;
     std::mutex mutex;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> ranges;  // [begin, end)
-    bool overflow = false;                                          // too many to keep: check everything
+    std::size_t compact_at = kMaxMerged;
+    bool overflow = false;  // too many disjoint spans to keep: check everything
     std::atomic<bool> pending{false};
 };
 
@@ -402,9 +404,37 @@ inline void note(const void* begin, std::size_t bytes) {
     if (!begin || !bytes) return;
     State& s = state();
     std::lock_guard lock(s.mutex);
+    if (s.overflow) {
+        s.pending.store(true, std::memory_order_release);
+        return;
+    }
     const auto at = reinterpret_cast<std::uintptr_t>(begin);
-    if (s.ranges.size() < 4096) s.ranges.emplace_back(at, at + bytes);
-    else s.overflow = true;
+    const std::uintptr_t end = bytes > UINTPTR_MAX - at ? UINTPTR_MAX : at + bytes;
+    if (!s.ranges.empty() && at <= s.ranges.back().second && end >= s.ranges.back().first) {
+        s.ranges.back().first = (std::min)(s.ranges.back().first, at);
+        s.ranges.back().second = (std::max)(s.ranges.back().second, end);
+        s.pending.store(true, std::memory_order_release);
+        return;
+    }
+    s.ranges.emplace_back(at, end);
+    if (s.ranges.size() > s.compact_at) {
+        std::sort(s.ranges.begin(), s.ranges.end());
+        std::size_t kept = 0;
+        for (std::size_t i = 1; i < s.ranges.size(); ++i) {
+            if (s.ranges[i].first <= s.ranges[kept].second)
+                s.ranges[kept].second = (std::max)(s.ranges[kept].second, s.ranges[i].second);
+            else
+                s.ranges[++kept] = s.ranges[i];
+        }
+        s.ranges.resize(kept + 1);
+        if (s.ranges.size() > State::kMaxMerged) {
+            s.overflow = true;
+            s.ranges.clear();
+            s.compact_at = State::kMaxMerged;
+        } else {
+            s.compact_at = (std::max)(State::kMaxMerged, s.ranges.size() + 4096);
+        }
+    }
     s.pending.store(true, std::memory_order_release);
 }
 
@@ -415,6 +445,7 @@ inline std::vector<std::pair<std::uintptr_t, std::uintptr_t>> take(bool& overflo
     if (!s.pending.load(std::memory_order_acquire)) return {};
     std::lock_guard lock(s.mutex);
     overflow = std::exchange(s.overflow, false);
+    s.compact_at = State::kMaxMerged;
     s.pending.store(false, std::memory_order_release);
     return std::exchange(s.ranges, {});
 }

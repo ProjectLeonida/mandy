@@ -12,6 +12,7 @@
 #include "vk_test_device.h"
 #include "../src/console_texture_layout.h"
 #include "../src/vulkan_title_detile.h"
+#include "../src/vulkan_title_image_pool.h"
 
 #include <algorithm>
 #include <atomic>
@@ -631,8 +632,201 @@ int main() {
         EXPECT(d.validation_errors() == 0);
     }
 
-    std::printf("vk_title_detile_test: %u cases + batched descriptor/cached PFN checks passed bit-for-bit "
-                "(13 formats x 14 layout/mode/mip/array/odd/linear cases, 0 validation errors)\n",
+    // Verify linear 3D direct copy with mips > 1 (array_layers == 1) bit-for-bit against console_texture::Layout,
+    // plus rejection of invalid array_layers != 1 for volume textures.
+    {
+        namespace ct = leonida::console_texture;
+        struct VolumeCase {
+            const char* name;
+            VkFormat vk_format;
+            std::uint32_t element_bytes;
+            std::uint32_t block_side;
+            std::uint32_t width;
+            std::uint32_t height;
+            std::uint32_t depth;
+            std::uint32_t mips;
+            VkDeviceSize src_offset;
+        };
+        const VolumeCase vcases[] = {
+            {"RGBA8 32x24x8 mips=4", VK_FORMAT_R8G8B8A8_UNORM, 4, 1, 32, 24, 8, 4, 4096},
+            {"R8 17x13x5 mips=3", VK_FORMAT_R8_UNORM, 1, 1, 17, 13, 5, 3, 256},
+            {"RGBA16F 16x12x6 mips=4", VK_FORMAT_R16G16B16A16_SFLOAT, 8, 1, 16, 12, 6, 4, 512},
+            {"BC1 32x32x4 mips=3", VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8, 4, 32, 32, 4, 3, 4096},
+            {"RGBA8 16x16x4 mips=1", VK_FORMAT_R8G8B8A8_UNORM, 4, 1, 16, 16, 4, 1, 256},
+        };
+        for (const auto& vc : vcases) {
+            ct::Desc cd{};
+            cd.dimension = ct::Dimension::tex3d;
+            cd.width = vc.width;
+            cd.height = vc.height;
+            cd.depth = vc.depth;
+            cd.mips = vc.mips;
+            cd.element_bytes = vc.element_bytes;
+            cd.block = vc.block_side;
+            cd.samples = 1;
+            cd.swizzle = ct::kLinear;
+            const auto layout_opt = ct::Layout::make(cd);
+            EXPECT(layout_opt.has_value());
+            const ct::Layout& layout = *layout_opt;
+            leonida::TitleDetileDesc desc = to_detile_desc(layout);
+            desc.dimension = 4;
+            desc.array_layers = 1;
+
+            const VkDeviceSize chunk_size = vc.src_offset + layout.size + 4096;
+            Buffer mirror_chunk;
+            EXPECT(make_host_buffer(d, chunk_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, mirror_chunk));
+            std::memset(mirror_chunk.mapped, 0xCC, std::size_t(chunk_size));
+            std::uint8_t* const tiled_ptr = mirror_chunk.mapped + vc.src_offset;
+            std::uint64_t seed = 0x517cc1b727220a95ull ^ (serial * 0x94d049bb133111ebull);
+            for (std::size_t i = 0; i < layout.size; ++i) {
+                seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+                tiled_ptr[i] = static_cast<std::uint8_t>(seed >> 56);
+            }
+
+            // Invalid array_layers > 1 on a 3D volume must be rejected.
+            auto bad_desc = desc;
+            bad_desc.array_layers = 2;
+            EXPECT(!leonida::TitleDetilePipeline::can_direct_linear(bad_desc, vc.src_offset, chunk_size, vc.width,
+                                                                    vc.height, vc.depth, vc.mips, 2, true));
+
+            EXPECT(leonida::TitleDetilePipeline::can_direct_linear(desc, vc.src_offset, chunk_size, vc.width,
+                                                                   vc.height, vc.depth, vc.mips, 1, true));
+            std::vector<VkBufferImageCopy> copy_regions;
+            EXPECT(leonida::TitleDetilePipeline::build_linear_regions(desc, vc.src_offset, vc.width, vc.height,
+                                                                      vc.depth, true, copy_regions));
+
+            std::vector<std::vector<std::uint8_t>> cpu_truth;
+            std::vector<VkBufferImageCopy> rb_regions;
+            VkDeviceSize rb_bytes = 0;
+            const VkDeviceSize rb_align = (std::max)(VkDeviceSize(4u), VkDeviceSize(vc.element_bytes)) * 4u;
+            for (std::uint32_t mip = 0; mip < vc.mips; ++mip) {
+                const auto& m = layout.mips[mip];
+                const std::size_t row_bytes = std::size_t(m.width) * vc.element_bytes;
+                const std::size_t slice_bytes = row_bytes * m.height;
+                const std::size_t vol_bytes = slice_bytes * m.depth;
+                std::vector<std::uint8_t> linear(vol_bytes, 0xA5);
+                EXPECT(layout.detile(tiled_ptr, std::size_t(layout.size), mip, 0, linear.data(), linear.size(),
+                                     row_bytes, slice_bytes) == ct::Error::ok);
+                cpu_truth.push_back(std::move(linear));
+
+                VkBufferImageCopy rb{};
+                rb.bufferOffset = leonida::detail::align_up_size(rb_bytes, rb_align);
+                rb.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
+                rb.imageExtent = {(std::max)(1u, vc.width >> mip), (std::max)(1u, vc.height >> mip),
+                                  (std::max)(1u, vc.depth >> mip)};
+                rb_regions.push_back(rb);
+                rb_bytes = rb.bufferOffset + vol_bytes;
+            }
+
+            Image img;
+            img.device = d.device;
+            img.destroy = d.fn<PFN_vkDestroyImage>("vkDestroyImage");
+            img.free_mem = d.fn<PFN_vkFreeMemory>("vkFreeMemory");
+            VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ii.imageType = VK_IMAGE_TYPE_3D;
+            ii.format = vc.vk_format;
+            ii.extent = {vc.width, vc.height, vc.depth};
+            ii.mipLevels = vc.mips;
+            ii.arrayLayers = 1;
+            ii.samples = VK_SAMPLE_COUNT_1_BIT;
+            ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            EXPECT(d.fn<PFN_vkCreateImage>("vkCreateImage")(d.device, &ii, nullptr, &img.handle) == VK_SUCCESS);
+            VkMemoryRequirements req{};
+            d.fn<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(d.device, img.handle, &req);
+            img.memory = alloc_memory(d, req, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            EXPECT(img.memory != VK_NULL_HANDLE);
+            EXPECT(d.fn<PFN_vkBindImageMemory>("vkBindImageMemory")(d.device, img.handle, img.memory, 0) == VK_SUCCESS);
+
+            Buffer readback;
+            EXPECT(make_host_buffer(d, (std::max)(rb_bytes, VkDeviceSize(64)), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                    readback));
+            std::memset(readback.mapped, 0x5A, std::size_t(readback.size));
+
+            const bool ran = d.run([&](VkCommandBuffer cb) {
+                const auto barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+                const auto copy_b2i = d.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
+                const auto copy_i2b = d.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+                VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                to_dst.srcQueueFamilyIndex = to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                to_dst.image = img.handle;
+                to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, vc.mips, 0, 1};
+                barrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                        nullptr, 1, &to_dst);
+                copy_b2i(cb, mirror_chunk.handle, img.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         static_cast<std::uint32_t>(copy_regions.size()), copy_regions.data());
+                VkImageMemoryBarrier to_src = to_dst;
+                to_src.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                to_src.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                        1, &to_src);
+                copy_i2b(cb, img.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.handle,
+                         static_cast<std::uint32_t>(rb_regions.size()), rb_regions.data());
+                VkMemoryBarrier host_vis{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                host_vis.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                host_vis.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_vis, 0, nullptr, 0,
+                        nullptr);
+                return true;
+            });
+            EXPECT(ran);
+            for (std::uint32_t mip = 0; mip < vc.mips; ++mip) {
+                const auto& expected = cpu_truth[mip];
+                const std::uint8_t* actual = readback.mapped + rb_regions[mip].bufferOffset;
+                if (std::memcmp(actual, expected.data(), expected.size()) != 0) {
+                    std::fprintf(stderr, "3D LINEAR MISMATCH case=%s mip=%u\n", vc.name, mip);
+                    return 1;
+                }
+            }
+            ++serial;
+            ++passed;
+        }
+        EXPECT(d.validation_errors() == 0);
+    }
+
+    // Verify TitleImagePool raises largest_slot to 8 MiB and caps >2 MiB page allocations at <= 16 MiB.
+    {
+        leonida::TitleImagePool pool;
+        std::vector<VkDeviceSize> alloc_sizes;
+        std::uint64_t next_mem = 1;
+        auto fake_bind = [](VkDevice, VkImage, VkDeviceMemory, VkDeviceSize) -> VkResult { return VK_SUCCESS; };
+        auto fake_destroy_img = [](VkDevice, VkImage, const VkAllocationCallbacks*) {};
+        auto fake_free_mem = [](VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {};
+        auto fake_alloc = [&](VkDeviceSize size, std::uint32_t& type) -> VkDeviceMemory {
+            alloc_sizes.push_back(size);
+            type = 0;
+            return reinterpret_cast<VkDeviceMemory>(next_mem++);
+        };
+        const VkDevice fake_dev = reinterpret_cast<VkDevice>(std::uintptr_t(1));
+        const VkImage fake_img = reinterpret_cast<VkImage>(std::uintptr_t(1));
+
+        // 5.5 MiB texture -> pooled in 11 MiB page (capacity 2, <= 16 MiB cap), second reuses same page!
+        VkMemoryRequirements req_55{5632ull << 10, 65536, 1u};
+        auto a1 = pool.bind(fake_dev, fake_img, req_55, fake_bind, fake_destroy_img, fake_free_mem, fake_alloc);
+        auto a2 = pool.bind(fake_dev, fake_img, req_55, fake_bind, fake_destroy_img, fake_free_mem, fake_alloc);
+        EXPECT(a1 && a2 && a1->page == a2->page);
+        EXPECT(alloc_sizes.size() == 1 && alloc_sizes[0] <= (16ull << 20));
+
+        // 8 MiB texture -> pooled in 16 MiB page (capacity 2).
+        VkMemoryRequirements req_8m{8ull << 20, 65536, 1u};
+        auto b1 = pool.bind(fake_dev, fake_img, req_8m, fake_bind, fake_destroy_img, fake_free_mem, fake_alloc);
+        auto b2 = pool.bind(fake_dev, fake_img, req_8m, fake_bind, fake_destroy_img, fake_free_mem, fake_alloc);
+        EXPECT(b1 && b2 && b1->page == b2->page);
+        EXPECT(alloc_sizes.size() == 2 && alloc_sizes[1] == (16ull << 20));
+
+        // > 8 MiB texture -> refused by pool (returns nullptr).
+        VkMemoryRequirements req_9m{9ull << 20, 65536, 1u};
+        auto c1 = pool.bind(fake_dev, fake_img, req_9m, fake_bind, fake_destroy_img, fake_free_mem, fake_alloc);
+        EXPECT(!c1 && alloc_sizes.size() == 2);
+    }
+
+    std::printf("vk_title_detile_test: %u cases + batched descriptor/cached PFN + linear 3D multi-mip + pool 8MiB "
+                "checks passed bit-for-bit (0 validation errors)\n",
                 passed);
     return 0;
 }

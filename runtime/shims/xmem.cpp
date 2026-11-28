@@ -784,6 +784,47 @@ bool table_frame(std::uintptr_t page, leonida::title_frames::Frame& out) {
     return true;
 }
 
+// Single-lock, zero-shared_ptr run_end over g_table_frames (src/title_frames.h).
+std::uintptr_t table_frame_run_end(std::uintptr_t from, std::uintptr_t to, bool& is_backed) {
+    constexpr std::uintptr_t kPage = leonida::title_frames::kPage;
+    if (from >= to) {
+        is_backed = false;
+        return to;
+    }
+    AcquireSRWLockShared(&g_frame_lock);
+    const auto has = [](std::uintptr_t p) -> bool {
+        const auto it = g_table_frames.find(p);
+        return it != g_table_frames.end() && it->second.section && it->second.section->scratch;
+    };
+    const std::uintptr_t first_page = from & ~(kPage - 1);
+    is_backed = has(first_page);
+    if (!is_backed && g_table_frames.empty()) {
+        ReleaseSRWLockShared(&g_frame_lock);
+        return to;
+    }
+    std::uintptr_t at = first_page + kPage;
+    while (at < to && at > from && has(at) == is_backed) at += kPage;
+    ReleaseSRWLockShared(&g_frame_lock);
+    return at < to && at > from ? at : to;
+}
+
+// Single-lock, zero-shared_ptr batch existence check over g_table_frames (src/title_frames.h).
+void table_frame_backed_batch(const std::uintptr_t* pages, std::uint8_t* out_backed, std::size_t count) {
+    constexpr std::uintptr_t kPage = leonida::title_frames::kPage;
+    if (!count) return;
+    AcquireSRWLockShared(&g_frame_lock);
+    if (g_table_frames.empty()) {
+        ReleaseSRWLockShared(&g_frame_lock);
+        for (std::size_t k = 0; k < count; ++k) out_backed[k] = 0;
+        return;
+    }
+    for (std::size_t k = 0; k < count; ++k) {
+        const auto it = g_table_frames.find(pages[k] & ~(kPage - 1));
+        out_backed[k] = (it != g_table_frames.end() && it->second.section && it->second.section->scratch) ? 1u : 0u;
+    }
+    ReleaseSRWLockShared(&g_frame_lock);
+}
+
 // Appends `value` in hex (with 0x) or decimal at `at`, which has room for it: no CRT, so no lock and no allocation.
 char* append_number(char* at, unsigned long long value, bool hex) {
     char digits[24];
@@ -3126,7 +3167,9 @@ void attach_mirror_locked(void* context, leonida::title_frames::Feed feed) {
 [[maybe_unused]] const bool g_mirror_attach_set = (leonida::title_frames::attach_fn = &attach_mirror, true);
 
 [[maybe_unused]] const bool g_title_frames_set =
-    (leonida::title_frames::set_lookup(&table_frame, &geometry_aliases), true);
+    (leonida::title_frames::set_lookup(&table_frame, &geometry_aliases, &table_frame_run_end,
+                                       &table_frame_backed_batch),
+     true);
 
 void set_fault_race_hook(FaultRaceHook hook) { g_fault_race_hook.store(hook, std::memory_order_release); }
 

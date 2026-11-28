@@ -1708,9 +1708,51 @@ struct TitleTextureCells {
         known_protect_gen_ = now;
     }
 
+    bool is_tile_pinned(std::uintptr_t tile) const noexcept {
+        constexpr std::uintptr_t kTile = leonida::geometry_writes::tile_size;
+        const std::uintptr_t tile_hi = (tile <= UINTPTR_MAX - kTile) ? (tile + kTile) : UINTPTR_MAX;
+        for (const auto& [p_lo, p_hi] : run_pin_ranges_) {
+            if (tile < p_hi && p_lo < tile_hi) return true;
+        }
+        return false;
+    }
+
+    // True when no title_memory_map change after `since` overlapped [lo, hi). Sets `gen_out` to the generation
+    // checked up to (leaf SRWLOCK shared read when generation moved).
+    static bool range_clean_since(std::uint64_t since, std::uintptr_t lo, std::uintptr_t hi, std::uint64_t& gen_out) {
+        const std::uint64_t cur = leonida::title_memory_map::generation();
+        if (cur == since) {
+            gen_out = cur;
+            return true;
+        }
+        bool overlapped = false;
+        std::uint64_t now = cur;
+        if (!leonida::title_memory_map::changes_since(
+                since, now, lo, hi, [&](std::uintptr_t c_from, std::uintptr_t c_to) {
+                    if (c_from < c_to) overlapped = true;
+                })) {
+            return false;
+        }
+        gen_out = now;
+        return !overlapped;
+    }
+
+    struct ArmStats {
+        std::uint64_t hot = 0;
+        std::uint64_t already = 0;
+        std::uint64_t backed = 0;
+        std::uint64_t fast_vp = 0;
+        std::uint64_t bridged = 0;
+        std::uint64_t vq = 0;
+        std::uint64_t vq_cache = 0;
+        std::uint64_t vq_vp = 0;
+    };
+    ArmStats arm_stats;
+
     void arm_batch(const std::uintptr_t* tiles, Cell* const* cells, std::int8_t* results, std::size_t count) {
         constexpr std::size_t kMaxBatchRunPages = 1024;  // up to 64 MiB per contiguous VirtualProtect run
         constexpr std::size_t kMaxLockBatchPages = 128;  // pages per pin check + geometry_writes lock hold
+        constexpr std::size_t kMaxBridgeGap = 8;         // max already-armed cold gap tiles to bridge in one VP
         constexpr std::size_t kMaxKnownProtectEntries = 262144;
         constexpr std::uintptr_t kTile = leonida::geometry_writes::tile_size;
         constexpr std::uintptr_t kHostPage = leonida::geometry_writes::page_size;
@@ -1741,11 +1783,13 @@ struct TitleTextureCells {
 
             run_versions_.resize(batch_n);
             run_pinned_.assign(batch_n, 0);
-            run_backed_.assign(batch_n, 0);
             run_eligible_.assign(batch_n, 0);
             run_failed_.assign(batch_n, 0);
+            run_pin_ranges_.clear();
+            run_need_backed_idx_.clear();
+            run_need_backed_vas_.clear();
 
-            // Snapshot versions BEFORE querying kernel pins, table-page backing, or taking geometry_writes::mutex.
+            // Snapshot versions BEFORE querying kernel pins or taking geometry_writes::mutex.
             for (std::size_t k = 0; k < batch_n; ++k)
                 run_versions_[k] = batch_cells[k]->version.load(std::memory_order_acquire);
 
@@ -1753,26 +1797,21 @@ struct TitleTextureCells {
             const std::uintptr_t last_tile = batch_tiles[batch_n - 1];
             const std::uintptr_t pin_hi = (last_tile <= UINTPTR_MAX - kTile) ? (last_tile + kTile) : UINTPTR_MAX;
             // Querying an OVERLAPPED pin can fault into xmem: NEVER call under geometry_writes::state().mutex.
+            // Record every overlapping pin interval in run_pin_ranges_ so gap-bridging NEVER bridges a pinned tile.
             if (pin_lo < pin_hi) {
                 leonida::kernel_writes::for_each_pin(pin_lo, pin_hi, [&](std::uintptr_t p_lo, std::uintptr_t p_hi) {
+                    run_pin_ranges_.emplace_back(p_lo, p_hi);
                     const std::uintptr_t first_tile = p_lo & ~(kTile - 1);
                     const std::uintptr_t* it = std::lower_bound(batch_tiles, batch_tiles + batch_n, first_tile);
                     for (; it < batch_tiles + batch_n && *it < p_hi; ++it)
                         run_pinned_[std::size_t(it - batch_tiles)] = 1;
                 });
-                // Table-backed pages have no host view (their alias peers are armed separately in batch_reqs_).
-                // Checked outside geometry_writes::state().mutex so g_frame_lock and s.mutex never nest; any
-                // concurrent remap bumps c->version and is caught below by run_versions_[k] != c->version.
-                if (leonida::title_frames::may_hold(pin_lo, pin_hi)) {
-                    for (std::size_t k = 0; k < batch_n; ++k) {
-                        if (!run_pinned_[k] && leonida::title_frames::backed(batch_tiles[k])) run_backed_[k] = 1;
-                    }
-                }
             }
+            const bool may_hold_frames = pin_lo < pin_hi && leonida::title_frames::may_hold(pin_lo, pin_hi);
 
             auto& s = leonida::geometry_writes::state();
             {
-                std::lock_guard lock(s.mutex);
+                std::unique_lock<std::mutex> lock(s.mutex);
                 for (std::size_t k = 0; k < batch_n; ++k) {
                     if (run_pinned_[k]) {
                         results[i + k] = 0;  // busy: kernel write in progress (even on hot tiles)
@@ -1781,6 +1820,7 @@ struct TitleTextureCells {
                     Cell* const c = batch_cells[k];
                     if (c->hot) {
                         results[i + k] = 1;
+                        ++arm_stats.hot;
                         continue;
                     }
                     if (run_versions_[k] != c->version.load(std::memory_order_relaxed)) {
@@ -1789,7 +1829,7 @@ struct TitleTextureCells {
                     }
                     // Zero-syscall fast path: all 16 host pages already guarded read-only (e.g. armed by
                     // HotColdTracking::CellGuard earlier in this leader pass; guaranteed cleared by reopen(),
-                    // Event::replaced, TitleVirtualProtect, and unmap_page), or a table-backed page with no host view.
+                    // Event::replaced, TitleVirtualProtect, and unmap_page).
                     bool all_armed = true;
                     for (const DWORD r : c->restore) {
                         if (!r) {
@@ -1797,15 +1837,63 @@ struct TitleTextureCells {
                             break;
                         }
                     }
-                    if (all_armed || run_backed_[k]) {
+                    if (all_armed) {
                         results[i + k] = 1;
+                        ++arm_stats.already;
                         continue;
                     }
-                    run_eligible_[k] = 1;
+                    if (may_hold_frames) {
+                        run_need_backed_idx_.push_back(k);
+                        run_need_backed_vas_.push_back(batch_tiles[k]);
+                    } else {
+                        run_eligible_[k] = 1;
+                    }
+                }
+
+                // Batch-check table-page backing outside geometry_writes::state().mutex ONLY for tiles that are not
+                // pinned, hot, or already all-armed (never nest g_frame_lock and s.mutex; single g_frame_lock hold
+                // with zero shared_ptr refcount churn). Re-verify version/hot/all_armed after re-acquiring s.mutex.
+                if (!run_need_backed_idx_.empty()) {
+                    lock.unlock();
+                    run_need_backed_out_.resize(run_need_backed_vas_.size());
+                    leonida::title_frames::backed_batch(run_need_backed_vas_.data(), run_need_backed_out_.data(),
+                                                        run_need_backed_vas_.size());
+                    lock.lock();
+                    for (std::size_t m = 0; m < run_need_backed_idx_.size(); ++m) {
+                        const std::size_t k = run_need_backed_idx_[m];
+                        Cell* const c = batch_cells[k];
+                        if (c->hot) {
+                            results[i + k] = 1;
+                            ++arm_stats.hot;
+                            continue;
+                        }
+                        if (run_versions_[k] != c->version.load(std::memory_order_relaxed)) {
+                            results[i + k] = -1;  // write/remap/pin raced during backed_batch
+                            continue;
+                        }
+                        bool all_armed = true;
+                        for (const DWORD r : c->restore) {
+                            if (!r) {
+                                all_armed = false;
+                                break;
+                            }
+                        }
+                        if (all_armed) {
+                            results[i + k] = 1;
+                            ++arm_stats.already;
+                            continue;
+                        }
+                        if (run_need_backed_out_[m]) {
+                            results[i + k] = 1;
+                            ++arm_stats.backed;
+                            continue;
+                        }
+                        run_eligible_[k] = 1;
+                    }
                 }
 
                 // Short-lived VirtualQuery cache within this lock hold: reuse uniform writable or already-read-only
-                // MEM_COMMIT regions across non-contiguous tiles while title_memory_map::generation() is unchanged.
+                // MEM_COMMIT regions across non-contiguous tiles while no map change overlapped [p, cached_hi).
                 std::uintptr_t cached_lo = 0;
                 std::uintptr_t cached_hi = 0;
                 DWORD cached_protect = 0;
@@ -1822,14 +1910,109 @@ struct TitleTextureCells {
                            batch_tiles[sub_end] == batch_tiles[sub_end - 1] + kTile) {
                         ++sub_end;
                     }
+
+                    // Gap-bridging fast path: coalesce scattered eligible tiles separated by <= kMaxBridgeGap
+                    // already-armed, unpinned cold tiles sharing identical known_protect/known_guarded/mapping and
+                    // uniform restore[0..15] == kp. Falls back to eligible-only [sub_start, sub_end) on any failure
+                    // or unexpected old protect (with mandatory VirtualProtect(old) rollback).
+                    if (has_known_protect_) {
+                        const auto it0 = known_protect_.find(batch_tiles[sub_start]);
+                        if (it0 != known_protect_.end() && it0->second.protect != 0 &&
+                            it0->second.mapping == batch_cells[sub_start]->mapping.load(std::memory_order_acquire)) {
+                            const DWORD kp = it0->second.protect;
+                            const DWORD kg = it0->second.guarded;
+                            const std::uintptr_t span_lo = batch_tiles[sub_start];
+                            std::size_t bridge_end = sub_start + 1;
+                            while (bridge_end < batch_n && run_eligible_[bridge_end]) {
+                                const std::uintptr_t prev_va = batch_tiles[bridge_end - 1];
+                                const std::uintptr_t next_va = batch_tiles[bridge_end];
+                                if (prev_va > UINTPTR_MAX - kTile || next_va > UINTPTR_MAX - kTile) break;
+                                const std::uintptr_t prev_end = prev_va + kTile;
+                                if (next_va < prev_end) break;
+                                const std::uintptr_t gap_bytes = next_va - prev_end;
+                                if (gap_bytes > kMaxBridgeGap * kTile) break;
+                                if ((next_va + kTile - span_lo) > kMaxBatchRunPages * kTile) break;
+                                const auto itn = known_protect_.find(next_va);
+                                if (itn == known_protect_.end() || itn->second.protect != kp ||
+                                    itn->second.guarded != kg ||
+                                    itn->second.mapping !=
+                                        batch_cells[bridge_end]->mapping.load(std::memory_order_acquire))
+                                    break;
+                                bool gap_ok = true;
+                                for (std::uintptr_t gap_va = prev_end; gap_va < next_va; gap_va += kTile) {
+                                    if (is_tile_pinned(gap_va)) {
+                                        gap_ok = false;
+                                        break;
+                                    }
+                                    const auto git = known_protect_.find(gap_va);
+                                    if (git == known_protect_.end() || git->second.protect != kp ||
+                                        git->second.guarded != kg) {
+                                        gap_ok = false;
+                                        break;
+                                    }
+                                    const auto cit = s.cells.find(gap_va);
+                                    if (cit == s.cells.end()) {
+                                        gap_ok = false;
+                                        break;
+                                    }
+                                    const Cell& gc = cit->second;
+                                    if (gc.hot ||
+                                        git->second.mapping != gc.mapping.load(std::memory_order_acquire)) {
+                                        gap_ok = false;
+                                        break;
+                                    }
+                                    for (const DWORD r : gc.restore) {
+                                        if (r != kp) {
+                                            gap_ok = false;
+                                            break;
+                                        }
+                                    }
+                                    if (!gap_ok) break;
+                                }
+                                if (!gap_ok) break;
+                                ++bridge_end;
+                            }
+                            if (bridge_end > sub_end) {
+                                const std::uintptr_t span_hi = batch_tiles[bridge_end - 1] + kTile;
+                                std::uint64_t verified_gen = 0;
+                                if (range_clean_since(known_protect_gen_, span_lo, span_hi, verified_gen)) {
+                                    DWORD old{};
+                                    if (VirtualProtect(reinterpret_cast<void*>(span_lo), span_hi - span_lo, kg,
+                                                       &old)) {
+                                        if (old == kp || old == kg) {
+                                            const std::uint64_t armed_gen =
+                                                (leonida::title_memory_map::generation() == verified_gen)
+                                                    ? verified_gen
+                                                    : Cell::kNoMapGen;
+                                            for (std::size_t k = sub_start; k < bridge_end; ++k) {
+                                                batch_cells[k]->restore.fill(kp);
+                                                batch_cells[k]->armed_map_gen = armed_gen;
+                                                results[i + k] = 1;
+                                            }
+                                            ++arm_stats.fast_vp;
+                                            ++arm_stats.bridged;
+                                            if (cached_hi && span_lo >= cached_lo && span_hi <= cached_hi)
+                                                cached_lo = span_hi;
+                                            sub_start = bridge_end;
+                                            continue;
+                                        }
+                                        // Unexpected prior protection: restore `old` and fall back to eligible-only.
+                                        DWORD dummy{};
+                                        VirtualProtect(reinterpret_cast<void*>(span_lo), span_hi - span_lo, old,
+                                                       &dummy);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     const std::uintptr_t sub_lo = batch_tiles[sub_start];
                     const std::uintptr_t sub_hi = sub_lo + (sub_end - sub_start) * kTile;
 
                     for (std::uintptr_t p = sub_lo; p < sub_hi;) {
-                        // Fast path: tile-aligned repeat arm with verified uniform protection and unchanged map
-                        // generation & cell mapping -> VirtualProtect directly with 0 VirtualQuery syscalls.
-                        if ((p & (kTile - 1)) == 0 && sub_hi - p >= kTile && has_known_protect_ &&
-                            leonida::title_memory_map::generation() == known_protect_gen_) {
+                        // Fast path: tile-aligned repeat arm with verified uniform protection and no map change
+                        // overlapping [p, end) since known_protect_gen_ -> VirtualProtect directly with 0 VirtualQuery.
+                        if ((p & (kTile - 1)) == 0 && sub_hi - p >= kTile && has_known_protect_) {
                             const std::size_t tile_k = sub_start + std::size_t((p - sub_lo) / kTile);
                             const auto it0 = known_protect_.find(batch_tiles[tile_k]);
                             if (it0 != known_protect_.end() && it0->second.protect != 0 &&
@@ -1847,22 +2030,33 @@ struct TitleTextureCells {
                                     ++fast_end;
                                 }
                                 const std::uintptr_t end = p + (fast_end - tile_k) * kTile;
-                                DWORD old{};
-                                if (VirtualProtect(reinterpret_cast<void*>(p), end - p, kg, &old)) {
-                                    if (old == kp || old == kg) {
-                                        for (std::size_t t = tile_k; t < fast_end; ++t)
-                                            batch_cells[t]->restore.fill(kp);
-                                        if (cached_hi && p >= cached_lo && end <= cached_hi) cached_lo = end;
-                                        p = end;
-                                        continue;
+                                std::uint64_t verified_gen = 0;
+                                if (range_clean_since(known_protect_gen_, p, end, verified_gen)) {
+                                    DWORD old{};
+                                    if (VirtualProtect(reinterpret_cast<void*>(p), end - p, kg, &old)) {
+                                        if (old == kp || old == kg) {
+                                            const std::uint64_t armed_gen =
+                                                (leonida::title_memory_map::generation() == verified_gen)
+                                                    ? verified_gen
+                                                    : Cell::kNoMapGen;
+                                            for (std::size_t t = tile_k; t < fast_end; ++t) {
+                                                batch_cells[t]->restore.fill(kp);
+                                                batch_cells[t]->armed_map_gen = armed_gen;
+                                            }
+                                            ++arm_stats.fast_vp;
+                                            if (cached_hi && p >= cached_lo && end <= cached_hi) cached_lo = end;
+                                            p = end;
+                                            continue;
+                                        }
+                                        // Unexpected prior protection (caller bypassed title_memory_map::changed):
+                                        // restore `old` before falling through to VirtualQuery + VirtualProtect.
+                                        DWORD dummy{};
+                                        VirtualProtect(reinterpret_cast<void*>(p), end - p, old, &dummy);
                                     }
-                                    // Unexpected prior protection (caller bypassed title_memory_map::changed):
-                                    // restore `old` before falling through to VirtualQuery + VirtualProtect.
-                                    DWORD dummy{};
-                                    VirtualProtect(reinterpret_cast<void*>(p), end - p, old, &dummy);
+                                    for (std::size_t t = tile_k; t < fast_end; ++t)
+                                        known_protect_.erase(batch_tiles[t]);
+                                    cached_hi = 0;
                                 }
-                                for (std::size_t t = tile_k; t < fast_end; ++t) known_protect_.erase(batch_tiles[t]);
-                                cached_hi = 0;
                             }
                         }
 
@@ -1874,8 +2068,10 @@ struct TitleTextureCells {
                         std::uint64_t query_gen = 0;
                         bool from_cache = false;
 
+                        std::uint64_t cache_now = 0;
                         if (p >= cached_lo && p < cached_hi &&
-                            leonida::title_memory_map::generation() == cached_gen) {
+                            range_clean_since(cached_gen, p, cached_hi, cache_now)) {
+                            cached_gen = cache_now;
                             region_base = cached_lo;
                             region_end = cached_hi;
                             state = MEM_COMMIT;
@@ -1883,8 +2079,10 @@ struct TitleTextureCells {
                             guarded = cached_guarded;
                             query_gen = cached_gen;
                             from_cache = true;
+                            ++arm_stats.vq_cache;
                         } else {
                             query_gen = leonida::title_memory_map::generation();
+                            ++arm_stats.vq;
                             MEMORY_BASIC_INFORMATION m{};
                             if (!VirtualQuery(reinterpret_cast<void*>(p), &m, sizeof m)) {
                                 const std::size_t tile_k = sub_start + std::size_t((p - sub_lo) / kTile);
@@ -1922,26 +2120,30 @@ struct TitleTextureCells {
                         }
                         if (state == MEM_COMMIT && !(protect & PAGE_GUARD) && guarded) {
                             DWORD old{};
+                            ++arm_stats.vq_vp;
                             if (VirtualProtect(reinterpret_cast<void*>(p), end - p, guarded, &old)) {
                                 for (std::uintptr_t q = p; q < end; q += kHostPage) {
                                     const std::size_t tile_k = sub_start + std::size_t((q - sub_lo) / kTile);
                                     const std::size_t sub_p = std::size_t((q & (kTile - 1)) / kHostPage);
                                     batch_cells[tile_k]->restore[sub_p] = protect;
+                                    batch_cells[tile_k]->armed_map_gen = Cell::kNoMapGen;
                                 }
-                                if (query_gen == known_protect_gen_ &&
-                                    leonida::title_memory_map::generation() == known_protect_gen_) {
-                                    const std::uintptr_t first_full = (p + kTile - 1) & ~(kTile - 1);
-                                    const std::uintptr_t last_full = end & ~(kTile - 1);
-                                    if (first_full < last_full && region_base <= first_full &&
-                                        region_end >= last_full) {
-                                        for (std::uintptr_t t = first_full; t < last_full; t += kTile) {
-                                            const std::size_t tile_k = sub_start + std::size_t((t - sub_lo) / kTile);
-                                            known_protect_[batch_tiles[tile_k]] = {
-                                                batch_cells[tile_k]->mapping.load(std::memory_order_acquire), protect,
-                                                guarded};
-                                        }
-                                        has_known_protect_ = true;
+                                const std::uintptr_t first_full = (p + kTile - 1) & ~(kTile - 1);
+                                const std::uintptr_t last_full = end & ~(kTile - 1);
+                                std::uint64_t after_gen = 0;
+                                if (first_full < last_full && region_base <= first_full && region_end >= last_full &&
+                                    range_clean_since(query_gen, first_full, last_full, after_gen)) {
+                                    const std::uint64_t armed_gen =
+                                        (leonida::title_memory_map::generation() == after_gen) ? after_gen
+                                                                                               : Cell::kNoMapGen;
+                                    for (std::uintptr_t t = first_full; t < last_full; t += kTile) {
+                                        const std::size_t tile_k = sub_start + std::size_t((t - sub_lo) / kTile);
+                                        known_protect_[batch_tiles[tile_k]] = {
+                                            batch_cells[tile_k]->mapping.load(std::memory_order_acquire), protect,
+                                            guarded};
+                                        batch_cells[tile_k]->armed_map_gen = armed_gen;
                                     }
+                                    has_known_protect_ = true;
                                 }
                                 if (cached_hi) cached_lo = end;
                             } else if (from_cache) {
@@ -1952,10 +2154,12 @@ struct TitleTextureCells {
                                 for (std::uintptr_t t = p; t < end;) {
                                     const std::uintptr_t t_end = (std::min)(end, (t & ~(kTile - 1)) + kTile);
                                     const std::size_t tile_k = sub_start + std::size_t((t - sub_lo) / kTile);
+                                    ++arm_stats.vq_vp;
                                     if (VirtualProtect(reinterpret_cast<void*>(t), t_end - t, guarded, &old)) {
                                         for (std::uintptr_t q = t; q < t_end; q += kHostPage) {
                                             const std::size_t sub_p = std::size_t((q & (kTile - 1)) / kHostPage);
                                             batch_cells[tile_k]->restore[sub_p] = protect;
+                                            batch_cells[tile_k]->armed_map_gen = Cell::kNoMapGen;
                                         }
                                     } else {
                                         run_failed_[tile_k] = 1;
@@ -1987,9 +2191,18 @@ struct TitleTextureCells {
     bool has_known_protect_ = false;
     std::vector<std::uint64_t> run_versions_;
     std::vector<std::uint8_t> run_pinned_;
-    std::vector<std::uint8_t> run_backed_;
     std::vector<std::uint8_t> run_eligible_;
     std::vector<std::uint8_t> run_failed_;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> run_pin_ranges_;
+    std::vector<std::size_t> run_need_backed_idx_;
+    std::vector<std::uintptr_t> run_need_backed_vas_;
+    std::vector<std::uint8_t> run_need_backed_out_;
+    void acquire_batch(const std::uintptr_t* tiles, Cell** out_cells, std::size_t count) {
+        leonida::geometry_writes::acquire_batch(tiles, out_cells, count);
+    }
+    void release_batch(const std::pair<std::uintptr_t, bool>* items, std::size_t count) {
+        leonida::geometry_writes::release_batch(items, count);
+    }
     void aliases(std::uintptr_t tile, std::vector<std::uintptr_t>& out) {
         if (const auto f = leonida::geometry_writes::aliases.load(std::memory_order_acquire)) f(tile, out);
     }
@@ -3690,6 +3903,9 @@ struct DeviceState {
         std::uint64_t value = 0;
         std::uint64_t mirror_hash = 0;
         int tile_cmp = 0;  // +1 unchanged, -1 changed, 0 unknown/fallback
+        // Why try_full_view() rejected this item (for cpu_fallback_by[6] telemetry):
+        // 0 = none/accepted, 1 = unmirrored_plain, 2 = unmirrored_other, 3 = in_feed, 4 = pending_bind
+        std::uint8_t reject_reason = 0;
         // Internal scratch for page_mirror_check_batch():
         enum class Mode : std::uint8_t { none, full, partial_tiles } mode = Mode::none;
         std::uint64_t mirror_va = 0;
@@ -14024,14 +14240,17 @@ public:
     bool deferred_stream() const { return deferred_stream_; }
 
     VkDeviceSize unbound_bytes() const { return image_backing_bytes() ? 0 : deferred_bytes_; }
+    bool pooled_image() const { return pooled_image_ != nullptr; }
 
 private:
     bool bind_placed_memory() {
         VkMemoryRequirements requirements{};
         std::uint32_t type = UINT32_MAX;
-        if (!image_backing_bytes_ && !bind_texture_memory(false, deferred_types_, requirements, type)) {
+        const bool pool = !(desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+        if (!image_backing_bytes_ && !bind_texture_memory(pool, deferred_types_, requirements, type)) {
             if (!(requirements.memoryTypeBits & ~deferred_types_) ||
-                !bind_texture_memory(false, ~deferred_types_, requirements, type)) return false;
+                !bind_texture_memory(pool, ~deferred_types_, requirements, type)) return false;
         }
         if (shared_zero_) {
             if (host_transfer_ && !host_initialize()) return false;
@@ -18752,11 +18971,30 @@ void DeviceState::page_mirror_check_batch(
         if (mirror.dirty(p)) need_upload = true;
     };
 
+    const auto record_reject = [](TitleMirrorCheckItem& item, std::uint8_t reason) {
+        // Priority: in_feed (3) / pending_bind (4) > unmirrored_plain (1) > unmirrored_other (2).
+        if (item.reject_reason == 0 || item.reject_reason == 2 || (item.reject_reason == 1 && reason >= 3))
+            item.reject_reason = reason;
+    };
+
     const auto try_full_view = [&](TitleMirrorCheckItem& item, std::uint64_t va, bool is_cpu_view) -> bool {
         if (!va || !item.bytes || va + item.bytes < va) return false;
         const std::uint64_t end = va + item.bytes;
         for (std::uint64_t p = va & ~(kPage - 1); p < end; p += kPage) {
-            if (page_in_feed(p) || !mirror.mirrored(p) || (any_pending && mirror.has_pending(p))) return false;
+            if (page_in_feed(p)) {
+                record_reject(item, 3);
+                return false;
+            }
+            if (!mirror.mirrored(p)) {
+                auto pit = page_mirror.plain.upper_bound(p);
+                const bool in_plain = (pit != page_mirror.plain.begin() && std::prev(pit)->second > p);
+                record_reject(item, in_plain ? 1 : 2);
+                return false;
+            }
+            if (any_pending && mirror.has_pending(p)) {
+                record_reject(item, 4);
+                return false;
+            }
             if (p > UINT64_MAX - kPage) break;
         }
         const bool serial_clean = mirror_just_synced && mirror_synced_serial != 0 && item.ex_armed &&
@@ -18790,6 +19028,7 @@ void DeviceState::page_mirror_check_batch(
         item.full_ok = false;
         item.single_chunk = false;
         item.tile_cmp = 0;
+        item.reject_reason = 0;
         item.mode = TitleMirrorCheckItem::Mode::none;
         item.mirror_va = 0;
         if (!item.active || !item.bytes) continue;
@@ -21476,7 +21715,7 @@ public:
                 if (entry->fills && entry->filled_from) title_partial_bytes_ += entry->backing_bytes;
         }
         bool overflow = false;
-        const auto written = leonida::title_texel_writes::take(overflow);
+        auto written = leonida::title_texel_writes::take(overflow);
         stats.written_ranges += written.size();
         title_map_changes_.clear();
         std::uint64_t map_now = 0;
@@ -21501,16 +21740,37 @@ public:
                     t.stale = true;
             }
         };
-        if (map_all || overflow) {
-            watch.note_changed_and_for_each(0, UINTPTR_MAX, remapped, map_all);
+        // A pure texel write (XG CopyIntoSubresource / DirectStorage / slot-31 copy): do NOT invalidate cached
+        // readability on already-filled full-mip textures; only retry when pending, partially filled, or never filled
+        // (preserves check_pending_stream_views and partial mip chain promotion).
+        const auto texel_written = [&](std::uint64_t key) {
+            const auto it = state_.title_textures.find(key);
+            if (it != state_.title_textures.end()) {
+                TitleTexture& t = *it->second;
+                if (t.memory.pending() || t.filled_from != 0 || !t.fills) {
+                    t.memory.retry();
+                    if (partial_mips() && !t.gpu_written && t.layout_known && !t.stale && t.resource &&
+                        !t.layout_guessed && !t.layout_from_xg && (!t.fills || t.filled_from) &&
+                        title_texture_readable(t) && (!t.fills || t.readable_from < t.filled_from))
+                        t.stale = true;
+                }
+            }
+        };
+        if (map_all) {
+            watch.note_changed_and_for_each(0, UINTPTR_MAX, remapped, true);
         } else {
-            // Merge map changes and noted texel writes into disjoint sorted spans so duplicate/adjacent ranges (or
-            // repeated full-space title_memory_map::changed() calls) touch each watched tile at most once.
-            if (!written.empty())
-                title_map_changes_.insert(title_map_changes_.end(), written.begin(), written.end());
-            leonida::merge_title_writes(title_map_changes_);
-            for (const auto& [from, to] : title_map_changes_)
-                watch.note_changed_and_for_each(from, to, remapped);
+            if (!title_map_changes_.empty()) {
+                leonida::merge_title_writes(title_map_changes_);
+                for (const auto& [from, to] : title_map_changes_)
+                    watch.note_changed_and_for_each(from, to, remapped, false);
+            }
+            if (overflow) {
+                watch.note_changed_and_for_each(0, UINTPTR_MAX, texel_written, false);
+            } else if (!written.empty()) {
+                leonida::merge_title_writes(written);
+                for (const auto& [from, to] : written)
+                    watch.note_changed_and_for_each(from, to, texel_written, false);
+            }
         }
         if (state_.titles_named_pending.load(std::memory_order_acquire)) {
             std::vector<std::uint64_t> named;
@@ -21792,7 +22052,8 @@ public:
                 job.entry.reset();
                 job.resource = nullptr;
                 job.slot = nullptr;
-                if (job.tiled.capacity() > (2ull << 20)) std::vector<std::uint8_t>{}.swap(job.tiled);
+                const std::size_t tiled_cap = (i < 4) ? (16ull << 20) : (2ull << 20);
+                if (job.tiled.capacity() > tiled_cap) std::vector<std::uint8_t>{}.swap(job.tiled);
                 if (job.piece_sums.capacity() > 8192) std::vector<std::uint64_t>{}.swap(job.piece_sums);
             }
             title_job_count_ = 0;
@@ -21825,6 +22086,9 @@ public:
             const bool have_mirror = state_.page_mirror.mirror != nullptr;
             if (have_mirror) title_mirror_checks_.resize(title_candidates_.size());
             bool any_mirror_active = false;
+            leonida::TextureVqCache stage2_vq_cache;
+            const std::uint64_t probes_before = stats.probes[0];
+            std::uint64_t pass_back_ns = 0;
 
             for (std::size_t idx = 0; idx < title_candidates_.size(); ++idx) {
                 TitleCandidate& cand = title_candidates_[idx];
@@ -21836,7 +22100,7 @@ public:
                     continue;
                 }
                 ++stats.checked;
-                if (!title_texture_readable(t)) {
+                if (!title_texture_readable(t, &stage2_vq_cache)) {
                     not_filled(t);
                     if (have_mirror) title_mirror_checks_[idx].active = false;
                     continue;
@@ -21849,10 +22113,21 @@ public:
                     if (have_mirror) title_mirror_checks_[idx].active = false;
                     continue;
                 }
-                if (!back_title_texture(t)) {
-                    not_filled(t);
-                    if (have_mirror) title_mirror_checks_[idx].active = false;
-                    continue;
+                if (t.unbound_bytes) {
+                    const auto back_start = clock::now();
+                    bool did_back = false, did_raw = false;
+                    const bool backed_ok = back_title_texture(t, &did_back, &did_raw);
+                    pass_back_ns += std::uint64_t(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - back_start).count());
+                    if (did_back) {
+                        ++stats.stage2_backed;
+                        if (did_raw) ++stats.stage2_raw_allocs;
+                    }
+                    if (!backed_ok) {
+                        not_filled(t);
+                        if (have_mirror) title_mirror_checks_[idx].active = false;
+                        continue;
+                    }
                 }
                 const std::size_t tiles = std::size_t(((t.cpu + span + 0xffff) & ~std::uint64_t(0xffff)) -
                                                       (t.cpu & ~std::uint64_t(0xffff))) >>
@@ -21881,8 +22156,12 @@ public:
                 }
             }
             const auto t_after_probe = clock::now();
-            stats.examine_probe_ns +=
+            const std::uint64_t probe_total_ns =
                 std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t_after_probe - t_after_arm).count());
+            stats.examine_probe_ns += probe_total_ns;
+            stats.examine_back_ns += pass_back_ns;
+            stats.examine_readable_ns += probe_total_ns > pass_back_ns ? probe_total_ns - pass_back_ns : 0;
+            stats.stage2_probes += stats.probes[0] - probes_before;
 
             // Stage 3: ONE page_mirror.mutex lock + ONE batched parallel TitleMirror::upload() for all candidates.
             if (have_mirror && any_mirror_active) {
@@ -21984,8 +22263,25 @@ public:
                     }
                 }
 
-                // CPU upload path: hash-before-reserve for ALL textures including tiles == 1 (`<= tiles`), and compare
-                // t.mirror_hash on whole reads so CPU fallback after a GPU upload never re-uploads unchanged bytes.
+                // CPU upload path: record fallback reason for telemetry, hash-before-reserve for ALL textures
+                // including tiles == 1 (`<= tiles`), and compare t.mirror_hash on whole reads so CPU fallback after a
+                // GPU upload never re-uploads unchanged bytes.
+                if (have_mirror) {
+                    const auto& mc = title_mirror_checks_[idx];
+                    std::size_t bucket = 1;  // unmirrored_other
+                    if (mc.full_ok) {
+                        bucket = mc.single_chunk ? 5 : 4;  // can_gpu_rejected : multi_chunk
+                    } else if (mc.reject_reason == 1) {
+                        bucket = 0;  // unmirrored_plain
+                    } else if (mc.reject_reason == 3) {
+                        bucket = 2;  // in_feed
+                    } else if (mc.reject_reason == 4) {
+                        bucket = 3;  // pending_bind
+                    }
+                    ++stats.cpu_fallback_by[bucket];
+                } else {
+                    ++stats.cpu_fallback_by[1];  // unmirrored_other
+                }
                 TitleJob& job = next_title_job();
                 job.entry = cand.entry;
                 job.resource = t.resource;
@@ -22129,20 +22425,45 @@ public:
             const double per_pass = 1e-6 / double((std::max)(std::uint64_t(1), title_split_passes_));
             std::fprintf(stderr,
                          "[rt] d3d12: title texture pass split, ms a pass: %.3f finding what to look at (%.3f lock "
-                         "wait), %.3f naming, arming and reserving (%.3f arm, %.3f read+back, %.3f mirror, %.3f "
-                         "publish), %.3f reading on %u threads (%.3f of it detiling, "
-                         "summed over them; %.1f MiB read whole a pass), %.3f recording and submitting the transfers\n",
+                         "wait), %.3f naming, arming and reserving (%.3f arm, %.3f readable (%llu probes), %.3f back "
+                         "(%llu backed, %llu raw), %.3f mirror, %.3f publish), %.3f reading on %u threads (%.3f of it "
+                         "detiling, summed over them; %.1f MiB read whole a pass), %.3f recording and submitting the "
+                         "transfers\n",
                          double(stats.collect_ns) * per_pass, double(stats.lock_wait_ns) * per_pass,
                          double(stats.examine_ns) * per_pass, double(stats.examine_arm_ns) * per_pass,
-                         double(stats.examine_probe_ns) * per_pass, double(stats.examine_mirror_ns) * per_pass,
+                         double(stats.examine_readable_ns) * per_pass,
+                         static_cast<unsigned long long>(stats.stage2_probes),
+                         double(stats.examine_back_ns) * per_pass,
+                         static_cast<unsigned long long>(stats.stage2_backed),
+                         static_cast<unsigned long long>(stats.stage2_raw_allocs),
+                         double(stats.examine_mirror_ns) * per_pass,
                          double(stats.examine_publish_ns) * per_pass, double(stats.read_ns) * per_pass,
                          title_read_pool_ ? title_read_pool_->threads() + 1 : 1,
                          double(stats.detile_ns) * per_pass,
                          double(stats.read_bytes) / 1048576.0 / double((std::max)(std::uint64_t(1), title_split_passes_)),
                          double(stats.staged_ns) * per_pass);
+            const auto arm_s = state_.texture_cells.arm_stats;
+            state_.texture_cells.arm_stats = {};
+            std::fprintf(stderr,
+                         "[rt] d3d12: title texture arm split: %llu hot, %llu already, %llu backed, %llu fast_vp "
+                         "(%llu bridged), %llu vq (%llu cache_hit), %llu vq_vp; cpu fallback by: %llu "
+                         "unmirrored_plain, %llu unmirrored_other, %llu in_feed, %llu pending_bind, %llu multi_chunk, "
+                         "%llu can_gpu_rejected\n",
+                         static_cast<unsigned long long>(arm_s.hot), static_cast<unsigned long long>(arm_s.already),
+                         static_cast<unsigned long long>(arm_s.backed), static_cast<unsigned long long>(arm_s.fast_vp),
+                         static_cast<unsigned long long>(arm_s.bridged), static_cast<unsigned long long>(arm_s.vq),
+                         static_cast<unsigned long long>(arm_s.vq_cache), static_cast<unsigned long long>(arm_s.vq_vp),
+                         static_cast<unsigned long long>(stats.cpu_fallback_by[0]),
+                         static_cast<unsigned long long>(stats.cpu_fallback_by[1]),
+                         static_cast<unsigned long long>(stats.cpu_fallback_by[2]),
+                         static_cast<unsigned long long>(stats.cpu_fallback_by[3]),
+                         static_cast<unsigned long long>(stats.cpu_fallback_by[4]),
+                         static_cast<unsigned long long>(stats.cpu_fallback_by[5]));
             stats.collect_ns = stats.lock_wait_ns = stats.examine_ns = stats.examine_arm_ns = stats.examine_probe_ns =
-                stats.examine_mirror_ns = stats.examine_publish_ns = stats.read_ns = stats.detile_ns =
-                stats.read_bytes = 0;
+                stats.examine_readable_ns = stats.examine_back_ns = stats.examine_mirror_ns =
+                    stats.examine_publish_ns = stats.read_ns = stats.detile_ns = stats.read_bytes = 0;
+            stats.stage2_probes = stats.stage2_backed = stats.stage2_raw_allocs = 0;
+            stats.cpu_fallback_by = {};
             stats.staged_ns = 0;
             title_split_passes_ = 0;
             stats.refresh_ns = stats.max_refresh_ns = stats.max_pass_bytes = 0;
@@ -22167,12 +22488,17 @@ private:
         std::uint64_t partial_fills = 0, partial_textures = 0, partial_upgrades = 0, partial_refused = 0;
         std::uint64_t read_whole = 0, unchanged_parts = 0, first_named = 0;
         std::array<std::uint64_t, 5> whole_by{};  // why read whole: first, no parts, one tile, all written, none
+        // Why Stage 4 fell back to CPU instead of GPU mirror: unmirrored_plain, unmirrored_other, in_feed,
+        // pending_bind, multi_chunk, can_gpu_rejected.
+        std::array<std::uint64_t, 6> cpu_fallback_by{};
         // Split of refresh_ns: waiting on title_texture_mutex (lock_wait_ns), up to the textures to look at (map
         // changes, notes, the watch's queue), naming and arming them (examine, mirror batch, readability, slot
         // reservation), the read threads' work (and of it the detile, summed over the threads), and the transfers'
         // recording and submission (staged_ns); bytes read whole.
         std::uint64_t lock_wait_ns = 0, collect_ns = 0, examine_ns = 0, read_ns = 0, detile_ns = 0, read_bytes = 0;
-        std::uint64_t examine_arm_ns = 0, examine_probe_ns = 0, examine_mirror_ns = 0, examine_publish_ns = 0;
+        std::uint64_t examine_arm_ns = 0, examine_probe_ns = 0, examine_readable_ns = 0, examine_back_ns = 0,
+                      examine_mirror_ns = 0, examine_publish_ns = 0;
+        std::uint64_t stage2_probes = 0, stage2_backed = 0, stage2_raw_allocs = 0;
         std::uint64_t staged_fills = 0, staged_fills_logged = 0, staged_ns = 0;
         std::uint64_t gpu_linear_fills = 0, gpu_detile_fills = 0, gpu_unchanged = 0, fast_passes = 0;
         // refresh_title_textures, since the last log line
@@ -22843,10 +23169,12 @@ private:
 
     // texture_memory_readable_bytes, timed and counted (TitleTextureStats::probes).
     // True when a fill can use what is readable; t.readable_from says what that is.
-    bool probe_title_texture(TitleTexture& t, bool waited, leonida::TexturePageCommitter commit = nullptr) {
+    bool probe_title_texture(TitleTexture& t, bool waited, leonida::TexturePageCommitter commit = nullptr,
+                             leonida::TextureVqCache* vq_cache = nullptr) {
         const auto start = std::chrono::steady_clock::now();
         t.readable_from = rt::xg_xs::first_mip_within(
-            t.layout, leonida::texture_memory_readable_bytes(std::uintptr_t(t.cpu), t.layout.layout.size, commit));
+            t.layout, leonida::texture_memory_readable_bytes(std::uintptr_t(t.cpu), t.layout.layout.size, commit,
+                                                             vq_cache));
         const bool readable = t.readable_from <= fill_limit(t);
         const std::size_t where = title_pass_ ? 0 : 1;
         TitleTextureStats& s = title_stats_;
@@ -22859,19 +23187,21 @@ private:
     }
 
     // A mapped texture can lose its pages between views or between refreshes.
-    bool title_texture_readable(TitleTexture& t) {
+    bool title_texture_readable(TitleTexture& t, leonida::TextureVqCache* vq_cache = nullptr) {
         const bool guard = check_pages_before_read();
         if (!guard && !t.memory.pending()) return true;
         const bool mapped = t.mapped && refresh_mapped_pages();
-        if (!title_pass_ && guard && !mapped)
+        if (!title_pass_ && guard)
             t.memory.sync_map(title_map_generation_, static_cast<std::uintptr_t>(t.cpu), t.layout.layout.size);
         const auto commit = mapped ? leonida::kernel_writes::state().committer.load(std::memory_order_acquire) : nullptr;
         const bool waited = t.memory.pending();
         // The answer is kept (generation 0) until a map change over the texture, a write into it or the periodic
-        // retry of refresh_title_textures asks again.
+        // retry of refresh_title_textures asks again. Keep cache_failure = guard && !mapped (a mapped plane may commit
+        // via raw VirtualAlloc without notifying title_memory_map), while enabling cache_success = guard (unmaps
+        // notify title_memory_map and reads are SEH-guarded).
         return t.memory.check(0, guard && !mapped,
-                              [&] { return probe_title_texture(t, waited, commit); },
-                              guard && !mapped);
+                              [&] { return probe_title_texture(t, waited, commit, mapped ? nullptr : vq_cache); },
+                              guard);
     }
 
     // At a slot-70 view of a texture: defer uploads to the batched refresh_title_textures() pass before GPU
@@ -22983,12 +23313,14 @@ private:
     }
 
     // A texture whose image has no memory yet gets it before its first fill. False (and stale) when it cannot.
-    bool back_title_texture(TitleTexture& t) {
+    bool back_title_texture(TitleTexture& t, bool* did_back = nullptr, bool* did_raw_alloc = nullptr) {
         if (!t.unbound_bytes) return true;
         if (t.owned ? !t.resource->back_streamed_texture() : !t.resource->image()) {
             t.stale = true;
             return false;
         }
+        if (did_back) *did_back = true;
+        if (did_raw_alloc && t.resource) *did_raw_alloc = !t.resource->pooled_image();
         t.mirror_hash_valid = false;
         t.set_resource(t.resource);
         return true;

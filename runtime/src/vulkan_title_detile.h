@@ -524,16 +524,17 @@ public:
         if (desc.block_side != 1 && desc.block_side != 4) return false;
         if (desc.mips.empty() || desc.mips.size() > image_mips || !desc.array_layers || desc.array_layers > image_layers)
             return false;
-        if (volume && desc.mips.size() > 1) return false;
+        if (volume && desc.array_layers != 1) return false;
         if (!desc.total_size || src_offset > chunk_size || desc.total_size > chunk_size - src_offset) return false;
-        const VkDeviceSize align = std::max<VkDeviceSize>(4, desc.element_bytes);
+        const VkDeviceSize align = (std::max)(VkDeviceSize(4), VkDeviceSize(desc.element_bytes));
         if (src_offset % align != 0) return false;
+        if (volume && image_depth > 1 && (desc.slice_bytes % align) != 0) return false;
         for (std::uint32_t layer = 0; layer < desc.array_layers; ++layer) {
             for (std::uint32_t level = 0; level < desc.mips.size(); ++level) {
                 const auto& m = desc.mips[level];
-                const std::uint32_t ew = std::max(1u, image_width >> level);
-                const std::uint32_t eh = std::max(1u, image_height >> level);
-                const std::uint32_t ed = volume ? std::max(1u, image_depth >> level) : 1u;
+                const std::uint32_t ew = (std::max)(1u, image_width >> level);
+                const std::uint32_t eh = (std::max)(1u, image_height >> level);
+                const std::uint32_t ed = volume ? (std::max)(1u, image_depth >> level) : 1u;
                 if (m.width_elements != (ew + desc.block_side - 1) / desc.block_side ||
                     m.height_elements != (eh + desc.block_side - 1) / desc.block_side ||
                     (volume && m.depth != ed))
@@ -542,6 +543,14 @@ public:
                 if (volume && (m.padded_height * desc.block_side < eh)) return false;
                 const VkDeviceSize off = src_offset + VkDeviceSize(layer) * desc.slice_bytes + m.offset;
                 if (off % align != 0) return false;
+                if (volume && ed > 1) {
+                    const VkDeviceSize row_stride = VkDeviceSize(m.pitch_texels / desc.block_side) * desc.element_bytes;
+                    const VkDeviceSize mip_slice = row_stride * m.height_elements;
+                    if (VkDeviceSize(ed - 1) > desc.total_size / (std::max)(VkDeviceSize(1), desc.slice_bytes))
+                        return false;
+                    const VkDeviceSize last_slice_off = VkDeviceSize(ed - 1) * desc.slice_bytes + m.offset;
+                    if (last_slice_off > desc.total_size || mip_slice > desc.total_size - last_slice_off) return false;
+                }
             }
         }
         return true;
@@ -556,14 +565,34 @@ public:
         for (std::uint32_t layer = 0; layer < desc.array_layers; ++layer) {
             for (std::uint32_t level = 0; level < desc.mips.size(); ++level) {
                 const auto& m = desc.mips[level];
-                VkBufferImageCopy copy{};
-                copy.bufferOffset = src_offset + VkDeviceSize(layer) * desc.slice_bytes + m.offset;
-                copy.bufferRowLength = m.pitch_texels;
-                copy.bufferImageHeight = volume ? m.padded_height * desc.block_side : 0u;
-                copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1};
-                copy.imageExtent = {std::max(1u, image_width >> level), std::max(1u, image_height >> level),
-                                    volume ? std::max(1u, image_depth >> level) : 1u};
-                out.push_back(copy);
+                const std::uint32_t ew = (std::max)(1u, image_width >> level);
+                const std::uint32_t eh = (std::max)(1u, image_height >> level);
+                const std::uint32_t ed = volume ? (std::max)(1u, image_depth >> level) : 1u;
+                const VkDeviceSize row_stride = VkDeviceSize(m.pitch_texels / desc.block_side) * desc.element_bytes;
+                const bool per_depth_slice =
+                    volume && ed > 1 && (desc.mips.size() > 1 || desc.slice_bytes != row_stride * m.padded_height);
+                if (per_depth_slice) {
+                    // Console linear 3D stores each depth slice's full mip chain stride `desc.slice_bytes` apart,
+                    // which exceeds one mip's `row_stride * padded_height` whenever mips > 1.
+                    for (std::uint32_t z = 0; z < ed; ++z) {
+                        VkBufferImageCopy copy{};
+                        copy.bufferOffset = src_offset + VkDeviceSize(z) * desc.slice_bytes + m.offset;
+                        copy.bufferRowLength = m.pitch_texels;
+                        copy.bufferImageHeight = 0u;
+                        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0u, 1u};
+                        copy.imageOffset = {0, 0, static_cast<std::int32_t>(z)};
+                        copy.imageExtent = {ew, eh, 1u};
+                        out.push_back(copy);
+                    }
+                } else {
+                    VkBufferImageCopy copy{};
+                    copy.bufferOffset = src_offset + VkDeviceSize(layer) * desc.slice_bytes + m.offset;
+                    copy.bufferRowLength = m.pitch_texels;
+                    copy.bufferImageHeight = volume ? m.padded_height * desc.block_side : 0u;
+                    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1};
+                    copy.imageExtent = {ew, eh, ed};
+                    out.push_back(copy);
+                }
             }
         }
         return !out.empty();

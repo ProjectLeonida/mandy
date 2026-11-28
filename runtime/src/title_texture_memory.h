@@ -55,11 +55,25 @@ private:
 
 using TexturePageCommitter = bool (*)(const void*, std::size_t);
 
+// Short-lived per-pass cache of the last verified readable MEM_COMMIT VirtualQuery region [lo, hi).
+// Reused across VA-sorted texture probes only when `!commit` and no title_memory_map change overlapped [lo, hi).
+struct TextureVqCache {
+    std::uintptr_t lo = 0;
+    std::uintptr_t hi = 0;
+    std::uint64_t gen = 0;
+
+    void reset() noexcept {
+        lo = hi = 0;
+        gen = 0;
+    }
+};
+
 // How many of the bytes from `base` are readable, up to the first page that is not (at most `size`). A page xmem's
 // frame table holds (a stream pool page queue slot 31 gave a physical page: no host view, src/title_frames.h) is
 // readable through its frame.
 inline std::uint64_t texture_memory_readable_bytes(std::uintptr_t base, std::uint64_t size,
-                                                   TexturePageCommitter commit = nullptr) {
+                                                   TexturePageCommitter commit = nullptr,
+                                                   TextureVqCache* vq_cache = nullptr) {
     if (!base || !size || size > (std::numeric_limits<std::uintptr_t>::max)() - base) return 0;
     const auto end = base + size;
     for (auto at = base; at < end;) {
@@ -72,6 +86,29 @@ inline std::uint64_t texture_memory_readable_bytes(std::uintptr_t base, std::uin
                 continue;
             }
         }
+        if (vq_cache && !commit && at >= vq_cache->lo && at < vq_cache->hi) {
+            const std::uint64_t cur = title_memory_map::generation();
+            bool clean = (cur == vq_cache->gen);
+            if (!clean) {
+                std::uint64_t now = cur;
+                bool overlapped = false;
+                if (title_memory_map::changes_since(vq_cache->gen, now, vq_cache->lo, vq_cache->hi,
+                                                    [&](std::uintptr_t c_from, std::uintptr_t c_to) {
+                                                        if (c_from < c_to) overlapped = true;
+                                                    }) &&
+                    !overlapped) {
+                    vq_cache->gen = now;
+                    clean = true;
+                } else {
+                    vq_cache->hi = 0;
+                }
+            }
+            if (clean) {
+                at = (std::min)(stop, vq_cache->hi);
+                continue;
+            }
+        }
+        const std::uint64_t query_gen = (vq_cache && !commit) ? title_memory_map::generation() : 0;
         MEMORY_BASIC_INFORMATION region{};
         const auto* address = reinterpret_cast<const void*>(at);
         if (!VirtualQuery(address, &region, sizeof(region))) return at - base;
@@ -89,6 +126,11 @@ inline std::uint64_t texture_memory_readable_bytes(std::uintptr_t base, std::uin
         const auto start = reinterpret_cast<std::uintptr_t>(region.BaseAddress);
         if (at < start || at - start >= region.RegionSize) return at - base;
         const auto available = region.RegionSize - (at - start);
+        if (vq_cache && !commit && region.RegionSize <= (std::numeric_limits<std::uintptr_t>::max)() - start) {
+            vq_cache->lo = start;
+            vq_cache->hi = start + region.RegionSize;
+            vq_cache->gen = query_gen;
+        }
         if (available >= stop - at) {
             at = stop;
             continue;
@@ -99,8 +141,9 @@ inline std::uint64_t texture_memory_readable_bytes(std::uintptr_t base, std::uin
 }
 
 // Check the whole footprint. A committed first page says nothing about a streamed mip farther on.
-inline bool texture_memory_readable(std::uintptr_t base, std::uint64_t size, TexturePageCommitter commit = nullptr) {
-    return size && texture_memory_readable_bytes(base, size, commit) == size;
+inline bool texture_memory_readable(std::uintptr_t base, std::uint64_t size, TexturePageCommitter commit = nullptr,
+                                    TextureVqCache* vq_cache = nullptr) {
+    return size && texture_memory_readable_bytes(base, size, commit, vq_cache) == size;
 }
 
 }  // namespace leonida
