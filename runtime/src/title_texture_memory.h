@@ -55,11 +55,12 @@ private:
 
 using TexturePageCommitter = bool (*)(const void*, std::size_t);
 
-// Check the whole footprint. A committed first page says nothing about a streamed mip farther on. A page xmem's frame
-// table holds (a stream pool page queue slot 31 gave a physical page: no host view, src/title_frames.h) is readable
-// through its frame.
-inline bool texture_memory_readable(std::uintptr_t base, std::uint64_t size, TexturePageCommitter commit = nullptr) {
-    if (!base || !size || size > (std::numeric_limits<std::uintptr_t>::max)() - base) return false;
+// How many of the bytes from `base` are readable, up to the first page that is not (at most `size`). A page xmem's
+// frame table holds (a stream pool page queue slot 31 gave a physical page: no host view, src/title_frames.h) is
+// readable through its frame.
+inline std::uint64_t texture_memory_readable_bytes(std::uintptr_t base, std::uint64_t size,
+                                                   TexturePageCommitter commit = nullptr) {
+    if (!base || !size || size > (std::numeric_limits<std::uintptr_t>::max)() - base) return 0;
     const auto end = base + size;
     for (auto at = base; at < end;) {
         auto stop = end;  // the host's part: up to the next table page
@@ -73,20 +74,20 @@ inline bool texture_memory_readable(std::uintptr_t base, std::uint64_t size, Tex
         }
         MEMORY_BASIC_INFORMATION region{};
         const auto* address = reinterpret_cast<const void*>(at);
-        if (!VirtualQuery(address, &region, sizeof(region))) return false;
+        if (!VirtualQuery(address, &region, sizeof(region))) return at - base;
         // A persistent Map can name an xmem section whose physical pages commit on first touch.
         // Only xmem may commit them. A bare reservation or an inaccessible page must still defer.
         if (commit && region.State == MEM_RESERVE && region.Type == MEM_MAPPED) {
-            if (!commit(address, end - at) || !VirtualQuery(address, &region, sizeof(region))) return false;
+            if (!commit(address, end - at) || !VirtualQuery(address, &region, sizeof(region))) return at - base;
         }
-        if (region.State != MEM_COMMIT || (region.Protect & PAGE_GUARD)) return false;
+        if (region.State != MEM_COMMIT || (region.Protect & PAGE_GUARD)) return at - base;
         switch (region.Protect & 0xff) {
         case PAGE_READONLY: case PAGE_READWRITE: case PAGE_WRITECOPY:
         case PAGE_EXECUTE_READ: case PAGE_EXECUTE_READWRITE: case PAGE_EXECUTE_WRITECOPY: break;
-        default: return false;
+        default: return at - base;
         }
         const auto start = reinterpret_cast<std::uintptr_t>(region.BaseAddress);
-        if (at < start || at - start >= region.RegionSize) return false;
+        if (at < start || at - start >= region.RegionSize) return at - base;
         const auto available = region.RegionSize - (at - start);
         if (available >= stop - at) {
             at = stop;
@@ -94,7 +95,12 @@ inline bool texture_memory_readable(std::uintptr_t base, std::uint64_t size, Tex
         }
         at += available;
     }
-    return true;
+    return size;
+}
+
+// Check the whole footprint. A committed first page says nothing about a streamed mip farther on.
+inline bool texture_memory_readable(std::uintptr_t base, std::uint64_t size, TexturePageCommitter commit = nullptr) {
+    return size && texture_memory_readable_bytes(base, size, commit) == size;
 }
 
 }  // namespace leonida

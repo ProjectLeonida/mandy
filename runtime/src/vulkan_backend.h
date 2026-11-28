@@ -2091,7 +2091,7 @@ public:
     }
 
     void mark_device_lost(const char* where = "a Vulkan call returned VK_ERROR_DEVICE_LOST") noexcept {
-        set_device_lost(device_lost_, where);
+        if (set_device_lost(device_lost_, where)) submit_mutex_.report_creates_on_loss();  // which creates were in it
         run_device_lost_hook();  // LEONIDA_AFTERMATH: the GPU crash dump is written before waiters wake
         if (fence_dispatcher_) {
             try {
@@ -2326,10 +2326,11 @@ private:
                 if (gate.submits != gate_logged.submits || gate.creates != gate_logged.creates) {
                     gate_logged = gate;
                     std::fprintf(stderr, "[rt] compile-gate: t=%.0f s: %llu submissions waited for pipeline creates "
-                                         "(%lld ms in all, longest %lld ms); %llu creates waited behind a submission "
-                                         "(%lld ms in all, longest %lld ms)\n",
+                                         "(%lld ms in all, longest %lld ms, %llu went ahead at the limit); %llu creates "
+                                         "waited behind a submission (%lld ms in all, longest %lld ms)\n",
                                  double(diagnostic_ms()) / 1000.0, static_cast<unsigned long long>(gate.submits),
                                  static_cast<long long>(gate.submit_ms), static_cast<long long>(gate.submit_max_ms),
+                                 static_cast<unsigned long long>(gate.ahead),
                                  static_cast<unsigned long long>(gate.creates), static_cast<long long>(gate.create_ms),
                                  static_cast<long long>(gate.create_max_ms));
                 }
@@ -2678,7 +2679,7 @@ public:
         context_.holds().pump_ready();  // presents queued behind what was just dropped can run
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
-            const SubmitMutex::SubmitTurn turn(context_.submit_mutex());  // a queue operation: the compile gate
+            const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
             const VkResult idle_result = context_.observe_result(vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle");
             if (idle_result == VK_SUCCESS) {
@@ -3144,8 +3145,33 @@ public:
             exec_cv_.wait(state, [this] { return !executing_; });
         }
         std::lock_guard lock(context_.submit_mutex());
-        const SubmitMutex::SubmitTurn turn(context_.submit_mutex());  // a queue operation: the compile gate
+        const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
         return context_.observe_result(context_.vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle") == VK_SUCCESS;
+    }
+
+    // Waits on the CPU until what this queue has submitted so far is done: its own timeline, without the device's
+    // submit lock, so other queues keep submitting, and without waiting for anything submitted after (review D9;
+    // idle() waits for the whole VkQueue, which D3D12 queues may share, and blocks every submission meanwhile).
+    bool wait_submitted() {
+        std::uint64_t value = 0;
+        {
+            std::lock_guard state(state_mutex_);
+            value = submitted_;
+        }
+        if (!value) return true;
+        VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wait.semaphoreCount = 1;
+        wait.pSemaphores = &progress_;
+        wait.pValues = &value;
+        constexpr std::uint64_t slice_ns = 100'000'000;  // 100 ms
+        for (;;) {  // bounded slices: a lost device wakes the wait
+            if (context_.is_device_lost()) return false;
+            const VkResult res = context_.vk.vkWaitSemaphores(context_.device(), &wait, slice_ns);
+            if (res == VK_SUCCESS) return true;
+            if (res == VK_TIMEOUT) continue;
+            if (res == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+            return false;
+        }
     }
 
 private:

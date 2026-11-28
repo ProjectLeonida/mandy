@@ -386,7 +386,6 @@ public:
         executing_.push_back(++execute_serial_);
         return execute_serial_;
     }
-
     // An ExecuteCommandLists replay starts (before its before_execute_ work): its serial, for execute_end().
     // When `enqueued_serial` != 0, execute_enqueue() already registered it in executing_ at enqueue time.
     std::uint64_t execute_begin(std::uint64_t enqueued_serial = 0) {
@@ -394,6 +393,19 @@ public:
         std::lock_guard lock(execute_mutex_);
         executing_.push_back(++execute_serial_);
         return execute_serial_;
+    }
+    // The last replay begun (or enqueued), and the oldest still in progress (kAfterExecutes when none): what
+    // execute_end stamps by, for a copy the device retires the same way outside these views (a title window,
+    // DeviceState::retire_orphan_windows).
+    std::uint64_t execute_epoch() {
+        std::lock_guard lock(execute_mutex_);
+        return execute_serial_;
+    }
+    std::uint64_t oldest_execute() {
+        std::lock_guard lock(execute_mutex_);
+        std::uint64_t oldest = kAfterExecutes;
+        for (const auto s : executing_) oldest = (std::min)(oldest, s);
+        return oldest;
     }
     // The replay that began (or was enqueued) with `serial` has recorded its submissions (or was dropped). Views
     // retired while only replays now finished were in progress get submitted() (the context's

@@ -135,6 +135,7 @@ public:
         leonida::ResourceId id{};
         leonida::ResourceBinding image{};
         const xg_xs::Texture* layout = nullptr;
+        unsigned from = 0;
         // cpu_slot:
         Slot* slot = nullptr;
         // mirror_linear / mirror_detile:
@@ -147,21 +148,22 @@ public:
         bool ok = false;
     };
 
-    // One CPU-staged upload in three steps:
+    // One CPU-staged upload in three steps (uploads the mips from `from` on; `tiled` then needs only
+    // mip_chain_bytes(layout, from) bytes):
     //   reserve (serial): the copy regions, a free slot and its buffer;
     //   fill (any thread, one slot each): the detile into the slot's mapped buffer;
     //   commit / commit_batch (serial): the transfer recorded and submitted; or unreserve when unchanged.
     template<class Device>
-    Slot* reserve(Device& d, const leonida::ResourceBinding& image, const xg_xs::Texture& layout) {
+    Slot* reserve(Device& d, const leonida::ResourceBinding& image, const xg_xs::Texture& layout, unsigned from = 0) {
         const auto block = leonida::copy_block_format(image, VK_IMAGE_ASPECT_COLOR_BIT);
         const auto mips = layout.layout.mips;
         const auto layers = layout.array;
-        if (!block.bytes || block.bytes != layout.format.bytes || !mips || mips > image.mip_levels ||
+        if (!block.bytes || block.bytes != layout.format.bytes || from >= mips || mips > image.mip_levels ||
             !layers || layers > image.array_layers) return nullptr;
         regions_.clear();
         VkDeviceSize bytes = 0;
         for (unsigned layer = 0; layer < layers; ++layer) {
-            for (unsigned level = 0; level < mips; ++level) {
+            for (unsigned level = from; level < mips; ++level) {
                 const auto& mip = layout.layout.plane[0].mips[level];
                 VkBufferImageCopy copy{};
                 copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1};
@@ -210,9 +212,9 @@ public:
     // Commits a single CPU-staged slot (used by fill_title_texture / fill_unlocked).
     template<class Device>
     bool commit(Device& d, leonida::ResourceId id, const leonida::ResourceBinding& image,
-                const xg_xs::Texture& layout, Slot& slot) {
+                const xg_xs::Texture& layout, Slot& slot, unsigned from = 0) {
         slot.reserved = false;
-        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, layout.layout.mips, 0, layout.array};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, from, layout.layout.mips - from, 0, layout.array};
         const auto result = d.context->write_staged_title_image(id, range, [&](const leonida::ReplayFunctions& replay,
                                                                                const leonida::LayoutPieces& pieces,
                                                                                const auto& waits) {
@@ -270,14 +272,15 @@ public:
         }
     }
 
+    // Uploads the mips from `from` on; `tiled` then needs only mip_chain_bytes(layout, from) bytes.
     template<class Device>
     bool write(Device& d, leonida::ResourceId id, const leonida::ResourceBinding& image,
                const xg_xs::Texture& layout, const std::uint8_t* tiled, std::vector<std::uint64_t>& columns,
-               bool inspect, bool& nonzero) {
-        Slot* slot = reserve(d, image, layout);
+               bool inspect, bool& nonzero, unsigned from = 0) {
+        Slot* slot = reserve(d, image, layout, from);
         if (!slot) return false;
         fill(*slot, image, layout, tiled, columns, inspect, nonzero);
-        return commit(d, id, image, layout, *slot);
+        return commit(d, id, image, layout, *slot, from);
     }
 
     static constexpr std::size_t kMaxSlots = 64;
@@ -461,7 +464,7 @@ private:
             if (!item.layout) continue;
             PreparedItem prep{};
             prep.index = i;
-            prep.range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, item.layout->layout.mips, 0, item.layout->array};
+            prep.range = {VK_IMAGE_ASPECT_COLOR_BIT, item.from, item.layout->layout.mips - item.from, 0, item.layout->array};
             if (item.kind == UploadKind::cpu_slot) {
                 if (!item.slot) continue;
                 prep.src_buffer = item.slot->buffer;
