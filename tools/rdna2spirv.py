@@ -4508,8 +4508,13 @@ class Gen:
                 prod = self.tmp()
                 self.emit(f"{prod} = OpIMul %ulong {u64(idx)} {u64(stride)}")
                 wide = add64(wide, prod)
-            fits = self.tmp()
-            self.emit(f"{fits} = OpULessThanEqual %bool {wide} {self.cl(0xFFFFFFFF)}")
+            # Test the high 32 bits instead of `OpULessThanEqual %bool wide 0xFFFFFFFF` (or
+            # `OpULessThan wide 0x100000000`): NVIDIA 580.82.07 NVVM aborts pipeline creation
+            # (`NVVM compilation failed: 3`, VkResult -13) on that compare when a literal V# folds
+            # `wide` to `0 + idx * stride`.
+            hi_w, fits = self.tmp(), self.tmp()
+            self.emit(f"{hi_w} = OpShiftRightLogical %ulong {wide} %c64_32")
+            self.emit(f"{fits} = OpIEqual %bool {hi_w} {self.cl(0)}")
             self.uses_long = True
         self.uses_psb = True
         l64, h64, sh, base, o64, addr = (self.tmp() for _ in range(6))
