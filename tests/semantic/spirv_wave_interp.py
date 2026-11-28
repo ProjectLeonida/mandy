@@ -25,6 +25,9 @@ wave size; BaseVertex and BaseInstance read 0; other Input variables read zero, 
 lane number giving that lane's integer value, e.g. {"VertexIndex": lambda lane: first + lane}). PushConstant words
 can be seeded (default zero).
 
+A fragment-shader interlock (OpBeginInvocationInterlockEXT / OpEndInvocationInterlockEXT) runs as a no-op: it orders
+invocations of other primitives at the same pixel, and a run here has none.
+
     run_wave(text, wave=32, push_constants=None, max_steps=2_000_000, builtins=None) ->
         {"outputs": [ {output_name: tuple_of_words} or None (lane killed) for each lane ],
          "steps": instructions executed (summed over invocations)}
@@ -690,6 +693,10 @@ class _Wave:
     # -- per-invocation instructions -----------------------------------------------------------------------------
     def eval(self, lane, res, op, a):
         m = self.m
+        if op in ("OpBeginInvocationInterlockEXT", "OpEndInvocationInterlockEXT"):
+            # The interlock orders fragment invocations of other primitives at the same pixel; one subgroup run
+            # here has none, so it orders nothing.
+            return None
         if op == "OpVariable":
             cls, pointee = m.ptr_types[a[0]]
             if cls != "Function":

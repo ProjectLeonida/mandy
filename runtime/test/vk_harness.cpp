@@ -309,12 +309,14 @@ int main(int argc, char** argv) {
     // (llvmpipe and other software devices), so the suite reports it as unsupported instead. 77 is the existing
     // "this device cannot run the test" code (runtime/test/shaders/check.py, scripts/run_gpu_tests.py).
     const std::vector<uint32_t> fs_code = read_spv(argv[2]);
-    bool needs_barycentric = false, needs_float64 = false;
+    bool needs_barycentric = false, needs_float64 = false, needs_interlock = false;
     for (std::size_t i = 5; i + 1 < fs_code.size();) {   // instructions follow the 5-word SPIR-V header
         const uint32_t words = fs_code[i] >> 16, op = fs_code[i] & 0xffffu;
         if (!words) break;
         if (op == 17 && fs_code[i + 1] == 5284)          // OpCapability FragmentBarycentricKHR
             needs_barycentric = true;
+        if (op == 17 && fs_code[i + 1] == 5378)          // OpCapability FragmentShaderPixelInterlockEXT (POPS)
+            needs_interlock = true;
         if (op == 17 && fs_code[i + 1] == 10)            // OpCapability Float64 (v_add_f64 and friends)
             needs_float64 = true;
         i += words;
@@ -323,6 +325,19 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "unsupported: %s reads BaryCoordKHR and the device has no %s\n",
                      argv[2], VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         return 77;
+    }
+    // The same for a pixel shader with an ordered section (POPS), which runs under fragment-shader interlock.
+    if (needs_interlock) {
+        VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT have_lock{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have_lock};
+        const bool ext = has(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
+        if (ext) vkGetPhysicalDeviceFeatures2(pd, &query);
+        if (!ext || !have_lock.fragmentShaderPixelInterlock) {
+            std::fprintf(stderr, "unsupported: %s uses fragment-shader interlock and the device has no "
+                                 "fragmentShaderPixelInterlock\n", argv[2]);
+            return 77;
+        }
     }
     // OpFmaKHR (rdna2spirv.py --fma khr) needs VK_KHR_shader_fma; a module of ANY stage that needs it is refused
     // (argv[1] is the vertex shader, or the mesh shader run as compute under VKH_MESH_COMPUTE).

@@ -364,6 +364,34 @@ def user_data_dword(stage, sgpr):
         return None
     return sgpr - (MS_ROOT_SGPR - GRAPHICS_ROOT_DWORD)
 
+
+# POPS: the hardware gives a pixel shader with an ordered section its collision word in the SGPR after its user
+# SGPRs and the primitive mask (Mesa's pops_collision_wave_id argument, GFX9-10.3): the collision wave id in bits
+# 0-9, this wave's id in bits 16-25, the overlap flag in bit 31. The program takes the wave id out with s_bfe_u32
+# and this field (offset 16, width 10).
+POPS_WAVE_ID_FIELD = 0x000A0010
+# What the translator puts in that SGPR at entry: no overlap, wave id 1, collision id 0. The program's wait loop
+# leaves once wave_id + ~collision_id is below src_pops_exiting_wave_id + ~collision_id, unsigned. With the exiting
+# id read as 0 (Gen.src_u) that is 0 < 0xFFFFFFFF, true at the first test. A word with wave id == collision id
+# (0, what the push constants usually hold) gives 0xFFFFFFFF < 0xFFFFFFFF, never true: a wave that reaches the loop
+# runs it to the loop guard. The overlap test before the loop skips it whenever a lane is on, so only a subgroup
+# with EXEC all off there entered it.
+POPS_COLLISION_SEED = 1 << 16
+
+
+def pops_collision_sgpr(insns, entry_reads):
+    """The SGPR a pixel shader's POPS collision word arrives in: the source of the s_bfe_u32 that takes out the
+    word's wave id (POPS_WAVE_ID_FIELD), when the program reads that SGPR's entry value (`entry_reads`, from
+    shader_meta's user_sgpr_reads). None when no such read is found: the word is then left as the push constants
+    give it, as before."""
+    for ins in insns:
+        a = ins["args"]
+        if (base_op(ins["op"]) == "s_bfe_u32" and len(a) == 3 and a[1]["k"] == "sgpr" and a[1].get("n", 1) == 1
+                and a[2]["k"] == "imm" and a[2]["v"] & 0xFFFFFFFF == POPS_WAVE_ID_FIELD
+                and a[1]["r"] in entry_reads):
+            return a[1]["r"]
+    return None
+
 # v_pipeflush (GFX10 VOP1) only flushes the VALU pipeline: no register, memory or EXEC effect to translate.
 # s_icache_inv invalidates the instruction cache; s_ttracedata / s_ttracedata_imm send thread-trace data;
 # s_code_end pads the end of a code object; s_version records the ISA version. None of them has a register, memory,
@@ -484,6 +512,7 @@ class Gen:
         self.uses_minlod = False
         self.uses_img_offset = False
         self.uses_pops = False
+        self.pops_word_sgpr = None  # PS: the SGPR the POPS collision word arrives in (pops_collision_sgpr)
         self.round_mode = False     # the program writes MODE.FP_ROUND[3:2] (f16/f64 rounding): kept in %mode_r16
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
@@ -689,7 +718,8 @@ class Gen:
         elif k == "special" and a["t"] == "src_pops_exiting_wave_id":
             # POPS (primitive-ordered pixel shading): the hardware wait loop compares this against the
             # collision word. Ordering comes from fragment-shader interlock around the whole shader instead
-            # (see assemble), so the id reads as 0 and the runtime puts 0 (no collision) in the collision SGPR.
+            # (see assemble), so the id reads as 0 and the collision word is seeded at entry with
+            # POPS_COLLISION_SEED, which ends the wait loop at its first test.
             v = self.cu(0)
             self.uses_pops = True
         elif k == "imm":
@@ -5866,6 +5896,13 @@ class Gen:
         generated (fit_shared_memory), whether the shader will use its LDS is not known yet; assume it does."""
         used = self.uses_lds if lds_used is None else lds_used
         return self.bar_rounds and used and 4 * self.lds_dwords + 12 > 16384
+
+    def note_pops_word(self, insns):
+        """PS: the SGPR the POPS collision word arrives in (pops_collision_sgpr), seeded at entry. Called once
+        build_meta, whose user_sgpr_reads says which entry values the program reads, is known."""
+        if self.stage == "ps":
+            reads = {r["sgpr"] for r in (self.build_meta or {}).get("user_sgpr_reads", ())}
+            self.pops_word_sgpr = pops_collision_sgpr(insns, reads)
 
     def fit_shared_memory(self):
         """SHADER-309: a compute shader's Workgroup memory, the LDS array plus %x_buf, must fit in MAX_SHARED_BYTES
@@ -16365,6 +16402,8 @@ def assemble(gen):
         iface += ["%frag_coord"] + (["%front_facing"] if "front" in gen.frag_inputs.values() else []) +             (["%bary"] if bary else [])
     for i in range(USER_SGPRS):          # index constants for the user-data copy at entry
         gen.cu(i)
+    if gen.uses_pops and gen.pops_word_sgpr is not None:
+        gen.cu(POPS_COLLISION_SEED)
     # SPIR-V module layout: every OpCapability, then every OpExtension, then imports.
     caps = ["Shader"] + (["Int64", "PhysicalStorageBufferAddresses"] if psb else []) + \
         (["RuntimeDescriptorArray"] if tex else []) + (["GroupNonUniform", "GroupNonUniformShuffle"] if sg else []) + \
@@ -16969,6 +17008,11 @@ def assemble(gen):
                f"%ud{i} = OpLoad %uint %ud{i}p",
                f"%ud{i}s = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(i)}",
                f"OpStore %ud{i}s %ud{i}"]
+    if gen.uses_pops and gen.pops_word_sgpr is not None:
+        # The POPS collision word is the hardware's, not user data: whatever the push constants hold at its dword
+        # (often 0, wave id == collision id) would keep a wave that enters the wait loop in it until the loop guard.
+        fn += [f"%pops_word = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(gen.pops_word_sgpr)}",
+               f"OpStore %pops_word {gen.cu(POPS_COLLISION_SEED)}"]
     if vs:
         # The hardware's VS input VGPRs are zero-based: v0 is the vertex id without the draw's base vertex and v3
         # the instance id without its first instance (Mesa: ac.vertex_id = load_vertex_id_zero_base, the base in
@@ -18981,6 +19025,7 @@ def _translate(path):
         halves_analysis(g, [insns], [[]])
         g.build_meta = _shader_meta.collect(path, info["name"], [insns], [[]],
                                             user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
+        g.note_pops_word(insns)
         g.fit_shared_memory()
         end = next((k for k, ins in enumerate(insns) if base_op(ins["op"]) == "s_endpgm"), len(insns))
         g.exec_changes = any(g.may_write_exec(ins) for ins in insns[:end])
@@ -19051,6 +19096,7 @@ def _translate(path):
     halves_analysis(g, blocks, succ)
     g.build_meta = _shader_meta.collect(path, info["name"], blocks, succ,
                                         user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
+    g.note_pops_word(insns)
 
     g.bar_rounds = needs_barrier_rounds(g, blocks, succ)
     folds, fold_chain, absorbed = {}, {}, set()
