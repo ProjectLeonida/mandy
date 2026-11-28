@@ -124,9 +124,9 @@ inline bool can_relay_wait() {
 inline bool relay_gate_wait(ID3D12Fence* gate, std::uint64_t value, std::span<const RelayTarget> targets) {
     if (auto* hook = relay_wait_hook()) return hook(gate, value, targets);
 #ifdef LEONIDA_VULKAN_DEVICE
-    rt::d3d12::FenceRelayTarget small[8];
+    rt::d3d12::FenceRelayTarget inline_targets[8];
     std::vector<rt::d3d12::FenceRelayTarget> large;
-    rt::d3d12::FenceRelayTarget* dst = small;
+    rt::d3d12::FenceRelayTarget* dst = inline_targets;
     if (targets.size() > 8) {
         large.resize(targets.size());
         dst = large.data();
