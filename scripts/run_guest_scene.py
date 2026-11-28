@@ -190,9 +190,11 @@ class Session:
         cmd = ([a.wine, *a.wine_arg] if wine else []) + [str(a.loader), "--run", guest_path(a.guest, wine), "--game-dir",
                                             guest_path(package, wine), "--overlay", guest_path(overlay, wine),
                                             "--", guest_path(a.shaders, wine)]
+        # tiny_guest_draw uses the Windows SDK's command-list method order.
         env_set = {"LEONIDA_SCENE_MODE": mode,
                    "LEONIDA_SCENE_AUDIO": "winmm" if a.play_audio else "offline",
-                   "LEONIDA_KEYBOARD_PAD": "always", "LEONIDA_GAMEINPUT_THREAD": "0", "LEONIDA_D3D12": "vulkan",
+                   "LEONIDA_KEYBOARD_PAD": "always", "LEONIDA_GAMEINPUT_THREAD": "0",
+                   "LEONIDA_D3D12": "vulkan", "LEONIDA_D3D12_LISTS": "pc",
                    "LEONIDA_SHADERS": guest_path(a.shaders / "spirv", wine), "LEONIDA_UNIMPLEMENTED": "stop"}
         env = dict(os.environ, **env_set)
         self.last = [self.logs / f"{name}.stdout.log", self.logs / f"{name}.stderr.log"]
