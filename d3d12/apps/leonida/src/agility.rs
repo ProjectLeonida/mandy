@@ -86,7 +86,14 @@ pub(crate) fn exported_sdk_version(dll: &[u8]) -> Option<u32> {
                 u32_at(s + 16)?,
                 u32_at(s + 20)?,
             );
-            (va <= rva && rva < va + size.max(raw_size)).then(|| (rva - va + raw) as usize)
+            // Checked: a malformed section table (va + size or the file offset past
+            // u32::MAX) is no section, not an overflow.
+            let end = va.checked_add(size.max(raw_size))?;
+            if va <= rva && rva < end {
+                (rva - va).checked_add(raw).map(|at| at as usize)
+            } else {
+                None
+            }
         })
     };
     let exports = offset(u32_at(optional + 112)?)?;
@@ -300,6 +307,28 @@ mod tests {
             None
         );
         assert_eq!(exported_sdk_version(b"MZ and nothing else"), None);
+    }
+
+    /// A section table whose numbers run past `u32::MAX` (a malformed or
+    /// truncated DLL) is no section: `None`, not an overflow panic.
+    #[test]
+    fn exported_sdk_version_is_none_for_a_section_past_u32_max() {
+        // Offsets as in `pe_with_exports`: the section header follows a
+        // 240-byte optional header at 0x40 + 24.
+        const TABLE: usize = 0x40 + 24 + 240;
+        let mut image = pe_with_exports(&[("D3D12SDKVersion", 616)]);
+        // Virtual address near the top, so that va + size wraps.
+        image[TABLE + 12..TABLE + 16].copy_from_slice(&0xFFFF_F000u32.to_le_bytes());
+        image[TABLE + 8..TABLE + 12].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+        assert_eq!(exported_sdk_version(&image), None);
+        // File offset near the top, so that rva - va + raw wraps: the section
+        // starts 0x100 below the export directory (at 0x1000) and is made big
+        // enough to hold it.
+        let mut image = pe_with_exports(&[("D3D12SDKVersion", 616)]);
+        image[TABLE + 8..TABLE + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+        image[TABLE + 12..TABLE + 16].copy_from_slice(&0x0F00u32.to_le_bytes());
+        image[TABLE + 20..TABLE + 24].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+        assert_eq!(exported_sdk_version(&image), None);
     }
 
     /// Windows' own runtime, where there is one: it exports a version the
