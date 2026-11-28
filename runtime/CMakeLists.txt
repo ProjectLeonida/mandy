@@ -4449,13 +4449,18 @@ if(TARGET Vulkan::Headers)
     # Subgroup size control in PSOs, end to end: runtime/test/shaders/cs_w64x_readlane.asm translated natively and with
     # --wave64-emulate, and cs_wqm_w32.asm, built here with tools/rdna2spirv.py through test/shaders/build.py. Needs
     # llvm-mc with the AMDGPU target (LLVM_MC in the environment, as for the other shader tests, or llvm-mc on PATH)
-    # and the Vulkan SDK's spirv tools; without them the test is not built.
+    # and the Vulkan SDK's spirv tools; without them the test is not built. build.py gets the folder of the spirv-as
+    # CMake found (LEONIDA_SPIRV_TOOLS), like the other shader rules, so the tools need not be on PATH.
     if(DEFINED ENV{LLVM_MC})
       set(LEONIDA_LLVM_MC "$ENV{LLVM_MC}")
     else()
       find_program(LEONIDA_LLVM_MC llvm-mc HINTS "C:/msys64/ucrt64/bin")
     endif()
-    if(LEONIDA_LLVM_MC AND Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    find_program(LEONIDA_SPIRV_AS spirv-as HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    find_program(LEONIDA_SPIRV_VAL spirv-val HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    if(LEONIDA_LLVM_MC AND LEONIDA_SPIRV_AS AND LEONIDA_SPIRV_VAL AND Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      get_filename_component(LEONIDA_SPIRV_TOOLS_DIR ${LEONIDA_SPIRV_AS} DIRECTORY)
+      file(TO_NATIVE_PATH "${LEONIDA_SPIRV_TOOLS_DIR}" LEONIDA_SPIRV_TOOLS_NATIVE)
       set(LEONIDA_SG_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/subgroup_shaders)
       set(LEONIDA_SG_INDEXES "")
       foreach(case "w64_native;cs_w64x_readlane;0" "w64_emulated;cs_w64x_readlane;1" "w32_native;cs_wqm_w32;0"
@@ -4468,8 +4473,8 @@ if(TARGET Vulkan::Headers)
           OUTPUT ${index}
           # The standalone harness runs these with the V# at s[0:3]; d3d12_subgroup_test passes it as four root
           # constants, which the D3D12 compute layout puts at s[4:7] (LEONIDA_USER_DATA_SHIFT=4, D3D-448).
-          COMMAND ${CMAKE_COMMAND} -E env LLVM_MC=${LEONIDA_LLVM_MC} LEONIDA_W64_EMULATE=${emulate}
-                  LEONIDA_USER_DATA_SHIFT=4
+          COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                  LEONIDA_W64_EMULATE=${emulate} LEONIDA_USER_DATA_SHIFT=4
                   $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                   ${LEONIDA_SG_DIR}/${folder} ${shader}
           DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
@@ -4499,7 +4504,7 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_subgroup COMMAND d3d12_subgroup_test)
       set_tests_properties(d3d12_subgroup PROPERTIES SKIP_RETURN_CODE 77)
     else()
-      message(STATUS "llvm-mc (set LLVM_MC) or glslangValidator not found: d3d12_subgroup_test is not built")
+      message(STATUS "llvm-mc (set LLVM_MC), spirv-as/spirv-val or glslangValidator not found: d3d12_subgroup_test is not built")
     endif()
 
     # Clears on every format class against WARP (needs a Vulkan GPU; exit 77 without one).
