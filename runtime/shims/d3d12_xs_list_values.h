@@ -255,6 +255,9 @@ struct Counters {
     // stored to as a host address), and through xmem's own mapping of a page the title's view keeps PAGE_NOACCESS.
     // Both are also counted in writes_landed.
     std::atomic<std::uint64_t> writes_arena{0}, writes_title_pages{0};
+    // Memory gates whose GPU-relay (vis_seq = 0) release was downgraded to a CPU-visibility Fence::Signal because a
+    // landed write came from a bare write group (no ExecuteCommandLists) or failed the exact-address/width/value check.
+    std::atomic<std::uint64_t> gpu_relay_downgraded_bare{0}, gpu_relay_downgraded_val{0};
 };
 
 inline Counters& counters() {
@@ -468,13 +471,16 @@ public:
 
     // Writes that land once `queue->written` reaches `value`. The caller signalled that value on the queue and
     // asked the fence to set wake() on it (SetEventOnCompletion), so the pump needs no polling for writes.
-    void add_writes(std::shared_ptr<QueueValues> queue, std::uint64_t value, std::vector<Write> writes) {
+    // `bare` is true when flushed with no ExecuteCommandLists (signal-only pre-writes): such writes cannot satisfy
+    // a held consumer via vis_seq = 0 relay because no execute pass covered earlier CPU writes/page remaps.
+    void add_writes(std::shared_ptr<QueueValues> queue, std::uint64_t value, std::vector<Write> writes,
+                    bool bare = false) {
         if (writes.empty() || exiting_.load(std::memory_order_relaxed)) return;  // stop(): see there
         std::vector<PendingRelay> relays;
         {
             std::lock_guard lock(mutex_);
             const std::uint64_t after_gate = max_pending_gate_locked(queue.get());
-            writes_.push_back({std::move(queue), value, std::move(writes), after_gate});
+            writes_.push_back({std::move(queue), value, std::move(writes), after_gate, bare});
             collect_retroactive_relays_locked(relays);
         }
         apply_retroactive_relays(relays);
@@ -650,6 +656,42 @@ public:
             std::fprintf(stderr, "[rt] d3d12_xs: %zu list value gates still held at exit stay shut\n", gates.size());
     }
 
+    enum class LandedMatch : std::uint8_t { none, gpu_met, bare, val_mismatch };
+
+    struct LandedRange {
+        std::uint64_t address = 0;
+        std::uint64_t value = 0;
+        std::uint8_t bytes = 0;
+        bool exact_value = false;  // true for WriteKind::value (false for timestamps)
+        bool bare = false;         // true when flushed with no ExecuteCommandLists
+    };
+
+    // Classifies how `landed` (in chronological landing order) overlaps `wait`:
+    // - `none`: no landed range overlaps `[wait.address, wait.address + need)`.
+    // - `bare`: at least one overlapping landed range came from a bare write group (no ExecuteCommandLists).
+    // - `gpu_met`: no overlapping range is bare, and the latest overlapping landed write has exact address, exact
+    //   width, `exact_value`, and satisfies `console_value_met`.
+    // - `val_mismatch`: an overlapping non-bare write landed, but the latest one was a timestamp, differed in
+    //   address/width, or did not satisfy `console_value_met`.
+    static LandedMatch match_landed(const Wait& wait, std::span<const LandedRange> landed) {
+        const std::uint64_t need = wait.wide ? 8u : 4u;
+        if (!wait.address || wait.address > UINT64_MAX - need) return LandedMatch::none;
+        const std::uint64_t wait_end = wait.address + need;
+        const LandedRange* latest = nullptr;
+        for (std::size_t i = landed.size(); i-- > 0;) {
+            const LandedRange& r = landed[i];
+            if (!r.bytes || r.address > UINT64_MAX - r.bytes) continue;
+            if (r.address >= wait_end || wait.address >= r.address + r.bytes) continue;
+            if (r.bare) return LandedMatch::bare;
+            if (!latest) latest = &r;
+        }
+        if (!latest) return LandedMatch::none;
+        if (latest->exact_value && latest->address == wait.address && latest->bytes == need &&
+            console_value_met(wait.comparison, latest->value, wait.reference, wait.wide))
+            return LandedMatch::gpu_met;
+        return LandedMatch::val_mismatch;
+    }
+
 private:
     using Clock = std::chrono::steady_clock;
     static constexpr unsigned kPollMs = 1;             // while a gate waits for memory nobody tells us about
@@ -663,13 +705,14 @@ private:
         std::uint64_t value;
         std::vector<Write> writes;
         std::uint64_t after_gate = 0;  // highest pending gate value on `queue` ahead of this write group
+        bool bare = false;             // true when flushed with no ExecuteCommandLists (signal-only pre-write)
     };
     struct Gate {
         std::shared_ptr<QueueValues> queue;
         std::uint64_t value = 0;
         std::vector<Wait> waits;
         std::vector<std::uint8_t> wait_met;  // per-wait met tracking: transitions 0->1 checked against Pump::land()
-        bool cpu_met = false;                // true if any wait became met without an overlapping Pump::land() write
+        bool cpu_met = false;                // true if any wait became met without a qualifying non-bare GPU write
         bool relaying = false;               // true while add_writes()/add_gate() is applying a retroactive relay
         Clock::time_point since{};
         std::uint64_t held_ms = 0;           // GetTickCount64 when it was held
@@ -681,11 +724,7 @@ private:
         std::shared_ptr<QueueValues> queue;
         std::uint64_t value;
         std::function<void()> action;
-        bool gpu_relay = false;  // true strictly when every wait transitioned false->true via Pump::land()
-    };
-    struct LandedRange {
-        std::uint64_t address = 0;
-        std::uint64_t end = 0;
+        bool gpu_relay = false;  // true strictly when every wait transitioned false->true via a qualifying GPU write
     };
     struct PendingRelay {
         std::shared_ptr<QueueValues> gate_queue;
@@ -713,17 +752,7 @@ private:
         return false;
     }
 
-    static bool overlaps_landed(const Wait& wait, std::span<const LandedRange> landed) {
-        const std::uint64_t need = wait.wide ? 8u : 4u;
-        if (!wait.address || wait.address > UINT64_MAX - need) return false;
-        const std::uint64_t wait_end = wait.address + need;
-        for (const LandedRange& r : landed) {
-            if (r.address < wait_end && wait.address < r.end) return true;
-        }
-        return false;
-    }
-
-    // Finds pending memory gates whose unmet waits ALL match in-flight WriteGroups with
+    // Finds pending memory gates whose unmet waits ALL match in-flight non-bare WriteGroups with
     // `group.after_gate == 0 && group.queue.get() != gate.queue.get()` (strictly cycle-free) and marks them
     // `relaying = true` so they can be redirected in QueueHolds outside mutex_. Called with mutex_ held.
     void collect_retroactive_relays_locked(std::vector<PendingRelay>& out) {
@@ -735,11 +764,14 @@ private:
             std::size_t unmet_count = 0;
             bool all_matched = true;
             for (std::size_t wi = 0; wi < gate.waits.size(); ++wi) {
-                if (wi < gate.wait_met.size() && gate.wait_met[wi]) continue;
+                if (wi < gate.wait_met.size() && gate.wait_met[wi]) {
+                    if (met_now(gate.waits[wi])) continue;
+                    gate.wait_met[wi] = 0;
+                }
                 ++unmet_count;
                 const WriteGroup* matched = nullptr;
                 for (const WriteGroup& group : writes_) {
-                    if (group.after_gate != 0 || group.queue.get() == gate.queue.get()) continue;
+                    if (group.bare || group.after_gate != 0 || group.queue.get() == gate.queue.get()) continue;
                     if (group_meets_value(group, gate.waits[wi])) {
                         matched = &group;
                         break;
@@ -1012,13 +1044,24 @@ private:
             const QueueValues* queue = gate.queue.get();
             if (std::find(blocked.begin(), blocked.end(), queue) != blocked.end()) {
                 // Record GPU-landed wait transitions on blocked later gates so they are not misclassified as CPU-met
-                // once an earlier gate on the same queue opens on a subsequent pass.
+                // once an earlier gate on the same queue opens on a subsequent pass (and record bare/value downgrades).
                 if (!force && !lost && !gate.action && !gate.relaying && !landed_ranges.empty()) {
                     if (gate.wait_met.size() != gate.waits.size()) gate.wait_met.assign(gate.waits.size(), 0);
                     for (std::size_t wi = 0; wi < gate.waits.size(); ++wi) {
-                        if (!gate.wait_met[wi] && overlaps_landed(gate.waits[wi], landed_ranges) &&
-                            met_now(gate.waits[wi]))
+                        if (gate.wait_met[wi]) continue;
+                        const LandedMatch match = match_landed(gate.waits[wi], landed_ranges);
+                        if (match != LandedMatch::none && met_now(gate.waits[wi])) {
                             gate.wait_met[wi] = 1;
+                            if (match != LandedMatch::gpu_met) {
+                                if (!gate.cpu_met) {
+                                    if (match == LandedMatch::bare)
+                                        bump(counters().gpu_relay_downgraded_bare);
+                                    else
+                                        bump(counters().gpu_relay_downgraded_val);
+                                }
+                                gate.cpu_met = true;
+                            }
+                        }
                     }
                 }
                 continue;
@@ -1040,7 +1083,16 @@ private:
                     if (met_now(wait)) {
                         if (!gate.wait_met[wi]) {
                             gate.wait_met[wi] = 1;
-                            if (!overlaps_landed(wait, landed_ranges)) gate.cpu_met = true;
+                            const LandedMatch match = match_landed(wait, landed_ranges);
+                            if (match != LandedMatch::gpu_met) {
+                                if (!gate.cpu_met) {
+                                    if (match == LandedMatch::bare)
+                                        bump(counters().gpu_relay_downgraded_bare);
+                                    else if (match == LandedMatch::val_mismatch)
+                                        bump(counters().gpu_relay_downgraded_val);
+                                }
+                                gate.cpu_met = true;
+                            }
                         }
                     } else {
                         gate.wait_met[wi] = 0;
@@ -1228,7 +1280,7 @@ private:
                      "%llu at device loss; %llu met after release); %llu cuts (%llu deferred to a query's end, %llu "
                      "failed), %llu on bundles; releaser %llu signals, %.1f ms, longest %.2f ms, %llu stalls; longest pump pass "
                      "%.2f ms; %llu page remaps at the call (longest wait %.2f ms), %llu deferred (%llu failed); "
-                     "timestamps %llu from the GPU, %llu from the CPU clock%s\n",
+                     "timestamps %llu from the GPU, %llu from the CPU clock; gpu-relay downgraded %llu bare, %llu value%s\n",
                      get(c.writes_recorded), get(c.writes_landed), get(c.writes_failed), get(c.waits_recorded),
                      get(c.waits_met_at_submit), get(c.waits_relayed), get(c.gates_held), get(c.gates_met),
                      get(c.gates_released), get(c.released_present), get(c.released_cycle), get(c.released_stalled),
@@ -1237,7 +1289,8 @@ private:
                      get(c.release_us) / 1000.0, get(c.release_us_max) / 1000.0, get(c.release_stalls),
                      get(c.pass_us_max) / 1000.0,
                      get(c.remaps_now), get(c.remap_wait_us_max) / 1000.0, get(c.remaps_deferred),
-                     get(c.remaps_failed), get(c.stamps_gpu), get(c.stamps_cpu), oldest);
+                     get(c.remaps_failed), get(c.stamps_gpu), get(c.stamps_cpu),
+                     get(c.gpu_relay_downgraded_bare), get(c.gpu_relay_downgraded_val), oldest);
     }
 
     // A timestamp write's value: the GPU's timestamp for the write's place in its list when the GPU wrote one, else
@@ -1318,7 +1371,8 @@ private:
             if (landed) {
                 bump(counters().writes_landed);
                 if (write.bytes && write.address <= UINT64_MAX - write.bytes)
-                    landed_ranges.push_back({write.address, write.address + write.bytes});
+                    landed_ranges.push_back(
+                        {write.address, value, write.bytes, write.kind == WriteKind::value, group.bare});
                 continue;
             }
             bump(counters().writes_failed);

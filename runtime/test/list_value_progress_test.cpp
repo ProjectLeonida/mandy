@@ -525,19 +525,23 @@ int main() {
         CHECK(holds.pending(10, 1));  // gate 10 was NEVER signaled!
         holds.held_changed(-1);
 
-        // In-transit lookup_relay() when apply_wait_relay finds nothing yet (race ordering), plus consume pruning.
+        // In-transit lookup_relay() when apply_wait_relay finds nothing yet (race ordering): relay_wait() returns false
+        // (nothing substituted yet) while keeping the redirect registered for lookup_relay() and consume pruning.
         const Wait single_rep[] = {{20, 4, {}}};
-        CHECK(holds.relay_wait(10, 2, single_rep, /*consume_on_substitute=*/true));
+        CHECK(!holds.relay_wait(10, 2, single_rep, /*consume_on_substitute=*/true));
         CHECK(holds.active_relay_count() == 1);  // retained for in-transit waiter
+        CHECK(!holds.relay_wait(10, 2, single_rep, /*consume_on_substitute=*/true));  // duplicate rejected cleanly
+        CHECK(holds.active_relay_count() == 1);
         std::vector<Wait> found;
         CHECK(holds.lookup_relay(10, 2, found));
         CHECK(found.size() == 1 && found[0].semaphore == 20 && found[0].value == 4);
         CHECK(holds.active_relay_count() == 0);  // consumed and pruned!
         CHECK(!holds.lookup_relay(10, 2, found));
 
-        // Non-consuming relays prune cleanly when gate is later signaled past gate_val or fence is removed.
-        CHECK(holds.relay_wait(10, 3, single_rep, /*consume_on_substitute=*/false));
-        CHECK(holds.relay_wait(10, 7, single_rep, /*consume_on_substitute=*/false));
+        // Non-consuming relays (with no matching waiter yet -> returns false, still registered) prune cleanly when
+        // gate is later signaled past gate_val or replacement fence is removed.
+        CHECK(!holds.relay_wait(10, 3, single_rep, /*consume_on_substitute=*/false));
+        CHECK(!holds.relay_wait(10, 7, single_rep, /*consume_on_substitute=*/false));
         CHECK(holds.active_relay_count() == 2);
         holds.signaled(10, 5, 0);
         CHECK(holds.active_relay_count() == 1);  // val 3 pruned, val 7 kept
