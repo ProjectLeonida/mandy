@@ -104,18 +104,19 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
 
 namespace {
 
-void put_u32(std::vector<uint8_t>& out, uint32_t v) {
-    out.push_back(static_cast<uint8_t>(v));
-    out.push_back(static_cast<uint8_t>(v >> 8));
-    out.push_back(static_cast<uint8_t>(v >> 16));
-    out.push_back(static_cast<uint8_t>(v >> 24));
+void write_u32(uint8_t*& dst, uint32_t v) {
+    dst[0] = static_cast<uint8_t>(v);
+    dst[1] = static_cast<uint8_t>(v >> 8);
+    dst[2] = static_cast<uint8_t>(v >> 16);
+    dst[3] = static_cast<uint8_t>(v >> 24);
+    dst += 4;
 }
 
-void put_f32(std::vector<uint8_t>& out, float v) {
+void write_f32(uint8_t*& dst, float v) {
     uint32_t bits = 0;
     static_assert(sizeof(bits) == sizeof(v));
     std::memcpy(&bits, &v, sizeof(bits));
-    put_u32(out, bits);
+    write_u32(dst, bits);
 }
 
 class Reader {
@@ -123,7 +124,7 @@ public:
     Reader(const uint8_t* data, size_t size) : data_(data), size_(size) {}
 
     [[nodiscard]] bool u32(uint32_t& v) {
-        if (pos_ + 4 > size_) return false;
+        if (4 > size_ - pos_) return false;
         v = static_cast<uint32_t>(data_[pos_]) |
             (static_cast<uint32_t>(data_[pos_ + 1]) << 8) |
             (static_cast<uint32_t>(data_[pos_ + 2]) << 16) |
@@ -162,46 +163,52 @@ bool known_version(uint32_t v, Version& out) {
 }  // namespace
 
 std::vector<uint8_t> encode_canonical(const RootSignature& sig) {
-    std::vector<uint8_t> out;
-    put_u32(out, kCanonicalMagic);
-    put_u32(out, kCanonicalVersion);
-    put_u32(out, static_cast<uint32_t>(sig.version));
-    put_u32(out, static_cast<uint32_t>(sig.params.size()));
-    put_u32(out, static_cast<uint32_t>(sig.static_samplers.size()));
-    put_u32(out, sig.flags);
+    const size_t sampler_dwords = sig.version == Version::V1_2 ? 14u : 13u;
+    size_t total_dwords = 6u;
+    total_dwords += sig.params.size() * 8u;
+    for (const RootParameter& p : sig.params) total_dwords += p.ranges.size() * 6u;
+    total_dwords += sig.static_samplers.size() * sampler_dwords;
+    std::vector<uint8_t> out(total_dwords * 4u);
+    uint8_t* dst = out.data();
+    write_u32(dst, kCanonicalMagic);
+    write_u32(dst, kCanonicalVersion);
+    write_u32(dst, static_cast<uint32_t>(sig.version));
+    write_u32(dst, static_cast<uint32_t>(sig.params.size()));
+    write_u32(dst, static_cast<uint32_t>(sig.static_samplers.size()));
+    write_u32(dst, sig.flags);
     for (const RootParameter& p : sig.params) {
-        put_u32(out, static_cast<uint32_t>(p.type));
-        put_u32(out, static_cast<uint32_t>(p.visibility));
-        put_u32(out, p.num_values);
-        put_u32(out, p.shader_register);
-        put_u32(out, p.register_space);
-        put_u32(out, p.descriptor_register);
-        put_u32(out, p.descriptor_space);
-        put_u32(out, static_cast<uint32_t>(p.ranges.size()));
+        write_u32(dst, static_cast<uint32_t>(p.type));
+        write_u32(dst, static_cast<uint32_t>(p.visibility));
+        write_u32(dst, p.num_values);
+        write_u32(dst, p.shader_register);
+        write_u32(dst, p.register_space);
+        write_u32(dst, p.descriptor_register);
+        write_u32(dst, p.descriptor_space);
+        write_u32(dst, static_cast<uint32_t>(p.ranges.size()));
         for (const DescriptorRange& r : p.ranges) {
-            put_u32(out, r.range_type);
-            put_u32(out, r.num_descriptors);
-            put_u32(out, r.base_shader_register);
-            put_u32(out, r.register_space);
-            put_u32(out, r.flags);
-            put_u32(out, r.offset_in_table);
+            write_u32(dst, r.range_type);
+            write_u32(dst, r.num_descriptors);
+            write_u32(dst, r.base_shader_register);
+            write_u32(dst, r.register_space);
+            write_u32(dst, r.flags);
+            write_u32(dst, r.offset_in_table);
         }
     }
     for (const StaticSampler& s : sig.static_samplers) {
-        put_u32(out, s.filter);
-        put_u32(out, s.address_u);
-        put_u32(out, s.address_v);
-        put_u32(out, s.address_w);
-        put_f32(out, s.mip_lod_bias);
-        put_u32(out, s.max_anisotropy);
-        put_u32(out, s.comparison_func);
-        put_u32(out, s.border_color);
-        put_f32(out, s.min_lod);
-        put_f32(out, s.max_lod);
-        put_u32(out, s.shader_register);
-        put_u32(out, s.register_space);
-        put_u32(out, static_cast<uint32_t>(s.visibility));
-        if (sig.version == Version::V1_2) put_u32(out, s.flags);
+        write_u32(dst, s.filter);
+        write_u32(dst, s.address_u);
+        write_u32(dst, s.address_v);
+        write_u32(dst, s.address_w);
+        write_f32(dst, s.mip_lod_bias);
+        write_u32(dst, s.max_anisotropy);
+        write_u32(dst, s.comparison_func);
+        write_u32(dst, s.border_color);
+        write_f32(dst, s.min_lod);
+        write_f32(dst, s.max_lod);
+        write_u32(dst, s.shader_register);
+        write_u32(dst, s.register_space);
+        write_u32(dst, static_cast<uint32_t>(s.visibility));
+        if (sig.version == Version::V1_2) write_u32(dst, s.flags);
     }
     return out;
 }
@@ -372,10 +379,12 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
         }
         RootParameter p;
         p.visibility = static_cast<Visibility>(vis);
+        const size_t pbase = static_cast<size_t>(poff);
         if (dtype == 1) {
             p.type = ParamType::Constants;
-            if (!u32_at(poff, p.shader_register) || !u32_at(poff + 4, p.register_space) ||
-                !u32_at(poff + 8, p.num_values)) {
+            if (pbase > size || 12 > size - pbase ||
+                !u32_at(pbase, p.shader_register) || !u32_at(pbase + 4, p.register_space) ||
+                !u32_at(pbase + 8, p.num_values)) {
                 out.error = "truncated RTS0 constants payload";
                 return out;
             }
@@ -383,15 +392,15 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
             p.type = ParamType::Descriptor;
             uint32_t dflags = 0;
             const size_t need = flags_v11 ? 12 : 8;
-            if (poff > size || need > size - static_cast<size_t>(poff)) {
+            if (pbase > size || need > size - pbase) {
                 out.error = "truncated RTS0 descriptor payload";
                 return out;
             }
-            if (!u32_at(poff, p.descriptor_register) || !u32_at(poff + 4, p.descriptor_space)) {
+            if (!u32_at(pbase, p.descriptor_register) || !u32_at(pbase + 4, p.descriptor_space)) {
                 out.error = "truncated RTS0 descriptor payload";
                 return out;
             }
-            if (flags_v11 && !u32_at(poff + 8, dflags)) {
+            if (flags_v11 && !u32_at(pbase + 8, dflags)) {
                 out.error = "truncated RTS0 descriptor flags";
                 return out;
             }
@@ -401,7 +410,7 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
             // Table payload: {u32 num_ranges, u32 ranges_offset}; the ranges sit at ranges_offset (from the payload
             // start), like every other table in RTS0. Measured against the PC serializer (root_signature_oracle_test).
             uint32_t nranges = 0, ranges_off = 0;
-            if (!u32_at(poff, nranges) || !u32_at(static_cast<size_t>(poff) + 4, ranges_off)) {
+            if (pbase > size || 8 > size - pbase || !u32_at(pbase, nranges) || !u32_at(pbase + 4, ranges_off)) {
                 out.error = "truncated RTS0 table payload";
                 return out;
             }
@@ -483,7 +492,7 @@ DecodeResult parse_rts0(const uint8_t* data, size_t size) {
     // DXBC container walk (mirrors input_signature in tools/rdna2spirv.py):
     // +28: chunk count, +32: chunk offsets, each chunk is FourCC + u32 size.
     auto at = [&](size_t off, uint32_t& v) {
-        if (off + 4 > size) return false;
+        if (off > size || 4 > size - off) return false;
         v = static_cast<uint32_t>(data[off]) | (static_cast<uint32_t>(data[off + 1]) << 8) |
             (static_cast<uint32_t>(data[off + 2]) << 16) | (static_cast<uint32_t>(data[off + 3]) << 24);
         return true;
@@ -499,28 +508,26 @@ DecodeResult parse_rts0(const uint8_t* data, size_t size) {
     }
     for (uint32_t k = 0; k < nchunks; ++k) {
         uint32_t off = 0;
-        // NOTE: off and payload_size are u32; promote to size_t BEFORE adding
-        // or a hostile container wraps the check and turns it into an OOB read.
+        // Subtract against `size` rather than adding to `off` or `payload_size`, so a hostile container cannot wrap
+        // 32-bit or size_t arithmetic into an OOB read.
         if (!at(32 + 4 * static_cast<size_t>(k), off) ||
-            static_cast<size_t>(off) + 8 > size) {
+            static_cast<size_t>(off) > size || 8 > size - static_cast<size_t>(off)) {
             out.error = "truncated DXBC chunk table";
             return out;
         }
-        if (data[off] == 'R' && data[off + 1] == 'T' && data[off + 2] == 'S' && data[off + 3] == '0') {
-            uint32_t payload_size = 0;
-            if (static_cast<size_t>(off) + 8 > size) {
-                out.error = "truncated RTS0 chunk header";
-                return out;
-            }
-            payload_size = static_cast<uint32_t>(data[off + 4]) |
-                           (static_cast<uint32_t>(data[off + 5]) << 8) |
-                           (static_cast<uint32_t>(data[off + 6]) << 16) |
-                           (static_cast<uint32_t>(data[off + 7]) << 24);
-            if (static_cast<size_t>(off) + 8 + payload_size > size) {
+        const size_t chunk_off = static_cast<size_t>(off);
+        if (data[chunk_off] == 'R' && data[chunk_off + 1] == 'T' && data[chunk_off + 2] == 'S' &&
+            data[chunk_off + 3] == '0') {
+            const uint32_t payload_size =
+                static_cast<uint32_t>(data[chunk_off + 4]) |
+                (static_cast<uint32_t>(data[chunk_off + 5]) << 8) |
+                (static_cast<uint32_t>(data[chunk_off + 6]) << 16) |
+                (static_cast<uint32_t>(data[chunk_off + 7]) << 24);
+            if (static_cast<size_t>(payload_size) > size - chunk_off - 8) {
                 out.error = "RTS0 chunk overruns its container";
                 return out;
             }
-            return parse_rts0_payload(data + off + 8, payload_size);
+            return parse_rts0_payload(data + chunk_off + 8, payload_size);
         }
     }
     out.error = "no RTS0 chunk in DXBC container";

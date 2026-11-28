@@ -617,6 +617,73 @@ int main() {
         check(!pack_stage(many, Stage::Compute).ok, "pack_stage: more than 64 parameters rejected");
     }
 
+    // RTS0 32-bit offset-wrap hardening: poff near UINT32_MAX (0xFFFFFFFC / 0xFFFFFFF8) on constants, descriptors,
+    // and tables, plus hostile DXBC chunk offsets / chunk payload_size near UINT32_MAX must all fail cleanly.
+    {
+        for (const uint32_t dtype : {0u, 1u, 2u}) {
+            for (const uint32_t bad_poff : {0xFFFFFFFCu, 0xFFFFFFF8u, 0xFFFFFFFFu}) {
+                std::vector<uint8_t> p;
+                put_u32(p, 2);         // version 1.1
+                put_u32(p, 1);         // 1 param
+                put_u32(p, 24);        // params table offset
+                put_u32(p, 0);         // 0 samplers
+                put_u32(p, 0);         // samplers offset
+                put_u32(p, 0);         // flags
+                put_u32(p, dtype);     // param type
+                put_u32(p, 0);         // visibility
+                put_u32(p, bad_poff);  // wrapping payload offset
+                check(!parse_rts0(p.data(), p.size()).ok, "RTS0 wrapping parameter offset rejected");
+            }
+        }
+
+        // Hostile DXBC chunk offset (0xFFFFFFF8) and chunk payload_size (0xFFFFFFFF) must fail cleanly.
+        std::vector<uint8_t> dxbc_bad_off;
+        dxbc_bad_off.insert(dxbc_bad_off.end(), {'D', 'X', 'B', 'C'});
+        dxbc_bad_off.insert(dxbc_bad_off.end(), 16, 0);
+        put_u32(dxbc_bad_off, 1);
+        put_u32(dxbc_bad_off, 40);
+        put_u32(dxbc_bad_off, 1);
+        put_u32(dxbc_bad_off, 0xFFFFFFF8u);
+        check(!parse_rts0(dxbc_bad_off.data(), dxbc_bad_off.size()).ok, "DXBC wrapping chunk offset rejected");
+
+        std::vector<uint8_t> dxbc_bad_len;
+        dxbc_bad_len.insert(dxbc_bad_len.end(), {'D', 'X', 'B', 'C'});
+        dxbc_bad_len.insert(dxbc_bad_len.end(), 16, 0);
+        put_u32(dxbc_bad_len, 1);
+        put_u32(dxbc_bad_len, 44);
+        put_u32(dxbc_bad_len, 1);
+        put_u32(dxbc_bad_len, 36);
+        dxbc_bad_len.insert(dxbc_bad_len.end(), {'R', 'T', 'S', '0'});
+        put_u32(dxbc_bad_len, 0xFFFFFFFFu);
+        check(!parse_rts0(dxbc_bad_len.data(), dxbc_bad_len.size()).ok, "DXBC wrapping RTS0 payload_size rejected");
+
+        // Pre-sized encode_canonical exact-size round-trip with many params, ranges, and V1_2 samplers.
+        RootSignature rich;
+        rich.version = Version::V1_2;
+        rich.flags = 0x12345678u;
+        for (uint32_t i = 0; i < 8; ++i) {
+            RootParameter tp = table();
+            tp.visibility = Visibility::All;
+            tp.ranges.push_back({1, 4, i, i + 1, 8, 16 + i});
+            rich.params.push_back(std::move(tp));
+        }
+        rich.params.push_back(consts(4));
+        rich.params.push_back(view());
+        for (uint32_t i = 0; i < 6; ++i) {
+            StaticSampler s;
+            s.shader_register = i;
+            s.mip_lod_bias = -0.25f * static_cast<float>(i);
+            s.flags = i & 3u;
+            rich.static_samplers.push_back(s);
+        }
+        const std::vector<uint8_t> enc = encode_canonical(rich);
+        const DecodeResult dec = decode_canonical(enc.data(), enc.size());
+        check(dec.ok && dec.sig.version == Version::V1_2 && dec.sig.flags == 0x12345678u &&
+                  dec.sig.params.size() == 10 && dec.sig.params[7].ranges.size() == 2 &&
+                  dec.sig.static_samplers.size() == 6 && dec.sig.static_samplers[5].flags == 1,
+              "pre-sized encode_canonical round-trips rich V1_2 signature");
+    }
+
     if (g_failures != 0) std::printf("%d FAILURES\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }
