@@ -214,6 +214,7 @@ int main() {
         return 77;
     }
     EXPECT(device_status == vktest::DeviceStatus::ready);
+    if (d.below_shader_push_constant_contract("d3d12_depth24_draw_test")) return 77;
     bool native = true;
     {
         const auto props = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(

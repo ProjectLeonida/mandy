@@ -541,6 +541,7 @@ int main() {
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
+    if (d.below_shader_push_constant_contract("d3d12_subgroup_test")) return 77;
     const leonida::SubgroupSizeCaps& caps = d.subgroup;
     leonida::SubgroupSizeCaps off = caps;  // the control: the layer knows nothing of the device's sizes
     off.min_size = off.max_size = off.default_size = 0;

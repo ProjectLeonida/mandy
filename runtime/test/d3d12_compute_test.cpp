@@ -254,6 +254,7 @@ int main() {
         return 77;
     }
     EXPECT(device_status == vktest::DeviceStatus::ready);
+    if (d.below_shader_push_constant_contract("d3d12_compute_test")) return 77;
 
     // The shader program the PSO carries, and a translator index that maps its hash to the test module.
     constexpr std::uint32_t code_word = 5000;

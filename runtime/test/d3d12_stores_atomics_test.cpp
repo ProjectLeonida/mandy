@@ -155,6 +155,7 @@ int main() {
             return 77;
         }
         EXPECT(status == vktest::DeviceStatus::ready);
+        if (d.below_shader_push_constant_contract("d3d12_stores_atomics_test")) return 77;
         if (!d.bindless) {
             std::printf("SKIP: the device lacks the descriptor indexing features of the bindless set 0\n");
             return 77;

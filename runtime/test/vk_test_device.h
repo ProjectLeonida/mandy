@@ -150,6 +150,8 @@ public:
     bool null_descriptor = false;          // VK_EXT_robustness2 and nullDescriptor are enabled
     // VK_EXT_external_memory_host is enabled when non-zero: its minImportedHostPointerAlignment.
     VkDeviceSize host_pointer_alignment = 0;
+    // The chosen device's maxPushConstantsSize, known after initialize(); 0 before it.
+    std::uint32_t max_push_constants_size = 0;
 
     Device() = default;
     Device(const Device&) = delete;
@@ -194,6 +196,18 @@ public:
     unsigned validation_errors() const { return validation_error_count(); }
     unsigned known_validation_errors() const { return known_validation_error_count(); }
     bool pipeline_cache_control_enabled() const { return v13_.core && v13_.pipeline_creation_cache_control; }
+
+    // The translated shaders' push-constant block is 144 bytes (ShaderUserData in src/vulkan_replay.h). A device
+    // below that cannot run a module built to the contract: the D3D12 layer refuses every pipeline with E_NOTIMPL
+    // (PipelineState::push_constants_fit; the uniform-buffer tail of #224 is not built), so a test that builds
+    // PSOs cannot pass there. Prints the skip line naming `test` and returns true below the contract size, the
+    // same condition rt::d3d12::device_push_constants_need_fallback reports on the created device.
+    bool below_shader_push_constant_contract(const char* test) const {
+        if (!physical || max_push_constants_size >= 144) return false;
+        std::printf("%s: skipped, the shaders' push-constant block needs 144 bytes and this GPU has %u\n", test,
+                    max_push_constants_size);
+        return true;
+    }
 
     // presentation: also enable VK_KHR_surface + VK_KHR_win32_surface and VK_KHR_swapchain (Windows only).
     bool create(bool presentation = false) { return initialize(presentation) == DeviceStatus::ready; }
@@ -368,6 +382,7 @@ private:
         }
         std::printf("device: %s%s%s\n", chosen.deviceName, v13_.core ? "" : " (Vulkan 1.2 + KHR extensions)",
                     validation ? " (validation on)" : "");
+        max_push_constants_size = chosen.limits.maxPushConstantsSize;
 
         VkPhysicalDeviceVulkan13Features features13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,

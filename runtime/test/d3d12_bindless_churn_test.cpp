@@ -395,6 +395,7 @@ int main(int argc, char** argv) {
         return 77;
     }
     if (device_status != vktest::DeviceStatus::ready) return 1;
+    if (d.below_shader_push_constant_contract("d3d12_bindless_churn_test")) return 77;
     if (!d.bindless) {
         std::printf("SKIP: the device lacks the descriptor indexing features of the bindless set 0\n");
         return 77;

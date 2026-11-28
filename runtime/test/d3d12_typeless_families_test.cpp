@@ -243,6 +243,7 @@ int main() {
     if (status == vktest::DeviceStatus::unavailable) return 77;
     if (status != vktest::DeviceStatus::ready) return 1;
     if (hostwine::host_is_wine()) return 77;  // the host D3D12 runtime is the reference
+    if (vk.below_shader_push_constant_contract("d3d12_typeless_families_test")) return 77;
     rt::d3d12::VulkanDeviceInfo info{};
     info.get_instance_proc = vk.instance_proc;
     info.instance = vk.instance;

@@ -221,6 +221,7 @@ int main(int argc, char** argv) {
     if (status == vktest::DeviceStatus::unavailable) return 77;
     if (status != vktest::DeviceStatus::ready) return 1;
     if (!vk.buffer_device_address) return 77;
+    if (vk.below_shader_push_constant_contract("d3d12_indirect_dispatch_count_test")) return 77;
     std::vector<std::uint8_t> program = fssm_program({0x1100u, 0x44u, 0x55u, 0x66u, 0x77u, 0x88u});
     for (UINT i = 0; i < 12; ++i) put32(program, 0xbf810000 + i);
     const auto container = shader_container(program);

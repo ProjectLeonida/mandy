@@ -574,6 +574,13 @@ int main() {
     Ref<ID3D12Device> ours, host;
     std::string adapter;
     if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
+    // Every case's PSO needs the 144 push-constant bytes the index declares; on a smaller limit they all fail and
+    // each would count as a per-case skip, leaving a silent pass that compared nothing.
+    if (rt::d3d12::device_push_constants_need_fallback(ours.p)) {
+        std::printf("d3d12_state_sweep_test: skipped, the PSOs need 144 push-constant bytes and this GPU has %u\n",
+                    rt::d3d12::device_max_push_constants_size(ours.p));
+        return 77;
+    }
     if (!host_device(vk, host, adapter)) {
         std::fprintf(stderr, "no host D3D12 device on the Vulkan device's adapter\n");
         return 77;

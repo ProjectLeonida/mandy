@@ -112,6 +112,7 @@ int main(int argc, char** argv) {
         return 77;
     }
     EXPECT(device_status == vktest::DeviceStatus::ready);
+    if (d.below_shader_push_constant_contract("d3d12_mesh_test")) return 77;
 
     const auto ms_program = fssm_program({0x4d530001, 0xbf810000});
     // The same mesh shader listed without "root_window": one translated before the graphics root window (D3D-448).
