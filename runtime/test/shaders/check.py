@@ -994,6 +994,13 @@ STORE_WORDS = {
     "cs_resinfo": ({**dict(enumerate([16, 4, 0, 5, 8, 2, 0, 5, 2, 1, 0, 5, 4, 1, 0xABCD])), 16: 2, 17: 5, 18: 5,
                     20: 0, 21: 0, 22: 0, 23: 5},
                    {}, {}),
+    # TFE leaves both seeded status words intact. D16 updates only the low half of its single data word.
+    "cs_image_tfe_dense": ({}, dict(enumerate([
+        0, 100, 101, 102, 0, 0, 0, 0,
+        *[0x5A5A03F5] * 8,
+        0x5A5A0000, 0x5A5A0064, 0x5A5A0065, 0x5A5A0066, *[0x5A5A0000] * 4,
+        *[0x5A5A03F6] * 8,
+    ])), {}),
 }
 # TEST-184: image_get_lod on vk_texture_test's textures. Per fixture, its draws: S# word 1 (MIN_LOD [11:0], MAX_LOD
 # [23:12], 4.8 fixed point), whether the two-mip texture is drawn, and mrt0, as derived in the .asm header:
