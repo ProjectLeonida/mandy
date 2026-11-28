@@ -814,7 +814,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             with mock.patch.object(make_game, "ROOT", tmp), \
                  mock.patch("shutil.which", return_value=None):
                 self.assert_fails(make_game.ensure_submodule,
-                                  match="git clone --recursive https://github.com/ubiquitarianism/leonida")
+                                  match="git clone --recursive https://github.com/ProjectLeonida/mandy")
 
     def test_ensure_submodule_zip_with_git_does_not_say_install_git(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -823,7 +823,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                  mock.patch("shutil.which", return_value="/usr/bin/git"), \
                  mock.patch("subprocess.run", return_value=not_a_repo):
                 err = self.assert_fails(make_game.ensure_submodule,
-                                        match="git clone --recursive https://github.com/ubiquitarianism/leonida")
+                                        match="git clone --recursive https://github.com/ProjectLeonida/mandy")
                 self.assertNotIn("Install Git", err)
 
     def test_ensure_submodule_names_the_clone_command_the_readme_gives(self):
