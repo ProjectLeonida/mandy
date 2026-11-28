@@ -113,7 +113,7 @@ class DsPermuteProbeTests(unittest.TestCase):
     def test_write_json_report_and_main_catch_oserror_cleanly(self):
         with tempfile.TemporaryDirectory() as tmp:
             out_path = os.path.join(tmp, "out.json")
-            with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+            with mock.patch.object(ds_permute_probe.tempfile, "NamedTemporaryFile", side_effect=PermissionError("denied")):
                 err = ds_permute_probe.write_json_report(out_path, {"ok": True})
             self.assertIsNotNone(err)
             self.assertIn("cannot write --json", err)
@@ -124,13 +124,27 @@ class DsPermuteProbeTests(unittest.TestCase):
             with mock.patch.dict(sys.modules, {"hw_oracle": pkg, "hw_oracle.asm": asm_mod,
                                                "hw_oracle.runner": runner_mod}), \
                  mock.patch.object(ds_permute_probe, "probe_wave", return_value=fake_probe), \
-                 mock.patch("builtins.open", side_effect=OSError("disk full")):
+                 mock.patch.object(ds_permute_probe.tempfile, "NamedTemporaryFile", side_effect=OSError("disk full")):
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
                     rc = ds_permute_probe.main(["--waves", "32", "--json", out_path])
             self.assertEqual(rc, 1)
             self.assertIn("error:", stderr.getvalue())
             self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_atomic_json_write_and_replace_failure_preserves_existing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "report.json")
+            self.assertIsNone(ds_permute_probe.write_json_report(out, {"ok": True}))
+            self.assertEqual(os.listdir(tmp), ["report.json"])
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"keep": true}\n')
+            with mock.patch.object(ds_permute_probe.os, "replace", side_effect=OSError("replace denied")):
+                err = ds_permute_probe.write_json_report(out, {"ok": False})
+            self.assertIsNotNone(err)
+            self.assertEqual(os.listdir(tmp), ["report.json"])
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"keep": true}\n')
 
 
 if __name__ == "__main__":
