@@ -19,9 +19,14 @@
 //      (forget_copy); its destroyed block leaves the lock-free block list and is reported to the device;
 //  14. LEONIDA_GEOMETRY_HOST picks a system-memory type (write-back for 1, write-combined for 2), never the BAR;
 //  15. a retired view is copied once more from its pages when they are readable, not when they are not;
-//  16. a full release queue joins touching ranges before it collapses to one covering range.
+//  16. a full release queue joins touching ranges before it collapses to one covering range;
+//  17. a range inside a live view is answered from that view (its address plus the offset), not copied again; it is
+//      refreshed with that view and leaves with it, and a view it was inside before keeps answering after the outer
+//      one goes; a retired view with a range inside it the release did not touch also waits for the command lists
+//      recorded before (LEONIDA_GEOMETRY_CONTAINED=0, a copy of its own as before, fails 17).
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -31,6 +36,7 @@
 #include <vector>
 
 #include "../shims/d3d12_geometry_views.h"
+#include "../src/command_list_epochs.h"
 #include "../src/title_va_alias.h"
 
 namespace {
@@ -618,6 +624,94 @@ int main() {
               "65536 touching ranges become one, and a range apart from them stays apart");
         coalesce.release(device);
         VirtualFree(host_title, 0, MEM_RELEASE);
+    }
+
+    // 17. Ranges inside a live view: (A, 128 KiB), then (A, 64 KiB) and (A + 4 KiB, 64 KiB), are 132 KiB of the
+    // title's bytes. Each with a copy of its own they were three views and 256 KiB of copies; the two inside the first
+    // are its bytes at their offsets, so one view of 128 KiB. Asked for smallest first, (B, 64 KiB) is no view's bytes
+    // yet and (B, 128 KiB) is not inside it: two views, and (B + 4 KiB, 64 KiB) is inside the second.
+    {
+        auto* nest_title =
+            static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 8 * kTile, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!nest_title) return 1;
+        for (std::size_t i = 0; i < 8 * kTile; ++i) nest_title[i] = std::uint8_t((i * 11) ^ 0x6e);
+        const auto a = reinterpret_cast<std::uintptr_t>(nest_title);
+        const auto b = a + 4 * kTile;
+        rt::d3d12::GeometryViews nest;
+        const auto host_of = [&](std::uint64_t at) -> const std::uint8_t* {
+            std::uint64_t host = 0, room = 0;
+            return at && nest.lookup(device.arena.address + at, host, room) ? reinterpret_cast<const std::uint8_t*>(host)
+                                                                            : nullptr;
+        };
+        const std::uint64_t outer = nest.resolve(device, a, 2 * kTile, copy);
+        const std::uint64_t head = nest.resolve(device, a, kTile, copy);
+        const std::uint64_t inner = nest.resolve(device, a + 4096, kTile, copy);
+        check(outer != 0 && head == outer && inner == outer + 4096 && nest.live_views() == 1 &&
+                  nest.bytes() == 2 * kTile,
+              "two ranges inside a live 128 KiB view are its bytes at their offsets: one view, 128 KiB");
+        check(nest.resolve(device, a + 4096, kTile, copy) == inner && nest.find(a + 4096, kTile) == inner &&
+                  nest.find(a, kTile) == head && host_of(inner) && !std::memcmp(host_of(inner), nest_title + 4096, kTile),
+              "asked again or found, the inner range has the same address, which holds the title's bytes");
+        title_write(a + 4096 + 77, 0xe1);
+        nest.refresh(copy);
+        check(host_of(inner) && host_of(inner)[77] == 0xe1, "a write inside the inner range reaches it with the view");
+
+        const std::uint64_t small = nest.resolve(device, b, kTile, copy);
+        const std::uint64_t large = nest.resolve(device, b, 2 * kTile, copy);
+        const std::uint64_t inside = nest.resolve(device, b + 4096, kTile, copy);
+        check(small != 0 && large != 0 && large != small && inside == large + 4096 && nest.live_views() == 3 &&
+                  nest.bytes() == 5 * kTile,
+              "smallest first: (B, 64 KiB) and (B, 128 KiB) are two views, (B + 4 KiB, 64 KiB) is inside the second");
+
+        // Retiring a range at the outer view's tail, which neither inner range touches, retires them with it: they
+        // were its bytes. Each is told by the address it was answered with.
+        std::vector<std::pair<std::uintptr_t, VkDeviceSize>> told;
+        const auto tell = [&](std::uintptr_t source, std::size_t, VkDeviceSize at) { told.emplace_back(source, at); };
+        const std::size_t retired = nest.retire_range(a + 100 * 1024, a + 104 * 1024, 1, tell);
+        const auto was_told = [&](std::uintptr_t source, VkDeviceSize at) {
+            return std::find(told.begin(), told.end(), std::make_pair(source, at)) != told.end();
+        };
+        check(retired == 1 && told.size() == 3 && was_told(a, outer) && was_told(a, head) &&
+                  was_told(a + 4096, inner) && nest.live_views() == 2,
+              "retiring the outer view retires the ranges inside it, each told with its own address");
+        check(nest.find(a, kTile) == 0 && nest.find(a + 4096, kTile) == 0 && nest.find(a, 2 * kTile) == 0,
+              "no range inside the retired view is found any more");
+        check(nest.reap(device, 1) == 1 && nest.bytes() == 3 * kTile, "the outer view's 128 KiB are freed once");
+        const std::uint64_t again = nest.resolve(device, a + 4096, kTile, copy);
+        check(again != 0 && nest.live_views() == 3 && nest.bytes() == 4 * kTile && host_of(again) &&
+                  !std::memcmp(host_of(again), nest_title + 4096, kTile),
+              "asked for after its view went, the inner range gets a view of its own with the title's bytes");
+
+        // The view (B, 128 KiB) goes by its tail; (B, 64 KiB), which it held inside, answers what is inside it again.
+        told.clear();
+        check(nest.retire_range(b + 100 * 1024, b + 104 * 1024, 2, tell) == 1 && told.size() == 2 &&
+                  was_told(b, large) && was_told(b + 4096, large + 4096) && nest.find(b, kTile) == small,
+              "the outer view of B retires with its inner range; the smaller view of B stays");
+        const std::uint64_t quarter = nest.resolve(device, b + 8192, kTile / 4, copy);
+        check(nest.reap(device, 2) == 1 && quarter == small + 8192 && nest.live_views() == 2,
+              "a range inside the smaller view of B is answered from it once the larger one has gone (and is freed)");
+
+        // A command list recorded before a retirement (its command_list_epochs stamp) may name a range inside the
+        // retired view that the release did not touch, which is still the title's: that view's memory waits for the
+        // list as well as for the replays. A view with nothing inside it, retired in the same replay, does not.
+        const auto c = a + 6 * kTile;
+        const std::uint64_t outer_c = nest.resolve(device, c, 2 * kTile, copy);
+        check(outer_c != 0 && nest.resolve(device, c + 4096, kTile, copy) == outer_c + 4096,
+              "a third outer view with a range inside it");
+        auto list = std::make_unique<leonida::command_list_epochs::Stamp>();
+        const std::uint64_t replay = nest.execute_begin();
+        nest.retire_range(c + 100 * 1024, c + 104 * 1024, rt::d3d12::GeometryViews::kAfterExecutes);
+        nest.retire_range(a + 4096, a + 8192, rt::d3d12::GeometryViews::kAfterExecutes);  // `again`: nothing inside
+        nest.execute_end(replay, [] { return std::uint64_t(3); });
+        check(nest.reap(device, 3) == 1 && nest.retired_count() == 1,
+              "while a list recorded before the retirement lives, only the view with nothing inside it is freed");
+        list.reset();
+        const std::uint64_t next = nest.execute_begin();
+        nest.execute_end(next, [] { return std::uint64_t(4); });
+        check(nest.reap(device, 3) == 0 && nest.reap(device, 4) == 1 && nest.retired_count() == 0,
+              "once that list is gone, the outer view waits only for the next replay's submissions");
+        nest.release(device);
+        VirtualFree(nest_title, 0, MEM_RELEASE);
     }
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

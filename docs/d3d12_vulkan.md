@@ -1780,7 +1780,9 @@ The copies:
   whole gets a copy of its whole range, so the BVH builder's commands are recorded.
 - `LEONIDA_GEOMETRY_MB` sets the device-local memory cap for streamed buffer views. The default is 0.
   A positive cap enables persistent copies of placed buffer SRVs and buffer descriptors in title memory.
-  A GPU-only reservation uses its paired CPU mapping. Matching source ranges share one copy.
+  A GPU-only reservation uses its paired CPU mapping. Matching source ranges share one copy, and a range inside a
+  live, filled copy is answered from that copy at its offset instead of being copied again
+  (`LEONIDA_GEOMETRY_CONTAINED=0`: a copy of its own, as before).
   The resource descriptor heap keeps its console indices and original CPU bytes. Its shader-visible copy
   encodes each resolved buffer's offset from the arena base. CPU writes through either physical mapping,
   file reads and XMem remaps invalidate the affected copies before their next submission.
@@ -1799,8 +1801,10 @@ The copies:
     extent is forgotten, and its memory is freed only after every ExecuteCommandLists replay in progress at the
     retirement has recorded its submissions and those have completed (`kAfterExecutes`). Before it leaves the
     refresh it is copied once more from its pages if they are still readable (a heap block freed in memory that
-    stays committed). The next view of the range makes a new copy.
-    `geometry_views_test` cases 14-16 cover this without a GPU.
+    stays committed). The ranges answered from inside it go with it, each invalidated by its own address; when the
+    release did not touch one of them, the view's memory also waits until no command list recorded before the
+    retirement is left, as a retired title window's does. The next view of the range makes a new copy.
+    `geometry_views_test` cases 14-17 cover this without a GPU.
 - **Which pages changed** since the last refresh: where xmem reserved the title's memory with `MEM_WRITE_WATCH`
   (`XMemVirtualAlloc`'s ordinary regions and the title's `VirtualAlloc` reservations, not placeholders or
   physical-page windows), the kernel says (`GetWriteWatch` with reset, its answers kept for every copy over the page:
