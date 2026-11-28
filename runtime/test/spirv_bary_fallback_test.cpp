@@ -710,13 +710,16 @@ int main(int argc, char** argv) {
 
     // 7i. BaryFallbackGsInfo counts computed-I/J blocks (#1497's geometry-limit precheck): the GS Input of an
     //     attribute only a block reads, and the block's three output Locations (12 components), forwarded or
-    //     zero-filled. Attribute 16 with its block at 14..16 needs 68/68, above a 64-component device; attribute 15
-    //     with its block at 13..15 is the 64/64 edge. (Found by @ecox982745, confirmed on a Vega 20 by @zmasi.)
+    //     zero-filled. Attribute 16 with its block at 14..16 needs 68/68, above a 64-component device. The
+    //     validation layer adds the 4 Position components (and Clip/CullDistance) to the Location end, so attribute
+    //     15 with its block at 13..15 (end 64) is above it too, and attribute 14 at 12..14 (end 60 + 4) is the edge.
+    //     (Found by @ecox982745 and @zmasi, the built-ins on a Vega 20 by @zmasi.)
     {
         // ok is false when the builder refused or its module did not parse.
-        const auto footprint = [&](std::uint32_t attr, std::uint32_t base, bool exported) {
+        const auto footprint = [&](std::uint32_t attr, std::uint32_t base, bool exported, std::uint32_t clip = 0) {
             const auto vs = build_vs({.raw_locs = exported ? std::vector<std::uint32_t>{attr}
-                                                           : std::vector<std::uint32_t>{}});
+                                                           : std::vector<std::uint32_t>{},
+                                      .clip_count = clip});
             const auto ps = build_ps({}, {}, 3, {}, {base});
             std::vector<std::uint32_t> gs;
             BaryFallbackGsInfo info{};
@@ -734,10 +737,23 @@ int main(int argc, char** argv) {
                   info.max_input_location_components == 68);
             CHECK(info.output_components == 4 + 3 + 12);
             CHECK(info.max_output_location == 16 && info.max_output_location_components == 68);
+            CHECK(info.builtin_components == 4);
         }
         {
             const auto [ok, info, ins] = footprint(15, 13, true);
             CHECK(ok && info.max_input_location_components == 64 && info.max_output_location_components == 64);
+            CHECK(info.max_input_location_components + info.builtin_components == 68);
+        }
+        {
+            const auto [ok, info, ins] = footprint(14, 12, true);
+            CHECK(ok && info.max_input_location_components + info.builtin_components == 64);
+            CHECK(info.max_output_location_components + info.builtin_components == 64);
+        }
+        {
+            // A forwarded ClipDistance[2] adds its components to the built-ins on both sides.
+            const auto [ok, info, ins] = footprint(14, 12, true, 2);
+            CHECK(ok && info.clip_count == 2 && info.builtin_components == 6);
+            CHECK(info.max_input_location_components + info.builtin_components == 66);
         }
         {
             // Zero-filled: no GS Input, but the block's Locations still count on the output side.

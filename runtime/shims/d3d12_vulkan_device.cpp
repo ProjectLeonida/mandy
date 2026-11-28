@@ -12738,15 +12738,18 @@ public:
             }
             const char* vs_name = vs_stage.entry ? vs_stage.entry->name.c_str() : "<vs>";
             const char* ps_name = ps_stage.entry ? ps_stage.entry->name.c_str() : "<ps>";
+            // The validation layer counts the built-ins (Position, Clip/CullDistance) on top of the Location end.
+            const std::uint32_t in_end = bary_info.max_input_location_components + bary_info.builtin_components;
+            const std::uint32_t out_end = bary_info.max_output_location_components + bary_info.builtin_components;
             const std::uint32_t max_gs_in = device_.max_geometry_input_components;
-            if (max_gs_in && (bary_info.max_input_location_components > max_gs_in ||
-                              bary_info.input_components > max_gs_in)) {
-                if (bary_info.max_input_location_components > max_gs_in) {
+            if (max_gs_in && (in_end > max_gs_in || bary_info.input_components > max_gs_in)) {
+                if (in_end > max_gs_in) {
                     std::fprintf(stderr,
                                  "[rt] d3d12: --bary-fallback geometry stage for %s + %s reads Location %u "
-                                 "(component end %u > maxGeometryInputComponents %u); refusing pipeline\n",
+                                 "(component end %u + %u built-in > maxGeometryInputComponents %u); refusing "
+                                 "pipeline\n",
                                  vs_name, ps_name, bary_info.max_input_location,
-                                 bary_info.max_input_location_components, max_gs_in);
+                                 bary_info.max_input_location_components, bary_info.builtin_components, max_gs_in);
                 } else {
                     std::fprintf(stderr,
                                  "[rt] d3d12: --bary-fallback geometry stage for %s + %s uses %u input components "
@@ -12756,14 +12759,14 @@ public:
                 return stream_unsupported("--bary-fallback geometry stage exceeds maxGeometryInputComponents");
             }
             const std::uint32_t max_gs_out = device_.max_geometry_output_components;
-            if (max_gs_out && (bary_info.max_output_location_components > max_gs_out ||
-                               bary_info.output_components > max_gs_out)) {
-                if (bary_info.max_output_location_components > max_gs_out) {
+            if (max_gs_out && (out_end > max_gs_out || bary_info.output_components > max_gs_out)) {
+                if (out_end > max_gs_out) {
                     std::fprintf(stderr,
                                  "[rt] d3d12: --bary-fallback geometry stage for %s + %s writes Location %u "
-                                 "(component end %u > maxGeometryOutputComponents %u); refusing pipeline\n",
+                                 "(component end %u + %u built-in > maxGeometryOutputComponents %u); refusing "
+                                 "pipeline\n",
                                  vs_name, ps_name, bary_info.max_output_location,
-                                 bary_info.max_output_location_components, max_gs_out);
+                                 bary_info.max_output_location_components, bary_info.builtin_components, max_gs_out);
                 } else {
                     std::fprintf(stderr,
                                  "[rt] d3d12: --bary-fallback geometry stage for %s + %s uses %u output components "

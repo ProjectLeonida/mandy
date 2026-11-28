@@ -43,18 +43,22 @@ struct BaryFallbackGsInfo {
     // Per-vertex scalar input components declared by the GS (4 for Position + dist_count + 4 per user Input
     // Location, including a VS attribute read only by a computed-I/J block).
     std::uint32_t input_components = 0;
-    // Highest `4 * Location + 4` across GS Input locations (0 when no user locations are forwarded);
-    // Vulkan VUID-RuntimeSpirv-Location-06272 requires this <= limits.maxGeometryInputComponents.
+    // Highest `4 * Location + 4` across GS Input locations (0 when no user locations are forwarded).
+    // With builtin_components, checked against limits.maxGeometryInputComponents (VUID-RuntimeSpirv-Location-06272).
     std::uint32_t max_input_location = 0;
     std::uint32_t max_input_location_components = 0;
     // Per-vertex scalar output components declared by the GS (4 for Position + dist_count + 4 * pass_locs + 3,
     // and 12 for each computed-I/J vec4[3]).
     std::uint32_t output_components = 0;
     // Highest `4 * Location + components` across GS Output locations (`pass_locs` vec4, `bary_location` vec3 and
-    // the last Location of each computed-I/J block);
-    // Vulkan VUID-RuntimeSpirv-Location-06272 requires this <= limits.maxGeometryOutputComponents.
+    // the last Location of each computed-I/J block).
+    // With builtin_components, checked against limits.maxGeometryOutputComponents (VUID-RuntimeSpirv-Location-06272).
     std::uint32_t max_output_location = 0;
     std::uint32_t max_output_location_components = 0;
+    // Built-in components on each side of the GS (4 for Position + dist_count). The Khronos validation layer adds
+    // them to the Location end above when it checks VUID-RuntimeSpirv-Location-06272, so a stage is within the
+    // limit when max_*_location_components + builtin_components <= the limit.
+    std::uint32_t builtin_components = 0;
 };
 
 // `per_vertex` is the index entry's `bary_fallback_input.per_vertex` (`ShaderEntry::bary_fallback_per_vertex`):
@@ -625,6 +629,7 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
         BaryFallbackGsInfo info{};
         info.clip_count = clip_count;
         info.cull_count = cull_count;
+        info.builtin_components = 4u + dist_count;
         // Inputs: every GS Input the module declares (id_in_loc), which includes a VS attribute only a computed-I/J
         // block reads and counts an input both an ordinary output and a block read once.
         info.input_components = 4u + dist_count + 4u * std::uint32_t(id_in_loc.size());
