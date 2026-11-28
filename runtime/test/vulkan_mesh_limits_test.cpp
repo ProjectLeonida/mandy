@@ -77,5 +77,25 @@ int main() {
     EXPECT(!mesh_limit_refusal(many, limits).empty());
     many.local_size = {64, 4, 1};  // 256 invocations over the 128 allowed
     EXPECT(!mesh_limit_refusal(many, limits).empty());
+    // Exact 3D invocation boundary and 64-bit product overflow guard (n[0] * n[1] * n[2] == 2^64 wraps to 0).
+    many.local_size = {16, 4, 2};  // 128 == 128
+    EXPECT(mesh_limit_refusal(many, limits).empty());
+    many.local_size = {16, 4, 3};  // 192 > 128
+    EXPECT(!mesh_limit_refusal(many, limits).empty());
+    auto wide = limits;
+    wide.maxMeshWorkGroupSize[0] = wide.maxMeshWorkGroupSize[1] = wide.maxMeshWorkGroupSize[2] = 0xffffffffu;
+    wide.maxMeshWorkGroupInvocations = 1024;
+    many.local_size = {1u << 24, 1u << 24, 1u << 16};  // product is 2^64 (wraps to 0 in uint64_t)
+    EXPECT(!mesh_limit_refusal(many, wide).empty());
+    many.local_size = {1u << 22, 1u << 22, 1u << 22};  // product is 2^66 (wraps to 0 in uint64_t)
+    EXPECT(!mesh_limit_refusal(many, wide).empty());
+    wide.maxMeshWorkGroupInvocations = 0xffffffffu;
+    many.local_size = {0xffffffffu, 1, 1};
+    EXPECT(mesh_limit_refusal(many, wide).empty());
+    many.local_size = {0xffffffffu, 2, 1};
+    EXPECT(!mesh_limit_refusal(many, wide).empty());
+    wide.maxMeshWorkGroupInvocations = 0;
+    many.local_size = {1, 1, 1};
+    EXPECT(!mesh_limit_refusal(many, wide).empty());
     return 0;
 }

@@ -25,11 +25,14 @@ namespace leonida {
 //     A limit of 0 means the properties were not read; the memory is not refused on a number nobody gave.
 inline std::string mesh_limit_refusal(const ShaderEntry& entry, const VkPhysicalDeviceMeshShaderPropertiesEXT& limits) {
     const auto& n = entry.local_size;
+    const std::uint64_t xy = std::uint64_t(n[0]) * n[1];
+    const bool invocations_exceed =
+        n[2] != 0 && (xy > limits.maxMeshWorkGroupInvocations ||
+                      (xy != 0 && n[2] > limits.maxMeshWorkGroupInvocations / xy));
     char text[384];
     if (entry.max_vertices > limits.maxMeshOutputVertices || entry.max_primitives > limits.maxMeshOutputPrimitives ||
         n[0] > limits.maxMeshWorkGroupSize[0] || n[1] > limits.maxMeshWorkGroupSize[1] ||
-        n[2] > limits.maxMeshWorkGroupSize[2] ||
-        std::uint64_t(n[0]) * n[1] * n[2] > limits.maxMeshWorkGroupInvocations) {
+        n[2] > limits.maxMeshWorkGroupSize[2] || invocations_exceed) {
         std::snprintf(text, sizeof text,
                       "%s needs %u vertices, %u primitives, %ux%ux%u threads; the device allows %u, %u, %u invocations",
                       entry.name.c_str(), entry.max_vertices, entry.max_primitives, n[0], n[1], n[2],
