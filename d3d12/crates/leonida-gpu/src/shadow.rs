@@ -3733,6 +3733,9 @@ pub(crate) fn let_go_idle() {
     // The snapshot buffers no snapshot took for that long go too, whether
     // or not there are windows.
     let_go_idle_snapshots(idle_ms);
+    // The spare buffers of copies of views' own bytes that no copy took for
+    // that long go too, whether or not there are windows.
+    let_go_idle_spares(idle_ms);
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -6604,17 +6607,27 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // frame): making a buffer and letting one go are a call into the kernel
     // each, and were most of what these threads ran.
     let width = len.next_multiple_of(256);
-    let spare = {
+    // The copies let go are dropped here, before the spare list's lock is
+    // taken; their buffers live on in `let_go` (placed copies have none of
+    // their own).
+    let let_go: Vec<(u64, ID3D12Resource, usize)> = gone
+        .into_iter()
+        .filter(|shadow| shadow.place.is_none())
+        .map(|shadow| (shadow.width(), shadow.buffer.clone(), shadow.data as usize))
+        .collect();
+    let (spare, unparked) = {
         let mut spare = EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        for shadow in gone.drain(..) {
-            if spare.len() < SPARE_MOST && shadow.place.is_none() {
-                spare.push((shadow.width(), shadow.buffer.clone(), shadow.data as usize));
-            }
-        }
-        spare.iter().position(|(w, ..)| *w == width).map(|i| spare.swap_remove(i))
+        let unparked = if let_go.is_empty() { Vec::new() } else { park(&mut spare, let_go, crate::host::coarse_ms()) };
+        (spare.iter().position(|(w, ..)| *w == width).map(|i| spare.swap_remove(i)), unparked)
     };
+    // Released after the lock, which the eight threads that translate lists
+    // queue on: a buffer is up to 64 MiB of committed memory. As idle spares
+    // and windows do, they go through `retire_resource`.
+    for buffer in unparked {
+        crate::host::retire_resource(buffer);
+    }
     let (buffer, data) = match spare {
-        Some((_, buffer, data)) => (buffer, data as *mut u8),
+        Some((_, buffer, data, _)) => (buffer, data as *mut u8),
         None => host()?.shared_buffer(width)?,
     };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
@@ -6635,11 +6648,76 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
-/// Leonida: buffers of copies [`exact`] let go, with their widths and where
-/// they are mapped, for its next copies of the same width.
-static EXACT_SPARE: Mutex<Vec<(u64, ID3D12Resource, usize)>> = Mutex::new(Vec::new());
-/// At most so many are kept (what comes after goes, as before).
+/// Leonida: buffers of copies [`exact`] let go, for its next copies of the
+/// same width.
+static EXACT_SPARE: Mutex<Vec<Spare<ID3D12Resource>>> = Mutex::new(Vec::new());
+/// A spare buffer: its width, the buffer, where it is mapped, and when it
+/// was parked ([`crate::host::coarse_ms`]).
+type Spare<B> = (u64, B, usize, u64);
+/// At most so many are kept (past that, the oldest goes for a newcomer,
+/// [`park`]).
 const SPARE_MOST: usize = 1024;
+/// And at most so many bytes of the PC's memory, each buffer counted in the
+/// whole 64 KiB blocks a committed buffer takes. A spare is reused only for
+/// a view of the same width, and with the count alone a spare of a width
+/// that never came back stayed for the rest of the run: a full list was at
+/// least 64 MiB, since no buffer takes less than a block, and could be up
+/// to 64 MiB a buffer ([`exact`]'s largest view).
+const SPARE_BYTES: u64 = 64 << 20;
+
+/// Parks the buffers `let_go` (width, buffer, where it is mapped) among
+/// `spare` at `now`. Where the spares would then hold more than
+/// [`SPARE_MOST`] buffers or [`SPARE_BYTES`], the spare parked longest ago
+/// makes room: the widths the title's ring repeats are taken and parked
+/// again all the time, so the oldest is of a width that did not come back.
+/// Refusing the newcomer instead would let those keep a width that does
+/// recur out of the list until they aged out. Returns the buffers that go,
+/// for the caller to release once the lock is released.
+fn park<B>(spare: &mut Vec<Spare<B>>, let_go: impl IntoIterator<Item = (u64, B, usize)>, now: u64) -> Vec<B> {
+    let committed = |width: u64| width.next_multiple_of(64 << 10);
+    let mut bytes: u64 = spare.iter().map(|&(width, ..)| committed(width)).sum();
+    let mut gone = Vec::new();
+    for (width, buffer, data) in let_go {
+        // (Larger than the list may hold at all; [`exact`]'s views are not.)
+        if committed(width) > SPARE_BYTES {
+            gone.push(buffer);
+            continue;
+        }
+        while spare.len() >= SPARE_MOST || bytes + committed(width) > SPARE_BYTES {
+            let Some(oldest) = spare.iter().enumerate().min_by_key(|(_, parked)| parked.3).map(|(i, _)| i) else {
+                break;
+            };
+            let (old, buffer, ..) = spare.swap_remove(oldest);
+            bytes -= committed(old);
+            gone.push(buffer);
+        }
+        bytes += committed(width);
+        spare.push((width, buffer, data, now));
+    }
+    gone
+}
+
+/// Takes out of `spare` the buffers parked `idle_ms` or more before `now`.
+fn idle_spares<B>(spare: &mut Vec<Spare<B>>, now: u64, idle_ms: u64) -> Vec<B> {
+    spare
+        .extract_if(.., |&mut (.., parked)| now.saturating_sub(parked) >= idle_ms)
+        .map(|(_, buffer, ..)| buffer)
+        .collect()
+}
+
+/// Lets go of the spare buffers of [`exact`] that no copy took for
+/// `idle_ms` ([`crate::host::ram_idle_ms`]). The title's ring gives the same
+/// few widths every frame, so their spares are taken again long before
+/// that; one that stays so long is of a width that did not come back. As
+/// idle windows of title memory do, they go through
+/// [`crate::host::retire_resource`].
+fn let_go_idle_spares(idle_ms: u64) {
+    let now = crate::host::coarse_ms();
+    let gone = idle_spares(&mut EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner()), now, idle_ms);
+    for buffer in gone {
+        crate::host::retire_resource(buffer);
+    }
+}
 
 /// Copies of single views' bytes made since the start.
 pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
@@ -6659,6 +6737,61 @@ pub(crate) fn exact_line(frames: f64) {
         asked as f64 / frames,
         made as f64 / frames
     );
+}
+
+#[cfg(test)]
+mod exact_spare_tests {
+    use super::{SPARE_MOST, Spare, idle_spares, park};
+
+    /// The memory a committed buffer of `width` bytes takes: whole 64 KiB
+    /// blocks.
+    fn committed(width: u64) -> u64 {
+        width.next_multiple_of(64 << 10)
+    }
+
+    /// Spare buffers of views whose widths never come back hold at most
+    /// 64 MiB of the PC's memory, the oldest giving way to newcomers, and go
+    /// once they have been parked for the idle time: with the count alone
+    /// the list kept 1,024 of them (up to 64 MiB each) for the rest of the
+    /// run.
+    #[test]
+    fn spares_of_widths_that_never_come_back_stay_under_64_mib_and_go_when_idle() {
+        const IDLE_MS: u64 = 10_000;
+        let mut spare: Vec<Spare<u32>> = Vec::new();
+        let mut went = 0;
+        // 3,000 views of as many widths (256 bytes to 750 KiB), let go 30
+        // at a sweep, one sweep every 0.1 s.
+        for sweep in 0..100u32 {
+            let let_go = (0..30).map(|i| {
+                let n = sweep * 30 + i;
+                (u64::from(n + 1) * 256, n, 0usize)
+            });
+            went += park(&mut spare, let_go, u64::from(sweep) * 100).len();
+        }
+        let bytes: u64 = spare.iter().map(|&(width, ..)| committed(width)).sum();
+        assert!(spare.len() <= SPARE_MOST);
+        assert!(bytes <= 64 << 20, "{} spares hold {} MiB", spare.len(), bytes >> 20);
+        assert!(!spare.is_empty(), "spares are still kept");
+        // Each buffer is either parked or handed back to be released.
+        assert_eq!(went + spare.len(), 3_000);
+        // Those that gave way were the oldest: the last sweep's are all kept.
+        assert_eq!(spare.iter().filter(|&&(.., at)| at == 9_900).count(), 30);
+        // A width that comes again still finds room in the full list: the
+        // oldest spare goes for it.
+        let width = 640 << 10;
+        assert!(bytes + committed(width) > 64 << 20, "the list has no room for it");
+        let gone = park(&mut spare, [(width, 9_999, 0)], 10_000);
+        assert!(!gone.is_empty());
+        assert!(spare.iter().any(|&(w, id, ..)| w == width && id == 9_999), "a newcomer is parked in a full list");
+        // The idle time after the last sweep: all it and those before it
+        // parked goes, the newcomer stays.
+        let gone = idle_spares(&mut spare, 9_900 + IDLE_MS, IDLE_MS);
+        assert!(!gone.is_empty());
+        assert_eq!(spare.iter().map(|&(_, id, ..)| id).collect::<Vec<_>>(), [9_999]);
+        // And at the idle time after it, none is left.
+        idle_spares(&mut spare, 10_000 + IDLE_MS, IDLE_MS);
+        assert!(spare.is_empty(), "{} spares left", spare.len());
+    }
 }
 
 #[cfg(test)]
