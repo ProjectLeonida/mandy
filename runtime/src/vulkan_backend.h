@@ -2747,12 +2747,15 @@ public:
     // held instead, and the call succeeds: the batch is replayed by the thread that submits the Signal (or the CPU
     // Signal), which is also where its errors are reported (stderr, and take_held_failure()).
     //
-    // `pin`, called only when the batch is held, returns what has to stay alive until the batch has run: the COM layer
-    // passes the pipeline states and root signatures the lists named (the application may release them and Reset
-    // the lists as soon as the call returns).
+    // `pin`, called only when the batch is held (or queued for the worker, LEONIDA_SUBMIT_ASYNC), returns what has to
+    // stay alive until the batch has run: the COM layer passes the pipeline states and root signatures the lists
+    // named (the application may release them and Reset the lists as soon as the call returns). `keep`, called when
+    // the batch is submitted at once, returns what has to stay alive until that submission has completed on the GPU,
+    // or null: the COM layer passes the objects a shim gave the lists for their recording alone (a scratch buffer).
+    // A held or queued batch has those in what `pin` returned, which is kept until its submission has completed too.
     using PinFn = std::function<std::shared_ptr<void>()>;
 
-    ReplayResult execute(std::span<const CommandList* const> lists, const PinFn& pin = {}) {
+    ReplayResult execute(std::span<const CommandList* const> lists, const PinFn& pin = {}, const PinFn& keep = {}) {
         pipeline_wait::note_submission();  // big compute warm-ups are left to their first use while the title submits
         auto* diagnostics = context_.device_fault();
         const auto execute_call = diagnostics ? diagnostics->next_execute_call() : 0;
@@ -2766,10 +2769,11 @@ public:
             enqueue(std::move(call));
             return ReplayResult::success;
         }
-        return execute_sync(lists, pin, execute_call);
+        return execute_sync(lists, pin, execute_call, keep);
     }
 
-    ReplayResult execute_sync(std::span<const CommandList* const> lists, const PinFn& pin, std::uint64_t execute_call) {
+    ReplayResult execute_sync(std::span<const CommandList* const> lists, const PinFn& pin, std::uint64_t execute_call,
+                              const PinFn& keep = {}) {
         ReplayResult result = ReplayResult::success;
         bool held = false;
         std::vector<std::shared_ptr<void>> retired;  // destroyed after state_mutex_ is released
@@ -2777,6 +2781,12 @@ public:
             std::lock_guard state(state_mutex_);
             if (!must_hold()) {
                 result = execute_now(lists, execute_call);
+                // A failed call submitted nothing of the lists, so there is nothing to keep them for.
+                std::shared_ptr<void> kept = result == ReplayResult::success && keep ? keep() : nullptr;
+                if (kept) {
+                    std::vector<std::shared_ptr<void>> pins{std::move(kept)};
+                    retire_pins(pins, submitted_);  // released by drain_pins once this submission has completed
+                }
             } else if (context_.is_device_lost()) {
                 result = queue_unsupported(__LINE__);
             } else {

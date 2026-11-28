@@ -700,11 +700,12 @@ void set_global_realtime_privilege_override_for_test(int state);
 bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT& back);
 
 // Makes `list` hold a reference to `object` until its next Reset or its release, as it holds the pipeline states it
-// names: for an object only the recording uses, such as a shim's own scratch buffer. A list is Reset once it has
-// been executed (or a held batch, src/queue_holds.h, keeps it pinned until it has run), and a resource released
-// after its submission is destroyed through the device's deferred queue once that submission has retired, so the
-// object outlives every GPU use the recording makes of it. False when `list` is not one of this module's command
-// lists or `object` is null.
+// names: for an object only the recording uses, such as a shim's own scratch buffer. D3D12 lets the application
+// Reset or release a list as soon as ExecuteCommandLists returns, while the GPU still runs it, so each execution of
+// the list also keeps the object until that submission has completed (a held batch, src/queue_holds.h, until it
+// has run and then until its submission has completed). That is what keeps a default-heap buffer's arena range
+// from being handed out again under a build that still uses it: the range is free the moment the buffer is
+// destroyed. False when `list` is not one of this module's command lists or `object` is null.
 bool hold_until_reset(ID3D12GraphicsCommandList* list, IUnknown* object);
 
 // Drops what a closed `list` recorded, as its next Reset would, without beginning a new recording: for a list its

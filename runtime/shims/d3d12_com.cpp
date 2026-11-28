@@ -225,8 +225,14 @@ public:
     // The pipeline states and root signatures the recording names (it holds a reference to each until Reset), and
     // the objects a shim handed it with hold_until_reset.
     const std::vector<IUnknown*>& pinned() const { return held_; }
+    // The objects a shim handed it with hold_until_reset (also in pinned()), which ExecuteCommandLists keeps until
+    // the submission has completed: the application may Reset or release the list as soon as the call returns.
+    const std::vector<IUnknown*>& kept() const { return kept_; }
     // rt::d3d12::hold_until_reset: an object the recording uses that its caller does not keep (a shim's own scratch).
-    void hold_for_recording(IUnknown* object) { hold(object); }
+    void hold_for_recording(IUnknown* object) {
+        if (std::find(kept_.begin(), kept_.end(), object) == kept_.end()) kept_.push_back(object);
+        hold(object);
+    }
     // rt::d3d12::drop_recording: what Reset lets go of, now, without a new recording; the list stays closed.
     bool drop_recording() {
         if (!list_.drop_recording()) return false;
@@ -1631,6 +1637,9 @@ private:
     // layout it reads and the pipeline ExecuteCommandLists looks up still exist. (Keeping them alive while the GPU
     // runs the submission stays the application's job, as in D3D12.)
     std::vector<IUnknown*> held_;
+    // The part of held_ a shim handed the list (hold_until_reset). Nothing else keeps those alive while the GPU runs
+    // the submission (CommandQueue::keep_lists). No references of its own: held_ has them.
+    std::vector<IUnknown*> kept_;
 
     // A bundle keeps its state calls and draws instead of applying them: it has no render targets, viewport or root
     // signature of its own to resolve them against, and what it sets belongs to the list that executes it.
@@ -1666,6 +1675,7 @@ private:
     void release_held() {
         for (IUnknown* object : held_) object->Release();
         held_.clear();
+        kept_.clear();
     }
 
     void set_pipeline(ID3D12PipelineState* state) {
@@ -2363,16 +2373,34 @@ public:
     // are not held (a D3D12 application keeps them until the fence it signals; the docs, section 4.4, list this),
     // except a shim's own the recording uses (hold_until_reset), which are pinned with them.
     static std::shared_ptr<void> pin_lists(const std::vector<const GraphicsCommandList*>& lists) {
-        auto objects = std::shared_ptr<std::vector<IUnknown*>>(new std::vector<IUnknown*>, [](auto* held) {
+        return reference_lists(lists, &GraphicsCommandList::pinned);
+    }
+
+    // What a batch submitted at once keeps alive until its submission has completed on the GPU: the shim's own
+    // objects its lists use (hold_until_reset). The lists release them at their Reset or release, which D3D12 allows
+    // as soon as ExecuteCommandLists returns, and a default-heap buffer's arena range is free again the moment the
+    // buffer is destroyed. Null when no list has any, which is every list without a shim's scratch.
+    static std::shared_ptr<void> keep_lists(const std::vector<const GraphicsCommandList*>& lists) {
+        for (const GraphicsCommandList* list : lists)
+            if (!list->kept().empty()) return reference_lists(lists, &GraphicsCommandList::kept);
+        return nullptr;
+    }
+
+    // Takes a reference to each object that `objects` returns for each list. They are released when the last copy of
+    // the result goes.
+    static std::shared_ptr<void> reference_lists(
+        const std::vector<const GraphicsCommandList*>& lists,
+        const std::vector<IUnknown*>& (GraphicsCommandList::*objects)() const) {
+        auto references = std::shared_ptr<std::vector<IUnknown*>>(new std::vector<IUnknown*>, [](auto* held) {
             for (IUnknown* object : *held) object->Release();
             delete held;
         });
         for (const GraphicsCommandList* list : lists)
-            for (IUnknown* object : list->pinned()) {
+            for (IUnknown* object : (list->*objects)()) {
                 object->AddRef();
-                objects->push_back(object);
+                references->push_back(object);
             }
-        return objects;
+        return references;
     }
 
     // A D3D12 queue holds the fences it waits on and signals until the work has been submitted.
@@ -2545,7 +2573,8 @@ public:
                 return;
             }
         }
-        last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
+        last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); },
+                                      [&graphics] { return keep_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success)
             std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
