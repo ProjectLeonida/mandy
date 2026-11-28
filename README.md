@@ -299,6 +299,19 @@ For `tools/pe_inspect.py`'s import classes on Linux, set `WINEPREFIX` to the pre
 `~/.wine`); without one, system DLLs are reported as `system (unverified)`
 ([docs/design.md](docs/design.md#day-one-when-the-exe-is-here)).
 
+UMU-Proton, the Proton build that [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher) downloads, has
+the same `files/bin/wine`, under `~/.local/share/Steam/compatibilitytools.d/UMU-Proton-<version>`. It runs outside
+the Steam Runtime. Give it a prefix of its own, because without `WINEPREFIX` the script uses `~/.wine`, and a prefix
+from another Wine version fails with "wine client error: version mismatch" (docs/testing.md, "Proton's wine"):
+
+```sh
+WINE=~/.local/share/Steam/compatibilitytools.d/UMU-Proton-11.0-2e-x86_64/files/bin/wine \
+WINEPREFIX=~/.local/share/leonida-umu <out>/gta6rt.sh --dry-run
+```
+
+The first start creates the prefix. Outside the Steam Runtime this Wine can also print "Wine cannot find the
+FreeType font library", which doesn't matter to the loader.
+
 On Linux, run `<out>/gta6rt.sh --dry-run` to inspect the packaged title's imports, then
 `<out>/gta6rt.sh --init` to check TLS callbacks and DLL initialization. Use `<out>/gta6rt.sh --run` for startup.
 These commands use the package in `game_path.txt`, the port's `overlay` for writes, and Vulkan by default.
