@@ -620,8 +620,9 @@ enum class IndirectKind : std::uint8_t {
     draw = 0,
     draw_indexed = 1,
     dispatch = 2,
-    // D3D12_DISPATCH_MESH_ARGUMENTS. Created on a device with mesh shaders; ExecuteIndirect with it records nothing
-    // yet (the replay is #3777's), so a title that only creates such a signature at startup goes on.
+    // D3D12_DISPATCH_MESH_ARGUMENTS. Created on a device with mesh shaders; ExecuteIndirect with it records a mesh
+    // Draw that the replay draws with vkCmdDrawMeshTasksIndirect(Count)EXT after its clamp pass (d3d12_com.cpp,
+    // record_indirect), not an ExecuteIndirect command.
     dispatch_mesh = 3,
 };
 

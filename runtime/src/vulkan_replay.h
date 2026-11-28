@@ -2054,6 +2054,9 @@ inline VkDeviceSize indirect_record_size(IndirectKind kind) {
     case IndirectKind::draw: return sizeof(VkDrawIndirectCommand);
     case IndirectKind::draw_indexed: return sizeof(VkDrawIndexedIndirectCommand);
     case IndirectKind::dispatch: return sizeof(VkDispatchIndirectCommand);
+    // A DISPATCH_MESH signature is recorded as a mesh Draw (record_indirect in d3d12_com.cpp), never as an
+    // ExecuteIndirect command, so one that reaches this is invalid: 0 makes the caller reject it.
+    case IndirectKind::dispatch_mesh: return 0;
     }
     return 0;
 }
